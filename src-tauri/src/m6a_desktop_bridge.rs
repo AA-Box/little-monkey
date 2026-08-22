@@ -55,6 +55,13 @@ pub struct AutonomousTaskSubmitRequest {
     pub recipe: Recipe,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutonomousTaskOwnerFenceRequest {
+    pub task_id: String,
+    pub owner: recipes::AutonomousTaskOwnerSnapshot,
+}
+
 fn validate_id(value: &str) -> Result<(), String> {
     named_id(value, "turn")
 }
@@ -347,11 +354,6 @@ pub async fn autonomous_task_submit(
     let owner = snapshot.execution_owner.as_ref().ok_or_else(|| {
         "Autonomous task submission requires an execution owner lease".to_string()
     })?;
-    if let Some(previous) = snapshot.previous_execution_owner.as_ref() {
-        recipes::transfer_autonomous_task_owner(&snapshot.task_id, previous, owner)?;
-    } else {
-        recipes::claim_autonomous_task_owner(&snapshot.task_id, owner)?;
-    }
     let status_text = crate::daemon_commands::command(vec![
         "daemon".to_string(),
         "status".to_string(),
@@ -386,6 +388,7 @@ pub async fn autonomous_task_submit(
             .timeout_seconds
             .unwrap_or(30 * 60)
             .to_string(),
+        "--initially-paused".to_string(),
         "--json".to_string(),
     ])
     .await;
@@ -394,8 +397,68 @@ pub async fn autonomous_task_submit(
     }
     let value: Value = serde_json::from_str(output?.trim())
         .map_err(|error| format!("Invalid autonomous queue JSON: {error}"))?;
-    serde_json::from_value(value)
-        .map_err(|error| format!("Invalid autonomous queue response: {error}"))
+    let mut response: DesktopTurnSubmitResponse = serde_json::from_value(value)
+        .map_err(|error| format!("Invalid autonomous queue response: {error}"))?;
+    // Queueing is deliberately complete before ownership changes. The queued
+    // job is parked at the daemon's queue-only boundary; after this CAS there
+    // is no fallible activation step left that could strand a daemon-owned job
+    // while the desktop resumes it.
+    if let Some(previous) = snapshot.previous_execution_owner.as_ref() {
+        recipes::transfer_autonomous_task_owner(&snapshot.task_id, previous, owner)?;
+    } else {
+        recipes::claim_autonomous_task_owner(&snapshot.task_id, owner)?;
+    }
+    let activation = crate::daemon_commands::command(vec![
+        "daemon".to_string(),
+        "resume".to_string(),
+        response.run_id.clone(),
+    ])
+    .await;
+    if let Err(error) = activation {
+        let rollback = recipes::AutonomousTaskOwnerSnapshot {
+            kind: "desktop".to_string(),
+            instance_id: snapshot
+                .previous_execution_owner
+                .as_ref()
+                .map(|previous| previous.instance_id.clone())
+                .unwrap_or_else(|| format!("desktop-{}", snapshot.task_id)),
+            lease_epoch: owner.lease_epoch.saturating_add(1),
+            lease_expires_at_ms: owner.lease_expires_at_ms,
+        };
+        let _ = recipes::transfer_autonomous_task_owner(&snapshot.task_id, owner, &rollback);
+        return Err(format!(
+            "Could not activate parked autonomous daemon job: {error}"
+        ));
+    }
+    response.state = "queued".to_string();
+    Ok(response)
+}
+
+/// Fences every desktop-side mutation against the durable owner identity and
+/// epoch. A lease renewal may change only the expiry; a different owner or
+/// epoch is a hard stop, including for a stale in-flight tool call.
+#[tauri::command]
+pub fn autonomous_task_owner_fence(request: AutonomousTaskOwnerFenceRequest) -> Result<(), String> {
+    named_id(&request.task_id, "autonomous task")?;
+    if request.owner.kind != "desktop" || request.owner.lease_epoch == 0 {
+        return Err("Desktop side effects require a valid desktop execution owner".to_string());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("Could not read wall clock: {error}"))?
+        .as_millis() as u64;
+    if recipes::autonomous_task_owner_epoch_matches(&request.task_id, &request.owner)?.is_none() {
+        if request.owner.lease_epoch != 1 {
+            return Err("Autonomous task owner fence lost its durable owner epoch".to_string());
+        }
+        recipes::claim_autonomous_task_owner(&request.task_id, &request.owner)?;
+    }
+    let _ = recipes::renew_autonomous_task_owner(
+        &request.task_id,
+        &request.owner,
+        now.saturating_add(60_000),
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

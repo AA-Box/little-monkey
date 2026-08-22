@@ -26,7 +26,7 @@ describe("autonomous task temporary-repository execution", () => {
     execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: repository });
     execFileSync("git", ["config", "user.name", "Test"], { cwd: repository });
     execFileSync("git", ["add", "."], { cwd: repository });
-    execFileSync("git", ["commit", "-qm", "baseline"], { cwd: repository });
+    execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-qm", "baseline"], { cwd: repository });
     const initial = createAutonomousTask({ objective: "fix the bug in bug.txt", targetSnapshot: target, workspaceRoots: roots, permissionSnapshot: permissions, constraints: { strategy: "DIRECT" }, planningContext: { relevantFiles: ["bug.txt"] } });
     const runtime: AutonomousTaskRuntime = {
       executeNode: async (_current, node) => { if (node.taskClass === "implementation") writeFileSync(join(repository, "bug.txt"), "fixed\n"); return { ok: true, summary: node.nodeId, workspaceRevision: "git-working-tree" }; },
@@ -108,6 +108,30 @@ describe("autonomous task temporary-repository execution", () => {
     const result = await runAutonomousTask({ task: resumed, resolvedTarget: { kind: "provider", providerId: "test", model: "model" } as never, runtime: passingRuntime() });
     expect(result.outcome).toBe("SUCCEEDED");
     expect(result.plan?.nodes.find((node) => node.nodeId === "implement")?.status).toBe("succeeded");
+  });
+
+  it("persists the exact worker mutation, artifact, and usage for daemon handoff", async () => {
+    const initial = makeTask();
+    const runtime: AutonomousTaskRuntime = {
+      ...passingRuntime(),
+      executeNode: async (_current, node) => node.taskClass === "implementation"
+        ? {
+            ok: true,
+            summary: "worker produced a patch",
+            changedFiles: ["bug.txt"],
+            workspaceRevision: "r1",
+            mutation: { beforeRevision: "r0", afterRevision: "r1", changedFiles: ["bug.txt"], patchDigest: "patch-digest" },
+            artifacts: [{ artifactId: "patch-1", kind: "patch", label: "worker patch", path: "/tmp/patch", digest: "patch-digest", createdAtMs: 1 }],
+            usage: { modelCalls: 2, toolCalls: 3 },
+          }
+        : { ok: true, summary: node.nodeId },
+    };
+    const result = await runAutonomousTask({ task: initial, resolvedTarget: { kind: "provider", providerId: "test", model: "model" } as never, runtime });
+    const worker = result.workers.find((entry) => entry.nodeId === "implement");
+    expect(result.outcome).toBe("SUCCEEDED");
+    expect(worker?.mutation?.patchDigest).toBe("patch-digest");
+    expect(worker?.artifacts?.[0]?.artifactId).toBe("patch-1");
+    expect(worker?.usage?.modelCalls).toBe(2);
   });
 
   it("does not read a stale snapshot while the coordinator consumes worker results", async () => {

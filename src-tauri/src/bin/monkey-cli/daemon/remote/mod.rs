@@ -964,7 +964,7 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
         RemoteCmd::NodeRefresh { alias } => node_refresh(&paths, alias.as_deref()).await?,
         RemoteCmd::NodeList { json } => node_list(&paths, *json)?,
         RemoteCmd::Place(args) => place(&paths, args).await?,
-        RemoteCmd::Placements { json } => placements(&paths, *json)?,
+        RemoteCmd::Placements { json } => placements(&paths, *json).await?,
         RemoteCmd::PlacementSync => placement_sync(&paths).await?,
     }
     Ok(())
@@ -1241,26 +1241,40 @@ pub(crate) async fn execute_autonomous_node(
     }
 }
 
-fn placements(paths: &DaemonPaths, json: bool) -> Result<(), String> {
+pub(crate) async fn fetch_autonomous_artifact(
+    alias: &str,
+    run_id: &str,
+    artifact_id: &str,
+    destination: &Path,
+) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    client::fetch_artifact(&paths, alias, run_id, artifact_id, destination, now_ms()?).await
+}
+
+async fn placements(paths: &DaemonPaths, json: bool) -> Result<(), String> {
     let records = RemoteStore::open(&paths.root)?.placements()?;
     if json {
-        let rows = records
-            .iter()
-            .map(|record| {
-                serde_json::json!({
-                    "submitted_run_id": record.submitted_run_id,
-                    "alias": record.alias,
-                    "node_run_id": record.node_run_id,
-                    "job_id": record.job_id,
-                    "state": record.state,
-                    "attempt": record.attempt,
-                    "residency": record.residency,
-                    "deciding_key": record.deciding_key,
-                    "last_error": record.last_error,
-                    "updated_at_ms": record.updated_at_ms,
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut rows = Vec::with_capacity(records.len());
+        for record in &records {
+            let result =
+                client::placed_status(paths, &record.alias, &record.submitted_run_id, now_ms()?)
+                    .await
+                    .ok()
+                    .and_then(|status| status.result);
+            rows.push(serde_json::json!({
+                "submitted_run_id": record.submitted_run_id,
+                "alias": record.alias,
+                "node_run_id": record.node_run_id,
+                "job_id": record.job_id,
+                "state": record.state,
+                "attempt": record.attempt,
+                "residency": record.residency,
+                "deciding_key": record.deciding_key,
+                "last_error": record.last_error,
+                "updated_at_ms": record.updated_at_ms,
+                "result": result,
+            }));
+        }
         return print_json(serde_json::json!({ "placements": rows }));
     }
     if records.is_empty() {

@@ -200,6 +200,10 @@ pub struct DaemonRunArgs {
     pub run_key: Option<String>,
     #[arg(long, default_value_t = 0)]
     pub priority: i32,
+    /// Queue paused so an ownership handoff can activate it only after the
+    /// owner CAS commits.
+    #[arg(long)]
+    pub initially_paused: bool,
     #[arg(long, default_value_t = 1)]
     pub max_attempts: u32,
     #[arg(long, default_value_t = 7 * 24 * 60 * 60)]
@@ -1415,6 +1419,7 @@ pub(crate) fn enqueue_frozen_recipe(
             origin: QueueOrigin::Local,
             deterministic_job_id: Some(job_id),
             priority: 0,
+            initially_paused: false,
             max_attempts: 1,
             max_runtime_ms: recipe
                 .timeout_seconds
@@ -1628,6 +1633,7 @@ impl remote::api::PlacementQueue for DaemonPlacementQueue {
             },
             deterministic_job_id: Some(placed_job_id(&spec.run_id)),
             priority: 0,
+            initially_paused: false,
             // A placed run is not retried on this node. A submitter that wants
             // another attempt places it again — possibly somewhere else — which
             // is the decision `node_placement::reconcile_placement` makes with
@@ -1678,6 +1684,26 @@ impl remote::api::PlacementQueue for DaemonPlacementQueue {
         let Some(job) = store.get_job(job_id)? else {
             return Ok(None);
         };
+        let result = little_monkey_lib::run_ledger::RunLedger::open(&self.paths.ledger_db)
+            .ok()
+            .and_then(|ledger| {
+                job.run_id
+                    .as_deref()
+                    .and_then(|run_id| ledger.load_events(run_id, 0, 10_000).ok())
+            })
+            .and_then(|events| {
+                events
+                    .into_iter()
+                    .rev()
+                    .find_map(|event| match event.event {
+                        RunEvent::TaskEvent {
+                            event_type,
+                            payload,
+                            ..
+                        } if event_type == "node_result" => Some(payload),
+                        _ => None,
+                    })
+            });
         Ok(Some(remote::api::PlacedJobState {
             state: format!("{:?}", job.state).to_ascii_lowercase(),
             terminal: matches!(
@@ -1686,6 +1712,7 @@ impl remote::api::PlacementQueue for DaemonPlacementQueue {
             ),
             updated_at_ms: job.updated_at_ms,
             last_error: job.last_error.clone(),
+            result,
         }))
     }
 }
@@ -1726,6 +1753,7 @@ struct QueueOptions {
     origin: QueueOrigin,
     deterministic_job_id: Option<String>,
     priority: i32,
+    initially_paused: bool,
     max_attempts: u32,
     max_runtime_ms: u64,
     max_memory_bytes: Option<u64>,
@@ -1774,6 +1802,7 @@ impl QueueOptions {
             params: args.param.clone(),
             deterministic_job_id,
             priority: args.priority,
+            initially_paused: args.initially_paused,
             max_attempts: args.max_attempts,
             max_runtime_ms: args.max_runtime_seconds.saturating_mul(1000),
             max_memory_bytes: args
@@ -2071,7 +2100,11 @@ fn enqueue(
                 return Err(error);
             }
         };
-    store.mark_queued(&job_id, &run_id, now_ms()?)?;
+    if options.initially_paused {
+        store.mark_queued_paused(&job_id, &run_id, now_ms()?)?;
+    } else {
+        store.mark_queued(&job_id, &run_id, now_ms()?)?;
+    }
     project_queue_origin(
         shared,
         &options.origin,
@@ -2364,6 +2397,7 @@ fn retry(cli: &crate::Cli, run_id: &str, acknowledge: bool) -> Result<(), String
         params: vec![],
         deterministic_job_id: None,
         priority: prior.priority,
+        initially_paused: false,
         max_attempts: prior.max_attempts,
         max_runtime_ms: prior.max_runtime_ms,
         max_memory_bytes: prior.max_memory_bytes,
@@ -3266,6 +3300,7 @@ async fn process_one_pending_delivery(
         params,
         deterministic_job_id: Some(deterministic_job_id),
         priority: 0,
+        initially_paused: false,
         max_attempts: 1,
         max_runtime_ms: 7 * 24 * 60 * 60 * 1_000,
         max_memory_bytes: None,
@@ -3690,6 +3725,7 @@ mod tests {
             param: vec![],
             run_key: Some("raw-secret-key".into()),
             priority: 0,
+            initially_paused: false,
             max_attempts: 1,
             max_runtime_seconds: 60,
             max_memory_mb: None,
@@ -3720,6 +3756,7 @@ mod tests {
             param: vec![],
             run_key: None,
             priority: 0,
+            initially_paused: false,
             max_attempts: 1,
             max_runtime_seconds: 60,
             max_memory_mb: None,

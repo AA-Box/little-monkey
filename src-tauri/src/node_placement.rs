@@ -336,6 +336,11 @@ pub struct PlacedRunStatus {
     /// the *node* refused it, not because the submitter predicted it would.
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Terminal node result, including mutation/revision/artifact metadata.
+    /// A successful placement without this payload is not a usable mutation
+    /// result at the origin.
+    #[serde(default)]
+    pub result: Option<serde_json::Value>,
 }
 
 /// The execution-relevant half of a placed `RunSpec`, frozen into the node's

@@ -49,6 +49,7 @@ export interface AutonomousTaskRuntimeContext {
   planningContext?: TaskPlanningContext;
   approval?: { requestId: string; confirmation: string; operationDigest?: string };
   beforeSideEffect?: () => void;
+  beforeSideEffectAsync?: () => Promise<void>;
 }
 
 export interface AutonomousTaskRuntime {
@@ -153,6 +154,7 @@ export interface RunAutonomousTaskParams {
   onUpdate?: (task: AutonomousTask) => void;
   control?: AutonomousTaskControl;
   approval?: { requestId: string; confirmation: string; operationDigest?: string };
+  ownerFence?: () => Promise<void>;
 }
 
 export class AutonomousTaskControl {
@@ -257,9 +259,19 @@ function advanceWorkspaceRevision(task: AutonomousTask, revision?: string): Auto
 function insertRepairNode(task: AutonomousTask, failedNode: TaskPlanNode, summary: string): AutonomousTask {
   if (!task.plan) return task;
   const repairId = `${failedNode.nodeId}-repair-${task.repairRounds}`;
-  const repairNode: TaskPlanNode = { ...failedNode, nodeId: repairId, taskClass: "implementation", objective: `Diagnose and repair ${failedNode.nodeId} using bounded failure evidence: ${summary.slice(0, 2_000)}`, dependencies: failedNode.dependencies, status: failedNode.dependencies.length ? "pending" : "ready", attempt: 0, workerId: null, resultSummary: null, repairOf: failedNode.nodeId };
-  const retriedNode = { ...failedNode, dependencies: [repairId], status: "pending" as const, attempt: 0, workerId: null, resultSummary: null };
-  return { ...task, plan: { ...task.plan, revision: task.plan.revision + 1, nodes: [...task.plan.nodes.map((node) => node.nodeId === failedNode.nodeId ? retriedNode : node), repairNode] }, updatedAtMs: Date.now() };
+  let repairDependencies = failedNode.dependencies;
+  let retriedDependencies = [repairId];
+  const nodes = task.plan.nodes.map((node) => {
+    if (failedNode.taskClass === "review" && node.taskClass === "verification" && failedNode.dependencies.includes(node.nodeId)) {
+      repairDependencies = node.dependencies;
+      retriedDependencies = failedNode.dependencies;
+      return { ...node, dependencies: [repairId], status: "pending" as const, attempt: 0, workerId: null, resultSummary: null, mutationRevision: null };
+    }
+    return node;
+  });
+  const repairNode: TaskPlanNode = { ...failedNode, nodeId: repairId, taskClass: "implementation", objective: `Diagnose and repair ${failedNode.nodeId} using bounded failure evidence: ${summary.slice(0, 2_000)}`, dependencies: repairDependencies, mutationScope: failedNode.mutationScope.length ? failedNode.mutationScope : ["workspace"], isolation: "shared", capabilities: ["read", "mutate", "verify"], executionRequirements: { needsWorkspaceWrite: true, needsNetwork: failedNode.executionRequirements?.needsNetwork ?? false, isolation: "shared" }, status: repairDependencies.length ? "pending" : "ready", attempt: 0, workerId: null, resultSummary: null, repairOf: failedNode.nodeId };
+  const retriedNode = { ...failedNode, dependencies: retriedDependencies, status: "pending" as const, attempt: 0, workerId: null, resultSummary: null, mutationRevision: null };
+  return { ...task, plan: { ...task.plan, revision: task.plan.revision + 1, nodes: [...nodes.map((node) => node.nodeId === failedNode.nodeId ? retriedNode : node), repairNode] }, updatedAtMs: Date.now() };
 }
 
 function parseStructuredReview(value: string): StructuredReviewResult | null {
@@ -316,7 +328,7 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
     }
     const startedAt = Date.now();
     const results = new Map<string, TaskNodeResult>();
-    for (const worker of task.workers) if (worker.worktree) results.set(worker.nodeId, { ok: true, summary: "Recovered worker result from the durable task snapshot.", worktree: worker.worktree, changedFiles: worker.changedFiles });
+    for (const worker of task.workers) if (worker.worktree || worker.mutation || worker.artifacts || worker.usage) results.set(worker.nodeId, { ok: true, summary: worker.resultSummary ?? "Recovered worker result from the durable task snapshot.", worktree: worker.worktree, changedFiles: worker.changedFiles, mutation: worker.mutation, artifacts: worker.artifacts, usage: worker.usage });
     if (task.waitingApproval && task.plan) {
       const approval = params.approval ?? params.control?.drainApproval();
       if (approval?.requestId === task.waitingApproval.requestId) {
@@ -357,9 +369,10 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
       }
       const executions = workers.map(async (worker) => {
         const node = task.plan!.nodes.find((candidate) => candidate.nodeId === worker.nodeId)!;
-        const context: AutonomousTaskRuntimeContext = { resolvedTarget: params.resolvedTarget, signal, worker, placement: worker.executionPlacement, planningContext: task.planningContext, approval: params.approval ?? params.control?.drainApproval() ?? undefined, beforeSideEffect: stopIfNeeded };
+        const context: AutonomousTaskRuntimeContext = { resolvedTarget: params.resolvedTarget, signal, worker, placement: worker.executionPlacement, planningContext: task.planningContext, approval: params.approval ?? params.control?.drainApproval() ?? undefined, beforeSideEffect: stopIfNeeded, beforeSideEffectAsync: params.ownerFence };
         params.control?.beginExecution();
         try {
+          await params.ownerFence?.();
           if (node.taskClass === "integration" && params.runtime.integrate) return await params.runtime.integrate(task, node, [...results.values()], context);
           if (node.taskClass === "verification" && params.runtime.verify) return await params.runtime.verify(task, node, context);
           if (node.taskClass === "review" && params.runtime.review) return await params.runtime.review(task, node, context);
@@ -397,7 +410,7 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
         if ((task.budgetSnapshot.maxArtifactBytes ?? Number.MAX_SAFE_INTEGER) < (task.usage?.artifactBytes ?? 0)) task = { ...task, outcome: "BUDGET_EXHAUSTED", summary: "Artifact budget exhausted.", updatedAtMs: Date.now() };
         task = { ...task, artifacts: [...task.artifacts, ...(result.artifacts ?? [])], updatedAtMs: Date.now() };
         task = { ...task, workers: task.workers.map((entry) => entry.workerId === worker.workerId ? { ...entry, finishedAtMs: Date.now() } : entry), updatedAtMs: Date.now() };
-        task = { ...task, workers: task.workers.map((entry) => entry.workerId === worker.workerId ? { ...entry, worktree: result.worktree, changedFiles: result.changedFiles, usage: result.usage } : entry), updatedAtMs: Date.now() };
+        task = { ...task, workers: task.workers.map((entry) => entry.workerId === worker.workerId ? { ...entry, worktree: result.worktree, changedFiles: result.changedFiles, mutation: result.mutation, artifacts: result.artifacts, resultSummary: result.summary.slice(0, 2_000), usage: result.usage } : entry), updatedAtMs: Date.now() };
         if (result.deliveryStep) task = { ...task, deliveryStep: result.deliveryStep };
         if (awaitingApproval && result.approval) task = { ...task, outcome: "WAITING_APPROVAL", waitingReason: result.summary, waitingApproval: { ...result.approval, nodeId: node.nodeId }, updatedAtMs: Date.now() };
         if (result.evidence) for (const evidence of result.evidence) {
@@ -482,7 +495,7 @@ export function defaultAutonomousTaskRuntime(resolvedTarget: ResolvedTarget, pla
         return { ok: false, summary: `Node '${node.nodeId}' requested capability '${capability}' outside the frozen permission ceiling.` };
       }
       const beforeRevision = await agentWorktreeClient.workspaceRevision().catch(() => task.workspaceRevision ?? "unknown");
-      const result = await runSubagentTaskStructured({ sessionId: task.sessionId ?? task.taskId, runId: task.taskId, parentCheckpointId: null, taskId: `${task.taskId}-${node.nodeId}`, description: node.objective.slice(0, 120), prompt: buildWorkerContext(task, node), profile: node.taskClass === "investigation" || node.taskClass === "review" ? "explore" : "code", capabilities: [...required], isolation: node.isolation === "worktree" ? "worktree" : undefined, target: resolvedTarget, effort: effortForTarget(resolvedTarget), parentSignal: context.signal, beforeToolCall: context.beforeSideEffect });
+      const result = await runSubagentTaskStructured({ sessionId: task.sessionId ?? task.taskId, runId: task.taskId, parentCheckpointId: null, taskId: `${task.taskId}-${node.nodeId}`, description: node.objective.slice(0, 120), prompt: buildWorkerContext(task, node), profile: node.taskClass === "investigation" || node.taskClass === "review" ? "explore" : "code", capabilities: [...required], isolation: node.isolation === "worktree" ? "worktree" : undefined, target: resolvedTarget, effort: effortForTarget(resolvedTarget), parentSignal: context.signal, beforeToolCall: context.beforeSideEffectAsync ?? context.beforeSideEffect });
       const afterRevision = node.isolation === "shared" ? await agentWorktreeClient.workspaceRevision().catch(() => undefined) : result.worktree?.diffDigest;
       const changedFiles = node.isolation === "shared" ? await agentWorktreeClient.workspaceChangedFiles().catch(() => result.changedFiles ?? []) : result.changedFiles ?? [];
       const patchDigest = afterRevision ? await textDigest(JSON.stringify({ afterRevision, changedFiles })) ?? afterRevision : result.worktree?.diffDigest;
@@ -500,6 +513,7 @@ export function defaultAutonomousTaskRuntime(resolvedTarget: ResolvedTarget, pla
       const applied: string[] = [];
       for (const path of paths) {
         if (context.signal.aborted) return { ok: false, summary: "Integration cancelled." };
+        await context.beforeSideEffectAsync?.();
         try { const response = await agentWorktreeClient.apply(path); applied.push(...response.applied_files); }
         catch (error) { return { ok: false, summary: `Integration conflict: ${error instanceof Error ? error.message : String(error)}` }; }
       }
@@ -525,12 +539,15 @@ export function defaultAutonomousTaskRuntime(resolvedTarget: ResolvedTarget, pla
       return { ok: true, summary: `${enabled.length} verification command(s) passed.`, evidence };
     },
     review: async (task, node, context) => {
-      const result = await runSubagentTask({ sessionId: task.sessionId ?? task.taskId, runId: task.taskId, parentCheckpointId: null, taskId: `${task.taskId}-${node.nodeId}`, description: "Review task diff", prompt: `${buildWorkerContext(task, node)}\nReview only. Do not mutate files. Return strict JSON with verdict, findings, filesReviewed, acceptanceCriteria, securityFindings, testCoverageFindings.`, profile: "explore", target: resolvedTarget, effort: effortForTarget(resolvedTarget), parentSignal: context.signal });
+      const beforeRevision = await agentWorktreeClient.workspaceRevision().catch(() => task.workspaceRevision);
+      const result = await runSubagentTask({ sessionId: task.sessionId ?? task.taskId, runId: task.taskId, parentCheckpointId: null, taskId: `${task.taskId}-${node.nodeId}`, description: "Review task diff", prompt: `${buildWorkerContext(task, node)}\nReview only. Do not mutate files. Return strict JSON with verdict, findings, filesReviewed, acceptanceCriteria, securityFindings, testCoverageFindings.`, profile: "explore", target: resolvedTarget, effort: effortForTarget(resolvedTarget), parentSignal: context.signal, beforeToolCall: context.beforeSideEffectAsync ?? context.beforeSideEffect });
       const testedRevision = await agentWorktreeClient.workspaceRevision().catch(() => task.workspaceRevision);
+      const mutated = Boolean(beforeRevision && testedRevision && beforeRevision !== testedRevision);
       const review = parseStructuredReview(result); const criteria = task.acceptanceCriteria.filter((candidate) => candidate.method === "review");
-      if (!review) return { ok: false, summary: "Review response was not valid structured JSON; no review evidence accepted.", evidence: criteria.map((criterion) => makeEvidence("Structured worker diff review", criterion.id, false, result, false, null, 0, { workspaceRevision: testedRevision, testedRevision, source: "review" })) };
-      const passed = review.verdict === "pass" && !review.findings.some((finding) => finding.severity === "blocking");
-      return { ok: passed, summary: JSON.stringify(review).slice(0, 8_000), review, evidence: criteria.map((criterion) => makeEvidence("Structured worker diff review", criterion.id, passed, JSON.stringify(review), true, passed ? 0 : 1, 0, { workspaceRevision: testedRevision, testedRevision, source: "review" })) };
+      const staleSummary = "Review mutated the workspace after its evidence boundary; the evidence is stale.";
+      if (!review) return { ok: false, summary: mutated ? staleSummary : "Review response was not valid structured JSON; no review evidence accepted.", evidence: criteria.map((criterion) => makeEvidence("Structured worker diff review", criterion.id, false, mutated ? staleSummary : result, false, null, 0, { stale: mutated, workspaceRevision: testedRevision, testedRevision, source: "review" })) };
+      const passed = !mutated && review.verdict === "pass" && !review.findings.some((finding) => finding.severity === "blocking");
+      return { ok: passed, summary: mutated ? staleSummary : JSON.stringify(review).slice(0, 8_000), review, evidence: criteria.map((criterion) => makeEvidence("Structured worker diff review", criterion.id, passed, mutated ? staleSummary : JSON.stringify(review), !mutated, passed ? 0 : 1, 0, { stale: mutated, workspaceRevision: testedRevision, testedRevision, source: "review" })) };
     },
     deliver: async (task, context) => {
       if (task.deliveryIntent === "leave_worktree") return { ok: true, summary: "Changes left in the managed worktree." };
@@ -553,9 +570,11 @@ export function defaultAutonomousTaskRuntime(resolvedTarget: ResolvedTarget, pla
       };
       const approval = context.approval;
       if (!approval) {
+        await context.beforeSideEffectAsync?.();
         const preview = await prepareDeliveryMutation(mutation);
         return { ok: false, awaitingApproval: true, summary: `${preview.summary}. Type ${preview.confirmationPhrase} to approve.`, approval: { requestId: `delivery-${task.taskId}-${step}`, operationDigest: preview.digest, expiresAtMs: preview.expiresAtMs, confirmationPhrase: preview.confirmationPhrase }, deliveryStep: step };
       }
+      await context.beforeSideEffectAsync?.();
       const result = await executeDeliveryMutation(mutation, approval.operationDigest ?? task.waitingApproval?.operationDigest ?? approval.requestId, approval.confirmation);
       const following = nextStep();
       if (following) {
@@ -662,11 +681,15 @@ export async function startAutonomousTask(params: StartAutonomousTaskParams): Pr
   const permission = usePermissionStore.getState();
   const runBudgets = defaultRunBudgets(false);
   const task = createAutonomousTask({ objective: params.objective, sessionId: params.sessionId, targetSnapshot, workspaceRoots: structuredClone(roots), permissionSnapshot: { mode: permission.mode, unattended: true, allowNetwork: false, allowExternalMutations: false }, constraints: params.constraints, planningContext: params.planningContext, deliveryIntent: params.deliveryIntent, deliveryTarget: params.deliveryTarget, budgetSnapshot: { wallTimeMs: runBudgets.wall_time_ms, maxModelCalls: runBudgets.max_model_calls, maxToolCalls: runBudgets.max_tool_calls, maxRepairRounds: 2, maxWorkers: 16, maxConcurrentWorkers: 4, maxArtifactBytes: runBudgets.max_artifact_bytes, maxCostMicros: runBudgets.max_cost_micros } });
+  const ownerFence = async (): Promise<void> => {
+    await invoke("autonomous_task_owner_fence", { request: { taskId: task.taskId, owner: { kind: task.executionOwner.kind, instance_id: task.executionOwner.instanceId, lease_epoch: task.executionOwner.leaseEpoch, lease_expires_at_ms: task.executionOwner.leaseExpiresAtMs } } });
+  };
+  await ownerFence();
   const control = new AutonomousTaskControl();
   const signal = mergeSignals(control.signal, params.signal);
   const recorder = await beginDurableRun({ runId: task.taskId, kind: "autonomous_task", task: task.objective, instructions: "Universal autonomous task coordinator", target: targetSnapshot, roots, permissionMode: permission.mode, allowNetwork: false, allowExternalMutations: false, budgets: runBudgets, workspaceAccess: "read_write" });
   const eventSink: AutonomousTaskEventSink = async (event) => { if (recorder) await appendRunEvent(task.taskId, taskEventToRunEvent(event)); };
-  const completion = runAutonomousTask({ task, resolvedTarget, runtime: params.runtime ?? defaultAutonomousTaskRuntime(resolvedTarget, defaultAutonomousTaskPlacementAdapters()), signal, eventSink, onUpdate: params.onUpdate, control }).then(async (result) => {
+  const completion = runAutonomousTask({ task, resolvedTarget, runtime: params.runtime ?? defaultAutonomousTaskRuntime(resolvedTarget, defaultAutonomousTaskPlacementAdapters()), signal, eventSink, onUpdate: params.onUpdate, control, ownerFence }).then(async (result) => {
     await finishAutonomousRun(recorder, result); return result;
   });
   void completion.catch(async (error) => { await recorder?.fail(error); });
@@ -678,9 +701,14 @@ export interface ResumeAutonomousTaskParams { task: AutonomousTask; onUpdate?: (
 export async function resumeAutonomousTask(params: ResumeAutonomousTaskParams): Promise<StartedAutonomousTask> {
   const resolvedTarget = await resolveTarget(); const control = new AutonomousTaskControl(); const signal = mergeSignals(control.signal, params.signal);
   const task = { ...params.task, outcome: "RUNNING" as const, repairRounds: ["FAILED", "VERIFICATION_FAILED", "DELIVERY_FAILED", "WAITING_USER"].includes(params.task.outcome) ? 0 : params.task.repairRounds, plan: params.task.plan ? { ...params.task.plan, nodes: params.task.plan.nodes.map((node) => node.status === "running" || node.status === "failed" || node.status === "blocked" || (params.task.waitingApproval && node.nodeId === params.task.waitingApproval.nodeId) ? { ...node, status: "pending" as const, workerId: null } : node) } : null, waitingReason: null, waitingApproval: null, updatedAtMs: Date.now() };
+  if (task.executionOwner.kind !== "desktop") throw new Error("Only the current desktop owner may resume an autonomous task.");
+  const ownerFence = async (): Promise<void> => {
+    await invoke("autonomous_task_owner_fence", { request: { taskId: task.taskId, owner: { kind: task.executionOwner.kind, instance_id: task.executionOwner.instanceId, lease_epoch: task.executionOwner.leaseEpoch, lease_expires_at_ms: task.executionOwner.leaseExpiresAtMs } } });
+  };
+  await ownerFence();
   const recorder = await attachDurableRun({ runId: task.taskId, roots: task.workspaceRoots });
   const eventSink: AutonomousTaskEventSink = async (event) => { if (recorder) await appendRunEvent(task.taskId, taskEventToRunEvent(event)); };
-  const completion = runAutonomousTask({ task, resolvedTarget, runtime: params.runtime ?? defaultAutonomousTaskRuntime(resolvedTarget, defaultAutonomousTaskPlacementAdapters()), signal, eventSink, onUpdate: params.onUpdate, control, approval: params.approval }).then(async (result) => { await finishAutonomousRun(recorder, result); return result; });
+  const completion = runAutonomousTask({ task, resolvedTarget, runtime: params.runtime ?? defaultAutonomousTaskRuntime(resolvedTarget, defaultAutonomousTaskPlacementAdapters()), signal, eventSink, onUpdate: params.onUpdate, control, approval: params.approval, ownerFence }).then(async (result) => { await finishAutonomousRun(recorder, result); return result; });
   void completion.catch(async (error) => { await recorder?.fail(error); });
   return { task, runId: task.taskId, control, completion };
 }
