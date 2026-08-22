@@ -36,12 +36,18 @@ $status.AccessibleName = 'Save status'
 $status.Location = New-Object System.Drawing.Point(16, 104)
 $status.AutoSize = $true
 
-$dark = New-Object System.Windows.Forms.CheckBox
+$dark = New-Object System.Windows.Forms.Button
 $dark.Text = 'Dark mode'
 $dark.AccessibleName = 'Dark mode'
-$dark.AccessibleRole = [System.Windows.Forms.AccessibleRole]::CheckButton
+$dark.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
+$dark.AccessibleDescription = 'Off'
+$dark.Tag = $false
 $dark.Location = New-Object System.Drawing.Point(16, 148)
-$dark.AutoSize = $true
+$dark.Size = New-Object System.Drawing.Size(110, 30)
+$dark.Add_Click({
+    $dark.Tag = -not [bool]$dark.Tag
+    $dark.AccessibleDescription = if ([bool]$dark.Tag) { 'On' } else { 'Off' }
+})
 
 $disabled = New-Object System.Windows.Forms.Button
 $disabled.Text = 'Disabled button'
@@ -82,12 +88,15 @@ if (Test-Path -LiteralPath $profilePath) {
     try {
         $saved = Get-Content -Raw -LiteralPath $profilePath -ErrorAction Stop | ConvertFrom-Json
         if ($saved.profile -is [string]) { $profile.Text = $saved.profile }
-        if ($saved.dark -eq $true) { $dark.Checked = $true }
+        if ($saved.dark -eq $true) {
+            $dark.Tag = $true
+            $dark.AccessibleDescription = 'On'
+        }
     } catch {}
 }
 
 $save.Add_Click({
-    @{profile=$profile.Text;dark=$dark.Checked} | ConvertTo-Json | Set-Content -LiteralPath $profilePath -Encoding UTF8
+    @{profile=$profile.Text;dark=[bool]$dark.Tag} | ConvertTo-Json | Set-Content -LiteralPath $profilePath -Encoding UTF8
     $status.Text = 'Saved'
 })
 
