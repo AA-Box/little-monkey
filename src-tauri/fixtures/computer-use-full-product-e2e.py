@@ -61,7 +61,7 @@ def main() -> int:
         node,
         str(repo / "node_modules/vite/bin/vite.js"),
         "--host",
-        "localhost",
+        "127.0.0.1",
         "--port",
         "1420",
     ]
@@ -71,7 +71,7 @@ def main() -> int:
         "dev",
         "--no-watch",
         "--config",
-        '{"build":{"beforeDevCommand":""}}',
+        '{"build":{"beforeDevCommand":"","devUrl":"http://127.0.0.1:1420"}}',
     ]
     environment = os.environ.copy()
     environment.update({
@@ -96,7 +96,7 @@ def main() -> int:
         if frontend_process.poll() is not None:
             break
         try:
-            with urllib.request.urlopen("http://localhost:1420/", timeout=2):
+            with urllib.request.urlopen("http://127.0.0.1:1420/", timeout=2):
                 break
         except (urllib.error.URLError, TimeoutError):
             time.sleep(1)
