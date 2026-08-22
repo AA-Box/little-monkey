@@ -1,126 +1,141 @@
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-[System.Windows.Forms.Application]::EnableVisualStyles()
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName WindowsBase
 
 $profilePath = Join-Path ([System.IO.Path]::GetTempPath()) 'little-monkey-testapp-profile.json'
-$form = New-Object System.Windows.Forms.Form
-$form.Name = 'LittleMonkeyTestApp'
-$form.Text = 'Little Monkey TestApp'
-$form.ClientSize = New-Object System.Drawing.Size(640, 420)
-$form.StartPosition = 'CenterScreen'
+$window = New-Object System.Windows.Window
+$window.Title = 'Little Monkey TestApp'
+$window.Width = 640
+$window.Height = 420
+$window.WindowStartupLocation = 'CenterScreen'
+$window.Name = 'LittleMonkeyTestApp'
 
-$title = New-Object System.Windows.Forms.Label
-$title.Text = 'Little Monkey TestApp'
-$title.Font = New-Object System.Drawing.Font('Segoe UI', 18, [System.Drawing.FontStyle]::Bold)
-$title.Location = New-Object System.Drawing.Point(16, 14)
-$title.AutoSize = $true
+$grid = New-Object System.Windows.Controls.Grid
+$grid.Margin = New-Object System.Windows.Thickness(16)
+foreach ($height in @(46, 34, 34, 42, 42, 42, 42, 42, 42)) {
+    $row = New-Object System.Windows.Controls.RowDefinition
+    $row.Height = New-Object System.Windows.GridLength($height)
+    $grid.RowDefinitions.Add($row)
+}
 
-$profileLabel = New-Object System.Windows.Forms.Label
+function Add-TextBlock([string]$text, [int]$row, [string]$automationName = '') {
+    $block = New-Object System.Windows.Controls.TextBlock
+    $block.Text = $text
+    $block.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+    if ($automationName) {
+        [System.Windows.Automation.AutomationProperties]::SetName($block, $automationName)
+    }
+    [System.Windows.Controls.Grid]::SetRow($block, $row)
+    $grid.Children.Add($block) | Out-Null
+    return $block
+}
+
+$title = Add-TextBlock 'Little Monkey TestApp' 0
+$title.FontSize = 24
+$title.FontWeight = [System.Windows.FontWeights]::Bold
+
+$profilePanel = New-Object System.Windows.Controls.StackPanel
+$profilePanel.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+[System.Windows.Controls.Grid]::SetRow($profilePanel, 1)
+$grid.Children.Add($profilePanel) | Out-Null
+$profileLabel = New-Object System.Windows.Controls.TextBlock
 $profileLabel.Text = 'Profile name'
-$profileLabel.Location = New-Object System.Drawing.Point(16, 70)
-$profileLabel.AutoSize = $true
-
-$profile = New-Object System.Windows.Forms.TextBox
+$profileLabel.Width = 104
+$profileLabel.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+$profilePanel.Children.Add($profileLabel) | Out-Null
+$profile = New-Object System.Windows.Controls.TextBox
 $profile.Name = 'ProfileInput'
-$profile.AccessibleName = 'Profile name'
-$profile.Location = New-Object System.Drawing.Point(120, 66)
-$profile.Size = New-Object System.Drawing.Size(300, 24)
+$profile.Width = 300
+$profile.VerticalContentAlignment = [System.Windows.VerticalAlignment]::Center
 $profile.Text = 'Test profile'
-
-$save = New-Object System.Windows.Forms.Button
+[System.Windows.Automation.AutomationProperties]::SetName($profile, 'Profile name')
+[System.Windows.Automation.AutomationProperties]::SetAutomationId($profile, 'ProfileInput')
+$profilePanel.Children.Add($profile) | Out-Null
+$save = New-Object System.Windows.Controls.Button
 $save.Name = 'SaveProfile'
-$save.Text = 'Save profile'
-$save.Location = New-Object System.Drawing.Point(440, 64)
-$save.Size = New-Object System.Drawing.Size(150, 30)
+$save.Content = 'Save profile'
+$save.Width = 150
+$save.Margin = New-Object System.Windows.Thickness(16, 0, 0, 0)
+[System.Windows.Automation.AutomationProperties]::SetName($save, 'Save profile')
+$profilePanel.Children.Add($save) | Out-Null
 
-$status = New-Object System.Windows.Forms.Label
-$status.Name = 'SaveStatus'
-$status.Text = 'Not saved'
-$status.AccessibleName = 'Save status'
-$status.Location = New-Object System.Drawing.Point(16, 104)
-$status.AutoSize = $true
+$status = Add-TextBlock 'Not saved' 2 'Save status'
 
-$dark = New-Object System.Windows.Forms.CheckBox
+$dark = New-Object System.Windows.Controls.CheckBox
 $dark.Name = 'DarkMode'
-$dark.Text = 'Dark mode'
-$dark.AccessibleName = 'Dark mode'
-$dark.AccessibleDescription = 'Off'
-$dark.Tag = $false
-$dark.Location = New-Object System.Drawing.Point(16, 148)
-$dark.AutoSize = $true
-$dark.Add_CheckedChanged({
-    $dark.Tag = [bool]$dark.Checked
-    $dark.AccessibleDescription = if ($dark.Checked) { 'On' } else { 'Off' }
+$dark.Content = 'Dark mode'
+$dark.Margin = New-Object System.Windows.Thickness(0, 4, 0, 4)
+[System.Windows.Automation.AutomationProperties]::SetName($dark, 'Dark mode')
+[System.Windows.Automation.AutomationProperties]::SetAutomationId($dark, 'DarkMode')
+[System.Windows.Automation.AutomationProperties]::SetHelpText($dark, 'Off')
+[System.Windows.Controls.Grid]::SetRow($dark, 3)
+$grid.Children.Add($dark) | Out-Null
+$dark.Add_Checked({
+    [System.Windows.Automation.AutomationProperties]::SetHelpText($dark, 'On')
+})
+$dark.Add_Unchecked({
+    [System.Windows.Automation.AutomationProperties]::SetHelpText($dark, 'Off')
 })
 
-$disabled = New-Object System.Windows.Forms.Button
-$disabled.Name = 'DisabledButton'
-$disabled.Text = 'Disabled button'
-$disabled.AccessibleName = 'Disabled button'
-$disabled.Location = New-Object System.Drawing.Point(150, 144)
-$disabled.Size = New-Object System.Drawing.Size(150, 30)
-$disabled.Enabled = $false
+$disabled = New-Object System.Windows.Controls.Button
+$disabled.Content = 'Disabled button'
+$disabled.IsEnabled = $false
+[System.Windows.Automation.AutomationProperties]::SetName($disabled, 'Disabled button')
+[System.Windows.Controls.Grid]::SetRow($disabled, 4)
+$grid.Children.Add($disabled) | Out-Null
 
-$dynamic = New-Object System.Windows.Forms.Button
-$dynamic.Name = 'AddDynamicItem'
-$dynamic.Text = 'Add dynamic item'
-$dynamic.Location = New-Object System.Drawing.Point(320, 144)
-$dynamic.Size = New-Object System.Drawing.Size(150, 30)
+$dynamic = New-Object System.Windows.Controls.Button
+$dynamic.Content = 'Add dynamic item'
+[System.Windows.Automation.AutomationProperties]::SetName($dynamic, 'Add dynamic item')
+[System.Windows.Controls.Grid]::SetRow($dynamic, 5)
+$grid.Children.Add($dynamic) | Out-Null
 $dynamic.Add_Click({
-    $item = New-Object System.Windows.Forms.Label
-    $item.Text = 'Dynamic item'
-    $item.Location = New-Object System.Drawing.Point(16, 340)
-    $item.AutoSize = $true
-    $form.Controls.Add($item)
+    $item = Add-TextBlock 'Dynamic item' 8
+    [System.Windows.Automation.AutomationProperties]::SetName($item, 'Dynamic item')
 })
 
-$destructive = New-Object System.Windows.Forms.Button
-$destructive.Name = 'DestructiveAction'
-$destructive.Text = 'Destructive action'
-$destructive.Location = New-Object System.Drawing.Point(480, 144)
-$destructive.Size = New-Object System.Drawing.Size(140, 30)
+$destructive = New-Object System.Windows.Controls.Button
+$destructive.Content = 'Destructive action'
+[System.Windows.Automation.AutomationProperties]::SetName($destructive, 'Destructive action')
+[System.Windows.Controls.Grid]::SetRow($destructive, 6)
+$grid.Children.Add($destructive) | Out-Null
 
-$passwordLabel = New-Object System.Windows.Forms.Label
-$passwordLabel.Text = 'Fake password field (must be blocked)'
-$passwordLabel.Location = New-Object System.Drawing.Point(16, 210)
-$passwordLabel.AutoSize = $true
-
-$password = New-Object System.Windows.Forms.TextBox
+$passwordLabel = Add-TextBlock 'Fake password field (must be blocked)' 7
+$password = New-Object System.Windows.Controls.PasswordBox
 $password.Name = 'FakePassword'
-$password.AccessibleName = 'Fake password field (must be blocked)'
-$password.UseSystemPasswordChar = $true
-$password.Location = New-Object System.Drawing.Point(16, 238)
-$password.Size = New-Object System.Drawing.Size(400, 24)
+$password.Width = 400
+[System.Windows.Automation.AutomationProperties]::SetName($password, 'Fake password field (must be blocked)')
+[System.Windows.Controls.Grid]::SetRow($password, 8)
+$grid.Children.Add($password) | Out-Null
 
 if (Test-Path -LiteralPath $profilePath) {
     try {
         $saved = Get-Content -Raw -LiteralPath $profilePath -ErrorAction Stop | ConvertFrom-Json
         if ($saved.profile -is [string]) { $profile.Text = $saved.profile }
-        if ($saved.dark -eq $true) {
-            $dark.Checked = $true
-            $dark.Tag = $true
-            $dark.AccessibleDescription = 'On'
-        }
+        if ($saved.dark -eq $true) { $dark.IsChecked = $true }
     } catch {}
 }
 
 $save.Add_Click({
-    @{profile=$profile.Text;dark=[bool]$dark.Tag} | ConvertTo-Json | Set-Content -LiteralPath $profilePath -Encoding UTF8
+    @{profile=$profile.Text;dark=[bool]$dark.IsChecked} | ConvertTo-Json | Set-Content -LiteralPath $profilePath -Encoding UTF8
     $status.Text = 'Saved'
 })
 
-$form.Controls.AddRange(@($title, $profileLabel, $profile, $save, $status, $dark, $disabled, $dynamic, $destructive, $passwordLabel, $password))
-$secondary = New-Object System.Windows.Forms.Form
-$secondary.Text = 'Little Monkey TestApp Secondary'
-$secondary.ClientSize = New-Object System.Drawing.Size(320, 180)
-$secondary.StartPosition = 'Manual'
-$secondary.Location = New-Object System.Drawing.Point(700, 120)
-$secondaryLabel = New-Object System.Windows.Forms.Label
+$window.Content = $grid
+$secondary = New-Object System.Windows.Window
+$secondary.Title = 'Little Monkey TestApp Secondary'
+$secondary.Width = 320
+$secondary.Height = 180
+$secondary.WindowStartupLocation = 'Manual'
+$secondary.Left = 700
+$secondary.Top = 120
+$secondaryLabel = New-Object System.Windows.Controls.TextBlock
 $secondaryLabel.Text = 'Little Monkey TestApp Secondary'
-$secondaryLabel.AccessibleName = 'Little Monkey TestApp Secondary'
-$secondaryLabel.Dock = 'Fill'
-$secondaryLabel.TextAlign = 'MiddleCenter'
-$secondary.Controls.Add($secondaryLabel)
+$secondaryLabel.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
+$secondaryLabel.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+[System.Windows.Automation.AutomationProperties]::SetName($secondaryLabel, 'Little Monkey TestApp Secondary')
+$secondary.Content = $secondaryLabel
+
 $secondary.Show()
-$form.Activate()
-[System.Windows.Forms.Application]::Run($form)
+$window.Show()
+[System.Windows.Threading.Dispatcher]::Run()
