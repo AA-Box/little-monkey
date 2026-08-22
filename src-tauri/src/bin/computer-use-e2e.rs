@@ -44,6 +44,7 @@ fn launch(fixture: &str) -> Result<Child, String> {
             command.args([
                 "-NoProfile",
                 "-NonInteractive",
+                "-STA",
                 "-ExecutionPolicy",
                 "Bypass",
                 "-File",

@@ -76,11 +76,13 @@ $password.UseSystemPasswordChar = $true
 $password.Location = New-Object System.Drawing.Point(16, 238)
 $password.Size = New-Object System.Drawing.Size(400, 24)
 
-try {
-    $saved = Get-Content -Raw -LiteralPath $profilePath | ConvertFrom-Json
-    if ($saved.profile -is [string]) { $profile.Text = $saved.profile }
-    if ($saved.dark -eq $true) { $dark.Checked = $true }
-} catch {}
+if (Test-Path -LiteralPath $profilePath) {
+    try {
+        $saved = Get-Content -Raw -LiteralPath $profilePath -ErrorAction Stop | ConvertFrom-Json
+        if ($saved.profile -is [string]) { $profile.Text = $saved.profile }
+        if ($saved.dark -eq $true) { $dark.Checked = $true }
+    } catch {}
+}
 
 $save.Add_Click({
     @{profile=$profile.Text;dark=$dark.Checked} | ConvertTo-Json | Set-Content -LiteralPath $profilePath -Encoding UTF8

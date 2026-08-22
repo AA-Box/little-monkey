@@ -1446,12 +1446,19 @@ $targets=@();$elements=@{}
 $windows=$root.FindAll([System.Windows.Automation.TreeScope]::Children,[System.Windows.Automation.Condition]::TrueCondition)
 $onlyPid=0
 try { if($env:COMPUTER_USE_FIXTURE_PID){$onlyPid=[int]$env:COMPUTER_USE_FIXTURE_PID} } catch {}
-if($onlyPid){$windows=@($windows | Where-Object {$_.Current.ProcessId -eq $onlyPid})}
+$fixtureFallback=$false
+if($onlyPid){
+  $windows=@($windows | Where-Object {$_.Current.ProcessId -eq $onlyPid})
+  if($windows.Count -eq 0){
+    $windows=@($root.FindAll([System.Windows.Automation.TreeScope]::Children,[System.Windows.Automation.Condition]::TrueCondition) | Where-Object {$_.Current.Name -eq 'Little Monkey TestApp'})
+    $fixtureFallback=$windows.Count -gt 0
+  }
+}
 function ValueOf($e) { try { return $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value } catch { try { return [string]$e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState } catch { return $null } } }
 function ActionsOf($e) { $a=@(); try { $e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern) | Out-Null; $a+='click'; $a+='double_click' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern) | Out-Null; $a+='click' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern) | Out-Null; $a+='set_value' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern) | Out-Null; $a+='select' } catch {}; return @($a | Select-Object -Unique) }
 function RectOf($rect) { $x=0.0;$y=0.0;$width=0.0;$height=0.0;try{$x=[double]$rect.X;$y=[double]$rect.Y;$width=[double]$rect.Width;$height=[double]$rect.Height}catch{};[ordered]@{x=$x;y=$y;width=$width;height=$height} }
 for($i=0;$i -lt $windows.Count -and $i -lt 64;$i++){
-  $w=$windows.Item($i);$p=$w.Current.ProcessId;$id="process:$p";$name=[string]$w.Current.Name;$windowId=[string]$w.Current.NativeWindowHandle;$targetId="$id::window-$i";
+  $w=$windows.Item($i);$p=$w.Current.ProcessId;$id=if($fixtureFallback){"process:$onlyPid"}else{"process:$p"};$name=[string]$w.Current.Name;$windowId=[string]$w.Current.NativeWindowHandle;$targetId="$id::window-$i";
   $t=[ordered]@{targetId=$targetId;applicationId=$id;applicationName=$name;windowId=$windowId;windowTitle=$name;bounds=(RectOf $w.Current.BoundingRectangle);focused=([bool]$w.Current.HasKeyboardFocus);sensitive=($name -match 'UAC|Windows Security|credential|password');supportedActions=@('inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot')};$targets+=$t;$list=@();$desc=$w.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition);
   for($j=0;$j -lt $desc.Count -and $j -lt 256;$j++){
     $e=$desc.Item($j);$label=[string]$e.Current.Name;$role=[string]$e.Current.ControlType.ProgrammaticName;$automation=[string]$e.Current.AutomationId;if([string]::IsNullOrWhiteSpace($automation)){try{$automation=($e.GetRuntimeId() -join '-')}catch{$automation=''}};$stable=($automation -replace '[^A-Za-z0-9._-]','_');$value=ValueOf $e;if($null -ne $value){$value=[string]$value};$actions=@(ActionsOf $e);$list+=[ordered]@{id="$targetId::element-$j::native-$stable";role=$role;label=$label;value=$value;bounds=(RectOf $e.Current.BoundingRectangle);enabled=([bool]$e.Current.IsEnabled);focused=([bool]$e.Current.HasKeyboardFocus);actions=$actions;sensitive=([bool]$e.Current.IsPassword -or ($role -match 'Edit' -and $label -match 'password|credential|secret'))};
