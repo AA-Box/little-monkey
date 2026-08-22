@@ -125,6 +125,26 @@ fn find_element<'a>(
         .find(|element| element.label == label)
 }
 
+fn find_toggle_element<'a>(
+    inspection: &'a ComputerInspection,
+    label: &str,
+) -> Option<&'a ComputerElement> {
+    inspection
+        .elements
+        .iter()
+        .find(|element| {
+            let role = element.role.to_ascii_lowercase();
+            element.label == label
+                && element.actions.iter().any(|action| action == "click")
+                && (role.contains("check") || role.contains("toggle"))
+        })
+        .or_else(|| {
+            inspection.elements.iter().find(|element| {
+                element.label == label && element.actions.iter().any(|action| action == "click")
+            })
+        })
+}
+
 fn find_profile_element<'a>(inspection: &'a ComputerInspection) -> Option<&'a ComputerElement> {
     inspection
         .elements
@@ -272,7 +292,7 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
                 "production provider did not expose secure and disabled controls".to_string(),
             );
         }
-        let dark = find_element(&first, "Dark mode")
+        let dark = find_toggle_element(&first, "Dark mode")
             .ok_or_else(|| "Dark mode control was not found".to_string())?;
         let profile_input = find_profile_element(&first)
             .ok_or_else(|| "Profile input was not found".to_string())?;
@@ -295,7 +315,7 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
             },
         )?;
         let after_dark = inspect(&state, &session.session_id, &target)?;
-        let dark_enabled = find_element(&after_dark, "Dark mode")
+        let dark_enabled = find_toggle_element(&after_dark, "Dark mode")
             .map(dark_is_on)
             .ok_or_else(|| "Dark mode postcondition was not observable".to_string())?;
         if !dark_enabled {
