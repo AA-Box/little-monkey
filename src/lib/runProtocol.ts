@@ -192,6 +192,8 @@ export type AutonomousTaskEventType =
   | "guidance_received"
   | "delivery_started"
   | "execution_handoff"
+  | "execution_handoff_rollback"
+  | "execution_owner_rollback"
   | "task_completed";
 export type RunEventWire =
   | Event<"queued", { queue: string | null }>

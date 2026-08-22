@@ -46,6 +46,10 @@ pub struct DesktopTurnSubmitResponse {
     pub job_id: String,
     pub run_id: String,
     pub state: String,
+    #[serde(default)]
+    pub rollback_owner: Option<recipes::AutonomousTaskOwnerSnapshot>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -426,9 +430,12 @@ pub async fn autonomous_task_submit(
             lease_expires_at_ms: owner.lease_expires_at_ms,
         };
         let _ = recipes::transfer_autonomous_task_owner(&snapshot.task_id, owner, &rollback);
-        return Err(format!(
+        response.state = "desktop_rollback".to_string();
+        response.rollback_owner = Some(rollback);
+        response.error = Some(format!(
             "Could not activate parked autonomous daemon job: {error}"
         ));
+        return Ok(response);
     }
     response.state = "queued".to_string();
     Ok(response)

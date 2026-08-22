@@ -306,6 +306,122 @@ fn parse_json(output: &str) -> Result<Value, String> {
         .map_err(|error| format!("Invalid daemon JSON output: {error}"))
 }
 
+fn autonomous_placement_scopes(run_spec: &crate::run_protocol::RunSpec) -> Vec<String> {
+    let Some(snapshot) = run_spec
+        .autonomous_task
+        .as_ref()
+        .and_then(|value| value.get("task_snapshot"))
+    else {
+        return Vec::new();
+    };
+    snapshot
+        .get("plan")
+        .and_then(|plan| plan.get("nodes"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|node| {
+            node.get("mutationScope")
+                .or_else(|| node.get("mutation_scope"))
+                .and_then(Value::as_array)
+                .map(|scopes| {
+                    scopes
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+        })
+        .unwrap_or_default()
+}
+
+fn autonomous_placement_path_in_scope(path: &str, scopes: &[String]) -> bool {
+    scopes.iter().any(|scope| {
+        let scope = scope.trim_end_matches('/');
+        scope == "workspace" || path == scope || path.starts_with(&format!("{scope}/"))
+    })
+}
+
+fn enforce_autonomous_placement_scope(
+    data_dir: &Path,
+    workspace: &Path,
+    snapshot_id: &str,
+    run_spec: &crate::run_protocol::RunSpec,
+) -> Result<(), String> {
+    let changed = crate::agent_worktrees::changed_files_since_snapshot(
+        data_dir,
+        workspace,
+        snapshot_id,
+    )?;
+    let scopes = autonomous_placement_scopes(run_spec);
+    let unauthorized = changed
+        .iter()
+        .filter(|path| !autonomous_placement_path_in_scope(path, &scopes))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unauthorized.is_empty() {
+        crate::agent_worktrees::restore_workspace_paths(
+            data_dir,
+            workspace,
+            snapshot_id,
+            &unauthorized,
+        )?;
+        return Err(format!(
+            "autonomous placement changed files outside its frozen mutation scope: {}",
+            unauthorized.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn workspace_patch_bytes(workspace: &Path) -> Result<Vec<u8>, String> {
+    let workspace_arg = workspace.to_string_lossy().into_owned();
+    let tracked = Command::new("git")
+        .args(["-C", workspace_arg.as_str(), "diff", "--binary", "--"])
+        .output()
+        .map_err(|error| format!("Could not collect workspace patch: {error}"))?;
+    if !tracked.status.success() {
+        return Err(format!("Could not collect workspace patch: {}", tracked.status));
+    }
+    let untracked = Command::new("git")
+        .args([
+            "-C",
+            workspace_arg.as_str(),
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
+        .output()
+        .map_err(|error| format!("Could not enumerate workspace patch files: {error}"))?;
+    if !untracked.status.success() {
+        return Err(format!("Could not enumerate workspace patch files: {}", untracked.status));
+    }
+    let mut patch = tracked.stdout;
+    for relative in untracked.stdout.split(|byte| *byte == 0).filter(|value| !value.is_empty()) {
+        let relative = String::from_utf8(relative.to_vec())
+            .map_err(|error| format!("Workspace patch path is not UTF-8: {error}"))?;
+        let output = Command::new("git")
+            .args([
+                "-C",
+                workspace_arg.as_str(),
+                "diff",
+                "--no-index",
+                "--binary",
+                "--",
+                "/dev/null",
+                relative.as_str(),
+            ])
+            .output()
+            .map_err(|error| format!("Could not collect untracked workspace patch: {error}"))?;
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Err(format!("Could not collect untracked workspace patch: {}", output.status));
+        }
+        patch.extend(output.stdout);
+    }
+    Ok(patch)
+}
+
 fn autonomous_placement_result(
     data_dir: &Path,
     workspace: &Path,
@@ -328,11 +444,7 @@ fn autonomous_placement_result(
         .filter(|path| !path.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let patch = Command::new("git")
-        .args(["-C", workspace_arg.as_str(), "diff", "--binary", "--"])
-        .output()
-        .map_err(|error| format!("Could not collect Docker patch: {error}"))?
-        .stdout;
+    let patch = workspace_patch_bytes(workspace)?;
     let patch_digest = format!("{:x}", Sha256::digest(&patch));
     let mut result = runner_result;
     if let Some(object) = result.as_object_mut() {
@@ -376,7 +488,7 @@ fn autonomous_placement_result(
                     "artifactId": blob.id,
                     "kind": "patch",
                     "label": "Docker autonomous placement patch",
-                    "digest": patch_digest,
+                    "digest": format!("{:x}", Sha256::digest(&patch)),
                     "sizeBytes": blob.size
                 }]),
             );
@@ -1614,6 +1726,16 @@ pub async fn autonomous_task_place_node(
                                     patch_path.to_string_lossy().into_owned(),
                                 ])
                                 .await?;
+                                let patch_bytes = std::fs::read(&patch_path)
+                                    .map_err(|error| format!("Could not read fetched remote patch: {error}"))?;
+                                if format!("{:x}", Sha256::digest(&patch_bytes)) != artifact_id {
+                                    let _ = std::fs::remove_file(&patch_path);
+                                    return Err("Remote autonomous patch failed its content digest check".to_string());
+                                }
+                                let local_snapshot = crate::agent_worktrees::snapshot(
+                                    &data_dir,
+                                    &workspace_root,
+                                )?;
                                 let patch_path_arg = patch_path.to_string_lossy().into_owned();
                                 let workspace_arg = workspace_root.to_string_lossy().into_owned();
                                 let check = Command::new("git")
@@ -1629,6 +1751,7 @@ pub async fn autonomous_task_place_node(
                                         format!("Could not validate remote patch: {error}")
                                     })?;
                                 if !check.status.success() {
+                                    let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
                                     return Err("Remote autonomous patch does not apply to the local workspace".to_string());
                                 }
                                 let apply = Command::new("git")
@@ -1639,8 +1762,17 @@ pub async fn autonomous_task_place_node(
                                     })?;
                                 let _ = std::fs::remove_file(&patch_path);
                                 if !apply.status.success() {
+                                    let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
                                     return Err("Could not apply remote autonomous patch".to_string());
                                 }
+                                let scope_result = enforce_autonomous_placement_scope(
+                                    &data_dir,
+                                    &workspace_root,
+                                    &local_snapshot.id,
+                                    &request.run_spec,
+                                );
+                                let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
+                                scope_result?;
                             }
                             result = autonomous_placement_result(
                                 &data_dir,
@@ -1685,6 +1817,10 @@ pub async fn autonomous_task_place_node(
                 .map_err(|error| format!("Could not persist Docker placement spec: {error}"))?;
             let before_revision =
                 crate::agent_worktrees::workspace_revision(&data_dir, Path::new(&host_workspace))?;
+            let local_snapshot = crate::agent_worktrees::snapshot(
+                &data_dir,
+                Path::new(&host_workspace),
+            )?;
             let args = vec![
                 "run".to_string(),
                 "--rm".to_string(),
@@ -1711,8 +1847,23 @@ pub async fn autonomous_task_place_node(
                 parse_json(&output_text)
             })
             .await
-            .map_err(|error| error.to_string())??;
+            .map_err(|error| error.to_string())?;
+            let runner_result = match runner_result {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
+                    return Err(error);
+                }
+            };
             let _ = std::fs::remove_file(&spec_path);
+            let scope_result = enforce_autonomous_placement_scope(
+                &data_dir,
+                Path::new(&host_workspace),
+                &local_snapshot.id,
+                &spec,
+            );
+            let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
+            scope_result?;
             autonomous_placement_result(
                 &data_dir,
                 Path::new(&host_workspace),

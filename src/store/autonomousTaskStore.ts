@@ -130,6 +130,15 @@ export const useAutonomousTaskStore = create<AutonomousTaskStoreState>((set, get
       let accepted;
       try { accepted = await submitAutonomousTaskToDaemon(frozenTask); }
       catch (error) { control?.resume(); throw error; }
+      if (accepted.rollback_owner) {
+        const rollbackOwner = { kind: "desktop" as const, instanceId: accepted.rollback_owner.instance_id, leaseEpoch: accepted.rollback_owner.lease_epoch, leaseExpiresAtMs: accepted.rollback_owner.lease_expires_at_ms };
+        const rollbackTask = { ...frozenTask, executionOwner: rollbackOwner, updatedAtMs: Date.now() };
+        await appendRunEvent(taskId, taskEventToRunEvent(taskEvent("execution_handoff_rollback", rollbackTask, { run_id: accepted.run_id, owner: rollbackOwner, error: accepted.error ?? "Daemon activation failed." })));
+        control?.adoptExecutionOwner(rollbackOwner);
+        control?.resume();
+        publish(rollbackTask);
+        throw new Error(accepted.error ?? "Could not activate parked autonomous daemon job; desktop ownership was restored.");
+      }
       const next = { ...frozenTask, executionOwner: { kind: "daemon" as const, instanceId: `daemon-${taskId}`, leaseEpoch: frozenTask.executionOwner.leaseEpoch + 1, leaseExpiresAtMs: Date.now() + frozenTask.budgetSnapshot.wallTimeMs }, updatedAtMs: Date.now() };
       try {
         await appendRunEvent(taskId, taskEventToRunEvent(taskEvent("execution_handoff", next, { job_id: accepted.job_id, run_id: accepted.run_id, owner: next.executionOwner })));
