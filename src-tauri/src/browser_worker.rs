@@ -824,6 +824,16 @@ impl BrowserWorkflowAdapter {
     pub fn shutdown_all(&self) -> Result<usize, String> {
         self.state.shutdown_all()
     }
+
+    /// Reads an artifact produced by this adapter's owned browser session.
+    /// Acceptance harnesses use this to prove that model-visible DOM content
+    /// came from the real Chromium/CDP path, rather than from a fixture string
+    /// copied directly into the native half of a test.
+    pub fn read_artifact(&self, artifact_id: &str) -> Result<Vec<u8>, String> {
+        self.artifacts
+            .read(artifact_id)
+            .map_err(|error| error.to_string())
+    }
 }
 
 struct OwnedBrowser {
@@ -929,6 +939,12 @@ impl OwnedBrowser {
         let mut command = Command::new(chrome);
         command
             .arg("--headless=new")
+            // Windows hosted runners can expose a broken virtual GPU to
+            // headless Chromium; its GPU child then aborts with STATUS_BREAKPOINT
+            // before DevToolsActivePort exists. Headless DOM/CDP work does not
+            // need hardware acceleration, so keep the real browser sandbox and
+            // job containment while selecting the software path explicitly.
+            .arg("--disable-gpu")
             .arg("--remote-debugging-port=0")
             .arg("--remote-allow-origins=http://127.0.0.1")
             .arg(format!("--user-data-dir={}", profile.display()))

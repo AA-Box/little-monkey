@@ -1,12 +1,12 @@
-# Safe Desktop Control — design & threat model (research spike)
+# Safe Desktop Control — design & threat model
 
-**Status:** Research (ROADMAP.md Phase 5, "Trust, Sandboxing, and PC Control" →
-"Safe Desktop Control"). This document, `src-tauri/src/desktop_control.rs`,
-`src/store/desktopControlStore.ts`, and `src/components/Settings/DesktopControlPanel.tsx`
-are a design-validation spike: real, working, gated, and off by default — not
-a finished production feature. Nothing here is exposed to the model as an
-agent tool; it is a user-driven Settings surface only, exactly like the M7
-companion's capture grants.
+**Status:** Implemented as the Safe Desktop Control substrate and extended by
+the production Computer Use capability. The model-facing contract, platform
+matrix, fixture, and acceptance cases are documented in
+[`computer-use.md`](computer-use.md) and [`computer-use-e2e.md`](computer-use-e2e.md).
+This document retains the original threat-model rationale; statements below
+that call the feature a Settings-only research spike describe the pre-Computer
+Use design and are superseded by that implementation.
 
 ## Why this exists
 
@@ -17,8 +17,8 @@ workspace or a sandboxed shell, and the existing permission system
 is categorically different — a granted action can do *anything a human at the
 keyboard could do*, in *any* application, including ones Little Monkey has no
 visibility into (password managers, banking apps, other people's chat
-windows, OS security dialogs). That blast radius is why this spike exists
-separately from `tools.rs` rather than as one more tool in the existing list,
+windows, OS security dialogs). That blast radius is why the capability remains
+separately gated rather than being treated as an ordinary workspace tool,
 and why it ships behind more gates than anything else in the app.
 
 ## Threat model
@@ -111,22 +111,16 @@ requesting a bad action," not "the sandbox was broken into."
   pure functions (`is_wayland_session`) that *are* compiled and unit-tested on
   macOS. The `enigo` crate's default `x11rb` feature supplies the Linux/X11
   backend, and its `Key` variants used here are all cross-platform.
-- **Remote/paired-device control.** Explicitly a separate, later ROADMAP item
-  ("Remote PC Control", still Research) that depends on this one shipping
-  first. Not touched here.
-- **Screen OCR / vision-based verification of what an action actually did.**
-  This spike executes actions and reports whether the backend call itself
-  succeeded; it does not screenshot-verify the visual outcome. `m7_companion`
-  already owns screen capture under its own grant system — a future phase
-  could compose the two, but this spike does not.
-- **An agent-callable tool.** Nothing here is added to `tools.rs`'s `TOOLS`
-  list or `agentLoop.ts`'s tool dispatch. It is reachable only from the
-  Settings panel a human opens themselves, exactly like `CompanionPanel`'s
-  capture grants — there is currently no path from "the model decides to
-  move the mouse" to this code at all. Making it agent-callable, if that's
-  ever wanted, is a distinct future decision that should re-run this threat
-  model from scratch, since it changes the attacker's capability from
-  "influence what a human approves" to "directly request actions."
+- **Unbounded remote control.** Remote runners reuse this grant, lock,
+  consent, target-verification, audit, and revocation boundary; a remote
+  controller cannot widen it or approve an OS security dialog.
+- **Screen OCR or visual certainty.** Computer Use can return bounded
+  screenshots and semantic re-reads, but a successful input call is not proof
+  that the application completed the intended business outcome. The result
+  explicitly distinguishes input sent from state verified.
+- **Unmediated agent control.** The model-facing tools exist only after the
+  user enables the capability and creates a local grant. The model cannot
+  create, widen, pause, resume, approve, or revoke that grant.
 
 ## What "approved batch" mode is (and is why it doesn't defeat the model above)
 

@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { errorMessage } from "../lib/errors";
 
 /**
- * Safe Desktop Control — a design-validation research spike. See
+ * Native Computer Use — the user-granted, scoped desktop-control capability. See
  * `docs/safe-desktop-control-design.md` and `src-tauri/src/desktop_control.rs`
  * for the full threat model; this store only wraps the Tauri `invoke()`
  * calls and the two events the backend emits. It never inlines a secret —
@@ -13,22 +13,42 @@ import { errorMessage } from "../lib/errors";
  */
 
 export type MouseButtonKind = "left" | "right" | "middle";
+export type ApprovalLevel = "low" | "medium" | "high" | "critical";
 
 /** Mirrors `desktop_control::ControlAction`'s internally-tagged shape exactly. */
 export type ControlAction =
   | { kind: "mouse_move"; x: number; y: number }
   | { kind: "mouse_click"; button: MouseButtonKind }
-  | { kind: "key_press"; key: string };
+  | { kind: "mouse_click_at"; x: number; y: number; button: MouseButtonKind }
+  | { kind: "mouse_double_click"; button: MouseButtonKind }
+  | { kind: "mouse_double_click_at"; x: number; y: number; button: MouseButtonKind }
+  | { kind: "mouse_drag"; from_x: number; from_y: number; to_x: number; to_y: number }
+  | { kind: "scroll"; delta_x: number; delta_y: number }
+  | { kind: "type_text"; text: string }
+  | { kind: "key_press"; key: string }
+  | { kind: "hotkey"; keys: string[] }
+  | { kind: "focus" }
+  | { kind: "semantic_click"; element_id: string; button: MouseButtonKind; expected_value?: string | null }
+  | { kind: "semantic_double_click"; element_id: string; button: MouseButtonKind; expected_value?: string | null }
+  | { kind: "select"; element_id: string; value: string }
+  | { kind: "set_value"; element_id: string; value: string }
+  | { kind: "wait"; milliseconds: number };
 
 /** Mirrors `desktop_control::ControlSession`. */
 export interface ControlSession {
   sessionId: string;
   allowedApplications: string[];
+  allowedWindows: string[];
   createdAtMs: number;
   expiresAtMs: number;
   active: boolean;
+  paused: boolean;
   indicatorVisible: boolean;
   approvedBatch: boolean;
+  approvalPolicy: "per_action" | "approved_batch";
+  allowScreenshots: boolean;
+  allowKeyboardInput: boolean;
+  allowClipboardRead: boolean;
 }
 
 /** Mirrors `desktop_control::PendingActionSummary`, the payload of the
@@ -36,13 +56,32 @@ export interface ControlSession {
 export interface PendingActionSummary {
   actionId: string;
   sessionId: string;
+  targetApplicationId: string;
+  targetWindowId?: string | null;
+  approvalLevel: ApprovalLevel;
+  description: string;
   action: ControlAction;
+}
+
+export interface VerificationEvidence {
+  kind: string;
+  elementId?: string | null;
+  expectedValue?: string | null;
+  observedValue?: string | null;
+  matched: boolean;
+  detail: string;
 }
 
 /** Mirrors `desktop_control::ActionOutcome`. */
 export interface ActionOutcome {
   actionId: string;
   executed: boolean;
+  inputSent: boolean;
+  stateVerified: boolean;
+  verification?: string | null;
+  verificationEvidence?: VerificationEvidence | null;
+  auditId: string;
+  approvalLevel: ApprovalLevel;
 }
 
 export interface EmergencyStopResult {
@@ -61,12 +100,18 @@ export interface DesktopControlStore {
    * `respondAction`/`stopSession`/`emergencyStop`. */
   pendingActions: PendingActionSummary[];
   error: string | null;
+  controlling: boolean;
 
   refreshSessions: () => Promise<void>;
   /** Starts a new session. Rejects (propagating the backend's exact message)
    * when permission mode is `"bypass"`, the allowlist is empty, or the
    * lifetime is out of bounds — see `desktop_control_start_session`. */
-  startSession: (allowedApplications: string[], lifetimeMs: number, approvedBatch: boolean) => Promise<ControlSession>;
+  startSession: (allowedApplications: string[], lifetimeMs: number, approvedBatch: boolean, options?: {
+    allowedWindows?: string[];
+    allowScreenshots?: boolean;
+    allowKeyboardInput?: boolean;
+    allowClipboardRead?: boolean;
+  }) => Promise<ControlSession>;
   stopSession: (sessionId: string) => Promise<boolean>;
   /** Requests one input action. For a non-approved-batch session this awaits
    * the user's decision on the resulting `desktop-control://action-pending`
@@ -84,6 +129,7 @@ export const useDesktopControlStore = create<DesktopControlStore>((set, get) => 
   sessions: [],
   pendingActions: [],
   error: null,
+  controlling: false,
 
   refreshSessions: async () => {
     try {
@@ -94,15 +140,20 @@ export const useDesktopControlStore = create<DesktopControlStore>((set, get) => 
     }
   },
 
-  startSession: async (allowedApplications, lifetimeMs, approvedBatch) => {
+  startSession: async (allowedApplications, lifetimeMs, approvedBatch, options = {}) => {
     try {
       const session = await invoke<ControlSession>("desktop_control_start_session", {
         allowedApplications,
         lifetimeMs,
         approvedBatch,
+        allowedWindows: options.allowedWindows ?? [],
+        allowScreenshots: options.allowScreenshots ?? true,
+        allowKeyboardInput: options.allowKeyboardInput ?? true,
+        allowClipboardRead: options.allowClipboardRead ?? false,
       });
       set((state) => ({
         sessions: [...state.sessions.filter((existing) => existing.sessionId !== session.sessionId), session],
+        controlling: true,
         error: null,
       }));
       return session;
@@ -118,6 +169,7 @@ export const useDesktopControlStore = create<DesktopControlStore>((set, get) => 
       set((state) => ({
         sessions: state.sessions.map((session) => (session.sessionId === sessionId ? { ...session, active: false } : session)),
         pendingActions: state.pendingActions.filter((action) => action.sessionId !== sessionId),
+        controlling: state.sessions.some((session) => session.active && session.sessionId !== sessionId),
         error: null,
       }));
       return stopped;
@@ -158,6 +210,7 @@ export const useDesktopControlStore = create<DesktopControlStore>((set, get) => 
     set((state) => ({
       sessions: state.sessions.map((session) => ({ ...session, active: false })),
       pendingActions: [],
+      controlling: false,
       error: null,
     }));
     await get().refreshSessions();
@@ -183,8 +236,19 @@ if (isTauri()) {
     useDesktopControlStore.setState((state) => ({
       sessions: state.sessions.map((session) => ({ ...session, active: false })),
       pendingActions: [],
+      controlling: false,
     }));
   }).catch((error) => {
     console.error("Failed to listen for desktop-control://emergency-stop events", error);
+  });
+
+  void listen<ControlSession | ControlSession[]>("desktop-control://session-state", (event) => {
+    const sessions = Array.isArray(event.payload) ? event.payload : [event.payload];
+    useDesktopControlStore.setState((state) => ({
+      sessions: [...state.sessions.filter((session) => !sessions.some((next) => next.sessionId === session.sessionId)), ...sessions],
+      controlling: sessions.some((session) => session.active),
+    }));
+  }).catch((error) => {
+    console.error("Failed to listen for desktop-control://session-state events", error);
   });
 }

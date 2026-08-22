@@ -331,6 +331,9 @@ fn write_log(
         body.push_str(&line);
         body.push('\n');
     }
+    let _rewrite_guard = REVISION_REWRITE_LOCK
+        .lock()
+        .map_err(|_| RevisionError::Io("revision rewrite lock poisoned".to_string()))?;
     // Temp file + rename, same reasoning as `prompts::save_impl`: a crash
     // mid-rewrite must not leave a truncated history behind.
     //
@@ -349,7 +352,7 @@ fn write_log(
     ));
     std::fs::write(&tmp, body)
         .map_err(|e| RevisionError::Io(format!("failed to write revisions: {e}")))?;
-    if let Err(error) = std::fs::rename(&tmp, &path) {
+    if let Err(error) = replace_revision_file(&tmp, &path) {
         // The temp file is this writer's own, so cleaning it up on failure
         // cannot disturb anybody else's in-flight write.
         let _ = std::fs::remove_file(&tmp);
@@ -360,11 +363,64 @@ fn write_log(
     Ok(())
 }
 
+#[cfg(unix)]
+fn replace_revision_file(
+    temporary: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(temporary, destination)
+}
+
+#[cfg(windows)]
+fn replace_revision_file(
+    temporary: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both buffers are owned, NUL-terminated UTF-16 strings and live
+    // for the duration of this synchronous Win32 call.
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_revision_file(
+    temporary: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(temporary, destination)
+}
+
 /// Distinguishes one writer's temp file from another's within this process.
 ///
 /// Paired with the pid so two *processes* — the desktop app and `monkey` — do
 /// not collide either. See [`write_log`] for the failure this prevents.
 static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REVISION_REWRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn append_line(
     root: &Path,
