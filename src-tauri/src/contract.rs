@@ -1278,7 +1278,7 @@ mod tests {
         let error = check_against_baseline(&serde_json::to_string(&published).unwrap())
             .expect_err("losing a tool without a major bump must fail");
         assert!(error.contains("tool removed: invented_tool"), "{error}");
-        assert!(error.contains("requires at least 2.0.0"), "{error}");
+        assert!(error.contains("requires at least 3.0.0"), "{error}");
     }
 
     #[test]
