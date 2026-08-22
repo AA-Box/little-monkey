@@ -189,7 +189,11 @@ fn find_profile_element<'a>(inspection: &'a ComputerInspection) -> Option<&'a Co
                 role.contains("edit") || role.contains("textfield") || role.contains("text field");
             let editable_action = element.actions.iter().any(|action| action == "set_value");
             let stable_profile_id = element.id.to_ascii_lowercase().contains("profileinput");
-            if !editable_role && !editable_action && !stable_profile_id {
+            let profile_value = matches!(
+                element.value.as_deref(),
+                Some("Test profile") | Some("hello")
+            );
+            if !editable_role && !editable_action && !stable_profile_id && !profile_value {
                 return None;
             }
             let mut score = 0;
@@ -199,10 +203,7 @@ fn find_profile_element<'a>(inspection: &'a ComputerInspection) -> Option<&'a Co
             if stable_profile_id {
                 score += 90;
             }
-            if matches!(
-                element.value.as_deref(),
-                Some("Test profile") | Some("hello")
-            ) {
+            if profile_value {
                 score += 80;
             }
             if editable_role {
