@@ -211,6 +211,38 @@ pub struct ComputerElement {
     #[serde(deserialize_with = "deserialize_vec_or_singleton")]
     pub actions: Vec<String>,
     pub sensitive: bool,
+    /// The provider-resolved control that will actually receive a semantic
+    /// action. Windows UIA can expose a child node with an ancestor's pattern;
+    /// approval, execution, and verification must bind to the same node.
+    #[serde(default)]
+    pub effective_action: Option<EffectiveActionTarget>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EffectiveActionTarget {
+    pub id: String,
+    pub role: String,
+    pub label: String,
+    pub bounds: ComputerBounds,
+    pub enabled: bool,
+    pub sensitive: bool,
+    #[serde(default)]
+    pub actions: Vec<String>,
+}
+
+impl EffectiveActionTarget {
+    fn from_element(element: &ComputerElement) -> Self {
+        Self {
+            id: element.id.clone(),
+            role: element.role.clone(),
+            label: element.label.clone(),
+            bounds: element.bounds.clone(),
+            enabled: element.enabled,
+            sensitive: element.sensitive,
+            actions: element.actions.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1155,7 +1187,25 @@ fn bounded_elements(
         }) {
             continue;
         }
-        if element.sensitive || sensitive_text(&format!("{} {}", element.role, element.label)) {
+        let effective = element
+            .effective_action
+            .as_ref()
+            .map(|value| EffectiveActionTarget {
+                id: value.id.clone(),
+                role: value.role.clone(),
+                label: value.label.clone(),
+                bounds: value.bounds.clone(),
+                enabled: value.enabled,
+                sensitive: value.sensitive,
+                actions: value.actions.clone(),
+            });
+        if element.sensitive
+            || effective.as_ref().is_some_and(|value| value.sensitive)
+            || sensitive_text(&format!("{} {}", element.role, element.label))
+            || effective
+                .as_ref()
+                .is_some_and(|value| sensitive_text(&format!("{} {}", value.role, value.label)))
+        {
             sensitive_element_count += 1;
             continue;
         }
@@ -1339,16 +1389,38 @@ public static class LMWindow { [DllImport("user32.dll")] public static extern bo
         double: bool,
     ) -> Result<(), String> {
         let element = find_element(target, element_id)?;
-        if element.sensitive || sensitive_text(&format!("{} {}", element.role, element.label)) {
+        let effective = element
+            .effective_action
+            .clone()
+            .unwrap_or_else(|| EffectiveActionTarget::from_element(&element));
+        if element.sensitive
+            || effective.sensitive
+            || sensitive_text(&format!("{} {}", element.role, element.label))
+            || sensitive_text(&format!("{} {}", effective.role, effective.label))
+        {
             return Err("Sensitive accessibility elements are blocked".to_string());
+        }
+        if !effective.enabled {
+            return Err("Disabled accessibility elements cannot be activated".to_string());
         }
         if button == MouseButtonKind::Left {
             let action = if double { "double_click" } else { "click" };
-            if native_semantic_action(target, element_id, action, None)? {
+            if native_semantic_action(target, &effective.id, action, None)? {
                 return Ok(());
             }
         }
-        let (x, y) = element_center(&element)?;
+        let (x, y) = element_center(&ComputerElement {
+            id: effective.id.clone(),
+            role: effective.role.clone(),
+            label: effective.label.clone(),
+            value: None,
+            bounds: effective.bounds.clone(),
+            enabled: effective.enabled,
+            focused: false,
+            actions: effective.actions.clone(),
+            sensitive: effective.sensitive,
+            effective_action: None,
+        })?;
         self.input.move_mouse(x, y)?;
         if double {
             self.input.double_click(button)
@@ -1370,14 +1442,36 @@ public static class LMWindow { [DllImport("user32.dll")] public static extern bo
             );
         }
         let element = find_element(target, element_id)?;
-        if element.sensitive || sensitive_text(&format!("{} {}", element.role, element.label)) {
+        let effective = element
+            .effective_action
+            .clone()
+            .unwrap_or_else(|| EffectiveActionTarget::from_element(&element));
+        if element.sensitive
+            || effective.sensitive
+            || sensitive_text(&format!("{} {}", element.role, element.label))
+            || sensitive_text(&format!("{} {}", effective.role, effective.label))
+        {
             return Err("Sensitive accessibility elements are blocked".to_string());
         }
+        if !effective.enabled {
+            return Err("Disabled accessibility elements cannot be edited".to_string());
+        }
         let semantic_action = if select { "select" } else { "set_value" };
-        if native_semantic_action(target, element_id, semantic_action, Some(value))? {
+        if native_semantic_action(target, &effective.id, semantic_action, Some(value))? {
             return Ok(());
         }
-        let (x, y) = element_center(&element)?;
+        let (x, y) = element_center(&ComputerElement {
+            id: effective.id.clone(),
+            role: effective.role.clone(),
+            label: effective.label.clone(),
+            value: None,
+            bounds: effective.bounds.clone(),
+            enabled: effective.enabled,
+            focused: false,
+            actions: effective.actions.clone(),
+            sensitive: effective.sensitive,
+            effective_action: None,
+        })?;
         self.input.move_mouse(x, y)?;
         self.input.click(MouseButtonKind::Left)?;
         if select {
@@ -1624,13 +1718,43 @@ function ActionsOf($e) {
   }
   return @($a | Select-Object -Unique)
 }
+function StableOf($e,$targetId,$elementIndex) {
+  $automation=[string]$e.Current.AutomationId
+  if([string]::IsNullOrWhiteSpace($automation)){try{$automation=($e.GetRuntimeId() -join '-')}catch{$automation=''}}
+  $stable=($automation -replace '[^A-Za-z0-9._-]','_')
+  return "$targetId::element-$elementIndex::native-$stable"
+}
+function ActionTargetOf($e) {
+  $current=$e
+  for($k=0;$k -lt 5;$k++) {
+    try { $current.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern) | Out-Null; return $current } catch {}
+    try { $current.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern) | Out-Null; return $current } catch {}
+    try { $current.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern) | Out-Null; return $current } catch {}
+    try { $current.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern) | Out-Null; return $current } catch {}
+    try { $current.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern) | Out-Null; return $current } catch {}
+    $current=ParentOf $current
+    if($null -eq $current){break}
+  }
+  return $null
+}
+function ActionTargetRecord($e,$targetId,$elementIndex) {
+  $actionTarget=ActionTargetOf $e
+  if($null -eq $actionTarget){return $null}
+  $role=[string]$actionTarget.Current.ControlType.ProgrammaticName
+  $label=[string]$actionTarget.Current.Name
+  $help=[string]$actionTarget.Current.HelpText
+  $context="$role $label $help $([string]$actionTarget.Current.AutomationId) $(AncestorText $actionTarget)"
+  $enabled=[bool]$actionTarget.Current.IsEnabled
+  try { $legacy=$actionTarget.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern).Current; if(([int]$legacy.State -band 1) -ne 0){$enabled=$false} } catch {}
+  [ordered]@{id=(StableOf $actionTarget $targetId $elementIndex);role=$role;label=$label;bounds=(RectOf $actionTarget.Current.BoundingRectangle);enabled=$enabled;sensitive=([bool]$actionTarget.Current.IsPassword -or ($context -match 'password|credential|secret'));actions=@(ActionsOf $actionTarget)}
+}
 function RectOf($rect) { $x=0.0;$y=0.0;$width=0.0;$height=0.0;try{$x=[double]$rect.X;$y=[double]$rect.Y;$width=[double]$rect.Width;$height=[double]$rect.Height}catch{};foreach($key in @('x','y','width','height')){ $value=Get-Variable $key -ValueOnly; if([double]::IsNaN($value) -or [double]::IsInfinity($value)){Set-Variable $key 0.0} };[ordered]@{x=$x;y=$y;width=$width;height=$height} }
 function AncestorText($e) { $parts=@();$current=$e;for($k=0;$k -lt 8;$k++){try{$current=$walker.GetParent($current);if($null -eq $current){break};$parts+=[string]$current.Current.Name}catch{break}};return ($parts -join ' ') }
 for($i=0;$i -lt $windows.Count -and $i -lt 64;$i++){
   $w=$windows.Item($i);$p=$w.Current.ProcessId;$id=if($fixtureFallback){"process:$onlyPid"}else{"process:$p"};$name=[string]$w.Current.Name;$windowId=[string]$w.Current.NativeWindowHandle;$targetId="$id::window-$i";
   $focused=([LMComputerUseDpi]::GetForegroundWindow() -eq [IntPtr]::new([int64]$windowId));if(-not $focused){try{$focused=[bool]$w.Current.IsKeyboardFocusWithin}catch{try{$focused=[bool]$w.Current.HasKeyboardFocus}catch{}}};$t=[ordered]@{targetId=$targetId;applicationId=$id;applicationName=$name;windowId=$windowId;windowTitle=$name;bounds=(RectOf $w.Current.BoundingRectangle);focused=$focused;sensitive=($name -match 'UAC|Windows Security|credential|password');supportedActions=@('inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot')};$targets+=$t;$list=@();$desc=$w.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition);
   for($j=0;$j -lt $desc.Count -and $j -lt 256;$j++){
-    $e=$desc.Item($j);$label=[string]$e.Current.Name;$help=[string]$e.Current.HelpText;$role=[string]$e.Current.ControlType.ProgrammaticName;$automation=[string]$e.Current.AutomationId;if([string]::IsNullOrWhiteSpace($automation)){try{$automation=($e.GetRuntimeId() -join '-')}catch{$automation=''}};$stable=($automation -replace '[^A-Za-z0-9._-]','_');$value=ValueOf $e;if($null -ne $value){$value=[string]$value};$actions=@(ActionsOf $e);$context="$role $label $help $automation $(AncestorText $e)";$enabled=([bool]$e.Current.IsEnabled);try{$legacy=$e.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern).Current;if(([int]$legacy.State -band 1) -ne 0){$enabled=$false}}catch{};$list+=[ordered]@{id="$targetId::element-$j::native-$stable";role=$role;label=$label;value=$value;bounds=(RectOf $e.Current.BoundingRectangle);enabled=$enabled;focused=([bool]$e.Current.HasKeyboardFocus);actions=$actions;sensitive=([bool]$e.Current.IsPassword -or ($context -match 'password|credential|secret'))};
+    $e=$desc.Item($j);$label=[string]$e.Current.Name;$help=[string]$e.Current.HelpText;$role=[string]$e.Current.ControlType.ProgrammaticName;$automation=[string]$e.Current.AutomationId;if([string]::IsNullOrWhiteSpace($automation)){try{$automation=($e.GetRuntimeId() -join '-')}catch{$automation=''}};$stable=($automation -replace '[^A-Za-z0-9._-]','_');$value=ValueOf $e;if($null -ne $value){$value=[string]$value};$actions=@(ActionsOf $e);$effective=ActionTargetRecord $e $targetId $j;$context="$role $label $help $automation $(AncestorText $e)";$enabled=([bool]$e.Current.IsEnabled);try{$legacy=$e.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern).Current;if(([int]$legacy.State -band 1) -ne 0){$enabled=$false}}catch{};$list+=[ordered]@{id="$targetId::element-$j::native-$stable";role=$role;label=$label;value=$value;bounds=(RectOf $e.Current.BoundingRectangle);enabled=$enabled;focused=([bool]$e.Current.HasKeyboardFocus);actions=$actions;effectiveAction=$effective;sensitive=([bool]$e.Current.IsPassword -or ($context -match 'password|credential|secret'))};
   }
   $elements[$targetId]=@($list)
 }
@@ -2997,6 +3121,7 @@ impl DesktopControlState {
             _ => None,
         };
         let mut element_unverified = false;
+        let mut effective_element_blocked = false;
         if let Some(element_id) = element_id {
             if let Ok(inspection) =
                 self.semantic
@@ -3007,15 +3132,27 @@ impl DesktopControlState {
                     .iter()
                     .find(|element| element.id == element_id)
                 {
+                    let effective = element
+                        .effective_action
+                        .clone()
+                        .unwrap_or_else(|| EffectiveActionTarget::from_element(element));
                     description.push_str(&format!(
-                        " role={} label={}",
-                        element.role,
-                        if element.label.is_empty() {
+                        " effective_id={} role={} label={} enabled={} sensitive={} actions={:?}",
+                        effective.id,
+                        effective.role,
+                        if effective.label.is_empty() {
                             "(unlabelled)"
                         } else {
-                            &element.label
-                        }
+                            &effective.label
+                        },
+                        effective.enabled,
+                        effective.sensitive,
+                        effective.actions,
                     ));
+                    if effective.sensitive || !effective.enabled {
+                        effective_element_blocked = true;
+                        description.push_str(" risk=blocked");
+                    }
                 } else {
                     element_unverified = true;
                 }
@@ -3024,7 +3161,7 @@ impl DesktopControlState {
             }
         }
         let level = if element_id.is_some() {
-            if element_unverified {
+            if element_unverified || effective_element_blocked {
                 ApprovalLevel::Critical
             } else {
                 approval_level_for_name(&description)
@@ -4487,6 +4624,125 @@ pub fn desktop_control_emergency_stop(
 mod tests {
     use super::*;
 
+    struct EffectiveActionTestBackend {
+        effective_label: std::sync::Arc<std::sync::Mutex<String>>,
+    }
+
+    impl EffectiveActionTestBackend {
+        fn target() -> ComputerTarget {
+            ComputerTarget {
+                target_id: "Notes::window-0".to_string(),
+                application_id: "Notes".to_string(),
+                application_name: "Notes".to_string(),
+                window_id: "Notes::window-0".to_string(),
+                provider_window_id: None,
+                window_title: "Notes".to_string(),
+                bounds: ComputerBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 400.0,
+                    height: 300.0,
+                },
+                focused: true,
+                sensitive: false,
+                supported_actions: vec!["inspect".to_string(), "click".to_string()],
+            }
+        }
+    }
+
+    impl DesktopSemanticBackend for EffectiveActionTestBackend {
+        fn list_targets(&self) -> Result<Vec<ComputerTarget>, String> {
+            Ok(vec![Self::target()])
+        }
+
+        fn inspect(
+            &self,
+            _application_id: &str,
+            _window_id: Option<&str>,
+            query: Option<&str>,
+        ) -> Result<ComputerInspection, String> {
+            let label = self.effective_label.lock().unwrap().clone();
+            let element = ComputerElement {
+                id: "Notes::window-0::element-1::native-child".to_string(),
+                role: "Text".to_string(),
+                label: "safe child label".to_string(),
+                value: None,
+                bounds: ComputerBounds {
+                    x: 10.0,
+                    y: 10.0,
+                    width: 100.0,
+                    height: 30.0,
+                },
+                enabled: true,
+                focused: false,
+                actions: vec!["click".to_string()],
+                sensitive: false,
+                effective_action: Some(EffectiveActionTarget {
+                    id: "Notes::window-0::element-1::native-parent".to_string(),
+                    role: "Button".to_string(),
+                    label,
+                    bounds: ComputerBounds {
+                        x: 10.0,
+                        y: 10.0,
+                        width: 100.0,
+                        height: 30.0,
+                    },
+                    enabled: true,
+                    sensitive: false,
+                    actions: vec!["click".to_string()],
+                }),
+            };
+            Ok(ComputerInspection {
+                target: Self::target(),
+                elements: vec![element],
+                truncated: false,
+                sensitive_element_count: 0,
+                query: query.map(str::to_string),
+            })
+        }
+
+        fn verify_target(
+            &self,
+            _application_id: &str,
+            _window_id: Option<&str>,
+            _require_frontmost: bool,
+        ) -> Result<ComputerTarget, String> {
+            Ok(Self::target())
+        }
+
+        fn focus(&self, _target: &ComputerTarget) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn click_element(
+            &self,
+            _target: &ComputerTarget,
+            _element_id: &str,
+            _button: MouseButtonKind,
+            _double: bool,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn set_value(
+            &self,
+            _target: &ComputerTarget,
+            _element_id: &str,
+            _value: &str,
+            _select: bool,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn screenshot(
+            &self,
+            target: &ComputerTarget,
+            bounds: Option<ComputerBounds>,
+        ) -> Result<(Vec<u8>, ComputerBounds), String> {
+            Ok((Vec::new(), bounds.unwrap_or_else(|| target.bounds.clone())))
+        }
+    }
+
     fn state() -> DesktopControlState {
         DesktopControlState::with_backend(Arc::new(NullBackend))
     }
@@ -4641,6 +4897,40 @@ mod tests {
             "Delete",
         );
         assert_ne!(first, changed_label);
+    }
+
+    #[test]
+    fn effective_action_semantics_are_included_in_approval_and_invalidate_on_change() {
+        let effective_label = std::sync::Arc::new(std::sync::Mutex::new("Save".to_string()));
+        let state = DesktopControlState::with_backends_and_lock(
+            Arc::new(NullBackend),
+            Arc::new(EffectiveActionTestBackend {
+                effective_label: effective_label.clone(),
+            }),
+            None,
+        );
+        let session = state
+            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
+            .unwrap();
+        let action = ControlAction::SemanticClick {
+            element_id: "Notes::window-0::element-1::native-child".to_string(),
+            button: MouseButtonKind::Left,
+            expected_value: None,
+        };
+        let (level, description) = state.action_approval("Notes", Some("Notes::window-0"), &action);
+        assert_eq!(level, ApprovalLevel::High);
+        assert!(description.contains("effective_id=Notes::window-0::element-1::native-parent"));
+        assert!(description.contains("label=Save"));
+
+        let ActionGate::Pending { action_id, .. } = state
+            .begin_action(&session.session_id, "Notes", action.clone())
+            .unwrap()
+        else {
+            panic!("per-action approval must create a pending action");
+        };
+        *effective_label.lock().unwrap() = "Delete".to_string();
+        let error = state.finish_pending(&action_id, &action, true).unwrap_err();
+        assert!(error.contains("approval was invalidated"));
     }
 
     #[test]

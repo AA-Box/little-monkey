@@ -291,6 +291,140 @@ describe("executeToolCall / programmatic dispatcher integration", () => {
       "tool_computer_inspect",
     ]);
   });
+
+  it("re-observes and retries a native provider failure before input is sent", async () => {
+    let clickAttempts = 0;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "tool_computer_list_targets") return JSON.stringify({ targets: [{ window_id: "w-1" }] });
+      if (command === "tool_computer_inspect") return JSON.stringify({ elements: [] });
+      if (command === "tool_computer_click") {
+        clickAttempts += 1;
+        if (clickAttempts === 1) throw new Error("transient provider failure");
+        return JSON.stringify({ executed: true, inputSent: true, stateVerified: true });
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const result = await executeToolCall(
+      call("computer_click", {
+        session_id: "desktop-session",
+        target_application_id: "Notes",
+        target_window_id: "w-1",
+        element_id: "Notes::element-1::native-button",
+      }),
+      null,
+      "turn-native-retry",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { computerUseBudget: new ComputerUseRunBudget() },
+    );
+
+    expect(JSON.parse(result)).toMatchObject({ executed: true, stateVerified: true });
+    expect(clickAttempts).toBe(2);
+    expect(invokeMock.mock.calls.map(([command]) => command)).toEqual([
+      "tool_computer_list_targets",
+      "tool_computer_click",
+      "tool_computer_inspect",
+      "tool_computer_list_targets",
+      "tool_computer_click",
+      "tool_computer_inspect",
+    ]);
+  });
+
+  it("returns input-sent verification failure without retrying the native action", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "tool_computer_list_targets") return JSON.stringify({ targets: [{ window_id: "w-1" }] });
+      if (command === "tool_computer_inspect") return JSON.stringify({ elements: [] });
+      if (command === "tool_computer_click") return JSON.stringify({ executed: true, inputSent: true, stateVerified: false });
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const result = await executeToolCall(
+      call("computer_click", {
+        session_id: "desktop-session",
+        target_application_id: "Notes",
+        target_window_id: "w-1",
+        element_id: "Notes::element-1::native-button",
+      }),
+      null,
+      "turn-native-no-duplicate",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { computerUseBudget: new ComputerUseRunBudget() },
+    );
+
+    expect(JSON.parse(result).error).toMatch(/INPUT_SENT_UNVERIFIED/);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "tool_computer_click")).toHaveLength(1);
+  });
+
+  it("runs one mixed browser-to-native golden task through the canonical dispatcher", async () => {
+    const trace: string[] = [];
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "tool_browser_inspect") {
+        trace.push("browser:inspect");
+        return JSON.stringify({ url: "https://example.test", dom: { save: "button" } });
+      }
+      if (command === "tool_computer_list_targets") {
+        trace.push("native:list_targets");
+        return JSON.stringify({ targets: [{ window_id: "w-1" }] });
+      }
+      if (command === "tool_computer_inspect") {
+        trace.push("native:inspect");
+        return JSON.stringify({ elements: [{ label: "Save profile" }] });
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const browserResult = await executeToolCall(
+      call("browser_inspect", { url: "https://example.test" }),
+      null,
+      "turn-mixed-golden",
+      emptyMcpRegistry,
+    );
+    const nativeResult = await executeToolCall(
+      call("computer_inspect", {
+        session_id: "desktop-session",
+        target_application_id: "Notes",
+        target_window_id: "w-1",
+      }),
+      null,
+      "turn-mixed-golden",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { computerUseBudget: new ComputerUseRunBudget() },
+    );
+
+    expect(JSON.parse(browserResult)).toMatchObject({ url: "https://example.test" });
+    expect(JSON.parse(nativeResult)).toMatchObject({ elements: [{ label: "Save profile" }] });
+    expect(trace).toEqual(["browser:inspect", "native:list_targets", "native:inspect", "native:inspect"]);
+  });
 });
 
 describe("executeToolCall / present_plan", () => {

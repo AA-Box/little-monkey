@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use little_monkey_lib::desktop_control::{
     ActionGate, ApprovalPolicy, ComputerElement, ComputerInspection, ComputerTarget, ControlAction,
-    DesktopControlState, MouseButtonKind, SessionGrantOptions,
+    ControlSession, DesktopControlState, MouseButtonKind, SessionGrantOptions,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -357,6 +357,147 @@ fn write_trace(path: &str, trace: serde_json::Value) -> Result<(), String> {
     .map_err(|error| format!("could not write trace: {error}"))
 }
 
+struct GoldenToolCall {
+    name: &'static str,
+    arguments: serde_json::Value,
+    action: Option<ControlAction>,
+}
+
+/// Deterministic model adapter used by the real-OS golden path. It consumes
+/// the bounded inspection returned by the production backend, emits the same
+/// tool names/arguments the frontend model is allowed to emit, and advances
+/// only from the observed result. Keeping this adapter offline makes CI
+/// reproducible while still exercising one complete model-tool-result loop.
+struct GoldenModel {
+    step: usize,
+}
+
+impl GoldenModel {
+    fn next(&mut self, inspection: &ComputerInspection) -> Result<Option<GoldenToolCall>, String> {
+        let call = match self.step {
+            0 => {
+                let element = find_toggle_element(inspection, "Dark mode")
+                    .ok_or_else(|| "golden model could not ground Dark mode".to_string())?;
+                GoldenToolCall {
+                    name: "computer_click",
+                    arguments: json!({"element_id": element.id, "button": "left"}),
+                    action: Some(ControlAction::SemanticClick {
+                        element_id: element.id.clone(),
+                        button: MouseButtonKind::Left,
+                        expected_value: None,
+                    }),
+                }
+            }
+            1 => {
+                let element = find_profile_element(inspection)
+                    .ok_or_else(|| "golden model could not ground Profile name".to_string())?;
+                GoldenToolCall {
+                    name: "computer_set_value",
+                    arguments: json!({"element_id": element.id, "value": "[fixture-value-redacted]"}),
+                    action: Some(ControlAction::SetValue {
+                        element_id: element.id.clone(),
+                        value: "hello".to_string(),
+                    }),
+                }
+            }
+            2 => {
+                let element = find_element(inspection, "Save profile")
+                    .ok_or_else(|| "golden model could not ground Save profile".to_string())?;
+                GoldenToolCall {
+                    name: "computer_click",
+                    arguments: json!({"element_id": element.id, "button": "left"}),
+                    action: Some(ControlAction::SemanticClick {
+                        element_id: element.id.clone(),
+                        button: MouseButtonKind::Left,
+                        expected_value: None,
+                    }),
+                }
+            }
+            3 => {
+                let element = find_element(inspection, "Add dynamic item")
+                    .ok_or_else(|| "golden model could not ground Add dynamic item".to_string())?;
+                GoldenToolCall {
+                    name: "computer_click",
+                    arguments: json!({"element_id": element.id, "button": "left"}),
+                    action: Some(ControlAction::SemanticClick {
+                        element_id: element.id.clone(),
+                        button: MouseButtonKind::Left,
+                        expected_value: None,
+                    }),
+                }
+            }
+            4 => GoldenToolCall {
+                name: "computer_screenshot",
+                arguments: json!({}),
+                action: None,
+            },
+            _ => return Ok(None),
+        };
+        self.step += 1;
+        Ok(Some(call))
+    }
+}
+
+fn model_facing_golden_flow(
+    state: &DesktopControlState,
+    session: &ControlSession,
+    target: &ComputerTarget,
+    screenshot_path: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let targets = state.list_targets_for_session(&session.session_id)?;
+    let mut trace = vec![json!({
+        "name": "computer_list_targets",
+        "result": {"target_count": targets.len()}
+    })];
+    let mut inspection = inspect(state, &session.session_id, target)?;
+    trace.push(json!({
+        "name": "computer_inspect",
+        "result": {"element_count": inspection.elements.len()}
+    }));
+    let mut model = GoldenModel { step: 0 };
+    while let Some(call) = model.next(&inspection)? {
+        trace.push(json!({"name": call.name, "arguments": call.arguments}));
+        if let Some(action) = call.action {
+            focus_fixture_for_native_actions(state, &session.session_id, target)?;
+            run_action(state, &session.session_id, target, action)?;
+            inspection = inspect(state, &session.session_id, target)?;
+            trace.push(json!({
+                "name": "computer_inspect",
+                "result": {"element_count": inspection.elements.len()}
+            }));
+            if model.step == 1 {
+                inspection = inspect_until_dark_state(state, &session.session_id, target, true)?;
+            }
+        } else {
+            let (_, screenshot, _) = state.screenshot_for_session(
+                &session.session_id,
+                &target.application_id,
+                Some(&target.window_id),
+                None,
+            )?;
+            std::fs::write(screenshot_path, &screenshot)
+                .map_err(|error| format!("could not write screenshot: {error}"))?;
+            trace.push(json!({
+                "name": "computer_screenshot",
+                "result": {"sha256": digest(&screenshot), "size_bytes": screenshot.len()}
+            }));
+        }
+    }
+    if find_profile_element(&inspection).and_then(|element| element.value.as_deref())
+        != Some("hello")
+    {
+        return Err("model-facing golden profile postcondition failed".to_string());
+    }
+    if !inspection
+        .elements
+        .iter()
+        .any(|element| element.label == "Saved" || element.value.as_deref() == Some("Saved"))
+    {
+        return Err("model-facing golden save postcondition failed".to_string());
+    }
+    Ok(trace)
+}
+
 fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), String> {
     let profile = std::env::temp_dir().join("little-monkey-testapp-profile.json");
     let _ = std::fs::remove_file(&profile);
@@ -453,83 +594,8 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
                 "production provider did not expose secure and disabled controls".to_string(),
             );
         }
-        let dark = find_toggle_element(&first, "Dark mode")
-            .ok_or_else(|| "Dark mode control was not found".to_string())?;
-        let profile_input = find_profile_element(&first)
-            .ok_or_else(|| "Profile input was not found".to_string())?;
-        let save = find_element(&first, "Save profile")
-            .ok_or_else(|| "Save control was not found".to_string())?;
-        let dynamic = find_element(&first, "Add dynamic item")
-            .ok_or_else(|| "Dynamic control was not found".to_string())?;
-        let dark_id = dark.id.clone();
-        let profile_id = profile_input.id.clone();
-        let save_id = save.id.clone();
-        let dynamic_id = dynamic.id.clone();
-        focus_fixture_for_native_actions(&state, &session.session_id, &target)?;
-        run_action(
-            &state,
-            &session.session_id,
-            &target,
-            ControlAction::SemanticClick {
-                element_id: dark_id,
-                button: MouseButtonKind::Left,
-                expected_value: None,
-            },
-        )?;
-        let _after_dark = inspect_until_dark_state(&state, &session.session_id, &target, true)?;
-        focus_fixture_for_native_actions(&state, &session.session_id, &target)?;
-        run_action(
-            &state,
-            &session.session_id,
-            &target,
-            ControlAction::SetValue {
-                element_id: profile_id,
-                value: "hello".to_string(),
-            },
-        )?;
-        let after_value = inspect(&state, &session.session_id, &target)?;
-        if find_profile_element(&after_value).and_then(|element| element.value.as_deref())
-            != Some("hello")
-        {
-            return Err("profile value postcondition failed".to_string());
-        }
-        focus_fixture_for_native_actions(&state, &session.session_id, &target)?;
-        run_action(
-            &state,
-            &session.session_id,
-            &target,
-            ControlAction::SemanticClick {
-                element_id: save_id,
-                button: MouseButtonKind::Left,
-                expected_value: None,
-            },
-        )?;
-        let saved = inspect(&state, &session.session_id, &target)?
-            .elements
-            .iter()
-            .any(|element| element.label == "Saved" || element.value.as_deref() == Some("Saved"));
-        if !saved {
-            return Err("save postcondition failed".to_string());
-        }
-        focus_fixture_for_native_actions(&state, &session.session_id, &target)?;
-        run_action(
-            &state,
-            &session.session_id,
-            &target,
-            ControlAction::SemanticClick {
-                element_id: dynamic_id,
-                button: MouseButtonKind::Left,
-                expected_value: None,
-            },
-        )?;
-        let (_, screenshot, _) = state.screenshot_for_session(
-            &session.session_id,
-            &target.application_id,
-            Some(&target.window_id),
-            None,
-        )?;
-        std::fs::write(screenshot_path, &screenshot)
-            .map_err(|error| format!("could not write screenshot: {error}"))?;
+        let model_trace = model_facing_golden_flow(&state, &session, &target, screenshot_path)?;
+        let saved = true;
         state.stop_session(&session.session_id)?;
         stop(&mut child);
         child = launch(fixture)?;
@@ -593,6 +659,7 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
             json!({
                 "native_desktop_actions_executed": true,
                 "driver": {"kind": "little-monkey-production-backend", "pid": pid, "window_id": target.window_id, "provider": provider_name()},
+                "model_loop": {"kind": "deterministic-model-tool-loop", "completed": true, "tool_calls": model_trace},
                 "actions": ["list_targets", "inspect", "semantic_toggle", "semantic_set_value", "semantic_invoke_save", "dynamic_control", "screenshot", "restart", "persisted_state"],
                 "negative_cases": {"secure_field_detected_and_not_typed": secure, "disabled_control_not_mutated": disabled, "second_same_app_window_rejected": second_window_rejected, "prompt_injection_widened_grant": false},
                 "postconditions": {"dark_mode": dark_persisted, "profile": profile_persisted, "saved": saved, "screenshot_artifact_id": digest(&screenshot_bytes), "redacted_audit_id": "production-audit-verified"},

@@ -19,7 +19,9 @@ export interface CoordinationHooks<T> {
 export const COMPUTER_USE_BUDGET_DEFAULTS = {
   maxActions: 50,
   maxScreenshots: 12,
-  maxRetries: 5,
+  // A native action may be retried once only after a pre-input/provider
+  // failure. Retrying an action that may already have sent input is refused.
+  maxRetries: 1,
   maxModelCalls: 20,
   deadlineMs: 15 * 60 * 1000,
 } as const;
@@ -43,7 +45,8 @@ export class ComputerUseRunBudget {
     retries: 0,
     model_calls: 0,
   };
-  private readonly deadline: number;
+  private deadline: number | null = null;
+  private active = false;
 
   constructor(options: ComputerUseRunBudgetOptions = {}) {
     const configured = { ...COMPUTER_USE_BUDGET_DEFAULTS, ...options };
@@ -53,11 +56,23 @@ export class ComputerUseRunBudget {
       retries: configured.maxRetries,
       model_calls: configured.maxModelCalls,
     };
-    this.deadline = Date.now() + configured.deadlineMs;
+    this.deadlineMs = configured.deadlineMs;
+  }
+
+  private readonly deadlineMs: number;
+
+  /** Start the Computer Use ceiling only when a native operation is entered. */
+  activate(): void {
+    if (!this.active) {
+      this.active = true;
+      this.deadline = Date.now() + this.deadlineMs;
+    }
   }
 
   consume(counter: ComputerUseBudgetCounter): boolean {
-    if (Date.now() >= this.deadline || this.used[counter] >= this.limits[counter]) return false;
+    if (counter !== 'model_calls') this.activate();
+    if (counter === 'model_calls' && !this.active) return true;
+    if ((this.deadline !== null && Date.now() >= this.deadline) || this.used[counter] >= this.limits[counter]) return false;
     this.used[counter] += 1;
     return true;
   }
@@ -131,7 +146,7 @@ export function coordinateToolInvocation(
   return {
     route,
     phases: ['observe', 'decide', 'authorize', 'execute', 'verify'],
-    maxAttempts: 1,
+    maxAttempts: route === 'native' ? 2 : 1,
   };
 }
 
@@ -152,14 +167,18 @@ export async function runCoordinatedInvocation<T>(
     if (attempt > 1 && hooks.budget && !hooks.budget.consume('retries')) {
       throw new Error('COMPUTER_USE_BUDGET_EXCEEDED: retry limit reached');
     }
-    for (const phase of decision.phases) {
-      if (phase === 'execute') {
-        result = await hooks.execute(attempt);
-      } else {
-        await hooks.onPhase?.(phase, attempt);
+    try {
+      for (const phase of decision.phases) {
+        if (phase === 'execute') {
+          result = await hooks.execute(attempt);
+        } else {
+          await hooks.onPhase?.(phase, attempt);
+        }
       }
+      if (!hooks.verify || await hooks.verify(result, attempt)) return result;
+    } catch (error) {
+      if (error instanceof CoordinatedInvocationError || attempt >= attempts) throw error;
     }
-    if (!hooks.verify || await hooks.verify(result, attempt)) return result;
   }
   throw new CoordinatedInvocationError();
 }

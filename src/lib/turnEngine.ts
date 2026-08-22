@@ -51,7 +51,7 @@ import { protocolToolCallId } from './durableRun';
 import { formatSkillSearchResults, formatSkillToolResult, type SkillRankingSignals, type SlashSkill } from './skills';
 import { rasterizeSvgToPng, type RasterizedPng } from './imageGeneration';
 import { errorMessage } from "./errors";
-import { ComputerUseRunBudget, coordinateToolInvocation, runCoordinatedInvocation } from './taskCoordinator';
+import { ComputerUseRunBudget, CoordinatedInvocationError, coordinateToolInvocation, runCoordinatedInvocation } from './taskCoordinator';
 import {
   formatProgrammaticExecutionResult,
   PROGRAMMATIC_TOOL_NAME,
@@ -1342,9 +1342,23 @@ async function executeToolCallInner(
     verify: (result) => {
       if (coordination.route !== 'native' || typeof result !== 'string') return true;
       try {
-        const parsed = JSON.parse(result) as { executed?: boolean; stateVerified?: boolean };
+        const parsed = JSON.parse(result) as {
+          error?: unknown;
+          executed?: boolean;
+          inputSent?: boolean;
+          stateVerified?: boolean;
+        };
+        if (parsed.executed === true && parsed.stateVerified === false && parsed.inputSent === true) {
+          throw new CoordinatedInvocationError();
+        }
+        if (typeof parsed.error === 'string' && parsed.error.length > 0) return false;
+        // A provider/target failure before input is sent is safe to recover
+        // once: the next attempt re-observes and re-authorizes the target.
         return parsed.executed !== true || parsed.stateVerified !== false;
-      } catch {
+      } catch (error) {
+        if (error instanceof CoordinatedInvocationError || result.includes('INPUT_SENT_UNVERIFIED')) {
+          throw new CoordinatedInvocationError();
+        }
         return true;
       }
     },

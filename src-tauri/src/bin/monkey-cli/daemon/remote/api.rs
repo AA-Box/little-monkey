@@ -377,6 +377,12 @@ impl RemoteApi {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_desktop(mut self, desktop: Arc<DesktopControlRuntime>) -> Self {
+        self.desktop = Some(desktop);
+        self
+    }
+
     /// Test builder: the injected API plus a fake chat queue, so the mobile
     /// chat contract is exercisable without a configured daemon.
     #[cfg(test)]
@@ -4377,6 +4383,8 @@ mod tests {
 
     use super::super::protocol::DeviceReadiness;
 
+    #[cfg(target_os = "windows")]
+    use little_monkey_lib::desktop_control::ControlAction;
     use little_monkey_lib::run_ledger::RunLedger;
     use little_monkey_lib::run_protocol::{
         ClientIdentity, ClientKind, ModelTargetSnapshot, PermissionMode as RunPermissionMode,
@@ -4808,6 +4816,310 @@ mod tests {
             body: body.to_vec(),
             auth: Some(auth),
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    struct RemoteWindowsE2EConsent;
+
+    #[cfg(target_os = "windows")]
+    impl crate::daemon::remote::desktop::ConsentPrompter for RemoteWindowsE2EConsent {
+        fn confirm_session(
+            &self,
+            _device_label: &str,
+        ) -> crate::daemon::remote::desktop::SessionConsent {
+            crate::daemon::remote::desktop::SessionConsent::AllowPerAction
+        }
+
+        fn confirm_action(&self, _device_label: &str, _description: &str) -> bool {
+            true
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires an interactive Windows desktop, the native fixture, and signed remote calls"]
+    fn signed_remote_windows_desktop_control_is_a_real_runner_golden_flow() {
+        assert_eq!(
+            std::env::var("COMPUTER_USE_REMOTE_WINDOWS_E2E").as_deref(),
+            Ok("1"),
+            "the ignored test must be explicitly enabled by the remote Windows CI job"
+        );
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("computer-use-test-app-windows.ps1");
+        let profile = std::env::temp_dir().join("little-monkey-testapp-profile.json");
+        let _ = std::fs::remove_file(&profile);
+        let mut child = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-STA",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&fixture)
+            .spawn()
+            .expect("Windows fixture must start");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        assert!(child.try_wait().expect("fixture status").is_none());
+        std::env::set_var("COMPUTER_USE_FIXTURE_PID", child.id().to_string());
+
+        let result = (|| -> Result<(), String> {
+            let actions = BTreeSet::from([RemoteAction::ControlDesktop]);
+            let (root, api, _secrets, device, secret) = fixture_scoped(actions, BTreeSet::new());
+            let paths = DaemonPaths::under(&root);
+            let state = Arc::new(
+                little_monkey_lib::desktop_control::DesktopControlState::production_with_lock(
+                    root.join("desktop_control.lock"),
+                ),
+            );
+            let runtime = DesktopControlRuntime::for_test(
+                state.clone(),
+                Arc::new(RemoteWindowsE2EConsent),
+                paths,
+            );
+            let api = api.with_desktop(runtime.clone());
+            let mut sequence = 1;
+            let mut call = |command: &str, method: &str, path: &str, body: Vec<u8>| {
+                let request = signed(&device, &secret, sequence, command, method, path, &body);
+                sequence += 1;
+                api.handle(request, 2_000)
+            };
+            let json = |response: ApiResponse| -> Result<serde_json::Value, String> {
+                if response.status >= 300 {
+                    return Err(format!(
+                        "signed remote request failed with {}: {}",
+                        response.status,
+                        String::from_utf8_lossy(&response.body)
+                    ));
+                }
+                serde_json::from_slice(&response.body).map_err(|error| error.to_string())
+            };
+            let start_body = serde_json::to_vec(&DesktopControlStartRequest {
+                allowlist: vec![format!("process:{}", child.id())],
+                batch_mode: false,
+                allowed_windows: Vec::new(),
+                lifetime_ms: Some(900_000),
+                allow_screenshots: Some(true),
+                allow_keyboard_input: Some(true),
+                allow_clipboard_read: Some(false),
+                approval_policy: Some(
+                    little_monkey_lib::desktop_control::ApprovalPolicy::PerAction,
+                ),
+            })
+            .map_err(|error| error.to_string())?;
+            let discovered = json(call(
+                "remote-start-discovery",
+                "POST",
+                "/v1/remote/desktop-control/start",
+                start_body.clone(),
+            ))?;
+            let discovery_session = discovered["session"]["sessionId"]
+                .as_str()
+                .ok_or_else(|| "signed remote start returned no session id".to_string())?
+                .to_string();
+            let list_body = serde_json::to_vec(&DesktopControlTargetRequest {
+                session_id: discovery_session.clone(),
+                target_application_id: None,
+                target_window_id: None,
+                query: None,
+                bounds: None,
+            })
+            .map_err(|error| error.to_string())?;
+            let listed = json(call(
+                "remote-list-discovery",
+                "POST",
+                "/v1/remote/desktop-control/list-targets",
+                list_body,
+            ))?;
+            let target = listed["targets"]
+                .as_array()
+                .and_then(|targets| {
+                    targets
+                        .iter()
+                        .find(|target| target["windowTitle"] == "Little Monkey TestApp")
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    "signed remote runner did not discover the fixture window".to_string()
+                })?;
+            let application_id = target["applicationId"].as_str().unwrap().to_string();
+            let window_id = target["windowId"].as_str().unwrap().to_string();
+            let stop_discovery = serde_json::to_vec(&DesktopControlStopRequest {
+                session_id: discovery_session,
+            })
+            .map_err(|error| error.to_string())?;
+            json(call(
+                "remote-stop-discovery",
+                "POST",
+                "/v1/remote/desktop-control/stop",
+                stop_discovery,
+            ))?;
+
+            let exact_start = serde_json::to_vec(&DesktopControlStartRequest {
+                allowlist: vec![application_id.clone()],
+                batch_mode: false,
+                allowed_windows: vec![window_id.clone()],
+                lifetime_ms: Some(900_000),
+                allow_screenshots: Some(true),
+                allow_keyboard_input: Some(true),
+                allow_clipboard_read: Some(false),
+                approval_policy: Some(
+                    little_monkey_lib::desktop_control::ApprovalPolicy::PerAction,
+                ),
+            })
+            .map_err(|error| error.to_string())?;
+            let started = json(call(
+                "remote-start-exact",
+                "POST",
+                "/v1/remote/desktop-control/start",
+                exact_start,
+            ))?;
+            let session_id = started["session"]["sessionId"]
+                .as_str()
+                .ok_or_else(|| "signed remote exact start returned no session id".to_string())?
+                .to_string();
+            let target_body = |session_id: &str| {
+                serde_json::to_vec(&DesktopControlTargetRequest {
+                    session_id: session_id.to_string(),
+                    target_application_id: Some(application_id.clone()),
+                    target_window_id: Some(window_id.clone()),
+                    query: None,
+                    bounds: None,
+                })
+                .unwrap()
+            };
+            let inspection = json(call(
+                "remote-inspect",
+                "POST",
+                "/v1/remote/desktop-control/inspect",
+                target_body(&session_id),
+            ))?;
+            let elements = inspection["inspection"]["elements"]
+                .as_array()
+                .ok_or_else(|| "signed remote inspection returned no elements".to_string())?;
+            let element_id = |label: &str, action: &str| {
+                elements.iter().find_map(|element| {
+                    (element["label"] == label
+                        && element["actions"].as_array().is_some_and(|actions| {
+                            actions.iter().any(|candidate| candidate == action)
+                        }))
+                    .then(|| element["id"].as_str().map(str::to_string))
+                    .flatten()
+                })
+            };
+            let dark_id = element_id("Dark mode", "click")
+                .ok_or_else(|| "signed remote inspection did not expose Dark mode".to_string())?;
+            let profile_id = element_id("Profile name", "set_value").ok_or_else(|| {
+                "signed remote inspection did not expose Profile name".to_string()
+            })?;
+            let save_id = element_id("Save profile", "click").ok_or_else(|| {
+                "signed remote inspection did not expose Save profile".to_string()
+            })?;
+            let action_body = |action: ControlAction| {
+                serde_json::to_vec(&DesktopControlActionRequest {
+                    session_id: session_id.clone(),
+                    target_application_id: application_id.clone(),
+                    target_window_id: Some(window_id.clone()),
+                    action,
+                })
+                .unwrap()
+            };
+            let mut action =
+                |command: &str, value: ControlAction| -> Result<serde_json::Value, String> {
+                    json(call(
+                        command,
+                        "POST",
+                        "/v1/remote/desktop-control/action",
+                        action_body(value),
+                    ))
+                };
+            action("remote-focus", ControlAction::Focus)?;
+            action(
+                "remote-toggle",
+                ControlAction::SemanticClick {
+                    element_id: dark_id,
+                    button: little_monkey_lib::desktop_control::MouseButtonKind::Left,
+                    expected_value: None,
+                },
+            )?;
+            action(
+                "remote-set-value",
+                ControlAction::SetValue {
+                    element_id: profile_id,
+                    value: "hello".to_string(),
+                },
+            )?;
+            action(
+                "remote-save",
+                ControlAction::SemanticClick {
+                    element_id: save_id,
+                    button: little_monkey_lib::desktop_control::MouseButtonKind::Left,
+                    expected_value: None,
+                },
+            )?;
+            let screenshot = json(call(
+                "remote-screenshot",
+                "POST",
+                "/v1/remote/desktop-control/screenshot",
+                target_body(&session_id),
+            ))?;
+            if screenshot["artifact_id"].as_str().is_none() {
+                return Err("signed remote screenshot returned no artifact id".to_string());
+            }
+            let pause_body = serde_json::to_vec(&DesktopControlStopRequest {
+                session_id: session_id.clone(),
+            })
+            .map_err(|error| error.to_string())?;
+            json(call(
+                "remote-pause",
+                "POST",
+                "/v1/remote/desktop-control/pause",
+                pause_body.clone(),
+            ))?;
+            let paused_action = call(
+                "remote-action-while-paused",
+                "POST",
+                "/v1/remote/desktop-control/action",
+                serde_json::to_vec(&DesktopControlActionRequest {
+                    session_id: session_id.clone(),
+                    target_application_id: application_id.clone(),
+                    target_window_id: Some(window_id.clone()),
+                    action: ControlAction::Focus,
+                })
+                .map_err(|error| error.to_string())?,
+            );
+            if paused_action.status != 409 {
+                return Err(format!(
+                    "paused remote action returned {}",
+                    paused_action.status
+                ));
+            }
+            json(call(
+                "remote-resume",
+                "POST",
+                "/v1/remote/desktop-control/resume",
+                pause_body,
+            ))?;
+            json(call(
+                "remote-stop-exact",
+                "POST",
+                "/v1/remote/desktop-control/stop",
+                serde_json::to_vec(&DesktopControlStopRequest { session_id })
+                    .map_err(|error| error.to_string())?,
+            ))?;
+            let audit = state.audit_snapshot()?;
+            let audit_text = serde_json::to_string(&audit).map_err(|error| error.to_string())?;
+            if audit_text.contains("hello") {
+                return Err("signed remote audit contained a value-writing payload".to_string());
+            }
+            Ok(())
+        })();
+        std::env::remove_var("COMPUTER_USE_FIXTURE_PID");
+        let _ = child.kill();
+        let _ = child.wait();
+        result.expect("signed remote Windows golden flow must pass");
     }
 
     #[test]

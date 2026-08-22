@@ -27,6 +27,15 @@ dictionary is rejected. CI runs this production path on macOS Accessibility,
 Windows UIAutomation, and Linux/X11 AT-SPI under Xvfb; Wayland remains an
 explicit fail-closed path.
 
+The production binary also runs an executable model-facing golden loop: the
+offline deterministic model grounds each action from the bounded observation,
+emits `computer_*` tool calls, receives the real OS result, and records the
+completed tool-call envelope. This keeps the model/tool protocol reproducible
+in CI while the OS actions remain real and provider-backed. Browser-to-native
+switching is covered by the frontend dispatcher golden test; it must use the
+browser route for web content and the native route only for an allowlisted
+desktop target.
+
 1. Feature off: Computer Use schemas are absent.
 2. Bypass mode: grant creation is refused.
 3. Empty grant: refused.

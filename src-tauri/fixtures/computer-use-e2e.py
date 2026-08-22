@@ -56,6 +56,10 @@ def main() -> int:
         requested_real_run
         and isinstance(trace, dict)
         and trace.get("native_desktop_actions_executed") is True
+        and isinstance(trace.get("model_loop"), dict)
+        and trace["model_loop"].get("kind") == "deterministic-model-tool-loop"
+        and trace["model_loop"].get("completed") is True
+        and isinstance(trace["model_loop"].get("tool_calls"), list)
         and isinstance(trace.get("driver"), dict)
         and trace["driver"].get("kind") == "little-monkey-production-backend"
         and trace["driver"].get("pid", 0) > 0
@@ -109,7 +113,14 @@ def main() -> int:
             if grant.get("window_scoped") is not True or grant.get("approval") != "test-approved-through-real-gate":
                 real_run = False
                 status = "invalid_native_evidence"
-                driver_error = "native driver did not prove the scoped grant and real approval gate"
+            driver_error = "native driver did not prove the scoped grant and real approval gate"
+    if real_run:
+        model_calls = trace["model_loop"]["tool_calls"]
+        model_names = {call.get("name") for call in model_calls if isinstance(call, dict)}
+        if not {"computer_list_targets", "computer_inspect", "computer_click", "computer_set_value", "computer_screenshot"}.issubset(model_names):
+            real_run = False
+            status = "invalid_model_evidence"
+            driver_error = "native driver did not prove the model-facing tool loop"
     evidence = {
         "schema_version": 1,
         "fixture": str(args.fixture),
@@ -119,6 +130,7 @@ def main() -> int:
         "real_desktop_actions_executed": real_run and ready,
         "postconditions": postconditions,
         "driver": trace.get("driver") if isinstance(trace, dict) else None,
+        "model_loop": trace.get("model_loop") if isinstance(trace, dict) else None,
         "actions": trace.get("actions", []) if isinstance(trace, dict) else [],
         "negative_cases": trace.get("negative_cases", {}) if isinstance(trace, dict) else {},
         "driver_error": driver_error,

@@ -486,7 +486,7 @@ impl DesktopControlRuntime {
     }
 
     #[cfg(test)]
-    fn for_test(
+    pub(crate) fn for_test(
         state: Arc<DesktopControlState>,
         prompter: Arc<dyn ConsentPrompter>,
         paths: DaemonPaths,
@@ -1220,6 +1220,182 @@ mod tests {
 
     fn session_id_of(value: &serde_json::Value) -> String {
         value["session"]["sessionId"].as_str().unwrap().to_string()
+    }
+
+    #[cfg(target_os = "windows")]
+    struct ProductionWindowsConsent;
+
+    #[cfg(target_os = "windows")]
+    impl ConsentPrompter for ProductionWindowsConsent {
+        fn confirm_session(&self, _device_label: &str) -> SessionConsent {
+            SessionConsent::AllowPerAction
+        }
+
+        fn confirm_action(&self, _device_label: &str, _description: &str) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires an interactive Windows desktop and the native fixture"]
+    fn remote_windows_runner_drives_the_production_uia_backend() {
+        assert_eq!(
+            std::env::var("COMPUTER_USE_REMOTE_WINDOWS_E2E").as_deref(),
+            Ok("1"),
+            "the ignored test must be explicitly enabled by the remote Windows CI job"
+        );
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("computer-use-test-app-windows.ps1");
+        let profile = std::env::temp_dir().join("little-monkey-testapp-profile.json");
+        let _ = std::fs::remove_file(&profile);
+        let mut child = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-STA",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&fixture)
+            .spawn()
+            .expect("Windows fixture must start");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        assert!(child.try_wait().expect("fixture status").is_none());
+        std::env::set_var("COMPUTER_USE_FIXTURE_PID", child.id().to_string());
+
+        let result = (|| -> Result<(), String> {
+            let base =
+                std::env::temp_dir().join(format!("lm-remote-windows-{}", uuid::Uuid::new_v4()));
+            let paths = DaemonPaths::under(&base);
+            let state = Arc::new(DesktopControlState::production_with_lock(
+                base.join("desktop_control.lock"),
+            ));
+            let runtime = DesktopControlRuntime::for_test(
+                state.clone(),
+                Arc::new(ProductionWindowsConsent),
+                paths,
+            );
+            let discovered = runtime.start_with_options(
+                "remote-windows-ci",
+                "Windows CI remote controller",
+                vec![format!("process:{}", child.id())],
+                false,
+                Vec::new(),
+                MAX_SESSION_LIFETIME_MS,
+                true,
+                true,
+                false,
+                Some(ApprovalPolicy::PerAction),
+            )?;
+            let discovery_session = session_id_of(&discovered);
+            let targets = runtime.list_targets("remote-windows-ci", &discovery_session)?;
+            let target = targets["targets"]
+                .as_array()
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find(|item| item["windowTitle"] == "Little Monkey TestApp")
+                })
+                .cloned()
+                .ok_or_else(|| "production remote UIA did not discover the fixture".to_string())?;
+            let application_id = target["applicationId"].as_str().unwrap().to_string();
+            let window_id = target["windowId"].as_str().unwrap().to_string();
+            runtime.stop("remote-windows-ci", &discovery_session)?;
+
+            let started = runtime.start_with_options(
+                "remote-windows-ci",
+                "Windows CI remote controller",
+                vec![application_id.clone()],
+                false,
+                vec![window_id.clone()],
+                MAX_SESSION_LIFETIME_MS,
+                true,
+                true,
+                false,
+                Some(ApprovalPolicy::PerAction),
+            )?;
+            let session_id = session_id_of(&started);
+            let inspect_request = |session_id: &str| DesktopControlTargetRequest {
+                session_id: session_id.to_string(),
+                target_application_id: Some(application_id.clone()),
+                target_window_id: Some(window_id.clone()),
+                query: None,
+                bounds: None,
+            };
+            let inspection = runtime.inspect("remote-windows-ci", inspect_request(&session_id))?;
+            let elements = inspection["inspection"]["elements"]
+                .as_array()
+                .ok_or_else(|| "remote UIA inspection returned no elements array".to_string())?;
+            let element_id = |label: &str, action: &str| {
+                elements.iter().find_map(|element| {
+                    (element["label"] == label
+                        && element["actions"].as_array().is_some_and(|actions| {
+                            actions.iter().any(|candidate| candidate == action)
+                        }))
+                    .then(|| element["id"].as_str().map(str::to_string))
+                    .flatten()
+                })
+            };
+            let dark_id = element_id("Dark mode", "click")
+                .ok_or_else(|| "remote UIA inspection did not expose Dark mode".to_string())?;
+            let profile_id = element_id("Profile name", "set_value")
+                .ok_or_else(|| "remote UIA inspection did not expose Profile name".to_string())?;
+            let save_id = element_id("Save profile", "click")
+                .ok_or_else(|| "remote UIA inspection did not expose Save profile".to_string())?;
+            let action_request = |action| DesktopControlActionRequest {
+                session_id: session_id.clone(),
+                target_application_id: application_id.clone(),
+                target_window_id: Some(window_id.clone()),
+                action,
+            };
+            runtime.action(
+                "remote-windows-ci",
+                "Windows CI remote controller",
+                action_request(ControlAction::SemanticClick {
+                    element_id: dark_id,
+                    button: MouseButtonKind::Left,
+                    expected_value: None,
+                }),
+            )?;
+            runtime.action(
+                "remote-windows-ci",
+                "Windows CI remote controller",
+                action_request(ControlAction::SetValue {
+                    element_id: profile_id,
+                    value: "hello".to_string(),
+                }),
+            )?;
+            runtime.action(
+                "remote-windows-ci",
+                "Windows CI remote controller",
+                action_request(ControlAction::SemanticClick {
+                    element_id: save_id,
+                    button: MouseButtonKind::Left,
+                    expected_value: None,
+                }),
+            )?;
+            let screenshot =
+                runtime.screenshot("remote-windows-ci", inspect_request(&session_id))?;
+            assert!(screenshot["artifact_id"].as_str().is_some());
+            let audit = state.audit_snapshot()?;
+            let audit_text = serde_json::to_string(&audit).map_err(|error| error.to_string())?;
+            if audit_text.contains("hello") {
+                return Err("remote audit contained the value-writing payload".to_string());
+            }
+            assert_eq!(runtime.emergency_stop_all(), 1);
+            assert!(state
+                .sessions_snapshot()?
+                .iter()
+                .all(|session| !session.active));
+            Ok(())
+        })();
+        std::env::remove_var("COMPUTER_USE_FIXTURE_PID");
+        let _ = child.kill();
+        let _ = child.wait();
+        result.expect("remote Windows production E2E must pass");
     }
 
     #[test]

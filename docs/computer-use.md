@@ -36,7 +36,7 @@ external transactions, including a semantic element whose inspected role or
 label is destructive. Critical actions always require their own approval,
 even inside an approved batch. Approved-batch mode is an explicit grant
 choice and never widens the allowlist or disables the kill switch. A shared
-run budget atomically caps 50 actions, 12 screenshots, 5 retries, 20 model
+run budget atomically caps 50 actions, 12 screenshots, 1 recovery retry, 20 model
 calls, and a 15-minute deadline. Callers must not turn Computer Use into an
 unbounded autonomous loop.
 
