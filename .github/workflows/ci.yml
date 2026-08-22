@@ -358,6 +358,43 @@ jobs:
       - name: Contract ABI gate
         run: pnpm contract:check
 
+  # The native acceptance path is intentionally separate from Rust unit tests:
+  # it needs an interactive desktop, accessibility permissions, and a real
+  # OS provider. The executable driver creates the production grant and writes
+  # machine-readable evidence; fabricated traces are not accepted.
+  computer-use-e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      COMPUTER_USE_E2E_RUN: 1
+      COMPUTER_USE_PRODUCTION_BACKEND: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run native Computer Use acceptance (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          python3 src-tauri/fixtures/computer-use-e2e.py \
+            --report "$RUNNER_TEMP/little-monkey-computer-use-e2e.json"
+
+      - name: Run native Computer Use acceptance (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          python src-tauri/fixtures/computer-use-e2e.py `
+            --report "$env:RUNNER_TEMP/little-monkey-computer-use-e2e.json"
+
+      - name: Upload native Computer Use evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: computer-use-e2e-${{ matrix.os }}
+          path: ${{ runner.temp }}/little-monkey-computer-use-e2e*
+          if-no-files-found: warn
+
   # ROADMAP #8 / K22: supply-chain review of what a release actually ships.
   # Split from the test matrix on purpose — these check the dependency set, not
   # the code, so they run once and neither blocks nor is blocked by a platform.
