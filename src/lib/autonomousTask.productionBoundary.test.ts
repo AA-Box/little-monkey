@@ -53,4 +53,14 @@ describe("default autonomous runtime production boundary", () => {
     const receiver = await promisify(execFile)(process.execPath, ["-e", "const spec=JSON.parse(process.argv[1]); const node=spec.autonomous_task.task_snapshot.plan.nodes[0]; if(node.executionPlacement.kind !== 'local' || node.executionPlacement.placementFulfilled !== true) process.exit(2); console.log(node.requestedExecutionPlacement.kind)", JSON.stringify(spec)]);
     expect(receiver.stdout.trim()).toBe(kind);
   });
+
+  it("classifies a lost external target without scheduling a generic repair", async () => {
+    const base = createAutonomousTask({ objective: "edit allowed.ts", targetSnapshot: target, workspaceRoots: roots, permissionSnapshot: permissions, constraints: { strategy: "DIRECT" }, planningContext: { relevantFiles: ["allowed.ts"] } });
+    const plan = createTaskPlan("edit allowed.ts", "DIRECT", 1, base.planningContext);
+    const placedPlan = { ...plan, nodes: plan.nodes.map((node) => node.nodeId === "implement" ? { ...node, executionPlacement: { kind: "remote_node" as const, targetId: "remote-a", nodeId: node.nodeId, reason: "test placement" } } : node) };
+    const runtime = defaultAutonomousTaskRuntime(target, { remote_node: vi.fn(async () => ({ ok: false, failureCode: "EXECUTION_TARGET_LOST" as const, summary: "EXECUTION_TARGET_LOST: remote disappeared" })) });
+    const result = await runAutonomousTask({ task: installTaskPlan(base, placedPlan), resolvedTarget: target, runtime });
+    expect(result.outcome).toBe("EXECUTION_TARGET_LOST");
+    expect(result.repairRounds).toBe(0);
+  });
 });
