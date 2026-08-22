@@ -296,6 +296,53 @@ fn inspect_until_dark_state(
     ))
 }
 
+fn saved_state_observed(inspection: &ComputerInspection) -> bool {
+    inspection.elements.iter().any(|element| {
+        element.label.trim().eq_ignore_ascii_case("saved")
+            || element
+                .value
+                .as_deref()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("saved"))
+    })
+}
+
+fn inspect_until_saved_state(
+    state: &DesktopControlState,
+    session_id: &str,
+    target: &ComputerTarget,
+) -> Result<ComputerInspection, String> {
+    let mut latest = inspect(state, session_id, target)?;
+    for attempt in 0..10 {
+        if saved_state_observed(&latest) {
+            return Ok(latest);
+        }
+        if attempt < 9 {
+            thread::sleep(Duration::from_millis(200));
+            latest = inspect(state, session_id, target)?;
+        }
+    }
+    let observed = latest
+        .elements
+        .iter()
+        .filter(|element| {
+            element.label.to_ascii_lowercase().contains("save")
+                || element
+                    .value
+                    .as_deref()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains("save"))
+        })
+        .map(|element| {
+            format!(
+                "id={} role={} label={:?} value={:?} actions={:?}",
+                element.id, element.role, element.label, element.value, element.actions
+            )
+        })
+        .collect::<Vec<_>>();
+    Err(format!(
+        "saved state was not observed semantically: {observed:?}"
+    ))
+}
+
 fn run_action(
     state: &DesktopControlState,
     session_id: &str,
@@ -479,6 +526,8 @@ fn model_facing_golden_flow(
             }));
             if model.step == 1 {
                 inspection = inspect_until_dark_state(state, &session.session_id, target, true)?;
+            } else if model.step == 3 {
+                inspection = inspect_until_saved_state(state, &session.session_id, target)?;
             }
         } else {
             let (_, screenshot, _) = state.screenshot_for_session(
@@ -500,11 +549,8 @@ fn model_facing_golden_flow(
     {
         return Err("model-facing golden profile postcondition failed".to_string());
     }
-    if !inspection
-        .elements
-        .iter()
-        .any(|element| element.label == "Saved" || element.value.as_deref() == Some("Saved"))
-    {
+    let inspection = inspect_until_saved_state(state, &session.session_id, target)?;
+    if !saved_state_observed(&inspection) {
         return Err("model-facing golden save postcondition failed".to_string());
     }
     Ok(trace)

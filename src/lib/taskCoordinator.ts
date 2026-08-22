@@ -272,6 +272,15 @@ export async function runCoordinatedInvocation<T>(
         }
       }
       if (!hooks.verify || await hooks.verify(result, attempt)) return result;
+      throw new CoordinatedInvocationError(computerUseFailure(
+        `${INPUT_SENT_UNVERIFIED}: input was sent but the requested postcondition was not verified`,
+        {
+          code: 'POSTCONDITION_FAILED',
+          inputSent: true,
+          safeToRetry: false,
+          phase: 'verify',
+        },
+      ));
     } catch (error) {
       if (!retryIsExplicitlySafe(error) || attempt >= attempts) throw error;
     }

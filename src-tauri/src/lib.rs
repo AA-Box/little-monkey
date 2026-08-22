@@ -887,47 +887,51 @@ pub fn run() {
     // plugin instance per app), disambiguated in the shared handler below by
     // comparing the fired `Shortcut` against this parsed constant.
     const DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT: &str = "CommandOrControl+Shift+Escape";
-    let desktop_control_emergency_stop_shortcut: tauri_plugin_global_shortcut::Shortcut =
-        DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT
-            .parse()
-            .expect("the desktop control emergency-stop hotkey must be valid");
-    // All three global OS-level shortcuts (the companion overlay's, the
-    // command palette's, and desktop control's fixed emergency stop) share
-    // one `tauri_plugin_global_shortcut` plugin registration — a Tauri app
-    // manages exactly one instance of each plugin — and one dispatching
-    // handler that tells them apart by comparing the fired `Shortcut`
-    // against each feature's configured, already-parsed value
-    // (`Shortcut`/`HotKey` derives `PartialEq`).
-    let companion_shortcut_parsed = configured_companion_shortcut
-        .parse::<tauri_plugin_global_shortcut::Shortcut>()
-        .expect("the configured companion shortcut must be valid");
-    let palette_shortcut_parsed = configured_palette_shortcut
-        .parse::<tauri_plugin_global_shortcut::Shortcut>()
-        .expect("the configured command palette shortcut must be valid");
-    let global_shortcuts = tauri_plugin_global_shortcut::Builder::new()
-        .with_shortcut(configured_companion_shortcut.as_str())
-        .expect("the configured companion shortcut must be valid")
-        .with_shortcut(configured_palette_shortcut.as_str())
-        .expect("the configured command palette shortcut must be valid")
-        .with_shortcut(DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT)
-        .expect("the desktop control emergency-stop hotkey must be valid")
-        .with_handler(move |app, shortcut, event| {
-            if event.state != tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                return;
-            }
-            if *shortcut == desktop_control_emergency_stop_shortcut {
-                let state = app.state::<desktop_control::DesktopControlState>();
-                let _ = state.emergency_stop();
-                if let Some(overlay) = app.get_webview_window("companion-overlay") {
-                    let _ = overlay.hide();
+    // The full-product acceptance process may run beside another Tauri app on
+    // the hosted desktop. It still exercises the emergency-stop implementation
+    // through the normal desktop-control state, but must not claim the user's
+    // machine-wide shortcuts and collide with that other process.
+    let global_shortcuts = if std::env::var("COMPUTER_USE_FULL_PRODUCT_E2E").as_deref() == Ok("1") {
+        tauri_plugin_global_shortcut::Builder::new().build()
+    } else {
+        let desktop_control_emergency_stop_shortcut: tauri_plugin_global_shortcut::Shortcut =
+            DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT
+                .parse()
+                .expect("the desktop control emergency-stop hotkey must be valid");
+        // All three global OS-level shortcuts share one plugin registration and
+        // one dispatching handler that tells them apart by comparing the fired
+        // Shortcut against each feature's configured value.
+        let companion_shortcut_parsed = configured_companion_shortcut
+            .parse::<tauri_plugin_global_shortcut::Shortcut>()
+            .expect("the configured companion shortcut must be valid");
+        let palette_shortcut_parsed = configured_palette_shortcut
+            .parse::<tauri_plugin_global_shortcut::Shortcut>()
+            .expect("the configured command palette shortcut must be valid");
+        tauri_plugin_global_shortcut::Builder::new()
+            .with_shortcut(configured_companion_shortcut.as_str())
+            .expect("the configured companion shortcut must be valid")
+            .with_shortcut(configured_palette_shortcut.as_str())
+            .expect("the configured command palette shortcut must be valid")
+            .with_shortcut(DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT)
+            .expect("the desktop control emergency-stop hotkey must be valid")
+            .with_handler(move |app, shortcut, event| {
+                if event.state != tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                    return;
                 }
-            } else if *shortcut == companion_shortcut_parsed {
-                let _ = m7_companion::show_overlay(app);
-            } else if *shortcut == palette_shortcut_parsed {
-                let _ = command_palette::show_palette(app);
-            }
-        })
-        .build();
+                if *shortcut == desktop_control_emergency_stop_shortcut {
+                    let state = app.state::<desktop_control::DesktopControlState>();
+                    let _ = state.emergency_stop();
+                    if let Some(overlay) = app.get_webview_window("companion-overlay") {
+                        let _ = overlay.hide();
+                    }
+                } else if *shortcut == companion_shortcut_parsed {
+                    let _ = m7_companion::show_overlay(app);
+                } else if *shortcut == palette_shortcut_parsed {
+                    let _ = command_palette::show_palette(app);
+                }
+            })
+            .build()
+    };
     let app = tauri::Builder::default()
         // Must be registered first (per tauri-plugin-single-instance's own
         // docs) so it can intercept a second launch before anything else

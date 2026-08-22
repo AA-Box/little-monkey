@@ -461,7 +461,7 @@ jobs:
   # production native provider. The browser value is extracted from a DOM
   # artifact and only that observed value is passed into the native fixture.
   computer-use-mixed-browser-native-e2e:
-    runs-on: windows-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 35
     env:
       COMPUTER_USE_E2E_RUN: 1
@@ -469,8 +469,14 @@ jobs:
       COMPUTER_USE_MIXED_BROWSER_NATIVE_E2E: 1
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
+      COMPUTER_USE_FIXTURE_SCRIPT: src-tauri/fixtures/computer-use-test-app-linux.py
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Linux X11/AT-SPI and Chromium acceptance dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf dbus-x11 at-spi2-core python3-pyatspi python3-tk python3-gi gir1.2-gtk-3.0 wmctrl xclip xvfb chromium
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
@@ -487,14 +493,13 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Stage the CLI sidecar required by the Tauri build script
-        shell: pwsh
         run: node scripts/ensure-cli-sidecar-placeholder.mjs
 
       - name: Run the real browser-to-native golden
-        shell: pwsh
         run: |
-          python src-tauri/fixtures/computer-use-e2e.py `
-            --report "$env:RUNNER_TEMP/little-monkey-mixed-browser-native-e2e.json"
+          dbus-run-session -- xvfb-run -a --server-args='-screen 0 1280x1024x24' \
+            python3 src-tauri/fixtures/computer-use-e2e.py \
+            --report "$RUNNER_TEMP/little-monkey-mixed-browser-native-e2e.json"
 
       - name: Upload mixed browser/native evidence
         if: always()

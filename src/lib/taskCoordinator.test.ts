@@ -53,7 +53,10 @@ describe('universal task coordinator routing', () => {
         execute: () => { executions += 1; return 'outcome'; },
         verify: () => false,
       },
-    )).rejects.toBeInstanceOf(CoordinatedInvocationError);
+    )).rejects.toMatchObject({
+      code: 'POSTCONDITION_FAILED',
+      failure: { inputSent: true, safeToRetry: false, phase: 'verify' },
+    });
     expect(executions).toBe(1);
     expect(phases).toEqual(['observe', 'decide', 'authorize', 'verify']);
   });
@@ -128,7 +131,17 @@ describe('universal task coordinator routing', () => {
 
     await expect(runCoordinatedInvocation(
       { route: 'native', phases: ['observe', 'decide', 'authorize', 'execute', 'verify'], maxAttempts: 2 },
-      { budget, execute: () => 'outcome', verify: () => false },
+      {
+        budget,
+        execute: () => {
+          throw new CoordinatedRetryableError(computerUseFailure('provider unavailable before input', {
+            code: 'PROVIDER_TRANSIENT_PRE_INPUT',
+            inputSent: false,
+            safeToRetry: true,
+            phase: 'pre_execute',
+          }));
+        },
+      },
     )).rejects.toThrow(/retry limit/i);
   });
 

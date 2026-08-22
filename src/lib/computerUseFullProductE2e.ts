@@ -146,7 +146,14 @@ export async function runComputerUseFullProductE2e(): Promise<void> {
       });
       inspection = await dispatch('computer_inspect', common);
       trace.postconditions.profile = String((elements().find((element) => element.id === profile.id)?.value ?? ''));
-      trace.postconditions.saved = elements().some((element) => element.label === 'Saved' || element.value === 'Saved');
+      const savedObserved = () => elements().some((element) => String(element.label ?? '').trim().toLowerCase() === 'saved'
+        || String(element.value ?? '').trim().toLowerCase() === 'saved');
+      trace.postconditions.saved = savedObserved();
+      for (let attempt = 0; !trace.postconditions.saved && attempt < 9; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        inspection = await dispatch('computer_inspect', common);
+        trace.postconditions.saved = savedObserved();
+      }
       const screenshot = await dispatch('computer_screenshot', common);
       trace.screenshot_received_by_frontend = typeof screenshot.contentBase64 === 'string' && screenshot.contentBase64.length > 100;
       trace.screenshot_artifact_id = String(screenshot.artifactId ?? '');

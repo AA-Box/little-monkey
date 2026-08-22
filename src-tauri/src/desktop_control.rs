@@ -1042,6 +1042,9 @@ fn backend_init_error_message(error: &str) -> String {
 }
 
 const MAX_NATIVE_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(target_os = "windows")]
+const NATIVE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(45);
+#[cfg(not(target_os = "windows"))]
 const NATIVE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_TARGETS: usize = 64;
 const MAX_ELEMENTS: usize = 256;
@@ -1934,6 +1937,8 @@ function ValueOf($e) {
   try { $value=$e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value; if($null -ne $value){return $value} } catch {}
   try { $value=[string]$e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState; if(-not [string]::IsNullOrWhiteSpace($value)){return $value} } catch {}
   try { $value=[string]$e.Current.HelpText; if(-not [string]::IsNullOrWhiteSpace($value)){return $value} } catch {}
+  try { $value=[string]$e.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern).Current.Value; if(-not [string]::IsNullOrWhiteSpace($value)){return $value} } catch {}
+  try { $value=[string]$e.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1); if(-not [string]::IsNullOrWhiteSpace($value)){return $value.Trim()} } catch {}
   $current=$e
   for($k=0;$k -lt 4;$k++) {
     $current=ParentOf $current
