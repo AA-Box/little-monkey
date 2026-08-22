@@ -14,10 +14,12 @@ PROFILE_PATH = os.path.join(os.environ.get("TMPDIR", "/tmp"), "little-monkey-tes
 
 
 class TestApp:
-    def __init__(self) -> None:
-        self.root = Gtk.Window(title="Little Monkey TestApp")
+    def __init__(self, application) -> None:
+        self.application = application
+        self.root = Gtk.ApplicationWindow(application=application)
+        self.root.set_title("Little Monkey TestApp")
         self.root.set_default_size(640, 560)
-        self.root.connect("destroy", Gtk.main_quit)
+        self.root.connect("destroy", lambda *_args: self.application.quit())
         self.dark = Gtk.CheckButton(label="Dark mode")
         self.profile = Gtk.Entry()
         self.profile.set_text("Test profile")
@@ -100,5 +102,11 @@ class TestApp:
 
 
 if __name__ == "__main__":
-    TestApp()
-    Gtk.main()
+    application = Gtk.Application(application_id="com.aabox.LittleMonkeyTestApp")
+    fixture = {}
+
+    def activate(app) -> None:
+        fixture["app"] = TestApp(app)
+
+    application.connect("activate", activate)
+    application.run(None)
