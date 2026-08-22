@@ -29,13 +29,6 @@ The port is reserved by the app and handed over on the command line. Bind
 loopback only. Both stdout and stderr are drained by the app; the tail of them
 is what a user sees when a launch fails, so log the reason a start failed.
 
-The app also sets `LITTLE_MONKEY_STUDIO_TOOL_DATA_DIR` to a private,
-per-tool directory under the active profile's app-data directory. Tools should
-put virtual environments, downloaded Python packages, caches, and other
-generated runtime state there. They must not write beside their executable or
-inside the repository. `FACE_SWAP_VENV` is a face-swap-specific test/build
-override, not the production path.
-
 Up to three tools stay resident at once, and each is left running between runs so
 a model is not reloaded per operation — alternating two tools (swap a face, then
 upscale the result) is the normal way these get used. Past that the least
@@ -54,12 +47,6 @@ and treats the first success as "loaded". You have 120 seconds.
   "id": "face-swap",
   "name": "Face Swap",
   "description": "Replace a face in the target with the one in the source.",
-  "licenseNotice": {
-    "title": "Non-commercial use only",
-    "message": "This tool's supplied model weights may not be used commercially.",
-    "commercialUseAllowed": false,
-    "url": "https://example.com/license"
-  },
   "inputs": [
     { "key": "source", "label": "Source face", "kind": "image", "required": true },
     { "key": "target", "label": "Target image", "kind": "image", "required": true },
@@ -72,11 +59,6 @@ and treats the first success as "loaded". You have 120 seconds.
   ]
 }
 ```
-
-`licenseNotice` is optional. When `commercialUseAllowed` is `false`, Studio
-shows the title, message, and HTTPS license URL on the selected tool's page
-before the user can run it. This is a prominent disclosure, not a legal
-license or a substitute for checking each supplied model's terms.
 
 **The manifest is your UI.** Studio draws a form from it and knows nothing else
 about your tool — that indirection is the whole design, and it is why a new tool

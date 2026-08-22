@@ -17,6 +17,24 @@ export interface CoordinationHooks<T> {
 
 const NATIVE_PREFIX = 'computer_';
 const BROWSER_TOOLS = new Set(['browser_click', 'browser_inspect', 'browser_navigate', 'web_fetch', 'web_search']);
+const BROWSER_APPLICATION_IDS = new Set([
+  'brave',
+  'com.apple.safari',
+  'com.brave.browser',
+  'com.google.chrome',
+  'com.google.chromium',
+  'firefox',
+  'google chrome',
+  'chromium',
+  'microsoft edge',
+  'microsoft.microsoftedge',
+  'msedge',
+  'mozilla firefox',
+  'org.chromium.chromium',
+  'org.mozilla.firefox',
+  'safari',
+  'brave browser',
+]);
 
 /** Single routing authority for tools that can affect an external surface. */
 export function coordinateToolInvocation(
@@ -34,12 +52,16 @@ export function coordinateToolInvocation(
           : 'workspace';
   if (route === 'native') {
     const target = typeof args.target_application_id === 'string' ? args.target_application_id : '';
-    if (/^https?:\/\//i.test(target)) {
+    const normalizedTarget = target.trim().toLowerCase();
+    const browserApplication = [...BROWSER_APPLICATION_IDS].some(
+      (browserId) => normalizedTarget === browserId || normalizedTarget.startsWith(`${browserId}::`),
+    );
+    if (/^https?:\/\//i.test(target) || browserApplication) {
       return {
         route,
         phases: ['observe', 'decide', 'authorize'],
         maxAttempts: 0,
-        error: 'Web targets must use browser tools; native Computer Use cannot drive a browser URL.',
+        error: 'Browser targets must use browser tools; native Computer Use cannot drive browser content or chrome.',
       };
     }
   }

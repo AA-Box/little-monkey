@@ -1286,6 +1286,30 @@ async function executeToolCallInner(
           throw error;
         }
       }
+      if (
+        phase === 'verify'
+        && name !== 'computer_list_targets'
+        && typeof args.target_application_id === 'string'
+      ) {
+        const observation = await invoke('tool_computer_inspect', {
+          session_id: args.session_id,
+          target_application_id: args.target_application_id,
+          target_window_id: args.target_window_id,
+          query: undefined,
+          turn_id: turnId,
+          tool_call_id: protocolToolCallId(toolCall.id),
+        });
+        const observationText = stringifyToolResult(observation);
+        try {
+          const parsed = JSON.parse(observationText) as { error?: unknown };
+          if (parsed && typeof parsed === 'object' && parsed.error) {
+            throw new Error(String(parsed.error));
+          }
+        } catch (error) {
+          if (error instanceof SyntaxError) throw error;
+          throw error;
+        }
+      }
     },
     execute: () => {
       const invocation = name.startsWith('mcp__')

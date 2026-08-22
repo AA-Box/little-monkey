@@ -150,6 +150,9 @@ pub struct ComputerInspection {
     pub target: ComputerTarget,
     pub elements: Vec<ComputerElement>,
     pub truncated: bool,
+    /// Count only; sensitive elements are never returned with labels or
+    /// values, but callers can verify that the provider saw and redacted them.
+    pub sensitive_element_count: usize,
     pub query: Option<String>,
 }
 
@@ -380,6 +383,7 @@ impl DesktopSemanticBackend for NullSemanticBackend {
             target,
             elements: Vec::new(),
             truncated: false,
+            sensitive_element_count: 0,
             query: query.map(str::to_string),
         })
     }
@@ -692,6 +696,7 @@ fn backend_init_error_message(error: &str) -> String {
 }
 
 const MAX_NATIVE_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const NATIVE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_TARGETS: usize = 64;
 const MAX_ELEMENTS: usize = 256;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -737,7 +742,7 @@ fn run_native_command_with_env(
         .spawn()
         .map_err(|error| format!("Could not start accessibility provider {program}: {error}"))?;
 
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| format!("Accessibility provider {program} did not expose stdout"))?;
@@ -745,63 +750,76 @@ fn run_native_command_with_env(
         .stderr
         .take()
         .ok_or_else(|| format!("Accessibility provider {program} did not expose stderr"))?;
-    let stderr_reader = std::thread::spawn(move || {
+    let (stderr_sender, stderr_receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut stderr = stderr;
         let mut captured = Vec::new();
         let mut chunk = [0_u8; 4096];
-        loop {
-            let count = stderr.read(&mut chunk).map_err(|error| error.to_string())?;
+        let result = loop {
+            let count = match stderr.read(&mut chunk) {
+                Ok(count) => count,
+                Err(error) => break Err(error.to_string()),
+            };
             if count == 0 {
-                break;
+                break Ok(captured);
             }
             let remaining = 64 * 1024 - captured.len();
             if remaining > 0 {
                 captured.extend_from_slice(&chunk[..count.min(remaining)]);
             }
-        }
-        Ok::<Vec<u8>, String>(captured)
+        };
+        let _ = stderr_sender.send(result);
     });
 
-    let mut stdout_bytes = Vec::new();
-    let mut chunk = [0_u8; 16 * 1024];
-    let mut oversized = false;
-    loop {
-        let count = match stdout.read(&mut chunk) {
-            Ok(count) => count,
+    let (stdout_sender, stdout_receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut stdout_bytes = Vec::new();
+        let mut chunk = [0_u8; 16 * 1024];
+        let result = loop {
+            let count = match stdout.read(&mut chunk) {
+                Ok(count) => count,
+                Err(error) => break Err(error.to_string()),
+            };
+            if count == 0 {
+                break Ok(stdout_bytes);
+            }
+            if stdout_bytes.len().saturating_add(count) > MAX_NATIVE_OUTPUT_BYTES {
+                break Err(
+                    "Accessibility provider returned more than the bounded output limit"
+                        .to_string(),
+                );
+            }
+            stdout_bytes.extend_from_slice(&chunk[..count]);
+        };
+        let _ = stdout_sender.send(result);
+    });
+    let deadline = std::time::Instant::now() + NATIVE_PROVIDER_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Accessibility provider {program} timed out"));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = stderr_reader.join();
                 return Err(format!(
-                    "Could not read accessibility provider output: {error}"
+                    "Could not wait for accessibility provider {program}: {error}"
                 ));
             }
-        };
-        if count == 0 {
-            break;
         }
-        if stdout_bytes.len().saturating_add(count) > MAX_NATIVE_OUTPUT_BYTES {
-            oversized = true;
-            break;
-        }
-        stdout_bytes.extend_from_slice(&chunk[..count]);
-    }
-
-    if oversized {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = stderr_reader.join();
-        return Err(
-            "Accessibility provider returned more than the bounded output limit".to_string(),
-        );
-    }
-
-    let status = child
-        .wait()
-        .map_err(|error| format!("Could not wait for accessibility provider {program}: {error}"))?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| format!("Accessibility provider {program} error reader panicked"))?
+    };
+    let stdout_bytes = stdout_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .map_err(|_| format!("Accessibility provider {program} output timed out"))?
+        .map_err(|error| format!("Could not read accessibility provider output: {error}"))?;
+    let stderr = stderr_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .map_err(|_| format!("Accessibility provider {program} error output timed out"))?
         .map_err(|error| format!("Could not read accessibility provider error output: {error}"))?;
     if !status.success() {
         let error = String::from_utf8_lossy(&stderr);
@@ -979,11 +997,12 @@ fn bounded_elements(
     snapshot: &NativeSnapshot,
     target: &ComputerTarget,
     query: Option<&str>,
-) -> (Vec<ComputerElement>, bool) {
+) -> (Vec<ComputerElement>, bool, usize) {
     let query = query.map(str::to_ascii_lowercase);
     let mut seen = std::collections::HashSet::new();
     let mut elements = Vec::new();
     let mut truncated = false;
+    let mut sensitive_element_count = 0;
     for element in snapshot
         .elements
         .get(&target.target_id)
@@ -1006,6 +1025,7 @@ fn bounded_elements(
             continue;
         }
         if element.sensitive || sensitive_text(&format!("{} {}", element.role, element.label)) {
+            sensitive_element_count += 1;
             continue;
         }
         if elements.len() == MAX_ELEMENTS {
@@ -1014,7 +1034,7 @@ fn bounded_elements(
         }
         elements.push(element.clone());
     }
-    (elements, truncated)
+    (elements, truncated, sensitive_element_count)
 }
 
 fn element_center(element: &ComputerElement) -> Result<(i32, i32), String> {
@@ -1055,7 +1075,7 @@ fn find_element(target: &ComputerTarget, element_id: &str) -> Result<ComputerEle
         false,
     )?;
     let snapshot = native_snapshot()?;
-    let (elements, _) = bounded_elements(&snapshot, &verified, None);
+    let (elements, _, _) = bounded_elements(&snapshot, &verified, None);
     elements
         .into_iter()
         .find(|element| element.id == element_id)
@@ -1088,11 +1108,13 @@ impl DesktopSemanticBackend for NativeSemanticBackend {
             false,
         )?;
         let snapshot = native_snapshot()?;
-        let (elements, truncated) = bounded_elements(&snapshot, &target, query);
+        let (elements, truncated, sensitive_element_count) =
+            bounded_elements(&snapshot, &target, query);
         Ok(ComputerInspection {
             target,
             elements,
             truncated,
+            sensitive_element_count,
             query: query.map(str::to_string),
         })
     }
@@ -1337,20 +1359,38 @@ public static class LMWindow { [DllImport("user32.dll")] public static extern bo
 const MACOS_AX_SCRIPT: &str = r#"
 ObjC.import('AppKit');
 const se = Application('System Events');
+const providerEnv = $.NSProcessInfo.processInfo.environment;
+const onlyPid = Number(ObjC.unwrap(providerEnv.objectForKey('COMPUTER_USE_FIXTURE_PID')) || 0);
+const onlyName = String(ObjC.unwrap(providerEnv.objectForKey('COMPUTER_USE_FIXTURE_APP_NAME')) || '');
 const safe = (f, d) => { try { const v = f(); return v === undefined ? d : v; } catch (_) { return d; } };
+const text = (...fs) => { for (const f of fs) { const value = safe(f, ''); if (value !== null && value !== undefined && String(value).trim() !== '') return String(value); } return ''; };
 const rect = o => { const p = safe(() => o.position(), [0,0]); const s = safe(() => o.size(), [0,0]); return {x:Number(p[0])||0,y:Number(p[1])||0,width:Number(s[0])||0,height:Number(s[1])||0}; };
 const targets = [], elements = {};
-for (const p of safe(() => se.processes(), [])) {
-  if (!safe(() => p.visible(), false)) continue;
-  const name = String(safe(() => p.name(), '')); const app = String(safe(() => p.bundleIdentifier(), name));
-  const front = Boolean(safe(() => p.frontmost(), false)); let wi = 0;
-  for (const w of safe(() => p.windows(), [])) {
-    if (wi >= 32) break;
-    const title = String(safe(() => w.name(), '')); const id = app + '::window-' + wi; const target = {targetId:id,applicationId:app,applicationName:name,windowId:id,windowTitle:title,bounds:rect(w),focused:front && wi===0,sensitive:false,supportedActions:['inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot']}; targets.push(target);
-    const out=[]; let ei=0;
-    for (const e of safe(() => w.entireContents(), [])) { if (ei++ >= 256) break; const role=String(safe(() => e.role(),'')); const subrole=String(safe(() => e.attribute('AXSubrole'),'')); const label=String(safe(() => e.description(), safe(() => e.name(),''))); const value=safe(() => e.value(), null); const native=String(safe(() => e.attribute('AXIdentifier'), '')); const stable=native.replace(/[^A-Za-z0-9._-]/g,'_'); const eb=rect(e); out.push({id:id+'::element-'+(ei-1)+'::native-'+stable,role,label,value:value===null?null:String(value),bounds:eb,enabled:Boolean(safe(() => e.enabled(),true)),focused:Boolean(safe(() => e.focused(),false)),actions:['click','double_click','set_value','select'],sensitive:/AXSecureTextField|securetextfield|password|secure|auth|credential/i.test(role+' '+subrole+' '+label)}); }
-    elements[id]=out; wi++;
+let processList = [];
+if (onlyName) {
+  const selected = safe(() => se.processes.byName(onlyName), null);
+  if (selected) processList = [selected];
+} else if (onlyPid) {
+  for (const candidate of safe(() => se.processes(), [])) {
+    if (Number(safe(() => candidate.unixId(), 0)) === onlyPid) { processList = [candidate]; break; }
   }
+} else {
+  processList = safe(() => se.processes(), []);
+}
+for (const p of processList) {
+  try {
+    if (onlyPid && Number(safe(() => p.unixId(), 0)) !== onlyPid) continue;
+    if (!safe(() => p.visible(), false)) continue;
+    const name = String(safe(() => p.name(), '')); const bundle = String(safe(() => p.bundleIdentifier(), '')); const app = bundle === 'null' || bundle === 'undefined' || !bundle ? name : bundle;
+    const front = Boolean(safe(() => p.frontmost(), false)); let wi = 0;
+    for (const w of safe(() => p.windows(), [])) {
+      if (wi >= 32) break;
+      const title = String(safe(() => w.name(), '')); const id = app + '::window-' + wi; const target = {targetId:id,applicationId:app,applicationName:name,windowId:id,windowTitle:title,bounds:rect(w),focused:front && wi===0,sensitive:false,supportedActions:['inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot']}; targets.push(target);
+      const out=[]; let ei=0;
+      for (const e of safe(() => w.entireContents(), [])) { if (ei++ >= 256) break; const role=String(safe(() => e.role(),'')); const subrole=String(safe(() => e.attribute('AXSubrole'),'')); const label=text(() => e.attribute('AXTitle'), () => e.description(), () => e.name()); const value=safe(() => e.value(), null); const native=String(safe(() => e.attribute('AXIdentifier'), '')); const stable=native.replace(/[^A-Za-z0-9._-]/g,'_'); const eb=rect(e); out.push({id:id+'::element-'+(ei-1)+'::native-'+stable,role,label,value:value===null?null:String(value),bounds:eb,enabled:Boolean(safe(() => e.enabled(),true)),focused:Boolean(safe(() => e.focused(),false)),actions:['click','double_click','set_value','select'],sensitive:/AXSecureTextField|securetextfield|password|secure|auth|credential/i.test(role+' '+subrole+' '+label)}); }
+      elements[id]=out; wi++;
+    }
+  } catch (_) {}
 }
 JSON.stringify({targets,elements});
 "#;
@@ -1424,18 +1464,20 @@ ObjC.import('Foundation');
 const se = Application('System Events');
 const env = $.NSProcessInfo.processInfo.environment;
 const get = key => ObjC.unwrap(env.objectForKey(key));
+const safe = (f, d) => { try { const v = f(); return v === undefined ? d : v; } catch (_) { return d; } };
+const text = (...fs) => { for (const f of fs) { const value = safe(f, ''); if (value !== null && value !== undefined && String(value).trim() !== '') return String(value); } return ''; };
 const appId = get('LM_APP_ID');
 const windowIndex = Number(get('LM_WINDOW_INDEX'));
 const elementIndex = Number(get('LM_ELEMENT_INDEX'));
 const action = get('LM_ACTION');
 const value = get('LM_VALUE');
-const process = se.processes.byBundleIdentifier(appId);
+const process = /^(com|org|net|io)\./.test(appId) ? se.processes.byBundleIdentifier(appId) : se.processes.byName(appId);
 const window = process.windows[windowIndex];
 const element = window.entireContents()[elementIndex];
 if (action === 'set_value') element.value = value;
-else if (action === 'select') element.click();
-else if (action === 'click') element.click();
-else if (action === 'double_click') { element.click(); element.click(); }
+else if (action === 'select') { try { element.performAction('AXPress'); } catch (_) { element.click(); } }
+else if (action === 'click') { try { element.performAction('AXPress'); } catch (_) { element.click(); } }
+else if (action === 'double_click') { try { element.performAction('AXPress'); element.performAction('AXPress'); } catch (_) { element.click(); element.click(); } }
 else throw new Error('unsupported semantic action');
 JSON.stringify({semantic:true});
 "#;
@@ -1446,11 +1488,10 @@ ObjC.import('Foundation');
 const se = Application('System Events');
 const env = $.NSProcessInfo.processInfo.environment;
 const get = key => ObjC.unwrap(env.objectForKey(key));
-const process = se.processes.byBundleIdentifier(get('LM_APP_ID'));
+const appId = get('LM_APP_ID');
+const process = /^(com|org|net|io)\./.test(appId) ? se.processes.byBundleIdentifier(appId) : se.processes.byName(appId);
 process.frontmost = true;
-const window = process.windows[Number(get('LM_WINDOW_INDEX'))];
-try { window.performAction('AXRaise'); } catch (_) { window.raise(); }
-JSON.stringify({focused:true});
+JSON.stringify({focused:Boolean(process.frontmost())});
 "#;
 
 #[cfg(target_os = "windows")]
@@ -2411,6 +2452,23 @@ impl DesktopControlState {
         Ok((text, audit_id))
     }
 
+    /// Reads clipboard content only for a session that explicitly granted the
+    /// clipboard capability. Remote callers use this wrapper so they share
+    /// the same target validation and redacted audit record as local callers.
+    pub fn clipboard_for_remote(
+        &self,
+        session_id: &str,
+        target_application_id: &str,
+        target_window_id: Option<&str>,
+    ) -> Result<(String, String), String> {
+        self.clipboard_for_session(
+            session_id,
+            target_application_id,
+            target_window_id,
+            &AuditContext::default(),
+        )
+    }
+
     fn require_active_session_for_target(
         &self,
         session_id: &str,
@@ -3365,8 +3423,8 @@ pub fn desktop_control_start_session(
         lifetime_ms,
         SessionGrantOptions {
             allowed_windows: allowed_windows.unwrap_or_default(),
-            allow_screenshots: allow_screenshots.unwrap_or(true),
-            allow_keyboard_input: allow_keyboard_input.unwrap_or(true),
+            allow_screenshots: allow_screenshots.unwrap_or(false),
+            allow_keyboard_input: allow_keyboard_input.unwrap_or(false),
             allow_clipboard_read: allow_clipboard_read.unwrap_or(false),
             approval_policy: Some(approval_policy.unwrap_or(if approved_batch {
                 ApprovalPolicy::ApprovedBatch

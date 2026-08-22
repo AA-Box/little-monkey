@@ -393,6 +393,12 @@
     {
       "plane": "control",
       "method": "POST",
+      "path": "/v1/remote/desktop-control/clipboard-read",
+      "gate": "action:ControlDesktop"
+    },
+    {
+      "plane": "control",
+      "method": "POST",
       "path": "/v1/remote/desktop-control/pause",
       "gate": "action:ControlDesktop"
     },

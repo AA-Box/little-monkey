@@ -26,7 +26,6 @@ import {
   missingRequired,
   toolDefaults,
   toolsClient,
-  DEFAULT_STUDIO_TOOL_CATALOG_URL,
   type StudioTool,
   type ToolInput,
   type ToolInputs,
@@ -76,18 +75,11 @@ export function ToolPanel({ railSlot }: Props) {
     void refresh();
   }, [refresh]);
 
-  // Refresh the publisher's signed Studio-tool catalog in the background. A
-  // failure is not worth an error banner: offline users can still see tools
-  // already imported or installed, and the catalog can be retried next launch.
+  // The registry is the operator-editable component feed the Runtime Hub
+  // already reads. A failure here is not worth an error banner: it only means
+  // the "available" list stays empty, and the installed list — the half that
+  // matters — is unaffected.
   const loadAvailable = useCallback(async () => {
-    try {
-      await runtimeHubClient.componentSyncCatalog({
-        operationId: createM3OperationId("studio-tools-catalog"),
-        url: DEFAULT_STUDIO_TOOL_CATALOG_URL,
-      });
-    } catch {
-      // Catalog discovery is best-effort; install still verifies the artifact.
-    }
     try {
       const entries = await runtimeHubClient.componentListRegistry({
         operationId: createM3OperationId("studio-tools"),
@@ -102,7 +94,9 @@ export function ToolPanel({ railSlot }: Props) {
     void loadAvailable();
   }, [loadAvailable]);
 
-  /** Manual import remains the air-gapped/self-hosted fallback. */
+  /** A catalog is a small JSON file a publisher hands out. Importing one is
+   *  what puts entries behind the Install buttons below — the registry starts
+   *  empty and there is no catalog server to poll. */
   const importCatalog = async () => {
     const picked = await open({
       directory: false,
@@ -180,7 +174,6 @@ export function ToolPanel({ railSlot }: Props) {
           managed: true,
         }),
       );
-      setSelectedId(component.componentId);
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -194,19 +187,17 @@ export function ToolPanel({ railSlot }: Props) {
     setError(null);
     try {
       const name = picked.split(/[/\\]/).pop() ?? picked;
-      const id = `local-${name.replace(/[^A-Za-z0-9._-]/g, "-")}`;
       setTools(
         await toolsClient.add({
           // Derived from the path so re-adding the same binary replaces its
           // entry instead of stacking duplicates.
-          id,
+          id: `local-${name.replace(/[^A-Za-z0-9._-]/g, "-")}`,
           name,
           path: picked,
           version: null,
           managed: false,
         }),
       );
-      setSelectedId(id);
     } catch (cause) {
       setError(String(cause));
     }
@@ -428,25 +419,6 @@ export function ToolPanel({ railSlot }: Props) {
                 <p className="text-xs text-faint">{t("Studio.tools.starting")}</p>
               ) : manifest ? (
                 <>
-                  {manifest.licenseNotice && !manifest.licenseNotice.commercialUseAllowed && (
-                    <div
-                      role="alert"
-                      className="rounded-lg border border-warning/50 bg-warning/10 p-3 text-xs"
-                    >
-                      <p className="font-medium text-warning">{manifest.licenseNotice.title}</p>
-                      <p className="mt-1 text-muted">{manifest.licenseNotice.message}</p>
-                      {manifest.licenseNotice.url && (
-                        <a
-                          className="mt-2 inline-block text-accent underline"
-                          href={manifest.licenseNotice.url}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          {t("Studio.tools.licenseDetails")}
-                        </a>
-                      )}
-                    </div>
-                  )}
                   <SettingsCard
                     title={manifest.name}
                     hint={manifest.description ?? undefined}

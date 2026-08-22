@@ -225,6 +225,12 @@ pub const REMOTE_ROUTES: &[RemoteRouteSpec] = &[
     RemoteRouteSpec {
         plane: RemotePlane::Control,
         method: "POST",
+        path: "/v1/remote/desktop-control/clipboard-read",
+        gate: RemoteGate::Action("ControlDesktop"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Control,
+        method: "POST",
         path: "/v1/remote/desktop-control/pause",
         gate: RemoteGate::Action("ControlDesktop"),
     },
@@ -1272,7 +1278,7 @@ mod tests {
         let error = check_against_baseline(&serde_json::to_string(&published).unwrap())
             .expect_err("losing a tool without a major bump must fail");
         assert!(error.contains("tool removed: invented_tool"), "{error}");
-        assert!(error.contains("requires at least 3.0.0"), "{error}");
+        assert!(error.contains("requires at least 2.0.0"), "{error}");
     }
 
     #[test]

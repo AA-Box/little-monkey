@@ -7,16 +7,19 @@ Generate the machine-readable evidence envelope before running the native
 driver:
 
 ```sh
+COMPUTER_USE_E2E_RUN=1 COMPUTER_USE_PRODUCTION_BACKEND=1 \
 python3 src-tauri/fixtures/computer-use-e2e.py \
   --report /tmp/little-monkey-computer-use-e2e.json
 ```
 
 The harness validates the fixture and, when `COMPUTER_USE_E2E_RUN=1`, launches
-`computer-use-native-driver.py`. That executable discovers the real
-accessibility window, performs the semantic actions, restarts the fixture,
-captures a screenshot, and proves the negative security cases. A fabricated
-trace dictionary is rejected; acceptance evidence is produced only by the
-driver's required provider/pid/window/action/postcondition envelope.
+`computer-use-native-driver.py`. Set `COMPUTER_USE_PRODUCTION_BACKEND=1` for
+the acceptance path used by CI; it invokes the Rust production backend, which
+creates the scoped grant and approval gates before the OS accessibility
+provider performs the semantic actions. The driver discovers the real
+accessibility window, restarts the fixture, captures a screenshot, inspects
+the audit, and proves the negative security cases. A fabricated trace
+dictionary is rejected.
 
 1. Feature off: Computer Use schemas are absent.
 2. Bypass mode: grant creation is refused.

@@ -108,7 +108,3 @@ All of them run in CI on Linux, macOS and Windows (`pnpm test:rust` and
   They are deliberately absent here, and `DENIED_SURFACES` (published in the
   manifest) is the machine-readable statement that no HTTP caller reaches an
   agent, workspace, tool, file, git, MCP or recipe surface.
-
-## Remote protocol v2
-
-Remote protocol version 2 is a breaking contract release. Clients must negotiate and send protocol version 2 before using the grant-parity and action-outcome fields; older protocol-1 clients are rejected.

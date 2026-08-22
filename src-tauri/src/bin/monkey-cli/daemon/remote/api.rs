@@ -765,6 +765,10 @@ impl RemoteApi {
                 require_action(scopes, RemoteAction::ControlDesktop)
                     .and_then(|_| self.desktop_control_screenshot(&request.body, device_id))
             }
+            ("POST", ["v1", "remote", "desktop-control", "clipboard-read"]) => {
+                require_action(scopes, RemoteAction::ControlDesktop)
+                    .and_then(|_| self.desktop_control_clipboard_read(&request.body, device_id))
+            }
             ("POST", ["v1", "remote", "desktop-control", "pause"]) => {
                 require_action(scopes, RemoteAction::ControlDesktop)
                     .and_then(|_| self.desktop_control_pause(&request.body, device_id, true))
@@ -1360,8 +1364,8 @@ impl RemoteApi {
             request
                 .lifetime_ms
                 .unwrap_or(little_monkey_lib::desktop_control::MAX_SESSION_LIFETIME_MS),
-            request.allow_screenshots.unwrap_or(true),
-            request.allow_keyboard_input.unwrap_or(true),
+            request.allow_screenshots.unwrap_or(false),
+            request.allow_keyboard_input.unwrap_or(false),
             request.allow_clipboard_read.unwrap_or(false),
             request.approval_policy,
         )?;
@@ -1437,6 +1441,24 @@ impl RemoteApi {
             })?;
         let target = request.session_id.clone();
         let value = runtime.screenshot(device_id, request)?;
+        Ok((200, value, Some(target)))
+    }
+
+    fn desktop_control_clipboard_read(
+        &self,
+        body: &[u8],
+        device_id: &str,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let runtime = self.require_desktop()?;
+        let request: DesktopControlTargetRequest =
+            serde_json::from_slice(body).map_err(|error| {
+                (
+                    400,
+                    format!("Invalid desktop-control clipboard-read request: {error}"),
+                )
+            })?;
+        let target = request.session_id.clone();
+        let value = runtime.clipboard_read(device_id, request)?;
         Ok((200, value, Some(target)))
     }
 

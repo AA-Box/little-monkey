@@ -57,9 +57,10 @@ def main() -> int:
         and isinstance(trace, dict)
         and trace.get("native_desktop_actions_executed") is True
         and isinstance(trace.get("driver"), dict)
+        and trace["driver"].get("kind") == "little-monkey-production-backend"
         and trace["driver"].get("pid", 0) > 0
         and trace["driver"].get("window_id")
-        and trace["driver"].get("provider") in {"Accessibility", "UIAutomation"}
+        and trace["driver"].get("provider") in {"Accessibility", "UIAutomation", "AT-SPI"}
     )
     status = "awaiting_native_trace"
     if requested_real_run and not real_run:

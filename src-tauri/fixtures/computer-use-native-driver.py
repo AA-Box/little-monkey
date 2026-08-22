@@ -38,8 +38,31 @@ def terminate(process: subprocess.Popen[bytes]) -> None:
             process.wait(timeout=3)
 
 
-def launch(fixture: Path) -> subprocess.Popen[bytes]:
-    process = subprocess.Popen([sys.executable, str(fixture)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def fixture_python() -> str:
+    candidates = [
+        os.environ.get("COMPUTER_USE_FIXTURE_PYTHON", ""),
+        sys.executable,
+        "/usr/bin/python3",
+        shutil.which("python3") or "",
+        shutil.which("python") or "",
+    ]
+    for candidate in dict.fromkeys(path for path in candidates if path):
+        try:
+            probe = subprocess.run(
+                [candidate, "-c", "import tkinter"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            continue
+        if probe.returncode == 0:
+            return candidate
+    raise RuntimeError("no Python interpreter with tkinter is available for the native fixture")
+
+
+def launch(fixture: Path, interpreter: str) -> subprocess.Popen[bytes]:
+    process = subprocess.Popen([interpreter, str(fixture)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     wait_for_process(process)
     return process
 
@@ -59,14 +82,16 @@ ObjC.import('Foundation');
 const env=$.NSProcessInfo.processInfo.environment;
 const pid=Number(ObjC.unwrap(env.objectForKey('LM_PID')));
 const se=Application('System Events');
-const p=se.processes.byUnixId(pid);
+let p=null; for(const candidate of se.processes()){try{if(Number(candidate.unixId())===pid){p=candidate;break}}catch(_){}}
+if(!p) throw new Error('native process not found: '+pid);
 const w=p.windows[0];
 const safe=(f,d)=>{try{const v=f();return v===undefined?d:v}catch(_){return d}};
+const text=(...fs)=>{for(const f of fs){const value=safe(f,'');if(value!==null&&value!==undefined&&String(value).trim()!=='')return String(value)}return ''};
 const out=[];
 for(const e of safe(()=>w.entireContents(),[])){
   const role=String(safe(()=>e.role(),''));
   const subrole=String(safe(()=>e.attribute('AXSubrole'),''));
-  const label=String(safe(()=>e.description(),safe(()=>e.name(),'')));
+  const label=text(()=>e.attribute('AXTitle'),()=>e.description(),()=>e.name());
   const value=safe(()=>e.value(),null);
   out.push({role,subrole,label,value:value===null?null:String(value),enabled:Boolean(safe(()=>e.enabled(),true)),secure:/AXSecureTextField|securetextfield|password/i.test(role+' '+subrole+' '+label)});
 }
@@ -81,11 +106,12 @@ const pid=Number(ObjC.unwrap(env.objectForKey('LM_PID')));
 const wanted=ObjC.unwrap(env.objectForKey('LM_LABEL'));
 const action=ObjC.unwrap(env.objectForKey('LM_ACTION'));
 const value=ObjC.unwrap(env.objectForKey('LM_VALUE'));
-const se=Application('System Events'); const p=se.processes.byUnixId(pid); const w=p.windows[0];
+const se=Application('System Events'); let p=null; for(const candidate of se.processes()){try{if(Number(candidate.unixId())===pid){p=candidate;break}}catch(_){}} if(!p) throw new Error('native process not found: '+pid); const w=p.windows[0];
 const safe=(f,d)=>{try{const v=f();return v===undefined?d:v}catch(_){return d}};
+const text=(...fs)=>{for(const f of fs){const value=safe(f,'');if(value!==null&&value!==undefined&&String(value).trim()!=='')return String(value)}return ''};
 let found=null;
 for(const e of safe(()=>w.entireContents(),[])){
-  const label=String(safe(()=>e.description(),safe(()=>e.name(),'')));
+  const label=text(()=>e.attribute('AXTitle'),()=>e.description(),()=>e.name());
   if(label===wanted){found=e;break;}
 }
 if(!found) throw new Error('native element not found: '+wanted);
@@ -109,7 +135,7 @@ def mac_action(pid: int, label: str, action: str, value: str = "") -> None:
     json.loads(result.stdout)
 
 
-def mac_run(process: subprocess.Popen[bytes], screenshot: Path) -> dict:
+def mac_run(process: subprocess.Popen[bytes], fixture: Path, interpreter: str, screenshot: Path) -> dict:
     pid = process.pid
     first = mac_jxa(MAC_SNAPSHOT.replace("ObjC.unwrap(env.objectForKey('LM_PID'))", str(pid)))
     labels = {str(e.get("label")) for e in first["elements"]}
@@ -129,7 +155,7 @@ def mac_run(process: subprocess.Popen[bytes], screenshot: Path) -> dict:
     subprocess.run(["screencapture", "-x", str(screenshot)], check=True, capture_output=True)
     terminate(process)
     process = None
-    restarted = launch(Path(sys.argv[1]))
+    restarted = launch(fixture, interpreter)
     try:
         after = mac_jxa(MAC_SNAPSHOT.replace("ObjC.unwrap(env.objectForKey('LM_PID'))", str(restarted.pid)))
         profile_persisted = any(str(e.get("value")) == "hello" for e in after["elements"])
@@ -173,9 +199,9 @@ $p.CloseMainWindow();$p.WaitForExit()
 """
 
 
-def windows_run(screenshot: Path) -> dict:
+def windows_run(fixture: Path, screenshot: Path, interpreter: str) -> dict:
     env = os.environ.copy()
-    env.update({"LM_PYTHON": sys.executable, "LM_FIXTURE": sys.argv[1], "LM_SCREENSHOT": str(screenshot)})
+    env.update({"LM_PYTHON": interpreter, "LM_FIXTURE": str(fixture), "LM_SCREENSHOT": str(screenshot)})
     result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_SCRIPT], check=True, capture_output=True, text=True, env=env)
     native = json.loads(result.stdout.strip().splitlines()[-1])
     if not native["profile_persisted"] or not native["dark_persisted"]:
@@ -196,16 +222,67 @@ def main() -> int:
     screenshot = args.trace.with_suffix(".png")
     profile = Path(os.environ.get("TMPDIR", "/tmp")) / "little-monkey-testapp-profile.json"
     profile.unlink(missing_ok=True)
+    interpreter = fixture_python()
+    if os.environ.get("COMPUTER_USE_PRODUCTION_BACKEND") == "1":
+        repo_root = Path(__file__).resolve().parents[2]
+        command = os.environ.get("COMPUTER_USE_BACKEND_DRIVER_COMMAND")
+        if command:
+            production_command = command.split()
+        else:
+            production_command = [
+                "cargo",
+                "run",
+                "--quiet",
+                "--manifest-path",
+                str(repo_root / "src-tauri" / "Cargo.toml"),
+                "--bin",
+                "computer-use-e2e",
+                "--",
+            ]
+        production_environment = os.environ.copy()
+        production_environment["COMPUTER_USE_PYTHON"] = interpreter
+        if platform.system() == "Darwin":
+            mac_fixture = args.trace.with_suffix(".macos-fixture")
+            compiled = subprocess.run(
+                [
+                    "swiftc",
+                    str(args.fixture.with_name("computer-use-test-app-macos.swift")),
+                    "-o",
+                    str(mac_fixture),
+                ],
+                check=False,
+            )
+            if compiled.returncode != 0:
+                args.trace.write_text(
+                    json.dumps({"native_desktop_actions_executed": False, "error": "macOS fixture compilation failed"}, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                return compiled.returncode
+            production_environment["COMPUTER_USE_FIXTURE_COMMAND"] = str(mac_fixture)
+            production_environment["COMPUTER_USE_FIXTURE_APP_ID"] = f"{mac_fixture.name}|{mac_fixture.stem}"
+            production_environment["COMPUTER_USE_FIXTURE_APP_NAME"] = mac_fixture.name
+        completed = subprocess.run(
+            production_command
+            + ["--fixture", str(args.fixture), "--trace", str(args.trace), "--screenshot", str(screenshot)],
+            check=False,
+            env=production_environment,
+        )
+        if completed.returncode != 0 and not args.trace.exists():
+            args.trace.write_text(
+                json.dumps({"native_desktop_actions_executed": False, "error": "production backend driver failed"}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        return completed.returncode
     process = None
     try:
-        process = launch(args.fixture)
+        process = launch(args.fixture, interpreter)
         if platform.system() == "Darwin":
-            trace = mac_run(process, screenshot)
+            trace = mac_run(process, args.fixture, interpreter, screenshot)
             process = None
         elif platform.system() == "Windows":
             terminate(process)
             process = None
-            trace = windows_run(screenshot)
+            trace = windows_run(args.fixture, screenshot, interpreter)
         else:
             raise RuntimeError("Native Computer Use driver requires macOS or Windows; Linux/X11 needs an interactive AT-SPI session")
         trace["native_desktop_actions_executed"] = True

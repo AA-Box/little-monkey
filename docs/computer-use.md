@@ -76,8 +76,11 @@ allowlist.
 
 The remote Computer Use surface mirrors the local observe/act lifecycle through
 `/v1/remote/desktop-control/list-targets`, `/inspect`, `/screenshot`,
-`/action`, `/pause`, `/resume`, and `/stop`. Read-only observation still
-requires the owned session and the paired `ControlDesktop` grant.
+`/clipboard-read`, `/action`, `/pause`, `/resume`, and `/stop`. Read-only
+observation still requires the owned session and the paired `ControlDesktop`
+grant. Omitted remote screenshot and keyboard capabilities default to disabled;
+clipboard reads require their own explicit grant and redact content from the
+durable audit.
 
 ## Verification and recovery
 

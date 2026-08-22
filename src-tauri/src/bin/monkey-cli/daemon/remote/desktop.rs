@@ -518,8 +518,8 @@ impl DesktopControlRuntime {
             batch_requested,
             Vec::new(),
             MAX_SESSION_LIFETIME_MS,
-            true,
-            true,
+            false,
+            false,
             false,
             None,
         )
@@ -733,6 +733,34 @@ impl DesktopControlRuntime {
             "content_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
             "bounds": bounds,
             "target": target,
+        }))
+    }
+
+    /// `POST /v1/remote/desktop-control/clipboard-read`.
+    pub fn clipboard_read(
+        &self,
+        device_id: &str,
+        request: DesktopControlTargetRequest,
+    ) -> Result<serde_json::Value, (u16, String)> {
+        self.require_owned_session(device_id, &request.session_id)?;
+        let application_id = request.target_application_id.ok_or((
+            400,
+            "desktop-control clipboard-read requires target_application_id".to_string(),
+        ))?;
+        let (content, audit_id) = self
+            .state
+            .clipboard_for_remote(
+                &request.session_id,
+                &application_id,
+                request.target_window_id.as_deref(),
+            )
+            .map_err(|error| (409, error))?;
+        Ok(serde_json::json!({
+            "protocol_version": super::protocol::REMOTE_PROTOCOL_VERSION,
+            "session_id": request.session_id,
+            "content": content,
+            "audit_id": audit_id,
+            "content_redacted_from_audit": true,
         }))
     }
 

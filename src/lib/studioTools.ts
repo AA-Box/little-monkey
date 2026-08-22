@@ -15,10 +15,6 @@
  */
 import { invoke } from "@tauri-apps/api/core";
 
-/** Rolling catalog published by the face-swap package workflow. */
-export const DEFAULT_STUDIO_TOOL_CATALOG_URL =
-  "https://github.com/AA-Box/little-monkey/releases/download/face-swap-catalog/face-swap-catalog.json";
-
 export type ToolInputKind = "image" | "text" | "number" | "toggle" | "choice";
 
 export interface ToolChoice {
@@ -44,15 +40,7 @@ export interface ToolManifest {
   id: string;
   name: string;
   description?: string | null;
-  licenseNotice?: ToolLicenseNotice | null;
   inputs: ToolInput[];
-}
-
-export interface ToolLicenseNotice {
-  title: string;
-  message: string;
-  commercialUseAllowed: boolean;
-  url?: string | null;
 }
 
 /** A tool in the user's library. */
