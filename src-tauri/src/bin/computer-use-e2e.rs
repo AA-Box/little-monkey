@@ -185,6 +185,12 @@ fn find_profile_element<'a>(inspection: &'a ComputerInspection) -> Option<&'a Co
         .filter(|element| !element.sensitive)
         .filter_map(|element| {
             let role = element.role.to_ascii_lowercase();
+            let editable_role =
+                role.contains("edit") || role.contains("textfield") || role.contains("text field");
+            let editable_action = element.actions.iter().any(|action| action == "set_value");
+            if !editable_role && !editable_action {
+                return None;
+            }
             let mut score = 0;
             if element.label == "Profile name" {
                 score += 100;
@@ -195,10 +201,10 @@ fn find_profile_element<'a>(inspection: &'a ComputerInspection) -> Option<&'a Co
             ) {
                 score += 80;
             }
-            if role.contains("edit") || role.contains("textfield") || role.contains("text field") {
+            if editable_role {
                 score += 40;
             }
-            if element.actions.iter().any(|action| action == "set_value") {
+            if editable_action {
                 score += 10;
             }
             (score > 0).then_some((score, element))
