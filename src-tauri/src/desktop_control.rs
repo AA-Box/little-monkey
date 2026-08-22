@@ -4553,7 +4553,7 @@ async fn request_action_impl(
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn tool_computer_list_targets(
     state: tauri::State<'_, DesktopControlState>,
     session_id: String,
@@ -4566,7 +4566,7 @@ pub fn tool_computer_list_targets(
         .map_err(|error| wire_control_error(error, ComputerUseFailurePhase::Observe))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn tool_computer_inspect(
     state: tauri::State<'_, DesktopControlState>,
     session_id: String,
@@ -4587,7 +4587,7 @@ pub fn tool_computer_inspect(
         .map_err(|error| wire_control_error(error, ComputerUseFailurePhase::Observe))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn tool_computer_screenshot(
     app: tauri::AppHandle,
     app_state: tauri::State<'_, crate::AppState>,
@@ -4632,7 +4632,7 @@ pub fn tool_computer_screenshot(
     result.map_err(|error| wire_control_error(error, ComputerUseFailurePhase::Execute))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn tool_computer_clipboard_read(
     state: tauri::State<'_, DesktopControlState>,
     session_id: String,
@@ -4661,7 +4661,7 @@ pub fn tool_computer_clipboard_read(
     result.map_err(|error| wire_control_error(error, ComputerUseFailurePhase::Observe))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_computer_focus(
     app: tauri::AppHandle,
     state: tauri::State<'_, DesktopControlState>,
@@ -4684,7 +4684,7 @@ pub async fn tool_computer_focus(
     .await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_computer_click(
     app: tauri::AppHandle,
     state: tauri::State<'_, DesktopControlState>,
@@ -4736,7 +4736,7 @@ pub async fn tool_computer_click(
     .await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_computer_double_click(
     app: tauri::AppHandle,
     state: tauri::State<'_, DesktopControlState>,
@@ -4788,7 +4788,7 @@ pub async fn tool_computer_double_click(
     .await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_computer_scroll(
     app: tauri::AppHandle,
     state: tauri::State<'_, DesktopControlState>,
@@ -4813,7 +4813,7 @@ pub async fn tool_computer_scroll(
     .await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_computer_type(
     app: tauri::AppHandle,
     state: tauri::State<'_, DesktopControlState>,
@@ -4837,7 +4837,7 @@ pub async fn tool_computer_type(
     .await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_computer_key(
     app: tauri::AppHandle,
     state: tauri::State<'_, DesktopControlState>,
@@ -4861,7 +4861,7 @@ pub async fn tool_computer_key(
     .await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_computer_hotkey(
     app: tauri::AppHandle,
     state: tauri::State<'_, DesktopControlState>,
@@ -4885,7 +4885,7 @@ pub async fn tool_computer_hotkey(
     .await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_computer_wait(
     app: tauri::AppHandle,
     state: tauri::State<'_, DesktopControlState>,
@@ -4909,7 +4909,7 @@ pub async fn tool_computer_wait(
     .await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_computer_select(
     app: tauri::AppHandle,
     state: tauri::State<'_, DesktopControlState>,
@@ -4934,7 +4934,7 @@ pub async fn tool_computer_select(
     .await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_computer_set_value(
     app: tauri::AppHandle,
     state: tauri::State<'_, DesktopControlState>,

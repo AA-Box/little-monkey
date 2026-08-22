@@ -90,14 +90,14 @@ export async function runComputerUseFullProductE2e(): Promise<void> {
   };
 
   const start = async (allowedWindows?: string[]): Promise<Session> => invoke('desktop_control_start_session', {
-    allowed_applications: allowedApplications,
-    lifetime_ms: 600_000,
-    approved_batch: true,
-    allowed_windows: allowedWindows ?? [],
-    allow_screenshots: true,
-    allow_keyboard_input: true,
-    allow_clipboard_read: false,
-    approval_policy: 'approved_batch',
+    allowedApplications,
+    lifetimeMs: 600_000,
+    approvedBatch: true,
+    allowedWindows: allowedWindows ?? [],
+    allowScreenshots: true,
+    allowKeyboardInput: true,
+    allowClipboardRead: false,
+    approvalPolicy: 'approved_batch',
   });
 
   try {
@@ -107,7 +107,7 @@ export async function runComputerUseFullProductE2e(): Promise<void> {
       const discovered = (await dispatch('computer_list_targets', { session_id: discovery.sessionId })) as NativeTarget[];
       const target = discovered.find((entry) => entry.windowTitle === 'Little Monkey TestApp') ?? discovered.find((entry) => /little monkey|python/i.test(entry.applicationName));
       if (!target) throw new Error('full product dispatcher could not discover the fixture window');
-      await invoke('desktop_control_stop_session', { session_id: discovery.sessionId });
+      await invoke('desktop_control_stop_session', { sessionId: discovery.sessionId });
 
       const scoped = await start([target.windowId]);
       sessionId = scoped.sessionId;
@@ -171,13 +171,13 @@ export async function runComputerUseFullProductE2e(): Promise<void> {
       trace.model_loop.completed = trace.status === 'completed';
     } finally {
       if (discovery.sessionId !== sessionId) {
-        await invoke('desktop_control_stop_session', { session_id: discovery.sessionId }).catch(() => undefined);
+        await invoke('desktop_control_stop_session', { sessionId: discovery.sessionId }).catch(() => undefined);
       }
     }
   } catch (error) {
     trace.error = error instanceof Error ? error.message : String(error);
   } finally {
-    if (sessionId) await invoke('desktop_control_stop_session', { session_id: sessionId }).catch(() => undefined);
+    if (sessionId) await invoke('desktop_control_stop_session', { sessionId }).catch(() => undefined);
     await invoke('computer_use_full_product_report', { report: trace });
   }
 }
