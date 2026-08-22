@@ -1,4634 +1,1 @@
-//! Safe Desktop Control â€” the production-gated native Computer Use substrate.
-//! Full threat model, platform boundaries, and recovery behavior:
-//! `docs/computer-use.md` and `docs/safe-desktop-control-design.md`.
-//!
-//! All model-facing actions still require a human-created session grant with
-//! explicit scope, capability flags, bounded lifetime, and approval policy.
-//!
-//! Shape, deliberately mirrored from two existing modules rather than
-//! invented fresh:
-//! - [`ControlSession`] mirrors `m7_companion::CaptureGrant` (id, scope,
-//!   `created_at_ms`/`expires_at_ms`, `active`), but the scope is a
-//!   non-empty *allowlist* of application/window identifiers rather than a
-//!   single optional one, and every action must name which allowlisted
-//!   target it's aimed at.
-//! - The pending-action approve/deny flow mirrors `permissions.rs`'s
-//!   `PendingPermission`/oneshot resume mechanism exactly (insert a
-//!   `oneshot::Sender<bool>` keyed by a generated id, await it with a
-//!   timeout, a separate command resolves it) â€” copied for the mechanism,
-//!   not the struct itself, since `PendingPermission` is tool-call-shaped
-//!   and carries run-ledger fields this spike has no use for.
-//!
-//! [`DesktopInputBackend`] is the one seam that keeps every session/gating/
-//! approval/emergency-stop code path testable without ever touching a real
-//! OS cursor: [`NullBackend`] (test double, always succeeds) and
-//! [`UnsupportedBackend`] (production fallback on platforms/environments
-//! without a wired input path, always a clear error) both implement it
-//! alongside the real `enigo`-backed implementation. No test in this module
-//! exercises anything other than `NullBackend`.
-//!
-//! Platform support for the real input path ([`EnigoBackend`], selected by
-//! [`production_backend`]):
-//! - **macOS** â€” real input (needs Accessibility permission). Runtime-verified.
-//! - **Windows** â€” real input via `enigo` (`SendInput` under the hood).
-//! - **Linux/X11** â€” real input via `enigo` (`x11rb`, `enigo`'s default
-//!   feature).
-//! - **Linux/Wayland** â€” deliberately *unsupported*: `production_backend`
-//!   detects a Wayland session (see [`is_wayland_session`]) and returns
-//!   [`UnsupportedBackend`] rather than constructing `enigo::Enigo`, since
-//!   synthetic input on Wayland needs an xdg-desktop-portal/libei integration
-//!   that is not built here. X11 sessions work today.
-//! - Everything else (BSD, etc.) â€” [`UnsupportedBackend`], as before.
-//!
-//! CAUTION: the Windows and Linux code paths below are compiled only on their
-//! own target_os, so they are NOT type-checked or runtime-verified in this
-//! macOS development environment. All non-trivial platform logic (the Wayland
-//! guard) is factored into pure, host-testable functions; the OS-gated blocks
-//! themselves are kept to a bare `enigo` call. See each block's own note.
-
-use std::collections::{BTreeMap, HashMap};
-use std::io::{Read, Write as _};
-use std::path::PathBuf;
-use std::process::Command;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use base64::Engine as _;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use tauri::{Emitter, Manager};
-use tokio::sync::oneshot;
-use uuid::Uuid;
-
-/// Longest a control session may run before it must be restarted explicitly
-/// â€” mirrors `m7_companion::MAX_GRANT_LIFETIME_MS`'s "bounded, not
-/// indefinite" posture for the same reason: an unattended session left open
-/// for hours is its own risk even with every other gate in place.
-pub const MAX_SESSION_LIFETIME_MS: u64 = 30 * 60 * 1_000;
-
-/// A held cross-process desktop-control lock is considered stale â€” and may be
-/// reclaimed â€” once it is older than this bound, even if its owner pid still
-/// happens to be alive. A single control session can never legitimately
-/// outlive [`MAX_SESSION_LIFETIME_MS`], so a lock older than that can only be
-/// a leak from a crashed or wedged controller.
-const STALE_LOCK_MS: u64 = MAX_SESSION_LIFETIME_MS;
-
-/// Longest a single pending action waits for a human decision before it is
-/// treated as denied â€” mirrors `permissions::PERMISSION_TIMEOUT`'s "silence
-/// is a denial, never a hang" posture, just shorter: an on-screen desktop
-/// action prompt is meant to be answered in seconds, not minutes.
-const ACTION_APPROVAL_TIMEOUT: Duration = Duration::from_secs(2 * 60);
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum MouseButtonKind {
-    Left,
-    Right,
-    Middle,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalPolicy {
-    PerAction,
-    ApprovedBatch,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalLevel {
-    Low,
-    Medium,
-    High,
-    Critical,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ComputerBounds {
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ComputerTarget {
-    pub target_id: String,
-    pub application_id: String,
-    pub application_name: String,
-    pub window_id: String,
-    /// Provider-specific identity retained across X11 window-id
-    /// normalization. It is intentionally not exposed to model callers.
-    #[serde(skip)]
-    pub(crate) provider_window_id: Option<String>,
-    pub window_title: String,
-    pub bounds: ComputerBounds,
-    pub focused: bool,
-    pub sensitive: bool,
-    pub supported_actions: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ComputerElement {
-    pub id: String,
-    pub role: String,
-    pub label: String,
-    pub value: Option<String>,
-    pub bounds: ComputerBounds,
-    pub enabled: bool,
-    pub focused: bool,
-    pub actions: Vec<String>,
-    pub sensitive: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ComputerInspection {
-    pub target: ComputerTarget,
-    pub elements: Vec<ComputerElement>,
-    pub truncated: bool,
-    /// Count only; sensitive elements are never returned with labels or
-    /// values, but callers can verify that the provider saw and redacted them.
-    pub sensitive_element_count: usize,
-    pub query: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ComputerScreenshot {
-    pub artifact_id: String,
-    pub audit_id: String,
-    pub media_type: String,
-    pub size_bytes: u64,
-    pub content_base64: String,
-    pub bounds: ComputerBounds,
-    pub target: ComputerTarget,
-}
-
-/// A single input action a control session may request. Internally tagged
-/// (`kind`) so the frontend's discriminated union matches this shape
-/// exactly, and so a future variant can carry its own fields without a
-/// serialization migration.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum ControlAction {
-    MouseMove {
-        x: i32,
-        y: i32,
-    },
-    MouseClick {
-        button: MouseButtonKind,
-    },
-    MouseClickAt {
-        x: i32,
-        y: i32,
-        button: MouseButtonKind,
-    },
-    MouseDoubleClick {
-        button: MouseButtonKind,
-    },
-    MouseDoubleClickAt {
-        x: i32,
-        y: i32,
-        button: MouseButtonKind,
-    },
-    MouseDrag {
-        from_x: i32,
-        from_y: i32,
-        to_x: i32,
-        to_y: i32,
-    },
-    Scroll {
-        delta_x: i32,
-        delta_y: i32,
-    },
-    TypeText {
-        text: String,
-    },
-    KeyPress {
-        key: String,
-    },
-    Hotkey {
-        keys: Vec<String>,
-    },
-    Focus,
-    SemanticClick {
-        element_id: String,
-        button: MouseButtonKind,
-        #[serde(default)]
-        expected_value: Option<String>,
-    },
-    SemanticDoubleClick {
-        element_id: String,
-        button: MouseButtonKind,
-        #[serde(default)]
-        expected_value: Option<String>,
-    },
-    Select {
-        element_id: String,
-        value: String,
-    },
-    SetValue {
-        element_id: String,
-        value: String,
-    },
-    Wait {
-        milliseconds: u64,
-    },
-}
-
-/// Seam between session/gating logic and the real OS. Every method takes
-/// `&self` (not `&mut self`) so a single `Arc<dyn DesktopInputBackend>` can
-/// be shared across concurrent action dispatches without an outer lock
-/// forcing them to serialize purely for borrow-checking reasons â€” real
-/// implementations that need exclusive access (e.g. `enigo::Enigo`, which
-/// isn't `Sync`) hold their own internal `Mutex`.
-pub trait DesktopInputBackend: Send + Sync {
-    fn move_mouse(&self, x: i32, y: i32) -> Result<(), String>;
-    fn click(&self, button: MouseButtonKind) -> Result<(), String>;
-    fn key_press(&self, key: &str) -> Result<(), String>;
-
-    fn double_click(&self, button: MouseButtonKind) -> Result<(), String> {
-        self.click(button)?;
-        self.click(button)
-    }
-
-    fn drag(&self, from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> Result<(), String> {
-        self.move_mouse(from_x, from_y)?;
-        self.click(MouseButtonKind::Left)?;
-        self.move_mouse(to_x, to_y)?;
-        self.click(MouseButtonKind::Left)
-    }
-
-    fn scroll(&self, delta_x: i32, delta_y: i32) -> Result<(), String> {
-        if delta_x != 0 {
-            self.key_press(&format!("scroll_x:{delta_x}"))?;
-        }
-        if delta_y != 0 {
-            self.key_press(&format!("scroll_y:{delta_y}"))?;
-        }
-        Ok(())
-    }
-
-    fn type_text(&self, text: &str) -> Result<(), String> {
-        for character in text.chars() {
-            self.key_press(&character.to_string())?;
-        }
-        Ok(())
-    }
-
-    fn hotkey(&self, keys: &[String]) -> Result<(), String> {
-        for key in keys {
-            self.key_press(key)?;
-        }
-        Ok(())
-    }
-}
-
-/// Test double: every action always succeeds and touches nothing on the
-/// real OS. Used by every test in this module and nowhere in the production
-/// backend selection below.
-#[derive(Default)]
-pub struct NullBackend;
-
-impl DesktopInputBackend for NullBackend {
-    fn move_mouse(&self, _x: i32, _y: i32) -> Result<(), String> {
-        Ok(())
-    }
-    fn click(&self, _button: MouseButtonKind) -> Result<(), String> {
-        Ok(())
-    }
-    fn key_press(&self, _key: &str) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-/// Production fallback for platforms (or macOS environments where backend
-/// construction itself failed, e.g. no Accessibility permission yet) with no
-/// wired real input path. Every action fails clearly rather than silently
-/// no-op-ing â€” a caller must never be able to mistake "nothing happened" for
-/// "the action ran".
-pub struct UnsupportedBackend(pub String);
-
-impl DesktopInputBackend for UnsupportedBackend {
-    fn move_mouse(&self, _x: i32, _y: i32) -> Result<(), String> {
-        Err(self.0.clone())
-    }
-    fn click(&self, _button: MouseButtonKind) -> Result<(), String> {
-        Err(self.0.clone())
-    }
-    fn key_press(&self, _key: &str) -> Result<(), String> {
-        Err(self.0.clone())
-    }
-}
-
-/// Semantic accessibility seam. The model never receives an unbounded raw OS
-/// handle: adapters return this normalized, bounded representation and every
-/// mutating operation re-resolves the target immediately before execution.
-pub trait DesktopSemanticBackend: Send + Sync {
-    fn list_targets(&self) -> Result<Vec<ComputerTarget>, String>;
-    fn inspect(
-        &self,
-        application_id: &str,
-        window_id: Option<&str>,
-        query: Option<&str>,
-    ) -> Result<ComputerInspection, String>;
-    fn verify_target(
-        &self,
-        application_id: &str,
-        window_id: Option<&str>,
-        require_frontmost: bool,
-    ) -> Result<ComputerTarget, String>;
-    fn focus(&self, target: &ComputerTarget) -> Result<(), String>;
-    fn click_element(
-        &self,
-        target: &ComputerTarget,
-        element_id: &str,
-        button: MouseButtonKind,
-        double: bool,
-    ) -> Result<(), String>;
-    fn set_value(
-        &self,
-        target: &ComputerTarget,
-        element_id: &str,
-        value: &str,
-        select: bool,
-    ) -> Result<(), String>;
-    fn screenshot(
-        &self,
-        target: &ComputerTarget,
-        bounds: Option<ComputerBounds>,
-    ) -> Result<(Vec<u8>, ComputerBounds), String>;
-}
-
-#[derive(Default)]
-pub struct NullSemanticBackend;
-
-impl DesktopSemanticBackend for NullSemanticBackend {
-    fn list_targets(&self) -> Result<Vec<ComputerTarget>, String> {
-        Ok(Vec::new())
-    }
-
-    fn inspect(
-        &self,
-        application_id: &str,
-        window_id: Option<&str>,
-        query: Option<&str>,
-    ) -> Result<ComputerInspection, String> {
-        let target = self.verify_target(application_id, window_id, false)?;
-        Ok(ComputerInspection {
-            target,
-            elements: Vec::new(),
-            truncated: false,
-            sensitive_element_count: 0,
-            query: query.map(str::to_string),
-        })
-    }
-
-    fn verify_target(
-        &self,
-        application_id: &str,
-        window_id: Option<&str>,
-        _require_frontmost: bool,
-    ) -> Result<ComputerTarget, String> {
-        Ok(ComputerTarget {
-            target_id: format!("{application_id}::{}", window_id.unwrap_or("window")),
-            application_id: application_id.to_string(),
-            application_name: application_id.to_string(),
-            window_id: window_id.unwrap_or("window").to_string(),
-            provider_window_id: None,
-            window_title: application_id.to_string(),
-            bounds: ComputerBounds::default(),
-            focused: true,
-            sensitive: false,
-            supported_actions: vec![
-                "inspect".to_string(),
-                "focus".to_string(),
-                "click".to_string(),
-            ],
-        })
-    }
-
-    fn focus(&self, _target: &ComputerTarget) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn click_element(
-        &self,
-        _target: &ComputerTarget,
-        _element_id: &str,
-        _button: MouseButtonKind,
-        _double: bool,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn set_value(
-        &self,
-        _target: &ComputerTarget,
-        _element_id: &str,
-        _value: &str,
-        _select: bool,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn screenshot(
-        &self,
-        target: &ComputerTarget,
-        bounds: Option<ComputerBounds>,
-    ) -> Result<(Vec<u8>, ComputerBounds), String> {
-        Ok((Vec::new(), bounds.unwrap_or_else(|| target.bounds.clone())))
-    }
-}
-
-/// Real input path (macOS, Windows, and Linux/X11). Not exercised by any test
-/// in this module (see the module doc) â€” only ever constructed by
-/// [`production_backend`]. The body is 100% `enigo`'s generic, cross-platform
-/// API (`Mouse`/`Keyboard` traits): nothing here is OS-specific, so the same
-/// struct/impl compiles unchanged on every supported target. `enigo` handles
-/// the per-OS input synthesis internally, in its own crate.
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-struct EnigoBackend(Mutex<enigo::Enigo>);
-
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-impl DesktopInputBackend for EnigoBackend {
-    fn move_mouse(&self, x: i32, y: i32) -> Result<(), String> {
-        use enigo::{Coordinate, Mouse};
-        self.0
-            .lock()
-            .map_err(|_| "desktop input backend lock is poisoned".to_string())?
-            .move_mouse(x, y, Coordinate::Abs)
-            .map_err(|error| error.to_string())
-    }
-
-    fn click(&self, button: MouseButtonKind) -> Result<(), String> {
-        use enigo::{Button, Direction, Mouse};
-        let button = match button {
-            MouseButtonKind::Left => Button::Left,
-            MouseButtonKind::Right => Button::Right,
-            MouseButtonKind::Middle => Button::Middle,
-        };
-        self.0
-            .lock()
-            .map_err(|_| "desktop input backend lock is poisoned".to_string())?
-            .button(button, Direction::Click)
-            .map_err(|error| error.to_string())
-    }
-
-    fn key_press(&self, key: &str) -> Result<(), String> {
-        use enigo::{Direction, Keyboard};
-        let parsed = parse_key(key)?;
-        self.0
-            .lock()
-            .map_err(|_| "desktop input backend lock is poisoned".to_string())?
-            .key(parsed, Direction::Click)
-            .map_err(|error| error.to_string())
-    }
-
-    fn double_click(&self, button: MouseButtonKind) -> Result<(), String> {
-        self.click(button)?;
-        self.click(button)
-    }
-
-    fn drag(&self, from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> Result<(), String> {
-        use enigo::{Button, Coordinate, Direction, Mouse};
-        let button = Button::Left;
-        let mut engine = self
-            .0
-            .lock()
-            .map_err(|_| "desktop input backend lock is poisoned".to_string())?;
-        engine
-            .move_mouse(from_x, from_y, Coordinate::Abs)
-            .map_err(|error| error.to_string())?;
-        engine
-            .button(button, Direction::Press)
-            .map_err(|error| error.to_string())?;
-        engine
-            .move_mouse(to_x, to_y, Coordinate::Abs)
-            .map_err(|error| error.to_string())?;
-        engine
-            .button(button, Direction::Release)
-            .map_err(|error| error.to_string())
-    }
-
-    fn scroll(&self, delta_x: i32, delta_y: i32) -> Result<(), String> {
-        use enigo::{Axis, Mouse};
-        let mut engine = self
-            .0
-            .lock()
-            .map_err(|_| "desktop input backend lock is poisoned".to_string())?;
-        if delta_y != 0 {
-            engine
-                .scroll(delta_y, Axis::Vertical)
-                .map_err(|error| error.to_string())?;
-        }
-        if delta_x != 0 {
-            engine
-                .scroll(delta_x, Axis::Horizontal)
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(())
-    }
-
-    fn type_text(&self, text: &str) -> Result<(), String> {
-        use enigo::Keyboard;
-        self.0
-            .lock()
-            .map_err(|_| "desktop input backend lock is poisoned".to_string())?
-            .text(text)
-            .map_err(|error| error.to_string())
-    }
-
-    fn hotkey(&self, keys: &[String]) -> Result<(), String> {
-        use enigo::{Direction, Keyboard};
-        let parsed: Result<Vec<_>, _> = keys.iter().map(|key| parse_key(key)).collect();
-        let parsed = parsed?;
-        let mut engine = self
-            .0
-            .lock()
-            .map_err(|_| "desktop input backend lock is poisoned".to_string())?;
-        for key in &parsed {
-            engine
-                .key(*key, Direction::Press)
-                .map_err(|error| error.to_string())?;
-        }
-        for key in parsed.iter().rev() {
-            engine
-                .key(*key, Direction::Release)
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(())
-    }
-}
-
-/// A single Unicode character is sent as itself; a small set of named keys
-/// covers the common non-printable ones. Anything else is rejected outright
-/// â€” silently guessing at an unrecognized key name is exactly the kind of
-/// "might do something other than what was approved" gap this spike avoids.
-/// Every `enigo::Key` variant used here is ungated in `enigo`'s `Key` enum, so
-/// this parses identically on macOS, Windows, and Linux.
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-fn parse_key(key: &str) -> Result<enigo::Key, String> {
-    use enigo::Key;
-    let mut chars = key.chars();
-    if let (Some(single), None) = (chars.next(), chars.next()) {
-        return Ok(Key::Unicode(single));
-    }
-    Ok(match key.to_ascii_lowercase().as_str() {
-        "enter" | "return" => Key::Return,
-        "tab" => Key::Tab,
-        "space" => Key::Space,
-        "escape" | "esc" => Key::Escape,
-        "backspace" => Key::Backspace,
-        "ctrl" | "control" => Key::Control,
-        "alt" | "option" => Key::Alt,
-        "shift" => Key::Shift,
-        "cmd" | "command" | "meta" | "super" | "windows" | "win" => Key::Meta,
-        "delete" => Key::Delete,
-        "up" => Key::UpArrow,
-        "down" => Key::DownArrow,
-        "left" => Key::LeftArrow,
-        "right" => Key::RightArrow,
-        _ => return Err(format!("Unsupported key name: {key}")),
-    })
-}
-
-/// Message returned by [`production_backend`] when a Linux/Wayland session is
-/// detected â€” kept as a named constant so the wording is asserted in tests.
-/// Its only production use is Linux-gated, hence the non-Linux `allow`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const WAYLAND_UNSUPPORTED_MESSAGE: &str =
-    "Wayland session detected â€” desktop control needs an xdg-desktop-portal/libei integration \
-     that isn't built yet; X11 sessions work today.";
-
-/// Pure Wayland-session detector. Takes the relevant environment values as
-/// plain `Option<&str>` (it does *not* read the environment itself) so it is
-/// fully unit-testable on any host, including this macOS build machine where
-/// no `#[cfg(target_os = "linux")]` code is ever compiled.
-///
-/// Decision:
-/// - an explicit, non-empty `XDG_SESSION_TYPE` is authoritative: only the
-///   literal `"wayland"` (case-insensitive) counts as Wayland, so `"x11"`
-///   (or any other value) is treated as not-Wayland;
-/// - otherwise, a set, non-empty `WAYLAND_DISPLAY` is taken as Wayland;
-/// - with neither signal present we assume X11/unknown and return `false` (do
-///   not block â€” X11 is the supported Linux path).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn is_wayland_session(xdg_session_type: Option<&str>, wayland_display: Option<&str>) -> bool {
-    if let Some(session_type) = xdg_session_type {
-        if !session_type.trim().is_empty() {
-            return session_type.trim().eq_ignore_ascii_case("wayland");
-        }
-    }
-    wayland_display.is_some_and(|value| !value.trim().is_empty())
-}
-
-/// Thin, Linux-only wrapper that reads the real `XDG_SESSION_TYPE` /
-/// `WAYLAND_DISPLAY` env vars and defers the actual decision to the pure
-/// [`is_wayland_session`] above.
-#[cfg(target_os = "linux")]
-fn is_wayland_session_from_env() -> bool {
-    let session_type = std::env::var("XDG_SESSION_TYPE").ok();
-    let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
-    is_wayland_session(session_type.as_deref(), wayland_display.as_deref())
-}
-
-/// Selects the real [`EnigoBackend`] on macOS / Windows / Linux-X11, or a clear
-/// [`UnsupportedBackend`] otherwise (Linux-Wayland, other OSes, or when the
-/// real backend's own construction fails, e.g. missing Accessibility
-/// permission on macOS) â€” never a silent no-op. Only ever called once, from
-/// `DesktopControlState::production`; every test in this module constructs its
-/// own [`NullBackend`] instead.
-///
-/// NOTE: the Windows and Linux arms below are compiled only on their own
-/// target_os and were NOT compiled or runtime-verified in this macOS
-/// development environment. Each arm is deliberately just a Wayland guard (a
-/// pure, host-tested function) plus one generic `enigo::Enigo::new` call whose
-/// API is identical across every target.
-fn production_backend() -> Arc<dyn DesktopInputBackend> {
-    // Linux/Wayland fails *closed and clearly* before any `enigo` construction:
-    // building `enigo::Enigo` (x11rb backend) under Wayland would either fail
-    // confusingly or behave unpredictably. X11 sessions fall through to enigo.
-    #[cfg(target_os = "linux")]
-    {
-        if is_wayland_session_from_env() {
-            return Arc::new(UnsupportedBackend(WAYLAND_UNSUPPORTED_MESSAGE.to_string()));
-        }
-    }
-    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-    {
-        match enigo::Enigo::new(&enigo::Settings::default()) {
-            Ok(engine) => Arc::new(EnigoBackend(Mutex::new(engine))),
-            Err(error) => Arc::new(UnsupportedBackend(backend_init_error_message(
-                &error.to_string(),
-            ))),
-        }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    {
-        Arc::new(UnsupportedBackend(
-            "Safe Desktop Control input simulation is not implemented on this platform â€” a real \
-             backend is wired only on macOS, Windows, and Linux/X11"
-                .to_string(),
-        ))
-    }
-}
-
-/// Per-OS hint appended to an `enigo::Enigo::new` failure. Kept tiny and
-/// cfg-selected (only the host target's arm is ever compiled); the surrounding
-/// pure string formatting is what makes the message.
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-fn backend_init_error_message(error: &str) -> String {
-    #[cfg(target_os = "macos")]
-    let hint = "grant Accessibility access in System Settings > Privacy & Security > \
-                Accessibility, then restart Little Monkey";
-    #[cfg(target_os = "windows")]
-    let hint = "the current desktop session may not permit synthetic input (e.g. no interactive \
-                desktop, or a higher-integrity window has focus)";
-    #[cfg(target_os = "linux")]
-    let hint = "ensure an X11 display is reachable (DISPLAY set); Wayland sessions are not \
-                supported yet";
-    format!("Could not initialize desktop input simulation â€” {hint}: {error}")
-}
-
-const MAX_NATIVE_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
-const NATIVE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_TARGETS: usize = 64;
-const MAX_ELEMENTS: usize = 256;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const WAYLAND_PORTAL_MESSAGE: &str =
-    "Wayland requires an approved xdg-desktop-portal RemoteDesktop/InputCapture/libei path; \
-     Little Monkey will not bypass compositor security";
-
-#[derive(Default, Deserialize)]
-struct NativeSnapshot {
-    #[serde(default)]
-    targets: Vec<ComputerTarget>,
-    #[serde(default)]
-    elements: HashMap<String, Vec<ComputerElement>>,
-}
-
-struct NativeSemanticBackend {
-    input: Arc<dyn DesktopInputBackend>,
-}
-
-fn production_semantic_backend(
-    input: Arc<dyn DesktopInputBackend>,
-) -> Arc<dyn DesktopSemanticBackend> {
-    Arc::new(NativeSemanticBackend { input })
-}
-
-fn run_native_command(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
-    run_native_command_with_env(program, args, &[])
-}
-
-fn run_native_command_with_env(
-    program: &str,
-    args: &[&str],
-    environment: &[(&str, String)],
-) -> Result<Vec<u8>, String> {
-    let mut command = Command::new(program);
-    command.args(args);
-    for (key, value) in environment {
-        command.env(key, value);
-    }
-    let mut child = command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("Could not start accessibility provider {program}: {error}"))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| format!("Accessibility provider {program} did not expose stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| format!("Accessibility provider {program} did not expose stderr"))?;
-    let (stderr_sender, stderr_receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut stderr = stderr;
-        let mut captured = Vec::new();
-        let mut chunk = [0_u8; 4096];
-        let result = loop {
-            let count = match stderr.read(&mut chunk) {
-                Ok(count) => count,
-                Err(error) => break Err(error.to_string()),
-            };
-            if count == 0 {
-                break Ok(captured);
-            }
-            let remaining = 64 * 1024 - captured.len();
-            if remaining > 0 {
-                captured.extend_from_slice(&chunk[..count.min(remaining)]);
-            }
-        };
-        let _ = stderr_sender.send(result);
-    });
-
-    let (stdout_sender, stdout_receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut stdout = stdout;
-        let mut stdout_bytes = Vec::new();
-        let mut chunk = [0_u8; 16 * 1024];
-        let result = loop {
-            let count = match stdout.read(&mut chunk) {
-                Ok(count) => count,
-                Err(error) => break Err(error.to_string()),
-            };
-            if count == 0 {
-                break Ok(stdout_bytes);
-            }
-            if stdout_bytes.len().saturating_add(count) > MAX_NATIVE_OUTPUT_BYTES {
-                break Err(
-                    "Accessibility provider returned more than the bounded output limit"
-                        .to_string(),
-                );
-            }
-            stdout_bytes.extend_from_slice(&chunk[..count]);
-        };
-        let _ = stdout_sender.send(result);
-    });
-    let deadline = std::time::Instant::now() + NATIVE_PROVIDER_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("Accessibility provider {program} timed out"));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "Could not wait for accessibility provider {program}: {error}"
-                ));
-            }
-        }
-    };
-    let stdout_bytes = stdout_receiver
-        .recv_timeout(Duration::from_secs(1))
-        .map_err(|_| format!("Accessibility provider {program} output timed out"))?
-        .map_err(|error| format!("Could not read accessibility provider output: {error}"))?;
-    let stderr = stderr_receiver
-        .recv_timeout(Duration::from_secs(1))
-        .map_err(|_| format!("Accessibility provider {program} error output timed out"))?
-        .map_err(|error| format!("Could not read accessibility provider error output: {error}"))?;
-    if !status.success() {
-        let error = String::from_utf8_lossy(&stderr);
-        return Err(if error.trim().is_empty() {
-            format!("Accessibility provider {program} exited unsuccessfully")
-        } else {
-            format!("Accessibility provider {program} failed: {}", error.trim())
-        });
-    }
-    Ok(stdout_bytes)
-}
-
-fn read_clipboard_native() -> Result<String, String> {
-    #[cfg(target_os = "macos")]
-    let bytes = run_native_command("pbpaste", &[])?;
-    #[cfg(target_os = "windows")]
-    let bytes = run_native_command(
-        "powershell.exe",
-        &[
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-Clipboard -Raw",
-        ],
-    )?;
-    #[cfg(target_os = "linux")]
-    let bytes = {
-        if is_wayland_session_from_env() {
-            return Err(WAYLAND_PORTAL_MESSAGE.to_string());
-        }
-        run_native_command("xclip", &["-selection", "clipboard", "-o"])
-            .or_else(|_| run_native_command("xsel", &["--clipboard", "--output"]))?
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    let bytes = return Err("Clipboard access is not implemented on this platform".to_string());
-    if bytes.len() > 64 * 1024 {
-        return Err("Clipboard content exceeds the 64 KiB Computer Use read bound".to_string());
-    }
-    String::from_utf8(bytes).map_err(|_| "Clipboard content is not valid UTF-8".to_string())
-}
-
-fn native_snapshot() -> Result<NativeSnapshot, String> {
-    #[cfg(target_os = "macos")]
-    {
-        let bytes = run_native_command("osascript", &["-l", "JavaScript", "-e", MACOS_AX_SCRIPT])?;
-        return serde_json::from_slice(&bytes)
-            .map_err(|error| format!("macOS Accessibility returned invalid data: {error}"));
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let bytes = run_native_command(
-            "powershell.exe",
-            &[
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                WINDOWS_UIA_SCRIPT,
-            ],
-        )?;
-        return serde_json::from_slice(&bytes)
-            .map_err(|error| format!("Windows UI Automation returned invalid data: {error}"));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if is_wayland_session_from_env() {
-            return Err(WAYLAND_PORTAL_MESSAGE.to_string());
-        }
-        let bytes = run_native_command("python3", &["-c", LINUX_ATSPI_SCRIPT])?;
-        let mut snapshot: NativeSnapshot = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("Linux AT-SPI returned invalid data: {error}"))?;
-        normalize_linux_window_ids(&mut snapshot);
-        return Ok(snapshot);
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    {
-        Err("Semantic accessibility is not implemented on this platform".to_string())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn normalize_linux_window_ids(snapshot: &mut NativeSnapshot) {
-    let Ok(output) = Command::new("wmctrl").args(["-l"]).output() else {
-        return;
-    };
-    let windows: Vec<(String, String)> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.splitn(4, char::is_whitespace);
-            let id = fields.next()?.trim().to_string();
-            let _desktop = fields.next()?;
-            let _host = fields.next()?;
-            let title = fields.next()?.trim().to_string();
-            Some((id, title))
-        })
-        .collect();
-    for target in &mut snapshot.targets {
-        target.provider_window_id = Some(target.window_id.clone());
-        if let Some((window_id, _)) = windows.iter().find(|(_, title)| {
-            !target.window_title.is_empty()
-                && (title == &target.window_title || title.contains(&target.window_title))
-        }) {
-            target.window_id = window_id.clone();
-        }
-    }
-}
-
-fn target_is_sensitive(target: &ComputerTarget) -> bool {
-    target.sensitive
-        || sensitive_text(&format!(
-            "{} {} {} {}",
-            target.application_id, target.application_name, target.window_id, target.window_title
-        ))
-}
-
-fn sensitive_text(value: &str) -> bool {
-    let normalized = value.to_ascii_lowercase();
-    [
-        "1password",
-        "lastpass",
-        "bitwarden",
-        "password manager",
-        "keychain",
-        "securityagent",
-        "system settings",
-        "system preferences",
-        "terminal",
-        "iterm",
-        "powershell",
-        "command prompt",
-        "uac",
-        "windows security",
-        "credential ui",
-        "#32770",
-        "sudo",
-        "authentication",
-        "auth dialog",
-        "biometric",
-        "loginwindow",
-        "full disk encryption",
-        "filevault",
-        "secure password",
-    ]
-    .iter()
-    .any(|token| normalized.contains(token))
-}
-
-fn target_matches(target: &ComputerTarget, application_id: &str, window_id: Option<&str>) -> bool {
-    let application_match = target.application_id == application_id
-        || target.application_name == application_id
-        || target.target_id == application_id;
-    application_match && window_id.is_none_or(|id| target.window_id == id || target.target_id == id)
-}
-
-fn checked_target(
-    snapshot: NativeSnapshot,
-    application_id: &str,
-    window_id: Option<&str>,
-    require_frontmost: bool,
-) -> Result<ComputerTarget, String> {
-    let target = snapshot
-        .targets
-        .into_iter()
-        .find(|target| target_matches(target, application_id, window_id))
-        .ok_or_else(|| "Target application/window is stale or no longer visible".to_string())?;
-    if target_is_sensitive(&target) {
-        return Err("Sensitive application/window targets are blocked".to_string());
-    }
-    if require_frontmost && !target.focused {
-        return Err("Target is not frontmost; focus it and retry".to_string());
-    }
-    Ok(target)
-}
-
-fn bounded_elements(
-    snapshot: &NativeSnapshot,
-    target: &ComputerTarget,
-    query: Option<&str>,
-) -> (Vec<ComputerElement>, bool, usize) {
-    let query = query.map(str::to_ascii_lowercase);
-    let mut seen = std::collections::HashSet::new();
-    let mut elements = Vec::new();
-    let mut truncated = false;
-    let mut sensitive_element_count = 0;
-    for element in snapshot
-        .elements
-        .get(&target.target_id)
-        .into_iter()
-        .flatten()
-    {
-        if !seen.insert(element.id.clone()) {
-            continue;
-        }
-        if query.as_ref().is_some_and(|needle| {
-            !format!(
-                "{} {} {}",
-                element.role,
-                element.label,
-                element.value.as_deref().unwrap_or_default()
-            )
-            .to_ascii_lowercase()
-            .contains(needle)
-        }) {
-            continue;
-        }
-        if element.sensitive || sensitive_text(&format!("{} {}", element.role, element.label)) {
-            sensitive_element_count += 1;
-            continue;
-        }
-        if elements.len() == MAX_ELEMENTS {
-            truncated = true;
-            break;
-        }
-        elements.push(element.clone());
-    }
-    (elements, truncated, sensitive_element_count)
-}
-
-fn element_center(element: &ComputerElement) -> Result<(i32, i32), String> {
-    if !element.bounds.x.is_finite()
-        || !element.bounds.y.is_finite()
-        || !element.bounds.width.is_finite()
-        || !element.bounds.height.is_finite()
-        || element.bounds.width <= 0.0
-        || element.bounds.height <= 0.0
-    {
-        return Err("Accessibility element has no actionable bounds".to_string());
-    }
-    let x = (element.bounds.x + element.bounds.width / 2.0).round();
-    let y = (element.bounds.y + element.bounds.height / 2.0).round();
-    if x < f64::from(i32::MIN)
-        || x > f64::from(i32::MAX)
-        || y < f64::from(i32::MIN)
-        || y > f64::from(i32::MAX)
-    {
-        return Err("Accessibility element bounds exceed native coordinate limits".to_string());
-    }
-    Ok((x as i32, y as i32))
-}
-
-fn find_element(target: &ComputerTarget, element_id: &str) -> Result<ComputerElement, String> {
-    let snapshot = native_snapshot()?;
-    let verified = checked_target(
-        snapshot,
-        &target.application_id,
-        Some(&target.window_id),
-        false,
-    )?;
-    let refreshed = native_snapshot()?;
-    let verified = checked_target(
-        refreshed,
-        &verified.application_id,
-        Some(&verified.window_id),
-        false,
-    )?;
-    let snapshot = native_snapshot()?;
-    let (elements, _, _) = bounded_elements(&snapshot, &verified, None);
-    elements
-        .into_iter()
-        .find(|element| element.id == element_id)
-        .ok_or_else(|| {
-            "Accessibility element is stale or outside the bounded inspection".to_string()
-        })
-}
-
-impl DesktopSemanticBackend for NativeSemanticBackend {
-    fn list_targets(&self) -> Result<Vec<ComputerTarget>, String> {
-        let mut targets = native_snapshot()?.targets;
-        targets.retain(|target| !target_is_sensitive(target));
-        targets.truncate(MAX_TARGETS);
-        Ok(targets)
-    }
-
-    fn inspect(
-        &self,
-        application_id: &str,
-        window_id: Option<&str>,
-        query: Option<&str>,
-    ) -> Result<ComputerInspection, String> {
-        let snapshot = native_snapshot()?;
-        let target = checked_target(snapshot, application_id, window_id, false)?;
-        let refreshed = native_snapshot()?;
-        let target = checked_target(
-            refreshed,
-            &target.application_id,
-            Some(&target.window_id),
-            false,
-        )?;
-        let snapshot = native_snapshot()?;
-        let (elements, truncated, sensitive_element_count) =
-            bounded_elements(&snapshot, &target, query);
-        Ok(ComputerInspection {
-            target,
-            elements,
-            truncated,
-            sensitive_element_count,
-            query: query.map(str::to_string),
-        })
-    }
-
-    fn verify_target(
-        &self,
-        application_id: &str,
-        window_id: Option<&str>,
-        require_frontmost: bool,
-    ) -> Result<ComputerTarget, String> {
-        checked_target(
-            native_snapshot()?,
-            application_id,
-            window_id,
-            require_frontmost,
-        )
-    }
-
-    fn focus(&self, target: &ComputerTarget) -> Result<(), String> {
-        #[cfg(target_os = "macos")]
-        {
-            let index = window_index(&target.window_id)?;
-            let bytes = run_native_command_with_env(
-                "osascript",
-                &["-l", "JavaScript", "-e", MACOS_FOCUS_SCRIPT],
-                &[
-                    ("LM_APP_ID", target.application_id.clone()),
-                    ("LM_WINDOW_INDEX", index.to_string()),
-                ],
-            )?;
-            if serde_json::from_slice::<serde_json::Value>(&bytes)
-                .ok()
-                .and_then(|json| json.get("focused").and_then(serde_json::Value::as_bool))
-                == Some(true)
-            {
-                return Ok(());
-            }
-            return Err(
-                "macOS Accessibility did not confirm the requested window focus".to_string(),
-            );
-        }
-        #[cfg(target_os = "windows")]
-        {
-            let script = r#"Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-public static class LMWindow { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd); }
-'@; [LMWindow]::SetForegroundWindow([IntPtr]::new([int64]$env:LM_WINDOW_HANDLE)) | Out-Null"#;
-            return Command::new("powershell.exe")
-                .args(["-NoProfile", "-NonInteractive", "-Command", script])
-                .env("LM_WINDOW_HANDLE", &target.window_id)
-                .status()
-                .map_err(|error| format!("Could not focus target: {error}"))
-                .and_then(|status| {
-                    if status.success() {
-                        Ok(())
-                    } else {
-                        Err("Could not focus target".to_string())
-                    }
-                });
-        }
-        #[cfg(target_os = "linux")]
-        {
-            if is_wayland_session_from_env() {
-                return Err(WAYLAND_PORTAL_MESSAGE.to_string());
-            }
-            return Command::new("wmctrl")
-                .args(["-ia", &target.window_id])
-                .status()
-                .map_err(|error| format!("Could not focus X11 target: {error}"))
-                .and_then(|status| {
-                    if status.success() {
-                        Ok(())
-                    } else {
-                        Err("Could not focus X11 target".to_string())
-                    }
-                });
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-        {
-            let _ = target;
-            Err("Target focus is not implemented on this platform".to_string())
-        }
-    }
-
-    fn click_element(
-        &self,
-        target: &ComputerTarget,
-        element_id: &str,
-        button: MouseButtonKind,
-        double: bool,
-    ) -> Result<(), String> {
-        let element = find_element(target, element_id)?;
-        if element.sensitive || sensitive_text(&format!("{} {}", element.role, element.label)) {
-            return Err("Sensitive accessibility elements are blocked".to_string());
-        }
-        if button == MouseButtonKind::Left {
-            let action = if double { "double_click" } else { "click" };
-            if native_semantic_action(target, element_id, action, None)? {
-                return Ok(());
-            }
-        }
-        let (x, y) = element_center(&element)?;
-        self.input.move_mouse(x, y)?;
-        if double {
-            self.input.double_click(button)
-        } else {
-            self.input.click(button)
-        }
-    }
-
-    fn set_value(
-        &self,
-        target: &ComputerTarget,
-        element_id: &str,
-        value: &str,
-        select: bool,
-    ) -> Result<(), String> {
-        if value.len() > 16 * 1024 || sensitive_text(value) {
-            return Err(
-                "Sensitive or oversized values cannot be sent through Computer Use".to_string(),
-            );
-        }
-        let element = find_element(target, element_id)?;
-        if element.sensitive || sensitive_text(&format!("{} {}", element.role, element.label)) {
-            return Err("Sensitive accessibility elements are blocked".to_string());
-        }
-        let semantic_action = if select { "select" } else { "set_value" };
-        if native_semantic_action(target, element_id, semantic_action, Some(value))? {
-            return Ok(());
-        }
-        let (x, y) = element_center(&element)?;
-        self.input.move_mouse(x, y)?;
-        self.input.click(MouseButtonKind::Left)?;
-        if select {
-            let modifier = if cfg!(target_os = "macos") {
-                "CMD"
-            } else {
-                "CTRL"
-            };
-            self.input
-                .hotkey(&[modifier.to_string(), "A".to_string()])?;
-        }
-        self.input.type_text(value)
-    }
-
-    fn screenshot(
-        &self,
-        target: &ComputerTarget,
-        bounds: Option<ComputerBounds>,
-    ) -> Result<(Vec<u8>, ComputerBounds), String> {
-        let requested = bounds.unwrap_or_else(|| target.bounds.clone());
-        if !requested.x.is_finite()
-            || !requested.y.is_finite()
-            || !requested.width.is_finite()
-            || !requested.height.is_finite()
-            || requested.width <= 0.0
-            || requested.height <= 0.0
-        {
-            return Err("Target has no bounded screenshot region".to_string());
-        }
-        if target.bounds.width > 0.0
-            && (requested.x < target.bounds.x
-                || requested.y < target.bounds.y
-                || requested.x + requested.width > target.bounds.x + target.bounds.width
-                || requested.y + requested.height > target.bounds.y + target.bounds.height)
-        {
-            return Err("Screenshot region is outside the verified target bounds".to_string());
-        }
-        let path = std::env::temp_dir().join(format!("little-monkey-shot-{}.png", Uuid::new_v4()));
-        let x = requested.x.round() as i32;
-        let y = requested.y.round() as i32;
-        let width = requested.width.round() as u32;
-        let height = requested.height.round() as u32;
-        if width == 0 || height == 0 || width > 8192 || height > 8192 {
-            return Err("Screenshot region is outside bounded dimensions".to_string());
-        }
-        #[cfg(target_os = "macos")]
-        let result = Command::new("screencapture")
-            .args(["-x", "-R", &format!("{x},{y},{width},{height}")])
-            .arg(&path)
-            .status()
-            .map_err(|error| format!("Could not capture macOS screenshot: {error}"));
-        #[cfg(target_os = "windows")]
-        let result = Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                WINDOWS_SCREENSHOT_SCRIPT,
-            ])
-            .env("LM_SCREENSHOT_PATH", &path)
-            .env("LM_SCREENSHOT_X", x.to_string())
-            .env("LM_SCREENSHOT_Y", y.to_string())
-            .env("LM_SCREENSHOT_W", width.to_string())
-            .env("LM_SCREENSHOT_H", height.to_string())
-            .status()
-            .map_err(|error| format!("Could not capture Windows screenshot: {error}"));
-        #[cfg(target_os = "linux")]
-        let result = {
-            if is_wayland_session_from_env() {
-                return Err(WAYLAND_PORTAL_MESSAGE.to_string());
-            }
-            let geometry = format!("{x},{y} {width}x{height}");
-            let scrot = Command::new("scrot")
-                .args(["-a", &geometry])
-                .arg(&path)
-                .status();
-            match scrot {
-                Ok(status) if status.success() => Ok(status),
-                _ => Command::new("import")
-                    .args([
-                        "-window",
-                        "root",
-                        "-crop",
-                        &format!("{width}x{height}+{x}+{y}"),
-                    ])
-                    .arg(&path)
-                    .status()
-                    .map_err(|error| format!("Could not capture bounded X11 screenshot: {error}")),
-            }
-        };
-        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-        let result: Result<std::process::ExitStatus, std::io::Error> =
-            Err(std::io::Error::other("unsupported"));
-        let status = result?;
-        if !status.success() {
-            return Err("Screenshot provider exited unsuccessfully".to_string());
-        }
-        let bytes = std::fs::read(&path)
-            .map_err(|error| format!("Could not read screenshot artifact: {error}"));
-        let _ = std::fs::remove_file(&path);
-        let bytes = bytes?;
-        if bytes.len() > MAX_NATIVE_OUTPUT_BYTES {
-            return Err("Screenshot exceeds bounded artifact size".to_string());
-        }
-        Ok((bytes, requested))
-    }
-}
-
-#[cfg(target_os = "macos")]
-const MACOS_AX_SCRIPT: &str = r#"
-ObjC.import('AppKit');
-const se = Application('System Events');
-const providerEnv = $.NSProcessInfo.processInfo.environment;
-const onlyPid = Number(ObjC.unwrap(providerEnv.objectForKey('COMPUTER_USE_FIXTURE_PID')) || 0);
-const onlyName = String(ObjC.unwrap(providerEnv.objectForKey('COMPUTER_USE_FIXTURE_APP_NAME')) || '');
-const safe = (f, d) => { try { const v = f(); return v === undefined ? d : v; } catch (_) { return d; } };
-const text = (...fs) => { for (const f of fs) { const value = safe(f, ''); if (value !== null && value !== undefined && String(value).trim() !== '') return String(value); } return ''; };
-const rect = o => { const p = safe(() => o.position(), [0,0]); const s = safe(() => o.size(), [0,0]); return {x:Number(p[0])||0,y:Number(p[1])||0,width:Number(s[0])||0,height:Number(s[1])||0}; };
-const targets = [], elements = {};
-let processList = [];
-if (onlyName) {
-  const selected = safe(() => se.processes.byName(onlyName), null);
-  if (selected) processList = [selected];
-} else if (onlyPid) {
-  for (const candidate of safe(() => se.processes(), [])) {
-    if (Number(safe(() => candidate.unixId(), 0)) === onlyPid) { processList = [candidate]; break; }
-  }
-} else {
-  processList = safe(() => se.processes(), []);
-}
-for (const p of processList) {
-  try {
-    if (onlyPid && Number(safe(() => p.unixId(), 0)) !== onlyPid) continue;
-    if (!safe(() => p.visible(), false)) continue;
-    const name = String(safe(() => p.name(), '')); const bundle = String(safe(() => p.bundleIdentifier(), '')); const app = bundle === 'null' || bundle === 'undefined' || !bundle ? name : bundle;
-    const front = Boolean(safe(() => p.frontmost(), false)); let wi = 0;
-    for (const w of safe(() => p.windows(), [])) {
-      if (wi >= 32) break;
-      const title = String(safe(() => w.name(), '')); const id = app + '::window-' + wi; const target = {targetId:id,applicationId:app,applicationName:name,windowId:id,windowTitle:title,bounds:rect(w),focused:front && wi===0,sensitive:false,supportedActions:['inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot']}; targets.push(target);
-      const out=[]; let ei=0;
-      for (const e of safe(() => w.entireContents(), [])) { if (ei++ >= 256) break; const role=String(safe(() => e.role(),'')); const subrole=String(safe(() => e.attribute('AXSubrole'),'')); const label=text(() => e.attribute('AXTitle'), () => e.description(), () => e.name()); const value=safe(() => e.value(), null); const native=String(safe(() => e.attribute('AXIdentifier'), '')); const stable=native.replace(/[^A-Za-z0-9._-]/g,'_'); const eb=rect(e); out.push({id:id+'::element-'+(ei-1)+'::native-'+stable,role,label,value:value===null?null:String(value),bounds:eb,enabled:Boolean(safe(() => e.enabled(),true)),focused:Boolean(safe(() => e.focused(),false)),actions:['click','double_click','set_value','select'],sensitive:/AXSecureTextField|securetextfield|password|secure|auth|credential/i.test(role+' '+subrole+' '+label)}); }
-      elements[id]=out; wi++;
-    }
-  } catch (_) {}
-}
-JSON.stringify({targets,elements});
-"#;
-
-#[cfg(target_os = "windows")]
-const WINDOWS_UIA_SCRIPT: &str = r#"
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
-$root=[System.Windows.Automation.AutomationElement]::RootElement
-$targets=@();$elements=@{}
-$windows=$root.FindAll([System.Windows.Automation.TreeScope]::Children,[System.Windows.Automation.Condition]::TrueCondition)
-$onlyPid=0
-try { if($env:COMPUTER_USE_FIXTURE_PID){$onlyPid=[int]$env:COMPUTER_USE_FIXTURE_PID} } catch {}
-if($onlyPid){$windows=@($windows | Where-Object {$_.Current.ProcessId -eq $onlyPid})}
-function ValueOf($e) { try { return $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value } catch { try { return [string]$e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState } catch { return $null } } }
-function ActionsOf($e) { $a=@(); try { $e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern) | Out-Null; $a+='click'; $a+='double_click' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern) | Out-Null; $a+='click' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern) | Out-Null; $a+='set_value' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern) | Out-Null; $a+='select' } catch {}; return @($a | Select-Object -Unique) }
-for($i=0;$i -lt $windows.Count -and $i -lt 64;$i++){ $w=$windows.Item($i);$p=$w.Current.ProcessId;$id="process:$p";$windowId=[string]$w.Current.NativeWindowHandle;$targetId="$id::window-$i";$r=$w.Current.BoundingRectangle;$t=[ordered]@{targetId=$targetId;applicationId=$id;applicationName=$w.Current.Name;windowId=$windowId;windowTitle=$w.Current.Name;bounds=@{x=$r.X;y=$r.Y;width=$r.Width;height=$r.Height};focused=$w.Current.HasKeyboardFocus;sensitive=($w.Current.Name -match 'UAC|Windows Security|credential|password');supportedActions=@('inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot')};$targets+=$t;$list=@();$desc=$w.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition);for($j=0;$j -lt $desc.Count -and $j -lt 256;$j++){ $e=$desc.Item($j);$label=$e.Current.Name;$role=$e.Current.ControlType.ProgrammaticName;$er=$e.Current.BoundingRectangle;$automation=$e.Current.AutomationId;if([string]::IsNullOrWhiteSpace($automation)){try{$automation=($e.GetRuntimeId() -join '-')}catch{$automation=''}};$stable=($automation -replace '[^A-Za-z0-9._-]','_');$list+=[ordered]@{id="$targetId::element-$j::native-$stable";role=$role;label=$label;value=(ValueOf $e);bounds=@{x=$er.X;y=$er.Y;width=$er.Width;height=$er.Height};enabled=$e.Current.IsEnabled;focused=$e.Current.HasKeyboardFocus;actions=(ActionsOf $e);sensitive=([bool]$e.Current.IsPassword -or ($role -match 'Edit' -and $label -match 'password|credential|secret'))};}$elements[$targetId]=$list}
-[ordered]@{targets=$targets;elements=$elements}|ConvertTo-Json -Compress -Depth 8
-"#;
-
-#[cfg(target_os = "windows")]
-const WINDOWS_SCREENSHOT_SCRIPT: &str = r#"
-Add-Type -AssemblyName System.Drawing
-Add-Type @'
-using System; using System.Drawing; using System.Drawing.Imaging; using System.Windows.Forms;
-'@
-$x=[int]$env:LM_SCREENSHOT_X;$y=[int]$env:LM_SCREENSHOT_Y;$w=[int]$env:LM_SCREENSHOT_W;$h=[int]$env:LM_SCREENSHOT_H
-$bmp=New-Object Drawing.Bitmap $w,$h;$g=[Drawing.Graphics]::FromImage($bmp);$g.CopyFromScreen($x,$y,0,0,$bmp.Size);$bmp.Save($env:LM_SCREENSHOT_PATH,[Drawing.Imaging.ImageFormat]::Png);$g.Dispose();$bmp.Dispose()
-"#;
-
-#[cfg(target_os = "linux")]
-const LINUX_ATSPI_SCRIPT: &str = r#"
-import json
-try:
- import pyatspi
-except Exception as e:
- raise SystemExit('AT-SPI unavailable: '+str(e))
-def rect(o):
- try:
-  b=o.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
-  return {'x':b.x,'y':b.y,'width':b.width,'height':b.height}
- except Exception: return {'x':0,'y':0,'width':0,'height':0}
-def walk(node):
- for child in list(node):
-  yield child
-  yield from walk(child)
-targets=[]; elements={}; desktop=pyatspi.Registry.getDesktop(0)
-for app in list(desktop)[:64]:
- name=str(getattr(app,'name','')); aid='atspi:'+name
- for wi,w in enumerate(list(app)[:32]):
-  title=str(getattr(w,'name','')); tid=aid+'::window-'+str(wi); st=w.getState(); target={'targetId':tid,'applicationId':aid,'applicationName':name,'windowId':tid,'windowTitle':title,'bounds':rect(w),'focused':bool(st.contains(pyatspi.STATE_ACTIVE)),'sensitive':False,'supportedActions':['inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot']};targets.append(target); out=[]
-  for ei,e in enumerate(list(walk(w))[:256]):
-   role=str(e.getRoleName()); label=str(getattr(e,'name','')); value=None
-   try: value=str(e.queryValue().getCurrentValue())
-   except Exception: pass
-   actions=[]
-   try:
-    qa=e.queryAction()
-    for ai in range(qa.nActions):
-     name=(qa.getActionName(ai) or '').lower()
-     if name in ('click','press','activate','select'): actions.append(name)
-   except Exception: pass
-   try: e.queryEditableText(); actions.append('set_value')
-   except Exception: pass
-   stable=(role+'-'+label).replace(' ','_')
-   out.append({'id':tid+'::element-'+str(ei)+'::native-'+stable[:80],'role':role,'label':label,'value':value,'bounds':rect(e),'enabled':True,'focused':False,'actions':list(dict.fromkeys(actions)),'sensitive':any(token in (role+' '+label).lower() for token in ('password','secure','credential','authentication'))})
-  elements[tid]=out
-print(json.dumps({'targets':targets,'elements':elements},separators=(',',':')))
-"#;
-
-#[cfg(target_os = "macos")]
-const MACOS_AX_ACTION_SCRIPT: &str = r#"
-ObjC.import('Foundation');
-const se = Application('System Events');
-const env = $.NSProcessInfo.processInfo.environment;
-const get = key => ObjC.unwrap(env.objectForKey(key));
-const safe = (f, d) => { try { const v = f(); return v === undefined ? d : v; } catch (_) { return d; } };
-const text = (...fs) => { for (const f of fs) { const value = safe(f, ''); if (value !== null && value !== undefined && String(value).trim() !== '') return String(value); } return ''; };
-const appId = get('LM_APP_ID');
-const windowIndex = Number(get('LM_WINDOW_INDEX'));
-const elementIndex = Number(get('LM_ELEMENT_INDEX'));
-const action = get('LM_ACTION');
-const value = get('LM_VALUE');
-const process = /^(com|org|net|io)\./.test(appId) ? se.processes.byBundleIdentifier(appId) : se.processes.byName(appId);
-const window = process.windows[windowIndex];
-const element = window.entireContents()[elementIndex];
-if (action === 'set_value') element.value = value;
-else if (action === 'select') { try { element.performAction('AXPress'); } catch (_) { element.click(); } }
-else if (action === 'click') { try { element.performAction('AXPress'); } catch (_) { element.click(); } }
-else if (action === 'double_click') { try { element.performAction('AXPress'); element.performAction('AXPress'); } catch (_) { element.click(); element.click(); } }
-else throw new Error('unsupported semantic action');
-JSON.stringify({semantic:true});
-"#;
-
-#[cfg(target_os = "macos")]
-const MACOS_FOCUS_SCRIPT: &str = r#"
-ObjC.import('Foundation');
-const se = Application('System Events');
-const env = $.NSProcessInfo.processInfo.environment;
-const get = key => ObjC.unwrap(env.objectForKey(key));
-const appId = get('LM_APP_ID');
-const process = /^(com|org|net|io)\./.test(appId) ? se.processes.byBundleIdentifier(appId) : se.processes.byName(appId);
-process.frontmost = true;
-JSON.stringify({focused:Boolean(process.frontmost())});
-"#;
-
-#[cfg(target_os = "windows")]
-const WINDOWS_UIA_ACTION_SCRIPT: &str = r#"
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
-$root=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]::new([int64]$env:LM_WINDOW_HANDLE))
-$desc=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
-$e=$desc.Item([int]$env:LM_ELEMENT_INDEX)
-$action=$env:LM_ACTION
-$performed=$false
-if($action -eq 'set_value') {
-  try { $p=$e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); $p.SetValue($env:LM_VALUE); $performed=$true } catch {}
-} elseif($action -eq 'select') {
-  try { $p=$e.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern); $p.Select(); $performed=$true } catch {}
-} elseif($action -eq 'click' -or $action -eq 'double_click') {
-  try { $p=$e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); $p.Invoke(); $performed=$true } catch {}
-  if(-not $performed) { try { $p=$e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern); $p.Toggle(); $performed=$true } catch {} }
-  if($performed -and $action -eq 'double_click') { try { $p.Invoke(); } catch {} }
-}
-if($performed) { [ordered]@{semantic=$true}|ConvertTo-Json -Compress } else { [ordered]@{semantic=$false}|ConvertTo-Json -Compress }
-"#;
-
-#[cfg(target_os = "linux")]
-const LINUX_ATSPI_ACTION_SCRIPT: &str = r#"
-import os, json
-import pyatspi
-def walk(node):
- for child in list(node):
-  yield child
-  yield from walk(child)
-app_name=os.environ['LM_APP_NAME']; wi=int(os.environ['LM_WINDOW_INDEX']); ei=int(os.environ['LM_ELEMENT_INDEX'])
-a=None
-for candidate in list(pyatspi.Registry.getDesktop(0)):
- if str(getattr(candidate,'name','')) == app_name: a=candidate; break
-if a is None: raise SystemExit('AT-SPI application is stale')
-w=list(a)[wi]; e=list(walk(w))[ei]; action=os.environ['LM_ACTION']
-if action in ('click','double_click','select'):
- actions=e.queryAction(); done=False
- for i in range(actions.nActions):
-  name=(actions.getActionName(i) or '').lower()
-  if name in ('click','press','activate','select'):
-   actions.doAction(i)
-   if action == 'double_click': actions.doAction(i)
-   done=True; break
- if not done:
-  print(json.dumps({'semantic':False},separators=(',',':'))); raise SystemExit(0)
-elif action == 'set_value':
- editable=e.queryEditableText(); editable.setTextContents(os.environ['LM_VALUE'])
-else: raise SystemExit('unsupported semantic action')
-print(json.dumps({'semantic':True},separators=(',',':')))
-"#;
-
-fn element_index(element_id: &str) -> Result<usize, String> {
-    element_id
-        .rsplit_once("::element-")
-        .and_then(|(_, index)| index.split("::").next())
-        .and_then(|index| index.parse::<usize>().ok())
-        .ok_or_else(|| "Accessibility element id has no stable provider index".to_string())
-}
-
-fn window_index(window_id: &str) -> Result<usize, String> {
-    window_id
-        .rsplit_once("::window-")
-        .and_then(|(_, index)| index.parse::<usize>().ok())
-        .ok_or_else(|| "Accessibility window id has no stable provider index".to_string())
-}
-
-fn native_semantic_action(
-    target: &ComputerTarget,
-    element_id: &str,
-    action: &str,
-    value: Option<&str>,
-) -> Result<bool, String> {
-    let element_index = element_index(element_id)?;
-    #[cfg(target_os = "macos")]
-    {
-        let window_index = window_index(&target.window_id)?;
-        let bytes = run_native_command_with_env(
-            "osascript",
-            &["-l", "JavaScript", "-e", MACOS_AX_ACTION_SCRIPT],
-            &[
-                ("LM_APP_ID", target.application_id.clone()),
-                ("LM_WINDOW_INDEX", window_index.to_string()),
-                ("LM_ELEMENT_INDEX", element_index.to_string()),
-                ("LM_ACTION", action.to_string()),
-                ("LM_VALUE", value.unwrap_or_default().to_string()),
-            ],
-        )?;
-        return serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|json| json.get("semantic").and_then(serde_json::Value::as_bool))
-            .ok_or_else(|| "macOS Accessibility action returned invalid data".to_string());
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let bytes = run_native_command_with_env(
-            "powershell.exe",
-            &[
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                WINDOWS_UIA_ACTION_SCRIPT,
-            ],
-            &[
-                ("LM_WINDOW_HANDLE", target.window_id.clone()),
-                ("LM_ELEMENT_INDEX", element_index.to_string()),
-                ("LM_ACTION", action.to_string()),
-                ("LM_VALUE", value.unwrap_or_default().to_string()),
-            ],
-        )?;
-        return serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|json| json.get("semantic").and_then(serde_json::Value::as_bool))
-            .ok_or_else(|| "Windows UI Automation action returned invalid data".to_string());
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if is_wayland_session_from_env() {
-            return Err(WAYLAND_PORTAL_MESSAGE.to_string());
-        }
-        let provider_window_id = target
-            .provider_window_id
-            .as_deref()
-            .unwrap_or(&target.window_id);
-        let window_index = window_index(provider_window_id)?;
-        let bytes = run_native_command_with_env(
-            "python3",
-            &["-c", LINUX_ATSPI_ACTION_SCRIPT],
-            &[
-                ("LM_APP_NAME", target.application_name.clone()),
-                ("LM_WINDOW_INDEX", window_index.to_string()),
-                ("LM_ELEMENT_INDEX", element_index.to_string()),
-                ("LM_ACTION", action.to_string()),
-                ("LM_VALUE", value.unwrap_or_default().to_string()),
-            ],
-        )?;
-        return serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|json| json.get("semantic").and_then(serde_json::Value::as_bool))
-            .ok_or_else(|| "Linux AT-SPI action returned invalid data".to_string());
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    {
-        let _ = (target, element_id, action, value, element_index);
-        Ok(false)
-    }
-}
-
-/// A single control session, scoped to an explicit, non-empty allowlist of
-/// application/window identifiers â€” see the module doc's comparison to
-/// `m7_companion::CaptureGrant`.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ControlSession {
-    pub session_id: String,
-    pub allowed_applications: Vec<String>,
-    pub allowed_windows: Vec<String>,
-    pub created_at_ms: u64,
-    pub expires_at_ms: u64,
-    pub active: bool,
-    pub paused: bool,
-    /// Always `true` while `active`: the visible on-screen indicator is not
-    /// optional in this design (see the design doc's threat-model table).
-    /// Kept as an explicit field rather than implied by `active` so the
-    /// frontend has one clear source of truth for whether to render the
-    /// "control is live" banner, and so a future mode that's active-but-
-    /// hidden would be a visible, deliberate change to this struct rather
-    /// than a silent behavior change.
-    pub indicator_visible: bool,
-    /// See the design doc's "What 'approved batch' mode is" section: skips
-    /// the per-action approval prompt for this session only, never widens
-    /// the allowlist, never disables emergency stop, never escapes the
-    /// session's own expiry.
-    pub approved_batch: bool,
-    pub approval_policy: ApprovalPolicy,
-    pub allow_screenshots: bool,
-    pub allow_keyboard_input: bool,
-    pub allow_clipboard_read: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct SessionGrantOptions {
-    pub allowed_windows: Vec<String>,
-    pub allow_screenshots: bool,
-    pub allow_keyboard_input: bool,
-    pub allow_clipboard_read: bool,
-    pub approval_policy: Option<ApprovalPolicy>,
-}
-
-impl SessionGrantOptions {
-    fn for_legacy(approved_batch: bool) -> Self {
-        Self {
-            allow_screenshots: true,
-            allow_keyboard_input: true,
-            approval_policy: Some(if approved_batch {
-                ApprovalPolicy::ApprovedBatch
-            } else {
-                ApprovalPolicy::PerAction
-            }),
-            ..Self::default()
-        }
-    }
-}
-
-/// An in-flight approval request for one [`ControlAction`], keyed by a
-/// generated id in [`DesktopControlState::pending`]. Not `Clone`/`Serialize`
-/// â€” the `oneshot::Sender` can't be, and nothing outside this module needs
-/// the whole struct; [`PendingActionSummary`] is the serializable view sent
-/// to the frontend.
-#[derive(Clone, Debug, Default)]
-struct AuditContext {
-    run_id: Option<String>,
-    tool_call_id: Option<String>,
-}
-
-struct PendingControlAction {
-    session_id: String,
-    target_application_id: String,
-    target_window_id: Option<String>,
-    action: ControlAction,
-    context: AuditContext,
-    approval_level: ApprovalLevel,
-    approval_digest: String,
-    description: String,
-    sender: Option<oneshot::Sender<bool>>,
-}
-
-/// Serializable snapshot of a pending action, emitted to the frontend so it
-/// can render an approve/deny prompt.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingActionSummary {
-    pub action_id: String,
-    pub session_id: String,
-    pub target_application_id: String,
-    pub target_window_id: Option<String>,
-    pub approval_level: ApprovalLevel,
-    pub description: String,
-    pub action: ControlAction,
-}
-
-#[derive(Clone, Debug, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct VerificationEvidence {
-    pub kind: String,
-    pub element_id: Option<String>,
-    pub expected_value: Option<String>,
-    pub observed_value: Option<String>,
-    pub matched: bool,
-    pub detail: String,
-}
-
-impl VerificationEvidence {
-    fn redacted_for_audit(&self) -> Self {
-        let mut redacted = self.clone();
-        if self.kind == "element_value" {
-            redacted.expected_value = None;
-            redacted.observed_value = None;
-            redacted.detail = format!("{}; values redacted from durable audit", self.detail);
-        }
-        redacted
-    }
-}
-
-/// Result of a resolved (executed or denied) action, returned to the caller
-/// of `desktop_control_request_action`.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ActionOutcome {
-    pub action_id: String,
-    pub executed: bool,
-    pub input_sent: bool,
-    pub state_verified: bool,
-    pub verification: Option<String>,
-    pub verification_evidence: Option<VerificationEvidence>,
-    pub audit_id: String,
-    pub approval_level: ApprovalLevel,
-}
-
-impl ActionOutcome {
-    pub fn from_execution(action_id: String, result: ExecutionResult) -> Self {
-        Self {
-            action_id,
-            executed: true,
-            input_sent: result.input_sent,
-            state_verified: result.state_verified,
-            verification: result.verification,
-            verification_evidence: result.verification_evidence,
-            audit_id: result.audit_id,
-            approval_level: result.approval_level,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ComputerAuditRecord {
-    pub audit_id: String,
-    pub run_id: Option<String>,
-    pub tool_call_id: Option<String>,
-    pub session_id: String,
-    pub target_application_id: String,
-    pub target_window_id: Option<String>,
-    pub action: String,
-    pub approval_level: ApprovalLevel,
-    pub result: String,
-    pub approval: String,
-    pub input_sent: bool,
-    pub state_verified: bool,
-    pub verification: Option<String>,
-    pub verification_evidence: Option<VerificationEvidence>,
-    pub screenshot_ref: Option<String>,
-    pub created_at_ms: u64,
-}
-
-/// Outcome of [`DesktopControlState::begin_action`]'s validation step â€”
-/// factored out from the async command so it's directly testable without an
-/// `AppHandle`/oneshot-await machinery (mirrors `permissions.rs`'s
-/// `mode_short_circuit` being a pure, directly-testable decision function).
-pub enum ActionGate {
-    /// The session is in "approved batch" mode: the action already ran (or
-    /// failed) against the backend, no approval needed.
-    Executed(Result<ExecutionResult, String>),
-    /// The session requires per-action approval: the caller must await
-    /// `receiver`, then dispatch to the backend itself on `Ok(Ok(true))`.
-    Pending {
-        action_id: String,
-        receiver: oneshot::Receiver<bool>,
-    },
-}
-
-pub struct ExecutionResult {
-    input_sent: bool,
-    state_verified: bool,
-    verification: Option<String>,
-    verification_evidence: Option<VerificationEvidence>,
-    audit_id: String,
-    approval_level: ApprovalLevel,
-}
-
-fn validate_coordinates(target: &ComputerTarget, x: i32, y: i32) -> Result<(), String> {
-    if !target.bounds.x.is_finite()
-        || !target.bounds.y.is_finite()
-        || !target.bounds.width.is_finite()
-        || !target.bounds.height.is_finite()
-        || target.bounds.width <= 0.0
-        || target.bounds.height <= 0.0
-    {
-        return Err("Target has no valid bounded coordinate region".to_string());
-    }
-    let inside_x =
-        f64::from(x) >= target.bounds.x && f64::from(x) <= target.bounds.x + target.bounds.width;
-    let inside_y =
-        f64::from(y) >= target.bounds.y && f64::from(y) <= target.bounds.y + target.bounds.height;
-    if inside_x && inside_y {
-        Ok(())
-    } else {
-        Err("Coordinate is outside the verified target bounds".to_string())
-    }
-}
-
-fn action_summary(action: &ControlAction) -> String {
-    match action {
-        ControlAction::TypeText { .. } => "type_text (content redacted)".to_string(),
-        ControlAction::SetValue { .. } | ControlAction::Select { .. } => {
-            "set_value (content redacted)".to_string()
-        }
-        ControlAction::SemanticClick {
-            element_id,
-            button,
-            expected_value,
-        } => format!(
-            "semantic_click element={element_id} button={button:?} expected_value={}",
-            if expected_value.is_some() {
-                "(redacted)"
-            } else {
-                "unspecified"
-            }
-        ),
-        ControlAction::SemanticDoubleClick {
-            element_id,
-            button,
-            expected_value,
-        } => format!(
-            "semantic_double_click element={element_id} button={button:?} expected_value={}",
-            if expected_value.is_some() {
-                "(redacted)"
-            } else {
-                "unspecified"
-            }
-        ),
-        _ => serde_json::to_string(action).unwrap_or_else(|_| "unserializable_action".to_string()),
-    }
-}
-
-fn approval_digest(
-    session_id: &str,
-    target_application_id: &str,
-    target_window_id: Option<&str>,
-    action: &ControlAction,
-    approval: ApprovalLevel,
-    description: &str,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"little-monkey-computer-approval-v1\0");
-    let action_json = serde_json::to_string(action).unwrap_or_default();
-    for value in [
-        session_id,
-        target_application_id,
-        target_window_id.unwrap_or(""),
-        &format!("{approval:?}"),
-        description,
-        &action_json,
-    ] {
-        hasher.update((value.len() as u64).to_le_bytes());
-        hasher.update(value.as_bytes());
-    }
-    format!("{:x}", hasher.finalize())
-}
-
-fn approval_level(action: &ControlAction) -> ApprovalLevel {
-    approval_level_for_name(&action_summary(action))
-}
-
-fn approval_level_for_name(action_name: &str) -> ApprovalLevel {
-    let summary = action_name.to_ascii_lowercase();
-    if [
-        "delete", "destroy", "remove", "purchase", "payment", "confirm", "send", "submit",
-        "publish", "revoke", "shutdown", "format", "erase",
-    ]
-    .iter()
-    .any(|token| summary.contains(token))
-    {
-        return ApprovalLevel::Critical;
-    }
-    if summary.contains("screenshot")
-        || summary.contains("inspect")
-        || summary.contains("clipboard")
-    {
-        ApprovalLevel::Low
-    } else if summary.contains("focus") || summary.contains("scroll") {
-        ApprovalLevel::Medium
-    } else {
-        ApprovalLevel::High
-    }
-}
-
-fn redacted_action_for_ui(action: &ControlAction) -> ControlAction {
-    match action {
-        ControlAction::TypeText { text } => ControlAction::TypeText {
-            text: format!("[redacted typed text: {} characters]", text.chars().count()),
-        },
-        ControlAction::SetValue { element_id, value } => ControlAction::SetValue {
-            element_id: element_id.clone(),
-            value: format!("[redacted value: {} characters]", value.chars().count()),
-        },
-        ControlAction::Select { element_id, value } => ControlAction::Select {
-            element_id: element_id.clone(),
-            value: format!("[redacted value: {} characters]", value.chars().count()),
-        },
-        other => other.clone(),
-    }
-}
-
-fn lock<'a, T>(mutex: &'a Mutex<T>, label: &str) -> Result<MutexGuard<'a, T>, String> {
-    mutex
-        .lock()
-        .map_err(|_| format!("{label} lock is poisoned"))
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
-}
-
-fn validate_application_id(value: &str) -> Result<(), String> {
-    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
-        Err(
-            "Application/window identifier must be a non-empty, printable, bounded string"
-                .to_string(),
-        )
-    } else {
-        Ok(())
-    }
-}
-
-/// Contents of the machine-wide desktop-control lock file. Persisted as JSON
-/// so a stale lock left by a crashed process can be inspected and reclaimed by
-/// a later controller (see [`STALE_LOCK_MS`] and `process_alive`).
-#[derive(Serialize, Deserialize)]
-struct LockContents {
-    pid: u32,
-    acquired_at_ms: u64,
-}
-
-/// RAII owner of the on-disk desktop-control lock file. Removing the file on
-/// drop is the process-exit backstop the design requires: even if a controller
-/// panics between `start_session_impl` and an explicit stop, dropping the
-/// [`DesktopControlState`] releases the lock so the next process is not blocked
-/// by a phantom owner.
-struct DesktopControlLockGuard {
-    path: PathBuf,
-}
-
-impl Drop for DesktopControlLockGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// Best-effort liveness probe mirroring `daemon::service::process_alive` â€” a
-/// lock whose owner pid is gone is always safe to reclaim regardless of age.
-fn process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
-    #[cfg(windows)]
-    {
-        std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .output()
-            .map(|output| {
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
-            })
-            .unwrap_or(false)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-        true
-    }
-}
-
-pub struct DesktopControlState {
-    backend: Arc<dyn DesktopInputBackend>,
-    semantic: Arc<dyn DesktopSemanticBackend>,
-    sessions: Mutex<BTreeMap<String, ControlSession>>,
-    pending: Mutex<HashMap<String, PendingControlAction>>,
-    audit: Mutex<Vec<ComputerAuditRecord>>,
-    /// Path of the machine-wide exclusive lock this state must hold while any
-    /// session is active, or `None` to disable cross-process locking (the
-    /// shape every in-module test and any pure in-process caller uses).
-    lock_path: Option<PathBuf>,
-    /// The currently-held lock guard, if this state owns an active session.
-    held_lock: Mutex<Option<DesktopControlLockGuard>>,
-}
-
-impl DesktopControlState {
-    pub fn production() -> Self {
-        let backend = production_backend();
-        Self::with_backends_and_lock(backend.clone(), production_semantic_backend(backend), None)
-    }
-
-    /// Production backend plus the machine-wide exclusive lock at
-    /// `<app_data>/desktop_control.lock`, so the local Tauri app and the
-    /// resident daemon can never drive real OS input at the same time even
-    /// though each constructs its own `DesktopControlState`.
-    pub fn production_with_lock(lock_path: PathBuf) -> Self {
-        let backend = production_backend();
-        Self::with_backends_and_lock(
-            backend.clone(),
-            production_semantic_backend(backend),
-            Some(lock_path),
-        )
-    }
-
-    pub fn with_backend(backend: Arc<dyn DesktopInputBackend>) -> Self {
-        Self::with_backend_and_lock(backend, None)
-    }
-
-    pub fn with_backend_and_lock(
-        backend: Arc<dyn DesktopInputBackend>,
-        lock_path: Option<PathBuf>,
-    ) -> Self {
-        Self::with_backends_and_lock(backend, Arc::new(NullSemanticBackend), lock_path)
-    }
-
-    pub fn with_backends_and_lock(
-        backend: Arc<dyn DesktopInputBackend>,
-        semantic: Arc<dyn DesktopSemanticBackend>,
-        lock_path: Option<PathBuf>,
-    ) -> Self {
-        Self {
-            backend,
-            semantic,
-            sessions: Mutex::new(BTreeMap::new()),
-            pending: Mutex::new(HashMap::new()),
-            audit: Mutex::new(Vec::new()),
-            lock_path,
-            held_lock: Mutex::new(None),
-        }
-    }
-
-    /// Acquire the machine-wide lock before a session may be created. A no-op
-    /// when cross-process locking is disabled (`lock_path` is `None`) or when
-    /// this state already owns the lock (a second concurrent session in the
-    /// same process is fine â€” the invariant is one *controller process* at a
-    /// time). A lock held by a live, recent process refuses the start.
-    fn acquire_lock(&self) -> Result<(), String> {
-        let Some(path) = self.lock_path.as_ref() else {
-            return Ok(());
-        };
-        let mut held = lock(&self.held_lock, "desktop control lock")?;
-        if held.is_some() {
-            return Ok(());
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                format!("Could not prepare desktop-control lock directory: {error}")
-            })?;
-        }
-        // One reclaim attempt: if the existing lock is stale (dead owner or
-        // older than STALE_LOCK_MS) remove it and retry the create-new.
-        for attempt in 0..2 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-            {
-                Ok(mut file) => {
-                    let contents = LockContents {
-                        pid: std::process::id(),
-                        acquired_at_ms: now_ms(),
-                    };
-                    let bytes = serde_json::to_vec(&contents).map_err(|error| {
-                        format!("Could not encode desktop-control lock: {error}")
-                    })?;
-                    file.write_all(&bytes).map_err(|error| {
-                        format!("Could not write desktop-control lock: {error}")
-                    })?;
-                    file.sync_all().map_err(|error| {
-                        format!("Could not persist desktop-control lock: {error}")
-                    })?;
-                    *held = Some(DesktopControlLockGuard { path: path.clone() });
-                    return Ok(());
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if attempt == 0 && self.reclaim_if_stale(path) {
-                        continue;
-                    }
-                    return Err(
-                        "Another control session is already active on this machine â€” stop it \
-                         (or wait for it to expire) before starting a new one"
-                            .to_string(),
-                    );
-                }
-                Err(error) => {
-                    return Err(format!("Could not create desktop-control lock: {error}"));
-                }
-            }
-        }
-        Err(
-            "Another control session is already active on this machine â€” stop it (or wait for \
-             it to expire) before starting a new one"
-                .to_string(),
-        )
-    }
-
-    /// Returns `true` (having removed the file) when the on-disk lock is stale
-    /// â€” unreadable, owned by a dead pid, or older than [`STALE_LOCK_MS`].
-    fn reclaim_if_stale(&self, path: &std::path::Path) -> bool {
-        let stale = match std::fs::read(path) {
-            Ok(bytes) => match serde_json::from_slice::<LockContents>(&bytes) {
-                Ok(contents) => {
-                    now_ms().saturating_sub(contents.acquired_at_ms) > STALE_LOCK_MS
-                        || !process_alive(contents.pid)
-                }
-                // A corrupt/partial lock file cannot represent a live owner.
-                Err(_) => true,
-            },
-            Err(_) => true,
-        };
-        if stale {
-            let _ = std::fs::remove_file(path);
-        }
-        stale
-    }
-
-    /// Drop the held lock once no session in this state is active any more.
-    fn release_lock_if_idle(&self) -> Result<(), String> {
-        if self.lock_path.is_none() {
-            return Ok(());
-        }
-        let any_active = lock(&self.sessions, "control sessions")?
-            .values()
-            .any(|session| session.active);
-        if !any_active {
-            *lock(&self.held_lock, "desktop control lock")? = None;
-        }
-        Ok(())
-    }
-
-    /// Core session-start logic, deliberately taking the caller's current
-    /// permission mode as a plain `&str` rather than reaching for
-    /// `tauri::State<AppState>` itself â€” this is the hard invariant
-    /// ("never reachable from bypass, no exceptions") and it must be
-    /// directly testable with a bare string, not only through a full Tauri
-    /// command. The `#[tauri::command]` wrapper below is what actually
-    /// resolves the live mode via `permissions::get_permission_mode`.
-    pub fn start_session_impl(
-        &self,
-        permission_mode: &str,
-        allowed_applications: Vec<String>,
-        lifetime_ms: u64,
-        approved_batch: bool,
-    ) -> Result<ControlSession, String> {
-        self.start_session_with_options(
-            permission_mode,
-            allowed_applications,
-            lifetime_ms,
-            SessionGrantOptions::for_legacy(approved_batch),
-        )
-    }
-
-    pub fn start_session_with_options(
-        &self,
-        permission_mode: &str,
-        allowed_applications: Vec<String>,
-        lifetime_ms: u64,
-        options: SessionGrantOptions,
-    ) -> Result<ControlSession, String> {
-        if permission_mode == "bypass" {
-            return Err(
-                "Safe Desktop Control can never be started while permission mode is bypass â€” \
-                 switch to a gated mode (manual, acceptEdits, plan, auto, or smart) first"
-                    .to_string(),
-            );
-        }
-        if allowed_applications.is_empty() {
-            return Err(
-                "Safe Desktop Control requires at least one allowed application/window â€” an \
-                 empty allowlist would mean the session could act anywhere"
-                    .to_string(),
-            );
-        }
-        if allowed_applications.len() > 64 {
-            return Err("Safe Desktop Control allowlist is limited to 64 entries".to_string());
-        }
-        for application_id in &allowed_applications {
-            validate_application_id(application_id)?;
-        }
-        if options.allowed_windows.len() > 64 {
-            return Err(
-                "Safe Desktop Control window allowlist is limited to 64 entries".to_string(),
-            );
-        }
-        for window_id in &options.allowed_windows {
-            validate_application_id(window_id)?;
-        }
-        if lifetime_ms == 0 || lifetime_ms > MAX_SESSION_LIFETIME_MS {
-            return Err(format!(
-                "Session lifetime must be between 1 ms and {MAX_SESSION_LIFETIME_MS} ms"
-            ));
-        }
-        // Acquire the machine-wide exclusive lock before a session exists, so
-        // a refused start never leaves a half-created session behind.
-        self.acquire_lock()?;
-        let created_at_ms = now_ms();
-        let approval_policy = options.approval_policy.unwrap_or(ApprovalPolicy::PerAction);
-        let session = ControlSession {
-            session_id: format!("desktop-control-{}", Uuid::new_v4()),
-            allowed_applications,
-            allowed_windows: options.allowed_windows,
-            created_at_ms,
-            expires_at_ms: created_at_ms.saturating_add(lifetime_ms),
-            active: true,
-            paused: false,
-            indicator_visible: true,
-            approved_batch: matches!(approval_policy, ApprovalPolicy::ApprovedBatch),
-            approval_policy,
-            allow_screenshots: options.allow_screenshots,
-            allow_keyboard_input: options.allow_keyboard_input,
-            allow_clipboard_read: options.allow_clipboard_read,
-        };
-        lock(&self.sessions, "control sessions")?
-            .insert(session.session_id.clone(), session.clone());
-        Ok(session)
-    }
-
-    /// Deactivates one session and denies any of its still-pending actions.
-    /// Returns whether the session was active before this call (so a caller
-    /// can tell "stopped something" from "was already stopped/unknown").
-    pub fn stop_session(&self, session_id: &str) -> Result<bool, String> {
-        let was_active = lock(&self.sessions, "control sessions")?
-            .get_mut(session_id)
-            .map(|session| {
-                let was_active = session.active;
-                session.active = false;
-                was_active
-            })
-            .unwrap_or(false);
-        self.deny_pending_for_session(session_id)?;
-        self.release_lock_if_idle()?;
-        Ok(was_active)
-    }
-
-    pub fn pause_session(&self, session_id: &str, paused: bool) -> Result<bool, String> {
-        let changed = lock(&self.sessions, "control sessions")?
-            .get_mut(session_id)
-            .map(|session| {
-                let changed = session.active && session.paused != paused;
-                if changed {
-                    session.paused = paused;
-                }
-                changed
-            })
-            .unwrap_or(false);
-        if paused {
-            self.deny_pending_for_session(session_id)?;
-        }
-        Ok(changed)
-    }
-
-    /// Read-only snapshot for the Settings panel, with lazily-expired
-    /// sessions reflected in the returned copy â€” mirrors
-    /// `m7_companion::M7CompanionState::security_grants`'s "reflect
-    /// expiration without mutating on a read" behavior.
-    pub fn sessions_snapshot(&self) -> Result<Vec<ControlSession>, String> {
-        let now = now_ms();
-        Ok(lock(&self.sessions, "control sessions")?
-            .values()
-            .cloned()
-            .map(|mut session| {
-                if session.expires_at_ms <= now {
-                    session.active = false;
-                }
-                session
-            })
-            .collect())
-    }
-
-    /// Returns whether any session is still active â€” used to decide whether
-    /// the visible indicator should keep showing.
-    pub fn any_session_active(&self) -> Result<bool, String> {
-        Ok(self
-            .sessions_snapshot()?
-            .iter()
-            .any(|session| session.active))
-    }
-
-    fn active_session(&self, session_id: &str) -> Result<ControlSession, String> {
-        let now = now_ms();
-        let mut sessions = lock(&self.sessions, "control sessions")?;
-        let session = sessions
-            .get_mut(session_id)
-            .ok_or_else(|| "Control session is missing or was stopped".to_string())?;
-        if session.expires_at_ms <= now {
-            session.active = false;
-        }
-        if !session.active {
-            return Err("Control session is inactive or expired".to_string());
-        }
-        if session.paused {
-            return Err("Control session is paused".to_string());
-        }
-        Ok(session.clone())
-    }
-
-    pub fn list_targets_for_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<ComputerTarget>, String> {
-        let session = self.active_session(session_id)?;
-        let mut targets = self.semantic.list_targets()?;
-        targets.retain(|target| {
-            !target_is_sensitive(target)
-                && session.allowed_applications.iter().any(|allowed| {
-                    allowed == &target.application_id
-                        || allowed == &target.application_name
-                        || allowed == &target.target_id
-                })
-                && (session.allowed_windows.is_empty()
-                    || session.allowed_windows.iter().any(|allowed| {
-                        allowed == &target.window_id || allowed == &target.target_id
-                    }))
-        });
-        targets.truncate(MAX_TARGETS);
-        Ok(targets)
-    }
-
-    pub fn inspect_for_session(
-        &self,
-        session_id: &str,
-        target_application_id: &str,
-        target_window_id: Option<&str>,
-        query: Option<&str>,
-    ) -> Result<ComputerInspection, String> {
-        let _ = self.require_active_session_for_target(
-            session_id,
-            target_application_id,
-            target_window_id,
-            false,
-        )?;
-        self.semantic
-            .inspect(target_application_id, target_window_id, query)
-    }
-
-    pub fn screenshot_for_session(
-        &self,
-        session_id: &str,
-        target_application_id: &str,
-        target_window_id: Option<&str>,
-        bounds: Option<ComputerBounds>,
-    ) -> Result<(ComputerTarget, Vec<u8>, ComputerBounds), String> {
-        let session = self.active_session(session_id)?;
-        if !session.allow_screenshots {
-            return Err("This session grant does not allow screenshots".to_string());
-        }
-        let (_, target) = self.require_active_session_for_target(
-            session_id,
-            target_application_id,
-            target_window_id,
-            false,
-        )?;
-        let (bytes, captured_bounds) = self.semantic.screenshot(&target, bounds)?;
-        Ok((target, bytes, captured_bounds))
-    }
-
-    fn clipboard_for_session(
-        &self,
-        session_id: &str,
-        target_application_id: &str,
-        target_window_id: Option<&str>,
-        context: &AuditContext,
-    ) -> Result<(String, String), String> {
-        let session = self.active_session(session_id)?;
-        if !session.allow_clipboard_read {
-            return Err("This session grant does not allow clipboard reads".to_string());
-        }
-        let _ = self.require_active_session_for_target(
-            session_id,
-            target_application_id,
-            target_window_id,
-            false,
-        )?;
-        let text = read_clipboard_native()?;
-        let audit_id = self.record_named_audit_with_context(
-            session_id,
-            target_application_id,
-            target_window_id,
-            "clipboard_read (content redacted)".to_string(),
-            "executed",
-            "granted",
-            false,
-            true,
-            Some("clipboard content returned to the model; content omitted from audit".to_string()),
-            context,
-        )?;
-        Ok((text, audit_id))
-    }
-
-    /// Reads clipboard content only for a session that explicitly granted the
-    /// clipboard capability. Remote callers use this wrapper so they share
-    /// the same target validation and redacted audit record as local callers.
-    pub fn clipboard_for_remote(
-        &self,
-        session_id: &str,
-        target_application_id: &str,
-        target_window_id: Option<&str>,
-    ) -> Result<(String, String), String> {
-        self.clipboard_for_session(
-            session_id,
-            target_application_id,
-            target_window_id,
-            &AuditContext::default(),
-        )
-    }
-
-    fn require_active_session_for_target(
-        &self,
-        session_id: &str,
-        target_application_id: &str,
-        target_window_id: Option<&str>,
-        require_frontmost: bool,
-    ) -> Result<(ControlSession, ComputerTarget), String> {
-        validate_application_id(target_application_id)?;
-        if let Some(window_id) = target_window_id {
-            validate_application_id(window_id)?;
-        }
-        if sensitive_text(target_application_id) || target_window_id.is_some_and(sensitive_text) {
-            return Err("Sensitive application/window targets are blocked".to_string());
-        }
-        let now = now_ms();
-        let session = {
-            let mut sessions = lock(&self.sessions, "control sessions")?;
-            let session = sessions
-                .get_mut(session_id)
-                .ok_or_else(|| "Control session is missing or was stopped".to_string())?;
-            if session.expires_at_ms <= now {
-                session.active = false;
-            }
-            if !session.active {
-                return Err("Control session is inactive or expired".to_string());
-            }
-            if session.paused {
-                return Err("Control session is paused".to_string());
-            }
-            session.clone()
-        };
-        let target = self.semantic.verify_target(
-            target_application_id,
-            target_window_id,
-            require_frontmost,
-        )?;
-        if target_is_sensitive(&target) {
-            return Err("Sensitive application/window targets are blocked".to_string());
-        }
-        let app_allowed = session.allowed_applications.iter().any(|allowed| {
-            allowed == target_application_id
-                || allowed == &target.application_id
-                || allowed == &target.application_name
-                || allowed == &target.target_id
-        });
-        let window_allowed = session.allowed_windows.is_empty()
-            || session
-                .allowed_windows
-                .iter()
-                .any(|allowed| allowed == &target.window_id || allowed == &target.target_id);
-        if !app_allowed || !window_allowed {
-            return Err(
-                "Target application/window is outside this session's allowlist".to_string(),
-            );
-        }
-        Ok((session, target))
-    }
-
-    fn action_requires_frontmost(action: &ControlAction) -> bool {
-        !matches!(action, ControlAction::Focus | ControlAction::Wait { .. })
-    }
-
-    fn action_targets_sensitive_focus(
-        &self,
-        target_application_id: &str,
-        target_window_id: Option<&str>,
-        action: &ControlAction,
-    ) -> Result<bool, String> {
-        if !matches!(
-            action,
-            ControlAction::TypeText { .. }
-                | ControlAction::KeyPress { .. }
-                | ControlAction::Hotkey { .. }
-        ) {
-            return Ok(false);
-        }
-        Ok(self
-            .semantic
-            .inspect(target_application_id, target_window_id, None)?
-            .elements
-            .iter()
-            .any(|element| element.focused && element.sensitive))
-    }
-
-    fn action_approval(
-        &self,
-        target_application_id: &str,
-        target_window_id: Option<&str>,
-        action: &ControlAction,
-    ) -> (ApprovalLevel, String) {
-        let mut description = action_summary(action);
-        let element_id = match action {
-            ControlAction::SemanticClick { element_id, .. }
-            | ControlAction::SemanticDoubleClick { element_id, .. }
-            | ControlAction::Select { element_id, .. }
-            | ControlAction::SetValue { element_id, .. } => Some(element_id.as_str()),
-            _ => None,
-        };
-        let mut element_unverified = false;
-        if let Some(element_id) = element_id {
-            if let Ok(inspection) =
-                self.semantic
-                    .inspect(target_application_id, target_window_id, None)
-            {
-                if let Some(element) = inspection
-                    .elements
-                    .iter()
-                    .find(|element| element.id == element_id)
-                {
-                    description.push_str(&format!(
-                        " role={} label={}",
-                        element.role,
-                        if element.label.is_empty() {
-                            "(unlabelled)"
-                        } else {
-                            &element.label
-                        }
-                    ));
-                } else {
-                    element_unverified = true;
-                }
-            } else {
-                element_unverified = true;
-            }
-        }
-        let level = if element_id.is_some() {
-            if element_unverified {
-                ApprovalLevel::Critical
-            } else {
-                approval_level_for_name(&description)
-            }
-        } else {
-            approval_level(action)
-        };
-        (level, description)
-    }
-
-    fn verify_postcondition(
-        &self,
-        target_application_id: &str,
-        target_window_id: Option<&str>,
-        action: &ControlAction,
-        before_value: Option<String>,
-    ) -> (bool, Option<VerificationEvidence>, Option<String>) {
-        let element_id = match action {
-            ControlAction::SemanticClick { element_id, .. }
-            | ControlAction::SemanticDoubleClick { element_id, .. }
-            | ControlAction::Select { element_id, .. }
-            | ControlAction::SetValue { element_id, .. } => Some(element_id.as_str()),
-            _ => None,
-        };
-        if matches!(action, ControlAction::Focus) {
-            return match self
-                .semantic
-                .verify_target(target_application_id, target_window_id, true)
-            {
-                Ok(target) if target.focused => (
-                    true,
-                    Some(VerificationEvidence {
-                        kind: "target_focus".to_string(),
-                        element_id: None,
-                        expected_value: None,
-                        observed_value: Some("focused".to_string()),
-                        matched: true,
-                        detail: "the requested target is focused after the action".to_string(),
-                    }),
-                    Some("target focus verified after action".to_string()),
-                ),
-                Ok(_) => (
-                    false,
-                    Some(VerificationEvidence {
-                        kind: "target_focus".to_string(),
-                        element_id: None,
-                        expected_value: Some("focused".to_string()),
-                        observed_value: Some("not_focused".to_string()),
-                        matched: false,
-                        detail: "the target remained reachable but is not focused".to_string(),
-                    }),
-                    Some("target remained reachable but focus was not verified".to_string()),
-                ),
-                Err(error) => (
-                    false,
-                    Some(VerificationEvidence {
-                        kind: "target_focus".to_string(),
-                        element_id: None,
-                        expected_value: Some("focused".to_string()),
-                        observed_value: None,
-                        matched: false,
-                        detail: error.clone(),
-                    }),
-                    Some(format!("target focus could not be verified: {error}")),
-                ),
-            };
-        }
-        if let Some(element_id) = element_id {
-            let expected = match action {
-                ControlAction::SemanticClick { expected_value, .. }
-                | ControlAction::SemanticDoubleClick { expected_value, .. } => {
-                    expected_value.clone()
-                }
-                ControlAction::Select { value, .. } | ControlAction::SetValue { value, .. } => {
-                    Some(value.clone())
-                }
-                _ => None,
-            };
-            let inspected = self
-                .semantic
-                .inspect(target_application_id, target_window_id, None)
-                .ok()
-                .and_then(|inspection| {
-                    inspection
-                        .elements
-                        .into_iter()
-                        .find(|element| element.id == element_id)
-                });
-            let observed = inspected.as_ref().and_then(|element| element.value.clone());
-            let matched = if let Some(expected) = expected.as_deref() {
-                observed
-                    .as_deref()
-                    .is_some_and(|value| value.trim() == expected.trim())
-            } else {
-                before_value
-                    .as_deref()
-                    .zip(observed.as_deref())
-                    .is_some_and(|(before, after)| before != after)
-            };
-            let detail = if expected.is_some() {
-                "the inspected element value was compared with the requested postcondition"
-            } else {
-                "the inspected element value was compared before and after the semantic action"
-            };
-            return (
-                matched,
-                Some(VerificationEvidence {
-                    kind: "element_value".to_string(),
-                    element_id: Some(element_id.to_string()),
-                    expected_value: expected,
-                    observed_value: observed,
-                    matched,
-                    detail: detail.to_string(),
-                }),
-                Some(if matched {
-                    "element state verified after action".to_string()
-                } else {
-                    "input was sent; the requested element state was not verified".to_string()
-                }),
-            );
-        }
-        let detail = if matches!(action, ControlAction::Wait { .. }) {
-            "the target was revalidated after the wait"
-        } else {
-            "input delivery was confirmed, but no element postcondition was supplied"
-        };
-        let verified = matches!(action, ControlAction::Wait { .. })
-            && self
-                .semantic
-                .verify_target(target_application_id, target_window_id, false)
-                .is_ok();
-        (
-            verified,
-            Some(VerificationEvidence {
-                kind: "target_revalidation".to_string(),
-                element_id: None,
-                expected_value: None,
-                observed_value: None,
-                matched: verified,
-                detail: detail.to_string(),
-            }),
-            Some(detail.to_string()),
-        )
-    }
-
-    fn set_audit_verification_evidence(
-        &self,
-        audit_id: &str,
-        evidence: Option<VerificationEvidence>,
-    ) -> Result<(), String> {
-        if let Some(record) = lock(&self.audit, "desktop control audit")?
-            .iter_mut()
-            .find(|record| record.audit_id == audit_id)
-        {
-            record.verification_evidence = evidence.map(|value| value.redacted_for_audit());
-        }
-        Ok(())
-    }
-
-    fn validate_action(
-        session: &ControlSession,
-        target: &ComputerTarget,
-        action: &ControlAction,
-    ) -> Result<(), String> {
-        let keyboard_action = matches!(
-            action,
-            ControlAction::TypeText { .. }
-                | ControlAction::KeyPress { .. }
-                | ControlAction::Hotkey { .. }
-                | ControlAction::Select { .. }
-                | ControlAction::SetValue { .. }
-        );
-        if keyboard_action && !session.allow_keyboard_input {
-            return Err("This session grant does not allow keyboard input".to_string());
-        }
-        match action {
-            ControlAction::TypeText { text } if text.len() > 16 * 1024 => {
-                Err("Typed text exceeds the 16 KiB action bound".to_string())
-            }
-            ControlAction::Hotkey { keys } if keys.is_empty() || keys.len() > 8 => {
-                Err("Hotkeys must contain between 1 and 8 named keys".to_string())
-            }
-            ControlAction::Hotkey { keys }
-                if keys.iter().any(|key| key.is_empty() || key.len() > 64) =>
-            {
-                Err("Hotkey names are bounded printable strings".to_string())
-            }
-            ControlAction::Scroll { delta_x, delta_y }
-                if delta_x.unsigned_abs() > 10_000 || delta_y.unsigned_abs() > 10_000 =>
-            {
-                Err("Scroll deltas exceed the bounded action limit".to_string())
-            }
-            ControlAction::Wait { milliseconds } if *milliseconds > 10_000 => {
-                Err("Wait is limited to 10 seconds".to_string())
-            }
-            ControlAction::MouseClickAt { x, y, .. }
-            | ControlAction::MouseDoubleClickAt { x, y, .. } => {
-                validate_coordinates(target, *x, *y)
-            }
-            ControlAction::MouseDrag {
-                from_x,
-                from_y,
-                to_x,
-                to_y,
-            } => {
-                validate_coordinates(target, *from_x, *from_y)?;
-                validate_coordinates(target, *to_x, *to_y)
-            }
-            ControlAction::SemanticClick { element_id, .. }
-            | ControlAction::SemanticDoubleClick { element_id, .. }
-            | ControlAction::Select { element_id, .. }
-            | ControlAction::SetValue { element_id, .. }
-                if element_id.len() > 512 || element_id.chars().any(char::is_control) =>
-            {
-                Err("Accessibility element id is invalid or too long".to_string())
-            }
-            _ => Ok(()),
-        }
-    }
-
-    fn execute_for_target_with_context(
-        &self,
-        session_id: &str,
-        target_application_id: &str,
-        target_window_id: Option<&str>,
-        action: &ControlAction,
-        context: &AuditContext,
-    ) -> Result<ExecutionResult, String> {
-        let (session, target) = self.require_active_session_for_target(
-            session_id,
-            target_application_id,
-            target_window_id,
-            Self::action_requires_frontmost(action),
-        )?;
-        Self::validate_action(&session, &target, action)?;
-        if self.action_targets_sensitive_focus(target_application_id, target_window_id, action)? {
-            return Err(
-                "Keyboard input into a sensitive or authentication element is blocked".to_string(),
-            );
-        }
-        let before_value = match action {
-            ControlAction::SemanticClick { element_id, .. }
-            | ControlAction::SemanticDoubleClick { element_id, .. }
-            | ControlAction::Select { element_id, .. }
-            | ControlAction::SetValue { element_id, .. } => self
-                .semantic
-                .inspect(target_application_id, target_window_id, None)
-                .ok()
-                .and_then(|inspection| {
-                    inspection
-                        .elements
-                        .into_iter()
-                        .find(|element| element.id == *element_id)
-                        .and_then(|element| element.value)
-                }),
-            _ => None,
-        };
-        let mut input_sent = false;
-        match action {
-            ControlAction::MouseMove { x, y } => {
-                validate_coordinates(&target, *x, *y)?;
-                self.backend.move_mouse(*x, *y)?;
-                input_sent = true;
-            }
-            ControlAction::MouseClick { button } => {
-                self.backend.click(*button)?;
-                input_sent = true;
-            }
-            ControlAction::MouseClickAt { x, y, button } => {
-                self.backend.move_mouse(*x, *y)?;
-                self.backend.click(*button)?;
-                input_sent = true;
-            }
-            ControlAction::MouseDoubleClick { button } => {
-                self.backend.double_click(*button)?;
-                input_sent = true;
-            }
-            ControlAction::MouseDoubleClickAt { x, y, button } => {
-                self.backend.move_mouse(*x, *y)?;
-                self.backend.double_click(*button)?;
-                input_sent = true;
-            }
-            ControlAction::MouseDrag {
-                from_x,
-                from_y,
-                to_x,
-                to_y,
-            } => {
-                self.backend.drag(*from_x, *from_y, *to_x, *to_y)?;
-                input_sent = true;
-            }
-            ControlAction::Scroll { delta_x, delta_y } => {
-                self.backend.scroll(*delta_x, *delta_y)?;
-                input_sent = true;
-            }
-            ControlAction::TypeText { text } => {
-                self.backend.type_text(text)?;
-                input_sent = true;
-            }
-            ControlAction::KeyPress { key } => {
-                if key.is_empty() || key.len() > 64 || key.chars().any(char::is_control) {
-                    return Err("Key name is invalid or too long".to_string());
-                }
-                self.backend.key_press(key)?;
-                input_sent = true;
-            }
-            ControlAction::Hotkey { keys } => {
-                self.backend.hotkey(keys)?;
-                input_sent = true;
-            }
-            ControlAction::Focus => {
-                self.semantic.focus(&target)?;
-            }
-            ControlAction::SemanticClick {
-                element_id, button, ..
-            } => {
-                self.semantic
-                    .click_element(&target, element_id, *button, false)?;
-                input_sent = true;
-            }
-            ControlAction::SemanticDoubleClick {
-                element_id, button, ..
-            } => {
-                self.semantic
-                    .click_element(&target, element_id, *button, true)?;
-                input_sent = true;
-            }
-            ControlAction::Select { element_id, value } => {
-                self.semantic.set_value(&target, element_id, value, true)?;
-                input_sent = true;
-            }
-            ControlAction::SetValue { element_id, value } => {
-                self.semantic.set_value(&target, element_id, value, false)?;
-                input_sent = true;
-            }
-            ControlAction::Wait { milliseconds } => {
-                std::thread::sleep(Duration::from_millis(*milliseconds))
-            }
-        }
-        let (verified, verification_evidence, verification) = self.verify_postcondition(
-            target_application_id,
-            target_window_id,
-            action,
-            before_value,
-        );
-        let audit_id = self.record_audit_with_context(
-            session_id,
-            target_application_id,
-            target_window_id,
-            action,
-            "executed",
-            "approved",
-            input_sent,
-            verified,
-            verification.clone(),
-            context,
-        )?;
-        self.set_audit_verification_evidence(&audit_id, verification_evidence.clone())?;
-        let (approval_level, _) =
-            self.action_approval(target_application_id, target_window_id, action);
-        Ok(ExecutionResult {
-            input_sent,
-            state_verified: verified,
-            verification,
-            verification_evidence,
-            audit_id,
-            approval_level,
-        })
-    }
-
-    fn record_audit_with_context(
-        &self,
-        session_id: &str,
-        target_application_id: &str,
-        target_window_id: Option<&str>,
-        action: &ControlAction,
-        result: &str,
-        approval: &str,
-        input_sent: bool,
-        state_verified: bool,
-        verification: Option<String>,
-        context: &AuditContext,
-    ) -> Result<String, String> {
-        self.record_named_audit_with_context(
-            session_id,
-            target_application_id,
-            target_window_id,
-            action_summary(action),
-            result,
-            approval,
-            input_sent,
-            state_verified,
-            verification,
-            context,
-        )
-    }
-
-    fn record_named_audit_with_context(
-        &self,
-        session_id: &str,
-        target_application_id: &str,
-        target_window_id: Option<&str>,
-        action_name: String,
-        result: &str,
-        approval: &str,
-        input_sent: bool,
-        state_verified: bool,
-        verification: Option<String>,
-        context: &AuditContext,
-    ) -> Result<String, String> {
-        let audit_id = format!("desktop-audit-{}", Uuid::new_v4());
-        let approval_level = approval_level_for_name(&action_name);
-        let record = ComputerAuditRecord {
-            audit_id: audit_id.clone(),
-            run_id: context.run_id.clone(),
-            tool_call_id: context.tool_call_id.clone(),
-            session_id: session_id.to_string(),
-            target_application_id: target_application_id.to_string(),
-            target_window_id: target_window_id.map(str::to_string),
-            action: action_name,
-            approval_level,
-            result: result.to_string(),
-            approval: approval.to_string(),
-            input_sent,
-            state_verified,
-            verification,
-            verification_evidence: None,
-            screenshot_ref: None,
-            created_at_ms: now_ms(),
-        };
-        let mut audit = lock(&self.audit, "desktop control audit")?;
-        if audit.len() >= 1024 {
-            audit.remove(0);
-        }
-        audit.push(record);
-        Ok(audit_id)
-    }
-
-    pub fn audit_snapshot(&self) -> Result<Vec<ComputerAuditRecord>, String> {
-        Ok(lock(&self.audit, "desktop control audit")?.clone())
-    }
-
-    fn record_screenshot_audit(
-        &self,
-        session_id: &str,
-        target_application_id: &str,
-        target_window_id: Option<&str>,
-        artifact_id: &str,
-        context: &AuditContext,
-    ) -> Result<String, String> {
-        let audit_id = self.record_named_audit_with_context(
-            session_id,
-            target_application_id,
-            target_window_id,
-            "screenshot".to_string(),
-            "executed",
-            "grant",
-            false,
-            true,
-            Some("bounded screenshot captured".to_string()),
-            context,
-        )?;
-        let mut audit = lock(&self.audit, "desktop control audit")?;
-        if let Some(record) = audit.iter_mut().find(|record| record.audit_id == audit_id) {
-            record.screenshot_ref = Some(artifact_id.to_string());
-        }
-        Ok(audit_id)
-    }
-
-    /// Records a screenshot requested through the paired daemon. The remote
-    /// path has no frontend turn/tool identity, but it must still create the
-    /// same durable audit row as the local screenshot command.
-    pub fn record_screenshot_audit_for_remote(
-        &self,
-        session_id: &str,
-        target_application_id: &str,
-        target_window_id: Option<&str>,
-        artifact_id: &str,
-    ) -> Result<String, String> {
-        self.record_screenshot_audit(
-            session_id,
-            target_application_id,
-            target_window_id,
-            artifact_id,
-            &AuditContext::default(),
-        )
-    }
-
-    /// Validates the session/allowlist, then either executes immediately
-    /// (approved-batch session) or registers a pending approval and returns
-    /// the receiver half of its oneshot channel for the caller to await.
-    /// Pure with respect to `AppHandle`/async runtime â€” the
-    /// `#[tauri::command]` wrapper owns emitting the frontend event and
-    /// awaiting with a timeout.
-    pub fn begin_action(
-        &self,
-        session_id: &str,
-        target_application_id: &str,
-        action: ControlAction,
-    ) -> Result<ActionGate, String> {
-        self.begin_action_for_target(session_id, target_application_id, None, action)
-    }
-
-    pub fn begin_action_for_target(
-        &self,
-        session_id: &str,
-        target_application_id: &str,
-        target_window_id: Option<&str>,
-        action: ControlAction,
-    ) -> Result<ActionGate, String> {
-        self.begin_action_for_target_with_context(
-            session_id,
-            target_application_id,
-            target_window_id,
-            action,
-            AuditContext::default(),
-        )
-    }
-
-    fn begin_action_for_target_with_context(
-        &self,
-        session_id: &str,
-        target_application_id: &str,
-        target_window_id: Option<&str>,
-        action: ControlAction,
-        context: AuditContext,
-    ) -> Result<ActionGate, String> {
-        let (session, _) = self.require_active_session_for_target(
-            session_id,
-            target_application_id,
-            target_window_id,
-            Self::action_requires_frontmost(&action),
-        )?;
-        let (approval, description) =
-            self.action_approval(target_application_id, target_window_id, &action);
-        if session.approved_batch && approval != ApprovalLevel::Critical {
-            return Ok(ActionGate::Executed(self.execute_for_target_with_context(
-                session_id,
-                target_application_id,
-                target_window_id,
-                &action,
-                &context,
-            )));
-        }
-        let approval_digest = approval_digest(
-            session_id,
-            target_application_id,
-            target_window_id,
-            &action,
-            approval,
-            &description,
-        );
-        let (sender, receiver) = oneshot::channel::<bool>();
-        let action_id = format!("control-action-{}", Uuid::new_v4());
-        lock(&self.pending, "pending control actions")?.insert(
-            action_id.clone(),
-            PendingControlAction {
-                session_id: session_id.to_string(),
-                target_application_id: target_application_id.to_string(),
-                target_window_id: target_window_id.map(str::to_string),
-                action: action.clone(),
-                context,
-                approval_level: approval,
-                approval_digest,
-                description,
-                sender: Some(sender),
-            },
-        );
-        Ok(ActionGate::Pending {
-            action_id,
-            receiver,
-        })
-    }
-
-    /// Resolves a pending action by id, sending the decision through its
-    /// oneshot channel. Returns `Ok(true)` if a pending action with that id
-    /// existed, `Ok(false)` otherwise â€” mirrors `permissions.rs`'s
-    /// `respond_if_pending` split between this pure lookup and the
-    /// `#[tauri::command]` wrapper that turns "not found" into an `Err`.
-    pub fn resolve_if_pending(&self, action_id: &str, approve: bool) -> Result<bool, String> {
-        let mut pending = lock(&self.pending, "pending control actions")?;
-        if !pending.contains_key(action_id) {
-            return Ok(false);
-        }
-        // If the receiving end was already dropped (e.g. the request timed
-        // out just before this call), there's nothing left to notify.
-        let sender = pending
-            .get_mut(action_id)
-            .and_then(|pending| pending.sender.take());
-        let Some(sender) = sender else {
-            return Ok(false);
-        };
-        let _ = sender.send(approve);
-        if !approve {
-            pending.remove(action_id);
-        }
-        Ok(true)
-    }
-
-    fn take_approved_pending(
-        &self,
-        action_id: &str,
-        action: &ControlAction,
-    ) -> Result<ExecutionResult, String> {
-        let pending = lock(&self.pending, "pending control actions")?
-            .remove(action_id)
-            .ok_or_else(|| "Approved control action was no longer pending".to_string())?;
-        if &pending.action != action {
-            return Err("Pending action payload changed before approval".to_string());
-        }
-        let (approval, description) = self.action_approval(
-            &pending.target_application_id,
-            pending.target_window_id.as_deref(),
-            &pending.action,
-        );
-        let digest = approval_digest(
-            &pending.session_id,
-            &pending.target_application_id,
-            pending.target_window_id.as_deref(),
-            &pending.action,
-            approval,
-            &description,
-        );
-        if approval != pending.approval_level || digest != pending.approval_digest {
-            let _ = self.record_named_audit_with_context(
-                &pending.session_id,
-                &pending.target_application_id,
-                pending.target_window_id.as_deref(),
-                format!("{} (approval invalidated)", pending.description),
-                "refused",
-                "approval_invalidated",
-                false,
-                false,
-                Some("Target semantics or risk changed while approval was pending".to_string()),
-                &pending.context,
-            );
-            return Err("Control action approval was invalidated by a target or risk change; approve the refreshed action".to_string());
-        }
-        self.execute_for_target_with_context(
-            &pending.session_id,
-            &pending.target_application_id,
-            pending.target_window_id.as_deref(),
-            &pending.action,
-            &pending.context,
-        )
-    }
-
-    /// Complete a pending per-action approval that a non-batch session
-    /// produced via [`ActionGate::Pending`]. Resolves the pending entry (so
-    /// its oneshot is consumed exactly once) and, only if it still existed and
-    /// the decision was to allow, dispatches the action to the backend. Used
-    /// by headless callers (the resident daemon's remote desktop-control
-    /// routes) that decide the approval inline with a local prompt rather than
-    /// through the async `#[tauri::command]` await/resolve split â€” and it keeps
-    /// `execute` module-private. Returns whether the action actually ran.
-    ///
-    /// A `false` result with `approve == true` means the session was stopped
-    /// (or its approval timed out) between `begin_action` and this call â€” the
-    /// action is intentionally *not* executed in that race.
-    pub fn finish_pending(
-        &self,
-        action_id: &str,
-        action: &ControlAction,
-        approve: bool,
-    ) -> Result<bool, String> {
-        Ok(self
-            .finish_pending_with_result(action_id, action, approve)?
-            .is_some())
-    }
-
-    pub fn finish_pending_with_result(
-        &self,
-        action_id: &str,
-        action: &ControlAction,
-        approve: bool,
-    ) -> Result<Option<ExecutionResult>, String> {
-        let Some(pending) = lock(&self.pending, "pending control actions")?.remove(action_id)
-        else {
-            return Ok(None);
-        };
-        if let Some(sender) = pending.sender {
-            let _ = sender.send(approve);
-        }
-        if !approve {
-            let _ = self.record_named_audit_with_context(
-                &pending.session_id,
-                &pending.target_application_id,
-                pending.target_window_id.as_deref(),
-                format!("{} (denied)", action_summary(&pending.action)),
-                "denied",
-                "operator_denied",
-                false,
-                false,
-                Some("operator denied the pending action".to_string()),
-                &pending.context,
-            );
-            return Ok(None);
-        }
-        if &pending.action != action {
-            return Err("Pending action payload changed before approval".to_string());
-        }
-        let (approval, description) = self.action_approval(
-            &pending.target_application_id,
-            pending.target_window_id.as_deref(),
-            &pending.action,
-        );
-        let digest = approval_digest(
-            &pending.session_id,
-            &pending.target_application_id,
-            pending.target_window_id.as_deref(),
-            &pending.action,
-            approval,
-            &description,
-        );
-        if approval != pending.approval_level || digest != pending.approval_digest {
-            return Err("Control action approval was invalidated by a target or risk change; approve the refreshed action".to_string());
-        }
-        let result = self.execute_for_target_with_context(
-            &pending.session_id,
-            &pending.target_application_id,
-            pending.target_window_id.as_deref(),
-            &pending.action,
-            &pending.context,
-        )?;
-        Ok(Some(result))
-    }
-
-    fn deny_pending_for_session(&self, session_id: &str) -> Result<(), String> {
-        let mut pending = lock(&self.pending, "pending control actions")?;
-        let matching: Vec<String> = pending
-            .iter()
-            .filter(|(_, action)| action.session_id == session_id)
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in matching {
-            if let Some(action) = pending.remove(&id) {
-                if let Some(sender) = action.sender {
-                    let _ = sender.send(false);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Removes one pending action without resolving it â€” used when the
-    /// approval wait itself times out (see `desktop_control_request_action`),
-    /// where the oneshot receiver has already observed the timeout and there
-    /// is nothing left to notify.
-    fn remove_pending(&self, action_id: &str) {
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.remove(action_id);
-        }
-    }
-
-    /// Deactivates every session and denies every pending action. Idempotent
-    /// â€” calling this when nothing is active returns `(0, 0)` and is not an
-    /// error, mirroring `m7_companion::M7CompanionState::emergency_stop`'s
-    /// same guarantee (both are wired into the same app-exit shutdown path in
-    /// `lib.rs`, so "already stopped" must never be treated as a failure).
-    pub fn emergency_stop(&self) -> Result<(usize, usize), String> {
-        let sessions_deactivated = {
-            let mut sessions = lock(&self.sessions, "control sessions")?;
-            let count = sessions.values().filter(|session| session.active).count();
-            for session in sessions.values_mut() {
-                session.active = false;
-            }
-            count
-        };
-        let actions_cancelled = {
-            let mut pending = lock(&self.pending, "pending control actions")?;
-            let count = pending.len();
-            for (_, action) in pending.drain() {
-                if let Some(sender) = action.sender {
-                    let _ = sender.send(false);
-                }
-            }
-            count
-        };
-        // Every session is now inactive, so the machine-wide lock is released
-        // unconditionally â€” this is the app-exit / kill-switch / revoke path.
-        self.release_lock_if_idle()?;
-        Ok((sessions_deactivated, actions_cancelled))
-    }
-}
-
-fn ensure_main_window(window: &tauri::Window) -> Result<(), String> {
-    if window.label() == "main" {
-        Ok(())
-    } else {
-        Err("Safe Desktop Control can only be driven from the main window".to_string())
-    }
-}
-
-fn ensure_control_window(window: &tauri::Window) -> Result<(), String> {
-    if matches!(window.label(), "main" | "companion-overlay") {
-        Ok(())
-    } else {
-        Err(
-            "Desktop control can only be managed from the main window or visible control overlay"
-                .to_string(),
-        )
-    }
-}
-
-#[tauri::command]
-pub fn desktop_control_start_session(
-    app: tauri::AppHandle,
-    window: tauri::Window,
-    permissions_state: tauri::State<'_, crate::AppState>,
-    state: tauri::State<'_, DesktopControlState>,
-    allowed_applications: Vec<String>,
-    lifetime_ms: u64,
-    approved_batch: bool,
-    allowed_windows: Option<Vec<String>>,
-    allow_screenshots: Option<bool>,
-    allow_keyboard_input: Option<bool>,
-    allow_clipboard_read: Option<bool>,
-    approval_policy: Option<ApprovalPolicy>,
-) -> Result<ControlSession, String> {
-    ensure_main_window(&window)?;
-    let mode = crate::permissions::get_permission_mode_impl(&permissions_state);
-    let session = state.start_session_with_options(
-        &mode,
-        allowed_applications,
-        lifetime_ms,
-        SessionGrantOptions {
-            allowed_windows: allowed_windows.unwrap_or_default(),
-            allow_screenshots: allow_screenshots.unwrap_or(false),
-            allow_keyboard_input: allow_keyboard_input.unwrap_or(false),
-            allow_clipboard_read: allow_clipboard_read.unwrap_or(false),
-            approval_policy: Some(approval_policy.unwrap_or(if approved_batch {
-                ApprovalPolicy::ApprovedBatch
-            } else {
-                ApprovalPolicy::PerAction
-            })),
-        },
-    )?;
-    // The visible, always-on-top overlay is part of the safety invariant. Do
-    // not leave a live input session behind when the operator cannot see it.
-    if let Err(error) = crate::m7_companion::show_overlay(&app) {
-        let _ = state.stop_session(&session.session_id);
-        return Err(format!(
-            "Could not establish the desktop-control indicator: {error}"
-        ));
-    }
-    let _ = app.emit("desktop-control://session-state", &session);
-    Ok(session)
-}
-
-#[tauri::command]
-pub fn desktop_control_stop_session(
-    app: tauri::AppHandle,
-    window: tauri::Window,
-    state: tauri::State<'_, DesktopControlState>,
-    session_id: String,
-) -> Result<bool, String> {
-    ensure_control_window(&window)?;
-    let stopped = state.stop_session(&session_id)?;
-    if !state.any_session_active()? {
-        if let Some(overlay) = app.get_webview_window("companion-overlay") {
-            let _ = overlay.hide();
-        }
-    }
-    let _ = app.emit(
-        "desktop-control://session-state",
-        state.sessions_snapshot()?,
-    );
-    Ok(stopped)
-}
-
-#[tauri::command]
-pub fn desktop_control_pause_session(
-    app: tauri::AppHandle,
-    window: tauri::Window,
-    state: tauri::State<'_, DesktopControlState>,
-    session_id: String,
-    paused: bool,
-) -> Result<bool, String> {
-    ensure_control_window(&window)?;
-    let changed = state.pause_session(&session_id, paused)?;
-    let _ = app.emit(
-        "desktop-control://session-state",
-        state.sessions_snapshot()?,
-    );
-    Ok(changed)
-}
-
-#[tauri::command]
-pub fn desktop_control_sessions(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, DesktopControlState>,
-) -> Result<Vec<ControlSession>, String> {
-    let sessions = state.sessions_snapshot()?;
-    if !sessions.iter().any(|session| session.active) {
-        if let Some(overlay) = app.get_webview_window("companion-overlay") {
-            let _ = overlay.hide();
-        }
-    }
-    Ok(sessions)
-}
-
-#[tauri::command]
-pub async fn desktop_control_request_action(
-    app: tauri::AppHandle,
-    window: tauri::Window,
-    state: tauri::State<'_, DesktopControlState>,
-    session_id: String,
-    target_application_id: String,
-    target_window_id: Option<String>,
-    action: ControlAction,
-    turn_id: Option<String>,
-    tool_call_id: Option<String>,
-) -> Result<ActionOutcome, String> {
-    ensure_main_window(&window)?;
-    request_action_impl(
-        &app,
-        state.inner(),
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        action,
-        turn_id,
-        tool_call_id,
-    )
-    .await
-}
-
-async fn request_action_impl(
-    app: &tauri::AppHandle,
-    state: &DesktopControlState,
-    session_id: &str,
-    target_application_id: &str,
-    target_window_id: Option<&str>,
-    action: ControlAction,
-    run_id: Option<String>,
-    tool_call_id: Option<String>,
-) -> Result<ActionOutcome, String> {
-    let context = AuditContext {
-        run_id,
-        tool_call_id,
-    };
-    let gate = match state.begin_action_for_target_with_context(
-        session_id,
-        target_application_id,
-        target_window_id,
-        action.clone(),
-        context.clone(),
-    ) {
-        Ok(gate) => gate,
-        Err(error) => {
-            let _ = state.record_named_audit_with_context(
-                session_id,
-                target_application_id,
-                target_window_id,
-                format!("{} (refused)", action_summary(&action)),
-                "refused",
-                "not_approved",
-                false,
-                false,
-                Some(error.clone()),
-                &context,
-            );
-            return Err(error);
-        }
-    };
-    match gate {
-        ActionGate::Executed(result) => {
-            let result = result?;
-            Ok(ActionOutcome {
-                action_id: format!("batch-{}", Uuid::new_v4()),
-                executed: true,
-                input_sent: result.input_sent,
-                state_verified: result.state_verified,
-                verification: result.verification,
-                verification_evidence: result.verification_evidence,
-                audit_id: result.audit_id,
-                approval_level: result.approval_level,
-            })
-        }
-        ActionGate::Pending {
-            action_id,
-            receiver,
-        } => {
-            let (approval_level, description) =
-                state.action_approval(target_application_id, target_window_id, &action);
-            let _ = app.emit(
-                "desktop-control://action-pending",
-                PendingActionSummary {
-                    action_id: action_id.clone(),
-                    session_id: session_id.to_string(),
-                    target_application_id: target_application_id.to_string(),
-                    target_window_id: target_window_id.map(str::to_string),
-                    approval_level,
-                    description,
-                    action: redacted_action_for_ui(&action),
-                },
-            );
-            match tokio::time::timeout(ACTION_APPROVAL_TIMEOUT, receiver).await {
-                Ok(Ok(true)) => {
-                    let result = state.take_approved_pending(&action_id, &action)?;
-                    Ok(ActionOutcome {
-                        action_id,
-                        executed: true,
-                        input_sent: result.input_sent,
-                        state_verified: result.state_verified,
-                        verification: result.verification,
-                        verification_evidence: result.verification_evidence,
-                        audit_id: result.audit_id,
-                        approval_level: result.approval_level,
-                    })
-                }
-                Ok(Ok(false)) => {
-                    let _ = state.record_named_audit_with_context(
-                        session_id,
-                        target_application_id,
-                        target_window_id,
-                        format!("{} (denied)", action_summary(&action)),
-                        "denied",
-                        "operator_denied",
-                        false,
-                        false,
-                        Some("operator denied the pending action".to_string()),
-                        &context,
-                    );
-                    Err("Control action was denied".to_string())
-                }
-                // Timed out, or the sender was dropped without a response.
-                Ok(Err(_)) | Err(_) => {
-                    state.remove_pending(&action_id);
-                    let _ = state.record_named_audit_with_context(
-                        session_id,
-                        target_application_id,
-                        target_window_id,
-                        format!("{} (timeout)", action_summary(&action)),
-                        "timeout",
-                        "not_approved",
-                        false,
-                        false,
-                        Some("operator approval timed out".to_string()),
-                        &context,
-                    );
-                    Err("Control action approval timed out".to_string())
-                }
-            }
-        }
-    }
-}
-
-#[tauri::command]
-pub fn tool_computer_list_targets(
-    state: tauri::State<'_, DesktopControlState>,
-    session_id: String,
-    turn_id: Option<String>,
-    tool_call_id: Option<String>,
-) -> Result<Vec<ComputerTarget>, String> {
-    let _ = (turn_id, tool_call_id);
-    state.list_targets_for_session(&session_id)
-}
-
-#[tauri::command]
-pub fn tool_computer_inspect(
-    state: tauri::State<'_, DesktopControlState>,
-    session_id: String,
-    target_application_id: String,
-    target_window_id: Option<String>,
-    query: Option<String>,
-    turn_id: Option<String>,
-    tool_call_id: Option<String>,
-) -> Result<ComputerInspection, String> {
-    let _ = (turn_id, tool_call_id);
-    state.inspect_for_session(
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        query.as_deref(),
-    )
-}
-
-#[tauri::command]
-pub fn tool_computer_screenshot(
-    app: tauri::AppHandle,
-    app_state: tauri::State<'_, crate::AppState>,
-    state: tauri::State<'_, DesktopControlState>,
-    session_id: String,
-    target_application_id: String,
-    target_window_id: Option<String>,
-    bounds: Option<ComputerBounds>,
-    turn_id: Option<String>,
-    tool_call_id: Option<String>,
-) -> Result<ComputerScreenshot, String> {
-    let (target, bytes, captured_bounds) = state.screenshot_for_session(
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        bounds,
-    )?;
-    let blob = crate::artifact_commands::store_for(&app, app_state.inner())?
-        .put(&bytes)
-        .map_err(|error| format!("Could not store screenshot artifact: {error}"))?;
-    let audit_id = state.record_screenshot_audit(
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        &blob.id,
-        &AuditContext {
-            run_id: turn_id,
-            tool_call_id,
-        },
-    )?;
-    Ok(ComputerScreenshot {
-        artifact_id: blob.id,
-        audit_id,
-        media_type: "image/png".to_string(),
-        size_bytes: blob.size,
-        content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
-        bounds: captured_bounds,
-        target,
-    })
-}
-
-#[tauri::command]
-pub fn tool_computer_clipboard_read(
-    state: tauri::State<'_, DesktopControlState>,
-    session_id: String,
-    target_application_id: String,
-    target_window_id: Option<String>,
-    turn_id: Option<String>,
-    tool_call_id: Option<String>,
-) -> Result<serde_json::Value, String> {
-    let (content, audit_id) = state.clipboard_for_session(
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        &AuditContext {
-            run_id: turn_id,
-            tool_call_id,
-        },
-    )?;
-    Ok(serde_json::json!({
-        "content": content,
-        "auditId": audit_id,
-        "note": "Clipboard reads are separately granted and are never included in the audit content",
-    }))
-}
-
-#[tauri::command]
-pub async fn tool_computer_focus(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, DesktopControlState>,
-    session_id: String,
-    target_application_id: String,
-    target_window_id: Option<String>,
-    turn_id: Option<String>,
-    tool_call_id: Option<String>,
-) -> Result<ActionOutcome, String> {
-    request_action_impl(
-        &app,
-        state.inner(),
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        ControlAction::Focus,
-        turn_id,
-        tool_call_id,
-    )
-    .await
-}
-
-#[tauri::command]
-pub async fn tool_computer_click(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, DesktopControlState>,
-    session_id: String,
-    target_application_id: String,
-    target_window_id: Option<String>,
-    element_id: Option<String>,
-    x: Option<i32>,
-    y: Option<i32>,
-    button: Option<MouseButtonKind>,
-    expected_value: Option<String>,
-    turn_id: Option<String>,
-    tool_call_id: Option<String>,
-) -> Result<ActionOutcome, String> {
-    let button = button.unwrap_or(MouseButtonKind::Left);
-    let action = if let Some(element_id) = element_id {
-        ControlAction::SemanticClick {
-            element_id,
-            button,
-            expected_value,
-        }
-    } else {
-        ControlAction::MouseClickAt {
-            x: x.ok_or_else(|| "computer_click needs element_id or x and y".to_string())?,
-            y: y.ok_or_else(|| "computer_click needs element_id or x and y".to_string())?,
-            button,
-        }
-    };
-    request_action_impl(
-        &app,
-        state.inner(),
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        action,
-        turn_id,
-        tool_call_id,
-    )
-    .await
-}
-
-#[tauri::command]
-pub async fn tool_computer_double_click(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, DesktopControlState>,
-    session_id: String,
-    target_application_id: String,
-    target_window_id: Option<String>,
-    element_id: Option<String>,
-    x: Option<i32>,
-    y: Option<i32>,
-    button: Option<MouseButtonKind>,
-    expected_value: Option<String>,
-    turn_id: Option<String>,
-    tool_call_id: Option<String>,
-) -> Result<ActionOutcome, String> {
-    let button = button.unwrap_or(MouseButtonKind::Left);
-    let action = if let Some(element_id) = element_id {
-        ControlAction::SemanticDoubleClick {
-            element_id,
-            button,
-            expected_value,
-        }
-    } else {
-        ControlAction::MouseDoubleClickAt {
-            x: x.ok_or_else(|| "computer_double_click needs element_id or x and y".to_string())?,
-            y: y.ok_or_else(|| "computer_double_click needs element_id or x and y".to_string())?,
-            button,
-        }
-    };
-    request_action_impl(
-        &app,
-        state.inner(),
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        action,
-        turn_id,
-        tool_call_id,
-    )
-    .await
-}
-
-#[tauri::command]
-pub async fn tool_computer_scroll(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, DesktopControlState>,
-    session_id: String,
-    target_application_id: String,
-    target_window_id: Option<String>,
-    delta_x: i32,
-    delta_y: i32,
-    turn_id: Option<String>,
-    tool_call_id: Option<String>,
-) -> Result<ActionOutcome, String> {
-    request_action_impl(
-        &app,
-        state.inner(),
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        ControlAction::Scroll { delta_x, delta_y },
-        turn_id,
-        tool_call_id,
-    )
-    .await
-}
-
-#[tauri::command]
-pub async fn tool_computer_type(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, DesktopControlState>,
-    session_id: String,
-    target_application_id: String,
-    target_window_id: Option<String>,
-    text: String,
-    turn_id: Option<String>,
-    tool_call_id: Option<String>,
-) -> Result<ActionOutcome, String> {
-    request_action_impl(
-        &app,
-        state.inner(),
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        ControlAction::TypeText { text },
-        turn_id,
-        tool_call_id,
-    )
-    .await
-}
-
-#[tauri::command]
-pub async fn tool_computer_key(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, DesktopControlState>,
-    session_id: String,
-    target_application_id: String,
-    target_window_id: Option<String>,
-    key: String,
-    turn_id: Option<String>,
-    tool_call_id: Option<String>,
-) -> Result<ActionOutcome, String> {
-    request_action_impl(
-        &app,
-        state.inner(),
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        ControlAction::KeyPress { key },
-        turn_id,
-        tool_call_id,
-    )
-    .await
-}
-
-#[tauri::command]
-pub async fn tool_computer_hotkey(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, DesktopControlState>,
-    session_id: String,
-    target_application_id: String,
-    target_window_id: Option<String>,
-    keys: Vec<String>,
-    turn_id: Option<String>,
-    tool_call_id: Option<String>,
-) -> Result<ActionOutcome, String> {
-    request_action_impl(
-        &app,
-        state.inner(),
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        ControlAction::Hotkey { keys },
-        turn_id,
-        tool_call_id,
-    )
-    .await
-}
-
-#[tauri::command]
-pub async fn tool_computer_wait(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, DesktopControlState>,
-    session_id: String,
-    target_application_id: String,
-    target_window_id: Option<String>,
-    milliseconds: u64,
-    turn_id: Option<String>,
-    tool_call_id: Option<String>,
-) -> Result<ActionOutcome, String> {
-    request_action_impl(
-        &app,
-        state.inner(),
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        ControlAction::Wait { milliseconds },
-        turn_id,
-        tool_call_id,
-    )
-    .await
-}
-
-#[tauri::command]
-pub async fn tool_computer_select(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, DesktopControlState>,
-    session_id: String,
-    target_application_id: String,
-    target_window_id: Option<String>,
-    element_id: String,
-    value: String,
-    turn_id: Option<String>,
-    tool_call_id: Option<String>,
-) -> Result<ActionOutcome, String> {
-    request_action_impl(
-        &app,
-        state.inner(),
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        ControlAction::Select { element_id, value },
-        turn_id,
-        tool_call_id,
-    )
-    .await
-}
-
-#[tauri::command]
-pub async fn tool_computer_set_value(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, DesktopControlState>,
-    session_id: String,
-    target_application_id: String,
-    target_window_id: Option<String>,
-    element_id: String,
-    value: String,
-    turn_id: Option<String>,
-    tool_call_id: Option<String>,
-) -> Result<ActionOutcome, String> {
-    request_action_impl(
-        &app,
-        state.inner(),
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        ControlAction::SetValue { element_id, value },
-        turn_id,
-        tool_call_id,
-    )
-    .await
-}
-
-#[tauri::command]
-pub fn desktop_control_respond_action(
-    window: tauri::Window,
-    state: tauri::State<'_, DesktopControlState>,
-    action_id: String,
-    approve: bool,
-) -> Result<(), String> {
-    ensure_main_window(&window)?;
-    if state.resolve_if_pending(&action_id, approve)? {
-        Ok(())
-    } else {
-        Err(format!("No pending control action with id {action_id}"))
-    }
-}
-
-#[tauri::command]
-pub fn desktop_control_emergency_stop(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, DesktopControlState>,
-) -> Result<serde_json::Value, String> {
-    let (sessions_deactivated, actions_cancelled) = state.emergency_stop()?;
-    if let Some(overlay) = app.get_webview_window("companion-overlay") {
-        let _ = overlay.hide();
-    }
-    let payload = serde_json::json!({
-        "sessionsDeactivated": sessions_deactivated,
-        "actionsCancelled": actions_cancelled,
-    });
-    let _ = app.emit("desktop-control://emergency-stop", payload.clone());
-    Ok(payload)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn state() -> DesktopControlState {
-        DesktopControlState::with_backend(Arc::new(NullBackend))
-    }
-
-    fn allow(apps: &[&str]) -> Vec<String> {
-        apps.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn grants_carry_independent_capabilities_and_windows() {
-        let state = state();
-        let session = state
-            .start_session_with_options(
-                "manual",
-                allow(&["TestApp"]),
-                60_000,
-                SessionGrantOptions {
-                    allowed_windows: vec!["TestApp::window-1".to_string()],
-                    allow_screenshots: false,
-                    allow_keyboard_input: false,
-                    allow_clipboard_read: false,
-                    approval_policy: Some(ApprovalPolicy::PerAction),
-                },
-            )
-            .unwrap();
-        assert_eq!(session.allowed_windows, ["TestApp::window-1"]);
-        assert!(!session.allow_screenshots);
-        assert!(!session.allow_keyboard_input);
-        assert_eq!(session.approval_policy, ApprovalPolicy::PerAction);
-    }
-
-    #[test]
-    fn sensitive_targets_are_refused_even_when_allowlisted() {
-        let state = state();
-        let session = state
-            .start_session_impl("manual", allow(&["1Password"]), 60_000, true)
-            .unwrap();
-        let error = match state.begin_action(
-            &session.session_id,
-            "1Password",
-            ControlAction::MouseClick {
-                button: MouseButtonKind::Left,
-            },
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("sensitive target must be refused"),
-        };
-        assert!(error.contains("Sensitive"));
-    }
-
-    #[test]
-    fn paused_session_refuses_actions_without_revoking_the_grant() {
-        let state = state();
-        let session = state
-            .start_session_impl("manual", allow(&["Notes"]), 60_000, true)
-            .unwrap();
-        assert!(state.pause_session(&session.session_id, true).unwrap());
-        let error = match state.begin_action(
-            &session.session_id,
-            "Notes",
-            ControlAction::MouseMove { x: 1, y: 1 },
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("paused session must refuse actions"),
-        };
-        assert!(error.contains("paused"));
-        assert!(state.sessions_snapshot().unwrap()[0].active);
-        assert!(state.pause_session(&session.session_id, false).unwrap());
-    }
-
-    #[test]
-    fn audit_redacts_typed_text_and_preserves_execution_verification() {
-        let state = state();
-        let session = state
-            .start_session_impl("manual", allow(&["Notes"]), 60_000, true)
-            .unwrap();
-        let ActionGate::Executed(result) = state
-            .begin_action(
-                &session.session_id,
-                "Notes",
-                ControlAction::TypeText {
-                    text: "secret-value".to_string(),
-                },
-            )
-            .unwrap()
-        else {
-            panic!("approved batch must execute immediately");
-        };
-        let result = result.unwrap();
-        assert!(result.input_sent);
-        assert!(!result.state_verified);
-        assert!(result
-            .verification
-            .as_deref()
-            .is_some_and(|message| message.contains("no element postcondition")));
-        let audit = state.audit_snapshot().unwrap();
-        assert!(audit[0].action.contains("redacted"));
-        assert!(!audit[0].action.contains("secret-value"));
-    }
-
-    #[test]
-    fn durable_value_verification_evidence_is_redacted_but_outcome_can_retain_it() {
-        let evidence = VerificationEvidence {
-            kind: "element_value".to_string(),
-            element_id: Some("element-1".to_string()),
-            expected_value: Some("secret-value".to_string()),
-            observed_value: Some("secret-value".to_string()),
-            matched: true,
-            detail: "compared".to_string(),
-        };
-        let audit = evidence.redacted_for_audit();
-        assert!(audit.expected_value.is_none());
-        assert!(audit.observed_value.is_none());
-        assert!(audit.detail.contains("redacted"));
-        assert_eq!(evidence.expected_value.as_deref(), Some("secret-value"));
-    }
-
-    #[test]
-    fn approval_digest_changes_when_target_semantics_or_risk_changes() {
-        let action = ControlAction::SetValue {
-            element_id: "element-1".to_string(),
-            value: "hello".to_string(),
-        };
-        let first = approval_digest(
-            "session",
-            "Notes",
-            Some("window"),
-            &action,
-            ApprovalLevel::High,
-            "Edit",
-        );
-        let changed_label = approval_digest(
-            "session",
-            "Notes",
-            Some("window"),
-            &action,
-            ApprovalLevel::Critical,
-            "Delete",
-        );
-        assert_ne!(first, changed_label);
-    }
-
-    #[test]
-    fn bypass_mode_is_always_refused() {
-        let state = state();
-        let err = state
-            .start_session_impl("bypass", allow(&["Notes"]), 60_000, false)
-            .unwrap_err();
-        assert!(err.contains("bypass"));
-        assert!(state.sessions_snapshot().unwrap().is_empty());
-    }
-
-    #[test]
-    fn every_gated_mode_can_start_a_session() {
-        let state = state();
-        for mode in ["manual", "acceptEdits", "plan", "auto", "smart"] {
-            let session = state
-                .start_session_impl(mode, allow(&["Notes"]), 60_000, false)
-                .unwrap_or_else(|error| panic!("mode {mode} should be allowed to start: {error}"));
-            assert!(session.active);
-            assert!(session.indicator_visible);
-        }
-    }
-
-    #[test]
-    fn empty_allowlist_is_refused() {
-        let state = state();
-        let err = state
-            .start_session_impl("manual", Vec::new(), 60_000, false)
-            .unwrap_err();
-        assert!(err.contains("allowed application"));
-    }
-
-    #[test]
-    fn lifetime_bounds_are_enforced() {
-        let state = state();
-        assert!(state
-            .start_session_impl("manual", allow(&["Notes"]), 0, false)
-            .is_err());
-        assert!(state
-            .start_session_impl(
-                "manual",
-                allow(&["Notes"]),
-                MAX_SESSION_LIFETIME_MS + 1,
-                false
-            )
-            .is_err());
-        assert!(state
-            .start_session_impl("manual", allow(&["Notes"]), MAX_SESSION_LIFETIME_MS, false)
-            .is_ok());
-    }
-
-    #[test]
-    fn allowlist_is_enforced_per_action() {
-        let state = state();
-        let session = state
-            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
-            .unwrap();
-
-        let outside = state.begin_action(
-            &session.session_id,
-            "Safari",
-            ControlAction::MouseMove { x: 1, y: 1 },
-        );
-        match outside {
-            Err(error) => assert!(error.contains("allowlist")),
-            Ok(_) => panic!("action against a non-allowlisted target must be rejected"),
-        }
-
-        let inside = state.begin_action(
-            &session.session_id,
-            "Notes",
-            ControlAction::MouseMove { x: 1, y: 1 },
-        );
-        assert!(matches!(inside, Ok(ActionGate::Pending { .. })));
-    }
-
-    #[test]
-    fn unknown_or_stopped_session_rejects_actions() {
-        let state = state();
-        assert!(state
-            .begin_action(
-                "does-not-exist",
-                "Notes",
-                ControlAction::KeyPress {
-                    key: "a".to_string()
-                }
-            )
-            .is_err());
-
-        let session = state
-            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
-            .unwrap();
-        assert!(state.stop_session(&session.session_id).unwrap());
-        assert!(state
-            .begin_action(
-                &session.session_id,
-                "Notes",
-                ControlAction::KeyPress {
-                    key: "a".to_string()
-                }
-            )
-            .is_err());
-    }
-
-    #[test]
-    fn approved_batch_session_executes_immediately_without_a_pending_entry() {
-        let state = state();
-        let session = state
-            .start_session_impl("manual", allow(&["Notes"]), 60_000, true)
-            .unwrap();
-
-        let gate = state
-            .begin_action(
-                &session.session_id,
-                "Notes",
-                ControlAction::MouseClick {
-                    button: MouseButtonKind::Left,
-                },
-            )
-            .unwrap();
-        match gate {
-            ActionGate::Executed(result) => assert!(result.is_ok()),
-            ActionGate::Pending { .. } => {
-                panic!("approved-batch session must not create a pending approval")
-            }
-        }
-    }
-
-    #[test]
-    fn pending_action_approval_resumes_via_the_oneshot_channel() {
-        let state = state();
-        let session = state
-            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
-            .unwrap();
-
-        let gate = state
-            .begin_action(
-                &session.session_id,
-                "Notes",
-                ControlAction::KeyPress {
-                    key: "a".to_string(),
-                },
-            )
-            .unwrap();
-        let ActionGate::Pending {
-            action_id,
-            receiver,
-        } = gate
-        else {
-            panic!("non-batch session must produce a pending approval");
-        };
-
-        assert!(state.resolve_if_pending(&action_id, true).unwrap());
-        assert_eq!(receiver.blocking_recv(), Ok(true));
-    }
-
-    #[test]
-    fn pending_action_denial_resumes_as_false() {
-        let state = state();
-        let session = state
-            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
-            .unwrap();
-
-        let gate = state
-            .begin_action(
-                &session.session_id,
-                "Notes",
-                ControlAction::KeyPress {
-                    key: "a".to_string(),
-                },
-            )
-            .unwrap();
-        let ActionGate::Pending {
-            action_id,
-            receiver,
-        } = gate
-        else {
-            panic!("non-batch session must produce a pending approval");
-        };
-
-        assert!(state.resolve_if_pending(&action_id, false).unwrap());
-        assert_eq!(receiver.blocking_recv(), Ok(false));
-    }
-
-    #[test]
-    fn resolving_an_unknown_pending_action_id_is_reported_as_not_found() {
-        let state = state();
-        assert!(!state.resolve_if_pending("does-not-exist", true).unwrap());
-    }
-
-    #[test]
-    fn stopping_a_session_denies_its_pending_actions() {
-        let state = state();
-        let session = state
-            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
-            .unwrap();
-        let gate = state
-            .begin_action(
-                &session.session_id,
-                "Notes",
-                ControlAction::KeyPress {
-                    key: "a".to_string(),
-                },
-            )
-            .unwrap();
-        let ActionGate::Pending {
-            action_id,
-            receiver,
-        } = gate
-        else {
-            panic!("non-batch session must produce a pending approval");
-        };
-
-        assert!(state.stop_session(&session.session_id).unwrap());
-
-        assert_eq!(receiver.blocking_recv(), Ok(false));
-        // The pending entry was consumed by the denial, not left dangling.
-        assert!(!state.resolve_if_pending(&action_id, true).unwrap());
-    }
-
-    #[test]
-    fn emergency_stop_deactivates_sessions_and_cancels_pending_actions_and_is_idempotent() {
-        let state = state();
-        let session = state
-            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
-            .unwrap();
-        let gate = state
-            .begin_action(
-                &session.session_id,
-                "Notes",
-                ControlAction::KeyPress {
-                    key: "a".to_string(),
-                },
-            )
-            .unwrap();
-        let ActionGate::Pending { receiver, .. } = gate else {
-            panic!("non-batch session must produce a pending approval");
-        };
-
-        assert_eq!(state.emergency_stop().unwrap(), (1, 1));
-        assert_eq!(receiver.blocking_recv(), Ok(false));
-        assert!(!state.sessions_snapshot().unwrap()[0].active);
-
-        // Calling it again with nothing left active/pending must not error
-        // and must report zero, not "already stopped".
-        assert_eq!(state.emergency_stop().unwrap(), (0, 0));
-    }
-
-    #[test]
-    fn expired_session_is_reported_inactive_and_rejects_new_actions() {
-        let state = state();
-        let session = state
-            .start_session_impl("manual", allow(&["Notes"]), 1, false)
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(5));
-
-        let snapshot = state.sessions_snapshot().unwrap();
-        assert!(
-            !snapshot
-                .iter()
-                .find(|s| s.session_id == session.session_id)
-                .unwrap()
-                .active
-        );
-
-        assert!(state
-            .begin_action(
-                &session.session_id,
-                "Notes",
-                ControlAction::KeyPress {
-                    key: "a".to_string()
-                }
-            )
-            .is_err());
-    }
-
-    fn temp_lock_path() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lm-desktop-control-lock-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("desktop_control.lock")
-    }
-
-    #[test]
-    fn cross_process_lock_refuses_a_second_controller_until_released() {
-        let lock_path = temp_lock_path();
-        // Two independent controllers (the local app and the resident daemon
-        // in production) pointed at the same machine-wide lock file.
-        let first = DesktopControlState::with_backend_and_lock(
-            Arc::new(NullBackend),
-            Some(lock_path.clone()),
-        );
-        let second = DesktopControlState::with_backend_and_lock(
-            Arc::new(NullBackend),
-            Some(lock_path.clone()),
-        );
-
-        let session = first
-            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
-            .expect("first controller should acquire the lock and start");
-
-        // While the first controller holds a live session, the second is
-        // refused â€” not silently allowed to also drive real input.
-        let refused = second
-            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
-            .unwrap_err();
-        assert!(
-            refused.contains("Another control session is already active"),
-            "unexpected refusal message: {refused}"
-        );
-
-        // Releasing via stop_session hands the lock to the second controller.
-        assert!(first.stop_session(&session.session_id).unwrap());
-        let after_stop = second
-            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
-            .expect("second controller should start once the first stops");
-        assert!(after_stop.active);
-
-        // Releasing via emergency_stop hands it back to the first controller.
-        second.emergency_stop().unwrap();
-        let after_emergency = first
-            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
-            .expect("first controller should start once the second emergency-stops");
-        assert!(after_emergency.active);
-
-        first.emergency_stop().unwrap();
-        let _ = std::fs::remove_dir_all(lock_path.parent().unwrap());
-    }
-
-    #[test]
-    fn a_stale_lock_older_than_the_bound_is_reclaimed() {
-        let lock_path = temp_lock_path();
-        // A leaked lock file older than any legitimate session lifetime must
-        // not permanently wedge desktop control, even if its recorded pid
-        // happens to still be a live process.
-        let contents = LockContents {
-            pid: std::process::id(),
-            acquired_at_ms: now_ms().saturating_sub(STALE_LOCK_MS + 1_000),
-        };
-        std::fs::write(&lock_path, serde_json::to_vec(&contents).unwrap()).unwrap();
-
-        let state = DesktopControlState::with_backend_and_lock(
-            Arc::new(NullBackend),
-            Some(lock_path.clone()),
-        );
-        let session = state
-            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
-            .expect("a lock older than STALE_LOCK_MS must be reclaimable");
-        assert!(session.active);
-
-        state.emergency_stop().unwrap();
-        let _ = std::fs::remove_dir_all(lock_path.parent().unwrap());
-    }
-
-    #[test]
-    fn a_corrupt_lock_file_is_reclaimed() {
-        let lock_path = temp_lock_path();
-        // A truncated/garbage lock file cannot describe a live owner.
-        std::fs::write(&lock_path, b"not json").unwrap();
-        let state = DesktopControlState::with_backend_and_lock(
-            Arc::new(NullBackend),
-            Some(lock_path.clone()),
-        );
-        let session = state
-            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
-            .expect("a corrupt lock must be reclaimable");
-        assert!(session.active);
-        state.emergency_stop().unwrap();
-        let _ = std::fs::remove_dir_all(lock_path.parent().unwrap());
-    }
-
-    #[test]
-    fn null_backend_always_succeeds_and_unsupported_backend_always_fails_clearly() {
-        let null = NullBackend;
-        assert!(null.move_mouse(0, 0).is_ok());
-        assert!(null.click(MouseButtonKind::Left).is_ok());
-        assert!(null.key_press("a").is_ok());
-
-        let unsupported = UnsupportedBackend("no backend wired".to_string());
-        assert_eq!(
-            unsupported.move_mouse(0, 0).unwrap_err(),
-            "no backend wired"
-        );
-        assert_eq!(
-            unsupported.click(MouseButtonKind::Left).unwrap_err(),
-            "no backend wired"
-        );
-        assert_eq!(unsupported.key_press("a").unwrap_err(), "no backend wired");
-    }
-
-    // ----- Wayland detection (pure, host-testable) -------------------------
-    //
-    // These run on this macOS build machine even though `is_wayland_session`'s
-    // only production caller is Linux-gated â€” that is the whole point of
-    // keeping the decision pure and env-free.
-
-    #[test]
-    fn wayland_session_type_is_detected() {
-        assert!(is_wayland_session(Some("wayland"), None));
-        // Case-insensitive and tolerant of surrounding whitespace.
-        assert!(is_wayland_session(Some("Wayland"), None));
-        assert!(is_wayland_session(Some(" wayland "), None));
-    }
-
-    #[test]
-    fn wayland_display_set_without_a_session_type_is_detected() {
-        assert!(is_wayland_session(None, Some("wayland-0")));
-    }
-
-    #[test]
-    fn x11_session_type_is_not_wayland_even_with_wayland_display_set() {
-        // An explicit session type is authoritative: `x11` is never Wayland,
-        // even if a stray WAYLAND_DISPLAY is also present (e.g. XWayland).
-        assert!(!is_wayland_session(Some("x11"), None));
-        assert!(!is_wayland_session(Some("x11"), Some("wayland-0")));
-    }
-
-    #[test]
-    fn no_signals_assumes_x11_and_does_not_block() {
-        assert!(!is_wayland_session(None, None));
-        // Empty values are treated as "unset" and must not block either.
-        assert!(!is_wayland_session(Some(""), None));
-        assert!(!is_wayland_session(Some("   "), Some("")));
-        // An unknown session type (not wayland) with no WAYLAND_DISPLAY is
-        // likewise not treated as Wayland.
-        assert!(!is_wayland_session(Some("tty"), None));
-    }
-
-    #[test]
-    fn wayland_unsupported_message_is_clear_about_x11_working() {
-        assert!(WAYLAND_UNSUPPORTED_MESSAGE.contains("Wayland"));
-        assert!(WAYLAND_UNSUPPORTED_MESSAGE.contains("X11 sessions work today"));
-    }
-}
+{_5sİxíçßÇŞjßÜ¢jnµêî±ê+Š§ı÷š·÷(š›­z»¬{zó¶ùï^ú{^8kn¶á÷7m¿6çÖüó¾ùm÷ßÓŞq­ü÷f›÷‡½Û~^é­ùmı¹×fßkÇ{ó§Ô¼¼„M…™”•Í­Ñ½À½¹ÑÉ½°ƒŠPÑ¡”ÁÉ½‘ÕÑ¥½¸µ…Ñ•¹…Ñ¥Ù”½µÁÕÑ•ÈUÍ”ÍÕ‰ÍÑÉ…Ñ”¸(¼¼„Õ±°Ñ¡É•…Ğµ½‘•°°Á±…Ñ™½É´‰½Õ¹‘…É¥•Ì°…¹É•½Ù•Éä‰•¡…Ù¥½Èè(¼¼„‘½Ì½½µÁÕÑ•ÈµÕÍ”¹µ‘€…¹‘½Ì½Í…™”µ‘•Í­Ñ½Àµ½¹ÑÉ½°µ‘•Í¥¸¹µ‘€¸(¼¼„(¼¼„±°µ½‘•°µ™…¥¹œ…Ñ¥½¹ÌÍÑ¥±°É•ÅÕ¥É”„¡Õµ…¸µÉ•…Ñ•Í•ÍÍ¥½¸É…¹Ğİ¥Ñ (¼¼„•áÁ±¥¥ĞÍ½Á”°…Á…‰¥±¥Ñä™±…Ì°‰½Õ¹‘•±¥™•Ñ¥µ”°…¹…ÁÁÉ½Ù…°Á½±¥ä¸(¼¼„(¼¼„M¡…Á”°‘•±¥‰•É…Ñ•±äµ¥ÉÉ½É•™É½´Ñİ¼•á¥ÍÑ¥¹œµ½‘Õ±•ÌÉ…Ñ¡•ÈÑ¡…¸(¼¼„¥¹Ù•¹Ñ•™É•Í è(¼¼„€´m½¹ÑÉ½±M•ÍÍ¥½¹tµ¥ÉÉ½ÉÌ´İ}½µÁ…¹¥½¸èé…ÁÑÕÉ•É…¹Ñ€€¡¥°Í½Á”°(¼¼„€€É•…Ñ•‘}…Ñ}µÍ€½•áÁ¥É•Í}…Ñ}µÍ€°…Ñ¥Ù•€¤°‰ÕĞÑ¡”Í½Á”¥Ì„(¼¼„€€¹½¸µ•µÁÑä€©…±±½İ±¥ÍĞ¨½˜…ÁÁ±¥…Ñ¥½¸½İ¥¹‘½Ü¥‘•¹Ñ¥™¥•ÉÌÉ…Ñ¡•ÈÑ¡…¸„(¼¼„€€Í¥¹±”½ÁÑ¥½¹…°½¹”°…¹•Ù•Éä…Ñ¥½¸µÕÍĞ¹…µ”İ¡¥ …±±½İ±¥ÍÑ•(¼¼„€€Ñ…É•Ğ¥ĞÌ…¥µ•…Ğ¸(¼¼„€´Q¡”Á•¹‘¥¹œµ…Ñ¥½¸…ÁÁÉ½Ù”½‘•¹ä™±½Üµ¥ÉÉ½ÉÌÁ•Éµ¥ÍÍ¥½¹Ì¹ÉÍ€Ì(¼¼„€€A•¹‘¥¹A•Éµ¥ÍÍ¥½¹€½½¹•Í¡½ĞÉ•ÍÕµ”µ•¡…¹¥Í´•á…Ñ±ä€¡¥¹Í•ÉĞ„(¼¼„€€½¹•Í¡½ĞèéM•¹‘•Èñ‰½½°ù€­•å•‰ä„•¹•É…Ñ•¥°…İ…¥Ğ¥Ğİ¥Ñ „(¼¼„€€Ñ¥µ•½ÕĞ°„Í•Á…É…Ñ”½µµ…¹É•Í½±Ù•Ì¥Ğ¤ƒŠP½Á¥•™½ÈÑ¡”µ•¡…¹¥Í´°(¼¼„€€¹½ĞÑ¡”ÍÑÉÕĞ¥ÑÍ•±˜°Í¥¹”A•¹‘¥¹A•Éµ¥ÍÍ¥½¹€¥ÌÑ½½°µ…±°µÍ¡…Á•(¼¼„€€…¹…ÉÉ¥•ÌÉÕ¸µ±•‘•È™¥•±‘ÌÑ¡¥ÌÍÁ¥­”¡…Ì¹¼ÕÍ”™½È¸(¼¼„(¼¼„m•Í­Ñ½Á%¹ÁÕÑ	…­•¹‘t¥ÌÑ¡”½¹”Í•…´Ñ¡…Ğ­••ÁÌ•Ù•ÉäÍ•ÍÍ¥½¸½…Ñ¥¹œ¼(¼¼„…ÁÁÉ½Ù…°½•µ•É•¹äµÍÑ½À½‘”Á…Ñ Ñ•ÍÑ…‰±”İ¥Ñ¡½ÕĞ•Ù•ÈÑ½Õ¡¥¹œ„É•…°(¼¼„=LÕÉÍ½Èèm9Õ±±	…­•¹‘t€¡Ñ•ÍĞ‘½Õ‰±”°…±İ…åÌÍÕ••‘Ì¤…¹(¼¼„mU¹ÍÕÁÁ½ÉÑ•‘	…­•¹‘t€¡ÁÉ½‘ÕÑ¥½¸™…±±‰…¬½¸Á±…Ñ™½ÉµÌ½•¹Ù¥É½¹µ•¹ÑÌ(¼¼„İ¥Ñ¡½ÕĞ„İ¥É•¥¹ÁÕĞÁ…Ñ °…±İ…åÌ„±•…È•ÉÉ½È¤‰½Ñ ¥µÁ±•µ•¹Ğ¥Ğ(¼¼„…±½¹Í¥‘”Ñ¡”É•…°•¹¥½€µ‰…­•¥µÁ±•µ•¹Ñ…Ñ¥½¸¸9¼Ñ•ÍĞ¥¸Ñ¡¥Ìµ½‘Õ±”(¼¼„•á•É¥Í•Ì…¹åÑ¡¥¹œ½Ñ¡•ÈÑ¡…¸9Õ±±	…­•¹‘€¸(¼¼„(¼¼„A±…Ñ™½É´ÍÕÁÁ½ÉĞ™½ÈÑ¡”É•…°¥¹ÁÕĞÁ…Ñ €¡m¹¥½	…­•¹‘t°Í•±•Ñ•‰ä(¼¼„mÁÉ½‘ÕÑ¥½¹}‰…­•¹‘t¤è(¼¼„€´€¨©µ…=L¨¨ƒŠPÉ•…°¥¹ÁÕĞ€¡¹••‘Ì•ÍÍ¥‰¥±¥ÑäÁ•Éµ¥ÍÍ¥½¸¤¸IÕ¹Ñ¥µ”µÙ•É¥™¥•¸(¼¼„€´€¨©]¥¹‘½İÌ¨¨ƒŠPÉ•…°¥¹ÁÕĞÙ¥„•¹¥½€€¡M•¹‘%¹ÁÕÑ€Õ¹‘•ÈÑ¡”¡½½¤¸(¼¼„€´€¨©1¥¹Õà½`ÄÄ¨¨ƒŠPÉ•…°¥¹ÁÕĞÙ¥„•¹¥½€€¡àÄÅÉ‰€°•¹¥½€Ì‘•™…Õ±Ğ(¼¼„€€™•…ÑÕÉ”¤¸(¼¼„€´€¨©1¥¹Õà½]…å±…¹¨¨ƒŠP‘•±¥‰•É…Ñ•±ä€©Õ¹ÍÕÁÁ½ÉÑ•¨èÁÉ½‘ÕÑ¥½¹}‰…­•¹‘€(¼¼„€€‘•Ñ•ÑÌ„]…å±…¹Í•ÍÍ¥½¸€¡Í•”m¥Í}İ…å±…¹‘}Í•ÍÍ¥½¹t¤…¹É•ÑÕÉ¹Ì(¼¼„€€mU¹ÍÕÁÁ½ÉÑ•‘	…­•¹‘tÉ…Ñ¡•ÈÑ¡…¸½¹ÍÑÉÕÑ¥¹œ•¹¥¼èé¹¥½€°Í¥¹”(¼¼„€€Íå¹Ñ¡•Ñ¥Œ¥¹ÁÕĞ½¸]…å±…¹¹••‘Ì…¸á‘œµ‘•Í­Ñ½ÀµÁ½ÉÑ…°½±¥‰•¤¥¹Ñ•É…Ñ¥½¸(¼¼„€€Ñ¡…Ğ¥Ì¹½Ğ‰Õ¥±Ğ¡•É”¸`ÄÄÍ•ÍÍ¥½¹Ìİ½É¬Ñ½‘…ä¸(¼¼„€´Ù•ÉåÑ¡¥¹œ•±Í”€¡	M°•ÑŒ¸¤ƒŠPmU¹ÍÕÁÁ½ÉÑ•‘	…­•¹‘t°…Ì‰•™½É”¸(¼¼„(¼¼„UQ%=8èÑ¡”]¥¹‘½İÌ…¹1¥¹Õà½‘”Á…Ñ¡Ì‰•±½Ü…É”½µÁ¥±•½¹±ä½¸Ñ¡•¥È(¼¼„½İ¸Ñ…É•Ñ}½Ì°Í¼Ñ¡•ä…É”9=PÑåÁ”µ¡•­•½ÈÉÕ¹Ñ¥µ”µÙ•É¥™¥•¥¸Ñ¡¥Ì(¼¼„µ…=L‘•Ù•±½Áµ•¹Ğ•¹Ù¥É½¹µ•¹Ğ¸±°¹½¸µÑÉ¥Ù¥…°Á±…Ñ™½É´±½¥Œ€¡Ñ¡”]…å±…¹(¼¼„Õ…É¤¥Ì™…Ñ½É•¥¹Ñ¼ÁÕÉ”°¡½ÍĞµÑ•ÍÑ…‰±”™Õ¹Ñ¥½¹ÌìÑ¡”=Lµ…Ñ•‰±½­Ì(¼¼„Ñ¡•µÍ•±Ù•Ì…É”­•ÁĞÑ¼„‰…É”•¹¥½€…±°¸M•”•… ‰±½¬Ì½İ¸¹½Ñ”¸()ÕÍ”ÍÑèé½±±•Ñ¥½¹Ìèéí	QÉ••5…À°!…Í¡5…Áôì)ÕÍ”ÍÑèé¥¼èéíI•…°]É¥Ñ”…Ì}ôì)ÕÍ”ÍÑèéÁ…Ñ èéA…Ñ¡	Õ˜ì)ÕÍ”ÍÑèéÁÉ½•ÍÌèé½µµ…¹ì)ÕÍ”ÍÑèéÍå¹ŒèéíÉŒ°5ÕÑ•à°5ÕÑ•áÕ…É‘ôì)ÕÍ”ÍÑèéÑ¥µ”èéíÕÉ…Ñ¥½¸°MåÍÑ•µQ¥µ”°U9%a}A=!ôì()ÕÍ”‰…Í”ØĞèé¹¥¹”…Ì|ì)ÕÍ”Í•É‘”èéí‘”èé•Í•É¥…±¥é•È°•Í•É¥…±¥é”°M•É¥…±¥é•ôì)ÕÍ”Í¡„Èèéí¥•ÍĞ°M¡„ÈÔÙôì)ÕÍ”Ñ…ÕÉ¤èéíµ¥ÑÑ•È°5…¹…•Éôì)ÕÍ”Ñ½­¥¼èéÍå¹Œèé½¹•Í¡½Ğì)ÕÍ”ÕÕ¥èéUÕ¥ì((¼¼¼1½¹•ÍĞ„½¹ÑÉ½°Í•ÍÍ¥½¸µ…äÉÕ¸‰•™½É”¥ĞµÕÍĞ‰”É•ÍÑ…ÉÑ••áÁ±¥¥Ñ±ä(¼¼¼ƒŠPµ¥ÉÉ½ÉÌ´İ}½µÁ…¹¥½¸èé5a}I9Q}1%Q%5}5M€Ì€‰‰½Õ¹‘•°¹½Ğ(¼¼¼¥¹‘•™¥¹¥Ñ”ˆÁ½ÍÑÕÉ”™½ÈÑ¡”Í…µ”É•…Í½¸è…¸Õ¹…ÑÑ•¹‘•Í•ÍÍ¥½¸±•™Ğ½Á•¸(¼¼¼™½È¡½ÕÉÌ¥Ì¥ÑÌ½İ¸É¥Í¬•Ù•¸İ¥Ñ •Ù•Éä½Ñ¡•È…Ñ”¥¸Á±…”¸)ÁÕˆ½¹ÍĞ5a}MMM%=9}1%Q%5}5LèÔØĞ€ô€ÌÀ€¨€ØÀ€¨€Å|ÀÀÀì((¼¼¼¡•±É½ÍÌµÁÉ½•ÍÌ‘•Í­Ñ½Àµ½¹ÑÉ½°±½¬¥Ì½¹Í¥‘•É•ÍÑ…±”ƒŠP…¹µ…ä‰”(¼¼¼É•±…¥µ•ƒŠP½¹”¥Ğ¥Ì½±‘•ÈÑ¡…¸Ñ¡¥Ì‰½Õ¹°•Ù•¸¥˜¥ÑÌ½İ¹•ÈÁ¥ÍÑ¥±°(¼¼¼¡…ÁÁ•¹ÌÑ¼‰”…±¥Ù”¸Í¥¹±”½¹ÑÉ½°Í•ÍÍ¥½¸…¸¹•Ù•È±•¥Ñ¥µ…Ñ•±ä(¼¼¼½ÕÑ±¥Ù”m5a}MMM%=9}1%Q%5}5Mt°Í¼„±½¬½±‘•ÈÑ¡…¸Ñ¡…Ğ…¸½¹±ä‰”(¼¼¼„±•…¬™É½´„É…Í¡•½Èİ•‘•½¹ÑÉ½±±•È¸)½¹ÍĞMQ1}1=-}5LèÔØĞ€ô5a}MMM%=9}1%Q%5}5Lì((¼¼¼1½¹•ÍĞ„Í¥¹±”Á•¹‘¥¹œ…Ñ¥½¸İ…¥ÑÌ™½È„¡Õµ…¸‘•¥Í¥½¸‰•™½É”¥Ğ¥Ì(¼¼¼ÑÉ•…Ñ•…Ì‘•¹¥•ƒŠPµ¥ÉÉ½ÉÌÁ•Éµ¥ÍÍ¥½¹ÌèéAI5%MM%=9}Q%5=UQ€Ì€‰Í¥±•¹”(¼¼¼¥Ì„‘•¹¥…°°¹•Ù•È„¡…¹œˆÁ½ÍÑÕÉ”°©ÕÍĞÍ¡½ÉÑ•Èè…¸½¸µÍÉ••¸‘•Í­Ñ½À(¼¼¼…Ñ¥½¸ÁÉ½µÁĞ¥Ìµ•…¹ĞÑ¼‰”…¹Íİ•É•¥¸Í•½¹‘Ì°¹½Ğµ¥¹ÕÑ•Ì¸)½¹ÍĞQ%=9}AAI=Y1}Q%5=UPèÕÉ…Ñ¥½¸€ôÕÉ…Ñ¥½¸èé™É½µ}Í•Ì È€¨€ØÀ¤ì((m‘•É¥Ù”¡±½¹”°½Áä°•‰Õœ°M•É¥…±¥é”°•Í•É¥…±¥é”°A…ÉÑ¥…±Ä°Ä¥t(mÍ•É‘”¡É•¹…µ•}…±°€ô€‰Í¹…­•}…Í”ˆ¥t)ÁÕˆ•¹Õ´5½ÕÍ•	ÕÑÑ½¹-¥¹ì(€€€1•™Ğ°(€€€I¥¡Ğ°(€€€5¥‘‘±”°)ô((m‘•É¥Ù”¡±½¹”°½Áä°•‰Õœ°M•É¥…±¥é”°•Í•É¥…±¥é”°A…ÉÑ¥…±Ä°Ä¥t(mÍ•É‘”¡É•¹…µ•}…±°€ô€‰Í¹…­•}…Í”ˆ¥t)ÁÕˆ•¹Õ´ÁÁÉ½Ù…±A½±¥äì(€€€A•ÉÑ¥½¸°(€€€ÁÁÉ½Ù•‘	…Ñ °)ô((m‘•É¥Ù”¡±½¹”°½Áä°•‰Õœ°M•É¥…±¥é”°•Í•É¥…±¥é”°A…ÉÑ¥…±Ä°Ä¥t(mÍ•É‘”¡É•¹…µ•}…±°€ô€‰Í¹…­•}…Í”ˆ¥t)ÁÕˆ•¹Õ´ÁÁÉ½Ù…±1•Ù•°ì(€€€1½Ü°(€€€5•‘¥Õ´°(€€€!¥ °(€€€É¥Ñ¥…°°)ô((m‘•É¥Ù”¡±½¹”°•‰Õœ°•™…Õ±Ğ°M•É¥…±¥é”°•Í•É¥…±¥é”°A…ÉÑ¥…±Ä¥t(mÍ•É‘”¡É•¹…µ•}…±°€ô€‰…µ•±…Í”ˆ¥t)ÁÕˆÍÑÉÕĞ½µÁÕÑ•É	½Õ¹‘Ìì(€€€ÁÕˆàè˜ØĞ°(€€€ÁÕˆäè˜ØĞ°(€€€ÁÕˆİ¥‘Ñ è˜ØĞ°(€€€ÁÕˆ¡•¥¡Ğè˜ØĞ°)ô((m‘•É¥Ù”¡±½¹”°•‰Õœ°M•É¥…±¥é”°•Í•É¥…±¥é”°A…ÉÑ¥…±Ä¥t(mÍ•É‘”¡É•¹…µ•}…±°€ô€‰…µ•±…Í”ˆ¥t)ÁÕˆÍÑÉÕĞ½µÁÕÑ•ÉQ…É•Ğì(€€€ÁÕˆÑ…É•Ñ}¥èMÑÉ¥¹œ°(€€€ÁÕˆ…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€ÁÕˆ…ÁÁ±¥…Ñ¥½¹}¹…µ”èMÑÉ¥¹œ°(€€€ÁÕˆİ¥¹‘½İ}¥èMÑÉ¥¹œ°(€€€€¼¼¼AÉ½Ù¥‘•ÈµÍÁ•¥™¥Œ¥‘•¹Ñ¥ÑäÉ•Ñ…¥¹•…É½ÍÌ`ÄÄİ¥¹‘½Üµ¥(€€€€¼¼¼¹½Éµ…±¥é…Ñ¥½¸¸%Ğ¥Ì¥¹Ñ•¹Ñ¥½¹…±±ä¹½Ğ•áÁ½Í•Ñ¼µ½‘•°…±±•ÉÌ¸(€€€€mÍ•É‘”¡Í­¥À¥t(€€€ÁÕˆ¡É…Ñ”¤ÁÉ½Ù¥‘•É}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÁÕˆİ¥¹‘½İ}Ñ¥Ñ±”èMÑÉ¥¹œ°(€€€ÁÕˆ‰½Õ¹‘Ìè½µÁÕÑ•É	½Õ¹‘Ì°(€€€ÁÕˆ™½ÕÍ•è‰½½°°(€€€ÁÕˆÍ•¹Í¥Ñ¥Ù”è‰½½°°(€€€ÁÕˆÍÕÁÁ½ÉÑ•‘}…Ñ¥½¹ÌèY•ŒñMÑÉ¥¹œø°)ô((m‘•É¥Ù”¡±½¹”°•‰Õœ°M•É¥…±¥é”°•Í•É¥…±¥é”°A…ÉÑ¥…±Ä¥t(mÍ•É‘”¡É•¹…µ•}…±°€ô€‰…µ•±…Í”ˆ¥t)ÁÕˆÍÑÉÕĞ½µÁÕÑ•É±•µ•¹Ğì(€€€ÁÕˆ¥èMÑÉ¥¹œ°(€€€ÁÕˆÉ½±”èMÑÉ¥¹œ°(€€€ÁÕˆ±…‰•°èMÑÉ¥¹œ°(€€€ÁÕˆÙ…±Õ”è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÁÕˆ‰½Õ¹‘Ìè½µÁÕÑ•É	½Õ¹‘Ì°(€€€ÁÕˆ•¹…‰±•è‰½½°°(€€€ÁÕˆ™½ÕÍ•è‰½½°°(€€€ÁÕˆ…Ñ¥½¹ÌèY•ŒñMÑÉ¥¹œø°(€€€ÁÕˆÍ•¹Í¥Ñ¥Ù”è‰½½°°)ô((m‘•É¥Ù”¡±½¹”°•‰Õœ°M•É¥…±¥é”°•Í•É¥…±¥é”°A…ÉÑ¥…±Ä¥t(mÍ•É‘”¡É•¹…µ•}…±°€ô€‰…µ•±…Í”ˆ¥t)ÁÕˆÍÑÉÕĞ½µÁÕÑ•É%¹ÍÁ•Ñ¥½¸ì(€€€ÁÕˆÑ…É•Ğè½µÁÕÑ•ÉQ…É•Ğ°(€€€ÁÕˆ•±•µ•¹ÑÌèY•Œñ½µÁÕÑ•É±•µ•¹Ğø°(€€€ÁÕˆÑÉÕ¹…Ñ•è‰½½°°(€€€€¼¼¼½Õ¹Ğ½¹±äìÍ•¹Í¥Ñ¥Ù”•±•µ•¹ÑÌ…É”¹•Ù•ÈÉ•ÑÕÉ¹•İ¥Ñ ±…‰•±Ì½È(€€€€¼¼¼Ù…±Õ•Ì°‰ÕĞ…±±•ÉÌ…¸Ù•É¥™äÑ¡…ĞÑ¡”ÁÉ½Ù¥‘•ÈÍ…Ü…¹É•‘…Ñ•Ñ¡•´¸(€€€ÁÕˆÍ•¹Í¥Ñ¥Ù•}•±•µ•¹Ñ}½Õ¹ĞèÕÍ¥é”°(€€€ÁÕˆÅÕ•Éäè=ÁÑ¥½¸ñMÑÉ¥¹œø°)ô((m‘•É¥Ù”¡±½¹”°•‰Õœ°M•É¥…±¥é”¥t(mÍ•É‘”¡É•¹…µ•}…±°€ô€‰…µ•±…Í”ˆ¥t)ÁÕˆÍÑÉÕĞ½µÁÕÑ•ÉMÉ••¹Í¡½Ğì(€€€ÁÕˆ…ÉÑ¥™…Ñ}¥èMÑÉ¥¹œ°(€€€ÁÕˆ…Õ‘¥Ñ}¥èMÑÉ¥¹œ°(€€€ÁÕˆµ•‘¥…}ÑåÁ”èMÑÉ¥¹œ°(€€€ÁÕˆÍ¥é•}‰åÑ•ÌèÔØĞ°(€€€ÁÕˆ½¹Ñ•¹Ñ}‰…Í”ØĞèMÑÉ¥¹œ°(€€€ÁÕˆ‰½Õ¹‘Ìè½µÁÕÑ•É	½Õ¹‘Ì°(€€€ÁÕˆÑ…É•Ğè½µÁÕÑ•ÉQ…É•Ğ°)ô((¼¼¼Í¥¹±”¥¹ÁÕĞ…Ñ¥½¸„½¹ÑÉ½°Í•ÍÍ¥½¸µ…äÉ•ÅÕ•ÍĞ¸%¹Ñ•É¹…±±äÑ…•(¼¼¼€¡­¥¹‘€¤Í¼Ñ¡”™É½¹Ñ•¹Ì‘¥ÍÉ¥µ¥¹…Ñ•Õ¹¥½¸µ…Ñ¡•ÌÑ¡¥ÌÍ¡…Á”(¼¼¼•á…Ñ±ä°…¹Í¼„™ÕÑÕÉ”Ù…É¥…¹Ğ…¸…ÉÉä¥ÑÌ½İ¸™¥•±‘Ìİ¥Ñ¡½ÕĞ„(¼¼¼Í•É¥…±¥é…Ñ¥½¸µ¥É…Ñ¥½¸¸(m‘•É¥Ù”¡±½¹”°•‰Õœ°M•É¥…±¥é”°•Í•É¥…±¥é”°A…ÉÑ¥…±Ä¥t(mÍ•É‘”¡É•¹…µ•}…±°€ô€‰Í¹…­•}…Í”ˆ°Ñ…œ€ô€‰­¥¹ˆ¥t)ÁÕˆ•¹Õ´½¹ÑÉ½±Ñ¥½¸ì(€€€5½ÕÍ•5½Ù”ì(€€€€€€€àè¤ÌÈ°(€€€€€€€äè¤ÌÈ°(€€€ô°(€€€5½ÕÍ•±¥¬ì(€€€€€€€‰ÕÑÑ½¸è5½ÕÍ•	ÕÑÑ½¹-¥¹°(€€€ô°(€€€5½ÕÍ•±¥­Ğì(€€€€€€€àè¤ÌÈ°(€€€€€€€äè¤ÌÈ°(€€€€€€€‰ÕÑÑ½¸è5½ÕÍ•	ÕÑÑ½¹-¥¹°(€€€ô°(€€€5½ÕÍ•½Õ‰±•±¥¬ì(€€€€€€€‰ÕÑÑ½¸è5½ÕÍ•	ÕÑÑ½¹-¥¹°(€€€ô°(€€€5½ÕÍ•½Õ‰±•±¥­Ğì(€€€€€€€àè¤ÌÈ°(€€€€€€€äè¤ÌÈ°(€€€€€€€‰ÕÑÑ½¸è5½ÕÍ•	ÕÑÑ½¹-¥¹°(€€€ô°(€€€5½ÕÍ•É…œì(€€€€€€€™É½µ}àè¤ÌÈ°(€€€€€€€™É½µ}äè¤ÌÈ°(€€€€€€€Ñ½}àè¤ÌÈ°(€€€€€€€Ñ½}äè¤ÌÈ°(€€€ô°(€€€MÉ½±°ì(€€€€€€€‘•±Ñ…}àè¤ÌÈ°(€€€€€€€‘•±Ñ…}äè¤ÌÈ°(€€€ô°(€€€QåÁ•Q•áĞì(€€€€€€€Ñ•áĞèMÑÉ¥¹œ°(€€€ô°(€€€-•åAÉ•ÍÌì(€€€€€€€­•äèMÑÉ¥¹œ°(€€€ô°(€€€!½Ñ­•äì(€€€€€€€­•åÌèY•ŒñMÑÉ¥¹œø°(€€€ô°(€€€½ÕÌ°(€€€M•µ…¹Ñ¥±¥¬ì(€€€€€€€•±•µ•¹Ñ}¥èMÑÉ¥¹œ°(€€€€€€€‰ÕÑÑ½¸è5½ÕÍ•	ÕÑÑ½¹-¥¹°(€€€€€€€€mÍ•É‘”¡‘•™…Õ±Ğ¥t(€€€€€€€•áÁ•Ñ•‘}Ù…±Õ”è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ô°(€€€M•µ…¹Ñ¥½Õ‰±•±¥¬ì(€€€€€€€•±•µ•¹Ñ}¥èMÑÉ¥¹œ°(€€€€€€€‰ÕÑÑ½¸è5½ÕÍ•	ÕÑÑ½¹-¥¹°(€€€€€€€€mÍ•É‘”¡‘•™…Õ±Ğ¥t(€€€€€€€•áÁ•Ñ•‘}Ù…±Õ”è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ô°(€€€M•±•Ğì(€€€€€€€•±•µ•¹Ñ}¥èMÑÉ¥¹œ°(€€€€€€€Ù…±Õ”èMÑÉ¥¹œ°(€€€ô°(€€€M•ÑY…±Õ”ì(€€€€€€€•±•µ•¹Ñ}¥èMÑÉ¥¹œ°(€€€€€€€Ù…±Õ”èMÑÉ¥¹œ°(€€€ô°(€€€]…¥Ğì(€€€€€€€µ¥±±¥Í•½¹‘ÌèÔØĞ°(€€€ô°)ô((¼¼¼M•…´‰•Ñİ••¸Í•ÍÍ¥½¸½…Ñ¥¹œ±½¥Œ…¹Ñ¡”É•…°=L¸Ù•Éäµ•Ñ¡½Ñ…­•Ì(¼¼¼€™Í•±™€€¡¹½Ğ€™µÕĞÍ•±™€¤Í¼„Í¥¹±”ÉŒñ‘å¸•Í­Ñ½Á%¹ÁÕÑ	…­•¹ù€…¸(¼¼¼‰”Í¡…É•…É½ÍÌ½¹ÕÉÉ•¹Ğ…Ñ¥½¸‘¥ÍÁ…Ñ¡•Ìİ¥Ñ¡½ÕĞ…¸½ÕÑ•È±½¬(¼¼¼™½É¥¹œÑ¡•´Ñ¼Í•É¥…±¥é”ÁÕÉ•±ä™½È‰½ÉÉ½Üµ¡•­¥¹œÉ•…Í½¹ÌƒŠPÉ•…°(¼¼¼¥µÁ±•µ•¹Ñ…Ñ¥½¹ÌÑ¡…Ğ¹•••á±ÕÍ¥Ù”…•ÍÌ€¡”¹œ¸•¹¥¼èé¹¥½€°İ¡¥ (¼¼¼¥Í¸ĞMå¹€¤¡½±Ñ¡•¥È½İ¸¥¹Ñ•É¹…°5ÕÑ•á€¸)ÁÕˆÑÉ…¥Ğ•Í­Ñ½Á%¹ÁÕÑ	…­•¹èM•¹€¬Må¹Œì(€€€™¸µ½Ù•}µ½ÕÍ” ™Í•±˜°àè¤ÌÈ°äè¤ÌÈ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€™¸±¥¬ ™Í•±˜°‰ÕÑÑ½¸è5½ÕÍ•	ÕÑÑ½¹-¥¹¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€™¸­•å}ÁÉ•ÍÌ ™Í•±˜°­•äè€™ÍÑÈ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì((€€€™¸‘½Õ‰±•}±¥¬ ™Í•±˜°‰ÕÑÑ½¸è5½ÕÍ•	ÕÑÑ½¹-¥¹¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€Í•±˜¹±¥¬¡‰ÕÑÑ½¸¤üì(€€€€€€€Í•±˜¹±¥¬¡‰ÕÑÑ½¸¤(€€€ô((€€€™¸‘É…œ ™Í•±˜°™É½µ}àè¤ÌÈ°™É½µ}äè¤ÌÈ°Ñ½}àè¤ÌÈ°Ñ½}äè¤ÌÈ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€Í•±˜¹µ½Ù•}µ½ÕÍ”¡™É½µ}à°™É½µ}ä¤üì(€€€€€€€Í•±˜¹±¥¬¡5½ÕÍ•	ÕÑÑ½¹-¥¹èé1•™Ğ¤üì(€€€€€€€Í•±˜¹µ½Ù•}µ½ÕÍ”¡Ñ½}à°Ñ½}ä¤üì(€€€€€€€Í•±˜¹±¥¬¡5½ÕÍ•	ÕÑÑ½¹-¥¹èé1•™Ğ¤(€€€ô((€€€™¸ÍÉ½±° ™Í•±˜°‘•±Ñ…}àè¤ÌÈ°‘•±Ñ…}äè¤ÌÈ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€¥˜‘•±Ñ…}à€„ô€Àì(€€€€€€€€€€€Í•±˜¹­•å}ÁÉ•ÍÌ ™™½Éµ…Ğ„ ‰ÍÉ½±±}àéí‘•±Ñ…}áôˆ¤¤üì(€€€€€€€ô(€€€€€€€¥˜‘•±Ñ…}ä€„ô€Àì(€€€€€€€€€€€Í•±˜¹­•å}ÁÉ•ÍÌ ™™½Éµ…Ğ„ ‰ÍÉ½±±}äéí‘•±Ñ…}åôˆ¤¤üì(€€€€€€€ô(€€€€€€€=¬  ¤¤(€€€ô((€€€™¸ÑåÁ•}Ñ•áĞ ™Í•±˜°Ñ•áĞè€™ÍÑÈ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€™½È¡…É…Ñ•È¥¸Ñ•áĞ¹¡…ÉÌ ¤ì(€€€€€€€€€€€Í•±˜¹­•å}ÁÉ•ÍÌ ™¡…É…Ñ•È¹Ñ½}ÍÑÉ¥¹œ ¤¤üì(€€€€€€€ô(€€€€€€€=¬  ¤¤(€€€ô((€€€™¸¡½Ñ­•ä ™Í•±˜°­•åÌè€™mMÑÉ¥¹t¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€™½È­•ä¥¸­•åÌì(€€€€€€€€€€€Í•±˜¹­•å}ÁÉ•ÍÌ¡­•ä¤üì(€€€€€€€ô(€€€€€€€=¬  ¤¤(€€€ô)ô((¼¼¼Q•ÍĞ‘½Õ‰±”è•Ù•Éä…Ñ¥½¸…±İ…åÌÍÕ••‘Ì…¹Ñ½Õ¡•Ì¹½Ñ¡¥¹œ½¸Ñ¡”(¼¼¼É•…°=L¸UÍ•‰ä•Ù•ÉäÑ•ÍĞ¥¸Ñ¡¥Ìµ½‘Õ±”…¹¹½İ¡•É”¥¸Ñ¡”ÁÉ½‘ÕÑ¥½¸(¼¼¼‰…­•¹Í•±•Ñ¥½¸‰•±½Ü¸(m‘•É¥Ù”¡•™…Õ±Ğ¥t)ÁÕˆÍÑÉÕĞ9Õ±±	…­•¹ì()¥µÁ°•Í­Ñ½Á%¹ÁÕÑ	…­•¹™½È9Õ±±	…­•¹ì(€€€™¸µ½Ù•}µ½ÕÍ” ™Í•±˜°}àè¤ÌÈ°}äè¤ÌÈ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€=¬  ¤¤(€€€ô(€€€™¸±¥¬ ™Í•±˜°}‰ÕÑÑ½¸è5½ÕÍ•	ÕÑÑ½¹-¥¹¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€=¬  ¤¤(€€€ô(€€€™¸­•å}ÁÉ•ÍÌ ™Í•±˜°}­•äè€™ÍÑÈ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€=¬  ¤¤(€€€ô)ô((¼¼¼AÉ½‘ÕÑ¥½¸™…±±‰…¬™½ÈÁ±…Ñ™½ÉµÌ€¡½Èµ…=L•¹Ù¥É½¹µ•¹ÑÌİ¡•É”‰…­•¹(¼¼¼½¹ÍÑÉÕÑ¥½¸¥ÑÍ•±˜™…¥±•°”¹œ¸¹¼•ÍÍ¥‰¥±¥ÑäÁ•Éµ¥ÍÍ¥½¸å•Ğ¤İ¥Ñ ¹¼(¼¼¼İ¥É•É•…°¥¹ÁÕĞÁ…Ñ ¸Ù•Éä…Ñ¥½¸™…¥±Ì±•…É±äÉ…Ñ¡•ÈÑ¡…¸Í¥±•¹Ñ±ä(¼¼¼¹¼µ½Àµ¥¹œƒŠP„…±±•ÈµÕÍĞ¹•Ù•È‰”…‰±”Ñ¼µ¥ÍÑ…­”€‰¹½Ñ¡¥¹œ¡…ÁÁ•¹•ˆ™½È(¼¼¼€‰Ñ¡”…Ñ¥½¸É…¸ˆ¸)ÁÕˆÍÑÉÕĞU¹ÍÕÁÁ½ÉÑ•‘	…­•¹¡ÁÕˆMÑÉ¥¹œ¤ì()¥µÁ°•Í­Ñ½Á%¹ÁÕÑ	…­•¹™½ÈU¹ÍÕÁÁ½ÉÑ•‘	…­•¹ì(€€€™¸µ½Ù•}µ½ÕÍ” ™Í•±˜°}àè¤ÌÈ°}äè¤ÌÈ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€ÉÈ¡Í•±˜¸À¹±½¹” ¤¤(€€€ô(€€€™¸±¥¬ ™Í•±˜°}‰ÕÑÑ½¸è5½ÕÍ•	ÕÑÑ½¹-¥¹¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€ÉÈ¡Í•±˜¸À¹±½¹” ¤¤(€€€ô(€€€™¸­•å}ÁÉ•ÍÌ ™Í•±˜°}­•äè€™ÍÑÈ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€ÉÈ¡Í•±˜¸À¹±½¹” ¤¤(€€€ô)ô((¼¼¼M•µ…¹Ñ¥Œ…•ÍÍ¥‰¥±¥ÑäÍ•…´¸Q¡”µ½‘•°¹•Ù•ÈÉ••¥Ù•Ì…¸Õ¹‰½Õ¹‘•É…Ü=L(¼¼¼¡…¹‘±”è…‘…ÁÑ•ÉÌÉ•ÑÕÉ¸Ñ¡¥Ì¹½Éµ…±¥é•°‰½Õ¹‘•É•ÁÉ•Í•¹Ñ…Ñ¥½¸…¹•Ù•Éä(¼¼¼µÕÑ…Ñ¥¹œ½Á•É…Ñ¥½¸É”µÉ•Í½±Ù•ÌÑ¡”Ñ…É•Ğ¥µµ•‘¥…Ñ•±ä‰•™½É”•á•ÕÑ¥½¸¸)ÁÕˆÑÉ…¥Ğ•Í­Ñ½ÁM•µ…¹Ñ¥	…­•¹èM•¹€¬Må¹Œì(€€€™¸±¥ÍÑ}Ñ…É•ÑÌ ™Í•±˜¤€´øI•ÍÕ±ĞñY•Œñ½µÁÕÑ•ÉQ…É•Ğø°MÑÉ¥¹œøì(€€€™¸¥¹ÍÁ•Ğ (€€€€€€€€™Í•±˜°(€€€€€€€…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€ÅÕ•Éäè=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€¤€´øI•ÍÕ±Ğñ½µÁÕÑ•É%¹ÍÁ•Ñ¥½¸°MÑÉ¥¹œøì(€€€™¸Ù•É¥™å}Ñ…É•Ğ (€€€€€€€€™Í•±˜°(€€€€€€€…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€É•ÅÕ¥É•}™É½¹Ñµ½ÍĞè‰½½°°(€€€€¤€´øI•ÍÕ±Ğñ½µÁÕÑ•ÉQ…É•Ğ°MÑÉ¥¹œøì(€€€™¸™½ÕÌ ™Í•±˜°Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€™¸±¥­}•±•µ•¹Ğ (€€€€€€€€™Í•±˜°(€€€€€€€Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ°(€€€€€€€•±•µ•¹Ñ}¥è€™ÍÑÈ°(€€€€€€€‰ÕÑÑ½¸è5½ÕÍ•	ÕÑÑ½¹-¥¹°(€€€€€€€‘½Õ‰±”è‰½½°°(€€€€¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€™¸Í•Ñ}Ù…±Õ” (€€€€€€€€™Í•±˜°(€€€€€€€Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ°(€€€€€€€•±•µ•¹Ñ}¥è€™ÍÑÈ°(€€€€€€€Ù…±Õ”è€™ÍÑÈ°(€€€€€€€Í•±•Ğè‰½½°°(€€€€¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€™¸ÍÉ••¹Í¡½Ğ (€€€€€€€€™Í•±˜°(€€€€€€€Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ°(€€€€€€€‰½Õ¹‘Ìè=ÁÑ¥½¸ñ½µÁÕÑ•É	½Õ¹‘Ìø°(€€€€¤€´øI•ÍÕ±Ğğ¡Y•ŒñÔàø°½µÁÕÑ•É	½Õ¹‘Ì¤°MÑÉ¥¹œøì)ô((m‘•É¥Ù”¡•™…Õ±Ğ¥t)ÁÕˆÍÑÉÕĞ9Õ±±M•µ…¹Ñ¥	…­•¹ì()¥µÁ°•Í­Ñ½ÁM•µ…¹Ñ¥	…­•¹™½È9Õ±±M•µ…¹Ñ¥	…­•¹ì(€€€™¸±¥ÍÑ}Ñ…É•ÑÌ ™Í•±˜¤€´øI•ÍÕ±ĞñY•Œñ½µÁÕÑ•ÉQ…É•Ğø°MÑÉ¥¹œøì(€€€€€€€=¬¡Y•Œèé¹•Ü ¤¤(€€€ô((€€€™¸¥¹ÍÁ•Ğ (€€€€€€€€™Í•±˜°(€€€€€€€…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€ÅÕ•Éäè=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€¤€´øI•ÍÕ±Ğñ½µÁÕÑ•É%¹ÍÁ•Ñ¥½¸°MÑÉ¥¹œøì(€€€€€€€±•ĞÑ…É•Ğ€ôÍ•±˜¹Ù•É¥™å}Ñ…É•Ğ¡…ÁÁ±¥…Ñ¥½¹}¥°İ¥¹‘½İ}¥°™…±Í”¤üì(€€€€€€€=¬¡½µÁÕÑ•É%¹ÍÁ•Ñ¥½¸ì(€€€€€€€€€€€Ñ…É•Ğ°(€€€€€€€€€€€•±•µ•¹ÑÌèY•Œèé¹•Ü ¤°(€€€€€€€€€€€ÑÉÕ¹…Ñ•è™…±Í”°(€€€€€€€€€€€Í•¹Í¥Ñ¥Ù•}•±•µ•¹Ñ}½Õ¹Ğè€À°(€€€€€€€€€€€ÅÕ•ÉäèÅÕ•Éä¹µ…À¡ÍÑÈèéÑ½}ÍÑÉ¥¹œ¤°(€€€€€€€ô¤(€€€ô((€€€™¸Ù•É¥™å}Ñ…É•Ğ (€€€€€€€€™Í•±˜°(€€€€€€€…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€}É•ÅÕ¥É•}™É½¹Ñµ½ÍĞè‰½½°°(€€€€¤€´øI•ÍÕ±Ğñ½µÁÕÑ•ÉQ…É•Ğ°MÑÉ¥¹œøì(€€€€€€€=¬¡½µÁÕÑ•ÉQ…É•Ğì(€€€€€€€€€€€Ñ…É•Ñ}¥è™½Éµ…Ğ„ ‰í…ÁÁ±¥…Ñ¥½¹}¥‘ôèéíôˆ°İ¥¹‘½İ}¥¹Õ¹İÉ…Á}½È ‰İ¥¹‘½Üˆ¤¤°(€€€€€€€€€€€…ÁÁ±¥…Ñ¥½¹}¥è…ÁÁ±¥…Ñ¥½¹}¥¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€…ÁÁ±¥…Ñ¥½¹}¹…µ”è…ÁÁ±¥…Ñ¥½¹}¥¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€İ¥¹‘½İ}¥èİ¥¹‘½İ}¥¹Õ¹İÉ…Á}½È ‰İ¥¹‘½Üˆ¤¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€ÁÉ½Ù¥‘•É}İ¥¹‘½İ}¥è9½¹”°(€€€€€€€€€€€İ¥¹‘½İ}Ñ¥Ñ±”è…ÁÁ±¥…Ñ¥½¹}¥¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€‰½Õ¹‘Ìè½µÁÕÑ•É	½Õ¹‘Ìèé‘•™…Õ±Ğ ¤°(€€€€€€€€€€€™½ÕÍ•èÑÉÕ”°(€€€€€€€€€€€Í•¹Í¥Ñ¥Ù”è™…±Í”°(€€€€€€€€€€€ÍÕÁÁ½ÉÑ•‘}…Ñ¥½¹ÌèÙ•Œ…l(€€€€€€€€€€€€€€€€‰¥¹ÍÁ•Ğˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€€‰™½ÕÌˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€€‰±¥¬ˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€t°(€€€€€€€ô¤(€€€ô((€€€™¸™½ÕÌ ™Í•±˜°}Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€=¬  ¤¤(€€€ô((€€€™¸±¥­}•±•µ•¹Ğ (€€€€€€€€™Í•±˜°(€€€€€€€}Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ°(€€€€€€€}•±•µ•¹Ñ}¥è€™ÍÑÈ°(€€€€€€€}‰ÕÑÑ½¸è5½ÕÍ•	ÕÑÑ½¹-¥¹°(€€€€€€€}‘½Õ‰±”è‰½½°°(€€€€¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€=¬  ¤¤(€€€ô((€€€™¸Í•Ñ}Ù…±Õ” (€€€€€€€€™Í•±˜°(€€€€€€€}Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ°(€€€€€€€}•±•µ•¹Ñ}¥è€™ÍÑÈ°(€€€€€€€}Ù…±Õ”è€™ÍÑÈ°(€€€€€€€}Í•±•Ğè‰½½°°(€€€€¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€=¬  ¤¤(€€€ô((€€€™¸ÍÉ••¹Í¡½Ğ (€€€€€€€€™Í•±˜°(€€€€€€€Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ°(€€€€€€€‰½Õ¹‘Ìè=ÁÑ¥½¸ñ½µÁÕÑ•É	½Õ¹‘Ìø°(€€€€¤€´øI•ÍÕ±Ğğ¡Y•ŒñÔàø°½µÁÕÑ•É	½Õ¹‘Ì¤°MÑÉ¥¹œøì(€€€€€€€=¬ ¡Y•Œèé¹•Ü ¤°‰½Õ¹‘Ì¹Õ¹İÉ…Á}½É}•±Í”¡ñğÑ…É•Ğ¹‰½Õ¹‘Ì¹±½¹” ¤¤¤¤(€€€ô)ô((¼¼¼I•…°¥¹ÁÕĞÁ…Ñ €¡µ…=L°]¥¹‘½İÌ°…¹1¥¹Õà½`ÄÄ¤¸9½Ğ•á•É¥Í•‰ä…¹äÑ•ÍĞ(¼¼¼¥¸Ñ¡¥Ìµ½‘Õ±”€¡Í•”Ñ¡”µ½‘Õ±”‘½Œ¤ƒŠP½¹±ä•Ù•È½¹ÍÑÉÕÑ•‰ä(¼¼¼mÁÉ½‘ÕÑ¥½¹}‰…­•¹‘t¸Q¡”‰½‘ä¥Ì€ÄÀÀ”•¹¥½€Ì•¹•É¥Œ°É½ÍÌµÁ±…Ñ™½É´(¼¼¼A$€¡5½ÕÍ•€½-•å‰½…É‘€ÑÉ…¥ÑÌ¤è¹½Ñ¡¥¹œ¡•É”¥Ì=LµÍÁ•¥™¥Œ°Í¼Ñ¡”Í…µ”(¼¼¼ÍÑÉÕĞ½¥µÁ°½µÁ¥±•ÌÕ¹¡…¹•½¸•Ù•ÉäÍÕÁÁ½ÉÑ•Ñ…É•Ğ¸•¹¥½€¡…¹‘±•Ì(¼¼¼Ñ¡”Á•Èµ=L¥¹ÁÕĞÍå¹Ñ¡•Í¥Ì¥¹Ñ•É¹…±±ä°¥¸¥ÑÌ½İ¸É…Ñ”¸(m™œ¡…¹ä¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ°Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ°Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¤¥t)ÍÑÉÕĞ¹¥½	…­•¹¡5ÕÑ•àñ•¹¥¼èé¹¥¼ø¤ì((m™œ¡…¹ä¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ°Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ°Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¤¥t)¥µÁ°•Í­Ñ½Á%¹ÁÕÑ	…­•¹™½È¹¥½	…­•¹ì(€€€™¸µ½Ù•}µ½ÕÍ” ™Í•±˜°àè¤ÌÈ°äè¤ÌÈ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€ÕÍ”•¹¥¼èéí½½É‘¥¹…Ñ”°5½ÕÍ•ôì(€€€€€€€Í•±˜¸À(€€€€€€€€€€€€¹±½¬ ¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ}ğ€‰‘•Í­Ñ½À¥¹ÁÕĞ‰…­•¹±½¬¥ÌÁ½¥Í½¹•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ü(€€€€€€€€€€€€¹µ½Ù•}µ½ÕÍ”¡à°ä°½½É‘¥¹…Ñ”èé‰Ì¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ•ÉÉ½È¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€ô((€€€™¸±¥¬ ™Í•±˜°‰ÕÑÑ½¸è5½ÕÍ•	ÕÑÑ½¹-¥¹¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€ÕÍ”•¹¥¼èéí	ÕÑÑ½¸°¥É•Ñ¥½¸°5½ÕÍ•ôì(€€€€€€€±•Ğ‰ÕÑÑ½¸€ôµ…Ñ ‰ÕÑÑ½¸ì(€€€€€€€€€€€5½ÕÍ•	ÕÑÑ½¹-¥¹èé1•™Ğ€ôø	ÕÑÑ½¸èé1•™Ğ°(€€€€€€€€€€€5½ÕÍ•	ÕÑÑ½¹-¥¹èéI¥¡Ğ€ôø	ÕÑÑ½¸èéI¥¡Ğ°(€€€€€€€€€€€5½ÕÍ•	ÕÑÑ½¹-¥¹èé5¥‘‘±”€ôø	ÕÑÑ½¸èé5¥‘‘±”°(€€€€€€€ôì(€€€€€€€Í•±˜¸À(€€€€€€€€€€€€¹±½¬ ¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ}ğ€‰‘•Í­Ñ½À¥¹ÁÕĞ‰…­•¹±½¬¥ÌÁ½¥Í½¹•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ü(€€€€€€€€€€€€¹‰ÕÑÑ½¸¡‰ÕÑÑ½¸°¥É•Ñ¥½¸èé±¥¬¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ•ÉÉ½È¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€ô((€€€™¸­•å}ÁÉ•ÍÌ ™Í•±˜°­•äè€™ÍÑÈ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€ÕÍ”•¹¥¼èéí¥É•Ñ¥½¸°-•å‰½…É‘ôì(€€€€€€€±•ĞÁ…ÉÍ•€ôÁ…ÉÍ•}­•ä¡­•ä¤üì(€€€€€€€Í•±˜¸À(€€€€€€€€€€€€¹±½¬ ¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ}ğ€‰‘•Í­Ñ½À¥¹ÁÕĞ‰…­•¹±½¬¥ÌÁ½¥Í½¹•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ü(€€€€€€€€€€€€¹­•ä¡Á…ÉÍ•°¥É•Ñ¥½¸èé±¥¬¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ•ÉÉ½È¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€ô((€€€™¸‘½Õ‰±•}±¥¬ ™Í•±˜°‰ÕÑÑ½¸è5½ÕÍ•	ÕÑÑ½¹-¥¹¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€Í•±˜¹±¥¬¡‰ÕÑÑ½¸¤üì(€€€€€€€Í•±˜¹±¥¬¡‰ÕÑÑ½¸¤(€€€ô((€€€™¸‘É…œ ™Í•±˜°™É½µ}àè¤ÌÈ°™É½µ}äè¤ÌÈ°Ñ½}àè¤ÌÈ°Ñ½}äè¤ÌÈ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€ÕÍ”•¹¥¼èéí	ÕÑÑ½¸°½½É‘¥¹…Ñ”°¥É•Ñ¥½¸°5½ÕÍ•ôì(€€€€€€€±•Ğ‰ÕÑÑ½¸€ô	ÕÑÑ½¸èé1•™Ğì(€€€€€€€±•ĞµÕĞ•¹¥¹”€ôÍ•±˜(€€€€€€€€€€€€¸À(€€€€€€€€€€€€¹±½¬ ¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ}ğ€‰‘•Í­Ñ½À¥¹ÁÕĞ‰…­•¹±½¬¥ÌÁ½¥Í½¹•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤üì(€€€€€€€•¹¥¹”(€€€€€€€€€€€€¹µ½Ù•}µ½ÕÍ”¡™É½µ}à°™É½µ}ä°½½É‘¥¹…Ñ”èé‰Ì¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ•ÉÉ½È¹Ñ½}ÍÑÉ¥¹œ ¤¤üì(€€€€€€€•¹¥¹”(€€€€€€€€€€€€¹‰ÕÑÑ½¸¡‰ÕÑÑ½¸°¥É•Ñ¥½¸èéAÉ•ÍÌ¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ•ÉÉ½È¹Ñ½}ÍÑÉ¥¹œ ¤¤üì(€€€€€€€•¹¥¹”(€€€€€€€€€€€€¹µ½Ù•}µ½ÕÍ”¡Ñ½}à°Ñ½}ä°½½É‘¥¹…Ñ”èé‰Ì¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ•ÉÉ½È¹Ñ½}ÍÑÉ¥¹œ ¤¤üì(€€€€€€€•¹¥¹”(€€€€€€€€€€€€¹‰ÕÑÑ½¸¡‰ÕÑÑ½¸°¥É•Ñ¥½¸èéI•±•…Í”¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ•ÉÉ½È¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€ô((€€€™¸ÍÉ½±° ™Í•±˜°‘•±Ñ…}àè¤ÌÈ°‘•±Ñ…}äè¤ÌÈ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€ÕÍ”•¹¥¼èéíá¥Ì°5½ÕÍ•ôì(€€€€€€€±•ĞµÕĞ•¹¥¹”€ôÍ•±˜(€€€€€€€€€€€€¸À(€€€€€€€€€€€€¹±½¬ ¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ}ğ€‰‘•Í­Ñ½À¥¹ÁÕĞ‰…­•¹±½¬¥ÌÁ½¥Í½¹•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤üì(€€€€€€€¥˜‘•±Ñ…}ä€„ô€Àì(€€€€€€€€€€€•¹¥¹”(€€€€€€€€€€€€€€€€¹ÍÉ½±°¡‘•±Ñ…}ä°á¥ÌèéY•ÉÑ¥…°¤(€€€€€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ•ÉÉ½È¹Ñ½}ÍÑÉ¥¹œ ¤¤üì(€€€€€€€ô(€€€€€€€¥˜‘•±Ñ…}à€„ô€Àì(€€€€€€€€€€€•¹¥¹”(€€€€€€€€€€€€€€€€¹ÍÉ½±°¡‘•±Ñ…}à°á¥Ìèé!½É¥é½¹Ñ…°¤(€€€€€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ•ÉÉ½È¹Ñ½}ÍÑÉ¥¹œ ¤¤üì(€€€€€€€ô(€€€€€€€=¬  ¤¤(€€€ô((€€€™¸ÑåÁ•}Ñ•áĞ ™Í•±˜°Ñ•áĞè€™ÍÑÈ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€ÕÍ”•¹¥¼èé-•å‰½…Éì(€€€€€€€Í•±˜¸À(€€€€€€€€€€€€¹±½¬ ¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ}ğ€‰‘•Í­Ñ½À¥¹ÁÕĞ‰…­•¹±½¬¥ÌÁ½¥Í½¹•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ü(€€€€€€€€€€€€¹Ñ•áĞ¡Ñ•áĞ¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ•ÉÉ½È¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€ô((€€€™¸¡½Ñ­•ä ™Í•±˜°­•åÌè€™mMÑÉ¥¹t¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€ÕÍ”•¹¥¼èéí¥É•Ñ¥½¸°-•å‰½…É‘ôì(€€€€€€€±•ĞÁ…ÉÍ•èI•ÍÕ±ĞñY•Œñ|ø°|ø€ô­•åÌ¹¥Ñ•È ¤¹µ…À¡ñ­•åğÁ…ÉÍ•}­•ä¡­•ä¤¤¹½±±•Ğ ¤ì(€€€€€€€±•ĞÁ…ÉÍ•€ôÁ…ÉÍ•üì(€€€€€€€±•ĞµÕĞ•¹¥¹”€ôÍ•±˜(€€€€€€€€€€€€¸À(€€€€€€€€€€€€¹±½¬ ¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ}ğ€‰‘•Í­Ñ½À¥¹ÁÕĞ‰…­•¹±½¬¥ÌÁ½¥Í½¹•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤üì(€€€€€€€™½È­•ä¥¸€™Á…ÉÍ•ì(€€€€€€€€€€€•¹¥¹”(€€€€€€€€€€€€€€€€¹­•ä ©­•ä°¥É•Ñ¥½¸èéAÉ•ÍÌ¤(€€€€€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ•ÉÉ½È¹Ñ½}ÍÑÉ¥¹œ ¤¤üì(€€€€€€€ô(€€€€€€€™½È­•ä¥¸Á…ÉÍ•¹¥Ñ•È ¤¹É•Ø ¤ì(€€€€€€€€€€€•¹¥¹”(€€€€€€€€€€€€€€€€¹­•ä ©­•ä°¥É•Ñ¥½¸èéI•±•…Í”¤(€€€€€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ•ÉÉ½È¹Ñ½}ÍÑÉ¥¹œ ¤¤üì(€€€€€€€ô(€€€€€€€=¬  ¤¤(€€€ô)ô((¼¼¼Í¥¹±”U¹¥½‘”¡…É…Ñ•È¥ÌÍ•¹Ğ…Ì¥ÑÍ•±˜ì„Íµ…±°Í•Ğ½˜¹…µ•­•åÌ(¼¼¼½Ù•ÉÌÑ¡”½µµ½¸¹½¸µÁÉ¥¹Ñ…‰±”½¹•Ì¸¹åÑ¡¥¹œ•±Í”¥ÌÉ•©•Ñ•½ÕÑÉ¥¡Ğ(¼¼¼ƒŠPÍ¥±•¹Ñ±äÕ•ÍÍ¥¹œ…Ğ…¸Õ¹É•½¹¥é•­•ä¹…µ”¥Ì•á…Ñ±äÑ¡”­¥¹½˜(¼¼¼€‰µ¥¡Ğ‘¼Í½µ•Ñ¡¥¹œ½Ñ¡•ÈÑ¡…¸İ¡…Ğİ…Ì…ÁÁÉ½Ù•ˆ…ÀÑ¡¥ÌÍÁ¥­”…Ù½¥‘Ì¸(¼¼¼Ù•Éä•¹¥¼èé-•å€Ù…É¥…¹ĞÕÍ•¡•É”¥ÌÕ¹…Ñ•¥¸•¹¥½€Ì-•å€•¹Õ´°Í¼(¼¼¼Ñ¡¥ÌÁ…ÉÍ•Ì¥‘•¹Ñ¥…±±ä½¸µ…=L°]¥¹‘½İÌ°…¹1¥¹Õà¸(m™œ¡…¹ä¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ°Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ°Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¤¥t)™¸Á…ÉÍ•}­•ä¡­•äè€™ÍÑÈ¤€´øI•ÍÕ±Ğñ•¹¥¼èé-•ä°MÑÉ¥¹œøì(€€€ÕÍ”•¹¥¼èé-•äì(€€€±•ĞµÕĞ¡…ÉÌ€ô­•ä¹¡…ÉÌ ¤ì(€€€¥˜±•Ğ€¡M½µ”¡Í¥¹±”¤°9½¹”¤€ô€¡¡…ÉÌ¹¹•áĞ ¤°¡…ÉÌ¹¹•áĞ ¤¤ì(€€€€€€€É•ÑÕÉ¸=¬¡-•äèéU¹¥½‘”¡Í¥¹±”¤¤ì(€€€ô(€€€=¬¡µ…Ñ ­•ä¹Ñ½}…Í¥¥}±½İ•É…Í” ¤¹…Í}ÍÑÈ ¤ì(€€€€€€€€‰•¹Ñ•Èˆğ€‰É•ÑÕÉ¸ˆ€ôø-•äèéI•ÑÕÉ¸°(€€€€€€€€‰Ñ…ˆˆ€ôø-•äèéQ…ˆ°(€€€€€€€€‰ÍÁ…”ˆ€ôø-•äèéMÁ…”°(€€€€€€€€‰•Í…Á”ˆğ€‰•ÍŒˆ€ôø-•äèéÍ…Á”°(€€€€€€€€‰‰…­ÍÁ…”ˆ€ôø-•äèé	…­ÍÁ…”°(€€€€€€€€‰ÑÉ°ˆğ€‰½¹ÑÉ½°ˆ€ôø-•äèé½¹ÑÉ½°°(€€€€€€€€‰…±Ğˆğ€‰½ÁÑ¥½¸ˆ€ôø-•äèé±Ğ°(€€€€€€€€‰Í¡¥™Ğˆ€ôø-•äèéM¡¥™Ğ°(€€€€€€€€‰µˆğ€‰½µµ…¹ˆğ€‰µ•Ñ„ˆğ€‰ÍÕÁ•Èˆğ€‰İ¥¹‘½İÌˆğ€‰İ¥¸ˆ€ôø-•äèé5•Ñ„°(€€€€€€€€‰‘•±•Ñ”ˆ€ôø-•äèé•±•Ñ”°(€€€€€€€€‰ÕÀˆ€ôø-•äèéUÁÉÉ½Ü°(€€€€€€€€‰‘½İ¸ˆ€ôø-•äèé½İ¹ÉÉ½Ü°(€€€€€€€€‰±•™Ğˆ€ôø-•äèé1•™ÑÉÉ½Ü°(€€€€€€€€‰É¥¡Ğˆ€ôø-•äèéI¥¡ÑÉÉ½Ü°(€€€€€€€|€ôøÉ•ÑÕÉ¸ÉÈ¡™½Éµ…Ğ„ ‰U¹ÍÕÁÁ½ÉÑ•­•ä¹…µ”èí­•åôˆ¤¤°(€€€ô¤)ô((¼¼¼5•ÍÍ…”É•ÑÕÉ¹•‰ämÁÉ½‘ÕÑ¥½¹}‰…­•¹‘tİ¡•¸„1¥¹Õà½]…å±…¹Í•ÍÍ¥½¸¥Ì(¼¼¼‘•Ñ•Ñ•ƒŠP­•ÁĞ…Ì„¹…µ•½¹ÍÑ…¹ĞÍ¼Ñ¡”İ½É‘¥¹œ¥Ì…ÍÍ•ÉÑ•¥¸Ñ•ÍÑÌ¸(¼¼¼%ÑÌ½¹±äÁÉ½‘ÕÑ¥½¸ÕÍ”¥Ì1¥¹Õàµ…Ñ•°¡•¹”Ñ¡”¹½¸µ1¥¹Õà…±±½İ€¸(m™}…ÑÑÈ¡¹½Ğ¡Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¤°…±±½Ü¡‘•…‘}½‘”¤¥t)½¹ÍĞ]e19}U9MUAA=IQ}5MMè€™ÍÑÈ€ô(€€€€‰]…å±…¹Í•ÍÍ¥½¸‘•Ñ•Ñ•ƒŠP‘•Í­Ñ½À½¹ÑÉ½°¹••‘Ì…¸á‘œµ‘•Í­Ñ½ÀµÁ½ÉÑ…°½±¥‰•¤¥¹Ñ•É…Ñ¥½¸p(€€€€Ñ¡…Ğ¥Í¸Ğ‰Õ¥±Ğå•Ğì`ÄÄÍ•ÍÍ¥½¹Ìİ½É¬Ñ½‘…ä¸ˆì((¼¼¼AÕÉ”]…å±…¹µÍ•ÍÍ¥½¸‘•Ñ•Ñ½È¸Q…­•ÌÑ¡”É•±•Ù…¹Ğ•¹Ù¥É½¹µ•¹ĞÙ…±Õ•Ì…Ì(¼¼¼Á±…¥¸=ÁÑ¥½¸ğ™ÍÑÈù€€¡¥Ğ‘½•Ì€©¹½Ğ¨É•…Ñ¡”•¹Ù¥É½¹µ•¹Ğ¥ÑÍ•±˜¤Í¼¥Ğ¥Ì(¼¼¼™Õ±±äÕ¹¥ĞµÑ•ÍÑ…‰±”½¸…¹ä¡½ÍĞ°¥¹±Õ‘¥¹œÑ¡¥Ìµ…=L‰Õ¥±µ…¡¥¹”İ¡•É”(¼¼¼¹¼€m™œ¡Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¥u€½‘”¥Ì•Ù•È½µÁ¥±•¸(¼¼¼(¼¼¼•¥Í¥½¸è(¼¼¼€´…¸•áÁ±¥¥Ğ°¹½¸µ•µÁÑäa}MMM%=9}QeA€¥Ì…ÕÑ¡½É¥Ñ…Ñ¥Ù”è½¹±äÑ¡”(¼¼¼€€±¥Ñ•É…°€‰İ…å±…¹‰€€¡…Í”µ¥¹Í•¹Í¥Ñ¥Ù”¤½Õ¹ÑÌ…Ì]…å±…¹°Í¼€‰àÄÄ‰€(¼¼¼€€€¡½È…¹ä½Ñ¡•ÈÙ…±Õ”¤¥ÌÑÉ•…Ñ•…Ì¹½Ğµ]…å±…¹ì(¼¼¼€´½Ñ¡•Éİ¥Í”°„Í•Ğ°¹½¸µ•µÁÑä]e19}%MA1e€¥ÌÑ…­•¸…Ì]…å±…¹ì(¼¼¼€´İ¥Ñ ¹•¥Ñ¡•ÈÍ¥¹…°ÁÉ•Í•¹Ğİ”…ÍÍÕµ”`ÄÄ½Õ¹­¹½İ¸…¹É•ÑÕÉ¸™…±Í•€€¡‘¼(¼¼¼€€¹½Ğ‰±½¬ƒŠP`ÄÄ¥ÌÑ¡”ÍÕÁÁ½ÉÑ•1¥¹ÕàÁ…Ñ ¤¸(m™}…ÑÑÈ¡¹½Ğ¡Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¤°…±±½Ü¡‘•…‘}½‘”¤¥t)™¸¥Í}İ…å±…¹‘}Í•ÍÍ¥½¸¡á‘}Í•ÍÍ¥½¹}ÑåÁ”è=ÁÑ¥½¸ğ™ÍÑÈø°İ…å±…¹‘}‘¥ÍÁ±…äè=ÁÑ¥½¸ğ™ÍÑÈø¤€´ø‰½½°ì(€€€¥˜±•ĞM½µ”¡Í•ÍÍ¥½¹}ÑåÁ”¤€ôá‘}Í•ÍÍ¥½¹}ÑåÁ”ì(€€€€€€€¥˜€…Í•ÍÍ¥½¹}ÑåÁ”¹ÑÉ¥´ ¤¹¥Í}•µÁÑä ¤ì(€€€€€€€€€€€É•ÑÕÉ¸Í•ÍÍ¥½¹}ÑåÁ”¹ÑÉ¥´ ¤¹•Å}¥¹½É•}…Í¥¥}…Í” ‰İ…å±…¹ˆ¤ì(€€€€€€€ô(€€€ô(€€€İ…å±…¹‘}‘¥ÍÁ±…ä¹¥Í}Í½µ•}…¹¡ñÙ…±Õ•ğ€…Ù…±Õ”¹ÑÉ¥´ ¤¹¥Í}•µÁÑä ¤¤)ô((¼¼¼Q¡¥¸°1¥¹Õàµ½¹±äİÉ…ÁÁ•ÈÑ¡…ĞÉ•…‘ÌÑ¡”É•…°a}MMM%=9}QeA€€¼(¼¼¼]e19}%MA1e€•¹ØÙ…ÉÌ…¹‘•™•ÉÌÑ¡”…ÑÕ…°‘•¥Í¥½¸Ñ¼Ñ¡”ÁÕÉ”(¼¼¼m¥Í}İ…å±…¹‘}Í•ÍÍ¥½¹t…‰½Ù”¸(m™œ¡Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¥t)™¸¥Í}İ…å±…¹‘}Í•ÍÍ¥½¹}™É½µ}•¹Ø ¤€´ø‰½½°ì(€€€±•ĞÍ•ÍÍ¥½¹}ÑåÁ”€ôÍÑèé•¹ØèéÙ…È ‰a}MMM%=9}QeAˆ¤¹½¬ ¤ì(€€€±•Ğİ…å±…¹‘}‘¥ÍÁ±…ä€ôÍÑèé•¹ØèéÙ…È ‰]e19}%MA1dˆ¤¹½¬ ¤ì(€€€¥Í}İ…å±…¹‘}Í•ÍÍ¥½¸¡Í•ÍÍ¥½¹}ÑåÁ”¹…Í}‘•É•˜ ¤°İ…å±…¹‘}‘¥ÍÁ±…ä¹…Í}‘•É•˜ ¤¤)ô((¼¼¼M•±•ÑÌÑ¡”É•…°m¹¥½	…­•¹‘t½¸µ…=L€¼]¥¹‘½İÌ€¼1¥¹Õàµ`ÄÄ°½È„±•…È(¼¼¼mU¹ÍÕÁÁ½ÉÑ•‘	…­•¹‘t½Ñ¡•Éİ¥Í”€¡1¥¹Õàµ]…å±…¹°½Ñ¡•È=M•Ì°½Èİ¡•¸Ñ¡”(¼¼¼É•…°‰…­•¹Ì½İ¸½¹ÍÑÉÕÑ¥½¸™…¥±Ì°”¹œ¸µ¥ÍÍ¥¹œ•ÍÍ¥‰¥±¥Ñä(¼¼¼Á•Éµ¥ÍÍ¥½¸½¸µ…=L¤ƒŠP¹•Ù•È„Í¥±•¹Ğ¹¼µ½À¸=¹±ä•Ù•È…±±•½¹”°™É½´(¼¼¼•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”èéÁÉ½‘ÕÑ¥½¹€ì•Ù•ÉäÑ•ÍĞ¥¸Ñ¡¥Ìµ½‘Õ±”½¹ÍÑÉÕÑÌ¥ÑÌ(¼¼¼½İ¸m9Õ±±	…­•¹‘t¥¹ÍÑ•…¸(¼¼¼(¼¼¼9=QèÑ¡”]¥¹‘½İÌ…¹1¥¹Õà…ÉµÌ‰•±½Ü…É”½µÁ¥±•½¹±ä½¸Ñ¡•¥È½İ¸(¼¼¼Ñ…É•Ñ}½Ì…¹İ•É”9=P½µÁ¥±•½ÈÉÕ¹Ñ¥µ”µÙ•É¥™¥•¥¸Ñ¡¥Ìµ…=L(¼¼¼‘•Ù•±½Áµ•¹Ğ•¹Ù¥É½¹µ•¹Ğ¸… …É´¥Ì‘•±¥‰•É…Ñ•±ä©ÕÍĞ„]…å±…¹Õ…É€¡„(¼¼¼ÁÕÉ”°¡½ÍĞµÑ•ÍÑ•™Õ¹Ñ¥½¸¤Á±ÕÌ½¹”•¹•É¥Œ•¹¥¼èé¹¥¼èé¹•İ€…±°İ¡½Í”(¼¼¼A$¥Ì¥‘•¹Ñ¥…°…É½ÍÌ•Ù•ÉäÑ…É•Ğ¸)™¸ÁÉ½‘ÕÑ¥½¹}‰…­•¹ ¤€´øÉŒñ‘å¸•Í­Ñ½Á%¹ÁÕÑ	…­•¹øì(€€€€¼¼1¥¹Õà½]…å±…¹™…¥±Ì€©±½Í•…¹±•…É±ä¨‰•™½É”…¹ä•¹¥½€½¹ÍÑÉÕÑ¥½¸è(€€€€¼¼‰Õ¥±‘¥¹œ•¹¥¼èé¹¥½€€¡àÄÅÉˆ‰…­•¹¤Õ¹‘•È]…å±…¹İ½Õ±•¥Ñ¡•È™…¥°(€€€€¼¼½¹™ÕÍ¥¹±ä½È‰•¡…Ù”Õ¹ÁÉ•‘¥Ñ…‰±ä¸`ÄÄÍ•ÍÍ¥½¹Ì™…±°Ñ¡É½Õ Ñ¼•¹¥¼¸(€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¥t(€€€ì(€€€€€€€¥˜¥Í}İ…å±…¹‘}Í•ÍÍ¥½¹}™É½µ}•¹Ø ¤ì(€€€€€€€€€€€É•ÑÕÉ¸ÉŒèé¹•Ü¡U¹ÍÕÁÁ½ÉÑ•‘	…­•¹¡]e19}U9MUAA=IQ}5MM¹Ñ½}ÍÑÉ¥¹œ ¤¤¤ì(€€€€€€€ô(€€€ô(€€€€m™œ¡…¹ä¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ°Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ°Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¤¥t(€€€ì(€€€€€€€µ…Ñ •¹¥¼èé¹¥¼èé¹•Ü ™•¹¥¼èéM•ÑÑ¥¹Ìèé‘•™…Õ±Ğ ¤¤ì(€€€€€€€€€€€=¬¡•¹¥¹”¤€ôøÉŒèé¹•Ü¡¹¥½	…­•¹¡5ÕÑ•àèé¹•Ü¡•¹¥¹”¤¤¤°(€€€€€€€€€€€ÉÈ¡•ÉÉ½È¤€ôøÉŒèé¹•Ü¡U¹ÍÕÁÁ½ÉÑ•‘	…­•¹¡‰…­•¹‘}¥¹¥Ñ}•ÉÉ½É}µ•ÍÍ…” (€€€€€€€€€€€€€€€€™•ÉÉ½È¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€¤¤¤°(€€€€€€€ô(€€€ô(€€€€m™œ¡¹½Ğ¡…¹ä¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ°Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ°Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¤¤¥t(€€€ì(€€€€€€€ÉŒèé¹•Ü¡U¹ÍÕÁÁ½ÉÑ•‘	…­•¹ (€€€€€€€€€€€€‰M…™”•Í­Ñ½À½¹ÑÉ½°¥¹ÁÕĞÍ¥µÕ±…Ñ¥½¸¥Ì¹½Ğ¥µÁ±•µ•¹Ñ•½¸Ñ¡¥ÌÁ±…Ñ™½É´ƒŠP„É•…°p(€€€€€€€€€€€€‰…­•¹¥Ìİ¥É•½¹±ä½¸µ…=L°]¥¹‘½İÌ°…¹1¥¹Õà½`ÄÄˆ(€€€€€€€€€€€€€€€€¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€¤¤(€€€ô)ô((¼¼¼A•Èµ=L¡¥¹Ğ…ÁÁ•¹‘•Ñ¼…¸•¹¥¼èé¹¥¼èé¹•İ€™…¥±ÕÉ”¸-•ÁĞÑ¥¹ä…¹(¼¼¼™œµÍ•±•Ñ•€¡½¹±äÑ¡”¡½ÍĞÑ…É•ĞÌ…É´¥Ì•Ù•È½µÁ¥±•¤ìÑ¡”ÍÕÉÉ½Õ¹‘¥¹œ(¼¼¼ÁÕÉ”ÍÑÉ¥¹œ™½Éµ…ÑÑ¥¹œ¥Ìİ¡…Ğµ…­•ÌÑ¡”µ•ÍÍ…”¸(m™œ¡…¹ä¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ°Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ°Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¤¥t)™¸‰…­•¹‘}¥¹¥Ñ}•ÉÉ½É}µ•ÍÍ…”¡•ÉÉ½Èè€™ÍÑÈ¤€´øMÑÉ¥¹œì(€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ¥t(€€€±•Ğ¡¥¹Ğ€ô€‰É…¹Ğ•ÍÍ¥‰¥±¥Ñä…•ÍÌ¥¸MåÍÑ•´M•ÑÑ¥¹Ì€øAÉ¥Ù…ä€˜M•ÕÉ¥Ñä€øp(€€€€€€€€€€€€€€€•ÍÍ¥‰¥±¥Ñä°Ñ¡•¸É•ÍÑ…ÉĞ1¥ÑÑ±”5½¹­•äˆì(€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ¥t(€€€±•Ğ¡¥¹Ğ€ô€‰Ñ¡”ÕÉÉ•¹Ğ‘•Í­Ñ½ÀÍ•ÍÍ¥½¸µ…ä¹½ĞÁ•Éµ¥ĞÍå¹Ñ¡•Ñ¥Œ¥¹ÁÕĞ€¡”¹œ¸¹¼¥¹Ñ•É…Ñ¥Ù”p(€€€€€€€€€€€€€€€‘•Í­Ñ½À°½È„¡¥¡•Èµ¥¹Ñ•É¥Ñäİ¥¹‘½Ü¡…Ì™½ÕÌ¤ˆì(€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¥t(€€€±•Ğ¡¥¹Ğ€ô€‰•¹ÍÕÉ”…¸`ÄÄ‘¥ÍÁ±…ä¥ÌÉ•…¡…‰±”€¡%MA1dÍ•Ğ¤ì]…å±…¹Í•ÍÍ¥½¹Ì…É”¹½Ğp(€€€€€€€€€€€€€€€ÍÕÁÁ½ÉÑ•å•Ğˆì(€€€™½Éµ…Ğ„ ‰½Õ±¹½Ğ¥¹¥Ñ¥…±¥é”‘•Í­Ñ½À¥¹ÁÕĞÍ¥µÕ±…Ñ¥½¸ƒŠPí¡¥¹Ñôèí•ÉÉ½Éôˆ¤)ô()½¹ÍĞ5a}9Q%Y}=UQAUQ}	eQLèÕÍ¥é”€ô€à€¨€ÄÀÈĞ€¨€ÄÀÈĞì)½¹ÍĞ9Q%Y}AI=Y%I}Q%5=UPèÕÉ…Ñ¥½¸€ôÕÉ…Ñ¥½¸èé™É½µ}Í•Ì ÄÔ¤ì)½¹ÍĞ5a}QIQLèÕÍ¥é”€ô€ØĞì)½¹ÍĞ5a}159QLèÕÍ¥é”€ô€ÈÔØì(m™}…ÑÑÈ¡¹½Ğ¡Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¤°…±±½Ü¡‘•…‘}½‘”¤¥t)½¹ÍĞ]e19}A=IQ1}5MMè€™ÍÑÈ€ô(€€€€‰]…å±…¹É•ÅÕ¥É•Ì…¸…ÁÁÉ½Ù•á‘œµ‘•Í­Ñ½ÀµÁ½ÉÑ…°I•µ½Ñ••Í­Ñ½À½%¹ÁÕÑ…ÁÑÕÉ”½±¥‰•¤Á…Ñ ìp(€€€€1¥ÑÑ±”5½¹­•äİ¥±°¹½Ğ‰åÁ…ÍÌ½µÁ½Í¥Ñ½ÈÍ•ÕÉ¥Ñäˆì((m‘•É¥Ù”¡•™…Õ±Ğ°•Í•É¥…±¥é”¥t)ÍÑÉÕĞ9…Ñ¥Ù•M¹…ÁÍ¡½Ğì(€€€€mÍ•É‘”¡‘•™…Õ±Ğ°‘•Í•É¥…±¥é•}İ¥Ñ €ô€‰‘•Í•É¥…±¥é•}Ù•}½É}Í¥¹±•Ñ½¸ˆ¥t(€€€Ñ…É•ÑÌèY•Œñ½µÁÕÑ•ÉQ…É•Ğø°(€€€€mÍ•É‘”¡‘•™…Õ±Ğ°‘•Í•É¥…±¥é•}İ¥Ñ €ô€‰‘•Í•É¥…±¥é•}•±•µ•¹Ñ}µ…Àˆ¥t(€€€•±•µ•¹ÑÌè!…Í¡5…ÀñMÑÉ¥¹œ°Y•Œñ½µÁÕÑ•É±•µ•¹Ğøø°)ô((m‘•É¥Ù”¡•Í•É¥…±¥é”¥t(mÍ•É‘”¡Õ¹Ñ…•¥t)•¹Õ´=¹•=É5…¹äñPøì(€€€5…¹ä¡Y•ŒñPø¤°(€€€=¹”¡P¤°)ô()™¸‘•Í•É¥…±¥é•}Ù•}½É}Í¥¹±•Ñ½¸ğ‘”°°Pø¡‘•Í•É¥…±¥é•Èè¤€´øI•ÍÕ±ĞñY•ŒñPø°èéÉÉ½Èø)İ¡•É”(€€€è•Í•É¥…±¥é•Èğ‘”ø°(€€€Pè•Í•É¥…±¥é”ğ‘”ø°)ì(€€€=¬¡µ…Ñ =¹•=É5…¹äèé‘•Í•É¥…±¥é”¡‘•Í•É¥…±¥é•È¤üì(€€€€€€€=¹•=É5…¹äèé5…¹ä¡Ù…±Õ•Ì¤€ôøÙ…±Õ•Ì°(€€€€€€€=¹•=É5…¹äèé=¹”¡Ù…±Õ”¤€ôøÙ•Œ…mÙ…±Õ•t°(€€€ô¤)ô()™¸‘•Í•É¥…±¥é•}•±•µ•¹Ñ}µ…Àğ‘”°ø (€€€‘•Í•É¥…±¥é•Èè°(¤€´øI•ÍÕ±Ğñ!…Í¡5…ÀñMÑÉ¥¹œ°Y•Œñ½µÁÕÑ•É±•µ•¹Ğøø°èéÉÉ½Èø)İ¡•É”(€€€è•Í•É¥…±¥é•Èğ‘”ø°)ì(€€€±•ĞÙ…±Õ•Ìè!…Í¡5…ÀñMÑÉ¥¹œ°=¹•=É5…¹äñ½µÁÕÑ•É±•µ•¹Ğøø€ô!…Í¡5…Àèé‘•Í•É¥…±¥é”¡‘•Í•É¥…±¥é•È¤üì(€€€=¬¡Ù…±Õ•Ì(€€€€€€€€¹¥¹Ñ½}¥Ñ•È ¤(€€€€€€€€¹µ…À¡ğ¡­•ä°Ù…±Õ”¥ğì(€€€€€€€€€€€±•Ğ•±•µ•¹ÑÌ€ôµ…Ñ Ù…±Õ”ì(€€€€€€€€€€€€€€€=¹•=É5…¹äèé5…¹ä¡•±•µ•¹ÑÌ¤€ôø•±•µ•¹ÑÌ°(€€€€€€€€€€€€€€€=¹•=É5…¹äèé=¹”¡•±•µ•¹Ğ¤€ôøÙ•Œ…m•±•µ•¹Ñt°(€€€€€€€€€€€ôì(€€€€€€€€€€€€¡­•ä°•±•µ•¹ÑÌ¤(€€€€€€€ô¤(€€€€€€€€¹½±±•Ğ ¤¤)ô()ÍÑÉÕĞ9…Ñ¥Ù•M•µ…¹Ñ¥	…­•¹ì(€€€¥¹ÁÕĞèÉŒñ‘å¸•Í­Ñ½Á%¹ÁÕÑ	…­•¹ø°)ô()™¸ÁÉ½‘ÕÑ¥½¹}Í•µ…¹Ñ¥}‰…­•¹ (€€€¥¹ÁÕĞèÉŒñ‘å¸•Í­Ñ½Á%¹ÁÕÑ	…­•¹ø°(¤€´øÉŒñ‘å¸•Í­Ñ½ÁM•µ…¹Ñ¥	…­•¹øì(€€€ÉŒèé¹•Ü¡9…Ñ¥Ù•M•µ…¹Ñ¥	…­•¹ì¥¹ÁÕĞô¤)ô()™¸ÉÕ¹}¹…Ñ¥Ù•}½µµ…¹¡ÁÉ½É…´è€™ÍÑÈ°…ÉÌè€™l™ÍÑÉt¤€´øI•ÍÕ±ĞñY•ŒñÔàø°MÑÉ¥¹œøì(€€€ÉÕ¹}¹…Ñ¥Ù•}½µµ…¹‘}İ¥Ñ¡}•¹Ø¡ÁÉ½É…´°…ÉÌ°€™mt¤)ô()™¸ÉÕ¹}¹…Ñ¥Ù•}½µµ…¹‘}İ¥Ñ¡}•¹Ø (€€€ÁÉ½É…´è€™ÍÑÈ°(€€€…ÉÌè€™l™ÍÑÉt°(€€€•¹Ù¥É½¹µ•¹Ğè€™l ™ÍÑÈ°MÑÉ¥¹œ¥t°(¤€´øI•ÍÕ±ĞñY•ŒñÔàø°MÑÉ¥¹œøì(€€€±•ĞµÕĞ½µµ…¹€ô½µµ…¹èé¹•Ü¡ÁÉ½É…´¤ì(€€€½µµ…¹¹…ÉÌ¡…ÉÌ¤ì(€€€™½È€¡­•ä°Ù…±Õ”¤¥¸•¹Ù¥É½¹µ•¹Ğì(€€€€€€€½µµ…¹¹•¹Ø¡­•ä°Ù…±Õ”¤ì(€€€ô(€€€±•ĞµÕĞ¡¥±€ô½µµ…¹(€€€€€€€€¹ÍÑ‘½ÕĞ¡ÍÑèéÁÉ½•ÍÌèéMÑ‘¥¼èéÁ¥Á• ¤¤(€€€€€€€€¹ÍÑ‘•ÉÈ¡ÍÑèéÁÉ½•ÍÌèéMÑ‘¥¼èéÁ¥Á• ¤¤(€€€€€€€€¹ÍÁ…İ¸ ¤(€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ™½Éµ…Ğ„ ‰½Õ±¹½ĞÍÑ…ÉĞ…•ÍÍ¥‰¥±¥ÑäÁÉ½Ù¥‘•ÈíÁÉ½É…µôèí•ÉÉ½Éôˆ¤¤üì((€€€±•ĞÍÑ‘½ÕĞ€ô¡¥±(€€€€€€€€¹ÍÑ‘½ÕĞ(€€€€€€€€¹Ñ…­” ¤(€€€€€€€€¹½­}½É}•±Í”¡ñğ™½Éµ…Ğ„ ‰•ÍÍ¥‰¥±¥ÑäÁÉ½Ù¥‘•ÈíÁÉ½É…µô‘¥¹½Ğ•áÁ½Í”ÍÑ‘½ÕĞˆ¤¤üì(€€€±•ĞÍÑ‘•ÉÈ€ô¡¥±(€€€€€€€€¹ÍÑ‘•ÉÈ(€€€€€€€€¹Ñ…­” ¤(€€€€€€€€¹½­}½É}•±Í”¡ñğ™½Éµ…Ğ„ ‰•ÍÍ¥‰¥±¥ÑäÁÉ½Ù¥‘•ÈíÁÉ½É…µô‘¥¹½Ğ•áÁ½Í”ÍÑ‘•ÉÈˆ¤¤üì(€€€±•Ğ€¡ÍÑ‘•ÉÉ}Í•¹‘•È°ÍÑ‘•ÉÉ}É••¥Ù•È¤€ôÍÑèéÍå¹ŒèéµÁÍŒèé¡…¹¹•° ¤ì(€€€ÍÑèéÑ¡É•…èéÍÁ…İ¸¡µ½Ù”ñğì(€€€€€€€±•ĞµÕĞÍÑ‘•ÉÈ€ôÍÑ‘•ÉÈì(€€€€€€€±•ĞµÕĞ…ÁÑÕÉ•€ôY•Œèé¹•Ü ¤ì(€€€€€€€±•ĞµÕĞ¡Õ¹¬€ôlÁ}Ôàì€ĞÀäÙtì(€€€€€€€±•ĞÉ•ÍÕ±Ğ€ô±½½Àì(€€€€€€€€€€€±•Ğ½Õ¹Ğ€ôµ…Ñ ÍÑ‘•ÉÈ¹É•… ™µÕĞ¡Õ¹¬¤ì(€€€€€€€€€€€€€€€=¬¡½Õ¹Ğ¤€ôø½Õ¹Ğ°(€€€€€€€€€€€€€€€ÉÈ¡•ÉÉ½È¤€ôø‰É•…¬ÉÈ¡•ÉÉ½È¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€ôì(€€€€€€€€€€€¥˜½Õ¹Ğ€ôô€Àì(€€€€€€€€€€€€€€€‰É•…¬=¬¡…ÁÑÕÉ•¤ì(€€€€€€€€€€€ô(€€€€€€€€€€€±•ĞÉ•µ…¥¹¥¹œ€ô€ØĞ€¨€ÄÀÈĞ€´…ÁÑÕÉ•¹±•¸ ¤ì(€€€€€€€€€€€¥˜É•µ…¥¹¥¹œ€ø€Àì(€€€€€€€€€€€€€€€…ÁÑÕÉ•¹•áÑ•¹‘}™É½µ}Í±¥” ™¡Õ¹­l¸¹½Õ¹Ğ¹µ¥¸¡É•µ…¥¹¥¹œ¥t¤ì(€€€€€€€€€€€ô(€€€€€€€ôì(€€€€€€€±•Ğ|€ôÍÑ‘•ÉÉ}Í•¹‘•È¹Í•¹¡É•ÍÕ±Ğ¤ì(€€€ô¤ì((€€€±•Ğ€¡ÍÑ‘½ÕÑ}Í•¹‘•È°ÍÑ‘½ÕÑ}É••¥Ù•È¤€ôÍÑèéÍå¹ŒèéµÁÍŒèé¡…¹¹•° ¤ì(€€€ÍÑèéÑ¡É•…èéÍÁ…İ¸¡µ½Ù”ñğì(€€€€€€€±•ĞµÕĞÍÑ‘½ÕĞ€ôÍÑ‘½ÕĞì(€€€€€€€±•ĞµÕĞÍÑ‘½ÕÑ}‰åÑ•Ì€ôY•Œèé¹•Ü ¤ì(€€€€€€€±•ĞµÕĞ¡Õ¹¬€ôlÁ}Ôàì€ÄØ€¨€ÄÀÈÑtì(€€€€€€€±•ĞÉ•ÍÕ±Ğ€ô±½½Àì(€€€€€€€€€€€±•Ğ½Õ¹Ğ€ôµ…Ñ ÍÑ‘½ÕĞ¹É•… ™µÕĞ¡Õ¹¬¤ì(€€€€€€€€€€€€€€€=¬¡½Õ¹Ğ¤€ôø½Õ¹Ğ°(€€€€€€€€€€€€€€€ÉÈ¡•ÉÉ½È¤€ôø‰É•…¬ÉÈ¡•ÉÉ½È¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€ôì(€€€€€€€€€€€¥˜½Õ¹Ğ€ôô€Àì(€€€€€€€€€€€€€€€‰É•…¬=¬¡ÍÑ‘½ÕÑ}‰åÑ•Ì¤ì(€€€€€€€€€€€ô(€€€€€€€€€€€¥˜ÍÑ‘½ÕÑ}‰åÑ•Ì¹±•¸ ¤¹Í…ÑÕÉ…Ñ¥¹}…‘¡½Õ¹Ğ¤€ø5a}9Q%Y}=UQAUQ}	eQLì(€€€€€€€€€€€€€€€‰É•…¬ÉÈ (€€€€€€€€€€€€€€€€€€€€‰•ÍÍ¥‰¥±¥ÑäÁÉ½Ù¥‘•ÈÉ•ÑÕÉ¹•µ½É”Ñ¡…¸Ñ¡”‰½Õ¹‘•½ÕÑÁÕĞ±¥µ¥Ğˆ(€€€€€€€€€€€€€€€€€€€€€€€€¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€€¤ì(€€€€€€€€€€€ô(€€€€€€€€€€€ÍÑ‘½ÕÑ}‰åÑ•Ì¹•áÑ•¹‘}™É½µ}Í±¥” ™¡Õ¹­l¸¹½Õ¹Ñt¤ì(€€€€€€€ôì(€€€€€€€±•Ğ|€ôÍÑ‘½ÕÑ}Í•¹‘•È¹Í•¹¡É•ÍÕ±Ğ¤ì(€€€ô¤ì(€€€±•Ğ‘•…‘±¥¹”€ôÍÑèéÑ¥µ”èé%¹ÍÑ…¹Ğèé¹½Ü ¤€¬9Q%Y}AI=Y%I}Q%5=UPì(€€€±•ĞÍÑ…ÑÕÌ€ô±½½Àì(€€€€€€€µ…Ñ ¡¥±¹ÑÉå}İ…¥Ğ ¤ì(€€€€€€€€€€€=¬¡M½µ”¡ÍÑ…ÑÕÌ¤¤€ôø‰É•…¬ÍÑ…ÑÕÌ°(€€€€€€€€€€€=¬¡9½¹”¤¥˜ÍÑèéÑ¥µ”èé%¹ÍÑ…¹Ğèé¹½Ü ¤€øô‘•…‘±¥¹”€ôøì(€€€€€€€€€€€€€€€±•Ğ|€ô¡¥±¹­¥±° ¤ì(€€€€€€€€€€€€€€€±•Ğ|€ô¡¥±¹İ…¥Ğ ¤ì(€€€€€€€€€€€€€€€É•ÑÕÉ¸ÉÈ¡™½Éµ…Ğ„ ‰•ÍÍ¥‰¥±¥ÑäÁÉ½Ù¥‘•ÈíÁÉ½É…µôÑ¥µ•½ÕĞˆ¤¤ì(€€€€€€€€€€€ô(€€€€€€€€€€€=¬¡9½¹”¤€ôøÍÑèéÑ¡É•…èéÍ±••À¡ÕÉ…Ñ¥½¸èé™É½µ}µ¥±±¥Ì ÄÀ¤¤°(€€€€€€€€€€€ÉÈ¡•ÉÉ½È¤€ôøì(€€€€€€€€€€€€€€€±•Ğ|€ô¡¥±¹­¥±° ¤ì(€€€€€€€€€€€€€€€±•Ğ|€ô¡¥±¹İ…¥Ğ ¤ì(€€€€€€€€€€€€€€€É•ÑÕÉ¸ÉÈ¡™½Éµ…Ğ„ (€€€€€€€€€€€€€€€€€€€€‰½Õ±¹½Ğİ…¥Ğ™½È…•ÍÍ¥‰¥±¥ÑäÁÉ½Ù¥‘•ÈíÁÉ½É…µôèí•ÉÉ½Éôˆ(€€€€€€€€€€€€€€€€¤¤ì(€€€€€€€€€€€ô(€€€€€€€ô(€€€ôì(€€€±•ĞÍÑ‘½ÕÑ}‰åÑ•Ì€ôÍÑ‘½ÕÑ}É••¥Ù•È(€€€€€€€€¹É•Ù}Ñ¥µ•½ÕĞ¡ÕÉ…Ñ¥½¸èé™É½µ}Í•Ì Ä¤¤(€€€€€€€€¹µ…Á}•ÉÈ¡ñ}ğ™½Éµ…Ğ„ ‰•ÍÍ¥‰¥±¥ÑäÁÉ½Ù¥‘•ÈíÁÉ½É…µô½ÕÑÁÕĞÑ¥µ•½ÕĞˆ¤¤ü(€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ™½Éµ…Ğ„ ‰½Õ±¹½ĞÉ•……•ÍÍ¥‰¥±¥ÑäÁÉ½Ù¥‘•È½ÕÑÁÕĞèí•ÉÉ½Éôˆ¤¤üì(€€€±•ĞÍÑ‘•ÉÈ€ôÍÑ‘•ÉÉ}É••¥Ù•È(€€€€€€€€¹É•Ù}Ñ¥µ•½ÕĞ¡ÕÉ…Ñ¥½¸èé™É½µ}Í•Ì Ä¤¤(€€€€€€€€¹µ…Á}•ÉÈ¡ñ}ğ™½Éµ…Ğ„ ‰•ÍÍ¥‰¥±¥ÑäÁÉ½Ù¥‘•ÈíÁÉ½É…µô•ÉÉ½È½ÕÑÁÕĞÑ¥µ•½ÕĞˆ¤¤ü(€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ™½Éµ…Ğ„ ‰½Õ±¹½ĞÉ•……•ÍÍ¥‰¥±¥ÑäÁÉ½Ù¥‘•È•ÉÉ½È½ÕÑÁÕĞèí•ÉÉ½Éôˆ¤¤üì(€€€¥˜€…ÍÑ…ÑÕÌ¹ÍÕ•ÍÌ ¤ì(€€€€€€€±•Ğ•ÉÉ½È€ôMÑÉ¥¹œèé™É½µ}ÕÑ˜á}±½ÍÍä ™ÍÑ‘•ÉÈ¤ì(€€€€€€€É•ÑÕÉ¸ÉÈ¡¥˜•ÉÉ½È¹ÑÉ¥´ ¤¹¥Í}•µÁÑä ¤ì(€€€€€€€€€€€™½Éµ…Ğ„ ‰•ÍÍ¥‰¥±¥ÑäÁÉ½Ù¥‘•ÈíÁÉ½É…µô•á¥Ñ•Õ¹ÍÕ•ÍÍ™Õ±±äˆ¤(€€€€€€€ô•±Í”ì(€€€€€€€€€€€™½Éµ…Ğ„ ‰•ÍÍ¥‰¥±¥ÑäÁÉ½Ù¥‘•ÈíÁÉ½É…µô™…¥±•èíôˆ°•ÉÉ½È¹ÑÉ¥´ ¤¤(€€€€€€€ô¤ì(€€€ô(€€€=¬¡ÍÑ‘½ÕÑ}‰åÑ•Ì¤)ô()™¸É•…‘}±¥Á‰½…É‘}¹…Ñ¥Ù” ¤€´øI•ÍÕ±ĞñMÑÉ¥¹œ°MÑÉ¥¹œøì(€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ¥t(€€€±•Ğ‰åÑ•Ì€ôÉÕ¹}¹…Ñ¥Ù•}½µµ…¹ ‰Á‰Á…ÍÑ”ˆ°€™mt¤üì(€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ¥t(€€€±•Ğ‰åÑ•Ì€ôÉÕ¹}¹…Ñ¥Ù•}½µµ…¹ (€€€€€€€€‰Á½İ•ÉÍ¡•±°¹•á”ˆ°(€€€€€€€€™l(€€€€€€€€€€€€ˆµ9½AÉ½™¥±”ˆ°(€€€€€€€€€€€€ˆµ9½¹%¹Ñ•É…Ñ¥Ù”ˆ°(€€€€€€€€€€€€ˆµ½µµ…¹ˆ°(€€€€€€€€€€€€‰•Ğµ±¥Á‰½…É€µI…Üˆ°(€€€€€€€t°(€€€€¤üì(€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¥t(€€€±•Ğ‰åÑ•Ì€ôì(€€€€€€€¥˜¥Í}İ…å±…¹‘}Í•ÍÍ¥½¹}™É½µ}•¹Ø ¤ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ¡]e19}A=IQ1}5MM¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€ÉÕ¹}¹…Ñ¥Ù•}½µµ…¹ ‰á±¥Àˆ°€™lˆµÍ•±•Ñ¥½¸ˆ°€‰±¥Á‰½…Éˆ°€ˆµ¼‰t¤(€€€€€€€€€€€€¹½É}•±Í”¡ñ}ğÉÕ¹}¹…Ñ¥Ù•}½µµ…¹ ‰áÍ•°ˆ°€™lˆ´µ±¥Á‰½…Éˆ°€ˆ´µ½ÕÑÁÕĞ‰t¤¤ü(€€€ôì(€€€€m™œ¡¹½Ğ¡…¹ä¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ°Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ°Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¤¤¥t(€€€±•Ğ‰åÑ•Ì€ôÉ•ÑÕÉ¸ÉÈ ‰±¥Á‰½…É…•ÍÌ¥Ì¹½Ğ¥µÁ±•µ•¹Ñ•½¸Ñ¡¥ÌÁ±…Ñ™½É´ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€¥˜‰åÑ•Ì¹±•¸ ¤€ø€ØĞ€¨€ÄÀÈĞì(€€€€€€€É•ÑÕÉ¸ÉÈ ‰±¥Á‰½…É½¹Ñ•¹Ğ•á••‘ÌÑ¡”€ØĞ-¥½µÁÕÑ•ÈUÍ”É•…‰½Õ¹ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€ô(€€€MÑÉ¥¹œèé™É½µ}ÕÑ˜à¡‰åÑ•Ì¤¹µ…Á}•ÉÈ¡ñ}ğ€‰±¥Á‰½…É½¹Ñ•¹Ğ¥Ì¹½ĞÙ…±¥UQ´àˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤)ô()™¸¹…Ñ¥Ù•}Í¹…ÁÍ¡½Ğ ¤€´øI•ÍÕ±Ğñ9…Ñ¥Ù•M¹…ÁÍ¡½Ğ°MÑÉ¥¹œøì(€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ¥t(€€€ì(€€€€€€€±•Ğ‰åÑ•Ì€ôÉÕ¹}¹…Ñ¥Ù•}½µµ…¹ ‰½Í…ÍÉ¥ÁĞˆ°€™lˆµ°ˆ°€‰)…Ù…MÉ¥ÁĞˆ°€ˆµ”ˆ°5=M}a}MI%AQt¤üì(€€€€€€€É•ÑÕÉ¸Í•É‘•}©Í½¸èé™É½µ}Í±¥” ™‰åÑ•Ì¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ™½Éµ…Ğ„ ‰µ…=L•ÍÍ¥‰¥±¥ÑäÉ•ÑÕÉ¹•¥¹Ù…±¥‘…Ñ„èí•ÉÉ½Éôˆ¤¤ì(€€€ô(€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ¥t(€€€ì(€€€€€€€±•Ğ‰åÑ•Ì€ôÉÕ¹}¹…Ñ¥Ù•}½µµ…¹ (€€€€€€€€€€€€‰Á½İ•ÉÍ¡•±°¹•á”ˆ°(€€€€€€€€€€€€™l(€€€€€€€€€€€€€€€€ˆµ9½AÉ½™¥±”ˆ°(€€€€€€€€€€€€€€€€ˆµ9½¹%¹Ñ•É…Ñ¥Ù”ˆ°(€€€€€€€€€€€€€€€€ˆµ½µµ…¹ˆ°(€€€€€€€€€€€€€€€]%9=]M}U%}MI%AP°(€€€€€€€€€€€t°(€€€€€€€€¤üì(€€€€€€€É•ÑÕÉ¸Í•É‘•}©Í½¸èé™É½µ}Í±¥” ™‰åÑ•Ì¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ™½Éµ…Ğ„ ‰]¥¹‘½İÌU$ÕÑ½µ…Ñ¥½¸É•ÑÕÉ¹•¥¹Ù…±¥‘…Ñ„èí•ÉÉ½Éôˆ¤¤ì(€€€ô(€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¥t(€€€ì(€€€€€€€¥˜¥Í}İ…å±…¹‘}Í•ÍÍ¥½¹}™É½µ}•¹Ø ¤ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ¡]e19}A=IQ1}5MM¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€±•Ğ‰åÑ•Ì€ôÉÕ¹}¹…Ñ¥Ù•}½µµ…¹ ‰ÁåÑ¡½¸Ìˆ°€™lˆµŒˆ°1%9Ua}QMA%}MI%AQt¤üì(€€€€€€€±•ĞµÕĞÍ¹…ÁÍ¡½Ğè9…Ñ¥Ù•M¹…ÁÍ¡½Ğ€ôÍ•É‘•}©Í½¸èé™É½µ}Í±¥” ™‰åÑ•Ì¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ™½Éµ…Ğ„ ‰1¥¹ÕàPµMA$É•ÑÕÉ¹•¥¹Ù…±¥‘…Ñ„èí•ÉÉ½Éôˆ¤¤üì(€€€€€€€¹½Éµ…±¥é•}±¥¹Õá}İ¥¹‘½İ}¥‘Ì ™µÕĞÍ¹…ÁÍ¡½Ğ¤ì(€€€€€€€É•ÑÕÉ¸=¬¡Í¹…ÁÍ¡½Ğ¤ì(€€€ô(€€€€m™œ¡¹½Ğ¡…¹ä¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ°Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ°Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¤¤¥t(€€€ì(€€€€€€€ÉÈ ‰M•µ…¹Ñ¥Œ…•ÍÍ¥‰¥±¥Ñä¥Ì¹½Ğ¥µÁ±•µ•¹Ñ•½¸Ñ¡¥ÌÁ±…Ñ™½É´ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€ô)ô((m™œ¡Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¥t)™¸¹½Éµ…±¥é•}±¥¹Õá}İ¥¹‘½İ}¥‘Ì¡Í¹…ÁÍ¡½Ğè€™µÕĞ9…Ñ¥Ù•M¹…ÁÍ¡½Ğ¤ì(€€€±•Ğ=¬¡½ÕÑÁÕĞ¤€ô½µµ…¹èé¹•Ü ‰İµÑÉ°ˆ¤¹…ÉÌ¡lˆµ°‰t¤¹½ÕÑÁÕĞ ¤•±Í”ì(€€€€€€€É•ÑÕÉ¸ì(€€€ôì(€€€±•Ğİ¥¹‘½İÌèY•Œğ¡MÑÉ¥¹œ°MÑÉ¥¹œ¤ø€ôMÑÉ¥¹œèé™É½µ}ÕÑ˜á}±½ÍÍä ™½ÕÑÁÕĞ¹ÍÑ‘½ÕĞ¤(€€€€€€€€¹±¥¹•Ì ¤(€€€€€€€€¹™¥±Ñ•É}µ…À¡ñ±¥¹•ğì(€€€€€€€€€€€±•ĞµÕĞ™¥•±‘Ì€ô±¥¹”¹ÍÁ±¥Ñ¸ Ğ°¡…Èèé¥Í}İ¡¥Ñ•ÍÁ…”¤ì(€€€€€€€€€€€±•Ğ¥€ô™¥•±‘Ì¹¹•áĞ ¤ü¹ÑÉ¥´ ¤¹Ñ½}ÍÑÉ¥¹œ ¤ì(€€€€€€€€€€€±•Ğ}‘•Í­Ñ½À€ô™¥•±‘Ì¹¹•áĞ ¤üì(€€€€€€€€€€€±•Ğ}¡½ÍĞ€ô™¥•±‘Ì¹¹•áĞ ¤üì(€€€€€€€€€€€±•ĞÑ¥Ñ±”€ô™¥•±‘Ì¹¹•áĞ ¤ü¹ÑÉ¥´ ¤¹Ñ½}ÍÑÉ¥¹œ ¤ì(€€€€€€€€€€€M½µ” ¡¥°Ñ¥Ñ±”¤¤(€€€€€€€ô¤(€€€€€€€€¹½±±•Ğ ¤ì(€€€™½ÈÑ…É•Ğ¥¸€™µÕĞÍ¹…ÁÍ¡½Ğ¹Ñ…É•ÑÌì(€€€€€€€Ñ…É•Ğ¹ÁÉ½Ù¥‘•É}İ¥¹‘½İ}¥€ôM½µ”¡Ñ…É•Ğ¹İ¥¹‘½İ}¥¹±½¹” ¤¤ì(€€€€€€€¥˜±•ĞM½µ” ¡İ¥¹‘½İ}¥°|¤¤€ôİ¥¹‘½İÌ¹¥Ñ•È ¤¹™¥¹¡ğ¡|°Ñ¥Ñ±”¥ğì(€€€€€€€€€€€€…Ñ…É•Ğ¹İ¥¹‘½İ}Ñ¥Ñ±”¹¥Í}•µÁÑä ¤(€€€€€€€€€€€€€€€€˜˜€¡Ñ¥Ñ±”€ôô€™Ñ…É•Ğ¹İ¥¹‘½İ}Ñ¥Ñ±”ñğÑ¥Ñ±”¹½¹Ñ…¥¹Ì ™Ñ…É•Ğ¹İ¥¹‘½İ}Ñ¥Ñ±”¤¤(€€€€€€€ô¤ì(€€€€€€€€€€€Ñ…É•Ğ¹İ¥¹‘½İ}¥€ôİ¥¹‘½İ}¥¹±½¹” ¤ì(€€€€€€€ô(€€€ô)ô()™¸Ñ…É•Ñ}¥Í}Í•¹Í¥Ñ¥Ù”¡Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ¤€´ø‰½½°ì(€€€Ñ…É•Ğ¹Í•¹Í¥Ñ¥Ù”(€€€€€€€ñğÍ•¹Í¥Ñ¥Ù•}Ñ•áĞ ™™½Éµ…Ğ„ (€€€€€€€€€€€€‰íôíôíôíôˆ°(€€€€€€€€€€€Ñ…É•Ğ¹…ÁÁ±¥…Ñ¥½¹}¥°Ñ…É•Ğ¹…ÁÁ±¥…Ñ¥½¹}¹…µ”°Ñ…É•Ğ¹İ¥¹‘½İ}¥°Ñ…É•Ğ¹İ¥¹‘½İ}Ñ¥Ñ±”(€€€€€€€€¤¤)ô()™¸Í•¹Í¥Ñ¥Ù•}Ñ•áĞ¡Ù…±Õ”è€™ÍÑÈ¤€´ø‰½½°ì(€€€±•Ğ¹½Éµ…±¥é•€ôÙ…±Õ”¹Ñ½}…Í¥¥}±½İ•É…Í” ¤ì(€€€l(€€€€€€€€ˆÅÁ…ÍÍİ½Éˆ°(€€€€€€€€‰±…ÍÑÁ…ÍÌˆ°(€€€€€€€€‰‰¥Ñİ…É‘•¸ˆ°(€€€€€€€€‰Á…ÍÍİ½Éµ…¹…•Èˆ°(€€€€€€€€‰­•å¡…¥¸ˆ°(€€€€€€€€‰Í•ÕÉ¥Ñå…•¹Ğˆ°(€€€€€€€€‰ÍåÍÑ•´Í•ÑÑ¥¹Ìˆ°(€€€€€€€€‰ÍåÍÑ•´ÁÉ•™•É•¹•Ìˆ°(€€€€€€€€‰Ñ•Éµ¥¹…°ˆ°(€€€€€€€€‰¥Ñ•É´ˆ°(€€€€€€€€‰Á½İ•ÉÍ¡•±°ˆ°(€€€€€€€€‰½µµ…¹ÁÉ½µÁĞˆ°(€€€€€€€€‰Õ…Œˆ°(€€€€€€€€‰İ¥¹‘½İÌÍ•ÕÉ¥Ñäˆ°(€€€€€€€€‰É•‘•¹Ñ¥…°Õ¤ˆ°(€€€€€€€€ˆŒÌÈÜÜÀˆ°(€€€€€€€€‰ÍÕ‘¼ˆ°(€€€€€€€€‰…ÕÑ¡•¹Ñ¥…Ñ¥½¸ˆ°(€€€€€€€€‰…ÕÑ ‘¥…±½œˆ°(€€€€€€€€‰‰¥½µ•ÑÉ¥Œˆ°(€€€€€€€€‰±½¥¹İ¥¹‘½Üˆ°(€€€€€€€€‰™Õ±°‘¥Í¬•¹ÉåÁÑ¥½¸ˆ°(€€€€€€€€‰™¥±•Ù…Õ±Ğˆ°(€€€€€€€€‰Í•ÕÉ”Á…ÍÍİ½Éˆ°(€€€t(€€€€¹¥Ñ•È ¤(€€€€¹…¹ä¡ñÑ½­•¹ğ¹½Éµ…±¥é•¹½¹Ñ…¥¹Ì¡Ñ½­•¸¤¤)ô()™¸Ñ…É•Ñ}µ…Ñ¡•Ì¡Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ°…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø¤€´ø‰½½°ì(€€€±•Ğ…ÁÁ±¥…Ñ¥½¹}µ…Ñ €ôÑ…É•Ğ¹…ÁÁ±¥…Ñ¥½¹}¥€ôô…ÁÁ±¥…Ñ¥½¹}¥(€€€€€€€ñğÑ…É•Ğ¹…ÁÁ±¥…Ñ¥½¹}¹…µ”€ôô…ÁÁ±¥…Ñ¥½¹}¥(€€€€€€€ñğÑ…É•Ğ¹Ñ…É•Ñ}¥€ôô…ÁÁ±¥…Ñ¥½¹}¥ì(€€€…ÁÁ±¥…Ñ¥½¹}µ…Ñ €˜˜İ¥¹‘½İ}¥¹¥Í}¹½¹•}½È¡ñ¥‘ğÑ…É•Ğ¹İ¥¹‘½İ}¥€ôô¥ñğÑ…É•Ğ¹Ñ…É•Ñ}¥€ôô¥¤)ô()™¸¡•­•‘}Ñ…É•Ğ (€€€Í¹…ÁÍ¡½Ğè9…Ñ¥Ù•M¹…ÁÍ¡½Ğ°(€€€…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€É•ÅÕ¥É•}™É½¹Ñµ½ÍĞè‰½½°°(¤€´øI•ÍÕ±Ğñ½µÁÕÑ•ÉQ…É•Ğ°MÑÉ¥¹œøì(€€€±•ĞÑ…É•Ğ€ôÍ¹…ÁÍ¡½Ğ(€€€€€€€€¹Ñ…É•ÑÌ(€€€€€€€€¹¥¹Ñ½}¥Ñ•È ¤(€€€€€€€€¹™¥¹¡ñÑ…É•ÑğÑ…É•Ñ}µ…Ñ¡•Ì¡Ñ…É•Ğ°…ÁÁ±¥…Ñ¥½¹}¥°İ¥¹‘½İ}¥¤¤(€€€€€€€€¹½­}½É}•±Í”¡ñğ€‰Q…É•Ğ…ÁÁ±¥…Ñ¥½¸½İ¥¹‘½Ü¥ÌÍÑ…±”½È¹¼±½¹•ÈÙ¥Í¥‰±”ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤üì(€€€¥˜Ñ…É•Ñ}¥Í}Í•¹Í¥Ñ¥Ù” ™Ñ…É•Ğ¤ì(€€€€€€€É•ÑÕÉ¸ÉÈ ‰M•¹Í¥Ñ¥Ù”…ÁÁ±¥…Ñ¥½¸½İ¥¹‘½ÜÑ…É•ÑÌ…É”‰±½­•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€ô(€€€¥˜É•ÅÕ¥É•}™É½¹Ñµ½ÍĞ€˜˜€…Ñ…É•Ğ¹™½ÕÍ•ì(€€€€€€€É•ÑÕÉ¸ÉÈ ‰Q…É•Ğ¥Ì¹½Ğ™É½¹Ñµ½ÍĞì™½ÕÌ¥Ğ…¹É•ÑÉäˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€ô(€€€=¬¡Ñ…É•Ğ¤)ô()™¸‰½Õ¹‘•‘}•±•µ•¹ÑÌ (€€€Í¹…ÁÍ¡½Ğè€™9…Ñ¥Ù•M¹…ÁÍ¡½Ğ°(€€€Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ°(€€€ÅÕ•Éäè=ÁÑ¥½¸ğ™ÍÑÈø°(¤€´ø€¡Y•Œñ½µÁÕÑ•É±•µ•¹Ğø°‰½½°°ÕÍ¥é”¤ì(€€€±•ĞÅÕ•Éä€ôÅÕ•Éä¹µ…À¡ÍÑÈèéÑ½}…Í¥¥}±½İ•É…Í”¤ì(€€€±•ĞµÕĞÍ••¸€ôÍÑèé½±±•Ñ¥½¹Ìèé!…Í¡M•Ğèé¹•Ü ¤ì(€€€±•ĞµÕĞ•±•µ•¹ÑÌ€ôY•Œèé¹•Ü ¤ì(€€€±•ĞµÕĞÑÉÕ¹…Ñ•€ô™…±Í”ì(€€€±•ĞµÕĞÍ•¹Í¥Ñ¥Ù•}•±•µ•¹Ñ}½Õ¹Ğ€ô€Àì(€€€™½È•±•µ•¹Ğ¥¸Í¹…ÁÍ¡½Ğ(€€€€€€€€¹•±•µ•¹ÑÌ(€€€€€€€€¹•Ğ ™Ñ…É•Ğ¹Ñ…É•Ñ}¥¤(€€€€€€€€¹¥¹Ñ½}¥Ñ•È ¤(€€€€€€€€¹™±…ÑÑ•¸ ¤(€€€ì(€€€€€€€¥˜€…Í••¸¹¥¹Í•ÉĞ¡•±•µ•¹Ğ¹¥¹±½¹” ¤¤ì(€€€€€€€€€€€½¹Ñ¥¹Õ”ì(€€€€€€€ô(€€€€€€€¥˜ÅÕ•Éä¹…Í}É•˜ ¤¹¥Í}Í½µ•}…¹¡ñ¹••‘±•ğì(€€€€€€€€€€€€…™½Éµ…Ğ„ (€€€€€€€€€€€€€€€€‰íôíôíôˆ°(€€€€€€€€€€€€€€€•±•µ•¹Ğ¹É½±”°(€€€€€€€€€€€€€€€•±•µ•¹Ğ¹±…‰•°°(€€€€€€€€€€€€€€€•±•µ•¹Ğ¹Ù…±Õ”¹…Í}‘•É•˜ ¤¹Õ¹İÉ…Á}½É}‘•™…Õ±Ğ ¤(€€€€€€€€€€€€¤(€€€€€€€€€€€€¹Ñ½}…Í¥¥}±½İ•É…Í” ¤(€€€€€€€€€€€€¹½¹Ñ…¥¹Ì¡¹••‘±”¤(€€€€€€€ô¤ì(€€€€€€€€€€€½¹Ñ¥¹Õ”ì(€€€€€€€ô(€€€€€€€¥˜•±•µ•¹Ğ¹Í•¹Í¥Ñ¥Ù”ñğÍ•¹Í¥Ñ¥Ù•}Ñ•áĞ ™™½Éµ…Ğ„ ‰íôíôˆ°•±•µ•¹Ğ¹É½±”°•±•µ•¹Ğ¹±…‰•°¤¤ì(€€€€€€€€€€€Í•¹Í¥Ñ¥Ù•}•±•µ•¹Ñ}½Õ¹Ğ€¬ô€Äì(€€€€€€€€€€€½¹Ñ¥¹Õ”ì(€€€€€€€ô(€€€€€€€¥˜•±•µ•¹ÑÌ¹±•¸ ¤€ôô5a}159QLì(€€€€€€€€€€€ÑÉÕ¹…Ñ•€ôÑÉÕ”ì(€€€€€€€€€€€‰É•…¬ì(€€€€€€€ô(€€€€€€€•±•µ•¹ÑÌ¹ÁÕÍ ¡•±•µ•¹Ğ¹±½¹” ¤¤ì(€€€ô(€€€€¡•±•µ•¹ÑÌ°ÑÉÕ¹…Ñ•°Í•¹Í¥Ñ¥Ù•}•±•µ•¹Ñ}½Õ¹Ğ¤)ô()™¸•±•µ•¹Ñ}•¹Ñ•È¡•±•µ•¹Ğè€™½µÁÕÑ•É±•µ•¹Ğ¤€´øI•ÍÕ±Ğğ¡¤ÌÈ°¤ÌÈ¤°MÑÉ¥¹œøì(€€€¥˜€…•±•µ•¹Ğ¹‰½Õ¹‘Ì¹à¹¥Í}™¥¹¥Ñ” ¤(€€€€€€€ñğ€…•±•µ•¹Ğ¹‰½Õ¹‘Ì¹ä¹¥Í}™¥¹¥Ñ” ¤(€€€€€€€ñğ€…•±•µ•¹Ğ¹‰½Õ¹‘Ì¹İ¥‘Ñ ¹¥Í}™¥¹¥Ñ” ¤(€€€€€€€ñğ€…•±•µ•¹Ğ¹‰½Õ¹‘Ì¹¡•¥¡Ğ¹¥Í}™¥¹¥Ñ” ¤(€€€€€€€ñğ•±•µ•¹Ğ¹‰½Õ¹‘Ì¹İ¥‘Ñ €ğô€À¸À(€€€€€€€ñğ•±•µ•¹Ğ¹‰½Õ¹‘Ì¹¡•¥¡Ğ€ğô€À¸À(€€€ì(€€€€€€€É•ÑÕÉ¸ÉÈ ‰•ÍÍ¥‰¥±¥Ñä•±•µ•¹Ğ¡…Ì¹¼…Ñ¥½¹…‰±”‰½Õ¹‘Ìˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€ô(€€€±•Ğà€ô€¡•±•µ•¹Ğ¹‰½Õ¹‘Ì¹à€¬•±•µ•¹Ğ¹‰½Õ¹‘Ì¹İ¥‘Ñ €¼€È¸À¤¹É½Õ¹ ¤ì(€€€±•Ğä€ô€¡•±•µ•¹Ğ¹‰½Õ¹‘Ì¹ä€¬•±•µ•¹Ğ¹‰½Õ¹‘Ì¹¡•¥¡Ğ€¼€È¸À¤¹É½Õ¹ ¤ì(€€€¥˜à€ğ˜ØĞèé™É½´¡¤ÌÈèé5%8¤(€€€€€€€ñğà€ø˜ØĞèé™É½´¡¤ÌÈèé5`¤(€€€€€€€ñğä€ğ˜ØĞèé™É½´¡¤ÌÈèé5%8¤(€€€€€€€ñğä€ø˜ØĞèé™É½´¡¤ÌÈèé5`¤(€€€ì(€€€€€€€É•ÑÕÉ¸ÉÈ ‰•ÍÍ¥‰¥±¥Ñä•±•µ•¹Ğ‰½Õ¹‘Ì•á••¹…Ñ¥Ù”½½É‘¥¹…Ñ”±¥µ¥ÑÌˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€ô(€€€=¬ ¡à…Ì¤ÌÈ°ä…Ì¤ÌÈ¤¤)ô()™¸™¥¹‘}•±•µ•¹Ğ¡Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ°•±•µ•¹Ñ}¥è€™ÍÑÈ¤€´øI•ÍÕ±Ğñ½µÁÕÑ•É±•µ•¹Ğ°MÑÉ¥¹œøì(€€€±•ĞÍ¹…ÁÍ¡½Ğ€ô¹…Ñ¥Ù•}Í¹…ÁÍ¡½Ğ ¤üì(€€€±•ĞÙ•É¥™¥•€ô¡•­•‘}Ñ…É•Ğ (€€€€€€€Í¹…ÁÍ¡½Ğ°(€€€€€€€€™Ñ…É•Ğ¹…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€M½µ” ™Ñ…É•Ğ¹İ¥¹‘½İ}¥¤°(€€€€€€€™…±Í”°(€€€€¤üì(€€€±•ĞÉ•™É•Í¡•€ô¹…Ñ¥Ù•}Í¹…ÁÍ¡½Ğ ¤üì(€€€±•ĞÙ•É¥™¥•€ô¡•­•‘}Ñ…É•Ğ (€€€€€€€É•™É•Í¡•°(€€€€€€€€™Ù•É¥™¥•¹…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€M½µ” ™Ù•É¥™¥•¹İ¥¹‘½İ}¥¤°(€€€€€€€™…±Í”°(€€€€¤üì(€€€±•ĞÍ¹…ÁÍ¡½Ğ€ô¹…Ñ¥Ù•}Í¹…ÁÍ¡½Ğ ¤üì(€€€±•Ğ€¡•±•µ•¹ÑÌ°|°|¤€ô‰½Õ¹‘•‘}•±•µ•¹ÑÌ ™Í¹…ÁÍ¡½Ğ°€™Ù•É¥™¥•°9½¹”¤ì(€€€•±•µ•¹ÑÌ(€€€€€€€€¹¥¹Ñ½}¥Ñ•È ¤(€€€€€€€€¹™¥¹¡ñ•±•µ•¹Ñğ•±•µ•¹Ğ¹¥€ôô•±•µ•¹Ñ}¥¤(€€€€€€€€¹½­}½É}•±Í”¡ñğì(€€€€€€€€€€€€‰•ÍÍ¥‰¥±¥Ñä•±•µ•¹Ğ¥ÌÍÑ…±”½È½ÕÑÍ¥‘”Ñ¡”‰½Õ¹‘•¥¹ÍÁ•Ñ¥½¸ˆ¹Ñ½}ÍÑÉ¥¹œ ¤(€€€€€€€ô¤)ô()¥µÁ°•Í­Ñ½ÁM•µ…¹Ñ¥	…­•¹™½È9…Ñ¥Ù•M•µ…¹Ñ¥	…­•¹ì(€€€™¸±¥ÍÑ}Ñ…É•ÑÌ ™Í•±˜¤€´øI•ÍÕ±ĞñY•Œñ½µÁÕÑ•ÉQ…É•Ğø°MÑÉ¥¹œøì(€€€€€€€±•ĞµÕĞÑ…É•ÑÌ€ô¹…Ñ¥Ù•}Í¹…ÁÍ¡½Ğ ¤ü¹Ñ…É•ÑÌì(€€€€€€€Ñ…É•ÑÌ¹É•Ñ…¥¸¡ñÑ…É•Ñğ€…Ñ…É•Ñ}¥Í}Í•¹Í¥Ñ¥Ù”¡Ñ…É•Ğ¤¤ì(€€€€€€€Ñ…É•ÑÌ¹ÑÉÕ¹…Ñ”¡5a}QIQL¤ì(€€€€€€€=¬¡Ñ…É•ÑÌ¤(€€€ô((€€€™¸¥¹ÍÁ•Ğ (€€€€€€€€™Í•±˜°(€€€€€€€…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€ÅÕ•Éäè=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€¤€´øI•ÍÕ±Ğñ½µÁÕÑ•É%¹ÍÁ•Ñ¥½¸°MÑÉ¥¹œøì(€€€€€€€±•ĞÍ¹…ÁÍ¡½Ğ€ô¹…Ñ¥Ù•}Í¹…ÁÍ¡½Ğ ¤üì(€€€€€€€±•ĞÑ…É•Ğ€ô¡•­•‘}Ñ…É•Ğ¡Í¹…ÁÍ¡½Ğ°…ÁÁ±¥…Ñ¥½¹}¥°İ¥¹‘½İ}¥°™…±Í”¤üì(€€€€€€€±•ĞÉ•™É•Í¡•€ô¹…Ñ¥Ù•}Í¹…ÁÍ¡½Ğ ¤üì(€€€€€€€±•ĞÑ…É•Ğ€ô¡•­•‘}Ñ…É•Ğ (€€€€€€€€€€€É•™É•Í¡•°(€€€€€€€€€€€€™Ñ…É•Ğ¹…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€M½µ” ™Ñ…É•Ğ¹İ¥¹‘½İ}¥¤°(€€€€€€€€€€€™…±Í”°(€€€€€€€€¤üì(€€€€€€€±•ĞÍ¹…ÁÍ¡½Ğ€ô¹…Ñ¥Ù•}Í¹…ÁÍ¡½Ğ ¤üì(€€€€€€€±•Ğ€¡•±•µ•¹ÑÌ°ÑÉÕ¹…Ñ•°Í•¹Í¥Ñ¥Ù•}•±•µ•¹Ñ}½Õ¹Ğ¤€ô(€€€€€€€€€€€‰½Õ¹‘•‘}•±•µ•¹ÑÌ ™Í¹…ÁÍ¡½Ğ°€™Ñ…É•Ğ°ÅÕ•Éä¤ì(€€€€€€€=¬¡½µÁÕÑ•É%¹ÍÁ•Ñ¥½¸ì(€€€€€€€€€€€Ñ…É•Ğ°(€€€€€€€€€€€•±•µ•¹ÑÌ°(€€€€€€€€€€€ÑÉÕ¹…Ñ•°(€€€€€€€€€€€Í•¹Í¥Ñ¥Ù•}•±•µ•¹Ñ}½Õ¹Ğ°(€€€€€€€€€€€ÅÕ•ÉäèÅÕ•Éä¹µ…À¡ÍÑÈèéÑ½}ÍÑÉ¥¹œ¤°(€€€€€€€ô¤(€€€ô((€€€™¸Ù•É¥™å}Ñ…É•Ğ (€€€€€€€€™Í•±˜°(€€€€€€€…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€É•ÅÕ¥É•}™É½¹Ñµ½ÍĞè‰½½°°(€€€€¤€´øI•ÍÕ±Ğñ½µÁÕÑ•ÉQ…É•Ğ°MÑÉ¥¹œøì(€€€€€€€¡•­•‘}Ñ…É•Ğ (€€€€€€€€€€€¹…Ñ¥Ù•}Í¹…ÁÍ¡½Ğ ¤ü°(€€€€€€€€€€€…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€İ¥¹‘½İ}¥°(€€€€€€€€€€€É•ÅÕ¥É•}™É½¹Ñµ½ÍĞ°(€€€€€€€€¤(€€€ô((€€€™¸™½ÕÌ ™Í•±˜°Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ¥t(€€€€€€€ì(€€€€€€€€€€€±•Ğ¥¹‘•à€ôİ¥¹‘½İ}¥¹‘•à ™Ñ…É•Ğ¹İ¥¹‘½İ}¥¤üì(€€€€€€€€€€€±•Ğ‰åÑ•Ì€ôÉÕ¹}¹…Ñ¥Ù•}½µµ…¹‘}İ¥Ñ¡}•¹Ø (€€€€€€€€€€€€€€€€‰½Í…ÍÉ¥ÁĞˆ°(€€€€€€€€€€€€€€€€™lˆµ°ˆ°€‰)…Ù…MÉ¥ÁĞˆ°€ˆµ”ˆ°5=M}=UM}MI%AQt°(€€€€€€€€€€€€€€€€™l(€€€€€€€€€€€€€€€€€€€€ ‰15}AA}%ˆ°Ñ…É•Ğ¹…ÁÁ±¥…Ñ¥½¹}¥¹±½¹” ¤¤°(€€€€€€€€€€€€€€€€€€€€ ‰15}]%9=]}%9`ˆ°¥¹‘•à¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€t°(€€€€€€€€€€€€¤üì(€€€€€€€€€€€¥˜Í•É‘•}©Í½¸èé™É½µ}Í±¥”èèñÍ•É‘•}©Í½¸èéY…±Õ”ø ™‰åÑ•Ì¤(€€€€€€€€€€€€€€€€¹½¬ ¤(€€€€€€€€€€€€€€€€¹…¹‘}Ñ¡•¸¡ñ©Í½¹ğ©Í½¸¹•Ğ ‰™½ÕÍ•ˆ¤¹…¹‘}Ñ¡•¸¡Í•É‘•}©Í½¸èéY…±Õ”èé…Í}‰½½°¤¤(€€€€€€€€€€€€€€€€ôôM½µ”¡ÑÉÕ”¤(€€€€€€€€€€€ì(€€€€€€€€€€€€€€€É•ÑÕÉ¸=¬  ¤¤ì(€€€€€€€€€€€ô(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ (€€€€€€€€€€€€€€€€‰µ…=L•ÍÍ¥‰¥±¥Ñä‘¥¹½Ğ½¹™¥É´Ñ¡”É•ÅÕ•ÍÑ•İ¥¹‘½Ü™½ÕÌˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€¤ì(€€€€€€€ô(€€€€€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ¥t(€€€€€€€ì(€€€€€€€€€€€±•ĞÍÉ¥ÁĞ€ôÈŒ‰‘µQåÁ” œ)ÕÍ¥¹œMåÍÑ•´ì)ÕÍ¥¹œMåÍÑ•´¹IÕ¹Ñ¥µ”¹%¹Ñ•É½ÁM•ÉÙ¥•Ìì)ÁÕ‰±¥ŒÍÑ…Ñ¥Œ±…ÍÌ15]¥¹‘½Üìm±±%µÁ½ÉĞ ‰ÕÍ•ÈÌÈ¹‘±°ˆ¥tÁÕ‰±¥ŒÍÑ…Ñ¥Œ•áÑ•É¸‰½½°M•Ñ½É•É½Õ¹‘]¥¹‘½Ü¡%¹ÑAÑÈ¡]¹¤ìô( ìm15]¥¹‘½İtèéM•Ñ½É•É½Õ¹‘]¥¹‘½Ü¡m%¹ÑAÑÉtèé¹•Ü¡m¥¹ĞØÑt‘•¹Øé15}]%9=]}!91¤¤ğ=ÕĞµ9Õ±°ˆŒì(€€€€€€€€€€€É•ÑÕÉ¸½µµ…¹èé¹•Ü ‰Á½İ•ÉÍ¡•±°¹•á”ˆ¤(€€€€€€€€€€€€€€€€¹…ÉÌ¡lˆµ9½AÉ½™¥±”ˆ°€ˆµ9½¹%¹Ñ•É…Ñ¥Ù”ˆ°€ˆµ½µµ…¹ˆ°ÍÉ¥ÁÑt¤(€€€€€€€€€€€€€€€€¹•¹Ø ‰15}]%9=]}!91ˆ°€™Ñ…É•Ğ¹İ¥¹‘½İ}¥¤(€€€€€€€€€€€€€€€€¹ÍÑ…ÑÕÌ ¤(€€€€€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ™½Éµ…Ğ„ ‰½Õ±¹½Ğ™½ÕÌÑ…É•Ğèí•ÉÉ½Éôˆ¤¤(€€€€€€€€€€€€€€€€¹…¹‘}Ñ¡•¸¡ñÍÑ…ÑÕÍğì(€€€€€€€€€€€€€€€€€€€¥˜ÍÑ…ÑÕÌ¹ÍÕ•ÍÌ ¤ì(€€€€€€€€€€€€€€€€€€€€€€€=¬  ¤¤(€€€€€€€€€€€€€€€€€€€ô•±Í”ì(€€€€€€€€€€€€€€€€€€€€€€€ÉÈ ‰½Õ±¹½Ğ™½ÕÌÑ…É•Ğˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€€€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€ô¤ì(€€€€€€€ô(€€€€€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¥t(€€€€€€€ì(€€€€€€€€€€€¥˜¥Í}İ…å±…¹‘}Í•ÍÍ¥½¹}™É½µ}•¹Ø ¤ì(€€€€€€€€€€€€€€€É•ÑÕÉ¸ÉÈ¡]e19}A=IQ1}5MM¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€€€€€ô(€€€€€€€€€€€É•ÑÕÉ¸½µµ…¹èé¹•Ü ‰İµÑÉ°ˆ¤(€€€€€€€€€€€€€€€€¹…ÉÌ¡lˆµ¥„ˆ°€™Ñ…É•Ğ¹İ¥¹‘½İ}¥‘t¤(€€€€€€€€€€€€€€€€¹ÍÑ…ÑÕÌ ¤(€€€€€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ™½Éµ…Ğ„ ‰½Õ±¹½Ğ™½ÕÌ`ÄÄÑ…É•Ğèí•ÉÉ½Éôˆ¤¤(€€€€€€€€€€€€€€€€¹…¹‘}Ñ¡•¸¡ñÍÑ…ÑÕÍğì(€€€€€€€€€€€€€€€€€€€¥˜ÍÑ…ÑÕÌ¹ÍÕ•ÍÌ ¤ì(€€€€€€€€€€€€€€€€€€€€€€€=¬  ¤¤(€€€€€€€€€€€€€€€€€€€ô•±Í”ì(€€€€€€€€€€€€€€€€€€€€€€€ÉÈ ‰½Õ±¹½Ğ™½ÕÌ`ÄÄÑ…É•Ğˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€€€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€ô¤ì(€€€€€€€ô(€€€€€€€€m™œ¡¹½Ğ¡…¹ä¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ°Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ°Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¤¤¥t(€€€€€€€ì(€€€€€€€€€€€±•Ğ|€ôÑ…É•Ğì(€€€€€€€€€€€ÉÈ ‰Q…É•Ğ™½ÕÌ¥Ì¹½Ğ¥µÁ±•µ•¹Ñ•½¸Ñ¡¥ÌÁ±…Ñ™½É´ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€€€€€ô(€€€ô((€€€™¸±¥­}•±•µ•¹Ğ (€€€€€€€€™Í•±˜°(€€€€€€€Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ°(€€€€€€€•±•µ•¹Ñ}¥è€™ÍÑÈ°(€€€€€€€‰ÕÑÑ½¸è5½ÕÍ•	ÕÑÑ½¹-¥¹°(€€€€€€€‘½Õ‰±”è‰½½°°(€€€€¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€±•Ğ•±•µ•¹Ğ€ô™¥¹‘}•±•µ•¹Ğ¡Ñ…É•Ğ°•±•µ•¹Ñ}¥¤üì(€€€€€€€¥˜•±•µ•¹Ğ¹Í•¹Í¥Ñ¥Ù”ñğÍ•¹Í¥Ñ¥Ù•}Ñ•áĞ ™™½Éµ…Ğ„ ‰íôíôˆ°•±•µ•¹Ğ¹É½±”°•±•µ•¹Ğ¹±…‰•°¤¤ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰M•¹Í¥Ñ¥Ù”…•ÍÍ¥‰¥±¥Ñä•±•µ•¹ÑÌ…É”‰±½­•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€¥˜‰ÕÑÑ½¸€ôô5½ÕÍ•	ÕÑÑ½¹-¥¹èé1•™Ğì(€€€€€€€€€€€±•Ğ…Ñ¥½¸€ô¥˜‘½Õ‰±”ì€‰‘½Õ‰±•}±¥¬ˆô•±Í”ì€‰±¥¬ˆôì(€€€€€€€€€€€¥˜¹…Ñ¥Ù•}Í•µ…¹Ñ¥}…Ñ¥½¸¡Ñ…É•Ğ°•±•µ•¹Ñ}¥°…Ñ¥½¸°9½¹”¤üì(€€€€€€€€€€€€€€€É•ÑÕÉ¸=¬  ¤¤ì(€€€€€€€€€€€ô(€€€€€€€ô(€€€€€€€±•Ğ€¡à°ä¤€ô•±•µ•¹Ñ}•¹Ñ•È ™•±•µ•¹Ğ¤üì(€€€€€€€Í•±˜¹¥¹ÁÕĞ¹µ½Ù•}µ½ÕÍ”¡à°ä¤üì(€€€€€€€¥˜‘½Õ‰±”ì(€€€€€€€€€€€Í•±˜¹¥¹ÁÕĞ¹‘½Õ‰±•}±¥¬¡‰ÕÑÑ½¸¤(€€€€€€€ô•±Í”ì(€€€€€€€€€€€Í•±˜¹¥¹ÁÕĞ¹±¥¬¡‰ÕÑÑ½¸¤(€€€€€€€ô(€€€ô((€€€™¸Í•Ñ}Ù…±Õ” (€€€€€€€€™Í•±˜°(€€€€€€€Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ°(€€€€€€€•±•µ•¹Ñ}¥è€™ÍÑÈ°(€€€€€€€Ù…±Õ”è€™ÍÑÈ°(€€€€€€€Í•±•Ğè‰½½°°(€€€€¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€¥˜Ù…±Õ”¹±•¸ ¤€ø€ÄØ€¨€ÄÀÈĞñğÍ•¹Í¥Ñ¥Ù•}Ñ•áĞ¡Ù…±Õ”¤ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ (€€€€€€€€€€€€€€€€‰M•¹Í¥Ñ¥Ù”½È½Ù•ÉÍ¥é•Ù…±Õ•Ì…¹¹½Ğ‰”Í•¹ĞÑ¡É½Õ ½µÁÕÑ•ÈUÍ”ˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€¤ì(€€€€€€€ô(€€€€€€€±•Ğ•±•µ•¹Ğ€ô™¥¹‘}•±•µ•¹Ğ¡Ñ…É•Ğ°•±•µ•¹Ñ}¥¤üì(€€€€€€€¥˜•±•µ•¹Ğ¹Í•¹Í¥Ñ¥Ù”ñğÍ•¹Í¥Ñ¥Ù•}Ñ•áĞ ™™½Éµ…Ğ„ ‰íôíôˆ°•±•µ•¹Ğ¹É½±”°•±•µ•¹Ğ¹±…‰•°¤¤ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰M•¹Í¥Ñ¥Ù”…•ÍÍ¥‰¥±¥Ñä•±•µ•¹ÑÌ…É”‰±½­•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€±•ĞÍ•µ…¹Ñ¥}…Ñ¥½¸€ô¥˜Í•±•Ğì€‰Í•±•Ğˆô•±Í”ì€‰Í•Ñ}Ù…±Õ”ˆôì(€€€€€€€¥˜¹…Ñ¥Ù•}Í•µ…¹Ñ¥}…Ñ¥½¸¡Ñ…É•Ğ°•±•µ•¹Ñ}¥°Í•µ…¹Ñ¥}…Ñ¥½¸°M½µ”¡Ù…±Õ”¤¤üì(€€€€€€€€€€€É•ÑÕÉ¸=¬  ¤¤ì(€€€€€€€ô(€€€€€€€±•Ğ€¡à°ä¤€ô•±•µ•¹Ñ}•¹Ñ•È ™•±•µ•¹Ğ¤üì(€€€€€€€Í•±˜¹¥¹ÁÕĞ¹µ½Ù•}µ½ÕÍ”¡à°ä¤üì(€€€€€€€Í•±˜¹¥¹ÁÕĞ¹±¥¬¡5½ÕÍ•	ÕÑÑ½¹-¥¹èé1•™Ğ¤üì(€€€€€€€¥˜Í•±•Ğì(€€€€€€€€€€€±•Ğµ½‘¥™¥•È€ô¥˜™œ„¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ¤ì(€€€€€€€€€€€€€€€€‰5ˆ(€€€€€€€€€€€ô•±Í”ì(€€€€€€€€€€€€€€€€‰QI0ˆ(€€€€€€€€€€€ôì(€€€€€€€€€€€Í•±˜¹¥¹ÁÕĞ(€€€€€€€€€€€€€€€€¹¡½Ñ­•ä ™mµ½‘¥™¥•È¹Ñ½}ÍÑÉ¥¹œ ¤°€‰ˆ¹Ñ½}ÍÑÉ¥¹œ ¥t¤üì(€€€€€€€ô(€€€€€€€Í•±˜¹¥¹ÁÕĞ¹ÑåÁ•}Ñ•áĞ¡Ù…±Õ”¤(€€€ô((€€€™¸ÍÉ••¹Í¡½Ğ (€€€€€€€€™Í•±˜°(€€€€€€€Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ°(€€€€€€€‰½Õ¹‘Ìè=ÁÑ¥½¸ñ½µÁÕÑ•É	½Õ¹‘Ìø°(€€€€¤€´øI•ÍÕ±Ğğ¡Y•ŒñÔàø°½µÁÕÑ•É	½Õ¹‘Ì¤°MÑÉ¥¹œøì(€€€€€€€±•ĞÉ•ÅÕ•ÍÑ•€ô‰½Õ¹‘Ì¹Õ¹İÉ…Á}½É}•±Í”¡ñğÑ…É•Ğ¹‰½Õ¹‘Ì¹±½¹” ¤¤ì(€€€€€€€¥˜€…É•ÅÕ•ÍÑ•¹à¹¥Í}™¥¹¥Ñ” ¤(€€€€€€€€€€€ñğ€…É•ÅÕ•ÍÑ•¹ä¹¥Í}™¥¹¥Ñ” ¤(€€€€€€€€€€€ñğ€…É•ÅÕ•ÍÑ•¹İ¥‘Ñ ¹¥Í}™¥¹¥Ñ” ¤(€€€€€€€€€€€ñğ€…É•ÅÕ•ÍÑ•¹¡•¥¡Ğ¹¥Í}™¥¹¥Ñ” ¤(€€€€€€€€€€€ñğÉ•ÅÕ•ÍÑ•¹İ¥‘Ñ €ğô€À¸À(€€€€€€€€€€€ñğÉ•ÅÕ•ÍÑ•¹¡•¥¡Ğ€ğô€À¸À(€€€€€€€ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰Q…É•Ğ¡…Ì¹¼‰½Õ¹‘•ÍÉ••¹Í¡½ĞÉ•¥½¸ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€¥˜Ñ…É•Ğ¹‰½Õ¹‘Ì¹İ¥‘Ñ €ø€À¸À(€€€€€€€€€€€€˜˜€¡É•ÅÕ•ÍÑ•¹à€ğÑ…É•Ğ¹‰½Õ¹‘Ì¹à(€€€€€€€€€€€€€€€ñğÉ•ÅÕ•ÍÑ•¹ä€ğÑ…É•Ğ¹‰½Õ¹‘Ì¹ä(€€€€€€€€€€€€€€€ñğÉ•ÅÕ•ÍÑ•¹à€¬É•ÅÕ•ÍÑ•¹İ¥‘Ñ €øÑ…É•Ğ¹‰½Õ¹‘Ì¹à€¬Ñ…É•Ğ¹‰½Õ¹‘Ì¹İ¥‘Ñ (€€€€€€€€€€€€€€€ñğÉ•ÅÕ•ÍÑ•¹ä€¬É•ÅÕ•ÍÑ•¹¡•¥¡Ğ€øÑ…É•Ğ¹‰½Õ¹‘Ì¹ä€¬Ñ…É•Ğ¹‰½Õ¹‘Ì¹¡•¥¡Ğ¤(€€€€€€€ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰MÉ••¹Í¡½ĞÉ•¥½¸¥Ì½ÕÑÍ¥‘”Ñ¡”Ù•É¥™¥•Ñ…É•Ğ‰½Õ¹‘Ìˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€±•ĞÁ…Ñ €ôÍÑèé•¹ØèéÑ•µÁ}‘¥È ¤¹©½¥¸¡™½Éµ…Ğ„ ‰±¥ÑÑ±”µµ½¹­•äµÍ¡½Ğµíô¹Á¹œˆ°UÕ¥èé¹•İ}ØĞ ¤¤¤ì(€€€€€€€±•Ğà€ôÉ•ÅÕ•ÍÑ•¹à¹É½Õ¹ ¤…Ì¤ÌÈì(€€€€€€€±•Ğä€ôÉ•ÅÕ•ÍÑ•¹ä¹É½Õ¹ ¤…Ì¤ÌÈì(€€€€€€€±•Ğİ¥‘Ñ €ôÉ•ÅÕ•ÍÑ•¹İ¥‘Ñ ¹É½Õ¹ ¤…ÌÔÌÈì(€€€€€€€±•Ğ¡•¥¡Ğ€ôÉ•ÅÕ•ÍÑ•¹¡•¥¡Ğ¹É½Õ¹ ¤…ÌÔÌÈì(€€€€€€€¥˜İ¥‘Ñ €ôô€Àñğ¡•¥¡Ğ€ôô€Àñğİ¥‘Ñ €ø€àÄäÈñğ¡•¥¡Ğ€ø€àÄäÈì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰MÉ••¹Í¡½ĞÉ•¥½¸¥Ì½ÕÑÍ¥‘”‰½Õ¹‘•‘¥µ•¹Í¥½¹Ìˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ¥t(€€€€€€€±•ĞÉ•ÍÕ±Ğ€ô½µµ…¹èé¹•Ü ‰ÍÉ••¹…ÁÑÕÉ”ˆ¤(€€€€€€€€€€€€¹…ÉÌ¡lˆµàˆ°€ˆµHˆ°€™™½Éµ…Ğ„ ‰íáô±íåô±íİ¥‘Ñ¡ô±í¡•¥¡Ñôˆ¥t¤(€€€€€€€€€€€€¹…Éœ ™Á…Ñ ¤(€€€€€€€€€€€€¹ÍÑ…ÑÕÌ ¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ™½Éµ…Ğ„ ‰½Õ±¹½Ğ…ÁÑÕÉ”µ…=LÍÉ••¹Í¡½Ğèí•ÉÉ½Éôˆ¤¤ì(€€€€€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ¥t(€€€€€€€±•ĞÉ•ÍÕ±Ğ€ô½µµ…¹èé¹•Ü ‰Á½İ•ÉÍ¡•±°¹•á”ˆ¤(€€€€€€€€€€€€¹…ÉÌ¡l(€€€€€€€€€€€€€€€€ˆµ9½AÉ½™¥±”ˆ°(€€€€€€€€€€€€€€€€ˆµ9½¹%¹Ñ•É…Ñ¥Ù”ˆ°(€€€€€€€€€€€€€€€€ˆµ½µµ…¹ˆ°(€€€€€€€€€€€€€€€]%9=]M}MI9M!=Q}MI%AP°(€€€€€€€€€€€t¤(€€€€€€€€€€€€¹•¹Ø ‰15}MI9M!=Q}AQ ˆ°€™Á…Ñ ¤(€€€€€€€€€€€€¹•¹Ø ‰15}MI9M!=Q}`ˆ°à¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€€€€€€€€€€¹•¹Ø ‰15}MI9M!=Q}dˆ°ä¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€€€€€€€€€€¹•¹Ø ‰15}MI9M!=Q}\ˆ°İ¥‘Ñ ¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€€€€€€€€€€¹•¹Ø ‰15}MI9M!=Q} ˆ°¡•¥¡Ğ¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€€€€€€€€€€¹ÍÑ…ÑÕÌ ¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ™½Éµ…Ğ„ ‰½Õ±¹½Ğ…ÁÑÕÉ”]¥¹‘½İÌÍÉ••¹Í¡½Ğèí•ÉÉ½Éôˆ¤¤ì(€€€€€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¥t(€€€€€€€±•ĞÉ•ÍÕ±Ğ€ôì(€€€€€€€€€€€¥˜¥Í}İ…å±…¹‘}Í•ÍÍ¥½¹}™É½µ}•¹Ø ¤ì(€€€€€€€€€€€€€€€É•ÑÕÉ¸ÉÈ¡]e19}A=IQ1}5MM¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€€€€€ô(€€€€€€€€€€€±•Ğ•½µ•ÑÉä€ô™½Éµ…Ğ„ ‰íáô±íåôíİ¥‘Ñ¡õáí¡•¥¡Ñôˆ¤ì(€€€€€€€€€€€±•ĞÍÉ½Ğ€ô½µµ…¹èé¹•Ü ‰ÍÉ½Ğˆ¤(€€€€€€€€€€€€€€€€¹…ÉÌ¡lˆµ„ˆ°€™•½µ•ÑÉåt¤(€€€€€€€€€€€€€€€€¹…Éœ ™Á…Ñ ¤(€€€€€€€€€€€€€€€€¹ÍÑ…ÑÕÌ ¤ì(€€€€€€€€€€€µ…Ñ ÍÉ½Ğì(€€€€€€€€€€€€€€€=¬¡ÍÑ…ÑÕÌ¤¥˜ÍÑ…ÑÕÌ¹ÍÕ•ÍÌ ¤€ôø=¬¡ÍÑ…ÑÕÌ¤°(€€€€€€€€€€€€€€€|€ôø½µµ…¹èé¹•Ü ‰¥µÁ½ÉĞˆ¤(€€€€€€€€€€€€€€€€€€€€¹…ÉÌ¡l(€€€€€€€€€€€€€€€€€€€€€€€€ˆµİ¥¹‘½Üˆ°(€€€€€€€€€€€€€€€€€€€€€€€€‰É½½Ğˆ°(€€€€€€€€€€€€€€€€€€€€€€€€ˆµÉ½Àˆ°(€€€€€€€€€€€€€€€€€€€€€€€€™™½Éµ…Ğ„ ‰íİ¥‘Ñ¡õáí¡•¥¡Ñô­íáô­íåôˆ¤°(€€€€€€€€€€€€€€€€€€€t¤(€€€€€€€€€€€€€€€€€€€€¹…Éœ ™Á…Ñ ¤(€€€€€€€€€€€€€€€€€€€€¹ÍÑ…ÑÕÌ ¤(€€€€€€€€€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ™½Éµ…Ğ„ ‰½Õ±¹½Ğ…ÁÑÕÉ”‰½Õ¹‘•`ÄÄÍÉ••¹Í¡½Ğèí•ÉÉ½Éôˆ¤¤°(€€€€€€€€€€€ô(€€€€€€€ôì(€€€€€€€€m™œ¡¹½Ğ¡…¹ä¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ°Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ°Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¤¤¥t(€€€€€€€±•ĞÉ•ÍÕ±ĞèI•ÍÕ±ĞñÍÑèéÁÉ½•ÍÌèéá¥ÑMÑ…ÑÕÌ°ÍÑèé¥¼èéÉÉ½Èø€ô(€€€€€€€€€€€ÉÈ¡ÍÑèé¥¼èéÉÉ½Èèé½Ñ¡•È ‰Õ¹ÍÕÁÁ½ÉÑ•ˆ¤¤ì(€€€€€€€±•ĞÍÑ…ÑÕÌ€ôÉ•ÍÕ±Ğüì(€€€€€€€¥˜€…ÍÑ…ÑÕÌ¹ÍÕ•ÍÌ ¤ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰MÉ••¹Í¡½ĞÁÉ½Ù¥‘•È•á¥Ñ•Õ¹ÍÕ•ÍÍ™Õ±±äˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€±•Ğ‰åÑ•Ì€ôÍÑèé™ÌèéÉ•… ™Á…Ñ ¤(€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ™½Éµ…Ğ„ ‰½Õ±¹½ĞÉ•…ÍÉ••¹Í¡½Ğ…ÉÑ¥™…Ğèí•ÉÉ½Éôˆ¤¤ì(€€€€€€€±•Ğ|€ôÍÑèé™ÌèéÉ•µ½Ù•}™¥±” ™Á…Ñ ¤ì(€€€€€€€±•Ğ‰åÑ•Ì€ô‰åÑ•Ìüì(€€€€€€€¥˜‰åÑ•Ì¹±•¸ ¤€ø5a}9Q%Y}=UQAUQ}	eQLì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰MÉ••¹Í¡½Ğ•á••‘Ì‰½Õ¹‘•…ÉÑ¥™…ĞÍ¥é”ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€=¬ ¡‰åÑ•Ì°É•ÅÕ•ÍÑ•¤¤(€€€ô)ô((m™œ¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ¥t)½¹ÍĞ5=M}a}MI%APè€™ÍÑÈ€ôÈŒˆ)=‰©¹¥µÁ½ÉĞ ÁÁ-¥Ğœ¤ì)½¹ÍĞÍ”€ôÁÁ±¥…Ñ¥½¸ MåÍÑ•´Ù•¹ÑÌœ¤ì)½¹ÍĞÁÉ½Ù¥‘•É¹Ø€ô€¹9MAÉ½•ÍÍ%¹™¼¹ÁÉ½•ÍÍ%¹™¼¹•¹Ù¥É½¹µ•¹Ğì)½¹ÍĞ½¹±åA¥€ô9Õµ‰•È¡=‰©¹Õ¹İÉ…À¡ÁÉ½Ù¥‘•É¹Ø¹½‰©•Ñ½É-•ä =5AUQI}UM}%aQUI}A%œ¤¤ñğ€À¤ì)½¹ÍĞ½¹±å9…µ”€ôMÑÉ¥¹œ¡=‰©¹Õ¹İÉ…À¡ÁÉ½Ù¥‘•É¹Ø¹½‰©•Ñ½É-•ä =5AUQI}UM}%aQUI}AA}95œ¤¤ñğ€œœ¤ì)½¹ÍĞÍ…™”€ô€¡˜°¤€ôøìÑÉäì½¹ÍĞØ€ô˜ ¤ìÉ•ÑÕÉ¸Ø€ôôôÕ¹‘•™¥¹•€ü€èØìô…Ñ €¡|¤ìÉ•ÑÕÉ¸ìôôì)½¹ÍĞÑ•áĞ€ô€ ¸¸¹™Ì¤€ôøì™½È€¡½¹ÍĞ˜½˜™Ì¤ì½¹ÍĞÙ…±Õ”€ôÍ…™”¡˜°€œœ¤ì¥˜€¡Ù…±Õ”€„ôô¹Õ±°€˜˜Ù…±Õ”€„ôôÕ¹‘•™¥¹•€˜˜MÑÉ¥¹œ¡Ù…±Õ”¤¹ÑÉ¥´ ¤€„ôô€œœ¤É•ÑÕÉ¸MÑÉ¥¹œ¡Ù…±Õ”¤ìôÉ•ÑÕÉ¸€œœìôì)½¹ÍĞÉ•Ğ€ô¼€ôøì½¹ÍĞÀ€ôÍ…™”  ¤€ôø¼¹Á½Í¥Ñ¥½¸ ¤°lÀ°Át¤ì½¹ÍĞÌ€ôÍ…™”  ¤€ôø¼¹Í¥é” ¤°lÀ°Át¤ìÉ•ÑÕÉ¸íàé9Õµ‰•È¡ÁlÁt¥ñğÀ±äé9Õµ‰•È¡ÁlÅt¥ñğÀ±İ¥‘Ñ é9Õµ‰•È¡ÍlÁt¥ñğÀ±¡•¥¡Ğé9Õµ‰•È¡ÍlÅt¥ñğÁôìôì)½¹ÍĞÑ…É•ÑÌ€ômt°•±•µ•¹ÑÌ€ôíôì)±•ĞÁÉ½•ÍÍ1¥ÍĞ€ômtì)¥˜€¡½¹±å9…µ”¤ì(€½¹ÍĞÍ•±•Ñ•€ôÍ…™”  ¤€ôøÍ”¹ÁÉ½•ÍÍ•Ì¹‰å9…µ”¡½¹±å9…µ”¤°¹Õ±°¤ì(€¥˜€¡Í•±•Ñ•¤ÁÉ½•ÍÍ1¥ÍĞ€ômÍ•±•Ñ•‘tì)ô•±Í”¥˜€¡½¹±åA¥¤ì(€™½È€¡½¹ÍĞ…¹‘¥‘…Ñ”½˜Í…™”  ¤€ôøÍ”¹ÁÉ½•ÍÍ•Ì ¤°mt¤¤ì(€€€¥˜€¡9Õµ‰•È¡Í…™”  ¤€ôø…¹‘¥‘…Ñ”¹Õ¹¥á% ¤°€À¤¤€ôôô½¹±åA¥¤ìÁÉ½•ÍÍ1¥ÍĞ€ôm…¹‘¥‘…Ñ•tì‰É•…¬ìô(€ô)ô•±Í”ì(€ÁÉ½•ÍÍ1¥ÍĞ€ôÍ…™”  ¤€ôøÍ”¹ÁÉ½•ÍÍ•Ì ¤°mt¤ì)ô)™½È€¡½¹ÍĞÀ½˜ÁÉ½•ÍÍ1¥ÍĞ¤ì(€ÑÉäì(€€€¥˜€¡½¹±åA¥€˜˜9Õµ‰•È¡Í…™”  ¤€ôøÀ¹Õ¹¥á% ¤°€À¤¤€„ôô½¹±åA¥¤½¹Ñ¥¹Õ”ì(€€€¥˜€ …Í…™”  ¤€ôøÀ¹Ù¥Í¥‰±” ¤°™…±Í”¤¤½¹Ñ¥¹Õ”ì(€€€½¹ÍĞ¹…µ”€ôMÑÉ¥¹œ¡Í…™”  ¤€ôøÀ¹¹…µ” ¤°€œœ¤¤ì½¹ÍĞ‰Õ¹‘±”€ôMÑÉ¥¹œ¡Í…™”  ¤€ôøÀ¹‰Õ¹‘±•%‘•¹Ñ¥™¥•È ¤°€œœ¤¤ì½¹ÍĞ…ÁÀ€ô‰Õ¹‘±”€ôôô€¹Õ±°œñğ‰Õ¹‘±”€ôôô€Õ¹‘•™¥¹•œñğ€…‰Õ¹‘±”€ü¹…µ”€è‰Õ¹‘±”ì(€€€½¹ÍĞ™É½¹Ğ€ô	½½±•…¸¡Í…™”  ¤€ôøÀ¹™É½¹Ñµ½ÍĞ ¤°™…±Í”¤¤ì±•Ğİ¤€ô€Àì(€€€™½È€¡½¹ÍĞÜ½˜Í…™”  ¤€ôøÀ¹İ¥¹‘½İÌ ¤°mt¤¤ì(€€€€€¥˜€¡İ¤€øô€ÌÈ¤‰É•…¬ì(€€€€€½¹ÍĞÑ¥Ñ±”€ôMÑÉ¥¹œ¡Í…™”  ¤€ôøÜ¹¹…µ” ¤°€œœ¤¤ì½¹ÍĞ¥€ô…ÁÀ€¬€œèéİ¥¹‘½Ü´œ€¬İ¤ì½¹ÍĞÑ…É•Ğ€ôíÑ…É•Ñ%é¥±…ÁÁ±¥…Ñ¥½¹%é…ÁÀ±…ÁÁ±¥…Ñ¥½¹9…µ”é¹…µ”±İ¥¹‘½İ%é¥±İ¥¹‘½İQ¥Ñ±”éÑ¥Ñ±”±‰½Õ¹‘ÌéÉ•Ğ¡Ü¤±™½ÕÍ•é™É½¹Ğ€˜˜İ¤ôôôÀ±Í•¹Í¥Ñ¥Ù”é™…±Í”±ÍÕÁÁ½ÉÑ•‘Ñ¥½¹Ìél¥¹ÍÁ•Ğœ°™½ÕÌœ°±¥¬œ°‘½Õ‰±•}±¥¬œ°ÍÉ½±°œ°ÑåÁ”œ°­•äœ°¡½Ñ­•äœ°ÍÉ••¹Í¡½ĞuôìÑ…É•ÑÌ¹ÁÕÍ ¡Ñ…É•Ğ¤ì(€€€€€½¹ÍĞ½ÕĞõmtì±•Ğ•¤ôÀì(€€€€€™½È€¡½¹ÍĞ”½˜Í…™”  ¤€ôøÜ¹•¹Ñ¥É•½¹Ñ•¹ÑÌ ¤°mt¤¤ì¥˜€¡•¤¬¬€øô€ÈÔØ¤‰É•…¬ì½¹ÍĞÉ½±”õMÑÉ¥¹œ¡Í…™”  ¤€ôø”¹É½±” ¤°œœ¤¤ì½¹ÍĞÍÕ‰É½±”õMÑÉ¥¹œ¡Í…™”  ¤€ôø”¹…ÑÑÉ¥‰ÕÑ” aMÕ‰É½±”œ¤°œœ¤¤ì½¹ÍĞ±…‰•°õÑ•áĞ  ¤€ôø”¹…ÑÑÉ¥‰ÕÑ” aQ¥Ñ±”œ¤°€ ¤€ôø”¹‘•ÍÉ¥ÁÑ¥½¸ ¤°€ ¤€ôø”¹¹…µ” ¤¤ì½¹ÍĞÙ…±Õ”õÍ…™”  ¤€ôø”¹Ù…±Õ” ¤°¹Õ±°¤ì½¹ÍĞ¹…Ñ¥Ù”õMÑÉ¥¹œ¡Í…™”  ¤€ôø”¹…ÑÑÉ¥‰ÕÑ” a%‘•¹Ñ¥™¥•Èœ¤°€œœ¤¤ì½¹ÍĞÍÑ…‰±”õ¹…Ñ¥Ù”¹É•Á±…” ½myµi„µèÀ´ä¹|µt½œ°|œ¤ì½¹ÍĞ•ˆõÉ•Ğ¡”¤ì½ÕĞ¹ÁÕÍ ¡í¥é¥¬œèé•±•µ•¹Ğ´œ¬¡•¤´Ä¤¬œèé¹…Ñ¥Ù”´œ­ÍÑ…‰±”±É½±”±±…‰•°±Ù…±Õ”éÙ…±Õ”ôôõ¹Õ±°ı¹Õ±°éMÑÉ¥¹œ¡Ù…±Õ”¤±‰½Õ¹‘Ìé•ˆ±•¹…‰±•é	½½±•…¸¡Í…™”  ¤€ôø”¹•¹…‰±• ¤±ÑÉÕ”¤¤±™½ÕÍ•é	½½±•…¸¡Í…™”  ¤€ôø”¹™½ÕÍ• ¤±™…±Í”¤¤±…Ñ¥½¹Ìél±¥¬œ°‘½Õ‰±•}±¥¬œ°Í•Ñ}Ù…±Õ”œ°Í•±•Ğt±Í•¹Í¥Ñ¥Ù”è½aM•ÕÉ•Q•áÑ¥•±‘ñÍ•ÕÉ•Ñ•áÑ™¥•±‘ñÁ…ÍÍİ½É‘ñÍ•ÕÉ•ñ…ÕÑ¡ñÉ•‘•¹Ñ¥…°½¤¹Ñ•ÍĞ¡É½±”¬œ€œ­ÍÕ‰É½±”¬œ€œ­±…‰•°¥ô¤ìô(€€€€€•±•µ•¹ÑÍm¥‘tõ½ÕĞìİ¤¬¬ì(€€€ô(€ô…Ñ €¡|¤íô)ô))M=8¹ÍÑÉ¥¹¥™ä¡íÑ…É•ÑÌ±•±•µ•¹ÑÍô¤ì(ˆŒì((m™œ¡Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ¥t)½¹ÍĞ]%9=]M}U%}MI%APè€™ÍÑÈ€ôÈŒˆ)‘µQåÁ”€µÍÍ•µ‰±å9…µ”U%ÕÑ½µ…Ñ¥½¹±¥•¹Ğ)‘µQåÁ”€µÍÍ•µ‰±å9…µ”U%ÕÑ½µ…Ñ¥½¹QåÁ•Ì(‘É½½ĞõmMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹ÕÑ½µ…Ñ¥½¹±•µ•¹ÑtèéI½½Ñ±•µ•¹Ğ(‘Ñ…É•ÑÌõ  ¤ì‘•±•µ•¹ÑÌõíô(‘İ¥¹‘½İÌô‘É½½Ğ¹¥¹‘±°¡mMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹QÉ••M½Á•tèé¡¥±‘É•¸±mMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹½¹‘¥Ñ¥½¹tèéQÉÕ•½¹‘¥Ñ¥½¸¤(‘½¹±åA¥ôÀ)ÑÉäì¥˜ ‘•¹Øé=5AUQI}UM}%aQUI}A%¥ì‘½¹±åA¥õm¥¹Ñt‘•¹Øé=5AUQI}UM}%aQUI}A%ôô…Ñ íô)¥˜ ‘½¹±åA¥¥ì‘İ¥¹‘½İÌõ  ‘İ¥¹‘½İÌğ]¡•É”µ=‰©•Ğì‘|¹ÕÉÉ•¹Ğ¹AÉ½•ÍÍ%€µ•Ä€‘½¹±åA¥‘ô¥ô)™Õ¹Ñ¥½¸Y…±Õ•=˜ ‘”¤ìÑÉäìÉ•ÑÕÉ¸€‘”¹•ÑÕÉÉ•¹ÑA…ÑÑ•É¸¡mMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹Y…±Õ•A…ÑÑ•É¹tèéA…ÑÑ•É¸¤¹ÕÉÉ•¹Ğ¹Y…±Õ”ô…Ñ ìÑÉäìÉ•ÑÕÉ¸mÍÑÉ¥¹t‘”¹•ÑÕÉÉ•¹ÑA…ÑÑ•É¸¡mMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹Q½±•A…ÑÑ•É¹tèéA…ÑÑ•É¸¤¹ÕÉÉ•¹Ğ¹Q½±•MÑ…Ñ”ô…Ñ ìÉ•ÑÕÉ¸€‘¹Õ±°ôôô)™Õ¹Ñ¥½¸Ñ¥½¹Í=˜ ‘”¤ì€‘„õ  ¤ìÑÉäì€‘”¹•ÑÕÉÉ•¹ÑA…ÑÑ•É¸¡mMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹%¹Ù½­•A…ÑÑ•É¹tèéA…ÑÑ•É¸¤ğ=ÕĞµ9Õ±°ì€‘„¬ô±¥¬œì€‘„¬ô‘½Õ‰±•}±¥¬œô…Ñ íôìÑÉäì€‘”¹•ÑÕÉÉ•¹ÑA…ÑÑ•É¸¡mMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹Q½±•A…ÑÑ•É¹tèéA…ÑÑ•É¸¤ğ=ÕĞµ9Õ±°ì€‘„¬ô±¥¬œô…Ñ íôìÑÉäì€‘”¹•ÑÕÉÉ•¹ÑA…ÑÑ•É¸¡mMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹Y…±Õ•A…ÑÑ•É¹tèéA…ÑÑ•É¸¤ğ=ÕĞµ9Õ±°ì€‘„¬ôÍ•Ñ}Ù…±Õ”œô…Ñ íôìÑÉäì€‘”¹•ÑÕÉÉ•¹ÑA…ÑÑ•É¸¡mMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹M•±•Ñ¥½¹%Ñ•µA…ÑÑ•É¹tèéA…ÑÑ•É¸¤ğ=ÕĞµ9Õ±°ì€‘„¬ôÍ•±•Ğœô…Ñ íôìÉ•ÑÕÉ¸  ‘„ğM•±•Ğµ=‰©•Ğ€µU¹¥ÅÕ”¤ô)™½È ‘¤ôÀì‘¤€µ±Ğ€‘İ¥¹‘½İÌ¹½Õ¹Ğ€µ…¹€‘¤€µ±Ğ€ØĞì‘¤¬¬¥ì€‘Üô‘İ¥¹‘½İÌ¹%Ñ•´ ‘¤¤ì‘Àô‘Ü¹ÕÉÉ•¹Ğ¹AÉ½•ÍÍ%ì‘¥ô‰ÁÉ½•ÍÌè‘Àˆì‘İ¥¹‘½İ%õmÍÑÉ¥¹t‘Ü¹ÕÉÉ•¹Ğ¹9…Ñ¥Ù•]¥¹‘½İ!…¹‘±”ì‘Ñ…É•Ñ%ôˆ‘¥èéİ¥¹‘½Ü´‘¤ˆì‘Èô‘Ü¹ÕÉÉ•¹Ğ¹	½Õ¹‘¥¹I•Ñ…¹±”ì‘Ğõm½É‘•É•‘uíÑ…É•Ñ%ô‘Ñ…É•Ñ%í…ÁÁ±¥…Ñ¥½¹%ô‘¥í…ÁÁ±¥…Ñ¥½¹9…µ”ô‘Ü¹ÕÉÉ•¹Ğ¹9…µ”íİ¥¹‘½İ%ô‘İ¥¹‘½İ%íİ¥¹‘½İQ¥Ñ±”ô‘Ü¹ÕÉÉ•¹Ğ¹9…µ”í‰½Õ¹‘Ìõíàô‘È¹`íäô‘È¹díİ¥‘Ñ ô‘È¹]¥‘Ñ í¡•¥¡Ğô‘È¹!•¥¡Ñôí™½ÕÍ•ô‘Ü¹ÕÉÉ•¹Ğ¹!…Í-•å‰½…É‘½ÕÌíÍ•¹Í¥Ñ¥Ù”ô ‘Ü¹ÕÉÉ•¹Ğ¹9…µ”€µµ…Ñ €Uñ]¥¹‘½İÌM•ÕÉ¥ÑåñÉ•‘•¹Ñ¥…±ñÁ…ÍÍİ½Éœ¤íÍÕÁÁ½ÉÑ•‘Ñ¥½¹Ìõ  ¥¹ÍÁ•Ğœ°™½ÕÌœ°±¥¬œ°‘½Õ‰±•}±¥¬œ°ÍÉ½±°œ°ÑåÁ”œ°­•äœ°¡½Ñ­•äœ°ÍÉ••¹Í¡½Ğœ¥ôì‘Ñ…É•ÑÌ¬ô‘Ğì‘±¥ÍĞõ  ¤ì‘‘•ÍŒô‘Ü¹¥¹‘±°¡mMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹QÉ••M½Á•tèé•Í•¹‘…¹ÑÌ±mMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹½¹‘¥Ñ¥½¹tèéQÉÕ•½¹‘¥Ñ¥½¸¤í™½È ‘¨ôÀì‘¨€µ±Ğ€‘‘•ÍŒ¹½Õ¹Ğ€µ…¹€‘¨€µ±Ğ€ÈÔØì‘¨¬¬¥ì€‘”ô‘‘•ÍŒ¹%Ñ•´ ‘¨¤ì‘±…‰•°ô‘”¹ÕÉÉ•¹Ğ¹9…µ”ì‘É½±”ô‘”¹ÕÉÉ•¹Ğ¹½¹ÑÉ½±QåÁ”¹AÉ½É…µµ…Ñ¥9…µ”ì‘•Èô‘”¹ÕÉÉ•¹Ğ¹	½Õ¹‘¥¹I•Ñ…¹±”ì‘…ÕÑ½µ…Ñ¥½¸ô‘”¹ÕÉÉ•¹Ğ¹ÕÑ½µ…Ñ¥½¹%í¥˜¡mÍÑÉ¥¹tèé%Í9Õ±±=É]¡¥Ñ•MÁ…” ‘…ÕÑ½µ…Ñ¥½¸¤¥íÑÉåì‘…ÕÑ½µ…Ñ¥½¸ô ‘”¹•ÑIÕ¹Ñ¥µ•% ¤€µ©½¥¸€œ´œ¥õ…Ñ¡ì‘…ÕÑ½µ…Ñ¥½¸ôœõôì‘ÍÑ…‰±”ô ‘…ÕÑ½µ…Ñ¥½¸€µÉ•Á±…”€myµi„µèÀ´ä¹|µtœ°|œ¤ì‘±¥ÍĞ¬õm½É‘•É•‘uí¥ôˆ‘Ñ…É•Ñ%èé•±•µ•¹Ğ´‘¨èé¹…Ñ¥Ù”´‘ÍÑ…‰±”ˆíÉ½±”ô‘É½±”í±…‰•°ô‘±…‰•°íÙ…±Õ”ô¡Y…±Õ•=˜€‘”¤í‰½Õ¹‘Ìõíàô‘•È¹`íäô‘•È¹díİ¥‘Ñ ô‘•È¹]¥‘Ñ í¡•¥¡Ğô‘•È¹!•¥¡Ñôí•¹…‰±•ô‘”¹ÕÉÉ•¹Ğ¹%Í¹…‰±•í™½ÕÍ•ô‘”¹ÕÉÉ•¹Ğ¹!…Í-•å‰½…É‘½ÕÌí…Ñ¥½¹Ìô¡Ñ¥½¹Í=˜€‘”¤íÍ•¹Í¥Ñ¥Ù”ô¡m‰½½±t‘”¹ÕÉÉ•¹Ğ¹%ÍA…ÍÍİ½É€µ½È€ ‘É½±”€µµ…Ñ €‘¥Ğœ€µ…¹€‘±…‰•°€µµ…Ñ €Á…ÍÍİ½É‘ñÉ•‘•¹Ñ¥…±ñÍ•É•Ğœ¤¥ôíô‘•±•µ•¹ÑÍl‘Ñ…É•Ñ%‘tô‘±¥ÍÑô)m½É‘•É•‘uíÑ…É•ÑÌô‘Ñ…É•ÑÌí•±•µ•¹ÑÌô‘•±•µ•¹ÑÍõñ½¹Ù•ÉÑQ¼µ)Í½¸€µ½µÁÉ•ÍÌ€µ•ÁÑ €à(ˆŒì((m™œ¡Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ¥t)½¹ÍĞ]%9=]M}MI9M!=Q}MI%APè€™ÍÑÈ€ôÈŒˆ)‘µQåÁ”€µÍÍ•µ‰±å9…µ”MåÍÑ•´¹É…İ¥¹œ)‘µQåÁ” œ)ÕÍ¥¹œMåÍÑ•´ìÕÍ¥¹œMåÍÑ•´¹É…İ¥¹œìÕÍ¥¹œMåÍÑ•´¹É…İ¥¹œ¹%µ…¥¹œìÕÍ¥¹œMåÍÑ•´¹]¥¹‘½İÌ¹½ÉµÌì( (‘àõm¥¹Ñt‘•¹Øé15}MI9M!=Q}`ì‘äõm¥¹Ñt‘•¹Øé15}MI9M!=Q}dì‘Üõm¥¹Ñt‘•¹Øé15}MI9M!=Q}\ì‘ õm¥¹Ñt‘•¹Øé15}MI9M!=Q} (‘‰µÀõ9•Üµ=‰©•ĞÉ…İ¥¹œ¹	¥Ñµ…À€‘Ü°‘ ì‘œõmÉ…İ¥¹œ¹É…Á¡¥ÍtèéÉ½µ%µ…” ‘‰µÀ¤ì‘œ¹½ÁåÉ½µMÉ••¸ ‘à°‘ä°À°À°‘‰µÀ¹M¥é”¤ì‘‰µÀ¹M…Ù” ‘•¹Øé15}MI9M!=Q}AQ ±mÉ…İ¥¹œ¹%µ…¥¹œ¹%µ…•½Éµ…ÑtèéA¹œ¤ì‘œ¹¥ÍÁ½Í” ¤ì‘‰µÀ¹¥ÍÁ½Í” ¤(ˆŒì((m™œ¡Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¥t)½¹ÍĞ1%9Ua}QMA%}MI%APè€™ÍÑÈ€ôÈŒˆ)¥µÁ½ÉĞ©Í½¸)ÑÉäè(¥µÁ½ÉĞÁå…ÑÍÁ¤)•á•ÁĞá•ÁÑ¥½¸…Ì”è(É…¥Í”MåÍÑ•µá¥Ğ PµMA$Õ¹…Ù…¥±…‰±”è€œ­ÍÑÈ¡”¤¤)‘•˜É•Ğ¡¼¤è(ÑÉäè(€ˆõ¼¹ÅÕ•Éå½µÁ½¹•¹Ğ ¤¹•ÑáÑ•¹ÑÌ¡Áå…ÑÍÁ¤¹M-Q=A}==IL¤(€É•ÑÕÉ¸ìàœéˆ¹à°äœéˆ¹ä°İ¥‘Ñ œéˆ¹İ¥‘Ñ °¡•¥¡Ğœéˆ¹¡•¥¡Ñô(•á•ÁĞá•ÁÑ¥½¸èÉ•ÑÕÉ¸ìàœèÀ°äœèÀ°İ¥‘Ñ œèÀ°¡•¥¡ĞœèÁô)‘•˜İ…±¬¡¹½‘”¤è(™½È¡¥±¥¸±¥ÍĞ¡¹½‘”¤è(€å¥•±¡¥±(€å¥•±™É½´İ…±¬¡¡¥±¤)Ñ…É•ÑÌõmtì•±•µ•¹ÑÌõíôì‘•Í­Ñ½ÀõÁå…ÑÍÁ¤¹I•¥ÍÑÉä¹•Ñ•Í­Ñ½À À¤)™½È…ÁÀ¥¸±¥ÍĞ¡‘•Í­Ñ½À¥lèØÑtè(¹…µ”õÍÑÈ¡•Ñ…ÑÑÈ¡…ÁÀ°¹…µ”œ°œœ¤¤ì…¥ô…ÑÍÁ¤èœ­¹…µ”(™½Èİ¤±Ü¥¸•¹Õµ•É…Ñ”¡±¥ÍĞ¡…ÁÀ¥lèÌÉt¤è(€Ñ¥Ñ±”õÍÑÈ¡•Ñ…ÑÑÈ¡Ü°¹…µ”œ°œœ¤¤ìÑ¥õ…¥¬œèéİ¥¹‘½Ü´œ­ÍÑÈ¡İ¤¤ìÍĞõÜ¹•ÑMÑ…Ñ” ¤ìÑ…É•ĞõìÑ…É•Ñ%œéÑ¥°…ÁÁ±¥…Ñ¥½¹%œé…¥°…ÁÁ±¥…Ñ¥½¹9…µ”œé¹…µ”°İ¥¹‘½İ%œéÑ¥°İ¥¹‘½İQ¥Ñ±”œéÑ¥Ñ±”°‰½Õ¹‘ÌœéÉ•Ğ¡Ü¤°™½ÕÍ•œé‰½½°¡ÍĞ¹½¹Ñ…¥¹Ì¡Áå…ÑÍÁ¤¹MQQ}Q%Y¤¤°Í•¹Í¥Ñ¥Ù”œé…±Í”°ÍÕÁÁ½ÉÑ•‘Ñ¥½¹Ìœél¥¹ÍÁ•Ğœ°™½ÕÌœ°±¥¬œ°‘½Õ‰±•}±¥¬œ°ÍÉ½±°œ°ÑåÁ”œ°­•äœ°¡½Ñ­•äœ°ÍÉ••¹Í¡½ĞuôíÑ…É•ÑÌ¹…ÁÁ•¹¡Ñ…É•Ğ¤ì½ÕĞõmt(€™½È•¤±”¥¸•¹Õµ•É…Ñ”¡±¥ÍĞ¡İ…±¬¡Ü¤¥lèÈÔÙt¤è(€€É½±”õÍÑÈ¡”¹•ÑI½±•9…µ” ¤¤ì±…‰•°õÍÑÈ¡•Ñ…ÑÑÈ¡”°¹…µ”œ°œœ¤¤ìÙ…±Õ”õ9½¹”(€€ÑÉäèÙ…±Õ”õÍÑÈ¡”¹ÅÕ•ÉåY…±Õ” ¤¹•ÑÕÉÉ•¹ÑY…±Õ” ¤¤(€€•á•ÁĞá•ÁÑ¥½¸èÁ…ÍÌ(€€…Ñ¥½¹Ìõmt(€€ÑÉäè(€€€Å„õ”¹ÅÕ•ÉåÑ¥½¸ ¤(€€€™½È…¤¥¸É…¹”¡Å„¹¹Ñ¥½¹Ì¤è(€€€€¹…µ”ô¡Å„¹•ÑÑ¥½¹9…µ”¡…¤¤½È€œœ¤¹±½İ•È ¤(€€€€¥˜¹…µ”¥¸€ ±¥¬œ°ÁÉ•ÍÌœ°…Ñ¥Ù…Ñ”œ°Í•±•Ğœ¤è…Ñ¥½¹Ì¹…ÁÁ•¹¡¹…µ”¤(€€•á•ÁĞá•ÁÑ¥½¸èÁ…ÍÌ(€€ÑÉäè”¹ÅÕ•Éå‘¥Ñ…‰±•Q•áĞ ¤ì…Ñ¥½¹Ì¹…ÁÁ•¹ Í•Ñ}Ù…±Õ”œ¤(€€•á•ÁĞá•ÁÑ¥½¸èÁ…ÍÌ(€€ÍÑ…‰±”ô¡É½±”¬œ´œ­±…‰•°¤¹É•Á±…” œ€œ°|œ¤(€€½ÕĞ¹…ÁÁ•¹¡ì¥œéÑ¥¬œèé•±•µ•¹Ğ´œ­ÍÑÈ¡•¤¤¬œèé¹…Ñ¥Ù”´œ­ÍÑ…‰±•lèàÁt°É½±”œéÉ½±”°±…‰•°œé±…‰•°°Ù…±Õ”œéÙ…±Õ”°‰½Õ¹‘ÌœéÉ•Ğ¡”¤°•¹…‰±•œéQÉÕ”°™½ÕÍ•œé…±Í”°…Ñ¥½¹Ìœé±¥ÍĞ¡‘¥Ğ¹™É½µ­•åÌ¡…Ñ¥½¹Ì¤¤°Í•¹Í¥Ñ¥Ù”œé…¹ä¡Ñ½­•¸¥¸€¡É½±”¬œ€œ­±…‰•°¤¹±½İ•È ¤™½ÈÑ½­•¸¥¸€ Á…ÍÍİ½Éœ°Í•ÕÉ”œ°É•‘•¹Ñ¥…°œ°…ÕÑ¡•¹Ñ¥…Ñ¥½¸œ¤¥ô¤(€•±•µ•¹ÑÍmÑ¥‘tõ½ÕĞ)ÁÉ¥¹Ğ¡©Í½¸¹‘ÕµÁÌ¡ìÑ…É•ÑÌœéÑ…É•ÑÌ°•±•µ•¹ÑÌœé•±•µ•¹ÑÍô±Í•Á…É…Ñ½ÉÌô œ°œ°œèœ¤¤¤(ˆŒì((m™œ¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ¥t)½¹ÍĞ5=M}a}Q%=9}MI%APè€™ÍÑÈ€ôÈŒˆ)=‰©¹¥µÁ½ÉĞ ½Õ¹‘…Ñ¥½¸œ¤ì)½¹ÍĞÍ”€ôÁÁ±¥…Ñ¥½¸ MåÍÑ•´Ù•¹ÑÌœ¤ì)½¹ÍĞ•¹Ø€ô€¹9MAÉ½•ÍÍ%¹™¼¹ÁÉ½•ÍÍ%¹™¼¹•¹Ù¥É½¹µ•¹Ğì)½¹ÍĞ•Ğ€ô­•ä€ôø=‰©¹Õ¹İÉ…À¡•¹Ø¹½‰©•Ñ½É-•ä¡­•ä¤¤ì)½¹ÍĞÍ…™”€ô€¡˜°¤€ôøìÑÉäì½¹ÍĞØ€ô˜ ¤ìÉ•ÑÕÉ¸Ø€ôôôÕ¹‘•™¥¹•€ü€èØìô…Ñ €¡|¤ìÉ•ÑÕÉ¸ìôôì)½¹ÍĞÑ•áĞ€ô€ ¸¸¹™Ì¤€ôøì™½È€¡½¹ÍĞ˜½˜™Ì¤ì½¹ÍĞÙ…±Õ”€ôÍ…™”¡˜°€œœ¤ì¥˜€¡Ù…±Õ”€„ôô¹Õ±°€˜˜Ù…±Õ”€„ôôÕ¹‘•™¥¹•€˜˜MÑÉ¥¹œ¡Ù…±Õ”¤¹ÑÉ¥´ ¤€„ôô€œœ¤É•ÑÕÉ¸MÑÉ¥¹œ¡Ù…±Õ”¤ìôÉ•ÑÕÉ¸€œœìôì)½¹ÍĞ…ÁÁ%€ô•Ğ 15}AA}%œ¤ì)½¹ÍĞİ¥¹‘½İ%¹‘•à€ô9Õµ‰•È¡•Ğ 15}]%9=]}%9`œ¤¤ì)½¹ÍĞ•±•µ•¹Ñ%¹‘•à€ô9Õµ‰•È¡•Ğ 15}159Q}%9`œ¤¤ì)½¹ÍĞ…Ñ¥½¸€ô•Ğ 15}Q%=8œ¤ì)½¹ÍĞÙ…±Õ”€ô•Ğ 15}Y1Uœ¤ì)½¹ÍĞÁÉ½•ÍÌ€ô€½x¡½µñ½Éñ¹•Ññ¥¼¥p¸¼¹Ñ•ÍĞ¡…ÁÁ%¤€üÍ”¹ÁÉ½•ÍÍ•Ì¹‰å	Õ¹‘±•%‘•¹Ñ¥™¥•È¡…ÁÁ%¤€èÍ”¹ÁÉ½•ÍÍ•Ì¹‰å9…µ”¡…ÁÁ%¤ì)½¹ÍĞİ¥¹‘½Ü€ôÁÉ½•ÍÌ¹İ¥¹‘½İÍmİ¥¹‘½İ%¹‘•átì)½¹ÍĞ•±•µ•¹Ğ€ôİ¥¹‘½Ü¹•¹Ñ¥É•½¹Ñ•¹ÑÌ ¥m•±•µ•¹Ñ%¹‘•átì)¥˜€¡…Ñ¥½¸€ôôô€Í•Ñ}Ù…±Õ”œ¤•±•µ•¹Ğ¹Ù…±Õ”€ôÙ…±Õ”ì)•±Í”¥˜€¡…Ñ¥½¸€ôôô€Í•±•Ğœ¤ìÑÉäì•±•µ•¹Ğ¹Á•É™½ÉµÑ¥½¸ aAÉ•ÍÌœ¤ìô…Ñ €¡|¤ì•±•µ•¹Ğ¹±¥¬ ¤ìôô)•±Í”¥˜€¡…Ñ¥½¸€ôôô€±¥¬œ¤ìÑÉäì•±•µ•¹Ğ¹Á•É™½ÉµÑ¥½¸ aAÉ•ÍÌœ¤ìô…Ñ €¡|¤ì•±•µ•¹Ğ¹±¥¬ ¤ìôô)•±Í”¥˜€¡…Ñ¥½¸€ôôô€‘½Õ‰±•}±¥¬œ¤ìÑÉäì•±•µ•¹Ğ¹Á•É™½ÉµÑ¥½¸ aAÉ•ÍÌœ¤ì•±•µ•¹Ğ¹Á•É™½ÉµÑ¥½¸ aAÉ•ÍÌœ¤ìô…Ñ €¡|¤ì•±•µ•¹Ğ¹±¥¬ ¤ì•±•µ•¹Ğ¹±¥¬ ¤ìôô)•±Í”Ñ¡É½Ü¹•ÜÉÉ½È Õ¹ÍÕÁÁ½ÉÑ•Í•µ…¹Ñ¥Œ…Ñ¥½¸œ¤ì))M=8¹ÍÑÉ¥¹¥™ä¡íÍ•µ…¹Ñ¥ŒéÑÉÕ•ô¤ì(ˆŒì((m™œ¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ¥t)½¹ÍĞ5=M}=UM}MI%APè€™ÍÑÈ€ôÈŒˆ)=‰©¹¥µÁ½ÉĞ ½Õ¹‘…Ñ¥½¸œ¤ì)½¹ÍĞÍ”€ôÁÁ±¥…Ñ¥½¸ MåÍÑ•´Ù•¹ÑÌœ¤ì)½¹ÍĞ•¹Ø€ô€¹9MAÉ½•ÍÍ%¹™¼¹ÁÉ½•ÍÍ%¹™¼¹•¹Ù¥É½¹µ•¹Ğì)½¹ÍĞ•Ğ€ô­•ä€ôø=‰©¹Õ¹İÉ…À¡•¹Ø¹½‰©•Ñ½É-•ä¡­•ä¤¤ì)½¹ÍĞ…ÁÁ%€ô•Ğ 15}AA}%œ¤ì)½¹ÍĞÁÉ½•ÍÌ€ô€½x¡½µñ½Éñ¹•Ññ¥¼¥p¸¼¹Ñ•ÍĞ¡…ÁÁ%¤€üÍ”¹ÁÉ½•ÍÍ•Ì¹‰å	Õ¹‘±•%‘•¹Ñ¥™¥•È¡…ÁÁ%¤€èÍ”¹ÁÉ½•ÍÍ•Ì¹‰å9…µ”¡…ÁÁ%¤ì)ÁÉ½•ÍÌ¹™É½¹Ñµ½ÍĞ€ôÑÉÕ”ì))M=8¹ÍÑÉ¥¹¥™ä¡í™½ÕÍ•é	½½±•…¸¡ÁÉ½•ÍÌ¹™É½¹Ñµ½ÍĞ ¤¥ô¤ì(ˆŒì((m™œ¡Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ¥t)½¹ÍĞ]%9=]M}U%}Q%=9}MI%APè€™ÍÑÈ€ôÈŒˆ)‘µQåÁ”€µÍÍ•µ‰±å9…µ”U%ÕÑ½µ…Ñ¥½¹±¥•¹Ğ)‘µQåÁ”€µÍÍ•µ‰±å9…µ”U%ÕÑ½µ…Ñ¥½¹QåÁ•Ì(‘É½½ĞõmMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹ÕÑ½µ…Ñ¥½¹±•µ•¹ÑtèéÉ½µ!…¹‘±”¡m%¹ÑAÑÉtèé¹•Ü¡m¥¹ĞØÑt‘•¹Øé15}]%9=]}!91¤¤(‘‘•ÍŒô‘É½½Ğ¹¥¹‘±°¡mMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹QÉ••M½Á•tèé•Í•¹‘…¹ÑÌ±mMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹½¹‘¥Ñ¥½¹tèéQÉÕ•½¹‘¥Ñ¥½¸¤(‘”ô‘‘•ÍŒ¹%Ñ•´¡m¥¹Ñt‘•¹Øé15}159Q}%9`¤(‘…Ñ¥½¸ô‘•¹Øé15}Q%=8(‘Á•É™½Éµ•ô‘™…±Í”)¥˜ ‘…Ñ¥½¸€µ•Ä€Í•Ñ}Ù…±Õ”œ¤ì(€ÑÉäì€‘Àô‘”¹•ÑÕÉÉ•¹ÑA…ÑÑ•É¸¡mMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹Y…±Õ•A…ÑÑ•É¹tèéA…ÑÑ•É¸¤ì€‘À¹M•ÑY…±Õ” ‘•¹Øé15}Y1U¤ì€‘Á•É™½Éµ•ô‘ÑÉÕ”ô…Ñ íô)ô•±Í•¥˜ ‘…Ñ¥½¸€µ•Ä€Í•±•Ğœ¤ì(€ÑÉäì€‘Àô‘”¹•ÑÕÉÉ•¹ÑA…ÑÑ•É¸¡mMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹M•±•Ñ¥½¹%Ñ•µA…ÑÑ•É¹tèéA…ÑÑ•É¸¤ì€‘À¹M•±•Ğ ¤ì€‘Á•É™½Éµ•ô‘ÑÉÕ”ô…Ñ íô)ô•±Í•¥˜ ‘…Ñ¥½¸€µ•Ä€±¥¬œ€µ½È€‘…Ñ¥½¸€µ•Ä€‘½Õ‰±•}±¥¬œ¤ì(€ÑÉäì€‘Àô‘”¹•ÑÕÉÉ•¹ÑA…ÑÑ•É¸¡mMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹%¹Ù½­•A…ÑÑ•É¹tèéA…ÑÑ•É¸¤ì€‘À¹%¹Ù½­” ¤ì€‘Á•É™½Éµ•ô‘ÑÉÕ”ô…Ñ íô(€¥˜ µ¹½Ğ€‘Á•É™½Éµ•¤ìÑÉäì€‘Àô‘”¹•ÑÕÉÉ•¹ÑA…ÑÑ•É¸¡mMåÍÑ•´¹]¥¹‘½İÌ¹ÕÑ½µ…Ñ¥½¸¹Q½±•A…ÑÑ•É¹tèéA…ÑÑ•É¸¤ì€‘À¹Q½±” ¤ì€‘Á•É™½Éµ•ô‘ÑÉÕ”ô…Ñ íôô(€¥˜ ‘Á•É™½Éµ•€µ…¹€‘…Ñ¥½¸€µ•Ä€‘½Õ‰±•}±¥¬œ¤ìÑÉäì€‘À¹%¹Ù½­” ¤ìô…Ñ íôô)ô)¥˜ ‘Á•É™½Éµ•¤ìm½É‘•É•‘uíÍ•µ…¹Ñ¥Œô‘ÑÉÕ•õñ½¹Ù•ÉÑQ¼µ)Í½¸€µ½µÁÉ•ÍÌô•±Í”ìm½É‘•É•‘uíÍ•µ…¹Ñ¥Œô‘™…±Í•õñ½¹Ù•ÉÑQ¼µ)Í½¸€µ½µÁÉ•ÍÌô(ˆŒì((m™œ¡Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¥t)½¹ÍĞ1%9Ua}QMA%}Q%=9}MI%APè€™ÍÑÈ€ôÈŒˆ)¥µÁ½ÉĞ½Ì°©Í½¸)¥µÁ½ÉĞÁå…ÑÍÁ¤)‘•˜İ…±¬¡¹½‘”¤è(™½È¡¥±¥¸±¥ÍĞ¡¹½‘”¤è(€å¥•±¡¥±(€å¥•±™É½´İ…±¬¡¡¥±¤)…ÁÁ}¹…µ”õ½Ì¹•¹Ù¥É½¹l15}AA}95tìİ¤õ¥¹Ğ¡½Ì¹•¹Ù¥É½¹l15}]%9=]}%9`t¤ì•¤õ¥¹Ğ¡½Ì¹•¹Ù¥É½¹l15}159Q}%9`t¤)„õ9½¹”)™½È…¹‘¥‘…Ñ”¥¸±¥ÍĞ¡Áå…ÑÍÁ¤¹I•¥ÍÑÉä¹•Ñ•Í­Ñ½À À¤¤è(¥˜ÍÑÈ¡•Ñ…ÑÑÈ¡…¹‘¥‘…Ñ”°¹…µ”œ°œœ¤¤€ôô…ÁÁ}¹…µ”è„õ…¹‘¥‘…Ñ”ì‰É•…¬)¥˜„¥Ì9½¹”èÉ…¥Í”MåÍÑ•µá¥Ğ PµMA$…ÁÁ±¥…Ñ¥½¸¥ÌÍÑ…±”œ¤)Üõ±¥ÍĞ¡„¥mİ¥tì”õ±¥ÍĞ¡İ…±¬¡Ü¤¥m•¥tì…Ñ¥½¸õ½Ì¹•¹Ù¥É½¹l15}Q%=8t)¥˜…Ñ¥½¸¥¸€ ±¥¬œ°‘½Õ‰±•}±¥¬œ°Í•±•Ğœ¤è(…Ñ¥½¹Ìõ”¹ÅÕ•ÉåÑ¥½¸ ¤ì‘½¹”õ…±Í”(™½È¤¥¸É…¹”¡…Ñ¥½¹Ì¹¹Ñ¥½¹Ì¤è(€¹…µ”ô¡…Ñ¥½¹Ì¹•ÑÑ¥½¹9…µ”¡¤¤½È€œœ¤¹±½İ•È ¤(€¥˜¹…µ”¥¸€ ±¥¬œ°ÁÉ•ÍÌœ°…Ñ¥Ù…Ñ”œ°Í•±•Ğœ¤è(€€…Ñ¥½¹Ì¹‘½Ñ¥½¸¡¤¤(€€¥˜…Ñ¥½¸€ôô€‘½Õ‰±•}±¥¬œè…Ñ¥½¹Ì¹‘½Ñ¥½¸¡¤¤(€€‘½¹”õQÉÕ”ì‰É•…¬(¥˜¹½Ğ‘½¹”è(€ÁÉ¥¹Ğ¡©Í½¸¹‘ÕµÁÌ¡ìÍ•µ…¹Ñ¥Œœé…±Í•ô±Í•Á…É…Ñ½ÉÌô œ°œ°œèœ¤¤¤ìÉ…¥Í”MåÍÑ•µá¥Ğ À¤)•±¥˜…Ñ¥½¸€ôô€Í•Ñ}Ù…±Õ”œè(•‘¥Ñ…‰±”õ”¹ÅÕ•Éå‘¥Ñ…‰±•Q•áĞ ¤ì•‘¥Ñ…‰±”¹Í•ÑQ•áÑ½¹Ñ•¹ÑÌ¡½Ì¹•¹Ù¥É½¹l15}Y1Ut¤)•±Í”èÉ…¥Í”MåÍÑ•µá¥Ğ Õ¹ÍÕÁÁ½ÉÑ•Í•µ…¹Ñ¥Œ…Ñ¥½¸œ¤)ÁÉ¥¹Ğ¡©Í½¸¹‘ÕµÁÌ¡ìÍ•µ…¹Ñ¥ŒœéQÉÕ•ô±Í•Á…É…Ñ½ÉÌô œ°œ°œèœ¤¤¤(ˆŒì()™¸•±•µ•¹Ñ}¥¹‘•à¡•±•µ•¹Ñ}¥è€™ÍÑÈ¤€´øI•ÍÕ±ĞñÕÍ¥é”°MÑÉ¥¹œøì(€€€•±•µ•¹Ñ}¥(€€€€€€€€¹ÉÍÁ±¥Ñ}½¹” ˆèé•±•µ•¹Ğ´ˆ¤(€€€€€€€€¹…¹‘}Ñ¡•¸¡ğ¡|°¥¹‘•à¥ğ¥¹‘•à¹ÍÁ±¥Ğ ˆèèˆ¤¹¹•áĞ ¤¤(€€€€€€€€¹…¹‘}Ñ¡•¸¡ñ¥¹‘•áğ¥¹‘•à¹Á…ÉÍ”èèñÕÍ¥é”ø ¤¹½¬ ¤¤(€€€€€€€€¹½­}½É}•±Í”¡ñğ€‰•ÍÍ¥‰¥±¥Ñä•±•µ•¹Ğ¥¡…Ì¹¼ÍÑ…‰±”ÁÉ½Ù¥‘•È¥¹‘•àˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤)ô()™¸İ¥¹‘½İ}¥¹‘•à¡İ¥¹‘½İ}¥è€™ÍÑÈ¤€´øI•ÍÕ±ĞñÕÍ¥é”°MÑÉ¥¹œøì(€€€İ¥¹‘½İ}¥(€€€€€€€€¹ÉÍÁ±¥Ñ}½¹” ˆèéİ¥¹‘½Ü´ˆ¤(€€€€€€€€¹…¹‘}Ñ¡•¸¡ğ¡|°¥¹‘•à¥ğ¥¹‘•à¹Á…ÉÍ”èèñÕÍ¥é”ø ¤¹½¬ ¤¤(€€€€€€€€¹½­}½É}•±Í”¡ñğ€‰•ÍÍ¥‰¥±¥Ñäİ¥¹‘½Ü¥¡…Ì¹¼ÍÑ…‰±”ÁÉ½Ù¥‘•È¥¹‘•àˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤)ô()™¸¹…Ñ¥Ù•}Í•µ…¹Ñ¥}…Ñ¥½¸ (€€€Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ°(€€€•±•µ•¹Ñ}¥è€™ÍÑÈ°(€€€…Ñ¥½¸è€™ÍÑÈ°(€€€Ù…±Õ”è=ÁÑ¥½¸ğ™ÍÑÈø°(¤€´øI•ÍÕ±Ğñ‰½½°°MÑÉ¥¹œøì(€€€±•Ğ•±•µ•¹Ñ}¥¹‘•à€ô•±•µ•¹Ñ}¥¹‘•à¡•±•µ•¹Ñ}¥¤üì(€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ¥t(€€€ì(€€€€€€€±•Ğİ¥¹‘½İ}¥¹‘•à€ôİ¥¹‘½İ}¥¹‘•à ™Ñ…É•Ğ¹İ¥¹‘½İ}¥¤üì(€€€€€€€±•Ğ‰åÑ•Ì€ôÉÕ¹}¹…Ñ¥Ù•}½µµ…¹‘}İ¥Ñ¡}•¹Ø (€€€€€€€€€€€€‰½Í…ÍÉ¥ÁĞˆ°(€€€€€€€€€€€€™lˆµ°ˆ°€‰)…Ù…MÉ¥ÁĞˆ°€ˆµ”ˆ°5=M}a}Q%=9}MI%AQt°(€€€€€€€€€€€€™l(€€€€€€€€€€€€€€€€ ‰15}AA}%ˆ°Ñ…É•Ğ¹…ÁÁ±¥…Ñ¥½¹}¥¹±½¹” ¤¤°(€€€€€€€€€€€€€€€€ ‰15}]%9=]}%9`ˆ°İ¥¹‘½İ}¥¹‘•à¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€ ‰15}159Q}%9`ˆ°•±•µ•¹Ñ}¥¹‘•à¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€ ‰15}Q%=8ˆ°…Ñ¥½¸¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€ ‰15}Y1Uˆ°Ù…±Õ”¹Õ¹İÉ…Á}½É}‘•™…Õ±Ğ ¤¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€t°(€€€€€€€€¤üì(€€€€€€€É•ÑÕÉ¸Í•É‘•}©Í½¸èé™É½µ}Í±¥”èèñÍ•É‘•}©Í½¸èéY…±Õ”ø ™‰åÑ•Ì¤(€€€€€€€€€€€€¹½¬ ¤(€€€€€€€€€€€€¹…¹‘}Ñ¡•¸¡ñ©Í½¹ğ©Í½¸¹•Ğ ‰Í•µ…¹Ñ¥Œˆ¤¹…¹‘}Ñ¡•¸¡Í•É‘•}©Í½¸èéY…±Õ”èé…Í}‰½½°¤¤(€€€€€€€€€€€€¹½­}½É}•±Í”¡ñğ€‰µ…=L•ÍÍ¥‰¥±¥Ñä…Ñ¥½¸É•ÑÕÉ¹•¥¹Ù…±¥‘…Ñ„ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€ô(€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ¥t(€€€ì(€€€€€€€±•Ğ‰åÑ•Ì€ôÉÕ¹}¹…Ñ¥Ù•}½µµ…¹‘}İ¥Ñ¡}•¹Ø (€€€€€€€€€€€€‰Á½İ•ÉÍ¡•±°¹•á”ˆ°(€€€€€€€€€€€€™l(€€€€€€€€€€€€€€€€ˆµ9½AÉ½™¥±”ˆ°(€€€€€€€€€€€€€€€€ˆµ9½¹%¹Ñ•É…Ñ¥Ù”ˆ°(€€€€€€€€€€€€€€€€ˆµ½µµ…¹ˆ°(€€€€€€€€€€€€€€€]%9=]M}U%}Q%=9}MI%AP°(€€€€€€€€€€€t°(€€€€€€€€€€€€™l(€€€€€€€€€€€€€€€€ ‰15}]%9=]}!91ˆ°Ñ…É•Ğ¹İ¥¹‘½İ}¥¹±½¹” ¤¤°(€€€€€€€€€€€€€€€€ ‰15}159Q}%9`ˆ°•±•µ•¹Ñ}¥¹‘•à¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€ ‰15}Q%=8ˆ°…Ñ¥½¸¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€ ‰15}Y1Uˆ°Ù…±Õ”¹Õ¹İÉ…Á}½É}‘•™…Õ±Ğ ¤¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€t°(€€€€€€€€¤üì(€€€€€€€É•ÑÕÉ¸Í•É‘•}©Í½¸èé™É½µ}Í±¥”èèñÍ•É‘•}©Í½¸èéY…±Õ”ø ™‰åÑ•Ì¤(€€€€€€€€€€€€¹½¬ ¤(€€€€€€€€€€€€¹…¹‘}Ñ¡•¸¡ñ©Í½¹ğ©Í½¸¹•Ğ ‰Í•µ…¹Ñ¥Œˆ¤¹…¹‘}Ñ¡•¸¡Í•É‘•}©Í½¸èéY…±Õ”èé…Í}‰½½°¤¤(€€€€€€€€€€€€¹½­}½É}•±Í”¡ñğ€‰]¥¹‘½İÌU$ÕÑ½µ…Ñ¥½¸…Ñ¥½¸É•ÑÕÉ¹•¥¹Ù…±¥‘…Ñ„ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€ô(€€€€m™œ¡Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¥t(€€€ì(€€€€€€€¥˜¥Í}İ…å±…¹‘}Í•ÍÍ¥½¹}™É½µ}•¹Ø ¤ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ¡]e19}A=IQ1}5MM¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€±•ĞÁÉ½Ù¥‘•É}İ¥¹‘½İ}¥€ôÑ…É•Ğ(€€€€€€€€€€€€¹ÁÉ½Ù¥‘•É}İ¥¹‘½İ}¥(€€€€€€€€€€€€¹…Í}‘•É•˜ ¤(€€€€€€€€€€€€¹Õ¹İÉ…Á}½È ™Ñ…É•Ğ¹İ¥¹‘½İ}¥¤ì(€€€€€€€±•Ğİ¥¹‘½İ}¥¹‘•à€ôİ¥¹‘½İ}¥¹‘•à¡ÁÉ½Ù¥‘•É}İ¥¹‘½İ}¥¤üì(€€€€€€€±•Ğ‰åÑ•Ì€ôÉÕ¹}¹…Ñ¥Ù•}½µµ…¹‘}İ¥Ñ¡}•¹Ø (€€€€€€€€€€€€‰ÁåÑ¡½¸Ìˆ°(€€€€€€€€€€€€™lˆµŒˆ°1%9Ua}QMA%}Q%=9}MI%AQt°(€€€€€€€€€€€€™l(€€€€€€€€€€€€€€€€ ‰15}AA}95ˆ°Ñ…É•Ğ¹…ÁÁ±¥…Ñ¥½¹}¹…µ”¹±½¹” ¤¤°(€€€€€€€€€€€€€€€€ ‰15}]%9=]}%9`ˆ°İ¥¹‘½İ}¥¹‘•à¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€ ‰15}159Q}%9`ˆ°•±•µ•¹Ñ}¥¹‘•à¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€ ‰15}Q%=8ˆ°…Ñ¥½¸¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€ ‰15}Y1Uˆ°Ù…±Õ”¹Õ¹İÉ…Á}½É}‘•™…Õ±Ğ ¤¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€t°(€€€€€€€€¤üì(€€€€€€€É•ÑÕÉ¸Í•É‘•}©Í½¸èé™É½µ}Í±¥”èèñÍ•É‘•}©Í½¸èéY…±Õ”ø ™‰åÑ•Ì¤(€€€€€€€€€€€€¹½¬ ¤(€€€€€€€€€€€€¹…¹‘}Ñ¡•¸¡ñ©Í½¹ğ©Í½¸¹•Ğ ‰Í•µ…¹Ñ¥Œˆ¤¹…¹‘}Ñ¡•¸¡Í•É‘•}©Í½¸èéY…±Õ”èé…Í}‰½½°¤¤(€€€€€€€€€€€€¹½­}½É}•±Í”¡ñğ€‰1¥¹ÕàPµMA$…Ñ¥½¸É•ÑÕÉ¹•¥¹Ù…±¥‘…Ñ„ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€ô(€€€€m™œ¡¹½Ğ¡…¹ä¡Ñ…É•Ñ}½Ì€ô€‰µ…½Ìˆ°Ñ…É•Ñ}½Ì€ô€‰İ¥¹‘½İÌˆ°Ñ…É•Ñ}½Ì€ô€‰±¥¹Õàˆ¤¤¥t(€€€ì(€€€€€€€±•Ğ|€ô€¡Ñ…É•Ğ°•±•µ•¹Ñ}¥°…Ñ¥½¸°Ù…±Õ”°•±•µ•¹Ñ}¥¹‘•à¤ì(€€€€€€€=¬¡™…±Í”¤(€€€ô)ô((¼¼¼Í¥¹±”½¹ÑÉ½°Í•ÍÍ¥½¸°Í½Á•Ñ¼…¸•áÁ±¥¥Ğ°¹½¸µ•µÁÑä…±±½İ±¥ÍĞ½˜(¼¼¼…ÁÁ±¥…Ñ¥½¸½İ¥¹‘½Ü¥‘•¹Ñ¥™¥•ÉÌƒŠPÍ•”Ñ¡”µ½‘Õ±”‘½ŒÌ½µÁ…É¥Í½¸Ñ¼(¼¼¼´İ}½µÁ…¹¥½¸èé…ÁÑÕÉ•É…¹Ñ€¸(m‘•É¥Ù”¡±½¹”°•‰Õœ°M•É¥…±¥é”°•Í•É¥…±¥é”°A…ÉÑ¥…±Ä¥t(mÍ•É‘”¡É•¹…µ•}…±°€ô€‰…µ•±…Í”ˆ¥t)ÁÕˆÍÑÉÕĞ½¹ÑÉ½±M•ÍÍ¥½¸ì(€€€ÁÕˆÍ•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€ÁÕˆ…±±½İ•‘}…ÁÁ±¥…Ñ¥½¹ÌèY•ŒñMÑÉ¥¹œø°(€€€ÁÕˆ…±±½İ•‘}İ¥¹‘½İÌèY•ŒñMÑÉ¥¹œø°(€€€ÁÕˆÉ•…Ñ•‘}…Ñ}µÌèÔØĞ°(€€€ÁÕˆ•áÁ¥É•Í}…Ñ}µÌèÔØĞ°(€€€ÁÕˆ…Ñ¥Ù”è‰½½°°(€€€ÁÕˆÁ…ÕÍ•è‰½½°°(€€€€¼¼¼±İ…åÌÑÉÕ•€İ¡¥±”…Ñ¥Ù•€èÑ¡”Ù¥Í¥‰±”½¸µÍÉ••¸¥¹‘¥…Ñ½È¥Ì¹½Ğ(€€€€¼¼¼½ÁÑ¥½¹…°¥¸Ñ¡¥Ì‘•Í¥¸€¡Í•”Ñ¡”‘•Í¥¸‘½ŒÌÑ¡É•…Ğµµ½‘•°Ñ…‰±”¤¸(€€€€¼¼¼-•ÁĞ…Ì…¸•áÁ±¥¥Ğ™¥•±É…Ñ¡•ÈÑ¡…¸¥µÁ±¥•‰ä…Ñ¥Ù•€Í¼Ñ¡”(€€€€¼¼¼™É½¹Ñ•¹¡…Ì½¹”±•…ÈÍ½ÕÉ”½˜ÑÉÕÑ ™½Èİ¡•Ñ¡•ÈÑ¼É•¹‘•ÈÑ¡”(€€€€¼¼¼€‰½¹ÑÉ½°¥Ì±¥Ù”ˆ‰…¹¹•È°…¹Í¼„™ÕÑÕÉ”µ½‘”Ñ¡…ĞÌ…Ñ¥Ù”µ‰ÕĞ´(€€€€¼¼¼¡¥‘‘•¸İ½Õ±‰”„Ù¥Í¥‰±”°‘•±¥‰•É…Ñ”¡…¹”Ñ¼Ñ¡¥ÌÍÑÉÕĞÉ…Ñ¡•È(€€€€¼¼¼Ñ¡…¸„Í¥±•¹Ğ‰•¡…Ù¥½È¡…¹”¸(€€€ÁÕˆ¥¹‘¥…Ñ½É}Ù¥Í¥‰±”è‰½½°°(€€€€¼¼¼M•”Ñ¡”‘•Í¥¸‘½ŒÌ€‰]¡…Ğ€…ÁÁÉ½Ù•‰…Ñ œµ½‘”¥ÌˆÍ•Ñ¥½¸èÍ­¥ÁÌ(€€€€¼¼¼Ñ¡”Á•Èµ…Ñ¥½¸…ÁÁÉ½Ù…°ÁÉ½µÁĞ™½ÈÑ¡¥ÌÍ•ÍÍ¥½¸½¹±ä°¹•Ù•Èİ¥‘•¹Ì(€€€€¼¼¼Ñ¡”…±±½İ±¥ÍĞ°¹•Ù•È‘¥Í…‰±•Ì•µ•É•¹äÍÑ½À°¹•Ù•È•Í…Á•ÌÑ¡”(€€€€¼¼¼Í•ÍÍ¥½¸Ì½İ¸•áÁ¥Éä¸(€€€ÁÕˆ…ÁÁÉ½Ù•‘}‰…Ñ è‰½½°°(€€€ÁÕˆ…ÁÁÉ½Ù…±}Á½±¥äèÁÁÉ½Ù…±A½±¥ä°(€€€ÁÕˆ…±±½İ}ÍÉ••¹Í¡½ÑÌè‰½½°°(€€€ÁÕˆ…±±½İ}­•å‰½…É‘}¥¹ÁÕĞè‰½½°°(€€€ÁÕˆ…±±½İ}±¥Á‰½…É‘}É•…è‰½½°°)ô((m‘•É¥Ù”¡±½¹”°•‰Õœ°•™…Õ±Ğ¥t)ÁÕˆÍÑÉÕĞM•ÍÍ¥½¹É…¹Ñ=ÁÑ¥½¹Ìì(€€€ÁÕˆ…±±½İ•‘}İ¥¹‘½İÌèY•ŒñMÑÉ¥¹œø°(€€€ÁÕˆ…±±½İ}ÍÉ••¹Í¡½ÑÌè‰½½°°(€€€ÁÕˆ…±±½İ}­•å‰½…É‘}¥¹ÁÕĞè‰½½°°(€€€ÁÕˆ…±±½İ}±¥Á‰½…É‘}É•…è‰½½°°(€€€ÁÕˆ…ÁÁÉ½Ù…±}Á½±¥äè=ÁÑ¥½¸ñÁÁÉ½Ù…±A½±¥äø°)ô()¥µÁ°M•ÍÍ¥½¹É…¹Ñ=ÁÑ¥½¹Ìì(€€€™¸™½É}±•…ä¡…ÁÁÉ½Ù•‘}‰…Ñ è‰½½°¤€´øM•±˜ì(€€€€€€€M•±˜ì(€€€€€€€€€€€…±±½İ}ÍÉ••¹Í¡½ÑÌèÑÉÕ”°(€€€€€€€€€€€…±±½İ}­•å‰½…É‘}¥¹ÁÕĞèÑÉÕ”°(€€€€€€€€€€€…ÁÁÉ½Ù…±}Á½±¥äèM½µ”¡¥˜…ÁÁÉ½Ù•‘}‰…Ñ ì(€€€€€€€€€€€€€€€ÁÁÉ½Ù…±A½±¥äèéÁÁÉ½Ù•‘	…Ñ (€€€€€€€€€€€ô•±Í”ì(€€€€€€€€€€€€€€€ÁÁÉ½Ù…±A½±¥äèéA•ÉÑ¥½¸(€€€€€€€€€€€ô¤°(€€€€€€€€€€€€¸¹M•±˜èé‘•™…Õ±Ğ ¤(€€€€€€€ô(€€€ô)ô((¼¼¼¸¥¸µ™±¥¡Ğ…ÁÁÉ½Ù…°É•ÅÕ•ÍĞ™½È½¹”m½¹ÑÉ½±Ñ¥½¹t°­•å•‰ä„(¼¼¼•¹•É…Ñ•¥¥¸m•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”èéÁ•¹‘¥¹t¸9½Ğ±½¹•€½M•É¥…±¥é•€(¼¼¼ƒŠPÑ¡”½¹•Í¡½ĞèéM•¹‘•É€…¸Ğ‰”°…¹¹½Ñ¡¥¹œ½ÕÑÍ¥‘”Ñ¡¥Ìµ½‘Õ±”¹••‘Ì(¼¼¼Ñ¡”İ¡½±”ÍÑÉÕĞìmA•¹‘¥¹Ñ¥½¹MÕµµ…Éåt¥ÌÑ¡”Í•É¥…±¥é…‰±”Ù¥•ÜÍ•¹Ğ(¼¼¼Ñ¼Ñ¡”™É½¹Ñ•¹¸(m‘•É¥Ù”¡±½¹”°•‰Õœ°•™…Õ±Ğ¥t)ÍÑÉÕĞÕ‘¥Ñ½¹Ñ•áĞì(€€€ÉÕ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°)ô()ÍÑÉÕĞA•¹‘¥¹½¹ÑÉ½±Ñ¥½¸ì(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€…Ñ¥½¸è½¹ÑÉ½±Ñ¥½¸°(€€€½¹Ñ•áĞèÕ‘¥Ñ½¹Ñ•áĞ°(€€€…ÁÁÉ½Ù…±}±•Ù•°èÁÁÉ½Ù…±1•Ù•°°(€€€…ÁÁÉ½Ù…±}‘¥•ÍĞèMÑÉ¥¹œ°(€€€‘•ÍÉ¥ÁÑ¥½¸èMÑÉ¥¹œ°(€€€Í•¹‘•Èè=ÁÑ¥½¸ñ½¹•Í¡½ĞèéM•¹‘•Èñ‰½½°øø°)ô((¼¼¼M•É¥…±¥é…‰±”Í¹…ÁÍ¡½Ğ½˜„Á•¹‘¥¹œ…Ñ¥½¸°•µ¥ÑÑ•Ñ¼Ñ¡”™É½¹Ñ•¹Í¼¥Ğ(¼¼¼…¸É•¹‘•È…¸…ÁÁÉ½Ù”½‘•¹äÁÉ½µÁĞ¸(m‘•É¥Ù”¡±½¹”°•‰Õœ°M•É¥…±¥é”¥t(mÍ•É‘”¡É•¹…µ•}…±°€ô€‰…µ•±…Í”ˆ¥t)ÁÕˆÍÑÉÕĞA•¹‘¥¹Ñ¥½¹MÕµµ…Éäì(€€€ÁÕˆ…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€ÁÕˆÍ•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€ÁÕˆÑ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€ÁÕˆÑ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÁÕˆ…ÁÁÉ½Ù…±}±•Ù•°èÁÁÉ½Ù…±1•Ù•°°(€€€ÁÕˆ‘•ÍÉ¥ÁÑ¥½¸èMÑÉ¥¹œ°(€€€ÁÕˆ…Ñ¥½¸è½¹ÑÉ½±Ñ¥½¸°)ô((m‘•É¥Ù”¡±½¹”°•‰Õœ°M•É¥…±¥é”°A…ÉÑ¥…±Ä¥t(mÍ•É‘”¡É•¹…µ•}…±°€ô€‰…µ•±…Í”ˆ¥t)ÁÕˆÍÑÉÕĞY•É¥™¥…Ñ¥½¹Ù¥‘•¹”ì(€€€ÁÕˆ­¥¹èMÑÉ¥¹œ°(€€€ÁÕˆ•±•µ•¹Ñ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÁÕˆ•áÁ•Ñ•‘}Ù…±Õ”è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÁÕˆ½‰Í•ÉÙ•‘}Ù…±Õ”è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÁÕˆµ…Ñ¡•è‰½½°°(€€€ÁÕˆ‘•Ñ…¥°èMÑÉ¥¹œ°)ô()¥µÁ°Y•É¥™¥…Ñ¥½¹Ù¥‘•¹”ì(€€€™¸É•‘…Ñ•‘}™½É}…Õ‘¥Ğ ™Í•±˜¤€´øM•±˜ì(€€€€€€€±•ĞµÕĞÉ•‘…Ñ•€ôÍ•±˜¹±½¹” ¤ì(€€€€€€€¥˜Í•±˜¹­¥¹€ôô€‰•±•µ•¹Ñ}Ù…±Õ”ˆì(€€€€€€€€€€€É•‘…Ñ•¹•áÁ•Ñ•‘}Ù…±Õ”€ô9½¹”ì(€€€€€€€€€€€É•‘…Ñ•¹½‰Í•ÉÙ•‘}Ù…±Õ”€ô9½¹”ì(€€€€€€€€€€€É•‘…Ñ•¹‘•Ñ…¥°€ô™½Éµ…Ğ„ ‰íôìÙ…±Õ•ÌÉ•‘…Ñ•™É½´‘ÕÉ…‰±”…Õ‘¥Ğˆ°Í•±˜¹‘•Ñ…¥°¤ì(€€€€€€€ô(€€€€€€€É•‘…Ñ•(€€€ô)ô((¼¼¼I•ÍÕ±Ğ½˜„É•Í½±Ù•€¡•á•ÕÑ•½È‘•¹¥•¤…Ñ¥½¸°É•ÑÕÉ¹•Ñ¼Ñ¡”…±±•È(¼¼¼½˜‘•Í­Ñ½Á}½¹ÑÉ½±}É•ÅÕ•ÍÑ}…Ñ¥½¹€¸(m‘•É¥Ù”¡±½¹”°•‰Õœ°M•É¥…±¥é”¥t(mÍ•É‘”¡É•¹…µ•}…±°€ô€‰…µ•±…Í”ˆ¥t)ÁÕˆÍÑÉÕĞÑ¥½¹=ÕÑ½µ”ì(€€€ÁÕˆ…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€ÁÕˆ•á•ÕÑ•è‰½½°°(€€€ÁÕˆ¥¹ÁÕÑ}Í•¹Ğè‰½½°°(€€€ÁÕˆÍÑ…Ñ•}Ù•É¥™¥•è‰½½°°(€€€ÁÕˆÙ•É¥™¥…Ñ¥½¸è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÁÕˆÙ•É¥™¥…Ñ¥½¹}•Ù¥‘•¹”è=ÁÑ¥½¸ñY•É¥™¥…Ñ¥½¹Ù¥‘•¹”ø°(€€€ÁÕˆ…Õ‘¥Ñ}¥èMÑÉ¥¹œ°(€€€ÁÕˆ…ÁÁÉ½Ù…±}±•Ù•°èÁÁÉ½Ù…±1•Ù•°°)ô()¥µÁ°Ñ¥½¹=ÕÑ½µ”ì(€€€ÁÕˆ™¸™É½µ}•á•ÕÑ¥½¸¡…Ñ¥½¹}¥èMÑÉ¥¹œ°É•ÍÕ±Ğèá•ÕÑ¥½¹I•ÍÕ±Ğ¤€´øM•±˜ì(€€€€€€€M•±˜ì(€€€€€€€€€€€…Ñ¥½¹}¥°(€€€€€€€€€€€•á•ÕÑ•èÑÉÕ”°(€€€€€€€€€€€¥¹ÁÕÑ}Í•¹ĞèÉ•ÍÕ±Ğ¹¥¹ÁÕÑ}Í•¹Ğ°(€€€€€€€€€€€ÍÑ…Ñ•}Ù•É¥™¥•èÉ•ÍÕ±Ğ¹ÍÑ…Ñ•}Ù•É¥™¥•°(€€€€€€€€€€€Ù•É¥™¥…Ñ¥½¸èÉ•ÍÕ±Ğ¹Ù•É¥™¥…Ñ¥½¸°(€€€€€€€€€€€Ù•É¥™¥…Ñ¥½¹}•Ù¥‘•¹”èÉ•ÍÕ±Ğ¹Ù•É¥™¥…Ñ¥½¹}•Ù¥‘•¹”°(€€€€€€€€€€€…Õ‘¥Ñ}¥èÉ•ÍÕ±Ğ¹…Õ‘¥Ñ}¥°(€€€€€€€€€€€…ÁÁÉ½Ù…±}±•Ù•°èÉ•ÍÕ±Ğ¹…ÁÁÉ½Ù…±}±•Ù•°°(€€€€€€€ô(€€€ô)ô((m‘•É¥Ù”¡±½¹”°•‰Õœ°M•É¥…±¥é”¥t(mÍ•É‘”¡É•¹…µ•}…±°€ô€‰…µ•±…Í”ˆ¥t)ÁÕˆÍÑÉÕĞ½µÁÕÑ•ÉÕ‘¥ÑI•½Éì(€€€ÁÕˆ…Õ‘¥Ñ}¥èMÑÉ¥¹œ°(€€€ÁÕˆÉÕ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÁÕˆÑ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÁÕˆÍ•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€ÁÕˆÑ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€ÁÕˆÑ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÁÕˆ…Ñ¥½¸èMÑÉ¥¹œ°(€€€ÁÕˆ…ÁÁÉ½Ù…±}±•Ù•°èÁÁÉ½Ù…±1•Ù•°°(€€€ÁÕˆÉ•ÍÕ±ĞèMÑÉ¥¹œ°(€€€ÁÕˆ…ÁÁÉ½Ù…°èMÑÉ¥¹œ°(€€€ÁÕˆ¥¹ÁÕÑ}Í•¹Ğè‰½½°°(€€€ÁÕˆÍÑ…Ñ•}Ù•É¥™¥•è‰½½°°(€€€ÁÕˆÙ•É¥™¥…Ñ¥½¸è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÁÕˆÙ•É¥™¥…Ñ¥½¹}•Ù¥‘•¹”è=ÁÑ¥½¸ñY•É¥™¥…Ñ¥½¹Ù¥‘•¹”ø°(€€€ÁÕˆÍÉ••¹Í¡½Ñ}É•˜è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÁÕˆÉ•…Ñ•‘}…Ñ}µÌèÔØĞ°)ô((¼¼¼=ÕÑ½µ”½˜m•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”èé‰•¥¹}…Ñ¥½¹tÌÙ…±¥‘…Ñ¥½¸ÍÑ•ÀƒŠP(¼¼¼™…Ñ½É•½ÕĞ™É½´Ñ¡”…Íå¹Œ½µµ…¹Í¼¥ĞÌ‘¥É•Ñ±äÑ•ÍÑ…‰±”İ¥Ñ¡½ÕĞ…¸(¼¼¼ÁÁ!…¹‘±•€½½¹•Í¡½Ğµ…İ…¥Ğµ…¡¥¹•Éä€¡µ¥ÉÉ½ÉÌÁ•Éµ¥ÍÍ¥½¹Ì¹ÉÍ€Ì(¼¼¼µ½‘•}Í¡½ÉÑ}¥ÉÕ¥Ñ€‰•¥¹œ„ÁÕÉ”°‘¥É•Ñ±äµÑ•ÍÑ…‰±”‘•¥Í¥½¸™Õ¹Ñ¥½¸¤¸)ÁÕˆ•¹Õ´Ñ¥½¹…Ñ”ì(€€€€¼¼¼Q¡”Í•ÍÍ¥½¸¥Ì¥¸€‰…ÁÁÉ½Ù•‰…Ñ ˆµ½‘”èÑ¡”…Ñ¥½¸…±É•…‘äÉ…¸€¡½È(€€€€¼¼¼™…¥±•¤……¥¹ÍĞÑ¡”‰…­•¹°¹¼…ÁÁÉ½Ù…°¹••‘•¸(€€€á•ÕÑ•¡I•ÍÕ±Ğñá•ÕÑ¥½¹I•ÍÕ±Ğ°MÑÉ¥¹œø¤°(€€€€¼¼¼Q¡”Í•ÍÍ¥½¸É•ÅÕ¥É•ÌÁ•Èµ…Ñ¥½¸…ÁÁÉ½Ù…°èÑ¡”…±±•ÈµÕÍĞ…İ…¥Ğ(€€€€¼¼¼É••¥Ù•É€°Ñ¡•¸‘¥ÍÁ…Ñ Ñ¼Ñ¡”‰…­•¹¥ÑÍ•±˜½¸=¬¡=¬¡ÑÉÕ”¤¥€¸(€€€A•¹‘¥¹œì(€€€€€€€…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€€€€€É••¥Ù•Èè½¹•Í¡½ĞèéI••¥Ù•Èñ‰½½°ø°(€€€ô°)ô()ÁÕˆÍÑÉÕĞá•ÕÑ¥½¹I•ÍÕ±Ğì(€€€¥¹ÁÕÑ}Í•¹Ğè‰½½°°(€€€ÍÑ…Ñ•}Ù•É¥™¥•è‰½½°°(€€€Ù•É¥™¥…Ñ¥½¸è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ù•É¥™¥…Ñ¥½¹}•Ù¥‘•¹”è=ÁÑ¥½¸ñY•É¥™¥…Ñ¥½¹Ù¥‘•¹”ø°(€€€…Õ‘¥Ñ}¥èMÑÉ¥¹œ°(€€€…ÁÁÉ½Ù…±}±•Ù•°èÁÁÉ½Ù…±1•Ù•°°)ô()™¸Ù…±¥‘…Ñ•}½½É‘¥¹…Ñ•Ì¡Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ°àè¤ÌÈ°äè¤ÌÈ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€¥˜€…Ñ…É•Ğ¹‰½Õ¹‘Ì¹à¹¥Í}™¥¹¥Ñ” ¤(€€€€€€€ñğ€…Ñ…É•Ğ¹‰½Õ¹‘Ì¹ä¹¥Í}™¥¹¥Ñ” ¤(€€€€€€€ñğ€…Ñ…É•Ğ¹‰½Õ¹‘Ì¹İ¥‘Ñ ¹¥Í}™¥¹¥Ñ” ¤(€€€€€€€ñğ€…Ñ…É•Ğ¹‰½Õ¹‘Ì¹¡•¥¡Ğ¹¥Í}™¥¹¥Ñ” ¤(€€€€€€€ñğÑ…É•Ğ¹‰½Õ¹‘Ì¹İ¥‘Ñ €ğô€À¸À(€€€€€€€ñğÑ…É•Ğ¹‰½Õ¹‘Ì¹¡•¥¡Ğ€ğô€À¸À(€€€ì(€€€€€€€É•ÑÕÉ¸ÉÈ ‰Q…É•Ğ¡…Ì¹¼Ù…±¥‰½Õ¹‘•½½É‘¥¹…Ñ”É•¥½¸ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€ô(€€€±•Ğ¥¹Í¥‘•}à€ô(€€€€€€€˜ØĞèé™É½´¡à¤€øôÑ…É•Ğ¹‰½Õ¹‘Ì¹à€˜˜˜ØĞèé™É½´¡à¤€ğôÑ…É•Ğ¹‰½Õ¹‘Ì¹à€¬Ñ…É•Ğ¹‰½Õ¹‘Ì¹İ¥‘Ñ ì(€€€±•Ğ¥¹Í¥‘•}ä€ô(€€€€€€€˜ØĞèé™É½´¡ä¤€øôÑ…É•Ğ¹‰½Õ¹‘Ì¹ä€˜˜˜ØĞèé™É½´¡ä¤€ğôÑ…É•Ğ¹‰½Õ¹‘Ì¹ä€¬Ñ…É•Ğ¹‰½Õ¹‘Ì¹¡•¥¡Ğì(€€€¥˜¥¹Í¥‘•}à€˜˜¥¹Í¥‘•}äì(€€€€€€€=¬  ¤¤(€€€ô•±Í”ì(€€€€€€€ÉÈ ‰½½É‘¥¹…Ñ”¥Ì½ÕÑÍ¥‘”Ñ¡”Ù•É¥™¥•Ñ…É•Ğ‰½Õ¹‘Ìˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€ô)ô()™¸…Ñ¥½¹}ÍÕµµ…Éä¡…Ñ¥½¸è€™½¹ÑÉ½±Ñ¥½¸¤€´øMÑÉ¥¹œì(€€€µ…Ñ …Ñ¥½¸ì(€€€€€€€½¹ÑÉ½±Ñ¥½¸èéQåÁ•Q•áĞì€¸¸ô€ôø€‰ÑåÁ•}Ñ•áĞ€¡½¹Ñ•¹ĞÉ•‘…Ñ•¤ˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•ÑY…±Õ”ì€¸¸ôğ½¹ÑÉ½±Ñ¥½¸èéM•±•Ğì€¸¸ô€ôøì(€€€€€€€€€€€€‰Í•Ñ}Ù…±Õ”€¡½¹Ñ•¹ĞÉ•‘…Ñ•¤ˆ¹Ñ½}ÍÑÉ¥¹œ ¤(€€€€€€€ô(€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•µ…¹Ñ¥±¥¬ì(€€€€€€€€€€€•±•µ•¹Ñ}¥°(€€€€€€€€€€€‰ÕÑÑ½¸°(€€€€€€€€€€€•áÁ•Ñ•‘}Ù…±Õ”°(€€€€€€€ô€ôø™½Éµ…Ğ„ (€€€€€€€€€€€€‰Í•µ…¹Ñ¥}±¥¬•±•µ•¹Ğõí•±•µ•¹Ñ}¥‘ô‰ÕÑÑ½¸õí‰ÕÑÑ½¸èıô•áÁ•Ñ•‘}Ù…±Õ”õíôˆ°(€€€€€€€€€€€¥˜•áÁ•Ñ•‘}Ù…±Õ”¹¥Í}Í½µ” ¤ì(€€€€€€€€€€€€€€€€ˆ¡É•‘…Ñ•¤ˆ(€€€€€€€€€€€ô•±Í”ì(€€€€€€€€€€€€€€€€‰Õ¹ÍÁ•¥™¥•ˆ(€€€€€€€€€€€ô(€€€€€€€€¤°(€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•µ…¹Ñ¥½Õ‰±•±¥¬ì(€€€€€€€€€€€•±•µ•¹Ñ}¥°(€€€€€€€€€€€‰ÕÑÑ½¸°(€€€€€€€€€€€•áÁ•Ñ•‘}Ù…±Õ”°(€€€€€€€ô€ôø™½Éµ…Ğ„ (€€€€€€€€€€€€‰Í•µ…¹Ñ¥}‘½Õ‰±•}±¥¬•±•µ•¹Ğõí•±•µ•¹Ñ}¥‘ô‰ÕÑÑ½¸õí‰ÕÑÑ½¸èıô•áÁ•Ñ•‘}Ù…±Õ”õíôˆ°(€€€€€€€€€€€¥˜•áÁ•Ñ•‘}Ù…±Õ”¹¥Í}Í½µ” ¤ì(€€€€€€€€€€€€€€€€ˆ¡É•‘…Ñ•¤ˆ(€€€€€€€€€€€ô•±Í”ì(€€€€€€€€€€€€€€€€‰Õ¹ÍÁ•¥™¥•ˆ(€€€€€€€€€€€ô(€€€€€€€€¤°(€€€€€€€|€ôøÍ•É‘•}©Í½¸èéÑ½}ÍÑÉ¥¹œ¡…Ñ¥½¸¤¹Õ¹İÉ…Á}½É}•±Í”¡ñ}ğ€‰Õ¹Í•É¥…±¥é…‰±•}…Ñ¥½¸ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€ô)ô()™¸…ÁÁÉ½Ù…±}‘¥•ÍĞ (€€€Í•ÍÍ¥½¹}¥è€™ÍÑÈ°(€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€…Ñ¥½¸è€™½¹ÑÉ½±Ñ¥½¸°(€€€…ÁÁÉ½Ù…°èÁÁÉ½Ù…±1•Ù•°°(€€€‘•ÍÉ¥ÁÑ¥½¸è€™ÍÑÈ°(¤€´øMÑÉ¥¹œì(€€€±•ĞµÕĞ¡…Í¡•È€ôM¡„ÈÔØèé¹•Ü ¤ì(€€€¡…Í¡•È¹ÕÁ‘…Ñ”¡ˆ‰±¥ÑÑ±”µµ½¹­•äµ½µÁÕÑ•Èµ…ÁÁÉ½Ù…°µØÅpÀˆ¤ì(€€€±•Ğ…Ñ¥½¹}©Í½¸€ôÍ•É‘•}©Í½¸èéÑ½}ÍÑÉ¥¹œ¡…Ñ¥½¸¤¹Õ¹İÉ…Á}½É}‘•™…Õ±Ğ ¤ì(€€€™½ÈÙ…±Õ”¥¸l(€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥¹Õ¹İÉ…Á}½È ˆˆ¤°(€€€€€€€€™™½Éµ…Ğ„ ‰í…ÁÁÉ½Ù…°èıôˆ¤°(€€€€€€€‘•ÍÉ¥ÁÑ¥½¸°(€€€€€€€€™…Ñ¥½¹}©Í½¸°(€€€tì(€€€€€€€¡…Í¡•È¹ÕÁ‘…Ñ” ¡Ù…±Õ”¹±•¸ ¤…ÌÔØĞ¤¹Ñ½}±•}‰åÑ•Ì ¤¤ì(€€€€€€€¡…Í¡•È¹ÕÁ‘…Ñ”¡Ù…±Õ”¹…Í}‰åÑ•Ì ¤¤ì(€€€ô(€€€™½Éµ…Ğ„ ‰ìéáôˆ°¡…Í¡•È¹™¥¹…±¥é” ¤¤)ô()™¸…ÁÁÉ½Ù…±}±•Ù•°¡…Ñ¥½¸è€™½¹ÑÉ½±Ñ¥½¸¤€´øÁÁÉ½Ù…±1•Ù•°ì(€€€…ÁÁÉ½Ù…±}±•Ù•±}™½É}¹…µ” ™…Ñ¥½¹}ÍÕµµ…Éä¡…Ñ¥½¸¤¤)ô()™¸…ÁÁÉ½Ù…±}±•Ù•±}™½É}¹…µ”¡…Ñ¥½¹}¹…µ”è€™ÍÑÈ¤€´øÁÁÉ½Ù…±1•Ù•°ì(€€€±•ĞÍÕµµ…Éä€ô…Ñ¥½¹}¹…µ”¹Ñ½}…Í¥¥}±½İ•É…Í” ¤ì(€€€¥˜l(€€€€€€€€‰‘•±•Ñ”ˆ°€‰‘•ÍÑÉ½äˆ°€‰É•µ½Ù”ˆ°€‰ÁÕÉ¡…Í”ˆ°€‰Á…åµ•¹Ğˆ°€‰½¹™¥É´ˆ°€‰Í•¹ˆ°€‰ÍÕ‰µ¥Ğˆ°(€€€€€€€€‰ÁÕ‰±¥Í ˆ°€‰É•Ù½­”ˆ°€‰Í¡ÕÑ‘½İ¸ˆ°€‰™½Éµ…Ğˆ°€‰•É…Í”ˆ°(€€€t(€€€€¹¥Ñ•È ¤(€€€€¹…¹ä¡ñÑ½­•¹ğÍÕµµ…Éä¹½¹Ñ…¥¹Ì¡Ñ½­•¸¤¤(€€€ì(€€€€€€€É•ÑÕÉ¸ÁÁÉ½Ù…±1•Ù•°èéÉ¥Ñ¥…°ì(€€€ô(€€€¥˜ÍÕµµ…Éä¹½¹Ñ…¥¹Ì ‰ÍÉ••¹Í¡½Ğˆ¤(€€€€€€€ñğÍÕµµ…Éä¹½¹Ñ…¥¹Ì ‰¥¹ÍÁ•Ğˆ¤(€€€€€€€ñğÍÕµµ…Éä¹½¹Ñ…¥¹Ì ‰±¥Á‰½…Éˆ¤(€€€ì(€€€€€€€ÁÁÉ½Ù…±1•Ù•°èé1½Ü(€€€ô•±Í”¥˜ÍÕµµ…Éä¹½¹Ñ…¥¹Ì ‰™½ÕÌˆ¤ñğÍÕµµ…Éä¹½¹Ñ…¥¹Ì ‰ÍÉ½±°ˆ¤ì(€€€€€€€ÁÁÉ½Ù…±1•Ù•°èé5•‘¥Õ´(€€€ô•±Í”ì(€€€€€€€ÁÁÉ½Ù…±1•Ù•°èé!¥ (€€€ô)ô()™¸É•‘…Ñ•‘}…Ñ¥½¹}™½É}Õ¤¡…Ñ¥½¸è€™½¹ÑÉ½±Ñ¥½¸¤€´ø½¹ÑÉ½±Ñ¥½¸ì(€€€µ…Ñ …Ñ¥½¸ì(€€€€€€€½¹ÑÉ½±Ñ¥½¸èéQåÁ•Q•áĞìÑ•áĞô€ôø½¹ÑÉ½±Ñ¥½¸èéQåÁ•Q•áĞì(€€€€€€€€€€€Ñ•áĞè™½Éµ…Ğ„ ‰mÉ•‘…Ñ•ÑåÁ•Ñ•áĞèíô¡…É…Ñ•ÉÍtˆ°Ñ•áĞ¹¡…ÉÌ ¤¹½Õ¹Ğ ¤¤°(€€€€€€€ô°(€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•ÑY…±Õ”ì•±•µ•¹Ñ}¥°Ù…±Õ”ô€ôø½¹ÑÉ½±Ñ¥½¸èéM•ÑY…±Õ”ì(€€€€€€€€€€€•±•µ•¹Ñ}¥è•±•µ•¹Ñ}¥¹±½¹” ¤°(€€€€€€€€€€€Ù…±Õ”è™½Éµ…Ğ„ ‰mÉ•‘…Ñ•Ù…±Õ”èíô¡…É…Ñ•ÉÍtˆ°Ù…±Õ”¹¡…ÉÌ ¤¹½Õ¹Ğ ¤¤°(€€€€€€€ô°(€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•±•Ğì•±•µ•¹Ñ}¥°Ù…±Õ”ô€ôø½¹ÑÉ½±Ñ¥½¸èéM•±•Ğì(€€€€€€€€€€€•±•µ•¹Ñ}¥è•±•µ•¹Ñ}¥¹±½¹” ¤°(€€€€€€€€€€€Ù…±Õ”è™½Éµ…Ğ„ ‰mÉ•‘…Ñ•Ù…±Õ”èíô¡…É…Ñ•ÉÍtˆ°Ù…±Õ”¹¡…ÉÌ ¤¹½Õ¹Ğ ¤¤°(€€€€€€€ô°(€€€€€€€½Ñ¡•È€ôø½Ñ¡•È¹±½¹” ¤°(€€€ô)ô()™¸±½¬ğ„°Pø¡µÕÑ•àè€˜„5ÕÑ•àñPø°±…‰•°è€™ÍÑÈ¤€´øI•ÍÕ±Ğñ5ÕÑ•áÕ…Éğ„°Pø°MÑÉ¥¹œøì(€€€µÕÑ•à(€€€€€€€€¹±½¬ ¤(€€€€€€€€¹µ…Á}•ÉÈ¡ñ}ğ™½Éµ…Ğ„ ‰í±…‰•±ô±½¬¥ÌÁ½¥Í½¹•ˆ¤¤)ô()™¸¹½İ}µÌ ¤€´øÔØĞì(€€€MåÍÑ•µQ¥µ”èé¹½Ü ¤(€€€€€€€€¹‘ÕÉ…Ñ¥½¹}Í¥¹”¡U9%a}A= ¤(€€€€€€€€¹µ…À¡ñ‘ÕÉ…Ñ¥½¹ğÔØĞèéÑÉå}™É½´¡‘ÕÉ…Ñ¥½¸¹…Í}µ¥±±¥Ì ¤¤¹Õ¹İÉ…Á}½È¡ÔØĞèé5`¤¤(€€€€€€€€¹Õ¹İÉ…Á}½È À¤)ô()™¸Ù…±¥‘…Ñ•}…ÁÁ±¥…Ñ¥½¹}¥¡Ù…±Õ”è€™ÍÑÈ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€¥˜Ù…±Õ”¹¥Í}•µÁÑä ¤ñğÙ…±Õ”¹±•¸ ¤€ø€ÈÔØñğÙ…±Õ”¹¡…ÉÌ ¤¹…¹ä¡¡…Èèé¥Í}½¹ÑÉ½°¤ì(€€€€€€€ÉÈ (€€€€€€€€€€€€‰ÁÁ±¥…Ñ¥½¸½İ¥¹‘½Ü¥‘•¹Ñ¥™¥•ÈµÕÍĞ‰”„¹½¸µ•µÁÑä°ÁÉ¥¹Ñ…‰±”°‰½Õ¹‘•ÍÑÉ¥¹œˆ(€€€€€€€€€€€€€€€€¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€¤(€€€ô•±Í”ì(€€€€€€€=¬  ¤¤(€€€ô)ô((¼¼¼½¹Ñ•¹ÑÌ½˜Ñ¡”µ…¡¥¹”µİ¥‘”‘•Í­Ñ½Àµ½¹ÑÉ½°±½¬™¥±”¸A•ÉÍ¥ÍÑ•…Ì)M=8(¼¼¼Í¼„ÍÑ…±”±½¬±•™Ğ‰ä„É…Í¡•ÁÉ½•ÍÌ…¸‰”¥¹ÍÁ•Ñ•…¹É•±…¥µ•‰ä(¼¼¼„±…Ñ•È½¹ÑÉ½±±•È€¡Í•”mMQ1}1=-}5Mt…¹ÁÉ½•ÍÍ}…±¥Ù•€¤¸(m‘•É¥Ù”¡M•É¥…±¥é”°•Í•É¥…±¥é”¥t)ÍÑÉÕĞ1½­½¹Ñ•¹ÑÌì(€€€Á¥èÔÌÈ°(€€€…ÅÕ¥É•‘}…Ñ}µÌèÔØĞ°)ô((¼¼¼I%$½İ¹•È½˜Ñ¡”½¸µ‘¥Í¬‘•Í­Ñ½Àµ½¹ÑÉ½°±½¬™¥±”¸I•µ½Ù¥¹œÑ¡”™¥±”½¸(¼¼¼‘É½À¥ÌÑ¡”ÁÉ½•ÍÌµ•á¥Ğ‰…­ÍÑ½ÀÑ¡”‘•Í¥¸É•ÅÕ¥É•Ìè•Ù•¸¥˜„½¹ÑÉ½±±•È(¼¼¼Á…¹¥Ì‰•Ñİ••¸ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ±€…¹…¸•áÁ±¥¥ĞÍÑ½À°‘É½ÁÁ¥¹œÑ¡”(¼¼¼m•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ•tÉ•±•…Í•ÌÑ¡”±½¬Í¼Ñ¡”¹•áĞÁÉ½•ÍÌ¥Ì¹½Ğ‰±½­•(¼¼¼‰ä„Á¡…¹Ñ½´½İ¹•È¸)ÍÑÉÕĞ•Í­Ñ½Á½¹ÑÉ½±1½­Õ…Éì(€€€Á…Ñ èA…Ñ¡	Õ˜°)ô()¥µÁ°É½À™½È•Í­Ñ½Á½¹ÑÉ½±1½­Õ…Éì(€€€™¸‘É½À ™µÕĞÍ•±˜¤ì(€€€€€€€±•Ğ|€ôÍÑèé™ÌèéÉ•µ½Ù•}™¥±” ™Í•±˜¹Á…Ñ ¤ì(€€€ô)ô((¼¼¼	•ÍĞµ•™™½ÉĞ±¥Ù•¹•ÍÌÁÉ½‰”µ¥ÉÉ½É¥¹œ‘…•µ½¸èéÍ•ÉÙ¥”èéÁÉ½•ÍÍ}…±¥Ù•€ƒŠP„(¼¼¼±½¬İ¡½Í”½İ¹•ÈÁ¥¥Ì½¹”¥Ì…±İ…åÌÍ…™”Ñ¼É•±…¥´É•…É‘±•ÍÌ½˜…”¸)™¸ÁÉ½•ÍÍ}…±¥Ù”¡Á¥èÔÌÈ¤€´ø‰½½°ì(€€€€m™œ¡Õ¹¥à¥t(€€€ì(€€€€€€€ÍÑèéÁÉ½•ÍÌèé½µµ…¹èé¹•Ü ‰­¥±°ˆ¤(€€€€€€€€€€€€¹…ÉÌ¡lˆ´Àˆ°€™Á¥¹Ñ½}ÍÑÉ¥¹œ ¥t¤(€€€€€€€€€€€€¹ÍÑ…ÑÕÌ ¤(€€€€€€€€€€€€¹µ…À¡ñÍÑ…ÑÕÍğÍÑ…ÑÕÌ¹ÍÕ•ÍÌ ¤¤(€€€€€€€€€€€€¹Õ¹İÉ…Á}½È¡™…±Í”¤(€€€ô(€€€€m™œ¡İ¥¹‘½İÌ¥t(€€€ì(€€€€€€€ÍÑèéÁÉ½•ÍÌèé½µµ…¹èé¹•Ü ‰Ñ…Í­±¥ÍĞˆ¤(€€€€€€€€€€€€¹…ÉÌ¡lˆ½$ˆ°€™™½Éµ…Ğ„ ‰A%•ÄíÁ¥‘ôˆ¤°€ˆ½9 ‰t¤(€€€€€€€€€€€€¹½ÕÑÁÕĞ ¤(€€€€€€€€€€€€¹µ…À¡ñ½ÕÑÁÕÑğì(€€€€€€€€€€€€€€€½ÕÑÁÕĞ¹ÍÑ…ÑÕÌ¹ÍÕ•ÍÌ ¤(€€€€€€€€€€€€€€€€€€€€˜˜MÑÉ¥¹œèé™É½µ}ÕÑ˜á}±½ÍÍä ™½ÕÑÁÕĞ¹ÍÑ‘½ÕĞ¤¹½¹Ñ…¥¹Ì ™Á¥¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€€€€€€€€€ô¤(€€€€€€€€€€€€¹Õ¹İÉ…Á}½È¡™…±Í”¤(€€€ô(€€€€m™œ¡¹½Ğ¡…¹ä¡Õ¹¥à°İ¥¹‘½İÌ¤¤¥t(€€€ì(€€€€€€€±•Ğ|€ôÁ¥ì(€€€€€€€ÑÉÕ”(€€€ô)ô()ÁÕˆÍÑÉÕĞ•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ì(€€€‰…­•¹èÉŒñ‘å¸•Í­Ñ½Á%¹ÁÕÑ	…­•¹ø°(€€€Í•µ…¹Ñ¥ŒèÉŒñ‘å¸•Í­Ñ½ÁM•µ…¹Ñ¥	…­•¹ø°(€€€Í•ÍÍ¥½¹Ìè5ÕÑ•àñ	QÉ••5…ÀñMÑÉ¥¹œ°½¹ÑÉ½±M•ÍÍ¥½¸øø°(€€€Á•¹‘¥¹œè5ÕÑ•àñ!…Í¡5…ÀñMÑÉ¥¹œ°A•¹‘¥¹½¹ÑÉ½±Ñ¥½¸øø°(€€€…Õ‘¥Ğè5ÕÑ•àñY•Œñ½µÁÕÑ•ÉÕ‘¥ÑI•½Éøø°(€€€€¼¼¼A…Ñ ½˜Ñ¡”µ…¡¥¹”µİ¥‘”•á±ÕÍ¥Ù”±½¬Ñ¡¥ÌÍÑ…Ñ”µÕÍĞ¡½±İ¡¥±”…¹ä(€€€€¼¼¼Í•ÍÍ¥½¸¥Ì…Ñ¥Ù”°½È9½¹•€Ñ¼‘¥Í…‰±”É½ÍÌµÁÉ½•ÍÌ±½­¥¹œ€¡Ñ¡”(€€€€¼¼¼Í¡…Á”•Ù•Éä¥¸µµ½‘Õ±”Ñ•ÍĞ…¹…¹äÁÕÉ”¥¸µÁÉ½•ÍÌ…±±•ÈÕÍ•Ì¤¸(€€€±½­}Á…Ñ è=ÁÑ¥½¸ñA…Ñ¡	Õ˜ø°(€€€€¼¼¼Q¡”ÕÉÉ•¹Ñ±äµ¡•±±½¬Õ…É°¥˜Ñ¡¥ÌÍÑ…Ñ”½İ¹Ì…¸…Ñ¥Ù”Í•ÍÍ¥½¸¸(€€€¡•±‘}±½¬è5ÕÑ•àñ=ÁÑ¥½¸ñ•Í­Ñ½Á½¹ÑÉ½±1½­Õ…Éøø°)ô()¥µÁ°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ì(€€€ÁÕˆ™¸ÁÉ½‘ÕÑ¥½¸ ¤€´øM•±˜ì(€€€€€€€±•Ğ‰…­•¹€ôÁÉ½‘ÕÑ¥½¹}‰…­•¹ ¤ì(€€€€€€€M•±˜èéİ¥Ñ¡}‰…­•¹‘Í}…¹‘}±½¬¡‰…­•¹¹±½¹” ¤°ÁÉ½‘ÕÑ¥½¹}Í•µ…¹Ñ¥}‰…­•¹¡‰…­•¹¤°9½¹”¤(€€€ô((€€€€¼¼¼AÉ½‘ÕÑ¥½¸‰…­•¹Á±ÕÌÑ¡”µ…¡¥¹”µİ¥‘”•á±ÕÍ¥Ù”±½¬…Ğ(€€€€¼¼¼€ñ…ÁÁ}‘…Ñ„ø½‘•Í­Ñ½Á}½¹ÑÉ½°¹±½­€°Í¼Ñ¡”±½…°Q…ÕÉ¤…ÁÀ…¹Ñ¡”(€€€€¼¼¼É•Í¥‘•¹Ğ‘…•µ½¸…¸¹•Ù•È‘É¥Ù”É•…°=L¥¹ÁÕĞ…ĞÑ¡”Í…µ”Ñ¥µ”•Ù•¸(€€€€¼¼¼Ñ¡½Õ •… ½¹ÍÑÉÕÑÌ¥ÑÌ½İ¸•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ•€¸(€€€ÁÕˆ™¸ÁÉ½‘ÕÑ¥½¹}İ¥Ñ¡}±½¬¡±½­}Á…Ñ èA…Ñ¡	Õ˜¤€´øM•±˜ì(€€€€€€€±•Ğ‰…­•¹€ôÁÉ½‘ÕÑ¥½¹}‰…­•¹ ¤ì(€€€€€€€M•±˜èéİ¥Ñ¡}‰…­•¹‘Í}…¹‘}±½¬ (€€€€€€€€€€€‰…­•¹¹±½¹” ¤°(€€€€€€€€€€€ÁÉ½‘ÕÑ¥½¹}Í•µ…¹Ñ¥}‰…­•¹¡‰…­•¹¤°(€€€€€€€€€€€M½µ”¡±½­}Á…Ñ ¤°(€€€€€€€€¤(€€€ô((€€€ÁÕˆ™¸İ¥Ñ¡}‰…­•¹¡‰…­•¹èÉŒñ‘å¸•Í­Ñ½Á%¹ÁÕÑ	…­•¹ø¤€´øM•±˜ì(€€€€€€€M•±˜èéİ¥Ñ¡}‰…­•¹‘}…¹‘}±½¬¡‰…­•¹°9½¹”¤(€€€ô((€€€ÁÕˆ™¸İ¥Ñ¡}‰…­•¹‘}…¹‘}±½¬ (€€€€€€€‰…­•¹èÉŒñ‘å¸•Í­Ñ½Á%¹ÁÕÑ	…­•¹ø°(€€€€€€€±½­}Á…Ñ è=ÁÑ¥½¸ñA…Ñ¡	Õ˜ø°(€€€€¤€´øM•±˜ì(€€€€€€€M•±˜èéİ¥Ñ¡}‰…­•¹‘Í}…¹‘}±½¬¡‰…­•¹°ÉŒèé¹•Ü¡9Õ±±M•µ…¹Ñ¥	…­•¹¤°±½­}Á…Ñ ¤(€€€ô((€€€ÁÕˆ™¸İ¥Ñ¡}‰…­•¹‘Í}…¹‘}±½¬ (€€€€€€€‰…­•¹èÉŒñ‘å¸•Í­Ñ½Á%¹ÁÕÑ	…­•¹ø°(€€€€€€€Í•µ…¹Ñ¥ŒèÉŒñ‘å¸•Í­Ñ½ÁM•µ…¹Ñ¥	…­•¹ø°(€€€€€€€±½­}Á…Ñ è=ÁÑ¥½¸ñA…Ñ¡	Õ˜ø°(€€€€¤€´øM•±˜ì(€€€€€€€M•±˜ì(€€€€€€€€€€€‰…­•¹°(€€€€€€€€€€€Í•µ…¹Ñ¥Œ°(€€€€€€€€€€€Í•ÍÍ¥½¹Ìè5ÕÑ•àèé¹•Ü¡	QÉ••5…Àèé¹•Ü ¤¤°(€€€€€€€€€€€Á•¹‘¥¹œè5ÕÑ•àèé¹•Ü¡!…Í¡5…Àèé¹•Ü ¤¤°(€€€€€€€€€€€…Õ‘¥Ğè5ÕÑ•àèé¹•Ü¡Y•Œèé¹•Ü ¤¤°(€€€€€€€€€€€±½­}Á…Ñ °(€€€€€€€€€€€¡•±‘}±½¬è5ÕÑ•àèé¹•Ü¡9½¹”¤°(€€€€€€€ô(€€€ô((€€€€¼¼¼ÅÕ¥É”Ñ¡”µ…¡¥¹”µİ¥‘”±½¬‰•™½É”„Í•ÍÍ¥½¸µ…ä‰”É•…Ñ•¸¹¼µ½À(€€€€¼¼¼İ¡•¸É½ÍÌµÁÉ½•ÍÌ±½­¥¹œ¥Ì‘¥Í…‰±•€¡±½­}Á…Ñ¡€¥Ì9½¹•€¤½Èİ¡•¸(€€€€¼¼¼Ñ¡¥ÌÍÑ…Ñ”…±É•…‘ä½İ¹ÌÑ¡”±½¬€¡„Í•½¹½¹ÕÉÉ•¹ĞÍ•ÍÍ¥½¸¥¸Ñ¡”(€€€€¼¼¼Í…µ”ÁÉ½•ÍÌ¥Ì™¥¹”ƒŠPÑ¡”¥¹Ù…É¥…¹Ğ¥Ì½¹”€©½¹ÑÉ½±±•ÈÁÉ½•ÍÌ¨…Ğ„(€€€€¼¼¼Ñ¥µ”¤¸±½¬¡•±‰ä„±¥Ù”°É••¹ĞÁÉ½•ÍÌÉ•™ÕÍ•ÌÑ¡”ÍÑ…ÉĞ¸(€€€™¸…ÅÕ¥É•}±½¬ ™Í•±˜¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€±•ĞM½µ”¡Á…Ñ ¤€ôÍ•±˜¹±½­}Á…Ñ ¹…Í}É•˜ ¤•±Í”ì(€€€€€€€€€€€É•ÑÕÉ¸=¬  ¤¤ì(€€€€€€€ôì(€€€€€€€±•ĞµÕĞ¡•±€ô±½¬ ™Í•±˜¹¡•±‘}±½¬°€‰‘•Í­Ñ½À½¹ÑÉ½°±½¬ˆ¤üì(€€€€€€€¥˜¡•±¹¥Í}Í½µ” ¤ì(€€€€€€€€€€€É•ÑÕÉ¸=¬  ¤¤ì(€€€€€€€ô(€€€€€€€¥˜±•ĞM½µ”¡Á…É•¹Ğ¤€ôÁ…Ñ ¹Á…É•¹Ğ ¤ì(€€€€€€€€€€€ÍÑèé™ÌèéÉ•…Ñ•}‘¥É}…±°¡Á…É•¹Ğ¤¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğì(€€€€€€€€€€€€€€€™½Éµ…Ğ„ ‰½Õ±¹½ĞÁÉ•Á…É”‘•Í­Ñ½Àµ½¹ÑÉ½°±½¬‘¥É•Ñ½Éäèí•ÉÉ½Éôˆ¤(€€€€€€€€€€€ô¤üì(€€€€€€€ô(€€€€€€€€¼¼=¹”É•±…¥´…ÑÑ•µÁĞè¥˜Ñ¡”•á¥ÍÑ¥¹œ±½¬¥ÌÍÑ…±”€¡‘•…½İ¹•È½È(€€€€€€€€¼¼½±‘•ÈÑ¡…¸MQ1}1=-}5L¤É•µ½Ù”¥Ğ…¹É•ÑÉäÑ¡”É•…Ñ”µ¹•Ü¸(€€€€€€€™½È…ÑÑ•µÁĞ¥¸€À¸¸Èì(€€€€€€€€€€€µ…Ñ ÍÑèé™Ìèé=Á•¹=ÁÑ¥½¹Ìèé¹•Ü ¤(€€€€€€€€€€€€€€€€¹İÉ¥Ñ”¡ÑÉÕ”¤(€€€€€€€€€€€€€€€€¹É•…Ñ•}¹•Ü¡ÑÉÕ”¤(€€€€€€€€€€€€€€€€¹½Á•¸¡Á…Ñ ¤(€€€€€€€€€€€ì(€€€€€€€€€€€€€€€=¬¡µÕĞ™¥±”¤€ôøì(€€€€€€€€€€€€€€€€€€€±•Ğ½¹Ñ•¹ÑÌ€ô1½­½¹Ñ•¹ÑÌì(€€€€€€€€€€€€€€€€€€€€€€€Á¥èÍÑèéÁÉ½•ÍÌèé¥ ¤°(€€€€€€€€€€€€€€€€€€€€€€€…ÅÕ¥É•‘}…Ñ}µÌè¹½İ}µÌ ¤°(€€€€€€€€€€€€€€€€€€€ôì(€€€€€€€€€€€€€€€€€€€±•Ğ‰åÑ•Ì€ôÍ•É‘•}©Í½¸èéÑ½}Ù•Œ ™½¹Ñ•¹ÑÌ¤¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğì(€€€€€€€€€€€€€€€€€€€€€€€™½Éµ…Ğ„ ‰½Õ±¹½Ğ•¹½‘”‘•Í­Ñ½Àµ½¹ÑÉ½°±½¬èí•ÉÉ½Éôˆ¤(€€€€€€€€€€€€€€€€€€€ô¤üì(€€€€€€€€€€€€€€€€€€€™¥±”¹İÉ¥Ñ•}…±° ™‰åÑ•Ì¤¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğì(€€€€€€€€€€€€€€€€€€€€€€€™½Éµ…Ğ„ ‰½Õ±¹½ĞİÉ¥Ñ”‘•Í­Ñ½Àµ½¹ÑÉ½°±½¬èí•ÉÉ½Éôˆ¤(€€€€€€€€€€€€€€€€€€€ô¤üì(€€€€€€€€€€€€€€€€€€€™¥±”¹Íå¹}…±° ¤¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğì(€€€€€€€€€€€€€€€€€€€€€€€™½Éµ…Ğ„ ‰½Õ±¹½ĞÁ•ÉÍ¥ÍĞ‘•Í­Ñ½Àµ½¹ÑÉ½°±½¬èí•ÉÉ½Éôˆ¤(€€€€€€€€€€€€€€€€€€€ô¤üì(€€€€€€€€€€€€€€€€€€€€©¡•±€ôM½µ”¡•Í­Ñ½Á½¹ÑÉ½±1½­Õ…ÉìÁ…Ñ èÁ…Ñ ¹±½¹” ¤ô¤ì(€€€€€€€€€€€€€€€€€€€É•ÑÕÉ¸=¬  ¤¤ì(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€ÉÈ¡•ÉÉ½È¤¥˜•ÉÉ½È¹­¥¹ ¤€ôôÍÑèé¥¼èéÉÉ½É-¥¹èé±É•…‘åá¥ÍÑÌ€ôøì(€€€€€€€€€€€€€€€€€€€¥˜…ÑÑ•µÁĞ€ôô€À€˜˜Í•±˜¹É•±…¥µ}¥™}ÍÑ…±”¡Á…Ñ ¤ì(€€€€€€€€€€€€€€€€€€€€€€€½¹Ñ¥¹Õ”ì(€€€€€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€€€€€É•ÑÕÉ¸ÉÈ (€€€€€€€€€€€€€€€€€€€€€€€€‰¹½Ñ¡•È½¹ÑÉ½°Í•ÍÍ¥½¸¥Ì…±É•…‘ä…Ñ¥Ù”½¸Ñ¡¥Ìµ…¡¥¹”ƒŠPÍÑ½À¥Ğp(€€€€€€€€€€€€€€€€€€€€€€€€€¡½Èİ…¥Ğ™½È¥ĞÑ¼•áÁ¥É”¤‰•™½É”ÍÑ…ÉÑ¥¹œ„¹•Ü½¹”ˆ(€€€€€€€€€€€€€€€€€€€€€€€€€€€€¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€€€€€€¤ì(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€ÉÈ¡•ÉÉ½È¤€ôøì(€€€€€€€€€€€€€€€€€€€É•ÑÕÉ¸ÉÈ¡™½Éµ…Ğ„ ‰½Õ±¹½ĞÉ•…Ñ”‘•Í­Ñ½Àµ½¹ÑÉ½°±½¬èí•ÉÉ½Éôˆ¤¤ì(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€ô(€€€€€€€ô(€€€€€€€ÉÈ (€€€€€€€€€€€€‰¹½Ñ¡•È½¹ÑÉ½°Í•ÍÍ¥½¸¥Ì…±É•…‘ä…Ñ¥Ù”½¸Ñ¡¥Ìµ…¡¥¹”ƒŠPÍÑ½À¥Ğ€¡½Èİ…¥Ğ™½Èp(€€€€€€€€€€€€¥ĞÑ¼•áÁ¥É”¤‰•™½É”ÍÑ…ÉÑ¥¹œ„¹•Ü½¹”ˆ(€€€€€€€€€€€€€€€€¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€¤(€€€ô((€€€€¼¼¼I•ÑÕÉ¹ÌÑÉÕ•€€¡¡…Ù¥¹œÉ•µ½Ù•Ñ¡”™¥±”¤İ¡•¸Ñ¡”½¸µ‘¥Í¬±½¬¥ÌÍÑ…±”(€€€€¼¼¼ƒŠPÕ¹É•…‘…‰±”°½İ¹•‰ä„‘•…Á¥°½È½±‘•ÈÑ¡…¸mMQ1}1=-}5Mt¸(€€€™¸É•±…¥µ}¥™}ÍÑ…±” ™Í•±˜°Á…Ñ è€™ÍÑèéÁ…Ñ èéA…Ñ ¤€´ø‰½½°ì(€€€€€€€±•ĞÍÑ…±”€ôµ…Ñ ÍÑèé™ÌèéÉ•…¡Á…Ñ ¤ì(€€€€€€€€€€€=¬¡‰åÑ•Ì¤€ôøµ…Ñ Í•É‘•}©Í½¸èé™É½µ}Í±¥”èèñ1½­½¹Ñ•¹ÑÌø ™‰åÑ•Ì¤ì(€€€€€€€€€€€€€€€=¬¡½¹Ñ•¹ÑÌ¤€ôøì(€€€€€€€€€€€€€€€€€€€¹½İ}µÌ ¤¹Í…ÑÕÉ…Ñ¥¹}ÍÕˆ¡½¹Ñ•¹ÑÌ¹…ÅÕ¥É•‘}…Ñ}µÌ¤€øMQ1}1=-}5L(€€€€€€€€€€€€€€€€€€€€€€€ñğ€…ÁÉ½•ÍÍ}…±¥Ù”¡½¹Ñ•¹ÑÌ¹Á¥¤(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€€¼¼½ÉÉÕÁĞ½Á…ÉÑ¥…°±½¬™¥±”…¹¹½ĞÉ•ÁÉ•Í•¹Ğ„±¥Ù”½İ¹•È¸(€€€€€€€€€€€€€€€ÉÈ¡|¤€ôøÑÉÕ”°(€€€€€€€€€€€ô°(€€€€€€€€€€€ÉÈ¡|¤€ôøÑÉÕ”°(€€€€€€€ôì(€€€€€€€¥˜ÍÑ…±”ì(€€€€€€€€€€€±•Ğ|€ôÍÑèé™ÌèéÉ•µ½Ù•}™¥±”¡Á…Ñ ¤ì(€€€€€€€ô(€€€€€€€ÍÑ…±”(€€€ô((€€€€¼¼¼É½ÀÑ¡”¡•±±½¬½¹”¹¼Í•ÍÍ¥½¸¥¸Ñ¡¥ÌÍÑ…Ñ”¥Ì…Ñ¥Ù”…¹äµ½É”¸(€€€™¸É•±•…Í•}±½­}¥™}¥‘±” ™Í•±˜¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€¥˜Í•±˜¹±½­}Á…Ñ ¹¥Í}¹½¹” ¤ì(€€€€€€€€€€€É•ÑÕÉ¸=¬  ¤¤ì(€€€€€€€ô(€€€€€€€±•Ğ…¹å}…Ñ¥Ù”€ô±½¬ ™Í•±˜¹Í•ÍÍ¥½¹Ì°€‰½¹ÑÉ½°Í•ÍÍ¥½¹Ìˆ¤ü(€€€€€€€€€€€€¹Ù…±Õ•Ì ¤(€€€€€€€€€€€€¹…¹ä¡ñÍ•ÍÍ¥½¹ğÍ•ÍÍ¥½¸¹…Ñ¥Ù”¤ì(€€€€€€€¥˜€……¹å}…Ñ¥Ù”ì(€€€€€€€€€€€€©±½¬ ™Í•±˜¹¡•±‘}±½¬°€‰‘•Í­Ñ½À½¹ÑÉ½°±½¬ˆ¤ü€ô9½¹”ì(€€€€€€€ô(€€€€€€€=¬  ¤¤(€€€ô((€€€€¼¼¼½É”Í•ÍÍ¥½¸µÍÑ…ÉĞ±½¥Œ°‘•±¥‰•É…Ñ•±äÑ…­¥¹œÑ¡”…±±•ÈÌÕÉÉ•¹Ğ(€€€€¼¼¼Á•Éµ¥ÍÍ¥½¸µ½‘”…Ì„Á±…¥¸€™ÍÑÉ€É…Ñ¡•ÈÑ¡…¸É•…¡¥¹œ™½È(€€€€¼¼¼Ñ…ÕÉ¤èéMÑ…Ñ”ñÁÁMÑ…Ñ”ù€¥ÑÍ•±˜ƒŠPÑ¡¥Ì¥ÌÑ¡”¡…É¥¹Ù…É¥…¹Ğ(€€€€¼¼¼€ ‰¹•Ù•ÈÉ•…¡…‰±”™É½´‰åÁ…ÍÌ°¹¼•á•ÁÑ¥½¹Ìˆ¤…¹¥ĞµÕÍĞ‰”(€€€€¼¼¼‘¥É•Ñ±äÑ•ÍÑ…‰±”İ¥Ñ „‰…É”ÍÑÉ¥¹œ°¹½Ğ½¹±äÑ¡É½Õ „™Õ±°Q…ÕÉ¤(€€€€¼¼¼½µµ…¹¸Q¡”€mÑ…ÕÉ¤èé½µµ…¹‘u€İÉ…ÁÁ•È‰•±½Ü¥Ìİ¡…Ğ…ÑÕ…±±ä(€€€€¼¼¼É•Í½±Ù•ÌÑ¡”±¥Ù”µ½‘”Ù¥„Á•Éµ¥ÍÍ¥½¹Ìèé•Ñ}Á•Éµ¥ÍÍ¥½¹}µ½‘•€¸(€€€ÁÕˆ™¸ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° (€€€€€€€€™Í•±˜°(€€€€€€€Á•Éµ¥ÍÍ¥½¹}µ½‘”è€™ÍÑÈ°(€€€€€€€…±±½İ•‘}…ÁÁ±¥…Ñ¥½¹ÌèY•ŒñMÑÉ¥¹œø°(€€€€€€€±¥™•Ñ¥µ•}µÌèÔØĞ°(€€€€€€€…ÁÁÉ½Ù•‘}‰…Ñ è‰½½°°(€€€€¤€´øI•ÍÕ±Ğñ½¹ÑÉ½±M•ÍÍ¥½¸°MÑÉ¥¹œøì(€€€€€€€Í•±˜¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}İ¥Ñ¡}½ÁÑ¥½¹Ì (€€€€€€€€€€€Á•Éµ¥ÍÍ¥½¹}µ½‘”°(€€€€€€€€€€€…±±½İ•‘}…ÁÁ±¥…Ñ¥½¹Ì°(€€€€€€€€€€€±¥™•Ñ¥µ•}µÌ°(€€€€€€€€€€€M•ÍÍ¥½¹É…¹Ñ=ÁÑ¥½¹Ìèé™½É}±•…ä¡…ÁÁÉ½Ù•‘}‰…Ñ ¤°(€€€€€€€€¤(€€€ô((€€€ÁÕˆ™¸ÍÑ…ÉÑ}Í•ÍÍ¥½¹}İ¥Ñ¡}½ÁÑ¥½¹Ì (€€€€€€€€™Í•±˜°(€€€€€€€Á•Éµ¥ÍÍ¥½¹}µ½‘”è€™ÍÑÈ°(€€€€€€€…±±½İ•‘}…ÁÁ±¥…Ñ¥½¹ÌèY•ŒñMÑÉ¥¹œø°(€€€€€€€±¥™•Ñ¥µ•}µÌèÔØĞ°(€€€€€€€½ÁÑ¥½¹ÌèM•ÍÍ¥½¹É…¹Ñ=ÁÑ¥½¹Ì°(€€€€¤€´øI•ÍÕ±Ğñ½¹ÑÉ½±M•ÍÍ¥½¸°MÑÉ¥¹œøì(€€€€€€€¥˜Á•Éµ¥ÍÍ¥½¹}µ½‘”€ôô€‰‰åÁ…ÍÌˆì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ (€€€€€€€€€€€€€€€€‰M…™”•Í­Ñ½À½¹ÑÉ½°…¸¹•Ù•È‰”ÍÑ…ÉÑ•İ¡¥±”Á•Éµ¥ÍÍ¥½¸µ½‘”¥Ì‰åÁ…ÍÌƒŠPp(€€€€€€€€€€€€€€€€Íİ¥Ñ Ñ¼„…Ñ•µ½‘”€¡µ…¹Õ…°°…•ÁÑ‘¥ÑÌ°Á±…¸°…ÕÑ¼°½ÈÍµ…ÉĞ¤™¥ÉÍĞˆ(€€€€€€€€€€€€€€€€€€€€¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€¤ì(€€€€€€€ô(€€€€€€€¥˜…±±½İ•‘}…ÁÁ±¥…Ñ¥½¹Ì¹¥Í}•µÁÑä ¤ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ (€€€€€€€€€€€€€€€€‰M…™”•Í­Ñ½À½¹ÑÉ½°É•ÅÕ¥É•Ì…Ğ±•…ÍĞ½¹”…±±½İ•…ÁÁ±¥…Ñ¥½¸½İ¥¹‘½ÜƒŠP…¸p(€€€€€€€€€€€€€€€€•µÁÑä…±±½İ±¥ÍĞİ½Õ±µ•…¸Ñ¡”Í•ÍÍ¥½¸½Õ±…Ğ…¹åİ¡•É”ˆ(€€€€€€€€€€€€€€€€€€€€¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€¤ì(€€€€€€€ô(€€€€€€€¥˜…±±½İ•‘}…ÁÁ±¥…Ñ¥½¹Ì¹±•¸ ¤€ø€ØĞì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰M…™”•Í­Ñ½À½¹ÑÉ½°…±±½İ±¥ÍĞ¥Ì±¥µ¥Ñ•Ñ¼€ØĞ•¹ÑÉ¥•Ìˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€™½È…ÁÁ±¥…Ñ¥½¹}¥¥¸€™…±±½İ•‘}…ÁÁ±¥…Ñ¥½¹Ìì(€€€€€€€€€€€Ù…±¥‘…Ñ•}…ÁÁ±¥…Ñ¥½¹}¥¡…ÁÁ±¥…Ñ¥½¹}¥¤üì(€€€€€€€ô(€€€€€€€¥˜½ÁÑ¥½¹Ì¹…±±½İ•‘}İ¥¹‘½İÌ¹±•¸ ¤€ø€ØĞì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ (€€€€€€€€€€€€€€€€‰M…™”•Í­Ñ½À½¹ÑÉ½°İ¥¹‘½Ü…±±½İ±¥ÍĞ¥Ì±¥µ¥Ñ•Ñ¼€ØĞ•¹ÑÉ¥•Ìˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€¤ì(€€€€€€€ô(€€€€€€€™½Èİ¥¹‘½İ}¥¥¸€™½ÁÑ¥½¹Ì¹…±±½İ•‘}İ¥¹‘½İÌì(€€€€€€€€€€€Ù…±¥‘…Ñ•}…ÁÁ±¥…Ñ¥½¹}¥¡İ¥¹‘½İ}¥¤üì(€€€€€€€ô(€€€€€€€¥˜±¥™•Ñ¥µ•}µÌ€ôô€Àñğ±¥™•Ñ¥µ•}µÌ€ø5a}MMM%=9}1%Q%5}5Lì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ¡™½Éµ…Ğ„ (€€€€€€€€€€€€€€€€‰M•ÍÍ¥½¸±¥™•Ñ¥µ”µÕÍĞ‰”‰•Ñİ••¸€ÄµÌ…¹í5a}MMM%=9}1%Q%5}5MôµÌˆ(€€€€€€€€€€€€¤¤ì(€€€€€€€ô(€€€€€€€€¼¼ÅÕ¥É”Ñ¡”µ…¡¥¹”µİ¥‘”•á±ÕÍ¥Ù”±½¬‰•™½É”„Í•ÍÍ¥½¸•á¥ÍÑÌ°Í¼(€€€€€€€€¼¼„É•™ÕÍ•ÍÑ…ÉĞ¹•Ù•È±•…Ù•Ì„¡…±˜µÉ•…Ñ•Í•ÍÍ¥½¸‰•¡¥¹¸(€€€€€€€Í•±˜¹…ÅÕ¥É•}±½¬ ¤üì(€€€€€€€±•ĞÉ•…Ñ•‘}…Ñ}µÌ€ô¹½İ}µÌ ¤ì(€€€€€€€±•Ğ…ÁÁÉ½Ù…±}Á½±¥ä€ô½ÁÑ¥½¹Ì¹…ÁÁÉ½Ù…±}Á½±¥ä¹Õ¹İÉ…Á}½È¡ÁÁÉ½Ù…±A½±¥äèéA•ÉÑ¥½¸¤ì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ô½¹ÑÉ½±M•ÍÍ¥½¸ì(€€€€€€€€€€€Í•ÍÍ¥½¹}¥è™½Éµ…Ğ„ ‰‘•Í­Ñ½Àµ½¹ÑÉ½°µíôˆ°UÕ¥èé¹•İ}ØĞ ¤¤°(€€€€€€€€€€€…±±½İ•‘}…ÁÁ±¥…Ñ¥½¹Ì°(€€€€€€€€€€€…±±½İ•‘}İ¥¹‘½İÌè½ÁÑ¥½¹Ì¹…±±½İ•‘}İ¥¹‘½İÌ°(€€€€€€€€€€€É•…Ñ•‘}…Ñ}µÌ°(€€€€€€€€€€€•áÁ¥É•Í}…Ñ}µÌèÉ•…Ñ•‘}…Ñ}µÌ¹Í…ÑÕÉ…Ñ¥¹}…‘¡±¥™•Ñ¥µ•}µÌ¤°(€€€€€€€€€€€…Ñ¥Ù”èÑÉÕ”°(€€€€€€€€€€€Á…ÕÍ•è™…±Í”°(€€€€€€€€€€€¥¹‘¥…Ñ½É}Ù¥Í¥‰±”èÑÉÕ”°(€€€€€€€€€€€…ÁÁÉ½Ù•‘}‰…Ñ èµ…Ñ¡•Ì„¡…ÁÁÉ½Ù…±}Á½±¥ä°ÁÁÉ½Ù…±A½±¥äèéÁÁÉ½Ù•‘	…Ñ ¤°(€€€€€€€€€€€…ÁÁÉ½Ù…±}Á½±¥ä°(€€€€€€€€€€€…±±½İ}ÍÉ••¹Í¡½ÑÌè½ÁÑ¥½¹Ì¹…±±½İ}ÍÉ••¹Í¡½ÑÌ°(€€€€€€€€€€€…±±½İ}­•å‰½…É‘}¥¹ÁÕĞè½ÁÑ¥½¹Ì¹…±±½İ}­•å‰½…É‘}¥¹ÁÕĞ°(€€€€€€€€€€€…±±½İ}±¥Á‰½…É‘}É•…è½ÁÑ¥½¹Ì¹…±±½İ}±¥Á‰½…É‘}É•…°(€€€€€€€ôì(€€€€€€€±½¬ ™Í•±˜¹Í•ÍÍ¥½¹Ì°€‰½¹ÑÉ½°Í•ÍÍ¥½¹Ìˆ¤ü(€€€€€€€€€€€€¹¥¹Í•ÉĞ¡Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥¹±½¹” ¤°Í•ÍÍ¥½¸¹±½¹” ¤¤ì(€€€€€€€=¬¡Í•ÍÍ¥½¸¤(€€€ô((€€€€¼¼¼•…Ñ¥Ù…Ñ•Ì½¹”Í•ÍÍ¥½¸…¹‘•¹¥•Ì…¹ä½˜¥ÑÌÍÑ¥±°µÁ•¹‘¥¹œ…Ñ¥½¹Ì¸(€€€€¼¼¼I•ÑÕÉ¹Ìİ¡•Ñ¡•ÈÑ¡”Í•ÍÍ¥½¸İ…Ì…Ñ¥Ù”‰•™½É”Ñ¡¥Ì…±°€¡Í¼„…±±•È(€€€€¼¼¼…¸Ñ•±°€‰ÍÑ½ÁÁ•Í½µ•Ñ¡¥¹œˆ™É½´€‰İ…Ì…±É•…‘äÍÑ½ÁÁ•½Õ¹­¹½İ¸ˆ¤¸(€€€ÁÕˆ™¸ÍÑ½Á}Í•ÍÍ¥½¸ ™Í•±˜°Í•ÍÍ¥½¹}¥è€™ÍÑÈ¤€´øI•ÍÕ±Ğñ‰½½°°MÑÉ¥¹œøì(€€€€€€€±•Ğİ…Í}…Ñ¥Ù”€ô±½¬ ™Í•±˜¹Í•ÍÍ¥½¹Ì°€‰½¹ÑÉ½°Í•ÍÍ¥½¹Ìˆ¤ü(€€€€€€€€€€€€¹•Ñ}µÕĞ¡Í•ÍÍ¥½¹}¥¤(€€€€€€€€€€€€¹µ…À¡ñÍ•ÍÍ¥½¹ğì(€€€€€€€€€€€€€€€±•Ğİ…Í}…Ñ¥Ù”€ôÍ•ÍÍ¥½¸¹…Ñ¥Ù”ì(€€€€€€€€€€€€€€€Í•ÍÍ¥½¸¹…Ñ¥Ù”€ô™…±Í”ì(€€€€€€€€€€€€€€€İ…Í}…Ñ¥Ù”(€€€€€€€€€€€ô¤(€€€€€€€€€€€€¹Õ¹İÉ…Á}½È¡™…±Í”¤ì(€€€€€€€Í•±˜¹‘•¹å}Á•¹‘¥¹}™½É}Í•ÍÍ¥½¸¡Í•ÍÍ¥½¹}¥¤üì(€€€€€€€Í•±˜¹É•±•…Í•}±½­}¥™}¥‘±” ¤üì(€€€€€€€=¬¡İ…Í}…Ñ¥Ù”¤(€€€ô((€€€ÁÕˆ™¸Á…ÕÍ•}Í•ÍÍ¥½¸ ™Í•±˜°Í•ÍÍ¥½¹}¥è€™ÍÑÈ°Á…ÕÍ•è‰½½°¤€´øI•ÍÕ±Ğñ‰½½°°MÑÉ¥¹œøì(€€€€€€€±•Ğ¡…¹•€ô±½¬ ™Í•±˜¹Í•ÍÍ¥½¹Ì°€‰½¹ÑÉ½°Í•ÍÍ¥½¹Ìˆ¤ü(€€€€€€€€€€€€¹•Ñ}µÕĞ¡Í•ÍÍ¥½¹}¥¤(€€€€€€€€€€€€¹µ…À¡ñÍ•ÍÍ¥½¹ğì(€€€€€€€€€€€€€€€±•Ğ¡…¹•€ôÍ•ÍÍ¥½¸¹…Ñ¥Ù”€˜˜Í•ÍÍ¥½¸¹Á…ÕÍ•€„ôÁ…ÕÍ•ì(€€€€€€€€€€€€€€€¥˜¡…¹•ì(€€€€€€€€€€€€€€€€€€€Í•ÍÍ¥½¸¹Á…ÕÍ•€ôÁ…ÕÍ•ì(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€¡…¹•(€€€€€€€€€€€ô¤(€€€€€€€€€€€€¹Õ¹İÉ…Á}½È¡™…±Í”¤ì(€€€€€€€¥˜Á…ÕÍ•ì(€€€€€€€€€€€Í•±˜¹‘•¹å}Á•¹‘¥¹}™½É}Í•ÍÍ¥½¸¡Í•ÍÍ¥½¹}¥¤üì(€€€€€€€ô(€€€€€€€=¬¡¡…¹•¤(€€€ô((€€€€¼¼¼I•…µ½¹±äÍ¹…ÁÍ¡½Ğ™½ÈÑ¡”M•ÑÑ¥¹ÌÁ…¹•°°İ¥Ñ ±…é¥±äµ•áÁ¥É•(€€€€¼¼¼Í•ÍÍ¥½¹ÌÉ•™±•Ñ•¥¸Ñ¡”É•ÑÕÉ¹•½ÁäƒŠPµ¥ÉÉ½ÉÌ(€€€€¼¼¼´İ}½µÁ…¹¥½¸èé4İ½µÁ…¹¥½¹MÑ…Ñ”èéÍ•ÕÉ¥Ñå}É…¹ÑÍ€Ì€‰É•™±•Ğ(€€€€¼¼¼•áÁ¥É…Ñ¥½¸İ¥Ñ¡½ÕĞµÕÑ…Ñ¥¹œ½¸„É•…ˆ‰•¡…Ù¥½È¸(€€€ÁÕˆ™¸Í•ÍÍ¥½¹Í}Í¹…ÁÍ¡½Ğ ™Í•±˜¤€´øI•ÍÕ±ĞñY•Œñ½¹ÑÉ½±M•ÍÍ¥½¸ø°MÑÉ¥¹œøì(€€€€€€€±•Ğ¹½Ü€ô¹½İ}µÌ ¤ì(€€€€€€€=¬¡±½¬ ™Í•±˜¹Í•ÍÍ¥½¹Ì°€‰½¹ÑÉ½°Í•ÍÍ¥½¹Ìˆ¤ü(€€€€€€€€€€€€¹Ù…±Õ•Ì ¤(€€€€€€€€€€€€¹±½¹• ¤(€€€€€€€€€€€€¹µ…À¡ñµÕĞÍ•ÍÍ¥½¹ğì(€€€€€€€€€€€€€€€¥˜Í•ÍÍ¥½¸¹•áÁ¥É•Í}…Ñ}µÌ€ğô¹½Üì(€€€€€€€€€€€€€€€€€€€Í•ÍÍ¥½¸¹…Ñ¥Ù”€ô™…±Í”ì(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€Í•ÍÍ¥½¸(€€€€€€€€€€€ô¤(€€€€€€€€€€€€¹½±±•Ğ ¤¤(€€€ô((€€€€¼¼¼I•ÑÕÉ¹Ìİ¡•Ñ¡•È…¹äÍ•ÍÍ¥½¸¥ÌÍÑ¥±°…Ñ¥Ù”ƒŠPÕÍ•Ñ¼‘•¥‘”İ¡•Ñ¡•È(€€€€¼¼¼Ñ¡”Ù¥Í¥‰±”¥¹‘¥…Ñ½ÈÍ¡½Õ±­••ÀÍ¡½İ¥¹œ¸(€€€ÁÕˆ™¸…¹å}Í•ÍÍ¥½¹}…Ñ¥Ù” ™Í•±˜¤€´øI•ÍÕ±Ğñ‰½½°°MÑÉ¥¹œøì(€€€€€€€=¬¡Í•±˜(€€€€€€€€€€€€¹Í•ÍÍ¥½¹Í}Í¹…ÁÍ¡½Ğ ¤ü(€€€€€€€€€€€€¹¥Ñ•È ¤(€€€€€€€€€€€€¹…¹ä¡ñÍ•ÍÍ¥½¹ğÍ•ÍÍ¥½¸¹…Ñ¥Ù”¤¤(€€€ô((€€€™¸…Ñ¥Ù•}Í•ÍÍ¥½¸ ™Í•±˜°Í•ÍÍ¥½¹}¥è€™ÍÑÈ¤€´øI•ÍÕ±Ğñ½¹ÑÉ½±M•ÍÍ¥½¸°MÑÉ¥¹œøì(€€€€€€€±•Ğ¹½Ü€ô¹½İ}µÌ ¤ì(€€€€€€€±•ĞµÕĞÍ•ÍÍ¥½¹Ì€ô±½¬ ™Í•±˜¹Í•ÍÍ¥½¹Ì°€‰½¹ÑÉ½°Í•ÍÍ¥½¹Ìˆ¤üì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍ•ÍÍ¥½¹Ì(€€€€€€€€€€€€¹•Ñ}µÕĞ¡Í•ÍÍ¥½¹}¥¤(€€€€€€€€€€€€¹½­}½É}•±Í”¡ñğ€‰½¹ÑÉ½°Í•ÍÍ¥½¸¥Ìµ¥ÍÍ¥¹œ½Èİ…ÌÍÑ½ÁÁ•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤üì(€€€€€€€¥˜Í•ÍÍ¥½¸¹•áÁ¥É•Í}…Ñ}µÌ€ğô¹½Üì(€€€€€€€€€€€Í•ÍÍ¥½¸¹…Ñ¥Ù”€ô™…±Í”ì(€€€€€€€ô(€€€€€€€¥˜€…Í•ÍÍ¥½¸¹…Ñ¥Ù”ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰½¹ÑÉ½°Í•ÍÍ¥½¸¥Ì¥¹…Ñ¥Ù”½È•áÁ¥É•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€¥˜Í•ÍÍ¥½¸¹Á…ÕÍ•ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰½¹ÑÉ½°Í•ÍÍ¥½¸¥ÌÁ…ÕÍ•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€=¬¡Í•ÍÍ¥½¸¹±½¹” ¤¤(€€€ô((€€€ÁÕˆ™¸±¥ÍÑ}Ñ…É•ÑÍ}™½É}Í•ÍÍ¥½¸ (€€€€€€€€™Í•±˜°(€€€€€€€Í•ÍÍ¥½¹}¥è€™ÍÑÈ°(€€€€¤€´øI•ÍÕ±ĞñY•Œñ½µÁÕÑ•ÉQ…É•Ğø°MÑÉ¥¹œøì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍ•±˜¹…Ñ¥Ù•}Í•ÍÍ¥½¸¡Í•ÍÍ¥½¹}¥¤üì(€€€€€€€±•ĞµÕĞÑ…É•ÑÌ€ôÍ•±˜¹Í•µ…¹Ñ¥Œ¹±¥ÍÑ}Ñ…É•ÑÌ ¤üì(€€€€€€€Ñ…É•ÑÌ¹É•Ñ…¥¸¡ñÑ…É•Ñğì(€€€€€€€€€€€€…Ñ…É•Ñ}¥Í}Í•¹Í¥Ñ¥Ù”¡Ñ…É•Ğ¤(€€€€€€€€€€€€€€€€˜˜Í•ÍÍ¥½¸¹…±±½İ•‘}…ÁÁ±¥…Ñ¥½¹Ì¹¥Ñ•È ¤¹…¹ä¡ñ…±±½İ•‘ğì(€€€€€€€€€€€€€€€€€€€…±±½İ•€ôô€™Ñ…É•Ğ¹…ÁÁ±¥…Ñ¥½¹}¥(€€€€€€€€€€€€€€€€€€€€€€€ñğ…±±½İ•€ôô€™Ñ…É•Ğ¹…ÁÁ±¥…Ñ¥½¹}¹…µ”(€€€€€€€€€€€€€€€€€€€€€€€ñğ…±±½İ•€ôô€™Ñ…É•Ğ¹Ñ…É•Ñ}¥(€€€€€€€€€€€€€€€ô¤(€€€€€€€€€€€€€€€€˜˜€¡Í•ÍÍ¥½¸¹…±±½İ•‘}İ¥¹‘½İÌ¹¥Í}•µÁÑä ¤(€€€€€€€€€€€€€€€€€€€ñğÍ•ÍÍ¥½¸¹…±±½İ•‘}İ¥¹‘½İÌ¹¥Ñ•È ¤¹…¹ä¡ñ…±±½İ•‘ğì(€€€€€€€€€€€€€€€€€€€€€€€…±±½İ•€ôô€™Ñ…É•Ğ¹İ¥¹‘½İ}¥ñğ…±±½İ•€ôô€™Ñ…É•Ğ¹Ñ…É•Ñ}¥(€€€€€€€€€€€€€€€€€€€ô¤¤(€€€€€€€ô¤ì(€€€€€€€Ñ…É•ÑÌ¹ÑÉÕ¹…Ñ”¡5a}QIQL¤ì(€€€€€€€=¬¡Ñ…É•ÑÌ¤(€€€ô((€€€ÁÕˆ™¸¥¹ÍÁ•Ñ}™½É}Í•ÍÍ¥½¸ (€€€€€€€€™Í•±˜°(€€€€€€€Í•ÍÍ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€ÅÕ•Éäè=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€¤€´øI•ÍÕ±Ğñ½µÁÕÑ•É%¹ÍÁ•Ñ¥½¸°MÑÉ¥¹œøì(€€€€€€€±•Ğ|€ôÍ•±˜¹É•ÅÕ¥É•}…Ñ¥Ù•}Í•ÍÍ¥½¹}™½É}Ñ…É•Ğ (€€€€€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€™…±Í”°(€€€€€€€€¤üì(€€€€€€€Í•±˜¹Í•µ…¹Ñ¥Œ(€€€€€€€€€€€€¹¥¹ÍÁ•Ğ¡Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°Ñ…É•Ñ}İ¥¹‘½İ}¥°ÅÕ•Éä¤(€€€ô((€€€ÁÕˆ™¸ÍÉ••¹Í¡½Ñ}™½É}Í•ÍÍ¥½¸ (€€€€€€€€™Í•±˜°(€€€€€€€Í•ÍÍ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€‰½Õ¹‘Ìè=ÁÑ¥½¸ñ½µÁÕÑ•É	½Õ¹‘Ìø°(€€€€¤€´øI•ÍÕ±Ğğ¡½µÁÕÑ•ÉQ…É•Ğ°Y•ŒñÔàø°½µÁÕÑ•É	½Õ¹‘Ì¤°MÑÉ¥¹œøì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍ•±˜¹…Ñ¥Ù•}Í•ÍÍ¥½¸¡Í•ÍÍ¥½¹}¥¤üì(€€€€€€€¥˜€…Í•ÍÍ¥½¸¹…±±½İ}ÍÉ••¹Í¡½ÑÌì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰Q¡¥ÌÍ•ÍÍ¥½¸É…¹Ğ‘½•Ì¹½Ğ…±±½ÜÍÉ••¹Í¡½ÑÌˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€±•Ğ€¡|°Ñ…É•Ğ¤€ôÍ•±˜¹É•ÅÕ¥É•}…Ñ¥Ù•}Í•ÍÍ¥½¹}™½É}Ñ…É•Ğ (€€€€€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€™…±Í”°(€€€€€€€€¤üì(€€€€€€€±•Ğ€¡‰åÑ•Ì°…ÁÑÕÉ•‘}‰½Õ¹‘Ì¤€ôÍ•±˜¹Í•µ…¹Ñ¥Œ¹ÍÉ••¹Í¡½Ğ ™Ñ…É•Ğ°‰½Õ¹‘Ì¤üì(€€€€€€€=¬ ¡Ñ…É•Ğ°‰åÑ•Ì°…ÁÑÕÉ•‘}‰½Õ¹‘Ì¤¤(€€€ô((€€€™¸±¥Á‰½…É‘}™½É}Í•ÍÍ¥½¸ (€€€€€€€€™Í•±˜°(€€€€€€€Í•ÍÍ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€½¹Ñ•áĞè€™Õ‘¥Ñ½¹Ñ•áĞ°(€€€€¤€´øI•ÍÕ±Ğğ¡MÑÉ¥¹œ°MÑÉ¥¹œ¤°MÑÉ¥¹œøì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍ•±˜¹…Ñ¥Ù•}Í•ÍÍ¥½¸¡Í•ÍÍ¥½¹}¥¤üì(€€€€€€€¥˜€…Í•ÍÍ¥½¸¹…±±½İ}±¥Á‰½…É‘}É•…ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰Q¡¥ÌÍ•ÍÍ¥½¸É…¹Ğ‘½•Ì¹½Ğ…±±½Ü±¥Á‰½…ÉÉ•…‘Ìˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€±•Ğ|€ôÍ•±˜¹É•ÅÕ¥É•}…Ñ¥Ù•}Í•ÍÍ¥½¹}™½É}Ñ…É•Ğ (€€€€€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€™…±Í”°(€€€€€€€€¤üì(€€€€€€€±•ĞÑ•áĞ€ôÉ•…‘}±¥Á‰½…É‘}¹…Ñ¥Ù” ¤üì(€€€€€€€±•Ğ…Õ‘¥Ñ}¥€ôÍ•±˜¹É•½É‘}¹…µ•‘}…Õ‘¥Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€€‰±¥Á‰½…É‘}É•…€¡½¹Ñ•¹ĞÉ•‘…Ñ•¤ˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€‰•á•ÕÑ•ˆ°(€€€€€€€€€€€€‰É…¹Ñ•ˆ°(€€€€€€€€€€€™…±Í”°(€€€€€€€€€€€ÑÉÕ”°(€€€€€€€€€€€M½µ” ‰±¥Á‰½…É½¹Ñ•¹ĞÉ•ÑÕÉ¹•Ñ¼Ñ¡”µ½‘•°ì½¹Ñ•¹Ğ½µ¥ÑÑ•™É½´…Õ‘¥Ğˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€½¹Ñ•áĞ°(€€€€€€€€¤üì(€€€€€€€=¬ ¡Ñ•áĞ°…Õ‘¥Ñ}¥¤¤(€€€ô((€€€€¼¼¼I•…‘Ì±¥Á‰½…É½¹Ñ•¹Ğ½¹±ä™½È„Í•ÍÍ¥½¸Ñ¡…Ğ•áÁ±¥¥Ñ±äÉ…¹Ñ•Ñ¡”(€€€€¼¼¼±¥Á‰½…É…Á…‰¥±¥Ñä¸I•µ½Ñ”…±±•ÉÌÕÍ”Ñ¡¥ÌİÉ…ÁÁ•ÈÍ¼Ñ¡•äÍ¡…É”(€€€€¼¼¼Ñ¡”Í…µ”Ñ…É•ĞÙ…±¥‘…Ñ¥½¸…¹É•‘…Ñ•…Õ‘¥ĞÉ•½É…Ì±½…°…±±•ÉÌ¸(€€€ÁÕˆ™¸±¥Á‰½…É‘}™½É}É•µ½Ñ” (€€€€€€€€™Í•±˜°(€€€€€€€Í•ÍÍ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€¤€´øI•ÍÕ±Ğğ¡MÑÉ¥¹œ°MÑÉ¥¹œ¤°MÑÉ¥¹œøì(€€€€€€€Í•±˜¹±¥Á‰½…É‘}™½É}Í•ÍÍ¥½¸ (€€€€€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€€™Õ‘¥Ñ½¹Ñ•áĞèé‘•™…Õ±Ğ ¤°(€€€€€€€€¤(€€€ô((€€€™¸É•ÅÕ¥É•}…Ñ¥Ù•}Í•ÍÍ¥½¹}™½É}Ñ…É•Ğ (€€€€€€€€™Í•±˜°(€€€€€€€Í•ÍÍ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€É•ÅÕ¥É•}™É½¹Ñµ½ÍĞè‰½½°°(€€€€¤€´øI•ÍÕ±Ğğ¡½¹ÑÉ½±M•ÍÍ¥½¸°½µÁÕÑ•ÉQ…É•Ğ¤°MÑÉ¥¹œøì(€€€€€€€Ù…±¥‘…Ñ•}…ÁÁ±¥…Ñ¥½¹}¥¡Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥¤üì(€€€€€€€¥˜±•ĞM½µ”¡İ¥¹‘½İ}¥¤€ôÑ…É•Ñ}İ¥¹‘½İ}¥ì(€€€€€€€€€€€Ù…±¥‘…Ñ•}…ÁÁ±¥…Ñ¥½¹}¥¡İ¥¹‘½İ}¥¤üì(€€€€€€€ô(€€€€€€€¥˜Í•¹Í¥Ñ¥Ù•}Ñ•áĞ¡Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥¤ñğÑ…É•Ñ}İ¥¹‘½İ}¥¹¥Í}Í½µ•}…¹¡Í•¹Í¥Ñ¥Ù•}Ñ•áĞ¤ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰M•¹Í¥Ñ¥Ù”…ÁÁ±¥…Ñ¥½¸½İ¥¹‘½ÜÑ…É•ÑÌ…É”‰±½­•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€±•Ğ¹½Ü€ô¹½İ}µÌ ¤ì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôì(€€€€€€€€€€€±•ĞµÕĞÍ•ÍÍ¥½¹Ì€ô±½¬ ™Í•±˜¹Í•ÍÍ¥½¹Ì°€‰½¹ÑÉ½°Í•ÍÍ¥½¹Ìˆ¤üì(€€€€€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍ•ÍÍ¥½¹Ì(€€€€€€€€€€€€€€€€¹•Ñ}µÕĞ¡Í•ÍÍ¥½¹}¥¤(€€€€€€€€€€€€€€€€¹½­}½É}•±Í”¡ñğ€‰½¹ÑÉ½°Í•ÍÍ¥½¸¥Ìµ¥ÍÍ¥¹œ½Èİ…ÌÍÑ½ÁÁ•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤üì(€€€€€€€€€€€¥˜Í•ÍÍ¥½¸¹•áÁ¥É•Í}…Ñ}µÌ€ğô¹½Üì(€€€€€€€€€€€€€€€Í•ÍÍ¥½¸¹…Ñ¥Ù”€ô™…±Í”ì(€€€€€€€€€€€ô(€€€€€€€€€€€¥˜€…Í•ÍÍ¥½¸¹…Ñ¥Ù”ì(€€€€€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰½¹ÑÉ½°Í•ÍÍ¥½¸¥Ì¥¹…Ñ¥Ù”½È•áÁ¥É•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€€€€€ô(€€€€€€€€€€€¥˜Í•ÍÍ¥½¸¹Á…ÕÍ•ì(€€€€€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰½¹ÑÉ½°Í•ÍÍ¥½¸¥ÌÁ…ÕÍ•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€€€€€ô(€€€€€€€€€€€Í•ÍÍ¥½¸¹±½¹” ¤(€€€€€€€ôì(€€€€€€€±•ĞÑ…É•Ğ€ôÍ•±˜¹Í•µ…¹Ñ¥Œ¹Ù•É¥™å}Ñ…É•Ğ (€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€É•ÅÕ¥É•}™É½¹Ñµ½ÍĞ°(€€€€€€€€¤üì(€€€€€€€¥˜Ñ…É•Ñ}¥Í}Í•¹Í¥Ñ¥Ù” ™Ñ…É•Ğ¤ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰M•¹Í¥Ñ¥Ù”…ÁÁ±¥…Ñ¥½¸½İ¥¹‘½ÜÑ…É•ÑÌ…É”‰±½­•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€±•Ğ…ÁÁ}…±±½İ•€ôÍ•ÍÍ¥½¸¹…±±½İ•‘}…ÁÁ±¥…Ñ¥½¹Ì¹¥Ñ•È ¤¹…¹ä¡ñ…±±½İ•‘ğì(€€€€€€€€€€€…±±½İ•€ôôÑ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥(€€€€€€€€€€€€€€€ñğ…±±½İ•€ôô€™Ñ…É•Ğ¹…ÁÁ±¥…Ñ¥½¹}¥(€€€€€€€€€€€€€€€ñğ…±±½İ•€ôô€™Ñ…É•Ğ¹…ÁÁ±¥…Ñ¥½¹}¹…µ”(€€€€€€€€€€€€€€€ñğ…±±½İ•€ôô€™Ñ…É•Ğ¹Ñ…É•Ñ}¥(€€€€€€€ô¤ì(€€€€€€€±•Ğİ¥¹‘½İ}…±±½İ•€ôÍ•ÍÍ¥½¸¹…±±½İ•‘}İ¥¹‘½İÌ¹¥Í}•µÁÑä ¤(€€€€€€€€€€€ñğÍ•ÍÍ¥½¸(€€€€€€€€€€€€€€€€¹…±±½İ•‘}İ¥¹‘½İÌ(€€€€€€€€€€€€€€€€¹¥Ñ•È ¤(€€€€€€€€€€€€€€€€¹…¹ä¡ñ…±±½İ•‘ğ…±±½İ•€ôô€™Ñ…É•Ğ¹İ¥¹‘½İ}¥ñğ…±±½İ•€ôô€™Ñ…É•Ğ¹Ñ…É•Ñ}¥¤ì(€€€€€€€¥˜€……ÁÁ}…±±½İ•ñğ€…İ¥¹‘½İ}…±±½İ•ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ (€€€€€€€€€€€€€€€€‰Q…É•Ğ…ÁÁ±¥…Ñ¥½¸½İ¥¹‘½Ü¥Ì½ÕÑÍ¥‘”Ñ¡¥ÌÍ•ÍÍ¥½¸Ì…±±½İ±¥ÍĞˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€¤ì(€€€€€€€ô(€€€€€€€=¬ ¡Í•ÍÍ¥½¸°Ñ…É•Ğ¤¤(€€€ô((€€€™¸…Ñ¥½¹}É•ÅÕ¥É•Í}™É½¹Ñµ½ÍĞ¡…Ñ¥½¸è€™½¹ÑÉ½±Ñ¥½¸¤€´ø‰½½°ì(€€€€€€€€…µ…Ñ¡•Ì„¡…Ñ¥½¸°½¹ÑÉ½±Ñ¥½¸èé½ÕÌğ½¹ÑÉ½±Ñ¥½¸èé]…¥Ğì€¸¸ô¤(€€€ô((€€€™¸…Ñ¥½¹}Ñ…É•ÑÍ}Í•¹Í¥Ñ¥Ù•}™½ÕÌ (€€€€€€€€™Í•±˜°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€…Ñ¥½¸è€™½¹ÑÉ½±Ñ¥½¸°(€€€€¤€´øI•ÍÕ±Ğñ‰½½°°MÑÉ¥¹œøì(€€€€€€€¥˜€…µ…Ñ¡•Ì„ (€€€€€€€€€€€…Ñ¥½¸°(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èéQåÁ•Q•áĞì€¸¸ô(€€€€€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èé-•åAÉ•ÍÌì€¸¸ô(€€€€€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èé!½Ñ­•äì€¸¸ô(€€€€€€€€¤ì(€€€€€€€€€€€É•ÑÕÉ¸=¬¡™…±Í”¤ì(€€€€€€€ô(€€€€€€€=¬¡Í•±˜(€€€€€€€€€€€€¹Í•µ…¹Ñ¥Œ(€€€€€€€€€€€€¹¥¹ÍÁ•Ğ¡Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°Ñ…É•Ñ}İ¥¹‘½İ}¥°9½¹”¤ü(€€€€€€€€€€€€¹•±•µ•¹ÑÌ(€€€€€€€€€€€€¹¥Ñ•È ¤(€€€€€€€€€€€€¹…¹ä¡ñ•±•µ•¹Ñğ•±•µ•¹Ğ¹™½ÕÍ•€˜˜•±•µ•¹Ğ¹Í•¹Í¥Ñ¥Ù”¤¤(€€€ô((€€€™¸…Ñ¥½¹}…ÁÁÉ½Ù…° (€€€€€€€€™Í•±˜°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€…Ñ¥½¸è€™½¹ÑÉ½±Ñ¥½¸°(€€€€¤€´ø€¡ÁÁÉ½Ù…±1•Ù•°°MÑÉ¥¹œ¤ì(€€€€€€€±•ĞµÕĞ‘•ÍÉ¥ÁÑ¥½¸€ô…Ñ¥½¹}ÍÕµµ…Éä¡…Ñ¥½¸¤ì(€€€€€€€±•Ğ•±•µ•¹Ñ}¥€ôµ…Ñ …Ñ¥½¸ì(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•µ…¹Ñ¥±¥¬ì•±•µ•¹Ñ}¥°€¸¸ô(€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èéM•µ…¹Ñ¥½Õ‰±•±¥¬ì•±•µ•¹Ñ}¥°€¸¸ô(€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èéM•±•Ğì•±•µ•¹Ñ}¥°€¸¸ô(€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èéM•ÑY…±Õ”ì•±•µ•¹Ñ}¥°€¸¸ô€ôøM½µ”¡•±•µ•¹Ñ}¥¹…Í}ÍÑÈ ¤¤°(€€€€€€€€€€€|€ôø9½¹”°(€€€€€€€ôì(€€€€€€€±•ĞµÕĞ•±•µ•¹Ñ}Õ¹Ù•É¥™¥•€ô™…±Í”ì(€€€€€€€¥˜±•ĞM½µ”¡•±•µ•¹Ñ}¥¤€ô•±•µ•¹Ñ}¥ì(€€€€€€€€€€€¥˜±•Ğ=¬¡¥¹ÍÁ•Ñ¥½¸¤€ô(€€€€€€€€€€€€€€€Í•±˜¹Í•µ…¹Ñ¥Œ(€€€€€€€€€€€€€€€€€€€€¹¥¹ÍÁ•Ğ¡Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°Ñ…É•Ñ}İ¥¹‘½İ}¥°9½¹”¤(€€€€€€€€€€€ì(€€€€€€€€€€€€€€€¥˜±•ĞM½µ”¡•±•µ•¹Ğ¤€ô¥¹ÍÁ•Ñ¥½¸(€€€€€€€€€€€€€€€€€€€€¹•±•µ•¹ÑÌ(€€€€€€€€€€€€€€€€€€€€¹¥Ñ•È ¤(€€€€€€€€€€€€€€€€€€€€¹™¥¹¡ñ•±•µ•¹Ñğ•±•µ•¹Ğ¹¥€ôô•±•µ•¹Ñ}¥¤(€€€€€€€€€€€€€€€ì(€€€€€€€€€€€€€€€€€€€‘•ÍÉ¥ÁÑ¥½¸¹ÁÕÍ¡}ÍÑÈ ™™½Éµ…Ğ„ (€€€€€€€€€€€€€€€€€€€€€€€€ˆÉ½±”õíô±…‰•°õíôˆ°(€€€€€€€€€€€€€€€€€€€€€€€•±•µ•¹Ğ¹É½±”°(€€€€€€€€€€€€€€€€€€€€€€€¥˜•±•µ•¹Ğ¹±…‰•°¹¥Í}•µÁÑä ¤ì(€€€€€€€€€€€€€€€€€€€€€€€€€€€€ˆ¡Õ¹±…‰•±±•¤ˆ(€€€€€€€€€€€€€€€€€€€€€€€ô•±Í”ì(€€€€€€€€€€€€€€€€€€€€€€€€€€€€™•±•µ•¹Ğ¹±…‰•°(€€€€€€€€€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€€€€€€¤¤ì(€€€€€€€€€€€€€€€ô•±Í”ì(€€€€€€€€€€€€€€€€€€€•±•µ•¹Ñ}Õ¹Ù•É¥™¥•€ôÑÉÕ”ì(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€ô•±Í”ì(€€€€€€€€€€€€€€€•±•µ•¹Ñ}Õ¹Ù•É¥™¥•€ôÑÉÕ”ì(€€€€€€€€€€€ô(€€€€€€€ô(€€€€€€€±•Ğ±•Ù•°€ô¥˜•±•µ•¹Ñ}¥¹¥Í}Í½µ” ¤ì(€€€€€€€€€€€¥˜•±•µ•¹Ñ}Õ¹Ù•É¥™¥•ì(€€€€€€€€€€€€€€€ÁÁÉ½Ù…±1•Ù•°èéÉ¥Ñ¥…°(€€€€€€€€€€€ô•±Í”ì(€€€€€€€€€€€€€€€…ÁÁÉ½Ù…±}±•Ù•±}™½É}¹…µ” ™‘•ÍÉ¥ÁÑ¥½¸¤(€€€€€€€€€€€ô(€€€€€€€ô•±Í”ì(€€€€€€€€€€€…ÁÁÉ½Ù…±}±•Ù•°¡…Ñ¥½¸¤(€€€€€€€ôì(€€€€€€€€¡±•Ù•°°‘•ÍÉ¥ÁÑ¥½¸¤(€€€ô((€€€™¸Ù•É¥™å}Á½ÍÑ½¹‘¥Ñ¥½¸ (€€€€€€€€™Í•±˜°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€…Ñ¥½¸è€™½¹ÑÉ½±Ñ¥½¸°(€€€€€€€‰•™½É•}Ù…±Õ”è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€€¤€´ø€¡‰½½°°=ÁÑ¥½¸ñY•É¥™¥…Ñ¥½¹Ù¥‘•¹”ø°=ÁÑ¥½¸ñMÑÉ¥¹œø¤ì(€€€€€€€±•Ğ•±•µ•¹Ñ}¥€ôµ…Ñ …Ñ¥½¸ì(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•µ…¹Ñ¥±¥¬ì•±•µ•¹Ñ}¥°€¸¸ô(€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èéM•µ…¹Ñ¥½Õ‰±•±¥¬ì•±•µ•¹Ñ}¥°€¸¸ô(€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èéM•±•Ğì•±•µ•¹Ñ}¥°€¸¸ô(€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èéM•ÑY…±Õ”ì•±•µ•¹Ñ}¥°€¸¸ô€ôøM½µ”¡•±•µ•¹Ñ}¥¹…Í}ÍÑÈ ¤¤°(€€€€€€€€€€€|€ôø9½¹”°(€€€€€€€ôì(€€€€€€€¥˜µ…Ñ¡•Ì„¡…Ñ¥½¸°½¹ÑÉ½±Ñ¥½¸èé½ÕÌ¤ì(€€€€€€€€€€€É•ÑÕÉ¸µ…Ñ Í•±˜(€€€€€€€€€€€€€€€€¹Í•µ…¹Ñ¥Œ(€€€€€€€€€€€€€€€€¹Ù•É¥™å}Ñ…É•Ğ¡Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°Ñ…É•Ñ}İ¥¹‘½İ}¥°ÑÉÕ”¤(€€€€€€€€€€€ì(€€€€€€€€€€€€€€€=¬¡Ñ…É•Ğ¤¥˜Ñ…É•Ğ¹™½ÕÍ•€ôø€ (€€€€€€€€€€€€€€€€€€€ÑÉÕ”°(€€€€€€€€€€€€€€€€€€€M½µ”¡Y•É¥™¥…Ñ¥½¹Ù¥‘•¹”ì(€€€€€€€€€€€€€€€€€€€€€€€­¥¹è€‰Ñ…É•Ñ}™½ÕÌˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€€€€€€€€€•±•µ•¹Ñ}¥è9½¹”°(€€€€€€€€€€€€€€€€€€€€€€€•áÁ•Ñ•‘}Ù…±Õ”è9½¹”°(€€€€€€€€€€€€€€€€€€€€€€€½‰Í•ÉÙ•‘}Ù…±Õ”èM½µ” ‰™½ÕÍ•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€€€€€€€€µ…Ñ¡•èÑÉÕ”°(€€€€€€€€€€€€€€€€€€€€€€€‘•Ñ…¥°è€‰Ñ¡”É•ÅÕ•ÍÑ•Ñ…É•Ğ¥Ì™½ÕÍ•…™Ñ•ÈÑ¡”…Ñ¥½¸ˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€€€€€ô¤°(€€€€€€€€€€€€€€€€€€€M½µ” ‰Ñ…É•Ğ™½ÕÌÙ•É¥™¥•…™Ñ•È…Ñ¥½¸ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€¤°(€€€€€€€€€€€€€€€=¬¡|¤€ôø€ (€€€€€€€€€€€€€€€€€€€™…±Í”°(€€€€€€€€€€€€€€€€€€€M½µ”¡Y•É¥™¥…Ñ¥½¹Ù¥‘•¹”ì(€€€€€€€€€€€€€€€€€€€€€€€­¥¹è€‰Ñ…É•Ñ}™½ÕÌˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€€€€€€€€€•±•µ•¹Ñ}¥è9½¹”°(€€€€€€€€€€€€€€€€€€€€€€€•áÁ•Ñ•‘}Ù…±Õ”èM½µ” ‰™½ÕÍ•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€€€€€€€€½‰Í•ÉÙ•‘}Ù…±Õ”èM½µ” ‰¹½Ñ}™½ÕÍ•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€€€€€€€€µ…Ñ¡•è™…±Í”°(€€€€€€€€€€€€€€€€€€€€€€€‘•Ñ…¥°è€‰Ñ¡”Ñ…É•ĞÉ•µ…¥¹•É•…¡…‰±”‰ÕĞ¥Ì¹½Ğ™½ÕÍ•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€€€€€ô¤°(€€€€€€€€€€€€€€€€€€€M½µ” ‰Ñ…É•ĞÉ•µ…¥¹•É•…¡…‰±”‰ÕĞ™½ÕÌİ…Ì¹½ĞÙ•É¥™¥•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€¤°(€€€€€€€€€€€€€€€ÉÈ¡•ÉÉ½È¤€ôø€ (€€€€€€€€€€€€€€€€€€€™…±Í”°(€€€€€€€€€€€€€€€€€€€M½µ”¡Y•É¥™¥…Ñ¥½¹Ù¥‘•¹”ì(€€€€€€€€€€€€€€€€€€€€€€€­¥¹è€‰Ñ…É•Ñ}™½ÕÌˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€€€€€€€€€•±•µ•¹Ñ}¥è9½¹”°(€€€€€€€€€€€€€€€€€€€€€€€•áÁ•Ñ•‘}Ù…±Õ”èM½µ” ‰™½ÕÍ•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€€€€€€€€½‰Í•ÉÙ•‘}Ù…±Õ”è9½¹”°(€€€€€€€€€€€€€€€€€€€€€€€µ…Ñ¡•è™…±Í”°(€€€€€€€€€€€€€€€€€€€€€€€‘•Ñ…¥°è•ÉÉ½È¹±½¹” ¤°(€€€€€€€€€€€€€€€€€€€ô¤°(€€€€€€€€€€€€€€€€€€€M½µ”¡™½Éµ…Ğ„ ‰Ñ…É•Ğ™½ÕÌ½Õ±¹½Ğ‰”Ù•É¥™¥•èí•ÉÉ½Éôˆ¤¤°(€€€€€€€€€€€€€€€€¤°(€€€€€€€€€€€ôì(€€€€€€€ô(€€€€€€€¥˜±•ĞM½µ”¡•±•µ•¹Ñ}¥¤€ô•±•µ•¹Ñ}¥ì(€€€€€€€€€€€±•Ğ•áÁ•Ñ•€ôµ…Ñ …Ñ¥½¸ì(€€€€€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•µ…¹Ñ¥±¥¬ì•áÁ•Ñ•‘}Ù…±Õ”°€¸¸ô(€€€€€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èéM•µ…¹Ñ¥½Õ‰±•±¥¬ì•áÁ•Ñ•‘}Ù…±Õ”°€¸¸ô€ôøì(€€€€€€€€€€€€€€€€€€€•áÁ•Ñ•‘}Ù…±Õ”¹±½¹” ¤(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•±•ĞìÙ…±Õ”°€¸¸ôğ½¹ÑÉ½±Ñ¥½¸èéM•ÑY…±Õ”ìÙ…±Õ”°€¸¸ô€ôøì(€€€€€€€€€€€€€€€€€€€M½µ”¡Ù…±Õ”¹±½¹” ¤¤(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€|€ôø9½¹”°(€€€€€€€€€€€ôì(€€€€€€€€€€€±•Ğ¥¹ÍÁ•Ñ•€ôÍ•±˜(€€€€€€€€€€€€€€€€¹Í•µ…¹Ñ¥Œ(€€€€€€€€€€€€€€€€¹¥¹ÍÁ•Ğ¡Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°Ñ…É•Ñ}İ¥¹‘½İ}¥°9½¹”¤(€€€€€€€€€€€€€€€€¹½¬ ¤(€€€€€€€€€€€€€€€€¹…¹‘}Ñ¡•¸¡ñ¥¹ÍÁ•Ñ¥½¹ğì(€€€€€€€€€€€€€€€€€€€¥¹ÍÁ•Ñ¥½¸(€€€€€€€€€€€€€€€€€€€€€€€€¹•±•µ•¹ÑÌ(€€€€€€€€€€€€€€€€€€€€€€€€¹¥¹Ñ½}¥Ñ•È ¤(€€€€€€€€€€€€€€€€€€€€€€€€¹™¥¹¡ñ•±•µ•¹Ñğ•±•µ•¹Ğ¹¥€ôô•±•µ•¹Ñ}¥¤(€€€€€€€€€€€€€€€ô¤ì(€€€€€€€€€€€±•Ğ½‰Í•ÉÙ•€ô¥¹ÍÁ•Ñ•¹…Í}É•˜ ¤¹…¹‘}Ñ¡•¸¡ñ•±•µ•¹Ñğ•±•µ•¹Ğ¹Ù…±Õ”¹±½¹” ¤¤ì(€€€€€€€€€€€±•Ğµ…Ñ¡•€ô¥˜±•ĞM½µ”¡•áÁ•Ñ•¤€ô•áÁ•Ñ•¹…Í}‘•É•˜ ¤ì(€€€€€€€€€€€€€€€½‰Í•ÉÙ•(€€€€€€€€€€€€€€€€€€€€¹…Í}‘•É•˜ ¤(€€€€€€€€€€€€€€€€€€€€¹¥Í}Í½µ•}…¹¡ñÙ…±Õ•ğÙ…±Õ”¹ÑÉ¥´ ¤€ôô•áÁ•Ñ•¹ÑÉ¥´ ¤¤(€€€€€€€€€€€ô•±Í”ì(€€€€€€€€€€€€€€€‰•™½É•}Ù…±Õ”(€€€€€€€€€€€€€€€€€€€€¹…Í}‘•É•˜ ¤(€€€€€€€€€€€€€€€€€€€€¹é¥À¡½‰Í•ÉÙ•¹…Í}‘•É•˜ ¤¤(€€€€€€€€€€€€€€€€€€€€¹¥Í}Í½µ•}…¹¡ğ¡‰•™½É”°…™Ñ•È¥ğ‰•™½É”€„ô…™Ñ•È¤(€€€€€€€€€€€ôì(€€€€€€€€€€€±•Ğ‘•Ñ…¥°€ô¥˜•áÁ•Ñ•¹¥Í}Í½µ” ¤ì(€€€€€€€€€€€€€€€€‰Ñ¡”¥¹ÍÁ•Ñ••±•µ•¹ĞÙ…±Õ”İ…Ì½µÁ…É•İ¥Ñ Ñ¡”É•ÅÕ•ÍÑ•Á½ÍÑ½¹‘¥Ñ¥½¸ˆ(€€€€€€€€€€€ô•±Í”ì(€€€€€€€€€€€€€€€€‰Ñ¡”¥¹ÍÁ•Ñ••±•µ•¹ĞÙ…±Õ”İ…Ì½µÁ…É•‰•™½É”…¹…™Ñ•ÈÑ¡”Í•µ…¹Ñ¥Œ…Ñ¥½¸ˆ(€€€€€€€€€€€ôì(€€€€€€€€€€€É•ÑÕÉ¸€ (€€€€€€€€€€€€€€€µ…Ñ¡•°(€€€€€€€€€€€€€€€M½µ”¡Y•É¥™¥…Ñ¥½¹Ù¥‘•¹”ì(€€€€€€€€€€€€€€€€€€€­¥¹è€‰•±•µ•¹Ñ}Ù…±Õ”ˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€€€€€•±•µ•¹Ñ}¥èM½µ”¡•±•µ•¹Ñ}¥¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€€€€•áÁ•Ñ•‘}Ù…±Õ”è•áÁ•Ñ•°(€€€€€€€€€€€€€€€€€€€½‰Í•ÉÙ•‘}Ù…±Õ”è½‰Í•ÉÙ•°(€€€€€€€€€€€€€€€€€€€µ…Ñ¡•°(€€€€€€€€€€€€€€€€€€€‘•Ñ…¥°è‘•Ñ…¥°¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€ô¤°(€€€€€€€€€€€€€€€M½µ”¡¥˜µ…Ñ¡•ì(€€€€€€€€€€€€€€€€€€€€‰•±•µ•¹ĞÍÑ…Ñ”Ù•É¥™¥•…™Ñ•È…Ñ¥½¸ˆ¹Ñ½}ÍÑÉ¥¹œ ¤(€€€€€€€€€€€€€€€ô•±Í”ì(€€€€€€€€€€€€€€€€€€€€‰¥¹ÁÕĞİ…ÌÍ•¹ĞìÑ¡”É•ÅÕ•ÍÑ••±•µ•¹ĞÍÑ…Ñ”İ…Ì¹½ĞÙ•É¥™¥•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤(€€€€€€€€€€€€€€€ô¤°(€€€€€€€€€€€€¤ì(€€€€€€€ô(€€€€€€€±•Ğ‘•Ñ…¥°€ô¥˜µ…Ñ¡•Ì„¡…Ñ¥½¸°½¹ÑÉ½±Ñ¥½¸èé]…¥Ğì€¸¸ô¤ì(€€€€€€€€€€€€‰Ñ¡”Ñ…É•Ğİ…ÌÉ•Ù…±¥‘…Ñ•…™Ñ•ÈÑ¡”İ…¥Ğˆ(€€€€€€€ô•±Í”ì(€€€€€€€€€€€€‰¥¹ÁÕĞ‘•±¥Ù•Éäİ…Ì½¹™¥Éµ•°‰ÕĞ¹¼•±•µ•¹ĞÁ½ÍÑ½¹‘¥Ñ¥½¸İ…ÌÍÕÁÁ±¥•ˆ(€€€€€€€ôì(€€€€€€€±•ĞÙ•É¥™¥•€ôµ…Ñ¡•Ì„¡…Ñ¥½¸°½¹ÑÉ½±Ñ¥½¸èé]…¥Ğì€¸¸ô¤(€€€€€€€€€€€€˜˜Í•±˜(€€€€€€€€€€€€€€€€¹Í•µ…¹Ñ¥Œ(€€€€€€€€€€€€€€€€¹Ù•É¥™å}Ñ…É•Ğ¡Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°Ñ…É•Ñ}İ¥¹‘½İ}¥°™…±Í”¤(€€€€€€€€€€€€€€€€¹¥Í}½¬ ¤ì(€€€€€€€€ (€€€€€€€€€€€Ù•É¥™¥•°(€€€€€€€€€€€M½µ”¡Y•É¥™¥…Ñ¥½¹Ù¥‘•¹”ì(€€€€€€€€€€€€€€€­¥¹è€‰Ñ…É•Ñ}É•Ù…±¥‘…Ñ¥½¸ˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€•±•µ•¹Ñ}¥è9½¹”°(€€€€€€€€€€€€€€€•áÁ•Ñ•‘}Ù…±Õ”è9½¹”°(€€€€€€€€€€€€€€€½‰Í•ÉÙ•‘}Ù…±Õ”è9½¹”°(€€€€€€€€€€€€€€€µ…Ñ¡•èÙ•É¥™¥•°(€€€€€€€€€€€€€€€‘•Ñ…¥°è‘•Ñ…¥°¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€ô¤°(€€€€€€€€€€€M½µ”¡‘•Ñ…¥°¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€¤(€€€ô((€€€™¸Í•Ñ}…Õ‘¥Ñ}Ù•É¥™¥…Ñ¥½¹}•Ù¥‘•¹” (€€€€€€€€™Í•±˜°(€€€€€€€…Õ‘¥Ñ}¥è€™ÍÑÈ°(€€€€€€€•Ù¥‘•¹”è=ÁÑ¥½¸ñY•É¥™¥…Ñ¥½¹Ù¥‘•¹”ø°(€€€€¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€¥˜±•ĞM½µ”¡É•½É¤€ô±½¬ ™Í•±˜¹…Õ‘¥Ğ°€‰‘•Í­Ñ½À½¹ÑÉ½°…Õ‘¥Ğˆ¤ü(€€€€€€€€€€€€¹¥Ñ•É}µÕĞ ¤(€€€€€€€€€€€€¹™¥¹¡ñÉ•½É‘ğÉ•½É¹…Õ‘¥Ñ}¥€ôô…Õ‘¥Ñ}¥¤(€€€€€€€ì(€€€€€€€€€€€É•½É¹Ù•É¥™¥…Ñ¥½¹}•Ù¥‘•¹”€ô•Ù¥‘•¹”¹µ…À¡ñÙ…±Õ•ğÙ…±Õ”¹É•‘…Ñ•‘}™½É}…Õ‘¥Ğ ¤¤ì(€€€€€€€ô(€€€€€€€=¬  ¤¤(€€€ô((€€€™¸Ù…±¥‘…Ñ•}…Ñ¥½¸ (€€€€€€€Í•ÍÍ¥½¸è€™½¹ÑÉ½±M•ÍÍ¥½¸°(€€€€€€€Ñ…É•Ğè€™½µÁÕÑ•ÉQ…É•Ğ°(€€€€€€€…Ñ¥½¸è€™½¹ÑÉ½±Ñ¥½¸°(€€€€¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€±•Ğ­•å‰½…É‘}…Ñ¥½¸€ôµ…Ñ¡•Ì„ (€€€€€€€€€€€…Ñ¥½¸°(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èéQåÁ•Q•áĞì€¸¸ô(€€€€€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èé-•åAÉ•ÍÌì€¸¸ô(€€€€€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èé!½Ñ­•äì€¸¸ô(€€€€€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èéM•±•Ğì€¸¸ô(€€€€€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èéM•ÑY…±Õ”ì€¸¸ô(€€€€€€€€¤ì(€€€€€€€¥˜­•å‰½…É‘}…Ñ¥½¸€˜˜€…Í•ÍÍ¥½¸¹…±±½İ}­•å‰½…É‘}¥¹ÁÕĞì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰Q¡¥ÌÍ•ÍÍ¥½¸É…¹Ğ‘½•Ì¹½Ğ…±±½Ü­•å‰½…É¥¹ÁÕĞˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€µ…Ñ …Ñ¥½¸ì(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èéQåÁ•Q•áĞìÑ•áĞô¥˜Ñ•áĞ¹±•¸ ¤€ø€ÄØ€¨€ÄÀÈĞ€ôøì(€€€€€€€€€€€€€€€ÉÈ ‰QåÁ•Ñ•áĞ•á••‘ÌÑ¡”€ÄØ-¥…Ñ¥½¸‰½Õ¹ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé!½Ñ­•äì­•åÌô¥˜­•åÌ¹¥Í}•µÁÑä ¤ñğ­•åÌ¹±•¸ ¤€ø€à€ôøì(€€€€€€€€€€€€€€€ÉÈ ‰!½Ñ­•åÌµÕÍĞ½¹Ñ…¥¸‰•Ñİ••¸€Ä…¹€à¹…µ•­•åÌˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé!½Ñ­•äì­•åÌô(€€€€€€€€€€€€€€€¥˜­•åÌ¹¥Ñ•È ¤¹…¹ä¡ñ­•åğ­•ä¹¥Í}•µÁÑä ¤ñğ­•ä¹±•¸ ¤€ø€ØĞ¤€ôø(€€€€€€€€€€€ì(€€€€€€€€€€€€€€€ÉÈ ‰!½Ñ­•ä¹…µ•Ì…É”‰½Õ¹‘•ÁÉ¥¹Ñ…‰±”ÍÑÉ¥¹Ìˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èéMÉ½±°ì‘•±Ñ…}à°‘•±Ñ…}äô(€€€€€€€€€€€€€€€¥˜‘•±Ñ…}à¹Õ¹Í¥¹•‘}…‰Ì ¤€ø€ÄÁ|ÀÀÀñğ‘•±Ñ…}ä¹Õ¹Í¥¹•‘}…‰Ì ¤€ø€ÄÁ|ÀÀÀ€ôø(€€€€€€€€€€€ì(€€€€€€€€€€€€€€€ÉÈ ‰MÉ½±°‘•±Ñ…Ì•á••Ñ¡”‰½Õ¹‘•…Ñ¥½¸±¥µ¥Ğˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé]…¥Ğìµ¥±±¥Í•½¹‘Ìô¥˜€©µ¥±±¥Í•½¹‘Ì€ø€ÄÁ|ÀÀÀ€ôøì(€€€€€€€€€€€€€€€ÉÈ ‰]…¥Ğ¥Ì±¥µ¥Ñ•Ñ¼€ÄÀÍ•½¹‘Ìˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé5½ÕÍ•±¥­Ğìà°ä°€¸¸ô(€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èé5½ÕÍ•½Õ‰±•±¥­Ğìà°ä°€¸¸ô€ôøì(€€€€€€€€€€€€€€€Ù…±¥‘…Ñ•}½½É‘¥¹…Ñ•Ì¡Ñ…É•Ğ°€©à°€©ä¤(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé5½ÕÍ•É…œì(€€€€€€€€€€€€€€€™É½µ}à°(€€€€€€€€€€€€€€€™É½µ}ä°(€€€€€€€€€€€€€€€Ñ½}à°(€€€€€€€€€€€€€€€Ñ½}ä°(€€€€€€€€€€€ô€ôøì(€€€€€€€€€€€€€€€Ù…±¥‘…Ñ•}½½É‘¥¹…Ñ•Ì¡Ñ…É•Ğ°€©™É½µ}à°€©™É½µ}ä¤üì(€€€€€€€€€€€€€€€Ù…±¥‘…Ñ•}½½É‘¥¹…Ñ•Ì¡Ñ…É•Ğ°€©Ñ½}à°€©Ñ½}ä¤(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•µ…¹Ñ¥±¥¬ì•±•µ•¹Ñ}¥°€¸¸ô(€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èéM•µ…¹Ñ¥½Õ‰±•±¥¬ì•±•µ•¹Ñ}¥°€¸¸ô(€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èéM•±•Ğì•±•µ•¹Ñ}¥°€¸¸ô(€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èéM•ÑY…±Õ”ì•±•µ•¹Ñ}¥°€¸¸ô(€€€€€€€€€€€€€€€¥˜•±•µ•¹Ñ}¥¹±•¸ ¤€ø€ÔÄÈñğ•±•µ•¹Ñ}¥¹¡…ÉÌ ¤¹…¹ä¡¡…Èèé¥Í}½¹ÑÉ½°¤€ôø(€€€€€€€€€€€ì(€€€€€€€€€€€€€€€ÉÈ ‰•ÍÍ¥‰¥±¥Ñä•±•µ•¹Ğ¥¥Ì¥¹Ù…±¥½ÈÑ½¼±½¹œˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€€€€€€€€€ô(€€€€€€€€€€€|€ôø=¬  ¤¤°(€€€€€€€ô(€€€ô((€€€™¸•á•ÕÑ•}™½É}Ñ…É•Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€€™Í•±˜°(€€€€€€€Í•ÍÍ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€…Ñ¥½¸è€™½¹ÑÉ½±Ñ¥½¸°(€€€€€€€½¹Ñ•áĞè€™Õ‘¥Ñ½¹Ñ•áĞ°(€€€€¤€´øI•ÍÕ±Ğñá•ÕÑ¥½¹I•ÍÕ±Ğ°MÑÉ¥¹œøì(€€€€€€€±•Ğ€¡Í•ÍÍ¥½¸°Ñ…É•Ğ¤€ôÍ•±˜¹É•ÅÕ¥É•}…Ñ¥Ù•}Í•ÍÍ¥½¹}™½É}Ñ…É•Ğ (€€€€€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€M•±˜èé…Ñ¥½¹}É•ÅÕ¥É•Í}™É½¹Ñµ½ÍĞ¡…Ñ¥½¸¤°(€€€€€€€€¤üì(€€€€€€€M•±˜èéÙ…±¥‘…Ñ•}…Ñ¥½¸ ™Í•ÍÍ¥½¸°€™Ñ…É•Ğ°…Ñ¥½¸¤üì(€€€€€€€¥˜Í•±˜¹…Ñ¥½¹}Ñ…É•ÑÍ}Í•¹Í¥Ñ¥Ù•}™½ÕÌ¡Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°Ñ…É•Ñ}İ¥¹‘½İ}¥°…Ñ¥½¸¤üì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ (€€€€€€€€€€€€€€€€‰-•å‰½…É¥¹ÁÕĞ¥¹Ñ¼„Í•¹Í¥Ñ¥Ù”½È…ÕÑ¡•¹Ñ¥…Ñ¥½¸•±•µ•¹Ğ¥Ì‰±½­•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€¤ì(€€€€€€€ô(€€€€€€€±•Ğ‰•™½É•}Ù…±Õ”€ôµ…Ñ …Ñ¥½¸ì(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•µ…¹Ñ¥±¥¬ì•±•µ•¹Ñ}¥°€¸¸ô(€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èéM•µ…¹Ñ¥½Õ‰±•±¥¬ì•±•µ•¹Ñ}¥°€¸¸ô(€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èéM•±•Ğì•±•µ•¹Ñ}¥°€¸¸ô(€€€€€€€€€€€ğ½¹ÑÉ½±Ñ¥½¸èéM•ÑY…±Õ”ì•±•µ•¹Ñ}¥°€¸¸ô€ôøÍ•±˜(€€€€€€€€€€€€€€€€¹Í•µ…¹Ñ¥Œ(€€€€€€€€€€€€€€€€¹¥¹ÍÁ•Ğ¡Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°Ñ…É•Ñ}İ¥¹‘½İ}¥°9½¹”¤(€€€€€€€€€€€€€€€€¹½¬ ¤(€€€€€€€€€€€€€€€€¹…¹‘}Ñ¡•¸¡ñ¥¹ÍÁ•Ñ¥½¹ğì(€€€€€€€€€€€€€€€€€€€¥¹ÍÁ•Ñ¥½¸(€€€€€€€€€€€€€€€€€€€€€€€€¹•±•µ•¹ÑÌ(€€€€€€€€€€€€€€€€€€€€€€€€¹¥¹Ñ½}¥Ñ•È ¤(€€€€€€€€€€€€€€€€€€€€€€€€¹™¥¹¡ñ•±•µ•¹Ñğ•±•µ•¹Ğ¹¥€ôô€©•±•µ•¹Ñ}¥¤(€€€€€€€€€€€€€€€€€€€€€€€€¹…¹‘}Ñ¡•¸¡ñ•±•µ•¹Ñğ•±•µ•¹Ğ¹Ù…±Õ”¤(€€€€€€€€€€€€€€€ô¤°(€€€€€€€€€€€|€ôø9½¹”°(€€€€€€€ôì(€€€€€€€±•ĞµÕĞ¥¹ÁÕÑ}Í•¹Ğ€ô™…±Í”ì(€€€€€€€µ…Ñ …Ñ¥½¸ì(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé5½ÕÍ•5½Ù”ìà°äô€ôøì(€€€€€€€€€€€€€€€Ù…±¥‘…Ñ•}½½É‘¥¹…Ñ•Ì ™Ñ…É•Ğ°€©à°€©ä¤üì(€€€€€€€€€€€€€€€Í•±˜¹‰…­•¹¹µ½Ù•}µ½ÕÍ” ©à°€©ä¤üì(€€€€€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ€ôÑÉÕ”ì(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé5½ÕÍ•±¥¬ì‰ÕÑÑ½¸ô€ôøì(€€€€€€€€€€€€€€€Í•±˜¹‰…­•¹¹±¥¬ ©‰ÕÑÑ½¸¤üì(€€€€€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ€ôÑÉÕ”ì(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé5½ÕÍ•±¥­Ğìà°ä°‰ÕÑÑ½¸ô€ôøì(€€€€€€€€€€€€€€€Í•±˜¹‰…­•¹¹µ½Ù•}µ½ÕÍ” ©à°€©ä¤üì(€€€€€€€€€€€€€€€Í•±˜¹‰…­•¹¹±¥¬ ©‰ÕÑÑ½¸¤üì(€€€€€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ€ôÑÉÕ”ì(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé5½ÕÍ•½Õ‰±•±¥¬ì‰ÕÑÑ½¸ô€ôøì(€€€€€€€€€€€€€€€Í•±˜¹‰…­•¹¹‘½Õ‰±•}±¥¬ ©‰ÕÑÑ½¸¤üì(€€€€€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ€ôÑÉÕ”ì(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé5½ÕÍ•½Õ‰±•±¥­Ğìà°ä°‰ÕÑÑ½¸ô€ôøì(€€€€€€€€€€€€€€€Í•±˜¹‰…­•¹¹µ½Ù•}µ½ÕÍ” ©à°€©ä¤üì(€€€€€€€€€€€€€€€Í•±˜¹‰…­•¹¹‘½Õ‰±•}±¥¬ ©‰ÕÑÑ½¸¤üì(€€€€€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ€ôÑÉÕ”ì(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé5½ÕÍ•É…œì(€€€€€€€€€€€€€€€™É½µ}à°(€€€€€€€€€€€€€€€™É½µ}ä°(€€€€€€€€€€€€€€€Ñ½}à°(€€€€€€€€€€€€€€€Ñ½}ä°(€€€€€€€€€€€ô€ôøì(€€€€€€€€€€€€€€€Í•±˜¹‰…­•¹¹‘É…œ ©™É½µ}à°€©™É½µ}ä°€©Ñ½}à°€©Ñ½}ä¤üì(€€€€€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ€ôÑÉÕ”ì(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èéMÉ½±°ì‘•±Ñ…}à°‘•±Ñ…}äô€ôøì(€€€€€€€€€€€€€€€Í•±˜¹‰…­•¹¹ÍÉ½±° ©‘•±Ñ…}à°€©‘•±Ñ…}ä¤üì(€€€€€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ€ôÑÉÕ”ì(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èéQåÁ•Q•áĞìÑ•áĞô€ôøì(€€€€€€€€€€€€€€€Í•±˜¹‰…­•¹¹ÑåÁ•}Ñ•áĞ¡Ñ•áĞ¤üì(€€€€€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ€ôÑÉÕ”ì(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé-•åAÉ•ÍÌì­•äô€ôøì(€€€€€€€€€€€€€€€¥˜­•ä¹¥Í}•µÁÑä ¤ñğ­•ä¹±•¸ ¤€ø€ØĞñğ­•ä¹¡…ÉÌ ¤¹…¹ä¡¡…Èèé¥Í}½¹ÑÉ½°¤ì(€€€€€€€€€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰-•ä¹…µ”¥Ì¥¹Ù…±¥½ÈÑ½¼±½¹œˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€Í•±˜¹‰…­•¹¹­•å}ÁÉ•ÍÌ¡­•ä¤üì(€€€€€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ€ôÑÉÕ”ì(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé!½Ñ­•äì­•åÌô€ôøì(€€€€€€€€€€€€€€€Í•±˜¹‰…­•¹¹¡½Ñ­•ä¡­•åÌ¤üì(€€€€€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ€ôÑÉÕ”ì(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé½ÕÌ€ôøì(€€€€€€€€€€€€€€€Í•±˜¹Í•µ…¹Ñ¥Œ¹™½ÕÌ ™Ñ…É•Ğ¤üì(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•µ…¹Ñ¥±¥¬ì(€€€€€€€€€€€€€€€•±•µ•¹Ñ}¥°‰ÕÑÑ½¸°€¸¸(€€€€€€€€€€€ô€ôøì(€€€€€€€€€€€€€€€Í•±˜¹Í•µ…¹Ñ¥Œ(€€€€€€€€€€€€€€€€€€€€¹±¥­}•±•µ•¹Ğ ™Ñ…É•Ğ°•±•µ•¹Ñ}¥°€©‰ÕÑÑ½¸°™…±Í”¤üì(€€€€€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ€ôÑÉÕ”ì(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•µ…¹Ñ¥½Õ‰±•±¥¬ì(€€€€€€€€€€€€€€€•±•µ•¹Ñ}¥°‰ÕÑÑ½¸°€¸¸(€€€€€€€€€€€ô€ôøì(€€€€€€€€€€€€€€€Í•±˜¹Í•µ…¹Ñ¥Œ(€€€€€€€€€€€€€€€€€€€€¹±¥­}•±•µ•¹Ğ ™Ñ…É•Ğ°•±•µ•¹Ñ}¥°€©‰ÕÑÑ½¸°ÑÉÕ”¤üì(€€€€€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ€ôÑÉÕ”ì(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•±•Ğì•±•µ•¹Ñ}¥°Ù…±Õ”ô€ôøì(€€€€€€€€€€€€€€€Í•±˜¹Í•µ…¹Ñ¥Œ¹Í•Ñ}Ù…±Õ” ™Ñ…É•Ğ°•±•µ•¹Ñ}¥°Ù…±Õ”°ÑÉÕ”¤üì(€€€€€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ€ôÑÉÕ”ì(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•ÑY…±Õ”ì•±•µ•¹Ñ}¥°Ù…±Õ”ô€ôøì(€€€€€€€€€€€€€€€Í•±˜¹Í•µ…¹Ñ¥Œ¹Í•Ñ}Ù…±Õ” ™Ñ…É•Ğ°•±•µ•¹Ñ}¥°Ù…±Õ”°™…±Í”¤üì(€€€€€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ€ôÑÉÕ”ì(€€€€€€€€€€€ô(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé]…¥Ğìµ¥±±¥Í•½¹‘Ìô€ôøì(€€€€€€€€€€€€€€€ÍÑèéÑ¡É•…èéÍ±••À¡ÕÉ…Ñ¥½¸èé™É½µ}µ¥±±¥Ì ©µ¥±±¥Í•½¹‘Ì¤¤(€€€€€€€€€€€ô(€€€€€€€ô(€€€€€€€±•Ğ€¡Ù•É¥™¥•°Ù•É¥™¥…Ñ¥½¹}•Ù¥‘•¹”°Ù•É¥™¥…Ñ¥½¸¤€ôÍ•±˜¹Ù•É¥™å}Á½ÍÑ½¹‘¥Ñ¥½¸ (€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€…Ñ¥½¸°(€€€€€€€€€€€‰•™½É•}Ù…±Õ”°(€€€€€€€€¤ì(€€€€€€€±•Ğ…Õ‘¥Ñ}¥€ôÍ•±˜¹É•½É‘}…Õ‘¥Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€…Ñ¥½¸°(€€€€€€€€€€€€‰•á•ÕÑ•ˆ°(€€€€€€€€€€€€‰…ÁÁÉ½Ù•ˆ°(€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ°(€€€€€€€€€€€Ù•É¥™¥•°(€€€€€€€€€€€Ù•É¥™¥…Ñ¥½¸¹±½¹” ¤°(€€€€€€€€€€€½¹Ñ•áĞ°(€€€€€€€€¤üì(€€€€€€€Í•±˜¹Í•Ñ}…Õ‘¥Ñ}Ù•É¥™¥…Ñ¥½¹}•Ù¥‘•¹” ™…Õ‘¥Ñ}¥°Ù•É¥™¥…Ñ¥½¹}•Ù¥‘•¹”¹±½¹” ¤¤üì(€€€€€€€±•Ğ€¡…ÁÁÉ½Ù…±}±•Ù•°°|¤€ô(€€€€€€€€€€€Í•±˜¹…Ñ¥½¹}…ÁÁÉ½Ù…°¡Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°Ñ…É•Ñ}İ¥¹‘½İ}¥°…Ñ¥½¸¤ì(€€€€€€€=¬¡á•ÕÑ¥½¹I•ÍÕ±Ğì(€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ°(€€€€€€€€€€€ÍÑ…Ñ•}Ù•É¥™¥•èÙ•É¥™¥•°(€€€€€€€€€€€Ù•É¥™¥…Ñ¥½¸°(€€€€€€€€€€€Ù•É¥™¥…Ñ¥½¹}•Ù¥‘•¹”°(€€€€€€€€€€€…Õ‘¥Ñ}¥°(€€€€€€€€€€€…ÁÁÉ½Ù…±}±•Ù•°°(€€€€€€€ô¤(€€€ô((€€€™¸É•½É‘}…Õ‘¥Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€€™Í•±˜°(€€€€€€€Í•ÍÍ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€…Ñ¥½¸è€™½¹ÑÉ½±Ñ¥½¸°(€€€€€€€É•ÍÕ±Ğè€™ÍÑÈ°(€€€€€€€…ÁÁÉ½Ù…°è€™ÍÑÈ°(€€€€€€€¥¹ÁÕÑ}Í•¹Ğè‰½½°°(€€€€€€€ÍÑ…Ñ•}Ù•É¥™¥•è‰½½°°(€€€€€€€Ù•É¥™¥…Ñ¥½¸è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€€€€€½¹Ñ•áĞè€™Õ‘¥Ñ½¹Ñ•áĞ°(€€€€¤€´øI•ÍÕ±ĞñMÑÉ¥¹œ°MÑÉ¥¹œøì(€€€€€€€Í•±˜¹É•½É‘}¹…µ•‘}…Õ‘¥Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€…Ñ¥½¹}ÍÕµµ…Éä¡…Ñ¥½¸¤°(€€€€€€€€€€€É•ÍÕ±Ğ°(€€€€€€€€€€€…ÁÁÉ½Ù…°°(€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ°(€€€€€€€€€€€ÍÑ…Ñ•}Ù•É¥™¥•°(€€€€€€€€€€€Ù•É¥™¥…Ñ¥½¸°(€€€€€€€€€€€½¹Ñ•áĞ°(€€€€€€€€¤(€€€ô((€€€™¸É•½É‘}¹…µ•‘}…Õ‘¥Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€€™Í•±˜°(€€€€€€€Í•ÍÍ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€…Ñ¥½¹}¹…µ”èMÑÉ¥¹œ°(€€€€€€€É•ÍÕ±Ğè€™ÍÑÈ°(€€€€€€€…ÁÁÉ½Ù…°è€™ÍÑÈ°(€€€€€€€¥¹ÁÕÑ}Í•¹Ğè‰½½°°(€€€€€€€ÍÑ…Ñ•}Ù•É¥™¥•è‰½½°°(€€€€€€€Ù•É¥™¥…Ñ¥½¸è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€€€€€½¹Ñ•áĞè€™Õ‘¥Ñ½¹Ñ•áĞ°(€€€€¤€´øI•ÍÕ±ĞñMÑÉ¥¹œ°MÑÉ¥¹œøì(€€€€€€€±•Ğ…Õ‘¥Ñ}¥€ô™½Éµ…Ğ„ ‰‘•Í­Ñ½Àµ…Õ‘¥Ğµíôˆ°UÕ¥èé¹•İ}ØĞ ¤¤ì(€€€€€€€±•Ğ…ÁÁÉ½Ù…±}±•Ù•°€ô…ÁÁÉ½Ù…±}±•Ù•±}™½É}¹…µ” ™…Ñ¥½¹}¹…µ”¤ì(€€€€€€€±•ĞÉ•½É€ô½µÁÕÑ•ÉÕ‘¥ÑI•½Éì(€€€€€€€€€€€…Õ‘¥Ñ}¥è…Õ‘¥Ñ}¥¹±½¹” ¤°(€€€€€€€€€€€ÉÕ¹}¥è½¹Ñ•áĞ¹ÉÕ¹}¥¹±½¹” ¤°(€€€€€€€€€€€Ñ½½±}…±±}¥è½¹Ñ•áĞ¹Ñ½½±}…±±}¥¹±½¹” ¤°(€€€€€€€€€€€Í•ÍÍ¥½¹}¥èÍ•ÍÍ¥½¹}¥¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èÑ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥èÑ…É•Ñ}İ¥¹‘½İ}¥¹µ…À¡ÍÑÈèéÑ½}ÍÑÉ¥¹œ¤°(€€€€€€€€€€€…Ñ¥½¸è…Ñ¥½¹}¹…µ”°(€€€€€€€€€€€…ÁÁÉ½Ù…±}±•Ù•°°(€€€€€€€€€€€É•ÍÕ±ĞèÉ•ÍÕ±Ğ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€…ÁÁÉ½Ù…°è…ÁÁÉ½Ù…°¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€¥¹ÁÕÑ}Í•¹Ğ°(€€€€€€€€€€€ÍÑ…Ñ•}Ù•É¥™¥•°(€€€€€€€€€€€Ù•É¥™¥…Ñ¥½¸°(€€€€€€€€€€€Ù•É¥™¥…Ñ¥½¹}•Ù¥‘•¹”è9½¹”°(€€€€€€€€€€€ÍÉ••¹Í¡½Ñ}É•˜è9½¹”°(€€€€€€€€€€€É•…Ñ•‘}…Ñ}µÌè¹½İ}µÌ ¤°(€€€€€€€ôì(€€€€€€€±•ĞµÕĞ…Õ‘¥Ğ€ô±½¬ ™Í•±˜¹…Õ‘¥Ğ°€‰‘•Í­Ñ½À½¹ÑÉ½°…Õ‘¥Ğˆ¤üì(€€€€€€€¥˜…Õ‘¥Ğ¹±•¸ ¤€øô€ÄÀÈĞì(€€€€€€€€€€€…Õ‘¥Ğ¹É•µ½Ù” À¤ì(€€€€€€€ô(€€€€€€€…Õ‘¥Ğ¹ÁÕÍ ¡É•½É¤ì(€€€€€€€=¬¡…Õ‘¥Ñ}¥¤(€€€ô((€€€ÁÕˆ™¸…Õ‘¥Ñ}Í¹…ÁÍ¡½Ğ ™Í•±˜¤€´øI•ÍÕ±ĞñY•Œñ½µÁÕÑ•ÉÕ‘¥ÑI•½Éø°MÑÉ¥¹œøì(€€€€€€€=¬¡±½¬ ™Í•±˜¹…Õ‘¥Ğ°€‰‘•Í­Ñ½À½¹ÑÉ½°…Õ‘¥Ğˆ¤ü¹±½¹” ¤¤(€€€ô((€€€™¸É•½É‘}ÍÉ••¹Í¡½Ñ}…Õ‘¥Ğ (€€€€€€€€™Í•±˜°(€€€€€€€Í•ÍÍ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€…ÉÑ¥™…Ñ}¥è€™ÍÑÈ°(€€€€€€€½¹Ñ•áĞè€™Õ‘¥Ñ½¹Ñ•áĞ°(€€€€¤€´øI•ÍÕ±ĞñMÑÉ¥¹œ°MÑÉ¥¹œøì(€€€€€€€±•Ğ…Õ‘¥Ñ}¥€ôÍ•±˜¹É•½É‘}¹…µ•‘}…Õ‘¥Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€€‰ÍÉ••¹Í¡½Ğˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€‰•á•ÕÑ•ˆ°(€€€€€€€€€€€€‰É…¹Ğˆ°(€€€€€€€€€€€™…±Í”°(€€€€€€€€€€€ÑÉÕ”°(€€€€€€€€€€€M½µ” ‰‰½Õ¹‘•ÍÉ••¹Í¡½Ğ…ÁÑÕÉ•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€½¹Ñ•áĞ°(€€€€€€€€¤üì(€€€€€€€±•ĞµÕĞ…Õ‘¥Ğ€ô±½¬ ™Í•±˜¹…Õ‘¥Ğ°€‰‘•Í­Ñ½À½¹ÑÉ½°…Õ‘¥Ğˆ¤üì(€€€€€€€¥˜±•ĞM½µ”¡É•½É¤€ô…Õ‘¥Ğ¹¥Ñ•É}µÕĞ ¤¹™¥¹¡ñÉ•½É‘ğÉ•½É¹…Õ‘¥Ñ}¥€ôô…Õ‘¥Ñ}¥¤ì(€€€€€€€€€€€É•½É¹ÍÉ••¹Í¡½Ñ}É•˜€ôM½µ”¡…ÉÑ¥™…Ñ}¥¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€=¬¡…Õ‘¥Ñ}¥¤(€€€ô((€€€€¼¼¼I•½É‘Ì„ÍÉ••¹Í¡½ĞÉ•ÅÕ•ÍÑ•Ñ¡É½Õ Ñ¡”Á…¥É•‘…•µ½¸¸Q¡”É•µ½Ñ”(€€€€¼¼¼Á…Ñ ¡…Ì¹¼™É½¹Ñ•¹ÑÕÉ¸½Ñ½½°¥‘•¹Ñ¥Ñä°‰ÕĞ¥ĞµÕÍĞÍÑ¥±°É•…Ñ”Ñ¡”(€€€€¼¼¼Í…µ”‘ÕÉ…‰±”…Õ‘¥ĞÉ½Ü…ÌÑ¡”±½…°ÍÉ••¹Í¡½Ğ½µµ…¹¸(€€€ÁÕˆ™¸É•½É‘}ÍÉ••¹Í¡½Ñ}…Õ‘¥Ñ}™½É}É•µ½Ñ” (€€€€€€€€™Í•±˜°(€€€€€€€Í•ÍÍ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€…ÉÑ¥™…Ñ}¥è€™ÍÑÈ°(€€€€¤€´øI•ÍÕ±ĞñMÑÉ¥¹œ°MÑÉ¥¹œøì(€€€€€€€Í•±˜¹É•½É‘}ÍÉ••¹Í¡½Ñ}…Õ‘¥Ğ (€€€€€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€…ÉÑ¥™…Ñ}¥°(€€€€€€€€€€€€™Õ‘¥Ñ½¹Ñ•áĞèé‘•™…Õ±Ğ ¤°(€€€€€€€€¤(€€€ô((€€€€¼¼¼Y…±¥‘…Ñ•ÌÑ¡”Í•ÍÍ¥½¸½…±±½İ±¥ÍĞ°Ñ¡•¸•¥Ñ¡•È•á•ÕÑ•Ì¥µµ•‘¥…Ñ•±ä(€€€€¼¼¼€¡…ÁÁÉ½Ù•µ‰…Ñ Í•ÍÍ¥½¸¤½ÈÉ•¥ÍÑ•ÉÌ„Á•¹‘¥¹œ…ÁÁÉ½Ù…°…¹É•ÑÕÉ¹Ì(€€€€¼¼¼Ñ¡”É••¥Ù•È¡…±˜½˜¥ÑÌ½¹•Í¡½Ğ¡…¹¹•°™½ÈÑ¡”…±±•ÈÑ¼…İ…¥Ğ¸(€€€€¼¼¼AÕÉ”İ¥Ñ É•ÍÁ•ĞÑ¼ÁÁ!…¹‘±•€½…Íå¹ŒÉÕ¹Ñ¥µ”ƒŠPÑ¡”(€€€€¼¼¼€mÑ…ÕÉ¤èé½µµ…¹‘u€İÉ…ÁÁ•È½İ¹Ì•µ¥ÑÑ¥¹œÑ¡”™É½¹Ñ•¹•Ù•¹Ğ…¹(€€€€¼¼¼…İ…¥Ñ¥¹œİ¥Ñ „Ñ¥µ•½ÕĞ¸(€€€ÁÕˆ™¸‰•¥¹}…Ñ¥½¸ (€€€€€€€€™Í•±˜°(€€€€€€€Í•ÍÍ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€…Ñ¥½¸è½¹ÑÉ½±Ñ¥½¸°(€€€€¤€´øI•ÍÕ±ĞñÑ¥½¹…Ñ”°MÑÉ¥¹œøì(€€€€€€€Í•±˜¹‰•¥¹}…Ñ¥½¹}™½É}Ñ…É•Ğ¡Í•ÍÍ¥½¹}¥°Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°9½¹”°…Ñ¥½¸¤(€€€ô((€€€ÁÕˆ™¸‰•¥¹}…Ñ¥½¹}™½É}Ñ…É•Ğ (€€€€€€€€™Í•±˜°(€€€€€€€Í•ÍÍ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€…Ñ¥½¸è½¹ÑÉ½±Ñ¥½¸°(€€€€¤€´øI•ÍÕ±ĞñÑ¥½¹…Ñ”°MÑÉ¥¹œøì(€€€€€€€Í•±˜¹‰•¥¹}…Ñ¥½¹}™½É}Ñ…É•Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€…Ñ¥½¸°(€€€€€€€€€€€Õ‘¥Ñ½¹Ñ•áĞèé‘•™…Õ±Ğ ¤°(€€€€€€€€¤(€€€ô((€€€™¸‰•¥¹}…Ñ¥½¹}™½É}Ñ…É•Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€€™Í•±˜°(€€€€€€€Í•ÍÍ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€€€€€…Ñ¥½¸è½¹ÑÉ½±Ñ¥½¸°(€€€€€€€½¹Ñ•áĞèÕ‘¥Ñ½¹Ñ•áĞ°(€€€€¤€´øI•ÍÕ±ĞñÑ¥½¹…Ñ”°MÑÉ¥¹œøì(€€€€€€€±•Ğ€¡Í•ÍÍ¥½¸°|¤€ôÍ•±˜¹É•ÅÕ¥É•}…Ñ¥Ù•}Í•ÍÍ¥½¹}™½É}Ñ…É•Ğ (€€€€€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€M•±˜èé…Ñ¥½¹}É•ÅÕ¥É•Í}™É½¹Ñµ½ÍĞ ™…Ñ¥½¸¤°(€€€€€€€€¤üì(€€€€€€€±•Ğ€¡…ÁÁÉ½Ù…°°‘•ÍÉ¥ÁÑ¥½¸¤€ô(€€€€€€€€€€€Í•±˜¹…Ñ¥½¹}…ÁÁÉ½Ù…°¡Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°Ñ…É•Ñ}İ¥¹‘½İ}¥°€™…Ñ¥½¸¤ì(€€€€€€€¥˜Í•ÍÍ¥½¸¹…ÁÁÉ½Ù•‘}‰…Ñ €˜˜…ÁÁÉ½Ù…°€„ôÁÁÉ½Ù…±1•Ù•°èéÉ¥Ñ¥…°ì(€€€€€€€€€€€É•ÑÕÉ¸=¬¡Ñ¥½¹…Ñ”èéá•ÕÑ•¡Í•±˜¹•á•ÕÑ•}™½É}Ñ…É•Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€€€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€€€€€€™…Ñ¥½¸°(€€€€€€€€€€€€€€€€™½¹Ñ•áĞ°(€€€€€€€€€€€€¤¤¤ì(€€€€€€€ô(€€€€€€€±•Ğ…ÁÁÉ½Ù…±}‘¥•ÍĞ€ô…ÁÁÉ½Ù…±}‘¥•ÍĞ (€€€€€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€€™…Ñ¥½¸°(€€€€€€€€€€€…ÁÁÉ½Ù…°°(€€€€€€€€€€€€™‘•ÍÉ¥ÁÑ¥½¸°(€€€€€€€€¤ì(€€€€€€€±•Ğ€¡Í•¹‘•È°É••¥Ù•È¤€ô½¹•Í¡½Ğèé¡…¹¹•°èèñ‰½½°ø ¤ì(€€€€€€€±•Ğ…Ñ¥½¹}¥€ô™½Éµ…Ğ„ ‰½¹ÑÉ½°µ…Ñ¥½¸µíôˆ°UÕ¥èé¹•İ}ØĞ ¤¤ì(€€€€€€€±½¬ ™Í•±˜¹Á•¹‘¥¹œ°€‰Á•¹‘¥¹œ½¹ÑÉ½°…Ñ¥½¹Ìˆ¤ü¹¥¹Í•ÉĞ (€€€€€€€€€€€…Ñ¥½¹}¥¹±½¹” ¤°(€€€€€€€€€€€A•¹‘¥¹½¹ÑÉ½±Ñ¥½¸ì(€€€€€€€€€€€€€€€Í•ÍÍ¥½¹}¥èÍ•ÍÍ¥½¹}¥¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èÑ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥èÑ…É•Ñ}İ¥¹‘½İ}¥¹µ…À¡ÍÑÈèéÑ½}ÍÑÉ¥¹œ¤°(€€€€€€€€€€€€€€€…Ñ¥½¸è…Ñ¥½¸¹±½¹” ¤°(€€€€€€€€€€€€€€€½¹Ñ•áĞ°(€€€€€€€€€€€€€€€…ÁÁÉ½Ù…±}±•Ù•°è…ÁÁÉ½Ù…°°(€€€€€€€€€€€€€€€…ÁÁÉ½Ù…±}‘¥•ÍĞ°(€€€€€€€€€€€€€€€‘•ÍÉ¥ÁÑ¥½¸°(€€€€€€€€€€€€€€€Í•¹‘•ÈèM½µ”¡Í•¹‘•È¤°(€€€€€€€€€€€ô°(€€€€€€€€¤ì(€€€€€€€=¬¡Ñ¥½¹…Ñ”èéA•¹‘¥¹œì(€€€€€€€€€€€…Ñ¥½¹}¥°(€€€€€€€€€€€É••¥Ù•È°(€€€€€€€ô¤(€€€ô((€€€€¼¼¼I•Í½±Ù•Ì„Á•¹‘¥¹œ…Ñ¥½¸‰ä¥°Í•¹‘¥¹œÑ¡”‘•¥Í¥½¸Ñ¡É½Õ ¥ÑÌ(€€€€¼¼¼½¹•Í¡½Ğ¡…¹¹•°¸I•ÑÕÉ¹Ì=¬¡ÑÉÕ”¥€¥˜„Á•¹‘¥¹œ…Ñ¥½¸İ¥Ñ Ñ¡…Ğ¥(€€€€¼¼¼•á¥ÍÑ•°=¬¡™…±Í”¥€½Ñ¡•Éİ¥Í”ƒŠPµ¥ÉÉ½ÉÌÁ•Éµ¥ÍÍ¥½¹Ì¹ÉÍ€Ì(€€€€¼¼¼É•ÍÁ½¹‘}¥™}Á•¹‘¥¹€ÍÁ±¥Ğ‰•Ñİ••¸Ñ¡¥ÌÁÕÉ”±½½­ÕÀ…¹Ñ¡”(€€€€¼¼¼€mÑ…ÕÉ¤èé½µµ…¹‘u€İÉ…ÁÁ•ÈÑ¡…ĞÑÕÉ¹Ì€‰¹½Ğ™½Õ¹ˆ¥¹Ñ¼…¸ÉÉ€¸(€€€ÁÕˆ™¸É•Í½±Ù•}¥™}Á•¹‘¥¹œ ™Í•±˜°…Ñ¥½¹}¥è€™ÍÑÈ°…ÁÁÉ½Ù”è‰½½°¤€´øI•ÍÕ±Ğñ‰½½°°MÑÉ¥¹œøì(€€€€€€€±•ĞµÕĞÁ•¹‘¥¹œ€ô±½¬ ™Í•±˜¹Á•¹‘¥¹œ°€‰Á•¹‘¥¹œ½¹ÑÉ½°…Ñ¥½¹Ìˆ¤üì(€€€€€€€¥˜€…Á•¹‘¥¹œ¹½¹Ñ…¥¹Í}­•ä¡…Ñ¥½¹}¥¤ì(€€€€€€€€€€€É•ÑÕÉ¸=¬¡™…±Í”¤ì(€€€€€€€ô(€€€€€€€€¼¼%˜Ñ¡”É••¥Ù¥¹œ•¹İ…Ì…±É•…‘ä‘É½ÁÁ•€¡”¹œ¸Ñ¡”É•ÅÕ•ÍĞÑ¥µ•(€€€€€€€€¼¼½ÕĞ©ÕÍĞ‰•™½É”Ñ¡¥Ì…±°¤°Ñ¡•É”Ì¹½Ñ¡¥¹œ±•™ĞÑ¼¹½Ñ¥™ä¸(€€€€€€€±•ĞÍ•¹‘•È€ôÁ•¹‘¥¹œ(€€€€€€€€€€€€¹•Ñ}µÕĞ¡…Ñ¥½¹}¥¤(€€€€€€€€€€€€¹…¹‘}Ñ¡•¸¡ñÁ•¹‘¥¹ğÁ•¹‘¥¹œ¹Í•¹‘•È¹Ñ…­” ¤¤ì(€€€€€€€±•ĞM½µ”¡Í•¹‘•È¤€ôÍ•¹‘•È•±Í”ì(€€€€€€€€€€€É•ÑÕÉ¸=¬¡™…±Í”¤ì(€€€€€€€ôì(€€€€€€€±•Ğ|€ôÍ•¹‘•È¹Í•¹¡…ÁÁÉ½Ù”¤ì(€€€€€€€¥˜€……ÁÁÉ½Ù”ì(€€€€€€€€€€€Á•¹‘¥¹œ¹É•µ½Ù”¡…Ñ¥½¹}¥¤ì(€€€€€€€ô(€€€€€€€=¬¡ÑÉÕ”¤(€€€ô((€€€™¸Ñ…­•}…ÁÁÉ½Ù•‘}Á•¹‘¥¹œ (€€€€€€€€™Í•±˜°(€€€€€€€…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€…Ñ¥½¸è€™½¹ÑÉ½±Ñ¥½¸°(€€€€¤€´øI•ÍÕ±Ğñá•ÕÑ¥½¹I•ÍÕ±Ğ°MÑÉ¥¹œøì(€€€€€€€±•ĞÁ•¹‘¥¹œ€ô±½¬ ™Í•±˜¹Á•¹‘¥¹œ°€‰Á•¹‘¥¹œ½¹ÑÉ½°…Ñ¥½¹Ìˆ¤ü(€€€€€€€€€€€€¹É•µ½Ù”¡…Ñ¥½¹}¥¤(€€€€€€€€€€€€¹½­}½É}•±Í”¡ñğ€‰ÁÁÉ½Ù•½¹ÑÉ½°…Ñ¥½¸İ…Ì¹¼±½¹•ÈÁ•¹‘¥¹œˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤üì(€€€€€€€¥˜€™Á•¹‘¥¹œ¹…Ñ¥½¸€„ô…Ñ¥½¸ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰A•¹‘¥¹œ…Ñ¥½¸Á…å±½…¡…¹•‰•™½É”…ÁÁÉ½Ù…°ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€±•Ğ€¡…ÁÁÉ½Ù…°°‘•ÍÉ¥ÁÑ¥½¸¤€ôÍ•±˜¹…Ñ¥½¹}…ÁÁÉ½Ù…° (€€€€€€€€€€€€™Á•¹‘¥¹œ¹Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Á•¹‘¥¹œ¹Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€€€€€€™Á•¹‘¥¹œ¹…Ñ¥½¸°(€€€€€€€€¤ì(€€€€€€€±•Ğ‘¥•ÍĞ€ô…ÁÁÉ½Ù…±}‘¥•ÍĞ (€€€€€€€€€€€€™Á•¹‘¥¹œ¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€™Á•¹‘¥¹œ¹Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Á•¹‘¥¹œ¹Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€€€€€€™Á•¹‘¥¹œ¹…Ñ¥½¸°(€€€€€€€€€€€…ÁÁÉ½Ù…°°(€€€€€€€€€€€€™‘•ÍÉ¥ÁÑ¥½¸°(€€€€€€€€¤ì(€€€€€€€¥˜…ÁÁÉ½Ù…°€„ôÁ•¹‘¥¹œ¹…ÁÁÉ½Ù…±}±•Ù•°ñğ‘¥•ÍĞ€„ôÁ•¹‘¥¹œ¹…ÁÁÉ½Ù…±}‘¥•ÍĞì(€€€€€€€€€€€±•Ğ|€ôÍ•±˜¹É•½É‘}¹…µ•‘}…Õ‘¥Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€€€€€€€€€€™Á•¹‘¥¹œ¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€€€€€™Á•¹‘¥¹œ¹Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€€€€€Á•¹‘¥¹œ¹Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€€€€€€€€€™½Éµ…Ğ„ ‰íô€¡…ÁÁÉ½Ù…°¥¹Ù…±¥‘…Ñ•¤ˆ°Á•¹‘¥¹œ¹‘•ÍÉ¥ÁÑ¥½¸¤°(€€€€€€€€€€€€€€€€‰É•™ÕÍ•ˆ°(€€€€€€€€€€€€€€€€‰…ÁÁÉ½Ù…±}¥¹Ù…±¥‘…Ñ•ˆ°(€€€€€€€€€€€€€€€™…±Í”°(€€€€€€€€€€€€€€€™…±Í”°(€€€€€€€€€€€€€€€M½µ” ‰Q…É•ĞÍ•µ…¹Ñ¥Ì½ÈÉ¥Í¬¡…¹•İ¡¥±”…ÁÁÉ½Ù…°İ…ÌÁ•¹‘¥¹œˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€™Á•¹‘¥¹œ¹½¹Ñ•áĞ°(€€€€€€€€€€€€¤ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰½¹ÑÉ½°…Ñ¥½¸…ÁÁÉ½Ù…°İ…Ì¥¹Ù…±¥‘…Ñ•‰ä„Ñ…É•Ğ½ÈÉ¥Í¬¡…¹”ì…ÁÁÉ½Ù”Ñ¡”É•™É•Í¡•…Ñ¥½¸ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€Í•±˜¹•á•ÕÑ•}™½É}Ñ…É•Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€€€€€€™Á•¹‘¥¹œ¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€™Á•¹‘¥¹œ¹Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Á•¹‘¥¹œ¹Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€€€€€€™Á•¹‘¥¹œ¹…Ñ¥½¸°(€€€€€€€€€€€€™Á•¹‘¥¹œ¹½¹Ñ•áĞ°(€€€€€€€€¤(€€€ô((€€€€¼¼¼½µÁ±•Ñ”„Á•¹‘¥¹œÁ•Èµ…Ñ¥½¸…ÁÁÉ½Ù…°Ñ¡…Ğ„¹½¸µ‰…Ñ Í•ÍÍ¥½¸(€€€€¼¼¼ÁÉ½‘Õ•Ù¥„mÑ¥½¹…Ñ”èéA•¹‘¥¹t¸I•Í½±Ù•ÌÑ¡”Á•¹‘¥¹œ•¹ÑÉä€¡Í¼(€€€€¼¼¼¥ÑÌ½¹•Í¡½Ğ¥Ì½¹ÍÕµ••á…Ñ±ä½¹”¤…¹°½¹±ä¥˜¥ĞÍÑ¥±°•á¥ÍÑ•…¹(€€€€¼¼¼Ñ¡”‘•¥Í¥½¸İ…ÌÑ¼…±±½Ü°‘¥ÍÁ…Ñ¡•ÌÑ¡”…Ñ¥½¸Ñ¼Ñ¡”‰…­•¹¸UÍ•(€€€€¼¼¼‰ä¡•…‘±•ÍÌ…±±•ÉÌ€¡Ñ¡”É•Í¥‘•¹Ğ‘…•µ½¸ÌÉ•µ½Ñ”‘•Í­Ñ½Àµ½¹ÑÉ½°(€€€€¼¼¼É½ÕÑ•Ì¤Ñ¡…Ğ‘•¥‘”Ñ¡”…ÁÁÉ½Ù…°¥¹±¥¹”İ¥Ñ „±½…°ÁÉ½µÁĞÉ…Ñ¡•ÈÑ¡…¸(€€€€¼¼¼Ñ¡É½Õ Ñ¡”…Íå¹Œ€mÑ…ÕÉ¤èé½µµ…¹‘u€…İ…¥Ğ½É•Í½±Ù”ÍÁ±¥ĞƒŠP…¹¥Ğ­••ÁÌ(€€€€¼¼¼•á•ÕÑ•€µ½‘Õ±”µÁÉ¥Ù…Ñ”¸I•ÑÕÉ¹Ìİ¡•Ñ¡•ÈÑ¡”…Ñ¥½¸…ÑÕ…±±äÉ…¸¸(€€€€¼¼¼(€€€€¼¼¼™…±Í•€É•ÍÕ±Ğİ¥Ñ …ÁÁÉ½Ù”€ôôÑÉÕ•€µ•…¹ÌÑ¡”Í•ÍÍ¥½¸İ…ÌÍÑ½ÁÁ•(€€€€¼¼¼€¡½È¥ÑÌ…ÁÁÉ½Ù…°Ñ¥µ•½ÕĞ¤‰•Ñİ••¸‰•¥¹}…Ñ¥½¹€…¹Ñ¡¥Ì…±°ƒŠPÑ¡”(€€€€¼¼¼…Ñ¥½¸¥Ì¥¹Ñ•¹Ñ¥½¹…±±ä€©¹½Ğ¨•á•ÕÑ•¥¸Ñ¡…ĞÉ…”¸(€€€ÁÕˆ™¸™¥¹¥Í¡}Á•¹‘¥¹œ (€€€€€€€€™Í•±˜°(€€€€€€€…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€…Ñ¥½¸è€™½¹ÑÉ½±Ñ¥½¸°(€€€€€€€…ÁÁÉ½Ù”è‰½½°°(€€€€¤€´øI•ÍÕ±Ğñ‰½½°°MÑÉ¥¹œøì(€€€€€€€=¬¡Í•±˜(€€€€€€€€€€€€¹™¥¹¥Í¡}Á•¹‘¥¹}İ¥Ñ¡}É•ÍÕ±Ğ¡…Ñ¥½¹}¥°…Ñ¥½¸°…ÁÁÉ½Ù”¤ü(€€€€€€€€€€€€¹¥Í}Í½µ” ¤¤(€€€ô((€€€ÁÕˆ™¸™¥¹¥Í¡}Á•¹‘¥¹}İ¥Ñ¡}É•ÍÕ±Ğ (€€€€€€€€™Í•±˜°(€€€€€€€…Ñ¥½¹}¥è€™ÍÑÈ°(€€€€€€€…Ñ¥½¸è€™½¹ÑÉ½±Ñ¥½¸°(€€€€€€€…ÁÁÉ½Ù”è‰½½°°(€€€€¤€´øI•ÍÕ±Ğñ=ÁÑ¥½¸ñá•ÕÑ¥½¹I•ÍÕ±Ğø°MÑÉ¥¹œøì(€€€€€€€±•ĞM½µ”¡Á•¹‘¥¹œ¤€ô±½¬ ™Í•±˜¹Á•¹‘¥¹œ°€‰Á•¹‘¥¹œ½¹ÑÉ½°…Ñ¥½¹Ìˆ¤ü¹É•µ½Ù”¡…Ñ¥½¹}¥¤(€€€€€€€•±Í”ì(€€€€€€€€€€€É•ÑÕÉ¸=¬¡9½¹”¤ì(€€€€€€€ôì(€€€€€€€¥˜±•ĞM½µ”¡Í•¹‘•È¤€ôÁ•¹‘¥¹œ¹Í•¹‘•Èì(€€€€€€€€€€€±•Ğ|€ôÍ•¹‘•È¹Í•¹¡…ÁÁÉ½Ù”¤ì(€€€€€€€ô(€€€€€€€¥˜€……ÁÁÉ½Ù”ì(€€€€€€€€€€€±•Ğ|€ôÍ•±˜¹É•½É‘}¹…µ•‘}…Õ‘¥Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€€€€€€€€€€™Á•¹‘¥¹œ¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€€€€€™Á•¹‘¥¹œ¹Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€€€€€Á•¹‘¥¹œ¹Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€€€€€€€€€™½Éµ…Ğ„ ‰íô€¡‘•¹¥•¤ˆ°…Ñ¥½¹}ÍÕµµ…Éä ™Á•¹‘¥¹œ¹…Ñ¥½¸¤¤°(€€€€€€€€€€€€€€€€‰‘•¹¥•ˆ°(€€€€€€€€€€€€€€€€‰½Á•É…Ñ½É}‘•¹¥•ˆ°(€€€€€€€€€€€€€€€™…±Í”°(€€€€€€€€€€€€€€€™…±Í”°(€€€€€€€€€€€€€€€M½µ” ‰½Á•É…Ñ½È‘•¹¥•Ñ¡”Á•¹‘¥¹œ…Ñ¥½¸ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€™Á•¹‘¥¹œ¹½¹Ñ•áĞ°(€€€€€€€€€€€€¤ì(€€€€€€€€€€€É•ÑÕÉ¸=¬¡9½¹”¤ì(€€€€€€€ô(€€€€€€€¥˜€™Á•¹‘¥¹œ¹…Ñ¥½¸€„ô…Ñ¥½¸ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰A•¹‘¥¹œ…Ñ¥½¸Á…å±½…¡…¹•‰•™½É”…ÁÁÉ½Ù…°ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€±•Ğ€¡…ÁÁÉ½Ù…°°‘•ÍÉ¥ÁÑ¥½¸¤€ôÍ•±˜¹…Ñ¥½¹}…ÁÁÉ½Ù…° (€€€€€€€€€€€€™Á•¹‘¥¹œ¹Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Á•¹‘¥¹œ¹Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€€€€€€™Á•¹‘¥¹œ¹…Ñ¥½¸°(€€€€€€€€¤ì(€€€€€€€±•Ğ‘¥•ÍĞ€ô…ÁÁÉ½Ù…±}‘¥•ÍĞ (€€€€€€€€€€€€™Á•¹‘¥¹œ¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€™Á•¹‘¥¹œ¹Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Á•¹‘¥¹œ¹Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€€€€€€™Á•¹‘¥¹œ¹…Ñ¥½¸°(€€€€€€€€€€€…ÁÁÉ½Ù…°°(€€€€€€€€€€€€™‘•ÍÉ¥ÁÑ¥½¸°(€€€€€€€€¤ì(€€€€€€€¥˜…ÁÁÉ½Ù…°€„ôÁ•¹‘¥¹œ¹…ÁÁÉ½Ù…±}±•Ù•°ñğ‘¥•ÍĞ€„ôÁ•¹‘¥¹œ¹…ÁÁÉ½Ù…±}‘¥•ÍĞì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ ‰½¹ÑÉ½°…Ñ¥½¸…ÁÁÉ½Ù…°İ…Ì¥¹Ù…±¥‘…Ñ•‰ä„Ñ…É•Ğ½ÈÉ¥Í¬¡…¹”ì…ÁÁÉ½Ù”Ñ¡”É•™É•Í¡•…Ñ¥½¸ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€ô(€€€€€€€±•ĞÉ•ÍÕ±Ğ€ôÍ•±˜¹•á•ÕÑ•}™½É}Ñ…É•Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€€€€€€™Á•¹‘¥¹œ¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€™Á•¹‘¥¹œ¹Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€Á•¹‘¥¹œ¹Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€€€€€€™Á•¹‘¥¹œ¹…Ñ¥½¸°(€€€€€€€€€€€€™Á•¹‘¥¹œ¹½¹Ñ•áĞ°(€€€€€€€€¤üì(€€€€€€€=¬¡M½µ”¡É•ÍÕ±Ğ¤¤(€€€ô((€€€™¸‘•¹å}Á•¹‘¥¹}™½É}Í•ÍÍ¥½¸ ™Í•±˜°Í•ÍÍ¥½¹}¥è€™ÍÑÈ¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€€€€€±•ĞµÕĞÁ•¹‘¥¹œ€ô±½¬ ™Í•±˜¹Á•¹‘¥¹œ°€‰Á•¹‘¥¹œ½¹ÑÉ½°…Ñ¥½¹Ìˆ¤üì(€€€€€€€±•Ğµ…Ñ¡¥¹œèY•ŒñMÑÉ¥¹œø€ôÁ•¹‘¥¹œ(€€€€€€€€€€€€¹¥Ñ•È ¤(€€€€€€€€€€€€¹™¥±Ñ•È¡ğ¡|°…Ñ¥½¸¥ğ…Ñ¥½¸¹Í•ÍÍ¥½¹}¥€ôôÍ•ÍÍ¥½¹}¥¤(€€€€€€€€€€€€¹µ…À¡ğ¡¥°|¥ğ¥¹±½¹” ¤¤(€€€€€€€€€€€€¹½±±•Ğ ¤ì(€€€€€€€™½È¥¥¸µ…Ñ¡¥¹œì(€€€€€€€€€€€¥˜±•ĞM½µ”¡…Ñ¥½¸¤€ôÁ•¹‘¥¹œ¹É•µ½Ù” ™¥¤ì(€€€€€€€€€€€€€€€¥˜±•ĞM½µ”¡Í•¹‘•È¤€ô…Ñ¥½¸¹Í•¹‘•Èì(€€€€€€€€€€€€€€€€€€€±•Ğ|€ôÍ•¹‘•È¹Í•¹¡™…±Í”¤ì(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€ô(€€€€€€€ô(€€€€€€€=¬  ¤¤(€€€ô((€€€€¼¼¼I•µ½Ù•Ì½¹”Á•¹‘¥¹œ…Ñ¥½¸İ¥Ñ¡½ÕĞÉ•Í½±Ù¥¹œ¥ĞƒŠPÕÍ•İ¡•¸Ñ¡”(€€€€¼¼¼…ÁÁÉ½Ù…°İ…¥Ğ¥ÑÍ•±˜Ñ¥µ•Ì½ÕĞ€¡Í•”‘•Í­Ñ½Á}½¹ÑÉ½±}É•ÅÕ•ÍÑ}…Ñ¥½¹€¤°(€€€€¼¼¼İ¡•É”Ñ¡”½¹•Í¡½ĞÉ••¥Ù•È¡…Ì…±É•…‘ä½‰Í•ÉÙ•Ñ¡”Ñ¥µ•½ÕĞ…¹Ñ¡•É”(€€€€¼¼¼¥Ì¹½Ñ¡¥¹œ±•™ĞÑ¼¹½Ñ¥™ä¸(€€€™¸É•µ½Ù•}Á•¹‘¥¹œ ™Í•±˜°…Ñ¥½¹}¥è€™ÍÑÈ¤ì(€€€€€€€¥˜±•Ğ=¬¡µÕĞÁ•¹‘¥¹œ¤€ôÍ•±˜¹Á•¹‘¥¹œ¹±½¬ ¤ì(€€€€€€€€€€€Á•¹‘¥¹œ¹É•µ½Ù”¡…Ñ¥½¹}¥¤ì(€€€€€€€ô(€€€ô((€€€€¼¼¼•…Ñ¥Ù…Ñ•Ì•Ù•ÉäÍ•ÍÍ¥½¸…¹‘•¹¥•Ì•Ù•ÉäÁ•¹‘¥¹œ…Ñ¥½¸¸%‘•µÁ½Ñ•¹Ğ(€€€€¼¼¼ƒŠP…±±¥¹œÑ¡¥Ìİ¡•¸¹½Ñ¡¥¹œ¥Ì…Ñ¥Ù”É•ÑÕÉ¹Ì€ À°€À¥€…¹¥Ì¹½Ğ…¸(€€€€¼¼¼•ÉÉ½È°µ¥ÉÉ½É¥¹œ´İ}½µÁ…¹¥½¸èé4İ½µÁ…¹¥½¹MÑ…Ñ”èé•µ•É•¹å}ÍÑ½Á€Ì(€€€€¼¼¼Í…µ”Õ…É…¹Ñ•”€¡‰½Ñ …É”İ¥É•¥¹Ñ¼Ñ¡”Í…µ”…ÁÀµ•á¥ĞÍ¡ÕÑ‘½İ¸Á…Ñ ¥¸(€€€€¼¼¼±¥ˆ¹ÉÍ€°Í¼€‰…±É•…‘äÍÑ½ÁÁ•ˆµÕÍĞ¹•Ù•È‰”ÑÉ•…Ñ•…Ì„™…¥±ÕÉ”¤¸(€€€ÁÕˆ™¸•µ•É•¹å}ÍÑ½À ™Í•±˜¤€´øI•ÍÕ±Ğğ¡ÕÍ¥é”°ÕÍ¥é”¤°MÑÉ¥¹œøì(€€€€€€€±•ĞÍ•ÍÍ¥½¹Í}‘•…Ñ¥Ù…Ñ•€ôì(€€€€€€€€€€€±•ĞµÕĞÍ•ÍÍ¥½¹Ì€ô±½¬ ™Í•±˜¹Í•ÍÍ¥½¹Ì°€‰½¹ÑÉ½°Í•ÍÍ¥½¹Ìˆ¤üì(€€€€€€€€€€€±•Ğ½Õ¹Ğ€ôÍ•ÍÍ¥½¹Ì¹Ù…±Õ•Ì ¤¹™¥±Ñ•È¡ñÍ•ÍÍ¥½¹ğÍ•ÍÍ¥½¸¹…Ñ¥Ù”¤¹½Õ¹Ğ ¤ì(€€€€€€€€€€€™½ÈÍ•ÍÍ¥½¸¥¸Í•ÍÍ¥½¹Ì¹Ù…±Õ•Í}µÕĞ ¤ì(€€€€€€€€€€€€€€€Í•ÍÍ¥½¸¹…Ñ¥Ù”€ô™…±Í”ì(€€€€€€€€€€€ô(€€€€€€€€€€€½Õ¹Ğ(€€€€€€€ôì(€€€€€€€±•Ğ…Ñ¥½¹Í}…¹•±±•€ôì(€€€€€€€€€€€±•ĞµÕĞÁ•¹‘¥¹œ€ô±½¬ ™Í•±˜¹Á•¹‘¥¹œ°€‰Á•¹‘¥¹œ½¹ÑÉ½°…Ñ¥½¹Ìˆ¤üì(€€€€€€€€€€€±•Ğ½Õ¹Ğ€ôÁ•¹‘¥¹œ¹±•¸ ¤ì(€€€€€€€€€€€™½È€¡|°…Ñ¥½¸¤¥¸Á•¹‘¥¹œ¹‘É…¥¸ ¤ì(€€€€€€€€€€€€€€€¥˜±•ĞM½µ”¡Í•¹‘•È¤€ô…Ñ¥½¸¹Í•¹‘•Èì(€€€€€€€€€€€€€€€€€€€±•Ğ|€ôÍ•¹‘•È¹Í•¹¡™…±Í”¤ì(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€ô(€€€€€€€€€€€½Õ¹Ğ(€€€€€€€ôì(€€€€€€€€¼¼Ù•ÉäÍ•ÍÍ¥½¸¥Ì¹½Ü¥¹…Ñ¥Ù”°Í¼Ñ¡”µ…¡¥¹”µİ¥‘”±½¬¥ÌÉ•±•…Í•(€€€€€€€€¼¼Õ¹½¹‘¥Ñ¥½¹…±±äƒŠPÑ¡¥Ì¥ÌÑ¡”…ÁÀµ•á¥Ğ€¼­¥±°µÍİ¥Ñ €¼É•Ù½­”Á…Ñ ¸(€€€€€€€Í•±˜¹É•±•…Í•}±½­}¥™}¥‘±” ¤üì(€€€€€€€=¬ ¡Í•ÍÍ¥½¹Í}‘•…Ñ¥Ù…Ñ•°…Ñ¥½¹Í}…¹•±±•¤¤(€€€ô)ô()™¸•¹ÍÕÉ•}µ…¥¹}İ¥¹‘½Ü¡İ¥¹‘½Üè€™Ñ…ÕÉ¤èé]¥¹‘½Ü¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€¥˜İ¥¹‘½Ü¹±…‰•° ¤€ôô€‰µ…¥¸ˆì(€€€€€€€=¬  ¤¤(€€€ô•±Í”ì(€€€€€€€ÉÈ ‰M…™”•Í­Ñ½À½¹ÑÉ½°…¸½¹±ä‰”‘É¥Ù•¸™É½´Ñ¡”µ…¥¸İ¥¹‘½Üˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€ô)ô()™¸•¹ÍÕÉ•}½¹ÑÉ½±}İ¥¹‘½Ü¡İ¥¹‘½Üè€™Ñ…ÕÉ¤èé]¥¹‘½Ü¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€¥˜µ…Ñ¡•Ì„¡İ¥¹‘½Ü¹±…‰•° ¤°€‰µ…¥¸ˆğ€‰½µÁ…¹¥½¸µ½Ù•É±…äˆ¤ì(€€€€€€€=¬  ¤¤(€€€ô•±Í”ì(€€€€€€€ÉÈ (€€€€€€€€€€€€‰•Í­Ñ½À½¹ÑÉ½°…¸½¹±ä‰”µ…¹…•™É½´Ñ¡”µ…¥¸İ¥¹‘½Ü½ÈÙ¥Í¥‰±”½¹ÑÉ½°½Ù•É±…äˆ(€€€€€€€€€€€€€€€€¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€¤(€€€ô)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ™¸‘•Í­Ñ½Á}½¹ÑÉ½±}ÍÑ…ÉÑ}Í•ÍÍ¥½¸ (€€€…ÁÀèÑ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€İ¥¹‘½ÜèÑ…ÕÉ¤èé]¥¹‘½Ü°(€€€Á•Éµ¥ÍÍ¥½¹Í}ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°É…Ñ”èéÁÁMÑ…Ñ”ø°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€…±±½İ•‘}…ÁÁ±¥…Ñ¥½¹ÌèY•ŒñMÑÉ¥¹œø°(€€€±¥™•Ñ¥µ•}µÌèÔØĞ°(€€€…ÁÁÉ½Ù•‘}‰…Ñ è‰½½°°(€€€…±±½İ•‘}İ¥¹‘½İÌè=ÁÑ¥½¸ñY•ŒñMÑÉ¥¹œøø°(€€€…±±½İ}ÍÉ••¹Í¡½ÑÌè=ÁÑ¥½¸ñ‰½½°ø°(€€€…±±½İ}­•å‰½…É‘}¥¹ÁÕĞè=ÁÑ¥½¸ñ‰½½°ø°(€€€…±±½İ}±¥Á‰½…É‘}É•…è=ÁÑ¥½¸ñ‰½½°ø°(€€€…ÁÁÉ½Ù…±}Á½±¥äè=ÁÑ¥½¸ñÁÁÉ½Ù…±A½±¥äø°(¤€´øI•ÍÕ±Ğñ½¹ÑÉ½±M•ÍÍ¥½¸°MÑÉ¥¹œøì(€€€•¹ÍÕÉ•}µ…¥¹}İ¥¹‘½Ü ™İ¥¹‘½Ü¤üì(€€€±•Ğµ½‘”€ôÉ…Ñ”èéÁ•Éµ¥ÍÍ¥½¹Ìèé•Ñ}Á•Éµ¥ÍÍ¥½¹}µ½‘•}¥µÁ° ™Á•Éµ¥ÍÍ¥½¹Í}ÍÑ…Ñ”¤ì(€€€±•ĞÍ•ÍÍ¥½¸€ôÍÑ…Ñ”¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}İ¥Ñ¡}½ÁÑ¥½¹Ì (€€€€€€€€™µ½‘”°(€€€€€€€…±±½İ•‘}…ÁÁ±¥…Ñ¥½¹Ì°(€€€€€€€±¥™•Ñ¥µ•}µÌ°(€€€€€€€M•ÍÍ¥½¹É…¹Ñ=ÁÑ¥½¹Ìì(€€€€€€€€€€€…±±½İ•‘}İ¥¹‘½İÌè…±±½İ•‘}İ¥¹‘½İÌ¹Õ¹İÉ…Á}½É}‘•™…Õ±Ğ ¤°(€€€€€€€€€€€…±±½İ}ÍÉ••¹Í¡½ÑÌè…±±½İ}ÍÉ••¹Í¡½ÑÌ¹Õ¹İÉ…Á}½È¡™…±Í”¤°(€€€€€€€€€€€…±±½İ}­•å‰½…É‘}¥¹ÁÕĞè…±±½İ}­•å‰½…É‘}¥¹ÁÕĞ¹Õ¹İÉ…Á}½È¡™…±Í”¤°(€€€€€€€€€€€…±±½İ}±¥Á‰½…É‘}É•…è…±±½İ}±¥Á‰½…É‘}É•…¹Õ¹İÉ…Á}½È¡™…±Í”¤°(€€€€€€€€€€€…ÁÁÉ½Ù…±}Á½±¥äèM½µ”¡…ÁÁÉ½Ù…±}Á½±¥ä¹Õ¹İÉ…Á}½È¡¥˜…ÁÁÉ½Ù•‘}‰…Ñ ì(€€€€€€€€€€€€€€€ÁÁÉ½Ù…±A½±¥äèéÁÁÉ½Ù•‘	…Ñ (€€€€€€€€€€€ô•±Í”ì(€€€€€€€€€€€€€€€ÁÁÉ½Ù…±A½±¥äèéA•ÉÑ¥½¸(€€€€€€€€€€€ô¤¤°(€€€€€€€ô°(€€€€¤üì(€€€€¼¼Q¡”Ù¥Í¥‰±”°…±İ…åÌµ½¸µÑ½À½Ù•É±…ä¥ÌÁ…ÉĞ½˜Ñ¡”Í…™•Ñä¥¹Ù…É¥…¹Ğ¸¼(€€€€¼¼¹½Ğ±•…Ù”„±¥Ù”¥¹ÁÕĞÍ•ÍÍ¥½¸‰•¡¥¹İ¡•¸Ñ¡”½Á•É…Ñ½È…¹¹½ĞÍ•”¥Ğ¸(€€€¥˜±•ĞÉÈ¡•ÉÉ½È¤€ôÉ…Ñ”èé´İ}½µÁ…¹¥½¸èéÍ¡½İ}½Ù•É±…ä ™…ÁÀ¤ì(€€€€€€€±•Ğ|€ôÍÑ…Ñ”¹ÍÑ½Á}Í•ÍÍ¥½¸ ™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥¤ì(€€€€€€€É•ÑÕÉ¸ÉÈ¡™½Éµ…Ğ„ (€€€€€€€€€€€€‰½Õ±¹½Ğ•ÍÑ…‰±¥Í Ñ¡”‘•Í­Ñ½Àµ½¹ÑÉ½°¥¹‘¥…Ñ½Èèí•ÉÉ½Éôˆ(€€€€€€€€¤¤ì(€€€ô(€€€±•Ğ|€ô…ÁÀ¹•µ¥Ğ ‰‘•Í­Ñ½Àµ½¹ÑÉ½°è¼½Í•ÍÍ¥½¸µÍÑ…Ñ”ˆ°€™Í•ÍÍ¥½¸¤ì(€€€=¬¡Í•ÍÍ¥½¸¤)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ™¸‘•Í­Ñ½Á}½¹ÑÉ½±}ÍÑ½Á}Í•ÍÍ¥½¸ (€€€…ÁÀèÑ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€İ¥¹‘½ÜèÑ…ÕÉ¤èé]¥¹‘½Ü°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(¤€´øI•ÍÕ±Ğñ‰½½°°MÑÉ¥¹œøì(€€€•¹ÍÕÉ•}½¹ÑÉ½±}İ¥¹‘½Ü ™İ¥¹‘½Ü¤üì(€€€±•ĞÍÑ½ÁÁ•€ôÍÑ…Ñ”¹ÍÑ½Á}Í•ÍÍ¥½¸ ™Í•ÍÍ¥½¹}¥¤üì(€€€¥˜€…ÍÑ…Ñ”¹…¹å}Í•ÍÍ¥½¹}…Ñ¥Ù” ¤üì(€€€€€€€¥˜±•ĞM½µ”¡½Ù•É±…ä¤€ô…ÁÀ¹•Ñ}İ•‰Ù¥•İ}İ¥¹‘½Ü ‰½µÁ…¹¥½¸µ½Ù•É±…äˆ¤ì(€€€€€€€€€€€±•Ğ|€ô½Ù•É±…ä¹¡¥‘” ¤ì(€€€€€€€ô(€€€ô(€€€±•Ğ|€ô…ÁÀ¹•µ¥Ğ (€€€€€€€€‰‘•Í­Ñ½Àµ½¹ÑÉ½°è¼½Í•ÍÍ¥½¸µÍÑ…Ñ”ˆ°(€€€€€€€ÍÑ…Ñ”¹Í•ÍÍ¥½¹Í}Í¹…ÁÍ¡½Ğ ¤ü°(€€€€¤ì(€€€=¬¡ÍÑ½ÁÁ•¤)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ™¸‘•Í­Ñ½Á}½¹ÑÉ½±}Á…ÕÍ•}Í•ÍÍ¥½¸ (€€€…ÁÀèÑ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€İ¥¹‘½ÜèÑ…ÕÉ¤èé]¥¹‘½Ü°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€Á…ÕÍ•è‰½½°°(¤€´øI•ÍÕ±Ğñ‰½½°°MÑÉ¥¹œøì(€€€•¹ÍÕÉ•}½¹ÑÉ½±}İ¥¹‘½Ü ™İ¥¹‘½Ü¤üì(€€€±•Ğ¡…¹•€ôÍÑ…Ñ”¹Á…ÕÍ•}Í•ÍÍ¥½¸ ™Í•ÍÍ¥½¹}¥°Á…ÕÍ•¤üì(€€€±•Ğ|€ô…ÁÀ¹•µ¥Ğ (€€€€€€€€‰‘•Í­Ñ½Àµ½¹ÑÉ½°è¼½Í•ÍÍ¥½¸µÍÑ…Ñ”ˆ°(€€€€€€€ÍÑ…Ñ”¹Í•ÍÍ¥½¹Í}Í¹…ÁÍ¡½Ğ ¤ü°(€€€€¤ì(€€€=¬¡¡…¹•¤)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ™¸‘•Í­Ñ½Á}½¹ÑÉ½±}Í•ÍÍ¥½¹Ì (€€€…ÁÀèÑ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(¤€´øI•ÍÕ±ĞñY•Œñ½¹ÑÉ½±M•ÍÍ¥½¸ø°MÑÉ¥¹œøì(€€€±•ĞÍ•ÍÍ¥½¹Ì€ôÍÑ…Ñ”¹Í•ÍÍ¥½¹Í}Í¹…ÁÍ¡½Ğ ¤üì(€€€¥˜€…Í•ÍÍ¥½¹Ì¹¥Ñ•È ¤¹…¹ä¡ñÍ•ÍÍ¥½¹ğÍ•ÍÍ¥½¸¹…Ñ¥Ù”¤ì(€€€€€€€¥˜±•ĞM½µ”¡½Ù•É±…ä¤€ô…ÁÀ¹•Ñ}İ•‰Ù¥•İ}İ¥¹‘½Ü ‰½µÁ…¹¥½¸µ½Ù•É±…äˆ¤ì(€€€€€€€€€€€±•Ğ|€ô½Ù•É±…ä¹¡¥‘” ¤ì(€€€€€€€ô(€€€ô(€€€=¬¡Í•ÍÍ¥½¹Ì¤)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ…Íå¹Œ™¸‘•Í­Ñ½Á}½¹ÑÉ½±}É•ÅÕ•ÍÑ}…Ñ¥½¸ (€€€…ÁÀèÑ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€İ¥¹‘½ÜèÑ…ÕÉ¤èé]¥¹‘½Ü°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€…Ñ¥½¸è½¹ÑÉ½±Ñ¥½¸°(€€€ÑÕÉ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(¤€´øI•ÍÕ±ĞñÑ¥½¹=ÕÑ½µ”°MÑÉ¥¹œøì(€€€•¹ÍÕÉ•}µ…¥¹}İ¥¹‘½Ü ™İ¥¹‘½Ü¤üì(€€€É•ÅÕ•ÍÑ}…Ñ¥½¹}¥µÁ° (€€€€€€€€™…ÁÀ°(€€€€€€€ÍÑ…Ñ”¹¥¹¹•È ¤°(€€€€€€€€™Í•ÍÍ¥½¹}¥°(€€€€€€€€™Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€…Ñ¥½¸°(€€€€€€€ÑÕÉ¹}¥°(€€€€€€€Ñ½½±}…±±}¥°(€€€€¤(€€€€¹…İ…¥Ğ)ô()…Íå¹Œ™¸É•ÅÕ•ÍÑ}…Ñ¥½¹}¥µÁ° (€€€…ÁÀè€™Ñ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€ÍÑ…Ñ”è€™•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”°(€€€Í•ÍÍ¥½¹}¥è€™ÍÑÈ°(€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥è€™ÍÑÈ°(€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ğ™ÍÑÈø°(€€€…Ñ¥½¸è½¹ÑÉ½±Ñ¥½¸°(€€€ÉÕ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(¤€´øI•ÍÕ±ĞñÑ¥½¹=ÕÑ½µ”°MÑÉ¥¹œøì(€€€±•Ğ½¹Ñ•áĞ€ôÕ‘¥Ñ½¹Ñ•áĞì(€€€€€€€ÉÕ¹}¥°(€€€€€€€Ñ½½±}…±±}¥°(€€€ôì(€€€±•Ğ…Ñ”€ôµ…Ñ ÍÑ…Ñ”¹‰•¥¹}…Ñ¥½¹}™½É}Ñ…É•Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€…Ñ¥½¸¹±½¹” ¤°(€€€€€€€½¹Ñ•áĞ¹±½¹” ¤°(€€€€¤ì(€€€€€€€=¬¡…Ñ”¤€ôø…Ñ”°(€€€€€€€ÉÈ¡•ÉÉ½È¤€ôøì(€€€€€€€€€€€±•Ğ|€ôÍÑ…Ñ”¹É•½É‘}¹…µ•‘}…Õ‘¥Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€€€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€€€€€™½Éµ…Ğ„ ‰íô€¡É•™ÕÍ•¤ˆ°…Ñ¥½¹}ÍÕµµ…Éä ™…Ñ¥½¸¤¤°(€€€€€€€€€€€€€€€€‰É•™ÕÍ•ˆ°(€€€€€€€€€€€€€€€€‰¹½Ñ}…ÁÁÉ½Ù•ˆ°(€€€€€€€€€€€€€€€™…±Í”°(€€€€€€€€€€€€€€€™…±Í”°(€€€€€€€€€€€€€€€M½µ”¡•ÉÉ½È¹±½¹” ¤¤°(€€€€€€€€€€€€€€€€™½¹Ñ•áĞ°(€€€€€€€€€€€€¤ì(€€€€€€€€€€€É•ÑÕÉ¸ÉÈ¡•ÉÉ½È¤ì(€€€€€€€ô(€€€ôì(€€€µ…Ñ …Ñ”ì(€€€€€€€Ñ¥½¹…Ñ”èéá•ÕÑ•¡É•ÍÕ±Ğ¤€ôøì(€€€€€€€€€€€±•ĞÉ•ÍÕ±Ğ€ôÉ•ÍÕ±Ğüì(€€€€€€€€€€€=¬¡Ñ¥½¹=ÕÑ½µ”ì(€€€€€€€€€€€€€€€…Ñ¥½¹}¥è™½Éµ…Ğ„ ‰‰…Ñ µíôˆ°UÕ¥èé¹•İ}ØĞ ¤¤°(€€€€€€€€€€€€€€€•á•ÕÑ•èÑÉÕ”°(€€€€€€€€€€€€€€€¥¹ÁÕÑ}Í•¹ĞèÉ•ÍÕ±Ğ¹¥¹ÁÕÑ}Í•¹Ğ°(€€€€€€€€€€€€€€€ÍÑ…Ñ•}Ù•É¥™¥•èÉ•ÍÕ±Ğ¹ÍÑ…Ñ•}Ù•É¥™¥•°(€€€€€€€€€€€€€€€Ù•É¥™¥…Ñ¥½¸èÉ•ÍÕ±Ğ¹Ù•É¥™¥…Ñ¥½¸°(€€€€€€€€€€€€€€€Ù•É¥™¥…Ñ¥½¹}•Ù¥‘•¹”èÉ•ÍÕ±Ğ¹Ù•É¥™¥…Ñ¥½¹}•Ù¥‘•¹”°(€€€€€€€€€€€€€€€…Õ‘¥Ñ}¥èÉ•ÍÕ±Ğ¹…Õ‘¥Ñ}¥°(€€€€€€€€€€€€€€€…ÁÁÉ½Ù…±}±•Ù•°èÉ•ÍÕ±Ğ¹…ÁÁÉ½Ù…±}±•Ù•°°(€€€€€€€€€€€ô¤(€€€€€€€ô(€€€€€€€Ñ¥½¹…Ñ”èéA•¹‘¥¹œì(€€€€€€€€€€€…Ñ¥½¹}¥°(€€€€€€€€€€€É••¥Ù•È°(€€€€€€€ô€ôøì(€€€€€€€€€€€±•Ğ€¡…ÁÁÉ½Ù…±}±•Ù•°°‘•ÍÉ¥ÁÑ¥½¸¤€ô(€€€€€€€€€€€€€€€ÍÑ…Ñ”¹…Ñ¥½¹}…ÁÁÉ½Ù…°¡Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°Ñ…É•Ñ}İ¥¹‘½İ}¥°€™…Ñ¥½¸¤ì(€€€€€€€€€€€±•Ğ|€ô…ÁÀ¹•µ¥Ğ (€€€€€€€€€€€€€€€€‰‘•Í­Ñ½Àµ½¹ÑÉ½°è¼½…Ñ¥½¸µÁ•¹‘¥¹œˆ°(€€€€€€€€€€€€€€€A•¹‘¥¹Ñ¥½¹MÕµµ…Éäì(€€€€€€€€€€€€€€€€€€€…Ñ¥½¹}¥è…Ñ¥½¹}¥¹±½¹” ¤°(€€€€€€€€€€€€€€€€€€€Í•ÍÍ¥½¹}¥èÍ•ÍÍ¥½¹}¥¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èÑ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥èÑ…É•Ñ}İ¥¹‘½İ}¥¹µ…À¡ÍÑÈèéÑ½}ÍÑÉ¥¹œ¤°(€€€€€€€€€€€€€€€€€€€…ÁÁÉ½Ù…±}±•Ù•°°(€€€€€€€€€€€€€€€€€€€‘•ÍÉ¥ÁÑ¥½¸°(€€€€€€€€€€€€€€€€€€€…Ñ¥½¸èÉ•‘…Ñ•‘}…Ñ¥½¹}™½É}Õ¤ ™…Ñ¥½¸¤°(€€€€€€€€€€€€€€€ô°(€€€€€€€€€€€€¤ì(€€€€€€€€€€€µ…Ñ Ñ½­¥¼èéÑ¥µ”èéÑ¥µ•½ÕĞ¡Q%=9}AAI=Y1}Q%5=UP°É••¥Ù•È¤¹…İ…¥Ğì(€€€€€€€€€€€€€€€=¬¡=¬¡ÑÉÕ”¤¤€ôøì(€€€€€€€€€€€€€€€€€€€±•ĞÉ•ÍÕ±Ğ€ôÍÑ…Ñ”¹Ñ…­•}…ÁÁÉ½Ù•‘}Á•¹‘¥¹œ ™…Ñ¥½¹}¥°€™…Ñ¥½¸¤üì(€€€€€€€€€€€€€€€€€€€=¬¡Ñ¥½¹=ÕÑ½µ”ì(€€€€€€€€€€€€€€€€€€€€€€€…Ñ¥½¹}¥°(€€€€€€€€€€€€€€€€€€€€€€€•á•ÕÑ•èÑÉÕ”°(€€€€€€€€€€€€€€€€€€€€€€€¥¹ÁÕÑ}Í•¹ĞèÉ•ÍÕ±Ğ¹¥¹ÁÕÑ}Í•¹Ğ°(€€€€€€€€€€€€€€€€€€€€€€€ÍÑ…Ñ•}Ù•É¥™¥•èÉ•ÍÕ±Ğ¹ÍÑ…Ñ•}Ù•É¥™¥•°(€€€€€€€€€€€€€€€€€€€€€€€Ù•É¥™¥…Ñ¥½¸èÉ•ÍÕ±Ğ¹Ù•É¥™¥…Ñ¥½¸°(€€€€€€€€€€€€€€€€€€€€€€€Ù•É¥™¥…Ñ¥½¹}•Ù¥‘•¹”èÉ•ÍÕ±Ğ¹Ù•É¥™¥…Ñ¥½¹}•Ù¥‘•¹”°(€€€€€€€€€€€€€€€€€€€€€€€…Õ‘¥Ñ}¥èÉ•ÍÕ±Ğ¹…Õ‘¥Ñ}¥°(€€€€€€€€€€€€€€€€€€€€€€€…ÁÁÉ½Ù…±}±•Ù•°èÉ•ÍÕ±Ğ¹…ÁÁÉ½Ù…±}±•Ù•°°(€€€€€€€€€€€€€€€€€€€ô¤(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€=¬¡=¬¡™…±Í”¤¤€ôøì(€€€€€€€€€€€€€€€€€€€±•Ğ|€ôÍÑ…Ñ”¹É•½É‘}¹…µ•‘}…Õ‘¥Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€€€€€€€€€€€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€€€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€€€€€€€€€€€€€™½Éµ…Ğ„ ‰íô€¡‘•¹¥•¤ˆ°…Ñ¥½¹}ÍÕµµ…Éä ™…Ñ¥½¸¤¤°(€€€€€€€€€€€€€€€€€€€€€€€€‰‘•¹¥•ˆ°(€€€€€€€€€€€€€€€€€€€€€€€€‰½Á•É…Ñ½É}‘•¹¥•ˆ°(€€€€€€€€€€€€€€€€€€€€€€€™…±Í”°(€€€€€€€€€€€€€€€€€€€€€€€™…±Í”°(€€€€€€€€€€€€€€€€€€€€€€€M½µ” ‰½Á•É…Ñ½È‘•¹¥•Ñ¡”Á•¹‘¥¹œ…Ñ¥½¸ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€€€€€€€€€™½¹Ñ•áĞ°(€€€€€€€€€€€€€€€€€€€€¤ì(€€€€€€€€€€€€€€€€€€€ÉÈ ‰½¹ÑÉ½°…Ñ¥½¸İ…Ì‘•¹¥•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€€¼¼Q¥µ•½ÕĞ°½ÈÑ¡”Í•¹‘•Èİ…Ì‘É½ÁÁ•İ¥Ñ¡½ÕĞ„É•ÍÁ½¹Í”¸(€€€€€€€€€€€€€€€=¬¡ÉÈ¡|¤¤ğÉÈ¡|¤€ôøì(€€€€€€€€€€€€€€€€€€€ÍÑ…Ñ”¹É•µ½Ù•}Á•¹‘¥¹œ ™…Ñ¥½¹}¥¤ì(€€€€€€€€€€€€€€€€€€€±•Ğ|€ôÍÑ…Ñ”¹É•½É‘}¹…µ•‘}…Õ‘¥Ñ}İ¥Ñ¡}½¹Ñ•áĞ (€€€€€€€€€€€€€€€€€€€€€€€Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€€€€€€€€€€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€€€€€€€€€€€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥°(€€€€€€€€€€€€€€€€€€€€€€€™½Éµ…Ğ„ ‰íô€¡Ñ¥µ•½ÕĞ¤ˆ°…Ñ¥½¹}ÍÕµµ…Éä ™…Ñ¥½¸¤¤°(€€€€€€€€€€€€€€€€€€€€€€€€‰Ñ¥µ•½ÕĞˆ°(€€€€€€€€€€€€€€€€€€€€€€€€‰¹½Ñ}…ÁÁÉ½Ù•ˆ°(€€€€€€€€€€€€€€€€€€€€€€€™…±Í”°(€€€€€€€€€€€€€€€€€€€€€€€™…±Í”°(€€€€€€€€€€€€€€€€€€€€€€€M½µ” ‰½Á•É…Ñ½È…ÁÁÉ½Ù…°Ñ¥µ•½ÕĞˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€€€€€€€€€€€€€€™½¹Ñ•áĞ°(€€€€€€€€€€€€€€€€€€€€¤ì(€€€€€€€€€€€€€€€€€€€ÉÈ ‰½¹ÑÉ½°…Ñ¥½¸…ÁÁÉ½Ù…°Ñ¥µ•½ÕĞˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€ô(€€€€€€€ô(€€€ô)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ™¸Ñ½½±}½µÁÕÑ•É}±¥ÍÑ}Ñ…É•ÑÌ (€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€ÑÕÉ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(¤€´øI•ÍÕ±ĞñY•Œñ½µÁÕÑ•ÉQ…É•Ğø°MÑÉ¥¹œøì(€€€±•Ğ|€ô€¡ÑÕÉ¹}¥°Ñ½½±}…±±}¥¤ì(€€€ÍÑ…Ñ”¹±¥ÍÑ}Ñ…É•ÑÍ}™½É}Í•ÍÍ¥½¸ ™Í•ÍÍ¥½¹}¥¤)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ™¸Ñ½½±}½µÁÕÑ•É}¥¹ÍÁ•Ğ (€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÅÕ•Éäè=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÑÕÉ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(¤€´øI•ÍÕ±Ğñ½µÁÕÑ•É%¹ÍÁ•Ñ¥½¸°MÑÉ¥¹œøì(€€€±•Ğ|€ô€¡ÑÕÉ¹}¥°Ñ½½±}…±±}¥¤ì(€€€ÍÑ…Ñ”¹¥¹ÍÁ•Ñ}™½É}Í•ÍÍ¥½¸ (€€€€€€€€™Í•ÍÍ¥½¹}¥°(€€€€€€€€™Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€ÅÕ•Éä¹…Í}‘•É•˜ ¤°(€€€€¤)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ™¸Ñ½½±}½µÁÕÑ•É}ÍÉ••¹Í¡½Ğ (€€€…ÁÀèÑ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€…ÁÁ}ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°É…Ñ”èéÁÁMÑ…Ñ”ø°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€‰½Õ¹‘Ìè=ÁÑ¥½¸ñ½µÁÕÑ•É	½Õ¹‘Ìø°(€€€ÑÕÉ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(¤€´øI•ÍÕ±Ğñ½µÁÕÑ•ÉMÉ••¹Í¡½Ğ°MÑÉ¥¹œøì(€€€±•Ğ€¡Ñ…É•Ğ°‰åÑ•Ì°…ÁÑÕÉ•‘}‰½Õ¹‘Ì¤€ôÍÑ…Ñ”¹ÍÉ••¹Í¡½Ñ}™½É}Í•ÍÍ¥½¸ (€€€€€€€€™Í•ÍÍ¥½¹}¥°(€€€€€€€€™Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€‰½Õ¹‘Ì°(€€€€¤üì(€€€±•Ğ‰±½ˆ€ôÉ…Ñ”èé…ÉÑ¥™…Ñ}½µµ…¹‘ÌèéÍÑ½É•}™½È ™…ÁÀ°…ÁÁ}ÍÑ…Ñ”¹¥¹¹•È ¤¤ü(€€€€€€€€¹ÁÕĞ ™‰åÑ•Ì¤(€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ÉÉ½Éğ™½Éµ…Ğ„ ‰½Õ±¹½ĞÍÑ½É”ÍÉ••¹Í¡½Ğ…ÉÑ¥™…Ğèí•ÉÉ½Éôˆ¤¤üì(€€€±•Ğ…Õ‘¥Ñ}¥€ôÍÑ…Ñ”¹É•½É‘}ÍÉ••¹Í¡½Ñ}…Õ‘¥Ğ (€€€€€€€€™Í•ÍÍ¥½¹}¥°(€€€€€€€€™Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€€™‰±½ˆ¹¥°(€€€€€€€€™Õ‘¥Ñ½¹Ñ•áĞì(€€€€€€€€€€€ÉÕ¹}¥èÑÕÉ¹}¥°(€€€€€€€€€€€Ñ½½±}…±±}¥°(€€€€€€€ô°(€€€€¤üì(€€€=¬¡½µÁÕÑ•ÉMÉ••¹Í¡½Ğì(€€€€€€€…ÉÑ¥™…Ñ}¥è‰±½ˆ¹¥°(€€€€€€€…Õ‘¥Ñ}¥°(€€€€€€€µ•‘¥…}ÑåÁ”è€‰¥µ…”½Á¹œˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€Í¥é•}‰åÑ•Ìè‰±½ˆ¹Í¥é”°(€€€€€€€½¹Ñ•¹Ñ}‰…Í”ØĞè‰…Í”ØĞèé•¹¥¹”èé•¹•É…±}ÁÕÉÁ½Í”èéMQ9I¹•¹½‘”¡‰åÑ•Ì¤°(€€€€€€€‰½Õ¹‘Ìè…ÁÑÕÉ•‘}‰½Õ¹‘Ì°(€€€€€€€Ñ…É•Ğ°(€€€ô¤)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ™¸Ñ½½±}½µÁÕÑ•É}±¥Á‰½…É‘}É•… (€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÑÕÉ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(¤€´øI•ÍÕ±ĞñÍ•É‘•}©Í½¸èéY…±Õ”°MÑÉ¥¹œøì(€€€±•Ğ€¡½¹Ñ•¹Ğ°…Õ‘¥Ñ}¥¤€ôÍÑ…Ñ”¹±¥Á‰½…É‘}™½É}Í•ÍÍ¥½¸ (€€€€€€€€™Í•ÍÍ¥½¹}¥°(€€€€€€€€™Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€€™Õ‘¥Ñ½¹Ñ•áĞì(€€€€€€€€€€€ÉÕ¹}¥èÑÕÉ¹}¥°(€€€€€€€€€€€Ñ½½±}…±±}¥°(€€€€€€€ô°(€€€€¤üì(€€€=¬¡Í•É‘•}©Í½¸èé©Í½¸„¡ì(€€€€€€€€‰½¹Ñ•¹Ğˆè½¹Ñ•¹Ğ°(€€€€€€€€‰…Õ‘¥Ñ%ˆè…Õ‘¥Ñ}¥°(€€€€€€€€‰¹½Ñ”ˆè€‰±¥Á‰½…ÉÉ•…‘Ì…É”Í•Á…É…Ñ•±äÉ…¹Ñ•…¹…É”¹•Ù•È¥¹±Õ‘•¥¸Ñ¡”…Õ‘¥Ğ½¹Ñ•¹Ğˆ°(€€€ô¤¤)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ…Íå¹Œ™¸Ñ½½±}½µÁÕÑ•É}™½ÕÌ (€€€…ÁÀèÑ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÑÕÉ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(¤€´øI•ÍÕ±ĞñÑ¥½¹=ÕÑ½µ”°MÑÉ¥¹œøì(€€€É•ÅÕ•ÍÑ}…Ñ¥½¹}¥µÁ° (€€€€€€€€™…ÁÀ°(€€€€€€€ÍÑ…Ñ”¹¥¹¹•È ¤°(€€€€€€€€™Í•ÍÍ¥½¹}¥°(€€€€€€€€™Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€½¹ÑÉ½±Ñ¥½¸èé½ÕÌ°(€€€€€€€ÑÕÉ¹}¥°(€€€€€€€Ñ½½±}…±±}¥°(€€€€¤(€€€€¹…İ…¥Ğ)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ…Íå¹Œ™¸Ñ½½±}½µÁÕÑ•É}±¥¬ (€€€…ÁÀèÑ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€•±•µ•¹Ñ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€àè=ÁÑ¥½¸ñ¤ÌÈø°(€€€äè=ÁÑ¥½¸ñ¤ÌÈø°(€€€‰ÕÑÑ½¸è=ÁÑ¥½¸ñ5½ÕÍ•	ÕÑÑ½¹-¥¹ø°(€€€•áÁ•Ñ•‘}Ù…±Õ”è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÑÕÉ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(¤€´øI•ÍÕ±ĞñÑ¥½¹=ÕÑ½µ”°MÑÉ¥¹œøì(€€€±•Ğ‰ÕÑÑ½¸€ô‰ÕÑÑ½¸¹Õ¹İÉ…Á}½È¡5½ÕÍ•	ÕÑÑ½¹-¥¹èé1•™Ğ¤ì(€€€±•Ğ…Ñ¥½¸€ô¥˜±•ĞM½µ”¡•±•µ•¹Ñ}¥¤€ô•±•µ•¹Ñ}¥ì(€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•µ…¹Ñ¥±¥¬ì(€€€€€€€€€€€•±•µ•¹Ñ}¥°(€€€€€€€€€€€‰ÕÑÑ½¸°(€€€€€€€€€€€•áÁ•Ñ•‘}Ù…±Õ”°(€€€€€€€ô(€€€ô•±Í”ì(€€€€€€€½¹ÑÉ½±Ñ¥½¸èé5½ÕÍ•±¥­Ğì(€€€€€€€€€€€àèà¹½­}½É}•±Í”¡ñğ€‰½µÁÕÑ•É}±¥¬¹••‘Ì•±•µ•¹Ñ}¥½Èà…¹äˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ü°(€€€€€€€€€€€äèä¹½­}½É}•±Í”¡ñğ€‰½µÁÕÑ•É}±¥¬¹••‘Ì•±•µ•¹Ñ}¥½Èà…¹äˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ü°(€€€€€€€€€€€‰ÕÑÑ½¸°(€€€€€€€ô(€€€ôì(€€€É•ÅÕ•ÍÑ}…Ñ¥½¹}¥µÁ° (€€€€€€€€™…ÁÀ°(€€€€€€€ÍÑ…Ñ”¹¥¹¹•È ¤°(€€€€€€€€™Í•ÍÍ¥½¹}¥°(€€€€€€€€™Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€…Ñ¥½¸°(€€€€€€€ÑÕÉ¹}¥°(€€€€€€€Ñ½½±}…±±}¥°(€€€€¤(€€€€¹…İ…¥Ğ)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ…Íå¹Œ™¸Ñ½½±}½µÁÕÑ•É}‘½Õ‰±•}±¥¬ (€€€…ÁÀèÑ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€•±•µ•¹Ñ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€àè=ÁÑ¥½¸ñ¤ÌÈø°(€€€äè=ÁÑ¥½¸ñ¤ÌÈø°(€€€‰ÕÑÑ½¸è=ÁÑ¥½¸ñ5½ÕÍ•	ÕÑÑ½¹-¥¹ø°(€€€•áÁ•Ñ•‘}Ù…±Õ”è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€ÑÕÉ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(¤€´øI•ÍÕ±ĞñÑ¥½¹=ÕÑ½µ”°MÑÉ¥¹œøì(€€€±•Ğ‰ÕÑÑ½¸€ô‰ÕÑÑ½¸¹Õ¹İÉ…Á}½È¡5½ÕÍ•	ÕÑÑ½¹-¥¹èé1•™Ğ¤ì(€€€±•Ğ…Ñ¥½¸€ô¥˜±•ĞM½µ”¡•±•µ•¹Ñ}¥¤€ô•±•µ•¹Ñ}¥ì(€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•µ…¹Ñ¥½Õ‰±•±¥¬ì(€€€€€€€€€€€•±•µ•¹Ñ}¥°(€€€€€€€€€€€‰ÕÑÑ½¸°(€€€€€€€€€€€•áÁ•Ñ•‘}Ù…±Õ”°(€€€€€€€ô(€€€ô•±Í”ì(€€€€€€€½¹ÑÉ½±Ñ¥½¸èé5½ÕÍ•½Õ‰±•±¥­Ğì(€€€€€€€€€€€àèà¹½­}½É}•±Í”¡ñğ€‰½µÁÕÑ•É}‘½Õ‰±•}±¥¬¹••‘Ì•±•µ•¹Ñ}¥½Èà…¹äˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ü°(€€€€€€€€€€€äèä¹½­}½É}•±Í”¡ñğ€‰½µÁÕÑ•É}‘½Õ‰±•}±¥¬¹••‘Ì•±•µ•¹Ñ}¥½Èà…¹äˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ü°(€€€€€€€€€€€‰ÕÑÑ½¸°(€€€€€€€ô(€€€ôì(€€€É•ÅÕ•ÍÑ}…Ñ¥½¹}¥µÁ° (€€€€€€€€™…ÁÀ°(€€€€€€€ÍÑ…Ñ”¹¥¹¹•È ¤°(€€€€€€€€™Í•ÍÍ¥½¹}¥°(€€€€€€€€™Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€…Ñ¥½¸°(€€€€€€€ÑÕÉ¹}¥°(€€€€€€€Ñ½½±}…±±}¥°(€€€€¤(€€€€¹…İ…¥Ğ)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ…Íå¹Œ™¸Ñ½½±}½µÁÕÑ•É}ÍÉ½±° (€€€…ÁÀèÑ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€‘•±Ñ…}àè¤ÌÈ°(€€€‘•±Ñ…}äè¤ÌÈ°(€€€ÑÕÉ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(¤€´øI•ÍÕ±ĞñÑ¥½¹=ÕÑ½µ”°MÑÉ¥¹œøì(€€€É•ÅÕ•ÍÑ}…Ñ¥½¹}¥µÁ° (€€€€€€€€™…ÁÀ°(€€€€€€€ÍÑ…Ñ”¹¥¹¹•È ¤°(€€€€€€€€™Í•ÍÍ¥½¹}¥°(€€€€€€€€™Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€½¹ÑÉ½±Ñ¥½¸èéMÉ½±°ì‘•±Ñ…}à°‘•±Ñ…}äô°(€€€€€€€ÑÕÉ¹}¥°(€€€€€€€Ñ½½±}…±±}¥°(€€€€¤(€€€€¹…İ…¥Ğ)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ…Íå¹Œ™¸Ñ½½±}½µÁÕÑ•É}ÑåÁ” (€€€…ÁÀèÑ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ•áĞèMÑÉ¥¹œ°(€€€ÑÕÉ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(¤€´øI•ÍÕ±ĞñÑ¥½¹=ÕÑ½µ”°MÑÉ¥¹œøì(€€€É•ÅÕ•ÍÑ}…Ñ¥½¹}¥µÁ° (€€€€€€€€™…ÁÀ°(€€€€€€€ÍÑ…Ñ”¹¥¹¹•È ¤°(€€€€€€€€™Í•ÍÍ¥½¹}¥°(€€€€€€€€™Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€½¹ÑÉ½±Ñ¥½¸èéQåÁ•Q•áĞìÑ•áĞô°(€€€€€€€ÑÕÉ¹}¥°(€€€€€€€Ñ½½±}…±±}¥°(€€€€¤(€€€€¹…İ…¥Ğ)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ…Íå¹Œ™¸Ñ½½±}½µÁÕÑ•É}­•ä (€€€…ÁÀèÑ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€­•äèMÑÉ¥¹œ°(€€€ÑÕÉ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(¤€´øI•ÍÕ±ĞñÑ¥½¹=ÕÑ½µ”°MÑÉ¥¹œøì(€€€É•ÅÕ•ÍÑ}…Ñ¥½¹}¥µÁ° (€€€€€€€€™…ÁÀ°(€€€€€€€ÍÑ…Ñ”¹¥¹¹•È ¤°(€€€€€€€€™Í•ÍÍ¥½¹}¥°(€€€€€€€€™Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€½¹ÑÉ½±Ñ¥½¸èé-•åAÉ•ÍÌì­•äô°(€€€€€€€ÑÕÉ¹}¥°(€€€€€€€Ñ½½±}…±±}¥°(€€€€¤(€€€€¹…İ…¥Ğ)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ…Íå¹Œ™¸Ñ½½±}½µÁÕÑ•É}¡½Ñ­•ä (€€€…ÁÀèÑ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€­•åÌèY•ŒñMÑÉ¥¹œø°(€€€ÑÕÉ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(¤€´øI•ÍÕ±ĞñÑ¥½¹=ÕÑ½µ”°MÑÉ¥¹œøì(€€€É•ÅÕ•ÍÑ}…Ñ¥½¹}¥µÁ° (€€€€€€€€™…ÁÀ°(€€€€€€€ÍÑ…Ñ”¹¥¹¹•È ¤°(€€€€€€€€™Í•ÍÍ¥½¹}¥°(€€€€€€€€™Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€½¹ÑÉ½±Ñ¥½¸èé!½Ñ­•äì­•åÌô°(€€€€€€€ÑÕÉ¹}¥°(€€€€€€€Ñ½½±}…±±}¥°(€€€€¤(€€€€¹…İ…¥Ğ)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ…Íå¹Œ™¸Ñ½½±}½µÁÕÑ•É}İ…¥Ğ (€€€…ÁÀèÑ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€µ¥±±¥Í•½¹‘ÌèÔØĞ°(€€€ÑÕÉ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(¤€´øI•ÍÕ±ĞñÑ¥½¹=ÕÑ½µ”°MÑÉ¥¹œøì(€€€É•ÅÕ•ÍÑ}…Ñ¥½¹}¥µÁ° (€€€€€€€€™…ÁÀ°(€€€€€€€ÍÑ…Ñ”¹¥¹¹•È ¤°(€€€€€€€€™Í•ÍÍ¥½¹}¥°(€€€€€€€€™Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€½¹ÑÉ½±Ñ¥½¸èé]…¥Ğìµ¥±±¥Í•½¹‘Ìô°(€€€€€€€ÑÕÉ¹}¥°(€€€€€€€Ñ½½±}…±±}¥°(€€€€¤(€€€€¹…İ…¥Ğ)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ…Íå¹Œ™¸Ñ½½±}½µÁÕÑ•É}Í•±•Ğ (€€€…ÁÀèÑ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€•±•µ•¹Ñ}¥èMÑÉ¥¹œ°(€€€Ù…±Õ”èMÑÉ¥¹œ°(€€€ÑÕÉ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(¤€´øI•ÍÕ±ĞñÑ¥½¹=ÕÑ½µ”°MÑÉ¥¹œøì(€€€É•ÅÕ•ÍÑ}…Ñ¥½¹}¥µÁ° (€€€€€€€€™…ÁÀ°(€€€€€€€ÍÑ…Ñ”¹¥¹¹•È ¤°(€€€€€€€€™Í•ÍÍ¥½¹}¥°(€€€€€€€€™Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•±•Ğì•±•µ•¹Ñ}¥°Ù…±Õ”ô°(€€€€€€€ÑÕÉ¹}¥°(€€€€€€€Ñ½½±}…±±}¥°(€€€€¤(€€€€¹…İ…¥Ğ)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ…Íå¹Œ™¸Ñ½½±}½µÁÕÑ•É}Í•Ñ}Ù…±Õ” (€€€…ÁÀèÑ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€Í•ÍÍ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€Ñ…É•Ñ}İ¥¹‘½İ}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€•±•µ•¹Ñ}¥èMÑÉ¥¹œ°(€€€Ù…±Õ”èMÑÉ¥¹œ°(€€€ÑÕÉ¹}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(€€€Ñ½½±}…±±}¥è=ÁÑ¥½¸ñMÑÉ¥¹œø°(¤€´øI•ÍÕ±ĞñÑ¥½¹=ÕÑ½µ”°MÑÉ¥¹œøì(€€€É•ÅÕ•ÍÑ}…Ñ¥½¹}¥µÁ° (€€€€€€€€™…ÁÀ°(€€€€€€€ÍÑ…Ñ”¹¥¹¹•È ¤°(€€€€€€€€™Í•ÍÍ¥½¹}¥°(€€€€€€€€™Ñ…É•Ñ}…ÁÁ±¥…Ñ¥½¹}¥°(€€€€€€€Ñ…É•Ñ}İ¥¹‘½İ}¥¹…Í}‘•É•˜ ¤°(€€€€€€€½¹ÑÉ½±Ñ¥½¸èéM•ÑY…±Õ”ì•±•µ•¹Ñ}¥°Ù…±Õ”ô°(€€€€€€€ÑÕÉ¹}¥°(€€€€€€€Ñ½½±}…±±}¥°(€€€€¤(€€€€¹…İ…¥Ğ)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ™¸‘•Í­Ñ½Á}½¹ÑÉ½±}É•ÍÁ½¹‘}…Ñ¥½¸ (€€€İ¥¹‘½ÜèÑ…ÕÉ¤èé]¥¹‘½Ü°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(€€€…Ñ¥½¹}¥èMÑÉ¥¹œ°(€€€…ÁÁÉ½Ù”è‰½½°°(¤€´øI•ÍÕ±Ğğ ¤°MÑÉ¥¹œøì(€€€•¹ÍÕÉ•}µ…¥¹}İ¥¹‘½Ü ™İ¥¹‘½Ü¤üì(€€€¥˜ÍÑ…Ñ”¹É•Í½±Ù•}¥™}Á•¹‘¥¹œ ™…Ñ¥½¹}¥°…ÁÁÉ½Ù”¤üì(€€€€€€€=¬  ¤¤(€€€ô•±Í”ì(€€€€€€€ÉÈ¡™½Éµ…Ğ„ ‰9¼Á•¹‘¥¹œ½¹ÑÉ½°…Ñ¥½¸İ¥Ñ ¥í…Ñ¥½¹}¥‘ôˆ¤¤(€€€ô)ô((mÑ…ÕÉ¤èé½µµ…¹‘t)ÁÕˆ™¸‘•Í­Ñ½Á}½¹ÑÉ½±}•µ•É•¹å}ÍÑ½À (€€€…ÁÀèÑ…ÕÉ¤èéÁÁ!…¹‘±”°(€€€ÍÑ…Ñ”èÑ…ÕÉ¤èéMÑ…Ñ”ğ|°•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ø°(¤€´øI•ÍÕ±ĞñÍ•É‘•}©Í½¸èéY…±Õ”°MÑÉ¥¹œøì(€€€±•Ğ€¡Í•ÍÍ¥½¹Í}‘•…Ñ¥Ù…Ñ•°…Ñ¥½¹Í}…¹•±±•¤€ôÍÑ…Ñ”¹•µ•É•¹å}ÍÑ½À ¤üì(€€€¥˜±•ĞM½µ”¡½Ù•É±…ä¤€ô…ÁÀ¹•Ñ}İ•‰Ù¥•İ}İ¥¹‘½Ü ‰½µÁ…¹¥½¸µ½Ù•É±…äˆ¤ì(€€€€€€€±•Ğ|€ô½Ù•É±…ä¹¡¥‘” ¤ì(€€€ô(€€€±•ĞÁ…å±½…€ôÍ•É‘•}©Í½¸èé©Í½¸„¡ì(€€€€€€€€‰Í•ÍÍ¥½¹Í•…Ñ¥Ù…Ñ•ˆèÍ•ÍÍ¥½¹Í}‘•…Ñ¥Ù…Ñ•°(€€€€€€€€‰…Ñ¥½¹Í…¹•±±•ˆè…Ñ¥½¹Í}…¹•±±•°(€€€ô¤ì(€€€±•Ğ|€ô…ÁÀ¹•µ¥Ğ ‰‘•Í­Ñ½Àµ½¹ÑÉ½°è¼½•µ•É•¹äµÍÑ½Àˆ°Á…å±½…¹±½¹” ¤¤ì(€€€=¬¡Á…å±½…¤)ô((m™œ¡Ñ•ÍĞ¥t)µ½Ñ•ÍÑÌì(€€€ÕÍ”ÍÕÁ•Èèè¨ì((€€€™¸ÍÑ…Ñ” ¤€´ø•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”ì(€€€€€€€•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”èéİ¥Ñ¡}‰…­•¹¡ÉŒèé¹•Ü¡9Õ±±	…­•¹¤¤(€€€ô((€€€™¸…±±½Ü¡…ÁÁÌè€™l™ÍÑÉt¤€´øY•ŒñMÑÉ¥¹œøì(€€€€€€€…ÁÁÌ¹¥Ñ•È ¤¹µ…À¡ñÍğÌ¹Ñ½}ÍÑÉ¥¹œ ¤¤¹½±±•Ğ ¤(€€€ô((€€€€mÑ•ÍÑt(€€€™¸É…¹ÑÍ}…ÉÉå}¥¹‘•Á•¹‘•¹Ñ}…Á…‰¥±¥Ñ¥•Í}…¹‘}İ¥¹‘½İÌ ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ôÍÑ…Ñ” ¤ì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}İ¥Ñ¡}½ÁÑ¥½¹Ì (€€€€€€€€€€€€€€€€‰µ…¹Õ…°ˆ°(€€€€€€€€€€€€€€€…±±½Ü ™l‰Q•ÍÑÁÀ‰t¤°(€€€€€€€€€€€€€€€€ØÁ|ÀÀÀ°(€€€€€€€€€€€€€€€M•ÍÍ¥½¹É…¹Ñ=ÁÑ¥½¹Ìì(€€€€€€€€€€€€€€€€€€€…±±½İ•‘}İ¥¹‘½İÌèÙ•Œ…l‰Q•ÍÑÁÀèéİ¥¹‘½Ü´Äˆ¹Ñ½}ÍÑÉ¥¹œ ¥t°(€€€€€€€€€€€€€€€€€€€…±±½İ}ÍÉ••¹Í¡½ÑÌè™…±Í”°(€€€€€€€€€€€€€€€€€€€…±±½İ}­•å‰½…É‘}¥¹ÁÕĞè™…±Í”°(€€€€€€€€€€€€€€€€€€€…±±½İ}±¥Á‰½…É‘}É•…è™…±Í”°(€€€€€€€€€€€€€€€€€€€…ÁÁÉ½Ù…±}Á½±¥äèM½µ”¡ÁÁÉ½Ù…±A½±¥äèéA•ÉÑ¥½¸¤°(€€€€€€€€€€€€€€€ô°(€€€€€€€€€€€€¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤ì(€€€€€€€…ÍÍ•ÉÑ}•Ä„¡Í•ÍÍ¥½¸¹…±±½İ•‘}İ¥¹‘½İÌ°l‰Q•ÍÑÁÀèéİ¥¹‘½Ü´Ä‰t¤ì(€€€€€€€…ÍÍ•ÉĞ„ …Í•ÍÍ¥½¸¹…±±½İ}ÍÉ••¹Í¡½ÑÌ¤ì(€€€€€€€…ÍÍ•ÉĞ„ …Í•ÍÍ¥½¸¹…±±½İ}­•å‰½…É‘}¥¹ÁÕĞ¤ì(€€€€€€€…ÍÍ•ÉÑ}•Ä„¡Í•ÍÍ¥½¸¹…ÁÁÉ½Ù…±}Á½±¥ä°ÁÁÉ½Ù…±A½±¥äèéA•ÉÑ¥½¸¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸Í•¹Í¥Ñ¥Ù•}Ñ…É•ÑÍ}…É•}É•™ÕÍ•‘}•Ù•¹}İ¡•¹}…±±½İ±¥ÍÑ• ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ôÍÑ…Ñ” ¤ì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™lˆÅA…ÍÍİ½É‰t¤°€ØÁ|ÀÀÀ°ÑÉÕ”¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤ì(€€€€€€€±•Ğ•ÉÉ½È€ôµ…Ñ ÍÑ…Ñ”¹‰•¥¹}…Ñ¥½¸ (€€€€€€€€€€€€™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€ˆÅA…ÍÍİ½Éˆ°(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé5½ÕÍ•±¥¬ì(€€€€€€€€€€€€€€€‰ÕÑÑ½¸è5½ÕÍ•	ÕÑÑ½¹-¥¹èé1•™Ğ°(€€€€€€€€€€€ô°(€€€€€€€€¤ì(€€€€€€€€€€€ÉÈ¡•ÉÉ½È¤€ôø•ÉÉ½È°(€€€€€€€€€€€=¬¡|¤€ôøÁ…¹¥Œ„ ‰Í•¹Í¥Ñ¥Ù”Ñ…É•ĞµÕÍĞ‰”É•™ÕÍ•ˆ¤°(€€€€€€€ôì(€€€€€€€…ÍÍ•ÉĞ„¡•ÉÉ½È¹½¹Ñ…¥¹Ì ‰M•¹Í¥Ñ¥Ù”ˆ¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸Á…ÕÍ•‘}Í•ÍÍ¥½¹}É•™ÕÍ•Í}…Ñ¥½¹Í}İ¥Ñ¡½ÕÑ}É•Ù½­¥¹}Ñ¡•}É…¹Ğ ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ôÍÑ…Ñ” ¤ì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€ØÁ|ÀÀÀ°ÑÉÕ”¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤ì(€€€€€€€…ÍÍ•ÉĞ„¡ÍÑ…Ñ”¹Á…ÕÍ•}Í•ÍÍ¥½¸ ™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥°ÑÉÕ”¤¹Õ¹İÉ…À ¤¤ì(€€€€€€€±•Ğ•ÉÉ½È€ôµ…Ñ ÍÑ…Ñ”¹‰•¥¹}…Ñ¥½¸ (€€€€€€€€€€€€™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€‰9½Ñ•Ìˆ°(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé5½ÕÍ•5½Ù”ìàè€Ä°äè€Äô°(€€€€€€€€¤ì(€€€€€€€€€€€ÉÈ¡•ÉÉ½È¤€ôø•ÉÉ½È°(€€€€€€€€€€€=¬¡|¤€ôøÁ…¹¥Œ„ ‰Á…ÕÍ•Í•ÍÍ¥½¸µÕÍĞÉ•™ÕÍ”…Ñ¥½¹Ìˆ¤°(€€€€€€€ôì(€€€€€€€…ÍÍ•ÉĞ„¡•ÉÉ½È¹½¹Ñ…¥¹Ì ‰Á…ÕÍ•ˆ¤¤ì(€€€€€€€…ÍÍ•ÉĞ„¡ÍÑ…Ñ”¹Í•ÍÍ¥½¹Í}Í¹…ÁÍ¡½Ğ ¤¹Õ¹İÉ…À ¥lÁt¹…Ñ¥Ù”¤ì(€€€€€€€…ÍÍ•ÉĞ„¡ÍÑ…Ñ”¹Á…ÕÍ•}Í•ÍÍ¥½¸ ™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥°™…±Í”¤¹Õ¹İÉ…À ¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸…Õ‘¥Ñ}É•‘…ÑÍ}ÑåÁ•‘}Ñ•áÑ}…¹‘}ÁÉ•Í•ÉÙ•Í}•á•ÕÑ¥½¹}Ù•É¥™¥…Ñ¥½¸ ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ôÍÑ…Ñ” ¤ì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€ØÁ|ÀÀÀ°ÑÉÕ”¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤ì(€€€€€€€±•ĞÑ¥½¹…Ñ”èéá•ÕÑ•¡É•ÍÕ±Ğ¤€ôÍÑ…Ñ”(€€€€€€€€€€€€¹‰•¥¹}…Ñ¥½¸ (€€€€€€€€€€€€€€€€™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€€€€€‰9½Ñ•Ìˆ°(€€€€€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èéQåÁ•Q•áĞì(€€€€€€€€€€€€€€€€€€€Ñ•áĞè€‰Í•É•ĞµÙ…±Õ”ˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€ô°(€€€€€€€€€€€€¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤(€€€€€€€•±Í”ì(€€€€€€€€€€€Á…¹¥Œ„ ‰…ÁÁÉ½Ù•‰…Ñ µÕÍĞ•á•ÕÑ”¥µµ•‘¥…Ñ•±äˆ¤ì(€€€€€€€ôì(€€€€€€€±•ĞÉ•ÍÕ±Ğ€ôÉ•ÍÕ±Ğ¹Õ¹İÉ…À ¤ì(€€€€€€€…ÍÍ•ÉĞ„¡É•ÍÕ±Ğ¹¥¹ÁÕÑ}Í•¹Ğ¤ì(€€€€€€€…ÍÍ•ÉĞ„ …É•ÍÕ±Ğ¹ÍÑ…Ñ•}Ù•É¥™¥•¤ì(€€€€€€€…ÍÍ•ÉĞ„¡É•ÍÕ±Ğ(€€€€€€€€€€€€¹Ù•É¥™¥…Ñ¥½¸(€€€€€€€€€€€€¹…Í}‘•É•˜ ¤(€€€€€€€€€€€€¹¥Í}Í½µ•}…¹¡ñµ•ÍÍ…•ğµ•ÍÍ…”¹½¹Ñ…¥¹Ì ‰¹¼•±•µ•¹ĞÁ½ÍÑ½¹‘¥Ñ¥½¸ˆ¤¤¤ì(€€€€€€€±•Ğ…Õ‘¥Ğ€ôÍÑ…Ñ”¹…Õ‘¥Ñ}Í¹…ÁÍ¡½Ğ ¤¹Õ¹İÉ…À ¤ì(€€€€€€€…ÍÍ•ÉĞ„¡…Õ‘¥ÑlÁt¹…Ñ¥½¸¹½¹Ñ…¥¹Ì ‰É•‘…Ñ•ˆ¤¤ì(€€€€€€€…ÍÍ•ÉĞ„ ……Õ‘¥ÑlÁt¹…Ñ¥½¸¹½¹Ñ…¥¹Ì ‰Í•É•ĞµÙ…±Õ”ˆ¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸‘ÕÉ…‰±•}Ù…±Õ•}Ù•É¥™¥…Ñ¥½¹}•Ù¥‘•¹•}¥Í}É•‘…Ñ•‘}‰ÕÑ}½ÕÑ½µ•}…¹}É•Ñ…¥¹}¥Ğ ¤ì(€€€€€€€±•Ğ•Ù¥‘•¹”€ôY•É¥™¥…Ñ¥½¹Ù¥‘•¹”ì(€€€€€€€€€€€­¥¹è€‰•±•µ•¹Ñ}Ù…±Õ”ˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€•±•µ•¹Ñ}¥èM½µ” ‰•±•µ•¹Ğ´Äˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€•áÁ•Ñ•‘}Ù…±Õ”èM½µ” ‰Í•É•ĞµÙ…±Õ”ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€½‰Í•ÉÙ•‘}Ù…±Õ”èM½µ” ‰Í•É•ĞµÙ…±Õ”ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤°(€€€€€€€€€€€µ…Ñ¡•èÑÉÕ”°(€€€€€€€€€€€‘•Ñ…¥°è€‰½µÁ…É•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€ôì(€€€€€€€±•Ğ…Õ‘¥Ğ€ô•Ù¥‘•¹”¹É•‘…Ñ•‘}™½É}…Õ‘¥Ğ ¤ì(€€€€€€€…ÍÍ•ÉĞ„¡…Õ‘¥Ğ¹•áÁ•Ñ•‘}Ù…±Õ”¹¥Í}¹½¹” ¤¤ì(€€€€€€€…ÍÍ•ÉĞ„¡…Õ‘¥Ğ¹½‰Í•ÉÙ•‘}Ù…±Õ”¹¥Í}¹½¹” ¤¤ì(€€€€€€€…ÍÍ•ÉĞ„¡…Õ‘¥Ğ¹‘•Ñ…¥°¹½¹Ñ…¥¹Ì ‰É•‘…Ñ•ˆ¤¤ì(€€€€€€€…ÍÍ•ÉÑ}•Ä„¡•Ù¥‘•¹”¹•áÁ•Ñ•‘}Ù…±Õ”¹…Í}‘•É•˜ ¤°M½µ” ‰Í•É•ĞµÙ…±Õ”ˆ¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸…ÁÁÉ½Ù…±}‘¥•ÍÑ}¡…¹•Í}İ¡•¹}Ñ…É•Ñ}Í•µ…¹Ñ¥Í}½É}É¥Í­}¡…¹•Ì ¤ì(€€€€€€€±•Ğ…Ñ¥½¸€ô½¹ÑÉ½±Ñ¥½¸èéM•ÑY…±Õ”ì(€€€€€€€€€€€•±•µ•¹Ñ}¥è€‰•±•µ•¹Ğ´Äˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€Ù…±Õ”è€‰¡•±±¼ˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€ôì(€€€€€€€±•Ğ™¥ÉÍĞ€ô…ÁÁÉ½Ù…±}‘¥•ÍĞ (€€€€€€€€€€€€‰Í•ÍÍ¥½¸ˆ°(€€€€€€€€€€€€‰9½Ñ•Ìˆ°(€€€€€€€€€€€M½µ” ‰İ¥¹‘½Üˆ¤°(€€€€€€€€€€€€™…Ñ¥½¸°(€€€€€€€€€€€ÁÁÉ½Ù…±1•Ù•°èé!¥ °(€€€€€€€€€€€€‰‘¥Ğˆ°(€€€€€€€€¤ì(€€€€€€€±•Ğ¡…¹•‘}±…‰•°€ô…ÁÁÉ½Ù…±}‘¥•ÍĞ (€€€€€€€€€€€€‰Í•ÍÍ¥½¸ˆ°(€€€€€€€€€€€€‰9½Ñ•Ìˆ°(€€€€€€€€€€€M½µ” ‰İ¥¹‘½Üˆ¤°(€€€€€€€€€€€€™…Ñ¥½¸°(€€€€€€€€€€€ÁÁÉ½Ù…±1•Ù•°èéÉ¥Ñ¥…°°(€€€€€€€€€€€€‰•±•Ñ”ˆ°(€€€€€€€€¤ì(€€€€€€€…ÍÍ•ÉÑ}¹”„¡™¥ÉÍĞ°¡…¹•‘}±…‰•°¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸‰åÁ…ÍÍ}µ½‘•}¥Í}…±İ…åÍ}É•™ÕÍ• ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ôÍÑ…Ñ” ¤ì(€€€€€€€±•Ğ•ÉÈ€ôÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰‰åÁ…ÍÌˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€ØÁ|ÀÀÀ°™…±Í”¤(€€€€€€€€€€€€¹Õ¹İÉ…Á}•ÉÈ ¤ì(€€€€€€€…ÍÍ•ÉĞ„¡•ÉÈ¹½¹Ñ…¥¹Ì ‰‰åÁ…ÍÌˆ¤¤ì(€€€€€€€…ÍÍ•ÉĞ„¡ÍÑ…Ñ”¹Í•ÍÍ¥½¹Í}Í¹…ÁÍ¡½Ğ ¤¹Õ¹İÉ…À ¤¹¥Í}•µÁÑä ¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸•Ù•Éå}…Ñ•‘}µ½‘•}…¹}ÍÑ…ÉÑ}…}Í•ÍÍ¥½¸ ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ôÍÑ…Ñ” ¤ì(€€€€€€€™½Èµ½‘”¥¸l‰µ…¹Õ…°ˆ°€‰…•ÁÑ‘¥ÑÌˆ°€‰Á±…¸ˆ°€‰…ÕÑ¼ˆ°€‰Íµ…ÉĞ‰tì(€€€€€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍÑ…Ñ”(€€€€€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ°¡µ½‘”°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€ØÁ|ÀÀÀ°™…±Í”¤(€€€€€€€€€€€€€€€€¹Õ¹İÉ…Á}½É}•±Í”¡ñ•ÉÉ½ÉğÁ…¹¥Œ„ ‰µ½‘”íµ½‘•ôÍ¡½Õ±‰”…±±½İ•Ñ¼ÍÑ…ÉĞèí•ÉÉ½Éôˆ¤¤ì(€€€€€€€€€€€…ÍÍ•ÉĞ„¡Í•ÍÍ¥½¸¹…Ñ¥Ù”¤ì(€€€€€€€€€€€…ÍÍ•ÉĞ„¡Í•ÍÍ¥½¸¹¥¹‘¥…Ñ½É}Ù¥Í¥‰±”¤ì(€€€€€€€ô(€€€ô((€€€€mÑ•ÍÑt(€€€™¸•µÁÑå}…±±½İ±¥ÍÑ}¥Í}É•™ÕÍ• ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ôÍÑ…Ñ” ¤ì(€€€€€€€±•Ğ•ÉÈ€ôÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°Y•Œèé¹•Ü ¤°€ØÁ|ÀÀÀ°™…±Í”¤(€€€€€€€€€€€€¹Õ¹İÉ…Á}•ÉÈ ¤ì(€€€€€€€…ÍÍ•ÉĞ„¡•ÉÈ¹½¹Ñ…¥¹Ì ‰…±±½İ•…ÁÁ±¥…Ñ¥½¸ˆ¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸±¥™•Ñ¥µ•}‰½Õ¹‘Í}…É•}•¹™½É• ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ôÍÑ…Ñ” ¤ì(€€€€€€€…ÍÍ•ÉĞ„¡ÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€À°™…±Í”¤(€€€€€€€€€€€€¹¥Í}•ÉÈ ¤¤ì(€€€€€€€…ÍÍ•ÉĞ„¡ÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° (€€€€€€€€€€€€€€€€‰µ…¹Õ…°ˆ°(€€€€€€€€€€€€€€€…±±½Ü ™l‰9½Ñ•Ì‰t¤°(€€€€€€€€€€€€€€€5a}MMM%=9}1%Q%5}5L€¬€Ä°(€€€€€€€€€€€€€€€™…±Í”(€€€€€€€€€€€€¤(€€€€€€€€€€€€¹¥Í}•ÉÈ ¤¤ì(€€€€€€€…ÍÍ•ÉĞ„¡ÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°5a}MMM%=9}1%Q%5}5L°™…±Í”¤(€€€€€€€€€€€€¹¥Í}½¬ ¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸…±±½İ±¥ÍÑ}¥Í}•¹™½É•‘}Á•É}…Ñ¥½¸ ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ôÍÑ…Ñ” ¤ì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€ØÁ|ÀÀÀ°™…±Í”¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤ì((€€€€€€€±•Ğ½ÕÑÍ¥‘”€ôÍÑ…Ñ”¹‰•¥¹}…Ñ¥½¸ (€€€€€€€€€€€€™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€‰M…™…É¤ˆ°(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé5½ÕÍ•5½Ù”ìàè€Ä°äè€Äô°(€€€€€€€€¤ì(€€€€€€€µ…Ñ ½ÕÑÍ¥‘”ì(€€€€€€€€€€€ÉÈ¡•ÉÉ½È¤€ôø…ÍÍ•ÉĞ„¡•ÉÉ½È¹½¹Ñ…¥¹Ì ‰…±±½İ±¥ÍĞˆ¤¤°(€€€€€€€€€€€=¬¡|¤€ôøÁ…¹¥Œ„ ‰…Ñ¥½¸……¥¹ÍĞ„¹½¸µ…±±½İ±¥ÍÑ•Ñ…É•ĞµÕÍĞ‰”É•©•Ñ•ˆ¤°(€€€€€€€ô((€€€€€€€±•Ğ¥¹Í¥‘”€ôÍÑ…Ñ”¹‰•¥¹}…Ñ¥½¸ (€€€€€€€€€€€€™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€‰9½Ñ•Ìˆ°(€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé5½ÕÍ•5½Ù”ìàè€Ä°äè€Äô°(€€€€€€€€¤ì(€€€€€€€…ÍÍ•ÉĞ„¡µ…Ñ¡•Ì„¡¥¹Í¥‘”°=¬¡Ñ¥½¹…Ñ”èéA•¹‘¥¹œì€¸¸ô¤¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸Õ¹­¹½İ¹}½É}ÍÑ½ÁÁ•‘}Í•ÍÍ¥½¹}É•©•ÑÍ}…Ñ¥½¹Ì ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ôÍÑ…Ñ” ¤ì(€€€€€€€…ÍÍ•ÉĞ„¡ÍÑ…Ñ”(€€€€€€€€€€€€¹‰•¥¹}…Ñ¥½¸ (€€€€€€€€€€€€€€€€‰‘½•Ìµ¹½Ğµ•á¥ÍĞˆ°(€€€€€€€€€€€€€€€€‰9½Ñ•Ìˆ°(€€€€€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé-•åAÉ•ÍÌì(€€€€€€€€€€€€€€€€€€€­•äè€‰„ˆ¹Ñ½}ÍÑÉ¥¹œ ¤(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€¤(€€€€€€€€€€€€¹¥Í}•ÉÈ ¤¤ì((€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€ØÁ|ÀÀÀ°™…±Í”¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤ì(€€€€€€€…ÍÍ•ÉĞ„¡ÍÑ…Ñ”¹ÍÑ½Á}Í•ÍÍ¥½¸ ™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥¤¹Õ¹İÉ…À ¤¤ì(€€€€€€€…ÍÍ•ÉĞ„¡ÍÑ…Ñ”(€€€€€€€€€€€€¹‰•¥¹}…Ñ¥½¸ (€€€€€€€€€€€€€€€€™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€€€€€‰9½Ñ•Ìˆ°(€€€€€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé-•åAÉ•ÍÌì(€€€€€€€€€€€€€€€€€€€­•äè€‰„ˆ¹Ñ½}ÍÑÉ¥¹œ ¤(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€¤(€€€€€€€€€€€€¹¥Í}•ÉÈ ¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸…ÁÁÉ½Ù•‘}‰…Ñ¡}Í•ÍÍ¥½¹}•á•ÕÑ•Í}¥µµ•‘¥…Ñ•±å}İ¥Ñ¡½ÕÑ}…}Á•¹‘¥¹}•¹ÑÉä ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ôÍÑ…Ñ” ¤ì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€ØÁ|ÀÀÀ°ÑÉÕ”¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤ì((€€€€€€€±•Ğ…Ñ”€ôÍÑ…Ñ”(€€€€€€€€€€€€¹‰•¥¹}…Ñ¥½¸ (€€€€€€€€€€€€€€€€™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€€€€€‰9½Ñ•Ìˆ°(€€€€€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé5½ÕÍ•±¥¬ì(€€€€€€€€€€€€€€€€€€€‰ÕÑÑ½¸è5½ÕÍ•	ÕÑÑ½¹-¥¹èé1•™Ğ°(€€€€€€€€€€€€€€€ô°(€€€€€€€€€€€€¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤ì(€€€€€€€µ…Ñ …Ñ”ì(€€€€€€€€€€€Ñ¥½¹…Ñ”èéá•ÕÑ•¡É•ÍÕ±Ğ¤€ôø…ÍÍ•ÉĞ„¡É•ÍÕ±Ğ¹¥Í}½¬ ¤¤°(€€€€€€€€€€€Ñ¥½¹…Ñ”èéA•¹‘¥¹œì€¸¸ô€ôøì(€€€€€€€€€€€€€€€Á…¹¥Œ„ ‰…ÁÁÉ½Ù•µ‰…Ñ Í•ÍÍ¥½¸µÕÍĞ¹½ĞÉ•…Ñ”„Á•¹‘¥¹œ…ÁÁÉ½Ù…°ˆ¤(€€€€€€€€€€€ô(€€€€€€€ô(€€€ô((€€€€mÑ•ÍÑt(€€€™¸Á•¹‘¥¹}…Ñ¥½¹}…ÁÁÉ½Ù…±}É•ÍÕµ•Í}Ù¥…}Ñ¡•}½¹•Í¡½Ñ}¡…¹¹•° ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ôÍÑ…Ñ” ¤ì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€ØÁ|ÀÀÀ°™…±Í”¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤ì((€€€€€€€±•Ğ…Ñ”€ôÍÑ…Ñ”(€€€€€€€€€€€€¹‰•¥¹}…Ñ¥½¸ (€€€€€€€€€€€€€€€€™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€€€€€‰9½Ñ•Ìˆ°(€€€€€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé-•åAÉ•ÍÌì(€€€€€€€€€€€€€€€€€€€­•äè€‰„ˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€ô°(€€€€€€€€€€€€¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤ì(€€€€€€€±•ĞÑ¥½¹…Ñ”èéA•¹‘¥¹œì(€€€€€€€€€€€…Ñ¥½¹}¥°(€€€€€€€€€€€É••¥Ù•È°(€€€€€€€ô€ô…Ñ”(€€€€€€€•±Í”ì(€€€€€€€€€€€Á…¹¥Œ„ ‰¹½¸µ‰…Ñ Í•ÍÍ¥½¸µÕÍĞÁÉ½‘Õ”„Á•¹‘¥¹œ…ÁÁÉ½Ù…°ˆ¤ì(€€€€€€€ôì((€€€€€€€…ÍÍ•ÉĞ„¡ÍÑ…Ñ”¹É•Í½±Ù•}¥™}Á•¹‘¥¹œ ™…Ñ¥½¹}¥°ÑÉÕ”¤¹Õ¹İÉ…À ¤¤ì(€€€€€€€…ÍÍ•ÉÑ}•Ä„¡É••¥Ù•È¹‰±½­¥¹}É•Ø ¤°=¬¡ÑÉÕ”¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸Á•¹‘¥¹}…Ñ¥½¹}‘•¹¥…±}É•ÍÕµ•Í}…Í}™…±Í” ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ôÍÑ…Ñ” ¤ì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€ØÁ|ÀÀÀ°™…±Í”¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤ì((€€€€€€€±•Ğ…Ñ”€ôÍÑ…Ñ”(€€€€€€€€€€€€¹‰•¥¹}…Ñ¥½¸ (€€€€€€€€€€€€€€€€™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€€€€€‰9½Ñ•Ìˆ°(€€€€€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé-•åAÉ•ÍÌì(€€€€€€€€€€€€€€€€€€€­•äè€‰„ˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€ô°(€€€€€€€€€€€€¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤ì(€€€€€€€±•ĞÑ¥½¹…Ñ”èéA•¹‘¥¹œì(€€€€€€€€€€€…Ñ¥½¹}¥°(€€€€€€€€€€€É••¥Ù•È°(€€€€€€€ô€ô…Ñ”(€€€€€€€•±Í”ì(€€€€€€€€€€€Á…¹¥Œ„ ‰¹½¸µ‰…Ñ Í•ÍÍ¥½¸µÕÍĞÁÉ½‘Õ”„Á•¹‘¥¹œ…ÁÁÉ½Ù…°ˆ¤ì(€€€€€€€ôì((€€€€€€€…ÍÍ•ÉĞ„¡ÍÑ…Ñ”¹É•Í½±Ù•}¥™}Á•¹‘¥¹œ ™…Ñ¥½¹}¥°™…±Í”¤¹Õ¹İÉ…À ¤¤ì(€€€€€€€…ÍÍ•ÉÑ}•Ä„¡É••¥Ù•È¹‰±½­¥¹}É•Ø ¤°=¬¡™…±Í”¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸É•Í½±Ù¥¹}…¹}Õ¹­¹½İ¹}Á•¹‘¥¹}…Ñ¥½¹}¥‘}¥Í}É•Á½ÉÑ•‘}…Í}¹½Ñ}™½Õ¹ ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ôÍÑ…Ñ” ¤ì(€€€€€€€…ÍÍ•ÉĞ„ …ÍÑ…Ñ”¹É•Í½±Ù•}¥™}Á•¹‘¥¹œ ‰‘½•Ìµ¹½Ğµ•á¥ÍĞˆ°ÑÉÕ”¤¹Õ¹İÉ…À ¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸ÍÑ½ÁÁ¥¹}…}Í•ÍÍ¥½¹}‘•¹¥•Í}¥ÑÍ}Á•¹‘¥¹}…Ñ¥½¹Ì ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ôÍÑ…Ñ” ¤ì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€ØÁ|ÀÀÀ°™…±Í”¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤ì(€€€€€€€±•Ğ…Ñ”€ôÍÑ…Ñ”(€€€€€€€€€€€€¹‰•¥¹}…Ñ¥½¸ (€€€€€€€€€€€€€€€€™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€€€€€‰9½Ñ•Ìˆ°(€€€€€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé-•åAÉ•ÍÌì(€€€€€€€€€€€€€€€€€€€­•äè€‰„ˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€ô°(€€€€€€€€€€€€¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤ì(€€€€€€€±•ĞÑ¥½¹…Ñ”èéA•¹‘¥¹œì(€€€€€€€€€€€…Ñ¥½¹}¥°(€€€€€€€€€€€É••¥Ù•È°(€€€€€€€ô€ô…Ñ”(€€€€€€€•±Í”ì(€€€€€€€€€€€Á…¹¥Œ„ ‰¹½¸µ‰…Ñ Í•ÍÍ¥½¸µÕÍĞÁÉ½‘Õ”„Á•¹‘¥¹œ…ÁÁÉ½Ù…°ˆ¤ì(€€€€€€€ôì((€€€€€€€…ÍÍ•ÉĞ„¡ÍÑ…Ñ”¹ÍÑ½Á}Í•ÍÍ¥½¸ ™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥¤¹Õ¹İÉ…À ¤¤ì((€€€€€€€…ÍÍ•ÉÑ}•Ä„¡É••¥Ù•È¹‰±½­¥¹}É•Ø ¤°=¬¡™…±Í”¤¤ì(€€€€€€€€¼¼Q¡”Á•¹‘¥¹œ•¹ÑÉäİ…Ì½¹ÍÕµ•‰äÑ¡”‘•¹¥…°°¹½Ğ±•™Ğ‘…¹±¥¹œ¸(€€€€€€€…ÍÍ•ÉĞ„ …ÍÑ…Ñ”¹É•Í½±Ù•}¥™}Á•¹‘¥¹œ ™…Ñ¥½¹}¥°ÑÉÕ”¤¹Õ¹İÉ…À ¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸•µ•É•¹å}ÍÑ½Á}‘•…Ñ¥Ù…Ñ•Í}Í•ÍÍ¥½¹Í}…¹‘}…¹•±Í}Á•¹‘¥¹}…Ñ¥½¹Í}…¹‘}¥Í}¥‘•µÁ½Ñ•¹Ğ ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ôÍÑ…Ñ” ¤ì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€ØÁ|ÀÀÀ°™…±Í”¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤ì(€€€€€€€±•Ğ…Ñ”€ôÍÑ…Ñ”(€€€€€€€€€€€€¹‰•¥¹}…Ñ¥½¸ (€€€€€€€€€€€€€€€€™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€€€€€‰9½Ñ•Ìˆ°(€€€€€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé-•åAÉ•ÍÌì(€€€€€€€€€€€€€€€€€€€­•äè€‰„ˆ¹Ñ½}ÍÑÉ¥¹œ ¤°(€€€€€€€€€€€€€€€ô°(€€€€€€€€€€€€¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤ì(€€€€€€€±•ĞÑ¥½¹…Ñ”èéA•¹‘¥¹œìÉ••¥Ù•È°€¸¸ô€ô…Ñ”•±Í”ì(€€€€€€€€€€€Á…¹¥Œ„ ‰¹½¸µ‰…Ñ Í•ÍÍ¥½¸µÕÍĞÁÉ½‘Õ”„Á•¹‘¥¹œ…ÁÁÉ½Ù…°ˆ¤ì(€€€€€€€ôì((€€€€€€€…ÍÍ•ÉÑ}•Ä„¡ÍÑ…Ñ”¹•µ•É•¹å}ÍÑ½À ¤¹Õ¹İÉ…À ¤°€ Ä°€Ä¤¤ì(€€€€€€€…ÍÍ•ÉÑ}•Ä„¡É••¥Ù•È¹‰±½­¥¹}É•Ø ¤°=¬¡™…±Í”¤¤ì(€€€€€€€…ÍÍ•ÉĞ„ …ÍÑ…Ñ”¹Í•ÍÍ¥½¹Í}Í¹…ÁÍ¡½Ğ ¤¹Õ¹İÉ…À ¥lÁt¹…Ñ¥Ù”¤ì((€€€€€€€€¼¼…±±¥¹œ¥Ğ……¥¸İ¥Ñ ¹½Ñ¡¥¹œ±•™Ğ…Ñ¥Ù”½Á•¹‘¥¹œµÕÍĞ¹½Ğ•ÉÉ½È(€€€€€€€€¼¼…¹µÕÍĞÉ•Á½ÉĞé•É¼°¹½Ğ€‰…±É•…‘äÍÑ½ÁÁ•ˆ¸(€€€€€€€…ÍÍ•ÉÑ}•Ä„¡ÍÑ…Ñ”¹•µ•É•¹å}ÍÑ½À ¤¹Õ¹İÉ…À ¤°€ À°€À¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸•áÁ¥É•‘}Í•ÍÍ¥½¹}¥Í}É•Á½ÉÑ•‘}¥¹…Ñ¥Ù•}…¹‘}É•©•ÑÍ}¹•İ}…Ñ¥½¹Ì ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ôÍÑ…Ñ” ¤ì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€Ä°™…±Í”¤(€€€€€€€€€€€€¹Õ¹İÉ…À ¤ì(€€€€€€€ÍÑèéÑ¡É•…èéÍ±••À¡ÕÉ…Ñ¥½¸èé™É½µ}µ¥±±¥Ì Ô¤¤ì((€€€€€€€±•ĞÍ¹…ÁÍ¡½Ğ€ôÍÑ…Ñ”¹Í•ÍÍ¥½¹Í}Í¹…ÁÍ¡½Ğ ¤¹Õ¹İÉ…À ¤ì(€€€€€€€…ÍÍ•ÉĞ„ (€€€€€€€€€€€€…Í¹…ÁÍ¡½Ğ(€€€€€€€€€€€€€€€€¹¥Ñ•È ¤(€€€€€€€€€€€€€€€€¹™¥¹¡ñÍğÌ¹Í•ÍÍ¥½¹}¥€ôôÍ•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥¤(€€€€€€€€€€€€€€€€¹Õ¹İÉ…À ¤(€€€€€€€€€€€€€€€€¹…Ñ¥Ù”(€€€€€€€€¤ì((€€€€€€€…ÍÍ•ÉĞ„¡ÍÑ…Ñ”(€€€€€€€€€€€€¹‰•¥¹}…Ñ¥½¸ (€€€€€€€€€€€€€€€€™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥°(€€€€€€€€€€€€€€€€‰9½Ñ•Ìˆ°(€€€€€€€€€€€€€€€½¹ÑÉ½±Ñ¥½¸èé-•åAÉ•ÍÌì(€€€€€€€€€€€€€€€€€€€­•äè€‰„ˆ¹Ñ½}ÍÑÉ¥¹œ ¤(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€¤(€€€€€€€€€€€€¹¥Í}•ÉÈ ¤¤ì(€€€ô((€€€™¸Ñ•µÁ}±½­}Á…Ñ  ¤€´øA…Ñ¡	Õ˜ì(€€€€€€€±•Ğ‘¥È€ôÍÑèé•¹ØèéÑ•µÁ}‘¥È ¤¹©½¥¸¡™½Éµ…Ğ„ ‰±´µ‘•Í­Ñ½Àµ½¹ÑÉ½°µ±½¬µíôˆ°UÕ¥èé¹•İ}ØĞ ¤¤¤ì(€€€€€€€ÍÑèé™ÌèéÉ•…Ñ•}‘¥É}…±° ™‘¥È¤¹Õ¹İÉ…À ¤ì(€€€€€€€‘¥È¹©½¥¸ ‰‘•Í­Ñ½Á}½¹ÑÉ½°¹±½¬ˆ¤(€€€ô((€€€€mÑ•ÍÑt(€€€™¸É½ÍÍ}ÁÉ½•ÍÍ}±½­}É•™ÕÍ•Í}…}Í•½¹‘}½¹ÑÉ½±±•É}Õ¹Ñ¥±}É•±•…Í• ¤ì(€€€€€€€±•Ğ±½­}Á…Ñ €ôÑ•µÁ}±½­}Á…Ñ  ¤ì(€€€€€€€€¼¼Qİ¼¥¹‘•Á•¹‘•¹Ğ½¹ÑÉ½±±•ÉÌ€¡Ñ¡”±½…°…ÁÀ…¹Ñ¡”É•Í¥‘•¹Ğ‘…•µ½¸(€€€€€€€€¼¼¥¸ÁÉ½‘ÕÑ¥½¸¤Á½¥¹Ñ•…ĞÑ¡”Í…µ”µ…¡¥¹”µİ¥‘”±½¬™¥±”¸(€€€€€€€±•Ğ™¥ÉÍĞ€ô•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”èéİ¥Ñ¡}‰…­•¹‘}…¹‘}±½¬ (€€€€€€€€€€€ÉŒèé¹•Ü¡9Õ±±	…­•¹¤°(€€€€€€€€€€€M½µ”¡±½­}Á…Ñ ¹±½¹” ¤¤°(€€€€€€€€¤ì(€€€€€€€±•ĞÍ•½¹€ô•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”èéİ¥Ñ¡}‰…­•¹‘}…¹‘}±½¬ (€€€€€€€€€€€ÉŒèé¹•Ü¡9Õ±±	…­•¹¤°(€€€€€€€€€€€M½µ”¡±½­}Á…Ñ ¹±½¹” ¤¤°(€€€€€€€€¤ì((€€€€€€€±•ĞÍ•ÍÍ¥½¸€ô™¥ÉÍĞ(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€ØÁ|ÀÀÀ°™…±Í”¤(€€€€€€€€€€€€¹•áÁ•Ğ ‰™¥ÉÍĞ½¹ÑÉ½±±•ÈÍ¡½Õ±…ÅÕ¥É”Ñ¡”±½¬…¹ÍÑ…ÉĞˆ¤ì((€€€€€€€€¼¼]¡¥±”Ñ¡”™¥ÉÍĞ½¹ÑÉ½±±•È¡½±‘Ì„±¥Ù”Í•ÍÍ¥½¸°Ñ¡”Í•½¹¥Ì(€€€€€€€€¼¼É•™ÕÍ•ƒŠP¹½ĞÍ¥±•¹Ñ±ä…±±½İ•Ñ¼…±Í¼‘É¥Ù”É•…°¥¹ÁÕĞ¸(€€€€€€€±•ĞÉ•™ÕÍ•€ôÍ•½¹(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€ØÁ|ÀÀÀ°™…±Í”¤(€€€€€€€€€€€€¹Õ¹İÉ…Á}•ÉÈ ¤ì(€€€€€€€…ÍÍ•ÉĞ„ (€€€€€€€€€€€É•™ÕÍ•¹½¹Ñ…¥¹Ì ‰¹½Ñ¡•È½¹ÑÉ½°Í•ÍÍ¥½¸¥Ì…±É•…‘ä…Ñ¥Ù”ˆ¤°(€€€€€€€€€€€€‰Õ¹•áÁ•Ñ•É•™ÕÍ…°µ•ÍÍ…”èíÉ•™ÕÍ•‘ôˆ(€€€€€€€€¤ì((€€€€€€€€¼¼I•±•…Í¥¹œÙ¥„ÍÑ½Á}Í•ÍÍ¥½¸¡…¹‘ÌÑ¡”±½¬Ñ¼Ñ¡”Í•½¹½¹ÑÉ½±±•È¸(€€€€€€€…ÍÍ•ÉĞ„¡™¥ÉÍĞ¹ÍÑ½Á}Í•ÍÍ¥½¸ ™Í•ÍÍ¥½¸¹Í•ÍÍ¥½¹}¥¤¹Õ¹İÉ…À ¤¤ì(€€€€€€€±•Ğ…™Ñ•É}ÍÑ½À€ôÍ•½¹(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€ØÁ|ÀÀÀ°™…±Í”¤(€€€€€€€€€€€€¹•áÁ•Ğ ‰Í•½¹½¹ÑÉ½±±•ÈÍ¡½Õ±ÍÑ…ÉĞ½¹”Ñ¡”™¥ÉÍĞÍÑ½ÁÌˆ¤ì(€€€€€€€…ÍÍ•ÉĞ„¡…™Ñ•É}ÍÑ½À¹…Ñ¥Ù”¤ì((€€€€€€€€¼¼I•±•…Í¥¹œÙ¥„•µ•É•¹å}ÍÑ½À¡…¹‘Ì¥Ğ‰…¬Ñ¼Ñ¡”™¥ÉÍĞ½¹ÑÉ½±±•È¸(€€€€€€€Í•½¹¹•µ•É•¹å}ÍÑ½À ¤¹Õ¹İÉ…À ¤ì(€€€€€€€±•Ğ…™Ñ•É}•µ•É•¹ä€ô™¥ÉÍĞ(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€ØÁ|ÀÀÀ°™…±Í”¤(€€€€€€€€€€€€¹•áÁ•Ğ ‰™¥ÉÍĞ½¹ÑÉ½±±•ÈÍ¡½Õ±ÍÑ…ÉĞ½¹”Ñ¡”Í•½¹•µ•É•¹äµÍÑ½ÁÌˆ¤ì(€€€€€€€…ÍÍ•ÉĞ„¡…™Ñ•É}•µ•É•¹ä¹…Ñ¥Ù”¤ì((€€€€€€€™¥ÉÍĞ¹•µ•É•¹å}ÍÑ½À ¤¹Õ¹İÉ…À ¤ì(€€€€€€€±•Ğ|€ôÍÑèé™ÌèéÉ•µ½Ù•}‘¥É}…±°¡±½­}Á…Ñ ¹Á…É•¹Ğ ¤¹Õ¹İÉ…À ¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸…}ÍÑ…±•}±½­}½±‘•É}Ñ¡…¹}Ñ¡•}‰½Õ¹‘}¥Í}É•±…¥µ• ¤ì(€€€€€€€±•Ğ±½­}Á…Ñ €ôÑ•µÁ}±½­}Á…Ñ  ¤ì(€€€€€€€€¼¼±•…­•±½¬™¥±”½±‘•ÈÑ¡…¸…¹ä±•¥Ñ¥µ…Ñ”Í•ÍÍ¥½¸±¥™•Ñ¥µ”µÕÍĞ(€€€€€€€€¼¼¹½ĞÁ•Éµ…¹•¹Ñ±äİ•‘”‘•Í­Ñ½À½¹ÑÉ½°°•Ù•¸¥˜¥ÑÌÉ•½É‘•Á¥(€€€€€€€€¼¼¡…ÁÁ•¹ÌÑ¼ÍÑ¥±°‰”„±¥Ù”ÁÉ½•ÍÌ¸(€€€€€€€±•Ğ½¹Ñ•¹ÑÌ€ô1½­½¹Ñ•¹ÑÌì(€€€€€€€€€€€Á¥èÍÑèéÁÉ½•ÍÌèé¥ ¤°(€€€€€€€€€€€…ÅÕ¥É•‘}…Ñ}µÌè¹½İ}µÌ ¤¹Í…ÑÕÉ…Ñ¥¹}ÍÕˆ¡MQ1}1=-}5L€¬€Å|ÀÀÀ¤°(€€€€€€€ôì(€€€€€€€ÍÑèé™ÌèéİÉ¥Ñ” ™±½­}Á…Ñ °Í•É‘•}©Í½¸èéÑ½}Ù•Œ ™½¹Ñ•¹ÑÌ¤¹Õ¹İÉ…À ¤¤¹Õ¹İÉ…À ¤ì((€€€€€€€±•ĞÍÑ…Ñ”€ô•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”èéİ¥Ñ¡}‰…­•¹‘}…¹‘}±½¬ (€€€€€€€€€€€ÉŒèé¹•Ü¡9Õ±±	…­•¹¤°(€€€€€€€€€€€M½µ”¡±½­}Á…Ñ ¹±½¹” ¤¤°(€€€€€€€€¤ì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€ØÁ|ÀÀÀ°™…±Í”¤(€€€€€€€€€€€€¹•áÁ•Ğ ‰„±½¬½±‘•ÈÑ¡…¸MQ1}1=-}5LµÕÍĞ‰”É•±…¥µ…‰±”ˆ¤ì(€€€€€€€…ÍÍ•ÉĞ„¡Í•ÍÍ¥½¸¹…Ñ¥Ù”¤ì((€€€€€€€ÍÑ…Ñ”¹•µ•É•¹å}ÍÑ½À ¤¹Õ¹İÉ…À ¤ì(€€€€€€€±•Ğ|€ôÍÑèé™ÌèéÉ•µ½Ù•}‘¥É}…±°¡±½­}Á…Ñ ¹Á…É•¹Ğ ¤¹Õ¹İÉ…À ¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸…}½ÉÉÕÁÑ}±½­}™¥±•}¥Í}É•±…¥µ• ¤ì(€€€€€€€±•Ğ±½­}Á…Ñ €ôÑ•µÁ}±½­}Á…Ñ  ¤ì(€€€€€€€€¼¼ÑÉÕ¹…Ñ•½…É‰…”±½¬™¥±”…¹¹½Ğ‘•ÍÉ¥‰”„±¥Ù”½İ¹•È¸(€€€€€€€ÍÑèé™ÌèéİÉ¥Ñ” ™±½­}Á…Ñ °ˆ‰¹½Ğ©Í½¸ˆ¤¹Õ¹İÉ…À ¤ì(€€€€€€€±•ĞÍÑ…Ñ”€ô•Í­Ñ½Á½¹ÑÉ½±MÑ…Ñ”èéİ¥Ñ¡}‰…­•¹‘}…¹‘}±½¬ (€€€€€€€€€€€ÉŒèé¹•Ü¡9Õ±±	…­•¹¤°(€€€€€€€€€€€M½µ”¡±½­}Á…Ñ ¹±½¹” ¤¤°(€€€€€€€€¤ì(€€€€€€€±•ĞÍ•ÍÍ¥½¸€ôÍÑ…Ñ”(€€€€€€€€€€€€¹ÍÑ…ÉÑ}Í•ÍÍ¥½¹}¥µÁ° ‰µ…¹Õ…°ˆ°…±±½Ü ™l‰9½Ñ•Ì‰t¤°€ØÁ|ÀÀÀ°™…±Í”¤(€€€€€€€€€€€€¹•áÁ•Ğ ‰„½ÉÉÕÁĞ±½¬µÕÍĞ‰”É•±…¥µ…‰±”ˆ¤ì(€€€€€€€…ÍÍ•ÉĞ„¡Í•ÍÍ¥½¸¹…Ñ¥Ù”¤ì(€€€€€€€ÍÑ…Ñ”¹•µ•É•¹å}ÍÑ½À ¤¹Õ¹İÉ…À ¤ì(€€€€€€€±•Ğ|€ôÍÑèé™ÌèéÉ•µ½Ù•}‘¥É}…±°¡±½­}Á…Ñ ¹Á…É•¹Ğ ¤¹Õ¹İÉ…À ¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸¹Õ±±}‰…­•¹‘}…±İ…åÍ}ÍÕ••‘Í}…¹‘}Õ¹ÍÕÁÁ½ÉÑ•‘}‰…­•¹‘}…±İ…åÍ}™…¥±Í}±•…É±ä ¤ì(€€€€€€€±•Ğ¹Õ±°€ô9Õ±±	…­•¹ì(€€€€€€€…ÍÍ•ÉĞ„¡¹Õ±°¹µ½Ù•}µ½ÕÍ” À°€À¤¹¥Í}½¬ ¤¤ì(€€€€€€€…ÍÍ•ÉĞ„¡¹Õ±°¹±¥¬¡5½ÕÍ•	ÕÑÑ½¹-¥¹èé1•™Ğ¤¹¥Í}½¬ ¤¤ì(€€€€€€€…ÍÍ•ÉĞ„¡¹Õ±°¹­•å}ÁÉ•ÍÌ ‰„ˆ¤¹¥Í}½¬ ¤¤ì((€€€€€€€±•ĞÕ¹ÍÕÁÁ½ÉÑ•€ôU¹ÍÕÁÁ½ÉÑ•‘	…­•¹ ‰¹¼‰…­•¹İ¥É•ˆ¹Ñ½}ÍÑÉ¥¹œ ¤¤ì(€€€€€€€…ÍÍ•ÉÑ}•Ä„ (€€€€€€€€€€€Õ¹ÍÕÁÁ½ÉÑ•¹µ½Ù•}µ½ÕÍ” À°€À¤¹Õ¹İÉ…Á}•ÉÈ ¤°(€€€€€€€€€€€€‰¹¼‰…­•¹İ¥É•ˆ(€€€€€€€€¤ì(€€€€€€€…ÍÍ•ÉÑ}•Ä„ (€€€€€€€€€€€Õ¹ÍÕÁÁ½ÉÑ•¹±¥¬¡5½ÕÍ•	ÕÑÑ½¹-¥¹èé1•™Ğ¤¹Õ¹İÉ…Á}•ÉÈ ¤°(€€€€€€€€€€€€‰¹¼‰…­•¹İ¥É•ˆ(€€€€€€€€¤ì(€€€€€€€…ÍÍ•ÉÑ}•Ä„¡Õ¹ÍÕÁÁ½ÉÑ•¹­•å}ÁÉ•ÍÌ ‰„ˆ¤¹Õ¹İÉ…Á}•ÉÈ ¤°€‰¹¼‰…­•¹İ¥É•ˆ¤ì(€€€ô((€€€€¼¼€´´´´´]…å±…¹‘•Ñ•Ñ¥½¸€¡ÁÕÉ”°¡½ÍĞµÑ•ÍÑ…‰±”¤€´´´´´´´´´´´´´´´´´´´´´´´´´(€€€€¼¼(€€€€¼¼Q¡•Í”ÉÕ¸½¸Ñ¡¥Ìµ…=L‰Õ¥±µ…¡¥¹”•Ù•¸Ñ¡½Õ ¥Í}İ…å±…¹‘}Í•ÍÍ¥½¹€Ì(€€€€¼¼½¹±äÁÉ½‘ÕÑ¥½¸…±±•È¥Ì1¥¹Õàµ…Ñ•ƒŠPÑ¡…Ğ¥ÌÑ¡”İ¡½±”Á½¥¹Ğ½˜(€€€€¼¼­••Á¥¹œÑ¡”‘•¥Í¥½¸ÁÕÉ”…¹•¹Øµ™É•”¸((€€€€mÑ•ÍÑt(€€€™¸İ…å±…¹‘}Í•ÍÍ¥½¹}ÑåÁ•}¥Í}‘•Ñ•Ñ• ¤ì(€€€€€€€…ÍÍ•ÉĞ„¡¥Í}İ…å±…¹‘}Í•ÍÍ¥½¸¡M½µ” ‰İ…å±…¹ˆ¤°9½¹”¤¤ì(€€€€€€€€¼¼…Í”µ¥¹Í•¹Í¥Ñ¥Ù”…¹Ñ½±•É…¹Ğ½˜ÍÕÉÉ½Õ¹‘¥¹œİ¡¥Ñ•ÍÁ…”¸(€€€€€€€…ÍÍ•ÉĞ„¡¥Í}İ…å±…¹‘}Í•ÍÍ¥½¸¡M½µ” ‰]…å±…¹ˆ¤°9½¹”¤¤ì(€€€€€€€…ÍÍ•ÉĞ„¡¥Í}İ…å±…¹‘}Í•ÍÍ¥½¸¡M½µ” ˆİ…å±…¹€ˆ¤°9½¹”¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸İ…å±…¹‘}‘¥ÍÁ±…å}Í•Ñ}İ¥Ñ¡½ÕÑ}…}Í•ÍÍ¥½¹}ÑåÁ•}¥Í}‘•Ñ•Ñ• ¤ì(€€€€€€€…ÍÍ•ÉĞ„¡¥Í}İ…å±…¹‘}Í•ÍÍ¥½¸¡9½¹”°M½µ” ‰İ…å±…¹´Àˆ¤¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸àÄÅ}Í•ÍÍ¥½¹}ÑåÁ•}¥Í}¹½Ñ}İ…å±…¹‘}•Ù•¹}İ¥Ñ¡}İ…å±…¹‘}‘¥ÍÁ±…å}Í•Ğ ¤ì(€€€€€€€€¼¼¸•áÁ±¥¥ĞÍ•ÍÍ¥½¸ÑåÁ”¥Ì…ÕÑ¡½É¥Ñ…Ñ¥Ù”èàÄÅ€¥Ì¹•Ù•È]…å±…¹°(€€€€€€€€¼¼•Ù•¸¥˜„ÍÑÉ…ä]e19}%MA1d¥Ì…±Í¼ÁÉ•Í•¹Ğ€¡”¹œ¸a]…å±…¹¤¸(€€€€€€€…ÍÍ•ÉĞ„ …¥Í}İ…å±…¹‘}Í•ÍÍ¥½¸¡M½µ” ‰àÄÄˆ¤°9½¹”¤¤ì(€€€€€€€…ÍÍ•ÉĞ„ …¥Í}İ…å±…¹‘}Í•ÍÍ¥½¸¡M½µ” ‰àÄÄˆ¤°M½µ” ‰İ…å±…¹´Àˆ¤¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸¹½}Í¥¹…±Í}…ÍÍÕµ•Í}àÄÅ}…¹‘}‘½•Í}¹½Ñ}‰±½¬ ¤ì(€€€€€€€…ÍÍ•ÉĞ„ …¥Í}İ…å±…¹‘}Í•ÍÍ¥½¸¡9½¹”°9½¹”¤¤ì(€€€€€€€€¼¼µÁÑäÙ…±Õ•Ì…É”ÑÉ•…Ñ•…Ì€‰Õ¹Í•Ğˆ…¹µÕÍĞ¹½Ğ‰±½¬•¥Ñ¡•È¸(€€€€€€€…ÍÍ•ÉĞ„ …¥Í}İ…å±…¹‘}Í•ÍÍ¥½¸¡M½µ” ˆˆ¤°9½¹”¤¤ì(€€€€€€€…ÍÍ•ÉĞ„ …¥Í}İ…å±…¹‘}Í•ÍÍ¥½¸¡M½µ” ˆ€€€ˆ¤°M½µ” ˆˆ¤¤¤ì(€€€€€€€€¼¼¸Õ¹­¹½İ¸Í•ÍÍ¥½¸ÑåÁ”€¡¹½Ğİ…å±…¹¤İ¥Ñ ¹¼]e19}%MA1d¥Ì(€€€€€€€€¼¼±¥­•İ¥Í”¹½ĞÑÉ•…Ñ•…Ì]…å±…¹¸(€€€€€€€…ÍÍ•ÉĞ„ …¥Í}İ…å±…¹‘}Í•ÍÍ¥½¸¡M½µ” ‰ÑÑäˆ¤°9½¹”¤¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸İ…å±…¹‘}Õ¹ÍÕÁÁ½ÉÑ•‘}µ•ÍÍ…•}¥Í}±•…É}…‰½ÕÑ}àÄÅ}İ½É­¥¹œ ¤ì(€€€€€€€…ÍÍ•ÉĞ„¡]e19}U9MUAA=IQ}5MM¹½¹Ñ…¥¹Ì ‰]…å±…¹ˆ¤¤ì(€€€€€€€…ÍÍ•ÉĞ„¡]e19}U9MUAA=IQ}5MM¹½¹Ñ…¥¹Ì ‰`ÄÄÍ•ÍÍ¥½¹Ìİ½É¬Ñ½‘…äˆ¤¤ì(€€€ô)ô(

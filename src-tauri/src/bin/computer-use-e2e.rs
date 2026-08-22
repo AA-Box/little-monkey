@@ -194,7 +194,7 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
         let session = state.start_session_with_options(
             "auto",
             allowed_applications(pid),
-            120_000,
+            900_000,
             SessionGrantOptions {
                 allow_screenshots: true,
                 allow_keyboard_input: true,
@@ -306,7 +306,7 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
         let restarted = state.start_session_with_options(
             "auto",
             allowed_applications(child.id()),
-            120_000,
+            900_000,
             SessionGrantOptions {
                 allow_screenshots: true,
                 allow_keyboard_input: true,
