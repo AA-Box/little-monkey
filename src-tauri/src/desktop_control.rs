@@ -1513,7 +1513,8 @@ for (const p of processList) {
     if (onlyPid && Number(safe(() => p.unixId(), 0)) !== onlyPid) continue;
     if (!safe(() => p.visible(), false)) continue;
     const name = String(safe(() => p.name(), '')); const bundle = String(safe(() => p.bundleIdentifier(), '')); const app = bundle === 'null' || bundle === 'undefined' || !bundle ? name : bundle;
-    const front = Boolean(safe(() => p.frontmost(), false)); let wi = 0;
+    const workspaceFrontPid = Number(safe(() => $.NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier, 0));
+    const front = onlyPid ? workspaceFrontPid === onlyPid : Boolean(safe(() => p.frontmost(), false)); let wi = 0;
     for (const w of safe(() => p.windows(), [])) {
       if (wi >= 32) break;
       const title = String(safe(() => w.name(), '')); const id = app + '::window-' + wi; const target = {targetId:id,applicationId:app,applicationName:name,windowId:id,windowTitle:title,bounds:rect(w),focused:front && wi===0,sensitive:false,supportedActions:['inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot']}; targets.push(target);
@@ -1722,13 +1723,18 @@ JSON.stringify({semantic:true});
 #[cfg(target_os = "macos")]
 const MACOS_FOCUS_SCRIPT: &str = r#"
 ObjC.import('Foundation');
+ObjC.import('AppKit');
 const se = Application('System Events');
 const env = $.NSProcessInfo.processInfo.environment;
 const get = key => ObjC.unwrap(env.objectForKey(key));
+const safe = (f, d) => { try { const v = f(); return v === undefined ? d : v; } catch (_) { return d; } };
 const appId = get('LM_APP_ID');
+const fixturePid = Number(get('COMPUTER_USE_FIXTURE_PID') || 0);
 const process = /^(com|org|net|io)\./.test(appId) ? se.processes.byBundleIdentifier(appId) : se.processes.byName(appId);
+if (fixturePid) safe(() => { const app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(fixturePid); app.activateWithOptions(2); return true; }, false);
 process.frontmost = true;
-JSON.stringify({focused:Boolean(process.frontmost())});
+const frontPid = Number(safe(() => $.NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier, 0));
+JSON.stringify({focused:fixturePid ? frontPid === fixturePid : Boolean(process.frontmost())});
 "#;
 
 #[cfg(target_os = "windows")]
