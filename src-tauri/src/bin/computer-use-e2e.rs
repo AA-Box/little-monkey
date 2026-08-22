@@ -134,14 +134,18 @@ fn find_toggle_element<'a>(
         .iter()
         .find(|element| {
             let role = element.role.to_ascii_lowercase();
-            element.label == label
-                && element.actions.iter().any(|action| action == "click")
-                && (role.contains("check") || role.contains("toggle"))
+            element.label == label && (role.contains("check") || role.contains("toggle"))
         })
         .or_else(|| {
             inspection.elements.iter().find(|element| {
                 element.label == label && element.actions.iter().any(|action| action == "click")
             })
+        })
+        .or_else(|| {
+            inspection
+                .elements
+                .iter()
+                .find(|element| element.label == label)
         })
 }
 
