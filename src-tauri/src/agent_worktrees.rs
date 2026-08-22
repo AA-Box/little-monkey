@@ -330,6 +330,15 @@ fn workspace_index_records(root: &Path) -> Result<HashMap<String, Vec<u8>>, Stri
     Ok(records)
 }
 
+pub fn validate_docker_workspace_root_count(root_count: usize) -> Result<(), String> {
+    if root_count != 1 {
+        return Err(format!(
+            "Docker autonomous placement supports exactly one workspace root; received {root_count}"
+        ));
+    }
+    Ok(())
+}
+
 fn copy_workspace_tree(source: &Path, destination: &Path) -> Result<(), String> {
     for entry in std::fs::read_dir(source).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
@@ -713,12 +722,19 @@ pub fn snapshot(data_root: &Path, workspace_root: &Path) -> Result<WorkspaceSnap
     let files_dir = dir.join("files");
     std::fs::create_dir_all(&files_dir)
         .map_err(|error| format!("Could not create workspace snapshot: {error}"))?;
-    let changed_files = workspace_changed_files(&root)?;
     let index_records = workspace_index_records(&root)?;
+    let mut changed_files = workspace_changed_files(&root)?;
+    changed_files.extend(
+        index_records
+            .iter()
+            .filter(|(_, record)| matches!(record.first(), Some(b'h' | b'S' | b's')))
+            .map(|(path, _)| path.clone()),
+    );
+    changed_files.sort();
+    changed_files.dedup();
     let mut entries = Vec::new();
-    // Clean tracked paths need no byte-for-byte baseline: bulk Git status
-    // identifies them if they become dirty, and restore falls back to HEAD.
-    // Only pre-existing dirty paths need content and index preservation.
+    // Clean tracked paths need no byte-for-byte baseline unless Git is already
+    // hiding their worktree changes with assume-unchanged/skip-worktree.
     for relative in &changed_files {
         let relative_path = relative_path(relative)?;
         let snapshot = workspace_path_snapshot(&root, relative)?;
@@ -1456,7 +1472,16 @@ pub fn workspace_revision(data_root: &Path, workspace_root: &Path) -> Result<Str
         }
         hasher.update([0]);
     }
-    for path in workspace_changed_files(&root)? {
+    let mut detailed_paths = workspace_changed_files(&root)?;
+    detailed_paths.extend(
+        index_records
+            .iter()
+            .filter(|(_, record)| matches!(record.first(), Some(b'h' | b'S' | b's')))
+            .map(|(path, _)| path.clone()),
+    );
+    detailed_paths.sort();
+    detailed_paths.dedup();
+    for path in detailed_paths {
         hasher.update(path.as_bytes());
         hasher.update([0]);
         let snapshot = workspace_path_snapshot(&root, &path)?;
@@ -2080,6 +2105,49 @@ mod tests {
             &repo,
             &["update-index", "--no-skip-worktree", "--", "a.txt"],
         );
+    }
+
+    #[test]
+    fn workspace_snapshot_detects_content_mutations_hidden_by_preexisting_index_flags() {
+        for (tag, flag, expected_marker) in [
+            ("baseline-assume-unchanged", "--assume-unchanged", 'h'),
+            ("baseline-skip-worktree", "--skip-worktree", 'S'),
+        ] {
+            let data = temp_dir(&format!("data-{tag}"));
+            let repo = init_repo(tag);
+            git(&repo, &["update-index", flag, "--", "a.txt"]);
+            let saved = snapshot(&data, &repo).unwrap();
+
+            std::fs::write(repo.join("a.txt"), "hidden worker mutation\n").unwrap();
+            assert_eq!(
+                changed_files_since_snapshot(&data, &repo, &saved.id).unwrap(),
+                vec!["a.txt".to_string()]
+            );
+            let patch = patch_bytes_since_snapshot(&data, &repo, &saved.id).unwrap();
+            let text = String::from_utf8_lossy(&patch);
+            assert!(text.contains("-hello"), "{text}");
+            assert!(text.contains("+hidden worker mutation"), "{text}");
+
+            restore_workspace_paths(&data, &repo, &saved.id, &["a.txt".to_string()]).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+                "hello\n"
+            );
+            assert_eq!(
+                run_git_ok(&repo, &["ls-files", "-s", "-v"])
+                    .unwrap()
+                    .chars()
+                    .next(),
+                Some(expected_marker)
+            );
+        }
+    }
+
+    #[test]
+    fn docker_placement_requires_one_workspace_root() {
+        assert!(validate_docker_workspace_root_count(1).is_ok());
+        let error = validate_docker_workspace_root_count(2).unwrap_err();
+        assert!(error.contains("exactly one workspace root"), "{error}");
     }
 
     #[test]

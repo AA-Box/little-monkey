@@ -178,7 +178,11 @@ fn autonomous_workspace_revision(path: &Path) -> Result<String, String> {
         }
         material.push(0);
     }
-    for relative in autonomous_changed_files(path)? {
+    let mut detailed_paths = autonomous_changed_files(path)?;
+    detailed_paths.extend(autonomous_index_flagged_paths(&index_records));
+    detailed_paths.sort();
+    detailed_paths.dedup();
+    for relative in detailed_paths {
         material.extend_from_slice(relative.as_bytes());
         material.push(0);
         let snapshot = autonomous_path_snapshot(path, &relative)?;
@@ -400,6 +404,16 @@ fn autonomous_index_records(path: &Path) -> Result<HashMap<String, Vec<u8>>, Str
     Ok(records)
 }
 
+fn autonomous_index_flagged_paths(index_records: &HashMap<String, Vec<u8>>) -> Vec<String> {
+    let mut paths = index_records
+        .iter()
+        .filter(|(_, record)| matches!(record.first(), Some(b'h' | b'S' | b's')))
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
 fn autonomous_path_snapshot(root: &Path, relative: &str) -> Result<AutonomousPathSnapshot, String> {
     let absolute = autonomous_safe_path(root, relative)?;
     let metadata = std::fs::symlink_metadata(&absolute).ok();
@@ -489,10 +503,11 @@ fn autonomous_git_patch_mode(state: &AutonomousPathState, filesystem_mode: u32) 
 
 fn autonomous_workspace_baseline(path: &Path) -> Result<AutonomousWorkspaceBaseline, String> {
     let mut files = HashMap::new();
-    // Git status is one bulk operation. Clean tracked paths need no content
-    // snapshot: a later status call identifies them, and restore falls back to
-    // HEAD. Only pre-existing dirty paths require detailed preservation.
-    let baseline_files = autonomous_changed_files(path)?;
+    let index_records = autonomous_index_records(path)?;
+    let mut baseline_files = autonomous_changed_files(path)?;
+    baseline_files.extend(autonomous_index_flagged_paths(&index_records));
+    baseline_files.sort();
+    baseline_files.dedup();
     for relative in baseline_files {
         files.insert(
             relative.clone(),
@@ -501,7 +516,7 @@ fn autonomous_workspace_baseline(path: &Path) -> Result<AutonomousWorkspaceBasel
     }
     Ok(AutonomousWorkspaceBaseline {
         files,
-        index_records: autonomous_index_records(path)?,
+        index_records,
     })
 }
 
@@ -3847,12 +3862,13 @@ async fn execute_autonomous_docker_node(
     docker_spec.run_id = format!("{}-{}", snapshot.task_id, node.node_id);
     docker_spec.idempotency_key = format!("autonomous-placement/{}", docker_spec.run_id);
     docker_spec.task = objective.to_string();
-    docker_spec.workspace = docker_spec.workspace.map(|mut workspace| {
-        for root in &mut workspace.roots {
-            root.canonical_path = "/workspace".to_string();
-        }
-        workspace
-    });
+    let workspace = docker_spec.workspace.as_mut().ok_or_else(|| {
+        "Docker autonomous placement requires exactly one workspace root".to_string()
+    })?;
+    little_monkey_lib::agent_worktrees::validate_docker_workspace_root_count(
+        workspace.roots.len(),
+    )?;
+    workspace.roots[0].canonical_path = "/workspace".to_string();
     docker_spec.autonomous_task = Some(serde_json::json!({
         "schema_version": recipes::AUTONOMOUS_TASK_RECIPE_SCHEMA_VERSION,
         "task_id": docker_spec.run_id,
@@ -5948,6 +5964,35 @@ async fn run_inner(
 mod tests {
     use super::*;
 
+    fn autonomous_test_git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn autonomous_test_repo(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("little-monkey-task-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        autonomous_test_git(&root, &["init", "-q"]);
+        autonomous_test_git(&root, &["config", "user.email", "test@example.com"]);
+        autonomous_test_git(&root, &["config", "user.name", "Autonomous Test"]);
+        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+        autonomous_test_git(&root, &["add", "--", "a.txt"]);
+        autonomous_test_git(&root, &["commit", "-qm", "initial"]);
+        root
+    }
+
     fn test_generation() -> recipes::DesktopGenerationSettingsSnapshot {
         recipes::DesktopGenerationSettingsSnapshot {
             temperature: Some(0.25),
@@ -6007,6 +6052,37 @@ mod tests {
         assert!(autonomous_phase_completed(&snapshot, "implement"));
         assert!(!autonomous_phase_completed(&snapshot, "verify"));
         assert!(!autonomous_phase_completed(&snapshot, "review"));
+    }
+
+    #[test]
+    fn autonomous_baseline_tracks_content_hidden_by_preexisting_index_flags() {
+        for (tag, flag, expected_marker) in [
+            ("baseline-assume-unchanged", "--assume-unchanged", 'h'),
+            ("baseline-skip-worktree", "--skip-worktree", 'S'),
+        ] {
+            let root = autonomous_test_repo(tag);
+            autonomous_test_git(&root, &["update-index", flag, "--", "a.txt"]);
+            let baseline = autonomous_workspace_baseline(&root).unwrap();
+
+            std::fs::write(root.join("a.txt"), "hidden worker mutation\n").unwrap();
+            assert_eq!(
+                autonomous_workspace_delta(&root, &baseline).unwrap(),
+                vec!["a.txt".to_string()]
+            );
+
+            autonomous_restore_baseline_path(&root, "a.txt", &baseline).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join("a.txt")).unwrap(),
+                "hello\n"
+            );
+            assert_eq!(
+                autonomous_test_git(&root, &["ls-files", "-s", "-v"])
+                    .chars()
+                    .next(),
+                Some(expected_marker)
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]

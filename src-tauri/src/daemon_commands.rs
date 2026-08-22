@@ -1899,19 +1899,12 @@ pub async fn autonomous_task_place_node(
             let spec_path = dir.join(format!("{}.json", uuid::Uuid::new_v4()));
             let mut spec = request.run_spec;
             consume_autonomous_placement_boundary(&mut spec, "docker")?;
-            let host_workspace = spec
-                .workspace
-                .as_ref()
-                .and_then(|workspace| workspace.roots.first())
-                .map(|root| root.canonical_path.clone())
-                .ok_or_else(|| {
-                    "Docker autonomous placement requires a workspace root".to_string()
-                })?;
-            if let Some(workspace) = spec.workspace.as_mut() {
-                for root in &mut workspace.roots {
-                    root.canonical_path = "/workspace".to_string();
-                }
-            }
+            let workspace = spec.workspace.as_mut().ok_or_else(|| {
+                "Docker autonomous placement requires exactly one workspace root".to_string()
+            })?;
+            crate::agent_worktrees::validate_docker_workspace_root_count(workspace.roots.len())?;
+            let host_workspace = workspace.roots[0].canonical_path.clone();
+            workspace.roots[0].canonical_path = "/workspace".to_string();
             let bytes = serde_json::to_vec_pretty(&spec)
                 .map_err(|error| format!("Could not serialize Docker placement spec: {error}"))?;
             std::fs::write(&spec_path, bytes)
