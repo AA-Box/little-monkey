@@ -211,26 +211,6 @@ fn autonomous_changed_files(path: &Path) -> Result<Vec<String>, String> {
     Ok(files)
 }
 
-fn autonomous_tracked_files(path: &Path) -> Result<Vec<String>, String> {
-    let output = Command::new("git")
-        .args(["ls-files", "-z", "--cached"])
-        .current_dir(path)
-        .output()
-        .map_err(|error| format!("could not inspect tracked files: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "could not inspect tracked files: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|record| !record.is_empty())
-        .map(|record| String::from_utf8_lossy(record).to_string())
-        .collect())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AutonomousPathState {
     Missing,
@@ -454,12 +434,35 @@ fn autonomous_head_path_snapshot(
     })
 }
 
+fn autonomous_git_patch_mode(state: &AutonomousPathState, filesystem_mode: u32) -> u32 {
+    match state {
+        AutonomousPathState::Missing => 0,
+        AutonomousPathState::Symlink(_) => 0o120000,
+        AutonomousPathState::File(_) => {
+            if filesystem_mode & 0o111 != 0 {
+                0o100755
+            } else {
+                0o100644
+            }
+        }
+        AutonomousPathState::Other => 0,
+    }
+}
+
+fn autonomous_null_device() -> &'static str {
+    if cfg!(windows) {
+        "NUL"
+    } else {
+        "/dev/null"
+    }
+}
+
 fn autonomous_workspace_baseline(path: &Path) -> Result<AutonomousWorkspaceBaseline, String> {
     let mut files = HashMap::new();
-    let mut baseline_files = autonomous_changed_files(path)?;
-    baseline_files.extend(autonomous_tracked_files(path)?);
-    baseline_files.sort();
-    baseline_files.dedup();
+    // Git status is one bulk operation. Clean tracked paths need no content
+    // snapshot: a later status call identifies them, and restore falls back to
+    // HEAD. Only pre-existing dirty paths require detailed preservation.
+    let baseline_files = autonomous_changed_files(path)?;
     for relative in baseline_files {
         files.insert(
             relative.clone(),
@@ -725,6 +728,7 @@ fn autonomous_patch_bytes_since_baseline(
     std::fs::create_dir(&temp)
         .map_err(|error| format!("could not create autonomous patch staging directory: {error}"))?;
     let mut patch = Vec::new();
+    let mut index_deltas = Vec::new();
     for relative in autonomous_workspace_delta(path, baseline)? {
         let before = baseline
             .files
@@ -733,7 +737,19 @@ fn autonomous_patch_bytes_since_baseline(
             .flatten()
             .unwrap_or(autonomous_head_path_snapshot(path, &relative)?);
         let after = autonomous_path_snapshot(path, &relative)?;
-        if before == after {
+        let before_mode = autonomous_git_patch_mode(&before.state, before.mode);
+        let after_mode = autonomous_git_patch_mode(&after.state, after.mode);
+        if before.index_state != after.index_state || before.index_metadata != after.index_metadata
+        {
+            index_deltas.push(little_monkey_lib::agent_worktrees::WorkspaceIndexDelta {
+                path: relative.clone(),
+                before_state: before.index_state.clone(),
+                after_state: after.index_state.clone(),
+                before_metadata: before.index_metadata.clone(),
+                after_metadata: after.index_metadata.clone(),
+            });
+        }
+        if before.state == after.state && before_mode == after_mode {
             continue;
         }
         let before_path = temp.join("before").join(&relative);
@@ -743,12 +759,12 @@ fn autonomous_patch_bytes_since_baseline(
         let before_arg = if before_exists {
             before_path.to_string_lossy().into_owned()
         } else {
-            "/dev/null".to_string()
+            autonomous_null_device().to_string()
         };
         let after_arg = if after_exists {
             after_path.to_string_lossy().into_owned()
         } else {
-            "/dev/null".to_string()
+            autonomous_null_device().to_string()
         };
         let output = Command::new("git")
             .args([
@@ -768,15 +784,30 @@ fn autonomous_patch_bytes_since_baseline(
                 "could not collect exact autonomous patch for '{relative}'"
             ));
         }
-        patch.extend(autonomous_rewrite_patch_paths(
-            output.stdout,
-            &relative,
-            before_exists,
-            after_exists,
-        ));
+        let mut rewritten =
+            autonomous_rewrite_patch_paths(output.stdout, &relative, before_exists, after_exists);
+        if before_mode != after_mode {
+            if rewritten.is_empty() {
+                rewritten = format!("diff --git a/{relative} b/{relative}\n").into_bytes();
+            }
+            let header = if before_mode == 0 {
+                format!("new file mode {after_mode:o}\n")
+            } else if after_mode == 0 {
+                format!("deleted file mode {before_mode:o}\n")
+            } else {
+                format!("old mode {before_mode:o}\nnew mode {after_mode:o}\n")
+            };
+            let insert_at = rewritten
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|index| index + 1)
+                .unwrap_or(rewritten.len());
+            rewritten.splice(insert_at..insert_at, header.as_bytes().iter().copied());
+        }
+        patch.extend(rewritten);
     }
     let _ = std::fs::remove_dir_all(&temp);
-    Ok(patch)
+    little_monkey_lib::agent_worktrees::append_index_deltas(patch, &index_deltas)
 }
 
 fn autonomous_restore_baseline_path(
@@ -1572,6 +1603,22 @@ struct RunResult {
     evidence: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     review: Option<serde_json::Value>,
+    #[serde(
+        rename = "failureKind",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    failure_kind: Option<AutonomousFailureKind>,
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum AutonomousFailureKind {
+    ExecutionTargetLost,
+    ExecutionFailed,
+    PermissionDenied,
+    BudgetExhausted,
+    Cancelled,
 }
 
 struct InvocationIdentity {
@@ -1880,6 +1927,11 @@ fn terminal_retry_result(
             iterations_capped: false,
             final_message: recorder.terminal_summary()?,
             files_changed: Vec::new(),
+            failure_kind: match status {
+                RunStatus::Cancelled => Some(AutonomousFailureKind::Cancelled),
+                RunStatus::Failed => Some(AutonomousFailureKind::ExecutionFailed),
+                _ => None,
+            },
             ..Default::default()
         },
     ))
@@ -1913,6 +1965,13 @@ pub async fn run(
         }
         Err(e) => {
             if json_output {
+                let failure_kind = if is_execution_target_lost(&e) {
+                    AutonomousFailureKind::ExecutionTargetLost
+                } else if e.contains("Permission denied") || e.starts_with("Blocked:") {
+                    AutonomousFailureKind::PermissionDenied
+                } else {
+                    AutonomousFailureKind::ExecutionFailed
+                };
                 let result = RunResult {
                     name: name_or_path.to_string(),
                     run_id: None,
@@ -1920,6 +1979,7 @@ pub async fn run(
                     iterations_capped: false,
                     final_message: Some(e.clone()),
                     files_changed: Vec::new(),
+                    failure_kind: Some(failure_kind),
                     ..Default::default()
                 };
                 println!(
@@ -4105,7 +4165,21 @@ async fn run_autonomous_task_executor(
                                 Path::new(&record.path),
                             )
                             .await?;
-                            Ok::<_, String>((node, changed, Some(record)))
+                            let status = little_monkey_lib::agent_worktrees::status(
+                                &worker_data_root,
+                                &record.path,
+                            )?;
+                            let worker_after_revision =
+                                little_monkey_lib::agent_worktrees::workspace_revision(
+                                    &worker_data_root,
+                                    Path::new(&record.path),
+                                )?;
+                            Ok::<_, String>((
+                                node,
+                                changed,
+                                Some(record),
+                                Some((status, worker_after_revision)),
+                            ))
                         } else {
                             let changed = autonomous_phase(
                                 &worker_snapshot,
@@ -4125,7 +4199,7 @@ async fn run_autonomous_task_executor(
                                 workspace_root,
                             )
                             .await?;
-                            Ok::<_, String>((node, changed, None))
+                            Ok::<_, String>((node, changed, None, None))
                         }
                     }
                     .await;
@@ -4166,11 +4240,19 @@ async fn run_autonomous_task_executor(
                 }
             }
             let mut claimed_files = HashMap::<String, String>::new();
-            for (node, _, record) in &completed_results {
-                if let Some(record) = record {
+            for (node, _, record, worker_state) in &completed_results {
+                if record.is_some() {
                     let status =
-                        little_monkey_lib::agent_worktrees::status(&data_root, &record.path)?;
-                    for file in status.changed_files {
+                        worker_state
+                            .as_ref()
+                            .map(|(status, _)| status)
+                            .ok_or_else(|| {
+                                format!(
+                                    "parallel worktree '{}' has no isolated status",
+                                    node.node_id
+                                )
+                            })?;
+                    for file in &status.changed_files {
                         if matches!(node.task_class.as_str(), "implementation" | "integration")
                             && !autonomous_file_in_scope(&file, &node.mutation_scope)
                         {
@@ -4190,34 +4272,47 @@ async fn run_autonomous_task_executor(
                     }
                 }
             }
-            for (node, mut changed, record) in completed_results {
+            for (node, mut changed, record, worker_state) in completed_results {
+                let worker_before_revision = worker_state
+                    .as_ref()
+                    .map(|(status, _)| status.base_revision.clone())
+                    .unwrap_or_else(|| parallel_before_revision.clone());
+                let worker_after_revision =
+                    worker_state.as_ref().map(|(_, revision)| revision.clone());
+                let worker_changed_files = worker_state
+                    .as_ref()
+                    .map(|(status, _)| status.changed_files.clone());
+                let worker_patch_digest = worker_state
+                    .as_ref()
+                    .map(|(status, _)| status.patch_digest.clone());
                 if let Some(record) = record {
                     changed.extend(little_monkey_lib::agent_worktrees::apply(
                         &data_root,
                         &record.path,
                     )?);
                 }
-                let after_revision = autonomous_workspace_revision(workspace_root)?;
-                let actual_changed = changed.clone();
+                let integration_revision = autonomous_workspace_revision(workspace_root)?;
+                let actual_changed = worker_changed_files.unwrap_or_else(|| changed.clone());
                 changed.extend(actual_changed.clone());
                 changed.sort();
                 changed.dedup();
-                let patch_digest = sha256_hex(actual_changed.join("\n").as_bytes());
+                let patch_digest = worker_patch_digest
+                    .unwrap_or_else(|| sha256_hex(actual_changed.join("\n").as_bytes()));
                 completed.insert(node.node_id.clone());
                 files_changed.extend(changed);
                 files_changed.sort();
                 files_changed.dedup();
-                effective_snapshot.current_workspace_revision = after_revision.clone();
+                effective_snapshot.current_workspace_revision = integration_revision.clone();
                 checkpoint_autonomous_task_snapshot(
                     &mut effective_snapshot,
-                    &after_revision,
+                    &integration_revision,
                     &completed,
                 );
                 autonomous_task_event(
                     recorder,
                     &effective_snapshot.task_id,
                     "node_mutation",
-                    serde_json::json!({ "node_id": node.node_id, "before_revision": parallel_before_revision, "after_revision": after_revision, "changed_files": actual_changed, "patch_digest": patch_digest, "timestamp_ms": unix_time_ms()?, "mutation": node.task_class == "implementation" }),
+                    serde_json::json!({ "node_id": node.node_id, "before_revision": worker_before_revision, "after_revision": worker_after_revision.unwrap_or_else(|| integration_revision.clone()), "integration_revision": integration_revision, "changed_files": actual_changed, "patch_digest": patch_digest, "timestamp_ms": unix_time_ms()?, "mutation": node.task_class == "implementation" }),
                 )?;
                 autonomous_task_event(
                     recorder,
@@ -4436,39 +4531,17 @@ async fn run_autonomous_task_executor(
                             artifact_id
                         ));
                     }
-                    let patch_path_arg = patch_path.to_string_lossy().into_owned();
-                    let check = Command::new("git")
-                        .args([
-                            "-C",
-                            &workspace_root.to_string_lossy(),
-                            "apply",
-                            "--check",
-                            &patch_path_arg,
-                        ])
-                        .output()
-                        .map_err(|error| format!("Could not validate remote patch: {error}"))?;
-                    if !check.status.success() {
-                        return Err(format!(
-                            "remote patch for node '{}' does not apply to the current workspace",
-                            node.node_id
-                        ));
-                    }
-                    let apply = Command::new("git")
-                        .args([
-                            "-C",
-                            &workspace_root.to_string_lossy(),
-                            "apply",
-                            &patch_path_arg,
-                        ])
-                        .output()
-                        .map_err(|error| format!("Could not apply remote patch: {error}"))?;
+                    let apply = little_monkey_lib::agent_worktrees::apply_patch_artifact(
+                        &workspace_root,
+                        &patch_bytes,
+                    );
                     let _ = std::fs::remove_file(&patch_path);
-                    if !apply.status.success() {
-                        return Err(format!(
-                            "Could not apply remote patch for node '{}'",
+                    apply.map_err(|error| {
+                        format!(
+                            "Could not apply remote patch for node '{}': {error}",
                             node.node_id
-                        ));
-                    }
+                        )
+                    })?;
                     imported = result
                         .get("changedFiles")
                         .and_then(|value| value.as_array())
@@ -5506,6 +5579,7 @@ async fn run_inner(
                         files_changed: result.files_changed,
                         evidence,
                         review,
+                        failure_kind: None,
                     },
                 ));
             }
@@ -5534,6 +5608,11 @@ async fn run_inner(
                         iterations_capped: false,
                         final_message: Some(error),
                         files_changed: Vec::new(),
+                        failure_kind: Some(if target_lost {
+                            AutonomousFailureKind::ExecutionTargetLost
+                        } else {
+                            AutonomousFailureKind::ExecutionFailed
+                        }),
                         ..Default::default()
                     },
                 ));
@@ -5552,6 +5631,7 @@ async fn run_inner(
                         iterations_capped: false,
                         final_message: Some(reason),
                         files_changed: Vec::new(),
+                        failure_kind: Some(AutonomousFailureKind::BudgetExhausted),
                         ..Default::default()
                     },
                 ));
@@ -5628,6 +5708,7 @@ async fn run_inner(
                         iterations_capped: false,
                         final_message: Some(reason),
                         files_changed: Vec::new(),
+                        failure_kind: Some(AutonomousFailureKind::BudgetExhausted),
                         ..Default::default()
                     },
                 ));
@@ -5659,6 +5740,11 @@ async fn run_inner(
                     iterations_capped: false,
                     final_message: Some(error),
                     files_changed: Vec::new(),
+                    failure_kind: Some(if exit_code == EXIT_PERMISSION_DENIED {
+                        AutonomousFailureKind::PermissionDenied
+                    } else {
+                        AutonomousFailureKind::ExecutionFailed
+                    }),
                     ..Default::default()
                 },
             ));
@@ -5704,6 +5790,7 @@ async fn run_inner(
         iterations_capped,
         final_message,
         files_changed,
+        failure_kind: iterations_capped.then_some(AutonomousFailureKind::BudgetExhausted),
         ..Default::default()
     };
     let code = if iterations_capped {
@@ -6047,6 +6134,7 @@ mod tests {
                 "passed": true
             })],
             review: Some(serde_json::json!({ "verdict": "pass" })),
+            failure_kind: None,
         })
         .unwrap();
         assert_eq!(value["evidence"][0]["node_id"], "verify");

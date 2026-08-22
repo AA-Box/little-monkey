@@ -25,6 +25,7 @@ export interface TaskNodeResult {
   ok: boolean;
   summary: string;
   failureCode?: "EXECUTION_TARGET_LOST" | "FAILED";
+  failureKind?: "EXECUTION_TARGET_LOST" | "EXECUTION_FAILED" | "PERMISSION_DENIED" | "BUDGET_EXHAUSTED" | "CANCELLED";
   worktreePath?: string;
   artifacts?: TaskArtifact[];
   evidence?: VerificationEvidence[];
@@ -151,12 +152,20 @@ function defaultAutonomousTaskPlacementAdapters(): AutonomousTaskPlacementAdapte
   const execute = async (kind: "docker" | "remote_node", task: AutonomousTask, node: TaskPlanNode): Promise<TaskNodeResult> => {
     const spec = buildAutonomousPlacementRunSpec(task, node, kind);
     const targetId = node.executionPlacement?.targetId?.trim();
-    if (!targetId) return { ok: false, summary: `Execution placement '${kind}' has no target id.` };
+    if (!targetId) {
+      return {
+        ok: false,
+        failureCode: "FAILED",
+        failureKind: "EXECUTION_FAILED",
+        summary: `Execution placement '${kind}' has no target id.`,
+      };
+    }
     try {
       return await invoke<TaskNodeResult>("autonomous_task_place_node", { request: { kind, targetId, runSpec: spec } });
     } catch (error) {
       const message = `${kind} execution failed: ${error instanceof Error ? error.message : String(error)}`;
-      return { ok: false, failureCode: targetLost(error) ? "EXECUTION_TARGET_LOST" : "FAILED", summary: message };
+      const lost = targetLost(error);
+      return { ok: false, failureCode: lost ? "EXECUTION_TARGET_LOST" : "FAILED", failureKind: lost ? "EXECUTION_TARGET_LOST" : "EXECUTION_FAILED", summary: message };
     }
   };
   return {
@@ -315,7 +324,7 @@ function outOfScopeFiles(node: TaskPlanNode, changedFiles: string[]): string[] {
 }
 
 function isExecutionTargetLost(result: TaskNodeResult): boolean {
-  return result.failureCode === "EXECUTION_TARGET_LOST" || /^EXECUTION_TARGET_LOST\s*:/i.test(result.summary);
+  return result.failureCode === "EXECUTION_TARGET_LOST" || result.failureKind === "EXECUTION_TARGET_LOST" || /^EXECUTION_TARGET_LOST\s*:/i.test(result.summary);
 }
 
 function insertRepairNode(task: AutonomousTask, failedNode: TaskPlanNode, summary: string): AutonomousTask {

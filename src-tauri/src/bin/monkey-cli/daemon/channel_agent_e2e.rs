@@ -54,6 +54,7 @@ use crate::durable_run::CliRunEventSink;
 use little_monkey_lib::channels::policy::{AccessPolicy, ChannelAccessPolicy, GroupActivation};
 use little_monkey_lib::channels::routing::{ChannelRoute, RouteScope, RouteTarget};
 use little_monkey_lib::channels::types::{ChannelHealth, ChannelKind};
+use little_monkey_lib::run_protocol::RunEvent;
 
 use super::adapters::telegram::TelegramAdapter;
 use super::channel_adapter::{AdapterConfig, ChannelAdapter};
@@ -599,11 +600,11 @@ fn autonomous_model_fixture() -> HttpFixture {
                 {
                     "nodeId": "implement-frontend",
                     "taskClass": "implementation",
-                    "objective": "Inspect the README and prepare the frontend slice.",
+                    "objective": "Set a.txt to the initial frontend slice A1.",
                     "dependencies": [],
-                    "mutationScope": ["README.md"],
+                    "mutationScope": ["a.txt"],
                     "isolation": "worktree",
-                    "relevantFiles": ["README.md"],
+                    "relevantFiles": ["a.txt"],
                     "capabilities": ["read", "mutate"],
                     "executionPlacement": {"kind": "worktree", "targetId": "local", "nodeId": "implement-frontend"},
                     "executionRequirements": {"needsWorkspaceWrite": true, "needsNetwork": false, "isolation": "worktree"}
@@ -611,11 +612,11 @@ fn autonomous_model_fixture() -> HttpFixture {
                 {
                     "nodeId": "implement-backend",
                     "taskClass": "implementation",
-                    "objective": "Inspect the README and prepare the backend slice.",
+                    "objective": "Set b.txt to the intentionally incomplete backend slice B1.",
                     "dependencies": [],
-                    "mutationScope": ["README.md"],
+                    "mutationScope": ["b.txt"],
                     "isolation": "worktree",
-                    "relevantFiles": ["README.md"],
+                    "relevantFiles": ["b.txt"],
                     "capabilities": ["read", "mutate"],
                     "executionPlacement": {"kind": "worktree", "targetId": "local", "nodeId": "implement-backend"},
                     "executionRequirements": {"needsWorkspaceWrite": true, "needsNetwork": false, "isolation": "worktree"}
@@ -627,7 +628,7 @@ fn autonomous_model_fixture() -> HttpFixture {
                     "dependencies": ["implement-frontend", "implement-backend"],
                     "mutationScope": ["workspace"],
                     "isolation": "shared",
-                    "relevantFiles": ["README.md"],
+                    "relevantFiles": ["a.txt", "b.txt"],
                     "capabilities": ["read", "mutate"],
                     "executionRequirements": {"needsWorkspaceWrite": true, "needsNetwork": false, "isolation": "shared"}
                 },
@@ -638,7 +639,7 @@ fn autonomous_model_fixture() -> HttpFixture {
                     "dependencies": ["integrate"],
                     "mutationScope": ["workspace"],
                     "isolation": "shared",
-                    "relevantFiles": ["README.md"],
+                    "relevantFiles": ["a.txt", "b.txt"],
                     "capabilities": ["read", "verify"]
                 },
                 {
@@ -648,34 +649,71 @@ fn autonomous_model_fixture() -> HttpFixture {
                     "dependencies": ["verify"],
                     "mutationScope": ["workspace"],
                     "isolation": "shared",
-                    "relevantFiles": ["README.md"],
+                    "relevantFiles": ["a.txt", "b.txt"],
                     "capabilities": ["read", "verify"]
                 }
             ]
         },
         "acceptanceCriteria": [
-            {"id": "verify-readme", "description": "The configured verification command passes.", "method": "verification_command", "blocking": true, "provenance": {"kind": "planner", "fragment": "configured verification"}},
-            {"id": "review-readme", "description": "The structured review passes.", "method": "review", "blocking": true, "provenance": {"kind": "planner", "fragment": "structured review"}},
-            {"id": "scope-readme", "description": "Workers stay inside README.md.", "method": "workspace_boundary", "blocking": true, "provenance": {"kind": "planner", "fragment": "README.md scope"}}
+            {"id": "verify-files", "description": "The configured verification command passes for both files.", "method": "verification_command", "blocking": true, "provenance": {"kind": "planner", "fragment": "configured verification"}},
+            {"id": "review-files", "description": "The structured review passes against the actual diff.", "method": "review", "blocking": true, "provenance": {"kind": "planner", "fragment": "structured review"}},
+            {"id": "scope-files", "description": "Workers stay inside their individual file scopes.", "method": "workspace_boundary", "blocking": true, "provenance": {"kind": "planner", "fragment": "file scopes"}}
         ],
-        "planningContext": {"relevantFiles": ["README.md"]},
+        "planningContext": {"relevantFiles": ["a.txt", "b.txt"]},
         "summary": "parallel autonomous coordinator fixture"
     });
     let review = serde_json::json!({
         "verdict": "pass",
         "findings": [],
-        "filesReviewed": ["README.md"],
-        "acceptanceCriteria": ["verify-readme", "review-readme", "scope-readme"],
+        "filesReviewed": ["a.txt", "b.txt"],
+        "acceptanceCriteria": ["verify-files", "review-files", "scope-files"],
         "securityFindings": [],
         "testCoverageFindings": []
     });
+    let sent_mutations = Arc::new(std::sync::Mutex::new(
+        std::collections::HashSet::<String>::new(),
+    ));
     HttpFixture::spawn(move |head, body, _index| {
         if !head.contains("/chat/completions") {
             return json_response(r#"{"error":"unexpected autonomous model route"}"#);
         }
-        let content = if body.contains("phase: review") || body.contains("bounded 'review' phase") {
+        let prompt_text = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|request| request["messages"].as_array().cloned())
+            .map(|messages| messages.iter().filter_map(|message| message["content"].as_str()).collect::<Vec<_>>().join("\n"))
+            .unwrap_or_else(|| body.to_string());
+        let implementation = prompt_text.contains("Universal AutonomousTask phase: implementation");
+        let repair = prompt_text.contains("Diagnose and repair");
+        let current_node_contract = prompt_text
+            .rsplit("Frozen node contract (do not change it):")
+            .next()
+            .unwrap_or(&prompt_text);
+        let mut path = if current_node_contract.contains("implement-backend")
+            || current_node_contract.contains("Set b.txt")
+            || (implementation && current_node_contract.contains("b.txt"))
+        {
+            "b.txt"
+        } else {
+            "a.txt"
+        };
+        if implementation {
+            let mut sent = sent_mutations.lock().expect("mutation fixture lock");
+            if repair && sent.contains("b.txt:repair") {
+                path = "a.txt";
+            }
+            let key = format!("{path}:{}", if repair { "repair" } else { "initial" });
+            if sent.insert(key.clone()) {
+                let content = if repair { if path == "a.txt" { "A2\n" } else { "B2\n" } } else if path == "a.txt" { "A1\n" } else { "B1\n" };
+                let arguments = serde_json::json!({ "path": path, "content": content }).to_string();
+                return sse_response(&[
+                    serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": format!("call-{key}"), "type": "function", "function": {"name": "write_file", "arguments": arguments}}]}}]}),
+                    serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                ]);
+            }
+        }
+        let content = if prompt_text.contains("phase: review") || prompt_text.contains("bounded 'review' phase") {
             review.to_string()
-        } else if body.contains("phase: planner") {
+        } else if prompt_text.contains("phase: planner") {
             planner.to_string()
         } else {
             "autonomous phase completed".to_string()
@@ -715,8 +753,9 @@ async fn run_autonomous_coordinator_end_to_end(root: &Path) {
     autonomous_e2e_git(&workspace, &["init", "-q"]);
     autonomous_e2e_git(&workspace, &["config", "user.email", "e2e@example.test"]);
     autonomous_e2e_git(&workspace, &["config", "user.name", "Autonomous E2E"]);
-    std::fs::write(workspace.join("README.md"), "autonomous fixture\n").expect("README");
-    autonomous_e2e_git(&workspace, &["add", "README.md"]);
+    std::fs::write(workspace.join("a.txt"), "A0\n").expect("a.txt");
+    std::fs::write(workspace.join("b.txt"), "B0\n").expect("b.txt");
+    autonomous_e2e_git(&workspace, &["add", "a.txt", "b.txt"]);
     autonomous_e2e_git(&workspace, &["commit", "-q", "-m", "fixture baseline"]);
 
     let roots = little_monkey_lib::app_paths::ensure_agent_config_roots().expect("config roots");
@@ -728,7 +767,7 @@ async fn run_autonomous_coordinator_end_to_end(root: &Path) {
             "commands": [{
                 "id": "autonomous-e2e-verify",
                 "label": "Autonomous E2E verification",
-                "command": "git diff --check --",
+                "command": "git diff --check -- && git grep -F -e \"A2\" -- a.txt && git grep -F -e \"B2\" -- b.txt",
                 "kind": "custom",
                 "enabled": true,
                 "timeoutSecs": 30
@@ -749,7 +788,6 @@ async fn run_autonomous_coordinator_end_to_end(root: &Path) {
         1,
         "the real CLI verification config was not visible to the coordinator"
     );
-
     let paths = DaemonPaths::under(&roots.legacy);
     paths.ensure().expect("daemon paths");
     let config = DaemonConfig::default();
@@ -829,6 +867,14 @@ async fn run_autonomous_coordinator_end_to_end(root: &Path) {
         std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default(),
         serde_json::to_string(&diagnostic_events).unwrap_or_default()
     );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("a.txt")).expect("a.txt result"),
+        "A2\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("b.txt")).expect("b.txt result"),
+        "B2\n"
+    );
     let events = SharedLedger::open(&paths.ledger_db)
         .expect("ledger")
         .run_ledger()
@@ -861,8 +907,63 @@ async fn run_autonomous_coordinator_end_to_end(root: &Path) {
         "structured review missing: {rendered}"
     );
     assert!(
-        model.count() >= 6,
-        "coordinator did not run planner, workers, integration, verify, and review"
+        rendered.contains("\"repair_of\""),
+        "verification did not trigger bounded repair: {rendered}"
+    );
+    let worker_mutations = events
+        .iter()
+        .filter_map(|event| {
+            if let RunEvent::TaskEvent {
+                event_type,
+                payload,
+                ..
+            } = &event.event
+            {
+                (event_type == "node_mutation"
+                    && payload.get("parallel") != Some(&serde_json::Value::Bool(true)))
+                .then_some(payload)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let parallel_mutations = events
+        .iter()
+        .filter_map(|event| {
+            if let RunEvent::TaskEvent {
+                event_type,
+                payload,
+                ..
+            } = &event.event
+            {
+                (event_type == "node_mutation" && payload.get("integration_revision").is_some())
+                    .then_some(payload)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        parallel_mutations.len() >= 2,
+        "isolated worker mutation evidence missing: {rendered}"
+    );
+    assert!(
+        parallel_mutations
+            .iter()
+            .all(|payload| payload["before_revision"].is_string()
+                && payload["patch_digest"]
+                    .as_str()
+                    .is_some_and(|digest| !digest.is_empty())
+                && payload["changed_files"].as_array().is_some()),
+        "worker evidence is not revision-bound: {parallel_mutations:?}"
+    );
+    assert!(
+        !worker_mutations.is_empty(),
+        "mutation-bearing worker events missing: {rendered}"
+    );
+    assert!(
+        model.count() >= 10,
+        "coordinator did not run planner, workers, repair, integration, verify, and review"
     );
 }
 
