@@ -15,6 +15,8 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
@@ -45,13 +47,24 @@ def main() -> int:
     args.report.unlink(missing_ok=True)
     app_log_path = args.report.with_suffix(".app.log")
     app_log_path.unlink(missing_ok=True)
+    frontend_log_path = args.report.with_suffix(".frontend.log")
+    frontend_log_path.unlink(missing_ok=True)
 
     python = os.environ.get("COMPUTER_USE_FIXTURE_PYTHON", sys.executable)
     fixture = subprocess.Popen([python, str(args.fixture)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     repo = Path(__file__).resolve().parents[2]
     pnpm = shutil.which("pnpm") or shutil.which("pnpm.cmd") or "pnpm"
     app_command = os.environ.get("COMPUTER_USE_FULL_PRODUCT_COMMAND")
-    command = app_command.split() if app_command else [pnpm, "tauri", "dev", "--no-watch"]
+    frontend_command = os.environ.get("COMPUTER_USE_FULL_PRODUCT_FRONTEND_COMMAND")
+    frontend = frontend_command.split() if frontend_command else [pnpm, "dev", "--", "--host", "127.0.0.1"]
+    command = app_command.split() if app_command else [
+        pnpm,
+        "tauri",
+        "dev",
+        "--no-watch",
+        "--config",
+        '{"build":{"beforeDevCommand":""}}',
+    ]
     environment = os.environ.copy()
     environment.update({
         "COMPUTER_USE_FULL_PRODUCT_E2E": "1",
@@ -61,6 +74,44 @@ def main() -> int:
     })
     if os.name != "nt":
         environment.setdefault("GDK_BACKEND", "x11")
+    frontend_log = frontend_log_path.open("w", encoding="utf-8")
+    frontend_process = subprocess.Popen(
+        frontend,
+        cwd=repo,
+        env=environment,
+        stdout=frontend_log,
+        stderr=subprocess.STDOUT,
+        start_new_session=(os.name != "nt"),
+    )
+    frontend_deadline = time.monotonic() + 120
+    while time.monotonic() < frontend_deadline:
+        if frontend_process.poll() is not None:
+            break
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:1420/", timeout=2):
+                break
+        except (urllib.error.URLError, TimeoutError):
+            time.sleep(1)
+    else:
+        frontend_log.flush()
+        tail = frontend_log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
+        print("frontend dev server output:", file=sys.stderr)
+        print("\n".join(tail), file=sys.stderr)
+        print("frontend dev server did not become ready", file=sys.stderr)
+        terminate(frontend_process)
+        frontend_log.close()
+        terminate(fixture)
+        return 1
+    if frontend_process.poll() is not None:
+        frontend_log.flush()
+        tail = frontend_log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
+        print("frontend dev server output:", file=sys.stderr)
+        print("\n".join(tail), file=sys.stderr)
+        print(f"frontend dev server exited (exit={frontend_process.poll()})", file=sys.stderr)
+        frontend_log.close()
+        terminate(fixture)
+        return 1
+
     app_log = app_log_path.open("w", encoding="utf-8")
     app = subprocess.Popen(
         command,
@@ -117,6 +168,8 @@ def main() -> int:
     finally:
         terminate(app)
         app_log.close()
+        terminate(frontend_process)
+        frontend_log.close()
         terminate(fixture)
 
 
