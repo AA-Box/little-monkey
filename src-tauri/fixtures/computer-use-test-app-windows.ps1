@@ -39,6 +39,7 @@ $status.AutoSize = $true
 $dark = New-Object System.Windows.Forms.CheckBox
 $dark.Text = 'Dark mode'
 $dark.AccessibleName = 'Dark mode'
+$dark.AccessibleRole = [System.Windows.Forms.AccessibleRole]::CheckButton
 $dark.Location = New-Object System.Drawing.Point(16, 148)
 $dark.AutoSize = $true
 
