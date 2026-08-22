@@ -4861,13 +4861,14 @@ mod tests {
             .arg(&fixture)
             .spawn()
             .expect("Windows fixture must start");
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        std::thread::sleep(std::time::Duration::from_secs(8));
         assert!(child.try_wait().expect("fixture status").is_none());
         std::env::set_var("COMPUTER_USE_FIXTURE_PID", child.id().to_string());
 
         let result = (|| -> Result<(), String> {
             let actions = BTreeSet::from([RemoteAction::ControlDesktop]);
-            let (root, api, _secrets, device, secret) = fixture_scoped(actions, BTreeSet::new());
+            let (root, api, _secrets, device, secret) =
+                fixture_scoped(actions, BTreeSet::from(["run-one".to_string()]));
             let paths = DaemonPaths::under(&root);
             let state = Arc::new(
                 little_monkey_lib::desktop_control::DesktopControlState::production_with_lock(

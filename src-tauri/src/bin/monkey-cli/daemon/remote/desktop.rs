@@ -1262,7 +1262,7 @@ mod tests {
             .arg(&fixture)
             .spawn()
             .expect("Windows fixture must start");
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        std::thread::sleep(std::time::Duration::from_secs(8));
         assert!(child.try_wait().expect("fixture status").is_none());
         std::env::set_var("COMPUTER_USE_FIXTURE_PID", child.id().to_string());
 
