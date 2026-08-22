@@ -1457,7 +1457,7 @@ if($onlyPid){
   }
 }
 function ValueOf($e) { try { return $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value } catch { try { return [string]$e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState } catch { return $null } } }
-function ActionsOf($e) { $a=@(); try { $e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern) | Out-Null; $a+='click'; $a+='double_click' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern) | Out-Null; $a+='click' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern) | Out-Null; $a+='set_value' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern) | Out-Null; $a+='select' } catch {}; if(([string]$e.Current.ControlType.ProgrammaticName -match 'Edit') -and -not ($a -contains 'set_value')){$a+='set_value'}; return @($a | Select-Object -Unique) }
+function ActionsOf($e) { $a=@(); try { $e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern) | Out-Null; $a+='click'; $a+='double_click' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern) | Out-Null; $a+='click' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern) | Out-Null; $a+='set_value' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern) | Out-Null; $a+='select' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern) | Out-Null; $a+='click' } catch {}; if(([string]$e.Current.ControlType.ProgrammaticName -match 'Edit') -and -not ($a -contains 'set_value')){$a+='set_value'}; return @($a | Select-Object -Unique) }
 function RectOf($rect) { $x=0.0;$y=0.0;$width=0.0;$height=0.0;try{$x=[double]$rect.X;$y=[double]$rect.Y;$width=[double]$rect.Width;$height=[double]$rect.Height}catch{};[ordered]@{x=$x;y=$y;width=$width;height=$height} }
 function AncestorText($e) { $parts=@();$current=$e;for($k=0;$k -lt 8;$k++){try{$current=$walker.GetParent($current);if($null -eq $current){break};$parts+=[string]$current.Current.Name}catch{break}};return ($parts -join ' ') }
 for($i=0;$i -lt $windows.Count -and $i -lt 64;$i++){
@@ -1654,7 +1654,10 @@ if($action -eq 'set_value') {
       } catch {}
     }
   } catch {}
-  if(-not $performed -and -not $toggleSupported) { try { $p=$e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); $p.Invoke(); $performed=$true } catch {} }
+  if(-not $performed -and -not $toggleSupported) {
+    try { $p=$e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); $p.Invoke(); $performed=$true } catch {}
+    if(-not $performed) { try { $p=$e.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern); $p.DoDefaultAction(); $performed=$true } catch {} }
+  }
   if($performed -and $action -eq 'double_click') { try { $fresh=ResolveElement; if($toggleSupported) { $fresh.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Toggle() } else { $fresh.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() } } catch {} }
 }
 if($performed) { [ordered]@{semantic=$true}|ConvertTo-Json -Compress } else { [ordered]@{semantic=$false}|ConvertTo-Json -Compress }
