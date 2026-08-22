@@ -56,7 +56,15 @@ def main() -> int:
     pnpm = shutil.which("pnpm") or shutil.which("pnpm.cmd") or "pnpm"
     app_command = os.environ.get("COMPUTER_USE_FULL_PRODUCT_COMMAND")
     frontend_command = os.environ.get("COMPUTER_USE_FULL_PRODUCT_FRONTEND_COMMAND")
-    frontend = frontend_command.split() if frontend_command else [pnpm, "dev", "--", "--host", "127.0.0.1"]
+    node = shutil.which("node") or shutil.which("node.exe") or "node"
+    frontend = frontend_command.split() if frontend_command else [
+        node,
+        str(repo / "node_modules/vite/bin/vite.js"),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "1420",
+    ]
     command = app_command.split() if app_command else [
         pnpm,
         "tauri",
