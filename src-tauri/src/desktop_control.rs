@@ -127,6 +127,7 @@ pub struct ComputerTarget {
     pub bounds: ComputerBounds,
     pub focused: bool,
     pub sensitive: bool,
+    #[serde(deserialize_with = "deserialize_vec_or_singleton")]
     pub supported_actions: Vec<String>,
 }
 
@@ -140,6 +141,7 @@ pub struct ComputerElement {
     pub bounds: ComputerBounds,
     pub enabled: bool,
     pub focused: bool,
+    #[serde(deserialize_with = "deserialize_vec_or_singleton")]
     pub actions: Vec<String>,
     pub sensitive: bool,
 }
@@ -717,6 +719,7 @@ struct NativeSnapshot {
 enum OneOrMany<T> {
     Many(Vec<T>),
     One(T),
+    None(Option<T>),
 }
 
 fn deserialize_vec_or_singleton<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
@@ -727,6 +730,7 @@ where
     Ok(match OneOrMany::deserialize(deserializer)? {
         OneOrMany::Many(values) => values,
         OneOrMany::One(value) => vec![value],
+        OneOrMany::None(_) => Vec::new(),
     })
 }
 
@@ -743,6 +747,7 @@ where
             let elements = match value {
                 OneOrMany::Many(elements) => elements,
                 OneOrMany::One(element) => vec![element],
+                OneOrMany::None(_) => Vec::new(),
             };
             (key, elements)
         })
