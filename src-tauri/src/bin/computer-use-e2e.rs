@@ -126,14 +126,32 @@ fn find_element<'a>(
 }
 
 fn find_profile_element<'a>(inspection: &'a ComputerInspection) -> Option<&'a ComputerElement> {
-    inspection.elements.iter().find(|element| {
-        !element.sensitive
-            && (element.label == "Profile name"
-                || element.value.as_deref() == Some("Test profile")
-                || element.value.as_deref() == Some("hello")
-                || element.role.to_ascii_lowercase().contains("edit")
-                || element.actions.iter().any(|action| action == "set_value"))
-    })
+    inspection
+        .elements
+        .iter()
+        .filter(|element| !element.sensitive)
+        .filter_map(|element| {
+            let role = element.role.to_ascii_lowercase();
+            let mut score = 0;
+            if element.label == "Profile name" {
+                score += 100;
+            }
+            if matches!(
+                element.value.as_deref(),
+                Some("Test profile") | Some("hello")
+            ) {
+                score += 80;
+            }
+            if role.contains("edit") || role.contains("textfield") || role.contains("text field") {
+                score += 40;
+            }
+            if element.actions.iter().any(|action| action == "set_value") {
+                score += 10;
+            }
+            (score > 0).then_some((score, element))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, element)| element)
 }
 
 fn dark_is_on(element: &ComputerElement) -> bool {
@@ -141,10 +159,12 @@ fn dark_is_on(element: &ComputerElement) -> bool {
         .value
         .as_deref()
         .map(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "checked"
-            )
+            let normalized = value.to_ascii_lowercase();
+            let state = normalized
+                .rsplit(['.', ' ', ':'])
+                .next()
+                .unwrap_or(&normalized);
+            matches!(state, "1" | "true" | "on" | "checked")
         })
         .unwrap_or(false)
 }
