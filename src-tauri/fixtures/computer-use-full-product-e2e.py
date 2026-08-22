@@ -96,7 +96,7 @@ def main() -> int:
         if frontend_process.poll() is not None:
             break
         try:
-            with urllib.request.urlopen("http://127.0.0.1:1420/", timeout=2):
+            with urllib.request.urlopen("http://localhost:1420/", timeout=2):
                 break
         except (urllib.error.URLError, TimeoutError):
             time.sleep(1)
