@@ -455,12 +455,12 @@ pub fn split_index_deltas(artifact: &[u8]) -> Result<(Vec<u8>, Vec<WorkspaceInde
             .expect("payload length has four bytes"),
     ) as usize;
     let payload_end = payload_len_start;
-    let payload_start = payload_end
-        .checked_sub(payload_len)
-        .ok_or_else(|| "Invalid index delta trailer length".to_string())?;
-    let magic_start = payload_start
-        .checked_sub(INDEX_DELTA_MAGIC.len())
-        .ok_or_else(|| "Invalid index delta trailer framing".to_string())?;
+    let Some(payload_start) = payload_end.checked_sub(payload_len) else {
+        return Ok((artifact.to_vec(), Vec::new()));
+    };
+    let Some(magic_start) = payload_start.checked_sub(INDEX_DELTA_MAGIC.len()) else {
+        return Ok((artifact.to_vec(), Vec::new()));
+    };
     if &artifact[magic_start..payload_start] != INDEX_DELTA_MAGIC {
         return Ok((artifact.to_vec(), Vec::new()));
     }
@@ -2084,6 +2084,11 @@ mod tests {
 
     #[test]
     fn framed_index_artifact_ignores_marker_text_inside_patch_content() {
+        let plain_patch = b"diff --git a/a.txt b/a.txt\n+plain source\n".to_vec();
+        assert_eq!(
+            split_index_deltas(&plain_patch).unwrap(),
+            (plain_patch.clone(), Vec::new())
+        );
         let deltas = vec![WorkspaceIndexDelta {
             path: "a.txt".to_string(),
             before_state: Vec::new(),
