@@ -91,6 +91,10 @@ fn allowed_applications(pid: u32) -> Vec<String> {
         "atspi:Python".to_string(),
         "atspi:python".to_string(),
         "atspi:python3".to_string(),
+        "atspi:Little Monkey TestApp".to_string(),
+        "atspi:com.aabox.LittleMonkeyTestApp".to_string(),
+        "Little Monkey TestApp".to_string(),
+        "com.aabox.LittleMonkeyTestApp".to_string(),
         "computer-use-test-app-macos".to_string(),
         "little-monkey-test-app-macos".to_string(),
     ];
@@ -113,20 +117,27 @@ fn provider_name() -> &'static str {
 }
 
 fn target_is_fixture(target: &ComputerTarget) -> bool {
+    let application = target.application_name.to_ascii_lowercase();
     target.window_title.contains("Little Monkey TestApp")
-        || target.application_name.contains("Python")
-        || target
-            .application_name
-            .to_ascii_lowercase()
-            .contains("python")
+        || application.contains("python")
+        || application.contains("little monkey")
+        || application.contains("littlemonkey")
 }
 
 fn target_is_primary_fixture(target: &ComputerTarget) -> bool {
     target.window_title == "Little Monkey TestApp"
-        || (target
+        || ((target
             .application_name
             .to_ascii_lowercase()
             .contains("python")
+            || target
+                .application_name
+                .to_ascii_lowercase()
+                .contains("little monkey")
+            || target
+                .application_name
+                .to_ascii_lowercase()
+                .contains("littlemonkey"))
             && !target
                 .window_title
                 .to_ascii_lowercase()
