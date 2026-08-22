@@ -2936,6 +2936,8 @@ fn find_chromium() -> Result<PathBuf, String> {
     }
     #[cfg(target_os = "linux")]
     candidates.extend([
+        PathBuf::from("/opt/google/chrome/google-chrome"),
+        PathBuf::from("/opt/google/chrome/chrome"),
         PathBuf::from("/usr/bin/google-chrome"),
         PathBuf::from("/usr/bin/chromium"),
         PathBuf::from("/usr/bin/chromium-browser"),
