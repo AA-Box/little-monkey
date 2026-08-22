@@ -292,6 +292,12 @@ async fn execute_subagent_tool_call(
     raw_arguments: &str,
     checkpoint_id: Option<&str>,
 ) -> String {
+    if !perms.tool_allowed(name) {
+        return serde_json::json!({
+            "error": format!("Tool \"{name}\" is not allowed by the frozen autonomous node contract")
+        })
+        .to_string();
+    }
     let args: serde_json::Value = if raw_arguments.trim().is_empty() {
         serde_json::json!({})
     } else {
@@ -860,6 +866,12 @@ async fn execute_tool_call(
     usage: &mut UsageSnapshot,
     mutated_files: &mut std::collections::HashSet<String>,
 ) -> String {
+    if !perms.tool_allowed(name) {
+        return serde_json::json!({
+            "error": format!("Tool \"{name}\" is not allowed by the frozen autonomous node contract")
+        })
+        .to_string();
+    }
     let args: serde_json::Value = if raw_arguments.trim().is_empty() {
         serde_json::json!({})
     } else {
@@ -1839,6 +1851,15 @@ async fn run_tool_loop(
             !name.is_some_and(|name| WORKSPACE_TOOL_NAMES.contains(&name))
         });
     }
+    // Dynamic tools are appended above, so apply the node contract after all
+    // normal and conditional tool definitions have been assembled.
+    tools_vec.retain(|definition| {
+        definition
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| perms.tool_allowed(name))
+    });
     let native = target.is_native();
 
     // Absolute (or workspace-relative, as given by the model) paths this

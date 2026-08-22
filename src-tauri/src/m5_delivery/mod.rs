@@ -24,6 +24,17 @@ use store::DeliveryStore;
 
 const PREVIEW_TTL_MS: u64 = 5 * 60 * 1_000;
 
+pub fn current_branch(root: &Path) -> Result<String, String> {
+    let branch = git::git_text(root, &["branch", "--show-current"])?;
+    if branch.is_empty() {
+        return Err(
+            "The repository is in a detached HEAD state; choose a named base branch.".to_string(),
+        );
+    }
+    validate_git_token("base branch", &branch)?;
+    Ok(branch)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeliveryPolicy {
@@ -648,6 +659,16 @@ pub fn prepare_mutation_impl(
         external: mutation.is_external(),
         expires_at_ms,
     })
+}
+
+/// Returns the durable execution state for an exact mutation digest. Autonomous
+/// delivery recovery uses this after a daemon restart so a completed local
+/// commit is not dispatched a second time when its task event was not flushed.
+pub fn mutation_execution_state_impl(digest: &str) -> Result<Option<String>, String> {
+    validate_digest(digest)?;
+    Ok(open_store()?
+        .execution(digest)?
+        .map(|execution| execution.state))
 }
 
 #[tauri::command]
