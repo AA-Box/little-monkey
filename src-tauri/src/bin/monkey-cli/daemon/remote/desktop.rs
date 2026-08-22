@@ -1278,20 +1278,24 @@ mod tests {
                 Arc::new(ProductionWindowsConsent),
                 paths,
             );
-            let discovered = runtime.start_with_options(
-                "remote-windows-ci",
-                "Windows CI remote controller",
-                vec![format!("process:{}", child.id())],
-                false,
-                Vec::new(),
-                MAX_SESSION_LIFETIME_MS,
-                true,
-                true,
-                false,
-                Some(ApprovalPolicy::PerAction),
-            )?;
+            let discovered = runtime
+                .start_with_options(
+                    "remote-windows-ci",
+                    "Windows CI remote controller",
+                    vec![format!("process:{}", child.id())],
+                    false,
+                    Vec::new(),
+                    MAX_SESSION_LIFETIME_MS,
+                    true,
+                    true,
+                    false,
+                    Some(ApprovalPolicy::PerAction),
+                )
+                .map_err(|(_, error)| error)?;
             let discovery_session = session_id_of(&discovered);
-            let targets = runtime.list_targets("remote-windows-ci", &discovery_session)?;
+            let targets = runtime
+                .list_targets("remote-windows-ci", &discovery_session)
+                .map_err(|(_, error)| error)?;
             let target = targets["targets"]
                 .as_array()
                 .and_then(|items| {
@@ -1303,20 +1307,24 @@ mod tests {
                 .ok_or_else(|| "production remote UIA did not discover the fixture".to_string())?;
             let application_id = target["applicationId"].as_str().unwrap().to_string();
             let window_id = target["windowId"].as_str().unwrap().to_string();
-            runtime.stop("remote-windows-ci", &discovery_session)?;
+            runtime
+                .stop("remote-windows-ci", &discovery_session)
+                .map_err(|(_, error)| error)?;
 
-            let started = runtime.start_with_options(
-                "remote-windows-ci",
-                "Windows CI remote controller",
-                vec![application_id.clone()],
-                false,
-                vec![window_id.clone()],
-                MAX_SESSION_LIFETIME_MS,
-                true,
-                true,
-                false,
-                Some(ApprovalPolicy::PerAction),
-            )?;
+            let started = runtime
+                .start_with_options(
+                    "remote-windows-ci",
+                    "Windows CI remote controller",
+                    vec![application_id.clone()],
+                    false,
+                    vec![window_id.clone()],
+                    MAX_SESSION_LIFETIME_MS,
+                    true,
+                    true,
+                    false,
+                    Some(ApprovalPolicy::PerAction),
+                )
+                .map_err(|(_, error)| error)?;
             let session_id = session_id_of(&started);
             let inspect_request = |session_id: &str| DesktopControlTargetRequest {
                 session_id: session_id.to_string(),
@@ -1325,7 +1333,9 @@ mod tests {
                 query: None,
                 bounds: None,
             };
-            let inspection = runtime.inspect("remote-windows-ci", inspect_request(&session_id))?;
+            let inspection = runtime
+                .inspect("remote-windows-ci", inspect_request(&session_id))
+                .map_err(|(_, error)| error)?;
             let elements = inspection["inspection"]["elements"]
                 .as_array()
                 .ok_or_else(|| "remote UIA inspection returned no elements array".to_string())?;
@@ -1351,34 +1361,41 @@ mod tests {
                 target_window_id: Some(window_id.clone()),
                 action,
             };
-            runtime.action(
-                "remote-windows-ci",
-                "Windows CI remote controller",
-                action_request(ControlAction::SemanticClick {
-                    element_id: dark_id,
-                    button: MouseButtonKind::Left,
-                    expected_value: None,
-                }),
-            )?;
-            runtime.action(
-                "remote-windows-ci",
-                "Windows CI remote controller",
-                action_request(ControlAction::SetValue {
-                    element_id: profile_id,
-                    value: "hello".to_string(),
-                }),
-            )?;
-            runtime.action(
-                "remote-windows-ci",
-                "Windows CI remote controller",
-                action_request(ControlAction::SemanticClick {
-                    element_id: save_id,
-                    button: MouseButtonKind::Left,
-                    expected_value: None,
-                }),
-            )?;
-            let screenshot =
-                runtime.screenshot("remote-windows-ci", inspect_request(&session_id))?;
+            runtime
+                .action(
+                    "remote-windows-ci",
+                    "Windows CI remote controller",
+                    action_request(ControlAction::SemanticClick {
+                        element_id: dark_id,
+                        button: MouseButtonKind::Left,
+                        expected_value: None,
+                    }),
+                )
+                .map_err(|(_, error)| error)?;
+            runtime
+                .action(
+                    "remote-windows-ci",
+                    "Windows CI remote controller",
+                    action_request(ControlAction::SetValue {
+                        element_id: profile_id,
+                        value: "hello".to_string(),
+                    }),
+                )
+                .map_err(|(_, error)| error)?;
+            runtime
+                .action(
+                    "remote-windows-ci",
+                    "Windows CI remote controller",
+                    action_request(ControlAction::SemanticClick {
+                        element_id: save_id,
+                        button: MouseButtonKind::Left,
+                        expected_value: None,
+                    }),
+                )
+                .map_err(|(_, error)| error)?;
+            let screenshot = runtime
+                .screenshot("remote-windows-ci", inspect_request(&session_id))
+                .map_err(|(_, error)| error)?;
             assert!(screenshot["artifact_id"].as_str().is_some());
             let audit = state.audit_snapshot()?;
             let audit_text = serde_json::to_string(&audit).map_err(|error| error.to_string())?;
