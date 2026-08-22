@@ -179,6 +179,11 @@ fn find_toggle_element<'a>(
 }
 
 fn find_profile_element<'a>(inspection: &'a ComputerInspection) -> Option<&'a ComputerElement> {
+    let profile_label_bounds = inspection
+        .elements
+        .iter()
+        .find(|element| element.label == "Profile name")
+        .map(|element| &element.bounds);
     inspection
         .elements
         .iter()
@@ -193,7 +198,18 @@ fn find_profile_element<'a>(inspection: &'a ComputerInspection) -> Option<&'a Co
                 element.value.as_deref(),
                 Some("Test profile") | Some("hello")
             );
-            if !editable_role && !editable_action && !stable_profile_id && !profile_value {
+            let adjacent_to_profile_label = profile_label_bounds.is_some_and(|label| {
+                element.label != "Profile name"
+                    && element.label != "Save profile"
+                    && element.bounds.x > label.x + label.width * 0.5
+                    && (element.bounds.y - label.y).abs() <= label.height.max(24.0)
+            });
+            if !editable_role
+                && !editable_action
+                && !stable_profile_id
+                && !profile_value
+                && !adjacent_to_profile_label
+            {
                 return None;
             }
             let mut score = 0;
@@ -205,6 +221,9 @@ fn find_profile_element<'a>(inspection: &'a ComputerInspection) -> Option<&'a Co
             }
             if profile_value {
                 score += 80;
+            }
+            if adjacent_to_profile_label {
+                score += 70;
             }
             if editable_role {
                 score += 40;
