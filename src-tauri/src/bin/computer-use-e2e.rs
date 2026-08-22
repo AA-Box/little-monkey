@@ -38,8 +38,24 @@ fn python_command() -> String {
 fn launch(fixture: &str) -> Result<Child, String> {
     let executable =
         std::env::var("COMPUTER_USE_FIXTURE_COMMAND").unwrap_or_else(|_| python_command());
-    let child = Command::new(executable)
-        .arg(fixture)
+    let mut command = Command::new(executable);
+    if cfg!(target_os = "windows") {
+        if let Ok(script) = std::env::var("COMPUTER_USE_FIXTURE_SCRIPT") {
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ]);
+            command.arg(script);
+        } else {
+            command.arg(fixture);
+        }
+    } else {
+        command.arg(fixture);
+    }
+    let child = command
         .spawn()
         .map_err(|error| format!("could not launch fixture: {error}"))?;
     thread::sleep(Duration::from_secs(2));

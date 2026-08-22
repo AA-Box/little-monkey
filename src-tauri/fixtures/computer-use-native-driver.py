@@ -261,6 +261,11 @@ def main() -> int:
             production_environment["COMPUTER_USE_FIXTURE_COMMAND"] = str(mac_fixture)
             production_environment["COMPUTER_USE_FIXTURE_APP_ID"] = f"{mac_fixture.name}|{mac_fixture.stem}"
             production_environment["COMPUTER_USE_FIXTURE_APP_NAME"] = mac_fixture.name
+        elif platform.system() == "Windows":
+            production_environment["COMPUTER_USE_FIXTURE_COMMAND"] = "powershell.exe"
+            production_environment["COMPUTER_USE_FIXTURE_SCRIPT"] = str(
+                repo_root / "src-tauri" / "fixtures" / "computer-use-test-app-windows.ps1"
+            )
         completed = subprocess.run(
             production_command
             + ["--fixture", str(args.fixture), "--trace", str(args.trace), "--screenshot", str(screenshot)],
