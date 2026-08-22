@@ -1560,6 +1560,13 @@ JSON.stringify({focused:Boolean(process.frontmost())});
 const WINDOWS_UIA_ACTION_SCRIPT: &str = r#"
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class LMComputerUseNative {
+  [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
+}
+'@
 $root=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]::new([int64]$env:LM_WINDOW_HANDLE))
 $desc=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
 $stable=$env:LM_ELEMENT_STABLE
@@ -1610,6 +1617,23 @@ if($action -eq 'set_value') {
             $after=$fresh.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState
             if($after -ne $before){$performed=$true}
           } catch {}
+        }
+      } catch {}
+    }
+    if(-not $performed) {
+      try {
+        $fresh=ResolveElement
+        $handle=[int64]$fresh.Current.NativeWindowHandle
+        if($handle -ne 0) {
+          [LMComputerUseNative]::SendMessage([IntPtr]::new($handle), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+          for($wait=0;$wait -lt 10 -and -not $performed;$wait++) {
+            Start-Sleep -Milliseconds 100
+            try {
+              $fresh=ResolveElement
+              $after=$fresh.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState
+              if($after -ne $before){$performed=$true}
+            } catch {}
+          }
         }
       } catch {}
     }
