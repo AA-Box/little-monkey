@@ -875,6 +875,7 @@ fn autonomous_patch_bytes_since_baseline(
                 &before_arg,
                 &after_arg,
             ])
+            .current_dir(path)
             .output()
             .map_err(|error| format!("could not collect exact autonomous patch: {error}"))?;
         if !output.status.success() && output.status.code() != Some(1) {
@@ -3865,9 +3866,8 @@ async fn execute_autonomous_docker_node(
     let workspace = docker_spec.workspace.as_mut().ok_or_else(|| {
         "Docker autonomous placement requires exactly one workspace root".to_string()
     })?;
-    little_monkey_lib::agent_worktrees::validate_docker_workspace_root_count(
-        workspace.roots.len(),
-    )?;
+    little_monkey_lib::agent_worktrees::validate_docker_workspace_root_count(workspace.roots.len())
+        .map_err(|error| error.to_string())?;
     workspace.roots[0].canonical_path = "/workspace".to_string();
     docker_spec.autonomous_task = Some(serde_json::json!({
         "schema_version": recipes::AUTONOMOUS_TASK_RECIPE_SCHEMA_VERSION,
@@ -3893,11 +3893,15 @@ async fn execute_autonomous_docker_node(
         "completed_nodes": [],
         "next_node_id": node.node_id
     }));
-    let bytes = match serde_json::to_vec_pretty(&docker_spec) {
+    let docker_recipe = little_monkey_lib::recipes::placed_recipe_from_spec(
+        &docker_spec,
+        "placed-docker-node".to_string(),
+    )?;
+    let bytes = match serde_json::to_vec_pretty(&docker_recipe) {
         Ok(bytes) => bytes,
         Err(error) => {
             return Err(format!(
-                "Could not serialize Docker placement spec: {error}"
+                "Could not serialize Docker placement recipe: {error}"
             ));
         }
     };
@@ -6079,6 +6083,70 @@ mod tests {
                 autonomous_test_git(&root, &["ls-files", "-s", "-v"])
                     .chars()
                     .next(),
+                Some(expected_marker)
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn autonomous_flagged_content_obeys_scope_and_patch_contract() {
+        for (tag, flag, expected_marker) in [
+            ("scope-assume-unchanged", "--assume-unchanged", 'h'),
+            ("scope-skip-worktree", "--skip-worktree", 'S'),
+        ] {
+            let root = autonomous_test_repo(tag);
+            std::fs::write(root.join("b.txt"), "base-b\n").unwrap();
+            autonomous_test_git(&root, &["add", "--", "b.txt"]);
+            autonomous_test_git(&root, &["commit", "-qm", "add b"]);
+            autonomous_test_git(&root, &["update-index", flag, "--", "a.txt"]);
+            let baseline = autonomous_workspace_baseline(&root).unwrap();
+
+            let mut allowed_node = test_node("allowed", "implementation", Vec::new());
+            allowed_node.mutation_scope = vec!["a.txt".to_string()];
+            std::fs::write(root.join("a.txt"), "allowed mutation\n").unwrap();
+            assert_eq!(
+                autonomous_workspace_delta(&root, &baseline).unwrap(),
+                vec!["a.txt".to_string()],
+                "{tag}"
+            );
+            assert!(enforce_autonomous_mutation_scope(&root, &baseline, &allowed_node).is_ok());
+            let patch = autonomous_patch_bytes_since_baseline(&root, &baseline).unwrap();
+            let patch_text = String::from_utf8_lossy(&patch);
+            assert!(
+                patch_text.contains("+allowed mutation"),
+                "{tag}: {patch_text}"
+            );
+
+            let verifier = autonomous_test_repo(&format!("{tag}-replay"));
+            little_monkey_lib::agent_worktrees::apply_patch_artifact(&verifier, &patch).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(verifier.join("a.txt")).unwrap(),
+                "allowed mutation\n"
+            );
+            let _ = std::fs::remove_dir_all(verifier);
+
+            autonomous_restore_baseline_path(&root, "a.txt", &baseline).unwrap();
+            let mut mixed_node = test_node("mixed", "implementation", Vec::new());
+            mixed_node.mutation_scope = vec!["b.txt".to_string()];
+            std::fs::write(root.join("a.txt"), "unauthorized mutation\n").unwrap();
+            std::fs::write(root.join("b.txt"), "allowed b mutation\n").unwrap();
+            let error =
+                enforce_autonomous_mutation_scope(&root, &baseline, &mixed_node).unwrap_err();
+            assert!(error.contains("a.txt"), "{error}");
+            assert_eq!(
+                std::fs::read_to_string(root.join("a.txt")).unwrap(),
+                "hello\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("b.txt")).unwrap(),
+                "allowed b mutation\n"
+            );
+            assert_eq!(
+                autonomous_test_git(&root, &["ls-files", "-s", "-v"])
+                    .lines()
+                    .find(|line| line.ends_with("a.txt"))
+                    .and_then(|line| line.chars().next()),
                 Some(expected_marker)
             );
             let _ = std::fs::remove_dir_all(root);

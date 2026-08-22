@@ -997,6 +997,95 @@ pub struct Recipe {
     pub autonomous_task: Option<AutonomousTaskSnapshot>,
 }
 
+/// Converts an immutable placement spec into the recipe consumed by the real
+/// headless runner. External runners must receive a recipe, not the protocol
+/// `RunSpec` itself: `task run` validates recipe fields and then reconstructs
+/// the exact frozen policy/target/budget from `placed_run`.
+pub fn placed_recipe_from_spec(
+    spec: &crate::run_protocol::RunSpec,
+    name: String,
+) -> Result<Recipe, String> {
+    spec.validate().map_err(|error| error.to_string())?;
+    let snapshot = crate::node_placement::PlacedRunSnapshot::from_spec(spec);
+    snapshot.validate()?;
+    let target = match &spec.target {
+        crate::run_protocol::ModelTargetSnapshot::Provider {
+            provider_id,
+            endpoint,
+            model,
+            ..
+        } if provider_id == "local-openai-compatible" => RecipeTarget {
+            provider: None,
+            model: Some(model.clone()),
+            ollama: None,
+            local_url: Some(endpoint.clone()),
+            managed_model: None,
+        },
+        crate::run_protocol::ModelTargetSnapshot::Provider {
+            provider_id, model, ..
+        } => RecipeTarget {
+            provider: Some(provider_id.clone()),
+            model: Some(model.clone()),
+            ollama: None,
+            local_url: None,
+            managed_model: None,
+        },
+        crate::run_protocol::ModelTargetSnapshot::Ollama { model, .. } => RecipeTarget {
+            provider: None,
+            model: None,
+            ollama: Some(model.clone()),
+            local_url: None,
+            managed_model: None,
+        },
+        crate::run_protocol::ModelTargetSnapshot::ManagedLlama { model_id, .. } => RecipeTarget {
+            provider: None,
+            model: None,
+            ollama: None,
+            local_url: None,
+            managed_model: Some(model_id.clone()),
+        },
+    };
+    let permission_mode =
+        match &spec.permission_policy.mode {
+            crate::run_protocol::PermissionMode::Manual => "manual",
+            crate::run_protocol::PermissionMode::AcceptEdits => "acceptEdits",
+            crate::run_protocol::PermissionMode::Smart => "smart",
+            crate::run_protocol::PermissionMode::Plan => "plan",
+            crate::run_protocol::PermissionMode::Auto => "auto",
+            crate::run_protocol::PermissionMode::Bypass => return Err(
+                "placed autonomous runs cannot use bypass permission mode on an unattended runner"
+                    .to_string(),
+            ),
+        }
+        .to_string();
+    let autonomous_task = spec
+        .autonomous_task
+        .clone()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| format!("placed autonomous task snapshot is invalid: {error}"))?;
+    let recipe = Recipe {
+        version: RECIPE_SCHEMA_VERSION,
+        name,
+        description: Some(format!("Placed autonomous run {}", spec.run_id)),
+        target,
+        workspace: snapshot.primary_root().map(str::to_string),
+        permission_mode,
+        system: spec.instructions.clone(),
+        prompt: spec.task.clone(),
+        params: HashMap::new(),
+        max_iterations: usize::try_from(spec.budgets.max_iterations).ok(),
+        timeout_seconds: Some(spec.budgets.wall_time_ms.div_ceil(1_000).max(1)),
+        output: RecipeOutput { json: true },
+        channel_send: None,
+        desktop_turn: None,
+        placed_run: Some(snapshot),
+        autonomous_task,
+    };
+    validate_recipe(&recipe).map_err(|error| format!("placed spec is not runnable: {error}"))?;
+    Ok(recipe)
+}
+
 fn is_valid_recipe_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -1875,6 +1964,30 @@ mod tests {
         );
         assert_eq!(placed.budgets.max_output_tokens, 4_321);
         assert_eq!(placed.submitted_run_id, "run:placed");
+    }
+
+    #[test]
+    fn a_placed_spec_becomes_a_runnable_local_executor_recipe() {
+        let mut spec = crate::node_placement::tests_support::placement_spec("run:docker");
+        if let crate::run_protocol::ModelTargetSnapshot::Provider {
+            provider_id,
+            endpoint,
+            ..
+        } = &mut spec.target
+        {
+            *provider_id = "local-openai-compatible".to_string();
+            *endpoint = "http://127.0.0.1:18080".to_string();
+        }
+        let recipe = placed_recipe_from_spec(&spec, "placed-docker-node".to_string()).unwrap();
+        assert_eq!(
+            recipe.target.local_url.as_deref(),
+            Some("http://127.0.0.1:18080")
+        );
+        assert_eq!(
+            recipe.placed_run.as_ref().unwrap().submitted_run_id,
+            "run:docker"
+        );
+        validate_recipe(&recipe).unwrap();
     }
 
     /// Both snapshots freeze the same four fields, so a recipe carrying both
