@@ -62,6 +62,17 @@ if (!import.meta.env.DEV) {
 
 const isCompanionOverlay = new URLSearchParams(window.location.search).get("overlay") === "1";
 const localeReady = loadLocaleTranslations(useLocaleStore.getState().locale);
+const isFullProductE2e = !isCompanionOverlay && import.meta.env.VITE_COMPUTER_USE_FULL_PRODUCT_E2E === "1";
+
+// The product golden is itself the boot-time health check. Start it as soon as
+// the webview module loads rather than making it wait behind optional store
+// hydration; a stuck unrelated hydration promise must not turn a live Tauri
+// process into an acceptance timeout with no evidence.
+if (isFullProductE2e) {
+  void import("./lib/computerUseFullProductE2e").then(({ runComputerUseFullProductE2e }) => {
+    window.setTimeout(() => void runComputerUseFullProductE2e(), 1_500);
+  });
+}
 
 if (isCompanionOverlay) {
   void localeReady.finally(() => {
@@ -92,9 +103,4 @@ if (isCompanionOverlay) {
       </ErrorBoundary>
     </React.StrictMode>,
   );
-  if (import.meta.env.VITE_COMPUTER_USE_FULL_PRODUCT_E2E === "1") {
-    void import("./lib/computerUseFullProductE2e").then(({ runComputerUseFullProductE2e }) => {
-      window.setTimeout(() => void runComputerUseFullProductE2e(), 1_500);
-    });
-  }
 });
