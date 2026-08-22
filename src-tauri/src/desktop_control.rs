@@ -1765,9 +1765,6 @@ for($i=0;$i -lt $windows.Count -and $i -lt 64;$i++){
 const WINDOWS_SCREENSHOT_SCRIPT: &str = r#"
 Add-Type -AssemblyName System.Drawing
 Add-Type @'
-using System; using System.Drawing; using System.Drawing.Imaging; using System.Windows.Forms;
-'@
-Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class LMComputerUseDpi { [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context); }
 '@

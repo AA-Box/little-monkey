@@ -456,7 +456,7 @@ jobs:
         shell: pwsh
         run: >-
           cargo test --manifest-path src-tauri/Cargo.toml --bin monkey-cli remote_windows
-          -- --ignored --nocapture
+          -- --ignored --nocapture --test-threads=1
 
   # ROADMAP #8 / K22: supply-chain review of what a release actually ships.
   # Split from the test matrix on purpose — these check the dependency set, not
