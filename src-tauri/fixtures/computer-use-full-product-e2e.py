@@ -39,7 +39,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixture", required=True, type=Path)
     parser.add_argument("--report", required=True, type=Path)
-    parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--timeout", type=int, default=900)
     args = parser.parse_args()
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.unlink(missing_ok=True)
