@@ -43,6 +43,8 @@ def main() -> int:
     args = parser.parse_args()
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.unlink(missing_ok=True)
+    app_log_path = args.report.with_suffix(".app.log")
+    app_log_path.unlink(missing_ok=True)
 
     python = os.environ.get("COMPUTER_USE_FIXTURE_PYTHON", sys.executable)
     fixture = subprocess.Popen([python, str(args.fixture)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -59,12 +61,13 @@ def main() -> int:
     })
     if os.name != "nt":
         environment.setdefault("GDK_BACKEND", "x11")
+    app_log = app_log_path.open("w", encoding="utf-8")
     app = subprocess.Popen(
         command,
         cwd=repo,
         env=environment,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=app_log,
+        stderr=subprocess.STDOUT,
         start_new_session=(os.name != "nt"),
     )
     try:
@@ -74,6 +77,11 @@ def main() -> int:
                 break
             time.sleep(1)
         if not args.report.is_file():
+            app_log.flush()
+            tail = app_log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
+            if tail:
+                print("full product app output:", file=sys.stderr)
+                print("\n".join(tail), file=sys.stderr)
             print(f"full product app did not produce {args.report} (exit={app.poll()})", file=sys.stderr)
             return 1
         report = json.loads(args.report.read_text(encoding="utf-8"))
@@ -108,6 +116,7 @@ def main() -> int:
         return 0
     finally:
         terminate(app)
+        app_log.close()
         terminate(fixture)
 
 
