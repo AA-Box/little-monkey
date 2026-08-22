@@ -331,6 +331,9 @@ fn write_log(
         body.push_str(&line);
         body.push('\n');
     }
+    let _rewrite_guard = REVISION_REWRITE_LOCK
+        .lock()
+        .map_err(|_| RevisionError::Io("revision rewrite lock poisoned".to_string()))?;
     // Temp file + rename, same reasoning as `prompts::save_impl`: a crash
     // mid-rewrite must not leave a truncated history behind.
     //
@@ -417,6 +420,7 @@ fn replace_revision_file(
 /// Paired with the pid so two *processes* — the desktop app and `monkey` — do
 /// not collide either. See [`write_log`] for the failure this prevents.
 static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REVISION_REWRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn append_line(
     root: &Path,
