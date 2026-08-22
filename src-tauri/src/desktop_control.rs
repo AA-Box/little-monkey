@@ -1570,10 +1570,8 @@ if($action -eq 'set_value') {
 } elseif($action -eq 'select') {
   try { $p=$e.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern); $p.Select(); $performed=$true } catch {}
 } elseif($action -eq 'click' -or $action -eq 'double_click') {
-  $isToggle=$e.Current.ControlType -eq [System.Windows.Automation.ControlType]::CheckBox
-  if($isToggle) { try { $p=$e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern); $p.Toggle(); $performed=$true } catch {} }
+  try { $p=$e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern); $p.Toggle(); $performed=$true } catch {}
   if(-not $performed) { try { $p=$e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); $p.Invoke(); $performed=$true } catch {} }
-  if(-not $performed) { try { $p=$e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern); $p.Toggle(); $performed=$true } catch {} }
   if($performed -and $action -eq 'double_click') { try { $p.Invoke(); } catch {} }
 }
 if($performed) { [ordered]@{semantic=$true}|ConvertTo-Json -Compress } else { [ordered]@{semantic=$false}|ConvertTo-Json -Compress }
