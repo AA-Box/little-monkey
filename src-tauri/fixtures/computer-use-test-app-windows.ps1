@@ -40,18 +40,18 @@ $status.AccessibleName = 'Save status'
 $status.Location = New-Object System.Drawing.Point(16, 104)
 $status.AutoSize = $true
 
-$dark = New-Object System.Windows.Forms.Button
+$dark = New-Object System.Windows.Forms.CheckBox
 $dark.Name = 'DarkMode'
 $dark.Text = 'Dark mode'
 $dark.AccessibleName = 'Dark mode'
-$dark.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
+$dark.AccessibleRole = [System.Windows.Forms.AccessibleRole]::CheckButton
 $dark.AccessibleDescription = 'Off'
 $dark.Tag = $false
 $dark.Location = New-Object System.Drawing.Point(16, 148)
-$dark.Size = New-Object System.Drawing.Size(110, 30)
-$dark.Add_Click({
-    $dark.Tag = -not [bool]$dark.Tag
-    $dark.AccessibleDescription = if ([bool]$dark.Tag) { 'On' } else { 'Off' }
+$dark.AutoSize = $true
+$dark.Add_CheckedChanged({
+    $dark.Tag = [bool]$dark.Checked
+    $dark.AccessibleDescription = if ($dark.Checked) { 'On' } else { 'Off' }
 })
 
 $disabled = New-Object System.Windows.Forms.Button
@@ -98,6 +98,7 @@ if (Test-Path -LiteralPath $profilePath) {
         $saved = Get-Content -Raw -LiteralPath $profilePath -ErrorAction Stop | ConvertFrom-Json
         if ($saved.profile -is [string]) { $profile.Text = $saved.profile }
         if ($saved.dark -eq $true) {
+            $dark.Checked = $true
             $dark.Tag = $true
             $dark.AccessibleDescription = 'On'
         }
