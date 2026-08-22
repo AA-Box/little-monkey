@@ -193,6 +193,25 @@ fn dark_is_on(element: &ComputerElement) -> bool {
         .unwrap_or(false)
 }
 
+fn inspect_until_dark_state(
+    state: &DesktopControlState,
+    session_id: &str,
+    target: &ComputerTarget,
+    expected: bool,
+) -> Result<ComputerInspection, String> {
+    let mut latest = inspect(state, session_id, target)?;
+    for attempt in 0..10 {
+        if find_toggle_element(&latest, "Dark mode").map(dark_is_on) == Some(expected) {
+            return Ok(latest);
+        }
+        if attempt < 9 {
+            thread::sleep(Duration::from_millis(200));
+            latest = inspect(state, session_id, target)?;
+        }
+    }
+    Err(format!("dark mode state did not settle to {expected}"))
+}
+
 fn run_action(
     state: &DesktopControlState,
     session_id: &str,
@@ -318,13 +337,7 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
                 expected_value: None,
             },
         )?;
-        let after_dark = inspect(&state, &session.session_id, &target)?;
-        let dark_enabled = find_toggle_element(&after_dark, "Dark mode")
-            .map(dark_is_on)
-            .ok_or_else(|| "Dark mode postcondition was not observable".to_string())?;
-        if !dark_enabled {
-            return Err("dark mode postcondition failed".to_string());
-        }
+        let _after_dark = inspect_until_dark_state(&state, &session.session_id, &target, true)?;
         run_action(
             &state,
             &session.session_id,
@@ -395,11 +408,12 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
             .into_iter()
             .find(|target| target_is_fixture(target))
             .ok_or_else(|| "restarted fixture was not discoverable".to_string())?;
-        let persisted = inspect(&state, &restarted.session_id, &persisted_target)?;
+        let persisted =
+            inspect_until_dark_state(&state, &restarted.session_id, &persisted_target, true)?;
         let profile_persisted = find_profile_element(&persisted)
             .and_then(|element| element.value.as_deref())
             == Some("hello");
-        let dark_persisted = find_element(&persisted, "Dark mode")
+        let dark_persisted = find_toggle_element(&persisted, "Dark mode")
             .map(dark_is_on)
             .unwrap_or(false);
         if !profile_persisted || !dark_persisted {
