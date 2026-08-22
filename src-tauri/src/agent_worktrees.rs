@@ -82,6 +82,20 @@ pub struct WorkspaceSnapshot {
     pub changed_files: Vec<String>,
 }
 
+/// Staged-state changes carried alongside a portable Git worktree patch.
+/// Git's unified patch format has no representation for an index-only change,
+/// so these records are kept in a versioned artifact trailer.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceIndexDelta {
+    pub path: String,
+    pub before_state: Vec<u8>,
+    pub after_state: Vec<u8>,
+    pub before_metadata: Vec<u8>,
+    pub after_metadata: Vec<u8>,
+}
+
+const INDEX_DELTA_MARKER: &[u8] = b"# little-monkey-index-state-v1 ";
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct WorkspaceSnapshotEntry {
     path: String,
@@ -163,22 +177,6 @@ fn workspace_changed_files(root: &Path) -> Result<Vec<String>, String> {
     files.sort();
     files.dedup();
     Ok(files)
-}
-
-fn workspace_tracked_files(root: &Path) -> Result<Vec<String>, String> {
-    let output = run_git(root, &["ls-files", "-z", "--cached"])?;
-    if !output.status.success() {
-        return Err(format!(
-            "git ls-files failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|record| !record.is_empty())
-        .map(|record| String::from_utf8_lossy(record).to_string())
-        .collect())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +302,47 @@ fn workspace_index_metadata(root: &Path, relative: &str) -> Result<Vec<u8>, Stri
         ));
     }
     Ok(output.stdout)
+}
+
+pub fn append_index_deltas(
+    mut patch: Vec<u8>,
+    deltas: &[WorkspaceIndexDelta],
+) -> Result<Vec<u8>, String> {
+    if deltas.is_empty() {
+        return Ok(patch);
+    }
+    if !patch.ends_with(b"\n") {
+        patch.push(b'\n');
+    }
+    patch.extend_from_slice(INDEX_DELTA_MARKER);
+    patch.extend(
+        serde_json::to_vec(deltas)
+            .map_err(|error| format!("Could not encode index delta: {error}"))?,
+    );
+    patch.push(b'\n');
+    Ok(patch)
+}
+
+pub fn split_index_deltas(artifact: &[u8]) -> Result<(Vec<u8>, Vec<WorkspaceIndexDelta>), String> {
+    let Some(marker_start) = artifact
+        .windows(INDEX_DELTA_MARKER.len())
+        .position(|window| window == INDEX_DELTA_MARKER)
+    else {
+        return Ok((artifact.to_vec(), Vec::new()));
+    };
+    let payload_start = marker_start + INDEX_DELTA_MARKER.len();
+    let payload_end = artifact[payload_start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|offset| payload_start + offset)
+        .unwrap_or(artifact.len());
+    let deltas = serde_json::from_slice(&artifact[payload_start..payload_end])
+        .map_err(|error| format!("Could not decode index delta: {error}"))?;
+    let mut patch = artifact[..marker_start].to_vec();
+    while patch.last().is_some_and(u8::is_ascii_whitespace) {
+        patch.pop();
+    }
+    Ok((patch, deltas))
 }
 
 fn workspace_path_snapshot(root: &Path, relative: &str) -> Result<WorkspacePathSnapshot, String> {
@@ -496,12 +535,11 @@ pub fn snapshot(data_root: &Path, workspace_root: &Path) -> Result<WorkspaceSnap
     std::fs::create_dir_all(&files_dir)
         .map_err(|error| format!("Could not create workspace snapshot: {error}"))?;
     let changed_files = workspace_changed_files(&root)?;
-    let mut snapshot_files = changed_files.clone();
-    snapshot_files.extend(workspace_tracked_files(&root)?);
-    snapshot_files.sort();
-    snapshot_files.dedup();
     let mut entries = Vec::new();
-    for relative in &snapshot_files {
+    // Clean tracked paths need no byte-for-byte baseline: bulk Git status
+    // identifies them if they become dirty, and restore falls back to HEAD.
+    // Only pre-existing dirty paths need content and index preservation.
+    for relative in &changed_files {
         let relative_path = relative_path(relative)?;
         let snapshot = workspace_path_snapshot(&root, relative)?;
         let mode = snapshot.mode;
@@ -647,6 +685,44 @@ fn git_head_state(root: &Path, relative: &str) -> Result<WorkspacePathState, Str
     }
 }
 
+fn git_head_mode(root: &Path, relative: &str) -> Result<u32, String> {
+    let tree = run_git(root, &["ls-tree", "-z", "HEAD", "--", relative])?;
+    let record = tree
+        .stdout
+        .split(|byte| *byte == 0)
+        .find(|record| !record.is_empty())
+        .unwrap_or_default();
+    Ok(record
+        .split(|byte| *byte == b' ')
+        .next()
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| u32::from_str_radix(value, 8).ok())
+        .unwrap_or_default())
+}
+
+fn git_patch_mode(state: &WorkspacePathState, filesystem_mode: u32) -> u32 {
+    match state {
+        WorkspacePathState::Missing => 0,
+        WorkspacePathState::Symlink(_) => 0o120000,
+        WorkspacePathState::File(_) => {
+            if filesystem_mode & 0o111 != 0 {
+                0o100755
+            } else {
+                0o100644
+            }
+        }
+        WorkspacePathState::Other => 0,
+    }
+}
+
+fn git_null_device() -> &'static str {
+    if cfg!(windows) {
+        "NUL"
+    } else {
+        "/dev/null"
+    }
+}
+
 fn materialize_patch_state(path: &Path, state: &WorkspacePathState) -> Result<bool, String> {
     match state {
         WorkspacePathState::Missing => Ok(false),
@@ -729,9 +805,10 @@ pub fn patch_bytes_since_snapshot(
     std::fs::create_dir(&temp)
         .map_err(|error| format!("Could not create autonomous patch staging directory: {error}"))?;
     let mut patch = Vec::new();
+    let mut index_deltas = Vec::new();
     for relative in changed {
-        let before_state = if let Some(entry) = entries.iter().find(|entry| entry.path == relative)
-        {
+        let before_entry = entries.iter().find(|entry| entry.path == relative);
+        let before_state = if let Some(entry) = before_entry {
             if !entry.existed {
                 WorkspacePathState::Missing
             } else if entry.kind == "symlink" {
@@ -754,7 +831,28 @@ pub fn patch_bytes_since_snapshot(
             git_head_state(&root, &relative)?
         };
         let after = workspace_path_snapshot(&root, &relative)?;
-        if before_state == after.state {
+        let before_mode = before_entry
+            .map(|entry| git_patch_mode(&before_state, entry.mode))
+            .unwrap_or(git_head_mode(&root, &relative)?);
+        let after_mode = git_patch_mode(&after.state, after.mode);
+        let index_changed = before_entry.is_some_and(|entry| {
+            entry.index_state != after.index_state || entry.index_metadata != after.index_metadata
+        }) || (before_entry.is_none()
+            && (!after.index_state.is_empty() || !after.index_metadata.is_empty()));
+        if index_changed {
+            index_deltas.push(WorkspaceIndexDelta {
+                path: relative.clone(),
+                before_state: before_entry
+                    .map(|entry| entry.index_state.clone())
+                    .unwrap_or_default(),
+                after_state: after.index_state.clone(),
+                before_metadata: before_entry
+                    .map(|entry| entry.index_metadata.clone())
+                    .unwrap_or_default(),
+                after_metadata: after.index_metadata.clone(),
+            });
+        }
+        if before_state == after.state && before_mode == after_mode {
             continue;
         }
         let before_path = temp.join("before").join(&relative);
@@ -764,12 +862,12 @@ pub fn patch_bytes_since_snapshot(
         let before_arg = if before_exists {
             before_path.to_string_lossy().into_owned()
         } else {
-            "/dev/null".to_string()
+            git_null_device().to_string()
         };
         let after_arg = if after_exists {
             after_path.to_string_lossy().into_owned()
         } else {
-            "/dev/null".to_string()
+            git_null_device().to_string()
         };
         let output = run_git(
             &root,
@@ -789,15 +887,30 @@ pub fn patch_bytes_since_snapshot(
                 "Could not collect autonomous patch for '{relative}'"
             ));
         }
-        patch.extend(rewrite_patch_paths(
-            output.stdout,
-            &relative,
-            before_exists,
-            after_exists,
-        ));
+        let mut rewritten =
+            rewrite_patch_paths(output.stdout, &relative, before_exists, after_exists);
+        if before_mode != after_mode {
+            if rewritten.is_empty() {
+                rewritten = format!("diff --git a/{relative} b/{relative}\n").into_bytes();
+            }
+            let header = if before_mode == 0 {
+                format!("new file mode {after_mode:o}\n")
+            } else if after_mode == 0 {
+                format!("deleted file mode {before_mode:o}\n")
+            } else {
+                format!("old mode {before_mode:o}\nnew mode {after_mode:o}\n")
+            };
+            let insert_at = rewritten
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|index| index + 1)
+                .unwrap_or(rewritten.len());
+            rewritten.splice(insert_at..insert_at, header.as_bytes().iter().copied());
+        }
+        patch.extend(rewritten);
     }
     let _ = std::fs::remove_dir_all(&temp);
-    Ok(patch)
+    append_index_deltas(patch, &index_deltas)
 }
 
 pub fn restore_workspace_paths(
@@ -1023,6 +1136,15 @@ pub fn require_registered(data_root: &Path, path: &str) -> Result<AgentWorktreeR
 
 /// Dirty flag + human-readable diffstat for a managed worktree. The marker
 /// file is excluded from both, so a fresh worktree reads as clean.
+fn worktree_patch_bytes(root: &Path) -> Result<String, String> {
+    // Intent-to-add makes untracked files part of the same canonical Git patch
+    // as tracked content and mode changes. The marker is then explicitly
+    // unstaged so it can never enter the artifact.
+    run_git_ok(root, &["add", "-A", "-N"])?;
+    let _ = run_git(root, &["reset", "--", MARKER_FILE]);
+    run_git_ok(root, &["diff", "HEAD", "--binary"])
+}
+
 pub fn status(data_root: &Path, path: &str) -> Result<AgentWorktreeStatus, String> {
     let record = require_registered(data_root, path)?;
     let wt = Path::new(&record.path);
@@ -1041,27 +1163,13 @@ pub fn status(data_root: &Path, path: &str) -> Result<AgentWorktreeStatus, Strin
         }
     }
     let base_revision = run_git_ok(wt, &["rev-parse", "HEAD"])?;
-    let mut hasher = Sha256::new();
-    hasher.update(base_revision.as_bytes());
-    hasher.update(
-        run_git_ok(wt, &["diff", "HEAD", "--binary"])
-            .unwrap_or_default()
-            .as_bytes(),
-    );
-    for path in &changed_files {
-        hasher.update(path.as_bytes());
-        let snapshot = workspace_path_snapshot(wt, path)?;
-        hasher.update(snapshot.state.bytes());
-        hasher.update(snapshot.mode.to_le_bytes());
-        hasher.update(snapshot.index_state);
-        hasher.update(snapshot.index_metadata);
-    }
+    let patch = worktree_patch_bytes(wt)?;
     Ok(AgentWorktreeStatus {
         dirty,
         diffstat: diffstat.trim().to_string(),
         changed_files,
         base_revision,
-        patch_digest: format!("{:x}", hasher.finalize()),
+        patch_digest: format!("{:x}", Sha256::digest(patch.as_bytes())),
     })
 }
 
@@ -1126,11 +1234,7 @@ pub fn apply(data_root: &Path, path: &str) -> Result<Vec<String>, String> {
     let wt = Path::new(&record.path);
     let workspace_root = PathBuf::from(&record.workspace_root);
 
-    // Intent-to-add makes untracked files show up in `git diff HEAD`; the
-    // marker file is immediately unstaged again so it never joins the patch.
-    run_git_ok(wt, &["add", "-A", "-N"])?;
-    let _ = run_git(wt, &["reset", "--", MARKER_FILE]);
-    let patch = run_git_ok(wt, &["diff", "HEAD", "--binary"])?;
+    let patch = worktree_patch_bytes(wt)?;
     if patch.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -1140,12 +1244,26 @@ pub fn apply(data_root: &Path, path: &str) -> Result<Vec<String>, String> {
         .filter(|f| f != MARKER_FILE)
         .collect::<Vec<_>>();
 
-    apply_patch(&workspace_root, &patch, true)?;
-    apply_patch(&workspace_root, &patch, false)?;
+    apply_patch(&workspace_root, patch.as_bytes(), true)?;
+    apply_patch(&workspace_root, patch.as_bytes(), false)?;
     Ok(files)
 }
 
-fn apply_patch(root: &Path, patch: &str, check: bool) -> Result<(), String> {
+/// Validates and applies a portable patch artifact, including any staged-state
+/// trailer that unified Git patches cannot represent themselves.
+pub fn apply_patch_artifact(root: &Path, artifact: &[u8]) -> Result<(), String> {
+    let (patch, index_deltas) = split_index_deltas(artifact)?;
+    if patch.iter().any(|byte| !byte.is_ascii_whitespace()) {
+        apply_patch(root, &patch, true)?;
+        apply_patch(root, &patch, false)?;
+    }
+    for delta in index_deltas {
+        restore_workspace_index(root, &delta.path, &delta.after_state, &delta.after_metadata)?;
+    }
+    Ok(())
+}
+
+fn apply_patch(root: &Path, patch: &[u8], check: bool) -> Result<(), String> {
     use std::io::Write;
     let mut args = vec!["-C"];
     let root_str = root.to_string_lossy().to_string();
@@ -1165,7 +1283,7 @@ fn apply_patch(root: &Path, patch: &str, check: bool) -> Result<(), String> {
         .stdin
         .as_mut()
         .ok_or("Failed to open git apply stdin")?
-        .write_all(patch.as_bytes())
+        .write_all(patch)
         .map_err(|e| format!("Failed to write the patch to git apply: {e}"))?;
     let output = child
         .wait_with_output()
@@ -1605,6 +1723,10 @@ mod tests {
         let mut permissions = std::fs::metadata(&file).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&file, permissions).unwrap();
+        let patch = patch_bytes_since_snapshot(&data, &repo, &saved.id).unwrap();
+        let text = String::from_utf8_lossy(&patch);
+        assert!(text.contains("old mode 100644"), "{text}");
+        assert!(text.contains("new mode 100755"), "{text}");
         assert_eq!(
             changed_files_since_snapshot(&data, &repo, &saved.id).unwrap(),
             vec!["a.txt".to_string()]
@@ -1628,6 +1750,16 @@ mod tests {
             changed_files_since_snapshot(&data, &repo, &saved.id).unwrap(),
             vec!["a.txt".to_string()]
         );
+        let patch = patch_bytes_since_snapshot(&data, &repo, &saved.id).unwrap();
+        let (worktree_patch, index_deltas) = split_index_deltas(&patch).unwrap();
+        assert!(worktree_patch.is_empty(), "{worktree_patch:?}");
+        assert_eq!(index_deltas.len(), 1);
+        assert_eq!(index_deltas[0].path, "a.txt");
+        git(&repo, &["add", "a.txt"]);
+        apply_patch_artifact(&repo, &patch).unwrap();
+        assert!(run_git_ok(&repo, &["diff", "--cached", "--", "a.txt"])
+            .unwrap()
+            .is_empty());
         restore_workspace_paths(&data, &repo, &saved.id, &["a.txt".to_string()]).unwrap();
         let staged = run_git_ok(&repo, &["diff", "--cached", "--", "a.txt"]).unwrap();
         assert!(staged.contains("+staged"), "{staged}");

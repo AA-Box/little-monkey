@@ -568,6 +568,10 @@ fn normalize_autonomous_placement_result(mut result: Value) -> Value {
                 .and_then(Value::as_str)
                 .is_some_and(|code| code == "EXECUTION_TARGET_LOST")
             || object
+                .get("failureKind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "EXECUTION_TARGET_LOST")
+            || object
                 .get("final_message")
                 .or_else(|| object.get("finalMessage"))
                 .and_then(Value::as_str)
@@ -575,6 +579,10 @@ fn normalize_autonomous_placement_result(mut result: Value) -> Value {
         if target_lost {
             object.insert(
                 "failureCode".to_string(),
+                Value::String("EXECUTION_TARGET_LOST".to_string()),
+            );
+            object.insert(
+                "failureKind".to_string(),
                 Value::String("EXECUTION_TARGET_LOST".to_string()),
             );
             if !object.contains_key("summary") {
@@ -1844,42 +1852,14 @@ pub async fn autonomous_task_place_node(
                                                 .to_string(),
                                         );
                                     }
-                                    let patch_path_arg = patch_path.to_string_lossy().into_owned();
-                                    let workspace_arg = workspace_root.to_string_lossy().into_owned();
-                                    let check = Command::new("git")
-                                        .args([
-                                            "-C",
-                                            workspace_arg.as_str(),
-                                            "apply",
-                                            "--check",
-                                            patch_path_arg.as_str(),
-                                        ])
-                                        .output()
-                                        .map_err(|error| {
-                                            format!("Could not validate remote patch: {error}")
-                                        })?;
-                                    if !check.status.success() {
-                                        let _ = std::fs::remove_file(&patch_path);
-                                        return Err(
-                                            "Remote autonomous patch does not apply to the local workspace"
-                                                .to_string(),
-                                        );
-                                    }
-                                    let apply = Command::new("git")
-                                        .args([
-                                            "-C",
-                                            workspace_arg.as_str(),
-                                            "apply",
-                                            patch_path_arg.as_str(),
-                                        ])
-                                        .output()
-                                        .map_err(|error| {
-                                            format!("Could not apply remote patch: {error}")
-                                        })?;
+                                    let apply = crate::agent_worktrees::apply_patch_artifact(
+                                        &workspace_root,
+                                        &patch_bytes,
+                                    );
                                     let _ = std::fs::remove_file(&patch_path);
-                                    if !apply.status.success() {
-                                        return Err("Could not apply remote autonomous patch".to_string());
-                                    }
+                                    apply.map_err(|error| {
+                                        format!("Could not apply remote autonomous patch: {error}")
+                                    })?;
                                     enforce_autonomous_placement_scope(
                                         &data_dir,
                                         &workspace_root,
@@ -2519,6 +2499,7 @@ mod tests {
         }));
         assert_eq!(result["ok"], false);
         assert_eq!(result["failureCode"], "EXECUTION_TARGET_LOST");
+        assert_eq!(result["failureKind"], "EXECUTION_TARGET_LOST");
         assert_eq!(result["summary"], result["final_message"]);
 
         let result = normalize_autonomous_placement_result(serde_json::json!({
