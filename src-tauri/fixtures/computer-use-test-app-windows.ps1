@@ -44,7 +44,6 @@ $dark = New-Object System.Windows.Forms.CheckBox
 $dark.Name = 'DarkMode'
 $dark.Text = 'Dark mode'
 $dark.AccessibleName = 'Dark mode'
-$dark.AccessibleRole = [System.Windows.Forms.AccessibleRole]::CheckButton
 $dark.AccessibleDescription = 'Off'
 $dark.Tag = $false
 $dark.Location = New-Object System.Drawing.Point(16, 148)
