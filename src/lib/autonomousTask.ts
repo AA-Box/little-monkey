@@ -59,7 +59,7 @@ export interface TaskConstraints {
 }
 
 export interface TaskExecutionRequirements { needsWorkspaceWrite: boolean; needsNetwork: boolean; isolation: TaskIsolation; platform?: string; }
-export interface TaskExecutionPlacement { kind: ExecutionPlacementKind; targetId: string; nodeId: string; reason: string; capabilities?: string[]; }
+export interface TaskExecutionPlacement { kind: ExecutionPlacementKind; targetId: string; nodeId: string; reason: string; capabilities?: string[]; requestedPlacement?: TaskExecutionPlacement; placementFulfilled?: boolean; }
 export interface TaskExecutionOwner { kind: "desktop" | "daemon" | "remote"; instanceId: string; leaseEpoch: number; leaseExpiresAtMs: number; }
 export interface TaskDeliveryTarget { worktreeId: string; repositorySlug: string; branch: string; remote: string; base: string; title: string; body: string; changedFiles?: string[]; prNumber?: number; }
 export interface TaskPlanningContext { currentWorkspaceRevision: string; relevantFiles: string[]; repositoryConventions: string[]; sourceMaterial: string[]; dependencyArtifactIds: string[]; upstreamDecisions: string[]; }
@@ -96,6 +96,7 @@ export interface TaskPlanNode {
   relevantFiles?: string[];
   capabilities?: string[];
   executionPlacement?: TaskExecutionPlacement;
+  requestedExecutionPlacement?: TaskExecutionPlacement;
   executionRequirements?: TaskExecutionRequirements;
   budget?: Partial<TaskBudgetSnapshot>;
   upstreamDecisions?: string[];
@@ -313,6 +314,9 @@ export function validateTaskPlan(plan: TaskPlan, context?: TaskPlanningContext):
     if ((current.taskClass === "implementation" || current.taskClass === "integration") && current.mutationScope.length === 0) errors.push(`${current.nodeId} mutating nodes require a non-empty mutation scope`);
     if (current.mutationScope.some((scope) => scope.includes("..") || scope.startsWith("/"))) errors.push(`${current.nodeId} mutation scope may not escape the workspace`);
     if (current.executionPlacement && current.executionPlacement.nodeId !== current.nodeId) errors.push(`${current.nodeId} placement must identify the same node`);
+    if (current.executionPlacement?.placementFulfilled && (current.executionPlacement.kind === "docker" || current.executionPlacement.kind === "remote_node")) errors.push(`${current.nodeId} cannot invoke another external placement after its placement was fulfilled`);
+    if (current.executionPlacement?.placementFulfilled && !current.requestedExecutionPlacement) errors.push(`${current.nodeId} placement provenance is required after placement fulfillment`);
+    if (current.requestedExecutionPlacement && !current.executionPlacement) errors.push(`${current.nodeId} placement provenance requires a receiver execution contract`);
     if (current.capabilities?.some((capability) => !["read", "mutate", "verify", "network", "git", "delegate"].includes(capability))) errors.push(`${current.nodeId} requests an unknown capability`);
     if (["investigation", "verification", "review"].includes(current.taskClass) && current.capabilities?.includes("mutate")) errors.push(`${current.nodeId} non-mutating nodes may not request mutate`);
     if (["investigation", "verification", "review"].includes(current.taskClass) && current.isolation !== "shared") errors.push(`${current.nodeId} non-mutating nodes must use shared isolation`);
@@ -347,6 +351,13 @@ export function validateTaskPlan(plan: TaskPlan, context?: TaskPlanningContext):
     if (!verifications.some((verification) => dependsOn(review.nodeId, verification.nodeId))) errors.push(`${review.nodeId} must depend on verification evidence`);
     for (const mutation of plan.nodes.filter((current) => current.taskClass === "implementation" || current.taskClass === "integration")) if (dependsOn(mutation.nodeId, review.nodeId)) errors.push(`${mutation.nodeId} is scheduled after review ${review.nodeId}`);
   }
+  const terminalVerifications = verifications.filter((verification) => !verifications.some((other) => other.nodeId !== verification.nodeId && dependsOn(other.nodeId, verification.nodeId)));
+  const terminalReviews = plan.nodes.filter((current) => current.taskClass === "review" && !plan.nodes.some((other) => other.taskClass === "review" && other.nodeId !== current.nodeId && dependsOn(other.nodeId, current.nodeId)));
+  for (const mutation of plan.nodes.filter((current) => current.taskClass === "implementation" || current.taskClass === "integration")) {
+    if (!terminalVerifications.some((verification) => dependsOn(verification.nodeId, mutation.nodeId))) errors.push(`${mutation.nodeId} must be an ancestor of final verification evidence`);
+    if (!terminalReviews.some((review) => dependsOn(review.nodeId, mutation.nodeId))) errors.push(`${mutation.nodeId} must be an ancestor of final review evidence`);
+  }
+  for (const delivery of plan.nodes.filter((current) => current.taskClass === "delivery")) if (!terminalReviews.some((review) => dependsOn(delivery.nodeId, review.nodeId))) errors.push(`${delivery.nodeId} must depend on final review evidence`);
   return [...new Set(errors)];
 }
 
