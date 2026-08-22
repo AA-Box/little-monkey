@@ -247,8 +247,8 @@ jobs:
 
       - name: Rust tests (Linux, inside the delegated cgroup)
         if: startsWith(matrix.os, 'ubuntu')
-        # Launches the test process in the delegated leaf before the test binary
-        # is built, so every process it spawns inherits the membership and
+        # Moves this shell into the delegated leaf before the test binary is
+        # built, so every process it spawns inherits the membership and
         # `/proc/self/cgroup` points somewhere `CgroupScope` can create under.
         # Falls through unchanged when the provisioning step found no v2
         # hierarchy, which keeps the supervised fallback the tested path there.
@@ -262,33 +262,25 @@ jobs:
         # does at runtime is privileged, and it still creates its own scope as
         # the unprivileged user under a subtree it owns.
         run: |
-          run_in_cgroup() {
+          move_into_cgroup() {
             if [ -z "${LITTLE_MONKEY_CI_CGROUP:-}" ]; then
-              "$@"
-              return
+              return 0
             fi
-            "$@" &
-            local pid=$!
             for attempt in $(seq 1 10); do
-              if echo "$pid" | sudo tee "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" >/dev/null; then
-                echo "running under $(cat /proc/$pid/cgroup)"
-                wait "$pid"
-                return $?
+              if printf '%s\\n' "$BASHPID" | sudo tee "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" >/dev/null; then
+                echo "running under $(cat /proc/self/cgroup)"
+                return 0
               fi
               sleep 1
             done
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
             return 1
           }
-          run_tests() {
-            dbus-run-session -- bash -lc '
-              unset GNOME_KEYRING_CONTROL
-              eval "$(printf "\\n" | gnome-keyring-daemon --unlock --replace --components=secrets)"
-              pnpm test:rust
-            '
-          }
-          run_in_cgroup run_tests
+          move_into_cgroup
+          dbus-run-session -- bash -lc '
+            unset GNOME_KEYRING_CONTROL
+            eval "$(printf "\\n" | gnome-keyring-daemon --unlock --replace --components=secrets)"
+            pnpm test:rust
+          '
 
       - name: Rust tests
         if: ${{ !startsWith(matrix.os, 'ubuntu') }}
@@ -344,9 +336,10 @@ jobs:
       - name: The delegated-cgroup leg really used cgroup v2
         if: startsWith(matrix.os, 'ubuntu')
         # The step above prints which backend this host offers; this one refuses
-        # the wrong answer. Same shell trick as the test step: launch the CLI in
-        # the delegated leaf first, so it resolves the hierarchy the provisioning
-        # step created rather than the root cgroup this job starts in.
+        # the wrong answer. Same shell trick as the test step: move into the
+        # delegated leaf first, so what the CLI resolves is the hierarchy the
+        # provisioning step created rather than the root cgroup this job starts
+        # in.
         #
         # Skipped, not failed, when provisioning found no v2 hierarchy — that is
         # a runner without the mechanism, and the supervised fallback it gets is
@@ -358,22 +351,18 @@ jobs:
             echo "no delegated cgroup on this runner; the supervised fallback is the tested path"
             exit 0
           fi
-          cargo_in_cgroup() {
-            cargo run --quiet --manifest-path src-tauri/Cargo.toml --bin monkey-cli -- processes limits &
-            local pid=$!
+          move_into_cgroup() {
             for attempt in $(seq 1 10); do
-              if echo "$pid" | sudo tee "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" >/dev/null; then
-                echo "running under $(cat /proc/$pid/cgroup)" >&2
-                wait "$pid"
-                return $?
+              if printf '%s\\n' "$BASHPID" | sudo tee "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" >/dev/null; then
+                echo "running under $(cat /proc/self/cgroup)" >&2
+                return 0
               fi
               sleep 1
             done
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
             return 1
           }
-          backend=$(cargo_in_cgroup | sed -n 's/^this host: //p')
+          move_into_cgroup
+          backend=$(cargo run --quiet --manifest-path src-tauri/Cargo.toml --bin monkey-cli -- processes limits | sed -n 's/^this host: //p')
           echo "backend: $backend"
           test "$backend" = "cgroup v2"
 
