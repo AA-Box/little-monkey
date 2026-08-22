@@ -330,11 +330,33 @@ fn workspace_index_records(root: &Path) -> Result<HashMap<String, Vec<u8>>, Stri
     Ok(records)
 }
 
-pub fn validate_docker_workspace_root_count(root_count: usize) -> Result<(), String> {
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AutonomousPlacementError {
+    DockerWorkspaceRootCount { expected: usize, actual: usize },
+}
+
+impl std::fmt::Display for AutonomousPlacementError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DockerWorkspaceRootCount { expected, actual } => write!(
+                formatter,
+                "DOCKER_WORKSPACE_ROOT_COUNT_UNSUPPORTED: Docker autonomous placement supports exactly one workspace root (expected {expected}); received {actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AutonomousPlacementError {}
+
+pub fn validate_docker_workspace_root_count(
+    root_count: usize,
+) -> Result<(), AutonomousPlacementError> {
     if root_count != 1 {
-        return Err(format!(
-            "Docker autonomous placement supports exactly one workspace root; received {root_count}"
-        ));
+        return Err(AutonomousPlacementError::DockerWorkspaceRootCount {
+            expected: 1,
+            actual: root_count,
+        });
     }
     Ok(())
 }
@@ -2147,7 +2169,14 @@ mod tests {
     fn docker_placement_requires_one_workspace_root() {
         assert!(validate_docker_workspace_root_count(1).is_ok());
         let error = validate_docker_workspace_root_count(2).unwrap_err();
-        assert!(error.contains("exactly one workspace root"), "{error}");
+        assert_eq!(
+            error,
+            AutonomousPlacementError::DockerWorkspaceRootCount {
+                expected: 1,
+                actual: 2
+            }
+        );
+        assert!(error.to_string().contains("exactly one workspace root"));
     }
 
     #[test]

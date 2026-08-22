@@ -1902,11 +1902,14 @@ pub async fn autonomous_task_place_node(
             let workspace = spec.workspace.as_mut().ok_or_else(|| {
                 "Docker autonomous placement requires exactly one workspace root".to_string()
             })?;
-            crate::agent_worktrees::validate_docker_workspace_root_count(workspace.roots.len())?;
+            crate::agent_worktrees::validate_docker_workspace_root_count(workspace.roots.len())
+                .map_err(|error| error.to_string())?;
             let host_workspace = workspace.roots[0].canonical_path.clone();
             workspace.roots[0].canonical_path = "/workspace".to_string();
-            let bytes = serde_json::to_vec_pretty(&spec)
-                .map_err(|error| format!("Could not serialize Docker placement spec: {error}"))?;
+            let recipe =
+                crate::recipes::placed_recipe_from_spec(&spec, "placed-docker-node".to_string())?;
+            let bytes = serde_json::to_vec_pretty(&recipe)
+                .map_err(|error| format!("Could not serialize Docker placement recipe: {error}"))?;
             std::fs::write(&spec_path, bytes)
                 .map_err(|error| format!("Could not persist Docker placement spec: {error}"))?;
             let before_revision =
@@ -2842,17 +2845,50 @@ mod tests {
                 "max_event_count": 32
             },
             "autonomous_task": {
+                "schema_version": 1,
+                "task_id": "docker-e2e-run",
+                "objective": "Run the Docker E2E mutation",
+                "source": "test",
+                "relevant_files": ["docker-e2e.txt"],
+                "current_workspace_revision": "docker-e2e-baseline",
+                "max_repair_rounds": 0,
+                "max_workers": 1,
+                "guidance": [],
+                "delivery_intent": "leave_worktree",
+                "execution_owner": {
+                    "kind": "remote",
+                    "instance_id": "docker-e2e-test",
+                    "lease_epoch": 1,
+                    "lease_expires_at_ms": 1784000120000u64
+                },
+                "previous_execution_owner": null,
+                "completed_nodes": [],
+                "next_node_id": "docker-e2e-node",
                 "task_snapshot": {
+                    "taskId": "docker-e2e-run",
+                    "objective": "Run the Docker E2E mutation",
+                    "source": "test",
+                    "workspaceRevision": "docker-e2e-baseline",
                     "plan": {
+                        "planId": "docker-e2e-plan",
+                        "strategy": "PLAN",
+                        "revision": 1,
                         "nodes": [{
                             "nodeId": "docker-e2e-node",
+                            "taskClass": "implementation",
+                            "objective": "Write the Docker E2E file",
+                            "dependencies": [],
+                            "mutationScope": ["docker-e2e.txt"],
+                            "isolation": "shared",
+                            "relevantFiles": ["docker-e2e.txt"],
+                            "capabilities": ["read", "mutate"],
                             "executionPlacement": {
                                 "kind": "docker",
                                 "targetId": image.to_string_lossy(),
                                 "nodeId": "docker-e2e-node"
-                            },
-                            "mutationScope": ["docker-e2e.txt"]
-                        }]
+                            }
+                        }],
+                        "outcome": "RUNNING"
                     }
                 }
             }
@@ -2885,6 +2921,247 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(verifier.join("docker-e2e.txt")).unwrap(),
             "written by the Docker autonomous runner\n"
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&verifier);
+    }
+
+    #[tokio::test]
+    async fn docker_placement_runs_the_real_monkey_cli_autonomous_executor() {
+        let required = std::env::var("LITTLE_MONKEY_REQUIRE_REAL_DOCKER_E2E").as_deref() == Ok("1");
+        let Some(image) = std::env::var_os("LITTLE_MONKEY_REAL_DOCKER_E2E_IMAGE") else {
+            assert!(
+                !required,
+                "real Docker E2E image is required but not configured"
+            );
+            eprintln!("SKIPPED: LITTLE_MONKEY_REAL_DOCKER_E2E_IMAGE is not configured");
+            return;
+        };
+        let docker_ready = Command::new("docker")
+            .args(["info", "--format", "{{.ServerVersion}}"])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !docker_ready {
+            assert!(!required, "Docker daemon is required but unavailable");
+            eprintln!("SKIPPED: Docker daemon is unavailable");
+            return;
+        }
+
+        let workspace = std::env::temp_dir().join(format!(
+            "little-monkey-docker-real-e2e-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let verifier = workspace.with_file_name(format!(
+            "little-monkey-docker-real-e2e-verifier-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let git = |root: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git should start");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let init = |root: &Path| {
+            std::fs::create_dir_all(root).unwrap();
+            git(root, &["init", "-q"]);
+            git(root, &["config", "user.email", "e2e@example.test"]);
+            git(root, &["config", "user.name", "Docker real E2E"]);
+            std::fs::write(root.join("baseline.txt"), "baseline\n").unwrap();
+            git(root, &["add", "."]);
+            git(root, &["commit", "-q", "-m", "baseline"]);
+        };
+        init(&workspace);
+
+        let image = image.to_string_lossy().into_owned();
+        let run_id = format!("docker-real-e2e-{}", uuid::Uuid::new_v4().simple());
+        let capability = serde_json::json!({
+            "state": "supported",
+            "evidence": "deterministic model fixture inside the container"
+        });
+        let run_spec: crate::run_protocol::RunSpec = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "run_id": run_id,
+            "idempotency_key": "docker-real-e2e-idempotency",
+            "created_at_ms": 1785000000000u64,
+            "kind": "autonomous_task",
+            "submitted_by": {
+                "client_id": "docker-real-e2e-test",
+                "instance_id": "docker-real-e2e-test",
+                "kind": "test",
+                "version": "1"
+            },
+            "task": "Run the real Docker autonomous executor",
+            "instructions": null,
+            "input_artifact_ids": [],
+            "target": {
+                "kind": "provider",
+                "target_id": "docker-real-e2e-target",
+                "label": "Docker real E2E target",
+                "provider_id": "local-openai-compatible",
+                "endpoint": "http://127.0.0.1:18080",
+                "model": "docker-real-fixture",
+                "credential_ref_id": "credential:none",
+                "capabilities": {
+                    "tool_calling": capability,
+                    "vision": capability,
+                    "embeddings": capability,
+                    "structured_output": capability,
+                    "image_generation": capability,
+                    "audio": capability,
+                    "runtime_lifecycle": capability,
+                    "fim": capability,
+                    "code_completion": capability,
+                    "inline_edit": capability,
+                    "fim_metadata": null
+                }
+            },
+            "workspace": {
+                "workspace_id": "docker-real-e2e-workspace",
+                "primary_root_id": "docker-real-e2e-root",
+                "roots": [{
+                    "root_id": "docker-real-e2e-root",
+                    "canonical_path": workspace.canonicalize().unwrap().to_string_lossy(),
+                    "access": "read_write",
+                    "allow_symlinks_within_root": false
+                }],
+                "repository_policy": null
+            },
+            "permission_policy": {
+                "mode": "auto",
+                "unattended": true,
+                "approval_timeout_ms": 60000,
+                "default_tool_decision": "allow",
+                "tool_rules": [{"tool": "write_file", "decision": "allow"}],
+                "allow_network": true,
+                "allow_external_mutations": false
+            },
+            "budgets": {
+                "wall_time_ms": 120000,
+                "max_iterations": 8,
+                "max_model_calls": 16,
+                "max_tool_calls": 16,
+                "max_input_tokens": 100000,
+                "max_output_tokens": 100000,
+                "max_cost_micros": null,
+                "max_artifact_bytes": 1048576,
+                "max_event_count": 256
+            },
+            "autonomous_task": {
+                "schema_version": 1,
+                "task_id": run_id,
+                "objective": "Run the real Docker autonomous executor",
+                "source": "test",
+                "relevant_files": ["docker-e2e.txt"],
+                "current_workspace_revision": "docker-real-e2e-baseline",
+                "max_repair_rounds": 0,
+                "max_workers": 1,
+                "guidance": [],
+                "delivery_intent": "leave_worktree",
+                "execution_owner": {
+                    "kind": "remote",
+                    "instance_id": "docker-real-e2e",
+                    "lease_epoch": 1,
+                    "lease_expires_at_ms": 4000000000000u64
+                },
+                "previous_execution_owner": null,
+                "completed_nodes": [],
+                "next_node_id": "docker-real-implement",
+                "task_snapshot": {
+                    "taskId": run_id,
+                    "objective": "Run the real Docker autonomous executor",
+                    "source": "test",
+                    "workspaceRevision": "docker-real-e2e-baseline",
+                    "plan": {
+                        "planId": "docker-real-e2e-plan",
+                        "strategy": "PLAN",
+                        "revision": 1,
+                        "nodes": [
+                            {
+                                "nodeId": "docker-real-implement",
+                                "taskClass": "implementation",
+                                "objective": "Write docker-e2e.txt using the file tool",
+                                "dependencies": [],
+                                "mutationScope": ["docker-e2e.txt"],
+                                "isolation": "shared",
+                                "relevantFiles": ["docker-e2e.txt"],
+                                "capabilities": ["read", "mutate"],
+                                "executionPlacement": {
+                                    "kind": "docker",
+                                    "targetId": image.clone(),
+                                    "nodeId": "docker-real-implement"
+                                }
+                            },
+                            {
+                                "nodeId": "docker-real-verify",
+                                "taskClass": "verification",
+                                "objective": "Run the configured Docker verification command",
+                                "dependencies": ["docker-real-implement"],
+                                "mutationScope": [],
+                                "isolation": "shared",
+                                "relevantFiles": ["docker-e2e.txt"],
+                                "capabilities": ["read", "verify"]
+                            },
+                            {
+                                "nodeId": "docker-real-review",
+                                "taskClass": "review",
+                                "objective": "Review the Docker mutation and return structured evidence",
+                                "dependencies": ["docker-real-verify"],
+                                "mutationScope": [],
+                                "isolation": "shared",
+                                "relevantFiles": ["docker-e2e.txt"],
+                                "capabilities": ["read", "verify"]
+                            }
+                        ]
+                    },
+                    "outcome": "RUNNING"
+                }
+            }
+        }))
+        .expect("real Docker E2E RunSpec should decode");
+        let result = autonomous_task_place_node(AutonomousTaskPlacementRequest {
+            kind: "docker".to_string(),
+            target_id: image,
+            run_spec,
+        })
+        .await
+        .expect("real Docker placement should succeed");
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert!(result["changedFiles"]
+            .as_array()
+            .is_some_and(|files| files.iter().any(|file| file == "docker-e2e.txt")));
+        assert!(result["evidence"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
+        assert_eq!(result["review"]["verdict"], "pass");
+        assert!(result["mutation"]["beforeRevision"].is_string());
+        assert!(result["mutation"]["afterRevision"].is_string());
+        assert!(result["mutation"]["patchDigest"].is_string());
+        let artifact_id = result["artifacts"][0]["artifactId"]
+            .as_str()
+            .expect("real Docker result should include its patch artifact");
+        let data_dir = crate::artifact_store::ArtifactStore::new(
+            crate::app_paths::data_dir()
+                .expect("app data dir")
+                .join("content-v1"),
+        )
+        .expect("artifact store");
+        let artifact = data_dir
+            .read(artifact_id)
+            .expect("real Docker patch artifact should be readable");
+        assert_eq!(format!("{:x}", Sha256::digest(&artifact)), artifact_id);
+        init(&verifier);
+        crate::agent_worktrees::apply_patch_artifact(&verifier, &artifact)
+            .expect("real Docker artifact should replay on a clean host repo");
+        assert_eq!(
+            std::fs::read_to_string(verifier.join("docker-e2e.txt")).unwrap(),
+            "written by the real monkey-cli\n"
         );
         let _ = std::fs::remove_dir_all(&workspace);
         let _ = std::fs::remove_dir_all(&verifier);
