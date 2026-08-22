@@ -46,6 +46,12 @@ describe("autonomous task planning", () => {
     const bad = { ...plan, nodes: [{ ...plan.nodes[0], dependencies: ["missing"] }, { ...plan.nodes[1], dependencies: [plan.nodes[2].nodeId] }, { ...plan.nodes[2], dependencies: [plan.nodes[1].nodeId] }] };
     expect(validateTaskPlan(bad)).toEqual(expect.arrayContaining(["implement depends on missing node missing", expect.stringContaining("cycle involving")]));
   });
+
+  it("rejects mutation scheduled after review evidence", () => {
+    const plan = createTaskPlan("x", "DIRECT");
+    const bad = { ...plan, nodes: [...plan.nodes, { ...plan.nodes[0], nodeId: "late-edit", dependencies: ["review"], status: "pending" as const }] };
+    expect(validateTaskPlan(bad)).toContain("late-edit is scheduled after review review");
+  });
 });
 
 describe("autonomous task execution", () => {

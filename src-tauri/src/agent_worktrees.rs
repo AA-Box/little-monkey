@@ -37,7 +37,7 @@
 //! refusal) are mirrored instead.
 
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -75,8 +75,211 @@ pub struct AgentWorktreeStatus {
     pub patch_digest: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkspaceSnapshot {
+    pub id: String,
+    pub revision: String,
+    pub changed_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WorkspaceSnapshotEntry {
+    path: String,
+    existed: bool,
+}
+
 fn base_dir(data_root: &Path) -> PathBuf {
     data_root.join(DIR_NAME)
+}
+
+fn snapshot_dir(data_root: &Path, snapshot_id: &str) -> Result<PathBuf, String> {
+    if snapshot_id.is_empty()
+        || snapshot_id.len() > 128
+        || !snapshot_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        return Err("Invalid workspace snapshot id".to_string());
+    }
+    Ok(data_root.join("workspace-snapshots").join(snapshot_id))
+}
+
+fn relative_path(value: &str) -> Result<PathBuf, String> {
+    let path = Path::new(value);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!("Workspace path escapes its root: '{value}'"));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn workspace_changed_files(root: &Path) -> Result<Vec<String>, String> {
+    let porcelain = run_git_ok(root, &["status", "--porcelain=v1"])?;
+    let mut files = porcelain
+        .lines()
+        .filter_map(|line| {
+            if line.len() < 4 {
+                return None;
+            }
+            let value = line[3..].trim();
+            if value.ends_with(MARKER_FILE) {
+                return None;
+            }
+            Some(
+                value
+                    .rsplit_once(" -> ")
+                    .map_or(value, |(_, renamed)| renamed)
+                    .to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn snapshot_entries(data_root: &Path, snapshot_id: &str) -> Result<(PathBuf, Vec<WorkspaceSnapshotEntry>), String> {
+    let dir = snapshot_dir(data_root, snapshot_id)?;
+    let raw = std::fs::read_to_string(dir.join("entries.json"))
+        .map_err(|error| format!("Could not read workspace snapshot: {error}"))?;
+    let entries = serde_json::from_str(&raw)
+        .map_err(|error| format!("Could not decode workspace snapshot: {error}"))?;
+    Ok((dir, entries))
+}
+
+pub fn snapshot(data_root: &Path, workspace_root: &Path) -> Result<WorkspaceSnapshot, String> {
+    let root = workspace_root
+        .canonicalize()
+        .map_err(|error| format!("Could not resolve workspace root: {error}"))?;
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let dir = snapshot_dir(data_root, &id)?;
+    let files_dir = dir.join("files");
+    std::fs::create_dir_all(&files_dir)
+        .map_err(|error| format!("Could not create workspace snapshot: {error}"))?;
+    let changed_files = workspace_changed_files(&root)?;
+    let mut entries = Vec::new();
+    for relative in &changed_files {
+        let relative_path = relative_path(relative)?;
+        let source = root.join(&relative_path);
+        let existed = source.is_file();
+        if existed {
+            let destination = files_dir.join(&relative_path);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    format!("Could not create snapshot parent for '{relative}': {error}")
+                })?;
+            }
+            std::fs::copy(&source, &destination).map_err(|error| {
+                format!("Could not snapshot workspace file '{relative}': {error}")
+            })?;
+        }
+        entries.push(WorkspaceSnapshotEntry {
+            path: relative.clone(),
+            existed,
+        });
+    }
+    let entries_json = serde_json::to_vec(&entries).map_err(|error| error.to_string())?;
+    std::fs::write(dir.join("entries.json"), entries_json)
+        .map_err(|error| format!("Could not persist workspace snapshot: {error}"))?;
+    let revision = workspace_revision(data_root, &root)?;
+    Ok(WorkspaceSnapshot {
+        id,
+        revision,
+        changed_files,
+    })
+}
+
+pub fn changed_files_since_snapshot(
+    data_root: &Path,
+    workspace_root: &Path,
+    snapshot_id: &str,
+) -> Result<Vec<String>, String> {
+    let (dir, entries) = snapshot_entries(data_root, snapshot_id)?;
+    let root = workspace_root
+        .canonicalize()
+        .map_err(|error| format!("Could not resolve workspace root: {error}"))?;
+    let current = workspace_changed_files(&root)?;
+    let mut paths = entries.iter().map(|entry| entry.path.clone()).collect::<HashSet<_>>();
+    paths.extend(current);
+    let mut changed = paths
+        .into_iter()
+        .filter(|relative| {
+            let before_entry = entries.iter().find(|entry| entry.path == *relative);
+            let before = before_entry.and_then(|entry| {
+                entry.existed.then(|| std::fs::read(dir.join("files").join(relative)).ok())
+            }).flatten();
+            let after = std::fs::read(root.join(relative)).ok();
+            before != after
+        })
+        .collect::<Vec<_>>();
+    changed.sort();
+    Ok(changed)
+}
+
+pub fn restore_workspace_paths(
+    data_root: &Path,
+    workspace_root: &Path,
+    snapshot_id: &str,
+    paths: &[String],
+) -> Result<(), String> {
+    let (dir, entries) = snapshot_entries(data_root, snapshot_id)?;
+    let root = workspace_root
+        .canonicalize()
+        .map_err(|error| format!("Could not resolve workspace root: {error}"))?;
+    for value in paths {
+        let relative = relative_path(value)?;
+        let absolute = root.join(&relative);
+        if let Some(entry) = entries.iter().find(|entry| entry.path == *value) {
+            if entry.existed {
+                let source = dir.join("files").join(&relative);
+                if let Some(parent) = absolute.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                }
+                std::fs::copy(source, &absolute).map_err(|error| {
+                    format!("Could not restore workspace path '{value}': {error}")
+                })?;
+            } else if absolute.is_file() || absolute.is_symlink() {
+                std::fs::remove_file(&absolute).map_err(|error| {
+                    format!("Could not remove workspace path '{value}': {error}")
+                })?;
+            } else if absolute.is_dir() {
+                std::fs::remove_dir_all(&absolute).map_err(|error| {
+                    format!("Could not remove workspace path '{value}': {error}")
+                })?;
+            }
+            continue;
+        }
+        let tracked = run_git(&root, &["ls-files", "--error-unmatch", "--", value])
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if tracked {
+            run_git_ok(
+                &root,
+                &["restore", "--source=HEAD", "--staged", "--worktree", "--", value],
+            )?;
+        } else if absolute.is_file() || absolute.is_symlink() {
+            std::fs::remove_file(&absolute).map_err(|error| error.to_string())?;
+        } else if absolute.is_dir() {
+            std::fs::remove_dir_all(&absolute).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+pub fn discard_snapshot(data_root: &Path, snapshot_id: &str) -> Result<(), String> {
+    let dir = snapshot_dir(data_root, snapshot_id)?;
+    if dir.exists() {
+        std::fs::remove_dir_all(dir).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn registry_path(data_root: &Path) -> PathBuf {
@@ -502,6 +705,48 @@ pub fn worktree_workspace_revision(
 }
 
 #[tauri::command]
+pub fn worktree_workspace_snapshot(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<WorkspaceSnapshot, String> {
+    let data_root = profile_data_root(&app)?;
+    let workspace_root = workspace::primary_root_canon(state.inner())?;
+    snapshot(&data_root, &workspace_root)
+}
+
+#[tauri::command]
+pub fn worktree_workspace_changed_files_since_snapshot(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    snapshot_id: String,
+) -> Result<Vec<String>, String> {
+    let data_root = profile_data_root(&app)?;
+    let workspace_root = workspace::primary_root_canon(state.inner())?;
+    changed_files_since_snapshot(&data_root, &workspace_root, &snapshot_id)
+}
+
+#[tauri::command]
+pub fn worktree_workspace_restore_paths(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    snapshot_id: String,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    let data_root = profile_data_root(&app)?;
+    let workspace_root = workspace::primary_root_canon(state.inner())?;
+    restore_workspace_paths(&data_root, &workspace_root, &snapshot_id, &paths)
+}
+
+#[tauri::command]
+pub fn worktree_workspace_snapshot_discard(
+    app: tauri::AppHandle,
+    snapshot_id: String,
+) -> Result<(), String> {
+    let data_root = profile_data_root(&app)?;
+    discard_snapshot(&data_root, &snapshot_id)
+}
+
+#[tauri::command]
 pub fn worktree_remove(app: tauri::AppHandle, path: String, force: bool) -> Result<(), String> {
     let data_root = profile_data_root(&app)?;
     let result = remove(&data_root, &path, force);
@@ -704,6 +949,22 @@ mod tests {
             std::fs::read_to_string(Path::new(&record.path).join("a.txt")).unwrap(),
             "agent version\n"
         );
+    }
+
+    #[test]
+    fn workspace_snapshot_restores_only_the_unauthorized_delta() {
+        let data = temp_dir("data-snapshot");
+        let repo = init_repo("snapshot");
+        let saved = snapshot(&data, &repo).unwrap();
+        std::fs::write(repo.join("a.txt"), "allowed\n").unwrap();
+        std::fs::write(repo.join("secret.txt"), "secret\n").unwrap();
+        let changed = changed_files_since_snapshot(&data, &repo, &saved.id).unwrap();
+        assert_eq!(changed, vec!["a.txt".to_string(), "secret.txt".to_string()]);
+        restore_workspace_paths(&data, &repo, &saved.id, &["secret.txt".to_string()]).unwrap();
+        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "allowed\n");
+        assert!(!repo.join("secret.txt").exists());
+        discard_snapshot(&data, &saved.id).unwrap();
+        assert!(!snapshot_dir(&data, &saved.id).unwrap().exists());
     }
 
     #[test]

@@ -13,7 +13,7 @@ import {
   buildWorkerContext, canRunTaskNodesTogether, createAutonomousTask, createTaskPlan, getReadyTaskPlanNodes,
   hasAuthoritativeAcceptanceEvidence, installTaskPlan, taskEvent, taskEventToRunEvent, validateTaskPlan,
   type AutonomousTask, type CreateAutonomousTaskInput, type TaskArtifact, type TaskEvent,
-  type TaskExecutionPlacement, type TaskPlan, type TaskPlanNode, type TaskPlanningContext, type TaskUsage, type TaskWorker, type VerificationEvidence,
+  type TaskExecutionOwner, type TaskExecutionPlacement, type TaskPlan, type TaskPlanNode, type TaskPlanningContext, type TaskUsage, type TaskWorker, type VerificationEvidence,
 } from "./autonomousTask";
 import { appendRunEvent } from "./runProtocol";
 import type { RunSpecWire } from "./runProtocol";
@@ -154,7 +154,7 @@ export interface RunAutonomousTaskParams {
   onUpdate?: (task: AutonomousTask) => void;
   control?: AutonomousTaskControl;
   approval?: { requestId: string; confirmation: string; operationDigest?: string };
-  ownerFence?: () => Promise<void>;
+  ownerFence?: (owner?: TaskExecutionOwner) => Promise<void>;
 }
 
 export class AutonomousTaskControl {
@@ -166,6 +166,7 @@ export class AutonomousTaskControl {
   private activeExecutions = 0;
   private coordinatorWork = 0;
   private safePointWaiters: Array<() => void> = [];
+  private ownerReplacement: TaskExecutionOwner | null = null;
 
   get signal(): AbortSignal { return this.controller.signal; }
   get isPaused(): boolean { return this.paused; }
@@ -194,6 +195,8 @@ export class AutonomousTaskControl {
     return readSnapshot();
   }
   relinquish(): void { this.controller.abort(); this.resume(); }
+  adoptExecutionOwner(owner: TaskExecutionOwner): void { this.ownerReplacement = structuredClone(owner); }
+  takeExecutionOwner(): TaskExecutionOwner | null { const next = this.ownerReplacement; this.ownerReplacement = null; return next; }
   guide(guidance: AutonomousTask["guidance"][number]): void { this.guidance.push(structuredClone(guidance)); this.guidance = this.guidance.slice(-8); this.wake?.(); this.wake = null; }
   drainGuidance(): AutonomousTask["guidance"] { const next = this.guidance; this.guidance = []; return next; }
   approve(requestId: string, confirmation: string, operationDigest?: string): void { this.approval = { requestId, confirmation, operationDigest }; this.wake?.(); this.wake = null; }
@@ -256,8 +259,50 @@ function advanceWorkspaceRevision(task: AutonomousTask, revision?: string): Auto
   return { ...task, workspaceRevision: revision, verificationEvidence: task.verificationEvidence.map((evidence) => ({ ...evidence, stale: true })), acceptanceCriteria: task.acceptanceCriteria.map((criterion) => criterion.method === "verification_command" || criterion.method === "review" ? { ...criterion, status: "pending", evidenceIds: [] } : criterion), updatedAtMs: Date.now() };
 }
 
+function mutatingRepairSources(plan: TaskPlan, failedNode: TaskPlanNode): TaskPlanNode[] {
+  const byId = new Map(plan.nodes.map((node) => [node.nodeId, node]));
+  const sources: TaskPlanNode[] = [];
+  const integrations: TaskPlanNode[] = [];
+  const seen = new Set<string>();
+  const visit = (node: TaskPlanNode): void => {
+    if (seen.has(node.nodeId)) return;
+    seen.add(node.nodeId);
+    if (node.taskClass === "implementation") sources.push(node);
+    if (node.taskClass === "integration") integrations.push(node);
+    for (const dependency of node.dependencies) {
+      const parent = byId.get(dependency);
+      if (parent) visit(parent);
+    }
+  };
+  if (failedNode.taskClass === "implementation") sources.push(failedNode);
+  else visit(failedNode);
+  if (sources.length === 0) sources.push(...integrations);
+  return [...new Map(sources.map((node) => [node.nodeId, node])).values()];
+}
+
+function scopeContains(scope: string, path: string): boolean {
+  const normalizedScope = scope.replace(/^\.\//, "").replace(/\/$/, "");
+  const normalizedPath = path.replace(/^\.\//, "");
+  return normalizedScope === "workspace" || normalizedScope === normalizedPath || normalizedPath.startsWith(`${normalizedScope}/`);
+}
+
+function outOfScopeFiles(node: TaskPlanNode, changedFiles: string[]): string[] {
+  return [...new Set(changedFiles.filter((path) => !node.mutationScope.some((scope) => scopeContains(scope, path))))];
+}
+
 function insertRepairNode(task: AutonomousTask, failedNode: TaskPlanNode, summary: string): AutonomousTask {
-  if (!task.plan) return task;
+  if (!task.plan || failedNode.taskClass === "delivery") return task;
+  const sources = mutatingRepairSources(task.plan, failedNode);
+  if (sources.length === 0) return task;
+  const scope = [...new Set(sources.flatMap((node) => node.mutationScope))].sort();
+  if (scope.length === 0 || !sources.some((node) => node.capabilities?.includes("mutate"))) return task;
+  const source = sources[0];
+  const mutatingFailedNode = failedNode.taskClass === "implementation" || failedNode.taskClass === "integration";
+  const isolation = mutatingFailedNode ? failedNode.isolation : source.isolation;
+  const executionPlacement = mutatingFailedNode ? failedNode.executionPlacement : source.executionPlacement;
+  const capabilities = [...new Set((mutatingFailedNode ? failedNode.capabilities : source.capabilities) ?? ["read", "mutate", "verify"])]
+    .filter((capability) => capability !== "mutate").concat("mutate");
+  const requirements = mutatingFailedNode ? failedNode.executionRequirements : source.executionRequirements;
   const repairId = `${failedNode.nodeId}-repair-${task.repairRounds}`;
   let repairDependencies = failedNode.dependencies;
   let retriedDependencies = [repairId];
@@ -269,7 +314,7 @@ function insertRepairNode(task: AutonomousTask, failedNode: TaskPlanNode, summar
     }
     return node;
   });
-  const repairNode: TaskPlanNode = { ...failedNode, nodeId: repairId, taskClass: "implementation", objective: `Diagnose and repair ${failedNode.nodeId} using bounded failure evidence: ${summary.slice(0, 2_000)}`, dependencies: repairDependencies, mutationScope: failedNode.mutationScope.length ? failedNode.mutationScope : ["workspace"], isolation: "shared", capabilities: ["read", "mutate", "verify"], executionRequirements: { needsWorkspaceWrite: true, needsNetwork: failedNode.executionRequirements?.needsNetwork ?? false, isolation: "shared" }, status: repairDependencies.length ? "pending" : "ready", attempt: 0, workerId: null, resultSummary: null, repairOf: failedNode.nodeId };
+  const repairNode: TaskPlanNode = { ...failedNode, nodeId: repairId, taskClass: "implementation", objective: `Diagnose and repair ${failedNode.nodeId} using bounded failure evidence: ${summary.slice(0, 2_000)}`, dependencies: repairDependencies, mutationScope: scope, isolation, capabilities, executionPlacement, executionRequirements: { needsWorkspaceWrite: true, needsNetwork: requirements?.needsNetwork ?? false, isolation, platform: requirements?.platform }, status: repairDependencies.length ? "pending" : "ready", attempt: 0, workerId: null, resultSummary: null, repairOf: failedNode.nodeId };
   const retriedNode = { ...failedNode, dependencies: retriedDependencies, status: "pending" as const, attempt: 0, workerId: null, resultSummary: null, mutationRevision: null };
   return { ...task, plan: { ...task.plan, revision: task.plan.revision + 1, nodes: [...nodes.map((node) => node.nodeId === failedNode.nodeId ? retriedNode : node), repairNode] }, updatedAtMs: Date.now() };
 }
@@ -338,6 +383,11 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
     }
     while (task.outcome === "RUNNING" && task.plan && task.plan.nodes.some((node) => node.status === "pending" || node.status === "ready" || node.status === "running")) {
       stopIfNeeded();
+      const replacement = params.control?.takeExecutionOwner();
+      if (replacement) {
+        task = { ...task, executionOwner: replacement, updatedAtMs: Date.now() };
+        await emit("execution_owner_rollback", { owner: replacement });
+      }
       const incomingGuidance = params.control?.drainGuidance() ?? [];
       if (incomingGuidance.length) { task = { ...task, guidance: [...task.guidance, ...incomingGuidance].slice(-32), updatedAtMs: Date.now() }; await emit("guidance_received", { guidance: incomingGuidance }); }
       await params.control?.waitIfPaused();
@@ -369,10 +419,10 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
       }
       const executions = workers.map(async (worker) => {
         const node = task.plan!.nodes.find((candidate) => candidate.nodeId === worker.nodeId)!;
-        const context: AutonomousTaskRuntimeContext = { resolvedTarget: params.resolvedTarget, signal, worker, placement: worker.executionPlacement, planningContext: task.planningContext, approval: params.approval ?? params.control?.drainApproval() ?? undefined, beforeSideEffect: stopIfNeeded, beforeSideEffectAsync: params.ownerFence };
+        const context: AutonomousTaskRuntimeContext = { resolvedTarget: params.resolvedTarget, signal, worker, placement: worker.executionPlacement, planningContext: task.planningContext, approval: params.approval ?? params.control?.drainApproval() ?? undefined, beforeSideEffect: stopIfNeeded, beforeSideEffectAsync: () => params.ownerFence?.(task.executionOwner) ?? Promise.resolve() };
         params.control?.beginExecution();
         try {
-          await params.ownerFence?.();
+          await params.ownerFence?.(task.executionOwner);
           if (node.taskClass === "integration" && params.runtime.integrate) return await params.runtime.integrate(task, node, [...results.values()], context);
           if (node.taskClass === "verification" && params.runtime.verify) return await params.runtime.verify(task, node, context);
           if (node.taskClass === "review" && params.runtime.review) return await params.runtime.review(task, node, context);
@@ -390,11 +440,15 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
         if (!node) throw new Error(`Task node ${worker.nodeId} disappeared from the plan.`);
         const rawResult = completed[index];
         const mutatingNode = node.taskClass === "implementation" || node.taskClass === "integration";
-        const result: TaskNodeResult = rawResult.ok && mutatingNode && !rawResult.mutation && !rawResult.workspaceRevision
-          ? { ...rawResult, ok: false, summary: "Mutating node did not return a revision-bound mutation record." }
-          : rawResult.ok && mutatingNode && !rawResult.mutation && rawResult.workspaceRevision
-            ? { ...rawResult, mutation: { beforeRevision: task.workspaceRevision ?? "unknown", afterRevision: rawResult.workspaceRevision, changedFiles: rawResult.changedFiles ?? [], patchDigest: rawResult.workspaceRevision } }
-            : rawResult;
+        const unauthorized = mutatingNode ? outOfScopeFiles(node, rawResult.changedFiles ?? rawResult.mutation?.changedFiles ?? []) : [];
+        const scopedResult = unauthorized.length > 0
+          ? { ...rawResult, ok: false, summary: `Node '${node.nodeId}' changed files outside its frozen mutation scope: ${unauthorized.join(", ")}` }
+          : rawResult;
+        const result: TaskNodeResult = scopedResult.ok && mutatingNode && !scopedResult.mutation && !scopedResult.workspaceRevision
+          ? { ...scopedResult, ok: false, summary: "Mutating node did not return a revision-bound mutation record." }
+          : scopedResult.ok && mutatingNode && !scopedResult.mutation && scopedResult.workspaceRevision
+            ? { ...scopedResult, mutation: { beforeRevision: task.workspaceRevision ?? "unknown", afterRevision: scopedResult.workspaceRevision, changedFiles: scopedResult.changedFiles ?? [], patchDigest: scopedResult.workspaceRevision } }
+            : scopedResult;
         results.set(node.nodeId, result);
         const awaitingApproval = !result.ok && result.awaitingApproval === true;
         const status: TaskPlanNode["status"] = result.ok ? "succeeded" : awaitingApproval ? "waiting_approval" : "failed";
@@ -428,7 +482,7 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
         if (failed) {
           if (task.repairRounds < task.budgetSnapshot.maxRepairRounds) {
             task = { ...task, repairRounds: task.repairRounds + 1, updatedAtMs: Date.now() };
-            for (const node of batch) { const failedNode = task.plan?.nodes.find((candidate) => candidate.nodeId === node.nodeId); const failedResult = completed.find((_result, resultIndex) => workers[resultIndex]?.nodeId === node.nodeId); if (failedNode?.status === "failed" && failedResult && !failedResult.ok) task = insertRepairNode(task, failedNode, failedResult.summary); }
+            for (const node of batch) { const failedNode = task.plan?.nodes.find((candidate) => candidate.nodeId === node.nodeId); const failedResult = completed.find((_result, resultIndex) => workers[resultIndex]?.nodeId === node.nodeId); if (failedNode?.status === "failed" && failedResult && !failedResult.ok) { const repaired = insertRepairNode(task, failedNode, failedResult.summary); if (repaired === task) task = { ...task, outcome: "FAILED", summary: `No causal mutating source is available to repair '${failedNode.nodeId}'.`, updatedAtMs: Date.now() }; else task = repaired; } }
             await emit("plan_changed", { reason: "Bounded repair round requested after worker failure.", repair_round: task.repairRounds });
           } else {
             task = { ...task, outcome: task.plan?.nodes.some((node) => node.status === "succeeded") ? "PARTIALLY_COMPLETED" : "FAILED", summary: "One or more task nodes failed after bounded repair rounds.", updatedAtMs: Date.now() };
@@ -495,11 +549,30 @@ export function defaultAutonomousTaskRuntime(resolvedTarget: ResolvedTarget, pla
         return { ok: false, summary: `Node '${node.nodeId}' requested capability '${capability}' outside the frozen permission ceiling.` };
       }
       const beforeRevision = await agentWorktreeClient.workspaceRevision().catch(() => task.workspaceRevision ?? "unknown");
-      const result = await runSubagentTaskStructured({ sessionId: task.sessionId ?? task.taskId, runId: task.taskId, parentCheckpointId: null, taskId: `${task.taskId}-${node.nodeId}`, description: node.objective.slice(0, 120), prompt: buildWorkerContext(task, node), profile: node.taskClass === "investigation" || node.taskClass === "review" ? "explore" : "code", capabilities: [...required], isolation: node.isolation === "worktree" ? "worktree" : undefined, target: resolvedTarget, effort: effortForTarget(resolvedTarget), parentSignal: context.signal, beforeToolCall: context.beforeSideEffectAsync ?? context.beforeSideEffect });
+      const mutatingNode = node.taskClass === "implementation" || node.taskClass === "integration";
+      const snapshot = mutatingNode && node.isolation === "shared" ? await agentWorktreeClient.workspaceSnapshot().catch(() => undefined) : undefined;
+      let result: Awaited<ReturnType<typeof runSubagentTaskStructured>>;
+      try {
+        result = await runSubagentTaskStructured({ sessionId: task.sessionId ?? task.taskId, runId: task.taskId, parentCheckpointId: null, taskId: `${task.taskId}-${node.nodeId}`, description: node.objective.slice(0, 120), prompt: buildWorkerContext(task, node), profile: node.taskClass === "investigation" || node.taskClass === "review" ? "explore" : "code", capabilities: [...required], isolation: node.isolation === "worktree" ? "worktree" : undefined, target: resolvedTarget, effort: effortForTarget(resolvedTarget), parentSignal: context.signal, beforeToolCall: context.beforeSideEffectAsync ?? context.beforeSideEffect });
+      } catch (error) {
+        if (snapshot) {
+          const changed = await agentWorktreeClient.workspaceChangedFilesSinceSnapshot(snapshot.id).catch(() => []);
+          const unauthorized = outOfScopeFiles(node, changed);
+          if (unauthorized.length) await agentWorktreeClient.workspaceRestorePaths(snapshot.id, unauthorized).catch(() => undefined);
+          await agentWorktreeClient.workspaceSnapshotDiscard(snapshot.id).catch(() => undefined);
+        }
+        throw error;
+      }
       const afterRevision = node.isolation === "shared" ? await agentWorktreeClient.workspaceRevision().catch(() => undefined) : result.worktree?.diffDigest;
-      const changedFiles = node.isolation === "shared" ? await agentWorktreeClient.workspaceChangedFiles().catch(() => result.changedFiles ?? []) : result.changedFiles ?? [];
-      const patchDigest = afterRevision ? await textDigest(JSON.stringify({ afterRevision, changedFiles })) ?? afterRevision : result.worktree?.diffDigest;
-      return { ok: result.outcome === "done", summary: result.report.slice(0, 8_000), worktree: result.worktree, changedFiles, mutation: (node.taskClass === "implementation" || node.taskClass === "integration") && afterRevision ? { beforeRevision, afterRevision, changedFiles, patchDigest: patchDigest ?? afterRevision } : undefined, artifacts: result.worktree ? [{ artifactId: `patch-${node.nodeId}-${Date.now()}`, kind: "patch", label: `Patch from ${node.nodeId}`, path: result.worktree.path, digest: result.worktree.diffDigest, createdAtMs: Date.now(), workspaceRevision: result.worktree.baseRevision }] : undefined, usage: result.usage };
+      const changedFiles = snapshot ? await agentWorktreeClient.workspaceChangedFilesSinceSnapshot(snapshot.id).catch(() => result.changedFiles ?? []) : node.isolation === "shared" ? await agentWorktreeClient.workspaceChangedFiles().catch(() => result.changedFiles ?? []) : result.changedFiles ?? [];
+      const unauthorized = mutatingNode ? outOfScopeFiles(node, changedFiles) : [];
+      if (snapshot) {
+        if (unauthorized.length) await agentWorktreeClient.workspaceRestorePaths(snapshot.id, unauthorized).catch(() => undefined);
+        await agentWorktreeClient.workspaceSnapshotDiscard(snapshot.id).catch(() => undefined);
+      }
+      if (unauthorized.length) return { ok: false, summary: `Node '${node.nodeId}' changed files outside its frozen mutation scope: ${unauthorized.join(", ")}`, changedFiles: unauthorized };
+      const patchDigest = node.isolation === "worktree" ? result.worktree?.diffDigest : afterRevision ? await textDigest(JSON.stringify({ afterRevision, changedFiles })) ?? afterRevision : undefined;
+      return { ok: result.outcome === "done", summary: result.report.slice(0, 8_000), worktree: result.worktree, changedFiles, mutation: mutatingNode && afterRevision ? { beforeRevision, afterRevision, changedFiles, patchDigest: patchDigest ?? afterRevision } : undefined, artifacts: result.worktree ? [{ artifactId: `patch-${node.nodeId}-${Date.now()}`, kind: "patch", label: `Patch from ${node.nodeId}`, path: result.worktree.path, digest: result.worktree.diffDigest, createdAtMs: Date.now(), workspaceRevision: result.worktree.baseRevision }] : undefined, usage: result.usage };
     },
     integrate: async (task, _node, results, context) => {
       const workerResults = results.filter((result) => result.worktree);
@@ -612,6 +685,8 @@ export interface AutonomousTaskDaemonSubmission {
   job_id: string;
   run_id: string;
   state: string;
+  rollback_owner?: { kind: "desktop"; instance_id: string; lease_epoch: number; lease_expires_at_ms: number };
+  error?: string;
 }
 
 export async function submitAutonomousTaskToDaemon(task: AutonomousTask): Promise<AutonomousTaskDaemonSubmission> {
@@ -681,8 +756,8 @@ export async function startAutonomousTask(params: StartAutonomousTaskParams): Pr
   const permission = usePermissionStore.getState();
   const runBudgets = defaultRunBudgets(false);
   const task = createAutonomousTask({ objective: params.objective, sessionId: params.sessionId, targetSnapshot, workspaceRoots: structuredClone(roots), permissionSnapshot: { mode: permission.mode, unattended: true, allowNetwork: false, allowExternalMutations: false }, constraints: params.constraints, planningContext: params.planningContext, deliveryIntent: params.deliveryIntent, deliveryTarget: params.deliveryTarget, budgetSnapshot: { wallTimeMs: runBudgets.wall_time_ms, maxModelCalls: runBudgets.max_model_calls, maxToolCalls: runBudgets.max_tool_calls, maxRepairRounds: 2, maxWorkers: 16, maxConcurrentWorkers: 4, maxArtifactBytes: runBudgets.max_artifact_bytes, maxCostMicros: runBudgets.max_cost_micros } });
-  const ownerFence = async (): Promise<void> => {
-    await invoke("autonomous_task_owner_fence", { request: { taskId: task.taskId, owner: { kind: task.executionOwner.kind, instance_id: task.executionOwner.instanceId, lease_epoch: task.executionOwner.leaseEpoch, lease_expires_at_ms: task.executionOwner.leaseExpiresAtMs } } });
+  const ownerFence = async (owner = task.executionOwner): Promise<void> => {
+    await invoke("autonomous_task_owner_fence", { request: { taskId: task.taskId, owner: { kind: owner.kind, instance_id: owner.instanceId, lease_epoch: owner.leaseEpoch, lease_expires_at_ms: owner.leaseExpiresAtMs } } });
   };
   await ownerFence();
   const control = new AutonomousTaskControl();
@@ -702,8 +777,8 @@ export async function resumeAutonomousTask(params: ResumeAutonomousTaskParams): 
   const resolvedTarget = await resolveTarget(); const control = new AutonomousTaskControl(); const signal = mergeSignals(control.signal, params.signal);
   const task = { ...params.task, outcome: "RUNNING" as const, repairRounds: ["FAILED", "VERIFICATION_FAILED", "DELIVERY_FAILED", "WAITING_USER"].includes(params.task.outcome) ? 0 : params.task.repairRounds, plan: params.task.plan ? { ...params.task.plan, nodes: params.task.plan.nodes.map((node) => node.status === "running" || node.status === "failed" || node.status === "blocked" || (params.task.waitingApproval && node.nodeId === params.task.waitingApproval.nodeId) ? { ...node, status: "pending" as const, workerId: null } : node) } : null, waitingReason: null, waitingApproval: null, updatedAtMs: Date.now() };
   if (task.executionOwner.kind !== "desktop") throw new Error("Only the current desktop owner may resume an autonomous task.");
-  const ownerFence = async (): Promise<void> => {
-    await invoke("autonomous_task_owner_fence", { request: { taskId: task.taskId, owner: { kind: task.executionOwner.kind, instance_id: task.executionOwner.instanceId, lease_epoch: task.executionOwner.leaseEpoch, lease_expires_at_ms: task.executionOwner.leaseExpiresAtMs } } });
+  const ownerFence = async (owner = task.executionOwner): Promise<void> => {
+    await invoke("autonomous_task_owner_fence", { request: { taskId: task.taskId, owner: { kind: owner.kind, instance_id: owner.instanceId, lease_epoch: owner.leaseEpoch, lease_expires_at_ms: owner.leaseExpiresAtMs } } });
   };
   await ownerFence();
   const recorder = await attachDurableRun({ runId: task.taskId, roots: task.workspaceRoots });

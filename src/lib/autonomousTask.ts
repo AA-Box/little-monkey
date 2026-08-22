@@ -300,6 +300,14 @@ export function validateTaskPlan(plan: TaskPlan, context?: TaskPlanningContext):
     ids.add(current.nodeId);
   }
   const byId = new Map(plan.nodes.map((current) => [current.nodeId, current]));
+  const dependsOn = (nodeId: string, ancestorId: string, visiting = new Set<string>()): boolean => {
+    if (nodeId === ancestorId) return true;
+    if (visiting.has(nodeId)) return false;
+    visiting.add(nodeId);
+    const found = (byId.get(nodeId)?.dependencies ?? []).some((dependency) => dependsOn(dependency, ancestorId, visiting));
+    visiting.delete(nodeId);
+    return found;
+  };
   for (const current of plan.nodes) for (const dependency of current.dependencies) if (!byId.has(dependency)) errors.push(`${current.nodeId} depends on missing node ${dependency}`);
   for (const current of plan.nodes) {
     if ((current.taskClass === "implementation" || current.taskClass === "integration") && current.mutationScope.length === 0) errors.push(`${current.nodeId} mutating nodes require a non-empty mutation scope`);
@@ -334,6 +342,11 @@ export function validateTaskPlan(plan: TaskPlan, context?: TaskPlanningContext):
   }
   if (!plan.nodes.some((current) => current.taskClass === "verification")) errors.push("plans require a verification node");
   if (!plan.nodes.some((current) => current.taskClass === "review")) errors.push("plans require a review node");
+  const verifications = plan.nodes.filter((current) => current.taskClass === "verification");
+  for (const review of plan.nodes.filter((current) => current.taskClass === "review")) {
+    if (!verifications.some((verification) => dependsOn(review.nodeId, verification.nodeId))) errors.push(`${review.nodeId} must depend on verification evidence`);
+    for (const mutation of plan.nodes.filter((current) => current.taskClass === "implementation" || current.taskClass === "integration")) if (dependsOn(mutation.nodeId, review.nodeId)) errors.push(`${mutation.nodeId} is scheduled after review ${review.nodeId}`);
+  }
   return [...new Set(errors)];
 }
 
