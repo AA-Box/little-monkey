@@ -1562,18 +1562,21 @@ Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 $root=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]::new([int64]$env:LM_WINDOW_HANDLE))
 $desc=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
-$e=$null
 $stable=$env:LM_ELEMENT_STABLE
-if(-not [string]::IsNullOrWhiteSpace($stable)) {
-  for($i=0;$i -lt $desc.Count;$i++) {
-    $candidate=$desc.Item($i)
-    $automation=[string]$candidate.Current.AutomationId
-    if([string]::IsNullOrWhiteSpace($automation)){try{$automation=($candidate.GetRuntimeId() -join '-')}catch{$automation=''}}
-    $candidateStable=($automation -replace '[^A-Za-z0-9._-]','_')
-    if($candidateStable -eq $stable){$e=$candidate;break}
+function ResolveElement {
+  $candidates=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
+  if(-not [string]::IsNullOrWhiteSpace($stable)) {
+    for($i=0;$i -lt $candidates.Count;$i++) {
+      $candidate=$candidates.Item($i)
+      $automation=[string]$candidate.Current.AutomationId
+      if([string]::IsNullOrWhiteSpace($automation)){try{$automation=($candidate.GetRuntimeId() -join '-')}catch{$automation=''}}
+      $candidateStable=($automation -replace '[^A-Za-z0-9._-]','_')
+      if($candidateStable -eq $stable){return $candidate}
+    }
   }
+  return $candidates.Item([int]$env:LM_ELEMENT_INDEX)
 }
-if($null -eq $e){$e=$desc.Item([int]$env:LM_ELEMENT_INDEX)}
+$e=ResolveElement
 $action=$env:LM_ACTION
 $performed=$false
 if($action -eq 'set_value') {
@@ -1582,9 +1585,37 @@ if($action -eq 'set_value') {
   try { $p=$e.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern); $p.Select(); $performed=$true } catch {}
 } elseif($action -eq 'click' -or $action -eq 'double_click') {
   $toggleSupported=$false
-  try { $p=$e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern); $toggleSupported=$true; $p.Toggle(); $performed=$true } catch {}
+  try {
+    $p=$e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
+    $toggleSupported=$true
+    $before=$p.Current.ToggleState
+    $p.Toggle()
+    for($wait=0;$wait -lt 10 -and -not $performed;$wait++) {
+      Start-Sleep -Milliseconds 100
+      try {
+        $fresh=ResolveElement
+        $after=$fresh.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState
+        if($after -ne $before){$performed=$true}
+      } catch {}
+    }
+    if(-not $performed) {
+      try {
+        $fresh=ResolveElement
+        $p=$fresh.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+        $p.Invoke()
+        for($wait=0;$wait -lt 10 -and -not $performed;$wait++) {
+          Start-Sleep -Milliseconds 100
+          try {
+            $fresh=ResolveElement
+            $after=$fresh.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState
+            if($after -ne $before){$performed=$true}
+          } catch {}
+        }
+      } catch {}
+    }
+  } catch {}
   if(-not $performed -and -not $toggleSupported) { try { $p=$e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); $p.Invoke(); $performed=$true } catch {} }
-  if($performed -and $action -eq 'double_click') { try { if($toggleSupported) { $p.Toggle() } else { $p.Invoke() } } catch {} }
+  if($performed -and $action -eq 'double_click') { try { $fresh=ResolveElement; if($toggleSupported) { $fresh.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Toggle() } else { $fresh.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() } } catch {} }
 }
 if($performed) { [ordered]@{semantic=$true}|ConvertTo-Json -Compress } else { [ordered]@{semantic=$false}|ConvertTo-Json -Compress }
 "#;
