@@ -44,6 +44,7 @@ $dark.AutoSize = $true
 
 $disabled = New-Object System.Windows.Forms.Button
 $disabled.Text = 'Disabled button'
+$disabled.AccessibleName = 'Disabled button'
 $disabled.Location = New-Object System.Drawing.Point(150, 144)
 $disabled.Size = New-Object System.Drawing.Size(150, 30)
 $disabled.Enabled = $false
