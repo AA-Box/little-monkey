@@ -267,7 +267,7 @@ jobs:
               return 0
             fi
             for attempt in $(seq 1 10); do
-              if printf '%s\\n' "$$" | sudo tee "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" >/dev/null; then
+              if printf '%s\n' "$$" | sudo tee "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" >/dev/null; then
                 echo "running under $(cat /proc/self/cgroup)"
                 return 0
               fi
@@ -353,7 +353,7 @@ jobs:
           fi
           move_into_cgroup() {
             for attempt in $(seq 1 10); do
-              if printf '%s\\n' "$$" | sudo tee "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" >/dev/null; then
+              if printf '%s\n' "$$" | sudo tee "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" >/dev/null; then
                 echo "running under $(cat /proc/self/cgroup)" >&2
                 return 0
               fi
