@@ -1,8397 +1,1563 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
-use little_monkey_lib::artifact_store::ArtifactStore;
-use little_monkey_lib::migration::{
-    admit, MigrationVerdict, TargetNode, MAX_MIGRATION_PAYLOAD_BYTES,
-};
-use little_monkey_lib::run_ledger::{RunLedger, StoredApproval, StoredRun};
-use little_monkey_lib::run_protocol::{
-    ClientIdentity, ClientKind, ModelTargetSnapshot, PermissionDecision, RunEvent,
-    RunEventEnvelope, RUN_PROTOCOL_SCHEMA_VERSION,
-};
-use serde::Serialize;
-
-use crate::daemon::ledger::SharedLedger;
-use crate::daemon::store::{DaemonPaths, DaemonStore};
-use crate::durable_run::{bounded_text, CliRunEventSink, DurableRunRecorder};
-
-use little_monkey_lib::run_protocol::OutputChannel;
-
-use super::desktop::DesktopControlRuntime;
-use super::migrate::land_migration;
-use super::protocol::{
-    all_peer_capabilities, canonical_request, capability_block, effective_capabilities,
-    legacy_capabilities, peer_capabilities_of, sha256_hex, terminal_digest, ApprovalRequestBody,
-    CancelRequestBody, DesktopControlActionRequest, DesktopControlStartRequest,
-    DesktopControlStopRequest, DesktopControlTargetRequest, DeviceCapability, DeviceCommand,
-    DeviceCommandControl, DeviceCommandRecovery, DeviceCommandResult, DeviceCommandStartRequest,
-    DeviceCommandState, DeviceSurface, MigrationAcceptRequest, MigrationPreflightRequest,
-    MigrationReceipt, PairAcceptRequest, PeerArtifactStored, PeerArtifactUpload, PeerHelloRequest,
-    PeerHelloResponse, RemoteAction, RemoteHostConfig, RemoteScopes, RunSummary,
-    SignedRequestHeaders, TalkTicketRequest, TalkTicketResponse, VoiceChunkRequest,
-    VoiceCloseRequest, DEFAULT_TALK_TICKET_TTL_MS, DEVICE_LEASE_MS, MAX_REMOTE_BODY_BYTES,
-    MAX_VOICE_CHUNK_BYTES, PHYSICAL_DEVICE_CAPABILITIES, REMOTE_PROTOCOL_VERSION,
-};
-use super::store::{
-    CommandReservation, DeviceArtifact, DeviceRecord, KeyringRemoteSecrets, MobileCaptureRecord,
-    MobileMessageRecord, MobileWorkflowRunRecord, RemoteSecretStore, RemoteStore,
-};
-
-/// Seam through which the mobile chat route reaches the daemon's recipe
-/// queue. Production (`daemon::DaemonMobileChatQueue`) queues the
-/// operator-configured `mobile-chat` recipe; tests inject a fake so the API
-/// contract is testable without a configured daemon.
-pub trait MobileChatQueue: Send + Sync {
-    /// Queues one chat turn. `client_key` is the mobile message id â€” the
-    /// implementation derives a deterministic job id from it, so replaying
-    /// the same signed request can never double-queue. `session_id` is the
-    /// conversation the turn belongs to, which is what the durable ingress
-    /// record keys its session on. Returns the durable run id.
-    fn queue_chat(
-        &self,
-        session_id: &str,
-        client_key: &str,
-        prompt: &str,
-    ) -> Result<String, String>;
-    /// Resolves the durable run id previously queued for this turn, if the job
-    /// has one yet. Both halves of the turn's identity are needed: the job id
-    /// is a digest over them and cannot be inverted.
-    fn chat_run_id(&self, session_id: &str, client_key: &str) -> Result<Option<String>, String>;
-}
-
-/// Seam through which the placement route reaches this node's own queue
-/// (roadmap K17 S2).
-///
-/// The same shape as [`MobileChatQueue`] and for the same reason: the route's
-/// contract â€” validate a foreign spec, refuse what this node cannot satisfy,
-/// record the placement â€” is testable without a configured daemon, while
-/// production (`daemon::DaemonPlacementQueue`) does the real enqueue.
-pub trait PlacementQueue: Send + Sync {
-    /// Accepts a frozen foreign spec and queues it here.
-    ///
-    /// The implementation owns the refusal for anything about *this* machine
-    /// that the spec needs and this machine has not got â€” a workspace root that
-    /// does not exist, a model target this node cannot execute â€” because those
-    /// are exactly the facts the wire cannot carry.
-    fn place(&self, spec: &little_monkey_lib::run_protocol::RunSpec) -> Result<PlacedJob, String>;
-    /// Current state of a previously placed run, by the node-side job id.
-    ///
-    /// Keyed on the job rather than the run because the job row is what carries
-    /// the *node's* verdict â€” its hold reason, its spawn failure, its budget
-    /// cancellation â€” and that verdict is what a placer needs to read.
-    fn placed_state(&self, job_id: &str) -> Result<Option<PlacedJobState>, String>;
-}
-
-/// What the node minted for one accepted placement.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlacedJob {
-    pub node_run_id: String,
-    pub job_id: String,
-    pub state: String,
-}
-
-/// A placed run's current state as the node sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlacedJobState {
-    pub state: String,
-    pub terminal: bool,
-    pub updated_at_ms: u64,
-    pub last_error: Option<String>,
-}
-
-/// Every model resident on this node: the managed hub's inventory plus whatever
-/// the local Ollama daemon has pulled (roadmap K17 S1).
-///
-/// # The synchronous-handler problem, and why it is not solved by giving up
-///
-/// Listing Ollama tags is one async loopback GET, and [`RemoteApi::handle`] is
-/// synchronous â€” it is called from `handle_http`, which is not. The first cut of
-/// this simply omitted Ollama, and the cost was real rather than cosmetic:
-/// `select_node`'s strongest ranking key is "the model is already resident", and
-/// a node's Ollama models are exactly the local models a placement would want to
-/// avoid re-pulling. A whole class of placements silently ranked as if every
-/// node were cold.
-///
-/// `block_in_place` moves this blocking section off the async worker so the
-/// runtime can keep serving, which is precisely what it exists for. It is
-/// **only** reached on a multi-threaded runtime â€” `block_in_place` panics on a
-/// current-thread one, and unit tests call `handle` with no runtime at all â€” so
-/// the flavour is checked first and the absence of a runtime degrades to "hub
-/// models only" rather than to a panic in a route handler.
-///
-/// A daemon whose Ollama is not running is not an error either: an unreachable
-/// Ollama contributes nothing and the node still describes itself.
-fn resident_models(
-    app_data: &std::path::Path,
-) -> Vec<little_monkey_lib::node_placement::NodeModel> {
-    let mut models = little_monkey_lib::m3_runtime_hub::installed_model_inventory(app_data);
-    let known: std::collections::BTreeSet<String> =
-        models.iter().map(|model| model.model_id.clone()).collect();
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return models;
-    };
-    if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
-        return models;
-    }
-    let tags = tokio::task::block_in_place(|| {
-        handle.block_on(async {
-            let client = little_monkey_lib::egress::hardened()
-                .build()
-                .map_err(|error| error.to_string())?;
-            little_monkey_lib::ollama::list_tag_names(&client).await
-        })
-    });
-    let Ok(tags) = tags else {
-        return models;
-    };
-    for tag in tags {
-        if known.contains(&tag) {
-            continue;
-        }
-        models.push(little_monkey_lib::node_placement::NodeModel {
-            model_id: tag.clone(),
-            display_name: tag,
-            runtime: "ollama".to_string(),
-            // Ollama's tag listing carries a size, but this route deliberately
-            // does not ask for it: `/api/tags` reports the blob size on disk,
-            // which is not the memory footprint the hub's numbers mean, and one
-            // field holding two different measurements is worse than a zero that
-            // is obviously not a measurement.
-            weights_bytes: 0,
-            estimated_ram_bytes: 0,
-            estimated_vram_bytes: 0,
-        });
-    }
-    models.sort_by(|left, right| left.model_id.cmp(&right.model_id));
-    models
-}
-
-/// Meta keys holding the two operator statements a node makes about itself
-/// (roadmap K17 S1). In the daemon's own meta table rather than in
-/// `RemoteHostConfig` because they are facts about the *machine*, not about its
-/// TLS listener, and an operator who has not configured a remote host can still
-/// set them.
-pub const NODE_RESIDENCY_META: &str = "node_residency";
-pub const NODE_NAME_META: &str = "node_name";
-
-#[derive(Debug, Clone)]
-pub struct ApiRequest {
-    pub method: String,
-    pub path_and_query: String,
-    pub body: Vec<u8>,
-    pub auth: Option<SignedRequestHeaders>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApiResponse {
-    pub status: u16,
-    pub content_type: &'static str,
-    pub body: Vec<u8>,
-}
-
-/// Unspent admissions held at once. A ticket lives thirty seconds and is spent
-/// immediately, so this is a ceiling on a burst rather than on conversations.
-const MAX_PENDING_TALK_TICKETS: usize = 64;
-
-#[derive(Debug, Clone)]
-struct PendingTalkTicket {
-    device_id: String,
-    secret_generation: u64,
-    signed_request_sha256: String,
-    session_id: String,
-    session_generation: String,
-    expires_at_ms: u64,
-}
-
-/// Identity frozen into a consumed Talk ticket. The ticket itself is removed
-/// before the HTTP 101 is returned and is never retained in this value.
-#[derive(Debug, Clone)]
-pub(crate) struct TalkSocketAuthorization {
-    pub device_id: String,
-    /// Digest of the signed request that minted this admission. Every turn the
-    /// socket submits is keyed on it, so a spoken turn's durable identity traces
-    /// back to a request that carried a valid signature, sequence and nonce.
-    pub signed_request_sha256: String,
-    pub session_id: String,
-    pub session_generation: String,
-}
-
-impl ApiResponse {
-    fn json<T: Serialize>(status: u16, value: &T) -> Self {
-        match serde_json::to_vec(value) {
-            Ok(body) => Self {
-                status,
-                content_type: "application/json",
-                body,
-            },
-            Err(error) => Self::error(500, &format!("Serialization failure: {error}")),
-        }
-    }
-
-    pub(super) fn error(status: u16, message: &str) -> Self {
-        Self::json(
-            status,
-            &serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "status": "error",
-                "message": bounded_text(message, 4_096),
-            }),
-        )
-    }
-}
-
-pub struct RemoteApi {
-    paths: DaemonPaths,
-    host: RemoteHostConfig,
-    store: Arc<Mutex<RemoteStore>>,
-    secrets: Arc<dyn RemoteSecretStore>,
-    /// Shared with the resident serve loop so revoke / kill-switch / escape
-    /// hatch can force-stop the same live sessions this API creates. `None`
-    /// only in desktop-agnostic unit tests.
-    desktop: Option<Arc<DesktopControlRuntime>>,
-    /// Chat execution seam for `/v1/remote/mobile/sessions/*/messages`.
-    /// `None` (bare unit tests) answers those routes with a clear 501-style
-    /// error instead of pretending to queue anything.
-    mobile_chat: Option<Arc<dyn MobileChatQueue>>,
-    /// Placement execution seam for `/v1/remote/node/runs` (roadmap K17 S2).
-    /// `None` (bare unit tests, and any build without a configured daemon)
-    /// answers the placement route with an explicit refusal rather than
-    /// accepting a spec it cannot run.
-    placement: Option<Arc<dyn PlacementQueue>>,
-    /// Run seam for `/v1/remote/peer/messages`. `None` (bare unit tests, and
-    /// any build without a configured daemon) refuses peer traffic outright
-    /// rather than recording envelopes it could never act on.
-    peer_runs: Option<Arc<dyn crate::daemon::channel_worker::RunQueue>>,
-    /// One lock per device command, held across its whole terminal commit.
-    ///
-    /// The commit is "decide whether this report is authoritative, publish its
-    /// artifact bytes, then write the row that names them", and those three are
-    /// one decision: a second report that lost the race must leave the winner's
-    /// file *and* row exactly as they are. Checking the row, releasing, writing
-    /// the file and taking the row again leaves a window where the loser's bytes
-    /// replace the winner's under the winner's digest.
-    ///
-    /// Deliberately not the store lock: an artifact fsync is long, and every
-    /// other request would queue behind it. Deliberately in memory: this API is
-    /// one process, cloned per connection over shared `Arc`s, so every task that
-    /// can commit a given command shares this map.
-    terminal_commits: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    /// Where remote requests land in the unified subsystem event stream
-    /// (roadmap K12).
-    ///
-    /// The remote node already keeps its own `remote_audit` table, but that
-    /// table lives in its own database with no join to the run stream â€” which is
-    /// the gap K12 names. This records the same requests where everything else
-    /// can be read alongside them; it does not replace `remote_audit`, which
-    /// holds the protocol-level denial detail this stream deliberately does not.
-    audit: little_monkey_lib::subsystem_audit::SubsystemAudit,
-    /// Short-lived, one-use WebSocket admissions keyed by a digest of the
-    /// opaque ticket. Device secrets never enter this map or a URL.
-    talk_tickets: Arc<Mutex<HashMap<String, PendingTalkTicket>>>,
-    /// Speech backends for Talk sockets. `None` â€” always, in production â€” means
-    /// the operator's own configured stack, resolved per session. A test
-    /// substitutes the two things that are genuinely outside this process, a
-    /// transcriber and a synthesizer, and nothing else.
-    talk_speech: Option<Arc<dyn super::talk::TalkSpeech>>,
-}
-
-impl Clone for RemoteApi {
-    fn clone(&self) -> Self {
-        Self {
-            paths: self.paths.clone(),
-            host: self.host.clone(),
-            store: Arc::clone(&self.store),
-            secrets: Arc::clone(&self.secrets),
-            desktop: self.desktop.clone(),
-            mobile_chat: self.mobile_chat.clone(),
-            placement: self.placement.clone(),
-            peer_runs: self.peer_runs.clone(),
-            // Shared, not copied: two clones that each had their own map would
-            // be two locks over one command, which is no lock at all.
-            terminal_commits: Arc::clone(&self.terminal_commits),
-            audit: self.audit.clone(),
-            talk_tickets: Arc::clone(&self.talk_tickets),
-            talk_speech: self.talk_speech.clone(),
-        }
-    }
-}
-
-impl RemoteApi {
-    pub fn production(
-        paths: DaemonPaths,
-        host: RemoteHostConfig,
-        desktop: Arc<DesktopControlRuntime>,
-        mobile_chat: Arc<dyn MobileChatQueue>,
-        placement: Arc<dyn PlacementQueue>,
-        peer_runs: Arc<dyn crate::daemon::channel_worker::RunQueue>,
-    ) -> Result<Self, String> {
-        let store = RemoteStore::open(&paths.root)?;
-        let audit = audit_for(&paths);
-        Ok(Self {
-            paths,
-            host,
-            store: Arc::new(Mutex::new(store)),
-            secrets: Arc::new(KeyringRemoteSecrets),
-            desktop: Some(desktop),
-            mobile_chat: Some(mobile_chat),
-            placement: Some(placement),
-            peer_runs: Some(peer_runs),
-            terminal_commits: Arc::new(Mutex::new(HashMap::new())),
-            audit,
-            talk_tickets: Arc::new(Mutex::new(HashMap::new())),
-            talk_speech: None,
-        })
-    }
-
-    /// The store this API answers from, for tests that need to queue work or
-    /// read the authoritative record beside the protocol.
-    #[cfg(test)]
-    pub fn store_for_tests(&self) -> Arc<Mutex<RemoteStore>> {
-        Arc::clone(&self.store)
-    }
-
-    #[cfg(test)]
-    pub fn injected(
-        paths: DaemonPaths,
-        host: RemoteHostConfig,
-        store: RemoteStore,
-        secrets: Arc<dyn RemoteSecretStore>,
-    ) -> Self {
-        let audit = audit_for(&paths);
-        Self {
-            paths,
-            host,
-            store: Arc::new(Mutex::new(store)),
-            secrets,
-            desktop: None,
-            mobile_chat: None,
-            placement: None,
-            peer_runs: None,
-            terminal_commits: Arc::new(Mutex::new(HashMap::new())),
-            audit,
-            talk_tickets: Arc::new(Mutex::new(HashMap::new())),
-            talk_speech: None,
-        }
-    }
-
-    /// Test builder: the injected API plus a fake chat queue, so the mobile
-    /// chat contract is exercisable without a configured daemon.
-    #[cfg(test)]
-    pub fn with_mobile_chat(mut self, mobile_chat: Arc<dyn MobileChatQueue>) -> Self {
-        self.mobile_chat = Some(mobile_chat);
-        self
-    }
-
-    /// Test builder: the injected API plus a scripted transcriber and
-    /// synthesizer, so a whole spoken conversation can be driven over a real
-    /// socket without a whisper build or a system voice.
-    #[cfg(test)]
-    pub fn with_talk_speech(mut self, speech: Arc<dyn super::talk::TalkSpeech>) -> Self {
-        self.talk_speech = Some(speech);
-        self
-    }
-
-    pub(crate) fn talk_speech(&self) -> Option<Arc<dyn super::talk::TalkSpeech>> {
-        self.talk_speech.clone()
-    }
-
-    /// Test builder: the injected API plus a fake placement queue, so the K17
-    /// placement contract is exercisable without a configured daemon.
-    #[cfg(test)]
-    pub fn with_placement(mut self, placement: Arc<dyn PlacementQueue>) -> Self {
-        self.placement = Some(placement);
-        self
-    }
-
-    /// Test builder: the injected API plus a fake run queue, so the peer
-    /// contract is exercisable without a configured daemon.
-    #[cfg(test)]
-    pub fn with_peer_runs(
-        mut self,
-        peer_runs: Arc<dyn crate::daemon::channel_worker::RunQueue>,
-    ) -> Self {
-        self.peer_runs = Some(peer_runs);
-        self
-    }
-
-    /// Answer one remote request and record it.
-    ///
-    /// Every path through the API returns an `ApiResponse`, so this wrapper is a
-    /// real choke point â€” unlike ACP's dispatch loop, no id-to-method
-    /// bookkeeping is needed, because the request and its response are in scope
-    /// together. `handle_request` below is the original body, unchanged.
-    pub fn handle(&self, request: ApiRequest, now_ms: u64) -> ApiResponse {
-        // Captured before the body is consumed. The query string is dropped: it
-        // can carry run and session ids, and `detail_json` is covered by the
-        // hash chain and therefore permanent.
-        let action = format!(
-            "{} {}",
-            request.method,
-            request
-                .path_and_query
-                .split('?')
-                .next()
-                .unwrap_or(&request.path_and_query)
-        );
-        let device_id = request
-            .auth
-            .as_ref()
-            .map(|headers| headers.device_id.clone());
-        let response = self.handle_request(request, now_ms);
-        self.audit
-            .record(little_monkey_lib::subsystem_audit::SubsystemAction {
-                subsystem: little_monkey_lib::run_ledger::Subsystem::Remote,
-                action,
-                // A remote request is not a run â€” `run_scope::Unattributed`'s
-                // `InboundRequest` is exactly this case â€” so the ambient scope is
-                // the only honest source.
-                turn_id: None,
-                // Remote requests are signed, not permission-gated: authenticity
-                // is proven by `verify_request`, not by a `request_permission`
-                // decision, so there is none to point at.
-                permission_request_id: None,
-                outcome: little_monkey_lib::subsystem_audit::outcome_for_status(response.status),
-                // The device is which paired client acted, which is the question
-                // a reader of this row actually has. Never the body or the
-                // signature.
-                detail: device_id.map(|id| serde_json::json!({ "deviceId": id })),
-            });
-        response
-    }
-
-    /// [`Self::handle`], plus the one route that is allowed to wait.
-    ///
-    /// A phone that polled for work every few seconds would either burn its
-    /// battery or answer commands late. Long-polling the lease route fixes both
-    /// without a second general-purpose socket: the request is an ordinary
-    /// signed one, it returns the moment a command exists, and it gives up at
-    /// `wait_ms` (capped at the lease length) so no connection is held open
-    /// indefinitely. Every other route is the unchanged synchronous path.
-    pub async fn handle_waiting(&self, request: ApiRequest, now_ms: u64) -> ApiResponse {
-        let (target, deadline_ms) = match long_poll_target(&request) {
-            Some(value) => value,
-            None => return self.handle(request, now_ms),
-        };
-        // The wait happens BEFORE dispatch, and the signed request is answered
-        // exactly once at the end. Re-running it per tick would hit the replay
-        // guard on the second pass and hand back the first tick's cached "no
-        // work" answer for the rest of the wait.
-        let Some(device_id) = request
-            .auth
-            .as_ref()
-            .map(|headers| headers.device_id.clone())
-        else {
-            return self.handle(request, now_ms);
-        };
-        let started = std::time::Instant::now();
-        let mut elapsed = 0u64;
-        while elapsed < deadline_ms {
-            // An unverified device id is enough to decide *whether to wait*: it
-            // grants nothing, and the answer below still goes through the full
-            // signature, revocation and replay checks.
-            let ready = match &target {
-                LongPollTarget::Lease => {
-                    self.has_pending_device_command(&device_id, now_ms.saturating_add(elapsed))
-                }
-                LongPollTarget::Control(command_id) => {
-                    self.command_control_changed(&device_id, command_id)
-                }
-            };
-            if ready {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(
-                LONG_POLL_TICK_MS.min(deadline_ms - elapsed),
-            ))
-            .await;
-            elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        }
-        self.handle(request, now_ms.saturating_add(elapsed))
-    }
-
-    fn has_pending_device_command(&self, device_id: &str, now_ms: u64) -> bool {
-        self.store
-            .lock()
-            .ok()
-            .and_then(|store| store.pending_device_command_count(device_id, now_ms).ok())
-            .is_some_and(|count| count > 0)
-    }
-
-    /// Whether a control watcher has anything to hear yet: a cancellation
-    /// asked for, or the command having left `running` under it.
-    fn command_control_changed(&self, device_id: &str, command_id: &str) -> bool {
-        self.store
-            .lock()
-            .ok()
-            .and_then(|store| store.device_command(command_id).ok().flatten())
-            .filter(|record| record.device_id == device_id)
-            .is_none_or(|record| record.cancel_requested || record.state.terminal())
-    }
-
-    fn handle_request(&self, request: ApiRequest, now_ms: u64) -> ApiResponse {
-        if request.body.len() > MAX_REMOTE_BODY_BYTES {
-            return ApiResponse::error(413, "Remote request body exceeds 1 MiB");
-        }
-        if request.method == "POST" && request.path_and_query == "/v1/remote/pairings/accept" {
-            return self.accept_pairing(&request.body, now_ms);
-        }
-        let Some(headers) = request.auth.as_ref() else {
-            return ApiResponse::error(401, "Signed remote authentication is required");
-        };
-        if let Err(error) = headers.validate_shape(now_ms) {
-            return ApiResponse::error(401, &error);
-        }
-        let device = match self
-            .store
-            .lock()
-            .map_err(|_| "Remote state lock was poisoned".to_string())
-            .and_then(|store| {
-                store
-                    .device(&headers.device_id)?
-                    .ok_or_else(|| "Unknown remote device".to_string())
-            }) {
-            Ok(value) if value.active() => value,
-            Ok(_) => return ApiResponse::error(401, "Remote device is revoked"),
-            Err(error) => return ApiResponse::error(401, &error),
-        };
-        if device.secret_generation != headers.secret_generation {
-            return ApiResponse::error(401, "Remote key generation is stale");
-        }
-        let secret = match self.secrets.get(&device.secret_slot()) {
-            Ok(value) => value,
-            Err(error) => return ApiResponse::error(503, &error),
-        };
-        if !super::protocol::verify_request(
-            &secret,
-            headers,
-            &request.method,
-            &request.path_and_query,
-            &request.body,
-        ) {
-            self.audit_denied(
-                now_ms,
-                Some(&headers.device_id),
-                "signature",
-                None,
-                "invalid_signature",
-            );
-            return ApiResponse::error(401, "Remote request signature is invalid");
-        }
-        let request_sha256 = sha256_hex(&canonical_request(
-            headers,
-            &request.method,
-            &request.path_and_query,
-            &request.body,
-        ));
-        let reservation = match self
-            .store
-            .lock()
-            .map_err(|_| "Remote state lock was poisoned".to_string())
-            .and_then(|mut store| {
-                store.reserve_command(
-                    &headers.device_id,
-                    headers.secret_generation,
-                    &headers.command_id,
-                    &headers.nonce,
-                    headers.sequence,
-                    &request_sha256,
-                    &request.method,
-                    &request.path_and_query,
-                    now_ms,
-                )
-            }) {
-            Ok(value) => value,
-            Err(error) => {
-                self.audit_denied(
-                    now_ms,
-                    Some(&headers.device_id),
-                    "replay_guard",
-                    None,
-                    &error,
-                );
-                return ApiResponse::error(409, &error);
-            }
-        };
-        if let CommandReservation::Replay {
-            status: Some(status),
-            response_body: Some(body),
-            processing: false,
-        } = &reservation
-        {
-            return ApiResponse {
-                status: *status,
-                content_type: "application/json",
-                body: body.clone(),
-            };
-        }
-        let was_processing = matches!(
-            reservation,
-            CommandReservation::Replay {
-                processing: true,
-                ..
-            }
-        );
-        let response = self.dispatch_authorized(&request, &device, &request_sha256, now_ms);
-        if let Ok(mut store) = self.store.lock() {
-            let _ = store.complete_command(
-                &headers.device_id,
-                &headers.command_id,
-                response.status,
-                &response.body,
-                was_processing,
-                now_ms,
-            );
-        }
-        response
-    }
-
-    fn accept_pairing(&self, body: &[u8], now_ms: u64) -> ApiResponse {
-        let request: PairAcceptRequest = match serde_json::from_slice(body) {
-            Ok(value) => value,
-            Err(error) => {
-                return ApiResponse::error(400, &format!("Invalid pairing request: {error}"));
-            }
-        };
-        if request.protocol_version != REMOTE_PROTOCOL_VERSION {
-            return ApiResponse::error(400, "Unsupported remote protocol version");
-        }
-        let result = self
-            .store
-            .lock()
-            .map_err(|_| "Remote state lock was poisoned".to_string())
-            .and_then(|mut store| {
-                let accepted = store.accept_invitation(
-                    &request.pairing_id,
-                    &request.pairing_token,
-                    &request.device_name,
-                    &self.host.runner_id,
-                    now_ms,
-                    self.secrets.as_ref(),
-                )?;
-                store.audit(
-                    now_ms,
-                    Some(&accepted.device_id),
-                    "pair_accept",
-                    Some(&request.pairing_id),
-                    "allowed",
-                    Some(&sha256_hex(body)),
-                )?;
-                Ok(accepted)
-            });
-        match result {
-            Ok(value) => ApiResponse::json(201, &value),
-            Err(error) => {
-                self.audit_denied(now_ms, None, "pair_accept", None, &error);
-                ApiResponse::error(403, &error)
-            }
-        }
-    }
-
-    fn dispatch_authorized(
-        &self,
-        request: &ApiRequest,
-        device: &DeviceRecord,
-        request_sha256: &str,
-        now_ms: u64,
-    ) -> ApiResponse {
-        let scopes = &device.scopes;
-        let device_id = device.device_id.as_str();
-        let (path, query) = request
-            .path_and_query
-            .split_once('?')
-            .map_or((request.path_and_query.as_str(), ""), |value| value);
-        let segments = path
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .collect::<Vec<_>>();
-        let result = match (request.method.as_str(), segments.as_slice()) {
-            ("GET", ["v1", "remote", "runs"]) => {
-                require_action(scopes, RemoteAction::ViewRuns).and_then(|_| self.list_runs(scopes))
-            }
-            ("GET", ["v1", "remote", "runs", run_id]) => {
-                require_action(scopes, RemoteAction::ViewRuns)
-                    .and_then(|_| self.run_detail(scopes, run_id))
-            }
-            ("GET", ["v1", "remote", "runs", run_id, "events"]) => {
-                require_action(scopes, RemoteAction::ViewEvents)
-                    .and_then(|_| self.run_events(scopes, run_id, query))
-            }
-            ("GET", ["v1", "remote", "runs", run_id, "approvals"]) => {
-                require_action(scopes, RemoteAction::ViewRuns)
-                    .and_then(|_| self.run_approvals(scopes, run_id))
-            }
-            ("GET", ["v1", "remote", "runs", run_id, "artifacts", artifact_id]) => {
-                require_action(scopes, RemoteAction::ReadArtifacts)
-                    .and_then(|_| self.artifact(scopes, run_id, artifact_id))
-            }
-            ("POST", ["v1", "remote", "runs", run_id, "approve"]) => {
-                require_action(scopes, RemoteAction::Approve)
-                    .and_then(|_| self.approve(scopes, run_id, &request.body, device_id, now_ms))
-            }
-            ("POST", ["v1", "remote", "runs", run_id, "cancel"]) => {
-                require_action(scopes, RemoteAction::Cancel)
-                    .and_then(|_| self.cancel(scopes, run_id, &request.body, now_ms))
-            }
-            ("POST", ["v1", "remote", "runs", run_id, "pause"]) => {
-                require_action(scopes, RemoteAction::Pause)
-                    .and_then(|_| self.set_paused(scopes, run_id, true, now_ms))
-            }
-            ("POST", ["v1", "remote", "runs", run_id, "resume"]) => {
-                require_action(scopes, RemoteAction::Pause)
-                    .and_then(|_| self.set_paused(scopes, run_id, false, now_ms))
-            }
-            ("POST", ["v1", "remote", "kill"]) => require_action(scopes, RemoteAction::Kill)
-                .and_then(|_| self.kill(device_id, now_ms)),
-            ("POST", ["v1", "remote", "desktop-control", "start"]) => {
-                require_action(scopes, RemoteAction::ControlDesktop)
-                    .and_then(|_| self.desktop_control_start(&request.body, device_id))
-            }
-            ("POST", ["v1", "remote", "desktop-control", "action"]) => {
-                require_action(scopes, RemoteAction::ControlDesktop)
-                    .and_then(|_| self.desktop_control_action(&request.body, device_id))
-            }
-            ("POST", ["v1", "remote", "desktop-control", "list-targets"]) => {
-                require_action(scopes, RemoteAction::ControlDesktop)
-                    .and_then(|_| self.desktop_control_list_targets(&request.body, device_id))
-            }
-            ("POST", ["v1", "remote", "desktop-control", "inspect"]) => {
-                require_action(scopes, RemoteAction::ControlDesktop)
-                    .and_then(|_| self.desktop_control_inspect(&request.body, device_id))
-            }
-            ("POST", ["v1", "remote", "desktop-control", "screenshot"]) => {
-                require_action(scopes, RemoteAction::ControlDesktop)
-                    .and_then(|_| self.desktop_control_screenshot(&request.body, device_id))
-            }
-            ("POST", ["v1", "remote", "desktop-control", "clipboard-read"]) => {
-                require_action(scopes, RemoteAction::ControlDesktop)
-                    .and_then(|_| self.desktop_control_clipboard_read(&request.body, device_id))
-            }
-            ("POST", ["v1", "remote", "desktop-control", "pause"]) => {
-                require_action(scopes, RemoteAction::ControlDesktop)
-                    .and_then(|_| self.desktop_control_pause(&request.body, device_id, true))
-            }
-            ("POST", ["v1", "remote", "desktop-control", "resume"]) => {
-                require_action(scopes, RemoteAction::ControlDesktop)
-                    .and_then(|_| self.desktop_control_pause(&request.body, device_id, false))
-            }
-            ("POST", ["v1", "remote", "desktop-control", "stop"]) => {
-                require_action(scopes, RemoteAction::ControlDesktop)
-                    .and_then(|_| self.desktop_control_stop(&request.body, device_id))
-            }
-            // --- Versioned `/v1/remote/mobile/*` extension (first-party
-            // mobile companion). Chat and workflow launch use the dedicated
-            // capability grant; a legacy pairing without capabilities
-            // resolves through `legacy_capabilities`, which never includes
-            // the mobile-only grants â€” so an old runner pairing cannot be
-            // escalated into a chat surface by a client-side update.
-            ("GET", ["v1", "remote", "mobile", "sessions"]) => {
-                require_capability(device, DeviceCapability::ViewSessions)
-                    .and_then(|_| self.mobile_sessions())
-            }
-            ("GET", ["v1", "remote", "mobile", "sessions", session_id, "messages"]) => {
-                require_capability(device, DeviceCapability::ViewSessions)
-                    .and_then(|_| self.mobile_messages_get(session_id, now_ms))
-            }
-            ("POST", ["v1", "remote", "mobile", "sessions", session_id, "messages"]) => {
-                require_capability(device, DeviceCapability::Chat).and_then(|_| {
-                    self.mobile_message_post(
-                        session_id,
-                        &request.body,
-                        device_id,
-                        request_sha256,
-                        now_ms,
-                    )
-                })
-            }
-            ("GET", ["v1", "remote", "mobile", "workflows"]) => {
-                require_capability(device, DeviceCapability::ViewTasks)
-                    .and_then(|_| self.mobile_workflows())
-            }
-            ("POST", ["v1", "remote", "mobile", "workflows", workflow_id, "runs"]) => {
-                require_capability(device, DeviceCapability::RunWorkflows)
-                    .and_then(|_| self.mobile_workflow_launch(workflow_id, device_id, now_ms))
-            }
-            ("POST", ["v1", "remote", "mobile", "captures"]) => {
-                require_capability(device, DeviceCapability::Capture).and_then(|_| {
-                    self.mobile_capture_post(&request.body, device, request_sha256, now_ms)
-                })
-            }
-            // --- Versioned `/v1/remote/device/*` plane: the runner asking the
-            // phone's own hardware for something.
-            //
-            // The first three routes are gated by device authentication alone
-            // and by no capability. That is deliberate and is not a hole:
-            // advertising a surface can only ever *narrow* what is effective
-            // (see `protocol::effective_capabilities`), reading one's own grant
-            // record discloses nothing the device was not already told at
-            // pairing, and the queue hands out only commands already queued
-            // *for this device* â€” each of which was capability-checked when it
-            // was queued and is re-checked at lease time below. Requiring a
-            // grant to advertise would instead deadlock the design: a device
-            // granted only `camera_capture` could never advertise a camera, so
-            // the camera would never become effective.
-            //
-            // What they are *not* gated by is peer standing, which is why each
-            // one refuses a peer-only pairing outright below: a peer has no
-            // hardware here, nothing is ever queued for it, and nothing about
-            // the plane that serves a phone should answer it at all. Without
-            // that, "a peer reaches only the peer plane" would be true of the
-            // routes that happen to check a capability and false of the ones
-            // that deliberately do not.
-            ("POST", ["v1", "remote", "device", "surface"]) => refuse_peer_only(device)
-                .and_then(|_| self.device_surface_post(&request.body, device, now_ms)),
-            ("GET", ["v1", "remote", "device", "state"]) => {
-                refuse_peer_only(device).and_then(|_| self.device_state(device))
-            }
-            ("GET", ["v1", "remote", "device", "commands", "next"]) => {
-                refuse_peer_only(device).and_then(|_| self.device_command_lease(device, now_ms))
-            }
-            // Reconciliation, never a second lease: the commands this device
-            // started and never finished, so a reconnect can deliver a staged
-            // result or say honestly that the outcome is unknown.
-            ("GET", ["v1", "remote", "device", "commands", "recover"]) => {
-                refuse_peer_only(device).and_then(|_| self.device_commands_recover(device, now_ms))
-            }
-            ("GET", ["v1", "remote", "device", "commands", command_id, "control"]) => {
-                self.device_command_control(device, command_id, now_ms)
-            }
-            ("POST", ["v1", "remote", "device", "commands", command_id, "start"]) => {
-                self.device_command_start(&request.body, device, command_id, now_ms)
-            }
-            ("POST", ["v1", "remote", "device", "commands", command_id, "result"]) => {
-                self.device_command_result(&request.body, device, command_id, now_ms)
-            }
-            // The audio of a live stream, while its control command is still
-            // running. Gated on the grant â€” an operator who revokes
-            // `voice_stream` mid-stream closes the microphone with the next
-            // chunk â€” and on owning the session, which the device was told
-            // about in the command it leased and never invents for itself.
-            ("POST", ["v1", "remote", "device", "voice", session_id, "chunk"]) => {
-                require_capability(device, DeviceCapability::VoiceStream)
-                    .and_then(|_| self.voice_chunk(&request.body, device, session_id, now_ms))
-            }
-            ("POST", ["v1", "remote", "device", "voice", session_id, "close"]) => {
-                require_capability(device, DeviceCapability::VoiceStream)
-                    .and_then(|_| self.voice_close(&request.body, device, session_id, now_ms))
-            }
-            // A live conversation, not a recording. The ticket is the whole of
-            // the authentication story for the socket that follows: a browser
-            // cannot put signed headers on a WebSocket handshake, so the device
-            // proves itself here â€” with the same signature, sequence, nonce and
-            // key generation as any other route â€” and receives a one-use,
-            // 30-second bearer it immediately spends. See `consume_talk_ticket`.
-            ("POST", ["v1", "remote", "device", "talk", "ticket"]) => {
-                require_capability(device, DeviceCapability::VoiceStream)
-                    .and_then(|_| self.talk_ticket(&request.body, device, request_sha256, now_ms))
-            }
-            // The upgrade itself never reaches this match â€” `server.rs` answers
-            // it before a body is collected. A *signed* GET that is not an
-            // upgrade does reach here, and is told what it is missing rather
-            // than 404ing on a route the contract publishes.
-            ("GET", ["v1", "remote", "device", "talk", session_id, "stream"]) => {
-                require_capability(device, DeviceCapability::VoiceStream)
-                    .and_then(|_| self.talk_stream_needs_upgrade(session_id))
-            }
-            // Registering where to reach this device, and withdrawing it. Both
-            // self-service for the same reason as the routes above: a push
-            // address grants nothing â€” a woken device still has to make an
-            // ordinary signed request â€” and a device must always be able to
-            // stop being woken.
-            ("GET", ["v1", "remote", "device", "push", "key"]) => {
-                refuse_peer_only(device).and_then(|_| self.device_push_key())
-            }
-            ("POST", ["v1", "remote", "device", "push"]) => refuse_peer_only(device)
-                .and_then(|_| self.device_push_register(&request.body, device_id, now_ms)),
-            ("DELETE", ["v1", "remote", "device", "push"]) => {
-                refuse_peer_only(device).and_then(|_| self.device_push_forget(device_id))
-            }
-            // --- Versioned `/v1/remote/node/*` placement plane (roadmap K17).
-            // A second plane beside the control plane above, sharing only this
-            // transport. The control-plane routes act on runs the node already
-            // holds; these are the only ones through which a run authored
-            // elsewhere can arrive.
-            ("GET", ["v1", "remote", "node"]) => {
-                require_capability(device, DeviceCapability::DescribeNode)
-                    .and_then(|_| self.node_descriptor())
-            }
-            ("GET", ["v1", "remote", "node", "health"]) => {
-                require_capability(device, DeviceCapability::DescribeNode)
-                    .and_then(|_| self.node_health(now_ms))
-            }
-            ("POST", ["v1", "remote", "node", "runs"]) => {
-                require_capability(device, DeviceCapability::PlaceRuns)
-                    .and_then(|_| self.place_run(&request.body, device_id, request_sha256, now_ms))
-            }
-            ("GET", ["v1", "remote", "node", "runs", submitted_run_id]) => {
-                require_capability(device, DeviceCapability::DescribeNode)
-                    .and_then(|_| self.placed_run_status(device_id, submitted_run_id))
-            }
-            // Live migration (roadmap K18) sits on the placement plane rather
-            // than beside it: a migration *is* a placement â€” a `RunSpec` this
-            // node did not author â€” plus the frozen image that turns it into a
-            // continuation. `GET /v1/remote/node` above is what an origin reads
-            // to choose a target, so migration needs no describe route of its own.
-            ("POST", ["v1", "remote", "node", "migration", "preflight"]) => {
-                require_capability(device, DeviceCapability::Migrate)
-                    .and_then(|_| self.migration_preflight(&request.body, now_ms))
-            }
-            ("POST", ["v1", "remote", "node", "migration", "accept"]) => {
-                require_capability(device, DeviceCapability::Migrate)
-                    .and_then(|_| self.migration_accept(&request.body, now_ms))
-            }
-            // --- Versioned `/v1/remote/peer/*` peer plane.
-            // A third plane. The control plane acts on this node's runs, the
-            // placement plane accepts a spec another owned node authored, and
-            // this one accepts *words* from a peer that then run under this
-            // node's own recipe. Peer standing implies nothing on the other
-            // two: none of these arms consults `scopes`.
-            ("POST", ["v1", "remote", "peer", "messages"]) => require_any_peer_capability(device)
-                .and_then(|_| self.peer_message_post(device, &request.body, now_ms)),
-            ("GET", ["v1", "remote", "peer", "threads", thread_id]) => {
-                require_any_peer_capability(device)
-                    .and_then(|_| self.peer_thread_get(device, thread_id, now_ms))
-            }
-            ("POST", ["v1", "remote", "peer", "hello"]) => require_any_peer_capability(device)
-                .and_then(|_| self.peer_hello_post(device, &request.body, now_ms)),
-            ("POST", ["v1", "remote", "peer", "artifacts"]) => {
-                require_capability(device, DeviceCapability::PeerArtifact)
-                    .and_then(|_| self.peer_artifact_post(device, &request.body, now_ms))
-            }
-            // Self-revocation needs no extra capability: a device may always
-            // sever itself. The store path force-stops any live desktop
-            // session the device owns, exactly like an operator revoke.
-            ("DELETE", ["v1", "remote", "mobile", "devices", "self"]) => {
-                self.mobile_revoke_self(device_id, now_ms)
-            }
-            _ => Err((404, "Unknown remote runner endpoint".to_string())),
-        };
-        let (response, outcome, target) = match result {
-            Ok((status, value, target)) => (ApiResponse::json(status, &value), "allowed", target),
-            Err((status, error)) => (
-                ApiResponse::error(status, &error),
-                if status == 403 {
-                    "scope_denied"
-                } else {
-                    "rejected"
-                },
-                None,
-            ),
-        };
-        if let Ok(mut store) = self.store.lock() {
-            let _ = store.audit(
-                now_ms,
-                Some(device_id),
-                &format!("{} {}", request.method, path),
-                target.as_deref(),
-                outcome,
-                Some(request_sha256),
-            );
-        }
-        response
-    }
-
-    fn list_runs(
-        &self,
-        scopes: &RemoteScopes,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let ledger = self.run_ledger()?;
-        let runs = ledger.list_runs(1_000, false).map_err(internal)?;
-        let shared = SharedLedger::open(&self.paths.ledger_db).map_err(internal)?;
-        let summaries = runs
-            .iter()
-            .filter(|run| scopes.permits_run(run))
-            .map(|run| summarize(run, &shared))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(internal)?;
-        Ok((
-            200,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "runs": summaries,
-            }),
-            None,
-        ))
-    }
-
-    fn run_detail(
-        &self,
-        scopes: &RemoteScopes,
-        run_id: &str,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let run = self.authorized_run(scopes, run_id)?;
-        let shared = SharedLedger::open(&self.paths.ledger_db).map_err(internal)?;
-        let summary = summarize(&run, &shared).map_err(internal)?;
-        // Whether a pause is in effect, so a controller offers *resume* on a
-        // paused run rather than pause again. It lives on the daemon's job
-        // rather than in the run's status, and it is read here rather than in
-        // `summarize` because the run list does not need it and would pay a
-        // second database open per row for it. A machine whose daemon store
-        // cannot be opened reports `false`: "not paused" is the state every
-        // caller already handles, and refusing to describe a run because its
-        // pause flag is unreadable would be a worse answer than a missing
-        // button.
-        let paused = DaemonStore::open(&self.paths)
-            .ok()
-            .and_then(|store| store.get_job(run_id).ok().flatten())
-            .is_some_and(|job| job.pause_requested);
-        // RunSpec contains only keychain references, never provider keys.
-        Ok((
-            200,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "run": summary,
-                "paused": paused,
-                "spec": run.spec,
-            }),
-            Some(run_id.to_string()),
-        ))
-    }
-
-    fn run_events(
-        &self,
-        scopes: &RemoteScopes,
-        run_id: &str,
-        query: &str,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        self.authorized_run(scopes, run_id)?;
-        let query = parse_query(query)?;
-        let after = query
-            .get("after")
-            .map(|value| value.parse::<u64>())
-            .transpose()
-            .map_err(|_| (400, "Invalid event cursor".to_string()))?
-            .unwrap_or(0);
-        let limit = query
-            .get("limit")
-            .map(|value| value.parse::<usize>())
-            .transpose()
-            .map_err(|_| (400, "Invalid event limit".to_string()))?
-            .unwrap_or(256)
-            .min(1_000);
-        let events = self
-            .run_ledger()?
-            .load_events(run_id, after, limit)
-            .map_err(internal)?;
-        let next_cursor = events.last().map(|event| event.sequence).unwrap_or(after);
-        Ok((
-            200,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "run_id": run_id,
-                "after": after,
-                "next_cursor": next_cursor,
-                "events": events,
-            }),
-            Some(run_id.to_string()),
-        ))
-    }
-
-    fn run_approvals(
-        &self,
-        scopes: &RemoteScopes,
-        run_id: &str,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        self.authorized_run(scopes, run_id)?;
-        let approvals = SharedLedger::open(&self.paths.ledger_db)
-            .and_then(|shared| shared.pending_approvals(run_id))
-            .map_err(internal)?;
-        Ok((
-            200,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "run_id": run_id,
-                "approvals": approvals.iter().map(approval_json).collect::<Vec<_>>(),
-            }),
-            Some(run_id.to_string()),
-        ))
-    }
-
-    fn artifact(
-        &self,
-        scopes: &RemoteScopes,
-        run_id: &str,
-        artifact_id: &str,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        self.authorized_run(scopes, run_id)?;
-        super::protocol::validate_id(artifact_id).map_err(|error| (400, error))?;
-        let connection = rusqlite::Connection::open(&self.paths.ledger_db).map_err(internal)?;
-        let artifact = connection
-            .query_row(
-                "SELECT name,media_type,content_sha256,size_bytes FROM artifacts
-                 WHERE artifact_id=?1 AND run_id=?2",
-                rusqlite::params![artifact_id, run_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                },
-            )
-            .map_err(|error| match error {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    (404, "Artifact is not linked to this run".to_string())
-                }
-                other => internal(other),
-            })?;
-        let size =
-            u64::try_from(artifact.3).map_err(|_| internal("Stored artifact size is invalid"))?;
-        if size > scopes.max_artifact_bytes {
-            return Err((
-                413,
-                "Artifact exceeds this controller's paired byte budget".to_string(),
-            ));
-        }
-        let app_data = self
-            .paths
-            .root
-            .parent()
-            .ok_or_else(|| internal("Daemon root has no app-data parent"))?;
-        let store = ArtifactStore::with_max_blob_size(
-            app_data.join("content-v1"),
-            scopes.max_artifact_bytes,
-        )
-        .map_err(internal)?;
-        let bytes = store.read(&artifact.2).map_err(internal)?;
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != size {
-            return Err(internal(
-                "Artifact ledger size does not match verified blob",
-            ));
-        }
-        Ok((
-            200,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "artifact_id": artifact_id,
-                "run_id": run_id,
-                "name": artifact.0,
-                "media_type": artifact.1,
-                "content_sha256": artifact.2,
-                "size_bytes": size,
-                "content_base64": STANDARD.encode(bytes),
-            }),
-            Some(format!("{run_id}:{artifact_id}")),
-        ))
-    }
-
-    fn approve(
-        &self,
-        scopes: &RemoteScopes,
-        run_id: &str,
-        body: &[u8],
-        device_id: &str,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        self.authorized_run(scopes, run_id)?;
-        let body: ApprovalRequestBody = serde_json::from_slice(body)
-            .map_err(|error| (400, format!("Invalid approval request: {error}")))?;
-        let decision = match body.decision.as_str() {
-            "allow_once" => PermissionDecision::AllowOnce,
-            "allow_for_run" => PermissionDecision::AllowForRun,
-            "deny" => PermissionDecision::Deny,
-            _ => return Err((400, "Unsupported approval decision".to_string())),
-        };
-        let ledger = self.run_ledger()?;
-        let approval = ledger
-            .load_approval(run_id, &body.request_id)
-            .map_err(internal)?
-            .ok_or_else(|| (404, "Unknown approval request".to_string()))?;
-        if approval.operation_sha256 != body.operation_sha256 {
-            return Err((403, "Approval operation digest does not match".to_string()));
-        }
-        if let Some(existing) = approval.decision {
-            if existing == decision {
-                return Ok((
-                    200,
-                    serde_json::json!({"status":"already_decided","decision":body.decision}),
-                    Some(run_id.to_string()),
-                ));
-            }
-            return Err((409, "Approval was already decided differently".to_string()));
-        }
-        if now_ms >= approval.expires_at_ms {
-            return Err((409, "Approval request has expired".to_string()));
-        }
-        let shared = SharedLedger::open(&self.paths.ledger_db).map_err(internal)?;
-        let recorder = control_recorder(&shared, run_id, device_id).map_err(internal)?;
-        recorder
-            .emit(RunEvent::PermissionDecided {
-                request_id: body.request_id,
-                operation_sha256: body.operation_sha256,
-                decision,
-                decided_by: recorder.client_identity(),
-            })
-            .map_err(internal)?;
-        Ok((
-            200,
-            serde_json::json!({"status":"decided","decision":body.decision}),
-            Some(run_id.to_string()),
-        ))
-    }
-
-    fn cancel(
-        &self,
-        scopes: &RemoteScopes,
-        run_id: &str,
-        body: &[u8],
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let run = self.authorized_run(scopes, run_id)?;
-        let body: CancelRequestBody = serde_json::from_slice(body)
-            .map_err(|error| (400, format!("Invalid cancellation request: {error}")))?;
-        if run.status.is_terminal() {
-            return Ok((
-                200,
-                serde_json::json!({"status":"already_terminal"}),
-                Some(run_id.to_string()),
-            ));
-        }
-        let mut store = DaemonStore::open(&self.paths).map_err(internal)?;
-        store.request_cancel(run_id, now_ms).map_err(internal)?;
-        super::super::append_cancellation(
-            &self.paths,
-            run_id,
-            body.reason
-                .as_deref()
-                .unwrap_or("Cancelled by paired controller"),
-        )
-        .map_err(internal)?;
-        Ok((
-            202,
-            serde_json::json!({"status":"cancellation_requested"}),
-            Some(run_id.to_string()),
-        ))
-    }
-
-    /// Suspend or resume a run without ending it.
-    ///
-    /// The gap this closes: the daemon has supported pause locally since it had
-    /// a `pause_requested` bit, but the remote protocol had no action for it, so
-    /// a paired controller's only way to stop a run consuming the machine was to
-    /// cancel it â€” destroying the work to stop it temporarily.
-    ///
-    /// Writes only the daemon's own bit, exactly as the local path does. Intent
-    /// flows one way â€” latch to daemon bits, never the reverse â€” because
-    /// `daemon_jobs` and `agent_processes` live in different databases with no
-    /// transaction spanning them, so two writers would be a race with no
-    /// arbitration primitive.
-    fn set_paused(
-        &self,
-        scopes: &RemoteScopes,
-        run_id: &str,
-        paused: bool,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let run = self.authorized_run(scopes, run_id)?;
-        // A terminal run is reported rather than errored, matching `cancel`: the
-        // controller asked for a state the run is already past, which is not a
-        // failure on its part.
-        if run.status.is_terminal() {
-            return Ok((
-                200,
-                serde_json::json!({"status":"already_terminal"}),
-                Some(run_id.to_string()),
-            ));
-        }
-        let mut store = DaemonStore::open(&self.paths).map_err(internal)?;
-        // `request_pause` refuses a terminal job itself, so a race between the
-        // check above and this call still cannot resurrect finished work.
-        store
-            .request_pause(run_id, paused, now_ms)
-            .map_err(|error| (409, error))?;
-        Ok((
-            202,
-            serde_json::json!({
-                "status": if paused { "pause_requested" } else { "resume_requested" }
-            }),
-            Some(run_id.to_string()),
-        ))
-    }
-
-    fn kill(
-        &self,
-        device_id: &str,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let mut store = DaemonStore::open(&self.paths).map_err(internal)?;
-        store.set_kill_switch(true).map_err(internal)?;
-        let cancelled = store.request_cancel_all(now_ms).map_err(internal)?;
-        // Engaging the kill switch must also force-stop any live desktop
-        // control session right away, in-process, rather than waiting for the
-        // serve loop's next enforcement tick.
-        let desktop_sessions_stopped = self
-            .desktop
-            .as_ref()
-            .map(|runtime| runtime.emergency_stop_all())
-            .unwrap_or(0);
-        Ok((
-            202,
-            serde_json::json!({
-                "status":"kill_switch_engaged",
-                "requested_by":device_id,
-                "cancelled_runs":cancelled,
-                "desktop_sessions_stopped":desktop_sessions_stopped,
-            }),
-            None,
-        ))
-    }
-
-    fn desktop_control_start(
-        &self,
-        body: &[u8],
-        device_id: &str,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let runtime = self.require_desktop()?;
-        let request: DesktopControlStartRequest =
-            serde_json::from_slice(body).map_err(|error| {
-                (
-                    400,
-                    format!("Invalid desktop-control start request: {error}"),
-                )
-            })?;
-        // The consent prompt runs inside `runtime.start` before any session is
-        // created â€” the human-visible gate on the runner itself.
-        let value = runtime.start_with_options(
-            device_id,
-            &self.device_label(device_id),
-            request.allowlist,
-            request.batch_mode,
-            request.allowed_windows,
-            request
-                .lifetime_ms
-                .unwrap_or(little_monkey_lib::desktop_control::MAX_SESSION_LIFETIME_MS),
-            request.allow_screenshots.unwrap_or(false),
-            request.allow_keyboard_input.unwrap_or(false),
-            request.allow_clipboard_read.unwrap_or(false),
-            request.approval_policy,
-        )?;
-        Ok((201, value, Some(device_id.to_string())))
-    }
-
-    fn desktop_control_action(
-        &self,
-        body: &[u8],
-        device_id: &str,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let runtime = self.require_desktop()?;
-        let request: DesktopControlActionRequest =
-            serde_json::from_slice(body).map_err(|error| {
-                (
-                    400,
-                    format!("Invalid desktop-control action request: {error}"),
-                )
-            })?;
-        let target = request.session_id.clone();
-        let value = runtime.action(device_id, &self.device_label(device_id), request)?;
-        Ok((200, value, Some(target)))
-    }
-
-    fn desktop_control_list_targets(
-        &self,
-        body: &[u8],
-        device_id: &str,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let runtime = self.require_desktop()?;
-        let request: DesktopControlTargetRequest =
-            serde_json::from_slice(body).map_err(|error| {
-                (
-                    400,
-                    format!("Invalid desktop-control list-targets request: {error}"),
-                )
-            })?;
-        let target = request.session_id.clone();
-        let value = runtime.list_targets(device_id, &request.session_id)?;
-        Ok((200, value, Some(target)))
-    }
-
-    fn desktop_control_inspect(
-        &self,
-        body: &[u8],
-        device_id: &str,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let runtime = self.require_desktop()?;
-        let request: DesktopControlTargetRequest =
-            serde_json::from_slice(body).map_err(|error| {
-                (
-                    400,
-                    format!("Invalid desktop-control inspect request: {error}"),
-                )
-            })?;
-        let target = request.session_id.clone();
-        let value = runtime.inspect(device_id, request)?;
-        Ok((200, value, Some(target)))
-    }
-
-    fn desktop_control_screenshot(
-        &self,
-        body: &[u8],
-        device_id: &str,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let runtime = self.require_desktop()?;
-        let request: DesktopControlTargetRequest =
-            serde_json::from_slice(body).map_err(|error| {
-                (
-                    400,
-                    format!("Invalid desktop-control screenshot request: {error}"),
-                )
-            })?;
-        let target = request.session_id.clone();
-        let value = runtime.screenshot(device_id, request)?;
-        Ok((200, value, Some(target)))
-    }
-
-    fn desktop_control_clipboard_read(
-        &self,
-        body: &[u8],
-        device_id: &str,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let runtime = self.require_desktop()?;
-        let request: DesktopControlTargetRequest =
-            serde_json::from_slice(body).map_err(|error| {
-                (
-                    400,
-                    format!("Invalid desktop-control clipboard-read request: {error}"),
-                )
-            })?;
-        let target = request.session_id.clone();
-        let value = runtime.clipboard_read(device_id, request)?;
-        Ok((200, value, Some(target)))
-    }
-
-    fn desktop_control_pause(
-        &self,
-        body: &[u8],
-        device_id: &str,
-        paused: bool,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let runtime = self.require_desktop()?;
-        let request: DesktopControlStopRequest = serde_json::from_slice(body).map_err(|error| {
-            (
-                400,
-                format!("Invalid desktop-control pause/resume request: {error}"),
-            )
-        })?;
-        let target = request.session_id.clone();
-        let value = runtime.pause(device_id, &request.session_id, paused)?;
-        Ok((200, value, Some(target)))
-    }
-
-    fn desktop_control_stop(
-        &self,
-        body: &[u8],
-        device_id: &str,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let runtime = self.require_desktop()?;
-        let request: DesktopControlStopRequest = serde_json::from_slice(body).map_err(|error| {
-            (
-                400,
-                format!("Invalid desktop-control stop request: {error}"),
-            )
-        })?;
-        let target = request.session_id.clone();
-        let value = runtime.stop(device_id, &request.session_id)?;
-        Ok((200, value, Some(target)))
-    }
-
-    fn require_desktop(&self) -> Result<&Arc<DesktopControlRuntime>, (u16, String)> {
-        self.desktop.as_ref().ok_or_else(|| {
-            (
-                503,
-                "Desktop control is not available on this runner".to_string(),
-            )
-        })
-    }
-
-    /// The paired device's human label, used in the local consent dialog.
-    /// Falls back to the opaque id if the record is unreadable.
-    fn device_label(&self, device_id: &str) -> String {
-        self.store
-            .lock()
-            .ok()
-            .and_then(|store| store.device(device_id).ok().flatten())
-            .map(|device| device.device_name)
-            .unwrap_or_else(|| device_id.to_string())
-    }
-
-    fn authorized_run(
-        &self,
-        scopes: &RemoteScopes,
-        run_id: &str,
-    ) -> Result<StoredRun, (u16, String)> {
-        super::protocol::validate_id(run_id).map_err(|error| (400, error))?;
-        let run = self
-            .run_ledger()?
-            .load_run(run_id)
-            .map_err(internal)?
-            .ok_or_else(|| (404, "Unknown durable run".to_string()))?;
-        if !scopes.permits_run(&run) {
-            // Do not reveal whether an out-of-scope run exists.
-            return Err((404, "Unknown durable run".to_string()));
-        }
-        Ok(run)
-    }
-
-    fn run_ledger(&self) -> Result<RunLedger, (u16, String)> {
-        RunLedger::open(&self.paths.ledger_db).map_err(internal)
-    }
-
-    // --- `/v1/remote/node` and `/v1/remote/migration/*` (roadmap K18) -------
-
-    /// The app data directory this node's desktop half also uses.
-    ///
-    /// A migration writes into the *desktop's* checkpoint directory and session
-    /// file on purpose: the thing that finally resumes a frozen turn is the
-    /// desktop's own K13 re-entry, and it reads those two places. Landing the
-    /// image anywhere else would make the daemon the only reader of a state
-    /// whose whole point is being resumed.
-    fn app_data_dir(&self) -> Result<&std::path::Path, (u16, String)> {
-        self.paths.ledger_db.parent().ok_or_else(|| {
-            (
-                500,
-                "This node's ledger path has no app-data parent".to_string(),
-            )
-        })
-    }
-
-    /// Collapses K17's node descriptor into what [`admit`] asks about.
-    ///
-    /// Built from `describe_node` rather than from a second probe, so a
-    /// migration is admitted against exactly the facts an origin read from
-    /// `GET /v1/remote/node` when it chose this target.
-    ///
-    /// **Installed rather than loaded, deliberately.** K13's `ModelNotResident`
-    /// asks what the *next round trip would reach*, which on the machine running
-    /// the turn is what is loaded. A target node is idle by definition â€” it has
-    /// loaded nothing â€” so asking the residency question here would refuse every
-    /// migration to every idle node. What a target can honestly promise is that
-    /// the model is present and will load; what it still refuses is a model it
-    /// does not have at all.
-    fn migration_target(
-        &self,
-        descriptor: &little_monkey_lib::node_placement::NodeDescriptor,
-        run_present: bool,
-    ) -> (Vec<String>, Vec<String>, bool) {
-        let mut models = descriptor
-            .resident_models
-            .iter()
-            .map(|model| model.model_id.clone())
-            .collect::<Vec<_>>();
-        models.sort();
-        models.dedup();
-        let mut runtimes = descriptor
-            .resident_models
-            .iter()
-            .map(|model| model.runtime.clone())
-            .collect::<Vec<_>>();
-        runtimes.sort();
-        runtimes.dedup();
-        (models, runtimes, run_present)
-    }
-
-    /// Answers "would you take this?" from metadata alone, before any bytes move.
-    ///
-    /// An optimisation and never the authority: `migration_accept` runs the very
-    /// same `admit` against the very same header. A target that trusted a
-    /// preflight would be trusting the *sender's* copy of facts about itself.
-    fn migration_preflight(
-        &self,
-        body: &[u8],
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let request: MigrationPreflightRequest = serde_json::from_slice(body)
-            .map_err(|error| (400, format!("Invalid migration preflight: {error}")))?;
-        if request.protocol_version != REMOTE_PROTOCOL_VERSION {
-            return Err((400, "Unsupported remote protocol version".to_string()));
-        }
-        let (verdict, descriptor) = self.admit_migration(&request.header, now_ms)?;
-        Ok((
-            200,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "node": descriptor,
-                "verdict": verdict,
-            }),
-            Some(request.header.run_id),
-        ))
-    }
-
-    /// The one admission decision, run identically by both migration routes.
-    ///
-    /// Returns the descriptor alongside the verdict because a refusal is only
-    /// actionable next to the facts it was made against â€” "this node does not
-    /// have that model" is answerable, "refused" is not.
-    fn admit_migration(
-        &self,
-        header: &little_monkey_lib::migration::MigrationHeader,
-        now_ms: u64,
-    ) -> Result<
-        (
-            MigrationVerdict,
-            little_monkey_lib::node_placement::NodeDescriptor,
-        ),
-        (u16, String),
-    > {
-        let descriptor = self.describe_node(now_ms)?;
-        let run_present = self
-            .run_ledger()?
-            .load_run(&header.run_id)
-            .map_err(internal)?
-            .is_some();
-        let (models, runtimes, run_present) = self.migration_target(&descriptor, run_present);
-        let verdict = admit(
-            header,
-            &TargetNode {
-                node_id: &descriptor.runner_id,
-                resident_models: &models,
-                runtime_ids: &runtimes,
-                // No live approvals: this node has granted the incoming process
-                // none, which is exactly why an image frozen with an outstanding
-                // one is refused rather than resumed past a permission nobody
-                // here gave.
-                live_approvals: &[],
-                // K17's rule, applied to a move: the *origin* states the
-                // residency it required and this node checks it against its own
-                // rather than trusting it â€” because a rule only the sender
-                // enforces is not enforced, and an alias can start pointing at a
-                // different host.
-                residency: &descriptor.residency,
-                max_payload_bytes: MAX_MIGRATION_PAYLOAD_BYTES,
-                run_present,
-            },
-        );
-        Ok((verdict, descriptor))
-    }
-
-    /// Takes the image, or refuses it â€” and on success leaves this node in the
-    /// exact state its desktop half's K13 re-entry reads.
-    fn migration_accept(
-        &self,
-        body: &[u8],
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let request: MigrationAcceptRequest = serde_json::from_slice(body)
-            .map_err(|error| (400, format!("Invalid migration image: {error}")))?;
-        if request.protocol_version != REMOTE_PROTOCOL_VERSION {
-            return Err((400, "Unsupported remote protocol version".to_string()));
-        }
-        let image = request.image;
-        // Structural first, capability second: a malformed image is a bad
-        // request on any node and must not be reported as a refusal this node
-        // could be reconfigured out of.
-        image.validate().map_err(|error| (400, error))?;
-        // The same gate K17's placement route applies, and for its reason: a run
-        // must not arrive while the operator has stopped this machine.
-        if DaemonStore::open(&self.paths)
-            .map_err(internal)?
-            .kill_switch()
-            .map_err(internal)?
-        {
-            return Err((409, "Global kill switch is engaged".to_string()));
-        }
-        let (verdict, descriptor) = self.admit_migration(&image.header, now_ms)?;
-        let MigrationVerdict::Acceptable { .. } = &verdict else {
-            // 409, not 400: the image is well-formed and this node simply
-            // cannot satisfy it. The blockers say what would have to change.
-            return Ok((
-                409,
-                serde_json::json!({
-                    "protocol_version": REMOTE_PROTOCOL_VERSION,
-                    "node": descriptor,
-                    "verdict": verdict,
-                }),
-                Some(image.header.run_id.clone()),
-            ));
-        };
-        let mut ledger = self.run_ledger()?;
-
-        // The run row comes from the *origin's* frozen spec, unmodified, and it
-        // goes in *first*. That is what makes the policy travel: the allowlist
-        // this node enforces and the budgets it charges are the ones the origin
-        // declared, and `egress.rs` resolves them by run id against this node's
-        // own ledger from here on. First rather than after the landing because
-        // the process row the landing creates references it â€” a foreign key,
-        // which is the schema saying the same thing.
-        //
-        // A landing that then fails leaves an event-less `queued` row, which is
-        // recoverable: `submit_run` is keyed by the spec's idempotency key and
-        // returns the existing run rather than erroring, so the same image can
-        // be sent again.
-        ledger.submit_run(&image.spec).map_err(internal)?;
-        let app_data_dir = self.app_data_dir()?.to_path_buf();
-        let landed = land_migration(&app_data_dir, &self.paths, &image, now_ms)
-            .map_err(|error| (500, error))?;
-        let arrival = RunEvent::MigrationArrived {
-            origin_node_id: image.header.origin_node_id.clone(),
-            origin_last_sequence: image.origin_last_sequence,
-            origin_last_event_hash: image.origin_last_event_hash.clone(),
-            payload_sha256: image.header.payload_sha256.clone(),
-        };
-        let envelope = RunEventEnvelope {
-            schema_version: RUN_PROTOCOL_SCHEMA_VERSION,
-            event_id: format!("evt-migration-{}", &image.header.payload_sha256[..24]),
-            run_id: image.header.run_id.clone(),
-            sequence: 1,
-            occurred_at_ms: now_ms,
-            actor_id: None,
-            emitter: ClientIdentity {
-                client_id: descriptor.runner_id.clone(),
-                instance_id: descriptor.runner_id.clone(),
-                kind: ClientKind::RemoteRunner,
-                version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-            event: arrival,
-        };
-        ledger.append_event(&envelope).map_err(internal)?;
-        let arrival_event_hash = ledger
-            .migration_arrival(&image.header.run_id)
-            .map_err(internal)?
-            .map(|arrival| arrival.event_hash)
-            .ok_or_else(|| {
-                (
-                    500,
-                    "The arrival event did not chain on this node".to_string(),
-                )
-            })?;
-
-        Ok((
-            201,
-            serde_json::to_value(MigrationReceipt {
-                protocol_version: REMOTE_PROTOCOL_VERSION,
-                node_id: descriptor.runner_id,
-                run_id: image.header.run_id.clone(),
-                process_id: landed.process_id,
-                workspace_root: landed.workspace_root.to_string_lossy().to_string(),
-                arrival_event_hash,
-                caveats: little_monkey_lib::migration::caveats(),
-            })
-            .map_err(internal)?,
-            Some(image.header.run_id),
-        ))
-    }
-
-    // --- `/v1/remote/mobile/*` handlers -----------------------------------
-
-    fn locked_store(&self) -> Result<std::sync::MutexGuard<'_, RemoteStore>, (u16, String)> {
-        self.store
-            .lock()
-            .map_err(|_| (500, "Remote state lock was poisoned".to_string()))
-    }
-
-    fn mobile_sessions(&self) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let sessions = self
-            .locked_store()?
-            .mobile_session_summaries()
-            .map_err(internal)?;
-        Ok((
-            200,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "sessions": sessions
-                    .iter()
-                    .map(|session| serde_json::json!({
-                        "id": session.session_id,
-                        "title": bounded_text(&session.title, 120),
-                        "model_label": "Node mobile-chat recipe",
-                        "updated_at_ms": session.updated_at_ms,
-                        "unread_count": 0,
-                    }))
-                    .collect::<Vec<_>>(),
-            }),
-            None,
-        ))
-    }
-
-    fn mobile_messages_get(
-        &self,
-        session_id: &str,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        self.materialize_mobile_replies(session_id, now_ms)?;
-        let messages = self
-            .locked_store()?
-            .mobile_messages(session_id, 2_000)
-            .map_err(internal)?;
-        Ok((
-            200,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "messages": messages
-                    .iter()
-                    .map(|message| serde_json::json!({
-                        "id": message.message_id,
-                        "role": message.role,
-                        "text": message.text,
-                        "created_at_ms": message.created_at_ms,
-                        "task_state": message.task_state,
-                    }))
-                    .collect::<Vec<_>>(),
-            }),
-            Some(session_id.to_string()),
-        ))
-    }
-
-    /// Turns terminal chat runs into visible replies. Called lazily from the
-    /// message GET (the client already polls), so no daemon-loop hook is
-    /// needed: for every still-`queued` user message, resolve its durable
-    /// run; once that run is terminal, append the assistant text (or a
-    /// system-role failure notice) and settle the user row's `task_state`.
-    /// Both inserts are idempotent (`ON CONFLICT DO NOTHING` + the state
-    /// filter), so concurrent polls cannot double-append.
-    fn materialize_mobile_replies(
-        &self,
-        session_id: &str,
-        now_ms: u64,
-    ) -> Result<(), (u16, String)> {
-        let Some(queue) = self.mobile_chat.as_ref() else {
-            return Ok(());
-        };
-        let pending: Vec<MobileMessageRecord> = {
-            let store = self.locked_store()?;
-            store
-                .mobile_messages(session_id, 2_000)
-                .map_err(internal)?
-                .into_iter()
-                .filter(|message| message.role == "user" && message.task_state == "queued")
-                .collect()
-        };
-        if pending.is_empty() {
-            return Ok(());
-        }
-        let ledger = self.run_ledger()?;
-        for message in pending {
-            let Some(run_id) = queue
-                .chat_run_id(session_id, &message.message_id)
-                .map_err(internal)?
-            else {
-                continue;
-            };
-            let events = match ledger.load_events(&run_id, 0, 1_000) {
-                Ok(events) => events,
-                Err(_) => continue, // Run not recorded yet â€” try again next poll.
-            };
-            let mut assistant_text = String::new();
-            let mut completed_summary: Option<String> = None;
-            let mut failed: Option<String> = None;
-            let mut cancelled = false;
-            for envelope in &events {
-                match &envelope.event {
-                    RunEvent::ModelDelta { channel, text, .. } => {
-                        if matches!(channel, OutputChannel::Assistant) {
-                            assistant_text.push_str(text);
-                        }
-                    }
-                    RunEvent::Completed { summary, .. } => {
-                        completed_summary = summary.clone();
-                    }
-                    RunEvent::Failed { message, .. } => failed = Some(message.clone()),
-                    RunEvent::Cancelled { .. } => cancelled = true,
-                    _ => {}
-                }
-            }
-            let terminal = completed_summary.is_some()
-                || failed.is_some()
-                || cancelled
-                || events
-                    .iter()
-                    .any(|envelope| matches!(envelope.event, RunEvent::Completed { .. }));
-            if !terminal {
-                continue;
-            }
-            let (role, text, final_state) = if let Some(reason) = failed {
-                (
-                    "system",
-                    format!(
-                        "The node could not answer this message: {}",
-                        bounded_text(&reason, 2_048)
-                    ),
-                    "failed",
-                )
-            } else if cancelled && assistant_text.trim().is_empty() {
-                (
-                    "system",
-                    "This message's run was cancelled on the node.".to_string(),
-                    "failed",
-                )
-            } else {
-                let text = if assistant_text.trim().is_empty() {
-                    completed_summary
-                        .unwrap_or_else(|| "(The run completed without any output.)".to_string())
-                } else {
-                    assistant_text
-                };
-                ("assistant", text, "accepted")
-            };
-            let mut store = self.locked_store()?;
-            store
-                .insert_mobile_message(&MobileMessageRecord {
-                    message_id: format!("{}-reply", message.message_id),
-                    session_id: message.session_id.clone(),
-                    device_id: message.device_id.clone(),
-                    role: role.to_string(),
-                    text,
-                    request_sha256: message.request_sha256.clone(),
-                    task_state: final_state.to_string(),
-                    created_at_ms: now_ms,
-                })
-                .map_err(internal)?;
-            store
-                .set_mobile_message_state(&message.message_id, final_state, now_ms)
-                .map_err(internal)?;
-        }
-        Ok(())
-    }
-
-    fn mobile_message_post(
-        &self,
-        session_id: &str,
-        body: &[u8],
-        device_id: &str,
-        request_sha256: &str,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let Some(queue) = self.mobile_chat.as_ref() else {
-            return Err((
-                501,
-                "This node build does not expose mobile chat execution".to_string(),
-            ));
-        };
-        let parsed: serde_json::Value = serde_json::from_slice(body)
-            .map_err(|error| (400, format!("Invalid mobile message body: {error}")))?;
-        let text = parsed
-            .get("text")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or((400, "Mobile message requires non-empty 'text'".to_string()))?;
-        if session_id.is_empty()
-            || session_id.len() > 128
-            || !session_id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            return Err((
-                400,
-                "Mobile session id must be 1-128 URL-safe characters".to_string(),
-            ));
-        }
-        // The message id doubles as the idempotent queue key: derived from
-        // the signed request digest, so an at-least-once retry of the SAME
-        // signed request maps onto the same message and job.
-        let message_id = format!("mm-{}", &request_sha256[..32]);
-        {
-            let mut store = self.locked_store()?;
-            store
-                .insert_mobile_message(&MobileMessageRecord {
-                    message_id: message_id.clone(),
-                    session_id: session_id.to_string(),
-                    device_id: device_id.to_string(),
-                    role: "user".to_string(),
-                    text: text.to_string(),
-                    request_sha256: request_sha256.to_string(),
-                    task_state: "queued".to_string(),
-                    created_at_ms: now_ms,
-                })
-                .map_err(internal)?;
-        }
-        match queue.queue_chat(session_id, &message_id, text) {
-            Ok(_run_id) => {}
-            Err(error) => {
-                let mut store = self.locked_store()?;
-                let _ = store.set_mobile_message_state(&message_id, "failed", now_ms);
-                return Err((503, format!("Mobile chat could not be queued: {error}")));
-            }
-        }
-        Ok((
-            201,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "message": { "id": message_id, "created_at_ms": now_ms },
-            }),
-            Some(session_id.to_string()),
-        ))
-    }
-
-    fn mobile_workflows(&self) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let app_data = self
-            .paths
-            .root
-            .parent()
-            .ok_or_else(|| internal("Daemon root has no app-data parent"))?
-            .to_path_buf();
-        let service = little_monkey_lib::m4_runtime::production_workflow_service(&app_data)
-            .map_err(internal)?;
-        let definitions = service.list().map_err(internal)?;
-        let last_runs = self
-            .locked_store()?
-            .mobile_workflow_last_runs()
-            .map_err(internal)?;
-        Ok((
-            200,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "workflows": definitions
-                    .iter()
-                    .map(|definition| {
-                        let mut entry = serde_json::json!({
-                            "id": definition.workflow_id,
-                            "name": definition.name,
-                            "summary": format!("v{} Â· {} nodes", definition.workflow_version, definition.nodes.len()),
-                        });
-                        if let Some(last) = last_runs.get(&definition.workflow_id) {
-                            entry["last_run_at_ms"] = serde_json::json!(last);
-                        }
-                        entry
-                    })
-                    .collect::<Vec<_>>(),
-            }),
-            None,
-        ))
-    }
-
-    fn mobile_workflow_launch(
-        &self,
-        workflow_id: &str,
-        device_id: &str,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let store = DaemonStore::open(&self.paths).map_err(internal)?;
-        if store.kill_switch().map_err(internal)? {
-            return Err((409, "Global kill switch is engaged".to_string()));
-        }
-        drop(store);
-        let app_data = self
-            .paths
-            .root
-            .parent()
-            .ok_or_else(|| internal("Daemon root has no app-data parent"))?
-            .to_path_buf();
-        let service = little_monkey_lib::m4_runtime::production_workflow_service(&app_data)
-            .map_err(internal)?;
-        let definition = service
-            .load(workflow_id)
-            .map_err(|error| (404, format!("Workflow is not available: {error}")))?;
-        let ir = service
-            .validate(&definition)
-            .map_err(|error| (409, format!("Workflow no longer validates: {error}")))?;
-        // A replay of the same SIGNED request never reaches this code â€” the
-        // command reservation in `handle` returns the cached response â€” so
-        // this id only needs to be unique per accepted launch.
-        let run_id = format!(
-            "m4-mobile-{}",
-            &sha256_hex(format!("{device_id}:{workflow_id}:{now_ms}").as_bytes())[..32]
-        );
-        let history = little_monkey_lib::m4_runtime::run_daemon_workflow_delivery(
-            &app_data,
-            workflow_id,
-            &ir.definition_sha256,
-            &run_id,
-            little_monkey_lib::workflow_core::WorkflowTrigger::Manual,
-            serde_json::json!({}),
-        )
-        .map_err(|error| (409, format!("Workflow launch failed: {error}")))?;
-        self.locked_store()?
-            .insert_mobile_workflow_run(&MobileWorkflowRunRecord {
-                run_id: history.run_id.clone(),
-                workflow_id: workflow_id.to_string(),
-                device_id: device_id.to_string(),
-                created_at_ms: now_ms,
-            })
-            .map_err(internal)?;
-        Ok((
-            201,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "run": {
-                    "run_id": history.run_id,
-                    "status": format!("{:?}", history.status).to_ascii_lowercase(),
-                    "kind": "workflow",
-                    "created_at_ms": now_ms,
-                    "updated_at_ms": now_ms,
-                    "pending_approval_count": 0,
-                },
-            }),
-            Some(workflow_id.to_string()),
-        ))
-    }
-
-    fn mobile_capture_post(
-        &self,
-        body: &[u8],
-        device: &DeviceRecord,
-        request_sha256: &str,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let parsed: serde_json::Value = serde_json::from_slice(body)
-            .map_err(|error| (400, format!("Invalid mobile capture body: {error}")))?;
-        let field = |name: &str| parsed.get(name).and_then(|value| value.as_str());
-        let capture_id = field("capture_id")
-            .filter(|value| {
-                !value.is_empty()
-                    && value.len() <= 128
-                    && value
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            })
-            .ok_or((400, "Capture requires a URL-safe 'capture_id'".to_string()))?;
-        let kind = field("kind")
-            .filter(|value| matches!(*value, "text" | "image" | "file" | "voice"))
-            .ok_or((
-                400,
-                "Capture 'kind' must be text, image, file, or voice".to_string(),
-            ))?;
-        let title = field("title")
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or((400, "Capture requires a non-empty 'title'".to_string()))?;
-        let text = field("text").map(str::to_string);
-        let declared_sha = field("content_sha256").map(str::to_string);
-        let media_type = field("mime_type").map(str::to_string);
-        let declared_size = parsed.get("size_bytes").and_then(|value| value.as_u64());
-
-        let mut stored_size: Option<u64> = None;
-        if let Some(content) = field("content_base64") {
-            let bytes = STANDARD
-                .decode(content)
-                .map_err(|_| (400, "Capture content is not valid base64".to_string()))?;
-            if bytes.len() as u64 > device.scopes.max_artifact_bytes {
-                return Err((
-                    413,
-                    "Capture exceeds this device grant's artifact budget".to_string(),
-                ));
-            }
-            let digest = sha256_hex(&bytes);
-            match &declared_sha {
-                Some(declared) if declared.eq_ignore_ascii_case(&digest) => {}
-                _ => {
-                    return Err((
-                        400,
-                        "Capture content_sha256 does not match the uploaded bytes".to_string(),
-                    ))
-                }
-            }
-            if let Some(size) = declared_size {
-                if size != bytes.len() as u64 {
-                    return Err((
-                        400,
-                        "Capture size_bytes does not match the uploaded bytes".to_string(),
-                    ));
-                }
-            }
-            let captures_dir = self.paths.root.join("mobile-captures");
-            std::fs::create_dir_all(&captures_dir).map_err(|error| {
-                internal(format!("Could not create capture directory: {error}"))
-            })?;
-            std::fs::write(captures_dir.join(capture_id), &bytes)
-                .map_err(|error| internal(format!("Could not persist capture payload: {error}")))?;
-            stored_size = Some(bytes.len() as u64);
-        } else if text.is_none() {
-            return Err((
-                400,
-                "Capture needs either 'text' or 'content_base64'".to_string(),
-            ));
-        }
-
-        self.locked_store()?
-            .insert_mobile_capture(&MobileCaptureRecord {
-                capture_id: capture_id.to_string(),
-                device_id: device.device_id.clone(),
-                kind: kind.to_string(),
-                title: title.to_string(),
-                text,
-                content_sha256: declared_sha,
-                size_bytes: stored_size.or(declared_size),
-                media_type,
-                request_sha256: request_sha256.to_string(),
-                created_at_ms: now_ms,
-            })
-            .map_err(internal)?;
-        Ok((
-            201,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "capture_id": capture_id,
-            }),
-            Some(capture_id.to_string()),
-        ))
-    }
-
-    // --- `/v1/remote/device/*` handlers ------------------------------------
-
-    /// The device reporting what it is and what its OS currently permits.
-    fn device_surface_post(
-        &self,
-        body: &[u8],
-        device: &DeviceRecord,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let mut surface: DeviceSurface = serde_json::from_slice(body)
-            .map_err(|error| (400, format!("Invalid device surface: {error}")))?;
-        // The runner timestamps the report itself. A device clock that is
-        // wrong (or flattering) must not decide how fresh the operator's view
-        // of it looks.
-        surface.reported_at_ms = now_ms;
-        surface.validate().map_err(|error| (400, error))?;
-        self.locked_store()?
-            .save_device_surface(&device.device_id, &surface, now_ms)
-            .map_err(internal)?;
-        Ok((
-            200,
-            device_state_json(device, Some(&surface)),
-            Some(device.device_id.clone()),
-        ))
-    }
-
-    // --- Realtime Talk -----------------------------------------------------
-
-    /// Issues the one-use bearer that admits a Talk WebSocket.
-    ///
-    /// **Why a ticket exists at all.** Every other route on this plane is a
-    /// signed request: HMAC over method, path, body, sequence, nonce and key
-    /// generation. A browser cannot put any of that on a WebSocket handshake â€”
-    /// the API takes no headers â€” so the choice is a socket authenticated by
-    /// something weaker, or a signed request that *mints* the admission. This
-    /// is the second: the ticket is issued only to a request that already
-    /// passed the full signature, replay and revocation checks, it is random,
-    /// it is single-use, it dies in thirty seconds, and it is spent
-    /// immediately. The identity it carries is the identity of the signed
-    /// request that made it, frozen â€” the socket cannot claim any other device.
-    ///
-    /// The ticket is never put in the response's `websocket_path`; the client
-    /// appends it as a query parameter at the moment it opens the socket, so a
-    /// path that ends up in a log or a history entry carries no bearer.
-    fn talk_ticket(
-        &self,
-        body: &[u8],
-        device: &DeviceRecord,
-        request_sha256: &str,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let request: TalkTicketRequest = serde_json::from_slice(body)
-            .map_err(|error| (400, format!("Invalid Talk ticket request: {error}")))?;
-        request.validate().map_err(|error| (400, error))?;
-        // The surface matters as much as the grant: a device whose OS refused
-        // the microphone must not be handed a socket that can only fail.
-        let surface = self
-            .locked_store()?
-            .device_surface(&device.device_id)
-            .map_err(internal)?;
-        if !effective_capabilities(&device.capabilities, surface.as_ref())
-            .contains(&DeviceCapability::VoiceStream)
-        {
-            return Err((
-                403,
-                "This device's microphone is not effective: the grant, the device's own \
-                 advertisement and its operating system permission must all allow it."
-                    .to_string(),
-            ));
-        }
-        let issued = TalkTicketResponse::issue(
-            request.session_id.clone(),
-            now_ms,
-            DEFAULT_TALK_TICKET_TTL_MS,
-        )
-        .map_err(|error| (400, error))?;
-        let mut tickets = self
-            .talk_tickets
-            .lock()
-            .map_err(|_| (500, "Talk ticket state was poisoned".to_string()))?;
-        // Expired admissions are swept on every issue rather than on a timer:
-        // this is the only path that adds to the map, so it is the only place
-        // it can grow.
-        tickets.retain(|_, pending| pending.expires_at_ms > now_ms);
-        if tickets.len() >= MAX_PENDING_TALK_TICKETS {
-            return Err((
-                429,
-                "Too many Talk sockets are being opened at once.".to_string(),
-            ));
-        }
-        tickets.insert(
-            sha256_hex(issued.ticket.as_bytes()),
-            PendingTalkTicket {
-                device_id: device.device_id.clone(),
-                secret_generation: device.secret_generation,
-                signed_request_sha256: request_sha256.to_string(),
-                session_id: issued.session_id.clone(),
-                session_generation: issued.session_generation.clone(),
-                expires_at_ms: issued.expires_at_ms,
-            },
-        );
-        drop(tickets);
-        Ok((
-            201,
-            serde_json::to_value(&issued).map_err(internal)?,
-            Some(device.device_id.clone()),
-        ))
-    }
-
-    /// Spends a ticket, returning the identity the socket then holds.
-    ///
-    /// `None` for anything at all wrong â€” unknown, expired, already spent,
-    /// wrong session, a device revoked or re-keyed in the meantime â€” with no
-    /// distinction between them, because a caller guessing tickets learns
-    /// nothing from which of those it hit. Removal happens under the same lock
-    /// as the lookup, which is what makes "one use" true against two sockets
-    /// racing with the same ticket.
-    pub(crate) fn consume_talk_ticket(
-        &self,
-        session_id: &str,
-        ticket: &str,
-        now_ms: u64,
-    ) -> Option<TalkSocketAuthorization> {
-        let pending = {
-            let mut tickets = self.talk_tickets.lock().ok()?;
-            let digest = sha256_hex(ticket.as_bytes());
-            let pending = tickets.get(&digest)?.clone();
-            if pending.expires_at_ms <= now_ms || pending.session_id != session_id {
-                // Removed either way: an expired or misdirected ticket has no
-                // second chance.
-                tickets.remove(&digest);
-                return None;
-            }
-            tickets.remove(&digest);
-            pending
-        };
-        // Re-checked at the moment of admission, not only at issue: thirty
-        // seconds is long enough for an operator to revoke a device, and the
-        // socket that follows can stay open for an hour.
-        let device = self
-            .store
-            .lock()
-            .ok()?
-            .device(&pending.device_id)
-            .ok()
-            .flatten()?;
-        if !device.active() || device.secret_generation != pending.secret_generation {
-            return None;
-        }
-        require_capability(&device, DeviceCapability::VoiceStream).ok()?;
-        Some(TalkSocketAuthorization {
-            device_id: pending.device_id,
-            signed_request_sha256: pending.signed_request_sha256,
-            session_id: pending.session_id,
-            session_generation: pending.session_generation,
-        })
-    }
-
-    /// Where the desktop half keeps its configuration, which is where the
-    /// operator's own speech backends are read from.
-    pub(crate) fn app_data_dir_for_talk(&self) -> std::path::PathBuf {
-        self.paths
-            .ledger_db
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| self.paths.root.clone())
-    }
-
-    /// What a finished Talk session leaves behind: bounded counters, on the
-    /// same audit stream every other remote action is written to.
-    ///
-    /// Deliberately not the transcript, not the assistant's answer and not one
-    /// byte of audio. A support bundle collects this stream, and a recording of
-    /// somebody's room is not a thing to put in one.
-    pub(crate) fn record_talk_session(
-        &self,
-        device_id: &str,
-        report: &super::talk::TalkSessionReport,
-    ) {
-        self.audit
-            .record(little_monkey_lib::subsystem_audit::SubsystemAction {
-                subsystem: little_monkey_lib::run_ledger::Subsystem::Remote,
-                action: "TALK /v1/remote/device/talk/stream".to_string(),
-                turn_id: None,
-                permission_request_id: None,
-                outcome: if report.stream_dropped || report.grant_revoked {
-                    little_monkey_lib::subsystem_audit::outcome_for_status(499)
-                } else {
-                    little_monkey_lib::subsystem_audit::outcome_for_status(200)
-                },
-                detail: Some(serde_json::json!({
-                    "deviceId": device_id,
-                    "utterances": report.utterances,
-                    "turns": report.turns_submitted,
-                    "interruptions": report.interruptions,
-                    "spokenChunks": report.spoken_chunks,
-                    "errors": report.errors,
-                    "fallbacks": report.fallbacks,
-                    "grantRevoked": report.grant_revoked,
-                    // Durations, in the same seven spans the desktop records.
-                    // Means and worst cases rather than samples, so a long
-                    // conversation cannot grow this row.
-                    "latencyMs": talk_latency_detail(&report.latency),
-                })),
-            });
-    }
-
-    /// Registers an open Talk socket as a live capture, and hands back the row
-    /// to close when it ends. A failure to register is not a reason to refuse
-    /// the conversation â€” but it is recorded, because an unobservable microphone
-    /// is the thing this exists to prevent.
-    pub(crate) fn open_talk_capture(
-        &self,
-        device_id: &str,
-        session_id: &str,
-        expires_at_ms: u64,
-    ) -> Option<String> {
-        let now_ms = super::now_ms_public().ok()?;
-        let mut store = self.store.lock().ok()?;
-        match store.open_talk_capture(device_id, session_id, expires_at_ms, now_ms) {
-            Ok(record) => Some(record.command_id),
-            Err(error) => {
-                self.audit
-                    .record(little_monkey_lib::subsystem_audit::SubsystemAction {
-                        subsystem: little_monkey_lib::run_ledger::Subsystem::Remote,
-                        action: "TALK /v1/remote/device/talk/stream".to_string(),
-                        turn_id: None,
-                        permission_request_id: None,
-                        outcome: little_monkey_lib::subsystem_audit::outcome_for_status(500),
-                        detail: Some(serde_json::json!({
-                            "deviceId": device_id,
-                            "captureRegistrationFailed": error,
-                        })),
-                    });
-                None
-            }
-        }
-    }
-
-    pub(crate) fn close_talk_capture(
-        &self,
-        device_id: &str,
-        command_id: &str,
-        error: Option<&str>,
-    ) {
-        let Ok(now_ms) = super::now_ms_public() else {
-            return;
-        };
-        if let Ok(mut store) = self.store.lock() {
-            let _ = store.close_talk_capture(device_id, command_id, error, now_ms);
-        }
-    }
-
-    /// Whether a device may still speak. Read between Talk turns, and on a timer
-    /// while an answer streams, so a grant withdrawn mid-conversation closes the
-    /// microphone.
-    ///
-    /// Deliberately the *same* test the ticket route admits on â€” grant âˆ©
-    /// advertised surface âˆ© OS permission â€” rather than the grant alone. A
-    /// microphone permission withdrawn on the phone half way through a
-    /// conversation is exactly the case where the weaker test would keep the
-    /// session alive, and it is the case that matters most.
-    pub(crate) fn talk_capability_live(&self, device_id: &str) -> bool {
-        let Ok(store) = self.store.lock() else {
-            return false;
-        };
-        let Some(device) = store.device(device_id).ok().flatten() else {
-            return false;
-        };
-        if !device.active() {
-            return false;
-        }
-        let surface = store.device_surface(device_id).ok().flatten();
-        effective_capabilities(&device.capabilities, surface.as_ref())
-            .contains(&DeviceCapability::VoiceStream)
-    }
-
-    fn talk_stream_needs_upgrade(
-        &self,
-        session_id: &str,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        Err((
-            426,
-            format!(
-                "Talk session '{session_id}' is a WebSocket endpoint. Request a ticket at \
-                 POST /v1/remote/device/talk/ticket and upgrade with it."
-            ),
-        ))
-    }
-
-    /// What this device may actually do, as the runner sees it â€” the same three
-    /// sets the operator's device card shows, so the phone and the desktop can
-    /// never disagree about why something is unavailable.
-    fn device_state(
-        &self,
-        device: &DeviceRecord,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let surface = self
-            .locked_store()?
-            .device_surface(&device.device_id)
-            .map_err(internal)?;
-        Ok((
-            200,
-            device_state_json(device, surface.as_ref()),
-            Some(device.device_id.clone()),
-        ))
-    }
-
-    /// Leases the next command, re-checking authority at the moment of handing
-    /// it over.
-    ///
-    /// A grant revoked, or an OS permission withdrawn, between queueing and
-    /// leasing must stop the command â€” so the check is here and not only at
-    /// enqueue. Such a command fails with an explicit reason rather than
-    /// silently vanishing, because a run is waiting on an answer.
-    fn device_command_lease(
-        &self,
-        device: &DeviceRecord,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let mut store = self.locked_store()?;
-        // A stream whose deadline passed is closed here, on the same sweep that
-        // expires stale commands: the device that abandoned it is by definition
-        // not the one asking for work, so this is where someone else notices.
-        super::voice::expire(&mut store, now_ms).map_err(internal)?;
-        let surface = store.device_surface(&device.device_id).map_err(internal)?;
-        let granted = granted_capabilities(device);
-        // Bounded: each iteration retires exactly one now-unauthorized command,
-        // so this cannot spin.
-        for _ in 0..64 {
-            let Some(record) = store
-                .lease_device_command(&device.device_id, DEVICE_LEASE_MS, now_ms)
-                .map_err(internal)?
-            else {
-                return Ok((204, serde_json::json!({}), None));
-            };
-            if let Some(block) = capability_block(&granted, surface.as_ref(), record.capability) {
-                // Failed with the reason, not with a shrug: a run is waiting on
-                // this answer and the operator needs to know which of the four
-                // axes said no.
-                store
-                    .complete_device_command(
-                        &device.device_id,
-                        &record.command_id,
-                        DeviceCommandState::Failed,
-                        None,
-                        None,
-                        Some(&block.explain(record.capability)),
-                        None,
-                        now_ms,
-                    )
-                    .map_err(internal)?;
-                store
-                    .audit(
-                        now_ms,
-                        Some(&device.device_id),
-                        "device_command_blocked",
-                        Some(&record.command_id),
-                        block.as_str(),
-                        None,
-                    )
-                    .map_err(internal)?;
-                continue;
-            }
-            let command = DeviceCommand {
-                protocol_version: REMOTE_PROTOCOL_VERSION,
-                command_id: record.command_id.clone(),
-                capability: record.capability,
-                arguments: record.arguments.clone(),
-                arguments_sha256: record.arguments_sha256.clone(),
-                expires_at_ms: record.expires_at_ms,
-                lease_expires_at_ms: record.lease_expires_at_ms.unwrap_or(record.expires_at_ms),
-                cancel_requested: record.cancel_requested,
-            };
-            let body = serde_json::to_value(&command)
-                .map_err(|error| internal(format!("Could not encode device command: {error}")))?;
-            return Ok((200, body, Some(record.command_id)));
-        }
-        Ok((204, serde_json::json!({}), None))
-    }
-
-    /// The device declaring it is about to touch hardware. `started: false`
-    /// means this command was already running â€” the device must not repeat the
-    /// action, and this is the reply a reconnect gets.
-    ///
-    /// Authority is re-checked here and not only at lease time. A lease and the
-    /// moment hardware is touched are different moments, and a grant withdrawn
-    /// or a permission revoked in between has to stop the action â€” the whole
-    /// point of the split is that nothing physical has happened yet.
-    ///
-    /// That re-check belongs to the `leased` â†’ `running` transition and to
-    /// nothing else. The same route also answers a *recovery*: an execution that
-    /// already holds this command and lost the reply. Re-running readiness there
-    /// would fail a command whose effect may already have happened because the
-    /// page went to the background afterwards â€” turning a momentary loss of
-    /// readiness into a revocation of work already authorized. What ends a
-    /// running command is cancellation or revocation, both on the control
-    /// channel; never a readiness check at a boundary it already passed.
-    fn device_command_start(
-        &self,
-        body: &[u8],
-        device: &DeviceRecord,
-        command_id: &str,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let request: DeviceCommandStartRequest = if body.is_empty() {
-            DeviceCommandStartRequest::default()
-        } else {
-            serde_json::from_slice(body)
-                .map_err(|error| (400, format!("Invalid device command start: {error}")))?
-        };
-        request.validate().map_err(|error| (400, error))?;
-        let mut store = self.locked_store()?;
-        let record = store
-            .device_command(command_id)
-            .map_err(internal)?
-            .filter(|record| record.device_id == device.device_id)
-            .ok_or((404, "Unknown device command".to_string()))?;
-        // A command already past its own deadline never begins, however long
-        // the device took to ask.
-        if record.expires_at_ms <= now_ms && !record.state.terminal() {
-            store.expire_device_commands(now_ms).map_err(internal)?;
-            return Err((409, "This command expired before it started".to_string()));
-        }
-        // Only the one transition that authorizes a *new* physical effect. A
-        // `running` command falls through to `start_device_command`, which
-        // answers a matching execution with `started: false, recoverable: true`
-        // and a different one with a refusal.
-        if matches!(record.state, DeviceCommandState::Leased) {
-            let surface = store.device_surface(&device.device_id).map_err(internal)?;
-            let granted = granted_capabilities(device);
-            if let Some(block) = capability_block(&granted, surface.as_ref(), record.capability) {
-                store
-                    .complete_device_command(
-                        &device.device_id,
-                        command_id,
-                        DeviceCommandState::Failed,
-                        None,
-                        None,
-                        Some(&block.explain(record.capability)),
-                        request.execution_id.as_deref(),
-                        now_ms,
-                    )
-                    .map_err(internal)?;
-                store
-                    .audit(
-                        now_ms,
-                        Some(&device.device_id),
-                        "device_command_blocked",
-                        Some(command_id),
-                        block.as_str(),
-                        None,
-                    )
-                    .map_err(internal)?;
-                return Err((403, block.explain(record.capability)));
-            }
-        }
-        let outcome = store
-            .start_device_command(
-                &device.device_id,
-                command_id,
-                request.execution_id.as_deref(),
-                now_ms,
-            )
-            .map_err(|error| (409, error))?;
-        Ok((
-            200,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "command_id": command_id,
-                "started": outcome.started,
-                // True when this is the same execution reconnecting: it may
-                // deliver a result it already staged, and must not re-execute.
-                "recoverable": outcome.recoverable,
-                "execution_id": outcome.execution_id,
-            }),
-            Some(command_id.to_string()),
-        ))
-    }
-
-    /// Every nonterminal command the runner still believes this device owns.
-    ///
-    /// Deliberately not a lease: handing a `running` command back through the
-    /// queue is precisely the second execution this design refuses. The device
-    /// answers each of these from its own journal â€” deliver the staged result,
-    /// or report the outcome unknown.
-    fn device_commands_recover(
-        &self,
-        device: &DeviceRecord,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let mut store = self.locked_store()?;
-        store.expire_device_commands(now_ms).map_err(internal)?;
-        let commands = store
-            .recoverable_device_commands(&device.device_id)
-            .map_err(internal)?
-            .into_iter()
-            .map(|record| DeviceCommandRecovery {
-                command_id: record.command_id,
-                capability: record.capability,
-                arguments_sha256: record.arguments_sha256,
-                state: record.state,
-                execution_id: record.execution_id,
-                started_at_ms: record.started_at_ms,
-                expires_at_ms: record.expires_at_ms,
-                cancel_requested: record.cancel_requested,
-            })
-            .collect::<Vec<_>>();
-        Ok((
-            200,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "commands": commands,
-            }),
-            None,
-        ))
-    }
-
-    /// A running command's control signals.
-    ///
-    /// One request the device makes while it is working, held open by the
-    /// long-poll until something changes, rather than a poll it repeats. That is
-    /// what lets a cancellation reach a recording already in progress without
-    /// spending a signed request every second.
-    fn device_command_control(
-        &self,
-        device: &DeviceRecord,
-        command_id: &str,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let store = self.locked_store()?;
-        let record = store
-            .device_command(command_id)
-            .map_err(internal)?
-            .filter(|record| record.device_id == device.device_id)
-            .ok_or((404, "Unknown device command".to_string()))?;
-        // Authority, deliberately not readiness. A page that goes to the
-        // background loses readiness for a moment; telling a recording already
-        // in progress that it was revoked would cut it short over a glance at
-        // another app. What ends a running command here is the operator taking
-        // the grant away, or the pairing itself going.
-        let revoked =
-            !device.active() || !granted_capabilities(device).contains(&record.capability);
-        let control = DeviceCommandControl {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            command_id: record.command_id.clone(),
-            state: record.state,
-            cancel_requested: record.cancel_requested,
-            revoked,
-            deadline_ms: record.expires_at_ms,
-        };
-        let _ = now_ms;
-        Ok((
-            200,
-            serde_json::to_value(&control).map_err(internal)?,
-            Some(record.command_id),
-        ))
-    }
-
-    /// The device's terminal report, with any artifact it produced.
-    fn device_command_result(
-        &self,
-        body: &[u8],
-        device: &DeviceRecord,
-        command_id: &str,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let result: DeviceCommandResult = serde_json::from_slice(body)
-            .map_err(|error| (400, format!("Invalid device command result: {error}")))?;
-        // The device's own declared bound never widens the operator's: the
-        // artifact budget on the pairing is the ceiling either way.
-        result
-            .validate(device.scopes.max_artifact_bytes)
-            .map_err(|error| (400, error))?;
-        // Decoded and digested before anything is written, because the digest is
-        // what decides whether this delivery is a retry of the stored result or
-        // a contradiction of it â€” and a contradiction must not reach the
-        // artifact file at all.
-        let decoded = match (&result.artifact_base64, &result.artifact_media_type) {
-            (Some(encoded), Some(media_type)) => {
-                let bytes = STANDARD
-                    .decode(encoded)
-                    .map_err(|_| (400, "Device artifact is not valid base64".to_string()))?;
-                if bytes.len() as u64 > device.scopes.max_artifact_bytes {
-                    return Err((
-                        413,
-                        "Device artifact exceeds this pairing's artifact budget".to_string(),
-                    ));
-                }
-                let sha256 = sha256_hex(&bytes);
-                if let Some(declared) = &result.artifact_sha256 {
-                    if declared != &sha256 {
-                        return Err((
-                            400,
-                            "The artifact's bytes do not match the digest the device declared"
-                                .to_string(),
-                        ));
-                    }
-                }
-                Some((
-                    bytes,
-                    DeviceArtifact {
-                        sha256,
-                        bytes: 0,
-                        media_type: media_type.clone(),
-                    },
-                ))
-            }
-            _ => None,
-        };
-        let artifact = decoded.as_ref().map(|(bytes, artifact)| DeviceArtifact {
-            bytes: bytes.len() as u64,
-            ..artifact.clone()
-        });
-        let digest = terminal_digest(
-            result.outcome,
-            result.result.as_ref(),
-            artifact.as_ref().map(|artifact| artifact.sha256.as_str()),
-            result
-                .error
-                .as_deref()
-                .map(|error| super::store::bounded(error, 4_096))
-                .as_deref(),
-        );
-        // From here to the acknowledgement is one serialized commit per command.
-        // Two conflicting reports racing each other must not be able to leave
-        // the row naming one digest and the file holding the other's bytes.
-        let commit = self.terminal_commit_lock(command_id);
-        let _committing = commit
-            .lock()
-            .map_err(|_| internal("Device command commit lock was poisoned"))?;
-        // Re-read *inside* the lock: whatever was true before it was taken is
-        // exactly the state a racing commit may have changed.
-        let already_terminal = {
-            let store = self.locked_store()?;
-            let existing = store
-                .device_command(command_id)
-                .map_err(internal)?
-                .filter(|record| record.device_id == device.device_id)
-                .ok_or((404, "Unknown device command".to_string()))?;
-            if existing.state.terminal() {
-                if let Some(stored) = &existing.terminal_sha256 {
-                    if stored != &digest {
-                        // The loser, and it changes nothing: not the file, not
-                        // the row, not the digest. It is refused before a single
-                        // byte of its artifact is written.
-                        return Err((
-                            409,
-                            format!(
-                                "This command already reported {} and that result is \
-                                 authoritative; a different result cannot replace it",
-                                existing.state.as_str()
-                            ),
-                        ));
-                    }
-                }
-                true
-            } else {
-                // `/start` is the authorization boundary for a physical effect,
-                // so a terminal report is only meaningful from the far side of
-                // it. Accepting one for a `queued` or `leased` command would let
-                // an authenticated device answer for an action the runner never
-                // authorized â€” and skip the readiness, grant and cancellation
-                // checks that boundary exists to make.
-                if existing.state != DeviceCommandState::Running {
-                    return Err((
-                        409,
-                        format!(
-                            "This command is {} and has not been started; a result can only be \
-                             reported for a running command",
-                            existing.state.as_str()
-                        ),
-                    ));
-                }
-                // Ownership is settled before the artifact is published, not
-                // after: an execution that does not hold this command must not
-                // be able to write over the artifact path of the one that does.
-                //
-                // A missing identity is refused as firmly as a wrong one. The
-                // pair-of-`Some`s test it replaces let an omitted `execution_id`
-                // through â€” the one form a second execution can always produce.
-                match (&existing.execution_id, result.execution_id.as_deref()) {
-                    (Some(held), Some(offered)) if held == offered => {}
-                    (Some(_), _) => {
-                        return Err((
-                            409,
-                            "This result does not name the execution that holds the command"
-                                .to_string(),
-                        ));
-                    }
-                    // Started by a build that had no execution identity to give.
-                    // Both ends must be silent about it: an id offered against a
-                    // command that never recorded one proves nothing.
-                    (None, None) => {}
-                    (None, Some(_)) => {
-                        return Err((
-                            409,
-                            "This command was started without an execution identity and cannot be \
-                             completed under one"
-                                .to_string(),
-                        ));
-                    }
-                }
-                false
-            }
-        };
-        // A replay publishes nothing. The stored bytes are the authoritative
-        // ones and they are already on disk under this command's name; rewriting
-        // them would be a write with no answer it could change.
-        if !already_terminal {
-            if let Some((bytes, _)) = &decoded {
-                self.persist_device_artifact(command_id, bytes)?;
-            }
-        }
-        let record = self
-            .locked_store()?
-            .complete_device_command(
-                &device.device_id,
-                command_id,
-                result.outcome,
-                result.result.as_ref(),
-                artifact.as_ref(),
-                result.error.as_deref(),
-                result.execution_id.as_deref(),
-                now_ms,
-            )
-            .map_err(|error| (409, error))?;
-        Ok((
-            200,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "command_id": record.command_id,
-                "state": record.state.as_str(),
-                // The authoritative record, so a retrying device can see that
-                // what the runner holds is what it delivered â€” and stop.
-                "acknowledged": true,
-                "artifact_sha256": record.artifact.as_ref().map(|artifact| artifact.sha256.clone()),
-            }),
-            Some(record.command_id),
-        ))
-    }
-
-    /// The commit lock for one command, minted on first use.
-    ///
-    /// Swept while the map is held rather than on a timer: an entry nobody else
-    /// holds is a command whose commit is over, and dropping it costs one
-    /// comparison. The bound is what stops a long-lived runner accumulating one
-    /// mutex per command it ever completed.
-    fn terminal_commit_lock(&self, command_id: &str) -> Arc<Mutex<()>> {
-        let mut locks = match self.terminal_commits.lock() {
-            Ok(value) => value,
-            // A poisoned map is not a reason to skip serialization: an
-            // unshared lock still serializes nothing but is safe to return, and
-            // the commit below re-reads authoritative state either way.
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if locks.len() > 256 {
-            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
-        }
-        Arc::clone(
-            locks
-                .entry(command_id.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
-        )
-    }
-
-    /// Writes one artifact so a crash can never leave a stored record pointing
-    /// at bytes that are not there.
-    ///
-    /// Staged under a deterministic temporary name, flushed, then renamed onto
-    /// the final path â€” the rename is atomic, so the file at the destination is
-    /// either the previous complete artifact or this complete one, never a
-    /// half-written mixture. The DB row is written afterwards: an orphaned
-    /// staging file or an artifact with no row is recoverable, a row naming
-    /// bytes that do not exist is not.
-    fn persist_device_artifact(&self, command_id: &str, bytes: &[u8]) -> Result<(), (u16, String)> {
-        use std::io::Write;
-        let directory = self.paths.root.join("device-artifacts");
-        let staging = directory.join("staging");
-        std::fs::create_dir_all(&staging).map_err(|error| {
-            internal(format!(
-                "Could not create device artifact directory: {error}"
-            ))
-        })?;
-        Self::sweep_stale_staging(&staging);
-        let temporary = staging.join(format!("{command_id}.part"));
-        {
-            let mut file = std::fs::File::create(&temporary)
-                .map_err(|error| internal(format!("Could not stage device artifact: {error}")))?;
-            file.write_all(bytes)
-                .map_err(|error| internal(format!("Could not stage device artifact: {error}")))?;
-            file.sync_all()
-                .map_err(|error| internal(format!("Could not flush device artifact: {error}")))?;
-        }
-        // The command id names the final file, so a retried report replaces its
-        // own bytes with identical ones and can never create a second artifact.
-        std::fs::rename(&temporary, directory.join(command_id))
-            .map_err(|error| internal(format!("Could not persist device artifact: {error}")))?;
-        Ok(())
-    }
-
-    /// Removes staged files a crashed upload left behind. Best-effort and
-    /// silent: an orphan costs disk, never correctness, and failing a live
-    /// delivery because an old temporary file could not be removed would be the
-    /// worse trade.
-    fn sweep_stale_staging(staging: &std::path::Path) {
-        const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60 * 60);
-        let Ok(entries) = std::fs::read_dir(staging) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let stale = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .map(|modified| modified.elapsed().unwrap_or_default() > STALE_AFTER)
-                .unwrap_or(false);
-            if stale {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-
-    /// One chunk of a live microphone stream.
-    ///
-    /// The store lock is taken once and held across the disk write on purpose:
-    /// that is what makes "check the sequence, append, move the counter" atomic,
-    /// and therefore what stops two concurrent posts of the same chunk from
-    /// writing the audio twice.
-    fn voice_chunk(
-        &self,
-        body: &[u8],
-        device: &DeviceRecord,
-        session_id: &str,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let request: VoiceChunkRequest = serde_json::from_slice(body)
-            .map_err(|error| (400, format!("Invalid voice chunk: {error}")))?;
-        request.validate().map_err(|error| (400, error))?;
-        let audio = STANDARD
-            .decode(&request.audio_base64)
-            .map_err(|_| (400, "Voice chunk audio is not valid base64".to_string()))?;
-        if audio.len() > MAX_VOICE_CHUNK_BYTES {
-            return Err((413, "Voice chunk exceeds the per-chunk ceiling".to_string()));
-        }
-        let mut store = self.locked_store()?;
-        let outcome = super::voice::accept_chunk(
-            &self.paths.root,
-            &mut store,
-            &device.device_id,
-            session_id,
-            &request,
-            &audio,
-            now_ms,
-        )?;
-        Ok((
-            200,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "session_id": session_id,
-                "accepted": outcome.accepted,
-                "next_sequence": outcome.next_sequence,
-                "bytes": outcome.bytes,
-                // The device's stop signal, on the reply to a request it is
-                // already making. No second poll exists for a cancellation to
-                // be missed on.
-                "stop": outcome.stop,
-            }),
-            Some(session_id.to_string()),
-        ))
-    }
-
-    /// The device ending a stream, and with it the control command it rode on.
-    fn voice_close(
-        &self,
-        body: &[u8],
-        device: &DeviceRecord,
-        session_id: &str,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let request: VoiceCloseRequest = if body.is_empty() {
-            VoiceCloseRequest {
-                protocol_version: REMOTE_PROTOCOL_VERSION,
-                error: None,
-            }
-        } else {
-            serde_json::from_slice(body)
-                .map_err(|error| (400, format!("Invalid voice close: {error}")))?
-        };
-        request.validate().map_err(|error| (400, error))?;
-        let mut store = self.locked_store()?;
-        let record = super::voice::close(
-            &mut store,
-            &device.device_id,
-            session_id,
-            request.error.as_deref(),
-            now_ms,
-        )?;
-        Ok((
-            200,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "session_id": record.session_id,
-                "state": record.state.as_str(),
-                "chunks": record.next_sequence,
-                "bytes": record.bytes,
-            }),
-            Some(record.session_id),
-        ))
-    }
-
-    /// The `applicationServerKey` a browser needs before it can subscribe.
-    ///
-    /// Public by construction â€” it is the *public* half of this runner's VAPID
-    /// identity, and a push service checks signatures against it. Answering 404
-    /// when Web Push is not configured is what tells the client not to offer
-    /// notifications at all.
-    fn device_push_key(&self) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        match super::push::application_server_key(&self.paths, self.secrets.as_ref()) {
-            Ok(Some(key)) => Ok((
-                200,
-                serde_json::json!({
-                    "protocol_version": REMOTE_PROTOCOL_VERSION,
-                    "backend": "web_push",
-                    "application_server_key": key,
-                }),
-                None,
-            )),
-            Ok(None) => Err((404, "This runner does not send Web Push".to_string())),
-            Err(error) => Err((503, error)),
-        }
-    }
-
-    fn device_push_register(
-        &self,
-        body: &[u8],
-        device_id: &str,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let parsed: serde_json::Value = serde_json::from_slice(body)
-            .map_err(|error| (400, format!("Invalid push registration: {error}")))?;
-        let backend = parsed
-            .get("backend")
-            .and_then(|value| value.as_str())
-            .ok_or((400, "A push registration needs a 'backend'".to_string()))?;
-        // A Web Push registration is the browser's whole subscription â€” the
-        // endpoint plus the two keys it will be encrypted to. It is validated
-        // here, before storage, so an unusable subscription is refused at the
-        // moment the device can still be told about it.
-        let token = if backend == "web_push" {
-            let subscription: super::push::WebPushSubscription =
-                serde_json::from_value(parsed.get("subscription").cloned().unwrap_or_default())
-                    .map_err(|error| (400, format!("Invalid push subscription: {error}")))?;
-            subscription.validate().map_err(|error| (400, error))?;
-            serde_json::to_string(&subscription).map_err(internal)?
-        } else {
-            parsed
-                .get("token")
-                .and_then(|value| value.as_str())
-                .ok_or((400, "A push registration needs a 'token'".to_string()))?
-                .to_string()
-        };
-        self.locked_store()?
-            .save_push_registration(device_id, backend, &token, now_ms)
-            .map_err(|error| (400, error))?;
-        Ok((
-            200,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "registered": true,
-            }),
-            Some(device_id.to_string()),
-        ))
-    }
-
-    fn device_push_forget(
-        &self,
-        device_id: &str,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        self.locked_store()?
-            .delete_push_registration(device_id)
-            .map_err(internal)?;
-        Ok((
-            200,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "registered": false,
-            }),
-            Some(device_id.to_string()),
-        ))
-    }
-
-    fn mobile_revoke_self(
-        &self,
-        device_id: &str,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let killer = self
-            .desktop
-            .as_ref()
-            .map(|desktop| Arc::clone(desktop) as Arc<dyn super::store::DesktopSessionKiller>);
-        self.locked_store()?
-            .revoke_device(
-                device_id,
-                "Self-revoked from the paired mobile device",
-                now_ms,
-                self.secrets.as_ref(),
-                killer.as_deref(),
-            )
-            .map_err(internal)?;
-        Ok((
-            200,
-            serde_json::json!({
-                "protocol_version": REMOTE_PROTOCOL_VERSION,
-                "revoked": true,
-            }),
-            Some(device_id.to_string()),
-        ))
-    }
-
-    // --- `/v1/remote/node/*` handlers (roadmap K17) ------------------------
-
-    /// The app-data directory this node's hub and workflow service live under.
-    /// The daemon root is a child of it, which is the same derivation the mobile
-    /// workflow routes above already make.
-    fn app_data(&self) -> Result<std::path::PathBuf, (u16, String)> {
-        self.paths
-            .root
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .ok_or_else(|| internal("Daemon root has no app-data parent"))
-    }
-
-    /// The operator-set identity of this node.
-    ///
-    /// Both values are operator statements held in the daemon's own meta table,
-    /// not inferred: nothing can derive which jurisdiction a machine's disks are
-    /// in, and a guess there is worse than an explicit
-    /// [`RESIDENCY_UNSPECIFIED`](little_monkey_lib::node_placement::RESIDENCY_UNSPECIFIED),
-    /// which a residency rule naming a real zone never matches.
-    fn node_identity(&self, store: &DaemonStore) -> (String, String) {
-        let residency = store
-            .get_meta(NODE_RESIDENCY_META)
-            .ok()
-            .flatten()
-            .filter(|value| little_monkey_lib::node_placement::validate_residency(value).is_ok())
-            .unwrap_or_else(|| {
-                little_monkey_lib::node_placement::RESIDENCY_UNSPECIFIED.to_string()
-            });
-        let name = store
-            .get_meta(NODE_NAME_META)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| self.host.runner_id.clone());
-        (name, residency)
-    }
-
-    fn describe_node(
-        &self,
-        now_ms: u64,
-    ) -> Result<little_monkey_lib::node_placement::NodeDescriptor, (u16, String)> {
-        use little_monkey_lib::m3_runtime_hub::M3HardwareProbe;
-        let store = DaemonStore::open(&self.paths).map_err(internal)?;
-        let config = crate::daemon::store::DaemonConfig::load(&self.paths).map_err(internal)?;
-        let backpressure = crate::daemon::backpressure_for(&store, &config).map_err(internal)?;
-        let (node_name, residency) = self.node_identity(&store);
-        // The same probe the admission loop uses, so a placer reads the numbers
-        // this node's own scheduler will judge the job against â€” not a second,
-        // differently-collected view of the same machine.
-        let hardware = little_monkey_lib::m3_production::SystemM3HardwareProbe
-            .snapshot()
-            .map_err(|error| {
-                (
-                    503,
-                    format!("This node could not measure its own hardware: {error}"),
-                )
-            })?;
-        Ok(little_monkey_lib::node_placement::NodeDescriptor {
-            protocol_version: little_monkey_lib::node_placement::NODE_PROTOCOL_VERSION,
-            runner_id: self.host.runner_id.clone(),
-            node_name,
-            residency,
-            accelerators: little_monkey_lib::node_placement::describe_accelerators(&hardware),
-            resident_models: resident_models(&self.app_data()?),
-            hardware,
-            accepting: backpressure.accepting,
-            queue_depth: backpressure.queue_depth,
-            queue_capacity: backpressure.queue_capacity,
-            captured_at_ms: now_ms,
-        })
-    }
-
-    fn node_descriptor(&self) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        // `captured_at_ms` comes from the hardware probe's own stamp rather than
-        // from the request clock: the snapshot is the measurement, and stamping
-        // it with "when you asked" would make a cached or slow probe look fresh.
-        let descriptor = self.describe_node(0)?;
-        let captured_at_ms = descriptor.hardware.captured_at_ms;
-        let descriptor = little_monkey_lib::node_placement::NodeDescriptor {
-            captured_at_ms,
-            ..descriptor
-        };
-        Ok((
-            200,
-            serde_json::to_value(&descriptor).map_err(internal)?,
-            None,
-        ))
-    }
-
-    /// The cheap half of [`Self::node_descriptor`], for the heartbeat.
-    ///
-    /// Separate because the descriptor probes hardware â€” which forks
-    /// `nvidia-smi` on CUDA hosts â€” and a placer polling every node every
-    /// 30 seconds must not make each node pay that. This reads only the queue.
-    fn node_health(
-        &self,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let store = DaemonStore::open(&self.paths).map_err(internal)?;
-        let config = crate::daemon::store::DaemonConfig::load(&self.paths).map_err(internal)?;
-        let backpressure = crate::daemon::backpressure_for(&store, &config).map_err(internal)?;
-        let placed_active = self.locked_store()?.placed_run_count().map_err(internal)?;
-        let health = little_monkey_lib::node_placement::NodeHealth {
-            protocol_version: little_monkey_lib::node_placement::NODE_PROTOCOL_VERSION,
-            runner_id: self.host.runner_id.clone(),
-            now_ms,
-            accepting: backpressure.accepting,
-            queue_depth: backpressure.queue_depth,
-            queue_capacity: backpressure.queue_capacity,
-            placed_active,
-        };
-        Ok((200, serde_json::to_value(&health).map_err(internal)?, None))
-    }
-
-    /// **Roadmap K17 S2: this node takes ownership of a foreign `RunSpec`.**
-    ///
-    /// The order of the checks is the contract. The spec is validated against
-    /// the shared protocol first, then against *this node's* facts â€” its
-    /// residency, its identity, its kill switch â€” and only then handed to the
-    /// queue, which owns the last class of refusal (a workspace root that does
-    /// not exist here, a target this node cannot execute). Nothing is recorded
-    /// until the queue has accepted, so a refused placement leaves no row
-    /// claiming the node took work it did not.
-    // --- `/v1/remote/peer/*` -----------------------------------------------
-
-    /// Take one envelope from a paired peer.
-    ///
-    /// Everything that decides *whether* it runs lives in the gate; this is the
-    /// transport half â€” parse, refuse to act while the kill switch is on, and
-    /// turn the gate's verdict into a status code the sender can act on.
-    fn peer_message_post(
-        &self,
-        device: &DeviceRecord,
-        body: &[u8],
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let Some(queue) = self.peer_runs.as_ref() else {
-            return Err((
-                501,
-                "This node build does not accept peer messages".to_string(),
-            ));
-        };
-        let envelope: little_monkey_lib::peers::PeerEnvelope = serde_json::from_slice(body)
-            .map_err(|error| (400, format!("Invalid peer envelope: {error}")))?;
-        let mut store = DaemonStore::open(&self.paths).map_err(internal)?;
-        if store.kill_switch().map_err(internal)? {
-            return Err((409, "Global kill switch is engaged".to_string()));
-        }
-        let granted = granted_capabilities(device);
-        let artifacts = crate::daemon::peer_ingress::peer_content_store(&self.paths)
-            .map_err(|error| (500, error))?;
-        let context = crate::daemon::peer_ingress::PeerContext {
-            device_id: &device.device_id,
-            granted: &granted,
-            revoked: !device.active(),
-            local_instance_id: &self.host.runner_id,
-            artifacts: &artifacts,
-        };
-        let accepted = crate::daemon::peer_ingress::accept_peer_envelope(
-            &mut store,
-            queue.as_ref(),
-            &envelope,
-            &context,
-            i64::try_from(now_ms).unwrap_or(i64::MAX),
-        )
-        .map_err(internal)?;
-
-        use crate::daemon::peer_ingress::PeerAcceptance;
-        match accepted {
-            PeerAcceptance::Accepted {
-                thread_id, job_id, ..
-            } => Ok((
-                202,
-                serde_json::json!({
-                    "accepted": true,
-                    "thread_id": thread_id,
-                    "message_id": envelope.message_id,
-                    // The peer's own handle for correlating a result later. The
-                    // local job id is deliberately not returned: it is this
-                    // node's business, and a peer that knew it would learn
-                    // nothing it can use.
-                    "correlation_id": envelope.correlation_id,
-                    "state": "queued",
-                    "queued": !job_id.is_empty(),
-                }),
-                Some(thread_id_target(&envelope.thread_id)),
-            )),
-            PeerAcceptance::AcceptedPending { thread_id, .. } => Ok((
-                202,
-                serde_json::json!({
-                    "accepted": true,
-                    "thread_id": thread_id,
-                    "message_id": envelope.message_id,
-                    "correlation_id": envelope.correlation_id,
-                    // Durably taken, not yet queued. Saying "accepted" is the
-                    // honest answer: a retry would be refused as a duplicate,
-                    // and this node will finish the submission itself.
-                    "state": "accepted",
-                    "queued": false,
-                }),
-                Some(thread_id_target(&envelope.thread_id)),
-            )),
-            PeerAcceptance::Duplicate {
-                thread_id,
-                accepted,
-                ..
-            } => Ok((
-                200,
-                serde_json::json!({
-                    "accepted": accepted,
-                    "thread_id": thread_id,
-                    "message_id": envelope.message_id,
-                    "correlation_id": envelope.correlation_id,
-                    "state": "duplicate",
-                    "queued": false,
-                }),
-                Some(thread_id_target(&envelope.thread_id)),
-            )),
-            PeerAcceptance::Rejected { reason, .. } => {
-                use little_monkey_lib::peers::PeerRejection;
-                let status = match reason {
-                    PeerRejection::MissingCapability | PeerRejection::PeerRevoked => 403,
-                    PeerRejection::Duplicate => 409,
-                    _ => 400,
-                };
-                Err((status, reason.message().to_string()))
-            }
-        }
-    }
-
-    /// One peer introducing itself, and learning what it may actually do here.
-    ///
-    /// The only route on this plane that changes nothing durable about
-    /// authority: what the caller advertises and asks for is stored beside the
-    /// pairing, never merged into it, so an operator sees the ask and decides.
-    /// `granted` in the reply is computed here from the pairing record â€” the
-    /// caller cannot influence it by anything it sent.
-    fn peer_hello_post(
-        &self,
-        device: &DeviceRecord,
-        body: &[u8],
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let hello: PeerHelloRequest = serde_json::from_slice(body)
-            .map_err(|error| (400, format!("Invalid peer hello: {error}")))?;
-        hello.validate().map_err(|error| (400, error))?;
-        let granted = peer_capabilities_of(&granted_capabilities(device));
-        if device.active() {
-            RemoteStore::open(&self.paths.root)
-                .map_err(internal)?
-                .record_peer_advertisement(
-                    &device.device_id,
-                    &hello.instance_id,
-                    &hello.advertised,
-                    &hello.requested,
-                    now_ms,
-                )
-                .map_err(internal)?;
-        }
-        let response = PeerHelloResponse {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            instance_id: self.host.runner_id.clone(),
-            now_ms,
-            advertised: all_peer_capabilities(),
-            granted,
-        };
-        Ok((
-            200,
-            serde_json::to_value(&response).map_err(internal)?,
-            Some(format!("peer:{}", device.device_id)),
-        ))
-    }
-
-    /// Take the bytes behind an artifact a peer is about to reference.
-    ///
-    /// Push rather than pull. The digest the sender declared is a checksum, not
-    /// an identifier this node trusts: the content store hashes what it
-    /// actually wrote, and a mismatch is refused rather than stored under the
-    /// name the sender chose.
-    ///
-    /// # This is where a peer earns the right to reference content
-    ///
-    /// The content store is shared with every other artifact on the machine, so
-    /// a blob being *in* it says nothing about who put it there. The durable
-    /// receipt written here does: it names the authenticated pairing this
-    /// request resolved to, the id and digest of what verified, the size, and
-    /// the metadata the receiver validated â€” and it is the only thing that lets
-    /// a later envelope name these bytes.
-    ///
-    /// It is written last, after the content passed integrity validation, so a
-    /// failed upload leaves no authorization behind.
-    fn peer_artifact_post(
-        &self,
-        device: &DeviceRecord,
-        body: &[u8],
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let upload: PeerArtifactUpload = serde_json::from_slice(body)
-            .map_err(|error| (400, format!("Invalid peer artifact: {error}")))?;
-        upload.validate().map_err(|error| (400, error))?;
-        let bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &upload.content_base64,
-        )
-        .map_err(|_| (400, "Peer artifact content is not valid base64".to_string()))?;
-        // Digest first, store second. The content store is content-addressed,
-        // so writing and then comparing ids would detect the mismatch just as
-        // well â€” but only after publishing the bytes into a store shared with
-        // runs, channels and the operator's own imports. A peer whose upload is
-        // refused must leave nothing behind, not an unreferenced blob it can
-        // keep adding to.
-        let digest = crate::durable_run::sha256_hex(&bytes);
-        if digest != upload.sha256.to_ascii_lowercase() {
-            return Err((
-                400,
-                "Peer artifact content does not match its declared digest".to_string(),
-            ));
-        }
-        let store = crate::daemon::peer_ingress::peer_content_store(&self.paths)
-            .map_err(|error| (500, error))?;
-        let blob = store
-            .put(&bytes)
-            .map_err(|error| (400, format!("Could not store the peer artifact: {error}")))?;
-        DaemonStore::open(&self.paths)
-            .map_err(internal)?
-            .record_peer_artifact_receipt(
-                &device.device_id,
-                &blob.id,
-                &blob.id,
-                blob.size,
-                upload.filename.as_deref(),
-                upload.media_type.as_deref(),
-                i64::try_from(now_ms).unwrap_or(i64::MAX),
-            )
-            .map_err(internal)?;
-        let stored = PeerArtifactStored {
-            artifact_id: blob.id,
-            sha256: upload.sha256.to_ascii_lowercase(),
-            size_bytes: blob.size,
-        };
-        Ok((
-            201,
-            serde_json::to_value(&stored).map_err(internal)?,
-            Some(format!("peer-artifact:{}", device.device_id)),
-        ))
-    }
-
-    /// What a thread looks like now, including results for finished work.
-    ///
-    /// The peer polls this rather than being called back. That is not a
-    /// shortcut: a callback would mean every receiving node holding an
-    /// outbound pairing to every peer that ever wrote to it, and a peer that
-    /// went away leaving retries behind. Polling keeps the trust one-way per
-    /// direction, the same shape the mobile path already uses.
-    fn peer_thread_get(
-        &self,
-        device: &DeviceRecord,
-        thread_id: &str,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let mut store = DaemonStore::open(&self.paths).map_err(internal)?;
-        // Scoped to the calling pairing in the query itself: a peer reads its
-        // own threads and nobody else's, and a thread belonging to someone else
-        // is indistinguishable from one that does not exist, so probing cannot
-        // enumerate other peers.
-        let Some(thread) = store
-            .peer_thread(&device.device_id, thread_id)
-            .map_err(internal)?
-        else {
-            return Err((404, "Unknown peer thread".to_string()));
-        };
-        self.materialize_peer_results(&mut store, &thread, now_ms)?;
-
-        let messages = store
-            .peer_messages(&device.device_id, thread_id, 200)
-            .map_err(internal)?;
-        let rows: Vec<serde_json::Value> = messages
-            .iter()
-            .map(|message| {
-                serde_json::json!({
-                    "message_id": message.message_id,
-                    "direction": message.direction.as_str(),
-                    "kind": message.kind,
-                    "correlation_id": message.correlation_id,
-                    "disposition": message.disposition.as_str(),
-                    "rejection": message.rejection,
-                    // A result row's payload is what this node produced and is
-                    // meant to travel; an inbound row's is the peer's own
-                    // envelope, echoed back unchanged.
-                    "payload": serde_json::from_str::<serde_json::Value>(&message.envelope_json)
-                        .unwrap_or(serde_json::Value::Null),
-                    "created_at_ms": message.created_at_ms,
-                })
-            })
-            .collect();
-        Ok((
-            200,
-            serde_json::json!({
-                "thread_id": thread.thread_id,
-                "created_at_ms": thread.created_at_ms,
-                "last_activity_at_ms": thread.last_activity_at_ms,
-                "messages": rows,
-            }),
-            Some(thread_id_target(thread_id)),
-        ))
-    }
-
-    /// Turn finished runs into result rows the peer can read.
-    ///
-    /// Runs when the peer polls rather than on a timer: nothing needs the
-    /// answer until someone asks for it, and doing it here means a result is
-    /// written exactly once, by the same idempotent insert, whether the peer
-    /// polls once or fifty times.
-    fn materialize_peer_results(
-        &self,
-        store: &mut DaemonStore,
-        thread: &crate::daemon::peer_store::PeerThreadRecord,
-        now_ms: u64,
-    ) -> Result<(), (u16, String)> {
-        let awaiting = store
-            .peer_messages_awaiting_result(&thread.peer_device_id, &thread.thread_id)
-            .map_err(internal)?;
-        if awaiting.is_empty() {
-            return Ok(());
-        }
-        let ledger = self.run_ledger()?;
-        for message in awaiting {
-            let Some(job_id) = message.job_id.as_deref() else {
-                continue;
-            };
-            let Some(job) = store.get_job(job_id).map_err(internal)? else {
-                continue;
-            };
-            let Some(run_id) = job.run_id.as_deref() else {
-                continue; // Queued but not started yet.
-            };
-            let Ok(events) = ledger.load_events(run_id, 0, 1_000) else {
-                continue; // Not recorded yet â€” the next poll tries again.
-            };
-            let Some(outcome) = terminal_outcome(&events) else {
-                continue; // Still running.
-            };
-            store
-                .record_peer_result(
-                    &thread.thread_id,
-                    &thread.peer_device_id,
-                    &self.host.runner_id,
-                    &format!("result-{}", message.message_id),
-                    message.correlation_id.as_deref(),
-                    job_id,
-                    &serde_json::json!({
-                        "in_reply_to": message.message_id,
-                        "state": outcome.state,
-                        "text": outcome.text,
-                    })
-                    .to_string(),
-                    i64::try_from(now_ms).unwrap_or(i64::MAX),
-                )
-                .map_err(internal)?;
-        }
-        Ok(())
-    }
-
-    fn place_run(
-        &self,
-        body: &[u8],
-        device_id: &str,
-        request_sha256: &str,
-        now_ms: u64,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let Some(queue) = self.placement.as_ref() else {
-            return Err((
-                501,
-                "This node build does not accept placed runs".to_string(),
-            ));
-        };
-        let request: little_monkey_lib::node_placement::PlaceRunRequest =
-            serde_json::from_slice(body)
-                .map_err(|error| (400, format!("Invalid placement request: {error}")))?;
-        request
-            .validate()
-            .map_err(|error| (400, format!("Placement request is invalid: {error}")))?;
-
-        let store = DaemonStore::open(&self.paths).map_err(internal)?;
-        if store.kill_switch().map_err(internal)? {
-            return Err((409, "Global kill switch is engaged".to_string()));
-        }
-        let (_, residency) = self.node_identity(&store);
-        drop(store);
-
-        // The placer states the rule it applied and this node checks it rather
-        // than trusting it. Two owned machines is exactly the case where an
-        // alias silently starts pointing somewhere else â€” a rotated bundle
-        // restored onto a different host, a re-provisioned box reusing a name â€”
-        // and a data-residency rule that only the *sender* enforces is not
-        // enforced at all.
-        if let Some(required) = &request.required_residency {
-            if required != &residency {
-                return Err((
-                    409,
-                    format!(
-                        "This node's data residency is '{residency}', not the required '{required}'"
-                    ),
-                ));
-            }
-        }
-        if let Some(expected) = &request.expected_runner_id {
-            if expected != &self.host.runner_id {
-                return Err((
-                    409,
-                    format!(
-                        "This node is '{}', not the expected '{expected}'",
-                        self.host.runner_id
-                    ),
-                ));
-            }
-        }
-
-        let submitted_run_id = request.spec.run_id.clone();
-        // A spec this node already owns is the same placement, not a second
-        // one. The signed-request replay guard covers an identical *retried*
-        // request; it cannot see a fresh request carrying a spec already placed.
-        if let Some(existing) = self
-            .locked_store()?
-            .placed_run(&submitted_run_id)
-            .map_err(internal)?
-        {
-            return Ok((
-                200,
-                serde_json::to_value(little_monkey_lib::node_placement::PlaceRunResponse {
-                    protocol_version: little_monkey_lib::node_placement::NODE_PROTOCOL_VERSION,
-                    submitted_run_id,
-                    node_run_id: existing.node_run_id,
-                    job_id: existing.job_id,
-                    state: "queued".to_string(),
-                    accepted_at_ms: existing.created_at_ms,
-                    residency: existing.residency,
-                })
-                .map_err(internal)?,
-                Some(existing.submitted_run_id),
-            ));
-        }
-
-        let placed = queue
-            .place(&request.spec)
-            .map_err(|error| (409, format!("This node refused the placement: {error}")))?;
-        self.locked_store()?
-            .insert_placed_run(&super::store::PlacedRunRecord {
-                submitted_run_id: submitted_run_id.clone(),
-                device_id: device_id.to_string(),
-                node_run_id: placed.node_run_id.clone(),
-                job_id: placed.job_id.clone(),
-                residency: residency.clone(),
-                // The digest of the signed request, which covers the exact spec
-                // bytes this node accepted. What was enforced here is auditable
-                // against what the submitter says it sent.
-                spec_sha256: request_sha256.to_string(),
-                created_at_ms: now_ms,
-            })
-            .map_err(internal)?;
-        Ok((
-            201,
-            serde_json::to_value(little_monkey_lib::node_placement::PlaceRunResponse {
-                protocol_version: little_monkey_lib::node_placement::NODE_PROTOCOL_VERSION,
-                submitted_run_id: submitted_run_id.clone(),
-                node_run_id: placed.node_run_id,
-                job_id: placed.job_id,
-                state: placed.state,
-                accepted_at_ms: now_ms,
-                residency,
-            })
-            .map_err(internal)?,
-            Some(submitted_run_id),
-        ))
-    }
-
-    /// One placed run's current state, keyed by the *submitter's* run id.
-    ///
-    /// Scoped to the placing device: a device may read the placements it made
-    /// and no others, which is the same rule `RemoteScopes::permits_run` applies
-    /// to the control plane's run listing.
-    fn placed_run_status(
-        &self,
-        device_id: &str,
-        submitted_run_id: &str,
-    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let Some(queue) = self.placement.as_ref() else {
-            return Err((
-                501,
-                "This node build does not accept placed runs".to_string(),
-            ));
-        };
-        let record = self
-            .locked_store()?
-            .placed_run(submitted_run_id)
-            .map_err(internal)?
-            .filter(|record| record.device_id == device_id)
-            .ok_or((404, "No such placed run".to_string()))?;
-        let state = queue
-            .placed_state(&record.job_id)
-            .map_err(internal)?
-            .unwrap_or(PlacedJobState {
-                // The placement row exists and the job row does not, which is
-                // what job retention leaves behind. Reported as its own state
-                // rather than as "failed": the node genuinely does not know how
-                // it ended, and saying "failed" would be a claim.
-                state: "unknown".to_string(),
-                terminal: true,
-                updated_at_ms: record.created_at_ms,
-                last_error: Some(
-                    "This node no longer retains the job row for this placement".to_string(),
-                ),
-            });
-        Ok((
-            200,
-            serde_json::to_value(little_monkey_lib::node_placement::PlacedRunStatus {
-                protocol_version: little_monkey_lib::node_placement::NODE_PROTOCOL_VERSION,
-                submitted_run_id: record.submitted_run_id.clone(),
-                node_run_id: record.node_run_id,
-                job_id: record.job_id,
-                state: state.state,
-                terminal: state.terminal,
-                updated_at_ms: state.updated_at_ms,
-                last_error: state.last_error,
-            })
-            .map_err(internal)?,
-            Some(record.submitted_run_id),
-        ))
-    }
-
-    fn audit_denied(
-        &self,
-        now_ms: u64,
-        device_id: Option<&str>,
-        action: &str,
-        target: Option<&str>,
-        outcome: &str,
-    ) {
-        if let Ok(mut store) = self.store.lock() {
-            let _ = store.audit(now_ms, device_id, action, target, outcome, None);
-        }
-    }
-}
-
-/// How often the long-poll checks for work. Short enough that a queued command
-/// reaches a waiting phone promptly, long enough that a held connection costs
-/// nothing measurable.
-const LONG_POLL_TICK_MS: u64 = 500;
-
-/// The two requests that may wait.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum LongPollTarget {
-    /// `GET /v1/remote/device/commands/next` â€” wait for work to exist.
-    Lease,
-    /// `GET /v1/remote/device/commands/{id}/control` â€” wait for a running
-    /// command's control state to change. A watcher held open like this is why
-    /// cancelling a recording does not need the device to poll every second.
-    Control(String),
-}
-
-/// What a request wants to wait for and for how long, capped at the lease
-/// length, or `None` when this request is not one that waits.
-fn long_poll_target(request: &ApiRequest) -> Option<(LongPollTarget, u64)> {
-    if request.method != "GET" {
-        return None;
-    }
-    let (path, query) = request
-        .path_and_query
-        .split_once('?')
-        .map_or((request.path_and_query.as_str(), ""), |value| value);
-    let segments = path
-        .trim_end_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    let target = match segments.as_slice() {
-        ["v1", "remote", "device", "commands", "next"] => LongPollTarget::Lease,
-        ["v1", "remote", "device", "commands", command_id, "control"] => {
-            LongPollTarget::Control((*command_id).to_string())
-        }
-        _ => return None,
-    };
-    let wait_ms = query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(key, _)| *key == "wait_ms")
-        .and_then(|(_, value)| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    (wait_ms > 0).then(|| (target, wait_ms.min(DEVICE_LEASE_MS)))
-}
-
-/// The three sets an operator (and the phone) must be able to tell apart:
-/// what Little Monkey granted, what the build supports, what the OS permits â€”
-/// and the intersection that actually decides. Computed in one place so the
-/// desktop card and the phone's own screen cannot drift.
-fn device_state_json(device: &DeviceRecord, surface: Option<&DeviceSurface>) -> serde_json::Value {
-    let granted = if device.capabilities.is_empty() {
-        legacy_capabilities(&device.scopes)
-    } else {
-        device.capabilities.clone()
-    };
-    // One row per physical capability, with the four axes kept apart and the
-    // single reason it is not effective named. A caller that only gets the
-    // intersection cannot tell an operator what to do about it.
-    let physical = PHYSICAL_DEVICE_CAPABILITIES
-        .iter()
-        .map(|capability| {
-            let block = capability_block(&granted, surface, *capability);
-            serde_json::json!({
-                "capability": capability,
-                "granted": granted.contains(capability),
-                "supported": surface.is_some_and(|surface| surface.capabilities.contains(capability)),
-                "permission": surface.map(|surface| surface.permission(*capability)),
-                "readiness": surface.map(|surface| surface.readiness(*capability)),
-                "effective": block.is_none(),
-                "blocked_by": block.map(|block| block.as_str()),
-                "reason": block.map(|block| block.explain(*capability)),
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({
-        "protocol_version": REMOTE_PROTOCOL_VERSION,
-        "device_id": device.device_id,
-        "device_name": device.device_name,
-        "granted": granted,
-        "advertised": surface.map(|surface| surface.capabilities.clone()),
-        "os_permissions": surface.map(|surface| surface.permissions.clone()),
-        "readiness": surface.map(|surface| surface.readiness.clone()),
-        "effective": effective_capabilities(&granted, surface),
-        "physical": physical,
-        "surface": surface,
-        "max_artifact_bytes": device.scopes.max_artifact_bytes,
-    })
-}
-
-fn require_action(scopes: &RemoteScopes, action: RemoteAction) -> Result<(), (u16, String)> {
-    if scopes.permits(action) {
-        Ok(())
-    } else {
-        Err((403, format!("Remote action '{action:?}' is not paired")))
-    }
-}
-
-/// Capability gate for the mobile extension. A device paired before
-/// capabilities existed resolves through `legacy_capabilities`, which maps
-/// only the legacy run-scope actions â€” so legacy pairings can never reach
-/// chat, workflow launch, or capture without an explicit re-pair.
-fn require_capability(
-    device: &DeviceRecord,
-    capability: DeviceCapability,
-) -> Result<(), (u16, String)> {
-    let effective = if device.capabilities.is_empty() {
-        legacy_capabilities(&device.scopes)
-    } else {
-        device.capabilities.clone()
-    };
-    if effective.contains(&capability) {
-        Ok(())
-    } else {
-        Err((
-            403,
-            format!("Device capability '{capability:?}' is not granted"),
-        ))
-    }
-}
-
-/// A peer needs at least one of the three peer grants to reach the peer plane
-/// at all. Which one a given envelope needs is decided per envelope, inside the
-/// gate, because that depends on what the envelope contains â€” but a pairing
-/// with no peer standing whatsoever never gets that far, and never gets to
-/// create a thread row.
-/// The grants recorded for this device, resolving the legacy empty-set
-/// convention the same way `require_capability` does.
-///
-/// Not [`protocol::effective_capabilities`], which additionally drops a
-/// physical capability the device's own surface cannot serve: a peer grant is
-/// never physical, and a peer has no surface to ask.
-/// Refuse a pairing whose entire standing is peer standing.
-///
-/// For the device-plane routes that are gated by authentication alone. Those
-/// routes are self-service for a paired phone â€” advertising a surface only ever
-/// narrows what is effective, and the queue hands out only commands already
-/// queued for that device â€” but a peer is not a phone: it has no hardware here,
-/// nothing is ever queued for it, and there is no reading of "peer standing" in
-/// which the plane that serves a phone is part of it.
-fn refuse_peer_only(device: &DeviceRecord) -> Result<(), (u16, String)> {
-    if crate::daemon::remote::protocol::is_peer_only(&granted_capabilities(device)) {
-        return Err((403, "A peer cannot act as a device here".to_string()));
-    }
-    Ok(())
-}
-
-fn granted_capabilities(device: &DeviceRecord) -> std::collections::BTreeSet<DeviceCapability> {
-    if device.capabilities.is_empty() {
-        legacy_capabilities(&device.scopes)
-    } else {
-        device.capabilities.clone()
-    }
-}
-
-/// What the audit trail records a peer request against. The thread, never the
-/// message text.
-fn thread_id_target(thread_id: &str) -> String {
-    format!("peer-thread:{thread_id}")
-}
-
-/// One finished run, as a peer result.
-struct PeerRunOutcome {
-    state: &'static str,
-    text: String,
-}
-
-/// Read a run's events and, if it ended, say how.
-///
-/// The assistant's own output is the answer when there is one; a summary is
-/// the fallback, and a failure or a cancellation is reported as such rather
-/// than as an empty success. A run still going produces `None`, which is how
-/// the caller knows to leave the request waiting.
-fn terminal_outcome(
-    events: &[little_monkey_lib::run_protocol::RunEventEnvelope],
-) -> Option<PeerRunOutcome> {
-    let mut assistant_text = String::new();
-    let mut summary: Option<String> = None;
-    let mut failure: Option<String> = None;
-    let mut cancelled = false;
-    let mut completed = false;
-    for envelope in events {
-        match &envelope.event {
-            RunEvent::ModelDelta { channel, text, .. } => {
-                if matches!(channel, OutputChannel::Assistant) {
-                    assistant_text.push_str(text);
-                }
-            }
-            RunEvent::Completed { summary: value, .. } => {
-                completed = true;
-                summary = value.clone();
-            }
-            RunEvent::Failed { message, .. } => failure = Some(message.clone()),
-            RunEvent::Cancelled { .. } => cancelled = true,
-            _ => {}
-        }
-    }
-    if let Some(reason) = failure {
-        return Some(PeerRunOutcome {
-            state: "failed",
-            text: bounded_text(&reason, 2_048),
-        });
-    }
-    if cancelled {
-        return Some(PeerRunOutcome {
-            state: "cancelled",
-            text: "The run was cancelled on the receiving installation.".to_string(),
-        });
-    }
-    if !completed {
-        return None;
-    }
-    let text = if assistant_text.trim().is_empty() {
-        summary.unwrap_or_else(|| "(The run completed without any output.)".to_string())
-    } else {
-        assistant_text
-    };
-    Some(PeerRunOutcome {
-        state: "succeeded",
-        text: bounded_text(&text, 16 * 1024),
-    })
-}
-
-fn require_any_peer_capability(device: &DeviceRecord) -> Result<(), (u16, String)> {
-    let effective = if device.capabilities.is_empty() {
-        legacy_capabilities(&device.scopes)
-    } else {
-        device.capabilities.clone()
-    };
-    let has_peer_standing = [
-        DeviceCapability::PeerMessage,
-        DeviceCapability::PeerTaskRequest,
-        DeviceCapability::PeerArtifact,
-    ]
-    .iter()
-    .any(|capability| effective.contains(capability));
-    if has_peer_standing {
-        Ok(())
-    } else {
-        Err((403, "This pairing is not a peer".to_string()))
-    }
-}
-
-fn summarize(run: &StoredRun, shared: &SharedLedger) -> Result<RunSummary, String> {
-    let label = match &run.spec.target {
-        ModelTargetSnapshot::ManagedLlama { label, .. }
-        | ModelTargetSnapshot::Ollama { label, .. }
-        | ModelTargetSnapshot::Provider { label, .. } => label.clone(),
-    };
-    Ok(RunSummary {
-        run_id: run.spec.run_id.clone(),
-        status: format!("{:?}", run.status).to_ascii_lowercase(),
-        kind: format!("{:?}", run.spec.kind).to_ascii_lowercase(),
-        created_at_ms: run.spec.created_at_ms,
-        updated_at_ms: run.updated_at_ms,
-        last_sequence: run.last_sequence,
-        workspace_id: run
-            .spec
-            .workspace
-            .as_ref()
-            .map(|workspace| workspace.workspace_id.clone()),
-        model_label: label,
-        pending_approval_count: shared.pending_approvals(&run.spec.run_id)?.len(),
-    })
-}
-
-fn approval_json(approval: &StoredApproval) -> serde_json::Value {
-    serde_json::json!({
-        "run_id": approval.run_id,
-        "request_id": approval.request_id,
-        "tool_call_id": approval.tool_call_id,
-        "tool_name": approval.tool_name,
-        "operation_sha256": approval.operation_sha256,
-        "expires_at_ms": approval.expires_at_ms,
-    })
-}
-
-fn control_recorder(
-    shared: &SharedLedger,
-    run_id: &str,
-    device_id: &str,
-) -> Result<Arc<DurableRunRecorder>, String> {
-    DurableRunRecorder::attach(
-        shared.run_ledger()?,
-        run_id,
-        "remote-controller".to_string(),
-        little_monkey_lib::run_protocol::ClientIdentity {
-            client_id: device_id.to_string(),
-            instance_id: format!("remote-{device_id}"),
-            kind: little_monkey_lib::run_protocol::ClientKind::RemoteRunner,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-        },
-    )
-}
-
-fn parse_query(query: &str) -> Result<std::collections::BTreeMap<String, String>, (u16, String)> {
-    let mut output = std::collections::BTreeMap::new();
-    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-        let key = key.into_owned();
-        if output.insert(key.clone(), value.into_owned()).is_some() {
-            return Err((400, format!("Duplicate query parameter '{key}'")));
-        }
-    }
-    Ok(output)
-}
-
-/// The remote node's ledger sits beside its daemon database, under the same app
-/// data directory `DaemonPaths` derives everything else from.
-fn audit_for(paths: &DaemonPaths) -> little_monkey_lib::subsystem_audit::SubsystemAudit {
-    match paths.ledger_db.parent() {
-        Some(app_data_dir) => {
-            little_monkey_lib::subsystem_audit::SubsystemAudit::in_data_dir(app_data_dir)
-        }
-        None => little_monkey_lib::subsystem_audit::SubsystemAudit::disabled(
-            "the daemon ledger path has no app-data parent to record beside",
-        ),
-    }
-}
-
-fn internal(error: impl std::fmt::Display) -> (u16, String) {
-    (500, error.to_string())
-}
-
-/// One session's latency, as the audit is allowed to see it: for each span, how
-/// many samples, their mean and the worst one. Spans nobody measured are absent
-/// rather than zero, because "no sample" and "instant" are different facts.
-fn talk_latency_detail(latency: &super::talk::TalkSessionLatency) -> serde_json::Value {
-    let span = |value: &super::talk::TalkLatencySpan| {
-        value.mean_ms().map(|mean| {
-            serde_json::json!({
-                "samples": value.samples,
-                "meanMs": mean,
-                "worstMs": value.worst_ms,
-            })
-        })
-    };
-    let mut detail = serde_json::Map::new();
-    for (name, value) in [
-        ("speechDetection", &latency.speech_detection),
-        ("capture", &latency.capture),
-        ("upload", &latency.upload),
-        ("transcription", &latency.transcription),
-        ("modelFirstToken", &latency.model_first_token),
-        ("ttsFirstAudio", &latency.tts_first_audio),
-        ("endToEnd", &latency.end_to_end),
-    ] {
-        if let Some(entry) = span(value) {
-            detail.insert(name.to_string(), entry);
-        }
-    }
-    serde_json::Value::Object(detail)
-}
-
-/// A Talk session's turns, running through exactly the surface the typed mobile
-/// chat uses.
-///
-/// **Why the mobile message rows are written here too.** A spoken turn and a
-/// typed one land in the same session; if only the typed ones left a row, the
-/// operator would open the chat after a conversation and find half of it
-/// missing. The user row is written before the turn is queued and the assistant
-/// row when it settles â€” the same two writes, in the same order, that
-/// `mobile_message_post` and `materialize_mobile_replies` make, so the two
-/// surfaces converge on one transcript instead of two.
-pub(crate) struct TalkSessionTurns {
-    api: RemoteApi,
-    device_id: String,
-    /// See [`TalkSocketAuthorization::signed_request_sha256`].
-    admission_sha256: String,
-}
-
-impl TalkSessionTurns {
-    pub(crate) fn new(api: RemoteApi, authorization: &TalkSocketAuthorization) -> Self {
-        Self {
-            api,
-            device_id: authorization.device_id.clone(),
-            admission_sha256: authorization.signed_request_sha256.clone(),
-        }
-    }
-}
-
-impl super::talk::TalkTurns for TalkSessionTurns {
-    fn submit(&self, session_id: &str, client_key: &str, text: &str) -> Result<String, String> {
-        let queue = self
-            .api
-            .mobile_chat
-            .as_ref()
-            .ok_or_else(|| "This node build does not execute conversation turns".to_string())?;
-        let now_ms = super::now_ms_public()?;
-        {
-            let mut store = self
-                .api
-                .store
-                .lock()
-                .map_err(|_| "Remote state lock was poisoned".to_string())?;
-            store.insert_mobile_message(&MobileMessageRecord {
-                message_id: client_key.to_string(),
-                session_id: session_id.to_string(),
-                device_id: self.device_id.clone(),
-                role: "user".to_string(),
-                text: text.to_string(),
-                // A Talk turn is admitted by the ticket the socket was opened
-                // with, whose own signed request digest is this. Naming it keeps
-                // the row auditable in the same way a typed one is.
-                request_sha256: self.admission_sha256.clone(),
-                task_state: "queued".to_string(),
-                created_at_ms: now_ms,
-            })?;
-        }
-        // A row that claims `queued` for a turn nothing ever queued is a lie the
-        // operator has no way to detect: the reply materializer skips it forever
-        // because its job never existed. Settle it here, exactly as
-        // `mobile_message_post` does, rather than leaving it to a sweep.
-        match queue.queue_chat(session_id, client_key, text) {
-            Ok(run_id) => Ok(run_id),
-            Err(error) => {
-                if let Ok(mut store) = self.api.store.lock() {
-                    let _ = store.set_mobile_message_state(client_key, "failed", now_ms);
-                }
-                Err(error)
-            }
-        }
-    }
-
-    fn progress(
-        &self,
-        run_id: &str,
-        from_index: u64,
-    ) -> Result<super::talk::TalkRunProgress, String> {
-        let ledger =
-            RunLedger::open(&self.api.paths.ledger_db).map_err(|error| error.to_string())?;
-        let events = match ledger.load_events(run_id, from_index, 500) {
-            Ok(events) => events,
-            // Not an error: the run row is written by the worker, and a turn
-            // queued microseconds ago may not have one yet.
-            Err(_) => {
-                return Ok(super::talk::TalkRunProgress {
-                    next_index: from_index,
-                    ..super::talk::TalkRunProgress::default()
-                })
-            }
-        };
-        let mut progress = super::talk::TalkRunProgress {
-            next_index: from_index.saturating_add(events.len() as u64),
-            ..super::talk::TalkRunProgress::default()
-        };
-        for envelope in &events {
-            match &envelope.event {
-                RunEvent::ModelDelta { channel, text, .. } => {
-                    if matches!(channel, OutputChannel::Assistant) {
-                        progress.delta.push_str(text);
-                    }
-                }
-                RunEvent::Completed { .. } => progress.finished = true,
-                RunEvent::Failed { message, .. } => {
-                    progress.finished = true;
-                    progress.error = Some(message.clone());
-                }
-                RunEvent::Cancelled { .. } => {
-                    progress.finished = true;
-                    if progress.delta.trim().is_empty() {
-                        progress.error = Some("This turn was cancelled.".to_string());
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(progress)
-    }
-
-    fn cancel(&self, run_id: &str) -> Result<(), String> {
-        // The same two steps the run centre and the phone's cancel button take:
-        // ask the store to stop the job, and append the durable cancellation
-        // event. What a tool already did in the world is not undone by either,
-        // and nothing in Talk claims otherwise.
-        let now_ms = super::now_ms_public()?;
-        DaemonStore::open(&self.api.paths)
-            .and_then(|mut store| store.request_cancel(run_id, now_ms))
-            .map_err(|error| error.to_string())?;
-        super::super::append_cancellation(&self.api.paths, run_id, "Interrupted by speech")
-            .map_err(|error| error.to_string())
-    }
-
-    fn still_granted(&self, device_id: &str) -> bool {
-        self.api.talk_capability_live(device_id)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::{BTreeSet, HashMap};
-    use std::path::PathBuf;
-
-    use super::super::protocol::DeviceReadiness;
-
-    use little_monkey_lib::run_ledger::RunLedger;
-    use little_monkey_lib::run_protocol::{
-        ClientIdentity, ClientKind, ModelTargetSnapshot, PermissionMode as RunPermissionMode,
-        PermissionPolicySnapshot, RootAccess, RootGrant, RunBudgets, RunKind, RunSpec,
-        ToolPolicyDecision, WorkspaceContext, RUN_PROTOCOL_SCHEMA_VERSION,
-    };
-
-    use super::*;
-    use crate::daemon::remote::protocol::{
-        sign_request, DeviceConstraints, OsPermission, RemoteAction,
-    };
-    use crate::daemon::remote::store::{DeviceCommandRequest, RemoteSecretStore};
-    use crate::daemon::store::DaemonConfig;
-    use crate::durable_run::DurableRunRecorder;
-    use little_monkey_lib::contract;
-
-    /// **The published contract's remote-plane table is checked against this
-    /// file's own dispatch match, not against a memory of it.**
-    ///
-    /// `little_monkey_lib::contract::REMOTE_ROUTES` is what third parties read
-    /// (K19). It cannot live beside the match â€” the contract is generated in
-    /// the library and this is a binary crate â€” so the risk is the ordinary
-    /// one for any second copy: a route added here, never published, and a
-    /// package that gates on the contract version therefore gating on a lie.
-    ///
-    /// This scans the match arms themselves: method, path shape *and* the
-    /// exact `RemoteAction`/`DeviceCapability` variant each arm requires. A
-    /// new route, a moved segment or a re-graded gate fails here rather than
-    /// in a reviewer's memory. The technique is `egress.rs`'s bare-client
-    /// ratchet and `server.rs`'s admission scan, for the same reason: the
-    /// defect class is "a call site that looks fine in isolation".
-    #[test]
-    fn every_dispatched_remote_route_is_in_the_published_contract() {
-        const SOURCE: &str = include_str!("api.rs");
-        let production = SOURCE
-            .split_once("\n#[cfg(test)]")
-            .map_or(SOURCE, |(before, _)| before);
-
-        // The one route dispatched before the match, because it runs before a
-        // device (and therefore a signature) exists.
-        assert!(
-            production.contains(r#"request.path_and_query == "/v1/remote/pairings/accept""#),
-            "the unauthenticated pairing route moved; the contract still names it"
-        );
-
-        let lines: Vec<&str> = production.lines().collect();
-        let mut dispatched: BTreeSet<(String, String, String)> = BTreeSet::new();
-        for (index, line) in lines.iter().enumerate() {
-            let trimmed = line.trim();
-            let Some(rest) = trimmed.strip_prefix('(') else {
-                continue;
-            };
-            let Some((method, rest)) = rest.split_once(", [") else {
-                continue;
-            };
-            let Some(method) = method.strip_prefix('"').and_then(|m| m.strip_suffix('"')) else {
-                continue;
-            };
-            let Some((segments, _)) = rest.split_once("]) =>") else {
-                continue;
-            };
-            let path = segments
-                .split(',')
-                .map(str::trim)
-                .filter(|segment| !segment.is_empty())
-                .map(
-                    |segment| match segment.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-                        Some(literal) => format!("/{literal}"),
-                        None => format!("/{{{segment}}}"),
-                    },
-                )
-                .collect::<String>();
-            // The gate is whatever the arm's first grant check names. Three
-            // lines is enough for every arm rustfmt produces here; an arm that
-            // grew past it would fail as `self_service` and be noticed.
-            let arm = lines[index..(index + 3).min(lines.len())].join(" ");
-            let gate = if arm.contains("require_any_peer_capability") {
-                // The peer plane's gate is "any of the three peer grants",
-                // which no single `DeviceCapability::` token can name.
-                "peer_standing".to_string()
-            } else {
-                arm.split_once("RemoteAction::")
-                    .map(|(_, tail)| format!("action:{}", variant(tail)))
-                    .or_else(|| {
-                        arm.split_once("DeviceCapability::")
-                            .map(|(_, tail)| format!("capability:{}", variant(tail)))
-                    })
-                    .unwrap_or_else(|| "self_service".to_string())
-            };
-            dispatched.insert((method.to_string(), path, gate));
-        }
-
-        let published: BTreeSet<(String, String, String)> = contract::REMOTE_ROUTES
-            .iter()
-            .filter(|route| route.gate != contract::RemoteGate::Unauthenticated)
-            .map(|route| {
-                (
-                    route.method.to_string(),
-                    route.path.to_string(),
-                    match route.gate {
-                        contract::RemoteGate::Action(action) => format!("action:{action}"),
-                        contract::RemoteGate::Capability(capability) => {
-                            format!("capability:{capability}")
-                        }
-                        contract::RemoteGate::SelfService => "self_service".to_string(),
-                        contract::RemoteGate::PeerStanding => "peer_standing".to_string(),
-                        contract::RemoteGate::Unauthenticated => unreachable!("filtered above"),
-                    },
-                )
-            })
-            .collect();
-
-        assert_eq!(
-            dispatched, published,
-            "the dispatch match and the published K19 contract disagree; \
-             update contract::REMOTE_ROUTES and republish (docs/contract-abi.md)"
-        );
-    }
-
-    /// The leading identifier of `Variant => ...`, `Variant)` or similar.
-    fn variant(tail: &str) -> String {
-        tail.chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect()
-    }
-
-    /// The wire version the contract publishes is the one this plane rejects
-    /// mismatches against. Two constants, one fact.
-    #[test]
-    fn the_published_remote_protocol_version_is_the_one_enforced() {
-        assert_eq!(contract::REMOTE_PROTOCOL_VERSION, REMOTE_PROTOCOL_VERSION);
-    }
-
-    #[derive(Default)]
-    struct FakeSecrets(Mutex<HashMap<String, Vec<u8>>>);
-    impl RemoteSecretStore for FakeSecrets {
-        fn get(&self, slot: &str) -> Result<Vec<u8>, String> {
-            self.0
-                .lock()
-                .unwrap()
-                .get(slot)
-                .cloned()
-                .ok_or_else(|| "missing secret".to_string())
-        }
-        fn set(&self, slot: &str, secret: &[u8]) -> Result<(), String> {
-            self.0
-                .lock()
-                .unwrap()
-                .insert(slot.to_string(), secret.to_vec());
-            Ok(())
-        }
-        fn delete(&self, slot: &str) -> Result<(), String> {
-            self.0.lock().unwrap().remove(slot);
-            Ok(())
-        }
-    }
-
-    fn spec(run_id: &str, workspace: &str) -> RunSpec {
-        RunSpec {
-            schema_version: RUN_PROTOCOL_SCHEMA_VERSION,
-            run_id: run_id.to_string(),
-            idempotency_key: format!("idem-{run_id}"),
-            created_at_ms: 1_000,
-            kind: RunKind::Background,
-            submitted_by: ClientIdentity {
-                client_id: "fixture".into(),
-                instance_id: "fixture".into(),
-                kind: ClientKind::Daemon,
-                version: "1".into(),
-            },
-            task: "fixture".into(),
-            instructions: None,
-            input_artifact_ids: vec![],
-            target: ModelTargetSnapshot::Provider {
-                target_id: "fixture".into(),
-                label: "fixture".into(),
-                provider_id: "fixture".into(),
-                endpoint: "https://example.invalid/v1".into(),
-                model: "fixture".into(),
-                credential_ref_id: "credential-none".into(),
-                capabilities: crate::task::cli_capabilities(),
-            },
-            workspace: Some(WorkspaceContext {
-                workspace_id: workspace.into(),
-                primary_root_id: "root".into(),
-                roots: vec![RootGrant {
-                    root_id: "root".into(),
-                    canonical_path: "/tmp".into(),
-                    access: RootAccess::ReadWrite,
-                    allow_symlinks_within_root: false,
-                }],
-                repository_policy: None,
-            }),
-            permission_policy: PermissionPolicySnapshot {
-                mode: RunPermissionMode::Auto,
-                unattended: true,
-                approval_timeout_ms: 60_000,
-                default_tool_decision: ToolPolicyDecision::Prompt,
-                tool_rules: vec![],
-                allow_network: false,
-                allow_external_mutations: false,
-                egress_allowlist: None,
-                channel_send: None,
-            },
-            budgets: RunBudgets {
-                wall_time_ms: 60_000,
-                max_iterations: 2,
-                max_model_calls: 2,
-                max_tool_calls: 2,
-                max_input_tokens: 10_000,
-                max_output_tokens: 10_000,
-                max_cost_micros: None,
-                max_artifact_bytes: 1_024,
-                max_event_count: 1_000,
-            },
-        }
-    }
-
-    /// `handle` wraps every path, so an unauthenticated request â€” the one that
-    /// never reaches a route at all â€” is still an event. That is the property
-    /// the wrapper buys over instrumenting routes: there is no branch to miss.
-    #[test]
-    fn an_unauthenticated_remote_request_is_still_recorded_as_denied() {
-        let (root, api, _secrets, _device, _key) = fixture();
-
-        let response = api.handle(
-            ApiRequest {
-                method: "GET".to_string(),
-                path_and_query: "/v1/remote/runs?limit=5".to_string(),
-                body: Vec::new(),
-                auth: None,
-            },
-            2_000,
-        );
-        assert_eq!(response.status, 401, "no signed auth means refused");
-
-        let ledger =
-            little_monkey_lib::run_ledger::RunLedger::open(DaemonPaths::under(&root).ledger_db)
-                .unwrap();
-        let events = ledger.recent_subsystem_events(None, 10).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].subsystem,
-            little_monkey_lib::run_ledger::Subsystem::Remote
-        );
-        assert_eq!(
-            events[0].action, "GET /v1/remote/runs",
-            "the query string is dropped: it carries ids and the row is permanent"
-        );
-        assert_eq!(
-            events[0].outcome,
-            little_monkey_lib::run_ledger::SubsystemOutcome::Denied,
-            "a refusal is not a failure â€” a reader counting failures must not count it"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    fn fixture() -> (PathBuf, RemoteApi, Arc<FakeSecrets>, String, Vec<u8>) {
-        fixture_with(BTreeSet::from([
-            RemoteAction::ViewRuns,
-            RemoteAction::ViewEvents,
-            RemoteAction::Approve,
-            RemoteAction::Cancel,
-        ]))
-    }
-
-    /// The same fixture with an explicit grant, so a test can prove an action
-    /// is refused without it as well as honoured with it.
-    fn fixture_with(
-        actions: BTreeSet<RemoteAction>,
-    ) -> (PathBuf, RemoteApi, Arc<FakeSecrets>, String, Vec<u8>) {
-        fixture_scoped(actions, BTreeSet::from(["run-one".to_string()]))
-    }
-
-    /// The same fixture with an explicit run scope, so a migration test can pair
-    /// a device for a run this node does not have yet â€” which is the only shape
-    /// a placement ever has.
-    fn fixture_scoped(
-        actions: BTreeSet<RemoteAction>,
-        run_ids: BTreeSet<String>,
-    ) -> (PathBuf, RemoteApi, Arc<FakeSecrets>, String, Vec<u8>) {
-        let root =
-            std::env::temp_dir().join(format!("little-monkey-remote-api-{}", uuid::Uuid::new_v4()));
-        let paths = DaemonPaths::under(&root);
-        paths.ensure().unwrap();
-        DaemonConfig::default().save(&paths).unwrap();
-        let ledger = RunLedger::open(&paths.ledger_db).unwrap();
-        let (recorder, _) =
-            DurableRunRecorder::submit(ledger, &spec("run-one", "workspace-one"), "fixture".into())
-                .unwrap();
-        recorder
-            .emit(RunEvent::Queued {
-                queue: Some("fixture".into()),
-            })
-            .unwrap();
-        recorder
-            .emit(RunEvent::Started {
-                engine_id: "fixture".into(),
-            })
-            .unwrap();
-        let fixture_expiry = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
-            + 60_000;
-        recorder
-            .emit(RunEvent::PermissionRequested {
-                request_id: "approval-one".into(),
-                tool_call_id: "tool-one".into(),
-                tool_name: "write_file".into(),
-                operation_sha256: "a".repeat(64),
-                expires_at_ms: fixture_expiry,
-                detail: "fixture approval".into(),
-                risk_level: None,
-                risk_reason: None,
-            })
-            .unwrap();
-        recorder
-            .emit(RunEvent::AwaitingApproval {
-                request_id: "approval-one".into(),
-                operation_sha256: "a".repeat(64),
-                expires_at_ms: fixture_expiry,
-                reason: Some("fixture".into()),
-            })
-            .unwrap();
-        let mut daemon_store = DaemonStore::open(&paths).unwrap();
-        let snapshot = paths.snapshots.join("job-run-one.json");
-        std::fs::write(&snapshot, b"{}").unwrap();
-        daemon_store
-            .insert_preparing(
-                &crate::daemon::store::NewDaemonJob {
-                    job_id: "job-run-one".into(),
-                    recipe_snapshot: snapshot,
-                    priority: 0,
-                    max_attempts: 1,
-                    created_at_ms: 1_000,
-                    max_runtime_ms: 60_000,
-                    max_memory_bytes: None,
-                    max_log_bytes: 1_024 * 1_024,
-                    repository_policy_json: None,
-                    worktree_json: None,
-                    parent_run_id: None,
-                },
-                8,
-            )
-            .unwrap();
-        daemon_store
-            .mark_queued("job-run-one", "run-one", 1_000)
-            .unwrap();
-        let host = RemoteHostConfig {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            runner_id: "runner-one".into(),
-            listen: "127.0.0.1:1".into(),
-            advertise_url: "https://runner.invalid".into(),
-            certificate_path: "/tmp/cert".into(),
-            private_key_path: "/tmp/key".into(),
-            certificate_sha256: "a".repeat(64),
-            enabled: true,
-        };
-        let mut store = RemoteStore::open(&paths.root).unwrap();
-        let scopes = RemoteScopes {
-            actions,
-            run_ids,
-            workspace_ids: BTreeSet::new(),
-            max_artifact_bytes: 1_024,
-        };
-        let secrets = Arc::new(FakeSecrets::default());
-        let invite = store.create_invitation(&scopes, 1_000, 3_000).unwrap();
-        let accepted = store
-            .accept_invitation(
-                &invite.pairing_id,
-                &invite.token,
-                "phone",
-                "runner-one",
-                1_100,
-                secrets.as_ref(),
-            )
-            .unwrap();
-        let secret = accepted.device_secret.as_bytes().to_vec();
-        let api = RemoteApi::injected(paths, host, store, secrets.clone());
-        (root, api, secrets, accepted.device_id, secret)
-    }
-
-    fn signed(
-        device_id: &str,
-        secret: &[u8],
-        sequence: u64,
-        command: &str,
-        method: &str,
-        path: &str,
-        body: &[u8],
-    ) -> ApiRequest {
-        signed_at(
-            device_id, secret, sequence, command, method, path, body, 2_000,
-        )
-    }
-
-    /// The same signed request against a caller-chosen clock.
-    ///
-    /// Every other test drives the API at a fixed `now_ms`, which is what makes
-    /// them deterministic. A Talk ticket cannot: it is minted through the API
-    /// and redeemed by the socket layer, which reads the real clock â€” so a
-    /// ticket issued in 1970 is expired before the handshake starts.
-    #[allow(clippy::too_many_arguments)]
-    fn signed_at(
-        device_id: &str,
-        secret: &[u8],
-        sequence: u64,
-        command: &str,
-        method: &str,
-        path: &str,
-        body: &[u8],
-        timestamp_ms: u64,
-    ) -> ApiRequest {
-        let mut auth = SignedRequestHeaders {
-            device_id: device_id.into(),
-            secret_generation: 1,
-            sequence,
-            timestamp_ms,
-            nonce: format!("nonce-{command}-0123456789"),
-            command_id: command.into(),
-            signature: String::new(),
-        };
-        auth.signature = sign_request(secret, &auth, method, path, body);
-        ApiRequest {
-            method: method.into(),
-            path_and_query: path.into(),
-            body: body.to_vec(),
-            auth: Some(auth),
-        }
-    }
-
-    #[test]
-    fn out_of_scope_run_is_indistinguishable_from_missing() {
-        let (root, api, _secrets, device, secret) = fixture();
-        let response = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-hidden",
-                "GET",
-                "/v1/remote/runs/run-hidden",
-                b"",
-            ),
-            2_000,
-        );
-        assert_eq!(response.status, 404);
-        assert!(!String::from_utf8_lossy(&response.body).contains("scope"));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn pausing_requires_its_own_grant_and_is_not_implied_by_cancel() {
-        // The weaker action is not free. A controller trusted to destroy a run
-        // is a different decision from one trusted to suspend it, and neither
-        // implies the other â€” otherwise adding this action would silently widen
-        // every pairing that already had `cancel`.
-        let (root, api, _secrets, device, secret) = fixture();
-        let response = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-pause-denied",
-                "POST",
-                "/v1/remote/runs/run-one/pause",
-                b"{}",
-            ),
-            2_000,
-        );
-        assert_eq!(response.status, 403);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn pause_and_resume_move_the_daemons_own_bit() {
-        // The gap this closes: the daemon has supported pause since it had a
-        // `pause_requested` bit, but no remote action reached it, so a paired
-        // controller could only stop a run by destroying it.
-        let (root, api, _secrets, device, secret) = fixture_with(BTreeSet::from([
-            RemoteAction::ViewRuns,
-            RemoteAction::Pause,
-        ]));
-        let paths = DaemonPaths::under(&root);
-
-        let paused = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-pause",
-                "POST",
-                "/v1/remote/runs/run-one/pause",
-                b"{}",
-            ),
-            2_000,
-        );
-        assert_eq!(paused.status, 202);
-        assert!(
-            DaemonStore::open(&paths)
-                .unwrap()
-                .get_job("run-one")
-                .unwrap()
-                .expect("job exists")
-                .pause_requested,
-            "a remote pause must reach the daemon's own bit, not just return 202"
-        );
-
-        let resumed = api.handle(
-            signed(
-                &device,
-                &secret,
-                2,
-                "cmd-resume",
-                "POST",
-                "/v1/remote/runs/run-one/resume",
-                b"{}",
-            ),
-            2_001,
-        );
-        assert_eq!(resumed.status, 202);
-        assert!(
-            !DaemonStore::open(&paths)
-                .unwrap()
-                .get_job("run-one")
-                .unwrap()
-                .expect("job exists")
-                .pause_requested
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn lost_response_replay_returns_cached_result_without_second_cancel_event() {
-        let (root, api, _secrets, device, secret) = fixture();
-        let body = br#"{"reason":"phone stop"}"#;
-        let request = signed(
-            &device,
-            &secret,
-            1,
-            "cmd-cancel",
-            "POST",
-            "/v1/remote/runs/run-one/cancel",
-            body,
-        );
-        let first = api.handle(request.clone(), 2_000);
-        let replay = api.handle(request, 2_001);
-        assert_eq!(first.status, 202);
-        assert_eq!(first, replay);
-        let events = RunLedger::open(&DaemonPaths::under(&root).ledger_db)
-            .unwrap()
-            .load_events("run-one", 0, 100)
-            .unwrap();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event.event, RunEvent::CancellationRequested { .. }))
-                .count(),
-            1
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn reconnect_reconciles_a_reserved_command_once_after_server_crash() {
-        let (root, api, _secrets, device, secret) = fixture();
-        let body = br#"{"reason":"reconnect stop"}"#;
-        let request = signed(
-            &device,
-            &secret,
-            1,
-            "cmd-crash",
-            "POST",
-            "/v1/remote/runs/run-one/cancel",
-            body,
-        );
-        let auth = request.auth.as_ref().unwrap();
-        let request_sha = sha256_hex(&canonical_request(
-            auth,
-            &request.method,
-            &request.path_and_query,
-            &request.body,
-        ));
-        // Simulate a runner crash immediately after reserving the monotonic
-        // command but before dispatching the cancellation.
-        assert_eq!(
-            api.store
-                .lock()
-                .unwrap()
-                .reserve_command(
-                    &device,
-                    1,
-                    &auth.command_id,
-                    &auth.nonce,
-                    auth.sequence,
-                    &request_sha,
-                    &request.method,
-                    &request.path_and_query,
-                    2_000,
-                )
-                .unwrap(),
-            CommandReservation::New
-        );
-        let recovered = api.handle(request.clone(), 2_001);
-        let replay = api.handle(request, 2_002);
-        assert_eq!(recovered.status, 202);
-        assert_eq!(recovered, replay);
-        let events = RunLedger::open(&DaemonPaths::under(&root).ledger_db)
-            .unwrap()
-            .load_events("run-one", 0, 100)
-            .unwrap();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event.event, RunEvent::CancellationRequested { .. }))
-                .count(),
-            1
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn invalid_signature_cannot_consume_sequence_or_cancel() {
-        let (root, api, _secrets, device, secret) = fixture();
-        let mut request = signed(
-            &device,
-            &secret,
-            1,
-            "cmd-forged",
-            "POST",
-            "/v1/remote/runs/run-one/cancel",
-            br#"{"reason":null}"#,
-        );
-        request.body = br#"{"reason":"tampered"}"#.to_vec();
-        assert_eq!(api.handle(request, 2_000).status, 401);
-        let valid = signed(
-            &device,
-            &secret,
-            1,
-            "cmd-valid",
-            "GET",
-            "/v1/remote/runs/run-one",
-            b"",
-        );
-        assert_eq!(api.handle(valid, 2_001).status, 200);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn approval_requires_the_exact_pending_operation_digest_and_is_idempotent() {
-        let (root, api, _secrets, device, secret) = fixture();
-        let wrong = br#"{"request_id":"approval-one","operation_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","decision":"allow_once"}"#;
-        let wrong_response = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-wrong-digest",
-                "POST",
-                "/v1/remote/runs/run-one/approve",
-                wrong,
-            ),
-            2_000,
-        );
-        assert_eq!(wrong_response.status, 403);
-        let valid_body = br#"{"request_id":"approval-one","operation_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","decision":"allow_once"}"#;
-        let valid = signed(
-            &device,
-            &secret,
-            2,
-            "cmd-approve",
-            "POST",
-            "/v1/remote/runs/run-one/approve",
-            valid_body,
-        );
-        let first = api.handle(valid.clone(), 2_001);
-        let replay = api.handle(valid, 2_002);
-        assert_eq!(first.status, 200, "body: {:?}", first.body);
-        assert_eq!(first, replay);
-        let approval = RunLedger::open(&DaemonPaths::under(&root).ledger_db)
-            .unwrap()
-            .load_approval("run-one", "approval-one")
-            .unwrap()
-            .unwrap();
-        assert_eq!(approval.decision, Some(PermissionDecision::AllowOnce));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    // --- `/v1/remote/mobile/*` extension ----------------------------------
-
-    #[derive(Default)]
-    struct FakeChatQueue {
-        queued: Mutex<Vec<(String, String)>>,
-    }
-
-    impl MobileChatQueue for FakeChatQueue {
-        fn queue_chat(
-            &self,
-            _session_id: &str,
-            client_key: &str,
-            prompt: &str,
-        ) -> Result<String, String> {
-            self.queued
-                .lock()
-                .unwrap()
-                .push((client_key.to_string(), prompt.to_string()));
-            Ok(format!("run-{client_key}"))
-        }
-
-        fn chat_run_id(
-            &self,
-            _session_id: &str,
-            client_key: &str,
-        ) -> Result<Option<String>, String> {
-            Ok(self
-                .queued
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|(key, _)| key == client_key)
-                .map(|(key, _)| format!("run-{key}")))
-        }
-    }
-
-    /// The whole point of the separate capability grant: a device paired
-    /// before mobile capabilities existed (or paired deliberately as a
-    /// runner-only controller) resolves through `legacy_capabilities`, which
-    /// never contains Chat â€” so a newer phone build cannot talk itself into
-    /// a chat surface the operator never granted.
-    #[test]
-    fn legacy_pairing_cannot_reach_mobile_chat_or_workflow_launch() {
-        let (root, api, _secrets, device, secret) = fixture();
-        let api = api.with_mobile_chat(Arc::new(FakeChatQueue::default()));
-        for (index, (method, path, body)) in [
-            ("GET", "/v1/remote/mobile/sessions", &b""[..]),
-            (
-                "POST",
-                "/v1/remote/mobile/sessions/s1/messages",
-                br#"{"text":"hi"}"#,
-            ),
-            ("GET", "/v1/remote/mobile/workflows", b""),
-            ("POST", "/v1/remote/mobile/workflows/wf/runs", b"{}"),
-            (
-                "POST",
-                "/v1/remote/mobile/captures",
-                br#"{"capture_id":"c1","kind":"text","title":"t","text":"x"}"#,
-            ),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let response = api.handle(
-                signed(
-                    &device,
-                    &secret,
-                    index as u64 + 1,
-                    &format!("cmd-legacy-{index}"),
-                    method,
-                    path,
-                    body,
-                ),
-                2_000 + index as u64,
-            );
-            assert_eq!(
-                response.status, 403,
-                "{method} {path} should be capability-denied"
-            );
-        }
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn granted_device_queues_one_chat_turn_and_reads_it_back() {
-        let (root, api, secrets, _legacy_device, _legacy_secret) = fixture();
-        let queue = Arc::new(FakeChatQueue::default());
-        let api = api.with_mobile_chat(queue.clone());
-        // Pair a second device that DOES carry the mobile grants.
-        let (device, secret) = {
-            let mut store = RemoteStore::open(&DaemonPaths::under(&root).root).unwrap();
-            let scopes = RemoteScopes {
-                actions: BTreeSet::from([RemoteAction::ViewRuns]),
-                run_ids: BTreeSet::from(["run-one".into()]),
-                workspace_ids: BTreeSet::new(),
-                max_artifact_bytes: 1_024,
-            };
-            let capabilities = BTreeSet::from([
-                DeviceCapability::ViewRuns,
-                DeviceCapability::ViewSessions,
-                DeviceCapability::Chat,
-            ]);
-            let invite = store
-                .create_invitation_with_capabilities(&scopes, &capabilities, 1_000, 3_000)
-                .unwrap();
-            let accepted = store
-                .accept_invitation(
-                    &invite.pairing_id,
-                    &invite.token,
-                    "granted-phone",
-                    "runner-one",
-                    1_100,
-                    secrets.as_ref(),
-                )
-                .unwrap();
-            (
-                accepted.device_id,
-                accepted.device_secret.as_bytes().to_vec(),
-            )
-        };
-
-        let post = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-chat-post",
-                "POST",
-                "/v1/remote/mobile/sessions/s1/messages",
-                br#"{"text":"what is queued?"}"#,
-            ),
-            2_000,
-        );
-        assert_eq!(
-            post.status,
-            201,
-            "body: {:?}",
-            String::from_utf8_lossy(&post.body)
-        );
-        assert_eq!(queue.queued.lock().unwrap().len(), 1);
-        assert_eq!(queue.queued.lock().unwrap()[0].1, "what is queued?");
-
-        let get = api.handle(
-            signed(
-                &device,
-                &secret,
-                2,
-                "cmd-chat-get",
-                "GET",
-                "/v1/remote/mobile/sessions/s1/messages",
-                b"",
-            ),
-            2_001,
-        );
-        assert_eq!(get.status, 200);
-        let body: serde_json::Value = serde_json::from_slice(&get.body).unwrap();
-        let messages = body["messages"].as_array().unwrap();
-        assert_eq!(
-            messages.len(),
-            1,
-            "only the user turn exists until the run is terminal"
-        );
-        assert_eq!(messages[0]["role"], "user");
-        assert_eq!(messages[0]["text"], "what is queued?");
-        assert_eq!(messages[0]["task_state"], "queued");
-
-        // The session list is derived from the same rows.
-        let sessions = api.handle(
-            signed(
-                &device,
-                &secret,
-                3,
-                "cmd-sessions",
-                "GET",
-                "/v1/remote/mobile/sessions",
-                b"",
-            ),
-            2_002,
-        );
-        assert_eq!(sessions.status, 200);
-        let listed: serde_json::Value = serde_json::from_slice(&sessions.body).unwrap();
-        assert_eq!(listed["sessions"][0]["id"], "s1");
-        assert_eq!(listed["sessions"][0]["title"], "what is queued?");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A capture whose declared digest does not match the uploaded bytes is
-    /// rejected outright â€” the node never stores content it cannot vouch for.
-    #[test]
-    fn capture_rejects_a_digest_that_does_not_match_its_bytes() {
-        let (root, api, secrets, _d, _s) = fixture();
-        let (device, secret) = {
-            let mut store = RemoteStore::open(&DaemonPaths::under(&root).root).unwrap();
-            let scopes = RemoteScopes {
-                actions: BTreeSet::from([RemoteAction::ViewRuns]),
-                run_ids: BTreeSet::from(["run-one".into()]),
-                workspace_ids: BTreeSet::new(),
-                max_artifact_bytes: 1_024,
-            };
-            let capabilities =
-                BTreeSet::from([DeviceCapability::ViewRuns, DeviceCapability::Capture]);
-            let invite = store
-                .create_invitation_with_capabilities(&scopes, &capabilities, 1_000, 3_000)
-                .unwrap();
-            let accepted = store
-                .accept_invitation(
-                    &invite.pairing_id,
-                    &invite.token,
-                    "capture-phone",
-                    "runner-one",
-                    1_100,
-                    secrets.as_ref(),
-                )
-                .unwrap();
-            (
-                accepted.device_id,
-                accepted.device_secret.as_bytes().to_vec(),
-            )
-        };
-        let payload = STANDARD.encode(b"hello");
-        let body = format!(
-            r#"{{"capture_id":"c1","kind":"file","title":"note","content_base64":"{payload}","content_sha256":"{}"}}"#,
-            "b".repeat(64)
-        );
-        let response = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-capture-bad",
-                "POST",
-                "/v1/remote/mobile/captures",
-                body.as_bytes(),
-            ),
-            2_000,
-        );
-        assert_eq!(response.status, 400);
-        assert!(String::from_utf8_lossy(&response.body).contains("content_sha256"));
-        let _ = std::fs::remove_dir_all(root);
-    }
-    // --- `/v1/remote/node/*` placement plane (roadmap K17) -----------------
-
-    #[derive(Default)]
-    struct FakePlacementQueue {
-        placed: Mutex<Vec<String>>,
-        refuse: Option<String>,
-    }
-
-    impl FakePlacementQueue {
-        fn refusing(reason: &str) -> Self {
-            Self {
-                placed: Mutex::new(Vec::new()),
-                refuse: Some(reason.to_string()),
-            }
-        }
-    }
-
-    impl PlacementQueue for FakePlacementQueue {
-        fn place(
-            &self,
-            spec: &little_monkey_lib::run_protocol::RunSpec,
-        ) -> Result<PlacedJob, String> {
-            if let Some(reason) = &self.refuse {
-                return Err(reason.clone());
-            }
-            self.placed.lock().unwrap().push(spec.run_id.clone());
-            Ok(PlacedJob {
-                // The node mints its own ids â€” deliberately different from the
-                // submitter's, which is the property the response's two id
-                // fields exist to keep visible.
-                node_run_id: format!("node-{}", spec.run_id),
-                job_id: format!("job-{}", spec.run_id),
-                state: "queued".to_string(),
-            })
-        }
-
-        fn placed_state(&self, job_id: &str) -> Result<Option<PlacedJobState>, String> {
-            Ok(Some(PlacedJobState {
-                state: "running".to_string(),
-                terminal: false,
-                updated_at_ms: 3_000,
-                last_error: Some(format!("state of {job_id}")),
-            }))
-        }
-    }
-
-    /// A pairing that carries the two K17 grants, so the placement plane is
-    /// reachable at all.
-    fn placement_fixture() -> (PathBuf, RemoteApi, String, Vec<u8>) {
-        let root = std::env::temp_dir().join(format!(
-            "little-monkey-remote-place-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let paths = DaemonPaths::under(&root);
-        paths.ensure().unwrap();
-        DaemonConfig::default().save(&paths).unwrap();
-        let host = RemoteHostConfig {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            runner_id: "runner-one".into(),
-            listen: "127.0.0.1:1".into(),
-            advertise_url: "https://runner.invalid".into(),
-            certificate_path: "/tmp/cert".into(),
-            private_key_path: "/tmp/key".into(),
-            certificate_sha256: "a".repeat(64),
-            enabled: true,
-        };
-        let mut store = RemoteStore::open(&paths.root).unwrap();
-        let scopes = RemoteScopes {
-            actions: BTreeSet::from([RemoteAction::ViewRuns]),
-            run_ids: BTreeSet::from(["run-one".into()]),
-            workspace_ids: BTreeSet::new(),
-            max_artifact_bytes: 1_024,
-        };
-        let capabilities = BTreeSet::from([
-            DeviceCapability::ViewRuns,
-            DeviceCapability::DescribeNode,
-            DeviceCapability::PlaceRuns,
-        ]);
-        let secrets = Arc::new(FakeSecrets::default());
-        let invite = store
-            .create_invitation_with_capabilities(&scopes, &capabilities, 1_000, 3_000)
-            .unwrap();
-        let accepted = store
-            .accept_invitation_with_capabilities(
-                &invite.pairing_id,
-                &invite.token,
-                "scheduler",
-                "runner-one",
-                None,
-                1_100,
-                secrets.as_ref(),
-            )
-            .unwrap();
-        let secret = accepted.device_secret.as_bytes().to_vec();
-        let api = RemoteApi::injected(paths, host, store, secrets);
-        (root, api, accepted.device_id, secret)
-    }
-
-    /// Two installations, in one process: this node, and a peer paired into it
-    /// with the grants named. No second machine, no network â€” the signature
-    /// path and the gate are the same ones a real pairing uses.
-    fn peer_fixture(
-        capabilities: BTreeSet<DeviceCapability>,
-    ) -> (PathBuf, RemoteApi, String, Vec<u8>) {
-        let root = std::env::temp_dir().join(format!(
-            "little-monkey-remote-peer-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let paths = DaemonPaths::under(&root);
-        paths.ensure().unwrap();
-        DaemonConfig::default().save(&paths).unwrap();
-        let host = RemoteHostConfig {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            runner_id: "runner-local".into(),
-            listen: "127.0.0.1:1".into(),
-            advertise_url: "https://runner.invalid".into(),
-            certificate_path: "/tmp/cert".into(),
-            private_key_path: "/tmp/key".into(),
-            certificate_sha256: "a".repeat(64),
-            enabled: true,
-        };
-        let mut store = RemoteStore::open(&paths.root).unwrap();
-        let scopes = RemoteScopes {
-            actions: BTreeSet::new(),
-            run_ids: BTreeSet::new(),
-            workspace_ids: BTreeSet::new(),
-            max_artifact_bytes: 1_024,
-        };
-        let secrets = Arc::new(FakeSecrets::default());
-        let invite = store
-            .create_invitation_with_capabilities(&scopes, &capabilities, 1_000, 3_000)
-            .unwrap();
-        let accepted = store
-            .accept_invitation_with_capabilities(
-                &invite.pairing_id,
-                &invite.token,
-                "peer-two",
-                "runner-local",
-                None,
-                1_100,
-                secrets.as_ref(),
-            )
-            .unwrap();
-        let secret = accepted.device_secret.as_bytes().to_vec();
-        let api = RemoteApi::injected(paths, host, store, secrets);
-        (root, api, accepted.device_id, secret)
-    }
-
-    fn every_peer_grant() -> BTreeSet<DeviceCapability> {
-        BTreeSet::from([
-            DeviceCapability::PeerMessage,
-            DeviceCapability::PeerTaskRequest,
-            DeviceCapability::PeerArtifact,
-        ])
-    }
-
-    fn peer_body(message_id: &str, kind: little_monkey_lib::peers::PeerMessageKind) -> Vec<u8> {
-        let mut envelope = little_monkey_lib::peers::PeerEnvelope::new(
-            message_id,
-            "thread-1",
-            kind,
-            "instance-peer-two",
-            "summarize the failing nightly build",
-            2_000,
-            600_000,
-        );
-        envelope.correlation_id = Some("corr-1".into());
-        serde_json::to_vec(&envelope).unwrap()
-    }
-
-    #[derive(Default)]
-    struct FakePeerRuns {
-        submitted: std::sync::Mutex<Vec<little_monkey_lib::channels::ingress::ConversationIngress>>,
-    }
-
-    impl crate::daemon::channel_worker::RunQueue for FakePeerRuns {
-        fn freeze_execution(
-            &self,
-            ingress: &little_monkey_lib::channels::ingress::ConversationIngress,
-        ) -> Result<little_monkey_lib::channels::ingress::FrozenExecutionContext, String> {
-            Ok(crate::daemon::channel_worker::test_frozen_execution(
-                ingress,
-            ))
-        }
-
-        fn submit(
-            &self,
-            ingress: &little_monkey_lib::channels::ingress::ConversationIngress,
-            _params: Vec<String>,
-        ) -> Result<String, String> {
-            self.submitted.lock().unwrap().push(ingress.clone());
-            Ok(ingress.deterministic_job_id())
-        }
-    }
-
-    /// Peer standing is its own thing. A pairing without any of the three peer
-    /// grants cannot reach the peer plane at all â€” which is what keeps every
-    /// pairing that existed before this build from becoming a peer.
-    #[test]
-    fn a_pairing_without_peer_grants_cannot_reach_the_peer_plane() {
-        // An ordinary controller pairing â€” the shape every pairing that
-        // existed before peers shipped still has.
-        let (root, api, _secrets, device, secret) = fixture();
-        let api = api.with_peer_runs(Arc::new(FakePeerRuns::default()));
-        for (index, (method, path, body)) in [
-            (
-                "POST",
-                "/v1/remote/peer/messages",
-                peer_body("msg-1", little_monkey_lib::peers::PeerMessageKind::Message),
-            ),
-            ("GET", "/v1/remote/peer/threads/thread-1", Vec::new()),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let response = api.handle(
-                signed(
-                    &device,
-                    &secret,
-                    index as u64 + 1,
-                    &format!("cmd-peer-{index}"),
-                    method,
-                    path,
-                    &body,
-                ),
-                2_000,
-            );
-            assert_eq!(
-                response.status, 403,
-                "{method} {path} must need a peer grant"
-            );
-        }
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn a_peer_task_request_becomes_a_turn_and_the_thread_shows_it_still_running() {
-        let (root, api, device, secret) = peer_fixture(every_peer_grant());
-        let runs = Arc::new(FakePeerRuns::default());
-        let api = api.with_peer_runs(runs.clone());
-
-        let accepted = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-peer-send",
-                "POST",
-                "/v1/remote/peer/messages",
-                &peer_body(
-                    "msg-1",
-                    little_monkey_lib::peers::PeerMessageKind::TaskRequest,
-                ),
-            ),
-            2_000,
-        );
-        assert_eq!(accepted.status, 202);
-        let body: serde_json::Value = serde_json::from_slice(&accepted.body).unwrap();
-        assert_eq!(body["accepted"], true);
-        assert_eq!(body["thread_id"], "thread-1");
-        assert_eq!(body["correlation_id"], "corr-1");
-
-        // It reached the ordinary durable path, as a peer turn.
-        let submitted = runs.submitted.lock().unwrap().clone();
-        assert_eq!(submitted.len(), 1);
-        assert_eq!(
-            submitted[0].source,
-            little_monkey_lib::channels::ingress::ConversationSource::Peer
-        );
-
-        // Nothing has finished, so the thread carries the request and no result.
-        let thread = api.handle(
-            signed(
-                &device,
-                &secret,
-                2,
-                "cmd-peer-poll",
-                "GET",
-                "/v1/remote/peer/threads/thread-1",
-                b"",
-            ),
-            2_100,
-        );
-        assert_eq!(thread.status, 200);
-        let body: serde_json::Value = serde_json::from_slice(&thread.body).unwrap();
-        let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0]["direction"], "inbound");
-        assert_eq!(messages[0]["disposition"], "accepted");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn a_retried_delivery_is_answered_with_the_first_decision_and_runs_once() {
-        let (root, api, device, secret) = peer_fixture(every_peer_grant());
-        let runs = Arc::new(FakePeerRuns::default());
-        let api = api.with_peer_runs(runs.clone());
-        let body = peer_body(
-            "msg-1",
-            little_monkey_lib::peers::PeerMessageKind::TaskRequest,
-        );
-
-        let first = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-peer-a",
-                "POST",
-                "/v1/remote/peer/messages",
-                &body,
-            ),
-            2_000,
-        );
-        let second = api.handle(
-            signed(
-                &device,
-                &secret,
-                2,
-                "cmd-peer-b",
-                "POST",
-                "/v1/remote/peer/messages",
-                &body,
-            ),
-            2_050,
-        );
-
-        assert_eq!(first.status, 202);
-        assert_eq!(second.status, 200);
-        let repeated: serde_json::Value = serde_json::from_slice(&second.body).unwrap();
-        assert_eq!(repeated["state"], "duplicate");
-        assert_eq!(repeated["accepted"], true);
-        assert_eq!(runs.submitted.lock().unwrap().len(), 1);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn a_peer_granted_only_conversation_cannot_ask_for_work() {
-        let (root, api, device, secret) =
-            peer_fixture(BTreeSet::from([DeviceCapability::PeerMessage]));
-        let runs = Arc::new(FakePeerRuns::default());
-        let api = api.with_peer_runs(runs.clone());
-
-        let refused = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-peer-task",
-                "POST",
-                "/v1/remote/peer/messages",
-                &peer_body(
-                    "msg-1",
-                    little_monkey_lib::peers::PeerMessageKind::TaskRequest,
-                ),
-            ),
-            2_000,
-        );
-        assert_eq!(refused.status, 403);
-        assert!(runs.submitted.lock().unwrap().is_empty());
-
-        // The same peer may still talk.
-        let allowed = api.handle(
-            signed(
-                &device,
-                &secret,
-                2,
-                "cmd-peer-msg",
-                "POST",
-                "/v1/remote/peer/messages",
-                &peer_body("msg-2", little_monkey_lib::peers::PeerMessageKind::Message),
-            ),
-            2_010,
-        );
-        assert_eq!(allowed.status, 202);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn a_peer_cannot_read_another_peers_thread() {
-        let (root, api, device, secret) = peer_fixture(every_peer_grant());
-        let api = api.with_peer_runs(Arc::new(FakePeerRuns::default()));
-        api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-peer-seed",
-                "POST",
-                "/v1/remote/peer/messages",
-                &peer_body("msg-1", little_monkey_lib::peers::PeerMessageKind::Message),
-            ),
-            2_000,
-        );
-
-        // A second peer, paired into the same node, asks for the first one's
-        // thread by name. It gets the same answer a thread that does not exist
-        // gets, so probing cannot enumerate anyone.
-        let mut store = RemoteStore::open(&api.paths.root).unwrap();
-        let scopes = RemoteScopes {
-            actions: BTreeSet::new(),
-            run_ids: BTreeSet::new(),
-            workspace_ids: BTreeSet::new(),
-            max_artifact_bytes: 1_024,
-        };
-        let secrets = Arc::new(FakeSecrets::default());
-        let invite = store
-            .create_invitation_with_capabilities(&scopes, &every_peer_grant(), 1_000, 3_000)
-            .unwrap();
-        let intruder = store
-            .accept_invitation_with_capabilities(
-                &invite.pairing_id,
-                &invite.token,
-                "peer-three",
-                "runner-local",
-                None,
-                1_100,
-                secrets.as_ref(),
-            )
-            .unwrap();
-        drop(store);
-        let api = RemoteApi::injected(
-            api.paths.clone(),
-            api.host.clone(),
-            RemoteStore::open(&api.paths.root).unwrap(),
-            secrets,
-        )
-        .with_peer_runs(Arc::new(FakePeerRuns::default()));
-
-        let response = api.handle(
-            signed(
-                &intruder.device_id,
-                intruder.device_secret.as_bytes(),
-                1,
-                "cmd-peer-peek",
-                "GET",
-                "/v1/remote/peer/threads/thread-1",
-                b"",
-            ),
-            2_100,
-        );
-        assert_eq!(response.status, 404);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn an_envelope_that_loops_back_here_is_refused_before_it_is_stored() {
-        let (root, api, device, secret) = peer_fixture(every_peer_grant());
-        let runs = Arc::new(FakePeerRuns::default());
-        let api = api.with_peer_runs(runs.clone());
-        let mut looped = little_monkey_lib::peers::PeerEnvelope::new(
-            "msg-1",
-            "thread-1",
-            little_monkey_lib::peers::PeerMessageKind::Message,
-            "instance-peer-two",
-            "round and round",
-            2_000,
-            600_000,
-        );
-        // This node is already in the chain: the message has been here before.
-        looped.origin_chain.push("runner-local".into());
-
-        let response = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-peer-loop",
-                "POST",
-                "/v1/remote/peer/messages",
-                &serde_json::to_vec(&looped).unwrap(),
-            ),
-            2_000,
-        );
-        assert_eq!(response.status, 400);
-        assert!(runs.submitted.lock().unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn an_expired_request_is_refused_rather_than_run_late() {
-        let (root, api, device, secret) = peer_fixture(every_peer_grant());
-        let runs = Arc::new(FakePeerRuns::default());
-        let api = api.with_peer_runs(runs.clone());
-
-        // A one-second life, so the request can arrive after it expired and
-        // still be well inside the signature's own skew window: this has to
-        // fail as expired, not as unauthorized.
-        let stale = little_monkey_lib::peers::PeerEnvelope::new(
-            "msg-1",
-            "thread-1",
-            little_monkey_lib::peers::PeerMessageKind::TaskRequest,
-            "instance-peer-two",
-            "summarize the failing nightly build",
-            2_000,
-            1_000,
-        );
-        let response = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-peer-stale",
-                "POST",
-                "/v1/remote/peer/messages",
-                &serde_json::to_vec(&stale).unwrap(),
-            ),
-            120_000,
-        );
-        assert_eq!(response.status, 400);
-        assert!(runs.submitted.lock().unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    fn placement_body(
-        run_id: &str,
-        required_residency: Option<&str>,
-        expected_runner_id: Option<&str>,
-    ) -> Vec<u8> {
-        serde_json::to_vec(&little_monkey_lib::node_placement::PlaceRunRequest {
-            protocol_version: little_monkey_lib::node_placement::NODE_PROTOCOL_VERSION,
-            spec: spec(run_id, "workspace-one"),
-            required_residency: required_residency.map(str::to_string),
-            expected_runner_id: expected_runner_id.map(str::to_string),
-        })
-        .unwrap()
-    }
-
-    /// **The grant that gates the only route through which a run this machine
-    /// did not author can start here.** Every existing pairing â€” and any new
-    /// one that was not explicitly given the K17 grants â€” is refused, which is
-    /// why `PlaceRuns` is its own capability rather than an implication of
-    /// `RunWorkflows` or of any run scope.
-    #[test]
-    fn a_pairing_without_the_placement_grants_cannot_describe_or_place() {
-        let (root, api, _secrets, device, secret) = fixture();
-        let api = api.with_placement(Arc::new(FakePlacementQueue::default()));
-        for (index, (method, path, body)) in [
-            ("GET", "/v1/remote/node", &b""[..]),
-            ("GET", "/v1/remote/node/health", b""),
-            ("POST", "/v1/remote/node/runs", b"{}"),
-            ("GET", "/v1/remote/node/runs/run-one", b""),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let response = api.handle(
-                signed(
-                    &device,
-                    &secret,
-                    index as u64 + 1,
-                    &format!("cmd-node-{index}"),
-                    method,
-                    path,
-                    body,
-                ),
-                2_000,
-            );
-            assert_eq!(
-                response.status, 403,
-                "{method} {path} must need an explicit K17 grant"
-            );
-        }
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// The node checks the residency claim rather than trusting the placer's
-    /// word for it. A rule enforced only by the sender is not enforced.
-    #[test]
-    fn the_node_refuses_a_placement_whose_residency_rule_it_does_not_satisfy() {
-        let (root, api, device, secret) = placement_fixture();
-        let api = api.with_placement(Arc::new(FakePlacementQueue::default()));
-        let body = placement_body("run-placed", Some("eu-west"), None);
-        let response = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-residency",
-                "POST",
-                "/v1/remote/node/runs",
-                &body,
-            ),
-            2_000,
-        );
-        assert_eq!(response.status, 409);
-        let message = String::from_utf8_lossy(&response.body).to_string();
-        assert!(
-            message.contains("unspecified") && message.contains("eu-west"),
-            "the refusal must name both labels: {message}"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// Same shape for identity: an alias that has started pointing at a
-    /// different machine is a refusal, not a silent re-target.
-    #[test]
-    fn the_node_refuses_a_placement_addressed_to_a_different_runner() {
-        let (root, api, device, secret) = placement_fixture();
-        let api = api.with_placement(Arc::new(FakePlacementQueue::default()));
-        let body = placement_body("run-placed", None, Some("runner-two"));
-        let response = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-runner",
-                "POST",
-                "/v1/remote/node/runs",
-                &body,
-            ),
-            2_000,
-        );
-        assert_eq!(response.status, 409);
-        assert!(String::from_utf8_lossy(&response.body).contains("runner-two"));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// The node owns what it accepts: it mints its own run id, records the
-    /// placement against the placing device, and a second *different* signed
-    /// request carrying the same spec resolves to the same placement instead of
-    /// starting a second run. (The replay guard covers an identical retry; this
-    /// covers the case it cannot see.)
-    #[test]
-    fn an_accepted_placement_is_owned_recorded_and_idempotent_per_spec() {
-        let (root, api, device, secret) = placement_fixture();
-        let queue = Arc::new(FakePlacementQueue::default());
-        let api = api.with_placement(queue.clone());
-        let body = placement_body("run-placed", None, Some("runner-one"));
-
-        let first = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-place-a",
-                "POST",
-                "/v1/remote/node/runs",
-                &body,
-            ),
-            2_000,
-        );
-        assert_eq!(
-            first.status,
-            201,
-            "{}",
-            String::from_utf8_lossy(&first.body)
-        );
-        let accepted: little_monkey_lib::node_placement::PlaceRunResponse =
-            serde_json::from_slice(&first.body).unwrap();
-        assert_eq!(accepted.submitted_run_id, "run-placed");
-        assert_eq!(accepted.node_run_id, "node-run-placed");
-        assert_ne!(
-            accepted.node_run_id, accepted.submitted_run_id,
-            "the node must not adopt a foreign run id as its own"
-        );
-
-        let second = api.handle(
-            signed(
-                &device,
-                &secret,
-                2,
-                "cmd-place-b",
-                "POST",
-                "/v1/remote/node/runs",
-                &body,
-            ),
-            2_500,
-        );
-        assert_eq!(second.status, 200, "a re-placed spec is the same placement");
-        let replayed: little_monkey_lib::node_placement::PlaceRunResponse =
-            serde_json::from_slice(&second.body).unwrap();
-        assert_eq!(replayed.node_run_id, accepted.node_run_id);
-        assert_eq!(
-            queue.placed.lock().unwrap().len(),
-            1,
-            "the node queued the spec exactly once"
-        );
-
-        // And the placement reads back, keyed by the SUBMITTER's id.
-        let status = api.handle(
-            signed(
-                &device,
-                &secret,
-                3,
-                "cmd-status",
-                "GET",
-                "/v1/remote/node/runs/run-placed",
-                b"",
-            ),
-            2_600,
-        );
-        assert_eq!(status.status, 200);
-        let status: little_monkey_lib::node_placement::PlacedRunStatus =
-            serde_json::from_slice(&status.body).unwrap();
-        assert_eq!(status.node_run_id, "node-run-placed");
-        assert_eq!(status.state, "running");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// The node's own refusal reaches the placer as a refusal, and nothing is
-    /// recorded: a placement row claiming this node took work it never queued
-    /// would be worse than the failed request.
-    #[test]
-    fn a_queue_refusal_is_reported_and_leaves_no_placement_record() {
-        let (root, api, device, secret) = placement_fixture();
-        let api = api.with_placement(Arc::new(FakePlacementQueue::refusing(
-            "the placed workspace root '/nowhere' does not exist on this node",
-        )));
-        let body = placement_body("run-placed", None, None);
-        let response = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-refuse",
-                "POST",
-                "/v1/remote/node/runs",
-                &body,
-            ),
-            2_000,
-        );
-        assert_eq!(response.status, 409);
-        assert!(String::from_utf8_lossy(&response.body).contains("/nowhere"));
-
-        let follow_up = api.handle(
-            signed(
-                &device,
-                &secret,
-                2,
-                "cmd-refuse-status",
-                "GET",
-                "/v1/remote/node/runs/run-placed",
-                b"",
-            ),
-            2_100,
-        );
-        assert_eq!(
-            follow_up.status, 404,
-            "a refused placement must leave no record behind"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A build with no placement queue answers the route explicitly rather than
-    /// accepting a spec it has no way to run.
-    #[test]
-    fn a_node_without_a_placement_queue_refuses_rather_than_accepting() {
-        let (root, api, device, secret) = placement_fixture();
-        let response = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-no-queue",
-                "POST",
-                "/v1/remote/node/runs",
-                &placement_body("run-placed", None, None),
-            ),
-            2_000,
-        );
-        assert_eq!(response.status, 501);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    // --- Live migration (roadmap K18) -------------------------------------
-    //
-    // Two machines is the honest bar for this feature and this repository's CI
-    // has one. What these exercise is the *wire path* against a loopback node:
-    // the real routes, the real signed transport, the real ledger, the real
-    // files on disk. They are not a substitute for two hosts â€” nothing here
-    // proves a network, a clock skew between machines, or a partial transfer.
-
-    /// Writes a frozen checkpoint and its workspace on a pretend origin node,
-    /// and returns that node's app-data root plus the checkpoint id.
-    fn frozen_origin(model: Option<&str>) -> (PathBuf, String) {
-        use little_monkey_lib::checkpoints::{CheckpointEntry, CheckpointManifest, ResumeState};
-
-        let origin = std::env::temp_dir().join(format!(
-            "little-monkey-migration-origin-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let workspace = origin.join("work");
-        std::fs::create_dir_all(workspace.join("src")).unwrap();
-        std::fs::write(workspace.join("src").join("main.rs"), b"fn main() {}").unwrap();
-
-        let checkpoint_id = "cp-migrate-01".to_string();
-        let checkpoint_dir = origin.join("checkpoints").join(&checkpoint_id);
-        std::fs::create_dir_all(&checkpoint_dir).unwrap();
-        std::fs::write(checkpoint_dir.join("0.bak"), b"fn main() {} // before").unwrap();
-        let manifest = CheckpointManifest {
-            version: 3,
-            created_at_ms: 1_000,
-            session_id: "session-migrated".to_string(),
-            anchor_index: 0,
-            label: "the frozen turn".to_string(),
-            shell_ran: false,
-            external_effects: vec![],
-            committed_effects: None,
-            reverted: false,
-            prev_id: None,
-            entries: vec![CheckpointEntry {
-                path: workspace
-                    .join("src")
-                    .join("main.rs")
-                    .to_string_lossy()
-                    .to_string(),
-                backup: Some("0.bak".to_string()),
-                redo: None,
-                after: None,
-            }],
-            remembered_facts: vec![],
-            staged_task_suggestions: vec![],
-            resume: Some(ResumeState {
-                process_id: "turn-origin-01".to_string(),
-                frozen_at_ms: 1_500,
-                model: model.map(str::to_string),
-                runtime_id: None,
-                workspace: Some(workspace.to_string_lossy().to_string()),
-                pending_approvals: vec![],
-            }),
-        };
-        std::fs::write(
-            checkpoint_dir.join("manifest.json"),
-            serde_json::to_vec(&manifest).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            origin.join("chat_sessions.json"),
-            serde_json::json!({
-                "sessions": [{ "id": "session-migrated", "messages": ["the frozen conversation"] }],
-                "activeSessionId": "session-migrated",
-            })
-            .to_string(),
-        )
-        .unwrap();
-        (origin, checkpoint_id)
-    }
-
-    /// K17's placement pairing plus the K18 grant, which is exactly the shape
-    /// the capability rule requires: `migrate` implies `place_runs`.
-    fn migration_fixture() -> (PathBuf, RemoteApi, String, Vec<u8>) {
-        migration_pairing(BTreeSet::from([
-            DeviceCapability::ViewRuns,
-            DeviceCapability::DescribeNode,
-            DeviceCapability::PlaceRuns,
-            DeviceCapability::Migrate,
-        ]))
-    }
-
-    fn migration_pairing(
-        capabilities: BTreeSet<DeviceCapability>,
-    ) -> (PathBuf, RemoteApi, String, Vec<u8>) {
-        let root = std::env::temp_dir().join(format!(
-            "little-monkey-remote-migrate-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let paths = DaemonPaths::under(&root);
-        paths.ensure().unwrap();
-        DaemonConfig::default().save(&paths).unwrap();
-        let host = RemoteHostConfig {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            runner_id: "runner-one".into(),
-            listen: "127.0.0.1:1".into(),
-            advertise_url: "https://runner.invalid".into(),
-            certificate_path: "/tmp/cert".into(),
-            private_key_path: "/tmp/key".into(),
-            certificate_sha256: "a".repeat(64),
-            enabled: true,
-        };
-        let mut store = RemoteStore::open(&paths.root).unwrap();
-        let scopes = RemoteScopes {
-            actions: BTreeSet::from([RemoteAction::ViewRuns]),
-            run_ids: BTreeSet::from(["run-one".into()]),
-            workspace_ids: BTreeSet::new(),
-            max_artifact_bytes: 1_024,
-        };
-        let secrets = Arc::new(FakeSecrets::default());
-        let invite = store
-            .create_invitation_with_capabilities(&scopes, &capabilities, 1_000, 3_000)
-            .unwrap();
-        let accepted = store
-            .accept_invitation_with_capabilities(
-                &invite.pairing_id,
-                &invite.token,
-                "origin",
-                "runner-one",
-                None,
-                1_100,
-                secrets.as_ref(),
-            )
-            .unwrap();
-        let secret = accepted.device_secret.as_bytes().to_vec();
-        let api = RemoteApi::injected(paths, host, store, secrets);
-        (root, api, accepted.device_id, secret)
-    }
-
-    #[test]
-    fn a_frozen_image_moves_to_the_node_and_lands_as_a_resumable_turn() {
-        let (root, api, device, secret) = migration_fixture();
-        // No model recorded, so the target's "is it here" check has nothing to
-        // refuse. The model refusal has its own test below.
-        let (origin, checkpoint_id) = frozen_origin(None);
-        let spec = spec("run-migrated", "workspace-one");
-        let image = super::super::migrate::build_image(
-            &origin,
-            "runner-origin",
-            &checkpoint_id,
-            &spec,
-            7,
-            &"c".repeat(64),
-            None,
-        )
-        .expect("the origin can read its own frozen image");
-
-        let preflight = serde_json::to_vec(&MigrationPreflightRequest {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            header: image.header.clone(),
-        })
-        .unwrap();
-        let response = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-preflight",
-                "POST",
-                "/v1/remote/node/migration/preflight",
-                &preflight,
-            ),
-            2_000,
-        );
-        assert_eq!(
-            response.status,
-            200,
-            "{}",
-            String::from_utf8_lossy(&response.body)
-        );
-        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(body["verdict"]["state"], "acceptable");
-        // The determinism statement travels with the verdict, so whoever presses
-        // Migrate reads it rather than a doc.
-        assert!(!body["verdict"]["caveats"].as_array().unwrap().is_empty());
-        // Nothing has moved yet: a preflight that landed anything would make the
-        // refusal path a write.
-        assert!(!root.join("checkpoints").join(&checkpoint_id).exists());
-
-        let accept = serde_json::to_vec(&MigrationAcceptRequest {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            image: image.clone(),
-        })
-        .unwrap();
-        let response = api.handle(
-            signed(
-                &device,
-                &secret,
-                2,
-                "cmd-accept",
-                "POST",
-                "/v1/remote/node/migration/accept",
-                &accept,
-            ),
-            2_100,
-        );
-        assert_eq!(
-            response.status,
-            201,
-            "{}",
-            String::from_utf8_lossy(&response.body)
-        );
-        let receipt: MigrationReceipt = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(receipt.run_id, "run-migrated");
-
-        // The workspace really crossed.
-        let landed_file = PathBuf::from(&receipt.workspace_root)
-            .join("src")
-            .join("main.rs");
-        assert_eq!(std::fs::read(&landed_file).unwrap(), b"fn main() {}");
-
-        // The conversation crossed too â€” without it a resume would continue a
-        // turn with no history.
-        let sessions: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(root.join("chat_sessions.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(sessions["sessions"][0]["id"], "session-migrated");
-
-        // And the checkpoint the desktop's K13 re-entry reads is on disk, with
-        // its paths re-rooted here and its resume naming the *local* row.
-        let manifest: little_monkey_lib::checkpoints::CheckpointManifest = serde_json::from_str(
-            &std::fs::read_to_string(
-                root.join("checkpoints")
-                    .join(&checkpoint_id)
-                    .join("manifest.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let resume = manifest
-            .resume
-            .expect("the landed checkpoint is still a freeze");
-        assert_eq!(resume.process_id, receipt.process_id);
-        assert_eq!(
-            resume.workspace.as_deref(),
-            Some(receipt.workspace_root.as_str())
-        );
-        assert!(manifest.entries[0]
-            .path
-            .starts_with(&receipt.workspace_root));
-        assert!(root
-            .join("checkpoints")
-            .join(&checkpoint_id)
-            .join("0.bak")
-            .exists());
-
-        // The process row is suspended, which is exactly the state the desktop's
-        // Resume path looks for.
-        let ledger = RunLedger::open(&DaemonPaths::under(&root).ledger_db).unwrap();
-        let record = ledger
-            .process_table()
-            .get(&receipt.process_id)
-            .unwrap()
-            .expect("the landed process exists");
-        assert_eq!(
-            record.state,
-            little_monkey_lib::process_table::ProcessState::Suspended
-        );
-        assert_eq!(record.run_id.as_deref(), Some("run-migrated"));
-
-        // One chain across both nodes: the target's first event names the
-        // origin's tip, and the join is what an auditor holding both halves runs.
-        let arrival = ledger
-            .migration_arrival("run-migrated")
-            .unwrap()
-            .expect("the target's half starts with an arrival");
-        assert_eq!(arrival.event_hash, receipt.arrival_event_hash);
-        let departure = little_monkey_lib::run_ledger::MigrationDeparture {
-            run_id: "run-migrated".to_string(),
-            sequence: 7,
-            event_hash: "c".repeat(64),
-            target_node_id: "runner-one".to_string(),
-            payload_sha256: image.header.payload_sha256.clone(),
-            checkpoint_id: checkpoint_id.clone(),
-        };
-        assert!(matches!(
-            little_monkey_lib::run_ledger::join_migration_chain(&departure, &arrival),
-            little_monkey_lib::run_ledger::MigrationChainJoin::Joined { .. }
-        ));
-        // And an origin claiming a different tip does not join, which is the
-        // whole point of hashing the link rather than trusting the field.
-        let mut forged = departure;
-        forged.event_hash = "d".repeat(64);
-        assert!(matches!(
-            little_monkey_lib::run_ledger::join_migration_chain(&forged, &arrival),
-            little_monkey_lib::run_ledger::MigrationChainJoin::Broken { .. }
-        ));
-
-        let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(origin);
-    }
-
-    #[test]
-    fn a_node_without_the_model_refuses_and_writes_nothing() {
-        let (root, api, device, secret) = migration_fixture();
-        let (origin, checkpoint_id) = frozen_origin(Some("a-model-this-node-never-installed"));
-        let spec = spec("run-migrated", "workspace-one");
-        let image = super::super::migrate::build_image(
-            &origin,
-            "runner-origin",
-            &checkpoint_id,
-            &spec,
-            7,
-            &"c".repeat(64),
-            None,
-        )
-        .unwrap();
-        let accept = serde_json::to_vec(&MigrationAcceptRequest {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            image,
-        })
-        .unwrap();
-        let response = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-accept-refused",
-                "POST",
-                "/v1/remote/node/migration/accept",
-                &accept,
-            ),
-            2_000,
-        );
-        assert_eq!(response.status, 409);
-        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(body["verdict"]["state"], "refused");
-        assert!(body["verdict"]["blockers"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("model-not-resident")));
-        // A refusal is not a partial landing.
-        assert!(!root.join("checkpoints").join(&checkpoint_id).exists());
-        let ledger = RunLedger::open(&DaemonPaths::under(&root).ledger_db).unwrap();
-        assert!(ledger.load_run("run-migrated").unwrap().is_none());
-        let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(origin);
-    }
-
-    /// A scheduler paired to *place* runs must not thereby be able to write a
-    /// workspace and a conversation onto this machine.
-    #[test]
-    fn a_pairing_that_may_place_runs_still_cannot_migrate_one_here() {
-        let (root, api, device, secret) = migration_pairing(BTreeSet::from([
-            DeviceCapability::ViewRuns,
-            DeviceCapability::DescribeNode,
-            DeviceCapability::PlaceRuns,
-        ]));
-        let response = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-migrate-denied",
-                "POST",
-                "/v1/remote/node/migration/accept",
-                b"{}",
-            ),
-            2_000,
-        );
-        assert_eq!(response.status, 403);
-        assert!(String::from_utf8_lossy(&response.body).contains("Migrate"));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// Tampering with a transferred file breaks the payload digest, and the
-    /// image is refused as malformed rather than admitted and then landed.
-    #[test]
-    fn a_tampered_payload_is_refused_before_any_capability_question() {
-        let (root, api, device, secret) = migration_fixture();
-        let (origin, checkpoint_id) = frozen_origin(None);
-        let spec = spec("run-migrated", "workspace-one");
-        let mut image = super::super::migrate::build_image(
-            &origin,
-            "runner-origin",
-            &checkpoint_id,
-            &spec,
-            7,
-            &"c".repeat(64),
-            None,
-        )
-        .unwrap();
-        image.payload.workspace_files[0].contents_base64 = STANDARD.encode(b"fn main() { evil() }");
-        let accept = serde_json::to_vec(&MigrationAcceptRequest {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            image,
-        })
-        .unwrap();
-        let response = api.handle(
-            signed(
-                &device,
-                &secret,
-                1,
-                "cmd-accept-tampered",
-                "POST",
-                "/v1/remote/node/migration/accept",
-                &accept,
-            ),
-            2_000,
-        );
-        assert_eq!(response.status, 400);
-        assert!(String::from_utf8_lossy(&response.body).contains("digest"));
-        let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(origin);
-    }
-
-    // --- `/v1/remote/device/*` -------------------------------------------
-
-    fn grant(api: &RemoteApi, device_id: &str, extra: &[DeviceCapability]) {
-        let mut store = api.store.lock().unwrap();
-        let mut capabilities = store.device(device_id).unwrap().unwrap().capabilities;
-        capabilities.extend(extra.iter().copied());
-        store
-            .set_device_capabilities(device_id, &capabilities, 2_000)
-            .unwrap();
-    }
-
-    fn advertise(
-        api: &RemoteApi,
-        device_id: &str,
-        secret: &[u8],
-        sequence: u64,
-        capabilities: &[DeviceCapability],
-        permissions: &[(DeviceCapability, OsPermission)],
-    ) -> ApiResponse {
-        let surface = DeviceSurface {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            platform: "android".into(),
-            platform_version: "15".into(),
-            app_version: "1.3.0".into(),
-            device_model: "Pixel 9".into(),
-            capabilities: capabilities.iter().copied().collect(),
-            permissions: permissions.iter().copied().collect(),
-            // Everything this helper advertises is ready; a test that needs an
-            // unready capability states its permission instead, which is the
-            // axis those tests are about.
-            readiness: capabilities
-                .iter()
-                .map(|capability| (*capability, DeviceReadiness::Ready))
-                .collect(),
-            constraints: DeviceConstraints::default(),
-            reported_at_ms: 0,
-        };
-        let body = serde_json::to_vec(&surface).unwrap();
-        api.handle(
-            signed(
-                device_id,
-                secret,
-                sequence,
-                &format!("cmd-surface-{sequence}"),
-                "POST",
-                "/v1/remote/device/surface",
-                &body,
-            ),
-            2_000,
-        )
-    }
-
-    /// Everything a Talk ticket has to be, in one pass.
-    ///
-    /// A ticket is the only credential a WebSocket handshake can carry, so the
-    /// properties below are the whole of that surface's security and each one
-    /// fails loudly here rather than in a reviewer's memory:
-    ///
-    /// - it is issued **only** to a request that already passed the signature,
-    ///   sequence, nonce and revocation checks, and **only** with the grant;
-    /// - it admits **once** â€” a second socket with the same ticket is refused;
-    /// - it is bound to **its own session**, so a ticket for one conversation
-    ///   cannot open another;
-    /// - it **expires**, in seconds rather than for the life of the socket;
-    /// - the bearer never appears in the path that a log or a history entry
-    ///   would keep.
-    #[test]
-    fn a_talk_ticket_admits_one_socket_once_and_only_with_the_grant() {
-        let (root, api, _secrets, device_id, secret) = fixture();
-        let body = serde_json::to_vec(&serde_json::json!({
-            "protocol_version": super::super::protocol::TALK_PROTOCOL_VERSION,
-            "session_id": "talk-session-one",
-        }))
-        .unwrap();
-        let ask = |sequence: u64| {
-            signed(
-                &device_id,
-                &secret,
-                sequence,
-                &format!("cmd-talk-{sequence}"),
-                "POST",
-                "/v1/remote/device/talk/ticket",
-                &body,
-            )
-        };
-
-        // No grant, no ticket â€” before anything about sockets is considered.
-        assert_eq!(api.handle(ask(1), 2_000).status, 403);
-
-        // `voice_stream` is not grantable on its own â€” a stream is a
-        // microphone â€” so the pair is what an operator actually grants.
-        grant(
-            &api,
-            &device_id,
-            &[
-                DeviceCapability::MicrophoneCapture,
-                DeviceCapability::VoiceStream,
-            ],
-        );
-        assert_eq!(
-            advertise(
-                &api,
-                &device_id,
-                &secret,
-                2,
-                &[
-                    DeviceCapability::MicrophoneCapture,
-                    DeviceCapability::VoiceStream
-                ],
-                &[
-                    (DeviceCapability::MicrophoneCapture, OsPermission::Granted),
-                    (DeviceCapability::VoiceStream, OsPermission::Granted),
-                ],
-            )
-            .status,
-            200
-        );
-        let response = api.handle(ask(3), 2_000);
-        assert_eq!(response.status, 201);
-        let issued: TalkTicketResponse = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(
-            issued.websocket_path,
-            "/v1/remote/device/talk/talk-session-one/stream"
-        );
-        assert!(
-            !issued.websocket_path.contains(&issued.ticket),
-            "the bearer must not be part of the path"
-        );
-
-        // A ticket for this session opens no other one.
-        assert!(api
-            .consume_talk_ticket("talk-session-two", &issued.ticket, 2_100)
-            .is_none());
-        // â€¦and that misdirected attempt burned it, so the right session cannot
-        // use it afterwards either.
-        assert!(api
-            .consume_talk_ticket("talk-session-one", &issued.ticket, 2_100)
-            .is_none());
-
-        let second = api.handle(ask(4), 2_000);
-        let issued: TalkTicketResponse = serde_json::from_slice(&second.body).unwrap();
-        let admitted = api
-            .consume_talk_ticket("talk-session-one", &issued.ticket, 2_100)
-            .expect("a fresh ticket admits its own session");
-        assert_eq!(admitted.device_id, device_id);
-        assert_eq!(admitted.session_generation, issued.session_generation);
-        assert!(
-            api.consume_talk_ticket("talk-session-one", &issued.ticket, 2_100)
-                .is_none(),
-            "one use only: a captured ticket cannot open a second socket"
-        );
-
-        // Expiry is real, and short.
-        let third = api.handle(ask(5), 2_000);
-        let issued: TalkTicketResponse = serde_json::from_slice(&third.body).unwrap();
-        assert!(api
-            .consume_talk_ticket("talk-session-one", &issued.ticket, issued.expires_at_ms)
-            .is_none());
-
-        // A grant withdrawn between issue and handshake closes the door, which
-        // is why the check is repeated at admission rather than trusted from
-        // issue time.
-        let fourth = api.handle(ask(6), 2_000);
-        let issued: TalkTicketResponse = serde_json::from_slice(&fourth.body).unwrap();
-        {
-            let mut store = api.store.lock().unwrap();
-            // Exactly what an operator withdrawing one capability does: the
-            // rest of the grant is untouched.
-            let mut kept = store.device(&device_id).unwrap().unwrap().capabilities;
-            kept.remove(&DeviceCapability::VoiceStream);
-            store
-                .set_device_capabilities(&device_id, &kept, 2_000)
-                .unwrap();
-        }
-        assert!(
-            api.consume_talk_ticket("talk-session-one", &issued.ticket, 2_100)
-                .is_none(),
-            "a revoked grant must not be admitted by a ticket minted before it"
-        );
-        assert!(!api.talk_capability_live(&device_id));
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A signed GET on the stream route is not the way in, and says so rather
-    /// than 404ing on a route the published contract names.
-    #[test]
-    fn a_plain_get_on_the_talk_stream_route_asks_for_an_upgrade() {
-        let (root, api, _secrets, device_id, secret) = fixture();
-        grant(
-            &api,
-            &device_id,
-            &[
-                DeviceCapability::MicrophoneCapture,
-                DeviceCapability::VoiceStream,
-            ],
-        );
-        let response = api.handle(
-            signed(
-                &device_id,
-                &secret,
-                1,
-                "cmd-talk-get",
-                "GET",
-                "/v1/remote/device/talk/talk-session-one/stream",
-                b"",
-            ),
-            2_000,
-        );
-        assert_eq!(response.status, 426);
-        assert!(String::from_utf8_lossy(&response.body).contains("talk/ticket"));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    // --- Talk, on the wire -------------------------------------------------
-
-    /// A conversation queue that goes through the **real** durable ingress.
-    ///
-    /// The only thing standing in for production here is the run *executor*:
-    /// `submit_conversation_turn` writes a real `ingress_turns` row under a real
-    /// dedupe key, and the answer is a real run in a real ledger. That is the
-    /// boundary a test is allowed to draw â€” a fake ingress would make the whole
-    /// exercise meaningless, since "does a spoken turn become an ordinary
-    /// durable turn" is the question.
-    struct IngressTalkQueue {
-        paths: DaemonPaths,
-        runs: Mutex<HashMap<String, String>>,
-        /// The recorders the test plays the model's part through.
-        recorders: Mutex<HashMap<String, Arc<DurableRunRecorder>>>,
-        /// The turns that reached ingress, with the outcome each one got.
-        accepted: Mutex<Vec<(String, String)>>,
-    }
-
-    struct RecordingRunQueue;
-
-    impl crate::daemon::channel_worker::RunQueue for RecordingRunQueue {
-        fn freeze_execution(
-            &self,
-            ingress: &little_monkey_lib::channels::ingress::ConversationIngress,
-        ) -> Result<little_monkey_lib::channels::ingress::FrozenExecutionContext, String> {
-            Ok(crate::daemon::channel_worker::test_frozen_execution(
-                ingress,
-            ))
-        }
-
-        fn submit(
-            &self,
-            ingress: &little_monkey_lib::channels::ingress::ConversationIngress,
-            _params: Vec<String>,
-        ) -> Result<String, String> {
-            Ok(ingress.deterministic_job_id())
-        }
-    }
-
-    impl IngressTalkQueue {
-        fn new(paths: DaemonPaths) -> Self {
-            Self {
-                paths,
-                runs: Mutex::new(HashMap::new()),
-                recorders: Mutex::new(HashMap::new()),
-                accepted: Mutex::new(Vec::new()),
-            }
-        }
-
-        /// The run a spoken turn produced, so the test can play the model's part
-        /// by appending real events to it.
-        fn recorder(&self, client_key: &str) -> Option<Arc<DurableRunRecorder>> {
-            self.recorders.lock().unwrap().get(client_key).cloned()
-        }
-    }
-
-    impl MobileChatQueue for IngressTalkQueue {
-        fn queue_chat(
-            &self,
-            session_id: &str,
-            client_key: &str,
-            prompt: &str,
-        ) -> Result<String, String> {
-            use little_monkey_lib::channels::ingress::{ConversationIngress, ConversationSource};
-            use little_monkey_lib::channels::routing::RouteTarget;
-
-            let now_ms = crate::daemon::remote::now_ms_public()? as i64;
-            // Exactly the shape `queue_mobile_chat_recipe` builds, because a
-            // spoken turn is a mobile chat turn: same source, same session key,
-            // same recipe.
-            let ingress = ConversationIngress::direct(
-                ConversationSource::Mobile,
-                session_id,
-                client_key,
-                format!("mobile:{session_id}"),
-                prompt,
-                RouteTarget::new("mobile-chat"),
-                now_ms,
-            );
-            let mut store = crate::daemon::store::DaemonStore::open(&self.paths)
-                .map_err(|error| error.to_string())?;
-            let outcome = crate::daemon::channel_ingress::submit_conversation_turn(
-                &mut store,
-                &RecordingRunQueue,
-                &ingress,
-                &[format!("prompt={prompt}")],
-                now_ms,
-            )?;
-            self.accepted
-                .lock()
-                .unwrap()
-                .push((client_key.to_string(), format!("{outcome:?}")));
-
-            // One real run per turn, so the session reads its answer back out of
-            // the ledger the way it does in production.
-            let run_id = format!("run-{client_key}");
-            let ledger = RunLedger::open(&self.paths.ledger_db).map_err(|e| e.to_string())?;
-            let (recorder, _) = DurableRunRecorder::submit(
-                ledger,
-                &spec(&run_id, "workspace-talk"),
-                "talk-fixture".into(),
-            )
-            .map_err(|error| error.to_string())?;
-            recorder
-                .emit(RunEvent::Started {
-                    engine_id: "talk-fixture".into(),
-                })
-                .map_err(|error| error.to_string())?;
-            self.runs
-                .lock()
-                .unwrap()
-                .insert(client_key.to_string(), run_id.clone());
-            self.recorders
-                .lock()
-                .unwrap()
-                .insert(client_key.to_string(), recorder);
-            Ok(run_id)
-        }
-
-        fn chat_run_id(
-            &self,
-            _session_id: &str,
-            client_key: &str,
-        ) -> Result<Option<String>, String> {
-            Ok(self.runs.lock().unwrap().get(client_key).cloned())
-        }
-    }
-
-    /// A scripted transcriber and synthesizer â€” the two things genuinely outside
-    /// this process.
-    struct ScriptedSpeech {
-        transcripts: Mutex<std::collections::VecDeque<String>>,
-        heard_bytes: Mutex<Vec<usize>>,
-        spoken: Mutex<Vec<String>>,
-    }
-
-    #[async_trait::async_trait]
-    impl super::super::talk::TalkSpeech for ScriptedSpeech {
-        async fn transcribe(&self, audio: Vec<u8>, _media_type: &str) -> Result<String, String> {
-            self.heard_bytes.lock().unwrap().push(audio.len());
-            Ok(self
-                .transcripts
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_default())
-        }
-
-        async fn synthesize(&self, text: &str) -> Result<(Vec<u8>, String), String> {
-            self.spoken.lock().unwrap().push(text.to_string());
-            Ok((b"RIFFfake".to_vec(), "audio/wav".to_string()))
-        }
-    }
-
-    fn talk_frame(
-        session_id: &str,
-        generation: &str,
-        sequence: u64,
-        kind: serde_json::Value,
-    ) -> tokio_tungstenite::tungstenite::Message {
-        let mut frame = serde_json::json!({
-            "protocol_version": super::super::protocol::TALK_PROTOCOL_VERSION,
-            "session_id": session_id,
-            "session_generation": generation,
-            "frame_sequence": sequence,
-        });
-        let object = frame.as_object_mut().unwrap();
-        for (key, value) in kind.as_object().unwrap() {
-            object.insert(key.clone(), value.clone());
-        }
-        tokio_tungstenite::tungstenite::Message::Text(frame.to_string().into())
-    }
-
-    /// **The whole spoken path, over a real socket, with nothing internal
-    /// faked.**
-    ///
-    /// Every unit test in this repository passed while mobile Talk could not
-    /// complete a single utterance, because two defects lived in the seams no
-    /// unit test crosses: the shipped client never sent the `hello` the runner
-    /// demands, and the connection was served without upgrades so the socket
-    /// after the `101` never arrived. Both are invisible to a scripted socket
-    /// and to a source-string scan. So this drives the real thing:
-    ///
-    /// signed ticket â†’ real HTTP upgrade â†’ real `tokio-tungstenite` client â†’
-    /// hello â†’ audio â†’ transcription â†’ **real durable ingress** â†’ a real run in
-    /// a real ledger â†’ assistant deltas â†’ speech before the run finishes â†’
-    /// barge-in that cancels and becomes the next turn â†’ revocation that closes
-    /// the socket.
-    #[tokio::test]
-    async fn a_paired_phone_holds_a_spoken_conversation_over_a_real_talk_socket() {
-        use futures_util::{SinkExt, StreamExt};
-
-        let (root, api, _secrets, device_id, secret) = fixture();
-        grant(
-            &api,
-            &device_id,
-            &[
-                DeviceCapability::VoiceStream,
-                DeviceCapability::MicrophoneCapture,
-            ],
-        );
-        advertise(
-            &api,
-            &device_id,
-            &secret,
-            1,
-            &[
-                DeviceCapability::VoiceStream,
-                DeviceCapability::MicrophoneCapture,
-            ],
-            &[
-                (DeviceCapability::VoiceStream, OsPermission::Granted),
-                (DeviceCapability::MicrophoneCapture, OsPermission::Granted),
-            ],
-        );
-
-        let queue = Arc::new(IngressTalkQueue::new(DaemonPaths::under(&root)));
-        let speech = Arc::new(ScriptedSpeech {
-            transcripts: Mutex::new(
-                [
-                    "what is the deploy status",
-                    "stop and tell me about staging",
-                ]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            ),
-            heard_bytes: Mutex::new(Vec::new()),
-            spoken: Mutex::new(Vec::new()),
-        });
-        let api = api
-            .with_mobile_chat(queue.clone())
-            .with_talk_speech(speech.clone());
-
-        // The real server, minus only TLS â€” which is the same listener every
-        // other route on this plane shares and is not what is under test.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let served = api.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let served = served.clone();
-                tokio::spawn(async move {
-                    // Production's own connection path, so a regression there â€”
-                    // dropping `with_upgrades`, say â€” fails this test rather
-                    // than only the phone.
-                    let _ = super::super::server::serve_upgradable(
-                        hyper_util::rt::TokioIo::new(stream),
-                        served,
-                    )
-                    .await;
-                });
-            }
-        });
-
-        // One ordinary signed request mints the ticket.
-        let session_id = format!("mobile-{device_id}");
-        let ticket_body = serde_json::to_vec(&serde_json::json!({
-            "protocol_version": super::super::protocol::TALK_PROTOCOL_VERSION,
-            "session_id": session_id,
-        }))
-        .unwrap();
-        let now_ms = crate::daemon::remote::now_ms_public().unwrap();
-        let issued = api.handle(
-            signed_at(
-                &device_id,
-                &secret,
-                2,
-                "cmd-talk-ticket",
-                "POST",
-                "/v1/remote/device/talk/ticket",
-                &ticket_body,
-                now_ms,
-            ),
-            now_ms,
-        );
-        assert_eq!(issued.status, 201, "the grant admits a ticket");
-        let ticket: serde_json::Value = serde_json::from_slice(&issued.body).unwrap();
-        let bearer = ticket["ticket"].as_str().unwrap().to_string();
-        let generation = ticket["session_generation"].as_str().unwrap().to_string();
-        let path = ticket["websocket_path"].as_str().unwrap().to_string();
-
-        let url = format!("ws://{address}{path}?ticket={bearer}");
-        let (mut socket, response) = tokio_tungstenite::connect_async(&url).await.expect(
-            "the ticket admits a real WebSocket â€” a 101 whose upgrade never \
-             resolves fails exactly here",
-        );
-        assert_eq!(response.status().as_u16(), 101);
-
-        let mut sequence = 0u64;
-        let mut next = |kind: serde_json::Value| {
-            sequence += 1;
-            talk_frame(&session_id, &generation, sequence, kind)
-        };
-
-        // Frame 1 is the hello, and its media type is the one the audio frames
-        // will actually carry.
-        socket
-            .send(next(serde_json::json!({
-                "type": "hello",
-                "media_type": "audio/webm;codecs=opus",
-                "sample_rate_hz": 48_000,
-                "channels": 1,
-            })))
-            .await
-            .unwrap();
-        // The client's own order: telemetry naming the utterance, then the
-        // utterance. The runner answers the instant an utterance closes, so
-        // metrics sent after it would be too late to belong to it.
-        socket
-            .send(next(serde_json::json!({
-                "type": "metrics",
-                "audio_sequence": 1,
-                "speech_detection_ms": 180,
-                "capture_ms": 1_200,
-                "upload_ms": 40,
-            })))
-            .await
-            .unwrap();
-        socket
-            .send(next(serde_json::json!({
-                "type": "audio",
-                "audio_sequence": 1,
-                "media_type": "audio/webm;codecs=opus",
-                "audio_base64": STANDARD.encode(b"first utterance bytes"),
-                "last": true,
-                // The device's own name for this utterance, which a closing
-                // frame must carry: it is the key the turn is queued under, and
-                // the only identity that survives a restart of this runner.
-                "utterance_id": "utt-first",
-            })))
-            .await
-            .unwrap();
-
-        // The runner reaches transcription, which means the hello was accepted
-        // and the audio was not refused.
-        let transcript = read_until(&mut socket, "transcript").await;
-        assert_eq!(transcript["text"], "what is the deploy status");
-        assert!(!speech.heard_bytes.lock().unwrap().is_empty());
-
-        // The turn is a real durable one, under the utterance's own identity.
-        let first_key = queue.accepted.lock().unwrap()[0].0.clone();
-        assert!(first_key.starts_with("talk-"));
-        {
-            let store = crate::daemon::store::DaemonStore::open(&DaemonPaths::under(&root))
-                .expect("daemon store");
-            let dedupe = little_monkey_lib::channels::ingress::dedupe_key_for(
-                little_monkey_lib::channels::ingress::ConversationSource::Mobile,
-                &session_id,
-                &first_key,
-            );
-            let row = store
-                .ingress_turn_by_dedupe_key(&dedupe)
-                .expect("ingress lookup")
-                .expect("a spoken turn is an ordinary durable turn");
-            assert_eq!(row.source_account_id, session_id);
-        }
-
-        // The model answers, and the first sentence is spoken before the run
-        // completes â€” incremental synthesis, not a wait for the whole answer.
-        let recorder = queue.recorder(&first_key).expect("a run for the turn");
-        emit_delta(&recorder, "The deploy finished. ");
-        let delta = read_until(&mut socket, "assistant_delta").await;
-        assert_eq!(delta["text"], "The deploy finished. ");
-        let audio = read_until(&mut socket, "output_audio").await;
-        assert_eq!(audio["media_type"], "audio/wav");
-        assert!(
-            !speech.spoken.lock().unwrap().is_empty(),
-            "a sentence is synthesized while the run is still going"
-        );
-
-        // Talking over it: the audio that interrupts is the next utterance.
-        sequence += 1;
-        socket
-            .send(talk_frame(
-                &session_id,
-                &generation,
-                sequence,
-                serde_json::json!({
-                    "type": "audio",
-                    "audio_sequence": 2,
-                    "media_type": "audio/webm;codecs=opus",
-                    "audio_base64": STANDARD.encode(b"second utterance bytes"),
-                    "last": true,
-                    "utterance_id": "utt-second",
-                }),
-            ))
-            .await
-            .unwrap();
-
-        let second = read_until(&mut socket, "transcript").await;
-        assert_eq!(
-            second["text"], "stop and tell me about staging",
-            "the interrupting words become the next turn instead of being thrown away"
-        );
-        assert_eq!(
-            queue.accepted.lock().unwrap().len(),
-            2,
-            "two spoken turns, two durable turns"
-        );
-
-        // Withdrawing the grant closes the conversation rather than waiting for
-        // the device to say something.
-        revoke(&api, &device_id, DeviceCapability::VoiceStream);
-        let closed = read_until_closed(&mut socket).await;
-        assert!(
-            closed,
-            "a revoked voice_stream ends the socket without another frame from the device"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// **A spoken turn that the queue refuses does not leave a row claiming to
-    /// be queued.**
-    ///
-    /// The transcript row and the durable turn live in two different SQLite
-    /// files, so they cannot be one transaction: the row is written first and
-    /// the turn is queued after. When that second step fails, the row is the
-    /// only thing left, and a row stuck at `queued` is worse than a lost one â€”
-    /// the reply materializer skips it forever (its job never existed), so the
-    /// operator sees a question of theirs waiting for an answer that no part of
-    /// the system is going to produce.
-    #[test]
-    fn a_spoken_turn_the_queue_refuses_settles_its_row_instead_of_stranding_it() {
-        use super::super::talk::TalkTurns;
-
-        struct RefusingQueue;
-        impl MobileChatQueue for RefusingQueue {
-            fn queue_chat(&self, _: &str, _: &str, _: &str) -> Result<String, String> {
-                Err("the daemon queue is not accepting work".to_string())
-            }
-            fn chat_run_id(&self, _: &str, _: &str) -> Result<Option<String>, String> {
-                Ok(None)
-            }
-        }
-
-        let (root, api, _secrets, device_id, _secret) = fixture();
-        let api = api.with_mobile_chat(Arc::new(RefusingQueue));
-        let turns = TalkSessionTurns::new(
-            api.clone(),
-            &TalkSocketAuthorization {
-                device_id: device_id.clone(),
-                signed_request_sha256: "a".repeat(64),
-                session_id: "mobile-session".to_string(),
-                session_generation: "generation-one".to_string(),
-            },
-        );
-
-        let refused = turns.submit("mobile-session", "talk-generation-1", "what is the status");
-        assert!(
-            refused.is_err(),
-            "the caller is told the turn did not queue"
-        );
-
-        let store = api.store.lock().unwrap();
-        let messages = store.mobile_messages("mobile-session", 10).unwrap();
-        assert_eq!(messages.len(), 1, "the transcript keeps what was said");
-        assert_eq!(
-            messages[0].task_state, "failed",
-            "a turn nothing queued must not sit at 'queued' forever"
-        );
-        drop(store);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// **The security audit sees a real Talk socket, not a fabricated row.**
-    ///
-    /// `docs/paired-devices.md` promises that an open Talk socket "shows up
-    /// there as a running `voice_stream` command, like any other capture in
-    /// flight". Until this test that promise was checked by handing the audit a
-    /// hand-built `DeviceCommandSnapshot` â€” which would have passed just as
-    /// happily with the entire Talk path deleted, and did pass while a live
-    /// socket wrote nothing anywhere.
-    ///
-    /// So: open a real admitted socket, then run the *production* device-state
-    /// reader against the same store and ask the real audit what it sees.
-    #[tokio::test]
-    async fn an_open_talk_socket_is_a_capture_the_security_audit_can_see() {
-        use futures_util::SinkExt;
-
-        let (root, api, _secrets, device_id, secret) = fixture();
-        grant(
-            &api,
-            &device_id,
-            &[
-                DeviceCapability::VoiceStream,
-                DeviceCapability::MicrophoneCapture,
-            ],
-        );
-        advertise(
-            &api,
-            &device_id,
-            &secret,
-            1,
-            &[
-                DeviceCapability::VoiceStream,
-                DeviceCapability::MicrophoneCapture,
-            ],
-            &[
-                (DeviceCapability::VoiceStream, OsPermission::Granted),
-                (DeviceCapability::MicrophoneCapture, OsPermission::Granted),
-            ],
-        );
-        let paths = DaemonPaths::under(&root);
-        let speech = Arc::new(ScriptedSpeech {
-            transcripts: Mutex::new(Default::default()),
-            heard_bytes: Mutex::new(Vec::new()),
-            spoken: Mutex::new(Vec::new()),
-        });
-        let api = api
-            .with_mobile_chat(Arc::new(IngressTalkQueue::new(paths.clone())))
-            .with_talk_speech(speech);
-
-        // Nothing is listening yet.
-        assert!(
-            !capture_in_flight(&paths),
-            "an idle runner reports no capture"
-        );
-
-        let address = spawn_talk_server(api.clone()).await;
-        let session_id = format!("mobile-{device_id}");
-        let (mut socket, generation) =
-            open_talk_socket(&api, &device_id, &secret, 2, &session_id, address).await;
-        socket
-            .send(talk_frame(
-                &session_id,
-                &generation,
-                1,
-                serde_json::json!({
-                    "type": "hello",
-                    "media_type": "audio/webm;codecs=opus",
-                    "sample_rate_hz": 48_000,
-                    "channels": 1,
-                }),
-            ))
-            .await
-            .unwrap();
-        // The `ready` frame proves the session is running, so the registration
-        // that happens before it has already landed.
-        let _ = read_until(&mut socket, "ready").await;
-
-        assert!(
-            capture_in_flight(&paths),
-            "an open Talk socket is a voice_stream capture in flight"
-        );
-
-        // Withdrawing the grant closes the socket, and the capture clears with
-        // it rather than outliving the authority that allowed it.
-        //
-        // Nothing else is sent. A device that is listening has no reason to
-        // send anything, and a session that only noticed the withdrawal when
-        // the next frame arrived would hold this microphone open until the idle
-        // deadline â€” fifteen minutes of capture on a grant that is gone. So the
-        // close below is on the runner's own clock, or it does not happen.
-        revoke(&api, &device_id, DeviceCapability::VoiceStream);
-        assert!(read_until_closed(&mut socket).await);
-        for _ in 0..100 {
-            if !capture_in_flight(&paths) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert!(
-            !capture_in_flight(&paths),
-            "a closed Talk socket leaves no capture claiming to be open"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// What the real audit says about this daemon root, right now.
-    fn capture_in_flight(paths: &DaemonPaths) -> bool {
-        let mut runtime = little_monkey_lib::security_doctor::SecurityRuntimeSnapshot::default();
-        crate::security_cli::collect_device_state_at(&mut runtime, paths);
-        let report = little_monkey_lib::security_doctor::run_security_audit(
-            &little_monkey_lib::security_doctor::SecurityAuditRequest {
-                app_data_dir: paths.root.clone(),
-                workspace: None,
-                deep: false,
-                fix: false,
-                runtime,
-            },
-        )
-        .expect("the audit runs");
-        report
-            .findings
-            .iter()
-            .any(|finding| finding.id == "devices.capture_in_flight")
-    }
-
-    async fn spawn_talk_server(api: RemoteApi) -> std::net::SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let api = api.clone();
-                tokio::spawn(async move {
-                    // Production's own connection path, so a regression there â€”
-                    // dropping `with_upgrades`, say â€” fails these tests rather
-                    // than only the phone.
-                    let _ = super::super::server::serve_upgradable(
-                        hyper_util::rt::TokioIo::new(stream),
-                        api,
-                    )
-                    .await;
-                });
-            }
-        });
-        address
-    }
-
-    /// Mints a ticket the ordinary signed way and spends it on a real socket.
-    async fn open_talk_socket(
-        api: &RemoteApi,
-        device_id: &str,
-        secret: &[u8],
-        sequence: u64,
-        session_id: &str,
-        address: std::net::SocketAddr,
-    ) -> (
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        String,
-    ) {
-        let body = serde_json::to_vec(&serde_json::json!({
-            "protocol_version": super::super::protocol::TALK_PROTOCOL_VERSION,
-            "session_id": session_id,
-        }))
-        .unwrap();
-        let now_ms = crate::daemon::remote::now_ms_public().unwrap();
-        let issued = api.handle(
-            signed_at(
-                device_id,
-                secret,
-                sequence,
-                &format!("cmd-talk-ticket-{sequence}"),
-                "POST",
-                "/v1/remote/device/talk/ticket",
-                &body,
-                now_ms,
-            ),
-            now_ms,
-        );
-        assert_eq!(issued.status, 201, "the grant admits a ticket");
-        let ticket: serde_json::Value = serde_json::from_slice(&issued.body).unwrap();
-        let url = format!(
-            "ws://{address}{}?ticket={}",
-            ticket["websocket_path"].as_str().unwrap(),
-            ticket["ticket"].as_str().unwrap()
-        );
-        let (socket, response) = tokio_tungstenite::connect_async(&url)
-            .await
-            .expect("the ticket admits a real WebSocket");
-        assert_eq!(response.status().as_u16(), 101);
-        (
-            socket,
-            ticket["session_generation"].as_str().unwrap().to_string(),
-        )
-    }
-
-    /// Reads server frames until one of `kind` arrives, or the socket ends.
-    async fn read_until(
-        socket: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        kind: &str,
-    ) -> serde_json::Value {
-        use futures_util::StreamExt;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            let message = tokio::time::timeout_at(deadline, socket.next())
-                .await
-                .unwrap_or_else(|_| panic!("timed out waiting for a '{kind}' frame"));
-            let Some(Ok(message)) = message else {
-                panic!("the socket closed while waiting for a '{kind}' frame");
-            };
-            let Ok(text) = message.into_text() else {
-                continue;
-            };
-            let Ok(frame) = serde_json::from_str::<serde_json::Value>(&text) else {
-                continue;
-            };
-            if frame["type"] == kind {
-                return frame;
-            }
-        }
-    }
-
-    async fn read_until_closed(
-        socket: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    ) -> bool {
-        use futures_util::StreamExt;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut saw_revocation = false;
-        loop {
-            let message = match tokio::time::timeout_at(deadline, socket.next()).await {
-                Ok(message) => message,
-                Err(_) => return false,
-            };
-            match message {
-                None => return saw_revocation,
-                Some(Ok(message)) => {
-                    if let Ok(text) = message.into_text() {
-                        if text.contains("capability_revoked") {
-                            saw_revocation = true;
-                        }
-                    }
-                }
-                Some(Err(_)) => return saw_revocation,
-            }
-        }
-    }
-
-    fn emit_delta(recorder: &DurableRunRecorder, text: &str) {
-        use crate::durable_run::CliRunEventSink;
-        recorder
-            .emit(RunEvent::ModelDelta {
-                message_id: "talk-answer".to_string(),
-                channel: OutputChannel::Assistant,
-                text: text.to_string(),
-            })
-            .expect("append an assistant delta");
-    }
-
-    /// Withdraws one capability and leaves the rest of the pairing intact â€”
-    /// which is what an operator revoking "may hear the room" actually does.
-    fn revoke(api: &RemoteApi, device_id: &str, capability: DeviceCapability) {
-        let mut store = api.store.lock().unwrap();
-        let mut capabilities = store.device(device_id).unwrap().unwrap().capabilities;
-        capabilities.remove(&capability);
-        store
-            .set_device_capabilities(device_id, &capabilities, 2_000)
-            .expect("revoke");
-    }
-
-    /// A whole voice stream over the signed plane: leased, started, audio
-    /// posted in order, stopped by an operator, closed by the device.
-    ///
-    /// The two properties worth having a test for are both about what happens
-    /// when the link is unreliable. A chunk delivered twice must be stored once
-    /// â€” otherwise a phone on a bad connection produces stuttering audio that
-    /// nothing downstream can detect. And an operator's stop must reach the
-    /// microphone, which it does on the answer to a chunk the device is already
-    /// posting rather than on a poll it might not make.
-    #[test]
-    fn a_voice_stream_survives_a_retry_and_stops_when_an_operator_says_so() {
-        let (root, api, _secrets, device_id, secret) = fixture();
-        grant(
-            &api,
-            &device_id,
-            &[
-                DeviceCapability::MicrophoneCapture,
-                DeviceCapability::VoiceStream,
-            ],
-        );
-        assert_eq!(
-            advertise(
-                &api,
-                &device_id,
-                &secret,
-                1,
-                &[
-                    DeviceCapability::MicrophoneCapture,
-                    DeviceCapability::VoiceStream
-                ],
-                &[
-                    (DeviceCapability::MicrophoneCapture, OsPermission::Granted),
-                    (DeviceCapability::VoiceStream, OsPermission::Granted),
-                ],
-            )
-            .status,
-            200
-        );
-
-        let session_id = "vs-testsessionidentifier".to_string();
-        let command_id = {
-            let mut store = api.store.lock().unwrap();
-            let command = store
-                .enqueue_device_command(
-                    &DeviceCommandRequest {
-                        device_id: device_id.clone(),
-                        capability: DeviceCapability::VoiceStream,
-                        arguments: serde_json::json!({
-                            "session_id": session_id,
-                            "duration_ms": 60_000,
-                            "chunk_ms": 1_000,
-                        }),
-                        source_run_id: None,
-                        source_session_id: None,
-                        source_tool_call_id: None,
-                        invocation_id: None,
-                        expires_at_ms: 300_000,
-                    },
-                    2_000,
-                )
-                .unwrap();
-            store
-                .open_voice_session(
-                    &session_id,
-                    &device_id,
-                    &command.command_id,
-                    None,
-                    None,
-                    200_000,
-                    2_000,
-                )
-                .unwrap();
-            command.command_id
-        };
-
-        // Lease and start, exactly as a photograph would.
-        let leased = api.handle(
-            signed(
-                &device_id,
-                &secret,
-                2,
-                "cmd-vlease",
-                "GET",
-                "/v1/remote/device/commands/next",
-                b"",
-            ),
-            2_000,
-        );
-        assert_eq!(leased.status, 200);
-        let start_path = format!("/v1/remote/device/commands/{command_id}/start");
-        assert_eq!(
-            api.handle(
-                signed(
-                    &device_id,
-                    &secret,
-                    3,
-                    "cmd-vstart",
-                    "POST",
-                    &start_path,
-                    b"{}"
-                ),
-                2_000,
-            )
-            .status,
-            200
-        );
-
-        let chunk_path = format!("/v1/remote/device/voice/{session_id}/chunk");
-        let chunk = |sequence: u64, audio: &[u8], first: bool| {
-            serde_json::to_vec(&VoiceChunkRequest {
-                protocol_version: REMOTE_PROTOCOL_VERSION,
-                sequence,
-                audio_base64: STANDARD.encode(audio),
-                media_type: first.then(|| "audio/webm".to_string()),
-                last: false,
-            })
-            .unwrap()
-        };
-        let first = api.handle(
-            signed(
-                &device_id,
-                &secret,
-                4,
-                "cmd-vchunk-0",
-                "POST",
-                &chunk_path,
-                &chunk(0, b"opus-one", true),
-            ),
-            2_100,
-        );
-        assert_eq!(first.status, 200);
-        let first: serde_json::Value = serde_json::from_slice(&first.body).unwrap();
-        assert_eq!(first["accepted"], serde_json::json!(true));
-        assert_eq!(first["next_sequence"], serde_json::json!(1));
-        assert_eq!(first["stop"], serde_json::json!(false));
-
-        // The device's reply was lost, so it sends chunk 0 again. The runner
-        // already holds it: the answer says so, and nothing is appended.
-        let retry = api.handle(
-            signed(
-                &device_id,
-                &secret,
-                5,
-                "cmd-vchunk-0b",
-                "POST",
-                &chunk_path,
-                &chunk(0, b"opus-one", false),
-            ),
-            2_200,
-        );
-        let retry: serde_json::Value = serde_json::from_slice(&retry.body).unwrap();
-        assert_eq!(retry["accepted"], serde_json::json!(false));
-        assert_eq!(retry["bytes"], serde_json::json!(8));
-
-        // An operator stops the stream. The device has not asked for anything
-        // since, so this is the moment nothing has told it yet.
-        api.store
-            .lock()
-            .unwrap()
-            .request_device_cancel(&command_id, 2_300)
-            .unwrap();
-
-        let second = api.handle(
-            signed(
-                &device_id,
-                &secret,
-                6,
-                "cmd-vchunk-1",
-                "POST",
-                &chunk_path,
-                &chunk(1, b"opus-two", false),
-            ),
-            2_400,
-        );
-        let second: serde_json::Value = serde_json::from_slice(&second.body).unwrap();
-        assert_eq!(
-            second["stop"],
-            serde_json::json!(true),
-            "an operator's stop must reach the microphone on the next chunk"
-        );
-        // Still accepted: the audio already recorded is not thrown away just
-        // because someone asked for the stream to end.
-        assert_eq!(second["accepted"], serde_json::json!(true));
-
-        let close_path = format!("/v1/remote/device/voice/{session_id}/close");
-        let closed = api.handle(
-            signed(
-                &device_id,
-                &secret,
-                7,
-                "cmd-vclose",
-                "POST",
-                &close_path,
-                br#"{"protocol_version":2}"#,
-            ),
-            2_500,
-        );
-        assert_eq!(closed.status, 200);
-        let closed: serde_json::Value = serde_json::from_slice(&closed.body).unwrap();
-        assert_eq!(closed["state"], serde_json::json!("closed"));
-        assert_eq!(closed["chunks"], serde_json::json!(2));
-
-        // Exactly the bytes that were recorded, once each, in order.
-        assert_eq!(
-            std::fs::read(super::super::voice::audio_path(
-                &api.paths.root,
-                &session_id
-            ))
-            .unwrap(),
-            b"opus-oneopus-two"
-        );
-
-        // A closed session takes nothing more.
-        let late = api.handle(
-            signed(
-                &device_id,
-                &secret,
-                8,
-                "cmd-vchunk-late",
-                "POST",
-                &chunk_path,
-                &chunk(2, b"opus-three", false),
-            ),
-            2_600,
-        );
-        assert_eq!(late.status, 409);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The end-to-end shape task 06 is judged on: a device advertises, a
-    /// command is queued, it is leased exactly once, started once, and its
-    /// result comes back with an artifact.
-    #[test]
-    fn a_device_receives_a_queued_command_exactly_once_and_returns_its_artifact() {
-        let (root, api, _secrets, device_id, secret) = fixture();
-        grant(&api, &device_id, &[DeviceCapability::CameraCapture]);
-        assert_eq!(
-            advertise(
-                &api,
-                &device_id,
-                &secret,
-                1,
-                &[DeviceCapability::CameraCapture],
-                &[(DeviceCapability::CameraCapture, OsPermission::Granted)],
-            )
-            .status,
-            200
-        );
-
-        let queued = api
-            .store
-            .lock()
-            .unwrap()
-            .enqueue_device_command(
-                &DeviceCommandRequest {
-                    device_id: device_id.clone(),
-                    capability: DeviceCapability::CameraCapture,
-                    arguments: serde_json::json!({ "position": "back" }),
-                    source_run_id: Some("run-one".into()),
-                    source_session_id: None,
-                    source_tool_call_id: Some("call-1".into()),
-                    invocation_id: None,
-                    expires_at_ms: 300_000,
-                },
-                2_000,
-            )
-            .unwrap();
-
-        let leased = api.handle(
-            signed(
-                &device_id,
-                &secret,
-                2,
-                "cmd-lease-1",
-                "GET",
-                "/v1/remote/device/commands/next",
-                b"",
-            ),
-            2_000,
-        );
-        assert_eq!(leased.status, 200);
-        let command: DeviceCommand = serde_json::from_slice(&leased.body).unwrap();
-        assert_eq!(command.command_id, queued.command_id);
-        assert_eq!(command.capability, DeviceCapability::CameraCapture);
-
-        // A second connection finds nothing: the command is leased, not shared.
-        let empty = api.handle(
-            signed(
-                &device_id,
-                &secret,
-                3,
-                "cmd-lease-2",
-                "GET",
-                "/v1/remote/device/commands/next",
-                b"",
-            ),
-            2_000,
-        );
-        assert_eq!(empty.status, 204);
-
-        let start_path = format!("/v1/remote/device/commands/{}/start", command.command_id);
-        let started = api.handle(
-            signed(
-                &device_id,
-                &secret,
-                4,
-                "cmd-start-1",
-                "POST",
-                &start_path,
-                b"{}",
-            ),
-            2_000,
-        );
-        assert_eq!(started.status, 200);
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&started.body).unwrap()["started"],
-            serde_json::json!(true)
-        );
-        // The reconnect case: the device retries `start` because it lost the
-        // reply. It must be told the action already began, not allowed to
-        // repeat it.
-        let again = api.handle(
-            signed(
-                &device_id,
-                &secret,
-                5,
-                "cmd-start-2",
-                "POST",
-                &start_path,
-                b"{}",
-            ),
-            2_000,
-        );
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&again.body).unwrap()["started"],
-            serde_json::json!(false),
-            "a reconnecting device must not perform the physical action twice"
-        );
-
-        let result = DeviceCommandResult {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            outcome: DeviceCommandState::Succeeded,
-            result: Some(serde_json::json!({ "width": 4, "height": 3 })),
-            artifact_base64: Some(STANDARD.encode(b"jpeg-bytes")),
-            artifact_media_type: Some("image/jpeg".into()),
-            artifact_sha256: None,
-            error: None,
-            execution_id: None,
-        };
-        let result_path = format!("/v1/remote/device/commands/{}/result", command.command_id);
-        let reported = api.handle(
-            signed(
-                &device_id,
-                &secret,
-                6,
-                "cmd-result-1",
-                "POST",
-                &result_path,
-                &serde_json::to_vec(&result).unwrap(),
-            ),
-            2_000,
-        );
-        assert_eq!(reported.status, 200);
-        let stored = api
-            .store
-            .lock()
-            .unwrap()
-            .device_command(&command.command_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.state, DeviceCommandState::Succeeded);
-        let artifact = stored.artifact.unwrap();
-        assert_eq!(artifact.bytes, 10);
-        assert_eq!(artifact.media_type, "image/jpeg");
-        assert!(root
-            .join("daemon/device-artifacts")
-            .join(&command.command_id)
-            .exists());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// One running command, and a terminal report to race against itself.
-    ///
-    /// Returns the fixture, the device record the commit path needs, and the
-    /// command id â€” leased, started, and owned by `exec-race-0001`.
-    fn running_command_fixture() -> (
-        PathBuf,
-        RemoteApi,
-        crate::daemon::remote::store::DeviceRecord,
-        String,
-    ) {
-        command_fixture(Stage::Running(Some("exec-race-0001")))
-    }
-
-    /// How far along its lifecycle a fixture's command has travelled.
-    #[derive(Clone, Copy)]
-    enum Stage {
-        Queued,
-        Leased,
-        /// Started, naming an execution â€” or, with `None`, started by a build
-        /// that had no execution identity to give.
-        Running(Option<&'static str>),
-    }
-
-    fn command_fixture(
-        stage: Stage,
-    ) -> (
-        PathBuf,
-        RemoteApi,
-        crate::daemon::remote::store::DeviceRecord,
-        String,
-    ) {
-        let (root, api, _secrets, device_id, secret) = fixture();
-        grant(&api, &device_id, &[DeviceCapability::CameraCapture]);
-        advertise(
-            &api,
-            &device_id,
-            &secret,
-            1,
-            &[DeviceCapability::CameraCapture],
-            &[(DeviceCapability::CameraCapture, OsPermission::Granted)],
-        );
-        let queued = api
-            .store
-            .lock()
-            .unwrap()
-            .enqueue_device_command(
-                &DeviceCommandRequest {
-                    device_id: device_id.clone(),
-                    capability: DeviceCapability::CameraCapture,
-                    arguments: serde_json::json!({ "position": "back" }),
-                    source_run_id: Some("run-one".into()),
-                    source_session_id: None,
-                    source_tool_call_id: Some("call-race".into()),
-                    invocation_id: None,
-                    expires_at_ms: 300_000,
-                },
-                2_000,
-            )
-            .unwrap();
-        if !matches!(stage, Stage::Queued) {
-            let leased = api.handle(
-                signed(
-                    &device_id,
-                    &secret,
-                    2,
-                    "cmd-race-lease",
-                    "GET",
-                    "/v1/remote/device/commands/next",
-                    b"",
-                ),
-                2_000,
-            );
-            assert_eq!(leased.status, 200);
-        }
-        if let Stage::Running(execution_id) = stage {
-            let body = match execution_id {
-                Some(value) => format!(r#"{{"execution_id":"{value}"}}"#).into_bytes(),
-                None => b"{}".to_vec(),
-            };
-            let start_path = format!("/v1/remote/device/commands/{}/start", queued.command_id);
-            let started = api.handle(
-                signed(
-                    &device_id,
-                    &secret,
-                    3,
-                    "cmd-race-start",
-                    "POST",
-                    &start_path,
-                    &body,
-                ),
-                2_000,
-            );
-            assert_eq!(started.status, 200);
-        }
-        let device = api
-            .store
-            .lock()
-            .unwrap()
-            .device(&device_id)
-            .unwrap()
-            .unwrap();
-        (root, api, device, queued.command_id)
-    }
-
-    fn camera_report(bytes: &[u8], execution_id: &str) -> Vec<u8> {
-        report_body(bytes, Some(execution_id))
-    }
-
-    fn report_body(bytes: &[u8], execution_id: Option<&str>) -> Vec<u8> {
-        serde_json::to_vec(&DeviceCommandResult {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            outcome: DeviceCommandState::Succeeded,
-            result: Some(serde_json::json!({ "bytes": bytes.len() })),
-            artifact_base64: Some(STANDARD.encode(bytes)),
-            artifact_media_type: Some("image/jpeg".into()),
-            artifact_sha256: Some(sha256_hex(bytes)),
-            error: None,
-            execution_id: execution_id.map(str::to_string),
-        })
-        .unwrap()
-    }
-
-    fn artifact_path(root: &std::path::Path, command_id: &str) -> PathBuf {
-        root.join("daemon/device-artifacts").join(command_id)
-    }
-
-    /// `/start` is the authorization boundary, so a terminal report is only
-    /// meaningful from the far side of it.
-    ///
-    /// Before this, an authenticated device could take a command straight from
-    /// `queued` â€” or from `leased`, without ever asking â€” to `succeeded`, which
-    /// skips every check that boundary exists to make: the grant, the readiness,
-    /// the cancellation, and the record of *which* execution is answering.
-    #[test]
-    fn a_result_for_a_command_that_was_never_started_is_refused() {
-        for (stage, expected) in [
-            (Stage::Queued, DeviceCommandState::Queued),
-            (Stage::Leased, DeviceCommandState::Leased),
-        ] {
-            let (root, api, device, command_id) = command_fixture(stage);
-            let body = camera_report(b"never-authorized", "exec-invented-1");
-            let (status, message) = api
-                .device_command_result(&body, &device, &command_id, 2_100)
-                .expect_err("a command that was never started has no result to report");
-            assert_eq!(status, 409, "{message}");
-            assert_eq!(
-                api.store
-                    .lock()
-                    .unwrap()
-                    .device_command(&command_id)
-                    .unwrap()
-                    .unwrap()
-                    .state,
-                expected,
-                "a refused report must not move the command"
-            );
-            assert!(
-                !artifact_path(&root, &command_id).exists(),
-                "a refused report must not publish an artifact"
-            );
-            let _ = std::fs::remove_dir_all(&root);
-        }
-    }
-
-    /// A running command answers only to the execution that holds it.
-    ///
-    /// Including the silent case: an omitted `execution_id` is the one form any
-    /// second execution can always produce, so it is refused exactly as firmly
-    /// as a wrong one.
-    #[test]
-    fn a_running_command_accepts_only_its_own_executions_result() {
-        for (offered, accepted) in [
-            (None, false),
-            (Some("exec-somebody-el"), false),
-            (Some("exec-race-0001"), true),
-        ] {
-            let (root, api, device, command_id) = running_command_fixture();
-            let body = report_body(b"jpeg-bytes", offered);
-            let answer = api.device_command_result(&body, &device, &command_id, 2_100);
-            let state = api
-                .store
-                .lock()
-                .unwrap()
-                .device_command(&command_id)
-                .unwrap()
-                .unwrap()
-                .state;
-            if accepted {
-                assert_eq!(answer.expect("the holder's result is accepted").0, 200);
-                assert_eq!(state, DeviceCommandState::Succeeded);
-                assert!(artifact_path(&root, &command_id).exists());
-            } else {
-                let (status, message) = answer.expect_err("only the holder may report");
-                assert_eq!(status, 409, "{message}");
-                assert_eq!(
-                    state,
-                    DeviceCommandState::Running,
-                    "a refused report must leave the command running"
-                );
-                assert!(
-                    !artifact_path(&root, &command_id).exists(),
-                    "a refused report must not publish an artifact"
-                );
-            }
-            let _ = std::fs::remove_dir_all(&root);
-        }
-    }
-
-    /// A command started before execution identities existed stays completable.
-    ///
-    /// Both ends have to be silent about it. An id offered against a command
-    /// that never recorded one proves nothing, and accepting it would let a
-    /// second execution answer for the first.
-    #[test]
-    fn a_command_started_without_an_execution_identity_completes_without_one() {
-        let (root, api, device, command_id) = command_fixture(Stage::Running(None));
-        let (status, message) = api
-            .device_command_result(
-                &report_body(b"jpeg-bytes", Some("exec-invented-1")),
-                &device,
-                &command_id,
-                2_100,
-            )
-            .expect_err("an invented identity proves nothing about a command that recorded none");
-        assert_eq!(status, 409, "{message}");
-        assert!(!artifact_path(&root, &command_id).exists());
-
-        let (status, _, _) = api
-            .device_command_result(
-                &report_body(b"jpeg-bytes", None),
-                &device,
-                &command_id,
-                2_100,
-            )
-            .expect("a legacy start must stay completable");
-        assert_eq!(status, 200);
-        assert_eq!(
-            api.store
-                .lock()
-                .unwrap()
-                .device_command(&command_id)
-                .unwrap()
-                .unwrap()
-                .state,
-            DeviceCommandState::Succeeded
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// What the runner holds, as two facts that must agree: the digest in the
-    /// row, and the bytes on disk.
-    fn stored_artifact(
-        root: &std::path::Path,
-        api: &RemoteApi,
-        command_id: &str,
-    ) -> (String, String) {
-        let stored = api
-            .store
-            .lock()
-            .unwrap()
-            .device_command(command_id)
-            .unwrap()
-            .unwrap();
-        let bytes = std::fs::read(root.join("daemon/device-artifacts").join(command_id))
-            .expect("a terminal record must never name bytes that are not there");
-        (stored.artifact.unwrap().sha256, sha256_hex(&bytes))
-    }
-
-    /// The same result delivered twice at the same moment.
-    ///
-    /// The device cannot tell a lost response from a lost request, so it
-    /// retries â€” and nothing stops the retry overlapping the original. Both
-    /// deliveries have to be acknowledged, and between them they may leave only
-    /// one artifact.
-    #[test]
-    fn two_identical_terminal_reports_racing_each_other_commit_once() {
-        for round in 0..8 {
-            let (root, api, device, command_id) = running_command_fixture();
-            let body = camera_report(b"jpeg-bytes-identical", "exec-race-0001");
-            let gate = std::sync::Barrier::new(2);
-            let (first, second) = std::thread::scope(|scope| {
-                let one = scope.spawn(|| {
-                    gate.wait();
-                    api.device_command_result(&body, &device, &command_id, 2_100)
-                });
-                let two = scope.spawn(|| {
-                    gate.wait();
-                    api.device_command_result(&body, &device, &command_id, 2_100)
-                });
-                (one.join().unwrap(), two.join().unwrap())
-            });
-            for answer in [&first, &second] {
-                let (status, _, _) = answer.as_ref().unwrap_or_else(|error| {
-                    panic!("round {round}: an identical retry was refused: {error:?}")
-                });
-                assert_eq!(*status, 200);
-            }
-            let (row, file) = stored_artifact(&root, &api, &command_id);
-            assert_eq!(row, sha256_hex(b"jpeg-bytes-identical"));
-            assert_eq!(row, file, "round {round}: the row and the bytes disagree");
-            let _ = std::fs::remove_dir_all(&root);
-        }
-    }
-
-    /// Two *different* results for one physical action, delivered at the same
-    /// moment.
-    ///
-    /// Exactly one may win, and the loser must change nothing â€” not the row,
-    /// not the digest, and above all not the bytes. Publishing the artifact
-    /// outside the commit is what used to make "the row says A, the file holds
-    /// B" reachable.
-    #[test]
-    fn a_conflicting_terminal_report_racing_the_winner_changes_nothing() {
-        for round in 0..8 {
-            let (root, api, device, command_id) = running_command_fixture();
-            let first_body = camera_report(b"jpeg-bytes-first", "exec-race-0001");
-            let second_body = camera_report(b"jpeg-bytes-second", "exec-race-0001");
-            let gate = std::sync::Barrier::new(2);
-            let (first, second) = std::thread::scope(|scope| {
-                let one = scope.spawn(|| {
-                    gate.wait();
-                    api.device_command_result(&first_body, &device, &command_id, 2_100)
-                });
-                let two = scope.spawn(|| {
-                    gate.wait();
-                    api.device_command_result(&second_body, &device, &command_id, 2_100)
-                });
-                (one.join().unwrap(), two.join().unwrap())
-            });
-            let accepted = [&first, &second]
-                .iter()
-                .filter(|answer| answer.is_ok())
-                .count();
-            assert_eq!(
-                accepted, 1,
-                "round {round}: exactly one report is authoritative"
-            );
-            for answer in [&first, &second] {
-                if let Err((status, _)) = answer {
-                    assert_eq!(
-                        *status, 409,
-                        "round {round}: the loser is refused, not failed"
-                    );
-                }
-            }
-            let (row, file) = stored_artifact(&root, &api, &command_id);
-            let winner = if first.is_ok() {
-                b"jpeg-bytes-first".as_slice()
-            } else {
-                b"jpeg-bytes-second".as_slice()
-            };
-            assert_eq!(row, sha256_hex(winner));
-            assert_eq!(
-                row, file,
-                "round {round}: the loser's bytes replaced the winner's under the winner's digest"
-            );
-            let _ = std::fs::remove_dir_all(&root);
-        }
-    }
-
-    /// Authority is re-checked at the moment the command is handed over, not
-    /// only when it was queued â€” an OS permission the user switched off in
-    /// between must stop it, with a reason the waiting run can read.
-    #[test]
-    fn a_permission_withdrawn_after_queueing_fails_the_command_at_lease_time() {
-        let (root, api, _secrets, device_id, secret) = fixture();
-        grant(&api, &device_id, &[DeviceCapability::LocationRead]);
-        advertise(
-            &api,
-            &device_id,
-            &secret,
-            1,
-            &[DeviceCapability::LocationRead],
-            &[(DeviceCapability::LocationRead, OsPermission::Granted)],
-        );
-        let queued = api
-            .store
-            .lock()
-            .unwrap()
-            .enqueue_device_command(
-                &DeviceCommandRequest {
-                    device_id: device_id.clone(),
-                    capability: DeviceCapability::LocationRead,
-                    arguments: serde_json::json!({}),
-                    source_run_id: None,
-                    source_session_id: None,
-                    source_tool_call_id: None,
-                    invocation_id: None,
-                    expires_at_ms: 300_000,
-                },
-                2_000,
-            )
-            .unwrap();
-        // The user revokes location in the OS and the app re-advertises.
-        advertise(
-            &api,
-            &device_id,
-            &secret,
-            2,
-            &[DeviceCapability::LocationRead],
-            &[(DeviceCapability::LocationRead, OsPermission::Denied)],
-        );
-        let leased = api.handle(
-            signed(
-                &device_id,
-                &secret,
-                3,
-                "cmd-lease-1",
-                "GET",
-                "/v1/remote/device/commands/next",
-                b"",
-            ),
-            2_000,
-        );
-        assert_eq!(leased.status, 204, "a denied capability yields no command");
-        let stored = api
-            .store
-            .lock()
-            .unwrap()
-            .device_command(&queued.command_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.state, DeviceCommandState::Failed);
-        // Not a shrug: the reason names the axis that refused and what the
-        // operator would do about it.
-        let reason = stored.error.unwrap();
-        assert!(
-            reason.contains("denies") && reason.contains("system settings"),
-            "the failure must say the OS denied it and where to fix it: {reason}"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// Advertising is not authority: a device that claims every capability
-    /// gains none it was not granted.
-    #[test]
-    fn advertising_a_capability_never_grants_it() {
-        let (root, api, _secrets, device_id, secret) = fixture();
-        let response = advertise(
-            &api,
-            &device_id,
-            &secret,
-            1,
-            &[
-                DeviceCapability::CameraCapture,
-                DeviceCapability::ScreenCapture,
-                DeviceCapability::MicrophoneCapture,
-            ],
-            &[
-                (DeviceCapability::CameraCapture, OsPermission::Granted),
-                (DeviceCapability::ScreenCapture, OsPermission::Granted),
-                (DeviceCapability::MicrophoneCapture, OsPermission::Granted),
-            ],
-        );
-        assert_eq!(response.status, 200);
-        let state: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-        let effective = state["effective"].as_array().unwrap();
-        assert!(
-            !effective
-                .iter()
-                .any(|value| value == "camera_capture" || value == "screen_capture"),
-            "a self-declared capability must not become effective: {effective:?}"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// The long poll waits for work and returns as soon as it exists, and it
-    /// never holds a connection longer than the lease.
-    #[tokio::test]
-    async fn the_lease_long_poll_waits_for_work_and_gives_up_on_time() {
-        let (root, api, _secrets, device_id, secret) = fixture();
-        grant(&api, &device_id, &[DeviceCapability::NotificationPost]);
-        advertise(
-            &api,
-            &device_id,
-            &secret,
-            1,
-            &[DeviceCapability::NotificationPost],
-            &[(DeviceCapability::NotificationPost, OsPermission::Granted)],
-        );
-
-        let started = std::time::Instant::now();
-        let empty = api
-            .handle_waiting(
-                signed(
-                    &device_id,
-                    &secret,
-                    2,
-                    "cmd-poll-1",
-                    "GET",
-                    "/v1/remote/device/commands/next?wait_ms=1200",
-                    b"",
-                ),
-                2_000,
-            )
-            .await;
-        assert_eq!(empty.status, 204);
-        let waited = started.elapsed();
-        assert!(
-            waited >= std::time::Duration::from_millis(1_000),
-            "an empty poll must actually wait, not spin: {waited:?}"
-        );
-        assert!(
-            waited < std::time::Duration::from_millis(10_000),
-            "the poll must give up well inside the lease: {waited:?}"
-        );
-
-        // With work already queued, the same request returns immediately.
-        api.store
-            .lock()
-            .unwrap()
-            .enqueue_device_command(
-                &DeviceCommandRequest {
-                    device_id: device_id.clone(),
-                    capability: DeviceCapability::NotificationPost,
-                    arguments: serde_json::json!({ "title": "hi", "body": "there" }),
-                    source_run_id: None,
-                    source_session_id: None,
-                    source_tool_call_id: None,
-                    invocation_id: None,
-                    expires_at_ms: 300_000,
-                },
-                2_000,
-            )
-            .unwrap();
-        let started = std::time::Instant::now();
-        let leased = api
-            .handle_waiting(
-                signed(
-                    &device_id,
-                    &secret,
-                    3,
-                    "cmd-poll-2",
-                    "GET",
-                    "/v1/remote/device/commands/next?wait_ms=20000",
-                    b"",
-                ),
-                2_000,
-            )
-            .await;
-        assert_eq!(leased.status, 200);
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(2_000),
-            "a queued command must not wait for the poll deadline"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A revoked device gets nothing, including on the device plane.
-    #[test]
-    fn a_revoked_device_cannot_lease_or_report() {
-        let (root, api, secrets, device_id, secret) = fixture();
-        grant(&api, &device_id, &[DeviceCapability::DeviceInfo]);
-        api.store
-            .lock()
-            .unwrap()
-            .revoke_device(&device_id, "lost", 2_000, secrets.as_ref(), None)
-            .unwrap();
-        for (sequence, command, method, path) in [
-            (1u64, "cmd-a", "GET", "/v1/remote/device/state"),
-            (2, "cmd-b", "GET", "/v1/remote/device/commands/next"),
-            (3, "cmd-c", "POST", "/v1/remote/device/surface"),
-        ] {
-            let response = api.handle(
-                signed(&device_id, &secret, sequence, command, method, path, b"{}"),
-                2_000,
-            );
-            assert_eq!(response.status, 401, "{path} answered a revoked device");
-        }
-        let _ = std::fs::remove_dir_all(root);
-    }
-}
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×]ºßTèµ©hºÚn¶X§zÍ]\ÙHÝŽ˜ÛÛXÝ[ÛœÎŽ’\ÚX\Â\ÙHÝŽœÞ[˜ÎŽžÐ\˜Ë]]^NÂ‚\ÙH˜\ÙMŽ™[™Ú[™NŽ™Ù[™\˜[Ü\œÜÙNŽ”ÕS‘T‘Â\ÙH˜\ÙMŽ‘[™Ú[™NÂ\ÙH]WÛ[ÛšÙ^WÛXŽŽ˜\Y˜XÝÜÝÜ™NŽ\Y˜XÝÝÜ™NÂ\ÙH]WÛ[ÛšÙ^WÛXŽŽ›ZYÜ˜][ÛŽŽžÂˆYZ]ZYÜ˜][Û•™\™XÝ\™Ù]›ÙKPVÓRQÔUSÓ—ÔVSÐQÐ–UTËŸNÂ\ÙH]WÛ[ÛšÙ^WÛXŽŽœ[—ÛYÙ\ŽŽžÔ[“YÙ\‹ÝÜ™Y\›Ý˜[ÝÜ™Y[ŸNÂ\ÙH]WÛ[ÛšÙ^WÛXŽŽœ[—Ü›ÝØÛÛŽžÂˆÛY[Y[]KÛY[Ú[™[Ù[\™Ù]Û˜\ÚÝ\›Z\ÜÚ[Û‘XÚ\Ú[Û‹[‘]™[ˆ[‘]™[[™[ÜK•S—Ô“ÕÐÓÓÔÐÒSPWÕ‘T”ÒSÓ‹ŸNÂ\ÙHÙ\™NŽ”Ù\šX[^™NÂ‚\ÙHÜ˜]NŽ™Y[[ÛŽŽ›YÙ\ŽŽ”Ú\™YYÙ\ŽÂ\ÙHÜ˜]NŽ™Y[[ÛŽŽœÝÜ™NŽžÑY[[Û”]ËY[[Û”ÝÜ™_NÂ\ÙHÜ˜]NŽ™\˜X›WÜ[ŽŽžØ›Ý[™YÝ^ÛT[‘]™[Ú[šË\˜X›T[”™XÛÜ™\ŸNÂ‚\ÙH]WÛ[ÛšÙ^WÛXŽŽœ[—Ü›ÝØÛÛŽ“Ý]]Ú[›™[Â‚\ÙHÝ\\ŽŽ™\ÚÝÜŽ‘\ÚÝÜÛÛ›Û[[YNÂ\ÙHÝ\\ŽŽ›ZYÜ˜]NŽ›[™ÛZYÜ˜][ÛŽÂ\ÙHÝ\\ŽŽœ›ÝØÛÛŽžÂˆ[ÜY\—ØØ\Xš[]Y\ËØ[›ÛšXØ[Ü™\]Y\ÝØ\Xš[]WØ›ØÚËY™™XÝ]™WØØ\Xš[]Y\ËˆYØXÞWØØ\Xš[]Y\ËY\—ØØ\Xš[]Y\×ÛÙ‹ÚLM—Ú^\›Z[˜[ÙYÙ\Ý\›Ý˜[™\]Y\Ý›ÙKˆØ[˜Ù[™\]Y\Ý›ÙK\ÚÝÜÛÛ›ÛXÝ[Û”™\]Y\Ý\ÚÝÜÛÛ›ÛÝ\™\]Y\Ýˆ\ÚÝÜÛÛ›ÛÝÜ™\]Y\Ý\ÚÝÜÛÛ›Û\™Ù]™\]Y\Ý]šXÙPØ\Xš[]K]šXÙPÛÛ[X[™ˆ]šXÙPÛÛ[X[™ÛÛ›Û]šXÙPÛÛ[X[™™XÛÝ™\žK]šXÙPÛÛ[X[™™\Ý[]šXÙPÛÛ[X[™Ý\™\]Y\Ýˆ]šXÙPÛÛ[X[™Ý]K]šXÙTÝ\™˜XÙKZYÜ˜][ÛXØÙ\™\]Y\ÝZYÜ˜][Û”™Y›YÚ™\]Y\ÝˆZYÜ˜][Û”™XÙZ\Z\XØÙ\™\]Y\ÝY\\Y˜XÝÝÜ™YY\\Y˜XÝ\ØYY\’[Ô™\]Y\ÝˆY\’[Ô™\ÜÛœÙK™[[ÝPXÝ[Û‹™[[ÝRÜÝÛÛ™šYË™[[ÝTØÛÜ\Ë[”Ý[[X\žKˆÚYÛ™Y™\]Y\ÝXY\œË[ÕXÚÙ]™\]Y\Ý[ÕXÚÙ]™\ÜÛœÙK›ÚXÙPÚ[šÔ™\]Y\Ýˆ›ÚXÙPÛÜÙT™\]Y\ÝQUSÕS×ÕPÒÑUÕÓTËU’PÑWÓPTÑWÓTËPVÔ‘SSÕWÐ“ÑWÐ–UTËˆPVÕ“ÒPÑWÐÒS’×Ð–UTËTÒPÐSÑU’PÑWÐÐTP’SUQTË‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ŸNÂ\ÙHÝ\\ŽŽœÝÜ™NŽžÂˆÛÛ[X[™™\Ù\˜][Û‹]šXÙP\Y˜XÝ]šXÙT™XÛÜ™Ù^\š[™Ô™[[ÝTÙXÜ™]Ë[Øš[PØ\\™T™XÛÜ™ˆ[Øš[SY\ÜØYÙT™XÛÜ™[Øš[UÛÜšÙ›ÝÔ[”™XÛÜ™™[[ÝTÙXÜ™]ÝÜ™K™[[ÝTÝÜ™KŸNÂ‚‹ËËÈÙX[H›ÝYÚÚXÚH[Øš[HÚ]›Ý]H™XXÚ\ÈHY[[Û‰ÜÈ™XÚ\B‹ËËÈ]Y]YKˆ›ÙXÝ[Ûˆ
+Y[[ÛŽŽ‘Y[[Û“[Øš[PÚ]]Y]YX
+H]Y]Y\ÈB‹ËËÈÜ\˜]Ü‹XÛÛ™šYÝ\™Y[Øš[KXÚ]™XÚ\NÈ\ÝÈ[š™XÝH˜ZÙHÛÈHTB‹ËËÈÛÛ˜XÝ\È\ÝX›HÚ]Ý]HÛÛ™šYÝ\™YY[[Û‹‚œXˆ˜Z][Øš[PÚ]]Y]YNˆÙ[™
+ÈÞ[˜ÈÂˆËËÈ]Y]Y\ÈÛ™HÚ]\›‹ˆÛY[ÚÙ^X\ÈH[Øš[HY\ÜØYÙHY8 %BˆËËÈ[\[Y[][Ûˆ\š]™\ÈH]\›Z[š\ÝXÈ›ØˆYœ›ÛH]ÛÈ™\^Z[™ÂˆËËÈHØ[YHÚYÛ™Y™\]Y\ÝØ[ˆ™]™\ˆÝX›K\]Y]YKˆÙ\ÜÚ[Û—ÚY\ÈBˆËËÈÛÛ™\œØ][ÛˆH\›ˆ™[Û™ÜÈËÚXÚ\ÈÚ]H\˜X›H[™Ü™\ÜÂˆËËÈ™XÛÜ™Ù^\È]ÈÙ\ÜÚ[ÛˆÛ‹ˆ™]\›œÈH\˜X›H[ˆY‚ˆ›ˆ]Y]YWØÚ]
+ˆ	œÙ[‹ˆÙ\ÜÚ[Û—ÚYˆ	œÝ‹ˆÛY[ÚÙ^Nˆ	œÝ‹ˆ›Û\ˆ	œÝ‹ˆ
+HOˆ™\Ý[Ýš[™ËÝš[™ÏŽÂˆËËÈ™\ÛÛ™\ÈH\˜X›H[ˆY™]š[Ý\ÛH]Y]YY›Üˆ\È\›‹YˆH›Ø‚ˆËËÈ\ÈÛ™HY]ˆ›Ý[™\ÈÙˆH\›‰ÜÈY[]H\™H™YYYˆH›ØˆYˆËËÈ\ÈHYÙ\ÝÝ™\ˆ[H[™Ø[››Ý™H[™\Y‚ˆ›ˆÚ]Ü[—ÚY
+	œÙ[‹Ù\ÜÚ[Û—ÚYˆ	œÝ‹ÛY[ÚÙ^Nˆ	œÝŠHOˆ™\Ý[Ü[ÛÝš[™Ï‹Ýš[™ÏŽÂŸB‚‹ËËÈÙX[H›ÝYÚÚXÚHXÙ[Y[›Ý]H™XXÚ\È\È›ÙIÜÈÝÛˆ]Y]YB‹ËËÈ
+›ØYX\ÌMÈÌŠK‚‹ËËÂ‹ËËÈHØ[YHÚ\H\ÈØ[Øš[PÚ]]Y]YXH[™›ÜˆHØ[YH™X\ÛÛŽˆH›Ý]IÜÂ‹ËËÈÛÛ˜XÝ8 %˜[Y]HH›Ü™ZYÛˆÜXË™Y\ÙHÚ]\È›ÙHØ[››ÝØ]\ÙžK‹ËËÈ™XÛÜ™HXÙ[Y[8 %\È\ÝX›HÚ]Ý]HÛÛ™šYÝ\™YY[[Û‹Ú[B‹ËËÈ›ÙXÝ[Ûˆ
+Y[[ÛŽŽ‘Y[[Û”XÙ[Y[]Y]YX
+HÙ\ÈH™X[[œ]Y]YK‚œXˆ˜Z]XÙ[Y[]Y]YNˆÙ[™
+ÈÞ[˜ÈÂˆËËÈXØÙ\ÈHœ›Þ™[ˆ›Ü™ZYÛˆÜXÈ[™]Y]Y\È]\™K‚ˆËËÂˆËËÈH[\[Y[][ÛˆÝÛœÈH™Y\Ø[›Üˆ[ž][™ÈX›Ý]
+\ÊˆXXÚ[™BˆËËÈ]HÜXÈ™YYÈ[™\ÈXXÚ[™H\È›ÝÛÝ8 %HÛÜšÜÜXÙH›ÛÝ]ˆËËÈÙ\È›Ý^\ÝH[Ù[\™Ù]\È›ÙHØ[››Ý^XÝ]H8 %™XØ]\ÙHÜÙBˆËËÈ\™H^XÝHH˜XÝÈHÚ\™HØ[››ÝØ\œžK‚ˆ›ˆXÙJ	œÙ[‹ÜXÎˆ	›]WÛ[ÛšÙ^WÛXŽŽœ[—Ü›ÝØÛÛŽ”[”ÜXÊHOˆ™\Ý[XÙY›Ø‹Ýš[™ÏŽÂˆËËÈÝ\œ™[Ý]HÙˆH™]š[Ý\ÛHXÙY[‹žHH›ÙK\ÚYH›ØˆY‚ˆËËÂˆËËÈÙ^YYÛˆH›Øˆ˜]\ˆ[ˆH[ˆ™XØ]\ÙHH›Øˆ›ÝÈ\ÈÚ]Ø\œšY\ÂˆËËÈH
+››ÙIÜÊˆ™\™XÝ8 %]ÈÛ™X\ÛÛ‹]ÈÜ]Ûˆ˜Z[\™K]ÈYÙ]ˆËËÈØ[˜Ù[][Ûˆ8 %[™]™\™XÝ\ÈÚ]HXÙ\ˆ™YYÈÈ™XY‚ˆ›ˆXÙYÜÝ]J	œÙ[‹›Ø—ÚYˆ	œÝŠHOˆ™\Ý[Ü[ÛXÙY›Ø”Ý]O‹Ýš[™ÏŽÂŸB‚‹ËËÈÚ]H›ÙHZ[Y›ÜˆÛ™HXØÙ\YXÙ[Y[‚ˆÖÙ\š]™JXYËÛÛ™K\X[\K\JWBœXˆÝXÝXÙY›ØˆÂˆXˆ›ÙWÜ[—ÚYˆÝš[™ËˆXˆ›Ø—ÚYˆÝš[™ËˆXˆÝ]NˆÝš[™ËŸB‚‹ËËÈHXÙY[‰ÜÈÝ\œ™[Ý]H\ÈH›ÙHÙY\È]‚ˆÖÙ\š]™JXYËÛÛ™K\X[\K\JWBœXˆÝXÝXÙY›Ø”Ý]HÂˆXˆÝ]NˆÝš[™ËˆXˆ\›Z[˜[ˆ›ÛÛˆXˆ\]YØ]Û\ÎˆMˆXˆ\ÝÙ\œ›ÜŽˆÜ[ÛÝš[™Ï‹ŸB‚‹ËËÈ]™\žH[Ù[™\ÚY[Ûˆ\È›ÙNˆHX[˜YÙYX‰ÜÈ[™[ÜžH\ÈÚ]]™\‚‹ËËÈHØØ[Û[XHY[[Ûˆ\È[Y
+›ØYX\ÌMÈÌJK‚‹ËËÂ‹ËËÈÈHÞ[˜Ú›Û›Ý\ËZ[™\ˆ›Ø›[K[™ÚH]\È›ÝÛÛ™YžHÚ]š[™È\‹ËËÂ‹ËËÈ\Ý[™ÈÛ[XHYÜÈ\ÈÛ™H\Þ[˜ÈÛÜ˜XÚÈÑU[™Ø™[[ÝP\NŽš[™XH\Â‹ËËÈÞ[˜Ú›Û›Ý\È8 %]\ÈØ[Yœ›ÛH[™WÚÚXÚ\È›ÝˆHš\œÝÝ]Ù‚‹ËËÈ\ÈÚ[\HÛZ]YÛ[XK[™HÛÜÝØ\È™X[˜]\ˆ[ˆÛÜÛY]XÎ‚‹ËËÈÙ[XÝÛ›ÙX	ÜÈÝ›Û™Ù\Ý˜[šÚ[™ÈÙ^H\ÈH[Ù[\È[™XYH™\ÚY[‹[™‹ËËÈH›ÙIÜÈÛ[XH[Ù[È\™H^XÝHHØØ[[Ù[ÈHXÙ[Y[ÛÝ[Ø[Â‹ËËÈ]›ÚY™K\[[™ËˆHÚÛHÛ\ÜÈÙˆXÙ[Y[ÈÚ[[H˜[šÙY\ÈYˆ]™\žB‹ËËÈ›ÙHÙ\™HÛÛ‚‹ËËÂ‹ËËÈ›ØÚ×Ú[—ÜXÙX[Ý™\È\È›ØÚÚ[™ÈÙXÝ[ÛˆÙ™ˆH\Þ[˜ÈÛÜšÙ\ˆÛÈB‹ËËÈ[[YHØ[ˆÙY\Ù\š[™ËÚXÚ\È™XÚ\Ù[HÚ]]^\ÝÈ›Ü‹ˆ]\Â‹ËËÈ
+Š›Û›JŠˆ™XXÚYÛˆH][K]™XYY[[YH8 %›ØÚ×Ú[—ÜXÙX[šXÜÈÛˆB‹ËËÈÝ\œ™[]™XYÛ™K[™[š]\ÝÈØ[[™XÚ]›È[[YH][8 %ÛÂ‹ËËÈH›]›Ý\ˆ\ÈÚXÚÙYš\œÝ[™HXœÙ[˜ÙHÙˆH[[YHYÜ˜Y\ÈÈšX‚‹ËËÈ[Ù[ÈÛ›Hˆ˜]\ˆ[ˆÈH[šXÈ[ˆH›Ý]H[™\‹‚‹ËËÂ‹ËËÈHY[[ÛˆÚÜÙHÛ[XH\È›Ý[›š[™È\È›Ý[ˆ\œ›ÜˆZ]\Žˆ[ˆ[œ™XXÚX›B‹ËËÈÛ[XHÛÛšX]\È›Ý[™È[™H›ÙHÝ[\ØÜšX™\È]Ù[‹‚™›ˆ™\ÚY[Û[Ù[Êˆ\Ù]Nˆ	œÝŽœ]Ž”]ŠHOˆ™XÏ]WÛ[ÛšÙ^WÛXŽŽ››ÙWÜXÙ[Y[Ž“›ÙS[Ù[ˆÂˆ]]][Ù[ÈH]WÛ[ÛšÙ^WÛXŽŽ›L×Ü[[YWÚXŽŽš[œÝ[YÛ[Ù[Ú[™[ÜžJ\Ù]JNÂˆ]Û›ÝÛŽˆÝŽ˜ÛÛXÝ[ÛœÎŽ•™YTÙ]Ýš[™ÏˆBˆ[Ù[Ëš]\Š
+K›X\
+[Ù[[Ù[›[Ù[ÚY˜ÛÛ™J
+JK˜ÛÛXÝ
+
+NÂˆ]ÚÊ[™JHHÚÚ[ÎŽœ[[YNŽ’[™NŽžWØÝ\œ™[
+
+H[ÙHÂˆ™]\›ˆ[Ù[ÎÂˆNÂˆYˆ[™Kœ[[YWÙ›]›ÜŠ
+HOHÚÚ[ÎŽœ[[YNŽ”[[YQ›]›ÜŽŽ“][U™XYÂˆ™]\›ˆ[Ù[ÎÂˆBˆ]YÜÈHÚÚ[ÎŽ\ÚÎŽ˜›ØÚ×Ú[—ÜXÙJÂˆ[™K˜›ØÚ×ÛÛŠ\Þ[˜ÈÂˆ]ÛY[H]WÛ[ÛšÙ^WÛXŽŽ™YÜ™\ÜÎŽš\™[™Y
+
+Bˆ˜Z[
+
+Bˆ›X\Ù\œŠ\œ›ÜŸ\œ›Ü‹×ÜÝš[™Ê
+JOÎÂˆ]WÛ[ÛšÙ^WÛXŽŽ›Û[XNŽ›\ÝÝY×Û˜[Y\Ê	˜ÛY[
+K˜]ØZ]ˆJBˆJNÂˆ]ÚÊYÜÊHHYÜÈ[ÙHÂˆ™]\›ˆ[Ù[ÎÂˆNÂˆ›ÜˆYÈ[ˆYÜÈÂˆYˆÛ›ÝÛ‹˜ÛÛZ[œÊ	YÊHÂˆÛÛ[YNÂˆBˆ[Ù[Ëœ\Ú
+]WÛ[ÛšÙ^WÛXŽŽ››ÙWÜXÙ[Y[Ž“›ÙS[Ù[Âˆ[Ù[ÚYˆYË˜ÛÛ™J
+Kˆ\Ü^WÛ˜[YNˆYËˆ[[YNˆ›Û[XH‹×ÜÝš[™Ê
+KˆËÈÛ[XIÜÈYÈ\Ý[™ÈØ\œšY\ÈHÚ^™K]\È›Ý]H[X™\˜][BˆËÈÙ\È›Ý\ÚÈ›Üˆ]ˆØ\KÝYÜØ™\ÜÈH›ØˆÚ^™HÛˆ\ÚËˆËÈÚXÚ\È›ÝHY[[ÜžH›ÛÝš[HX‰ÜÈ[X™\œÈYX[‹[™Û™BˆËÈšY[Û[™ÈÛÈY™™\™[YX\Ý\™[Y[È\ÈÛÜœÙH[ˆH™\›È]ˆËÈ\ÈØš[Ý\ÛH›ÝHYX\Ý\™[Y[‚ˆÙZYÚ×Øž]\Îˆˆ\Ý[X]YÜ˜[WØž]\Îˆˆ\Ý[X]YÝœ˜[WØž]\ÎˆˆJNÂˆBˆ[Ù[ËœÛÜØžJYšYÚY›[Ù[ÚY˜Û\
+	œšYÚ›[Ù[ÚY
+JNÂˆ[Ù[ÂŸB‚‹ËËÈY]HÙ^\ÈÛ[™ÈHÛÈÜ\˜]ÜˆÝ][Y[ÈH›ÙHXZÙ\ÈX›Ý]]Ù[‚‹ËËÈ
+›ØYX\ÌMÈÌJKˆ[ˆHY[[Û‰ÜÈÝÛˆY]HX›H˜]\ˆ[ˆ[‚‹ËËÈ™[[ÝRÜÝÛÛ™šYØ™XØ]\ÙH^H\™H˜XÝÈX›Ý]H
+›XXÚ[™J‹›ÝX›Ý]]Â‹ËËÈÈ\Ý[™\‹[™[ˆÜ\˜]ÜˆÚÈ\È›ÝÛÛ™šYÝ\™YH™[[ÝHÜÝØ[ˆÝ[‹ËËÈÙ][K‚œXˆÛÛœÝ“ÑWÔ‘TÒQSÖWÓQUNˆ	œÝˆH››ÙWÜ™\ÚY[˜ÞHŽÂœXˆÛÛœÝ“ÑWÓSQWÓQUNˆ	œÝˆH››ÙWÛ˜[YHŽÂ‚ˆÖÙ\š]™JXYËÛÛ™JWBœXˆÝXÝ\T™\]Y\ÝÂˆXˆY]ÙˆÝš[™ËˆXˆ]Ø[™Ü]Y\žNˆÝš[™ËˆXˆ›ÙNˆ™XÏN‹ˆXˆ]]ˆÜ[ÛÚYÛ™Y™\]Y\ÝXY\œÏ‹ŸB‚ˆÖÙ\š]™JXYËÛÛ™K\X[\K\JWBœXˆÝXÝ\T™\ÜÛœÙHÂˆXˆÝ]\ÎˆLM‹ˆXˆÛÛ[Ý\Nˆ	‰ÜÝ]XÈÝ‹ˆXˆ›ÙNˆ™XÏN‹ŸB‚‹ËËÈ[œÜ[YZ\ÜÚ[ÛœÈ[]Û˜ÙKˆHXÚÙ]]™\È\HÙXÛÛ™È[™\ÈÜ[‹ËËÈ[[YYX][KÛÈ\È\ÈHÙZ[[™ÈÛˆH\œÝ˜]\ˆ[ˆÛˆÛÛ™\œØ][ÛœË‚˜ÛÛœÝPVÔS‘S‘×ÕS×ÕPÒÑUÎˆ\Ú^™HHÂ‚ˆÖÙ\š]™JXYËÛÛ™JWBœÝXÝ[™[™Õ[ÕXÚÙ]Âˆ]šXÙWÚYˆÝš[™ËˆÙXÜ™]ÙÙ[™\˜][ÛŽˆMˆÚYÛ™YÜ™\]Y\ÝÜÚLMŽˆÝš[™ËˆÙ\ÜÚ[Û—ÚYˆÝš[™ËˆÙ\ÜÚ[Û—ÙÙ[™\˜][ÛŽˆÝš[™Ëˆ^\™\×Ø]Û\ÎˆMŸB‚‹ËËÈY[]Hœ›Þ™[ˆ[ÈHÛÛœÝ[YY[ÈXÚÙ]ˆHXÚÙ]]Ù[ˆ\È™[[Ý™Y‹ËËÈ™Y›Ü™HHLH\È™]\›™Y[™\È™]™\ˆ™]Z[™Y[ˆ\È˜[YK‚ˆÖÙ\š]™JXYËÛÛ™JWBœXŠÜ˜]JHÝXÝ[ÔÛØÚÙ]]]Üš^˜][ÛˆÂˆXˆ]šXÙWÚYˆÝš[™ËˆËËÈYÙ\ÝÙˆHÚYÛ™Y™\]Y\Ý]Z[Y\ÈYZ\ÜÚ[Û‹ˆ]™\žH\›ˆBˆËËÈÛØÚÙ]ÝX›Z]È\ÈÙ^YYÛˆ]ÛÈHÜÚÙ[ˆ\›‰ÜÈ\˜X›HY[]H˜XÙ\ÂˆËËÈ˜XÚÈÈH™\]Y\Ý]Ø\œšYYH˜[YÚYÛ˜]\™KÙ\]Y[˜ÙH[™›Û˜ÙK‚ˆXˆÚYÛ™YÜ™\]Y\ÝÜÚLMŽˆÝš[™ËˆXˆÙ\ÜÚ[Û—ÚYˆÝš[™ËˆXˆÙ\ÜÚ[Û—ÙÙ[™\˜][ÛŽˆÝš[™ËŸB‚š[\\T™\ÜÛœÙHÂˆ›ˆœÛÛˆÙ\šX[^™OŠÝ]\ÎˆLM‹˜[YNˆ	•
+HOˆÙ[ˆÂˆX]ÚÙ\™WÚœÛÛŽŽ×Ý™XÊ˜[YJHÂˆÚÊ›ÙJHOˆÙ[ˆÂˆÝ]\ËˆÛÛ[Ý\Nˆ˜\XØ][Û‹ÚœÛÛˆ‹ˆ›ÙKˆKˆ\œŠ\œ›ÜŠHOˆÙ[ŽŽ™\œ›ÜŠL	™›Ü›X]J”Ù\šX[^˜][Ûˆ˜Z[\™NˆÙ\œ›ÜŸHŠJKˆBˆB‚ˆXŠÝ\\ŠH›ˆ\œ›ÜŠÝ]\ÎˆLM‹Y\ÜØYÙNˆ	œÝŠHOˆÙ[ˆÂˆÙ[ŽŽšœÛÛŠˆÝ]\Ëˆ	œÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆœÝ]\ÈŽˆ™\œ›Üˆ‹ˆ›Y\ÜØYÙHŽˆ›Ý[™YÝ^
+Y\ÜØYÙKÌMŠKˆJKˆ
+BˆBŸB‚œXˆÝXÝ™[[ÝP\HÂˆ]ÎˆY[[Û”]ËˆÜÝˆ™[[ÝRÜÝÛÛ™šYËˆÝÜ™Nˆ\˜Ï]]^™[[ÝTÝÜ™O‹ˆÙXÜ™]Îˆ\˜Ï[ˆ™[[ÝTÙXÜ™]ÝÜ™O‹ˆËËÈÚ\™YÚ]H™\ÚY[Ù\™HÛÜÛÈ™]›ÚÙHÈÚ[\ÝÚ]ÚÈ\ØØ\BˆËËÈ]ÚØ[ˆ›Ü˜ÙK\ÝÜHØ[YH]™HÙ\ÜÚ[ÛœÈ\ÈTHÜ™X]\Ëˆ›Û™XˆËËÈÛ›H[ˆ\ÚÝÜXYÛ›ÜÝXÈ[š]\ÝË‚ˆ\ÚÝÜˆÜ[Û\˜Ï\ÚÝÜÛÛ›Û[[YO‹ˆËËÈÚ]^XÝ][ÛˆÙX[H›ÜˆÝŒKÜ™[[ÝKÛ[Øš[KÜÙ\ÜÚ[ÛœËÊ‹ÛY\ÜØYÙ\Ø‚ˆËËÈ›Û™X
+˜\™H[š]\ÝÊH[œÝÙ\œÈÜÙH›Ý]\ÈÚ]HÛX\ˆLK\Ý[BˆËËÈ\œ›Üˆ[œÝXYÙˆ™][™[™ÈÈ]Y]YH[ž][™Ë‚ˆ[Øš[WØÚ]ˆÜ[Û\˜Ï[ˆ[Øš[PÚ]]Y]YO‹ˆËËÈXÙ[Y[^XÝ][ÛˆÙX[H›ÜˆÝŒKÜ™[[ÝKÛ›ÙKÜ[œØ
+›ØYX\ÌMÈÌŠK‚ˆËËÈ›Û™X
+˜\™H[š]\ÝË[™[žHZ[Ú]Ý]HÛÛ™šYÝ\™YY[[ÛŠBˆËËÈ[œÝÙ\œÈHXÙ[Y[›Ý]HÚ][ˆ^XÚ]™Y\Ø[˜]\ˆ[‚ˆËËÈXØÙ\[™ÈHÜXÈ]Ø[››Ý[‹‚ˆXÙ[Y[ˆÜ[Û\˜Ï[ˆXÙ[Y[]Y]YO‹ˆËËÈ[ˆÙX[H›ÜˆÝŒKÜ™[[ÝKÜY\‹ÛY\ÜØYÙ\Øˆ›Û™X
+˜\™H[š]\ÝË[™ˆËËÈ[žHZ[Ú]Ý]HÛÛ™šYÝ\™YY[[ÛŠH™Y\Ù\ÈY\ˆ˜Y™šXÈÝ]šYÚˆËËÈ˜]\ˆ[ˆ™XÛÜ™[™È[™[Ü\È]ÛÝ[™]™\ˆXÝÛ‹‚ˆY\—Ü[œÎˆÜ[Û\˜Ï[ˆÜ˜]NŽ™Y[[ÛŽŽ˜Ú[›™[ÝÛÜšÙ\ŽŽ”[”]Y]YO‹ˆËËÈÛ™HØÚÈ\ˆ]šXÙHÛÛ[X[™[XÜ›ÜÜÈ]ÈÚÛH\›Z[˜[ÛÛ[Z]‚ˆËËÂˆËËÈHÛÛ[Z]\È™XÚYHÚ]\ˆ\È™\Ü\È]]Üš]]]™KX›\Ú]ÂˆËËÈ\Y˜XÝž]\Ë[ˆÜš]HH›ÝÈ]˜[Y\È[H‹[™ÜÙH™YH\™BˆËËÈÛ™HXÚ\Ú[ÛŽˆHÙXÛÛ™™\Ü]ÜÝH˜XÙH]\ÝX]™HHÚ[›™\‰ÜÂˆËËÈš[H
+˜[™
+ˆ›ÝÈ^XÝH\È^H\™KˆÚXÚÚ[™ÈH›ÝË™[X\Ú[™ËÜš][™ÂˆËËÈHš[H[™ZÚ[™ÈH›ÝÈYØZ[ˆX]™\ÈHÚ[™ÝÈÚ\™HHÜÙ\‰ÜÈž]\ÂˆËËÈ™\XÙHHÚ[›™\‰ÜÈ[™\ˆHÚ[›™\‰ÜÈYÙ\Ý‚ˆËËÂˆËËÈ[X™\˜][H›ÝHÝÜ™HØÚÎˆ[ˆ\Y˜XÝœÞ[˜È\ÈÛ™Ë[™]™\žBˆËËÈÝ\ˆ™\]Y\ÝÛÝ[]Y]YH™Z[™]ˆ[X™\˜][H[ˆY[[ÜžNˆ\ÈTH\ÂˆËËÈÛ™H›ØÙ\ÜËÛÛ™Y\ˆÛÛ›™XÝ[ÛˆÝ™\ˆÚ\™Y\˜ØËÛÈ]™\žH\ÚÈ]ˆËËÈØ[ˆÛÛ[Z]HÚ]™[ˆÛÛ[X[™Ú\™\È\ÈX\‚ˆ\›Z[˜[ØÛÛ[Z]Îˆ\˜Ï]]^\ÚX\Ýš[™Ë\˜Ï]]^
+
+O‹ˆËËÈÚ\™H™[[ÝH™\]Y\ÝÈ[™[ˆH[šYšYYÝXœÞ\Ý[H]™[Ý™X[BˆËËÈ
+›ØYX\ÌLŠK‚ˆËËÂˆËËÈH™[[ÝH›ÙH[™XYHÙY\È]ÈÝÛˆ™[[ÝWØ]Y]X›K]]ˆËËÈX›H]™\È[ˆ]ÈÝÛˆ]X˜\ÙHÚ]›È›Ú[ˆÈH[ˆÝ™X[H8 %ÚXÚ\ÂˆËËÈHØ\ÌLˆ˜[Y\Ëˆ\È™XÛÜ™ÈHØ[YH™\]Y\ÝÈÚ\™H]™\ž][™È[ÙBˆËËÈØ[ˆ™H™XY[Û™ÜÚYH[NÈ]Ù\È›Ý™\XÙH™[[ÝWØ]Y]ÚXÚˆËËÈÛÈH›ÝØÛÛ[]™[[šX[]Z[\ÈÝ™X[H[X™\˜][HÙ\È›Ý‚ˆ]Y]ˆ]WÛ[ÛšÙ^WÛXŽŽœÝXœÞ\Ý[WØ]Y]Ž”ÝXœÞ\Ý[P]Y]ˆËËÈÚÜ[]™YÛ™K]\ÙHÙX”ÛØÚÙ]YZ\ÜÚ[ÛœÈÙ^YYžHHYÙ\ÝÙˆBˆËËÈÜ\]YHXÚÙ]ˆ]šXÙHÙXÜ™]È™]™\ˆ[\ˆ\ÈX\ÜˆHT“‚ˆ[×ÝXÚÙ]Îˆ\˜Ï]]^\ÚX\Ýš[™Ë[™[™Õ[ÕXÚÙ]‹ˆËËÈÜYXÚ˜XÚÙ[™È›Üˆ[ÈÛØÚÙ]Ëˆ›Û™X8 %[Ø^\Ë[ˆ›ÙXÝ[Ûˆ8 %YX[œÂˆËËÈHÜ\˜]Ü‰ÜÈÝÛˆÛÛ™šYÝ\™YÝXÚË™\ÛÛ™Y\ˆÙ\ÜÚ[Û‹ˆH\ÝˆËËÈÝXœÝ]]\ÈHÛÈ[™ÜÈ]\™HÙ[Z[™[HÝ]ÚYH\È›ØÙ\ÜËBˆËËÈ˜[œØÜšX™\ˆ[™HÞ[\Ú^™\‹[™›Ý[™È[ÙK‚ˆ[×ÜÜYXÚˆÜ[Û\˜Ï[ˆÝ\\ŽŽ[ÎŽ•[ÔÜYXÚ‹ŸB‚š[\ÛÛ™H›Üˆ™[[ÝP\HÂˆ›ˆÛÛ™J	œÙ[ŠHOˆÙ[ˆÂˆÙ[ˆÂˆ]ÎˆÙ[‹œ]Ë˜ÛÛ™J
+KˆÜÝˆÙ[‹šÜÝ˜ÛÛ™J
+KˆÝÜ™Nˆ\˜ÎŽ˜ÛÛ™J	œÙ[‹œÝÜ™JKˆÙXÜ™]Îˆ\˜ÎŽ˜ÛÛ™J	œÙ[‹œÙXÜ™]ÊKˆ\ÚÝÜˆÙ[‹™\ÚÝÜ˜ÛÛ™J
+Kˆ[Øš[WØÚ]ˆÙ[‹›[Øš[WØÚ]˜ÛÛ™J
+KˆXÙ[Y[ˆÙ[‹œXÙ[Y[˜ÛÛ™J
+KˆY\—Ü[œÎˆÙ[‹œY\—Ü[œË˜ÛÛ™J
+KˆËÈÚ\™Y›ÝÛÜYYˆÛÈÛÛ™\È]XXÚYZ\ˆÝÛˆX\ÛÝ[ˆËÈ™HÛÈØÚÜÈÝ™\ˆÛ™HÛÛ[X[™ÚXÚ\È›ÈØÚÈ][‚ˆ\›Z[˜[ØÛÛ[Z]Îˆ\˜ÎŽ˜ÛÛ™J	œÙ[‹\›Z[˜[ØÛÛ[Z]ÊKˆ]Y]ˆÙ[‹˜]Y]˜ÛÛ™J
+Kˆ[×ÝXÚÙ]Îˆ\˜ÎŽ˜ÛÛ™J	œÙ[‹[×ÝXÚÙ]ÊKˆ[×ÜÜYXÚˆÙ[‹[×ÜÜYXÚ˜ÛÛ™J
+KˆBˆBŸB‚š[\™[[ÝP\HÂˆXˆ›ˆ›ÙXÝ[ÛŠˆ]ÎˆY[[Û”]ËˆÜÝˆ™[[ÝRÜÝÛÛ™šYËˆ\ÚÝÜˆ\˜Ï\ÚÝÜÛÛ›Û[[YO‹ˆ[Øš[WØÚ]ˆ\˜Ï[ˆ[Øš[PÚ]]Y]YO‹ˆXÙ[Y[ˆ\˜Ï[ˆXÙ[Y[]Y]YO‹ˆY\—Ü[œÎˆ\˜Ï[ˆÜ˜]NŽ™Y[[ÛŽŽ˜Ú[›™[ÝÛÜšÙ\ŽŽ”[”]Y]YO‹ˆ
+HOˆ™\Ý[Ù[‹Ýš[™ÏˆÂˆ]ÝÜ™HH™[[ÝTÝÜ™NŽ›Ü[Š	œ]Ëœ›ÛÝ
+OÎÂˆ]]Y]H]Y]Ù›ÜŠ	œ]ÊNÂˆÚÊÙ[ˆÂˆ]ËˆÜÝˆÝÜ™Nˆ\˜ÎŽ›™]Ê]]^Ž›™]ÊÝÜ™JJKˆÙXÜ™]Îˆ\˜ÎŽ›™]ÊÙ^\š[™Ô™[[ÝTÙXÜ™]ÊKˆ\ÚÝÜˆÛÛYJ\ÚÝÜ
+Kˆ[Øš[WØÚ]ˆÛÛYJ[Øš[WØÚ]
+KˆXÙ[Y[ˆÛÛYJXÙ[Y[
+KˆY\—Ü[œÎˆÛÛYJY\—Ü[œÊKˆ\›Z[˜[ØÛÛ[Z]Îˆ\˜ÎŽ›™]Ê]]^Ž›™]Ê\ÚX\Ž›™]Ê
+JJKˆ]Y]ˆ[×ÝXÚÙ]Îˆ\˜ÎŽ›™]Ê]]^Ž›™]Ê\ÚX\Ž›™]Ê
+JJKˆ[×ÜÜYXÚˆ›Û™KˆJBˆB‚ˆËËÈHÝÜ™H\ÈTH[œÝÙ\œÈœ›ÛK›Üˆ\ÝÈ]™YYÈ]Y]YHÛÜšÈÜ‚ˆËËÈ™XYH]]Üš]]]™H™XÛÜ™™\ÚYHH›ÝØÛÛ‚ˆÖØÙ™Ê\Ý
+WBˆXˆ›ˆÝÜ™WÙ›Ü—Ý\ÝÊ	œÙ[ŠHOˆ\˜Ï]]^™[[ÝTÝÜ™OˆÂˆ\˜ÎŽ˜ÛÛ™J	œÙ[‹œÝÜ™JBˆB‚ˆÖØÙ™Ê\Ý
+WBˆXˆ›ˆ[š™XÝY
+ˆ]ÎˆY[[Û”]ËˆÜÝˆ™[[ÝRÜÝÛÛ™šYËˆÝÜ™Nˆ™[[ÝTÝÜ™KˆÙXÜ™]Îˆ\˜Ï[ˆ™[[ÝTÙXÜ™]ÝÜ™O‹ˆ
+HOˆÙ[ˆÂˆ]]Y]H]Y]Ù›ÜŠ	œ]ÊNÂˆÙ[ˆÂˆ]ËˆÜÝˆÝÜ™Nˆ\˜ÎŽ›™]Ê]]^Ž›™]ÊÝÜ™JJKˆÙXÜ™]Ëˆ\ÚÝÜˆ›Û™Kˆ[Øš[WØÚ]ˆ›Û™KˆXÙ[Y[ˆ›Û™KˆY\—Ü[œÎˆ›Û™Kˆ\›Z[˜[ØÛÛ[Z]Îˆ\˜ÎŽ›™]Ê]]^Ž›™]Ê\ÚX\Ž›™]Ê
+JJKˆ]Y]ˆ[×ÝXÚÙ]Îˆ\˜ÎŽ›™]Ê]]^Ž›™]Ê\ÚX\Ž›™]Ê
+JJKˆ[×ÜÜYXÚˆ›Û™KˆBˆB‚ˆËËÈ\ÝZ[\ŽˆH[š™XÝYTH\ÈH˜ZÙHÚ]]Y]YKÛÈH[Øš[BˆËËÈÚ]ÛÛ˜XÝ\È^\˜Ú\ØX›HÚ]Ý]HÛÛ™šYÝ\™YY[[Û‹‚ˆÖØÙ™Ê\Ý
+WBˆXˆ›ˆÚ]Û[Øš[WØÚ]
+]]Ù[‹[Øš[WØÚ]ˆ\˜Ï[ˆ[Øš[PÚ]]Y]YOŠHOˆÙ[ˆÂˆÙ[‹›[Øš[WØÚ]HÛÛYJ[Øš[WØÚ]
+NÂˆÙ[‚ˆB‚ˆËËÈ\ÝZ[\ŽˆH[š™XÝYTH\ÈHØÜš\Y˜[œØÜšX™\ˆ[™ˆËËÈÞ[\Ú^™\‹ÛÈHÚÛHÜÚÙ[ˆÛÛ™\œØ][ÛˆØ[ˆ™Hš]™[ˆÝ™\ˆH™X[ˆËËÈÛØÚÙ]Ú]Ý]HÚ\Ü\ˆZ[ÜˆHÞ\Ý[H›ÚXÙK‚ˆÖØÙ™Ê\Ý
+WBˆXˆ›ˆÚ]Ý[×ÜÜYXÚ
+]]Ù[‹ÜYXÚˆ\˜Ï[ˆÝ\\ŽŽ[ÎŽ•[ÔÜYXÚŠHOˆÙ[ˆÂˆÙ[‹[×ÜÜYXÚHÛÛYJÜYXÚ
+NÂˆÙ[‚ˆB‚ˆXŠÜ˜]JH›ˆ[×ÜÜYXÚ
+	œÙ[ŠHOˆÜ[Û\˜Ï[ˆÝ\\ŽŽ[ÎŽ•[ÔÜYXÚˆÂˆÙ[‹[×ÜÜYXÚ˜ÛÛ™J
+BˆB‚ˆËËÈ\ÝZ[\ŽˆH[š™XÝYTH\ÈH˜ZÙHXÙ[Y[]Y]YKÛÈHÌMÂˆËËÈXÙ[Y[ÛÛ˜XÝ\È^\˜Ú\ØX›HÚ]Ý]HÛÛ™šYÝ\™YY[[Û‹‚ˆÖØÙ™Ê\Ý
+WBˆXˆ›ˆÚ]ÜXÙ[Y[
+]]Ù[‹XÙ[Y[ˆ\˜Ï[ˆXÙ[Y[]Y]YOŠHOˆÙ[ˆÂˆÙ[‹œXÙ[Y[HÛÛYJXÙ[Y[
+NÂˆÙ[‚ˆB‚ˆËËÈ\ÝZ[\ŽˆH[š™XÝYTH\ÈH˜ZÙH[ˆ]Y]YKÛÈHY\‚ˆËËÈÛÛ˜XÝ\È^\˜Ú\ØX›HÚ]Ý]HÛÛ™šYÝ\™YY[[Û‹‚ˆÖØÙ™Ê\Ý
+WBˆXˆ›ˆÚ]ÜY\—Ü[œÊˆ]]Ù[‹ˆY\—Ü[œÎˆ\˜Ï[ˆÜ˜]NŽ™Y[[ÛŽŽ˜Ú[›™[ÝÛÜšÙ\ŽŽ”[”]Y]YO‹ˆ
+HOˆÙ[ˆÂˆÙ[‹œY\—Ü[œÈHÛÛYJY\—Ü[œÊNÂˆÙ[‚ˆB‚ˆËËÈ[œÝÙ\ˆÛ™H™[[ÝH™\]Y\Ý[™™XÛÜ™]‚ˆËËÂˆËËÈ]™\žH]›ÝYÚHTH™]\›œÈ[ˆ\T™\ÜÛœÙXÛÈ\ÈÜ˜\\ˆ\ÈBˆËËÈ™X[ÚÚÙHÚ[8 %[›ZÙHPÔ	ÜÈ\Ü]ÚÛÜ›ÈY]Ë[Y]ÙˆËËÈ›ÛÚÚÙY\[™È\È™YYY™XØ]\ÙHH™\]Y\Ý[™]È™\ÜÛœÙH\™H[ˆØÛÜBˆËËÈÙÙ]\‹ˆ[™WÜ™\]Y\Ý™[ÝÈ\ÈHÜšYÚ[˜[›ÙK[˜Ú[™ÙY‚ˆXˆ›ˆ[™J	œÙ[‹™\]Y\Ýˆ\T™\]Y\Ý›Ý×Û\ÎˆM
+HOˆ\T™\ÜÛœÙHÂˆËÈØ\\™Y™Y›Ü™HH›ÙH\ÈÛÛœÝ[YYˆH]Y\žHÝš[™È\È›ÜYˆ]ˆËÈØ[ˆØ\œžH[ˆ[™Ù\ÜÚ[ÛˆYË[™]Z[ÚœÛÛ˜\ÈÛÝ™\™YžHBˆËÈ\ÚÚZ[ˆ[™\™Y›Ü™H\›X[™[‚ˆ]XÝ[ÛˆH›Ü›X]JˆžßHßH‹ˆ™\]Y\Ý›Y]Ùˆ™\]Y\Ýˆœ]Ø[™Ü]Y\žBˆœÜ]
+	ÏÉÊBˆ›™^
+
+Bˆ[Ü˜\ÛÜŠ	œ™\]Y\Ýœ]Ø[™Ü]Y\žJBˆ
+NÂˆ]]šXÙWÚYH™\]Y\Ýˆ˜]]ˆ˜\×Ü™YŠ
+Bˆ›X\
+XY\œßXY\œË™]šXÙWÚY˜ÛÛ™J
+JNÂˆ]™\ÜÛœÙHHÙ[‹š[™WÜ™\]Y\Ý
+™\]Y\Ý›Ý×Û\ÊNÂˆÙ[‹˜]Y]ˆœ™XÛÜ™
+]WÛ[ÛšÙ^WÛXŽŽœÝXœÞ\Ý[WØ]Y]Ž”ÝXœÞ\Ý[PXÝ[ÛˆÂˆÝXœÞ\Ý[Nˆ]WÛ[ÛšÙ^WÛXŽŽœ[—ÛYÙ\ŽŽ”ÝXœÞ\Ý[NŽ”™[[ÝKˆXÝ[Û‹ˆËÈH™[[ÝH™\]Y\Ý\È›ÝH[ˆ8 %[—ÜØÛÜNŽ•[˜]šX]Y	ÜÂˆËÈ[˜›Ý[™™\]Y\Ý\È^XÝH\ÈØ\ÙH8 %ÛÈH[XšY[ØÛÜH\ÂˆËÈHÛ›HÛ™\ÝÛÝ\˜ÙK‚ˆ\›—ÚYˆ›Û™KˆËÈ™[[ÝH™\]Y\ÝÈ\™HÚYÛ™Y›Ý\›Z\ÜÚ[Û‹YØ]Yˆ]][XÚ]BˆËÈ\È›Ý™[ˆžH™\šYžWÜ™\]Y\Ý›ÝžHH™\]Y\ÝÜ\›Z\ÜÚ[Û˜ˆËÈXÚ\Ú[Û‹ÛÈ\™H\È›Û™HÈÚ[]‚ˆ\›Z\ÜÚ[Û—Ü™\]Y\ÝÚYˆ›Û™KˆÝ]ÛÛYNˆ]WÛ[ÛšÙ^WÛXŽŽœÝXœÞ\Ý[WØ]Y]Ž›Ý]ÛÛYWÙ›Ü—ÜÝ]\Ê™\ÜÛœÙKœÝ]\ÊKˆËÈH]šXÙH\ÈÚXÚZ\™YÛY[XÝYÚXÚ\ÈH]Y\Ý[Û‚ˆËÈH™XY\ˆÙˆ\È›ÝÈXÝX[H\Ëˆ™]™\ˆH›ÙHÜˆBˆËÈÚYÛ˜]\™K‚ˆ]Z[ˆ]šXÙWÚY›X\
+YÙ\™WÚœÛÛŽŽšœÛÛˆJÈ™]šXÙRYŽˆYJJKˆJNÂˆ™\ÜÛœÙBˆB‚ˆËËÈØÙ[ŽŽš[™XK\ÈHÛ™H›Ý]H]\È[ÝÙYÈØZ]‚ˆËËÂˆËËÈHÛ™H]ÛY›ÜˆÛÜšÈ]™\žH™]ÈÙXÛÛ™ÈÛÝ[Z]\ˆ\›ˆ]ÂˆËËÈ˜]\žHÜˆ[œÝÙ\ˆÛÛ[X[™È]KˆÛ™Ë\Û[™ÈHX\ÙH›Ý]Hš^\È›ÝˆËËÈÚ]Ý]HÙXÛÛ™Ù[™\˜[\\œÜÙHÛØÚÙ]ˆH™\]Y\Ý\È[ˆÜ™[˜\žBˆËËÈÚYÛ™YÛ™K]™]\›œÈH[ÛY[HÛÛ[X[™^\ÝË[™]Ú]™\È\]ˆËËÈØZ]Û\Ø
+Ø\Y]HX\ÙH[™Ý
+HÛÈ›ÈÛÛ›™XÝ[Ûˆ\È[Ü[‚ˆËËÈ[™Yš[š][Kˆ]™\žHÝ\ˆ›Ý]H\ÈH[˜Ú[™ÙYÞ[˜Ú›Û›Ý\È]‚ˆXˆ\Þ[˜È›ˆ[™WÝØZ][™Ê	œÙ[‹™\]Y\Ýˆ\T™\]Y\Ý›Ý×Û\ÎˆM
+HOˆ\T™\ÜÛœÙHÂˆ]
+\™Ù]XY[™WÛ\ÊHHX]ÚÛ™×ÜÛÝ\™Ù]
+	œ™\]Y\Ý
+HÂˆÛÛYJ˜[YJHOˆ˜[YKˆ›Û™HOˆ™]\›ˆÙ[‹š[™J™\]Y\Ý›Ý×Û\ÊKˆNÂˆËÈHØZ]\[œÈ‘Q“Ô‘H\Ü]Ú[™HÚYÛ™Y™\]Y\Ý\È[œÝÙ\™YˆËÈ^XÝHÛ˜ÙH]H[™ˆ™K\[›š[™È]\ˆXÚÈÛÝ[]H™\^BˆËÈÝX\™ÛˆHÙXÛÛ™\ÜÈ[™[™˜XÚÈHš\œÝXÚÉÜÈØXÚY››ÂˆËÈÛÜšÈˆ[œÝÙ\ˆ›ÜˆH™\ÝÙˆHØZ]‚ˆ]ÛÛYJ]šXÙWÚY
+HH™\]Y\Ýˆ˜]]ˆ˜\×Ü™YŠ
+Bˆ›X\
+XY\œßXY\œË™]šXÙWÚY˜ÛÛ™J
+JBˆ[ÙHÂˆ™]\›ˆÙ[‹š[™J™\]Y\Ý›Ý×Û\ÊNÂˆNÂˆ]Ý\YHÝŽ[YNŽ’[œÝ[Ž››ÝÊ
+NÂˆ]]][\ÙYHMÂˆÚ[H[\ÙYXY[™WÛ\ÈÂˆËÈ[ˆ[™\šYšYY]šXÙHY\È[›ÝYÚÈXÚYH
+Ú]\ˆÈØZ]
+Žˆ]ˆËÈÜ˜[È›Ý[™Ë[™H[œÝÙ\ˆ™[ÝÈÝ[ÛÙ\È›ÝYÚH[ˆËÈÚYÛ˜]\™K™]›ØØ][Ûˆ[™™\^HÚXÚÜË‚ˆ]™XYHHX]Ú	\™Ù]ÂˆÛ™ÔÛ\™Ù]Ž“X\ÙHOˆÂˆÙ[‹š\×Ü[™[™×Ù]šXÙWØÛÛ[X[™
+	™]šXÙWÚY›Ý×Û\ËœØ]\˜][™×ØY
+[\ÙY
+JBˆBˆÛ™ÔÛ\™Ù]ŽÛÛ›Û
+ÛÛ[X[™ÚY
+HOˆÂˆÙ[‹˜ÛÛ[X[™ØÛÛ›ÛØÚ[™ÙY
+	™]šXÙWÚYÛÛ[X[™ÚY
+BˆBˆNÂˆYˆ™XYHÂˆœ™XZÎÂˆBˆÚÚ[ÎŽ[YNŽœÛY\
+ÝŽ[YNŽ‘\˜][ÛŽŽ™œ›ÛWÛZ[\ÊˆÓ‘×ÔÓÕPÒ×ÓTË›Z[ŠXY[™WÛ\ÈH[\ÙY
+Kˆ
+JBˆ˜]ØZ]Âˆ[\ÙYHMŽžWÙœ›ÛJÝ\Y™[\ÙY
+
+K˜\×ÛZ[\Ê
+JK[Ü˜\ÛÜŠMŽ“PV
+NÂˆBˆÙ[‹š[™J™\]Y\Ý›Ý×Û\ËœØ]\˜][™×ØY
+[\ÙY
+JBˆB‚ˆ›ˆ\×Ü[™[™×Ù]šXÙWØÛÛ[X[™
+	œÙ[‹]šXÙWÚYˆ	œÝ‹›Ý×Û\ÎˆM
+HOˆ›ÛÛÂˆÙ[‹œÝÜ™Bˆ›ØÚÊ
+Bˆ›ÚÊ
+Bˆ˜[™Ý[ŠÝÜ™_ÝÜ™Kœ[™[™×Ù]šXÙWØÛÛ[X[™ØÛÝ[
+]šXÙWÚY›Ý×Û\ÊK›ÚÊ
+JBˆš\×ÜÛÛYWØ[™
+ÛÝ[ÛÝ[ˆ
+BˆB‚ˆËËÈÚ]\ˆHÛÛ›ÛØ]Ú\ˆ\È[ž][™ÈÈX\ˆY]ˆHØ[˜Ù[][Û‚ˆËËÈ\ÚÙY›Ü‹ÜˆHÛÛ[X[™]š[™ÈY[›š[™Ø[™\ˆ]‚ˆ›ˆÛÛ[X[™ØÛÛ›ÛØÚ[™ÙY
+	œÙ[‹]šXÙWÚYˆ	œÝ‹ÛÛ[X[™ÚYˆ	œÝŠHOˆ›ÛÛÂˆÙ[‹œÝÜ™Bˆ›ØÚÊ
+Bˆ›ÚÊ
+Bˆ˜[™Ý[ŠÝÜ™_ÝÜ™K™]šXÙWØÛÛ[X[™
+ÛÛ[X[™ÚY
+K›ÚÊ
+K™›][Š
+JBˆ™š[\Š™XÛÜ™™XÛÜ™™]šXÙWÚYOH]šXÙWÚY
+Bˆš\×Û›Û™WÛÜŠ™XÛÜ™™XÛÜ™˜Ø[˜Ù[Ü™\]Y\ÝY™XÛÜ™œÝ]K\›Z[˜[
+
+JBˆB‚ˆ›ˆ[™WÜ™\]Y\Ý
+	œÙ[‹™\]Y\Ýˆ\T™\]Y\Ý›Ý×Û\ÎˆM
+HOˆ\T™\ÜÛœÙHÂˆYˆ™\]Y\Ý˜›ÙK›[Š
+HˆPVÔ‘SSÕWÐ“ÑWÐ–UTÈÂˆ™]\›ˆ\T™\ÜÛœÙNŽ™\œ›ÜŠLË”™[[ÝH™\]Y\Ý›ÙH^ÙYYÈHZPˆŠNÂˆBˆYˆ™\]Y\Ý›Y]ÙOH”ÔÕˆ	‰ˆ™\]Y\Ýœ]Ø[™Ü]Y\žHOH‹ÝŒKÜ™[[ÝKÜZ\š[™ÜËØXØÙ\ˆÂˆ™]\›ˆÙ[‹˜XØÙ\ÜZ\š[™Ê	œ™\]Y\Ý˜›ÙK›Ý×Û\ÊNÂˆBˆ]ÛÛYJXY\œÊHH™\]Y\Ý˜]]˜\×Ü™YŠ
+H[ÙHÂˆ™]\›ˆ\T™\ÜÛœÙNŽ™\œ›ÜŠK”ÚYÛ™Y™[[ÝH]][XØ][Ûˆ\È™\]Z\™YŠNÂˆNÂˆYˆ]\œŠ\œ›ÜŠHHXY\œË˜[Y]WÜÚ\J›Ý×Û\ÊHÂˆ™]\›ˆ\T™\ÜÛœÙNŽ™\œ›ÜŠK	™\œ›ÜŠNÂˆBˆ]]šXÙHHX]ÚÙ[‚ˆœÝÜ™Bˆ›ØÚÊ
+Bˆ›X\Ù\œŠß”™[[ÝHÝ]HØÚÈØ\ÈÚ\ÛÛ™Y‹×ÜÝš[™Ê
+JBˆ˜[™Ý[ŠÝÜ™_ÂˆÝÜ™Bˆ™]šXÙJ	šXY\œË™]šXÙWÚY
+OÂˆ›Ú×ÛÜ—Ù[ÙJ•[šÛ›ÝÛˆ™[[ÝH]šXÙH‹×ÜÝš[™Ê
+JBˆJHÂˆÚÊ˜[YJHYˆ˜[YK˜XÝ]™J
+HOˆ˜[YKˆÚÊÊHOˆ™]\›ˆ\T™\ÜÛœÙNŽ™\œ›ÜŠK”™[[ÝH]šXÙH\È™]›ÚÙYŠKˆ\œŠ\œ›ÜŠHOˆ™]\›ˆ\T™\ÜÛœÙNŽ™\œ›ÜŠK	™\œ›ÜŠKˆNÂˆYˆ]šXÙKœÙXÜ™]ÙÙ[™\˜][ÛˆOHXY\œËœÙXÜ™]ÙÙ[™\˜][ÛˆÂˆ™]\›ˆ\T™\ÜÛœÙNŽ™\œ›ÜŠK”™[[ÝHÙ^HÙ[™\˜][Ûˆ\ÈÝ[HŠNÂˆBˆ]ÙXÜ™]HX]ÚÙ[‹œÙXÜ™]Ë™Ù]
+	™]šXÙKœÙXÜ™]ÜÛÝ
+
+JHÂˆÚÊ˜[YJHOˆ˜[YKˆ\œŠ\œ›ÜŠHOˆ™]\›ˆ\T™\ÜÛœÙNŽ™\œ›ÜŠLË	™\œ›ÜŠKˆNÂˆYˆ\Ý\\ŽŽœ›ÝØÛÛŽ™\šYžWÜ™\]Y\Ý
+ˆ	œÙXÜ™]ˆXY\œËˆ	œ™\]Y\Ý›Y]Ùˆ	œ™\]Y\Ýœ]Ø[™Ü]Y\žKˆ	œ™\]Y\Ý˜›ÙKˆ
+HÂˆÙ[‹˜]Y]Ù[šYY
+ˆ›Ý×Û\ËˆÛÛYJ	šXY\œË™]šXÙWÚY
+KˆœÚYÛ˜]\™H‹ˆ›Û™Kˆš[˜[YÜÚYÛ˜]\™H‹ˆ
+NÂˆ™]\›ˆ\T™\ÜÛœÙNŽ™\œ›ÜŠK”™[[ÝH™\]Y\ÝÚYÛ˜]\™H\È[˜[YŠNÂˆBˆ]™\]Y\ÝÜÚLMˆHÚLM—Ú^
+	˜Ø[›ÛšXØ[Ü™\]Y\Ý
+ˆXY\œËˆ	œ™\]Y\Ý›Y]Ùˆ	œ™\]Y\Ýœ]Ø[™Ü]Y\žKˆ	œ™\]Y\Ý˜›ÙKˆ
+JNÂˆ]™\Ù\˜][ÛˆHX]ÚÙ[‚ˆœÝÜ™Bˆ›ØÚÊ
+Bˆ›X\Ù\œŠß”™[[ÝHÝ]HØÚÈØ\ÈÚ\ÛÛ™Y‹×ÜÝš[™Ê
+JBˆ˜[™Ý[Š]]ÝÜ™_ÂˆÝÜ™Kœ™\Ù\™WØÛÛ[X[™
+ˆ	šXY\œË™]šXÙWÚYˆXY\œËœÙXÜ™]ÙÙ[™\˜][Û‹ˆ	šXY\œË˜ÛÛ[X[™ÚYˆ	šXY\œË››Û˜ÙKˆXY\œËœÙ\]Y[˜ÙKˆ	œ™\]Y\ÝÜÚLM‹ˆ	œ™\]Y\Ý›Y]Ùˆ	œ™\]Y\Ýœ]Ø[™Ü]Y\žKˆ›Ý×Û\Ëˆ
+BˆJHÂˆÚÊ˜[YJHOˆ˜[YKˆ\œŠ\œ›ÜŠHOˆÂˆÙ[‹˜]Y]Ù[šYY
+ˆ›Ý×Û\ËˆÛÛYJ	šXY\œË™]šXÙWÚY
+Kˆœ™\^WÙÝX\™‹ˆ›Û™Kˆ	™\œ›Ü‹ˆ
+NÂˆ™]\›ˆ\T™\ÜÛœÙNŽ™\œ›ÜŠK	™\œ›ÜŠNÂˆBˆNÂˆYˆ]ÛÛ[X[™™\Ù\˜][ÛŽŽ”™\^HÂˆÝ]\ÎˆÛÛYJÝ]\ÊKˆ™\ÜÛœÙWØ›ÙNˆÛÛYJ›ÙJKˆ›ØÙ\ÜÚ[™Îˆ˜[ÙKˆHH	œ™\Ù\˜][Û‚ˆÂˆ™]\›ˆ\T™\ÜÛœÙHÂˆÝ]\Îˆ
+œÝ]\ËˆÛÛ[Ý\Nˆ˜\XØ][Û‹ÚœÛÛˆ‹ˆ›ÙNˆ›ÙK˜ÛÛ™J
+KˆNÂˆBˆ]Ø\×Ü›ØÙ\ÜÚ[™ÈHX]Ú\ÈJˆ™\Ù\˜][Û‹ˆÛÛ[X[™™\Ù\˜][ÛŽŽ”™\^HÂˆ›ØÙ\ÜÚ[™ÎˆYKˆ‹‚ˆBˆ
+NÂˆ]™\ÜÛœÙHHÙ[‹™\Ü]ÚØ]]Üš^™Y
+	œ™\]Y\Ý	™]šXÙK	œ™\]Y\ÝÜÚLM‹›Ý×Û\ÊNÂˆYˆ]ÚÊ]]ÝÜ™JHHÙ[‹œÝÜ™K›ØÚÊ
+HÂˆ]ÈHÝÜ™K˜ÛÛ\]WØÛÛ[X[™
+ˆ	šXY\œË™]šXÙWÚYˆ	šXY\œË˜ÛÛ[X[™ÚYˆ™\ÜÛœÙKœÝ]\Ëˆ	œ™\ÜÛœÙK˜›ÙKˆØ\×Ü›ØÙ\ÜÚ[™Ëˆ›Ý×Û\Ëˆ
+NÂˆBˆ™\ÜÛœÙBˆB‚ˆ›ˆXØÙ\ÜZ\š[™Ê	œÙ[‹›ÙNˆ	–ÝNK›Ý×Û\ÎˆM
+HOˆ\T™\ÜÛœÙHÂˆ]™\]Y\ÝˆZ\XØÙ\™\]Y\ÝHX]ÚÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJHÂˆÚÊ˜[YJHOˆ˜[YKˆ\œŠ\œ›ÜŠHOˆÂˆ™]\›ˆ\T™\ÜÛœÙNŽ™\œ›ÜŠ	™›Ü›X]J’[˜[YZ\š[™È™\]Y\ÝˆÙ\œ›ÜŸHŠJNÂˆBˆNÂˆYˆ™\]Y\Ýœ›ÝØÛÛÝ™\œÚ[ÛˆOH‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓˆÂˆ™]\›ˆ\T™\ÜÛœÙNŽ™\œ›ÜŠ•[œÝ\ÜY™[[ÝH›ÝØÛÛ™\œÚ[ÛˆŠNÂˆBˆ]™\Ý[HÙ[‚ˆœÝÜ™Bˆ›ØÚÊ
+Bˆ›X\Ù\œŠß”™[[ÝHÝ]HØÚÈØ\ÈÚ\ÛÛ™Y‹×ÜÝš[™Ê
+JBˆ˜[™Ý[Š]]ÝÜ™_Âˆ]XØÙ\YHÝÜ™K˜XØÙ\Ú[š]][ÛŠˆ	œ™\]Y\ÝœZ\š[™×ÚYˆ	œ™\]Y\ÝœZ\š[™×ÝÚÙ[‹ˆ	œ™\]Y\Ý™]šXÙWÛ˜[YKˆ	œÙ[‹šÜÝœ[›™\—ÚYˆ›Ý×Û\ËˆÙ[‹œÙXÜ™]Ë˜\×Ü™YŠ
+Kˆ
+OÎÂˆÝÜ™K˜]Y]
+ˆ›Ý×Û\ËˆÛÛYJ	˜XØÙ\Y™]šXÙWÚY
+KˆœZ\—ØXØÙ\‹ˆÛÛYJ	œ™\]Y\ÝœZ\š[™×ÚY
+Kˆ˜[ÝÙY‹ˆÛÛYJ	œÚLM—Ú^
+›ÙJJKˆ
+OÎÂˆÚÊXØÙ\Y
+BˆJNÂˆX]Ú™\Ý[ÂˆÚÊ˜[YJHOˆ\T™\ÜÛœÙNŽšœÛÛŠŒK	˜[YJKˆ\œŠ\œ›ÜŠHOˆÂˆÙ[‹˜]Y]Ù[šYY
+›Ý×Û\Ë›Û™KœZ\—ØXØÙ\‹›Û™K	™\œ›ÜŠNÂˆ\T™\ÜÛœÙNŽ™\œ›ÜŠË	™\œ›ÜŠBˆBˆBˆB‚ˆ›ˆ\Ü]ÚØ]]Üš^™Y
+ˆ	œÙ[‹ˆ™\]Y\Ýˆ	\T™\]Y\Ýˆ]šXÙNˆ	‘]šXÙT™XÛÜ™ˆ™\]Y\ÝÜÚLMŽˆ	œÝ‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ\T™\ÜÛœÙHÂˆ]ØÛÜ\ÈH	™]šXÙKœØÛÜ\ÎÂˆ]]šXÙWÚYH]šXÙK™]šXÙWÚY˜\×ÜÝŠ
+NÂˆ]
+]]Y\žJHH™\]Y\Ýˆœ]Ø[™Ü]Y\žBˆœÜ]ÛÛ˜ÙJ	ÏÉÊBˆ›X\ÛÜŠ
+™\]Y\Ýœ]Ø[™Ü]Y\žK˜\×ÜÝŠ
+KˆŠK˜[Y_˜[YJNÂˆ]ÙYÛY[ÈH]ˆœÜ]
+	ËÉÊBˆ™š[\ŠÙYÛY[\ÙYÛY[š\×Ù[\J
+JBˆ˜ÛÛXÝŽ™XÏÏŠ
+NÂˆ]™\Ý[HX]Ú
+™\]Y\Ý›Y]Ù˜\×ÜÝŠ
+KÙYÛY[Ë˜\×ÜÛXÙJ
+JHÂˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹œ[œÈ—JHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽ•šY]Ô[œÊK˜[™Ý[ŠßÙ[‹›\ÝÜ[œÊØÛÜ\ÊJBˆBˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹œ[œÈ‹[—ÚYJHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽ•šY]Ô[œÊBˆ˜[™Ý[ŠßÙ[‹œ[—Ù]Z[
+ØÛÜ\Ë[—ÚY
+JBˆBˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹œ[œÈ‹[—ÚY™]™[È—JHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽ•šY]Ñ]™[ÊBˆ˜[™Ý[ŠßÙ[‹œ[—Ù]™[ÊØÛÜ\Ë[—ÚY]Y\žJJBˆBˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹œ[œÈ‹[—ÚY˜\›Ý˜[È—JHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽ•šY]Ô[œÊBˆ˜[™Ý[ŠßÙ[‹œ[—Ø\›Ý˜[ÊØÛÜ\Ë[—ÚY
+JBˆBˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹œ[œÈ‹[—ÚY˜\Y˜XÝÈ‹\Y˜XÝÚYJHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽ”™XY\Y˜XÝÊBˆ˜[™Ý[ŠßÙ[‹˜\Y˜XÝ
+ØÛÜ\Ë[—ÚY\Y˜XÝÚY
+JBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹œ[œÈ‹[—ÚY˜\›Ý™H—JHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽ\›Ý™JBˆ˜[™Ý[ŠßÙ[‹˜\›Ý™JØÛÜ\Ë[—ÚY	œ™\]Y\Ý˜›ÙK]šXÙWÚY›Ý×Û\ÊJBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹œ[œÈ‹[—ÚY˜Ø[˜Ù[—JHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽØ[˜Ù[
+Bˆ˜[™Ý[ŠßÙ[‹˜Ø[˜Ù[
+ØÛÜ\Ë[—ÚY	œ™\]Y\Ý˜›ÙK›Ý×Û\ÊJBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹œ[œÈ‹[—ÚYœ]\ÙH—JHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽ”]\ÙJBˆ˜[™Ý[ŠßÙ[‹œÙ]Ü]\ÙY
+ØÛÜ\Ë[—ÚYYK›Ý×Û\ÊJBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹œ[œÈ‹[—ÚYœ™\Ý[YH—JHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽ”]\ÙJBˆ˜[™Ý[ŠßÙ[‹œÙ]Ü]\ÙY
+ØÛÜ\Ë[—ÚY˜[ÙK›Ý×Û\ÊJBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹šÚ[—JHOˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽ’Ú[
+Bˆ˜[™Ý[ŠßÙ[‹šÚ[
+]šXÙWÚY›Ý×Û\ÊJKˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹™\ÚÝÜXÛÛ›Û‹œÝ\—JHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽÛÛ›Û\ÚÝÜ
+Bˆ˜[™Ý[ŠßÙ[‹™\ÚÝÜØÛÛ›ÛÜÝ\
+	œ™\]Y\Ý˜›ÙK]šXÙWÚY
+JBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹™\ÚÝÜXÛÛ›Û‹˜XÝ[Ûˆ—JHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽÛÛ›Û\ÚÝÜ
+Bˆ˜[™Ý[ŠßÙ[‹™\ÚÝÜØÛÛ›ÛØXÝ[ÛŠ	œ™\]Y\Ý˜›ÙK]šXÙWÚY
+JBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹™\ÚÝÜXÛÛ›Û‹›\Ý]\™Ù]È—JHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽÛÛ›Û\ÚÝÜ
+Bˆ˜[™Ý[ŠßÙ[‹™\ÚÝÜØÛÛ›ÛÛ\ÝÝ\™Ù]Ê	œ™\]Y\Ý˜›ÙK]šXÙWÚY
+JBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹™\ÚÝÜXÛÛ›Û‹š[œÜXÝ—JHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽÛÛ›Û\ÚÝÜ
+Bˆ˜[™Ý[ŠßÙ[‹™\ÚÝÜØÛÛ›ÛÚ[œÜXÝ
+	œ™\]Y\Ý˜›ÙK]šXÙWÚY
+JBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹™\ÚÝÜXÛÛ›Û‹œØÜ™Y[œÚÝ—JHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽÛÛ›Û\ÚÝÜ
+Bˆ˜[™Ý[ŠßÙ[‹™\ÚÝÜØÛÛ›ÛÜØÜ™Y[œÚÝ
+	œ™\]Y\Ý˜›ÙK]šXÙWÚY
+JBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹™\ÚÝÜXÛÛ›Û‹˜Û\›Ø\™\™XY—JHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽÛÛ›Û\ÚÝÜ
+Bˆ˜[™Ý[ŠßÙ[‹™\ÚÝÜØÛÛ›ÛØÛ\›Ø\™Ü™XY
+	œ™\]Y\Ý˜›ÙK]šXÙWÚY
+JBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹™\ÚÝÜXÛÛ›Û‹œ]\ÙH—JHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽÛÛ›Û\ÚÝÜ
+Bˆ˜[™Ý[ŠßÙ[‹™\ÚÝÜØÛÛ›ÛÜ]\ÙJ	œ™\]Y\Ý˜›ÙK]šXÙWÚYYJJBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹™\ÚÝÜXÛÛ›Û‹œ™\Ý[YH—JHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽÛÛ›Û\ÚÝÜ
+Bˆ˜[™Ý[ŠßÙ[‹™\ÚÝÜØÛÛ›ÛÜ]\ÙJ	œ™\]Y\Ý˜›ÙK]šXÙWÚY˜[ÙJJBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹™\ÚÝÜXÛÛ›Û‹œÝÜ—JHOˆÂˆ™\]Z\™WØXÝ[ÛŠØÛÜ\Ë™[[ÝPXÝ[ÛŽŽÛÛ›Û\ÚÝÜ
+Bˆ˜[™Ý[ŠßÙ[‹™\ÚÝÜØÛÛ›ÛÜÝÜ
+	œ™\]Y\Ý˜›ÙK]šXÙWÚY
+JBˆBˆËÈKKH™\œÚ[Û™YÝŒKÜ™[[ÝKÛ[Øš[KÊ˜^[œÚ[Ûˆ
+š\œÝ\\BˆËÈ[Øš[HÛÛ\[š[ÛŠKˆÚ][™ÛÜšÙ›ÝÈ][˜Ú\ÙHHYXØ]YˆËÈØ\Xš[]HÜ˜[ÈHYØXÞHZ\š[™ÈÚ]Ý]Ø\Xš[]Y\ÂˆËÈ™\ÛÛ™\È›ÝYÚYØXÞWØØ\Xš[]Y\ØÚXÚ™]™\ˆ[˜ÛY\ÂˆËÈH[Øš[K[Û›HÜ˜[È8 %ÛÈ[ˆÛ[›™\ˆZ\š[™ÈØ[››Ý™BˆËÈ\ØØ[]Y[ÈHÚ]Ý\™˜XÙHžHHÛY[\ÚYH\]K‚ˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹›[Øš[H‹œÙ\ÜÚ[ÛœÈ—JHOˆÂˆ™\]Z\™WØØ\Xš[]J]šXÙK]šXÙPØ\Xš[]NŽ•šY]ÔÙ\ÜÚ[ÛœÊBˆ˜[™Ý[ŠßÙ[‹›[Øš[WÜÙ\ÜÚ[ÛœÊ
+JBˆBˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹›[Øš[H‹œÙ\ÜÚ[ÛœÈ‹Ù\ÜÚ[Û—ÚY›Y\ÜØYÙ\È—JHOˆÂˆ™\]Z\™WØØ\Xš[]J]šXÙK]šXÙPØ\Xš[]NŽ•šY]ÔÙ\ÜÚ[ÛœÊBˆ˜[™Ý[ŠßÙ[‹›[Øš[WÛY\ÜØYÙ\×ÙÙ]
+Ù\ÜÚ[Û—ÚY›Ý×Û\ÊJBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹›[Øš[H‹œÙ\ÜÚ[ÛœÈ‹Ù\ÜÚ[Û—ÚY›Y\ÜØYÙ\È—JHOˆÂˆ™\]Z\™WØØ\Xš[]J]šXÙK]šXÙPØ\Xš[]NŽÚ]
+K˜[™Ý[ŠßÂˆÙ[‹›[Øš[WÛY\ÜØYÙWÜÜÝ
+ˆÙ\ÜÚ[Û—ÚYˆ	œ™\]Y\Ý˜›ÙKˆ]šXÙWÚYˆ™\]Y\ÝÜÚLM‹ˆ›Ý×Û\Ëˆ
+BˆJBˆBˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹›[Øš[H‹ÛÜšÙ›ÝÜÈ—JHOˆÂˆ™\]Z\™WØØ\Xš[]J]šXÙK]šXÙPØ\Xš[]NŽ•šY]Õ\ÚÜÊBˆ˜[™Ý[ŠßÙ[‹›[Øš[WÝÛÜšÙ›ÝÜÊ
+JBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹›[Øš[H‹ÛÜšÙ›ÝÜÈ‹ÛÜšÙ›Ý×ÚYœ[œÈ—JHOˆÂˆ™\]Z\™WØØ\Xš[]J]šXÙK]šXÙPØ\Xš[]NŽ”[•ÛÜšÙ›ÝÜÊBˆ˜[™Ý[ŠßÙ[‹›[Øš[WÝÛÜšÙ›Ý×Û][˜Ú
+ÛÜšÙ›Ý×ÚY]šXÙWÚY›Ý×Û\ÊJBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹›[Øš[H‹˜Ø\\™\È—JHOˆÂˆ™\]Z\™WØØ\Xš[]J]šXÙK]šXÙPØ\Xš[]NŽØ\\™JK˜[™Ý[ŠßÂˆÙ[‹›[Øš[WØØ\\™WÜÜÝ
+	œ™\]Y\Ý˜›ÙK]šXÙK™\]Y\ÝÜÚLM‹›Ý×Û\ÊBˆJBˆBˆËÈKKH™\œÚ[Û™YÝŒKÜ™[[ÝKÙ]šXÙKÊ˜[™NˆH[›™\ˆ\ÚÚ[™ÈBˆËÈÛ™IÜÈÝÛˆ\™Ø\™H›ÜˆÛÛY][™Ë‚ˆËÂˆËÈHš\œÝ™YH›Ý]\È\™HØ]YžH]šXÙH]][XØ][Ûˆ[Û™BˆËÈ[™žH›ÈØ\Xš[]Kˆ]\È[X™\˜]H[™\È›ÝHÛN‚ˆËÈY™\\Ú[™ÈHÝ\™˜XÙHØ[ˆÛ›H]™\ˆ
+›˜\œ›ÝÊˆÚ]\ÈY™™XÝ]™BˆËÈ
+ÙYH›ÝØÛÛŽ™Y™™XÝ]™WØØ\Xš[]Y\Ø
+K™XY[™ÈÛ™IÜÈÝÛˆÜ˜[ˆËÈ™XÛÜ™\ØÛÜÙ\È›Ý[™ÈH]šXÙHØ\È›Ý[™XYHÛ]ˆËÈZ\š[™Ë[™H]Y]YH[™ÈÝ]Û›HÛÛ[X[™È[™XYH]Y]YYˆËÈ
+™›Üˆ\È]šXÙJˆ8 %XXÚÙˆÚXÚØ\ÈØ\Xš[]KXÚXÚÙYÚ[ˆ]ˆËÈØ\È]Y]YY[™\È™KXÚXÚÙY]X\ÙH[YH™[ÝËˆ™\]Z\š[™ÈBˆËÈÜ˜[ÈY™\\ÙHÛÝ[[œÝXYXYØÚÈH\ÚYÛŽˆH]šXÙBˆËÈÜ˜[YÛ›HØ[Y\˜WØØ\\™XÛÝ[™]™\ˆY™\\ÙHHØ[Y\˜KÛÂˆËÈHØ[Y\˜HÛÝ[™]™\ˆ™XÛÛYHY™™XÝ]™K‚ˆËÂˆËÈÚ]^H\™H
+››Ý
+ˆØ]YžH\ÈY\ˆÝ[™[™ËÚXÚ\ÈÚHXXÚˆËÈÛ™H™Y\Ù\ÈHY\‹[Û›HZ\š[™ÈÝ]šYÚ™[ÝÎˆHY\ˆ\È›ÂˆËÈ\™Ø\™H\™K›Ý[™È\È]™\ˆ]Y]YY›Üˆ][™›Ý[™ÈX›Ý]ˆËÈH[™H]Ù\™\ÈHÛ™HÚÝ[[œÝÙ\ˆ]][ˆÚ]Ý]ˆËÈ]˜HY\ˆ™XXÚ\ÈÛ›HHY\ˆ[™HˆÛÝ[™HYHÙˆBˆËÈ›Ý]\È]\[ˆÈÚXÚÈHØ\Xš[]H[™˜[ÙHÙˆHÛ™\ÂˆËÈ][X™\˜][HÈ›Ý‚ˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹™]šXÙH‹œÝ\™˜XÙH—JHOˆ™Y\ÙWÜY\—ÛÛ›J]šXÙJBˆ˜[™Ý[ŠßÙ[‹™]šXÙWÜÝ\™˜XÙWÜÜÝ
+	œ™\]Y\Ý˜›ÙK]šXÙK›Ý×Û\ÊJKˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹™]šXÙH‹œÝ]H—JHOˆÂˆ™Y\ÙWÜY\—ÛÛ›J]šXÙJK˜[™Ý[ŠßÙ[‹™]šXÙWÜÝ]J]šXÙJJBˆBˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹™]šXÙH‹˜ÛÛ[X[™È‹›™^—JHOˆÂˆ™Y\ÙWÜY\—ÛÛ›J]šXÙJK˜[™Ý[ŠßÙ[‹™]šXÙWØÛÛ[X[™ÛX\ÙJ]šXÙK›Ý×Û\ÊJBˆBˆËÈ™XÛÛ˜Ú[X][Û‹™]™\ˆHÙXÛÛ™X\ÙNˆHÛÛ[X[™È\È]šXÙBˆËÈÝ\Y[™™]™\ˆš[š\ÚYÛÈH™XÛÛ›™XÝØ[ˆ[]™\ˆHÝYÙYˆËÈ™\Ý[ÜˆØ^HÛ™\ÝH]HÝ]ÛÛYH\È[šÛ›ÝÛ‹‚ˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹™]šXÙH‹˜ÛÛ[X[™È‹œ™XÛÝ™\ˆ—JHOˆÂˆ™Y\ÙWÜY\—ÛÛ›J]šXÙJK˜[™Ý[ŠßÙ[‹™]šXÙWØÛÛ[X[™×Ü™XÛÝ™\Š]šXÙK›Ý×Û\ÊJBˆBˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹™]šXÙH‹˜ÛÛ[X[™È‹ÛÛ[X[™ÚY˜ÛÛ›Û—JHOˆÂˆÙ[‹™]šXÙWØÛÛ[X[™ØÛÛ›Û
+]šXÙKÛÛ[X[™ÚY›Ý×Û\ÊBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹™]šXÙH‹˜ÛÛ[X[™È‹ÛÛ[X[™ÚYœÝ\—JHOˆÂˆÙ[‹™]šXÙWØÛÛ[X[™ÜÝ\
+	œ™\]Y\Ý˜›ÙK]šXÙKÛÛ[X[™ÚY›Ý×Û\ÊBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹™]šXÙH‹˜ÛÛ[X[™È‹ÛÛ[X[™ÚYœ™\Ý[—JHOˆÂˆÙ[‹™]šXÙWØÛÛ[X[™Ü™\Ý[
+	œ™\]Y\Ý˜›ÙK]šXÙKÛÛ[X[™ÚY›Ý×Û\ÊBˆBˆËÈH]Y[ÈÙˆH]™HÝ™X[KÚ[H]ÈÛÛ›ÛÛÛ[X[™\ÈÝ[ˆËÈ[›š[™ËˆØ]YÛˆHÜ˜[8 %[ˆÜ\˜]ÜˆÚÈ™]›ÚÙ\ÂˆËÈ›ÚXÙWÜÝ™X[XZY\Ý™X[HÛÜÙ\ÈHZXÜ›ÜÛ™HÚ]H™^ˆËÈÚ[šÈ8 %[™ÛˆÝÛš[™ÈHÙ\ÜÚ[Û‹ÚXÚH]šXÙHØ\ÈÛˆËÈX›Ý][ˆHÛÛ[X[™]X\ÙY[™™]™\ˆ[™[È›Üˆ]Ù[‹‚ˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹™]šXÙH‹›ÚXÙH‹Ù\ÜÚ[Û—ÚY˜Ú[šÈ—JHOˆÂˆ™\]Z\™WØØ\Xš[]J]šXÙK]šXÙPØ\Xš[]NŽ•›ÚXÙTÝ™X[JBˆ˜[™Ý[ŠßÙ[‹›ÚXÙWØÚ[šÊ	œ™\]Y\Ý˜›ÙK]šXÙKÙ\ÜÚ[Û—ÚY›Ý×Û\ÊJBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹™]šXÙH‹›ÚXÙH‹Ù\ÜÚ[Û—ÚY˜ÛÜÙH—JHOˆÂˆ™\]Z\™WØØ\Xš[]J]šXÙK]šXÙPØ\Xš[]NŽ•›ÚXÙTÝ™X[JBˆ˜[™Ý[ŠßÙ[‹›ÚXÙWØÛÜÙJ	œ™\]Y\Ý˜›ÙK]šXÙKÙ\ÜÚ[Û—ÚY›Ý×Û\ÊJBˆBˆËÈH]™HÛÛ™\œØ][Û‹›ÝH™XÛÜ™[™ËˆHXÚÙ]\ÈHÚÛHÙ‚ˆËÈH]][XØ][ÛˆÝÜžH›ÜˆHÛØÚÙ]]›ÛÝÜÎˆHœ›ÝÜÙ\‚ˆËÈØ[››Ý]ÚYÛ™YXY\œÈÛˆHÙX”ÛØÚÙ][™ÚZÙKÛÈH]šXÙBˆËÈ›Ý™\È]Ù[ˆ\™H8 %Ú]HØ[YHÚYÛ˜]\™KÙ\]Y[˜ÙK›Û˜ÙH[™ˆËÈÙ^HÙ[™\˜][Ûˆ\È[žHÝ\ˆ›Ý]H8 %[™™XÙZ]™\ÈHÛ™K]\ÙKˆËÈÌ\ÙXÛÛ™™X\™\ˆ][[YYX][HÜ[™ËˆÙYHÛÛœÝ[YWÝ[×ÝXÚÙ]‚ˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹™]šXÙH‹[È‹XÚÙ]—JHOˆÂˆ™\]Z\™WØØ\Xš[]J]šXÙK]šXÙPØ\Xš[]NŽ•›ÚXÙTÝ™X[JBˆ˜[™Ý[ŠßÙ[‹[×ÝXÚÙ]
+	œ™\]Y\Ý˜›ÙK]šXÙK™\]Y\ÝÜÚLM‹›Ý×Û\ÊJBˆBˆËÈH\Ü˜YH]Ù[ˆ™]™\ˆ™XXÚ\È\ÈX]Ú8 %Ù\™\‹œœØ[œÝÙ\œÂˆËÈ]™Y›Ü™HH›ÙH\ÈÛÛXÝYˆH
+œÚYÛ™Y
+ˆÑU]\È›Ý[‚ˆËÈ\Ü˜YHÙ\È™XXÚ\™K[™\ÈÛÚ]]\ÈZ\ÜÚ[™È˜]\‚ˆËÈ[ˆ[™ÈÛˆH›Ý]HHÛÛ˜XÝX›\Ú\Ë‚ˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹™]šXÙH‹[È‹Ù\ÜÚ[Û—ÚYœÝ™X[H—JHOˆÂˆ™\]Z\™WØØ\Xš[]J]šXÙK]šXÙPØ\Xš[]NŽ•›ÚXÙTÝ™X[JBˆ˜[™Ý[ŠßÙ[‹[×ÜÝ™X[WÛ™YY×Ý\Ü˜YJÙ\ÜÚ[Û—ÚY
+JBˆBˆËÈ™YÚ\Ý\š[™ÈÚ\™HÈ™XXÚ\È]šXÙK[™Ú]˜]Ú[™È]ˆ›ÝˆËÈÙ[‹\Ù\šXÙH›ÜˆHØ[YH™X\ÛÛˆ\ÈH›Ý]\ÈX›Ý™NˆH\ÚˆËÈY™\ÜÈÜ˜[È›Ý[™È8 %HÛÚÙ[ˆ]šXÙHÝ[\ÈÈXZÙH[‚ˆËÈÜ™[˜\žHÚYÛ™Y™\]Y\Ý8 %[™H]šXÙH]\Ý[Ø^\È™HX›HÂˆËÈÝÜ™Z[™ÈÛÚÙ[‹‚ˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹™]šXÙH‹œ\Ú‹šÙ^H—JHOˆÂˆ™Y\ÙWÜY\—ÛÛ›J]šXÙJK˜[™Ý[ŠßÙ[‹™]šXÙWÜ\ÚÚÙ^J
+JBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹™]šXÙH‹œ\Ú—JHOˆ™Y\ÙWÜY\—ÛÛ›J]šXÙJBˆ˜[™Ý[ŠßÙ[‹™]šXÙWÜ\ÚÜ™YÚ\Ý\Š	œ™\]Y\Ý˜›ÙK]šXÙWÚY›Ý×Û\ÊJKˆ
+‘SUH‹ÈŒH‹œ™[[ÝH‹™]šXÙH‹œ\Ú—JHOˆÂˆ™Y\ÙWÜY\—ÛÛ›J]šXÙJK˜[™Ý[ŠßÙ[‹™]šXÙWÜ\ÚÙ›Ü™Ù]
+]šXÙWÚY
+JBˆBˆËÈKKH™\œÚ[Û™YÝŒKÜ™[[ÝKÛ›ÙKÊ˜XÙ[Y[[™H
+›ØYX\ÌMÊK‚ˆËÈHÙXÛÛ™[™H™\ÚYHHÛÛ›Û[™HX›Ý™KÚ\š[™ÈÛ›H\ÂˆËÈ˜[œÜÜˆHÛÛ›Û\[™H›Ý]\ÈXÝÛˆ[œÈH›ÙH[™XYBˆËÈÛÎÈ\ÙH\™HHÛ›HÛ™\È›ÝYÚÚXÚH[ˆ]]Ü™YˆËÈ[Ù]Ú\™HØ[ˆ\œš]™K‚ˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹››ÙH—JHOˆÂˆ™\]Z\™WØØ\Xš[]J]šXÙK]šXÙPØ\Xš[]NŽ‘\ØÜšX™S›ÙJBˆ˜[™Ý[ŠßÙ[‹››ÙWÙ\ØÜš\ÜŠ
+JBˆBˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹››ÙH‹šX[—JHOˆÂˆ™\]Z\™WØØ\Xš[]J]šXÙK]šXÙPØ\Xš[]NŽ‘\ØÜšX™S›ÙJBˆ˜[™Ý[ŠßÙ[‹››ÙWÚX[
+›Ý×Û\ÊJBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹››ÙH‹œ[œÈ—JHOˆÂˆ™\]Z\™WØØ\Xš[]J]šXÙK]šXÙPØ\Xš[]NŽ”XÙT[œÊBˆ˜[™Ý[ŠßÙ[‹œXÙWÜ[Š	œ™\]Y\Ý˜›ÙK]šXÙWÚY™\]Y\ÝÜÚLM‹›Ý×Û\ÊJBˆBˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹››ÙH‹œ[œÈ‹ÝX›Z]YÜ[—ÚYJHOˆÂˆ™\]Z\™WØØ\Xš[]J]šXÙK]šXÙPØ\Xš[]NŽ‘\ØÜšX™S›ÙJBˆ˜[™Ý[ŠßÙ[‹œXÙYÜ[—ÜÝ]\Ê]šXÙWÚYÝX›Z]YÜ[—ÚY
+JBˆBˆËÈ]™HZYÜ˜][Ûˆ
+›ØYX\ÌN
+HÚ]ÈÛˆHXÙ[Y[[™H˜]\‚ˆËÈ[ˆ™\ÚYH]ˆHZYÜ˜][Ûˆ
+š\ÊˆHXÙ[Y[8 %H[”ÜXØ\ÂˆËÈ›ÙHY›Ý]]Üˆ8 %\ÈHœ›Þ™[ˆ[XYÙH]\›œÈ][ÈBˆËÈÛÛ[X][Û‹ˆÑUÝŒKÜ™[[ÝKÛ›ÙXX›Ý™H\ÈÚ][ˆÜšYÚ[ˆ™XYÂˆËÈÈÚÛÜÙHH\™Ù]ÛÈZYÜ˜][Ûˆ™YYÈ›È\ØÜšX™H›Ý]HÙˆ]ÈÝÛ‹‚ˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹››ÙH‹›ZYÜ˜][Ûˆ‹œ™Y›YÚ—JHOˆÂˆ™\]Z\™WØØ\Xš[]J]šXÙK]šXÙPØ\Xš[]NŽ“ZYÜ˜]JBˆ˜[™Ý[ŠßÙ[‹›ZYÜ˜][Û—Ü™Y›YÚ
+	œ™\]Y\Ý˜›ÙK›Ý×Û\ÊJBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹››ÙH‹›ZYÜ˜][Ûˆ‹˜XØÙ\—JHOˆÂˆ™\]Z\™WØØ\Xš[]J]šXÙK]šXÙPØ\Xš[]NŽ“ZYÜ˜]JBˆ˜[™Ý[ŠßÙ[‹›ZYÜ˜][Û—ØXØÙ\
+	œ™\]Y\Ý˜›ÙK›Ý×Û\ÊJBˆBˆËÈKKH™\œÚ[Û™YÝŒKÜ™[[ÝKÜY\‹Ê˜Y\ˆ[™K‚ˆËÈH\™[™KˆHÛÛ›Û[™HXÝÈÛˆ\È›ÙIÜÈ[œËBˆËÈXÙ[Y[[™HXØÙ\ÈHÜXÈ[›Ý\ˆÝÛ™Y›ÙH]]Ü™Y[™ˆËÈ\ÈÛ™HXØÙ\È
+ÛÜ™Êˆœ›ÛHHY\ˆ][ˆ[ˆ[™\ˆ\ÂˆËÈ›ÙIÜÈÝÛˆ™XÚ\KˆY\ˆÝ[™[™È[\Y\È›Ý[™ÈÛˆHÝ\‚ˆËÈÛÎˆ›Û™HÙˆ\ÙH\›\ÈÛÛœÝ[ÈØÛÜ\Ø‚ˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹œY\ˆ‹›Y\ÜØYÙ\È—JHOˆ™\]Z\™WØ[žWÜY\—ØØ\Xš[]J]šXÙJBˆ˜[™Ý[ŠßÙ[‹œY\—ÛY\ÜØYÙWÜÜÝ
+]šXÙK	œ™\]Y\Ý˜›ÙK›Ý×Û\ÊJKˆ
+‘ÑU‹ÈŒH‹œ™[[ÝH‹œY\ˆ‹™XYÈ‹™XYÚYJHOˆÂˆ™\]Z\™WØ[žWÜY\—ØØ\Xš[]J]šXÙJBˆ˜[™Ý[ŠßÙ[‹œY\—Ý™XYÙÙ]
+]šXÙK™XYÚY›Ý×Û\ÊJBˆBˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹œY\ˆ‹š[È—JHOˆ™\]Z\™WØ[žWÜY\—ØØ\Xš[]J]šXÙJBˆ˜[™Ý[ŠßÙ[‹œY\—Ú[×ÜÜÝ
+]šXÙK	œ™\]Y\Ý˜›ÙK›Ý×Û\ÊJKˆ
+”ÔÕ‹ÈŒH‹œ™[[ÝH‹œY\ˆ‹˜\Y˜XÝÈ—JHOˆÂˆ™\]Z\™WØØ\Xš[]J]šXÙK]šXÙPØ\Xš[]NŽ”Y\\Y˜XÝ
+Bˆ˜[™Ý[ŠßÙ[‹œY\—Ø\Y˜XÝÜÜÝ
+]šXÙK	œ™\]Y\Ý˜›ÙK›Ý×Û\ÊJBˆBˆËÈÙ[‹\™]›ØØ][Ûˆ™YYÈ›È^˜HØ\Xš[]NˆH]šXÙHX^H[Ø^\ÂˆËÈÙ]™\ˆ]Ù[‹ˆHÝÜ™H]›Ü˜ÙK\ÝÜÈ[žH]™H\ÚÝÜˆËÈÙ\ÜÚ[ÛˆH]šXÙHÝÛœË^XÝHZÙH[ˆÜ\˜]Üˆ™]›ÚÙK‚ˆ
+‘SUH‹ÈŒH‹œ™[[ÝH‹›[Øš[H‹™]šXÙ\È‹œÙ[ˆ—JHOˆÂˆÙ[‹›[Øš[WÜ™]›ÚÙWÜÙ[Š]šXÙWÚY›Ý×Û\ÊBˆBˆÈOˆ\œŠ
+•[šÛ›ÝÛˆ™[[ÝH[›™\ˆ[™Ú[‹×ÜÝš[™Ê
+JJKˆNÂˆ]
+™\ÜÛœÙKÝ]ÛÛYK\™Ù]
+HHX]Ú™\Ý[ÂˆÚÊ
+Ý]\Ë˜[YK\™Ù]
+JHOˆ
+\T™\ÜÛœÙNŽšœÛÛŠÝ]\Ë	˜[YJK˜[ÝÙY‹\™Ù]
+Kˆ\œŠ
+Ý]\Ë\œ›ÜŠJHOˆ
+ˆ\T™\ÜÛœÙNŽ™\œ›ÜŠÝ]\Ë	™\œ›ÜŠKˆYˆÝ]\ÈOHÈÂˆœØÛÜWÙ[šYY‚ˆH[ÙHÂˆœ™Z™XÝY‚ˆKˆ›Û™Kˆ
+KˆNÂˆYˆ]ÚÊ]]ÝÜ™JHHÙ[‹œÝÜ™K›ØÚÊ
+HÂˆ]ÈHÝÜ™K˜]Y]
+ˆ›Ý×Û\ËˆÛÛYJ]šXÙWÚY
+Kˆ	™›Ü›X]JžßHßH‹™\]Y\Ý›Y]Ù]
+Kˆ\™Ù]˜\×Ù\™YŠ
+KˆÝ]ÛÛYKˆÛÛYJ™\]Y\ÝÜÚLMŠKˆ
+NÂˆBˆ™\ÜÛœÙBˆB‚ˆ›ˆ\ÝÜ[œÊˆ	œÙ[‹ˆØÛÜ\Îˆ	”™[[ÝTØÛÜ\Ëˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]YÙ\ˆHÙ[‹œ[—ÛYÙ\Š
+OÎÂˆ][œÈHYÙ\‹›\ÝÜ[œÊWÌ˜[ÙJK›X\Ù\œŠ[\›˜[
+OÎÂˆ]Ú\™YHÚ\™YYÙ\ŽŽ›Ü[Š	œÙ[‹œ]Ë›YÙ\—ÙŠK›X\Ù\œŠ[\›˜[
+OÎÂˆ]Ý[[X\šY\ÈH[œÂˆš]\Š
+Bˆ™š[\Š[ŸØÛÜ\Ëœ\›Z]×Ü[Š[ŠJBˆ›X\
+[ŸÝ[[X\š^™J[‹	œÚ\™Y
+JBˆ˜ÛÛXÝŽ™\Ý[™XÏÏ‹ÏŠ
+Bˆ›X\Ù\œŠ[\›˜[
+OÎÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆœ[œÈŽˆÝ[[X\šY\ËˆJKˆ›Û™Kˆ
+JBˆB‚ˆ›ˆ[—Ù]Z[
+ˆ	œÙ[‹ˆØÛÜ\Îˆ	”™[[ÝTØÛÜ\Ëˆ[—ÚYˆ	œÝ‹ˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ][ˆHÙ[‹˜]]Üš^™YÜ[ŠØÛÜ\Ë[—ÚY
+OÎÂˆ]Ú\™YHÚ\™YYÙ\ŽŽ›Ü[Š	œÙ[‹œ]Ë›YÙ\—ÙŠK›X\Ù\œŠ[\›˜[
+OÎÂˆ]Ý[[X\žHHÝ[[X\š^™J	œ[‹	œÚ\™Y
+K›X\Ù\œŠ[\›˜[
+OÎÂˆËÈÚ]\ˆH]\ÙH\È[ˆY™™XÝÛÈHÛÛ›Û\ˆÙ™™\œÈ
+œ™\Ý[YJˆÛˆBˆËÈ]\ÙY[ˆ˜]\ˆ[ˆ]\ÙHYØZ[‹ˆ]]™\ÈÛˆHY[[Û‰ÜÈ›Ø‚ˆËÈ˜]\ˆ[ˆ[ˆH[‰ÜÈÝ]\Ë[™]\È™XY\™H˜]\ˆ[ˆ[‚ˆËÈÝ[[X\š^™X™XØ]\ÙHH[ˆ\ÝÙ\È›Ý™YY][™ÛÝ[^HBˆËÈÙXÛÛ™]X˜\ÙHÜ[ˆ\ˆ›ÝÈ›Üˆ]ˆHXXÚ[™HÚÜÙHY[[ÛˆÝÜ™BˆËÈØ[››Ý™HÜ[™Y™\ÜÈ˜[ÙXˆ››Ý]\ÙYˆ\ÈHÝ]H]™\žBˆËÈØ[\ˆ[™XYH[™\Ë[™™Y\Ú[™ÈÈ\ØÜšX™HH[ˆ™XØ]\ÙH]ÂˆËÈ]\ÙH›YÈ\È[œ™XYX›HÛÝ[™HHÛÜœÙH[œÝÙ\ˆ[ˆHZ\ÜÚ[™ÂˆËÈ]Û‹‚ˆ]]\ÙYHY[[Û”ÝÜ™NŽ›Ü[Š	œÙ[‹œ]ÊBˆ›ÚÊ
+Bˆ˜[™Ý[ŠÝÜ™_ÝÜ™K™Ù]Ú›ØŠ[—ÚY
+K›ÚÊ
+K™›][Š
+JBˆš\×ÜÛÛYWØ[™
+›ØŸ›Ø‹œ]\ÙWÜ™\]Y\ÝY
+NÂˆËÈ[”ÜXÈÛÛZ[œÈÛ›HÙ^XÚZ[ˆ™Y™\™[˜Ù\Ë™]™\ˆ›ÝšY\ˆÙ^\Ë‚ˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆœ[ˆŽˆÝ[[X\žKˆœ]\ÙYŽˆ]\ÙYˆœÜXÈŽˆ[‹œÜXËˆJKˆÛÛYJ[—ÚY×ÜÝš[™Ê
+JKˆ
+JBˆB‚ˆ›ˆ[—Ù]™[Êˆ	œÙ[‹ˆØÛÜ\Îˆ	”™[[ÝTØÛÜ\Ëˆ[—ÚYˆ	œÝ‹ˆ]Y\žNˆ	œÝ‹ˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆÙ[‹˜]]Üš^™YÜ[ŠØÛÜ\Ë[—ÚY
+OÎÂˆ]]Y\žHH\œÙWÜ]Y\žJ]Y\žJOÎÂˆ]Y\ˆH]Y\žBˆ™Ù]
+˜Y\ˆŠBˆ›X\
+˜[Y_˜[YKœ\œÙNŽMŠ
+JBˆ˜[œÜÜÙJ
+Bˆ›X\Ù\œŠß
+’[˜[Y]™[Ý\œÛÜˆ‹×ÜÝš[™Ê
+JJOÂˆ[Ü˜\ÛÜŠ
+NÂˆ][Z]H]Y\žBˆ™Ù]
+›[Z]ŠBˆ›X\
+˜[Y_˜[YKœ\œÙNŽ\Ú^™OŠ
+JBˆ˜[œÜÜÙJ
+Bˆ›X\Ù\œŠß
+’[˜[Y]™[[Z]‹×ÜÝš[™Ê
+JJOÂˆ[Ü˜\ÛÜŠMŠBˆ›Z[ŠWÌ
+NÂˆ]]™[ÈHÙ[‚ˆœ[—ÛYÙ\Š
+OÂˆ›ØYÙ]™[Ê[—ÚYY\‹[Z]
+Bˆ›X\Ù\œŠ[\›˜[
+OÎÂˆ]™^ØÝ\œÛÜˆH]™[Ë›\Ý
+
+K›X\
+]™[]™[œÙ\]Y[˜ÙJK[Ü˜\ÛÜŠY\ŠNÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆœ[—ÚYŽˆ[—ÚYˆ˜Y\ˆŽˆY\‹ˆ›™^ØÝ\œÛÜˆŽˆ™^ØÝ\œÛÜ‹ˆ™]™[ÈŽˆ]™[ËˆJKˆÛÛYJ[—ÚY×ÜÝš[™Ê
+JKˆ
+JBˆB‚ˆ›ˆ[—Ø\›Ý˜[Êˆ	œÙ[‹ˆØÛÜ\Îˆ	”™[[ÝTØÛÜ\Ëˆ[—ÚYˆ	œÝ‹ˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆÙ[‹˜]]Üš^™YÜ[ŠØÛÜ\Ë[—ÚY
+OÎÂˆ]\›Ý˜[ÈHÚ\™YYÙ\ŽŽ›Ü[Š	œÙ[‹œ]Ë›YÙ\—ÙŠBˆ˜[™Ý[ŠÚ\™YÚ\™Yœ[™[™×Ø\›Ý˜[Ê[—ÚY
+JBˆ›X\Ù\œŠ[\›˜[
+OÎÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆœ[—ÚYŽˆ[—ÚYˆ˜\›Ý˜[ÈŽˆ\›Ý˜[Ëš]\Š
+K›X\
+\›Ý˜[ÚœÛÛŠK˜ÛÛXÝŽ™XÏÏŠ
+KˆJKˆÛÛYJ[—ÚY×ÜÝš[™Ê
+JKˆ
+JBˆB‚ˆ›ˆ\Y˜XÝ
+ˆ	œÙ[‹ˆØÛÜ\Îˆ	”™[[ÝTØÛÜ\Ëˆ[—ÚYˆ	œÝ‹ˆ\Y˜XÝÚYˆ	œÝ‹ˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆÙ[‹˜]]Üš^™YÜ[ŠØÛÜ\Ë[—ÚY
+OÎÂˆÝ\\ŽŽœ›ÝØÛÛŽ˜[Y]WÚY
+\Y˜XÝÚY
+K›X\Ù\œŠ\œ›ÜŸ
+\œ›ÜŠJOÎÂˆ]ÛÛ›™XÝ[ÛˆH\Ü[]NŽÛÛ›™XÝ[ÛŽŽ›Ü[Š	œÙ[‹œ]Ë›YÙ\—ÙŠK›X\Ù\œŠ[\›˜[
+OÎÂˆ]\Y˜XÝHÛÛ›™XÝ[Û‚ˆœ]Y\žWÜ›ÝÊˆ”ÑSPÕ˜[YKYYXWÝ\KÛÛ[ÜÚLM‹Ú^™WØž]\È”“ÓH\Y˜XÝÂˆÒT‘H\Y˜XÝÚYOÌHS‘[—ÚYOÌˆ‹ˆ\Ü[]NŽœ\˜[\ÈVØ\Y˜XÝÚY[—ÚYKˆ›ÝßÂˆÚÊ
+ˆ›ÝË™Ù]ŽËÝš[™ÏŠ
+OËˆ›ÝË™Ù]ŽËÝš[™ÏŠJOËˆ›ÝË™Ù]ŽËÝš[™ÏŠŠOËˆ›ÝË™Ù]ŽËMŠÊOËˆ
+JBˆKˆ
+Bˆ›X\Ù\œŠ\œ›ÜŸX]Ú\œ›ÜˆÂˆ\Ü[]NŽ‘\œ›ÜŽŽ”]Y\žT™]\›™Y›Ô›ÝÜÈOˆÂˆ
+\Y˜XÝ\È›Ý[šÙYÈ\È[ˆ‹×ÜÝš[™Ê
+JBˆBˆÝ\ˆOˆ[\›˜[
+Ý\ŠKˆJOÎÂˆ]Ú^™HBˆMŽžWÙœ›ÛJ\Y˜XÝŒÊK›X\Ù\œŠß[\›˜[
+”ÝÜ™Y\Y˜XÝÚ^™H\È[˜[YŠJOÎÂˆYˆÚ^™HˆØÛÜ\Ë›X^Ø\Y˜XÝØž]\ÈÂˆ™]\›ˆ\œŠ
+ˆLËˆ\Y˜XÝ^ÙYYÈ\ÈÛÛ›Û\‰ÜÈZ\™Yž]HYÙ]‹×ÜÝš[™Ê
+Kˆ
+JNÂˆBˆ]\Ù]HHÙ[‚ˆœ]Âˆœ›ÛÝˆœ\™[
+
+Bˆ›Ú×ÛÜ—Ù[ÙJ[\›˜[
+‘Y[[Ûˆ›ÛÝ\È›È\Y]H\™[ŠJOÎÂˆ]ÝÜ™HH\Y˜XÝÝÜ™NŽÚ]ÛX^Ø›Ø—ÜÚ^™Jˆ\Ù]Kš›Ú[Š˜ÛÛ[]ŒHŠKˆØÛÜ\Ë›X^Ø\Y˜XÝØž]\Ëˆ
+Bˆ›X\Ù\œŠ[\›˜[
+OÎÂˆ]ž]\ÈHÝÜ™Kœ™XY
+	˜\Y˜XÝŒŠK›X\Ù\œŠ[\›˜[
+OÎÂˆYˆMŽžWÙœ›ÛJž]\Ë›[Š
+JK[Ü˜\ÛÜŠMŽ“PV
+HOHÚ^™HÂˆ™]\›ˆ\œŠ[\›˜[
+ˆ\Y˜XÝYÙ\ˆÚ^™HÙ\È›ÝX]Ú™\šYšYY›Øˆ‹ˆ
+JNÂˆBˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆ˜\Y˜XÝÚYŽˆ\Y˜XÝÚYˆœ[—ÚYŽˆ[—ÚYˆ›˜[YHŽˆ\Y˜XÝŒˆ›YYXWÝ\HŽˆ\Y˜XÝŒKˆ˜ÛÛ[ÜÚLMˆŽˆ\Y˜XÝŒ‹ˆœÚ^™WØž]\ÈŽˆÚ^™Kˆ˜ÛÛ[Ø˜\ÙMŽˆÕS‘T‘™[˜ÛÙJž]\ÊKˆJKˆÛÛYJ›Ü›X]JžÜ[—ÚYNžØ\Y˜XÝÚYHŠJKˆ
+JBˆB‚ˆ›ˆ\›Ý™Jˆ	œÙ[‹ˆØÛÜ\Îˆ	”™[[ÝTØÛÜ\Ëˆ[—ÚYˆ	œÝ‹ˆ›ÙNˆ	–ÝNKˆ]šXÙWÚYˆ	œÝ‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆÙ[‹˜]]Üš^™YÜ[ŠØÛÜ\Ë[—ÚY
+OÎÂˆ]›ÙNˆ\›Ý˜[™\]Y\Ý›ÙHHÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJBˆ›X\Ù\œŠ\œ›ÜŸ
+›Ü›X]J’[˜[Y\›Ý˜[™\]Y\ÝˆÙ\œ›ÜŸHŠJJOÎÂˆ]XÚ\Ú[ÛˆHX]Ú›ÙK™XÚ\Ú[Û‹˜\×ÜÝŠ
+HÂˆ˜[Ý×ÛÛ˜ÙHˆOˆ\›Z\ÜÚ[Û‘XÚ\Ú[ÛŽŽ[ÝÓÛ˜ÙKˆ˜[Ý×Ù›Ü—Ü[ˆˆOˆ\›Z\ÜÚ[Û‘XÚ\Ú[ÛŽŽ[ÝÑ›Ü”[‹ˆ™[žHˆOˆ\›Z\ÜÚ[Û‘XÚ\Ú[ÛŽŽ‘[žKˆÈOˆ™]\›ˆ\œŠ
+•[œÝ\ÜY\›Ý˜[XÚ\Ú[Ûˆ‹×ÜÝš[™Ê
+JJKˆNÂˆ]YÙ\ˆHÙ[‹œ[—ÛYÙ\Š
+OÎÂˆ]\›Ý˜[HYÙ\‚ˆ›ØYØ\›Ý˜[
+[—ÚY	˜›ÙKœ™\]Y\ÝÚY
+Bˆ›X\Ù\œŠ[\›˜[
+OÂˆ›Ú×ÛÜ—Ù[ÙJ
+•[šÛ›ÝÛˆ\›Ý˜[™\]Y\Ý‹×ÜÝš[™Ê
+JJOÎÂˆYˆ\›Ý˜[›Ü\˜][Û—ÜÚLMˆOH›ÙK›Ü\˜][Û—ÜÚLMˆÂˆ™]\›ˆ\œŠ
+Ë\›Ý˜[Ü\˜][ÛˆYÙ\ÝÙ\È›ÝX]Ú‹×ÜÝš[™Ê
+JJNÂˆBˆYˆ]ÛÛYJ^\Ý[™ÊHH\›Ý˜[™XÚ\Ú[ÛˆÂˆYˆ^\Ý[™ÈOHXÚ\Ú[ÛˆÂˆ™]\›ˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÈœÝ]\ÈŽˆ˜[™XYWÙXÚYY‹™XÚ\Ú[ÛˆŽ˜›ÙK™XÚ\Ú[ÛŸJKˆÛÛYJ[—ÚY×ÜÝš[™Ê
+JKˆ
+JNÂˆBˆ™]\›ˆ\œŠ
+K\›Ý˜[Ø\È[™XYHXÚYYY™™\™[H‹×ÜÝš[™Ê
+JJNÂˆBˆYˆ›Ý×Û\ÈH\›Ý˜[™^\™\×Ø]Û\ÈÂˆ™]\›ˆ\œŠ
+K\›Ý˜[™\]Y\Ý\È^\™Y‹×ÜÝš[™Ê
+JJNÂˆBˆ]Ú\™YHÚ\™YYÙ\ŽŽ›Ü[Š	œÙ[‹œ]Ë›YÙ\—ÙŠK›X\Ù\œŠ[\›˜[
+OÎÂˆ]™XÛÜ™\ˆHÛÛ›ÛÜ™XÛÜ™\Š	œÚ\™Y[—ÚY]šXÙWÚY
+K›X\Ù\œŠ[\›˜[
+OÎÂˆ™XÛÜ™\‚ˆ™[Z]
+[‘]™[Ž”\›Z\ÜÚ[Û‘XÚYYÂˆ™\]Y\ÝÚYˆ›ÙKœ™\]Y\ÝÚYˆÜ\˜][Û—ÜÚLMŽˆ›ÙK›Ü\˜][Û—ÜÚLM‹ˆXÚ\Ú[Û‹ˆXÚYYØžNˆ™XÛÜ™\‹˜ÛY[ÚY[]J
+KˆJBˆ›X\Ù\œŠ[\›˜[
+OÎÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÈœÝ]\ÈŽˆ™XÚYY‹™XÚ\Ú[ÛˆŽ˜›ÙK™XÚ\Ú[ÛŸJKˆÛÛYJ[—ÚY×ÜÝš[™Ê
+JKˆ
+JBˆB‚ˆ›ˆØ[˜Ù[
+ˆ	œÙ[‹ˆØÛÜ\Îˆ	”™[[ÝTØÛÜ\Ëˆ[—ÚYˆ	œÝ‹ˆ›ÙNˆ	–ÝNKˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ][ˆHÙ[‹˜]]Üš^™YÜ[ŠØÛÜ\Ë[—ÚY
+OÎÂˆ]›ÙNˆØ[˜Ù[™\]Y\Ý›ÙHHÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJBˆ›X\Ù\œŠ\œ›ÜŸ
+›Ü›X]J’[˜[YØ[˜Ù[][Ûˆ™\]Y\ÝˆÙ\œ›ÜŸHŠJJOÎÂˆYˆ[‹œÝ]\Ëš\×Ý\›Z[˜[
+
+HÂˆ™]\›ˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÈœÝ]\ÈŽˆ˜[™XYWÝ\›Z[˜[ŸJKˆÛÛYJ[—ÚY×ÜÝš[™Ê
+JKˆ
+JNÂˆBˆ]]]ÝÜ™HHY[[Û”ÝÜ™NŽ›Ü[Š	œÙ[‹œ]ÊK›X\Ù\œŠ[\›˜[
+OÎÂˆÝÜ™Kœ™\]Y\ÝØØ[˜Ù[
+[—ÚY›Ý×Û\ÊK›X\Ù\œŠ[\›˜[
+OÎÂˆÝ\\ŽŽœÝ\\ŽŽ˜\[™ØØ[˜Ù[][ÛŠˆ	œÙ[‹œ]Ëˆ[—ÚYˆ›ÙKœ™X\ÛÛ‚ˆ˜\×Ù\™YŠ
+Bˆ[Ü˜\ÛÜŠØ[˜Ù[YžHZ\™YÛÛ›Û\ˆŠKˆ
+Bˆ›X\Ù\œŠ[\›˜[
+OÎÂˆÚÊ
+ˆŒ‹ˆÙ\™WÚœÛÛŽŽšœÛÛˆJÈœÝ]\ÈŽˆ˜Ø[˜Ù[][Û—Ü™\]Y\ÝYŸJKˆÛÛYJ[—ÚY×ÜÝš[™Ê
+JKˆ
+JBˆB‚ˆËËÈÝ\Ü[™Üˆ™\Ý[YHH[ˆÚ]Ý][™[™È]‚ˆËËÂˆËËÈHØ\\ÈÛÜÙ\ÎˆHY[[Ûˆ\ÈÝ\ÜY]\ÙHØØ[HÚ[˜ÙH]YˆËËÈH]\ÙWÜ™\]Y\ÝYš]]H™[[ÝH›ÝØÛÛY›ÈXÝ[Ûˆ›Üˆ]ÛÂˆËËÈHZ\™YÛÛ›Û\‰ÜÈÛ›HØ^HÈÝÜH[ˆÛÛœÝ[Z[™ÈHXXÚ[™HØ\ÈÂˆËËÈØ[˜Ù[]8 %\Ý›ÞZ[™ÈHÛÜšÈÈÝÜ][\Ü˜\š[K‚ˆËËÂˆËËÈÜš]\ÈÛ›HHY[[Û‰ÜÈÝÛˆš]^XÝH\ÈHØØ[]Ù\Ëˆ[[ˆËËÈ›ÝÜÈÛ™HØ^H8 %]ÚÈY[[Ûˆš]Ë™]™\ˆH™]™\œÙH8 %™XØ]\ÙBˆËËÈY[[Û—Ú›ØœØ[™YÙ[Ü›ØÙ\ÜÙ\Ø]™H[ˆY™™\™[]X˜\Ù\ÈÚ]›ÂˆËËÈ˜[œØXÝ[ÛˆÜ[›š[™È[KÛÈÛÈÜš]\œÈÛÝ[™HH˜XÙHÚ]›ÂˆËËÈ\˜š]˜][Ûˆš[Z]]™K‚ˆ›ˆÙ]Ü]\ÙY
+ˆ	œÙ[‹ˆØÛÜ\Îˆ	”™[[ÝTØÛÜ\Ëˆ[—ÚYˆ	œÝ‹ˆ]\ÙYˆ›ÛÛˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ][ˆHÙ[‹˜]]Üš^™YÜ[ŠØÛÜ\Ë[—ÚY
+OÎÂˆËÈH\›Z[˜[[ˆ\È™\ÜY˜]\ˆ[ˆ\œ›Ü™YX]Ú[™ÈØ[˜Ù[ˆBˆËÈÛÛ›Û\ˆ\ÚÙY›ÜˆHÝ]HH[ˆ\È[™XYH\ÝÚXÚ\È›ÝBˆËÈ˜Z[\™HÛˆ]È\‚ˆYˆ[‹œÝ]\Ëš\×Ý\›Z[˜[
+
+HÂˆ™]\›ˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÈœÝ]\ÈŽˆ˜[™XYWÝ\›Z[˜[ŸJKˆÛÛYJ[—ÚY×ÜÝš[™Ê
+JKˆ
+JNÂˆBˆ]]]ÝÜ™HHY[[Û”ÝÜ™NŽ›Ü[Š	œÙ[‹œ]ÊK›X\Ù\œŠ[\›˜[
+OÎÂˆËÈ™\]Y\ÝÜ]\ÙX™Y\Ù\ÈH\›Z[˜[›Øˆ]Ù[‹ÛÈH˜XÙH™]ÙY[ˆBˆËÈÚXÚÈX›Ý™H[™\ÈØ[Ý[Ø[››Ý™\Ý\œ™XÝš[š\ÚYÛÜšË‚ˆÝÜ™Bˆœ™\]Y\ÝÜ]\ÙJ[—ÚY]\ÙY›Ý×Û\ÊBˆ›X\Ù\œŠ\œ›ÜŸ
+K\œ›ÜŠJOÎÂˆÚÊ
+ˆŒ‹ˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœÝ]\ÈŽˆYˆ]\ÙYÈœ]\ÙWÜ™\]Y\ÝYˆH[ÙHÈœ™\Ý[YWÜ™\]Y\ÝYˆBˆJKˆÛÛYJ[—ÚY×ÜÝš[™Ê
+JKˆ
+JBˆB‚ˆ›ˆÚ[
+ˆ	œÙ[‹ˆ]šXÙWÚYˆ	œÝ‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]]]ÝÜ™HHY[[Û”ÝÜ™NŽ›Ü[Š	œÙ[‹œ]ÊK›X\Ù\œŠ[\›˜[
+OÎÂˆÝÜ™KœÙ]ÚÚ[ÜÝÚ]Ú
+YJK›X\Ù\œŠ[\›˜[
+OÎÂˆ]Ø[˜Ù[YHÝÜ™Kœ™\]Y\ÝØØ[˜Ù[Ø[
+›Ý×Û\ÊK›X\Ù\œŠ[\›˜[
+OÎÂˆËÈ[™ØYÚ[™ÈHÚ[ÝÚ]Ú]\Ý[ÛÈ›Ü˜ÙK\ÝÜ[žH]™H\ÚÝÜˆËÈÛÛ›ÛÙ\ÜÚ[ÛˆšYÚ]Ø^K[‹\›ØÙ\ÜË˜]\ˆ[ˆØZ][™È›ÜˆBˆËÈÙ\™HÛÜ	ÜÈ™^[™›Ü˜Ù[Y[XÚË‚ˆ]\ÚÝÜÜÙ\ÜÚ[Ûœ×ÜÝÜYHÙ[‚ˆ™\ÚÝÜˆ˜\×Ü™YŠ
+Bˆ›X\
+[[Y_[[YK™[Y\™Ù[˜ÞWÜÝÜØ[
+
+JBˆ[Ü˜\ÛÜŠ
+NÂˆÚÊ
+ˆŒ‹ˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœÝ]\ÈŽˆšÚ[ÜÝÚ]ÚÙ[™ØYÙY‹ˆœ™\]Y\ÝYØžHŽ™]šXÙWÚYˆ˜Ø[˜Ù[YÜ[œÈŽ˜Ø[˜Ù[Yˆ™\ÚÝÜÜÙ\ÜÚ[Ûœ×ÜÝÜYŽ™\ÚÝÜÜÙ\ÜÚ[Ûœ×ÜÝÜYˆJKˆ›Û™Kˆ
+JBˆB‚ˆ›ˆ\ÚÝÜØÛÛ›ÛÜÝ\
+ˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ]šXÙWÚYˆ	œÝ‹ˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ][[YHHÙ[‹œ™\]Z\™WÙ\ÚÝÜ
+
+OÎÂˆ]™\]Y\Ýˆ\ÚÝÜÛÛ›ÛÝ\™\]Y\ÝBˆÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJK›X\Ù\œŠ\œ›ÜŸÂˆ
+ˆˆ›Ü›X]J’[˜[Y\ÚÝÜXÛÛ›ÛÝ\™\]Y\ÝˆÙ\œ›ÜŸHŠKˆ
+BˆJOÎÂˆËÈHÛÛœÙ[›Û\[œÈ[œÚYH[[YKœÝ\™Y›Ü™H[žHÙ\ÜÚ[Ûˆ\ÂˆËÈÜ™X]Y8 %H[X[‹]š\ÚX›HØ]HÛˆH[›™\ˆ]Ù[‹‚ˆ]˜[YHH[[YKœÝ\ÝÚ]ÛÜ[ÛœÊˆ]šXÙWÚYˆ	œÙ[‹™]šXÙWÛX™[
+]šXÙWÚY
+Kˆ™\]Y\Ý˜[ÝÛ\Ýˆ™\]Y\Ý˜˜]ÚÛ[ÙKˆ™\]Y\Ý˜[ÝÙYÝÚ[™ÝÜËˆ™\]Y\Ýˆ›Y™][YWÛ\Âˆ[Ü˜\ÛÜŠ]WÛ[ÛšÙ^WÛXŽŽ™\ÚÝÜØÛÛ›ÛŽ“PVÔÑTÔÒSÓ—ÓQ‘USQWÓTÊKˆ™\]Y\Ý˜[Ý×ÜØÜ™Y[œÚÝË[Ü˜\ÛÜŠ˜[ÙJKˆ™\]Y\Ý˜[Ý×ÚÙ^X›Ø\™Ú[œ][Ü˜\ÛÜŠ˜[ÙJKˆ™\]Y\Ý˜[Ý×ØÛ\›Ø\™Ü™XY[Ü˜\ÛÜŠ˜[ÙJKˆ™\]Y\Ý˜\›Ý˜[ÜÛXÞKˆ
+OÎÂˆÚÊ
+ŒK˜[YKÛÛYJ]šXÙWÚY×ÜÝš[™Ê
+JJJBˆB‚ˆ›ˆ\ÚÝÜØÛÛ›ÛØXÝ[ÛŠˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ]šXÙWÚYˆ	œÝ‹ˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ][[YHHÙ[‹œ™\]Z\™WÙ\ÚÝÜ
+
+OÎÂˆ]™\]Y\Ýˆ\ÚÝÜÛÛ›ÛXÝ[Û”™\]Y\ÝBˆÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJK›X\Ù\œŠ\œ›ÜŸÂˆ
+ˆˆ›Ü›X]J’[˜[Y\ÚÝÜXÛÛ›ÛXÝ[Ûˆ™\]Y\ÝˆÙ\œ›ÜŸHŠKˆ
+BˆJOÎÂˆ]\™Ù]H™\]Y\ÝœÙ\ÜÚ[Û—ÚY˜ÛÛ™J
+NÂˆ]˜[YHH[[YK˜XÝ[ÛŠ]šXÙWÚY	œÙ[‹™]šXÙWÛX™[
+]šXÙWÚY
+K™\]Y\Ý
+OÎÂˆÚÊ
+Œ˜[YKÛÛYJ\™Ù]
+JJBˆB‚ˆ›ˆ\ÚÝÜØÛÛ›ÛÛ\ÝÝ\™Ù]Êˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ]šXÙWÚYˆ	œÝ‹ˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ][[YHHÙ[‹œ™\]Z\™WÙ\ÚÝÜ
+
+OÎÂˆ]™\]Y\Ýˆ\ÚÝÜÛÛ›Û\™Ù]™\]Y\ÝBˆÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJK›X\Ù\œŠ\œ›ÜŸÂˆ
+ˆˆ›Ü›X]J’[˜[Y\ÚÝÜXÛÛ›Û\Ý]\™Ù]È™\]Y\ÝˆÙ\œ›ÜŸHŠKˆ
+BˆJOÎÂˆ]\™Ù]H™\]Y\ÝœÙ\ÜÚ[Û—ÚY˜ÛÛ™J
+NÂˆ]˜[YHH[[YK›\ÝÝ\™Ù]Ê]šXÙWÚY	œ™\]Y\ÝœÙ\ÜÚ[Û—ÚY
+OÎÂˆÚÊ
+Œ˜[YKÛÛYJ\™Ù]
+JJBˆB‚ˆ›ˆ\ÚÝÜØÛÛ›ÛÚ[œÜXÝ
+ˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ]šXÙWÚYˆ	œÝ‹ˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ][[YHHÙ[‹œ™\]Z\™WÙ\ÚÝÜ
+
+OÎÂˆ]™\]Y\Ýˆ\ÚÝÜÛÛ›Û\™Ù]™\]Y\ÝBˆÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJK›X\Ù\œŠ\œ›ÜŸÂˆ
+ˆˆ›Ü›X]J’[˜[Y\ÚÝÜXÛÛ›Û[œÜXÝ™\]Y\ÝˆÙ\œ›ÜŸHŠKˆ
+BˆJOÎÂˆ]\™Ù]H™\]Y\ÝœÙ\ÜÚ[Û—ÚY˜ÛÛ™J
+NÂˆ]˜[YHH[[YKš[œÜXÝ
+]šXÙWÚY™\]Y\Ý
+OÎÂˆÚÊ
+Œ˜[YKÛÛYJ\™Ù]
+JJBˆB‚ˆ›ˆ\ÚÝÜØÛÛ›ÛÜØÜ™Y[œÚÝ
+ˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ]šXÙWÚYˆ	œÝ‹ˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ][[YHHÙ[‹œ™\]Z\™WÙ\ÚÝÜ
+
+OÎÂˆ]™\]Y\Ýˆ\ÚÝÜÛÛ›Û\™Ù]™\]Y\ÝBˆÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJK›X\Ù\œŠ\œ›ÜŸÂˆ
+ˆˆ›Ü›X]J’[˜[Y\ÚÝÜXÛÛ›ÛØÜ™Y[œÚÝ™\]Y\ÝˆÙ\œ›ÜŸHŠKˆ
+BˆJOÎÂˆ]\™Ù]H™\]Y\ÝœÙ\ÜÚ[Û—ÚY˜ÛÛ™J
+NÂˆ]˜[YHH[[YKœØÜ™Y[œÚÝ
+]šXÙWÚY™\]Y\Ý
+OÎÂˆÚÊ
+Œ˜[YKÛÛYJ\™Ù]
+JJBˆB‚ˆ›ˆ\ÚÝÜØÛÛ›ÛØÛ\›Ø\™Ü™XY
+ˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ]šXÙWÚYˆ	œÝ‹ˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ][[YHHÙ[‹œ™\]Z\™WÙ\ÚÝÜ
+
+OÎÂˆ]™\]Y\Ýˆ\ÚÝÜÛÛ›Û\™Ù]™\]Y\ÝBˆÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJK›X\Ù\œŠ\œ›ÜŸÂˆ
+ˆˆ›Ü›X]J’[˜[Y\ÚÝÜXÛÛ›ÛÛ\›Ø\™\™XY™\]Y\ÝˆÙ\œ›ÜŸHŠKˆ
+BˆJOÎÂˆ]\™Ù]H™\]Y\ÝœÙ\ÜÚ[Û—ÚY˜ÛÛ™J
+NÂˆ]˜[YHH[[YK˜Û\›Ø\™Ü™XY
+]šXÙWÚY™\]Y\Ý
+OÎÂˆÚÊ
+Œ˜[YKÛÛYJ\™Ù]
+JJBˆB‚ˆ›ˆ\ÚÝÜØÛÛ›ÛÜ]\ÙJˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ]šXÙWÚYˆ	œÝ‹ˆ]\ÙYˆ›ÛÛˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ][[YHHÙ[‹œ™\]Z\™WÙ\ÚÝÜ
+
+OÎÂˆ]™\]Y\Ýˆ\ÚÝÜÛÛ›ÛÝÜ™\]Y\ÝHÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJK›X\Ù\œŠ\œ›ÜŸÂˆ
+ˆˆ›Ü›X]J’[˜[Y\ÚÝÜXÛÛ›Û]\ÙKÜ™\Ý[YH™\]Y\ÝˆÙ\œ›ÜŸHŠKˆ
+BˆJOÎÂˆ]\™Ù]H™\]Y\ÝœÙ\ÜÚ[Û—ÚY˜ÛÛ™J
+NÂˆ]˜[YHH[[YKœ]\ÙJ]šXÙWÚY	œ™\]Y\ÝœÙ\ÜÚ[Û—ÚY]\ÙY
+OÎÂˆÚÊ
+Œ˜[YKÛÛYJ\™Ù]
+JJBˆB‚ˆ›ˆ\ÚÝÜØÛÛ›ÛÜÝÜ
+ˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ]šXÙWÚYˆ	œÝ‹ˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ][[YHHÙ[‹œ™\]Z\™WÙ\ÚÝÜ
+
+OÎÂˆ]™\]Y\Ýˆ\ÚÝÜÛÛ›ÛÝÜ™\]Y\ÝHÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJK›X\Ù\œŠ\œ›ÜŸÂˆ
+ˆˆ›Ü›X]J’[˜[Y\ÚÝÜXÛÛ›ÛÝÜ™\]Y\ÝˆÙ\œ›ÜŸHŠKˆ
+BˆJOÎÂˆ]\™Ù]H™\]Y\ÝœÙ\ÜÚ[Û—ÚY˜ÛÛ™J
+NÂˆ]˜[YHH[[YKœÝÜ
+]šXÙWÚY	œ™\]Y\ÝœÙ\ÜÚ[Û—ÚY
+OÎÂˆÚÊ
+Œ˜[YKÛÛYJ\™Ù]
+JJBˆB‚ˆ›ˆ™\]Z\™WÙ\ÚÝÜ
+	œÙ[ŠHOˆ™\Ý[	\˜Ï\ÚÝÜÛÛ›Û[[YO‹
+LM‹Ýš[™ÊOˆÂˆÙ[‹™\ÚÝÜ˜\×Ü™YŠ
+K›Ú×ÛÜ—Ù[ÙJÂˆ
+ˆLËˆ‘\ÚÝÜÛÛ›Û\È›Ý]˜Z[X›HÛˆ\È[›™\ˆ‹×ÜÝš[™Ê
+Kˆ
+BˆJBˆB‚ˆËËÈHZ\™Y]šXÙIÜÈ[X[ˆX™[\ÙY[ˆHØØ[ÛÛœÙ[X[ÙË‚ˆËËÈ˜[È˜XÚÈÈHÜ\]YHYYˆH™XÛÜ™\È[œ™XYX›K‚ˆ›ˆ]šXÙWÛX™[
+	œÙ[‹]šXÙWÚYˆ	œÝŠHOˆÝš[™ÈÂˆÙ[‹œÝÜ™Bˆ›ØÚÊ
+Bˆ›ÚÊ
+Bˆ˜[™Ý[ŠÝÜ™_ÝÜ™K™]šXÙJ]šXÙWÚY
+K›ÚÊ
+K™›][Š
+JBˆ›X\
+]šXÙ_]šXÙK™]šXÙWÛ˜[YJBˆ[Ü˜\ÛÜ—Ù[ÙJ]šXÙWÚY×ÜÝš[™Ê
+JBˆB‚ˆ›ˆ]]Üš^™YÜ[Šˆ	œÙ[‹ˆØÛÜ\Îˆ	”™[[ÝTØÛÜ\Ëˆ[—ÚYˆ	œÝ‹ˆ
+HOˆ™\Ý[ÝÜ™Y[‹
+LM‹Ýš[™ÊOˆÂˆÝ\\ŽŽœ›ÝØÛÛŽ˜[Y]WÚY
+[—ÚY
+K›X\Ù\œŠ\œ›ÜŸ
+\œ›ÜŠJOÎÂˆ][ˆHÙ[‚ˆœ[—ÛYÙ\Š
+OÂˆ›ØYÜ[Š[—ÚY
+Bˆ›X\Ù\œŠ[\›˜[
+OÂˆ›Ú×ÛÜ—Ù[ÙJ
+•[šÛ›ÝÛˆ\˜X›H[ˆ‹×ÜÝš[™Ê
+JJOÎÂˆYˆ\ØÛÜ\Ëœ\›Z]×Ü[Š	œ[ŠHÂˆËÈÈ›Ý™]™X[Ú]\ˆ[ˆÝ][Ù‹\ØÛÜH[ˆ^\ÝË‚ˆ™]\›ˆ\œŠ
+•[šÛ›ÝÛˆ\˜X›H[ˆ‹×ÜÝš[™Ê
+JJNÂˆBˆÚÊ[ŠBˆB‚ˆ›ˆ[—ÛYÙ\Š	œÙ[ŠHOˆ™\Ý[[“YÙ\‹
+LM‹Ýš[™ÊOˆÂˆ[“YÙ\ŽŽ›Ü[Š	œÙ[‹œ]Ë›YÙ\—ÙŠK›X\Ù\œŠ[\›˜[
+BˆB‚ˆËÈKKHÝŒKÜ™[[ÝKÛ›ÙX[™ÝŒKÜ™[[ÝKÛZYÜ˜][Û‹Ê˜
+›ØYX\ÌN
+HKKKKKKB‚ˆËËÈH\]H\™XÝÜžH\È›ÙIÜÈ\ÚÝÜ[ˆ[ÛÈ\Ù\Ë‚ˆËËÂˆËËÈHZYÜ˜][ÛˆÜš]\È[ÈH
+™\ÚÝÜ	ÜÊˆÚXÚÜÚ[\™XÝÜžH[™Ù\ÜÚ[Û‚ˆËËÈš[HÛˆ\œÜÙNˆH[™È]š[˜[H™\Ý[Y\ÈHœ›Þ™[ˆ\›ˆ\ÈBˆËËÈ\ÚÝÜ	ÜÈÝÛˆÌLÈ™KY[žK[™]™XYÈÜÙHÛÈXÙ\Ëˆ[™[™ÈBˆËËÈ[XYÙH[ž]Ú\™H[ÙHÛÝ[XZÙHHY[[ÛˆHÛ›H™XY\ˆÙˆHÝ]BˆËËÈÚÜÙHÚÛHÚ[\È™Z[™È™\Ý[YY‚ˆ›ˆ\Ù]WÙ\Š	œÙ[ŠHOˆ™\Ý[	œÝŽœ]Ž”]
+LM‹Ýš[™ÊOˆÂˆÙ[‹œ]Ë›YÙ\—Ù‹œ\™[
+
+K›Ú×ÛÜ—Ù[ÙJÂˆ
+ˆLˆ•\È›ÙIÜÈYÙ\ˆ]\È›È\Y]H\™[‹×ÜÝš[™Ê
+Kˆ
+BˆJBˆB‚ˆËËÈÛÛ\Ù\ÈÌMÉÜÈ›ÙH\ØÜš\Üˆ[ÈÚ]ØYZ]H\ÚÜÈX›Ý]‚ˆËËÂˆËËÈZ[œ›ÛH\ØÜšX™WÛ›ÙX˜]\ˆ[ˆœ›ÛHHÙXÛÛ™›Ø™KÛÈBˆËËÈZYÜ˜][Ûˆ\ÈYZ]YYØZ[œÝ^XÝHH˜XÝÈ[ˆÜšYÚ[ˆ™XYœ›ÛBˆËËÈÑUÝŒKÜ™[[ÝKÛ›ÙXÚ[ˆ]ÚÜÙH\È\™Ù]‚ˆËËÂˆËËÈ
+Š’[œÝ[Y˜]\ˆ[ˆØYY[X™\˜][KŠŠˆÌLÉÜÈ[Ù[›Ý™\ÚY[ˆËËÈ\ÚÜÈÚ]H
+›™^›Ý[™š\ÛÝ[™XXÚ
+‹ÚXÚÛˆHXXÚ[™H[›š[™ÂˆËËÈH\›ˆ\ÈÚ]\ÈØYYˆH\™Ù]›ÙH\ÈYHžHYš[š][Ûˆ8 %]\ÂˆËËÈØYY›Ý[™È8 %ÛÈ\ÚÚ[™ÈH™\ÚY[˜ÞH]Y\Ý[Ûˆ\™HÛÝ[™Y\ÙH]™\žBˆËËÈZYÜ˜][ÛˆÈ]™\žHYH›ÙKˆÚ]H\™Ù]Ø[ˆÛ™\ÝH›ÛZ\ÙH\È]ˆËËÈH[Ù[\È™\Ù[[™Ú[ØYÈÚ]]Ý[™Y\Ù\È\ÈH[Ù[]ˆËËÈÙ\È›Ý]™H][‚ˆ›ˆZYÜ˜][Û—Ý\™Ù]
+ˆ	œÙ[‹ˆ\ØÜš\ÜŽˆ	›]WÛ[ÛšÙ^WÛXŽŽ››ÙWÜXÙ[Y[Ž“›ÙQ\ØÜš\Ü‹ˆ[—Ü™\Ù[ˆ›ÛÛˆ
+HOˆ
+™XÏÝš[™Ï‹™XÏÝš[™Ï‹›ÛÛ
+HÂˆ]]][Ù[ÈH\ØÜš\Ü‚ˆœ™\ÚY[Û[Ù[Âˆš]\Š
+Bˆ›X\
+[Ù[[Ù[›[Ù[ÚY˜ÛÛ™J
+JBˆ˜ÛÛXÝŽ™XÏÏŠ
+NÂˆ[Ù[ËœÛÜ
+
+NÂˆ[Ù[Ë™Y\
+
+NÂˆ]]][[Y\ÈH\ØÜš\Ü‚ˆœ™\ÚY[Û[Ù[Âˆš]\Š
+Bˆ›X\
+[Ù[[Ù[œ[[YK˜ÛÛ™J
+JBˆ˜ÛÛXÝŽ™XÏÏŠ
+NÂˆ[[Y\ËœÛÜ
+
+NÂˆ[[Y\Ë™Y\
+
+NÂˆ
+[Ù[Ë[[Y\Ë[—Ü™\Ù[
+BˆB‚ˆËËÈ[œÝÙ\œÈÛÝ[[ÝHZÙH\ÏÈˆœ›ÛHY]Y]H[Û™K™Y›Ü™H[žHž]\È[Ý™K‚ˆËËÂˆËËÈ[ˆÜ[Z\Ø][Ûˆ[™™]™\ˆH]]Üš]NˆZYÜ˜][Û—ØXØÙ\[œÈH™\žBˆËËÈØ[YHYZ]YØZ[œÝH™\žHØ[YHXY\‹ˆH\™Ù]]\ÝYBˆËËÈ™Y›YÚÛÝ[™H\Ý[™ÈH
+œÙ[™\‰ÜÊˆÛÜHÙˆ˜XÝÈX›Ý]]Ù[‹‚ˆ›ˆZYÜ˜][Û—Ü™Y›YÚ
+ˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]™\]Y\ÝˆZYÜ˜][Û”™Y›YÚ™\]Y\ÝHÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJBˆ›X\Ù\œŠ\œ›ÜŸ
+›Ü›X]J’[˜[YZYÜ˜][Ûˆ™Y›YÚˆÙ\œ›ÜŸHŠJJOÎÂˆYˆ™\]Y\Ýœ›ÝØÛÛÝ™\œÚ[ÛˆOH‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓˆÂˆ™]\›ˆ\œŠ
+•[œÝ\ÜY™[[ÝH›ÝØÛÛ™\œÚ[Ûˆ‹×ÜÝš[™Ê
+JJNÂˆBˆ]
+™\™XÝ\ØÜš\ÜŠHHÙ[‹˜YZ]ÛZYÜ˜][ÛŠ	œ™\]Y\ÝšXY\‹›Ý×Û\ÊOÎÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆ››ÙHŽˆ\ØÜš\Ü‹ˆ™\™XÝŽˆ™\™XÝˆJKˆÛÛYJ™\]Y\ÝšXY\‹œ[—ÚY
+Kˆ
+JBˆB‚ˆËËÈHÛ™HYZ\ÜÚ[ÛˆXÚ\Ú[Û‹[ˆY[XØ[HžH›ÝZYÜ˜][Ûˆ›Ý]\Ë‚ˆËËÂˆËËÈ™]\›œÈH\ØÜš\Üˆ[Û™ÜÚYHH™\™XÝ™XØ]\ÙHH™Y\Ø[\ÈÛ›BˆËËÈXÝ[Û˜X›H™^ÈH˜XÝÈ]Ø\ÈXYHYØZ[œÝ8 %\È›ÙHÙ\È›ÝˆËËÈ]™H][Ù[ˆ\È[œÝÙ\˜X›Kœ™Y\ÙYˆ\È›Ý‚ˆ›ˆYZ]ÛZYÜ˜][ÛŠˆ	œÙ[‹ˆXY\Žˆ	›]WÛ[ÛšÙ^WÛXŽŽ›ZYÜ˜][ÛŽŽ“ZYÜ˜][Û’XY\‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[ˆ
+ˆZYÜ˜][Û•™\™XÝˆ]WÛ[ÛšÙ^WÛXŽŽ››ÙWÜXÙ[Y[Ž“›ÙQ\ØÜš\Ü‹ˆ
+Kˆ
+LM‹Ýš[™ÊKˆˆÂˆ]\ØÜš\ÜˆHÙ[‹™\ØÜšX™WÛ›ÙJ›Ý×Û\ÊOÎÂˆ][—Ü™\Ù[HÙ[‚ˆœ[—ÛYÙ\Š
+OÂˆ›ØYÜ[Š	šXY\‹œ[—ÚY
+Bˆ›X\Ù\œŠ[\›˜[
+OÂˆš\×ÜÛÛYJ
+NÂˆ]
+[Ù[Ë[[Y\Ë[—Ü™\Ù[
+HHÙ[‹›ZYÜ˜][Û—Ý\™Ù]
+	™\ØÜš\Ü‹[—Ü™\Ù[
+NÂˆ]™\™XÝHYZ]
+ˆXY\‹ˆ	•\™Ù]›ÙHÂˆ›ÙWÚYˆ	™\ØÜš\Ü‹œ[›™\—ÚYˆ™\ÚY[Û[Ù[Îˆ	›[Ù[Ëˆ[[YWÚYÎˆ	œ[[Y\ËˆËÈ›È]™H\›Ý˜[Îˆ\È›ÙH\ÈÜ˜[YH[˜ÛÛZ[™È›ØÙ\ÜÂˆËÈ›Û™KÚXÚ\È^XÝHÚH[ˆ[XYÙHœ›Þ™[ˆÚ][ˆÝ]Ý[™[™ÂˆËÈÛ™H\È™Y\ÙY˜]\ˆ[ˆ™\Ý[YY\ÝH\›Z\ÜÚ[Ûˆ›Ø›ÙBˆËÈ\™HØ]™K‚ˆ]™WØ\›Ý˜[Îˆ	–×KˆËÈÌMÉÜÈ[K\YYÈH[Ý™NˆH
+›ÜšYÚ[ŠˆÝ]\ÈBˆËÈ™\ÚY[˜ÞH]™\]Z\™Y[™\È›ÙHÚXÚÜÈ]YØZ[œÝ]ÈÝÛ‚ˆËÈ˜]\ˆ[ˆ\Ý[™È]8 %™XØ]\ÙHH[HÛ›HHÙ[™\‚ˆËÈ[™›Ü˜Ù\È\È›Ý[™›Ü˜ÙY[™[ˆ[X\ÈØ[ˆÝ\Ú[[™È]BˆËÈY™™\™[ÜÝ‚ˆ™\ÚY[˜ÞNˆ	™\ØÜš\Ü‹œ™\ÚY[˜ÞKˆX^Ü^[ØYØž]\ÎˆPVÓRQÔUSÓ—ÔVSÐQÐ–UTËˆ[—Ü™\Ù[ˆKˆ
+NÂˆÚÊ
+™\™XÝ\ØÜš\ÜŠJBˆB‚ˆËËÈZÙ\ÈH[XYÙKÜˆ™Y\Ù\È]8 %[™ÛˆÝXØÙ\ÜÈX]™\È\È›ÙH[ˆBˆËËÈ^XÝÝ]H]È\ÚÝÜ[‰ÜÈÌLÈ™KY[žH™XYË‚ˆ›ˆZYÜ˜][Û—ØXØÙ\
+ˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]™\]Y\ÝˆZYÜ˜][ÛXØÙ\™\]Y\ÝHÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJBˆ›X\Ù\œŠ\œ›ÜŸ
+›Ü›X]J’[˜[YZYÜ˜][Ûˆ[XYÙNˆÙ\œ›ÜŸHŠJJOÎÂˆYˆ™\]Y\Ýœ›ÝØÛÛÝ™\œÚ[ÛˆOH‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓˆÂˆ™]\›ˆ\œŠ
+•[œÝ\ÜY™[[ÝH›ÝØÛÛ™\œÚ[Ûˆ‹×ÜÝš[™Ê
+JJNÂˆBˆ][XYÙHH™\]Y\Ýš[XYÙNÂˆËÈÝXÝ\˜[š\œÝØ\Xš[]HÙXÛÛ™ˆHX[›Ü›YY[XYÙH\ÈH˜YˆËÈ™\]Y\ÝÛˆ[žH›ÙH[™]\Ý›Ý™H™\ÜY\ÈH™Y\Ø[\È›ÙBˆËÈÛÝ[™H™XÛÛ™šYÝ\™YÝ]Ù‹‚ˆ[XYÙK˜[Y]J
+K›X\Ù\œŠ\œ›ÜŸ
+\œ›ÜŠJOÎÂˆËÈHØ[YHØ]HÌMÉÜÈXÙ[Y[›Ý]H\Y\Ë[™›Üˆ]È™X\ÛÛŽˆH[‚ˆËÈ]\Ý›Ý\œš]™HÚ[HHÜ\˜]Üˆ\ÈÝÜY\ÈXXÚ[™K‚ˆYˆY[[Û”ÝÜ™NŽ›Ü[Š	œÙ[‹œ]ÊBˆ›X\Ù\œŠ[\›˜[
+OÂˆšÚ[ÜÝÚ]Ú
+
+Bˆ›X\Ù\œŠ[\›˜[
+OÂˆÂˆ™]\›ˆ\œŠ
+K‘ÛØ˜[Ú[ÝÚ]Ú\È[™ØYÙY‹×ÜÝš[™Ê
+JJNÂˆBˆ]
+™\™XÝ\ØÜš\ÜŠHHÙ[‹˜YZ]ÛZYÜ˜][ÛŠ	š[XYÙKšXY\‹›Ý×Û\ÊOÎÂˆ]ZYÜ˜][Û•™\™XÝŽXØÙ\X›HÈ‹ˆHH	™\™XÝ[ÙHÂˆËÈK›ÝˆH[XYÙH\ÈÙ[Y›Ü›YY[™\È›ÙHÚ[\BˆËÈØ[››ÝØ]\ÙžH]ˆH›ØÚÙ\œÈØ^HÚ]ÛÝ[]™HÈÚ[™ÙK‚ˆ™]\›ˆÚÊ
+ˆKˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆ››ÙHŽˆ\ØÜš\Ü‹ˆ™\™XÝŽˆ™\™XÝˆJKˆÛÛYJ[XYÙKšXY\‹œ[—ÚY˜ÛÛ™J
+JKˆ
+JNÂˆNÂˆ]]]YÙ\ˆHÙ[‹œ[—ÛYÙ\Š
+OÎÂ‚ˆËÈH[ˆ›ÝÈÛÛY\Èœ›ÛHH
+›ÜšYÚ[‰ÜÊˆœ›Þ™[ˆÜXË[›[ÙYšYY[™]ˆËÈÛÙ\È[ˆ
+™š\œÝ
+‹ˆ]\ÈÚ]XZÙ\ÈHÛXÞH˜]™[ˆH[ÝÛ\ÝˆËÈ\È›ÙH[™›Ü˜Ù\È[™HYÙ]È]Ú\™Ù\È\™HHÛ™\ÈHÜšYÚ[‚ˆËÈXÛ\™Y[™YÜ™\ÜËœœØ™\ÛÛ™\È[HžH[ˆYYØZ[œÝ\È›ÙIÜÂˆËÈÝÛˆYÙ\ˆœ›ÛH\™HÛ‹ˆš\œÝ˜]\ˆ[ˆY\ˆH[™[™È™XØ]\ÙBˆËÈH›ØÙ\ÜÈ›ÝÈH[™[™ÈÜ™X]\È™Y™\™[˜Ù\È]8 %H›Ü™ZYÛˆÙ^KˆËÈÚXÚ\ÈHØÚ[XHØ^Z[™ÈHØ[YH[™Ë‚ˆËÂˆËÈH[™[™È][ˆ˜Z[ÈX]™\È[ˆ]™[[\ÜÈ]Y]YY›ÝËÚXÚ\ÂˆËÈ™XÛÝ™\˜X›NˆÝX›Z]Ü[˜\ÈÙ^YYžHHÜXÉÜÈY[\Ý[˜ÞHÙ^H[™ˆËÈ™]\›œÈH^\Ý[™È[ˆ˜]\ˆ[ˆ\œ›Üš[™ËÛÈHØ[YH[XYÙHØ[‚ˆËÈ™HÙ[YØZ[‹‚ˆYÙ\‹œÝX›Z]Ü[Š	š[XYÙKœÜXÊK›X\Ù\œŠ[\›˜[
+OÎÂˆ]\Ù]WÙ\ˆHÙ[‹˜\Ù]WÙ\Š
+OË×Ü]ØYŠ
+NÂˆ][™YH[™ÛZYÜ˜][ÛŠ	˜\Ù]WÙ\‹	œÙ[‹œ]Ë	š[XYÙK›Ý×Û\ÊBˆ›X\Ù\œŠ\œ›ÜŸ
+L\œ›ÜŠJOÎÂˆ]\œš]˜[H[‘]™[Ž“ZYÜ˜][Û\œš]™YÂˆÜšYÚ[—Û›ÙWÚYˆ[XYÙKšXY\‹›ÜšYÚ[—Û›ÙWÚY˜ÛÛ™J
+KˆÜšYÚ[—Û\ÝÜÙ\]Y[˜ÙNˆ[XYÙK›ÜšYÚ[—Û\ÝÜÙ\]Y[˜ÙKˆÜšYÚ[—Û\ÝÙ]™[Ú\Úˆ[XYÙK›ÜšYÚ[—Û\ÝÙ]™[Ú\Ú˜ÛÛ™J
+Kˆ^[ØYÜÚLMŽˆ[XYÙKšXY\‹œ^[ØYÜÚLM‹˜ÛÛ™J
+KˆNÂˆ][™[ÜHH[‘]™[[™[ÜHÂˆØÚ[XWÝ™\œÚ[ÛŽˆ•S—Ô“ÕÐÓÓÔÐÒSPWÕ‘T”ÒSÓ‹ˆ]™[ÚYˆ›Ü›X]J™][ZYÜ˜][Û‹^ßH‹	š[XYÙKšXY\‹œ^[ØYÜÚLM–Ë‹ŒJKˆ[—ÚYˆ[XYÙKšXY\‹œ[—ÚY˜ÛÛ™J
+KˆÙ\]Y[˜ÙNˆKˆØØÝ\œ™YØ]Û\Îˆ›Ý×Û\ËˆXÝÜ—ÚYˆ›Û™Kˆ[Z]\ŽˆÛY[Y[]HÂˆÛY[ÚYˆ\ØÜš\Ü‹œ[›™\—ÚY˜ÛÛ™J
+Kˆ[œÝ[˜ÙWÚYˆ\ØÜš\Ü‹œ[›™\—ÚY˜ÛÛ™J
+KˆÚ[™ˆÛY[Ú[™Ž”™[[ÝT[›™\‹ˆ™\œÚ[ÛŽˆ[ˆJÐT‘Ó×ÔÑ×Õ‘T”ÒSÓˆŠK×ÜÝš[™Ê
+KˆKˆ]™[ˆ\œš]˜[ˆNÂˆYÙ\‹˜\[™Ù]™[
+	™[™[ÜJK›X\Ù\œŠ[\›˜[
+OÎÂˆ]\œš]˜[Ù]™[Ú\ÚHYÙ\‚ˆ›ZYÜ˜][Û—Ø\œš]˜[
+	š[XYÙKšXY\‹œ[—ÚY
+Bˆ›X\Ù\œŠ[\›˜[
+OÂˆ›X\
+\œš]˜[\œš]˜[™]™[Ú\Ú
+Bˆ›Ú×ÛÜ—Ù[ÙJÂˆ
+ˆLˆ•H\œš]˜[]™[Y›ÝÚZ[ˆÛˆ\È›ÙH‹×ÜÝš[™Ê
+Kˆ
+BˆJOÎÂ‚ˆÚÊ
+ˆŒKˆÙ\™WÚœÛÛŽŽ×Ý˜[YJZYÜ˜][Û”™XÙZ\Âˆ›ÝØÛÛÝ™\œÚ[ÛŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆ›ÙWÚYˆ\ØÜš\Ü‹œ[›™\—ÚYˆ[—ÚYˆ[XYÙKšXY\‹œ[—ÚY˜ÛÛ™J
+Kˆ›ØÙ\Ü×ÚYˆ[™Yœ›ØÙ\Ü×ÚYˆÛÜšÜÜXÙWÜ›ÛÝˆ[™YÛÜšÜÜXÙWÜ›ÛÝ×ÜÝš[™×ÛÜÜÞJ
+K×ÜÝš[™Ê
+Kˆ\œš]˜[Ù]™[Ú\ÚˆØ]™X]Îˆ]WÛ[ÛšÙ^WÛXŽŽ›ZYÜ˜][ÛŽŽ˜Ø]™X]Ê
+KˆJBˆ›X\Ù\œŠ[\›˜[
+OËˆÛÛYJ[XYÙKšXY\‹œ[—ÚY
+Kˆ
+JBˆB‚ˆËÈKKHÝŒKÜ™[[ÝKÛ[Øš[KÊ˜[™\œÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKB‚ˆ›ˆØÚÙYÜÝÜ™J	œÙ[ŠHOˆ™\Ý[ÝŽœÞ[˜ÎŽ“]]^ÝX\™	×Ë™[[ÝTÝÜ™O‹
+LM‹Ýš[™ÊOˆÂˆÙ[‹œÝÜ™Bˆ›ØÚÊ
+Bˆ›X\Ù\œŠß
+L”™[[ÝHÝ]HØÚÈØ\ÈÚ\ÛÛ™Y‹×ÜÝš[™Ê
+JJBˆB‚ˆ›ˆ[Øš[WÜÙ\ÜÚ[ÛœÊ	œÙ[ŠHOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]Ù\ÜÚ[ÛœÈHÙ[‚ˆ›ØÚÙYÜÝÜ™J
+OÂˆ›[Øš[WÜÙ\ÜÚ[Û—ÜÝ[[X\šY\Ê
+Bˆ›X\Ù\œŠ[\›˜[
+OÎÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆœÙ\ÜÚ[ÛœÈŽˆÙ\ÜÚ[ÛœÂˆš]\Š
+Bˆ›X\
+Ù\ÜÚ[ÛŸÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆšYŽˆÙ\ÜÚ[Û‹œÙ\ÜÚ[Û—ÚYˆ]HŽˆ›Ý[™YÝ^
+	œÙ\ÜÚ[Û‹]KLŒ
+Kˆ›[Ù[ÛX™[Žˆ“›ÙH[Øš[KXÚ]™XÚ\H‹ˆ\]YØ]Û\ÈŽˆÙ\ÜÚ[Û‹\]YØ]Û\Ëˆ[œ™XYØÛÝ[ŽˆˆJJBˆ˜ÛÛXÝŽ™XÏÏŠ
+KˆJKˆ›Û™Kˆ
+JBˆB‚ˆ›ˆ[Øš[WÛY\ÜØYÙ\×ÙÙ]
+ˆ	œÙ[‹ˆÙ\ÜÚ[Û—ÚYˆ	œÝ‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆÙ[‹›X]\šX[^™WÛ[Øš[WÜ™\Y\ÊÙ\ÜÚ[Û—ÚY›Ý×Û\ÊOÎÂˆ]Y\ÜØYÙ\ÈHÙ[‚ˆ›ØÚÙYÜÝÜ™J
+OÂˆ›[Øš[WÛY\ÜØYÙ\ÊÙ\ÜÚ[Û—ÚY—Ì
+Bˆ›X\Ù\œŠ[\›˜[
+OÎÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆ›Y\ÜØYÙ\ÈŽˆY\ÜØYÙ\Âˆš]\Š
+Bˆ›X\
+Y\ÜØYÙ_Ù\™WÚœÛÛŽŽšœÛÛˆJÂˆšYŽˆY\ÜØYÙK›Y\ÜØYÙWÚYˆœ›ÛHŽˆY\ÜØYÙKœ›ÛKˆ^ŽˆY\ÜØYÙK^ˆ˜Ü™X]YØ]Û\ÈŽˆY\ÜØYÙK˜Ü™X]YØ]Û\Ëˆ\Ú×ÜÝ]HŽˆY\ÜØYÙK\Ú×ÜÝ]KˆJJBˆ˜ÛÛXÝŽ™XÏÏŠ
+KˆJKˆÛÛYJÙ\ÜÚ[Û—ÚY×ÜÝš[™Ê
+JKˆ
+JBˆB‚ˆËËÈ\›œÈ\›Z[˜[Ú][œÈ[Èš\ÚX›H™\Y\ËˆØ[Y^š[Hœ›ÛHBˆËËÈY\ÜØYÙHÑU
+HÛY[[™XYHÛÊKÛÈ›ÈY[[Û‹[ÛÜÛÚÈ\ÂˆËËÈ™YYYˆ›Üˆ]™\žHÝ[X]Y]YY\Ù\ˆY\ÜØYÙK™\ÛÛ™H]È\˜X›BˆËËÈ[ŽÈÛ˜ÙH][ˆ\È\›Z[˜[\[™H\ÜÚ\Ý[^
+ÜˆBˆËËÈÞ\Ý[K\›ÛH˜Z[\™H›ÝXÙJH[™Ù]HH\Ù\ˆ›ÝÉÜÈ\Ú×ÜÝ]X‚ˆËËÈ›Ý[œÙ\È\™HY[\Ý[
+ÓˆÓÓ‘“PÕÈ“ÕS‘Ø
+ÈHÝ]BˆËËÈš[\ŠKÛÈÛÛ˜Ý\œ™[ÛÈØ[››ÝÝX›KX\[™‚ˆ›ˆX]\šX[^™WÛ[Øš[WÜ™\Y\Êˆ	œÙ[‹ˆÙ\ÜÚ[Û—ÚYˆ	œÝ‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+
+K
+LM‹Ýš[™ÊOˆÂˆ]ÛÛYJ]Y]YJHHÙ[‹›[Øš[WØÚ]˜\×Ü™YŠ
+H[ÙHÂˆ™]\›ˆÚÊ
+
+JNÂˆNÂˆ][™[™Îˆ™XÏ[Øš[SY\ÜØYÙT™XÛÜ™ˆHÂˆ]ÝÜ™HHÙ[‹›ØÚÙYÜÝÜ™J
+OÎÂˆÝÜ™Bˆ›[Øš[WÛY\ÜØYÙ\ÊÙ\ÜÚ[Û—ÚY—Ì
+Bˆ›X\Ù\œŠ[\›˜[
+OÂˆš[×Ú]\Š
+Bˆ™š[\ŠY\ÜØYÙ_Y\ÜØYÙKœ›ÛHOH\Ù\ˆˆ	‰ˆY\ÜØYÙK\Ú×ÜÝ]HOHœ]Y]YYŠBˆ˜ÛÛXÝ
+
+BˆNÂˆYˆ[™[™Ëš\×Ù[\J
+HÂˆ™]\›ˆÚÊ
+
+JNÂˆBˆ]YÙ\ˆHÙ[‹œ[—ÛYÙ\Š
+OÎÂˆ›ÜˆY\ÜØYÙH[ˆ[™[™ÈÂˆ]ÛÛYJ[—ÚY
+HH]Y]YBˆ˜Ú]Ü[—ÚY
+Ù\ÜÚ[Û—ÚY	›Y\ÜØYÙK›Y\ÜØYÙWÚY
+Bˆ›X\Ù\œŠ[\›˜[
+OÂˆ[ÙHÂˆÛÛ[YNÂˆNÂˆ]]™[ÈHX]ÚYÙ\‹›ØYÙ]™[Ê	œ[—ÚYWÌ
+HÂˆÚÊ]™[ÊHOˆ]™[Ëˆ\œŠÊHOˆÛÛ[YKËÈ[ˆ›Ý™XÛÜ™YY]8 %žHYØZ[ˆ™^Û‚ˆNÂˆ]]]\ÜÚ\Ý[Ý^HÝš[™ÎŽ›™]Ê
+NÂˆ]]]ÛÛ\]YÜÝ[[X\žNˆÜ[ÛÝš[™ÏˆH›Û™NÂˆ]]]˜Z[YˆÜ[ÛÝš[™ÏˆH›Û™NÂˆ]]]Ø[˜Ù[YH˜[ÙNÂˆ›Üˆ[™[ÜH[ˆ	™]™[ÈÂˆX]Ú	™[™[ÜK™]™[Âˆ[‘]™[Ž“[Ù[[HÈÚ[›™[^‹ˆHOˆÂˆYˆX]Ú\ÈJÚ[›™[Ý]]Ú[›™[Ž\ÜÚ\Ý[
+HÂˆ\ÜÚ\Ý[Ý^œ\ÚÜÝŠ^
+NÂˆBˆBˆ[‘]™[ŽÛÛ\]YÈÝ[[X\žK‹ˆHOˆÂˆÛÛ\]YÜÝ[[X\žHHÝ[[X\žK˜ÛÛ™J
+NÂˆBˆ[‘]™[Ž‘˜Z[YÈY\ÜØYÙK‹ˆHOˆ˜Z[YHÛÛYJY\ÜØYÙK˜ÛÛ™J
+JKˆ[‘]™[ŽØ[˜Ù[YÈ‹ˆHOˆØ[˜Ù[YHYKˆÈOˆßBˆBˆBˆ]\›Z[˜[HÛÛ\]YÜÝ[[X\žKš\×ÜÛÛYJ
+Bˆ˜Z[Yš\×ÜÛÛYJ
+BˆØ[˜Ù[Yˆ]™[Âˆš]\Š
+Bˆ˜[žJ[™[Ü_X]Ú\ÈJ[™[ÜK™]™[[‘]™[ŽÛÛ\]YÈ‹ˆJJNÂˆYˆ]\›Z[˜[ÂˆÛÛ[YNÂˆBˆ]
+›ÛK^š[˜[ÜÝ]JHHYˆ]ÛÛYJ™X\ÛÛŠHH˜Z[YÂˆ
+ˆœÞ\Ý[H‹ˆ›Ü›X]Jˆ•H›ÙHÛÝ[›Ý[œÝÙ\ˆ\ÈY\ÜØYÙNˆßH‹ˆ›Ý[™YÝ^
+	œ™X\ÛÛ‹—Ì
+Bˆ
+Kˆ™˜Z[Y‹ˆ
+BˆH[ÙHYˆØ[˜Ù[Y	‰ˆ\ÜÚ\Ý[Ý^š[J
+Kš\×Ù[\J
+HÂˆ
+ˆœÞ\Ý[H‹ˆ•\ÈY\ÜØYÙIÜÈ[ˆØ\ÈØ[˜Ù[YÛˆH›ÙKˆ‹×ÜÝš[™Ê
+Kˆ™˜Z[Y‹ˆ
+BˆH[ÙHÂˆ]^HYˆ\ÜÚ\Ý[Ý^š[J
+Kš\×Ù[\J
+HÂˆÛÛ\]YÜÝ[[X\žBˆ[Ü˜\ÛÜ—Ù[ÙJŠH[ˆÛÛ\]YÚ]Ý][žHÝ]]ŠH‹×ÜÝš[™Ê
+JBˆH[ÙHÂˆ\ÜÚ\Ý[Ý^ˆNÂˆ
+˜\ÜÚ\Ý[‹^˜XØÙ\YŠBˆNÂˆ]]]ÝÜ™HHÙ[‹›ØÚÙYÜÝÜ™J
+OÎÂˆÝÜ™Bˆš[œÙ\Û[Øš[WÛY\ÜØYÙJ	“[Øš[SY\ÜØYÙT™XÛÜ™ÂˆY\ÜØYÙWÚYˆ›Ü›X]JžßK\™\H‹Y\ÜØYÙK›Y\ÜØYÙWÚY
+KˆÙ\ÜÚ[Û—ÚYˆY\ÜØYÙKœÙ\ÜÚ[Û—ÚY˜ÛÛ™J
+Kˆ]šXÙWÚYˆY\ÜØYÙK™]šXÙWÚY˜ÛÛ™J
+Kˆ›ÛNˆ›ÛK×ÜÝš[™Ê
+Kˆ^ˆ™\]Y\ÝÜÚLMŽˆY\ÜØYÙKœ™\]Y\ÝÜÚLM‹˜ÛÛ™J
+Kˆ\Ú×ÜÝ]Nˆš[˜[ÜÝ]K×ÜÝš[™Ê
+KˆÜ™X]YØ]Û\Îˆ›Ý×Û\ËˆJBˆ›X\Ù\œŠ[\›˜[
+OÎÂˆÝÜ™BˆœÙ]Û[Øš[WÛY\ÜØYÙWÜÝ]J	›Y\ÜØYÙK›Y\ÜØYÙWÚYš[˜[ÜÝ]K›Ý×Û\ÊBˆ›X\Ù\œŠ[\›˜[
+OÎÂˆBˆÚÊ
+
+JBˆB‚ˆ›ˆ[Øš[WÛY\ÜØYÙWÜÜÝ
+ˆ	œÙ[‹ˆÙ\ÜÚ[Û—ÚYˆ	œÝ‹ˆ›ÙNˆ	–ÝNKˆ]šXÙWÚYˆ	œÝ‹ˆ™\]Y\ÝÜÚLMŽˆ	œÝ‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]ÛÛYJ]Y]YJHHÙ[‹›[Øš[WØÚ]˜\×Ü™YŠ
+H[ÙHÂˆ™]\›ˆ\œŠ
+ˆLKˆ•\È›ÙHZ[Ù\È›Ý^ÜÙH[Øš[HÚ]^XÝ][Ûˆ‹×ÜÝš[™Ê
+Kˆ
+JNÂˆNÂˆ]\œÙYˆÙ\™WÚœÛÛŽŽ•˜[YHHÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJBˆ›X\Ù\œŠ\œ›ÜŸ
+›Ü›X]J’[˜[Y[Øš[HY\ÜØYÙH›ÙNˆÙ\œ›ÜŸHŠJJOÎÂˆ]^H\œÙYˆ™Ù]
+^ŠBˆ˜[™Ý[Š˜[Y_˜[YK˜\×ÜÝŠ
+JBˆ›X\
+ÝŽŽš[JBˆ™š[\Š˜[Y_]˜[YKš\×Ù[\J
+JBˆ›Ú×ÛÜŠ
+“[Øš[HY\ÜØYÙH™\]Z\™\È›Û‹Y[\H	Ý^	È‹×ÜÝš[™Ê
+JJOÎÂˆYˆÙ\ÜÚ[Û—ÚYš\×Ù[\J
+BˆÙ\ÜÚ[Û—ÚY›[Š
+HˆLŽˆ\Ù\ÜÚ[Û—ÚYˆ˜Ú\œÊ
+Bˆ˜[
+ßËš\×Ø\ØÚZWØ[[[Y\šXÊ
+HÈOH	ËIÈÈOH	×ÉÊBˆÂˆ™]\›ˆ\œŠ
+ˆˆ“[Øš[HÙ\ÜÚ[ÛˆY]\Ý™HKLLŽT“\ØY™HÚ\˜XÝ\œÈ‹×ÜÝš[™Ê
+Kˆ
+JNÂˆBˆËÈHY\ÜØYÙHYÝX›\È\ÈHY[\Ý[]Y]YHÙ^Nˆ\š]™Yœ›ÛBˆËÈHÚYÛ™Y™\]Y\ÝYÙ\ÝÛÈ[ˆ][X\Ý[Û˜ÙH™]žHÙˆHÐSQBˆËÈÚYÛ™Y™\]Y\ÝX\ÈÛÈHØ[YHY\ÜØYÙH[™›Ø‹‚ˆ]Y\ÜØYÙWÚYH›Ü›X]J›[K^ßH‹	œ™\]Y\ÝÜÚLM–Ë‹ŒÌ—JNÂˆÂˆ]]]ÝÜ™HHÙ[‹›ØÚÙYÜÝÜ™J
+OÎÂˆÝÜ™Bˆš[œÙ\Û[Øš[WÛY\ÜØYÙJ	“[Øš[SY\ÜØYÙT™XÛÜ™ÂˆY\ÜØYÙWÚYˆY\ÜØYÙWÚY˜ÛÛ™J
+KˆÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û—ÚY×ÜÝš[™Ê
+Kˆ]šXÙWÚYˆ]šXÙWÚY×ÜÝš[™Ê
+Kˆ›ÛNˆ\Ù\ˆ‹×ÜÝš[™Ê
+Kˆ^ˆ^×ÜÝš[™Ê
+Kˆ™\]Y\ÝÜÚLMŽˆ™\]Y\ÝÜÚLM‹×ÜÝš[™Ê
+Kˆ\Ú×ÜÝ]Nˆœ]Y]YY‹×ÜÝš[™Ê
+KˆÜ™X]YØ]Û\Îˆ›Ý×Û\ËˆJBˆ›X\Ù\œŠ[\›˜[
+OÎÂˆBˆX]Ú]Y]YKœ]Y]YWØÚ]
+Ù\ÜÚ[Û—ÚY	›Y\ÜØYÙWÚY^
+HÂˆÚÊÜ[—ÚY
+HOˆßBˆ\œŠ\œ›ÜŠHOˆÂˆ]]]ÝÜ™HHÙ[‹›ØÚÙYÜÝÜ™J
+OÎÂˆ]ÈHÝÜ™KœÙ]Û[Øš[WÛY\ÜØYÙWÜÝ]J	›Y\ÜØYÙWÚY™˜Z[Y‹›Ý×Û\ÊNÂˆ™]\›ˆ\œŠ
+LË›Ü›X]J“[Øš[HÚ]ÛÝ[›Ý™H]Y]YYˆÙ\œ›ÜŸHŠJJNÂˆBˆBˆÚÊ
+ˆŒKˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆ›Y\ÜØYÙHŽˆÈšYŽˆY\ÜØYÙWÚY˜Ü™X]YØ]Û\ÈŽˆ›Ý×Û\ÈKˆJKˆÛÛYJÙ\ÜÚ[Û—ÚY×ÜÝš[™Ê
+JKˆ
+JBˆB‚ˆ›ˆ[Øš[WÝÛÜšÙ›ÝÜÊ	œÙ[ŠHOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]\Ù]HHÙ[‚ˆœ]Âˆœ›ÛÝˆœ\™[
+
+Bˆ›Ú×ÛÜ—Ù[ÙJ[\›˜[
+‘Y[[Ûˆ›ÛÝ\È›È\Y]H\™[ŠJOÂˆ×Ü]ØYŠ
+NÂˆ]Ù\šXÙHH]WÛ[ÛšÙ^WÛXŽŽ›MÜ[[YNŽœ›ÙXÝ[Û—ÝÛÜšÙ›Ý×ÜÙ\šXÙJ	˜\Ù]JBˆ›X\Ù\œŠ[\›˜[
+OÎÂˆ]Yš[š][ÛœÈHÙ\šXÙK›\Ý
+
+K›X\Ù\œŠ[\›˜[
+OÎÂˆ]\ÝÜ[œÈHÙ[‚ˆ›ØÚÙYÜÝÜ™J
+OÂˆ›[Øš[WÝÛÜšÙ›Ý×Û\ÝÜ[œÊ
+Bˆ›X\Ù\œŠ[\›˜[
+OÎÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆÛÜšÙ›ÝÜÈŽˆYš[š][ÛœÂˆš]\Š
+Bˆ›X\
+Yš[š][ÛŸÂˆ]]][žHHÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆšYŽˆYš[š][Û‹ÛÜšÙ›Ý×ÚYˆ›˜[YHŽˆYš[š][Û‹›˜[YKˆœÝ[[X\žHŽˆ›Ü›X]JžßH0­ÈßH›Ù\È‹Yš[š][Û‹ÛÜšÙ›Ý×Ý™\œÚ[Û‹Yš[š][Û‹››Ù\Ë›[Š
+JKˆJNÂˆYˆ]ÛÛYJ\Ý
+HH\ÝÜ[œË™Ù]
+	™Yš[š][Û‹ÛÜšÙ›Ý×ÚY
+HÂˆ[žVÈ›\ÝÜ[—Ø]Û\È—HHÙ\™WÚœÛÛŽŽšœÛÛˆJ\Ý
+NÂˆBˆ[žBˆJBˆ˜ÛÛXÝŽ™XÏÏŠ
+KˆJKˆ›Û™Kˆ
+JBˆB‚ˆ›ˆ[Øš[WÝÛÜšÙ›Ý×Û][˜Ú
+ˆ	œÙ[‹ˆÛÜšÙ›Ý×ÚYˆ	œÝ‹ˆ]šXÙWÚYˆ	œÝ‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]ÝÜ™HHY[[Û”ÝÜ™NŽ›Ü[Š	œÙ[‹œ]ÊK›X\Ù\œŠ[\›˜[
+OÎÂˆYˆÝÜ™KšÚ[ÜÝÚ]Ú
+
+K›X\Ù\œŠ[\›˜[
+OÈÂˆ™]\›ˆ\œŠ
+K‘ÛØ˜[Ú[ÝÚ]Ú\È[™ØYÙY‹×ÜÝš[™Ê
+JJNÂˆBˆ›Ü
+ÝÜ™JNÂˆ]\Ù]HHÙ[‚ˆœ]Âˆœ›ÛÝˆœ\™[
+
+Bˆ›Ú×ÛÜ—Ù[ÙJ[\›˜[
+‘Y[[Ûˆ›ÛÝ\È›È\Y]H\™[ŠJOÂˆ×Ü]ØYŠ
+NÂˆ]Ù\šXÙHH]WÛ[ÛšÙ^WÛXŽŽ›MÜ[[YNŽœ›ÙXÝ[Û—ÝÛÜšÙ›Ý×ÜÙ\šXÙJ	˜\Ù]JBˆ›X\Ù\œŠ[\›˜[
+OÎÂˆ]Yš[š][ÛˆHÙ\šXÙBˆ›ØY
+ÛÜšÙ›Ý×ÚY
+Bˆ›X\Ù\œŠ\œ›ÜŸ
+›Ü›X]J•ÛÜšÙ›ÝÈ\È›Ý]˜Z[X›NˆÙ\œ›ÜŸHŠJJOÎÂˆ]\ˆHÙ\šXÙBˆ˜[Y]J	™Yš[š][ÛŠBˆ›X\Ù\œŠ\œ›ÜŸ
+K›Ü›X]J•ÛÜšÙ›ÝÈ›ÈÛ™Ù\ˆ˜[Y]\ÎˆÙ\œ›ÜŸHŠJJOÎÂˆËÈH™\^HÙˆHØ[YHÒQÓ‘Q™\]Y\Ý™]™\ˆ™XXÚ\È\ÈÛÙH8 %BˆËÈÛÛ[X[™™\Ù\˜][Ûˆ[ˆ[™X™]\›œÈHØXÚY™\ÜÛœÙH8 %ÛÂˆËÈ\ÈYÛ›H™YYÈÈ™H[š\]YH\ˆXØÙ\Y][˜Ú‚ˆ][—ÚYH›Ü›X]Jˆ›M[[Øš[K^ßH‹ˆ	œÚLM—Ú^
+›Ü›X]JžÙ]šXÙWÚYNžÝÛÜšÙ›Ý×ÚYNžÛ›Ý×Û\ßHŠK˜\×Øž]\Ê
+JVË‹ŒÌ—Bˆ
+NÂˆ]\ÝÜžHH]WÛ[ÛšÙ^WÛXŽŽ›MÜ[[YNŽœ[—ÙY[[Û—ÝÛÜšÙ›Ý×Ù[]™\žJˆ	˜\Ù]KˆÛÜšÙ›Ý×ÚYˆ	š\‹™Yš[š][Û—ÜÚLM‹ˆ	œ[—ÚYˆ]WÛ[ÛšÙ^WÛXŽŽÛÜšÙ›Ý×ØÛÜ™NŽ•ÛÜšÙ›ÝÕšYÙÙ\ŽŽ“X[X[ˆÙ\™WÚœÛÛŽŽšœÛÛˆJßJKˆ
+Bˆ›X\Ù\œŠ\œ›ÜŸ
+K›Ü›X]J•ÛÜšÙ›ÝÈ][˜Ú˜Z[YˆÙ\œ›ÜŸHŠJJOÎÂˆÙ[‹›ØÚÙYÜÝÜ™J
+OÂˆš[œÙ\Û[Øš[WÝÛÜšÙ›Ý×Ü[Š	“[Øš[UÛÜšÙ›ÝÔ[”™XÛÜ™Âˆ[—ÚYˆ\ÝÜžKœ[—ÚY˜ÛÛ™J
+KˆÛÜšÙ›Ý×ÚYˆÛÜšÙ›Ý×ÚY×ÜÝš[™Ê
+Kˆ]šXÙWÚYˆ]šXÙWÚY×ÜÝš[™Ê
+KˆÜ™X]YØ]Û\Îˆ›Ý×Û\ËˆJBˆ›X\Ù\œŠ[\›˜[
+OÎÂˆÚÊ
+ˆŒKˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆœ[ˆŽˆÂˆœ[—ÚYŽˆ\ÝÜžKœ[—ÚYˆœÝ]\ÈŽˆ›Ü›X]JžÎßH‹\ÝÜžKœÝ]\ÊK×Ø\ØÚZWÛÝÙ\˜Ø\ÙJ
+KˆšÚ[™ŽˆÛÜšÙ›ÝÈ‹ˆ˜Ü™X]YØ]Û\ÈŽˆ›Ý×Û\Ëˆ\]YØ]Û\ÈŽˆ›Ý×Û\Ëˆœ[™[™×Ø\›Ý˜[ØÛÝ[ŽˆˆKˆJKˆÛÛYJÛÜšÙ›Ý×ÚY×ÜÝš[™Ê
+JKˆ
+JBˆB‚ˆ›ˆ[Øš[WØØ\\™WÜÜÝ
+ˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ]šXÙNˆ	‘]šXÙT™XÛÜ™ˆ™\]Y\ÝÜÚLMŽˆ	œÝ‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]\œÙYˆÙ\™WÚœÛÛŽŽ•˜[YHHÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJBˆ›X\Ù\œŠ\œ›ÜŸ
+›Ü›X]J’[˜[Y[Øš[HØ\\™H›ÙNˆÙ\œ›ÜŸHŠJJOÎÂˆ]šY[H˜[YNˆ	œÝŸ\œÙY™Ù]
+˜[YJK˜[™Ý[Š˜[Y_˜[YK˜\×ÜÝŠ
+JNÂˆ]Ø\\™WÚYHšY[
+˜Ø\\™WÚYŠBˆ™š[\Š˜[Y_Âˆ]˜[YKš\×Ù[\J
+Bˆ	‰ˆ˜[YK›[Š
+HHLŽˆ	‰ˆ˜[YBˆ˜Ú\œÊ
+Bˆ˜[
+ßËš\×Ø\ØÚZWØ[[[Y\šXÊ
+HÈOH	ËIÈÈOH	×ÉÊBˆJBˆ›Ú×ÛÜŠ
+Ø\\™H™\]Z\™\ÈHT“\ØY™H	ØØ\\™WÚY	È‹×ÜÝš[™Ê
+JJOÎÂˆ]Ú[™HšY[
+šÚ[™ŠBˆ™š[\Š˜[Y_X]Ú\ÈJ
+˜[YK^ˆš[XYÙHˆ™š[Hˆ›ÚXÙHŠJBˆ›Ú×ÛÜŠ
+ˆˆØ\\™H	ÚÚ[™	È]\Ý™H^[XYÙKš[KÜˆ›ÚXÙH‹×ÜÝš[™Ê
+Kˆ
+JOÎÂˆ]]HHšY[
+]HŠBˆ›X\
+ÝŽŽš[JBˆ™š[\Š˜[Y_]˜[YKš\×Ù[\J
+JBˆ›Ú×ÛÜŠ
+Ø\\™H™\]Z\™\ÈH›Û‹Y[\H	Ý]IÈ‹×ÜÝš[™Ê
+JJOÎÂˆ]^HšY[
+^ŠK›X\
+ÝŽŽ×ÜÝš[™ÊNÂˆ]XÛ\™YÜÚHHšY[
+˜ÛÛ[ÜÚLMˆŠK›X\
+ÝŽŽ×ÜÝš[™ÊNÂˆ]YYXWÝ\HHšY[
+›Z[YWÝ\HŠK›X\
+ÝŽŽ×ÜÝš[™ÊNÂˆ]XÛ\™YÜÚ^™HH\œÙY™Ù]
+œÚ^™WØž]\ÈŠK˜[™Ý[Š˜[Y_˜[YK˜\×ÝM
+
+JNÂ‚ˆ]]]ÝÜ™YÜÚ^™NˆÜ[ÛMˆH›Û™NÂˆYˆ]ÛÛYJÛÛ[
+HHšY[
+˜ÛÛ[Ø˜\ÙMŠHÂˆ]ž]\ÈHÕS‘T‘ˆ™XÛÙJÛÛ[
+Bˆ›X\Ù\œŠß
+Ø\\™HÛÛ[\È›Ý˜[Y˜\ÙM‹×ÜÝš[™Ê
+JJOÎÂˆYˆž]\Ë›[Š
+H\ÈMˆ]šXÙKœØÛÜ\Ë›X^Ø\Y˜XÝØž]\ÈÂˆ™]\›ˆ\œŠ
+ˆLËˆØ\\™H^ÙYYÈ\È]šXÙHÜ˜[	ÜÈ\Y˜XÝYÙ]‹×ÜÝš[™Ê
+Kˆ
+JNÂˆBˆ]YÙ\ÝHÚLM—Ú^
+	˜ž]\ÊNÂˆX]Ú	™XÛ\™YÜÚHÂˆÛÛYJXÛ\™Y
+HYˆXÛ\™Y™\WÚYÛ›Ü™WØ\ØÚZWØØ\ÙJ	™YÙ\Ý
+HOˆßBˆÈOˆÂˆ™]\›ˆ\œŠ
+ˆˆØ\\™HÛÛ[ÜÚLMˆÙ\È›ÝX]ÚH\ØYYž]\È‹×ÜÝš[™Ê
+Kˆ
+JBˆBˆBˆYˆ]ÛÛYJÚ^™JHHXÛ\™YÜÚ^™HÂˆYˆÚ^™HOHž]\Ë›[Š
+H\ÈMÂˆ™]\›ˆ\œŠ
+ˆˆØ\\™HÚ^™WØž]\ÈÙ\È›ÝX]ÚH\ØYYž]\È‹×ÜÝš[™Ê
+Kˆ
+JNÂˆBˆBˆ]Ø\\™\×Ù\ˆHÙ[‹œ]Ëœ›ÛÝš›Ú[Š›[Øš[KXØ\\™\ÈŠNÂˆÝŽ™œÎŽ˜Ü™X]WÙ\—Ø[
+	˜Ø\\™\×Ù\ŠK›X\Ù\œŠ\œ›ÜŸÂˆ[\›˜[
+›Ü›X]JÛÝ[›ÝÜ™X]HØ\\™H\™XÝÜžNˆÙ\œ›ÜŸHŠJBˆJOÎÂˆÝŽ™œÎŽÜš]JØ\\™\×Ù\‹š›Ú[ŠØ\\™WÚY
+K	˜ž]\ÊBˆ›X\Ù\œŠ\œ›ÜŸ[\›˜[
+›Ü›X]JÛÝ[›Ý\œÚ\ÝØ\\™H^[ØYˆÙ\œ›ÜŸHŠJJOÎÂˆÝÜ™YÜÚ^™HHÛÛYJž]\Ë›[Š
+H\ÈM
+NÂˆH[ÙHYˆ^š\×Û›Û™J
+HÂˆ™]\›ˆ\œŠ
+ˆˆØ\\™H™YYÈZ]\ˆ	Ý^	ÈÜˆ	ØÛÛ[Ø˜\ÙM	È‹×ÜÝš[™Ê
+Kˆ
+JNÂˆB‚ˆÙ[‹›ØÚÙYÜÝÜ™J
+OÂˆš[œÙ\Û[Øš[WØØ\\™J	“[Øš[PØ\\™T™XÛÜ™ÂˆØ\\™WÚYˆØ\\™WÚY×ÜÝš[™Ê
+Kˆ]šXÙWÚYˆ]šXÙK™]šXÙWÚY˜ÛÛ™J
+KˆÚ[™ˆÚ[™×ÜÝš[™Ê
+Kˆ]Nˆ]K×ÜÝš[™Ê
+Kˆ^ˆÛÛ[ÜÚLMŽˆXÛ\™YÜÚKˆÚ^™WØž]\ÎˆÝÜ™YÜÚ^™K›ÜŠXÛ\™YÜÚ^™JKˆYYXWÝ\Kˆ™\]Y\ÝÜÚLMŽˆ™\]Y\ÝÜÚLM‹×ÜÝš[™Ê
+KˆÜ™X]YØ]Û\Îˆ›Ý×Û\ËˆJBˆ›X\Ù\œŠ[\›˜[
+OÎÂˆÚÊ
+ˆŒKˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆ˜Ø\\™WÚYŽˆØ\\™WÚYˆJKˆÛÛYJØ\\™WÚY×ÜÝš[™Ê
+JKˆ
+JBˆB‚ˆËÈKKHÝŒKÜ™[[ÝKÙ]šXÙKÊ˜[™\œÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKB‚ˆËËÈH]šXÙH™\Ü[™ÈÚ]]\È[™Ú]]ÈÔÈÝ\œ™[H\›Z]Ë‚ˆ›ˆ]šXÙWÜÝ\™˜XÙWÜÜÝ
+ˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ]šXÙNˆ	‘]šXÙT™XÛÜ™ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]]]Ý\™˜XÙNˆ]šXÙTÝ\™˜XÙHHÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJBˆ›X\Ù\œŠ\œ›ÜŸ
+›Ü›X]J’[˜[Y]šXÙHÝ\™˜XÙNˆÙ\œ›ÜŸHŠJJOÎÂˆËÈH[›™\ˆ[Y\Ý[\ÈH™\Ü]Ù[‹ˆH]šXÙHÛØÚÈ]\ÂˆËÈÜ›Û™È
+Üˆ›]\š[™ÊH]\Ý›ÝXÚYHÝÈœ™\ÚHÜ\˜]Ü‰ÜÈšY]ÂˆËÈÙˆ]ÛÚÜË‚ˆÝ\™˜XÙKœ™\ÜYØ]Û\ÈH›Ý×Û\ÎÂˆÝ\™˜XÙK˜[Y]J
+K›X\Ù\œŠ\œ›ÜŸ
+\œ›ÜŠJOÎÂˆÙ[‹›ØÚÙYÜÝÜ™J
+OÂˆœØ]™WÙ]šXÙWÜÝ\™˜XÙJ	™]šXÙK™]šXÙWÚY	œÝ\™˜XÙK›Ý×Û\ÊBˆ›X\Ù\œŠ[\›˜[
+OÎÂˆÚÊ
+ˆŒˆ]šXÙWÜÝ]WÚœÛÛŠ]šXÙKÛÛYJ	œÝ\™˜XÙJJKˆÛÛYJ]šXÙK™]šXÙWÚY˜ÛÛ™J
+JKˆ
+JBˆB‚ˆËÈKKH™X[[YH[ÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKB‚ˆËËÈ\ÜÝY\ÈHÛ™K]\ÙH™X\™\ˆ]YZ]ÈH[ÈÙX”ÛØÚÙ]‚ˆËËÂˆËËÈ
+Š•ÚHHXÚÙ]^\ÝÈ][ŠŠˆ]™\žHÝ\ˆ›Ý]HÛˆ\È[™H\ÈBˆËËÈÚYÛ™Y™\]Y\ÝˆPPÈÝ™\ˆY]Ù]›ÙKÙ\]Y[˜ÙK›Û˜ÙH[™Ù^BˆËËÈÙ[™\˜][Û‹ˆHœ›ÝÜÙ\ˆØ[››Ý][žHÙˆ]ÛˆHÙX”ÛØÚÙ][™ÚZÙH8 %ˆËËÈHTHZÙ\È›ÈXY\œÈ8 %ÛÈHÚÚXÙH\ÈHÛØÚÙ]]][XØ]YžBˆËËÈÛÛY][™ÈÙXZÙ\‹ÜˆHÚYÛ™Y™\]Y\Ý]
+›Z[ÊˆHYZ\ÜÚ[Û‹ˆ\ÂˆËËÈ\ÈHÙXÛÛ™ˆHXÚÙ]\È\ÜÝYYÛ›HÈH™\]Y\Ý][™XYBˆËËÈ\ÜÙYH[ÚYÛ˜]\™K™\^H[™™]›ØØ][ÛˆÚXÚÜË]\È˜[™ÛKˆËËÈ]\ÈÚ[™ÛK]\ÙK]Y\È[ˆ\HÙXÛÛ™Ë[™]\ÈÜ[ˆËËÈ[[YYX][KˆHY[]H]Ø\œšY\È\ÈHY[]HÙˆHÚYÛ™YˆËËÈ™\]Y\Ý]XYH]œ›Þ™[ˆ8 %HÛØÚÙ]Ø[››ÝÛZ[H[žHÝ\ˆ]šXÙK‚ˆËËÂˆËËÈHXÚÙ]\È™]™\ˆ][ˆH™\ÜÛœÙIÜÈÙXœÛØÚÙ]Ü]ÈHÛY[ˆËËÈ\[™È]\ÈH]Y\žH\˜[Y]\ˆ]H[ÛY[]Ü[œÈHÛØÚÙ]ÛÈBˆËËÈ]][™È\[ˆHÙÈÜˆH\ÝÜžH[žHØ\œšY\È›È™X\™\‹‚ˆ›ˆ[×ÝXÚÙ]
+ˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ]šXÙNˆ	‘]šXÙT™XÛÜ™ˆ™\]Y\ÝÜÚLMŽˆ	œÝ‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]™\]Y\Ýˆ[ÕXÚÙ]™\]Y\ÝHÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJBˆ›X\Ù\œŠ\œ›ÜŸ
+›Ü›X]J’[˜[Y[ÈXÚÙ]™\]Y\ÝˆÙ\œ›ÜŸHŠJJOÎÂˆ™\]Y\Ý˜[Y]J
+K›X\Ù\œŠ\œ›ÜŸ
+\œ›ÜŠJOÎÂˆËÈHÝ\™˜XÙHX]\œÈ\È]XÚ\ÈHÜ˜[ˆH]šXÙHÚÜÙHÔÈ™Y\ÙYˆËÈHZXÜ›ÜÛ™H]\Ý›Ý™H[™YHÛØÚÙ]]Ø[ˆÛ›H˜Z[‚ˆ]Ý\™˜XÙHHÙ[‚ˆ›ØÚÙYÜÝÜ™J
+OÂˆ™]šXÙWÜÝ\™˜XÙJ	™]šXÙK™]šXÙWÚY
+Bˆ›X\Ù\œŠ[\›˜[
+OÎÂˆYˆYY™™XÝ]™WØØ\Xš[]Y\Ê	™]šXÙK˜Ø\Xš[]Y\ËÝ\™˜XÙK˜\×Ü™YŠ
+JBˆ˜ÛÛZ[œÊ	‘]šXÙPØ\Xš[]NŽ•›ÚXÙTÝ™X[JBˆÂˆ™]\›ˆ\œŠ
+ˆËˆ•\È]šXÙIÜÈZXÜ›ÜÛ™H\È›ÝY™™XÝ]™NˆHÜ˜[H]šXÙIÜÈÝÛˆˆY™\\Ù[Y[[™]ÈÜ\˜][™ÈÞ\Ý[H\›Z\ÜÚ[Ûˆ]\Ý[[ÝÈ]ˆ‚ˆ×ÜÝš[™Ê
+Kˆ
+JNÂˆBˆ]\ÜÝYYH[ÕXÚÙ]™\ÜÛœÙNŽš\ÜÝYJˆ™\]Y\ÝœÙ\ÜÚ[Û—ÚY˜ÛÛ™J
+Kˆ›Ý×Û\ËˆQUSÕS×ÕPÒÑUÕÓTËˆ
+Bˆ›X\Ù\œŠ\œ›ÜŸ
+\œ›ÜŠJOÎÂˆ]]]XÚÙ]ÈHÙ[‚ˆ[×ÝXÚÙ]Âˆ›ØÚÊ
+Bˆ›X\Ù\œŠß
+L•[ÈXÚÙ]Ý]HØ\ÈÚ\ÛÛ™Y‹×ÜÝš[™Ê
+JJOÎÂˆËÈ^\™YYZ\ÜÚ[ÛœÈ\™HÝÙ\Ûˆ]™\žH\ÜÝYH˜]\ˆ[ˆÛˆH[Y\Ž‚ˆËÈ\È\ÈHÛ›H]]YÈÈHX\ÛÈ]\ÈHÛ›HXÙBˆËÈ]Ø[ˆÜ›ÝË‚ˆXÚÙ]Ëœ™]Z[ŠË[™[™ß[™[™Ë™^\™\×Ø]Û\Èˆ›Ý×Û\ÊNÂˆYˆXÚÙ]Ë›[Š
+HHPVÔS‘S‘×ÕS×ÕPÒÑUÈÂˆ™]\›ˆ\œŠ
+ˆŽKˆ•ÛÈX[žH[ÈÛØÚÙ]È\™H™Z[™ÈÜ[™Y]Û˜ÙKˆ‹×ÜÝš[™Ê
+Kˆ
+JNÂˆBˆXÚÙ]Ëš[œÙ\
+ˆÚLM—Ú^
+\ÜÝYYXÚÙ]˜\×Øž]\Ê
+JKˆ[™[™Õ[ÕXÚÙ]Âˆ]šXÙWÚYˆ]šXÙK™]šXÙWÚY˜ÛÛ™J
+KˆÙXÜ™]ÙÙ[™\˜][ÛŽˆ]šXÙKœÙXÜ™]ÙÙ[™\˜][Û‹ˆÚYÛ™YÜ™\]Y\ÝÜÚLMŽˆ™\]Y\ÝÜÚLM‹×ÜÝš[™Ê
+KˆÙ\ÜÚ[Û—ÚYˆ\ÜÝYYœÙ\ÜÚ[Û—ÚY˜ÛÛ™J
+KˆÙ\ÜÚ[Û—ÙÙ[™\˜][ÛŽˆ\ÜÝYYœÙ\ÜÚ[Û—ÙÙ[™\˜][Û‹˜ÛÛ™J
+Kˆ^\™\×Ø]Û\Îˆ\ÜÝYY™^\™\×Ø]Û\ËˆKˆ
+NÂˆ›Ü
+XÚÙ]ÊNÂˆÚÊ
+ˆŒKˆÙ\™WÚœÛÛŽŽ×Ý˜[YJ	š\ÜÝYY
+K›X\Ù\œŠ[\›˜[
+OËˆÛÛYJ]šXÙK™]šXÙWÚY˜ÛÛ™J
+JKˆ
+JBˆB‚ˆËËÈÜ[™ÈHXÚÙ]™]\›š[™ÈHY[]HHÛØÚÙ][ˆÛË‚ˆËËÂˆËËÈ›Û™X›Üˆ[ž][™È][Ü›Û™È8 %[šÛ›ÝÛ‹^\™Y[™XYHÜ[ˆËËÈÜ›Û™ÈÙ\ÜÚ[Û‹H]šXÙH™]›ÚÙYÜˆ™KZÙ^YY[ˆHYX[[YH8 %Ú]›ÂˆËËÈ\Ý[˜Ý[Ûˆ™]ÙY[ˆ[K™XØ]\ÙHHØ[\ˆÝY\ÜÚ[™ÈXÚÙ]ÈX\›œÂˆËËÈ›Ý[™Èœ›ÛHÚXÚÙˆÜÙH]]ˆ™[[Ý˜[\[œÈ[™\ˆHØ[YHØÚÂˆËËÈ\ÈHÛÚÝ\ÚXÚ\ÈÚ]XZÙ\È›Û™H\ÙHˆYHYØZ[œÝÛÈÛØÚÙ]ÂˆËËÈ˜XÚ[™ÈÚ]HØ[YHXÚÙ]‚ˆXŠÜ˜]JH›ˆÛÛœÝ[YWÝ[×ÝXÚÙ]
+ˆ	œÙ[‹ˆÙ\ÜÚ[Û—ÚYˆ	œÝ‹ˆXÚÙ]ˆ	œÝ‹ˆ›Ý×Û\ÎˆMˆ
+HOˆÜ[Û[ÔÛØÚÙ]]]Üš^˜][ÛˆÂˆ][™[™ÈHÂˆ]]]XÚÙ]ÈHÙ[‹[×ÝXÚÙ]Ë›ØÚÊ
+K›ÚÊ
+OÎÂˆ]YÙ\ÝHÚLM—Ú^
+XÚÙ]˜\×Øž]\Ê
+JNÂˆ][™[™ÈHXÚÙ]Ë™Ù]
+	™YÙ\Ý
+OË˜ÛÛ™J
+NÂˆYˆ[™[™Ë™^\™\×Ø]Û\ÈH›Ý×Û\È[™[™ËœÙ\ÜÚ[Û—ÚYOHÙ\ÜÚ[Û—ÚYÂˆËÈ™[[Ý™YZ]\ˆØ^Nˆ[ˆ^\™YÜˆZ\Ù\™XÝYXÚÙ]\È›ÂˆËÈÙXÛÛ™Ú[˜ÙK‚ˆXÚÙ]Ëœ™[[Ý™J	™YÙ\Ý
+NÂˆ™]\›ˆ›Û™NÂˆBˆXÚÙ]Ëœ™[[Ý™J	™YÙ\Ý
+NÂˆ[™[™ÂˆNÂˆËÈ™KXÚXÚÙY]H[ÛY[ÙˆYZ\ÜÚ[Û‹›ÝÛ›H]\ÜÝYNˆ\BˆËÈÙXÛÛ™È\ÈÛ™È[›ÝYÚ›Üˆ[ˆÜ\˜]ÜˆÈ™]›ÚÙHH]šXÙK[™BˆËÈÛØÚÙ]]›ÛÝÜÈØ[ˆÝ^HÜ[ˆ›Üˆ[ˆÝ\‹‚ˆ]]šXÙHHÙ[‚ˆœÝÜ™Bˆ›ØÚÊ
+Bˆ›ÚÊ
+OÂˆ™]šXÙJ	œ[™[™Ë™]šXÙWÚY
+Bˆ›ÚÊ
+Bˆ™›][Š
+OÎÂˆYˆY]šXÙK˜XÝ]™J
+H]šXÙKœÙXÜ™]ÙÙ[™\˜][ÛˆOH[™[™ËœÙXÜ™]ÙÙ[™\˜][ÛˆÂˆ™]\›ˆ›Û™NÂˆBˆ™\]Z\™WØØ\Xš[]J	™]šXÙK]šXÙPØ\Xš[]NŽ•›ÚXÙTÝ™X[JK›ÚÊ
+OÎÂˆÛÛYJ[ÔÛØÚÙ]]]Üš^˜][ÛˆÂˆ]šXÙWÚYˆ[™[™Ë™]šXÙWÚYˆÚYÛ™YÜ™\]Y\ÝÜÚLMŽˆ[™[™ËœÚYÛ™YÜ™\]Y\ÝÜÚLM‹ˆÙ\ÜÚ[Û—ÚYˆ[™[™ËœÙ\ÜÚ[Û—ÚYˆÙ\ÜÚ[Û—ÙÙ[™\˜][ÛŽˆ[™[™ËœÙ\ÜÚ[Û—ÙÙ[™\˜][Û‹ˆJBˆB‚ˆËËÈÚ\™HH\ÚÝÜ[ˆÙY\È]ÈÛÛ™šYÝ\˜][Û‹ÚXÚ\ÈÚ\™HBˆËËÈÜ\˜]Ü‰ÜÈÝÛˆÜYXÚ˜XÚÙ[™È\™H™XYœ›ÛK‚ˆXŠÜ˜]JH›ˆ\Ù]WÙ\—Ù›Ü—Ý[Ê	œÙ[ŠHOˆÝŽœ]Ž”]YˆÂˆÙ[‹œ]Âˆ›YÙ\—Ù‚ˆœ\™[
+
+Bˆ›X\
+ÝŽœ]Ž”]Ž×Ü]ØYŠBˆ[Ü˜\ÛÜ—Ù[ÙJÙ[‹œ]Ëœ›ÛÝ˜ÛÛ™J
+JBˆB‚ˆËËÈÚ]Hš[š\ÚY[ÈÙ\ÜÚ[ÛˆX]™\È™Z[™ˆ›Ý[™YÛÝ[\œËÛˆBˆËËÈØ[YH]Y]Ý™X[H]™\žHÝ\ˆ™[[ÝHXÝ[Ûˆ\ÈÜš][ˆË‚ˆËËÂˆËËÈ[X™\˜][H›ÝH˜[œØÜš\›ÝH\ÜÚ\Ý[	ÜÈ[œÝÙ\ˆ[™›ÝÛ™BˆËËÈž]HÙˆ]Y[ËˆHÝ\Ü[™HÛÛXÝÈ\ÈÝ™X[K[™H™XÛÜ™[™ÈÙ‚ˆËËÈÛÛYX›ÙIÜÈ›ÛÛH\È›ÝH[™ÈÈ][ˆÛ™K‚ˆXŠÜ˜]JH›ˆ™XÛÜ™Ý[×ÜÙ\ÜÚ[ÛŠˆ	œÙ[‹ˆ]šXÙWÚYˆ	œÝ‹ˆ™\Üˆ	œÝ\\ŽŽ[ÎŽ•[ÔÙ\ÜÚ[Û”™\Üˆ
+HÂˆÙ[‹˜]Y]ˆœ™XÛÜ™
+]WÛ[ÛšÙ^WÛXŽŽœÝXœÞ\Ý[WØ]Y]Ž”ÝXœÞ\Ý[PXÝ[ÛˆÂˆÝXœÞ\Ý[Nˆ]WÛ[ÛšÙ^WÛXŽŽœ[—ÛYÙ\ŽŽ”ÝXœÞ\Ý[NŽ”™[[ÝKˆXÝ[ÛŽˆ•SÈÝŒKÜ™[[ÝKÙ]šXÙKÝ[ËÜÝ™X[H‹×ÜÝš[™Ê
+Kˆ\›—ÚYˆ›Û™Kˆ\›Z\ÜÚ[Û—Ü™\]Y\ÝÚYˆ›Û™KˆÝ]ÛÛYNˆYˆ™\ÜœÝ™X[WÙ›ÜY™\Ü™Ü˜[Ü™]›ÚÙYÂˆ]WÛ[ÛšÙ^WÛXŽŽœÝXœÞ\Ý[WØ]Y]Ž›Ý]ÛÛYWÙ›Ü—ÜÝ]\ÊNJBˆH[ÙHÂˆ]WÛ[ÛšÙ^WÛXŽŽœÝXœÞ\Ý[WØ]Y]Ž›Ý]ÛÛYWÙ›Ü—ÜÝ]\ÊŒ
+BˆKˆ]Z[ˆÛÛYJÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆ™]šXÙRYŽˆ]šXÙWÚYˆ]\˜[˜Ù\ÈŽˆ™\Ü]\˜[˜Ù\Ëˆ\›œÈŽˆ™\Ü\›œ×ÜÝX›Z]Yˆš[\œ\[ÛœÈŽˆ™\Üš[\œ\[ÛœËˆœÜÚÙ[Ú[šÜÈŽˆ™\ÜœÜÚÙ[—ØÚ[šÜËˆ™\œ›ÜœÈŽˆ™\Ü™\œ›ÜœËˆ™˜[˜XÚÜÈŽˆ™\Ü™˜[˜XÚÜËˆ™Ü˜[™]›ÚÙYŽˆ™\Ü™Ü˜[Ü™]›ÚÙYˆËÈ\˜][ÛœË[ˆHØ[YHÙ]™[ˆÜ[œÈH\ÚÝÜ™XÛÜ™Ë‚ˆËÈYX[œÈ[™ÛÜœÝØ\Ù\È˜]\ˆ[ˆØ[\\ËÛÈHÛ™ÂˆËÈÛÛ™\œØ][ÛˆØ[››ÝÜ›ÝÈ\È›ÝË‚ˆ›][˜ÞS\ÈŽˆ[×Û][˜ÞWÙ]Z[
+	œ™\Ü›][˜ÞJKˆJJKˆJNÂˆB‚ˆËËÈ™YÚ\Ý\œÈ[ˆÜ[ˆ[ÈÛØÚÙ]\ÈH]™HØ\\™K[™[™È˜XÚÈH›ÝÂˆËËÈÈÛÜÙHÚ[ˆ][™ËˆH˜Z[\™HÈ™YÚ\Ý\ˆ\È›ÝH™X\ÛÛˆÈ™Y\ÙBˆËËÈHÛÛ™\œØ][Ûˆ8 %]]\È™XÛÜ™Y™XØ]\ÙH[ˆ[›ØœÙ\˜X›HZXÜ›ÜÛ™BˆËËÈ\ÈH[™È\È^\ÝÈÈ™]™[‚ˆXŠÜ˜]JH›ˆÜ[—Ý[×ØØ\\™Jˆ	œÙ[‹ˆ]šXÙWÚYˆ	œÝ‹ˆÙ\ÜÚ[Û—ÚYˆ	œÝ‹ˆ^\™\×Ø]Û\ÎˆMˆ
+HOˆÜ[ÛÝš[™ÏˆÂˆ]›Ý×Û\ÈHÝ\\ŽŽ››Ý×Û\×ÜX›XÊ
+K›ÚÊ
+OÎÂˆ]]]ÝÜ™HHÙ[‹œÝÜ™K›ØÚÊ
+K›ÚÊ
+OÎÂˆX]ÚÝÜ™K›Ü[—Ý[×ØØ\\™J]šXÙWÚYÙ\ÜÚ[Û—ÚY^\™\×Ø]Û\Ë›Ý×Û\ÊHÂˆÚÊ™XÛÜ™
+HOˆÛÛYJ™XÛÜ™˜ÛÛ[X[™ÚY
+Kˆ\œŠ\œ›ÜŠHOˆÂˆÙ[‹˜]Y]ˆœ™XÛÜ™
+]WÛ[ÛšÙ^WÛXŽŽœÝXœÞ\Ý[WØ]Y]Ž”ÝXœÞ\Ý[PXÝ[ÛˆÂˆÝXœÞ\Ý[Nˆ]WÛ[ÛšÙ^WÛXŽŽœ[—ÛYÙ\ŽŽ”ÝXœÞ\Ý[NŽ”™[[ÝKˆXÝ[ÛŽˆ•SÈÝŒKÜ™[[ÝKÙ]šXÙKÝ[ËÜÝ™X[H‹×ÜÝš[™Ê
+Kˆ\›—ÚYˆ›Û™Kˆ\›Z\ÜÚ[Û—Ü™\]Y\ÝÚYˆ›Û™KˆÝ]ÛÛYNˆ]WÛ[ÛšÙ^WÛXŽŽœÝXœÞ\Ý[WØ]Y]Ž›Ý]ÛÛYWÙ›Ü—ÜÝ]\ÊL
+Kˆ]Z[ˆÛÛYJÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆ™]šXÙRYŽˆ]šXÙWÚYˆ˜Ø\\™T™YÚ\Ý˜][Û‘˜Z[YŽˆ\œ›Ü‹ˆJJKˆJNÂˆ›Û™BˆBˆBˆB‚ˆXŠÜ˜]JH›ˆÛÜÙWÝ[×ØØ\\™Jˆ	œÙ[‹ˆ]šXÙWÚYˆ	œÝ‹ˆÛÛ[X[™ÚYˆ	œÝ‹ˆ\œ›ÜŽˆÜ[Û	œÝ‹ˆ
+HÂˆ]ÚÊ›Ý×Û\ÊHHÝ\\ŽŽ››Ý×Û\×ÜX›XÊ
+H[ÙHÂˆ™]\›ŽÂˆNÂˆYˆ]ÚÊ]]ÝÜ™JHHÙ[‹œÝÜ™K›ØÚÊ
+HÂˆ]ÈHÝÜ™K˜ÛÜÙWÝ[×ØØ\\™J]šXÙWÚYÛÛ[X[™ÚY\œ›Ü‹›Ý×Û\ÊNÂˆBˆB‚ˆËËÈÚ]\ˆH]šXÙHX^HÝ[ÜXZËˆ™XY™]ÙY[ˆ[È\›œË[™ÛˆH[Y\‚ˆËËÈÚ[H[ˆ[œÝÙ\ˆÝ™X[\ËÛÈHÜ˜[Ú]˜]ÛˆZYXÛÛ™\œØ][ÛˆÛÜÙ\ÈBˆËËÈZXÜ›ÜÛ™K‚ˆËËÂˆËËÈ[X™\˜][HH
+œØ[YJˆ\ÝHXÚÙ]›Ý]HYZ]ÈÛˆ8 %Ü˜[8¢*BˆËËÈY™\\ÙYÝ\™˜XÙH8¢*HÔÈ\›Z\ÜÚ[Ûˆ8 %˜]\ˆ[ˆHÜ˜[[Û™KˆBˆËËÈZXÜ›ÜÛ™H\›Z\ÜÚ[ÛˆÚ]˜]ÛˆÛˆHÛ™H[ˆØ^H›ÝYÚBˆËËÈÛÛ™\œØ][Ûˆ\È^XÝHHØ\ÙHÚ\™HHÙXZÙ\ˆ\ÝÛÝ[ÙY\BˆËËÈÙ\ÜÚ[Ûˆ[]™K[™]\ÈHØ\ÙH]X]\œÈ[ÜÝ‚ˆXŠÜ˜]JH›ˆ[×ØØ\Xš[]WÛ]™J	œÙ[‹]šXÙWÚYˆ	œÝŠHOˆ›ÛÛÂˆ]ÚÊÝÜ™JHHÙ[‹œÝÜ™K›ØÚÊ
+H[ÙHÂˆ™]\›ˆ˜[ÙNÂˆNÂˆ]ÛÛYJ]šXÙJHHÝÜ™K™]šXÙJ]šXÙWÚY
+K›ÚÊ
+K™›][Š
+H[ÙHÂˆ™]\›ˆ˜[ÙNÂˆNÂˆYˆY]šXÙK˜XÝ]™J
+HÂˆ™]\›ˆ˜[ÙNÂˆBˆ]Ý\™˜XÙHHÝÜ™K™]šXÙWÜÝ\™˜XÙJ]šXÙWÚY
+K›ÚÊ
+K™›][Š
+NÂˆY™™XÝ]™WØØ\Xš[]Y\Ê	™]šXÙK˜Ø\Xš[]Y\ËÝ\™˜XÙK˜\×Ü™YŠ
+JBˆ˜ÛÛZ[œÊ	‘]šXÙPØ\Xš[]NŽ•›ÚXÙTÝ™X[JBˆB‚ˆ›ˆ[×ÜÝ™X[WÛ™YY×Ý\Ü˜YJˆ	œÙ[‹ˆÙ\ÜÚ[Û—ÚYˆ	œÝ‹ˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ\œŠ
+ˆ‹ˆ›Ü›X]Jˆ•[ÈÙ\ÜÚ[Ûˆ	ÞÜÙ\ÜÚ[Û—ÚYIÈ\ÈHÙX”ÛØÚÙ][™Ú[ˆ™\]Y\ÝHXÚÙ]]ˆÔÕÝŒKÜ™[[ÝKÙ]šXÙKÝ[ËÝXÚÙ][™\Ü˜YHÚ]]ˆ‚ˆ
+Kˆ
+JBˆB‚ˆËËÈÚ]\È]šXÙHX^HXÝX[HË\ÈH[›™\ˆÙY\È]8 %HØ[YH™YBˆËËÈÙ]ÈHÜ\˜]Ü‰ÜÈ]šXÙHØ\™ÚÝÜËÛÈHÛ™H[™H\ÚÝÜØ[‚ˆËËÈ™]™\ˆ\ØYÜ™YHX›Ý]ÚHÛÛY][™È\È[˜]˜Z[X›K‚ˆ›ˆ]šXÙWÜÝ]Jˆ	œÙ[‹ˆ]šXÙNˆ	‘]šXÙT™XÛÜ™ˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]Ý\™˜XÙHHÙ[‚ˆ›ØÚÙYÜÝÜ™J
+OÂˆ™]šXÙWÜÝ\™˜XÙJ	™]šXÙK™]šXÙWÚY
+Bˆ›X\Ù\œŠ[\›˜[
+OÎÂˆÚÊ
+ˆŒˆ]šXÙWÜÝ]WÚœÛÛŠ]šXÙKÝ\™˜XÙK˜\×Ü™YŠ
+JKˆÛÛYJ]šXÙK™]šXÙWÚY˜ÛÛ™J
+JKˆ
+JBˆB‚ˆËËÈX\Ù\ÈH™^ÛÛ[X[™™KXÚXÚÚ[™È]]Üš]H]H[ÛY[Ùˆ[™[™ÂˆËËÈ]Ý™\‹‚ˆËËÂˆËËÈHÜ˜[™]›ÚÙYÜˆ[ˆÔÈ\›Z\ÜÚ[ÛˆÚ]˜]Û‹™]ÙY[ˆ]Y]YZ[™È[™ˆËËÈX\Ú[™È]\ÝÝÜHÛÛ[X[™8 %ÛÈHÚXÚÈ\È\™H[™›ÝÛ›H]ˆËËÈ[œ]Y]YKˆÝXÚHÛÛ[X[™˜Z[ÈÚ][ˆ^XÚ]™X\ÛÛˆ˜]\ˆ[‚ˆËËÈÚ[[H˜[š\Ú[™Ë™XØ]\ÙHH[ˆ\ÈØZ][™ÈÛˆ[ˆ[œÝÙ\‹‚ˆ›ˆ]šXÙWØÛÛ[X[™ÛX\ÙJˆ	œÙ[‹ˆ]šXÙNˆ	‘]šXÙT™XÛÜ™ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]]]ÝÜ™HHÙ[‹›ØÚÙYÜÝÜ™J
+OÎÂˆËÈHÝ™X[HÚÜÙHXY[™H\ÜÙY\ÈÛÜÙY\™KÛˆHØ[YHÝÙY\]ˆËÈ^\™\ÈÝ[HÛÛ[X[™ÎˆH]šXÙH]X˜[™Û™Y]\ÈžHYš[š][Û‚ˆËÈ›ÝHÛ™H\ÚÚ[™È›ÜˆÛÜšËÛÈ\È\ÈÚ\™HÛÛY[Û™H[ÙH›ÝXÙ\Ë‚ˆÝ\\ŽŽ›ÚXÙNŽ™^\™J	›]]ÝÜ™K›Ý×Û\ÊK›X\Ù\œŠ[\›˜[
+OÎÂˆ]Ý\™˜XÙHHÝÜ™K™]šXÙWÜÝ\™˜XÙJ	™]šXÙK™]šXÙWÚY
+K›X\Ù\œŠ[\›˜[
+OÎÂˆ]Ü˜[YHÜ˜[YØØ\Xš[]Y\Ê]šXÙJNÂˆËÈ›Ý[™YˆXXÚ]\˜][Ûˆ™]\™\È^XÝHÛ™H›ÝË][˜]]Üš^™YÛÛ[X[™ˆËÈÛÈ\ÈØ[››ÝÜ[‹‚ˆ›ÜˆÈ[ˆ‹Âˆ]ÛÛYJ™XÛÜ™
+HHÝÜ™Bˆ›X\ÙWÙ]šXÙWØÛÛ[X[™
+	™]šXÙK™]šXÙWÚYU’PÑWÓPTÑWÓTË›Ý×Û\ÊBˆ›X\Ù\œŠ[\›˜[
+OÂˆ[ÙHÂˆ™]\›ˆÚÊ
+ŒÙ\™WÚœÛÛŽŽšœÛÛˆJßJK›Û™JJNÂˆNÂˆYˆ]ÛÛYJ›ØÚÊHHØ\Xš[]WØ›ØÚÊ	™Ü˜[YÝ\™˜XÙK˜\×Ü™YŠ
+K™XÛÜ™˜Ø\Xš[]JHÂˆËÈ˜Z[YÚ]H™X\ÛÛ‹›ÝÚ]HÚYÎˆH[ˆ\ÈØZ][™ÈÛ‚ˆËÈ\È[œÝÙ\ˆ[™HÜ\˜]Üˆ™YYÈÈÛ›ÝÈÚXÚÙˆH›Ý\‚ˆËÈ^\ÈØZY›Ë‚ˆÝÜ™Bˆ˜ÛÛ\]WÙ]šXÙWØÛÛ[X[™
+ˆ	™]šXÙK™]šXÙWÚYˆ	œ™XÛÜ™˜ÛÛ[X[™ÚYˆ]šXÙPÛÛ[X[™Ý]NŽ‘˜Z[Yˆ›Û™Kˆ›Û™KˆÛÛYJ	˜›ØÚË™^Z[Š™XÛÜ™˜Ø\Xš[]JJKˆ›Û™Kˆ›Ý×Û\Ëˆ
+Bˆ›X\Ù\œŠ[\›˜[
+OÎÂˆÝÜ™Bˆ˜]Y]
+ˆ›Ý×Û\ËˆÛÛYJ	™]šXÙK™]šXÙWÚY
+Kˆ™]šXÙWØÛÛ[X[™Ø›ØÚÙY‹ˆÛÛYJ	œ™XÛÜ™˜ÛÛ[X[™ÚY
+Kˆ›ØÚË˜\×ÜÝŠ
+Kˆ›Û™Kˆ
+Bˆ›X\Ù\œŠ[\›˜[
+OÎÂˆÛÛ[YNÂˆBˆ]ÛÛ[X[™H]šXÙPÛÛ[X[™Âˆ›ÝØÛÛÝ™\œÚ[ÛŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆÛÛ[X[™ÚYˆ™XÛÜ™˜ÛÛ[X[™ÚY˜ÛÛ™J
+KˆØ\Xš[]Nˆ™XÛÜ™˜Ø\Xš[]Kˆ\™Ý[Y[Îˆ™XÛÜ™˜\™Ý[Y[Ë˜ÛÛ™J
+Kˆ\™Ý[Y[×ÜÚLMŽˆ™XÛÜ™˜\™Ý[Y[×ÜÚLM‹˜ÛÛ™J
+Kˆ^\™\×Ø]Û\Îˆ™XÛÜ™™^\™\×Ø]Û\ËˆX\ÙWÙ^\™\×Ø]Û\Îˆ™XÛÜ™›X\ÙWÙ^\™\×Ø]Û\Ë[Ü˜\ÛÜŠ™XÛÜ™™^\™\×Ø]Û\ÊKˆØ[˜Ù[Ü™\]Y\ÝYˆ™XÛÜ™˜Ø[˜Ù[Ü™\]Y\ÝYˆNÂˆ]›ÙHHÙ\™WÚœÛÛŽŽ×Ý˜[YJ	˜ÛÛ[X[™
+Bˆ›X\Ù\œŠ\œ›ÜŸ[\›˜[
+›Ü›X]JÛÝ[›Ý[˜ÛÙH]šXÙHÛÛ[X[™ˆÙ\œ›ÜŸHŠJJOÎÂˆ™]\›ˆÚÊ
+Œ›ÙKÛÛYJ™XÛÜ™˜ÛÛ[X[™ÚY
+JJNÂˆBˆÚÊ
+ŒÙ\™WÚœÛÛŽŽšœÛÛˆJßJK›Û™JJBˆB‚ˆËËÈH]šXÙHXÛ\š[™È]\ÈX›Ý]ÈÝXÚ\™Ø\™KˆÝ\Yˆ˜[ÙXˆËËÈYX[œÈ\ÈÛÛ[X[™Ø\È[™XYH[›š[™È8 %H]šXÙH]\Ý›Ý™\X]BˆËËÈXÝ[Û‹[™\È\ÈH™\HH™XÛÛ›™XÝÙ]Ë‚ˆËËÂˆËËÈ]]Üš]H\È™KXÚXÚÙY\™H[™›ÝÛ›H]X\ÙH[YKˆHX\ÙH[™BˆËËÈ[ÛY[\™Ø\™H\ÈÝXÚY\™HY™™\™[[ÛY[Ë[™HÜ˜[Ú]˜]Û‚ˆËËÈÜˆH\›Z\ÜÚ[Ûˆ™]›ÚÙY[ˆ™]ÙY[ˆ\ÈÈÝÜHXÝ[Ûˆ8 %HÚÛBˆËËÈÚ[ÙˆHÜ]\È]›Ý[™È\ÚXØ[\È\[™YY]‚ˆËËÂˆËËÈ]™KXÚXÚÈ™[Û™ÜÈÈHX\ÙY8¡¤ˆ[›š[™Ø˜[œÚ][Ûˆ[™ÂˆËËÈ›Ý[™È[ÙKˆHØ[YH›Ý]H[ÛÈ[œÝÙ\œÈH
+œ™XÛÝ™\žJŽˆ[ˆ^XÝ][Ûˆ]ˆËËÈ[™XYHÛÈ\ÈÛÛ[X[™[™ÜÝH™\Kˆ™K\[›š[™È™XY[™\ÜÈ\™BˆËËÈÛÝ[˜Z[HÛÛ[X[™ÚÜÙHY™™XÝX^H[™XYH]™H\[™Y™XØ]\ÙHBˆËËÈYÙHÙ[ÈH˜XÚÙÜ›Ý[™Y\Ø\™È8 %\›š[™ÈH[ÛY[\žHÜÜÈÙ‚ˆËËÈ™XY[™\ÜÈ[ÈH™]›ØØ][ÛˆÙˆÛÜšÈ[™XYH]]Üš^™YˆÚ][™ÈBˆËËÈ[›š[™ÈÛÛ[X[™\ÈØ[˜Ù[][ÛˆÜˆ™]›ØØ][Û‹›ÝÛˆHÛÛ›ÛˆËËÈÚ[›™[È™]™\ˆH™XY[™\ÜÈÚXÚÈ]H›Ý[™\žH][™XYH\ÜÙY‚ˆ›ˆ]šXÙWØÛÛ[X[™ÜÝ\
+ˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ]šXÙNˆ	‘]šXÙT™XÛÜ™ˆÛÛ[X[™ÚYˆ	œÝ‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]™\]Y\Ýˆ]šXÙPÛÛ[X[™Ý\™\]Y\ÝHYˆ›ÙKš\×Ù[\J
+HÂˆ]šXÙPÛÛ[X[™Ý\™\]Y\ÝŽ™Y˜][
+
+BˆH[ÙHÂˆÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJBˆ›X\Ù\œŠ\œ›ÜŸ
+›Ü›X]J’[˜[Y]šXÙHÛÛ[X[™Ý\ˆÙ\œ›ÜŸHŠJJOÂˆNÂˆ™\]Y\Ý˜[Y]J
+K›X\Ù\œŠ\œ›ÜŸ
+\œ›ÜŠJOÎÂˆ]]]ÝÜ™HHÙ[‹›ØÚÙYÜÝÜ™J
+OÎÂˆ]™XÛÜ™HÝÜ™Bˆ™]šXÙWØÛÛ[X[™
+ÛÛ[X[™ÚY
+Bˆ›X\Ù\œŠ[\›˜[
+OÂˆ™š[\Š™XÛÜ™™XÛÜ™™]šXÙWÚYOH]šXÙK™]šXÙWÚY
+Bˆ›Ú×ÛÜŠ
+•[šÛ›ÝÛˆ]šXÙHÛÛ[X[™‹×ÜÝš[™Ê
+JJOÎÂˆËÈHÛÛ[X[™[™XYH\Ý]ÈÝÛˆXY[™H™]™\ˆ™YÚ[œËÝÙ]™\ˆÛ™ÂˆËÈH]šXÙHÛÚÈÈ\ÚË‚ˆYˆ™XÛÜ™™^\™\×Ø]Û\ÈH›Ý×Û\È	‰ˆ\™XÛÜ™œÝ]K\›Z[˜[
+
+HÂˆÝÜ™K™^\™WÙ]šXÙWØÛÛ[X[™Ê›Ý×Û\ÊK›X\Ù\œŠ[\›˜[
+OÎÂˆ™]\›ˆ\œŠ
+K•\ÈÛÛ[X[™^\™Y™Y›Ü™H]Ý\Y‹×ÜÝš[™Ê
+JJNÂˆBˆËÈÛ›HHÛ™H˜[œÚ][Ûˆ]]]Üš^™\ÈH
+›™]Êˆ\ÚXØ[Y™™XÝˆBˆËÈ[›š[™ØÛÛ[X[™˜[È›ÝYÚÈÝ\Ù]šXÙWØÛÛ[X[™ÚXÚˆËÈ[œÝÙ\œÈHX]Ú[™È^XÝ][ÛˆÚ]Ý\Yˆ˜[ÙK™XÛÝ™\˜X›NˆYXˆËÈ[™HY™™\™[Û™HÚ]H™Y\Ø[‚ˆYˆX]Ú\ÈJ™XÛÜ™œÝ]K]šXÙPÛÛ[X[™Ý]NŽ“X\ÙY
+HÂˆ]Ý\™˜XÙHHÝÜ™K™]šXÙWÜÝ\™˜XÙJ	™]šXÙK™]šXÙWÚY
+K›X\Ù\œŠ[\›˜[
+OÎÂˆ]Ü˜[YHÜ˜[YØØ\Xš[]Y\Ê]šXÙJNÂˆYˆ]ÛÛYJ›ØÚÊHHØ\Xš[]WØ›ØÚÊ	™Ü˜[YÝ\™˜XÙK˜\×Ü™YŠ
+K™XÛÜ™˜Ø\Xš[]JHÂˆÝÜ™Bˆ˜ÛÛ\]WÙ]šXÙWØÛÛ[X[™
+ˆ	™]šXÙK™]šXÙWÚYˆÛÛ[X[™ÚYˆ]šXÙPÛÛ[X[™Ý]NŽ‘˜Z[Yˆ›Û™Kˆ›Û™KˆÛÛYJ	˜›ØÚË™^Z[Š™XÛÜ™˜Ø\Xš[]JJKˆ™\]Y\Ý™^XÝ][Û—ÚY˜\×Ù\™YŠ
+Kˆ›Ý×Û\Ëˆ
+Bˆ›X\Ù\œŠ[\›˜[
+OÎÂˆÝÜ™Bˆ˜]Y]
+ˆ›Ý×Û\ËˆÛÛYJ	™]šXÙK™]šXÙWÚY
+Kˆ™]šXÙWØÛÛ[X[™Ø›ØÚÙY‹ˆÛÛYJÛÛ[X[™ÚY
+Kˆ›ØÚË˜\×ÜÝŠ
+Kˆ›Û™Kˆ
+Bˆ›X\Ù\œŠ[\›˜[
+OÎÂˆ™]\›ˆ\œŠ
+Ë›ØÚË™^Z[Š™XÛÜ™˜Ø\Xš[]JJJNÂˆBˆBˆ]Ý]ÛÛYHHÝÜ™BˆœÝ\Ù]šXÙWØÛÛ[X[™
+ˆ	™]šXÙK™]šXÙWÚYˆÛÛ[X[™ÚYˆ™\]Y\Ý™^XÝ][Û—ÚY˜\×Ù\™YŠ
+Kˆ›Ý×Û\Ëˆ
+Bˆ›X\Ù\œŠ\œ›ÜŸ
+K\œ›ÜŠJOÎÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆ˜ÛÛ[X[™ÚYŽˆÛÛ[X[™ÚYˆœÝ\YŽˆÝ]ÛÛYKœÝ\YˆËÈYHÚ[ˆ\È\ÈHØ[YH^XÝ][Ûˆ™XÛÛ›™XÝ[™Îˆ]X^BˆËÈ[]™\ˆH™\Ý[][™XYHÝYÙY[™]\Ý›Ý™KY^XÝ]K‚ˆœ™XÛÝ™\˜X›HŽˆÝ]ÛÛYKœ™XÛÝ™\˜X›Kˆ™^XÝ][Û—ÚYŽˆÝ]ÛÛYK™^XÝ][Û—ÚYˆJKˆÛÛYJÛÛ[X[™ÚY×ÜÝš[™Ê
+JKˆ
+JBˆB‚ˆËËÈ]™\žH›Û\›Z[˜[ÛÛ[X[™H[›™\ˆÝ[™[Y]™\È\È]šXÙHÝÛœË‚ˆËËÂˆËËÈ[X™\˜][H›ÝHX\ÙNˆ[™[™ÈH[›š[™ØÛÛ[X[™˜XÚÈ›ÝYÚBˆËËÈ]Y]YH\È™XÚ\Ù[HHÙXÛÛ™^XÝ][Ûˆ\È\ÚYÛˆ™Y\Ù\ËˆH]šXÙBˆËËÈ[œÝÙ\œÈXXÚÙˆ\ÙHœ›ÛH]ÈÝÛˆ›Ý\›˜[8 %[]™\ˆHÝYÙY™\Ý[ˆËËÈÜˆ™\ÜHÝ]ÛÛYH[šÛ›ÝÛ‹‚ˆ›ˆ]šXÙWØÛÛ[X[™×Ü™XÛÝ™\Šˆ	œÙ[‹ˆ]šXÙNˆ	‘]šXÙT™XÛÜ™ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]]]ÝÜ™HHÙ[‹›ØÚÙYÜÝÜ™J
+OÎÂˆÝÜ™K™^\™WÙ]šXÙWØÛÛ[X[™Ê›Ý×Û\ÊK›X\Ù\œŠ[\›˜[
+OÎÂˆ]ÛÛ[X[™ÈHÝÜ™Bˆœ™XÛÝ™\˜X›WÙ]šXÙWØÛÛ[X[™Ê	™]šXÙK™]šXÙWÚY
+Bˆ›X\Ù\œŠ[\›˜[
+OÂˆš[×Ú]\Š
+Bˆ›X\
+™XÛÜ™]šXÙPÛÛ[X[™™XÛÝ™\žHÂˆÛÛ[X[™ÚYˆ™XÛÜ™˜ÛÛ[X[™ÚYˆØ\Xš[]Nˆ™XÛÜ™˜Ø\Xš[]Kˆ\™Ý[Y[×ÜÚLMŽˆ™XÛÜ™˜\™Ý[Y[×ÜÚLM‹ˆÝ]Nˆ™XÛÜ™œÝ]Kˆ^XÝ][Û—ÚYˆ™XÛÜ™™^XÝ][Û—ÚYˆÝ\YØ]Û\Îˆ™XÛÜ™œÝ\YØ]Û\Ëˆ^\™\×Ø]Û\Îˆ™XÛÜ™™^\™\×Ø]Û\ËˆØ[˜Ù[Ü™\]Y\ÝYˆ™XÛÜ™˜Ø[˜Ù[Ü™\]Y\ÝYˆJBˆ˜ÛÛXÝŽ™XÏÏŠ
+NÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆ˜ÛÛ[X[™ÈŽˆÛÛ[X[™ËˆJKˆ›Û™Kˆ
+JBˆB‚ˆËËÈH[›š[™ÈÛÛ[X[™	ÜÈÛÛ›ÛÚYÛ˜[Ë‚ˆËËÂˆËËÈÛ™H™\]Y\ÝH]šXÙHXZÙ\ÈÚ[H]\ÈÛÜšÚ[™Ë[Ü[ˆžHBˆËËÈÛ™Ë\Û[[ÛÛY][™ÈÚ[™Ù\Ë˜]\ˆ[ˆHÛ]™\X]Ëˆ]\ÂˆËËÈÚ]]ÈHØ[˜Ù[][Ûˆ™XXÚH™XÛÜ™[™È[™XYH[ˆ›ÙÜ™\ÜÈÚ]Ý]ˆËËÈÜ[™[™ÈHÚYÛ™Y™\]Y\Ý]™\žHÙXÛÛ™‚ˆ›ˆ]šXÙWØÛÛ[X[™ØÛÛ›Û
+ˆ	œÙ[‹ˆ]šXÙNˆ	‘]šXÙT™XÛÜ™ˆÛÛ[X[™ÚYˆ	œÝ‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]ÝÜ™HHÙ[‹›ØÚÙYÜÝÜ™J
+OÎÂˆ]™XÛÜ™HÝÜ™Bˆ™]šXÙWØÛÛ[X[™
+ÛÛ[X[™ÚY
+Bˆ›X\Ù\œŠ[\›˜[
+OÂˆ™š[\Š™XÛÜ™™XÛÜ™™]šXÙWÚYOH]šXÙK™]šXÙWÚY
+Bˆ›Ú×ÛÜŠ
+•[šÛ›ÝÛˆ]šXÙHÛÛ[X[™‹×ÜÝš[™Ê
+JJOÎÂˆËÈ]]Üš]K[X™\˜][H›Ý™XY[™\ÜËˆHYÙH]ÛÙ\ÈÈBˆËÈ˜XÚÙÜ›Ý[™ÜÙ\È™XY[™\ÜÈ›ÜˆH[ÛY[È[[™ÈH™XÛÜ™[™È[™XYBˆËÈ[ˆ›ÙÜ™\ÜÈ]]Ø\È™]›ÚÙYÛÝ[Ý]]ÚÜÝ™\ˆHÛ[˜ÙH]ˆËÈ[›Ý\ˆ\ˆÚ][™ÈH[›š[™ÈÛÛ[X[™\™H\ÈHÜ\˜]ÜˆZÚ[™ÂˆËÈHÜ˜[]Ø^KÜˆHZ\š[™È]Ù[ˆÛÚ[™Ë‚ˆ]™]›ÚÙYBˆY]šXÙK˜XÝ]™J
+HYÜ˜[YØØ\Xš[]Y\Ê]šXÙJK˜ÛÛZ[œÊ	œ™XÛÜ™˜Ø\Xš[]JNÂˆ]ÛÛ›ÛH]šXÙPÛÛ[X[™ÛÛ›ÛÂˆ›ÝØÛÛÝ™\œÚ[ÛŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆÛÛ[X[™ÚYˆ™XÛÜ™˜ÛÛ[X[™ÚY˜ÛÛ™J
+KˆÝ]Nˆ™XÛÜ™œÝ]KˆØ[˜Ù[Ü™\]Y\ÝYˆ™XÛÜ™˜Ø[˜Ù[Ü™\]Y\ÝYˆ™]›ÚÙYˆXY[™WÛ\Îˆ™XÛÜ™™^\™\×Ø]Û\ËˆNÂˆ]ÈH›Ý×Û\ÎÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽ×Ý˜[YJ	˜ÛÛ›Û
+K›X\Ù\œŠ[\›˜[
+OËˆÛÛYJ™XÛÜ™˜ÛÛ[X[™ÚY
+Kˆ
+JBˆB‚ˆËËÈH]šXÙIÜÈ\›Z[˜[™\ÜÚ][žH\Y˜XÝ]›ÙXÙY‚ˆ›ˆ]šXÙWØÛÛ[X[™Ü™\Ý[
+ˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ]šXÙNˆ	‘]šXÙT™XÛÜ™ˆÛÛ[X[™ÚYˆ	œÝ‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]™\Ý[ˆ]šXÙPÛÛ[X[™™\Ý[HÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJBˆ›X\Ù\œŠ\œ›ÜŸ
+›Ü›X]J’[˜[Y]šXÙHÛÛ[X[™™\Ý[ˆÙ\œ›ÜŸHŠJJOÎÂˆËÈH]šXÙIÜÈÝÛˆXÛ\™Y›Ý[™™]™\ˆÚY[œÈHÜ\˜]Ü‰ÜÎˆBˆËÈ\Y˜XÝYÙ]ÛˆHZ\š[™È\ÈHÙZ[[™ÈZ]\ˆØ^K‚ˆ™\Ý[ˆ˜[Y]J]šXÙKœØÛÜ\Ë›X^Ø\Y˜XÝØž]\ÊBˆ›X\Ù\œŠ\œ›ÜŸ
+\œ›ÜŠJOÎÂˆËÈXÛÙY[™YÙ\ÝY™Y›Ü™H[ž][™È\ÈÜš][‹™XØ]\ÙHHYÙ\Ý\ÂˆËÈÚ]XÚY\ÈÚ]\ˆ\È[]™\žH\ÈH™]žHÙˆHÝÜ™Y™\Ý[Ü‚ˆËÈHÛÛ˜YXÝ[ÛˆÙˆ]8 %[™HÛÛ˜YXÝ[Ûˆ]\Ý›Ý™XXÚBˆËÈ\Y˜XÝš[H][‚ˆ]XÛÙYHX]Ú
+	œ™\Ý[˜\Y˜XÝØ˜\ÙM	œ™\Ý[˜\Y˜XÝÛYYXWÝ\JHÂˆ
+ÛÛYJ[˜ÛÙY
+KÛÛYJYYXWÝ\JJHOˆÂˆ]ž]\ÈHÕS‘T‘ˆ™XÛÙJ[˜ÛÙY
+Bˆ›X\Ù\œŠß
+‘]šXÙH\Y˜XÝ\È›Ý˜[Y˜\ÙM‹×ÜÝš[™Ê
+JJOÎÂˆYˆž]\Ë›[Š
+H\ÈMˆ]šXÙKœØÛÜ\Ë›X^Ø\Y˜XÝØž]\ÈÂˆ™]\›ˆ\œŠ
+ˆLËˆ‘]šXÙH\Y˜XÝ^ÙYYÈ\ÈZ\š[™ÉÜÈ\Y˜XÝYÙ]‹×ÜÝš[™Ê
+Kˆ
+JNÂˆBˆ]ÚLMˆHÚLM—Ú^
+	˜ž]\ÊNÂˆYˆ]ÛÛYJXÛ\™Y
+HH	œ™\Ý[˜\Y˜XÝÜÚLMˆÂˆYˆXÛ\™YOH	œÚLMˆÂˆ™]\›ˆ\œŠ
+ˆˆ•H\Y˜XÝ	ÜÈž]\ÈÈ›ÝX]ÚHYÙ\ÝH]šXÙHXÛ\™Y‚ˆ×ÜÝš[™Ê
+Kˆ
+JNÂˆBˆBˆÛÛYJ
+ˆž]\Ëˆ]šXÙP\Y˜XÝÂˆÚLM‹ˆž]\ÎˆˆYYXWÝ\NˆYYXWÝ\K˜ÛÛ™J
+KˆKˆ
+JBˆBˆÈOˆ›Û™KˆNÂˆ]\Y˜XÝHXÛÙY˜\×Ü™YŠ
+K›X\
+
+ž]\Ë\Y˜XÝ
+_]šXÙP\Y˜XÝÂˆž]\Îˆž]\Ë›[Š
+H\ÈMˆ‹˜\Y˜XÝ˜ÛÛ™J
+BˆJNÂˆ]YÙ\ÝH\›Z[˜[ÙYÙ\Ý
+ˆ™\Ý[›Ý]ÛÛYKˆ™\Ý[œ™\Ý[˜\×Ü™YŠ
+Kˆ\Y˜XÝ˜\×Ü™YŠ
+K›X\
+\Y˜XÝ\Y˜XÝœÚLM‹˜\×ÜÝŠ
+JKˆ™\Ý[ˆ™\œ›Ü‚ˆ˜\×Ù\™YŠ
+Bˆ›X\
+\œ›ÜŸÝ\\ŽŽœÝÜ™NŽ˜›Ý[™Y
+\œ›Ü‹ÌMŠJBˆ˜\×Ù\™YŠ
+Kˆ
+NÂˆËÈœ›ÛH\™HÈHXÚÛ›ÝÛYÙ[Y[\ÈÛ™HÙ\šX[^™YÛÛ[Z]\ˆÛÛ[X[™‚ˆËÈÛÈÛÛ™›XÝ[™È™\ÜÈ˜XÚ[™ÈXXÚÝ\ˆ]\Ý›Ý™HX›HÈX]™BˆËÈH›ÝÈ˜[Z[™ÈÛ™HYÙ\Ý[™Hš[HÛ[™ÈHÝ\‰ÜÈž]\Ë‚ˆ]ÛÛ[Z]HÙ[‹\›Z[˜[ØÛÛ[Z]ÛØÚÊÛÛ[X[™ÚY
+NÂˆ]ØÛÛ[Z][™ÈHÛÛ[Z]ˆ›ØÚÊ
+Bˆ›X\Ù\œŠß[\›˜[
+‘]šXÙHÛÛ[X[™ÛÛ[Z]ØÚÈØ\ÈÚ\ÛÛ™YŠJOÎÂˆËÈ™K\™XY
+š[œÚYJˆHØÚÎˆÚ]]™\ˆØ\ÈYH™Y›Ü™H]Ø\ÈZÙ[ˆ\ÂˆËÈ^XÝHHÝ]HH˜XÚ[™ÈÛÛ[Z]X^H]™HÚ[™ÙY‚ˆ][™XYWÝ\›Z[˜[HÂˆ]ÝÜ™HHÙ[‹›ØÚÙYÜÝÜ™J
+OÎÂˆ]^\Ý[™ÈHÝÜ™Bˆ™]šXÙWØÛÛ[X[™
+ÛÛ[X[™ÚY
+Bˆ›X\Ù\œŠ[\›˜[
+OÂˆ™š[\Š™XÛÜ™™XÛÜ™™]šXÙWÚYOH]šXÙK™]šXÙWÚY
+Bˆ›Ú×ÛÜŠ
+•[šÛ›ÝÛˆ]šXÙHÛÛ[X[™‹×ÜÝš[™Ê
+JJOÎÂˆYˆ^\Ý[™ËœÝ]K\›Z[˜[
+
+HÂˆYˆ]ÛÛYJÝÜ™Y
+HH	™^\Ý[™Ë\›Z[˜[ÜÚLMˆÂˆYˆÝÜ™YOH	™YÙ\ÝÂˆËÈHÜÙ\‹[™]Ú[™Ù\È›Ý[™Îˆ›ÝHš[K›ÝˆËÈH›ÝË›ÝHYÙ\Ýˆ]\È™Y\ÙY™Y›Ü™HHÚ[™ÛBˆËÈž]HÙˆ]È\Y˜XÝ\ÈÜš][‹‚ˆ™]\›ˆ\œŠ
+ˆKˆ›Ü›X]Jˆ•\ÈÛÛ[X[™[™XYH™\ÜYßH[™]™\Ý[\Èˆ]]Üš]]]™NÈHY™™\™[™\Ý[Ø[››Ý™\XÙH]‹ˆ^\Ý[™ËœÝ]K˜\×ÜÝŠ
+Bˆ
+Kˆ
+JNÂˆBˆBˆYBˆH[ÙHÂˆËÈÜÝ\\ÈH]]Üš^˜][Ûˆ›Ý[™\žH›ÜˆH\ÚXØ[Y™™XÝˆËÈÛÈH\›Z[˜[™\Ü\ÈÛ›HYX[š[™Ù[œ›ÛHH˜\ˆÚYHÙ‚ˆËÈ]ˆXØÙ\[™ÈÛ™H›ÜˆH]Y]YYÜˆX\ÙYÛÛ[X[™ÛÝ[]ˆËÈ[ˆ]][XØ]Y]šXÙH[œÝÙ\ˆ›Üˆ[ˆXÝ[ÛˆH[›™\ˆ™]™\‚ˆËÈ]]Üš^™Y8 %[™ÚÚ\H™XY[™\ÜËÜ˜[[™Ø[˜Ù[][Û‚ˆËÈÚXÚÜÈ]›Ý[™\žH^\ÝÈÈXZÙK‚ˆYˆ^\Ý[™ËœÝ]HOH]šXÙPÛÛ[X[™Ý]NŽ”[›š[™ÈÂˆ™]\›ˆ\œŠ
+ˆKˆ›Ü›X]Jˆ•\ÈÛÛ[X[™\ÈßH[™\È›Ý™Y[ˆÝ\YÈH™\Ý[Ø[ˆÛ›H™Hˆ™\ÜY›ÜˆH[›š[™ÈÛÛ[X[™‹ˆ^\Ý[™ËœÝ]K˜\×ÜÝŠ
+Bˆ
+Kˆ
+JNÂˆBˆËÈÝÛ™\œÚ\\ÈÙ]Y™Y›Ü™HH\Y˜XÝ\ÈX›\ÚY›ÝˆËÈY\Žˆ[ˆ^XÝ][Ûˆ]Ù\È›ÝÛ\ÈÛÛ[X[™]\Ý›ÝˆËÈ™HX›HÈÜš]HÝ™\ˆH\Y˜XÝ]ÙˆHÛ™H]Ù\Ë‚ˆËÂˆËÈHZ\ÜÚ[™ÈY[]H\È™Y\ÙY\Èš\›[H\ÈHÜ›Û™ÈÛ™KˆBˆËÈZ\‹[Ù‹XÛÛYXÈ\Ý]™\XÙ\È][ˆÛZ]Y^XÝ][Û—ÚYˆËÈ›ÝYÚ8 %HÛ™H›Ü›HHÙXÛÛ™^XÝ][ÛˆØ[ˆ[Ø^\È›ÙXÙK‚ˆX]Ú
+	™^\Ý[™Ë™^XÝ][Û—ÚY™\Ý[™^XÝ][Û—ÚY˜\×Ù\™YŠ
+JHÂˆ
+ÛÛYJ[
+KÛÛYJÙ™™\™Y
+JHYˆ[OHÙ™™\™YOˆßBˆ
+ÛÛYJÊKÊHOˆÂˆ™]\›ˆ\œŠ
+ˆKˆ•\È™\Ý[Ù\È›Ý˜[YHH^XÝ][Ûˆ]ÛÈHÛÛ[X[™‚ˆ×ÜÝš[™Ê
+Kˆ
+JNÂˆBˆËÈÝ\YžHHZ[]Y›È^XÝ][ÛˆY[]HÈÚ]™K‚ˆËÈ›Ý[™È]\Ý™HÚ[[X›Ý]]ˆ[ˆYÙ™™\™YYØZ[œÝBˆËÈÛÛ[X[™]™]™\ˆ™XÛÜ™YÛ™H›Ý™\È›Ý[™Ë‚ˆ
+›Û™K›Û™JHOˆßBˆ
+›Û™KÛÛYJÊJHOˆÂˆ™]\›ˆ\œŠ
+ˆKˆ•\ÈÛÛ[X[™Ø\ÈÝ\YÚ]Ý][ˆ^XÝ][ÛˆY[]H[™Ø[››Ý™HˆÛÛ\]Y[™\ˆÛ™H‚ˆ×ÜÝš[™Ê
+Kˆ
+JNÂˆBˆBˆ˜[ÙBˆBˆNÂˆËÈH™\^HX›\Ú\È›Ý[™ËˆHÝÜ™Yž]\È\™HH]]Üš]]]™BˆËÈÛ™\È[™^H\™H[™XYHÛˆ\ÚÈ[™\ˆ\ÈÛÛ[X[™	ÜÈ˜[YNÈ™]Üš][™ÂˆËÈ[HÛÝ[™HHÜš]HÚ]›È[œÝÙ\ˆ]ÛÝ[Ú[™ÙK‚ˆYˆX[™XYWÝ\›Z[˜[ÂˆYˆ]ÛÛYJ
+ž]\ËÊJHH	™XÛÙYÂˆÙ[‹œ\œÚ\ÝÙ]šXÙWØ\Y˜XÝ
+ÛÛ[X[™ÚYž]\ÊOÎÂˆBˆBˆ]™XÛÜ™HÙ[‚ˆ›ØÚÙYÜÝÜ™J
+OÂˆ˜ÛÛ\]WÙ]šXÙWØÛÛ[X[™
+ˆ	™]šXÙK™]šXÙWÚYˆÛÛ[X[™ÚYˆ™\Ý[›Ý]ÛÛYKˆ™\Ý[œ™\Ý[˜\×Ü™YŠ
+Kˆ\Y˜XÝ˜\×Ü™YŠ
+Kˆ™\Ý[™\œ›Ü‹˜\×Ù\™YŠ
+Kˆ™\Ý[™^XÝ][Û—ÚY˜\×Ù\™YŠ
+Kˆ›Ý×Û\Ëˆ
+Bˆ›X\Ù\œŠ\œ›ÜŸ
+K\œ›ÜŠJOÎÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆ˜ÛÛ[X[™ÚYŽˆ™XÛÜ™˜ÛÛ[X[™ÚYˆœÝ]HŽˆ™XÛÜ™œÝ]K˜\×ÜÝŠ
+KˆËÈH]]Üš]]]™H™XÛÜ™ÛÈH™]žZ[™È]šXÙHØ[ˆÙYH]ˆËÈÚ]H[›™\ˆÛÈ\ÈÚ]][]™\™Y8 %[™ÝÜ‚ˆ˜XÚÛ›ÝÛYÙYŽˆYKˆ˜\Y˜XÝÜÚLMˆŽˆ™XÛÜ™˜\Y˜XÝ˜\×Ü™YŠ
+K›X\
+\Y˜XÝ\Y˜XÝœÚLM‹˜ÛÛ™J
+JKˆJKˆÛÛYJ™XÛÜ™˜ÛÛ[X[™ÚY
+Kˆ
+JBˆB‚ˆËËÈHÛÛ[Z]ØÚÈ›ÜˆÛ™HÛÛ[X[™Z[YÛˆš\œÝ\ÙK‚ˆËËÂˆËËÈÝÙ\Ú[HHX\\È[˜]\ˆ[ˆÛˆH[Y\Žˆ[ˆ[žH›Ø›ÙH[ÙBˆËËÈÛÈ\ÈHÛÛ[X[™ÚÜÙHÛÛ[Z]\ÈÝ™\‹[™›Ü[™È]ÛÜÝÈÛ™BˆËËÈÛÛ\\š\ÛÛ‹ˆH›Ý[™\ÈÚ]ÝÜÈHÛ™Ë[]™Y[›™\ˆXØÝ[][][™ÈÛ™BˆËËÈ]]^\ˆÛÛ[X[™]]™\ˆÛÛ\]Y‚ˆ›ˆ\›Z[˜[ØÛÛ[Z]ÛØÚÊ	œÙ[‹ÛÛ[X[™ÚYˆ	œÝŠHOˆ\˜Ï]]^
+
+OˆÂˆ]]]ØÚÜÈHX]ÚÙ[‹\›Z[˜[ØÛÛ[Z]Ë›ØÚÊ
+HÂˆÚÊ˜[YJHOˆ˜[YKˆËÈHÚ\ÛÛ™YX\\È›ÝH™X\ÛÛˆÈÚÚ\Ù\šX[^˜][ÛŽˆ[‚ˆËÈ[œÚ\™YØÚÈÝ[Ù\šX[^™\È›Ý[™È]\ÈØY™HÈ™]\›‹[™ˆËÈHÛÛ[Z]™[ÝÈ™K\™XYÈ]]Üš]]]™HÝ]HZ]\ˆØ^K‚ˆ\œŠÚ\ÛÛ™Y
+HOˆÚ\ÛÛ™Yš[×Ú[›™\Š
+KˆNÂˆYˆØÚÜË›[Š
+HˆMˆÂˆØÚÜËœ™]Z[ŠËØÚß\˜ÎŽœÝ›Û™×ØÛÝ[
+ØÚÊHˆJNÂˆBˆ\˜ÎŽ˜ÛÛ™JˆØÚÜÂˆ™[žJÛÛ[X[™ÚY×ÜÝš[™Ê
+JBˆ›Ü—Ú[œÙ\ÝÚ]
+\˜ÎŽ›™]Ê]]^Ž›™]Ê
+
+JJJKˆ
+BˆB‚ˆËËÈÜš]\ÈÛ™H\Y˜XÝÛÈHÜ˜\ÚØ[ˆ™]™\ˆX]™HHÝÜ™Y™XÛÜ™Ú[[™ÂˆËËÈ]ž]\È]\™H›Ý\™K‚ˆËËÂˆËËÈÝYÙY[™\ˆH]\›Z[š\ÝXÈ[\Ü˜\žH˜[YK›\ÚY[ˆ™[˜[YYÛÂˆËËÈHš[˜[]8 %H™[˜[YH\È]ÛZXËÛÈHš[H]H\Ý[˜][Ûˆ\ÂˆËËÈZ]\ˆH™]š[Ý\ÈÛÛ\]H\Y˜XÝÜˆ\ÈÛÛ\]HÛ™K™]™\ˆBˆËËÈ[‹]Üš][ˆZ^\™KˆHˆ›ÝÈ\ÈÜš][ˆY\Ø\™Îˆ[ˆÜœ[™YˆËËÈÝYÚ[™Èš[HÜˆ[ˆ\Y˜XÝÚ]›È›ÝÈ\È™XÛÝ™\˜X›KH›ÝÈ˜[Z[™ÂˆËËÈž]\È]È›Ý^\Ý\È›Ý‚ˆ›ˆ\œÚ\ÝÙ]šXÙWØ\Y˜XÝ
+	œÙ[‹ÛÛ[X[™ÚYˆ	œÝ‹ž]\Îˆ	–ÝNJHOˆ™\Ý[
+
+K
+LM‹Ýš[™ÊOˆÂˆ\ÙHÝŽš[ÎŽ•Üš]NÂˆ]\™XÝÜžHHÙ[‹œ]Ëœ›ÛÝš›Ú[Š™]šXÙKX\Y˜XÝÈŠNÂˆ]ÝYÚ[™ÈH\™XÝÜžKš›Ú[ŠœÝYÚ[™ÈŠNÂˆÝŽ™œÎŽ˜Ü™X]WÙ\—Ø[
+	œÝYÚ[™ÊK›X\Ù\œŠ\œ›ÜŸÂˆ[\›˜[
+›Ü›X]JˆÛÝ[›ÝÜ™X]H]šXÙH\Y˜XÝ\™XÝÜžNˆÙ\œ›ÜŸH‚ˆ
+JBˆJOÎÂˆÙ[ŽŽœÝÙY\ÜÝ[WÜÝYÚ[™Ê	œÝYÚ[™ÊNÂˆ][\Ü˜\žHHÝYÚ[™Ëš›Ú[Š›Ü›X]JžØÛÛ[X[™ÚYKœ\ŠJNÂˆÂˆ]]]š[HHÝŽ™œÎŽ‘š[NŽ˜Ü™X]J	[\Ü˜\žJBˆ›X\Ù\œŠ\œ›ÜŸ[\›˜[
+›Ü›X]JÛÝ[›ÝÝYÙH]šXÙH\Y˜XÝˆÙ\œ›ÜŸHŠJJOÎÂˆš[KÜš]WØ[
+ž]\ÊBˆ›X\Ù\œŠ\œ›ÜŸ[\›˜[
+›Ü›X]JÛÝ[›ÝÝYÙH]šXÙH\Y˜XÝˆÙ\œ›ÜŸHŠJJOÎÂˆš[KœÞ[˜×Ø[
+
+Bˆ›X\Ù\œŠ\œ›ÜŸ[\›˜[
+›Ü›X]JÛÝ[›Ý›\Ú]šXÙH\Y˜XÝˆÙ\œ›ÜŸHŠJJOÎÂˆBˆËÈHÛÛ[X[™Y˜[Y\ÈHš[˜[š[KÛÈH™]šYY™\Ü™\XÙ\È]ÂˆËÈÝÛˆž]\ÈÚ]Y[XØ[Û™\È[™Ø[ˆ™]™\ˆÜ™X]HHÙXÛÛ™\Y˜XÝ‚ˆÝŽ™œÎŽœ™[˜[YJ	[\Ü˜\žK\™XÝÜžKš›Ú[ŠÛÛ[X[™ÚY
+JBˆ›X\Ù\œŠ\œ›ÜŸ[\›˜[
+›Ü›X]JÛÝ[›Ý\œÚ\Ý]šXÙH\Y˜XÝˆÙ\œ›ÜŸHŠJJOÎÂˆÚÊ
+
+JBˆB‚ˆËËÈ™[[Ý™\ÈÝYÙYš[\ÈHÜ˜\ÚY\ØYY™Z[™ˆ™\ÝYY™›Ü[™ˆËËÈÚ[[ˆ[ˆÜœ[ˆÛÜÝÈ\ÚË™]™\ˆÛÜœ™XÝ™\ÜË[™˜Z[[™ÈH]™BˆËËÈ[]™\žH™XØ]\ÙH[ˆÛ[\Ü˜\žHš[HÛÝ[›Ý™H™[[Ý™YÛÝ[™HBˆËËÈÛÜœÙH˜YK‚ˆ›ˆÝÙY\ÜÝ[WÜÝYÚ[™ÊÝYÚ[™Îˆ	œÝŽœ]Ž”]
+HÂˆÛÛœÝÕSWÐQ•TŽˆÝŽ[YNŽ‘\˜][ÛˆHÝŽ[YNŽ‘\˜][ÛŽŽ™œ›ÛWÜÙXÜÊŒ
+ˆŒ
+NÂˆ]ÚÊ[šY\ÊHHÝŽ™œÎŽœ™XYÙ\ŠÝYÚ[™ÊH[ÙHÂˆ™]\›ŽÂˆNÂˆ›Üˆ[žH[ˆ[šY\Ë™›][Š
+HÂˆ]Ý[HH[žBˆ›Y]Y]J
+Bˆ˜[™Ý[ŠY]Y]_Y]Y]K›[ÙYšYY
+
+JBˆ›X\
+[ÙYšYY[ÙYšYY™[\ÙY
+
+K[Ü˜\ÛÜ—ÙY˜][
+
+HˆÕSWÐQ•TŠBˆ[Ü˜\ÛÜŠ˜[ÙJNÂˆYˆÝ[HÂˆ]ÈHÝŽ™œÎŽœ™[[Ý™WÙš[J[žKœ]
+
+JNÂˆBˆBˆB‚ˆËËÈÛ™HÚ[šÈÙˆH]™HZXÜ›ÜÛ™HÝ™X[K‚ˆËËÂˆËËÈHÝÜ™HØÚÈ\ÈZÙ[ˆÛ˜ÙH[™[XÜ›ÜÜÈH\ÚÈÜš]HÛˆ\œÜÙN‚ˆËËÈ]\ÈÚ]XZÙ\È˜ÚXÚÈHÙ\]Y[˜ÙK\[™[Ý™HHÛÝ[\ˆˆ]ÛZXËˆËËÈ[™\™Y›Ü™HÚ]ÝÜÈÛÈÛÛ˜Ý\œ™[ÜÝÈÙˆHØ[YHÚ[šÈœ›ÛBˆËËÈÜš][™ÈH]Y[ÈÚXÙK‚ˆ›ˆ›ÚXÙWØÚ[šÊˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ]šXÙNˆ	‘]šXÙT™XÛÜ™ˆÙ\ÜÚ[Û—ÚYˆ	œÝ‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]™\]Y\Ýˆ›ÚXÙPÚ[šÔ™\]Y\ÝHÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJBˆ›X\Ù\œŠ\œ›ÜŸ
+›Ü›X]J’[˜[Y›ÚXÙHÚ[šÎˆÙ\œ›ÜŸHŠJJOÎÂˆ™\]Y\Ý˜[Y]J
+K›X\Ù\œŠ\œ›ÜŸ
+\œ›ÜŠJOÎÂˆ]]Y[ÈHÕS‘T‘ˆ™XÛÙJ	œ™\]Y\Ý˜]Y[×Ø˜\ÙM
+Bˆ›X\Ù\œŠß
+•›ÚXÙHÚ[šÈ]Y[È\È›Ý˜[Y˜\ÙM‹×ÜÝš[™Ê
+JJOÎÂˆYˆ]Y[Ë›[Š
+HˆPVÕ“ÒPÑWÐÒS’×Ð–UTÈÂˆ™]\›ˆ\œŠ
+LË•›ÚXÙHÚ[šÈ^ÙYYÈH\‹XÚ[šÈÙZ[[™È‹×ÜÝš[™Ê
+JJNÂˆBˆ]]]ÝÜ™HHÙ[‹›ØÚÙYÜÝÜ™J
+OÎÂˆ]Ý]ÛÛYHHÝ\\ŽŽ›ÚXÙNŽ˜XØÙ\ØÚ[šÊˆ	œÙ[‹œ]Ëœ›ÛÝˆ	›]]ÝÜ™Kˆ	™]šXÙK™]šXÙWÚYˆÙ\ÜÚ[Û—ÚYˆ	œ™\]Y\Ýˆ	˜]Y[Ëˆ›Ý×Û\Ëˆ
+OÎÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆœÙ\ÜÚ[Û—ÚYŽˆÙ\ÜÚ[Û—ÚYˆ˜XØÙ\YŽˆÝ]ÛÛYK˜XØÙ\Yˆ›™^ÜÙ\]Y[˜ÙHŽˆÝ]ÛÛYK›™^ÜÙ\]Y[˜ÙKˆ˜ž]\ÈŽˆÝ]ÛÛYK˜ž]\ËˆËÈH]šXÙIÜÈÝÜÚYÛ˜[ÛˆH™\HÈH™\]Y\Ý]\ÂˆËÈ[™XYHXZÚ[™Ëˆ›ÈÙXÛÛ™Û^\ÝÈ›ÜˆHØ[˜Ù[][ÛˆÂˆËÈ™HZ\ÜÙYÛ‹‚ˆœÝÜŽˆÝ]ÛÛYKœÝÜˆJKˆÛÛYJÙ\ÜÚ[Û—ÚY×ÜÝš[™Ê
+JKˆ
+JBˆB‚ˆËËÈH]šXÙH[™[™ÈHÝ™X[K[™Ú]]HÛÛ›ÛÛÛ[X[™]›ÙHÛ‹‚ˆ›ˆ›ÚXÙWØÛÜÙJˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ]šXÙNˆ	‘]šXÙT™XÛÜ™ˆÙ\ÜÚ[Û—ÚYˆ	œÝ‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]™\]Y\Ýˆ›ÚXÙPÛÜÙT™\]Y\ÝHYˆ›ÙKš\×Ù[\J
+HÂˆ›ÚXÙPÛÜÙT™\]Y\ÝÂˆ›ÝØÛÛÝ™\œÚ[ÛŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆ\œ›ÜŽˆ›Û™KˆBˆH[ÙHÂˆÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJBˆ›X\Ù\œŠ\œ›ÜŸ
+›Ü›X]J’[˜[Y›ÚXÙHÛÜÙNˆÙ\œ›ÜŸHŠJJOÂˆNÂˆ™\]Y\Ý˜[Y]J
+K›X\Ù\œŠ\œ›ÜŸ
+\œ›ÜŠJOÎÂˆ]]]ÝÜ™HHÙ[‹›ØÚÙYÜÝÜ™J
+OÎÂˆ]™XÛÜ™HÝ\\ŽŽ›ÚXÙNŽ˜ÛÜÙJˆ	›]]ÝÜ™Kˆ	™]šXÙK™]šXÙWÚYˆÙ\ÜÚ[Û—ÚYˆ™\]Y\Ý™\œ›Ü‹˜\×Ù\™YŠ
+Kˆ›Ý×Û\Ëˆ
+OÎÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆœÙ\ÜÚ[Û—ÚYŽˆ™XÛÜ™œÙ\ÜÚ[Û—ÚYˆœÝ]HŽˆ™XÛÜ™œÝ]K˜\×ÜÝŠ
+Kˆ˜Ú[šÜÈŽˆ™XÛÜ™›™^ÜÙ\]Y[˜ÙKˆ˜ž]\ÈŽˆ™XÛÜ™˜ž]\ËˆJKˆÛÛYJ™XÛÜ™œÙ\ÜÚ[Û—ÚY
+Kˆ
+JBˆB‚ˆËËÈH\XØ][Û”Ù\™\’Ù^XHœ›ÝÜÙ\ˆ™YYÈ™Y›Ü™H]Ø[ˆÝXœØÜšX™K‚ˆËËÂˆËËÈX›XÈžHÛÛœÝXÝ[Ûˆ8 %]\ÈH
+œX›XÊˆ[ˆÙˆ\È[›™\‰ÜÈTQˆËËÈY[]K[™H\ÚÙ\šXÙHÚXÚÜÈÚYÛ˜]\™\ÈYØZ[œÝ]ˆ[œÝÙ\š[™ÈˆËËÈÚ[ˆÙXˆ\Ú\È›ÝÛÛ™šYÝ\™Y\ÈÚ][ÈHÛY[›ÝÈÙ™™\‚ˆËËÈ›ÝYšXØ][ÛœÈ][‚ˆ›ˆ]šXÙWÜ\ÚÚÙ^J	œÙ[ŠHOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆX]ÚÝ\\ŽŽœ\ÚŽ˜\XØ][Û—ÜÙ\™\—ÚÙ^J	œÙ[‹œ]ËÙ[‹œÙXÜ™]Ë˜\×Ü™YŠ
+JHÂˆÚÊÛÛYJÙ^JJHOˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆ˜˜XÚÙ[™ŽˆÙX—Ü\Ú‹ˆ˜\XØ][Û—ÜÙ\™\—ÚÙ^HŽˆÙ^KˆJKˆ›Û™Kˆ
+JKˆÚÊ›Û™JHOˆ\œŠ
+•\È[›™\ˆÙ\È›ÝÙ[™ÙXˆ\Ú‹×ÜÝš[™Ê
+JJKˆ\œŠ\œ›ÜŠHOˆ\œŠ
+LË\œ›ÜŠJKˆBˆB‚ˆ›ˆ]šXÙWÜ\ÚÜ™YÚ\Ý\Šˆ	œÙ[‹ˆ›ÙNˆ	–ÝNKˆ]šXÙWÚYˆ	œÝ‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]\œÙYˆÙ\™WÚœÛÛŽŽ•˜[YHHÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJBˆ›X\Ù\œŠ\œ›ÜŸ
+›Ü›X]J’[˜[Y\Ú™YÚ\Ý˜][ÛŽˆÙ\œ›ÜŸHŠJJOÎÂˆ]˜XÚÙ[™H\œÙYˆ™Ù]
+˜˜XÚÙ[™ŠBˆ˜[™Ý[Š˜[Y_˜[YK˜\×ÜÝŠ
+JBˆ›Ú×ÛÜŠ
+H\Ú™YÚ\Ý˜][Ûˆ™YYÈH	Ø˜XÚÙ[™	È‹×ÜÝš[™Ê
+JJOÎÂˆËÈHÙXˆ\Ú™YÚ\Ý˜][Ûˆ\ÈHœ›ÝÜÙ\‰ÜÈÚÛHÝXœØÜš\[Ûˆ8 %BˆËÈ[™Ú[\ÈHÛÈÙ^\È]Ú[™H[˜Üž\YËˆ]\È˜[Y]YˆËÈ\™K™Y›Ü™HÝÜ˜YÙKÛÈ[ˆ[\ØX›HÝXœØÜš\[Ûˆ\È™Y\ÙY]BˆËÈ[ÛY[H]šXÙHØ[ˆÝ[™HÛX›Ý]]‚ˆ]ÚÙ[ˆHYˆ˜XÚÙ[™OHÙX—Ü\ÚˆÂˆ]ÝXœØÜš\[ÛŽˆÝ\\ŽŽœ\ÚŽ•ÙX”\ÚÝXœØÜš\[ÛˆBˆÙ\™WÚœÛÛŽŽ™œ›ÛWÝ˜[YJ\œÙY™Ù]
+œÝXœØÜš\[ÛˆŠK˜ÛÛ™Y
+
+K[Ü˜\ÛÜ—ÙY˜][
+
+JBˆ›X\Ù\œŠ\œ›ÜŸ
+›Ü›X]J’[˜[Y\ÚÝXœØÜš\[ÛŽˆÙ\œ›ÜŸHŠJJOÎÂˆÝXœØÜš\[Û‹˜[Y]J
+K›X\Ù\œŠ\œ›ÜŸ
+\œ›ÜŠJOÎÂˆÙ\™WÚœÛÛŽŽ×ÜÝš[™Ê	œÝXœØÜš\[ÛŠK›X\Ù\œŠ[\›˜[
+OÂˆH[ÙHÂˆ\œÙYˆ™Ù]
+ÚÙ[ˆŠBˆ˜[™Ý[Š˜[Y_˜[YK˜\×ÜÝŠ
+JBˆ›Ú×ÛÜŠ
+H\Ú™YÚ\Ý˜][Ûˆ™YYÈH	ÝÚÙ[‰È‹×ÜÝš[™Ê
+JJOÂˆ×ÜÝš[™Ê
+BˆNÂˆÙ[‹›ØÚÙYÜÝÜ™J
+OÂˆœØ]™WÜ\ÚÜ™YÚ\Ý˜][ÛŠ]šXÙWÚY˜XÚÙ[™	ÚÙ[‹›Ý×Û\ÊBˆ›X\Ù\œŠ\œ›ÜŸ
+\œ›ÜŠJOÎÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆœ™YÚ\Ý\™YŽˆYKˆJKˆÛÛYJ]šXÙWÚY×ÜÝš[™Ê
+JKˆ
+JBˆB‚ˆ›ˆ]šXÙWÜ\ÚÙ›Ü™Ù]
+ˆ	œÙ[‹ˆ]šXÙWÚYˆ	œÝ‹ˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆÙ[‹›ØÚÙYÜÝÜ™J
+OÂˆ™[]WÜ\ÚÜ™YÚ\Ý˜][ÛŠ]šXÙWÚY
+Bˆ›X\Ù\œŠ[\›˜[
+OÎÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆœ™YÚ\Ý\™YŽˆ˜[ÙKˆJKˆÛÛYJ]šXÙWÚY×ÜÝš[™Ê
+JKˆ
+JBˆB‚ˆ›ˆ[Øš[WÜ™]›ÚÙWÜÙ[Šˆ	œÙ[‹ˆ]šXÙWÚYˆ	œÝ‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]Ú[\ˆHÙ[‚ˆ™\ÚÝÜˆ˜\×Ü™YŠ
+Bˆ›X\
+\ÚÝÜ\˜ÎŽ˜ÛÛ™J\ÚÝÜ
+H\È\˜Ï[ˆÝ\\ŽŽœÝÜ™NŽ‘\ÚÝÜÙ\ÜÚ[Û’Ú[\ŠNÂˆÙ[‹›ØÚÙYÜÝÜ™J
+OÂˆœ™]›ÚÙWÙ]šXÙJˆ]šXÙWÚYˆ”Ù[‹\™]›ÚÙYœ›ÛHHZ\™Y[Øš[H]šXÙH‹ˆ›Ý×Û\ËˆÙ[‹œÙXÜ™]Ë˜\×Ü™YŠ
+KˆÚ[\‹˜\×Ù\™YŠ
+Kˆ
+Bˆ›X\Ù\œŠ[\›˜[
+OÎÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆœ›ÝØÛÛÝ™\œÚ[ÛˆŽˆ‘SSÕWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆœ™]›ÚÙYŽˆYKˆJKˆÛÛYJ]šXÙWÚY×ÜÝš[™Ê
+JKˆ
+JBˆB‚ˆËÈKKHÝŒKÜ™[[ÝKÛ›ÙKÊ˜[™\œÈ
+›ØYX\ÌMÊHKKKKKKKKKKKKKKKKKKKKKKKB‚ˆËËÈH\Y]H\™XÝÜžH\È›ÙIÜÈXˆ[™ÛÜšÙ›ÝÈÙ\šXÙH]™H[™\‹‚ˆËËÈHY[[Ûˆ›ÛÝ\ÈHÚ[Ùˆ]ÚXÚ\ÈHØ[YH\š]˜][ÛˆH[Øš[BˆËËÈÛÜšÙ›ÝÈ›Ý]\ÈX›Ý™H[™XYHXZÙK‚ˆ›ˆ\Ù]J	œÙ[ŠHOˆ™\Ý[ÝŽœ]Ž”]Y‹
+LM‹Ýš[™ÊOˆÂˆÙ[‹œ]Âˆœ›ÛÝˆœ\™[
+
+Bˆ›X\
+ÝŽœ]Ž”]Ž×Ü]ØYŠBˆ›Ú×ÛÜ—Ù[ÙJ[\›˜[
+‘Y[[Ûˆ›ÛÝ\È›È\Y]H\™[ŠJBˆB‚ˆËËÈHÜ\˜]Ü‹\Ù]Y[]HÙˆ\È›ÙK‚ˆËËÂˆËËÈ›Ý˜[Y\È\™HÜ\˜]ÜˆÝ][Y[È[[ˆHY[[Û‰ÜÈÝÛˆY]HX›KˆËËÈ›Ý[™™\œ™Yˆ›Ý[™ÈØ[ˆ\š]™HÚXÚ\š\ÙXÝ[ÛˆHXXÚ[™IÜÈ\ÚÜÈ\™BˆËËÈ[‹[™HÝY\ÜÈ\™H\ÈÛÜœÙH[ˆ[ˆ^XÚ]ˆËËÈØ‘TÒQSÖWÕS”ÔPÒQ’QQJ]WÛ[ÛšÙ^WÛXŽŽ››ÙWÜXÙ[Y[Ž”‘TÒQSÖWÕS”ÔPÒQ’QQ
+KˆËËÈÚXÚH™\ÚY[˜ÞH[H˜[Z[™ÈH™X[›Û™H™]™\ˆX]Ú\Ë‚ˆ›ˆ›ÙWÚY[]J	œÙ[‹ÝÜ™Nˆ	‘Y[[Û”ÝÜ™JHOˆ
+Ýš[™ËÝš[™ÊHÂˆ]™\ÚY[˜ÞHHÝÜ™Bˆ™Ù]ÛY]J“ÑWÔ‘TÒQSÖWÓQUJBˆ›ÚÊ
+Bˆ™›][Š
+Bˆ™š[\Š˜[Y_]WÛ[ÛšÙ^WÛXŽŽ››ÙWÜXÙ[Y[Ž˜[Y]WÜ™\ÚY[˜ÞJ˜[YJKš\×ÛÚÊ
+JBˆ[Ü˜\ÛÜ—Ù[ÙJÂˆ]WÛ[ÛšÙ^WÛXŽŽ››ÙWÜXÙ[Y[Ž”‘TÒQSÖWÕS”ÔPÒQ’QQ×ÜÝš[™Ê
+BˆJNÂˆ]˜[YHHÝÜ™Bˆ™Ù]ÛY]J“ÑWÓSQWÓQUJBˆ›ÚÊ
+Bˆ™›][Š
+Bˆ[Ü˜\ÛÜ—Ù[ÙJÙ[‹šÜÝœ[›™\—ÚY˜ÛÛ™J
+JNÂˆ
+˜[YK™\ÚY[˜ÞJBˆB‚ˆ›ˆ\ØÜšX™WÛ›ÙJˆ	œÙ[‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[]WÛ[ÛšÙ^WÛXŽŽ››ÙWÜXÙ[Y[Ž“›ÙQ\ØÜš\Ü‹
+LM‹Ýš[™ÊOˆÂˆ\ÙH]WÛ[ÛšÙ^WÛXŽŽ›L×Ü[[YWÚXŽŽ“LÒ\™Ø\™T›Ø™NÂˆ]ÝÜ™HHY[[Û”ÝÜ™NŽ›Ü[Š	œÙ[‹œ]ÊK›X\Ù\œŠ[\›˜[
+OÎÂˆ]ÛÛ™šYÈHÜ˜]NŽ™Y[[ÛŽŽœÝÜ™NŽ‘Y[[ÛÛÛ™šYÎŽ›ØY
+	œÙ[‹œ]ÊK›X\Ù\œŠ[\›˜[
+OÎÂˆ]˜XÚÜ™\ÜÝ\™HHÜ˜]NŽ™Y[[ÛŽŽ˜˜XÚÜ™\ÜÝ\™WÙ›ÜŠ	œÝÜ™K	˜ÛÛ™šYÊK›X\Ù\œŠ[\›˜[
+OÎÂˆ]
+›ÙWÛ˜[YK™\ÚY[˜ÞJHHÙ[‹››ÙWÚY[]J	œÝÜ™JNÂˆËÈHØ[YH›Ø™HHYZ\ÜÚ[ÛˆÛÜ\Ù\ËÛÈHXÙ\ˆ™XYÈH[X™\œÂˆËÈ\È›ÙIÜÈÝÛˆØÚY[\ˆÚ[YÙHH›ØˆYØZ[œÝ8 %›ÝHÙXÛÛ™ˆËÈY™™\™[KXÛÛXÝYšY]ÈÙˆHØ[YHXXÚ[™K‚ˆ]\™Ø\™HH]WÛ[ÛšÙ^WÛXŽŽ›L×Ü›ÙXÝ[ÛŽŽ”Þ\Ý[SLÒ\™Ø\™T›Ø™BˆœÛ˜\ÚÝ
+
+Bˆ›X\Ù\œŠ\œ›ÜŸÂˆ
+ˆLËˆ›Ü›X]J•\È›ÙHÛÝ[›ÝYX\Ý\™H]ÈÝÛˆ\™Ø\™NˆÙ\œ›ÜŸHŠKˆ
+BˆJOÎÂˆÚÊ]WÛ[ÛšÙ^WÛXŽŽ››ÙWÜXÙ[Y[Ž“›ÙQ\ØÜš\ÜˆÂˆ›ÝØÛÛÝ™\œÚ[ÛŽˆ]WÛ[ÛšÙ^WÛXŽŽ››ÙWÜXÙ[Y[Ž““ÑWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆ[›™\—ÚYˆÙ[‹šÜÝœ[›™\—ÚY˜ÛÛ™J
+Kˆ›ÙWÛ˜[YKˆ™\ÚY[˜ÞKˆXØÙ[\˜]ÜœÎˆ]WÛ[ÛšÙ^WÛXŽŽ››ÙWÜXÙ[Y[Ž™\ØÜšX™WØXØÙ[\˜]ÜœÊ	š\™Ø\™JKˆ™\ÚY[Û[Ù[Îˆ™\ÚY[Û[Ù[Ê	œÙ[‹˜\Ù]J
+OÊKˆ\™Ø\™KˆXØÙ\[™Îˆ˜XÚÜ™\ÜÝ\™K˜XØÙ\[™Ëˆ]Y]YWÙ\ˆ˜XÚÜ™\ÜÝ\™Kœ]Y]YWÙ\ˆ]Y]YWØØ\XÚ]Nˆ˜XÚÜ™\ÜÝ\™Kœ]Y]YWØØ\XÚ]KˆØ\\™YØ]Û\Îˆ›Ý×Û\ËˆJBˆB‚ˆ›ˆ›ÙWÙ\ØÜš\ÜŠ	œÙ[ŠHOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆËÈØ\\™YØ]Û\ØÛÛY\Èœ›ÛHH\™Ø\™H›Ø™IÜÈÝÛˆÝ[\˜]\ˆ[‚ˆËÈœ›ÛHH™\]Y\ÝÛØÚÎˆHÛ˜\ÚÝ\ÈHYX\Ý\™[Y[[™Ý[\[™ÂˆËÈ]Ú]Ú[ˆ[ÝH\ÚÙYˆÛÝ[XZÙHHØXÚYÜˆÛÝÈ›Ø™HÛÚÈœ™\Ú‚ˆ]\ØÜš\ÜˆHÙ[‹™\ØÜšX™WÛ›ÙJ
+OÎÂˆ]Ø\\™YØ]Û\ÈH\ØÜš\Ü‹š\™Ø\™K˜Ø\\™YØ]Û\ÎÂˆ]\ØÜš\ÜˆH]WÛ[ÛšÙ^WÛXŽŽ››ÙWÜXÙ[Y[Ž“›ÙQ\ØÜš\ÜˆÂˆØ\\™YØ]Û\Ëˆ‹™\ØÜš\Ü‚ˆNÂˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽ×Ý˜[YJ	™\ØÜš\ÜŠK›X\Ù\œŠ[\›˜[
+OËˆ›Û™Kˆ
+JBˆB‚ˆËËÈHÚX\[ˆÙˆØÙ[ŽŽ››ÙWÙ\ØÜš\Ü˜K›ÜˆHX\™X]‚ˆËËÂˆËËÈÙ\\˜]H™XØ]\ÙHH\ØÜš\Üˆ›Ø™\È\™Ø\™H8 %ÚXÚ›ÜšÜÂˆËËÈšYXK\ÛZXÛˆÕQHÜÝÈ8 %[™HXÙ\ˆÛ[™È]™\žH›ÙH]™\žBˆËËÈÌÙXÛÛ™È]\Ý›ÝXZÙHXXÚ›ÙH^H]ˆ\È™XYÈÛ›HH]Y]YK‚ˆ›ˆ›ÙWÚX[
+ˆ	œÙ[‹ˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]ÝÜ™HHY[[Û”ÝÜ™NŽ›Ü[Š	œÙ[‹œ]ÊK›X\Ù\œŠ[\›˜[
+OÎÂˆ]ÛÛ™šYÈHÜ˜]NŽ™Y[[ÛŽŽœÝÜ™NŽ‘Y[[ÛÛÛ™šYÎŽ›ØY
+	œÙ[‹œ]ÊK›X\Ù\œŠ[\›˜[
+OÎÂˆ]˜XÚÜ™\ÜÝ\™HHÜ˜]NŽ™Y[[ÛŽŽ˜˜XÚÜ™\ÜÝ\™WÙ›ÜŠ	œÝÜ™K	˜ÛÛ™šYÊK›X\Ù\œŠ[\›˜[
+OÎÂˆ]XÙYØXÝ]™HHÙ[‹›ØÚÙYÜÝÜ™J
+OËœXÙYÜ[—ØÛÝ[
+
+K›X\Ù\œŠ[\›˜[
+OÎÂˆ]X[H]WÛ[ÛšÙ^WÛXŽŽ››ÙWÜXÙ[Y[Ž“›ÙRX[Âˆ›ÝØÛÛÝ™\œÚ[ÛŽˆ]WÛ[ÛšÙ^WÛXŽŽ››ÙWÜXÙ[Y[Ž““ÑWÔ“ÕÐÓÓÕ‘T”ÒSÓ‹ˆ[›™\—ÚYˆÙ[‹šÜÝœ[›™\—ÚY˜ÛÛ™J
+Kˆ›Ý×Û\ËˆXØÙ\[™Îˆ˜XÚÜ™\ÜÝ\™K˜XØÙ\[™Ëˆ]Y]YWÙ\ˆ˜XÚÜ™\ÜÝ\™Kœ]Y]YWÙ\ˆ]Y]YWØØ\XÚ]Nˆ˜XÚÜ™\ÜÝ\™Kœ]Y]YWØØ\XÚ]KˆXÙYØXÝ]™KˆNÂˆÚÊ
+ŒÙ\™WÚœÛÛŽŽ×Ý˜[YJ	šX[
+K›X\Ù\œŠ[\›˜[
+OË›Û™JJBˆB‚ˆËËÈ
+Š”›ØYX\ÌMÈÌŽˆ\È›ÙHZÙ\ÈÝÛ™\œÚ\ÙˆH›Ü™ZYÛˆ[”ÜXØŠŠ‚ˆËËÂˆËËÈHÜ™\ˆÙˆHÚXÚÜÈ\ÈHÛÛ˜XÝˆHÜXÈ\È˜[Y]YYØZ[œÝˆËËÈHÚ\™Y›ÝØÛÛš\œÝ[ˆYØZ[œÝ
+\È›ÙIÜÊˆ˜XÝÈ8 %]ÂˆËËÈ™\ÚY[˜ÞK]ÈY[]K]ÈÚ[ÝÚ]Ú8 %[™Û›H[ˆ[™YÈBˆËËÈ]Y]YKÚXÚÝÛœÈH\ÝÛ\ÜÈÙˆ™Y\Ø[
+HÛÜšÜÜXÙH›ÛÝ]Ù\ÂˆËËÈ›Ý^\Ý\™KH\™Ù]\È›ÙHØ[››Ý^XÝ]JKˆ›Ý[™È\È™XÛÜ™YˆËËÈ[[H]Y]YH\ÈXØÙ\YÛÈH™Y\ÙYXÙ[Y[X]™\È›È›ÝÂˆËËÈÛZ[Z[™ÈH›ÙHÛÚÈÛÜšÈ]Y›Ý‚ˆËÈKKHÝŒKÜ™[[ÝKÜY\‹Ê˜KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKB‚ˆËËÈZÙHÛ™H[™[ÜHœ›ÛHHZ\™YY\‹‚ˆËËÂˆËËÈ]™\ž][™È]XÚY\È
+Ú]\Šˆ][œÈ]™\È[ˆHØ]NÈ\È\ÈBˆËËÈ˜[œÜÜ[ˆ8 %\œÙK™Y\ÙHÈXÝÚ[HHÚ[ÝÚ]Ú\ÈÛ‹[™ˆËËÈ\›ˆHØ]IÜÈ™\™XÝ[ÈHÝ]\ÈÛÙHHÙ[™\ˆØ[ˆXÝÛ‹‚ˆ›ˆY\—ÛY\ÜØYÙWÜÜÝ
+ˆ	œÙ[‹ˆ]šXÙNˆ	‘]šXÙT™XÛÜ™ˆ›ÙNˆ	–ÝNKˆ›Ý×Û\ÎˆMˆ
+HOˆ™\Ý[
+LM‹Ù\™WÚœÛÛŽŽ•˜[YKÜ[ÛÝš[™ÏŠK
+LM‹Ýš[™ÊOˆÂˆ]ÛÛYJ]Y]YJHHÙ[‹œY\—Ü[œË˜\×Ü™YŠ
+H[ÙHÂˆ™]\›ˆ\œŠ
+ˆLKˆ•\È›ÙHZ[Ù\È›ÝXØÙ\Y\ˆY\ÜØYÙ\È‹×ÜÝš[™Ê
+Kˆ
+JNÂˆNÂˆ][™[ÜNˆ]WÛ[ÛšÙ^WÛXŽŽœY\œÎŽ”Y\‘[™[ÜHHÙ\™WÚœÛÛŽŽ™œ›ÛWÜÛXÙJ›ÙJBˆ›X\Ù\œŠ\œ›ÜŸ
+›Ü›X]J’[˜[YY\ˆ[™[ÜNˆÙ\œ›ÜŸHŠJJOÎÂˆ]]]ÝÜ™HHY[[Û”ÝÜ™NŽ›Ü[Š	œÙ[‹œ]ÊK›X\Ù\œŠ[\›˜[
+OÎÂˆYˆÝÜ™KšÚ[ÜÝÚ]Ú
+
+K›X\Ù\œŠ[\›˜[
+OÈÂˆ™]\›ˆ\œŠ
+K‘ÛØ˜[Ú[ÝÚ]Ú\È[™ØYÙY‹×ÜÝš[™Ê
+JJNÂˆBˆ]Ü˜[YHÜ˜[YØØ\Xš[]Y\Ê]šXÙJNÂˆ]\Y˜XÝÈHÜ˜]NŽ™Y[[ÛŽŽœY\—Ú[™Ü™\ÜÎŽœY\—ØÛÛ[ÜÝÜ™J	œÙ[‹œ]ÊBˆ›X\Ù\œŠ\œ›ÜŸ
+L\œ›ÜŠJOÎÂˆ]ÛÛ^HÜ˜]NŽ™Y[[ÛŽŽœY\—Ú[™Ü™\ÜÎŽ”Y\ÛÛ^Âˆ]šXÙWÚYˆ	™]šXÙK™]šXÙWÚYˆÜ˜[Yˆ	™Ü˜[Yˆ™]›ÚÙYˆY]šXÙK˜XÝ]™J
+KˆØØ[Ú[œÝ[˜ÙWÚYˆ	œÙ[‹šÜÝœ[›™\—ÚYˆ\Y˜XÝÎˆ	˜\Y˜XÝËˆNÂˆ]XØÙ\YHÜ˜]NŽ™Y[[ÛŽŽœY\—Ú[™Ü™\ÜÎŽ˜XØÙ\ÜY\—Ù[™[ÜJˆ	›]]ÝÜ™Kˆ]Y]YK˜\×Ü™YŠ
+Kˆ	™[™[ÜKˆ	˜ÛÛ^ˆMŽžWÙœ›ÛJ›Ý×Û\ÊK[Ü˜\ÛÜŠMŽ“PV
+Kˆ
+Bˆ›X\Ù\œŠ[\›˜[
+OÎÂ‚ˆ\ÙHÜ˜]NŽ™Y[[ÛŽŽœY\—Ú[™Ü™\ÜÎŽ”Y\XØÙ\[˜ÙNÂˆX]ÚXØÙ\YÂˆY\XØÙ\[˜ÙNŽXØÙ\YÂˆ™XYÚY›Ø—ÚY‹‚ˆHOˆÚÊ
+ˆŒ‹ˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆ˜XØÙ\YŽˆYKˆ™XYÚYŽˆ™XYÚYˆ›Y\ÜØYÙWÚYŽˆ[™[ÜK›Y\ÜØYÙWÚYˆËÈHY\‰ÜÈÝÛˆ[™H›ÜˆÛÜœ™[][™ÈH™\Ý[]\‹ˆBˆËÈØØ[›ØˆY\È[X™\˜][H›Ý™]\›™Yˆ]\È\ÂˆËÈ›ÙIÜÈ\Ú[™\ÜË[™HY\ˆ]Û™]È]ÛÝ[X\›‚ˆËÈ›Ý[™È]Ø[ˆ\ÙK‚ˆ˜ÛÜœ™[][Û—ÚYŽˆ[™[ÜK˜ÛÜœ™[][Û—ÚYˆœÝ]HŽˆœ]Y]YY‹ˆœ]Y]YYŽˆZ›Ø—ÚYš\×Ù[\J
+KˆJKˆÛÛYJ™XYÚYÝ\™Ù]
+	™[™[ÜK™XYÚY
+JKˆ
+JKˆY\XØÙ\[˜ÙNŽXØÙ\Y[™[™ÈÈ™XYÚY‹ˆHOˆÚÊ
+ˆŒ‹ˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆ˜XØÙ\YŽˆYKˆ™XYÚYŽˆ™XYÚYˆ›Y\ÜØYÙWÚYŽˆ[™[ÜK›Y\ÜØYÙWÚYˆ˜ÛÜœ™[][Û—ÚYŽˆ[™[ÜK˜ÛÜœ™[][Û—ÚYˆËÈ\˜X›HZÙ[‹›ÝY]]Y]YYˆØ^Z[™È˜XØÙ\Yˆ\ÈBˆËÈÛ™\Ý[œÝÙ\ŽˆH™]žHÛÝ[™H™Y\ÙY\ÈH\XØ]KˆËÈ[™\È›ÙHÚ[š[š\ÚHÝX›Z\ÜÚ[Ûˆ]Ù[‹‚ˆœÝ]HŽˆ˜XØÙ\Y‹ˆœ]Y]YYŽˆ˜[ÙKˆJKˆÛÛYJ™XYÚYÝ\™Ù]
+	™[™[ÜK™XYÚY
+JKˆ
+JKˆY\XØÙ\[˜ÙNŽ‘\XØ]HÂˆ™XYÚYˆXØÙ\Yˆ‹‚ˆHOˆÚÊ
+ˆŒˆÙ\™WÚœÛÛŽŽšœÛÛˆJÂˆ˜XØÙ\YŽˆXØÙ\Yˆ5Û­õ¶‰žËkºwµçw2Â&ö÷Dw&çBÂ'Vä'VFvWG2Â'Vä¶–æBÂ'Vå7V2À¢FööÅöÆ–7”FV6—6–öâÂv÷&·76T6öçFW‡BÂ%Tåõ$õDô4ôÅõ44„TÔõdU%4”ôâÀ¢Ó° ¢W6R7WW#£¢£°¢W6R7&FS£¦FVÖöã£§&VÖ÷FS£§&÷Fö6öÃ£§°¢6–vå÷&WVW7BÂFWf–6T6öç7G&–çG2Â÷5W&Ö—76–öâÂ&VÖ÷FT7F–öâÀ¢Ó°¢W6R7&FS£¦FVÖöã£§&VÖ÷FS£§7F÷&S£§´FWf–6T6öÖÖæE&WVW7BÂ&VÖ÷FU6V7&WE7F÷&WÓ°¢W6R7&FS£¦FVÖöã£§7F÷&S£¤FVÖöä6öæf–s°¢W6R7&FS£¦GW&&ÆU÷'Vã£¤GW&&ÆU'Vå&V6÷&FW#°¢W6RÆ—GFÆUöÖöæ¶W•öÆ–#£¦6öçG&7C° ¢òòò¢¥F†RV&Æ—6†VB6öçG&7Bw2&VÖ÷FR×ÆæRF&ÆR—26†V6¶VBv–ç7BF†—0¢òòòf–ÆRw2÷vâF—7F6‚ÖF6‚Âæ÷Bv–ç7BÖVÖ÷'’öb—Bâ¢ ¢òòð¢òòòÆ—GFÆUöÖöæ¶W•öÆ–#£¦6öçG&7C£¥$TÔõDUõ$õUDU6—2v†BF†—&B'F–W2&V@¢òòò„³’’â—B6ææ÷BÆ—fR&W6–FRF†RÖF6‚(	BF†R6öçG&7B—2vVæW&FVB–à¢òòòF†RÆ–'&'’æBF†—2—2&–æ'’7&FR(	B6òF†R&—6²—2F†R÷&F–æ'¢òòòöæRf÷"ç’6V6öæB6÷“¢&÷WFRFFVB†W&RÂæWfW"V&Æ—6†VBÂæB¢òòò6¶vRF†BvFW2öâF†R6öçG&7BfW'6–öâF†W&Vf÷&RvF–æröâÆ–Rà¢òòð¢òòòF†—266ç2F†RÖF6‚&×2F†V×6VÇfW3¢ÖWF†öBÂF‚6†R¦æB¢F†P¢òòòW†7B&VÖ÷FT7F–öæöFWf–6T6&–Æ—G–f&–çBV6‚&Ò&WV—&W2â¢òòòæWr&÷WFRÂÖ÷fVB6VvÖVçB÷"&RÖw&FVBvFRf–Ç2†W&R&F†W"F†à¢òòò–â&Wf–WvW"w2ÖVÖ÷'’âF†RFV6†æ—VR—2Vw&W72ç'6w2&&RÖ6Æ–Vç@¢òòò&F6†WBæB6W'fW"ç'6w2FÖ—76–öâ66âÂf÷"F†R6ÖR&V6öã¢F†P¢òòòFVfV7B6Æ72—2&6ÆÂ6—FRF†BÆöö·2f–æR–â—6öÆF–öâ"à¢5·FW7EÐ¢fâWfW'•öF—7F6†VE÷&VÖ÷FU÷&÷WFUö—5ö–å÷F†U÷V&Æ—6†VEö6öçG&7B‚’°¢6öç7B4õU$4S¢g7G"Ò–æ6ÇVFU÷7G"‚&’ç'2"“°¢ÆWB&öGV7F–öâÒ4õU$4P¢ç7Æ—Eööæ6R‚%Æâ5¶6fr‡FW7B•Ò"¢æÖö÷"…4õU$4RÂÂ†&Vf÷&RÂò—Â&Vf÷&R“° ¢òòF†RöæR&÷WFRF—7F6†VB&Vf÷&RF†RÖF6‚Â&V6W6R—B'Vç2&Vf÷&R¢òòFWf–6R†æBF†W&Vf÷&R6–væGW&R’W†—7G2à¢76W'B€¢&öGV7F–öâæ6öçF–ç2‡"2'&WVW7BçF…öæE÷VW'’ÓÒ"÷c÷&VÖ÷FR÷—&–æw2ö66WB""2’À¢'F†RVæWF†VçF–6FVB—&–ær&÷WFRÖ÷fVC²F†R6öçG&7B7F–ÆÂæÖW2—B ¢“° ¢ÆWBÆ–æW3¢fV3Âg7G#âÒ&öGV7F–öâæÆ–æW2‚’æ6öÆÆV7B‚“°¢ÆWB×WBF—7F6†VC¢%G&VU6WCÂ…7G&–ærÂ7G&–ærÂ7G&–ær“âÒ%G&VU6WC£¦æWr‚“°¢f÷"†–æFW‚ÂÆ–æR’–âÆ–æW2æ—FW"‚’æVçVÖW&FR‚’°¢ÆWBG&–ÖÖVBÒÆ–æRçG&–Ò‚“°¢ÆWB6öÖR‡&W7B’ÒG&–ÖÖVBç7G&—÷&Vf—‚‚r‚r’VÇ6R°¢6öçF–çVS°¢Ó°¢ÆWB6öÖR‚†ÖWF†öBÂ&W7B’’Ò&W7Bç7Æ—Eööæ6R‚"Â²"’VÇ6R°¢6öçF–çVS°¢Ó°¢ÆWB6öÖR†ÖWF†öB’ÒÖWF†öBç7G&—÷&Vf—‚‚r"r’ææE÷F†Vâ‡Æ×ÂÒç7G&—÷7Vff—‚‚r"r’’VÇ6R°¢6öçF–çVS°¢Ó°¢ÆWB6öÖR‚‡6VvÖVçG2Âò’’Ò&W7Bç7Æ—Eööæ6R‚%Ò’Óâ"’VÇ6R°¢6öçF–çVS°¢Ó°¢ÆWBF‚Ò6VvÖVçG0¢ç7Æ—B‚rÂr¢æÖ‡7G#£§G&–Ò¢æf–ÇFW"‡Ç6VvÖVçGÂ6VvÖVçBæ—5öV×G’‚’¢æÖ€¢Ç6VvÖVçGÂÖF6‚6VvÖVçBç7G&—÷&Vf—‚‚r"r’ææE÷F†Vâ‡Ç7Â2ç7G&—÷7Vff—‚‚r"r’’°¢6öÖR†Æ—FW&Â’Óâf÷&ÖB‚"÷¶Æ—FW&ÇÒ"’À¢æöæRÓâf÷&ÖB‚"÷···6VvÖVçG××Ò"’À¢ÒÀ¢¢æ6öÆÆV7C££Å7G&–æsâ‚“°¢òòF†RvFR—2v†FWfW"F†R&Òw2f—'7Bw&çB6†V6²æÖW2âF‡&VP¢òòÆ–æW2—2Væ÷Vv‚f÷"WfW'’&Ò'W7Ff×B&öGV6W2†W&S²â&ÒF†@¢òòw&Wr7B—Bv÷VÆBf–Â26VÆe÷6W'f–6VæB&Ræ÷F–6VBà¢ÆWB&ÒÒÆ–æW5¶–æFW‚ââ†–æFW‚²2’æÖ–â†Æ–æW2æÆVâ‚’•Òæ¦ö–â‚""“°¢ÆWBvFRÒ–b&Òæ6öçF–ç2‚'&WV—&Uöç•÷VW%ö6&–Æ—G’"’°¢òòF†RVW"ÆæRw2vFR—2&ç’öbF†RF‡&VRVW"w&çG2"À¢òòv†–6‚æò6–ævÆRFWf–6T6&–Æ—G“£¦Fö¶Vâ6âæÖRà¢'VW%÷7FæF–ær"çFõ÷7G&–ær‚¢ÒVÇ6R°¢&Òç7Æ—Eööæ6R‚%&VÖ÷FT7F–öã£¢"¢æÖ‡Â…òÂF–Â—Âf÷&ÖB‚&7F–öã§·Ò"Âf&–çB‡F–Â’’¢æ÷%öVÇ6R‡ÇÂ°¢&Òç7Æ—Eööæ6R‚$FWf–6T6&–Æ—G“£¢"¢æÖ‡Â…òÂF–Â—Âf÷&ÖB‚&6&–Æ—G“§·Ò"Âf&–çB‡F–Â’’¢Ò¢çVçw&ö÷%öVÇ6R‡ÇÂ'6VÆe÷6W'f–6R"çFõ÷7G&–ær‚’¢Ó°¢F—7F6†VBæ–ç6W'B‚†ÖWF†öBçFõ÷7G&–ær‚’ÂF‚ÂvFR’“°¢Ð ¢ÆWBV&Æ—6†VC¢%G&VU6WCÂ…7G&–ærÂ7G&–ærÂ7G&–ær“âÒ6öçG&7C£¥$TÔõDUõ$õUDU0¢æ—FW"‚¢æf–ÇFW"‡Ç&÷WFWÂ&÷WFRævFRÒ6öçG&7C£¥&VÖ÷FTvFS£¥VæWF†VçF–6FVB¢æÖ‡Ç&÷WFWÂ°¢€¢&÷WFRæÖWF†öBçFõ÷7G&–ær‚’À¢&÷WFRçF‚çFõ÷7G&–ær‚’À¢ÖF6‚&÷WFRævFR°¢6öçG&7C£¥&VÖ÷FTvFS£¤7F–öâ†7F–öâ’Óâf÷&ÖB‚&7F–öã§¶7F–öçÒ"’À¢6öçG&7C£¥&VÖ÷FTvFS£¤6&–Æ—G’†6&–Æ—G’’Óâ°¢f÷&ÖB‚&6&–Æ—G“§¶6&–Æ—G—Ò"¢Ð¢6öçG&7C£¥&VÖ÷FTvFS£¥6VÆe6W'f–6RÓâ'6VÆe÷6W'f–6R"çFõ÷7G&–ær‚’À¢6öçG&7C£¥&VÖ÷FTvFS£¥VW%7FæF–ærÓâ'VW%÷7FæF–ær"çFõ÷7G&–ær‚’À¢6öçG&7C£¥&VÖ÷FTvFS£¥VæWF†VçF–6FVBÓâVç&V6†&ÆR‚&f–ÇFW&VB&÷fR"’À¢ÒÀ¢¢Ò¢æ6öÆÆV7B‚“° ¢76W'EöW€¢F—7F6†VBÂV&Æ—6†VBÀ¢'F†RF—7F6‚ÖF6‚æBF†RV&Æ—6†VB³’6öçG&7BF—6w&VS²À¢WFFR6öçG&7C£¥$TÔõDUõ$õUDU2æB&WV&Æ—6‚†Fö72ö6öçG&7BÖ&’æÖB’ ¢“°¢Ð ¢òòòF†RÆVF–ær–FVçF–f–W"öbf&–çBÓâââæÂf&–çB–÷"6–Ö–Æ"à¢fâf&–çB‡F–Ã¢g7G"’Óâ7G&–ær°¢F–Âæ6†'2‚¢çF¶U÷v†–ÆR‡Æ7Â2æ—5öÇ†çVÖW&–2‚’ÇÂ¦2ÓÒuòr¢æ6öÆÆV7B‚¢Ð ¢òòòF†Rv—&RfW'6–öâF†R6öçG&7BV&Æ—6†W2—2F†RöæRF†—2ÆæR&V¦V7G0¢òòòÖ—6ÖF6†W2v–ç7BâGvò6öç7FçG2ÂöæRf7Bà¢5·FW7EÐ¢fâF†U÷V&Æ—6†VE÷&VÖ÷FU÷&÷Fö6öÅ÷fW'6–öåö—5÷F†UööæUöVæf÷&6VB‚’°¢76W'EöW†6öçG&7C£¥$TÔõDUõ$õDô4ôÅõdU%4”ôâÂ$TÔõDUõ$õDô4ôÅõdU%4”ôâ“°¢Ð ¢5¶FW&—fR„FVfVÇB•Ð¢7G'V7Bf¶U6V7&WG2„×WFWƒÄ†6„ÖÅ7G&–ærÂfV3ÇSƒããâ“°¢–×Â&VÖ÷FU6V7&WE7F÷&Rf÷"f¶U6V7&WG2°¢fâvWB‚g6VÆbÂ6Æ÷C¢g7G"’Óâ&W7VÇCÅfV3ÇSƒâÂ7G&–æsâ°¢6VÆbã ¢æÆö6²‚¢çVçw&‚¢ævWB‡6Æ÷B¢æ6ÆöæVB‚¢æöµö÷%öVÇ6R‡ÇÂ&Ö—76–ær6V7&WB"çFõ÷7G&–ær‚’¢Ð¢fâ6WB‚g6VÆbÂ6Æ÷C¢g7G"Â6V7&WC¢e·S…Ò’Óâ&W7VÇCÂ‚’Â7G&–æsâ°¢6VÆbã ¢æÆö6²‚¢çVçw&‚¢æ–ç6W'B‡6Æ÷BçFõ÷7G&–ær‚’Â6V7&WBçFõ÷fV2‚’“°¢ö²‚‚’¢Ð¢fâFVÆWFR‚g6VÆbÂ6Æ÷C¢g7G"’Óâ&W7VÇCÂ‚’Â7G&–æsâ°¢6VÆbãæÆö6²‚’çVçw&‚’ç&VÖ÷fR‡6Æ÷B“°¢ö²‚‚’¢Ð¢Ð ¢fâ7V2‡'Våö–C¢g7G"Âv÷&·76S¢g7G"’Óâ'Vå7V2°¢'Vå7V2°¢66†VÖ÷fW'6–öã¢%Tåõ$õDô4ôÅõ44„TÔõdU%4”ôâÀ¢'Våö–C¢'Våö–BçFõ÷7G&–ær‚’À¢–FV×÷FVæ7•ö¶W“¢f÷&ÖB‚&–FVÒ×·'Våö–GÒ"’À¢7&VFVEöEö×3¢óÀ¢¶–æC¢'Vä¶–æC£¤&6¶w&÷VæBÀ¢7V&Ö—GFVEö'“¢6Æ–VçD–FVçF—G’°¢6Æ–VçEö–C¢&f—‡GW&R"æ–çFò‚’À¢–ç7Fæ6Uö–C¢&f—‡GW&R"æ–çFò‚’À¢¶–æC¢6Æ–VçD¶–æC£¤FVÖöâÀ¢fW'6–öã¢#"æ–çFò‚’À¢ÒÀ¢F6³¢&f—‡GW&R"æ–çFò‚’À¢–ç7G'V7F–öç3¢æöæRÀ¢–çWEö'F–f7Eö–G3¢fV2µÒÀ¢F&vWC¢ÖöFVÅF&vWE6æ6†÷C£¥&÷f–FW"°¢F&vWEö–C¢&f—‡GW&R"æ–çFò‚’À¢Æ&VÃ¢&f—‡GW&R"æ–çFò‚’À¢&÷f–FW%ö–C¢&f—‡GW&R"æ–çFò‚’À¢VæGö–çC¢&‡GG3¢òöW†×ÆRæ–çfÆ–B÷c"æ–çFò‚’À¢ÖöFVÃ¢&f—‡GW&R"æ–çFò‚’À¢7&VFVçF–Å÷&Veö–C¢&7&VFVçF–ÂÖæöæR"æ–çFò‚’À¢6&–Æ—F–W3¢7&FS£§F6³£¦6Æ•ö6&–Æ—F–W2‚’À¢ÒÀ¢v÷&·76S¢6öÖR…v÷&·76T6öçFW‡B°¢v÷&·76Uö–C¢v÷&·76Ræ–çFò‚’À¢&–Ö'•÷&ö÷Eö–C¢'&ö÷B"æ–çFò‚’À¢&ö÷G3¢fV2µ&ö÷Dw&çB°¢&ö÷Eö–C¢'&ö÷B"æ–çFò‚’À¢6æöæ–6Å÷Fƒ¢"÷F×"æ–çFò‚’À¢66W73¢&ö÷D66W73£¥&VEw&—FRÀ¢ÆÆ÷u÷7–ÖÆ–æ·5÷v—F†–å÷&ö÷C¢fÇ6RÀ¢ÕÒÀ¢&W÷6—F÷'•÷öÆ–7“¢æöæRÀ¢Ò’À¢W&Ö—76–öå÷öÆ–7“¢W&Ö—76–öåöÆ–7•6æ6†÷B°¢ÖöFS¢'VåW&Ö—76–öäÖöFS£¤WFòÀ¢VæGFVæFVC¢G'VRÀ¢&÷fÅ÷F–ÖV÷WEö×3¢cóÀ¢FVfVÇE÷FööÅöFV6—6–öã¢FööÅöÆ–7”FV6—6–öã£¥&ö×BÀ¢FööÅ÷'VÆW3¢fV2µÒÀ¢ÆÆ÷uöæWGv÷&³¢fÇ6RÀ¢ÆÆ÷uöW‡FW&æÅö×WFF–öç3¢fÇ6RÀ¢Vw&W75öÆÆ÷vÆ—7C¢æöæRÀ¢6†ææVÅ÷6VæC¢æöæRÀ¢ÒÀ¢'VFvWG3¢'Vä'VFvWG2°¢vÆÅ÷F–ÖUö×3¢cóÀ¢Ö…ö—FW&F–öç3¢"À¢Ö…öÖöFVÅö6ÆÇ3¢"À¢Ö…÷FööÅö6ÆÇ3¢"À¢Ö…ö–çWE÷Fö¶Vç3¢óÀ¢Ö…ö÷WGWE÷Fö¶Vç3¢óÀ¢Ö…ö6÷7EöÖ–7&÷3¢æöæRÀ¢Ö…ö'F–f7Eö'—FW3¢ó#BÀ¢Ö…öWfVçEö6÷VçC¢óÀ¢ÒÀ¢Ð¢Ð ¢òòò†æFÆVw&2WfW'’F‚Â6òâVæWF†VçF–6FVB&WVW7B(	BF†RöæRF†@¢òòòæWfW"&V6†W2&÷WFRBÆÂ(	B—27F–ÆÂâWfVçBâF†B—2F†R&÷W'G¢òòòF†Rw&W"'W—2÷fW"–ç7G'VÖVçF–ær&÷WFW3¢F†W&R—2æò'&æ6‚FòÖ—72à¢5·FW7EÐ¢fâå÷VæWF†VçF–6FVE÷&VÖ÷FU÷&WVW7Eö—5÷7F–ÆÅ÷&V6÷&FVEö5öFVæ–VB‚’°¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂöFWf–6RÂö¶W’’Òf—‡GW&R‚“° ¢ÆWB&W7öç6RÒ’æ†æFÆR€¢•&WVW7B°¢ÖWF†öC¢$tUB"çFõ÷7G&–ær‚’À¢F…öæE÷VW'“¢"÷c÷&VÖ÷FR÷'Vç3öÆ–Ö—CÓR"çFõ÷7G&–ær‚’À¢&öG“¢fV3£¦æWr‚’À¢WFƒ¢æöæRÀ¢ÒÀ¢%óÀ¢“°¢76W'EöW‡&W7öç6Rç7FGW2ÂCÂ&æò6–væVBWF‚ÖVç2&VgW6VB"“° ¢ÆWBÆVFvW"Ð¢Æ—GFÆUöÖöæ¶W•öÆ–#£§'VåöÆVFvW#£¥'VäÆVFvW#£¦÷Vâ„FVÖöåF‡3£§VæFW"‚g&ö÷B’æÆVFvW%öF"¢çVçw&‚“°¢ÆWBWfVçG2ÒÆVFvW"ç&V6VçE÷7V'7—7FVÕöWfVçG2„æöæRÂ’çVçw&‚“°¢76W'EöW†WfVçG2æÆVâ‚’Â“°¢76W'EöW€¢WfVçG5³Òç7V'7—7FVÒÀ¢Æ—GFÆUöÖöæ¶W•öÆ–#£§'VåöÆVFvW#£¥7V'7—7FVÓ£¥&VÖ÷FP¢“°¢76W'EöW€¢WfVçG5³Òæ7F–öâÂ$tUB÷c÷&VÖ÷FR÷'Vç2"À¢'F†RVW'’7G&–ær—2G&÷VC¢—B6'&–W2–G2æBF†R&÷r—2W&ÖæVçB ¢“°¢76W'EöW€¢WfVçG5³Òæ÷WF6öÖRÀ¢Æ—GFÆUöÖöæ¶W•öÆ–#£§'VåöÆVFvW#£¥7V'7—7FVÔ÷WF6öÖS£¤FVæ–VBÀ¢&&VgW6Â—2æ÷Bf–ÇW&R(	B&VFW"6÷VçF–ærf–ÇW&W2×W7Bæ÷B6÷VçB—B ¢“° ¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‚g&ö÷B“°¢Ð ¢fâf—‡GW&R‚’Óâ…F„'VbÂ&VÖ÷FT’Â&3Äf¶U6V7&WG3âÂ7G&–ærÂfV3ÇSƒâ’°¢f—‡GW&U÷v—F‚„%G&VU6WC£¦g&öÒ…°¢&VÖ÷FT7F–öã£¥f–Wu'Vç2À¢&VÖ÷FT7F–öã£¥f–WtWfVçG2À¢&VÖ÷FT7F–öã£¤&÷fRÀ¢&VÖ÷FT7F–öã£¤6æ6VÂÀ¢Ò’¢Ð ¢òòòF†R6ÖRf—‡GW&Rv—F‚âW‡Æ–6—Bw&çBÂ6òFW7B6â&÷fRâ7F–öà¢òòò—2&VgW6VBv—F†÷WB—B2vVÆÂ2†öæ÷W&VBv—F‚—Bà¢fâf—‡GW&U÷v—F‚€¢7F–öç3¢%G&VU6WCÅ&VÖ÷FT7F–öãâÀ¢’Óâ…F„'VbÂ&VÖ÷FT’Â&3Äf¶U6V7&WG3âÂ7G&–ærÂfV3ÇSƒâ’°¢f—‡GW&U÷66÷VB†7F–öç2Â%G&VU6WC£¦g&öÒ…²''VâÖöæR"çFõ÷7G&–ær‚•Ò’¢Ð ¢òòòF†R6ÖRf—‡GW&Rv—F‚âW‡Æ–6—B'Vâ66÷RÂ6òÖ–w&F–öâFW7B6â— ¢òòòFWf–6Rf÷"'VâF†—2æöFRFöW2æ÷B†fR–WB(	Bv†–6‚—2F†RöæÇ’6†P¢òòòÆ6VÖVçBWfW"†2à¢fâf—‡GW&U÷66÷VB€¢7F–öç3¢%G&VU6WCÅ&VÖ÷FT7F–öãâÀ¢'Våö–G3¢%G&VU6WCÅ7G&–æsâÀ¢’Óâ…F„'VbÂ&VÖ÷FT’Â&3Äf¶U6V7&WG3âÂ7G&–ærÂfV3ÇSƒâ’°¢ÆWB&ö÷BÐ¢7FC£¦Vçc£§FV×öF—"‚’æ¦ö–â†f÷&ÖB‚&Æ—GFÆRÖÖöæ¶W’×&VÖ÷FRÖ’×·Ò"ÂWV–C£¥WV–C£¦æWu÷cB‚’’“°¢ÆWBF‡2ÒFVÖöåF‡3£§VæFW"‚g&ö÷B“°¢F‡2æVç7W&R‚’çVçw&‚“°¢FVÖöä6öæf–s£¦FVfVÇB‚’ç6fR‚gF‡2’çVçw&‚“°¢ÆWBÆVFvW"Ò'VäÆVFvW#£¦÷Vâ‚gF‡2æÆVFvW%öF"’çVçw&‚“°¢ÆWB‡&V6÷&FW"Âò’Ð¢GW&&ÆU'Vå&V6÷&FW#£§7V&Ö—B†ÆVFvW"Âg7V2‚''VâÖöæR"Â'v÷&·76RÖöæR"’Â&f—‡GW&R"æ–çFò‚’¢çVçw&‚“°¢&V6÷&FW ¢æVÖ—B…'VäWfVçC£¥VWVVB°¢VWVS¢6öÖR‚&f—‡GW&R"æ–çFò‚’’À¢Ò¢çVçw&‚“°¢&V6÷&FW ¢æVÖ—B…'VäWfVçC£¥7F'FVB°¢Væv–æUö–C¢&f—‡GW&R"æ–çFò‚’À¢Ò¢çVçw&‚“°¢ÆWBf—‡GW&UöW‡—'’Ò7FC£§F–ÖS£¥7—7FVÕF–ÖS£¦æ÷r‚¢æGW&F–öå÷6–æ6R‡7FC£§F–ÖS£¥Tä•…ôUô4‚¢çVçw&‚¢æ5öÖ–ÆÆ—2‚’2Sc@¢²có°¢&V6÷&FW ¢æVÖ—B…'VäWfVçC£¥W&Ö—76–öå&WVW7FVB°¢&WVW7Eö–C¢&&÷fÂÖöæR"æ–çFò‚’À¢FööÅö6ÆÅö–C¢'FööÂÖöæR"æ–çFò‚’À¢FööÅöæÖS¢'w&—FUöf–ÆR"æ–çFò‚’À¢÷W&F–öå÷6†#Sc¢&"ç&WVBƒcB’À¢W‡—&W5öEö×3¢f—‡GW&UöW‡—'’À¢FWF–Ã¢&f—‡GW&R&÷fÂ"æ–çFò‚’À¢&—6µöÆWfVÃ¢æöæRÀ¢&—6µ÷&V6öã¢æöæRÀ¢Ò¢çVçw&‚“°¢&V6÷&FW ¢æVÖ—B…'VäWfVçC£¤v—F–æt&÷fÂ°¢&WVW7Eö–C¢&&÷fÂÖöæR"æ–çFò‚’À¢÷W&F–öå÷6†#Sc¢&"ç&WVBƒcB’À¢W‡—&W5öEö×3¢f—‡GW&UöW‡—'’À¢&V6öã¢6öÖR‚&f—‡GW&R"æ–çFò‚’’À¢Ò¢çVçw&‚“°¢ÆWB×WBFVÖöå÷7F÷&RÒFVÖöå7F÷&S£¦÷Vâ‚gF‡2’çVçw&‚“°¢ÆWB6æ6†÷BÒF‡2ç6æ6†÷G2æ¦ö–â‚&¦ö"×'VâÖöæRæ§6öâ"“°¢7FC£¦g3£§w&—FR‚g6æ6†÷BÂ"'·Ò"’çVçw&‚“°¢FVÖöå÷7F÷&P¢æ–ç6W'E÷&W&–ær€¢f7&FS£¦FVÖöã£§7F÷&S£¤æWtFVÖöä¦ö"°¢¦ö%ö–C¢&¦ö"×'VâÖöæR"æ–çFò‚’À¢&V6—U÷6æ6†÷C¢6æ6†÷BÀ¢&–÷&—G“¢À¢Ö…öGFV×G3¢À¢7&VFVEöEö×3¢óÀ¢Ö…÷'VçF–ÖUö×3¢cóÀ¢Ö…öÖVÖ÷'•ö'—FW3¢æöæRÀ¢Ö…öÆöuö'—FW3¢ó#B¢ó#BÀ¢&W÷6—F÷'•÷öÆ–7•ö§6öã¢æöæRÀ¢v÷&·G&VUö§6öã¢æöæRÀ¢&VçE÷'Våö–C¢æöæRÀ¢ÒÀ¢‚À¢¢çVçw&‚“°¢FVÖöå÷7F÷&P¢æÖ&µ÷VWVVB‚&¦ö"×'VâÖöæR"Â''VâÖöæR"Âó¢çVçw&‚“°¢ÆWB†÷7BÒ&VÖ÷FT†÷7D6öæf–r°¢&÷Fö6öÅ÷fW'6–öã¢$TÔõDUõ$õDô4ôÅõdU%4”ôâÀ¢'VææW%ö–C¢''VææW"ÖöæR"æ–çFò‚’À¢Æ—7FVã¢##rããã£"æ–çFò‚’À¢GfW'F—6U÷W&Ã¢&‡GG3¢ò÷'VææW"æ–çfÆ–B"æ–çFò‚’À¢6W'F–f–6FU÷Fƒ¢"÷F×ö6W'B"æ–çFò‚’À¢&—fFUö¶W•÷Fƒ¢"÷F×ö¶W’"æ–çFò‚’À¢6W'F–f–6FU÷6†#Sc¢&"ç&WVBƒcB’À¢Væ&ÆVC¢G'VRÀ¢Ó°¢ÆWB×WB7F÷&RÒ&VÖ÷FU7F÷&S£¦÷Vâ‚gF‡2ç&ö÷B’çVçw&‚“°¢ÆWB66÷W2Ò&VÖ÷FU66÷W2°¢7F–öç2À¢'Våö–G2À¢v÷&·76Uö–G3¢%G&VU6WC£¦æWr‚’À¢Ö…ö'F–f7Eö'—FW3¢ó#BÀ¢Ó°¢ÆWB6V7&WG2Ò&3£¦æWr„f¶U6V7&WG3£¦FVfVÇB‚’“°¢ÆWB–çf—FRÒ7F÷&Ræ7&VFUö–çf—FF–öâ‚g66÷W2ÂóÂ5ó’çVçw&‚“°¢ÆWB66WFVBÒ7F÷&P¢æ66WEö–çf—FF–öâ€¢f–çf—FRç—&–æuö–BÀ¢f–çf—FRçFö¶VâÀ¢'†öæR"À¢''VææW"ÖöæR"À¢óÀ¢6V7&WG2æ5÷&Vb‚’À¢¢çVçw&‚“°¢ÆWB6V7&WBÒ66WFVBæFWf–6U÷6V7&WBæ5ö'—FW2‚’çFõ÷fV2‚“°¢ÆWB’Ò&VÖ÷FT“£¦–æ¦V7FVB‡F‡2Â†÷7BÂ7F÷&RÂ6V7&WG2æ6ÆöæR‚’“°¢‡&ö÷BÂ’Â6V7&WG2Â66WFVBæFWf–6Uö–BÂ6V7&WB¢Ð ¢fâ6–væVB€¢FWf–6Uö–C¢g7G"À¢6V7&WC¢e·S…ÒÀ¢6WVVæ6S¢ScBÀ¢6öÖÖæC¢g7G"À¢ÖWF†öC¢g7G"À¢Fƒ¢g7G"À¢&öG“¢e·S…ÒÀ¢’Óâ•&WVW7B°¢6–væVEöB€¢FWf–6Uö–BÂ6V7&WBÂ6WVVæ6RÂ6öÖÖæBÂÖWF†öBÂF‚Â&öG’Â%óÀ¢¢Ð ¢òòòF†R6ÖR6–væVB&WVW7Bv–ç7B6ÆÆW"Ö6†÷6Vâ6Æö6²à¢òòð¢òòòWfW'’÷F†W"FW7BG&—fW2F†R’Bf—†VBæ÷uö×6Âv†–6‚—2v†BÖ¶W0¢òòòF†VÒFWFW&Ö–æ—7F–2âFÆ²F–6¶WB6ææ÷C¢—B—2Ö–çFVBF‡&÷Vv‚F†R¢òòòæB&VFVVÖVB'’F†R6ö6¶WBÆ–W"Âv†–6‚&VG2F†R&VÂ6Æö6²(	B6ò¢òòòF–6¶WB—77VVB–â“s—2W‡—&VB&Vf÷&RF†R†æG6†¶R7F'G2à¢5¶ÆÆ÷r†6Æ—“£§FöõöÖç•ö&wVÖVçG2•Ð¢fâ6–væVEöB€¢FWf–6Uö–C¢g7G"À¢6V7&WC¢e·S…ÒÀ¢6WVVæ6S¢ScBÀ¢6öÖÖæC¢g7G"À¢ÖWF†öC¢g7G"À¢Fƒ¢g7G"À¢&öG“¢e·S…ÒÀ¢F–ÖW7F×ö×3¢ScBÀ¢’Óâ•&WVW7B°¢ÆWB×WBWF‚Ò6–væVE&WVW7D†VFW'2°¢FWf–6Uö–C¢FWf–6Uö–Bæ–çFò‚’À¢6V7&WEövVæW&F–öã¢À¢6WVVæ6RÀ¢F–ÖW7F×ö×2À¢æöæ6S¢f÷&ÖB‚&æöæ6R×¶6öÖÖæGÒÓ#3CScsƒ’"’À¢6öÖÖæEö–C¢6öÖÖæBæ–çFò‚’À¢6–væGW&S¢7G&–æs£¦æWr‚’À¢Ó°¢WF‚ç6–væGW&RÒ6–vå÷&WVW7B‡6V7&WBÂfWF‚ÂÖWF†öBÂF‚Â&öG’“°¢•&WVW7B°¢ÖWF†öC¢ÖWF†öBæ–çFò‚’À¢F…öæE÷VW'“¢F‚æ–çFò‚’À¢&öG“¢&öG’çFõ÷fV2‚’À¢WFƒ¢6öÖR†WF‚’À¢Ð¢Ð ¢5·FW7EÐ¢fâ÷WEööe÷66÷U÷'Våö—5ö–æF—7F–æwV—6†&ÆUög&öÕöÖ—76–ær‚’°¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6RÂ6V7&WB’Òf—‡GW&R‚“°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖBÖ†–FFVâ"À¢$tUB"À¢"÷c÷&VÖ÷FR÷'Vç2÷'VâÖ†–FFVâ"À¢"""À¢’À¢%óÀ¢“°¢76W'EöW‡&W7öç6Rç7FGW2ÂCB“°¢76W'B‚7G&–æs£¦g&öÕ÷WFc…öÆ÷77’‚g&W7öç6Ræ&öG’’æ6öçF–ç2‚'66÷R"’“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢5·FW7EÐ¢fâW6–æu÷&WV—&W5ö—G5ö÷våöw&çEöæEö—5öæ÷Eö–×Æ–VEö'•ö6æ6VÂ‚’°¢òòF†RvV¶W"7F–öâ—2æ÷Bg&VRâ6öçG&öÆÆW"G'W7FVBFòFW7G&÷’'Và¢òò—2F–ffW&VçBFV6—6–öâg&öÒöæRG'W7FVBFò7W7VæB—BÂæBæV—F†W ¢òò–×Æ–W2F†R÷F†W"(	B÷F†W'v—6RFF–ærF†—27F–öâv÷VÆB6–ÆVçFÇ’v–FVà¢òòWfW'’—&–ærF†BÇ&VG’†B6æ6VÆà¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6RÂ6V7&WB’Òf—‡GW&R‚“°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖB×W6RÖFVæ–VB"À¢%õ5B"À¢"÷c÷&VÖ÷FR÷'Vç2÷'VâÖöæR÷W6R"À¢"'·Ò"À¢’À¢%óÀ¢“°¢76W'EöW‡&W7öç6Rç7FGW2ÂC2“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢5·FW7EÐ¢fâW6UöæE÷&W7VÖUöÖ÷fU÷F†UöFVÖöç5ö÷våö&—B‚’°¢òòF†RvF†—26Æ÷6W3¢F†RFVÖöâ†27W÷'FVBW6R6–æ6R—B†B¢òòW6U÷&WVW7FVF&—BÂ'WBæò&VÖ÷FR7F–öâ&V6†VB—BÂ6ò—&V@¢òò6öçG&öÆÆW"6÷VÆBöæÇ’7F÷'Vâ'’FW7G&÷––ær—Bà¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6RÂ6V7&WB’Òf—‡GW&U÷v—F‚„%G&VU6WC£¦g&öÒ…°¢&VÖ÷FT7F–öã£¥f–Wu'Vç2À¢&VÖ÷FT7F–öã£¥W6RÀ¢Ò’“°¢ÆWBF‡2ÒFVÖöåF‡3£§VæFW"‚g&ö÷B“° ¢ÆWBW6VBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖB×W6R"À¢%õ5B"À¢"÷c÷&VÖ÷FR÷'Vç2÷'VâÖöæR÷W6R"À¢"'·Ò"À¢’À¢%óÀ¢“°¢76W'EöW‡W6VBç7FGW2Â#"“°¢76W'B€¢FVÖöå7F÷&S£¦÷Vâ‚gF‡2¢çVçw&‚¢ævWEö¦ö"‚''VâÖöæR"¢çVçw&‚¢æW‡V7B‚&¦ö"W†—7G2"¢çW6U÷&WVW7FVBÀ¢&&VÖ÷FRW6R×W7B&V6‚F†RFVÖöâw2÷vâ&—BÂæ÷B§W7B&WGW&â#" ¢“° ¢ÆWB&W7VÖVBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢"À¢&6ÖB×&W7VÖR"À¢%õ5B"À¢"÷c÷&VÖ÷FR÷'Vç2÷'VâÖöæR÷&W7VÖR"À¢"'·Ò"À¢’À¢%óÀ¢“°¢76W'EöW‡&W7VÖVBç7FGW2Â#"“°¢76W'B€¢FVÖöå7F÷&S£¦÷Vâ‚gF‡2¢çVçw&‚¢ævWEö¦ö"‚''VâÖöæR"¢çVçw&‚¢æW‡V7B‚&¦ö"W†—7G2"¢çW6U÷&WVW7FV@¢“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢5·FW7EÐ¢fâÆ÷7E÷&W7öç6U÷&WÆ•÷&WGW&ç5ö66†VE÷&W7VÇE÷v—F†÷WE÷6V6öæEö6æ6VÅöWfVçB‚’°¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6RÂ6V7&WB’Òf—‡GW&R‚“°¢ÆWB&öG’Ò'"2'²'&V6öâ#¢'†öæR7F÷'Ò"3°¢ÆWB&WVW7BÒ6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖBÖ6æ6VÂ"À¢%õ5B"À¢"÷c÷&VÖ÷FR÷'Vç2÷'VâÖöæRö6æ6VÂ"À¢&öG’À¢“°¢ÆWBf—'7BÒ’æ†æFÆR‡&WVW7Bæ6ÆöæR‚’Â%ó“°¢ÆWB&WÆ’Ò’æ†æFÆR‡&WVW7BÂ%ó“°¢76W'EöW†f—'7Bç7FGW2Â#"“°¢76W'EöW†f—'7BÂ&WÆ’“°¢ÆWBWfVçG2Ò'VäÆVFvW#£¦÷Vâ‚dFVÖöåF‡3£§VæFW"‚g&ö÷B’æÆVFvW%öF"¢çVçw&‚¢æÆöEöWfVçG2‚''VâÖöæR"ÂÂ¢çVçw&‚“°¢76W'EöW€¢WfVçG0¢æ—FW"‚¢æf–ÇFW"‡ÆWfVçGÂÖF6†W2†WfVçBæWfVçBÂ'VäWfVçC£¤6æ6VÆÆF–öå&WVW7FVB²ââÒ’¢æ6÷VçB‚’À¢¢“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢5·FW7EÐ¢fâ&V6öææV7E÷&V6öæ6–ÆW5ö÷&W6W'fVEö6öÖÖæEööæ6UögFW%÷6W'fW%ö7&6‚‚’°¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6RÂ6V7&WB’Òf—‡GW&R‚“°¢ÆWB&öG’Ò'"2'²'&V6öâ#¢'&V6öææV7B7F÷'Ò"3°¢ÆWB&WVW7BÒ6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖBÖ7&6‚"À¢%õ5B"À¢"÷c÷&VÖ÷FR÷'Vç2÷'VâÖöæRö6æ6VÂ"À¢&öG’À¢“°¢ÆWBWF‚Ò&WVW7BæWF‚æ5÷&Vb‚’çVçw&‚“°¢ÆWB&WVW7E÷6†Ò6†#Seö†W‚‚f6æöæ–6Å÷&WVW7B€¢WF‚À¢g&WVW7BæÖWF†öBÀ¢g&WVW7BçF…öæE÷VW'’À¢g&WVW7Bæ&öG’À¢’“°¢òò6–×VÆFR'VææW"7&6‚–ÖÖVF–FVÇ’gFW"&W6W'f–ærF†RÖöæ÷Föæ–0¢òò6öÖÖæB'WB&Vf÷&RF—7F6†–ærF†R6æ6VÆÆF–öâà¢76W'EöW€¢’ç7F÷&P¢æÆö6²‚¢çVçw&‚¢ç&W6W'fUö6öÖÖæB€¢fFWf–6RÀ¢À¢fWF‚æ6öÖÖæEö–BÀ¢fWF‚ææöæ6RÀ¢WF‚ç6WVVæ6RÀ¢g&WVW7E÷6†À¢g&WVW7BæÖWF†öBÀ¢g&WVW7BçF…öæE÷VW'’À¢%óÀ¢¢çVçw&‚’À¢6öÖÖæE&W6W'fF–öã£¤æWp¢“°¢ÆWB&V6÷fW&VBÒ’æ†æFÆR‡&WVW7Bæ6ÆöæR‚’Â%ó“°¢ÆWB&WÆ’Ò’æ†æFÆR‡&WVW7BÂ%ó"“°¢76W'EöW‡&V6÷fW&VBç7FGW2Â#"“°¢76W'EöW‡&V6÷fW&VBÂ&WÆ’“°¢ÆWBWfVçG2Ò'VäÆVFvW#£¦÷Vâ‚dFVÖöåF‡3£§VæFW"‚g&ö÷B’æÆVFvW%öF"¢çVçw&‚¢æÆöEöWfVçG2‚''VâÖöæR"ÂÂ¢çVçw&‚“°¢76W'EöW€¢WfVçG0¢æ—FW"‚¢æf–ÇFW"‡ÆWfVçGÂÖF6†W2†WfVçBæWfVçBÂ'VäWfVçC£¤6æ6VÆÆF–öå&WVW7FVB²ââÒ’¢æ6÷VçB‚’À¢¢“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢5·FW7EÐ¢fâ–çfÆ–E÷6–væGW&Uö6ææ÷Eö6öç7VÖU÷6WVVæ6Uö÷%ö6æ6VÂ‚’°¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6RÂ6V7&WB’Òf—‡GW&R‚“°¢ÆWB×WB&WVW7BÒ6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖBÖf÷&vVB"À¢%õ5B"À¢"÷c÷&VÖ÷FR÷'Vç2÷'VâÖöæRö6æ6VÂ"À¢'"2'²'&V6öâ#¦çVÆÇÒ"2À¢“°¢&WVW7Bæ&öG’Ò'"2'²'&V6öâ#¢'F×W&VB'Ò"2çFõ÷fV2‚“°¢76W'EöW†’æ†æFÆR‡&WVW7BÂ%ó’ç7FGW2ÂC“°¢ÆWBfÆ–BÒ6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖB×fÆ–B"À¢$tUB"À¢"÷c÷&VÖ÷FR÷'Vç2÷'VâÖöæR"À¢"""À¢“°¢76W'EöW†’æ†æFÆR‡fÆ–BÂ%ó’ç7FGW2Â#“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢5·FW7EÐ¢fâ&÷fÅ÷&WV—&W5÷F†UöW†7E÷VæF–æuö÷W&F–öåöF–vW7EöæEö—5ö–FV×÷FVçB‚’°¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6RÂ6V7&WB’Òf—‡GW&R‚“°¢ÆWBw&öærÒ'"2'²'&WVW7Eö–B#¢&&÷fÂÖöæR"Â&÷W&F–öå÷6†#Sb#¢&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&""Â&FV6—6–öâ#¢&ÆÆ÷uööæ6R'Ò"3°¢ÆWBw&öæu÷&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖB×w&öærÖF–vW7B"À¢%õ5B"À¢"÷c÷&VÖ÷FR÷'Vç2÷'VâÖöæRö&÷fR"À¢w&öærÀ¢’À¢%óÀ¢“°¢76W'EöW‡w&öæu÷&W7öç6Rç7FGW2ÂC2“°¢ÆWBfÆ–Eö&öG’Ò'"2'²'&WVW7Eö–B#¢&&÷fÂÖöæR"Â&÷W&F–öå÷6†#Sb#¢&"Â&FV6—6–öâ#¢&ÆÆ÷uööæ6R'Ò"3°¢ÆWBfÆ–BÒ6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢"À¢&6ÖBÖ&÷fR"À¢%õ5B"À¢"÷c÷&VÖ÷FR÷'Vç2÷'VâÖöæRö&÷fR"À¢fÆ–Eö&öG’À¢“°¢ÆWBf—'7BÒ’æ†æFÆR‡fÆ–Bæ6ÆöæR‚’Â%ó“°¢ÆWB&WÆ’Ò’æ†æFÆR‡fÆ–BÂ%ó"“°¢76W'EöW†f—'7Bç7FGW2Â#Â&&öG“¢³£÷Ò"Âf—'7Bæ&öG’“°¢76W'EöW†f—'7BÂ&WÆ’“°¢ÆWB&÷fÂÒ'VäÆVFvW#£¦÷Vâ‚dFVÖöåF‡3£§VæFW"‚g&ö÷B’æÆVFvW%öF"¢çVçw&‚¢æÆöEö&÷fÂ‚''VâÖöæR"Â&&÷fÂÖöæR"¢çVçw&‚¢çVçw&‚“°¢76W'EöW†&÷fÂæFV6—6–öâÂ6öÖR…W&Ö—76–öäFV6—6–öã£¤ÆÆ÷töæ6R’“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢òòÒÒÒ÷c÷&VÖ÷FRöÖö&–ÆRò¦W‡FVç6–öâÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¢5¶FW&—fR„FVfVÇB•Ð¢7G'V7Bf¶T6†EVWVR°¢VWVVC¢×WFWƒÅfV3Â…7G&–ærÂ7G&–ær“ãâÀ¢Ð ¢–×ÂÖö&–ÆT6†EVWVRf÷"f¶T6†EVWVR°¢fâVWVUö6†B€¢g6VÆbÀ¢÷6W76–öåö–C¢g7G"À¢6Æ–VçEö¶W“¢g7G"À¢&ö×C¢g7G"À¢’Óâ&W7VÇCÅ7G&–ærÂ7G&–æsâ°¢6VÆbçVWVV@¢æÆö6²‚¢çVçw&‚¢çW6‚‚†6Æ–VçEö¶W’çFõ÷7G&–ær‚’Â&ö×BçFõ÷7G&–ær‚’’“°¢ö²†f÷&ÖB‚''Vâ×¶6Æ–VçEö¶W—Ò"’¢Ð ¢fâ6†E÷'Våö–B€¢g6VÆbÀ¢÷6W76–öåö–C¢g7G"À¢6Æ–VçEö¶W“¢g7G"À¢’Óâ&W7VÇCÄ÷F–öãÅ7G&–æsâÂ7G&–æsâ°¢ö²‡6VÆ`¢çVWVV@¢æÆö6²‚¢çVçw&‚¢æ—FW"‚¢æf–æB‡Â†¶W’Âò—Â¶W’ÓÒ6Æ–VçEö¶W’¢æÖ‡Â†¶W’Âò—Âf÷&ÖB‚''Vâ×¶¶W—Ò"’’¢Ð¢Ð ¢òòòF†Rv†öÆRö–çBöbF†R6W&FR6&–Æ—G’w&çC¢FWf–6R—&V@¢òòò&Vf÷&RÖö&–ÆR6&–Æ—F–W2W†—7FVB†÷"—&VBFVÆ–&W&FVÇ’2¢òòò'VææW"ÖöæÇ’6öçG&öÆÆW"’&W6öÇfW2F‡&÷Vv‚ÆVv7•ö6&–Æ—F–W6Âv†–6€¢òòòæWfW"6öçF–ç26†B(	B6òæWvW"†öæR'V–ÆB6ææ÷BFÆ²—G6VÆb–çFð¢òòò6†B7W&f6RF†R÷W&F÷"æWfW"w&çFVBà¢5·FW7EÐ¢fâÆVv7•÷—&–æuö6ææ÷E÷&V6…öÖö&–ÆUö6†Eö÷%÷v÷&¶fÆ÷uöÆVæ6‚‚’°¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6RÂ6V7&WB’Òf—‡GW&R‚“°¢ÆWB’Ò’çv—F…öÖö&–ÆUö6†B„&3£¦æWr„f¶T6†EVWVS£¦FVfVÇB‚’’“°¢f÷"†–æFW‚Â†ÖWF†öBÂF‚Â&öG’’’–â°¢‚$tUB"Â"÷c÷&VÖ÷FRöÖö&–ÆR÷6W76–öç2"Âf""%²âåÒ’À¢€¢%õ5B"À¢"÷c÷&VÖ÷FRöÖö&–ÆR÷6W76–öç2÷3öÖW76vW2"À¢'"2'²'FW‡B#¢&†’'Ò"2À¢’À¢‚$tUB"Â"÷c÷&VÖ÷FRöÖö&–ÆR÷v÷&¶fÆ÷w2"Â"""’À¢‚%õ5B"Â"÷c÷&VÖ÷FRöÖö&–ÆR÷v÷&¶fÆ÷w2÷vb÷'Vç2"Â"'·Ò"’À¢€¢%õ5B"À¢"÷c÷&VÖ÷FRöÖö&–ÆRö6GW&W2"À¢'"2'²&6GW&Uö–B#¢&3"Â&¶–æB#¢'FW‡B"Â'F—FÆR#¢'B"Â'FW‡B#¢'‚'Ò"2À¢’À¢Ð¢æ–çFõö—FW"‚¢æVçVÖW&FR‚¢°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢–æFW‚2ScB²À¢ff÷&ÖB‚&6ÖBÖÆVv7’×¶–æFW‡Ò"’À¢ÖWF†öBÀ¢F‚À¢&öG’À¢’À¢%ó²–æFW‚2ScBÀ¢“°¢76W'EöW€¢&W7öç6Rç7FGW2ÂC2À¢'¶ÖWF†öGÒ·F‡Ò6†÷VÆB&R6&–Æ—G’ÖFVæ–VB ¢“°¢Ð¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢5·FW7EÐ¢fâw&çFVEöFWf–6U÷VWVW5ööæUö6†E÷GW&åöæE÷&VG5ö—Eö&6²‚’°¢ÆWB‡&ö÷BÂ’Â6V7&WG2ÂöÆVv7•öFWf–6RÂöÆVv7•÷6V7&WB’Òf—‡GW&R‚“°¢ÆWBVWVRÒ&3£¦æWr„f¶T6†EVWVS£¦FVfVÇB‚’“°¢ÆWB’Ò’çv—F…öÖö&–ÆUö6†B‡VWVRæ6ÆöæR‚’“°¢òò—"6V6öæBFWf–6RF†BDôU26''’F†RÖö&–ÆRw&çG2à¢ÆWB†FWf–6RÂ6V7&WB’Ò°¢ÆWB×WB7F÷&RÒ&VÖ÷FU7F÷&S£¦÷Vâ‚dFVÖöåF‡3£§VæFW"‚g&ö÷B’ç&ö÷B’çVçw&‚“°¢ÆWB66÷W2Ò&VÖ÷FU66÷W2°¢7F–öç3¢%G&VU6WC£¦g&öÒ…µ&VÖ÷FT7F–öã£¥f–Wu'Vç5Ò’À¢'Våö–G3¢%G&VU6WC£¦g&öÒ…²''VâÖöæR"æ–çFò‚•Ò’À¢v÷&·76Uö–G3¢%G&VU6WC£¦æWr‚’À¢Ö…ö'F–f7Eö'—FW3¢ó#BÀ¢Ó°¢ÆWB6&–Æ—F–W2Ò%G&VU6WC£¦g&öÒ…°¢FWf–6T6&–Æ—G“£¥f–Wu'Vç2À¢FWf–6T6&–Æ—G“£¥f–Wu6W76–öç2À¢FWf–6T6&–Æ—G“£¤6†BÀ¢Ò“°¢ÆWB–çf—FRÒ7F÷&P¢æ7&VFUö–çf—FF–öå÷v—F…ö6&–Æ—F–W2‚g66÷W2Âf6&–Æ—F–W2ÂóÂ5ó¢çVçw&‚“°¢ÆWB66WFVBÒ7F÷&P¢æ66WEö–çf—FF–öâ€¢f–çf—FRç—&–æuö–BÀ¢f–çf—FRçFö¶VâÀ¢&w&çFVB×†öæR"À¢''VææW"ÖöæR"À¢óÀ¢6V7&WG2æ5÷&Vb‚’À¢¢çVçw&‚“°¢€¢66WFVBæFWf–6Uö–BÀ¢66WFVBæFWf–6U÷6V7&WBæ5ö'—FW2‚’çFõ÷fV2‚’À¢¢Ó° ¢ÆWB÷7BÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖBÖ6†B×÷7B"À¢%õ5B"À¢"÷c÷&VÖ÷FRöÖö&–ÆR÷6W76–öç2÷3öÖW76vW2"À¢'"2'²'FW‡B#¢'v†B—2VWVVCò'Ò"2À¢’À¢%óÀ¢“°¢76W'EöW€¢÷7Bç7FGW2À¢#À¢&&öG“¢³£÷Ò"À¢7G&–æs£¦g&öÕ÷WFc…öÆ÷77’‚g÷7Bæ&öG’¢“°¢76W'EöW‡VWVRçVWVVBæÆö6²‚’çVçw&‚’æÆVâ‚’Â“°¢76W'EöW‡VWVRçVWVVBæÆö6²‚’çVçw&‚•³ÒãÂ'v†B—2VWVVCò"“° ¢ÆWBvWBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢"À¢&6ÖBÖ6†BÖvWB"À¢$tUB"À¢"÷c÷&VÖ÷FRöÖö&–ÆR÷6W76–öç2÷3öÖW76vW2"À¢"""À¢’À¢%óÀ¢“°¢76W'EöW†vWBç7FGW2Â#“°¢ÆWB&öG“¢6W&FUö§6öã£¥fÇVRÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚fvWBæ&öG’’çVçw&‚“°¢ÆWBÖW76vW2Ò&öG•²&ÖW76vW2%Òæ5ö'&’‚’çVçw&‚“°¢76W'EöW€¢ÖW76vW2æÆVâ‚’À¢À¢&öæÇ’F†RW6W"GW&âW†—7G2VçF–ÂF†R'Vâ—2FW&Ö–æÂ ¢“°¢76W'EöW†ÖW76vW5³Õ²'&öÆR%ÒÂ'W6W""“°¢76W'EöW†ÖW76vW5³Õ²'FW‡B%ÒÂ'v†B—2VWVVCò"“°¢76W'EöW†ÖW76vW5³Õ²'F6µ÷7FFR%ÒÂ'VWVVB"“° ¢òòF†R6W76–öâÆ—7B—2FW&—fVBg&öÒF†R6ÖR&÷w2à¢ÆWB6W76–öç2Ò’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢2À¢&6ÖB×6W76–öç2"À¢$tUB"À¢"÷c÷&VÖ÷FRöÖö&–ÆR÷6W76–öç2"À¢"""À¢’À¢%ó"À¢“°¢76W'EöW‡6W76–öç2ç7FGW2Â#“°¢ÆWBÆ—7FVC¢6W&FUö§6öã£¥fÇVRÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚g6W76–öç2æ&öG’’çVçw&‚“°¢76W'EöW†Æ—7FVE²'6W76–öç2%Õ³Õ²&–B%ÒÂ'3"“°¢76W'EöW†Æ—7FVE²'6W76–öç2%Õ³Õ²'F—FÆR%ÒÂ'v†B—2VWVVCò"“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢òòò6GW&Rv†÷6RFV6Æ&VBF–vW7BFöW2æ÷BÖF6‚F†RWÆöFVB'—FW2—0¢òòò&V¦V7FVB÷WG&–v‡B(	BF†RæöFRæWfW"7F÷&W26öçFVçB—B6ææ÷Bf÷V6‚f÷"à¢5·FW7EÐ¢fâ6GW&U÷&V¦V7G5ööF–vW7E÷F†EöFöW5öæ÷EöÖF6…ö—G5ö'—FW2‚’°¢ÆWB‡&ö÷BÂ’Â6V7&WG2ÂöBÂ÷2’Òf—‡GW&R‚“°¢ÆWB†FWf–6RÂ6V7&WB’Ò°¢ÆWB×WB7F÷&RÒ&VÖ÷FU7F÷&S£¦÷Vâ‚dFVÖöåF‡3£§VæFW"‚g&ö÷B’ç&ö÷B’çVçw&‚“°¢ÆWB66÷W2Ò&VÖ÷FU66÷W2°¢7F–öç3¢%G&VU6WC£¦g&öÒ…µ&VÖ÷FT7F–öã£¥f–Wu'Vç5Ò’À¢'Våö–G3¢%G&VU6WC£¦g&öÒ…²''VâÖöæR"æ–çFò‚•Ò’À¢v÷&·76Uö–G3¢%G&VU6WC£¦æWr‚’À¢Ö…ö'F–f7Eö'—FW3¢ó#BÀ¢Ó°¢ÆWB6&–Æ—F–W2Ð¢%G&VU6WC£¦g&öÒ…´FWf–6T6&–Æ—G“£¥f–Wu'Vç2ÂFWf–6T6&–Æ—G“£¤6GW&UÒ“°¢ÆWB–çf—FRÒ7F÷&P¢æ7&VFUö–çf—FF–öå÷v—F…ö6&–Æ—F–W2‚g66÷W2Âf6&–Æ—F–W2ÂóÂ5ó¢çVçw&‚“°¢ÆWB66WFVBÒ7F÷&P¢æ66WEö–çf—FF–öâ€¢f–çf—FRç—&–æuö–BÀ¢f–çf—FRçFö¶VâÀ¢&6GW&R×†öæR"À¢''VææW"ÖöæR"À¢óÀ¢6V7&WG2æ5÷&Vb‚’À¢¢çVçw&‚“°¢€¢66WFVBæFWf–6Uö–BÀ¢66WFVBæFWf–6U÷6V7&WBæ5ö'—FW2‚’çFõ÷fV2‚’À¢¢Ó°¢ÆWB–ÆöBÒ5DäD$BæVæ6öFR†"&†VÆÆò"“°¢ÆWB&öG’Òf÷&ÖB€¢"2'·²&6GW&Uö–B#¢&3"Â&¶–æB#¢&f–ÆR"Â'F—FÆR#¢&æ÷FR"Â&6öçFVçEö&6ScB#¢'·–ÆöGÒ"Â&6öçFVçE÷6†#Sb#¢'·Ò'×Ò"2À¢&""ç&WVBƒcB¢“°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖBÖ6GW&RÖ&B"À¢%õ5B"À¢"÷c÷&VÖ÷FRöÖö&–ÆRö6GW&W2"À¢&öG’æ5ö'—FW2‚’À¢’À¢%óÀ¢“°¢76W'EöW‡&W7öç6Rç7FGW2ÂC“°¢76W'B…7G&–æs£¦g&öÕ÷WFc…öÆ÷77’‚g&W7öç6Ræ&öG’’æ6öçF–ç2‚&6öçFVçE÷6†#Sb"’“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð¢òòÒÒÒ÷c÷&VÖ÷FRöæöFRò¦Æ6VÖVçBÆæR‡&öFÖ³r’ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¢5¶FW&—fR„FVfVÇB•Ð¢7G'V7Bf¶UÆ6VÖVçEVWVR°¢Æ6VC¢×WFWƒÅfV3Å7G&–æsãâÀ¢&VgW6S¢÷F–öãÅ7G&–æsâÀ¢Ð ¢–×Âf¶UÆ6VÖVçEVWVR°¢fâ&VgW6–ær‡&V6öã¢g7G"’Óâ6VÆb°¢6VÆb°¢Æ6VC¢×WFWƒ£¦æWr…fV3£¦æWr‚’’À¢&VgW6S¢6öÖR‡&V6öâçFõ÷7G&–ær‚’’À¢Ð¢Ð¢Ð ¢–×ÂÆ6VÖVçEVWVRf÷"f¶UÆ6VÖVçEVWVR°¢fâÆ6R€¢g6VÆbÀ¢7V3¢fÆ—GFÆUöÖöæ¶W•öÆ–#£§'Vå÷&÷Fö6öÃ£¥'Vå7V2À¢’Óâ&W7VÇCÅÆ6VD¦ö"Â7G&–æsâ°¢–bÆWB6öÖR‡&V6öâ’Òg6VÆbç&VgW6R°¢&WGW&âW'"‡&V6öâæ6ÆöæR‚’“°¢Ð¢6VÆbçÆ6VBæÆö6²‚’çVçw&‚’çW6‚‡7V2ç'Våö–Bæ6ÆöæR‚’“°¢ö²…Æ6VD¦ö"°¢òòF†RæöFRÖ–çG2—G2÷vâ–G2(	BFVÆ–&W&FVÇ’F–ffW&VçBg&öÒF†P¢òò7V&Ö—GFW"w2Âv†–6‚—2F†R&÷W'G’F†R&W7öç6Rw2Gvò–@¢òòf–VÆG2W†—7BFò¶VWf—6–&ÆRà¢æöFU÷'Våö–C¢f÷&ÖB‚&æöFR×·Ò"Â7V2ç'Våö–B’À¢¦ö%ö–C¢f÷&ÖB‚&¦ö"×·Ò"Â7V2ç'Våö–B’À¢7FFS¢'VWVVB"çFõ÷7G&–ær‚’À¢Ò¢Ð ¢fâÆ6VE÷7FFR‚g6VÆbÂ¦ö%ö–C¢g7G"’Óâ&W7VÇCÄ÷F–öãÅÆ6VD¦ö%7FFSâÂ7G&–æsâ°¢ö²…6öÖR…Æ6VD¦ö%7FFR°¢7FFS¢''Vææ–ær"çFõ÷7G&–ær‚’À¢FW&Ö–æÃ¢fÇ6RÀ¢WFFVEöEö×3¢5óÀ¢Æ7EöW'&÷#¢6öÖR†f÷&ÖB‚'7FFRöb¶¦ö%ö–GÒ"’’À¢Ò’¢Ð¢Ð ¢òòò—&–ærF†B6'&–W2F†RGvò³rw&çG2Â6òF†RÆ6VÖVçBÆæR—0¢òòò&V6†&ÆRBÆÂà¢fâÆ6VÖVçEöf—‡GW&R‚’Óâ…F„'VbÂ&VÖ÷FT’Â7G&–ærÂfV3ÇSƒâ’°¢ÆWB&ö÷BÒ7FC£¦Vçc£§FV×öF—"‚’æ¦ö–â†f÷&ÖB€¢&Æ—GFÆRÖÖöæ¶W’×&VÖ÷FR×Æ6R×·Ò"À¢WV–C£¥WV–C£¦æWu÷cB‚¢’“°¢ÆWBF‡2ÒFVÖöåF‡3£§VæFW"‚g&ö÷B“°¢F‡2æVç7W&R‚’çVçw&‚“°¢FVÖöä6öæf–s£¦FVfVÇB‚’ç6fR‚gF‡2’çVçw&‚“°¢ÆWB†÷7BÒ&VÖ÷FT†÷7D6öæf–r°¢&÷Fö6öÅ÷fW'6–öã¢$TÔõDUõ$õDô4ôÅõdU%4”ôâÀ¢'VææW%ö–C¢''VææW"ÖöæR"æ–çFò‚’À¢Æ—7FVã¢##rããã£"æ–çFò‚’À¢GfW'F—6U÷W&Ã¢&‡GG3¢ò÷'VææW"æ–çfÆ–B"æ–çFò‚’À¢6W'F–f–6FU÷Fƒ¢"÷F×ö6W'B"æ–çFò‚’À¢&—fFUö¶W•÷Fƒ¢"÷F×ö¶W’"æ–çFò‚’À¢6W'F–f–6FU÷6†#Sc¢&"ç&WVBƒcB’À¢Væ&ÆVC¢G'VRÀ¢Ó°¢ÆWB×WB7F÷&RÒ&VÖ÷FU7F÷&S£¦÷Vâ‚gF‡2ç&ö÷B’çVçw&‚“°¢ÆWB66÷W2Ò&VÖ÷FU66÷W2°¢7F–öç3¢%G&VU6WC£¦g&öÒ…µ&VÖ÷FT7F–öã£¥f–Wu'Vç5Ò’À¢'Våö–G3¢%G&VU6WC£¦g&öÒ…²''VâÖöæR"æ–çFò‚•Ò’À¢v÷&·76Uö–G3¢%G&VU6WC£¦æWr‚’À¢Ö…ö'F–f7Eö'—FW3¢ó#BÀ¢Ó°¢ÆWB6&–Æ—F–W2Ò%G&VU6WC£¦g&öÒ…°¢FWf–6T6&–Æ—G“£¥f–Wu'Vç2À¢FWf–6T6&–Æ—G“£¤FW67&–&TæöFRÀ¢FWf–6T6&–Æ—G“£¥Æ6U'Vç2À¢Ò“°¢ÆWB6V7&WG2Ò&3£¦æWr„f¶U6V7&WG3£¦FVfVÇB‚’“°¢ÆWB–çf—FRÒ7F÷&P¢æ7&VFUö–çf—FF–öå÷v—F…ö6&–Æ—F–W2‚g66÷W2Âf6&–Æ—F–W2ÂóÂ5ó¢çVçw&‚“°¢ÆWB66WFVBÒ7F÷&P¢æ66WEö–çf—FF–öå÷v—F…ö6&–Æ—F–W2€¢f–çf—FRç—&–æuö–BÀ¢f–çf—FRçFö¶VâÀ¢'66†VGVÆW""À¢''VææW"ÖöæR"À¢æöæRÀ¢óÀ¢6V7&WG2æ5÷&Vb‚’À¢¢çVçw&‚“°¢ÆWB6V7&WBÒ66WFVBæFWf–6U÷6V7&WBæ5ö'—FW2‚’çFõ÷fV2‚“°¢ÆWB’Ò&VÖ÷FT“£¦–æ¦V7FVB‡F‡2Â†÷7BÂ7F÷&RÂ6V7&WG2“°¢‡&ö÷BÂ’Â66WFVBæFWf–6Uö–BÂ6V7&WB¢Ð ¢òòòGvò–ç7FÆÆF–öç2Â–âöæR&ö6W73¢F†—2æöFRÂæBVW"—&VB–çFò—@¢òòòv—F‚F†Rw&çG2æÖVBâæò6V6öæBÖ6†–æRÂæòæWGv÷&²(	BF†R6–væGW&P¢òòòF‚æBF†RvFR&RF†R6ÖRöæW2&VÂ—&–ærW6W2à¢fâVW%öf—‡GW&R€¢6&–Æ—F–W3¢%G&VU6WCÄFWf–6T6&–Æ—G“âÀ¢’Óâ…F„'VbÂ&VÖ÷FT’Â7G&–ærÂfV3ÇSƒâ’°¢ÆWB&ö÷BÒ7FC£¦Vçc£§FV×öF—"‚’æ¦ö–â†f÷&ÖB€¢&Æ—GFÆRÖÖöæ¶W’×&VÖ÷FR×VW"×·Ò"À¢WV–C£¥WV–C£¦æWu÷cB‚¢’“°¢ÆWBF‡2ÒFVÖöåF‡3£§VæFW"‚g&ö÷B“°¢F‡2æVç7W&R‚’çVçw&‚“°¢FVÖöä6öæf–s£¦FVfVÇB‚’ç6fR‚gF‡2’çVçw&‚“°¢ÆWB†÷7BÒ&VÖ÷FT†÷7D6öæf–r°¢&÷Fö6öÅ÷fW'6–öã¢$TÔõDUõ$õDô4ôÅõdU%4”ôâÀ¢'VææW%ö–C¢''VææW"ÖÆö6Â"æ–çFò‚’À¢Æ—7FVã¢##rããã£"æ–çFò‚’À¢GfW'F—6U÷W&Ã¢&‡GG3¢ò÷'VææW"æ–çfÆ–B"æ–çFò‚’À¢6W'F–f–6FU÷Fƒ¢"÷F×ö6W'B"æ–çFò‚’À¢&—fFUö¶W•÷Fƒ¢"÷F×ö¶W’"æ–çFò‚’À¢6W'F–f–6FU÷6†#Sc¢&"ç&WVBƒcB’À¢Væ&ÆVC¢G'VRÀ¢Ó°¢ÆWB×WB7F÷&RÒ&VÖ÷FU7F÷&S£¦÷Vâ‚gF‡2ç&ö÷B’çVçw&‚“°¢ÆWB66÷W2Ò&VÖ÷FU66÷W2°¢7F–öç3¢%G&VU6WC£¦æWr‚’À¢'Våö–G3¢%G&VU6WC£¦æWr‚’À¢v÷&·76Uö–G3¢%G&VU6WC£¦æWr‚’À¢Ö…ö'F–f7Eö'—FW3¢ó#BÀ¢Ó°¢ÆWB6V7&WG2Ò&3£¦æWr„f¶U6V7&WG3£¦FVfVÇB‚’“°¢ÆWB–çf—FRÒ7F÷&P¢æ7&VFUö–çf—FF–öå÷v—F…ö6&–Æ—F–W2‚g66÷W2Âf6&–Æ—F–W2ÂóÂ5ó¢çVçw&‚“°¢ÆWB66WFVBÒ7F÷&P¢æ66WEö–çf—FF–öå÷v—F…ö6&–Æ—F–W2€¢f–çf—FRç—&–æuö–BÀ¢f–çf—FRçFö¶VâÀ¢'VW"×Gvò"À¢''VææW"ÖÆö6Â"À¢æöæRÀ¢óÀ¢6V7&WG2æ5÷&Vb‚’À¢¢çVçw&‚“°¢ÆWB6V7&WBÒ66WFVBæFWf–6U÷6V7&WBæ5ö'—FW2‚’çFõ÷fV2‚“°¢ÆWB’Ò&VÖ÷FT“£¦–æ¦V7FVB‡F‡2Â†÷7BÂ7F÷&RÂ6V7&WG2“°¢‡&ö÷BÂ’Â66WFVBæFWf–6Uö–BÂ6V7&WB¢Ð ¢fâWfW'•÷VW%öw&çB‚’Óâ%G&VU6WCÄFWf–6T6&–Æ—G“â°¢%G&VU6WC£¦g&öÒ…°¢FWf–6T6&–Æ—G“£¥VW$ÖW76vRÀ¢FWf–6T6&–Æ—G“£¥VW%F6µ&WVW7BÀ¢FWf–6T6&–Æ—G“£¥VW$'F–f7BÀ¢Ò¢Ð ¢fâVW%ö&öG’†ÖW76vUö–C¢g7G"Â¶–æC¢Æ—GFÆUöÖöæ¶W•öÆ–#£§VW'3£¥VW$ÖW76vT¶–æB’ÓâfV3ÇSƒâ°¢ÆWB×WBVçfVÆ÷RÒÆ—GFÆUöÖöæ¶W•öÆ–#£§VW'3£¥VW$VçfVÆ÷S£¦æWr€¢ÖW76vUö–BÀ¢'F‡&VBÓ"À¢¶–æBÀ¢&–ç7Fæ6R×VW"×Gvò"À¢'7VÖÖ&—¦RF†Rf–Æ–æræ–v‡FÇ’'V–ÆB"À¢%óÀ¢cóÀ¢“°¢VçfVÆ÷Ræ6÷'&VÆF–öåö–BÒ6öÖR‚&6÷'"Ó"æ–çFò‚’“°¢6W&FUö§6öã£§Fõ÷fV2‚fVçfVÆ÷R’çVçw&‚¢Ð ¢5¶FW&—fR„FVfVÇB•Ð¢7G'V7Bf¶UVW%'Vç2°¢7V&Ö—GFVC¢7FC£§7–æ3£¤×WFWƒÅfV3ÆÆ—GFÆUöÖöæ¶W•öÆ–#£¦6†ææVÇ3£¦–æw&W73£¤6öçfW'6F–öä–æw&W73ãâÀ¢Ð ¢–×Â7&FS£¦FVÖöã£¦6†ææVÅ÷v÷&¶W#£¥'VåVWVRf÷"f¶UVW%'Vç2°¢fâg&VW¦UöW†V7WF–öâ€¢g6VÆbÀ¢–æw&W73¢fÆ—GFÆUöÖöæ¶W•öÆ–#£¦6†ææVÇ3£¦–æw&W73£¤6öçfW'6F–öä–æw&W72À¢’Óâ&W7VÇCÆÆ—GFÆUöÖöæ¶W•öÆ–#£¦6†ææVÇ3£¦–æw&W73£¤g&÷¦VäW†V7WF–öä6öçFW‡BÂ7G&–æsâ°¢ö²†7&FS£¦FVÖöã£¦6†ææVÅ÷v÷&¶W#£§FW7Eög&÷¦VåöW†V7WF–öâ€¢–æw&W72À¢’¢Ð ¢fâ7V&Ö—B€¢g6VÆbÀ¢–æw&W73¢fÆ—GFÆUöÖöæ¶W•öÆ–#£¦6†ææVÇ3£¦–æw&W73£¤6öçfW'6F–öä–æw&W72À¢÷&×3¢fV3Å7G&–æsâÀ¢’Óâ&W7VÇCÅ7G&–ærÂ7G&–æsâ°¢6VÆbç7V&Ö—GFVBæÆö6²‚’çVçw&‚’çW6‚†–æw&W72æ6ÆöæR‚’“°¢ö²†–æw&W72æFWFW&Ö–æ—7F–5ö¦ö%ö–B‚’¢Ð¢Ð ¢òòòVW"7FæF–ær—2—G2÷vâF†–ærâ—&–ærv—F†÷WBç’öbF†RF‡&VRVW ¢òòòw&çG26ææ÷B&V6‚F†RVW"ÆæRBÆÂ(	Bv†–6‚—2v†B¶VW2WfW'¢òòò—&–ærF†BW†—7FVB&Vf÷&RF†—2'V–ÆBg&öÒ&V6öÖ–ærVW"à¢5·FW7EÐ¢fâ÷—&–æu÷v—F†÷WE÷VW%öw&çG5ö6ææ÷E÷&V6…÷F†U÷VW%÷ÆæR‚’°¢òòâ÷&F–æ'’6öçG&öÆÆW"—&–ær(	BF†R6†RWfW'’—&–ærF†@¢òòW†—7FVB&Vf÷&RVW'26†—VB7F–ÆÂ†2à¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6RÂ6V7&WB’Òf—‡GW&R‚“°¢ÆWB’Ò’çv—F…÷VW%÷'Vç2„&3£¦æWr„f¶UVW%'Vç3£¦FVfVÇB‚’’“°¢f÷"†–æFW‚Â†ÖWF†öBÂF‚Â&öG’’’–â°¢€¢%õ5B"À¢"÷c÷&VÖ÷FR÷VW"öÖW76vW2"À¢VW%ö&öG’‚&×6rÓ"ÂÆ—GFÆUöÖöæ¶W•öÆ–#£§VW'3£¥VW$ÖW76vT¶–æC£¤ÖW76vR’À¢’À¢‚$tUB"Â"÷c÷&VÖ÷FR÷VW"÷F‡&VG2÷F‡&VBÓ"ÂfV3£¦æWr‚’’À¢Ð¢æ–çFõö—FW"‚¢æVçVÖW&FR‚¢°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢–æFW‚2ScB²À¢ff÷&ÖB‚&6ÖB×VW"×¶–æFW‡Ò"’À¢ÖWF†öBÀ¢F‚À¢f&öG’À¢’À¢%óÀ¢“°¢76W'EöW€¢&W7öç6Rç7FGW2ÂC2À¢'¶ÖWF†öGÒ·F‡Ò×W7BæVVBVW"w&çB ¢“°¢Ð¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢5·FW7EÐ¢fâ÷VW%÷F6µ÷&WVW7Eö&V6öÖW5ö÷GW&åöæE÷F†U÷F‡&VE÷6†÷w5ö—E÷7F–ÆÅ÷'Vææ–ær‚’°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6V7&WB’ÒVW%öf—‡GW&R†WfW'•÷VW%öw&çB‚’“°¢ÆWB'Vç2Ò&3£¦æWr„f¶UVW%'Vç3£¦FVfVÇB‚’“°¢ÆWB’Ò’çv—F…÷VW%÷'Vç2‡'Vç2æ6ÆöæR‚’“° ¢ÆWB66WFVBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖB×VW"×6VæB"À¢%õ5B"À¢"÷c÷&VÖ÷FR÷VW"öÖW76vW2"À¢gVW%ö&öG’€¢&×6rÓ"À¢Æ—GFÆUöÖöæ¶W•öÆ–#£§VW'3£¥VW$ÖW76vT¶–æC£¥F6µ&WVW7BÀ¢’À¢’À¢%óÀ¢“°¢76W'EöW†66WFVBç7FGW2Â#"“°¢ÆWB&öG“¢6W&FUö§6öã£¥fÇVRÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚f66WFVBæ&öG’’çVçw&‚“°¢76W'EöW†&öG•²&66WFVB%ÒÂG'VR“°¢76W'EöW†&öG•²'F‡&VEö–B%ÒÂ'F‡&VBÓ"“°¢76W'EöW†&öG•²&6÷'&VÆF–öåö–B%ÒÂ&6÷'"Ó"“° ¢òò—B&V6†VBF†R÷&F–æ'’GW&&ÆRF‚Â2VW"GW&âà¢ÆWB7V&Ö—GFVBÒ'Vç2ç7V&Ö—GFVBæÆö6²‚’çVçw&‚’æ6ÆöæR‚“°¢76W'EöW‡7V&Ö—GFVBæÆVâ‚’Â“°¢76W'EöW€¢7V&Ö—GFVE³Òç6÷W&6RÀ¢Æ—GFÆUöÖöæ¶W•öÆ–#£¦6†ææVÇ3£¦–æw&W73£¤6öçfW'6F–öå6÷W&6S£¥VW ¢“° ¢òòæ÷F†–ær†2f–æ—6†VBÂ6òF†RF‡&VB6'&–W2F†R&WVW7BæBæò&W7VÇBà¢ÆWBF‡&VBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢"À¢&6ÖB×VW"×öÆÂ"À¢$tUB"À¢"÷c÷&VÖ÷FR÷VW"÷F‡&VG2÷F‡&VBÓ"À¢"""À¢’À¢%óÀ¢“°¢76W'EöW‡F‡&VBç7FGW2Â#“°¢ÆWB&öG“¢6W&FUö§6öã£¥fÇVRÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚gF‡&VBæ&öG’’çVçw&‚“°¢ÆWBÖW76vW2Ò&öG•²&ÖW76vW2%Òæ5ö'&’‚’çVçw&‚“°¢76W'EöW†ÖW76vW2æÆVâ‚’Â“°¢76W'EöW†ÖW76vW5³Õ²&F—&V7F–öâ%ÒÂ&–æ&÷VæB"“°¢76W'EöW†ÖW76vW5³Õ²&F—7÷6—F–öâ%ÒÂ&66WFVB"“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢5·FW7EÐ¢fâ÷&WG&–VEöFVÆ—fW'•ö—5öç7vW&VE÷v—F…÷F†Uöf—'7EöFV6—6–öåöæE÷'Vç5ööæ6R‚’°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6V7&WB’ÒVW%öf—‡GW&R†WfW'•÷VW%öw&çB‚’“°¢ÆWB'Vç2Ò&3£¦æWr„f¶UVW%'Vç3£¦FVfVÇB‚’“°¢ÆWB’Ò’çv—F…÷VW%÷'Vç2‡'Vç2æ6ÆöæR‚’“°¢ÆWB&öG’ÒVW%ö&öG’€¢&×6rÓ"À¢Æ—GFÆUöÖöæ¶W•öÆ–#£§VW'3£¥VW$ÖW76vT¶–æC£¥F6µ&WVW7BÀ¢“° ¢ÆWBf—'7BÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖB×VW"Ö"À¢%õ5B"À¢"÷c÷&VÖ÷FR÷VW"öÖW76vW2"À¢f&öG’À¢’À¢%óÀ¢“°¢ÆWB6V6öæBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢"À¢&6ÖB×VW"Ö""À¢%õ5B"À¢"÷c÷&VÖ÷FR÷VW"öÖW76vW2"À¢f&öG’À¢’À¢%óSÀ¢“° ¢76W'EöW†f—'7Bç7FGW2Â#"“°¢76W'EöW‡6V6öæBç7FGW2Â#“°¢ÆWB&WVFVC¢6W&FUö§6öã£¥fÇVRÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚g6V6öæBæ&öG’’çVçw&‚“°¢76W'EöW‡&WVFVE²'7FFR%ÒÂ&GWÆ–6FR"“°¢76W'EöW‡&WVFVE²&66WFVB%ÒÂG'VR“°¢76W'EöW‡'Vç2ç7V&Ö—GFVBæÆö6²‚’çVçw&‚’æÆVâ‚’Â“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢5·FW7EÐ¢fâ÷VW%öw&çFVEööæÇ•ö6öçfW'6F–öåö6ææ÷Eö6µöf÷%÷v÷&²‚’°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6V7&WB’Ð¢VW%öf—‡GW&R„%G&VU6WC£¦g&öÒ…´FWf–6T6&–Æ—G“£¥VW$ÖW76vUÒ’“°¢ÆWB'Vç2Ò&3£¦æWr„f¶UVW%'Vç3£¦FVfVÇB‚’“°¢ÆWB’Ò’çv—F…÷VW%÷'Vç2‡'Vç2æ6ÆöæR‚’“° ¢ÆWB&VgW6VBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖB×VW"×F6²"À¢%õ5B"À¢"÷c÷&VÖ÷FR÷VW"öÖW76vW2"À¢gVW%ö&öG’€¢&×6rÓ"À¢Æ—GFÆUöÖöæ¶W•öÆ–#£§VW'3£¥VW$ÖW76vT¶–æC£¥F6µ&WVW7BÀ¢’À¢’À¢%óÀ¢“°¢76W'EöW‡&VgW6VBç7FGW2ÂC2“°¢76W'B‡'Vç2ç7V&Ö—GFVBæÆö6²‚’çVçw&‚’æ—5öV×G’‚’“° ¢òòF†R6ÖRVW"Ö’7F–ÆÂFÆ²à¢ÆWBÆÆ÷vVBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢"À¢&6ÖB×VW"Ö×6r"À¢%õ5B"À¢"÷c÷&VÖ÷FR÷VW"öÖW76vW2"À¢gVW%ö&öG’‚&×6rÓ""ÂÆ—GFÆUöÖöæ¶W•öÆ–#£§VW'3£¥VW$ÖW76vT¶–æC£¤ÖW76vR’À¢’À¢%óÀ¢“°¢76W'EöW†ÆÆ÷vVBç7FGW2Â#"“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢5·FW7EÐ¢fâ÷VW%ö6ææ÷E÷&VEöæ÷F†W%÷VW'5÷F‡&VB‚’°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6V7&WB’ÒVW%öf—‡GW&R†WfW'•÷VW%öw&çB‚’“°¢ÆWB’Ò’çv—F…÷VW%÷'Vç2„&3£¦æWr„f¶UVW%'Vç3£¦FVfVÇB‚’’“°¢’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖB×VW"×6VVB"À¢%õ5B"À¢"÷c÷&VÖ÷FR÷VW"öÖW76vW2"À¢gVW%ö&öG’‚&×6rÓ"ÂÆ—GFÆUöÖöæ¶W•öÆ–#£§VW'3£¥VW$ÖW76vT¶–æC£¤ÖW76vR’À¢’À¢%óÀ¢“° ¢òò6V6öæBVW"Â—&VB–çFòF†R6ÖRæöFRÂ6·2f÷"F†Rf—'7BöæRw0¢òòF‡&VB'’æÖRâ—BvWG2F†R6ÖRç7vW"F‡&VBF†BFöW2æ÷BW†—7@¢òòvWG2Â6ò&ö&–ær6ææ÷BVçVÖW&FRç–öæRà¢ÆWB×WB7F÷&RÒ&VÖ÷FU7F÷&S£¦÷Vâ‚f’çF‡2ç&ö÷B’çVçw&‚“°¢ÆWB66÷W2Ò&VÖ÷FU66÷W2°¢7F–öç3¢%G&VU6WC£¦æWr‚’À¢'Våö–G3¢%G&VU6WC£¦æWr‚’À¢v÷&·76Uö–G3¢%G&VU6WC£¦æWr‚’À¢Ö…ö'F–f7Eö'—FW3¢ó#BÀ¢Ó°¢ÆWB6V7&WG2Ò&3£¦æWr„f¶U6V7&WG3£¦FVfVÇB‚’“°¢ÆWB–çf—FRÒ7F÷&P¢æ7&VFUö–çf—FF–öå÷v—F…ö6&–Æ—F–W2‚g66÷W2ÂfWfW'•÷VW%öw&çB‚’ÂóÂ5ó¢çVçw&‚“°¢ÆWB–çG'VFW"Ò7F÷&P¢æ66WEö–çf—FF–öå÷v—F…ö6&–Æ—F–W2€¢f–çf—FRç—&–æuö–BÀ¢f–çf—FRçFö¶VâÀ¢'VW"×F‡&VR"À¢''VææW"ÖÆö6Â"À¢æöæRÀ¢óÀ¢6V7&WG2æ5÷&Vb‚’À¢¢çVçw&‚“°¢G&÷‡7F÷&R“°¢ÆWB’Ò&VÖ÷FT“£¦–æ¦V7FVB€¢’çF‡2æ6ÆöæR‚’À¢’æ†÷7Bæ6ÆöæR‚’À¢&VÖ÷FU7F÷&S£¦÷Vâ‚f’çF‡2ç&ö÷B’çVçw&‚’À¢6V7&WG2À¢¢çv—F…÷VW%÷'Vç2„&3£¦æWr„f¶UVW%'Vç3£¦FVfVÇB‚’’“° ¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢f–çG'VFW"æFWf–6Uö–BÀ¢–çG'VFW"æFWf–6U÷6V7&WBæ5ö'—FW2‚’À¢À¢&6ÖB×VW"×VV²"À¢$tUB"À¢"÷c÷&VÖ÷FR÷VW"÷F‡&VG2÷F‡&VBÓ"À¢"""À¢’À¢%óÀ¢“°¢76W'EöW‡&W7öç6Rç7FGW2ÂCB“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢5·FW7EÐ¢fâåöVçfVÆ÷U÷F†EöÆö÷5ö&6µö†W&Uö—5÷&VgW6VEö&Vf÷&Uö—Eö—5÷7F÷&VB‚’°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6V7&WB’ÒVW%öf—‡GW&R†WfW'•÷VW%öw&çB‚’“°¢ÆWB'Vç2Ò&3£¦æWr„f¶UVW%'Vç3£¦FVfVÇB‚’“°¢ÆWB’Ò’çv—F…÷VW%÷'Vç2‡'Vç2æ6ÆöæR‚’“°¢ÆWB×WBÆö÷VBÒÆ—GFÆUöÖöæ¶W•öÆ–#£§VW'3£¥VW$VçfVÆ÷S£¦æWr€¢&×6rÓ"À¢'F‡&VBÓ"À¢Æ—GFÆUöÖöæ¶W•öÆ–#£§VW'3£¥VW$ÖW76vT¶–æC£¤ÖW76vRÀ¢&–ç7Fæ6R×VW"×Gvò"À¢'&÷VæBæB&÷VæB"À¢%óÀ¢cóÀ¢“°¢òòF†—2æöFR—2Ç&VG’–âF†R6†–ã¢F†RÖW76vR†2&VVâ†W&R&Vf÷&Rà¢Æö÷VBæ÷&–v–åö6†–âçW6‚‚''VææW"ÖÆö6Â"æ–çFò‚’“° ¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖB×VW"ÖÆö÷"À¢%õ5B"À¢"÷c÷&VÖ÷FR÷VW"öÖW76vW2"À¢g6W&FUö§6öã£§Fõ÷fV2‚fÆö÷VB’çVçw&‚’À¢’À¢%óÀ¢“°¢76W'EöW‡&W7öç6Rç7FGW2ÂC“°¢76W'B‡'Vç2ç7V&Ö—GFVBæÆö6²‚’çVçw&‚’æ—5öV×G’‚’“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢5·FW7EÐ¢fâåöW‡—&VE÷&WVW7Eö—5÷&VgW6VE÷&F†W%÷F†å÷'VåöÆFR‚’°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6V7&WB’ÒVW%öf—‡GW&R†WfW'•÷VW%öw&çB‚’“°¢ÆWB'Vç2Ò&3£¦æWr„f¶UVW%'Vç3£¦FVfVÇB‚’“°¢ÆWB’Ò’çv—F…÷VW%÷'Vç2‡'Vç2æ6ÆöæR‚’“° ¢òòöæR×6V6öæBÆ–fRÂ6òF†R&WVW7B6â'&—fRgFW"—BW‡—&VBæ@¢òò7F–ÆÂ&RvVÆÂ–ç6–FRF†R6–væGW&Rw2÷vâ6¶Wrv–æF÷s¢F†—2†2Fð¢òòf–Â2W‡—&VBÂæ÷B2VæWF†÷&—¦VBà¢ÆWB7FÆRÒÆ—GFÆUöÖöæ¶W•öÆ–#£§VW'3£¥VW$VçfVÆ÷S£¦æWr€¢&×6rÓ"À¢'F‡&VBÓ"À¢Æ—GFÆUöÖöæ¶W•öÆ–#£§VW'3£¥VW$ÖW76vT¶–æC£¥F6µ&WVW7BÀ¢&–ç7Fæ6R×VW"×Gvò"À¢'7VÖÖ&—¦RF†Rf–Æ–æræ–v‡FÇ’'V–ÆB"À¢%óÀ¢óÀ¢“°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖB×VW"×7FÆR"À¢%õ5B"À¢"÷c÷&VÖ÷FR÷VW"öÖW76vW2"À¢g6W&FUö§6öã£§Fõ÷fV2‚g7FÆR’çVçw&‚’À¢’À¢#óÀ¢“°¢76W'EöW‡&W7öç6Rç7FGW2ÂC“°¢76W'B‡'Vç2ç7V&Ö—GFVBæÆö6²‚’çVçw&‚’æ—5öV×G’‚’“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢fâÆ6VÖVçEö&öG’€¢'Våö–C¢g7G"À¢&WV—&VE÷&W6–FVæ7“¢÷F–öãÂg7G#âÀ¢W‡V7FVE÷'VææW%ö–C¢÷F–öãÂg7G#âÀ¢’ÓâfV3ÇSƒâ°¢6W&FUö§6öã£§Fõ÷fV2‚fÆ—GFÆUöÖöæ¶W•öÆ–#£¦æöFU÷Æ6VÖVçC£¥Æ6U'Vå&WVW7B°¢&÷Fö6öÅ÷fW'6–öã¢Æ—GFÆUöÖöæ¶W•öÆ–#£¦æöFU÷Æ6VÖVçC£¤äôDUõ$õDô4ôÅõdU%4”ôâÀ¢7V3¢7V2‡'Våö–BÂ'v÷&·76RÖöæR"’À¢&WV—&VE÷&W6–FVæ7“¢&WV—&VE÷&W6–FVæ7’æÖ‡7G#£§Fõ÷7G&–ær’À¢W‡V7FVE÷'VææW%ö–C¢W‡V7FVE÷'VææW%ö–BæÖ‡7G#£§Fõ÷7G&–ær’À¢Ò¢çVçw&‚¢Ð ¢òòò¢¥F†Rw&çBF†BvFW2F†RöæÇ’&÷WFRF‡&÷Vv‚v†–6‚'VâF†—2Ö6†–æP¢òòòF–Bæ÷BWF†÷"6â7F'B†W&Râ¢¢WfW'’W†—7F–ær—&–ær(	BæBç’æWp¢òòòöæRF†Bv2æ÷BW‡Æ–6—FÇ’v—fVâF†R³rw&çG2(	B—2&VgW6VBÂv†–6‚—0¢òòòv‡’Æ6U'Vç6—2—G2÷vâ6&–Æ—G’&F†W"F†ââ–×Æ–6F–öâö`¢òòò'Våv÷&¶fÆ÷w6÷"öbç’'Vâ66÷Rà¢5·FW7EÐ¢fâ÷—&–æu÷v—F†÷WE÷F†U÷Æ6VÖVçEöw&çG5ö6ææ÷EöFW67&–&Uö÷%÷Æ6R‚’°¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6RÂ6V7&WB’Òf—‡GW&R‚“°¢ÆWB’Ò’çv—F…÷Æ6VÖVçB„&3£¦æWr„f¶UÆ6VÖVçEVWVS£¦FVfVÇB‚’’“°¢f÷"†–æFW‚Â†ÖWF†öBÂF‚Â&öG’’’–â°¢‚$tUB"Â"÷c÷&VÖ÷FRöæöFR"Âf""%²âåÒ’À¢‚$tUB"Â"÷c÷&VÖ÷FRöæöFRö†VÇF‚"Â"""’À¢‚%õ5B"Â"÷c÷&VÖ÷FRöæöFR÷'Vç2"Â"'·Ò"’À¢‚$tUB"Â"÷c÷&VÖ÷FRöæöFR÷'Vç2÷'VâÖöæR"Â"""’À¢Ð¢æ–çFõö—FW"‚¢æVçVÖW&FR‚¢°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢–æFW‚2ScB²À¢ff÷&ÖB‚&6ÖBÖæöFR×¶–æFW‡Ò"’À¢ÖWF†öBÀ¢F‚À¢&öG’À¢’À¢%óÀ¢“°¢76W'EöW€¢&W7öç6Rç7FGW2ÂC2À¢'¶ÖWF†öGÒ·F‡Ò×W7BæVVBâW‡Æ–6—B³rw&çB ¢“°¢Ð¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢òòòF†RæöFR6†V6·2F†R&W6–FVæ7’6Æ–Ò&F†W"F†âG'W7F–ærF†RÆ6W"w0¢òòòv÷&Bf÷"—Bâ'VÆRVæf÷&6VBöæÇ’'’F†R6VæFW"—2æ÷BVæf÷&6VBà¢5·FW7EÐ¢fâF†UöæöFU÷&VgW6W5ö÷Æ6VÖVçE÷v†÷6U÷&W6–FVæ7•÷'VÆUö—EöFöW5öæ÷E÷6F—6g’‚’°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6V7&WB’ÒÆ6VÖVçEöf—‡GW&R‚“°¢ÆWB’Ò’çv—F…÷Æ6VÖVçB„&3£¦æWr„f¶UÆ6VÖVçEVWVS£¦FVfVÇB‚’’“°¢ÆWB&öG’ÒÆ6VÖVçEö&öG’‚''Vâ×Æ6VB"Â6öÖR‚&WR×vW7B"’ÂæöæR“°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖB×&W6–FVæ7’"À¢%õ5B"À¢"÷c÷&VÖ÷FRöæöFR÷'Vç2"À¢f&öG’À¢’À¢%óÀ¢“°¢76W'EöW‡&W7öç6Rç7FGW2ÂC’“°¢ÆWBÖW76vRÒ7G&–æs£¦g&öÕ÷WFc…öÆ÷77’‚g&W7öç6Ræ&öG’’çFõ÷7G&–ær‚“°¢76W'B€¢ÖW76vRæ6öçF–ç2‚'Vç7V6–f–VB"’bbÖW76vRæ6öçF–ç2‚&WR×vW7B"’À¢'F†R&VgW6Â×W7BæÖR&÷F‚Æ&VÇ3¢¶ÖW76vWÒ ¢“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢òòò6ÖR6†Rf÷"–FVçF—G“¢âÆ–2F†B†27F'FVBö–çF–ærB¢òòòF–ffW&VçBÖ6†–æR—2&VgW6ÂÂæ÷B6–ÆVçB&R×F&vWBà¢5·FW7EÐ¢fâF†UöæöFU÷&VgW6W5ö÷Æ6VÖVçEöFG&W76VE÷FõööF–ffW&VçE÷'VææW"‚’°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6V7&WB’ÒÆ6VÖVçEöf—‡GW&R‚“°¢ÆWB’Ò’çv—F…÷Æ6VÖVçB„&3£¦æWr„f¶UÆ6VÖVçEVWVS£¦FVfVÇB‚’’“°¢ÆWB&öG’ÒÆ6VÖVçEö&öG’‚''Vâ×Æ6VB"ÂæöæRÂ6öÖR‚''VææW"×Gvò"’“°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖB×'VææW""À¢%õ5B"À¢"÷c÷&VÖ÷FRöæöFR÷'Vç2"À¢f&öG’À¢’À¢%óÀ¢“°¢76W'EöW‡&W7öç6Rç7FGW2ÂC’“°¢76W'B…7G&–æs£¦g&öÕ÷WFc…öÆ÷77’‚g&W7öç6Ræ&öG’’æ6öçF–ç2‚''VææW"×Gvò"’“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢òòòF†RæöFR÷vç2v†B—B66WG3¢—BÖ–çG2—G2÷vâ'Vâ–BÂ&V6÷&G2F†P¢òòòÆ6VÖVçBv–ç7BF†RÆ6–ærFWf–6RÂæB6V6öæB¦F–ffW&VçB¢6–væV@¢òòò&WVW7B6''––ærF†R6ÖR7V2&W6öÇfW2FòF†R6ÖRÆ6VÖVçB–ç7FVBö`¢òòò7F'F–ær6V6öæB'Vââ…F†R&WÆ’wV&B6÷fW'2â–FVçF–6Â&WG'“²F†—0¢òòò6÷fW'2F†R66R—B6ææ÷B6VRâ¢5·FW7EÐ¢fâåö66WFVE÷Æ6VÖVçEö—5ö÷væVE÷&V6÷&FVEöæEö–FV×÷FVçE÷W%÷7V2‚’°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6V7&WB’ÒÆ6VÖVçEöf—‡GW&R‚“°¢ÆWBVWVRÒ&3£¦æWr„f¶UÆ6VÖVçEVWVS£¦FVfVÇB‚’“°¢ÆWB’Ò’çv—F…÷Æ6VÖVçB‡VWVRæ6ÆöæR‚’“°¢ÆWB&öG’ÒÆ6VÖVçEö&öG’‚''Vâ×Æ6VB"ÂæöæRÂ6öÖR‚''VææW"ÖöæR"’“° ¢ÆWBf—'7BÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖB×Æ6RÖ"À¢%õ5B"À¢"÷c÷&VÖ÷FRöæöFR÷'Vç2"À¢f&öG’À¢’À¢%óÀ¢“°¢76W'EöW€¢f—'7Bç7FGW2À¢#À¢'·Ò"À¢7G&–æs£¦g&öÕ÷WFc…öÆ÷77’‚ff—'7Bæ&öG’¢“°¢ÆWB66WFVC¢Æ—GFÆUöÖöæ¶W•öÆ–#£¦æöFU÷Æ6VÖVçC£¥Æ6U'Vå&W7öç6RÐ¢6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚ff—'7Bæ&öG’’çVçw&‚“°¢76W'EöW†66WFVBç7V&Ö—GFVE÷'Våö–BÂ''Vâ×Æ6VB"“°¢76W'EöW†66WFVBææöFU÷'Våö–BÂ&æöFR×'Vâ×Æ6VB"“°¢76W'EöæR€¢66WFVBææöFU÷'Våö–BÂ66WFVBç7V&Ö—GFVE÷'Våö–BÀ¢'F†RæöFR×W7Bæ÷BF÷Bf÷&V–vâ'Vâ–B2—G2÷vâ ¢“° ¢ÆWB6V6öæBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢"À¢&6ÖB×Æ6RÖ""À¢%õ5B"À¢"÷c÷&VÖ÷FRöæöFR÷'Vç2"À¢f&öG’À¢’À¢%óSÀ¢“°¢76W'EöW‡6V6öæBç7FGW2Â#Â&&R×Æ6VB7V2—2F†R6ÖRÆ6VÖVçB"“°¢ÆWB&WÆ–VC¢Æ—GFÆUöÖöæ¶W•öÆ–#£¦æöFU÷Æ6VÖVçC£¥Æ6U'Vå&W7öç6RÐ¢6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚g6V6öæBæ&öG’’çVçw&‚“°¢76W'EöW‡&WÆ–VBææöFU÷'Våö–BÂ66WFVBææöFU÷'Våö–B“°¢76W'EöW€¢VWVRçÆ6VBæÆö6²‚’çVçw&‚’æÆVâ‚’À¢À¢'F†RæöFRVWVVBF†R7V2W†7FÇ’öæ6R ¢“° ¢òòæBF†RÆ6VÖVçB&VG2&6²Â¶W–VB'’F†R5T$Ô•EDU"w2–Bà¢ÆWB7FGW2Ò’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢2À¢&6ÖB×7FGW2"À¢$tUB"À¢"÷c÷&VÖ÷FRöæöFR÷'Vç2÷'Vâ×Æ6VB"À¢"""À¢’À¢%ócÀ¢“°¢76W'EöW‡7FGW2ç7FGW2Â#“°¢ÆWB7FGW3¢Æ—GFÆUöÖöæ¶W•öÆ–#£¦æöFU÷Æ6VÖVçC£¥Æ6VE'Vå7FGW2Ð¢6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚g7FGW2æ&öG’’çVçw&‚“°¢76W'EöW‡7FGW2ææöFU÷'Våö–BÂ&æöFR×'Vâ×Æ6VB"“°¢76W'EöW‡7FGW2ç7FFRÂ''Vææ–ær"“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢òòòF†RæöFRw2÷vâ&VgW6Â&V6†W2F†RÆ6W"2&VgW6ÂÂæBæ÷F†–ær—0¢òòò&V6÷&FVC¢Æ6VÖVçB&÷r6Æ–Ö–ærF†—2æöFRFöö²v÷&²—BæWfW"VWVV@¢òòòv÷VÆB&Rv÷'6RF†âF†Rf–ÆVB&WVW7Bà¢5·FW7EÐ¢fâ÷VWVU÷&VgW6Åö—5÷&W÷'FVEöæEöÆVfW5öæõ÷Æ6VÖVçE÷&V6÷&B‚’°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6V7&WB’ÒÆ6VÖVçEöf—‡GW&R‚“°¢ÆWB’Ò’çv—F…÷Æ6VÖVçB„&3£¦æWr„f¶UÆ6VÖVçEVWVS£§&VgW6–ær€¢'F†RÆ6VBv÷&·76R&ö÷Bröæ÷v†W&RrFöW2æ÷BW†—7BöâF†—2æöFR"À¢’’“°¢ÆWB&öG’ÒÆ6VÖVçEö&öG’‚''Vâ×Æ6VB"ÂæöæRÂæöæR“°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖB×&VgW6R"À¢%õ5B"À¢"÷c÷&VÖ÷FRöæöFR÷'Vç2"À¢f&öG’À¢’À¢%óÀ¢“°¢76W'EöW‡&W7öç6Rç7FGW2ÂC’“°¢76W'B…7G&–æs£¦g&öÕ÷WFc…öÆ÷77’‚g&W7öç6Ræ&öG’’æ6öçF–ç2‚"öæ÷v†W&R"’“° ¢ÆWBföÆÆ÷u÷WÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢"À¢&6ÖB×&VgW6R×7FGW2"À¢$tUB"À¢"÷c÷&VÖ÷FRöæöFR÷'Vç2÷'Vâ×Æ6VB"À¢"""À¢’À¢%óÀ¢“°¢76W'EöW€¢föÆÆ÷u÷Wç7FGW2ÂCBÀ¢&&VgW6VBÆ6VÖVçB×W7BÆVfRæò&V6÷&B&V†–æB ¢“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢òòò'V–ÆBv—F‚æòÆ6VÖVçBVWVRç7vW'2F†R&÷WFRW‡Æ–6—FÇ’&F†W"F†à¢òòò66WF–ær7V2—B†2æòv’Fò'Vâà¢5·FW7EÐ¢fâöæöFU÷v—F†÷WEö÷Æ6VÖVçE÷VWVU÷&VgW6W5÷&F†W%÷F†åö66WF–ær‚’°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6V7&WB’ÒÆ6VÖVçEöf—‡GW&R‚“°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖBÖæò×VWVR"À¢%õ5B"À¢"÷c÷&VÖ÷FRöæöFR÷'Vç2"À¢gÆ6VÖVçEö&öG’‚''Vâ×Æ6VB"ÂæöæRÂæöæR’À¢’À¢%óÀ¢“°¢76W'EöW‡&W7öç6Rç7FGW2ÂS“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢òòÒÒÒÆ—fRÖ–w&F–öâ‡&öFÖ³‚’ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢òð¢òòGvòÖ6†–æW2—2F†R†öæW7B&"f÷"F†—2fVGW&RæBF†—2&W÷6—F÷'’w24¢òò†2öæRâv†BF†W6RW†W&6—6R—2F†R§v—&RF‚¢v–ç7BÆö÷&6²æöFS ¢òòF†R&VÂ&÷WFW2ÂF†R&VÂ6–væVBG&ç7÷'BÂF†R&VÂÆVFvW"ÂF†R&VÀ¢òòf–ÆW2öâF—6²âF†W’&Ræ÷B7V'7F—GWFRf÷"Gvò†÷7G2(	Bæ÷F†–ær†W&P¢òò&÷fW2æWGv÷&²Â6Æö6²6¶Wr&WGvVVâÖ6†–æW2Â÷"'F–ÂG&ç6fW"à ¢òòòw&—FW2g&÷¦Vâ6†V6·ö–çBæB—G2v÷&·76Röâ&WFVæB÷&–v–âæöFRÀ¢òòòæB&WGW&ç2F†BæöFRw2ÖFF&ö÷BÇW2F†R6†V6·ö–çB–Bà¢fâg&÷¦Våö÷&–v–â†ÖöFVÃ¢÷F–öãÂg7G#â’Óâ…F„'VbÂ7G&–ær’°¢W6RÆ—GFÆUöÖöæ¶W•öÆ–#£¦6†V6·ö–çG3£§´6†V6·ö–çDVçG'’Â6†V6·ö–çDÖæ–fW7BÂ&W7VÖU7FFWÓ° ¢ÆWB÷&–v–âÒ7FC£¦Vçc£§FV×öF—"‚’æ¦ö–â†f÷&ÖB€¢&Æ—GFÆRÖÖöæ¶W’ÖÖ–w&F–öâÖ÷&–v–â×·Ò"À¢WV–C£¥WV–C£¦æWu÷cB‚¢’“°¢ÆWBv÷&·76RÒ÷&–v–âæ¦ö–â‚'v÷&²"“°¢7FC£¦g3£¦7&VFUöF—%öÆÂ‡v÷&·76Ræ¦ö–â‚'7&2"’’çVçw&‚“°¢7FC£¦g3£§w&—FR‡v÷&·76Ræ¦ö–â‚'7&2"’æ¦ö–â‚&Ö–âç'2"’Â"&fâÖ–â‚’·Ò"’çVçw&‚“° ¢ÆWB6†V6·ö–çEö–BÒ&7ÖÖ–w&FRÓ"çFõ÷7G&–ær‚“°¢ÆWB6†V6·ö–çEöF—"Ò÷&–v–âæ¦ö–â‚&6†V6·ö–çG2"’æ¦ö–â‚f6†V6·ö–çEö–B“°¢7FC£¦g3£¦7&VFUöF—%öÆÂ‚f6†V6·ö–çEöF—"’çVçw&‚“°¢7FC£¦g3£§w&—FR†6†V6·ö–çEöF—"æ¦ö–â‚#æ&²"’Â"&fâÖ–â‚’·Òòò&Vf÷&R"’çVçw&‚“°¢ÆWBÖæ–fW7BÒ6†V6·ö–çDÖæ–fW7B°¢fW'6–öã¢2À¢7&VFVEöEö×3¢óÀ¢6W76–öåö–C¢'6W76–öâÖÖ–w&FVB"çFõ÷7G&–ær‚’À¢æ6†÷%ö–æFWƒ¢À¢Æ&VÃ¢'F†Rg&÷¦VâGW&â"çFõ÷7G&–ær‚’À¢6†VÆÅ÷&ã¢fÇ6RÀ¢W‡FW&æÅöVffV7G3¢fV2µÒÀ¢6öÖÖ—GFVEöVffV7G3¢æöæRÀ¢&WfW'FVC¢fÇ6RÀ¢&Weö–C¢æöæRÀ¢VçG&–W3¢fV2´6†V6·ö–çDVçG'’°¢Fƒ¢v÷&·76P¢æ¦ö–â‚'7&2"¢æ¦ö–â‚&Ö–âç'2"¢çFõ÷7G&–æuöÆ÷77’‚¢çFõ÷7G&–ær‚’À¢&6·W¢6öÖR‚#æ&²"çFõ÷7G&–ær‚’’À¢&VFó¢æöæRÀ¢gFW#¢æöæRÀ¢ÕÒÀ¢&VÖVÖ&W&VEöf7G3¢fV2µÒÀ¢7FvVE÷F6µ÷7VvvW7F–öç3¢fV2µÒÀ¢&W7VÖS¢6öÖR…&W7VÖU7FFR°¢&ö6W75ö–C¢'GW&âÖ÷&–v–âÓ"çFõ÷7G&–ær‚’À¢g&÷¦VåöEö×3¢óSÀ¢ÖöFVÃ¢ÖöFVÂæÖ‡7G#£§Fõ÷7G&–ær’À¢'VçF–ÖUö–C¢æöæRÀ¢v÷&·76S¢6öÖR‡v÷&·76RçFõ÷7G&–æuöÆ÷77’‚’çFõ÷7G&–ær‚’’À¢VæF–æuö&÷fÇ3¢fV2µÒÀ¢Ò’À¢Ó°¢7FC£¦g3£§w&—FR€¢6†V6·ö–çEöF—"æ¦ö–â‚&Öæ–fW7Bæ§6öâ"’À¢6W&FUö§6öã£§Fõ÷fV2‚fÖæ–fW7B’çVçw&‚’À¢¢çVçw&‚“°¢7FC£¦g3£§w&—FR€¢÷&–v–âæ¦ö–â‚&6†E÷6W76–öç2æ§6öâ"’À¢6W&FUö§6öã£¦§6öâ‡°¢'6W76–öç2#¢·²&–B#¢'6W76–öâÖÖ–w&FVB"Â&ÖW76vW2#¢²'F†Rg&÷¦Vâ6öçfW'6F–öâ%ÒÕÒÀ¢&7F—fU6W76–öä–B#¢'6W76–öâÖÖ–w&FVB"À¢Ò¢çFõ÷7G&–ær‚’À¢¢çVçw&‚“°¢†÷&–v–âÂ6†V6·ö–çEö–B¢Ð ¢òòò³rw2Æ6VÖVçB—&–ærÇW2F†R³‚w&çBÂv†–6‚—2W†7FÇ’F†R6†P¢òòòF†R6&–Æ—G’'VÆR&WV—&W3¢Ö–w&FV–×Æ–W2Æ6U÷'Vç6à¢fâÖ–w&F–öåöf—‡GW&R‚’Óâ…F„'VbÂ&VÖ÷FT’Â7G&–ærÂfV3ÇSƒâ’°¢Ö–w&F–öå÷—&–ær„%G&VU6WC£¦g&öÒ…°¢FWf–6T6&–Æ—G“£¥f–Wu'Vç2À¢FWf–6T6&–Æ—G“£¤FW67&–&TæöFRÀ¢FWf–6T6&–Æ—G“£¥Æ6U'Vç2À¢FWf–6T6&–Æ—G“£¤Ö–w&FRÀ¢Ò’¢Ð ¢fâÖ–w&F–öå÷—&–ær€¢6&–Æ—F–W3¢%G&VU6WCÄFWf–6T6&–Æ—G“âÀ¢’Óâ…F„'VbÂ&VÖ÷FT’Â7G&–ærÂfV3ÇSƒâ’°¢ÆWB&ö÷BÒ7FC£¦Vçc£§FV×öF—"‚’æ¦ö–â†f÷&ÖB€¢&Æ—GFÆRÖÖöæ¶W’×&VÖ÷FRÖÖ–w&FR×·Ò"À¢WV–C£¥WV–C£¦æWu÷cB‚¢’“°¢ÆWBF‡2ÒFVÖöåF‡3£§VæFW"‚g&ö÷B“°¢F‡2æVç7W&R‚’çVçw&‚“°¢FVÖöä6öæf–s£¦FVfVÇB‚’ç6fR‚gF‡2’çVçw&‚“°¢ÆWB†÷7BÒ&VÖ÷FT†÷7D6öæf–r°¢&÷Fö6öÅ÷fW'6–öã¢$TÔõDUõ$õDô4ôÅõdU%4”ôâÀ¢'VææW%ö–C¢''VææW"ÖöæR"æ–çFò‚’À¢Æ—7FVã¢##rããã£"æ–çFò‚’À¢GfW'F—6U÷W&Ã¢&‡GG3¢ò÷'VææW"æ–çfÆ–B"æ–çFò‚’À¢6W'F–f–6FU÷Fƒ¢"÷F×ö6W'B"æ–çFò‚’À¢&—fFUö¶W•÷Fƒ¢"÷F×ö¶W’"æ–çFò‚’À¢6W'F–f–6FU÷6†#Sc¢&"ç&WVBƒcB’À¢Væ&ÆVC¢G'VRÀ¢Ó°¢ÆWB×WB7F÷&RÒ&VÖ÷FU7F÷&S£¦÷Vâ‚gF‡2ç&ö÷B’çVçw&‚“°¢ÆWB66÷W2Ò&VÖ÷FU66÷W2°¢7F–öç3¢%G&VU6WC£¦g&öÒ…µ&VÖ÷FT7F–öã£¥f–Wu'Vç5Ò’À¢'Våö–G3¢%G&VU6WC£¦g&öÒ…²''VâÖöæR"æ–çFò‚•Ò’À¢v÷&·76Uö–G3¢%G&VU6WC£¦æWr‚’À¢Ö…ö'F–f7Eö'—FW3¢ó#BÀ¢Ó°¢ÆWB6V7&WG2Ò&3£¦æWr„f¶U6V7&WG3£¦FVfVÇB‚’“°¢ÆWB–çf—FRÒ7F÷&P¢æ7&VFUö–çf—FF–öå÷v—F…ö6&–Æ—F–W2‚g66÷W2Âf6&–Æ—F–W2ÂóÂ5ó¢çVçw&‚“°¢ÆWB66WFVBÒ7F÷&P¢æ66WEö–çf—FF–öå÷v—F…ö6&–Æ—F–W2€¢f–çf—FRç—&–æuö–BÀ¢f–çf—FRçFö¶VâÀ¢&÷&–v–â"À¢''VææW"ÖöæR"À¢æöæRÀ¢óÀ¢6V7&WG2æ5÷&Vb‚’À¢¢çVçw&‚“°¢ÆWB6V7&WBÒ66WFVBæFWf–6U÷6V7&WBæ5ö'—FW2‚’çFõ÷fV2‚“°¢ÆWB’Ò&VÖ÷FT“£¦–æ¦V7FVB‡F‡2Â†÷7BÂ7F÷&RÂ6V7&WG2“°¢‡&ö÷BÂ’Â66WFVBæFWf–6Uö–BÂ6V7&WB¢Ð ¢5·FW7EÐ¢fâög&÷¦Våö–ÖvUöÖ÷fW5÷Fõ÷F†UöæöFUöæEöÆæG5ö5ö÷&W7VÖ&ÆU÷GW&â‚’°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6V7&WB’ÒÖ–w&F–öåöf—‡GW&R‚“°¢òòæòÖöFVÂ&V6÷&FVBÂ6òF†RF&vWBw2&—2—B†W&R"6†V6²†2æ÷F†–ærFð¢òò&VgW6RâF†RÖöFVÂ&VgW6Â†2—G2÷vâFW7B&VÆ÷rà¢ÆWB†÷&–v–âÂ6†V6·ö–çEö–B’Òg&÷¦Våö÷&–v–â„æöæR“°¢ÆWB7V2Ò7V2‚''VâÖÖ–w&FVB"Â'v÷&·76RÖöæR"“°¢ÆWB–ÖvRÒ7WW#£§7WW#£¦Ö–w&FS£¦'V–ÆEö–ÖvR€¢f÷&–v–âÀ¢''VææW"Ö÷&–v–â"À¢f6†V6·ö–çEö–BÀ¢g7V2À¢rÀ¢b&2"ç&WVBƒcB’À¢æöæRÀ¢¢æW‡V7B‚'F†R÷&–v–â6â&VB—G2÷vâg&÷¦Vâ–ÖvR"“° ¢ÆWB&VfÆ–v‡BÒ6W&FUö§6öã£§Fõ÷fV2‚dÖ–w&F–öå&VfÆ–v‡E&WVW7B°¢&÷Fö6öÅ÷fW'6–öã¢$TÔõDUõ$õDô4ôÅõdU%4”ôâÀ¢†VFW#¢–ÖvRæ†VFW"æ6ÆöæR‚’À¢Ò¢çVçw&‚“°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖB×&VfÆ–v‡B"À¢%õ5B"À¢"÷c÷&VÖ÷FRöæöFRöÖ–w&F–öâ÷&VfÆ–v‡B"À¢g&VfÆ–v‡BÀ¢’À¢%óÀ¢“°¢76W'EöW€¢&W7öç6Rç7FGW2À¢#À¢'·Ò"À¢7G&–æs£¦g&öÕ÷WFc…öÆ÷77’‚g&W7öç6Ræ&öG’¢“°¢ÆWB&öG“¢6W&FUö§6öã£¥fÇVRÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚g&W7öç6Ræ&öG’’çVçw&‚“°¢76W'EöW†&öG•²'fW&F–7B%Õ²'7FFR%ÒÂ&66WF&ÆR"“°¢òòF†RFWFW&Ö–æ—6Ò7FFVÖVçBG&fVÇ2v—F‚F†RfW&F–7BÂ6òv†öWfW"&W76W0¢òòÖ–w&FR&VG2—B&F†W"F†âFö2à¢76W'B‚&öG•²'fW&F–7B%Õ²&6fVG2%Òæ5ö'&’‚’çVçw&‚’æ—5öV×G’‚’“°¢òòæ÷F†–ær†2Ö÷fVB–WC¢&VfÆ–v‡BF†BÆæFVBç—F†–ærv÷VÆBÖ¶RF†P¢òò&VgW6ÂF‚w&—FRà¢76W'B‚&ö÷Bæ¦ö–â‚&6†V6·ö–çG2"’æ¦ö–â‚f6†V6·ö–çEö–B’æW†—7G2‚’“° ¢ÆWB66WBÒ6W&FUö§6öã£§Fõ÷fV2‚dÖ–w&F–öä66WE&WVW7B°¢&÷Fö6öÅ÷fW'6–öã¢$TÔõDUõ$õDô4ôÅõdU%4”ôâÀ¢–ÖvS¢–ÖvRæ6ÆöæR‚’À¢Ò¢çVçw&‚“°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢"À¢&6ÖBÖ66WB"À¢%õ5B"À¢"÷c÷&VÖ÷FRöæöFRöÖ–w&F–öâö66WB"À¢f66WBÀ¢’À¢%óÀ¢“°¢76W'EöW€¢&W7öç6Rç7FGW2À¢#À¢'·Ò"À¢7G&–æs£¦g&öÕ÷WFc…öÆ÷77’‚g&W7öç6Ræ&öG’¢“°¢ÆWB&V6V—C¢Ö–w&F–öå&V6V—BÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚g&W7öç6Ræ&öG’’çVçw&‚“°¢76W'EöW‡&V6V—Bç'Våö–BÂ''VâÖÖ–w&FVB"“° ¢òòF†Rv÷&·76R&VÆÇ’7&÷76VBà¢ÆWBÆæFVEöf–ÆRÒF„'Vc£¦g&öÒ‚g&V6V—Bçv÷&·76U÷&ö÷B¢æ¦ö–â‚'7&2"¢æ¦ö–â‚&Ö–âç'2"“°¢76W'EöW‡7FC£¦g3£§&VB‚fÆæFVEöf–ÆR’çVçw&‚’Â"&fâÖ–â‚’·Ò"“° ¢òòF†R6öçfW'6F–öâ7&÷76VBFöò(	Bv—F†÷WB—B&W7VÖRv÷VÆB6öçF–çVR¢òòGW&âv—F‚æò†—7F÷'’à¢ÆWB6W76–öç3¢6W&FUö§6öã£¥fÇVRÒ6W&FUö§6öã£¦g&öÕ÷7G"€¢g7FC£¦g3£§&VE÷Fõ÷7G&–ær‡&ö÷Bæ¦ö–â‚&6†E÷6W76–öç2æ§6öâ"’’çVçw&‚’À¢¢çVçw&‚“°¢76W'EöW‡6W76–öç5²'6W76–öç2%Õ³Õ²&–B%ÒÂ'6W76–öâÖÖ–w&FVB"“° ¢òòæBF†R6†V6·ö–çBF†RFW6·F÷w2³2&RÖVçG'’&VG2—2öâF—6²Âv—F€¢òò—G2F‡2&R×&ö÷FVB†W&RæB—G2&W7VÖRæÖ–ærF†R¦Æö6Â¢&÷rà¢ÆWBÖæ–fW7C¢Æ—GFÆUöÖöæ¶W•öÆ–#£¦6†V6·ö–çG3£¤6†V6·ö–çDÖæ–fW7BÒ6W&FUö§6öã£¦g&öÕ÷7G"€¢g7FC£¦g3£§&VE÷Fõ÷7G&–ær€¢&ö÷Bæ¦ö–â‚&6†V6·ö–çG2"¢æ¦ö–â‚f6†V6·ö–çEö–B¢æ¦ö–â‚&Öæ–fW7Bæ§6öâ"’À¢¢çVçw&‚’À¢¢çVçw&‚“°¢ÆWB&W7VÖRÒÖæ–fW7@¢ç&W7VÖP¢æW‡V7B‚'F†RÆæFVB6†V6·ö–çB—27F–ÆÂg&VW¦R"“°¢76W'EöW‡&W7VÖRç&ö6W75ö–BÂ&V6V—Bç&ö6W75ö–B“°¢76W'EöW€¢&W7VÖRçv÷&·76Ræ5öFW&Vb‚’À¢6öÖR‡&V6V—Bçv÷&·76U÷&ö÷Bæ5÷7G"‚’¢“°¢76W'B†Öæ–fW7BæVçG&–W5³Ð¢çF€¢ç7F'G5÷v—F‚‚g&V6V—Bçv÷&·76U÷&ö÷B’“°¢76W'B‡&ö÷@¢æ¦ö–â‚&6†V6·ö–çG2"¢æ¦ö–â‚f6†V6·ö–çEö–B¢æ¦ö–â‚#æ&²"¢æW†—7G2‚’“° ¢òòF†R&ö6W72&÷r—27W7VæFVBÂv†–6‚—2W†7FÇ’F†R7FFRF†RFW6·F÷w0¢òò&W7VÖRF‚Æöö·2f÷"à¢ÆWBÆVFvW"Ò'VäÆVFvW#£¦÷Vâ‚dFVÖöåF‡3£§VæFW"‚g&ö÷B’æÆVFvW%öF"’çVçw&‚“°¢ÆWB&V6÷&BÒÆVFvW ¢ç&ö6W75÷F&ÆR‚¢ævWB‚g&V6V—Bç&ö6W75ö–B¢çVçw&‚¢æW‡V7B‚'F†RÆæFVB&ö6W72W†—7G2"“°¢76W'EöW€¢&V6÷&Bç7FFRÀ¢Æ—GFÆUöÖöæ¶W•öÆ–#£§&ö6W75÷F&ÆS£¥&ö6W757FFS£¥7W7VæFV@¢“°¢76W'EöW‡&V6÷&Bç'Våö–Bæ5öFW&Vb‚’Â6öÖR‚''VâÖÖ–w&FVB"’“° ¢òòöæR6†–â7&÷72&÷F‚æöFW3¢F†RF&vWBw2f—'7BWfVçBæÖW2F†P¢òò÷&–v–âw2F—ÂæBF†R¦ö–â—2v†BâVF—F÷"†öÆF–ær&÷F‚†ÇfW2'Vç2à¢ÆWB'&—fÂÒÆVFvW ¢æÖ–w&F–öåö'&—fÂ‚''VâÖÖ–w&FVB"¢çVçw&‚¢æW‡V7B‚'F†RF&vWBw2†Æb7F'G2v—F‚â'&—fÂ"“°¢76W'EöW†'&—fÂæWfVçEö†6‚Â&V6V—Bæ'&—fÅöWfVçEö†6‚“°¢ÆWBFW'GW&RÒÆ—GFÆUöÖöæ¶W•öÆ–#£§'VåöÆVFvW#£¤Ö–w&F–öäFW'GW&R°¢'Våö–C¢''VâÖÖ–w&FVB"çFõ÷7G&–ær‚’À¢6WVVæ6S¢rÀ¢WfVçEö†6ƒ¢&2"ç&WVBƒcB’À¢F&vWEöæöFUö–C¢''VææW"ÖöæR"çFõ÷7G&–ær‚’À¢–ÆöE÷6†#Sc¢–ÖvRæ†VFW"ç–ÆöE÷6†#Sbæ6ÆöæR‚’À¢6†V6·ö–çEö–C¢6†V6·ö–çEö–Bæ6ÆöæR‚’À¢Ó°¢76W'B†ÖF6†W2€¢Æ—GFÆUöÖöæ¶W•öÆ–#£§'VåöÆVFvW#£¦¦ö–åöÖ–w&F–öåö6†–â‚fFW'GW&RÂf'&—fÂ’À¢Æ—GFÆUöÖöæ¶W•öÆ–#£§'VåöÆVFvW#£¤Ö–w&F–öä6†–ä¦ö–ã£¤¦ö–æVB²ââÐ¢’“°¢òòæBâ÷&–v–â6Æ–Ö–ærF–ffW&VçBF—FöW2æ÷B¦ö–âÂv†–6‚—2F†P¢òòv†öÆRö–çBöb†6†–ærF†RÆ–æ²&F†W"F†âG'W7F–ærF†Rf–VÆBà¢ÆWB×WBf÷&vVBÒFW'GW&S°¢f÷&vVBæWfVçEö†6‚Ò&B"ç&WVBƒcB“°¢76W'B†ÖF6†W2€¢Æ—GFÆUöÖöæ¶W•öÆ–#£§'VåöÆVFvW#£¦¦ö–åöÖ–w&F–öåö6†–â‚ff÷&vVBÂf'&—fÂ’À¢Æ—GFÆUöÖöæ¶W•öÆ–#£§'VåöÆVFvW#£¤Ö–w&F–öä6†–ä¦ö–ã£¤'&ö¶Vâ²ââÐ¢’“° ¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ†÷&–v–â“°¢Ð ¢5·FW7EÐ¢fâöæöFU÷v—F†÷WE÷F†UöÖöFVÅ÷&VgW6W5öæE÷w&—FW5öæ÷F†–ær‚’°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6V7&WB’ÒÖ–w&F–öåöf—‡GW&R‚“°¢ÆWB†÷&–v–âÂ6†V6·ö–çEö–B’Òg&÷¦Våö÷&–v–â…6öÖR‚&ÖÖöFVÂ×F†—2ÖæöFRÖæWfW"Ö–ç7FÆÆVB"’“°¢ÆWB7V2Ò7V2‚''VâÖÖ–w&FVB"Â'v÷&·76RÖöæR"“°¢ÆWB–ÖvRÒ7WW#£§7WW#£¦Ö–w&FS£¦'V–ÆEö–ÖvR€¢f÷&–v–âÀ¢''VææW"Ö÷&–v–â"À¢f6†V6·ö–çEö–BÀ¢g7V2À¢rÀ¢b&2"ç&WVBƒcB’À¢æöæRÀ¢¢çVçw&‚“°¢ÆWB66WBÒ6W&FUö§6öã£§Fõ÷fV2‚dÖ–w&F–öä66WE&WVW7B°¢&÷Fö6öÅ÷fW'6–öã¢$TÔõDUõ$õDô4ôÅõdU%4”ôâÀ¢–ÖvRÀ¢Ò¢çVçw&‚“°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖBÖ66WB×&VgW6VB"À¢%õ5B"À¢"÷c÷&VÖ÷FRöæöFRöÖ–w&F–öâö66WB"À¢f66WBÀ¢’À¢%óÀ¢“°¢76W'EöW‡&W7öç6Rç7FGW2ÂC’“°¢ÆWB&öG“¢6W&FUö§6öã£¥fÇVRÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚g&W7öç6Ræ&öG’’çVçw&‚“°¢76W'EöW†&öG•²'fW&F–7B%Õ²'7FFR%ÒÂ'&VgW6VB"“°¢76W'B†&öG•²'fW&F–7B%Õ²&&Æö6¶W'2%Ð¢æ5ö'&’‚¢çVçw&‚¢æ6öçF–ç2‚g6W&FUö§6öã£¦§6öâ‚&ÖöFVÂÖæ÷B×&W6–FVçB"’’“°¢òò&VgW6Â—2æ÷B'F–ÂÆæF–ærà¢76W'B‚&ö÷Bæ¦ö–â‚&6†V6·ö–çG2"’æ¦ö–â‚f6†V6·ö–çEö–B’æW†—7G2‚’“°¢ÆWBÆVFvW"Ò'VäÆVFvW#£¦÷Vâ‚dFVÖöåF‡3£§VæFW"‚g&ö÷B’æÆVFvW%öF"’çVçw&‚“°¢76W'B†ÆVFvW"æÆöE÷'Vâ‚''VâÖÖ–w&FVB"’çVçw&‚’æ—5öæöæR‚’“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ†÷&–v–â“°¢Ð ¢òòò66†VGVÆW"—&VBFò§Æ6R¢'Vç2×W7Bæ÷BF†W&V'’&R&ÆRFòw&—FR¢òòòv÷&·76RæB6öçfW'6F–öâöçFòF†—2Ö6†–æRà¢5·FW7EÐ¢fâ÷—&–æu÷F†EöÖ•÷Æ6U÷'Vç5÷7F–ÆÅö6ææ÷EöÖ–w&FUööæUö†W&R‚’°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6V7&WB’ÒÖ–w&F–öå÷—&–ær„%G&VU6WC£¦g&öÒ…°¢FWf–6T6&–Æ—G“£¥f–Wu'Vç2À¢FWf–6T6&–Æ—G“£¤FW67&–&TæöFRÀ¢FWf–6T6&–Æ—G“£¥Æ6U'Vç2À¢Ò’“°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖBÖÖ–w&FRÖFVæ–VB"À¢%õ5B"À¢"÷c÷&VÖ÷FRöæöFRöÖ–w&F–öâö66WB"À¢"'·Ò"À¢’À¢%óÀ¢“°¢76W'EöW‡&W7öç6Rç7FGW2ÂC2“°¢76W'B…7G&–æs£¦g&öÕ÷WFc…öÆ÷77’‚g&W7öç6Ræ&öG’’æ6öçF–ç2‚$Ö–w&FR"’“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢òòòF×W&–ærv—F‚G&ç6fW'&VBf–ÆR'&V·2F†R–ÆöBF–vW7BÂæBF†P¢òòò–ÖvR—2&VgW6VB2ÖÆf÷&ÖVB&F†W"F†âFÖ—GFVBæBF†VâÆæFVBà¢5·FW7EÐ¢fâ÷F×W&VE÷–ÆöEö—5÷&VgW6VEö&Vf÷&Uöç•ö6&–Æ—G•÷VW7F–öâ‚’°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6V7&WB’ÒÖ–w&F–öåöf—‡GW&R‚“°¢ÆWB†÷&–v–âÂ6†V6·ö–çEö–B’Òg&÷¦Våö÷&–v–â„æöæR“°¢ÆWB7V2Ò7V2‚''VâÖÖ–w&FVB"Â'v÷&·76RÖöæR"“°¢ÆWB×WB–ÖvRÒ7WW#£§7WW#£¦Ö–w&FS£¦'V–ÆEö–ÖvR€¢f÷&–v–âÀ¢''VææW"Ö÷&–v–â"À¢f6†V6·ö–çEö–BÀ¢g7V2À¢rÀ¢b&2"ç&WVBƒcB’À¢æöæRÀ¢¢çVçw&‚“°¢–ÖvRç–ÆöBçv÷&·76Uöf–ÆW5³Òæ6öçFVçG5ö&6ScBÒ5DäD$BæVæ6öFR†"&fâÖ–â‚’²Wf–Â‚’Ò"“°¢ÆWB66WBÒ6W&FUö§6öã£§Fõ÷fV2‚dÖ–w&F–öä66WE&WVW7B°¢&÷Fö6öÅ÷fW'6–öã¢$TÔõDUõ$õDô4ôÅõdU%4”ôâÀ¢–ÖvRÀ¢Ò¢çVçw&‚“°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6RÀ¢g6V7&WBÀ¢À¢&6ÖBÖ66WB×F×W&VB"À¢%õ5B"À¢"÷c÷&VÖ÷FRöæöFRöÖ–w&F–öâö66WB"À¢f66WBÀ¢’À¢%óÀ¢“°¢76W'EöW‡&W7öç6Rç7FGW2ÂC“°¢76W'B…7G&–æs£¦g&öÕ÷WFc…öÆ÷77’‚g&W7öç6Ræ&öG’’æ6öçF–ç2‚&F–vW7B"’“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ†÷&–v–â“°¢Ð ¢òòÒÒÒ÷c÷&VÖ÷FRöFWf–6Rò¦ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¢fâw&çB†“¢e&VÖ÷FT’ÂFWf–6Uö–C¢g7G"ÂW‡G&¢e´FWf–6T6&–Æ—G•Ò’°¢ÆWB×WB7F÷&RÒ’ç7F÷&RæÆö6²‚’çVçw&‚“°¢ÆWB×WB6&–Æ—F–W2Ò7F÷&RæFWf–6R†FWf–6Uö–B’çVçw&‚’çVçw&‚’æ6&–Æ—F–W3°¢6&–Æ—F–W2æW‡FVæB†W‡G&æ—FW"‚’æ6÷–VB‚’“°¢7F÷&P¢ç6WEöFWf–6Uö6&–Æ—F–W2†FWf–6Uö–BÂf6&–Æ—F–W2Â%ó¢çVçw&‚“°¢Ð ¢fâGfW'F—6R€¢“¢e&VÖ÷FT’À¢FWf–6Uö–C¢g7G"À¢6V7&WC¢e·S…ÒÀ¢6WVVæ6S¢ScBÀ¢6&–Æ—F–W3¢e´FWf–6T6&–Æ—G•ÒÀ¢W&Ö—76–öç3¢e²„FWf–6T6&–Æ—G’Â÷5W&Ö—76–öâ•ÒÀ¢’Óâ•&W7öç6R°¢ÆWB7W&f6RÒFWf–6U7W&f6R°¢&÷Fö6öÅ÷fW'6–öã¢$TÔõDUõ$õDô4ôÅõdU%4”ôâÀ¢ÆFf÷&Ó¢&æG&ö–B"æ–çFò‚’À¢ÆFf÷&Õ÷fW'6–öã¢#R"æ–çFò‚’À¢÷fW'6–öã¢#ã2ã"æ–çFò‚’À¢FWf–6UöÖöFVÃ¢%—†VÂ’"æ–çFò‚’À¢6&–Æ—F–W3¢6&–Æ—F–W2æ—FW"‚’æ6÷–VB‚’æ6öÆÆV7B‚’À¢W&Ö—76–öç3¢W&Ö—76–öç2æ—FW"‚’æ6÷–VB‚’æ6öÆÆV7B‚’À¢òòWfW'—F†–ærF†—2†VÇW"GfW'F—6W2—2&VG“²FW7BF†BæVVG2à¢òòVç&VG’6&–Æ—G’7FFW2—G2W&Ö—76–öâ–ç7FVBÂv†–6‚—2F†P¢òò†—2F†÷6RFW7G2&R&÷WBà¢&VF–æW73¢6&–Æ—F–W0¢æ—FW"‚¢æÖ‡Æ6&–Æ—G—Â‚¦6&–Æ—G’ÂFWf–6U&VF–æW73£¥&VG’’¢æ6öÆÆV7B‚’À¢6öç7G&–çG3¢FWf–6T6öç7G&–çG3£¦FVfVÇB‚’À¢&W÷'FVEöEö×3¢À¢Ó°¢ÆWB&öG’Ò6W&FUö§6öã£§Fõ÷fV2‚g7W&f6R’çVçw&‚“°¢’æ†æFÆR€¢6–væVB€¢FWf–6Uö–BÀ¢6V7&WBÀ¢6WVVæ6RÀ¢ff÷&ÖB‚&6ÖB×7W&f6R×·6WVVæ6WÒ"’À¢%õ5B"À¢"÷c÷&VÖ÷FRöFWf–6R÷7W&f6R"À¢f&öG’À¢’À¢%óÀ¢¢Ð ¢òòòWfW'—F†–ærFÆ²F–6¶WB†2Fò&RÂ–âöæR72à¢òòð¢òòòF–6¶WB—2F†RöæÇ’7&VFVçF–ÂvV%6ö6¶WB†æG6†¶R6â6''’Â6òF†P¢òòò&÷W'F–W2&VÆ÷r&RF†Rv†öÆRöbF†B7W&f6Rw26V7W&—G’æBV6‚öæP¢òòòf–Ç2Æ÷VFÇ’†W&R&F†W"F†â–â&Wf–WvW"w2ÖVÖ÷'“ ¢òòð¢òòòÒ—B—2—77VVB¢¦öæÇ’¢¢Fò&WVW7BF†BÇ&VG’76VBF†R6–væGW&RÀ¢òòò6WVVæ6RÂæöæ6RæB&Wfö6F–öâ6†V6·2ÂæB¢¦öæÇ’¢¢v—F‚F†Rw&çC°¢òòòÒ—BFÖ—G2¢¦öæ6R¢¢(	B6V6öæB6ö6¶WBv—F‚F†R6ÖRF–6¶WB—2&VgW6VC°¢òòòÒ—B—2&÷VæBFò¢¦—G2÷vâ6W76–öâ¢¢Â6òF–6¶WBf÷"öæR6öçfW'6F–öà¢òòò6ææ÷B÷Vâæ÷F†W#°¢òòòÒ—B¢¦W‡—&W2¢¢Â–â6V6öæG2&F†W"F†âf÷"F†RÆ–fRöbF†R6ö6¶WC°¢òòòÒF†R&V&W"æWfW"V'2–âF†RF‚F†BÆör÷"†—7F÷'’VçG'¢òòòv÷VÆB¶VWà¢5·FW7EÐ¢fâ÷FÆµ÷F–6¶WEöFÖ—G5ööæU÷6ö6¶WEööæ6UöæEööæÇ•÷v—F…÷F†Uöw&çB‚’°¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6Uö–BÂ6V7&WB’Òf—‡GW&R‚“°¢ÆWB&öG’Ò6W&FUö§6öã£§Fõ÷fV2‚g6W&FUö§6öã£¦§6öâ‡°¢'&÷Fö6öÅ÷fW'6–öâ#¢7WW#£§7WW#£§&÷Fö6öÃ£¥DÄµõ$õDô4ôÅõdU%4”ôâÀ¢'6W76–öåö–B#¢'FÆ²×6W76–öâÖöæR"À¢Ò’¢çVçw&‚“°¢ÆWB6²ÒÇ6WVVæ6S¢ScGÂ°¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢6WVVæ6RÀ¢ff÷&ÖB‚&6ÖB×FÆ²×·6WVVæ6WÒ"’À¢%õ5B"À¢"÷c÷&VÖ÷FRöFWf–6R÷FÆ²÷F–6¶WB"À¢f&öG’À¢¢Ó° ¢òòæòw&çBÂæòF–6¶WB(	B&Vf÷&Rç—F†–ær&÷WB6ö6¶WG2—26öç6–FW&VBà¢76W'EöW†’æ†æFÆR†6²ƒ’Â%ó’ç7FGW2ÂC2“° ¢òòfö–6U÷7G&VÖ—2æ÷Bw&çF&ÆRöâ—G2÷vâ(	B7G&VÒ—2¢òòÖ–7&÷†öæR(	B6òF†R—"—2v†Bâ÷W&F÷"7GVÆÇ’w&çG2à¢w&çB€¢f’À¢fFWf–6Uö–BÀ¢e°¢FWf–6T6&–Æ—G“£¤Ö–7&÷†öæT6GW&RÀ¢FWf–6T6&–Æ—G“£¥fö–6U7G&VÒÀ¢ÒÀ¢“°¢76W'EöW€¢GfW'F—6R€¢f’À¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢"À¢e°¢FWf–6T6&–Æ—G“£¤Ö–7&÷†öæT6GW&RÀ¢FWf–6T6&–Æ—G“£¥fö–6U7G&VÐ¢ÒÀ¢e°¢„FWf–6T6&–Æ—G“£¤Ö–7&÷†öæT6GW&RÂ÷5W&Ö—76–öã£¤w&çFVB’À¢„FWf–6T6&–Æ—G“£¥fö–6U7G&VÒÂ÷5W&Ö—76–öã£¤w&çFVB’À¢ÒÀ¢¢ç7FGW2À¢# ¢“°¢ÆWB&W7öç6RÒ’æ†æFÆR†6²ƒ2’Â%ó“°¢76W'EöW‡&W7öç6Rç7FGW2Â#“°¢ÆWB—77VVC¢FÆµF–6¶WE&W7öç6RÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚g&W7öç6Ræ&öG’’çVçw&‚“°¢76W'EöW€¢—77VVBçvV'6ö6¶WE÷F‚À¢"÷c÷&VÖ÷FRöFWf–6R÷FÆ²÷FÆ²×6W76–öâÖöæR÷7G&VÒ ¢“°¢76W'B€¢—77VVBçvV'6ö6¶WE÷F‚æ6öçF–ç2‚f—77VVBçF–6¶WB’À¢'F†R&V&W"×W7Bæ÷B&R'BöbF†RF‚ ¢“° ¢òòF–6¶WBf÷"F†—26W76–öâ÷Vç2æò÷F†W"öæRà¢76W'B†¢æ6öç7VÖU÷FÆµ÷F–6¶WB‚'FÆ²×6W76–öâ×Gvò"Âf—77VVBçF–6¶WBÂ%ó¢æ—5öæöæR‚’“°¢òò(
+fæBF†BÖ—6F—&V7FVBGFV×B'W&æVB—BÂ6òF†R&–v‡B6W76–öâ6ææ÷@¢òòW6R—BgFW'v&G2V—F†W"à¢76W'B†¢æ6öç7VÖU÷FÆµ÷F–6¶WB‚'FÆ²×6W76–öâÖöæR"Âf—77VVBçF–6¶WBÂ%ó¢æ—5öæöæR‚’“° ¢ÆWB6V6öæBÒ’æ†æFÆR†6²ƒB’Â%ó“°¢ÆWB—77VVC¢FÆµF–6¶WE&W7öç6RÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚g6V6öæBæ&öG’’çVçw&‚“°¢ÆWBFÖ—GFVBÒ¢æ6öç7VÖU÷FÆµ÷F–6¶WB‚'FÆ²×6W76–öâÖöæR"Âf—77VVBçF–6¶WBÂ%ó¢æW‡V7B‚&g&W6‚F–6¶WBFÖ—G2—G2÷vâ6W76–öâ"“°¢76W'EöW†FÖ—GFVBæFWf–6Uö–BÂFWf–6Uö–B“°¢76W'EöW†FÖ—GFVBç6W76–öåövVæW&F–öâÂ—77VVBç6W76–öåövVæW&F–öâ“°¢76W'B€¢’æ6öç7VÖU÷FÆµ÷F–6¶WB‚'FÆ²×6W76–öâÖöæR"Âf—77VVBçF–6¶WBÂ%ó¢æ—5öæöæR‚’À¢&öæRW6RöæÇ“¢6GW&VBF–6¶WB6ææ÷B÷Vâ6V6öæB6ö6¶WB ¢“° ¢òòW‡—'’—2&VÂÂæB6†÷'Bà¢ÆWBF†—&BÒ’æ†æFÆR†6²ƒR’Â%ó“°¢ÆWB—77VVC¢FÆµF–6¶WE&W7öç6RÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚gF†—&Bæ&öG’’çVçw&‚“°¢76W'B†¢æ6öç7VÖU÷FÆµ÷F–6¶WB‚'FÆ²×6W76–öâÖöæR"Âf—77VVBçF–6¶WBÂ—77VVBæW‡—&W5öEö×2¢æ—5öæöæR‚’“° ¢òòw&çBv—F†G&vâ&WGvVVâ—77VRæB†æG6†¶R6Æ÷6W2F†RFö÷"Âv†–6€¢òò—2v‡’F†R6†V6²—2&WVFVBBFÖ—76–öâ&F†W"F†âG'W7FVBg&öÐ¢òò—77VRF–ÖRà¢ÆWBf÷W'F‚Ò’æ†æFÆR†6²ƒb’Â%ó“°¢ÆWB—77VVC¢FÆµF–6¶WE&W7öç6RÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚ff÷W'F‚æ&öG’’çVçw&‚“°¢°¢ÆWB×WB7F÷&RÒ’ç7F÷&RæÆö6²‚’çVçw&‚“°¢òòW†7FÇ’v†Bâ÷W&F÷"v—F†G&v–æröæR6&–Æ—G’FöW3¢F†P¢òò&W7BöbF†Rw&çB—2VçF÷V6†VBà¢ÆWB×WB¶WBÒ7F÷&RæFWf–6R‚fFWf–6Uö–B’çVçw&‚’çVçw&‚’æ6&–Æ—F–W3°¢¶WBç&VÖ÷fR‚dFWf–6T6&–Æ—G“£¥fö–6U7G&VÒ“°¢7F÷&P¢ç6WEöFWf–6Uö6&–Æ—F–W2‚fFWf–6Uö–BÂf¶WBÂ%ó¢çVçw&‚“°¢Ð¢76W'B€¢’æ6öç7VÖU÷FÆµ÷F–6¶WB‚'FÆ²×6W76–öâÖöæR"Âf—77VVBçF–6¶WBÂ%ó¢æ—5öæöæR‚’À¢&&Wfö¶VBw&çB×W7Bæ÷B&RFÖ—GFVB'’F–6¶WBÖ–çFVB&Vf÷&R—B ¢“°¢76W'B‚’çFÆµö6&–Æ—G•öÆ—fR‚fFWf–6Uö–B’“° ¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢òòò6–væVBtUBöâF†R7G&VÒ&÷WFR—2æ÷BF†Rv’–âÂæB6—26ò&F†W ¢òòòF†âCF–æröâ&÷WFRF†RV&Æ—6†VB6öçG&7BæÖW2à¢5·FW7EÐ¢fâ÷Æ–åövWEööå÷F†U÷FÆµ÷7G&VÕ÷&÷WFUö6·5öf÷%öå÷Ww&FR‚’°¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6Uö–BÂ6V7&WB’Òf—‡GW&R‚“°¢w&çB€¢f’À¢fFWf–6Uö–BÀ¢e°¢FWf–6T6&–Æ—G“£¤Ö–7&÷†öæT6GW&RÀ¢FWf–6T6&–Æ—G“£¥fö–6U7G&VÒÀ¢ÒÀ¢“°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢À¢&6ÖB×FÆ²ÖvWB"À¢$tUB"À¢"÷c÷&VÖ÷FRöFWf–6R÷FÆ²÷FÆ²×6W76–öâÖöæR÷7G&VÒ"À¢"""À¢’À¢%óÀ¢“°¢76W'EöW‡&W7öç6Rç7FGW2ÂC#b“°¢76W'B…7G&–æs£¦g&öÕ÷WFc…öÆ÷77’‚g&W7öç6Ræ&öG’’æ6öçF–ç2‚'FÆ²÷F–6¶WB"’“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢òòÒÒÒFÆ²ÂöâF†Rv—&RÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¢òòò6öçfW'6F–öâVWVRF†BvöW2F‡&÷Vv‚F†R¢§&VÂ¢¢GW&&ÆR–æw&W72à¢òòð¢òòòF†RöæÇ’F†–ær7FæF–ær–âf÷"&öGV7F–öâ†W&R—2F†R'Vâ¦W†V7WF÷"£ ¢òòò7V&Ö—Eö6öçfW'6F–öå÷GW&æw&—FW2&VÂ–æw&W75÷GW&ç6&÷rVæFW"&VÀ¢òòòFVGWR¶W’ÂæBF†Rç7vW"—2&VÂ'Vâ–â&VÂÆVFvW"âF†B—2F†P¢òòò&÷VæF'’FW7B—2ÆÆ÷vVBFòG&r(	Bf¶R–æw&W72v÷VÆBÖ¶RF†Rv†öÆP¢òòòW†W&6—6RÖVæ–ævÆW72Â6–æ6R&FöW27ö¶VâGW&â&V6öÖRâ÷&F–æ'¢òòòGW&&ÆRGW&â"—2F†RVW7F–öâà¢7G'V7B–æw&W75FÆµVWVR°¢F‡3¢FVÖöåF‡2À¢'Vç3¢×WFWƒÄ†6„ÖÅ7G&–ærÂ7G&–æsãâÀ¢òòòF†R&V6÷&FW'2F†RFW7BÆ—2F†RÖöFVÂw2'BF‡&÷Vv‚à¢&V6÷&FW'3¢×WFWƒÄ†6„ÖÅ7G&–ærÂ&3ÄGW&&ÆU'Vå&V6÷&FW#ããâÀ¢òòòF†RGW&ç2F†B&V6†VB–æw&W72Âv—F‚F†R÷WF6öÖRV6‚öæRv÷Bà¢66WFVC¢×WFWƒÅfV3Â…7G&–ærÂ7G&–ær“ãâÀ¢Ð ¢7G'V7B&V6÷&F–æu'VåVWVS° ¢–×Â7&FS£¦FVÖöã£¦6†ææVÅ÷v÷&¶W#£¥'VåVWVRf÷"&V6÷&F–æu'VåVWVR°¢fâg&VW¦UöW†V7WF–öâ€¢g6VÆbÀ¢–æw&W73¢fÆ—GFÆUöÖöæ¶W•öÆ–#£¦6†ææVÇ3£¦–æw&W73£¤6öçfW'6F–öä–æw&W72À¢’Óâ&W7VÇCÆÆ—GFÆUöÖöæ¶W•öÆ–#£¦6†ææVÇ3£¦–æw&W73£¤g&÷¦VäW†V7WF–öä6öçFW‡BÂ7G&–æsâ°¢ö²†7&FS£¦FVÖöã£¦6†ææVÅ÷v÷&¶W#£§FW7Eög&÷¦VåöW†V7WF–öâ€¢–æw&W72À¢’¢Ð ¢fâ7V&Ö—B€¢g6VÆbÀ¢–æw&W73¢fÆ—GFÆUöÖöæ¶W•öÆ–#£¦6†ææVÇ3£¦–æw&W73£¤6öçfW'6F–öä–æw&W72À¢÷&×3¢fV3Å7G&–æsâÀ¢’Óâ&W7VÇCÅ7G&–ærÂ7G&–æsâ°¢ö²†–æw&W72æFWFW&Ö–æ—7F–5ö¦ö%ö–B‚’¢Ð¢Ð ¢–×Â–æw&W75FÆµVWVR°¢fâæWr‡F‡3¢FVÖöåF‡2’Óâ6VÆb°¢6VÆb°¢F‡2À¢'Vç3¢×WFWƒ£¦æWr„†6„Ö£¦æWr‚’’À¢&V6÷&FW'3¢×WFWƒ£¦æWr„†6„Ö£¦æWr‚’’À¢66WFVC¢×WFWƒ£¦æWr…fV3£¦æWr‚’’À¢Ð¢Ð ¢òòòF†R'Vâ7ö¶VâGW&â&öGV6VBÂ6òF†RFW7B6âÆ’F†RÖöFVÂw2'@¢òòò'’VæF–ær&VÂWfVçG2Fò—Bà¢fâ&V6÷&FW"‚g6VÆbÂ6Æ–VçEö¶W“¢g7G"’Óâ÷F–öãÄ&3ÄGW&&ÆU'Vå&V6÷&FW#ãâ°¢6VÆbç&V6÷&FW'2æÆö6²‚’çVçw&‚’ævWB†6Æ–VçEö¶W’’æ6ÆöæVB‚¢Ð¢Ð ¢–×ÂÖö&–ÆT6†EVWVRf÷"–æw&W75FÆµVWVR°¢fâVWVUö6†B€¢g6VÆbÀ¢6W76–öåö–C¢g7G"À¢6Æ–VçEö¶W“¢g7G"À¢&ö×C¢g7G"À¢’Óâ&W7VÇCÅ7G&–ærÂ7G&–æsâ°¢W6RÆ—GFÆUöÖöæ¶W•öÆ–#£¦6†ææVÇ3£¦–æw&W73£§´6öçfW'6F–öä–æw&W72Â6öçfW'6F–öå6÷W&6WÓ°¢W6RÆ—GFÆUöÖöæ¶W•öÆ–#£¦6†ææVÇ3£§&÷WF–æs£¥&÷WFUF&vWC° ¢ÆWBæ÷uö×2Ò7&FS£¦FVÖöã£§&VÖ÷FS£¦æ÷uö×5÷V&Æ–2‚“ò2“cC°¢òòW†7FÇ’F†R6†RVWVUöÖö&–ÆUö6†E÷&V6—V'V–ÆG2Â&V6W6R¢òò7ö¶VâGW&â—2Öö&–ÆR6†BGW&ã¢6ÖR6÷W&6RÂ6ÖR6W76–öâ¶W’À¢òò6ÖR&V6—Rà¢ÆWB–æw&W72Ò6öçfW'6F–öä–æw&W73£¦F—&V7B€¢6öçfW'6F–öå6÷W&6S£¤Öö&–ÆRÀ¢6W76–öåö–BÀ¢6Æ–VçEö¶W’À¢f÷&ÖB‚&Öö&–ÆS§·6W76–öåö–GÒ"’À¢&ö×BÀ¢&÷WFUF&vWC£¦æWr‚&Öö&–ÆRÖ6†B"’À¢æ÷uö×2À¢“°¢ÆWB×WB7F÷&RÒ7&FS£¦FVÖöã£§7F÷&S£¤FVÖöå7F÷&S£¦÷Vâ‚g6VÆbçF‡2¢æÖöW'"‡ÆW'&÷'ÂW'&÷"çFõ÷7G&–ær‚’“ó°¢ÆWB÷WF6öÖRÒ7&FS£¦FVÖöã£¦6†ææVÅö–æw&W73£§7V&Ö—Eö6öçfW'6F–öå÷GW&â€¢f×WB7F÷&RÀ¢e&V6÷&F–æu'VåVWVRÀ¢f–æw&W72À¢e¶f÷&ÖB‚'&ö×C×·&ö×GÒ"•ÒÀ¢æ÷uö×2À¢“ó°¢6VÆbæ66WFV@¢æÆö6²‚¢çVçw&‚¢çW6‚‚†6Æ–VçEö¶W’çFõ÷7G&–ær‚’Âf÷&ÖB‚'¶÷WF6öÖS£÷Ò"’’“° ¢òòöæR&VÂ'VâW"GW&âÂ6òF†R6W76–öâ&VG2—G2ç7vW"&6²÷WBö`¢òòF†RÆVFvW"F†Rv’—BFöW2–â&öGV7F–öâà¢ÆWB'Våö–BÒf÷&ÖB‚''Vâ×¶6Æ–VçEö¶W—Ò"“°¢ÆWBÆVFvW"Ò'VäÆVFvW#£¦÷Vâ‚g6VÆbçF‡2æÆVFvW%öF"’æÖöW'"‡ÆWÂRçFõ÷7G&–ær‚’“ó°¢ÆWB‡&V6÷&FW"Âò’ÒGW&&ÆU'Vå&V6÷&FW#£§7V&Ö—B€¢ÆVFvW"À¢g7V2‚g'Våö–BÂ'v÷&·76R×FÆ²"’À¢'FÆ²Öf—‡GW&R"æ–çFò‚’À¢¢æÖöW'"‡ÆW'&÷'ÂW'&÷"çFõ÷7G&–ær‚’“ó°¢&V6÷&FW ¢æVÖ—B…'VäWfVçC£¥7F'FVB°¢Væv–æUö–C¢'FÆ²Öf—‡GW&R"æ–çFò‚’À¢Ò¢æÖöW'"‡ÆW'&÷'ÂW'&÷"çFõ÷7G&–ær‚’“ó°¢6VÆbç'Vç0¢æÆö6²‚¢çVçw&‚¢æ–ç6W'B†6Æ–VçEö¶W’çFõ÷7G&–ær‚’Â'Våö–Bæ6ÆöæR‚’“°¢6VÆbç&V6÷&FW'0¢æÆö6²‚¢çVçw&‚¢æ–ç6W'B†6Æ–VçEö¶W’çFõ÷7G&–ær‚’Â&V6÷&FW"“°¢ö²‡'Våö–B¢Ð ¢fâ6†E÷'Våö–B€¢g6VÆbÀ¢÷6W76–öåö–C¢g7G"À¢6Æ–VçEö¶W“¢g7G"À¢’Óâ&W7VÇCÄ÷F–öãÅ7G&–æsâÂ7G&–æsâ°¢ö²‡6VÆbç'Vç2æÆö6²‚’çVçw&‚’ævWB†6Æ–VçEö¶W’’æ6ÆöæVB‚’¢Ð¢Ð ¢òòò67&—FVBG&ç67&–&W"æB7–çF†W6—¦W"(	BF†RGvòF†–æw2vVçV–æVÇ’÷WG6–FP¢òòòF†—2&ö6W72à¢7G'V7B67&—FVE7VV6‚°¢G&ç67&—G3¢×WFWƒÇ7FC£¦6öÆÆV7F–öç3£¥fV4FWVSÅ7G&–æsãâÀ¢†V&Eö'—FW3¢×WFWƒÅfV3ÇW6—¦SãâÀ¢7ö¶Vã¢×WFWƒÅfV3Å7G&–æsãâÀ¢Ð ¢5¶7–æ5÷G&—C£¦7–æ5÷G&—EÐ¢–×Â7WW#£§7WW#£§FÆ³£¥FÆµ7VV6‚f÷"67&—FVE7VV6‚°¢7–æ2fâG&ç67&–&R‚g6VÆbÂVF–ó¢fV3ÇSƒâÂöÖVF–÷G—S¢g7G"’Óâ&W7VÇCÅ7G&–ærÂ7G&–æsâ°¢6VÆbæ†V&Eö'—FW2æÆö6²‚’çVçw&‚’çW6‚†VF–òæÆVâ‚’“°¢ö²‡6VÆ`¢çG&ç67&—G0¢æÆö6²‚¢çVçw&‚¢ç÷ög&öçB‚¢çVçw&ö÷%öFVfVÇB‚’¢Ð ¢7–æ2fâ7–çF†W6—¦R‚g6VÆbÂFW‡C¢g7G"’Óâ&W7VÇCÂ…fV3ÇSƒâÂ7G&–ær’Â7G&–æsâ°¢6VÆbç7ö¶VâæÆö6²‚’çVçw&‚’çW6‚‡FW‡BçFõ÷7G&–ær‚’“°¢ö²‚†"%$”dff¶R"çFõ÷fV2‚’Â&VF–ò÷vb"çFõ÷7G&–ær‚’’¢Ð¢Ð ¢fâFÆµög&ÖR€¢6W76–öåö–C¢g7G"À¢vVæW&F–öã¢g7G"À¢6WVVæ6S¢ScBÀ¢¶–æC¢6W&FUö§6öã£¥fÇVRÀ¢’ÓâFö¶–õ÷GVæw7FVæ—FS£§GVæw7FVæ—FS£¤ÖW76vR°¢ÆWB×WBg&ÖRÒ6W&FUö§6öã£¦§6öâ‡°¢'&÷Fö6öÅ÷fW'6–öâ#¢7WW#£§7WW#£§&÷Fö6öÃ£¥DÄµõ$õDô4ôÅõdU%4”ôâÀ¢'6W76–öåö–B#¢6W76–öåö–BÀ¢'6W76–öåövVæW&F–öâ#¢vVæW&F–öâÀ¢&g&ÖU÷6WVVæ6R#¢6WVVæ6RÀ¢Ò“°¢ÆWBö&¦V7BÒg&ÖRæ5öö&¦V7Eö×WB‚’çVçw&‚“°¢f÷"†¶W’ÂfÇVR’–â¶–æBæ5öö&¦V7B‚’çVçw&‚’°¢ö&¦V7Bæ–ç6W'B†¶W’æ6ÆöæR‚’ÂfÇVRæ6ÆöæR‚’“°¢Ð¢Fö¶–õ÷GVæw7FVæ—FS£§GVæw7FVæ—FS£¤ÖW76vS£¥FW‡B†g&ÖRçFõ÷7G&–ær‚’æ–çFò‚’¢Ð ¢òòò¢¥F†Rv†öÆR7ö¶VâF‚Â÷fW"&VÂ6ö6¶WBÂv—F‚æ÷F†–ær–çFW&æÀ¢òòòf¶VBâ¢ ¢òòð¢òòòWfW'’Væ—BFW7B–âF†—2&W÷6—F÷'’76VBv†–ÆRÖö&–ÆRFÆ²6÷VÆBæ÷@¢òòò6ö×ÆWFR6–ævÆRWGFW&æ6RÂ&V6W6RGvòFVfV7G2Æ—fVB–âF†R6V×2æð¢òòòVæ—BFW7B7&÷76W3¢F†R6†—VB6Æ–VçBæWfW"6VçBF†R†VÆÆöF†R'VææW ¢òòòFVÖæG2ÂæBF†R6öææV7F–öâv26W'fVBv—F†÷WBWw&FW26òF†R6ö6¶W@¢òòògFW"F†RæWfW"'&—fVBâ&÷F‚&R–çf—6–&ÆRFò67&—FVB6ö6¶W@¢òòòæBFò6÷W&6R×7G&–ær66ââ6òF†—2G&—fW2F†R&VÂF†–æs ¢òòð¢òòò6–væVBF–6¶WB(i"&VÂ…EEWw&FR(i"&VÂFö¶–ò×GVæw7FVæ—FV6Æ–VçB(i ¢òòò†VÆÆò(i"VF–ò(i"G&ç67&—F–öâ(i"¢§&VÂGW&&ÆR–æw&W72¢¢(i"&VÂ'Vâ–à¢òòò&VÂÆVFvW"(i"76—7FçBFVÇF2(i"7VV6‚&Vf÷&RF†R'Vâf–æ—6†W2(i ¢òòò&&vRÖ–âF†B6æ6VÇ2æB&V6öÖW2F†RæW‡BGW&â(i"&Wfö6F–öâF†B6Æ÷6W0¢òòòF†R6ö6¶WBà¢5·Fö¶–ó£§FW7EÐ¢7–æ2fâ÷—&VE÷†öæUö†öÆG5ö÷7ö¶Våö6öçfW'6F–öåö÷fW%ö÷&VÅ÷FÆµ÷6ö6¶WB‚’°¢W6RgWGW&W5÷WF–Ã£§µ6–æ´W‡BÂ7G&VÔW‡GÓ° ¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6Uö–BÂ6V7&WB’Òf—‡GW&R‚“°¢w&çB€¢f’À¢fFWf–6Uö–BÀ¢e°¢FWf–6T6&–Æ—G“£¥fö–6U7G&VÒÀ¢FWf–6T6&–Æ—G“£¤Ö–7&÷†öæT6GW&RÀ¢ÒÀ¢“°¢GfW'F—6R€¢f’À¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢À¢e°¢FWf–6T6&–Æ—G“£¥fö–6U7G&VÒÀ¢FWf–6T6&–Æ—G“£¤Ö–7&÷†öæT6GW&RÀ¢ÒÀ¢e°¢„FWf–6T6&–Æ—G“£¥fö–6U7G&VÒÂ÷5W&Ö—76–öã£¤w&çFVB’À¢„FWf–6T6&–Æ—G“£¤Ö–7&÷†öæT6GW&RÂ÷5W&Ö—76–öã£¤w&çFVB’À¢ÒÀ¢“° ¢ÆWBVWVRÒ&3£¦æWr„–æw&W75FÆµVWVS£¦æWr„FVÖöåF‡3£§VæFW"‚g&ö÷B’’“°¢ÆWB7VV6‚Ò&3£¦æWr…67&—FVE7VV6‚°¢G&ç67&—G3¢×WFWƒ£¦æWr€¢°¢'v†B—2F†RFWÆ÷’7FGW2"À¢'7F÷æBFVÆÂÖR&÷WB7Fv–ær"À¢Ð¢æ–çFõö—FW"‚¢æÖ‡7G#£§Fõ÷7G&–ær¢æ6öÆÆV7B‚’À¢’À¢†V&Eö'—FW3¢×WFWƒ£¦æWr…fV3£¦æWr‚’’À¢7ö¶Vã¢×WFWƒ£¦æWr…fV3£¦æWr‚’’À¢Ò“°¢ÆWB’Ò¢çv—F…öÖö&–ÆUö6†B‡VWVRæ6ÆöæR‚’¢çv—F…÷FÆµ÷7VV6‚‡7VV6‚æ6ÆöæR‚’“° ¢òòF†R&VÂ6W'fW"ÂÖ–çW2öæÇ’DÅ2(	Bv†–6‚—2F†R6ÖRÆ—7FVæW"WfW'¢òò÷F†W"&÷WFRöâF†—2ÆæR6†&W2æB—2æ÷Bv†B—2VæFW"FW7Bà¢ÆWBÆ—7FVæW"ÒFö¶–ó£¦æWC£¥F7Æ—7FVæW#£¦&–æB‚##rããã£"’æv—BçVçw&‚“°¢ÆWBFG&W72ÒÆ—7FVæW"æÆö6ÅöFG"‚’çVçw&‚“°¢ÆWB6W'fVBÒ’æ6ÆöæR‚“°¢Fö¶–ó£§7vâ†7–æ2Ö÷fR°¢Æö÷°¢ÆWBö²‚‡7G&VÒÂò’’ÒÆ—7FVæW"æ66WB‚’æv—BVÇ6R°¢&WGW&ã°¢Ó°¢ÆWB6W'fVBÒ6W'fVBæ6ÆöæR‚“°¢Fö¶–ó£§7vâ†7–æ2Ö÷fR°¢òò&öGV7F–öâw2÷vâ6öææV7F–öâF‚Â6ò&Vw&W76–öâF†W&R(	@¢òòG&÷–ærv—F…÷Ww&FW6Â6’(	Bf–Ç2F†—2FW7B&F†W ¢òòF†âöæÇ’F†R†öæRà¢ÆWBòÒ7WW#£§7WW#£§6W'fW#£§6W'fU÷Ww&F&ÆR€¢‡—W%÷WF–Ã£§'C£¥Fö¶–ô–ó£¦æWr‡7G&VÒ’À¢6W'fVBÀ¢¢æv—C°¢Ò“°¢Ð¢Ò“° ¢òòöæR÷&F–æ'’6–væVB&WVW7BÖ–çG2F†RF–6¶WBà¢ÆWB6W76–öåö–BÒf÷&ÖB‚&Öö&–ÆR×¶FWf–6Uö–GÒ"“°¢ÆWBF–6¶WEö&öG’Ò6W&FUö§6öã£§Fõ÷fV2‚g6W&FUö§6öã£¦§6öâ‡°¢'&÷Fö6öÅ÷fW'6–öâ#¢7WW#£§7WW#£§&÷Fö6öÃ£¥DÄµõ$õDô4ôÅõdU%4”ôâÀ¢'6W76–öåö–B#¢6W76–öåö–BÀ¢Ò’¢çVçw&‚“°¢ÆWBæ÷uö×2Ò7&FS£¦FVÖöã£§&VÖ÷FS£¦æ÷uö×5÷V&Æ–2‚’çVçw&‚“°¢ÆWB—77VVBÒ’æ†æFÆR€¢6–væVEöB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢"À¢&6ÖB×FÆ²×F–6¶WB"À¢%õ5B"À¢"÷c÷&VÖ÷FRöFWf–6R÷FÆ²÷F–6¶WB"À¢gF–6¶WEö&öG’À¢æ÷uö×2À¢’À¢æ÷uö×2À¢“°¢76W'EöW†—77VVBç7FGW2Â#Â'F†Rw&çBFÖ—G2F–6¶WB"“°¢ÆWBF–6¶WC¢6W&FUö§6öã£¥fÇVRÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚f—77VVBæ&öG’’çVçw&‚“°¢ÆWB&V&W"ÒF–6¶WE²'F–6¶WB%Òæ5÷7G"‚’çVçw&‚’çFõ÷7G&–ær‚“°¢ÆWBvVæW&F–öâÒF–6¶WE²'6W76–öåövVæW&F–öâ%Òæ5÷7G"‚’çVçw&‚’çFõ÷7G&–ær‚“°¢ÆWBF‚ÒF–6¶WE²'vV'6ö6¶WE÷F‚%Òæ5÷7G"‚’çVçw&‚’çFõ÷7G&–ær‚“° ¢ÆWBW&ÂÒf÷&ÖB‚'w3¢ò÷¶FG&W77×·F‡Ó÷F–6¶WC×¶&V&W'Ò"“°¢ÆWB†×WB6ö6¶WBÂ&W7öç6R’ÒFö¶–õ÷GVæw7FVæ—FS£¦6öææV7Eö7–æ2‚gW&Â’æv—BæW‡V7B€¢'F†RF–6¶WBFÖ—G2&VÂvV%6ö6¶WB(	Bv†÷6RWw&FRæWfW"À¢&W6öÇfW2f–Ç2W†7FÇ’†W&R"À¢“°¢76W'EöW‡&W7öç6Rç7FGW2‚’æ5÷Sb‚’Â“° ¢ÆWB×WB6WVVæ6RÒScC°¢ÆWB×WBæW‡BÒÆ¶–æC¢6W&FUö§6öã£¥fÇVWÂ°¢6WVVæ6R³Ò°¢FÆµög&ÖR‚g6W76–öåö–BÂfvVæW&F–öâÂ6WVVæ6RÂ¶–æB¢Ó° ¢òòg&ÖR—2F†R†VÆÆòÂæB—G2ÖVF–G—R—2F†RöæRF†RVF–òg&ÖW0¢òòv–ÆÂ7GVÆÇ’6''’à¢6ö6¶W@¢ç6VæB†æW‡B‡6W&FUö§6öã£¦§6öâ‡°¢'G—R#¢&†VÆÆò"À¢&ÖVF–÷G—R#¢&VF–ò÷vV&Ó¶6öFV73Ö÷W2"À¢'6×ÆU÷&FUö‡¢#¢C…óÀ¢&6†ææVÇ2#¢À¢Ò’’¢æv—@¢çVçw&‚“°¢òòF†R6Æ–VçBw2÷vâ÷&FW#¢FVÆVÖWG'’æÖ–ærF†RWGFW&æ6RÂF†VâF†P¢òòWGFW&æ6RâF†R'VææW"ç7vW'2F†R–ç7FçBâWGFW&æ6R6Æ÷6W2Â6ð¢òòÖWG&–726VçBgFW"—Bv÷VÆB&RFöòÆFRFò&VÆöærFò—Bà¢6ö6¶W@¢ç6VæB†æW‡B‡6W&FUö§6öã£¦§6öâ‡°¢'G—R#¢&ÖWG&–72"À¢&VF–õ÷6WVVæ6R#¢À¢'7VV6…öFWFV7F–öåö×2#¢ƒÀ¢&6GW&Uö×2#¢ó#À¢'WÆöEö×2#¢CÀ¢Ò’’¢æv—@¢çVçw&‚“°¢6ö6¶W@¢ç6VæB†æW‡B‡6W&FUö§6öã£¦§6öâ‡°¢'G—R#¢&VF–ò"À¢&VF–õ÷6WVVæ6R#¢À¢&ÖVF–÷G—R#¢&VF–ò÷vV&Ó¶6öFV73Ö÷W2"À¢&VF–õö&6ScB#¢5DäD$BæVæ6öFR†"&f—'7BWGFW&æ6R'—FW2"’À¢&Æ7B#¢G'VRÀ¢òòF†RFWf–6Rw2÷vâæÖRf÷"F†—2WGFW&æ6RÂv†–6‚6Æ÷6–æp¢òòg&ÖR×W7B6''“¢—B—2F†R¶W’F†RGW&â—2VWVVBVæFW"Âæ@¢òòF†RöæÇ’–FVçF—G’F†B7W'f—fW2&W7F'BöbF†—2'VææW"à¢'WGFW&æ6Uö–B#¢'WGBÖf—'7B"À¢Ò’’¢æv—@¢çVçw&‚“° ¢òòF†R'VææW"&V6†W2G&ç67&—F–öâÂv†–6‚ÖVç2F†R†VÆÆòv266WFV@¢òòæBF†RVF–òv2æ÷B&VgW6VBà¢ÆWBG&ç67&—BÒ&VE÷VçF–Â‚f×WB6ö6¶WBÂ'G&ç67&—B"’æv—C°¢76W'EöW‡G&ç67&—E²'FW‡B%ÒÂ'v†B—2F†RFWÆ÷’7FGW2"“°¢76W'B‚7VV6‚æ†V&Eö'—FW2æÆö6²‚’çVçw&‚’æ—5öV×G’‚’“° ¢òòF†RGW&â—2&VÂGW&&ÆRöæRÂVæFW"F†RWGFW&æ6Rw2÷vâ–FVçF—G’à¢ÆWBf—'7Eö¶W’ÒVWVRæ66WFVBæÆö6²‚’çVçw&‚•³Òãæ6ÆöæR‚“°¢76W'B†f—'7Eö¶W’ç7F'G5÷v—F‚‚'FÆ²Ò"’“°¢°¢ÆWB7F÷&RÒ7&FS£¦FVÖöã£§7F÷&S£¤FVÖöå7F÷&S£¦÷Vâ‚dFVÖöåF‡3£§VæFW"‚g&ö÷B’¢æW‡V7B‚&FVÖöâ7F÷&R"“°¢ÆWBFVGWRÒÆ—GFÆUöÖöæ¶W•öÆ–#£¦6†ææVÇ3£¦–æw&W73£¦FVGWUö¶W•öf÷"€¢Æ—GFÆUöÖöæ¶W•öÆ–#£¦6†ææVÇ3£¦–æw&W73£¤6öçfW'6F–öå6÷W&6S£¤Öö&–ÆRÀ¢g6W76–öåö–BÀ¢ff—'7Eö¶W’À¢“°¢ÆWB&÷rÒ7F÷&P¢æ–æw&W75÷GW&åö'•öFVGWUö¶W’‚fFVGWR¢æW‡V7B‚&–æw&W72Æöö·W"¢æW‡V7B‚&7ö¶VâGW&â—2â÷&F–æ'’GW&&ÆRGW&â"“°¢76W'EöW‡&÷rç6÷W&6Uö66÷VçEö–BÂ6W76–öåö–B“°¢Ð ¢òòF†RÖöFVÂç7vW'2ÂæBF†Rf—'7B6VçFVæ6R—27ö¶Vâ&Vf÷&RF†R'Và¢òò6ö×ÆWFW2(	B–æ7&VÖVçFÂ7–çF†W6—2Âæ÷Bv—Bf÷"F†Rv†öÆRç7vW"à¢ÆWB&V6÷&FW"ÒVWVRç&V6÷&FW"‚ff—'7Eö¶W’’æW‡V7B‚&'Vâf÷"F†RGW&â"“°¢VÖ—EöFVÇF‚g&V6÷&FW"Â%F†RFWÆ÷’f–æ—6†VBâ"“°¢ÆWBFVÇFÒ&VE÷VçF–Â‚f×WB6ö6¶WBÂ&76—7FçEöFVÇF"’æv—C°¢76W'EöW†FVÇF²'FW‡B%ÒÂ%F†RFWÆ÷’f–æ—6†VBâ"“°¢ÆWBVF–òÒ&VE÷VçF–Â‚f×WB6ö6¶WBÂ&÷WGWEöVF–ò"’æv—C°¢76W'EöW†VF–õ²&ÖVF–÷G—R%ÒÂ&VF–ò÷vb"“°¢76W'B€¢7VV6‚ç7ö¶VâæÆö6²‚’çVçw&‚’æ—5öV×G’‚’À¢&6VçFVæ6R—27–çF†W6—¦VBv†–ÆRF†R'Vâ—27F–ÆÂvö–ær ¢“° ¢òòFÆ¶–ær÷fW"—C¢F†RVF–òF†B–çFW''WG2—2F†RæW‡BWGFW&æ6Rà¢6WVVæ6R³Ò°¢6ö6¶W@¢ç6VæB‡FÆµög&ÖR€¢g6W76–öåö–BÀ¢fvVæW&F–öâÀ¢6WVVæ6RÀ¢6W&FUö§6öã£¦§6öâ‡°¢'G—R#¢&VF–ò"À¢&VF–õ÷6WVVæ6R#¢"À¢&ÖVF–÷G—R#¢&VF–ò÷vV&Ó¶6öFV73Ö÷W2"À¢&VF–õö&6ScB#¢5DäD$BæVæ6öFR†"'6V6öæBWGFW&æ6R'—FW2"’À¢&Æ7B#¢G'VRÀ¢'WGFW&æ6Uö–B#¢'WGB×6V6öæB"À¢Ò’À¢’¢æv—@¢çVçw&‚“° ¢ÆWB6V6öæBÒ&VE÷VçF–Â‚f×WB6ö6¶WBÂ'G&ç67&—B"’æv—C°¢76W'EöW€¢6V6öæE²'FW‡B%ÒÂ'7F÷æBFVÆÂÖR&÷WB7Fv–ær"À¢'F†R–çFW''WF–ærv÷&G2&V6öÖRF†RæW‡BGW&â–ç7FVBöb&V–ærF‡&÷vâv’ ¢“°¢76W'EöW€¢VWVRæ66WFVBæÆö6²‚’çVçw&‚’æÆVâ‚’À¢"À¢'Gvò7ö¶VâGW&ç2ÂGvòGW&&ÆRGW&ç2 ¢“° ¢òòv—F†G&v–ærF†Rw&çB6Æ÷6W2F†R6öçfW'6F–öâ&F†W"F†âv—F–ærf÷ ¢òòF†RFWf–6RFò6’6öÖWF†–ærà¢&Wfö¶R‚f’ÂfFWf–6Uö–BÂFWf–6T6&–Æ—G“£¥fö–6U7G&VÒ“°¢ÆWB6Æ÷6VBÒ&VE÷VçF–Åö6Æ÷6VB‚f×WB6ö6¶WB’æv—C°¢76W'B€¢6Æ÷6VBÀ¢&&Wfö¶VBfö–6U÷7G&VÒVæG2F†R6ö6¶WBv—F†÷WBæ÷F†W"g&ÖRg&öÒF†RFWf–6R ¢“° ¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‚g&ö÷B“°¢Ð ¢òòò¢¤7ö¶VâGW&âF†BF†RVWVR&VgW6W2FöW2æ÷BÆVfR&÷r6Æ–Ö–ærFð¢òòò&RVWVVBâ¢ ¢òòð¢òòòF†RG&ç67&—B&÷ræBF†RGW&&ÆRGW&âÆ—fR–âGvòF–ffW&VçB5Æ—FP¢òòòf–ÆW2Â6òF†W’6ææ÷B&RöæRG&ç67F–öã¢F†R&÷r—2w&—GFVâf—'7Bæ@¢òòòF†RGW&â—2VWVVBgFW"âv†VâF†B6V6öæB7FWf–Ç2ÂF†R&÷r—2F†P¢òòòöæÇ’F†–ærÆVgBÂæB&÷r7GV6²BVWVVF—2v÷'6RF†âÆ÷7BöæR(	@¢òòòF†R&WÇ’ÖFW&–Æ—¦W"6¶—2—Bf÷&WfW"†—G2¦ö"æWfW"W†—7FVB’Â6òF†P¢òòò÷W&F÷"6VW2VW7F–öâöbF†V—'2v—F–ærf÷"âç7vW"F†Bæò'Bö`¢òòòF†R7—7FVÒ—2vö–ærFò&öGV6Rà¢5·FW7EÐ¢fâ÷7ö¶Vå÷GW&å÷F†U÷VWVU÷&VgW6W5÷6WGFÆW5ö—G5÷&÷uö–ç7FVEööe÷7G&æF–æuö—B‚’°¢W6R7WW#£§7WW#£§FÆ³£¥FÆµGW&ç3° ¢7G'V7B&VgW6–æuVWVS°¢–×ÂÖö&–ÆT6†EVWVRf÷"&VgW6–æuVWVR°¢fâVWVUö6†B‚g6VÆbÂó¢g7G"Âó¢g7G"Âó¢g7G"’Óâ&W7VÇCÅ7G&–ærÂ7G&–æsâ°¢W'"‚'F†RFVÖöâVWVR—2æ÷B66WF–ærv÷&²"çFõ÷7G&–ær‚’¢Ð¢fâ6†E÷'Våö–B‚g6VÆbÂó¢g7G"Âó¢g7G"’Óâ&W7VÇCÄ÷F–öãÅ7G&–æsâÂ7G&–æsâ°¢ö²„æöæR¢Ð¢Ð ¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6Uö–BÂ÷6V7&WB’Òf—‡GW&R‚“°¢ÆWB’Ò’çv—F…öÖö&–ÆUö6†B„&3£¦æWr…&VgW6–æuVWVR’“°¢ÆWBGW&ç2ÒFÆµ6W76–öåGW&ç3£¦æWr€¢’æ6ÆöæR‚’À¢eFÆµ6ö6¶WDWF†÷&—¦F–öâ°¢FWf–6Uö–C¢FWf–6Uö–Bæ6ÆöæR‚’À¢6–væVE÷&WVW7E÷6†#Sc¢&"ç&WVBƒcB’À¢6W76–öåö–C¢&Öö&–ÆR×6W76–öâ"çFõ÷7G&–ær‚’À¢6W76–öåövVæW&F–öã¢&vVæW&F–öâÖöæR"çFõ÷7G&–ær‚’À¢ÒÀ¢“° ¢ÆWB&VgW6VBÒGW&ç2ç7V&Ö—B‚&Öö&–ÆR×6W76–öâ"Â'FÆ²ÖvVæW&F–öâÓ"Â'v†B—2F†R7FGW2"“°¢76W'B€¢&VgW6VBæ—5öW'"‚’À¢'F†R6ÆÆW"—2FöÆBF†RGW&âF–Bæ÷BVWVR ¢“° ¢ÆWB7F÷&RÒ’ç7F÷&RæÆö6²‚’çVçw&‚“°¢ÆWBÖW76vW2Ò7F÷&RæÖö&–ÆUöÖW76vW2‚&Öö&–ÆR×6W76–öâ"Â’çVçw&‚“°¢76W'EöW†ÖW76vW2æÆVâ‚’ÂÂ'F†RG&ç67&—B¶VW2v†Bv26–B"“°¢76W'EöW€¢ÖW76vW5³ÒçF6µ÷7FFRÂ&f–ÆVB"À¢&GW&âæ÷F†–ærVWVVB×W7Bæ÷B6—BBwVWVVBrf÷&WfW" ¢“°¢G&÷‡7F÷&R“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‚g&ö÷B“°¢Ð ¢òòò¢¥F†R6V7W&—G’VF—B6VW2&VÂFÆ²6ö6¶WBÂæ÷Bf'&–6FVB&÷râ¢ ¢òòð¢òòòFö72÷—&VBÖFWf–6W2æÖF&öÖ—6W2F†Bâ÷VâFÆ²6ö6¶WB'6†÷w2W ¢òòòF†W&R2'Vææ–ærfö–6U÷7G&VÖ6öÖÖæBÂÆ–¶Rç’÷F†W"6GW&R–à¢òòòfÆ–v‡B"âVçF–ÂF†—2FW7BF†B&öÖ—6Rv26†V6¶VB'’†æF–ærF†RVF—B¢òòò†æBÖ'V–ÇBFWf–6T6öÖÖæE6æ6†÷F(	Bv†–6‚v÷VÆB†fR76VB§W7B0¢òòò†–Ç’v—F‚F†RVçF—&RFÆ²F‚FVÆWFVBÂæBF–B72v†–ÆRÆ—fP¢òòò6ö6¶WBw&÷FRæ÷F†–ærç—v†W&Rà¢òòð¢òòò6ó¢÷Vâ&VÂFÖ—GFVB6ö6¶WBÂF†Vâ'VâF†R§&öGV7F–öâ¢FWf–6R×7FFP¢òòò&VFW"v–ç7BF†R6ÖR7F÷&RæB6²F†R&VÂVF—Bv†B—B6VW2à¢5·Fö¶–ó£§FW7EÐ¢7–æ2fâåö÷Vå÷FÆµ÷6ö6¶WEö—5öö6GW&U÷F†U÷6V7W&—G•öVF—Eö6å÷6VR‚’°¢W6RgWGW&W5÷WF–Ã£¥6–æ´W‡C° ¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6Uö–BÂ6V7&WB’Òf—‡GW&R‚“°¢w&çB€¢f’À¢fFWf–6Uö–BÀ¢e°¢FWf–6T6&–Æ—G“£¥fö–6U7G&VÒÀ¢FWf–6T6&–Æ—G“£¤Ö–7&÷†öæT6GW&RÀ¢ÒÀ¢“°¢GfW'F—6R€¢f’À¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢À¢e°¢FWf–6T6&–Æ—G“£¥fö–6U7G&VÒÀ¢FWf–6T6&–Æ—G“£¤Ö–7&÷†öæT6GW&RÀ¢ÒÀ¢e°¢„FWf–6T6&–Æ—G“£¥fö–6U7G&VÒÂ÷5W&Ö—76–öã£¤w&çFVB’À¢„FWf–6T6&–Æ—G“£¤Ö–7&÷†öæT6GW&RÂ÷5W&Ö—76–öã£¤w&çFVB’À¢ÒÀ¢“°¢ÆWBF‡2ÒFVÖöåF‡3£§VæFW"‚g&ö÷B“°¢ÆWB7VV6‚Ò&3£¦æWr…67&—FVE7VV6‚°¢G&ç67&—G3¢×WFWƒ£¦æWr„FVfVÇC£¦FVfVÇB‚’’À¢†V&Eö'—FW3¢×WFWƒ£¦æWr…fV3£¦æWr‚’’À¢7ö¶Vã¢×WFWƒ£¦æWr…fV3£¦æWr‚’’À¢Ò“°¢ÆWB’Ò¢çv—F…öÖö&–ÆUö6†B„&3£¦æWr„–æw&W75FÆµVWVS£¦æWr‡F‡2æ6ÆöæR‚’’’¢çv—F…÷FÆµ÷7VV6‚‡7VV6‚“° ¢òòæ÷F†–ær—2Æ—7FVæ–ær–WBà¢76W'B€¢6GW&Uö–åöfÆ–v‡B‚gF‡2’À¢&â–FÆR'VææW"&W÷'G2æò6GW&R ¢“° ¢ÆWBFG&W72Ò7vå÷FÆµ÷6W'fW"†’æ6ÆöæR‚’’æv—C°¢ÆWB6W76–öåö–BÒf÷&ÖB‚&Öö&–ÆR×¶FWf–6Uö–GÒ"“°¢ÆWB†×WB6ö6¶WBÂvVæW&F–öâ’Ð¢÷Vå÷FÆµ÷6ö6¶WB‚f’ÂfFWf–6Uö–BÂg6V7&WBÂ"Âg6W76–öåö–BÂFG&W72’æv—C°¢6ö6¶W@¢ç6VæB‡FÆµög&ÖR€¢g6W76–öåö–BÀ¢fvVæW&F–öâÀ¢À¢6W&FUö§6öã£¦§6öâ‡°¢'G—R#¢&†VÆÆò"À¢&ÖVF–÷G—R#¢&VF–ò÷vV&Ó¶6öFV73Ö÷W2"À¢'6×ÆU÷&FUö‡¢#¢C…óÀ¢&6†ææVÇ2#¢À¢Ò’À¢’¢æv—@¢çVçw&‚“°¢òòF†R&VG–g&ÖR&÷fW2F†R6W76–öâ—2'Vææ–ærÂ6òF†R&Vv—7G&F–öà¢òòF†B†Vç2&Vf÷&R—B†2Ç&VG’ÆæFVBà¢ÆWBòÒ&VE÷VçF–Â‚f×WB6ö6¶WBÂ'&VG’"’æv—C° ¢76W'B€¢6GW&Uö–åöfÆ–v‡B‚gF‡2’À¢&â÷VâFÆ²6ö6¶WB—2fö–6U÷7G&VÒ6GW&R–âfÆ–v‡B ¢“° ¢òòv—F†G&v–ærF†Rw&çB6Æ÷6W2F†R6ö6¶WBÂæBF†R6GW&R6ÆV'2v—F€¢òò—B&F†W"F†â÷WFÆ—f–ærF†RWF†÷&—G’F†BÆÆ÷vVB—Bà¢òð¢òòæ÷F†–ærVÇ6R—26VçBâFWf–6RF†B—2Æ—7FVæ–ær†2æò&V6öâFð¢òò6VæBç—F†–ærÂæB6W76–öâF†BöæÇ’æ÷F–6VBF†Rv—F†G&vÂv†Và¢òòF†RæW‡Bg&ÖR'&—fVBv÷VÆB†öÆBF†—2Ö–7&÷†öæR÷VâVçF–ÂF†R–FÆP¢òòFVFÆ–æR(	Bf–gFVVâÖ–çWFW2öb6GW&Röâw&çBF†B—2vöæRâ6òF†P¢òò6Æ÷6R&VÆ÷r—2öâF†R'VææW"w2÷vâ6Æö6²Â÷"—BFöW2æ÷B†Vâà¢&Wfö¶R‚f’ÂfFWf–6Uö–BÂFWf–6T6&–Æ—G“£¥fö–6U7G&VÒ“°¢76W'B‡&VE÷VçF–Åö6Æ÷6VB‚f×WB6ö6¶WB’æv—B“°¢f÷"ò–ââã°¢–b6GW&Uö–åöfÆ–v‡B‚gF‡2’°¢'&V³°¢Ð¢Fö¶–ó£§F–ÖS£§6ÆVW‡7FC£§F–ÖS£¤GW&F–öã£¦g&öÕöÖ–ÆÆ—2ƒS’’æv—C°¢Ð¢76W'B€¢6GW&Uö–åöfÆ–v‡B‚gF‡2’À¢&6Æ÷6VBFÆ²6ö6¶WBÆVfW2æò6GW&R6Æ–Ö–ærFò&R÷Vâ ¢“° ¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‚g&ö÷B“°¢Ð ¢òòòv†BF†R&VÂVF—B6—2&÷WBF†—2FVÖöâ&ö÷BÂ&–v‡Bæ÷rà¢fâ6GW&Uö–åöfÆ–v‡B‡F‡3¢dFVÖöåF‡2’Óâ&ööÂ°¢ÆWB×WB'VçF–ÖRÒÆ—GFÆUöÖöæ¶W•öÆ–#£§6V7W&—G•öFö7F÷#£¥6V7W&—G•'VçF–ÖU6æ6†÷C£¦FVfVÇB‚“°¢7&FS£§6V7W&—G•ö6Æ“£¦6öÆÆV7EöFWf–6U÷7FFUöB‚f×WB'VçF–ÖRÂF‡2“°¢ÆWB&W÷'BÒÆ—GFÆUöÖöæ¶W•öÆ–#£§6V7W&—G•öFö7F÷#£§'Vå÷6V7W&—G•öVF—B€¢fÆ—GFÆUöÖöæ¶W•öÆ–#£§6V7W&—G•öFö7F÷#£¥6V7W&—G”VF—E&WVW7B°¢öFFöF—#¢F‡2ç&ö÷Bæ6ÆöæR‚’À¢v÷&·76S¢æöæRÀ¢FVW¢fÇ6RÀ¢f—ƒ¢fÇ6RÀ¢'VçF–ÖRÀ¢ÒÀ¢¢æW‡V7B‚'F†RVF—B'Vç2"“°¢&W÷'@¢æf–æF–æw0¢æ—FW"‚¢æç’‡Æf–æF–æwÂf–æF–æræ–BÓÒ&FWf–6W2æ6GW&Uö–åöfÆ–v‡B"¢Ð ¢7–æ2fâ7vå÷FÆµ÷6W'fW"†“¢&VÖ÷FT’’Óâ7FC£¦æWC£¥6ö6¶WDFG"°¢ÆWBÆ—7FVæW"ÒFö¶–ó£¦æWC£¥F7Æ—7FVæW#£¦&–æB‚##rããã£"’æv—BçVçw&‚“°¢ÆWBFG&W72ÒÆ—7FVæW"æÆö6ÅöFG"‚’çVçw&‚“°¢Fö¶–ó£§7vâ†7–æ2Ö÷fR°¢Æö÷°¢ÆWBö²‚‡7G&VÒÂò’’ÒÆ—7FVæW"æ66WB‚’æv—BVÇ6R°¢&WGW&ã°¢Ó°¢ÆWB’Ò’æ6ÆöæR‚“°¢Fö¶–ó£§7vâ†7–æ2Ö÷fR°¢òò&öGV7F–öâw2÷vâ6öææV7F–öâF‚Â6ò&Vw&W76–öâF†W&R(	@¢òòG&÷–ærv—F…÷Ww&FW6Â6’(	Bf–Ç2F†W6RFW7G2&F†W ¢òòF†âöæÇ’F†R†öæRà¢ÆWBòÒ7WW#£§7WW#£§6W'fW#£§6W'fU÷Ww&F&ÆR€¢‡—W%÷WF–Ã£§'C£¥Fö¶–ô–ó£¦æWr‡7G&VÒ’À¢’À¢¢æv—C°¢Ò“°¢Ð¢Ò“°¢FG&W70¢Ð ¢òòòÖ–çG2F–6¶WBF†R÷&F–æ'’6–væVBv’æB7VæG2—Böâ&VÂ6ö6¶WBà¢7–æ2fâ÷Vå÷FÆµ÷6ö6¶WB€¢“¢e&VÖ÷FT’À¢FWf–6Uö–C¢g7G"À¢6V7&WC¢e·S…ÒÀ¢6WVVæ6S¢ScBÀ¢6W76–öåö–C¢g7G"À¢FG&W73¢7FC£¦æWC£¥6ö6¶WDFG"À¢’Óâ€¢Fö¶–õ÷GVæw7FVæ—FS£¥vV%6ö6¶WE7G&VÓÀ¢Fö¶–õ÷GVæw7FVæ—FS£¤Ö–&UFÇ57G&VÓÇFö¶–ó£¦æWC£¥F77G&VÓâÀ¢âÀ¢7G&–ærÀ¢’°¢ÆWB&öG’Ò6W&FUö§6öã£§Fõ÷fV2‚g6W&FUö§6öã£¦§6öâ‡°¢'&÷Fö6öÅ÷fW'6–öâ#¢7WW#£§7WW#£§&÷Fö6öÃ£¥DÄµõ$õDô4ôÅõdU%4”ôâÀ¢'6W76–öåö–B#¢6W76–öåö–BÀ¢Ò’¢çVçw&‚“°¢ÆWBæ÷uö×2Ò7&FS£¦FVÖöã£§&VÖ÷FS£¦æ÷uö×5÷V&Æ–2‚’çVçw&‚“°¢ÆWB—77VVBÒ’æ†æFÆR€¢6–væVEöB€¢FWf–6Uö–BÀ¢6V7&WBÀ¢6WVVæ6RÀ¢ff÷&ÖB‚&6ÖB×FÆ²×F–6¶WB×·6WVVæ6WÒ"’À¢%õ5B"À¢"÷c÷&VÖ÷FRöFWf–6R÷FÆ²÷F–6¶WB"À¢f&öG’À¢æ÷uö×2À¢’À¢æ÷uö×2À¢“°¢76W'EöW†—77VVBç7FGW2Â#Â'F†Rw&çBFÖ—G2F–6¶WB"“°¢ÆWBF–6¶WC¢6W&FUö§6öã£¥fÇVRÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚f—77VVBæ&öG’’çVçw&‚“°¢ÆWBW&ÂÒf÷&ÖB€¢'w3¢ò÷¶FG&W77×·Ó÷F–6¶WC×·Ò"À¢F–6¶WE²'vV'6ö6¶WE÷F‚%Òæ5÷7G"‚’çVçw&‚’À¢F–6¶WE²'F–6¶WB%Òæ5÷7G"‚’çVçw&‚¢“°¢ÆWB‡6ö6¶WBÂ&W7öç6R’ÒFö¶–õ÷GVæw7FVæ—FS£¦6öææV7Eö7–æ2‚gW&Â¢æv—@¢æW‡V7B‚'F†RF–6¶WBFÖ—G2&VÂvV%6ö6¶WB"“°¢76W'EöW‡&W7öç6Rç7FGW2‚’æ5÷Sb‚’Â“°¢€¢6ö6¶WBÀ¢F–6¶WE²'6W76–öåövVæW&F–öâ%Òæ5÷7G"‚’çVçw&‚’çFõ÷7G&–ær‚’À¢¢Ð ¢òòò&VG26W'fW"g&ÖW2VçF–ÂöæRöb¶–æF'&—fW2Â÷"F†R6ö6¶WBVæG2à¢7–æ2fâ&VE÷VçF–Â€¢6ö6¶WC¢f×WBFö¶–õ÷GVæw7FVæ—FS£¥vV%6ö6¶WE7G&VÓÀ¢Fö¶–õ÷GVæw7FVæ—FS£¤Ö–&UFÇ57G&VÓÇFö¶–ó£¦æWC£¥F77G&VÓâÀ¢âÀ¢¶–æC¢g7G"À¢’Óâ6W&FUö§6öã£¥fÇVR°¢W6RgWGW&W5÷WF–Ã£¥7G&VÔW‡C°¢ÆWBFVFÆ–æRÒFö¶–ó£§F–ÖS£¤–ç7FçC£¦æ÷r‚’²7FC£§F–ÖS£¤GW&F–öã£¦g&öÕ÷6V72ƒ3“°¢Æö÷°¢ÆWBÖW76vRÒFö¶–ó£§F–ÖS£§F–ÖV÷WEöB†FVFÆ–æRÂ6ö6¶WBææW‡B‚’¢æv—@¢çVçw&ö÷%öVÇ6R‡Å÷Âæ–2‚'F–ÖVB÷WBv—F–ærf÷"w¶¶–æGÒrg&ÖR"’“°¢ÆWB6öÖR„ö²†ÖW76vR’’ÒÖW76vRVÇ6R°¢æ–2‚'F†R6ö6¶WB6Æ÷6VBv†–ÆRv—F–ærf÷"w¶¶–æGÒrg&ÖR"“°¢Ó°¢ÆWBö²‡FW‡B’ÒÖW76vRæ–çFõ÷FW‡B‚’VÇ6R°¢6öçF–çVS°¢Ó°¢ÆWBö²†g&ÖR’Ò6W&FUö§6öã£¦g&öÕ÷7G#££Ç6W&FUö§6öã£¥fÇVSâ‚gFW‡B’VÇ6R°¢6öçF–çVS°¢Ó°¢–bg&ÖU²'G—R%ÒÓÒ¶–æB°¢&WGW&âg&ÖS°¢Ð¢Ð¢Ð ¢7–æ2fâ&VE÷VçF–Åö6Æ÷6VB€¢6ö6¶WC¢f×WBFö¶–õ÷GVæw7FVæ—FS£¥vV%6ö6¶WE7G&VÓÀ¢Fö¶–õ÷GVæw7FVæ—FS£¤Ö–&UFÇ57G&VÓÇFö¶–ó£¦æWC£¥F77G&VÓâÀ¢âÀ¢’Óâ&ööÂ°¢W6RgWGW&W5÷WF–Ã£¥7G&VÔW‡C°¢ÆWBFVFÆ–æRÒFö¶–ó£§F–ÖS£¤–ç7FçC£¦æ÷r‚’²7FC£§F–ÖS£¤GW&F–öã£¦g&öÕ÷6V72ƒ3“°¢ÆWB×WB6u÷&Wfö6F–öâÒfÇ6S°¢Æö÷°¢ÆWBÖW76vRÒÖF6‚Fö¶–ó£§F–ÖS£§F–ÖV÷WEöB†FVFÆ–æRÂ6ö6¶WBææW‡B‚’’æv—B°¢ö²†ÖW76vR’ÓâÖW76vRÀ¢W'"…ò’Óâ&WGW&âfÇ6RÀ¢Ó°¢ÖF6‚ÖW76vR°¢æöæRÓâ&WGW&â6u÷&Wfö6F–öâÀ¢6öÖR„ö²†ÖW76vR’’Óâ°¢–bÆWBö²‡FW‡B’ÒÖW76vRæ–çFõ÷FW‡B‚’°¢–bFW‡Bæ6öçF–ç2‚&6&–Æ—G•÷&Wfö¶VB"’°¢6u÷&Wfö6F–öâÒG'VS°¢Ð¢Ð¢Ð¢6öÖR„W'"…ò’’Óâ&WGW&â6u÷&Wfö6F–öâÀ¢Ð¢Ð¢Ð ¢fâVÖ—EöFVÇF‡&V6÷&FW#¢dGW&&ÆU'Vå&V6÷&FW"ÂFW‡C¢g7G"’°¢W6R7&FS£¦GW&&ÆU÷'Vã£¤6Æ•'VäWfVçE6–æ³°¢&V6÷&FW ¢æVÖ—B…'VäWfVçC£¤ÖöFVÄFVÇF°¢ÖW76vUö–C¢'FÆ²Öç7vW""çFõ÷7G&–ær‚’À¢6†ææVÃ¢÷WGWD6†ææVÃ£¤76—7FçBÀ¢FW‡C¢FW‡BçFõ÷7G&–ær‚’À¢Ò¢æW‡V7B‚&VæBâ76—7FçBFVÇF"“°¢Ð ¢òòòv—F†G&w2öæR6&–Æ—G’æBÆVfW2F†R&W7BöbF†R—&–ær–çF7B(	@¢òòòv†–6‚—2v†Bâ÷W&F÷"&Wfö¶–ær&Ö’†V"F†R&ööÒ"7GVÆÇ’FöW2à¢fâ&Wfö¶R†“¢e&VÖ÷FT’ÂFWf–6Uö–C¢g7G"Â6&–Æ—G“¢FWf–6T6&–Æ—G’’°¢ÆWB×WB7F÷&RÒ’ç7F÷&RæÆö6²‚’çVçw&‚“°¢ÆWB×WB6&–Æ—F–W2Ò7F÷&RæFWf–6R†FWf–6Uö–B’çVçw&‚’çVçw&‚’æ6&–Æ—F–W3°¢6&–Æ—F–W2ç&VÖ÷fR‚f6&–Æ—G’“°¢7F÷&P¢ç6WEöFWf–6Uö6&–Æ—F–W2†FWf–6Uö–BÂf6&–Æ—F–W2Â%ó¢æW‡V7B‚'&Wfö¶R"“°¢Ð ¢òòòv†öÆRfö–6R7G&VÒ÷fW"F†R6–væVBÆæS¢ÆV6VBÂ7F'FVBÂVF–ð¢òòò÷7FVB–â÷&FW"Â7F÷VB'’â÷W&F÷"Â6Æ÷6VB'’F†RFWf–6Rà¢òòð¢òòòF†RGvò&÷W'F–W2v÷'F‚†f–ærFW7Bf÷"&R&÷F‚&÷WBv†B†Vç0¢òòòv†VâF†RÆ–æ²—2Vç&VÆ–&ÆRâ6‡Væ²FVÆ—fW&VBGv–6R×W7B&R7F÷&VBöæ6P¢òòò(	B÷F†W'v—6R†öæRöâ&B6öææV7F–öâ&öGV6W27GWGFW&–ærVF–òF†@¢òòòæ÷F†–ærF÷vç7G&VÒ6âFWFV7BâæBâ÷W&F÷"w27F÷×W7B&V6‚F†P¢òòòÖ–7&÷†öæRÂv†–6‚—BFöW2öâF†Rç7vW"Fò6‡Væ²F†RFWf–6R—2Ç&VG¢òòò÷7F–ær&F†W"F†âöâöÆÂ—BÖ–v‡Bæ÷BÖ¶Rà¢5·FW7EÐ¢fâ÷fö–6U÷7G&VÕ÷7W'f—fW5ö÷&WG'•öæE÷7F÷5÷v†Våöåö÷W&F÷%÷6—5÷6ò‚’°¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6Uö–BÂ6V7&WB’Òf—‡GW&R‚“°¢w&çB€¢f’À¢fFWf–6Uö–BÀ¢e°¢FWf–6T6&–Æ—G“£¤Ö–7&÷†öæT6GW&RÀ¢FWf–6T6&–Æ—G“£¥fö–6U7G&VÒÀ¢ÒÀ¢“°¢76W'EöW€¢GfW'F—6R€¢f’À¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢À¢e°¢FWf–6T6&–Æ—G“£¤Ö–7&÷†öæT6GW&RÀ¢FWf–6T6&–Æ—G“£¥fö–6U7G&VÐ¢ÒÀ¢e°¢„FWf–6T6&–Æ—G“£¤Ö–7&÷†öæT6GW&RÂ÷5W&Ö—76–öã£¤w&çFVB’À¢„FWf–6T6&–Æ—G“£¥fö–6U7G&VÒÂ÷5W&Ö—76–öã£¤w&çFVB’À¢ÒÀ¢¢ç7FGW2À¢# ¢“° ¢ÆWB6W76–öåö–BÒ'g2×FW7G6W76–öæ–FVçF–f–W""çFõ÷7G&–ær‚“°¢ÆWB6öÖÖæEö–BÒ°¢ÆWB×WB7F÷&RÒ’ç7F÷&RæÆö6²‚’çVçw&‚“°¢ÆWB6öÖÖæBÒ7F÷&P¢æVçVWVUöFWf–6Uö6öÖÖæB€¢dFWf–6T6öÖÖæE&WVW7B°¢FWf–6Uö–C¢FWf–6Uö–Bæ6ÆöæR‚’À¢6&–Æ—G“¢FWf–6T6&–Æ—G“£¥fö–6U7G&VÒÀ¢&wVÖVçG3¢6W&FUö§6öã£¦§6öâ‡°¢'6W76–öåö–B#¢6W76–öåö–BÀ¢&GW&F–öåö×2#¢cóÀ¢&6‡Væµö×2#¢óÀ¢Ò’À¢6÷W&6U÷'Våö–C¢æöæRÀ¢6÷W&6U÷6W76–öåö–C¢æöæRÀ¢6÷W&6U÷FööÅö6ÆÅö–C¢æöæRÀ¢–çfö6F–öåö–C¢æöæRÀ¢W‡—&W5öEö×3¢3óÀ¢ÒÀ¢%óÀ¢¢çVçw&‚“°¢7F÷&P¢æ÷Vå÷fö–6U÷6W76–öâ€¢g6W76–öåö–BÀ¢fFWf–6Uö–BÀ¢f6öÖÖæBæ6öÖÖæEö–BÀ¢æöæRÀ¢æöæRÀ¢#óÀ¢%óÀ¢¢çVçw&‚“°¢6öÖÖæBæ6öÖÖæEö–@¢Ó° ¢òòÆV6RæB7F'BÂW†7FÇ’2†÷Föw&‚v÷VÆBà¢ÆWBÆV6VBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢"À¢&6ÖB×fÆV6R"À¢$tUB"À¢"÷c÷&VÖ÷FRöFWf–6Rö6öÖÖæG2öæW‡B"À¢"""À¢’À¢%óÀ¢“°¢76W'EöW†ÆV6VBç7FGW2Â#“°¢ÆWB7F'E÷F‚Òf÷&ÖB‚"÷c÷&VÖ÷FRöFWf–6Rö6öÖÖæG2÷¶6öÖÖæEö–GÒ÷7F'B"“°¢76W'EöW€¢’æ†æFÆR€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢2À¢&6ÖB×g7F'B"À¢%õ5B"À¢g7F'E÷F‚À¢"'·Ò ¢’À¢%óÀ¢¢ç7FGW2À¢# ¢“° ¢ÆWB6‡Væµ÷F‚Òf÷&ÖB‚"÷c÷&VÖ÷FRöFWf–6R÷fö–6R÷·6W76–öåö–GÒö6‡Væ²"“°¢ÆWB6‡Væ²ÒÇ6WVVæ6S¢ScBÂVF–ó¢e·S…ÒÂf—'7C¢&ööÇÂ°¢6W&FUö§6öã£§Fõ÷fV2‚efö–6T6‡Væµ&WVW7B°¢&÷Fö6öÅ÷fW'6–öã¢$TÔõDUõ$õDô4ôÅõdU%4”ôâÀ¢6WVVæ6RÀ¢VF–õö&6ScC¢5DäD$BæVæ6öFR†VF–ò’À¢ÖVF–÷G—S¢f—'7BçF†Vâ‡ÇÂ&VF–ò÷vV&Ò"çFõ÷7G&–ær‚’’À¢Æ7C¢fÇ6RÀ¢Ò¢çVçw&‚¢Ó°¢ÆWBf—'7BÒ’æ†æFÆR€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢BÀ¢&6ÖB×f6‡Væ²Ó"À¢%õ5B"À¢f6‡Væµ÷F‚À¢f6‡Væ²ƒÂ"&÷W2ÖöæR"ÂG'VR’À¢’À¢%óÀ¢“°¢76W'EöW†f—'7Bç7FGW2Â#“°¢ÆWBf—'7C¢6W&FUö§6öã£¥fÇVRÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚ff—'7Bæ&öG’’çVçw&‚“°¢76W'EöW†f—'7E²&66WFVB%ÒÂ6W&FUö§6öã£¦§6öâ‡G'VR’“°¢76W'EöW†f—'7E²&æW‡E÷6WVVæ6R%ÒÂ6W&FUö§6öã£¦§6öâƒ’“°¢76W'EöW†f—'7E²'7F÷%ÒÂ6W&FUö§6öã£¦§6öâ†fÇ6R’“° ¢òòF†RFWf–6Rw2&WÇ’v2Æ÷7BÂ6ò—B6VæG26‡Væ²v–ââF†R'VææW ¢òòÇ&VG’†öÆG2—C¢F†Rç7vW"6—26òÂæBæ÷F†–ær—2VæFVBà¢ÆWB&WG'’Ò’æ†æFÆR€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢RÀ¢&6ÖB×f6‡Væ²Ó""À¢%õ5B"À¢f6‡Væµ÷F‚À¢f6‡Væ²ƒÂ"&÷W2ÖöæR"ÂfÇ6R’À¢’À¢%ó#À¢“°¢ÆWB&WG'“¢6W&FUö§6öã£¥fÇVRÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚g&WG'’æ&öG’’çVçw&‚“°¢76W'EöW‡&WG'•²&66WFVB%ÒÂ6W&FUö§6öã£¦§6öâ†fÇ6R’“°¢76W'EöW‡&WG'•²&'—FW2%ÒÂ6W&FUö§6öã£¦§6öâƒ‚’“° ¢òòâ÷W&F÷"7F÷2F†R7G&VÒâF†RFWf–6R†2æ÷B6¶VBf÷"ç—F†–æp¢òò6–æ6RÂ6òF†—2—2F†RÖöÖVçBæ÷F†–ær†2FöÆB—B–WBà¢’ç7F÷&P¢æÆö6²‚¢çVçw&‚¢ç&WVW7EöFWf–6Uö6æ6VÂ‚f6öÖÖæEö–BÂ%ó3¢çVçw&‚“° ¢ÆWB6V6öæBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢bÀ¢&6ÖB×f6‡Væ²Ó"À¢%õ5B"À¢f6‡Væµ÷F‚À¢f6‡Væ²ƒÂ"&÷W2×Gvò"ÂfÇ6R’À¢’À¢%óCÀ¢“°¢ÆWB6V6öæC¢6W&FUö§6öã£¥fÇVRÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚g6V6öæBæ&öG’’çVçw&‚“°¢76W'EöW€¢6V6öæE²'7F÷%ÒÀ¢6W&FUö§6öã£¦§6öâ‡G'VR’À¢&â÷W&F÷"w27F÷×W7B&V6‚F†RÖ–7&÷†öæRöâF†RæW‡B6‡Væ² ¢“°¢òò7F–ÆÂ66WFVC¢F†RVF–òÇ&VG’&V6÷&FVB—2æ÷BF‡&÷vâv’§W7@¢òò&V6W6R6öÖVöæR6¶VBf÷"F†R7G&VÒFòVæBà¢76W'EöW‡6V6öæE²&66WFVB%ÒÂ6W&FUö§6öã£¦§6öâ‡G'VR’“° ¢ÆWB6Æ÷6U÷F‚Òf÷&ÖB‚"÷c÷&VÖ÷FRöFWf–6R÷fö–6R÷·6W76–öåö–GÒö6Æ÷6R"“°¢ÆWB6Æ÷6VBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢rÀ¢&6ÖB×f6Æ÷6R"À¢%õ5B"À¢f6Æ÷6U÷F‚À¢'"2'²'&÷Fö6öÅ÷fW'6–öâ#£'Ò"2À¢’À¢%óSÀ¢“°¢76W'EöW†6Æ÷6VBç7FGW2Â#“°¢ÆWB6Æ÷6VC¢6W&FUö§6öã£¥fÇVRÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚f6Æ÷6VBæ&öG’’çVçw&‚“°¢76W'EöW†6Æ÷6VE²'7FFR%ÒÂ6W&FUö§6öã£¦§6öâ‚&6Æ÷6VB"’“°¢76W'EöW†6Æ÷6VE²&6‡Væ·2%ÒÂ6W&FUö§6öã£¦§6öâƒ"’“° ¢òòW†7FÇ’F†R'—FW2F†BvW&R&V6÷&FVBÂöæ6RV6‚Â–â÷&FW"à¢76W'EöW€¢7FC£¦g3£§&VB‡7WW#£§7WW#£§fö–6S£¦VF–õ÷F‚€¢f’çF‡2ç&ö÷BÀ¢g6W76–öåö–@¢’¢çVçw&‚’À¢"&÷W2ÖöæV÷W2×Gvò ¢“° ¢òò6Æ÷6VB6W76–öâF¶W2æ÷F†–ærÖ÷&Rà¢ÆWBÆFRÒ’æ†æFÆR€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢‚À¢&6ÖB×f6‡Væ²ÖÆFR"À¢%õ5B"À¢f6‡Væµ÷F‚À¢f6‡Væ²ƒ"Â"&÷W2×F‡&VR"ÂfÇ6R’À¢’À¢%ócÀ¢“°¢76W'EöW†ÆFRç7FGW2ÂC’“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‚g&ö÷B“°¢Ð ¢òòòF†RVæB×FòÖVæB6†RF6²b—2§VFvVBöã¢FWf–6RGfW'F—6W2Â¢òòò6öÖÖæB—2VWVVBÂ—B—2ÆV6VBW†7FÇ’öæ6RÂ7F'FVBöæ6RÂæB—G0¢òòò&W7VÇB6öÖW2&6²v—F‚â'F–f7Bà¢5·FW7EÐ¢fâöFWf–6U÷&V6V—fW5ö÷VWVVEö6öÖÖæEöW†7FÇ•ööæ6UöæE÷&WGW&ç5ö—G5ö'F–f7B‚’°¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6Uö–BÂ6V7&WB’Òf—‡GW&R‚“°¢w&çB‚f’ÂfFWf–6Uö–BÂe´FWf–6T6&–Æ—G“£¤6ÖW&6GW&UÒ“°¢76W'EöW€¢GfW'F—6R€¢f’À¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢À¢e´FWf–6T6&–Æ—G“£¤6ÖW&6GW&UÒÀ¢e²„FWf–6T6&–Æ—G“£¤6ÖW&6GW&RÂ÷5W&Ö—76–öã£¤w&çFVB•ÒÀ¢¢ç7FGW2À¢# ¢“° ¢ÆWBVWVVBÒ¢ç7F÷&P¢æÆö6²‚¢çVçw&‚¢æVçVWVUöFWf–6Uö6öÖÖæB€¢dFWf–6T6öÖÖæE&WVW7B°¢FWf–6Uö–C¢FWf–6Uö–Bæ6ÆöæR‚’À¢6&–Æ—G“¢FWf–6T6&–Æ—G“£¤6ÖW&6GW&RÀ¢&wVÖVçG3¢6W&FUö§6öã£¦§6öâ‡²'÷6—F–öâ#¢&&6²"Ò’À¢6÷W&6U÷'Våö–C¢6öÖR‚''VâÖöæR"æ–çFò‚’’À¢6÷W&6U÷6W76–öåö–C¢æöæRÀ¢6÷W&6U÷FööÅö6ÆÅö–C¢6öÖR‚&6ÆÂÓ"æ–çFò‚’’À¢–çfö6F–öåö–C¢æöæRÀ¢W‡—&W5öEö×3¢3óÀ¢ÒÀ¢%óÀ¢¢çVçw&‚“° ¢ÆWBÆV6VBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢"À¢&6ÖBÖÆV6RÓ"À¢$tUB"À¢"÷c÷&VÖ÷FRöFWf–6Rö6öÖÖæG2öæW‡B"À¢"""À¢’À¢%óÀ¢“°¢76W'EöW†ÆV6VBç7FGW2Â#“°¢ÆWB6öÖÖæC¢FWf–6T6öÖÖæBÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚fÆV6VBæ&öG’’çVçw&‚“°¢76W'EöW†6öÖÖæBæ6öÖÖæEö–BÂVWVVBæ6öÖÖæEö–B“°¢76W'EöW†6öÖÖæBæ6&–Æ—G’ÂFWf–6T6&–Æ—G“£¤6ÖW&6GW&R“° ¢òò6V6öæB6öææV7F–öâf–æG2æ÷F†–æs¢F†R6öÖÖæB—2ÆV6VBÂæ÷B6†&VBà¢ÆWBV×G’Ò’æ†æFÆR€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢2À¢&6ÖBÖÆV6RÓ""À¢$tUB"À¢"÷c÷&VÖ÷FRöFWf–6Rö6öÖÖæG2öæW‡B"À¢"""À¢’À¢%óÀ¢“°¢76W'EöW†V×G’ç7FGW2Â#B“° ¢ÆWB7F'E÷F‚Òf÷&ÖB‚"÷c÷&VÖ÷FRöFWf–6Rö6öÖÖæG2÷·Ò÷7F'B"Â6öÖÖæBæ6öÖÖæEö–B“°¢ÆWB7F'FVBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢BÀ¢&6ÖB×7F'BÓ"À¢%õ5B"À¢g7F'E÷F‚À¢"'·Ò"À¢’À¢%óÀ¢“°¢76W'EöW‡7F'FVBç7FGW2Â#“°¢76W'EöW€¢6W&FUö§6öã£¦g&öÕ÷6Æ–6S££Ç6W&FUö§6öã£¥fÇVSâ‚g7F'FVBæ&öG’’çVçw&‚•²'7F'FVB%ÒÀ¢6W&FUö§6öã£¦§6öâ‡G'VR¢“°¢òòF†R&V6öææV7B66S¢F†RFWf–6R&WG&–W27F'F&V6W6R—BÆ÷7BF†P¢òò&WÇ’â—B×W7B&RFöÆBF†R7F–öâÇ&VG’&VvâÂæ÷BÆÆ÷vVBFð¢òò&WVB—Bà¢ÆWBv–âÒ’æ†æFÆR€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢RÀ¢&6ÖB×7F'BÓ""À¢%õ5B"À¢g7F'E÷F‚À¢"'·Ò"À¢’À¢%óÀ¢“°¢76W'EöW€¢6W&FUö§6öã£¦g&öÕ÷6Æ–6S££Ç6W&FUö§6öã£¥fÇVSâ‚fv–âæ&öG’’çVçw&‚•²'7F'FVB%ÒÀ¢6W&FUö§6öã£¦§6öâ†fÇ6R’À¢&&V6öææV7F–ærFWf–6R×W7Bæ÷BW&f÷&ÒF†R‡—6–6Â7F–öâGv–6R ¢“° ¢ÆWB&W7VÇBÒFWf–6T6öÖÖæE&W7VÇB°¢&÷Fö6öÅ÷fW'6–öã¢$TÔõDUõ$õDô4ôÅõdU%4”ôâÀ¢÷WF6öÖS¢FWf–6T6öÖÖæE7FFS£¥7V66VVFVBÀ¢&W7VÇC¢6öÖR‡6W&FUö§6öã£¦§6öâ‡²'v–GF‚#¢BÂ&†V–v‡B#¢2Ò’’À¢'F–f7Eö&6ScC¢6öÖR…5DäD$BæVæ6öFR†"&§VrÖ'—FW2"’’À¢'F–f7EöÖVF–÷G—S¢6öÖR‚&–ÖvRö§Vr"æ–çFò‚’’À¢'F–f7E÷6†#Sc¢æöæRÀ¢W'&÷#¢æöæRÀ¢W†V7WF–öåö–C¢æöæRÀ¢Ó°¢ÆWB&W7VÇE÷F‚Òf÷&ÖB‚"÷c÷&VÖ÷FRöFWf–6Rö6öÖÖæG2÷·Ò÷&W7VÇB"Â6öÖÖæBæ6öÖÖæEö–B“°¢ÆWB&W÷'FVBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢bÀ¢&6ÖB×&W7VÇBÓ"À¢%õ5B"À¢g&W7VÇE÷F‚À¢g6W&FUö§6öã£§Fõ÷fV2‚g&W7VÇB’çVçw&‚’À¢’À¢%óÀ¢“°¢76W'EöW‡&W÷'FVBç7FGW2Â#“°¢ÆWB7F÷&VBÒ¢ç7F÷&P¢æÆö6²‚¢çVçw&‚¢æFWf–6Uö6öÖÖæB‚f6öÖÖæBæ6öÖÖæEö–B¢çVçw&‚¢çVçw&‚“°¢76W'EöW‡7F÷&VBç7FFRÂFWf–6T6öÖÖæE7FFS£¥7V66VVFVB“°¢ÆWB'F–f7BÒ7F÷&VBæ'F–f7BçVçw&‚“°¢76W'EöW†'F–f7Bæ'—FW2Â“°¢76W'EöW†'F–f7BæÖVF–÷G—RÂ&–ÖvRö§Vr"“°¢76W'B‡&ö÷@¢æ¦ö–â‚&FVÖöâöFWf–6RÖ'F–f7G2"¢æ¦ö–â‚f6öÖÖæBæ6öÖÖæEö–B¢æW†—7G2‚’“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢òòòöæR'Vææ–ær6öÖÖæBÂæBFW&Ö–æÂ&W÷'BFò&6Rv–ç7B—G6VÆbà¢òòð¢òòò&WGW&ç2F†Rf—‡GW&RÂF†RFWf–6R&V6÷&BF†R6öÖÖ—BF‚æVVG2ÂæBF†P¢òòò6öÖÖæB–B(	BÆV6VBÂ7F'FVBÂæB÷væVB'’W†V2×&6RÓà¢fâ'Vææ–æuö6öÖÖæEöf—‡GW&R‚’Óâ€¢F„'VbÀ¢&VÖ÷FT’À¢7&FS£¦FVÖöã£§&VÖ÷FS£§7F÷&S£¤FWf–6U&V6÷&BÀ¢7G&–ærÀ¢’°¢6öÖÖæEöf—‡GW&R…7FvS£¥'Vææ–ær…6öÖR‚&W†V2×&6RÓ"’’¢Ð ¢òòò†÷rf"Æöær—G2Æ–fV7–6ÆRf—‡GW&Rw26öÖÖæB†2G&fVÆÆVBà¢5¶FW&—fR„6ÆöæRÂ6÷’•Ð¢VçVÒ7FvR°¢VWVVBÀ¢ÆV6VBÀ¢òòò7F'FVBÂæÖ–ærâW†V7WF–öâ(	B÷"Âv—F‚æöæVÂ7F'FVB'’'V–Æ@¢òòòF†B†BæòW†V7WF–öâ–FVçF—G’Fòv—fRà¢'Vææ–ær„÷F–öãÂbw7FF–27G#â’À¢Ð ¢fâ6öÖÖæEöf—‡GW&R€¢7FvS¢7FvRÀ¢’Óâ€¢F„'VbÀ¢&VÖ÷FT’À¢7&FS£¦FVÖöã£§&VÖ÷FS£§7F÷&S£¤FWf–6U&V6÷&BÀ¢7G&–ærÀ¢’°¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6Uö–BÂ6V7&WB’Òf—‡GW&R‚“°¢w&çB‚f’ÂfFWf–6Uö–BÂe´FWf–6T6&–Æ—G“£¤6ÖW&6GW&UÒ“°¢GfW'F—6R€¢f’À¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢À¢e´FWf–6T6&–Æ—G“£¤6ÖW&6GW&UÒÀ¢e²„FWf–6T6&–Æ—G“£¤6ÖW&6GW&RÂ÷5W&Ö—76–öã£¤w&çFVB•ÒÀ¢“°¢ÆWBVWVVBÒ¢ç7F÷&P¢æÆö6²‚¢çVçw&‚¢æVçVWVUöFWf–6Uö6öÖÖæB€¢dFWf–6T6öÖÖæE&WVW7B°¢FWf–6Uö–C¢FWf–6Uö–Bæ6ÆöæR‚’À¢6&–Æ—G“¢FWf–6T6&–Æ—G“£¤6ÖW&6GW&RÀ¢&wVÖVçG3¢6W&FUö§6öã£¦§6öâ‡²'÷6—F–öâ#¢&&6²"Ò’À¢6÷W&6U÷'Våö–C¢6öÖR‚''VâÖöæR"æ–çFò‚’’À¢6÷W&6U÷6W76–öåö–C¢æöæRÀ¢6÷W&6U÷FööÅö6ÆÅö–C¢6öÖR‚&6ÆÂ×&6R"æ–çFò‚’’À¢–çfö6F–öåö–C¢æöæRÀ¢W‡—&W5öEö×3¢3óÀ¢ÒÀ¢%óÀ¢¢çVçw&‚“°¢–bÖF6†W2‡7FvRÂ7FvS£¥VWVVB’°¢ÆWBÆV6VBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢"À¢&6ÖB×&6RÖÆV6R"À¢$tUB"À¢"÷c÷&VÖ÷FRöFWf–6Rö6öÖÖæG2öæW‡B"À¢"""À¢’À¢%óÀ¢“°¢76W'EöW†ÆV6VBç7FGW2Â#“°¢Ð¢–bÆWB7FvS£¥'Vææ–ær†W†V7WF–öåö–B’Ò7FvR°¢ÆWB&öG’ÒÖF6‚W†V7WF–öåö–B°¢6öÖR‡fÇVR’Óâf÷&ÖB‡"2'·²&W†V7WF–öåö–B#¢'·fÇVWÒ'×Ò"2’æ–çFõö'—FW2‚’À¢æöæRÓâ"'·Ò"çFõ÷fV2‚’À¢Ó°¢ÆWB7F'E÷F‚Òf÷&ÖB‚"÷c÷&VÖ÷FRöFWf–6Rö6öÖÖæG2÷·Ò÷7F'B"ÂVWVVBæ6öÖÖæEö–B“°¢ÆWB7F'FVBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢2À¢&6ÖB×&6R×7F'B"À¢%õ5B"À¢g7F'E÷F‚À¢f&öG’À¢’À¢%óÀ¢“°¢76W'EöW‡7F'FVBç7FGW2Â#“°¢Ð¢ÆWBFWf–6RÒ¢ç7F÷&P¢æÆö6²‚¢çVçw&‚¢æFWf–6R‚fFWf–6Uö–B¢çVçw&‚¢çVçw&‚“°¢‡&ö÷BÂ’ÂFWf–6RÂVWVVBæ6öÖÖæEö–B¢Ð ¢fâ6ÖW&÷&W÷'B†'—FW3¢e·S…ÒÂW†V7WF–öåö–C¢g7G"’ÓâfV3ÇSƒâ°¢&W÷'Eö&öG’†'—FW2Â6öÖR†W†V7WF–öåö–B’¢Ð ¢fâ&W÷'Eö&öG’†'—FW3¢e·S…ÒÂW†V7WF–öåö–C¢÷F–öãÂg7G#â’ÓâfV3ÇSƒâ°¢6W&FUö§6öã£§Fõ÷fV2‚dFWf–6T6öÖÖæE&W7VÇB°¢&÷Fö6öÅ÷fW'6–öã¢$TÔõDUõ$õDô4ôÅõdU%4”ôâÀ¢÷WF6öÖS¢FWf–6T6öÖÖæE7FFS£¥7V66VVFVBÀ¢&W7VÇC¢6öÖR‡6W&FUö§6öã£¦§6öâ‡²&'—FW2#¢'—FW2æÆVâ‚’Ò’’À¢'F–f7Eö&6ScC¢6öÖR…5DäD$BæVæ6öFR†'—FW2’’À¢'F–f7EöÖVF–÷G—S¢6öÖR‚&–ÖvRö§Vr"æ–çFò‚’’À¢'F–f7E÷6†#Sc¢6öÖR‡6†#Seö†W‚†'—FW2’’À¢W'&÷#¢æöæRÀ¢W†V7WF–öåö–C¢W†V7WF–öåö–BæÖ‡7G#£§Fõ÷7G&–ær’À¢Ò¢çVçw&‚¢Ð ¢fâ'F–f7E÷F‚‡&ö÷C¢g7FC£§Fƒ£¥F‚Â6öÖÖæEö–C¢g7G"’ÓâF„'Vb°¢&ö÷Bæ¦ö–â‚&FVÖöâöFWf–6RÖ'F–f7G2"’æ¦ö–â†6öÖÖæEö–B¢Ð ¢òòò÷7F'F—2F†RWF†÷&—¦F–öâ&÷VæF'’Â6òFW&Ö–æÂ&W÷'B—2öæÇ¢òòòÖVæ–ævgVÂg&öÒF†Rf"6–FRöb—Bà¢òòð¢òòò&Vf÷&RF†—2ÂâWF†VçF–6FVBFWf–6R6÷VÆBF¶R6öÖÖæB7G&–v‡Bg&öÐ¢òòòVWVVF(	B÷"g&öÒÆV6VFÂv—F†÷WBWfW"6¶–ær(	BFò7V66VVFVFÂv†–6€¢òòò6¶—2WfW'’6†V6²F†B&÷VæF'’W†—7G2FòÖ¶S¢F†Rw&çBÂF†R&VF–æW72À¢òòòF†R6æ6VÆÆF–öâÂæBF†R&V6÷&Böb§v†–6‚¢W†V7WF–öâ—2ç7vW&–ærà¢5·FW7EÐ¢fâ÷&W7VÇEöf÷%öö6öÖÖæE÷F†E÷v5öæWfW%÷7F'FVEö—5÷&VgW6VB‚’°¢f÷"‡7FvRÂW‡V7FVB’–â°¢…7FvS£¥VWVVBÂFWf–6T6öÖÖæE7FFS£¥VWVVB’À¢…7FvS£¤ÆV6VBÂFWf–6T6öÖÖæE7FFS£¤ÆV6VB’À¢Ò°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6öÖÖæEö–B’Ò6öÖÖæEöf—‡GW&R‡7FvR“°¢ÆWB&öG’Ò6ÖW&÷&W÷'B†"&æWfW"ÖWF†÷&—¦VB"Â&W†V2Ö–çfVçFVBÓ"“°¢ÆWB‡7FGW2ÂÖW76vR’Ò¢æFWf–6Uö6öÖÖæE÷&W7VÇB‚f&öG’ÂfFWf–6RÂf6öÖÖæEö–BÂ%ó¢æW‡V7EöW'"‚&6öÖÖæBF†Bv2æWfW"7F'FVB†2æò&W7VÇBFò&W÷'B"“°¢76W'EöW‡7FGW2ÂC’Â'¶ÖW76vWÒ"“°¢76W'EöW€¢’ç7F÷&P¢æÆö6²‚¢çVçw&‚¢æFWf–6Uö6öÖÖæB‚f6öÖÖæEö–B¢çVçw&‚¢çVçw&‚¢ç7FFRÀ¢W‡V7FVBÀ¢&&VgW6VB&W÷'B×W7Bæ÷BÖ÷fRF†R6öÖÖæB ¢“°¢76W'B€¢'F–f7E÷F‚‚g&ö÷BÂf6öÖÖæEö–B’æW†—7G2‚’À¢&&VgW6VB&W÷'B×W7Bæ÷BV&Æ—6‚â'F–f7B ¢“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‚g&ö÷B“°¢Ð¢Ð ¢òòò'Vææ–ær6öÖÖæBç7vW'2öæÇ’FòF†RW†V7WF–öâF†B†öÆG2—Bà¢òòð¢òòò–æ6ÇVF–ærF†R6–ÆVçB66S¢âöÖ—GFVBW†V7WF–öåö–F—2F†RöæRf÷&Òç¢òòò6V6öæBW†V7WF–öâ6âÇv—2&öGV6RÂ6ò—B—2&VgW6VBW†7FÇ’2f—&ÖÇ¢òòò2w&öæröæRà¢5·FW7EÐ¢fâ÷'Vææ–æuö6öÖÖæEö66WG5ööæÇ•ö—G5ö÷våöW†V7WF–öç5÷&W7VÇB‚’°¢f÷"†öffW&VBÂ66WFVB’–â°¢„æöæRÂfÇ6R’À¢…6öÖR‚&W†V2×6öÖV&öG’ÖVÂ"’ÂfÇ6R’À¢…6öÖR‚&W†V2×&6RÓ"’ÂG'VR’À¢Ò°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6öÖÖæEö–B’Ò'Vææ–æuö6öÖÖæEöf—‡GW&R‚“°¢ÆWB&öG’Ò&W÷'Eö&öG’†"&§VrÖ'—FW2"ÂöffW&VB“°¢ÆWBç7vW"Ò’æFWf–6Uö6öÖÖæE÷&W7VÇB‚f&öG’ÂfFWf–6RÂf6öÖÖæEö–BÂ%ó“°¢ÆWB7FFRÒ¢ç7F÷&P¢æÆö6²‚¢çVçw&‚¢æFWf–6Uö6öÖÖæB‚f6öÖÖæEö–B¢çVçw&‚¢çVçw&‚¢ç7FFS°¢–b66WFVB°¢76W'EöW†ç7vW"æW‡V7B‚'F†R†öÆFW"w2&W7VÇB—266WFVB"’ãÂ#“°¢76W'EöW‡7FFRÂFWf–6T6öÖÖæE7FFS£¥7V66VVFVB“°¢76W'B†'F–f7E÷F‚‚g&ö÷BÂf6öÖÖæEö–B’æW†—7G2‚’“°¢ÒVÇ6R°¢ÆWB‡7FGW2ÂÖW76vR’Òç7vW"æW‡V7EöW'"‚&öæÇ’F†R†öÆFW"Ö’&W÷'B"“°¢76W'EöW‡7FGW2ÂC’Â'¶ÖW76vWÒ"“°¢76W'EöW€¢7FFRÀ¢FWf–6T6öÖÖæE7FFS£¥'Vææ–ærÀ¢&&VgW6VB&W÷'B×W7BÆVfRF†R6öÖÖæB'Vææ–ær ¢“°¢76W'B€¢'F–f7E÷F‚‚g&ö÷BÂf6öÖÖæEö–B’æW†—7G2‚’À¢&&VgW6VB&W÷'B×W7Bæ÷BV&Æ—6‚â'F–f7B ¢“°¢Ð¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‚g&ö÷B“°¢Ð¢Ð ¢òòò6öÖÖæB7F'FVB&Vf÷&RW†V7WF–öâ–FVçF—F–W2W†—7FVB7F—26ö×ÆWF&ÆRà¢òòð¢òòò&÷F‚VæG2†fRFò&R6–ÆVçB&÷WB—Bââ–BöffW&VBv–ç7B6öÖÖæ@¢òòòF†BæWfW"&V6÷&FVBöæR&÷fW2æ÷F†–ærÂæB66WF–ær—Bv÷VÆBÆWB¢òòò6V6öæBW†V7WF–öâç7vW"f÷"F†Rf—'7Bà¢5·FW7EÐ¢fâö6öÖÖæE÷7F'FVE÷v—F†÷WEöåöW†V7WF–öåö–FVçF—G•ö6ö×ÆWFW5÷v—F†÷WEööæR‚’°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6öÖÖæEö–B’Ò6öÖÖæEöf—‡GW&R…7FvS£¥'Vææ–ær„æöæR’“°¢ÆWB‡7FGW2ÂÖW76vR’Ò¢æFWf–6Uö6öÖÖæE÷&W7VÇB€¢g&W÷'Eö&öG’†"&§VrÖ'—FW2"Â6öÖR‚&W†V2Ö–çfVçFVBÓ"’’À¢fFWf–6RÀ¢f6öÖÖæEö–BÀ¢%óÀ¢¢æW‡V7EöW'"‚&â–çfVçFVB–FVçF—G’&÷fW2æ÷F†–ær&÷WB6öÖÖæBF†B&V6÷&FVBæöæR"“°¢76W'EöW‡7FGW2ÂC’Â'¶ÖW76vWÒ"“°¢76W'B‚'F–f7E÷F‚‚g&ö÷BÂf6öÖÖæEö–B’æW†—7G2‚’“° ¢ÆWB‡7FGW2ÂòÂò’Ò¢æFWf–6Uö6öÖÖæE÷&W7VÇB€¢g&W÷'Eö&öG’†"&§VrÖ'—FW2"ÂæöæR’À¢fFWf–6RÀ¢f6öÖÖæEö–BÀ¢%óÀ¢¢æW‡V7B‚&ÆVv7’7F'B×W7B7F’6ö×ÆWF&ÆR"“°¢76W'EöW‡7FGW2Â#“°¢76W'EöW€¢’ç7F÷&P¢æÆö6²‚¢çVçw&‚¢æFWf–6Uö6öÖÖæB‚f6öÖÖæEö–B¢çVçw&‚¢çVçw&‚¢ç7FFRÀ¢FWf–6T6öÖÖæE7FFS£¥7V66VVFV@¢“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‚g&ö÷B“°¢Ð ¢òòòv†BF†R'VææW"†öÆG2Â2Gvòf7G2F†B×W7Bw&VS¢F†RF–vW7B–âF†P¢òòò&÷rÂæBF†R'—FW2öâF—6²à¢fâ7F÷&VEö'F–f7B€¢&ö÷C¢g7FC£§Fƒ£¥F‚À¢“¢e&VÖ÷FT’À¢6öÖÖæEö–C¢g7G"À¢’Óâ…7G&–ærÂ7G&–ær’°¢ÆWB7F÷&VBÒ¢ç7F÷&P¢æÆö6²‚¢çVçw&‚¢æFWf–6Uö6öÖÖæB†6öÖÖæEö–B¢çVçw&‚¢çVçw&‚“°¢ÆWB'—FW2Ò7FC£¦g3£§&VB‡&ö÷Bæ¦ö–â‚&FVÖöâöFWf–6RÖ'F–f7G2"’æ¦ö–â†6öÖÖæEö–B’¢æW‡V7B‚&FW&Ö–æÂ&V6÷&B×W7BæWfW"æÖR'—FW2F†B&Ræ÷BF†W&R"“°¢‡7F÷&VBæ'F–f7BçVçw&‚’ç6†#SbÂ6†#Seö†W‚‚f'—FW2’¢Ð ¢òòòF†R6ÖR&W7VÇBFVÆ—fW&VBGv–6RBF†R6ÖRÖöÖVçBà¢òòð¢òòòF†RFWf–6R6ææ÷BFVÆÂÆ÷7B&W7öç6Rg&öÒÆ÷7B&WVW7BÂ6ò—@¢òòò&WG&–W2(	BæBæ÷F†–ær7F÷2F†R&WG'’÷fW&Æ–ærF†R÷&–v–æÂâ&÷F€¢òòòFVÆ—fW&–W2†fRFò&R6¶æ÷vÆVFvVBÂæB&WGvVVâF†VÒF†W’Ö’ÆVfRöæÇ¢òòòöæR'F–f7Bà¢5·FW7EÐ¢fâGvõö–FVçF–6Å÷FW&Ö–æÅ÷&W÷'G5÷&6–æuöV6…ö÷F†W%ö6öÖÖ—Eööæ6R‚’°¢f÷"&÷VæB–ââã‚°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6öÖÖæEö–B’Ò'Vææ–æuö6öÖÖæEöf—‡GW&R‚“°¢ÆWB&öG’Ò6ÖW&÷&W÷'B†"&§VrÖ'—FW2Ö–FVçF–6Â"Â&W†V2×&6RÓ"“°¢ÆWBvFRÒ7FC£§7–æ3£¤&'&–W#£¦æWrƒ"“°¢ÆWB†f—'7BÂ6V6öæB’Ò7FC£§F‡&VC£§66÷R‡Ç66÷WÂ°¢ÆWBöæRÒ66÷Rç7vâ‡ÇÂ°¢vFRçv—B‚“°¢’æFWf–6Uö6öÖÖæE÷&W7VÇB‚f&öG’ÂfFWf–6RÂf6öÖÖæEö–BÂ%ó¢Ò“°¢ÆWBGvòÒ66÷Rç7vâ‡ÇÂ°¢vFRçv—B‚“°¢’æFWf–6Uö6öÖÖæE÷&W7VÇB‚f&öG’ÂfFWf–6RÂf6öÖÖæEö–BÂ%ó¢Ò“°¢†öæRæ¦ö–â‚’çVçw&‚’ÂGvòæ¦ö–â‚’çVçw&‚’¢Ò“°¢f÷"ç7vW"–â²ff—'7BÂg6V6öæEÒ°¢ÆWB‡7FGW2ÂòÂò’Òç7vW"æ5÷&Vb‚’çVçw&ö÷%öVÇ6R‡ÆW'&÷'Â°¢æ–2‚'&÷VæB·&÷VæGÓ¢â–FVçF–6Â&WG'’v2&VgW6VC¢¶W'&÷#£÷Ò"¢Ò“°¢76W'EöW‚§7FGW2Â#“°¢Ð¢ÆWB‡&÷rÂf–ÆR’Ò7F÷&VEö'F–f7B‚g&ö÷BÂf’Âf6öÖÖæEö–B“°¢76W'EöW‡&÷rÂ6†#Seö†W‚†"&§VrÖ'—FW2Ö–FVçF–6Â"’“°¢76W'EöW‡&÷rÂf–ÆRÂ'&÷VæB·&÷VæGÓ¢F†R&÷ræBF†R'—FW2F—6w&VR"“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‚g&ö÷B“°¢Ð¢Ð ¢òòòGvò¦F–ffW&VçB¢&W7VÇG2f÷"öæR‡—6–6Â7F–öâÂFVÆ—fW&VBBF†R6ÖP¢òòòÖöÖVçBà¢òòð¢òòòW†7FÇ’öæRÖ’v–âÂæBF†RÆ÷6W"×W7B6†ævRæ÷F†–ær(	Bæ÷BF†R&÷rÀ¢òòòæ÷BF†RF–vW7BÂæB&÷fRÆÂæ÷BF†R'—FW2âV&Æ—6†–ærF†R'F–f7@¢òòò÷WG6–FRF†R6öÖÖ—B—2v†BW6VBFòÖ¶R'F†R&÷r6—2ÂF†Rf–ÆR†öÆG0¢òòò""&V6†&ÆRà¢5·FW7EÐ¢fâö6öæfÆ–7F–æu÷FW&Ö–æÅ÷&W÷'E÷&6–æu÷F†U÷v–ææW%ö6†ævW5öæ÷F†–ær‚’°¢f÷"&÷VæB–ââã‚°¢ÆWB‡&ö÷BÂ’ÂFWf–6RÂ6öÖÖæEö–B’Ò'Vææ–æuö6öÖÖæEöf—‡GW&R‚“°¢ÆWBf—'7Eö&öG’Ò6ÖW&÷&W÷'B†"&§VrÖ'—FW2Öf—'7B"Â&W†V2×&6RÓ"“°¢ÆWB6V6öæEö&öG’Ò6ÖW&÷&W÷'B†"&§VrÖ'—FW2×6V6öæB"Â&W†V2×&6RÓ"“°¢ÆWBvFRÒ7FC£§7–æ3£¤&'&–W#£¦æWrƒ"“°¢ÆWB†f—'7BÂ6V6öæB’Ò7FC£§F‡&VC£§66÷R‡Ç66÷WÂ°¢ÆWBöæRÒ66÷Rç7vâ‡ÇÂ°¢vFRçv—B‚“°¢’æFWf–6Uö6öÖÖæE÷&W7VÇB‚ff—'7Eö&öG’ÂfFWf–6RÂf6öÖÖæEö–BÂ%ó¢Ò“°¢ÆWBGvòÒ66÷Rç7vâ‡ÇÂ°¢vFRçv—B‚“°¢’æFWf–6Uö6öÖÖæE÷&W7VÇB‚g6V6öæEö&öG’ÂfFWf–6RÂf6öÖÖæEö–BÂ%ó¢Ò“°¢†öæRæ¦ö–â‚’çVçw&‚’ÂGvòæ¦ö–â‚’çVçw&‚’¢Ò“°¢ÆWB66WFVBÒ²ff—'7BÂg6V6öæEÐ¢æ—FW"‚¢æf–ÇFW"‡Æç7vW'Âç7vW"æ—5öö²‚’¢æ6÷VçB‚“°¢76W'EöW€¢66WFVBÂÀ¢'&÷VæB·&÷VæGÓ¢W†7FÇ’öæR&W÷'B—2WF†÷&—FF—fR ¢“°¢f÷"ç7vW"–â²ff—'7BÂg6V6öæEÒ°¢–bÆWBW'"‚‡7FGW2Âò’’Òç7vW"°¢76W'EöW€¢§7FGW2ÂC’À¢'&÷VæB·&÷VæGÓ¢F†RÆ÷6W"—2&VgW6VBÂæ÷Bf–ÆVB ¢“°¢Ð¢Ð¢ÆWB‡&÷rÂf–ÆR’Ò7F÷&VEö'F–f7B‚g&ö÷BÂf’Âf6öÖÖæEö–B“°¢ÆWBv–ææW"Ò–bf—'7Bæ—5öö²‚’°¢"&§VrÖ'—FW2Öf—'7B"æ5÷6Æ–6R‚¢ÒVÇ6R°¢"&§VrÖ'—FW2×6V6öæB"æ5÷6Æ–6R‚¢Ó°¢76W'EöW‡&÷rÂ6†#Seö†W‚‡v–ææW"’“°¢76W'EöW€¢&÷rÂf–ÆRÀ¢'&÷VæB·&÷VæGÓ¢F†RÆ÷6W"w2'—FW2&WÆ6VBF†Rv–ææW"w2VæFW"F†Rv–ææW"w2F–vW7B ¢“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‚g&ö÷B“°¢Ð¢Ð ¢òòòWF†÷&—G’—2&RÖ6†V6¶VBBF†RÖöÖVçBF†R6öÖÖæB—2†æFVB÷fW"Âæ÷@¢òòòöæÇ’v†Vâ—Bv2VWVVB(	Bâõ2W&Ö—76–öâF†RW6W"7v—F6†VBöfb–à¢òòò&WGvVVâ×W7B7F÷—BÂv—F‚&V6öâF†Rv—F–ær'Vâ6â&VBà¢5·FW7EÐ¢fâ÷W&Ö—76–öå÷v—F†G&våögFW%÷VWVV–æuöf–Ç5÷F†Uö6öÖÖæEöEöÆV6U÷F–ÖR‚’°¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6Uö–BÂ6V7&WB’Òf—‡GW&R‚“°¢w&çB‚f’ÂfFWf–6Uö–BÂe´FWf–6T6&–Æ—G“£¤Æö6F–öå&VEÒ“°¢GfW'F—6R€¢f’À¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢À¢e´FWf–6T6&–Æ—G“£¤Æö6F–öå&VEÒÀ¢e²„FWf–6T6&–Æ—G“£¤Æö6F–öå&VBÂ÷5W&Ö—76–öã£¤w&çFVB•ÒÀ¢“°¢ÆWBVWVVBÒ¢ç7F÷&P¢æÆö6²‚¢çVçw&‚¢æVçVWVUöFWf–6Uö6öÖÖæB€¢dFWf–6T6öÖÖæE&WVW7B°¢FWf–6Uö–C¢FWf–6Uö–Bæ6ÆöæR‚’À¢6&–Æ—G“¢FWf–6T6&–Æ—G“£¤Æö6F–öå&VBÀ¢&wVÖVçG3¢6W&FUö§6öã£¦§6öâ‡·Ò’À¢6÷W&6U÷'Våö–C¢æöæRÀ¢6÷W&6U÷6W76–öåö–C¢æöæRÀ¢6÷W&6U÷FööÅö6ÆÅö–C¢æöæRÀ¢–çfö6F–öåö–C¢æöæRÀ¢W‡—&W5öEö×3¢3óÀ¢ÒÀ¢%óÀ¢¢çVçw&‚“°¢òòF†RW6W"&Wfö¶W2Æö6F–öâ–âF†Rõ2æBF†R&RÖGfW'F—6W2à¢GfW'F—6R€¢f’À¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢"À¢e´FWf–6T6&–Æ—G“£¤Æö6F–öå&VEÒÀ¢e²„FWf–6T6&–Æ—G“£¤Æö6F–öå&VBÂ÷5W&Ö—76–öã£¤FVæ–VB•ÒÀ¢“°¢ÆWBÆV6VBÒ’æ†æFÆR€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢2À¢&6ÖBÖÆV6RÓ"À¢$tUB"À¢"÷c÷&VÖ÷FRöFWf–6Rö6öÖÖæG2öæW‡B"À¢"""À¢’À¢%óÀ¢“°¢76W'EöW†ÆV6VBç7FGW2Â#BÂ&FVæ–VB6&–Æ—G’––VÆG2æò6öÖÖæB"“°¢ÆWB7F÷&VBÒ¢ç7F÷&P¢æÆö6²‚¢çVçw&‚¢æFWf–6Uö6öÖÖæB‚gVWVVBæ6öÖÖæEö–B¢çVçw&‚¢çVçw&‚“°¢76W'EöW‡7F÷&VBç7FFRÂFWf–6T6öÖÖæE7FFS£¤f–ÆVB“°¢òòæ÷B6‡'Vs¢F†R&V6öâæÖW2F†R†—2F†B&VgW6VBæBv†BF†P¢òò÷W&F÷"v÷VÆBFò&÷WB—Bà¢ÆWB&V6öâÒ7F÷&VBæW'&÷"çVçw&‚“°¢76W'B€¢&V6öâæ6öçF–ç2‚&FVæ–W2"’bb&V6öâæ6öçF–ç2‚'7—7FVÒ6WGF–æw2"’À¢'F†Rf–ÇW&R×W7B6’F†Rõ2FVæ–VB—BæBv†W&RFòf—‚—C¢·&V6öçÒ ¢“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢òòòGfW'F—6–ær—2æ÷BWF†÷&—G“¢FWf–6RF†B6Æ–×2WfW'’6&–Æ—G¢òòòv–ç2æöæR—Bv2æ÷Bw&çFVBà¢5·FW7EÐ¢fâGfW'F—6–æuöö6&–Æ—G•öæWfW%öw&çG5ö—B‚’°¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6Uö–BÂ6V7&WB’Òf—‡GW&R‚“°¢ÆWB&W7öç6RÒGfW'F—6R€¢f’À¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢À¢e°¢FWf–6T6&–Æ—G“£¤6ÖW&6GW&RÀ¢FWf–6T6&–Æ—G“£¥67&VVä6GW&RÀ¢FWf–6T6&–Æ—G“£¤Ö–7&÷†öæT6GW&RÀ¢ÒÀ¢e°¢„FWf–6T6&–Æ—G“£¤6ÖW&6GW&RÂ÷5W&Ö—76–öã£¤w&çFVB’À¢„FWf–6T6&–Æ—G“£¥67&VVä6GW&RÂ÷5W&Ö—76–öã£¤w&çFVB’À¢„FWf–6T6&–Æ—G“£¤Ö–7&÷†öæT6GW&RÂ÷5W&Ö—76–öã£¤w&çFVB’À¢ÒÀ¢“°¢76W'EöW‡&W7öç6Rç7FGW2Â#“°¢ÆWB7FFS¢6W&FUö§6öã£¥fÇVRÒ6W&FUö§6öã£¦g&öÕ÷6Æ–6R‚g&W7öç6Ræ&öG’’çVçw&‚“°¢ÆWBVffV7F—fRÒ7FFU²&VffV7F—fR%Òæ5ö'&’‚’çVçw&‚“°¢76W'B€¢VffV7F—fP¢æ—FW"‚¢æç’‡ÇfÇVWÂfÇVRÓÒ&6ÖW&ö6GW&R"ÇÂfÇVRÓÒ'67&VVåö6GW&R"’À¢&6VÆbÖFV6Æ&VB6&–Æ—G’×W7Bæ÷B&V6öÖRVffV7F—fS¢¶VffV7F—fS£÷Ò ¢“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢òòòF†RÆöæröÆÂv—G2f÷"v÷&²æB&WGW&ç226ööâ2—BW†—7G2ÂæB—@¢òòòæWfW"†öÆG26öææV7F–öâÆöævW"F†âF†RÆV6Rà¢5·Fö¶–ó£§FW7EÐ¢7–æ2fâF†UöÆV6UöÆöæu÷öÆÅ÷v—G5öf÷%÷v÷&µöæEöv—fW5÷Wööå÷F–ÖR‚’°¢ÆWB‡&ö÷BÂ’Â÷6V7&WG2ÂFWf–6Uö–BÂ6V7&WB’Òf—‡GW&R‚“°¢w&çB‚f’ÂfFWf–6Uö–BÂe´FWf–6T6&–Æ—G“£¤æ÷F–f–6F–öå÷7EÒ“°¢GfW'F—6R€¢f’À¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢À¢e´FWf–6T6&–Æ—G“£¤æ÷F–f–6F–öå÷7EÒÀ¢e²„FWf–6T6&–Æ—G“£¤æ÷F–f–6F–öå÷7BÂ÷5W&Ö—76–öã£¤w&çFVB•ÒÀ¢“° ¢ÆWB7F'FVBÒ7FC£§F–ÖS£¤–ç7FçC£¦æ÷r‚“°¢ÆWBV×G’Ò¢æ†æFÆU÷v—F–ær€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢"À¢&6ÖB×öÆÂÓ"À¢$tUB"À¢"÷c÷&VÖ÷FRöFWf–6Rö6öÖÖæG2öæW‡C÷v—Eö×3Ó#"À¢"""À¢’À¢%óÀ¢¢æv—C°¢76W'EöW†V×G’ç7FGW2Â#B“°¢ÆWBv—FVBÒ7F'FVBæVÆ6VB‚“°¢76W'B€¢v—FVBãÒ7FC£§F–ÖS£¤GW&F–öã£¦g&öÕöÖ–ÆÆ—2ƒó’À¢&âV×G’öÆÂ×W7B7GVÆÇ’v—BÂæ÷B7–ã¢·v—FVC£÷Ò ¢“°¢76W'B€¢v—FVBÂ7FC£§F–ÖS£¤GW&F–öã£¦g&öÕöÖ–ÆÆ—2ƒó’À¢'F†RöÆÂ×W7Bv—fRWvVÆÂ–ç6–FRF†RÆV6S¢·v—FVC£÷Ò ¢“° ¢òòv—F‚v÷&²Ç&VG’VWVVBÂF†R6ÖR&WVW7B&WGW&ç2–ÖÖVF–FVÇ’à¢’ç7F÷&P¢æÆö6²‚¢çVçw&‚¢æVçVWVUöFWf–6Uö6öÖÖæB€¢dFWf–6T6öÖÖæE&WVW7B°¢FWf–6Uö–C¢FWf–6Uö–Bæ6ÆöæR‚’À¢6&–Æ—G“¢FWf–6T6&–Æ—G“£¤æ÷F–f–6F–öå÷7BÀ¢&wVÖVçG3¢6W&FUö§6öã£¦§6öâ‡²'F—FÆR#¢&†’"Â&&öG’#¢'F†W&R"Ò’À¢6÷W&6U÷'Våö–C¢æöæRÀ¢6÷W&6U÷6W76–öåö–C¢æöæRÀ¢6÷W&6U÷FööÅö6ÆÅö–C¢æöæRÀ¢–çfö6F–öåö–C¢æöæRÀ¢W‡—&W5öEö×3¢3óÀ¢ÒÀ¢%óÀ¢¢çVçw&‚“°¢ÆWB7F'FVBÒ7FC£§F–ÖS£¤–ç7FçC£¦æ÷r‚“°¢ÆWBÆV6VBÒ¢æ†æFÆU÷v—F–ær€¢6–væVB€¢fFWf–6Uö–BÀ¢g6V7&WBÀ¢2À¢&6ÖB×öÆÂÓ""À¢$tUB"À¢"÷c÷&VÖ÷FRöFWf–6Rö6öÖÖæG2öæW‡C÷v—Eö×3Ó#"À¢"""À¢’À¢%óÀ¢¢æv—C°¢76W'EöW†ÆV6VBç7FGW2Â#“°¢76W'B€¢7F'FVBæVÆ6VB‚’Â7FC£§F–ÖS£¤GW&F–öã£¦g&öÕöÖ–ÆÆ—2ƒ%ó’À¢&VWVVB6öÖÖæB×W7Bæ÷Bv—Bf÷"F†RöÆÂFVFÆ–æR ¢“°¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð ¢òòò&Wfö¶VBFWf–6RvWG2æ÷F†–ærÂ–æ6ÇVF–æröâF†RFWf–6RÆæRà¢5·FW7EÐ¢fâ÷&Wfö¶VEöFWf–6Uö6ææ÷EöÆV6Uö÷%÷&W÷'B‚’°¢ÆWB‡&ö÷BÂ’Â6V7&WG2ÂFWf–6Uö–BÂ6V7&WB’Òf—‡GW&R‚“°¢w&çB‚f’ÂfFWf–6Uö–BÂe´FWf–6T6&–Æ—G“£¤FWf–6T–æfõÒ“°¢’ç7F÷&P¢æÆö6²‚¢çVçw&‚¢ç&Wfö¶UöFWf–6R‚fFWf–6Uö–BÂ&Æ÷7B"Â%óÂ6V7&WG2æ5÷&Vb‚’ÂæöæR¢çVçw&‚“°¢f÷"‡6WVVæ6RÂ6öÖÖæBÂÖWF†öBÂF‚’–â°¢ƒScBÂ&6ÖBÖ"Â$tUB"Â"÷c÷&VÖ÷FRöFWf–6R÷7FFR"’À¢ƒ"Â&6ÖBÖ""Â$tUB"Â"÷c÷&VÖ÷FRöFWf–6Rö6öÖÖæG2öæW‡B"’À¢ƒ2Â&6ÖBÖ2"Â%õ5B"Â"÷c÷&VÖ÷FRöFWf–6R÷7W&f6R"’À¢Ò°¢ÆWB&W7öç6RÒ’æ†æFÆR€¢6–væVB‚fFWf–6Uö–BÂg6V7&WBÂ6WVVæ6RÂ6öÖÖæBÂÖWF†öBÂF‚Â"'·Ò"’À¢%óÀ¢“°¢76W'EöW‡&W7öç6Rç7FGW2ÂCÂ'·F‡Òç7vW&VB&Wfö¶VBFWf–6R"“°¢Ð¢ÆWBòÒ7FC£¦g3£§&VÖ÷fUöF—%öÆÂ‡&ö÷B“°¢Ð§Ð

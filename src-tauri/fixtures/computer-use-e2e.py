@@ -95,10 +95,21 @@ def main() -> int:
             real_run = False
             status = "invalid_native_evidence"
             driver_error = "native driver did not prove all persistence and screenshot postconditions"
-        elif not negatives.get("secure_field_detected_and_not_typed") or not negatives.get("disabled_control_not_mutated") or negatives.get("prompt_injection_widened_grant"):
+        elif (
+            not negatives.get("secure_field_detected_and_not_typed")
+            or not negatives.get("disabled_control_not_mutated")
+            or not negatives.get("second_same_app_window_rejected")
+            or negatives.get("prompt_injection_widened_grant")
+        ):
             real_run = False
             status = "invalid_native_evidence"
             driver_error = "native driver did not prove the negative security cases"
+        else:
+            grant = trace.get("grant", {}) if isinstance(trace, dict) else {}
+            if grant.get("window_scoped") is not True or grant.get("approval") != "test-approved-through-real-gate":
+                real_run = False
+                status = "invalid_native_evidence"
+                driver_error = "native driver did not prove the scoped grant and real approval gate"
     evidence = {
         "schema_version": 1,
         "fixture": str(args.fixture),

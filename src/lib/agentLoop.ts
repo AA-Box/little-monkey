@@ -60,6 +60,7 @@ import {
   type ToolExecutionContext,
 } from './turnEngine';
 import { classifyToolCall, type RiskClassification } from './riskJudge';
+import { ComputerUseRunBudget } from './taskCoordinator';
 import {
   composeReferencedText,
   extractMentionPaths,
@@ -1561,6 +1562,7 @@ function registerDurableController(
 interface DurableTurnContext {
   recorder: DurableRunRecorder | null;
   failure: string | null;
+  computerUseBudget: ComputerUseRunBudget | null;
   /** One-shot model call for the bounded learning reflection pass, built by
    * `runAgentTurnBody` (which owns the resolved target and the privacy gate)
    * and consumed by `runAgentTurn`'s `finally` — the learning step can only
@@ -2321,7 +2323,14 @@ async function runTurnGuarded(
   }).catch(() => null);
   // Distinct from checkpointId (which can be null): scopes shell,
   // cancellation, permission prompts, and durable run events to this turn.
-  const durable: DurableTurnContext = { recorder: null, failure: null, reflect: null, skills: null, toolFailures: [] };
+  const durable: DurableTurnContext = {
+    recorder: null,
+    failure: null,
+    computerUseBudget: useSettingsStore.getState().desktopControlEnabled ? new ComputerUseRunBudget() : null,
+    reflect: null,
+    skills: null,
+    toolFailures: [],
+  };
   let thrown: unknown = null;
   try {
     await runAgentTurnBody(
@@ -2491,6 +2500,11 @@ async function runAgentTurnBody(
   const requireVision = images.length > 0;
 
   const settings = useSettingsStore.getState();
+  const consumeComputerUseModelCall = (): void => {
+    if (durable.computerUseBudget && !durable.computerUseBudget.consume('model_calls')) {
+      throw new Error('COMPUTER_USE_BUDGET_EXCEEDED: model call deadline or limit reached');
+    }
+  };
   const privacyWorkspaceId = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? 'global';
   const privacyWireCache: PrivacyWireCache = new Map();
   const surfacedRateLimitWarnings = new Set<string>();
@@ -3001,6 +3015,7 @@ async function runAgentTurnBody(
     if (!prepared) {
       throw new Error('Privacy Firewall cancelled context summarization.');
     }
+    consumeComputerUseModelCall();
     const result = await attemptStream(
       prepared.target,
       prepared.messages,
@@ -3045,6 +3060,7 @@ async function runAgentTurnBody(
           if (!prepared) {
             throw new Error('Privacy Firewall cancelled risk classification.');
           }
+          consumeComputerUseModelCall();
           return attemptStream(
               prepared.target,
               prepared.messages,
@@ -3075,6 +3091,7 @@ async function runAgentTurnBody(
     if (!prepared) {
       throw new Error('Privacy Firewall cancelled the learning reflection.');
     }
+    consumeComputerUseModelCall();
     const result = await attemptStream(
       prepared.target,
       prepared.messages,
@@ -3269,6 +3286,7 @@ async function runAgentTurnBody(
       toolDefinitions: toolsForTurn,
       isToolAvailable,
       onCompleted: completeToolCall,
+      computerUseBudget: durable.computerUseBudget ?? undefined,
     };
     const programmaticToolOffered = toolsForTurn.some(
       (tool) => tool.function.name === PROGRAMMATIC_TOOL.function.name,
@@ -3340,6 +3358,7 @@ async function runAgentTurnBody(
     const assistantPlaceholder: ChatMessage = { role: 'assistant', content: '' };
     addMessage(assistantPlaceholder);
 
+    consumeComputerUseModelCall();
     let attempt = await attemptStream(
       target,
       outboundWireHistory,
@@ -3384,6 +3403,7 @@ async function runAgentTurnBody(
       });
       surfaceRateLimitWarnings(target);
       addMessage({ role: 'assistant', content: '' });
+      consumeComputerUseModelCall();
       attempt = await attemptStream(
         target,
         outboundWireHistory,
@@ -3446,6 +3466,7 @@ async function runAgentTurnBody(
           ? preparedFailoverWire.messages
           : wireHistoryFor(target);
       addMessage({ role: 'assistant', content: '' });
+      consumeComputerUseModelCall();
       attempt = await attemptStream(
         target,
         failoverWireHistory,

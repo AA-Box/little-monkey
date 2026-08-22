@@ -22,6 +22,10 @@ The model-facing tools are `computer_list_targets`, `computer_screenshot`,
 `computer_set_value`. Every call supplies an active session and an
 application/window target. The model must list and inspect first; semantic
 element ids are preferred, with bounded coordinates as an explicit fallback.
+Native semantic actions carry provider identity: macOS resolves `AXIdentifier`,
+Windows resolves UIA AutomationId/runtime identity, and Linux/X11 resolves an
+AT-SPI provider path. When an observed identity was available, a missing one
+is a stale-target failure rather than an index fallback.
 The backend re-resolves the target at execution time and after the action, so
 stale ids, changed windows, inactive grants, and non-frontmost mutation
 targets fail closed. Results distinguish input sent from state verified.
@@ -31,9 +35,10 @@ high for typing/clicking/value mutation, and critical for destructive or
 external transactions, including a semantic element whose inspected role or
 label is destructive. Critical actions always require their own approval,
 even inside an approved batch. Approved-batch mode is an explicit grant
-choice and never widens the allowlist or disables the kill switch. A bounded wait loop
-must cap actions, duration, screenshots, retries, and model calls; callers
-must not turn Computer Use into an unbounded autonomous loop.
+choice and never widens the allowlist or disables the kill switch. A shared
+run budget atomically caps 50 actions, 12 screenshots, 5 retries, 20 model
+calls, and a 15-minute deadline. Callers must not turn Computer Use into an
+unbounded autonomous loop.
 
 ## Security boundary
 
@@ -64,7 +69,7 @@ choice and bounded observe/authorize/execute/verify phases.
 | Platform | Semantic access | Input/screenshot boundary |
 | --- | --- | --- |
 | macOS | System Events / Accessibility, normalized and bounded | Accessibility is required for input/tree access; Screen Recording is required for screenshots; the target must remain visible/frontmost |
-| Windows | UI Automation, normalized and bounded | SendInput/enigo is used for input; window identity and bounds are rechecked; DPI and integrity changes fail closed; UAC/security dialogs are blocked |
+| Windows | UI Automation, normalized and bounded | Every target is checked with `GetWindowThreadProcessId` → `OpenProcessToken(TokenIntegrityLevel)` against the current process; native scripts use `SetThreadDpiAwarenessContext(PER_MONITOR_AWARE_V2)` and `GetDpiForWindow`; higher-integrity targets fail closed |
 | Linux/X11 | AT-SPI when `pyatspi` is available | enigo plus bounded `scrot`/ImageMagick region capture; missing providers return a typed error |
 | Linux/Wayland | No compositor bypass | Requires an approved xdg-desktop-portal RemoteDesktop/InputCapture/libei path; Little Monkey refuses to bypass Wayland security |
 
@@ -86,12 +91,11 @@ durable audit.
 
 The normal loop is semantic target listing → bounded inspection → screenshot
 when needed → model decision → policy/approval → input → target/state
-verification screenshot or semantic re-read. Recovery errors are classified
-as stale target, target not frontmost, permission denied, sensitive target,
-provider unavailable, unsupported platform/display, input sent but unverified,
-timeout, cancelled, and emergency stopped. The model should stop and ask the
-operator when recovery would require widening the grant or bypassing a
-security boundary.
+verification screenshot or semantic re-read. If input was sent but the
+postcondition is not verified, the coordinator returns the typed
+`INPUT_SENT_UNVERIFIED` failure instead of treating the last result as success.
+The model should stop and ask the operator when recovery would require widening
+the grant or bypassing a security boundary.
 
 ## Acceptance fixture
 

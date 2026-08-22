@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { coordinateToolInvocation, runCoordinatedInvocation } from './taskCoordinator';
+import { CoordinatedInvocationError, coordinateToolInvocation, runCoordinatedInvocation } from './taskCoordinator';
 
 describe('universal task coordinator routing', () => {
   it('routes native Computer Use through observe/authorize/verify phases', () => {
@@ -34,15 +34,14 @@ describe('universal task coordinator routing', () => {
   it('owns phase order and stops retrying at the declared budget', async () => {
     const phases: string[] = [];
     let executions = 0;
-    const result = await runCoordinatedInvocation(
+    await expect(runCoordinatedInvocation(
       { route: 'native', phases: ['observe', 'decide', 'authorize', 'execute', 'verify'], maxAttempts: 1 },
       {
         onPhase: (phase) => { phases.push(phase); },
         execute: () => { executions += 1; return 'outcome'; },
         verify: () => false,
       },
-    );
-    expect(result).toBe('outcome');
+    )).rejects.toBeInstanceOf(CoordinatedInvocationError);
     expect(executions).toBe(1);
     expect(phases).toEqual(['observe', 'decide', 'authorize', 'verify']);
   });

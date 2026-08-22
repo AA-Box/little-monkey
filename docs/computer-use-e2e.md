@@ -1,7 +1,9 @@
 # Computer Use E2E matrix
 
-Use the native fixture from `computer-use.md` with a fresh profile and a
-manual approval grant scoped only to `Little Monkey TestApp`.
+Use the native fixture from `computer-use.md` with a fresh profile. The driver
+discovers the target first, creates a grant scoped to that exact window, proves
+a second same-application window is refused, and exercises the real
+per-action approval gate (`test-approved-through-real-gate`).
 
 Generate the machine-readable evidence envelope before running the native
 driver:
@@ -19,7 +21,9 @@ creates the scoped grant and approval gates before the OS accessibility
 provider performs the semantic actions. The driver discovers the real
 accessibility window, restarts the fixture, captures a screenshot, inspects
 the audit, and proves the negative security cases. A fabricated trace
-dictionary is rejected.
+dictionary is rejected. CI runs this production path on macOS Accessibility,
+Windows UIAutomation, and Linux/X11 AT-SPI under Xvfb; Wayland remains an
+explicit fail-closed path.
 
 1. Feature off: Computer Use schemas are absent.
 2. Bypass mode: grant creation is refused.

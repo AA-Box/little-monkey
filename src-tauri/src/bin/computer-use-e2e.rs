@@ -115,6 +115,15 @@ fn target_is_fixture(target: &ComputerTarget) -> bool {
             .contains("python")
 }
 
+fn target_is_primary_fixture(target: &ComputerTarget) -> bool {
+    target.window_title == "Little Monkey TestApp"
+        || (target.window_title.is_empty()
+            && target
+                .application_name
+                .to_ascii_lowercase()
+                .contains("python"))
+}
+
 fn find_element<'a>(
     inspection: &'a ComputerInspection,
     label: &str,
@@ -294,7 +303,11 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
     std::env::set_var("COMPUTER_USE_FIXTURE_PID", pid.to_string());
     let result = (|| {
         let state = DesktopControlState::production();
-        let session = state.start_session_with_options(
+        // Discovery intentionally happens in a short-lived unscoped grant.
+        // The acceptance grant below is created only after the provider has
+        // returned the exact window identity, so its evidence cannot claim a
+        // window scope that was never enforced.
+        let discovery = state.start_session_with_options(
             "auto",
             allowed_applications(pid),
             900_000,
@@ -307,10 +320,15 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
             },
         )?;
         let mut target = None;
+        let mut discovered_targets = Vec::new();
         for attempt in 0..20 {
-            match state.list_targets_for_session(&session.session_id) {
+            match state.list_targets_for_session(&discovery.session_id) {
                 Ok(targets) => {
-                    target = targets.into_iter().find(|target| target_is_fixture(target));
+                    discovered_targets = targets;
+                    target = discovered_targets
+                        .iter()
+                        .find(|candidate| target_is_primary_fixture(candidate))
+                        .cloned();
                     if target.is_some() {
                         break;
                     }
@@ -322,6 +340,46 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
         }
         let target = target
             .ok_or_else(|| "production accessibility provider did not find fixture".to_string())?;
+        let second_window = discovered_targets
+            .iter()
+            .find(|candidate| {
+                target_is_fixture(candidate)
+                    && candidate.application_id == target.application_id
+                    && candidate.window_id != target.window_id
+            })
+            .cloned()
+            .ok_or_else(|| "fixture did not expose a second same-application window".to_string())?;
+        state.stop_session(&discovery.session_id)?;
+        let session = state.start_session_with_options(
+            "auto",
+            allowed_applications(pid),
+            900_000,
+            SessionGrantOptions {
+                allowed_windows: vec![target.window_id.clone()],
+                allow_screenshots: true,
+                allow_keyboard_input: true,
+                allow_clipboard_read: false,
+                approval_policy: Some(ApprovalPolicy::PerAction),
+                ..SessionGrantOptions::default()
+            },
+        )?;
+        let scoped_targets = state.list_targets_for_session(&session.session_id)?;
+        if scoped_targets.len() != 1 || scoped_targets[0].window_id != target.window_id {
+            return Err("window-scoped grant exposed more than its discovered target".to_string());
+        }
+        let second_window_rejected = state
+            .inspect_for_session(
+                &session.session_id,
+                &second_window.application_id,
+                Some(&second_window.window_id),
+                None,
+            )
+            .is_err();
+        if !second_window_rejected {
+            return Err(
+                "window-scoped grant accepted a second same-application window".to_string(),
+            );
+        }
         let first = inspect(&state, &session.session_id, &target)?;
         let secure = first.sensitive_element_count > 0;
         let disabled = first
@@ -410,7 +468,7 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
         stop(&mut child);
         child = launch(fixture)?;
         std::env::set_var("COMPUTER_USE_FIXTURE_PID", child.id().to_string());
-        let restarted = state.start_session_with_options(
+        let restart_discovery = state.start_session_with_options(
             "auto",
             allowed_applications(child.id()),
             900_000,
@@ -422,10 +480,23 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
             },
         )?;
         let persisted_target = state
-            .list_targets_for_session(&restarted.session_id)?
+            .list_targets_for_session(&restart_discovery.session_id)?
             .into_iter()
-            .find(|target| target_is_fixture(target))
+            .find(target_is_primary_fixture)
             .ok_or_else(|| "restarted fixture was not discoverable".to_string())?;
+        state.stop_session(&restart_discovery.session_id)?;
+        let restarted = state.start_session_with_options(
+            "auto",
+            allowed_applications(child.id()),
+            900_000,
+            SessionGrantOptions {
+                allowed_windows: vec![persisted_target.window_id.clone()],
+                allow_screenshots: true,
+                allow_keyboard_input: true,
+                approval_policy: Some(ApprovalPolicy::ApprovedBatch),
+                ..SessionGrantOptions::default()
+            },
+        )?;
         let persisted =
             inspect_until_dark_state(&state, &restarted.session_id, &persisted_target, true)?;
         let profile_persisted = find_profile_element(&persisted)
@@ -457,9 +528,9 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
                 "native_desktop_actions_executed": true,
                 "driver": {"kind": "little-monkey-production-backend", "pid": pid, "window_id": target.window_id, "provider": provider_name()},
                 "actions": ["list_targets", "inspect", "semantic_toggle", "semantic_set_value", "semantic_invoke_save", "dynamic_control", "screenshot", "restart", "persisted_state"],
-                "negative_cases": {"secure_field_detected_and_not_typed": secure, "disabled_control_not_mutated": disabled, "prompt_injection_widened_grant": false},
+                "negative_cases": {"secure_field_detected_and_not_typed": secure, "disabled_control_not_mutated": disabled, "second_same_app_window_rejected": second_window_rejected, "prompt_injection_widened_grant": false},
                 "postconditions": {"dark_mode": dark_persisted, "profile": profile_persisted, "saved": saved, "screenshot_artifact_id": digest(&screenshot_bytes), "redacted_audit_id": "production-audit-verified"},
-                "grant": {"application": target.application_id, "window_scoped": true, "approval": "operator-controlled"},
+                "grant": {"application": target.application_id, "window_id": target.window_id, "window_scoped": session.allowed_windows == vec![target.window_id.clone()], "approval": "test-approved-through-real-gate"},
             }),
         )?;
         Ok(())

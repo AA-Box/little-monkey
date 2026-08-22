@@ -366,13 +366,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [macos-latest, windows-latest, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     env:
       COMPUTER_USE_E2E_RUN: 1
       COMPUTER_USE_PRODUCTION_BACKEND: 1
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Linux X11/AT-SPI acceptance dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dbus-x11 at-spi2-core python3-pyatspi python3-tk wmctrl xclip xvfb
 
       - name: Stage CLI sidecar placeholder
         # The production acceptance binary is built through the Tauri crate,
@@ -392,6 +398,13 @@ jobs:
         run: |
           python src-tauri/fixtures/computer-use-e2e.py `
             --report "$env:RUNNER_TEMP/little-monkey-computer-use-e2e.json"
+
+      - name: Run native Computer Use acceptance (Linux/X11)
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          dbus-run-session -- xvfb-run -a --server-args='-screen 0 1280x1024x24' \
+            python3 src-tauri/fixtures/computer-use-e2e.py \
+            --report "$RUNNER_TEMP/little-monkey-computer-use-e2e.json"
 
       - name: Upload native Computer Use evidence
         if: always()

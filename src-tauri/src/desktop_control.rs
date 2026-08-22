@@ -50,6 +50,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write as _};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -65,6 +66,72 @@ use uuid::Uuid;
 /// indefinite" posture for the same reason: an unattended session left open
 /// for hours is its own risk even with every other gate in place.
 pub const MAX_SESSION_LIFETIME_MS: u64 = 30 * 60 * 1_000;
+
+const DEFAULT_COMPUTER_USE_MAX_ACTIONS: u64 = 50;
+const DEFAULT_COMPUTER_USE_MAX_SCREENSHOTS: u64 = 12;
+const DEFAULT_COMPUTER_USE_MAX_RETRIES: u64 = 5;
+const DEFAULT_COMPUTER_USE_MAX_MODEL_CALLS: u64 = 20;
+const DEFAULT_COMPUTER_USE_DEADLINE_MS: u64 = 15 * 60 * 1_000;
+
+/// Shared, atomic limits for one native Computer Use run. The frontend owns
+/// model-call/retry charging; this same object owns the host-side action and
+/// screenshot counters so concurrent dispatcher paths cannot overspend them.
+#[derive(Debug)]
+pub struct ComputerUseRunBudget {
+    pub max_actions: u64,
+    pub max_screenshots: u64,
+    pub max_retries: u64,
+    pub max_model_calls: u64,
+    pub deadline_ms: u64,
+    started_at: std::time::Instant,
+    actions: AtomicU64,
+    screenshots: AtomicU64,
+}
+
+impl Default for ComputerUseRunBudget {
+    fn default() -> Self {
+        Self {
+            max_actions: DEFAULT_COMPUTER_USE_MAX_ACTIONS,
+            max_screenshots: DEFAULT_COMPUTER_USE_MAX_SCREENSHOTS,
+            max_retries: DEFAULT_COMPUTER_USE_MAX_RETRIES,
+            max_model_calls: DEFAULT_COMPUTER_USE_MAX_MODEL_CALLS,
+            deadline_ms: DEFAULT_COMPUTER_USE_DEADLINE_MS,
+            started_at: std::time::Instant::now(),
+            actions: AtomicU64::new(0),
+            screenshots: AtomicU64::new(0),
+        }
+    }
+}
+
+impl ComputerUseRunBudget {
+    fn consume(&self, counter: &str) -> Result<(), String> {
+        if self.started_at.elapsed() >= Duration::from_millis(self.deadline_ms) {
+            return Err("COMPUTER_USE_BUDGET_EXCEEDED: run deadline reached".to_string());
+        }
+        let (used, limit) = match counter {
+            "actions" => (&self.actions, self.max_actions),
+            "screenshots" => (&self.screenshots, self.max_screenshots),
+            _ => return Err(format!("unknown Computer Use budget counter {counter}")),
+        };
+        let mut current = used.load(Ordering::Relaxed);
+        loop {
+            if current >= limit {
+                return Err(format!(
+                    "COMPUTER_USE_BUDGET_EXCEEDED: {counter} limit reached"
+                ));
+            }
+            match used.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
 
 /// A held cross-process desktop-control lock is considered stale — and may be
 /// reclaimed — once it is older than this bound, even if its owner pid still
@@ -1029,10 +1096,32 @@ fn checked_target(
     if target_is_sensitive(&target) {
         return Err("Sensitive application/window targets are blocked".to_string());
     }
+    #[cfg(target_os = "windows")]
+    verify_windows_target_integrity(&target.window_id)?;
     if require_frontmost && !target.focused {
         return Err("Target is not frontmost; focus it and retry".to_string());
     }
     Ok(target)
+}
+
+#[cfg(target_os = "windows")]
+fn verify_windows_target_integrity(window_id: &str) -> Result<(), String> {
+    let bytes = run_native_command_with_env(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_SECURITY_SCRIPT,
+        ],
+        &[("LM_WINDOW_HANDLE", window_id.to_string())],
+    )?;
+    let result: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Windows integrity check returned invalid data: {error}"))?;
+    if result.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("Windows target integrity or per-monitor DPI check failed closed".to_string());
+    }
+    Ok(())
 }
 
 fn bounded_elements(
@@ -1438,10 +1527,54 @@ JSON.stringify({targets,elements});
 "#;
 
 #[cfg(target_os = "windows")]
+const WINDOWS_SECURITY_SCRIPT: &str = r#"
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class LMComputerUseSecurity {
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+  [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+  [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hWnd);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentProcessId();
+  [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+  [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
+  [DllImport("advapi32.dll", SetLastError=true)] public static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+  [DllImport("advapi32.dll", SetLastError=true)] public static extern bool GetTokenInformation(IntPtr token, int kind, IntPtr data, uint length, out uint returned);
+  public static int Integrity(uint pid) {
+    var process=OpenProcess(0x1000, false, pid); if(process==IntPtr.Zero) return -1;
+    IntPtr token; if(!OpenProcessToken(process, 0x0008, out token)){CloseHandle(process);return -1;}
+    uint length; GetTokenInformation(token, 25, IntPtr.Zero, 0, out length);
+    var buffer=Marshal.AllocHGlobal((int)length); int level=-1;
+    if(GetTokenInformation(token, 25, buffer, length, out length)) {
+      var sid=Marshal.ReadIntPtr(buffer); var count=Marshal.ReadByte(sid, 1);
+      level=Marshal.ReadInt32(sid, 8 + 4 * (count - 1));
+    }
+    Marshal.FreeHGlobal(buffer); CloseHandle(token); CloseHandle(process); return level;
+  }
+  public static int TargetIntegrity(IntPtr hwnd) { uint pid; GetWindowThreadProcessId(hwnd, out pid); return Integrity(pid); }
+}
+'@
+$handle=[IntPtr]::new([int64]$env:LM_WINDOW_HANDLE)
+[LMComputerUseSecurity]::SetThreadDpiAwarenessContext([IntPtr]::new(-4)) | Out-Null
+$target=[LMComputerUseSecurity]::TargetIntegrity($handle)
+$current=[LMComputerUseSecurity]::Integrity([LMComputerUseSecurity]::GetCurrentProcessId())
+$dpi=[LMComputerUseSecurity]::GetDpiForWindow($handle)
+if($target -lt 0 -or $current -lt 0 -or $dpi -le 0){throw 'Could not determine Windows target integrity or per-monitor DPI'}
+if($target -gt $current){throw "Refusing higher-integrity target ($target > $current)"}
+[ordered]@{ok=$true;target_integrity=$target;current_integrity=$current;dpi=$dpi}|ConvertTo-Json -Compress
+"#;
+
+#[cfg(target_os = "windows")]
 const WINDOWS_UIA_SCRIPT: &str = r#"
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class LMComputerUseDpi { [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context); }
+'@
+[LMComputerUseDpi]::SetThreadDpiAwarenessContext([IntPtr]::new(-4)) | Out-Null
 $root=[System.Windows.Automation.AutomationElement]::RootElement
 $targets=@();$elements=@{}
 $windows=$root.FindAll([System.Windows.Automation.TreeScope]::Children,[System.Windows.Automation.Condition]::TrueCondition)
@@ -1452,7 +1585,7 @@ $fixtureFallback=$false
 if($onlyPid){
   $windows=@($windows | Where-Object {$_.Current.ProcessId -eq $onlyPid})
   if($windows.Count -eq 0){
-    $windows=@($root.FindAll([System.Windows.Automation.TreeScope]::Children,[System.Windows.Automation.Condition]::TrueCondition) | Where-Object {$_.Current.Name -eq 'Little Monkey TestApp'})
+    $windows=@($root.FindAll([System.Windows.Automation.TreeScope]::Children,[System.Windows.Automation.Condition]::TrueCondition) | Where-Object {$_.Current.Name -like 'Little Monkey TestApp*'})
     $fixtureFallback=$windows.Count -gt 0
   }
 }
@@ -1477,6 +1610,11 @@ Add-Type -AssemblyName System.Drawing
 Add-Type @'
 using System; using System.Drawing; using System.Drawing.Imaging; using System.Windows.Forms;
 '@
+Add-Type @'
+using System; using System.Runtime.InteropServices;
+public static class LMComputerUseDpi { [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context); }
+'@
+[LMComputerUseDpi]::SetThreadDpiAwarenessContext([IntPtr]::new(-4)) | Out-Null
 $x=[int]$env:LM_SCREENSHOT_X;$y=[int]$env:LM_SCREENSHOT_Y;$w=[int]$env:LM_SCREENSHOT_W;$h=[int]$env:LM_SCREENSHOT_H
 $bmp=New-Object Drawing.Bitmap $w,$h;$g=[Drawing.Graphics]::FromImage($bmp);$g.CopyFromScreen($x,$y,0,0,$bmp.Size);$bmp.Save($env:LM_SCREENSHOT_PATH,[Drawing.Imaging.ImageFormat]::Png);$g.Dispose();$bmp.Dispose()
 "#;
@@ -1493,16 +1631,21 @@ def rect(o):
   b=o.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
   return {'x':b.x,'y':b.y,'width':b.width,'height':b.height}
  except Exception: return {'x':0,'y':0,'width':0,'height':0}
-def walk(node):
- for child in list(node):
-  yield child
-  yield from walk(child)
+def provider_part(node, path):
+ role = str(node.getRoleName() or '')
+ name = str(getattr(node, 'name', '') or '')
+ return (':'.join(str(index) for index in path) + ':' + role + ':' + name).replace(' ', '_')[:160]
+def walk(node, path=()):
+ for index, child in enumerate(list(node)):
+  child_path = path + (index,)
+  yield child, child_path
+  yield from walk(child, child_path)
 targets=[]; elements={}; desktop=pyatspi.Registry.getDesktop(0)
 for app in list(desktop)[:64]:
  name=str(getattr(app,'name','')); aid='atspi:'+name
  for wi,w in enumerate(list(app)[:32]):
   title=str(getattr(w,'name','')); tid=aid+'::window-'+str(wi); st=w.getState(); target={'targetId':tid,'applicationId':aid,'applicationName':name,'windowId':tid,'windowTitle':title,'bounds':rect(w),'focused':bool(st.contains(pyatspi.STATE_ACTIVE)),'sensitive':False,'supportedActions':['inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot']};targets.append(target); out=[]
-  for ei,e in enumerate(list(walk(w))[:256]):
+  for ei,(e,path) in enumerate(list(walk(w))[:256]):
    role=str(e.getRoleName()); label=str(getattr(e,'name','')); value=None
    try: value=str(e.queryValue().getCurrentValue())
    except Exception: pass
@@ -1515,8 +1658,8 @@ for app in list(desktop)[:64]:
    except Exception: pass
    try: e.queryEditableText(); actions.append('set_value')
    except Exception: pass
-   stable=(role+'-'+label).replace(' ','_')
-   out.append({'id':tid+'::element-'+str(ei)+'::native-'+stable[:80],'role':role,'label':label,'value':value,'bounds':rect(e),'enabled':True,'focused':False,'actions':list(dict.fromkeys(actions)),'sensitive':any(token in (role+' '+label).lower() for token in ('password','secure','credential','authentication'))})
+   stable=provider_part(e,path)
+   out.append({'id':tid+'::element-'+str(ei)+'::native-'+stable,'role':role,'label':label,'value':value,'bounds':rect(e),'enabled':True,'focused':False,'actions':list(dict.fromkeys(actions)),'sensitive':any(token in (role+' '+label).lower() for token in ('password','secure','credential','authentication'))})
   elements[tid]=out
 print(json.dumps({'targets':targets,'elements':elements},separators=(',',':')))
 "#;
@@ -1532,11 +1675,20 @@ const text = (...fs) => { for (const f of fs) { const value = safe(f, ''); if (v
 const appId = get('LM_APP_ID');
 const windowIndex = Number(get('LM_WINDOW_INDEX'));
 const elementIndex = Number(get('LM_ELEMENT_INDEX'));
+const stable = get('LM_ELEMENT_STABLE');
 const action = get('LM_ACTION');
 const value = get('LM_VALUE');
 const process = /^(com|org|net|io)\./.test(appId) ? se.processes.byBundleIdentifier(appId) : se.processes.byName(appId);
 const window = process.windows[windowIndex];
-const element = window.entireContents()[elementIndex];
+const contents = window.entireContents();
+let element = null;
+if (stable) {
+  element = contents.find(e => String(safe(() => e.attribute('AXIdentifier'), '')).replace(/[^A-Za-z0-9._-]/g, '_') === stable) || null;
+  if (!element) throw new Error('macOS Accessibility element is stale');
+} else {
+  element = contents[elementIndex];
+}
+if (!element) throw new Error('macOS Accessibility element is stale');
 if (action === 'set_value') element.value = value;
 else if (action === 'select') { try { element.performAction('AXPress'); } catch (_) { element.click(); } }
 else if (action === 'click') { try { element.performAction('AXPress'); } catch (_) { element.click(); } }
@@ -1561,6 +1713,11 @@ JSON.stringify({focused:Boolean(process.frontmost())});
 const WINDOWS_UIA_ACTION_SCRIPT: &str = r#"
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+Add-Type @'
+using System; using System.Runtime.InteropServices;
+public static class LMComputerUseDpi { [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context); }
+'@
+[LMComputerUseDpi]::SetThreadDpiAwarenessContext([IntPtr]::new(-4)) | Out-Null
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
@@ -1667,16 +1824,29 @@ if($performed) { [ordered]@{semantic=$true}|ConvertTo-Json -Compress } else { [o
 const LINUX_ATSPI_ACTION_SCRIPT: &str = r#"
 import os, json
 import pyatspi
-def walk(node):
- for child in list(node):
-  yield child
-  yield from walk(child)
-app_name=os.environ['LM_APP_NAME']; wi=int(os.environ['LM_WINDOW_INDEX']); ei=int(os.environ['LM_ELEMENT_INDEX'])
+def provider_part(node, path):
+ role=str(node.getRoleName() or '')
+ name=str(getattr(node, 'name', '') or '')
+ return (':'.join(str(index) for index in path)+':'+role+':'+name).replace(' ','_')[:160]
+def walk(node, path=()):
+ for index, child in enumerate(list(node)):
+  child_path=path+(index,)
+  yield child, child_path
+  yield from walk(child, child_path)
+app_name=os.environ['LM_APP_NAME']; wi=int(os.environ['LM_WINDOW_INDEX']); ei=int(os.environ['LM_ELEMENT_INDEX']); stable=os.environ.get('LM_ELEMENT_STABLE','')
 a=None
 for candidate in list(pyatspi.Registry.getDesktop(0)):
  if str(getattr(candidate,'name','')) == app_name: a=candidate; break
 if a is None: raise SystemExit('AT-SPI application is stale')
-w=list(a)[wi]; e=list(walk(w))[ei]; action=os.environ['LM_ACTION']
+w=list(a)[wi]; entries=list(walk(w)); e=None
+if stable:
+ for candidate,path in entries:
+  if provider_part(candidate,path)==stable: e=candidate; break
+ if e is None: raise SystemExit('AT-SPI element is stale')
+else:
+ e=entries[ei][0]
+if e is None: raise SystemExit('AT-SPI element is stale')
+action=os.environ['LM_ACTION']
 if action in ('click','double_click','select'):
  actions=e.queryAction(); done=False
  for i in range(actions.nActions):
@@ -1701,7 +1871,7 @@ fn element_index(element_id: &str) -> Result<usize, String> {
         .ok_or_else(|| "Accessibility element id has no stable provider index".to_string())
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn element_native_stable(element_id: &str) -> Option<&str> {
     element_id
         .rsplit_once("::native-")
@@ -1732,6 +1902,18 @@ fn native_semantic_action(
                 ("LM_APP_ID", target.application_id.clone()),
                 ("LM_WINDOW_INDEX", window_index.to_string()),
                 ("LM_ELEMENT_INDEX", element_index.to_string()),
+                (
+                    "LM_ELEMENT_STABLE",
+                    element_native_stable(element_id)
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+                (
+                    "LM_ELEMENT_STABLE",
+                    element_native_stable(element_id)
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
                 ("LM_ACTION", action.to_string()),
                 ("LM_VALUE", value.unwrap_or_default().to_string()),
             ],
@@ -1834,13 +2016,14 @@ pub struct ControlSession {
     pub allow_clipboard_read: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct SessionGrantOptions {
     pub allowed_windows: Vec<String>,
     pub allow_screenshots: bool,
     pub allow_keyboard_input: bool,
     pub allow_clipboard_read: bool,
     pub approval_policy: Option<ApprovalPolicy>,
+    pub budget: Option<ComputerUseRunBudget>,
 }
 
 impl SessionGrantOptions {
@@ -2199,6 +2382,7 @@ pub struct DesktopControlState {
     backend: Arc<dyn DesktopInputBackend>,
     semantic: Arc<dyn DesktopSemanticBackend>,
     sessions: Mutex<BTreeMap<String, ControlSession>>,
+    budgets: Mutex<HashMap<String, Arc<ComputerUseRunBudget>>>,
     pending: Mutex<HashMap<String, PendingControlAction>>,
     audit: Mutex<Vec<ComputerAuditRecord>>,
     /// Path of the machine-wide exclusive lock this state must hold while any
@@ -2248,6 +2432,7 @@ impl DesktopControlState {
             backend,
             semantic,
             sessions: Mutex::new(BTreeMap::new()),
+            budgets: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             audit: Mutex::new(Vec::new()),
             lock_path,
@@ -2436,6 +2621,8 @@ impl DesktopControlState {
             allow_keyboard_input: options.allow_keyboard_input,
             allow_clipboard_read: options.allow_clipboard_read,
         };
+        let budget = Arc::new(options.budget.unwrap_or_default());
+        lock(&self.budgets, "Computer Use run budgets")?.insert(session.session_id.clone(), budget);
         lock(&self.sessions, "control sessions")?
             .insert(session.session_id.clone(), session.clone());
         Ok(session)
@@ -2454,6 +2641,7 @@ impl DesktopControlState {
             })
             .unwrap_or(false);
         self.deny_pending_for_session(session_id)?;
+        lock(&self.budgets, "Computer Use run budgets")?.remove(session_id);
         self.release_lock_if_idle()?;
         Ok(was_active)
     }
@@ -2520,6 +2708,13 @@ impl DesktopControlState {
         Ok(session.clone())
     }
 
+    fn budget_for(&self, session_id: &str) -> Result<Arc<ComputerUseRunBudget>, String> {
+        lock(&self.budgets, "Computer Use run budgets")?
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| "Computer Use run budget is missing or was stopped".to_string())
+    }
+
     pub fn list_targets_for_session(
         &self,
         session_id: &str,
@@ -2570,6 +2765,7 @@ impl DesktopControlState {
         if !session.allow_screenshots {
             return Err("This session grant does not allow screenshots".to_string());
         }
+        self.budget_for(session_id)?.consume("screenshots")?;
         let (_, target) = self.require_active_session_for_target(
             session_id,
             target_application_id,
@@ -2991,6 +3187,7 @@ impl DesktopControlState {
             target_window_id,
             Self::action_requires_frontmost(action),
         )?;
+        self.budget_for(session_id)?.consume("actions")?;
         Self::validate_action(&session, &target, action)?;
         if self.action_targets_sensitive_focus(target_application_id, target_window_id, action)? {
             return Err(
@@ -3535,6 +3732,7 @@ impl DesktopControlState {
             }
             count
         };
+        lock(&self.budgets, "Computer Use run budgets")?.clear();
         // Every session is now inactive, so the machine-wide lock is released
         // unconditionally — this is the app-exit / kill-switch / revoke path.
         self.release_lock_if_idle()?;
@@ -3592,6 +3790,7 @@ pub fn desktop_control_start_session(
             } else {
                 ApprovalPolicy::PerAction
             })),
+            budget: None,
         },
     )?;
     // The visible, always-on-top overlay is part of the safety invariant. Do
@@ -4238,6 +4437,7 @@ mod tests {
                     allow_keyboard_input: false,
                     allow_clipboard_read: false,
                     approval_policy: Some(ApprovalPolicy::PerAction),
+                    budget: None,
                 },
             )
             .unwrap();
@@ -4245,6 +4445,19 @@ mod tests {
         assert!(!session.allow_screenshots);
         assert!(!session.allow_keyboard_input);
         assert_eq!(session.approval_policy, ApprovalPolicy::PerAction);
+    }
+
+    #[test]
+    fn run_budget_atomically_bounds_actions_and_screenshots() {
+        let budget = ComputerUseRunBudget {
+            max_actions: 1,
+            max_screenshots: 1,
+            ..ComputerUseRunBudget::default()
+        };
+        assert!(budget.consume("actions").is_ok());
+        assert!(budget.consume("actions").is_err());
+        assert!(budget.consume("screenshots").is_ok());
+        assert!(budget.consume("screenshots").is_err());
     }
 
     #[test]

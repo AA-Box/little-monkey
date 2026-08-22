@@ -101,4 +101,17 @@ $save.Add_Click({
 })
 
 $form.Controls.AddRange(@($title, $profileLabel, $profile, $save, $status, $dark, $disabled, $dynamic, $destructive, $passwordLabel, $password))
+$secondary = New-Object System.Windows.Forms.Form
+$secondary.Text = 'Little Monkey TestApp Secondary'
+$secondary.ClientSize = New-Object System.Drawing.Size(320, 180)
+$secondary.StartPosition = 'Manual'
+$secondary.Location = New-Object System.Drawing.Point(700, 120)
+$secondaryLabel = New-Object System.Windows.Forms.Label
+$secondaryLabel.Text = 'Little Monkey TestApp Secondary'
+$secondaryLabel.AccessibleName = 'Little Monkey TestApp Secondary'
+$secondaryLabel.Dock = 'Fill'
+$secondaryLabel.TextAlign = 'MiddleCenter'
+$secondary.Controls.Add($secondaryLabel)
+$secondary.Show()
+$form.Activate()
 [System.Windows.Forms.Application]::Run($form)

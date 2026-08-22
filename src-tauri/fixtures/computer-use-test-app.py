@@ -77,6 +77,18 @@ class TestApp:
             ttk.Label(self.list_frame, text=f"List item {index}").pack(anchor="w", padx=10, pady=2)
 
         self.root.after(100, self.apply_theme)
+        self.root.after(250, self.open_secondary_window)
+
+    def open_secondary_window(self) -> None:
+        self.secondary = tk.Toplevel(self.root)
+        self.secondary.title("Little Monkey TestApp Secondary")
+        self.secondary.geometry("320x180+700+120")
+        ttk.Label(
+            self.secondary,
+            text="Little Monkey TestApp Secondary",
+            padding=24,
+        ).pack(fill="both", expand=True)
+        self.root.focus_force()
 
     def load_profile(self) -> None:
         try:

@@ -13,6 +13,69 @@ export interface CoordinationHooks<T> {
   onPhase?: (phase: CoordinationPhase, attempt: number) => void | Promise<void>;
   execute: (attempt: number) => T | Promise<T>;
   verify?: (result: T, attempt: number) => boolean | Promise<boolean>;
+  budget?: ComputerUseRunBudget;
+}
+
+export const COMPUTER_USE_BUDGET_DEFAULTS = {
+  maxActions: 50,
+  maxScreenshots: 12,
+  maxRetries: 5,
+  maxModelCalls: 20,
+  deadlineMs: 15 * 60 * 1000,
+} as const;
+
+export interface ComputerUseRunBudgetOptions {
+  maxActions?: number;
+  maxScreenshots?: number;
+  maxRetries?: number;
+  maxModelCalls?: number;
+  deadlineMs?: number;
+}
+
+export type ComputerUseBudgetCounter = 'actions' | 'screenshots' | 'retries' | 'model_calls';
+
+/** One atomic budget shared by every Computer Use dispatcher in a run. */
+export class ComputerUseRunBudget {
+  private readonly limits: Record<ComputerUseBudgetCounter, number>;
+  private readonly used: Record<ComputerUseBudgetCounter, number> = {
+    actions: 0,
+    screenshots: 0,
+    retries: 0,
+    model_calls: 0,
+  };
+  private readonly deadline: number;
+
+  constructor(options: ComputerUseRunBudgetOptions = {}) {
+    const configured = { ...COMPUTER_USE_BUDGET_DEFAULTS, ...options };
+    this.limits = {
+      actions: configured.maxActions,
+      screenshots: configured.maxScreenshots,
+      retries: configured.maxRetries,
+      model_calls: configured.maxModelCalls,
+    };
+    this.deadline = Date.now() + configured.deadlineMs;
+  }
+
+  consume(counter: ComputerUseBudgetCounter): boolean {
+    if (Date.now() >= this.deadline || this.used[counter] >= this.limits[counter]) return false;
+    this.used[counter] += 1;
+    return true;
+  }
+
+  remaining(counter: ComputerUseBudgetCounter): number {
+    return Math.max(0, this.limits[counter] - this.used[counter]);
+  }
+}
+
+export const INPUT_SENT_UNVERIFIED = 'INPUT_SENT_UNVERIFIED';
+
+export class CoordinatedInvocationError extends Error {
+  readonly code = INPUT_SENT_UNVERIFIED;
+
+  constructor() {
+    super(`${INPUT_SENT_UNVERIFIED}: input was sent but the requested postcondition was not verified`);
+    this.name = 'CoordinatedInvocationError';
+  }
 }
 
 const NATIVE_PREFIX = 'computer_';
@@ -86,6 +149,9 @@ export async function runCoordinatedInvocation<T>(
   const attempts = Math.max(1, Math.min(decision.maxAttempts, 2));
   let result!: T;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    if (attempt > 1 && hooks.budget && !hooks.budget.consume('retries')) {
+      throw new Error('COMPUTER_USE_BUDGET_EXCEEDED: retry limit reached');
+    }
     for (const phase of decision.phases) {
       if (phase === 'execute') {
         result = await hooks.execute(attempt);
@@ -93,7 +159,7 @@ export async function runCoordinatedInvocation<T>(
         await hooks.onPhase?.(phase, attempt);
       }
     }
-    if (!hooks.verify || await hooks.verify(result, attempt) || attempt === attempts) return result;
+    if (!hooks.verify || await hooks.verify(result, attempt)) return result;
   }
-  return result;
+  throw new CoordinatedInvocationError();
 }

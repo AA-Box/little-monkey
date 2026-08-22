@@ -568,6 +568,7 @@ impl DesktopControlRuntime {
                     allow_keyboard_input,
                     allow_clipboard_read,
                     approval_policy: Some(approval_policy),
+                    budget: None,
                 },
             )
             .map_err(|error| (409, error))?;

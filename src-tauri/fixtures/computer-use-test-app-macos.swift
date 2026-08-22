@@ -3,6 +3,7 @@ import Foundation
 
 final class TestAppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
+    private var secondaryWindow: NSWindow!
     private var darkMode: NSButton!
     private var profileName: NSTextField!
     private var status: NSTextField!
@@ -85,6 +86,15 @@ final class TestAppDelegate: NSObject, NSApplicationDelegate {
         window.contentView = content
         window.center()
         window.makeKeyAndOrderFront(nil)
+        secondaryWindow = NSWindow(
+            contentRect: NSRect(x: 700, y: 500, width: 320, height: 180),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        secondaryWindow.title = "Little Monkey TestApp Secondary"
+        secondaryWindow.contentView = NSTextField(labelWithString: "Little Monkey TestApp Secondary")
+        secondaryWindow.orderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         applyTheme()
     }

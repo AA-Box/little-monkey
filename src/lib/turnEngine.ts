@@ -51,7 +51,7 @@ import { protocolToolCallId } from './durableRun';
 import { formatSkillSearchResults, formatSkillToolResult, type SkillRankingSignals, type SlashSkill } from './skills';
 import { rasterizeSvgToPng, type RasterizedPng } from './imageGeneration';
 import { errorMessage } from "./errors";
-import { coordinateToolInvocation, runCoordinatedInvocation } from './taskCoordinator';
+import { ComputerUseRunBudget, coordinateToolInvocation, runCoordinatedInvocation } from './taskCoordinator';
 import {
   formatProgrammaticExecutionResult,
   PROGRAMMATIC_TOOL_NAME,
@@ -66,6 +66,8 @@ export interface ToolExecutionContext {
   isToolAvailable?: (toolName: string) => boolean;
   /** Shared completion lifecycle for direct and nested calls. */
   onCompleted?: (toolCall: ToolCall, result: string) => void | Promise<void>;
+  /** Shared run-wide native Computer Use counters and deadline. */
+  computerUseBudget?: ComputerUseRunBudget;
 }
 
 /** The canonical execution identity shared by run_program and its recorder. */
@@ -1264,6 +1266,7 @@ async function executeToolCallInner(
     ? await extensionInvocationId(turnId, toolCall.id, extensionBinding)
     : undefined;
   return runCoordinatedInvocation(coordination, {
+    budget: executionContext?.computerUseBudget,
     onPhase: async (phase) => {
       if (coordination.route !== 'native') return;
       if (phase === 'authorize' && typeof args.session_id !== 'string') {
@@ -1312,6 +1315,12 @@ async function executeToolCallInner(
       }
     },
     execute: () => {
+      if (coordination.route === 'native' && executionContext?.computerUseBudget) {
+        const counter = name === 'computer_screenshot' ? 'screenshots' : 'actions';
+        if (!executionContext.computerUseBudget.consume(counter)) {
+          return JSON.stringify({ error: 'COMPUTER_USE_BUDGET_EXCEEDED', counter });
+        }
+      }
       const invocation = name.startsWith('mcp__')
         ? invokeMcpTool(name, args, turnId, protocolToolCallId(toolCall.id), mcpRegistry)
         : name.startsWith('ext__')

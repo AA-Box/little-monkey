@@ -50,6 +50,7 @@ import { useUserHooksStore } from "../store/userHooksStore";
 import { usePermissionStore } from "../store/permissionStore";
 import { DurableRunRecorder } from "./durableRun";
 import type { RunEventWire } from "./runProtocol";
+import { ComputerUseRunBudget } from "./taskCoordinator";
 
 const emptyMcpRegistry: McpToolRegistry = new Map();
 
@@ -250,6 +251,45 @@ describe("executeToolCall / programmatic dispatcher integration", () => {
     expect(JSON.parse(result).error).toContain("Invalid arguments for \"read_file\"");
     expect(invokeMock).not.toHaveBeenCalled();
     expect(completed).toHaveBeenCalledOnce();
+  });
+
+  it("runs a native call through the model-facing observe/authorize/execute/verify dispatcher", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "tool_computer_list_targets") return JSON.stringify({ targets: [{ window_id: "w-1" }] });
+      if (command === "tool_computer_inspect") return JSON.stringify({ elements: [] });
+      if (command === "tool_computer_click") return JSON.stringify({ executed: true, stateVerified: true });
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const result = await executeToolCall(
+      call("computer_click", {
+        session_id: "desktop-session",
+        target_application_id: "Notes",
+        target_window_id: "w-1",
+        element_id: "Notes::element-1::native-button",
+      }),
+      null,
+      "turn-native",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { computerUseBudget: new ComputerUseRunBudget() },
+    );
+
+    expect(JSON.parse(result)).toMatchObject({ executed: true, stateVerified: true });
+    expect(invokeMock.mock.calls.map(([command]) => command)).toEqual([
+      "tool_computer_list_targets",
+      "tool_computer_click",
+      "tool_computer_inspect",
+    ]);
   });
 });
 
