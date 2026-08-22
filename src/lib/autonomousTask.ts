@@ -123,6 +123,9 @@ export interface TaskWorker {
   executionPlacement?: TaskExecutionPlacement;
   worktree?: { id: string; path: string; branch: string; baseRevision: string; diffDigest: string };
   changedFiles?: string[];
+  mutation?: { beforeRevision: string; afterRevision: string; changedFiles: string[]; patchDigest: string };
+  artifacts?: TaskArtifact[];
+  resultSummary?: string;
   usage?: Partial<TaskUsage>;
 }
 
@@ -303,6 +306,8 @@ export function validateTaskPlan(plan: TaskPlan, context?: TaskPlanningContext):
     if (current.mutationScope.some((scope) => scope.includes("..") || scope.startsWith("/"))) errors.push(`${current.nodeId} mutation scope may not escape the workspace`);
     if (current.executionPlacement && current.executionPlacement.nodeId !== current.nodeId) errors.push(`${current.nodeId} placement must identify the same node`);
     if (current.capabilities?.some((capability) => !["read", "mutate", "verify", "network", "git", "delegate"].includes(capability))) errors.push(`${current.nodeId} requests an unknown capability`);
+    if (["investigation", "verification", "review"].includes(current.taskClass) && current.capabilities?.includes("mutate")) errors.push(`${current.nodeId} non-mutating nodes may not request mutate`);
+    if (["investigation", "verification", "review"].includes(current.taskClass) && current.isolation !== "shared") errors.push(`${current.nodeId} non-mutating nodes must use shared isolation`);
     if (current.executionRequirements?.needsWorkspaceWrite && !current.capabilities?.includes("mutate")) errors.push(`${current.nodeId} requires workspace write capability but does not request mutate`);
     if (current.executionRequirements?.needsNetwork && !current.capabilities?.includes("network")) errors.push(`${current.nodeId} requires network capability but does not request network`);
     if (current.executionRequirements?.isolation !== current.isolation) errors.push(`${current.nodeId} execution requirements and node isolation disagree`);

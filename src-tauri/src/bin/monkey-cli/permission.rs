@@ -124,6 +124,10 @@ pub struct TerminalPermissions {
     allow_network: bool,
     allow_external_mutations: bool,
     channel_send: Option<little_monkey_lib::run_protocol::ChannelSendPolicy>,
+    /// When set, this is the exact tool surface frozen for the current
+    /// autonomous node. It is checked both when tools are offered and at the
+    /// dispatch boundary so a hallucinated tool cannot widen a node's grant.
+    tool_allowlist: Option<HashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -145,6 +149,7 @@ impl TerminalPermissions {
             allow_network: true,
             allow_external_mutations: false,
             channel_send: None,
+            tool_allowlist: None,
         }
     }
 
@@ -163,6 +168,7 @@ impl TerminalPermissions {
             allow_network: self.allow_network,
             allow_external_mutations: self.allow_external_mutations,
             channel_send: self.channel_send.clone(),
+            tool_allowlist: self.tool_allowlist.clone(),
         }
     }
 
@@ -186,11 +192,30 @@ impl TerminalPermissions {
             allow_network: true,
             allow_external_mutations: false,
             channel_send: None,
+            tool_allowlist: None,
         }
     }
 
     pub fn set_allow_network(&mut self, allow: bool) {
         self.allow_network = allow;
+    }
+
+    pub fn set_tool_allowlist<I, S>(&mut self, tools: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tool_allowlist = Some(tools.into_iter().map(Into::into).collect());
+    }
+
+    pub fn clear_tool_allowlist(&mut self) {
+        self.tool_allowlist = None;
+    }
+
+    pub fn tool_allowed(&self, tool: &str) -> bool {
+        self.tool_allowlist
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(tool))
     }
 
     pub fn allow_network(&self) -> bool {
@@ -778,5 +803,17 @@ mod tests {
             }
             other => panic!("unexpected third event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn autonomous_tool_allowlist_is_inherited_by_workers_and_fails_closed() {
+        let mut permissions = TerminalPermissions::new(PermissionMode::Auto);
+        permissions.set_tool_allowlist(["read_file", "grep"]);
+        assert!(permissions.tool_allowed("read_file"));
+        assert!(!permissions.tool_allowed("write_file"));
+        assert!(!permissions.tool_allowed("mcp_docs_search"));
+        let worker = permissions.fork_for_parallel();
+        assert!(worker.tool_allowed("grep"));
+        assert!(!worker.tool_allowed("run_shell"));
     }
 }

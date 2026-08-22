@@ -100,6 +100,7 @@ pub struct PlacedJobState {
     pub terminal: bool,
     pub updated_at_ms: u64,
     pub last_error: Option<String>,
+    pub result: Option<serde_json::Value>,
 }
 
 /// Every model resident on this node: the managed hub's inventory plus whatever
@@ -3728,6 +3729,7 @@ impl RemoteApi {
                 last_error: Some(
                     "This node no longer retains the job row for this placement".to_string(),
                 ),
+                result: None,
             });
         Ok((
             200,
@@ -3740,6 +3742,7 @@ impl RemoteApi {
                 terminal: state.terminal,
                 updated_at_ms: state.updated_at_ms,
                 last_error: state.last_error,
+                result: state.result,
             })
             .map_err(internal)?,
             Some(record.submitted_run_id),
@@ -5228,6 +5231,7 @@ mod tests {
                 terminal: false,
                 updated_at_ms: 3_000,
                 last_error: Some(format!("state of {job_id}")),
+                result: None,
             }))
         }
     }

@@ -25,11 +25,11 @@ use little_monkey_lib::mcp::McpServerEntry;
 use little_monkey_lib::recipes::{self, DesktopTurnSnapshot, Recipe};
 use little_monkey_lib::run_ledger::RunLedger;
 use little_monkey_lib::run_protocol::{
-    CapabilityAssessment, CapabilityState, ClientIdentity, ClientKind, ModelCapabilitiesSnapshot,
-    ModelTargetSnapshot, PermissionDecision, PermissionMode as RunPermissionMode,
-    PermissionPolicySnapshot, RiskLevel, RootAccess, RootGrant, RunBudgets, RunEvent, RunKind,
-    RunSpec, RunStatus, ToolPermissionRule, ToolPolicyDecision, WorkspaceContext,
-    RUN_PROTOCOL_SCHEMA_VERSION,
+    ArtifactKind, CapabilityAssessment, CapabilityState, ClientIdentity, ClientKind,
+    ModelCapabilitiesSnapshot, ModelTargetSnapshot, PermissionDecision,
+    PermissionMode as RunPermissionMode, PermissionPolicySnapshot, RiskLevel, RootAccess,
+    RootGrant, RunBudgets, RunEvent, RunKind, RunSpec, RunStatus, ToolPermissionRule,
+    ToolPolicyDecision, WorkspaceContext, RUN_PROTOCOL_SCHEMA_VERSION,
 };
 use little_monkey_lib::run_scope::RunScope;
 use little_monkey_lib::workspace;
@@ -250,6 +250,21 @@ fn autonomous_patch_digest(path: &Path) -> Result<String, String> {
         }
     }
     Ok(sha256_hex(&material))
+}
+
+fn autonomous_patch_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    let path_arg = path.to_string_lossy().into_owned();
+    let output = Command::new("git")
+        .args(["-C", path_arg.as_str(), "diff", "--binary", "--"])
+        .output()
+        .map_err(|error| format!("could not collect autonomous patch: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not collect autonomous patch (git exited {})",
+            output.status
+        ));
+    }
+    Ok(output.stdout)
 }
 
 fn autonomous_repository_manifest(path: &Path) -> String {
@@ -1426,6 +1441,7 @@ async fn autonomous_phase(
     mcp_entries: &[McpServerEntry],
     attached_stacks: &[String],
     phase: &str,
+    capabilities: &[String],
     objective: &str,
     max_iterations: usize,
     workspace_root: &Path,
@@ -1457,6 +1473,23 @@ async fn autonomous_phase(
     phase_options.system = Some(format!(
         "You are executing the bounded '{phase}' phase of a durable autonomous task. The coordinator owns phase transitions and evidence."
     ));
+    let mut node_tools = HashSet::from(["read_file", "list_dir", "glob", "grep"]);
+    if capabilities.iter().any(|capability| capability == "mutate") {
+        node_tools.extend(["write_file", "edit_file", "run_shell", "remember"]);
+    }
+    if capabilities
+        .iter()
+        .any(|capability| capability == "network")
+    {
+        node_tools.extend(["web_fetch", "web_search"]);
+    }
+    if capabilities
+        .iter()
+        .any(|capability| capability == "delegate")
+    {
+        node_tools.insert("task");
+    }
+    perms.set_tool_allowlist(node_tools);
     let changed = crate::agent::run_turn_with_max_iterations(
         client,
         target,
@@ -1469,7 +1502,9 @@ async fn autonomous_phase(
         attached_stacks,
         Some(max_iterations),
     )
-    .await?;
+    .await;
+    perms.clear_tool_allowlist();
+    let changed = changed?;
     autonomous_task_event(
         recorder,
         &snapshot.task_id,
@@ -1602,6 +1637,27 @@ fn validate_autonomous_nodes(
                 node.node_id
             ));
         }
+        if matches!(
+            node.task_class.as_str(),
+            "investigation" | "verification" | "review"
+        ) {
+            if node
+                .capabilities
+                .iter()
+                .any(|capability| capability == "mutate")
+            {
+                return Err(format!(
+                    "autonomous node '{}' is non-mutating but requests the mutate capability",
+                    node.node_id
+                ));
+            }
+            if node.isolation != "shared" {
+                return Err(format!(
+                    "autonomous node '{}' is non-mutating but is not shared-isolated",
+                    node.node_id
+                ));
+            }
+        }
         if let Some(placement) = &node.execution_placement {
             let kind = placement
                 .get("kind")
@@ -1690,6 +1746,117 @@ fn validate_autonomous_node_capabilities(
         ));
     }
     Ok(())
+}
+
+fn schedule_autonomous_repair(
+    snapshot: &mut recipes::AutonomousTaskSnapshot,
+    nodes: &mut Vec<FrozenAutonomousNode>,
+    completed: &mut HashSet<String>,
+    failed_node: &FrozenAutonomousNode,
+    repair_rounds: &mut u32,
+    summary: &str,
+) -> Result<bool, String> {
+    if failed_node.task_class == "planner" || *repair_rounds >= snapshot.max_repair_rounds {
+        return Ok(false);
+    }
+    *repair_rounds = repair_rounds.saturating_add(1);
+    let base_id = format!("{}-repair-{}", failed_node.node_id, repair_rounds);
+    let mut repair_id = base_id.clone();
+    let mut suffix = 1u32;
+    while nodes.iter().any(|node| node.node_id == repair_id) {
+        repair_id = format!("{base_id}-{suffix}");
+        suffix = suffix.saturating_add(1);
+    }
+    let mut repair_dependencies = failed_node.dependencies.clone();
+    let mut retried = failed_node.clone();
+    if failed_node.task_class == "review" {
+        if let Some(verification) = nodes.iter_mut().find(|node| {
+            node.task_class == "verification"
+                && failed_node
+                    .dependencies
+                    .iter()
+                    .any(|dependency| dependency == &node.node_id)
+        }) {
+            repair_dependencies = verification.dependencies.clone();
+            verification.dependencies = vec![repair_id.clone()];
+            verification.status = "pending".to_string();
+            verification.mutation_revision = None;
+            completed.remove(&verification.node_id);
+        }
+    } else {
+        retried.dependencies = vec![repair_id.clone()];
+    }
+    retried.status = "pending".to_string();
+    retried.mutation_revision = None;
+    let repair_node = FrozenAutonomousNode {
+        node_id: repair_id.clone(),
+        task_class: "implementation".to_string(),
+        objective: format!(
+            "Diagnose and repair {} using bounded failure evidence: {}",
+            failed_node.node_id,
+            bounded_text(summary, 2_000)
+        ),
+        dependencies: repair_dependencies,
+        status: "pending".to_string(),
+        mutation_scope: if failed_node.mutation_scope.is_empty() {
+            vec!["workspace".to_string()]
+        } else {
+            failed_node.mutation_scope.clone()
+        },
+        isolation: "shared".to_string(),
+        relevant_files: failed_node.relevant_files.clone(),
+        capabilities: vec![
+            "read".to_string(),
+            "mutate".to_string(),
+            "verify".to_string(),
+        ],
+        execution_placement: None,
+        execution_requirements: Some(serde_json::json!({
+            "needsWorkspaceWrite": true,
+            "needsNetwork": false,
+            "isolation": "shared"
+        })),
+        budget: failed_node.budget.clone(),
+        upstream_decisions: failed_node.upstream_decisions.clone(),
+        repair_of: Some(failed_node.node_id.clone()),
+        mutation_revision: None,
+    };
+    if let Some(node) = nodes
+        .iter_mut()
+        .find(|node| node.node_id == failed_node.node_id)
+    {
+        *node = retried;
+    }
+    nodes.push(repair_node);
+    validate_autonomous_nodes(nodes.clone())?;
+    if let Some(task_snapshot) = snapshot.task_snapshot.as_mut() {
+        if let Some(object) = task_snapshot.as_object_mut() {
+            object.insert(
+                "repairRounds".to_string(),
+                serde_json::json!(*repair_rounds),
+            );
+            let plan_revision = object
+                .get("plan")
+                .and_then(|plan| plan.get("revision"))
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0)
+                .saturating_add(1);
+            let mut plan = object
+                .get("plan")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let Some(plan_object) = plan.as_object_mut() {
+                plan_object.insert("nodes".to_string(), serde_json::json!(nodes));
+                plan_object.insert("revision".to_string(), serde_json::json!(plan_revision));
+            }
+            object.insert("plan".to_string(), plan);
+            object.insert(
+                "completedNodes".to_string(),
+                serde_json::to_value(completed.clone()).map_err(|error| error.to_string())?,
+            );
+        }
+    }
+    Ok(true)
 }
 
 fn autonomous_file_in_scope(path: &str, scopes: &[String]) -> bool {
@@ -2198,6 +2365,7 @@ async fn execute_autonomous_delivery(
                 .ok_or_else(|| format!("Approval '{request_id}' disappeared from the ledger"))?;
             match approval.decision {
                 Some(PermissionDecision::AllowOnce | PermissionDecision::AllowForRun) => {
+                    autonomous_owner_guard(snapshot)?;
                     little_monkey_lib::m5_delivery::execute_mutation_impl(
                         mutation,
                         preview.digest.clone(),
@@ -2405,6 +2573,13 @@ async fn run_autonomous_task_executor(
             completed.insert(node.node_id.clone());
         }
     }
+    let mut repair_rounds = effective_snapshot
+        .task_snapshot
+        .as_ref()
+        .and_then(|value| value.get("repairRounds"))
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0);
     let initial_snapshot = effective_snapshot.task_snapshot.clone().unwrap_or_else(|| {
         serde_json::json!({
             "taskId": effective_snapshot.task_id,
@@ -2451,8 +2626,71 @@ async fn run_autonomous_task_executor(
         }),
     )?;
     let mut files_changed = Vec::new();
+    // A desktop handoff may arrive after workers finished but before the
+    // integration node consumed their exact worktrees. Reattach those
+    // durable worker records before calculating readiness; completed-node ids
+    // alone are insufficient to reconstruct the pending patch set.
+    if nodes
+        .iter()
+        .any(|node| node.task_class == "integration" && !completed.contains(&node.node_id))
+    {
+        if let Some(workers) = effective_snapshot
+            .task_snapshot
+            .as_ref()
+            .and_then(|value| value.get("workers"))
+            .and_then(|value| value.as_array())
+        {
+            let data_root = crate::app_data_dir().ok_or_else(|| {
+                "Could not resolve app data directory for recovered autonomous workers".to_string()
+            })?;
+            for worker in workers {
+                let Some(node_id) = worker.get("nodeId").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                if !completed.contains(node_id) {
+                    continue;
+                }
+                let Some(path) = worker
+                    .get("worktree")
+                    .and_then(|value| value.get("path"))
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                let status = little_monkey_lib::agent_worktrees::status(&data_root, path)?;
+                let node = nodes
+                    .iter()
+                    .find(|candidate| candidate.node_id == node_id)
+                    .ok_or_else(|| {
+                        format!("recovered worker references unknown node '{node_id}'")
+                    })?;
+                if status.changed_files.iter().any(|file| {
+                    node.task_class == "implementation"
+                        && !autonomous_file_in_scope(file, &node.mutation_scope)
+                }) {
+                    return Err(format!(
+                        "recovered worker '{}' changed files outside its frozen mutation scope",
+                        node_id
+                    ));
+                }
+                let applied = little_monkey_lib::agent_worktrees::apply(&data_root, path)?;
+                files_changed.extend(applied.clone());
+                autonomous_task_event(
+                    recorder,
+                    &effective_snapshot.task_id,
+                    "worker_result_recovered",
+                    serde_json::json!({ "node_id": node_id, "worktree": path, "changed_files": applied }),
+                )?;
+            }
+            if !files_changed.is_empty() {
+                let revision = autonomous_workspace_revision(workspace_root)?;
+                effective_snapshot.current_workspace_revision = revision.clone();
+                checkpoint_autonomous_task_snapshot(&mut effective_snapshot, &revision, &completed);
+            }
+        }
+    }
     let mut next_hint = effective_snapshot.next_node_id.clone();
-    for _ in 0..128 {
+    'autonomous: for _ in 0..128 {
         autonomous_owner_guard(&effective_snapshot)?;
         let ready = nodes
             .iter()
@@ -2543,6 +2781,7 @@ async fn run_autonomous_task_executor(
                             mcp_entries,
                             attached_stacks,
                             &node.task_class,
+                            &node.capabilities,
                             &node_objective,
                             autonomous_node_max_iterations(&node, max_iterations),
                             Path::new(&record.path),
@@ -2562,6 +2801,7 @@ async fn run_autonomous_task_executor(
                             mcp_entries,
                             attached_stacks,
                             &node.task_class,
+                            &node.capabilities,
                             &node_objective,
                             autonomous_node_max_iterations(&node, max_iterations),
                             workspace_root,
@@ -2574,7 +2814,31 @@ async fn run_autonomous_task_executor(
             let parallel_results = futures_util::future::join_all(futures).await;
             let mut completed_results = Vec::new();
             for result in parallel_results {
-                completed_results.push(result?);
+                match result {
+                    Ok(result) => completed_results.push(result),
+                    Err(error) => {
+                        let failed_node = parallel_nodes.first().ok_or_else(|| {
+                            "parallel autonomous worker failure lost its node".to_string()
+                        })?;
+                        if schedule_autonomous_repair(
+                            &mut effective_snapshot,
+                            &mut nodes,
+                            &mut completed,
+                            failed_node,
+                            &mut repair_rounds,
+                            &error,
+                        )? {
+                            autonomous_task_event(
+                                recorder,
+                                &effective_snapshot.task_id,
+                                "plan_changed",
+                                serde_json::json!({ "reason": error, "repair_round": repair_rounds, "repair_of": failed_node.node_id }),
+                            )?;
+                            continue 'autonomous;
+                        }
+                        return Err(error);
+                    }
+                }
             }
             let mut claimed_files = HashMap::<String, String>::new();
             for (node, _, record) in &completed_results {
@@ -2734,9 +2998,127 @@ async fn run_autonomous_task_executor(
                     "completed_nodes": [],
                     "next_node_id": node.node_id
                 }));
-                let _status =
-                    crate::daemon::remote::execute_autonomous_node(alias, &remote_spec).await?;
-                Vec::new()
+                let status = match crate::daemon::remote::execute_autonomous_node(
+                    alias,
+                    &remote_spec,
+                )
+                .await
+                {
+                    Ok(status) => status,
+                    Err(error) => {
+                        if schedule_autonomous_repair(
+                            &mut effective_snapshot,
+                            &mut nodes,
+                            &mut completed,
+                            &node,
+                            &mut repair_rounds,
+                            &error,
+                        )? {
+                            autonomous_task_event(
+                                recorder,
+                                &effective_snapshot.task_id,
+                                "plan_changed",
+                                serde_json::json!({ "reason": error, "repair_round": repair_rounds, "repair_of": node.node_id }),
+                            )?;
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                };
+                let result = status.result.ok_or_else(|| {
+                    format!(
+                        "remote autonomous node '{}' completed without a transported node result",
+                        node.node_id
+                    )
+                })?;
+                if result.get("ok").and_then(|value| value.as_bool()) != Some(true) {
+                    return Err(format!(
+                        "remote autonomous node '{}' returned an unsuccessful result",
+                        node.node_id
+                    ));
+                }
+                let mut imported = Vec::new();
+                if node.task_class == "implementation" || node.task_class == "integration" {
+                    let artifact_id = result
+                        .get("artifacts")
+                        .and_then(|value| value.as_array())
+                        .and_then(|artifacts| {
+                            artifacts.iter().find(|artifact| {
+                                artifact.get("kind").and_then(|value| value.as_str())
+                                    == Some("patch")
+                            })
+                        })
+                        .and_then(|artifact| artifact.get("artifactId"))
+                        .and_then(|value| value.as_str());
+                    let artifact_id = artifact_id.ok_or_else(|| {
+                        format!(
+                            "remote autonomous node '{}' returned a mutation without a patch artifact",
+                            node.node_id
+                        )
+                    })?;
+                    autonomous_owner_guard(&effective_snapshot)?;
+                    let data_dir = crate::app_data_dir().ok_or_else(|| {
+                        "Could not resolve app data directory for remote patch".to_string()
+                    })?;
+                    let patch_path = data_dir.join("autonomous-placements").join(format!(
+                        "{}-{}.patch",
+                        effective_snapshot.task_id, node.node_id
+                    ));
+                    std::fs::create_dir_all(patch_path.parent().unwrap_or(&data_dir)).map_err(
+                        |error| format!("Could not create remote patch directory: {error}"),
+                    )?;
+                    crate::daemon::remote::fetch_autonomous_artifact(
+                        alias,
+                        &remote_run_id,
+                        artifact_id,
+                        &patch_path,
+                    )
+                    .await?;
+                    let patch_path_arg = patch_path.to_string_lossy().into_owned();
+                    let check = Command::new("git")
+                        .args([
+                            "-C",
+                            &workspace_root.to_string_lossy(),
+                            "apply",
+                            "--check",
+                            &patch_path_arg,
+                        ])
+                        .output()
+                        .map_err(|error| format!("Could not validate remote patch: {error}"))?;
+                    if !check.status.success() {
+                        return Err(format!(
+                            "remote patch for node '{}' does not apply to the current workspace",
+                            node.node_id
+                        ));
+                    }
+                    let apply = Command::new("git")
+                        .args([
+                            "-C",
+                            &workspace_root.to_string_lossy(),
+                            "apply",
+                            &patch_path_arg,
+                        ])
+                        .output()
+                        .map_err(|error| format!("Could not apply remote patch: {error}"))?;
+                    let _ = std::fs::remove_file(&patch_path);
+                    if !apply.status.success() {
+                        return Err(format!(
+                            "Could not apply remote patch for node '{}'",
+                            node.node_id
+                        ));
+                    }
+                    imported = result
+                        .get("changedFiles")
+                        .and_then(|value| value.as_array())
+                        .map(|files| {
+                            files
+                                .iter()
+                                .filter_map(|file| file.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
+                imported
             } else if kind == "docker" {
                 return Err(format!("autonomous node '{}' requires '{}' placement, but the daemon executor has no local fallback for that placement", node.node_id, kind));
             } else {
@@ -2767,6 +3149,7 @@ async fn run_autonomous_task_executor(
                 mcp_entries,
                 attached_stacks,
                 "planner",
+                &node.capabilities,
                 &node_objective,
                 autonomous_node_max_iterations(&node, max_iterations),
                 workspace_root,
@@ -2808,8 +3191,28 @@ async fn run_autonomous_task_executor(
             )?;
             continue;
         } else if node.task_class == "delivery" {
-            execute_autonomous_delivery(&effective_snapshot, &node.node_id, recorder, state)
-                .await?;
+            if let Err(error) =
+                execute_autonomous_delivery(&effective_snapshot, &node.node_id, recorder, state)
+                    .await
+            {
+                if schedule_autonomous_repair(
+                    &mut effective_snapshot,
+                    &mut nodes,
+                    &mut completed,
+                    &node,
+                    &mut repair_rounds,
+                    &error,
+                )? {
+                    autonomous_task_event(
+                        recorder,
+                        &effective_snapshot.task_id,
+                        "plan_changed",
+                        serde_json::json!({ "reason": error, "repair_round": repair_rounds, "repair_of": node.node_id }),
+                    )?;
+                    continue;
+                }
+                return Err(error);
+            }
             Vec::new()
         } else if node.isolation == "worktree" {
             let data_root = crate::app_data_dir().ok_or_else(|| {
@@ -2817,7 +3220,7 @@ async fn run_autonomous_task_executor(
             })?;
             let record = little_monkey_lib::agent_worktrees::create(&data_root, workspace_root)?;
             let worker_state = crate::build_state(&Some(PathBuf::from(&record.path)))?;
-            let changed = autonomous_phase(
+            let changed = match autonomous_phase(
                 &effective_snapshot,
                 recorder,
                 client,
@@ -2829,11 +3232,34 @@ async fn run_autonomous_task_executor(
                 mcp_entries,
                 attached_stacks,
                 &node.task_class,
+                &node.capabilities,
                 &node_objective,
                 autonomous_node_max_iterations(&node, max_iterations),
                 Path::new(&record.path),
             )
-            .await?;
+            .await
+            {
+                Ok(changed) => changed,
+                Err(error) => {
+                    if schedule_autonomous_repair(
+                        &mut effective_snapshot,
+                        &mut nodes,
+                        &mut completed,
+                        &node,
+                        &mut repair_rounds,
+                        &error,
+                    )? {
+                        autonomous_task_event(
+                            recorder,
+                            &effective_snapshot.task_id,
+                            "plan_changed",
+                            serde_json::json!({ "reason": error, "repair_round": repair_rounds, "repair_of": node.node_id }),
+                        )?;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
             let worktree_status =
                 little_monkey_lib::agent_worktrees::status(&data_root, &record.path)?;
             if node.task_class == "implementation"
@@ -2842,18 +3268,60 @@ async fn run_autonomous_task_executor(
                     .iter()
                     .any(|file| !autonomous_file_in_scope(file, &node.mutation_scope))
             {
-                return Err(format!(
+                let error = format!(
                     "autonomous node '{}' changed files outside its frozen mutation scope",
                     node.node_id
-                ));
+                );
+                if schedule_autonomous_repair(
+                    &mut effective_snapshot,
+                    &mut nodes,
+                    &mut completed,
+                    &node,
+                    &mut repair_rounds,
+                    &error,
+                )? {
+                    autonomous_task_event(
+                        recorder,
+                        &effective_snapshot.task_id,
+                        "plan_changed",
+                        serde_json::json!({ "reason": error, "repair_round": repair_rounds, "repair_of": node.node_id }),
+                    )?;
+                    continue;
+                }
+                return Err(error);
             }
-            let mut applied = little_monkey_lib::agent_worktrees::apply(&data_root, &record.path)?;
+            autonomous_owner_guard(&effective_snapshot)?;
+            let mut applied = match little_monkey_lib::agent_worktrees::apply(
+                &data_root,
+                &record.path,
+            ) {
+                Ok(applied) => applied,
+                Err(error) => {
+                    if schedule_autonomous_repair(
+                        &mut effective_snapshot,
+                        &mut nodes,
+                        &mut completed,
+                        &node,
+                        &mut repair_rounds,
+                        &error,
+                    )? {
+                        autonomous_task_event(
+                            recorder,
+                            &effective_snapshot.task_id,
+                            "plan_changed",
+                            serde_json::json!({ "reason": error, "repair_round": repair_rounds, "repair_of": node.node_id }),
+                        )?;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
             applied.extend(changed);
             applied.sort();
             applied.dedup();
             applied
         } else {
-            autonomous_phase(
+            match autonomous_phase(
                 &effective_snapshot,
                 recorder,
                 client,
@@ -2865,21 +3333,63 @@ async fn run_autonomous_task_executor(
                 mcp_entries,
                 attached_stacks,
                 &node.task_class,
+                &node.capabilities,
                 &node_objective,
                 autonomous_node_max_iterations(&node, max_iterations),
                 workspace_root,
             )
-            .await?
+            .await
+            {
+                Ok(changed) => changed,
+                Err(error) => {
+                    if schedule_autonomous_repair(
+                        &mut effective_snapshot,
+                        &mut nodes,
+                        &mut completed,
+                        &node,
+                        &mut repair_rounds,
+                        &error,
+                    )? {
+                        autonomous_task_event(
+                            recorder,
+                            &effective_snapshot.task_id,
+                            "plan_changed",
+                            serde_json::json!({ "reason": error, "repair_round": repair_rounds, "repair_of": node.node_id }),
+                        )?;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
         };
         if !placement_is_external && node.task_class == "verification" {
-            run_autonomous_verification(
+            if let Err(error) = run_autonomous_verification(
                 &effective_snapshot,
                 &node.node_id,
                 recorder,
                 state,
                 workspace_root,
             )
-            .await?;
+            .await
+            {
+                if schedule_autonomous_repair(
+                    &mut effective_snapshot,
+                    &mut nodes,
+                    &mut completed,
+                    &node,
+                    &mut repair_rounds,
+                    &error,
+                )? {
+                    autonomous_task_event(
+                        recorder,
+                        &effective_snapshot.task_id,
+                        "plan_changed",
+                        serde_json::json!({ "reason": error, "repair_round": repair_rounds, "repair_of": node.node_id }),
+                    )?;
+                    continue;
+                }
+                return Err(error);
+            }
         }
         if !placement_is_external && node.task_class == "review" {
             let review_json = autonomous_json_object_from_history(history);
@@ -2889,7 +3399,24 @@ async fn run_autonomous_task_executor(
                 .and_then(|value| value.as_str())
                 != Some("pass")
             {
-                return Err("structured autonomous review did not pass".to_string());
+                let error = "structured autonomous review did not pass".to_string();
+                if schedule_autonomous_repair(
+                    &mut effective_snapshot,
+                    &mut nodes,
+                    &mut completed,
+                    &node,
+                    &mut repair_rounds,
+                    &error,
+                )? {
+                    autonomous_task_event(
+                        recorder,
+                        &effective_snapshot.task_id,
+                        "plan_changed",
+                        serde_json::json!({ "reason": error, "repair_round": repair_rounds, "repair_of": node.node_id }),
+                    )?;
+                    continue;
+                }
+                return Err(error);
             }
             autonomous_task_event(
                 recorder,
@@ -2900,16 +3427,103 @@ async fn run_autonomous_task_executor(
         }
         let after_revision = autonomous_workspace_revision(workspace_root)?;
         let actual_changed = autonomous_changed_files(workspace_root)?;
+        if !matches!(
+            node.task_class.as_str(),
+            "implementation" | "integration" | "delivery"
+        ) && before_revision != after_revision
+        {
+            autonomous_task_event(
+                recorder,
+                &effective_snapshot.task_id,
+                "node_failed",
+                serde_json::json!({
+                    "node_id": node.node_id,
+                    "reason": "non-mutating autonomous node changed the workspace after its verification boundary",
+                    "before_revision": before_revision,
+                    "after_revision": after_revision,
+                    "stale_evidence": true
+                }),
+            )?;
+            let error = format!(
+                "autonomous node '{}' mutated the workspace despite its non-mutating contract",
+                node.node_id
+            );
+            if schedule_autonomous_repair(
+                &mut effective_snapshot,
+                &mut nodes,
+                &mut completed,
+                &node,
+                &mut repair_rounds,
+                &error,
+            )? {
+                autonomous_task_event(
+                    recorder,
+                    &effective_snapshot.task_id,
+                    "plan_changed",
+                    serde_json::json!({ "reason": error, "repair_round": repair_rounds, "repair_of": node.node_id }),
+                )?;
+                continue;
+            }
+            return Err(error);
+        }
         let mut mutation_files = actual_changed.clone();
         mutation_files.extend(changed.clone());
         mutation_files.sort();
         mutation_files.dedup();
         let patch_digest = autonomous_patch_digest(workspace_root)?;
+        let mut result_artifacts = Vec::new();
+        if node.task_class == "implementation" || node.task_class == "integration" {
+            let patch_bytes = autonomous_patch_bytes(workspace_root)?;
+            if !patch_bytes.is_empty() {
+                let app_data = crate::app_data_dir().ok_or_else(|| {
+                    "Could not resolve app data directory for autonomous artifact".to_string()
+                })?;
+                let store = little_monkey_lib::artifact_store::ArtifactStore::with_max_blob_size(
+                    app_data.join("content-v1"),
+                    run_spec.budgets.max_artifact_bytes,
+                )
+                .map_err(|error| format!("could not open autonomous artifact store: {error}"))?;
+                let blob = store.put(&patch_bytes).map_err(|error| {
+                    format!("could not persist autonomous patch artifact: {error}")
+                })?;
+                recorder.emit(RunEvent::ArtifactAdded {
+                    artifact_id: blob.id.clone(),
+                    kind: ArtifactKind::Other,
+                    name: format!("autonomous-{}-patch.diff", node.node_id),
+                    media_type: "text/x-diff".to_string(),
+                    content_sha256: blob.id.clone(),
+                    size_bytes: blob.size,
+                })?;
+                result_artifacts.push(serde_json::json!({
+                    "artifactId": blob.id,
+                    "kind": "patch",
+                    "label": format!("Patch from {}", node.node_id),
+                    "digest": patch_digest.clone(),
+                    "sizeBytes": blob.size
+                }));
+            }
+        }
         autonomous_task_event(
             recorder,
             &effective_snapshot.task_id,
             "node_mutation",
-            serde_json::json!({ "node_id": node.node_id, "before_revision": before_revision, "after_revision": after_revision, "changed_files": mutation_files, "patch_digest": patch_digest, "timestamp_ms": unix_time_ms()?, "mutation": node.task_class == "implementation" || node.task_class == "integration" }),
+            serde_json::json!({ "node_id": node.node_id, "before_revision": before_revision.clone(), "after_revision": after_revision.clone(), "changed_files": mutation_files.clone(), "patch_digest": patch_digest.clone(), "timestamp_ms": unix_time_ms()?, "mutation": node.task_class == "implementation" || node.task_class == "integration" }),
+        )?;
+        autonomous_task_event(
+            recorder,
+            &effective_snapshot.task_id,
+            "node_result",
+            serde_json::json!({
+                "node_id": node.node_id,
+                "ok": true,
+                "summary": format!("Autonomous node '{}' completed.", node.node_id),
+                "changedFiles": mutation_files.clone(),
+                "workspaceRevision": after_revision.clone(),
+                "mutation": (node.task_class == "implementation" || node.task_class == "integration").then(|| serde_json::json!({ "beforeRevision": before_revision.clone(), "afterRevision": after_revision.clone(), "changedFiles": actual_changed.clone(), "patchDigest": patch_digest.clone() })),
+                "artifacts": result_artifacts,
+                "evidence": [],
+                "usage": recorder.current_usage()?
+            }),
         )?;
         files_changed.extend(changed);
         files_changed.extend(actual_changed);
@@ -3703,6 +4317,93 @@ mod tests {
         assert_eq!(nodes[0].capabilities, vec!["read", "mutate"]);
         assert_eq!(nodes[0].repair_of.as_deref(), Some("previous"));
         assert_eq!(nodes[0].mutation_revision.as_deref(), Some("r0"));
+    }
+
+    fn test_node(id: &str, class: &str, dependencies: Vec<&str>) -> FrozenAutonomousNode {
+        FrozenAutonomousNode {
+            node_id: id.to_string(),
+            task_class: class.to_string(),
+            objective: id.to_string(),
+            dependencies: dependencies.into_iter().map(str::to_string).collect(),
+            status: "succeeded".to_string(),
+            mutation_scope: if matches!(class, "implementation" | "integration") {
+                vec!["workspace".to_string()]
+            } else {
+                vec!["workspace".to_string()]
+            },
+            isolation: "shared".to_string(),
+            relevant_files: vec!["workspace".to_string()],
+            capabilities: if matches!(class, "implementation" | "integration") {
+                vec!["read".to_string(), "mutate".to_string()]
+            } else {
+                vec!["read".to_string(), "verify".to_string()]
+            },
+            execution_placement: None,
+            execution_requirements: None,
+            budget: None,
+            upstream_decisions: Vec::new(),
+            repair_of: None,
+            mutation_revision: None,
+        }
+    }
+
+    #[test]
+    fn non_mutating_nodes_reject_mutation_capability() {
+        let mut node = test_node("review", "review", Vec::new());
+        node.capabilities.push("mutate".to_string());
+        assert!(validate_autonomous_nodes(vec![node])
+            .unwrap_err()
+            .contains("non-mutating"));
+    }
+
+    #[test]
+    fn bounded_review_repair_runs_verification_again() {
+        let nodes = vec![
+            test_node("integrate", "integration", Vec::new()),
+            test_node("verify", "verification", vec!["integrate"]),
+            test_node("review", "review", vec!["verify"]),
+        ];
+        let mut snapshot = recipes::AutonomousTaskSnapshot {
+            task_id: "repair-test".to_string(),
+            max_repair_rounds: 2,
+            task_snapshot: Some(serde_json::json!({
+                "plan": { "planId": "p", "strategy": "PLAN", "revision": 1, "nodes": nodes },
+                "repairRounds": 0
+            })),
+            ..Default::default()
+        };
+        let mut nodes = frozen_autonomous_nodes(&snapshot).unwrap();
+        let mut completed = HashSet::from(["integrate".to_string(), "verify".to_string()]);
+        let failed = nodes
+            .iter()
+            .find(|node| node.node_id == "review")
+            .unwrap()
+            .clone();
+        let mut rounds = 0;
+        assert!(schedule_autonomous_repair(
+            &mut snapshot,
+            &mut nodes,
+            &mut completed,
+            &failed,
+            &mut rounds,
+            "review mutated after verification"
+        )
+        .unwrap());
+        let repair = nodes
+            .iter()
+            .find(|node| node.repair_of.as_deref() == Some("review"))
+            .unwrap();
+        let verify = nodes.iter().find(|node| node.node_id == "verify").unwrap();
+        assert_eq!(repair.dependencies, vec!["integrate"]);
+        assert_eq!(verify.dependencies, vec![repair.node_id.clone()]);
+        assert_eq!(
+            nodes
+                .iter()
+                .find(|node| node.node_id == "review")
+                .unwrap()
+                .dependencies,
+            vec!["verify"]
+        );
     }
 
     #[test]

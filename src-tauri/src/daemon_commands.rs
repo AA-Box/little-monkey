@@ -306,6 +306,85 @@ fn parse_json(output: &str) -> Result<Value, String> {
         .map_err(|error| format!("Invalid daemon JSON output: {error}"))
 }
 
+fn autonomous_placement_result(
+    data_dir: &Path,
+    workspace: &Path,
+    before_revision: &str,
+    runner_result: Value,
+) -> Result<Value, String> {
+    if runner_result.get("ok").and_then(Value::as_bool) == Some(false) {
+        return Ok(runner_result);
+    }
+    let after_revision = crate::agent_worktrees::workspace_revision(data_dir, workspace)?;
+    let workspace_arg = workspace.to_string_lossy().into_owned();
+    let status = Command::new("git")
+        .args(["-C", workspace_arg.as_str(), "status", "--porcelain"])
+        .output()
+        .map_err(|error| format!("Could not inspect Docker workspace: {error}"))?;
+    let changed_files = String::from_utf8_lossy(&status.stdout)
+        .lines()
+        .filter_map(|line| line.get(3..))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let patch = Command::new("git")
+        .args(["-C", workspace_arg.as_str(), "diff", "--binary", "--"])
+        .output()
+        .map_err(|error| format!("Could not collect Docker patch: {error}"))?
+        .stdout;
+    let patch_digest = format!("{:x}", Sha256::digest(&patch));
+    let mut result = runner_result;
+    if let Some(object) = result.as_object_mut() {
+        let ok = object
+            .get("ok")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| object.get("status").and_then(Value::as_str) == Some("ok"));
+        object.insert("ok".to_string(), Value::Bool(ok));
+        if !ok {
+            return Ok(result);
+        }
+        let changed_json = serde_json::json!(changed_files);
+        object.insert("changedFiles".to_string(), changed_json.clone());
+        object.insert(
+            "workspaceRevision".to_string(),
+            serde_json::json!(after_revision),
+        );
+        if before_revision != after_revision {
+            object.insert(
+                "mutation".to_string(),
+                serde_json::json!({
+                    "beforeRevision": before_revision,
+                    "afterRevision": after_revision,
+                    "changedFiles": changed_json,
+                    "patchDigest": patch_digest
+                }),
+            );
+        }
+        if !patch.is_empty() {
+            let store = crate::artifact_store::ArtifactStore::with_max_blob_size(
+                data_dir.join("content-v1"),
+                32 * 1024 * 1024,
+            )
+            .map_err(|error| format!("Could not open Docker artifact store: {error}"))?;
+            let blob = store
+                .put(&patch)
+                .map_err(|error| format!("Could not persist Docker patch artifact: {error}"))?;
+            object.insert(
+                "artifacts".to_string(),
+                serde_json::json!([{
+                    "artifactId": blob.id,
+                    "kind": "patch",
+                    "label": "Docker autonomous placement patch",
+                    "digest": patch_digest,
+                    "sizeBytes": blob.size
+                }]),
+            );
+        }
+    }
+    Ok(result)
+}
+
 fn parse_typed_json<T: DeserializeOwned>(output: &str) -> Result<T, String> {
     serde_json::from_str(output.trim())
         .map_err(|error| format!("Invalid daemon JSON output: {error}"))
@@ -1416,6 +1495,17 @@ pub async fn autonomous_task_place_node(
                 .map_err(|error| format!("Could not serialize placement spec: {error}"))?;
             std::fs::write(&spec_path, bytes)
                 .map_err(|error| format!("Could not persist placement spec: {error}"))?;
+            let workspace_root = request
+                .run_spec
+                .workspace
+                .as_ref()
+                .and_then(|workspace| workspace.roots.first())
+                .map(|root| PathBuf::from(&root.canonical_path))
+                .ok_or_else(|| {
+                    "Remote autonomous placement requires a workspace root".to_string()
+                })?;
+            let before_revision =
+                crate::agent_worktrees::workspace_revision(&data_dir, &workspace_root)?;
             let result = async {
                 let output = command(vec![
                     "daemon".into(),
@@ -1433,13 +1523,18 @@ pub async fn autonomous_task_place_node(
                     .get("placement")
                     .and_then(|placement| placement.get("submitted_run_id"))
                     .and_then(Value::as_str)
-                    .ok_or_else(|| "Remote placement response omitted submitted_run_id".to_string())?
+                    .ok_or_else(|| {
+                        "Remote placement response omitted submitted_run_id".to_string()
+                    })?
                     .to_string();
                 let deadline = Instant::now()
                     + std::time::Duration::from_millis(request.run_spec.budgets.wall_time_ms);
                 loop {
                     if Instant::now() >= deadline {
-                        return Err("Remote autonomous node placement exceeded its frozen wall-time budget".to_string());
+                        return Err(
+                            "Remote autonomous node placement exceeded its frozen wall-time budget"
+                                .to_string(),
+                        );
                     }
                     let _ = command(vec![
                         "daemon".into(),
@@ -1456,10 +1551,15 @@ pub async fn autonomous_task_place_node(
                         ])
                         .await?,
                     )?;
-                    if let Some(row) = rows
-                        .get("placements")
-                        .and_then(Value::as_array)
-                        .and_then(|rows| rows.iter().find(|row| row.get("submitted_run_id").and_then(Value::as_str) == Some(submitted_run_id.as_str())))
+                    if let Some(row) =
+                        rows.get("placements")
+                            .and_then(Value::as_array)
+                            .and_then(|rows| {
+                                rows.iter().find(|row| {
+                                    row.get("submitted_run_id").and_then(Value::as_str)
+                                        == Some(submitted_run_id.as_str())
+                                })
+                            })
                     {
                         let state = row.get("state").and_then(Value::as_str).unwrap_or_default();
                         if matches!(state, "succeeded" | "failed" | "cancelled") {
@@ -1470,12 +1570,85 @@ pub async fn autonomous_task_place_node(
                                     .unwrap_or("remote autonomous node failed")
                                     .to_string());
                             }
-                            return Ok(serde_json::json!({
-                                "ok": true,
-                                "summary": format!("Remote autonomous node completed on {}.", request.target_id),
-                                "changedFiles": [],
-                                "workspaceRevision": null
-                            }));
+                            let mut result = row.get("result").cloned().ok_or_else(|| {
+                                "Remote node succeeded without a transported node result"
+                                    .to_string()
+                            })?;
+                            if result.get("ok").and_then(Value::as_bool) != Some(true) {
+                                return Err(
+                                    "Remote node returned no successful mutation/result contract"
+                                        .to_string(),
+                                );
+                            }
+                            if result
+                                .get("mutation")
+                                .and_then(Value::as_object)
+                                .is_some()
+                            {
+                                let artifact_id = result
+                                    .get("artifacts")
+                                    .and_then(Value::as_array)
+                                    .and_then(|artifacts| {
+                                        artifacts.iter().find(|artifact| {
+                                            artifact.get("kind").and_then(Value::as_str)
+                                                == Some("patch")
+                                        })
+                                    })
+                                    .and_then(|artifact| artifact.get("artifactId"))
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(|| {
+                                        "Remote mutation result omitted its patch artifact"
+                                            .to_string()
+                                    })?;
+                                let patch_path = data_dir
+                                    .join("autonomous-placements")
+                                    .join(format!("{submitted_run_id}-{artifact_id}.patch"));
+                                command(vec![
+                                    "daemon".into(),
+                                    "remote".into(),
+                                    "artifact".into(),
+                                    request.target_id.clone(),
+                                    submitted_run_id.clone(),
+                                    artifact_id.to_string(),
+                                    "--output".into(),
+                                    patch_path.to_string_lossy().into_owned(),
+                                ])
+                                .await?;
+                                let patch_path_arg = patch_path.to_string_lossy().into_owned();
+                                let workspace_arg = workspace_root.to_string_lossy().into_owned();
+                                let check = Command::new("git")
+                                    .args([
+                                        "-C",
+                                        workspace_arg.as_str(),
+                                        "apply",
+                                        "--check",
+                                        patch_path_arg.as_str(),
+                                    ])
+                                    .output()
+                                    .map_err(|error| {
+                                        format!("Could not validate remote patch: {error}")
+                                    })?;
+                                if !check.status.success() {
+                                    return Err("Remote autonomous patch does not apply to the local workspace".to_string());
+                                }
+                                let apply = Command::new("git")
+                                    .args(["-C", workspace_arg.as_str(), "apply", patch_path_arg.as_str()])
+                                    .output()
+                                    .map_err(|error| {
+                                        format!("Could not apply remote patch: {error}")
+                                    })?;
+                                let _ = std::fs::remove_file(&patch_path);
+                                if !apply.status.success() {
+                                    return Err("Could not apply remote autonomous patch".to_string());
+                                }
+                            }
+                            result = autonomous_placement_result(
+                                &data_dir,
+                                &workspace_root,
+                                &before_revision,
+                                result,
+                            )?;
+                            return Ok(result);
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1510,6 +1683,8 @@ pub async fn autonomous_task_place_node(
                 .map_err(|error| format!("Could not serialize Docker placement spec: {error}"))?;
             std::fs::write(&spec_path, bytes)
                 .map_err(|error| format!("Could not persist Docker placement spec: {error}"))?;
+            let before_revision =
+                crate::agent_worktrees::workspace_revision(&data_dir, Path::new(&host_workspace))?;
             let args = vec![
                 "run".to_string(),
                 "--rm".to_string(),
@@ -1522,10 +1697,12 @@ pub async fn autonomous_task_place_node(
                 "-w".to_string(),
                 "/workspace".to_string(),
                 request.target_id,
-                "monkey-autonomous-runner".to_string(),
+                "task".to_string(),
+                "run".to_string(),
                 "/run/autonomous-spec.json".to_string(),
+                "--json".to_string(),
             ];
-            let result = tokio::task::spawn_blocking(move || {
+            let runner_result = tokio::task::spawn_blocking(move || {
                 let output = Command::new("docker")
                     .args(args)
                     .output()
@@ -1534,9 +1711,14 @@ pub async fn autonomous_task_place_node(
                 parse_json(&output_text)
             })
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())??;
             let _ = std::fs::remove_file(&spec_path);
-            result
+            autonomous_placement_result(
+                &data_dir,
+                Path::new(&host_workspace),
+                &before_revision,
+                runner_result,
+            )
         }
         other => Err(format!(
             "Unsupported autonomous placement backend '{other}'"
