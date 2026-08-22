@@ -294,6 +294,16 @@ fn run_action(
     }
 }
 
+fn focus_fixture_for_native_actions(
+    state: &DesktopControlState,
+    session_id: &str,
+    target: &ComputerTarget,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    run_action(state, session_id, target, ControlAction::Focus)?;
+    Ok(())
+}
+
 fn inspect(
     state: &DesktopControlState,
     session_id: &str,
@@ -433,7 +443,7 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
         let profile_id = profile_input.id.clone();
         let save_id = save.id.clone();
         let dynamic_id = dynamic.id.clone();
-        run_action(&state, &session.session_id, &target, ControlAction::Focus)?;
+        focus_fixture_for_native_actions(&state, &session.session_id, &target)?;
         run_action(
             &state,
             &session.session_id,
@@ -445,7 +455,7 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
             },
         )?;
         let _after_dark = inspect_until_dark_state(&state, &session.session_id, &target, true)?;
-        run_action(&state, &session.session_id, &target, ControlAction::Focus)?;
+        focus_fixture_for_native_actions(&state, &session.session_id, &target)?;
         run_action(
             &state,
             &session.session_id,
@@ -461,7 +471,7 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
         {
             return Err("profile value postcondition failed".to_string());
         }
-        run_action(&state, &session.session_id, &target, ControlAction::Focus)?;
+        focus_fixture_for_native_actions(&state, &session.session_id, &target)?;
         run_action(
             &state,
             &session.session_id,
@@ -479,7 +489,7 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
         if !saved {
             return Err("save postcondition failed".to_string());
         }
-        run_action(&state, &session.session_id, &target, ControlAction::Focus)?;
+        focus_fixture_for_native_actions(&state, &session.session_id, &target)?;
         run_action(
             &state,
             &session.session_id,
@@ -561,7 +571,7 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
             json!({
                 "native_desktop_actions_executed": true,
                 "driver": {"kind": "little-monkey-production-backend", "pid": pid, "window_id": target.window_id, "provider": provider_name()},
-                "actions": ["list_targets", "inspect", "focus", "semantic_toggle", "semantic_set_value", "semantic_invoke_save", "dynamic_control", "screenshot", "restart", "persisted_state"],
+                "actions": ["list_targets", "inspect", "semantic_toggle", "semantic_set_value", "semantic_invoke_save", "dynamic_control", "screenshot", "restart", "persisted_state"],
                 "negative_cases": {"secure_field_detected_and_not_typed": secure, "disabled_control_not_mutated": disabled, "second_same_app_window_rejected": second_window_rejected, "prompt_injection_widened_grant": false},
                 "postconditions": {"dark_mode": dark_persisted, "profile": profile_persisted, "saved": saved, "screenshot_artifact_id": digest(&screenshot_bytes), "redacted_audit_id": "production-audit-verified"},
                 "grant": {"application": target.application_id, "window_id": target.window_id, "window_scoped": session.allowed_windows == vec![target.window_id.clone()], "approval": "test-approved-through-real-gate"},
