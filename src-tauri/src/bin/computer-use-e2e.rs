@@ -209,7 +209,25 @@ fn inspect_until_dark_state(
             latest = inspect(state, session_id, target)?;
         }
     }
-    Err(format!("dark mode state did not settle to {expected}"))
+    let observed = latest
+        .elements
+        .iter()
+        .filter(|element| element.label == "Dark mode")
+        .map(|element| {
+            format!(
+                "id={} role={} value={:?} actions={:?} enabled={} bounds={:?}",
+                element.id,
+                element.role,
+                element.value,
+                element.actions,
+                element.enabled,
+                element.bounds
+            )
+        })
+        .collect::<Vec<_>>();
+    Err(format!(
+        "dark mode state did not settle to {expected}: {observed:?}"
+    ))
 }
 
 fn run_action(

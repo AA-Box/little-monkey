@@ -1441,6 +1441,7 @@ JSON.stringify({targets,elements});
 const WINDOWS_UIA_SCRIPT: &str = r#"
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName System.Windows.Forms
 $root=[System.Windows.Automation.AutomationElement]::RootElement
 $targets=@();$elements=@{}
 $windows=$root.FindAll([System.Windows.Automation.TreeScope]::Children,[System.Windows.Automation.Condition]::TrueCondition)
@@ -1634,6 +1635,21 @@ if($action -eq 'set_value') {
               if($after -ne $before){$performed=$true}
             } catch {}
           }
+        }
+      } catch {}
+    }
+    if(-not $performed) {
+      try {
+        $fresh=ResolveElement
+        $fresh.SetFocus()
+        [System.Windows.Forms.SendKeys]::SendWait(' ')
+        for($wait=0;$wait -lt 10 -and -not $performed;$wait++) {
+          Start-Sleep -Milliseconds 100
+          try {
+            $fresh=ResolveElement
+            $after=$fresh.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState
+            if($after -ne $before){$performed=$true}
+          } catch {}
         }
       } catch {}
     }
