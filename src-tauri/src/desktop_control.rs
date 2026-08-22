@@ -1562,7 +1562,18 @@ Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 $root=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]::new([int64]$env:LM_WINDOW_HANDLE))
 $desc=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
-$e=$desc.Item([int]$env:LM_ELEMENT_INDEX)
+$e=$null
+$stable=$env:LM_ELEMENT_STABLE
+if(-not [string]::IsNullOrWhiteSpace($stable)) {
+  for($i=0;$i -lt $desc.Count;$i++) {
+    $candidate=$desc.Item($i)
+    $automation=[string]$candidate.Current.AutomationId
+    if([string]::IsNullOrWhiteSpace($automation)){try{$automation=($candidate.GetRuntimeId() -join '-')}catch{$automation=''}}
+    $candidateStable=($automation -replace '[^A-Za-z0-9._-]','_')
+    if($candidateStable -eq $stable){$e=$candidate;break}
+  }
+}
+if($null -eq $e){$e=$desc.Item([int]$env:LM_ELEMENT_INDEX)}
 $action=$env:LM_ACTION
 $performed=$false
 if($action -eq 'set_value') {
@@ -1616,6 +1627,13 @@ fn element_index(element_id: &str) -> Result<usize, String> {
         .ok_or_else(|| "Accessibility element id has no stable provider index".to_string())
 }
 
+#[cfg(target_os = "windows")]
+fn element_native_stable(element_id: &str) -> Option<&str> {
+    element_id
+        .rsplit_once("::native-")
+        .map(|(_, stable)| stable)
+}
+
 fn window_index(window_id: &str) -> Result<usize, String> {
     window_id
         .rsplit_once("::window-")
@@ -1662,6 +1680,12 @@ fn native_semantic_action(
             &[
                 ("LM_WINDOW_HANDLE", target.window_id.clone()),
                 ("LM_ELEMENT_INDEX", element_index.to_string()),
+                (
+                    "LM_ELEMENT_STABLE",
+                    element_native_stable(element_id)
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
                 ("LM_ACTION", action.to_string()),
                 ("LM_VALUE", value.unwrap_or_default().to_string()),
             ],
