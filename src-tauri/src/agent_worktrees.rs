@@ -85,16 +85,20 @@ pub struct WorkspaceSnapshot {
 /// Staged-state changes carried alongside a portable Git worktree patch.
 /// Git's unified patch format has no representation for an index-only change,
 /// so these records are kept in a versioned artifact trailer.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkspaceIndexDelta {
     pub path: String,
     pub before_state: Vec<u8>,
     pub after_state: Vec<u8>,
     pub before_metadata: Vec<u8>,
     pub after_metadata: Vec<u8>,
+    #[serde(default)]
+    pub before_record: Vec<u8>,
+    #[serde(default)]
+    pub after_record: Vec<u8>,
 }
 
-const INDEX_DELTA_MARKER: &[u8] = b"# little-monkey-index-state-v1 ";
+const INDEX_DELTA_MAGIC: &[u8] = b"LMIDX-V1\0";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct WorkspaceSnapshotEntry {
@@ -304,6 +308,121 @@ fn workspace_index_metadata(root: &Path, relative: &str) -> Result<Vec<u8>, Stri
     Ok(output.stdout)
 }
 
+fn workspace_index_records(root: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
+    let output = run_git(root, &["ls-files", "-s", "-v", "-z"])?;
+    if !output.status.success() {
+        return Err(format!(
+            "Could not inspect the Git index: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut records = HashMap::new();
+    for record in output.stdout.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let Some(separator) = record.iter().position(|byte| *byte == b'\t') else {
+            return Err("Git index record omitted its path separator".to_string());
+        };
+        let path = String::from_utf8_lossy(&record[separator + 1..]).to_string();
+        records.insert(path, record[..separator].to_vec());
+    }
+    Ok(records)
+}
+
+fn copy_workspace_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    for entry in std::fs::read_dir(source).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        if name == std::ffi::OsStr::new(".git") {
+            continue;
+        }
+        let source_path = entry.path();
+        let destination_path = destination.join(&name);
+        let metadata =
+            std::fs::symlink_metadata(&source_path).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() {
+            let target = std::fs::read_link(&source_path).map_err(|error| error.to_string())?;
+            if let Some(parent) = destination_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            if std::fs::metadata(&source_path).is_ok_and(|target| target.is_dir()) {
+                create_workspace_directory_symlink(&target.to_string_lossy(), &destination_path)?;
+            } else {
+                create_workspace_symlink(&target.to_string_lossy(), &destination_path)?;
+            }
+        } else if metadata.is_dir() {
+            std::fs::create_dir(&destination_path).map_err(|error| error.to_string())?;
+            copy_workspace_tree(&source_path, &destination_path)?;
+        } else if metadata.is_file() {
+            if let Some(parent) = destination_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::copy(&source_path, &destination_path).map_err(|error| error.to_string())?;
+            std::fs::set_permissions(&destination_path, metadata.permissions())
+                .map_err(|error| error.to_string())?;
+        } else {
+            return Err(format!(
+                "Cannot transport unsupported workspace entry '{}'",
+                source_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Creates a self-contained Git workspace for an isolated container.
+///
+/// The copy is committed with every file force-added, including ignored files,
+/// so the returned patch describes only the container's mutation and can be
+/// applied to the unchanged host workspace. The caller owns the returned path.
+pub fn prepare_container_workspace(workspace_root: &Path) -> Result<PathBuf, String> {
+    let source = workspace_root
+        .canonicalize()
+        .map_err(|error| format!("Could not resolve workspace root: {error}"))?;
+    let destination = std::env::temp_dir().join(format!(
+        "little-monkey-docker-workspace-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    if let Err(error) = (|| {
+        std::fs::create_dir(&destination).map_err(|error| error.to_string())?;
+        copy_workspace_tree(&source, &destination)?;
+        for (args, operation) in [
+            (vec!["init", "-q"], "initialize"),
+            (
+                vec!["config", "user.email", "transport@little-monkey.invalid"],
+                "configure email",
+            ),
+            (
+                vec!["config", "user.name", "Little Monkey transport"],
+                "configure name",
+            ),
+            (
+                vec!["config", "core.autocrlf", "false"],
+                "configure line endings",
+            ),
+            (vec!["add", "-A", "-f", "--", "."], "stage files"),
+            (
+                vec!["commit", "-q", "--allow-empty", "-m", "container baseline"],
+                "commit baseline",
+            ),
+        ] {
+            let output = run_git(&destination, &args)?;
+            if !output.status.success() {
+                return Err(format!(
+                    "Could not {operation} for container workspace: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+        }
+        Ok::<(), String>(())
+    })() {
+        let _ = std::fs::remove_dir_all(&destination);
+        return Err(error);
+    }
+    Ok(destination)
+}
+
 pub fn append_index_deltas(
     mut patch: Vec<u8>,
     deltas: &[WorkspaceIndexDelta],
@@ -311,34 +430,43 @@ pub fn append_index_deltas(
     if deltas.is_empty() {
         return Ok(patch);
     }
+    let payload = serde_json::to_vec(deltas)
+        .map_err(|error| format!("Could not encode index delta: {error}"))?;
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| "Index delta payload is too large to encode".to_string())?;
     if !patch.ends_with(b"\n") {
         patch.push(b'\n');
     }
-    patch.extend_from_slice(INDEX_DELTA_MARKER);
-    patch.extend(
-        serde_json::to_vec(deltas)
-            .map_err(|error| format!("Could not encode index delta: {error}"))?,
-    );
-    patch.push(b'\n');
+    patch.extend_from_slice(INDEX_DELTA_MAGIC);
+    patch.extend_from_slice(&payload);
+    patch.extend_from_slice(&payload_len.to_le_bytes());
     Ok(patch)
 }
 
 pub fn split_index_deltas(artifact: &[u8]) -> Result<(Vec<u8>, Vec<WorkspaceIndexDelta>), String> {
-    let Some(marker_start) = artifact
-        .windows(INDEX_DELTA_MARKER.len())
-        .position(|window| window == INDEX_DELTA_MARKER)
-    else {
+    let trailer_len = INDEX_DELTA_MAGIC.len() + std::mem::size_of::<u32>();
+    if artifact.len() < trailer_len {
         return Ok((artifact.to_vec(), Vec::new()));
-    };
-    let payload_start = marker_start + INDEX_DELTA_MARKER.len();
-    let payload_end = artifact[payload_start..]
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map(|offset| payload_start + offset)
-        .unwrap_or(artifact.len());
+    }
+    let payload_len_start = artifact.len() - std::mem::size_of::<u32>();
+    let payload_len = u32::from_le_bytes(
+        artifact[payload_len_start..]
+            .try_into()
+            .expect("payload length has four bytes"),
+    ) as usize;
+    let payload_end = payload_len_start;
+    let payload_start = payload_end
+        .checked_sub(payload_len)
+        .ok_or_else(|| "Invalid index delta trailer length".to_string())?;
+    let magic_start = payload_start
+        .checked_sub(INDEX_DELTA_MAGIC.len())
+        .ok_or_else(|| "Invalid index delta trailer framing".to_string())?;
+    if &artifact[magic_start..payload_start] != INDEX_DELTA_MAGIC {
+        return Ok((artifact.to_vec(), Vec::new()));
+    }
     let deltas = serde_json::from_slice(&artifact[payload_start..payload_end])
         .map_err(|error| format!("Could not decode index delta: {error}"))?;
-    let mut patch = artifact[..marker_start].to_vec();
+    let mut patch = artifact[..magic_start].to_vec();
     while patch.last().is_some_and(u8::is_ascii_whitespace) {
         patch.pop();
     }
@@ -387,6 +515,16 @@ fn create_workspace_symlink(target: &str, destination: &Path) -> Result<(), Stri
 #[cfg(windows)]
 fn create_workspace_symlink(target: &str, destination: &Path) -> Result<(), String> {
     std::os::windows::fs::symlink_file(target, destination).map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn create_workspace_directory_symlink(target: &str, destination: &Path) -> Result<(), String> {
+    std::os::unix::fs::symlink(target, destination).map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+fn create_workspace_directory_symlink(target: &str, destination: &Path) -> Result<(), String> {
+    std::os::windows::fs::symlink_dir(target, destination).map_err(|error| error.to_string())
 }
 
 fn restore_workspace_state(
@@ -471,6 +609,7 @@ fn restore_workspace_index(
     relative: &str,
     index_state: &[u8],
     index_metadata: &[u8],
+    index_record: &[u8],
 ) -> Result<(), String> {
     let _ = run_git(root, &["restore", "--staged", "--", relative]);
     if index_state.is_empty() {
@@ -483,7 +622,7 @@ fn restore_workspace_index(
                 ));
             }
         }
-        return Ok(());
+        return restore_workspace_index_flags(root, relative, index_record);
     }
     use std::io::Write;
     let mut child = Command::new("git")
@@ -507,6 +646,46 @@ fn restore_workspace_index(
     if !output.status.success() {
         return Err(format!(
             "Could not restore staged state for '{relative}': {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    restore_workspace_index_flags(root, relative, index_record)
+}
+
+pub fn restore_workspace_index_flags(
+    root: &Path,
+    relative: &str,
+    index_record: &[u8],
+) -> Result<(), String> {
+    if index_record.is_empty() {
+        return Ok(());
+    }
+    let reset = run_git(
+        root,
+        &[
+            "update-index",
+            "--no-assume-unchanged",
+            "--no-skip-worktree",
+            "--",
+            relative,
+        ],
+    )?;
+    if !reset.status.success() {
+        return Err(format!(
+            "Could not reset Git index flags for '{relative}': {}",
+            String::from_utf8_lossy(&reset.stderr).trim()
+        ));
+    }
+    let flag = index_record.first().copied().unwrap_or(b'H');
+    let option = match flag {
+        b'h' => "--assume-unchanged",
+        b'S' | b's' => "--skip-worktree",
+        _ => return Ok(()),
+    };
+    let output = run_git(root, &["update-index", option, "--", relative])?;
+    if !output.status.success() {
+        return Err(format!(
+            "Could not restore Git index flags for '{relative}': {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
@@ -535,6 +714,7 @@ pub fn snapshot(data_root: &Path, workspace_root: &Path) -> Result<WorkspaceSnap
     std::fs::create_dir_all(&files_dir)
         .map_err(|error| format!("Could not create workspace snapshot: {error}"))?;
     let changed_files = workspace_changed_files(&root)?;
+    let index_records = workspace_index_records(&root)?;
     let mut entries = Vec::new();
     // Clean tracked paths need no byte-for-byte baseline: bulk Git status
     // identifies them if they become dirty, and restore falls back to HEAD.
@@ -579,12 +759,24 @@ pub fn snapshot(data_root: &Path, workspace_root: &Path) -> Result<WorkspaceSnap
     let entries_json = serde_json::to_vec(&entries).map_err(|error| error.to_string())?;
     std::fs::write(dir.join("entries.json"), entries_json)
         .map_err(|error| format!("Could not persist workspace snapshot: {error}"))?;
+    let index_json = serde_json::to_vec(&index_records).map_err(|error| error.to_string())?;
+    std::fs::write(dir.join("index.json"), index_json)
+        .map_err(|error| format!("Could not persist workspace index snapshot: {error}"))?;
     let revision = workspace_revision(data_root, &root)?;
     Ok(WorkspaceSnapshot {
         id,
         revision,
         changed_files,
     })
+}
+
+fn snapshot_index_records(dir: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
+    match std::fs::read(dir.join("index.json")) {
+        Ok(raw) => serde_json::from_slice(&raw)
+            .map_err(|error| format!("Could not decode workspace index snapshot: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(error) => Err(format!("Could not read workspace index snapshot: {error}")),
+    }
 }
 
 pub fn changed_files_since_snapshot(
@@ -596,12 +788,21 @@ pub fn changed_files_since_snapshot(
     let root = workspace_root
         .canonicalize()
         .map_err(|error| format!("Could not resolve workspace root: {error}"))?;
+    let before_index = snapshot_index_records(&dir)?;
+    let after_index = workspace_index_records(&root)?;
     let current = workspace_changed_files(&root)?;
     let mut paths = entries
         .iter()
         .map(|entry| entry.path.clone())
         .collect::<HashSet<_>>();
     paths.extend(current);
+    let mut changed_index_paths = before_index
+        .keys()
+        .chain(after_index.keys())
+        .cloned()
+        .collect::<HashSet<_>>();
+    changed_index_paths.retain(|path| before_index.get(path) != after_index.get(path));
+    paths.extend(changed_index_paths);
     let mut changed = Vec::new();
     for relative in paths {
         let before_entry = entries.iter().find(|entry| entry.path == relative);
@@ -645,6 +846,19 @@ pub fn changed_files_since_snapshot(
                     }
                 }
             })
+            .or_else(|| {
+                before_index.get(&relative).map(|_| {
+                    let state =
+                        git_head_state(&root, &relative).unwrap_or(WorkspacePathState::Missing);
+                    let mode = git_head_mode(&root, &relative).unwrap_or_default();
+                    WorkspacePathSnapshot {
+                        state,
+                        mode,
+                        index_state: Vec::new(),
+                        index_metadata: Vec::new(),
+                    }
+                })
+            })
             .unwrap_or(WorkspacePathSnapshot {
                 state: WorkspacePathState::Missing,
                 mode: 0,
@@ -652,7 +866,16 @@ pub fn changed_files_since_snapshot(
                 index_metadata: Vec::new(),
             });
         let after = workspace_path_snapshot(&root, &relative)?;
-        if before != after {
+        let index_changed = before_index.get(&relative) != after_index.get(&relative);
+        let detailed_index_changed = before_entry.is_some_and(|entry| {
+            entry.index_state != after.index_state || entry.index_metadata != after.index_metadata
+        });
+        if before.state != after.state
+            || git_patch_mode(&before.state, before.mode)
+                != git_patch_mode(&after.state, after.mode)
+            || index_changed
+            || detailed_index_changed
+        {
             changed.push(relative);
         }
     }
@@ -712,14 +935,6 @@ fn git_patch_mode(state: &WorkspacePathState, filesystem_mode: u32) -> u32 {
             }
         }
         WorkspacePathState::Other => 0,
-    }
-}
-
-fn git_null_device() -> &'static str {
-    if cfg!(windows) {
-        "NUL"
-    } else {
-        "/dev/null"
     }
 }
 
@@ -794,11 +1009,16 @@ pub fn patch_bytes_since_snapshot(
     snapshot_id: &str,
 ) -> Result<Vec<u8>, String> {
     let (dir, entries) = snapshot_entries(data_root, snapshot_id)?;
+    let before_index = snapshot_index_records(&dir)?;
     let root = workspace_root
         .canonicalize()
         .map_err(|error| error.to_string())?;
+    let after_index = workspace_index_records(&root)?;
     let changed = changed_files_since_snapshot(data_root, &root, snapshot_id)?;
-    let temp = std::env::temp_dir().join(format!(
+    // Keep both operands relative to the worktree. Git for Windows rejects
+    // some absolute no-index operands even though the same paths are valid
+    // from the repository root.
+    let temp = root.join(format!(
         "lm-autonomous-patch-{}",
         uuid::Uuid::new_v4().simple()
     ));
@@ -837,8 +1057,7 @@ pub fn patch_bytes_since_snapshot(
         let after_mode = git_patch_mode(&after.state, after.mode);
         let index_changed = before_entry.is_some_and(|entry| {
             entry.index_state != after.index_state || entry.index_metadata != after.index_metadata
-        }) || (before_entry.is_none()
-            && (!after.index_state.is_empty() || !after.index_metadata.is_empty()));
+        }) || before_index.get(&relative) != after_index.get(&relative);
         if index_changed {
             index_deltas.push(WorkspaceIndexDelta {
                 path: relative.clone(),
@@ -850,24 +1069,47 @@ pub fn patch_bytes_since_snapshot(
                     .map(|entry| entry.index_metadata.clone())
                     .unwrap_or_default(),
                 after_metadata: after.index_metadata.clone(),
+                before_record: before_index.get(&relative).cloned().unwrap_or_default(),
+                after_record: after_index.get(&relative).cloned().unwrap_or_default(),
             });
         }
         if before_state == after.state && before_mode == after_mode {
             continue;
         }
         let before_path = temp.join("before").join(&relative);
-        let after_path = safe_workspace_path(&root, &relative)?;
         let before_exists = materialize_patch_state(&before_path, &before_state)?;
         let after_exists = !matches!(after.state, WorkspacePathState::Missing);
         let before_arg = if before_exists {
-            before_path.to_string_lossy().into_owned()
+            before_path
+                .strip_prefix(&root)
+                .map_err(|error| error.to_string())?
+                .to_string_lossy()
+                .into_owned()
         } else {
-            git_null_device().to_string()
+            let empty_path = temp.join("empty-before").join(&relative);
+            if let Some(parent) = empty_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(&empty_path, []).map_err(|error| error.to_string())?;
+            empty_path
+                .strip_prefix(&root)
+                .map_err(|error| error.to_string())?
+                .to_string_lossy()
+                .into_owned()
         };
         let after_arg = if after_exists {
-            after_path.to_string_lossy().into_owned()
+            relative.clone()
         } else {
-            git_null_device().to_string()
+            let empty_path = temp.join("empty-after").join(&relative);
+            if let Some(parent) = empty_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(&empty_path, []).map_err(|error| error.to_string())?;
+            empty_path
+                .strip_prefix(&root)
+                .map_err(|error| error.to_string())?
+                .to_string_lossy()
+                .into_owned()
         };
         let output = run_git(
             &root,
@@ -883,8 +1125,11 @@ pub fn patch_bytes_since_snapshot(
         )?;
         if !output.status.success() && output.status.code() != Some(1) {
             let _ = std::fs::remove_dir_all(&temp);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim().chars().take(2_048).collect::<String>();
             return Err(format!(
-                "Could not collect autonomous patch for '{relative}'"
+                "Could not collect autonomous patch for '{relative}': git diff --no-index exited with status {:?}: {}",
+                output.status.code(), stderr
             ));
         }
         let mut rewritten =
@@ -920,6 +1165,7 @@ pub fn restore_workspace_paths(
     paths: &[String],
 ) -> Result<(), String> {
     let (dir, entries) = snapshot_entries(data_root, snapshot_id)?;
+    let before_index = snapshot_index_records(&dir)?;
     let root = workspace_root
         .canonicalize()
         .map_err(|error| format!("Could not resolve workspace root: {error}"))?;
@@ -946,7 +1192,16 @@ pub fn restore_workspace_paths(
             };
             restore_workspace_state(&root, value, &state)?;
             restore_workspace_mode(&root, value, entry.mode)?;
-            restore_workspace_index(&root, value, &entry.index_state, &entry.index_metadata)?;
+            restore_workspace_index(
+                &root,
+                value,
+                &entry.index_state,
+                &entry.index_metadata,
+                before_index
+                    .get(value)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            )?;
             continue;
         }
         let tracked = run_git(&root, &["ls-files", "--error-unmatch", "--", value])
@@ -963,6 +1218,14 @@ pub fn restore_workspace_paths(
                     "--",
                     value,
                 ],
+            )?;
+            restore_workspace_index_flags(
+                &root,
+                value,
+                before_index
+                    .get(value)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
             )?;
         } else {
             remove_workspace_path(&root, value)?;
@@ -1182,6 +1445,17 @@ pub fn workspace_revision(data_root: &Path, workspace_root: &Path) -> Result<Str
     let mut hasher = Sha256::new();
     hasher.update(head.as_bytes());
     hasher.update(diff.as_bytes());
+    let index_records = workspace_index_records(&root)?;
+    let mut index_paths = index_records.keys().cloned().collect::<Vec<_>>();
+    index_paths.sort();
+    for path in index_paths {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        if let Some(record) = index_records.get(&path) {
+            hasher.update(record);
+        }
+        hasher.update([0]);
+    }
     for path in workspace_changed_files(&root)? {
         hasher.update(path.as_bytes());
         hasher.update([0]);
@@ -1258,7 +1532,13 @@ pub fn apply_patch_artifact(root: &Path, artifact: &[u8]) -> Result<(), String> 
         apply_patch(root, &patch, false)?;
     }
     for delta in index_deltas {
-        restore_workspace_index(root, &delta.path, &delta.after_state, &delta.after_metadata)?;
+        restore_workspace_index(
+            root,
+            &delta.path,
+            &delta.after_state,
+            &delta.after_metadata,
+            &delta.after_record,
+        )?;
     }
     Ok(())
 }
@@ -1763,6 +2043,61 @@ mod tests {
         restore_workspace_paths(&data, &repo, &saved.id, &["a.txt".to_string()]).unwrap();
         let staged = run_git_ok(&repo, &["diff", "--cached", "--", "a.txt"]).unwrap();
         assert!(staged.contains("+staged"), "{staged}");
+    }
+
+    #[test]
+    fn workspace_snapshot_detects_clean_file_index_flags_without_status_entries() {
+        let data = temp_dir("data-index-flags");
+        let repo = init_repo("index-flags");
+        let saved = snapshot(&data, &repo).unwrap();
+        git(
+            &repo,
+            &["update-index", "--assume-unchanged", "--", "a.txt"],
+        );
+        assert_eq!(
+            changed_files_since_snapshot(&data, &repo, &saved.id).unwrap(),
+            vec!["a.txt".to_string()]
+        );
+        let artifact = patch_bytes_since_snapshot(&data, &repo, &saved.id).unwrap();
+        let verifier = init_repo("index-flags-verifier");
+        apply_patch_artifact(&verifier, &artifact).unwrap();
+        assert!(run_git_ok(&verifier, &["ls-files", "-s", "-v"])
+            .unwrap()
+            .starts_with('h'));
+        git(
+            &repo,
+            &["update-index", "--no-assume-unchanged", "--", "a.txt"],
+        );
+        assert!(changed_files_since_snapshot(&data, &repo, &saved.id)
+            .unwrap()
+            .is_empty());
+        git(&repo, &["update-index", "--skip-worktree", "--", "a.txt"]);
+        assert_eq!(
+            changed_files_since_snapshot(&data, &repo, &saved.id).unwrap(),
+            vec!["a.txt".to_string()]
+        );
+        git(
+            &repo,
+            &["update-index", "--no-skip-worktree", "--", "a.txt"],
+        );
+    }
+
+    #[test]
+    fn framed_index_artifact_ignores_marker_text_inside_patch_content() {
+        let deltas = vec![WorkspaceIndexDelta {
+            path: "a.txt".to_string(),
+            before_state: Vec::new(),
+            after_state: Vec::new(),
+            before_metadata: Vec::new(),
+            after_metadata: Vec::new(),
+            before_record: Vec::new(),
+            after_record: Vec::new(),
+        }];
+        let patch = b"+LMIDX-V1\0 inside source text\n".to_vec();
+        let artifact = append_index_deltas(patch.clone(), &deltas).unwrap();
+        let (decoded_patch, decoded_deltas) = split_index_deltas(&artifact).unwrap();
+        assert_eq!(decoded_patch, patch[..patch.len() - 1].to_vec());
+        assert_eq!(decoded_deltas, deltas);
     }
 
     #[test]

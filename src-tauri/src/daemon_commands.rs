@@ -1920,13 +1920,34 @@ pub async fn autonomous_task_place_node(
                 crate::agent_worktrees::workspace_revision(&data_dir, Path::new(&host_workspace))?;
             let local_snapshot =
                 crate::agent_worktrees::snapshot(&data_dir, Path::new(&host_workspace))?;
+            let container_workspace = match crate::agent_worktrees::prepare_container_workspace(
+                Path::new(&host_workspace),
+            ) {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
+                    let _ = std::fs::remove_file(&spec_path);
+                    return Err(error);
+                }
+            };
+            let container_snapshot =
+                match crate::agent_worktrees::snapshot(&data_dir, &container_workspace) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        let _ =
+                            crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
+                        let _ = std::fs::remove_dir_all(&container_workspace);
+                        let _ = std::fs::remove_file(&spec_path);
+                        return Err(error);
+                    }
+                };
             let args = vec![
                 "run".to_string(),
                 "--rm".to_string(),
                 "--network".to_string(),
                 "none".to_string(),
                 "-v".to_string(),
-                format!("{}:/workspace", host_workspace),
+                format!("{}:/workspace", container_workspace.display()),
                 "-v".to_string(),
                 format!("{}:/run/autonomous-spec.json:ro", spec_path.display()),
                 "-w".to_string(),
@@ -1951,17 +1972,39 @@ pub async fn autonomous_task_place_node(
                 Ok(result) => result,
                 Err(error) => {
                     let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
+                    let _ =
+                        crate::agent_worktrees::discard_snapshot(&data_dir, &container_snapshot.id);
+                    let _ = std::fs::remove_dir_all(&container_workspace);
                     return Err(autonomous_execution_target_lost(error));
                 }
             };
             let _ = std::fs::remove_file(&spec_path);
-            let placement_result = enforce_autonomous_placement_scope(
-                &data_dir,
-                Path::new(&host_workspace),
-                &local_snapshot.id,
-                &spec,
-            )
-            .and_then(|_| {
+            let placement_result = (|| {
+                if runner_result.get("ok").and_then(Value::as_bool) != Some(false) {
+                    enforce_autonomous_placement_scope(
+                        &data_dir,
+                        &container_workspace,
+                        &container_snapshot.id,
+                        &spec,
+                    )?;
+                    let patch = crate::agent_worktrees::patch_bytes_since_snapshot(
+                        &data_dir,
+                        &container_workspace,
+                        &container_snapshot.id,
+                    )?;
+                    if !patch.is_empty() {
+                        crate::agent_worktrees::apply_patch_artifact(
+                            Path::new(&host_workspace),
+                            &patch,
+                        )?;
+                    }
+                    enforce_autonomous_placement_scope(
+                        &data_dir,
+                        Path::new(&host_workspace),
+                        &local_snapshot.id,
+                        &spec,
+                    )?;
+                }
                 autonomous_placement_result(
                     &data_dir,
                     Path::new(&host_workspace),
@@ -1969,8 +2012,10 @@ pub async fn autonomous_task_place_node(
                     &local_snapshot.id,
                     runner_result,
                 )
-            });
+            })();
             let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
+            let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &container_snapshot.id);
+            let _ = std::fs::remove_dir_all(&container_workspace);
             placement_result
         }
         other => Err(format!(
@@ -2679,6 +2724,177 @@ mod tests {
         .expect("the signal decodes from a raw status value");
         assert_eq!(signal.state, DesktopBackpressureState::Slow);
         assert_eq!(signal.retry_after_ms, Some(26_000));
+    }
+
+    #[tokio::test]
+    async fn docker_placement_round_trips_a_patch_artifact_to_the_host() {
+        let required = std::env::var("LITTLE_MONKEY_REQUIRE_DOCKER_E2E").as_deref() == Ok("1");
+        let Some(image) = std::env::var_os("LITTLE_MONKEY_DOCKER_E2E_IMAGE") else {
+            assert!(!required, "Docker E2E image is required but not configured");
+            eprintln!("SKIPPED: LITTLE_MONKEY_DOCKER_E2E_IMAGE is not configured");
+            return;
+        };
+        let docker_ready = Command::new("docker")
+            .args(["info", "--format", "{{.ServerVersion}}"])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !docker_ready {
+            assert!(!required, "Docker daemon is required but unavailable");
+            eprintln!("SKIPPED: Docker daemon is unavailable");
+            return;
+        }
+
+        let workspace = std::env::temp_dir().join(format!(
+            "little-monkey-docker-e2e-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let verifier = workspace.with_file_name(format!(
+            "little-monkey-docker-e2e-verifier-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let git = |root: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git should start");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let init = |root: &Path| {
+            std::fs::create_dir_all(root).unwrap();
+            git(root, &["init", "-q"]);
+            git(root, &["config", "user.email", "e2e@example.test"]);
+            git(root, &["config", "user.name", "Docker E2E"]);
+            std::fs::write(root.join("a.txt"), "baseline\n").unwrap();
+            git(root, &["add", "."]);
+            git(root, &["commit", "-q", "-m", "baseline"]);
+        };
+        init(&workspace);
+
+        let capability = serde_json::json!({
+            "state": "unsupported",
+            "evidence": "Docker E2E"
+        });
+        let run_spec: crate::run_protocol::RunSpec = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "run_id": "docker-e2e-run",
+            "idempotency_key": "docker-e2e-run",
+            "created_at_ms": 1784000000000u64,
+            "kind": "autonomous_task",
+            "submitted_by": {
+                "client_id": "docker-e2e-test",
+                "instance_id": "docker-e2e-test",
+                "kind": "test",
+                "version": "1"
+            },
+            "task": "Run the Docker E2E mutation",
+            "instructions": null,
+            "input_artifact_ids": [],
+            "target": {
+                "kind": "provider",
+                "target_id": "docker-e2e-target",
+                "label": "Docker E2E target",
+                "provider_id": "test-provider",
+                "endpoint": "https://example.test/v1",
+                "model": "test-model",
+                "credential_ref_id": "docker-e2e-credential",
+                "capabilities": {
+                    "tool_calling": capability,
+                    "vision": capability,
+                    "embeddings": capability,
+                    "structured_output": capability,
+                    "image_generation": capability,
+                    "audio": capability,
+                    "runtime_lifecycle": capability,
+                    "fim": capability,
+                    "code_completion": capability,
+                    "inline_edit": capability,
+                    "fim_metadata": null
+                }
+            },
+            "workspace": {
+                "workspace_id": "docker-e2e-workspace",
+                "primary_root_id": "docker-e2e-root",
+                "roots": [{
+                    "root_id": "docker-e2e-root",
+                    "canonical_path": workspace.canonicalize().unwrap().to_string_lossy(),
+                    "access": "read_write",
+                    "allow_symlinks_within_root": false
+                }],
+                "repository_policy": null
+            },
+            "permission_policy": {
+                "mode": "auto",
+                "unattended": true,
+                "approval_timeout_ms": 1000,
+                "default_tool_decision": "allow",
+                "tool_rules": [],
+                "allow_network": false,
+                "allow_external_mutations": false
+            },
+            "budgets": {
+                "wall_time_ms": 120000,
+                "max_iterations": 1,
+                "max_model_calls": 1,
+                "max_tool_calls": 1,
+                "max_input_tokens": 1,
+                "max_output_tokens": 1,
+                "max_cost_micros": null,
+                "max_artifact_bytes": 1048576,
+                "max_event_count": 32
+            },
+            "autonomous_task": {
+                "task_snapshot": {
+                    "plan": {
+                        "nodes": [{
+                            "nodeId": "docker-e2e-node",
+                            "executionPlacement": {
+                                "kind": "docker",
+                                "targetId": image.to_string_lossy(),
+                                "nodeId": "docker-e2e-node"
+                            },
+                            "mutationScope": ["docker-e2e.txt"]
+                        }]
+                    }
+                }
+            }
+        }))
+        .expect("Docker E2E RunSpec should decode");
+        let result = autonomous_task_place_node(AutonomousTaskPlacementRequest {
+            kind: "docker".to_string(),
+            target_id: image.to_string_lossy().into_owned(),
+            run_spec,
+        })
+        .await
+        .expect("Docker placement should succeed");
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("docker-e2e.txt")).unwrap(),
+            "written by the Docker autonomous runner\n"
+        );
+        let artifact_id = result["artifacts"][0]["artifactId"]
+            .as_str()
+            .expect("Docker placement should return its patch artifact");
+        let data_dir = crate::app_paths::data_dir().expect("app data dir");
+        let store = crate::artifact_store::ArtifactStore::new(data_dir.join("content-v1"))
+            .expect("artifact store");
+        let artifact = store
+            .read(artifact_id)
+            .expect("patch artifact should be readable");
+        init(&verifier);
+        crate::agent_worktrees::apply_patch_artifact(&verifier, &artifact)
+            .expect("host should apply the returned patch artifact");
+        assert_eq!(
+            std::fs::read_to_string(verifier.join("docker-e2e.txt")).unwrap(),
+            "written by the Docker autonomous runner\n"
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&verifier);
     }
 
     fn fixture_schedule(path: &Path, entry_id: &str, cron: &str) -> DaemonRecipeSchedule {

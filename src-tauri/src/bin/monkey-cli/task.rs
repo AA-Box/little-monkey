@@ -167,6 +167,17 @@ fn autonomous_workspace_revision(path: &Path) -> Result<String, String> {
     let mut material = head.stdout;
     material.push(b'\n');
     material.extend_from_slice(&diff.stdout);
+    let index_records = autonomous_index_records(path)?;
+    let mut index_paths = index_records.keys().cloned().collect::<Vec<_>>();
+    index_paths.sort();
+    for relative in index_paths {
+        material.extend_from_slice(relative.as_bytes());
+        material.push(0);
+        if let Some(record) = index_records.get(&relative) {
+            material.extend_from_slice(record);
+        }
+        material.push(0);
+    }
     for relative in autonomous_changed_files(path)? {
         material.extend_from_slice(relative.as_bytes());
         material.push(0);
@@ -241,6 +252,7 @@ struct AutonomousPathSnapshot {
 #[derive(Default)]
 struct AutonomousWorkspaceBaseline {
     files: HashMap<String, Option<AutonomousPathSnapshot>>,
+    index_records: HashMap<String, Vec<u8>>,
 }
 
 fn autonomous_safe_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
@@ -362,6 +374,32 @@ fn autonomous_index_metadata(path: &Path, relative: &str) -> Result<Vec<u8>, Str
     Ok(output.stdout)
 }
 
+fn autonomous_index_records(path: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
+    let output = Command::new("git")
+        .args(["ls-files", "-s", "-v", "-z"])
+        .current_dir(path)
+        .output()
+        .map_err(|error| format!("could not inspect the Git index: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not inspect the Git index: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut records = HashMap::new();
+    for record in output.stdout.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let Some(separator) = record.iter().position(|byte| *byte == b'\t') else {
+            return Err("Git index record omitted its path separator".to_string());
+        };
+        let path = String::from_utf8_lossy(&record[separator + 1..]).to_string();
+        records.insert(path, record[..separator].to_vec());
+    }
+    Ok(records)
+}
+
 fn autonomous_path_snapshot(root: &Path, relative: &str) -> Result<AutonomousPathSnapshot, String> {
     let absolute = autonomous_safe_path(root, relative)?;
     let metadata = std::fs::symlink_metadata(&absolute).ok();
@@ -449,14 +487,6 @@ fn autonomous_git_patch_mode(state: &AutonomousPathState, filesystem_mode: u32) 
     }
 }
 
-fn autonomous_null_device() -> &'static str {
-    if cfg!(windows) {
-        "NUL"
-    } else {
-        "/dev/null"
-    }
-}
-
 fn autonomous_workspace_baseline(path: &Path) -> Result<AutonomousWorkspaceBaseline, String> {
     let mut files = HashMap::new();
     // Git status is one bulk operation. Clean tracked paths need no content
@@ -469,7 +499,10 @@ fn autonomous_workspace_baseline(path: &Path) -> Result<AutonomousWorkspaceBasel
             Some(autonomous_path_snapshot(path, &relative)?),
         );
     }
-    Ok(AutonomousWorkspaceBaseline { files })
+    Ok(AutonomousWorkspaceBaseline {
+        files,
+        index_records: autonomous_index_records(path)?,
+    })
 }
 
 fn autonomous_workspace_delta(
@@ -477,8 +510,17 @@ fn autonomous_workspace_delta(
     baseline: &AutonomousWorkspaceBaseline,
 ) -> Result<Vec<String>, String> {
     let current = autonomous_changed_files(path)?;
+    let current_index = autonomous_index_records(path)?;
     let mut paths = baseline.files.keys().cloned().collect::<HashSet<_>>();
     paths.extend(current);
+    let mut changed_index_paths = baseline
+        .index_records
+        .keys()
+        .chain(current_index.keys())
+        .cloned()
+        .collect::<HashSet<_>>();
+    changed_index_paths.retain(|path| baseline.index_records.get(path) != current_index.get(path));
+    paths.extend(changed_index_paths);
     let mut delta = Vec::new();
     for relative in paths {
         let before = baseline
@@ -488,7 +530,16 @@ fn autonomous_workspace_delta(
             .flatten()
             .unwrap_or(autonomous_head_path_snapshot(path, &relative)?);
         let after = autonomous_path_snapshot(path, &relative)?;
-        if before != after {
+        let index_changed = baseline.index_records.get(&relative) != current_index.get(&relative);
+        let detailed_index_changed = baseline.files.contains_key(&relative)
+            && (before.index_state != after.index_state
+                || before.index_metadata != after.index_metadata);
+        if before.state != after.state
+            || autonomous_git_patch_mode(&before.state, before.mode)
+                != autonomous_git_patch_mode(&after.state, after.mode)
+            || index_changed
+            || detailed_index_changed
+        {
             delta.push(relative);
         }
     }
@@ -721,7 +772,10 @@ fn autonomous_patch_bytes_since_baseline(
     path: &Path,
     baseline: &AutonomousWorkspaceBaseline,
 ) -> Result<Vec<u8>, String> {
-    let temp = std::env::temp_dir().join(format!(
+    // Keep both operands relative to the worktree. Git for Windows rejects
+    // some absolute no-index operands even though the same paths are valid
+    // from the repository root.
+    let temp = path.join(format!(
         "lm-autonomous-patch-{}",
         uuid::Uuid::new_v4().simple()
     ));
@@ -729,6 +783,7 @@ fn autonomous_patch_bytes_since_baseline(
         .map_err(|error| format!("could not create autonomous patch staging directory: {error}"))?;
     let mut patch = Vec::new();
     let mut index_deltas = Vec::new();
+    let current_index = autonomous_index_records(path)?;
     for relative in autonomous_workspace_delta(path, baseline)? {
         let before = baseline
             .files
@@ -739,7 +794,9 @@ fn autonomous_patch_bytes_since_baseline(
         let after = autonomous_path_snapshot(path, &relative)?;
         let before_mode = autonomous_git_patch_mode(&before.state, before.mode);
         let after_mode = autonomous_git_patch_mode(&after.state, after.mode);
-        if before.index_state != after.index_state || before.index_metadata != after.index_metadata
+        if before.index_state != after.index_state
+            || before.index_metadata != after.index_metadata
+            || baseline.index_records.get(&relative) != current_index.get(&relative)
         {
             index_deltas.push(little_monkey_lib::agent_worktrees::WorkspaceIndexDelta {
                 path: relative.clone(),
@@ -747,24 +804,51 @@ fn autonomous_patch_bytes_since_baseline(
                 after_state: after.index_state.clone(),
                 before_metadata: before.index_metadata.clone(),
                 after_metadata: after.index_metadata.clone(),
+                before_record: baseline
+                    .index_records
+                    .get(&relative)
+                    .cloned()
+                    .unwrap_or_default(),
+                after_record: current_index.get(&relative).cloned().unwrap_or_default(),
             });
         }
         if before.state == after.state && before_mode == after_mode {
             continue;
         }
         let before_path = temp.join("before").join(&relative);
-        let after_path = autonomous_safe_path(path, &relative)?;
         let before_exists = autonomous_materialize_patch_state(&before_path, &before.state)?;
         let after_exists = !matches!(after.state, AutonomousPathState::Missing);
         let before_arg = if before_exists {
-            before_path.to_string_lossy().into_owned()
+            before_path
+                .strip_prefix(path)
+                .map_err(|error| error.to_string())?
+                .to_string_lossy()
+                .into_owned()
         } else {
-            autonomous_null_device().to_string()
+            let empty_path = temp.join("empty-before").join(&relative);
+            if let Some(parent) = empty_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(&empty_path, b"").map_err(|error| error.to_string())?;
+            empty_path
+                .strip_prefix(path)
+                .map_err(|error| error.to_string())?
+                .to_string_lossy()
+                .into_owned()
         };
         let after_arg = if after_exists {
-            after_path.to_string_lossy().into_owned()
+            relative.clone()
         } else {
-            autonomous_null_device().to_string()
+            let empty_path = temp.join("empty-after").join(&relative);
+            if let Some(parent) = empty_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(&empty_path, b"").map_err(|error| error.to_string())?;
+            empty_path
+                .strip_prefix(path)
+                .map_err(|error| error.to_string())?
+                .to_string_lossy()
+                .into_owned()
         };
         let output = Command::new("git")
             .args([
@@ -780,8 +864,11 @@ fn autonomous_patch_bytes_since_baseline(
             .map_err(|error| format!("could not collect exact autonomous patch: {error}"))?;
         if !output.status.success() && output.status.code() != Some(1) {
             let _ = std::fs::remove_dir_all(&temp);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim().chars().take(2_048).collect::<String>();
             return Err(format!(
-                "could not collect exact autonomous patch for '{relative}'"
+                "could not collect exact autonomous patch for '{relative}': git diff --no-index exited with status {:?}: {}",
+                output.status.code(), stderr
             ));
         }
         let mut rewritten =
@@ -818,11 +905,20 @@ fn autonomous_restore_baseline_path(
     if let Some(Some(snapshot)) = baseline.files.get(relative) {
         autonomous_restore_state(path, relative, &snapshot.state)?;
         autonomous_restore_mode(path, relative, snapshot.mode)?;
-        return autonomous_restore_index(
+        autonomous_restore_index(
             path,
             relative,
             &snapshot.index_state,
             &snapshot.index_metadata,
+        )?;
+        return little_monkey_lib::agent_worktrees::restore_workspace_index_flags(
+            path,
+            relative,
+            baseline
+                .index_records
+                .get(relative)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
         );
     }
     let tracked = Command::new("git")
@@ -850,6 +946,15 @@ fn autonomous_restore_baseline_path(
                 String::from_utf8_lossy(&restored.stderr).trim()
             ));
         }
+        little_monkey_lib::agent_worktrees::restore_workspace_index_flags(
+            path,
+            relative,
+            baseline
+                .index_records
+                .get(relative)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )?;
     } else {
         autonomous_remove_path(path, relative)?;
     }
@@ -3772,17 +3877,34 @@ async fn execute_autonomous_docker_node(
         "completed_nodes": [],
         "next_node_id": node.node_id
     }));
-    let bytes = serde_json::to_vec_pretty(&docker_spec)
-        .map_err(|error| format!("Could not serialize Docker placement spec: {error}"))?;
-    std::fs::write(&spec_path, bytes)
-        .map_err(|error| format!("Could not persist Docker placement spec: {error}"))?;
+    let bytes = match serde_json::to_vec_pretty(&docker_spec) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Err(format!(
+                "Could not serialize Docker placement spec: {error}"
+            ));
+        }
+    };
+    if let Err(error) = std::fs::write(&spec_path, bytes) {
+        return Err(format!("Could not persist Docker placement spec: {error}"));
+    }
+    let container_workspace =
+        little_monkey_lib::agent_worktrees::prepare_container_workspace(workspace_root)?;
+    let container_baseline = match autonomous_workspace_baseline(&container_workspace) {
+        Ok(baseline) => baseline,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&container_workspace);
+            let _ = std::fs::remove_file(&spec_path);
+            return Err(error);
+        }
+    };
     let args = vec![
         "run".to_string(),
         "--rm".to_string(),
         "--network".to_string(),
         "none".to_string(),
         "-v".to_string(),
-        format!("{}:/workspace", workspace_root.display()),
+        format!("{}:/workspace", container_workspace.display()),
         "-v".to_string(),
         format!("{}:/run/autonomous-spec.json:ro", spec_path.display()),
         "-w".to_string(),
@@ -3793,35 +3915,56 @@ async fn execute_autonomous_docker_node(
         "/run/autonomous-spec.json".to_string(),
         "--json".to_string(),
     ];
-    let output = tokio::task::spawn_blocking(move || {
+    let execution_result = tokio::task::spawn_blocking(move || {
         Command::new("docker")
             .args(args)
             .output()
             .map_err(|error| format!("Docker backend could not start: {error}"))
     })
     .await
-    .map_err(|error| error.to_string())??;
+    .map_err(|error| error.to_string())
+    .and_then(|result| result);
     let _ = std::fs::remove_file(&spec_path);
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !output.status.success() {
-        return Err(format!(
-            "Docker autonomous node failed: {}",
-            if stderr.is_empty() { stdout } else { stderr }
-        ));
-    }
-    let raw = if stdout.is_empty() { stderr } else { stdout };
-    let mut result: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|error| format!("Docker autonomous node returned invalid JSON: {error}"))?;
+    let result = (|| {
+        let output = execution_result?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !output.status.success() {
+            return Err(format!(
+                "Docker autonomous node failed: {}",
+                if stderr.is_empty() { stdout } else { stderr }
+            ));
+        }
+        let raw = if stdout.is_empty() { stderr } else { stdout };
+        let mut result: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|error| format!("Docker autonomous node returned invalid JSON: {error}"))?;
+        let object = result
+            .as_object_mut()
+            .ok_or_else(|| "Docker autonomous node result was not an object".to_string())?;
+        let ok = object
+            .get("ok")
+            .and_then(|value| value.as_bool())
+            .unwrap_or_else(|| object.get("status").and_then(|value| value.as_str()) == Some("ok"));
+        object.insert("ok".to_string(), serde_json::Value::Bool(ok));
+        if !ok {
+            return Ok(result);
+        }
+        enforce_autonomous_mutation_scope(&container_workspace, &container_baseline, node)?;
+        let patch_bytes =
+            autonomous_patch_bytes_since_baseline(&container_workspace, &container_baseline)?;
+        if !patch_bytes.is_empty() {
+            little_monkey_lib::agent_worktrees::apply_patch_artifact(workspace_root, &patch_bytes)
+                .map_err(|error| format!("Could not apply Docker patch artifact: {error}"))?;
+        }
+        enforce_autonomous_mutation_scope(workspace_root, baseline, node)?;
+        Ok(result)
+    })();
+    let _ = std::fs::remove_dir_all(&container_workspace);
+    let mut result = result?;
     let object = result
         .as_object_mut()
         .ok_or_else(|| "Docker autonomous node result was not an object".to_string())?;
-    let ok = object
-        .get("ok")
-        .and_then(|value| value.as_bool())
-        .unwrap_or_else(|| object.get("status").and_then(|value| value.as_str()) == Some("ok"));
-    object.insert("ok".to_string(), serde_json::Value::Bool(ok));
-    if !ok {
+    if object.get("ok").and_then(|value| value.as_bool()) != Some(true) {
         return Ok(result);
     }
     let after_revision = autonomous_workspace_revision(workspace_root)?;
