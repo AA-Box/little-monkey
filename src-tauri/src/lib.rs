@@ -1925,6 +1925,8 @@ pub fn run() {
             desktop_control::desktop_control_request_action,
             desktop_control::desktop_control_respond_action,
             desktop_control::desktop_control_emergency_stop,
+            desktop_control::computer_use_full_product_report,
+            desktop_control::desktop_control_provider_info,
             desktop_control::tool_computer_list_targets,
             desktop_control::tool_computer_screenshot,
             desktop_control::tool_computer_clipboard_read,

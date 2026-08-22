@@ -51,7 +51,17 @@ import { protocolToolCallId } from './durableRun';
 import { formatSkillSearchResults, formatSkillToolResult, type SkillRankingSignals, type SlashSkill } from './skills';
 import { rasterizeSvgToPng, type RasterizedPng } from './imageGeneration';
 import { errorMessage } from "./errors";
-import { ComputerUseRunBudget, CoordinatedInvocationError, coordinateToolInvocation, runCoordinatedInvocation } from './taskCoordinator';
+import {
+  ComputerUseRunBudget,
+  CoordinatedInvocationError,
+  CoordinatedRetryableError,
+  computerUseFailure,
+  coordinateToolInvocation,
+  INPUT_SENT_UNVERIFIED,
+  parseComputerUseFailure,
+  runCoordinatedInvocation,
+  type ComputerUseFailure,
+} from './taskCoordinator';
 import {
   formatProgrammaticExecutionResult,
   PROGRAMMATIC_TOOL_NAME,
@@ -228,6 +238,53 @@ export function stringifyToolResult(result: unknown): string {
 export function stringifyToolError(err: unknown): string {
   const message = err instanceof Error ? err.message : typeof err === 'string' ? err : JSON.stringify(err);
   return JSON.stringify({ error: message });
+}
+
+/** Normalizes a native invoke rejection without ever turning an unknown
+ * transport failure into evidence that no input reached the OS. Rust action
+ * commands reject with the same five-field failure object; plain IPC errors
+ * become terminal/ambiguous here. */
+function stringifyComputerUseError(err: unknown): string {
+  const failure = parseComputerUseFailure(err);
+  return JSON.stringify({ error: failure });
+}
+
+function nativeFailureFromResult(result: string): ComputerUseFailure | null {
+  try {
+    const parsed: unknown = JSON.parse(result);
+    if (!parsed || typeof parsed !== 'object') return null;
+    const record = parsed as Record<string, unknown>;
+    if (record.error !== undefined) {
+      return parseComputerUseFailure(record.error);
+    }
+    if (record.failure !== undefined) {
+      return parseComputerUseFailure(record.failure);
+    }
+  } catch {
+    // A malformed native result is an unknown execution outcome.
+  }
+  return null;
+}
+
+function throwForNativeFailure(result: string): void {
+  const failure = nativeFailureFromResult(result);
+  if (!failure) return;
+  if (failure.safeToRetry === true && failure.inputSent === false) {
+    throw new CoordinatedRetryableError(failure);
+  }
+  throw new CoordinatedInvocationError(failure);
+}
+
+function parseNativeObservation(result: string): unknown {
+  throwForNativeFailure(result);
+  try {
+    return JSON.parse(result);
+  } catch {
+    throw new CoordinatedInvocationError(computerUseFailure(
+      'Native observation returned malformed data',
+      { code: 'UNKNOWN', inputSent: true, safeToRetry: false, phase: 'observe' },
+    ));
+  }
 }
 
 /** The tool-message content used for a call the user's Stop button cancelled
@@ -1270,24 +1327,18 @@ async function executeToolCallInner(
     onPhase: async (phase) => {
       if (coordination.route !== 'native') return;
       if (phase === 'authorize' && typeof args.session_id !== 'string') {
-        throw new Error('Native Computer Use requires an active session grant.');
+        throw new CoordinatedInvocationError(computerUseFailure(
+          'Native Computer Use requires an active session grant.',
+          { code: 'SECURITY_REFUSED', inputSent: false, safeToRetry: false, phase: 'authorize' },
+        ));
       }
       if (phase === 'observe' && name !== 'computer_list_targets') {
         const observation = await invoke('tool_computer_list_targets', {
           session_id: args.session_id,
           turn_id: turnId,
           tool_call_id: protocolToolCallId(toolCall.id),
-        });
-        const observationText = stringifyToolResult(observation);
-        try {
-          const parsed = JSON.parse(observationText) as { error?: unknown };
-          if (parsed && typeof parsed === 'object' && parsed.error) {
-            throw new Error(String(parsed.error));
-          }
-        } catch (error) {
-          if (error instanceof SyntaxError) throw error;
-          throw error;
-        }
+        }).then(stringifyToolResult, stringifyComputerUseError);
+        parseNativeObservation(observation);
       }
       if (
         phase === 'verify'
@@ -1301,17 +1352,8 @@ async function executeToolCallInner(
           query: undefined,
           turn_id: turnId,
           tool_call_id: protocolToolCallId(toolCall.id),
-        });
-        const observationText = stringifyToolResult(observation);
-        try {
-          const parsed = JSON.parse(observationText) as { error?: unknown };
-          if (parsed && typeof parsed === 'object' && parsed.error) {
-            throw new Error(String(parsed.error));
-          }
-        } catch (error) {
-          if (error instanceof SyntaxError) throw error;
-          throw error;
-        }
+        }).then(stringifyToolResult, stringifyComputerUseError);
+        parseNativeObservation(observation);
       }
     },
     execute: () => {
@@ -1331,7 +1373,10 @@ async function executeToolCallInner(
               extensionRegistry ?? new Map(),
             )
               .then((result) => result.tool_result ?? result.output_json, stringifyToolError)
-          : invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
+          : invoke(`tool_${name}`, args).then(
+            stringifyToolResult,
+            coordination.route === 'native' ? stringifyComputerUseError : stringifyToolError,
+          );
       return raceInvocationWithStop(
         invocation,
         turnId,
@@ -1341,6 +1386,7 @@ async function executeToolCallInner(
     },
     verify: (result) => {
       if (coordination.route !== 'native' || typeof result !== 'string') return true;
+      throwForNativeFailure(result);
       try {
         const parsed = JSON.parse(result) as {
           error?: unknown;
@@ -1349,20 +1395,36 @@ async function executeToolCallInner(
           stateVerified?: boolean;
         };
         if (parsed.executed === true && parsed.stateVerified === false && parsed.inputSent === true) {
-          throw new CoordinatedInvocationError();
+          throw new CoordinatedInvocationError(computerUseFailure(
+            `${INPUT_SENT_UNVERIFIED}: input was sent but the requested postcondition was not verified`,
+            { code: 'INPUT_SENT_UNVERIFIED', inputSent: true, safeToRetry: false, phase: 'verify' },
+          ));
         }
-        if (typeof parsed.error === 'string' && parsed.error.length > 0) return false;
-        // A provider/target failure before input is sent is safe to recover
-        // once: the next attempt re-observes and re-authorizes the target.
-        return parsed.executed !== true || parsed.stateVerified !== false;
-      } catch (error) {
-        if (error instanceof CoordinatedInvocationError || result.includes('INPUT_SENT_UNVERIFIED')) {
-          throw new CoordinatedInvocationError();
+        if (parsed.error !== undefined) {
+          throw new CoordinatedInvocationError(parseComputerUseFailure(parsed.error));
+        }
+        if (parsed.executed === true && parsed.stateVerified === false) {
+          throw new CoordinatedInvocationError(computerUseFailure(
+            'Native action returned an unverified execution outcome',
+            { code: 'UNKNOWN', inputSent: true, safeToRetry: false, phase: 'verify' },
+          ));
         }
         return true;
+      } catch (error) {
+        if (error instanceof CoordinatedInvocationError || error instanceof CoordinatedRetryableError) throw error;
+        throw new CoordinatedInvocationError(parseComputerUseFailure(error));
       }
     },
-  }).catch(stringifyToolError);
+  }).catch((error) => {
+    if (coordination.route === 'native') {
+      return stringifyComputerUseError(
+        error instanceof CoordinatedInvocationError || error instanceof CoordinatedRetryableError
+          ? error.failure
+          : error,
+      );
+    }
+    return stringifyToolError(error);
+  });
 }
 
 /** Races an in-flight tool `invoke` against the Stop button: on abort, the

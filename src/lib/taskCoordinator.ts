@@ -16,6 +16,73 @@ export interface CoordinationHooks<T> {
   budget?: ComputerUseRunBudget;
 }
 
+export type ComputerUseFailureCode =
+  | 'PRECONDITION_CHANGED'
+  | 'STALE_OBSERVATION'
+  | 'TARGET_NOT_FOUND'
+  | 'PROVIDER_TRANSIENT_PRE_INPUT'
+  | 'OPERATOR_DENIED'
+  | 'APPROVAL_TIMEOUT'
+  | 'SECURITY_REFUSED'
+  | 'SESSION_PAUSED'
+  | 'SESSION_STOPPED'
+  | 'SESSION_REVOKED'
+  | 'BUDGET_EXCEEDED'
+  | 'INPUT_SENT_UNVERIFIED'
+  | 'INPUT_MAY_HAVE_BEEN_SENT'
+  | 'POSTCONDITION_FAILED'
+  | 'PROVIDER_FAILURE'
+  | 'UNKNOWN';
+
+export type ComputerUseFailurePhase = 'observe' | 'authorize' | 'pre_execute' | 'execute' | 'verify';
+
+export interface ComputerUseFailure {
+  code: ComputerUseFailureCode;
+  inputSent: boolean;
+  safeToRetry: boolean;
+  phase: ComputerUseFailurePhase;
+  message: string;
+}
+
+export function isComputerUseFailure(value: unknown): value is ComputerUseFailure {
+  if (!value || typeof value !== 'object') return false;
+  const failure = value as Record<string, unknown>;
+  return typeof failure.code === 'string'
+    && typeof failure.inputSent === 'boolean'
+    && typeof failure.safeToRetry === 'boolean'
+    && typeof failure.phase === 'string'
+    && typeof failure.message === 'string';
+}
+
+export function computerUseFailure(
+  message: string,
+  overrides: Partial<ComputerUseFailure> = {},
+): ComputerUseFailure {
+  return {
+    code: 'UNKNOWN',
+    inputSent: true,
+    safeToRetry: false,
+    phase: 'execute',
+    message,
+    ...overrides,
+  };
+}
+
+export function parseComputerUseFailure(error: unknown): ComputerUseFailure {
+  if (isComputerUseFailure(error)) return error;
+  const text = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (isComputerUseFailure(parsed)) return parsed;
+    if (parsed && typeof parsed === 'object' && isComputerUseFailure((parsed as Record<string, unknown>).failure)) {
+      return (parsed as Record<string, unknown>).failure as ComputerUseFailure;
+    }
+  } catch {
+    // Unknown invoke/IPC failures are fail-closed below.
+  }
+  return computerUseFailure(text || 'Unknown Computer Use execution failure');
+}
+
 export const COMPUTER_USE_BUDGET_DEFAULTS = {
   maxActions: 50,
   maxScreenshots: 12,
@@ -85,12 +152,41 @@ export class ComputerUseRunBudget {
 export const INPUT_SENT_UNVERIFIED = 'INPUT_SENT_UNVERIFIED';
 
 export class CoordinatedInvocationError extends Error {
-  readonly code = INPUT_SENT_UNVERIFIED;
+  readonly failure: ComputerUseFailure;
+  readonly code: ComputerUseFailureCode;
 
-  constructor() {
-    super(`${INPUT_SENT_UNVERIFIED}: input was sent but the requested postcondition was not verified`);
+  constructor(failure: ComputerUseFailure = computerUseFailure(
+    `${INPUT_SENT_UNVERIFIED}: input was sent but the requested postcondition was not verified`,
+    { code: 'INPUT_SENT_UNVERIFIED', inputSent: true, safeToRetry: false, phase: 'verify' },
+  )) {
+    super(failure.message);
+    this.failure = failure;
+    this.code = failure.code;
     this.name = 'CoordinatedInvocationError';
   }
+}
+
+export class CoordinatedRetryableError extends Error {
+  readonly failure: ComputerUseFailure;
+
+  constructor(failure: ComputerUseFailure) {
+    super(failure.message);
+    this.failure = failure;
+    this.name = 'CoordinatedRetryableError';
+  }
+}
+
+function retryIsExplicitlySafe(error: unknown): error is CoordinatedRetryableError {
+  const retryableCodes: ComputerUseFailureCode[] = [
+    'PRECONDITION_CHANGED',
+    'STALE_OBSERVATION',
+    'TARGET_NOT_FOUND',
+    'PROVIDER_TRANSIENT_PRE_INPUT',
+  ];
+  return error instanceof CoordinatedRetryableError
+    && error.failure.safeToRetry === true
+    && error.failure.inputSent === false
+    && retryableCodes.includes(error.failure.code);
 }
 
 const NATIVE_PREFIX = 'computer_';
@@ -177,7 +273,7 @@ export async function runCoordinatedInvocation<T>(
       }
       if (!hooks.verify || await hooks.verify(result, attempt)) return result;
     } catch (error) {
-      if (error instanceof CoordinatedInvocationError || attempt >= attempts) throw error;
+      if (!retryIsExplicitlySafe(error) || attempt >= attempts) throw error;
     }
   }
   throw new CoordinatedInvocationError();

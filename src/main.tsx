@@ -92,4 +92,9 @@ if (isCompanionOverlay) {
       </ErrorBoundary>
     </React.StrictMode>,
   );
+  if (import.meta.env.VITE_COMPUTER_USE_FULL_PRODUCT_E2E === "1") {
+    void import("./lib/computerUseFullProductE2e").then(({ runComputerUseFullProductE2e }) => {
+      window.setTimeout(() => void runComputerUseFullProductE2e(), 1_500);
+    });
+  }
 });

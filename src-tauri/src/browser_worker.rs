@@ -824,6 +824,16 @@ impl BrowserWorkflowAdapter {
     pub fn shutdown_all(&self) -> Result<usize, String> {
         self.state.shutdown_all()
     }
+
+    /// Reads an artifact produced by this adapter's owned browser session.
+    /// Acceptance harnesses use this to prove that model-visible DOM content
+    /// came from the real Chromium/CDP path, rather than from a fixture string
+    /// copied directly into the native half of a test.
+    pub fn read_artifact(&self, artifact_id: &str) -> Result<Vec<u8>, String> {
+        self.artifacts
+            .read(artifact_id)
+            .map_err(|error| error.to_string())
+    }
 }
 
 struct OwnedBrowser {

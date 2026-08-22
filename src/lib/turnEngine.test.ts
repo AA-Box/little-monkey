@@ -299,7 +299,13 @@ describe("executeToolCall / programmatic dispatcher integration", () => {
       if (command === "tool_computer_inspect") return JSON.stringify({ elements: [] });
       if (command === "tool_computer_click") {
         clickAttempts += 1;
-        if (clickAttempts === 1) throw new Error("transient provider failure");
+        if (clickAttempts === 1) throw new Error(JSON.stringify({
+          code: "PROVIDER_TRANSIENT_PRE_INPUT",
+          inputSent: false,
+          safeToRetry: true,
+          phase: "pre_execute",
+          message: "transient provider failure before input",
+        }));
         return JSON.stringify({ executed: true, inputSent: true, stateVerified: true });
       }
       throw new Error(`unexpected command ${command}`);
@@ -371,8 +377,94 @@ describe("executeToolCall / programmatic dispatcher integration", () => {
       { computerUseBudget: new ComputerUseRunBudget() },
     );
 
-    expect(JSON.parse(result).error).toMatch(/INPUT_SENT_UNVERIFIED/);
+    expect(JSON.parse(result).error).toMatchObject({ code: "INPUT_SENT_UNVERIFIED", inputSent: true, safeToRetry: false });
     expect(invokeMock.mock.calls.filter(([command]) => command === "tool_computer_click")).toHaveLength(1);
+  });
+
+  it("fails closed on an unknown native IPC rejection without retrying", async () => {
+    let actionCalls = 0;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "tool_computer_list_targets") return JSON.stringify({ targets: [{ window_id: "w-1" }] });
+      if (command === "tool_computer_inspect") return JSON.stringify({ elements: [] });
+      if (command === "tool_computer_click") {
+        actionCalls += 1;
+        throw new Error("IPC connection lost after the provider ran");
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const result = await executeToolCall(
+      call("computer_click", {
+        session_id: "desktop-session",
+        target_application_id: "Notes",
+        target_window_id: "w-1",
+        element_id: "Notes::element-1::native-button",
+      }),
+      null,
+      "turn-native-unknown-ipc",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { computerUseBudget: new ComputerUseRunBudget() },
+    );
+
+    expect(JSON.parse(result).error).toMatchObject({ code: "UNKNOWN", inputSent: true, safeToRetry: false });
+    expect(actionCalls).toBe(1);
+  });
+
+  it.each([
+    ["ambiguous provider failure", { code: "INPUT_MAY_HAVE_BEEN_SENT", inputSent: true, safeToRetry: false, phase: "execute", message: "partial input" }],
+    ["operator denial", { code: "OPERATOR_DENIED", inputSent: false, safeToRetry: false, phase: "authorize", message: "denied" }],
+    ["approval timeout", { code: "APPROVAL_TIMEOUT", inputSent: false, safeToRetry: false, phase: "authorize", message: "timeout" }],
+    ["paused session", { code: "SESSION_PAUSED", inputSent: false, safeToRetry: false, phase: "authorize", message: "paused" }],
+    ["stopped session", { code: "SESSION_STOPPED", inputSent: false, safeToRetry: false, phase: "authorize", message: "stopped" }],
+    ["revoked session", { code: "SESSION_REVOKED", inputSent: false, safeToRetry: false, phase: "authorize", message: "revoked" }],
+    ["security refusal", { code: "SECURITY_REFUSED", inputSent: false, safeToRetry: false, phase: "authorize", message: "refused" }],
+  ] as const)("never retries %s", async (_label, failure) => {
+    let actionCalls = 0;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "tool_computer_list_targets") return JSON.stringify({ targets: [{ window_id: "w-1" }] });
+      if (command === "tool_computer_inspect") return JSON.stringify({ elements: [] });
+      if (command === "tool_computer_click") {
+        actionCalls += 1;
+        throw new Error(JSON.stringify(failure));
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const result = await executeToolCall(
+      call("computer_click", {
+        session_id: "desktop-session",
+        target_application_id: "Notes",
+        target_window_id: "w-1",
+        element_id: "Notes::element-1::native-button",
+      }),
+      null,
+      `turn-terminal-${failure.code}`,
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { computerUseBudget: new ComputerUseRunBudget() },
+    );
+
+    expect(JSON.parse(result).error).toMatchObject(failure);
+    expect(actionCalls).toBe(1);
   });
 
   it("runs one mixed browser-to-native golden task through the canonical dispatcher", async () => {

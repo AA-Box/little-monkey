@@ -119,7 +119,6 @@ if (Test-Path -LiteralPath $profilePath) {
 $save.Add_Click({
     @{profile=$profile.Text;dark=[bool]$dark.IsChecked} | ConvertTo-Json | Set-Content -LiteralPath $profilePath -Encoding UTF8
     $status.Text = 'Saved'
-    [System.Windows.Automation.AutomationProperties]::SetName($status, 'Saved')
 })
 
 $window.Content = $grid

@@ -69,9 +69,140 @@ pub const MAX_SESSION_LIFETIME_MS: u64 = 30 * 60 * 1_000;
 
 const DEFAULT_COMPUTER_USE_MAX_ACTIONS: u64 = 50;
 const DEFAULT_COMPUTER_USE_MAX_SCREENSHOTS: u64 = 12;
-const DEFAULT_COMPUTER_USE_MAX_RETRIES: u64 = 5;
+const DEFAULT_COMPUTER_USE_MAX_RETRIES: u64 = 1;
 const DEFAULT_COMPUTER_USE_MAX_MODEL_CALLS: u64 = 20;
 const DEFAULT_COMPUTER_USE_DEADLINE_MS: u64 = 15 * 60 * 1_000;
+
+/// Machine-readable failure contract shared by the native provider, Tauri
+/// commands, and the frontend coordinator. An absent/unknown outcome is
+/// deliberately represented as terminal rather than retryable.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ComputerUseFailureCode {
+    PreconditionChanged,
+    StaleObservation,
+    TargetNotFound,
+    ProviderTransientPreInput,
+    OperatorDenied,
+    ApprovalTimeout,
+    SecurityRefused,
+    SessionPaused,
+    SessionStopped,
+    SessionRevoked,
+    BudgetExceeded,
+    InputSentUnverified,
+    InputMayHaveBeenSent,
+    PostconditionFailed,
+    ProviderFailure,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerUseFailurePhase {
+    Observe,
+    Authorize,
+    PreExecute,
+    Execute,
+    Verify,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputerUseFailure {
+    pub code: ComputerUseFailureCode,
+    pub input_sent: bool,
+    pub safe_to_retry: bool,
+    pub phase: ComputerUseFailurePhase,
+    pub message: String,
+}
+
+impl ComputerUseFailure {
+    fn provider_failure(message: String, input_sent: bool, safe_to_retry: bool) -> Self {
+        Self {
+            code: if input_sent {
+                ComputerUseFailureCode::InputMayHaveBeenSent
+            } else {
+                ComputerUseFailureCode::ProviderFailure
+            },
+            input_sent,
+            safe_to_retry,
+            phase: ComputerUseFailurePhase::Execute,
+            message,
+        }
+    }
+
+    fn pre_input_provider_failure(message: String) -> Self {
+        Self {
+            code: ComputerUseFailureCode::ProviderTransientPreInput,
+            input_sent: false,
+            safe_to_retry: true,
+            phase: ComputerUseFailurePhase::PreExecute,
+            message,
+        }
+    }
+
+    fn ambiguous(message: String) -> Self {
+        Self::provider_failure(message, true, false)
+    }
+
+    fn wire(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            "{\"code\":\"UNKNOWN\",\"inputSent\":true,\"safeToRetry\":false,\"phase\":\"execute\",\"message\":\"Computer Use failure\"}".to_string()
+        })
+    }
+}
+
+fn wire_control_failure(
+    code: ComputerUseFailureCode,
+    phase: ComputerUseFailurePhase,
+    message: String,
+) -> String {
+    ComputerUseFailure {
+        code,
+        input_sent: false,
+        safe_to_retry: false,
+        phase,
+        message,
+    }
+    .wire()
+}
+
+fn wire_control_error(message: String, phase: ComputerUseFailurePhase) -> String {
+    if serde_json::from_str::<ComputerUseFailure>(&message).is_ok() {
+        return message;
+    }
+    let normalized = message.to_ascii_lowercase();
+    let code = if normalized.contains("paused") {
+        ComputerUseFailureCode::SessionPaused
+    } else if normalized.contains("revoked") {
+        ComputerUseFailureCode::SessionRevoked
+    } else if normalized.contains("stopped")
+        || normalized.contains("inactive")
+        || normalized.contains("expired")
+        || normalized.contains("missing")
+    {
+        ComputerUseFailureCode::SessionStopped
+    } else if normalized.contains("budget") {
+        ComputerUseFailureCode::BudgetExceeded
+    } else if normalized.contains("outside")
+        || normalized.contains("allowlist")
+        || normalized.contains("sensitive")
+        || normalized.contains("blocked")
+        || normalized.contains("invalid")
+        || normalized.contains("needs")
+    {
+        ComputerUseFailureCode::SecurityRefused
+    } else {
+        ComputerUseFailureCode::Unknown
+    };
+    wire_control_failure(code, phase, message)
+}
+
+/// Provider implementations may override the `*_attested` methods below to
+/// report a known pre-input failure. The legacy methods remain available for
+/// existing platform adapters, but their errors are fail-closed.
+pub type ProviderExecutionFailure = ComputerUseFailure;
 
 /// Shared, atomic limits for one native Computer Use run. The frontend owns
 /// model-call/retry charging; this same object owns the host-side action and
@@ -352,9 +483,35 @@ pub trait DesktopInputBackend: Send + Sync {
     fn click(&self, button: MouseButtonKind) -> Result<(), String>;
     fn key_press(&self, key: &str) -> Result<(), String>;
 
+    fn move_mouse_attested(&self, x: i32, y: i32) -> Result<(), ProviderExecutionFailure> {
+        self.move_mouse(x, y)
+            .map_err(ComputerUseFailure::pre_input_provider_failure)
+    }
+
+    fn click_attested(&self, button: MouseButtonKind) -> Result<(), ProviderExecutionFailure> {
+        self.click(button).map_err(ComputerUseFailure::ambiguous)
+    }
+
+    fn key_press_attested(&self, key: &str) -> Result<(), ProviderExecutionFailure> {
+        self.key_press(key).map_err(ComputerUseFailure::ambiguous)
+    }
+
     fn double_click(&self, button: MouseButtonKind) -> Result<(), String> {
         self.click(button)?;
         self.click(button)
+    }
+
+    fn double_click_attested(
+        &self,
+        button: MouseButtonKind,
+    ) -> Result<(), ProviderExecutionFailure> {
+        self.click_attested(button)?;
+        self.click_attested(button)
+            .map_err(|error| ComputerUseFailure {
+                input_sent: true,
+                safe_to_retry: false,
+                ..error
+            })
     }
 
     fn drag(&self, from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> Result<(), String> {
@@ -362,6 +519,29 @@ pub trait DesktopInputBackend: Send + Sync {
         self.click(MouseButtonKind::Left)?;
         self.move_mouse(to_x, to_y)?;
         self.click(MouseButtonKind::Left)
+    }
+
+    fn drag_attested(
+        &self,
+        from_x: i32,
+        from_y: i32,
+        to_x: i32,
+        to_y: i32,
+    ) -> Result<(), ProviderExecutionFailure> {
+        self.move_mouse_attested(from_x, from_y)?;
+        self.click_attested(MouseButtonKind::Left)?;
+        self.move_mouse_attested(to_x, to_y)
+            .map_err(|error| ComputerUseFailure {
+                input_sent: true,
+                safe_to_retry: false,
+                ..error
+            })?;
+        self.click_attested(MouseButtonKind::Left)
+            .map_err(|error| ComputerUseFailure {
+                input_sent: true,
+                safe_to_retry: false,
+                ..error
+            })
     }
 
     fn scroll(&self, delta_x: i32, delta_y: i32) -> Result<(), String> {
@@ -374,6 +554,11 @@ pub trait DesktopInputBackend: Send + Sync {
         Ok(())
     }
 
+    fn scroll_attested(&self, delta_x: i32, delta_y: i32) -> Result<(), ProviderExecutionFailure> {
+        self.scroll(delta_x, delta_y)
+            .map_err(ComputerUseFailure::ambiguous)
+    }
+
     fn type_text(&self, text: &str) -> Result<(), String> {
         for character in text.chars() {
             self.key_press(&character.to_string())?;
@@ -381,9 +566,43 @@ pub trait DesktopInputBackend: Send + Sync {
         Ok(())
     }
 
+    fn type_text_attested(&self, text: &str) -> Result<(), ProviderExecutionFailure> {
+        let mut input_sent = false;
+        for character in text.chars() {
+            match self.key_press_attested(&character.to_string()) {
+                Ok(()) => input_sent = true,
+                Err(error) => {
+                    return Err(ComputerUseFailure {
+                        input_sent: input_sent || error.input_sent,
+                        safe_to_retry: !input_sent && error.safe_to_retry,
+                        ..error
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn hotkey(&self, keys: &[String]) -> Result<(), String> {
         for key in keys {
             self.key_press(key)?;
+        }
+        Ok(())
+    }
+
+    fn hotkey_attested(&self, keys: &[String]) -> Result<(), ProviderExecutionFailure> {
+        let mut input_sent = false;
+        for key in keys {
+            match self.key_press_attested(key) {
+                Ok(()) => input_sent = true,
+                Err(error) => {
+                    return Err(ComputerUseFailure {
+                        input_sent: input_sent || error.input_sent,
+                        safe_to_retry: !input_sent && error.safe_to_retry,
+                        ..error
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -463,6 +682,32 @@ pub trait DesktopSemanticBackend: Send + Sync {
         target: &ComputerTarget,
         bounds: Option<ComputerBounds>,
     ) -> Result<(Vec<u8>, ComputerBounds), String>;
+
+    fn focus_attested(&self, target: &ComputerTarget) -> Result<(), ProviderExecutionFailure> {
+        self.focus(target).map_err(ComputerUseFailure::ambiguous)
+    }
+
+    fn click_element_attested(
+        &self,
+        target: &ComputerTarget,
+        element_id: &str,
+        button: MouseButtonKind,
+        double: bool,
+    ) -> Result<(), ProviderExecutionFailure> {
+        self.click_element(target, element_id, button, double)
+            .map_err(ComputerUseFailure::ambiguous)
+    }
+
+    fn set_value_attested(
+        &self,
+        target: &ComputerTarget,
+        element_id: &str,
+        value: &str,
+        select: bool,
+    ) -> Result<(), ProviderExecutionFailure> {
+        self.set_value(target, element_id, value, select)
+            .map_err(ComputerUseFailure::ambiguous)
+    }
 }
 
 #[derive(Default)]
@@ -3421,25 +3666,39 @@ impl DesktopControlState {
         match action {
             ControlAction::MouseMove { x, y } => {
                 validate_coordinates(&target, *x, *y)?;
-                self.backend.move_mouse(*x, *y)?;
+                self.backend
+                    .move_mouse_attested(*x, *y)
+                    .map_err(|error| error.wire())?;
                 input_sent = true;
             }
             ControlAction::MouseClick { button } => {
-                self.backend.click(*button)?;
+                self.backend
+                    .click_attested(*button)
+                    .map_err(|error| error.wire())?;
                 input_sent = true;
             }
             ControlAction::MouseClickAt { x, y, button } => {
-                self.backend.move_mouse(*x, *y)?;
-                self.backend.click(*button)?;
+                self.backend
+                    .move_mouse_attested(*x, *y)
+                    .map_err(|error| error.wire())?;
+                self.backend
+                    .click_attested(*button)
+                    .map_err(|error| error.wire())?;
                 input_sent = true;
             }
             ControlAction::MouseDoubleClick { button } => {
-                self.backend.double_click(*button)?;
+                self.backend
+                    .double_click_attested(*button)
+                    .map_err(|error| error.wire())?;
                 input_sent = true;
             }
             ControlAction::MouseDoubleClickAt { x, y, button } => {
-                self.backend.move_mouse(*x, *y)?;
-                self.backend.double_click(*button)?;
+                self.backend
+                    .move_mouse_attested(*x, *y)
+                    .map_err(|error| error.wire())?;
+                self.backend
+                    .double_click_attested(*button)
+                    .map_err(|error| error.wire())?;
                 input_sent = true;
             }
             ControlAction::MouseDrag {
@@ -3448,51 +3707,69 @@ impl DesktopControlState {
                 to_x,
                 to_y,
             } => {
-                self.backend.drag(*from_x, *from_y, *to_x, *to_y)?;
+                self.backend
+                    .drag_attested(*from_x, *from_y, *to_x, *to_y)
+                    .map_err(|error| error.wire())?;
                 input_sent = true;
             }
             ControlAction::Scroll { delta_x, delta_y } => {
-                self.backend.scroll(*delta_x, *delta_y)?;
+                self.backend
+                    .scroll_attested(*delta_x, *delta_y)
+                    .map_err(|error| error.wire())?;
                 input_sent = true;
             }
             ControlAction::TypeText { text } => {
-                self.backend.type_text(text)?;
+                self.backend
+                    .type_text_attested(text)
+                    .map_err(|error| error.wire())?;
                 input_sent = true;
             }
             ControlAction::KeyPress { key } => {
                 if key.is_empty() || key.len() > 64 || key.chars().any(char::is_control) {
                     return Err("Key name is invalid or too long".to_string());
                 }
-                self.backend.key_press(key)?;
+                self.backend
+                    .key_press_attested(key)
+                    .map_err(|error| error.wire())?;
                 input_sent = true;
             }
             ControlAction::Hotkey { keys } => {
-                self.backend.hotkey(keys)?;
+                self.backend
+                    .hotkey_attested(keys)
+                    .map_err(|error| error.wire())?;
                 input_sent = true;
             }
             ControlAction::Focus => {
-                self.semantic.focus(&target)?;
+                self.semantic
+                    .focus_attested(&target)
+                    .map_err(|error| error.wire())?;
             }
             ControlAction::SemanticClick {
                 element_id, button, ..
             } => {
                 self.semantic
-                    .click_element(&target, element_id, *button, false)?;
+                    .click_element_attested(&target, element_id, *button, false)
+                    .map_err(|error| error.wire())?;
                 input_sent = true;
             }
             ControlAction::SemanticDoubleClick {
                 element_id, button, ..
             } => {
                 self.semantic
-                    .click_element(&target, element_id, *button, true)?;
+                    .click_element_attested(&target, element_id, *button, true)
+                    .map_err(|error| error.wire())?;
                 input_sent = true;
             }
             ControlAction::Select { element_id, value } => {
-                self.semantic.set_value(&target, element_id, value, true)?;
+                self.semantic
+                    .set_value_attested(&target, element_id, value, true)
+                    .map_err(|error| error.wire())?;
                 input_sent = true;
             }
             ControlAction::SetValue { element_id, value } => {
-                self.semantic.set_value(&target, element_id, value, false)?;
+                self.semantic
+                    .set_value_attested(&target, element_id, value, false)
+                    .map_err(|error| error.wire())?;
                 input_sent = true;
             }
             ControlAction::Wait { milliseconds } => {
@@ -3965,6 +4242,46 @@ fn ensure_control_window(window: &tauri::Window) -> Result<(), String> {
     }
 }
 
+/// Test-only product seam used by the full frontend/native acceptance job.
+/// It is inert unless the CI flag and an explicit report path are both set;
+/// the report is written by the host process after the frontend has completed
+/// its real dispatcher/IPC/native flow, then the app exits so the gate cannot
+/// pass on a detached or timed-out webview.
+#[tauri::command]
+pub fn computer_use_full_product_report(
+    app: tauri::AppHandle,
+    report: serde_json::Value,
+) -> Result<(), String> {
+    if std::env::var("COMPUTER_USE_FULL_PRODUCT_E2E").as_deref() != Ok("1") {
+        return Err("full product Computer Use acceptance is disabled".to_string());
+    }
+    let path = std::env::var("COMPUTER_USE_FULL_PRODUCT_REPORT")
+        .map_err(|_| "COMPUTER_USE_FULL_PRODUCT_REPORT is not configured".to_string())?;
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("could not write full product evidence: {error}"))?;
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn desktop_control_provider_info() -> serde_json::Value {
+    serde_json::json!({
+        "backend": "production",
+        "provider": if cfg!(target_os = "windows") {
+            "UIAutomation"
+        } else if cfg!(target_os = "macos") {
+            "Accessibility"
+        } else if cfg!(target_os = "linux") {
+            "AT-SPI"
+        } else {
+            "unsupported"
+        },
+    })
+}
+
 #[tauri::command]
 pub fn desktop_control_start_session(
     app: tauri::AppHandle,
@@ -4124,12 +4441,25 @@ async fn request_action_impl(
                 Some(error.clone()),
                 &context,
             );
-            return Err(error);
+            return Err(wire_control_error(
+                error,
+                ComputerUseFailurePhase::Authorize,
+            ));
         }
     };
     match gate {
         ActionGate::Executed(result) => {
-            let result = result?;
+            let result = result.map_err(|error| {
+                if error.trim_start().starts_with('{') {
+                    error
+                } else {
+                    wire_control_failure(
+                        ComputerUseFailureCode::Unknown,
+                        ComputerUseFailurePhase::Execute,
+                        error,
+                    )
+                }
+            })?;
             Ok(ActionOutcome {
                 action_id: format!("batch-{}", Uuid::new_v4()),
                 executed: true,
@@ -4161,7 +4491,12 @@ async fn request_action_impl(
             );
             match tokio::time::timeout(ACTION_APPROVAL_TIMEOUT, receiver).await {
                 Ok(Ok(true)) => {
-                    let result = state.take_approved_pending(&action_id, &action)?;
+                    let result =
+                        state
+                            .take_approved_pending(&action_id, &action)
+                            .map_err(|error| {
+                                wire_control_error(error, ComputerUseFailurePhase::Authorize)
+                            })?;
                     Ok(ActionOutcome {
                         action_id,
                         executed: true,
@@ -4186,7 +4521,11 @@ async fn request_action_impl(
                         Some("operator denied the pending action".to_string()),
                         &context,
                     );
-                    Err("Control action was denied".to_string())
+                    Err(wire_control_failure(
+                        ComputerUseFailureCode::OperatorDenied,
+                        ComputerUseFailurePhase::Authorize,
+                        "Control action was denied".to_string(),
+                    ))
                 }
                 // Timed out, or the sender was dropped without a response.
                 Ok(Err(_)) | Err(_) => {
@@ -4203,7 +4542,11 @@ async fn request_action_impl(
                         Some("operator approval timed out".to_string()),
                         &context,
                     );
-                    Err("Control action approval timed out".to_string())
+                    Err(wire_control_failure(
+                        ComputerUseFailureCode::ApprovalTimeout,
+                        ComputerUseFailurePhase::Authorize,
+                        "Control action approval timed out".to_string(),
+                    ))
                 }
             }
         }
@@ -4218,7 +4561,9 @@ pub fn tool_computer_list_targets(
     tool_call_id: Option<String>,
 ) -> Result<Vec<ComputerTarget>, String> {
     let _ = (turn_id, tool_call_id);
-    state.list_targets_for_session(&session_id)
+    state
+        .list_targets_for_session(&session_id)
+        .map_err(|error| wire_control_error(error, ComputerUseFailurePhase::Observe))
 }
 
 #[tauri::command]
@@ -4232,12 +4577,14 @@ pub fn tool_computer_inspect(
     tool_call_id: Option<String>,
 ) -> Result<ComputerInspection, String> {
     let _ = (turn_id, tool_call_id);
-    state.inspect_for_session(
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        query.as_deref(),
-    )
+    state
+        .inspect_for_session(
+            &session_id,
+            &target_application_id,
+            target_window_id.as_deref(),
+            query.as_deref(),
+        )
+        .map_err(|error| wire_control_error(error, ComputerUseFailurePhase::Observe))
 }
 
 #[tauri::command]
@@ -4252,34 +4599,37 @@ pub fn tool_computer_screenshot(
     turn_id: Option<String>,
     tool_call_id: Option<String>,
 ) -> Result<ComputerScreenshot, String> {
-    let (target, bytes, captured_bounds) = state.screenshot_for_session(
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        bounds,
-    )?;
-    let blob = crate::artifact_commands::store_for(&app, app_state.inner())?
-        .put(&bytes)
-        .map_err(|error| format!("Could not store screenshot artifact: {error}"))?;
-    let audit_id = state.record_screenshot_audit(
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        &blob.id,
-        &AuditContext {
-            run_id: turn_id,
-            tool_call_id,
-        },
-    )?;
-    Ok(ComputerScreenshot {
-        artifact_id: blob.id,
-        audit_id,
-        media_type: "image/png".to_string(),
-        size_bytes: blob.size,
-        content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
-        bounds: captured_bounds,
-        target,
-    })
+    let result = (|| {
+        let (target, bytes, captured_bounds) = state.screenshot_for_session(
+            &session_id,
+            &target_application_id,
+            target_window_id.as_deref(),
+            bounds,
+        )?;
+        let blob = crate::artifact_commands::store_for(&app, app_state.inner())?
+            .put(&bytes)
+            .map_err(|error| format!("Could not store screenshot artifact: {error}"))?;
+        let audit_id = state.record_screenshot_audit(
+            &session_id,
+            &target_application_id,
+            target_window_id.as_deref(),
+            &blob.id,
+            &AuditContext {
+                run_id: turn_id,
+                tool_call_id,
+            },
+        )?;
+        Ok(ComputerScreenshot {
+            artifact_id: blob.id,
+            audit_id,
+            media_type: "image/png".to_string(),
+            size_bytes: blob.size,
+            content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            bounds: captured_bounds,
+            target,
+        })
+    })();
+    result.map_err(|error| wire_control_error(error, ComputerUseFailurePhase::Execute))
 }
 
 #[tauri::command]
@@ -4291,20 +4641,24 @@ pub fn tool_computer_clipboard_read(
     turn_id: Option<String>,
     tool_call_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let (content, audit_id) = state.clipboard_for_session(
-        &session_id,
-        &target_application_id,
-        target_window_id.as_deref(),
-        &AuditContext {
-            run_id: turn_id,
-            tool_call_id,
-        },
-    )?;
-    Ok(serde_json::json!({
-        "content": content,
-        "auditId": audit_id,
-        "note": "Clipboard reads are separately granted and are never included in the audit content",
-    }))
+    let result = state
+        .clipboard_for_session(
+            &session_id,
+            &target_application_id,
+            target_window_id.as_deref(),
+            &AuditContext {
+                run_id: turn_id,
+                tool_call_id,
+            },
+        )
+        .map(|(content, audit_id)| {
+            serde_json::json!({
+                "content": content,
+                "auditId": audit_id,
+                "note": "Clipboard reads are separately granted and are never included in the audit content",
+            })
+        });
+    result.map_err(|error| wire_control_error(error, ComputerUseFailurePhase::Observe))
 }
 
 #[tauri::command]
@@ -4354,8 +4708,18 @@ pub async fn tool_computer_click(
         }
     } else {
         ControlAction::MouseClickAt {
-            x: x.ok_or_else(|| "computer_click needs element_id or x and y".to_string())?,
-            y: y.ok_or_else(|| "computer_click needs element_id or x and y".to_string())?,
+            x: x.ok_or_else(|| {
+                wire_control_error(
+                    "computer_click needs element_id or x and y".to_string(),
+                    ComputerUseFailurePhase::Authorize,
+                )
+            })?,
+            y: y.ok_or_else(|| {
+                wire_control_error(
+                    "computer_click needs element_id or x and y".to_string(),
+                    ComputerUseFailurePhase::Authorize,
+                )
+            })?,
             button,
         }
     };
@@ -4396,8 +4760,18 @@ pub async fn tool_computer_double_click(
         }
     } else {
         ControlAction::MouseDoubleClickAt {
-            x: x.ok_or_else(|| "computer_double_click needs element_id or x and y".to_string())?,
-            y: y.ok_or_else(|| "computer_double_click needs element_id or x and y".to_string())?,
+            x: x.ok_or_else(|| {
+                wire_control_error(
+                    "computer_double_click needs element_id or x and y".to_string(),
+                    ComputerUseFailurePhase::Authorize,
+                )
+            })?,
+            y: y.ok_or_else(|| {
+                wire_control_error(
+                    "computer_double_click needs element_id or x and y".to_string(),
+                    ComputerUseFailurePhase::Authorize,
+                )
+            })?,
             button,
         }
     };
@@ -4621,8 +4995,51 @@ pub fn desktop_control_emergency_stop(
 mod tests {
     use super::*;
 
+    struct PartialInputBackend {
+        key_presses: std::sync::atomic::AtomicUsize,
+        clicks: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PartialInputBackend {
+        fn new() -> Self {
+            Self {
+                key_presses: std::sync::atomic::AtomicUsize::new(0),
+                clicks: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl DesktopInputBackend for PartialInputBackend {
+        fn move_mouse(&self, _x: i32, _y: i32) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn click(&self, _button: MouseButtonKind) -> Result<(), String> {
+            let call = self
+                .clicks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                Ok(())
+            } else {
+                Err("provider failed after the first click".to_string())
+            }
+        }
+
+        fn key_press(&self, _key: &str) -> Result<(), String> {
+            let call = self
+                .key_presses
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                Ok(())
+            } else {
+                Err("provider failed after the first key".to_string())
+            }
+        }
+    }
+
     struct EffectiveActionTestBackend {
         effective_label: std::sync::Arc<std::sync::Mutex<String>>,
+        fail_click: bool,
     }
 
     impl EffectiveActionTestBackend {
@@ -4718,7 +5135,11 @@ mod tests {
             _button: MouseButtonKind,
             _double: bool,
         ) -> Result<(), String> {
-            Ok(())
+            if self.fail_click {
+                Err("semantic provider returned an ambiguous invocation error".to_string())
+            } else {
+                Ok(())
+            }
         }
 
         fn set_value(
@@ -4742,6 +5163,24 @@ mod tests {
 
     fn state() -> DesktopControlState {
         DesktopControlState::with_backend(Arc::new(NullBackend))
+    }
+
+    fn partial_failure(action: ControlAction) -> ComputerUseFailure {
+        let state = DesktopControlState::with_backend(Arc::new(PartialInputBackend::new()));
+        let session = state
+            .start_session_impl("manual", allow(&["Notes"]), 60_000, true)
+            .unwrap();
+        let ActionGate::Executed(result) = state
+            .begin_action(&session.session_id, "Notes", action)
+            .unwrap()
+        else {
+            panic!("approved batch must execute immediately");
+        };
+        let error = match result {
+            Ok(_) => panic!("partial provider failure unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        serde_json::from_str(&error).expect("provider failure must be typed JSON")
     }
 
     fn allow(apps: &[&str]) -> Vec<String> {
@@ -4855,6 +5294,119 @@ mod tests {
     }
 
     #[test]
+    fn partial_input_failures_are_terminal_and_attest_input_sent() {
+        let typed = partial_failure(ControlAction::TypeText {
+            text: "hello".to_string(),
+        });
+        assert_eq!(typed.code, ComputerUseFailureCode::InputMayHaveBeenSent);
+        assert!(typed.input_sent);
+        assert!(!typed.safe_to_retry);
+
+        let hotkey = partial_failure(ControlAction::Hotkey {
+            keys: vec!["ctrl".to_string(), "c".to_string()],
+        });
+        assert!(hotkey.input_sent);
+        assert!(!hotkey.safe_to_retry);
+
+        let double_click = partial_failure(ControlAction::MouseDoubleClick {
+            button: MouseButtonKind::Left,
+        });
+        assert!(double_click.input_sent);
+        assert!(!double_click.safe_to_retry);
+    }
+
+    #[test]
+    fn provider_contract_can_attest_a_safe_pre_input_retry() {
+        struct PreInputBackend;
+        impl DesktopInputBackend for PreInputBackend {
+            fn move_mouse(&self, _x: i32, _y: i32) -> Result<(), String> {
+                Ok(())
+            }
+            fn click(&self, _button: MouseButtonKind) -> Result<(), String> {
+                Ok(())
+            }
+            fn key_press(&self, _key: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn click_attested(
+                &self,
+                _button: MouseButtonKind,
+            ) -> Result<(), ProviderExecutionFailure> {
+                Err(ComputerUseFailure::pre_input_provider_failure(
+                    "accessibility provider unavailable before click".to_string(),
+                ))
+            }
+        }
+
+        let state = DesktopControlState::with_backend(Arc::new(PreInputBackend));
+        let session = state
+            .start_session_impl("manual", allow(&["Notes"]), 60_000, true)
+            .unwrap();
+        let ActionGate::Executed(result) = state
+            .begin_action(
+                &session.session_id,
+                "Notes",
+                ControlAction::MouseClick {
+                    button: MouseButtonKind::Left,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("approved batch must execute immediately");
+        };
+        let error = match result {
+            Ok(_) => panic!("pre-input provider failure unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        let failure: ComputerUseFailure =
+            serde_json::from_str(&error).expect("provider failure must be typed JSON");
+        assert_eq!(
+            failure.code,
+            ComputerUseFailureCode::ProviderTransientPreInput
+        );
+        assert!(!failure.input_sent);
+        assert!(failure.safe_to_retry);
+    }
+
+    #[test]
+    fn semantic_provider_errors_are_ambiguous_and_never_retryable() {
+        let state = DesktopControlState::with_backends_and_lock(
+            Arc::new(NullBackend),
+            Arc::new(EffectiveActionTestBackend {
+                effective_label: Arc::new(std::sync::Mutex::new("Save".to_string())),
+                fail_click: true,
+            }),
+            None,
+        );
+        let session = state
+            .start_session_impl("manual", allow(&["Notes"]), 60_000, true)
+            .unwrap();
+        let gate = state
+            .begin_action(
+                &session.session_id,
+                "Notes",
+                ControlAction::SemanticClick {
+                    element_id: "Notes::window-0::element-1::native-child".to_string(),
+                    button: MouseButtonKind::Left,
+                    expected_value: None,
+                },
+            )
+            .unwrap();
+        let ActionGate::Executed(result) = gate else {
+            panic!("approved batch must execute immediately");
+        };
+        let error = match result {
+            Ok(_) => panic!("ambiguous semantic provider error unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        let failure: ComputerUseFailure =
+            serde_json::from_str(&error).expect("semantic failure must be typed JSON");
+        assert_eq!(failure.code, ComputerUseFailureCode::InputMayHaveBeenSent);
+        assert!(failure.input_sent);
+        assert!(!failure.safe_to_retry);
+    }
+
+    #[test]
     fn durable_value_verification_evidence_is_redacted_but_outcome_can_retain_it() {
         let evidence = VerificationEvidence {
             kind: "element_value".to_string(),
@@ -4903,6 +5455,7 @@ mod tests {
             Arc::new(NullBackend),
             Arc::new(EffectiveActionTestBackend {
                 effective_label: effective_label.clone(),
+                fail_click: false,
             }),
             None,
         );

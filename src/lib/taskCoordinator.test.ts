@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { ComputerUseRunBudget, CoordinatedInvocationError, coordinateToolInvocation, runCoordinatedInvocation } from './taskCoordinator';
+import {
+  ComputerUseRunBudget,
+  CoordinatedInvocationError,
+  CoordinatedRetryableError,
+  computerUseFailure,
+  coordinateToolInvocation,
+  runCoordinatedInvocation,
+} from './taskCoordinator';
 
 describe('universal task coordinator routing', () => {
   it('routes native Computer Use through observe/authorize/verify phases', () => {
@@ -53,22 +60,50 @@ describe('universal task coordinator routing', () => {
 
   it('re-runs observation and execution after a pre-input phase failure', async () => {
     const phases: string[] = [];
-    let observeFailures = 0;
+    let executeFailures = 0;
     let executions = 0;
+    const budget = new ComputerUseRunBudget({ maxRetries: 1 });
     const result = await runCoordinatedInvocation(
       { route: 'native', phases: ['observe', 'decide', 'authorize', 'execute', 'verify'], maxAttempts: 2 },
       {
         onPhase: (phase, attempt) => {
           phases.push(`${attempt}:${phase}`);
-          if (phase === 'observe' && observeFailures++ === 0) throw new Error('stale observation');
         },
-        execute: () => { executions += 1; return 'recovered'; },
+        execute: () => {
+          executions += 1;
+          if (executeFailures++ === 0) {
+            throw new CoordinatedRetryableError(computerUseFailure('provider unavailable before input', {
+              code: 'PROVIDER_TRANSIENT_PRE_INPUT',
+              inputSent: false,
+              safeToRetry: true,
+              phase: 'pre_execute',
+            }));
+          }
+          return 'recovered';
+        },
         verify: () => true,
+        budget,
       },
     );
     expect(result).toBe('recovered');
-    expect(executions).toBe(1);
-    expect(phases).toEqual(['1:observe', '2:observe', '2:decide', '2:authorize', '2:verify']);
+    expect(executions).toBe(2);
+    expect(budget.remaining('retries')).toBe(0);
+    expect(phases).toEqual([
+      '1:observe', '1:decide', '1:authorize',
+      '2:observe', '2:decide', '2:authorize', '2:verify',
+    ]);
+  });
+
+  it('fails closed for an untyped phase exception', async () => {
+    let executions = 0;
+    await expect(runCoordinatedInvocation(
+      { route: 'native', phases: ['observe', 'decide', 'authorize', 'execute', 'verify'], maxAttempts: 2 },
+      {
+        onPhase: (phase) => { if (phase === 'observe') throw new Error('unknown backend exception'); },
+        execute: () => { executions += 1; return 'never'; },
+      },
+    )).rejects.toThrow('unknown backend exception');
+    expect(executions).toBe(0);
   });
 
   it('never retries once the native backend reports input sent without verification', async () => {
