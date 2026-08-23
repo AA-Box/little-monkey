@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   detectStandardConflicts,
   mergeDiscoveredStandards,
+  sameStandardPolicy,
   selectStandards,
   standardsPromptSection,
   standardsSelectionProvenance,
+  validateStandardsDocument,
   type EngineeringStandard,
 } from "./standards";
 
@@ -35,6 +37,9 @@ function fixture(overrides: Partial<EngineeringStandard> = {}): EngineeringStand
     last_verified_at_ms: 3,
     content_sha256: "b".repeat(64),
     drift: "healthy",
+    revision_history: [],
+    pending_revision: null,
+    checker_command_ids: [],
     ...overrides,
   };
 }
@@ -88,14 +93,16 @@ describe("standards selection", () => {
     expect(selection.omitted).toBe(1);
   });
 
-  it("renders frozen ids, versions, content hashes, evidence and authority boundaries", () => {
-    const selection = selectStandards([fixture()], "React component");
+  it("renders frozen provenance and only checker ids/counts, never command text", () => {
+    const selection = selectStandards([fixture({ checker_command_ids: ["verify-test"] })], "React component");
     const section = standardsPromptSection(selection);
     expect(section).toContain("Applicable engineering standards");
     expect(section).toContain("never grant tools, network, secrets, budget, or permission authority");
     expect(section).toContain("react-components@v2");
     expect(section).toContain(`sha256:${"b".repeat(64)}`);
     expect(section).toContain("package.json:12");
+    expect(section).toContain("1 locally-bound Verification command");
+    expect(section).not.toContain("npm test");
     expect(standardsSelectionProvenance(selection).selected[0]).toMatchObject({ standard_id: "react-components", version: 2, content_sha256: "b".repeat(64) });
   });
 });
@@ -108,24 +115,52 @@ describe("standards lifecycle", () => {
     expect(detected.map((standard) => standard.status)).toEqual(["conflicting", "conflicting"]);
   });
 
-  it("increments candidate revision when rediscovered policy content changes", () => {
+  it("increments candidate revision and archives the prior immutable policy", () => {
     const original = fixture({ status: "candidate", content_sha256: "1".repeat(64), version: 2 });
-    const rediscovered = fixture({ status: "candidate", content_sha256: "2".repeat(64), version: 1 });
+    const rediscovered = fixture({ status: "candidate", body: "Changed policy", content_sha256: "2".repeat(64), version: 1 });
     const [merged] = mergeDiscoveredStandards([original], [rediscovered]);
     expect(merged.version).toBe(3);
+    expect(merged.revision_history).toHaveLength(1);
+    expect(merged.revision_history[0]).toMatchObject({ version: 2, body: original.body, reason: "rediscovered" });
   });
 
-  it("preserves approved content while refreshing evidence and drift", () => {
-    const approved = fixture({ content_sha256: "1".repeat(64), evidence: [] });
+  it("keeps an approved policy frozen and creates an explicit pending revision", () => {
+    const approved = fixture({ content_sha256: "1".repeat(64), version: 2 });
     const rediscovered = fixture({
       status: "candidate",
+      body: "A deliberately changed policy",
       content_sha256: "2".repeat(64),
       evidence: [{ path: "package.json", line: 5, excerpt: "react", sha256: "2".repeat(64), kind: "config", supports: true }],
     });
     const [merged] = mergeDiscoveredStandards([approved], [rediscovered]);
     expect(merged.status).toBe("approved");
     expect(merged.version).toBe(2);
-    expect(merged.evidence).toEqual(rediscovered.evidence);
+    expect(merged.body).toBe(approved.body);
+    expect(merged.evidence).toEqual(approved.evidence);
+    expect(merged.pending_revision).toMatchObject({ version: 3, body: rediscovered.body, content_sha256: rediscovered.content_sha256 });
     expect(merged.drift).toBe("weakened");
+  });
+
+  it("does not manufacture a policy revision when only evidence changes", () => {
+    const approved = fixture();
+    const rediscovered = fixture({
+      status: "candidate",
+      evidence: [{ ...approved.evidence[0], sha256: "c".repeat(64) }],
+    });
+    expect(sameStandardPolicy(approved, rediscovered)).toBe(true);
+    const [merged] = mergeDiscoveredStandards([approved], [rediscovered]);
+    expect(merged.version).toBe(2);
+    expect(merged.pending_revision).toBeNull();
+  });
+
+  it("normalizes legacy schema-v1 standards with the new lifecycle fields", () => {
+    const legacy = { ...fixture() } as Record<string, unknown>;
+    delete legacy.revision_history;
+    delete legacy.pending_revision;
+    delete legacy.checker_command_ids;
+    const document = validateStandardsDocument({ schema_version: 1, workspace_id: "repo", generated_at_ms: 1, standards: [legacy] });
+    expect(document.standards[0].revision_history).toEqual([]);
+    expect(document.standards[0].pending_revision).toBeNull();
+    expect(document.standards[0].checker_command_ids).toEqual([]);
   });
 });
