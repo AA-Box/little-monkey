@@ -19,6 +19,30 @@ export interface StandardApplicability {
   task_keywords: string[];
 }
 
+/** Immutable snapshot archived when an accepted/candidate policy revision is
+ * superseded. Evidence travels with the revision so later audits can explain
+ * what the user approved at that point in time rather than reconstructing it
+ * from today's repository. */
+export interface StandardRevision {
+  version: number;
+  title: string;
+  body: string;
+  applicability: StandardApplicability;
+  severity: StandardSeverity;
+  tags: string[];
+  evidence: StandardEvidence[];
+  content_sha256: string;
+  recorded_at_ms: number;
+  reason: "rediscovered" | "approved_revision" | "imported_revision";
+}
+
+/** A proposed replacement for the active approved policy. Rediscovery/import
+ * may create this, but only an explicit user approval can make it active. */
+export interface PendingStandardRevision extends Omit<StandardRevision, "reason"> {
+  proposed_at_ms: number;
+  source: "discovered" | "imported";
+}
+
 export interface EngineeringStandard {
   standard_id: string;
   version: number;
@@ -43,6 +67,14 @@ export interface EngineeringStandard {
   last_verified_at_ms: number | null;
   content_sha256: string;
   drift: StandardDrift;
+  /** Prior immutable policy snapshots. Legacy schema-v1 documents are
+   * normalized to an empty array on read. */
+  revision_history: StandardRevision[];
+  /** A changed proposal never silently replaces approved text. */
+  pending_revision: PendingStandardRevision | null;
+  /** IDs only. The command text is intentionally NOT stored in the repository;
+   * execution resolves these IDs through the app-owned Verification config. */
+  checker_command_ids: string[];
 }
 
 export interface StandardsDocument {
@@ -115,6 +147,48 @@ function validateStandard(value: unknown): asserts value is EngineeringStandard 
   if (!Array.isArray(standard.evidence) || !Array.isArray(standard.tags) || !Array.isArray(standard.conflicts_with)) throw new Error(`Standard ${standard.standard_id} has malformed evidence/tags/conflicts.`);
   if (typeof standard.confidence !== "number" || standard.confidence < 0 || standard.confidence > 1) throw new Error(`Standard ${standard.standard_id} has invalid confidence.`);
   if (!/^[a-f0-9]{64}$/i.test(standard.content_sha256 ?? "")) throw new Error(`Standard ${standard.standard_id} has an invalid content digest.`);
+
+  // Backward-compatible normalization for documents written by the first
+  // Standards Studio slice. Keeping schema_version=1 avoids invalidating
+  // already committed portable files while making the new lifecycle fields
+  // concrete everywhere after the next save.
+  if (!Array.isArray(standard.revision_history)) standard.revision_history = [];
+  if (standard.pending_revision === undefined) standard.pending_revision = null;
+  if (!Array.isArray(standard.checker_command_ids)) standard.checker_command_ids = [];
+
+  for (const revision of standard.revision_history) validateRevision(standard.standard_id, revision);
+  if (standard.pending_revision) validateRevision(standard.standard_id, standard.pending_revision);
+  if (!standard.checker_command_ids.every((id) => typeof id === "string" && id.trim().length > 0)) {
+    throw new Error(`Standard ${standard.standard_id} has malformed checker command ids.`);
+  }
+}
+
+function validateRevision(standardId: string, value: unknown): void {
+  if (!value || typeof value !== "object") throw new Error(`Standard ${standardId} has a malformed revision.`);
+  const revision = value as Partial<StandardRevision>;
+  if (!Number.isInteger(revision.version) || Number(revision.version) < 1) throw new Error(`Standard ${standardId} has an invalid revision version.`);
+  if (!revision.title?.trim() || !revision.body?.trim()) throw new Error(`Standard ${standardId} has a revision without title/body.`);
+  if (!/^[a-f0-9]{64}$/i.test(revision.content_sha256 ?? "")) throw new Error(`Standard ${standardId} has a revision with an invalid digest.`);
+  if (!Array.isArray(revision.evidence) || !Array.isArray(revision.tags)) throw new Error(`Standard ${standardId} has malformed revision evidence/tags.`);
+}
+
+export function snapshotStandardRevision(
+  standard: EngineeringStandard,
+  reason: StandardRevision["reason"],
+  recordedAtMs = Date.now(),
+): StandardRevision {
+  return {
+    version: standard.version,
+    title: standard.title,
+    body: standard.body,
+    applicability: structuredClone(standard.applicability),
+    severity: standard.severity,
+    tags: [...standard.tags],
+    evidence: standard.evidence.map((entry) => ({ ...entry })),
+    content_sha256: standard.content_sha256,
+    recorded_at_ms: recordedAtMs,
+    reason,
+  };
 }
 
 function tokens(value: string): Set<string> {
@@ -289,8 +363,44 @@ export function standardsPromptSection(selection: StandardsSelection): string {
       standard.evidence.length > 0
         ? `Evidence: ${standard.evidence.slice(0, 5).map((evidence) => `${evidence.supports ? "+" : "-"}${evidence.path}${evidence.line ? `:${evidence.line}` : ""}@${evidence.sha256.slice(0, 12)}`).join(", ")}.`
         : "Evidence: manual/imported standard with no repository evidence rows.",
+      standard.checker_command_ids.length > 0
+        ? `Mechanical verification: ${standard.checker_command_ids.length} locally-bound Verification command${standard.checker_command_ids.length === 1 ? "" : "s"}; command text is intentionally not stored in repository policy.`
+        : "Mechanical verification: no local Verification command bound.",
     ]),
   ].join("\n");
+}
+
+function sameApplicability(left: StandardApplicability, right: StandardApplicability): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+/** Evidence hashes are deliberately excluded: evidence drift is tracked by
+ * `drift`, while policy revision identity is title/body/applicability/severity.
+ * This prevents an ordinary source-file edit from manufacturing a new policy
+ * version by changing only an evidence SHA. */
+export function sameStandardPolicy(left: EngineeringStandard, right: EngineeringStandard): boolean {
+  return left.title === right.title
+    && left.body === right.body
+    && left.severity === right.severity
+    && sameApplicability(left.applicability, right.applicability)
+    && JSON.stringify(left.tags) === JSON.stringify(right.tags);
+}
+
+function pendingFrom(candidate: EngineeringStandard, version: number, source: PendingStandardRevision["source"]): PendingStandardRevision {
+  const now = Date.now();
+  return {
+    version,
+    title: candidate.title,
+    body: candidate.body,
+    applicability: structuredClone(candidate.applicability),
+    severity: candidate.severity,
+    tags: [...candidate.tags],
+    evidence: candidate.evidence.map((entry) => ({ ...entry })),
+    content_sha256: candidate.content_sha256,
+    recorded_at_ms: now,
+    proposed_at_ms: now,
+    source,
+  };
 }
 
 export function mergeDiscoveredStandards(
@@ -305,22 +415,27 @@ export function mergeDiscoveredStandards(
       continue;
     }
     if (existing.status === "approved" || existing.status === "deprecated") {
-      const contentChanged = existing.content_sha256 !== candidate.content_sha256;
+      const policyChanged = !sameStandardPolicy(existing, candidate);
       byId.set(candidate.standard_id, {
         ...existing,
-        // Evidence is refreshed, but approved policy text never silently
-        // changes underneath an approval. A changed proposal increments the
-        // discovered revision only after an explicit future approval/import.
-        evidence: candidate.evidence,
+        // Active approved evidence belongs to the approved snapshot. The new
+        // evidence lives on the proposal until the user accepts that revision.
         confidence: candidate.confidence,
         last_verified_at_ms: candidate.last_verified_at_ms,
-        drift: contentChanged ? "weakened" : "healthy",
+        drift: policyChanged ? "weakened" : "healthy",
+        pending_revision: policyChanged ? pendingFrom(candidate, existing.version + 1, "discovered") : null,
       });
     } else {
+      const policyChanged = !sameStandardPolicy(existing, candidate);
       byId.set(candidate.standard_id, {
         ...candidate,
-        version: existing.content_sha256 === candidate.content_sha256 ? existing.version : existing.version + 1,
+        version: policyChanged ? existing.version + 1 : existing.version,
         created_at_ms: existing.created_at_ms,
+        revision_history: policyChanged
+          ? [...existing.revision_history, snapshotStandardRevision(existing, "rediscovered")]
+          : [...existing.revision_history],
+        pending_revision: null,
+        checker_command_ids: [...existing.checker_command_ids],
       });
     }
   }
