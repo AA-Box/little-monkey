@@ -7,8 +7,10 @@ import { fileURLToPath } from "node:url";
 export const EXTENSION_PACKAGE_PREFIX = "extension.";
 export const LMX_SCHEMA_VERSION = 1;
 export const MAX_FILES = 128;
-export const MAX_FILE_BYTES = 8 * 1024 * 1024;
-export const MAX_TOTAL_BYTES = 24 * 1024 * 1024;
+export const MAX_PATH_CHARS = 512;
+export const MAX_FILE_BYTES = 3 * 1024 * 1024;
+export const MAX_TOTAL_BYTES = 3 * 1024 * 1024;
+export const MAX_MANIFEST_BYTES = 256 * 1024;
 
 export function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -22,7 +24,7 @@ export function canonical(value) {
 
 function safeRelative(relative) {
   const normalized = relative.split(path.sep).join("/");
-  if (!normalized || normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized)) throw new Error(`unsafe package path: ${relative}`);
+  if (!normalized || normalized.length > MAX_PATH_CHARS || normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized)) throw new Error(`unsafe package path: ${relative}`);
   const parts = normalized.split("/");
   if (parts.some((part) => !part || part === "." || part === "..")) throw new Error(`unsafe package path: ${relative}`);
   return normalized;
@@ -51,6 +53,8 @@ export async function packExtension(sourceDirectory) {
   const root = path.resolve(sourceDirectory);
   const manifest = JSON.parse(await readFile(path.join(root, "extension.json"), "utf8"));
   if (!manifest.extension_id || !manifest.version || !manifest.component?.path) throw new Error("extension.json is missing extension_id, version, or component.path");
+  const manifestText = canonical(manifest);
+  if (Buffer.byteLength(manifestText, "utf8") > MAX_MANIFEST_BYTES) throw new Error("extension.json exceeds the .lmx manifest metadata limit");
   const files = await collectFiles(root);
   let total = 0;
   const filesBase64 = {};
@@ -64,13 +68,14 @@ export async function packExtension(sourceDirectory) {
   if (!(componentPath in filesBase64)) throw new Error("declared component is missing from package files");
   const envelope = { schema_version: LMX_SCHEMA_VERSION, manifest, files_base64: filesBase64 };
   // Compact deterministic JSON, deliberately without a trailing newline. The
-  // signed M4 bundle_sha256 is the exact UTF-8 bytes served by the static host.
+  // 3 MiB decoded + 256 KiB manifest/path bounds leave base64/JSON overhead
+  // safely below the host-owned 5 MiB `tool_web_fetch` response ceiling.
   const text = canonical(envelope);
   return {
     envelope,
     text,
     package_sha256: sha256(Buffer.from(text, "utf8")),
-    manifest_sha256: sha256(Buffer.from(canonical(manifest), "utf8")),
+    manifest_sha256: sha256(Buffer.from(manifestText, "utf8")),
   };
 }
 
