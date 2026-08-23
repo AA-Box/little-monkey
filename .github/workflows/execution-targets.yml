@@ -6,7 +6,7 @@ on:
     branches: [develop]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   contract:
@@ -55,48 +55,3 @@ jobs:
           LITTLE_MONKEY_REQUIRE_RUNNER_DOCKER_E2E: "1"
           LITTLE_MONKEY_RUNNER_DOCKER_E2E_IMAGE: little-monkey-execution-runner
         run: cargo test --manifest-path src-tauri/Cargo.toml execution_target::tests --lib
-
-  pr440-lifecycle-fix:
-    if: github.event_name == 'pull_request' && github.event.pull_request.number == 440
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: feature/execution-targets
-          fetch-depth: 0
-      - name: Apply the already validated lifecycle patch
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          source = Path('.github/workflows/pr440-autofix.yml').read_text().splitlines()
-          start = next(i for i, line in enumerate(source) if "python3 <<'PY'" in line) + 1
-          end = next(i for i in range(start, len(source)) if source[i].strip() == 'PY')
-          body = source[start:end]
-          output = []
-          in_triple = False
-          for line in body:
-              if not in_triple and line.startswith('          '):
-                  line = line[10:]
-              output.append(line)
-              if line.count("'''") % 2 == 1:
-                  in_triple = not in_triple
-          Path('/tmp/pr440_apply.py').write_text('\n'.join(output) + '\n')
-          PY
-          python3 /tmp/pr440_apply.py
-          cargo fmt --manifest-path src-tauri/Cargo.toml
-      - name: Push validated lifecycle code only
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add \
-            src-tauri/src/execution_target.rs \
-            src-tauri/src/daemon_commands.rs \
-            src-tauri/src/lib.rs \
-            src/lib/autonomousTaskRunner.ts \
-            src/store/autonomousTaskStore.ts \
-            src/components/AutonomousTask/AutonomousTaskPanel.tsx
-          git diff --cached --quiet && exit 0
-          git commit -m "fix(execution): complete remote task lifecycle"
-          git push origin HEAD:feature/execution-targets
