@@ -1,106 +1,215 @@
-import { mkdir, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
+import { invoke } from "@tauri-apps/api/core";
 import { tempDir } from "@tauri-apps/api/path";
+import { mkdir, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
 
 import {
   executableExtensionsClient,
-  type CapabilityKind,
   type ExtensionApproval,
   type ExtensionDetail,
   type ExtensionManifest,
   type ExtensionPreview,
-  type PermissionDeclaration,
 } from "./executableExtensionsClient";
+import type {
+  AdditionalRegistryRecord,
+  RegistrySnapshot,
+} from "./ecosystemClient";
 
-export const EXTENSION_REGISTRY_SCHEMA = 1;
+/**
+ * Executable extensions deliberately do NOT become M4 declarative packages.
+ * The existing signed M4 registry is reused only as an artifact index: entries
+ * in the reserved `extension.` namespace bind an extension id/version to an
+ * immutable .lmx digest and manifest digest. The downloaded bytes then go
+ * through the existing executable-extension runtime, which independently
+ * validates the manifest/component/signature and permission approval digest.
+ */
+export const M4_EXTENSION_PACKAGE_PREFIX = "extension.";
 export const LMX_SCHEMA = 1;
-export const MAX_LMX_BYTES = 64 * 1024 * 1024;
+export const MAX_LMX_DOWNLOAD_CHARS = 12 * 1024 * 1024;
 export const MAX_LMX_FILES = 128;
-export const MAX_LMX_FILE_BYTES = 32 * 1024 * 1024;
+export const MAX_LMX_FILE_BYTES = 8 * 1024 * 1024;
+export const MAX_LMX_DECODED_BYTES = 24 * 1024 * 1024;
 
-export type ExtensionCategory =
-  | "developer_tools"
-  | "channels"
-  | "models"
-  | "search"
-  | "knowledge"
-  | "productivity"
-  | "devices"
-  | "speech"
-  | "automation"
-  | "connectors";
+interface RegistryPackageVersionWire {
+  version: string;
+  bundle_sha256: string;
+  manifest_sha256: string;
+}
 
-export interface ExtensionRegistrySource {
-  source_id: string;
-  display_name: string;
-  index_url: string;
-  /** Raw Ed25519 public key, base64 encoded. Trust is configured by the user;
-   * a downloaded index can never introduce its own trust root. */
-  public_key_base64: string;
-  key_id: string;
-  enabled: boolean;
-  added_at_ms: number;
-  last_sequence: number;
-  last_snapshot_sha256: string | null;
+interface FetchResultWire {
+  url: string;
+  final_url: string;
+  title: string | null;
+  content_type: string;
+  markdown: string;
+  total_chars: number;
+  truncated: boolean;
+}
+
+export interface MarketplaceRegistry {
+  record: AdditionalRegistryRecord;
+  snapshot: RegistrySnapshot;
 }
 
 export interface ExtensionRegistryEntry {
+  registry_source_id: string;
+  registry_display_name: string;
+  registry_snapshot_sha256: string;
+  package_id: string;
   extension_id: string;
   version: string;
-  display_name: string;
-  description: string;
-  publisher: string;
-  category: ExtensionCategory;
   package_url: string;
   package_sha256: string;
   manifest_sha256: string;
-  host_api: { minimum: string; maximum_exclusive?: string | null };
-  capabilities: CapabilityKind[];
-  permissions: PermissionDeclaration[];
-  platforms: string[];
-  architectures: string[];
-  source_url: string | null;
-  docs_url: string | null;
-  changelog: string | null;
-  deprecated: boolean;
   revoked: boolean;
-}
-
-export interface ExtensionRegistrySnapshot {
-  schema_version: number;
-  registry_id: string;
-  sequence: number;
-  generated_at_ms: number;
-  refresh_after_ms: number;
-  expires_at_ms: number;
-  entries: ExtensionRegistryEntry[];
-  revocations: Array<{ extension_id: string; version: string | null; reason: string }>;
-  signature: {
-    algorithm: "ed25519";
-    key_id: string;
-    signature_base64: string;
-  };
-}
-
-export interface VerifiedExtensionRegistry {
-  source: ExtensionRegistrySource;
-  snapshot: ExtensionRegistrySnapshot;
-  snapshot_sha256: string;
-  verified_at_ms: number;
+  revocation_reason: string | null;
 }
 
 export interface LmxEnvelope {
   schema_version: number;
   manifest: ExtensionManifest;
-  /** Files are base64 bytes keyed by source-relative path. `extension.json`
-   * is reconstructed from `manifest`, so it must not appear here. */
+  /** Files are base64 bytes keyed by source-relative path. extension.json is
+   * reconstructed from `manifest` and therefore must not appear here. */
   files_base64: Record<string, string>;
 }
 
 export interface MarketplaceInstallPreview {
-  registry: VerifiedExtensionRegistry;
+  registry: MarketplaceRegistry;
   entry: ExtensionRegistryEntry;
   source_path: string;
   runtime_preview: ExtensionPreview;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/i.test(value);
+}
+
+function parseSemver(value: string): [number, number, number] | null {
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(value);
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
+}
+
+export function compareSemver(left: string, right: string): number {
+  const a = parseSemver(left);
+  const b = parseSemver(right);
+  if (!a || !b) return left.localeCompare(right);
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] !== b[index]) return a[index] - b[index];
+  }
+  return 0;
+}
+
+function validRegistryLocation(value: string): URL {
+  const url = new URL(value);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))) {
+    throw new Error(`Registry ${value} must use HTTPS (localhost HTTP is allowed for development).`);
+  }
+  if (url.username || url.password) throw new Error("Registry URLs cannot contain credentials.");
+  return url;
+}
+
+/** Static-registry convention used by the publisher CLI. The URL itself does
+ * not need to be trusted: the already-verified M4 snapshot binds the bytes to
+ * `bundle_sha256`, so a compromised mirror can only cause a refusal. */
+export function extensionArtifactUrl(registryLocation: string, extensionId: string, version: string): string {
+  const registry = validRegistryLocation(registryLocation);
+  const base = new URL(".", registry);
+  return new URL(`extensions/${encodeURIComponent(extensionId)}/${version}.lmx`, base).toString();
+}
+
+function parseRegistryVersion(value: unknown): RegistryPackageVersionWire | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<RegistryPackageVersionWire>;
+  if (typeof candidate.version !== "string" || !parseSemver(candidate.version)) return null;
+  if (!isSha256(candidate.bundle_sha256) || !isSha256(candidate.manifest_sha256)) return null;
+  return {
+    version: candidate.version,
+    bundle_sha256: candidate.bundle_sha256.toLowerCase(),
+    manifest_sha256: candidate.manifest_sha256.toLowerCase(),
+  };
+}
+
+function nestedPackageTarget(value: unknown): { packageId: string; version: string | null } | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const packageId = typeof record.package_id === "string" ? record.package_id : null;
+  if (packageId) {
+    return {
+      packageId,
+      version: typeof record.version === "string" ? record.version : null,
+    };
+  }
+  for (const child of Object.values(record)) {
+    const target = nestedPackageTarget(child);
+    if (target) return target;
+  }
+  return null;
+}
+
+function revocationFor(snapshot: RegistrySnapshot, packageId: string, version: string): string | null {
+  for (const raw of snapshot.revocations ?? []) {
+    const target = nestedPackageTarget(raw);
+    if (!target || target.packageId !== packageId) continue;
+    if (target.version !== null && target.version !== version) continue;
+    if (raw && typeof raw === "object") {
+      const record = raw as Record<string, unknown>;
+      if (typeof record.reason === "string" && record.reason.trim()) return record.reason.trim();
+    }
+    return "revoked by the signed M4 registry";
+  }
+  return null;
+}
+
+export function marketplaceRegistries(records: AdditionalRegistryRecord[]): MarketplaceRegistry[] {
+  return records
+    .filter((record): record is AdditionalRegistryRecord & { verified: NonNullable<AdditionalRegistryRecord["verified"]> } => record.verified !== null)
+    .map((record) => ({ record, snapshot: record.verified.snapshot }));
+}
+
+export function extensionEntriesFromRegistries(registries: MarketplaceRegistry[]): ExtensionRegistryEntry[] {
+  const entries: ExtensionRegistryEntry[] = [];
+  for (const registry of registries) {
+    const location = registry.record.source.location;
+    for (const [packageId, rawVersions] of Object.entries(registry.snapshot.packages ?? {})) {
+      if (!packageId.startsWith(M4_EXTENSION_PACKAGE_PREFIX)) continue;
+      const extensionId = packageId.slice(M4_EXTENSION_PACKAGE_PREFIX.length);
+      if (!extensionId) continue;
+      for (const raw of rawVersions) {
+        const version = parseRegistryVersion(raw);
+        if (!version) continue; // Rust already verified the snapshot; fail-soft for old frontend shapes.
+        const reason = revocationFor(registry.snapshot, packageId, version.version);
+        entries.push({
+          registry_source_id: registry.record.source.source_id,
+          registry_display_name: registry.record.source.display_name,
+          registry_snapshot_sha256: registry.record.verified!.snapshot_sha256,
+          package_id: packageId,
+          extension_id: extensionId,
+          version: version.version,
+          package_url: extensionArtifactUrl(location, extensionId, version.version),
+          package_sha256: version.bundle_sha256,
+          manifest_sha256: version.manifest_sha256,
+          revoked: reason !== null,
+          revocation_reason: reason,
+        });
+      }
+    }
+  }
+  return entries.sort((left, right) =>
+    left.extension_id.localeCompare(right.extension_id) || compareSemver(right.version, left.version),
+  );
+}
+
+export function latestEntries(registries: MarketplaceRegistry[]): ExtensionRegistryEntry[] {
+  const latest = new Map<string, ExtensionRegistryEntry>();
+  for (const entry of extensionEntriesFromRegistries(registries)) {
+    if (entry.revoked) continue;
+    const current = latest.get(entry.extension_id);
+    if (!current || compareSemver(entry.version, current.version) > 0) latest.set(entry.extension_id, entry);
+  }
+  return [...latest.values()].sort((left, right) => left.extension_id.localeCompare(right.extension_id));
 }
 
 function base64Bytes(value: string): Uint8Array {
@@ -108,15 +217,6 @@ function base64Bytes(value: string): Uint8Array {
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
   return bytes;
-}
-
-function bytesBase64(bytes: Uint8Array): string {
-  let binary = "";
-  const block = 0x8000;
-  for (let index = 0; index < bytes.length; index += block) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + block));
-  }
-  return btoa(binary);
 }
 
 async function sha256Bytes(bytes: Uint8Array): Promise<string> {
@@ -135,105 +235,59 @@ function canonical(value: unknown): string {
   return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonical(object[key])}`).join(",")}}`;
 }
 
-function registrySigningPayload(snapshot: ExtensionRegistrySnapshot): Uint8Array {
-  const { signature: _signature, ...unsigned } = snapshot;
-  return new TextEncoder().encode(canonical(unsigned));
-}
-
-async function verifyEd25519(publicKeyBase64: string, signatureBase64: string, payload: Uint8Array): Promise<boolean> {
-  const publicKey = await crypto.subtle.importKey(
-    "raw",
-    base64Bytes(publicKeyBase64),
-    { name: "Ed25519" },
-    false,
-    ["verify"],
-  );
-  return crypto.subtle.verify({ name: "Ed25519" }, publicKey, base64Bytes(signatureBase64), payload);
-}
-
-function validHttpsOrLocal(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === "https:" || (parsed.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname));
-  } catch {
-    return false;
-  }
-}
-
-function validateId(value: string, field: string): void {
-  if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/.test(value)) throw new Error(`${field} is not a bounded identifier.`);
-}
-
-function validateRegistrySnapshot(snapshot: ExtensionRegistrySnapshot, source: ExtensionRegistrySource, nowMs: number): void {
-  if (snapshot.schema_version !== EXTENSION_REGISTRY_SCHEMA) throw new Error(`Unsupported extension registry schema ${snapshot.schema_version}.`);
-  validateId(snapshot.registry_id, "registry_id");
-  if (!Number.isSafeInteger(snapshot.sequence) || snapshot.sequence < 1) throw new Error("Registry sequence must be a positive integer.");
-  if (snapshot.sequence < source.last_sequence) throw new Error(`Registry rollback refused: sequence ${snapshot.sequence} is older than trusted sequence ${source.last_sequence}.`);
-  if (snapshot.signature.algorithm !== "ed25519") throw new Error("Registry signature must use Ed25519.");
-  if (snapshot.signature.key_id !== source.key_id) throw new Error("Registry signing key does not match the configured trust root.");
-  if (snapshot.expires_at_ms <= nowMs) throw new Error("Registry snapshot is expired.");
-  if (snapshot.generated_at_ms > nowMs + 5 * 60_000) throw new Error("Registry snapshot is implausibly far in the future.");
-  if (snapshot.entries.length > 10_000) throw new Error("Registry contains too many entries.");
-  const seen = new Set<string>();
-  for (const entry of snapshot.entries) {
-    validateId(entry.extension_id, "extension_id");
-    if (!/^\d+\.\d+\.\d+$/.test(entry.version)) throw new Error(`${entry.extension_id} has a non-canonical version.`);
-    if (!validHttpsOrLocal(entry.package_url)) throw new Error(`${entry.extension_id} has an unsafe package URL.`);
-    if (!/^[a-f0-9]{64}$/i.test(entry.package_sha256) || !/^[a-f0-9]{64}$/i.test(entry.manifest_sha256)) throw new Error(`${entry.extension_id} has an invalid digest.`);
-    const key = `${entry.extension_id}@${entry.version}`;
-    if (seen.has(key)) throw new Error(`Registry contains duplicate ${key}.`);
-    seen.add(key);
-  }
-}
-
-export async function fetchVerifiedRegistry(source: ExtensionRegistrySource, nowMs = Date.now()): Promise<VerifiedExtensionRegistry> {
-  if (!source.enabled) throw new Error(`${source.display_name} is disabled.`);
-  if (!validHttpsOrLocal(source.index_url)) throw new Error("Registry URL must be HTTPS (localhost HTTP is allowed for development). ");
-  const response = await fetch(source.index_url, { cache: "no-store", redirect: "follow" });
-  if (!response.ok) throw new Error(`Registry returned HTTP ${response.status}.`);
-  const raw = await response.text();
-  if (raw.length > 16 * 1024 * 1024) throw new Error("Registry index exceeds the 16 MiB limit.");
-  const snapshot = JSON.parse(raw) as ExtensionRegistrySnapshot;
-  validateRegistrySnapshot(snapshot, source, nowMs);
-  if (!(await verifyEd25519(source.public_key_base64, snapshot.signature.signature_base64, registrySigningPayload(snapshot)))) {
-    throw new Error("Registry signature verification failed.");
-  }
-  return {
-    source,
-    snapshot,
-    snapshot_sha256: await sha256Text(canonical(snapshot)),
-    verified_at_ms: nowMs,
-  };
-}
-
 function safeRelativePath(path: string): string {
   const normalized = path.replaceAll("\\", "/");
-  if (!normalized || normalized.startsWith("/") || normalized.includes("\0")) throw new Error(`Unsafe extension package path: ${path}`);
+  if (!normalized || normalized.startsWith("/") || normalized.includes("\0") || /^[A-Za-z]:/.test(normalized)) {
+    throw new Error(`Unsafe .lmx path: ${path}`);
+  }
   const parts = normalized.split("/");
-  if (parts.some((part) => !part || part === "." || part === "..")) throw new Error(`Unsafe extension package path: ${path}`);
-  if (/^[A-Za-z]:/.test(normalized)) throw new Error(`Unsafe extension package path: ${path}`);
+  if (parts.some((part) => !part || part === "." || part === "..")) throw new Error(`Unsafe .lmx path: ${path}`);
   return normalized;
 }
 
-function validateLmx(envelope: LmxEnvelope): void {
-  if (envelope.schema_version !== LMX_SCHEMA) throw new Error(`Unsupported .lmx schema ${envelope.schema_version}.`);
-  if (!envelope.manifest?.extension_id || typeof envelope.files_base64 !== "object") throw new Error("Malformed .lmx package.");
-  const entries = Object.entries(envelope.files_base64);
-  if (entries.length === 0 || entries.length > MAX_LMX_FILES) throw new Error("Invalid .lmx file count.");
-  let total = 0;
-  const normalized = new Set<string>();
-  for (const [path, encoded] of entries) {
-    const safe = safeRelativePath(path);
-    const collisionKey = safe.normalize("NFC").toLowerCase();
-    if (normalized.has(collisionKey)) throw new Error(`Duplicate/colliding .lmx path: ${path}`);
-    normalized.add(collisionKey);
+export function validateLmxEnvelope(envelope: LmxEnvelope): void {
+  if (envelope.schema_version !== LMX_SCHEMA) throw new Error(`Unsupported .lmx schema ${String(envelope.schema_version)}.`);
+  if (!envelope.manifest?.extension_id || !envelope.manifest?.version || !envelope.files_base64 || typeof envelope.files_base64 !== "object") {
+    throw new Error("Malformed .lmx package.");
+  }
+  const files = Object.entries(envelope.files_base64);
+  if (files.length === 0 || files.length > MAX_LMX_FILES) throw new Error("Invalid .lmx file count.");
+  const collisions = new Set<string>();
+  let decodedBytes = 0;
+  for (const [rawPath, encoded] of files) {
+    const path = safeRelativePath(rawPath);
+    const collisionKey = path.normalize("NFC").toLocaleLowerCase("en-US");
+    if (collisions.has(collisionKey)) throw new Error(`Duplicate/colliding .lmx path: ${rawPath}`);
+    collisions.add(collisionKey);
     const bytes = base64Bytes(encoded);
-    if (bytes.byteLength > MAX_LMX_FILE_BYTES) throw new Error(`${path} exceeds the per-file .lmx limit.`);
-    total += bytes.byteLength;
-    if (total > MAX_LMX_BYTES) throw new Error(".lmx decoded payload exceeds 64 MiB.");
+    if (bytes.byteLength > MAX_LMX_FILE_BYTES) throw new Error(`${rawPath} exceeds the per-file .lmx limit.`);
+    decodedBytes += bytes.byteLength;
+    if (decodedBytes > MAX_LMX_DECODED_BYTES) throw new Error(".lmx decoded payload exceeds its limit.");
   }
   const component = safeRelativePath(envelope.manifest.component.path);
-  if (!Object.prototype.hasOwnProperty.call(envelope.files_base64, component)) throw new Error(".lmx does not contain the declared component.");
+  if (!Object.prototype.hasOwnProperty.call(envelope.files_base64, component)) {
+    throw new Error(".lmx does not contain the component declared by extension.json.");
+  }
+  if (Object.keys(envelope.files_base64).some((path) => safeRelativePath(path) === "extension.json")) {
+    throw new Error(".lmx must not contain a second extension.json; the signed manifest is the single source of truth.");
+  }
+}
+
+async function fetchPackageText(url: string): Promise<string> {
+  const result = await invoke<FetchResultWire>("tool_web_fetch", {
+    url,
+    max_chars: MAX_LMX_DOWNLOAD_CHARS,
+    start_index: 0,
+    turn_id: null,
+    tool_call_id: crypto.randomUUID(),
+  });
+  if (result.truncated || result.total_chars > MAX_LMX_DOWNLOAD_CHARS) {
+    throw new Error(`.lmx package exceeds the ${MAX_LMX_DOWNLOAD_CHARS} character marketplace limit.`);
+  }
+  if (!/^application\/(?:json|[^;]+\+json)|^text\/plain/i.test(result.content_type)) {
+    throw new Error(`.lmx must be served as JSON/text; received ${result.content_type || "unknown content type"}.`);
+  }
+  return result.markdown;
 }
 
 async function joinTemp(root: string, relative: string): Promise<string> {
@@ -242,91 +296,96 @@ async function joinTemp(root: string, relative: string): Promise<string> {
 }
 
 export async function downloadAndMaterializeLmx(entry: ExtensionRegistryEntry): Promise<string> {
-  const response = await fetch(entry.package_url, { cache: "no-store", redirect: "follow" });
-  if (!response.ok) throw new Error(`Extension package returned HTTP ${response.status}.`);
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength > MAX_LMX_BYTES * 2) throw new Error("Encoded .lmx exceeds the download limit.");
-  const digest = await sha256Bytes(bytes);
-  if (digest.toLowerCase() !== entry.package_sha256.toLowerCase()) throw new Error("Extension package digest does not match the signed registry entry.");
+  if (entry.revoked) throw new Error(entry.revocation_reason ?? `${entry.extension_id}@${entry.version} is revoked.`);
+  const raw = await fetchPackageText(entry.package_url);
+  const packageDigest = await sha256Text(raw);
+  if (packageDigest.toLowerCase() !== entry.package_sha256.toLowerCase()) {
+    throw new Error(".lmx bytes do not match the digest in the verified M4 registry snapshot.");
+  }
   let envelope: LmxEnvelope;
-  try { envelope = JSON.parse(new TextDecoder().decode(bytes)) as LmxEnvelope; } catch { throw new Error("Extension package is not valid .lmx JSON."); }
-  validateLmx(envelope);
-  if (envelope.manifest.extension_id !== entry.extension_id || envelope.manifest.version !== entry.version) throw new Error("Extension package identity does not match its registry entry.");
+  try {
+    envelope = JSON.parse(raw) as LmxEnvelope;
+  } catch {
+    throw new Error("Downloaded extension is not valid .lmx JSON.");
+  }
+  validateLmxEnvelope(envelope);
+  if (envelope.manifest.extension_id !== entry.extension_id || envelope.manifest.version !== entry.version) {
+    throw new Error(".lmx identity/version does not match the verified M4 catalog entry.");
+  }
   const manifestDigest = await sha256Text(canonical(envelope.manifest));
-  if (manifestDigest.toLowerCase() !== entry.manifest_sha256.toLowerCase()) throw new Error("Extension manifest digest does not match its registry entry.");
+  if (manifestDigest.toLowerCase() !== entry.manifest_sha256.toLowerCase()) {
+    throw new Error(".lmx manifest does not match the manifest digest in the verified M4 registry snapshot.");
+  }
 
   const root = await tempDir();
-  const directory = await joinTemp(root, `little-monkey-extension-${entry.extension_id.replace(/[^A-Za-z0-9_.-]/g, "-")}-${entry.version}-${crypto.randomUUID()}`);
+  const safeId = entry.extension_id.replace(/[^A-Za-z0-9_.-]/g, "-");
+  const directory = await joinTemp(root, `little-monkey-lmx-${safeId}-${entry.version}-${crypto.randomUUID()}`);
   await mkdir(directory, { recursive: true });
   await writeTextFile(await joinTemp(directory, "extension.json"), `${JSON.stringify(envelope.manifest, null, 2)}\n`);
   for (const [relative, encoded] of Object.entries(envelope.files_base64)) {
-    const safe = safeRelativePath(relative);
-    const parts = safe.split("/");
+    const path = safeRelativePath(relative);
+    const parts = path.split("/");
     if (parts.length > 1) await mkdir(await joinTemp(directory, parts.slice(0, -1).join("/")), { recursive: true });
-    await writeFile(await joinTemp(directory, safe), base64Bytes(encoded));
+    await writeFile(await joinTemp(directory, path), base64Bytes(encoded));
   }
   return directory;
 }
 
-export async function previewMarketplaceInstall(registry: VerifiedExtensionRegistry, entry: ExtensionRegistryEntry): Promise<MarketplaceInstallPreview> {
-  if (entry.revoked || registry.snapshot.revocations.some((revocation) => revocation.extension_id === entry.extension_id && (revocation.version === null || revocation.version === entry.version))) {
-    throw new Error(`${entry.extension_id}@${entry.version} is revoked.`);
+export async function previewMarketplaceInstall(registry: MarketplaceRegistry, entry: ExtensionRegistryEntry): Promise<MarketplaceInstallPreview> {
+  if (registry.record.source.source_id !== entry.registry_source_id) throw new Error("Registry provenance mismatch.");
+  if (registry.record.verified?.snapshot_sha256 !== entry.registry_snapshot_sha256) {
+    throw new Error("Registry snapshot changed; refresh the marketplace before installing.");
   }
   const source_path = await downloadAndMaterializeLmx(entry);
   const runtime_preview = await executableExtensionsClient.discover(source_path);
-  if (runtime_preview.manifest.extension_id !== entry.extension_id || runtime_preview.manifest.version !== entry.version) throw new Error("Runtime preview identity differs from signed registry metadata.");
+  if (runtime_preview.manifest.extension_id !== entry.extension_id || runtime_preview.manifest.version !== entry.version) {
+    throw new Error("Executable runtime preview disagrees with the verified M4 catalog identity.");
+  }
   return { registry, entry, source_path, runtime_preview };
 }
 
-export function approvalForPreview(preview: ExtensionPreview, grants: ExtensionApproval["grants"], acknowledgeHighRisk: boolean, acknowledgeUntrusted: boolean): ExtensionApproval {
-  return {
-    approval_digest: preview.approval_digest,
-    grants,
-    allow_unsigned: false,
-    allow_untrusted: acknowledgeUntrusted,
-    allow_high_risk: acknowledgeHighRisk,
-  };
-}
-
-export function isSafeAutomaticUpdate(preview: ExtensionPreview, installed: ExtensionDetail, entry: ExtensionRegistryEntry): { safe: boolean; reasons: string[] } {
+export function isSafeAutomaticUpdate(
+  preview: ExtensionPreview,
+  installed: ExtensionDetail,
+  entry: ExtensionRegistryEntry,
+): { safe: boolean; reasons: string[] } {
   const reasons: string[] = [];
-  if (entry.revoked || entry.deprecated) reasons.push("registry marks this release revoked/deprecated");
+  if (entry.revoked) reasons.push(entry.revocation_reason ?? "registry revoked this release");
+  if (compareSemver(entry.version, installed.active_version) <= 0) reasons.push("candidate is not newer than the active version");
   if (installed.manifest.publisher !== preview.manifest.publisher) reasons.push("publisher changed");
-  if (installed.trust.state !== "verified" || preview.trust.state !== "verified") reasons.push("publisher/runtime trust is not verified");
+  if (installed.trust.state !== "verified" || preview.trust.state !== "verified") reasons.push("runtime publisher trust is not verified");
+  if (installed.trust.trust_root_id !== preview.trust.trust_root_id || installed.trust.key_id !== preview.trust.key_id) reasons.push("publisher signing lineage changed");
   if (preview.permission_diff?.expands_authority) reasons.push("permissions expand authority");
   if (!preview.compatible) reasons.push(preview.compatibility_reason ?? "host API/platform is incompatible");
-  if (preview.requires_unsigned_approval || preview.requires_untrusted_approval || preview.requires_high_risk_approval) reasons.push("runtime requires a new trust/risk acknowledgement");
+  if (preview.blockers.length > 0) reasons.push(...preview.blockers);
+  if (preview.requires_unsigned_approval || preview.requires_untrusted_approval || preview.requires_high_risk_approval) {
+    reasons.push("runtime requires a new trust/risk acknowledgement");
+  }
   return { safe: reasons.length === 0, reasons };
 }
 
-export function registryEntryKey(entry: ExtensionRegistryEntry): string {
-  return `${entry.extension_id}@${entry.version}`;
+export function approvalForExistingGrants(preview: ExtensionPreview): ExtensionApproval {
+  return {
+    approval_digest: preview.approval_digest,
+    grants: preview.permissions
+      .filter((permission) => permission.granted)
+      .map((permission) => ({ permission_id: permission.permission_id, binding: permission.binding_label })),
+    allow_unsigned: false,
+    allow_untrusted: false,
+    allow_high_risk: false,
+  };
 }
 
-export function latestEntries(registries: VerifiedExtensionRegistry[]): ExtensionRegistryEntry[] {
-  const byExtension = new Map<string, ExtensionRegistryEntry>();
-  for (const registry of registries) {
-    for (const entry of registry.snapshot.entries) {
-      if (entry.revoked) continue;
-      const current = byExtension.get(entry.extension_id);
-      if (!current || compareSemver(entry.version, current.version) > 0) byExtension.set(entry.extension_id, entry);
-    }
+export function marketplaceDiagnostic(records: AdditionalRegistryRecord[]): string[] {
+  const findings: string[] = [];
+  for (const record of records) {
+    if (!record.verified) findings.push(`${record.source.display_name}: registry has no verified snapshot`);
+    else if (record.verified.snapshot.expires_unix_ms <= Date.now()) findings.push(`${record.source.display_name}: verified snapshot is expired`);
+    if (record.last_verification_error) findings.push(`${record.source.display_name}: ${record.last_verification_error}`);
   }
-  return [...byExtension.values()].sort((left, right) => left.display_name.localeCompare(right.display_name));
+  return findings;
 }
 
-export function compareSemver(left: string, right: string): number {
-  const a = left.split(".").map(Number);
-  const b = right.split(".").map(Number);
-  for (let index = 0; index < 3; index += 1) {
-    const delta = (a[index] ?? 0) - (b[index] ?? 0);
-    if (delta !== 0) return delta;
-  }
-  return 0;
-}
-
-/** SDK helper used by tests/scripts to produce byte-identical .lmx envelopes. */
-export function deterministicLmxText(manifest: ExtensionManifest, files: Record<string, Uint8Array>): string {
-  const files_base64 = Object.fromEntries(Object.entries(files).sort(([a], [b]) => a.localeCompare(b)).map(([path, bytes]) => [safeRelativePath(path), bytesBase64(bytes)]));
-  return canonical({ schema_version: LMX_SCHEMA, manifest, files_base64 });
+export function formatMarketplaceFailure(context: string, error: unknown): string {
+  return `${context}: ${errorMessage(error)}`;
 }
