@@ -146,9 +146,18 @@ export async function runComputerUseFullProductE2e(): Promise<void> {
       await dispatch('computer_focus', common);
       let inspection = await dispatch('computer_inspect', common);
       const elements = () => (inspection.elements ?? []) as Array<Record<string, any>>;
-      const dark = elements().find((element) => element.label === 'Dark mode');
-      const profile = elements().find((element) => element.label === 'Profile name' || /edit|text/i.test(String(element.role)));
-      const save = elements().find((element) => element.label === 'Save profile');
+      const actionsOf = (element: Record<string, any>) => Array.isArray(element.actions)
+        ? element.actions.map((action: unknown) => String(action))
+        : [];
+      const dark = elements().find((element) => element.label === 'Dark mode'
+        && /check/i.test(String(element.role))
+        && actionsOf(element).includes('click'));
+      const profile = elements().find((element) => element.label === 'Profile name'
+        && /edit/i.test(String(element.role))
+        && actionsOf(element).includes('set_value'));
+      const save = elements().find((element) => element.label === 'Save profile'
+        && /button/i.test(String(element.role))
+        && actionsOf(element).includes('click'));
       if (!dark || !profile || !save) throw new Error('full product inspection did not expose semantic fixture controls');
 
       await dispatch('computer_click', {
@@ -157,7 +166,8 @@ export async function runComputerUseFullProductE2e(): Promise<void> {
         button: 'left',
       });
       inspection = await dispatch('computer_inspect', common);
-      const darkAfter = elements().find((element) => element.label === 'Dark mode');
+      const darkAfter = elements().find((element) => element.id === dark.id)
+        ?? elements().find((element) => element.label === 'Dark mode' && /check/i.test(String(element.role)));
       trace.postconditions.dark_mode = /on|true|checked|togglestate\.on|1/i.test(String(darkAfter?.value ?? ''));
 
       const profileValue = `frontend-real-os-golden-${pid}`;
@@ -178,7 +188,9 @@ export async function runComputerUseFullProductE2e(): Promise<void> {
       }
 
       const observedProfile = () => elements().find((element) => element.id === profile.id)
-        ?? elements().find((element) => element.label === 'Profile name' && /edit|text/i.test(String(element.role)));
+        ?? elements().find((element) => element.label === 'Profile name'
+          && /edit/i.test(String(element.role))
+          && actionsOf(element).includes('set_value'));
       for (let attempt = 0; !profileVerified && attempt < 10; attempt += 1) {
         if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 200));
         inspection = await dispatch('computer_inspect', common);
