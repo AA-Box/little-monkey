@@ -1288,6 +1288,27 @@ fn native_snapshot() -> Result<NativeSnapshot, String> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn native_target_snapshot() -> Result<NativeSnapshot, String> {
+    let bytes = run_native_command_with_env(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_UIA_SCRIPT,
+        ],
+        &[("LM_TARGETS_ONLY", "1".to_string())],
+    )?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Windows UI Automation returned invalid data: {error}"))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn native_target_snapshot() -> Result<NativeSnapshot, String> {
+    native_snapshot()
+}
+
 #[cfg(target_os = "linux")]
 fn normalize_linux_window_ids(snapshot: &mut NativeSnapshot) {
     let Ok(output) = Command::new("wmctrl").args(["-l"]).output() else {
@@ -1515,7 +1536,7 @@ fn find_element(target: &ComputerTarget, element_id: &str) -> Result<ComputerEle
 
 impl DesktopSemanticBackend for NativeSemanticBackend {
     fn list_targets(&self) -> Result<Vec<ComputerTarget>, String> {
-        let mut targets = native_snapshot()?.targets;
+        let mut targets = native_target_snapshot()?.targets;
         targets.retain(|target| !target_is_sensitive(target));
         targets.truncate(MAX_TARGETS);
         Ok(targets)
@@ -1920,17 +1941,19 @@ public static class LMComputerUseDpi { [DllImport("user32.dll")] public static e
 [LMComputerUseDpi]::SetThreadDpiAwarenessContext([IntPtr]::new(-4)) | Out-Null
 $root=[System.Windows.Automation.AutomationElement]::RootElement
 $targets=@();$elements=@{}
-$windows=$root.FindAll([System.Windows.Automation.TreeScope]::Children,[System.Windows.Automation.Condition]::TrueCondition)
 $onlyPid=0
 try { if($env:COMPUTER_USE_FIXTURE_PID){$onlyPid=[int]$env:COMPUTER_USE_FIXTURE_PID} } catch {}
+$windows=if($onlyPid){
+  $pidCondition=[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty,$onlyPid)
+  $root.FindAll([System.Windows.Automation.TreeScope]::Children,$pidCondition)
+}else{
+  $root.FindAll([System.Windows.Automation.TreeScope]::Children,[System.Windows.Automation.Condition]::TrueCondition)
+}
 $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker
 $fixtureFallback=$false
-if($onlyPid){
-  $windows=@($windows | Where-Object {$_.Current.ProcessId -eq $onlyPid})
-  if($windows.Count -eq 0){
-    $windows=@($root.FindAll([System.Windows.Automation.TreeScope]::Children,[System.Windows.Automation.Condition]::TrueCondition) | Where-Object {$_.Current.Name -like 'Little Monkey TestApp*'})
-    $fixtureFallback=$windows.Count -gt 0
-  }
+if($onlyPid -and $windows.Count -eq 0){
+  $windows=@($root.FindAll([System.Windows.Automation.TreeScope]::Children,[System.Windows.Automation.Condition]::TrueCondition) | Where-Object {$_.Current.Name -like 'Little Monkey TestApp*'})
+  $fixtureFallback=$windows.Count -gt 0
 }
 function ParentOf($e) { try { return $walker.GetParent($e) } catch { return $null } }
 function ValueOf($e) {
@@ -2002,7 +2025,7 @@ function RectOf($rect) { $x=0.0;$y=0.0;$width=0.0;$height=0.0;try{$x=[double]$re
 function AncestorText($e) { $parts=@();$current=$e;for($k=0;$k -lt 8;$k++){try{$current=$walker.GetParent($current);if($null -eq $current){break};$parts+=[string]$current.Current.Name}catch{break}};return ($parts -join ' ') }
 for($i=0;$i -lt $windows.Count -and $i -lt 64;$i++){
   $w=$windows.Item($i);$p=$w.Current.ProcessId;$id=if($fixtureFallback){"process:$onlyPid"}else{"process:$p"};$name=[string]$w.Current.Name;$windowId=[string]$w.Current.NativeWindowHandle;$targetId="$id::window-$i";
-  $focused=([LMComputerUseDpi]::GetForegroundWindow() -eq [IntPtr]::new([int64]$windowId));if(-not $focused){try{$focused=[bool]$w.Current.IsKeyboardFocusWithin}catch{try{$focused=[bool]$w.Current.HasKeyboardFocus}catch{}}};$t=[ordered]@{targetId=$targetId;applicationId=$id;applicationName=$name;windowId=$windowId;windowTitle=$name;bounds=(RectOf $w.Current.BoundingRectangle);focused=$focused;sensitive=($name -match 'UAC|Windows Security|credential|password');supportedActions=@('inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot')};$targets+=$t;$list=@();$desc=$w.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition);
+  $focused=([LMComputerUseDpi]::GetForegroundWindow() -eq [IntPtr]::new([int64]$windowId));if(-not $focused){try{$focused=[bool]$w.Current.IsKeyboardFocusWithin}catch{try{$focused=[bool]$w.Current.HasKeyboardFocus}catch{}}};$t=[ordered]@{targetId=$targetId;applicationId=$id;applicationName=$name;windowId=$windowId;windowTitle=$name;bounds=(RectOf $w.Current.BoundingRectangle);focused=$focused;sensitive=($name -match 'UAC|Windows Security|credential|password');supportedActions=@('inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot')};$targets+=$t;$list=@();if($env:LM_TARGETS_ONLY -eq '1'){$elements[$targetId]=@($list);continue};$desc=$w.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition);
   for($j=0;$j -lt $desc.Count -and $j -lt 256;$j++){
     $e=$desc.Item($j);$label=[string]$e.Current.Name;$help=[string]$e.Current.HelpText;$role=[string]$e.Current.ControlType.ProgrammaticName;$automation=[string]$e.Current.AutomationId;if([string]::IsNullOrWhiteSpace($automation)){try{$automation=($e.GetRuntimeId() -join '-')}catch{$automation=''}};$stable=($automation -replace '[^A-Za-z0-9._-]','_');$value=ValueOf $e;if($null -ne $value){$value=[string]$value};$actions=@(ActionsOf $e);$effective=ActionTargetRecord $e $targetId $j;$context="$role $label $help $automation $(AncestorText $e)";$enabled=([bool]$e.Current.IsEnabled);try{$legacy=$e.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern).Current;if(([int]$legacy.State -band 1) -ne 0){$enabled=$false}}catch{};$list+=[ordered]@{id="$targetId::element-$j::native-$stable";role=$role;label=$label;value=$value;bounds=(RectOf $e.Current.BoundingRectangle);enabled=$enabled;focused=([bool]$e.Current.HasKeyboardFocus);actions=$actions;effectiveAction=$effective;sensitive=([bool]$e.Current.IsPassword -or ($context -match 'password|credential|secret'))};
   }
