@@ -2096,7 +2096,10 @@ impl ExecutionTarget for DockerExecutionTarget {
         }
         let name = Self::container_name(&request.run_id);
         let mut command = Command::new(&self.docker_binary);
-        command.args(["run", "--detach", "--name", &name, "--pid", "private"]);
+        // Docker's default PID namespace is private. Do not pass the
+        // non-portable `private` value: older Docker engines reject it even
+        // though they already provide the required default.
+        command.args(["run", "--detach", "--name", &name]);
         command.args([
             "--cap-drop",
             "ALL",
