@@ -139,7 +139,7 @@ def main() -> int:
     capability = json.loads((repo / "src-tauri" / "capabilities" / "default.json").read_text(encoding="utf-8"))
     capability["identifier"] = "computer-use-full-product-e2e"
     capability["description"] = "Temporary capability for the real frontend/native acceptance window"
-    capability["windows"] = ["main"]
+    capability["windows"] = ["main", "companion-overlay"]
     capability.pop("remote", None)
     capability["permissions"].extend([
         "allow-computer-use-full-product-report",
@@ -166,6 +166,18 @@ def main() -> int:
         "center": True,
         "titleBarStyle": "Overlay",
         "hiddenTitle": True,
+    }, {
+        "label": "companion-overlay",
+        "title": "Little Monkey Companion",
+        "width": 440,
+        "height": 560,
+        "minWidth": 360,
+        "minHeight": 420,
+        "visible": False,
+        "alwaysOnTop": True,
+        "decorations": False,
+        "resizable": True,
+        "skipTaskbar": True,
     }]
     tauri_config["app"]["security"]["capabilities"] = ["computer-use-full-product-e2e"]
     config_path.write_text(json.dumps(tauri_config), encoding="utf-8")
