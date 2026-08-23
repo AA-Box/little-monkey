@@ -461,7 +461,7 @@ jobs:
         run: >-
           python src-tauri/fixtures/computer-use-full-product-e2e.py
           --fixture src-tauri/fixtures/computer-use-test-app.py
-          --timeout 900
+          --timeout 300
           --report "$env:RUNNER_TEMP/little-monkey-full-product-e2e.json"
 
       - name: Upload full product evidence
