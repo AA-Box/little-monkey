@@ -817,16 +817,26 @@ impl Default for AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let full_product_e2e = std::env::var("COMPUTER_USE_FULL_PRODUCT_E2E").as_deref() == Ok("1");
+    let startup_step = |step: &str| {
+        if full_product_e2e {
+            eprintln!("full product startup: {step}");
+        }
+    };
     // Before anything else, and before any thread exists: a GUI launch hands us
     // launchd's `PATH`, so every shell tool would miss the user's own binaries
     // (`~/.local/bin`, Homebrew, version-manager shims) until this runs.
+    startup_step("before login path");
     login_path::hydrate();
+    startup_step("after login path");
     // User-authored agent/CLI configuration has a stable, portable home of
     // its own. Managed state below remains in the OS app-data directory.
     app_paths::ensure_agent_config_dir()
         .expect("failed to initialize the Little Monkey agent home");
+    startup_step("after agent config");
     let app_data_dir = app_paths::data_dir()
         .expect("the operating system must provide an application data directory");
+    startup_step("after data directory");
     // Installed before anything that can refuse an outbound request, and the only
     // initialization here that is deliberately NOT an `expect`. Every neighbour on
     // this list is a capability the app needs to work; this one only writes refusals
@@ -839,21 +849,28 @@ pub fn run() {
             eprintln!("egress denials will not be recorded this session: {error}");
         }
     }
+    startup_step("after denial sink");
     let m3_state = m3_production::build_m3_command_state(&app_data_dir)
         .expect("failed to initialize the local runtime and API hub");
+    startup_step("after m3");
     let quantization_state = m3_production::build_quantization_command_state(&app_data_dir)
         .expect("failed to initialize the model conversion and quantization workbench");
+    startup_step("after quantization");
     let m4_state = m4_commands::M4CommandState::production(&app_data_dir)
         .expect("failed to initialize packages, MCP Apps, and workflow services");
+    startup_step("after m4");
     let native_skills_state =
         native_skill_commands::NativeSkillsCommandState::production(&app_data_dir)
             .expect("failed to initialize the native SKILL.md runtime");
+    startup_step("after native skills");
     let skill_learning_state =
         skill_learning_commands::SkillLearningCommandState::production(&app_data_dir)
             .expect("failed to initialize the skill learning store");
+    startup_step("after skill learning");
     let skill_activation_state =
         skill_activation_commands::SkillActivationCommandState::production(&app_data_dir)
             .expect("failed to initialize the skill activation store");
+    startup_step("after skill activation");
     // Resolves an interrupted promotion against what is actually installed
     // before anything can discover or invoke a half-published skill.
     skill_learning_commands::reconcile_at_startup(
@@ -861,15 +878,19 @@ pub fn run() {
         &native_skills_state.manager,
         None,
     );
+    startup_step("after startup reconciliation");
     let browser_state = browser_worker::BrowserCommandState::production(&app_data_dir)
         .expect("failed to initialize the isolated browser worker");
+    startup_step("after browser");
     let m7_state = m7_companion::M7CompanionState::production(&app_data_dir)
         .expect("failed to initialize the desktop companion");
+    startup_step("after companion");
     let configured_companion_shortcut = m7_state
         .overlay_shortcut()
         .expect("failed to load the configured companion shortcut");
     let palette_state = command_palette::CommandPaletteState::production(&app_data_dir)
         .expect("failed to initialize the command palette");
+    startup_step("after palette");
     let configured_palette_shortcut = palette_state
         .shortcut()
         .expect("failed to load the configured command palette shortcut");
@@ -879,6 +900,7 @@ pub fn run() {
     let desktop_control_state = desktop_control::DesktopControlState::production_with_lock(
         app_data_dir.join("desktop_control.lock"),
     );
+    startup_step("after desktop control");
     // Fixed (not user-configurable, unlike the companion overlay shortcut
     // above) global emergency-stop hotkey — see ROADMAP.md's Safe Desktop
     // Control acceptance criteria ("Emergency stop hotkey") and the design
@@ -980,6 +1002,9 @@ pub fn run() {
             artifacts::handle_request(ctx.app_handle().state::<AppState>().inner(), &request)
         })
         .setup(|app| {
+            if full_product_e2e {
+                eprintln!("full product startup: setup entered");
+            }
             // Keep the native-skill registry live for external edits and
             // cross-window updates. Workspace restoration below triggers a
             // second sync once the primary root is known.
