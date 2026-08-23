@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
 
 import { primaryRoot, useWorkspaceStore } from "./workspaceStore";
@@ -12,11 +13,15 @@ import {
   approveStandard,
   checkStandardsDrift,
   discoverAndMergeStandards,
+  exportAgentOsStandards,
   exportStandards,
+  importAgentOsStandards,
   importStandards,
   loadStandards,
+  setStandardCheckers,
   setStandardStatus,
 } from "../lib/standardsRepository";
+import type { VerifyResult } from "./verifyTypes";
 
 export const STANDARDS_IMPORT_PATH = ".little-monkey/standards/import.json";
 export const STANDARDS_EXPORT_PATH = ".little-monkey/standards/export.json";
@@ -27,6 +32,7 @@ interface StandardsStore {
   loading: boolean;
   error: string | null;
   lastExportPath: string | null;
+  lastCheckerResults: Record<string, VerifyResult[]>;
   refresh: () => Promise<void>;
   discover: () => Promise<void>;
   approve: (standardId: string) => Promise<void>;
@@ -36,6 +42,10 @@ interface StandardsStore {
   preview: (taskText: string, fileHints?: string[], budgetChars?: number) => StandardsSelection;
   importFile: () => Promise<void>;
   exportFile: () => Promise<void>;
+  importAgentOs: () => Promise<void>;
+  exportAgentOs: () => Promise<void>;
+  setCheckers: (standardId: string, commandIds: string[]) => Promise<void>;
+  runCheckers: (standardId: string) => Promise<VerifyResult[]>;
 }
 
 function activeWorkspace(): string | null {
@@ -54,12 +64,13 @@ export const useStandardsStore = create<StandardsStore>((set, get) => ({
   loading: false,
   error: null,
   lastExportPath: null,
+  lastCheckerResults: {},
 
   refresh: async () => {
     const sequence = ++refreshSequence;
     const workspacePath = activeWorkspace();
     if (!workspacePath) {
-      set({ document: null, workspacePath: null, loading: false, error: null, lastExportPath: null });
+      set({ document: null, workspacePath: null, loading: false, error: null, lastExportPath: null, lastCheckerResults: {} });
       return;
     }
     set({ loading: true, error: null });
@@ -149,5 +160,56 @@ export const useStandardsStore = create<StandardsStore>((set, get) => ({
       set({ loading: false, error: message(error) });
       throw error;
     }
+  },
+
+  importAgentOs: async () => {
+    const workspacePath = activeWorkspace();
+    if (!workspacePath) throw new Error("Open a workspace before importing Agent OS standards.");
+    set({ loading: true, error: null });
+    try {
+      const document = await importAgentOsStandards(workspacePath);
+      set({ document, workspacePath, loading: false });
+    } catch (error) {
+      set({ loading: false, error: message(error) });
+      throw error;
+    }
+  },
+
+  exportAgentOs: async () => {
+    const document = get().document;
+    if (!document) throw new Error("No standards are loaded.");
+    set({ loading: true, error: null });
+    try {
+      const path = await exportAgentOsStandards(document);
+      set({ loading: false, lastExportPath: path });
+    } catch (error) {
+      set({ loading: false, error: message(error) });
+      throw error;
+    }
+  },
+
+  setCheckers: async (standardId, commandIds) => {
+    const workspacePath = activeWorkspace();
+    const document = get().document;
+    if (!workspacePath || !document) throw new Error("No standards workspace is loaded.");
+    const next = await setStandardCheckers(workspacePath, document, standardId, commandIds);
+    set({ document: next, error: null });
+  },
+
+  runCheckers: async (standardId) => {
+    const standard = get().document?.standards.find((entry) => entry.standard_id === standardId);
+    if (!standard) throw new Error(`Unknown standard ${standardId}.`);
+    if (standard.checker_command_ids.length === 0) throw new Error("No Verification commands are bound to this standard.");
+    const results: VerifyResult[] = [];
+    for (const commandId of standard.checker_command_ids) {
+      const result = await invoke<VerifyResult>("verify_run", {
+        commandId,
+        turnId: null,
+        sandboxPath: null,
+      });
+      results.push(result);
+    }
+    set((state) => ({ lastCheckerResults: { ...state.lastCheckerResults, [standardId]: results }, error: null }));
+    return results;
   },
 }));
