@@ -5991,6 +5991,7 @@ mod tests {
         autonomous_test_git(&root, &["init", "-q"]);
         autonomous_test_git(&root, &["config", "user.email", "test@example.com"]);
         autonomous_test_git(&root, &["config", "user.name", "Autonomous Test"]);
+        autonomous_test_git(&root, &["config", "core.autocrlf", "false"]);
         std::fs::write(root.join("a.txt"), "hello\n").unwrap();
         autonomous_test_git(&root, &["add", "--", "a.txt"]);
         autonomous_test_git(&root, &["commit", "-qm", "initial"]);
