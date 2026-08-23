@@ -190,14 +190,12 @@ def main() -> int:
         build_deadline = time.monotonic() + max(args.timeout + 300, 1800)
         acceptance_deadline: float | None = None
         while not args.report.is_file():
-            if app.poll() is not None and not args.report.is_file():
-                break
+            app_log.flush()
+            app_output = app_log_path.read_text(encoding="utf-8", errors="replace")
+            if acceptance_deadline is None and "little-monkey.exe" in app_output:
+                acceptance_deadline = time.monotonic() + args.timeout
             if acceptance_deadline is None:
-                app_log.flush()
-                app_output = app_log_path.read_text(encoding="utf-8", errors="replace")
-                if "little-monkey.exe" in app_output:
-                    acceptance_deadline = time.monotonic() + args.timeout
-                elif time.monotonic() >= build_deadline:
+                if app.poll() is not None or time.monotonic() >= build_deadline:
                     break
             elif time.monotonic() >= acceptance_deadline:
                 break
