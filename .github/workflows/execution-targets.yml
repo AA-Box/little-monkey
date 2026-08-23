@@ -73,9 +73,15 @@ jobs:
           start = next(i for i, line in enumerate(source) if "python3 <<'PY'" in line) + 1
           end = next(i for i in range(start, len(source)) if source[i].strip() == 'PY')
           body = source[start:end]
-          nonempty = [len(line) - len(line.lstrip()) for line in body if line.strip()]
-          indent = min(nonempty) if nonempty else 0
-          Path('/tmp/pr440_apply.py').write_text('\n'.join(line[indent:] for line in body) + '\n')
+          output = []
+          in_triple = False
+          for line in body:
+              if not in_triple and line.startswith('          '):
+                  line = line[10:]
+              output.append(line)
+              if line.count("'''") % 2 == 1:
+                  in_triple = not in_triple
+          Path('/tmp/pr440_apply.py').write_text('\n'.join(output) + '\n')
           PY
           python3 /tmp/pr440_apply.py
       - name: Install Linux system dependencies
