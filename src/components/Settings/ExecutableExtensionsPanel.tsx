@@ -202,7 +202,6 @@ export function ExecutableExtensionsPanel() {
   }, [items, refresh]);
 
   useEffect(() => {
-    setPreview(null);
     setGrantedIds(new Set());
     setWorkspaceBindings({});
     setAllowUnsigned(false);
@@ -219,6 +218,10 @@ export function ExecutableExtensionsPanel() {
     setWebhookHandlerId("");
     setWebhookSecret("");
   }, [selectedId]);
+
+  useEffect(() => {
+    if (preview && preview.manifest.extension_id !== selectedId) setPreview(null);
+  }, [preview, selectedId]);
 
   useEffect(() => {
     if (!selected) {
