@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  detectStandardConflicts,
   mergeDiscoveredStandards,
   selectStandards,
   standardsPromptSection,
+  standardsSelectionProvenance,
   type EngineeringStandard,
 } from "./standards";
 
@@ -44,9 +46,21 @@ describe("standards selection", () => {
       "Add a React component with accessibility coverage",
       ["src/components/Settings/Foo.tsx"],
     );
-    expect(selection.selected[0].standard.standard_id).toBe("react-components");
+    expect(selection.selected.map((entry) => entry.standard.standard_id)).toEqual(["react-components"]);
     expect(selection.selected[0].reasons.join(" ")).toContain("task keyword");
     expect(selection.selected[0].reasons.join(" ")).toContain("files:");
+  });
+
+  it("does not spend prompt budget on unrelated recommendations", () => {
+    const selection = selectStandards([
+      fixture({ standard_id: "rust", title: "Rust only", body: "Use Cargo.", applicability: { globs: ["src-tauri/**"], languages: ["rust"], frameworks: ["cargo"], task_keywords: ["rust"] } }),
+    ], "Change the React settings component", ["src/components/Settings/Foo.tsx"]);
+    expect(selection.selected).toEqual([]);
+  });
+
+  it("keeps required repository gates even without a lexical match", () => {
+    const required = fixture({ standard_id: "verify", severity: "required", title: "Run verification", body: "Run the repository verification command.", applicability: { globs: [], languages: [], frameworks: [], task_keywords: ["verify"] } });
+    expect(selectStandards([required], "Update documentation").selected[0].standard.standard_id).toBe("verify");
   });
 
   it("never injects rejected, stale-contradicted, or unapproved candidates", () => {
@@ -59,24 +73,48 @@ describe("standards selection", () => {
     expect(selection.selected.map((entry) => entry.standard.standard_id)).toEqual(["approved"]);
   });
 
+  it("suppresses both sides of an unresolved approved conflict", () => {
+    const one = fixture({ standard_id: "one", conflicts_with: ["two"] });
+    const two = fixture({ standard_id: "two", title: "Other component policy" });
+    expect(selectStandards([one, two], "React component").selected).toEqual([]);
+  });
+
   it("honors the prompt budget without silently truncating a standard", () => {
     const first = fixture({ standard_id: "first", severity: "required", body: "A".repeat(250) });
-    const second = fixture({ standard_id: "second", body: "B".repeat(250) });
-    const selection = selectStandards([first, second], "general", [], 400);
+    const second = fixture({ standard_id: "second", severity: "required", body: "B".repeat(250) });
+    const selection = selectStandards([first, second], "general", [], 520);
     expect(selection.selected).toHaveLength(1);
     expect(selection.selected[0].standard.standard_id).toBe("first");
     expect(selection.omitted).toBe(1);
   });
 
-  it("renders authority boundaries into the injected prompt", () => {
-    const section = standardsPromptSection(selectStandards([fixture()], "React component"));
+  it("renders frozen ids, versions, content hashes, evidence and authority boundaries", () => {
+    const selection = selectStandards([fixture()], "React component");
+    const section = standardsPromptSection(selection);
     expect(section).toContain("Applicable engineering standards");
     expect(section).toContain("never grant tools, network, secrets, budget, or permission authority");
     expect(section).toContain("react-components@v2");
+    expect(section).toContain(`sha256:${"b".repeat(64)}`);
+    expect(section).toContain("package.json:12");
+    expect(standardsSelectionProvenance(selection).selected[0]).toMatchObject({ standard_id: "react-components", version: 2, content_sha256: "b".repeat(64) });
   });
 });
 
-describe("discovery merge", () => {
+describe("standards lifecycle", () => {
+  it("marks explicit active conflicts for Studio resolution", () => {
+    const one = fixture({ standard_id: "one", status: "candidate", conflicts_with: ["two"] });
+    const two = fixture({ standard_id: "two", status: "approved" });
+    const detected = detectStandardConflicts([one, two]);
+    expect(detected.map((standard) => standard.status)).toEqual(["conflicting", "conflicting"]);
+  });
+
+  it("increments candidate revision when rediscovered policy content changes", () => {
+    const original = fixture({ status: "candidate", content_sha256: "1".repeat(64), version: 2 });
+    const rediscovered = fixture({ status: "candidate", content_sha256: "2".repeat(64), version: 1 });
+    const [merged] = mergeDiscoveredStandards([original], [rediscovered]);
+    expect(merged.version).toBe(3);
+  });
+
   it("preserves approved content while refreshing evidence and drift", () => {
     const approved = fixture({ content_sha256: "1".repeat(64), evidence: [] });
     const rediscovered = fixture({
