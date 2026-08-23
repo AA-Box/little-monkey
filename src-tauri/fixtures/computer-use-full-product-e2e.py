@@ -163,7 +163,7 @@ def main() -> int:
                     break
                 app_log.flush()
                 app_output = app_log_path.read_text(encoding="utf-8", errors="replace")
-                if "Running `" in app_output and "little-monkey" in app_output:
+                if "little-monkey.exe" in app_output:
                     acceptance_deadline = time.monotonic() + args.timeout
             elif time.monotonic() >= acceptance_deadline:
                 break
