@@ -818,7 +818,33 @@ impl Default for AppState {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let full_product_e2e = std::env::var("COMPUTER_USE_FULL_PRODUCT_E2E").as_deref() == Ok("1");
-    const FULL_PRODUCT_E2E_CAPABILITY: &str = r#{\n  \"identifier\": \"computer-use-full-product-e2e\",\n  \"description\": \"Runtime-only capability for the real frontend/native acceptance window\",\n  \"windows\": [\"main\"],\n  \"remote\": {\n    \"urls\": [\"http://127.0.0.1:1420/**\"]\n  },\n  \"permissions\": [\n    \"core:default\",\n    \"core:window:allow-start-dragging\",\n    \"opener:default\",\n    \"shell:default\",\n    \"dialog:default\",\n    \"fs:default\",\n    \"deep-link:default\",\n    \"updater:default\",\n    \"process:allow-restart\",\n    {\n      \"identifier\": \"fs:allow-write-text-file\",\n      \"allow\": [{ \"path\": \"$TEMP/**\" }]\n    },\n    {\n      \"identifier\": \"opener:allow-open-path\",\n      \"allow\": [{ \"path\": \"$TEMP/**\" }]\n    }\n  ]\n}#;
+    const FULL_PRODUCT_E2E_CAPABILITY: &str = r#"{
+  "identifier": "computer-use-full-product-e2e",
+  "description": "Runtime-only capability for the real frontend/native acceptance window",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:1420/**"]
+  },
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "opener:default",
+    "shell:default",
+    "dialog:default",
+    "fs:default",
+    "deep-link:default",
+    "updater:default",
+    "process:allow-restart",
+    {
+      "identifier": "fs:allow-write-text-file",
+      "allow": [{ "path": "$TEMP/**" }]
+    },
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [{ "path": "$TEMP/**" }]
+    }
+  ]
+}"#;
     // Before anything else, and before any thread exists: a GUI launch hands us
     // launchd's `PATH`, so every shell tool would miss the user's own binaries
     // (`~/.local/bin`, Homebrew, version-manager shims) until this runs.
