@@ -159,12 +159,12 @@ def main() -> int:
             if app.poll() is not None and not args.report.is_file():
                 break
             if acceptance_deadline is None:
-                if time.monotonic() >= build_deadline:
-                    break
                 app_log.flush()
                 app_output = app_log_path.read_text(encoding="utf-8", errors="replace")
                 if "little-monkey.exe" in app_output:
                     acceptance_deadline = time.monotonic() + args.timeout
+                elif time.monotonic() >= build_deadline:
+                    break
             elif time.monotonic() >= acceptance_deadline:
                 break
             time.sleep(1)
