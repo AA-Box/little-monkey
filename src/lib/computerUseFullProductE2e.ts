@@ -48,7 +48,7 @@ export async function runComputerUseFullProductE2e(): Promise<void> {
     screenshot_artifact_id: '',
     screenshot_base64: '',
     model_loop: { kind: 'deterministic-frontend-model-tool-loop', completed: false, tool_calls: [] as string[] },
-    tool_calls: [] as Array<{ name: string; result: string }>,
+    tool_calls: [] as Array<{ name: string; result: string; durationMs: number }>,
     error: null as string | null,
   };
   let sessionId: string | undefined;
@@ -63,6 +63,7 @@ export async function runComputerUseFullProductE2e(): Promise<void> {
   ];
 
   const dispatch = async (name: string, args: Record<string, unknown>): Promise<any> => {
+    const startedAt = performance.now();
     const result = await executeToolCall(
       toolCall(name, args, callIndex),
       null,
@@ -84,7 +85,7 @@ export async function runComputerUseFullProductE2e(): Promise<void> {
     trace.real_frontend_dispatcher = true;
     trace.task_coordinator = true;
     trace.real_tauri_ipc = true;
-    trace.tool_calls.push({ name, result });
+    trace.tool_calls.push({ name, result, durationMs: Math.round(performance.now() - startedAt) });
     trace.model_loop.tool_calls.push(name);
     return parseResult(result);
   };
