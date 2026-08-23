@@ -101,6 +101,10 @@ pub mod support_bundle;
 // health). Self-contained: engine + thin command layer live in one file,
 // same convention as `ollama`/`llama`/`server`/`mcp`/`stacks`.
 pub mod diagnostics;
+// Stable execution-target contract shared by local, Docker, paired-node, and
+// SSH-runner execution. The module is Tauri-free so the CLI and remote runner
+// use the exact same identity, capability, transfer, and result validation.
+pub mod execution_target;
 pub mod workflow_core;
 // Runtime/model hub service plus its thin desktop command layer. The hub
 // composes Ollama, managed llama.cpp, MLX, catalog/download, and API policy
@@ -1827,6 +1831,10 @@ pub fn run() {
             daemon_commands::remote_node_refresh,
             daemon_commands::remote_placement_sync,
             daemon_commands::autonomous_task_place_node,
+            daemon_commands::execution_targets_list,
+            daemon_commands::execution_target_probe,
+            daemon_commands::execution_target_remove,
+            daemon_commands::execution_workspace_push,
             daemon_commands::remote_node_label,
             m5_delivery::m5_delivery_prepare_mutation,
             m5_delivery::m5_delivery_execute_mutation,

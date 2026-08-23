@@ -5494,6 +5494,14 @@ async fn run_inner(
         autonomous_task: recipe.autonomous_task.as_ref().map(|snapshot| {
             serde_json::to_value(snapshot).expect("autonomous snapshot is serializable")
         }),
+        execution_target: recipe
+            .placed_run
+            .as_ref()
+            .and_then(|placed| placed.execution_target.clone()),
+        workspace_transfer: recipe
+            .placed_run
+            .as_ref()
+            .and_then(|placed| placed.workspace_transfer.clone()),
     };
     // **The half of K17 S3 that makes a travelled policy more than paperwork.**
     //
@@ -6856,6 +6864,8 @@ mod tests {
                 max_artifact_bytes: 1 << 20,
                 max_event_count: 10_000,
             },
+            execution_target: None,
+            workspace_transfer: None,
         }
     }
 

@@ -25,6 +25,7 @@ mod conversations_cli;
 mod daemon;
 mod durable_run;
 mod embed_cli;
+mod execution_cli;
 mod extensions_cli;
 mod ingress_cli;
 mod launcher;
@@ -482,6 +483,15 @@ enum Cmd {
     /// docs/roadmap/p3-scheduled-automation.md.
     #[command(subcommand)]
     Task(TaskCmd),
+    /// Configure and probe execution targets (local, Docker, paired node, SSH runner).
+    #[command(subcommand)]
+    Targets(execution_cli::TargetsCmd),
+    /// Create portable workspace transfers and safely apply remote results.
+    #[command(subcommand)]
+    Workspace(execution_cli::WorkspaceCmd),
+    /// Serve the Little Monkey runner protocol over stdio for SSH transport.
+    #[command(subcommand)]
+    Runner(execution_cli::RunnerCmd),
     /// Validate, run, inspect, and replay the same typed workflows as the
     /// desktop visual editor.
     #[command(subcommand)]
@@ -1642,6 +1652,9 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             TaskCmd::Resume { run_id } => task::autonomous_resume(run_id),
             TaskCmd::Cancel { run_id } => task::autonomous_cancel(run_id),
         },
+        Cmd::Targets(action) => execution_cli::targets(action.clone()),
+        Cmd::Workspace(action) => execution_cli::workspace(action.clone()),
+        Cmd::Runner(action) => execution_cli::runner(action.clone()),
         Cmd::Workflow(action) => {
             let data_dir = app_data_dir()
                 .ok_or_else(|| "Could not resolve the app data directory".to_string());

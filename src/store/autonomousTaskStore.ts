@@ -1,6 +1,6 @@
 import { create } from "zustand";
 
-import { taskEvent, taskEventToRunEvent, type AutonomousTask, type TaskGuidance } from "../lib/autonomousTask";
+import { taskEvent, taskEventToRunEvent, type AutonomousTask, type TaskConstraints, type TaskGuidance } from "../lib/autonomousTask";
 import { AutonomousTaskControl, resumeAutonomousTask, startAutonomousTask, submitAutonomousTaskToDaemon, type StartedAutonomousTask } from "../lib/autonomousTaskRunner";
 import { appendRunEvent, decideRunPermission, listRuns, loadRunEvents, requestRunCancellation } from "../lib/runProtocol";
 
@@ -44,7 +44,7 @@ export interface AutonomousTaskStoreState {
   init: () => Promise<void>;
   refresh: () => Promise<void>;
   select: (taskId: string | null) => void;
-  start: (objective: string, sessionId: string) => Promise<AutonomousTask>;
+  start: (objective: string, sessionId: string, constraints?: Pick<TaskConstraints, "executionPlacement">) => Promise<AutonomousTask>;
   pause: (taskId: string) => Promise<void>;
   resume: (taskId: string) => Promise<void>;
   cancel: (taskId: string, reason?: string) => Promise<void>;
@@ -79,8 +79,8 @@ export const useAutonomousTaskStore = create<AutonomousTaskStoreState>((set, get
       }));
     }),
     init: async () => { await get().refresh(); },
-    start: (objective, sessionId) => withBusy(set, get, "start", async () => {
-      const handle = await startAutonomousTask({ objective, sessionId, onUpdate: publish });
+    start: (objective, sessionId, constraints) => withBusy(set, get, "start", async () => {
+      const handle = await startAutonomousTask({ objective, sessionId, constraints, onUpdate: publish });
       set((state) => { const pausedTaskIds = { ...state.pausedTaskIds }; delete pausedTaskIds[handle.runId]; return { pausedTaskIds }; });
       started.set(handle.runId, handle); controls.set(handle.runId, handle.control); publish(handle.task);
       void handle.completion.then((task) => { publish(task); started.delete(handle.runId); controls.delete(handle.runId); }).catch((error) => { set({ error: error instanceof Error ? error.message : String(error) }); started.delete(handle.runId); controls.delete(handle.runId); });

@@ -99,6 +99,7 @@ import { UpdatesPanel } from "./UpdatesPanel";
 import { PrivacyFirewallPanel } from "./PrivacyFirewallPanel";
 import { DesktopControlPanel } from "./DesktopControlPanel";
 import { DiagnosticsPanel } from "./DiagnosticsPanel";
+import { ExecutionTargetsPanel } from "./ExecutionTargetsPanel";
 import { AppearancePanel } from "./AppearancePanel";
 import { ProfilesPanel } from "./ProfilesPanel";
 import { TeamModePanel } from "./TeamModePanel";
@@ -121,7 +122,7 @@ interface SettingsModalProps {
   initialTabRequest?: number;
 }
 
-type StaticSettingsTab = "local" | "ollama" | "providers" | "automation" | "rules" | "memorystudio" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "extensions" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "channels" | "telephony" | "peers" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "profiles" | "approvalchains" | "localapps" | "comparelab" | "resources" | "updates";
+type StaticSettingsTab = "local" | "ollama" | "providers" | "automation" | "rules" | "memorystudio" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "extensions" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "channels" | "telephony" | "peers" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "profiles" | "approvalchains" | "localapps" | "comparelab" | "resources" | "updates" | "execution";
 export type SettingsTab = StaticSettingsTab | ProviderSettingsTab;
 
 const ICONS: Record<StaticSettingsTab, LucideIcon> = {
@@ -162,13 +163,14 @@ const ICONS: Record<StaticSettingsTab, LucideIcon> = {
   comparelab: FlaskConical,
   resources: Gauge,
   updates: RefreshCw,
+  execution: Server,
 };
 
 const GROUPS: { labelKey: string; ids: StaticSettingsTab[] }[] = [
   { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "updates", "security", "privacy", "diagnostics", "approvalchains", "profiles", "team", "companion", "desktopcontrol", "shortcuts", "usage", "resources", "portability"] },
   { labelKey: "SettingsModal.groupModels", ids: ["runtimehub", "local", "ollama", "providers", "comparelab"] },
   { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "memorystudio", "tasks", "localapps"] },
-  { labelKey: "SettingsModal.groupIntegrations", ids: ["extensions", "ecosystem", "browser", "gitdelivery", "triage", "background", "connectors", "channels", "telephony", "peers", "prompts", "apiserver"] },
+  { labelKey: "SettingsModal.groupIntegrations", ids: ["extensions", "ecosystem", "browser", "gitdelivery", "triage", "background", "execution", "connectors", "channels", "telephony", "peers", "prompts", "apiserver"] },
 ];
 
 const LABEL_KEYS: Record<StaticSettingsTab, string> = {
@@ -209,6 +211,7 @@ const LABEL_KEYS: Record<StaticSettingsTab, string> = {
   comparelab: "SettingsModal.tabCompareLab",
   resources: "SettingsModal.tabResourceLedger",
   updates: "SettingsModal.tabUpdates",
+  execution: "SettingsModal.tabExecutionTargets",
 };
 
 const FOCUSABLE_SELECTOR = [
@@ -502,6 +505,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "profiles" && <ProfilesPanel />}
               {tab === "comparelab" && <CompareLabPanel />}
               {tab === "resources" && <ResourceLedgerPanel />}
+              {tab === "execution" && <ExecutionTargetsPanel />}
             </div>
           </div>
         </div>

@@ -70,17 +70,20 @@ export type AutonomousTaskPlacementAdapter = (
 ) => Promise<TaskNodeResult>;
 
 export interface AutonomousTaskPlacementAdapters {
+  /** Generic executor seam. `context.placement.kind` selects the configured target. */
+  target?: AutonomousTaskPlacementAdapter;
+  /** @deprecated use `target`; retained for persisted integrations during migration. */
   docker?: AutonomousTaskPlacementAdapter;
+  /** @deprecated use `target`; retained for persisted integrations during migration. */
   remote_node?: AutonomousTaskPlacementAdapter;
 }
 
-function consumedPlacementNode(node: TaskPlanNode, kind: "docker" | "remote_node"): TaskPlanNode {
+function consumedPlacementNode(node: TaskPlanNode, kind: string): TaskPlanNode {
   const requestedPlacement = structuredClone(node.executionPlacement);
-  const isolation = kind === "docker" ? "shared" as const : node.isolation;
   return {
     ...structuredClone(node),
     dependencies: [],
-    isolation,
+    isolation: node.isolation,
     requestedExecutionPlacement: requestedPlacement,
     executionPlacement: {
       kind: "local",
@@ -90,11 +93,11 @@ function consumedPlacementNode(node: TaskPlanNode, kind: "docker" | "remote_node
       requestedPlacement,
       placementFulfilled: true,
     },
-    executionRequirements: node.executionRequirements ? { ...structuredClone(node.executionRequirements), isolation } : undefined,
+    executionRequirements: node.executionRequirements ? { ...structuredClone(node.executionRequirements), isolation: node.isolation } : undefined,
   };
 }
 
-export function buildAutonomousPlacementRunSpec(task: AutonomousTask, node: TaskPlanNode, kind: "docker" | "remote_node"): RunSpecWire {
+export function buildAutonomousPlacementRunSpec(task: AutonomousTask, node: TaskPlanNode, kind: string): RunSpecWire {
   const placedNode = consumedPlacementNode(node, kind);
   const taskSnapshot = {
     ...structuredClone(task),
@@ -149,7 +152,7 @@ export function buildAutonomousPlacementRunSpec(task: AutonomousTask, node: Task
 
 function defaultAutonomousTaskPlacementAdapters(): AutonomousTaskPlacementAdapters {
   const targetLost = (error: unknown): boolean => /^EXECUTION_TARGET_LOST\s*:/i.test(error instanceof Error ? error.message : String(error));
-  const execute = async (kind: "docker" | "remote_node", task: AutonomousTask, node: TaskPlanNode): Promise<TaskNodeResult> => {
+  const execute = async (kind: string, task: AutonomousTask, node: TaskPlanNode): Promise<TaskNodeResult> => {
     const spec = buildAutonomousPlacementRunSpec(task, node, kind);
     const targetId = node.executionPlacement?.targetId?.trim();
     if (!targetId) {
@@ -169,8 +172,7 @@ function defaultAutonomousTaskPlacementAdapters(): AutonomousTaskPlacementAdapte
     }
   };
   return {
-    docker: (task, node) => execute("docker", task, node),
-    remote_node: (task, node) => execute("remote_node", task, node),
+    target: (task, node, context) => execute(context.placement?.kind ?? "local", task, node),
   };
 }
 
@@ -404,7 +406,11 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
       let acceptedPlan: TaskPlan | null = null;
       if (planned?.plan && validatePlannedTaskPlan(planned.plan, task)) acceptedPlan = planned.plan;
       if (hasPlanner && !acceptedPlan) throw new Error("Autonomous planner returned an invalid or incomplete repository-aware DAG.");
-      const plan = acceptedPlan ?? createTaskPlan(task.objective, task.constraints.strategy ?? "PLAN", Math.min(task.budgetSnapshot.maxWorkers, task.budgetSnapshot.maxConcurrentWorkers ?? task.budgetSnapshot.maxWorkers), task.planningContext);
+      const plannedBase = acceptedPlan ?? createTaskPlan(task.objective, task.constraints.strategy ?? "PLAN", Math.min(task.budgetSnapshot.maxWorkers, task.budgetSnapshot.maxConcurrentWorkers ?? task.budgetSnapshot.maxWorkers), task.planningContext);
+      const selectedPlacement = task.constraints.executionPlacement;
+      const plan = selectedPlacement
+        ? { ...plannedBase, revision: plannedBase.revision + 1, nodes: plannedBase.nodes.map((node) => ({ ...node, executionPlacement: { ...selectedPlacement, nodeId: node.nodeId }, requestedExecutionPlacement: undefined })) }
+        : plannedBase;
       const plannedCriteria = planned?.acceptanceCriteria;
       const criteriaAreStructured = Boolean(plannedCriteria && plannedCriteria.length >= 3 && plannedCriteria.some((criterion) => criterion.method === "verification_command") && plannedCriteria.some((criterion) => criterion.method === "review") && plannedCriteria.every((criterion) => Boolean(criterion.provenance?.kind && criterion.provenance.fragment)));
       if (hasPlanner && !criteriaAreStructured) throw new Error("Autonomous planner returned incomplete acceptance criteria; verification and review provenance are required.");
@@ -586,8 +592,9 @@ export function defaultAutonomousTaskRuntime(resolvedTarget: ResolvedTarget, pla
     },
     executeNode: async (task, node, context) => {
       const placementKind = node.executionPlacement?.kind;
-      if (placementKind === "docker" || placementKind === "remote_node") {
-        const adapter = placementAdapters[placementKind];
+      if (placementKind && placementKind !== "local" && placementKind !== "worktree") {
+        const adapter = placementAdapters.target
+          ?? (placementAdapters as unknown as Record<string, AutonomousTaskPlacementAdapter | undefined>)[placementKind];
         if (!adapter) return { ok: false, summary: "Execution placement '" + placementKind + "' has no registered backend adapter; refusing local fallback." };
         return adapter(task, node, context);
       }

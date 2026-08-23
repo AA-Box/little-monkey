@@ -11,7 +11,7 @@ export type TaskExecutionStrategy = "DIRECT" | "PLAN" | "DELEGATE" | "PARALLEL_D
 export type TaskClass = "investigation" | "implementation" | "integration" | "verification" | "review" | "delivery";
 export type TaskNodeStatus = "pending" | "ready" | "running" | "waiting_approval" | "succeeded" | "failed" | "blocked" | "cancelled";
 export type TaskIsolation = "shared" | "worktree";
-export type ExecutionPlacementKind = "local" | "worktree" | "docker" | "remote_node";
+export type ExecutionPlacementKind = "local" | "worktree" | "docker" | "remote_node" | (string & {});
 export type DeliveryIntent = "leave_worktree" | "commit" | "push_owned_branch" | "open_or_update_pr";
 export type TaskOutcome =
   | "RUNNING"
@@ -314,7 +314,7 @@ export function validateTaskPlan(plan: TaskPlan, context?: TaskPlanningContext):
     if ((current.taskClass === "implementation" || current.taskClass === "integration") && current.mutationScope.length === 0) errors.push(`${current.nodeId} mutating nodes require a non-empty mutation scope`);
     if (current.mutationScope.some((scope) => scope.includes("..") || scope.startsWith("/"))) errors.push(`${current.nodeId} mutation scope may not escape the workspace`);
     if (current.executionPlacement && current.executionPlacement.nodeId !== current.nodeId) errors.push(`${current.nodeId} placement must identify the same node`);
-    if (current.executionPlacement?.placementFulfilled && (current.executionPlacement.kind === "docker" || current.executionPlacement.kind === "remote_node")) errors.push(`${current.nodeId} cannot invoke another external placement after its placement was fulfilled`);
+    if (current.executionPlacement?.placementFulfilled && current.executionPlacement.kind !== "local" && current.executionPlacement.kind !== "worktree") errors.push(`${current.nodeId} cannot invoke another external placement after its placement was fulfilled`);
     if (current.executionPlacement?.placementFulfilled && !current.requestedExecutionPlacement) errors.push(`${current.nodeId} placement provenance is required after placement fulfillment`);
     if (current.requestedExecutionPlacement && !current.executionPlacement) errors.push(`${current.nodeId} placement provenance requires a receiver execution contract`);
     if (current.capabilities?.some((capability) => !["read", "mutate", "verify", "network", "git", "delegate"].includes(capability))) errors.push(`${current.nodeId} requests an unknown capability`);
@@ -324,7 +324,7 @@ export function validateTaskPlan(plan: TaskPlan, context?: TaskPlanningContext):
     if (current.executionRequirements?.needsNetwork && !current.capabilities?.includes("network")) errors.push(`${current.nodeId} requires network capability but does not request network`);
     if (current.executionRequirements?.isolation !== current.isolation) errors.push(`${current.nodeId} execution requirements and node isolation disagree`);
     if (current.executionPlacement?.kind === "worktree" && current.isolation !== "worktree") errors.push(`${current.nodeId} worktree placement requires worktree isolation`);
-    if ((current.executionPlacement?.kind === "docker" || current.executionPlacement?.kind === "remote_node") && !current.executionPlacement.targetId.trim()) errors.push(current.nodeId + " " + current.executionPlacement.kind + " placement requires a target id");
+    if (current.executionPlacement && current.executionPlacement.kind !== "local" && current.executionPlacement.kind !== "worktree" && !current.executionPlacement.targetId.trim()) errors.push(current.nodeId + " " + current.executionPlacement.kind + " placement requires a target id");
     if (context && context.relevantFiles.length > 0 && current.relevantFiles?.some((file) => file !== "workspace" && !context.relevantFiles.includes(file))) errors.push(`${current.nodeId} references files outside the planner's repository context`);
   }
   const visiting = new Set<string>();

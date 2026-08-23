@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { CheckCircle2, Loader2, Pause, Play, Send, Square, X, XCircle } from "lucide-react";
 
 import { useAutonomousTaskStore } from "../../store/autonomousTaskStore";
@@ -24,8 +25,15 @@ export function AutonomousTaskPanel({ sessionId, onClose }: AutonomousTaskPanelP
   const [objective, setObjective] = useState("");
   const [guidance, setGuidance] = useState("");
   const [confirmation, setConfirmation] = useState("");
+  const [targetId, setTargetId] = useState("");
+  const [targets, setTargets] = useState<Array<{ id: string; kind: string; name: string }>>([]);
 
   useEffect(() => { void store.init(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    void invoke<Record<string, { kind: string; identity: { displayName: string } }>>("execution_targets_list")
+      .then((value) => setTargets(Object.entries(value).map(([id, target]) => ({ id, kind: target.kind, name: target.identity.displayName }))))
+      .catch(() => setTargets([]));
+  }, []);
   const selected = useMemo(() => store.tasks.find((task) => task.taskId === store.selectedTaskId) ?? null, [store.tasks, store.selectedTaskId]);
   const paused = selected ? Boolean(store.pausedTaskIds[selected.taskId]) : false;
   const running = selected?.outcome === "RUNNING" && !paused;
@@ -37,8 +45,9 @@ export function AutonomousTaskPanel({ sessionId, onClose }: AutonomousTaskPanelP
         <div><h2 id="autonomous-task-title" className="text-sm font-semibold text-foreground">Autonomous task</h2><p className="mt-1 max-w-2xl text-xs leading-5 text-muted">One objective, bounded workers, durable evidence, and optional Git delivery.</p></div>
         <IconButton size="sm" aria-label="Close autonomous tasks" title="Close" onClick={onClose}><X size={15} /></IconButton>
       </header>
-      <form className="flex shrink-0 gap-2 border-b border-border px-5 py-3" onSubmit={(event) => { event.preventDefault(); if (objective.trim()) void store.start(objective.trim(), sessionId).then(() => setObjective("")); }}>
+      <form className="flex shrink-0 flex-wrap gap-2 border-b border-border px-5 py-3" onSubmit={(event) => { event.preventDefault(); if (objective.trim()) void store.start(objective.trim(), sessionId, targetId ? { executionPlacement: { kind: targets.find((target) => target.id === targetId)?.kind ?? "local", targetId, nodeId: "pending", reason: "selected by the operator" } } : undefined).then(() => setObjective("")); }}>
         <input className="min-w-0 flex-1 rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground outline-none focus:border-accent" placeholder="What should Little Monkey complete?" value={objective} onChange={(event) => setObjective(event.target.value)} />
+        <label className="flex items-center gap-2 text-xs text-muted"><span>Run on</span><select className="rounded-md border border-border bg-background px-2 py-2 text-foreground" value={targetId} onChange={(event) => setTargetId(event.target.value)}><option value="">Automatic</option>{targets.map((target) => <option key={target.id} value={target.id}>{target.name} · {target.kind}</option>)}</select></label>
         <Button type="submit" variant="primary" disabled={!objective.trim() || store.busy.start}><Play size={14} /> Start</Button>
       </form>
       {store.error && <p role="alert" className="mx-5 mt-3 rounded-md border border-danger/40 bg-danger/10 p-3 text-xs text-danger">{store.error}</p>}
