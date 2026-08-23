@@ -69,7 +69,9 @@ def main() -> int:
         config_path = Path(config_name)
         tauri_config = json.loads((repo / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
         tauri_config["build"]["beforeDevCommand"] = ""
-        tauri_config["build"].pop("devUrl", None)
+        # Tauri merges this override with tauri.conf.json. Omitting devUrl
+        # leaves the base development URL active, so explicitly clear it.
+        tauri_config["build"]["devUrl"] = None
         config_path.write_text(json.dumps(tauri_config), encoding="utf-8")
     command = app_command.split() if app_command else [
         pnpm,
