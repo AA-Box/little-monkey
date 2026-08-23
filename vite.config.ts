@@ -3,6 +3,7 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
 const host = process.env.TAURI_DEV_HOST;
+const fullProductE2eBuild = process.env.VITE_COMPUTER_USE_FULL_PRODUCT_E2E === "1";
 
 const productionBuild = {
   manifest: true,
@@ -31,6 +32,10 @@ const productionBuild = {
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [react(), tailwindcss()],
+  // The full-product acceptance loads the built bundle through Tauri's local
+  // asset server; relative URLs also work when that server is not rooted at
+  // the repository's web origin.
+  base: fullProductE2eBuild ? "./" : "/",
 
   // Vite 7 resolves build settings per environment. Keep the top-level copy
   // for legacy/Tauri callers and the explicit client copy for the environment
