@@ -294,6 +294,16 @@ describe("toolsForSettings", () => {
 
   const toolsWithWeb = [toolDef("write_file"), toolDef("web_fetch"), toolDef("web_search"), toolDef("run_shell")];
 
+  it("hides Computer Use until the user enables the desktop-control capability", () => {
+    const computer = [toolDef("computer_list_targets"), toolDef("computer_click"), toolDef("write_file")];
+    expect(toolsForSettings(computer, true).map((tool) => tool.function.name)).toEqual(["write_file"]);
+    expect(toolsForSettings(computer, true, true, false, false, false, false, false, true).map((tool) => tool.function.name)).toEqual([
+      "computer_list_targets",
+      "computer_click",
+      "write_file",
+    ]);
+  });
+
   it("keeps web_fetch and web_search when webToolsEnabled is true (or omitted)", () => {
     expect(toolsForSettings(toolsWithWeb, true, true).map((t) => t.function.name)).toEqual([
       "write_file",

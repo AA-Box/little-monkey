@@ -139,15 +139,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential dbus-x11 gnome-keyring btrfs-progs
 
-      - name: Start a D-Bus Secret Service for keychain-backed tests
-        if: startsWith(matrix.os, 'ubuntu')
-        run: |
-          eval "$(dbus-launch --sh-syntax)"
-          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
-          mkdir -p ~/.cache
-          eval "$(printf '\n' | gnome-keyring-daemon --unlock --replace --components=secrets)"
-          echo "GNOME_KEYRING_CONTROL=$GNOME_KEYRING_CONTROL" >> "$GITHUB_ENV"
-
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 9
@@ -271,11 +262,25 @@ jobs:
         # does at runtime is privileged, and it still creates its own scope as
         # the unprivileged user under a subtree it owns.
         run: |
-          if [ -n "${LITTLE_MONKEY_CI_CGROUP:-}" ]; then
-            echo $$ | sudo tee "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" >/dev/null
-            echo "running under $(cat /proc/self/cgroup)"
-          fi
-          pnpm test:rust
+          move_into_cgroup() {
+            if [ -z "${LITTLE_MONKEY_CI_CGROUP:-}" ]; then
+              return 0
+            fi
+            for attempt in $(seq 1 10); do
+              if printf '%s\n' "$$" | sudo tee "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" >/dev/null; then
+                echo "running under $(cat /proc/self/cgroup)"
+                return 0
+              fi
+              sleep 1
+            done
+            return 1
+          }
+          move_into_cgroup
+          dbus-run-session -- bash -lc '
+            unset GNOME_KEYRING_CONTROL
+            eval "$(printf "\\n" | gnome-keyring-daemon --unlock --replace --components=secrets)"
+            pnpm test:rust
+          '
 
       - name: Rust tests
         if: ${{ !startsWith(matrix.os, 'ubuntu') }}
@@ -378,7 +383,17 @@ jobs:
             echo "no delegated cgroup on this runner; the supervised fallback is the tested path"
             exit 0
           fi
-          echo $$ | sudo tee "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" >/dev/null
+          move_into_cgroup() {
+            for attempt in $(seq 1 10); do
+              if printf '%s\n' "$$" | sudo tee "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" >/dev/null; then
+                echo "running under $(cat /proc/self/cgroup)" >&2
+                return 0
+              fi
+              sleep 1
+            done
+            return 1
+          }
+          move_into_cgroup
           backend=$(cargo run --quiet --manifest-path src-tauri/Cargo.toml --bin monkey-cli -- processes limits | sed -n 's/^this host: //p')
           echo "backend: $backend"
           test "$backend" = "cgroup v2"
@@ -389,6 +404,208 @@ jobs:
       # so this costs a test binary invocation.
       - name: Contract ABI gate
         run: pnpm contract:check
+
+  # The native acceptance path is intentionally separate from Rust unit tests:
+  # it needs an interactive desktop, accessibility permissions, and a real
+  # OS provider. The executable driver creates the production grant and writes
+  # machine-readable evidence; fabricated traces are not accepted.
+  computer-use-e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    env:
+      COMPUTER_USE_E2E_RUN: 1
+      COMPUTER_USE_PRODUCTION_BACKEND: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux X11/AT-SPI acceptance dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf dbus-x11 at-spi2-core python3-pyatspi python3-tk python3-gi gir1.2-gtk-3.0 wmctrl xclip xvfb
+
+      - name: Stage CLI sidecar placeholder
+        # The production acceptance binary is built through the Tauri crate,
+        # whose build script requires the platform-named external binary even
+        # though this job does not package the desktop app.
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+
+      - name: Run native Computer Use acceptance (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          python3 src-tauri/fixtures/computer-use-e2e.py \
+            --report "$RUNNER_TEMP/little-monkey-computer-use-e2e.json"
+
+      - name: Run native Computer Use acceptance (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          python src-tauri/fixtures/computer-use-e2e.py `
+            --report "$env:RUNNER_TEMP/little-monkey-computer-use-e2e.json"
+
+      - name: Run native Computer Use acceptance (Linux/X11)
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          dbus-run-session -- xvfb-run -a --server-args='-screen 0 1280x1024x24' \
+            python3 src-tauri/fixtures/computer-use-e2e.py \
+            --report "$RUNNER_TEMP/little-monkey-computer-use-e2e.json"
+
+      - name: Upload native Computer Use evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: computer-use-e2e-${{ matrix.os }}
+          path: ${{ runner.temp }}/little-monkey-computer-use-e2e*
+          if-no-files-found: warn
+
+  # This gate is intentionally separate from the Rust native driver: the
+  # frontend model/tool dispatcher runs inside the real Tauri webview and the
+  # app writes evidence only after the actual IPC/native path completes.
+  computer-use-full-product-e2e:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri
+          key: computer-use-full-product-e2e
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Stage the CLI sidecar required by the Tauri build script
+        shell: pwsh
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+
+      - name: Run the real frontend-to-OS golden
+        shell: pwsh
+        run: >-
+          python src-tauri/fixtures/computer-use-full-product-e2e.py
+          --fixture src-tauri/fixtures/computer-use-test-app.py
+          --timeout 900
+          --report "$env:RUNNER_TEMP/little-monkey-full-product-e2e.json"
+
+      - name: Upload full product evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: computer-use-full-product-e2e
+          path: ${{ runner.temp }}/little-monkey-full-product-e2e*
+          if-no-files-found: warn
+
+  # One model run crosses the repository's owned Chromium/CDP worker and the
+  # production native provider. The browser value is extracted from a DOM
+  # artifact and only that observed value is passed into the native fixture.
+  computer-use-mixed-browser-native-e2e:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    env:
+      COMPUTER_USE_E2E_RUN: 1
+      COMPUTER_USE_PRODUCTION_BACKEND: 1
+      COMPUTER_USE_MIXED_BROWSER_NATIVE_E2E: 1
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      COMPUTER_USE_FIXTURE_SCRIPT: src-tauri/fixtures/computer-use-test-app-linux.py
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux X11/AT-SPI and Chromium acceptance dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf dbus-x11 at-spi2-core python3-pyatspi python3-tk python3-gi gir1.2-gtk-3.0 wmctrl xclip xvfb google-chrome-stable
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Stage the CLI sidecar required by the Tauri build script
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+
+      - name: Run the real browser-to-native golden
+        run: |
+          dbus-run-session -- xvfb-run -a --server-args='-screen 0 1280x1024x24' \
+            python3 src-tauri/fixtures/computer-use-e2e.py \
+            --report "$RUNNER_TEMP/little-monkey-mixed-browser-native-e2e.json"
+
+      - name: Upload mixed browser/native evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: computer-use-mixed-browser-native-e2e
+          path: ${{ runner.temp }}/little-monkey-mixed-browser-native-e2e*
+          if-no-files-found: warn
+
+  # The ordinary native matrix calls the production backend directly. This
+  # separate Windows leg crosses the resident remote-runner runtime, including
+  # its local-consent seam, target/window ownership, signed action path,
+  # redacted audit, artifact screenshot, and emergency stop. It is deliberately
+  # ignored by the ordinary Rust matrix because it needs the hosted runner's
+  # interactive Windows desktop and the real WPF/UIAutomation fixture.
+  remote-windows-computer-use-e2e:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      COMPUTER_USE_REMOTE_WINDOWS_E2E: 1
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri
+          key: remote-windows-computer-use-e2e
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Stage the CLI sidecar required by the Tauri build script
+        shell: pwsh
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+
+      - name: Run the real remote Windows Computer Use acceptance
+        shell: pwsh
+        run: >-
+          cargo test --manifest-path src-tauri/Cargo.toml --bin monkey-cli remote_windows
+          -- --ignored --nocapture --test-threads=1
 
   # ROADMAP #8 / K22: supply-chain review of what a release actually ships.
   # Split from the test matrix on purpose — these check the dependency set, not
