@@ -2035,6 +2035,23 @@ fn configured_docker_target(
     Ok((target_id.to_string(), Box::new(target)))
 }
 
+fn autonomous_runner_result_from_events(
+    events: &[crate::execution_target::TargetEvent],
+) -> Option<Value> {
+    events.iter().rev().find_map(|event| {
+        event
+            .message
+            .lines()
+            .rev()
+            .chain(std::iter::once(event.message.as_str()))
+            .find_map(|line| {
+                serde_json::from_str::<Value>(line.trim())
+                    .ok()
+                    .filter(Value::is_object)
+            })
+    })
+}
+
 async fn execute_registered_target_placement(
     request: AutonomousTaskPlacementRequest,
 ) -> Result<Value, String> {
@@ -2283,6 +2300,10 @@ async fn execute_registered_target_placement(
                 .unwrap_or_default()
         ));
     }
+    let runner_result = target
+        .events(&handle, 0)
+        .ok()
+        .and_then(|events| autonomous_runner_result_from_events(&events));
     let result = target
         .workspace_result(&handle)
         .map_err(|error| error.to_string())?;
@@ -2292,14 +2313,24 @@ async fn execute_registered_target_placement(
         .cleanup(&workspace_handle)
         .map_err(|error| error.to_string())?;
     delete_autonomous_placement_record(&data_dir, &spec.run_id)?;
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "ok": true,
         "reviewRequired": true,
         "summary": format!("{placement_kind} runner completed; review the persisted workspace result before applying it"),
         "resultId": result_id,
         "changedFiles": result.new_files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
         "deletedFiles": result.deleted_files,
-    }))
+    });
+    if let Some(runner_result) = runner_result {
+        if let Some(object) = response.as_object_mut() {
+            for field in ["evidence", "review"] {
+                if let Some(value) = runner_result.get(field) {
+                    object.insert(field.to_string(), value.clone());
+                }
+            }
+        }
+    }
+    Ok(response)
 }
 
 /// Execute a frozen autonomous node through the selected placement backend.
@@ -3283,16 +3314,31 @@ mod tests {
             git(root, &["add", "."]);
             git(root, &["commit", "-q", "-m", "baseline"]);
         };
+        let clone_baseline = |source: &Path, target: &Path| {
+            let output = Command::new("git")
+                .args(["clone", "-q"])
+                .arg(source)
+                .arg(target)
+                .output()
+                .expect("git clone should start");
+            assert!(
+                output.status.success(),
+                "git clone: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            git(target, &["remote", "remove", "origin"]);
+        };
         init(&workspace);
 
+        let run_id = format!("docker-e2e-{}", uuid::Uuid::new_v4().simple());
         let capability = serde_json::json!({
             "state": "unsupported",
             "evidence": "Docker E2E"
         });
         let run_spec: crate::run_protocol::RunSpec = serde_json::from_value(serde_json::json!({
             "schema_version": 1,
-            "run_id": "docker-e2e-run",
-            "idempotency_key": "docker-e2e-run",
+            "run_id": run_id.clone(),
+            "idempotency_key": run_id.clone(),
             "created_at_ms": 1784000000000u64,
             "kind": "autonomous_task",
             "submitted_by": {
@@ -3359,7 +3405,7 @@ mod tests {
             },
             "autonomous_task": {
                 "schema_version": 1,
-                "task_id": "docker-e2e-run",
+                "task_id": run_id.clone(),
                 "objective": "Run the Docker E2E mutation",
                 "source": "test",
                 "relevant_files": ["docker-e2e.txt"],
@@ -3378,12 +3424,12 @@ mod tests {
                 "completed_nodes": [],
                 "next_node_id": "docker-e2e-node",
                 "task_snapshot": {
-                    "taskId": "docker-e2e-run",
+                    "taskId": run_id.clone(),
                     "objective": "Run the Docker E2E mutation",
                     "source": "test",
                     "workspaceRevision": "docker-e2e-baseline",
                     "plan": {
-                        "planId": "docker-e2e-plan",
+                        "planId": format!("docker-{run_id}"),
                         "strategy": "PLAN",
                         "revision": 1,
                         "nodes": [{
@@ -3425,7 +3471,7 @@ mod tests {
             .expect("Docker placement should persist a result");
         let remote_result = crate::execution_target::load_workspace_result(&data_dir, result_id)
             .expect("persisted Docker result should be readable");
-        init(&verifier);
+        clone_baseline(&workspace, &verifier);
         crate::execution_target::apply_workspace_result(
             &verifier,
             &remote_result.base_snapshot_digest,
@@ -3490,6 +3536,20 @@ mod tests {
             std::fs::write(root.join("baseline.txt"), "baseline\n").unwrap();
             git(root, &["add", "."]);
             git(root, &["commit", "-q", "-m", "baseline"]);
+        };
+        let clone_baseline = |source: &Path, target: &Path| {
+            let output = Command::new("git")
+                .args(["clone", "-q"])
+                .arg(source)
+                .arg(target)
+                .output()
+                .expect("git clone should start");
+            assert!(
+                output.status.success(),
+                "git clone: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            git(target, &["remote", "remove", "origin"]);
         };
         init(&workspace);
 
@@ -3669,7 +3729,7 @@ mod tests {
             result["resultId"].as_str().unwrap(),
         )
         .expect("real Docker result should be persisted");
-        init(&verifier);
+        clone_baseline(&workspace, &verifier);
         crate::execution_target::apply_workspace_result(
             &verifier,
             &remote_result.base_snapshot_digest,
