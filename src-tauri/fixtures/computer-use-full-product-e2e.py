@@ -69,7 +69,11 @@ def main() -> int:
     ]
     config_path: Path | None = None
     if app_command is None:
-        config_fd, config_name = tempfile.mkstemp(prefix="little-monkey-full-product-", suffix=".json")
+        config_fd, config_name = tempfile.mkstemp(
+            dir=repo / "src-tauri",
+            prefix="little-monkey-full-product-",
+            suffix=".json",
+        )
         os.close(config_fd)
         config_path = Path(config_name)
         tauri_config = json.loads((repo / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
