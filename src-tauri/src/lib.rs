@@ -835,6 +835,15 @@ pub fn run() {
     "deep-link:default",
     "updater:default",
     "process:allow-restart",
+    "allow-computer-use-full-product-report",
+    "allow-desktop-control-start-session",
+    "allow-desktop-control-stop-session",
+    "allow-desktop-control-provider-info",
+    "allow-tool-computer-list-targets",
+    "allow-tool-computer-inspect",
+    "allow-tool-computer-click",
+    "allow-tool-computer-set-value",
+    "allow-tool-computer-screenshot",
     {
       "identifier": "fs:allow-write-text-file",
       "allow": [{ "path": "$TEMP/**" }]

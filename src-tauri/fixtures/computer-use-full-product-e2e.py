@@ -150,6 +150,17 @@ def main() -> int:
     capability["description"] = "Temporary capability for the real frontend/native acceptance window"
     capability["windows"] = ["main"]
     capability["remote"] = {"urls": ["http://127.0.0.1:1420/**"]}
+    capability["permissions"].extend([
+        "allow-computer-use-full-product-report",
+        "allow-desktop-control-start-session",
+        "allow-desktop-control-stop-session",
+        "allow-desktop-control-provider-info",
+        "allow-tool-computer-list-targets",
+        "allow-tool-computer-inspect",
+        "allow-tool-computer-click",
+        "allow-tool-computer-set-value",
+        "allow-tool-computer-screenshot",
+    ])
     capability_path.unlink(missing_ok=True)
     capability_path.write_text(json.dumps(capability), encoding="utf-8")
     app_log = app_log_path.open("w", encoding="utf-8")
