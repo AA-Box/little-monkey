@@ -817,7 +817,6 @@ impl Default for AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let full_product_e2e = std::env::var("COMPUTER_USE_FULL_PRODUCT_E2E").as_deref() == Ok("1");
     // Before anything else, and before any thread exists: a GUI launch hands us
     // launchd's `PATH`, so every shell tool would miss the user's own binaries
     // (`~/.local/bin`, Homebrew, version-manager shims) until this runs.
@@ -980,23 +979,7 @@ pub fn run() {
         .register_uri_scheme_protocol("artifact", |ctx, request| {
             artifacts::handle_request(ctx.app_handle().state::<AppState>().inner(), &request)
         })
-        .setup(move |app| {
-            // The hosted Windows runner resolves `localhost` inconsistently
-            // between the Tauri webview and the IPv4-only Vite fixture. Keep
-            // this recovery path scoped to the full-product acceptance mode;
-            // normal launches continue using the configured dev URL.
-            if full_product_e2e {
-                let main_window = app
-                    .get_webview_window("main")
-                    .expect("full product main window must exist");
-                main_window
-                    .navigate(
-                        "http://127.0.0.1:1420/"
-                            .parse()
-                            .expect("full product dev URL must be valid"),
-                    )
-                    .expect("full product main window navigation must succeed");
-            }
+        .setup(|app| {
             // Keep the native-skill registry live for external edits and
             // cross-window updates. Workspace restoration below triggers a
             // second sync once the primary root is known.
