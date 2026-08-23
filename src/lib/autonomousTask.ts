@@ -127,6 +127,8 @@ export interface TaskWorker {
   mutation?: { beforeRevision: string; afterRevision: string; changedFiles: string[]; patchDigest: string };
   artifacts?: TaskArtifact[];
   resultSummary?: string;
+  failureCode?: string;
+  failureKind?: string;
   usage?: Partial<TaskUsage>;
   resultId?: string;
 }

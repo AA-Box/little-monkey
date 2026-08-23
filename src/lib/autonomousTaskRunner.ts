@@ -24,8 +24,8 @@ import { effortForTarget } from "../store/modelStore";
 export interface TaskNodeResult {
   ok: boolean;
   summary: string;
-  failureCode?: "EXECUTION_TARGET_LOST" | "FAILED";
-  failureKind?: "EXECUTION_TARGET_LOST" | "EXECUTION_FAILED" | "PERMISSION_DENIED" | "BUDGET_EXHAUSTED" | "CANCELLED";
+  failureCode?: string;
+  failureKind?: string;
   worktreePath?: string;
   artifacts?: TaskArtifact[];
   evidence?: VerificationEvidence[];
@@ -153,7 +153,15 @@ export function buildAutonomousPlacementRunSpec(task: AutonomousTask, node: Task
 }
 
 function defaultAutonomousTaskPlacementAdapters(): AutonomousTaskPlacementAdapters {
-  const targetLost = (error: unknown): boolean => /^EXECUTION_TARGET_LOST\s*:/i.test(error instanceof Error ? error.message : String(error));
+  const executionError = (error: unknown): { code: string; detail: string } => {
+    const raw = error instanceof Error ? error.message : String(error);
+    try {
+      const parsed = JSON.parse(raw) as { code?: unknown; detail?: unknown; error?: unknown };
+      if (typeof parsed.code === "string") return { code: parsed.code, detail: String(parsed.detail ?? parsed.error ?? raw) };
+    } catch { /* Tauri may return a plain structured error string. */ }
+    const match = raw.match(/^([A-Z][A-Z0-9_]+):\s*(.*)$/s);
+    return match ? { code: match[1], detail: match[2] } : { code: "EXECUTION_FAILED", detail: raw };
+  };
   const execute = async (kind: string, task: AutonomousTask, node: TaskPlanNode): Promise<TaskNodeResult> => {
     const spec = buildAutonomousPlacementRunSpec(task, node, kind);
     const targetId = node.executionPlacement?.targetId?.trim();
@@ -166,11 +174,20 @@ function defaultAutonomousTaskPlacementAdapters(): AutonomousTaskPlacementAdapte
       };
     }
     try {
+      type Recovery = TaskNodeResult & { known: boolean; pending?: boolean; remoteRunId?: string };
+      let recovery = await invoke<Recovery>("autonomous_task_recover_node", { targetId, runId: spec.run_id });
+      while (recovery.known && recovery.pending) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        recovery = await invoke<Recovery>("autonomous_task_recover_node", { targetId, runId: spec.run_id });
+      }
+      if (recovery.known) {
+        const { known: _known, pending: _pending, remoteRunId: _remoteRunId, ...result } = recovery;
+        return result;
+      }
       return await invoke<TaskNodeResult>("autonomous_task_place_node", { request: { targetId, runSpec: spec } });
     } catch (error) {
-      const message = `${kind} execution failed: ${error instanceof Error ? error.message : String(error)}`;
-      const lost = targetLost(error);
-      return { ok: false, failureCode: lost ? "EXECUTION_TARGET_LOST" : "FAILED", failureKind: lost ? "EXECUTION_TARGET_LOST" : "EXECUTION_FAILED", summary: message };
+      const parsed = executionError(error);
+      return { ok: false, failureCode: parsed.code, failureKind: parsed.code, summary: `${kind} execution failed: ${parsed.detail}` };
     }
   };
   return {
@@ -328,7 +345,18 @@ function outOfScopeFiles(node: TaskPlanNode, changedFiles: string[]): string[] {
 }
 
 function isExecutionTargetLost(result: TaskNodeResult): boolean {
-  return result.failureCode === "EXECUTION_TARGET_LOST" || result.failureKind === "EXECUTION_TARGET_LOST" || /^EXECUTION_TARGET_LOST\s*:/i.test(result.summary);
+  const targetLossCodes = new Set([
+    "EXECUTION_TARGET_LOST",
+    "TARGET_UNREACHABLE",
+    "TARGET_IDENTITY_CHANGED",
+    "HOST_KEY_CHANGED",
+    "PROTOCOL_INCOMPATIBLE",
+    "RUNNER_LOST",
+    "RUNNER_RESTARTED",
+  ]);
+  return targetLossCodes.has(result.failureCode ?? "")
+    || targetLossCodes.has(result.failureKind ?? "")
+    || /^[A-Z][A-Z0-9_]+\s*:/i.test(result.summary) && targetLossCodes.has(result.summary.split(":", 1)[0]);
 }
 
 function insertRepairNode(task: AutonomousTask, failedNode: TaskPlanNode, summary: string): AutonomousTask {
@@ -500,7 +528,7 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
           ? { ...rawResult, ok: false, summary: `Node '${node.nodeId}' changed files outside its frozen mutation scope: ${unauthorized.join(", ")}` }
           : rawResult;
         const result: TaskNodeResult = isExecutionTargetLost(scopedResult)
-          ? { ...scopedResult, ok: false, failureCode: "EXECUTION_TARGET_LOST" }
+          ? { ...scopedResult, ok: false }
           : scopedResult.ok && mutatingNode && !scopedResult.mutation && !scopedResult.workspaceRevision
             ? { ...scopedResult, ok: false, summary: "Mutating node did not return a revision-bound mutation record." }
             : scopedResult.ok && mutatingNode && !scopedResult.mutation && scopedResult.workspaceRevision
@@ -522,7 +550,7 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
         if ((task.budgetSnapshot.maxArtifactBytes ?? Number.MAX_SAFE_INTEGER) < (task.usage?.artifactBytes ?? 0)) task = { ...task, outcome: "BUDGET_EXHAUSTED", summary: "Artifact budget exhausted.", updatedAtMs: Date.now() };
         task = { ...task, artifacts: [...task.artifacts, ...(result.artifacts ?? [])], updatedAtMs: Date.now() };
         task = { ...task, workers: task.workers.map((entry) => entry.workerId === worker.workerId ? { ...entry, finishedAtMs: Date.now() } : entry), updatedAtMs: Date.now() };
-        task = { ...task, workers: task.workers.map((entry) => entry.workerId === worker.workerId ? { ...entry, worktree: result.worktree, changedFiles: result.changedFiles, mutation: result.mutation, artifacts: result.artifacts, resultId: result.resultId, resultSummary: result.summary.slice(0, 2_000), usage: result.usage } : entry), updatedAtMs: Date.now() };
+        task = { ...task, workers: task.workers.map((entry) => entry.workerId === worker.workerId ? { ...entry, worktree: result.worktree, changedFiles: result.changedFiles, mutation: result.mutation, artifacts: result.artifacts, resultId: result.resultId, failureCode: result.failureCode, failureKind: result.failureKind, resultSummary: result.summary.slice(0, 2_000), usage: result.usage } : entry), updatedAtMs: Date.now() };
         if (result.deliveryStep) task = { ...task, deliveryStep: result.deliveryStep };
         if (awaitingApproval && result.approval) task = { ...task, outcome: "WAITING_APPROVAL", waitingReason: result.summary, waitingApproval: { ...result.approval, nodeId: node.nodeId }, updatedAtMs: Date.now() };
         if (result.evidence) for (const evidence of result.evidence) {

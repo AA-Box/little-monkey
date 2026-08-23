@@ -2,11 +2,12 @@ use clap::{Args, Subcommand};
 use little_monkey_lib::app_paths;
 use little_monkey_lib::execution_target::{
     apply_execution_result, apply_workspace_result, discard_workspace_result,
-    load_execution_result, runner_probe, runner_serve_stdio, ExecutionTargetKind, SshRunnerConfig,
-    TargetCapabilities, TargetConfig, TargetError, TargetIdentity, TargetRegistry, WorkspaceResult,
-    WorkspaceTransfer, EXECUTION_PROTOCOL_VERSION,
+    load_execution_result, runner_child, runner_probe, runner_serve_stdio, ExecutionTargetKind,
+    SshRunnerConfig, TargetCapabilities, TargetConfig, TargetError, TargetIdentity, TargetRegistry,
+    WorkspaceResult, WorkspaceTransfer, EXECUTION_PROTOCOL_VERSION,
 };
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Subcommand, Debug, Clone)]
@@ -98,6 +99,15 @@ pub enum RunnerCmd {
     Serve {
         #[arg(long)]
         stdio: bool,
+    },
+    #[command(hide = true)]
+    Child {
+        #[arg(long)]
+        outcome: PathBuf,
+        #[arg(long)]
+        environment: String,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
     },
 }
 
@@ -328,6 +338,20 @@ pub fn runner(command: RunnerCmd) -> Result<(), String> {
                 return Err("runner serve requires --stdio".to_string());
             }
             runner_serve_stdio().map_err(|error| error.to_string())
+        }
+        RunnerCmd::Child {
+            outcome,
+            environment,
+            command,
+        } => {
+            if !outcome.is_absolute() {
+                return Err("runner child outcome path must be absolute".to_string());
+            }
+            let environment: BTreeMap<String, String> =
+                serde_json::from_str(&environment).map_err(|error| error.to_string())?;
+            let code = runner_child(&outcome, &environment, &command)
+                .map_err(|error| error.to_string())?;
+            std::process::exit(code);
         }
     }
 }

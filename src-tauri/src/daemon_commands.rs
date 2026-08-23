@@ -500,31 +500,6 @@ fn finish_cli_output(output: std::process::Output) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|_| "Daemon output is not valid UTF-8".to_string())
 }
 
-/// A JSON CLI command may return a structured failure on stdout while using a
-/// non-zero exit code. Placement must preserve that result: treating every
-/// such exit as a lost Docker target discards the child run's evidence and
-/// final failure classification.
-fn finish_json_cli_output(output: std::process::Output) -> Result<String, String> {
-    if output.stdout.len() > MAX_CLI_OUTPUT_BYTES || output.stderr.len() > MAX_CLI_OUTPUT_BYTES {
-        return Err("Daemon command output exceeded 4 MiB".to_string());
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let raw = if stdout.is_empty() { &stderr } else { &stdout };
-    if output.status.success() || serde_json::from_str::<Value>(raw).is_ok() {
-        return if raw.is_empty() {
-            Err("Daemon command returned no output".to_string())
-        } else {
-            Ok(raw.to_string())
-        };
-    }
-    Err(if stderr.is_empty() {
-        format!("Daemon command exited with {}", output.status)
-    } else {
-        stderr
-    })
-}
-
 fn run_cli_with_secret(args: Vec<String>, secret: String) -> Result<String, String> {
     let output = Command::new(cli_path())
         .args(&args)
@@ -543,35 +518,6 @@ pub(crate) async fn command(args: Vec<String>) -> Result<String, String> {
 fn parse_json(output: &str) -> Result<Value, String> {
     serde_json::from_str(output.trim())
         .map_err(|error| format!("Invalid daemon JSON output: {error}"))
-}
-
-fn autonomous_placement_scopes(run_spec: &crate::run_protocol::RunSpec) -> Vec<String> {
-    let Some(snapshot) = run_spec
-        .autonomous_task
-        .as_ref()
-        .and_then(|value| value.get("task_snapshot"))
-    else {
-        return Vec::new();
-    };
-    snapshot
-        .get("plan")
-        .and_then(|plan| plan.get("nodes"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find_map(|node| {
-            node.get("mutationScope")
-                .or_else(|| node.get("mutation_scope"))
-                .and_then(Value::as_array)
-                .map(|scopes| {
-                    scopes
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                })
-        })
-        .unwrap_or_default()
 }
 
 fn consume_autonomous_placement_boundary(
@@ -691,109 +637,6 @@ fn consume_autonomous_placement_boundary(
 
 fn autonomous_execution_target_lost(error: impl std::fmt::Display) -> String {
     format!("EXECUTION_TARGET_LOST: {error}")
-}
-
-fn autonomous_placement_path_in_scope(path: &str, scopes: &[String]) -> bool {
-    scopes.iter().any(|scope| {
-        let scope = scope.trim_end_matches('/');
-        scope == "workspace" || path == scope || path.starts_with(&format!("{scope}/"))
-    })
-}
-
-fn enforce_autonomous_placement_scope(
-    data_dir: &Path,
-    workspace: &Path,
-    snapshot_id: &str,
-    run_spec: &crate::run_protocol::RunSpec,
-) -> Result<(), String> {
-    let changed =
-        crate::agent_worktrees::changed_files_since_snapshot(data_dir, workspace, snapshot_id)?;
-    let scopes = autonomous_placement_scopes(run_spec);
-    let unauthorized = changed
-        .iter()
-        .filter(|path| !autonomous_placement_path_in_scope(path, &scopes))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !unauthorized.is_empty() {
-        crate::agent_worktrees::restore_workspace_paths(
-            data_dir,
-            workspace,
-            snapshot_id,
-            &unauthorized,
-        )?;
-        return Err(format!(
-            "autonomous placement changed files outside its frozen mutation scope: {}",
-            unauthorized.join(", ")
-        ));
-    }
-    Ok(())
-}
-
-fn autonomous_placement_result(
-    data_dir: &Path,
-    workspace: &Path,
-    before_revision: &str,
-    snapshot_id: &str,
-    runner_result: Value,
-) -> Result<Value, String> {
-    let mut result = normalize_autonomous_placement_result(runner_result);
-    if result.get("ok").and_then(Value::as_bool) == Some(false) {
-        return Ok(result);
-    }
-    let after_revision = crate::agent_worktrees::workspace_revision(data_dir, workspace)?;
-    let changed_files =
-        crate::agent_worktrees::changed_files_since_snapshot(data_dir, workspace, snapshot_id)?;
-    let patch =
-        crate::agent_worktrees::patch_bytes_since_snapshot(data_dir, workspace, snapshot_id)?;
-    let patch_digest = format!("{:x}", Sha256::digest(&patch));
-    if let Some(object) = result.as_object_mut() {
-        let ok = object
-            .get("ok")
-            .and_then(Value::as_bool)
-            .unwrap_or_else(|| object.get("status").and_then(Value::as_str) == Some("ok"));
-        object.insert("ok".to_string(), Value::Bool(ok));
-        if !ok {
-            return Ok(result);
-        }
-        let changed_json = serde_json::json!(changed_files);
-        object.insert("changedFiles".to_string(), changed_json.clone());
-        object.insert(
-            "workspaceRevision".to_string(),
-            serde_json::json!(after_revision),
-        );
-        if before_revision != after_revision {
-            object.insert(
-                "mutation".to_string(),
-                serde_json::json!({
-                    "beforeRevision": before_revision,
-                    "afterRevision": after_revision,
-                    "changedFiles": changed_json,
-                    "patchDigest": patch_digest
-                }),
-            );
-        }
-        if !patch.is_empty() {
-            let store = crate::artifact_store::ArtifactStore::with_max_blob_size(
-                data_dir.join("content-v1"),
-                32 * 1024 * 1024,
-            )
-            .map_err(|error| format!("Could not open Docker artifact store: {error}"))?;
-            let blob = store
-                .put(&patch)
-                .map_err(|error| format!("Could not persist Docker patch artifact: {error}"))?;
-            object.insert(
-                "artifacts".to_string(),
-                serde_json::json!([{
-                    "artifactId": blob.id,
-                    "kind": "patch",
-                    "label": "Docker autonomous placement patch",
-                    "digest": format!("{:x}", Sha256::digest(&patch)),
-                    "sizeBytes": blob.size
-                }]),
-            );
-        }
-    }
-    Ok(result)
 }
 
 fn normalize_autonomous_placement_result(mut result: Value) -> Value {
@@ -1927,6 +1770,61 @@ pub struct AutonomousTaskPlacementRequest {
     pub run_spec: crate::run_protocol::RunSpec,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutonomousPlacementRecord {
+    run_id: String,
+    target_id: String,
+    handle: crate::execution_target::TargetRunHandle,
+    workspace: crate::execution_target::WorkspaceHandle,
+    created_at_ms: u64,
+}
+
+fn autonomous_placement_record_path(data_dir: &Path, run_id: &str) -> Result<PathBuf, String> {
+    validate_id("placement run id", run_id)?;
+    Ok(data_dir
+        .join("execution-placements")
+        .join(format!("{run_id}.json")))
+}
+
+fn save_autonomous_placement_record(
+    data_dir: &Path,
+    record: &AutonomousPlacementRecord,
+) -> Result<(), String> {
+    let path = autonomous_placement_record_path(data_dir, &record.run_id)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(record).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    std::fs::rename(temporary, path).map_err(|error| error.to_string())
+}
+
+fn load_autonomous_placement_record(
+    data_dir: &Path,
+    run_id: &str,
+) -> Result<Option<AutonomousPlacementRecord>, String> {
+    let path = autonomous_placement_record_path(data_dir, run_id)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    serde_json::from_slice(&std::fs::read(path).map_err(|error| error.to_string())?)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+fn delete_autonomous_placement_record(data_dir: &Path, run_id: &str) -> Result<(), String> {
+    let path = autonomous_placement_record_path(data_dir, run_id)?;
+    if path.exists() {
+        std::fs::remove_file(path).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn resolve_execution_target_kind(
     target_id: &str,
     requested_kind: Option<&str>,
@@ -1955,6 +1853,339 @@ fn resolve_execution_target_kind(
         Some("local") | None => Err(format!("unknown execution target '{target_id}'")),
         Some(other) => Err(format!("unknown execution target kind '{other}'")),
     }
+}
+
+#[tauri::command]
+pub async fn autonomous_task_recover_node(
+    target_id: String,
+    run_id: String,
+) -> Result<Value, String> {
+    validate_id("placement target", &target_id)?;
+    validate_id("placement run id", &run_id)?;
+    let data_dir = crate::app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve app data directory".to_string())?;
+    let Some(record) = load_autonomous_placement_record(&data_dir, &run_id)? else {
+        return Ok(serde_json::json!({"known": false}));
+    };
+    if record.target_id != target_id {
+        return Err("placement record target does not match the requested target".to_string());
+    }
+    let registry =
+        crate::execution_target::TargetRegistry::load(&data_dir.join("execution-targets.json"))
+            .map_err(|error| error.to_string())?;
+    let target = registry
+        .get(&target_id)
+        .map_err(|error| error.to_string())?
+        .target()
+        .map_err(|error| error.to_string())?;
+    let status = target
+        .status(&record.handle)
+        .map_err(|error| error.to_string())?;
+    if matches!(
+        status,
+        crate::execution_target::TargetRunStatus::Queued
+            | crate::execution_target::TargetRunStatus::Running
+    ) {
+        return Ok(serde_json::json!({
+            "known": true,
+            "pending": true,
+            "status": status,
+            "remoteRunId": record.handle.remote_id
+        }));
+    }
+    if status != crate::execution_target::TargetRunStatus::Succeeded {
+        let (failure_code, failure_kind) = match status {
+            crate::execution_target::TargetRunStatus::Failed => ("RUNNER_FAILED", "RUNNER_FAILED"),
+            crate::execution_target::TargetRunStatus::Cancelled => {
+                ("RUN_CANCELLED", "RUN_CANCELLED")
+            }
+            _ => ("RUNNER_LOST", "RUNNER_LOST"),
+        };
+        return Ok(serde_json::json!({
+            "known": true,
+            "pending": false,
+            "ok": false,
+            "failureCode": failure_code,
+            "failureKind": failure_kind,
+            "summary": format!("Recovered remote placement ended with status {status:?}")
+        }));
+    }
+    let result = target
+        .workspace_result(&record.handle)
+        .map_err(|error| error.to_string())?;
+    let result_id = crate::execution_target::persist_workspace_result(&data_dir, &result)
+        .map_err(|error| error.to_string())?;
+    target
+        .cleanup(&record.workspace)
+        .map_err(|error| error.to_string())?;
+    delete_autonomous_placement_record(&data_dir, &run_id)?;
+    Ok(serde_json::json!({
+        "known": true,
+        "pending": false,
+        "ok": true,
+        "reviewRequired": true,
+        "summary": "Recovered remote placement; review the persisted workspace result before applying it",
+        "resultId": result_id,
+        "changedFiles": result.new_files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
+        "deletedFiles": result.deleted_files,
+    }))
+}
+
+fn configured_docker_target(
+    data_dir: &Path,
+    target_id: &str,
+) -> Result<(String, Box<dyn crate::execution_target::ExecutionTarget>), String> {
+    let registry =
+        crate::execution_target::TargetRegistry::load(&data_dir.join("execution-targets.json"))
+            .map_err(|error| error.to_string())?;
+    if let Ok(config) = registry.get(target_id) {
+        let image = match config {
+            crate::execution_target::TargetConfig::Docker { image, .. } => image.clone(),
+            _ => return Err(format!("execution target '{target_id}' is not Docker")),
+        };
+        return config
+            .target()
+            .map(|target| (image, target))
+            .map_err(|error| error.to_string());
+    }
+    // Keep direct legacy callers working, but configured target IDs always
+    // resolve through the registry and therefore cannot be mistaken for an
+    // image name.
+    let target = crate::execution_target::DockerExecutionTarget::new(
+        format!(
+            "docker-{}",
+            &format!("{:x}", Sha256::digest(target_id.as_bytes()))[..24]
+        ),
+        format!("Docker {target_id}"),
+        target_id.to_string(),
+        data_dir.join("execution-runner"),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok((target_id.to_string(), Box::new(target)))
+}
+
+async fn execute_registered_target_placement(
+    request: AutonomousTaskPlacementRequest,
+) -> Result<Value, String> {
+    let data_dir = crate::app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve app data directory".to_string())?;
+    let registry_path = data_dir.join("execution-targets.json");
+    let mut registry = crate::execution_target::TargetRegistry::load(&registry_path)
+        .map_err(|error| error.to_string())?;
+    let configured = registry.targets.get(&request.target_id).cloned();
+    let (target, previous_identity) = if let Some(config) = configured.as_ref() {
+        (
+            config.target().map_err(|error| error.to_string())?,
+            Some(config.identity().clone()),
+        )
+    } else if request
+        .kind
+        .as_deref()
+        .is_some_and(|kind| matches!(kind.replace('-', "_").as_str(), "docker"))
+    {
+        let (_, target) = configured_docker_target(&data_dir, &request.target_id)?;
+        (target, None)
+    } else {
+        return Err(format!("unknown execution target '{}'", request.target_id));
+    };
+
+    if previous_identity.as_ref().is_some_and(|identity| {
+        matches!(
+            identity.trust_state,
+            crate::execution_target::TargetTrustState::Changed
+                | crate::execution_target::TargetTrustState::Revoked
+        )
+    }) {
+        return Err(
+            crate::execution_target::TargetError::TargetIdentityChanged(format!(
+                "execution target '{}' is not trusted",
+                request.target_id
+            ))
+            .to_string(),
+        );
+    }
+    let snapshot = target.probe().map_err(|error| error.to_string())?;
+    if let Some(previous) = previous_identity.as_ref() {
+        if previous
+            .verified_identity
+            .as_ref()
+            .zip(snapshot.identity.verified_identity.as_ref())
+            .is_some_and(|(before, after)| before != after)
+        {
+            if let Some(config) = registry.targets.get_mut(&request.target_id) {
+                config.identity_mut().trust_state =
+                    crate::execution_target::TargetTrustState::Changed;
+            }
+            registry
+                .save(&registry_path)
+                .map_err(|error| error.to_string())?;
+            return Err(
+                crate::execution_target::TargetError::TargetIdentityChanged(format!(
+                    "execution target '{}' identity changed",
+                    request.target_id
+                ))
+                .to_string(),
+            );
+        }
+    }
+    let placement_kind = match snapshot.identity.kind {
+        crate::execution_target::ExecutionTargetKind::Docker => "docker",
+        crate::execution_target::ExecutionTargetKind::SshRunner => "ssh_runner",
+        _ => {
+            return Err(format!(
+                "execution target '{}' is not a supported autonomous runner",
+                request.target_id
+            ))
+        }
+    };
+    if let Some(config) = registry.targets.get_mut(&request.target_id) {
+        *config.identity_mut() = snapshot.identity.clone();
+        registry
+            .save(&registry_path)
+            .map_err(|error| error.to_string())?;
+    }
+
+    let mut spec = request.run_spec;
+    consume_autonomous_placement_boundary(&mut spec, placement_kind)?;
+    let (workspace_id, host_workspace) = {
+        let workspace = spec.workspace.as_ref().ok_or_else(|| {
+            format!("{placement_kind} autonomous placement requires exactly one workspace root")
+        })?;
+        crate::agent_worktrees::validate_docker_workspace_root_count(workspace.roots.len())
+            .map_err(|error| error.to_string())?;
+        (
+            workspace.workspace_id.clone(),
+            PathBuf::from(workspace.roots[0].canonical_path.clone()),
+        )
+    };
+    let mut transfer = spec.workspace_transfer.clone().unwrap_or(
+        crate::execution_target::WorkspaceTransfer::from_workspace(&host_workspace, &workspace_id)
+            .map_err(|error| format!("{placement_kind} workspace transfer failed: {error}"))?,
+    );
+    transfer.policy = crate::execution_target::WorkspacePolicy::Ephemeral;
+    let requires_git = !matches!(
+        transfer.kind,
+        crate::execution_target::WorkspaceTransferKind::ContentSnapshot
+    );
+    spec.workspace_transfer = Some(transfer.clone());
+    spec.execution_target = Some(snapshot.clone());
+    snapshot
+        .require(&crate::execution_target::RequiredCapabilities {
+            shell: true,
+            git: requires_git,
+            disposable_workspace: true,
+            ..Default::default()
+        })
+        .map_err(|error| error.to_string())?;
+    spec.workspace
+        .as_mut()
+        .expect("workspace validated above")
+        .roots[0]
+        .canonical_path = "/workspace".to_string();
+    let recipe =
+        crate::recipes::placed_recipe_from_spec(&spec, format!("placed-{placement_kind}-node"))?;
+    let recipe_bytes = serde_json::to_vec(&recipe)
+        .map_err(|error| format!("Could not serialize placement recipe: {error}"))?;
+    let input_file = crate::execution_target::WorkspaceResultFile {
+        path: ".little-monkey/execution-spec.json".to_string(),
+        sha256: format!("{:x}", Sha256::digest(&recipe_bytes)),
+        bytes: recipe_bytes,
+        executable: false,
+        file_type: "file".to_string(),
+        symlink_target: None,
+    };
+    let workspace_handle = target
+        .prepare_workspace(
+            &transfer,
+            crate::execution_target::WorkspacePolicy::Ephemeral,
+        )
+        .map_err(|error| error.to_string())?;
+    let run_request = crate::execution_target::RunRequest {
+        run_id: spec.run_id.clone(),
+        target: snapshot,
+        required_capabilities: crate::execution_target::RequiredCapabilities {
+            shell: true,
+            git: requires_git,
+            disposable_workspace: true,
+            ..Default::default()
+        },
+        workspace: workspace_handle.clone(),
+        command: vec![
+            "monkey".to_string(),
+            "task".to_string(),
+            "run".to_string(),
+            ".little-monkey/execution-spec.json".to_string(),
+            "--json".to_string(),
+        ],
+        environment: BTreeMap::new(),
+        wall_time_ms: spec.budgets.wall_time_ms,
+        max_artifact_bytes: spec.budgets.max_artifact_bytes,
+        workspace_transfer: Some(transfer),
+        input_files: vec![input_file],
+    };
+    let handle = target
+        .submit_run(run_request)
+        .map_err(|error| error.to_string())?;
+    save_autonomous_placement_record(
+        &data_dir,
+        &AutonomousPlacementRecord {
+            run_id: spec.run_id.clone(),
+            target_id: request.target_id.clone(),
+            handle: handle.clone(),
+            workspace: workspace_handle.clone(),
+            created_at_ms: crate::execution_target::execution_now_ms(),
+        },
+    )?;
+    let deadline =
+        Instant::now() + std::time::Duration::from_millis(spec.budgets.wall_time_ms.max(1));
+    let status = loop {
+        let status = target.status(&handle).map_err(|error| error.to_string())?;
+        if matches!(
+            status,
+            crate::execution_target::TargetRunStatus::Succeeded
+                | crate::execution_target::TargetRunStatus::Failed
+                | crate::execution_target::TargetRunStatus::Cancelled
+                | crate::execution_target::TargetRunStatus::Lost
+        ) {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = target.cancel(&handle);
+            let _ = target.cleanup(&workspace_handle);
+            delete_autonomous_placement_record(&data_dir, &spec.run_id)?;
+            return Err("RUNNER_LOST: autonomous placement exceeded its wall-time budget".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    };
+    if status != crate::execution_target::TargetRunStatus::Succeeded {
+        let _ = target.cleanup(&workspace_handle);
+        delete_autonomous_placement_record(&data_dir, &spec.run_id)?;
+        let code = match status {
+            crate::execution_target::TargetRunStatus::Failed => "RUNNER_FAILED",
+            crate::execution_target::TargetRunStatus::Cancelled => "RUN_CANCELLED",
+            _ => "RUNNER_LOST",
+        };
+        return Err(format!(
+            "{code}: {placement_kind} runner finished with status {status:?}"
+        ));
+    }
+    let result = target
+        .workspace_result(&handle)
+        .map_err(|error| error.to_string())?;
+    let result_id = crate::execution_target::persist_workspace_result(&data_dir, &result)
+        .map_err(|error| error.to_string())?;
+    target
+        .cleanup(&workspace_handle)
+        .map_err(|error| error.to_string())?;
+    delete_autonomous_placement_record(&data_dir, &spec.run_id)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "reviewRequired": true,
+        "summary": format!("{placement_kind} runner completed; review the persisted workspace result before applying it"),
+        "resultId": result_id,
+        "changedFiles": result.new_files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
+        "deletedFiles": result.deleted_files,
+    }))
 }
 
 /// Execute a frozen autonomous node through the selected placement backend.
@@ -2184,386 +2415,7 @@ pub async fn autonomous_task_place_node(
             let _ = std::fs::remove_file(&spec_path);
             result
         }
-        "docker" => {
-            let data_dir = crate::app_paths::data_dir()
-                .ok_or_else(|| "Could not resolve app data directory".to_string())?;
-            let dir = data_dir.join("autonomous-placements");
-            std::fs::create_dir_all(&dir)
-                .map_err(|error| format!("Could not create placement directory: {error}"))?;
-            let spec_path = dir.join(format!("{}.json", uuid::Uuid::new_v4()));
-            let mut spec = request.run_spec;
-            consume_autonomous_placement_boundary(&mut spec, "docker")?;
-            let workspace = spec.workspace.as_mut().ok_or_else(|| {
-                "Docker autonomous placement requires exactly one workspace root".to_string()
-            })?;
-            crate::agent_worktrees::validate_docker_workspace_root_count(workspace.roots.len())
-                .map_err(|error| error.to_string())?;
-            let host_workspace = workspace.roots[0].canonical_path.clone();
-            if spec.workspace_transfer.is_none() {
-                spec.workspace_transfer = Some(
-                    crate::execution_target::WorkspaceTransfer::from_workspace(
-                        Path::new(&host_workspace),
-                        &workspace.workspace_id,
-                    )
-                    .map_err(|error| format!("Docker workspace transfer failed: {error}"))?,
-                );
-            }
-            if spec.execution_target.is_none() {
-                let target_digest = format!("{:x}", Sha256::digest(request.target_id.as_bytes()));
-                let docker_target = crate::execution_target::DockerExecutionTarget::new(
-                    format!("docker-{}", &target_digest[..24]),
-                    format!("Docker {}", request.target_id),
-                    request.target_id.clone(),
-                    data_dir.join("execution-runner"),
-                )
-                .map_err(|error| error.to_string())?;
-                spec.execution_target = Some(
-                    crate::execution_target::ExecutionTarget::probe(&docker_target)
-                        .map_err(|error| error.to_string())?,
-                );
-            }
-            if let Some(target) = &spec.execution_target {
-                target
-                    .require(&crate::execution_target::RequiredCapabilities {
-                        shell: true,
-                        disposable_workspace: true,
-                        ..Default::default()
-                    })
-                    .map_err(|error| error.to_string())?;
-            }
-            workspace.roots[0].canonical_path = "/workspace".to_string();
-            let recipe =
-                crate::recipes::placed_recipe_from_spec(&spec, "placed-docker-node".to_string())?;
-            let bytes = serde_json::to_vec_pretty(&recipe)
-                .map_err(|error| format!("Could not serialize Docker placement recipe: {error}"))?;
-            std::fs::write(&spec_path, bytes)
-                .map_err(|error| format!("Could not persist Docker placement spec: {error}"))?;
-            let before_revision =
-                crate::agent_worktrees::workspace_revision(&data_dir, Path::new(&host_workspace))?;
-            let local_snapshot =
-                crate::agent_worktrees::snapshot(&data_dir, Path::new(&host_workspace))?;
-            let container_workspace = match crate::agent_worktrees::prepare_container_workspace(
-                Path::new(&host_workspace),
-            ) {
-                Ok(path) => path,
-                Err(error) => {
-                    let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
-                    let _ = std::fs::remove_file(&spec_path);
-                    return Err(error);
-                }
-            };
-            let container_snapshot =
-                match crate::agent_worktrees::snapshot(&data_dir, &container_workspace) {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        let _ =
-                            crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
-                        let _ = std::fs::remove_dir_all(&container_workspace);
-                        let _ = std::fs::remove_file(&spec_path);
-                        return Err(error);
-                    }
-                };
-            let args = vec![
-                "run".to_string(),
-                "--rm".to_string(),
-                "--network".to_string(),
-                "none".to_string(),
-                "-e".to_string(),
-                "GIT_CONFIG_COUNT=1".to_string(),
-                "-e".to_string(),
-                "GIT_CONFIG_KEY_0=safe.directory".to_string(),
-                "-e".to_string(),
-                "GIT_CONFIG_VALUE_0=/workspace".to_string(),
-                "-v".to_string(),
-                format!("{}:/workspace", container_workspace.display()),
-                "-v".to_string(),
-                format!("{}:/run/autonomous-spec.json:ro", spec_path.display()),
-                "-w".to_string(),
-                "/workspace".to_string(),
-                request.target_id,
-                "task".to_string(),
-                "run".to_string(),
-                "/run/autonomous-spec.json".to_string(),
-                "--json".to_string(),
-            ];
-            let runner_result = tokio::task::spawn_blocking(move || {
-                let output = Command::new("docker")
-                    .args(args)
-                    .output()
-                    .map_err(|error| format!("Docker backend could not start: {error}"))?;
-                let output_text = finish_json_cli_output(output)?;
-                parse_json(&output_text)
-            })
-            .await
-            .map_err(autonomous_execution_target_lost)?;
-            let runner_result = match runner_result {
-                Ok(result) => result,
-                Err(error) => {
-                    let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
-                    let _ =
-                        crate::agent_worktrees::discard_snapshot(&data_dir, &container_snapshot.id);
-                    let _ = std::fs::remove_dir_all(&container_workspace);
-                    return Err(autonomous_execution_target_lost(error));
-                }
-            };
-            let _ = std::fs::remove_file(&spec_path);
-            let placement_result = (|| {
-                if runner_result.get("ok").and_then(Value::as_bool) != Some(false) {
-                    enforce_autonomous_placement_scope(
-                        &data_dir,
-                        &container_workspace,
-                        &container_snapshot.id,
-                        &spec,
-                    )?;
-                    let result_id = spec
-                        .workspace_transfer
-                        .as_ref()
-                        .map(|base| {
-                            let result = crate::execution_target::workspace_result_from_workspace(
-                                base,
-                                &container_workspace,
-                            )
-                            .map_err(|error| error.to_string())?;
-                            crate::execution_target::persist_workspace_result(&data_dir, &result)
-                                .map_err(|error| error.to_string())
-                        })
-                        .transpose()?;
-                    let mut response = autonomous_placement_result(
-                        &data_dir,
-                        Path::new(&host_workspace),
-                        &before_revision,
-                        &local_snapshot.id,
-                        runner_result,
-                    )?;
-                    if let Some(result_id) = result_id {
-                        if let Some(object) = response.as_object_mut() {
-                            object.insert("resultId".to_string(), Value::String(result_id));
-                            object.insert("reviewRequired".to_string(), Value::Bool(true));
-                        }
-                    }
-                    return Ok(response);
-                }
-                autonomous_placement_result(
-                    &data_dir,
-                    Path::new(&host_workspace),
-                    &before_revision,
-                    &local_snapshot.id,
-                    runner_result,
-                )
-            })();
-            let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
-            let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &container_snapshot.id);
-            let _ = std::fs::remove_dir_all(&container_workspace);
-            placement_result
-        }
-        "ssh_runner" => {
-            let data_dir = crate::app_paths::data_dir()
-                .ok_or_else(|| "Could not resolve app data directory".to_string())?;
-            let registry_path = data_dir.join("execution-targets.json");
-            let mut registry = crate::execution_target::TargetRegistry::load(&registry_path)
-                .map_err(|error| error.to_string())?;
-            let previous = registry
-                .get(&request.target_id)
-                .map_err(|error| error.to_string())?
-                .identity()
-                .clone();
-            if matches!(
-                previous.trust_state,
-                crate::execution_target::TargetTrustState::Changed
-                    | crate::execution_target::TargetTrustState::Revoked
-            ) {
-                return Err(
-                    crate::execution_target::TargetError::TargetIdentityChanged(format!(
-                        "SSH target '{}' is not trusted",
-                        request.target_id
-                    ))
-                    .to_string(),
-                );
-            }
-            let target = registry
-                .get(&request.target_id)
-                .map_err(|error| error.to_string())?
-                .target()
-                .map_err(|error| error.to_string())?;
-            let snapshot = target.probe().map_err(|error| error.to_string())?;
-            if previous
-                .verified_identity
-                .as_ref()
-                .zip(snapshot.identity.verified_identity.as_ref())
-                .is_some_and(|(before, after)| before != after)
-            {
-                if let Some(config) = registry.targets.get_mut(&request.target_id) {
-                    match config {
-                        crate::execution_target::TargetConfig::SshRunner { identity, .. } => {
-                            identity.trust_state =
-                                crate::execution_target::TargetTrustState::Changed;
-                        }
-                        _ => return Err("Selected target is not an SSH runner".to_string()),
-                    }
-                }
-                registry
-                    .save(&registry_path)
-                    .map_err(|error| error.to_string())?;
-                return Err(
-                    crate::execution_target::TargetError::TargetIdentityChanged(format!(
-                        "SSH target '{}' identity changed",
-                        request.target_id
-                    ))
-                    .to_string(),
-                );
-            }
-            if snapshot.identity.kind != crate::execution_target::ExecutionTargetKind::SshRunner {
-                return Err("Selected target is not an SSH runner".to_string());
-            }
-            if let Some(config) = registry.targets.get_mut(&request.target_id) {
-                match config {
-                    crate::execution_target::TargetConfig::SshRunner { identity, .. } => {
-                        *identity = snapshot.identity.clone();
-                    }
-                    _ => return Err("Selected target is not an SSH runner".to_string()),
-                }
-            }
-            registry
-                .save(&registry_path)
-                .map_err(|error| error.to_string())?;
-
-            let mut spec = request.run_spec;
-            consume_autonomous_placement_boundary(&mut spec, "ssh_runner")?;
-            let (workspace_id, host_workspace) = {
-                let workspace = spec.workspace.as_ref().ok_or_else(|| {
-                    "SSH autonomous placement requires exactly one workspace root".to_string()
-                })?;
-                crate::agent_worktrees::validate_docker_workspace_root_count(workspace.roots.len())
-                    .map_err(|error| error.to_string())?;
-                (
-                    workspace.workspace_id.clone(),
-                    PathBuf::from(workspace.roots[0].canonical_path.clone()),
-                )
-            };
-            let mut transfer = spec.workspace_transfer.clone().unwrap_or(
-                crate::execution_target::WorkspaceTransfer::from_workspace(
-                    &host_workspace,
-                    &workspace_id,
-                )
-                .map_err(|error| format!("SSH workspace transfer failed: {error}"))?,
-            );
-            transfer.policy = crate::execution_target::WorkspacePolicy::Ephemeral;
-            spec.workspace_transfer = Some(transfer.clone());
-            spec.execution_target = Some(snapshot.clone());
-            snapshot
-                .require(&crate::execution_target::RequiredCapabilities {
-                    shell: true,
-                    git: !matches!(
-                        transfer.kind,
-                        crate::execution_target::WorkspaceTransferKind::ContentSnapshot
-                    ),
-                    disposable_workspace: true,
-                    ..Default::default()
-                })
-                .map_err(|error| error.to_string())?;
-            spec.workspace
-                .as_mut()
-                .expect("workspace validated above")
-                .roots[0]
-                .canonical_path = "/workspace".to_string();
-            let recipe = crate::recipes::placed_recipe_from_spec(
-                &spec,
-                "placed-ssh-runner-node".to_string(),
-            )?;
-            let recipe_bytes = serde_json::to_vec(&recipe)
-                .map_err(|error| format!("Could not serialize SSH placement recipe: {error}"))?;
-            let input_file = crate::execution_target::WorkspaceResultFile {
-                path: ".little-monkey/execution-spec.json".to_string(),
-                sha256: format!("{:x}", Sha256::digest(&recipe_bytes)),
-                bytes: recipe_bytes,
-                executable: false,
-                file_type: "file".to_string(),
-                symlink_target: None,
-            };
-            let workspace_handle = target
-                .prepare_workspace(
-                    &transfer,
-                    crate::execution_target::WorkspacePolicy::Ephemeral,
-                )
-                .map_err(|error| error.to_string())?;
-            let run_request = crate::execution_target::RunRequest {
-                run_id: spec.run_id.clone(),
-                target: snapshot,
-                required_capabilities: crate::execution_target::RequiredCapabilities {
-                    shell: true,
-                    git: !matches!(
-                        transfer.kind,
-                        crate::execution_target::WorkspaceTransferKind::ContentSnapshot
-                    ),
-                    disposable_workspace: true,
-                    ..Default::default()
-                },
-                workspace: workspace_handle.clone(),
-                command: vec![
-                    "monkey".to_string(),
-                    "task".to_string(),
-                    "run".to_string(),
-                    ".little-monkey/execution-spec.json".to_string(),
-                    "--json".to_string(),
-                ],
-                environment: BTreeMap::new(),
-                wall_time_ms: spec.budgets.wall_time_ms,
-                max_artifact_bytes: spec.budgets.max_artifact_bytes,
-                workspace_transfer: Some(transfer),
-                input_files: vec![input_file],
-            };
-            let handle = target
-                .submit_run(run_request)
-                .map_err(|error| error.to_string())?;
-            let deadline =
-                Instant::now() + std::time::Duration::from_millis(spec.budgets.wall_time_ms.max(1));
-            let status = loop {
-                let status = target.status(&handle).map_err(|error| error.to_string())?;
-                if matches!(
-                    status,
-                    crate::execution_target::TargetRunStatus::Succeeded
-                        | crate::execution_target::TargetRunStatus::Failed
-                        | crate::execution_target::TargetRunStatus::Cancelled
-                        | crate::execution_target::TargetRunStatus::Lost
-                ) {
-                    break status;
-                }
-                if Instant::now() >= deadline {
-                    let _ = target.cancel(&handle);
-                    let _ = target.cleanup(&workspace_handle);
-                    return Err(crate::execution_target::TargetError::RunnerLost(
-                        "SSH autonomous placement exceeded its wall-time budget".to_string(),
-                    )
-                    .to_string());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            };
-            if status != crate::execution_target::TargetRunStatus::Succeeded {
-                let _ = target.cleanup(&workspace_handle);
-                return Err(crate::execution_target::TargetError::RunnerLost(format!(
-                    "SSH runner finished with status {status:?}"
-                ))
-                .to_string());
-            }
-            let result = target
-                .workspace_result(&handle)
-                .map_err(|error| error.to_string())?;
-            let result_id = crate::execution_target::persist_workspace_result(&data_dir, &result)
-                .map_err(|error| error.to_string())?;
-            target
-                .cleanup(&workspace_handle)
-                .map_err(|error| error.to_string())?;
-            Ok(serde_json::json!({
-                "ok": true,
-                "summary": "SSH runner completed; review the persisted workspace result before applying it",
-                "resultId": result_id,
-                "changedFiles": result.new_files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
-                "deletedFiles": result.deleted_files,
-            }))
-        }
-        other => Err(format!(
-            "Unsupported autonomous placement backend '{other}'"
-        )),
+        _ => execute_registered_target_placement(request).await,
     }
 }
 

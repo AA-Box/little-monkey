@@ -1831,6 +1831,7 @@ pub fn run() {
             daemon_commands::remote_node_refresh,
             daemon_commands::remote_placement_sync,
             daemon_commands::autonomous_task_place_node,
+            daemon_commands::autonomous_task_recover_node,
             daemon_commands::execution_targets_list,
             daemon_commands::execution_target_probe,
             daemon_commands::execution_target_add,

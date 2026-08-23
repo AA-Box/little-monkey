@@ -33,6 +33,10 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+pub fn execution_now_ms() -> u64 {
+    now_ms()
+}
+
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -1779,6 +1783,16 @@ pub trait ExecutionTarget: Send + Sync {
         policy: WorkspacePolicy,
     ) -> Result<WorkspaceHandle, TargetError>;
     fn submit_run(&self, request: RunRequest) -> Result<TargetRunHandle, TargetError>;
+    fn attach_run(&self, run_id: &str) -> Result<TargetRunHandle, TargetError> {
+        if !valid_id(run_id) {
+            return Err(TargetError::invalid("run id is invalid"));
+        }
+        Ok(TargetRunHandle {
+            run_id: run_id.to_string(),
+            remote_id: run_id.to_string(),
+            target_id: self.probe()?.identity.stable_id,
+        })
+    }
     fn events(
         &self,
         handle: &TargetRunHandle,
@@ -2144,6 +2158,18 @@ impl ExecutionTarget for DockerExecutionTarget {
             target_id: self.identity.stable_id.clone(),
         })
     }
+    fn attach_run(&self, run_id: &str) -> Result<TargetRunHandle, TargetError> {
+        let record = self
+            .load_records()?
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| TargetError::runner_lost("Docker run record was not found"))?;
+        Ok(TargetRunHandle {
+            run_id: run_id.to_string(),
+            remote_id: record.remote_id,
+            target_id: self.identity.stable_id.clone(),
+        })
+    }
     fn events(
         &self,
         handle: &TargetRunHandle,
@@ -2174,7 +2200,7 @@ impl ExecutionTarget for DockerExecutionTarget {
             .args([
                 "inspect",
                 "--format",
-                "{{.State.Status}}",
+                "{{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}}",
                 &handle.remote_id,
             ])
             .output()
@@ -2182,12 +2208,9 @@ impl ExecutionTarget for DockerExecutionTarget {
         if !output.status.success() {
             return Ok(TargetRunStatus::Lost);
         }
-        Ok(match String::from_utf8_lossy(&output.stdout).trim() {
-            "created" => TargetRunStatus::Queued,
-            "running" | "restarting" => TargetRunStatus::Running,
-            "exited" => TargetRunStatus::Succeeded,
-            _ => TargetRunStatus::Lost,
-        })
+        Ok(docker_status_from_inspect(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
     }
     fn cancel(&self, handle: &TargetRunHandle) -> Result<(), TargetError> {
         let output = Command::new(&self.docker_binary)
@@ -2274,6 +2297,22 @@ impl ExecutionTarget for DockerExecutionTarget {
         }
         self.save_records(&records)?;
         Ok(())
+    }
+}
+
+fn docker_status_from_inspect(value: &str) -> TargetRunStatus {
+    let fields = value.split_whitespace().collect::<Vec<_>>();
+    let state = fields.first().copied().unwrap_or_default();
+    let exit_code = fields.get(1).and_then(|value| value.parse::<i32>().ok());
+    let oom_killed = fields.get(2).copied() == Some("true");
+    match state {
+        "created" => TargetRunStatus::Queued,
+        "running" | "restarting" => TargetRunStatus::Running,
+        "exited" if exit_code == Some(0) => TargetRunStatus::Succeeded,
+        "exited" => TargetRunStatus::Failed,
+        "dead" if oom_killed => TargetRunStatus::Failed,
+        "dead" => TargetRunStatus::Lost,
+        _ => TargetRunStatus::Lost,
     }
 }
 
@@ -2775,6 +2814,14 @@ impl TargetConfig {
             | Self::SshRunner { identity, .. } => identity,
         }
     }
+    pub fn identity_mut(&mut self) -> &mut TargetIdentity {
+        match self {
+            Self::Local { identity }
+            | Self::Docker { identity, .. }
+            | Self::RemoteNode { identity }
+            | Self::SshRunner { identity, .. } => identity,
+        }
+    }
     pub fn validate(&self) -> Result<(), TargetError> {
         self.identity().validate()?;
         if let Self::SshRunner { config, .. } = self {
@@ -2898,9 +2945,21 @@ struct RunnerProcess {
     workspace: WorkspaceHandle,
     base_transfer: WorkspaceTransfer,
     transient_inputs: Vec<PathBuf>,
+    outcome_path: PathBuf,
+    terminal: Option<RunnerTerminalOutcome>,
     started_at_ms: u64,
     wall_time_ms: u64,
     cancelled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunnerTerminalOutcome {
+    status: TargetRunStatus,
+    finished_at_ms: u64,
+    exit_code: Option<i32>,
+    termination_reason: Option<String>,
+    result_digest: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2909,6 +2968,10 @@ struct PersistedRunnerProcess {
     workspace: WorkspaceHandle,
     base_transfer: WorkspaceTransfer,
     transient_inputs: Vec<PathBuf>,
+    #[serde(default)]
+    outcome_path: Option<PathBuf>,
+    #[serde(default)]
+    terminal: Option<RunnerTerminalOutcome>,
     started_at_ms: u64,
     wall_time_ms: u64,
     pid: u32,
@@ -2945,6 +3008,8 @@ fn persist_runner_processes(
                     workspace: process.workspace.clone(),
                     base_transfer: process.base_transfer.clone(),
                     transient_inputs: process.transient_inputs.clone(),
+                    outcome_path: Some(process.outcome_path.clone()),
+                    terminal: process.terminal.clone(),
                     started_at_ms: process.started_at_ms,
                     wall_time_ms: process.wall_time_ms,
                     pid: process.pid,
@@ -2974,6 +3039,7 @@ fn load_runner_processes(
     Ok(records
         .into_iter()
         .map(|(run_id, record)| {
+            let outcome_run_id = run_id.clone();
             (
                 run_id,
                 RunnerProcess {
@@ -2982,6 +3048,12 @@ fn load_runner_processes(
                     workspace: record.workspace,
                     base_transfer: record.base_transfer,
                     transient_inputs: record.transient_inputs,
+                    outcome_path: record.outcome_path.unwrap_or_else(|| {
+                        runner_data
+                            .join("outcomes")
+                            .join(format!("{outcome_run_id}.json"))
+                    }),
+                    terminal: record.terminal,
                     started_at_ms: record.started_at_ms,
                     wall_time_ms: record.wall_time_ms,
                     cancelled: record.cancelled,
@@ -2989,6 +3061,60 @@ fn load_runner_processes(
             )
         })
         .collect())
+}
+
+fn read_runner_outcome(
+    process: &RunnerProcess,
+) -> Result<Option<RunnerTerminalOutcome>, TargetError> {
+    if !process.outcome_path.exists() {
+        return Ok(None);
+    }
+    serde_json::from_slice(&fs::read(&process.outcome_path)?)
+        .map(Some)
+        .map_err(|error| TargetError::runner_lost(format!("invalid runner outcome: {error}")))
+}
+
+fn write_runner_outcome(
+    outcome_path: &Path,
+    status: TargetRunStatus,
+    exit_code: Option<i32>,
+    termination_reason: Option<String>,
+) -> Result<RunnerTerminalOutcome, TargetError> {
+    if let Some(parent) = outcome_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let outcome = RunnerTerminalOutcome {
+        status,
+        finished_at_ms: now_ms(),
+        exit_code,
+        termination_reason,
+        result_digest: None,
+    };
+    let temporary = outcome_path.with_extension("json.tmp");
+    fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(&outcome).map_err(|error| TargetError::Io(error.to_string()))?,
+    )?;
+    fs::rename(temporary, outcome_path)?;
+    Ok(outcome)
+}
+
+fn set_runner_result_digest(outcome_path: &Path, result_digest: String) -> Result<(), TargetError> {
+    let Some(mut outcome) =
+        serde_json::from_slice::<RunnerTerminalOutcome>(&fs::read(outcome_path)?).ok()
+    else {
+        return Err(TargetError::result_retrieval_failed(
+            "runner outcome disappeared before result persistence",
+        ));
+    };
+    outcome.result_digest = Some(result_digest);
+    let temporary = outcome_path.with_extension("json.tmp");
+    fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(&outcome).map_err(|error| TargetError::Io(error.to_string()))?,
+    )?;
+    fs::rename(temporary, outcome_path)?;
+    Ok(())
 }
 
 fn process_alive(pid: u32) -> bool {
@@ -3210,6 +3336,14 @@ fn runner_status(process: &mut RunnerProcess) -> Result<TargetRunStatus, TargetE
     if process.cancelled {
         return Ok(TargetRunStatus::Cancelled);
     }
+    if let Some(outcome) = process.terminal.as_ref() {
+        return Ok(outcome.status.clone());
+    }
+    if let Some(outcome) = read_runner_outcome(process)? {
+        let status = outcome.status.clone();
+        process.terminal = Some(outcome);
+        return Ok(status);
+    }
     if now_ms().saturating_sub(process.started_at_ms) > process.wall_time_ms {
         if let Some(child) = process.child.as_mut() {
             child
@@ -3221,23 +3355,97 @@ fn runner_status(process: &mut RunnerProcess) -> Result<TargetRunStatus, TargetE
                 libc::kill(process.pid as libc::pid_t, libc::SIGKILL);
             }
         }
+        process.terminal = Some(write_runner_outcome(
+            &process.outcome_path,
+            TargetRunStatus::Failed,
+            None,
+            Some("wall-time budget exceeded".to_string()),
+        )?);
         return Ok(TargetRunStatus::Failed);
     }
     if let Some(child) = process.child.as_mut() {
         return match child.try_wait()? {
             None => Ok(TargetRunStatus::Running),
-            Some(status) if status.success() => Ok(TargetRunStatus::Succeeded),
-            Some(_) => Ok(TargetRunStatus::Failed),
+            Some(status) => {
+                let fallback = write_runner_outcome(
+                    &process.outcome_path,
+                    if status.success() {
+                        TargetRunStatus::Succeeded
+                    } else {
+                        TargetRunStatus::Failed
+                    },
+                    status.code(),
+                    (!status.success() && status.code().is_none())
+                        .then(|| "runner child terminated by a signal".to_string()),
+                )?;
+                let terminal = read_runner_outcome(process)?.unwrap_or(fallback);
+                let result = terminal.status.clone();
+                process.terminal = Some(terminal);
+                Ok(result)
+            }
         };
     }
-    // A reconnected runner cannot wait on a child it did not spawn. The
-    // durable workspace and result contract make the terminal state observable
-    // without relying on the old stdio session's in-memory Child handle.
+    // A reconnected runner can only report a terminal state when the child
+    // durably wrote one. A dead PID without an outcome is a lost run, never a
+    // successful run.
     Ok(if process_alive(process.pid) {
         TargetRunStatus::Running
     } else {
-        TargetRunStatus::Succeeded
+        TargetRunStatus::Lost
     })
+}
+
+/// Executes one runner command in a child process and writes its terminal
+/// outcome before exiting. The outcome file is what makes a run observable
+/// after the stdio transport that launched it has disappeared.
+pub fn runner_child(
+    outcome_path: &Path,
+    environment: &BTreeMap<String, String>,
+    command: &[String],
+) -> Result<i32, TargetError> {
+    if command.is_empty()
+        || command
+            .iter()
+            .any(|part| part.is_empty() || part.contains('\0'))
+    {
+        return Err(TargetError::invalid("runner child command is invalid"));
+    }
+    validate_environment(environment)?;
+    let mut child = Command::new(&command[0]);
+    child
+        .args(&command[1..])
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .current_dir(std::env::current_dir().map_err(TargetError::from)?);
+    for (key, value) in environment {
+        child.env(key, value);
+    }
+    let status = match child.status() {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = write_runner_outcome(
+                outcome_path,
+                TargetRunStatus::Failed,
+                None,
+                Some(format!("command could not start: {error}")),
+            );
+            return Ok(127);
+        }
+    };
+    let exit_code = status.code();
+    let run_status = if status.success() {
+        TargetRunStatus::Succeeded
+    } else {
+        TargetRunStatus::Failed
+    };
+    write_runner_outcome(
+        outcome_path,
+        run_status,
+        exit_code,
+        (!status.success() && exit_code.is_none())
+            .then(|| "command terminated by a signal".to_string()),
+    )?;
+    Ok(exit_code.unwrap_or(1))
 }
 
 fn runner_submit(value: &serde_json::Value) -> Result<(String, RunnerProcess), TargetError> {
@@ -3325,15 +3533,28 @@ fn runner_submit(value: &serde_json::Value) -> Result<(String, RunnerProcess), T
         base_snapshot_digest: transfer.base_snapshot_digest.clone(),
         base_transfer: Some(transfer.clone()),
     };
-    let mut command = Command::new(&request.command[0]);
-    command.args(&request.command[1..]);
+    let run_id = request.run_id.clone();
+    let outcome_path = runner_data.join("outcomes").join(format!("{run_id}.json"));
+    let runner_executable = std::env::current_exe().map_err(|error| {
+        TargetError::runner_lost(format!("runner executable unavailable: {error}"))
+    })?;
+    let environment = serde_json::to_string(&request.environment)
+        .map_err(|error| TargetError::invalid(error.to_string()))?;
+    let mut command = Command::new(runner_executable);
+    command.args([
+        "runner",
+        "child",
+        "--outcome",
+        outcome_path.to_string_lossy().as_ref(),
+        "--environment",
+        &environment,
+        "--",
+    ]);
+    command.args(&request.command);
     command
         .current_dir(&path)
         .env_clear()
         .env("PATH", "/usr/local/bin:/usr/bin:/bin");
-    for (key, value) in &request.environment {
-        command.env(key, value);
-    }
     command.stdout(Stdio::null()).stderr(Stdio::null());
     let child = match command.spawn() {
         Ok(child) => child,
@@ -3346,7 +3567,6 @@ fn runner_submit(value: &serde_json::Value) -> Result<(String, RunnerProcess), T
             )));
         }
     };
-    let run_id = request.run_id.clone();
     Ok((
         run_id,
         RunnerProcess {
@@ -3355,6 +3575,8 @@ fn runner_submit(value: &serde_json::Value) -> Result<(String, RunnerProcess), T
             workspace,
             base_transfer: transfer,
             transient_inputs,
+            outcome_path,
+            terminal: None,
             started_at_ms: now_ms(),
             wall_time_ms: request.wall_time_ms.max(1),
             cancelled: false,
@@ -3398,11 +3620,14 @@ pub fn runner_serve_stdio() -> Result<(), TargetError> {
                     .get("runId")
                     .and_then(|value| value.as_str())
                     .unwrap_or_default();
-                match runs
+                let status = runs
                     .get_mut(id)
                     .ok_or_else(|| TargetError::runner_lost("unknown run"))
-                    .and_then(runner_status)
-                {
+                    .and_then(runner_status);
+                if status.is_ok() {
+                    persist_runner_processes(&runner_data, &runs)?;
+                }
+                match status {
                     Ok(status) => serde_json::json!({"status":status}),
                     Err(error) => {
                         serde_json::json!({"code":error.code(),"error":error.to_string()})
@@ -3431,6 +3656,14 @@ pub fn runner_serve_stdio() -> Result<(), TargetError> {
                         Ok(())
                     }) {
                     Ok(()) => {
+                        if let Some(process) = runs.get_mut(id) {
+                            process.terminal = Some(write_runner_outcome(
+                                &process.outcome_path,
+                                TargetRunStatus::Cancelled,
+                                None,
+                                Some("cancelled by client".to_string()),
+                            )?);
+                        }
                         persist_runner_processes(&runner_data, &runs)?;
                         serde_json::json!({"ok":true})
                     }
@@ -3462,12 +3695,21 @@ pub fn runner_serve_stdio() -> Result<(), TargetError> {
                                 let _ = fs::remove_file(path);
                             }
                         }
-                        workspace_result_from_workspace(
+                        let result = workspace_result_from_workspace(
                             &process.base_transfer,
                             &process.workspace.path,
-                        )
+                        )?;
+                        let result_id = workspace_result_id(&result)?;
+                        if let Some(outcome) = process.terminal.as_mut() {
+                            outcome.result_digest = Some(result_id.clone());
+                        }
+                        set_runner_result_digest(&process.outcome_path, result_id)?;
+                        Ok(result)
                     }) {
-                    Ok(result) => serde_json::json!({"result":result}),
+                    Ok(result) => {
+                        persist_runner_processes(&runner_data, &runs)?;
+                        serde_json::json!({"result":result})
+                    }
                     Err(error) => {
                         serde_json::json!({"code":error.code(),"error":error.to_string()})
                     }
@@ -3699,5 +3941,289 @@ mod tests {
         discard_workspace_result(&data_dir, &patch_id).unwrap();
         assert!(load_execution_result(&data_dir, &patch_id).is_err());
         let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn docker_status_uses_exit_code_not_container_state_alone() {
+        assert_eq!(
+            docker_status_from_inspect("exited\t0\tfalse"),
+            TargetRunStatus::Succeeded
+        );
+        assert_eq!(
+            docker_status_from_inspect("exited\t42\tfalse"),
+            TargetRunStatus::Failed
+        );
+        assert_eq!(
+            docker_status_from_inspect("running\t0\tfalse"),
+            TargetRunStatus::Running
+        );
+    }
+
+    #[test]
+    fn runner_reconnect_never_infers_success_from_a_dead_pid() {
+        let root = std::env::temp_dir().join(format!("little-monkey-runner-lost-{}", now_ms()));
+        fs::create_dir_all(&root).unwrap();
+        let transfer = WorkspaceTransfer::from_workspace(&root, "workspace-lost").unwrap();
+        let mut process = RunnerProcess {
+            child: None,
+            pid: std::process::id().saturating_add(1_000_000),
+            workspace: WorkspaceHandle {
+                workspace_id: transfer.workspace_id.clone(),
+                snapshot_id: transfer.snapshot_id.clone(),
+                path: root.clone(),
+                policy: WorkspacePolicy::Ephemeral,
+                base_snapshot_digest: transfer.base_snapshot_digest.clone(),
+                base_transfer: Some(transfer.clone()),
+            },
+            base_transfer: transfer,
+            transient_inputs: Vec::new(),
+            outcome_path: root.join("outcome.json"),
+            terminal: None,
+            started_at_ms: now_ms(),
+            wall_time_ms: 60_000,
+            cancelled: false,
+        };
+        assert_eq!(runner_status(&mut process).unwrap(), TargetRunStatus::Lost);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runner_reconnect_uses_durable_nonzero_outcome() {
+        let root = std::env::temp_dir().join(format!("little-monkey-runner-failed-{}", now_ms()));
+        fs::create_dir_all(&root).unwrap();
+        let transfer = WorkspaceTransfer::from_workspace(&root, "workspace-failed").unwrap();
+        let outcome_path = root.join("outcome.json");
+        write_runner_outcome(
+            &outcome_path,
+            TargetRunStatus::Failed,
+            Some(42),
+            Some("command exited nonzero".to_string()),
+        )
+        .unwrap();
+        let mut process = RunnerProcess {
+            child: None,
+            pid: std::process::id().saturating_add(1_000_001),
+            workspace: WorkspaceHandle {
+                workspace_id: transfer.workspace_id.clone(),
+                snapshot_id: transfer.snapshot_id.clone(),
+                path: root.clone(),
+                policy: WorkspacePolicy::Ephemeral,
+                base_snapshot_digest: transfer.base_snapshot_digest.clone(),
+                base_transfer: Some(transfer.clone()),
+            },
+            base_transfer: transfer,
+            transient_inputs: Vec::new(),
+            outcome_path,
+            terminal: None,
+            started_at_ms: now_ms(),
+            wall_time_ms: 60_000,
+            cancelled: false,
+        };
+        assert_eq!(
+            runner_status(&mut process).unwrap(),
+            TargetRunStatus::Failed
+        );
+        assert_eq!(process.terminal.unwrap().exit_code, Some(42));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn real_runner_docker_protocol_reports_success_and_nonzero_failure() {
+        let required =
+            std::env::var("LITTLE_MONKEY_REQUIRE_RUNNER_DOCKER_E2E").as_deref() == Ok("1");
+        let Some(image) = std::env::var_os("LITTLE_MONKEY_RUNNER_DOCKER_E2E_IMAGE") else {
+            assert!(
+                !required,
+                "runner Docker E2E image is required but not configured"
+            );
+            eprintln!("SKIPPED: LITTLE_MONKEY_RUNNER_DOCKER_E2E_IMAGE is not configured");
+            return;
+        };
+        let image = image.to_string_lossy().into_owned();
+        let docker_ready = Command::new("docker")
+            .args(["info", "--format", "{{.ServerVersion}}"])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !docker_ready {
+            assert!(!required, "Docker daemon is required but unavailable");
+            eprintln!("SKIPPED: Docker daemon is unavailable");
+            return;
+        }
+
+        fn run_protocol_command(
+            image: &str,
+        ) -> (
+            std::process::Child,
+            std::process::ChildStdin,
+            BufReader<std::process::ChildStdout>,
+        ) {
+            let mut child = Command::new("docker")
+                .args(["run", "--rm", "-i", image])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("runner container should start");
+            let stdin = child.stdin.take().expect("runner stdin");
+            let stdout = BufReader::new(child.stdout.take().expect("runner stdout"));
+            (child, stdin, stdout)
+        }
+        fn request(
+            stdin: &mut std::process::ChildStdin,
+            stdout: &mut BufReader<std::process::ChildStdout>,
+            value: serde_json::Value,
+        ) -> serde_json::Value {
+            writeln!(stdin, "{}", serde_json::to_string(&value).unwrap()).unwrap();
+            stdin.flush().unwrap();
+            let mut line = String::new();
+            stdout.read_line(&mut line).unwrap();
+            serde_json::from_str(line.trim()).unwrap()
+        }
+        fn wait_status(
+            stdin: &mut std::process::ChildStdin,
+            stdout: &mut BufReader<std::process::ChildStdout>,
+            run_id: &str,
+        ) -> TargetRunStatus {
+            for _ in 0..100 {
+                let response = request(
+                    stdin,
+                    stdout,
+                    serde_json::json!({"type":"status","runId":run_id}),
+                );
+                let status: TargetRunStatus =
+                    serde_json::from_value(response["status"].clone()).unwrap();
+                if matches!(
+                    status,
+                    TargetRunStatus::Succeeded
+                        | TargetRunStatus::Failed
+                        | TargetRunStatus::Cancelled
+                        | TargetRunStatus::Lost
+                ) {
+                    return status;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            panic!("runner did not reach a terminal state");
+        }
+        fn transfer_for_run(suffix: &str) -> WorkspaceTransfer {
+            let root = std::env::temp_dir().join(format!("little-monkey-runner-e2e-{suffix}"));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("baseline.txt"), b"baseline\n").unwrap();
+            let transfer =
+                WorkspaceTransfer::from_workspace(&root, &format!("runner-e2e-{suffix}")).unwrap();
+            let _ = fs::remove_dir_all(root);
+            transfer
+        }
+        fn submit(
+            stdin: &mut std::process::ChildStdin,
+            stdout: &mut BufReader<std::process::ChildStdout>,
+            run_id: &str,
+            command: Vec<String>,
+            transfer: WorkspaceTransfer,
+        ) -> TargetRunStatus {
+            let probe: ExecutionTargetSnapshot =
+                serde_json::from_value(request(stdin, stdout, serde_json::json!({"type":"probe"})))
+                    .unwrap();
+            let manifest = transfer.manifest_request();
+            let prepared = request(
+                stdin,
+                stdout,
+                serde_json::json!({"type":"workspace_prepare","manifest":manifest}),
+            );
+            let missing = prepared["missing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>();
+            let objects = transfer
+                .all_objects()
+                .filter(|object| missing.contains(&object.sha256))
+                .cloned()
+                .collect::<Vec<_>>();
+            request(
+                stdin,
+                stdout,
+                serde_json::json!({
+                    "type":"workspace_upload",
+                    "workspaceId":transfer.workspace_id,
+                    "snapshotId":transfer.snapshot_id,
+                    "objects":objects
+                }),
+            );
+            let mut cas_transfer = transfer.clone();
+            cas_transfer.object_hashes = manifest.object_hashes;
+            cas_transfer.objects.clear();
+            cas_transfer.tracked_diff = None;
+            cas_transfer.git_bundle = None;
+            cas_transfer.tracked_diff_hash = manifest.tracked_diff_hash;
+            cas_transfer.git_bundle_hash = manifest.git_bundle_hash;
+            let workspace = WorkspaceHandle {
+                workspace_id: transfer.workspace_id.clone(),
+                snapshot_id: transfer.snapshot_id.clone(),
+                path: PathBuf::from("."),
+                policy: WorkspacePolicy::Ephemeral,
+                base_snapshot_digest: transfer.base_snapshot_digest.clone(),
+                base_transfer: Some(transfer),
+            };
+            let response = request(
+                stdin,
+                stdout,
+                serde_json::json!({
+                    "type":"submit_run",
+                    "request": RunRequest {
+                        run_id: run_id.to_string(),
+                        target: probe,
+                        required_capabilities: RequiredCapabilities { shell: true, ..Default::default() },
+                        workspace,
+                        command,
+                        environment: BTreeMap::new(),
+                        wall_time_ms: 10_000,
+                        max_artifact_bytes: 1_000_000,
+                        workspace_transfer: Some(cas_transfer),
+                        input_files: Vec::new(),
+                    }
+                }),
+            );
+            assert!(
+                response.get("remoteId").is_some(),
+                "runner submission failed: {response}"
+            );
+            wait_status(stdin, stdout, run_id)
+        }
+
+        let (mut child, mut stdin, mut stdout) = run_protocol_command(&image);
+        let success_transfer = transfer_for_run("success");
+        assert_eq!(
+            submit(
+                &mut stdin,
+                &mut stdout,
+                "runner-e2e-success",
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf changed > result.txt".into()
+                ],
+                success_transfer,
+            ),
+            TargetRunStatus::Succeeded
+        );
+        let failure_transfer = transfer_for_run("failure");
+        assert_eq!(
+            submit(
+                &mut stdin,
+                &mut stdout,
+                "runner-e2e-failure",
+                vec!["sh".into(), "-c".into(), "exit 42".into()],
+                failure_transfer,
+            ),
+            TargetRunStatus::Failed
+        );
+        writeln!(stdin, "{{\"type\":\"shutdown\"}}").unwrap();
+        let _ = stdin.flush();
+        drop(stdin);
+        let _ = child.wait();
     }
 }
