@@ -8,8 +8,9 @@ import { EcosystemPackages } from "./EcosystemPackages";
 import { EcosystemPlugins } from "./EcosystemPlugins";
 import { EcosystemMcpApps, EcosystemOAuth } from "./EcosystemConnections";
 import { EcosystemWorkflowDesigner, EcosystemWorkflowRuns } from "./EcosystemWorkflows";
+import { ExtensionMarketplacePanel } from "./ExtensionMarketplacePanel";
 
-type EcosystemTab = "marketplace" | "installed" | "plugins" | "connections" | "apps" | "workflows" | "runs";
+type EcosystemTab = "marketplace" | "extensions" | "installed" | "plugins" | "connections" | "apps" | "workflows" | "runs";
 
 export function EcosystemPanel() {
   const { t } = useT();
@@ -22,6 +23,7 @@ export function EcosystemPanel() {
 
   const tabs = [
     { id: "marketplace", label: t("EcosystemPanel.marketplace") },
+    { id: "extensions", label: "Extensions" },
     { id: "installed", label: t("EcosystemPanel.installed") },
     { id: "plugins", label: t("EcosystemPanel.plugins") },
     { id: "connections", label: t("EcosystemPanel.connections") },
@@ -62,6 +64,7 @@ export function EcosystemPanel() {
       )}
 
       {tab === "marketplace" && <EcosystemDiscover />}
+      {tab === "extensions" && <ExtensionMarketplacePanel />}
       {tab === "installed" && <EcosystemPackages view="installed" />}
       {tab === "plugins" && <EcosystemPlugins />}
       {tab === "connections" && <EcosystemOAuth />}
