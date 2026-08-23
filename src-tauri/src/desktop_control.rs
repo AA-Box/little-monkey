@@ -4617,7 +4617,7 @@ async fn request_action_impl(
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn tool_computer_list_targets(
+pub async fn tool_computer_list_targets(
     state: tauri::State<'_, DesktopControlState>,
     session_id: String,
     turn_id: Option<String>,
@@ -4630,7 +4630,7 @@ pub fn tool_computer_list_targets(
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn tool_computer_inspect(
+pub async fn tool_computer_inspect(
     state: tauri::State<'_, DesktopControlState>,
     session_id: String,
     target_application_id: String,
@@ -4651,7 +4651,7 @@ pub fn tool_computer_inspect(
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn tool_computer_screenshot(
+pub async fn tool_computer_screenshot(
     app: tauri::AppHandle,
     app_state: tauri::State<'_, crate::AppState>,
     state: tauri::State<'_, DesktopControlState>,
@@ -4696,7 +4696,7 @@ pub fn tool_computer_screenshot(
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn tool_computer_clipboard_read(
+pub async fn tool_computer_clipboard_read(
     state: tauri::State<'_, DesktopControlState>,
     session_id: String,
     target_application_id: String,

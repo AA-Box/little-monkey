@@ -117,6 +117,7 @@ export async function runComputerUseFullProductE2e(): Promise<void> {
         target_application_id: target.applicationId,
         target_window_id: target.windowId,
       };
+      await dispatch('computer_focus', common);
       let inspection = await dispatch('computer_inspect', common);
       const elements = () => (inspection.elements ?? []) as Array<Record<string, any>>;
       const dark = elements().find((element) => element.label === 'Dark mode');
