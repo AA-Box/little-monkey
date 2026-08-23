@@ -57,6 +57,28 @@ fn normalized_path(value: &str) -> String {
     value.nfkc().flat_map(char::to_lowercase).collect()
 }
 
+fn same_path(left: &Path, right: &Path) -> bool {
+    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+    if left == right {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let normalize = |path: &Path| {
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .trim_end_matches('/')
+                .to_ascii_lowercase()
+        };
+        normalize(&left) == normalize(&right)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn command_output(
     program: &str,
     args: &[&str],
@@ -605,7 +627,7 @@ impl WorkspaceTransfer {
         let git_root = command_output("git", &["rev-parse", "--show-toplevel"], Some(&root)).ok();
         let git_scope = git_root
             .as_ref()
-            .filter(|value| PathBuf::from(String::from_utf8_lossy(value).trim()) == root)
+            .filter(|value| same_path(&PathBuf::from(String::from_utf8_lossy(value).trim()), &root))
             .map(|_| {
                 command_output(
                     "git",
@@ -729,7 +751,10 @@ impl WorkspaceTransfer {
         manifest.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         objects.sort_by(|left, right| left.sha256.cmp(&right.sha256));
         let (kind, tracked_diff, git_bundle) = if let Some(git_root) = git_root {
-            if PathBuf::from(String::from_utf8_lossy(&git_root).trim()) == root {
+            if same_path(
+                &PathBuf::from(String::from_utf8_lossy(&git_root).trim()),
+                &root,
+            ) {
                 let base_commit = String::from_utf8_lossy(&command_output(
                     "git",
                     &["rev-parse", "HEAD"],
@@ -1088,14 +1113,22 @@ fn validate_relative_path(value: &str, max_bytes: usize) -> Result<(), TargetErr
 }
 
 fn validate_symlink_target(value: &str, max_depth: usize) -> Result<(), TargetError> {
-    if value.is_empty() || value.len() > MAX_TRANSFER_PATH_BYTES || Path::new(value).is_absolute() {
+    if value.is_empty()
+        || value.len() > MAX_TRANSFER_PATH_BYTES
+        || value.starts_with('/')
+        || value.starts_with('\\')
+        || Path::new(value).is_absolute()
+    {
         return Err(TargetError::workspace_transfer_failed(
             "unsafe symlink target",
         ));
     }
     let mut depth = 0usize;
     for component in Path::new(value).components() {
-        if matches!(component, Component::ParentDir) {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
             return Err(TargetError::workspace_transfer_failed(
                 "symlink escapes workspace",
             ));
