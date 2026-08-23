@@ -16,8 +16,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 
@@ -58,15 +56,8 @@ def main() -> int:
     app_command = os.environ.get("COMPUTER_USE_FULL_PRODUCT_COMMAND")
     frontend_command = os.environ.get("COMPUTER_USE_FULL_PRODUCT_FRONTEND_COMMAND")
     node = shutil.which("node") or shutil.which("node.exe") or "node"
-    frontend = frontend_command.split() if frontend_command else [
-        node,
-        str(repo / "node_modules/vite/bin/vite.js"),
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "1420",
-        "--strictPort",
-    ]
+    frontend_is_server = frontend_command is not None
+    frontend = frontend_command.split() if frontend_is_server else [pnpm, "build"]
     config_path: Path | None = None
     if app_command is None:
         config_fd, config_name = tempfile.mkstemp(
@@ -78,7 +69,7 @@ def main() -> int:
         config_path = Path(config_name)
         tauri_config = json.loads((repo / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
         tauri_config["build"]["beforeDevCommand"] = ""
-        tauri_config["build"]["devUrl"] = "http://127.0.0.1:1420"
+        tauri_config["build"].pop("devUrl", None)
         config_path.write_text(json.dumps(tauri_config), encoding="utf-8")
     command = app_command.split() if app_command else [
         pnpm,
@@ -106,45 +97,48 @@ def main() -> int:
         stderr=subprocess.STDOUT,
         start_new_session=(os.name != "nt"),
     )
-    frontend_deadline = time.monotonic() + 120
-    while time.monotonic() < frontend_deadline:
-        if frontend_process.poll() is not None:
-            break
-        try:
-            with urllib.request.urlopen("http://127.0.0.1:1420/", timeout=2):
+    if frontend_is_server:
+        frontend_deadline = time.monotonic() + 120
+        while time.monotonic() < frontend_deadline:
+            if frontend_process.poll() is not None:
                 break
-        except (urllib.error.URLError, TimeoutError):
             time.sleep(1)
+        if frontend_process.poll() is None:
+            pass
+        else:
+            frontend_log.flush()
+            tail = frontend_log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
+            print("frontend command output:", file=sys.stderr)
+            print("\n".join(tail), file=sys.stderr)
+            print(f"frontend command exited (exit={frontend_process.poll()})", file=sys.stderr)
+            frontend_log.close()
+            terminate(fixture)
+            if config_path:
+                config_path.unlink(missing_ok=True)
+            return 1
     else:
-        frontend_log.flush()
-        tail = frontend_log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
-        print("frontend dev server output:", file=sys.stderr)
-        print("\n".join(tail), file=sys.stderr)
-        print("frontend dev server did not become ready", file=sys.stderr)
-        terminate(frontend_process)
-        frontend_log.close()
-        terminate(fixture)
-        if config_path:
-            config_path.unlink(missing_ok=True)
-        return 1
-    if frontend_process.poll() is not None:
-        frontend_log.flush()
-        tail = frontend_log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
-        print("frontend dev server output:", file=sys.stderr)
-        print("\n".join(tail), file=sys.stderr)
-        print(f"frontend dev server exited (exit={frontend_process.poll()})", file=sys.stderr)
-        frontend_log.close()
-        terminate(fixture)
-        if config_path:
-            config_path.unlink(missing_ok=True)
-        return 1
+        try:
+            frontend_process.wait(timeout=300)
+        except subprocess.TimeoutExpired:
+            terminate(frontend_process)
+        if frontend_process.returncode != 0:
+            frontend_log.flush()
+            tail = frontend_log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
+            print("frontend build output:", file=sys.stderr)
+            print("\n".join(tail), file=sys.stderr)
+            print(f"frontend build exited (exit={frontend_process.returncode})", file=sys.stderr)
+            frontend_log.close()
+            terminate(fixture)
+            if config_path:
+                config_path.unlink(missing_ok=True)
+            return 1
 
     capability_path = repo / "src-tauri" / "capabilities" / "computer-use-full-product-e2e.json"
     capability = json.loads((repo / "src-tauri" / "capabilities" / "default.json").read_text(encoding="utf-8"))
     capability["identifier"] = "computer-use-full-product-e2e"
     capability["description"] = "Temporary capability for the real frontend/native acceptance window"
     capability["windows"] = ["main"]
-    capability["remote"] = {"urls": ["http://127.0.0.1:1420/**"]}
+    capability.pop("remote", None)
     capability["permissions"].extend([
         "allow-computer-use-full-product-report",
         "allow-desktop-control-start-session",
@@ -158,14 +152,11 @@ def main() -> int:
     ])
     capability_path.unlink(missing_ok=True)
     capability_path.write_text(json.dumps(capability), encoding="utf-8")
-    # Declare both the capability and the loopback URL before Tauri creates the
-    # webview. Runtime ACL injection is useful for commands registered after
-    # startup, but remote-origin IPC must be associated with the initial window
-    # during app configuration on Windows WebView2.
+    # Declare the capability before Tauri creates the local webview so its ACL
+    # is present during initial IPC authority construction.
     tauri_config["app"]["windows"] = [{
         "label": "main",
         "title": "Little Monkey",
-        "url": "http://127.0.0.1:1420/",
         "width": 1440,
         "height": 800,
         "minWidth": 1400,
