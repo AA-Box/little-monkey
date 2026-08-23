@@ -55,6 +55,7 @@ interface AppMenuProps {
   onOpenBrowserWorkbench: () => void;
   onOpenCommandPalette: () => void;
   onOpenIssueToPr: () => void;
+  onOpenAutonomousTask: () => void;
   onOpenDesignToApp: () => void;
   onOpenProductionDebugging: () => void;
   onOpenIncidentCommander: () => void;
@@ -169,6 +170,7 @@ export function AppMenu({
   onOpenBrowserWorkbench,
   onOpenCommandPalette,
   onOpenIssueToPr,
+  onOpenAutonomousTask,
   onOpenDesignToApp,
   onOpenProductionDebugging,
   onOpenIncidentCommander,
@@ -255,6 +257,7 @@ export function AppMenu({
       items: [
         { key: "designToApp", icon: <PanelsTopLeft size={14} className={iconClass} />, label: t("AppMenu.designToApp"), onOpen: onOpenDesignToApp },
         { key: "issueToPr", icon: <GitPullRequest size={14} className={iconClass} />, label: t("AppMenu.issueToPr"), onOpen: onOpenIssueToPr },
+        { key: "autonomousTask", icon: <Workflow size={14} className={iconClass} />, label: t("AppMenu.autonomousTask"), onOpen: onOpenAutonomousTask },
         { key: "productionDebugging", icon: <Bug size={14} className={iconClass} />, label: t("AppMenu.productionDebugging"), onOpen: onOpenProductionDebugging },
         { key: "visualEditMode", icon: <Wand2 size={14} className={iconClass} />, label: t("AppMenu.visualEditMode"), onOpen: onOpenVisualEditMode },
         { key: "browserWorkbench", icon: <Globe size={14} className={iconClass} />, label: t("AppMenu.browserWorkbench"), onOpen: onOpenBrowserWorkbench },

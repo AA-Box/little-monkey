@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 use tauri::Emitter;
 
 const MAX_CLI_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
@@ -285,6 +286,31 @@ fn finish_cli_output(output: std::process::Output) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|_| "Daemon output is not valid UTF-8".to_string())
 }
 
+/// A JSON CLI command may return a structured failure on stdout while using a
+/// non-zero exit code. Placement must preserve that result: treating every
+/// such exit as a lost Docker target discards the child run's evidence and
+/// final failure classification.
+fn finish_json_cli_output(output: std::process::Output) -> Result<String, String> {
+    if output.stdout.len() > MAX_CLI_OUTPUT_BYTES || output.stderr.len() > MAX_CLI_OUTPUT_BYTES {
+        return Err("Daemon command output exceeded 4 MiB".to_string());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let raw = if stdout.is_empty() { &stderr } else { &stdout };
+    if output.status.success() || serde_json::from_str::<Value>(raw).is_ok() {
+        return if raw.is_empty() {
+            Err("Daemon command returned no output".to_string())
+        } else {
+            Ok(raw.to_string())
+        };
+    }
+    Err(if stderr.is_empty() {
+        format!("Daemon command exited with {}", output.status)
+    } else {
+        stderr
+    })
+}
+
 fn run_cli_with_secret(args: Vec<String>, secret: String) -> Result<String, String> {
     let output = Command::new(cli_path())
         .args(&args)
@@ -303,6 +329,304 @@ pub(crate) async fn command(args: Vec<String>) -> Result<String, String> {
 fn parse_json(output: &str) -> Result<Value, String> {
     serde_json::from_str(output.trim())
         .map_err(|error| format!("Invalid daemon JSON output: {error}"))
+}
+
+fn autonomous_placement_scopes(run_spec: &crate::run_protocol::RunSpec) -> Vec<String> {
+    let Some(snapshot) = run_spec
+        .autonomous_task
+        .as_ref()
+        .and_then(|value| value.get("task_snapshot"))
+    else {
+        return Vec::new();
+    };
+    snapshot
+        .get("plan")
+        .and_then(|plan| plan.get("nodes"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|node| {
+            node.get("mutationScope")
+                .or_else(|| node.get("mutation_scope"))
+                .and_then(Value::as_array)
+                .map(|scopes| {
+                    scopes
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+        })
+        .unwrap_or_default()
+}
+
+fn consume_autonomous_placement_boundary(
+    run_spec: &mut crate::run_protocol::RunSpec,
+    placement_kind: &str,
+) -> Result<(), String> {
+    let nodes = run_spec
+        .autonomous_task
+        .as_mut()
+        .and_then(|value| value.get_mut("task_snapshot"))
+        .and_then(|value| value.get_mut("plan"))
+        .and_then(|value| value.get_mut("nodes"))
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "autonomous placement spec omitted its frozen node plan".to_string())?;
+    let mut consumed = false;
+    for node in &mut *nodes {
+        let Some(object) = node.as_object_mut() else {
+            return Err("autonomous placement spec contains a non-object node".to_string());
+        };
+        let current = object
+            .get("executionPlacement")
+            .or_else(|| object.get("execution_placement"))
+            .cloned();
+        let Some(current) = current else { continue };
+        let kind = current
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if kind != placement_kind {
+            continue;
+        }
+        if object.get("placementFulfilled").and_then(Value::as_bool) == Some(true)
+            || current.get("placementFulfilled").and_then(Value::as_bool) == Some(true)
+        {
+            return Err(
+                "autonomous placement was already fulfilled; refusing a second placement hop"
+                    .to_string(),
+            );
+        }
+        let node_id = current
+            .get("nodeId")
+            .or_else(|| current.get("node_id"))
+            .and_then(Value::as_str)
+            .or_else(|| object.get("nodeId").and_then(Value::as_str))
+            .unwrap_or("placed-node")
+            .to_string();
+        let isolation = if placement_kind == "docker" {
+            object.insert("isolation".to_string(), Value::String("shared".to_string()));
+            "shared".to_string()
+        } else {
+            object
+                .get("isolation")
+                .and_then(Value::as_str)
+                .unwrap_or("shared")
+                .to_string()
+        };
+        {
+            let requirements = if object.contains_key("executionRequirements") {
+                object.get_mut("executionRequirements")
+            } else {
+                object.get_mut("execution_requirements")
+            };
+            if let Some(requirements) = requirements.and_then(Value::as_object_mut) {
+                requirements.insert("isolation".to_string(), Value::String(isolation.clone()));
+            }
+        }
+        object.insert("requestedExecutionPlacement".to_string(), current);
+        object.insert("placementFulfilled".to_string(), Value::Bool(true));
+        object.insert(
+            "executionPlacement".to_string(),
+            serde_json::json!({
+                "kind": "local",
+                "targetId": "local",
+                "nodeId": node_id,
+                "reason": format!("already fulfilled by {placement_kind} placement executor"),
+                "placementFulfilled": true
+            }),
+        );
+        consumed = true;
+    }
+    if consumed {
+        return Ok(());
+    }
+    let already_consumed = nodes.iter().all(|node| {
+        let Some(object) = node.as_object() else {
+            return false;
+        };
+        if object.get("placementFulfilled").and_then(Value::as_bool) != Some(true)
+            && object
+                .get("executionPlacement")
+                .and_then(|placement| placement.get("placementFulfilled"))
+                .and_then(Value::as_bool)
+                != Some(true)
+        {
+            return false;
+        }
+        object
+            .get("requestedExecutionPlacement")
+            .or_else(|| object.get("requested_placement"))
+            .or_else(|| {
+                object
+                    .get("executionPlacement")
+                    .and_then(|placement| placement.get("requestedPlacement"))
+            })
+            .and_then(|placement| placement.get("kind"))
+            .and_then(Value::as_str)
+            == Some(placement_kind)
+    });
+    if already_consumed {
+        Ok(())
+    } else {
+        Err(format!(
+            "autonomous placement spec contains no {placement_kind} node"
+        ))
+    }
+}
+
+fn autonomous_execution_target_lost(error: impl std::fmt::Display) -> String {
+    format!("EXECUTION_TARGET_LOST: {error}")
+}
+
+fn autonomous_placement_path_in_scope(path: &str, scopes: &[String]) -> bool {
+    scopes.iter().any(|scope| {
+        let scope = scope.trim_end_matches('/');
+        scope == "workspace" || path == scope || path.starts_with(&format!("{scope}/"))
+    })
+}
+
+fn enforce_autonomous_placement_scope(
+    data_dir: &Path,
+    workspace: &Path,
+    snapshot_id: &str,
+    run_spec: &crate::run_protocol::RunSpec,
+) -> Result<(), String> {
+    let changed =
+        crate::agent_worktrees::changed_files_since_snapshot(data_dir, workspace, snapshot_id)?;
+    let scopes = autonomous_placement_scopes(run_spec);
+    let unauthorized = changed
+        .iter()
+        .filter(|path| !autonomous_placement_path_in_scope(path, &scopes))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unauthorized.is_empty() {
+        crate::agent_worktrees::restore_workspace_paths(
+            data_dir,
+            workspace,
+            snapshot_id,
+            &unauthorized,
+        )?;
+        return Err(format!(
+            "autonomous placement changed files outside its frozen mutation scope: {}",
+            unauthorized.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn autonomous_placement_result(
+    data_dir: &Path,
+    workspace: &Path,
+    before_revision: &str,
+    snapshot_id: &str,
+    runner_result: Value,
+) -> Result<Value, String> {
+    let mut result = normalize_autonomous_placement_result(runner_result);
+    if result.get("ok").and_then(Value::as_bool) == Some(false) {
+        return Ok(result);
+    }
+    let after_revision = crate::agent_worktrees::workspace_revision(data_dir, workspace)?;
+    let changed_files =
+        crate::agent_worktrees::changed_files_since_snapshot(data_dir, workspace, snapshot_id)?;
+    let patch =
+        crate::agent_worktrees::patch_bytes_since_snapshot(data_dir, workspace, snapshot_id)?;
+    let patch_digest = format!("{:x}", Sha256::digest(&patch));
+    if let Some(object) = result.as_object_mut() {
+        let ok = object
+            .get("ok")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| object.get("status").and_then(Value::as_str) == Some("ok"));
+        object.insert("ok".to_string(), Value::Bool(ok));
+        if !ok {
+            return Ok(result);
+        }
+        let changed_json = serde_json::json!(changed_files);
+        object.insert("changedFiles".to_string(), changed_json.clone());
+        object.insert(
+            "workspaceRevision".to_string(),
+            serde_json::json!(after_revision),
+        );
+        if before_revision != after_revision {
+            object.insert(
+                "mutation".to_string(),
+                serde_json::json!({
+                    "beforeRevision": before_revision,
+                    "afterRevision": after_revision,
+                    "changedFiles": changed_json,
+                    "patchDigest": patch_digest
+                }),
+            );
+        }
+        if !patch.is_empty() {
+            let store = crate::artifact_store::ArtifactStore::with_max_blob_size(
+                data_dir.join("content-v1"),
+                32 * 1024 * 1024,
+            )
+            .map_err(|error| format!("Could not open Docker artifact store: {error}"))?;
+            let blob = store
+                .put(&patch)
+                .map_err(|error| format!("Could not persist Docker patch artifact: {error}"))?;
+            object.insert(
+                "artifacts".to_string(),
+                serde_json::json!([{
+                    "artifactId": blob.id,
+                    "kind": "patch",
+                    "label": "Docker autonomous placement patch",
+                    "digest": format!("{:x}", Sha256::digest(&patch)),
+                    "sizeBytes": blob.size
+                }]),
+            );
+        }
+    }
+    Ok(result)
+}
+
+fn normalize_autonomous_placement_result(mut result: Value) -> Value {
+    if let Some(object) = result.as_object_mut() {
+        let target_lost = object
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status == "execution_target_lost")
+            || object
+                .get("failureCode")
+                .and_then(Value::as_str)
+                .is_some_and(|code| code == "EXECUTION_TARGET_LOST")
+            || object
+                .get("failureKind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "EXECUTION_TARGET_LOST")
+            || object
+                .get("final_message")
+                .or_else(|| object.get("finalMessage"))
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.trim_start().starts_with("EXECUTION_TARGET_LOST:"));
+        if target_lost {
+            object.insert(
+                "failureCode".to_string(),
+                Value::String("EXECUTION_TARGET_LOST".to_string()),
+            );
+            object.insert(
+                "failureKind".to_string(),
+                Value::String("EXECUTION_TARGET_LOST".to_string()),
+            );
+            if !object.contains_key("summary") {
+                if let Some(message) = object
+                    .get("final_message")
+                    .or_else(|| object.get("finalMessage"))
+                    .cloned()
+                {
+                    object.insert("summary".to_string(), message);
+                }
+            }
+        }
+        let ok = object
+            .get("ok")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| object.get("status").and_then(Value::as_str) == Some("ok"));
+        object.insert("ok".to_string(), Value::Bool(ok));
+    }
+    result
 }
 
 fn parse_typed_json<T: DeserializeOwned>(output: &str) -> Result<T, String> {
@@ -1377,6 +1701,356 @@ pub async fn remote_placement_sync() -> Result<String, String> {
     .await
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutonomousTaskPlacementRequest {
+    pub kind: String,
+    pub target_id: String,
+    pub run_spec: crate::run_protocol::RunSpec,
+}
+
+/// Execute a frozen autonomous node through the selected placement backend.
+/// Remote nodes use the existing signed placement plane and wait for the node's
+/// durable placement to become terminal. Docker uses an explicit runner image
+/// contract; it never falls back to the host process or executes a shell.
+#[tauri::command]
+pub async fn autonomous_task_place_node(
+    request: AutonomousTaskPlacementRequest,
+) -> Result<Value, String> {
+    request
+        .run_spec
+        .validate()
+        .map_err(|error| error.to_string())?;
+    validate_token("placement kind", &request.kind, 32)?;
+    validate_token("placement target", &request.target_id, 512)?;
+    if request.target_id.starts_with('-') {
+        return Err("Placement target cannot start with '-'".to_string());
+    }
+    match request.kind.as_str() {
+        "remote_node" => {
+            validate_id("remote node alias", &request.target_id)?;
+            let mut run_spec = request.run_spec;
+            consume_autonomous_placement_boundary(&mut run_spec, "remote_node")?;
+            let data_dir = crate::app_paths::data_dir()
+                .ok_or_else(|| "Could not resolve app data directory".to_string())?;
+            let dir = data_dir.join("autonomous-placements");
+            std::fs::create_dir_all(&dir)
+                .map_err(|error| format!("Could not create placement directory: {error}"))?;
+            let spec_path = dir.join(format!("{}.json", uuid::Uuid::new_v4()));
+            let bytes = serde_json::to_vec_pretty(&run_spec)
+                .map_err(|error| format!("Could not serialize placement spec: {error}"))?;
+            std::fs::write(&spec_path, bytes)
+                .map_err(|error| format!("Could not persist placement spec: {error}"))?;
+            let workspace_root = run_spec
+                .workspace
+                .as_ref()
+                .and_then(|workspace| workspace.roots.first())
+                .map(|root| PathBuf::from(&root.canonical_path))
+                .ok_or_else(|| {
+                    "Remote autonomous placement requires a workspace root".to_string()
+                })?;
+            let before_revision =
+                crate::agent_worktrees::workspace_revision(&data_dir, &workspace_root)?;
+            let result = async {
+                let output = command(vec![
+                    "daemon".into(),
+                    "remote".into(),
+                    "place".into(),
+                    "--spec".into(),
+                    spec_path.to_string_lossy().into_owned(),
+                    "--alias".into(),
+                    request.target_id.clone(),
+                    "--json".into(),
+                ])
+                .await
+                .map_err(autonomous_execution_target_lost)?;
+                let accepted = parse_json(&output)?;
+                let submitted_run_id = accepted
+                    .get("placement")
+                    .and_then(|placement| placement.get("submitted_run_id"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        "Remote placement response omitted submitted_run_id".to_string()
+                    })?
+                    .to_string();
+                let deadline = Instant::now()
+                    + std::time::Duration::from_millis(run_spec.budgets.wall_time_ms);
+                loop {
+                    if Instant::now() >= deadline {
+                        return Err(autonomous_execution_target_lost(
+                            "Remote autonomous node placement exceeded its frozen wall-time budget",
+                        ));
+                    }
+                    let _ = command(vec![
+                        "daemon".into(),
+                        "remote".into(),
+                        "placement-sync".into(),
+                    ])
+                    .await
+                    .map_err(autonomous_execution_target_lost)?;
+                    let rows = parse_json(
+                        &command(vec![
+                            "daemon".into(),
+                            "remote".into(),
+                            "placements".into(),
+                            "--json".into(),
+                        ])
+                        .await
+                        .map_err(autonomous_execution_target_lost)?,
+                    )?;
+                    if let Some(row) =
+                        rows.get("placements")
+                            .and_then(Value::as_array)
+                            .and_then(|rows| {
+                                rows.iter().find(|row| {
+                                    row.get("submitted_run_id").and_then(Value::as_str)
+                                        == Some(submitted_run_id.as_str())
+                                })
+                            })
+                    {
+                        let state = row.get("state").and_then(Value::as_str).unwrap_or_default();
+                        if matches!(state, "succeeded" | "failed" | "cancelled") {
+                            if state != "succeeded" {
+                                return Err(autonomous_execution_target_lost(
+                                    row.get("last_error")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("remote autonomous node failed"),
+                                ));
+                            }
+                            let result = row.get("result").cloned().ok_or_else(|| {
+                                "Remote node succeeded without a transported node result"
+                                    .to_string()
+                            })?;
+                            let local_snapshot = crate::agent_worktrees::snapshot(
+                                &data_dir,
+                                &workspace_root,
+                            )?;
+                            let placement_result = async {
+                                if result.get("ok").and_then(Value::as_bool) != Some(true) {
+                                    return Err(
+                                        "Remote node returned no successful mutation/result contract"
+                                            .to_string(),
+                                    );
+                                }
+                                if result
+                                    .get("mutation")
+                                    .and_then(Value::as_object)
+                                    .is_some()
+                                {
+                                    let artifact_id = result
+                                        .get("artifacts")
+                                        .and_then(Value::as_array)
+                                        .and_then(|artifacts| {
+                                            artifacts.iter().find(|artifact| {
+                                                artifact.get("kind").and_then(Value::as_str)
+                                                    == Some("patch")
+                                            })
+                                        })
+                                        .and_then(|artifact| artifact.get("artifactId"))
+                                        .and_then(Value::as_str)
+                                        .ok_or_else(|| {
+                                            "Remote mutation result omitted its patch artifact"
+                                                .to_string()
+                                        })?;
+                                    let patch_path = data_dir
+                                        .join("autonomous-placements")
+                                        .join(format!("{submitted_run_id}-{artifact_id}.patch"));
+                                    command(vec![
+                                        "daemon".into(),
+                                        "remote".into(),
+                                        "artifact".into(),
+                                        request.target_id.clone(),
+                                        submitted_run_id.clone(),
+                                        artifact_id.to_string(),
+                                        "--output".into(),
+                                        patch_path.to_string_lossy().into_owned(),
+                                    ])
+                                    .await
+                                    .map_err(autonomous_execution_target_lost)?;
+                                    let patch_bytes = std::fs::read(&patch_path).map_err(|error| {
+                                        format!("Could not read fetched remote patch: {error}")
+                                    })?;
+                                    if format!("{:x}", Sha256::digest(&patch_bytes)) != artifact_id {
+                                        let _ = std::fs::remove_file(&patch_path);
+                                        return Err(
+                                            "Remote autonomous patch failed its content digest check"
+                                                .to_string(),
+                                        );
+                                    }
+                                    let apply = crate::agent_worktrees::apply_patch_artifact(
+                                        &workspace_root,
+                                        &patch_bytes,
+                                    );
+                                    let _ = std::fs::remove_file(&patch_path);
+                                    apply.map_err(|error| {
+                                        format!("Could not apply remote autonomous patch: {error}")
+                                    })?;
+                                    enforce_autonomous_placement_scope(
+                                        &data_dir,
+                                        &workspace_root,
+                                        &local_snapshot.id,
+                                        &run_spec,
+                                    )?;
+                                }
+                                autonomous_placement_result(
+                                    &data_dir,
+                                    &workspace_root,
+                                    &before_revision,
+                                    &local_snapshot.id,
+                                    result,
+                                )
+                            }
+                            .await;
+                            let _ = crate::agent_worktrees::discard_snapshot(
+                                &data_dir,
+                                &local_snapshot.id,
+                            );
+                            return placement_result;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+            .await;
+            let _ = std::fs::remove_file(&spec_path);
+            result
+        }
+        "docker" => {
+            let data_dir = crate::app_paths::data_dir()
+                .ok_or_else(|| "Could not resolve app data directory".to_string())?;
+            let dir = data_dir.join("autonomous-placements");
+            std::fs::create_dir_all(&dir)
+                .map_err(|error| format!("Could not create placement directory: {error}"))?;
+            let spec_path = dir.join(format!("{}.json", uuid::Uuid::new_v4()));
+            let mut spec = request.run_spec;
+            consume_autonomous_placement_boundary(&mut spec, "docker")?;
+            let workspace = spec.workspace.as_mut().ok_or_else(|| {
+                "Docker autonomous placement requires exactly one workspace root".to_string()
+            })?;
+            crate::agent_worktrees::validate_docker_workspace_root_count(workspace.roots.len())
+                .map_err(|error| error.to_string())?;
+            let host_workspace = workspace.roots[0].canonical_path.clone();
+            workspace.roots[0].canonical_path = "/workspace".to_string();
+            let recipe =
+                crate::recipes::placed_recipe_from_spec(&spec, "placed-docker-node".to_string())?;
+            let bytes = serde_json::to_vec_pretty(&recipe)
+                .map_err(|error| format!("Could not serialize Docker placement recipe: {error}"))?;
+            std::fs::write(&spec_path, bytes)
+                .map_err(|error| format!("Could not persist Docker placement spec: {error}"))?;
+            let before_revision =
+                crate::agent_worktrees::workspace_revision(&data_dir, Path::new(&host_workspace))?;
+            let local_snapshot =
+                crate::agent_worktrees::snapshot(&data_dir, Path::new(&host_workspace))?;
+            let container_workspace = match crate::agent_worktrees::prepare_container_workspace(
+                Path::new(&host_workspace),
+            ) {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
+                    let _ = std::fs::remove_file(&spec_path);
+                    return Err(error);
+                }
+            };
+            let container_snapshot =
+                match crate::agent_worktrees::snapshot(&data_dir, &container_workspace) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        let _ =
+                            crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
+                        let _ = std::fs::remove_dir_all(&container_workspace);
+                        let _ = std::fs::remove_file(&spec_path);
+                        return Err(error);
+                    }
+                };
+            let args = vec![
+                "run".to_string(),
+                "--rm".to_string(),
+                "--network".to_string(),
+                "none".to_string(),
+                "-e".to_string(),
+                "GIT_CONFIG_COUNT=1".to_string(),
+                "-e".to_string(),
+                "GIT_CONFIG_KEY_0=safe.directory".to_string(),
+                "-e".to_string(),
+                "GIT_CONFIG_VALUE_0=/workspace".to_string(),
+                "-v".to_string(),
+                format!("{}:/workspace", container_workspace.display()),
+                "-v".to_string(),
+                format!("{}:/run/autonomous-spec.json:ro", spec_path.display()),
+                "-w".to_string(),
+                "/workspace".to_string(),
+                request.target_id,
+                "task".to_string(),
+                "run".to_string(),
+                "/run/autonomous-spec.json".to_string(),
+                "--json".to_string(),
+            ];
+            let runner_result = tokio::task::spawn_blocking(move || {
+                let output = Command::new("docker")
+                    .args(args)
+                    .output()
+                    .map_err(|error| format!("Docker backend could not start: {error}"))?;
+                let output_text = finish_json_cli_output(output)?;
+                parse_json(&output_text)
+            })
+            .await
+            .map_err(autonomous_execution_target_lost)?;
+            let runner_result = match runner_result {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
+                    let _ =
+                        crate::agent_worktrees::discard_snapshot(&data_dir, &container_snapshot.id);
+                    let _ = std::fs::remove_dir_all(&container_workspace);
+                    return Err(autonomous_execution_target_lost(error));
+                }
+            };
+            let _ = std::fs::remove_file(&spec_path);
+            let placement_result = (|| {
+                if runner_result.get("ok").and_then(Value::as_bool) != Some(false) {
+                    enforce_autonomous_placement_scope(
+                        &data_dir,
+                        &container_workspace,
+                        &container_snapshot.id,
+                        &spec,
+                    )?;
+                    let patch = crate::agent_worktrees::patch_bytes_since_snapshot(
+                        &data_dir,
+                        &container_workspace,
+                        &container_snapshot.id,
+                    )?;
+                    if !patch.is_empty() {
+                        crate::agent_worktrees::apply_patch_artifact(
+                            Path::new(&host_workspace),
+                            &patch,
+                        )?;
+                    }
+                    enforce_autonomous_placement_scope(
+                        &data_dir,
+                        Path::new(&host_workspace),
+                        &local_snapshot.id,
+                        &spec,
+                    )?;
+                }
+                autonomous_placement_result(
+                    &data_dir,
+                    Path::new(&host_workspace),
+                    &before_revision,
+                    &local_snapshot.id,
+                    runner_result,
+                )
+            })();
+            let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
+            let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &container_snapshot.id);
+            let _ = std::fs::remove_dir_all(&container_workspace);
+            placement_result
+        }
+        other => Err(format!(
+            "Unsupported autonomous placement backend '{other}'"
+        )),
+    }
+}
+
 /// States what this machine advertises to schedulers allowed to place work on
 /// it. Both values are operator statements — nothing infers a machine's
 /// jurisdiction — so both are validated here before they reach the sidecar.
@@ -1889,6 +2563,24 @@ mod tests {
         assert!(validate_remote_pair_request(&granted_mobile).is_ok());
     }
 
+    #[test]
+    fn autonomous_placement_normalizes_target_loss_before_backend_specific_processing() {
+        let result = normalize_autonomous_placement_result(serde_json::json!({
+            "status": "execution_target_lost",
+            "final_message": "EXECUTION_TARGET_LOST: Docker daemon unavailable"
+        }));
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["failureCode"], "EXECUTION_TARGET_LOST");
+        assert_eq!(result["failureKind"], "EXECUTION_TARGET_LOST");
+        assert_eq!(result["summary"], result["final_message"]);
+
+        let result = normalize_autonomous_placement_result(serde_json::json!({
+            "status": "ok"
+        }));
+        assert_eq!(result["ok"], true);
+        assert!(result.get("failureCode").is_none());
+    }
+
     /// A verbatim `monkey daemon status --json` payload, as a string.
     ///
     /// A string and not `json!` on purpose: this is the CLI's wire bytes, and the
@@ -2059,6 +2751,455 @@ mod tests {
         .expect("the signal decodes from a raw status value");
         assert_eq!(signal.state, DesktopBackpressureState::Slow);
         assert_eq!(signal.retry_after_ms, Some(26_000));
+    }
+
+    #[tokio::test]
+    async fn docker_placement_round_trips_a_patch_artifact_to_the_host() {
+        let required = std::env::var("LITTLE_MONKEY_REQUIRE_DOCKER_E2E").as_deref() == Ok("1");
+        let Some(image) = std::env::var_os("LITTLE_MONKEY_DOCKER_E2E_IMAGE") else {
+            assert!(!required, "Docker E2E image is required but not configured");
+            eprintln!("SKIPPED: LITTLE_MONKEY_DOCKER_E2E_IMAGE is not configured");
+            return;
+        };
+        let docker_ready = Command::new("docker")
+            .args(["info", "--format", "{{.ServerVersion}}"])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !docker_ready {
+            assert!(!required, "Docker daemon is required but unavailable");
+            eprintln!("SKIPPED: Docker daemon is unavailable");
+            return;
+        }
+
+        let workspace = std::env::temp_dir().join(format!(
+            "little-monkey-docker-e2e-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let verifier = workspace.with_file_name(format!(
+            "little-monkey-docker-e2e-verifier-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let git = |root: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git should start");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let init = |root: &Path| {
+            std::fs::create_dir_all(root).unwrap();
+            git(root, &["init", "-q"]);
+            git(root, &["config", "user.email", "e2e@example.test"]);
+            git(root, &["config", "user.name", "Docker E2E"]);
+            std::fs::write(root.join("a.txt"), "baseline\n").unwrap();
+            git(root, &["add", "."]);
+            git(root, &["commit", "-q", "-m", "baseline"]);
+        };
+        init(&workspace);
+
+        let capability = serde_json::json!({
+            "state": "unsupported",
+            "evidence": "Docker E2E"
+        });
+        let run_spec: crate::run_protocol::RunSpec = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "run_id": "docker-e2e-run",
+            "idempotency_key": "docker-e2e-run",
+            "created_at_ms": 1784000000000u64,
+            "kind": "autonomous_task",
+            "submitted_by": {
+                "client_id": "docker-e2e-test",
+                "instance_id": "docker-e2e-test",
+                "kind": "test",
+                "version": "1"
+            },
+            "task": "Run the Docker E2E mutation",
+            "instructions": null,
+            "input_artifact_ids": [],
+            "target": {
+                "kind": "provider",
+                "target_id": "docker-e2e-target",
+                "label": "Docker E2E target",
+                "provider_id": "test-provider",
+                "endpoint": "https://example.test/v1",
+                "model": "test-model",
+                "credential_ref_id": "docker-e2e-credential",
+                "capabilities": {
+                    "tool_calling": capability,
+                    "vision": capability,
+                    "embeddings": capability,
+                    "structured_output": capability,
+                    "image_generation": capability,
+                    "audio": capability,
+                    "runtime_lifecycle": capability,
+                    "fim": capability,
+                    "code_completion": capability,
+                    "inline_edit": capability,
+                    "fim_metadata": null
+                }
+            },
+            "workspace": {
+                "workspace_id": "docker-e2e-workspace",
+                "primary_root_id": "docker-e2e-root",
+                "roots": [{
+                    "root_id": "docker-e2e-root",
+                    "canonical_path": workspace.canonicalize().unwrap().to_string_lossy(),
+                    "access": "read_write",
+                    "allow_symlinks_within_root": false
+                }],
+                "repository_policy": null
+            },
+            "permission_policy": {
+                "mode": "auto",
+                "unattended": true,
+                "approval_timeout_ms": 1000,
+                "default_tool_decision": "allow",
+                "tool_rules": [],
+                "allow_network": false,
+                "allow_external_mutations": false
+            },
+            "budgets": {
+                "wall_time_ms": 120000,
+                "max_iterations": 1,
+                "max_model_calls": 1,
+                "max_tool_calls": 1,
+                "max_input_tokens": 1,
+                "max_output_tokens": 1,
+                "max_cost_micros": null,
+                "max_artifact_bytes": 1048576,
+                "max_event_count": 32
+            },
+            "autonomous_task": {
+                "schema_version": 1,
+                "task_id": "docker-e2e-run",
+                "objective": "Run the Docker E2E mutation",
+                "source": "test",
+                "relevant_files": ["docker-e2e.txt"],
+                "current_workspace_revision": "docker-e2e-baseline",
+                "max_repair_rounds": 0,
+                "max_workers": 1,
+                "guidance": [],
+                "delivery_intent": "leave_worktree",
+                "execution_owner": {
+                    "kind": "remote",
+                    "instance_id": "docker-e2e-test",
+                    "lease_epoch": 1,
+                    "lease_expires_at_ms": 1784000120000u64
+                },
+                "previous_execution_owner": null,
+                "completed_nodes": [],
+                "next_node_id": "docker-e2e-node",
+                "task_snapshot": {
+                    "taskId": "docker-e2e-run",
+                    "objective": "Run the Docker E2E mutation",
+                    "source": "test",
+                    "workspaceRevision": "docker-e2e-baseline",
+                    "plan": {
+                        "planId": "docker-e2e-plan",
+                        "strategy": "PLAN",
+                        "revision": 1,
+                        "nodes": [{
+                            "nodeId": "docker-e2e-node",
+                            "taskClass": "implementation",
+                            "objective": "Write the Docker E2E file",
+                            "dependencies": [],
+                            "mutationScope": ["docker-e2e.txt"],
+                            "isolation": "shared",
+                            "relevantFiles": ["docker-e2e.txt"],
+                            "capabilities": ["read", "mutate"],
+                            "executionPlacement": {
+                                "kind": "docker",
+                                "targetId": image.to_string_lossy(),
+                                "nodeId": "docker-e2e-node"
+                            }
+                        }],
+                        "outcome": "RUNNING"
+                    }
+                }
+            }
+        }))
+        .expect("Docker E2E RunSpec should decode");
+        let result = autonomous_task_place_node(AutonomousTaskPlacementRequest {
+            kind: "docker".to_string(),
+            target_id: image.to_string_lossy().into_owned(),
+            run_spec,
+        })
+        .await
+        .expect("Docker placement should succeed");
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("docker-e2e.txt")).unwrap(),
+            "written by the Docker autonomous runner\n"
+        );
+        let artifact_id = result["artifacts"][0]["artifactId"]
+            .as_str()
+            .expect("Docker placement should return its patch artifact");
+        let data_dir = crate::app_paths::data_dir().expect("app data dir");
+        let store = crate::artifact_store::ArtifactStore::new(data_dir.join("content-v1"))
+            .expect("artifact store");
+        let artifact = store
+            .read(artifact_id)
+            .expect("patch artifact should be readable");
+        init(&verifier);
+        crate::agent_worktrees::apply_patch_artifact(&verifier, &artifact)
+            .expect("host should apply the returned patch artifact");
+        assert_eq!(
+            std::fs::read_to_string(verifier.join("docker-e2e.txt")).unwrap(),
+            "written by the Docker autonomous runner\n"
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&verifier);
+    }
+
+    #[tokio::test]
+    async fn docker_placement_runs_the_real_monkey_cli_autonomous_executor() {
+        let required = std::env::var("LITTLE_MONKEY_REQUIRE_REAL_DOCKER_E2E").as_deref() == Ok("1");
+        let Some(image) = std::env::var_os("LITTLE_MONKEY_REAL_DOCKER_E2E_IMAGE") else {
+            assert!(
+                !required,
+                "real Docker E2E image is required but not configured"
+            );
+            eprintln!("SKIPPED: LITTLE_MONKEY_REAL_DOCKER_E2E_IMAGE is not configured");
+            return;
+        };
+        let docker_ready = Command::new("docker")
+            .args(["info", "--format", "{{.ServerVersion}}"])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !docker_ready {
+            assert!(!required, "Docker daemon is required but unavailable");
+            eprintln!("SKIPPED: Docker daemon is unavailable");
+            return;
+        }
+
+        let workspace = std::env::temp_dir().join(format!(
+            "little-monkey-docker-real-e2e-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let verifier = workspace.with_file_name(format!(
+            "little-monkey-docker-real-e2e-verifier-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let git = |root: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git should start");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let init = |root: &Path| {
+            std::fs::create_dir_all(root).unwrap();
+            git(root, &["init", "-q"]);
+            git(root, &["config", "user.email", "e2e@example.test"]);
+            git(root, &["config", "user.name", "Docker real E2E"]);
+            std::fs::write(root.join("baseline.txt"), "baseline\n").unwrap();
+            git(root, &["add", "."]);
+            git(root, &["commit", "-q", "-m", "baseline"]);
+        };
+        init(&workspace);
+
+        let image = image.to_string_lossy().into_owned();
+        let run_id = format!("docker-real-e2e-{}", uuid::Uuid::new_v4().simple());
+        let capability = serde_json::json!({
+            "state": "supported",
+            "evidence": "deterministic model fixture inside the container"
+        });
+        let run_spec: crate::run_protocol::RunSpec = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "run_id": run_id,
+            "idempotency_key": "docker-real-e2e-idempotency",
+            "created_at_ms": 1785000000000u64,
+            "kind": "autonomous_task",
+            "submitted_by": {
+                "client_id": "docker-real-e2e-test",
+                "instance_id": "docker-real-e2e-test",
+                "kind": "test",
+                "version": "1"
+            },
+            "task": "Run the real Docker autonomous executor",
+            "instructions": null,
+            "input_artifact_ids": [],
+            "target": {
+                "kind": "provider",
+                "target_id": "docker-real-e2e-target",
+                "label": "Docker real E2E target",
+                "provider_id": "local-openai-compatible",
+                "endpoint": "http://127.0.0.1:18080",
+                "model": "docker-real-fixture",
+                "credential_ref_id": "credential:none",
+                "capabilities": {
+                    "tool_calling": capability,
+                    "vision": capability,
+                    "embeddings": capability,
+                    "structured_output": capability,
+                    "image_generation": capability,
+                    "audio": capability,
+                    "runtime_lifecycle": capability,
+                    "fim": capability,
+                    "code_completion": capability,
+                    "inline_edit": capability,
+                    "fim_metadata": null
+                }
+            },
+            "workspace": {
+                "workspace_id": "docker-real-e2e-workspace",
+                "primary_root_id": "docker-real-e2e-root",
+                "roots": [{
+                    "root_id": "docker-real-e2e-root",
+                    "canonical_path": workspace.canonicalize().unwrap().to_string_lossy(),
+                    "access": "read_write",
+                    "allow_symlinks_within_root": false
+                }],
+                "repository_policy": null
+            },
+            "permission_policy": {
+                "mode": "auto",
+                "unattended": true,
+                "approval_timeout_ms": 60000,
+                "default_tool_decision": "allow",
+                "tool_rules": [{"tool": "write_file", "decision": "allow"}],
+                "allow_network": true,
+                "allow_external_mutations": false
+            },
+            "budgets": {
+                "wall_time_ms": 120000,
+                "max_iterations": 8,
+                "max_model_calls": 16,
+                "max_tool_calls": 16,
+                "max_input_tokens": 100000,
+                "max_output_tokens": 100000,
+                "max_cost_micros": null,
+                "max_artifact_bytes": 1048576,
+                "max_event_count": 256
+            },
+            "autonomous_task": {
+                "schema_version": 1,
+                "task_id": run_id,
+                "objective": "Run the real Docker autonomous executor",
+                "source": "test",
+                "relevant_files": ["docker-e2e.txt"],
+                "current_workspace_revision": "docker-real-e2e-baseline",
+                "max_repair_rounds": 0,
+                "max_workers": 1,
+                "guidance": [],
+                "delivery_intent": "leave_worktree",
+                "execution_owner": {
+                    "kind": "remote",
+                    "instance_id": "docker-real-e2e",
+                    "lease_epoch": 1,
+                    "lease_expires_at_ms": 4000000000000u64
+                },
+                "previous_execution_owner": null,
+                "completed_nodes": [],
+                "next_node_id": "docker-real-implement",
+                "task_snapshot": {
+                    "taskId": run_id,
+                    "objective": "Run the real Docker autonomous executor",
+                    "source": "test",
+                    "workspaceRevision": "docker-real-e2e-baseline",
+                    "plan": {
+                        "planId": "docker-real-e2e-plan",
+                        "strategy": "PLAN",
+                        "revision": 1,
+                        "nodes": [
+                            {
+                                "nodeId": "docker-real-implement",
+                                "taskClass": "implementation",
+                                "objective": "Write docker-e2e.txt using the file tool",
+                                "dependencies": [],
+                                "mutationScope": ["docker-e2e.txt"],
+                                "isolation": "shared",
+                                "relevantFiles": ["docker-e2e.txt"],
+                                "capabilities": ["read", "mutate"],
+                                "executionPlacement": {
+                                    "kind": "docker",
+                                    "targetId": image.clone(),
+                                    "nodeId": "docker-real-implement"
+                                }
+                            },
+                            {
+                                "nodeId": "docker-real-verify",
+                                "taskClass": "verification",
+                                "objective": "Run the configured Docker verification command",
+                                "dependencies": ["docker-real-implement"],
+                                "mutationScope": [],
+                                "isolation": "shared",
+                                "relevantFiles": ["docker-e2e.txt"],
+                                "capabilities": ["read", "verify"]
+                            },
+                            {
+                                "nodeId": "docker-real-review",
+                                "taskClass": "review",
+                                "objective": "Review the Docker mutation and return structured evidence",
+                                "dependencies": ["docker-real-verify"],
+                                "mutationScope": [],
+                                "isolation": "shared",
+                                "relevantFiles": ["docker-e2e.txt"],
+                                "capabilities": ["read", "verify"]
+                            }
+                        ]
+                    },
+                    "outcome": "RUNNING"
+                }
+            }
+        }))
+        .expect("real Docker E2E RunSpec should decode");
+        let result = autonomous_task_place_node(AutonomousTaskPlacementRequest {
+            kind: "docker".to_string(),
+            target_id: image,
+            run_spec,
+        })
+        .await
+        .expect("real Docker placement should succeed");
+        assert_eq!(
+            result.get("ok").and_then(Value::as_bool),
+            Some(true),
+            "real Docker child result: {result}"
+        );
+        assert!(result["changedFiles"]
+            .as_array()
+            .is_some_and(|files| files.iter().any(|file| file == "docker-e2e.txt")));
+        assert!(result["evidence"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
+        assert_eq!(result["review"]["verdict"], "pass");
+        assert!(result["mutation"]["beforeRevision"].is_string());
+        assert!(result["mutation"]["afterRevision"].is_string());
+        assert!(result["mutation"]["patchDigest"].is_string());
+        let artifact_id = result["artifacts"][0]["artifactId"]
+            .as_str()
+            .expect("real Docker result should include its patch artifact");
+        let data_dir = crate::artifact_store::ArtifactStore::new(
+            crate::app_paths::data_dir()
+                .expect("app data dir")
+                .join("content-v1"),
+        )
+        .expect("artifact store");
+        let artifact = data_dir
+            .read(artifact_id)
+            .expect("real Docker patch artifact should be readable");
+        assert_eq!(format!("{:x}", Sha256::digest(&artifact)), artifact_id);
+        init(&verifier);
+        crate::agent_worktrees::apply_patch_artifact(&verifier, &artifact)
+            .expect("real Docker artifact should replay on a clean host repo");
+        assert_eq!(
+            std::fs::read_to_string(verifier.join("docker-e2e.txt")).unwrap(),
+            "written by the real monkey-cli\n"
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&verifier);
     }
 
     fn fixture_schedule(path: &Path, entry_id: &str, cron: &str) -> DaemonRecipeSchedule {

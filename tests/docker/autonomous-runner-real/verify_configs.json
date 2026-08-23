@@ -1,0 +1,14 @@
+{
+  "/workspace": {
+    "commands": [
+      {
+        "id": "docker-real-e2e-verification",
+        "label": "Docker real autonomous verification",
+        "command": "test \"$(cat docker-e2e.txt)\" = \"written by the real monkey-cli\"",
+        "kind": "custom",
+        "enabled": true,
+        "timeoutSecs": 30
+      }
+    ]
+  }
+}

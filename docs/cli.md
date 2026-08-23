@@ -77,6 +77,10 @@ monkey stacks embed-server start --model-path <embedding.gguf> | status | stop
 monkey task list | validate <recipe-file>
 monkey task run <name-or-path> [--param key=value ...] [--json]
 monkey task schedule <name-or-path> --cron "<expr>"
+monkey task start "<objective>" --target ollama:<model> [--workspace <path>] [--json]
+monkey task status [--run-id <id>] [--json]
+monkey task attach <run-id> [--follow] [--json]
+monkey task guide|pause|resume|cancel <run-id> [<guidance>]
 
 monkey workflow list | validate <definition.json>
 monkey workflow run <workflow-id> [--inputs '{}'] [--secrets '{}']

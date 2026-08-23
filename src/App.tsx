@@ -69,6 +69,7 @@ import { studioClient } from "./lib/studioClient";
 import { SegmentedControl } from "./components/ui/SegmentedControl";
 import {
   AgentInbox,
+  AutonomousTaskPanel,
   ApiContractDiffLabPanel,
   ApprovalChainModal,
   ArtifactPane,
@@ -322,6 +323,7 @@ function App() {
   const browserWorkbenchOpen = activeFeaturePanel === "browser-workbench";
   const designToAppOpen = activeFeaturePanel === "design-to-app";
   const issueToPrOpen = activeFeaturePanel === "issue-to-pr";
+  const autonomousTaskOpen = activeFeaturePanel === "autonomous-task";
   const productionDebuggingOpen = activeFeaturePanel === "production-debugging";
   const incidentCommanderOpen = activeFeaturePanel === "incident-commander";
   const securityAutofixOpen = activeFeaturePanel === "security-autofix";
@@ -1068,6 +1070,7 @@ function App() {
           onOpenBrowserWorkbench={() => openFeaturePanel("browser-workbench")}
           onOpenCommandPalette={openCommandPalette}
           onOpenIssueToPr={() => openFeaturePanel("issue-to-pr")}
+          onOpenAutonomousTask={() => openFeaturePanel("autonomous-task")}
           onOpenDesignToApp={() => openFeaturePanel("design-to-app")}
           onOpenProductionDebugging={() => openFeaturePanel("production-debugging")}
           onOpenIncidentCommander={() => openFeaturePanel("incident-commander")}
@@ -1249,6 +1252,8 @@ function App() {
                   void useRunStore.getState().selectRun(runId);
                 }}
               />
+            ) : autonomousTaskOpen ? (
+              <AutonomousTaskPanel sessionId={activeSessionId} onClose={() => closeFeaturePanel("autonomous-task")} />
             ) : productionDebuggingOpen ? (
               <ProductionDebuggingPanel
                 onClose={() => closeFeaturePanel("production-debugging")}

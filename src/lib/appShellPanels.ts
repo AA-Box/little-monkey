@@ -9,6 +9,7 @@ export const FEATURE_PANEL_IDS = [
   "browser-workbench",
   "design-to-app",
   "issue-to-pr",
+  "autonomous-task",
   "production-debugging",
   "incident-commander",
   "security-autofix",

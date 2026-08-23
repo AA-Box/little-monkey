@@ -686,6 +686,7 @@ pub(super) fn queue_options_for(
         params,
         deterministic_job_id: Some(ingress.deterministic_job_id()),
         priority: ingress.target.priority,
+        initially_paused: false,
         max_attempts: 1,
         // Half an hour unless the frozen recipe asked for less. A conversation
         // nobody is watching should not be able to hold a slot for a week, and
