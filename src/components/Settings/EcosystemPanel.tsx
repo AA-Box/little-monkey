@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { AlertTriangle, RefreshCw, ShieldCheck } from "lucide-react";
 import { Button, Tabs } from "../ui";
 import { useT } from "../../lib/i18n";
@@ -8,7 +8,11 @@ import { EcosystemPackages } from "./EcosystemPackages";
 import { EcosystemPlugins } from "./EcosystemPlugins";
 import { EcosystemMcpApps, EcosystemOAuth } from "./EcosystemConnections";
 import { EcosystemWorkflowDesigner, EcosystemWorkflowRuns } from "./EcosystemWorkflows";
-import { ExtensionMarketplacePanel } from "./ExtensionMarketplacePanel";
+
+const ExtensionMarketplacePanel = lazy(async () => {
+  const module = await import("./ExtensionMarketplacePanel");
+  return { default: module.ExtensionMarketplacePanel };
+});
 
 type EcosystemTab = "marketplace" | "extensions" | "installed" | "plugins" | "connections" | "apps" | "workflows" | "runs";
 
@@ -64,7 +68,11 @@ export function EcosystemPanel() {
       )}
 
       {tab === "marketplace" && <EcosystemDiscover />}
-      {tab === "extensions" && <ExtensionMarketplacePanel />}
+      {tab === "extensions" && (
+        <Suspense fallback={<div className="rounded-lg border border-border bg-surface p-5 text-center text-xs text-muted">Loading executable extensions…</div>}>
+          <ExtensionMarketplacePanel />
+        </Suspense>
+      )}
       {tab === "installed" && <EcosystemPackages view="installed" />}
       {tab === "plugins" && <EcosystemPlugins />}
       {tab === "connections" && <EcosystemOAuth />}
