@@ -1,7 +1,14 @@
-FROM debian:bookworm-slim
+FROM ubuntu:22.04
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends --yes ca-certificates git python3 \
+    && apt-get install --no-install-recommends --yes \
+        ca-certificates \
+        git \
+        libappindicator3-1 \
+        libgtk-3-0 \
+        librsvg2-2 \
+        libwebkit2gtk-4.1-0 \
+        python3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY src-tauri/target/debug/monkey-cli /usr/local/bin/monkey-cli
