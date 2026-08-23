@@ -72,10 +72,10 @@ def main() -> int:
         config_fd, config_name = tempfile.mkstemp(prefix="little-monkey-full-product-", suffix=".json")
         os.close(config_fd)
         config_path = Path(config_name)
-        config_path.write_text(
-            json.dumps({"build": {"beforeDevCommand": "", "devUrl": "http://127.0.0.1:1420"}}),
-            encoding="utf-8",
-        )
+        tauri_config = json.loads((repo / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
+        tauri_config["build"]["beforeDevCommand"] = ""
+        tauri_config["build"]["devUrl"] = "http://127.0.0.1:1420"
+        config_path.write_text(json.dumps(tauri_config), encoding="utf-8")
     command = app_command.split() if app_command else [
         pnpm,
         "tauri",
