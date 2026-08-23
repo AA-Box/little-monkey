@@ -2183,6 +2183,16 @@ impl ExecutionTarget for DockerExecutionTarget {
         if let Some(ram) = request.target.identity.capabilities.max_ram_bytes {
             command.args(["--memory", &ram.to_string()]);
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::metadata(&request.workspace.path)?;
+            let user = format!("{}:{}", metadata.uid(), metadata.gid());
+            // App-owned data is intentionally private. Match the container's
+            // identity to its owner so rootless/user-namespaced Docker can
+            // write the bind mount without weakening the host permissions.
+            command.args(["--user", &user]);
+        }
         command.args([
             "--mount",
             &format!(
