@@ -132,12 +132,12 @@ function intersects(left: Set<string>, values: string[]): string[] {
 }
 
 function globHintMatches(glob: string, path: string): boolean {
-  const normalized = path.replaceAll("\\", "/").toLowerCase();
+  const normalized = path.replace(/\\/g, "/").toLowerCase();
   const hint = glob
-    .replaceAll("**/", "")
-    .replaceAll("**", "")
-    .replaceAll("*", "")
-    .replaceAll("?", "")
+    .replace(/\*\*\//g, "")
+    .replace(/\*\*/g, "")
+    .replace(/\*/g, "")
+    .replace(/\?/g, "")
     .toLowerCase();
   return hint.length > 1 && normalized.includes(hint);
 }

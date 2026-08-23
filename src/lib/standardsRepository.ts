@@ -26,7 +26,7 @@ interface WorkspaceDirEntry {
  * backend's sandboxed workspace commands using STANDARD_FILE. */
 export function standardsFilePath(workspacePath: string): string {
   const separator = workspacePath.includes("\\") && !workspacePath.includes("/") ? "\\" : "/";
-  return `${workspacePath.replace(/[\\/]$/, "")}${separator}${STANDARD_FILE.replaceAll("/", separator)}`;
+  return `${workspacePath.replace(/[\\/]$/, "")}${separator}${STANDARD_FILE.replace(/\//g, separator)}`;
 }
 
 async function readWorkspaceText(relativePath: string): Promise<string | null> {
@@ -96,7 +96,7 @@ async function readEvidence(
     ? lines[Math.max(0, line - 1)]?.trim().slice(0, 500) ?? needle
     : content.slice(0, 500).trim();
   return {
-    path: relativePath.replaceAll("\\", "/"),
+    path: relativePath.replace(/\\/g, "/"),
     line,
     excerpt,
     sha256: await sha256(content),
