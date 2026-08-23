@@ -36,19 +36,17 @@ fn main() {
     }
 
     if std::env::var("COMPUTER_USE_FULL_PRODUCT_E2E").as_deref() == Ok("1") {
-        attributes = attributes.app_manifest(
-            tauri_build::AppManifest::new().commands(&[
-                "computer_use_full_product_report",
-                "desktop_control_start_session",
-                "desktop_control_stop_session",
-                "desktop_control_provider_info",
-                "tool_computer_list_targets",
-                "tool_computer_inspect",
-                "tool_computer_click",
-                "tool_computer_set_value",
-                "tool_computer_screenshot",
-            ]),
-        );
+        attributes = attributes.app_manifest(tauri_build::AppManifest::new().commands(&[
+            "computer_use_full_product_report",
+            "desktop_control_start_session",
+            "desktop_control_stop_session",
+            "desktop_control_provider_info",
+            "tool_computer_list_targets",
+            "tool_computer_inspect",
+            "tool_computer_click",
+            "tool_computer_set_value",
+            "tool_computer_screenshot",
+        ]));
     }
 
     tauri_build::try_build(attributes).expect("failed to run tauri-build");

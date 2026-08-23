@@ -85,6 +85,7 @@ def main() -> int:
     environment.update({
         "COMPUTER_USE_FULL_PRODUCT_E2E": "1",
         "COMPUTER_USE_FULL_PRODUCT_REPORT": str(args.report),
+        "COMPUTER_USE_FIXTURE_PID": str(fixture.pid),
         "VITE_COMPUTER_USE_FULL_PRODUCT_E2E": "1",
         "VITE_COMPUTER_USE_FIXTURE_PID": str(fixture.pid),
     })
