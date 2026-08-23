@@ -1001,7 +1001,7 @@ pub fn run() {
         .register_uri_scheme_protocol("artifact", |ctx, request| {
             artifacts::handle_request(ctx.app_handle().state::<AppState>().inner(), &request)
         })
-        .setup(|app| {
+        .setup(move |app| {
             if full_product_e2e {
                 eprintln!("full product startup: setup entered");
             }
