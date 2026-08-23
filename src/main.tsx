@@ -1,4 +1,5 @@
 import React from "react";
+import { invoke } from "@tauri-apps/api/core";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -69,9 +70,21 @@ const isFullProductE2e = !isCompanionOverlay && import.meta.env.VITE_COMPUTER_US
 // hydration; a stuck unrelated hydration promise must not turn a live Tauri
 // process into an acceptance timeout with no evidence.
 if (isFullProductE2e) {
-  void import("./lib/computerUseFullProductE2e").then(({ runComputerUseFullProductE2e }) => {
-    window.setTimeout(() => void runComputerUseFullProductE2e(), 1_500);
-  });
+  const reportBootstrapFailure = (error: unknown) => invoke("computer_use_full_product_report", {
+    report: {
+      status: "failed",
+      error: error instanceof Error ? error.message : String(error),
+      real_frontend_dispatcher: false,
+      real_tauri_ipc: false,
+    },
+  }).catch(() => undefined);
+  void import("./lib/computerUseFullProductE2e")
+    .then(({ runComputerUseFullProductE2e }) => {
+      window.setTimeout(() => {
+        void runComputerUseFullProductE2e().catch(reportBootstrapFailure);
+      }, 1_500);
+    })
+    .catch(reportBootstrapFailure);
 }
 
 if (isCompanionOverlay) {
