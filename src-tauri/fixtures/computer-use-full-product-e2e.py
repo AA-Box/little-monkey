@@ -153,9 +153,19 @@ def main() -> int:
         start_new_session=(os.name != "nt"),
     )
     try:
-        deadline = time.monotonic() + args.timeout
-        while time.monotonic() < deadline and not args.report.is_file():
+        build_deadline = time.monotonic() + args.timeout
+        acceptance_deadline: float | None = None
+        while not args.report.is_file():
             if app.poll() is not None and not args.report.is_file():
+                break
+            if acceptance_deadline is None:
+                if time.monotonic() >= build_deadline:
+                    break
+                app_log.flush()
+                app_output = app_log_path.read_text(encoding="utf-8", errors="replace")
+                if "Running `" in app_output and "little-monkey" in app_output:
+                    acceptance_deadline = time.monotonic() + args.timeout
+            elif time.monotonic() >= acceptance_deadline:
                 break
             time.sleep(1)
         if not args.report.is_file():
