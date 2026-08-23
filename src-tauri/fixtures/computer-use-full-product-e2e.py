@@ -168,6 +168,7 @@ def main() -> int:
         "hiddenTitle": True,
     }, {
         "label": "companion-overlay",
+        "url": "index.html?overlay=1",
         "title": "Little Monkey Companion",
         "width": 440,
         "height": 560,
