@@ -145,7 +145,7 @@ export function StandardsStudioPanel() {
       <section className="rounded-lg border border-border bg-surface p-3">
         <div className="flex flex-wrap gap-1.5">
           {(["candidates", "approved", "drift", "conflicts", "deprecated"] as StudioTab[]).map((entry) => (
-            <Button key={entry} size="sm" variant={tab === entry ? "primary" : "default"} onClick={() => setTab(entry)}>
+            <Button key={entry} size="sm" variant={tab === entry ? "primary" : "secondary"} onClick={() => setTab(entry)}>
               {entry[0].toUpperCase() + entry.slice(1)} ({counts[entry]})
             </Button>
           ))}
