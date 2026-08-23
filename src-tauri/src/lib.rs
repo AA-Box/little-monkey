@@ -817,6 +817,7 @@ impl Default for AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let full_product_e2e = std::env::var("COMPUTER_USE_FULL_PRODUCT_E2E").as_deref() == Ok("1");
     // Before anything else, and before any thread exists: a GUI launch hands us
     // launchd's `PATH`, so every shell tool would miss the user's own binaries
     // (`~/.local/bin`, Homebrew, version-manager shims) until this runs.
@@ -891,7 +892,7 @@ pub fn run() {
     // the hosted desktop. It still exercises the emergency-stop implementation
     // through the normal desktop-control state, but must not claim the user's
     // machine-wide shortcuts and collide with that other process.
-    let global_shortcuts = if std::env::var("COMPUTER_USE_FULL_PRODUCT_E2E").as_deref() == Ok("1") {
+    let global_shortcuts = if full_product_e2e {
         tauri_plugin_global_shortcut::Builder::new().build()
     } else {
         let desktop_control_emergency_stop_shortcut: tauri_plugin_global_shortcut::Shortcut =
@@ -979,7 +980,23 @@ pub fn run() {
         .register_uri_scheme_protocol("artifact", |ctx, request| {
             artifacts::handle_request(ctx.app_handle().state::<AppState>().inner(), &request)
         })
-        .setup(|app| {
+        .setup(move |app| {
+            if full_product_e2e && app.get_webview_window("main").is_none() {
+                eprintln!("full product app had no main webview; creating the acceptance window");
+                tauri::WebviewWindowBuilder::new(
+                    app,
+                    "main",
+                    tauri::WebviewUrl::External(
+                        "http://127.0.0.1:1420/"
+                            .parse()
+                            .expect("full product dev URL must be valid"),
+                    ),
+                )
+                .title("Little Monkey")
+                .inner_size(1440.0, 800.0)
+                .build()
+                .expect("full product main window must be creatable");
+            }
             // Keep the native-skill registry live for external edits and
             // cross-window updates. Workspace restoration below triggers a
             // second sync once the primary root is known.
