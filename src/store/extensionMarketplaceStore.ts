@@ -104,42 +104,47 @@ function automaticApproval(preview: ExtensionPreview): ExtensionApproval | null 
   };
 }
 
-async function previewUpdateCandidate(
-  registry: MarketplaceRegistry,
-  entry: ExtensionRegistryEntry,
-  installed: ExtensionDetail,
-): Promise<ExtensionUpdateCandidate> {
-  try {
-    const downloaded = await previewMarketplaceInstall(registry, entry);
-    const runtimePreview = await executableExtensionsClient.previewUpdate(downloaded.source_path);
-    const safety = isSafeAutomaticUpdate(runtimePreview, installed, entry);
-    const reasons = [...safety.reasons];
-    if (automaticApproval(runtimePreview) === null) reasons.push("existing host-bound permission must be reviewed manually");
-    return {
-      installed,
-      entry,
-      registry,
-      safe_auto_update: safety.safe && automaticApproval(runtimePreview) !== null,
-      reasons,
-    };
-  } catch (error) {
-    return { installed, entry, registry, safe_auto_update: false, reasons: [errorMessage(error)] };
-  }
-}
-
-async function computeUpdates(
+/** Catalog/update discovery is intentionally metadata-only. A verified M4
+ * snapshot is enough to report that a newer immutable artifact exists, but it
+ * is not enough to decide executable-runtime safety. That second decision is
+ * deferred until the user opens Review or has explicitly opted into
+ * `automatic_safe`, preventing passive Settings browsing from causing network
+ * permission prompts/downloads. */
+function metadataUpdates(
   registries: MarketplaceRegistry[],
   installed: ExtensionDetail[],
-): Promise<ExtensionUpdateCandidate[]> {
+): ExtensionUpdateCandidate[] {
   const output: ExtensionUpdateCandidate[] = [];
   for (const entry of latestEntries(registries)) {
     const current = installedForEntry(installed, entry);
     if (!current || compareSemver(entry.version, current.active_version) <= 0) continue;
     const registry = registryForEntry(registries, entry);
     if (!registry) continue;
-    output.push(await previewUpdateCandidate(registry, entry, current));
+    output.push({
+      installed: current,
+      entry,
+      registry,
+      safe_auto_update: false,
+      reasons: ["runtime trust, compatibility and permission diff are evaluated when this release is reviewed"],
+    });
   }
   return output;
+}
+
+async function evaluateAutomaticCandidate(candidate: ExtensionUpdateCandidate): Promise<{
+  downloaded: MarketplaceInstallPreview;
+  runtimePreview: ExtensionPreview;
+  approval: ExtensionApproval | null;
+  safe: boolean;
+  reasons: string[];
+}> {
+  const downloaded = await previewMarketplaceInstall(candidate.registry, candidate.entry);
+  const runtimePreview = await executableExtensionsClient.previewUpdate(downloaded.source_path);
+  const safety = isSafeAutomaticUpdate(runtimePreview, candidate.installed, candidate.entry);
+  const approval = automaticApproval(runtimePreview);
+  const reasons = [...safety.reasons];
+  if (approval === null) reasons.push("existing host-bound permission must be reviewed manually");
+  return { downloaded, runtimePreview, approval, safe: safety.safe && approval !== null, reasons };
 }
 
 export const useExtensionMarketplaceStore = create<ExtensionMarketplaceState>((set, get) => ({
@@ -168,7 +173,7 @@ export const useExtensionMarketplaceStore = create<ExtensionMarketplaceState>((s
       ]);
       const registries = marketplaceRegistries(registryRecords);
       const catalog = latestEntries(registries);
-      const updates = get().updatePolicy === "off" ? [] : await computeUpdates(registries, installed);
+      const updates = get().updatePolicy === "off" ? [] : metadataUpdates(registries, installed);
       set({ registryRecords, registries, catalog, installed, updates, loading: false });
       if (get().updatePolicy === "automatic_safe") await get().applySafeUpdates();
     } catch (error) {
@@ -241,35 +246,46 @@ export const useExtensionMarketplaceStore = create<ExtensionMarketplaceState>((s
 
   applySafeUpdates: async () => {
     const failures: string[] = [];
+    const reviewRequired: string[] = [];
     let applied = 0;
+    // Every catalog candidate starts as metadata-only. Automatic mode is the
+    // explicit opt-in that authorizes the download/preview needed to determine
+    // whether it satisfies the narrow safe-update predicate.
     for (const candidate of get().updates) {
-      if (!candidate.safe_auto_update) continue;
       try {
-        // Re-download and re-preview immediately before mutation. A registry
-        // refresh, runtime trust change, permission diff, or digest mismatch can
-        // therefore turn an earlier safe result into a refusal rather than a race.
+        const evaluated = await evaluateAutomaticCandidate(candidate);
+        if (!evaluated.safe || !evaluated.approval) {
+          reviewRequired.push(`${candidate.entry.extension_id}: ${evaluated.reasons.join("; ") || "manual review required"}`);
+          continue;
+        }
+        // Re-check immediately before mutation rather than carrying a preview
+        // across another candidate or an arbitrary UI delay.
         const downloaded = await previewMarketplaceInstall(candidate.registry, candidate.entry);
         const runtimePreview = await executableExtensionsClient.previewUpdate(downloaded.source_path);
         const safety = isSafeAutomaticUpdate(runtimePreview, candidate.installed, candidate.entry);
         const approval = automaticApproval(runtimePreview);
-        if (!safety.safe || !approval) continue;
+        if (!safety.safe || !approval) {
+          reviewRequired.push(`${candidate.entry.extension_id}: ${[...safety.reasons, approval ? "" : "host-bound permission requires review"].filter(Boolean).join("; ")}`);
+          continue;
+        }
         await executableExtensionsClient.update(downloaded.source_path, approval);
         applied += 1;
       } catch (error) {
         failures.push(`${candidate.entry.extension_id}: ${errorMessage(error)}`);
       }
     }
-    if (applied > 0 || failures.length > 0) {
+    if (applied > 0 || failures.length > 0 || reviewRequired.length > 0) {
       set({
         notice: applied > 0 ? `Applied ${applied} safe executable extension update${applied === 1 ? "" : "s"}.` : get().notice,
         error: failures.length > 0 ? failures.join("\n") : get().error,
       });
     }
-    // Avoid recursion: update state directly instead of calling refreshAll(),
-    // which would call applySafeUpdates again while the policy is automatic.
     try {
       const installed = await executableExtensionsClient.list();
-      const updates = await computeUpdates(get().registries, installed);
+      const updates = metadataUpdates(get().registries, installed).map((candidate) => {
+        const detail = reviewRequired.find((reason) => reason.startsWith(`${candidate.entry.extension_id}: `));
+        return detail ? { ...candidate, reasons: [detail.slice(candidate.entry.extension_id.length + 2)] } : candidate;
+      });
       set({ installed, updates });
     } catch (error) {
       set({ error: errorMessage(error) });
