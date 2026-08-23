@@ -153,7 +153,12 @@ def main() -> int:
         start_new_session=(os.name != "nt"),
     )
     try:
-        build_deadline = time.monotonic() + args.timeout
+        # The Tauri CLI compiles the full Windows app inside this subprocess.
+        # Its final cargo line can reach a redirected log a few seconds after
+        # the nominal build window, so leave a bounded grace period before
+        # treating a missing launch marker as a build failure. The workflow's
+        # job timeout remains the outer bound for a genuinely stuck build.
+        build_deadline = time.monotonic() + args.timeout + 300
         acceptance_deadline: float | None = None
         while not args.report.is_file():
             if app.poll() is not None and not args.report.is_file():
