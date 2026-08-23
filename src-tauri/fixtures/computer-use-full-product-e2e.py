@@ -79,10 +79,6 @@ def main() -> int:
         tauri_config = json.loads((repo / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
         tauri_config["build"]["beforeDevCommand"] = ""
         tauri_config["build"]["devUrl"] = "http://127.0.0.1:1420"
-        # Let the full-product setup hook create the acceptance window. This
-        # avoids a config-created window retaining the normal app URL before
-        # the loopback frontend is available.
-        tauri_config["app"]["windows"] = []
         config_path.write_text(json.dumps(tauri_config), encoding="utf-8")
     command = app_command.split() if app_command else [
         pnpm,
@@ -130,7 +126,6 @@ def main() -> int:
         terminate(fixture)
         if config_path:
             config_path.unlink(missing_ok=True)
-        capability_path.unlink(missing_ok=True)
         return 1
     if frontend_process.poll() is not None:
         frontend_log.flush()
@@ -163,6 +158,24 @@ def main() -> int:
     ])
     capability_path.unlink(missing_ok=True)
     capability_path.write_text(json.dumps(capability), encoding="utf-8")
+    # Declare both the capability and the loopback URL before Tauri creates the
+    # webview. Runtime ACL injection is useful for commands registered after
+    # startup, but remote-origin IPC must be associated with the initial window
+    # during app configuration on Windows WebView2.
+    tauri_config["app"]["windows"] = [{
+        "label": "main",
+        "title": "Little Monkey",
+        "url": "http://127.0.0.1:1420/",
+        "width": 1440,
+        "height": 800,
+        "minWidth": 1400,
+        "minHeight": 600,
+        "center": True,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": True,
+    }]
+    tauri_config["app"]["security"]["capabilities"] = ["computer-use-full-product-e2e"]
+    config_path.write_text(json.dumps(tauri_config), encoding="utf-8")
     app_log = app_log_path.open("w", encoding="utf-8")
     app = subprocess.Popen(
         command,
@@ -239,6 +252,7 @@ def main() -> int:
         terminate(fixture)
         if config_path:
             config_path.unlink(missing_ok=True)
+        capability_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
