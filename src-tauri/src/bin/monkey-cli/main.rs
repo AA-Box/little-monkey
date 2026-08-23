@@ -569,6 +569,39 @@ enum TaskCmd {
         #[arg(long)]
         cron: String,
     },
+    /// Start a durable Universal Autonomous Task Coordinator run.
+    Start {
+        objective: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show durable autonomous-task runs.
+    Status {
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print task events once, or keep following until the run is terminal.
+    Attach {
+        run_id: String,
+        #[arg(long)]
+        follow: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Append user guidance to a task's durable event stream.
+    Guide { run_id: String, guidance: String },
+    /// Pause a queued or running task.
+    Pause { run_id: String },
+    /// Resume a paused task.
+    Resume { run_id: String },
+    /// Cancel a task and record the cancellation request.
+    Cancel { run_id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1592,6 +1625,22 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             TaskCmd::Conformance { fixture } => task::conformance(fixture),
             TaskCmd::List => task::list(),
             TaskCmd::Schedule { name_or_path, cron } => task::schedule(name_or_path, cron),
+            TaskCmd::Start {
+                objective,
+                target,
+                workspace,
+                json,
+            } => task::autonomous_start(objective, target, workspace.as_deref(), *json),
+            TaskCmd::Status { run_id, json } => task::autonomous_status(run_id.as_deref(), *json),
+            TaskCmd::Attach {
+                run_id,
+                follow,
+                json,
+            } => task::autonomous_attach(run_id, *follow, *json),
+            TaskCmd::Guide { run_id, guidance } => task::autonomous_guide(run_id, guidance),
+            TaskCmd::Pause { run_id } => task::autonomous_pause(run_id),
+            TaskCmd::Resume { run_id } => task::autonomous_resume(run_id),
+            TaskCmd::Cancel { run_id } => task::autonomous_cancel(run_id),
         },
         Cmd::Workflow(action) => {
             let data_dir = app_data_dir()

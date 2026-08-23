@@ -54,6 +54,7 @@ use crate::durable_run::CliRunEventSink;
 use little_monkey_lib::channels::policy::{AccessPolicy, ChannelAccessPolicy, GroupActivation};
 use little_monkey_lib::channels::routing::{ChannelRoute, RouteScope, RouteTarget};
 use little_monkey_lib::channels::types::{ChannelHealth, ChannelKind};
+use little_monkey_lib::run_protocol::RunEvent;
 
 use super::adapters::telegram::TelegramAdapter;
 use super::channel_adapter::{AdapterConfig, ChannelAdapter};
@@ -583,6 +584,389 @@ fn model_fixture() -> HttpFixture {
     .expect("bind the model fixture")
 }
 
+/// The autonomous coordinator fixture uses the product's real model boundary
+/// as well. The planner response deliberately asks for two worktree workers so
+/// the test exercises the resident daemon, parallel scheduling, worktree
+/// creation/application, integration, configured verification, and structured
+/// review in one process-level run.
+fn autonomous_model_fixture() -> HttpFixture {
+    let planner = serde_json::json!({
+        "plan": {
+            "planId": "autonomous-e2e-plan",
+            "strategy": "PARALLEL_DELEGATE",
+            "revision": 1,
+            "rationale": "Two independent repository workers feed one integration barrier.",
+            "nodes": [
+                {
+                    "nodeId": "implement-frontend",
+                    "taskClass": "implementation",
+                    "objective": "Set a.txt to the initial frontend slice A1.",
+                    "dependencies": [],
+                    "mutationScope": ["a.txt"],
+                    "isolation": "worktree",
+                    "relevantFiles": ["a.txt"],
+                    "capabilities": ["read", "mutate"],
+                    "executionPlacement": {"kind": "worktree", "targetId": "local", "nodeId": "implement-frontend"},
+                    "executionRequirements": {"needsWorkspaceWrite": true, "needsNetwork": false, "isolation": "worktree"}
+                },
+                {
+                    "nodeId": "implement-backend",
+                    "taskClass": "implementation",
+                    "objective": "Set b.txt to the intentionally incomplete backend slice B1.",
+                    "dependencies": [],
+                    "mutationScope": ["b.txt"],
+                    "isolation": "worktree",
+                    "relevantFiles": ["b.txt"],
+                    "capabilities": ["read", "mutate"],
+                    "executionPlacement": {"kind": "worktree", "targetId": "local", "nodeId": "implement-backend"},
+                    "executionRequirements": {"needsWorkspaceWrite": true, "needsNetwork": false, "isolation": "worktree"}
+                },
+                {
+                    "nodeId": "integrate",
+                    "taskClass": "integration",
+                    "objective": "Integrate the worker results after scope inspection.",
+                    "dependencies": ["implement-frontend", "implement-backend"],
+                    "mutationScope": ["workspace"],
+                    "isolation": "shared",
+                    "relevantFiles": ["a.txt", "b.txt"],
+                    "capabilities": ["read", "mutate"],
+                    "executionRequirements": {"needsWorkspaceWrite": true, "needsNetwork": false, "isolation": "shared"}
+                },
+                {
+                    "nodeId": "verify",
+                    "taskClass": "verification",
+                    "objective": "Run the configured verification command.",
+                    "dependencies": ["integrate"],
+                    "mutationScope": ["workspace"],
+                    "isolation": "shared",
+                    "relevantFiles": ["a.txt", "b.txt"],
+                    "capabilities": ["read", "verify"]
+                },
+                {
+                    "nodeId": "review",
+                    "taskClass": "review",
+                    "objective": "Return a structured review of the integrated repository.",
+                    "dependencies": ["verify"],
+                    "mutationScope": ["workspace"],
+                    "isolation": "shared",
+                    "relevantFiles": ["a.txt", "b.txt"],
+                    "capabilities": ["read", "verify"]
+                }
+            ]
+        },
+        "acceptanceCriteria": [
+            {"id": "verify-files", "description": "The configured verification command passes for both files.", "method": "verification_command", "blocking": true, "provenance": {"kind": "planner", "fragment": "configured verification"}},
+            {"id": "review-files", "description": "The structured review passes against the actual diff.", "method": "review", "blocking": true, "provenance": {"kind": "planner", "fragment": "structured review"}},
+            {"id": "scope-files", "description": "Workers stay inside their individual file scopes.", "method": "workspace_boundary", "blocking": true, "provenance": {"kind": "planner", "fragment": "file scopes"}}
+        ],
+        "planningContext": {"relevantFiles": ["a.txt", "b.txt"]},
+        "summary": "parallel autonomous coordinator fixture"
+    });
+    let review = serde_json::json!({
+        "verdict": "pass",
+        "findings": [],
+        "filesReviewed": ["a.txt", "b.txt"],
+        "acceptanceCriteria": ["verify-files", "review-files", "scope-files"],
+        "securityFindings": [],
+        "testCoverageFindings": []
+    });
+    let sent_mutations = Arc::new(std::sync::Mutex::new(
+        std::collections::HashSet::<String>::new(),
+    ));
+    HttpFixture::spawn(move |head, body, _index| {
+        if !head.contains("/chat/completions") {
+            return json_response(r#"{"error":"unexpected autonomous model route"}"#);
+        }
+        let prompt_text = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|request| request["messages"].as_array().cloned())
+            .map(|messages| messages.iter().filter_map(|message| message["content"].as_str()).collect::<Vec<_>>().join("\n"))
+            .unwrap_or_else(|| body.to_string());
+        let implementation = prompt_text.contains("Universal AutonomousTask phase: implementation");
+        let repair = prompt_text.contains("Diagnose and repair");
+        let current_node_contract = prompt_text
+            .rsplit("Frozen node contract (do not change it):")
+            .next()
+            .unwrap_or(&prompt_text);
+        let mut path = if current_node_contract.contains("implement-backend")
+            || current_node_contract.contains("Set b.txt")
+            || (implementation && current_node_contract.contains("b.txt"))
+        {
+            "b.txt"
+        } else {
+            "a.txt"
+        };
+        if implementation {
+            let mut sent = sent_mutations.lock().expect("mutation fixture lock");
+            if repair && sent.contains("b.txt:repair") {
+                path = "a.txt";
+            }
+            let key = format!("{path}:{}", if repair { "repair" } else { "initial" });
+            if sent.insert(key.clone()) {
+                let content = if repair { if path == "a.txt" { "A2\n" } else { "B2\n" } } else if path == "a.txt" { "A1\n" } else { "B1\n" };
+                let arguments = serde_json::json!({ "path": path, "content": content }).to_string();
+                return sse_response(&[
+                    serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": format!("call-{key}"), "type": "function", "function": {"name": "write_file", "arguments": arguments}}]}}]}),
+                    serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                ]);
+            }
+        }
+        let content = if prompt_text.contains("phase: review") || prompt_text.contains("bounded 'review' phase") {
+            review.to_string()
+        } else if prompt_text.contains("phase: planner") {
+            planner.to_string()
+        } else {
+            "autonomous phase completed".to_string()
+        };
+        sse_response(&[
+            serde_json::json!({"choices": [{"index": 0, "delta": {"content": content}}]}),
+            serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        ])
+    })
+    .expect("bind the autonomous model fixture")
+}
+
+fn autonomous_e2e_git(root: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .expect("start git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn run_autonomous_coordinator_end_to_end(root: &Path) {
+    if !isolation_is_real(root) {
+        println!(
+            "{SKIPPED} on this platform: autonomous coordinator profile isolation is unavailable"
+        );
+        return;
+    }
+    let model = autonomous_model_fixture();
+    let workspace = root.join("autonomous-workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    autonomous_e2e_git(&workspace, &["init", "-q"]);
+    autonomous_e2e_git(&workspace, &["config", "user.email", "e2e@example.test"]);
+    autonomous_e2e_git(&workspace, &["config", "user.name", "Autonomous E2E"]);
+    std::fs::write(workspace.join("a.txt"), "A0\n").expect("a.txt");
+    std::fs::write(workspace.join("b.txt"), "B0\n").expect("b.txt");
+    autonomous_e2e_git(&workspace, &["add", "a.txt", "b.txt"]);
+    autonomous_e2e_git(&workspace, &["commit", "-q", "-m", "fixture baseline"]);
+
+    let roots = little_monkey_lib::app_paths::ensure_agent_config_roots().expect("config roots");
+    let data_dir = little_monkey_lib::app_paths::data_dir().expect("data dir");
+    std::fs::create_dir_all(&data_dir).expect("data directory");
+    let workspace_key = workspace.canonicalize().expect("canonical workspace");
+    let verify_config = serde_json::json!({
+        workspace_key.to_string_lossy(): {
+            "commands": [{
+                "id": "autonomous-e2e-verify",
+                "label": "Autonomous E2E verification",
+                "command": "git diff --check -- && git grep -F -e \"A2\" -- a.txt && git grep -F -e \"B2\" -- b.txt",
+                "kind": "custom",
+                "enabled": true,
+                "timeoutSecs": 30
+            }]
+        }
+    });
+    std::fs::write(
+        data_dir.join("verify_configs.json"),
+        serde_json::to_vec_pretty(&verify_config).expect("verify config JSON"),
+    )
+    .expect("verify config");
+    assert_eq!(
+        crate::verify_cli::enabled_commands_at(
+            &data_dir.join("verify_configs.json"),
+            &workspace_key
+        )
+        .len(),
+        1,
+        "the real CLI verification config was not visible to the coordinator"
+    );
+    let paths = DaemonPaths::under(&roots.legacy);
+    paths.ensure().expect("daemon paths");
+    let config = DaemonConfig::default();
+    config.save(&paths).expect("daemon config");
+    let cli = std::env::var(CLI_ENV).expect("real monkey-cli path");
+    let target = format!("local-url:{}|autonomous-e2e", model.base);
+    let started = std::process::Command::new(cli)
+        .args([
+            "task",
+            "start",
+            "Run the autonomous coordinator fixture",
+            "--target",
+            &target,
+            "--workspace",
+            workspace.to_str().expect("workspace UTF-8"),
+            "--json",
+        ])
+        .current_dir(&workspace)
+        .output()
+        .expect("start autonomous task process");
+    assert!(
+        started.status.success(),
+        "task start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let queued: serde_json::Value = serde_json::from_slice(&started.stdout).expect("queued JSON");
+    let job_id = queued["job_id"]
+        .as_str()
+        .expect("queued job id")
+        .to_string();
+    let run_id = queued["run_id"]
+        .as_str()
+        .expect("queued run id")
+        .to_string();
+
+    let mut engine = DaemonEngine::new(
+        DaemonStore::open(&paths).expect("engine store"),
+        SharedLedger::open(&paths.ledger_db).expect("engine ledger"),
+        paths.clone(),
+        config,
+        RealProcessAdapter::current().expect("process adapter"),
+        SilentNotifier,
+        SystemClock,
+        "autonomous-e2e-daemon".to_string(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let terminal = loop {
+        engine.tick().expect("daemon tick");
+        let state = DaemonStore::open(&paths)
+            .expect("state read")
+            .get_job(&job_id)
+            .expect("job read")
+            .expect("job")
+            .state;
+        if matches!(
+            state,
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled
+        ) {
+            break state;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "autonomous task did not finish: {state:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    };
+    let diagnostic_events = SharedLedger::open(&paths.ledger_db)
+        .expect("diagnostic ledger")
+        .run_ledger()
+        .expect("diagnostic run ledger")
+        .load_events(&run_id, 0, 1_000)
+        .expect("diagnostic events");
+    assert_eq!(
+        terminal,
+        JobState::Succeeded,
+        "autonomous task failed; log: {}\nevents: {}",
+        std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default(),
+        serde_json::to_string(&diagnostic_events).unwrap_or_default()
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("a.txt")).expect("a.txt result"),
+        "A2\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("b.txt")).expect("b.txt result"),
+        "B2\n"
+    );
+    let events = SharedLedger::open(&paths.ledger_db)
+        .expect("ledger")
+        .run_ledger()
+        .expect("run ledger")
+        .load_events(&run_id, 0, 1_000)
+        .expect("run events");
+    let rendered = serde_json::to_string(&events).expect("event JSON");
+    assert!(
+        rendered.contains("\"parallel\":true"),
+        "parallel workers missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"isolation\":\"worktree\""),
+        "worktree workers missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"verification_evidence\""),
+        "verification evidence missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"authoritative\":true"),
+        "authoritative evidence missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"review_evidence\""),
+        "review evidence missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"verdict\":\"pass\""),
+        "structured review missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"repair_of\""),
+        "verification did not trigger bounded repair: {rendered}"
+    );
+    let worker_mutations = events
+        .iter()
+        .filter_map(|event| {
+            if let RunEvent::TaskEvent {
+                event_type,
+                payload,
+                ..
+            } = &event.event
+            {
+                (event_type == "node_mutation"
+                    && payload.get("parallel") != Some(&serde_json::Value::Bool(true)))
+                .then_some(payload)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let parallel_mutations = events
+        .iter()
+        .filter_map(|event| {
+            if let RunEvent::TaskEvent {
+                event_type,
+                payload,
+                ..
+            } = &event.event
+            {
+                (event_type == "node_mutation" && payload.get("integration_revision").is_some())
+                    .then_some(payload)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        parallel_mutations.len() >= 2,
+        "isolated worker mutation evidence missing: {rendered}"
+    );
+    assert!(
+        parallel_mutations
+            .iter()
+            .all(|payload| payload["before_revision"].is_string()
+                && payload["patch_digest"]
+                    .as_str()
+                    .is_some_and(|digest| !digest.is_empty())
+                && payload["changed_files"].as_array().is_some()),
+        "worker evidence is not revision-bound: {parallel_mutations:?}"
+    );
+    assert!(
+        !worker_mutations.is_empty(),
+        "mutation-bearing worker events missing: {rendered}"
+    );
+    assert!(
+        model.count() >= 10,
+        "coordinator did not run planner, workers, repair, integration, verify, and review"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The isolated profile
 // ---------------------------------------------------------------------------
@@ -740,6 +1124,17 @@ fn a_slack_message_becomes_an_agent_reply_end_to_end() {
                 run_end_to_end(&root, world).await;
             })
         },
+    );
+}
+
+/// The real CLI start path queues an autonomous coordinator and the resident
+/// daemon executes the actual process, worktree, integration, verification,
+/// and structured-review boundaries against a temporary Git repository.
+#[test]
+fn autonomous_coordinator_runs_through_the_resident_daemon_end_to_end() {
+    in_isolated_process(
+        "autonomous_coordinator_runs_through_the_resident_daemon_end_to_end",
+        |root| Box::pin(async move { run_autonomous_coordinator_end_to_end(&root).await }),
     );
 }
 
