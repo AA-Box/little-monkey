@@ -50,7 +50,20 @@ def main() -> int:
     frontend_log_path.unlink(missing_ok=True)
 
     python = os.environ.get("COMPUTER_USE_FIXTURE_PYTHON", sys.executable)
-    fixture = subprocess.Popen([python, str(args.fixture)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if os.name == "nt":
+        fixture_command = [
+            shutil.which("powershell.exe") or "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-STA",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(args.fixture.with_name("computer-use-test-app-windows.ps1")),
+        ]
+    else:
+        fixture_command = [python, str(args.fixture)]
+    fixture = subprocess.Popen(fixture_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     repo = Path(__file__).resolve().parents[2]
     pnpm = shutil.which("pnpm") or shutil.which("pnpm.cmd") or "pnpm"
     app_command = os.environ.get("COMPUTER_USE_FULL_PRODUCT_COMMAND")
