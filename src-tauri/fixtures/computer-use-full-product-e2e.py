@@ -14,6 +14,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -64,14 +65,24 @@ def main() -> int:
         "127.0.0.1",
         "--port",
         "1420",
+        "--strictPort",
     ]
+    config_path: Path | None = None
+    if app_command is None:
+        config_fd, config_name = tempfile.mkstemp(prefix="little-monkey-full-product-", suffix=".json")
+        os.close(config_fd)
+        config_path = Path(config_name)
+        config_path.write_text(
+            json.dumps({"build": {"beforeDevCommand": "", "devUrl": "http://127.0.0.1:1420"}}),
+            encoding="utf-8",
+        )
     command = app_command.split() if app_command else [
         pnpm,
         "tauri",
         "dev",
         "--no-watch",
         "--config",
-        '{"build":{"beforeDevCommand":"","devUrl":"http://127.0.0.1:1420"}}',
+        str(config_path),
     ]
     environment = os.environ.copy()
     environment.update({
@@ -109,6 +120,8 @@ def main() -> int:
         terminate(frontend_process)
         frontend_log.close()
         terminate(fixture)
+        if config_path:
+            config_path.unlink(missing_ok=True)
         return 1
     if frontend_process.poll() is not None:
         frontend_log.flush()
@@ -118,6 +131,8 @@ def main() -> int:
         print(f"frontend dev server exited (exit={frontend_process.poll()})", file=sys.stderr)
         frontend_log.close()
         terminate(fixture)
+        if config_path:
+            config_path.unlink(missing_ok=True)
         return 1
 
     app_log = app_log_path.open("w", encoding="utf-8")
@@ -179,6 +194,8 @@ def main() -> int:
         terminate(frontend_process)
         frontend_log.close()
         terminate(fixture)
+        if config_path:
+            config_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
