@@ -12,6 +12,13 @@ type NativeTarget = {
 
 type Session = { sessionId: string; allowedWindows: string[] };
 
+type ComputerUseFailureLike = {
+  code?: unknown;
+  inputSent?: unknown;
+  safeToRetry?: unknown;
+  phase?: unknown;
+};
+
 const turnId = 'computer-use-full-product-golden';
 
 function toolCall(name: string, args: Record<string, unknown>, index: number): ToolCall {
@@ -28,6 +35,24 @@ function parseResult(result: string): any {
     throw new Error(typeof parsed.error === 'string' ? parsed.error : JSON.stringify(parsed.error));
   }
   return parsed;
+}
+
+function failureFromError(error: unknown): ComputerUseFailureLike | null {
+  if (!(error instanceof Error)) return null;
+  try {
+    const parsed = JSON.parse(error.message) as unknown;
+    return parsed && typeof parsed === 'object' ? parsed as ComputerUseFailureLike : null;
+  } catch {
+    return null;
+  }
+}
+
+function isInputSentUnverified(error: unknown): boolean {
+  const failure = failureFromError(error);
+  return failure?.code === 'INPUT_SENT_UNVERIFIED'
+    && failure.inputSent === true
+    && failure.safeToRetry === false
+    && failure.phase === 'verify';
 }
 
 /** Runs only when the CI harness explicitly enables the product golden. Every
@@ -47,6 +72,7 @@ export async function runComputerUseFullProductE2e(): Promise<void> {
     screenshot_received_by_frontend: false,
     screenshot_artifact_id: '',
     screenshot_base64: '',
+    unverified_actions_resolved_by_reobservation: [] as string[],
     model_loop: { kind: 'deterministic-frontend-model-tool-loop', completed: false, tool_calls: [] as string[] },
     tool_calls: [] as Array<{ name: string; result: string; durationMs: number }>,
     error: null as string | null,
@@ -133,29 +159,73 @@ export async function runComputerUseFullProductE2e(): Promise<void> {
       inspection = await dispatch('computer_inspect', common);
       const darkAfter = elements().find((element) => element.label === 'Dark mode');
       trace.postconditions.dark_mode = /on|true|checked|togglestate\.on|1/i.test(String(darkAfter?.value ?? ''));
+
       const profileValue = `frontend-real-os-golden-${pid}`;
-      const setResult = await dispatch('computer_set_value', {
-        ...common,
-        element_id: profile.id,
-        value: profileValue,
-      });
-      trace.state_verified = Boolean(setResult.stateVerified);
-      await dispatch('computer_click', {
-        ...common,
-        element_id: save.id,
-        button: 'left',
-        expected_value: save.value ?? save.label,
-      });
-      inspection = await dispatch('computer_inspect', common);
-      trace.postconditions.profile = String((elements().find((element) => element.id === profile.id)?.value ?? ''));
+      let profileVerified = false;
+      let setValueUnverified: unknown = null;
+      try {
+        const setResult = await dispatch('computer_set_value', {
+          ...common,
+          element_id: profile.id,
+          value: profileValue,
+        });
+        profileVerified = Boolean(setResult.stateVerified);
+      } catch (error) {
+        if (!isInputSentUnverified(error)) throw error;
+        // The mutation boundary has already been crossed. Never resend the
+        // value. Resolve the typed uncertainty only by fresh observations.
+        setValueUnverified = error;
+      }
+
+      const observedProfile = () => elements().find((element) => element.id === profile.id)
+        ?? elements().find((element) => element.label === 'Profile name' && /edit|text/i.test(String(element.role)));
+      for (let attempt = 0; !profileVerified && attempt < 10; attempt += 1) {
+        if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 200));
+        inspection = await dispatch('computer_inspect', common);
+        profileVerified = String(observedProfile()?.value ?? '') === profileValue;
+      }
+      if (!profileVerified) {
+        if (setValueUnverified) throw setValueUnverified;
+        throw new Error('profile value was not re-observed after computer_set_value');
+      }
+      if (setValueUnverified) {
+        trace.unverified_actions_resolved_by_reobservation.push('computer_set_value');
+      }
+      trace.postconditions.profile = String(observedProfile()?.value ?? '');
+
+      let saveUnverified: unknown = null;
+      try {
+        await dispatch('computer_click', {
+          ...common,
+          element_id: save.id,
+          button: 'left',
+        });
+      } catch (error) {
+        if (!isInputSentUnverified(error)) throw error;
+        // "Saved" lives on a different semantic element than the button.
+        // Do not click again; prove that cross-element postcondition by
+        // re-inspection instead.
+        saveUnverified = error;
+      }
+
       const savedObserved = () => elements().some((element) => String(element.label ?? '').trim().toLowerCase() === 'saved'
         || String(element.value ?? '').trim().toLowerCase() === 'saved');
+      inspection = await dispatch('computer_inspect', common);
       trace.postconditions.saved = savedObserved();
       for (let attempt = 0; !trace.postconditions.saved && attempt < 9; attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 200));
         inspection = await dispatch('computer_inspect', common);
         trace.postconditions.saved = savedObserved();
       }
+      if (!trace.postconditions.saved) {
+        if (saveUnverified) throw saveUnverified;
+        throw new Error('Saved status was not re-observed after computer_click');
+      }
+      if (saveUnverified) {
+        trace.unverified_actions_resolved_by_reobservation.push('computer_click:Save profile');
+      }
+
+      trace.state_verified = profileVerified && trace.postconditions.saved;
       const screenshot = await dispatch('computer_screenshot', common);
       trace.screenshot_received_by_frontend = typeof screenshot.contentBase64 === 'string' && screenshot.contentBase64.length > 100;
       trace.screenshot_artifact_id = String(screenshot.artifactId ?? '');
