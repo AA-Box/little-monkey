@@ -4,7 +4,6 @@ import { mkdir, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
 
 import {
   executableExtensionsClient,
-  type ExtensionApproval,
   type ExtensionDetail,
   type ExtensionManifest,
   type ExtensionPreview,
@@ -24,10 +23,14 @@ import type {
  */
 export const M4_EXTENSION_PACKAGE_PREFIX = "extension.";
 export const LMX_SCHEMA = 1;
-export const MAX_LMX_DOWNLOAD_CHARS = 12 * 1024 * 1024;
+/** `tool_web_fetch` has a host-owned 5 MiB response-body ceiling. Keep the
+ * deterministic package comfortably below it even after base64/JSON overhead. */
+export const MAX_LMX_DOWNLOAD_CHARS = 5 * 1024 * 1024;
 export const MAX_LMX_FILES = 128;
-export const MAX_LMX_FILE_BYTES = 8 * 1024 * 1024;
-export const MAX_LMX_DECODED_BYTES = 24 * 1024 * 1024;
+export const MAX_LMX_PATH_CHARS = 512;
+export const MAX_LMX_FILE_BYTES = 3 * 1024 * 1024;
+export const MAX_LMX_DECODED_BYTES = 3 * 1024 * 1024;
+export const MAX_LMX_MANIFEST_BYTES = 256 * 1024;
 
 interface RegistryPackageVersionWire {
   version: string;
@@ -237,7 +240,7 @@ function canonical(value: unknown): string {
 
 function safeRelativePath(path: string): string {
   const normalized = path.replaceAll("\\", "/");
-  if (!normalized || normalized.startsWith("/") || normalized.includes("\0") || /^[A-Za-z]:/.test(normalized)) {
+  if (!normalized || normalized.length > MAX_LMX_PATH_CHARS || normalized.startsWith("/") || normalized.includes("\0") || /^[A-Za-z]:/.test(normalized)) {
     throw new Error(`Unsafe .lmx path: ${path}`);
   }
   const parts = normalized.split("/");
@@ -249,6 +252,9 @@ export function validateLmxEnvelope(envelope: LmxEnvelope): void {
   if (envelope.schema_version !== LMX_SCHEMA) throw new Error(`Unsupported .lmx schema ${String(envelope.schema_version)}.`);
   if (!envelope.manifest?.extension_id || !envelope.manifest?.version || !envelope.files_base64 || typeof envelope.files_base64 !== "object") {
     throw new Error("Malformed .lmx package.");
+  }
+  if (new TextEncoder().encode(canonical(envelope.manifest)).byteLength > MAX_LMX_MANIFEST_BYTES) {
+    throw new Error(".lmx manifest exceeds its bounded metadata limit.");
   }
   const files = Object.entries(envelope.files_base64);
   if (files.length === 0 || files.length > MAX_LMX_FILES) throw new Error("Invalid .lmx file count.");
@@ -362,18 +368,6 @@ export function isSafeAutomaticUpdate(
     reasons.push("runtime requires a new trust/risk acknowledgement");
   }
   return { safe: reasons.length === 0, reasons };
-}
-
-export function approvalForExistingGrants(preview: ExtensionPreview): ExtensionApproval {
-  return {
-    approval_digest: preview.approval_digest,
-    grants: preview.permissions
-      .filter((permission) => permission.granted)
-      .map((permission) => ({ permission_id: permission.permission_id, binding: permission.binding_label })),
-    allow_unsigned: false,
-    allow_untrusted: false,
-    allow_high_risk: false,
-  };
 }
 
 export function marketplaceDiagnostic(records: AdditionalRegistryRecord[]): string[] {
