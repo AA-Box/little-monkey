@@ -38,6 +38,8 @@ export interface TaskNodeResult {
   approval?: { requestId: string; operationDigest: string; expiresAtMs: number; confirmationPhrase?: string };
   deliveryStep?: "commit" | "push" | "create_draft_pr" | "update_draft_pr";
   review?: StructuredReviewResult;
+  resultId?: string;
+  reviewRequired?: boolean;
 }
 
 export interface StructuredReviewResult { verdict: "pass" | "changes_required"; findings: Array<{ severity: "blocking" | "warning" | "suggestion"; path: string; title: string; body: string }>; filesReviewed: string[]; acceptanceCriteria: string[]; securityFindings: string[]; testCoverageFindings: string[]; }
@@ -164,7 +166,7 @@ function defaultAutonomousTaskPlacementAdapters(): AutonomousTaskPlacementAdapte
       };
     }
     try {
-      return await invoke<TaskNodeResult>("autonomous_task_place_node", { request: { kind, targetId, runSpec: spec } });
+      return await invoke<TaskNodeResult>("autonomous_task_place_node", { request: { targetId, runSpec: spec } });
     } catch (error) {
       const message = `${kind} execution failed: ${error instanceof Error ? error.message : String(error)}`;
       const lost = targetLost(error);
@@ -520,7 +522,7 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
         if ((task.budgetSnapshot.maxArtifactBytes ?? Number.MAX_SAFE_INTEGER) < (task.usage?.artifactBytes ?? 0)) task = { ...task, outcome: "BUDGET_EXHAUSTED", summary: "Artifact budget exhausted.", updatedAtMs: Date.now() };
         task = { ...task, artifacts: [...task.artifacts, ...(result.artifacts ?? [])], updatedAtMs: Date.now() };
         task = { ...task, workers: task.workers.map((entry) => entry.workerId === worker.workerId ? { ...entry, finishedAtMs: Date.now() } : entry), updatedAtMs: Date.now() };
-        task = { ...task, workers: task.workers.map((entry) => entry.workerId === worker.workerId ? { ...entry, worktree: result.worktree, changedFiles: result.changedFiles, mutation: result.mutation, artifacts: result.artifacts, resultSummary: result.summary.slice(0, 2_000), usage: result.usage } : entry), updatedAtMs: Date.now() };
+        task = { ...task, workers: task.workers.map((entry) => entry.workerId === worker.workerId ? { ...entry, worktree: result.worktree, changedFiles: result.changedFiles, mutation: result.mutation, artifacts: result.artifacts, resultId: result.resultId, resultSummary: result.summary.slice(0, 2_000), usage: result.usage } : entry), updatedAtMs: Date.now() };
         if (result.deliveryStep) task = { ...task, deliveryStep: result.deliveryStep };
         if (awaitingApproval && result.approval) task = { ...task, outcome: "WAITING_APPROVAL", waitingReason: result.summary, waitingApproval: { ...result.approval, nodeId: node.nodeId }, updatedAtMs: Date.now() };
         if (result.evidence) for (const evidence of result.evidence) {

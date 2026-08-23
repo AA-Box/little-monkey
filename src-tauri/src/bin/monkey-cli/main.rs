@@ -584,6 +584,9 @@ enum TaskCmd {
         objective: String,
         #[arg(long)]
         target: String,
+        /// Stable executor target id, distinct from `--target`'s model/provider.
+        #[arg(long = "executor-target")]
+        executor_target: Option<String>,
         #[arg(long)]
         workspace: Option<PathBuf>,
         #[arg(long)]
@@ -1638,9 +1641,16 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             TaskCmd::Start {
                 objective,
                 target,
+                executor_target,
                 workspace,
                 json,
-            } => task::autonomous_start(objective, target, workspace.as_deref(), *json),
+            } => task::autonomous_start(
+                objective,
+                target,
+                executor_target.as_deref(),
+                workspace.as_deref(),
+                *json,
+            ),
             TaskCmd::Status { run_id, json } => task::autonomous_status(run_id.as_deref(), *json),
             TaskCmd::Attach {
                 run_id,

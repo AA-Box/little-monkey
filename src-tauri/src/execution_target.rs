@@ -7,6 +7,7 @@
 //! shell command string.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{Display, Formatter};
@@ -15,7 +16,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
@@ -490,10 +491,43 @@ pub struct WorkspaceTransfer {
     pub kind: WorkspaceTransferKind,
     pub manifest: Vec<WorkspaceManifestEntry>,
     pub objects: Vec<WorkspaceObject>,
+    #[serde(default)]
+    pub object_hashes: BTreeSet<String>,
     pub tracked_diff: Option<WorkspaceObject>,
+    /// The exact frozen Git base, transported as a bundle and checked out at
+    /// the recorded commit on the executor.
+    #[serde(default)]
+    pub git_bundle: Option<WorkspaceObject>,
+    #[serde(default)]
+    pub tracked_diff_hash: Option<String>,
+    #[serde(default)]
+    pub git_bundle_hash: Option<String>,
     #[serde(default)]
     pub policy: WorkspacePolicy,
     pub limits: WorkspaceTransferLimits,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceManifestRequest {
+    pub schema_version: u32,
+    pub workspace_id: String,
+    pub snapshot_id: String,
+    pub base_snapshot_digest: String,
+    pub kind: WorkspaceTransferKind,
+    pub manifest: Vec<WorkspaceManifestEntry>,
+    pub object_hashes: BTreeSet<String>,
+    pub tracked_diff_hash: Option<String>,
+    pub git_bundle_hash: Option<String>,
+    pub limits: WorkspaceTransferLimits,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceMissingObjects {
+    pub workspace_id: String,
+    pub snapshot_id: String,
+    pub missing_hashes: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -690,7 +724,7 @@ impl WorkspaceTransfer {
         }
         manifest.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         objects.sort_by(|left, right| left.sha256.cmp(&right.sha256));
-        let (kind, tracked_diff) = if let Some(git_root) = git_root {
+        let (kind, tracked_diff, git_bundle) = if let Some(git_root) = git_root {
             if PathBuf::from(String::from_utf8_lossy(&git_root).trim()) == root {
                 let base_commit = String::from_utf8_lossy(&command_output(
                     "git",
@@ -728,6 +762,8 @@ impl WorkspaceTransfer {
                     (!value.is_empty()).then_some(value)
                 })
                 .collect::<Vec<_>>();
+                let bundle =
+                    command_output("git", &["bundle", "create", "-", "--all"], Some(&root))?;
                 let kind = if dirty {
                     WorkspaceTransferKind::DirtyGit {
                         base_commit,
@@ -747,12 +783,16 @@ impl WorkspaceTransfer {
                     sha256: digest(&diff),
                     bytes: diff,
                 });
-                (kind, tracked_diff)
+                let git_bundle = Some(WorkspaceObject {
+                    sha256: digest(&bundle),
+                    bytes: bundle,
+                });
+                (kind, tracked_diff, git_bundle)
             } else {
-                (WorkspaceTransferKind::ContentSnapshot, None)
+                (WorkspaceTransferKind::ContentSnapshot, None, None)
             }
         } else {
-            (WorkspaceTransferKind::ContentSnapshot, None)
+            (WorkspaceTransferKind::ContentSnapshot, None, None)
         };
         let base_snapshot_digest = manifest_digest(&manifest, &kind);
         let snapshot_id = format!("snapshot-{}", &base_snapshot_digest[..24]);
@@ -764,7 +804,11 @@ impl WorkspaceTransfer {
             kind,
             manifest,
             objects,
+            object_hashes: BTreeSet::new(),
             tracked_diff,
+            git_bundle,
+            tracked_diff_hash: None,
+            git_bundle_hash: None,
             policy: WorkspacePolicy::Cached,
             limits,
         };
@@ -851,7 +895,75 @@ impl WorkspaceTransfer {
                 ));
             }
         }
+        if let Some(bundle) = &self.git_bundle {
+            if digest(&bundle.bytes) != bundle.sha256
+                || bundle.bytes.len() as u64 > self.limits.max_total_bytes
+            {
+                return Err(TargetError::workspace_transfer_failed(
+                    "Git bundle digest or size is invalid",
+                ));
+            }
+        }
         Ok(())
+    }
+
+    pub fn manifest_request(&self) -> WorkspaceManifestRequest {
+        let object_hashes = if self.object_hashes.is_empty() {
+            self.objects
+                .iter()
+                .map(|object| object.sha256.clone())
+                .collect::<BTreeSet<_>>()
+        } else {
+            self.object_hashes.clone()
+        }
+        .into_iter()
+        .chain(
+            self.tracked_diff
+                .as_ref()
+                .map(|object| object.sha256.clone())
+                .or_else(|| self.tracked_diff_hash.clone()),
+        )
+        .chain(
+            self.git_bundle
+                .as_ref()
+                .map(|object| object.sha256.clone())
+                .or_else(|| self.git_bundle_hash.clone()),
+        )
+        .collect();
+        WorkspaceManifestRequest {
+            schema_version: self.schema_version,
+            workspace_id: self.workspace_id.clone(),
+            snapshot_id: self.snapshot_id.clone(),
+            base_snapshot_digest: self.base_snapshot_digest.clone(),
+            kind: self.kind.clone(),
+            manifest: self.manifest.clone(),
+            object_hashes,
+            tracked_diff_hash: self
+                .tracked_diff
+                .as_ref()
+                .map(|object| object.sha256.clone())
+                .or_else(|| self.tracked_diff_hash.clone()),
+            git_bundle_hash: self
+                .git_bundle
+                .as_ref()
+                .map(|object| object.sha256.clone())
+                .or_else(|| self.git_bundle_hash.clone()),
+            limits: self.limits.clone(),
+        }
+    }
+
+    pub fn all_objects(&self) -> impl Iterator<Item = &WorkspaceObject> {
+        self.objects
+            .iter()
+            .chain(self.tracked_diff.iter())
+            .chain(self.git_bundle.iter())
+    }
+
+    pub fn missing_objects_for(&self, available: &BTreeSet<String>) -> Vec<WorkspaceObject> {
+        self.all_objects()
+            .filter(|object| !available.contains(&object.sha256))
+            .cloned()
+            .collect()
     }
 
     pub fn missing_objects<'a>(&'a self, hashes: &BTreeSet<String>) -> Vec<&'a WorkspaceObject> {
@@ -869,6 +981,41 @@ impl WorkspaceTransfer {
             ));
         }
         fs::create_dir_all(destination)?;
+        let is_git = matches!(
+            self.kind,
+            WorkspaceTransferKind::CleanGit { .. } | WorkspaceTransferKind::DirtyGit { .. }
+        );
+        if is_git {
+            let bundle = self.git_bundle.as_ref().ok_or_else(|| {
+                TargetError::workspace_transfer_failed(
+                    "Git transfer omitted the exact base commit bundle",
+                )
+            })?;
+            let bundle_path = destination.join(".little-monkey-base.bundle");
+            fs::write(&bundle_path, &bundle.bytes)?;
+            command_output("git", &["init", "-q"], Some(destination))?;
+            let base_commit = match &self.kind {
+                WorkspaceTransferKind::CleanGit { base_commit, .. }
+                | WorkspaceTransferKind::DirtyGit { base_commit, .. } => base_commit,
+                WorkspaceTransferKind::ContentSnapshot => unreachable!(),
+            };
+            command_output(
+                "git",
+                &[
+                    "fetch",
+                    "-q",
+                    bundle_path.to_string_lossy().as_ref(),
+                    base_commit,
+                ],
+                Some(destination),
+            )?;
+            command_output(
+                "git",
+                &["checkout", "-q", "--detach", base_commit],
+                Some(destination),
+            )?;
+            let _ = fs::remove_file(&bundle_path);
+        }
         let object_map = self
             .objects
             .iter()
@@ -901,27 +1048,6 @@ impl WorkspaceTransfer {
                     ))
                 }
             }
-        }
-        if matches!(
-            self.kind,
-            WorkspaceTransferKind::CleanGit { .. } | WorkspaceTransferKind::DirtyGit { .. }
-        ) {
-            command_output("git", &["init", "-q"], Some(destination))?;
-            command_output("git", &["add", "--all"], Some(destination))?;
-            command_output(
-                "git",
-                &[
-                    "-c",
-                    "user.name=Little Monkey runner",
-                    "-c",
-                    "user.email=runner@little-monkey.invalid",
-                    "commit",
-                    "--allow-empty",
-                    "-qm",
-                    "Little Monkey workspace snapshot",
-                ],
-                Some(destination),
-            )?;
         }
         Ok(())
     }
@@ -1132,6 +1258,203 @@ pub struct WorkspaceResult {
     pub binary_changes: Vec<String>,
     pub artifacts: Vec<ArtifactDescriptor>,
     pub verification_evidence: Vec<VerificationEvidence>,
+}
+
+pub fn workspace_result_id(result: &WorkspaceResult) -> Result<String, TargetError> {
+    result.validate()?;
+    let bytes = serde_json::to_vec(result)
+        .map_err(|error| TargetError::result_retrieval_failed(error.to_string()))?;
+    Ok(format!("result-{}", &digest(&bytes)[..32]))
+}
+
+pub fn persist_workspace_result(
+    data_dir: &Path,
+    result: &WorkspaceResult,
+) -> Result<String, TargetError> {
+    let id = workspace_result_id(result)?;
+    let directory = data_dir.join("execution-results");
+    fs::create_dir_all(&directory)?;
+    let bytes = serde_json::to_vec_pretty(result)
+        .map_err(|error| TargetError::result_retrieval_failed(error.to_string()))?;
+    let path = directory.join(format!("{id}.json"));
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, bytes)?;
+    fs::rename(temporary, path)?;
+    Ok(id)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchResult {
+    pub kind: String,
+    pub base_snapshot_digest: String,
+    #[serde(with = "serde_bytes")]
+    pub patch: Vec<u8>,
+    pub patch_sha256: String,
+}
+
+impl PatchResult {
+    pub fn validate(&self) -> Result<(), TargetError> {
+        if self.kind != "git_patch" || !valid_digest(&self.base_snapshot_digest) {
+            return Err(TargetError::result_retrieval_failed(
+                "invalid persisted patch result",
+            ));
+        }
+        if self.patch.is_empty() || self.patch.len() as u64 > MAX_TRANSFER_TOTAL_BYTES {
+            return Err(TargetError::result_retrieval_failed(
+                "persisted patch result exceeds transfer bounds",
+            ));
+        }
+        if digest(&self.patch) != self.patch_sha256 {
+            return Err(TargetError::result_retrieval_failed(
+                "persisted patch digest mismatch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "result", rename_all = "camelCase")]
+pub enum PersistedExecutionResult {
+    Workspace(WorkspaceResult),
+    Patch(PatchResult),
+}
+
+pub fn persist_patch_result(
+    data_dir: &Path,
+    base_snapshot_digest: &str,
+    patch: Vec<u8>,
+) -> Result<String, TargetError> {
+    let result = PatchResult {
+        kind: "git_patch".to_string(),
+        base_snapshot_digest: base_snapshot_digest.to_string(),
+        patch_sha256: digest(&patch),
+        patch,
+    };
+    result.validate()?;
+    let id = format!(
+        "result-{}",
+        &digest(
+            &serde_json::to_vec(&result)
+                .map_err(|error| TargetError::result_retrieval_failed(error.to_string()))?
+        )[..32]
+    );
+    let directory = data_dir.join("execution-results");
+    fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{id}.json"));
+    let temporary = path.with_extension("json.tmp");
+    fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(&result)
+            .map_err(|error| TargetError::result_retrieval_failed(error.to_string()))?,
+    )?;
+    fs::rename(temporary, path)?;
+    Ok(id)
+}
+
+pub fn load_workspace_result(
+    data_dir: &Path,
+    result_id: &str,
+) -> Result<WorkspaceResult, TargetError> {
+    if !valid_id(result_id) {
+        return Err(TargetError::invalid("result id is invalid"));
+    }
+    let result: WorkspaceResult = serde_json::from_slice(&fs::read(
+        data_dir
+            .join("execution-results")
+            .join(format!("{result_id}.json")),
+    )?)
+    .map_err(|error| TargetError::result_retrieval_failed(error.to_string()))?;
+    result.validate()?;
+    Ok(result)
+}
+
+pub fn load_execution_result(
+    data_dir: &Path,
+    result_id: &str,
+) -> Result<PersistedExecutionResult, TargetError> {
+    if !valid_id(result_id) {
+        return Err(TargetError::invalid("result id is invalid"));
+    }
+    let bytes = fs::read(
+        data_dir
+            .join("execution-results")
+            .join(format!("{result_id}.json")),
+    )?;
+    if let Ok(result) = serde_json::from_slice::<WorkspaceResult>(&bytes) {
+        result.validate()?;
+        return Ok(PersistedExecutionResult::Workspace(result));
+    }
+    let result: PatchResult = serde_json::from_slice(&bytes)
+        .map_err(|error| TargetError::result_retrieval_failed(error.to_string()))?;
+    result.validate()?;
+    Ok(PersistedExecutionResult::Patch(result))
+}
+
+pub fn apply_execution_result(
+    root: &Path,
+    result: &PersistedExecutionResult,
+) -> Result<(), TargetError> {
+    match result {
+        PersistedExecutionResult::Workspace(result) => {
+            apply_workspace_result(root, &result.base_snapshot_digest, result)
+        }
+        PersistedExecutionResult::Patch(result) => {
+            result.validate()?;
+            let current =
+                WorkspaceTransfer::from_workspace(root, "apply-check")?.base_snapshot_digest;
+            if current != result.base_snapshot_digest {
+                return Err(TargetError::WorkspaceConflict(
+                    "local workspace changed since the remote snapshot".to_string(),
+                ));
+            }
+            let mut check = Command::new("git")
+                .args(["apply", "--check", "--binary", "--"])
+                .current_dir(root)
+                .stdin(Stdio::piped())
+                .spawn()?;
+            check
+                .stdin
+                .take()
+                .ok_or_else(|| TargetError::Io("could not open git apply check stdin".to_string()))?
+                .write_all(&result.patch)?;
+            if !check.wait()?.success() {
+                return Err(TargetError::WorkspaceConflict(
+                    "git apply check failed".to_string(),
+                ));
+            }
+            let mut apply = Command::new("git")
+                .args(["apply", "--binary", "--"])
+                .current_dir(root)
+                .stdin(Stdio::piped())
+                .spawn()?;
+            apply
+                .stdin
+                .take()
+                .ok_or_else(|| TargetError::Io("could not open git apply stdin".to_string()))?
+                .write_all(&result.patch)?;
+            if !apply.wait()?.success() {
+                return Err(TargetError::WorkspaceConflict(
+                    "git apply failed".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+pub fn discard_workspace_result(data_dir: &Path, result_id: &str) -> Result<(), TargetError> {
+    if !valid_id(result_id) {
+        return Err(TargetError::invalid("result id is invalid"));
+    }
+    let path = data_dir
+        .join("execution-results")
+        .join(format!("{result_id}.json"));
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 impl WorkspaceResult {
@@ -1573,6 +1896,14 @@ pub struct DockerExecutionTarget {
     workspaces: Arc<Mutex<HashMap<String, WorkspaceHandle>>>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct DockerRunRecord {
+    run_id: String,
+    remote_id: String,
+    workspace: WorkspaceHandle,
+    base_transfer: WorkspaceTransfer,
+}
+
 impl DockerExecutionTarget {
     pub fn new(
         stable_id: String,
@@ -1614,6 +1945,31 @@ impl DockerExecutionTarget {
                 .take(48)
                 .collect::<String>()
         )
+    }
+
+    fn state_path(&self) -> PathBuf {
+        self.runner_data.join("docker-runs.json")
+    }
+
+    fn load_records(&self) -> Result<BTreeMap<String, DockerRunRecord>, TargetError> {
+        let path = self.state_path();
+        if !path.exists() {
+            return Ok(BTreeMap::new());
+        }
+        serde_json::from_slice(&fs::read(path)?).map_err(|error| TargetError::Io(error.to_string()))
+    }
+
+    fn save_records(&self, records: &BTreeMap<String, DockerRunRecord>) -> Result<(), TargetError> {
+        fs::create_dir_all(&self.runner_data)?;
+        let path = self.state_path();
+        let temporary = path.with_extension("json.tmp");
+        fs::write(
+            &temporary,
+            serde_json::to_vec_pretty(records)
+                .map_err(|error| TargetError::Io(error.to_string()))?,
+        )?;
+        fs::rename(temporary, path)?;
+        Ok(())
     }
 }
 
@@ -1693,9 +2049,7 @@ impl ExecutionTarget for DockerExecutionTarget {
         }
         let name = Self::container_name(&request.run_id);
         let mut command = Command::new(&self.docker_binary);
-        command.args([
-            "run", "--detach", "--rm", "--name", &name, "--pid", "private",
-        ]);
+        command.args(["run", "--detach", "--name", &name, "--pid", "private"]);
         command.args([
             "--cap-drop",
             "ALL",
@@ -1746,6 +2100,17 @@ impl ExecutionTarget for DockerExecutionTarget {
             ));
         }
         let remote_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let record = DockerRunRecord {
+            run_id: request.run_id.clone(),
+            remote_id: remote_id.clone(),
+            workspace: request.workspace.clone(),
+            base_transfer: request.workspace.base_transfer.clone().ok_or_else(|| {
+                TargetError::workspace_transfer_failed("Docker run omitted its base transfer")
+            })?,
+        };
+        let mut records = self.load_records()?;
+        records.insert(request.run_id.clone(), record);
+        self.save_records(&records)?;
         self.processes
             .lock()
             .map_err(|_| TargetError::Io("Docker process registry poisoned".into()))?
@@ -1864,18 +2229,24 @@ impl ExecutionTarget for DockerExecutionTarget {
         Ok(Vec::new())
     }
     fn workspace_result(&self, handle: &TargetRunHandle) -> Result<WorkspaceResult, TargetError> {
+        let persisted = self.load_records()?.get(&handle.run_id).cloned();
         let workspace = self
             .workspaces
             .lock()
             .map_err(|_| TargetError::Io("Docker workspace registry poisoned".into()))?
             .get(&handle.run_id)
             .cloned()
+            .or_else(|| persisted.as_ref().map(|record| record.workspace.clone()))
             .ok_or_else(|| {
                 TargetError::result_retrieval_failed("Docker run workspace is no longer registered")
             })?;
-        let base = workspace.base_transfer.as_ref().ok_or_else(|| {
-            TargetError::result_retrieval_failed("Docker run omitted its workspace snapshot")
-        })?;
+        let base = workspace
+            .base_transfer
+            .as_ref()
+            .or_else(|| persisted.as_ref().map(|record| &record.base_transfer))
+            .ok_or_else(|| {
+                TargetError::result_retrieval_failed("Docker run omitted its workspace snapshot")
+            })?;
         workspace_result_from_workspace(base, &workspace.path)
     }
     fn cleanup(&self, workspace: &WorkspaceHandle) -> Result<(), TargetError> {
@@ -1883,6 +2254,25 @@ impl ExecutionTarget for DockerExecutionTarget {
             fs::remove_dir_all(&workspace.path).map_err(TargetError::from)?;
             let _ = fs::remove_file(WorkspaceTransfer::cache_marker_path(&workspace.path));
         }
+        let mut records = self.load_records()?;
+        let removed = records
+            .iter()
+            .filter(|(_, record)| {
+                record.workspace.workspace_id == workspace.workspace_id
+                    && record.workspace.snapshot_id == workspace.snapshot_id
+            })
+            .map(|(_, record)| record.remote_id.clone())
+            .collect::<Vec<_>>();
+        records.retain(|_, record| {
+            record.workspace.workspace_id != workspace.workspace_id
+                || record.workspace.snapshot_id != workspace.snapshot_id
+        });
+        for remote_id in removed {
+            let _ = Command::new(&self.docker_binary)
+                .args(["rm", "--force", &remote_id])
+                .output();
+        }
+        self.save_records(&records)?;
         Ok(())
     }
 }
@@ -2001,7 +2391,6 @@ impl SshRunnerTarget {
                     git: true,
                     disposable_workspace: true,
                     persistent_workspace: true,
-                    suspend: true,
                     outbound_network: false,
                     ..TargetCapabilities::default()
                 },
@@ -2142,12 +2531,78 @@ impl ExecutionTarget for SshRunnerTarget {
     fn submit_run(&self, request: RunRequest) -> Result<TargetRunHandle, TargetError> {
         request.target.require(&request.required_capabilities)?;
         let mut request = request;
-        request.workspace_transfer = request
+        let transfer = request
             .workspace_transfer
-            .or_else(|| request.workspace.base_transfer.clone());
+            .or_else(|| request.workspace.base_transfer.clone())
+            .ok_or_else(|| {
+                TargetError::workspace_transfer_failed("SSH run omitted workspace transfer")
+            })?;
+        let manifest = transfer.manifest_request();
+        let prepared = self.request(serde_json::json!({
+            "type": "workspace_prepare",
+            "manifest": manifest
+        }))?;
+        if let Some(error) = prepared.get("error") {
+            return Err(TargetError::workspace_transfer_failed(error.to_string()));
+        }
+        let missing = prepared
+            .get("missing")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                TargetError::protocol_incompatible("workspace prepare omitted missing hashes")
+            })?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let objects = transfer
+            .missing_objects_for(
+                &transfer
+                    .all_objects()
+                    .filter(|object| !missing.contains(&object.sha256))
+                    .map(|object| object.sha256.clone())
+                    .collect(),
+            )
+            .into_iter()
+            .filter(|object| missing.contains(&object.sha256))
+            .collect::<Vec<_>>();
+        if !objects.is_empty() {
+            let uploaded = self.request(serde_json::json!({
+                "type": "workspace_upload",
+                "workspaceId": transfer.workspace_id,
+                "snapshotId": transfer.snapshot_id,
+                "objects": objects
+            }))?;
+            if let Some(error) = uploaded.get("error") {
+                return Err(TargetError::workspace_transfer_failed(error.to_string()));
+            }
+        }
+        let mut cas_transfer = transfer;
+        cas_transfer.object_hashes = manifest.object_hashes.clone();
+        cas_transfer.objects.clear();
+        cas_transfer.tracked_diff = None;
+        cas_transfer.git_bundle = None;
+        cas_transfer.tracked_diff_hash = manifest.tracked_diff_hash;
+        cas_transfer.git_bundle_hash = manifest.git_bundle_hash;
+        request.workspace_transfer = Some(cas_transfer);
         let response = self.request(serde_json::json!({"type":"submit_run","request":request}))?;
         if response.get("error").is_some() {
-            return Err(TargetError::runner_lost(response.to_string()));
+            let code = response
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("RUNNER_LOST");
+            let detail = response
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("runner rejected run")
+                .to_string();
+            return Err(match code {
+                "CAPABILITY_UNAVAILABLE" => TargetError::capability_unavailable(detail),
+                "PROTOCOL_INCOMPATIBLE" => TargetError::protocol_incompatible(detail),
+                "WORKSPACE_CONFLICT" => TargetError::workspace_conflict(detail),
+                "WORKSPACE_TRANSFER_FAILED" => TargetError::workspace_transfer_failed(detail),
+                _ => TargetError::runner_lost(detail),
+            });
         }
         Ok(TargetRunHandle {
             run_id: request.run_id,
@@ -2429,7 +2884,6 @@ pub fn runner_probe() -> Result<ExecutionTargetSnapshot, TargetError> {
             git: true,
             disposable_workspace: true,
             persistent_workspace: true,
-            suspend: true,
             ..TargetCapabilities::default()
         },
         last_successful_probe_ms: Some(now_ms()),
@@ -2439,12 +2893,25 @@ pub fn runner_probe() -> Result<ExecutionTargetSnapshot, TargetError> {
 }
 
 struct RunnerProcess {
-    child: Child,
+    child: Option<Child>,
+    pid: u32,
     workspace: WorkspaceHandle,
     base_transfer: WorkspaceTransfer,
     transient_inputs: Vec<PathBuf>,
-    started_at: Instant,
+    started_at_ms: u64,
     wall_time_ms: u64,
+    cancelled: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedRunnerProcess {
+    run_id: String,
+    workspace: WorkspaceHandle,
+    base_transfer: WorkspaceTransfer,
+    transient_inputs: Vec<PathBuf>,
+    started_at_ms: u64,
+    wall_time_ms: u64,
+    pid: u32,
     cancelled: bool,
 }
 
@@ -2459,22 +2926,318 @@ fn runner_data_directory() -> Result<PathBuf, TargetError> {
         .ok_or_else(|| TargetError::Io("could not resolve runner data directory".into()))
 }
 
+fn runner_state_path(runner_data: &Path) -> PathBuf {
+    runner_data.join("runs.json")
+}
+
+fn persist_runner_processes(
+    runner_data: &Path,
+    runs: &HashMap<String, RunnerProcess>,
+) -> Result<(), TargetError> {
+    fs::create_dir_all(runner_data)?;
+    let records = runs
+        .iter()
+        .map(|(run_id, process)| {
+            (
+                run_id.clone(),
+                PersistedRunnerProcess {
+                    run_id: run_id.clone(),
+                    workspace: process.workspace.clone(),
+                    base_transfer: process.base_transfer.clone(),
+                    transient_inputs: process.transient_inputs.clone(),
+                    started_at_ms: process.started_at_ms,
+                    wall_time_ms: process.wall_time_ms,
+                    pid: process.pid,
+                    cancelled: process.cancelled,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let bytes =
+        serde_json::to_vec_pretty(&records).map_err(|error| TargetError::Io(error.to_string()))?;
+    let temporary = runner_state_path(runner_data).with_extension("json.tmp");
+    fs::write(&temporary, bytes)?;
+    fs::rename(temporary, runner_state_path(runner_data))?;
+    Ok(())
+}
+
+fn load_runner_processes(
+    runner_data: &Path,
+) -> Result<HashMap<String, RunnerProcess>, TargetError> {
+    let path = runner_state_path(runner_data);
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let records: BTreeMap<String, PersistedRunnerProcess> =
+        serde_json::from_slice(&fs::read(path)?)
+            .map_err(|error| TargetError::Io(error.to_string()))?;
+    Ok(records
+        .into_iter()
+        .map(|(run_id, record)| {
+            (
+                run_id,
+                RunnerProcess {
+                    child: None,
+                    pid: record.pid,
+                    workspace: record.workspace,
+                    base_transfer: record.base_transfer,
+                    transient_inputs: record.transient_inputs,
+                    started_at_ms: record.started_at_ms,
+                    wall_time_ms: record.wall_time_ms,
+                    cancelled: record.cancelled,
+                },
+            )
+        })
+        .collect())
+}
+
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // The runner is deliberately a transport process. PID liveness lets a
+        // fresh stdio connection observe a child that outlived the transport.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn runner_cas_directory(
+    runner_data: &Path,
+    workspace_id: &str,
+    snapshot_id: &str,
+) -> Result<PathBuf, TargetError> {
+    let path = runner_data.join("cas").join(workspace_id).join(snapshot_id);
+    if !path.starts_with(runner_data) {
+        return Err(TargetError::invalid("runner CAS path escapes runner data"));
+    }
+    fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+fn cas_object_path(cas: &Path, hash: &str) -> Result<PathBuf, TargetError> {
+    if !valid_digest(hash) {
+        return Err(TargetError::workspace_transfer_failed(
+            "CAS object hash is invalid",
+        ));
+    }
+    Ok(cas.join(hash))
+}
+
+fn validate_manifest_request(request: &WorkspaceManifestRequest) -> Result<(), TargetError> {
+    if request.schema_version != 1
+        || !valid_id(&request.workspace_id)
+        || !valid_id(&request.snapshot_id)
+        || !valid_digest(&request.base_snapshot_digest)
+    {
+        return Err(TargetError::workspace_transfer_failed(
+            "invalid workspace manifest identity",
+        ));
+    }
+    let mut paths = BTreeSet::new();
+    let mut normalized = BTreeSet::new();
+    for entry in &request.manifest {
+        validate_relative_path(&entry.relative_path, request.limits.max_path_bytes)?;
+        if !paths.insert(entry.relative_path.clone())
+            || !normalized.insert(normalized_path(&entry.relative_path))
+        {
+            return Err(TargetError::workspace_transfer_failed(
+                "workspace manifest contains a path collision",
+            ));
+        }
+        if !matches!(entry.file_type.as_str(), "file" | "directory" | "symlink") {
+            return Err(TargetError::workspace_transfer_failed(
+                "workspace manifest contains an unsupported file type",
+            ));
+        }
+    }
+    if request.object_hashes.iter().any(|hash| !valid_digest(hash))
+        || request
+            .tracked_diff_hash
+            .as_deref()
+            .is_some_and(|hash| !valid_digest(hash))
+        || request
+            .git_bundle_hash
+            .as_deref()
+            .is_some_and(|hash| !valid_digest(hash))
+    {
+        return Err(TargetError::workspace_transfer_failed(
+            "workspace manifest contains an invalid object hash",
+        ));
+    }
+    Ok(())
+}
+
+fn runner_prepare_workspace(
+    value: &serde_json::Value,
+) -> Result<WorkspaceMissingObjects, TargetError> {
+    let request: WorkspaceManifestRequest = serde_json::from_value(
+        value
+            .get("manifest")
+            .cloned()
+            .ok_or_else(|| TargetError::protocol_incompatible("workspace manifest omitted"))?,
+    )
+    .map_err(|error| TargetError::protocol_incompatible(error.to_string()))?;
+    validate_manifest_request(&request)?;
+    let runner_data = runner_data_directory()?;
+    let cas = runner_cas_directory(&runner_data, &request.workspace_id, &request.snapshot_id)?;
+    let missing_hashes = request
+        .object_hashes
+        .iter()
+        .filter(|hash| !cas_object_path(&cas, hash).is_ok_and(|path| path.is_file()))
+        .cloned()
+        .collect();
+    Ok(WorkspaceMissingObjects {
+        workspace_id: request.workspace_id,
+        snapshot_id: request.snapshot_id,
+        missing_hashes,
+    })
+}
+
+fn runner_upload_workspace(
+    value: &serde_json::Value,
+) -> Result<WorkspaceMissingObjects, TargetError> {
+    let workspace_id = value
+        .get("workspaceId")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            TargetError::protocol_incompatible("workspace upload omitted workspaceId")
+        })?;
+    let snapshot_id = value
+        .get("snapshotId")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| TargetError::protocol_incompatible("workspace upload omitted snapshotId"))?;
+    if !valid_id(workspace_id) || !valid_id(snapshot_id) {
+        return Err(TargetError::invalid("workspace upload identity is invalid"));
+    }
+    let objects: Vec<WorkspaceObject> =
+        serde_json::from_value(value.get("objects").cloned().ok_or_else(|| {
+            TargetError::protocol_incompatible("workspace upload omitted objects")
+        })?)
+        .map_err(|error| TargetError::protocol_incompatible(error.to_string()))?;
+    let runner_data = runner_data_directory()?;
+    let cas = runner_cas_directory(&runner_data, workspace_id, snapshot_id)?;
+    for object in objects {
+        if !valid_digest(&object.sha256) || digest(&object.bytes) != object.sha256 {
+            return Err(TargetError::workspace_transfer_failed(
+                "workspace upload object digest mismatch",
+            ));
+        }
+        let path = cas_object_path(&cas, &object.sha256)?;
+        if !path.exists() {
+            let temporary = path.with_extension("tmp");
+            fs::write(&temporary, object.bytes)?;
+            fs::rename(temporary, path)?;
+        }
+    }
+    Ok(WorkspaceMissingObjects {
+        workspace_id: workspace_id.to_string(),
+        snapshot_id: snapshot_id.to_string(),
+        missing_hashes: BTreeSet::new(),
+    })
+}
+
+fn resolve_transfer_from_cas(
+    mut transfer: WorkspaceTransfer,
+    runner_data: &Path,
+) -> Result<WorkspaceTransfer, TargetError> {
+    let manifest = transfer.manifest_request();
+    let cas = runner_cas_directory(runner_data, &manifest.workspace_id, &manifest.snapshot_id)?;
+    if transfer.objects.is_empty() && !manifest.object_hashes.is_empty() {
+        let mut objects = Vec::new();
+        for hash in &manifest.object_hashes {
+            let path = cas_object_path(&cas, hash)?;
+            let bytes = fs::read(&path).map_err(|error| {
+                TargetError::workspace_transfer_failed(format!(
+                    "CAS object {hash} unavailable: {error}"
+                ))
+            })?;
+            if digest(&bytes) != *hash {
+                return Err(TargetError::workspace_transfer_failed(
+                    "CAS object changed after negotiation",
+                ));
+            }
+            objects.push(WorkspaceObject {
+                sha256: hash.clone(),
+                bytes,
+            });
+        }
+        let tracked_hash = transfer.tracked_diff_hash.clone().or_else(|| {
+            transfer
+                .tracked_diff
+                .as_ref()
+                .map(|object| object.sha256.clone())
+        });
+        let bundle_hash = transfer.git_bundle_hash.clone().or_else(|| {
+            transfer
+                .git_bundle
+                .as_ref()
+                .map(|object| object.sha256.clone())
+        });
+        transfer.objects = objects
+            .iter()
+            .filter(|object| {
+                Some(object.sha256.as_str()) != tracked_hash.as_deref()
+                    && Some(object.sha256.as_str()) != bundle_hash.as_deref()
+            })
+            .cloned()
+            .collect();
+        transfer.tracked_diff = tracked_hash.map(|hash| WorkspaceObject {
+            sha256: hash.clone(),
+            bytes: objects
+                .iter()
+                .find(|object| object.sha256 == hash)
+                .map(|object| object.bytes.clone())
+                .unwrap_or_default(),
+        });
+        transfer.git_bundle = bundle_hash.map(|hash| WorkspaceObject {
+            sha256: hash.clone(),
+            bytes: objects
+                .iter()
+                .find(|object| object.sha256 == hash)
+                .map(|object| object.bytes.clone())
+                .unwrap_or_default(),
+        });
+    }
+    transfer.validate()?;
+    Ok(transfer)
+}
+
 fn runner_status(process: &mut RunnerProcess) -> Result<TargetRunStatus, TargetError> {
     if process.cancelled {
         return Ok(TargetRunStatus::Cancelled);
     }
-    if process.started_at.elapsed().as_millis() as u64 > process.wall_time_ms {
-        process
-            .child
-            .kill()
-            .map_err(|error| TargetError::runner_lost(error.to_string()))?;
+    if now_ms().saturating_sub(process.started_at_ms) > process.wall_time_ms {
+        if let Some(child) = process.child.as_mut() {
+            child
+                .kill()
+                .map_err(|error| TargetError::runner_lost(error.to_string()))?;
+        } else if process_alive(process.pid) {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(process.pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
         return Ok(TargetRunStatus::Failed);
     }
-    match process.child.try_wait()? {
-        None => Ok(TargetRunStatus::Running),
-        Some(status) if status.success() => Ok(TargetRunStatus::Succeeded),
-        Some(_) => Ok(TargetRunStatus::Failed),
+    if let Some(child) = process.child.as_mut() {
+        return match child.try_wait()? {
+            None => Ok(TargetRunStatus::Running),
+            Some(status) if status.success() => Ok(TargetRunStatus::Succeeded),
+            Some(_) => Ok(TargetRunStatus::Failed),
+        };
     }
+    // A reconnected runner cannot wait on a child it did not spawn. The
+    // durable workspace and result contract make the terminal state observable
+    // without relying on the old stdio session's in-memory Child handle.
+    Ok(if process_alive(process.pid) {
+        TargetRunStatus::Running
+    } else {
+        TargetRunStatus::Succeeded
+    })
 }
 
 fn runner_submit(value: &serde_json::Value) -> Result<(String, RunnerProcess), TargetError> {
@@ -2501,6 +3264,7 @@ fn runner_submit(value: &serde_json::Value) -> Result<(String, RunnerProcess), T
         TargetError::workspace_transfer_failed("runner request omitted workspace transfer")
     })?;
     let runner_data = runner_data_directory()?;
+    let transfer = resolve_transfer_from_cas(transfer, &runner_data)?;
     let path = app_owned_workspace(&runner_data, &transfer.workspace_id, &transfer.snapshot_id)?;
     if path.exists() {
         if !transfer.cached_matches(&path)? {
@@ -2586,11 +3350,12 @@ fn runner_submit(value: &serde_json::Value) -> Result<(String, RunnerProcess), T
     Ok((
         run_id,
         RunnerProcess {
-            child,
+            pid: child.id(),
+            child: Some(child),
             workspace,
             base_transfer: transfer,
             transient_inputs,
-            started_at: Instant::now(),
+            started_at_ms: now_ms(),
             wall_time_ms: request.wall_time_ms.max(1),
             cancelled: false,
         },
@@ -2600,7 +3365,8 @@ fn runner_submit(value: &serde_json::Value) -> Result<(String, RunnerProcess), T
 pub fn runner_serve_stdio() -> Result<(), TargetError> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
-    let mut runs: HashMap<String, RunnerProcess> = HashMap::new();
+    let runner_data = runner_data_directory()?;
+    let mut runs = load_runner_processes(&runner_data)?;
     for line in stdin.lock().lines() {
         let line = line.map_err(TargetError::from)?;
         if line.trim().is_empty() {
@@ -2611,9 +3377,18 @@ pub fn runner_serve_stdio() -> Result<(), TargetError> {
         let response = match request.get("type").and_then(|value| value.as_str()) {
             Some("probe") => serde_json::to_value(runner_probe()?)
                 .map_err(|error| TargetError::invalid(error.to_string()))?,
+            Some("workspace_prepare") => match runner_prepare_workspace(&request) {
+                Ok(missing) => serde_json::json!({"missing": missing.missing_hashes}),
+                Err(error) => serde_json::json!({"code":error.code(),"error":error.to_string()}),
+            },
+            Some("workspace_upload") => match runner_upload_workspace(&request) {
+                Ok(_) => serde_json::json!({"ok":true}),
+                Err(error) => serde_json::json!({"code":error.code(),"error":error.to_string()}),
+            },
             Some("submit_run") => match runner_submit(&request) {
                 Ok((run_id, process)) => {
                     runs.insert(run_id.clone(), process);
+                    persist_runner_processes(&runner_data, &runs)?;
                     serde_json::json!({"remoteId":run_id,"status":"running"})
                 }
                 Err(error) => serde_json::json!({"code":error.code(),"error":error.to_string()}),
@@ -2644,11 +3419,21 @@ pub fn runner_serve_stdio() -> Result<(), TargetError> {
                     .get_mut(id)
                     .ok_or_else(|| TargetError::runner_lost("unknown run"))
                     .and_then(|process| {
-                        process.child.kill()?;
+                        if let Some(child) = process.child.as_mut() {
+                            child.kill()?;
+                        } else if process_alive(process.pid) {
+                            #[cfg(unix)]
+                            unsafe {
+                                libc::kill(process.pid as libc::pid_t, libc::SIGKILL);
+                            }
+                        }
                         process.cancelled = true;
                         Ok(())
                     }) {
-                    Ok(()) => serde_json::json!({"ok":true}),
+                    Ok(()) => {
+                        persist_runner_processes(&runner_data, &runs)?;
+                        serde_json::json!({"ok":true})
+                    }
                     Err(error) => {
                         serde_json::json!({"code":error.code(),"error":error.to_string()})
                     }
@@ -2713,6 +3498,7 @@ pub fn runner_serve_stdio() -> Result<(), TargetError> {
                         }
                     }
                 }
+                persist_runner_processes(&runner_data, &runs)?;
                 serde_json::json!({"ok":true})
             }
             Some("shutdown") => break,
@@ -2817,7 +3603,7 @@ mod tests {
     }
 
     #[test]
-    fn git_transfer_uses_a_synthetic_baseline_for_result_application() {
+    fn git_transfer_preserves_the_exact_base_commit_for_result_application() {
         let root = std::env::temp_dir().join(format!("little-monkey-git-{}", now_ms()));
         let remote = root.with_extension("remote");
         fs::create_dir_all(&root).unwrap();
@@ -2841,6 +3627,17 @@ mod tests {
         let base = WorkspaceTransfer::from_workspace(&root, "workspace-git").unwrap();
         assert!(matches!(base.kind, WorkspaceTransferKind::CleanGit { .. }));
         base.materialize(&remote).unwrap();
+        let base_commit = match &base.kind {
+            WorkspaceTransferKind::CleanGit { base_commit, .. } => base_commit,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            String::from_utf8_lossy(
+                &command_output("git", &["rev-parse", "HEAD"], Some(&remote)).unwrap()
+            )
+            .trim(),
+            base_commit
+        );
         assert!(command_output("git", &["diff", "HEAD", "--exit-code"], Some(&remote)).is_ok());
         fs::write(remote.join("note.txt"), b"after").unwrap();
         let result = workspace_result_from_workspace(&base, &remote).unwrap();
@@ -2849,5 +3646,58 @@ mod tests {
         assert_eq!(fs::read(root.join("note.txt")).unwrap(), b"after");
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(remote);
+    }
+
+    #[test]
+    fn manifest_negotiation_returns_only_objects_missing_at_the_target() {
+        let root = std::env::temp_dir().join(format!("little-monkey-cas-{}", now_ms()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        fs::write(root.join("b.bin"), [0, 1, 2, 255]).unwrap();
+        let transfer = WorkspaceTransfer::from_workspace(&root, "workspace-cas").unwrap();
+        let available = transfer
+            .objects
+            .first()
+            .map(|object| BTreeSet::from([object.sha256.clone()]))
+            .unwrap_or_default();
+        let missing = transfer.missing_objects_for(&available);
+        assert_eq!(
+            missing.len(),
+            transfer.objects.len().saturating_sub(available.len())
+                + usize::from(transfer.tracked_diff.is_some())
+                + usize::from(transfer.git_bundle.is_some())
+        );
+        assert!(missing
+            .iter()
+            .all(|object| !available.contains(&object.sha256)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persisted_result_is_reviewable_and_discardable_without_touching_workspace() {
+        let data_dir = std::env::temp_dir().join(format!("little-monkey-results-{}", now_ms()));
+        let result = WorkspaceResult {
+            base_snapshot_digest: "a".repeat(64),
+            resulting_snapshot_digest: "b".repeat(64),
+            git_diff: Vec::new(),
+            new_files: Vec::new(),
+            deleted_files: Vec::new(),
+            binary_changes: Vec::new(),
+            artifacts: Vec::new(),
+            verification_evidence: Vec::new(),
+        };
+        let id = persist_workspace_result(&data_dir, &result).unwrap();
+        assert_eq!(load_workspace_result(&data_dir, &id).unwrap(), result);
+        discard_workspace_result(&data_dir, &id).unwrap();
+        assert!(load_workspace_result(&data_dir, &id).is_err());
+        let patch_id =
+            persist_patch_result(&data_dir, &"c".repeat(64), b"git patch".to_vec()).unwrap();
+        assert!(matches!(
+            load_execution_result(&data_dir, &patch_id).unwrap(),
+            PersistedExecutionResult::Patch(_)
+        ));
+        discard_workspace_result(&data_dir, &patch_id).unwrap();
+        assert!(load_execution_result(&data_dir, &patch_id).is_err());
+        let _ = fs::remove_dir_all(data_dir);
     }
 }

@@ -1,7 +1,8 @@
 use clap::{Args, Subcommand};
 use little_monkey_lib::app_paths;
 use little_monkey_lib::execution_target::{
-    apply_workspace_result, runner_probe, runner_serve_stdio, ExecutionTargetKind, SshRunnerConfig,
+    apply_execution_result, apply_workspace_result, discard_workspace_result,
+    load_execution_result, runner_probe, runner_serve_stdio, ExecutionTargetKind, SshRunnerConfig,
     TargetCapabilities, TargetConfig, TargetError, TargetIdentity, TargetRegistry, WorkspaceResult,
     WorkspaceTransfer, EXECUTION_PROTOCOL_VERSION,
 };
@@ -78,6 +79,17 @@ pub enum WorkspaceCmd {
         #[arg(long)]
         base_digest: String,
     },
+    /// Review a persisted remote result without changing the local workspace.
+    Review { result_id: String },
+    /// Apply a persisted result only after the frozen-base conflict check.
+    Apply {
+        result_id: String,
+        workspace: PathBuf,
+    },
+    /// Export a persisted result for review or handoff.
+    Export { result_id: String, output: PathBuf },
+    /// Discard a persisted remote result and its local copy.
+    Discard { result_id: String },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -278,6 +290,32 @@ pub fn workspace(command: WorkspaceCmd) -> Result<(), String> {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
             apply_workspace_result(&workspace, &base_digest, &result)
                 .map_err(|error| error.to_string())
+        }
+        WorkspaceCmd::Review { result_id } => {
+            let data_dir = app_paths::data_dir().ok_or("Could not resolve app data directory")?;
+            print_json(
+                &load_execution_result(&data_dir, &result_id).map_err(|error| error.to_string())?,
+            )
+        }
+        WorkspaceCmd::Apply {
+            result_id,
+            workspace,
+        } => {
+            let data_dir = app_paths::data_dir().ok_or("Could not resolve app data directory")?;
+            let result =
+                load_execution_result(&data_dir, &result_id).map_err(|error| error.to_string())?;
+            apply_execution_result(&workspace, &result).map_err(|error| error.to_string())
+        }
+        WorkspaceCmd::Export { result_id, output } => {
+            let data_dir = app_paths::data_dir().ok_or("Could not resolve app data directory")?;
+            let result =
+                load_execution_result(&data_dir, &result_id).map_err(|error| error.to_string())?;
+            let bytes = serde_json::to_vec_pretty(&result).map_err(|error| error.to_string())?;
+            std::fs::write(output, bytes).map_err(|error| error.to_string())
+        }
+        WorkspaceCmd::Discard { result_id } => {
+            let data_dir = app_paths::data_dir().ok_or("Could not resolve app data directory")?;
+            discard_workspace_result(&data_dir, &result_id).map_err(|error| error.to_string())
         }
     }
 }

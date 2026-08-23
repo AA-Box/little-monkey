@@ -101,6 +101,79 @@ pub async fn execution_target_remove(id: String) -> Result<(), String> {
     registry.save(&path).map_err(|error| error.to_string())
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionTargetAddRequest {
+    pub id: String,
+    pub kind: String,
+    pub name: Option<String>,
+    pub image: Option<String>,
+    pub host: Option<String>,
+    pub user: Option<String>,
+    pub port: Option<u16>,
+    pub known_hosts: Option<String>,
+    pub key_file: Option<String>,
+    pub runner_data: Option<String>,
+}
+
+#[tauri::command]
+pub async fn execution_target_add(request: ExecutionTargetAddRequest) -> Result<(), String> {
+    validate_id("target id", &request.id)?;
+    let data_dir = crate::app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve app data directory".to_string())?;
+    let runner_data = request
+        .runner_data
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("execution-runner"));
+    let display_name = request.name.unwrap_or_else(|| request.id.clone());
+    let identity = |kind| crate::execution_target::TargetIdentity {
+        stable_id: request.id.clone(),
+        display_name: display_name.clone(),
+        kind,
+        endpoint: request.host.clone(),
+        verified_identity: None,
+        platform: "unknown".into(),
+        runner_version: "unknown".into(),
+        protocol_version: crate::execution_target::EXECUTION_PROTOCOL_VERSION,
+        capabilities: match kind {
+            crate::execution_target::ExecutionTargetKind::Docker => {
+                crate::execution_target::TargetCapabilities::docker()
+            }
+            _ => crate::execution_target::TargetCapabilities::default(),
+        },
+        last_successful_probe_ms: None,
+        trust_state: crate::execution_target::TargetTrustState::Unverified,
+    };
+    let config = match request.kind.replace('-', "_").as_str() {
+        "docker" => crate::execution_target::TargetConfig::Docker {
+            identity: identity(crate::execution_target::ExecutionTargetKind::Docker),
+            image: request.image.ok_or("Docker target image is required")?,
+            runner_data,
+        },
+        "ssh_runner" | "ssh" => crate::execution_target::TargetConfig::SshRunner {
+            identity: identity(crate::execution_target::ExecutionTargetKind::SshRunner),
+            config: crate::execution_target::SshRunnerConfig {
+                host: request.host.ok_or("SSH target host is required")?,
+                user: request.user,
+                port: request.port,
+                key_file: request.key_file.map(PathBuf::from),
+                known_hosts: PathBuf::from(
+                    request.known_hosts.ok_or("SSH known_hosts is required")?,
+                ),
+                jump_host: None,
+                runner_binary: "monkey".into(),
+            },
+            runner_data,
+        },
+        other => return Err(format!("unsupported execution target kind '{other}'")),
+    };
+    let path = data_dir.join("execution-targets.json");
+    let mut registry =
+        crate::execution_target::TargetRegistry::load(&path).map_err(|error| error.to_string())?;
+    registry.add(config).map_err(|error| error.to_string())?;
+    registry.save(&path).map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 pub async fn execution_workspace_push(
     workspace: String,
@@ -118,6 +191,51 @@ pub async fn execution_workspace_push(
     let transfer = crate::execution_target::WorkspaceTransfer::from_workspace(&path, &id)
         .map_err(|error| error.to_string())?;
     serde_json::to_value(transfer).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn execution_result_review(result_id: String) -> Result<Value, String> {
+    validate_id("result id", &result_id)?;
+    let data_dir = crate::app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve app data directory".to_string())?;
+    let result = crate::execution_target::load_execution_result(&data_dir, &result_id)
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(result).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn execution_result_apply(result_id: String, workspace: String) -> Result<(), String> {
+    validate_id("result id", &result_id)?;
+    let data_dir = crate::app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve app data directory".to_string())?;
+    let workspace = PathBuf::from(workspace)
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let result = crate::execution_target::load_execution_result(&data_dir, &result_id)
+        .map_err(|error| error.to_string())?;
+    crate::execution_target::apply_execution_result(&workspace, &result)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn execution_result_export(result_id: String, output: String) -> Result<(), String> {
+    validate_id("result id", &result_id)?;
+    validate_output_path(&output)?;
+    let data_dir = crate::app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve app data directory".to_string())?;
+    let result = crate::execution_target::load_execution_result(&data_dir, &result_id)
+        .map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec_pretty(&result).map_err(|error| error.to_string())?;
+    std::fs::write(output, bytes).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn execution_result_discard(result_id: String) -> Result<(), String> {
+    validate_id("result id", &result_id)?;
+    let data_dir = crate::app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve app data directory".to_string())?;
+    crate::execution_target::discard_workspace_result(&data_dir, &result_id)
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1800,9 +1918,43 @@ pub async fn remote_placement_sync() -> Result<String, String> {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutonomousTaskPlacementRequest {
-    pub kind: String,
+    /// Deprecated compatibility field. Routing is always resolved from the
+    /// stable target id in the registry; callers cannot select an executor by
+    /// spelling a backend kind.
+    #[serde(default)]
+    pub kind: Option<String>,
     pub target_id: String,
     pub run_spec: crate::run_protocol::RunSpec,
+}
+
+fn resolve_execution_target_kind(
+    target_id: &str,
+    requested_kind: Option<&str>,
+) -> Result<String, String> {
+    let data_dir = crate::app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve app data directory".to_string())?;
+    let registry =
+        crate::execution_target::TargetRegistry::load(&data_dir.join("execution-targets.json"))
+            .map_err(|error| error.to_string())?;
+    if let Ok(config) = registry.get(target_id) {
+        return Ok(match config.identity().kind {
+            crate::execution_target::ExecutionTargetKind::Local => "local",
+            crate::execution_target::ExecutionTargetKind::Docker => "docker",
+            crate::execution_target::ExecutionTargetKind::RemoteNode => "remote_node",
+            crate::execution_target::ExecutionTargetKind::SshRunner => "ssh_runner",
+        }
+        .to_string());
+    }
+    // K17 aliases are owned by the paired-node registry. Keep the legacy
+    // alias as a lookup hint only; execution still happens in the target
+    // adapter below, never in the frontend.
+    match requested_kind.map(|kind| kind.replace('-', "_")).as_deref() {
+        Some("remote_node") => Ok("remote_node".to_string()),
+        Some("docker") => Ok("docker".to_string()),
+        Some("ssh_runner") => Ok("ssh_runner".to_string()),
+        Some("local") | None => Err(format!("unknown execution target '{target_id}'")),
+        Some(other) => Err(format!("unknown execution target kind '{other}'")),
+    }
 }
 
 /// Execute a frozen autonomous node through the selected placement backend.
@@ -1817,12 +1969,12 @@ pub async fn autonomous_task_place_node(
         .run_spec
         .validate()
         .map_err(|error| error.to_string())?;
-    validate_token("placement kind", &request.kind, 32)?;
     validate_token("placement target", &request.target_id, 512)?;
     if request.target_id.starts_with('-') {
         return Err("Placement target cannot start with '-'".to_string());
     }
-    match request.kind.as_str() {
+    let kind = resolve_execution_target_kind(&request.target_id, request.kind.as_deref())?;
+    match kind.as_str() {
         "remote_node" => {
             validate_id("remote node alias", &request.target_id)?;
             let mut run_spec = request.run_spec;
@@ -1863,38 +2015,6 @@ pub async fn autonomous_task_place_node(
                     })?,
                 );
             }
-            if run_spec.execution_target.is_none() {
-                let identity = crate::execution_target::TargetIdentity {
-                    stable_id: request.target_id.clone(),
-                    display_name: format!("Remote node {}", request.target_id),
-                    kind: crate::execution_target::ExecutionTargetKind::RemoteNode,
-                    endpoint: None,
-                    verified_identity: None,
-                    platform: "remote".to_string(),
-                    runner_version: "unknown".to_string(),
-                    protocol_version: crate::execution_target::EXECUTION_PROTOCOL_VERSION,
-                    capabilities: crate::execution_target::TargetCapabilities {
-                        durable_background_execution: true,
-                        shell: true,
-                        git: true,
-                        persistent_workspace: true,
-                        disposable_workspace: true,
-                        ..Default::default()
-                    },
-                    last_successful_probe_ms: None,
-                    trust_state: crate::execution_target::TargetTrustState::Unverified,
-                };
-                run_spec.execution_target = Some(
-                    crate::execution_target::ExecutionTargetSnapshot::freeze(
-                        identity,
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|value| value.as_millis() as u64)
-                            .unwrap_or_default(),
-                    )
-                    .map_err(|error| error.to_string())?,
-                );
-            }
             if let Some(target) = &run_spec.execution_target {
                 target
                     .require(&crate::execution_target::RequiredCapabilities {
@@ -1908,8 +2028,6 @@ pub async fn autonomous_task_place_node(
                 .map_err(|error| format!("Could not serialize placement spec: {error}"))?;
             std::fs::write(&spec_path, bytes)
                 .map_err(|error| format!("Could not persist placement spec: {error}"))?;
-            let before_revision =
-                crate::agent_worktrees::workspace_revision(&data_dir, &workspace_root)?;
             let result = async {
                 let output = command(vec![
                     "daemon".into(),
@@ -1976,14 +2094,10 @@ pub async fn autonomous_task_place_node(
                                         .unwrap_or("remote autonomous node failed"),
                                 ));
                             }
-                            let result = row.get("result").cloned().ok_or_else(|| {
+                            let mut result = row.get("result").cloned().ok_or_else(|| {
                                 "Remote node succeeded without a transported node result"
                                     .to_string()
                             })?;
-                            let local_snapshot = crate::agent_worktrees::snapshot(
-                                &data_dir,
-                                &workspace_root,
-                            )?;
                             let placement_result = async {
                                 if result.get("ok").and_then(Value::as_bool) != Some(true) {
                                     return Err(
@@ -2036,34 +2150,30 @@ pub async fn autonomous_task_place_node(
                                                 .to_string(),
                                         );
                                     }
-                                    let apply = crate::agent_worktrees::apply_patch_artifact(
-                                        &workspace_root,
-                                        &patch_bytes,
-                                    );
-                                    let _ = std::fs::remove_file(&patch_path);
-                                    apply.map_err(|error| {
-                                        format!("Could not apply remote autonomous patch: {error}")
-                                    })?;
-                                    enforce_autonomous_placement_scope(
+                                    let result_id = crate::execution_target::persist_patch_result(
                                         &data_dir,
-                                        &workspace_root,
-                                        &local_snapshot.id,
-                                        &run_spec,
-                                    )?;
+                                        &run_spec
+                                            .workspace_transfer
+                                            .as_ref()
+                                            .ok_or_else(|| {
+                                                "Remote result omitted its workspace transfer"
+                                                    .to_string()
+                                            })?
+                                            .base_snapshot_digest,
+                                        patch_bytes,
+                                    )
+                                    .map_err(|error| {
+                                        format!("Could not persist remote result: {error}")
+                                    })?;
+                                    let _ = std::fs::remove_file(&patch_path);
+                                    if let Some(object) = result.as_object_mut() {
+                                        object.insert("resultId".to_string(), Value::String(result_id));
+                                        object.insert("reviewRequired".to_string(), Value::Bool(true));
+                                    }
                                 }
-                                autonomous_placement_result(
-                                    &data_dir,
-                                    &workspace_root,
-                                    &before_revision,
-                                    &local_snapshot.id,
-                                    result,
-                                )
+                                Ok(result)
                             }
                             .await;
-                            let _ = crate::agent_worktrees::discard_snapshot(
-                                &data_dir,
-                                &local_snapshot.id,
-                            );
                             return placement_result;
                         }
                     }
@@ -2205,23 +2315,33 @@ pub async fn autonomous_task_place_node(
                         &container_snapshot.id,
                         &spec,
                     )?;
-                    let patch = crate::agent_worktrees::patch_bytes_since_snapshot(
-                        &data_dir,
-                        &container_workspace,
-                        &container_snapshot.id,
-                    )?;
-                    if !patch.is_empty() {
-                        crate::agent_worktrees::apply_patch_artifact(
-                            Path::new(&host_workspace),
-                            &patch,
-                        )?;
-                    }
-                    enforce_autonomous_placement_scope(
+                    let result_id = spec
+                        .workspace_transfer
+                        .as_ref()
+                        .map(|base| {
+                            let result = crate::execution_target::workspace_result_from_workspace(
+                                base,
+                                &container_workspace,
+                            )
+                            .map_err(|error| error.to_string())?;
+                            crate::execution_target::persist_workspace_result(&data_dir, &result)
+                                .map_err(|error| error.to_string())
+                        })
+                        .transpose()?;
+                    let mut response = autonomous_placement_result(
                         &data_dir,
                         Path::new(&host_workspace),
+                        &before_revision,
                         &local_snapshot.id,
-                        &spec,
+                        runner_result,
                     )?;
+                    if let Some(result_id) = result_id {
+                        if let Some(object) = response.as_object_mut() {
+                            object.insert("resultId".to_string(), Value::String(result_id));
+                            object.insert("reviewRequired".to_string(), Value::Bool(true));
+                        }
+                    }
+                    return Ok(response);
                 }
                 autonomous_placement_result(
                     &data_dir,
@@ -2428,26 +2548,15 @@ pub async fn autonomous_task_place_node(
             let result = target
                 .workspace_result(&handle)
                 .map_err(|error| error.to_string())?;
-            let local_snapshot = crate::agent_worktrees::snapshot(&data_dir, &host_workspace)
+            let result_id = crate::execution_target::persist_workspace_result(&data_dir, &result)
                 .map_err(|error| error.to_string())?;
-            crate::execution_target::apply_workspace_result(
-                &host_workspace,
-                &result.base_snapshot_digest,
-                &result,
-            )
-            .map_err(|error| error.to_string())?;
-            enforce_autonomous_placement_scope(
-                &data_dir,
-                &host_workspace,
-                &local_snapshot.id,
-                &spec,
-            )?;
             target
                 .cleanup(&workspace_handle)
                 .map_err(|error| error.to_string())?;
             Ok(serde_json::json!({
                 "ok": true,
-                "summary": "SSH runner completed the autonomous placement",
+                "summary": "SSH runner completed; review the persisted workspace result before applying it",
+                "resultId": result_id,
                 "changedFiles": result.new_files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
                 "deletedFiles": result.deleted_files,
             }))
@@ -3333,29 +3442,30 @@ mod tests {
         }))
         .expect("Docker E2E RunSpec should decode");
         let result = autonomous_task_place_node(AutonomousTaskPlacementRequest {
-            kind: "docker".to_string(),
+            kind: Some("docker".to_string()),
             target_id: image.to_string_lossy().into_owned(),
             run_spec,
         })
         .await
         .expect("Docker placement should succeed");
         assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
-        assert_eq!(
-            std::fs::read_to_string(workspace.join("docker-e2e.txt")).unwrap(),
-            "written by the Docker autonomous runner\n"
-        );
-        let artifact_id = result["artifacts"][0]["artifactId"]
-            .as_str()
-            .expect("Docker placement should return its patch artifact");
         let data_dir = crate::app_paths::data_dir().expect("app data dir");
-        let store = crate::artifact_store::ArtifactStore::new(data_dir.join("content-v1"))
-            .expect("artifact store");
-        let artifact = store
-            .read(artifact_id)
-            .expect("patch artifact should be readable");
+        assert!(
+            !workspace.join("docker-e2e.txt").exists(),
+            "remote results must not mutate the host workspace"
+        );
+        let result_id = result["resultId"]
+            .as_str()
+            .expect("Docker placement should persist a result");
+        let remote_result = crate::execution_target::load_workspace_result(&data_dir, result_id)
+            .expect("persisted Docker result should be readable");
         init(&verifier);
-        crate::agent_worktrees::apply_patch_artifact(&verifier, &artifact)
-            .expect("host should apply the returned patch artifact");
+        crate::execution_target::apply_workspace_result(
+            &verifier,
+            &remote_result.base_snapshot_digest,
+            &remote_result,
+        )
+        .expect("explicit result apply should succeed on a clean verifier");
         assert_eq!(
             std::fs::read_to_string(verifier.join("docker-e2e.txt")).unwrap(),
             "written by the Docker autonomous runner\n"
@@ -3564,7 +3674,7 @@ mod tests {
         }))
         .expect("real Docker E2E RunSpec should decode");
         let result = autonomous_task_place_node(AutonomousTaskPlacementRequest {
-            kind: "docker".to_string(),
+            kind: Some("docker".to_string()),
             target_id: image,
             run_spec,
         })
@@ -3582,25 +3692,24 @@ mod tests {
             .as_array()
             .is_some_and(|items| !items.is_empty()));
         assert_eq!(result["review"]["verdict"], "pass");
-        assert!(result["mutation"]["beforeRevision"].is_string());
-        assert!(result["mutation"]["afterRevision"].is_string());
-        assert!(result["mutation"]["patchDigest"].is_string());
-        let artifact_id = result["artifacts"][0]["artifactId"]
-            .as_str()
-            .expect("real Docker result should include its patch artifact");
-        let data_dir = crate::artifact_store::ArtifactStore::new(
-            crate::app_paths::data_dir()
-                .expect("app data dir")
-                .join("content-v1"),
+        let data_dir = crate::app_paths::data_dir().expect("app data dir");
+        assert!(result["resultId"].is_string());
+        assert!(
+            !workspace.join("docker-e2e.txt").exists(),
+            "remote results must not mutate the host workspace"
+        );
+        let remote_result = crate::execution_target::load_workspace_result(
+            &data_dir,
+            result["resultId"].as_str().unwrap(),
         )
-        .expect("artifact store");
-        let artifact = data_dir
-            .read(artifact_id)
-            .expect("real Docker patch artifact should be readable");
-        assert_eq!(format!("{:x}", Sha256::digest(&artifact)), artifact_id);
+        .expect("real Docker result should be persisted");
         init(&verifier);
-        crate::agent_worktrees::apply_patch_artifact(&verifier, &artifact)
-            .expect("real Docker artifact should replay on a clean host repo");
+        crate::execution_target::apply_workspace_result(
+            &verifier,
+            &remote_result.base_snapshot_digest,
+            &remote_result,
+        )
+        .expect("explicit result apply should replay on a clean host repo");
         assert_eq!(
             std::fs::read_to_string(verifier.join("docker-e2e.txt")).unwrap(),
             "written by the real monkey-cli\n"

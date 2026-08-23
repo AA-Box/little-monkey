@@ -128,6 +128,7 @@ export interface TaskWorker {
   artifacts?: TaskArtifact[];
   resultSummary?: string;
   usage?: Partial<TaskUsage>;
+  resultId?: string;
 }
 
 export interface TaskArtifact {
