@@ -2111,7 +2111,6 @@ async fn execute_registered_target_placement(
         },
         workspace: workspace_handle.clone(),
         command: vec![
-            "monkey".to_string(),
             "task".to_string(),
             "run".to_string(),
             ".little-monkey/execution-spec.json".to_string(),
