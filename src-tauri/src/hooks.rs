@@ -385,11 +385,15 @@ mod tests {
         let cwd = std::env::temp_dir();
         let projector = crate::test_support::RecordingProjector::shared();
 
-        let outcome = hook_exec_impl(&cwd, "cat", "hello", projector.clone())
+        #[cfg(target_os = "windows")]
+        let (command, expected_stdout) = ("echo hello", "hello");
+        #[cfg(not(target_os = "windows"))]
+        let (command, expected_stdout) = ("cat", "hello");
+        let outcome = hook_exec_impl(&cwd, command, "hello", projector.clone())
             .await
             .expect("the hook runs");
         assert_eq!(outcome.exit_code, Some(0));
-        assert_eq!(outcome.stdout, "hello");
+        assert_eq!(outcome.stdout.trim(), expected_stdout);
 
         let row = projector.only(ProcessKind::HookCommand);
         assert_eq!(row.state, crate::process_table::ProcessState::Exited);

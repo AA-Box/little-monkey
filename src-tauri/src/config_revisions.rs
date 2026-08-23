@@ -349,7 +349,7 @@ fn write_log(
     ));
     std::fs::write(&tmp, body)
         .map_err(|e| RevisionError::Io(format!("failed to write revisions: {e}")))?;
-    if let Err(error) = std::fs::rename(&tmp, &path) {
+    if let Err(error) = replace_revision_file(&tmp, &path) {
         // The temp file is this writer's own, so cleaning it up on failure
         // cannot disturb anybody else's in-flight write.
         let _ = std::fs::remove_file(&tmp);
@@ -360,11 +360,79 @@ fn write_log(
     Ok(())
 }
 
+#[cfg(unix)]
+fn replace_revision_file(
+    temporary: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(temporary, destination)
+}
+
+#[cfg(windows)]
+fn replace_revision_file(
+    temporary: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // A reader that opened the previous revision just before the writer's
+    // process-wide record lock was acquired can briefly keep the destination
+    // handle alive on Windows. Retry only those transient sharing failures;
+    // every other error remains fail-closed.
+    for _ in 0..80 {
+        // SAFETY: both buffers are owned, NUL-terminated UTF-16 strings and
+        // live for the duration of this synchronous Win32 call.
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                target.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } != 0
+        {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_ACCESS_DENIED as i32 || code == ERROR_SHARING_VIOLATION as i32
+        ) {
+            return Err(error);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Err(std::io::Error::last_os_error())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_revision_file(
+    temporary: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(temporary, destination)
+}
+
 /// Distinguishes one writer's temp file from another's within this process.
 ///
 /// Paired with the pid so two *processes* — the desktop app and `monkey` — do
 /// not collide either. See [`write_log`] for the failure this prevents.
 static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REVISION_RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn append_line(
     root: &Path,
@@ -435,6 +503,12 @@ pub fn record(
     entity_id: &str,
     request: RecordRequest,
 ) -> Result<Revision, RevisionError> {
+    // The optimistic base check and the subsequent append/rewrite must see one
+    // coherent local history. In particular, Windows cannot replace the old
+    // file while another thread still has a read handle open on it.
+    let _record_guard = REVISION_RECORD_LOCK
+        .lock()
+        .map_err(|_| RevisionError::Io("revision record lock poisoned".to_string()))?;
     validate_ids(kind, entity_id)?;
     if request.content.len() > MAX_CONTENT_BYTES {
         return Err(RevisionError::Invalid(format!(

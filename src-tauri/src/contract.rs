@@ -45,7 +45,7 @@ use crate::http_route_registry::{
 /// * **minor**: anything additive — a new route, method, tool, or optional
 ///   parameter.
 /// * **patch**: descriptions and other non-structural wording.
-pub const CONTRACT_VERSION: &str = "1.7.0";
+pub const CONTRACT_VERSION: &str = "2.0.0";
 
 /// How long a surface stays after it is announced deprecated.
 ///
@@ -63,7 +63,7 @@ pub const ACP_PROTOCOL_VERSION: u64 = 1;
 /// Signed remote-plane protocol version. Mirrors `monkey-cli`'s
 /// `daemon::remote::protocol::REMOTE_PROTOCOL_VERSION`, checked by the same
 /// source-scanning test that checks [`REMOTE_ROUTES`].
-pub const REMOTE_PROTOCOL_VERSION: u32 = 1;
+pub const REMOTE_PROTOCOL_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // The remote plane's route table
@@ -202,6 +202,42 @@ pub const REMOTE_ROUTES: &[RemoteRouteSpec] = &[
         plane: RemotePlane::Control,
         method: "POST",
         path: "/v1/remote/desktop-control/action",
+        gate: RemoteGate::Action("ControlDesktop"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Control,
+        method: "POST",
+        path: "/v1/remote/desktop-control/list-targets",
+        gate: RemoteGate::Action("ControlDesktop"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Control,
+        method: "POST",
+        path: "/v1/remote/desktop-control/inspect",
+        gate: RemoteGate::Action("ControlDesktop"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Control,
+        method: "POST",
+        path: "/v1/remote/desktop-control/screenshot",
+        gate: RemoteGate::Action("ControlDesktop"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Control,
+        method: "POST",
+        path: "/v1/remote/desktop-control/clipboard-read",
+        gate: RemoteGate::Action("ControlDesktop"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Control,
+        method: "POST",
+        path: "/v1/remote/desktop-control/pause",
+        gate: RemoteGate::Action("ControlDesktop"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Control,
+        method: "POST",
+        path: "/v1/remote/desktop-control/resume",
         gate: RemoteGate::Action("ControlDesktop"),
     },
     RemoteRouteSpec {
@@ -1242,7 +1278,7 @@ mod tests {
         let error = check_against_baseline(&serde_json::to_string(&published).unwrap())
             .expect_err("losing a tool without a major bump must fail");
         assert!(error.contains("tool removed: invented_tool"), "{error}");
-        assert!(error.contains("requires at least 2.0.0"), "{error}");
+        assert!(error.contains("requires at least 3.0.0"), "{error}");
     }
 
     #[test]

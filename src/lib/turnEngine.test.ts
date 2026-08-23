@@ -50,6 +50,7 @@ import { useUserHooksStore } from "../store/userHooksStore";
 import { usePermissionStore } from "../store/permissionStore";
 import { DurableRunRecorder } from "./durableRun";
 import type { RunEventWire } from "./runProtocol";
+import { ComputerUseRunBudget } from "./taskCoordinator";
 
 const emptyMcpRegistry: McpToolRegistry = new Map();
 
@@ -250,6 +251,271 @@ describe("executeToolCall / programmatic dispatcher integration", () => {
     expect(JSON.parse(result).error).toContain("Invalid arguments for \"read_file\"");
     expect(invokeMock).not.toHaveBeenCalled();
     expect(completed).toHaveBeenCalledOnce();
+  });
+
+  it("runs a native call through the model-facing observe/authorize/execute/verify dispatcher", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "tool_computer_list_targets") return JSON.stringify({ targets: [{ window_id: "w-1" }] });
+      if (command === "tool_computer_inspect") return JSON.stringify({ elements: [] });
+      if (command === "tool_computer_click") return JSON.stringify({ executed: true, stateVerified: true });
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const result = await executeToolCall(
+      call("computer_click", {
+        session_id: "desktop-session",
+        target_application_id: "Notes",
+        target_window_id: "w-1",
+        element_id: "Notes::element-1::native-button",
+      }),
+      null,
+      "turn-native",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { computerUseBudget: new ComputerUseRunBudget() },
+    );
+
+    expect(JSON.parse(result)).toMatchObject({ executed: true, stateVerified: true });
+    expect(invokeMock.mock.calls.map(([command]) => command)).toEqual([
+      "tool_computer_list_targets",
+      "tool_computer_click",
+      "tool_computer_inspect",
+    ]);
+  });
+
+  it("re-observes and retries a native provider failure before input is sent", async () => {
+    let clickAttempts = 0;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "tool_computer_list_targets") return JSON.stringify({ targets: [{ window_id: "w-1" }] });
+      if (command === "tool_computer_inspect") return JSON.stringify({ elements: [] });
+      if (command === "tool_computer_click") {
+        clickAttempts += 1;
+        if (clickAttempts === 1) throw new Error(JSON.stringify({
+          code: "PROVIDER_TRANSIENT_PRE_INPUT",
+          inputSent: false,
+          safeToRetry: true,
+          phase: "pre_execute",
+          message: "transient provider failure before input",
+        }));
+        return JSON.stringify({ executed: true, inputSent: true, stateVerified: true });
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const result = await executeToolCall(
+      call("computer_click", {
+        session_id: "desktop-session",
+        target_application_id: "Notes",
+        target_window_id: "w-1",
+        element_id: "Notes::element-1::native-button",
+      }),
+      null,
+      "turn-native-retry",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { computerUseBudget: new ComputerUseRunBudget() },
+    );
+
+    expect(JSON.parse(result)).toMatchObject({ executed: true, stateVerified: true });
+    expect(clickAttempts).toBe(2);
+    expect(invokeMock.mock.calls.map(([command]) => command)).toEqual([
+      "tool_computer_list_targets",
+      "tool_computer_click",
+      "tool_computer_inspect",
+      "tool_computer_list_targets",
+      "tool_computer_click",
+      "tool_computer_inspect",
+    ]);
+  });
+
+  it("returns input-sent verification failure without retrying the native action", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "tool_computer_list_targets") return JSON.stringify({ targets: [{ window_id: "w-1" }] });
+      if (command === "tool_computer_inspect") return JSON.stringify({ elements: [] });
+      if (command === "tool_computer_click") return JSON.stringify({ executed: true, inputSent: true, stateVerified: false });
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const result = await executeToolCall(
+      call("computer_click", {
+        session_id: "desktop-session",
+        target_application_id: "Notes",
+        target_window_id: "w-1",
+        element_id: "Notes::element-1::native-button",
+      }),
+      null,
+      "turn-native-no-duplicate",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { computerUseBudget: new ComputerUseRunBudget() },
+    );
+
+    expect(JSON.parse(result).error).toMatchObject({ code: "INPUT_SENT_UNVERIFIED", inputSent: true, safeToRetry: false });
+    expect(invokeMock.mock.calls.filter(([command]) => command === "tool_computer_click")).toHaveLength(1);
+  });
+
+  it("fails closed on an unknown native IPC rejection without retrying", async () => {
+    let actionCalls = 0;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "tool_computer_list_targets") return JSON.stringify({ targets: [{ window_id: "w-1" }] });
+      if (command === "tool_computer_inspect") return JSON.stringify({ elements: [] });
+      if (command === "tool_computer_click") {
+        actionCalls += 1;
+        throw new Error("IPC connection lost after the provider ran");
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const result = await executeToolCall(
+      call("computer_click", {
+        session_id: "desktop-session",
+        target_application_id: "Notes",
+        target_window_id: "w-1",
+        element_id: "Notes::element-1::native-button",
+      }),
+      null,
+      "turn-native-unknown-ipc",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { computerUseBudget: new ComputerUseRunBudget() },
+    );
+
+    expect(JSON.parse(result).error).toMatchObject({ code: "UNKNOWN", inputSent: true, safeToRetry: false });
+    expect(actionCalls).toBe(1);
+  });
+
+  it.each([
+    ["ambiguous provider failure", { code: "INPUT_MAY_HAVE_BEEN_SENT", inputSent: true, safeToRetry: false, phase: "execute", message: "partial input" }],
+    ["operator denial", { code: "OPERATOR_DENIED", inputSent: false, safeToRetry: false, phase: "authorize", message: "denied" }],
+    ["approval timeout", { code: "APPROVAL_TIMEOUT", inputSent: false, safeToRetry: false, phase: "authorize", message: "timeout" }],
+    ["paused session", { code: "SESSION_PAUSED", inputSent: false, safeToRetry: false, phase: "authorize", message: "paused" }],
+    ["stopped session", { code: "SESSION_STOPPED", inputSent: false, safeToRetry: false, phase: "authorize", message: "stopped" }],
+    ["revoked session", { code: "SESSION_REVOKED", inputSent: false, safeToRetry: false, phase: "authorize", message: "revoked" }],
+    ["security refusal", { code: "SECURITY_REFUSED", inputSent: false, safeToRetry: false, phase: "authorize", message: "refused" }],
+  ] as const)("never retries %s", async (_label, failure) => {
+    let actionCalls = 0;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "tool_computer_list_targets") return JSON.stringify({ targets: [{ window_id: "w-1" }] });
+      if (command === "tool_computer_inspect") return JSON.stringify({ elements: [] });
+      if (command === "tool_computer_click") {
+        actionCalls += 1;
+        throw new Error(JSON.stringify(failure));
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const result = await executeToolCall(
+      call("computer_click", {
+        session_id: "desktop-session",
+        target_application_id: "Notes",
+        target_window_id: "w-1",
+        element_id: "Notes::element-1::native-button",
+      }),
+      null,
+      `turn-terminal-${failure.code}`,
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { computerUseBudget: new ComputerUseRunBudget() },
+    );
+
+    expect(JSON.parse(result).error).toMatchObject(failure);
+    expect(actionCalls).toBe(1);
+  });
+
+  it("runs one mixed browser-to-native golden task through the canonical dispatcher", async () => {
+    const trace: string[] = [];
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "tool_browser_inspect") {
+        trace.push("browser:inspect");
+        return JSON.stringify({ url: "https://example.test", dom: { save: "button" } });
+      }
+      if (command === "tool_computer_list_targets") {
+        trace.push("native:list_targets");
+        return JSON.stringify({ targets: [{ window_id: "w-1" }] });
+      }
+      if (command === "tool_computer_inspect") {
+        trace.push("native:inspect");
+        return JSON.stringify({ elements: [{ label: "Save profile" }] });
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const browserResult = await executeToolCall(
+      call("browser_inspect", { url: "https://example.test" }),
+      null,
+      "turn-mixed-golden",
+      emptyMcpRegistry,
+    );
+    const nativeResult = await executeToolCall(
+      call("computer_inspect", {
+        session_id: "desktop-session",
+        target_application_id: "Notes",
+        target_window_id: "w-1",
+      }),
+      null,
+      "turn-mixed-golden",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { computerUseBudget: new ComputerUseRunBudget() },
+    );
+
+    expect(JSON.parse(browserResult)).toMatchObject({ url: "https://example.test" });
+    expect(JSON.parse(nativeResult)).toMatchObject({ elements: [{ label: "Save profile" }] });
+    expect(trace).toEqual(["browser:inspect", "native:list_targets", "native:inspect", "native:inspect"]);
   });
 });
 

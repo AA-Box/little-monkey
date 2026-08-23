@@ -8,7 +8,7 @@ use ring::{hmac, rand as ring_rand};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const REMOTE_PROTOCOL_VERSION: u32 = 1;
+pub const REMOTE_PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_REQUEST_SKEW_MS: u64 = 5 * 60 * 1_000;
 /// A capture may contain a 32 MiB binary artifact encoded as base64 plus
 /// bounded JSON metadata. Hyper still enforces this before allocating the
@@ -1144,6 +1144,18 @@ pub struct DesktopControlStartRequest {
     pub allowlist: Vec<String>,
     #[serde(default)]
     pub batch_mode: bool,
+    #[serde(default)]
+    pub allowed_windows: Vec<String>,
+    #[serde(default)]
+    pub lifetime_ms: Option<u64>,
+    #[serde(default)]
+    pub allow_screenshots: Option<bool>,
+    #[serde(default)]
+    pub allow_keyboard_input: Option<bool>,
+    #[serde(default)]
+    pub allow_clipboard_read: Option<bool>,
+    #[serde(default)]
+    pub approval_policy: Option<little_monkey_lib::desktop_control::ApprovalPolicy>,
 }
 
 /// Body of `POST /v1/remote/desktop-control/action`. Reuses the desktop-control
@@ -1156,6 +1168,8 @@ pub struct DesktopControlActionRequest {
     /// Which allowlisted application/window this action is aimed at — the
     /// desktop-control core enforces this against the session allowlist.
     pub target_application_id: String,
+    #[serde(default)]
+    pub target_window_id: Option<String>,
     pub action: little_monkey_lib::desktop_control::ControlAction,
 }
 
@@ -1164,6 +1178,21 @@ pub struct DesktopControlActionRequest {
 #[serde(deny_unknown_fields)]
 pub struct DesktopControlStopRequest {
     pub session_id: String,
+}
+
+/// Read-only target selection request shared by list/inspect/screenshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopControlTargetRequest {
+    pub session_id: String,
+    #[serde(default)]
+    pub target_application_id: Option<String>,
+    #[serde(default)]
+    pub target_window_id: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub bounds: Option<little_monkey_lib::desktop_control::ComputerBounds>,
 }
 
 /// Body of `POST /v1/remote/migration/preflight` — metadata only, so a target

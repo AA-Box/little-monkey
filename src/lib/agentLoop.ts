@@ -60,6 +60,7 @@ import {
   type ToolExecutionContext,
 } from './turnEngine';
 import { classifyToolCall, type RiskClassification } from './riskJudge';
+import { ComputerUseRunBudget } from './taskCoordinator';
 import {
   composeReferencedText,
   extractMentionPaths,
@@ -574,12 +575,43 @@ export const formatVerifyNotice = verifyNoticeCodec.format;
  * doc, which suggested reusing `VERIFY_NOTE_PREFIX` for this message. */
 export const VERIFY_FIX_NOTE_PREFIX = '[Verify Fix]';
 
+function computerScreenshotContent(toolName: string, result: string): ChatContentPart[] | null {
+  if (toolName !== 'computer_screenshot') return null;
+  try {
+    const parsed = JSON.parse(result) as { content_base64?: unknown };
+    if (typeof parsed.content_base64 !== 'string' || parsed.content_base64.length === 0) return null;
+    const { content_base64: _content, ...metadata } = parsed;
+    return [
+      { type: 'text', text: JSON.stringify(metadata) },
+      { type: 'image_url', image_url: { url: `data:image/png;base64,${parsed.content_base64}` } },
+    ];
+  } catch {
+    return null;
+  }
+}
+
 export function isVerifyFixNotice(message: ChatMessage): boolean {
   return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(VERIFY_FIX_NOTE_PREFIX);
 }
 
 /** Tool names gated by the `webToolsEnabled` settings toggle — see `toolsForSettings`. */
 const WEB_TOOL_NAMES = new Set(['web_fetch', 'web_search']);
+const COMPUTER_TOOL_NAMES = new Set([
+  'computer_list_targets',
+  'computer_screenshot',
+  'computer_clipboard_read',
+  'computer_inspect',
+  'computer_focus',
+  'computer_click',
+  'computer_double_click',
+  'computer_scroll',
+  'computer_type',
+  'computer_key',
+  'computer_hotkey',
+  'computer_wait',
+  'computer_select',
+  'computer_set_value',
+]);
 
 /**
  * Filters `remember` out of the tool list offered to the model this turn
@@ -622,10 +654,12 @@ export function toolsForSettings(
   readSkillResourceToolEnabled = false,
   skillLearningToolEnabled = false,
   skillSearchToolEnabled = false,
+  desktopControlEnabled = false,
 ): ToolDef[] {
   const filtered = tools.filter((tool) => {
     if (!memoryEnabled && tool.function.name === 'remember') return false;
     if (!webToolsEnabled && WEB_TOOL_NAMES.has(tool.function.name)) return false;
+    if (!desktopControlEnabled && COMPUTER_TOOL_NAMES.has(tool.function.name)) return false;
     return true;
   });
   return [
@@ -1528,6 +1562,7 @@ function registerDurableController(
 interface DurableTurnContext {
   recorder: DurableRunRecorder | null;
   failure: string | null;
+  computerUseBudget: ComputerUseRunBudget | null;
   /** One-shot model call for the bounded learning reflection pass, built by
    * `runAgentTurnBody` (which owns the resolved target and the privacy gate)
    * and consumed by `runAgentTurn`'s `finally` — the learning step can only
@@ -2288,7 +2323,14 @@ async function runTurnGuarded(
   }).catch(() => null);
   // Distinct from checkpointId (which can be null): scopes shell,
   // cancellation, permission prompts, and durable run events to this turn.
-  const durable: DurableTurnContext = { recorder: null, failure: null, reflect: null, skills: null, toolFailures: [] };
+  const durable: DurableTurnContext = {
+    recorder: null,
+    failure: null,
+    computerUseBudget: useSettingsStore.getState().desktopControlEnabled ? new ComputerUseRunBudget() : null,
+    reflect: null,
+    skills: null,
+    toolFailures: [],
+  };
   let thrown: unknown = null;
   try {
     await runAgentTurnBody(
@@ -2458,6 +2500,11 @@ async function runAgentTurnBody(
   const requireVision = images.length > 0;
 
   const settings = useSettingsStore.getState();
+  const consumeComputerUseModelCall = (): void => {
+    if (durable.computerUseBudget && !durable.computerUseBudget.consume('model_calls')) {
+      throw new Error('COMPUTER_USE_BUDGET_EXCEEDED: model call deadline or limit reached');
+    }
+  };
   const privacyWorkspaceId = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? 'global';
   const privacyWireCache: PrivacyWireCache = new Map();
   const surfacedRateLimitWarnings = new Set<string>();
@@ -2950,6 +2997,7 @@ async function runAgentTurnBody(
       // without one there is no evidence chain for a proposal to append to.
       cachedLearningMode() !== null && cachedLearningMode() !== 'off' && durable.recorder !== null,
       skillSearchToolEnabled,
+      settings.desktopControlEnabled,
     ),
     hasWorkspace,
   );
@@ -2967,6 +3015,7 @@ async function runAgentTurnBody(
     if (!prepared) {
       throw new Error('Privacy Firewall cancelled context summarization.');
     }
+    consumeComputerUseModelCall();
     const result = await attemptStream(
       prepared.target,
       prepared.messages,
@@ -3011,6 +3060,7 @@ async function runAgentTurnBody(
           if (!prepared) {
             throw new Error('Privacy Firewall cancelled risk classification.');
           }
+          consumeComputerUseModelCall();
           return attemptStream(
               prepared.target,
               prepared.messages,
@@ -3041,6 +3091,7 @@ async function runAgentTurnBody(
     if (!prepared) {
       throw new Error('Privacy Firewall cancelled the learning reflection.');
     }
+    consumeComputerUseModelCall();
     const result = await attemptStream(
       prepared.target,
       prepared.messages,
@@ -3235,6 +3286,7 @@ async function runAgentTurnBody(
       toolDefinitions: toolsForTurn,
       isToolAvailable,
       onCompleted: completeToolCall,
+      computerUseBudget: durable.computerUseBudget ?? undefined,
     };
     const programmaticToolOffered = toolsForTurn.some(
       (tool) => tool.function.name === PROGRAMMATIC_TOOL.function.name,
@@ -3306,6 +3358,7 @@ async function runAgentTurnBody(
     const assistantPlaceholder: ChatMessage = { role: 'assistant', content: '' };
     addMessage(assistantPlaceholder);
 
+    consumeComputerUseModelCall();
     let attempt = await attemptStream(
       target,
       outboundWireHistory,
@@ -3350,6 +3403,7 @@ async function runAgentTurnBody(
       });
       surfaceRateLimitWarnings(target);
       addMessage({ role: 'assistant', content: '' });
+      consumeComputerUseModelCall();
       attempt = await attemptStream(
         target,
         outboundWireHistory,
@@ -3412,6 +3466,7 @@ async function runAgentTurnBody(
           ? preparedFailoverWire.messages
           : wireHistoryFor(target);
       addMessage({ role: 'assistant', content: '' });
+      consumeComputerUseModelCall();
       attempt = await attemptStream(
         target,
         failoverWireHistory,
@@ -3716,7 +3771,7 @@ async function runAgentTurnBody(
       const toolMessage: ChatMessage = {
         role: 'tool',
         tool_call_id: toolCall.id,
-        content: modelResultContent,
+        content: computerScreenshotContent(toolCall.function.name, resultContent) ?? modelResultContent,
       };
       addMessage(toolMessage);
 
