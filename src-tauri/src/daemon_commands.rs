@@ -2157,6 +2157,12 @@ async fn execute_registered_target_placement(
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     };
     if status != crate::execution_target::TargetRunStatus::Succeeded {
+        let detail = target
+            .events(&handle, 0)
+            .ok()
+            .and_then(|events| events.into_iter().last())
+            .map(|event| event.message.trim().chars().take(2_048).collect::<String>())
+            .filter(|message| !message.is_empty());
         let _ = target.cleanup(&workspace_handle);
         delete_autonomous_placement_record(&data_dir, &spec.run_id)?;
         let code = match status {
@@ -2165,7 +2171,10 @@ async fn execute_registered_target_placement(
             _ => "RUNNER_LOST",
         };
         return Err(format!(
-            "{code}: {placement_kind} runner finished with status {status:?}"
+            "{code}: {placement_kind} runner finished with status {status:?}{}",
+            detail
+                .map(|message| format!("; output: {message}"))
+                .unwrap_or_default()
         ));
     }
     let result = target

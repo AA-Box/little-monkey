@@ -1949,6 +1949,8 @@ struct DockerRunRecord {
     remote_id: String,
     workspace: WorkspaceHandle,
     base_transfer: WorkspaceTransfer,
+    #[serde(default)]
+    transient_inputs: Vec<String>,
 }
 
 impl DockerExecutionTarget {
@@ -2017,6 +2019,14 @@ impl DockerExecutionTarget {
         )?;
         fs::rename(temporary, path)?;
         Ok(())
+    }
+
+    fn remove_transient_inputs(root: &Path, inputs: &[String]) {
+        for relative in inputs {
+            if let Ok(path) = safe_apply_join(root, relative) {
+                let _ = fs::remove_file(path);
+            }
+        }
     }
 }
 
@@ -2094,6 +2104,47 @@ impl ExecutionTarget for DockerExecutionTarget {
                 "Docker run command is empty or contains NUL",
             ));
         }
+        if request.input_files.len() > 1_024 {
+            return Err(TargetError::workspace_transfer_failed(
+                "Docker input file count exceeds transfer bounds",
+            ));
+        }
+        let mut input_bytes = 0u64;
+        let mut transient_inputs = Vec::new();
+        for file in &request.input_files {
+            if file.file_type != "file" {
+                return Err(TargetError::invalid(
+                    "Docker input files must be regular files",
+                ));
+            }
+            if digest(&file.bytes) != file.sha256 {
+                return Err(TargetError::invalid(format!(
+                    "Docker input digest mismatch for {}",
+                    file.path
+                )));
+            }
+            if file.bytes.len() as u64 > MAX_TRANSFER_FILE_BYTES
+                || input_bytes.saturating_add(file.bytes.len() as u64) > MAX_TRANSFER_TOTAL_BYTES
+            {
+                return Err(TargetError::workspace_transfer_failed(
+                    "Docker input files exceed transfer bounds",
+                ));
+            }
+            input_bytes = input_bytes.saturating_add(file.bytes.len() as u64);
+            let input_path = safe_apply_join(&request.workspace.path, &file.path)?;
+            if input_path.exists() || fs::symlink_metadata(&input_path).is_ok() {
+                return Err(TargetError::workspace_conflict(format!(
+                    "Docker input would overwrite workspace content: {}",
+                    file.path
+                )));
+            }
+            if let Some(parent) = input_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&input_path, &file.bytes)?;
+            set_executable(&input_path, file.executable)?;
+            transient_inputs.push(file.path.clone());
+        }
         let name = Self::container_name(&request.run_id);
         let mut command = Command::new(&self.docker_binary);
         // Docker's default PID namespace is private. Do not pass the
@@ -2141,26 +2192,60 @@ impl ExecutionTarget for DockerExecutionTarget {
         }
         command.args([&self.image]);
         command.args(&request.command);
-        let output = command
-            .output()
-            .map_err(|error| TargetError::target_unreachable(error.to_string()))?;
+        let output = match command.output() {
+            Ok(output) => output,
+            Err(error) => {
+                Self::remove_transient_inputs(&request.workspace.path, &transient_inputs);
+                return Err(TargetError::target_unreachable(error.to_string()));
+            }
+        };
         if !output.status.success() {
+            Self::remove_transient_inputs(&request.workspace.path, &transient_inputs);
             return Err(TargetError::target_unreachable(
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
             ));
         }
         let remote_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let base_transfer = match request.workspace.base_transfer.clone() {
+            Some(base_transfer) => base_transfer,
+            None => {
+                Self::remove_transient_inputs(&request.workspace.path, &transient_inputs);
+                let _ = Command::new(&self.docker_binary)
+                    .args(["rm", "--force", &remote_id])
+                    .output();
+                return Err(TargetError::workspace_transfer_failed(
+                    "Docker run omitted its base transfer",
+                ));
+            }
+        };
         let record = DockerRunRecord {
             run_id: request.run_id.clone(),
             remote_id: remote_id.clone(),
             workspace: request.workspace.clone(),
-            base_transfer: request.workspace.base_transfer.clone().ok_or_else(|| {
-                TargetError::workspace_transfer_failed("Docker run omitted its base transfer")
-            })?,
+            base_transfer,
+            transient_inputs: transient_inputs.clone(),
         };
-        let mut records = self.load_records()?;
+        let mut records = match self.load_records() {
+            Ok(records) => records,
+            Err(error) => {
+                Self::remove_transient_inputs(&request.workspace.path, &transient_inputs);
+                let _ = Command::new(&self.docker_binary)
+                    .args(["rm", "--force", &remote_id])
+                    .output();
+                return Err(error);
+            }
+        };
         records.insert(request.run_id.clone(), record);
-        self.save_records(&records)?;
+        if let Err(error) = self.save_records(&records) {
+            Self::remove_transient_inputs(
+                &request.workspace.path,
+                &records[&request.run_id].transient_inputs,
+            );
+            let _ = Command::new(&self.docker_binary)
+                .args(["rm", "--force", &remote_id])
+                .output();
+            return Err(error);
+        }
         self.processes
             .lock()
             .map_err(|_| TargetError::Io("Docker process registry poisoned".into()))?
@@ -2299,6 +2384,9 @@ impl ExecutionTarget for DockerExecutionTarget {
             .ok_or_else(|| {
                 TargetError::result_retrieval_failed("Docker run workspace is no longer registered")
             })?;
+        if let Some(record) = persisted.as_ref() {
+            Self::remove_transient_inputs(&workspace.path, &record.transient_inputs);
+        }
         let base = workspace
             .base_transfer
             .as_ref()
