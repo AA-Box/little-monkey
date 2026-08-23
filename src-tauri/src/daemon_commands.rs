@@ -1778,6 +1778,10 @@ struct AutonomousPlacementRecord {
     handle: crate::execution_target::TargetRunHandle,
     workspace: crate::execution_target::WorkspaceHandle,
     created_at_ms: u64,
+    #[serde(default)]
+    cancelled: bool,
+    #[serde(default)]
+    paused: bool,
 }
 
 fn autonomous_placement_record_path(data_dir: &Path, run_id: &str) -> Result<PathBuf, String> {
@@ -1870,6 +1874,17 @@ pub async fn autonomous_task_recover_node(
     if record.target_id != target_id {
         return Err("placement record target does not match the requested target".to_string());
     }
+    if record.cancelled {
+        delete_autonomous_placement_record(&data_dir, &run_id)?;
+        return Ok(serde_json::json!({
+            "known": true,
+            "pending": false,
+            "ok": false,
+            "failureCode": "RUN_CANCELLED",
+            "failureKind": "RUN_CANCELLED",
+            "summary": "Recovered remote placement was cancelled by the operator"
+        }));
+    }
     let registry =
         crate::execution_target::TargetRegistry::load(&data_dir.join("execution-targets.json"))
             .map_err(|error| error.to_string())?;
@@ -1928,6 +1943,62 @@ pub async fn autonomous_task_recover_node(
         "resultId": result_id,
         "changedFiles": result.new_files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
         "deletedFiles": result.deleted_files,
+    }))
+}
+
+#[tauri::command]
+pub async fn autonomous_task_control_node(
+    target_id: String,
+    run_id: String,
+    action: String,
+) -> Result<Value, String> {
+    validate_id("placement target", &target_id)?;
+    validate_id("placement run id", &run_id)?;
+    let data_dir = crate::app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve app data directory".to_string())?;
+    let Some(mut record) = load_autonomous_placement_record(&data_dir, &run_id)? else {
+        return Ok(serde_json::json!({"known": false}));
+    };
+    if record.target_id != target_id {
+        return Err("placement record target does not match the requested target".to_string());
+    }
+    let registry =
+        crate::execution_target::TargetRegistry::load(&data_dir.join("execution-targets.json"))
+            .map_err(|error| error.to_string())?;
+    let target = registry
+        .get(&target_id)
+        .map_err(|error| error.to_string())?
+        .target()
+        .map_err(|error| error.to_string())?;
+    match action.as_str() {
+        "cancel" => {
+            target
+                .cancel(&record.handle)
+                .map_err(|error| error.to_string())?;
+            record.cancelled = true;
+            record.paused = false;
+        }
+        "pause" => {
+            target
+                .pause(&record.handle)
+                .map_err(|error| error.to_string())?;
+            record.paused = true;
+        }
+        "resume" => {
+            target
+                .resume(&record.handle)
+                .map_err(|error| error.to_string())?;
+            record.paused = false;
+        }
+        _ => return Err("placement control action must be cancel, pause, or resume".to_string()),
+    }
+    save_autonomous_placement_record(&data_dir, &record)?;
+    Ok(serde_json::json!({
+        "known": true,
+        "action": action,
+        "remoteRunId": record.handle.remote_id,
+        "cancelled": record.cancelled,
+        "paused": record.paused
     }))
 }
 
@@ -2062,7 +2133,19 @@ async fn execute_registered_target_placement(
         crate::execution_target::WorkspaceTransfer::from_workspace(&host_workspace, &workspace_id)
             .map_err(|error| format!("{placement_kind} workspace transfer failed: {error}"))?,
     );
-    transfer.policy = crate::execution_target::WorkspacePolicy::Ephemeral;
+    // All nodes of one autonomous task share a task-scoped executor workspace.
+    // This lets verification/review observe changes from earlier remote nodes
+    // without ever applying those changes to the user's checkout.
+    let task_scope = spec
+        .autonomous_task
+        .as_ref()
+        .and_then(|value| value.get("task_snapshot"))
+        .and_then(|value| value.get("taskId"))
+        .and_then(Value::as_str)
+        .unwrap_or(&spec.run_id);
+    let task_scope_digest = format!("{:x}", Sha256::digest(task_scope.as_bytes()));
+    transfer.snapshot_id = format!("task-{}", &task_scope_digest[..24]);
+    transfer.policy = crate::execution_target::WorkspacePolicy::Persistent;
     let requires_git = !matches!(
         transfer.kind,
         crate::execution_target::WorkspaceTransferKind::ContentSnapshot
@@ -2086,8 +2169,13 @@ async fn execute_registered_target_placement(
         crate::recipes::placed_recipe_from_spec(&spec, format!("placed-{placement_kind}-node"))?;
     let recipe_bytes = serde_json::to_vec(&recipe)
         .map_err(|error| format!("Could not serialize placement recipe: {error}"))?;
+    let execution_spec_digest = format!("{:x}", Sha256::digest(spec.run_id.as_bytes()));
+    let execution_spec_path = format!(
+        ".little-monkey/execution-spec-{}.json",
+        &execution_spec_digest[..24]
+    );
     let input_file = crate::execution_target::WorkspaceResultFile {
-        path: ".little-monkey/execution-spec.json".to_string(),
+        path: execution_spec_path.clone(),
         sha256: format!("{:x}", Sha256::digest(&recipe_bytes)),
         bytes: recipe_bytes,
         executable: false,
@@ -2097,7 +2185,7 @@ async fn execute_registered_target_placement(
     let workspace_handle = target
         .prepare_workspace(
             &transfer,
-            crate::execution_target::WorkspacePolicy::Ephemeral,
+            crate::execution_target::WorkspacePolicy::Persistent,
         )
         .map_err(|error| error.to_string())?;
     let run_request = crate::execution_target::RunRequest {
@@ -2113,7 +2201,7 @@ async fn execute_registered_target_placement(
         command: vec![
             "task".to_string(),
             "run".to_string(),
-            ".little-monkey/execution-spec.json".to_string(),
+            execution_spec_path,
             "--json".to_string(),
         ],
         environment: BTreeMap::new(),
@@ -2133,11 +2221,29 @@ async fn execute_registered_target_placement(
             handle: handle.clone(),
             workspace: workspace_handle.clone(),
             created_at_ms: crate::execution_target::execution_now_ms(),
+            cancelled: false,
+            paused: false,
         },
     )?;
-    let deadline =
+    let mut deadline =
         Instant::now() + std::time::Duration::from_millis(spec.budgets.wall_time_ms.max(1));
     let status = loop {
+        if let Some(control) = load_autonomous_placement_record(&data_dir, &spec.run_id)? {
+            if control.cancelled {
+                let _ = target.cleanup(&workspace_handle);
+                delete_autonomous_placement_record(&data_dir, &spec.run_id)?;
+                return Err(
+                    "RUN_CANCELLED: autonomous placement was cancelled by the operator".into(),
+                );
+            }
+            if control.paused {
+                // A user pause suspends wall-time accounting as well as the
+                // executor process so a long pause cannot become a timeout.
+                deadline += std::time::Duration::from_millis(500);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+        }
         let status = target.status(&handle).map_err(|error| error.to_string())?;
         if matches!(
             status,

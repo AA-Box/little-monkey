@@ -506,6 +506,10 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
         params.control?.beginExecution();
         try {
           await params.ownerFence?.(task.executionOwner);
+          const externalPlacement = context.placement
+            && context.placement.kind !== "local"
+            && context.placement.kind !== "worktree";
+          if (externalPlacement) return await params.runtime.executeNode(task, node, context);
           if (node.taskClass === "integration" && params.runtime.integrate) return await params.runtime.integrate(task, node, [...results.values()], context);
           if (node.taskClass === "verification" && params.runtime.verify) return await params.runtime.verify(task, node, context);
           if (node.taskClass === "review" && params.runtime.review) return await params.runtime.review(task, node, context);
@@ -529,11 +533,13 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
           : rawResult;
         const result: TaskNodeResult = isExecutionTargetLost(scopedResult)
           ? { ...scopedResult, ok: false }
-          : scopedResult.ok && mutatingNode && !scopedResult.mutation && !scopedResult.workspaceRevision
-            ? { ...scopedResult, ok: false, summary: "Mutating node did not return a revision-bound mutation record." }
-            : scopedResult.ok && mutatingNode && !scopedResult.mutation && scopedResult.workspaceRevision
-              ? { ...scopedResult, mutation: { beforeRevision: task.workspaceRevision ?? "unknown", afterRevision: scopedResult.workspaceRevision, changedFiles: scopedResult.changedFiles ?? [], patchDigest: scopedResult.workspaceRevision } }
-              : scopedResult;
+          : scopedResult.ok && mutatingNode && scopedResult.reviewRequired && scopedResult.resultId
+            ? scopedResult
+            : scopedResult.ok && mutatingNode && !scopedResult.mutation && !scopedResult.workspaceRevision
+              ? { ...scopedResult, ok: false, summary: "Mutating node did not return a revision-bound mutation record." }
+              : scopedResult.ok && mutatingNode && !scopedResult.mutation && scopedResult.workspaceRevision
+                ? { ...scopedResult, mutation: { beforeRevision: task.workspaceRevision ?? "unknown", afterRevision: scopedResult.workspaceRevision, changedFiles: scopedResult.changedFiles ?? [], patchDigest: scopedResult.workspaceRevision } }
+                : scopedResult;
         results.set(node.nodeId, result);
         const awaitingApproval = !result.ok && result.awaitingApproval === true;
         const status: TaskPlanNode["status"] = result.ok ? "succeeded" : awaitingApproval ? "waiting_approval" : "failed";

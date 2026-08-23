@@ -599,6 +599,13 @@ impl WorkspaceTransfer {
             {
                 return Ok(false);
             }
+            // A Persistent workspace is a task-owned mutable execution surface.
+            // Its marker freezes the original transfer identity while later nodes
+            // intentionally build on changes produced by earlier nodes. The path
+            // is app-owned and task-scoped by the placement service.
+            if matches!(self.policy, WorkspacePolicy::Persistent) {
+                return Ok(true);
+            }
         }
         let current = Self::from_workspace(destination, &self.workspace_id)?;
         Ok(manifest_digest(&current.manifest, &self.kind) == self.base_snapshot_digest)
@@ -2431,7 +2438,7 @@ fn docker_status_from_inspect(value: &str) -> TargetRunStatus {
     let oom_killed = fields.get(2).copied() == Some("true");
     match state {
         "created" => TargetRunStatus::Queued,
-        "running" | "restarting" => TargetRunStatus::Running,
+        "running" | "restarting" | "paused" => TargetRunStatus::Running,
         "exited" if exit_code == Some(0) => TargetRunStatus::Succeeded,
         "exited" => TargetRunStatus::Failed,
         "dead" if oom_killed => TargetRunStatus::Failed,
@@ -2803,16 +2810,34 @@ impl ExecutionTarget for SshRunnerTarget {
         .map_err(|error| TargetError::runner_lost(error.to_string()))
     }
     fn cancel(&self, handle: &TargetRunHandle) -> Result<(), TargetError> {
-        self.request(serde_json::json!({"type":"cancel","runId":handle.remote_id}))
-            .map(|_| ())
+        let response =
+            self.request(serde_json::json!({"type":"cancel","runId":handle.remote_id}))?;
+        if let Some(error) = response.get("error") {
+            return Err(TargetError::runner_lost(
+                error.as_str().unwrap_or("runner rejected cancellation"),
+            ));
+        }
+        Ok(())
     }
     fn pause(&self, handle: &TargetRunHandle) -> Result<(), TargetError> {
-        self.request(serde_json::json!({"type":"pause","runId":handle.remote_id}))
-            .map(|_| ())
+        let response =
+            self.request(serde_json::json!({"type":"pause","runId":handle.remote_id}))?;
+        if let Some(error) = response.get("error") {
+            return Err(TargetError::unsupported(
+                error.as_str().unwrap_or("runner rejected pause"),
+            ));
+        }
+        Ok(())
     }
     fn resume(&self, handle: &TargetRunHandle) -> Result<(), TargetError> {
-        self.request(serde_json::json!({"type":"resume","runId":handle.remote_id}))
-            .map(|_| ())
+        let response =
+            self.request(serde_json::json!({"type":"resume","runId":handle.remote_id}))?;
+        if let Some(error) = response.get("error") {
+            return Err(TargetError::unsupported(
+                error.as_str().unwrap_or("runner rejected resume"),
+            ));
+        }
+        Ok(())
     }
     fn artifacts(&self, handle: &TargetRunHandle) -> Result<Vec<ArtifactDescriptor>, TargetError> {
         let response =
@@ -3055,6 +3080,7 @@ pub fn runner_probe() -> Result<ExecutionTargetSnapshot, TargetError> {
             git: true,
             disposable_workspace: true,
             persistent_workspace: true,
+            suspend: cfg!(unix),
             ..TargetCapabilities::default()
         },
         last_successful_probe_ms: Some(now_ms()),
@@ -3469,14 +3495,11 @@ fn runner_status(process: &mut RunnerProcess) -> Result<TargetRunStatus, TargetE
         return Ok(status);
     }
     if now_ms().saturating_sub(process.started_at_ms) > process.wall_time_ms {
-        if let Some(child) = process.child.as_mut() {
-            child
-                .kill()
-                .map_err(|error| TargetError::runner_lost(error.to_string()))?;
-        } else if process_alive(process.pid) {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(process.pid as libc::pid_t, libc::SIGKILL);
+        if crate::os_signal::kill_process_group(process.pid).is_err() {
+            if let Some(child) = process.child.as_mut() {
+                child
+                    .kill()
+                    .map_err(|error| TargetError::runner_lost(error.to_string()))?;
             }
         }
         process.terminal = Some(write_runner_outcome(
@@ -3679,6 +3702,13 @@ fn runner_submit(value: &serde_json::Value) -> Result<(String, RunnerProcess), T
         .current_dir(&path)
         .env_clear()
         .env("PATH", "/usr/local/bin:/usr/bin:/bin");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Put the wrapper and the command it spawns in one process group so
+        // cancel/pause/resume control the actual workload, not only the wrapper.
+        command.process_group(0);
+    }
     command.stdout(Stdio::null()).stderr(Stdio::null());
     let child = match command.spawn() {
         Ok(child) => child,
@@ -3768,12 +3798,9 @@ pub fn runner_serve_stdio() -> Result<(), TargetError> {
                     .get_mut(id)
                     .ok_or_else(|| TargetError::runner_lost("unknown run"))
                     .and_then(|process| {
-                        if let Some(child) = process.child.as_mut() {
-                            child.kill()?;
-                        } else if process_alive(process.pid) {
-                            #[cfg(unix)]
-                            unsafe {
-                                libc::kill(process.pid as libc::pid_t, libc::SIGKILL);
+                        if crate::os_signal::kill_process_group(process.pid).is_err() {
+                            if let Some(child) = process.child.as_mut() {
+                                child.kill()?;
                             }
                         }
                         process.cancelled = true;
@@ -3797,7 +3824,37 @@ pub fn runner_serve_stdio() -> Result<(), TargetError> {
                 }
             }
             Some("pause") | Some("resume") => {
-                serde_json::json!({"code":"UNSUPPORTED","error":"pause/resume is not supported by this runner build"})
+                let id = request
+                    .get("runId")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                let pause = request.get("type").and_then(|value| value.as_str()) == Some("pause");
+                let controlled = runs
+                    .get_mut(id)
+                    .ok_or_else(|| TargetError::runner_lost("unknown run"))
+                    .and_then(|process| {
+                        if !process_alive(process.pid) {
+                            return Err(TargetError::runner_lost(
+                                "runner process is no longer alive",
+                            ));
+                        }
+                        if pause {
+                            crate::os_signal::suspend_process_group(process.pid)
+                                .map_err(TargetError::unsupported)
+                        } else {
+                            crate::os_signal::resume_process_group(process.pid)
+                                .map_err(TargetError::unsupported)
+                        }
+                    });
+                match controlled {
+                    Ok(()) => {
+                        persist_runner_processes(&runner_data, &runs)?;
+                        serde_json::json!({"ok":true})
+                    }
+                    Err(error) => {
+                        serde_json::json!({"code":error.code(),"error":error.to_string()})
+                    }
+                }
             }
             Some("artifacts") => serde_json::json!({"artifacts": []}),
             Some("workspace_result") => {
@@ -4072,6 +4129,10 @@ mod tests {
         assert_eq!(
             docker_status_from_inspect("exited\t0\tfalse"),
             TargetRunStatus::Succeeded
+        );
+        assert_eq!(
+            docker_status_from_inspect("paused\t0\tfalse"),
+            TargetRunStatus::Running
         );
         assert_eq!(
             docker_status_from_inspect("exited\t42\tfalse"),
