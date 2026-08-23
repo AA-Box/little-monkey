@@ -552,6 +552,7 @@ fn run_spec(run_id: &str, now_ms: u64) -> RunSpec {
             max_artifact_bytes: 1_024,
             max_event_count: 100,
         },
+        autonomous_task: None,
     }
 }
 

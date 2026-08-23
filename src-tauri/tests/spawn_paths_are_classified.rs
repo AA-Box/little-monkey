@@ -343,6 +343,11 @@ const CLASSIFIED_CLI: &[(&str, Class, &str)] = &[
         "managed-runtime install and probe operations",
     ),
     (
+        "task.rs",
+        Class::HostUtility,
+        "autonomous executor Git inspection and verification use fixed arguments",
+    ),
+    (
         "daemon/callback_exposure.rs",
         Class::ManagedService,
         "the operator's own tunnel client, started and supervised by the daemon \

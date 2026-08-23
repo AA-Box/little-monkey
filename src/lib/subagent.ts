@@ -386,6 +386,20 @@ export interface RunSubagentTaskParams {
     reason: string,
     toolCallId: string,
   ) => void;
+  onStructuredResult?: (result: RunSubagentTaskResult) => void;
+  /** Node-level capability ceiling, intersected with the built-in profile and
+   * the frozen task policy before tools are offered or dispatched. */
+  capabilities?: readonly string[];
+  /** Called immediately before every model-requested tool side effect. */
+  beforeToolCall?: () => void | Promise<void>;
+}
+
+export interface RunSubagentTaskResult {
+  report: string;
+  outcome: "done" | "error" | "cancelled";
+  changedFiles: string[];
+  worktree?: { id: string; path: string; branch: string; baseRevision: string; diffDigest: string };
+  usage?: { modelCalls: number; toolCalls: number; inputTokens: number; outputTokens: number; costMicros: number };
 }
 
 /**
@@ -431,7 +445,12 @@ function isErrorResult(result: string): boolean {
  * worktree bookkeeping failure must not corrupt the tool result.
  */
 export async function runSubagentTask(params: RunSubagentTaskParams): Promise<string> {
-  if (params.isolation !== 'worktree') return runSubagentTaskLoop(params);
+  if (params.isolation !== 'worktree') {
+    const report = await runSubagentTaskLoop(params);
+    const live = useSubagentStore.getState().runs[params.toolCallId ?? params.taskId];
+    params.onStructuredResult?.({ report, outcome: structuredOutcome(report), changedFiles: [], usage: live?.usage ? { modelCalls: 1, toolCalls: live.toolCallCount, inputTokens: live.usage.promptTokens, outputTokens: live.usage.completionTokens, costMicros: 0 } : undefined });
+    return report;
+  }
 
   const resolved = resolveSubagentProfile(params.profile, useCustomAgentStore.getState().defs);
   const base = resolved.kind === 'builtin' ? resolved.profile : resolved.kind === 'custom' ? resolved.base : null;
@@ -472,6 +491,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
       // Nothing was produced — an empty worktree holds no agent work, so
       // removing it is safe on every outcome, cancellation included.
       await agentWorktreeClient.remove(created.path, false);
+      params.onStructuredResult?.({ report: result, outcome: structuredOutcome(result), changedFiles: [], worktree: { id: created.branch, path: created.path, branch: created.branch, baseRevision: st.base_revision, diffDigest: st.patch_digest } });
       return result;
     }
     useSessionStore
@@ -481,6 +501,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
         diffstat: st.diffstat,
         status: 'kept',
       });
+    params.onStructuredResult?.({ report: result, outcome: structuredOutcome(result), changedFiles: st.changed_files, worktree: { id: created.branch, path: created.path, branch: created.branch, baseRevision: st.base_revision, diffDigest: st.patch_digest } });
     return isErrorResult(result)
       ? result
       : `${result}\n\n[Changes were left in an isolated worktree at ${created.path} — NOT applied to the workspace. The user can apply or discard them from this agent's row.]\nDiffstat:\n${st.diffstat}`;
@@ -489,9 +510,20 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
   }
 }
 
+function structuredOutcome(result: string): RunSubagentTaskResult["outcome"] {
+  if (/cancel/i.test(result) && isErrorResult(result)) return "cancelled";
+  return isErrorResult(result) ? "error" : "done";
+}
+
+export async function runSubagentTaskStructured(params: RunSubagentTaskParams): Promise<RunSubagentTaskResult> {
+  let structured: RunSubagentTaskResult | undefined;
+  const report = await runSubagentTask({ ...params, onStructuredResult: (result) => { structured = result; params.onStructuredResult?.(result); } });
+  return structured ?? { report, outcome: structuredOutcome(report), changedFiles: [] };
+}
+
 async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<string> {
   useUsageHistoryStore.getState().recordSubagentTaskStarted();
-  const { sessionId, runId, parentCheckpointId, parentSignal, taskId, toolCallId, groupId, workflowRunId, description, prompt, profile, target, effort, risk, onMutatedPath, onMutationFailure } =
+  const { sessionId, runId, parentCheckpointId, parentSignal, taskId, toolCallId, groupId, workflowRunId, description, prompt, profile, target, effort, risk, onMutatedPath, onMutationFailure, capabilities } =
     params;
 
   // The key `subagentStore`/`ChatSession.subagentRuns` are updated under —
@@ -644,11 +676,26 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
     // per call, so a granted-but-hallucinated name never dispatches either.
     const profileTools: ToolDef[] =
       resolvedProfile.kind === 'custom' ? toolsForCustomAgent(resolvedProfile.def) : toolsForProfile(resolvedProfile.profile);
+    const capabilitySet = new Set(capabilities ?? ['read', 'mutate', 'verify', 'network', 'delegate']);
+    const readOnlyTools = new Set(['read_file', 'list_dir', 'glob', 'grep', 'search_docs', 'read_skill_resource']);
+    const mutationTools = new Set(['write_file', 'edit_file', 'remember', 'manage_skill_learning']);
+    const verificationTools = new Set(['run_shell', 'shell_output', 'shell_kill']);
+    const networkTools = new Set(['web_fetch', 'web_search', 'device_action']);
+    const delegationTools = new Set(['task', 'spawn_task', 'workflow']);
+    const policyTools = profileTools.filter((tool) => {
+      const name = tool.function.name;
+      if (readOnlyTools.has(name)) return capabilitySet.has('read');
+      if (mutationTools.has(name)) return capabilitySet.has('mutate');
+      if (verificationTools.has(name)) return capabilitySet.has('verify') || capabilitySet.has('mutate');
+      if (networkTools.has(name)) return capabilitySet.has('network');
+      if (delegationTools.has(name)) return capabilitySet.has('delegate');
+      return capabilitySet.has('read');
+    });
     // In Plan Mode an `explore`-class agent still dispatches, but any name
     // Plan Mode refuses (a read-only custom agent may hold web tools, which
     // are permission-gated) is dropped from the child's OFFER too — same
     // fail-closed double layer the parent's own `toolsForMode` applies.
-    const tools: ToolDef[] = planMode ? profileTools.filter((tool) => !isBlockedInPlanMode(tool.function.name)) : profileTools;
+    const tools: ToolDef[] = planMode ? policyTools.filter((tool) => !isBlockedInPlanMode(tool.function.name)) : policyTools;
     // The def's own effort wins over the inherited turn effort — that's what
     // declaring `effort` in the definition file is FOR; a caller has no way
     // to signal "explicitly override the def" separately from "inherited".
@@ -739,6 +786,7 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
         // `toolsForProfile` only shapes what's *offered*; this is the
         // enforcement point that makes it an actual authorization boundary.
         const allowed = isToolCallAllowed(toolCall, tools);
+        if (!aborted && allowed) await params.beforeToolCall?.();
         const resultContent = aborted
           ? CANCELLED_TOOL_RESULT
           : !allowed

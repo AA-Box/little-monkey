@@ -242,6 +242,7 @@ fn bridge_turn_with_contract(
         param: Vec::new(),
         run_key: None,
         priority: 100,
+        initially_paused: false,
         max_attempts: 1,
         max_runtime_seconds: 1_800,
         max_memory_mb: None,

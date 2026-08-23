@@ -955,6 +955,7 @@ fn run_spec(session: &ControlSession) -> RunSpec {
             max_artifact_bytes: MAX_REMOTE_ARTIFACT_BYTES,
             max_event_count: 100_000,
         },
+        autonomous_task: None,
     }
 }
 

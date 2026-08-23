@@ -1168,6 +1168,7 @@ mod tests {
                     max_artifact_bytes: 10_000_000,
                     max_event_count: 10_000,
                 },
+                autonomous_task: None,
             }
         }
 

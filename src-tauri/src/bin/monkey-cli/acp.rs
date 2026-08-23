@@ -867,6 +867,7 @@ fn persist_recipe(
         channel_send: None,
         desktop_turn: None,
         placed_run: None,
+        autonomous_task: None,
     };
     little_monkey_lib::recipes::validate_recipe(&recipe)?;
     let bytes = serde_json::to_vec_pretty(&recipe).map_err(|error| error.to_string())?;

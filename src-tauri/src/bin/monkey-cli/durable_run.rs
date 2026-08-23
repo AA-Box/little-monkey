@@ -772,6 +772,10 @@ pub fn normalize_semantic_stream(events: &[RunEventEnvelope]) -> Vec<NormalizedS
                         "migration_arrived",
                         serde_json::json!({ "origin_node_id": origin_node_id, "origin_last_sequence": origin_last_sequence }),
                     )),
+                    RunEvent::TaskEvent { event_type, .. } => normalized.push(semantic(
+                        "task_event",
+                        serde_json::json!({ "event_type": event_type }),
+                    )),
                     RunEvent::ModelDelta { .. } | RunEvent::UsageRecorded { .. } => unreachable!(),
                 }
             }
@@ -905,6 +909,7 @@ mod tests {
                 max_artifact_bytes: 1_000_000,
                 max_event_count: 10_000,
             },
+            autonomous_task: None,
         }
     }
 

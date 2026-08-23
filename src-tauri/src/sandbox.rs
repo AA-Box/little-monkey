@@ -2016,6 +2016,7 @@ fn build_sandbox_run_spec(
             max_artifact_bytes: MAX_ARTIFACT_BYTES_BUDGET,
             max_event_count: 64,
         },
+        autonomous_task: None,
     };
     spec.validate().map_err(|error| error.to_string())?;
     Ok(spec)

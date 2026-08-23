@@ -41,6 +41,10 @@ const MAX_ISSUE_URL_LEN: usize = 2_048;
 const BRANCH_PREFIX: &str = "issue-to-pr/";
 const CHECK_OUTPUT_CAP: usize = 4_096;
 const DEFAULT_PROTECTED_BRANCHES: [&str; 3] = ["main", "master", "develop"];
+
+fn default_base_ref() -> String {
+    "HEAD".to_string()
+}
 const VALID_STATUSES: [&str; 8] = [
     "planning",
     "implementing",
@@ -80,6 +84,10 @@ pub struct IssueToPrRun {
     pub issue_body: String,
     pub worktree_id: String,
     pub branch: String,
+    /// The branch/ref the owned worktree was created from and the eventual PR
+    /// must target. Legacy persisted runs default to HEAD for compatibility.
+    #[serde(default = "default_base_ref")]
+    pub base_ref: String,
     /// The attached secondary workspace root's label (see `workspace.rs`) —
     /// the frontend prefixes every agent tool-call path with
     /// `"<label>/"` so the headless turn can only ever touch this owned
@@ -353,6 +361,8 @@ pub async fn issue_to_pr_start(
 ) -> Result<IssueToPrRun, String> {
     let (owner, repo, number) = parse_issue_url(&issue_url)?;
     let repository_slug = format!("{owner}/{repo}");
+    let repository_root = workspace::primary_root_canon(&state)?.to_path_buf();
+    let base_ref = m5_delivery::current_branch(&repository_root)?;
 
     let auth = m5_delivery::m5_github_auth_status()?;
     if !auth.authenticated {
@@ -368,8 +378,15 @@ pub async fn issue_to_pr_start(
         .and_then(|worktree_id| m5_delivery::m5_delivery_inspect_worktree(worktree_id).ok())
         .filter(|inspection| matches!(inspection.worktree.state.as_str(), "active" | "recovered"));
 
+    let mut run_base_ref = base_ref.clone();
     let (worktree_id, branch, workspace_label) = if let Some(inspection) = reusable {
         let record = inspection.worktree;
+        if let Some(previous) = existing_runs
+            .iter()
+            .find(|run| run.worktree_id == record.marker.worktree_id)
+        {
+            run_base_ref = previous.base_ref.clone();
+        }
         let label = workspace::add_secondary_workspace_root_impl(
             state.inner(),
             record.marker.canonical_path.clone(),
@@ -377,7 +394,9 @@ pub async fn issue_to_pr_start(
         .label;
         (record.marker.worktree_id, record.marker.branch, label)
     } else {
-        let record = create_worktree_for_issue(state.inner(), &repository_slug, number).await?;
+        let record =
+            create_worktree_for_issue(state.inner(), &repository_slug, number, &run_base_ref)
+                .await?;
         let label = workspace::add_secondary_workspace_root_impl(
             state.inner(),
             record.marker.canonical_path.clone(),
@@ -408,6 +427,7 @@ pub async fn issue_to_pr_start(
         issue_body,
         worktree_id,
         branch,
+        base_ref: run_base_ref,
         workspace_label,
         status: "planning".to_string(),
         pr_number: None,
@@ -431,6 +451,7 @@ async fn create_worktree_for_issue(
     state: &AppState,
     repository_slug: &str,
     number: u32,
+    base_ref: &str,
 ) -> Result<OwnedWorktreeRecord, String> {
     let repository_root = workspace::primary_root_canon(state)?
         .to_string_lossy()
@@ -438,7 +459,7 @@ async fn create_worktree_for_issue(
     let request = WorktreeCreateRequest {
         repository_root,
         repository_slug: repository_slug.to_string(),
-        base_ref: "HEAD".to_string(),
+        base_ref: base_ref.to_string(),
         label: format!("issue-{number}"),
         allowed_remotes: vec!["origin".to_string()],
         branch_prefix: BRANCH_PREFIX.to_string(),
@@ -676,6 +697,7 @@ mod tests {
             issue_body: "Body".to_string(),
             worktree_id: format!("wt-{created_at_ms}"),
             branch: "issue-to-pr/fixture".to_string(),
+            base_ref: "develop".to_string(),
             workspace_label: "fixture".to_string(),
             status: status.to_string(),
             pr_number: None,

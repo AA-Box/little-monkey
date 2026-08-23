@@ -7,6 +7,7 @@
  */
 export const issueToPrLocale: Record<string, string> = {
   "AppMenu.issueToPr": "Issue-to-PR",
+  "AppMenu.autonomousTask": "Autonomous task",
   "IssueToPr.title": "Issue-to-PR Agent Flow",
   "IssueToPr.subtitle": "Paste a GitHub issue URL and watch Little Monkey plan, implement, check, and ready a draft PR on its own owned branch.",
   "IssueToPr.close": "Close Issue-to-PR",
