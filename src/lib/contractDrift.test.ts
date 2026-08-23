@@ -56,6 +56,20 @@ const contract = JSON.parse(
 
 /** Tools the desktop offers that contract v1 does not publish. */
 const DESKTOP_ONLY = [
+  'computer_clipboard_read',
+  'computer_click',
+  'computer_double_click',
+  'computer_focus',
+  'computer_hotkey',
+  'computer_inspect',
+  'computer_key',
+  'computer_list_targets',
+  'computer_screenshot',
+  'computer_scroll',
+  'computer_select',
+  'computer_set_value',
+  'computer_type',
+  'computer_wait',
   'spawn_task',
   'shell_output',
   'shell_kill',

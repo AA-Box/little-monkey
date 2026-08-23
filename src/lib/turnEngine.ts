@@ -52,6 +52,17 @@ import { formatSkillSearchResults, formatSkillToolResult, type SkillRankingSigna
 import { rasterizeSvgToPng, type RasterizedPng } from './imageGeneration';
 import { errorMessage } from "./errors";
 import {
+  ComputerUseRunBudget,
+  CoordinatedInvocationError,
+  CoordinatedRetryableError,
+  computerUseFailure,
+  coordinateToolInvocation,
+  INPUT_SENT_UNVERIFIED,
+  parseComputerUseFailure,
+  runCoordinatedInvocation,
+  type ComputerUseFailure,
+} from './taskCoordinator';
+import {
   formatProgrammaticExecutionResult,
   PROGRAMMATIC_TOOL_NAME,
   programmaticExecutionService,
@@ -65,6 +76,8 @@ export interface ToolExecutionContext {
   isToolAvailable?: (toolName: string) => boolean;
   /** Shared completion lifecycle for direct and nested calls. */
   onCompleted?: (toolCall: ToolCall, result: string) => void | Promise<void>;
+  /** Shared run-wide native Computer Use counters and deadline. */
+  computerUseBudget?: ComputerUseRunBudget;
 }
 
 /** The canonical execution identity shared by run_program and its recorder. */
@@ -227,6 +240,53 @@ export function stringifyToolError(err: unknown): string {
   return JSON.stringify({ error: message });
 }
 
+/** Normalizes a native invoke rejection without ever turning an unknown
+ * transport failure into evidence that no input reached the OS. Rust action
+ * commands reject with the same five-field failure object; plain IPC errors
+ * become terminal/ambiguous here. */
+function stringifyComputerUseError(err: unknown): string {
+  const failure = parseComputerUseFailure(err);
+  return JSON.stringify({ error: failure });
+}
+
+function nativeFailureFromResult(result: string): ComputerUseFailure | null {
+  try {
+    const parsed: unknown = JSON.parse(result);
+    if (!parsed || typeof parsed !== 'object') return null;
+    const record = parsed as Record<string, unknown>;
+    if (record.error !== undefined) {
+      return parseComputerUseFailure(record.error);
+    }
+    if (record.failure !== undefined) {
+      return parseComputerUseFailure(record.failure);
+    }
+  } catch {
+    // A malformed native result is an unknown execution outcome.
+  }
+  return null;
+}
+
+function throwForNativeFailure(result: string): void {
+  const failure = nativeFailureFromResult(result);
+  if (!failure) return;
+  if (failure.safeToRetry === true && failure.inputSent === false) {
+    throw new CoordinatedRetryableError(failure);
+  }
+  throw new CoordinatedInvocationError(failure);
+}
+
+function parseNativeObservation(result: string): unknown {
+  throwForNativeFailure(result);
+  try {
+    return JSON.parse(result);
+  } catch {
+    throw new CoordinatedInvocationError(computerUseFailure(
+      'Native observation returned malformed data',
+      { code: 'UNKNOWN', inputSent: true, safeToRetry: false, phase: 'observe' },
+    ));
+  }
+}
+
 /** The tool-message content used for a call the user's Stop button cancelled
  * (either mid-execution, or before it ever started). A result message is
  * still recorded for every requested call so the persisted transcript never
@@ -345,7 +405,29 @@ const MUTATING_TOOLS = RISK_ELIGIBLE_TOOLS;
 /** Tools whose calls are permission-gated and therefore need `turn_id`, so
  * Rust can scope a permission prompt (and, for run_shell/web_fetch, Stop-button
  * cancellation) to the right in-flight turn. */
-const PERMISSION_GATED_TOOLS = new Set([...MUTATING_TOOLS, 'remember', 'web_fetch', 'web_search']);
+const COMPUTER_TOOL_NAMES = new Set([
+  'computer_list_targets',
+  'computer_screenshot',
+  'computer_clipboard_read',
+  'computer_inspect',
+  'computer_focus',
+  'computer_click',
+  'computer_double_click',
+  'computer_scroll',
+  'computer_type',
+  'computer_key',
+  'computer_hotkey',
+  'computer_wait',
+  'computer_select',
+  'computer_set_value',
+]);
+const PERMISSION_GATED_TOOLS = new Set([
+  ...MUTATING_TOOLS,
+  'remember',
+  'web_fetch',
+  'web_search',
+  ...COMPUTER_TOOL_NAMES,
+]);
 
 /**
  * Whether Plan Mode refuses `name` outright: every permission-gated tool
@@ -878,8 +960,11 @@ async function executeToolCallInner(
     learningRunId: skill?.runId,
     skillResourceSnapshot: name === 'read_skill_resource' && typeof args.command === 'string'
       ? skill?.invokedSkillSnapshots?.get(args.command.trim().replace(/^\//, '').toLowerCase())
-      : undefined,
+    : undefined,
   });
+
+  const coordination = coordinateToolInvocation(name, args);
+  if (coordination.error) return stringifyToolError(new Error(coordination.error));
 
   if (name === PROGRAMMATIC_TOOL_NAME) {
     if (!programmatic) {
@@ -1237,23 +1322,109 @@ async function executeToolCallInner(
   const durableExtensionInvocationId = extensionBinding
     ? await extensionInvocationId(turnId, toolCall.id, extensionBinding)
     : undefined;
-  const invocation = name.startsWith('mcp__')
-    ? invokeMcpTool(name, args, turnId, protocolToolCallId(toolCall.id), mcpRegistry)
-    : name.startsWith('ext__')
-      ? invokeExecutableExtensionTool(
-          name,
-          args,
-          durableExtensionInvocationId ?? protocolToolCallId(`${turnId}:${toolCall.id}:${name}`),
-          extensionRegistry ?? new Map(),
-        )
-          .then((result) => result.tool_result ?? result.output_json, stringifyToolError)
-      : invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
-  return raceInvocationWithStop(
-    invocation,
-    turnId,
-    signal,
-    name.startsWith('ext__') ? durableExtensionInvocationId : undefined,
-  );
+  return runCoordinatedInvocation(coordination, {
+    budget: executionContext?.computerUseBudget,
+    onPhase: async (phase) => {
+      if (coordination.route !== 'native') return;
+      if (phase === 'authorize' && typeof args.session_id !== 'string') {
+        throw new CoordinatedInvocationError(computerUseFailure(
+          'Native Computer Use requires an active session grant.',
+          { code: 'SECURITY_REFUSED', inputSent: false, safeToRetry: false, phase: 'authorize' },
+        ));
+      }
+      if (phase === 'observe' && name !== 'computer_list_targets') {
+        const observation = await invoke('tool_computer_list_targets', {
+          session_id: args.session_id,
+          turn_id: turnId,
+          tool_call_id: protocolToolCallId(toolCall.id),
+        }).then(stringifyToolResult, stringifyComputerUseError);
+        parseNativeObservation(observation);
+      }
+      if (
+        phase === 'verify'
+        && name !== 'computer_list_targets'
+        && typeof args.target_application_id === 'string'
+      ) {
+        const observation = await invoke('tool_computer_inspect', {
+          session_id: args.session_id,
+          target_application_id: args.target_application_id,
+          target_window_id: args.target_window_id,
+          query: undefined,
+          turn_id: turnId,
+          tool_call_id: protocolToolCallId(toolCall.id),
+        }).then(stringifyToolResult, stringifyComputerUseError);
+        parseNativeObservation(observation);
+      }
+    },
+    execute: () => {
+      if (coordination.route === 'native' && executionContext?.computerUseBudget) {
+        const counter = name === 'computer_screenshot' ? 'screenshots' : 'actions';
+        if (!executionContext.computerUseBudget.consume(counter)) {
+          return JSON.stringify({ error: 'COMPUTER_USE_BUDGET_EXCEEDED', counter });
+        }
+      }
+      const invocation = name.startsWith('mcp__')
+        ? invokeMcpTool(name, args, turnId, protocolToolCallId(toolCall.id), mcpRegistry)
+        : name.startsWith('ext__')
+          ? invokeExecutableExtensionTool(
+              name,
+              args,
+              durableExtensionInvocationId ?? protocolToolCallId(`${turnId}:${toolCall.id}:${name}`),
+              extensionRegistry ?? new Map(),
+            )
+              .then((result) => result.tool_result ?? result.output_json, stringifyToolError)
+          : invoke(`tool_${name}`, args).then(
+            stringifyToolResult,
+            coordination.route === 'native' ? stringifyComputerUseError : stringifyToolError,
+          );
+      return raceInvocationWithStop(
+        invocation,
+        turnId,
+        signal,
+        name.startsWith('ext__') ? durableExtensionInvocationId : undefined,
+      );
+    },
+    verify: (result) => {
+      if (coordination.route !== 'native' || typeof result !== 'string') return true;
+      throwForNativeFailure(result);
+      try {
+        const parsed = JSON.parse(result) as {
+          error?: unknown;
+          executed?: boolean;
+          inputSent?: boolean;
+          stateVerified?: boolean;
+        };
+        if (parsed.executed === true && parsed.stateVerified === false && parsed.inputSent === true) {
+          throw new CoordinatedInvocationError(computerUseFailure(
+            `${INPUT_SENT_UNVERIFIED}: input was sent but the requested postcondition was not verified`,
+            { code: 'INPUT_SENT_UNVERIFIED', inputSent: true, safeToRetry: false, phase: 'verify' },
+          ));
+        }
+        if (parsed.error !== undefined) {
+          throw new CoordinatedInvocationError(parseComputerUseFailure(parsed.error));
+        }
+        if (parsed.executed === true && parsed.stateVerified === false) {
+          throw new CoordinatedInvocationError(computerUseFailure(
+            'Native action returned an unverified execution outcome',
+            { code: 'UNKNOWN', inputSent: true, safeToRetry: false, phase: 'verify' },
+          ));
+        }
+        return true;
+      } catch (error) {
+        if (error instanceof CoordinatedInvocationError || error instanceof CoordinatedRetryableError) throw error;
+        throw new CoordinatedInvocationError(parseComputerUseFailure(error));
+      }
+    },
+  }).catch((error) => {
+    if (coordination.route === 'native') {
+      return stringifyComputerUseError(
+        error instanceof CoordinatedInvocationError || error instanceof CoordinatedRetryableError
+          ? error.failure
+          : error,
+      );
+    }
+    return stringifyToolError(error);
+  });
 }
 
 /** Races an in-flight tool `invoke` against the Stop button: on abort, the

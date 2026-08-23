@@ -6,7 +6,118 @@
  */
 import type { ToolDef } from './llamaClient';
 
+const COMPUTER_TARGET_PROPERTIES = {
+  session_id: {
+    type: 'string',
+    description: 'An active session grant created by the user for this run. Never invent or widen it.',
+  },
+  target_application_id: {
+    type: 'string',
+    description: 'Exact application id/name returned by computer_list_targets.',
+  },
+  target_window_id: {
+    type: 'string',
+    description: 'Exact current window id returned by computer_list_targets; omit only when the target has one unambiguous window.',
+  },
+} as const;
+
+const COMPUTER_COMMON_DESCRIPTION =
+  'Native Computer Use only: use browser DOM/browser tools for web pages when available, and use run_shell for terminal work. Requires an active user-granted, application/window-scoped session. Re-list and re-inspect after stale-target errors. Password managers, authentication/security dialogs, OS permission settings, sudo/UAC, keychains, biometrics, and hidden password fields are blocked; never put secrets in tool arguments unless the user explicitly supplied them for a permitted target.';
+
+function computerTool(
+  name: string,
+  description: string,
+  properties: Record<string, unknown>,
+  required: string[],
+): ToolDef {
+  return {
+    type: 'function',
+    function: {
+      name,
+      description: `${description} ${COMPUTER_COMMON_DESCRIPTION}`,
+      parameters: {
+        type: 'object',
+        properties,
+        required,
+        additionalProperties: false,
+      },
+    },
+  };
+}
+
+const COMPUTER_TOOLS: ToolDef[] = [
+  computerTool(
+    'computer_list_targets',
+    'List only currently visible, non-sensitive native application windows covered by the active grant. This is the required first step before native actions.',
+    { session_id: COMPUTER_TARGET_PROPERTIES.session_id },
+    ['session_id'],
+  ),
+  computerTool(
+    'computer_screenshot',
+    'Capture a bounded screenshot of a verified granted native target. The result includes a durable artifact reference and image bytes for the vision loop; screenshots are disabled unless the grant permits them.',
+    {
+      ...COMPUTER_TARGET_PROPERTIES,
+      bounds: {
+        type: 'object',
+        description: 'Optional region inside the verified target bounds: x, y, width, height. Keep it as small as practical.',
+        properties: {
+          x: { type: 'number' }, y: { type: 'number' }, width: { type: 'number' }, height: { type: 'number' },
+        },
+        required: ['x', 'y', 'width', 'height'],
+        additionalProperties: false,
+      },
+    },
+    ['session_id', 'target_application_id'],
+  ),
+  computerTool(
+    'computer_inspect',
+    'Inspect a bounded, filtered semantic accessibility tree. Prefer the returned element id, role, label, value, bounds, enabled state, focus state, and actions over coordinates.',
+    { ...COMPUTER_TARGET_PROPERTIES, query: { type: 'string', description: 'Optional case-insensitive label/role/value filter.' } },
+    ['session_id', 'target_application_id'],
+  ),
+  computerTool(
+    'computer_clipboard_read',
+    'Read the current clipboard only when the grant separately allows clipboard reads. This is a distinct capability because clipboard data may contain secrets; its content is never stored in the audit log.',
+    { ...COMPUTER_TARGET_PROPERTIES },
+    ['session_id', 'target_application_id'],
+  ),
+  computerTool('computer_focus', 'Focus a verified native application/window before acting.', { ...COMPUTER_TARGET_PROPERTIES }, ['session_id', 'target_application_id']),
+  computerTool(
+    'computer_click',
+    'Click a semantic accessibility element. Coordinate x/y is an explicitly supported fallback only when inspection has no actionable element.',
+    {
+      ...COMPUTER_TARGET_PROPERTIES,
+      element_id: { type: 'string', description: 'Preferred inspected accessibility element id.' },
+      x: { type: 'integer', description: 'Coordinate fallback, bounded to the verified target.' },
+      y: { type: 'integer', description: 'Coordinate fallback, bounded to the verified target.' },
+      button: { type: 'string', enum: ['left', 'right', 'middle'] },
+      expected_value: { type: 'string', description: 'Optional postcondition: the inspected element value must equal this after the click.' },
+    },
+    ['session_id', 'target_application_id'],
+  ),
+  computerTool(
+    'computer_double_click',
+    'Double-click a semantic accessibility element, with bounded coordinate fallback.',
+    {
+      ...COMPUTER_TARGET_PROPERTIES,
+      element_id: { type: 'string', description: 'Preferred inspected accessibility element id.' },
+      x: { type: 'integer' }, y: { type: 'integer' },
+      button: { type: 'string', enum: ['left', 'right', 'middle'] },
+      expected_value: { type: 'string', description: 'Optional postcondition: the inspected element value must equal this after the double-click.' },
+    },
+    ['session_id', 'target_application_id'],
+  ),
+  computerTool('computer_scroll', 'Scroll the verified frontmost target by bounded deltas.', { ...COMPUTER_TARGET_PROPERTIES, delta_x: { type: 'integer' }, delta_y: { type: 'integer' } }, ['session_id', 'target_application_id', 'delta_y']),
+  computerTool('computer_type', 'Type bounded text into the verified frontmost target. The audit records only that text was typed, never its contents.', { ...COMPUTER_TARGET_PROPERTIES, text: { type: 'string', description: 'Text to type; maximum 16 KiB. Do not use for password-manager or hidden password fields.' } }, ['session_id', 'target_application_id', 'text']),
+  computerTool('computer_key', 'Press one named key in the verified frontmost target, such as Enter, Tab, Escape, or a single printable character.', { ...COMPUTER_TARGET_PROPERTIES, key: { type: 'string' } }, ['session_id', 'target_application_id', 'key']),
+  computerTool('computer_hotkey', 'Press a bounded named-key combination in the verified frontmost target.', { ...COMPUTER_TARGET_PROPERTIES, keys: { type: 'array', items: { type: 'string' }, description: 'One to eight named keys, e.g. ["CTRL", "A"].' } }, ['session_id', 'target_application_id', 'keys']),
+  computerTool('computer_wait', 'Wait for a bounded native UI update, then report whether the target remained verifiable.', { ...COMPUTER_TARGET_PROPERTIES, milliseconds: { type: 'integer', description: '0-10000 milliseconds.' } }, ['session_id', 'target_application_id', 'milliseconds']),
+  computerTool('computer_select', 'Select a value through a verified semantic accessibility element.', { ...COMPUTER_TARGET_PROPERTIES, element_id: { type: 'string' }, value: { type: 'string', description: 'Non-secret bounded option value.' } }, ['session_id', 'target_application_id', 'element_id', 'value']),
+  computerTool('computer_set_value', 'Set a value through a verified semantic accessibility element; password and authentication elements are refused.', { ...COMPUTER_TARGET_PROPERTIES, element_id: { type: 'string' }, value: { type: 'string', description: 'Bounded value; never include a secret unless the target is explicitly permitted.' } }, ['session_id', 'target_application_id', 'element_id', 'value']),
+];
+
 export const TOOLS: ToolDef[] = [
+  ...COMPUTER_TOOLS,
   {
     type: 'function',
     function: {

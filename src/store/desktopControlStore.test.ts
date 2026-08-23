@@ -9,12 +9,14 @@ const invokeMock = vi.fn();
 const handlers = vi.hoisted(() => ({
   pending: null as ((event: { payload: unknown }) => void) | null,
   emergencyStop: null as ((event: { payload: unknown }) => void) | null,
+  sessionState: null as ((event: { payload: unknown }) => void) | null,
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: (name: string, handler: (event: { payload: unknown }) => void) => {
     if (name === "desktop-control://action-pending") handlers.pending = handler;
     if (name === "desktop-control://emergency-stop") handlers.emergencyStop = handler;
+    if (name === "desktop-control://session-state") handlers.sessionState = handler;
     return Promise.resolve(() => {});
   },
 }));
@@ -29,11 +31,17 @@ function makeSession(overrides: Partial<ControlSession> = {}): ControlSession {
   return {
     sessionId: "desktop-control-1",
     allowedApplications: ["Notes"],
+    allowedWindows: [],
     createdAtMs: 0,
     expiresAtMs: 60_000,
     active: true,
     indicatorVisible: true,
     approvedBatch: false,
+    paused: false,
+    approvalPolicy: "per_action",
+    allowScreenshots: true,
+    allowKeyboardInput: true,
+    allowClipboardRead: false,
     ...overrides,
   };
 }
@@ -42,6 +50,9 @@ function makePending(overrides: Partial<PendingActionSummary> = {}): PendingActi
   return {
     actionId: "control-action-1",
     sessionId: "desktop-control-1",
+    targetApplicationId: "Notes",
+    approvalLevel: "high",
+    description: "key_press",
     action: { kind: "key_press", key: "a" },
     ...overrides,
   };
@@ -82,8 +93,12 @@ describe("desktopControlStore.startSession", () => {
 
     expect(invokeMock).toHaveBeenCalledWith("desktop_control_start_session", {
       allowedApplications: ["Notes"],
+      allowedWindows: [],
       lifetimeMs: 60_000,
       approvedBatch: true,
+      allowScreenshots: true,
+      allowKeyboardInput: true,
+      allowClipboardRead: false,
     });
     expect(result).toEqual(session);
     expect(useDesktopControlStore.getState().sessions).toEqual([session]);
