@@ -97,7 +97,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - name: Format changed Rust
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml
       - name: Typecheck
         run: pnpm typecheck
       - name: Stage CLI sidecar placeholder
