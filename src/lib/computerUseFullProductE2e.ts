@@ -237,6 +237,7 @@ export async function runComputerUseFullProductE2e(): Promise<void> {
         trace.unverified_actions_resolved_by_reobservation.push('computer_click:Save profile');
       }
 
+      trace.postconditions.profile = String(observedProfile()?.value ?? '');
       trace.state_verified = profileVerified && trace.postconditions.saved;
       const screenshot = await dispatch('computer_screenshot', common);
       trace.screenshot_received_by_frontend = typeof screenshot.contentBase64 === 'string' && screenshot.contentBase64.length > 100;
