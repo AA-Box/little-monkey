@@ -42,6 +42,7 @@ fn main() {
             "desktop_control_stop_session",
             "desktop_control_provider_info",
             "tool_computer_list_targets",
+            "tool_computer_focus",
             "tool_computer_inspect",
             "tool_computer_click",
             "tool_computer_set_value",
