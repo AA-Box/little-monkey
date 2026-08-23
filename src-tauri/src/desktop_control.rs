@@ -1046,6 +1046,8 @@ const MAX_NATIVE_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const NATIVE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(not(target_os = "windows"))]
 const NATIVE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(target_os = "windows")]
+const FULL_PRODUCT_E2E_PROVIDER_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_TARGETS: usize = 64;
 const MAX_ELEMENTS: usize = 256;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -1183,7 +1185,15 @@ fn run_native_command_with_env(
         };
         let _ = stdout_sender.send(result);
     });
-    let deadline = std::time::Instant::now() + NATIVE_PROVIDER_TIMEOUT;
+    #[cfg(target_os = "windows")]
+    let provider_timeout = if std::env::var("COMPUTER_USE_FULL_PRODUCT_E2E").as_deref() == Ok("1") {
+        FULL_PRODUCT_E2E_PROVIDER_TIMEOUT
+    } else {
+        NATIVE_PROVIDER_TIMEOUT
+    };
+    #[cfg(not(target_os = "windows"))]
+    let provider_timeout = NATIVE_PROVIDER_TIMEOUT;
+    let deadline = std::time::Instant::now() + provider_timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
