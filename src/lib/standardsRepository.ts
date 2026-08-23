@@ -3,8 +3,10 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   emptyStandardsDocument,
   mergeDiscoveredStandards,
+  snapshotStandardRevision,
   validateStandardsDocument,
   type EngineeringStandard,
+  type PendingStandardRevision,
   type StandardEvidence,
   type StandardsDocument,
 } from "./standards";
@@ -12,8 +14,11 @@ import {
 const MAX_SCAN_FILES = 300;
 const MAX_SCAN_DEPTH = 4;
 const MAX_EVIDENCE_BYTES = 256 * 1024;
+const MAX_AGENT_OS_FILES = 100;
 const STANDARD_FILE = ".little-monkey/standards/index.json";
 const EXPORT_FILE = ".little-monkey/standards/export.json";
+const AGENT_OS_INDEX_CANDIDATES = ["agent-os/standards/index.yml", ".agent-os/standards/index.yml"] as const;
+const AGENT_OS_EXPORT_DIR = ".little-monkey/standards/agent-os-export";
 const SKIP_DIRS = new Set([".git", "node_modules", "target", "dist", "build", ".next", ".venv"]);
 
 interface WorkspaceDirEntry {
@@ -105,12 +110,8 @@ async function readEvidence(
   };
 }
 
-async function contentDigest(title: string, body: string, evidence: StandardEvidence[]): Promise<string> {
-  return sha256(JSON.stringify({
-    title,
-    body,
-    evidence: evidence.map(({ path, sha256: digest, supports }) => ({ path, sha256: digest, supports })),
-  }));
+async function contentDigest(title: string, body: string, applicability: EngineeringStandard["applicability"], severity: EngineeringStandard["severity"], tags: string[]): Promise<string> {
+  return sha256(JSON.stringify({ title, body, applicability, severity, tags }));
 }
 
 async function standard(
@@ -118,9 +119,12 @@ async function standard(
   title: string,
   body: string,
   evidence: StandardEvidence[],
-  options: Partial<Pick<EngineeringStandard, "severity" | "confidence" | "tags" | "applicability">> = {},
+  options: Partial<Pick<EngineeringStandard, "severity" | "confidence" | "tags" | "applicability" | "origin">> = {},
 ): Promise<EngineeringStandard> {
   const now = Date.now();
+  const applicability = options.applicability ?? { globs: [], languages: [], frameworks: [], task_keywords: [] };
+  const severity = options.severity ?? "recommended";
+  const tags = options.tags ?? [];
   return {
     standard_id: id,
     version: 1,
@@ -128,20 +132,23 @@ async function standard(
     body,
     scope: "repository",
     scope_path: null,
-    applicability: options.applicability ?? { globs: [], languages: [], frameworks: [], task_keywords: [] },
-    severity: options.severity ?? "recommended",
+    applicability,
+    severity,
     status: "candidate",
-    origin: "discovered",
+    origin: options.origin ?? "discovered",
     confidence: options.confidence ?? 0.9,
-    tags: options.tags ?? [],
+    tags,
     evidence,
     conflicts_with: [],
     supersedes: null,
     created_at_ms: now,
     approved_at_ms: null,
     last_verified_at_ms: now,
-    content_sha256: await contentDigest(title, body, evidence),
+    content_sha256: await contentDigest(title, body, applicability, severity, tags),
     drift: "healthy",
+    revision_history: [],
+    pending_revision: null,
+    checker_command_ids: [],
   };
 }
 
@@ -293,6 +300,94 @@ async function conventionStandards(): Promise<EngineeringStandard[]> {
   )];
 }
 
+/** Extract Markdown paths from Agent OS's standards index without interpreting
+ * YAML as code or requiring a YAML runtime. The adapter intentionally accepts
+ * only repository-relative `.md` references and then reads each through the
+ * normal workspace sandbox. */
+function agentOsIndexMarkdownPaths(index: string): string[] {
+  const paths = new Set<string>();
+  const matcher = /(?:^|[\s\[,{:-])['\"]?([A-Za-z0-9_./-]+\.md)['\"]?(?=$|[\s\]},#])/gm;
+  for (const match of index.matchAll(matcher)) {
+    const raw = match[1].replace(/\\/g, "/");
+    if (raw.startsWith("/") || raw.includes("..") || /^[A-Za-z]:/.test(raw)) continue;
+    paths.add(raw);
+    if (paths.size >= MAX_AGENT_OS_FILES) break;
+  }
+  return [...paths];
+}
+
+function markdownTitle(markdown: string, fallback: string): string {
+  const heading = markdown.match(/^#\s+(.+)$/m)?.[1]?.trim();
+  return heading || fallback.replace(/\.md$/i, "").split("/").at(-1)?.replace(/[-_]+/g, " ") || "Imported standard";
+}
+
+function normalizeAgentOsPath(indexPath: string, referencedPath: string): string {
+  if (referencedPath.startsWith("agent-os/") || referencedPath.startsWith(".agent-os/")) return referencedPath;
+  const root = indexPath.slice(0, indexPath.lastIndexOf("/") + 1);
+  return `${root}${referencedPath}`.replace(/\/\.\//g, "/");
+}
+
+export async function importAgentOsStandards(workspacePath: string): Promise<StandardsDocument> {
+  let indexPath: string | null = null;
+  let rawIndex: string | null = null;
+  for (const candidate of AGENT_OS_INDEX_CANDIDATES) {
+    const raw = await readWorkspaceText(candidate);
+    if (raw) { indexPath = candidate; rawIndex = raw; break; }
+  }
+  if (!indexPath || !rawIndex) {
+    throw new Error(`No Agent OS standards index found (${AGENT_OS_INDEX_CANDIDATES.join(" or ")}).`);
+  }
+
+  const indexEvidence = await readEvidence(indexPath, "", "documentation");
+  const imported: EngineeringStandard[] = [];
+  for (const referenced of agentOsIndexMarkdownPaths(rawIndex)) {
+    const path = normalizeAgentOsPath(indexPath, referenced);
+    const markdown = await readWorkspaceText(path);
+    if (!markdown || new TextEncoder().encode(markdown).byteLength > MAX_EVIDENCE_BYTES) continue;
+    const evidence = await readEvidence(path, "", "documentation");
+    if (!evidence) continue;
+    const normalizedId = `agent-os-${path.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}`;
+    imported.push(await standard(
+      normalizedId,
+      markdownTitle(markdown, path),
+      markdown.trim(),
+      indexEvidence ? [indexEvidence, evidence] : [evidence],
+      { origin: "imported", confidence: 1, tags: ["agent-os", "imported"], applicability: { globs: [], languages: [], frameworks: [], task_keywords: [] } },
+    ));
+  }
+  if (imported.length === 0) throw new Error(`Agent OS index ${indexPath} did not reference readable Markdown standards.`);
+
+  const current = await loadStandards(workspacePath);
+  const next = { ...current, standards: mergeDiscoveredStandards(current.standards, imported), generated_at_ms: Date.now() };
+  await saveStandards(workspacePath, next);
+  return next;
+}
+
+function safeExportName(standard: EngineeringStandard): string {
+  return `${standard.standard_id.toLowerCase().replace(/[^a-z0-9._-]+/g, "-")}.md`;
+}
+
+export async function exportAgentOsStandards(document: StandardsDocument): Promise<string> {
+  const approved = document.standards.filter((standard) => standard.status === "approved");
+  if (approved.length === 0) throw new Error("Approve at least one standard before exporting to Agent OS.");
+  const files = approved.map((standard) => safeExportName(standard));
+  const index = ["# Generated by Little Monkey Standards Studio", "standards:", ...files.map((file) => `  - ${file}`), ""].join("\n");
+  await writeWorkspaceText(`${AGENT_OS_EXPORT_DIR}/index.yml`, index);
+  for (let i = 0; i < approved.length; i += 1) {
+    const standard = approved[i];
+    const markdown = [
+      `# ${standard.title}`,
+      "",
+      standard.body,
+      "",
+      `<!-- little-monkey-standard: ${standard.standard_id}@v${standard.version} sha256:${standard.content_sha256} -->`,
+      "",
+    ].join("\n");
+    await writeWorkspaceText(`${AGENT_OS_EXPORT_DIR}/${files[i]}`, markdown);
+  }
+  return `${AGENT_OS_EXPORT_DIR}/index.yml`;
+}
+
 export async function discoverStandards(_workspacePath: string): Promise<EngineeringStandard[]> {
   const groups = await Promise.all([packageJsonStandards(), configStandards(), ciStandards(), conventionStandards()]);
   const byId = new Map<string, EngineeringStandard>();
@@ -348,11 +443,34 @@ export async function checkStandardsDrift(workspacePath: string, document: Stand
   return next;
 }
 
+function activatePendingRevision(standard: EngineeringStandard, pending: PendingStandardRevision, now: number): EngineeringStandard {
+  return {
+    ...standard,
+    version: pending.version,
+    title: pending.title,
+    body: pending.body,
+    applicability: structuredClone(pending.applicability),
+    severity: pending.severity,
+    tags: [...pending.tags],
+    evidence: pending.evidence.map((entry) => ({ ...entry })),
+    content_sha256: pending.content_sha256,
+    origin: pending.source,
+    status: "approved",
+    approved_at_ms: now,
+    last_verified_at_ms: now,
+    drift: "healthy",
+    revision_history: [...standard.revision_history, snapshotStandardRevision(standard, "approved_revision", now)],
+    pending_revision: null,
+  };
+}
+
 export async function approveStandard(workspacePath: string, document: StandardsDocument, standardId: string): Promise<StandardsDocument> {
   const now = Date.now();
-  const standards = document.standards.map((standard) => standard.standard_id === standardId
-    ? { ...standard, status: "approved" as const, approved_at_ms: now, last_verified_at_ms: now, drift: "healthy" as const }
-    : standard);
+  const standards = document.standards.map((standard) => {
+    if (standard.standard_id !== standardId) return standard;
+    if (standard.pending_revision) return activatePendingRevision(standard, standard.pending_revision, now);
+    return { ...standard, status: "approved" as const, approved_at_ms: now, last_verified_at_ms: now, drift: "healthy" as const };
+  });
   const next = { ...document, standards, generated_at_ms: now };
   await saveStandards(workspacePath, next);
   return next;
@@ -360,6 +478,16 @@ export async function approveStandard(workspacePath: string, document: Standards
 
 export async function setStandardStatus(workspacePath: string, document: StandardsDocument, standardId: string, status: EngineeringStandard["status"]): Promise<StandardsDocument> {
   const standards = document.standards.map((standard) => standard.standard_id === standardId ? { ...standard, status } : standard);
+  const next = { ...document, standards, generated_at_ms: Date.now() };
+  await saveStandards(workspacePath, next);
+  return next;
+}
+
+export async function setStandardCheckers(workspacePath: string, document: StandardsDocument, standardId: string, commandIds: string[]): Promise<StandardsDocument> {
+  const normalized = [...new Set(commandIds.map((id) => id.trim()).filter(Boolean))];
+  const standards = document.standards.map((standard) => standard.standard_id === standardId
+    ? { ...standard, checker_command_ids: normalized }
+    : standard);
   const next = { ...document, standards, generated_at_ms: Date.now() };
   await saveStandards(workspacePath, next);
   return next;
@@ -374,14 +502,51 @@ export async function importStandards(workspacePath: string, sourcePath: string)
   const incoming = validateStandardsDocument(JSON.parse(raw));
   const current = await loadStandards(workspacePath);
   const byId = new Map(current.standards.map((standard) => [standard.standard_id, standard]));
-  for (const standard of incoming.standards) byId.set(standard.standard_id, { ...standard, origin: "imported" });
+  for (const imported of incoming.standards) {
+    const existing = byId.get(imported.standard_id);
+    if (!existing) {
+      byId.set(imported.standard_id, { ...imported, origin: "imported" });
+      continue;
+    }
+    if (existing.content_sha256 === imported.content_sha256) {
+      byId.set(imported.standard_id, { ...imported, origin: "imported", checker_command_ids: existing.checker_command_ids });
+      continue;
+    }
+    if (existing.status === "approved") {
+      const now = Date.now();
+      byId.set(imported.standard_id, {
+        ...existing,
+        drift: "weakened",
+        pending_revision: {
+          version: existing.version + 1,
+          title: imported.title,
+          body: imported.body,
+          applicability: structuredClone(imported.applicability),
+          severity: imported.severity,
+          tags: [...imported.tags],
+          evidence: imported.evidence.map((entry) => ({ ...entry })),
+          content_sha256: imported.content_sha256,
+          recorded_at_ms: now,
+          proposed_at_ms: now,
+          source: "imported",
+        },
+      });
+    } else {
+      byId.set(imported.standard_id, {
+        ...imported,
+        origin: "imported",
+        version: existing.version + 1,
+        revision_history: [...existing.revision_history, snapshotStandardRevision(existing, "imported_revision")],
+        checker_command_ids: existing.checker_command_ids,
+      });
+    }
+  }
   const next = { ...current, standards: [...byId.values()], generated_at_ms: Date.now() };
   await saveStandards(workspacePath, next);
   return next;
 }
 
-export async function exportStandards(_document: StandardsDocument, _targetPath?: string): Promise<string> {
-  const document = await loadStandards("workspace");
-  await writeWorkspaceText(EXPORT_FILE, `${JSON.stringify(document, null, 2)}\n`);
-  return EXPORT_FILE;
+export async function exportStandards(document: StandardsDocument, targetPath = EXPORT_FILE): Promise<string> {
+  await writeWorkspaceText(targetPath, `${JSON.stringify(document, null, 2)}\n`);
+  return targetPath;
 }
