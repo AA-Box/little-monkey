@@ -1,5 +1,4 @@
 import { create } from "zustand";
-import { open, save } from "@tauri-apps/plugin-dialog";
 
 import { primaryRoot, useWorkspaceStore } from "./workspaceStore";
 import {
@@ -19,11 +18,15 @@ import {
   setStandardStatus,
 } from "../lib/standardsRepository";
 
+export const STANDARDS_IMPORT_PATH = ".little-monkey/standards/import.json";
+export const STANDARDS_EXPORT_PATH = ".little-monkey/standards/export.json";
+
 interface StandardsStore {
   document: StandardsDocument | null;
   workspacePath: string | null;
   loading: boolean;
   error: string | null;
+  lastExportPath: string | null;
   refresh: () => Promise<void>;
   discover: () => Promise<void>;
   approve: (standardId: string) => Promise<void>;
@@ -50,12 +53,13 @@ export const useStandardsStore = create<StandardsStore>((set, get) => ({
   workspacePath: null,
   loading: false,
   error: null,
+  lastExportPath: null,
 
   refresh: async () => {
     const sequence = ++refreshSequence;
     const workspacePath = activeWorkspace();
     if (!workspacePath) {
-      set({ document: null, workspacePath: null, loading: false, error: null });
+      set({ document: null, workspacePath: null, loading: false, error: null, lastExportPath: null });
       return;
     }
     set({ loading: true, error: null });
@@ -124,17 +128,26 @@ export const useStandardsStore = create<StandardsStore>((set, get) => ({
   importFile: async () => {
     const workspacePath = activeWorkspace();
     if (!workspacePath) throw new Error("Open a workspace before importing standards.");
-    const source = await open({ multiple: false, directory: false, filters: [{ name: "Standards JSON", extensions: ["json"] }] });
-    if (typeof source !== "string") return;
-    const document = await importStandards(workspacePath, source);
-    set({ document, workspacePath, error: null });
+    set({ loading: true, error: null });
+    try {
+      const document = await importStandards(workspacePath, STANDARDS_IMPORT_PATH);
+      set({ document, workspacePath, loading: false });
+    } catch (error) {
+      set({ loading: false, error: `${message(error)} Put the portable JSON at ${STANDARDS_IMPORT_PATH} and retry.` });
+      throw error;
+    }
   },
 
   exportFile: async () => {
     const document = get().document;
     if (!document) throw new Error("No standards are loaded.");
-    const target = await save({ defaultPath: "little-monkey-standards.json", filters: [{ name: "Standards JSON", extensions: ["json"] }] });
-    if (typeof target !== "string") return;
-    await exportStandards(document, target);
+    set({ loading: true, error: null });
+    try {
+      const path = await exportStandards(document);
+      set({ loading: false, lastExportPath: path });
+    } catch (error) {
+      set({ loading: false, error: message(error) });
+      throw error;
+    }
   },
 }));
