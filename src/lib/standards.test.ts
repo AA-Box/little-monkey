@@ -42,7 +42,7 @@ function fixture(overrides: Partial<EngineeringStandard> = {}): EngineeringStand
 describe("standards selection", () => {
   it("selects relevant approved standards and records why", () => {
     const selection = selectStandards(
-      [fixture(), fixture({ standard_id: "rust", title: "Rust only", body: "Use Cargo.", applicability: { globs: ["src-tauri/**"], languages: ["rust"], frameworks: ["cargo"], task_keywords: ["rust"] } })],
+      [fixture(), fixture({ standard_id: "rust", title: "Rust only", body: "Use Cargo.", tags: ["rust"], applicability: { globs: ["src-tauri/**"], languages: ["rust"], frameworks: ["cargo"], task_keywords: ["rust"] } })],
       "Add a React component with accessibility coverage",
       ["src/components/Settings/Foo.tsx"],
     );
@@ -53,7 +53,7 @@ describe("standards selection", () => {
 
   it("does not spend prompt budget on unrelated recommendations", () => {
     const selection = selectStandards([
-      fixture({ standard_id: "rust", title: "Rust only", body: "Use Cargo.", applicability: { globs: ["src-tauri/**"], languages: ["rust"], frameworks: ["cargo"], task_keywords: ["rust"] } }),
+      fixture({ standard_id: "rust", title: "Rust only", body: "Use Cargo.", tags: ["rust"], applicability: { globs: ["src-tauri/**"], languages: ["rust"], frameworks: ["cargo"], task_keywords: ["rust"] } }),
     ], "Change the React settings component", ["src/components/Settings/Foo.tsx"]);
     expect(selection.selected).toEqual([]);
   });
