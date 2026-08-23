@@ -130,6 +130,7 @@ def main() -> int:
         terminate(fixture)
         if config_path:
             config_path.unlink(missing_ok=True)
+        capability_path.unlink(missing_ok=True)
         return 1
     if frontend_process.poll() is not None:
         frontend_log.flush()
@@ -143,6 +144,14 @@ def main() -> int:
             config_path.unlink(missing_ok=True)
         return 1
 
+    capability_path = repo / "src-tauri" / "capabilities" / "computer-use-full-product-e2e.json"
+    capability = json.loads((repo / "src-tauri" / "capabilities" / "default.json").read_text(encoding="utf-8"))
+    capability["identifier"] = "computer-use-full-product-e2e"
+    capability["description"] = "Temporary capability for the real frontend/native acceptance window"
+    capability["windows"] = ["main"]
+    capability["remote"] = {"urls": ["http://127.0.0.1:1420/**"]}
+    capability_path.unlink(missing_ok=True)
+    capability_path.write_text(json.dumps(capability), encoding="utf-8")
     app_log = app_log_path.open("w", encoding="utf-8")
     app = subprocess.Popen(
         command,
