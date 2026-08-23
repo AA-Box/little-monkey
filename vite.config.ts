@@ -31,7 +31,21 @@ const productionBuild = {
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
-  plugins: [react(), tailwindcss()],
+  plugins: [
+    {
+      name: "computer-use-full-product-e2e-entry",
+      enforce: "pre" as const,
+      transformIndexHtml: {
+        order: "pre" as const,
+        handler(html: string) {
+          if (!fullProductE2eBuild) return html;
+          return html.replace("/src/main.tsx", "/src/fullProductE2eMain.ts");
+        },
+      },
+    },
+    react(),
+    tailwindcss(),
+  ],
   // The full-product acceptance loads the built bundle through Tauri's local
   // asset server; relative URLs also work when that server is not rooted at
   // the repository's web origin.
