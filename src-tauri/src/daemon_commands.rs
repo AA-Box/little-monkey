@@ -286,6 +286,31 @@ fn finish_cli_output(output: std::process::Output) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|_| "Daemon output is not valid UTF-8".to_string())
 }
 
+/// A JSON CLI command may return a structured failure on stdout while using a
+/// non-zero exit code. Placement must preserve that result: treating every
+/// such exit as a lost Docker target discards the child run's evidence and
+/// final failure classification.
+fn finish_json_cli_output(output: std::process::Output) -> Result<String, String> {
+    if output.stdout.len() > MAX_CLI_OUTPUT_BYTES || output.stderr.len() > MAX_CLI_OUTPUT_BYTES {
+        return Err("Daemon command output exceeded 4 MiB".to_string());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let raw = if stdout.is_empty() { &stderr } else { &stdout };
+    if output.status.success() || serde_json::from_str::<Value>(raw).is_ok() {
+        return if raw.is_empty() {
+            Err("Daemon command returned no output".to_string())
+        } else {
+            Ok(raw.to_string())
+        };
+    }
+    Err(if stderr.is_empty() {
+        format!("Daemon command exited with {}", output.status)
+    } else {
+        stderr
+    })
+}
+
 fn run_cli_with_secret(args: Vec<String>, secret: String) -> Result<String, String> {
     let output = Command::new(cli_path())
         .args(&args)
@@ -1959,7 +1984,7 @@ pub async fn autonomous_task_place_node(
                     .args(args)
                     .output()
                     .map_err(|error| format!("Docker backend could not start: {error}"))?;
-                let output_text = finish_cli_output(output)?;
+                let output_text = finish_json_cli_output(output)?;
                 parse_json(&output_text)
             })
             .await
@@ -3132,7 +3157,11 @@ mod tests {
         })
         .await
         .expect("real Docker placement should succeed");
-        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            result.get("ok").and_then(Value::as_bool),
+            Some(true),
+            "real Docker child result: {result}"
+        );
         assert!(result["changedFiles"]
             .as_array()
             .is_some_and(|files| files.iter().any(|file| file == "docker-e2e.txt")));

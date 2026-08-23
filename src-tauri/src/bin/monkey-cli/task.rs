@@ -3950,6 +3950,14 @@ async fn execute_autonomous_docker_node(
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if !output.status.success() {
+            if let Ok(mut result) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                if let Some(object) = result.as_object_mut() {
+                    object
+                        .entry("ok".to_string())
+                        .or_insert_with(|| serde_json::Value::Bool(false));
+                }
+                return Ok(result);
+            }
             return Err(format!(
                 "Docker autonomous node failed: {}",
                 if stderr.is_empty() { stdout } else { stderr }
