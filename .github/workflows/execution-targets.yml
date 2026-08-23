@@ -106,14 +106,18 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml execution_target::tests --lib
       - name: Daemon placement tests
         run: cargo test --manifest-path src-tauri/Cargo.toml daemon_commands::tests --lib
-      - name: Commit validated lifecycle fix
+      - name: Commit validated lifecycle code only
         shell: bash
         run: |
-          rm -f .github/workflows/pr440-autofix.yml .github/workflows/pr440-autofix-pr.yml
-          git show HEAD^:.github/workflows/execution-targets.yml > .github/workflows/execution-targets.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
+          git add \
+            src-tauri/src/execution_target.rs \
+            src-tauri/src/daemon_commands.rs \
+            src-tauri/src/lib.rs \
+            src/lib/autonomousTaskRunner.ts \
+            src/store/autonomousTaskStore.ts \
+            src/components/AutonomousTask/AutonomousTaskPanel.tsx
           git diff --cached --quiet && exit 0
           git commit -m "fix(execution): complete remote task lifecycle"
           git push origin HEAD:feature/execution-targets
