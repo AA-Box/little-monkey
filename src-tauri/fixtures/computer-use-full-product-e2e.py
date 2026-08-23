@@ -184,7 +184,10 @@ def main() -> int:
         # the nominal build window, so leave a bounded grace period before
         # treating a missing launch marker as a build failure. The workflow's
         # job timeout remains the outer bound for a genuinely stuck build.
-        build_deadline = time.monotonic() + args.timeout + 300
+        # Hosted Windows runners can spend more than twenty minutes fetching
+        # and compiling the first Tauri dependency graph. Keep this guard
+        # below the workflow timeout, but do not reject a valid late launch.
+        build_deadline = time.monotonic() + max(args.timeout + 300, 1800)
         acceptance_deadline: float | None = None
         while not args.report.is_file():
             if app.poll() is not None and not args.report.is_file():
