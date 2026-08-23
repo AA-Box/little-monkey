@@ -10,6 +10,10 @@ const reportBootstrapFailure = (error: unknown) => invoke("computer_use_full_pro
   },
 }).catch(() => undefined);
 
-window.setTimeout(() => {
-  void runComputerUseFullProductE2e().catch(reportBootstrapFailure);
-}, 1_500);
+const isCompanionOverlay = new URLSearchParams(window.location.search).get("overlay") === "1";
+
+if (!isCompanionOverlay) {
+  window.setTimeout(() => {
+    void runComputerUseFullProductE2e().catch(reportBootstrapFailure);
+  }, 1_500);
+}
