@@ -79,10 +79,10 @@ def main() -> int:
         tauri_config = json.loads((repo / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
         tauri_config["build"]["beforeDevCommand"] = ""
         tauri_config["build"]["devUrl"] = "http://127.0.0.1:1420"
-        acceptance_window = tauri_config["app"]["windows"][0]
-        acceptance_window["label"] = "main"
-        acceptance_window["url"] = "http://127.0.0.1:1420/"
-        acceptance_window["visible"] = True
+        # Let the full-product setup hook create the acceptance window. This
+        # avoids a config-created window retaining the normal app URL before
+        # the loopback frontend is available.
+        tauri_config["app"]["windows"] = []
         config_path.write_text(json.dumps(tauri_config), encoding="utf-8")
     command = app_command.split() if app_command else [
         pnpm,
