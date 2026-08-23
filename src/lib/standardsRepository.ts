@@ -318,7 +318,7 @@ function agentOsIndexMarkdownPaths(index: string): string[] {
 
 function markdownTitle(markdown: string, fallback: string): string {
   const heading = markdown.match(/^#\s+(.+)$/m)?.[1]?.trim();
-  return heading || fallback.replace(/\.md$/i, "").split("/").at(-1)?.replace(/[-_]+/g, " ") || "Imported standard";
+  return heading || fallback.replace(/\.md$/i, "").split("/").pop()?.replace(/[-_]+/g, " ") || "Imported standard";
 }
 
 function normalizeAgentOsPath(indexPath: string, referencedPath: string): string {
