@@ -4,6 +4,7 @@ FROM ${BASE_IMAGE}
 ARG MONKEY_BINARY=src-tauri/target/debug/monkey-cli
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes ca-certificates git \
+        libappindicator3-1 libgtk-3-0 librsvg2-2 libwebkit2gtk-4.1-0 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 monkey
 
