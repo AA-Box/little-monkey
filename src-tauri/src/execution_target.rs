@@ -2184,11 +2184,15 @@ impl ExecutionTarget for DockerExecutionTarget {
             command.args(["--memory", &ram.to_string()]);
         }
         command.args([
-            "-v",
-            &format!("{}:/workspace:rw", request.workspace.path.display()),
+            "--mount",
+            &format!(
+                "type=bind,source={},target=/workspace",
+                request.workspace.path.display()
+            ),
             "-w",
             "/workspace",
         ]);
+        command.args(["-e", "PATH=/usr/local/bin:/usr/bin:/bin"]);
         for (key, value) in &request.environment {
             if key
                 .chars()
@@ -2315,11 +2319,31 @@ impl ExecutionTarget for DockerExecutionTarget {
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
             ));
         }
+        let mut message = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            if !message.is_empty() {
+                message.push('\n');
+            }
+            message.push_str(stderr.trim());
+        }
+        if let Ok(inspect) = Command::new(&self.docker_binary)
+            .args(["inspect", "--format", "{{.State.Error}}", &handle.remote_id])
+            .output()
+        {
+            let error = String::from_utf8_lossy(&inspect.stdout).trim().to_string();
+            if !error.is_empty() {
+                if !message.is_empty() {
+                    message.push('\n');
+                }
+                message.push_str(&error);
+            }
+        }
         Ok(vec![TargetEvent {
             sequence: 1,
             run_id: handle.run_id.clone(),
             kind: "log".into(),
-            message: String::from_utf8_lossy(&output.stdout).into_owned(),
+            message,
             at_ms: now_ms(),
         }])
     }
