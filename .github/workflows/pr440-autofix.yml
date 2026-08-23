@@ -1,0 +1,593 @@
+name: PR 440 end-to-end autofix
+
+on:
+  push:
+    branches: [feature/execution-targets]
+    paths: [.github/workflows/pr440-autofix.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/execution-targets
+          fetch-depth: 0
+      - name: Apply end-to-end execution fixes
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          def replace_once(path: str, old: str, new: str):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}: {old[:100]!r}")
+              p.write_text(text.replace(old, new, 1))
+
+          # --- execution_target.rs: persistent task workspaces, accurate paused status,
+          # runner suspend/resume, process-tree cancellation, and SSH control errors.
+          path = "src-tauri/src/execution_target.rs"
+          replace_once(path,
+          '''            if marker.workspace_id != self.workspace_id
+                || marker.snapshot_id != self.snapshot_id
+                || marker.base_snapshot_digest != self.base_snapshot_digest
+            {
+                return Ok(false);
+            }
+        }
+        let current = Self::from_workspace(destination, &self.workspace_id)?;
+''',
+          '''            if marker.workspace_id != self.workspace_id
+                || marker.snapshot_id != self.snapshot_id
+                || marker.base_snapshot_digest != self.base_snapshot_digest
+            {
+                return Ok(false);
+            }
+            // A Persistent workspace is a task-owned mutable execution surface.
+            // Its marker freezes the original transfer identity while later nodes
+            // intentionally build on changes produced by earlier nodes. The path
+            // is app-owned and task-scoped by the placement service.
+            if matches!(self.policy, WorkspacePolicy::Persistent) {
+                return Ok(true);
+            }
+        }
+        let current = Self::from_workspace(destination, &self.workspace_id)?;
+''')
+
+          replace_once(path,
+          '''        "running" | "restarting" => TargetRunStatus::Running,
+''',
+          '''        "running" | "restarting" | "paused" => TargetRunStatus::Running,
+''')
+
+          replace_once(path,
+          '''            persistent_workspace: true,
+            ..TargetCapabilities::default()
+''',
+          '''            persistent_workspace: true,
+            suspend: cfg!(unix),
+            ..TargetCapabilities::default()
+''')
+
+          replace_once(path,
+          '''    command
+        .current_dir(&path)
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin");
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+''',
+          '''    command
+        .current_dir(&path)
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Put the wrapper and the command it spawns in one process group so
+        // cancel/pause/resume control the actual workload, not only the wrapper.
+        command.process_group(0);
+    }
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+''')
+
+          replace_once(path,
+          '''        if let Some(child) = process.child.as_mut() {
+            child
+                .kill()
+                .map_err(|error| TargetError::runner_lost(error.to_string()))?;
+        } else if process_alive(process.pid) {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(process.pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+''',
+          '''        if crate::os_signal::kill_process_group(process.pid).is_err() {
+            if let Some(child) = process.child.as_mut() {
+                child
+                    .kill()
+                    .map_err(|error| TargetError::runner_lost(error.to_string()))?;
+            }
+        }
+''')
+
+          replace_once(path,
+          '''                        if let Some(child) = process.child.as_mut() {
+                            child.kill()?;
+                        } else if process_alive(process.pid) {
+                            #[cfg(unix)]
+                            unsafe {
+                                libc::kill(process.pid as libc::pid_t, libc::SIGKILL);
+                            }
+                        }
+                        process.cancelled = true;
+                        Ok(())
+''',
+          '''                        if crate::os_signal::kill_process_group(process.pid).is_err() {
+                            if let Some(child) = process.child.as_mut() {
+                                child.kill()?;
+                            }
+                        }
+                        process.cancelled = true;
+                        Ok(())
+''')
+
+          replace_once(path,
+          '''            Some("pause") | Some("resume") => {
+                serde_json::json!({"code":"UNSUPPORTED","error":"pause/resume is not supported by this runner build"})
+            }
+''',
+          '''            Some("pause") | Some("resume") => {
+                let id = request
+                    .get("runId")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                let pause = request.get("type").and_then(|value| value.as_str()) == Some("pause");
+                let controlled = runs
+                    .get_mut(id)
+                    .ok_or_else(|| TargetError::runner_lost("unknown run"))
+                    .and_then(|process| {
+                        if !process_alive(process.pid) {
+                            return Err(TargetError::runner_lost("runner process is no longer alive"));
+                        }
+                        if pause {
+                            crate::os_signal::suspend_process_group(process.pid)
+                                .map_err(TargetError::unsupported)
+                        } else {
+                            crate::os_signal::resume_process_group(process.pid)
+                                .map_err(TargetError::unsupported)
+                        }
+                    });
+                match controlled {
+                    Ok(()) => {
+                        persist_runner_processes(&runner_data, &runs)?;
+                        serde_json::json!({"ok":true})
+                    }
+                    Err(error) => serde_json::json!({"code":error.code(),"error":error.to_string()}),
+                }
+            }
+''')
+
+          replace_once(path,
+          '''    fn cancel(&self, handle: &TargetRunHandle) -> Result<(), TargetError> {
+        self.request(serde_json::json!({"type":"cancel","runId":handle.remote_id}))
+            .map(|_| ())
+    }
+    fn pause(&self, handle: &TargetRunHandle) -> Result<(), TargetError> {
+        self.request(serde_json::json!({"type":"pause","runId":handle.remote_id}))
+            .map(|_| ())
+    }
+    fn resume(&self, handle: &TargetRunHandle) -> Result<(), TargetError> {
+        self.request(serde_json::json!({"type":"resume","runId":handle.remote_id}))
+            .map(|_| ())
+    }
+''',
+          '''    fn cancel(&self, handle: &TargetRunHandle) -> Result<(), TargetError> {
+        let response = self.request(serde_json::json!({"type":"cancel","runId":handle.remote_id}))?;
+        if let Some(error) = response.get("error") {
+            return Err(TargetError::runner_lost(error.as_str().unwrap_or("runner rejected cancellation")));
+        }
+        Ok(())
+    }
+    fn pause(&self, handle: &TargetRunHandle) -> Result<(), TargetError> {
+        let response = self.request(serde_json::json!({"type":"pause","runId":handle.remote_id}))?;
+        if let Some(error) = response.get("error") {
+            return Err(TargetError::unsupported(error.as_str().unwrap_or("runner rejected pause")));
+        }
+        Ok(())
+    }
+    fn resume(&self, handle: &TargetRunHandle) -> Result<(), TargetError> {
+        let response = self.request(serde_json::json!({"type":"resume","runId":handle.remote_id}))?;
+        if let Some(error) = response.get("error") {
+            return Err(TargetError::unsupported(error.as_str().unwrap_or("runner rejected resume")));
+        }
+        Ok(())
+    }
+''')
+
+          replace_once(path,
+          '''        assert_eq!(
+            docker_status_from_inspect("exited\\t0\\tfalse"),
+            TargetRunStatus::Succeeded
+        );
+''',
+          '''        assert_eq!(
+            docker_status_from_inspect("exited\\t0\\tfalse"),
+            TargetRunStatus::Succeeded
+        );
+        assert_eq!(
+            docker_status_from_inspect("paused\\t0\\tfalse"),
+            TargetRunStatus::Running
+        );
+''')
+
+          # --- daemon_commands.rs: task-scoped persistent executor workspace,
+          # recoverable control state, and a generic control command.
+          path = "src-tauri/src/daemon_commands.rs"
+          replace_once(path,
+          '''struct AutonomousPlacementRecord {
+    run_id: String,
+    target_id: String,
+    handle: crate::execution_target::TargetRunHandle,
+    workspace: crate::execution_target::WorkspaceHandle,
+    created_at_ms: u64,
+}
+''',
+          '''struct AutonomousPlacementRecord {
+    run_id: String,
+    target_id: String,
+    handle: crate::execution_target::TargetRunHandle,
+    workspace: crate::execution_target::WorkspaceHandle,
+    created_at_ms: u64,
+    #[serde(default)]
+    cancelled: bool,
+    #[serde(default)]
+    paused: bool,
+}
+''')
+
+          replace_once(path,
+          '''    if record.target_id != target_id {
+        return Err("placement record target does not match the requested target".to_string());
+    }
+    let registry =
+''',
+          '''    if record.target_id != target_id {
+        return Err("placement record target does not match the requested target".to_string());
+    }
+    if record.cancelled {
+        delete_autonomous_placement_record(&data_dir, &run_id)?;
+        return Ok(serde_json::json!({
+            "known": true,
+            "pending": false,
+            "ok": false,
+            "failureCode": "RUN_CANCELLED",
+            "failureKind": "RUN_CANCELLED",
+            "summary": "Recovered remote placement was cancelled by the operator"
+        }));
+    }
+    let registry =
+''')
+
+          marker = '''fn configured_docker_target(
+'''
+          p = Path(path)
+          text = p.read_text()
+          if text.count(marker) != 1:
+              raise SystemExit("daemon_commands.rs: configured_docker_target marker mismatch")
+          control_fn = r'''#[tauri::command]
+pub async fn autonomous_task_control_node(
+    target_id: String,
+    run_id: String,
+    action: String,
+) -> Result<Value, String> {
+    validate_id("placement target", &target_id)?;
+    validate_id("placement run id", &run_id)?;
+    let data_dir = crate::app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve app data directory".to_string())?;
+    let Some(mut record) = load_autonomous_placement_record(&data_dir, &run_id)? else {
+        return Ok(serde_json::json!({"known": false}));
+    };
+    if record.target_id != target_id {
+        return Err("placement record target does not match the requested target".to_string());
+    }
+    let registry =
+        crate::execution_target::TargetRegistry::load(&data_dir.join("execution-targets.json"))
+            .map_err(|error| error.to_string())?;
+    let target = registry
+        .get(&target_id)
+        .map_err(|error| error.to_string())?
+        .target()
+        .map_err(|error| error.to_string())?;
+    match action.as_str() {
+        "cancel" => {
+            target.cancel(&record.handle).map_err(|error| error.to_string())?;
+            record.cancelled = true;
+            record.paused = false;
+        }
+        "pause" => {
+            target.pause(&record.handle).map_err(|error| error.to_string())?;
+            record.paused = true;
+        }
+        "resume" => {
+            target.resume(&record.handle).map_err(|error| error.to_string())?;
+            record.paused = false;
+        }
+        _ => return Err("placement control action must be cancel, pause, or resume".to_string()),
+    }
+    save_autonomous_placement_record(&data_dir, &record)?;
+    Ok(serde_json::json!({
+        "known": true,
+        "action": action,
+        "remoteRunId": record.handle.remote_id,
+        "cancelled": record.cancelled,
+        "paused": record.paused
+    }))
+}
+
+'''
+          p.write_text(text.replace(marker, control_fn + marker, 1))
+
+          replace_once(path,
+          '''    let mut transfer = spec.workspace_transfer.clone().unwrap_or(
+        crate::execution_target::WorkspaceTransfer::from_workspace(&host_workspace, &workspace_id)
+            .map_err(|error| format!("{placement_kind} workspace transfer failed: {error}"))?,
+    );
+    transfer.policy = crate::execution_target::WorkspacePolicy::Ephemeral;
+''',
+          '''    let mut transfer = spec.workspace_transfer.clone().unwrap_or(
+        crate::execution_target::WorkspaceTransfer::from_workspace(&host_workspace, &workspace_id)
+            .map_err(|error| format!("{placement_kind} workspace transfer failed: {error}"))?,
+    );
+    // All nodes of one autonomous task share a task-scoped executor workspace.
+    // This lets verification/review observe changes from earlier remote nodes
+    // without ever applying those changes to the user's checkout.
+    let task_scope = spec
+        .autonomous_task
+        .as_ref()
+        .and_then(|value| value.get("task_snapshot"))
+        .and_then(|value| value.get("taskId"))
+        .and_then(Value::as_str)
+        .unwrap_or(&spec.run_id);
+    let task_scope_digest = format!("{:x}", Sha256::digest(task_scope.as_bytes()));
+    transfer.snapshot_id = format!("task-{}", &task_scope_digest[..24]);
+    transfer.policy = crate::execution_target::WorkspacePolicy::Persistent;
+''')
+
+          replace_once(path,
+          '''    let input_file = crate::execution_target::WorkspaceResultFile {
+        path: ".little-monkey/execution-spec.json".to_string(),
+''',
+          '''    let execution_spec_digest = format!("{:x}", Sha256::digest(spec.run_id.as_bytes()));
+    let execution_spec_path = format!(
+        ".little-monkey/execution-spec-{}.json",
+        &execution_spec_digest[..24]
+    );
+    let input_file = crate::execution_target::WorkspaceResultFile {
+        path: execution_spec_path.clone(),
+''')
+
+          replace_once(path,
+          '''        .prepare_workspace(
+            &transfer,
+            crate::execution_target::WorkspacePolicy::Ephemeral,
+        )
+''',
+          '''        .prepare_workspace(
+            &transfer,
+            crate::execution_target::WorkspacePolicy::Persistent,
+        )
+''')
+
+          replace_once(path,
+          '''            ".little-monkey/execution-spec.json".to_string(),
+            "--json".to_string(),
+''',
+          '''            execution_spec_path,
+            "--json".to_string(),
+''')
+
+          replace_once(path,
+          '''            created_at_ms: crate::execution_target::execution_now_ms(),
+        },
+''',
+          '''            created_at_ms: crate::execution_target::execution_now_ms(),
+            cancelled: false,
+            paused: false,
+        },
+''')
+
+          replace_once(path,
+          '''    let deadline =
+        Instant::now() + std::time::Duration::from_millis(spec.budgets.wall_time_ms.max(1));
+    let status = loop {
+        let status = target.status(&handle).map_err(|error| error.to_string())?;
+''',
+          '''    let mut deadline =
+        Instant::now() + std::time::Duration::from_millis(spec.budgets.wall_time_ms.max(1));
+    let status = loop {
+        if let Some(control) = load_autonomous_placement_record(&data_dir, &spec.run_id)? {
+            if control.cancelled {
+                let _ = target.cleanup(&workspace_handle);
+                delete_autonomous_placement_record(&data_dir, &spec.run_id)?;
+                return Err("RUN_CANCELLED: autonomous placement was cancelled by the operator".into());
+            }
+            if control.paused {
+                // A user pause suspends wall-time accounting as well as the
+                // executor process so a long pause cannot become a timeout.
+                deadline += std::time::Duration::from_millis(500);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+        }
+        let status = target.status(&handle).map_err(|error| error.to_string())?;
+''')
+
+          # --- lib.rs: expose the generic placement control command to the desktop.
+          path = "src-tauri/src/lib.rs"
+          replace_once(path,
+          '''            daemon_commands::autonomous_task_recover_node,
+            daemon_commands::execution_targets_list,
+''',
+          '''            daemon_commands::autonomous_task_recover_node,
+            daemon_commands::autonomous_task_control_node,
+            daemon_commands::execution_targets_list,
+''')
+
+          # --- autonomousTaskRunner.ts: every externally placed node class goes
+          # through the target adapter; review-required remote mutations remain valid.
+          path = "src/lib/autonomousTaskRunner.ts"
+          replace_once(path,
+          '''          if (node.taskClass === "integration" && params.runtime.integrate) return await params.runtime.integrate(task, node, [...results.values()], context);
+          if (node.taskClass === "verification" && params.runtime.verify) return await params.runtime.verify(task, node, context);
+          if (node.taskClass === "review" && params.runtime.review) return await params.runtime.review(task, node, context);
+          if (node.taskClass === "delivery" && params.runtime.deliver) return await params.runtime.deliver(task, context);
+          return await params.runtime.executeNode(task, node, context);
+''',
+          '''          const externalPlacement = context.placement
+            && context.placement.kind !== "local"
+            && context.placement.kind !== "worktree";
+          if (externalPlacement) return await params.runtime.executeNode(task, node, context);
+          if (node.taskClass === "integration" && params.runtime.integrate) return await params.runtime.integrate(task, node, [...results.values()], context);
+          if (node.taskClass === "verification" && params.runtime.verify) return await params.runtime.verify(task, node, context);
+          if (node.taskClass === "review" && params.runtime.review) return await params.runtime.review(task, node, context);
+          if (node.taskClass === "delivery" && params.runtime.deliver) return await params.runtime.deliver(task, context);
+          return await params.runtime.executeNode(task, node, context);
+''')
+
+          replace_once(path,
+          '''          : scopedResult.ok && mutatingNode && !scopedResult.mutation && !scopedResult.workspaceRevision
+            ? { ...scopedResult, ok: false, summary: "Mutating node did not return a revision-bound mutation record." }
+''',
+          '''          : scopedResult.ok && mutatingNode && scopedResult.reviewRequired && scopedResult.resultId
+            ? scopedResult
+            : scopedResult.ok && mutatingNode && !scopedResult.mutation && !scopedResult.workspaceRevision
+              ? { ...scopedResult, ok: false, summary: "Mutating node did not return a revision-bound mutation record." }
+''')
+          # Fix indentation of the following conditional arm after inserting one level.
+          p = Path(path)
+          text = p.read_text().replace(
+          '''            : scopedResult.ok && mutatingNode && !scopedResult.mutation && scopedResult.workspaceRevision
+              ? { ...scopedResult, mutation:''',
+          '''              : scopedResult.ok && mutatingNode && !scopedResult.mutation && scopedResult.workspaceRevision
+                ? { ...scopedResult, mutation:''', 1).replace(
+          '''              : scopedResult;
+''',
+          '''                : scopedResult;
+''', 1)
+          p.write_text(text)
+
+          # --- store: explicit task controls reach active external executors.
+          path = "src/store/autonomousTaskStore.ts"
+          replace_once(path,
+          '''import { create } from "zustand";
+''',
+          '''import { invoke } from "@tauri-apps/api/core";
+import { create } from "zustand";
+''')
+
+          marker = '''export const useAutonomousTaskStore = create<AutonomousTaskStoreState>((set, get) => {
+'''
+          p = Path(path)
+          text = p.read_text()
+          if text.count(marker) != 1:
+              raise SystemExit("autonomousTaskStore.ts: store marker mismatch")
+          helper = '''async function controlActiveExternalPlacements(task: AutonomousTask, action: "cancel" | "pause" | "resume"): Promise<void> {
+  const active = task.workers.filter((worker) => {
+    const placement = worker.executionPlacement;
+    return !worker.finishedAtMs
+      && placement
+      && placement.kind !== "local"
+      && placement.kind !== "worktree"
+      && placement.targetId !== "local";
+  });
+  for (const worker of active) {
+    const targetId = worker.executionPlacement?.targetId;
+    if (!targetId) continue;
+    await invoke("autonomous_task_control_node", {
+      targetId,
+      runId: `${task.taskId}-${worker.nodeId}`,
+      action,
+    });
+  }
+}
+
+'''
+          p.write_text(text.replace(marker, helper + marker, 1))
+
+          replace_once(path,
+          '''    pause: (taskId) => withBusy(set, get, `pause:${taskId}`, async () => { controls.get(taskId)?.pause(); await appendRunEvent(taskId, { type: "paused", payload: { reason: "Paused by the user." } }); set((state) => ({ pausedTaskIds: { ...state.pausedTaskIds, [taskId]: true } })); }),
+''',
+          '''    pause: (taskId) => withBusy(set, get, `pause:${taskId}`, async () => { const current = get().tasks.find((task) => task.taskId === taskId); if (current) await controlActiveExternalPlacements(current, "pause"); controls.get(taskId)?.pause(); await appendRunEvent(taskId, { type: "paused", payload: { reason: "Paused by the user." } }); set((state) => ({ pausedTaskIds: { ...state.pausedTaskIds, [taskId]: true } })); }),
+''')
+
+          replace_once(path,
+          '''    resume: (taskId) => withBusy(set, get, `resume:${taskId}`, async () => {
+      const existing = controls.get(taskId);
+''',
+          '''    resume: (taskId) => withBusy(set, get, `resume:${taskId}`, async () => {
+      const currentTask = get().tasks.find((task) => task.taskId === taskId);
+      if (currentTask) await controlActiveExternalPlacements(currentTask, "resume");
+      const existing = controls.get(taskId);
+''')
+
+          replace_once(path,
+          '''    cancel: (taskId, reason = "Cancelled by the user.") => withBusy(set, get, `cancel:${taskId}`, async () => { controls.get(taskId)?.cancel(); await requestRunCancellation(taskId, reason); }),
+''',
+          '''    cancel: (taskId, reason = "Cancelled by the user.") => withBusy(set, get, `cancel:${taskId}`, async () => { const current = get().tasks.find((task) => task.taskId === taskId); if (current) await controlActiveExternalPlacements(current, "cancel"); controls.get(taskId)?.cancel(); await requestRunCancellation(taskId, reason); }),
+''')
+
+          # --- panel: selecting the built-in Local target is an explicit local run,
+          # not an attempt to send Local through the external runner path.
+          path = "src/components/AutonomousTask/AutonomousTaskPanel.tsx"
+          replace_once(path,
+          '''      <form className="flex shrink-0 flex-wrap gap-2 border-b border-border px-5 py-3" onSubmit={(event) => { event.preventDefault(); if (objective.trim()) void store.start(objective.trim(), sessionId, targetId ? { executionPlacement: { kind: "target", targetId, nodeId: "pending", reason: "selected by the operator" } } : undefined).then(() => setObjective("")); }}>
+''',
+          '''      <form className="flex shrink-0 flex-wrap gap-2 border-b border-border px-5 py-3" onSubmit={(event) => { event.preventDefault(); if (!objective.trim()) return; const selectedTarget = targets.find((target) => target.id === targetId); const placement = targetId && selectedTarget?.kind !== "local" ? { executionPlacement: { kind: "target", targetId, nodeId: "pending", reason: "selected by the operator" } } : undefined; void store.start(objective.trim(), sessionId, placement).then(() => setObjective("")); }}>
+''')
+
+          print("Applied PR 440 fixes")
+          PY
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf build-essential
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Format
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Stage CLI sidecar placeholder
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+      - name: Execution target tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml execution_target::tests --lib
+      - name: Daemon placement tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml daemon_commands::tests --lib
+      - name: Commit validated fixes and remove one-shot workflow
+        shell: bash
+        run: |
+          rm .github/workflows/pr440-autofix.yml
+          git config user.name "OpenAI Codex Fix"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "fix(execution): complete remote task lifecycle"
+          git push origin HEAD:feature/execution-targets
