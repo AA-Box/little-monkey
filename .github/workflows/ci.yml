@@ -286,6 +286,38 @@ jobs:
         if: ${{ !startsWith(matrix.os, 'ubuntu') }}
         run: pnpm test:rust
 
+      - name: Build the real Docker autonomous runner
+        if: startsWith(matrix.os, 'ubuntu')
+        run: docker build --tag little-monkey-autonomous-e2e:ci tests/docker/autonomous-runner
+
+      - name: Build monkey-cli for the real Docker autonomous runner
+        if: startsWith(matrix.os, 'ubuntu')
+        run: cargo build --manifest-path src-tauri/Cargo.toml --bin monkey-cli
+
+      - name: Build the real monkey-cli Docker autonomous runner image
+        if: startsWith(matrix.os, 'ubuntu')
+        run: docker build --file tests/docker/autonomous-runner-real/Dockerfile --tag little-monkey-autonomous-real-e2e:ci .
+
+      - name: Docker autonomous placement E2E
+        if: startsWith(matrix.os, 'ubuntu')
+        env:
+          LITTLE_MONKEY_DOCKER_E2E_IMAGE: little-monkey-autonomous-e2e:ci
+          LITTLE_MONKEY_REQUIRE_DOCKER_E2E: "1"
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --lib \
+            daemon_commands::tests::docker_placement_round_trips_a_patch_artifact_to_the_host \
+            -- --exact --nocapture
+
+      - name: Real monkey-cli Docker autonomous placement E2E
+        if: startsWith(matrix.os, 'ubuntu')
+        env:
+          LITTLE_MONKEY_REAL_DOCKER_E2E_IMAGE: little-monkey-autonomous-real-e2e:ci
+          LITTLE_MONKEY_REQUIRE_REAL_DOCKER_E2E: "1"
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --lib \
+            daemon_commands::tests::docker_placement_runs_the_real_monkey_cli_autonomous_executor \
+            -- --exact --nocapture
+
       - name: Apple-Silicon MLX full-ladder transaction
         if: matrix.os == 'macos-latest'
         shell: bash
