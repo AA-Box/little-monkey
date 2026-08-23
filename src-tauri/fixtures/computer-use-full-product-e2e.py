@@ -161,6 +161,7 @@ def main() -> int:
         "allow-desktop-control-stop-session",
         "allow-desktop-control-provider-info",
         "allow-tool-computer-list-targets",
+        "allow-tool-computer-focus",
         "allow-tool-computer-inspect",
         "allow-tool-computer-click",
         "allow-tool-computer-set-value",
