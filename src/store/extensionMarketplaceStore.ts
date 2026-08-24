@@ -4,7 +4,6 @@ import { create } from "zustand";
 import {
   ecosystemClient,
   type AdditionalRegistryRecord,
-  type RegistrySnapshot,
 } from "../lib/ecosystemClient";
 import {
   executableExtensionsClient,
@@ -28,7 +27,6 @@ import {
 } from "../lib/marketplaceCatalog";
 
 const STORAGE_KEY = "little-monkey-extension-update-policy-v1";
-const MAX_REGISTRY_SNAPSHOT_CHARS = 2 * 1024 * 1024;
 
 export type ExtensionUpdatePolicy = "off" | "notify" | "automatic_safe";
 export type MarketplaceMutationMode = "install" | "update";
@@ -43,13 +41,6 @@ export interface ExtensionUpdateCandidate {
   registry: MarketplaceRegistry;
   safe_auto_update: boolean;
   reasons: string[];
-}
-
-interface WebFetchResult {
-  markdown: string;
-  total_chars: number;
-  truncated: boolean;
-  content_type: string;
 }
 
 interface ExtensionMarketplaceState {
@@ -135,26 +126,12 @@ function diagnosticsNotice(conflicts: MarketplaceCatalogConflict[], expired: str
   return messages.length > 0 ? messages.join(" ") : null;
 }
 
-async function refreshRegistryMetadata(records: AdditionalRegistryRecord[]): Promise<AdditionalRegistryRecord[]> {
-  const refreshed: AdditionalRegistryRecord[] = [];
-  for (const record of records) {
-    try {
-      const result = await invoke<WebFetchResult>("tool_web_fetch", {
-        url: record.source.location,
-        max_chars: MAX_REGISTRY_SNAPSHOT_CHARS,
-        start_index: 0,
-        turn_id: null,
-        tool_call_id: `marketplace-registry:${crypto.randomUUID()}`,
-      });
-      if (result.truncated || result.total_chars > MAX_REGISTRY_SNAPSHOT_CHARS) throw new Error("registry snapshot exceeds the marketplace metadata limit");
-      if (!/^application\/(?:json|[^;]+\+json)|^text\/plain/i.test(result.content_type || "")) throw new Error(`registry snapshot must be JSON/text, received ${result.content_type || "unknown content type"}`);
-      const snapshot = JSON.parse(result.markdown) as RegistrySnapshot;
-      refreshed.push(await ecosystemClient.verifyRegistrySource(record.source.source_id, snapshot));
-    } catch (error) {
-      refreshed.push({ ...record, last_verification_error: errorMessage(error) });
-    }
-  }
-  return refreshed;
+/** Triggers the native executable bridge to refresh every configured registry
+ * through the guarded HTTP client and M4 verifier. The renderer never receives
+ * unverified registry JSON. */
+async function refreshRegistryMetadata(): Promise<AdditionalRegistryRecord[]> {
+  await invoke<ExtensionDetail[]>("extensions_list", { refreshMarketplace: true });
+  return ecosystemClient.listRegistrySources();
 }
 
 async function evaluateAutomaticCandidate(candidate: ExtensionUpdateCandidate): Promise<{
@@ -211,9 +188,7 @@ export const useExtensionMarketplaceStore = create<ExtensionMarketplaceState>((s
     if (policy === "off") { await get().refreshAll(); return; }
     set({ loading: true, error: null });
     try {
-      const current = await ecosystemClient.listRegistrySources();
-      const registryRecords = await refreshRegistryMetadata(current);
-      const installed = await executableExtensionsClient.list();
+      const [registryRecords, installed] = await Promise.all([refreshRegistryMetadata(), executableExtensionsClient.list()]);
       set({ ...snapshotState(registryRecords, installed, policy), loading: false });
       if (policy === "automatic_safe") await get().applySafeUpdates();
     } catch (error) { set({ loading: false, error: errorMessage(error) }); }
