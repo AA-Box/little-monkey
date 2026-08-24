@@ -18,14 +18,6 @@
       "allow": [{ "path": "$TEMP/**" }]
     },
     {
-      "identifier": "fs:allow-write-file",
-      "allow": [{ "path": "$TEMP/**" }]
-    },
-    {
-      "identifier": "fs:allow-mkdir",
-      "allow": [{ "path": "$TEMP/**" }]
-    },
-    {
       "identifier": "opener:allow-open-path",
       "allow": [{ "path": "$TEMP/**" }]
     }
