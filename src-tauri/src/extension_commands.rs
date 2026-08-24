@@ -217,7 +217,9 @@ fn stage_marketplace_package(encoded: &str) -> Result<PathBuf, String> {
         .map_err(|error| format!("Cannot create marketplace staging directory: {error}"))?;
 
     let write_result = (|| -> Result<(), String> {
-        fs::write(directory.join("extension.json"), format!("{}\n", serde_json::to_string_pretty(&envelope.manifest).map_err(|error| format!("Cannot encode marketplace manifest: {error}"))?))
+        let manifest = serde_json::to_string_pretty(&envelope.manifest)
+            .map_err(|error| format!("Cannot encode marketplace manifest: {error}"))?;
+        fs::write(directory.join("extension.json"), format!("{manifest}\n"))
             .map_err(|error| format!("Cannot stage marketplace manifest: {error}"))?;
         for (relative, bytes) in decoded {
             let target = directory.join(&relative);
@@ -336,12 +338,9 @@ pub async fn extensions_set_config(
     extension_id: String,
     values: BTreeMap<String, serde_json::Value>,
 ) -> Result<ExtensionDetail, String> {
-    manager()?.set_config(&extension_id, values).await
+    manager()?.set_config(&extension_id, values)
 }
 
-/// The only desktop boundary where an extension secret exists as plaintext.
-/// It is never put in a sidecar argument, returned, logged, or persisted in the
-/// registry; the UI receives only the slot's configured boolean on refresh.
 #[tauri::command]
 pub async fn extensions_set_secret(
     extension_id: String,
