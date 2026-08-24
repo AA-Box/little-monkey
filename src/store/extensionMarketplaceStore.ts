@@ -1,8 +1,10 @@
+import { invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
 
 import {
   ecosystemClient,
   type AdditionalRegistryRecord,
+  type RegistrySnapshot,
 } from "../lib/ecosystemClient";
 import {
   executableExtensionsClient,
@@ -14,15 +16,19 @@ import {
 import {
   compareSemver,
   isSafeAutomaticUpdate,
-  latestEntries,
   marketplaceRegistries,
   previewMarketplaceInstall,
   type ExtensionRegistryEntry,
   type MarketplaceInstallPreview,
   type MarketplaceRegistry,
 } from "../lib/extensionMarketplace";
+import {
+  resolveMarketplaceCatalog,
+  type MarketplaceCatalogConflict,
+} from "../lib/marketplaceCatalog";
 
 const STORAGE_KEY = "little-monkey-extension-update-policy-v1";
+const MAX_REGISTRY_SNAPSHOT_CHARS = 2 * 1024 * 1024;
 
 export type ExtensionUpdatePolicy = "off" | "notify" | "automatic_safe";
 export type MarketplaceMutationMode = "install" | "update";
@@ -39,10 +45,19 @@ export interface ExtensionUpdateCandidate {
   reasons: string[];
 }
 
+interface WebFetchResult {
+  markdown: string;
+  total_chars: number;
+  truncated: boolean;
+  content_type: string;
+}
+
 interface ExtensionMarketplaceState {
   registryRecords: AdditionalRegistryRecord[];
   registries: MarketplaceRegistry[];
   catalog: ExtensionRegistryEntry[];
+  catalogConflicts: MarketplaceCatalogConflict[];
+  expiredRegistrySourceIds: string[];
   installed: ExtensionDetail[];
   updates: ExtensionUpdateCandidate[];
   updatePolicy: ExtensionUpdatePolicy;
@@ -52,6 +67,7 @@ interface ExtensionMarketplaceState {
   notice: string | null;
   hydrate: () => Promise<void>;
   refreshAll: () => Promise<void>;
+  runUpdateCycle: () => Promise<void>;
   previewEntry: (entry: ExtensionRegistryEntry) => Promise<void>;
   clearPreview: () => void;
   applyPending: (grants: PermissionGrant[], acknowledgeHighRisk: boolean, acknowledgeUntrusted: boolean) => Promise<void>;
@@ -90,10 +106,6 @@ function installedForEntry(installed: ExtensionDetail[], entry: ExtensionRegistr
 
 function automaticApproval(preview: ExtensionPreview): ExtensionApproval | null {
   const granted = preview.permissions.filter((permission) => permission.granted);
-  // binding_label is intentionally only a display label. The runtime does not
-  // expose the canonical host binding, so silently reconstructing a workspace
-  // grant would either narrow it incorrectly or grant a different path. Any
-  // bound permission therefore remains a manual review/update.
   if (granted.some((permission) => permission.binding_label !== null)) return null;
   return {
     approval_digest: preview.approval_digest,
@@ -104,18 +116,13 @@ function automaticApproval(preview: ExtensionPreview): ExtensionApproval | null 
   };
 }
 
-/** Catalog/update discovery is intentionally metadata-only. A verified M4
- * snapshot is enough to report that a newer immutable artifact exists, but it
- * is not enough to decide executable-runtime safety. That second decision is
- * deferred until the user opens Review or has explicitly opted into
- * `automatic_safe`, preventing passive Settings browsing from causing network
- * permission prompts/downloads. */
 function metadataUpdates(
+  catalog: ExtensionRegistryEntry[],
   registries: MarketplaceRegistry[],
   installed: ExtensionDetail[],
 ): ExtensionUpdateCandidate[] {
   const output: ExtensionUpdateCandidate[] = [];
-  for (const entry of latestEntries(registries)) {
+  for (const entry of catalog) {
     const current = installedForEntry(installed, entry);
     if (!current || compareSemver(entry.version, current.active_version) <= 0) continue;
     const registry = registryForEntry(registries, entry);
@@ -129,6 +136,41 @@ function metadataUpdates(
     });
   }
   return output;
+}
+
+function diagnosticsNotice(conflicts: MarketplaceCatalogConflict[], expired: string[]): string | null {
+  const messages: string[] = [];
+  if (conflicts.length > 0) messages.push(`Blocked ${conflicts.length} executable release${conflicts.length === 1 ? "" : "s"} because verified registries disagree on immutable digests.`);
+  if (expired.length > 0) messages.push(`Ignored ${expired.length} expired verified registry snapshot${expired.length === 1 ? "" : "s"}; refresh must succeed before those sources can authorize installs or updates.`);
+  return messages.length > 0 ? messages.join(" ") : null;
+}
+
+async function refreshRegistryMetadata(records: AdditionalRegistryRecord[]): Promise<AdditionalRegistryRecord[]> {
+  const refreshed: AdditionalRegistryRecord[] = [];
+  for (const record of records) {
+    try {
+      const result = await invoke<WebFetchResult>("tool_web_fetch", {
+        url: record.source.location,
+        max_chars: MAX_REGISTRY_SNAPSHOT_CHARS,
+        start_index: 0,
+        turn_id: null,
+        tool_call_id: `marketplace-registry:${crypto.randomUUID()}`,
+      });
+      if (result.truncated || result.total_chars > MAX_REGISTRY_SNAPSHOT_CHARS) {
+        throw new Error("registry snapshot exceeds the marketplace metadata limit");
+      }
+      if (!/^application\/(?:json|[^;]+\+json)|^text\/plain/i.test(result.content_type || "")) {
+        throw new Error(`registry snapshot must be JSON/text, received ${result.content_type || "unknown content type"}`);
+      }
+      const snapshot = JSON.parse(result.markdown) as RegistrySnapshot;
+      refreshed.push(await ecosystemClient.verifyRegistrySource(record.source.source_id, snapshot));
+    } catch (error) {
+      // The M4 service owns verification state. A network/parse/signature error
+      // must never erase a previously verified snapshot from this cycle.
+      refreshed.push({ ...record, last_verification_error: errorMessage(error) });
+    }
+  }
+  return refreshed;
 }
 
 async function evaluateAutomaticCandidate(candidate: ExtensionUpdateCandidate): Promise<{
@@ -147,10 +189,32 @@ async function evaluateAutomaticCandidate(candidate: ExtensionUpdateCandidate): 
   return { downloaded, runtimePreview, approval, safe: safety.safe && approval !== null, reasons };
 }
 
+function snapshotState(
+  records: AdditionalRegistryRecord[],
+  installed: ExtensionDetail[],
+  policy: ExtensionUpdatePolicy,
+) {
+  const registries = marketplaceRegistries(records);
+  const resolved = resolveMarketplaceCatalog(registries);
+  const updates = policy === "off" ? [] : metadataUpdates(resolved.entries, registries, installed);
+  return {
+    registryRecords: records,
+    registries,
+    catalog: resolved.entries,
+    catalogConflicts: resolved.conflicts,
+    expiredRegistrySourceIds: resolved.expired_source_ids,
+    installed,
+    updates,
+    notice: diagnosticsNotice(resolved.conflicts, resolved.expired_source_ids),
+  };
+}
+
 export const useExtensionMarketplaceStore = create<ExtensionMarketplaceState>((set, get) => ({
   registryRecords: [],
   registries: [],
   catalog: [],
+  catalogConflicts: [],
+  expiredRegistrySourceIds: [],
   installed: [],
   updates: [],
   updatePolicy: "notify",
@@ -165,17 +229,34 @@ export const useExtensionMarketplaceStore = create<ExtensionMarketplaceState>((s
   },
 
   refreshAll: async () => {
-    set({ loading: true, error: null, notice: null });
+    set({ loading: true, error: null });
     try {
       const [registryRecords, installed] = await Promise.all([
         ecosystemClient.listRegistrySources(),
         executableExtensionsClient.list(),
       ]);
-      const registries = marketplaceRegistries(registryRecords);
-      const catalog = latestEntries(registries);
-      const updates = get().updatePolicy === "off" ? [] : metadataUpdates(registries, installed);
-      set({ registryRecords, registries, catalog, installed, updates, loading: false });
-      if (get().updatePolicy === "automatic_safe") await get().applySafeUpdates();
+      set({ ...snapshotState(registryRecords, installed, get().updatePolicy), loading: false });
+    } catch (error) {
+      set({ loading: false, error: errorMessage(error) });
+    }
+  },
+
+  runUpdateCycle: async () => {
+    const policy = get().updatePolicy;
+    if (policy === "off") {
+      await get().refreshAll();
+      return;
+    }
+    set({ loading: true, error: null });
+    try {
+      const current = await ecosystemClient.listRegistrySources();
+      // Notify mode refreshes only signed inert metadata. No .lmx package is
+      // downloaded here; executable bytes are touched only by explicit Review
+      // or the opt-in automatic-safe path below.
+      const registryRecords = await refreshRegistryMetadata(current);
+      const installed = await executableExtensionsClient.list();
+      set({ ...snapshotState(registryRecords, installed, policy), loading: false });
+      if (policy === "automatic_safe") await get().applySafeUpdates();
     } catch (error) {
       set({ loading: false, error: errorMessage(error) });
     }
@@ -184,6 +265,7 @@ export const useExtensionMarketplaceStore = create<ExtensionMarketplaceState>((s
   previewEntry: async (entry) => {
     const registry = registryForEntry(get().registries, entry);
     if (!registry) throw new Error("The signed M4 registry snapshot for this release is no longer current; refresh first.");
+    if (registry.snapshot.expires_unix_ms <= Date.now()) throw new Error("The signed registry snapshot has expired; refresh it before installing.");
     set({ loading: true, error: null, notice: null, pendingPreview: null });
     try {
       const downloaded = await previewMarketplaceInstall(registry, entry);
@@ -204,16 +286,14 @@ export const useExtensionMarketplaceStore = create<ExtensionMarketplaceState>((s
   applyPending: async (grants, acknowledgeHighRisk, acknowledgeUntrusted) => {
     const pending = get().pendingPreview;
     if (!pending) throw new Error("No marketplace change is awaiting approval.");
+    const currentRegistry = registryForEntry(get().registries, pending.entry);
+    if (!currentRegistry || currentRegistry.snapshot.expires_unix_ms <= Date.now()) {
+      throw new Error("The signed registry authority for this preview is no longer current; refresh and review again.");
+    }
     const preview = pending.runtime_preview;
-    if (preview.requires_unsigned_approval) {
-      throw new Error("Network-delivered unsigned executable extensions are refused by the marketplace.");
-    }
-    if (preview.requires_high_risk_approval && !acknowledgeHighRisk) {
-      throw new Error("Review and acknowledge the requested high-risk permissions first.");
-    }
-    if (preview.requires_untrusted_approval && !acknowledgeUntrusted) {
-      throw new Error("The extension publisher is not trusted by the executable runtime; explicit acknowledgement is required.");
-    }
+    if (preview.requires_unsigned_approval) throw new Error("Network-delivered unsigned executable extensions are refused by the marketplace.");
+    if (preview.requires_high_risk_approval && !acknowledgeHighRisk) throw new Error("Review and acknowledge the requested high-risk permissions first.");
+    if (preview.requires_untrusted_approval && !acknowledgeUntrusted) throw new Error("The extension publisher is not trusted by the executable runtime; explicit acknowledgement is required.");
     const approval: ExtensionApproval = {
       approval_digest: preview.approval_digest,
       grants,
@@ -223,14 +303,19 @@ export const useExtensionMarketplaceStore = create<ExtensionMarketplaceState>((s
     };
     set({ loading: true, error: null, notice: null });
     try {
+      // Re-preview the same immutable staged package immediately before the
+      // mutation so runtime trust/permission state cannot go stale across UI
+      // review. This does not perform another network download.
+      const finalPreview = pending.mode === "update"
+        ? await executableExtensionsClient.previewUpdate(pending.source_path)
+        : await executableExtensionsClient.previewInstall(pending.source_path);
+      if (finalPreview.approval_digest !== preview.approval_digest) {
+        throw new Error("Executable runtime approval state changed; review the release again.");
+      }
       const result = pending.mode === "update"
         ? await executableExtensionsClient.update(pending.source_path, approval)
         : await executableExtensionsClient.install(pending.source_path, approval);
-      set({
-        pendingPreview: null,
-        loading: false,
-        notice: `${pending.mode === "update" ? "Updated" : "Installed"} ${result.manifest.display_name} to ${result.active_version}.`,
-      });
+      set({ pendingPreview: null, loading: false, notice: `${pending.mode === "update" ? "Updated" : "Installed"} ${result.manifest.display_name} to ${result.active_version}.` });
       await get().refreshAll();
     } catch (error) {
       set({ loading: false, error: errorMessage(error) });
@@ -241,34 +326,35 @@ export const useExtensionMarketplaceStore = create<ExtensionMarketplaceState>((s
   setUpdatePolicy: async (policy) => {
     persistPolicy(policy);
     set({ updatePolicy: policy });
-    await get().refreshAll();
+    await get().runUpdateCycle();
   },
 
   applySafeUpdates: async () => {
     const failures: string[] = [];
     const reviewRequired: string[] = [];
     let applied = 0;
-    // Every catalog candidate starts as metadata-only. Automatic mode is the
-    // explicit opt-in that authorizes the download/preview needed to determine
-    // whether it satisfies the narrow safe-update predicate.
     for (const candidate of get().updates) {
       try {
+        const currentRegistry = registryForEntry(get().registries, candidate.entry);
+        if (!currentRegistry || currentRegistry.snapshot.expires_unix_ms <= Date.now()) {
+          reviewRequired.push(`${candidate.entry.extension_id}: signed registry snapshot is no longer current`);
+          continue;
+        }
         const evaluated = await evaluateAutomaticCandidate(candidate);
         if (!evaluated.safe || !evaluated.approval) {
           reviewRequired.push(`${candidate.entry.extension_id}: ${evaluated.reasons.join("; ") || "manual review required"}`);
           continue;
         }
-        // Re-check immediately before mutation rather than carrying a preview
-        // across another candidate or an arbitrary UI delay.
-        const downloaded = await previewMarketplaceInstall(candidate.registry, candidate.entry);
-        const runtimePreview = await executableExtensionsClient.previewUpdate(downloaded.source_path);
-        const safety = isSafeAutomaticUpdate(runtimePreview, candidate.installed, candidate.entry);
-        const approval = automaticApproval(runtimePreview);
-        if (!safety.safe || !approval) {
-          reviewRequired.push(`${candidate.entry.extension_id}: ${[...safety.reasons, approval ? "" : "host-bound permission requires review"].filter(Boolean).join("; ")}`);
+        // Re-preview the exact staged bytes, not a second download. A changed
+        // runtime permission/trust result fails closed before mutation.
+        const finalPreview = await executableExtensionsClient.previewUpdate(evaluated.downloaded.source_path);
+        const finalSafety = isSafeAutomaticUpdate(finalPreview, candidate.installed, candidate.entry);
+        const finalApproval = automaticApproval(finalPreview);
+        if (!finalSafety.safe || !finalApproval || finalApproval.approval_digest !== evaluated.approval.approval_digest) {
+          reviewRequired.push(`${candidate.entry.extension_id}: runtime trust/permission state changed before update`);
           continue;
         }
-        await executableExtensionsClient.update(downloaded.source_path, approval);
+        await executableExtensionsClient.update(evaluated.downloaded.source_path, finalApproval);
         applied += 1;
       } catch (error) {
         failures.push(`${candidate.entry.extension_id}: ${errorMessage(error)}`);
@@ -282,7 +368,7 @@ export const useExtensionMarketplaceStore = create<ExtensionMarketplaceState>((s
     }
     try {
       const installed = await executableExtensionsClient.list();
-      const updates = metadataUpdates(get().registries, installed).map((candidate) => {
+      const updates = metadataUpdates(get().catalog, get().registries, installed).map((candidate) => {
         const detail = reviewRequired.find((reason) => reason.startsWith(`${candidate.entry.extension_id}: `));
         return detail ? { ...candidate, reasons: [detail.slice(candidate.entry.extension_id.length + 2)] } : candidate;
       });
