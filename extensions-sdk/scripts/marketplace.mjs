@@ -67,9 +67,6 @@ export async function packExtension(sourceDirectory) {
   const componentPath = safeRelative(manifest.component.path);
   if (!(componentPath in filesBase64)) throw new Error("declared component is missing from package files");
   const envelope = { schema_version: LMX_SCHEMA_VERSION, manifest, files_base64: filesBase64 };
-  // Compact deterministic JSON, deliberately without a trailing newline. The
-  // 3 MiB decoded + 256 KiB manifest/path bounds leave base64/JSON overhead
-  // safely below the host-owned 5 MiB `tool_web_fetch` response ceiling.
   const text = canonical(envelope);
   return {
     envelope,
@@ -99,6 +96,10 @@ export async function publishIntoSnapshot(lmxPath, snapshotPath, registryRoot) {
   const snapshot = JSON.parse(await readFile(snapshotPath, "utf8"));
   if (!snapshot.packages || !snapshot.signature) throw new Error("snapshot is not an M4 registry snapshot");
   if (snapshot.signature.signature_hex) throw new Error("refusing to mutate an already-signed registry snapshot; clear/rebuild it first");
+  const provenanceRegistry = manifest.provenance?.source?.curated_registry?.registry_id;
+  if (!provenanceRegistry || provenanceRegistry !== snapshot.registry_id) {
+    throw new Error(`marketplace extension provenance must name target curated registry ${snapshot.registry_id}`);
+  }
   const versions = Array.isArray(snapshot.packages[packageId]) ? snapshot.packages[packageId] : [];
   const filtered = versions.filter((entry) => entry.version !== manifest.version);
   filtered.push({ version: manifest.version, bundle_sha256: bundleSha, manifest_sha256: manifestSha });
@@ -133,8 +134,6 @@ function registrySigningShape(snapshot) {
 
 export function registrySigningPayload(snapshot) {
   if (snapshot.signature?.algorithm !== "ed25519") throw new Error("M4 registry signature algorithm must be ed25519");
-  // Mirrors Rust RegistrySnapshot::signing_payload(): serde struct field order,
-  // BTreeMap package-key ordering, and an empty signature_hex.
   return Buffer.from(JSON.stringify(registrySigningShape(snapshot)), "utf8");
 }
 
@@ -171,7 +170,7 @@ async function main() {
   }
   if (command === "sign-registry") {
     const [snapshotPath, privateKeyPath] = args;
-    if (!snapshotPath || !privateKeyPath) throw new Error("usage: marketplace.mjs sign-registry <m4-snapshot.json> <ed25519-private-key.pem>");
+    if (!snapshotPath || !privateKeyPath) throw new Error("usage: marketplace.mjs sign-registry <m4-snapshot.json> <ed25519-private-key.pem> <trust-root-id> <key-id>");
     process.stdout.write(`${await signRegistry(snapshotPath, privateKeyPath)}\n`);
     return;
   }
