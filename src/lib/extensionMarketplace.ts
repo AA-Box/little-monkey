@@ -1,5 +1,3 @@
-import { invoke } from "@tauri-apps/api/core";
-
 import {
   executableExtensionsClient,
   type ExtensionDetail,
@@ -13,36 +11,25 @@ import type {
 
 /**
  * Executable extensions deliberately do NOT become M4 declarative packages.
- * The existing signed M4 registry is reused only as an artifact index: entries
- * in the reserved `extension.` namespace bind an extension id/version to an
- * immutable .lmx digest and manifest digest. The downloaded bytes then go
- * through the existing executable-extension runtime, which independently
- * validates the manifest/component/signature and permission approval digest.
+ * The existing signed M4 registry is reused as the artifact authority: entries
+ * in the reserved `extension.` namespace bind extension id/version to immutable
+ * package + manifest digests. The renderer only selects one signed identity;
+ * Rust resolves those digests from its own verified M4 state and owns network,
+ * staging, runtime preview, and mutation revalidation.
  */
 export const M4_EXTENSION_PACKAGE_PREFIX = "extension.";
 export const LMX_SCHEMA = 1;
-export const MAX_LMX_DOWNLOAD_CHARS = 5 * 1024 * 1024;
 export const MAX_LMX_FILES = 128;
 export const MAX_LMX_PATH_CHARS = 512;
 export const MAX_LMX_FILE_BYTES = 3 * 1024 * 1024;
 export const MAX_LMX_DECODED_BYTES = 3 * 1024 * 1024;
 export const MAX_LMX_MANIFEST_BYTES = 256 * 1024;
-const MARKETPLACE_STAGE_PREFIX = "little-monkey-marketplace-lmx-v1:";
+const MARKETPLACE_PREPARE_PREFIX = "little-monkey-marketplace-prepare:v2:";
 
 interface RegistryPackageVersionWire {
   version: string;
   bundle_sha256: string;
   manifest_sha256: string;
-}
-
-interface FetchResultWire {
-  url: string;
-  final_url: string;
-  title: string | null;
-  content_type: string;
-  markdown: string;
-  total_chars: number;
-  truncated: boolean;
 }
 
 export interface MarketplaceRegistry {
@@ -73,6 +60,7 @@ export interface LmxEnvelope {
 export interface MarketplaceInstallPreview {
   registry: MarketplaceRegistry;
   entry: ExtensionRegistryEntry;
+  /** Opaque native marketplace lease, never a renderer-owned filesystem path. */
   source_path: string;
   runtime_preview: ExtensionPreview;
 }
@@ -109,6 +97,8 @@ function validRegistryLocation(value: string): URL {
   return url;
 }
 
+/** Informational/static-publisher path only. Installation never sends this URL
+ * to Rust and never fetches it in the renderer. */
 export function extensionArtifactUrl(registryLocation: string, extensionId: string, version: string): string {
   const registry = validRegistryLocation(registryLocation);
   const base = new URL(".", registry);
@@ -131,9 +121,7 @@ function nestedPackageTarget(value: unknown): { packageId: string; version: stri
   if (!value || typeof value !== "object") return null;
   const record = value as Record<string, unknown>;
   const packageId = typeof record.package_id === "string" ? record.package_id : null;
-  if (packageId) {
-    return { packageId, version: typeof record.version === "string" ? record.version : null };
-  }
+  if (packageId) return { packageId, version: typeof record.version === "string" ? record.version : null };
   for (const child of Object.values(record)) {
     const target = nestedPackageTarget(child);
     if (target) return target;
@@ -211,15 +199,6 @@ function base64Bytes(value: string): Uint8Array {
   return bytes;
 }
 
-async function sha256Bytes(bytes: Uint8Array): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-async function sha256Text(value: string): Promise<string> {
-  return sha256Bytes(new TextEncoder().encode(value));
-}
-
 function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
@@ -237,6 +216,8 @@ function safeRelativePath(path: string): string {
   return normalized;
 }
 
+/** Publisher/test helper only. Native Rust repeats these checks and is the
+ * installation authority. */
 export function validateLmxEnvelope(envelope: LmxEnvelope): void {
   if (envelope.schema_version !== LMX_SCHEMA) throw new Error(`Unsupported .lmx schema ${String(envelope.schema_version)}.`);
   if (!envelope.manifest?.extension_id || !envelope.manifest?.version || !envelope.files_base64 || typeof envelope.files_base64 !== "object") {
@@ -262,46 +243,25 @@ export function validateLmxEnvelope(envelope: LmxEnvelope): void {
   if (Object.keys(envelope.files_base64).some((path) => safeRelativePath(path) === "extension.json")) throw new Error(".lmx must not contain a second extension.json; the signed manifest is the single source of truth.");
 }
 
-async function fetchPackageText(url: string): Promise<string> {
-  const result = await invoke<FetchResultWire>("tool_web_fetch", {
-    url,
-    max_chars: MAX_LMX_DOWNLOAD_CHARS,
-    start_index: 0,
-    turn_id: null,
-    tool_call_id: crypto.randomUUID(),
-  });
-  if (result.truncated || result.total_chars > MAX_LMX_DOWNLOAD_CHARS) throw new Error(`.lmx package exceeds the ${MAX_LMX_DOWNLOAD_CHARS} character marketplace limit.`);
-  if (!/^application\/(?:json|[^;]+\+json)|^text\/plain/i.test(result.content_type)) throw new Error(`.lmx must be served as JSON/text; received ${result.content_type || "unknown content type"}.`);
-  return result.markdown;
-}
-
-export async function downloadAndMaterializeLmx(entry: ExtensionRegistryEntry): Promise<string> {
-  if (entry.revoked) throw new Error(entry.revocation_reason ?? `${entry.extension_id}@${entry.version} is revoked.`);
-  const raw = await fetchPackageText(entry.package_url);
-  const packageDigest = await sha256Text(raw);
-  if (packageDigest.toLowerCase() !== entry.package_sha256.toLowerCase()) throw new Error(".lmx bytes do not match the digest in the verified M4 registry snapshot.");
-  let envelope: LmxEnvelope;
-  try { envelope = JSON.parse(raw) as LmxEnvelope; } catch { throw new Error("Downloaded extension is not valid .lmx JSON."); }
-  validateLmxEnvelope(envelope);
-  if (envelope.manifest.extension_id !== entry.extension_id || envelope.manifest.version !== entry.version) throw new Error(".lmx identity/version does not match the verified M4 catalog entry.");
-  const manifestDigest = await sha256Text(canonical(envelope.manifest));
-  if (manifestDigest.toLowerCase() !== entry.manifest_sha256.toLowerCase()) throw new Error(".lmx manifest does not match the manifest digest in the verified M4 registry snapshot.");
-
-  // The renderer never receives filesystem write authority. It passes the
-  // already digest-checked inert package to the fixed extension bridge, which
-  // re-verifies all signed identities/digests in Rust and stages bytes under an
-  // app-owned cache before invoking the ordinary executable runtime preview.
-  const request = {
-    raw_package: raw,
-    package_sha256: entry.package_sha256,
-    manifest_sha256: entry.manifest_sha256,
-    extension_id: entry.extension_id,
-    version: entry.version,
+function prepareSource(entry: ExtensionRegistryEntry): string {
+  return `${MARKETPLACE_PREPARE_PREFIX}${JSON.stringify({
     registry_source_id: entry.registry_source_id,
     registry_snapshot_sha256: entry.registry_snapshot_sha256,
-  };
-  const preview = await executableExtensionsClient.discover(`${MARKETPLACE_STAGE_PREFIX}${JSON.stringify(request)}`);
-  if (preview.manifest.extension_id !== entry.extension_id || preview.manifest.version !== entry.version) throw new Error("Native marketplace staging disagrees with the verified M4 catalog identity.");
+    extension_id: entry.extension_id,
+    version: entry.version,
+  })}`;
+}
+
+/** Native Rust resolves URL + expected hashes from its own verified M4 state,
+ * fetches the .lmx, verifies/stages it, and returns an opaque lease in
+ * preview.source_path. No package bytes, URL, or expected digest crosses this
+ * renderer boundary. */
+export async function downloadAndMaterializeLmx(entry: ExtensionRegistryEntry): Promise<string> {
+  if (entry.revoked) throw new Error(entry.revocation_reason ?? `${entry.extension_id}@${entry.version} is revoked.`);
+  const preview = await executableExtensionsClient.discover(prepareSource(entry));
+  if (preview.manifest.extension_id !== entry.extension_id || preview.manifest.version !== entry.version) {
+    throw new Error("Native marketplace preparation disagrees with the selected M4 catalog identity.");
+  }
   return preview.source_path;
 }
 
