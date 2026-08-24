@@ -7,42 +7,13 @@ use crate::executable_extensions::{
     ActiveCapability, Approval, CapabilityKind, ExtensionDetail, ExtensionLogRow, ExtensionManager,
     ExtensionPreview, InvocationRequest, InvocationResult, PermissionKind,
 };
-use base64::Engine as _;
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use uuid::Uuid;
+use std::collections::BTreeMap;
 
-const MARKETPLACE_STAGE_PREFIX: &str = "little-monkey-marketplace-lmx-v1:";
-const MARKETPLACE_CACHE_DIR: &str = "extension-marketplace-cache-v1";
-const MAX_LMX_DOWNLOAD_BYTES: usize = 5 * 1024 * 1024;
-const MAX_LMX_FILES: usize = 128;
-const MAX_LMX_PATH_CHARS: usize = 512;
-const MAX_LMX_FILE_BYTES: usize = 3 * 1024 * 1024;
-const MAX_LMX_DECODED_BYTES: usize = 3 * 1024 * 1024;
-const MAX_LMX_MANIFEST_BYTES: usize = 256 * 1024;
+#[path = "marketplace_commands.rs"]
+pub(crate) mod marketplace_commands;
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MarketplaceStageRequest {
-    raw_package: String,
-    package_sha256: String,
-    manifest_sha256: String,
-    extension_id: String,
-    version: String,
-    registry_source_id: String,
-    registry_snapshot_sha256: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MarketplaceEnvelope {
-    schema_version: u32,
-    manifest: serde_json::Value,
-    files_base64: BTreeMap<String, String>,
-}
+const MARKETPLACE_PREPARE_PREFIX: &str = "little-monkey-marketplace-prepare:v2:";
+const MARKETPLACE_HANDLE_PREFIX: &str = "little-monkey-marketplace:v2:";
 
 fn manager() -> Result<ExtensionManager, String> {
     let app_data = crate::app_paths::data_dir()
@@ -50,205 +21,21 @@ fn manager() -> Result<ExtensionManager, String> {
     ExtensionManager::new(app_data)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
-}
-
-fn require_sha256(label: &str, value: &str) -> Result<(), String> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(format!("{label} is not a SHA-256 digest"));
-    }
-    Ok(())
-}
-
-fn canonical_json(value: &serde_json::Value) -> Result<String, String> {
-    match value {
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => serde_json::to_string(value)
-            .map_err(|error| format!("Cannot encode canonical marketplace JSON: {error}")),
-        serde_json::Value::Array(items) => {
-            let encoded = items
-                .iter()
-                .map(canonical_json)
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(format!("[{}]", encoded.join(",")))
-        }
-        serde_json::Value::Object(object) => {
-            let mut keys = object.keys().collect::<Vec<_>>();
-            keys.sort();
-            let mut fields = Vec::with_capacity(keys.len());
-            for key in keys {
-                let encoded_key = serde_json::to_string(key)
-                    .map_err(|error| format!("Cannot encode marketplace JSON key: {error}"))?;
-                fields.push(format!("{encoded_key}:{}", canonical_json(&object[key])?));
-            }
-            Ok(format!("{{{}}}", fields.join(",")))
-        }
-    }
-}
-
-fn safe_marketplace_path(raw: &str) -> Result<PathBuf, String> {
-    if raw.is_empty() || raw.len() > MAX_LMX_PATH_CHARS || raw.contains('\0') {
-        return Err(format!("Unsafe marketplace package path: {raw}"));
-    }
-    let normalized = raw.replace('\\', "/");
-    if normalized.starts_with('/')
-        || normalized
-            .as_bytes()
-            .get(1)
-            .is_some_and(|byte| *byte == b':')
-    {
-        return Err(format!("Unsafe marketplace package path: {raw}"));
-    }
-    let mut path = PathBuf::new();
-    for part in normalized.split('/') {
-        if part.is_empty() || part == "." || part == ".." || !part.is_ascii() {
-            return Err(format!("Unsafe marketplace package path: {raw}"));
-        }
-        path.push(part);
-    }
-    Ok(path)
-}
-
-fn stage_marketplace_package(encoded: &str) -> Result<PathBuf, String> {
-    let request: MarketplaceStageRequest = serde_json::from_str(encoded)
-        .map_err(|error| format!("Invalid marketplace staging request: {error}"))?;
-    require_sha256("Marketplace package digest", &request.package_sha256)?;
-    require_sha256("Marketplace manifest digest", &request.manifest_sha256)?;
-    require_sha256(
-        "Marketplace registry snapshot digest",
-        &request.registry_snapshot_sha256,
-    )?;
-    if request.registry_source_id.trim().is_empty() {
-        return Err("Marketplace registry source id is empty".to_string());
-    }
-    let raw = request.raw_package.as_bytes();
-    if raw.is_empty() || raw.len() > MAX_LMX_DOWNLOAD_BYTES {
-        return Err("Marketplace .lmx exceeds its bounded encoded size".to_string());
-    }
-    if sha256_hex(raw) != request.package_sha256.to_ascii_lowercase() {
-        return Err("Marketplace .lmx does not match the verified M4 package digest".to_string());
-    }
-
-    let envelope: MarketplaceEnvelope = serde_json::from_slice(raw)
-        .map_err(|error| format!("Marketplace .lmx is not valid JSON: {error}"))?;
-    if envelope.schema_version != 1 {
-        return Err(format!(
-            "Unsupported marketplace .lmx schema {}",
-            envelope.schema_version
-        ));
-    }
-    if envelope.files_base64.is_empty() || envelope.files_base64.len() > MAX_LMX_FILES {
-        return Err("Marketplace .lmx has an invalid file count".to_string());
-    }
-
-    let manifest_canonical = canonical_json(&envelope.manifest)?;
-    if manifest_canonical.len() > MAX_LMX_MANIFEST_BYTES {
-        return Err("Marketplace extension manifest exceeds its metadata limit".to_string());
-    }
-    if sha256_hex(manifest_canonical.as_bytes()) != request.manifest_sha256.to_ascii_lowercase() {
-        return Err("Marketplace manifest does not match the verified M4 manifest digest".to_string());
-    }
-    let manifest_id = envelope
-        .manifest
-        .get("extension_id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "Marketplace manifest is missing extension_id".to_string())?;
-    let manifest_version = envelope
-        .manifest
-        .get("version")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "Marketplace manifest is missing version".to_string())?;
-    if manifest_id != request.extension_id || manifest_version != request.version {
-        return Err("Marketplace manifest identity/version disagrees with signed M4 metadata".to_string());
-    }
-    let component_path = envelope
-        .manifest
-        .get("component")
-        .and_then(|value| value.get("path"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "Marketplace manifest is missing component.path".to_string())?;
-    let component = safe_marketplace_path(component_path)?;
-
-    let mut decoded = Vec::with_capacity(envelope.files_base64.len());
-    let mut total = 0usize;
-    let mut collisions = BTreeSet::new();
-    for (raw_path, encoded_bytes) in envelope.files_base64 {
-        let relative = safe_marketplace_path(&raw_path)?;
-        let key = relative.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
-        if !collisions.insert(key) {
-            return Err(format!("Marketplace .lmx contains a colliding path: {raw_path}"));
-        }
-        if relative == Path::new("extension.json") {
-            return Err("Marketplace .lmx must not contain a second extension.json".to_string());
-        }
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded_bytes)
-            .map_err(|_| format!("Marketplace .lmx contains invalid base64 for {raw_path}"))?;
-        if bytes.len() > MAX_LMX_FILE_BYTES {
-            return Err(format!("Marketplace file exceeds its size limit: {raw_path}"));
-        }
-        total = total
-            .checked_add(bytes.len())
-            .ok_or_else(|| "Marketplace decoded size overflow".to_string())?;
-        if total > MAX_LMX_DECODED_BYTES {
-            return Err("Marketplace .lmx decoded payload exceeds its limit".to_string());
-        }
-        decoded.push((relative, bytes));
-    }
-    if !decoded.iter().any(|(path, _)| path == &component) {
-        return Err("Marketplace .lmx is missing its declared component".to_string());
-    }
-
-    let app_data = crate::app_paths::data_dir()
-        .ok_or_else(|| "Could not resolve the Little Monkey app-data directory".to_string())?;
-    let root = app_data.join(MARKETPLACE_CACHE_DIR);
-    fs::create_dir_all(&root).map_err(|error| format!("Cannot create marketplace cache: {error}"))?;
-    let directory = root.join(format!(
-        "{}-{}",
-        request.package_sha256.to_ascii_lowercase(),
-        Uuid::new_v4().simple()
-    ));
-    fs::create_dir(&directory)
-        .map_err(|error| format!("Cannot create marketplace staging directory: {error}"))?;
-
-    let write_result = (|| -> Result<(), String> {
-        let manifest = serde_json::to_string_pretty(&envelope.manifest)
-            .map_err(|error| format!("Cannot encode marketplace manifest: {error}"))?;
-        fs::write(directory.join("extension.json"), format!("{manifest}\n"))
-            .map_err(|error| format!("Cannot stage marketplace manifest: {error}"))?;
-        for (relative, bytes) in decoded {
-            let target = directory.join(&relative);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| format!("Cannot create marketplace package directory: {error}"))?;
-            }
-            fs::write(&target, bytes)
-                .map_err(|error| format!("Cannot stage marketplace package file: {error}"))?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = write_result {
-        let _ = fs::remove_dir_all(&directory);
-        return Err(error);
-    }
-    Ok(directory)
-}
-
-fn resolve_discovery_source(source_path: String) -> Result<String, String> {
-    let Some(encoded) = source_path.strip_prefix(MARKETPLACE_STAGE_PREFIX) else {
-        return Ok(source_path);
-    };
-    Ok(stage_marketplace_package(encoded)?.to_string_lossy().to_string())
-}
-
 #[tauri::command]
-pub async fn extensions_discover(source_path: String) -> Result<ExtensionPreview, String> {
-    manager()?.discover(resolve_discovery_source(source_path)?)
+pub async fn extensions_discover(
+    window: tauri::Window,
+    state: tauri::State<'_, crate::m4_commands::M4CommandState>,
+    source_path: String,
+) -> Result<ExtensionPreview, String> {
+    if let Some(encoded) = source_path.strip_prefix(MARKETPLACE_PREPARE_PREFIX) {
+        let request = serde_json::from_str(encoded)
+            .map_err(|error| format!("Invalid marketplace prepare request: {error}"))?;
+        return marketplace_commands::marketplace_prepare_extension(window, state, request).await;
+    }
+    if source_path.starts_with(MARKETPLACE_HANDLE_PREFIX) {
+        return marketplace_commands::marketplace_preview_install(state, source_path).await;
+    }
+    manager()?.discover(source_path)
 }
 
 #[tauri::command]
@@ -270,9 +57,20 @@ pub async fn extensions_inspect(extension_id: String) -> Result<ExtensionDetail,
 
 #[tauri::command]
 pub async fn extensions_install(
+    window: tauri::Window,
+    state: tauri::State<'_, crate::m4_commands::M4CommandState>,
     source_path: String,
     approval: Approval,
 ) -> Result<ExtensionDetail, String> {
+    if source_path.starts_with(MARKETPLACE_HANDLE_PREFIX) {
+        return marketplace_commands::marketplace_install_extension(
+            window,
+            state,
+            source_path,
+            approval,
+        )
+        .await;
+    }
     manager()?.install(source_path, approval).await
 }
 
@@ -298,15 +96,32 @@ pub async fn extensions_set_running(
 }
 
 #[tauri::command]
-pub async fn extensions_preview_update(source_path: String) -> Result<ExtensionPreview, String> {
+pub async fn extensions_preview_update(
+    state: tauri::State<'_, crate::m4_commands::M4CommandState>,
+    source_path: String,
+) -> Result<ExtensionPreview, String> {
+    if source_path.starts_with(MARKETPLACE_HANDLE_PREFIX) {
+        return marketplace_commands::marketplace_preview_update(state, source_path).await;
+    }
     manager()?.preview_update(source_path)
 }
 
 #[tauri::command]
 pub async fn extensions_update(
+    window: tauri::Window,
+    state: tauri::State<'_, crate::m4_commands::M4CommandState>,
     source_path: String,
     approval: Approval,
 ) -> Result<ExtensionDetail, String> {
+    if source_path.starts_with(MARKETPLACE_HANDLE_PREFIX) {
+        return marketplace_commands::marketplace_update_extension(
+            window,
+            state,
+            source_path,
+            approval,
+        )
+        .await;
+    }
     manager()?.update(source_path, approval).await
 }
 
@@ -351,7 +166,10 @@ pub async fn extensions_set_secret(
 }
 
 #[tauri::command]
-pub async fn extensions_remove_secret(extension_id: String, slot_id: String) -> Result<(), String> {
+pub async fn extensions_remove_secret(
+    extension_id: String,
+    slot_id: String,
+) -> Result<(), String> {
     manager()?.remove_secret(&extension_id, &slot_id)
 }
 
