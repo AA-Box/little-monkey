@@ -226,6 +226,7 @@ Boundaries in full: **[docs/security.md](docs/security.md)**. Vulnerabilities go
 | See what the app does today | [Features](docs/features.md) |
 | Drive it from a terminal | [CLI](docs/cli.md) |
 | Run a bounded autonomous task with durable evidence | [Autonomous tasks](docs/autonomous-tasks.md) |
+| Run work on local, Docker, paired-node, or SSH executors | [Execution targets](docs/execution-targets.md) |
 | Build, test, or find the code | [Setup and development](docs/setup.md) |
 | Understand the trust model | [Workspace and trust boundaries](docs/security.md) |
 | Know where a claim stops | [Limitations](docs/limitations.md) |

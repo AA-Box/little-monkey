@@ -24,8 +24,8 @@ import { effortForTarget } from "../store/modelStore";
 export interface TaskNodeResult {
   ok: boolean;
   summary: string;
-  failureCode?: "EXECUTION_TARGET_LOST" | "FAILED";
-  failureKind?: "EXECUTION_TARGET_LOST" | "EXECUTION_FAILED" | "PERMISSION_DENIED" | "BUDGET_EXHAUSTED" | "CANCELLED";
+  failureCode?: string;
+  failureKind?: string;
   worktreePath?: string;
   artifacts?: TaskArtifact[];
   evidence?: VerificationEvidence[];
@@ -38,6 +38,8 @@ export interface TaskNodeResult {
   approval?: { requestId: string; operationDigest: string; expiresAtMs: number; confirmationPhrase?: string };
   deliveryStep?: "commit" | "push" | "create_draft_pr" | "update_draft_pr";
   review?: StructuredReviewResult;
+  resultId?: string;
+  reviewRequired?: boolean;
 }
 
 export interface StructuredReviewResult { verdict: "pass" | "changes_required"; findings: Array<{ severity: "blocking" | "warning" | "suggestion"; path: string; title: string; body: string }>; filesReviewed: string[]; acceptanceCriteria: string[]; securityFindings: string[]; testCoverageFindings: string[]; }
@@ -70,17 +72,20 @@ export type AutonomousTaskPlacementAdapter = (
 ) => Promise<TaskNodeResult>;
 
 export interface AutonomousTaskPlacementAdapters {
+  /** Generic executor seam. `context.placement.kind` selects the configured target. */
+  target?: AutonomousTaskPlacementAdapter;
+  /** @deprecated use `target`; retained for persisted integrations during migration. */
   docker?: AutonomousTaskPlacementAdapter;
+  /** @deprecated use `target`; retained for persisted integrations during migration. */
   remote_node?: AutonomousTaskPlacementAdapter;
 }
 
-function consumedPlacementNode(node: TaskPlanNode, kind: "docker" | "remote_node"): TaskPlanNode {
+function consumedPlacementNode(node: TaskPlanNode, kind: string): TaskPlanNode {
   const requestedPlacement = structuredClone(node.executionPlacement);
-  const isolation = kind === "docker" ? "shared" as const : node.isolation;
   return {
     ...structuredClone(node),
     dependencies: [],
-    isolation,
+    isolation: node.isolation,
     requestedExecutionPlacement: requestedPlacement,
     executionPlacement: {
       kind: "local",
@@ -90,11 +95,11 @@ function consumedPlacementNode(node: TaskPlanNode, kind: "docker" | "remote_node
       requestedPlacement,
       placementFulfilled: true,
     },
-    executionRequirements: node.executionRequirements ? { ...structuredClone(node.executionRequirements), isolation } : undefined,
+    executionRequirements: node.executionRequirements ? { ...structuredClone(node.executionRequirements), isolation: node.isolation } : undefined,
   };
 }
 
-export function buildAutonomousPlacementRunSpec(task: AutonomousTask, node: TaskPlanNode, kind: "docker" | "remote_node"): RunSpecWire {
+export function buildAutonomousPlacementRunSpec(task: AutonomousTask, node: TaskPlanNode, kind: string): RunSpecWire {
   const placedNode = consumedPlacementNode(node, kind);
   const taskSnapshot = {
     ...structuredClone(task),
@@ -148,8 +153,16 @@ export function buildAutonomousPlacementRunSpec(task: AutonomousTask, node: Task
 }
 
 function defaultAutonomousTaskPlacementAdapters(): AutonomousTaskPlacementAdapters {
-  const targetLost = (error: unknown): boolean => /^EXECUTION_TARGET_LOST\s*:/i.test(error instanceof Error ? error.message : String(error));
-  const execute = async (kind: "docker" | "remote_node", task: AutonomousTask, node: TaskPlanNode): Promise<TaskNodeResult> => {
+  const executionError = (error: unknown): { code: string; detail: string } => {
+    const raw = error instanceof Error ? error.message : String(error);
+    try {
+      const parsed = JSON.parse(raw) as { code?: unknown; detail?: unknown; error?: unknown };
+      if (typeof parsed.code === "string") return { code: parsed.code, detail: String(parsed.detail ?? parsed.error ?? raw) };
+    } catch { /* Tauri may return a plain structured error string. */ }
+    const match = raw.match(/^([A-Z][A-Z0-9_]+):\s*(.*)$/s);
+    return match ? { code: match[1], detail: match[2] } : { code: "EXECUTION_FAILED", detail: raw };
+  };
+  const execute = async (kind: string, task: AutonomousTask, node: TaskPlanNode): Promise<TaskNodeResult> => {
     const spec = buildAutonomousPlacementRunSpec(task, node, kind);
     const targetId = node.executionPlacement?.targetId?.trim();
     if (!targetId) {
@@ -161,16 +174,24 @@ function defaultAutonomousTaskPlacementAdapters(): AutonomousTaskPlacementAdapte
       };
     }
     try {
-      return await invoke<TaskNodeResult>("autonomous_task_place_node", { request: { kind, targetId, runSpec: spec } });
+      type Recovery = TaskNodeResult & { known: boolean; pending?: boolean; remoteRunId?: string };
+      let recovery = await invoke<Recovery>("autonomous_task_recover_node", { targetId, runId: spec.run_id });
+      while (recovery.known && recovery.pending) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        recovery = await invoke<Recovery>("autonomous_task_recover_node", { targetId, runId: spec.run_id });
+      }
+      if (recovery.known) {
+        const { known: _known, pending: _pending, remoteRunId: _remoteRunId, ...result } = recovery;
+        return result;
+      }
+      return await invoke<TaskNodeResult>("autonomous_task_place_node", { request: { targetId, runSpec: spec } });
     } catch (error) {
-      const message = `${kind} execution failed: ${error instanceof Error ? error.message : String(error)}`;
-      const lost = targetLost(error);
-      return { ok: false, failureCode: lost ? "EXECUTION_TARGET_LOST" : "FAILED", failureKind: lost ? "EXECUTION_TARGET_LOST" : "EXECUTION_FAILED", summary: message };
+      const parsed = executionError(error);
+      return { ok: false, failureCode: parsed.code, failureKind: parsed.code, summary: `${kind} execution failed: ${parsed.detail}` };
     }
   };
   return {
-    docker: (task, node) => execute("docker", task, node),
-    remote_node: (task, node) => execute("remote_node", task, node),
+    target: (task, node, context) => execute(context.placement?.kind ?? "local", task, node),
   };
 }
 
@@ -324,7 +345,18 @@ function outOfScopeFiles(node: TaskPlanNode, changedFiles: string[]): string[] {
 }
 
 function isExecutionTargetLost(result: TaskNodeResult): boolean {
-  return result.failureCode === "EXECUTION_TARGET_LOST" || result.failureKind === "EXECUTION_TARGET_LOST" || /^EXECUTION_TARGET_LOST\s*:/i.test(result.summary);
+  const targetLossCodes = new Set([
+    "EXECUTION_TARGET_LOST",
+    "TARGET_UNREACHABLE",
+    "TARGET_IDENTITY_CHANGED",
+    "HOST_KEY_CHANGED",
+    "PROTOCOL_INCOMPATIBLE",
+    "RUNNER_LOST",
+    "RUNNER_RESTARTED",
+  ]);
+  return targetLossCodes.has(result.failureCode ?? "")
+    || targetLossCodes.has(result.failureKind ?? "")
+    || /^[A-Z][A-Z0-9_]+\s*:/i.test(result.summary) && targetLossCodes.has(result.summary.split(":", 1)[0]);
 }
 
 function insertRepairNode(task: AutonomousTask, failedNode: TaskPlanNode, summary: string): AutonomousTask {
@@ -404,7 +436,11 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
       let acceptedPlan: TaskPlan | null = null;
       if (planned?.plan && validatePlannedTaskPlan(planned.plan, task)) acceptedPlan = planned.plan;
       if (hasPlanner && !acceptedPlan) throw new Error("Autonomous planner returned an invalid or incomplete repository-aware DAG.");
-      const plan = acceptedPlan ?? createTaskPlan(task.objective, task.constraints.strategy ?? "PLAN", Math.min(task.budgetSnapshot.maxWorkers, task.budgetSnapshot.maxConcurrentWorkers ?? task.budgetSnapshot.maxWorkers), task.planningContext);
+      const plannedBase = acceptedPlan ?? createTaskPlan(task.objective, task.constraints.strategy ?? "PLAN", Math.min(task.budgetSnapshot.maxWorkers, task.budgetSnapshot.maxConcurrentWorkers ?? task.budgetSnapshot.maxWorkers), task.planningContext);
+      const selectedPlacement = task.constraints.executionPlacement;
+      const plan = selectedPlacement
+        ? { ...plannedBase, revision: plannedBase.revision + 1, nodes: plannedBase.nodes.map((node) => ({ ...node, executionPlacement: { ...selectedPlacement, nodeId: node.nodeId }, requestedExecutionPlacement: undefined })) }
+        : plannedBase;
       const plannedCriteria = planned?.acceptanceCriteria;
       const criteriaAreStructured = Boolean(plannedCriteria && plannedCriteria.length >= 3 && plannedCriteria.some((criterion) => criterion.method === "verification_command") && plannedCriteria.some((criterion) => criterion.method === "review") && plannedCriteria.every((criterion) => Boolean(criterion.provenance?.kind && criterion.provenance.fragment)));
       if (hasPlanner && !criteriaAreStructured) throw new Error("Autonomous planner returned incomplete acceptance criteria; verification and review provenance are required.");
@@ -470,6 +506,10 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
         params.control?.beginExecution();
         try {
           await params.ownerFence?.(task.executionOwner);
+          const externalPlacement = context.placement
+            && context.placement.kind !== "local"
+            && context.placement.kind !== "worktree";
+          if (externalPlacement) return await params.runtime.executeNode(task, node, context);
           if (node.taskClass === "integration" && params.runtime.integrate) return await params.runtime.integrate(task, node, [...results.values()], context);
           if (node.taskClass === "verification" && params.runtime.verify) return await params.runtime.verify(task, node, context);
           if (node.taskClass === "review" && params.runtime.review) return await params.runtime.review(task, node, context);
@@ -492,12 +532,14 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
           ? { ...rawResult, ok: false, summary: `Node '${node.nodeId}' changed files outside its frozen mutation scope: ${unauthorized.join(", ")}` }
           : rawResult;
         const result: TaskNodeResult = isExecutionTargetLost(scopedResult)
-          ? { ...scopedResult, ok: false, failureCode: "EXECUTION_TARGET_LOST" }
-          : scopedResult.ok && mutatingNode && !scopedResult.mutation && !scopedResult.workspaceRevision
-            ? { ...scopedResult, ok: false, summary: "Mutating node did not return a revision-bound mutation record." }
-            : scopedResult.ok && mutatingNode && !scopedResult.mutation && scopedResult.workspaceRevision
-              ? { ...scopedResult, mutation: { beforeRevision: task.workspaceRevision ?? "unknown", afterRevision: scopedResult.workspaceRevision, changedFiles: scopedResult.changedFiles ?? [], patchDigest: scopedResult.workspaceRevision } }
-              : scopedResult;
+          ? { ...scopedResult, ok: false }
+          : scopedResult.ok && mutatingNode && scopedResult.reviewRequired && scopedResult.resultId
+            ? scopedResult
+            : scopedResult.ok && mutatingNode && !scopedResult.mutation && !scopedResult.workspaceRevision
+              ? { ...scopedResult, ok: false, summary: "Mutating node did not return a revision-bound mutation record." }
+              : scopedResult.ok && mutatingNode && !scopedResult.mutation && scopedResult.workspaceRevision
+                ? { ...scopedResult, mutation: { beforeRevision: task.workspaceRevision ?? "unknown", afterRevision: scopedResult.workspaceRevision, changedFiles: scopedResult.changedFiles ?? [], patchDigest: scopedResult.workspaceRevision } }
+                : scopedResult;
         results.set(node.nodeId, result);
         const awaitingApproval = !result.ok && result.awaitingApproval === true;
         const status: TaskPlanNode["status"] = result.ok ? "succeeded" : awaitingApproval ? "waiting_approval" : "failed";
@@ -514,7 +556,7 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
         if ((task.budgetSnapshot.maxArtifactBytes ?? Number.MAX_SAFE_INTEGER) < (task.usage?.artifactBytes ?? 0)) task = { ...task, outcome: "BUDGET_EXHAUSTED", summary: "Artifact budget exhausted.", updatedAtMs: Date.now() };
         task = { ...task, artifacts: [...task.artifacts, ...(result.artifacts ?? [])], updatedAtMs: Date.now() };
         task = { ...task, workers: task.workers.map((entry) => entry.workerId === worker.workerId ? { ...entry, finishedAtMs: Date.now() } : entry), updatedAtMs: Date.now() };
-        task = { ...task, workers: task.workers.map((entry) => entry.workerId === worker.workerId ? { ...entry, worktree: result.worktree, changedFiles: result.changedFiles, mutation: result.mutation, artifacts: result.artifacts, resultSummary: result.summary.slice(0, 2_000), usage: result.usage } : entry), updatedAtMs: Date.now() };
+        task = { ...task, workers: task.workers.map((entry) => entry.workerId === worker.workerId ? { ...entry, worktree: result.worktree, changedFiles: result.changedFiles, mutation: result.mutation, artifacts: result.artifacts, resultId: result.resultId, failureCode: result.failureCode, failureKind: result.failureKind, resultSummary: result.summary.slice(0, 2_000), usage: result.usage } : entry), updatedAtMs: Date.now() };
         if (result.deliveryStep) task = { ...task, deliveryStep: result.deliveryStep };
         if (awaitingApproval && result.approval) task = { ...task, outcome: "WAITING_APPROVAL", waitingReason: result.summary, waitingApproval: { ...result.approval, nodeId: node.nodeId }, updatedAtMs: Date.now() };
         if (result.evidence) for (const evidence of result.evidence) {
@@ -586,8 +628,9 @@ export function defaultAutonomousTaskRuntime(resolvedTarget: ResolvedTarget, pla
     },
     executeNode: async (task, node, context) => {
       const placementKind = node.executionPlacement?.kind;
-      if (placementKind === "docker" || placementKind === "remote_node") {
-        const adapter = placementAdapters[placementKind];
+      if (placementKind && placementKind !== "local" && placementKind !== "worktree") {
+        const adapter = placementAdapters.target
+          ?? (placementAdapters as unknown as Record<string, AutonomousTaskPlacementAdapter | undefined>)[placementKind];
         if (!adapter) return { ok: false, summary: "Execution placement '" + placementKind + "' has no registered backend adapter; refusing local fallback." };
         return adapter(task, node, context);
       }

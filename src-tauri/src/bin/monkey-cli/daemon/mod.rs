@@ -1553,19 +1553,42 @@ fn placed_recipe(
     // refused rather than silently rehomed onto the daemon's working directory,
     // which would run the submitter's task against the wrong files — the
     // quietest possible way to get this wrong.
-    let workspace = match snapshot.primary_root() {
-        Some(root) => {
-            let canonical = PathBuf::from(root).canonicalize().map_err(|error| {
-                format!("this node cannot resolve the placed workspace root '{root}': {error}")
-            })?;
-            if !canonical.is_dir() {
-                return Err(format!(
-                    "the placed workspace root '{root}' is not a directory on this node"
-                ));
-            }
-            Some(canonical.to_string_lossy().to_string())
+    let workspace = if let Some(transfer) = &spec.workspace_transfer {
+        let path = little_monkey_lib::execution_target::app_owned_workspace(
+            &app_data,
+            &transfer.workspace_id,
+            &transfer.snapshot_id,
+        )
+        .map_err(|error| error.to_string())?;
+        if !path.exists() {
+            transfer
+                .materialize(&path)
+                .map_err(|error| error.to_string())?;
+            transfer
+                .mark_cached(&path)
+                .map_err(|error| error.to_string())?;
+        } else if !transfer
+            .cached_matches(&path)
+            .map_err(|error| error.to_string())?
+        {
+            return Err("cached placed workspace does not match the requested snapshot".into());
         }
-        None => None,
+        Some(path.to_string_lossy().to_string())
+    } else {
+        match snapshot.primary_root() {
+            Some(root) => {
+                let canonical = PathBuf::from(root).canonicalize().map_err(|error| {
+                    format!("this node cannot resolve the placed workspace root '{root}': {error}")
+                })?;
+                if !canonical.is_dir() {
+                    return Err(format!(
+                        "the placed workspace root '{root}' is not a directory on this node"
+                    ));
+                }
+                Some(canonical.to_string_lossy().to_string())
+            }
+            None => None,
+        }
     };
 
     let recipe = little_monkey_lib::recipes::Recipe {

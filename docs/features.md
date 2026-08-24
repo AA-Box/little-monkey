@@ -19,6 +19,16 @@ narrower than its name suggests, the boundary is in [Limitations](limitations.md
 
 ## Workspace: files, review, terminal, and browser
 
+### Execution targets and portable workspaces
+
+- Configure and probe local, Docker, paired Little Monkey, and SSH-backed
+  runner targets. Freeze target identity/capabilities into each placed run.
+- Transfer clean Git, dirty Git, and non-Git workspaces with bounded,
+  content-addressed manifests; materialize executor-owned workspaces and
+  retrieve reviewable diffs, artifacts, and verification evidence.
+- Apply returned changes only through digest/conflict checks and Git preflight;
+  local checkouts are never overwritten automatically.
+
 - Reopen into the folders you were working in. The attached set is snapshotted on change and reattached at launch; folders deleted or moved since the last run are dropped rather than blocking the restore. Permission grants stay session-scoped and are never restored with a workspace.
 - Work across eight right-sidebar tabs — code review, single-file diff, terminal, browser, side tasks, workspace files, background tasks, and processes. Tabs stay mounted, share one drag-resizable persisted width, support a region-wide fullscreen toggle, and each has a keyboard shortcut on every platform.
 - Review changes in a git-backed panel using real porcelain output, with a per-file diff view and PR awareness. Pick the base — the branch's merge-base with its upstream, or HEAD — and the layout — every diff stacked, or one file at a time. Against HEAD the file list is uncapped and each diff loads on open; against the merge-base the panel is bounded by a 300-file payload cap and says so.
