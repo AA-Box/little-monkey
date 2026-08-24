@@ -821,6 +821,43 @@ impl Default for AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let full_product_e2e = std::env::var("COMPUTER_USE_FULL_PRODUCT_E2E").as_deref() == Ok("1");
+    const FULL_PRODUCT_E2E_CAPABILITY: &str = r#"{
+  "identifier": "computer-use-full-product-e2e",
+  "description": "Runtime-only capability for the real frontend/native acceptance window",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:1420/**"]
+  },
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "opener:default",
+    "shell:default",
+    "dialog:default",
+    "fs:default",
+    "deep-link:default",
+    "updater:default",
+    "process:allow-restart",
+    "allow-computer-use-full-product-report",
+    "allow-desktop-control-start-session",
+    "allow-desktop-control-stop-session",
+    "allow-desktop-control-provider-info",
+    "allow-tool-computer-list-targets",
+    "allow-tool-computer-inspect",
+    "allow-tool-computer-click",
+    "allow-tool-computer-set-value",
+    "allow-tool-computer-screenshot",
+    {
+      "identifier": "fs:allow-write-text-file",
+      "allow": [{ "path": "$TEMP/**" }]
+    },
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [{ "path": "$TEMP/**" }]
+    }
+  ]
+}"#;
     // Before anything else, and before any thread exists: a GUI launch hands us
     // launchd's `PATH`, so every shell tool would miss the user's own binaries
     // (`~/.local/bin`, Homebrew, version-manager shims) until this runs.
@@ -891,47 +928,51 @@ pub fn run() {
     // plugin instance per app), disambiguated in the shared handler below by
     // comparing the fired `Shortcut` against this parsed constant.
     const DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT: &str = "CommandOrControl+Shift+Escape";
-    let desktop_control_emergency_stop_shortcut: tauri_plugin_global_shortcut::Shortcut =
-        DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT
-            .parse()
-            .expect("the desktop control emergency-stop hotkey must be valid");
-    // All three global OS-level shortcuts (the companion overlay's, the
-    // command palette's, and desktop control's fixed emergency stop) share
-    // one `tauri_plugin_global_shortcut` plugin registration — a Tauri app
-    // manages exactly one instance of each plugin — and one dispatching
-    // handler that tells them apart by comparing the fired `Shortcut`
-    // against each feature's configured, already-parsed value
-    // (`Shortcut`/`HotKey` derives `PartialEq`).
-    let companion_shortcut_parsed = configured_companion_shortcut
-        .parse::<tauri_plugin_global_shortcut::Shortcut>()
-        .expect("the configured companion shortcut must be valid");
-    let palette_shortcut_parsed = configured_palette_shortcut
-        .parse::<tauri_plugin_global_shortcut::Shortcut>()
-        .expect("the configured command palette shortcut must be valid");
-    let global_shortcuts = tauri_plugin_global_shortcut::Builder::new()
-        .with_shortcut(configured_companion_shortcut.as_str())
-        .expect("the configured companion shortcut must be valid")
-        .with_shortcut(configured_palette_shortcut.as_str())
-        .expect("the configured command palette shortcut must be valid")
-        .with_shortcut(DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT)
-        .expect("the desktop control emergency-stop hotkey must be valid")
-        .with_handler(move |app, shortcut, event| {
-            if event.state != tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                return;
-            }
-            if *shortcut == desktop_control_emergency_stop_shortcut {
-                let state = app.state::<desktop_control::DesktopControlState>();
-                let _ = state.emergency_stop();
-                if let Some(overlay) = app.get_webview_window("companion-overlay") {
-                    let _ = overlay.hide();
+    // The full-product acceptance process may run beside another Tauri app on
+    // the hosted desktop. It still exercises the emergency-stop implementation
+    // through the normal desktop-control state, but must not claim the user's
+    // machine-wide shortcuts and collide with that other process.
+    let global_shortcuts = if full_product_e2e {
+        tauri_plugin_global_shortcut::Builder::new().build()
+    } else {
+        let desktop_control_emergency_stop_shortcut: tauri_plugin_global_shortcut::Shortcut =
+            DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT
+                .parse()
+                .expect("the desktop control emergency-stop hotkey must be valid");
+        // All three global OS-level shortcuts share one plugin registration and
+        // one dispatching handler that tells them apart by comparing the fired
+        // Shortcut against each feature's configured value.
+        let companion_shortcut_parsed = configured_companion_shortcut
+            .parse::<tauri_plugin_global_shortcut::Shortcut>()
+            .expect("the configured companion shortcut must be valid");
+        let palette_shortcut_parsed = configured_palette_shortcut
+            .parse::<tauri_plugin_global_shortcut::Shortcut>()
+            .expect("the configured command palette shortcut must be valid");
+        tauri_plugin_global_shortcut::Builder::new()
+            .with_shortcut(configured_companion_shortcut.as_str())
+            .expect("the configured companion shortcut must be valid")
+            .with_shortcut(configured_palette_shortcut.as_str())
+            .expect("the configured command palette shortcut must be valid")
+            .with_shortcut(DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT)
+            .expect("the desktop control emergency-stop hotkey must be valid")
+            .with_handler(move |app, shortcut, event| {
+                if event.state != tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                    return;
                 }
-            } else if *shortcut == companion_shortcut_parsed {
-                let _ = m7_companion::show_overlay(app);
-            } else if *shortcut == palette_shortcut_parsed {
-                let _ = command_palette::show_palette(app);
-            }
-        })
-        .build();
+                if *shortcut == desktop_control_emergency_stop_shortcut {
+                    let state = app.state::<desktop_control::DesktopControlState>();
+                    let _ = state.emergency_stop();
+                    if let Some(overlay) = app.get_webview_window("companion-overlay") {
+                        let _ = overlay.hide();
+                    }
+                } else if *shortcut == companion_shortcut_parsed {
+                    let _ = m7_companion::show_overlay(app);
+                } else if *shortcut == palette_shortcut_parsed {
+                    let _ = command_palette::show_palette(app);
+                }
+            })
+            .build()
+    };
     let app = tauri::Builder::default()
         // Must be registered first (per tauri-plugin-single-instance's own
         // docs) so it can intercept a second launch before anything else
@@ -979,7 +1020,27 @@ pub fn run() {
         .register_uri_scheme_protocol("artifact", |ctx, request| {
             artifacts::handle_request(ctx.app_handle().state::<AppState>().inner(), &request)
         })
-        .setup(|app| {
+        .setup(move |app| {
+            if full_product_e2e {
+                app.add_capability(FULL_PRODUCT_E2E_CAPABILITY)
+                    .expect("full product acceptance capability must be valid");
+            }
+            if full_product_e2e && app.get_webview_window("main").is_none() {
+                eprintln!("full product app had no main webview; creating the acceptance window");
+                tauri::WebviewWindowBuilder::new(
+                    app,
+                    "main",
+                    tauri::WebviewUrl::External(
+                        "http://127.0.0.1:1420/"
+                            .parse()
+                            .expect("full product dev URL must be valid"),
+                    ),
+                )
+                .title("Little Monkey")
+                .inner_size(1440.0, 800.0)
+                .build()
+                .expect("full product main window must be creatable");
+            }
             // Keep the native-skill registry live for external edits and
             // cross-window updates. Workspace restoration below triggers a
             // second sync once the primary root is known.
@@ -1943,10 +2004,27 @@ pub fn run() {
             privacy_firewall::privacy_firewall_execute_send,
             desktop_control::desktop_control_start_session,
             desktop_control::desktop_control_stop_session,
+            desktop_control::desktop_control_pause_session,
             desktop_control::desktop_control_sessions,
             desktop_control::desktop_control_request_action,
             desktop_control::desktop_control_respond_action,
             desktop_control::desktop_control_emergency_stop,
+            desktop_control::computer_use_full_product_report,
+            desktop_control::desktop_control_provider_info,
+            desktop_control::tool_computer_list_targets,
+            desktop_control::tool_computer_screenshot,
+            desktop_control::tool_computer_clipboard_read,
+            desktop_control::tool_computer_inspect,
+            desktop_control::tool_computer_focus,
+            desktop_control::tool_computer_click,
+            desktop_control::tool_computer_double_click,
+            desktop_control::tool_computer_scroll,
+            desktop_control::tool_computer_type,
+            desktop_control::tool_computer_key,
+            desktop_control::tool_computer_hotkey,
+            desktop_control::tool_computer_wait,
+            desktop_control::tool_computer_select,
+            desktop_control::tool_computer_set_value,
             runtime_pr_watcher::runtime_pr_watcher_state,
             runtime_pr_watcher::runtime_pr_watcher_check_now,
         ])

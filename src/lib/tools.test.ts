@@ -31,6 +31,31 @@ describe("buildTools", () => {
   });
 });
 
+describe("Computer Use tools", () => {
+  it("offers the complete native tool surface with a grant-first contract", () => {
+    const names = TOOLS.map((tool) => tool.function.name);
+    expect(names).toEqual(expect.arrayContaining([
+      "computer_list_targets",
+      "computer_screenshot",
+      "computer_inspect",
+      "computer_focus",
+      "computer_click",
+      "computer_double_click",
+      "computer_scroll",
+      "computer_type",
+      "computer_key",
+      "computer_hotkey",
+      "computer_wait",
+      "computer_select",
+      "computer_set_value",
+      "computer_clipboard_read",
+    ]));
+    const click = TOOLS.find((tool) => tool.function.name === "computer_click");
+    expect(click?.function.description).toContain("active user-granted");
+    expect(click?.function.description).toContain("browser DOM");
+  });
+});
+
 describe("toolsForWorkspace", () => {
   it("removes workspace and subagent tools when no workspace is attached", () => {
     const tools = toolsForWorkspace([...TOOLS, TASK_TOOL], false);

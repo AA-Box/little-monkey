@@ -398,6 +398,11 @@ const CLASSIFIED_CLI: &[(&str, Class, &str)] = &[
         "remote-controlled desktop operations, gated by the pairing's granted scope",
     ),
     (
+        "daemon/remote/api.rs",
+        Class::HostUtility,
+        "the ignored Windows acceptance test launches the repository-owned WPF fixture with fixed arguments",
+    ),
+    (
         "daemon/adapters/signal.rs",
         Class::ManagedService,
         "the signal-cli transport the user configured",
