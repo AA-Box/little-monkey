@@ -13,7 +13,7 @@ import {
   writePackage,
 } from "./marketplace.mjs";
 
-function manifest() {
+function manifest(registryId = "fixture-registry") {
   return {
     schema_version: 1,
     extension_id: "com.example.echo",
@@ -29,15 +29,15 @@ function manifest() {
     dependencies: [],
     compatibility: { minimum_app_version: "0.1.0", maximum_app_version_exclusive: null, platforms: [], architectures: [] },
     publisher: "example",
-    provenance: { publisher: "example", source: { git: { remote: "https://example.invalid/repo", commit_sha: "a".repeat(40) } }, source_revision: "a".repeat(40), build_reproducible: true },
+    provenance: { publisher: "example", source: { curated_registry: { registry_id: registryId } }, source_revision: "a".repeat(40), build_reproducible: true },
     signature: null,
     checksums: { "component.wasm": "0".repeat(64) },
   };
 }
 
-async function extensionFixture(root) {
+async function extensionFixture(root, registryId = "fixture-registry") {
   await mkdir(root, { recursive: true });
-  await writeFile(path.join(root, "extension.json"), `${JSON.stringify(manifest(), null, 2)}\n`);
+  await writeFile(path.join(root, "extension.json"), `${JSON.stringify(manifest(registryId), null, 2)}\n`);
   await writeFile(path.join(root, "component.wasm"), Buffer.from([0, 97, 115, 109]));
   await mkdir(path.join(root, "assets"));
   await writeFile(path.join(root, "assets", "note.txt"), "hello");
@@ -94,6 +94,20 @@ test("publishIntoSnapshot reuses M4 packages and static extension layout", async
   const snapshot = JSON.parse(await readFile(snapshotPath, "utf8"));
   assert.deepEqual(snapshot.packages[result.package_id], [{ version: "1.2.3", bundle_sha256: packed.package_sha256, manifest_sha256: packed.manifest_sha256 }]);
   assert.equal(await readFile(path.join(registryRoot, "extensions", "com.example.echo", "1.2.3.lmx"), "utf8"), packed.text);
+});
+
+test("publishIntoSnapshot refuses extension provenance for another registry", async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), "lm-marketplace-provenance-"));
+  const source = path.join(temp, "extension");
+  const lmx = path.join(temp, "echo.lmx");
+  const snapshotPath = path.join(temp, "index.json");
+  await extensionFixture(source, "other-registry");
+  await writePackage(source, lmx);
+  await writeFile(snapshotPath, `${JSON.stringify(unsignedSnapshot(), null, 2)}\n`);
+  await assert.rejects(
+    () => publishIntoSnapshot(lmx, snapshotPath, path.join(temp, "public")),
+    /provenance must name target curated registry fixture-registry/,
+  );
 });
 
 test("M4 registry signing helper round-trips Ed25519 payload", async () => {
