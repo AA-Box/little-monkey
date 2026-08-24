@@ -179,6 +179,11 @@ pub fn kill_process_group(pid: u32) -> Result<(), String> {
     signal_group(pid, libc::SIGKILL)
 }
 
+#[cfg(windows)]
+pub fn kill_process_group(pid: u32) -> Result<(), String> {
+    command_ok("taskkill", &["/PID", &pid.to_string(), "/T", "/F"])
+}
+
 /// Signals the process group led by `pid`.
 ///
 /// A direct `killpg(2)` rather than shelling out to `kill`. The subprocess form

@@ -363,6 +363,10 @@ pub struct PlacedRunSnapshot {
     pub workspace: Option<WorkspaceContext>,
     pub permission_policy: PermissionPolicySnapshot,
     pub budgets: RunBudgets,
+    #[serde(default)]
+    pub execution_target: Option<crate::execution_target::ExecutionTargetSnapshot>,
+    #[serde(default)]
+    pub workspace_transfer: Option<crate::execution_target::WorkspaceTransfer>,
 }
 
 impl PlacedRunSnapshot {
@@ -376,6 +380,8 @@ impl PlacedRunSnapshot {
             workspace: spec.workspace.clone(),
             permission_policy: spec.permission_policy.clone(),
             budgets: spec.budgets.clone(),
+            execution_target: spec.execution_target.clone(),
+            workspace_transfer: spec.workspace_transfer.clone(),
         }
     }
 
@@ -390,6 +396,12 @@ impl PlacedRunSnapshot {
             .validate()
             .map_err(|error| error.to_string())?;
         self.budgets.validate().map_err(|error| error.to_string())?;
+        if let Some(target) = &self.execution_target {
+            target.validate().map_err(|error| error.to_string())?;
+        }
+        if let Some(transfer) = &self.workspace_transfer {
+            transfer.validate().map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
 
@@ -852,6 +864,8 @@ pub(crate) mod tests_support {
                 max_event_count: 1_000,
             },
             autonomous_task: None,
+            execution_target: None,
+            workspace_transfer: None,
         }
     }
 }

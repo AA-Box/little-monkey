@@ -3,6 +3,18 @@
 What the permission and trust model guarantees. The enforcement gaps it does
 *not* close are in [Limitations](limitations.md#enforcement-and-isolation).
 
+Execution targets add a second, explicit trust boundary. A run freezes the
+target identity and capability digest before submission; target changes are
+reported as identity/protocol failures, not silently accepted. Workspace
+transfers are content-addressed and materialized only below runner-owned data
+directories. Paths, links, special files, transfer sizes, and normalization
+collisions are validated on both sides. Docker receives no host socket,
+privilege, or arbitrary mount, and SSH requires strict known-host verification.
+Secrets resolve on the executor by default; only explicitly supplied
+environment entries are forwarded, and the whole originating environment is
+never copied. Remote loss is recorded separately from cancellation, so a
+connection drop cannot claim that remote work stopped.
+
 Little Monkey canonicalizes workspace paths and rejects traversal and symlink escapes. Read-only workspace operations do not mutate files; mutating file, shell, memory, MCP, browser, Git and GitHub, workflow, background, capture, and remote actions use their applicable permission or grant boundary. A remote server's `readOnlyHint`, model output, webpage text, package instructions, or imported archive can never approve its own operation.
 
 Shell commands run inside the workspace with bounded time and cancellation. Scheduled and headless recipes require an explicit permission mode and cannot use unattended `bypass`. External mutations are recorded as pending, confirmed, or `needs_reconciliation`; ambiguous effects are not retried as if known safe. API keys, OAuth tokens, bearer secrets, remote device keys, and TLS private keys use the OS keychain where the feature supports credentials.
