@@ -73,6 +73,16 @@ function stripPortableCheckerAuthority(document: StandardsDocument): StandardsDo
   };
 }
 
+function hydrateCheckerBindings(document: StandardsDocument, bindings: StandardsCheckerBindings): StandardsDocument {
+  return {
+    ...document,
+    standards: document.standards.map((standard) => ({
+      ...standard,
+      checker_command_ids: [...(bindings[standard.standard_id] ?? [])],
+    })),
+  };
+}
+
 function resolveConflictLifecycle(standards: EngineeringStandard[]): EngineeringStandard[] {
   const activeIds = new Set(
     standards
@@ -116,7 +126,7 @@ async function policyDigest(standard: Pick<EngineeringStandard, "title" | "body"
 async function evaluateDrift(document: StandardsDocument): Promise<StandardsDocument> {
   const now = Date.now();
   const standards: EngineeringStandard[] = [];
-  for (const standard of document.standards) {
+  for (const standard of stripPortableCheckerAuthority(document).standards) {
     const supports = standard.evidence.filter((entry) => entry.supports);
     const shouldEvaluate = supports.length > 0 && ["approved", "stale", "conflicting"].includes(standard.status);
     if (!shouldEvaluate) {
@@ -155,10 +165,7 @@ async function evaluateDrift(document: StandardsDocument): Promise<StandardsDocu
 }
 
 async function secureImport(workspacePath: string): Promise<StandardsDocument> {
-  const raw = await invoke<string>("tool_read_file", {
-    path: STANDARDS_IMPORT_PATH,
-    workspace_root_override: null,
-  });
+  const raw = await invoke<string>("tool_read_file", { path: STANDARDS_IMPORT_PATH, workspace_root_override: null });
   const incoming = stripPortableCheckerAuthority(validateStandardsDocument(JSON.parse(raw)));
   const current = stripPortableCheckerAuthority(await loadStandards(workspacePath));
   const byId = new Map(current.standards.map((standard) => [standard.standard_id, standard]));
@@ -220,13 +227,14 @@ async function secureImport(workspacePath: string): Promise<StandardsDocument> {
     });
   }
 
-  const next = {
-    ...current,
-    standards: resolveConflictLifecycle([...byId.values()]),
-    generated_at_ms: Date.now(),
-  };
-  await saveStandards(workspacePath, next);
+  const next = { ...current, standards: resolveConflictLifecycle([...byId.values()]), generated_at_ms: Date.now() };
+  await saveStandards(workspacePath, stripPortableCheckerAuthority(next));
   return next;
+}
+
+function withLocalBindings(workspacePath: string, document: StandardsDocument): { document: StandardsDocument; checkerBindings: StandardsCheckerBindings } {
+  const checkerBindings = pruneStandardsCheckerBindings(workspacePath, document.standards.map((standard) => standard.standard_id));
+  return { document: hydrateCheckerBindings(document, checkerBindings), checkerBindings };
 }
 
 let refreshSequence = 0;
@@ -250,10 +258,10 @@ export const useStandardsStore = create<StandardsStore>((set, get) => ({
     set({ loading: true, error: null });
     try {
       const loaded = stripPortableCheckerAuthority(await loadStandards(workspacePath));
-      const document = await evaluateDrift(loaded);
-      const checkerBindings = pruneStandardsCheckerBindings(workspacePath, document.standards.map((standard) => standard.standard_id));
+      const evaluated = await evaluateDrift(loaded);
+      const hydrated = withLocalBindings(workspacePath, evaluated);
       if (sequence !== refreshSequence) return;
-      set({ document, workspacePath, checkerBindings, loading: false, error: null });
+      set({ ...hydrated, workspacePath, loading: false, error: null });
     } catch (error) {
       if (sequence !== refreshSequence) return;
       set({ document: emptyStandardsDocument(workspacePath), workspacePath, checkerBindings: loadStandardsCheckerBindings(workspacePath), loading: false, error: message(error) });
@@ -267,9 +275,8 @@ export const useStandardsStore = create<StandardsStore>((set, get) => ({
     try {
       const discovered = stripPortableCheckerAuthority(await discoverAndMergeStandards(workspacePath));
       const document = { ...discovered, standards: resolveConflictLifecycle(discovered.standards) };
-      await saveStandards(workspacePath, document);
-      const checkerBindings = pruneStandardsCheckerBindings(workspacePath, document.standards.map((standard) => standard.standard_id));
-      set({ document, workspacePath, checkerBindings, loading: false });
+      await saveStandards(workspacePath, stripPortableCheckerAuthority(document));
+      set({ ...withLocalBindings(workspacePath, document), workspacePath, loading: false });
     } catch (error) {
       set({ loading: false, error: message(error) });
       throw error;
@@ -278,55 +285,54 @@ export const useStandardsStore = create<StandardsStore>((set, get) => ({
 
   approve: async (standardId) => {
     const workspacePath = activeWorkspace();
-    const document = get().document;
-    if (!workspacePath || !document) throw new Error("No standards workspace is loaded.");
-    const approved = stripPortableCheckerAuthority(await approveStandard(workspacePath, document, standardId));
-    const next = { ...approved, standards: resolveConflictLifecycle(approved.standards) };
-    await saveStandards(workspacePath, next);
-    set({ document: next, error: null });
+    const current = get().document;
+    if (!workspacePath || !current) throw new Error("No standards workspace is loaded.");
+    const approved = stripPortableCheckerAuthority(await approveStandard(workspacePath, stripPortableCheckerAuthority(current), standardId));
+    const document = { ...approved, standards: resolveConflictLifecycle(approved.standards) };
+    await saveStandards(workspacePath, document);
+    set({ ...withLocalBindings(workspacePath, document), error: null });
   },
 
   reject: async (standardId) => {
     const workspacePath = activeWorkspace();
-    const document = get().document;
-    if (!workspacePath || !document) throw new Error("No standards workspace is loaded.");
-    const rejected = stripPortableCheckerAuthority(await setStandardStatus(workspacePath, document, standardId, "rejected"));
-    const next = { ...rejected, standards: resolveConflictLifecycle(rejected.standards) };
-    await saveStandards(workspacePath, next);
-    set({ document: next, error: null });
+    const current = get().document;
+    if (!workspacePath || !current) throw new Error("No standards workspace is loaded.");
+    const rejected = stripPortableCheckerAuthority(await setStandardStatus(workspacePath, stripPortableCheckerAuthority(current), standardId, "rejected"));
+    const document = { ...rejected, standards: resolveConflictLifecycle(rejected.standards) };
+    await saveStandards(workspacePath, document);
+    set({ ...withLocalBindings(workspacePath, document), error: null });
   },
 
   rejectRevision: async (standardId) => {
     const workspacePath = activeWorkspace();
-    const document = get().document;
-    if (!workspacePath || !document) throw new Error("No standards workspace is loaded.");
-    const standards = document.standards.map((standard) => standard.standard_id === standardId && standard.pending_revision
-      ? { ...standard, pending_revision: null }
-      : standard);
-    const next = await evaluateDrift({ ...document, standards, generated_at_ms: Date.now() });
-    await saveStandards(workspacePath, next);
-    set({ document: next, error: null });
+    const current = get().document;
+    if (!workspacePath || !current) throw new Error("No standards workspace is loaded.");
+    const portable = stripPortableCheckerAuthority(current);
+    const standards = portable.standards.map((standard) => standard.standard_id === standardId && standard.pending_revision ? { ...standard, pending_revision: null } : standard);
+    const document = await evaluateDrift({ ...portable, standards, generated_at_ms: Date.now() });
+    await saveStandards(workspacePath, document);
+    set({ ...withLocalBindings(workspacePath, document), error: null });
   },
 
   deprecate: async (standardId) => {
     const workspacePath = activeWorkspace();
-    const document = get().document;
-    if (!workspacePath || !document) throw new Error("No standards workspace is loaded.");
-    const deprecated = stripPortableCheckerAuthority(await setStandardStatus(workspacePath, document, standardId, "deprecated"));
-    const next = { ...deprecated, standards: resolveConflictLifecycle(deprecated.standards) };
-    await saveStandards(workspacePath, next);
-    set({ document: next, error: null });
+    const current = get().document;
+    if (!workspacePath || !current) throw new Error("No standards workspace is loaded.");
+    const deprecated = stripPortableCheckerAuthority(await setStandardStatus(workspacePath, stripPortableCheckerAuthority(current), standardId, "deprecated"));
+    const document = { ...deprecated, standards: resolveConflictLifecycle(deprecated.standards) };
+    await saveStandards(workspacePath, document);
+    set({ ...withLocalBindings(workspacePath, document), error: null });
   },
 
   drift: async () => {
     const workspacePath = activeWorkspace();
-    const document = get().document;
-    if (!workspacePath || !document) throw new Error("No standards workspace is loaded.");
+    const current = get().document;
+    if (!workspacePath || !current) throw new Error("No standards workspace is loaded.");
     set({ loading: true, error: null });
     try {
-      const next = await evaluateDrift(document);
-      await saveStandards(workspacePath, next);
-      set({ document: next, loading: false });
+      const document = await evaluateDrift(stripPortableCheckerAuthority(current));
+      await saveStandards(workspacePath, document);
+      set({ ...withLocalBindings(workspacePath, document), loading: false });
     } catch (error) {
       set({ loading: false, error: message(error) });
       throw error;
@@ -342,8 +348,7 @@ export const useStandardsStore = create<StandardsStore>((set, get) => ({
     set({ loading: true, error: null });
     try {
       const document = await secureImport(workspacePath);
-      const checkerBindings = pruneStandardsCheckerBindings(workspacePath, document.standards.map((standard) => standard.standard_id));
-      set({ document, workspacePath, checkerBindings, loading: false });
+      set({ ...withLocalBindings(workspacePath, document), workspacePath, loading: false });
     } catch (error) {
       set({ loading: false, error: `${message(error)} Put the portable JSON at ${STANDARDS_IMPORT_PATH} and retry.` });
       throw error;
@@ -371,8 +376,7 @@ export const useStandardsStore = create<StandardsStore>((set, get) => ({
       const imported = stripPortableCheckerAuthority(await importAgentOsStandards(workspacePath));
       const document = { ...imported, standards: resolveConflictLifecycle(imported.standards) };
       await saveStandards(workspacePath, document);
-      const checkerBindings = pruneStandardsCheckerBindings(workspacePath, document.standards.map((standard) => standard.standard_id));
-      set({ document, workspacePath, checkerBindings, loading: false });
+      set({ ...withLocalBindings(workspacePath, document), workspacePath, loading: false });
     } catch (error) {
       set({ loading: false, error: message(error) });
       throw error;
@@ -403,7 +407,7 @@ export const useStandardsStore = create<StandardsStore>((set, get) => ({
     const unavailable = normalized.filter((id) => !enabled.has(id));
     if (unavailable.length > 0) throw new Error(`Verification command is disabled or missing: ${unavailable.join(", ")}.`);
     const checkerBindings = saveStandardCheckerBinding(workspacePath, standardId, normalized);
-    set({ checkerBindings, error: null });
+    set({ checkerBindings, document: hydrateCheckerBindings(stripPortableCheckerAuthority(document), checkerBindings), error: null });
   },
 
   runCheckers: async (standardId) => {
