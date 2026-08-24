@@ -1029,6 +1029,7 @@ fn autonomous_repository_manifest(path: &Path) -> String {
 pub fn autonomous_start(
     objective: &str,
     target: &str,
+    executor_target: Option<&str>,
     workspace: Option<&Path>,
     json_output: bool,
 ) -> Result<(), String> {
@@ -1038,6 +1039,15 @@ pub fn autonomous_start(
     }
     let recipe_target = autonomous_recipe_target(target)?;
     recipe_target.validate()?;
+    if let Some(executor_target) = executor_target {
+        if executor_target.is_empty()
+            || !executor_target.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+            })
+        {
+            return Err("executor target id contains unsafe characters".to_string());
+        }
+    }
     let workspace = autonomous_workspace(workspace)?;
     let workspace_path = PathBuf::from(
         workspace
@@ -1051,6 +1061,21 @@ pub fn autonomous_start(
     let run_id = format!("task-{}", uuid::Uuid::new_v4());
     let task_id = run_id.clone();
     let recipe = Recipe { version: recipes::RECIPE_SCHEMA_VERSION, name: format!("autonomous-{run_id}"), description: Some("Durable autonomous task queued through the resident daemon.".to_string()), target: recipe_target, workspace: workspace.roots.first().map(|root| root.canonical_path.clone()), permission_mode: "auto".to_string(), system: Some("Plan the objective using repository evidence, execute bounded work, run verification, review the diff, and report structured evidence. Do not claim success without checks.".to_string()), prompt: objective.to_string(), params: Default::default(), max_iterations: Some(128), timeout_seconds: Some(DEFAULT_WALL_TIME_MS / 1_000), output: recipes::RecipeOutput { json: true }, channel_send: None, desktop_turn: None, placed_run: None, autonomous_task: Some(recipes::AutonomousTaskSnapshot { schema_version: recipes::AUTONOMOUS_TASK_RECIPE_SCHEMA_VERSION, task_id: run_id.clone(), objective: objective.to_string(), source: "cli".to_string(), relevant_files: Vec::new(), current_workspace_revision: workspace_revision.clone(), max_repair_rounds: 2, max_workers: 4, guidance: Vec::new(), delivery_intent: Some("leave_worktree".to_string()), execution_owner: Some(recipes::AutonomousTaskOwnerSnapshot { kind: "daemon".to_string(), instance_id: "resident-daemon".to_string(), lease_epoch: 1, lease_expires_at_ms: unix_time_ms()?.saturating_add(DEFAULT_WALL_TIME_MS) }), previous_execution_owner: None, task_snapshot: Some(serde_json::json!({ "taskId": run_id, "objective": objective, "source": "cli", "workspaceRevision": workspace_revision, "relevantFiles": [], "planningContext": { "repositoryManifest": autonomous_repository_manifest(&workspace_path) }, "outcome": "RUNNING" })), completed_nodes: Vec::new(), next_node_id: Some("planner".to_string()) }) };
+    let mut recipe = recipe;
+    if let Some(executor_target) = executor_target {
+        if let Some(snapshot) = recipe.autonomous_task.as_mut() {
+            if let Some(task_snapshot) = snapshot.task_snapshot.as_mut() {
+                task_snapshot["constraints"] = serde_json::json!({
+                    "executionPlacement": {
+                        "kind": "target",
+                        "targetId": executor_target,
+                        "nodeId": "pending",
+                        "reason": "selected by the CLI operator"
+                    }
+                });
+            }
+        }
+    }
     let queued = crate::daemon::enqueue_frozen_recipe(recipe, &task_id)?;
     let result = serde_json::json!({ "run_id": queued.run_id, "task_id": queued.run_id, "job_id": queued.job_id, "status": "queued", "kind": "autonomous_task" });
     if json_output {
@@ -5494,6 +5519,14 @@ async fn run_inner(
         autonomous_task: recipe.autonomous_task.as_ref().map(|snapshot| {
             serde_json::to_value(snapshot).expect("autonomous snapshot is serializable")
         }),
+        execution_target: recipe
+            .placed_run
+            .as_ref()
+            .and_then(|placed| placed.execution_target.clone()),
+        workspace_transfer: recipe
+            .placed_run
+            .as_ref()
+            .and_then(|placed| placed.workspace_transfer.clone()),
     };
     // **The half of K17 S3 that makes a travelled policy more than paperwork.**
     //
@@ -6856,6 +6889,8 @@ mod tests {
                 max_artifact_bytes: 1 << 20,
                 max_event_count: 10_000,
             },
+            execution_target: None,
+            workspace_transfer: None,
         }
     }
 

@@ -158,6 +158,10 @@ export interface RunSpecWire {
   permission_policy: PermissionPolicySnapshotWire;
   budgets: RunBudgetsWire;
   autonomous_task?: Record<string, unknown> | null;
+  /** Frozen execution identity/capabilities, separate from the model target. */
+  execution_target?: Record<string, unknown> | null;
+  /** Content-addressed workspace manifest/delta for non-local targets. */
+  workspace_transfer?: Record<string, unknown> | null;
 }
 
 export interface UsageSnapshotWire {

@@ -4,6 +4,13 @@ The Autonomous Task panel and `monkey task` commands run one objective through a
 
 Every coordinator transition is a `task_event` in the hash-chained run ledger. Events carry a replayable task snapshot, so restart and CLI attachment do not depend on React state. The Rust protocol validates task identifiers, event names, and payload size; the ledger projects the event without interpreting task-specific business state.
 
+Execution placement is an executor concern layered around this coordinator.
+Select Automatic or a configured target in the task panel; the selected target
+identity and workspace transfer are frozen into each placed `RunSpec`. The
+workspace is provisioned on the executor and remote results are represented as
+reviewable artifacts. See [Execution targets](execution-targets.md) for Docker,
+SSH, transfer, conflict, and trust details.
+
 ## CLI
 
 ```text
