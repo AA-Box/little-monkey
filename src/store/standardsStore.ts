@@ -422,6 +422,4 @@ export const useStandardsStore = create<StandardsStore>((set, get) => ({
     set((state) => ({ lastCheckerResults: { ...state.lastCheckerResults, [standardId]: results }, error: null }));
     return results;
   },
-
-  clearMessage: undefined as never,
 }));
