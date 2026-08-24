@@ -1,6 +1,13 @@
 #!/bin/sh
 set -eu
 
+home=/tmp/little-monkey-home
+data=/tmp/little-monkey-data
+mkdir -p "$home" "$data/com.littlemonkey.app"
+cp /opt/little-monkey-fixture/verify_configs.json "$data/com.littlemonkey.app/verify_configs.json"
+export HOME="$home"
+export XDG_DATA_HOME="$data"
+
 python3 /opt/model_fixture.py &
 fixture_pid=$!
 trap 'kill "$fixture_pid" 2>/dev/null || true' EXIT INT TERM

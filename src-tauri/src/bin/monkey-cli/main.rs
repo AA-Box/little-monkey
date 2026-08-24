@@ -25,6 +25,7 @@ mod conversations_cli;
 mod daemon;
 mod durable_run;
 mod embed_cli;
+mod execution_cli;
 mod extensions_cli;
 mod ingress_cli;
 mod launcher;
@@ -482,6 +483,15 @@ enum Cmd {
     /// docs/roadmap/p3-scheduled-automation.md.
     #[command(subcommand)]
     Task(TaskCmd),
+    /// Configure and probe execution targets (local, Docker, paired node, SSH runner).
+    #[command(subcommand)]
+    Targets(execution_cli::TargetsCmd),
+    /// Create portable workspace transfers and safely apply remote results.
+    #[command(subcommand)]
+    Workspace(execution_cli::WorkspaceCmd),
+    /// Serve the Little Monkey runner protocol over stdio for SSH transport.
+    #[command(subcommand)]
+    Runner(execution_cli::RunnerCmd),
     /// Validate, run, inspect, and replay the same typed workflows as the
     /// desktop visual editor.
     #[command(subcommand)]
@@ -574,6 +584,9 @@ enum TaskCmd {
         objective: String,
         #[arg(long)]
         target: String,
+        /// Stable executor target id, distinct from `--target`'s model/provider.
+        #[arg(long = "executor-target")]
+        executor_target: Option<String>,
         #[arg(long)]
         workspace: Option<PathBuf>,
         #[arg(long)]
@@ -1628,9 +1641,16 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             TaskCmd::Start {
                 objective,
                 target,
+                executor_target,
                 workspace,
                 json,
-            } => task::autonomous_start(objective, target, workspace.as_deref(), *json),
+            } => task::autonomous_start(
+                objective,
+                target,
+                executor_target.as_deref(),
+                workspace.as_deref(),
+                *json,
+            ),
             TaskCmd::Status { run_id, json } => task::autonomous_status(run_id.as_deref(), *json),
             TaskCmd::Attach {
                 run_id,
@@ -1642,6 +1662,9 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             TaskCmd::Resume { run_id } => task::autonomous_resume(run_id),
             TaskCmd::Cancel { run_id } => task::autonomous_cancel(run_id),
         },
+        Cmd::Targets(action) => execution_cli::targets(action.clone()),
+        Cmd::Workspace(action) => execution_cli::workspace(action.clone()),
+        Cmd::Runner(action) => execution_cli::runner(action.clone()),
         Cmd::Workflow(action) => {
             let data_dir = app_data_dir()
                 .ok_or_else(|| "Could not resolve the app data directory".to_string());

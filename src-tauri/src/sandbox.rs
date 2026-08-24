@@ -2017,6 +2017,8 @@ fn build_sandbox_run_spec(
             max_event_count: 64,
         },
         autonomous_task: None,
+        execution_target: None,
+        workspace_transfer: None,
     };
     spec.validate().map_err(|error| error.to_string())?;
     Ok(spec)
