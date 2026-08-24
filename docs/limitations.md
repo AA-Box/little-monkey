@@ -7,6 +7,18 @@ rather than left for a reader to discover. Work that is not built yet lives in
 
 ## Runtimes and hardware
 
+- Execution target support is user-owned and opt-in: Docker requires a local
+  or explicitly configured Docker runtime, and SSH requires an installed,
+  compatible `monkey` runner plus a maintained `known_hosts` file. The generic
+  runner currently returns bounded event/artifact surfaces; provider secrets
+  remain executor-local unless an explicit forwarding map is supplied.
+- Workspace results represent safe snapshot deltas. Dirty Git bases are
+  returned as changed-file content rather than replaying the entire pre-run
+  `HEAD` diff, so a local apply cannot duplicate the user's original edits.
+- Existing paired-node placement and K18 migration retain their established
+  lifecycle semantics; the execution-target layer does not make operating
+  system process migration portable or infer undocumented remote capacity.
+
 - The published MLX catalog and signed Apple Silicon package are installed automatically from Runtime Hub → Runtimes on supported macOS/aarch64 hosts. If GitHub is unreachable, the local registry and Import catalog path remain available. ROCm, Vulkan, and DirectML are not advertised as maintained managed runtimes.
 - The MLX video engine carries mlx-video pinned to a commit, because that project publishes no releases or tags and the name `mlx-video` on PyPI belongs to an unrelated package. Its open issue #40 reports black output from quantized Wan 2.2 checkpoints at some frame counts; the frame counts affected have not been mapped on reference hardware here.
 - Hardware-fit estimates and runtime controls are implemented, but the ±15% memory matrix, clean-machine lifecycle checks, and the MLX release gate need maintained physical reference hardware. Edge-device profiles are still static heuristics; the Runtime Hub's Benchmark section measures throughput, time-to-first-token and peak memory on this machine, but those profiles do not yet read from it.

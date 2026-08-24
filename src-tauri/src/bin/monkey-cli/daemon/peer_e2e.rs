@@ -553,6 +553,8 @@ fn run_spec(run_id: &str, now_ms: u64) -> RunSpec {
             max_event_count: 100,
         },
         autonomous_task: None,
+        execution_target: None,
+        workspace_transfer: None,
     }
 }
 

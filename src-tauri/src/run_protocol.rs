@@ -1235,6 +1235,13 @@ pub struct RunSpec {
     /// placement. Ordinary runs leave this absent.
     #[serde(default)]
     pub autonomous_task: Option<serde_json::Value>,
+    /// Frozen executor identity/capability snapshot. The model target and
+    /// execution target are separate concerns.
+    #[serde(default)]
+    pub execution_target: Option<crate::execution_target::ExecutionTargetSnapshot>,
+    /// Portable workspace snapshot/delta for non-local executors.
+    #[serde(default)]
+    pub workspace_transfer: Option<crate::execution_target::WorkspaceTransfer>,
 }
 
 impl RunSpec {
@@ -1274,6 +1281,16 @@ impl RunSpec {
                     "exceeds the 512 KiB limit",
                 ));
             }
+        }
+        if let Some(target) = &self.execution_target {
+            target.validate().map_err(|error| {
+                ProtocolValidationError::new("execution_target", error.to_string())
+            })?;
+        }
+        if let Some(transfer) = &self.workspace_transfer {
+            transfer.validate().map_err(|error| {
+                ProtocolValidationError::new("workspace_transfer", error.to_string())
+            })?;
         }
         Ok(())
     }
@@ -2250,6 +2267,8 @@ mod tests {
                 max_event_count: 10_000,
             },
             autonomous_task: None,
+            execution_target: None,
+            workspace_transfer: None,
         }
     }
 

@@ -2599,6 +2599,7 @@ export const en: Record<string, string> = {
   "Update.installUpdate": "Install update",
   "Update.applying": "Updating…",
   "SettingsModal.tabUpdates": "Updates & integrity",
+  "SettingsModal.tabExecutionTargets": "Execution targets",
   "UpdatesPanel.title": "Updates & integrity",
   "UpdatesPanel.description":
     "Check for a new build, roll back to the version you were running, and see what this install verified about itself at startup.",

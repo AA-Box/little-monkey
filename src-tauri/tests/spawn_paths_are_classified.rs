@@ -219,6 +219,12 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
         "mobile companion pairing and capture helpers",
     ),
     (
+        "execution_target.rs",
+        Class::ManagedService,
+        "the configured execution-target runner owns its child lifecycle inside the target's \
+         transport and durable wall-time boundary",
+    ),
+    (
         "knowledge_service.rs",
         Class::ManagedService,
         "knowledge pipeline helpers over user-selected sources",

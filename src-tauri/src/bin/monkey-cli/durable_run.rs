@@ -910,6 +910,8 @@ mod tests {
                 max_event_count: 10_000,
             },
             autonomous_task: None,
+            execution_target: None,
+            workspace_transfer: None,
         }
     }
 

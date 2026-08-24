@@ -3139,6 +3139,8 @@ pub(super) mod tests {
                 max_event_count: 1000,
             },
             autonomous_task: None,
+            execution_target: None,
+            workspace_transfer: None,
         }
     }
 
