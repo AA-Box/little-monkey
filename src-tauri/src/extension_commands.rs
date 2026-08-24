@@ -39,7 +39,14 @@ pub async fn extensions_discover(
 }
 
 #[tauri::command]
-pub async fn extensions_list() -> Result<Vec<ExtensionDetail>, String> {
+pub async fn extensions_list(
+    window: tauri::Window,
+    state: tauri::State<'_, crate::m4_commands::M4CommandState>,
+    refresh_marketplace: Option<bool>,
+) -> Result<Vec<ExtensionDetail>, String> {
+    if refresh_marketplace.unwrap_or(false) {
+        marketplace_commands::marketplace_refresh_registries(window, state).await?;
+    }
     manager()?.list()
 }
 
