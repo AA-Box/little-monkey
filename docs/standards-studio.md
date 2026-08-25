@@ -49,6 +49,14 @@ At turn time, the existing rules refresh also refreshes the standards index. The
 
 Standards are guidance and verification constraints. They cannot grant tools, network, secret access, additional budget, a different permission mode, or any other execution authority.
 
+## Executable checker bindings
+
+An approved selected standard may bind to an existing Verification command by command ID. The selected checker IDs are frozen with the task and carried through both the normal in-process turn and the resident daemon recipe, so a later settings change cannot silently change which checker that accepted task requires.
+
+Bound Standards checkers are completion gates, not a synonym for the global Verification toggle. After a workspace mutation, required bound checkers run even when global Verification is disabled. A failing checker is fed back through the bounded verification-fix loop and is re-run after that corrective round even if the model makes no additional edit. If the checker still fails when the fix budget is exhausted, or if its bound command is missing or disabled, the turn cannot report successful completion.
+
+Global Verification remains independent: when enabled it continues to run the workspace's enabled verification commands in addition to any checker IDs required by the frozen Standards selection.
+
 ## Drift
 
 `Check drift` re-hashes the evidence files through the workspace boundary:
@@ -69,4 +77,4 @@ Conflict handling is explicit rather than model-guessed. Selection is determinis
 
 ## Scope and extension points
 
-The production path is intentionally evidence-first. New detector/checker or Agent OS adapter integrations should emit the same structured candidate/evidence model and still require the same approval lifecycle; an imported adapter must never become an executable permission mechanism. Mechanically executable checkers should be introduced only through Little Monkey's existing bounded tool/permission system, not by executing arbitrary commands stored in the standards JSON.
+The production path is intentionally evidence-first. New detector/checker or Agent OS adapter integrations should emit the same structured candidate/evidence model and still require the same approval lifecycle; an imported adapter must never become an executable permission mechanism. Executable checker bindings may reference only existing Verification commands and therefore inherit Little Monkey's bounded execution and permission model; standards JSON never becomes arbitrary command-execution authority.
