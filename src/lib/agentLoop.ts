@@ -1147,15 +1147,15 @@ export async function runVerificationPhase(
         }),
       });
       if (!ok) {
+        const required = requiredSet.has(cmd.id);
         const failure: VerifyFailure = {
           label: result.label,
           code: result.code,
           output,
-          required: requiredSet.has(cmd.id),
-          fixable: true,
+          ...(required ? { required: true, fixable: true } : {}),
         };
         if (firstFailure === null) firstFailure = failure;
-        if (failure.required && firstRequiredFailure === null) firstRequiredFailure = failure;
+        if (required && firstRequiredFailure === null) firstRequiredFailure = failure;
       }
     } catch (err) {
       const output = errorMessage(err);
@@ -1170,15 +1170,15 @@ export async function runVerificationPhase(
           durationMs: 0,
         }),
       });
+      const required = requiredSet.has(cmd.id);
       const failure: VerifyFailure = {
         label: cmd.label,
         code: null,
         output,
-        required: requiredSet.has(cmd.id),
-        fixable: true,
+        ...(required ? { required: true, fixable: true } : {}),
       };
       if (firstFailure === null) firstFailure = failure;
-      if (failure.required && firstRequiredFailure === null) firstRequiredFailure = failure;
+      if (required && firstRequiredFailure === null) firstRequiredFailure = failure;
     } finally {
       useSessionStore.getState().setRunningVerifyLabel(sessionId, null);
     }
