@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 pub(crate) mod marketplace_commands;
 #[path = "marketplace_provenance.rs"]
 pub(crate) mod marketplace_provenance;
+#[path = "marketplace_staging_integrity.rs"]
+pub(crate) mod marketplace_staging_integrity;
 
 const MARKETPLACE_PREPARE_PREFIX: &str = "little-monkey-marketplace-prepare:v2:";
 const MARKETPLACE_HANDLE_PREFIX: &str = "little-monkey-marketplace:v2:";
@@ -32,9 +34,12 @@ pub async fn extensions_discover(
     if let Some(encoded) = source_path.strip_prefix(MARKETPLACE_PREPARE_PREFIX) {
         let request = serde_json::from_str(encoded)
             .map_err(|error| format!("Invalid marketplace prepare request: {error}"))?;
-        return marketplace_commands::marketplace_prepare_extension(window, state, request).await;
+        let preview = marketplace_commands::marketplace_prepare_extension(window, state, request).await?;
+        marketplace_staging_integrity::validate_handle(&preview.source_path)?;
+        return Ok(preview);
     }
     if source_path.starts_with(MARKETPLACE_HANDLE_PREFIX) {
+        marketplace_staging_integrity::validate_handle(&source_path)?;
         return marketplace_commands::marketplace_preview_install(state, source_path).await;
     }
     manager()?.discover(source_path)
@@ -84,6 +89,7 @@ pub async fn extensions_install(
     approval: Approval,
 ) -> Result<ExtensionDetail, String> {
     if source_path.starts_with(MARKETPLACE_HANDLE_PREFIX) {
+        marketplace_staging_integrity::validate_handle(&source_path)?;
         // Persist the native lease identity before mutation.  On a crash after
         // runtime success, `extensions_list` reconciles this authorization into
         // a committed receipt by matching the installed manifest/trust identity.
@@ -131,6 +137,7 @@ pub async fn extensions_preview_update(
     source_path: String,
 ) -> Result<ExtensionPreview, String> {
     if source_path.starts_with(MARKETPLACE_HANDLE_PREFIX) {
+        marketplace_staging_integrity::validate_handle(&source_path)?;
         return marketplace_commands::marketplace_preview_update(state, source_path).await;
     }
     manager()?.preview_update(source_path)
@@ -144,6 +151,7 @@ pub async fn extensions_update(
     approval: Approval,
 ) -> Result<ExtensionDetail, String> {
     if source_path.starts_with(MARKETPLACE_HANDLE_PREFIX) {
+        marketplace_staging_integrity::validate_handle(&source_path)?;
         let receipt = marketplace_provenance::authorize_from_handle(
             &source_path,
             marketplace_provenance::MarketplaceMutationKind::Update,
