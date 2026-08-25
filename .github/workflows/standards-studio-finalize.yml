@@ -26,43 +26,12 @@ jobs:
           from pathlib import Path
           p = Path('src-tauri/src/bin/monkey-cli/agent.rs')
           s = p.read_text()
-          old1 = '''        statusln!(
-            options,
-            "
-[verify] running \\\"{}\\\"…",
-            cmd.label
-        );'''
-          new1 = '''        statusln!(options, "\\n[verify] running \\\"{}\\\"…", cmd.label);'''
-          old2 = '''                        let message = format!(
-                            "{VERIFY_NOTE_PREFIX} The verification command "{}" failed (exit {code_display}). Fix the reported problems, then stop.
-                        {}",
-                            failure.label, protected_output
-                        );
-                        statusln!(
-                            options,
-                            "
-{message}"
-                        );'''
-          new2 = '''                        let message = format!(
-                            "{VERIFY_NOTE_PREFIX} The verification command \\\"{}\\\" failed (exit {code_display}). Fix the reported problems, then stop.\\n{}",
-                            failure.label, protected_output
-                        );
-                        statusln!(options, "\\n{message}");'''
-          old3 = '''                        let message = format!(
-                            "Completion blocked: required Standards verification "{}" did not pass (exit {code_display}). {}",
-                            failure.label, failure.output
-                        );
-                        statusln!(
-                            options,
-                            "
-{message}"
-                        );'''
-          new3 = '''                        let message = format!(
-                            "Completion blocked: required Standards verification \\\"{}\\\" did not pass (exit {code_display}). {}",
-                            failure.label, failure.output
-                        );
-                        statusln!(options, "\\n{message}");'''
-          for label, old, new in [('status', old1, new1), ('feedback', old2, new2), ('gate', old3, new3)]:
+          fixes = [
+              ('status', '        statusln!(\n            options,\n            "\n[verify] running \\\"{}\\\"…",\n            cmd.label\n        );', '        statusln!(options, "\\n[verify] running \\\"{}\\\"…", cmd.label);'),
+              ('feedback', '                        let message = format!(\n                            "{VERIFY_NOTE_PREFIX} The verification command "{}" failed (exit {code_display}). Fix the reported problems, then stop.\n                        {}",\n                            failure.label, protected_output\n                        );\n                        statusln!(\n                            options,\n                            "\n{message}"\n                        );', '                        let message = format!(\n                            "{VERIFY_NOTE_PREFIX} The verification command \\\"{}\\\" failed (exit {code_display}). Fix the reported problems, then stop.\\n{}",\n                            failure.label, protected_output\n                        );\n                        statusln!(options, "\\n{message}");'),
+              ('gate', '                        let message = format!(\n                            "Completion blocked: required Standards verification "{}" did not pass (exit {code_display}). {}",\n                            failure.label, failure.output\n                        );\n                        statusln!(\n                            options,\n                            "\n{message}"\n                        );', '                        let message = format!(\n                            "Completion blocked: required Standards verification \\\"{}\\\" did not pass (exit {code_display}). {}",\n                            failure.label, failure.output\n                        );\n                        statusln!(options, "\\n{message}");'),
+          ]
+          for label, old, new in fixes:
               if old not in s:
                   raise SystemExit(f'missing Rust correction target: {label}')
               s = s.replace(old, new, 1)
