@@ -30,7 +30,9 @@ jobs:
           components: rustfmt
 
       - name: Apply targeted integration changes
-        run: python3 scripts/apply-wayland-computer-use-integration.py
+        run: |
+          python3 scripts/apply-wayland-computer-use-integration.py
+          python3 scripts/fix-wayland-portal-types.py
 
       - name: Format changed Rust sources
         run: rustfmt --edition 2021 src-tauri/src/desktop_control.rs src-tauri/src/desktop_control/wayland_portal.rs
@@ -44,7 +46,9 @@ jobs:
       - name: Commit verified integration
         run: |
           rm scripts/apply-wayland-computer-use-integration.py
+          rm scripts/fix-wayland-portal-types.py
           rm .github/workflows/wayland-integration-bootstrap.yml
+          rm -f .wayland-ci-trigger
           rustfmt --edition 2021 src-tauri/src/desktop_control.rs src-tauri/src/desktop_control/wayland_portal.rs
           git config user.name "little-monkey-wayland-bot"
           git config user.email "actions@users.noreply.github.com"
