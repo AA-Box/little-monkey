@@ -628,7 +628,6 @@ fn preview_with_handle(mut preview: ExtensionPreview, handle: String) -> Extensi
     preview
 }
 
-#[tauri::command]
 pub async fn marketplace_refresh_registries(
     window: tauri::Window,
     state: tauri::State<'_, M4CommandState>,
@@ -673,7 +672,6 @@ pub async fn marketplace_refresh_registries(
     Ok(output)
 }
 
-#[tauri::command]
 pub async fn marketplace_prepare_extension(
     window: tauri::Window,
     state: tauri::State<'_, M4CommandState>,
@@ -694,7 +692,6 @@ pub async fn marketplace_prepare_extension(
     }
 }
 
-#[tauri::command]
 pub async fn marketplace_preview_install(
     state: tauri::State<'_, M4CommandState>,
     staging_handle: String,
@@ -705,7 +702,6 @@ pub async fn marketplace_preview_install(
         .map(|preview| preview_with_handle(preview, staging_handle))
 }
 
-#[tauri::command]
 pub async fn marketplace_preview_update(
     state: tauri::State<'_, M4CommandState>,
     staging_handle: String,
@@ -716,7 +712,6 @@ pub async fn marketplace_preview_update(
         .map(|preview| preview_with_handle(preview, staging_handle))
 }
 
-#[tauri::command]
 pub async fn marketplace_install_extension(
     window: tauri::Window,
     state: tauri::State<'_, M4CommandState>,
@@ -736,7 +731,6 @@ pub async fn marketplace_install_extension(
     }
 }
 
-#[tauri::command]
 pub async fn marketplace_update_extension(
     window: tauri::Window,
     state: tauri::State<'_, M4CommandState>,
@@ -756,7 +750,6 @@ pub async fn marketplace_update_extension(
     }
 }
 
-#[tauri::command]
 pub fn marketplace_cleanup_extension(staging_handle: String) -> Result<bool, String> {
     cleanup_handle(&staging_handle)
 }
