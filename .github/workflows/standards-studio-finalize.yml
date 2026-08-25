@@ -16,6 +16,18 @@ jobs:
         with:
           ref: feat/standards-studio
           fetch-depth: 0
+      - name: Relax one source matcher
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('scripts/standards-studio-finalize.py')
+          s = p.read_text()
+          old = 'body_chunk = replace_once(body_chunk, old_verify_exit, new_verify_exit, "normal verification completion gate")'
+          new = '''verify_exit_pattern = re.compile(r"      if \\(!signal\\?\\.aborted && mutatedFiles\\.size > 0\\) \\{[\\s\\S]*?\\n      \\}\\n      return;", re.M)\nreplacement = new_verify_exit + "      return;"\nbody_chunk, matched = verify_exit_pattern.subn(replacement, body_chunk, count=1)\nif matched != 1:\n    raise SystemExit(f"normal verification completion gate matched {matched} times")'''
+          if old not in s:
+              raise SystemExit('patch-script target missing')
+          p.write_text(s.replace(old, new, 1))
+          PY
       - name: Apply final wiring
         run: python3 scripts/standards-studio-finalize.py
       - name: Format and validate patch
