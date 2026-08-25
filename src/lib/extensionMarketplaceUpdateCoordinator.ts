@@ -5,10 +5,25 @@ const MIN_INTERVAL_MS = 60 * 1000;
 
 let timer: ReturnType<typeof setInterval> | null = null;
 let running: Promise<void> | null = null;
+let hydration: Promise<void> | null = null;
+
+function ensureHydrated(): Promise<void> {
+  if (hydration) return hydration;
+  hydration = useExtensionMarketplaceStore.getState().hydrate().catch((error) => {
+    hydration = null;
+    throw error;
+  });
+  return hydration;
+}
 
 async function runOnce(): Promise<void> {
   if (running) return running;
-  running = useExtensionMarketplaceStore.getState().runUpdateCycle().finally(() => {
+  running = (async () => {
+    // Persisted policy is an authority boundary: in particular, a saved `off`
+    // policy must be loaded before any cycle is allowed to perform registry IO.
+    await ensureHydrated();
+    await useExtensionMarketplaceStore.getState().runUpdateCycle();
+  })().finally(() => {
     running = null;
   });
   return running;
@@ -17,8 +32,9 @@ async function runOnce(): Promise<void> {
 /**
  * Owns marketplace update policy at application lifecycle level rather than
  * coupling automatic mutation to opening Settings. Call only from the primary
- * application window. An immediate cycle runs at startup, then bounded periodic
- * cycles continue until the returned disposer is called.
+ * application window. Persisted policy is hydrated before the immediate startup
+ * cycle, then bounded periodic cycles continue until the returned disposer is
+ * called.
  */
 export function startExtensionMarketplaceUpdateCoordinator(intervalMs = DEFAULT_INTERVAL_MS): () => void {
   if (timer !== null) return () => stopExtensionMarketplaceUpdateCoordinator();
@@ -31,6 +47,9 @@ export function startExtensionMarketplaceUpdateCoordinator(intervalMs = DEFAULT_
 export function stopExtensionMarketplaceUpdateCoordinator(): void {
   if (timer !== null) clearInterval(timer);
   timer = null;
+  // A later coordinator start must re-read persisted policy instead of assuming
+  // the previous application lifecycle's hydration is still authoritative.
+  hydration = null;
 }
 
 export function extensionMarketplaceUpdateInFlight(): boolean {
