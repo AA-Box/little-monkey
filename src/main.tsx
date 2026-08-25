@@ -1,11 +1,13 @@
 import React from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import "./index.css";
 import { applyAppearance, subscribeToSystemTheme } from "./lib/theme";
 import { resolveAppearanceSettings } from "./lib/appearanceProfiles";
+import { startExtensionMarketplaceUpdateCoordinator } from "./lib/extensionMarketplaceUpdateCoordinator";
 import { useSettingsStore } from "./store/settingsStore";
 import { primaryRoot, useWorkspaceStore } from "./store/workspaceStore";
 import { hydrateSessions, useSessionStore } from "./store/sessionStore";
@@ -105,6 +107,13 @@ if (isCompanionOverlay) {
   const preselectedSessionId = new URLSearchParams(window.location.search).get("session");
   if (preselectedSessionId) {
     useSessionStore.getState().switchSession(preselectedSessionId);
+  }
+
+  // Marketplace update policy belongs to the application lifecycle, not to
+  // whether Settings happens to be open. Only the primary window owns the
+  // coordinator; secondary session windows load this entry point too.
+  if (getCurrentWindow().label === "main") {
+    startExtensionMarketplaceUpdateCoordinator();
   }
 
   // Top-level boundary: without it a render error anywhere unmounts the
