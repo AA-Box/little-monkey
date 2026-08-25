@@ -620,6 +620,8 @@ struct VerifyFailure {
     label: String,
     code: Option<i32>,
     output: String,
+    required: bool,
+    fixable: bool,
 }
 
 /// Combines a verify command's stdout/stderr into the single `output` string
@@ -692,22 +694,122 @@ async fn run_verification_phase(
     options: &chat::ChatOptions,
     history: &mut Vec<serde_json::Value>,
     verification_index: &mut u64,
+    required_command_ids: &[String],
 ) -> Result<Option<VerifyFailure>, String> {
-    let Ok(root) = workspace::primary_root_canon(state) else {
-        return Ok(None);
+    let required: std::collections::HashSet<&str> =
+        required_command_ids.iter().map(String::as_str).collect();
+    let root = match workspace::primary_root_canon(state) {
+        Ok(root) => root,
+        Err(_) if required.is_empty() => return Ok(None),
+        Err(error) => {
+            let output =
+                format!("Required Standards verification has no available workspace: {error}");
+            history.push(serde_json::json!({
+                "role": "system",
+                "content": format!("{VERIFY_NOTE_PREFIX}{}", serde_json::json!({
+                    "label": "Standards checker bindings",
+                    "kind": "standards",
+                    "ok": false,
+                    "code": serde_json::Value::Null,
+                    "output": output.clone(),
+                    "durationMs": 0,
+                })),
+            }));
+            return Ok(Some(VerifyFailure {
+                label: "Standards checker bindings".to_string(),
+                code: None,
+                output,
+                required: true,
+                fixable: false,
+            }));
+        }
     };
-    let commands = verify_cli::enabled_commands(&root);
+
+    let all_commands = verify_cli::all_commands(&root);
+    let missing: Vec<String> = required_command_ids
+        .iter()
+        .filter(|id| {
+            !all_commands
+                .iter()
+                .any(|command| command.id.as_str() == id.as_str() && command.enabled)
+        })
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        let output = format!(
+            "Required Standards checker is disabled or missing: {}.",
+            missing.join(", ")
+        );
+        *verification_index = verification_index
+            .checked_add(1)
+            .ok_or_else(|| "verification event counter overflow".to_string())?;
+        emit_run_event(
+            perms,
+            RunEvent::VerificationFinished {
+                verification_id: format!("verification-{verification_index}"),
+                name: "Standards checker bindings".to_string(),
+                passed: false,
+                summary: output.clone(),
+                artifact_ids: Vec::new(),
+                duration_ms: 0,
+            },
+        )?;
+        history.push(serde_json::json!({
+            "role": "system",
+            "content": format!("{VERIFY_NOTE_PREFIX}{}", serde_json::json!({
+                "label": "Standards checker bindings",
+                "kind": "standards",
+                "ok": false,
+                "code": serde_json::Value::Null,
+                "output": output.clone(),
+                "durationMs": 0,
+            })),
+        }));
+        return Ok(Some(VerifyFailure {
+            label: "Standards checker bindings".to_string(),
+            code: None,
+            output,
+            required: true,
+            fixable: false,
+        }));
+    }
+
+    let mut commands: Vec<&little_monkey_lib::verify::VerifyCommand> = if options.verify {
+        all_commands
+            .iter()
+            .filter(|command| command.enabled)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut selected: std::collections::HashSet<&str> =
+        commands.iter().map(|command| command.id.as_str()).collect();
+    for id in required_command_ids {
+        if selected.contains(id.as_str()) {
+            continue;
+        }
+        if let Some(command) = all_commands
+            .iter()
+            .find(|command| command.id.as_str() == id.as_str() && command.enabled)
+        {
+            commands.push(command);
+            selected.insert(command.id.as_str());
+        }
+    }
     if commands.is_empty() {
         return Ok(None);
     }
 
-    // Resolved once, before the phase runs, and fatal when it cannot be: a verify
-    // command is a bounded native execution, and one with no process-table row is
-    // a limit-enforced tree outside the ledger that claims to hold all of them.
     let projector = little_monkey_lib::bounded_execution::cli_projector()?;
     let mut first_failure: Option<VerifyFailure> = None;
-    for cmd in &commands {
-        statusln!(options, "\n[verify] running \"{}\"…", cmd.label);
+    let mut first_required_failure: Option<VerifyFailure> = None;
+    for cmd in commands {
+        statusln!(
+            options,
+            "
+[verify] running \"{}\"…",
+            cmd.label
+        );
         let result = verify::run_command_impl(state, &root, cmd, None, projector.clone()).await;
         let ok = !result.timed_out && result.code == Some(0);
         let output = build_verify_output(&result);
@@ -772,15 +874,29 @@ async fn run_verification_phase(
             "content": format!("{VERIFY_NOTE_PREFIX}{notice}"),
         }));
 
-        if !ok && first_failure.is_none() {
-            first_failure = Some(VerifyFailure {
+        if !ok {
+            let failure = VerifyFailure {
                 label: result.label.clone(),
                 code: result.code,
                 output,
-            });
+                required: required.contains(cmd.id.as_str()),
+                fixable: true,
+            };
+            if first_failure.is_none() {
+                first_failure = Some(VerifyFailure {
+                    label: failure.label.clone(),
+                    code: failure.code,
+                    output: failure.output.clone(),
+                    required: failure.required,
+                    fixable: failure.fixable,
+                });
+            }
+            if failure.required && first_required_failure.is_none() {
+                first_required_failure = Some(failure);
+            }
         }
     }
-    Ok(first_failure)
+    Ok(first_required_failure.or(first_failure))
 }
 
 fn preview(s: &str, max: usize) -> String {
@@ -1587,6 +1703,7 @@ pub async fn run_turn_with_max_iterations(
         attached_stacks,
         max_iterations_override,
         false,
+        &[],
     )
     .await
 }
@@ -1616,6 +1733,7 @@ pub async fn run_prepared_turn_with_max_iterations(
     attached_stacks: &[String],
     max_iterations_override: Option<usize>,
     mutation_required: bool,
+    required_verify_command_ids: &[String],
 ) -> Result<Vec<String>, String> {
     if history
         .last()
@@ -1690,6 +1808,7 @@ pub async fn run_prepared_turn_with_max_iterations(
         mcp_entries,
         attached_stacks,
         max_iterations_override,
+        required_verify_command_ids,
         &mut usage,
         &mut observed,
     )
@@ -1749,6 +1868,7 @@ async fn run_tool_loop(
     mcp_entries: &[McpServerEntry],
     attached_stacks: &[String],
     max_iterations_override: Option<usize>,
+    required_verify_command_ids: &[String],
     usage: &mut UsageSnapshot,
     observed: &mut ObservedMutations,
 ) -> Result<(), String> {
@@ -1874,6 +1994,7 @@ async fn run_tool_loop(
     // turn — bounded by `DEFAULT_VERIFY_MAX_ROUNDS`, mirroring
     // `agentLoop.ts`'s `verifyRound`/`settings.verifyMaxRounds`.
     let mut verify_round: u32 = 0;
+    let mut verification_recheck_pending = false;
     let mut verification_index: u64 = 0;
     let permission_scope = workspace::primary_root_canon(state)
         .map(|root| root.to_string_lossy().to_string())
@@ -1954,20 +2075,29 @@ async fn run_tool_loop(
             // mutated) before returning, exactly like `agentLoop.ts`'s
             // `runAgentTurnBody` does at its own `toolCalls.length === 0`
             // exit.
-            if options.verify && !mutated_files.is_empty() {
-                if let Some(failure) =
-                    run_verification_phase(state, perms, options, history, &mut verification_index)
-                        .await?
+            if (!mutated_files.is_empty() || verification_recheck_pending)
+                && (options.verify || !required_verify_command_ids.is_empty())
+            {
+                verification_recheck_pending = false;
+                if let Some(failure) = run_verification_phase(
+                    state,
+                    perms,
+                    options,
+                    history,
+                    &mut verification_index,
+                    required_verify_command_ids,
+                )
+                .await?
                 {
-                    if verify_round
-                        < options
-                            .verify_max_rounds
-                            .unwrap_or(DEFAULT_VERIFY_MAX_ROUNDS)
+                    if failure.fixable
+                        && verify_round
+                            < options
+                                .verify_max_rounds
+                                .unwrap_or(DEFAULT_VERIFY_MAX_ROUNDS)
                     {
                         verify_round += 1;
-                        // Cleared so only edits made in response to *this*
-                        // failure trigger the next verification pass.
                         mutated_files.clear();
+                        verification_recheck_pending = true;
                         let code_display = failure
                             .code
                             .map(|c| c.to_string())
@@ -1977,12 +2107,35 @@ async fn run_tool_loop(
                             &failure.output,
                         );
                         let message = format!(
-                            "{VERIFY_NOTE_PREFIX} The verification command \"{}\" failed (exit {code_display}). Fix the reported problems, then stop.\n{}",
+                            "{VERIFY_NOTE_PREFIX} The verification command "{}" failed (exit {code_display}). Fix the reported problems, then stop.
+                        {}",
                             failure.label, protected_output
                         );
-                        statusln!(options, "\n{message}");
+                        statusln!(
+                            options,
+                            "
+{message}"
+                        );
                         history.push(serde_json::json!({ "role": "system", "content": message }));
                         continue;
+                    }
+                    if failure.required {
+                        let code_display = failure
+                            .code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "unavailable".to_string());
+                        let message = format!(
+                            "Completion blocked: required Standards verification "{}" did not pass (exit {code_display}). {}",
+                            failure.label, failure.output
+                        );
+                        statusln!(
+                            options,
+                            "
+{message}"
+                        );
+                        history
+                            .push(serde_json::json!({ "role": "assistant", "content": message }));
+                        return Err(message);
                     }
                 }
             }

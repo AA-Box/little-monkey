@@ -69,6 +69,8 @@ import {
   type ResolvedTextReference,
 } from './mentions';
 import { currentSystemPrompt, ULTRACODE_SYSTEM_SECTION, type AttachedStackPromptInfo } from './systemPrompt';
+import { freezeStandardsForTask } from './standardsExecution';
+import { planVerificationCommands } from './verificationPlan';
 import { composeSkillCatalog, composeSkillSystemPrompt, skillRankingSignalsFor, MAX_MODEL_SKILLS, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
 import { composeSavedWorkflowCatalog } from './workflow';
 import { selectSavedWorkflowList, useSavedWorkflowStore } from '../store/savedWorkflowStore';
@@ -1011,6 +1013,10 @@ export interface VerifyFailure {
   label: string;
   code: number | null;
   output: string;
+  /** Required Standards checker failures are hard completion gates. */
+  required?: boolean;
+  /** False when another model edit cannot repair the failure (for example a missing binding). */
+  fixable?: boolean;
 }
 
 /**
@@ -1025,7 +1031,7 @@ export interface VerifyFailure {
  * enabled commands) never triggers a round regardless of the round budget.
  */
 export function shouldFeedBackVerifyFailure(failure: VerifyFailure | null, verifyRound: number, verifyMaxRounds: number): boolean {
-  return failure !== null && verifyRound < verifyMaxRounds;
+  return failure !== null && failure.fixable !== false && verifyRound < verifyMaxRounds;
 }
 
 /**
@@ -1062,36 +1068,60 @@ export async function runVerificationPhase(
   sessionId: string,
   turnId: string,
   addMessage: (msg: ChatMessage) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  requiredCommandIds: readonly string[] = [],
 ): Promise<VerifyFailure | null> {
-  if (!useSettingsStore.getState().verifyEnabled) return null;
+  const includeConfiguredCommands = useSettingsStore.getState().verifyEnabled;
+  const requiredIds = [...new Set(requiredCommandIds.map((id) => id.trim()).filter(Boolean))];
+  if (!includeConfiguredCommands && requiredIds.length === 0) return null;
   if (usePermissionStore.getState().mode === 'plan') return null;
   if (signal?.aborted) return null;
 
   let config: VerifyConfig;
   try {
     config = await invoke<VerifyConfig>('verify_get_config', {});
-  } catch {
-    // No workspace open, or the config file couldn't be read — nothing to run.
-    return null;
+  } catch (error) {
+    if (requiredIds.length === 0) return null;
+    const output = `Could not load the Verification configuration required by selected Standards: ${errorMessage(error)}`;
+    addMessage({
+      role: 'system',
+      content: formatVerifyNotice({
+        label: 'Standards checker bindings',
+        kind: 'standards',
+        ok: false,
+        code: null,
+        output,
+        durationMs: 0,
+      }),
+    });
+    return { label: 'Standards checker bindings', code: null, output, required: true, fixable: false };
   }
 
-  const enabledCommands = config.commands.filter((c) => c.enabled);
-  if (enabledCommands.length === 0) return null;
+  const plan = planVerificationCommands(config, includeConfiguredCommands, requiredIds);
+  if (plan.missingRequiredIds.length > 0) {
+    const output = `Required Standards checker is disabled or missing: ${plan.missingRequiredIds.join(', ')}.`;
+    addMessage({
+      role: 'system',
+      content: formatVerifyNotice({
+        label: 'Standards checker bindings',
+        kind: 'standards',
+        ok: false,
+        code: null,
+        output,
+        durationMs: 0,
+      }),
+    });
+    return { label: 'Standards checker bindings', code: null, output, required: true, fixable: false };
+  }
+  if (plan.commands.length === 0) return null;
 
+  const requiredSet = new Set(requiredIds);
   let firstFailure: VerifyFailure | null = null;
+  let firstRequiredFailure: VerifyFailure | null = null;
 
-  for (const cmd of enabledCommands) {
-    // Stop fired either before this iteration or while the previous
-    // command's invoke was in flight (handled below) — either way, don't
-    // start another configured command.
+  for (const cmd of plan.commands) {
     if (signal?.aborted) break;
 
-    // Surfaced as a "running <label>…" row in the timeline
-    // (MessageList.tsx's VerifyRunningRow) — test suites can run long enough
-    // (up to `timeout_secs`, default 300s) that a bare typing indicator would
-    // read as a hang. Cleared in `finally` so a thrown/rejected invoke below
-    // never leaves a stale "running" row behind.
     useSessionStore.getState().setRunningVerifyLabel(sessionId, cmd.label || cmd.command);
     try {
       useUsageHistoryStore.getState().recordVerifyRun();
@@ -1099,12 +1129,6 @@ export async function runVerificationPhase(
       const result = signal ? await Promise.race([invocation, abortedPromise(signal).then(() => null)]) : await invocation;
 
       if (result === null) {
-        // Aborted mid-command: tell the Rust side to kill it via the same
-        // turn-keyed cancel channel `executeToolCall` uses for tool calls,
-        // then stop the phase entirely rather than starting the next
-        // configured command. The original invocation promise already has a
-        // handler attached (via Promise.race), so its eventual (discarded)
-        // result never becomes an unhandled rejection.
         void invoke('tools_cancel_running', { turnId }).catch(() => {});
         break;
       }
@@ -1122,15 +1146,19 @@ export async function runVerificationPhase(
           durationMs: result.durationMs,
         }),
       });
-      if (!ok && firstFailure === null) {
-        firstFailure = { label: result.label, code: result.code, output };
+      if (!ok) {
+        const failure: VerifyFailure = {
+          label: result.label,
+          code: result.code,
+          output,
+          required: requiredSet.has(cmd.id),
+          fixable: true,
+        };
+        if (firstFailure === null) firstFailure = failure;
+        if (failure.required && firstRequiredFailure === null) firstRequiredFailure = failure;
       }
     } catch (err) {
-      // verify_run itself rejected (e.g. the command was deleted from the
-      // config in another window between the check above and this call) —
-      // surface it as a failed notice rather than silently dropping the
-      // round.
-      const message = errorMessage(err);
+      const output = errorMessage(err);
       addMessage({
         role: 'system',
         content: formatVerifyNotice({
@@ -1138,19 +1166,25 @@ export async function runVerificationPhase(
           kind: cmd.kind,
           ok: false,
           code: null,
-          output: message,
+          output,
           durationMs: 0,
         }),
       });
-      if (firstFailure === null) {
-        firstFailure = { label: cmd.label, code: null, output: message };
-      }
+      const failure: VerifyFailure = {
+        label: cmd.label,
+        code: null,
+        output,
+        required: requiredSet.has(cmd.id),
+        fixable: true,
+      };
+      if (firstFailure === null) firstFailure = failure;
+      if (failure.required && firstRequiredFailure === null) firstRequiredFailure = failure;
     } finally {
       useSessionStore.getState().setRunningVerifyLabel(sessionId, null);
     }
   }
 
-  return firstFailure;
+  return firstRequiredFailure ?? firstFailure;
 }
 
 
@@ -1956,6 +1990,10 @@ async function runDaemonAgentTurn(
   store.addMessage(sessionId, { role: 'user', content: userText });
 
   const { textRefs, images, unresolved } = await resolveReferences(userText, attachments);
+  const frozenStandards = await freezeStandardsForTask(
+    userText,
+    textRefs.filter((reference) => reference.source !== 'terminal').map((reference) => reference.path),
+  );
   if (images.length > 0) {
     store.updateMessageAt(sessionId, anchorIndex, { content: toMessageContent(userText, images) });
   }
@@ -2137,7 +2175,13 @@ async function runDaemonAgentTurn(
     turnId,
     userText,
     systemPrompt: composeSkillSystemPrompt(
-      currentSystemPrompt(session?.personaId ?? null, attachedStacksForPrompt, docChatMode),
+      currentSystemPrompt(
+        session?.personaId ?? null,
+        attachedStacksForPrompt,
+        docChatMode,
+        frozenStandards.promptSection,
+        frozenStandards.checkerCommandIds.length > 0,
+      ),
       skillInvocations,
     ),
     history: targetHistory,
@@ -2149,6 +2193,7 @@ async function runDaemonAgentTurn(
     memoryEnabled: settings.memoryEnabled,
     verifyEnabled: settings.verifyEnabled,
     verifyMaxRounds: settings.verifyMaxRounds,
+    standardsCheckerCommandIds: frozenStandards.checkerCommandIds,
     subagentsEnabled: settings.subagentsEnabled,
     effort: effortForTarget(resolvedTarget) ?? null,
     mcpServers: useMcpStore.getState().servers,
@@ -2472,6 +2517,10 @@ async function runAgentTurnBody(
   // *wire* payload (sessionStore keeps the unexpanded text the user typed),
   // but images are promoted into the stored message itself, right below.
   const { textRefs, images, unresolved } = await resolveReferences(userText, attachments);
+  const frozenStandards = await freezeStandardsForTask(
+    userText,
+    textRefs.filter((reference) => reference.source !== 'terminal').map((reference) => reference.path),
+  );
 
   if (images.length > 0) {
     updateLastMessage({ content: toMessageContent(userText, images) });
@@ -3138,6 +3187,7 @@ async function runAgentTurnBody(
   // anything — this is what makes `verifyMaxRounds` a hard bound rather than
   // a "keep trying until it passes" loop.
   let verifyRound = 0;
+  let verificationRecheckPending = false;
 
   /**
    * The turn's safe point: freeze first if a suspend is latched, then park.
@@ -3295,7 +3345,13 @@ async function runAgentTurnBody(
       role: 'system',
       content: [
         composeSkillSystemPrompt(
-          currentSystemPrompt(personaId, attachedStacksForPrompt, docChatMode),
+          currentSystemPrompt(
+            personaId,
+            attachedStacksForPrompt,
+            docChatMode,
+            frozenStandards.promptSection,
+            frozenStandards.checkerCommandIds.length > 0,
+          ),
           skillInvocations,
         ),
         ...(ultracode ? [ULTRACODE_SYSTEM_SECTION] : []),
@@ -3547,34 +3603,42 @@ async function runAgentTurnBody(
       // verification commands (if any files were mutated and the user
       // hasn't hit Stop) before returning — see `runVerificationPhase`'s doc
       // comment for exactly what gates this.
-      if (!signal?.aborted && mutatedFiles.size > 0) {
+      if (!signal?.aborted && (mutatedFiles.size > 0 || verificationRecheckPending)) {
         const verificationStartedAt = Date.now();
-        const failure = await runVerificationPhase(sessionId, turnId, addMessage, signal);
-        if (settings.verifyEnabled && !signal?.aborted) {
+        verificationRecheckPending = false;
+        const failure = await runVerificationPhase(
+          sessionId,
+          turnId,
+          addMessage,
+          signal,
+          frozenStandards.checkerCommandIds,
+        );
+        if ((settings.verifyEnabled || frozenStandards.checkerCommandIds.length > 0) && !signal?.aborted) {
           durable.recorder?.recordVerification(
             failure?.label ?? 'Workspace verification',
             failure === null,
             failure === null
-              ? 'Configured verification completed without a reported failure.'
+              ? 'Configured and Standards-required verification completed without a reported failure.'
               : `Exit ${failure.code ?? 'timeout'}: ${failure.output}`,
             Date.now() - verificationStartedAt,
           );
         }
-        // A command failed and there's a feed-back round left to spend —
-        // append one fix instruction and send the loop around again instead
-        // of returning. `mutatedFiles` is cleared so only edits made in
-        // response to *this* failure trigger the next verification pass;
-        // `signal?.aborted` is re-checked since `runVerificationPhase` can
-        // return early (rather than run every command) once Stop fires
-        // mid-phase — see its doc comment.
         if (failure !== null && !signal?.aborted && shouldFeedBackVerifyFailure(failure, verifyRound, settings.verifyMaxRounds)) {
           verifyRound += 1;
           mutatedFiles.clear();
+          verificationRecheckPending = true;
           addMessage({
             role: 'system',
-            content: `${VERIFY_FIX_NOTE_PREFIX} The verification command "${failure.label}" failed (exit ${failure.code ?? 'timeout'}). Fix the reported problems, then stop.\n${failure.output}`,
+            content: `${VERIFY_FIX_NOTE_PREFIX} The verification command "${failure.label}" failed (exit ${failure.code ?? 'timeout'}). Fix the reported problems, then stop.
+${failure.output}`,
           });
           continue;
+        }
+        if (failure?.required && !signal?.aborted) {
+          const failureMessage = `Completion blocked: required Standards verification "${failure.label}" did not pass (exit ${failure.code ?? 'unavailable'}). ${failure.output}`;
+          durable.failure = failureMessage;
+          updateLastMessage({ content: failureMessage });
+          return;
         }
       }
       return;
