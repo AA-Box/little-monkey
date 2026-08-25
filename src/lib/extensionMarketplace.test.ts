@@ -13,12 +13,13 @@ import {
   type ExtensionRegistryEntry,
   type LmxEnvelope,
 } from "./extensionMarketplace";
+import { resolveMarketplaceCatalog } from "./marketplaceCatalog";
 
 const DIGEST_A = "a".repeat(64);
 const DIGEST_B = "b".repeat(64);
 
-function registryRecord(): AdditionalRegistryRecord {
-  return {
+function registryRecord(overrides: Partial<AdditionalRegistryRecord> = {}): AdditionalRegistryRecord {
+  const record: AdditionalRegistryRecord = {
     source: {
       source_id: "team",
       display_name: "Team registry",
@@ -48,6 +49,7 @@ function registryRecord(): AdditionalRegistryRecord {
     },
     last_verification_error: null,
   };
+  return { ...record, ...overrides };
 }
 
 describe("extension marketplace M4 bridge", () => {
@@ -85,6 +87,54 @@ describe("extension marketplace M4 bridge", () => {
       files_base64: { "component.wasm": "AA==", "Component.wasm": "AA==" },
     } as unknown as LmxEnvelope;
     expect(() => validateLmxEnvelope(colliding)).toThrow(/colliding/);
+  });
+
+  it("fails closed when verified registries disagree on immutable bytes for the newest version", () => {
+    const first = registryRecord();
+    const second = registryRecord({
+      source: {
+        source_id: "other",
+        display_name: "Other registry",
+        location: "https://other.example/index.json",
+        added_unix_ms: 1,
+      },
+      verified: {
+        ...registryRecord().verified!,
+        snapshot_sha256: "d".repeat(64),
+        snapshot: {
+          ...registryRecord().verified!.snapshot,
+          registry_id: "other-registry",
+          packages: {
+            "extension.com.example.echo": [
+              { version: "1.2.0", bundle_sha256: DIGEST_A, manifest_sha256: DIGEST_A },
+            ],
+          },
+        },
+      },
+    });
+    const resolved = resolveMarketplaceCatalog(marketplaceRegistries([first, second]));
+    expect(resolved.entries).toEqual([]);
+    expect(resolved.conflicts).toHaveLength(1);
+    expect(resolved.conflicts[0]).toMatchObject({
+      extension_id: "com.example.echo",
+      version: "1.2.0",
+      source_ids: ["other", "team"],
+    });
+  });
+
+  it("never authorizes executable entries from an expired signed snapshot", () => {
+    const expired = registryRecord({
+      verified: {
+        ...registryRecord().verified!,
+        snapshot: {
+          ...registryRecord().verified!.snapshot,
+          expires_unix_ms: Date.now() - 1,
+        },
+      },
+    });
+    const resolved = resolveMarketplaceCatalog(marketplaceRegistries([expired]));
+    expect(resolved.entries).toEqual([]);
+    expect(resolved.expired_source_ids).toEqual(["team"]);
   });
 });
 
