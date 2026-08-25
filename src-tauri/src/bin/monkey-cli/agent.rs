@@ -804,12 +804,7 @@ async fn run_verification_phase(
     let mut first_failure: Option<VerifyFailure> = None;
     let mut first_required_failure: Option<VerifyFailure> = None;
     for cmd in commands {
-        statusln!(
-            options,
-            "
-[verify] running \"{}\"…",
-            cmd.label
-        );
+        statusln!(options, "\n[verify] running \"{}\"…", cmd.label);
         let result = verify::run_command_impl(state, &root, cmd, None, projector.clone()).await;
         let ok = !result.timed_out && result.code == Some(0);
         let output = build_verify_output(&result);
@@ -2107,15 +2102,10 @@ async fn run_tool_loop(
                             &failure.output,
                         );
                         let message = format!(
-                            "{VERIFY_NOTE_PREFIX} The verification command "{}" failed (exit {code_display}). Fix the reported problems, then stop.
-                        {}",
+                            "{VERIFY_NOTE_PREFIX} The verification command \"{}\" failed (exit {code_display}). Fix the reported problems, then stop.\n{}",
                             failure.label, protected_output
                         );
-                        statusln!(
-                            options,
-                            "
-{message}"
-                        );
+                        statusln!(options, "\n{message}");
                         history.push(serde_json::json!({ "role": "system", "content": message }));
                         continue;
                     }
@@ -2125,14 +2115,10 @@ async fn run_tool_loop(
                             .map(|c| c.to_string())
                             .unwrap_or_else(|| "unavailable".to_string());
                         let message = format!(
-                            "Completion blocked: required Standards verification "{}" did not pass (exit {code_display}). {}",
+                            "Completion blocked: required Standards verification \"{}\" did not pass (exit {code_display}). {}",
                             failure.label, failure.output
                         );
-                        statusln!(
-                            options,
-                            "
-{message}"
-                        );
+                        statusln!(options, "\n{message}");
                         history
                             .push(serde_json::json!({ "role": "assistant", "content": message }));
                         return Err(message);
