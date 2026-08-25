@@ -154,7 +154,7 @@ describe("extension marketplace update policy", () => {
     expect(mocks.update).not.toHaveBeenCalled();
   });
 
-  it("automatic-safe pauses for manual review when an existing grant has a host-only binding", async () => {
+  it("automatic-safe pauses for manual review and cleans staging when a host-only binding exists", async () => {
     const record = verifiedRegistryRecord();
     const installed = installedExtension();
     const preview = safePreviewWithHostBinding();
@@ -174,6 +174,33 @@ describe("extension marketplace update policy", () => {
     expect(mocks.previewMarketplaceInstall).toHaveBeenCalledTimes(1);
     expect(mocks.previewUpdate).toHaveBeenCalledTimes(1);
     expect(mocks.update).not.toHaveBeenCalled();
+    expect(mocks.invoke).toHaveBeenCalledWith("extensions_list", { cleanupMarketplaceHandle: preview.source_path });
     expect(useExtensionMarketplaceStore.getState().updates[0]?.reasons.join(" ")).toMatch(/host-bound permission/);
+  });
+
+  it("canceling a manual preview relinquishes its native staging lease", async () => {
+    const record = verifiedRegistryRecord();
+    const preview = safePreviewWithHostBinding();
+    useExtensionMarketplaceStore.setState({
+      pendingPreview: {
+        registry: { record, snapshot: record.verified.snapshot },
+        entry: {
+          extension_id: "com.example.echo",
+          version: "1.1.0",
+          package_sha256: DIGEST_A,
+          manifest_sha256: DIGEST_B,
+          registry_source_id: "team",
+          registry_snapshot_sha256: record.verified.snapshot_sha256,
+        },
+        source_path: preview.source_path,
+        runtime_preview: preview,
+        mode: "update",
+      } as never,
+    });
+
+    await useExtensionMarketplaceStore.getState().clearPreview();
+
+    expect(useExtensionMarketplaceStore.getState().pendingPreview).toBeNull();
+    expect(mocks.invoke).toHaveBeenCalledWith("extensions_list", { cleanupMarketplaceHandle: preview.source_path });
   });
 });
