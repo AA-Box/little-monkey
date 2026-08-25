@@ -13,7 +13,7 @@
 //! works without another native input stack, and we never call ConnectToEIS,
 //! so the mutually-exclusive transports cannot be mixed accidentally.
 
-use super::{DesktopInputBackend, MouseButtonKind};
+use super::{ComputerUseFailure, DesktopInputBackend, MouseButtonKind, ProviderExecutionFailure};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -191,9 +191,11 @@ impl WaylandPortalBackend {
                 reply: reply_tx,
             })
             .map_err(|_| capability_error("the Wayland portal worker stopped".to_string()))?;
-        reply_rx.recv_timeout(BACKEND_COMMAND_TIMEOUT).map_err(|_| {
-            capability_error("the Wayland portal input request timed out".to_string())
-        })?
+        reply_rx
+            .recv_timeout(BACKEND_COMMAND_TIMEOUT)
+            .map_err(|_| {
+                capability_error("the Wayland portal input request timed out".to_string())
+            })?
     }
 }
 
@@ -236,6 +238,22 @@ impl DesktopInputBackend for WaylandPortalBackend {
 
     fn hotkey(&self, keys: &[String]) -> Result<(), String> {
         self.request(InputCommand::Hotkey(keys.to_vec()))
+    }
+
+    fn drag_attested(
+        &self,
+        from_x: i32,
+        from_y: i32,
+        to_x: i32,
+        to_y: i32,
+    ) -> Result<(), ProviderExecutionFailure> {
+        self.request(InputCommand::Drag(from_x, from_y, to_x, to_y))
+            .map_err(ComputerUseFailure::ambiguous)
+    }
+
+    fn hotkey_attested(&self, keys: &[String]) -> Result<(), ProviderExecutionFailure> {
+        self.request(InputCommand::Hotkey(keys.to_vec()))
+            .map_err(ComputerUseFailure::ambiguous)
     }
 }
 
@@ -342,7 +360,10 @@ impl PortalCore {
         let proxy = self.remote_proxy().await?;
         let options: HashMap<&str, Value<'_>> = HashMap::new();
         proxy
-            .call::<_, _, ()>("NotifyPointerButton", &(&session.path, options, code, state))
+            .call::<_, _, ()>(
+                "NotifyPointerButton",
+                &(&session.path, options, code, state),
+            )
             .await
             .map_err(|error| portal_error("send pointer button", error))
     }
@@ -378,7 +399,10 @@ impl PortalCore {
         let proxy = self.remote_proxy().await?;
         let options: HashMap<&str, Value<'_>> = HashMap::new();
         proxy
-            .call::<_, _, ()>("NotifyKeyboardKeysym", &(&session.path, options, keysym, state))
+            .call::<_, _, ()>(
+                "NotifyKeyboardKeysym",
+                &(&session.path, options, keysym, state),
+            )
             .await
             .map_err(|error| portal_error("send keyboard input", error))
     }
@@ -410,14 +434,9 @@ async fn probe_remote_desktop(connection: &Connection) -> Result<(), String> {
         )));
     }
 
-    let screencast = Proxy::new(
-        connection,
-        PORTAL_SERVICE,
-        PORTAL_PATH,
-        SCREENCAST_IFACE,
-    )
-    .await
-    .map_err(|error| portal_error("create ScreenCast proxy", error))?;
+    let screencast = Proxy::new(connection, PORTAL_SERVICE, PORTAL_PATH, SCREENCAST_IFACE)
+        .await
+        .map_err(|error| portal_error("create ScreenCast proxy", error))?;
     let sources: u32 = screencast
         .get_property("AvailableSourceTypes")
         .await
@@ -454,12 +473,7 @@ async fn create_remote_desktop_session(connection: &Connection) -> Result<Portal
         &create_options,
     )
     .await?;
-    let session_string = value_string(&create_results, "session_handle")?;
-    let session_path = OwnedObjectPath::try_from(session_string.as_str()).map_err(|error| {
-        capability_error(format!(
-            "RemoteDesktop returned an invalid session object path: {error}"
-        ))
-    })?;
+    let session_path = value_object_path(&create_results, "session_handle")?;
 
     let expected_session = portal_session_path(connection, &session_token)?;
     if session_path.as_str() != expected_session {
@@ -581,7 +595,9 @@ where
     let response = tokio::time::timeout(PORTAL_REQUEST_TIMEOUT, responses.next())
         .await
         .map_err(|_| capability_error(format!("portal request {method} timed out")))?
-        .ok_or_else(|| capability_error(format!("portal request {method} closed without a response")))?;
+        .ok_or_else(|| {
+            capability_error(format!("portal request {method} closed without a response"))
+        })?;
     let (code, results): (u32, Vardict) = response
         .body()
         .deserialize()
@@ -632,6 +648,16 @@ fn token(prefix: &str) -> String {
     format!("lm_{prefix}_{}", Uuid::new_v4().simple())
 }
 
+fn value_object_path(values: &Vardict, key: &str) -> Result<OwnedObjectPath, String> {
+    let value = values
+        .get(key)
+        .ok_or_else(|| capability_error(format!("portal response omitted {key}")))?
+        .try_clone()
+        .map_err(|error| portal_error(&format!("clone portal field {key}"), error))?;
+    OwnedObjectPath::try_from(value)
+        .map_err(|error| portal_error(&format!("decode portal field {key} as object path"), error))
+}
+
 fn value_string(values: &Vardict, key: &str) -> Result<String, String> {
     let value = values
         .get(key)
@@ -658,8 +684,8 @@ fn value_streams(values: &Vardict) -> Result<Vec<PortalStream>, String> {
         .ok_or_else(|| capability_error("portal response omitted streams".to_string()))?
         .try_clone()
         .map_err(|error| portal_error("clone portal streams", error))?;
-    let raw: Vec<(u32, Vardict)> = Vec::try_from(value)
-        .map_err(|error| portal_error("decode portal streams", error))?;
+    let raw: Vec<(u32, Vardict)> =
+        Vec::try_from(value).map_err(|error| portal_error("decode portal streams", error))?;
     raw.into_iter()
         .map(|(node_id, props)| {
             let position = optional_pair_i32(&props, "position").unwrap_or((0, 0));
@@ -701,7 +727,11 @@ fn require_devices(devices: u32, required: u32, label: &str) -> Result<(), Strin
 
 fn keysym_for_char(character: char) -> Result<i32, String> {
     let code = u32::from(character);
-    let keysym = if code <= 0xff { code } else { 0x0100_0000 | code };
+    let keysym = if code <= 0xff {
+        code
+    } else {
+        0x0100_0000 | code
+    };
     i32::try_from(keysym).map_err(|_| "Unsupported Unicode key symbol".to_string())
 }
 
@@ -749,7 +779,9 @@ pub(super) fn screenshot_active_window() -> Result<Vec<u8>, String> {
             let result = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(|error| capability_error(format!("could not create screenshot runtime: {error}")))
+                .map_err(|error| {
+                    capability_error(format!("could not create screenshot runtime: {error}"))
+                })
                 .and_then(|runtime| runtime.block_on(screenshot_active_window_async()));
             let _ = tx.send(result);
         })
@@ -762,14 +794,9 @@ async fn screenshot_active_window_async() -> Result<Vec<u8>, String> {
     let connection = Connection::session()
         .await
         .map_err(|error| portal_error("connect to D-Bus for screenshot", error))?;
-    let screenshot = Proxy::new(
-        &connection,
-        PORTAL_SERVICE,
-        PORTAL_PATH,
-        SCREENSHOT_IFACE,
-    )
-    .await
-    .map_err(|error| portal_error("create Screenshot proxy", error))?;
+    let screenshot = Proxy::new(&connection, PORTAL_SERVICE, PORTAL_PATH, SCREENSHOT_IFACE)
+        .await
+        .map_err(|error| portal_error("create Screenshot proxy", error))?;
     let version: u32 = screenshot
         .get_property("version")
         .await
@@ -803,17 +830,18 @@ async fn screenshot_active_window_async() -> Result<Vec<u8>, String> {
     )
     .await?;
     let uri = value_string(&results, "uri")?;
-    let url = Url::parse(&uri)
-        .map_err(|error| capability_error(format!("Screenshot portal returned invalid URI: {error}")))?;
+    let url = Url::parse(&uri).map_err(|error| {
+        capability_error(format!("Screenshot portal returned invalid URI: {error}"))
+    })?;
     if url.scheme() != "file" {
         return Err(capability_error(format!(
             "Screenshot portal returned unsupported URI scheme {}",
             url.scheme()
         )));
     }
-    let path = url
-        .to_file_path()
-        .map_err(|_| capability_error("Screenshot portal returned a non-local file URI".to_string()))?;
+    let path = url.to_file_path().map_err(|_| {
+        capability_error("Screenshot portal returned a non-local file URI".to_string())
+    })?;
     let metadata = std::fs::metadata(&path)
         .map_err(|error| capability_error(format!("could not stat portal screenshot: {error}")))?;
     if metadata.len() > SCREENSHOT_MAX_BYTES as u64 {

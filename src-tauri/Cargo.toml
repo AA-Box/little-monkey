@@ -69,6 +69,7 @@ tauri-plugin-deep-link = "2"
 # registered first in the plugin chain (see lib.rs).
 tauri-plugin-single-instance = "2"
 tokio = { version = "1.52.3", features = ["full"] }
+zbus = "5.17.0"
 # "form" added for web.rs's `tool_web_search`: reqwest 0.13 feature-gates
 # `RequestBuilder::form` (unlike earlier 0.11/0.12 examples elsewhere), needed
 # to POST the DuckDuckGo query as `application/x-www-form-urlencoded`.
