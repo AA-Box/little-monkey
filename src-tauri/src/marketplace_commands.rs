@@ -421,6 +421,10 @@ fn cleanup_handle(handle: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+fn lease_is_expired(created_unix_ms: u64, now: u64) -> bool {
+    now.saturating_sub(created_unix_ms) > STAGING_TTL_MS
+}
+
 fn prune_stale_leases(now: u64) -> Result<(), String> {
     let root = marketplace_cache_root()?;
     for entry in fs::read_dir(&root).map_err(|error| error.to_string())? {
@@ -433,7 +437,7 @@ fn prune_stale_leases(now: u64) -> Result<(), String> {
         let marker = path.join("lease.json");
         let Ok(raw) = fs::read_to_string(&marker) else { continue };
         let Ok(lease) = serde_json::from_str::<MarketplaceLease>(&raw) else { continue };
-        if now.saturating_sub(lease.created_unix_ms) > STAGING_TTL_MS {
+        if lease_is_expired(lease.created_unix_ms, now) {
             let _ = fs::remove_dir_all(path);
         }
     }
@@ -589,6 +593,10 @@ fn resolve_handle(
     now: u64,
 ) -> Result<PathBuf, String> {
     let (lease, package) = load_lease(handle)?;
+    if lease_is_expired(lease.created_unix_ms, now) {
+        let _ = cleanup_handle(handle);
+        return Err("Marketplace staging lease has expired; prepare and review the release again".to_string());
+    }
     let request = MarketplacePrepareRequest {
         registry_source_id: lease.registry_source_id.clone(),
         registry_snapshot_sha256: lease.registry_snapshot_sha256.clone(),
@@ -769,6 +777,14 @@ mod tests {
         assert!(id_from_handle("little-monkey-marketplace:v2:../escape").is_err());
         let id = Uuid::new_v4();
         assert_eq!(id_from_handle(&handle_for(id)).unwrap(), id);
+    }
+
+    #[test]
+    fn staging_lease_ttl_is_enforced_at_use_boundary() {
+        let now = STAGING_TTL_MS + 10;
+        assert!(!lease_is_expired(now - STAGING_TTL_MS, now));
+        assert!(lease_is_expired(now - STAGING_TTL_MS - 1, now));
+        assert!(!lease_is_expired(now + 1, now));
     }
 
     #[test]
