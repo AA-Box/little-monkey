@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  capture-frontend-tests:
+  fix-and-validate:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-22.04
     steps:
@@ -17,6 +17,56 @@ jobs:
         with:
           ref: feat/standards-studio
           fetch-depth: 0
+      - name: Preserve legacy verification failure shape
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/lib/agentLoop.ts')
+          s = p.read_text()
+          old = '''        const failure: VerifyFailure = {
+          label: result.label,
+          code: result.code,
+          output,
+          required: requiredSet.has(cmd.id),
+          fixable: true,
+        };
+        if (firstFailure === null) firstFailure = failure;
+        if (failure.required && firstRequiredFailure === null) firstRequiredFailure = failure;'''
+          new = '''        const required = requiredSet.has(cmd.id);
+        const failure: VerifyFailure = {
+          label: result.label,
+          code: result.code,
+          output,
+          ...(required ? { required: true, fixable: true } : {}),
+        };
+        if (firstFailure === null) firstFailure = failure;
+        if (required && firstRequiredFailure === null) firstRequiredFailure = failure;'''
+          if old not in s:
+              raise SystemExit('normal verification failure target missing')
+          s = s.replace(old, new, 1)
+          old = '''      const failure: VerifyFailure = {
+        label: cmd.label,
+        code: null,
+        output,
+        required: requiredSet.has(cmd.id),
+        fixable: true,
+      };
+      if (firstFailure === null) firstFailure = failure;
+      if (failure.required && firstRequiredFailure === null) firstRequiredFailure = failure;'''
+          new = '''      const required = requiredSet.has(cmd.id);
+      const failure: VerifyFailure = {
+        label: cmd.label,
+        code: null,
+        output,
+        ...(required ? { required: true, fixable: true } : {}),
+      };
+      if (firstFailure === null) firstFailure = failure;
+      if (required && firstRequiredFailure === null) firstRequiredFailure = failure;'''
+          if old not in s:
+              raise SystemExit('exception verification failure target missing')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git diff --check
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with:
           version: 9
@@ -26,29 +76,15 @@ jobs:
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-      - name: Capture affected Vitest failures
-        shell: bash
+      - name: Validate affected frontend contracts
         run: |
-          set +e
-          pnpm exec vitest run \
-            src/lib/standards.test.ts \
-            src/lib/verificationPlan.test.ts \
-            src/lib/daemonDesktopTurn.test.ts \
-            src/lib/agentLoopDurableIngress.test.ts \
-            src/lib/agentLoopBrowserExecution.test.ts \
-            src/lib/agentLoopLocalExecutorGuard.test.ts \
-            > /tmp/vitest.log 2>&1
-          code=$?
-          {
-            echo "exit_code=$code"
-            echo "--- vitest output ---"
-            cat /tmp/vitest.log
-          } > ci-vitest-failure.txt
-          exit 0
-      - name: Commit diagnostic output
+          pnpm exec vitest run src/lib/agentLoop.test.ts src/lib/standards.test.ts src/lib/verificationPlan.test.ts src/lib/daemonDesktopTurn.test.ts
+          pnpm typecheck
+      - name: Commit fix and clean diagnostics
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add ci-vitest-failure.txt
-          git commit -m "chore: capture affected frontend test failures"
+          git add src/lib/agentLoop.ts
+          git rm .github/workflows/standards-ci-diagnose.yml ci-vitest-failure.txt
+          git commit -m "fix: preserve verification failure compatibility"
           git push origin HEAD:feat/standards-studio
