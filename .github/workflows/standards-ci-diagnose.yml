@@ -1,0 +1,47 @@
+name: Standards CI diagnostic
+
+on:
+  push:
+    branches:
+      - feat/standards-studio
+
+permissions:
+  contents: write
+
+jobs:
+  capture-frontend-tests:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/standards-studio
+          fetch-depth: 0
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Capture exact Vitest failure
+        shell: bash
+        run: |
+          set +e
+          pnpm test > /tmp/vitest.log 2>&1
+          code=$?
+          {
+            echo "exit_code=$code"
+            echo "--- vitest tail ---"
+            tail -n 800 /tmp/vitest.log
+          } > ci-vitest-failure.txt
+          exit 0
+      - name: Commit diagnostic output
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ci-vitest-failure.txt
+          git commit -m "chore: capture frontend test failure"
+          git push origin HEAD:feat/standards-studio
