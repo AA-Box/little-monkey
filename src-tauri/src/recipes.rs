@@ -117,7 +117,7 @@ impl RecipeTarget {
     }
 }
 
-pub const DESKTOP_TURN_SCHEMA_VERSION: u32 = 3;
+pub const DESKTOP_TURN_SCHEMA_VERSION: u32 = 4;
 const MAX_DESKTOP_HISTORY_MESSAGES: usize = 2_000;
 const MAX_DESKTOP_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DESKTOP_MCP_SERVERS: usize = 64;
@@ -193,6 +193,8 @@ pub struct DesktopToolProfileSnapshot {
     pub web_tools_enabled: bool,
     pub verify_enabled: bool,
     pub verify_max_rounds: u32,
+    #[serde(default)]
+    pub standards_checker_command_ids: Vec<String>,
     pub subagents_enabled: bool,
 }
 
@@ -465,6 +467,21 @@ impl DesktopTurnSnapshot {
         self.generation.validate()?;
         if self.tool_profile.verify_max_rounds > 3 {
             return Err("desktop verify_max_rounds must be between 0 and 3".to_string());
+        }
+        if self.tool_profile.standards_checker_command_ids.len() > 256
+            || self
+                .tool_profile
+                .standards_checker_command_ids
+                .iter()
+                .any(|id| !valid_snapshot_id(id))
+        {
+            return Err("desktop Standards checker ids are invalid".to_string());
+        }
+        let mut normalized_checker_ids = self.tool_profile.standards_checker_command_ids.clone();
+        normalized_checker_ids.sort();
+        normalized_checker_ids.dedup();
+        if normalized_checker_ids != self.tool_profile.standards_checker_command_ids {
+            return Err("desktop Standards checker ids must be sorted and unique".to_string());
         }
         let system = recipe
             .system
@@ -2096,6 +2113,7 @@ mod tests {
                 web_tools_enabled: false,
                 verify_enabled: true,
                 verify_max_rounds: 2,
+                standards_checker_command_ids: Vec::new(),
                 subagents_enabled: false,
             },
             mcp_servers: Vec::new(),

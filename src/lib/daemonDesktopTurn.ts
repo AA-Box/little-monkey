@@ -32,7 +32,7 @@ import type { PermissionMode } from "../store/permissionStore";
 import type { WorkspaceRootInfo } from "../store/workspaceStore";
 import type { McpServerInfo } from "../store/mcpStore";
 
-export const DAEMON_DESKTOP_TURN_SCHEMA_VERSION = 3 as const;
+export const DAEMON_DESKTOP_TURN_SCHEMA_VERSION = 4 as const;
 const ACTIVE_TURNS_KEY = "little-monkey-daemon-desktop-turns-v1";
 const POLL_INTERVAL_MS = 150;
 
@@ -71,6 +71,7 @@ interface FrozenToolProfileWire {
   web_tools_enabled: boolean;
   verify_enabled: boolean;
   verify_max_rounds: number;
+  standards_checker_command_ids: string[];
   subagents_enabled: boolean;
 }
 
@@ -143,6 +144,7 @@ export interface BuildDaemonDesktopRecipeOptions {
   memoryEnabled: boolean;
   verifyEnabled: boolean;
   verifyMaxRounds: number;
+  standardsCheckerCommandIds?: readonly string[];
   subagentsEnabled: boolean;
   effort: FrozenGenerationSettingsWire["effort"];
   generation?: Partial<Omit<FrozenGenerationSettingsWire, "effort">>;
@@ -357,6 +359,7 @@ export async function buildDaemonDesktopRecipe(
         web_tools_enabled: options.allowNetwork,
         verify_enabled: options.verifyEnabled,
         verify_max_rounds: options.verifyMaxRounds,
+        standards_checker_command_ids: [...new Set(options.standardsCheckerCommandIds ?? [])].sort(),
         subagents_enabled: options.subagentsEnabled,
       },
       mcp_servers: await frozenMcpServers(options.mcpServers),
