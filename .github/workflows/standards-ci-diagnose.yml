@@ -26,16 +26,23 @@ jobs:
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-      - name: Capture exact Vitest failure
+      - name: Capture affected Vitest failures
         shell: bash
         run: |
           set +e
-          pnpm test > /tmp/vitest.log 2>&1
+          pnpm exec vitest run \
+            src/lib/standards.test.ts \
+            src/lib/verificationPlan.test.ts \
+            src/lib/daemonDesktopTurn.test.ts \
+            src/lib/agentLoopDurableIngress.test.ts \
+            src/lib/agentLoopBrowserExecution.test.ts \
+            src/lib/agentLoopLocalExecutorGuard.test.ts \
+            > /tmp/vitest.log 2>&1
           code=$?
           {
             echo "exit_code=$code"
-            echo "--- vitest tail ---"
-            tail -n 800 /tmp/vitest.log
+            echo "--- vitest output ---"
+            cat /tmp/vitest.log
           } > ci-vitest-failure.txt
           exit 0
       - name: Commit diagnostic output
@@ -43,5 +50,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add ci-vitest-failure.txt
-          git commit -m "chore: capture frontend test failure"
+          git commit -m "chore: capture affected frontend test failures"
           git push origin HEAD:feat/standards-studio
