@@ -31,6 +31,86 @@ vi.mock("../lib/extensionMarketplace", async (importOriginal) => {
 
 import { useExtensionMarketplaceStore } from "./extensionMarketplaceStore";
 
+const DIGEST_A = "a".repeat(64);
+const DIGEST_B = "b".repeat(64);
+
+function verifiedRegistryRecord() {
+  return {
+    source: {
+      source_id: "team",
+      display_name: "Team registry",
+      location: "https://registry.example/index.json",
+      added_unix_ms: 1,
+    },
+    verified: {
+      snapshot: {
+        schema_version: 1,
+        registry_id: "team-registry",
+        sequence: 4,
+        generated_unix_ms: 1,
+        refresh_after_unix_ms: 2,
+        expires_unix_ms: Date.now() + 60_000,
+        packages: {
+          "extension.com.example.echo": [
+            { version: "1.1.0", bundle_sha256: DIGEST_A, manifest_sha256: DIGEST_B },
+          ],
+        },
+        revocations: [],
+        signature: { trust_root_id: "root", key_id: "key", algorithm: "ed25519", signature_hex: "11" },
+      },
+      verified_unix_ms: 3,
+      snapshot_sha256: "c".repeat(64),
+    },
+    last_verification_error: null,
+  };
+}
+
+function installedExtension() {
+  return {
+    active_version: "1.0.0",
+    manifest: { extension_id: "com.example.echo", publisher: "Example" },
+    trust: {
+      state: "verified",
+      reason: "ok",
+      trust_root_id: "root",
+      key_id: "key",
+      manifest_sha256: DIGEST_A,
+      component_sha256: DIGEST_A,
+    },
+  };
+}
+
+function safePreviewWithHostBinding() {
+  return {
+    source_path: "little-monkey-marketplace:v2:00000000-0000-0000-0000-000000000001",
+    source_digest: DIGEST_A,
+    manifest: { extension_id: "com.example.echo", version: "1.1.0", publisher: "Example" },
+    trust: {
+      state: "verified",
+      reason: "ok",
+      trust_root_id: "root",
+      key_id: "key",
+      manifest_sha256: DIGEST_B,
+      component_sha256: DIGEST_A,
+    },
+    compatible: true,
+    compatibility_reason: null,
+    permissions: [
+      {
+        permission_id: "workspace.read",
+        granted: true,
+        binding_label: "/repo",
+      },
+    ],
+    permission_diff: { added: [], removed: [], unchanged: [], expands_authority: false },
+    approval_digest: DIGEST_A,
+    requires_unsigned_approval: false,
+    requires_untrusted_approval: false,
+    requires_high_risk_approval: false,
+    blockers: [],
+  };
+}
+
 describe("extension marketplace update policy", () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockReset();
@@ -72,5 +152,28 @@ describe("extension marketplace update policy", () => {
     expect(mocks.previewMarketplaceInstall).not.toHaveBeenCalled();
     expect(mocks.previewUpdate).not.toHaveBeenCalled();
     expect(mocks.update).not.toHaveBeenCalled();
+  });
+
+  it("automatic-safe pauses for manual review when an existing grant has a host-only binding", async () => {
+    const record = verifiedRegistryRecord();
+    const installed = installedExtension();
+    const preview = safePreviewWithHostBinding();
+    mocks.listRegistrySources.mockResolvedValue([record]);
+    mocks.listExtensions.mockResolvedValue([installed]);
+    mocks.previewMarketplaceInstall.mockImplementation(async (registry, entry) => ({
+      registry,
+      entry,
+      source_path: preview.source_path,
+      runtime_preview: preview,
+    }));
+    mocks.previewUpdate.mockResolvedValue(preview);
+
+    useExtensionMarketplaceStore.setState({ updatePolicy: "automatic_safe" });
+    await useExtensionMarketplaceStore.getState().runUpdateCycle();
+
+    expect(mocks.previewMarketplaceInstall).toHaveBeenCalledTimes(1);
+    expect(mocks.previewUpdate).toHaveBeenCalledTimes(1);
+    expect(mocks.update).not.toHaveBeenCalled();
+    expect(useExtensionMarketplaceStore.getState().updates[0]?.reasons.join(" ")).toMatch(/host-bound permission/);
   });
 });
