@@ -308,8 +308,31 @@ export const useStandardsStore = create<StandardsStore>((set, get) => ({
     const current = get().document;
     if (!workspacePath || !current) throw new Error("No standards workspace is loaded.");
     const portable = stripPortableCheckerAuthority(current);
-    const standards = portable.standards.map((standard) => standard.standard_id === standardId && standard.pending_revision ? { ...standard, pending_revision: null } : standard);
-    const document = await evaluateDrift({ ...portable, standards, generated_at_ms: Date.now() });
+    const rejectedAt = Date.now();
+    const standards = portable.standards.map((standard) => {
+      if (standard.standard_id !== standardId || !standard.pending_revision) return standard;
+      const pending = standard.pending_revision;
+      return {
+        ...standard,
+        revision_history: [
+          ...standard.revision_history,
+          {
+            version: pending.version,
+            title: pending.title,
+            body: pending.body,
+            applicability: structuredClone(pending.applicability),
+            severity: pending.severity,
+            tags: [...pending.tags],
+            evidence: pending.evidence.map((entry) => ({ ...entry })),
+            content_sha256: pending.content_sha256,
+            recorded_at_ms: rejectedAt,
+            reason: "rejected_revision" as const,
+          },
+        ],
+        pending_revision: null,
+      };
+    });
+    const document = await evaluateDrift({ ...portable, standards, generated_at_ms: rejectedAt });
     await saveStandards(workspacePath, document);
     set({ ...withLocalBindings(workspacePath, document), error: null });
   },
