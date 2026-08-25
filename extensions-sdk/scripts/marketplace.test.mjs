@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdtemp, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -76,6 +76,25 @@ test("packExtension rejects symlinks instead of following them", async () => {
   await extensionFixture(source);
   await symlink(path.join(source, "component.wasm"), path.join(source, "alias.wasm"));
   await assert.rejects(() => packExtension(source), /symlinks are not permitted/);
+});
+
+test("packExtension rejects paths the native marketplace cannot materialize portably", async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), "lm-marketplace-path-"));
+  const source = path.join(temp, "extension");
+  await extensionFixture(source);
+  await writeFile(path.join(source, "assets", "café.txt"), "unicode");
+  await assert.rejects(() => packExtension(source), /unsafe package path/);
+});
+
+test("packExtension rejects case-colliding paths when the host filesystem can represent them", async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), "lm-marketplace-case-"));
+  const source = path.join(temp, "extension");
+  await extensionFixture(source);
+  await writeFile(path.join(source, "assets", "Note.txt"), "collision");
+  const names = await readdir(path.join(source, "assets"));
+  if (names.includes("note.txt") && names.includes("Note.txt")) {
+    await assert.rejects(() => packExtension(source), /duplicate\/reserved package path/);
+  }
 });
 
 test("publishIntoSnapshot reuses M4 packages and static extension layout", async () => {
