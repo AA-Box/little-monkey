@@ -19,7 +19,7 @@ jobs:
       - name: Install Linux system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf build-essential
       - name: Fix Rust verification messages
         run: |
           python3 - <<'PY'
@@ -39,12 +39,15 @@ jobs:
           PY
           cargo fmt --manifest-path src-tauri/Cargo.toml
           git diff --check
+      - name: Stage CLI sidecar placeholder
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
       - name: Compile monkey-cli
         run: cargo check --manifest-path src-tauri/Cargo.toml --bin monkey-cli
-      - name: Commit source correction
+      - name: Commit source correction and remove temporary finalizer
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add src-tauri/src/bin/monkey-cli/agent.rs
-          git commit -m "fix: correct Standards verification failure messages"
+          git rm .github/workflows/standards-studio-finalize.yml scripts/standards-studio-finalize.py
+          git commit -m "fix: correct Standards verification build and clean finalizer"
           git push origin HEAD:feat/standards-studio
