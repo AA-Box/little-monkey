@@ -407,7 +407,14 @@ pub fn dictation_stop(
 ) -> Result<(), String> {
     ensure_main_window(&window)?;
     if let Some(session) = take_session(&runtime, &session_id)? {
-        session.native.stop()?;
+        // The native stop blocks until the recognizer delivers its final
+        // result, and macOS delivers that on the main queue. Tauri runs
+        // synchronous commands on the main thread, so waiting here would
+        // deadlock against the very callback we wait for. Outcomes reach the
+        // frontend as events, so nothing is lost by moving off the caller.
+        tauri::async_runtime::spawn_blocking(move || {
+            let _ = session.native.stop();
+        });
     }
     Ok(())
 }
