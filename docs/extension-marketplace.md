@@ -6,10 +6,40 @@ Little Monkey distributes executable WASM extensions through the **same signed M
 
 Distribution and execution are deliberately two independent checks:
 
-1. **M4 registry trust** answers “which immutable bytes did this verified catalog publish?” The existing Rust M4 verifier checks the registry Ed25519 signature, trust root/key, expiry, monotonic sequence/rollback protection, package/version digests, and signed revocations.
-2. **Executable runtime trust** answers “may these bytes execute with these capabilities?” After download, the existing executable-extension manager independently validates `extension.json`, publisher signature/trust, component/checksum integrity, app/platform compatibility, dependency/capability collisions, and the exact permission approval digest before it installs or updates anything.
+1. **M4 registry trust** answers “which immutable bytes did this verified catalog publish?” Rust verifies the registry Ed25519 signature, trust root/key, expiry, monotonic sequence/rollback protection, package/version digests, and signed revocations.
+2. **Executable runtime trust** answers “may these bytes execute with these capabilities?” The existing executable-extension manager independently validates `extension.json`, publisher signature/trust, component/checksum integrity, app/platform compatibility, dependency/capability collisions, and the exact permission approval digest before install/update.
 
-A valid registry signature never grants executable permissions. A valid extension publisher signature never bypasses the M4 artifact digest. Network-delivered unsigned extensions are refused by Marketplace even though the local-folder installer retains its explicit unsigned-development flow.
+A valid registry signature never grants executable permissions. A valid extension publisher signature never bypasses M4 distribution provenance. Network-delivered unsigned extensions are refused by Marketplace even though the local-folder installer retains its explicit unsigned-development flow.
+
+## Native marketplace authority boundary
+
+The renderer is not a distribution authority. It submits only the signed identity the user selected:
+
+```text
+registry source id
++ verified snapshot SHA-256
++ extension id
++ version
+```
+
+Rust then resolves that identity from the **currently verified M4 state**. The renderer never supplies the artifact URL, raw `.lmx` bytes, expected package digest, or expected manifest digest.
+
+Native preparation performs this sequence:
+
+1. resolve the configured registry source and require the exact reviewed snapshot digest;
+2. require an unexpired verified M4 snapshot;
+3. resolve `extension.<extension_id>@<version>` from that snapshot;
+4. reject an effective signed revocation;
+5. fail closed if another currently verified source advertises the same extension/version with different immutable package or manifest digests;
+6. derive the artifact URL from the verified registry location;
+7. fetch through the hardened native executable-extension HTTP client with DNS/redirect/size protections;
+8. verify the exact `.lmx` SHA-256 against native-resolved M4 metadata;
+9. canonicalize and verify the embedded manifest digest;
+10. verify extension id/version and curated-registry provenance;
+11. enforce bounded path/file/component rules;
+12. materialize only under the app-owned marketplace cache and return an **opaque staging lease**.
+
+Preview/install/update receive only that opaque lease. Before mutation Rust re-resolves the lease against current M4 state, so source removal, snapshot replacement, expiry, revocation, or changed signed digests invalidates the preview and requires review again. Successful mutations clean the lease, and stale abandoned leases are pruned.
 
 ## Reusing the M4 registry schema
 
@@ -27,13 +57,15 @@ No executable bytes are passed through the declarative `PackageStore` (which int
 - `bundle_sha256`: SHA-256 of the exact deterministic `.lmx` UTF-8 bytes;
 - `manifest_sha256`: SHA-256 of the canonical executable manifest.
 
-The `.lmx` artifact is served beside the static registry:
+The `.lmx` artifact is served beside a remotely configured static registry:
 
 ```text
 <registry root>/extensions/<extension_id>/<version>.lmx
 ```
 
 A signed M4 package/version revocation for the reserved id is also an executable marketplace revocation.
+
+The executable catalog is resolved fail-closed across verified sources. Mirrored sources that advertise identical immutable bytes are deduplicated; if verified sources disagree on the package or manifest digest for the newest version, that release is blocked instead of silently choosing one source or falling back to an older version. The bundled first-party M4 catalog participates in the same trust namespace; it currently contains declarative built-ins rather than remotely downloadable executable artifacts, so executable acquisition still requires a verified source with an artifact location.
 
 ## `.lmx` format
 
@@ -47,18 +79,16 @@ A signed M4 package/version revocation for the reserved id is also an executable
 }
 ```
 
-`extension.json` is not duplicated in `files_base64`; it is reconstructed from the envelope manifest. Packaging and installation reject absolute paths, `.`/`..`, drive-prefixed paths, case/Unicode-normalization collisions, symlinks in publisher tooling, excessive file counts, excessive per-file size, and excessive decoded size. The declared component must exist.
+`extension.json` is not duplicated in `files_base64`; it is reconstructed from the envelope manifest. Packaging and native staging reject absolute paths, `.`/`..`, drive-prefixed paths, non-ASCII/path tricks, case-colliding paths, excessive file counts, excessive per-file size, and excessive decoded size. The declared component must exist.
 
-Marketplace downloads use Little Monkey's existing `tool_web_fetch` path, so normal network permission and egress controls remain in force. The downloaded text is hashed before parsing and must match the signed M4 `bundle_sha256`. The manifest is separately canonicalized and checked against `manifest_sha256` before the executable runtime gets the materialized source.
-
-Temporary materialization is restricted to the app's `$TEMP/**` capability. It is not workspace or home-directory write authority.
+The manifest's `provenance.source.curated_registry.registry_id` must match the registry that authorized the artifact. Publisher tooling enforces the same relationship before a package can be added to a snapshot, so durable installed provenance cannot drift from distribution provenance.
 
 ## User experience
 
 Settings → Ecosystem → **Extensions** has three views:
 
 - **Discover** lists the newest non-revoked executable releases from currently verified M4 registry sources.
-- **Registries** shows the same M4 registry records, verification state, sequence, snapshot digest, expiry and errors. It intentionally has no separate extension keys or source list.
+- **Registries** shows M4 registry records, verification state, sequence, snapshot digest, expiry and errors. It intentionally has no separate extension keys or trust-root list.
 - **Updates** shows installed-version → catalog-version candidates and an update policy.
 
 Every manual install/update opens the executable runtime's real permission preview. Workspace read/write grants require an explicit canonical host path. High-risk and untrusted-publisher acknowledgements remain explicit runtime approvals.
@@ -66,6 +96,10 @@ Every manual install/update opens the executable runtime's real permission previ
 ## Update policy
 
 Policies are `off`, `notify`, and `automatic_safe`.
+
+- `off`: the recurring updater performs no marketplace registry refresh or executable download.
+- `notify`: native code refreshes and verifies signed registry metadata and surfaces update candidates, but does not download executable artifacts.
+- `automatic_safe`: after native metadata refresh, a candidate may be staged and applied only if all safety conditions remain true.
 
 An update is automatic only when all of these remain true immediately before mutation:
 
@@ -80,7 +114,9 @@ An update is automatic only when all of these remain true immediately before mut
 
 The last rule is intentional. `PermissionView.binding_label` is display-only; the canonical workspace binding stays host-private. Marketplace never reconstructs authority from that label, so such updates pause for manual review.
 
-Automatic updates re-download, re-hash, and re-preview immediately before calling `extensions_update`, preventing a stale “safe” result from becoming mutation authority.
+Automatic-safe stages an immutable artifact once, previews it, re-previews the same opaque native lease immediately before mutation, then Rust revalidates the lease against current signed M4 authority before the runtime update. A changed snapshot/trust/permission state therefore stops mutation without accepting stale approval authority.
+
+The update coordinator is owned by the primary application window and starts from app lifecycle hydration; opening Settings is not required for update discovery. Secondary/session windows do not start duplicate update loops.
 
 ## Publisher workflow
 
@@ -108,16 +144,20 @@ node extensions-sdk/scripts/marketplace.mjs verify-registry \
   public/index.json registry-public.pem
 ```
 
-`publish` refuses to mutate a snapshot whose `signature_hex` is already populated. Increment the M4 snapshot sequence/timestamps using the registry's normal release process, add all desired package/extension entries, then sign once.
+Before `publish`, the manifest must declare the same curated M4 `registry_id` as the target snapshot. `publish` also refuses to mutate a snapshot whose `signature_hex` is already populated. Increment the M4 snapshot sequence/timestamps using the registry's normal release process, add all desired package/extension entries, then sign once.
 
 The resulting directory is static-hostable on HTTPS, including GitHub Pages/object storage. Little Monkey does not require a central marketplace backend.
 
 ## Security boundaries
 
 - Registry verification is Rust-owned M4 logic, not renderer-created trust.
+- Registry refresh and executable artifact acquisition are native operations; renderer-provided bytes/hashes/URLs cannot authorize an install.
 - Registry URLs cannot smuggle credentials; executable artifacts are content-addressed by the signed snapshot.
+- A renderer cannot self-authorize arbitrary bytes by supplying matching hashes because expected hashes are resolved from native verified M4 state.
+- Opaque marketplace leases are revalidated at preview and mutation boundaries.
 - `.lmx` does not weaken the existing Wasmtime sandbox or permission grant model.
 - Marketplace cannot install unsigned network executable code.
-- Revoked releases are excluded/refused before materialization.
+- Revoked or expired releases are excluded/refused before materialization.
+- Conflicting verified registry identities fail closed.
 - Update policy cannot widen permissions or synthesize hidden workspace bindings.
 - Registry and publisher signing keys are separate trust domains and can be rotated/revoked independently through their existing stores.
