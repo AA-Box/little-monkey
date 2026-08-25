@@ -302,10 +302,16 @@ pub fn reconcile(installed: &[ExtensionDetail]) -> Result<(), String> {
             Ok(raw) => raw,
             Err(_) => continue,
         };
-        let mut receipt: MarketplaceProvenanceReceipt = match serde_json::from_slice(&raw) {
-            Ok(receipt) if receipt.schema_version == RECEIPT_SCHEMA_VERSION && receipt.origin == "marketplace" => receipt,
-            _ => continue,
-        };
+        let mut receipt: MarketplaceProvenanceReceipt =
+            match serde_json::from_slice::<MarketplaceProvenanceReceipt>(&raw) {
+                Ok(receipt)
+                    if receipt.schema_version == RECEIPT_SCHEMA_VERSION
+                        && receipt.origin == "marketplace" =>
+                {
+                    receipt
+                }
+                _ => continue,
+            };
         if receipt.state == ReceiptState::Committed {
             continue;
         }
