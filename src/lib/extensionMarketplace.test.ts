@@ -136,6 +136,32 @@ describe("extension marketplace M4 bridge", () => {
     expect(resolved.entries).toEqual([]);
     expect(resolved.expired_source_ids).toEqual(["team"]);
   });
+
+  it("does not apply a signed revocation before its effective time", () => {
+    const futureRevocation = registryRecord({
+      verified: {
+        ...registryRecord().verified!,
+        snapshot: {
+          ...registryRecord().verified!.snapshot,
+          revocations: [{
+            revocation_id: "scheduled-echo-revocation",
+            target: {
+              package_version: {
+                package_id: "extension.com.example.echo",
+                version: "1.2.0",
+              },
+            },
+            effective_unix_ms: Date.now() + 60_000,
+            reason: "scheduled publisher withdrawal",
+          }],
+        },
+      },
+    });
+    const entries = extensionEntriesFromRegistries(marketplaceRegistries([futureRevocation]));
+    const scheduled = entries.find((entry) => entry.version === "1.2.0");
+    expect(scheduled?.revoked).toBe(false);
+    expect(scheduled?.revocation_reason).toBeNull();
+  });
 });
 
 describe("automatic extension updates", () => {
