@@ -1,0 +1,743 @@
+name: Standards Studio finalizer
+
+on:
+  push:
+    branches: [feat/standards-studio]
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/standards-studio
+          fetch-depth: 0
+      - name: Apply final Standards execution wiring
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          def read(path):
+              return Path(path).read_text()
+
+          def write(path, text):
+              Path(path).write_text(text)
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count == 0:
+                  if new in text:
+                      return text
+                  raise SystemExit(f"missing replacement target: {label}")
+              if count != 1:
+                  raise SystemExit(f"replacement target {label} occurred {count} times")
+              return text.replace(old, new, 1)
+
+          # Frontend normal turn + daemon submission.
+          p = 'src/lib/agentLoop.ts'
+          s = read(p)
+          s = replace_once(
+              s,
+              "import { currentSystemPrompt, ULTRACODE_SYSTEM_SECTION, type AttachedStackPromptInfo } from './systemPrompt';\n",
+              "import { currentSystemPrompt, ULTRACODE_SYSTEM_SECTION, type AttachedStackPromptInfo } from './systemPrompt';\nimport { freezeStandardsForTask } from './standardsExecution';\nimport { planVerificationCommands } from './verificationPlan';\n",
+              'agentLoop imports',
+          )
+          s = replace_once(
+              s,
+              "export interface VerifyFailure {\n  label: string;\n  code: number | null;\n  output: string;\n}\n",
+              "export interface VerifyFailure {\n  label: string;\n  code: number | null;\n  output: string;\n  /** Required Standards checker failures are hard completion gates. */\n  required?: boolean;\n  /** False when another model edit cannot repair the failure (for example a missing binding). */\n  fixable?: boolean;\n}\n",
+              'VerifyFailure shape',
+          )
+          s = replace_once(
+              s,
+              "  return failure !== null && verifyRound < verifyMaxRounds;\n",
+              "  return failure !== null && failure.fixable !== false && verifyRound < verifyMaxRounds;\n",
+              'verification feedback policy',
+          )
+
+          verify_pattern = re.compile(r"export async function runVerificationPhase\([\s\S]*?\n  return firstFailure;\n}\n", re.M)
+          verify_replacement = r'''export async function runVerificationPhase(
+  sessionId: string,
+  turnId: string,
+  addMessage: (msg: ChatMessage) => void,
+  signal?: AbortSignal,
+  requiredCommandIds: readonly string[] = [],
+): Promise<VerifyFailure | null> {
+  const includeConfiguredCommands = useSettingsStore.getState().verifyEnabled;
+  const requiredIds = [...new Set(requiredCommandIds.map((id) => id.trim()).filter(Boolean))];
+  if (!includeConfiguredCommands && requiredIds.length === 0) return null;
+  if (usePermissionStore.getState().mode === 'plan') return null;
+  if (signal?.aborted) return null;
+
+  let config: VerifyConfig;
+  try {
+    config = await invoke<VerifyConfig>('verify_get_config', {});
+  } catch (error) {
+    if (requiredIds.length === 0) return null;
+    const output = `Could not load the Verification configuration required by selected Standards: ${errorMessage(error)}`;
+    addMessage({
+      role: 'system',
+      content: formatVerifyNotice({
+        label: 'Standards checker bindings',
+        kind: 'standards',
+        ok: false,
+        code: null,
+        output,
+        durationMs: 0,
+      }),
+    });
+    return { label: 'Standards checker bindings', code: null, output, required: true, fixable: false };
+  }
+
+  const plan = planVerificationCommands(config, includeConfiguredCommands, requiredIds);
+  if (plan.missingRequiredIds.length > 0) {
+    const output = `Required Standards checker is disabled or missing: ${plan.missingRequiredIds.join(', ')}.`;
+    addMessage({
+      role: 'system',
+      content: formatVerifyNotice({
+        label: 'Standards checker bindings',
+        kind: 'standards',
+        ok: false,
+        code: null,
+        output,
+        durationMs: 0,
+      }),
+    });
+    return { label: 'Standards checker bindings', code: null, output, required: true, fixable: false };
+  }
+  if (plan.commands.length === 0) return null;
+
+  const requiredSet = new Set(requiredIds);
+  let firstFailure: VerifyFailure | null = null;
+  let firstRequiredFailure: VerifyFailure | null = null;
+
+  for (const cmd of plan.commands) {
+    if (signal?.aborted) break;
+
+    useSessionStore.getState().setRunningVerifyLabel(sessionId, cmd.label || cmd.command);
+    try {
+      useUsageHistoryStore.getState().recordVerifyRun();
+      const invocation = invoke<VerifyRunResult>('verify_run', { commandId: cmd.id, turnId });
+      const result = signal ? await Promise.race([invocation, abortedPromise(signal).then(() => null)]) : await invocation;
+
+      if (result === null) {
+        void invoke('tools_cancel_running', { turnId }).catch(() => {});
+        break;
+      }
+
+      const ok = !result.timedOut && result.code === 0;
+      const output = buildVerifyOutput(result);
+      addMessage({
+        role: 'system',
+        content: formatVerifyNotice({
+          label: result.label,
+          kind: result.kind,
+          ok,
+          code: result.code,
+          output,
+          durationMs: result.durationMs,
+        }),
+      });
+      if (!ok) {
+        const failure: VerifyFailure = {
+          label: result.label,
+          code: result.code,
+          output,
+          required: requiredSet.has(cmd.id),
+          fixable: true,
+        };
+        if (firstFailure === null) firstFailure = failure;
+        if (failure.required && firstRequiredFailure === null) firstRequiredFailure = failure;
+      }
+    } catch (err) {
+      const output = errorMessage(err);
+      addMessage({
+        role: 'system',
+        content: formatVerifyNotice({
+          label: cmd.label,
+          kind: cmd.kind,
+          ok: false,
+          code: null,
+          output,
+          durationMs: 0,
+        }),
+      });
+      const failure: VerifyFailure = {
+        label: cmd.label,
+        code: null,
+        output,
+        required: requiredSet.has(cmd.id),
+        fixable: true,
+      };
+      if (firstFailure === null) firstFailure = failure;
+      if (failure.required && firstRequiredFailure === null) firstRequiredFailure = failure;
+    } finally {
+      useSessionStore.getState().setRunningVerifyLabel(sessionId, null);
+    }
+  }
+
+  return firstRequiredFailure ?? firstFailure;
+}
+'''
+          s2, n = verify_pattern.subn(verify_replacement, s, count=1)
+          if n == 0:
+              if 'firstRequiredFailure ?? firstFailure' not in s:
+                  raise SystemExit('could not replace runVerificationPhase')
+          else:
+              s = s2
+
+          daemon_needle = "  const { textRefs, images, unresolved } = await resolveReferences(userText, attachments);\n"
+          daemon_insert = daemon_needle + "  const frozenStandards = await freezeStandardsForTask(\n    userText,\n    textRefs.filter((reference) => reference.source !== 'terminal').map((reference) => reference.path),\n  );\n"
+          daemon_start = s.index('async function runDaemonAgentTurn(')
+          daemon_end = s.index('/** Reattaches chat placeholders', daemon_start)
+          daemon_chunk = s[daemon_start:daemon_end]
+          daemon_chunk = replace_once(daemon_chunk, daemon_needle, daemon_insert, 'daemon frozen Standards')
+          daemon_chunk = replace_once(
+              daemon_chunk,
+              "      currentSystemPrompt(session?.personaId ?? null, attachedStacksForPrompt, docChatMode),\n",
+              "      currentSystemPrompt(\n        session?.personaId ?? null,\n        attachedStacksForPrompt,\n        docChatMode,\n        frozenStandards.promptSection,\n        frozenStandards.checkerCommandIds.length > 0,\n      ),\n",
+              'daemon system prompt Standards',
+          )
+          daemon_chunk = replace_once(
+              daemon_chunk,
+              "    verifyMaxRounds: settings.verifyMaxRounds,\n",
+              "    verifyMaxRounds: settings.verifyMaxRounds,\n    standardsCheckerCommandIds: frozenStandards.checkerCommandIds,\n",
+              'daemon checker ids',
+          )
+          s = s[:daemon_start] + daemon_chunk + s[daemon_end:]
+
+          body_start = s.index('async function runAgentTurnBody(')
+          body_end = s.index('\n/**', body_start + 100)
+          body_chunk = s[body_start:body_end]
+          body_chunk = replace_once(body_chunk, daemon_needle, daemon_insert, 'normal turn frozen Standards')
+          body_chunk = replace_once(
+              body_chunk,
+              "          currentSystemPrompt(personaId, attachedStacksForPrompt, docChatMode),\n",
+              "          currentSystemPrompt(\n            personaId,\n            attachedStacksForPrompt,\n            docChatMode,\n            frozenStandards.promptSection,\n            frozenStandards.checkerCommandIds.length > 0,\n          ),\n",
+              'normal system prompt Standards',
+          )
+          body_chunk = replace_once(
+              body_chunk,
+              "  let verifyRound = 0;\n",
+              "  let verifyRound = 0;\n  let verificationRecheckPending = false;\n",
+              'verification recheck state',
+          )
+          old_verify_exit = '''      if (!signal?.aborted && mutatedFiles.size > 0) {
+        const verificationStartedAt = Date.now();
+        const failure = await runVerificationPhase(sessionId, turnId, addMessage, signal);
+        if (settings.verifyEnabled && !signal?.aborted) {
+          durable.recorder?.recordVerification(
+            failure?.label ?? 'Workspace verification',
+            failure === null,
+            failure === null
+              ? 'Configured verification completed without a reported failure.'
+              : `Exit ${failure.code ?? 'timeout'}: ${failure.output}`,
+            Date.now() - verificationStartedAt,
+          );
+        }
+        // A command failed and there's a feed-back round left to spend —
+        // append one fix instruction and send the loop around again instead
+        // of returning. `mutatedFiles` is cleared so only edits made in
+        // response to *this* failure trigger the next verification pass;
+        // `signal?.aborted` is re-checked since `runVerificationPhase` can
+        // return early (rather than run every command) once Stop fires
+        // mid-phase — see its doc comment.
+        if (failure !== null && !signal?.aborted && shouldFeedBackVerifyFailure(failure, verifyRound, settings.verifyMaxRounds)) {
+          verifyRound += 1;
+          mutatedFiles.clear();
+          addMessage({
+            role: 'system',
+            content: `${VERIFY_FIX_NOTE_PREFIX} The verification command "${failure.label}" failed (exit ${failure.code ?? 'timeout'}). Fix the reported problems, then stop.\n${failure.output}`,
+          });
+          continue;
+        }
+      }
+'''
+          new_verify_exit = '''      if (!signal?.aborted && (mutatedFiles.size > 0 || verificationRecheckPending)) {
+        const verificationStartedAt = Date.now();
+        verificationRecheckPending = false;
+        const failure = await runVerificationPhase(
+          sessionId,
+          turnId,
+          addMessage,
+          signal,
+          frozenStandards.checkerCommandIds,
+        );
+        if ((settings.verifyEnabled || frozenStandards.checkerCommandIds.length > 0) && !signal?.aborted) {
+          durable.recorder?.recordVerification(
+            failure?.label ?? 'Workspace verification',
+            failure === null,
+            failure === null
+              ? 'Configured and Standards-required verification completed without a reported failure.'
+              : `Exit ${failure.code ?? 'timeout'}: ${failure.output}`,
+            Date.now() - verificationStartedAt,
+          );
+        }
+        if (failure !== null && !signal?.aborted && shouldFeedBackVerifyFailure(failure, verifyRound, settings.verifyMaxRounds)) {
+          verifyRound += 1;
+          mutatedFiles.clear();
+          verificationRecheckPending = true;
+          addMessage({
+            role: 'system',
+            content: `${VERIFY_FIX_NOTE_PREFIX} The verification command "${failure.label}" failed (exit ${failure.code ?? 'timeout'}). Fix the reported problems, then stop.\n${failure.output}`,
+          });
+          continue;
+        }
+        if (failure?.required && !signal?.aborted) {
+          const failureMessage = `Completion blocked: required Standards verification "${failure.label}" did not pass (exit ${failure.code ?? 'unavailable'}). ${failure.output}`;
+          durable.failure = failureMessage;
+          updateLastMessage({ content: failureMessage });
+          return;
+        }
+      }
+'''
+          body_chunk = replace_once(body_chunk, old_verify_exit, new_verify_exit, 'normal verification completion gate')
+          s = s[:body_start] + body_chunk + s[body_end:]
+          write(p, s)
+
+          # Immutable daemon snapshot carries the exact checker IDs.
+          p = 'src/lib/daemonDesktopTurn.ts'
+          s = read(p)
+          s = replace_once(s, 'export const DAEMON_DESKTOP_TURN_SCHEMA_VERSION = 3 as const;', 'export const DAEMON_DESKTOP_TURN_SCHEMA_VERSION = 4 as const;', 'TS desktop schema')
+          s = replace_once(
+              s,
+              '  verify_max_rounds: number;\n  subagents_enabled: boolean;\n',
+              '  verify_max_rounds: number;\n  standards_checker_command_ids: string[];\n  subagents_enabled: boolean;\n',
+              'TS frozen checker field',
+          )
+          s = replace_once(
+              s,
+              '  verifyMaxRounds: number;\n  subagentsEnabled: boolean;\n',
+              '  verifyMaxRounds: number;\n  standardsCheckerCommandIds?: readonly string[];\n  subagentsEnabled: boolean;\n',
+              'TS recipe options checker field',
+          )
+          s = replace_once(
+              s,
+              '        verify_max_rounds: options.verifyMaxRounds,\n        subagents_enabled: options.subagentsEnabled,\n',
+              '        verify_max_rounds: options.verifyMaxRounds,\n        standards_checker_command_ids: [...new Set(options.standardsCheckerCommandIds ?? [])].sort(),\n        subagents_enabled: options.subagentsEnabled,\n',
+              'TS recipe checker snapshot',
+          )
+          write(p, s)
+
+          # Rust recipe schema mirrors the frozen IDs and validates them.
+          p = 'src-tauri/src/recipes.rs'
+          s = read(p)
+          s = replace_once(s, 'pub const DESKTOP_TURN_SCHEMA_VERSION: u32 = 3;', 'pub const DESKTOP_TURN_SCHEMA_VERSION: u32 = 4;', 'Rust desktop schema')
+          s = replace_once(
+              s,
+              '    pub verify_enabled: bool,\n    pub verify_max_rounds: u32,\n    pub subagents_enabled: bool,\n',
+              '    pub verify_enabled: bool,\n    pub verify_max_rounds: u32,\n    #[serde(default)]\n    pub standards_checker_command_ids: Vec<String>,\n    pub subagents_enabled: bool,\n',
+              'Rust frozen checker field',
+          )
+          s = replace_once(
+              s,
+              '        if self.tool_profile.verify_max_rounds > 3 {\n            return Err("desktop verify_max_rounds must be between 0 and 3".to_string());\n        }\n',
+              '        if self.tool_profile.verify_max_rounds > 3 {\n            return Err("desktop verify_max_rounds must be between 0 and 3".to_string());\n        }\n        if self.tool_profile.standards_checker_command_ids.len() > 256\n            || self\n                .tool_profile\n                .standards_checker_command_ids\n                .iter()\n                .any(|id| !valid_snapshot_id(id))\n        {\n            return Err("desktop Standards checker ids are invalid".to_string());\n        }\n        let mut normalized_checker_ids = self.tool_profile.standards_checker_command_ids.clone();\n        normalized_checker_ids.sort();\n        normalized_checker_ids.dedup();\n        if normalized_checker_ids != self.tool_profile.standards_checker_command_ids {\n            return Err("desktop Standards checker ids must be sorted and unique".to_string());\n        }\n',
+              'Rust checker validation',
+          )
+          # Fix struct literals in this file's tests/helpers.
+          s = re.sub(
+              r'(verify_max_rounds:\s*[^,]+,\n)(\s*)(subagents_enabled:)',
+              r'\1\2standards_checker_command_ids: Vec::new(),\n\2\3',
+              s,
+          )
+          write(p, s)
+
+          # Rust agent verifier receives immutable IDs from daemon task execution.
+          p = 'src-tauri/src/bin/monkey-cli/agent.rs'
+          s = read(p)
+          s = replace_once(
+              s,
+              'struct VerifyFailure {\n    label: String,\n    code: Option<i32>,\n    output: String,\n}\n',
+              'struct VerifyFailure {\n    label: String,\n    code: Option<i32>,\n    output: String,\n    required: bool,\n    fixable: bool,\n}\n',
+              'Rust VerifyFailure shape',
+          )
+
+          rust_verify_pattern = re.compile(r"async fn run_verification_phase\([\s\S]*?\n    Ok\(first_failure\)\n}\n", re.M)
+          rust_verify_replacement = r'''async fn run_verification_phase(
+    state: &AppState,
+    perms: &TerminalPermissions,
+    options: &chat::ChatOptions,
+    history: &mut Vec<serde_json::Value>,
+    verification_index: &mut u64,
+    required_command_ids: &[String],
+) -> Result<Option<VerifyFailure>, String> {
+    let required: std::collections::HashSet<&str> =
+        required_command_ids.iter().map(String::as_str).collect();
+    let root = match workspace::primary_root_canon(state) {
+        Ok(root) => root,
+        Err(error) if required.is_empty() => return Ok(None),
+        Err(error) => {
+            let output = format!("Required Standards verification has no available workspace: {error}");
+            history.push(serde_json::json!({
+                "role": "system",
+                "content": format!("{VERIFY_NOTE_PREFIX}{}", serde_json::json!({
+                    "label": "Standards checker bindings",
+                    "kind": "standards",
+                    "ok": false,
+                    "code": serde_json::Value::Null,
+                    "output": output,
+                    "durationMs": 0,
+                })),
+            }));
+            return Ok(Some(VerifyFailure {
+                label: "Standards checker bindings".to_string(),
+                code: None,
+                output,
+                required: true,
+                fixable: false,
+            }));
+        }
+    };
+
+    let all_commands = verify_cli::all_commands(&root);
+    let missing: Vec<String> = required_command_ids
+        .iter()
+        .filter(|id| {
+            !all_commands
+                .iter()
+                .any(|command| command.id == ***id && command.enabled)
+        })
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        let output = format!(
+            "Required Standards checker is disabled or missing: {}.",
+            missing.join(", ")
+        );
+        *verification_index = verification_index
+            .checked_add(1)
+            .ok_or_else(|| "verification event counter overflow".to_string())?;
+        emit_run_event(
+            perms,
+            RunEvent::VerificationFinished {
+                verification_id: format!("verification-{verification_index}"),
+                name: "Standards checker bindings".to_string(),
+                passed: false,
+                summary: output.clone(),
+                artifact_ids: Vec::new(),
+                duration_ms: 0,
+            },
+        )?;
+        history.push(serde_json::json!({
+            "role": "system",
+            "content": format!("{VERIFY_NOTE_PREFIX}{}", serde_json::json!({
+                "label": "Standards checker bindings",
+                "kind": "standards",
+                "ok": false,
+                "code": serde_json::Value::Null,
+                "output": output,
+                "durationMs": 0,
+            })),
+        }));
+        return Ok(Some(VerifyFailure {
+            label: "Standards checker bindings".to_string(),
+            code: None,
+            output,
+            required: true,
+            fixable: false,
+        }));
+    }
+
+    let mut commands: Vec<&little_monkey_lib::verify::VerifyCommand> = if options.verify {
+        all_commands.iter().filter(|command| command.enabled).collect()
+    } else {
+        Vec::new()
+    };
+    let mut selected: std::collections::HashSet<&str> =
+        commands.iter().map(|command| command.id.as_str()).collect();
+    for id in required_command_ids {
+        if selected.contains(id.as_str()) {
+            continue;
+        }
+        if let Some(command) = all_commands
+            .iter()
+            .find(|command| command.id == *id && command.enabled)
+        {
+            commands.push(command);
+            selected.insert(command.id.as_str());
+        }
+    }
+    if commands.is_empty() {
+        return Ok(None);
+    }
+
+    let projector = little_monkey_lib::bounded_execution::cli_projector()?;
+    let mut first_failure: Option<VerifyFailure> = None;
+    let mut first_required_failure: Option<VerifyFailure> = None;
+    for cmd in commands {
+        statusln!(options, "\n[verify] running \"{}\"…", cmd.label);
+        let result = verify::run_command_impl(state, &root, cmd, None, projector.clone()).await;
+        let ok = !result.timed_out && result.code == Some(0);
+        let output = build_verify_output(&result);
+        statusln!(
+            options,
+            "[verify] {} — {} ({} ms)",
+            result.label,
+            if ok { "PASS" } else { "FAIL" },
+            result.duration_ms
+        );
+        if !ok && !output.is_empty() {
+            statusln!(options, "{output}");
+        }
+
+        *verification_index = verification_index
+            .checked_add(1)
+            .ok_or_else(|| "verification event counter overflow".to_string())?;
+        let verification_name = bounded_single_line(&result.label, 1_024);
+        emit_run_event(
+            perms,
+            RunEvent::VerificationFinished {
+                verification_id: format!("verification-{verification_index}"),
+                name: if verification_name.trim().is_empty() {
+                    "verification".to_string()
+                } else {
+                    verification_name
+                },
+                passed: ok,
+                summary: format!(
+                    "{} (exit {})",
+                    if ok {
+                        "passed"
+                    } else if result.timed_out {
+                        "timed out"
+                    } else {
+                        "failed"
+                    },
+                    result
+                        .code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                ),
+                artifact_ids: Vec::new(),
+                duration_ms: result.duration_ms,
+            },
+        )?;
+
+        let protected_output = wrap_untrusted_content(
+            &format!("verification subprocess {}", result.label),
+            &output,
+        );
+        let notice = serde_json::json!({
+            "label": result.label,
+            "kind": result.kind,
+            "ok": ok,
+            "code": result.code,
+            "output": protected_output,
+            "durationMs": result.duration_ms,
+        });
+        history.push(serde_json::json!({
+            "role": "system",
+            "content": format!("{VERIFY_NOTE_PREFIX}{notice}"),
+        }));
+
+        if !ok {
+            let failure = VerifyFailure {
+                label: result.label.clone(),
+                code: result.code,
+                output,
+                required: required.contains(cmd.id.as_str()),
+                fixable: true,
+            };
+            if first_failure.is_none() {
+                first_failure = Some(VerifyFailure {
+                    label: failure.label.clone(),
+                    code: failure.code,
+                    output: failure.output.clone(),
+                    required: failure.required,
+                    fixable: failure.fixable,
+                });
+            }
+            if failure.required && first_required_failure.is_none() {
+                first_required_failure = Some(failure);
+            }
+        }
+    }
+    Ok(first_required_failure.or(first_failure))
+}
+'''.replace('***id', '**id')
+          s2, n = rust_verify_pattern.subn(rust_verify_replacement, s, count=1)
+          if n == 0:
+              if 'first_required_failure.or(first_failure)' not in s:
+                  raise SystemExit('could not replace Rust run_verification_phase')
+          else:
+              s = s2
+
+          s = replace_once(
+              s,
+              '        max_iterations_override,\n        false,\n    )\n',
+              '        max_iterations_override,\n        false,\n        &[],\n    )\n',
+              'Rust ordinary prepared call',
+          )
+          s = replace_once(
+              s,
+              '    max_iterations_override: Option<usize>,\n    mutation_required: bool,\n) -> Result<Vec<String>, String> {\n',
+              '    max_iterations_override: Option<usize>,\n    mutation_required: bool,\n    required_verify_command_ids: &[String],\n) -> Result<Vec<String>, String> {\n',
+              'Rust prepared signature',
+          )
+          s = replace_once(
+              s,
+              '        max_iterations_override,\n        &mut usage,\n        &mut observed,\n',
+              '        max_iterations_override,\n        required_verify_command_ids,\n        &mut usage,\n        &mut observed,\n',
+              'Rust run_tool_loop call',
+          )
+          s = replace_once(
+              s,
+              '    max_iterations_override: Option<usize>,\n    usage: &mut UsageSnapshot,\n',
+              '    max_iterations_override: Option<usize>,\n    required_verify_command_ids: &[String],\n    usage: &mut UsageSnapshot,\n',
+              'Rust run_tool_loop signature',
+          )
+          s = replace_once(
+              s,
+              '    let mut verify_round: u32 = 0;\n    let mut verification_index: u64 = 0;\n',
+              '    let mut verify_round: u32 = 0;\n    let mut verification_recheck_pending = false;\n    let mut verification_index: u64 = 0;\n',
+              'Rust verification recheck state',
+          )
+          old_rust_exit = '''            if options.verify && !mutated_files.is_empty() {
+                if let Some(failure) =
+                    run_verification_phase(state, perms, options, history, &mut verification_index)
+                        .await?
+                {
+                    if verify_round
+                        < options
+                            .verify_max_rounds
+                            .unwrap_or(DEFAULT_VERIFY_MAX_ROUNDS)
+                    {
+                        verify_round += 1;
+                        // Cleared so only edits made in response to *this*
+                        // failure trigger the next verification pass.
+                        mutated_files.clear();
+                        let code_display = failure
+                            .code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "timeout".to_string());
+                        let protected_output = wrap_untrusted_content(
+                            &format!("verification subprocess {}", failure.label),
+                            &failure.output,
+                        );
+                        let message = format!(
+                            "{VERIFY_NOTE_PREFIX} The verification command \"{}\" failed (exit {code_display}). Fix the reported problems, then stop.\n{}",
+                            failure.label, protected_output
+                        );
+                        statusln!(options, "\n{message}");
+                        history.push(serde_json::json!({ "role": "system", "content": message }));
+                        continue;
+                    }
+                }
+            }
+'''
+          new_rust_exit = '''            if (!mutated_files.is_empty() || verification_recheck_pending)
+                && (options.verify || !required_verify_command_ids.is_empty())
+            {
+                verification_recheck_pending = false;
+                if let Some(failure) = run_verification_phase(
+                    state,
+                    perms,
+                    options,
+                    history,
+                    &mut verification_index,
+                    required_verify_command_ids,
+                )
+                .await?
+                {
+                    if failure.fixable
+                        && verify_round
+                            < options
+                                .verify_max_rounds
+                                .unwrap_or(DEFAULT_VERIFY_MAX_ROUNDS)
+                    {
+                        verify_round += 1;
+                        mutated_files.clear();
+                        verification_recheck_pending = true;
+                        let code_display = failure
+                            .code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "timeout".to_string());
+                        let protected_output = wrap_untrusted_content(
+                            &format!("verification subprocess {}", failure.label),
+                            &failure.output,
+                        );
+                        let message = format!(
+                            "{VERIFY_NOTE_PREFIX} The verification command \"{}\" failed (exit {code_display}). Fix the reported problems, then stop.\n{}",
+                            failure.label, protected_output
+                        );
+                        statusln!(options, "\n{message}");
+                        history.push(serde_json::json!({ "role": "system", "content": message }));
+                        continue;
+                    }
+                    if failure.required {
+                        let code_display = failure
+                            .code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "unavailable".to_string());
+                        let message = format!(
+                            "Completion blocked: required Standards verification \"{}\" did not pass (exit {code_display}). {}",
+                            failure.label, failure.output
+                        );
+                        statusln!(options, "\n{message}");
+                        history.push(serde_json::json!({ "role": "assistant", "content": message }));
+                        return Err(message);
+                    }
+                }
+            }
+'''
+          s = replace_once(s, old_rust_exit, new_rust_exit, 'Rust verification completion gate')
+          write(p, s)
+
+          # Task runner passes the exact frozen checker ids only for a desktop snapshot.
+          p = 'src-tauri/src/bin/monkey-cli/task.rs'
+          s = read(p)
+          s = replace_once(
+              s,
+              '                Some(max_iterations),\n                mutation_required,\n            )\n',
+              '                Some(max_iterations),\n                mutation_required,\n                &snapshot.tool_profile.standards_checker_command_ids,\n            )\n',
+              'daemon required checker handoff',
+          )
+          # The desktop branch needs the snapshot binding in scope.
+          s = replace_once(
+              s,
+              '        if recipe.desktop_turn.is_some() {\n            crate::agent::run_prepared_turn_with_max_iterations(\n',
+              '        if let Some(snapshot) = recipe.desktop_turn.as_ref() {\n            crate::agent::run_prepared_turn_with_max_iterations(\n',
+              'daemon snapshot binding',
+          )
+          s = re.sub(
+              r'(verify_max_rounds:\s*[^,]+,\n)(\s*)(subagents_enabled:)',
+              r'\1\2standards_checker_command_ids: Vec::new(),\n\2\3',
+              s,
+          )
+          write(p, s)
+
+          # Make the required-checker behavior explicit in architecture docs.
+          p = 'docs/standards-studio.md'
+          s = read(p)
+          marker = '## Mechanical verification\n'
+          if marker in s and 'hard completion gate' not in s:
+              s = s.replace(
+                  marker,
+                  marker + '\nSelected Standards checker IDs are frozen with each operation (including queued resident turns). They run after workspace edits even when global Verification is disabled. A missing, disabled, or failing required checker is a hard completion gate: the agent may use only the configured bounded fix rounds, then the run terminates as failed instead of reporting completion.\n\n',
+                  1,
+              )
+          write(p, s)
+          PY
+
+          cargo fmt --manifest-path src-tauri/Cargo.toml
+          git diff --check
+
+      - name: Commit finalized wiring
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "No changes required"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/lib/agentLoop.ts src/lib/daemonDesktopTurn.ts src-tauri/src/recipes.rs src-tauri/src/bin/monkey-cli/agent.rs src-tauri/src/bin/monkey-cli/task.rs docs/standards-studio.md
+          git commit -m "fix: enforce Standards across all execution paths"
+          git push origin HEAD:feat/standards-studio
