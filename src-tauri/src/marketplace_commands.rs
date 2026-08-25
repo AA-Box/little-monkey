@@ -11,7 +11,8 @@
 use crate::executable_extensions::{Approval, ExtensionDetail, ExtensionManager, ExtensionPreview};
 use crate::m4_commands::M4CommandState;
 use crate::package_ecosystem::{
-    AdditionalRegistryRecord, RegistrySnapshot, RevocationTarget, SemanticVersion,
+    signed_first_party_catalog, AdditionalRegistryRecord, RegistrySnapshot, RevocationTarget,
+    SemanticVersion,
 };
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -181,6 +182,72 @@ fn package_revoked(
     })
 }
 
+fn active_release_identity(
+    snapshot: &RegistrySnapshot,
+    package_id: &str,
+    version: SemanticVersion,
+    now: u64,
+) -> Option<(String, String)> {
+    if now >= snapshot.expires_unix_ms || package_revoked(snapshot, package_id, version, now).is_some() {
+        return None;
+    }
+    snapshot
+        .packages
+        .get(package_id)?
+        .iter()
+        .find(|release| release.version == version)
+        .map(|release| {
+            (
+                release.bundle_sha256.to_ascii_lowercase(),
+                release.manifest_sha256.to_ascii_lowercase(),
+            )
+        })
+}
+
+fn require_consistent_registry_identity(
+    records: &[AdditionalRegistryRecord],
+    package_id: &str,
+    version: SemanticVersion,
+    expected_bundle_sha256: &str,
+    expected_manifest_sha256: &str,
+    now: u64,
+) -> Result<(), String> {
+    let expected_bundle_sha256 = expected_bundle_sha256.to_ascii_lowercase();
+    let expected_manifest_sha256 = expected_manifest_sha256.to_ascii_lowercase();
+
+    for record in records {
+        let Some(verified) = record.verified.as_ref() else {
+            continue;
+        };
+        let Some((bundle_sha256, manifest_sha256)) =
+            active_release_identity(verified.snapshot(), package_id, version, now)
+        else {
+            continue;
+        };
+        if bundle_sha256 != expected_bundle_sha256 || manifest_sha256 != expected_manifest_sha256 {
+            return Err(format!(
+                "Verified M4 registries disagree on immutable digests for {package_id}@{version}; refresh/review the registry conflict before installing"
+            ));
+        }
+    }
+
+    // The bundled first-party registry has no remote executable artifacts today,
+    // but it is still part of the M4 trust namespace. If a future bundled
+    // snapshot indexes the same extension/version, a conflicting remote source
+    // must fail closed rather than bypassing first-party provenance.
+    let (_, first_party_snapshot, _) = signed_first_party_catalog().map_err(|error| error.to_string())?;
+    if let Some((bundle_sha256, manifest_sha256)) =
+        active_release_identity(&first_party_snapshot, package_id, version, now)
+    {
+        if bundle_sha256 != expected_bundle_sha256 || manifest_sha256 != expected_manifest_sha256 {
+            return Err(format!(
+                "Built-in first-party M4 catalog conflicts with the selected registry for {package_id}@{version}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn resolve_marketplace_entry(
     state: &M4CommandState,
     request: &MarketplacePrepareRequest,
@@ -191,7 +258,7 @@ fn resolve_marketplace_entry(
         .list_registry_sources()
         .map_err(|error| error.to_string())?;
     let record = records
-        .into_iter()
+        .iter()
         .find(|record| record.source.source_id == request.registry_source_id)
         .ok_or_else(|| "Marketplace registry source is no longer configured".to_string())?;
     let verified = record
@@ -218,15 +285,25 @@ fn resolve_marketplace_entry(
     if let Some(reason) = package_revoked(snapshot, &package_id, version, now) {
         return Err(format!("Marketplace release is revoked: {reason}"));
     }
+    let package_sha256 = release.bundle_sha256.clone();
+    let manifest_sha256 = release.manifest_sha256.clone();
+    require_consistent_registry_identity(
+        &records,
+        &package_id,
+        version,
+        &package_sha256,
+        &manifest_sha256,
+        now,
+    )?;
     Ok(ResolvedMarketplaceEntry {
-        registry_source_id: record.source.source_id,
+        registry_source_id: record.source.source_id.clone(),
         registry_id: snapshot.registry_id.clone(),
         registry_snapshot_sha256: verified.snapshot_sha256().to_string(),
-        registry_location: record.source.location,
+        registry_location: record.source.location.clone(),
         extension_id: request.extension_id.clone(),
         version: request.version.clone(),
-        package_sha256: release.bundle_sha256.clone(),
-        manifest_sha256: release.manifest_sha256.clone(),
+        package_sha256,
+        manifest_sha256,
     })
 }
 
@@ -692,5 +769,26 @@ mod tests {
         assert!(id_from_handle("little-monkey-marketplace:v2:../escape").is_err());
         let id = Uuid::new_v4();
         assert_eq!(id_from_handle(&handle_for(id)).unwrap(), id);
+    }
+
+    #[test]
+    fn bundled_catalog_is_part_of_marketplace_identity_namespace() {
+        let (_, snapshot, _) = signed_first_party_catalog().expect("first-party catalog");
+        for (package_id, releases) in &snapshot.packages {
+            if !package_id.starts_with("extension.") {
+                continue;
+            }
+            for release in releases {
+                let identity = active_release_identity(
+                    &snapshot,
+                    package_id,
+                    release.version,
+                    snapshot.generated_unix_ms,
+                )
+                .expect("active first-party extension identity");
+                assert_eq!(identity.0, release.bundle_sha256.to_ascii_lowercase());
+                assert_eq!(identity.1, release.manifest_sha256.to_ascii_lowercase());
+            }
+        }
     }
 }
