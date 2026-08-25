@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 
 #[path = "marketplace_commands.rs"]
 pub(crate) mod marketplace_commands;
+#[path = "marketplace_provenance.rs"]
+pub(crate) mod marketplace_provenance;
 
 const MARKETPLACE_PREPARE_PREFIX: &str = "little-monkey-marketplace-prepare:v2:";
 const MARKETPLACE_HANDLE_PREFIX: &str = "little-monkey-marketplace:v2:";
@@ -57,7 +59,9 @@ pub async fn extensions_list(
     if refresh_marketplace.unwrap_or(false) {
         marketplace_commands::marketplace_refresh_registries(window, state).await?;
     }
-    manager()?.list()
+    let installed = manager()?.list()?;
+    marketplace_provenance::reconcile(&installed)?;
+    Ok(installed)
 }
 
 #[tauri::command]
@@ -80,13 +84,22 @@ pub async fn extensions_install(
     approval: Approval,
 ) -> Result<ExtensionDetail, String> {
     if source_path.starts_with(MARKETPLACE_HANDLE_PREFIX) {
-        return marketplace_commands::marketplace_install_extension(
+        // Persist the native lease identity before mutation.  On a crash after
+        // runtime success, `extensions_list` reconciles this authorization into
+        // a committed receipt by matching the installed manifest/trust identity.
+        let receipt = marketplace_provenance::authorize_from_handle(
+            &source_path,
+            marketplace_provenance::MarketplaceMutationKind::Install,
+        )?;
+        let detail = marketplace_commands::marketplace_install_extension(
             window,
             state,
             source_path,
             approval,
         )
-        .await;
+        .await?;
+        marketplace_provenance::commit(&receipt, &detail)?;
+        return Ok(detail);
     }
     manager()?.install(source_path, approval).await
 }
@@ -131,13 +144,19 @@ pub async fn extensions_update(
     approval: Approval,
 ) -> Result<ExtensionDetail, String> {
     if source_path.starts_with(MARKETPLACE_HANDLE_PREFIX) {
-        return marketplace_commands::marketplace_update_extension(
+        let receipt = marketplace_provenance::authorize_from_handle(
+            &source_path,
+            marketplace_provenance::MarketplaceMutationKind::Update,
+        )?;
+        let detail = marketplace_commands::marketplace_update_extension(
             window,
             state,
             source_path,
             approval,
         )
-        .await;
+        .await?;
+        marketplace_provenance::commit(&receipt, &detail)?;
+        return Ok(detail);
     }
     manager()?.update(source_path, approval).await
 }
