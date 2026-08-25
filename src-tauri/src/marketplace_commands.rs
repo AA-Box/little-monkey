@@ -152,6 +152,14 @@ fn safe_marketplace_path(raw: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn claim_marketplace_package_path(collisions: &mut BTreeSet<String>, relative: &Path) -> bool {
+    let key = relative
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    key != "extension.json" && collisions.insert(key)
+}
+
 fn require_main_window(window: &tauri::Window) -> Result<(), String> {
     if window.label() == "main" {
         Ok(())
@@ -507,8 +515,7 @@ fn stage_package(
     let mut collisions = BTreeSet::new();
     for (raw_path, encoded) in envelope.files_base64 {
         let relative = safe_marketplace_path(&raw_path)?;
-        let key = relative.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
-        if !collisions.insert(key) || relative == Path::new("extension.json") {
+        if !claim_marketplace_package_path(&mut collisions, &relative) {
             return Err(format!("Marketplace .lmx contains a duplicate/reserved path: {raw_path}"));
         }
         let bytes = base64::engine::general_purpose::STANDARD
@@ -785,6 +792,23 @@ mod tests {
         assert!(!lease_is_expired(now - STAGING_TTL_MS, now));
         assert!(lease_is_expired(now - STAGING_TTL_MS - 1, now));
         assert!(!lease_is_expired(now + 1, now));
+    }
+
+    #[test]
+    fn package_path_collisions_and_manifest_aliases_fail_closed() {
+        let mut claimed = BTreeSet::new();
+        assert!(!claim_marketplace_package_path(
+            &mut claimed,
+            Path::new("Extension.json")
+        ));
+        assert!(claim_marketplace_package_path(
+            &mut claimed,
+            Path::new("component.wasm")
+        ));
+        assert!(!claim_marketplace_package_path(
+            &mut claimed,
+            Path::new("Component.wasm")
+        ));
     }
 
     #[test]
