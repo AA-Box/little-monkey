@@ -10,23 +10,62 @@ permissions:
 
 jobs:
   finalize:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
           ref: feat/standards-studio
           fetch-depth: 0
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential
       - name: Fix Rust verification messages
         run: |
           python3 - <<'PY'
           from pathlib import Path
           p = Path('src-tauri/src/bin/monkey-cli/agent.rs')
           s = p.read_text()
-          s = s.replace('''        statusln!(\n            options,\n            "\n[verify] running \\\"{}\\\"…",\n            cmd.label\n        );''', '''        statusln!(options, "\\n[verify] running \\\"{}\\\"…", cmd.label);''')
-          s = s.replace('''                        let message = format!(\n                            "{VERIFY_NOTE_PREFIX} The verification command "{}" failed (exit {code_display}). Fix the reported problems, then stop.\n                        {}",\n                            failure.label, protected_output\n                        );\n                        statusln!(\n                            options,\n                            "\n{message}"\n                        );''', '''                        let message = format!(\n                            "{VERIFY_NOTE_PREFIX} The verification command \\\"{}\\\" failed (exit {code_display}). Fix the reported problems, then stop.\\n{}",\n                            failure.label, protected_output\n                        );\n                        statusln!(options, "\\n{message}");''')
-          s = s.replace('''                        let message = format!(\n                            "Completion blocked: required Standards verification "{}" did not pass (exit {code_display}). {}",\n                            failure.label, failure.output\n                        );\n                        statusln!(\n                            options,\n                            "\n{message}"\n                        );''', '''                        let message = format!(\n                            "Completion blocked: required Standards verification \\\"{}\\\" did not pass (exit {code_display}). {}",\n                            failure.label, failure.output\n                        );\n                        statusln!(options, "\\n{message}");''')
-          if 'verification command "{}" failed' in s or 'Standards verification "{}" did not pass' in s:
-              raise SystemExit('malformed Rust verification quote remained')
+          old1 = '''        statusln!(
+            options,
+            "
+[verify] running \\\"{}\\\"…",
+            cmd.label
+        );'''
+          new1 = '''        statusln!(options, "\\n[verify] running \\\"{}\\\"…", cmd.label);'''
+          old2 = '''                        let message = format!(
+                            "{VERIFY_NOTE_PREFIX} The verification command "{}" failed (exit {code_display}). Fix the reported problems, then stop.
+                        {}",
+                            failure.label, protected_output
+                        );
+                        statusln!(
+                            options,
+                            "
+{message}"
+                        );'''
+          new2 = '''                        let message = format!(
+                            "{VERIFY_NOTE_PREFIX} The verification command \\\"{}\\\" failed (exit {code_display}). Fix the reported problems, then stop.\\n{}",
+                            failure.label, protected_output
+                        );
+                        statusln!(options, "\\n{message}");'''
+          old3 = '''                        let message = format!(
+                            "Completion blocked: required Standards verification "{}" did not pass (exit {code_display}). {}",
+                            failure.label, failure.output
+                        );
+                        statusln!(
+                            options,
+                            "
+{message}"
+                        );'''
+          new3 = '''                        let message = format!(
+                            "Completion blocked: required Standards verification \\\"{}\\\" did not pass (exit {code_display}). {}",
+                            failure.label, failure.output
+                        );
+                        statusln!(options, "\\n{message}");'''
+          for label, old, new in [('status', old1, new1), ('feedback', old2, new2), ('gate', old3, new3)]:
+              if old not in s:
+                  raise SystemExit(f'missing Rust correction target: {label}')
+              s = s.replace(old, new, 1)
           p.write_text(s)
           PY
           cargo fmt --manifest-path src-tauri/Cargo.toml
@@ -38,9 +77,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add src-tauri/src/bin/monkey-cli/agent.rs
-          if git diff --cached --quiet; then
-            echo "No source correction required"
-            exit 0
-          fi
           git commit -m "fix: correct Standards verification failure messages"
           git push origin HEAD:feat/standards-studio
