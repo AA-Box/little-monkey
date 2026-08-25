@@ -130,14 +130,18 @@ function nestedPackageTarget(value: unknown): { packageId: string; version: stri
 }
 
 function revocationFor(snapshot: RegistrySnapshot, packageId: string, version: string): string | null {
+  const nowMs = Date.now();
   for (const raw of snapshot.revocations ?? []) {
+    if (!raw || typeof raw !== "object") continue;
+    const record = raw as Record<string, unknown>;
+    // M4 revocations are scheduled. Keep renderer catalog semantics aligned
+    // with the native verifier instead of blocking a release before the signed
+    // effective timestamp has actually arrived.
+    if (typeof record.effective_unix_ms === "number" && record.effective_unix_ms > nowMs) continue;
     const target = nestedPackageTarget(raw);
     if (!target || target.packageId !== packageId) continue;
     if (target.version !== null && target.version !== version) continue;
-    if (raw && typeof raw === "object") {
-      const record = raw as Record<string, unknown>;
-      if (typeof record.reason === "string" && record.reason.trim()) return record.reason.trim();
-    }
+    if (typeof record.reason === "string" && record.reason.trim()) return record.reason.trim();
     return "revoked by the signed M4 registry";
   }
   return null;
