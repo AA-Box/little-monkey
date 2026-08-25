@@ -167,6 +167,61 @@ fn receipt_path(receipt: &MarketplaceProvenanceReceipt) -> Result<PathBuf, Strin
     Ok(provenance_root()?.join(format!("{}.json", receipt_identity_key(receipt))))
 }
 
+#[cfg(unix)]
+fn replace_provenance_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(temporary, destination)
+}
+
+#[cfg(windows)]
+fn replace_provenance_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+
+    for _ in 0..80 {
+        // SAFETY: both buffers are owned, NUL-terminated UTF-16 strings and
+        // remain alive for this synchronous Win32 call.
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                target.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } != 0
+        {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_ACCESS_DENIED as i32 || code == ERROR_SHARING_VIOLATION as i32
+        ) {
+            return Err(error);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Err(std::io::Error::last_os_error())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_provenance_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(temporary, destination)
+}
+
 fn atomic_write_json(path: &Path, receipt: &MarketplaceProvenanceReceipt) -> Result<(), String> {
     let parent = path
         .parent()
@@ -178,7 +233,7 @@ fn atomic_write_json(path: &Path, receipt: &MarketplaceProvenanceReceipt) -> Res
     let result = (|| -> Result<(), String> {
         fs::write(&temp, bytes)
             .map_err(|error| format!("Cannot write marketplace provenance receipt: {error}"))?;
-        fs::rename(&temp, path)
+        replace_provenance_file(&temp, path)
             .map_err(|error| format!("Cannot commit marketplace provenance receipt: {error}"))?;
         Ok(())
     })();
@@ -414,5 +469,30 @@ mod tests {
             "other-registry",
         )
         .is_err());
+    }
+
+    #[test]
+    fn atomic_receipt_write_replaces_existing_state() {
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-marketplace-provenance-test-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create test provenance root");
+        let path = root.join("receipt.json");
+
+        let mut receipt = sample_receipt();
+        atomic_write_json(&path, &receipt).expect("write authorized receipt");
+        receipt.state = ReceiptState::Committed;
+        receipt.committed_unix_ms = Some(30);
+        atomic_write_json(&path, &receipt).expect("replace committed receipt");
+
+        let stored: MarketplaceProvenanceReceipt = serde_json::from_slice(
+            &fs::read(&path).expect("read committed receipt"),
+        )
+        .expect("decode committed receipt");
+        assert_eq!(stored.state, ReceiptState::Committed);
+        assert_eq!(stored.committed_unix_ms, Some(30));
+
+        fs::remove_dir_all(&root).expect("remove test provenance root");
     }
 }
