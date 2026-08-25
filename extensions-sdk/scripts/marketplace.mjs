@@ -24,24 +24,32 @@ export function canonical(value) {
 
 function safeRelative(relative) {
   const normalized = relative.split(path.sep).join("/");
-  if (!normalized || normalized.length > MAX_PATH_CHARS || normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized)) throw new Error(`unsafe package path: ${relative}`);
+  if (!normalized || normalized.length > MAX_PATH_CHARS || normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized) || !/^[\x00-\x7F]+$/.test(normalized)) throw new Error(`unsafe package path: ${relative}`);
   const parts = normalized.split("/");
   if (parts.some((part) => !part || part === "." || part === "..")) throw new Error(`unsafe package path: ${relative}`);
   return normalized;
 }
 
-async function collectFiles(root, directory = root, output = []) {
+function claimPackagePath(collisions, relative) {
+  const key = relative.toLowerCase();
+  if (key === "extension.json" || collisions.has(key)) return false;
+  collisions.add(key);
+  return true;
+}
+
+async function collectFiles(root, directory = root, output = [], collisions = new Set()) {
   for (const entry of (await readdir(directory)).sort()) {
     const absolute = path.join(directory, entry);
     const stat = await lstat(absolute);
     if (stat.isSymbolicLink()) throw new Error(`symlinks are not permitted in .lmx packages: ${absolute}`);
     if (stat.isDirectory()) {
-      await collectFiles(root, absolute, output);
+      await collectFiles(root, absolute, output, collisions);
       continue;
     }
     if (!stat.isFile()) throw new Error(`unsupported package entry: ${absolute}`);
     const relative = safeRelative(path.relative(root, absolute));
     if (relative === "extension.json") continue;
+    if (!claimPackagePath(collisions, relative)) throw new Error(`duplicate/reserved package path: ${relative}`);
     if (stat.size > MAX_FILE_BYTES) throw new Error(`${relative} exceeds the per-file .lmx limit`);
     output.push({ absolute, relative, size: stat.size });
     if (output.length > MAX_FILES) throw new Error(`.lmx package exceeds ${MAX_FILES} files`);
