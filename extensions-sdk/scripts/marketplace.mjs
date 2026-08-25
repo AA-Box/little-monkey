@@ -23,7 +23,7 @@ export function canonical(value) {
 }
 
 function safeRelative(relative) {
-  const normalized = relative.split(path.sep).join("/");
+  const normalized = relative.replaceAll("\\", "/");
   if (!normalized || normalized.length > MAX_PATH_CHARS || normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized) || !/^[\x00-\x7F]+$/.test(normalized)) throw new Error(`unsafe package path: ${relative}`);
   const parts = normalized.split("/");
   if (parts.some((part) => !part || part === "." || part === "..")) throw new Error(`unsafe package path: ${relative}`);
