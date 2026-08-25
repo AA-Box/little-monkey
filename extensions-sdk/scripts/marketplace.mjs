@@ -170,7 +170,7 @@ async function main() {
   }
   if (command === "sign-registry") {
     const [snapshotPath, privateKeyPath] = args;
-    if (!snapshotPath || !privateKeyPath) throw new Error("usage: marketplace.mjs sign-registry <m4-snapshot.json> <ed25519-private-key.pem> <trust-root-id> <key-id>");
+    if (!snapshotPath || !privateKeyPath) throw new Error("usage: marketplace.mjs sign-registry <m4-snapshot.json> <ed25519-private-key.pem>");
     process.stdout.write(`${await signRegistry(snapshotPath, privateKeyPath)}\n`);
     return;
   }
