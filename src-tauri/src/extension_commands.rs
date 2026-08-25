@@ -43,7 +43,17 @@ pub async fn extensions_list(
     window: tauri::Window,
     state: tauri::State<'_, crate::m4_commands::M4CommandState>,
     refresh_marketplace: Option<bool>,
+    cleanup_marketplace_handle: Option<String>,
 ) -> Result<Vec<ExtensionDetail>, String> {
+    if let Some(handle) = cleanup_marketplace_handle {
+        if window.label() != "main" {
+            return Err("Marketplace staging cleanup is allowed only from the main window".to_string());
+        }
+        if !handle.starts_with(MARKETPLACE_HANDLE_PREFIX) {
+            return Err("Invalid marketplace staging handle".to_string());
+        }
+        marketplace_commands::marketplace_cleanup_extension(handle)?;
+    }
     if refresh_marketplace.unwrap_or(false) {
         marketplace_commands::marketplace_refresh_registries(window, state).await?;
     }
