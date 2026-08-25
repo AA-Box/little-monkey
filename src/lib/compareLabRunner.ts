@@ -13,10 +13,7 @@
  * prompt opts in, only the read-only `explore` tool profile
  * (`read_file`/`list_dir`/`glob`/`grep`) is ever offered — no mutating tool,
  * `task`, `skill`, or MCP tool is reachable from a lab run at all, regardless
- * of what any individual suite prompt requests. `compareLabRunner.test.ts`
- * pins both halves of this: a default-mode prompt whose model hallucinates a
- * tool call never reaches `invoke`, and an explicit opt-in prompt's tool call
- * does reach it (proving the gate is a real switch, not dead code).
+ * of what any individual suite prompt requests.
  */
 import { resolveTarget, preflightTarget } from "./compareRunner";
 import {
@@ -28,6 +25,11 @@ import {
 } from "./turnEngine";
 import type { ChatMessage } from "./llamaClient";
 import { currentSystemPrompt } from "./systemPrompt";
+import {
+  EMPTY_FROZEN_STANDARDS_CONTEXT,
+  freezeStandardsForTask,
+  type FrozenStandardsContext,
+} from "./standardsExecution";
 import { toolsForProfile } from "./tools";
 import { isLocalExecutionTarget } from "./comparisonPlan";
 import type { McpToolRegistry } from "./mcpTools";
@@ -48,22 +50,8 @@ import type { ModelTargetSnapshot } from "./modelTargets";
 import { useCompareLabStore } from "../store/compareLabStore";
 import { errorMessage } from "./errors";
 
-/** Synthetic session id passed to `attemptStream` purely so provider
- * rate-limit tracking has something to key on — Lab runs never write into
- * `useUsageStore`/`useUsageHistoryStore` (see `recordUsage: false` below),
- * so nothing user-visible is keyed by this id. */
 const LAB_SESSION_ID = "compare-lab";
-
-/** Hard cap on tool-calling rounds for a tools-enabled prompt, mirroring the
- * bounded-loop shape `agentLoop.ts`'s own turn loop uses (a different,
- * larger cap there) — prevents a runaway model from looping forever inside
- * one batched pair. */
 const MAX_TOOL_ROUNDS = 4;
-
-/** No MCP server is ever reachable from a lab run — this empty registry is
- * threaded through so `executeToolCall`'s `mcp__`-prefixed dispatch branch is
- * simply unreachable (no name in `EXPLORE_PROFILE_TOOL_NAMES` starts with
- * `mcp__`), never because of any live connection state. */
 const EMPTY_MCP_REGISTRY: McpToolRegistry = new Map();
 
 export interface LabRunHandle {
@@ -74,16 +62,17 @@ export interface LabRunHandle {
 const runControllers = new Map<string, AbortController>();
 
 function toolsFor(prompt: LabPrompt) {
-  // The ONLY place `compareLabRunner.ts` decides whether any tool schema is
-  // offered at all. Everything else in this module treats `tools` as an
-  // opaque list handed to `attemptStream`/`executeToolCall` — there is no
-  // fallback path anywhere below that widens this beyond the read-only
-  // `explore` profile, even for an opted-in prompt.
   return prompt.toolsEnabled ? toolsForProfile("explore") : [];
 }
 
-function labSystemPrompt(toolsEnabled: boolean): string {
-  const base = currentSystemPrompt(null, [], false);
+function labSystemPrompt(toolsEnabled: boolean, standards: FrozenStandardsContext): string {
+  const base = currentSystemPrompt(
+    null,
+    [],
+    false,
+    standards.promptSection,
+    standards.checkerCommandIds.length > 0,
+  );
   const suffix = toolsEnabled
     ? [
         "",
@@ -107,17 +96,13 @@ function addUsage(a: LabUsage | null, b: LabUsage | undefined): LabUsage | null 
   };
 }
 
-/** Runs exactly one (prompt, target) pair to completion and writes every
- * intermediate/final state into `compareLabStore` as it goes, so the UI can
- * render partial progress live instead of only after the whole suite
- * finishes. Never throws — every failure mode (unavailable target, stream
- * error, aborted) is recorded as a terminal `LabResult` instead. */
 async function runLabPair(
   runId: string,
   prompt: LabPrompt,
   target: ModelTargetSnapshot,
   costRate: LabCostRate | undefined,
   signal: AbortSignal,
+  standards: FrozenStandardsContext,
 ): Promise<void> {
   const store = useCompareLabStore.getState();
   const toolsOffered = prompt.toolsEnabled === true;
@@ -161,7 +146,7 @@ async function runLabPair(
 
   const tools = toolsFor(prompt);
   const wireHistory: ChatMessage[] = [
-    { role: "system", content: labSystemPrompt(toolsOffered) },
+    { role: "system", content: labSystemPrompt(toolsOffered, standards) },
     { role: "user", content: prompt.text },
   ];
   const toolAttempts: LabToolAttempt[] = [];
@@ -211,12 +196,6 @@ async function runLabPair(
       return;
     }
 
-    // The model asked for a tool. Every attempt is recorded regardless of
-    // whether it was actually offered — the whole point of `allowed` below
-    // is to make a hallucinated call outside the offered schema (or ANY call
-    // at all under a default no-tools prompt, since `tools` is `[]` there
-    // and nothing can ever be `allowed`) visible in the report rather than
-    // silently dropped.
     wireHistory.push({ role: "assistant", content: result.content, tool_calls: result.toolCalls });
     for (const toolCall of result.toolCalls) {
       const allowed = isToolCallAllowed(toolCall, tools);
@@ -244,12 +223,6 @@ async function runLabPair(
     }
 
     if (!toolsOffered) {
-      // A default (tools-off) prompt whose model still emitted a tool call:
-      // every attempt above was rejected without execution. Stop here rather
-      // than looping the rejection back for more rounds — this is reported
-      // as a failed pair (blocked tool use), consistent with how the
-      // existing single-shot Compare flow treats the same situation in
-      // `compareRunner.ts`'s `runBranch`.
       finalize({
         status: "failed",
         error: "The model requested a tool in a default (tools-off) Compare Lab run; no tool was executed.",
@@ -262,7 +235,6 @@ async function runLabPair(
     }
   }
 
-  // Exhausted MAX_TOOL_ROUNDS while tools stayed in play the whole time.
   const verifierOutcome = evaluateVerifier(prompt.verifier, content);
   finalize({
     status: "completed",
@@ -275,17 +247,6 @@ async function runLabPair(
   });
 }
 
-/** Starts a full suite run: every (prompt, target) pair in `suite.prompts` ×
- * `modelSet.targets`. Remote-execution targets (providers, cloud Ollama tags)
- * all run fully concurrently; any local-execution target (local llama.cpp,
- * non-cloud Ollama — see `comparisonPlan.ts`'s `isLocalExecutionTarget`) is
- * always serialized, one pair at a time, for the whole run — a simpler,
- * strictly more conservative rule than `comparisonPlan.ts`'s per-comparison
- * memory-budget planner (which only serializes when an estimate actually
- * exceeds available memory): a lab run can cover many more prompts than a
- * single comparison, so this never risks two local runtimes resident at
- * once, at the cost of sometimes serializing when concurrent local execution
- * would in fact have fit. */
 export function startLabRun(
   suite: BenchmarkSuite,
   modelSet: ModelSet,
@@ -304,15 +265,40 @@ export function startLabRun(
 
   const done = (async () => {
     try {
+      // Freeze once per suite prompt before any pair starts. Every model that
+      // evaluates the same prompt therefore sees the same approved versions,
+      // even if Standards Studio changes while the batch is running.
+      const standardsContexts = new Map<string, FrozenStandardsContext>(
+        await Promise.all(
+          run.prompts.map(async (prompt) => [prompt.id, await freezeStandardsForTask(prompt.text)] as const),
+        ),
+      );
+      const standardsFor = (prompt: LabPrompt) =>
+        standardsContexts.get(prompt.id) ?? EMPTY_FROZEN_STANDARDS_CONTEXT;
+
       const remoteWork = run.prompts.flatMap((prompt) =>
-        remoteTargets.map((target) => runLabPair(run.id, prompt, target, costRates[target.key], controller.signal)),
+        remoteTargets.map((target) => runLabPair(
+          run.id,
+          prompt,
+          target,
+          costRates[target.key],
+          controller.signal,
+          standardsFor(prompt),
+        )),
       );
       const remoteDone = Promise.allSettled(remoteWork);
 
       for (const target of localTargets) {
         for (const prompt of run.prompts) {
           if (controller.signal.aborted) break;
-          await runLabPair(run.id, prompt, target, costRates[target.key], controller.signal);
+          await runLabPair(
+            run.id,
+            prompt,
+            target,
+            costRates[target.key],
+            controller.signal,
+            standardsFor(prompt),
+          );
         }
       }
 
@@ -326,8 +312,6 @@ export function startLabRun(
   return { runId: run.id, done };
 }
 
-/** Aborts every still-in-flight pair of a run. Already-finished pairs keep
- * their recorded terminal state; in-flight pairs are marked `cancelled`. */
 export function stopLabRun(runId: string): void {
   runControllers.get(runId)?.abort();
 }

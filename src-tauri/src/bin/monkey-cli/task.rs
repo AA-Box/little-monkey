@@ -5850,7 +5850,7 @@ async fn run_inner(
     }
 
     let turn_future = async {
-        if recipe.desktop_turn.is_some() {
+        if let Some(snapshot) = recipe.desktop_turn.as_ref() {
             crate::agent::run_prepared_turn_with_max_iterations(
                 client,
                 &target,
@@ -5863,6 +5863,7 @@ async fn run_inner(
                 &attached_stacks,
                 Some(max_iterations),
                 mutation_required,
+                &snapshot.tool_profile.standards_checker_command_ids,
             )
             .await
         } else {
@@ -6068,6 +6069,7 @@ mod tests {
             web_tools_enabled: false,
             verify_enabled: true,
             verify_max_rounds: 3,
+            standards_checker_command_ids: Vec::new(),
             subagents_enabled: false,
         };
         let options = desktop_chat_options(

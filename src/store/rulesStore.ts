@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { useStandardsStore } from "./standardsStore";
 
 /**
  * Mirrors the Rust `RuleFile` struct (src-tauri/src/rules.rs) exactly —
@@ -46,7 +47,9 @@ export interface RulesStore {
   facts: MemoryFact[];
   /** Re-fetch `rules` and `facts` from the backend. Cheap (local file reads),
    * safe to call once per turn so external edits to MONKEY.md (and newly
-   * remembered facts) are picked up without a file watcher. */
+   * remembered facts) are picked up without a file watcher. Standards Studio
+   * piggybacks on this existing turn boundary so approved standards refresh
+   * without adding a parallel orchestration lifecycle. */
   refresh: () => Promise<void>;
 }
 
@@ -73,15 +76,14 @@ export const useRulesStore = create<RulesStore>((set) => ({
     // dropped instead of overwriting fresher state.
     const requestId = ++latestRefreshRequest;
 
-    // A broken MONKEY.md/memories.json (or, transiently, no workspace open
-    // yet) must never block a turn from proceeding — same "never a hard
-    // error" philosophy as `rules.rs`/`memory.rs`'s own reads. Falling back to
-    // `[]` just means this turn's prompt carries no rules/facts, not that the
-    // turn fails. The two calls fail independently so a broken one doesn't
-    // wipe out the other.
+    // A broken MONKEY.md/memories.json/standards index (or, transiently, no
+    // workspace open yet) must never block a turn from proceeding. The three
+    // reads fail independently so a broken optional source cannot wipe out or
+    // block the others.
     const [rules, facts] = await Promise.all([
       invoke<RuleFile[]>("rules_read").catch(() => [] as RuleFile[]),
       invoke<MemoryFact[]>("memory_list").catch(() => [] as MemoryFact[]),
+      useStandardsStore.getState().refresh().catch(() => undefined),
     ]);
 
     if (requestId !== latestRefreshRequest) return;
