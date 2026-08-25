@@ -33,7 +33,7 @@ export interface StandardRevision {
   evidence: StandardEvidence[];
   content_sha256: string;
   recorded_at_ms: number;
-  reason: "rediscovered" | "approved_revision" | "imported_revision";
+  reason: "rediscovered" | "approved_revision" | "imported_revision" | "rejected_revision";
 }
 
 /** A proposed replacement for the active approved policy. Rediscovery/import
@@ -148,10 +148,6 @@ function validateStandard(value: unknown): asserts value is EngineeringStandard 
   if (typeof standard.confidence !== "number" || standard.confidence < 0 || standard.confidence > 1) throw new Error(`Standard ${standard.standard_id} has invalid confidence.`);
   if (!/^[a-f0-9]{64}$/i.test(standard.content_sha256 ?? "")) throw new Error(`Standard ${standard.standard_id} has an invalid content digest.`);
 
-  // Backward-compatible normalization for documents written by the first
-  // Standards Studio slice. Keeping schema_version=1 avoids invalidating
-  // already committed portable files while making the new lifecycle fields
-  // concrete everywhere after the next save.
   if (!Array.isArray(standard.revision_history)) standard.revision_history = [];
   if (standard.pending_revision === undefined) standard.pending_revision = null;
   if (!Array.isArray(standard.checker_command_ids)) standard.checker_command_ids = [];
@@ -231,10 +227,6 @@ function activeConflictIds(standards: EngineeringStandard[]): Set<string> {
   return conflicts;
 }
 
-/** Marks explicit active conflicts without trying to infer policy conflict from
- * natural-language wording. Rejected/deprecated/stale standards do not keep a
- * conflict alive, so resolving one side restores the other side's prior
- * approved/candidate lifecycle on the next explicit approval/discovery. */
 export function detectStandardConflicts(standards: EngineeringStandard[]): EngineeringStandard[] {
   const activeIds = new Set(
     standards
@@ -269,8 +261,6 @@ export function selectStandards(
   for (const standard of standards) {
     if (standard.status !== "approved") continue;
     if (standard.drift === "contradicted" || standard.drift === "not_applicable") continue;
-    // Never resolve two approved contradictory policies by arbitrary ranking.
-    // Conflict resolution is a lifecycle action in Standards Studio.
     if (conflicts.has(standard.standard_id)) continue;
 
     let score = standard.severity === "required" ? 80 : standard.severity === "recommended" ? 35 : 10;
@@ -304,8 +294,6 @@ export function selectStandards(
       reasons.push(`files: ${matchingFiles.slice(0, 3).join(", ")}`);
     }
 
-    // Required standards are repository-wide gates. Recommendations and
-    // informational conventions must be relevant to this concrete task.
     if (standard.severity !== "required" && !matched) continue;
     if (standard.drift === "weakened" || standard.drift === "unknown") score -= 10;
 
@@ -374,10 +362,6 @@ function sameApplicability(left: StandardApplicability, right: StandardApplicabi
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-/** Evidence hashes are deliberately excluded: evidence drift is tracked by
- * `drift`, while policy revision identity is title/body/applicability/severity.
- * This prevents an ordinary source-file edit from manufacturing a new policy
- * version by changing only an evidence SHA. */
 export function sameStandardPolicy(left: EngineeringStandard, right: EngineeringStandard): boolean {
   return left.title === right.title
     && left.body === right.body
@@ -418,8 +402,6 @@ export function mergeDiscoveredStandards(
       const policyChanged = !sameStandardPolicy(existing, candidate);
       byId.set(candidate.standard_id, {
         ...existing,
-        // Active approved evidence belongs to the approved snapshot. The new
-        // evidence lives on the proposal until the user accepts that revision.
         confidence: candidate.confidence,
         last_verified_at_ms: candidate.last_verified_at_ms,
         drift: policyChanged ? "weakened" : "healthy",
