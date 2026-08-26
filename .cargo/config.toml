@@ -1,0 +1,5 @@
+# whisper-rs ships version-matched bindings. Using them keeps Little Monkey builds
+# independent of a system libclang installation and is required by the pinned
+# Windows ARM64 fork. whisper.cpp itself is still compiled into the application.
+[env]
+WHISPER_DONT_GENERATE_BINDINGS = "1"
