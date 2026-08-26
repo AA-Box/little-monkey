@@ -819,6 +819,23 @@ impl Default for AppState {
     }
 }
 
+/// Whether any window the user can actually see is still open.
+///
+/// `is_visible` is what separates a window that was closed from one that was
+/// only hidden: hiding leaves the window alive in `webview_windows()`, which is
+/// why counting windows instead of visible ones keeps the app running with
+/// nothing on screen.
+///
+/// A minimized window counts as one the user still has. `is_visible` is
+/// `NSWindow.isVisible` on macOS, which a miniaturized window answers `false`
+/// — so without the `is_minimized` arm, closing one window while another sits
+/// in the Dock would quit the app and take that window with it.
+fn any_window_visible<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
+    app.webview_windows().values().any(|window| {
+        window.is_visible().unwrap_or(false) || window.is_minimized().unwrap_or(false)
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let full_product_e2e = std::env::var("COMPUTER_USE_FULL_PRODUCT_E2E").as_deref() == Ok("1");
@@ -2032,6 +2049,23 @@ pub fn run() {
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {
+        // Closing the last window a user can see must quit the app. Windows
+        // the app hides rather than closes — `companion-overlay` is hidden on
+        // dismiss (see `m7_companion::hide_overlay`) and built with
+        // `skip_taskbar(true)` — still count as live windows to the runtime,
+        // so without this the process survives its own UI: menu bar owned, no
+        // window on screen, and a dock click that opens nothing because
+        // `RunEvent::Reopen` goes unhandled.
+        if let tauri::RunEvent::WindowEvent {
+            event: tauri::WindowEvent::Destroyed,
+            ..
+        } = &event
+        {
+            if !any_window_visible(app_handle) {
+                app_handle.exit(0);
+            }
+        }
+
         // `App::run` never returns — once the event loop is done, the
         // underlying `tao` runtime calls `std::process::exit` directly
         // (see its own doc comment), which skips Rust's Drop-based cleanup
