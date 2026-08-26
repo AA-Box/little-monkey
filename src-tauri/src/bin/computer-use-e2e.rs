@@ -296,6 +296,49 @@ fn inspect_until_dark_state(
     ))
 }
 
+fn inspect_until_fixture_controls_ready(
+    state: &DesktopControlState,
+    session_id: &str,
+    target: &ComputerTarget,
+) -> Result<ComputerInspection, String> {
+    // macOS Accessibility can expose the window before its descendants have
+    // finished entering the AX tree. Treat that as startup latency rather than
+    // a product failure, but keep the acceptance strict: both the sensitive
+    // control and disabled-state semantics must become observable within the
+    // bounded deadline or the test still fails with useful evidence.
+    let mut latest = inspect(state, session_id, target)?;
+    for attempt in 0..20 {
+        let secure = latest.sensitive_element_count > 0;
+        let disabled = latest
+            .elements
+            .iter()
+            .any(|element| element.label == "Disabled button" && !element.enabled);
+        if secure && disabled {
+            return Ok(latest);
+        }
+        if attempt < 19 {
+            thread::sleep(Duration::from_millis(250));
+            latest = inspect(state, session_id, target)?;
+        }
+    }
+
+    let disabled_candidates = latest
+        .elements
+        .iter()
+        .filter(|element| element.label.to_ascii_lowercase().contains("disabled"))
+        .map(|element| {
+            format!(
+                "id={} role={} label={:?} enabled={} value={:?}",
+                element.id, element.role, element.label, element.enabled, element.value
+            )
+        })
+        .collect::<Vec<_>>();
+    Err(format!(
+        "production provider did not expose secure and disabled controls after 5s: sensitive_element_count={}, disabled_candidates={disabled_candidates:?}",
+        latest.sensitive_element_count
+    ))
+}
+
 fn saved_state_observed(inspection: &ComputerInspection) -> bool {
     inspection.elements.iter().any(|element| {
         element.label.trim().eq_ignore_ascii_case("saved")
@@ -742,17 +785,7 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
                 "window-scoped grant accepted a second same-application window".to_string(),
             );
         }
-        let first = inspect(&state, &session.session_id, &target)?;
-        let secure = first.sensitive_element_count > 0;
-        let disabled = first
-            .elements
-            .iter()
-            .any(|element| element.label == "Disabled button" && !element.enabled);
-        if !secure || !disabled {
-            return Err(
-                "production provider did not expose secure and disabled controls".to_string(),
-            );
-        }
+        let first = inspect_until_fixture_controls_ready(&state, &session.session_id, &target)?;
         let model_trace =
             model_facing_golden_flow(&state, &session, &target, screenshot_path, &profile_value)?;
         if let Some(evidence) = mixed_evidence.as_mut() {
