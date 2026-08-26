@@ -71,16 +71,17 @@ jobs:
           PY
           cargo fmt --manifest-path src-tauri/Cargo.toml
           git diff --check
-      - name: Verify Rust library compiles
+      - name: Compile and preserve diagnostics
         shell: bash
         run: |
           node scripts/ensure-cli-sidecar-placeholder.mjs
-          cargo check --manifest-path src-tauri/Cargo.toml --lib
-      - name: Commit source fix
-        shell: bash
-        run: |
+          set +e
+          cargo check --manifest-path src-tauri/Cargo.toml --lib 2>&1 | tee .github/pr448-cargo-check.log
+          status=${PIPESTATUS[0]}
+          set -e
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src-tauri/src/daemon_commands.rs
+          git add src-tauri/src/daemon_commands.rs .github/pr448-cargo-check.log
           git commit -m "fix: repair remote execution target typing"
           git push origin HEAD:fix/remote-execution-e2e-ssh-remotenode
+          exit "$status"
