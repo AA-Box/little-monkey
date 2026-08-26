@@ -8409,11 +8409,15 @@ mod tests {
     /// normal condition for a read-only task, and must not be read as the
     /// task having been pre-solved.
     fn read_only_verification_command() -> crate::verify::VerifyCommand {
+        #[cfg(target_os = "windows")]
+        let command = r#"if exist "src\uploader.rs" (exit /b 0) else (exit /b 1)"#;
+        #[cfg(not(target_os = "windows"))]
+        let command = "test -f src/uploader.rs";
         crate::verify::VerifyCommand {
             id: "verify-1".to_string(),
             label: "sources present".to_string(),
             kind: "test".to_string(),
-            command: "test -f src/uploader.rs".to_string(),
+            command: command.to_string(),
             enabled: true,
             timeout_secs: Some(30),
         }
@@ -9102,11 +9106,15 @@ mod tests {
     }
 
     fn verification_command() -> crate::verify::VerifyCommand {
+        #[cfg(target_os = "windows")]
+        let command = r#"findstr /L /C:"with_retry(" src\uploader.rs > nul"#;
+        #[cfg(not(target_os = "windows"))]
+        let command = "grep -q 'with_retry(' src/uploader.rs";
         crate::verify::VerifyCommand {
             id: "verify-1".to_string(),
             label: "retry present".to_string(),
             kind: "test".to_string(),
-            command: "grep -q 'with_retry(' src/uploader.rs".to_string(),
+            command: command.to_string(),
             enabled: true,
             timeout_secs: Some(30),
         }

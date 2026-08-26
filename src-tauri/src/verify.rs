@@ -994,7 +994,7 @@ pub(crate) mod tests {
         let state = AppState::default();
         let cwd = temp_path("cwd_timeout");
         std::fs::create_dir_all(&cwd).unwrap();
-        let mut cmd = command("c1", "sleep 30");
+        let mut cmd = command("c1", &long_running_command());
         cmd.timeout_secs = Some(1);
 
         let started = Instant::now();
@@ -1089,7 +1089,7 @@ pub(crate) mod tests {
         let cwd = temp_path("cwd_row_breach");
         std::fs::create_dir_all(&cwd).unwrap();
         let projector = crate::test_support::RecordingProjector::shared();
-        let mut cmd = command("c1", "sleep 30");
+        let mut cmd = command("c1", &long_running_command());
         cmd.timeout_secs = Some(1);
 
         let result = run_command_impl(&state, &cwd, &cmd, None, projector.clone()).await;
@@ -1123,7 +1123,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let projector = crate::test_support::RecordingProjector::shared();
         let turn_id = "turn-cancel-row".to_string();
-        let cmd = command("c1", "sleep 30");
+        let cmd = command("c1", &long_running_command());
 
         let cancel = state
             .tool_cancel
@@ -1353,7 +1353,7 @@ pub(crate) mod tests {
         let state = AppState::default();
         let cwd = temp_path("cwd_cancel");
         std::fs::create_dir_all(&cwd).unwrap();
-        let cmd = command("c1", "sleep 30");
+        let cmd = command("c1", &long_running_command());
         let turn_id = "turn-1".to_string();
 
         // Pre-seed the cancel channel for this turn (mirrors what
