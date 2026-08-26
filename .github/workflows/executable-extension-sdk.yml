@@ -145,9 +145,14 @@ jobs:
           grep -q 'extension.dev.example.e2e' "$REGISTRY/index.json"
           node --input-type=module - "$RUNNER_TEMP/published.lmx" <<'NODE'
           import { readFile } from "node:fs/promises";
-          import { validateLmxEnvelope } from "./src/lib/extensionMarketplace.ts";
+          import { canonical, LMX_SCHEMA_VERSION } from "./extensions-sdk/scripts/marketplace.mjs";
           const path = process.argv[2];
-          validateLmxEnvelope(JSON.parse(await readFile(path, "utf8")));
+          const raw = await readFile(path, "utf8");
+          const envelope = JSON.parse(raw);
+          if (raw !== canonical(envelope)) throw new Error("CLI package is not canonical .lmx JSON");
+          if (envelope.schema_version !== LMX_SCHEMA_VERSION) throw new Error("wrong .lmx schema");
+          if (!envelope.manifest?.signature?.signature_hex) throw new Error("published manifest is unsigned");
+          if (!envelope.files_base64?.[envelope.manifest.component.path]) throw new Error("published component is missing");
           NODE
 
   arm-host-runtime:
