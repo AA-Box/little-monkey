@@ -5,7 +5,36 @@ use little_monkey_lib::execution_target::{
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+struct TestTempDir {
+    path: PathBuf,
+}
+
+impl TestTempDir {
+    fn new(label: &str) -> Self {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "little-monkey-ssh-e2e-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create SSH E2E temp directory");
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TestTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
 
 fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set when SSH E2E is required"))
@@ -107,7 +136,7 @@ fn real_ssh_runner_covers_transfer_reconnect_result_pause_resume_and_cancel() {
     assert!(snapshot.identity.capabilities.shell);
     assert!(snapshot.identity.capabilities.disposable_workspace);
 
-    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = TestTempDir::new("reconnect");
     std::fs::write(workspace.path().join("input.txt"), b"from-client\n").unwrap();
     let handle = submit(
         &first,
@@ -160,7 +189,7 @@ fn real_ssh_runner_covers_transfer_reconnect_result_pause_resume_and_cancel() {
             artifact.label == "result.txt" && artifact.sha256 == result_file.sha256
         }));
 
-    let pause_workspace = tempfile::tempdir().expect("pause workspace");
+    let pause_workspace = TestTempDir::new("pause");
     std::fs::write(pause_workspace.path().join("input.txt"), b"pause\n").unwrap();
     let pause_handle = submit(
         &reconnected,
@@ -201,7 +230,7 @@ fn real_ssh_runner_covers_transfer_reconnect_result_pause_resume_and_cancel() {
         TargetRunStatus::Succeeded
     );
 
-    let cancel_workspace = tempfile::tempdir().expect("cancel workspace");
+    let cancel_workspace = TestTempDir::new("cancel");
     std::fs::write(cancel_workspace.path().join("input.txt"), b"cancel\n").unwrap();
     let cancel_handle = submit(
         &reconnected,
