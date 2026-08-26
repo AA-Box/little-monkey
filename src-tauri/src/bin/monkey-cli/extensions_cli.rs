@@ -1,5 +1,9 @@
-//! Headless lifecycle surface for the same executable-extension manager used
-//! by Settings > Extensions. Secrets are read from stdin, never argv.
+//! Headless executable-extension lifecycle and developer tooling.
+//! Runtime secrets are read from stdin, never argv. Developer signing keys are
+//! referenced by path and are never imported into the application's trust store.
+
+#[path = "extension_dev_cli.rs"]
+mod extension_dev_cli;
 
 use little_monkey_lib::executable_extensions::{
     Approval, ExtensionManager, InvocationRequest, PermissionGrant,
@@ -10,6 +14,98 @@ use std::path::{Path, PathBuf};
 
 #[derive(clap::Subcommand, Debug)]
 pub enum ExtensionsCmd {
+    /// Create a standalone compilable extension project.
+    Init {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long = "id")]
+        extension_id: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, value_enum, default_value_t = extension_dev_cli::DevTemplate::Tool)]
+        template: extension_dev_cli::DevTemplate,
+        #[arg(long, default_value = "Local Developer")]
+        publisher: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Build, validate, launch in an isolated development profile, stream logs,
+    /// and hot-restart when project files change.
+    Dev {
+        #[arg(default_value = ".")]
+        source: PathBuf,
+        #[arg(long)]
+        capability: Option<String>,
+        /// JSON input or @PATH for the optional capability invocation.
+        #[arg(long, default_value = "{}")]
+        input: String,
+        /// Build/start once instead of watching for changes.
+        #[arg(long)]
+        once: bool,
+    },
+    /// Run extension.test.json/extension.tests.json conformance in an isolated profile.
+    Test {
+        #[arg(default_value = ".")]
+        source: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate a project/bundle path or an already-installed extension id.
+    Validate {
+        target: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Build and deterministically package an extension as .lmx.
+    Pack {
+        #[arg(default_value = ".")]
+        source: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Sign a deterministic .lmx using an Ed25519 PKCS#8 PEM publisher key.
+    Sign {
+        package: PathBuf,
+        #[arg(long = "private-key")]
+        private_key: PathBuf,
+        #[arg(long = "trust-root-id")]
+        trust_root_id: String,
+        #[arg(long = "key-id")]
+        key_id: String,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run conformance, build, sign, publish to a static M4 registry and re-sign
+    /// the registry snapshot. Registry and publisher private keys remain outside
+    /// the application and are only read for this explicit command.
+    Publish {
+        #[arg(default_value = ".")]
+        source: PathBuf,
+        #[arg(long)]
+        snapshot: PathBuf,
+        #[arg(long = "registry-root")]
+        registry_root: PathBuf,
+        #[arg(long = "publisher-private-key")]
+        publisher_private_key: PathBuf,
+        #[arg(long = "trust-root-id")]
+        trust_root_id: String,
+        #[arg(long = "key-id")]
+        key_id: String,
+        #[arg(long = "registry-private-key")]
+        registry_private_key: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, default_value_t = 24)]
+        refresh_hours: u64,
+        #[arg(long, default_value_t = 7)]
+        expiry_days: u64,
+        #[arg(long)]
+        json: bool,
+    },
     Discover {
         source: PathBuf,
         #[arg(long)]
@@ -38,11 +134,6 @@ pub enum ExtensionsCmd {
         allow_untrusted: bool,
         #[arg(long)]
         allow_high_risk: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    Validate {
-        extension_id: String,
         #[arg(long)]
         json: bool,
     },
@@ -140,6 +231,81 @@ pub enum ExtensionsCmd {
 pub async fn run(action: &ExtensionsCmd, app_data: &Path) -> Result<(), String> {
     let manager = ExtensionManager::new(app_data)?;
     match action {
+        ExtensionsCmd::Init {
+            path,
+            extension_id,
+            name,
+            template,
+            publisher,
+            json,
+        } => extension_dev_cli::init(
+            path,
+            extension_id.as_deref(),
+            name.as_deref(),
+            *template,
+            publisher,
+            *json,
+        ),
+        ExtensionsCmd::Dev {
+            source,
+            capability,
+            input,
+            once,
+        } => extension_dev_cli::dev(source, capability.as_deref(), input, *once).await,
+        ExtensionsCmd::Test { source, json } => {
+            extension_dev_cli::test_extension(source, *json).await
+        }
+        ExtensionsCmd::Validate { target, json } => {
+            extension_dev_cli::validate(&manager, target, *json).await
+        }
+        ExtensionsCmd::Pack {
+            source,
+            output,
+            json,
+        } => extension_dev_cli::pack(source, output.as_deref(), *json),
+        ExtensionsCmd::Sign {
+            package,
+            private_key,
+            trust_root_id,
+            key_id,
+            output,
+            json,
+        } => extension_dev_cli::sign(
+            package,
+            private_key,
+            trust_root_id,
+            key_id,
+            output.as_deref(),
+            *json,
+        ),
+        ExtensionsCmd::Publish {
+            source,
+            snapshot,
+            registry_root,
+            publisher_private_key,
+            trust_root_id,
+            key_id,
+            registry_private_key,
+            output,
+            refresh_hours,
+            expiry_days,
+            json,
+        } => {
+            extension_dev_cli::publish(
+                source,
+                snapshot,
+                registry_root,
+                publisher_private_key,
+                trust_root_id,
+                key_id,
+                registry_private_key,
+                output.as_deref(),
+                *refresh_hours,
+                *expiry_days,
+                *json,
+            )
+            .await
+        }
         ExtensionsCmd::Discover { source, json } => print(&manager.discover(source)?, *json),
         ExtensionsCmd::List { json } => print(&manager.list()?, *json),
         ExtensionsCmd::Inspect { extension_id, json }
@@ -165,9 +331,6 @@ pub async fn run(action: &ExtensionsCmd, app_data: &Path) -> Result<(), String> 
                 *allow_high_risk,
             )?;
             print(&manager.install(source, approval).await?, *json)
-        }
-        ExtensionsCmd::Validate { extension_id, json } => {
-            print(&manager.validate_installed(extension_id).await?, *json)
         }
         ExtensionsCmd::Enable {
             extension_id,
