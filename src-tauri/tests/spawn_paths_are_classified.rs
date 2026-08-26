@@ -362,6 +362,11 @@ const CLASSIFIED_CLI: &[(&str, Class, &str)] = &[
         "autonomous executor Git inspection and verification use fixed arguments",
     ),
     (
+        "extension_dev_cli.rs",
+        Class::HostUtility,
+        "extension development invokes only fixed `cargo build --release --target wasm32-wasip2` and `git rev-parse HEAD` commands; project paths select the working directory but never become executable or shell-authored command text",
+    ),
+    (
         "daemon/callback_exposure.rs",
         Class::ManagedService,
         "the operator's own tunnel client, started and supervised by the daemon \
