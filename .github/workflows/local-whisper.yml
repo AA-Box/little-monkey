@@ -64,7 +64,7 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential cmake clang ninja-build
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential cmake clang libclang-dev ninja-build
       - name: Verify Windows ARM64 native toolchain
         if: matrix.target == 'aarch64-pc-windows-msvc'
         shell: pwsh
@@ -98,7 +98,7 @@ jobs:
       - name: Install build and audio dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential cmake clang ninja-build ffmpeg
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential cmake clang libclang-dev ninja-build ffmpeg
       - uses: actions/setup-node@v4
         with:
           node-version: 24
