@@ -58,7 +58,8 @@ fn submit(
     command: Vec<String>,
     wall_time_ms: u64,
 ) -> TargetRunHandle {
-    let transfer = WorkspaceTransfer::from_workspace(root, workspace_id).expect("workspace transfer");
+    let transfer =
+        WorkspaceTransfer::from_workspace(root, workspace_id).expect("workspace transfer");
     let workspace = target
         .prepare_workspace(&transfer, WorkspacePolicy::Persistent)
         .expect("prepare SSH workspace");
@@ -78,6 +79,7 @@ fn submit(
             max_artifact_bytes: 4 * 1024 * 1024,
             workspace_transfer: Some(transfer),
             input_files: Vec::new(),
+            run_spec: None,
         })
         .expect("submit SSH runner task")
 }
@@ -150,9 +152,13 @@ fn real_ssh_runner_covers_transfer_reconnect_result_pause_resume_and_cancel() {
         .find(|file| file.path == "result.txt")
         .expect("remote result file");
     assert_eq!(result_file.bytes, b"from-client\nremote\n");
-    assert!(reconnected.artifacts(&handle).expect("SSH artifacts").iter().any(|artifact| {
-        artifact.label == "result.txt" && artifact.sha256 == result_file.sha256
-    }));
+    assert!(reconnected
+        .artifacts(&handle)
+        .expect("SSH artifacts")
+        .iter()
+        .any(|artifact| {
+            artifact.label == "result.txt" && artifact.sha256 == result_file.sha256
+        }));
 
     let pause_workspace = tempfile::tempdir().expect("pause workspace");
     std::fs::write(pause_workspace.path().join("input.txt"), b"pause\n").unwrap();
@@ -178,7 +184,9 @@ fn real_ssh_runner_covers_transfer_reconnect_result_pause_resume_and_cancel() {
     reconnected.pause(&pause_handle).expect("pause SSH run");
     thread::sleep(Duration::from_millis(500));
     assert_eq!(
-        reconnected.status(&pause_handle).expect("paused SSH status"),
+        reconnected
+            .status(&pause_handle)
+            .expect("paused SSH status"),
         TargetRunStatus::Running,
         "paused runner processes remain non-terminal"
     );

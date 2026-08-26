@@ -92,7 +92,11 @@ impl RemoteNodeTarget {
 
     fn state_dir(&self) -> Result<PathBuf, TargetError> {
         let root = crate::app_paths::data_dir()
-            .or_else(|| std::env::current_dir().ok().map(|path| path.join(".little-monkey")))
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|path| path.join(".little-monkey"))
+            })
             .ok_or_else(|| TargetError::Io("could not resolve execution-target state".into()))?;
         let path = root
             .join("execution-remote-node")
@@ -310,7 +314,8 @@ impl RemoteNodeTarget {
         let temporary = path.with_extension("json.tmp");
         fs::write(
             &temporary,
-            serde_json::to_vec_pretty(spec).map_err(|error| TargetError::invalid(error.to_string()))?,
+            serde_json::to_vec_pretty(spec)
+                .map_err(|error| TargetError::invalid(error.to_string()))?,
         )?;
         fs::rename(temporary, &path)?;
         Ok(path)
@@ -350,7 +355,9 @@ impl ExecutionTarget for RemoteNodeTarget {
         let runner_id = node
             .get("runner_id")
             .and_then(Value::as_str)
-            .ok_or_else(|| TargetError::protocol_incompatible("node list omitted runner identity"))?;
+            .ok_or_else(|| {
+                TargetError::protocol_incompatible("node list omitted runner identity")
+            })?;
         if let Some(expected) = self.snapshot.identity.verified_identity.as_deref() {
             if !expected.is_empty() && expected != runner_id {
                 return Err(TargetError::TargetIdentityChanged(format!(
@@ -369,16 +376,12 @@ impl ExecutionTarget for RemoteNodeTarget {
             .unwrap_or(&identity.display_name)
             .to_string();
         identity.verified_identity = Some(runner_id.to_string());
-        identity.platform = if identity.platform.trim().is_empty() {
-            "remote-node".to_string()
-        } else {
-            identity.platform
-        };
-        identity.runner_version = if identity.runner_version.trim().is_empty() {
-            "k17".to_string()
-        } else {
-            identity.runner_version
-        };
+        if identity.platform.trim().is_empty() {
+            identity.platform = "remote-node".to_string();
+        }
+        if identity.runner_version.trim().is_empty() {
+            identity.runner_version = "k17".to_string();
+        }
         // These are capabilities of the existing K17 node protocol itself.
         // Hardware/model-specific capabilities already frozen in the configured
         // target are preserved rather than guessed from a thin liveness row.
@@ -465,7 +468,9 @@ impl ExecutionTarget for RemoteNodeTarget {
         let submitted_run_id = placement
             .get("submitted_run_id")
             .and_then(Value::as_str)
-            .ok_or_else(|| TargetError::protocol_incompatible("placement omitted submitted run id"))?;
+            .ok_or_else(|| {
+                TargetError::protocol_incompatible("placement omitted submitted run id")
+            })?;
         let node_run_id = placement
             .get("node_run_id")
             .and_then(Value::as_str)

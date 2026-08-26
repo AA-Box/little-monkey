@@ -2073,6 +2073,33 @@ async fn execute_registered_target_placement(
     {
         let (_, target) = configured_docker_target(&data_dir, &request.target_id)?;
         (target, None)
+    } else if request
+        .kind
+        .as_deref()
+        .is_some_and(|kind| matches!(kind.replace('-', "_").as_str(), "remote_node"))
+    {
+        validate_id("remote node alias", &request.target_id)?;
+        let identity = crate::execution_target::TargetIdentity {
+            stable_id: request.target_id.clone(),
+            display_name: request.target_id.clone(),
+            kind: crate::execution_target::ExecutionTargetKind::RemoteNode,
+            endpoint: None,
+            verified_identity: None,
+            platform: "remote-node".to_string(),
+            runner_version: "k17".to_string(),
+            protocol_version: crate::execution_target::EXECUTION_PROTOCOL_VERSION,
+            capabilities: crate::execution_target::TargetCapabilities::default(),
+            last_successful_probe_ms: None,
+            trust_state: crate::execution_target::TargetTrustState::Unverified,
+        };
+        let snapshot = crate::execution_target::ExecutionTargetSnapshot::freeze(
+            identity,
+            crate::execution_target::execution_now_ms(),
+        )
+        .map_err(|error| error.to_string())?;
+        let target = crate::execution_target::RemoteNodeTarget::from_snapshot(snapshot)
+            .map_err(|error| error.to_string())?;
+        (Box::new(target), None)
     } else {
         return Err(format!("unknown execution target '{}'", request.target_id));
     };
@@ -2118,6 +2145,7 @@ async fn execute_registered_target_placement(
     }
     let placement_kind = match snapshot.identity.kind {
         crate::execution_target::ExecutionTargetKind::Docker => "docker",
+        crate::execution_target::ExecutionTargetKind::RemoteNode => "remote_node",
         crate::execution_target::ExecutionTargetKind::SshRunner => "ssh_runner",
         _ => {
             return Err(format!(
@@ -2128,6 +2156,15 @@ async fn execute_registered_target_placement(
     };
     if let Some(config) = registry.targets.get_mut(&request.target_id) {
         *config.identity_mut() = snapshot.identity.clone();
+        registry
+            .save(&registry_path)
+            .map_err(|error| error.to_string())?;
+    } else if snapshot.identity.kind == crate::execution_target::ExecutionTargetKind::RemoteNode {
+        registry
+            .add(crate::execution_target::TargetConfig::RemoteNode {
+                identity: snapshot.identity.clone(),
+            })
+            .map_err(|error| error.to_string())?;
         registry
             .save(&registry_path)
             .map_err(|error| error.to_string())?;
@@ -2226,6 +2263,7 @@ async fn execute_registered_target_placement(
         max_artifact_bytes: spec.budgets.max_artifact_bytes,
         workspace_transfer: Some(transfer),
         input_files: vec![input_file],
+        run_spec: Some(spec.clone()),
     };
     let handle = target
         .submit_run(run_request)
@@ -2333,10 +2371,9 @@ async fn execute_registered_target_placement(
     Ok(response)
 }
 
-/// Execute a frozen autonomous node through the selected placement backend.
-/// Remote nodes use the existing signed placement plane and wait for the node's
-/// durable placement to become terminal. Docker uses an explicit runner image
-/// contract; it never falls back to the host process or executes a shell.
+/// Execute a frozen autonomous node through the selected execution-target contract.
+/// Backend-specific transport and workspace behavior belongs to each
+/// `ExecutionTarget`; autonomous orchestration stays target-neutral.
 #[tauri::command]
 pub async fn autonomous_task_place_node(
     request: AutonomousTaskPlacementRequest,
@@ -2349,219 +2386,8 @@ pub async fn autonomous_task_place_node(
     if request.target_id.starts_with('-') {
         return Err("Placement target cannot start with '-'".to_string());
     }
-    let kind = resolve_execution_target_kind(&request.target_id, request.kind.as_deref())?;
-    match kind.as_str() {
-        "remote_node" => {
-            validate_id("remote node alias", &request.target_id)?;
-            let mut run_spec = request.run_spec;
-            consume_autonomous_placement_boundary(&mut run_spec, "remote_node")?;
-            let data_dir = crate::app_paths::data_dir()
-                .ok_or_else(|| "Could not resolve app data directory".to_string())?;
-            let dir = data_dir.join("autonomous-placements");
-            std::fs::create_dir_all(&dir)
-                .map_err(|error| format!("Could not create placement directory: {error}"))?;
-            let spec_path = dir.join(format!("{}.json", uuid::Uuid::new_v4()));
-            let workspace_root = run_spec
-                .workspace
-                .as_ref()
-                .and_then(|workspace| workspace.roots.first())
-                .map(|root| PathBuf::from(&root.canonical_path))
-                .ok_or_else(|| {
-                    "Remote autonomous placement requires a workspace root".to_string()
-                })?;
-            // The remote node owns an app-managed workspace. A placement no
-            // longer assumes that the submitter's absolute path exists on the
-            // other machine: freeze the content-addressed transfer beside the
-            // RunSpec and let the node materialize it under runner data.
-            if run_spec.workspace_transfer.is_none() {
-                let workspace_id = run_spec
-                    .workspace
-                    .as_ref()
-                    .map(|workspace| workspace.workspace_id.clone())
-                    .ok_or_else(|| {
-                        "Remote autonomous placement omitted workspace identity".to_string()
-                    })?;
-                run_spec.workspace_transfer = Some(
-                    crate::execution_target::WorkspaceTransfer::from_workspace(
-                        &workspace_root,
-                        &workspace_id,
-                    )
-                    .map_err(|error| {
-                        format!("Could not prepare remote workspace transfer: {error}")
-                    })?,
-                );
-            }
-            if let Some(target) = &run_spec.execution_target {
-                target
-                    .require(&crate::execution_target::RequiredCapabilities {
-                        shell: true,
-                        disposable_workspace: true,
-                        ..Default::default()
-                    })
-                    .map_err(|error| error.to_string())?;
-            }
-            let bytes = serde_json::to_vec_pretty(&run_spec)
-                .map_err(|error| format!("Could not serialize placement spec: {error}"))?;
-            std::fs::write(&spec_path, bytes)
-                .map_err(|error| format!("Could not persist placement spec: {error}"))?;
-            let result = async {
-                let output = command(vec![
-                    "daemon".into(),
-                    "remote".into(),
-                    "place".into(),
-                    "--spec".into(),
-                    spec_path.to_string_lossy().into_owned(),
-                    "--alias".into(),
-                    request.target_id.clone(),
-                    "--json".into(),
-                ])
-                .await
-                .map_err(autonomous_execution_target_lost)?;
-                let accepted = parse_json(&output)?;
-                let submitted_run_id = accepted
-                    .get("placement")
-                    .and_then(|placement| placement.get("submitted_run_id"))
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        "Remote placement response omitted submitted_run_id".to_string()
-                    })?
-                    .to_string();
-                let deadline = Instant::now()
-                    + std::time::Duration::from_millis(run_spec.budgets.wall_time_ms);
-                loop {
-                    if Instant::now() >= deadline {
-                        return Err(autonomous_execution_target_lost(
-                            "Remote autonomous node placement exceeded its frozen wall-time budget",
-                        ));
-                    }
-                    let _ = command(vec![
-                        "daemon".into(),
-                        "remote".into(),
-                        "placement-sync".into(),
-                    ])
-                    .await
-                    .map_err(autonomous_execution_target_lost)?;
-                    let rows = parse_json(
-                        &command(vec![
-                            "daemon".into(),
-                            "remote".into(),
-                            "placements".into(),
-                            "--json".into(),
-                        ])
-                        .await
-                        .map_err(autonomous_execution_target_lost)?,
-                    )?;
-                    if let Some(row) =
-                        rows.get("placements")
-                            .and_then(Value::as_array)
-                            .and_then(|rows| {
-                                rows.iter().find(|row| {
-                                    row.get("submitted_run_id").and_then(Value::as_str)
-                                        == Some(submitted_run_id.as_str())
-                                })
-                            })
-                    {
-                        let state = row.get("state").and_then(Value::as_str).unwrap_or_default();
-                        if matches!(state, "succeeded" | "failed" | "cancelled") {
-                            if state != "succeeded" {
-                                return Err(autonomous_execution_target_lost(
-                                    row.get("last_error")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("remote autonomous node failed"),
-                                ));
-                            }
-                            let mut result = row.get("result").cloned().ok_or_else(|| {
-                                "Remote node succeeded without a transported node result"
-                                    .to_string()
-                            })?;
-                            let placement_result = async {
-                                if result.get("ok").and_then(Value::as_bool) != Some(true) {
-                                    return Err(
-                                        "Remote node returned no successful mutation/result contract"
-                                            .to_string(),
-                                    );
-                                }
-                                if result
-                                    .get("mutation")
-                                    .and_then(Value::as_object)
-                                    .is_some()
-                                {
-                                    let artifact_id = result
-                                        .get("artifacts")
-                                        .and_then(Value::as_array)
-                                        .and_then(|artifacts| {
-                                            artifacts.iter().find(|artifact| {
-                                                artifact.get("kind").and_then(Value::as_str)
-                                                    == Some("patch")
-                                            })
-                                        })
-                                        .and_then(|artifact| artifact.get("artifactId"))
-                                        .and_then(Value::as_str)
-                                        .ok_or_else(|| {
-                                            "Remote mutation result omitted its patch artifact"
-                                                .to_string()
-                                        })?;
-                                    let patch_path = data_dir
-                                        .join("autonomous-placements")
-                                        .join(format!("{submitted_run_id}-{artifact_id}.patch"));
-                                    command(vec![
-                                        "daemon".into(),
-                                        "remote".into(),
-                                        "artifact".into(),
-                                        request.target_id.clone(),
-                                        submitted_run_id.clone(),
-                                        artifact_id.to_string(),
-                                        "--output".into(),
-                                        patch_path.to_string_lossy().into_owned(),
-                                    ])
-                                    .await
-                                    .map_err(autonomous_execution_target_lost)?;
-                                    let patch_bytes = std::fs::read(&patch_path).map_err(|error| {
-                                        format!("Could not read fetched remote patch: {error}")
-                                    })?;
-                                    if format!("{:x}", Sha256::digest(&patch_bytes)) != artifact_id {
-                                        let _ = std::fs::remove_file(&patch_path);
-                                        return Err(
-                                            "Remote autonomous patch failed its content digest check"
-                                                .to_string(),
-                                        );
-                                    }
-                                    let result_id = crate::execution_target::persist_patch_result(
-                                        &data_dir,
-                                        &run_spec
-                                            .workspace_transfer
-                                            .as_ref()
-                                            .ok_or_else(|| {
-                                                "Remote result omitted its workspace transfer"
-                                                    .to_string()
-                                            })?
-                                            .base_snapshot_digest,
-                                        patch_bytes,
-                                    )
-                                    .map_err(|error| {
-                                        format!("Could not persist remote result: {error}")
-                                    })?;
-                                    let _ = std::fs::remove_file(&patch_path);
-                                    if let Some(object) = result.as_object_mut() {
-                                        object.insert("resultId".to_string(), Value::String(result_id));
-                                        object.insert("reviewRequired".to_string(), Value::Bool(true));
-                                    }
-                                }
-                                Ok(result)
-                            }
-                            .await;
-                            return placement_result;
-                        }
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                }
-            }
-            .await;
-            let _ = std::fs::remove_file(&spec_path);
-            result
-        }
-        _ => execute_registered_target_placement(request).await,
-    }
+    resolve_execution_target_kind(&request.target_id, request.kind.as_deref())?;
+    execute_registered_target_placement(request).await
 }
 
 /// States what this machine advertises to schedulers allowed to place work on
