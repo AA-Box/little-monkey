@@ -1,0 +1,198 @@
+name: Channel secure-store native service E2E
+
+on:
+  pull_request:
+    paths:
+      - "src-tauri/src/channels/**"
+      - "src-tauri/src/daemon_commands.rs"
+      - "src-tauri/src/bin/monkey-cli/channels_cli.rs"
+      - "src-tauri/src/bin/monkey-cli/daemon/**"
+      - "src-tauri/tests/channel_secure_store_service_e2e.rs"
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+      - ".github/workflows/channel-secure-store-service-e2e.yml"
+  push:
+    branches: [main, develop]
+    paths:
+      - "src-tauri/src/channels/**"
+      - "src-tauri/src/daemon_commands.rs"
+      - "src-tauri/src/bin/monkey-cli/channels_cli.rs"
+      - "src-tauri/src/bin/monkey-cli/daemon/**"
+      - "src-tauri/tests/channel_secure_store_service_e2e.rs"
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+      - ".github/workflows/channel-secure-store-service-e2e.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: channel-secure-store-service-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  LITTLE_MONKEY_REQUIRE_CHANNEL_SECURE_STORE_SERVICE_E2E: "1"
+
+jobs:
+  macos-windows:
+    name: native service (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri
+          key: channel-secure-store-${{ matrix.os }}
+
+      # tauri-build expects the bundled CLI sidecar path to exist while the
+      # integration test is compiled. The test itself uses Cargo's real
+      # CARGO_BIN_EXE_monkey-cli artifact, never this placeholder.
+      - name: Stage CLI sidecar placeholder
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+
+      - name: Native credential -> installed service -> Telegram worker
+        run: >-
+          cargo test --manifest-path src-tauri/Cargo.toml
+          --test channel_secure_store_service_e2e
+          real_os_service_reads_desktop_written_credential
+          -- --exact --nocapture --test-threads=1
+
+  linux:
+    name: native service (ubuntu-22.04)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native desktop/service dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            build-essential dbus dbus-user-session dbus-x11 gnome-keyring \
+            libdbus-1-dev keyutils
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri
+          key: channel-secure-store-ubuntu
+
+      - name: Stage CLI sidecar placeholder
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+
+      # Hosted runners do not promise a login user manager. Start the same
+      # unprivileged systemd --user manager production uses and give it the
+      # canonical %t/bus path emitted by service.rs. This makes `daemon install`
+      # exercise systemctl --user for real instead of replacing it with a child
+      # process in the test.
+      - name: Start real systemd user manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime="$RUNNER_TEMP/lm-xdg-runtime"
+          mkdir -p "$runtime"
+          chmod 700 "$runtime"
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime/bus" >> "$GITHUB_ENV"
+          export XDG_RUNTIME_DIR="$runtime"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus"
+
+          systemd --user >"$RUNNER_TEMP/lm-systemd-user.log" 2>&1 &
+          echo $! >"$RUNNER_TEMP/lm-systemd-user.pid"
+
+          ready=0
+          for _ in $(seq 1 60); do
+            if systemctl --user show-environment >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 0.5
+          done
+          if [ "$ready" -ne 1 ]; then
+            cat "$RUNNER_TEMP/lm-systemd-user.log" || true
+            exit 1
+          fi
+          systemctl --user import-environment HOME PATH XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+          test -S "$runtime/bus"
+
+      # Desktop case: prove the writer and systemd-launched daemon agree while
+      # org.freedesktop.secrets is really present on the canonical user bus.
+      - name: Secret Service desktop round-trip through real systemd service
+        shell: bash
+        run: |
+          set -euo pipefail
+          eval "$(printf '\n' | gnome-keyring-daemon --unlock --replace --components=secrets)"
+          found=0
+          for _ in $(seq 1 30); do
+            if busctl --user --no-pager list | grep -q 'org.freedesktop.secrets'; then
+              found=1
+              break
+            fi
+            sleep 0.25
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "Secret Service did not register on the user bus" >&2
+            busctl --user --no-pager list || true
+            exit 1
+          fi
+          cargo test --manifest-path src-tauri/Cargo.toml \
+            --test channel_secure_store_service_e2e \
+            real_os_service_reads_desktop_written_credential \
+            -- --exact --nocapture --test-threads=1
+
+      # Headless/user-service case: keep the real systemd user manager and its
+      # bus, remove Secret Service entirely, and require the combined keyring
+      # backend's native keyutils path to survive the same cross-process/service
+      # round-trip. A passing test cannot be a Secret Service pass in disguise.
+      - name: Headless keyutils round-trip through real systemd service
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkill -u "$USER" -x gnome-keyring-daemon || true
+          unset GNOME_KEYRING_CONTROL || true
+          for _ in $(seq 1 30); do
+            if ! busctl --user --no-pager list | grep -q 'org.freedesktop.secrets'; then
+              break
+            fi
+            sleep 0.25
+          done
+          if busctl --user --no-pager list | grep -q 'org.freedesktop.secrets'; then
+            echo "Secret Service is still present; refusing a false headless pass" >&2
+            exit 1
+          fi
+          keyctl show >/dev/null
+          cargo test --manifest-path src-tauri/Cargo.toml \
+            --test channel_secure_store_service_e2e \
+            real_systemd_service_reads_headless_native_credential \
+            -- --exact --nocapture --test-threads=1
+
+      # This is the already-existing full Telegram pipeline acceptance. It uses
+      # production adapter/daemon/agent/outbox code with deterministic provider
+      # and model endpoints, so the native-boundary test above and this test
+      # together cover the complete bug path without a live bot token.
+      - name: Telegram inbound -> agent run -> outbound reply
+        shell: bash
+        run: |
+          cargo build --manifest-path src-tauri/Cargo.toml --bin monkey-cli
+          cargo test --manifest-path src-tauri/Cargo.toml --bin monkey-cli \
+            daemon::channel_agent_e2e::a_telegram_message_becomes_an_agent_reply_end_to_end \
+            -- --exact --nocapture --test-threads=1
+
+      - name: Dump systemd diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          systemctl --user --no-pager --full status || true
+          systemctl --user --no-pager --full list-units 'little-monkey-daemon*' || true
+          cat "$RUNNER_TEMP/lm-systemd-user.log" || true
