@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { FormEvent, KeyboardEvent } from "react";
+import type { ClipboardEvent, FormEvent, KeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { CornerDownLeft, Square } from "lucide-react";
@@ -12,6 +12,15 @@ import { startCrew } from "../../lib/crewRunner";
 import type { ModelTargetSnapshot } from "../../lib/modelTargets";
 import { isImagePath, readImageAsDataUrl } from "../../lib/imageAttachment";
 import { textContent } from "../../lib/llamaClient";
+import {
+  composePromptWithPastedText,
+  formatEstimatedTokens,
+  formatPastedTextSize,
+  isPastedTextPath,
+  nextPastedTextName,
+  pastedTextPath,
+  shouldCollapsePastedText,
+} from "../../lib/pastedText";
 import { selectSessionMessages, selectTurnRunning, sessionMessages, useSessionStore } from "../../store/sessionStore";
 import { useWorkspaceStore } from "../../store/workspaceStore";
 import { usePromptStore } from "../../store/promptStore";
@@ -34,6 +43,7 @@ import { ContextUsageIndicator } from "./ContextUsageIndicator";
 import { CheckpointTimeline } from "./CheckpointTimeline";
 import { AttachMenu } from "./AttachMenu";
 import { AttachmentChip } from "./AttachmentChip";
+import PastedTextEditorModal from "./PastedTextEditorModal";
 import { DictationButton, type DictationButtonHandle } from "./DictationButton";
 import { Tooltip } from "./MessageActions";
 import { WorkspaceBar } from "../Workspace/WorkspaceBar";
@@ -93,42 +103,27 @@ import { isExecutionServiceUnavailable } from "../../lib/daemonDesktopTurn";
 
 const MAX_TEXTAREA_HEIGHT_PX = 160;
 
-/** Shape returned by the Rust `list_workspace_paths` command. */
 interface WorkspacePathsResult {
   entries: MentionEntry[];
   truncated: boolean;
 }
 
-/** Cap on how many filtered rows are handed to <MentionAutocomplete>. */
 const MAX_MENTION_RESULTS = 50;
 
-/**
- * Looks backward from `cursor` in `text` for an active "@"-mention trigger:
- * the nearest "@" that is either at the start of the text or preceded by
- * whitespace, with no whitespace between that "@" and the cursor. Returns
- * the trigger's start index (the position of "@" itself) and the query text
- * typed after it, or `null` if the cursor isn't inside a mention trigger.
- */
 function findMentionRange(text: string, cursor: number): { start: number; query: string } | null {
   const upToCursor = text.slice(0, cursor);
   const at = upToCursor.lastIndexOf("@");
   if (at === -1) return null;
 
   const query = upToCursor.slice(at + 1);
-  if (/\s/.test(query)) return null; // whitespace between "@" and cursor — not an active trigger
+  if (/\s/.test(query)) return null;
 
   const before = at === 0 ? "" : upToCursor[at - 1];
-  if (at !== 0 && !/\s/.test(before)) return null; // "@" isn't at start-of-text or after whitespace
+  if (at !== 0 && !/\s/.test(before)) return null;
 
   return { start: at, query };
 }
 
-/**
- * Filters/ranks the cached workspace path list against `query`: a
- * case-insensitive substring match on the full path, with basename-starts-
- * with ranked above basename-contains, ranked above full-path-contains, then
- * capped to MAX_MENTION_RESULTS.
- */
 function filterMentionEntries(all: MentionEntry[], query: string): MentionEntry[] {
   const needle = query.toLowerCase();
 
@@ -155,34 +150,17 @@ function filterMentionEntries(all: MentionEntry[], query: string): MentionEntry[
   return ranked.slice(0, MAX_MENTION_RESULTS).map((r) => r.entry);
 }
 
-/**
- * Looks for an active "/"-command trigger: unlike `findMentionRange`, this
- * only fires when "/" is the FIRST non-whitespace character of the whole
- * input and the cursor hasn't moved past that leading token — "/" mid-text
- * is almost always a path (e.g. "src/lib"), so no popup there. Returns the
- * trigger's start index (the position of "/" itself) and the query text
- * typed after it, or `null` if the cursor isn't inside an active trigger.
- */
 function findSlashRange(text: string, cursor: number): { start: number; query: string } | null {
   const start = text.search(/\S/);
   if (start === -1 || text[start] !== "/") return null;
-  if (cursor <= start) return null; // cursor is at or before the "/" itself — not an active trigger yet
+  if (cursor <= start) return null;
 
   const query = text.slice(start + 1, cursor);
-  if (/\s/.test(query)) return null; // whitespace between "/" and cursor — the leading token ended
+  if (/\s/.test(query)) return null;
 
   return { start, query };
 }
 
-/**
- * Splits the composer text into segments so recognized leading slash-command
- * tokens can be tinted in the input. Mirrors the send-path parsers exactly:
- * a built-in only counts as the whole first token (`parseBuiltInSlashCommand`)
- * while installed skills may stack (`parseSkillTurn`). Unknown leading
- * "/text" stays untinted — it is probably a path — so the tint doubles as
- * feedback that the token actually resolved. Returns `null` when nothing
- * highlights so the textarea can skip the overlay entirely.
- */
 function splitCommandSegments(
   text: string,
   skillCommands: ReadonlySet<string>,
@@ -218,12 +196,6 @@ function splitCommandSegments(
   return segments;
 }
 
-/**
- * Filters/ranks prompt-library entries against `query`: command-starts-with
- * ranked above name-starts-with, ranked above either containing the query —
- * fully client-side against `promptStore` entries, unlike mentions there's
- * no Rust round trip since the whole library is already in memory.
- */
 function filterSlashEntries(all: SlashCatalogEntry[], query: string): SlashCatalogEntry[] {
   const needle = query.toLowerCase();
 
@@ -262,8 +234,6 @@ function activeModelDescription(): string {
   return state.active ? `local:${state.active.name} (${state.llamaStatus})` : `local runtime (${state.llamaStatus}; no model selected)`;
 }
 
-/** How much of a session's transcript exists right now — the evidence for
- * whether a failed send ever became a turn. */
 function messageCount(sessionId: string): number {
   return useSessionStore.getState().sessions.find((entry) => entry.id === sessionId)?.messages.length ?? 0;
 }
@@ -319,32 +289,18 @@ export async function switchModelFromSlash(selector: string): Promise<string> {
 }
 
 interface ChatWindowProps {
-  /** The session this pane renders and sends turns into. Each pane (primary
-   * and split — see App.tsx) owns one; they operate independently. */
   sessionId: string;
-  /** Opens Settings on the Prompts tab — passed down to `PersonaSelector`'s
-   * "Manage prompts…" row (see App.tsx's deep-link hook). */
   onManagePrompts: () => void;
   onOpenSettingsTab: (tab: SettingsTab) => void;
-  /** Optional host element in the window's title-bar strip (see App.tsx).
-   * When provided, the Compare/Crew pickers portal there instead of the
-   * composer footer — only the primary pane gets one; the split pane keeps
-   * its footer placement. */
   headerActionsSlot?: HTMLElement | null;
-  /** Opens the Background-tasks drawer — the "N running tasks" chip's click
-   * target (see App.tsx, which reuses its own top-bar tasks-toggle open
-   * branch). Optional so hosts without the right-sidebar region (none
-   * today) simply get a non-clickable chip. */
   onOpenBackgroundTasks?: () => void;
-  /** Opens the Product Manager Copilot panel — `/pm-plan`'s target surface,
-   * where the plain-text goal typed here becomes an editable, savable plan.
-   * Optional for the same reason as `onOpenBackgroundTasks`: a host without
-   * the feature-panel region still runs the command, it just can't reveal the
-   * panel. */
   onOpenPmCopilot?: () => void;
-  /** Switches the app to the Studio section — where a running generation the
-   * chip is counting actually lives. Optional like the two above. */
   onOpenStudio?: () => void;
+}
+
+interface ComposerDraftSnapshot {
+  input: string;
+  attachments: AttachmentRef[];
 }
 
 export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks, onOpenPmCopilot, onOpenStudio }: ChatWindowProps) {
@@ -354,10 +310,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const { t } = useT();
 
   const [input, setInput] = useState("");
-  // Whether THIS pane's session has a turn in flight — session-scoped store
-  // state, not component state: the turn survives pane switches (keeping
-  // its Stop affordance wherever its session is shown), and a session
-  // already running a turn stays locked in whichever pane displays it.
   const sending = useSessionStore(selectTurnRunning(sessionId));
   const activeProvider = useModelStore((state) => state.activeProvider);
   const llamaStatus = useModelStore((state) => state.llamaStatus);
@@ -369,12 +321,10 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const [startingCrew, setStartingCrew] = useState(false);
   const [crewId, setCrewId] = useState<string | null>(null);
   const [ultracodeMode, setUltracodeMode] = useState(false);
-  // The caught value, not its text: what the banner offers depends on what
-  // failed. A refused turn whose only fault is that the execution service is
-  // down gets a Repair action instead of a Retry that would refuse again.
   const [error, setError] = useState<unknown>(null);
   const [repairingService, setRepairingService] = useState(false);
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
+  const [editingPastedPath, setEditingPastedPath] = useState<string | null>(null);
   const pendingBrowserEvidence = useBrowserWorkbenchStore((state) => state.pendingBySession[sessionId] ?? null);
   const consumeBrowserEvidence = useBrowserWorkbenchStore((state) => state.consumeForChat);
   const pendingTerminalEvidence = useTerminalStore((state) => state.pendingEvidenceByChat[sessionId] ?? null);
@@ -382,35 +332,20 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const dictationButtonRef = useRef<DictationButtonHandle>(null);
 
-  // "@"-mention autocomplete state. `mentionQuery` being non-null is what
-  // controls whether the popup is rendered at all.
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   const [mentionEntries, setMentionEntries] = useState<MentionEntry[]>([]);
   const [mentionActiveIndex, setMentionActiveIndex] = useState(0);
-
-  // Index of the "@" that opened the current mention trigger, so selection
-  // knows exactly what span of the textarea to replace.
   const mentionStartRef = useRef<number | null>(null);
-  // Cache of the full workspace path list, fetched at most once per mount
-  // (or re-fetched after a prior failure, e.g. no workspace was open yet).
   const workspacePathsRef = useRef<MentionEntry[] | null>(null);
   const workspacePathsPromiseRef = useRef<Promise<MentionEntry[]> | null>(null);
-  // Guards against a slow/late `list_workspace_paths` response clobbering
-  // the results of a more recent keystroke.
   const mentionRequestIdRef = useRef(0);
 
-  // Invalidate the cached mention path list whenever the attached folders
-  // change (primary swapped, or a secondary attached/removed) — otherwise a
-  // newly attached folder's files would never show up in "@"-mentions until
-  // ChatWindow happens to remount.
   const rootsKey = roots.map((r) => r.id).join("|");
   useEffect(() => {
     workspacePathsRef.current = null;
     workspacePathsPromiseRef.current = null;
   }, [rootsKey]);
 
-  // "/"-command autocomplete state — mirrors the "@"-mention state above.
-  // `slashQuery` being non-null is what controls whether the popup renders.
   const promptEntries = usePromptStore((state) => state.entries);
   const installedPackageKey = useEcosystemStore((state) =>
     state.installed
@@ -430,9 +365,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       ecosystemClient.activePluginSnapshots().catch(() => [] as ActivePluginRuntimeSnapshot[]),
       ecosystemClient.pluginRuntime().catch(() => [] as PluginRuntimeDescriptor[]),
       refreshNativeSkills().catch(() => undefined),
-      // Custom agent defs ride the same discovery pass (and the same
-      // workspace-change deps) as skills; the store keeps its own state, so
-      // nothing is destructured from this slot.
       useCustomAgentStore.getState().refresh(),
     ])
       .then(([packageEntries, pluginSnapshots, runtimes]) => {
@@ -524,8 +456,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const [slashQuery, setSlashQuery] = useState<string | null>(null);
   const [slashEntries, setSlashEntries] = useState<SlashCatalogEntry[]>([]);
   const [slashActiveIndex, setSlashActiveIndex] = useState(0);
-  // Index of the "/" that opened the current slash trigger, so selection
-  // knows exactly what span of the textarea to replace.
   const slashStartRef = useRef<number | null>(null);
   const invokedSkillPreview = useMemo(() => {
     try {
@@ -538,8 +468,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     () => new Set(availableSkills.map((skill) => skill.command.toLowerCase())),
     [availableSkills],
   );
-  // When set, the textarea renders its own text transparent and this overlay
-  // paints the same text on top with recognized command tokens in accent.
   const commandSegments = useMemo(
     () => splitCommandSegments(input, skillCommandSet),
     [input, skillCommandSet],
@@ -571,17 +499,12 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     const readyAssistantIds = new Set(
       runtimes.filter((runtime) => runtime.health === "healthy").map((runtime) => runtime.package_id),
     );
-    // Native .agents/skills roots are user-editable and may change while this
-    // composer stays open. Freeze the exact current discovery immediately
-    // before parsing the turn so hashes, instructions, and resource paths
-    // all belong to one snapshot.
     let freshNativeEntries: typeof activeNativeSkills = [];
     try {
       await refreshNativeSkills();
       freshNativeEntries = useNativeSkillsStore.getState().descriptors;
     } catch {
-      // Never reuse a stale external snapshot after discovery fails. Native
-      // skills disappear for this turn, but ordinary chat remains available.
+      // Never reuse a stale external snapshot after discovery fails.
     }
     const freshAvailableSkills = [
       ...localPromptSkills(promptEntries),
@@ -608,14 +531,11 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     el.style.height = `${Math.min(el.scrollHeight, MAX_TEXTAREA_HEIGHT_PX)}px`;
   }, []);
 
-  // Composer state (draft text, attachments, error banner, @/ popups) is
-  // pane-local, not session-local — nothing else keys it to `sessionId`. A
-  // brand new `sessionId` (switching panes, or `newSession` handing this
-  // pane a freshly reset session) means a blank compose slate.
   useEffect(() => {
     setInput("");
     setError(null);
     setAttachments([]);
+    setEditingPastedPath(null);
     setCompareTargets([]);
     setStartingComparison(false);
     setCrewId(null);
@@ -627,9 +547,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     requestAnimationFrame(resizeTextarea);
   }, [sessionId, resizeTextarea]);
 
-  // Browser evidence is never sent directly from the workbench. The user
-  // explicitly stages it here first, where the bounded untrusted summary and
-  // screenshot remain visible and removable before Send.
   useEffect(() => {
     if (!pendingBrowserEvidence) return;
     setInput((current) => [current.trim(), pendingBrowserEvidence.summary].filter(Boolean).join("\n\n"));
@@ -652,9 +569,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     });
   }, [consumeBrowserEvidence, pendingBrowserEvidence, resizeTextarea, sessionId]);
 
-  // Terminal evidence crosses into a model turn only after TerminalPanel's
-  // explicit review confirmation. It then appears as a normal removable
-  // composer attachment and still waits for the user's final Send action.
   useEffect(() => {
     if (!pendingTerminalEvidence?.length) return;
     const evidence = consumeTerminalEvidence(sessionId);
@@ -679,13 +593,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     });
   }, [consumeTerminalEvidence, pendingTerminalEvidence, resizeTextarea, sessionId, t]);
 
-  // One finalized spoken utterance, sent as its own turn.
-  //
-  // `utteranceId` is the recognition job's id, minted before the audio was
-  // transcribed, and it travels all the way to the durable ingress row as the
-  // turn's dedupe identity: a submission retried after a timeout lands on the
-  // run the first attempt made instead of starting a second one. Only the
-  // final transcript gets here — partial recognition never becomes a turn.
   const sendVoiceTurn = useCallback((text: string, utteranceId: string) => {
     setError(null);
     void runAgentTurn(sessionId, text, [], undefined, utteranceId, [], [], false, null, "voice")
@@ -694,19 +601,11 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       });
   }, [sessionId]);
 
-  // The separately-capability-scoped companion overlay never writes session
-  // state directly. Rust emits its explicit context only to the main window;
-  // the currently active primary composer accepts it here for user review
-  // before Send. Screen context stays an in-memory vision attachment.
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | null = null;
     void companionClient.onCompose((payload) => {
       if (useSessionStore.getState().activeSessionId !== sessionId) return;
-      // A finalized hands-free utterance is a turn the operator already made,
-      // out loud. It becomes a durable `voice` ingress turn under the
-      // recognition job's own id, rather than text waiting in the box — see
-      // `sendVoiceTurn`. Everything else still waits for Send.
       if (payload.utteranceId) {
         sendVoiceTurn(payload.text, payload.utteranceId);
         return;
@@ -746,9 +645,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
           return result.entries;
         })
         .catch(() => {
-          // No workspace open (or some other failure) — never let this throw
-          // into the chat's error banner. Reset so a later "@" can retry,
-          // e.g. once a workspace has been opened.
           workspacePathsPromiseRef.current = null;
           return [];
         });
@@ -759,7 +655,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const handleAddFiles = useCallback(async () => {
     try {
       const selected = await open({ multiple: true, directory: false });
-      if (!selected) return; // user cancelled
+      if (!selected) return;
       const paths = Array.isArray(selected) ? selected : [selected];
       if (paths.length === 0) return;
       setAttachments((prev) => {
@@ -768,12 +664,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         return additions.length > 0 ? [...prev, ...additions] : prev;
       });
 
-      // Image files get their bytes read + base64-encoded once, right now,
-      // rather than on send — the resulting data URL doubles as both the
-      // chip's thumbnail preview and the content actually wired to the
-      // model later (see `agentLoop.ts`'s `resolveReferences`), so the file
-      // is never read twice. Chips still appear immediately above; each
-      // image one just upgrades in place once its read finishes.
       for (const path of paths) {
         if (!isImagePath(path)) continue;
         try {
@@ -791,7 +681,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const handleAddFolder = useCallback(async () => {
     try {
       const selected = await open({ multiple: true, directory: true });
-      if (!selected) return; // user cancelled
+      if (!selected) return;
       const paths = Array.isArray(selected) ? selected : [selected];
       if (paths.length === 0) return;
       setAttachments((prev) => {
@@ -806,6 +696,45 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
 
   const handleRemoveAttachment = useCallback((path: string) => {
     setAttachments((prev) => prev.filter((a) => a.path !== path));
+    setEditingPastedPath((current) => current === path ? null : current);
+  }, []);
+
+  /**
+   * Large-paste conversion is intentionally model-free. The exact clipboard
+   * text becomes an in-memory virtual attachment and remains editable even
+   * when no model/runtime is configured. It is expanded back into the exact
+   * user prompt only after Send, so routing/token charges happen once and only
+   * as part of the actual turn.
+   */
+  const handlePaste = useCallback((event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const pasted = event.clipboardData.getData("text/plain");
+    if (!pasted || !shouldCollapsePastedText(pasted)) return;
+
+    event.preventDefault();
+    setMentionQuery(null);
+    mentionStartRef.current = null;
+    setSlashQuery(null);
+    slashStartRef.current = null;
+    setAttachments((current) => {
+      const name = nextPastedTextName(current);
+      return [
+        ...current,
+        {
+          path: pastedTextPath(name),
+          isDir: false,
+          kind: "inline_text",
+          content: pasted,
+          label: name,
+        },
+      ];
+    });
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, []);
+
+  const handleSavePastedText = useCallback((path: string, content: string) => {
+    setAttachments((current) => current.map((attachment) =>
+      attachment.path === path ? { ...attachment, content } : attachment
+    ));
   }, []);
 
   const handleEditGeneratedImage = useCallback(async (path: string, _prompt: string, artifactId?: string) => {
@@ -838,34 +767,20 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     text: string,
     pendingAttachments: AttachmentRef[],
     skillInvocations: SkillInvocationSnapshot[] = [],
-    // Ultracode (see `EffortSelector.tsx`): the SAME single-model turn, with
-    // the agent loop layering its multi-agent-orchestration system section on
-    // top and force-offering the `task` tool — never a multi-model fan-out.
     ultracode = false,
+    restoreDraft?: ComposerDraftSnapshot,
   ) => {
     setError(null);
 
-    // The agent loop owns the turn's abort handle (keyed by session — see
-    // stopTurn) and flips the per-session running flag `sending` above
-    // subscribes to, so nothing pane-local tracks the turn.
-    // `availableSkills` (the same full list `prepareTurnInstructions` already
-    // draws `skillInvocations` from) lets the turn's `skill` tool auto-invoke
-    // any skill not already explicitly invoked above — see
-    // `settingsStore.skillAutoInvokeEnabled`.
     const messagesBefore = messageCount(sessionId);
     void runAgentTurn(sessionId, text, pendingAttachments, undefined, undefined, skillInvocations, availableSkillsRef.current, ultracode)
       .catch((err: unknown) => {
         setError(err);
-        // A send refused before it was accepted — an unavailable resident
-        // runner is the usual reason — leaves nothing behind: no transcript
-        // entry, no durable turn, no run. The typed message is the only thing
-        // that would be lost, so it goes back in the box, and pressing Send
-        // again once the runner is up is the same send rather than a retyped
-        // one. A turn that got far enough to write to the transcript owns its
-        // own failure and the composer stays as the user left it.
         if (messageCount(sessionId) !== messagesBefore) return;
-        setInput((current) => current || text);
-        setAttachments((current) => (current.length > 0 ? current : pendingAttachments));
+        setInput((current) => current || restoreDraft?.input || text);
+        setAttachments((current) =>
+          current.length > 0 ? current : restoreDraft?.attachments ?? pendingAttachments
+        );
       })
       .finally(() => {
         textareaRef.current?.focus();
@@ -908,14 +823,9 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     }
     if (command === "pm-plan") {
       if (!commandArguments) throw new Error("Use /pm-plan <product goal>.");
-      // Generation runs against the same active chat target this composer's
-      // ModelSwitcher selects (`pmCopilot.ts`'s `activeTarget`), so the goal
-      // is typed here and only edited/saved in the panel.
       onOpenPmCopilot?.();
       await usePmCopilotStore.getState().startFromGoal(commandArguments);
       const drafted = usePmCopilotStore.getState();
-      // `generate()` records failures in its own state rather than throwing,
-      // so surface them here as a failed command notice.
       if (drafted.status === "error") throw new Error(drafted.error ?? "Plan generation failed.");
       const plan = drafted.plan;
       appendCommandNotice(
@@ -1057,9 +967,14 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         return;
       }
     }
-    const text = settledInput.trim();
-    if (!text) return;
-    const builtIn = parseBuiltInSlashCommand(text);
+
+    const visibleText = settledInput.trim();
+    const pastedDrafts = attachments.filter((attachment) =>
+      isPastedTextPath(attachment.path) && Boolean(attachment.content)
+    );
+    if (!visibleText && pastedDrafts.length === 0) return;
+
+    const builtIn = visibleText ? parseBuiltInSlashCommand(visibleText) : null;
     if (builtIn) {
       setInput("");
       setAttachments([]);
@@ -1075,11 +990,19 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     }
     if (sending || startingComparison || startingCrew || preparingTurnRef.current || localModelStarting) return;
 
+    // Pasted cards are a local presentation detail only. Reconstruct the
+    // exact user-authored content BEFORE any turn semantics are evaluated so
+    // mutation detection, skills, privacy, Compare/Crew and the model all see
+    // the same prompt they would have seen if the textarea had kept the paste.
+    const semanticText = composePromptWithPastedText(settledInput, attachments).trim();
+    const modelAttachments = attachments.filter((attachment) => !isPastedTextPath(attachment.path));
+    if (!semanticText) return;
+
     preparingTurnRef.current = true;
     setPreparingTurn(true);
     let skillInvocations: SkillInvocationSnapshot[];
     try {
-      skillInvocations = await prepareTurnInstructions(text);
+      skillInvocations = await prepareTurnInstructions(semanticText);
     } catch (skillError) {
       setError(`No turn was sent because enabled plugin instructions could not be verified: ${errorMessage(skillError)}`);
       preparingTurnRef.current = false;
@@ -1094,9 +1017,10 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       setError(null);
       setStartingCrew(true);
       try {
-        await startCrew(sessionId, text, pendingAttachments, crewId, skillInvocations);
+        await startCrew(sessionId, semanticText, modelAttachments, crewId, skillInvocations);
         setInput("");
         setAttachments([]);
+        setEditingPastedPath(null);
         requestAnimationFrame(resizeTextarea);
       } catch (err) {
         setError(err);
@@ -1110,9 +1034,10 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       setError(null);
       setStartingComparison(true);
       try {
-        await startComparison(sessionId, text, pendingAttachments, compareTargets, skillInvocations);
+        await startComparison(sessionId, semanticText, modelAttachments, compareTargets, skillInvocations);
         setInput("");
         setAttachments([]);
+        setEditingPastedPath(null);
         requestAnimationFrame(resizeTextarea);
       } catch (err) {
         setError(err);
@@ -1125,20 +1050,21 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
 
     setInput("");
     setAttachments([]);
+    setEditingPastedPath(null);
     requestAnimationFrame(resizeTextarea);
-    // Ultracode rides the normal single-turn path — the flag only changes
-    // what the agent loop layers into the system prompt and tool list.
-    sendTurn(text, pendingAttachments, skillInvocations, ultracodeMode);
+    sendTurn(
+      semanticText,
+      modelAttachments,
+      skillInvocations,
+      ultracodeMode,
+      { input: settledInput, attachments: pendingAttachments },
+    );
   }, [input, sending, startingComparison, startingCrew, ultracodeMode, attachments, crewId, compareTargets, resizeTextarea, sendTurn, sessionId, prepareTurnInstructions, executeBuiltIn, appendCommandNotice, localModelStarting]);
 
   const handleStop = useCallback(() => {
     stopTurn(sessionId);
   }, [sessionId]);
 
-  // A turn refused for want of the execution service leaves nothing behind
-  // (see `sendTurn`): the typed message went back in the composer, so the
-  // repair only has to clear the banner — the send is the user's again, with
-  // exactly the text they wrote.
   const serviceRepairNeeded = isExecutionServiceUnavailable(error);
   const handleRepairService = useCallback(() => {
     setRepairingService(true);
@@ -1175,13 +1101,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     [sending, prepareTurnInstructions, sendTurn, sessionId]
   );
 
-  // Entry point for ROADMAP.md's "Side Tasks" item: "start a side task from
-  // selected chat context" — the `Split` hover button `MessageBubble.tsx`
-  // renders on every user/assistant bubble calls this with the message's
-  // own transcript index. Opens the side-task composer prefilled with that
-  // message's text as the seed prompt; nothing runs until the user reviews
-  // and clicks "Start side task" there (`SideTaskComposer.tsx`) — this
-  // handler itself never starts anything.
   const handleStartSideTask = useCallback(
     (index: number) => {
       const source = sessionMessages(sessionId)[index];
@@ -1200,12 +1119,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     [sessionId]
   );
 
-  // Regenerate the last turn: drop everything from the last user message
-  // onward (its whole downstream reply included) and resubmit that message —
-  // the same mechanics as editing a past message, just without changing the
-  // text. Image attachments are rebuilt from the stored message's content
-  // parts (they carry the already-encoded data URL), so a retried turn keeps
-  // its images.
   const handleRetry = useCallback(() => {
     if (sending || preparingTurnRef.current) return;
     const currentMessages = sessionMessages(sessionId);
@@ -1236,8 +1149,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
           throw new Error("This chat started another turn while plugin instructions were being verified.");
         }
         useSessionStore.getState().truncateFromIndex(sessionId, lastUserIndex);
-        // Ultracode is sticky for the chat (see EffortSelector), so a retry
-        // keeps it — same flag the original send carried.
         sendTurn(text, imageAttachments, skillInvocations, ultracodeMode);
       })
       .catch((turnError: unknown) => {
@@ -1301,11 +1212,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       const currentValue = el ? el.value : input;
       const end = el?.selectionStart ?? currentValue.length;
 
-      // Picking a persona sets it as this session's active persona (composed
-      // into the system prompt every turn — see systemPrompt.ts) and clears
-      // the "/command" the user typed, the Cherry-Studio-style "switch
-      // assistant from the composer" gesture; it never inserts text into the
-      // composer the way a snippet does.
       if (entry.kind === "persona") {
         useSessionStore.getState().setSessionPersona(sessionId, entry.id);
         const nextValue = currentValue.slice(0, start) + currentValue.slice(end);
@@ -1348,10 +1254,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     setInput(value);
     resizeTextarea();
 
-    // Mention and slash triggers are mutually exclusive: one anchors at an
-    // "@" that can appear anywhere, the other only at index 0 — but both
-    // popups are still separate pieces of state, so an inactive trigger's
-    // popup must be explicitly closed rather than left stale.
     const mentionRange = findMentionRange(value, cursor);
     if (mentionRange) {
       if (slashQuery !== null) closeSlashPopup();
@@ -1362,7 +1264,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
 
       const requestId = ++mentionRequestIdRef.current;
       void loadWorkspacePaths().then((all) => {
-        if (mentionRequestIdRef.current !== requestId) return; // a newer keystroke superseded this fetch
+        if (mentionRequestIdRef.current !== requestId) return;
         setMentionEntries(filterMentionEntries(all, mentionRange.query));
       });
       return;
@@ -1381,11 +1283,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    // Enter confirms an active IME composition on CJK and other input
-    // methods; it must not choose a suggestion or send the message too.
     if (event.nativeEvent.isComposing) return;
-    // Resolve from the store on every event so an edit in Settings is live
-    // without remounting the composer (including in a secondary window).
     const { overrides } = useShortcutStore.getState();
     const platform = detectShortcutPlatform();
     const suggestionShortcut = shortcutIdForEvent(event, "suggestions", platform, overrides);
@@ -1427,7 +1325,9 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       }
       if (suggestionShortcut === "previousSuggestion") {
         event.preventDefault();
-        setSlashActiveIndex((prev) => (slashEntries.length === 0 ? 0 : (prev - 1 + slashEntries.length) % slashEntries.length));
+        setSlashActiveIndex((prev) =>
+          slashEntries.length === 0 ? 0 : (prev - 1 + slashEntries.length) % slashEntries.length
+        );
         return;
       }
       if (suggestionShortcut === "chooseSuggestion") {
@@ -1478,13 +1378,16 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       return;
     }
 
-    // Once Enter/Shift+Enter is reassigned, do not let the textarea's native
-    // newline behavior keep the old binding alive behind the registry's back.
     if (event.key === "Enter") event.preventDefault();
   };
 
-  // Rendered either in the composer footer or portaled into the title-bar
-  // strip (`headerActionsSlot`) — same elements and state either way.
+  const hasPastedTextDraft = attachments.some((attachment) =>
+    isPastedTextPath(attachment.path) && Boolean(attachment.content)
+  );
+  const editingPastedAttachment = editingPastedPath
+    ? attachments.find((attachment) => attachment.path === editingPastedPath && isPastedTextPath(attachment.path)) ?? null
+    : null;
+
   const comparisonPickers = (
     <>
       <CompareTargetPicker
@@ -1514,9 +1417,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     </>
   );
 
-  // Knowledge (StackPicker) portals alongside Compare/Crew when a header
-  // slot exists; otherwise it stays in its original composer-footer spot
-  // (see the split pane's fallback render below) rather than jumping rows.
   const stackPicker = <StackPicker sessionId={sessionId} placement={headerActionsSlot ? "down" : "up"} />;
 
   return (
@@ -1539,8 +1439,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
             <span className="min-w-0 break-words">
               {serviceRepairNeeded ? t("ChatWindow.executionServiceDown") : errorMessage(error)}
             </span>
-            {/* Retrying a turn the execution service refused just refuses
-                again, so the same slot repairs the service instead. */}
             <button
               type="button"
               onClick={serviceRepairNeeded
@@ -1566,7 +1464,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       )}
 
       <TaskSuggestionChips sessionId={sessionId} />
-
       <RunningTasksChip onClick={onOpenBackgroundTasks} onOpenStudio={onOpenStudio} />
 
       <div className="relative shrink-0 bg-background px-4 py-3">
@@ -1618,15 +1515,18 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                 {attachments.map((attachment) => {
                   const segments = attachment.path.split(/[\\/]/).filter(Boolean);
                   const name = attachment.label ?? segments[segments.length - 1] ?? attachment.path;
+                  const pastedText = isPastedTextPath(attachment.path) && attachment.content !== undefined;
                   return (
                     <AttachmentChip
                       key={attachment.path}
                       name={name}
                       isDir={attachment.isDir}
                       previewUrl={attachment.kind === "image" ? attachment.dataUrl : undefined}
-                      // Inline-content attachments (terminal evidence) carry a
-                      // synthetic path — nothing to reveal on disk.
                       revealPath={attachment.content === undefined ? attachment.path : undefined}
+                      detail={pastedText
+                        ? `${formatPastedTextSize(attachment.content ?? "")} · ${formatEstimatedTokens(attachment.content ?? "")}`
+                        : undefined}
+                      onOpen={pastedText ? () => setEditingPastedPath(attachment.path) : undefined}
                       onRemove={() => handleRemoveAttachment(attachment.path)}
                     />
                   );
@@ -1639,6 +1539,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                   ref={textareaRef}
                   value={input}
                   onChange={handleInput}
+                  onPaste={handlePaste}
                   onKeyDown={handleKeyDown}
                   onScroll={syncCommandOverlayScroll}
                   placeholder={t("ChatWindow.inputPlaceholder")}
@@ -1680,15 +1581,12 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                 <button
                   type="button"
                   onClick={sending ? handleStop : handleSend}
-                  disabled={preparingTurn || startingComparison || startingCrew || localModelStarting || (!sending && !input.trim())}
+                  disabled={preparingTurn || startingComparison || startingCrew || localModelStarting || (!sending && !input.trim() && !hasPastedTextDraft)}
                   aria-label={sending ? t("ChatWindow.stopResponseAriaLabel") : t("ChatWindow.sendMessageAriaLabel")}
                   className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full text-faint transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                 >
                   {sending ? <Square size={13} className="fill-current" /> : <CornerDownLeft size={16} />}
                 </button>
-                {/* The one control in the composer whose effect is worth
-                    spelling out: stopping mid-turn keeps what already
-                    streamed rather than discarding the exchange. */}
                 {sending && (
                   <Tooltip
                     text={t("ChatWindow.stopResponseAriaLabel")}
@@ -1733,6 +1631,14 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
           </>,
           headerActionsSlot,
         )}
+      {editingPastedAttachment && (
+        <PastedTextEditorModal
+          name={editingPastedAttachment.label ?? "Pasted text.md"}
+          content={editingPastedAttachment.content ?? ""}
+          onClose={() => setEditingPastedPath(null)}
+          onSave={(content) => handleSavePastedText(editingPastedAttachment.path, content)}
+        />
+      )}
     </div>
   );
 }
