@@ -24,6 +24,7 @@ describe("pastedText", () => {
   });
 
   it("uses a deterministic provider-independent token estimate", () => {
+    expect(estimatePastedTextTokens("")).toBe(0);
     expect(estimatePastedTextTokens("x".repeat(4_000))).toBe(1_000);
     expect(formatEstimatedTokens("x".repeat(4_000))).toBe("~1.0k tokens");
   });
@@ -36,13 +37,24 @@ describe("pastedText", () => {
     ])).toBe("Pasted text (5).md");
   });
 
-  it("reconstructs exact pasted blocks before visible composer text", () => {
-    const prompt = composePromptWithPastedText("please implement this", [
-      { path: "pasted://one", content: "# Spec\nA" },
+  it("returns a sole pasted prompt byte-for-byte when no separate instruction exists", () => {
+    const content = "# Spec\n\nImplement this exactly.\n";
+    expect(composePromptWithPastedText("", [
+      { path: "pasted://one", label: "Pasted text (1).md", content },
+    ])).toBe(content);
+  });
+
+  it("keeps the typed instruction first and names multiple pasted blocks", () => {
+    const prompt = composePromptWithPastedText("/review please compare these", [
+      { path: "pasted://one", label: "Pasted text (1).md", content: "# Spec\nA" },
       { path: "/workspace/file.ts", content: "must not be folded in" },
-      { path: "pasted://two", content: "## More\nB" },
+      { path: "pasted://two", label: "Pasted text (2).md", content: "## More\nB" },
     ]);
-    expect(prompt).toBe("# Spec\nA\n\n## More\nB\n\nplease implement this");
+    expect(prompt).toBe(
+      "/review please compare these\n\n" +
+      "### Pasted text (1).md\n\n# Spec\nA\n\n" +
+      "### Pasted text (2).md\n\n## More\nB",
+    );
   });
 
   it("creates opaque local-only pasted paths", () => {
