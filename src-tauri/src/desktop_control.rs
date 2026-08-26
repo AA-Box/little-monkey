@@ -33,18 +33,18 @@
 //! - **Windows** — real input via `enigo` (`SendInput` under the hood).
 //! - **Linux/X11** — real input via `enigo` (`x11rb`, `enigo`'s default
 //!   feature).
-//! - **Linux/Wayland** — deliberately *unsupported*: `production_backend`
-//!   detects a Wayland session (see [`is_wayland_session`]) and returns
-//!   [`UnsupportedBackend`] rather than constructing `enigo::Enigo`, since
-//!   synthetic input on Wayland needs an xdg-desktop-portal/libei integration
-//!   that is not built here. X11 sessions work today.
+//! - **Linux/Wayland** — real semantic access through AT-SPI plus raw input
+//!   through the user-mediated xdg-desktop-portal RemoteDesktop/ScreenCast
+//!   session in `desktop_control/wayland_portal.rs`. No compositor bypass or
+//!   unrestricted `/dev/uinput` path exists. Active-window screenshots require
+//!   Screenshot portal v3 so capture cannot silently widen to a whole display.
 //! - Everything else (BSD, etc.) — [`UnsupportedBackend`], as before.
 //!
-//! CAUTION: the Windows and Linux code paths below are compiled only on their
-//! own target_os, so they are NOT type-checked or runtime-verified in this
-//! macOS development environment. All non-trivial platform logic (the Wayland
-//! guard) is factored into pure, host-testable functions; the OS-gated blocks
-//! themselves are kept to a bare `enigo` call. See each block's own note.
+//! Linux/Wayland is deliberately capability-probed at runtime: compositors may
+//! ship different portal backends. Missing RemoteDesktop keyboard/pointer,
+//! monitor streams, or ActiveWindow screenshots fail with a precise
+//! `WAYLAND_CAPABILITY_UNAVAILABLE` error instead of falling back to insecure
+//! global input/capture.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write as _};
@@ -60,6 +60,9 @@ use sha2::{Digest, Sha256};
 use tauri::{Emitter, Manager};
 use tokio::sync::oneshot;
 use uuid::Uuid;
+
+#[cfg(target_os = "linux")]
+mod wayland_portal;
 
 /// Longest a control session may run before it must be restarted explicitly
 /// — mirrors `m7_companion::MAX_GRANT_LIFETIME_MS`'s "bounded, not
@@ -943,14 +946,6 @@ fn parse_key(key: &str) -> Result<enigo::Key, String> {
     })
 }
 
-/// Message returned by [`production_backend`] when a Linux/Wayland session is
-/// detected — kept as a named constant so the wording is asserted in tests.
-/// Its only production use is Linux-gated, hence the non-Linux `allow`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const WAYLAND_UNSUPPORTED_MESSAGE: &str =
-    "Wayland session detected — desktop control needs an xdg-desktop-portal/libei integration \
-     that isn't built yet; X11 sessions work today.";
-
 /// Pure Wayland-session detector. Takes the relevant environment values as
 /// plain `Option<&str>` (it does *not* read the environment itself) so it is
 /// fully unit-testable on any host, including this macOS build machine where
@@ -983,26 +978,18 @@ fn is_wayland_session_from_env() -> bool {
     is_wayland_session(session_type.as_deref(), wayland_display.as_deref())
 }
 
-/// Selects the real [`EnigoBackend`] on macOS / Windows / Linux-X11, or a clear
-/// [`UnsupportedBackend`] otherwise (Linux-Wayland, other OSes, or when the
-/// real backend's own construction fails, e.g. missing Accessibility
-/// permission on macOS) — never a silent no-op. Only ever called once, from
-/// `DesktopControlState::production`; every test in this module constructs its
-/// own [`NullBackend`] instead.
-///
-/// NOTE: the Windows and Linux arms below are compiled only on their own
-/// target_os and were NOT compiled or runtime-verified in this macOS
-/// development environment. Each arm is deliberately just a Wayland guard (a
-/// pure, host-tested function) plus one generic `enigo::Enigo::new` call whose
-/// API is identical across every target.
+/// Selects the production input backend. Wayland gets its compositor-mediated
+/// portal implementation; macOS, Windows, and Linux/X11 use Enigo. A missing
+/// portal capability remains a clear fail-closed `UnsupportedBackend`, never an
+/// XWayland/uinput fallback.
 fn production_backend() -> Arc<dyn DesktopInputBackend> {
-    // Linux/Wayland fails *closed and clearly* before any `enigo` construction:
-    // building `enigo::Enigo` (x11rb backend) under Wayland would either fail
-    // confusingly or behave unpredictably. X11 sessions fall through to enigo.
     #[cfg(target_os = "linux")]
     {
         if is_wayland_session_from_env() {
-            return Arc::new(UnsupportedBackend(WAYLAND_UNSUPPORTED_MESSAGE.to_string()));
+            return match wayland_portal::WaylandPortalBackend::new() {
+                Ok(backend) => Arc::new(backend),
+                Err(error) => Arc::new(UnsupportedBackend(error)),
+            };
         }
     }
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -1036,8 +1023,8 @@ fn backend_init_error_message(error: &str) -> String {
     let hint = "the current desktop session may not permit synthetic input (e.g. no interactive \
                 desktop, or a higher-integrity window has focus)";
     #[cfg(target_os = "linux")]
-    let hint = "ensure an X11 display is reachable (DISPLAY set); Wayland sessions are not \
-                supported yet";
+    let hint = "ensure an X11 display is reachable (DISPLAY set); Wayland is handled by the \
+                xdg-desktop-portal backend before Enigo is constructed";
     format!("Could not initialize desktop input simulation — {hint}: {error}")
 }
 
@@ -1052,8 +1039,8 @@ const MAX_TARGETS: usize = 64;
 const MAX_ELEMENTS: usize = 256;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const WAYLAND_PORTAL_MESSAGE: &str =
-    "Wayland requires an approved xdg-desktop-portal RemoteDesktop/InputCapture/libei path; \
-     Little Monkey will not bypass compositor security";
+    "Wayland clipboard read requires an explicit xdg-desktop-portal Clipboard grant; \
+     Little Monkey will not fall back to compositor-bypassing clipboard access";
 
 #[derive(Default, Deserialize)]
 struct NativeSnapshot {
@@ -1283,13 +1270,14 @@ fn native_snapshot() -> Result<NativeSnapshot, String> {
     }
     #[cfg(target_os = "linux")]
     {
-        if is_wayland_session_from_env() {
-            return Err(WAYLAND_PORTAL_MESSAGE.to_string());
-        }
+        // AT-SPI is display-server independent and remains the semantic source
+        // of truth on both X11 and Wayland. Only X11 needs wmctrl normalization.
         let bytes = run_native_command("python3", &["-c", LINUX_ATSPI_SCRIPT])?;
         let mut snapshot: NativeSnapshot = serde_json::from_slice(&bytes)
             .map_err(|error| format!("Linux AT-SPI returned invalid data: {error}"))?;
-        normalize_linux_window_ids(&mut snapshot);
+        if !is_wayland_session_from_env() {
+            normalize_linux_window_ids(&mut snapshot);
+        }
         return Ok(snapshot);
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -1638,7 +1626,29 @@ public static class LMWindow { [DllImport("user32.dll")] public static extern bo
         #[cfg(target_os = "linux")]
         {
             if is_wayland_session_from_env() {
-                return Err(WAYLAND_PORTAL_MESSAGE.to_string());
+                let provider_window_id = target
+                    .provider_window_id
+                    .as_deref()
+                    .unwrap_or(&target.window_id);
+                let index = window_index(provider_window_id)?;
+                let bytes = run_native_command_with_env(
+                    "python3",
+                    &["-c", LINUX_ATSPI_FOCUS_SCRIPT],
+                    &[
+                        ("LM_APP_NAME", target.application_name.clone()),
+                        ("LM_WINDOW_INDEX", index.to_string()),
+                    ],
+                )?;
+                if serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .ok()
+                    .and_then(|json| json.get("focused").and_then(serde_json::Value::as_bool))
+                    == Some(true)
+                {
+                    return Ok(());
+                }
+                return Err(
+                    "Linux AT-SPI did not confirm the requested Wayland window focus".to_string(),
+                );
             }
             return Command::new("wmctrl")
                 .args(["-ia", &target.window_id])
@@ -1787,6 +1797,38 @@ public static class LMWindow { [DllImport("user32.dll")] public static extern bo
         {
             return Err("Screenshot region is outside the verified target bounds".to_string());
         }
+        #[cfg(target_os = "linux")]
+        if is_wayland_session_from_env() {
+            let full_target = (requested.x - target.bounds.x).abs() < 0.5
+                && (requested.y - target.bounds.y).abs() < 0.5
+                && (requested.width - target.bounds.width).abs() < 0.5
+                && (requested.height - target.bounds.height).abs() < 0.5;
+            if !full_target {
+                return Err(
+                    "WAYLAND_CAPABILITY_UNAVAILABLE: Wayland screenshot subregions are refused; request the full verified target window"
+                        .to_string(),
+                );
+            }
+            let before = checked_target(
+                native_snapshot()?,
+                &target.application_id,
+                Some(&target.window_id),
+                true,
+            )?;
+            let bytes = wayland_portal::screenshot_active_window()?;
+            // Re-check after capture as well. If focus changed during the portal
+            // request, discard the image rather than returning ambiguous pixels.
+            let after = checked_target(
+                native_snapshot()?,
+                &target.application_id,
+                Some(&target.window_id),
+                true,
+            )?;
+            if before.target_id != after.target_id {
+                return Err("Target changed while the Wayland screenshot was captured".to_string());
+            }
+            return Ok((bytes, after.bounds));
+        }
         let path = std::env::temp_dir().join(format!("little-monkey-shot-{}.png", Uuid::new_v4()));
         let x = requested.x.round() as i32;
         let y = requested.y.round() as i32;
@@ -1818,9 +1860,6 @@ public static class LMWindow { [DllImport("user32.dll")] public static extern bo
             .map_err(|error| format!("Could not capture Windows screenshot: {error}"));
         #[cfg(target_os = "linux")]
         let result = {
-            if is_wayland_session_from_env() {
-                return Err(WAYLAND_PORTAL_MESSAGE.to_string());
-            }
             let geometry = format!("{x},{y} {width}x{height}");
             let scrot = Command::new("scrot")
                 .args(["-a", &geometry])
@@ -2322,6 +2361,42 @@ if($performed) { [ordered]@{semantic=$true}|ConvertTo-Json -Compress } else { [o
 "#;
 
 #[cfg(target_os = "linux")]
+const LINUX_ATSPI_FOCUS_SCRIPT: &str = r#"
+import os, json, time
+import pyatspi
+app_name=os.environ['LM_APP_NAME']; wi=int(os.environ['LM_WINDOW_INDEX'])
+a=None
+for candidate in list(pyatspi.Registry.getDesktop(0)):
+ if str(getattr(candidate,'name','')) == app_name: a=candidate; break
+if a is None: raise SystemExit('AT-SPI application is stale')
+windows=list(a)
+if wi < 0 or wi >= len(windows): raise SystemExit('AT-SPI window is stale')
+w=windows[wi]; attempted=False
+try:
+ w.queryComponent().grabFocus(); attempted=True
+except Exception:
+ pass
+try:
+ actions=w.queryAction()
+ for i in range(actions.nActions):
+  name=(actions.getName(i) or '').lower()
+  if name in ('activate','raise','focus'):
+   actions.doAction(i); attempted=True; break
+except Exception:
+ pass
+focused=False
+for _ in range(10):
+ try:
+  state=w.getState()
+  focused=state.contains(pyatspi.STATE_ACTIVE) or state.contains(pyatspi.STATE_FOCUSED)
+ except Exception:
+  focused=False
+ if focused: break
+ time.sleep(0.05)
+print(json.dumps({'focused':bool(focused and attempted)},separators=(',',':')))
+"#;
+
+#[cfg(target_os = "linux")]
 const LINUX_ATSPI_ACTION_SCRIPT: &str = r#"
 import os, json
 import pyatspi
@@ -2454,9 +2529,6 @@ fn native_semantic_action(
     }
     #[cfg(target_os = "linux")]
     {
-        if is_wayland_session_from_env() {
-            return Err(WAYLAND_PORTAL_MESSAGE.to_string());
-        }
         let provider_window_id = target
             .provider_window_id
             .as_deref()
@@ -5973,8 +6045,9 @@ mod tests {
     }
 
     #[test]
-    fn wayland_unsupported_message_is_clear_about_x11_working() {
-        assert!(WAYLAND_UNSUPPORTED_MESSAGE.contains("Wayland"));
-        assert!(WAYLAND_UNSUPPORTED_MESSAGE.contains("X11 sessions work today"));
+    fn wayland_clipboard_failure_remains_explicit_and_fail_closed() {
+        assert!(WAYLAND_PORTAL_MESSAGE.contains("Wayland clipboard"));
+        assert!(WAYLAND_PORTAL_MESSAGE.contains("xdg-desktop-portal"));
+        assert!(WAYLAND_PORTAL_MESSAGE.contains("will not fall back"));
     }
 }
