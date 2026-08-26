@@ -825,16 +825,19 @@ impl<R: CommandRunner> ServiceManager<R> {
     pub fn render_manifest(&self, paths: &DaemonPaths) -> Result<String, String> {
         let executable = utf8_path(&self.executable, "monkey executable")?;
         let agent_home = utf8_path(&self.agent_home, "agent home")?;
+        let user_home = utf8_path(&self.home, "user home")?;
         Ok(match self.platform {
             ServicePlatform::Launchd => {
                 let launchd_label = self.launchd_label();
                 let stdout = paths.logs.join("service.stdout.log");
                 let stderr = paths.logs.join("service.stderr.log");
                 format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key><string>{launchd_label}</string>\n  <key>ProgramArguments</key>\n  <array><string>{}</string><string>--profile</string><string>{}</string><string>daemon</string><string>serve</string></array>\n  <key>EnvironmentVariables</key><dict><key>LITTLE_MONKEY_HOME</key><string>{}</string></dict>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>ProcessType</key><string>Background</string>\n  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict>\n</plist>\n",
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key><string>{launchd_label}</string>\n  <key>ProgramArguments</key>\n  <array><string>{}</string><string>--profile</string><string>{}</string><string>daemon</string><string>serve</string></array>\n  <key>EnvironmentVariables</key>\n  <dict>\n    <key>LITTLE_MONKEY_HOME</key><string>{}</string>\n    <key>HOME</key><string>{}</string>\n  </dict>\n  <key>WorkingDirectory</key><string>{}</string>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>ProcessType</key><string>Background</string>\n  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict>\n</plist>\n",
                     xml_escape(&executable),
                     xml_escape(&self.profile_id),
                     xml_escape(&agent_home),
+                    xml_escape(user_home),
+                    xml_escape(user_home),
                     xml_escape(utf8_path(&stdout, "service stdout log")?),
                     xml_escape(utf8_path(&stderr, "service stderr log")?),
                 )
@@ -844,7 +847,7 @@ impl<R: CommandRunner> ServiceManager<R> {
                 systemd_environment_escape(&format!("LITTLE_MONKEY_HOME={agent_home}")),
                 systemd_escape(&executable),
                 systemd_escape(&self.profile_id),
-                systemd_escape(utf8_path(&self.home, "user home")?),
+                systemd_escape(user_home),
             ),
             ServicePlatform::WindowsTask => {
                 let script = format!(
@@ -1532,8 +1535,6 @@ fn command_output_text(bytes: &[u8]) -> String {
         (&bytes[2..], Some(true))
     } else if bytes.len() >= 2 && bytes[1] == 0 {
         (bytes, Some(false))
-    } else {
-        (bytes, None)
     };
     let Some(big_endian) = utf16 else {
         return String::from_utf8_lossy(bytes).into_owned();
@@ -1905,6 +1906,12 @@ mod tests {
             assert!(command.contains("daemon"));
             assert!(command.contains("serve"));
             assert!(command.contains("LITTLE_MONKEY_HOME"));
+            if platform == ServicePlatform::Launchd {
+                assert!(rendered.contains("<key>HOME</key><string>/home/test</string>"));
+                assert!(rendered.contains(
+                    "<key>WorkingDirectory</key><string>/home/test</string>"
+                ));
+            }
             assert!(!rendered.contains("--agent-home"));
             assert!(!command.contains("--agent-home"));
             assert!(command.contains("profile"));
