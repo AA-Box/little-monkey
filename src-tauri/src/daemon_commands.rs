@@ -2099,7 +2099,8 @@ async fn execute_registered_target_placement(
         .map_err(|error| error.to_string())?;
         let target = crate::execution_target::RemoteNodeTarget::from_snapshot(snapshot)
             .map_err(|error| error.to_string())?;
-        (Box::new(target), None)
+        let target: Box<dyn crate::execution_target::ExecutionTarget> = Box::new(target);
+        (target, None)
     } else {
         return Err(format!("unknown execution target '{}'", request.target_id));
     };
@@ -2338,10 +2339,10 @@ async fn execute_registered_target_placement(
                 .unwrap_or_default()
         ));
     }
-    let runner_result = target
-        .events(&handle, 0)
-        .ok()
-        .and_then(|events| autonomous_runner_result_from_events(&events));
+    let runner_events = target.events(&handle, 0).ok();
+    let runner_result = runner_events
+        .as_deref()
+        .and_then(autonomous_runner_result_from_events);
     let result = target
         .workspace_result(&handle)
         .map_err(|error| error.to_string())?;
