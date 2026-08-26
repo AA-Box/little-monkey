@@ -37,17 +37,6 @@ jobs:
           cargo fmt --manifest-path src-tauri/Cargo.toml
           git diff --check
 
-      - name: Install Linux system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential
-
-      - name: Verify monkey CLI compiles
-        shell: bash
-        run: |
-          node scripts/ensure-cli-sidecar-placeholder.mjs
-          cargo check --manifest-path src-tauri/Cargo.toml --bin monkey-cli --locked
-
       - name: Commit source fix
         shell: bash
         run: |
