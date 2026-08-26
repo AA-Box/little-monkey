@@ -4,7 +4,7 @@ import {
   visibleProviderModels,
   visibleProviderModelsForProvider,
 } from "../../lib/providerModelSelection";
-import { providerModelsEmptyStateKey } from "./ModelSwitcher";
+import { modelMatchesQuery, providerModelsEmptyStateKey } from "./ModelSwitcher";
 
 const models = [{ id: "model-a" }, { id: "model-b" }, { id: "model-c" }];
 
@@ -68,5 +68,17 @@ describe("providerModelsEmptyStateKey", () => {
   it("distinguishes an empty curation from a provider with no loaded inventory", () => {
     expect(providerModelsEmptyStateKey(3)).toBe("ModelSwitcher.noCloudModelsSelected");
     expect(providerModelsEmptyStateKey(0)).toBe("ModelSwitcher.noCloudModelsConfigured");
+  });
+});
+
+describe("modelMatchesQuery", () => {
+  it("matches model ids, display names, and provider labels case-insensitively", () => {
+    expect(modelMatchesQuery("SONNET", "claude-sonnet-4-5", "Claude Sonnet 4.5")).toBe(true);
+    expect(modelMatchesQuery("anthropic", "claude-sonnet-4-5", "Anthropic")).toBe(true);
+    expect(modelMatchesQuery("gpt", "claude-sonnet-4-5", "Anthropic")).toBe(false);
+  });
+
+  it("treats blank search as showing every model", () => {
+    expect(modelMatchesQuery("   ", "anything")).toBe(true);
   });
 });
