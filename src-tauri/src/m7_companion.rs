@@ -1429,7 +1429,7 @@ fn normalize_extension_transcript(
 
 async fn transcribe_path(
     state: &M7CompanionState,
-    job_id: &str,
+    _job_id: &str,
     path: &Path,
     cancellation: &CancellationToken,
     diarize: bool,

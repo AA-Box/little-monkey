@@ -15,7 +15,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use futures_util::StreamExt;
 use opus_decoder::OpusDecoder;
 use sha2::{Digest, Sha256};
-use symphonia::core::audio::Audio;
 use symphonia::core::codecs::audio::{well_known::CODEC_ID_OPUS, AudioDecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
@@ -409,7 +408,7 @@ fn decode_audio(path: &Path, cancellation: &CancellationToken) -> Result<Vec<f32
             }
             Err(error) => return Err(format!("Decode recorded audio: {error}")),
         };
-        let rate = audio.spec().rate;
+        let rate = audio.spec().rate();
         match source_rate {
             Some(previous) if previous != rate => {
                 return Err("Recorded audio changes sample rate mid-stream".to_string())
@@ -417,7 +416,7 @@ fn decode_audio(path: &Path, cancellation: &CancellationToken) -> Result<Vec<f32
             None => source_rate = Some(rate),
             _ => {}
         }
-        let channels = audio.spec().channels.count();
+        let channels = audio.spec().channels().count();
         let mut interleaved = vec![0.0f32; audio.samples_interleaved()];
         audio.copy_to_slice_interleaved(&mut interleaved);
         downmix_interleaved(&interleaved, channels, &mut mono)?;
@@ -472,7 +471,7 @@ fn run_whisper(
         .clamp(1, 8) as i32;
     params.set_n_threads(threads);
     let cancel_for_callback = cancellation.clone();
-    params.set_abort_callback_safe(Some(move || cancel_for_callback.is_cancelled()));
+    params.set_abort_callback_safe(move || cancel_for_callback.is_cancelled());
     if let Err(error) = state.full(params, &pcm) {
         if cancellation.is_cancelled() {
             return Err("Transcription cancelled".to_string());
