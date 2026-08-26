@@ -3,6 +3,7 @@ import { AlertTriangle, RefreshCw, ShieldCheck } from "lucide-react";
 import { Button, Tabs } from "../ui";
 import { useT } from "../../lib/i18n";
 import { useEcosystemStore } from "../../store/ecosystemStore";
+import { UnifiedEcosystemDiscover } from "./UnifiedEcosystemDiscover";
 import { EcosystemDiscover } from "./EcosystemDiscover";
 import { EcosystemPackages } from "./EcosystemPackages";
 import { EcosystemPlugins } from "./EcosystemPlugins";
@@ -14,11 +15,11 @@ const ExtensionMarketplacePanel = lazy(async () => {
   return { default: module.ExtensionMarketplacePanel };
 });
 
-type EcosystemTab = "marketplace" | "extensions" | "installed" | "plugins" | "connections" | "apps" | "workflows" | "runs";
+type EcosystemTab = "discover" | "packages" | "extensions" | "installed" | "plugins" | "connections" | "apps" | "workflows" | "runs";
 
 export function EcosystemPanel() {
   const { t } = useT();
-  const [tab, setTab] = useState<EcosystemTab>("marketplace");
+  const [tab, setTab] = useState<EcosystemTab>("discover");
   const { error, clearError, busy, refreshPackages, refreshWorkflows } = useEcosystemStore();
 
   useEffect(() => {
@@ -26,8 +27,9 @@ export function EcosystemPanel() {
   }, [refreshPackages, refreshWorkflows]);
 
   const tabs = [
-    { id: "marketplace", label: t("EcosystemPanel.marketplace") },
-    { id: "extensions", label: "Extensions" },
+    { id: "discover", label: "Discover" },
+    { id: "packages", label: "Packages" },
+    { id: "extensions", label: "WASM" },
     { id: "installed", label: t("EcosystemPanel.installed") },
     { id: "plugins", label: t("EcosystemPanel.plugins") },
     { id: "connections", label: t("EcosystemPanel.connections") },
@@ -67,7 +69,14 @@ export function EcosystemPanel() {
         </div>
       )}
 
-      {tab === "marketplace" && <EcosystemDiscover />}
+      {tab === "discover" && (
+        <UnifiedEcosystemDiscover
+          onOpenPackages={() => setTab("packages")}
+          onOpenExtensions={() => setTab("extensions")}
+          onOpenMcp={() => setTab("apps")}
+        />
+      )}
+      {tab === "packages" && <EcosystemDiscover />}
       {tab === "extensions" && (
         <Suspense fallback={<div className="rounded-lg border border-border bg-surface p-5 text-center text-xs text-muted">Loading executable extensions…</div>}>
           <ExtensionMarketplacePanel />
