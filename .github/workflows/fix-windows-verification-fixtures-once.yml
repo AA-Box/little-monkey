@@ -34,8 +34,8 @@ jobs:
 
           learning = Path("src-tauri/src/skill_learning.rs")
           text = learning.read_text()
-          old = '        let command = r#"findstr /L /C:\"with_retry(\" src\\\\uploader.rs > nul"#;'
-          new = '        let command = r#"findstr /L /C:with_retry src\\\\uploader.rs > nul"#;'
+          old = r'        let command = r#"findstr /L /C:"with_retry(" src\uploader.rs > nul"#;'
+          new = r'        let command = r#"findstr /L /C:with_retry src\uploader.rs > nul"#;'
           if text.count(old) != 1:
               raise SystemExit(f"expected exactly one Windows skill verification fixture, found {text.count(old)}")
           learning.write_text(text.replace(old, new, 1))
