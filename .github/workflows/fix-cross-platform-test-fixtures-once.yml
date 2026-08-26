@@ -1,0 +1,100 @@
+name: Apply cross-platform test fixture fixes once
+
+on:
+  push:
+    branches:
+      - fix/zero-config-whisper
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/zero-config-whisper
+          fetch-depth: 0
+
+      - name: Patch platform-specific test fixtures
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: Path, old: str, new: str) -> None:
+              text = path.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, found {count}: {old[:100]!r}")
+              path.write_text(text.replace(old, new, 1))
+
+          verify = Path("src-tauri/src/verify.rs")
+          for test_name, old_decl, new_decl in [
+              (
+                  "run_command_impl_times_out_a_long_running_command",
+                  'let mut cmd = command("c1", "sleep 30");',
+                  'let mut cmd = command("c1", &long_running_command());',
+              ),
+              (
+                  "a_verify_command_stopped_by_a_limit_persists_the_typed_breach",
+                  'let mut cmd = command("c1", "sleep 30");',
+                  'let mut cmd = command("c1", &long_running_command());',
+              ),
+              (
+                  "a_cancelled_verify_command_closes_as_cancelled_and_not_as_a_limit",
+                  'let cmd = command("c1", "sleep 30");',
+                  'let cmd = command("c1", &long_running_command());',
+              ),
+              (
+                  "run_command_impl_is_killed_by_tool_cancel_notify",
+                  'let cmd = command("c1", "sleep 30");',
+                  'let cmd = command("c1", &long_running_command());',
+              ),
+          ]:
+              text = verify.read_text()
+              marker = f"async fn {test_name}()"
+              start = text.find(marker)
+              if start < 0:
+                  raise SystemExit(f"{verify}: missing test {test_name}")
+              end = text.find("\n    }", start)
+              if end < 0:
+                  raise SystemExit(f"{verify}: could not bound test {test_name}")
+              block = text[start:end]
+              if block.count(old_decl) != 1:
+                  raise SystemExit(f"{verify}: {test_name} expected one long-running fixture, found {block.count(old_decl)}")
+              block = block.replace(old_decl, new_decl, 1)
+              verify.write_text(text[:start] + block + text[end:])
+
+          skill = Path("src-tauri/src/skill_learning.rs")
+          replace_once(
+              skill,
+              '''    fn verification_command() -> crate::verify::VerifyCommand {\n        crate::verify::VerifyCommand {\n            id: "verify-1".to_string(),\n            label: "retry present".to_string(),\n            kind: "test".to_string(),\n            command: "grep -q 'with_retry(' src/uploader.rs".to_string(),\n            enabled: true,\n            timeout_secs: Some(30),\n        }\n    }''',
+              '''    fn verification_command() -> crate::verify::VerifyCommand {\n        #[cfg(target_os = "windows")]\n        let command = r#"findstr /L /C:\"with_retry(\" src\\uploader.rs > nul"#;\n        #[cfg(not(target_os = "windows"))]\n        let command = "grep -q 'with_retry(' src/uploader.rs";\n        crate::verify::VerifyCommand {\n            id: "verify-1".to_string(),\n            label: "retry present".to_string(),\n            kind: "test".to_string(),\n            command: command.to_string(),\n            enabled: true,\n            timeout_secs: Some(30),\n        }\n    }''',
+          )
+          replace_once(
+              skill,
+              '''    fn read_only_verification_command() -> crate::verify::VerifyCommand {\n        crate::verify::VerifyCommand {\n            id: "verify-1".to_string(),\n            label: "sources present".to_string(),\n            kind: "test".to_string(),\n            command: "test -f src/uploader.rs".to_string(),\n            enabled: true,\n            timeout_secs: Some(30),\n        }\n    }''',
+              '''    fn read_only_verification_command() -> crate::verify::VerifyCommand {\n        #[cfg(target_os = "windows")]\n        let command = r#"if exist \"src\\uploader.rs\" (exit /b 0) else (exit /b 1)"#;\n        #[cfg(not(target_os = "windows"))]\n        let command = "test -f src/uploader.rs";\n        crate::verify::VerifyCommand {\n            id: "verify-1".to_string(),\n            label: "sources present".to_string(),\n            kind: "test".to_string(),\n            command: command.to_string(),\n            enabled: true,\n            timeout_secs: Some(30),\n        }\n    }''',
+          )
+
+          mcp = Path("src-tauri/tests/mcp_stdio.rs")
+          replace_once(
+              mcp,
+              '''    // Give the (separate) server process a moment to receive the\n    // notification and write the marker before asserting on it.\n    let mut seen = false;\n    for _ in 0..50 {\n        if marker.exists() {\n            seen = true;\n            break;\n        }\n        tokio::time::sleep(std::time::Duration::from_millis(100)).await;\n    }\n    assert!(\n        seen,\n        "server never observed a notifications/cancelled for the cancelled call"\n    );\n    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "cancelled");''',
+              '''    // `std::fs::write` creates/truncates the marker before its bytes are\n    // necessarily visible to this process. Poll the evidence we actually care\n    // about instead of treating mere file existence as a completed write.\n    let mut observed = String::new();\n    for _ in 0..50 {\n        if let Ok(contents) = std::fs::read_to_string(&marker) {\n            if contents == "cancelled" {\n                observed = contents;\n                break;\n            }\n        }\n        tokio::time::sleep(std::time::Duration::from_millis(100)).await;\n    }\n    assert_eq!(\n        observed,\n        "cancelled",\n        "server never completed the notifications/cancelled marker write"\n    );''',
+          )
+          PY
+
+      - name: Commit fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/src/verify.rs src-tauri/src/skill_learning.rs src-tauri/tests/mcp_stdio.rs
+          git diff --cached --check
+          git commit -m "test: make cancellation and verification fixtures cross-platform"
+          git push origin HEAD:fix/zero-config-whisper
