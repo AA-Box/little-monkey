@@ -102,6 +102,7 @@ jobs:
     timeout-minutes: 25
     env:
       CARGO_PROFILE_RELEASE_DEBUG: 0
+      RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v4
       - name: Install build and audio dependencies
@@ -133,4 +134,4 @@ jobs:
       - name: Auto-provision model and transcribe both production formats
         # Exercise the optimized application path used for shipping, including
         # model provisioning, decode, inference and transcript extraction.
-        run: cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib local_whisper::tests::e2e_auto_provisions_and_transcribes_real_audio -- --nocapture
+        run: time cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib local_whisper::tests::e2e_auto_provisions_and_transcribes_real_audio -- --nocapture
