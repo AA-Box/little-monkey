@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Cloud, Cpu, Search, Server, X } from "lucide-react";
 
@@ -23,17 +23,36 @@ const SOURCE_TABS: Array<{ id: SourceTab; icon: typeof Cloud; labelKey: string }
   { id: "ollama", icon: Server, labelKey: "ModelSwitcher.ollamaSectionLabel" },
 ];
 
+function providerReady(provider: ProviderConfig): boolean {
+  return provider.has_key || provider.is_extension;
+}
+
 function providerSort(a: ProviderConfig, b: ProviderConfig): number {
-  if (a.has_key !== b.has_key) return a.has_key ? -1 : 1;
+  const aReady = providerReady(a);
+  const bReady = providerReady(b);
+  if (aReady !== bReady) return aReady ? -1 : 1;
   if (a.is_custom !== b.is_custom) return a.is_custom ? 1 : -1;
   return a.label.localeCompare(b.label);
+}
+
+function targetKey(
+  activeProvider: "local" | "ollama" | "provider",
+  localPath: string | null | undefined,
+  ollamaModel: string | null,
+  providerId: string | null,
+  providerModel: string | null,
+): string {
+  if (activeProvider === "local") return `local:${localPath ?? ""}`;
+  if (activeProvider === "ollama") return `ollama:${ollamaModel ?? ""}`;
+  return `provider:${providerId ?? ""}:${providerModel ?? ""}`;
 }
 
 /**
  * Point-of-use model setup. This intentionally owns no provider transport or
  * credential logic: it drives the same modelStore actions Settings already
  * uses, so keys still land in the OS keychain and model discovery still goes
- * through the Rust provider proxy.
+ * through the Rust provider proxy. Local and Ollama setup reuse their existing
+ * production panels instead of creating a second install/runtime path.
  */
 export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
   const providers = useModelStore((s) => s.providers);
@@ -44,6 +63,11 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
   const setProviderKey = useModelStore((s) => s.setProviderKey);
   const addCustomProvider = useModelStore((s) => s.addCustomProvider);
   const useProviderModel = useModelStore((s) => s.useProviderModel);
+  const activeProvider = useModelStore((s) => s.activeProvider);
+  const activeLocalModel = useModelStore((s) => s.active);
+  const activeOllamaModel = useModelStore((s) => s.activeOllamaModel);
+  const activeProviderId = useModelStore((s) => s.activeProviderId);
+  const activeProviderModel = useModelStore((s) => s.activeProviderModel);
   const providerModelFilters = useSettingsStore((s) => s.providerModelFilters);
   const setProviderModelSelection = useSettingsStore((s) => s.setProviderModelSelection);
   const { t } = useT();
@@ -59,10 +83,30 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
   const [customApiKey, setCustomApiKey] = useState("");
   const [customBusy, setCustomBusy] = useState(false);
   const [customError, setCustomError] = useState<string | null>(null);
+  const wasOpenRef = useRef(false);
+  const activationBaselineRef = useRef("");
+
+  const currentTargetKey = targetKey(
+    activeProvider,
+    activeLocalModel?.path,
+    activeOllamaModel,
+    activeProviderId,
+    activeProviderModel,
+  );
+
+  useEffect(() => {
+    if (open && !wasOpenRef.current) {
+      activationBaselineRef.current = currentTargetKey;
+    }
+    wasOpenRef.current = open;
+  }, [open, currentTargetKey]);
 
   useEffect(() => {
     if (!open) return;
-    void refreshProviders();
+    void refreshProviders().catch(() => {
+      // Provider-specific errors are already kept in modelStore; the setup
+      // surface remains usable for local/Ollama even if provider refresh fails.
+    });
   }, [open, refreshProviders]);
 
   useEffect(() => {
@@ -74,10 +118,32 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [open, onClose]);
 
+  // Reused local/Ollama panels own their activation actions. Close this dialog
+  // once one of those actions changes the active target, matching the cloud
+  // flow's select-and-return-to-chat behavior.
+  useEffect(() => {
+    if (!open || currentTargetKey === activationBaselineRef.current) return;
+    if (source === "local" && activeProvider === "local" && activeLocalModel?.path) {
+      onClose();
+    }
+    if (source === "ollama" && activeProvider === "ollama" && activeOllamaModel) {
+      onClose();
+    }
+  }, [
+    activeLocalModel?.path,
+    activeOllamaModel,
+    activeProvider,
+    currentTargetKey,
+    onClose,
+    open,
+    source,
+  ]);
+
   const sortedProviders = useMemo(() => [...providers].sort(providerSort), [providers]);
   const selectedProvider = selectedProviderId
     ? providers.find((provider) => provider.id === selectedProviderId) ?? null
     : null;
+  const selectedProviderReady = selectedProvider ? providerReady(selectedProvider) : false;
   const selectedModels = selectedProvider ? providerModels[selectedProvider.id] ?? [] : [];
   const filteredModels = useMemo(() => {
     const needle = modelSearch.trim().toLowerCase();
@@ -86,9 +152,22 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
   }, [modelSearch, selectedModels]);
 
   useEffect(() => {
-    if (!open || !selectedProvider?.has_key || selectedModels.length > 0) return;
-    void refreshProviderModels(selectedProvider.id);
-  }, [open, refreshProviderModels, selectedModels.length, selectedProvider]);
+    if (!open || selectedProviderId || sortedProviders.length === 0) return;
+    const preferred =
+      (activeProvider === "provider" && activeProviderId
+        ? sortedProviders.find((provider) => provider.id === activeProviderId)
+        : undefined) ??
+      sortedProviders.find(providerReady) ??
+      sortedProviders[0];
+    setSelectedProviderId(preferred.id);
+  }, [activeProvider, activeProviderId, open, selectedProviderId, sortedProviders]);
+
+  useEffect(() => {
+    if (!open || !selectedProvider || !selectedProviderReady || selectedModels.length > 0) return;
+    void refreshProviderModels(selectedProvider.id).catch(() => {
+      // Error text is stored in providerKeyError and rendered below.
+    });
+  }, [open, refreshProviderModels, selectedModels.length, selectedProvider, selectedProviderReady]);
 
   if (!open) return null;
 
@@ -96,14 +175,17 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
     setSelectedProviderId(provider.id);
     setApiKey("");
     setModelSearch("");
+    setCustomError(null);
   };
 
   const connectSelectedProvider = async () => {
-    if (!selectedProvider || !apiKey.trim() || connecting) return;
+    if (!selectedProvider || selectedProvider.is_extension || !apiKey.trim() || connecting) return;
     setConnecting(true);
     try {
       await setProviderKey(selectedProvider.id, apiKey.trim());
       setApiKey("");
+    } catch {
+      // modelStore owns and exposes the provider-specific failure message.
     } finally {
       setConnecting(false);
     }
@@ -114,6 +196,8 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
     setRefreshing(true);
     try {
       await refreshProviderModels(selectedProvider.id);
+    } catch {
+      // modelStore owns and exposes the provider-specific failure message.
     } finally {
       setRefreshing(false);
     }
@@ -220,7 +304,11 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
                     }`}
                   >
                     <span className="min-w-0 truncate">{provider.label}</span>
-                    {provider.has_key && <StatusPill tone="success">{t("ProviderCard.connected")}</StatusPill>}
+                    {provider.is_extension ? (
+                      <StatusPill tone="neutral">{t("ProviderCard.extension")}</StatusPill>
+                    ) : provider.has_key ? (
+                      <StatusPill tone="success">{t("ProviderCard.connected")}</StatusPill>
+                    ) : null}
                   </button>
                 ))}
 
@@ -267,7 +355,7 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
                   <div className="flex min-h-48 items-center justify-center text-center text-sm text-faint">
                     Choose a provider to connect it and pick a model.
                   </div>
-                ) : !selectedProvider.has_key ? (
+                ) : !selectedProviderReady ? (
                   <div className="mx-auto flex max-w-lg flex-col gap-3 py-6">
                     <div>
                       <h3 className="text-sm font-semibold text-foreground">{selectedProvider.label}</h3>
@@ -303,7 +391,11 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
                           <h3 className="truncate text-sm font-semibold text-foreground">{selectedProvider.label}</h3>
-                          <StatusPill tone="success">{t("ProviderCard.connected")}</StatusPill>
+                          {selectedProvider.is_extension ? (
+                            <StatusPill tone="neutral">{t("ProviderCard.extension")}</StatusPill>
+                          ) : (
+                            <StatusPill tone="success">{t("ProviderCard.connected")}</StatusPill>
+                          )}
                         </div>
                         <p className="mt-0.5 text-xs text-muted">Pick a model to use it in this chat.</p>
                       </div>
