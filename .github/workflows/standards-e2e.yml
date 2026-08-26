@@ -60,6 +60,9 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Typecheck Standards integration
+        run: pnpm typecheck
+
       - name: Standards lifecycle and discovery fixtures
         run: pnpm vitest run src/lib/standards.test.ts src/lib/standardsDiscovery.test.ts
 
