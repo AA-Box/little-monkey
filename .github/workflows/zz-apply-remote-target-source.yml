@@ -1,0 +1,261 @@
+name: Apply remote target source patch
+
+on:
+  push:
+    branches: [fix/remote-execution-e2e-ssh-remotenode]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ !contains(github.event.head_commit.message, '[remote-target-patched]') }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/remote-execution-e2e-ssh-remotenode
+          fetch-depth: 0
+      - name: Patch execution target integration
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          # execution_target.rs: carry the frozen RunSpec through the target seam,
+          # and move RemoteNodeTarget into its production adapter module.
+          p = Path('src-tauri/src/execution_target.rs')
+          s = p.read_text()
+          old = '''    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+              pub input_files: Vec<WorkspaceResultFile>,
+          }'''
+          if old not in s:
+              raise SystemExit('RunRequest insertion anchor not found')
+          s = s.replace(old, '''    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+              pub input_files: Vec<WorkspaceResultFile>,
+              /// Optional frozen application-level run contract. Runner-style targets
+              /// execute the explicit command above; persistent paired nodes consume
+              /// this RunSpec through the existing signed K17 placement plane.
+              #[serde(default, skip_serializing_if = "Option::is_none")]
+              pub run_spec: Option<crate::run_protocol::RunSpec>,
+          }''', 1)
+          pattern = re.compile(r'''\n#\[derive\(Clone\)\]\npub struct RemoteNodeTarget \{.*?\n\}\n\n#\[derive\(Clone, Debug, PartialEq, Eq, Serialize, Deserialize\)\]\n#\[serde\(rename_all = "camelCase", tag = "kind"\)\]\npub enum TargetConfig''', re.S)
+          replacement = '''
+          mod remote_node;
+          pub use remote_node::RemoteNodeTarget;
+
+          #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+          #[serde(rename_all = "camelCase", tag = "kind")]
+          pub enum TargetConfig'''
+          s, n = pattern.subn(replacement, s, count=1)
+          if n != 1:
+              raise SystemExit(f'RemoteNodeTarget block replacement count={n}')
+          old = '''                        workspace_transfer: Some(cas_transfer),
+                                  input_files: Vec::new(),
+                              }'''
+          if old not in s:
+              raise SystemExit('runner test RunRequest anchor not found')
+          s = s.replace(old, '''                        workspace_transfer: Some(cas_transfer),
+                                  input_files: Vec::new(),
+                                  run_spec: None,
+                              }''', 1)
+          p.write_text(s)
+
+          # daemon_commands.rs: instantiate a paired K17 alias as a target when it
+          # is first used, persist the probed identity for restart recovery, and
+          # route every backend through the same executor loop.
+          p = Path('src-tauri/src/daemon_commands.rs')
+          s = p.read_text()
+          old = '''    } else if request
+                  .kind
+                  .as_deref()
+                  .is_some_and(|kind| matches!(kind.replace('-', "_").as_str(), "docker"))
+              {
+                  let (_, target) = configured_docker_target(&data_dir, &request.target_id)?;
+                  (target, None)
+              } else {
+                  return Err(format!("unknown execution target '{}'", request.target_id));
+              };'''
+          if old not in s:
+              raise SystemExit('generic target resolution anchor not found')
+          s = s.replace(old, '''    } else if request
+                  .kind
+                  .as_deref()
+                  .is_some_and(|kind| matches!(kind.replace('-', "_").as_str(), "docker"))
+              {
+                  let (_, target) = configured_docker_target(&data_dir, &request.target_id)?;
+                  (target, None)
+              } else if request
+                  .kind
+                  .as_deref()
+                  .is_some_and(|kind| matches!(kind.replace('-', "_").as_str(), "remote_node"))
+              {
+                  validate_id("remote node alias", &request.target_id)?;
+                  let identity = crate::execution_target::TargetIdentity {
+                      stable_id: request.target_id.clone(),
+                      display_name: request.target_id.clone(),
+                      kind: crate::execution_target::ExecutionTargetKind::RemoteNode,
+                      endpoint: None,
+                      verified_identity: None,
+                      platform: "remote-node".to_string(),
+                      runner_version: "k17".to_string(),
+                      protocol_version: crate::execution_target::EXECUTION_PROTOCOL_VERSION,
+                      capabilities: crate::execution_target::TargetCapabilities::default(),
+                      last_successful_probe_ms: None,
+                      trust_state: crate::execution_target::TargetTrustState::Unverified,
+                  };
+                  let snapshot = crate::execution_target::ExecutionTargetSnapshot::freeze(
+                      identity,
+                      crate::execution_target::execution_now_ms(),
+                  )
+                  .map_err(|error| error.to_string())?;
+                  let target = crate::execution_target::RemoteNodeTarget::from_snapshot(snapshot)
+                      .map_err(|error| error.to_string())?;
+                  (Box::new(target), None)
+              } else {
+                  return Err(format!("unknown execution target '{}'", request.target_id));
+              };''', 1)
+
+          old = '''    let placement_kind = match snapshot.identity.kind {
+                  crate::execution_target::ExecutionTargetKind::Docker => "docker",
+                  crate::execution_target::ExecutionTargetKind::SshRunner => "ssh_runner",
+                  _ => {
+                      return Err(format!(
+                          "execution target '{}' is not a supported autonomous runner",
+                          request.target_id
+                      ))
+                  }
+              };'''
+          if old not in s:
+              raise SystemExit('placement kind anchor not found')
+          s = s.replace(old, '''    let placement_kind = match snapshot.identity.kind {
+                  crate::execution_target::ExecutionTargetKind::Docker => "docker",
+                  crate::execution_target::ExecutionTargetKind::RemoteNode => "remote_node",
+                  crate::execution_target::ExecutionTargetKind::SshRunner => "ssh_runner",
+                  _ => {
+                      return Err(format!(
+                          "execution target '{}' is not a supported autonomous runner",
+                          request.target_id
+                      ))
+                  }
+              };''', 1)
+
+          old = '''    if let Some(config) = registry.targets.get_mut(&request.target_id) {
+                  *config.identity_mut() = snapshot.identity.clone();
+                  registry
+                      .save(&registry_path)
+                      .map_err(|error| error.to_string())?;
+              }'''
+          if old not in s:
+              raise SystemExit('target persistence anchor not found')
+          s = s.replace(old, '''    if let Some(config) = registry.targets.get_mut(&request.target_id) {
+                  *config.identity_mut() = snapshot.identity.clone();
+                  registry
+                      .save(&registry_path)
+                      .map_err(|error| error.to_string())?;
+              } else if snapshot.identity.kind == crate::execution_target::ExecutionTargetKind::RemoteNode {
+                  registry
+                      .add(crate::execution_target::TargetConfig::RemoteNode {
+                          identity: snapshot.identity.clone(),
+                      })
+                      .map_err(|error| error.to_string())?;
+                  registry
+                      .save(&registry_path)
+                      .map_err(|error| error.to_string())?;
+              }''', 1)
+
+          old = '''        workspace_transfer: Some(transfer),
+                  input_files: vec![input_file],
+              };'''
+          if old not in s:
+              raise SystemExit('daemon RunRequest anchor not found')
+          s = s.replace(old, '''        workspace_transfer: Some(transfer),
+                  input_files: vec![input_file],
+                  run_spec: Some(spec.clone()),
+              };''', 1)
+
+          pattern = re.compile(r'''/// Execute a frozen autonomous node through the selected placement backend\..*?\n#\[tauri::command\]\npub async fn autonomous_task_place_node\(\n    request: AutonomousTaskPlacementRequest,\n\) -> Result<Value, String> \{.*?\n\}\n\n/// States what this machine advertises''', re.S)
+          replacement = '''/// Execute a frozen autonomous node through the selected execution-target contract.
+          /// Backend-specific transport and workspace behavior belongs to each
+          /// `ExecutionTarget`; autonomous orchestration stays target-neutral.
+          #[tauri::command]
+          pub async fn autonomous_task_place_node(
+              request: AutonomousTaskPlacementRequest,
+          ) -> Result<Value, String> {
+              request
+                  .run_spec
+                  .validate()
+                  .map_err(|error| error.to_string())?;
+              validate_token("placement target", &request.target_id, 512)?;
+              if request.target_id.starts_with('-') {
+                  return Err("Placement target cannot start with '-'".to_string());
+              }
+              resolve_execution_target_kind(&request.target_id, request.kind.as_deref())?;
+              execute_registered_target_placement(request).await
+          }
+
+          /// States what this machine advertises'''
+          s, n = pattern.subn(replacement, s, count=1)
+          if n != 1:
+              raise SystemExit(f'autonomous_task_place_node replacement count={n}')
+          p.write_text(s)
+
+          # Frontend sends the placement kind only as a compatibility hint when a
+          # paired K17 alias has not yet been promoted into execution-targets.json.
+          p = Path('src/lib/autonomousTaskRunner.ts')
+          s = p.read_text()
+          old = '''      return await invoke<TaskNodeResult>("autonomous_task_place_node", { request: { targetId, runSpec: spec } });'''
+          if old not in s:
+              raise SystemExit('frontend invoke anchor not found')
+          s = s.replace(old, '''      return await invoke<TaskNodeResult>("autonomous_task_place_node", { request: { kind, targetId, runSpec: spec } });''', 1)
+          p.write_text(s)
+
+          # The standalone SSH acceptance test uses the same RunRequest wire but
+          # has no application-level RunSpec.
+          p = Path('src-tauri/tests/execution_target_ssh_e2e.rs')
+          s = p.read_text()
+          old = '''            workspace_transfer: Some(transfer),
+                      input_files: Vec::new(),
+                  })'''
+          if old not in s:
+              raise SystemExit('SSH test RunRequest anchor not found')
+          s = s.replace(old, '''            workspace_transfer: Some(transfer),
+                      input_files: Vec::new(),
+                      run_spec: None,
+                  })''', 1)
+          p.write_text(s)
+
+          # Avoid moving fields out of the identity while it is still being built.
+          p = Path('src-tauri/src/execution_target/remote_node.rs')
+          s = p.read_text()
+          old = '''        identity.platform = if identity.platform.trim().is_empty() {
+                      "remote-node".to_string()
+                  } else {
+                      identity.platform
+                  };
+                  identity.runner_version = if identity.runner_version.trim().is_empty() {
+                      "k17".to_string()
+                  } else {
+                      identity.runner_version
+                  };'''
+          if old not in s:
+              raise SystemExit('remote-node identity anchor not found')
+          s = s.replace(old, '''        if identity.platform.trim().is_empty() {
+                      identity.platform = "remote-node".to_string();
+                  }
+                  if identity.runner_version.trim().is_empty() {
+                      identity.runner_version = "k17".to_string();
+                  }''', 1)
+          p.write_text(s)
+          PY
+      - name: Format and commit
+        shell: bash
+        run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- src/execution_target.rs src/execution_target/remote_node.rs src/daemon_commands.rs tests/execution_target_ssh_e2e.rs
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/src/execution_target.rs src-tauri/src/execution_target/remote_node.rs src-tauri/src/daemon_commands.rs src-tauri/tests/execution_target_ssh_e2e.rs src/lib/autonomousTaskRunner.ts
+          git commit -m "feat(remote): route K17 nodes through ExecutionTarget [remote-target-patched]"
+          git push origin HEAD:fix/remote-execution-e2e-ssh-remotenode
