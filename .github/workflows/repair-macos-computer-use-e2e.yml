@@ -80,26 +80,6 @@ jobs:
               text = text.replace(anchor, helper + anchor, 1)
 
           old = '''        let first = inspect(&state, &session.session_id, &target)?;
-                  let secure = first.sensitive_element_count > 0;
-                  let disabled = first
-                      .elements
-                      .iter()
-                      .any(|element| element.label == "Disabled button" && !element.enabled);
-                  if !secure || !disabled {
-                      return Err(
-                          "production provider did not expose secure and disabled controls".to_string(),
-                      );
-                  }
-          '''
-          new = '''        let first = inspect_until_fixture_controls_ready(
-                      &state,
-                      &session.session_id,
-                      &target,
-                  )?;
-          '''
-          if old not in text:
-              # rustfmt indentation in the branch may differ; replace the exact logical block.
-              old = '''        let first = inspect(&state, &session.session_id, &target)?;
               let secure = first.sensitive_element_count > 0;
               let disabled = first
                   .elements
@@ -111,7 +91,7 @@ jobs:
                   );
               }
           '''
-              new = '''        let first = inspect_until_fixture_controls_ready(
+          new = '''        let first = inspect_until_fixture_controls_ready(
                   &state,
                   &session.session_id,
                   &target,
@@ -126,7 +106,7 @@ jobs:
       - name: Format and verify patch
         shell: bash
         run: |
-          cargo fmt --manifest-path src-tauri/Cargo.toml -- src/bin/computer-use-e2e.rs
+          rustfmt --edition 2021 src-tauri/src/bin/computer-use-e2e.rs
           git diff --check
           grep -q 'inspect_until_fixture_controls_ready' src-tauri/src/bin/computer-use-e2e.rs
 
