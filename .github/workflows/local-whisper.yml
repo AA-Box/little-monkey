@@ -29,6 +29,12 @@ on:
 permissions:
   contents: read
 
+# Never leave an obsolete Whisper acceptance run consuming a runner after a
+# newer revision of the same PR has been pushed.
+concurrency:
+  group: local-whisper-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   compile-all-release-targets:
     name: compile (${{ matrix.label }})
@@ -91,8 +97,8 @@ jobs:
   real-transcription:
     name: real WAV + browser WebM/Opus transcription
     runs-on: ubuntu-22.04
-    # A cold release build can take several minutes, but the inference itself
-    # must never be allowed to leave this workflow running indefinitely.
+    # A cold release build can take several minutes, but inference must never be
+    # allowed to leave this workflow running indefinitely.
     timeout-minutes: 25
     env:
       CARGO_PROFILE_RELEASE_DEBUG: 0
@@ -125,7 +131,6 @@ jobs:
           echo "LITTLE_MONKEY_LOCAL_WHISPER_E2E_WAV=$RUNNER_TEMP/jfk.wav" >> "$GITHUB_ENV"
           echo "LITTLE_MONKEY_LOCAL_WHISPER_E2E_WEBM=$RUNNER_TEMP/jfk.webm" >> "$GITHUB_ENV"
       - name: Auto-provision model and transcribe both production formats
-        # whisper.cpp inference must be tested with the optimized profile used by
-        # shipped builds. The unoptimized Cargo test profile makes CPU inference
-        # orders of magnitude slower and can look hung on hosted CI runners.
+        # Exercise the optimized application path used for shipping, including
+        # model provisioning, decode, inference and transcript extraction.
         run: cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib local_whisper::tests::e2e_auto_provisions_and_transcribes_real_audio -- --nocapture
