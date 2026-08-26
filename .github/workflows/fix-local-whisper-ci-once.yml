@@ -1,0 +1,90 @@
+name: Apply local Whisper CI fixes once
+
+on:
+  push:
+    branches:
+      - fix/zero-config-whisper
+    paths:
+      - '.github/workflows/fix-local-whisper-ci-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/zero-config-whisper
+          fetch-depth: 0
+      - name: Apply compile fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_exact(path: str, old: str, new: str, *, count: int = 1) -> None:
+              p = Path(path)
+              text = p.read_text()
+              actual = text.count(old)
+              if actual != count:
+                  raise SystemExit(f"{path}: expected {count} occurrence(s) of {old!r}, found {actual}")
+              p.write_text(text.replace(old, new, count))
+
+          replace_exact(
+              "src-tauri/src/local_whisper.rs",
+              "use symphonia::core::audio::Audio;\n",
+              "",
+          )
+          replace_exact(
+              "src-tauri/src/local_whisper.rs",
+              "let rate = audio.spec().rate;",
+              "let rate = audio.spec().rate();",
+          )
+          replace_exact(
+              "src-tauri/src/local_whisper.rs",
+              "let channels = audio.spec().channels.count();",
+              "let channels = audio.spec().channels().count();",
+          )
+          replace_exact(
+              "src-tauri/src/local_whisper.rs",
+              "params.set_abort_callback_safe(Some(move || cancel_for_callback.is_cancelled()));",
+              "params.set_abort_callback_safe(move || cancel_for_callback.is_cancelled());",
+          )
+          replace_exact(
+              "src-tauri/src/m7_companion.rs",
+              "async fn transcribe_path(\n    state: &M7CompanionState,\n    job_id: &str,",
+              "async fn transcribe_path(\n    state: &M7CompanionState,\n    _job_id: &str,",
+          )
+
+          workflow = Path(".github/workflows/local-whisper.yml")
+          text = workflow.read_text()
+          old = "cmake clang ninja-build"
+          occurrences = text.count(old)
+          if occurrences != 2:
+              raise SystemExit(f"local-whisper.yml: expected 2 Linux dependency lists, found {occurrences}")
+          workflow.write_text(text.replace(old, "cmake clang libclang-dev ninja-build"))
+
+          cargo_config = Path(".cargo/config.toml")
+          if not cargo_config.exists():
+              raise SystemExit("expected .cargo/config.toml to exist")
+          cargo_config.unlink()
+          PY
+
+          # The pinned screenpipe whisper-rs fork intentionally generates bindings on
+          # Windows x86_64 and uses stripped bundled bindings only on Windows ARM64.
+          # A global WHISPER_DONT_GENERATE_BINDINGS forced Linux-generated layout
+          # assertions onto MSVC x86_64, causing the _G_fpos_t/_IO_FILE overflows.
+          git rm .github/workflows/fix-local-whisper-ci-once.yml
+          git status --short
+      - name: Commit fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "fix(talk): make built-in Whisper compile cross-platform"
+          git push origin HEAD:fix/zero-config-whisper
