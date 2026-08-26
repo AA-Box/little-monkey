@@ -1,0 +1,142 @@
+name: Repair macOS Computer Use E2E
+
+on:
+  push:
+    branches:
+      - fix/channel-secret-daemon-ownership
+    paths:
+      - .github/workflows/repair-macos-computer-use-e2e.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/channel-secret-daemon-ownership
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - name: Make fixture-readiness check deterministic
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src-tauri/src/bin/computer-use-e2e.rs")
+          text = path.read_text()
+
+          anchor = '''fn saved_state_observed(inspection: &ComputerInspection) -> bool {'''
+          helper = r'''fn inspect_until_fixture_controls_ready(
+              state: &DesktopControlState,
+              session_id: &str,
+              target: &ComputerTarget,
+          ) -> Result<ComputerInspection, String> {
+              // macOS Accessibility can expose the window before its descendants have
+              // finished entering the AX tree. Treat that as startup latency rather than
+              // a product failure, but keep the acceptance strict: both the sensitive
+              // control and disabled-state semantics must become observable within the
+              // bounded deadline or the test still fails with useful evidence.
+              let mut latest = inspect(state, session_id, target)?;
+              for attempt in 0..20 {
+                  let secure = latest.sensitive_element_count > 0;
+                  let disabled = latest
+                      .elements
+                      .iter()
+                      .any(|element| element.label == "Disabled button" && !element.enabled);
+                  if secure && disabled {
+                      return Ok(latest);
+                  }
+                  if attempt < 19 {
+                      thread::sleep(Duration::from_millis(250));
+                      latest = inspect(state, session_id, target)?;
+                  }
+              }
+
+              let disabled_candidates = latest
+                  .elements
+                  .iter()
+                  .filter(|element| element.label.to_ascii_lowercase().contains("disabled"))
+                  .map(|element| {
+                      format!(
+                          "id={} role={} label={:?} enabled={} value={:?}",
+                          element.id, element.role, element.label, element.enabled, element.value
+                      )
+                  })
+                  .collect::<Vec<_>>();
+              Err(format!(
+                  "production provider did not expose secure and disabled controls after 5s: sensitive_element_count={}, disabled_candidates={disabled_candidates:?}",
+                  latest.sensitive_element_count
+              ))
+          }
+
+          '''
+          if helper.strip() not in text:
+              if anchor not in text:
+                  raise SystemExit("saved_state_observed anchor not found")
+              text = text.replace(anchor, helper + anchor, 1)
+
+          old = '''        let first = inspect(&state, &session.session_id, &target)?;
+                  let secure = first.sensitive_element_count > 0;
+                  let disabled = first
+                      .elements
+                      .iter()
+                      .any(|element| element.label == "Disabled button" && !element.enabled);
+                  if !secure || !disabled {
+                      return Err(
+                          "production provider did not expose secure and disabled controls".to_string(),
+                      );
+                  }
+          '''
+          new = '''        let first = inspect_until_fixture_controls_ready(
+                      &state,
+                      &session.session_id,
+                      &target,
+                  )?;
+          '''
+          if old not in text:
+              # rustfmt indentation in the branch may differ; replace the exact logical block.
+              old = '''        let first = inspect(&state, &session.session_id, &target)?;
+              let secure = first.sensitive_element_count > 0;
+              let disabled = first
+                  .elements
+                  .iter()
+                  .any(|element| element.label == "Disabled button" && !element.enabled);
+              if !secure || !disabled {
+                  return Err(
+                      "production provider did not expose secure and disabled controls".to_string(),
+                  );
+              }
+          '''
+              new = '''        let first = inspect_until_fixture_controls_ready(
+                  &state,
+                  &session.session_id,
+                  &target,
+              )?;
+          '''
+          if old not in text:
+              raise SystemExit("failing readiness block not found")
+          text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+
+      - name: Format and verify patch
+        shell: bash
+        run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- src/bin/computer-use-e2e.rs
+          git diff --check
+          grep -q 'inspect_until_fixture_controls_ready' src-tauri/src/bin/computer-use-e2e.rs
+
+      - name: Commit repair and remove bootstrap workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/repair-macos-computer-use-e2e.yml
+          git add src-tauri/src/bin/computer-use-e2e.rs .github/workflows/repair-macos-computer-use-e2e.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'test(computer-use): wait for macOS accessibility tree readiness'
+          git push origin HEAD:fix/channel-secret-daemon-ownership
