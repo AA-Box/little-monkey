@@ -32,12 +32,10 @@ export interface AttachmentChipProps {
 }
 
 /**
- * Small pill representing one pending attachment (file or folder) in the
- * chat composer's input pill, above the textarea. The caller owns the
- * attachments list and what removing/opening one means. A real filesystem
- * attachment may also expose the one-item right-click "Show in Finder" menu
- * through the same `reveal_in_finder` command the workspace bar and session
- * menu use.
+ * Small pill representing one pending attachment in the chat composer. The
+ * outer wrapper is deliberately non-button UI: editable virtual attachments
+ * get a real primary <button> and the remove affordance is a sibling button,
+ * avoiding nested interactive controls while preserving full keyboard access.
  */
 export function AttachmentChip({
   name,
@@ -76,40 +74,8 @@ export function AttachmentChip({
     void invoke("reveal_in_finder", { path: revealPath }).catch((err) => console.error(err));
   };
 
-  const keyboardInteractive = Boolean(onOpen || revealPath);
-
-  return (
-    <span
-      ref={chipRef}
-      tabIndex={keyboardInteractive ? 0 : undefined}
-      role={onOpen ? "button" : undefined}
-      aria-label={onOpen ? `Open ${name}` : undefined}
-      onClick={onOpen}
-      onContextMenu={
-        revealPath
-          ? (event) => {
-              event.preventDefault();
-              setMenuOpen(true);
-            }
-          : undefined
-      }
-      onKeyDown={
-        keyboardInteractive
-          ? (event) => {
-              if (onOpen && (event.key === "Enter" || event.key === " ")) {
-                event.preventDefault();
-                onOpen();
-                return;
-              }
-              if (revealPath && (event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey))) {
-                event.preventDefault();
-                setMenuOpen(true);
-              }
-            }
-          : undefined
-      }
-      className={`relative inline-flex items-center gap-1.5 rounded-md border border-border bg-surface-2 px-2 py-1 text-xs ${onOpen ? "cursor-pointer hover:bg-surface" : ""}`}
-    >
+  const body = (
+    <>
       {previewUrl ? (
         <img src={previewUrl} alt="" className="h-4 w-4 shrink-0 rounded-sm object-cover" />
       ) : (
@@ -119,15 +85,51 @@ export function AttachmentChip({
         <span className="max-w-[10rem] truncate">{name}</span>
         {detail && <span className="max-w-[10rem] truncate text-[10px] leading-tight text-faint">{detail}</span>}
       </span>
+    </>
+  );
+
+  return (
+    <span
+      ref={chipRef}
+      tabIndex={revealPath && !onOpen ? 0 : undefined}
+      onContextMenu={
+        revealPath
+          ? (event) => {
+              event.preventDefault();
+              setMenuOpen(true);
+            }
+          : undefined
+      }
+      onKeyDown={
+        revealPath && !onOpen
+          ? (event) => {
+              if (event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey)) {
+                event.preventDefault();
+                setMenuOpen(true);
+              }
+            }
+          : undefined
+      }
+      className="relative inline-flex items-center gap-1 rounded-md border border-border bg-surface-2 px-1 py-1 text-xs"
+    >
+      {onOpen ? (
+        <button
+          type="button"
+          onClick={onOpen}
+          aria-label={`Open ${name}`}
+          className="flex min-w-0 cursor-pointer items-center gap-1.5 rounded px-1 text-left hover:bg-surface"
+        >
+          {body}
+        </button>
+      ) : (
+        <span className="flex min-w-0 items-center gap-1.5 px-1">{body}</span>
+      )}
       {removable && (
         <button
           type="button"
-          onClick={(event) => {
-            event.stopPropagation();
-            onRemove();
-          }}
+          onClick={onRemove}
           aria-label={t("AttachmentChip.removeAttachment")}
-          className="shrink-0 cursor-pointer text-faint hover:text-danger"
+          className="shrink-0 cursor-pointer rounded p-0.5 text-faint hover:bg-surface hover:text-danger"
         >
           <X size={10} />
         </button>
