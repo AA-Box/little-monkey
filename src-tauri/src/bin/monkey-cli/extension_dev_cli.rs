@@ -206,7 +206,10 @@ pub fn init(
         let mut entries = fs::read_dir(path)
             .map_err(|error| format!("Cannot inspect '{}': {error}", path.display()))?;
         if entries.next().is_some() {
-            return Err(format!("Refusing to initialize non-empty directory '{}'", path.display()));
+            return Err(format!(
+                "Refusing to initialize non-empty directory '{}'",
+                path.display()
+            ));
         }
     } else {
         fs::create_dir_all(path)
@@ -364,17 +367,17 @@ bindings::export!(Extension with_types_in bindings);
             .map_err(|error| error.to_string())?
         );
     } else {
-        println!("Initialized {} at {}", manifest["extension_id"], root.display());
+        println!(
+            "Initialized {} at {}",
+            manifest["extension_id"],
+            root.display()
+        );
         println!("Next: monkey extensions dev .");
     }
     Ok(())
 }
 
-pub async fn validate(
-    manager: &ExtensionManager,
-    target: &str,
-    json: bool,
-) -> Result<(), String> {
+pub async fn validate(manager: &ExtensionManager, target: &str, json: bool) -> Result<(), String> {
     let path = Path::new(target);
     if path.exists() {
         let source = if path.is_dir() && path.join("Cargo.toml").is_file() {
@@ -385,13 +388,22 @@ pub async fn validate(
         };
         let preview = manager.discover(&source)?;
         if json {
-            println!("{}", serde_json::to_string_pretty(&preview).map_err(|error| error.to_string())?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&preview).map_err(|error| error.to_string())?
+            );
         } else {
-            println!("{} {}", preview.manifest.display_name, preview.manifest.version);
+            println!(
+                "{} {}",
+                preview.manifest.display_name, preview.manifest.version
+            );
             println!("compatible: {}", preview.compatible);
             println!("trust: {:?}", preview.trust.state);
             for permission in &preview.permissions {
-                println!("permission: {:?} {} — {}", permission.kind, permission.scope, permission.reason);
+                println!(
+                    "permission: {:?} {} — {}",
+                    permission.kind, permission.scope, permission.reason
+                );
             }
             for blocker in &preview.blockers {
                 println!("blocker: {blocker}");
@@ -404,9 +416,15 @@ pub async fn validate(
     }
     let detail = manager.validate_installed(target).await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&detail).map_err(|error| error.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&detail).map_err(|error| error.to_string())?
+        );
     } else {
-        println!("{} {} — {:?}", detail.manifest.display_name, detail.active_version, detail.health.state);
+        println!(
+            "{} {} — {:?}",
+            detail.manifest.display_name, detail.active_version, detail.health.state
+        );
     }
     Ok(())
 }
@@ -414,9 +432,12 @@ pub async fn validate(
 pub fn pack(source: &Path, output: Option<&Path>, json: bool) -> Result<(), String> {
     let (_, bundle) = build_bundle(source)?;
     let manifest = read_manifest(&bundle)?;
-    let output = output
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| source.join("dist").join(format!("{}-{}.lmx", manifest.extension_id, manifest.version)));
+    let output = output.map(Path::to_path_buf).unwrap_or_else(|| {
+        source.join("dist").join(format!(
+            "{}-{}.lmx",
+            manifest.extension_id, manifest.version
+        ))
+    });
     let result = pack_bundle(&bundle, &output)?;
     print_value(&result, json)
 }
@@ -453,7 +474,8 @@ pub async fn dev(
         .canonicalize()
         .map_err(|error| format!("Cannot resolve '{}': {error}", source.display()))?;
     let profile = root.join(".little-monkey/dev-profile");
-    fs::create_dir_all(&profile).map_err(|error| format!("Cannot create development profile: {error}"))?;
+    fs::create_dir_all(&profile)
+        .map_err(|error| format!("Cannot create development profile: {error}"))?;
     let input_json = read_json_arg(input)?;
     serde_json::from_str::<Value>(&input_json)
         .map_err(|error| format!("Development invocation input must be JSON: {error}"))?;
@@ -484,14 +506,20 @@ pub async fn dev(
         manager.set_enabled(&extension_id, true).await?;
         manager.set_running(&extension_id, true).await?;
 
-        println!("[DEVELOPMENT MODE] {} {}", detail.manifest.display_name, detail.active_version);
+        println!(
+            "[DEVELOPMENT MODE] {} {}",
+            detail.manifest.display_name, detail.active_version
+        );
         println!("Isolated profile: {}", profile.display());
         if preview.permissions.is_empty() {
             println!("Requested permissions: none");
         } else {
             println!("Requested permissions:");
             for permission in &preview.permissions {
-                println!("  {:?} {} — {}", permission.kind, permission.scope, permission.reason);
+                println!(
+                    "  {:?} {} — {}",
+                    permission.kind, permission.scope, permission.reason
+                );
             }
         }
         if let Some(capability_id) = capability {
@@ -559,15 +587,21 @@ pub async fn publish(
     }
     let report = conformance_report(source).await?;
     if report.failed > 0 {
-        return Err(format!("Publishing refused: {} conformance case(s) failed", report.failed));
+        return Err(format!(
+            "Publishing refused: {} conformance case(s) failed",
+            report.failed
+        ));
     }
 
     let (_, bundle) = build_bundle(source)?;
-    let mut snapshot: RegistrySnapshot = serde_json::from_str(
-        &fs::read_to_string(snapshot_path)
-            .map_err(|error| format!("Cannot read registry snapshot '{}': {error}", snapshot_path.display()))?,
-    )
-    .map_err(|error| format!("Invalid registry snapshot: {error}"))?;
+    let mut snapshot: RegistrySnapshot =
+        serde_json::from_str(&fs::read_to_string(snapshot_path).map_err(|error| {
+            format!(
+                "Cannot read registry snapshot '{}': {error}",
+                snapshot_path.display()
+            )
+        })?)
+        .map_err(|error| format!("Invalid registry snapshot: {error}"))?;
     if snapshot.signature.algorithm != "ed25519" {
         return Err("Registry snapshot must use ed25519".to_string());
     }
@@ -576,15 +610,19 @@ pub async fn publish(
     manifest.provenance.source = InstallSource::CuratedRegistry {
         registry_id: snapshot.registry_id.clone(),
     };
-    manifest.provenance.source_revision = git_revision(source).unwrap_or_else(|| manifest.version.to_string());
+    manifest.provenance.source_revision =
+        git_revision(source).unwrap_or_else(|| manifest.version.to_string());
     manifest.provenance.build_reproducible = true;
     manifest.signature = None;
     manifest.validate()?;
     write_json(bundle.join("extension.json"), &manifest)?;
 
-    let unsigned_output = output
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| source.join("dist").join(format!("{}-{}.lmx", manifest.extension_id, manifest.version)));
+    let unsigned_output = output.map(Path::to_path_buf).unwrap_or_else(|| {
+        source.join("dist").join(format!(
+            "{}-{}.lmx",
+            manifest.extension_id, manifest.version
+        ))
+    });
     pack_bundle(&bundle, &unsigned_output)?;
     let signed = sign_package(
         &unsigned_output,
@@ -617,7 +655,12 @@ pub async fn publish(
         .checked_add(expiry_days.saturating_mul(24 * 60 * 60 * 1000))
         .ok_or_else(|| "Registry expiry timestamp overflow".to_string())?;
     snapshot.signature.signature_hex.clear();
-    let registry_signature = sign_bytes(registry_private_key, &snapshot.signing_payload().map_err(|error| error.to_string())?)?;
+    let registry_signature = sign_bytes(
+        registry_private_key,
+        &snapshot
+            .signing_payload()
+            .map_err(|error| error.to_string())?,
+    )?;
     snapshot.signature.signature_hex = registry_signature;
 
     let artifact_dir = registry_root
@@ -667,8 +710,12 @@ fn build_bundle(source: &Path) -> Result<(BuildResult, PathBuf), String> {
     let artifact = root
         .join("target/wasm32-wasip2/release")
         .join(format!("{}.wasm", crate_name.replace('-', "_")));
-    let component = fs::read(&artifact)
-        .map_err(|error| format!("Built component '{}' is missing: {error}", artifact.display()))?;
+    let component = fs::read(&artifact).map_err(|error| {
+        format!(
+            "Built component '{}' is missing: {error}",
+            artifact.display()
+        )
+    })?;
     let component_digest = sha256_hex(&component);
     let mut manifest: ExtensionManifest = serde_json::from_str(
         &fs::read_to_string(root.join("extension.json"))
@@ -682,7 +729,8 @@ fn build_bundle(source: &Path) -> Result<(BuildResult, PathBuf), String> {
         .checksums
         .insert("component.wasm".to_string(), component_digest.clone());
     manifest.signature = None;
-    manifest.provenance.source_revision = git_revision(&root).unwrap_or_else(|| "local".to_string());
+    manifest.provenance.source_revision =
+        git_revision(&root).unwrap_or_else(|| "local".to_string());
     manifest.provenance.build_reproducible = true;
 
     let bundle = root
@@ -693,7 +741,8 @@ fn build_bundle(source: &Path) -> Result<(BuildResult, PathBuf), String> {
         fs::remove_dir_all(&bundle)
             .map_err(|error| format!("Cannot clear previous build: {error}"))?;
     }
-    fs::create_dir_all(&bundle).map_err(|error| format!("Cannot create build directory: {error}"))?;
+    fs::create_dir_all(&bundle)
+        .map_err(|error| format!("Cannot create build directory: {error}"))?;
     manifest.provenance.source = InstallSource::LocalFolder {
         canonical_path: bundle
             .canonicalize()
@@ -724,13 +773,17 @@ async fn conformance_report(source: &Path) -> Result<ConformanceReport, String> 
     let (_, bundle) = build_bundle(&root)?;
     let profile = root.join(".little-monkey/test-profile");
     if profile.exists() {
-        fs::remove_dir_all(&profile).map_err(|error| format!("Cannot reset test profile: {error}"))?;
+        fs::remove_dir_all(&profile)
+            .map_err(|error| format!("Cannot reset test profile: {error}"))?;
     }
     fs::create_dir_all(&profile).map_err(|error| format!("Cannot create test profile: {error}"))?;
     let manager = ExtensionManager::new(&profile)?;
     let preview = manager.discover(&bundle)?;
     if !preview.compatible || !preview.blockers.is_empty() {
-        return Err(format!("Extension is not installable: {}", preview.blockers.join("; ")));
+        return Err(format!(
+            "Extension is not installable: {}",
+            preview.blockers.join("; ")
+        ));
     }
     let grants = development_grants(&preview.permissions, &root)?;
     let extension_id = preview.manifest.extension_id.clone();
@@ -768,13 +821,20 @@ async fn conformance_report(source: &Path) -> Result<ConformanceReport, String> 
             Ok(response) => {
                 let output = serde_json::from_str::<Value>(&response.output_json)
                     .unwrap_or_else(|_| Value::String(response.output_json));
-                let passed = case.expected.as_ref().is_none_or(|expected| expected == &output);
+                let passed = case
+                    .expected
+                    .as_ref()
+                    .is_none_or(|expected| expected == &output);
                 results.push(ConformanceCaseResult {
                     name: case.name,
                     capability_id: case.capability_id,
                     passed,
                     output: Some(output),
-                    error: if passed { None } else { Some("output did not match expected JSON".to_string()) },
+                    error: if passed {
+                        None
+                    } else {
+                        Some("output did not match expected JSON".to_string())
+                    },
                 });
             }
             Err(error) => results.push(ConformanceCaseResult {
@@ -808,7 +868,10 @@ async fn conformance_report(source: &Path) -> Result<ConformanceReport, String> 
     })
 }
 
-fn load_conformance_cases(root: &Path, manifest: &ExtensionManifest) -> Result<Vec<ConformanceCase>, String> {
+fn load_conformance_cases(
+    root: &Path,
+    manifest: &ExtensionManifest,
+) -> Result<Vec<ConformanceCase>, String> {
     let path = root.join("extension.tests.json");
     if path.is_file() {
         let cases: Vec<ConformanceCase> = serde_json::from_str(
@@ -846,8 +909,11 @@ fn development_grants(
         .iter()
         .map(|permission| PermissionGrant {
             permission_id: permission.permission_id.clone(),
-            binding: matches!(permission.kind, PermissionKind::WorkspaceRead | PermissionKind::WorkspaceWrite)
-                .then(|| canonical.clone()),
+            binding: matches!(
+                permission.kind,
+                PermissionKind::WorkspaceRead | PermissionKind::WorkspaceWrite
+            )
+            .then(|| canonical.clone()),
         })
         .collect())
 }
@@ -870,13 +936,19 @@ fn pack_bundle(bundle: &Path, output: &Path) -> Result<PackageResult, String> {
         let metadata = fs::symlink_metadata(entry.path())
             .map_err(|error| format!("Cannot inspect '{}': {error}", entry.path().display()))?;
         if metadata.file_type().is_symlink() {
-            return Err(format!("Symlinks are not permitted in .lmx packages: {}", entry.path().display()));
+            return Err(format!(
+                "Symlinks are not permitted in .lmx packages: {}",
+                entry.path().display()
+            ));
         }
         if metadata.is_dir() {
             continue;
         }
         if !metadata.is_file() {
-            return Err(format!("Unsupported package entry: {}", entry.path().display()));
+            return Err(format!(
+                "Unsupported package entry: {}",
+                entry.path().display()
+            ));
         }
         let relative = entry
             .path()
@@ -898,11 +970,16 @@ fn pack_bundle(bundle: &Path, output: &Path) -> Result<PackageResult, String> {
         if bytes.len() > MAX_FILE_BYTES {
             return Err(format!("{relative} exceeds the per-file .lmx limit"));
         }
-        total = total.checked_add(bytes.len()).ok_or_else(|| ".lmx size overflow".to_string())?;
+        total = total
+            .checked_add(bytes.len())
+            .ok_or_else(|| ".lmx size overflow".to_string())?;
         if total > MAX_TOTAL_BYTES {
             return Err(".lmx decoded payload exceeds its total limit".to_string());
         }
-        files_base64.insert(relative, base64::engine::general_purpose::STANDARD.encode(bytes));
+        files_base64.insert(
+            relative,
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        );
     }
     if files_base64.is_empty() || !files_base64.contains_key(&manifest.component.path) {
         return Err(".lmx package is missing the declared component".to_string());
@@ -918,7 +995,8 @@ fn pack_bundle(bundle: &Path, output: &Path) -> Result<PackageResult, String> {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Cannot create package output directory: {error}"))?;
     }
-    fs::write(output, &text).map_err(|error| format!("Cannot write '{}': {error}", output.display()))?;
+    fs::write(output, &text)
+        .map_err(|error| format!("Cannot write '{}': {error}", output.display()))?;
     Ok(PackageResult {
         output: output.to_string_lossy().to_string(),
         extension_id: manifest.extension_id,
@@ -937,14 +1015,20 @@ fn sign_package(
 ) -> Result<SignResult, String> {
     let text = fs::read_to_string(input)
         .map_err(|error| format!("Cannot read package '{}': {error}", input.display()))?;
-    let value: Value = serde_json::from_str(&text).map_err(|error| format!("Invalid .lmx JSON: {error}"))?;
+    let value: Value =
+        serde_json::from_str(&text).map_err(|error| format!("Invalid .lmx JSON: {error}"))?;
     if canonical_json(&value)? != text {
-        return Err(".lmx is not deterministically encoded; run `monkey extensions pack` first".to_string());
+        return Err(
+            ".lmx is not deterministically encoded; run `monkey extensions pack` first".to_string(),
+        );
     }
-    let mut envelope: LmxEnvelope = serde_json::from_value(value)
-        .map_err(|error| format!("Invalid .lmx envelope: {error}"))?;
+    let mut envelope: LmxEnvelope =
+        serde_json::from_value(value).map_err(|error| format!("Invalid .lmx envelope: {error}"))?;
     if envelope.schema_version != LMX_SCHEMA_VERSION {
-        return Err(format!("Unsupported .lmx schema {}", envelope.schema_version));
+        return Err(format!(
+            "Unsupported .lmx schema {}",
+            envelope.schema_version
+        ));
     }
     let mut manifest: ExtensionManifest = serde_json::from_value(envelope.manifest.clone())
         .map_err(|error| format!("Invalid extension manifest: {error}"))?;
@@ -962,11 +1046,17 @@ fn sign_package(
     let value = serde_json::to_value(&envelope).map_err(|error| error.to_string())?;
     let signed_text = canonical_json(&value)?;
     if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("Cannot create signing output directory: {error}"))?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Cannot create signing output directory: {error}"))?;
     }
-    fs::write(output, &signed_text)
-        .map_err(|error| format!("Cannot write signed package '{}': {error}", output.display()))?;
-    let manifest_text = canonical_json(&serde_json::to_value(&manifest).map_err(|error| error.to_string())?)?;
+    fs::write(output, &signed_text).map_err(|error| {
+        format!(
+            "Cannot write signed package '{}': {error}",
+            output.display()
+        )
+    })?;
+    let manifest_text =
+        canonical_json(&serde_json::to_value(&manifest).map_err(|error| error.to_string())?)?;
     Ok(SignResult {
         output: output.to_string_lossy().to_string(),
         extension_id: manifest.extension_id,
@@ -979,8 +1069,12 @@ fn sign_package(
 }
 
 fn sign_bytes(private_key: &Path, payload: &[u8]) -> Result<String, String> {
-    let text = fs::read_to_string(private_key)
-        .map_err(|error| format!("Cannot read signing key '{}': {error}", private_key.display()))?;
+    let text = fs::read_to_string(private_key).map_err(|error| {
+        format!(
+            "Cannot read signing key '{}': {error}",
+            private_key.display()
+        )
+    })?;
     let encoded = text
         .lines()
         .filter(|line| !line.starts_with("-----"))
@@ -989,7 +1083,7 @@ fn sign_bytes(private_key: &Path, payload: &[u8]) -> Result<String, String> {
     let der = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(|error| format!("Signing key is not valid PEM/base64 PKCS#8: {error}"))?;
-    let key_pair = Ed25519KeyPair::from_pkcs8(&der)
+    let key_pair = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&der)
         .map_err(|_| "Signing key must be an Ed25519 PKCS#8 private key".to_string())?;
     Ok(hex(key_pair.sign(payload).as_ref()))
 }
@@ -1043,7 +1137,10 @@ fn safe_relative(path: &Path) -> Result<String, String> {
         || path.components().any(|component| {
             matches!(
                 component,
-                Component::ParentDir | Component::CurDir | Component::RootDir | Component::Prefix(_)
+                Component::ParentDir
+                    | Component::CurDir
+                    | Component::RootDir
+                    | Component::Prefix(_)
             )
         })
     {
@@ -1054,7 +1151,9 @@ fn safe_relative(path: &Path) -> Result<String, String> {
         || value.len() > MAX_PATH_CHARS
         || !value.is_ascii()
         || value.starts_with('/')
-        || value.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
     {
         return Err(format!("Unsafe .lmx path: {value}"));
     }
@@ -1092,20 +1191,30 @@ fn canonical_json(value: &Value) -> Result<String, String> {
 
 fn write_json(path: PathBuf, value: &impl Serialize) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("Cannot create '{}': {error}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Cannot create '{}': {error}", parent.display()))?;
     }
     fs::write(
         &path,
-        format!("{}\n", serde_json::to_string_pretty(value).map_err(|error| error.to_string())?),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(value).map_err(|error| error.to_string())?
+        ),
     )
     .map_err(|error| format!("Cannot write '{}': {error}", path.display()))
 }
 
 fn print_value(value: &impl Serialize, json: bool) -> Result<(), String> {
     if json {
-        println!("{}", serde_json::to_string_pretty(value).map_err(|error| error.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).map_err(|error| error.to_string())?
+        );
     } else {
-        println!("{}", serde_json::to_string_pretty(value).map_err(|error| error.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).map_err(|error| error.to_string())?
+        );
     }
     Ok(())
 }
@@ -1150,7 +1259,13 @@ fn slugify(value: &str) -> String {
             out.push('-');
         }
     }
-    out.trim_matches('-').to_string().chars().take(48).collect::<String>().trim_matches('-').to_string()
+    out.trim_matches('-')
+        .to_string()
+        .chars()
+        .take(48)
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
 }
 
 fn title_case(slug: &str) -> String {
@@ -1181,14 +1296,21 @@ fn project_fingerprint(root: &Path) -> Result<String, String> {
         if !entry.file_type().is_file() {
             continue;
         }
-        let metadata = entry.metadata().map_err(|error| format!("Cannot stat watched file: {error}"))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("Cannot stat watched file: {error}"))?;
         let modified = metadata
             .modified()
             .ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
-        rows.push(format!("{}:{}:{}", relative.display(), metadata.len(), modified));
+        rows.push(format!(
+            "{}:{}:{}",
+            relative.display(),
+            metadata.len(),
+            modified
+        ));
     }
     Ok(sha256_hex(rows.join("\n").as_bytes()))
 }
@@ -1200,7 +1322,10 @@ mod tests {
     #[test]
     fn canonical_json_orders_nested_objects() {
         let value = serde_json::json!({"z": 1, "a": {"y": 2, "b": 3}});
-        assert_eq!(canonical_json(&value).unwrap(), r#"{"a":{"b":3,"y":2},"z":1}"#);
+        assert_eq!(
+            canonical_json(&value).unwrap(),
+            r#"{"a":{"b":3,"y":2},"z":1}"#
+        );
     }
 
     #[test]
@@ -1224,7 +1349,10 @@ mod tests {
             DevTemplate::WebSearch,
             DevTemplate::DeviceProvider,
         ];
-        let kinds = templates.iter().map(|template| template.capability_kind()).collect::<BTreeSet<_>>();
+        let kinds = templates
+            .iter()
+            .map(|template| template.capability_kind())
+            .collect::<BTreeSet<_>>();
         assert_eq!(kinds.len(), templates.len());
     }
 }
