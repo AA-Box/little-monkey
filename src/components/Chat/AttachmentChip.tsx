@@ -11,6 +11,10 @@ export interface AttachmentChipProps {
   isDir: boolean;
   /** Invoked when the user clicks the remove ("x") control on the chip. */
   onRemove: () => void;
+  /** Optional primary action for virtual/editable attachments. */
+  onOpen?: () => void;
+  /** Small secondary metadata, e.g. an estimated token count. */
+  detail?: string;
   /** Whether the remove ("x") control is rendered at all. Defaults to
    * `true`; pass `false` to show an inert, non-removable chip (e.g. while a
    * workspace picker is locked). */
@@ -28,21 +32,26 @@ export interface AttachmentChipProps {
 }
 
 /**
- * Small pill representing one pending attachment (file or folder) in the
- * chat composer's input pill, above the textarea. Purely presentational -
- * the caller owns the attachments list and what removing one means - except
- * for the one-item right-click menu, which reveals `revealPath` in the OS
- * file manager through the same `reveal_in_finder` command the workspace bar
- * and session menu use.
+ * Small pill representing one pending attachment in the chat composer. The
+ * outer wrapper is deliberately non-button UI: editable virtual attachments
+ * get a real primary <button> and the remove affordance is a sibling button,
+ * avoiding nested interactive controls while preserving full keyboard access.
  */
-export function AttachmentChip({ name, isDir, onRemove, removable = true, previewUrl, revealPath }: AttachmentChipProps) {
+export function AttachmentChip({
+  name,
+  isDir,
+  onRemove,
+  onOpen,
+  detail,
+  removable = true,
+  previewUrl,
+  revealPath,
+}: AttachmentChipProps) {
   const { t } = useT();
   const Icon = isDir ? Folder : FileText;
   const [menuOpen, setMenuOpen] = useState(false);
   const chipRef = useRef<HTMLSpanElement>(null);
 
-  // Same dismissal contract as the app's other floating menus (WorkspaceBar,
-  // SessionMenu): a pointerdown anywhere outside closes, as does Escape.
   useEffect(() => {
     if (!menuOpen) return;
     function handlePointerDown(event: PointerEvent) {
@@ -65,13 +74,24 @@ export function AttachmentChip({ name, isDir, onRemove, removable = true, previe
     void invoke("reveal_in_finder", { path: revealPath }).catch((err) => console.error(err));
   };
 
+  const body = (
+    <>
+      {previewUrl ? (
+        <img src={previewUrl} alt="" className="h-4 w-4 shrink-0 rounded-sm object-cover" />
+      ) : (
+        <Icon size={12} className="shrink-0 text-faint" />
+      )}
+      <span className="flex min-w-0 flex-col">
+        <span className="max-w-[10rem] truncate">{name}</span>
+        {detail && <span className="max-w-[10rem] truncate text-[10px] leading-tight text-faint">{detail}</span>}
+      </span>
+    </>
+  );
+
   return (
     <span
       ref={chipRef}
-      // Focusable only when there is a menu to open: the context-menu key
-      // (and Shift+F10) is the keyboard's only route to a right-click, and
-      // it needs a focused element to fire on.
-      tabIndex={revealPath ? 0 : undefined}
+      tabIndex={revealPath && !onOpen ? 0 : undefined}
       onContextMenu={
         revealPath
           ? (event) => {
@@ -81,7 +101,7 @@ export function AttachmentChip({ name, isDir, onRemove, removable = true, previe
           : undefined
       }
       onKeyDown={
-        revealPath
+        revealPath && !onOpen
           ? (event) => {
               if (event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey)) {
                 event.preventDefault();
@@ -90,20 +110,26 @@ export function AttachmentChip({ name, isDir, onRemove, removable = true, previe
             }
           : undefined
       }
-      className="relative inline-flex items-center gap-1.5 rounded-md border border-border bg-surface-2 px-2 py-1 text-xs"
+      className="relative inline-flex items-center gap-1 rounded-md border border-border bg-surface-2 px-1 py-1 text-xs"
     >
-      {previewUrl ? (
-        <img src={previewUrl} alt="" className="h-4 w-4 shrink-0 rounded-sm object-cover" />
+      {onOpen ? (
+        <button
+          type="button"
+          onClick={onOpen}
+          aria-label={`Open ${name}`}
+          className="flex min-w-0 cursor-pointer items-center gap-1.5 rounded px-1 text-left hover:bg-surface"
+        >
+          {body}
+        </button>
       ) : (
-        <Icon size={12} className="shrink-0 text-faint" />
+        <span className="flex min-w-0 items-center gap-1.5 px-1">{body}</span>
       )}
-      <span className="max-w-[10rem] truncate">{name}</span>
       {removable && (
         <button
           type="button"
           onClick={onRemove}
           aria-label={t("AttachmentChip.removeAttachment")}
-          className="shrink-0 cursor-pointer text-faint hover:text-danger"
+          className="shrink-0 cursor-pointer rounded p-0.5 text-faint hover:bg-surface hover:text-danger"
         >
           <X size={10} />
         </button>
