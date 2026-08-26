@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, Plus, Search, TriangleAlert } from "lucide-react";
 
 import { useModelStore, type CloudModelRetirementWarning } from "../../store/modelStore";
@@ -7,7 +7,10 @@ import { useSettingsStore, DEFAULT_PROVIDER_MODEL_FILTER } from "../../store/set
 import { cloudModelRetirementWarning } from "../../lib/modelRetirement";
 import { useT } from "../../lib/i18n";
 import { visibleProviderModelsForProvider } from "../../lib/providerModelSelection";
-import { AddModelDialog } from "./AddModelDialog";
+
+const AddModelDialog = lazy(() =>
+  import("./AddModelDialog").then((module) => ({ default: module.AddModelDialog })),
+);
 
 /** Connected provider + loaded inventory but no curated rows is a selection
  * state, not a missing API-key/configuration state. */
@@ -41,9 +44,9 @@ function retirementTooltip(
 
 /**
  * Point-of-use chat model picker. In addition to switching already available
- * targets, it owns discovery/search and opens `AddModelDialog`, so a user who
- * reaches "No model" never has to know which Settings subsection configures
- * which runtime/provider.
+ * targets, it owns discovery/search and opens a lazy-loaded setup dialog, so a
+ * user who reaches "No model" never has to know which Settings subsection
+ * configures which runtime/provider.
  *
  * `placement` defaults to "up" for ChatWindow's bottom composer; panels near
  * the top of a scroll container pass "down" so the dropdown is not clipped.
@@ -66,7 +69,9 @@ export function ModelSwitcher({ placement = "up" }: { placement?: "up" | "down" 
   const providerModelFilters = useSettingsStore((s) => s.providerModelFilters);
   const { t } = useT();
 
-  const connectedProviders = providers.filter((provider) => provider.has_key);
+  // Extension-contributed providers authenticate inside their sandbox and do
+  // not own a key, so `is_extension` is just as selectable as `has_key` here.
+  const connectedProviders = providers.filter((provider) => provider.has_key || provider.is_extension);
   // Embedding-only GGUFs can be installed for Knowledge Stacks, but they
   // cannot answer chat requests and must never appear as chat targets.
   const installedChatModels = installed.filter((model) => model.kind === "chat");
@@ -303,7 +308,17 @@ export function ModelSwitcher({ placement = "up" }: { placement?: "up" | "down" 
         )}
       </div>
 
-      <AddModelDialog open={addModelOpen} onClose={() => setAddModelOpen(false)} />
+      {addModelOpen && (
+        <Suspense
+          fallback={
+            <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/45 backdrop-blur-[2px]">
+              <div className="h-5 w-5 animate-spin rounded-full border-2 border-border border-t-accent" />
+            </div>
+          }
+        >
+          <AddModelDialog open onClose={() => setAddModelOpen(false)} />
+        </Suspense>
+      )}
     </>
   );
 }
