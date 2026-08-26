@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use futures_util::StreamExt;
 use opus_decoder::OpusDecoder;
 use sha2::{Digest, Sha256};
+use symphonia::core::audio::Audio;
 use symphonia::core::codecs::audio::{well_known::CODEC_ID_OPUS, AudioDecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
@@ -28,7 +29,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 const MODEL_DIRECTORY: &str = "local-whisper-v1";
 const MODEL_FILE: &str = "ggml-base-q5_1.bin";
 const MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin";
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/f281eb45af861ab5e5297d23694b7d46e090c02c/ggml-base-q5_1.bin";
 const MODEL_SHA256: &str = "422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898";
 const MAX_MODEL_BYTES: u64 = 128 * 1024 * 1024;
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
@@ -114,11 +115,8 @@ async fn verified_existing_model(path: &Path) -> Result<bool, String> {
 async fn download_model(path: &Path) -> Result<(), String> {
     let url = reqwest::Url::parse(MODEL_URL)
         .map_err(|error| format!("Built-in local speech model URL is invalid: {error}"))?;
-    crate::egress::classify_public_download_url(
-        &url,
-        crate::egress::PublicDestinations::Only,
-    )
-    .map_err(|error| format!("Local speech model download refused: {error}"))?;
+    crate::egress::classify_public_download_url(&url, crate::egress::PublicDestinations::Only)
+        .map_err(|error| format!("Local speech model download refused: {error}"))?;
     let client = crate::egress::public_download_client(
         crate::egress::PublicDestinations::Only,
         "local-whisper.model-download",
@@ -157,7 +155,8 @@ async fn download_model(path: &Path) -> Result<(), String> {
 
     let result = async {
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| format!("Read local speech model download: {error}"))?;
+            let chunk =
+                chunk.map_err(|error| format!("Read local speech model download: {error}"))?;
             written = written.saturating_add(chunk.len() as u64);
             if written > MAX_MODEL_BYTES {
                 return Err("Local speech model download exceeds its size limit".to_string());
@@ -273,7 +272,9 @@ fn resample_linear(input: &[f32], source_rate: u32) -> Result<Vec<f32>, String> 
     }
     if source_rate == WHISPER_SAMPLE_RATE {
         if input.len() > MAX_WHISPER_SAMPLES {
-            return Err("Recorded audio exceeds the one-hour local transcription limit".to_string());
+            return Err(
+                "Recorded audio exceeds the one-hour local transcription limit".to_string(),
+            );
         }
         return Ok(input.to_vec());
     }
@@ -350,7 +351,9 @@ fn decode_opus(
             .ok_or_else(|| "Decoded Opus sample count overflow".to_string())?;
         downmix_interleaved(&frame[..used], channels, &mut mono)?;
         if mono.len() > MAX_WHISPER_SAMPLES {
-            return Err("Recorded audio exceeds the one-hour local transcription limit".to_string());
+            return Err(
+                "Recorded audio exceeds the one-hour local transcription limit".to_string(),
+            );
         }
     }
     if mono.is_empty() {
@@ -420,14 +423,16 @@ fn decode_audio(path: &Path, cancellation: &CancellationToken) -> Result<Vec<f32
         downmix_interleaved(&interleaved, channels, &mut mono)?;
         let max_source_samples = rate as usize * MAX_AUDIO_SECONDS;
         if mono.len() > max_source_samples {
-            return Err("Recorded audio exceeds the one-hour local transcription limit".to_string());
+            return Err(
+                "Recorded audio exceeds the one-hour local transcription limit".to_string(),
+            );
         }
     }
     resample_linear(
         &mono,
-        source_rate.or(params.sample_rate).ok_or_else(|| {
-            "Recorded audio did not report a sample rate".to_string()
-        })?,
+        source_rate
+            .or(params.sample_rate)
+            .ok_or_else(|| "Recorded audio did not report a sample rate".to_string())?,
     )
 }
 
@@ -533,9 +538,7 @@ mod tests {
 
     #[test]
     fn resamples_to_whispers_rate() {
-        let input: Vec<f32> = (0..48_000)
-            .map(|index| index as f32 / 48_000.0)
-            .collect();
+        let input: Vec<f32> = (0..48_000).map(|index| index as f32 / 48_000.0).collect();
         let output = resample_linear(&input, 48_000).unwrap();
         assert_eq!(output.len(), 16_000);
         assert!((output[8_000] - 0.5).abs() < 0.001);
@@ -554,5 +557,40 @@ mod tests {
     fn centiseconds_become_milliseconds_without_negative_wrap() {
         assert_eq!(timestamp_ms(123), Some(1_230));
         assert_eq!(timestamp_ms(-1), None);
+    }
+
+    #[tokio::test]
+    async fn e2e_auto_provisions_and_transcribes_real_audio() {
+        let wav = match std::env::var_os("LITTLE_MONKEY_LOCAL_WHISPER_E2E_WAV") {
+            Some(path) => PathBuf::from(path),
+            None => return,
+        };
+        let webm = PathBuf::from(
+            std::env::var_os("LITTLE_MONKEY_LOCAL_WHISPER_E2E_WEBM")
+                .expect("WebM fixture must accompany the WAV fixture"),
+        );
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-whisper-e2e-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+
+        let prepared = prepare(&root).await.expect("model auto-provisions");
+        assert!(prepared.is_file());
+        assert_eq!(sha256_file(&prepared).await.unwrap(), MODEL_SHA256);
+
+        for fixture in [&wav, &webm] {
+            let transcript = transcribe(&root, fixture, "en", CancellationToken::new())
+                .await
+                .unwrap_or_else(|error| panic!("{} failed: {error}", fixture.display()));
+            let normalized = transcript.text.to_ascii_lowercase();
+            assert!(
+                normalized.contains("country") || normalized.contains("ask not"),
+                "unexpected transcript for {}: {}",
+                fixture.display(),
+                transcript.text
+            );
+        }
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

@@ -137,19 +137,6 @@ export function CompanionPanel() {
     }
   }, []);
 
-  const chooseWhisperPath = useCallback(async (kind: "binary" | "model") => {
-    const selected = await open({ multiple: false, directory: false });
-    if (!selected || Array.isArray(selected) || !config) return;
-    setConfig({
-      ...config,
-      voice: {
-        ...config.voice,
-        whisperBinary: kind === "binary" ? selected : config.voice.whisperBinary,
-        whisperModel: kind === "model" ? selected : config.voice.whisperModel,
-      },
-    });
-  }, [config]);
-
   const transcribeFile = useCallback(async () => {
     const selected = await open({
       multiple: false,
@@ -234,7 +221,7 @@ export function CompanionPanel() {
         <div className="mt-3 grid gap-3 md:grid-cols-2">
           <label className="text-xs text-muted">Backend
             <select className={`${INPUT} mt-1`} value={config.voice.backend} onChange={(event) => setConfig({ ...config, voice: { ...config.voice, backend: event.target.value as TranscriptionBackendKind } })}>
-              <option value="local_whisper">Local whisper.cpp</option>
+              <option value="local_whisper">Built-in local Whisper</option>
               <option value="provider">BYOK provider</option>
               <option value="executable_extension">Executable extension</option>
             </select>
@@ -242,14 +229,11 @@ export function CompanionPanel() {
           <label className="text-xs text-muted">Language
             <input className={`${INPUT} mt-1`} value={config.voice.language} onChange={(event) => setConfig({ ...config, voice: { ...config.voice, language: event.target.value } })} />
           </label>
-          {config.voice.backend === "local_whisper" ? <>
-            <label className="text-xs text-muted">whisper.cpp binary
-              <div className="mt-1 flex gap-2"><input className={INPUT} readOnly value={config.voice.whisperBinary ?? ""} /><Button size="sm" onClick={() => void chooseWhisperPath("binary")}>Choose</Button></div>
-            </label>
-            <label className="text-xs text-muted">Whisper model
-              <div className="mt-1 flex gap-2"><input className={INPUT} readOnly value={config.voice.whisperModel ?? ""} /><Button size="sm" onClick={() => void chooseWhisperPath("model")}>Choose</Button></div>
-            </label>
-          </> : config.voice.backend === "provider" ? <>
+          {config.voice.backend === "local_whisper" ? (
+            <div className="rounded-md border border-border bg-background p-3 text-xs text-muted md:col-span-2">
+              Local transcription is built in. Little Monkey installs and verifies its multilingual Whisper model automatically; there is no binary or model path to configure.
+            </div>
+          ) : config.voice.backend === "provider" ? <>
             <label className="text-xs text-muted">Provider id
               <input className={`${INPUT} mt-1`} value={config.voice.providerId ?? ""} onChange={(event) => setConfig({ ...config, voice: { ...config.voice, providerId: event.target.value || null } })} placeholder="openai" />
             </label>

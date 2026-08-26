@@ -829,12 +829,6 @@ fn validate_config(config: &CompanionConfig) -> Result<(), String> {
         .overlay_shortcut
         .parse::<tauri_plugin_global_shortcut::Shortcut>()
         .map_err(|error| format!("Companion shortcut is invalid: {error}"))?;
-    if let Some(binary) = &config.voice.whisper_binary {
-        validate_absolute_regular(binary, true)?;
-    }
-    if let Some(model) = &config.voice.whisper_model {
-        validate_absolute_regular(model, false)?;
-    }
     if let Some(extension_id) = &config.voice.extension_id {
         validate_id("extensionId", extension_id)?;
     }
@@ -1136,9 +1130,10 @@ pub fn m7_talk_status(
     ensure_main_window(&window)?;
     let voice = state.config()?.voice;
     let configured = match voice.backend {
-        TranscriptionBackendKind::LocalWhisper => {
-            voice.whisper_binary.is_some() && voice.whisper_model.is_some()
-        }
+        // Local Whisper is part of the application. The model is provisioned
+        // automatically in the background and lazily retried on first use, so
+        // no user-supplied executable/model paths are a configuration gate.
+        TranscriptionBackendKind::LocalWhisper => true,
         TranscriptionBackendKind::Provider => voice.provider_id.is_some(),
         // Both halves, because either one alone resolves to nothing: the
         // capability names what to run and the extension id names whose copy
@@ -1442,68 +1437,28 @@ async fn transcribe_path(
     let config = state.config()?.voice;
     match config.backend {
         TranscriptionBackendKind::LocalWhisper => {
-            let binary = validate_absolute_regular(
-                config
-                    .whisper_binary
-                    .as_deref()
-                    .ok_or("Configure a local whisper.cpp binary first")?,
-                true,
-            )?;
-            let model = validate_absolute_regular(
-                config
-                    .whisper_model
-                    .as_deref()
-                    .ok_or("Configure a local whisper model first")?,
-                false,
-            )?;
-            let prefix = state.root.join("tmp").join(format!("transcript-{job_id}"));
-            let mut command = tokio::process::Command::new(binary);
-            command
-                .arg("-m")
-                .arg(model)
-                .arg("-f")
-                .arg(path)
-                .arg("-oj")
-                .arg("-of")
-                .arg(&prefix)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-            if config.language != "auto" {
-                command.arg("-l").arg(&config.language);
-            }
-            let mut child = command
-                .spawn()
-                .map_err(|error| format!("Start whisper.cpp: {error}"))?;
-            let status = tokio::select! {
-                _ = cancellation.cancelled() => {
-                    let _ = child.kill().await;
-                    return Err("Transcription cancelled".to_string());
-                }
-                status = tokio::time::timeout(Duration::from_secs(60 * 60), child.wait()) => {
-                    status.map_err(|_| "Transcription exceeded one hour".to_string())?
-                        .map_err(|error| format!("Wait for whisper.cpp: {error}"))?
-                }
-            };
-            if !status.success() {
-                return Err(format!("whisper.cpp exited with {status}"));
-            }
-            let json_path = prefix.with_extension("json");
-            let bytes = fs::read(&json_path)
-                .map_err(|error| format!("Read whisper.cpp transcript: {error}"))?;
-            let _ = fs::remove_file(json_path);
-            if bytes.len() > MAX_TRANSCRIPT_BYTES {
+            let transcript = crate::local_whisper::transcribe(
+                &state.app_data_dir,
+                path,
+                &config.language,
+                cancellation.clone(),
+            )
+            .await?;
+            if transcript.text.len() > MAX_TRANSCRIPT_BYTES {
                 return Err("Transcript exceeds its byte limit".to_string());
             }
-            let value: Value = serde_json::from_slice(&bytes)
-                .map_err(|error| format!("Decode whisper.cpp transcript: {error}"))?;
-            let text = extract_transcript(&value);
-            if text.is_empty() {
-                return Err("whisper.cpp returned an empty transcript".to_string());
-            }
-            let segments = extract_speaker_segments(&value);
-            Ok((text, "local_whisper".to_string(), segments))
+            let segments = transcript
+                .segments
+                .into_iter()
+                .map(|segment| SpeakerSegment {
+                    speaker: "Unknown speaker".to_string(),
+                    start_ms: segment.start_ms,
+                    end_ms: segment.end_ms,
+                    text: segment.text,
+                    confidence: None,
+                })
+                .collect();
+            Ok((transcript.text, "local_whisper".to_string(), segments))
         }
         TranscriptionBackendKind::Provider => {
             let provider = config
@@ -1821,24 +1776,9 @@ pub async fn m7_talk_transcribe(
 pub fn call_speech_readiness(app_data_dir: &Path) -> Result<(), String> {
     let voice = M7CompanionState::production(app_data_dir)?.config()?.voice;
     match voice.backend {
-        TranscriptionBackendKind::LocalWhisper => {
-            if voice
-                .whisper_binary
-                .as_deref()
-                .unwrap_or_default()
-                .is_empty()
-                || voice
-                    .whisper_model
-                    .as_deref()
-                    .unwrap_or_default()
-                    .is_empty()
-            {
-                return Err(
-                    "Local transcription has no whisper binary or model configured, so nothing said on a call can be understood."
-                        .to_string(),
-                );
-            }
-        }
+        // The local engine ships with the app and provisions its verified model
+        // automatically. Readiness is no longer a user-configuration question.
+        TranscriptionBackendKind::LocalWhisper => {}
         TranscriptionBackendKind::Provider => {
             if voice.provider_id.as_deref().unwrap_or_default().is_empty() {
                 return Err(

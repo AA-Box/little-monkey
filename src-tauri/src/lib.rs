@@ -140,6 +140,7 @@ pub mod runtime_telemetry;
 // endpoints. The module owns its media jobs so normal app shutdown can revoke
 // every grant and cancel every child/network task before Tauri exits.
 pub mod dictation;
+pub mod local_whisper;
 pub mod m7_companion;
 // Global Command Palette (ROADMAP.md, Phase 1): owns only the OS-level
 // shortcut's persisted configuration and "bring the palette to the front"
@@ -1097,6 +1098,20 @@ pub fn run() {
                         eprintln!("Managed {} runtime setup failed: {error}", spec.id);
                     }
                 }
+            }
+
+            // Prepare the built-in local speech model without blocking the UI.
+            // This is an optimization, not a gate: every local transcription calls
+            // prepare() again, so a first-launch network failure automatically retries
+            // when the user actually speaks. No path selection or external runtime is
+            // required on macOS, Windows, or Linux.
+            {
+                let speech_data_dir = app_data_dir.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = local_whisper::prepare(&speech_data_dir).await {
+                        eprintln!("Built-in local speech model setup failed; it will retry on use: {error}");
+                    }
+                });
             }
 
             // K22 startup self-integrity check. Runs *after* materialization on
