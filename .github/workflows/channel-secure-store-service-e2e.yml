@@ -91,40 +91,40 @@ jobs:
       - name: Stage CLI sidecar placeholder
         run: node scripts/ensure-cli-sidecar-placeholder.mjs
 
-      # Hosted runners do not promise a login user manager. Start the same
-      # unprivileged systemd --user manager production uses and give it the
-      # canonical %t/bus path emitted by service.rs. This makes `daemon install`
-      # exercise systemctl --user for real instead of replacing it with a child
-      # process in the test.
+      # A nested `systemd --user` cannot allocate a cgroup inside GitHub's
+      # hosted-compute-agent.service. Start the runner account's genuine
+      # user@UID.service through PID 1 instead. This gives systemctl --user the
+      # same manager and canonical /run/user/UID/bus that a normal login owns.
       - name: Start real systemd user manager
         shell: bash
         run: |
           set -euo pipefail
-          runtime="$RUNNER_TEMP/lm-xdg-runtime"
-          mkdir -p "$runtime"
-          chmod 700 "$runtime"
-          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
-          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime/bus" >> "$GITHUB_ENV"
-          export XDG_RUNTIME_DIR="$runtime"
-          export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus"
+          uid="$(id -u)"
+          runtime="/run/user/$uid"
 
-          systemd --user >"$RUNNER_TEMP/lm-systemd-user.log" 2>&1 &
-          echo $! >"$RUNNER_TEMP/lm-systemd-user.pid"
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@${uid}.service"
 
           ready=0
           for _ in $(seq 1 60); do
-            if systemctl --user show-environment >/dev/null 2>&1; then
+            if [ -S "$runtime/bus" ]; then
               ready=1
               break
             fi
             sleep 0.5
           done
           if [ "$ready" -ne 1 ]; then
-            cat "$RUNNER_TEMP/lm-systemd-user.log" || true
+            sudo systemctl --no-pager --full status "user@${uid}.service" || true
             exit 1
           fi
+
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime/bus" >> "$GITHUB_ENV"
+          export XDG_RUNTIME_DIR="$runtime"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus"
+
+          systemctl --user show-environment >/dev/null
           systemctl --user import-environment HOME PATH XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
-          test -S "$runtime/bus"
 
       # Desktop case: prove the writer and systemd-launched daemon agree while
       # org.freedesktop.secrets is really present on the canonical user bus.
@@ -195,4 +195,4 @@ jobs:
         run: |
           systemctl --user --no-pager --full status || true
           systemctl --user --no-pager --full list-units 'little-monkey-daemon*' || true
-          cat "$RUNNER_TEMP/lm-systemd-user.log" || true
+          sudo systemctl --no-pager --full status "user@$(id -u).service" || true
