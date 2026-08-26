@@ -1,4 +1,4 @@
-name: Bootstrap PR 448 Rust CI fixes
+name: Verify PR 448 Rust CI fix
 
 on:
   push:
@@ -11,67 +11,18 @@ permissions:
   contents: write
 
 jobs:
-  patch:
+  verify:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
           ref: fix/remote-execution-e2e-ssh-remotenode
           fetch-depth: 0
-      - name: Patch daemon target typing
-        shell: bash
+      - name: Install Linux system deps
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          path = Path('src-tauri/src/daemon_commands.rs')
-          text = path.read_text()
-
-          remote_pattern = re.compile(
-              r"(?P<indent>^[ \t]*)let target = crate::execution_target::RemoteNodeTarget::from_snapshot\(snapshot\)\n"
-              r"(?P=indent)    \.map_err\(\|error\| error\.to_string\(\)\)\?;\n"
-              r"(?P=indent)\(Box::new\(target\), None\)",
-              re.MULTILINE,
-          )
-          text, count = remote_pattern.subn(
-              lambda match: (
-                  f"{match.group('indent')}let target = crate::execution_target::RemoteNodeTarget::from_snapshot(snapshot)\n"
-                  f"{match.group('indent')}    .map_err(|error| error.to_string())?;\n"
-                  f"{match.group('indent')}let target: Box<dyn crate::execution_target::ExecutionTarget> = Box::new(target);\n"
-                  f"{match.group('indent')}(target, None)"
-              ),
-              text,
-              count=1,
-          )
-          if count != 1:
-              raise SystemExit(f'remote-node target replacement count was {count}, expected 1')
-
-          events_pattern = re.compile(
-              r"(?P<indent>^[ \t]*)let runner_result = target\n"
-              r"(?P=indent)    \.events\(&handle, 0\)\n"
-              r"(?P=indent)    \.ok\(\)\n"
-              r"(?P=indent)    \.and_then\(\|events\| autonomous_runner_result_from_events\(&events\)\);",
-              re.MULTILINE,
-          )
-          text, count = events_pattern.subn(
-              lambda match: (
-                  f"{match.group('indent')}let runner_events = target.events(&handle, 0).ok();\n"
-                  f"{match.group('indent')}let runner_result = runner_events\n"
-                  f"{match.group('indent')}    .as_deref()\n"
-                  f"{match.group('indent')}    .and_then(autonomous_runner_result_from_events);"
-              ),
-              text,
-              count=1,
-          )
-          if count != 1:
-              raise SystemExit(f'runner-result event replacement count was {count}, expected 1')
-
-          path.write_text(text)
-          PY
-          cargo fmt --manifest-path src-tauri/Cargo.toml
-          git diff --check
-      - name: Compile and preserve diagnostics
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential dbus-x11 gnome-keyring btrfs-progs
+      - name: Verify Rust library compiles
         shell: bash
         run: |
           node scripts/ensure-cli-sidecar-placeholder.mjs
@@ -79,9 +30,11 @@ jobs:
           cargo check --manifest-path src-tauri/Cargo.toml --lib 2>&1 | tee .github/pr448-cargo-check.txt
           status=${PIPESTATUS[0]}
           set -e
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src-tauri/src/daemon_commands.rs .github/pr448-cargo-check.txt
-          git commit -m "fix: repair remote execution target typing"
-          git push origin HEAD:fix/remote-execution-e2e-ssh-remotenode
+          if [ "$status" -ne 0 ]; then
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git add -f .github/pr448-cargo-check.txt
+            git commit -m "ci: capture PR 448 Rust compiler diagnostics"
+            git push origin HEAD:fix/remote-execution-e2e-ssh-remotenode
+          fi
           exit "$status"
