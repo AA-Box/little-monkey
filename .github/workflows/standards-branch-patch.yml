@@ -1,0 +1,127 @@
+name: Wire Standards 5/5 branch
+
+on:
+  push:
+    branches:
+      - fix/standards-5of5-cli-evals
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/standards-5of5-cli-evals
+          fetch-depth: 0
+      - name: Apply focused source wiring
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one anchor, found {count}: {old[:80]!r}")
+              p.write_text(text.replace(old, new, 1))
+
+          main = "src-tauri/src/bin/monkey-cli/main.rs"
+          replace_once(main, "mod security_cli;\nmod skills_cli;", "mod security_cli;\nmod skills_cli;\nmod standards_cli;")
+          replace_once(
+              main,
+              '    /// Discover, preview, install, update, disable, and roll back data-only SKILL.md skills.\n    #[command(subcommand)]\n    Skills(skills_cli::SkillsCmd),\n    /// Inspect the same declarative plugin runtime and health aggregate as the desktop app.',
+              '    /// Discover, preview, install, update, disable, and roll back data-only SKILL.md skills.\n    #[command(subcommand)]\n    Skills(skills_cli::SkillsCmd),\n    /// Discover and manage evidence-backed repository engineering standards.\n    #[command(subcommand)]\n    Standards(standards_cli::StandardsCmd),\n    /// Inspect the same declarative plugin runtime and health aggregate as the desktop app.'
+          )
+          replace_once(
+              main,
+              '        Cmd::Plugins(action) => {\n',
+              '        Cmd::Standards(action) => {\n            let workspace = cli.workspace.clone().unwrap_or_else(|| {\n                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))\n            });\n            standards_cli::run(action, &workspace)\n        }\n        Cmd::Plugins(action) => {\n'
+          )
+
+          repository = "src/lib/standardsRepository.ts"
+          replace_once(
+              repository,
+              '} from "./standards";\n\nconst MAX_SCAN_FILES',
+              '} from "./standards";\nimport { analyzeRepositoryConventions, type RepositoryScanFile } from "./standardsDiscovery";\n\nconst MAX_SCAN_FILES'
+          )
+          replace_once(
+              repository,
+              'const MAX_EVIDENCE_BYTES = 256 * 1024;\n',
+              'const MAX_EVIDENCE_BYTES = 256 * 1024;\nconst MAX_STRUCTURAL_SCAN_BYTES = 3 * 1024 * 1024;\n'
+          )
+          structural = r'''async function structuralConventionStandards(): Promise<EngineeringStandard[]> {
+            const files = await collectFiles();
+            const corpus: RepositoryScanFile[] = [];
+            let totalBytes = 0;
+            const relevant = /(?:\.(?:ts|tsx|js|jsx|rs|py|go|java|kt|kts|swift|cs|c|cc|cpp|h|hpp|md|mdx)$)|(?:^|\/)(?:tsconfig\.json|\.editorconfig|commitlint\.config\.(?:js|cjs|mjs))$/i;
+            for (const path of files) {
+              if (!relevant.test(path)) continue;
+              const content = await readWorkspaceText(path);
+              if (content === null) continue;
+              const bytes = new TextEncoder().encode(content).byteLength;
+              if (bytes > MAX_EVIDENCE_BYTES || totalBytes + bytes > MAX_STRUCTURAL_SCAN_BYTES) continue;
+              totalBytes += bytes;
+              corpus.push({ path, content });
+            }
+
+            const result: EngineeringStandard[] = [];
+            for (const discovered of analyzeRepositoryConventions(corpus)) {
+              const evidence: StandardEvidence[] = [];
+              for (const path of discovered.supportingPaths) {
+                const item = await readEvidence(path, "", discovered.evidenceKind, true);
+                if (item) evidence.push(item);
+              }
+              for (const path of discovered.counterexamplePaths) {
+                const item = await readEvidence(path, "", discovered.evidenceKind, false);
+                if (item) evidence.push(item);
+              }
+              if (evidence.filter((item) => item.supports).length === 0) continue;
+              result.push(await standard(
+                discovered.id,
+                discovered.title,
+                discovered.body,
+                evidence,
+                {
+                  confidence: discovered.confidence,
+                  tags: discovered.tags,
+                  applicability: {
+                    globs: discovered.globs,
+                    languages: discovered.languages,
+                    frameworks: discovered.frameworks,
+                    task_keywords: discovered.taskKeywords,
+                  },
+                },
+              ));
+            }
+            return result;
+          }
+
+          '''
+          replace_once(
+              repository,
+              '/** Extract Markdown paths from Agent OS\'s standards index without interpreting',
+              structural + '/** Extract Markdown paths from Agent OS\'s standards index without interpreting'
+          )
+          replace_once(
+              repository,
+              'const groups = await Promise.all([packageJsonStandards(), configStandards(), ciStandards(), conventionStandards()]);',
+              'const groups = await Promise.all([packageJsonStandards(), configStandards(), ciStandards(), conventionStandards(), structuralConventionStandards()]);'
+          )
+
+          # The patch workflow is an implementation transport only; never leave it in the product branch.
+          Path(".github/workflows/standards-branch-patch.yml").unlink()
+          PY
+      - name: Commit wired implementation
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/src/bin/monkey-cli/main.rs src/lib/standardsRepository.ts .github/workflows/standards-branch-patch.yml
+          git commit -m "feat(standards): wire CLI and structural discovery"
+          git push origin HEAD:fix/standards-5of5-cli-evals
