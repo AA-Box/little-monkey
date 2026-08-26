@@ -25,11 +25,12 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path("src-tauri/src/bin/computer-use-e2e.rs")
           text = path.read_text()
 
-          anchor = '''fn saved_state_observed(inspection: &ComputerInspection) -> bool {'''
+          anchor = "fn saved_state_observed(inspection: &ComputerInspection) -> bool {"
           helper = r'''fn inspect_until_fixture_controls_ready(
               state: &DesktopControlState,
               session_id: &str,
@@ -74,32 +75,36 @@ jobs:
           }
 
           '''
-          if helper.strip() not in text:
+          if "fn inspect_until_fixture_controls_ready(" not in text:
               if anchor not in text:
                   raise SystemExit("saved_state_observed anchor not found")
               text = text.replace(anchor, helper + anchor, 1)
 
-          old = '''        let first = inspect(&state, &session.session_id, &target)?;
-              let secure = first.sensitive_element_count > 0;
-              let disabled = first
-                  .elements
-                  .iter()
-                  .any(|element| element.label == "Disabled button" && !element.enabled);
-              if !secure || !disabled {
-                  return Err(
-                      "production provider did not expose secure and disabled controls".to_string(),
-                  );
-              }
-          '''
-          new = '''        let first = inspect_until_fixture_controls_ready(
-                  &state,
-                  &session.session_id,
-                  &target,
-              )?;
-          '''
-          if old not in text:
+          pattern = re.compile(
+              r'''(?ms)^(?P<i>[ \t]+)let first = inspect\(&state, &session\.session_id, &target\)\?;\n'''
+              r'''(?P=i)let secure = first\.sensitive_element_count > 0;\n'''
+              r'''(?P=i)let disabled = first\n'''
+              r'''(?P=i)    \.elements\n'''
+              r'''(?P=i)    \.iter\(\)\n'''
+              r'''(?P=i)    \.any\(\|element\| element\.label == "Disabled button" && !element\.enabled\);\n'''
+              r'''(?P=i)if !secure \|\| !disabled \{\n'''
+              r'''(?P=i)    return Err\(\n'''
+              r'''(?P=i)        "production provider did not expose secure and disabled controls"\.to_string\(\),\n'''
+              r'''(?P=i)    \);\n'''
+              r'''(?P=i)\}\n'''
+          )
+          match = pattern.search(text)
+          if not match:
               raise SystemExit("failing readiness block not found")
-          text = text.replace(old, new, 1)
+          indent = match.group("i")
+          replacement = (
+              f"{indent}let first = inspect_until_fixture_controls_ready(\n"
+              f"{indent}    &state,\n"
+              f"{indent}    &session.session_id,\n"
+              f"{indent}    &target,\n"
+              f"{indent})?;\n"
+          )
+          text = text[:match.start()] + replacement + text[match.end():]
           path.write_text(text)
           PY
 
