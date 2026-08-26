@@ -325,7 +325,7 @@ export function validateTaskPlan(plan: TaskPlan, context?: TaskPlanningContext):
     if (["investigation", "verification", "review"].includes(current.taskClass) && current.isolation !== "shared") errors.push(`${current.nodeId} non-mutating nodes must use shared isolation`);
     if (current.executionRequirements?.needsWorkspaceWrite && !current.capabilities?.includes("mutate")) errors.push(`${current.nodeId} requires workspace write capability but does not request mutate`);
     if (current.executionRequirements?.needsNetwork && !current.capabilities?.includes("network")) errors.push(`${current.nodeId} requires network capability but does not request network`);
-    if (current.executionRequirements?.isolation !== current.isolation) errors.push(`${current.nodeId} execution requirements and node isolation disagree`);
+    if (current.executionRequirements && current.executionRequirements.isolation !== current.isolation) errors.push(`${current.nodeId} execution requirements and node isolation disagree`);
     if (current.executionPlacement?.kind === "worktree" && current.isolation !== "worktree") errors.push(`${current.nodeId} worktree placement requires worktree isolation`);
     if (current.executionPlacement && current.executionPlacement.kind !== "local" && current.executionPlacement.kind !== "worktree" && !current.executionPlacement.targetId.trim()) errors.push(current.nodeId + " " + current.executionPlacement.kind + " placement requires a target id");
     if (context && context.relevantFiles.length > 0 && current.relevantFiles?.some((file) => file !== "workspace" && !context.relevantFiles.includes(file))) errors.push(`${current.nodeId} references files outside the planner's repository context`);
