@@ -843,15 +843,18 @@ impl<R: CommandRunner> ServiceManager<R> {
                 )
             }
             ServicePlatform::SystemdUser => format!(
-                "[Unit]\nDescription=Little Monkey durable local agent daemon\nAfter=network-online.target\n\n[Service]\nType=simple\nEnvironment={}\nExecStart={} --profile={} daemon serve\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=full\nWorkingDirectory={}\n\n[Install]\nWantedBy=default.target\n",
+                "[Unit]\nDescription=Little Monkey durable local agent daemon\nAfter=network-online.target\n\n[Service]\nType=simple\nEnvironment={}\nEnvironment={}\nEnvironment=\"XDG_RUNTIME_DIR=%t\"\nEnvironment=\"DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus\"\nExecStart={} --profile={} daemon serve\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=full\nWorkingDirectory={}\n\n[Install]\nWantedBy=default.target\n",
                 systemd_environment_escape(&format!("LITTLE_MONKEY_HOME={agent_home}")),
+                systemd_environment_escape(&format!("HOME={user_home}")),
                 systemd_escape(&executable),
                 systemd_escape(&self.profile_id),
                 systemd_escape(user_home),
             ),
             ServicePlatform::WindowsTask => {
                 let script = format!(
-                    "$env:LITTLE_MONKEY_HOME={}; & {} --profile {} daemon serve; exit $LASTEXITCODE",
+                    "$env:USERPROFILE={}; $env:HOME={}; $env:LITTLE_MONKEY_HOME={}; & {} --profile {} daemon serve; exit $LASTEXITCODE",
+                    powershell_single_quote(user_home),
+                    powershell_single_quote(user_home),
                     powershell_single_quote(&agent_home),
                     powershell_single_quote(&executable),
                     powershell_single_quote(&self.profile_id),
@@ -1535,6 +1538,8 @@ fn command_output_text(bytes: &[u8]) -> String {
         (&bytes[2..], Some(true))
     } else if bytes.len() >= 2 && bytes[1] == 0 {
         (bytes, Some(false))
+    } else {
+        (bytes, None)
     };
     let Some(big_endian) = utf16 else {
         return String::from_utf8_lossy(bytes).into_owned();
@@ -1906,11 +1911,25 @@ mod tests {
             assert!(command.contains("daemon"));
             assert!(command.contains("serve"));
             assert!(command.contains("LITTLE_MONKEY_HOME"));
-            if platform == ServicePlatform::Launchd {
-                assert!(rendered.contains("<key>HOME</key><string>/home/test</string>"));
-                assert!(rendered.contains(
-                    "<key>WorkingDirectory</key><string>/home/test</string>"
-                ));
+            match platform {
+                ServicePlatform::Launchd => {
+                    assert!(rendered.contains("<key>HOME</key><string>/home/test</string>"));
+                    assert!(
+                        rendered.contains("<key>WorkingDirectory</key><string>/home/test</string>")
+                    );
+                }
+                ServicePlatform::SystemdUser => {
+                    assert!(rendered.contains(r#"Environment="HOME=/home/test""#));
+                    assert!(rendered.contains(r#"Environment="XDG_RUNTIME_DIR=%t""#));
+                    assert!(rendered
+                        .contains(r#"Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus""#));
+                    assert!(rendered.contains(r#"WorkingDirectory="/home/test""#));
+                }
+                ServicePlatform::WindowsTask => {
+                    assert!(command.contains("$env:USERPROFILE='/home/test'"));
+                    assert!(command.contains("$env:HOME='/home/test'"));
+                    assert!(rendered.contains("<LogonType>InteractiveToken</LogonType>"));
+                }
             }
             assert!(!rendered.contains("--agent-home"));
             assert!(!command.contains("--agent-home"));
