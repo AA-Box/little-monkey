@@ -24,7 +24,7 @@ const KIND_LABEL: Record<UnifiedCatalogKind, string> = {
 
 function routeLabel(entry: UnifiedCatalogEntry): string {
   if (entry.kind === "package") return entry.updateState === "installed" ? "Manage package" : "Review package";
-  if (entry.kind === "wasm") return entry.updateState === "installed" ? "Manage extension" : "Review extension";
+  if (entry.kind === "wasm") return entry.updateState === "installed" ? "Manage extension" : "Review verified release";
   return "Configure MCP";
 }
 
@@ -41,9 +41,11 @@ export function UnifiedEcosystemDiscover({
   const extensionLoading = useExtensionMarketplaceStore((state) => state.loading);
   const hydrateExtensions = useExtensionMarketplaceStore((state) => state.hydrate);
   const refreshExtensions = useExtensionMarketplaceStore((state) => state.refreshAll);
+  const previewExtension = useExtensionMarketplaceStore((state) => state.previewEntry);
   const [query, setQuery] = useState("");
   const [kind, setKind] = useState<UnifiedCatalogKind | "all">("all");
   const [refreshing, setRefreshing] = useState(false);
+  const [openingId, setOpeningId] = useState<string | null>(null);
 
   useEffect(() => {
     void hydrateExtensions();
@@ -69,10 +71,33 @@ export function UnifiedEcosystemDiscover({
     }
   }
 
-  function open(entry: UnifiedCatalogEntry) {
-    if (entry.kind === "package") onOpenPackages();
-    else if (entry.kind === "wasm") onOpenExtensions();
-    else onOpenMcp();
+  async function open(entry: UnifiedCatalogEntry) {
+    if (entry.kind === "package") {
+      onOpenPackages();
+      return;
+    }
+    if (entry.kind === "mcp") {
+      onOpenMcp();
+      return;
+    }
+
+    const release = extensionCatalog.find((candidate) =>
+      `wasm:${candidate.registry_source_id}:${candidate.extension_id}@${candidate.version}` === entry.id
+    );
+    // Installed entries remain manageable even when their registry release was
+    // removed. New/update review, however, must always start from the exact
+    // verified M4 identity represented by this catalog row.
+    if (!release) {
+      onOpenExtensions();
+      return;
+    }
+    setOpeningId(entry.id);
+    try {
+      await previewExtension(release);
+      onOpenExtensions();
+    } finally {
+      setOpeningId(null);
+    }
   }
 
   return (
@@ -157,11 +182,17 @@ export function UnifiedEcosystemDiscover({
                 <div className="rounded-md bg-surface-2 px-2 py-1.5 text-[11px] text-muted">{entry.securityBoundary}</div>
                 {!entry.metadataComplete && (
                   <p className="mt-2 text-[11px] text-faint">
-                    Full executable metadata is intentionally fetched and verified natively only when you review this release; the catalog does not trust unsigned renderer metadata.
+                    Full executable metadata is fetched and verified natively when you review this release. The catalog never trusts unsigned renderer metadata to fill publisher, capability, or permission fields.
                   </p>
                 )}
-                <Button className="mt-3" size="sm" disabled={entry.updateState === "revoked"} onClick={() => open(entry)}>
-                  <ExternalLink size={13} /> {routeLabel(entry)}
+                <Button
+                  className="mt-3"
+                  size="sm"
+                  disabled={entry.updateState === "revoked" || openingId !== null || extensionLoading}
+                  onClick={() => void open(entry)}
+                >
+                  {openingId === entry.id ? <RefreshCw size={13} className="animate-spin" /> : <ExternalLink size={13} />}
+                  {openingId === entry.id ? "Verifying release…" : routeLabel(entry)}
                 </Button>
               </div>
             </article>
