@@ -3,12 +3,16 @@ import { AlertTriangle, RefreshCw, ShieldCheck } from "lucide-react";
 import { Button, Tabs } from "../ui";
 import { useT } from "../../lib/i18n";
 import { useEcosystemStore } from "../../store/ecosystemStore";
-import { UnifiedEcosystemDiscover } from "./UnifiedEcosystemDiscover";
 import { EcosystemDiscover } from "./EcosystemDiscover";
 import { EcosystemPackages } from "./EcosystemPackages";
 import { EcosystemPlugins } from "./EcosystemPlugins";
 import { EcosystemMcpApps, EcosystemOAuth } from "./EcosystemConnections";
 import { EcosystemWorkflowDesigner, EcosystemWorkflowRuns } from "./EcosystemWorkflows";
+
+const UnifiedEcosystemDiscover = lazy(async () => {
+  const module = await import("./UnifiedEcosystemDiscover");
+  return { default: module.UnifiedEcosystemDiscover };
+});
 
 const ExtensionMarketplacePanel = lazy(async () => {
   const module = await import("./ExtensionMarketplacePanel");
@@ -70,11 +74,13 @@ export function EcosystemPanel() {
       )}
 
       {tab === "discover" && (
-        <UnifiedEcosystemDiscover
-          onOpenPackages={() => setTab("packages")}
-          onOpenExtensions={() => setTab("extensions")}
-          onOpenMcp={() => setTab("apps")}
-        />
+        <Suspense fallback={<div className="rounded-lg border border-border bg-surface p-5 text-center text-xs text-muted">Loading ecosystem catalog…</div>}>
+          <UnifiedEcosystemDiscover
+            onOpenPackages={() => setTab("packages")}
+            onOpenExtensions={() => setTab("extensions")}
+            onOpenMcp={() => setTab("apps")}
+          />
+        </Suspense>
       )}
       {tab === "packages" && <EcosystemDiscover />}
       {tab === "extensions" && (
