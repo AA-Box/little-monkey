@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 /**
  * Attachment-chip interaction contracts. Real files expose the Finder menu;
- * virtual attachments do not. Editable virtual attachments instead expose a
- * primary open action without letting the nested remove control trigger it.
+ * virtual attachments do not. Editable virtual attachments expose a real
+ * primary button next to, never around, the independent remove button.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -49,7 +49,7 @@ describe("AttachmentChip", () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
-  it("opens an editable virtual attachment by click and keyboard", () => {
+  it("opens an editable virtual attachment through a real button", () => {
     const onOpen = vi.fn();
     render(
       <AttachmentChip
@@ -61,17 +61,17 @@ describe("AttachmentChip", () => {
       />,
     );
 
-    const chip = screen.getByRole("button", { name: "Open Pasted text (1).md" });
+    const openButton = screen.getByRole("button", { name: "Open Pasted text (1).md" });
+    expect(openButton.tagName).toBe("BUTTON");
+    expect(openButton.querySelector("button")).toBeNull();
     expect(screen.getByText("12 KB · ~3.0k tokens")).toBeTruthy();
-    fireEvent.click(chip);
-    fireEvent.keyDown(chip, { key: "Enter" });
-    fireEvent.keyDown(chip, { key: " " });
+    fireEvent.click(openButton);
 
-    expect(onOpen).toHaveBeenCalledTimes(3);
+    expect(onOpen).toHaveBeenCalledOnce();
     expect(invoke).not.toHaveBeenCalled();
   });
 
-  it("removes an editable attachment without also opening it", () => {
+  it("keeps remove as a sibling control and does not open when removing", () => {
     const onOpen = vi.fn();
     const onRemove = vi.fn();
     render(
@@ -83,7 +83,10 @@ describe("AttachmentChip", () => {
       />,
     );
 
-    fireEvent.click(screen.getByLabelText("Remove attachment"));
+    const openButton = screen.getByRole("button", { name: "Open Pasted text (1).md" });
+    const removeButton = screen.getByLabelText("Remove attachment");
+    expect(openButton.contains(removeButton)).toBe(false);
+    fireEvent.click(removeButton);
 
     expect(onRemove).toHaveBeenCalledOnce();
     expect(onOpen).not.toHaveBeenCalled();
