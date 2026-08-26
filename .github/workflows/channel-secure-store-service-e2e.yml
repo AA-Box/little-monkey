@@ -154,7 +154,8 @@ jobs:
       # Headless/user-service case: keep the real systemd user manager and its
       # bus, remove Secret Service entirely, and require the combined keyring
       # backend's native keyutils path to survive the same cross-process/service
-      # round-trip. A passing test cannot be a Secret Service pass in disguise.
+      # round-trip. Both pre- and post-assertions are required so D-Bus
+      # activation cannot turn a headless pass into a Secret Service pass.
       - name: Headless keyutils round-trip through real systemd service
         shell: bash
         run: |
@@ -176,6 +177,10 @@ jobs:
             --test channel_secure_store_service_e2e \
             real_systemd_service_reads_headless_native_credential \
             -- --exact --nocapture --test-threads=1
+          if busctl --user --no-pager list | grep -q 'org.freedesktop.secrets'; then
+            echo "Secret Service auto-activated during the headless credential test; refusing a false keyutils pass" >&2
+            exit 1
+          fi
 
       # This is the already-existing full Telegram pipeline acceptance. It uses
       # production adapter/daemon/agent/outbox code with deterministic provider
