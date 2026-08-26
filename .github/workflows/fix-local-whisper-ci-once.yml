@@ -59,25 +59,11 @@ jobs:
               "async fn transcribe_path(\n    state: &M7CompanionState,\n    _job_id: &str,",
           )
 
-          workflow = Path(".github/workflows/local-whisper.yml")
-          text = workflow.read_text()
-          old = "cmake clang ninja-build"
-          occurrences = text.count(old)
-          if occurrences != 2:
-              raise SystemExit(f"local-whisper.yml: expected 2 Linux dependency lists, found {occurrences}")
-          workflow.write_text(text.replace(old, "cmake clang libclang-dev ninja-build"))
-
           cargo_config = Path(".cargo/config.toml")
           if not cargo_config.exists():
               raise SystemExit("expected .cargo/config.toml to exist")
           cargo_config.unlink()
           PY
-
-          # The pinned screenpipe whisper-rs fork intentionally generates bindings on
-          # Windows x86_64 and uses stripped bundled bindings only on Windows ARM64.
-          # A global WHISPER_DONT_GENERATE_BINDINGS forced Linux-generated layout
-          # assertions onto MSVC x86_64, causing the _G_fpos_t/_IO_FILE overflows.
-          git rm .github/workflows/fix-local-whisper-ci-once.yml
           git status --short
       - name: Commit fixes
         shell: bash
