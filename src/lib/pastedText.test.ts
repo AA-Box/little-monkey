@@ -6,8 +6,11 @@ import {
   formatEstimatedTokens,
   isPastedTextPath,
   nextPastedTextName,
+  nextPastedTextOrder,
   pastedTextPath,
+  rebasePastedTextPlacements,
   shouldCollapsePastedText,
+  type PastedTextPlacement,
 } from "./pastedText";
 
 describe("pastedText", () => {
@@ -37,24 +40,73 @@ describe("pastedText", () => {
     ])).toBe("Pasted text (5).md");
   });
 
-  it("returns a sole pasted prompt byte-for-byte when no separate instruction exists", () => {
-    const content = "# Spec\n\nImplement this exactly.\n";
+  it("assigns stable ordering to consecutive zero-width pasted anchors", () => {
+    expect(nextPastedTextOrder([])).toBe(0);
+    expect(nextPastedTextOrder([
+      { path: "pasted://a", offset: 0, order: 0 },
+      { path: "pasted://b", offset: 0, order: 3 },
+    ])).toBe(4);
+  });
+
+  it("returns a sole pasted prompt byte-for-byte, including boundary whitespace", () => {
+    const content = "\n  # Spec\n\nImplement this exactly.\n\n";
     expect(composePromptWithPastedText("", [
       { path: "pasted://one", label: "Pasted text (1).md", content },
+    ], [
+      { path: "pasted://one", offset: 0, order: 0 },
     ])).toBe(content);
   });
 
-  it("keeps the typed instruction first and names multiple pasted blocks", () => {
-    const prompt = composePromptWithPastedText("/review please compare these", [
-      { path: "pasted://one", label: "Pasted text (1).md", content: "# Spec\nA" },
-      { path: "/workspace/file.ts", content: "must not be folded in" },
-      { path: "pasted://two", label: "Pasted text (2).md", content: "## More\nB" },
+  it("reconstructs a paste at the exact middle position without synthetic headings or separators", () => {
+    const visible = "before  after";
+    const pasted = "<PASTE>\n";
+    expect(composePromptWithPastedText(visible, [
+      { path: "pasted://one", label: "Pasted text (1).md", content: pasted },
+    ], [
+      { path: "pasted://one", offset: 7, order: 0 },
+    ])).toBe(`before ${pasted} after`);
+  });
+
+  it("keeps multiple consecutive pastes in event order without adding prompt text", () => {
+    expect(composePromptWithPastedText("tail", [
+      { path: "pasted://one", content: "FIRST" },
+      { path: "pasted://two", content: "SECOND" },
+    ], [
+      { path: "pasted://one", offset: 0, order: 0 },
+      { path: "pasted://two", offset: 0, order: 1 },
+    ])).toBe("FIRSTSECONDtail");
+  });
+
+  it("rebases anchors when the user types before and after a collapsed paste", () => {
+    let visible = "AB";
+    let placements: PastedTextPlacement[] = [{ path: "pasted://one", offset: 1, order: 0 }];
+
+    const typedBefore = "xAB";
+    placements = rebasePastedTextPlacements(visible, typedBefore, placements);
+    visible = typedBefore;
+    expect(placements[0].offset).toBe(2);
+
+    const typedAtAnchor = "xAyB";
+    placements = rebasePastedTextPlacements(visible, typedAtAnchor, placements);
+    visible = typedAtAnchor;
+    // An insertion exactly at the zero-width anchor follows the paste.
+    expect(placements[0].offset).toBe(2);
+
+    expect(composePromptWithPastedText(visible, [
+      { path: "pasted://one", content: "PASTE" },
+    ], placements)).toBe("xAPASTEyB");
+  });
+
+  it("rebases an anchor across deletion/replacement of surrounding visible text", () => {
+    const placements: PastedTextPlacement[] = [{ path: "pasted://one", offset: 6, order: 0 }];
+    expect(rebasePastedTextPlacements("hello world", "hi world", placements)).toEqual([
+      { path: "pasted://one", offset: 3, order: 0 },
     ]);
-    expect(prompt).toBe(
-      "/review please compare these\n\n" +
-      "### Pasted text (1).md\n\n# Spec\nA\n\n" +
-      "### Pasted text (2).md\n\n## More\nB",
-    );
+    expect(rebasePastedTextPlacements("abcDEFghi", "abcXghi", [
+      { path: "pasted://one", offset: 5, order: 0 },
+    ])).toEqual([
+      { path: "pasted://one", offset: 3, order: 0 },
+    ]);
   });
 
   it("creates opaque local-only pasted paths", () => {
