@@ -33,7 +33,7 @@ export function shouldCollapsePastedText(text: string): boolean {
  * token approximation as contextTrimmer.ts for a transparent cost hint.
  */
 export function estimatePastedTextTokens(text: string): number {
-  return Math.max(1, Math.ceil(text.length / CHARS_PER_TOKEN_ESTIMATE));
+  return Math.ceil(text.length / CHARS_PER_TOKEN_ESTIMATE);
 }
 
 export function formatEstimatedTokens(text: string): string {
@@ -73,21 +73,35 @@ export function pastedTextPath(name: string): string {
 }
 
 /**
- * A collapsed paste is only a composer representation. At submit time its
- * exact text is reconstructed into the user prompt before any model routing,
- * privacy scan, mutation detection, skill parsing, Compare, or Crew logic.
- * This preserves the semantics and token usage of an ordinary paste while
- * keeping the UI usable. Pasted blocks are ordered by attachment order, then
- * followed by any text left visible in the composer.
+ * A collapsed paste is only a composer representation. At submit time the
+ * exact text is reconstructed into the user prompt before model routing,
+ * privacy scans, mutation detection, skill parsing, Compare, or Crew logic.
+ *
+ * One attachment with no separately typed instruction is the overwhelmingly
+ * common "I pasted a huge prompt" case. Return those bytes verbatim so the
+ * feature changes presentation only, not semantics or token use.
+ *
+ * When the user also typed an instruction (or attached multiple pastes), keep
+ * the typed instruction first. That preserves leading slash/skill semantics
+ * and gives each pasted block a stable Markdown heading so prompts can refer
+ * to "Pasted text (2).md" unambiguously.
  */
 export function composePromptWithPastedText(
   visibleInput: string,
   attachments: readonly PastedTextLike[],
 ): string {
-  const blocks = attachments
-    .filter((attachment) => isPastedTextPath(attachment.path))
-    .map((attachment) => attachment.content ?? "")
-    .filter((content) => content.length > 0);
+  const pasted = attachments
+    .filter((attachment) => isPastedTextPath(attachment.path) && Boolean(attachment.content))
+    .map((attachment, index) => ({
+      name: attachment.label?.trim() || `Pasted text (${index + 1}).md`,
+      content: attachment.content ?? "",
+    }));
+
+  if (pasted.length === 0) return visibleInput;
+  if (pasted.length === 1 && visibleInput.length === 0) return pasted[0].content;
+
+  const blocks: string[] = [];
   if (visibleInput.length > 0) blocks.push(visibleInput);
+  blocks.push(...pasted.map(({ name, content }) => `### ${name}\n\n${content}`));
   return blocks.join("\n\n");
 }
