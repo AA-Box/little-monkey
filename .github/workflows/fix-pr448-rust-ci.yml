@@ -23,41 +23,59 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path('src-tauri/src/daemon_commands.rs')
           text = path.read_text()
 
-          old = '''        let target = crate::execution_target::RemoteNodeTarget::from_snapshot(snapshot)
-              .map_err(|error| error.to_string())?;
-          (Box::new(target), None)
-          '''
-          new = '''        let target = crate::execution_target::RemoteNodeTarget::from_snapshot(snapshot)
-              .map_err(|error| error.to_string())?;
-          let target: Box<dyn crate::execution_target::ExecutionTarget> = Box::new(target);
-          (target, None)
-          '''
-          if old not in text:
-              raise SystemExit('remote-node target block did not match expected source')
-          text = text.replace(old, new, 1)
+          remote_pattern = re.compile(
+              r"(?P<indent>^[ \t]*)let target = crate::execution_target::RemoteNodeTarget::from_snapshot\(snapshot\)\n"
+              r"(?P=indent)    \.map_err\(\|error\| error\.to_string\(\)\)\?;\n"
+              r"(?P=indent)\(Box::new\(target\), None\)",
+              re.MULTILINE,
+          )
+          text, count = remote_pattern.subn(
+              lambda match: (
+                  f"{match.group('indent')}let target = crate::execution_target::RemoteNodeTarget::from_snapshot(snapshot)\n"
+                  f"{match.group('indent')}    .map_err(|error| error.to_string())?;\n"
+                  f"{match.group('indent')}let target: Box<dyn crate::execution_target::ExecutionTarget> = Box::new(target);\n"
+                  f"{match.group('indent')}(target, None)"
+              ),
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit(f'remote-node target replacement count was {count}, expected 1')
 
-          old = '''    let runner_result = target
-              .events(&handle, 0)
-              .ok()
-              .and_then(|events| autonomous_runner_result_from_events(&events));
-          '''
-          new = '''    let runner_events = target.events(&handle, 0).ok();
-          let runner_result = runner_events
-              .as_deref()
-              .and_then(autonomous_runner_result_from_events);
-          '''
-          if old not in text:
-              raise SystemExit('runner-result event block did not match expected source')
-          text = text.replace(old, new, 1)
+          events_pattern = re.compile(
+              r"(?P<indent>^[ \t]*)let runner_result = target\n"
+              r"(?P=indent)    \.events\(&handle, 0\)\n"
+              r"(?P=indent)    \.ok\(\)\n"
+              r"(?P=indent)    \.and_then\(\|events\| autonomous_runner_result_from_events\(&events\)\);",
+              re.MULTILINE,
+          )
+          text, count = events_pattern.subn(
+              lambda match: (
+                  f"{match.group('indent')}let runner_events = target.events(&handle, 0).ok();\n"
+                  f"{match.group('indent')}let runner_result = runner_events\n"
+                  f"{match.group('indent')}    .as_deref()\n"
+                  f"{match.group('indent')}    .and_then(autonomous_runner_result_from_events);"
+              ),
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit(f'runner-result event replacement count was {count}, expected 1')
 
           path.write_text(text)
           PY
           cargo fmt --manifest-path src-tauri/Cargo.toml
           git diff --check
+      - name: Verify Rust library compiles
+        shell: bash
+        run: |
+          node scripts/ensure-cli-sidecar-placeholder.mjs
+          cargo check --manifest-path src-tauri/Cargo.toml --lib
       - name: Commit source fix
         shell: bash
         run: |
@@ -66,8 +84,3 @@ jobs:
           git add src-tauri/src/daemon_commands.rs
           git commit -m "fix: repair remote execution target typing"
           git push origin HEAD:fix/remote-execution-e2e-ssh-remotenode
-      - name: Verify Rust library compiles
-        shell: bash
-        run: |
-          node scripts/ensure-cli-sidecar-placeholder.mjs
-          cargo check --manifest-path src-tauri/Cargo.toml --lib
