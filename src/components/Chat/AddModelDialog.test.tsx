@@ -72,7 +72,7 @@ describe("AddModelDialog point-of-use cloud setup", () => {
 
     const keyInputs = await screen.findAllByPlaceholderText("ProviderCard.apiKeyPlaceholder");
     expect(keyInputs).toHaveLength(2);
-    const keyInput = keyInputs[1];
+    const keyInput = keyInputs[0];
     fireEvent.change(keyInput, { target: { value: "sk-ant-test" } });
 
     const connectButton = keyInput.parentElement?.querySelector("button");
