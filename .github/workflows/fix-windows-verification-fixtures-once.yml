@@ -1,0 +1,52 @@
+name: Fix Windows verification fixtures once
+
+on:
+  push:
+    branches:
+      - fix/zero-config-whisper
+    paths:
+      - .github/workflows/fix-windows-verification-fixtures-once.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/zero-config-whisper
+          fetch-depth: 0
+
+      - name: Patch Windows-only test fixtures
+        shell: python
+        run: |
+          from pathlib import Path
+
+          verify = Path("src-tauri/src/verify.rs")
+          text = verify.read_text()
+          old = '    "ping -n 31 127.0.0.1 > nul"'
+          new = '    "powershell.exe -NoLogo -NoProfile -NonInteractive -Command Start-Sleep -Seconds 30"'
+          if text.count(old) != 1:
+              raise SystemExit(f"expected exactly one Windows long-running fixture, found {text.count(old)}")
+          verify.write_text(text.replace(old, new, 1))
+
+          learning = Path("src-tauri/src/skill_learning.rs")
+          text = learning.read_text()
+          old = '        let command = r#"findstr /L /C:\"with_retry(\" src\\\\uploader.rs > nul"#;'
+          new = '        let command = r#"findstr /L /C:with_retry src\\\\uploader.rs > nul"#;'
+          if text.count(old) != 1:
+              raise SystemExit(f"expected exactly one Windows skill verification fixture, found {text.count(old)}")
+          learning.write_text(text.replace(old, new, 1))
+
+      - name: Show patch
+        run: git diff --check && git diff -- src-tauri/src/verify.rs src-tauri/src/skill_learning.rs
+
+      - name: Commit source fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/src/verify.rs src-tauri/src/skill_learning.rs
+          git commit -m "test: make verification fixtures reliable on Windows"
+          git push origin HEAD:fix/zero-config-whisper
