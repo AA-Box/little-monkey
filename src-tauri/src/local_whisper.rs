@@ -8,6 +8,7 @@
 //! historical `whisperBinary`/`whisperModel` fields for wire compatibility, but
 //! local transcription no longer reads them.
 
+use std::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -439,6 +440,16 @@ fn timestamp_ms(value: i64) -> Option<u64> {
     u64::try_from(value).ok()?.checked_mul(10)
 }
 
+unsafe extern "C" fn cancellation_abort_callback(user_data: *mut c_void) -> bool {
+    if user_data.is_null() {
+        return false;
+    }
+    // SAFETY: run_whisper passes a pointer to a boxed CancellationToken whose
+    // allocation stays alive and unmoved until state.full() has returned.
+    let cancellation = unsafe { &*user_data.cast::<CancellationToken>() };
+    cancellation.is_cancelled()
+}
+
 fn run_whisper(
     model: &Path,
     pcm: Vec<f32>,
@@ -470,9 +481,26 @@ fn run_whisper(
         .unwrap_or(4)
         .clamp(1, 8) as i32;
     params.set_n_threads(threads);
-    let cancel_for_callback = cancellation.clone();
-    params.set_abort_callback_safe(move || cancel_for_callback.is_cancelled());
-    if let Err(error) = state.full(params, &pcm) {
+
+    // Do not use whisper-rs' set_abort_callback_safe at the pinned revision.
+    // It type-erases the stored closure but instantiates its trampoline with the
+    // original concrete closure type, so the callback casts user_data to the
+    // wrong type. Once whisper.cpp invokes that callback the result is undefined
+    // behavior (the CI E2E test manifested it as an inference hang). Keep the
+    // cancellation token in our own stable allocation and wire the raw callback
+    // for exactly the synchronous lifetime of state.full() instead.
+    let cancel_for_callback = Box::new(cancellation.clone());
+    let cancel_user_data = (&*cancel_for_callback as *const CancellationToken)
+        .cast_mut()
+        .cast::<c_void>();
+    unsafe {
+        params.set_abort_callback(Some(cancellation_abort_callback));
+        params.set_abort_callback_user_data(cancel_user_data);
+    }
+
+    let full_result = state.full(params, &pcm);
+    drop(cancel_for_callback);
+    if let Err(error) = full_result {
         if cancellation.is_cancelled() {
             return Err("Transcription cancelled".to_string());
         }
@@ -556,6 +584,17 @@ mod tests {
     fn centiseconds_become_milliseconds_without_negative_wrap() {
         assert_eq!(timestamp_ms(123), Some(1_230));
         assert_eq!(timestamp_ms(-1), None);
+    }
+
+    #[test]
+    fn cancellation_abort_callback_reads_stable_token() {
+        let cancellation = Box::new(CancellationToken::new());
+        let user_data = (&*cancellation as *const CancellationToken)
+            .cast_mut()
+            .cast::<c_void>();
+        assert!(!unsafe { cancellation_abort_callback(user_data) });
+        cancellation.cancel();
+        assert!(unsafe { cancellation_abort_callback(user_data) });
     }
 
     #[tokio::test]
