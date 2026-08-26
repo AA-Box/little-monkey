@@ -225,6 +225,14 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
          transport and durable wall-time boundary",
     ),
     (
+        "execution_target/remote_node.rs",
+        Class::HostUtility,
+        "invokes only the bundled `monkey-cli daemon remote` control-plane surface with \
+         fixed subcommands and validated app-owned identifiers; it never accepts a \
+         model-authored program or free-form argv, and any future model-authored argv \
+         must instead enter the resource infrastructure",
+    ),
+    (
         "knowledge_service.rs",
         Class::ManagedService,
         "knowledge pipeline helpers over user-selected sources",

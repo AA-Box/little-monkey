@@ -184,7 +184,7 @@ function defaultAutonomousTaskPlacementAdapters(): AutonomousTaskPlacementAdapte
         const { known: _known, pending: _pending, remoteRunId: _remoteRunId, ...result } = recovery;
         return result;
       }
-      return await invoke<TaskNodeResult>("autonomous_task_place_node", { request: { targetId, runSpec: spec } });
+      return await invoke<TaskNodeResult>("autonomous_task_place_node", { request: { kind, targetId, runSpec: spec } });
     } catch (error) {
       const parsed = executionError(error);
       return { ok: false, failureCode: parsed.code, failureKind: parsed.code, summary: `${kind} execution failed: ${parsed.detail}` };
