@@ -9107,7 +9107,7 @@ mod tests {
 
     fn verification_command() -> crate::verify::VerifyCommand {
         #[cfg(target_os = "windows")]
-        let command = r#"findstr /L /C:"with_retry(" src\uploader.rs > nul"#;
+        let command = r#"findstr /L /C:with_retry src\uploader.rs > nul"#;
         #[cfg(not(target_os = "windows"))]
         let command = "grep -q 'with_retry(' src/uploader.rs";
         crate::verify::VerifyCommand {
