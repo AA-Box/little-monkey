@@ -44,7 +44,10 @@ function statusFiles(repository: string): string[] {
     .split(/\r?\n/)
     .filter(Boolean)
     .map((line) => line.slice(3).trim())
-    .map((path) => path.includes(" -> ") ? path.split(" -> ").at(-1)! : path)
+    .map((path) => {
+      const parts = path.split(" -> ");
+      return parts[parts.length - 1];
+    })
     .sort();
 }
 
@@ -170,7 +173,7 @@ function runtimeFor(
   state: ScenarioState,
 ): AutonomousTaskRuntime {
   const runtime: AutonomousTaskRuntime = {
-    executeNode: async (current, node, context) => {
+    executeNode: async (current, node, _context) => {
       if (node.taskClass === "investigation") {
         return { ok: true, summary: "investigation completed without mutation", usage: { modelCalls: 1, toolCalls: 1 } };
       }
@@ -216,7 +219,7 @@ function runtimeFor(
         state.activeWorkers -= 1;
       }
     },
-    integrate: async (current) => {
+    integrate: async (_current) => {
       state.integrationCalls += 1;
       if (fixture.id === "conflicting-worker-edits" && state.integrationCalls === 1) {
         return { ok: false, summary: "deterministic integration conflict", usage: { modelCalls: 1 } };
