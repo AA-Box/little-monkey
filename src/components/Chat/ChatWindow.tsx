@@ -18,8 +18,11 @@ import {
   formatPastedTextSize,
   isPastedTextPath,
   nextPastedTextName,
+  nextPastedTextOrder,
   pastedTextPath,
+  rebasePastedTextPlacements,
   shouldCollapsePastedText,
+  type PastedTextPlacement,
 } from "../../lib/pastedText";
 import { selectSessionMessages, selectTurnRunning, sessionMessages, useSessionStore } from "../../store/sessionStore";
 import { useWorkspaceStore } from "../../store/workspaceStore";
@@ -301,6 +304,7 @@ interface ChatWindowProps {
 interface ComposerDraftSnapshot {
   input: string;
   attachments: AttachmentRef[];
+  pastedPlacements: PastedTextPlacement[];
 }
 
 export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks, onOpenPmCopilot, onOpenStudio }: ChatWindowProps) {
@@ -309,7 +313,16 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const roots = useWorkspaceStore((state) => state.roots);
   const { t } = useT();
 
-  const [input, setInput] = useState("");
+  const [input, setInputState] = useState("");
+  const inputRef = useRef("");
+  const [pastedPlacements, setPastedPlacements] = useState<PastedTextPlacement[]>([]);
+  const setInput = useCallback((next: string | ((current: string) => string)) => {
+    const previous = inputRef.current;
+    const value = typeof next === "function" ? next(previous) : next;
+    inputRef.current = value;
+    setPastedPlacements((current) => rebasePastedTextPlacements(previous, value, current));
+    setInputState(value);
+  }, []);
   const sending = useSessionStore(selectTurnRunning(sessionId));
   const activeProvider = useModelStore((state) => state.activeProvider);
   const llamaStatus = useModelStore((state) => state.llamaStatus);
@@ -457,13 +470,17 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const [slashEntries, setSlashEntries] = useState<SlashCatalogEntry[]>([]);
   const [slashActiveIndex, setSlashActiveIndex] = useState(0);
   const slashStartRef = useRef<number | null>(null);
+  const semanticPreviewInput = useMemo(
+    () => composePromptWithPastedText(input, attachments, pastedPlacements),
+    [input, attachments, pastedPlacements],
+  );
   const invokedSkillPreview = useMemo(() => {
     try {
-      return parseSkillTurn(input, availableSkills)?.invocations ?? [];
+      return parseSkillTurn(semanticPreviewInput, availableSkills)?.invocations ?? [];
     } catch {
       return [];
     }
-  }, [input, availableSkills]);
+  }, [semanticPreviewInput, availableSkills]);
   const skillCommandSet = useMemo(
     () => new Set(availableSkills.map((skill) => skill.command.toLowerCase())),
     [availableSkills],
@@ -535,6 +552,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     setInput("");
     setError(null);
     setAttachments([]);
+    setPastedPlacements([]);
     setEditingPastedPath(null);
     setCompareTargets([]);
     setStartingComparison(false);
@@ -545,7 +563,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     setSlashQuery(null);
     slashStartRef.current = null;
     requestAnimationFrame(resizeTextarea);
-  }, [sessionId, resizeTextarea]);
+  }, [sessionId, resizeTextarea, setInput]);
 
   useEffect(() => {
     if (!pendingBrowserEvidence) return;
@@ -567,7 +585,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       resizeTextarea();
       textareaRef.current?.focus();
     });
-  }, [consumeBrowserEvidence, pendingBrowserEvidence, resizeTextarea, sessionId]);
+  }, [consumeBrowserEvidence, pendingBrowserEvidence, resizeTextarea, sessionId, setInput]);
 
   useEffect(() => {
     if (!pendingTerminalEvidence?.length) return;
@@ -591,7 +609,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       resizeTextarea();
       textareaRef.current?.focus();
     });
-  }, [consumeTerminalEvidence, pendingTerminalEvidence, resizeTextarea, sessionId, t]);
+  }, [consumeTerminalEvidence, pendingTerminalEvidence, resizeTextarea, sessionId, setInput, t]);
 
   const sendVoiceTurn = useCallback((text: string, utteranceId: string) => {
     setError(null);
@@ -634,7 +652,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       disposed = true;
       unlisten?.();
     };
-  }, [resizeTextarea, sendVoiceTurn, sessionId]);
+  }, [resizeTextarea, sendVoiceTurn, sessionId, setInput]);
 
   const loadWorkspacePaths = useCallback((): Promise<MentionEntry[]> => {
     if (workspacePathsRef.current) return Promise.resolve(workspacePathsRef.current);
@@ -696,40 +714,58 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
 
   const handleRemoveAttachment = useCallback((path: string) => {
     setAttachments((prev) => prev.filter((a) => a.path !== path));
+    if (isPastedTextPath(path)) {
+      setPastedPlacements((current) => current.filter((placement) => placement.path !== path));
+    }
     setEditingPastedPath((current) => current === path ? null : current);
   }, []);
 
   /**
-   * Large-paste conversion is intentionally model-free. The exact clipboard
-   * text becomes an in-memory virtual attachment and remains editable even
-   * when no model/runtime is configured. It is expanded back into the exact
-   * user prompt only after Send, so routing/token charges happen once and only
-   * as part of the actual turn.
+   * Large-paste conversion is model-free and position-preserving. The selected
+   * visible range is removed exactly as a native paste would replace it, while
+   * the pasted bytes live in an editable virtual Markdown card anchored at the
+   * replacement offset. Subsequent textarea edits rebase that zero-width
+   * anchor through `setInput`, so Send can reconstruct the original semantics.
    */
   const handlePaste = useCallback((event: ClipboardEvent<HTMLTextAreaElement>) => {
     const pasted = event.clipboardData.getData("text/plain");
     if (!pasted || !shouldCollapsePastedText(pasted)) return;
 
     event.preventDefault();
+    const currentValue = event.currentTarget.value;
+    const selectionStart = event.currentTarget.selectionStart ?? currentValue.length;
+    const selectionEnd = event.currentTarget.selectionEnd ?? selectionStart;
+    const nextVisible = currentValue.slice(0, selectionStart) + currentValue.slice(selectionEnd);
+    const name = nextPastedTextName(attachments);
+    const path = pastedTextPath(name);
+    const order = nextPastedTextOrder(pastedPlacements);
+
     setMentionQuery(null);
     mentionStartRef.current = null;
     setSlashQuery(null);
     slashStartRef.current = null;
-    setAttachments((current) => {
-      const name = nextPastedTextName(current);
-      return [
-        ...current,
-        {
-          path: pastedTextPath(name),
-          isDir: false,
-          kind: "inline_text",
-          content: pasted,
-          label: name,
-        },
-      ];
+    setInput(nextVisible);
+    setPastedPlacements((current) => [
+      ...current,
+      { path, offset: selectionStart, order },
+    ]);
+    setAttachments((current) => [
+      ...current,
+      {
+        path,
+        isDir: false,
+        kind: "inline_text",
+        content: pasted,
+        label: name,
+      },
+    ]);
+    requestAnimationFrame(() => {
+      const node = textareaRef.current;
+      node?.focus();
+      node?.setSelectionRange(selectionStart, selectionStart);
+      resizeTextarea();
     });
-    requestAnimationFrame(() => textareaRef.current?.focus());
-  }, []);
+  }, [attachments, pastedPlacements, resizeTextarea, setInput]);
 
   const handleSavePastedText = useCallback((path: string, content: string) => {
     setAttachments((current) => current.map((attachment) =>
@@ -761,7 +797,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     } catch (caught) {
       setError(caught);
     }
-  }, [resizeTextarea, t]);
+  }, [resizeTextarea, setInput, t]);
 
   const sendTurn = useCallback((
     text: string,
@@ -777,7 +813,14 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       .catch((err: unknown) => {
         setError(err);
         if (messageCount(sessionId) !== messagesBefore) return;
-        setInput((current) => current || restoreDraft?.input || text);
+        if (!inputRef.current) {
+          const restoredInput = restoreDraft?.input ?? text;
+          inputRef.current = restoredInput;
+          setInputState(restoredInput);
+          setPastedPlacements((current) =>
+            current.length > 0 ? current : restoreDraft?.pastedPlacements ?? []
+          );
+        }
         setAttachments((current) =>
           current.length > 0 ? current : restoreDraft?.attachments ?? pendingAttachments
         );
@@ -968,16 +1011,22 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       }
     }
 
-    const visibleText = settledInput.trim();
+    const settledPlacements = rebasePastedTextPlacements(inputRef.current, settledInput, pastedPlacements);
+    const semanticText = composePromptWithPastedText(settledInput, attachments, settledPlacements);
     const pastedDrafts = attachments.filter((attachment) =>
       isPastedTextPath(attachment.path) && Boolean(attachment.content)
     );
-    if (!visibleText && pastedDrafts.length === 0) return;
+    if (!semanticText.trim() && pastedDrafts.length === 0) return;
 
-    const builtIn = visibleText ? parseBuiltInSlashCommand(visibleText) : null;
+    // Built-ins are parsed only after the hidden pasted blocks have been put
+    // back in their exact textarea positions. A collapsed `/model ...` paste
+    // therefore behaves exactly like the same expanded native paste.
+    const builtIn = parseBuiltInSlashCommand(semanticText);
     if (builtIn) {
       setInput("");
       setAttachments([]);
+      setPastedPlacements([]);
+      setEditingPastedPath(null);
       requestAnimationFrame(resizeTextarea);
       void executeBuiltIn(builtIn.definition.command, builtIn.arguments).catch((commandError: unknown) => {
         appendCommandNotice(
@@ -990,13 +1039,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     }
     if (sending || startingComparison || startingCrew || preparingTurnRef.current || localModelStarting) return;
 
-    // Pasted cards are a local presentation detail only. Reconstruct the
-    // exact user-authored content BEFORE any turn semantics are evaluated so
-    // mutation detection, skills, privacy, Compare/Crew and the model all see
-    // the same prompt they would have seen if the textarea had kept the paste.
-    const semanticText = composePromptWithPastedText(settledInput, attachments).trim();
     const modelAttachments = attachments.filter((attachment) => !isPastedTextPath(attachment.path));
-    if (!semanticText) return;
 
     preparingTurnRef.current = true;
     setPreparingTurn(true);
@@ -1020,6 +1063,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         await startCrew(sessionId, semanticText, modelAttachments, crewId, skillInvocations);
         setInput("");
         setAttachments([]);
+        setPastedPlacements([]);
         setEditingPastedPath(null);
         requestAnimationFrame(resizeTextarea);
       } catch (err) {
@@ -1037,6 +1081,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         await startComparison(sessionId, semanticText, modelAttachments, compareTargets, skillInvocations);
         setInput("");
         setAttachments([]);
+        setPastedPlacements([]);
         setEditingPastedPath(null);
         requestAnimationFrame(resizeTextarea);
       } catch (err) {
@@ -1050,6 +1095,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
 
     setInput("");
     setAttachments([]);
+    setPastedPlacements([]);
     setEditingPastedPath(null);
     requestAnimationFrame(resizeTextarea);
     sendTurn(
@@ -1057,9 +1103,9 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       modelAttachments,
       skillInvocations,
       ultracodeMode,
-      { input: settledInput, attachments: pendingAttachments },
+      { input: settledInput, attachments: pendingAttachments, pastedPlacements: settledPlacements },
     );
-  }, [input, sending, startingComparison, startingCrew, ultracodeMode, attachments, crewId, compareTargets, resizeTextarea, sendTurn, sessionId, prepareTurnInstructions, executeBuiltIn, appendCommandNotice, localModelStarting]);
+  }, [input, sending, startingComparison, startingCrew, ultracodeMode, attachments, pastedPlacements, crewId, compareTargets, resizeTextarea, sendTurn, sessionId, prepareTurnInstructions, executeBuiltIn, appendCommandNotice, localModelStarting, setInput]);
 
   const handleStop = useCallback(() => {
     stopTurn(sessionId);
@@ -1192,7 +1238,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         resizeTextarea();
       });
     },
-    [input, closeMentionPopup, resizeTextarea]
+    [input, closeMentionPopup, resizeTextarea, setInput]
   );
 
   const closeSlashPopup = useCallback(() => {
@@ -1245,7 +1291,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         resizeTextarea();
       });
     },
-    [input, closeSlashPopup, resizeTextarea, sessionId]
+    [input, closeSlashPopup, resizeTextarea, sessionId, setInput]
   );
 
   const handleInput = (event: FormEvent<HTMLTextAreaElement>) => {
