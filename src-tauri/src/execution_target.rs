@@ -1781,6 +1781,11 @@ pub struct RunRequest {
     pub workspace_transfer: Option<WorkspaceTransfer>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_files: Vec<WorkspaceResultFile>,
+    /// Optional frozen application-level run contract. Runner-style targets
+    /// execute the explicit command above; persistent paired nodes consume
+    /// this RunSpec through the existing signed K17 placement plane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_spec: Option<crate::run_protocol::RunSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2895,77 +2900,8 @@ impl ExecutionTarget for SshRunnerTarget {
     }
 }
 
-#[derive(Clone)]
-pub struct RemoteNodeTarget {
-    snapshot: ExecutionTargetSnapshot,
-}
-
-impl RemoteNodeTarget {
-    pub fn from_snapshot(snapshot: ExecutionTargetSnapshot) -> Result<Self, TargetError> {
-        if snapshot.identity.kind != ExecutionTargetKind::RemoteNode {
-            return Err(TargetError::invalid("snapshot is not a remote-node target"));
-        }
-        Ok(Self { snapshot })
-    }
-}
-
-impl ExecutionTarget for RemoteNodeTarget {
-    fn probe(&self) -> Result<ExecutionTargetSnapshot, TargetError> {
-        Ok(self.snapshot.clone())
-    }
-    fn capabilities(&self) -> Result<TargetCapabilities, TargetError> {
-        Ok(self.snapshot.identity.capabilities.clone())
-    }
-    fn prepare_workspace(
-        &self,
-        _transfer: &WorkspaceTransfer,
-        _policy: WorkspacePolicy,
-    ) -> Result<WorkspaceHandle, TargetError> {
-        Err(TargetError::unsupported(format!(
-            "remote node {} must provision through the existing signed placement plane",
-            self.snapshot.identity.stable_id
-        )))
-    }
-    fn submit_run(&self, _: RunRequest) -> Result<TargetRunHandle, TargetError> {
-        Err(TargetError::unsupported(
-            "remote node submission is delegated to the existing signed placement plane",
-        ))
-    }
-    fn events(&self, _: &TargetRunHandle, _: u64) -> Result<Vec<TargetEvent>, TargetError> {
-        Ok(Vec::new())
-    }
-    fn status(&self, _: &TargetRunHandle) -> Result<TargetRunStatus, TargetError> {
-        Err(TargetError::unsupported(
-            "remote node status is owned by the existing placement plane",
-        ))
-    }
-    fn cancel(&self, _: &TargetRunHandle) -> Result<(), TargetError> {
-        Err(TargetError::unsupported(
-            "remote node cancellation is owned by the existing placement plane",
-        ))
-    }
-    fn pause(&self, _: &TargetRunHandle) -> Result<(), TargetError> {
-        Err(TargetError::unsupported(
-            "remote node pause is owned by the existing placement plane",
-        ))
-    }
-    fn resume(&self, _: &TargetRunHandle) -> Result<(), TargetError> {
-        Err(TargetError::unsupported(
-            "remote node resume is owned by the existing placement plane",
-        ))
-    }
-    fn artifacts(&self, _: &TargetRunHandle) -> Result<Vec<ArtifactDescriptor>, TargetError> {
-        Ok(Vec::new())
-    }
-    fn workspace_result(&self, _: &TargetRunHandle) -> Result<WorkspaceResult, TargetError> {
-        Err(TargetError::result_retrieval_failed(
-            "remote node result is owned by the existing placement plane",
-        ))
-    }
-    fn cleanup(&self, _: &WorkspaceHandle) -> Result<(), TargetError> {
-        Ok(())
-    }
-}
+mod remote_node;
+pub use remote_node::RemoteNodeTarget;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
@@ -4403,6 +4339,7 @@ mod tests {
                         max_artifact_bytes: 1_000_000,
                         workspace_transfer: Some(cas_transfer),
                         input_files: Vec::new(),
+                        run_spec: None,
                     }
                 }),
             );
