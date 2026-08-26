@@ -43,6 +43,7 @@ mod repl;
 mod revisions_cli;
 mod security_cli;
 mod skills_cli;
+mod standards_cli;
 mod sse;
 mod stacks_cli;
 mod support_bundle_cli;
@@ -502,6 +503,9 @@ enum Cmd {
     /// Discover, preview, install, update, disable, and roll back data-only SKILL.md skills.
     #[command(subcommand)]
     Skills(skills_cli::SkillsCmd),
+    /// Discover and manage evidence-backed repository engineering standards.
+    #[command(subcommand)]
+    Standards(standards_cli::StandardsCmd),
     /// Inspect the same declarative plugin runtime and health aggregate as the desktop app.
     #[command(subcommand)]
     Plugins(plugins_cli::PluginsCmd),
@@ -1695,6 +1699,12 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
                 }
                 Err(error) => Err(error),
             }
+        }
+        Cmd::Standards(action) => {
+            let workspace = cli.workspace.clone().unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            });
+            standards_cli::run(action, &workspace)
         }
         Cmd::Plugins(action) => {
             let data_dir = app_data_dir()

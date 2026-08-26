@@ -10,10 +10,12 @@ import {
   type StandardEvidence,
   type StandardsDocument,
 } from "./standards";
+import { analyzeRepositoryConventions, type RepositoryScanFile } from "./standardsDiscovery";
 
 const MAX_SCAN_FILES = 300;
 const MAX_SCAN_DEPTH = 4;
 const MAX_EVIDENCE_BYTES = 256 * 1024;
+const MAX_STRUCTURAL_SCAN_BYTES = 3 * 1024 * 1024;
 const MAX_AGENT_OS_FILES = 100;
 const STANDARD_FILE = ".little-monkey/standards/index.json";
 const EXPORT_FILE = ".little-monkey/standards/export.json";
@@ -300,6 +302,53 @@ async function conventionStandards(): Promise<EngineeringStandard[]> {
   )];
 }
 
+async function structuralConventionStandards(): Promise<EngineeringStandard[]> {
+  const files = await collectFiles();
+  const corpus: RepositoryScanFile[] = [];
+  let totalBytes = 0;
+  const relevant = /(?:\.(?:ts|tsx|js|jsx|rs|py|go|java|kt|kts|swift|cs|c|cc|cpp|h|hpp|md|mdx)$)|(?:^|\/)(?:tsconfig\.json|\.editorconfig|commitlint\.config\.(?:js|cjs|mjs))$/i;
+  for (const path of files) {
+    if (!relevant.test(path)) continue;
+    const content = await readWorkspaceText(path);
+    if (content === null) continue;
+    const bytes = new TextEncoder().encode(content).byteLength;
+    if (bytes > MAX_EVIDENCE_BYTES || totalBytes + bytes > MAX_STRUCTURAL_SCAN_BYTES) continue;
+    totalBytes += bytes;
+    corpus.push({ path, content });
+  }
+
+  const result: EngineeringStandard[] = [];
+  for (const discovered of analyzeRepositoryConventions(corpus)) {
+    const evidence: StandardEvidence[] = [];
+    for (const path of discovered.supportingPaths) {
+      const item = await readEvidence(path, "", discovered.evidenceKind, true);
+      if (item) evidence.push(item);
+    }
+    for (const path of discovered.counterexamplePaths) {
+      const item = await readEvidence(path, "", discovered.evidenceKind, false);
+      if (item) evidence.push(item);
+    }
+    if (evidence.filter((item) => item.supports).length === 0) continue;
+    result.push(await standard(
+      discovered.id,
+      discovered.title,
+      discovered.body,
+      evidence,
+      {
+        confidence: discovered.confidence,
+        tags: discovered.tags,
+        applicability: {
+          globs: discovered.globs,
+          languages: discovered.languages,
+          frameworks: discovered.frameworks,
+          task_keywords: discovered.taskKeywords,
+        },
+      },
+    ));
+  }
+  return result;
+}
+
 /** Extract Markdown paths from Agent OS's standards index without interpreting
  * YAML as code or requiring a YAML runtime. The adapter intentionally accepts
  * only repository-relative `.md` references and then reads each through the
@@ -389,7 +438,7 @@ export async function exportAgentOsStandards(document: StandardsDocument): Promi
 }
 
 export async function discoverStandards(_workspacePath: string): Promise<EngineeringStandard[]> {
-  const groups = await Promise.all([packageJsonStandards(), configStandards(), ciStandards(), conventionStandards()]);
+  const groups = await Promise.all([packageJsonStandards(), configStandards(), ciStandards(), conventionStandards(), structuralConventionStandards()]);
   const byId = new Map<string, EngineeringStandard>();
   for (const candidate of groups.flat()) {
     const existing = byId.get(candidate.standard_id);
