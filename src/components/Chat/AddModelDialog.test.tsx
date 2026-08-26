@@ -70,7 +70,9 @@ describe("AddModelDialog point-of-use cloud setup", () => {
     const onClose = vi.fn();
     render(<AddModelDialog open onClose={onClose} />);
 
-    const keyInput = await screen.findByPlaceholderText("ProviderCard.apiKeyPlaceholder");
+    const keyInputs = await screen.findAllByPlaceholderText("ProviderCard.apiKeyPlaceholder");
+    expect(keyInputs).toHaveLength(2);
+    const keyInput = keyInputs[1];
     fireEvent.change(keyInput, { target: { value: "sk-ant-test" } });
 
     const connectButton = keyInput.parentElement?.querySelector("button");
