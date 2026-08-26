@@ -547,8 +547,6 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
   const [savingEntryId, setSavingEntryId] = useState<string | null>(null);
   const [lightbox, setLightbox] = useState<GenerationEntry | null>(null);
   const lightboxRef = useRef<HTMLDialogElement>(null);
-  const lightboxOpenRef = useRef(false);
-  lightboxOpenRef.current = lightbox !== null;
 
   // `showModal` is the only way into the top layer, so open and close are
   // driven from state rather than the `open` attribute.
@@ -562,14 +560,21 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
   // The macOS traffic-light close control belongs to the app window, not the
   // HTML dialog. If it is clicked while the lightbox is open, consume that
   // close request for the dialog so a near-miss cannot quit the whole app.
+  //
+  // Registered only while the lightbox is actually open, because the listener
+  // is not free: Tauri prevents the close for *any* window that has a JS
+  // close-requested listener and leaves it to JS to destroy the window (see
+  // `on_window_event` in tauri's `manager/window.rs`). A listener that outlives
+  // what it guards therefore disarms every close path — traffic light, ⌘W and
+  // the Window menu alike — and one that is registered but can no longer
+  // resolve its own state wedges the window shut for good.
   useEffect(() => {
-    if (!IN_DESKTOP_APP) return undefined;
+    if (!IN_DESKTOP_APP || lightbox === null) return undefined;
 
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void getCurrentWindow()
       .onCloseRequested((event) => {
-        if (!lightboxOpenRef.current) return;
         event.preventDefault();
         setLightbox(null);
       })
@@ -581,7 +586,7 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
       disposed = true;
       unlisten?.();
     };
-  }, []);
+  }, [lightbox]);
 
   // A segment shows only the models that can do something in it, so the
   // picker never offers a video model under Image.
