@@ -1319,7 +1319,6 @@ function App() {
                 onOpenBackgroundTasks={openBackgroundTasksPanel}
                 onOpenPmCopilot={() => openFeaturePanel("pm-copilot")}
                 onOpenStudio={() => setSection("studio")}
-                onOpenTalk={() => openFeaturePanel("talk")}
               />
             )}
           </Suspense>
@@ -1358,7 +1357,6 @@ function App() {
                   onOpenBackgroundTasks={openBackgroundTasksPanel}
                   onOpenPmCopilot={() => openFeaturePanel("pm-copilot")}
                   onOpenStudio={() => setSection("studio")}
-                  onOpenTalk={() => openFeaturePanel("talk")}
                 />
               )}
             </Suspense>

@@ -47,6 +47,8 @@ import { CheckpointTimeline } from "./CheckpointTimeline";
 import { AttachMenu } from "./AttachMenu";
 import { AttachmentChip } from "./AttachmentChip";
 import PastedTextEditorModal from "./PastedTextEditorModal";
+import { type TalkState } from "../../lib/talkEngine";
+import { useTalkSession } from "../Talk/useTalkSession";
 import { DictationButton, type DictationButtonHandle } from "./DictationButton";
 import { Tooltip } from "./MessageActions";
 import { WorkspaceBar } from "../Workspace/WorkspaceBar";
@@ -291,6 +293,29 @@ export async function switchModelFromSlash(selector: string): Promise<string> {
   return matches[0].canonical;
 }
 
+/** Talk's state, as the composer's status line shows it. */
+const TALK_STATE_TONE: Record<TalkState, string> = {
+  idle: "bg-muted",
+  starting: "bg-accent animate-pulse",
+  listening: "bg-success animate-pulse",
+  transcribing: "bg-accent animate-pulse",
+  thinking: "bg-accent animate-pulse",
+  speaking: "bg-accent",
+  interrupted: "bg-warning",
+  error: "bg-danger",
+};
+
+const TALK_STATE_LABEL_KEY: Record<TalkState, string> = {
+  idle: "ChatWindow.talkStateIdle",
+  starting: "ChatWindow.talkStateStarting",
+  listening: "ChatWindow.talkStateListening",
+  transcribing: "ChatWindow.talkStateTranscribing",
+  thinking: "ChatWindow.talkStateThinking",
+  speaking: "ChatWindow.talkStateSpeaking",
+  interrupted: "ChatWindow.talkStateInterrupted",
+  error: "ChatWindow.talkStateError",
+};
+
 interface ChatWindowProps {
   sessionId: string;
   onManagePrompts: () => void;
@@ -299,7 +324,6 @@ interface ChatWindowProps {
   onOpenBackgroundTasks?: () => void;
   onOpenPmCopilot?: () => void;
   onOpenStudio?: () => void;
-  onOpenTalk?: () => void;
 }
 
 interface ComposerDraftSnapshot {
@@ -308,7 +332,7 @@ interface ComposerDraftSnapshot {
   pastedPlacements: PastedTextPlacement[];
 }
 
-export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks, onOpenPmCopilot, onOpenStudio, onOpenTalk }: ChatWindowProps) {
+export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks, onOpenPmCopilot, onOpenStudio }: ChatWindowProps) {
   const messages = useSessionStore(selectSessionMessages(sessionId));
   const persistError = useSessionStore((state) => state.persistError);
   const roots = useWorkspaceStore((state) => state.roots);
@@ -345,6 +369,12 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const consumeTerminalEvidence = useTerminalStore((state) => state.consumeEvidence);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const dictationButtonRef = useRef<DictationButtonHandle>(null);
+  // Talk, in this conversation rather than on a surface of its own. The hook
+  // stays inert — no config read, no engine, no microphone — until this flips,
+  // so a chat nobody has spoken to opens no devices.
+  const [talkActive, setTalkActive] = useState(false);
+  const talk = useTalkSession(sessionId, { enabled: talkActive, autoStartMode: "continuous" });
+  const talkState: TalkState = talkActive ? talk.snapshot?.state ?? "starting" : "idle";
 
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   const [mentionEntries, setMentionEntries] = useState<MentionEntry[]>([]);
@@ -1431,7 +1461,17 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const hasPastedTextDraft = attachments.some((attachment) =>
     isPastedTextPath(attachment.path) && Boolean(attachment.content)
   );
-  const showTalkButton = Boolean(onOpenTalk) && !sending && !input.trim() && !hasPastedTextDraft;
+  const showTalkButton = !talkActive && !sending && !input.trim() && !hasPastedTextDraft;
+  // Ending Talk is the same click that started it. The hook's teardown closes
+  // the microphone when `talkActive` goes false; stopping the engine first is
+  // what makes the speaker go quiet in the same moment rather than a chunk later.
+  const startTalk = useCallback(() => {
+    setTalkActive(true);
+  }, []);
+  const stopTalk = useCallback(() => {
+    void talk.stop();
+    setTalkActive(false);
+  }, [talk]);
   const editingPastedAttachment = editingPastedPath
     ? attachments.find((attachment) => attachment.path === editingPastedPath && isPastedTextPath(attachment.path)) ?? null
     : null;
@@ -1581,6 +1621,37 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                 })}
               </div>
             )}
+            {talkActive && (
+              // What Talk is doing, where the person doing it is already
+              // looking. The level meter is the honest part: "Listening" with a
+              // flat meter is a dead microphone, and that is worth seeing
+              // without opening a settings panel.
+              <div className="mb-1.5 flex items-center gap-2 text-xs">
+                <span className={`h-2 w-2 shrink-0 rounded-full ${TALK_STATE_TONE[talkState]}`} aria-hidden />
+                <span role="status" aria-live="polite" className="shrink-0 text-muted">
+                  {t(TALK_STATE_LABEL_KEY[talkState])}
+                  {talk.snapshot?.awaitingWakePhrase && talkState === "listening"
+                    ? ` — ${t("ChatWindow.talkAwaitingWakePhrase")}`
+                    : ""}
+                </span>
+                <span
+                  className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-border"
+                  role="meter"
+                  aria-label={t("ChatWindow.talkLevelAriaLabel")}
+                  aria-valuenow={Math.round((talk.snapshot?.inputLevel ?? 0) * 100)}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                >
+                  <span
+                    className="block h-full bg-success transition-[width] duration-75"
+                    style={{ width: `${Math.min(100, Math.round((talk.snapshot?.inputLevel ?? 0) * 100))}%` }}
+                  />
+                </span>
+                {talk.setupError && (
+                  <span role="alert" className="shrink-0 text-danger">{talk.setupError}</span>
+                )}
+              </div>
+            )}
             <div className="flex items-end gap-2">
               <div className="relative min-w-0 flex-1">
                 <textarea
@@ -1626,26 +1697,37 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                 disabled={sending || preparingTurn || startingComparison || startingCrew}
               />
               <span className="group/action relative shrink-0">
-                {/* Nothing to send yet -> the same slot opens Talk, so the
-                    composer's primary button is never a dead control. */}
+                {/* One slot, four jobs: end Talk while a voice conversation is
+                    running, stop a streaming turn, send what is typed, and —
+                    with nothing to send — start Talk, so the composer's primary
+                    button is never a dead control. Talk outranks the turn's own
+                    Stop while it is running: talking over the answer already
+                    interrupts it, so the button is free to mean "stop talking". */}
                 <button
                   type="button"
-                  onClick={sending ? handleStop : showTalkButton ? onOpenTalk : handleSend}
-                  disabled={preparingTurn || startingComparison || startingCrew || localModelStarting || (!sending && !showTalkButton && !input.trim() && !hasPastedTextDraft)}
-                  aria-label={sending
-                    ? t("ChatWindow.stopResponseAriaLabel")
-                    : showTalkButton
-                      ? t("ChatWindow.talkAriaLabel")
-                      : t("ChatWindow.sendMessageAriaLabel")}
-                  className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full text-faint transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                  onClick={talkActive ? stopTalk : sending ? handleStop : showTalkButton ? startTalk : handleSend}
+                  disabled={!talkActive && (preparingTurn || startingComparison || startingCrew || localModelStarting || (!sending && !showTalkButton && !input.trim() && !hasPastedTextDraft))}
+                  aria-label={talkActive
+                    ? t("ChatWindow.talkStopAriaLabel")
+                    : sending
+                      ? t("ChatWindow.stopResponseAriaLabel")
+                      : showTalkButton
+                        ? t("ChatWindow.talkAriaLabel")
+                        : t("ChatWindow.sendMessageAriaLabel")}
+                  aria-pressed={talkActive || undefined}
+                  className={`flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
+                    talkActive ? "bg-accent-soft text-accent hover:bg-accent-soft hover:text-accent" : "text-faint"
+                  }`}
                 >
-                  {sending
+                  {talkActive || sending
                     ? <Square size={13} className="fill-current" />
                     : showTalkButton
                       ? <AudioLines size={16} />
                       : <CornerDownLeft size={16} />}
                 </button>
-                {sending ? (
+                {talkActive ? (
+                  <Tooltip text={t("ChatWindow.talkStopAriaLabel")} />
+                ) : sending ? (
                   <Tooltip
                     text={t("ChatWindow.stopResponseAriaLabel")}
                     hint={t("ChatWindow.stopResponseHint")}
