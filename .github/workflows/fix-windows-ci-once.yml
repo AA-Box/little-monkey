@@ -26,18 +26,18 @@ jobs:
 
           verify = Path("src-tauri/src/verify.rs")
           text = verify.read_text()
-          old = '            "powershell.exe -NoLogo -NoProfile -NonInteractive -Command Start-Sleep -Seconds 30".to_string()'
-          new = '            "ping -n 31 127.0.0.1 > nul".to_string()'
-          if old not in text:
-              raise SystemExit("Windows long-running verification fixture did not match expected PR head")
+          old = "powershell.exe -NoLogo -NoProfile -NonInteractive -Command Start-Sleep -Seconds 30"
+          new = "ping -n 31 127.0.0.1 > nul"
+          if text.count(old) != 1:
+              raise SystemExit(f"expected one PowerShell sleeper, found {text.count(old)}")
           verify.write_text(text.replace(old, new, 1))
 
           learning = Path("src-tauri/src/skill_learning.rs")
           text = learning.read_text()
-          old = '        let command = r#"if exist \\"src\\\\uploader.rs\\" (exit /b 0) else (exit /b 1)"#;'
-          new = '        let command = r#"if exist src\\\\uploader.rs (exit /b 0) else (exit /b 1)"#;'
-          if old not in text:
-              raise SystemExit("Windows read-only verification fixture did not match expected PR head")
+          old = r'''r#"if exist "src\uploader.rs" (exit /b 0) else (exit /b 1)"#'''
+          new = r'''r#"if exist src\uploader.rs (exit /b 0) else (exit /b 1)"#'''
+          if text.count(old) != 1:
+              raise SystemExit(f"expected one quoted Windows existence check, found {text.count(old)}")
           learning.write_text(text.replace(old, new, 1))
 
           Path(".github/workflows/fix-windows-ci-once.yml").unlink()
