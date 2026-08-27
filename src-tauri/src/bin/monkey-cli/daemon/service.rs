@@ -363,7 +363,7 @@ impl<R: CommandRunner> ServiceManager<R> {
         let manifest_path = self.manifest_path(paths);
         let (contents, runtime) = match self.platform {
             ServicePlatform::Launchd | ServicePlatform::SystemdUser => {
-                let contents = match std::fs::read_to_string(&manifest_path) {
+                let contents = match read_manifest_text(&manifest_path) {
                     Ok(contents) => contents,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
                     Err(error) => {
@@ -397,7 +397,7 @@ impl<R: CommandRunner> ServiceManager<R> {
                         },
                     )
                 } else {
-                    let contents = match std::fs::read_to_string(&manifest_path) {
+                    let contents = match read_manifest_text(&manifest_path) {
                         Ok(contents) => contents,
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                             return Ok(true)
@@ -433,7 +433,7 @@ impl<R: CommandRunner> ServiceManager<R> {
 
     fn snapshot_current(&self, paths: &DaemonPaths) -> Result<CurrentServiceSnapshot, String> {
         let manifest_path = self.manifest_path(paths);
-        let mut manifest_contents = match std::fs::read_to_string(&manifest_path) {
+        let mut manifest_contents = match read_manifest_text(&manifest_path) {
             Ok(contents) => Some(contents),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(format!("Failed to snapshot service manifest: {error}")),
@@ -472,9 +472,7 @@ impl<R: CommandRunner> ServiceManager<R> {
                     ],
                 )?;
                 if query.status.success() {
-                    manifest_contents = Some(normalize_windows_task_xml(&command_output_text(
-                        &query.stdout,
-                    )));
+                    manifest_contents = Some(command_output_text(&query.stdout));
                     (true, self.windows_task_running(&self.windows_task())?)
                 } else {
                     (false, false)
@@ -569,7 +567,7 @@ impl<R: CommandRunner> ServiceManager<R> {
         let manifest_path = self.legacy_manifest_path(paths);
         let (contents, runtime) = match self.platform {
             ServicePlatform::Launchd | ServicePlatform::SystemdUser => {
-                let contents = match std::fs::read_to_string(&manifest_path) {
+                let contents = match read_manifest_text(&manifest_path) {
                     Ok(contents) => contents,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                     Err(error) => {
@@ -596,7 +594,7 @@ impl<R: CommandRunner> ServiceManager<R> {
                 if !query.status.success() {
                     return Ok(None);
                 }
-                let contents = normalize_windows_task_xml(&command_output_text(&query.stdout));
+                let contents = command_output_text(&query.stdout);
                 // `/End` reports whether the task was running during the stop
                 // step, so a manifest that already names this profile decides
                 // ownership on its own and needs no extra query.
@@ -727,7 +725,7 @@ impl<R: CommandRunner> ServiceManager<R> {
         restart: bool,
         was_registered: bool,
     ) -> Result<(), String> {
-        let manifest_unchanged = std::fs::read_to_string(&legacy.manifest_path)
+        let manifest_unchanged = read_manifest_text(&legacy.manifest_path)
             .is_ok_and(|contents| contents == legacy.manifest_contents);
         if !manifest_unchanged {
             publish_service_manifest(&legacy.manifest_path, &legacy.manifest_contents)?;
@@ -825,30 +823,35 @@ impl<R: CommandRunner> ServiceManager<R> {
     pub fn render_manifest(&self, paths: &DaemonPaths) -> Result<String, String> {
         let executable = utf8_path(&self.executable, "monkey executable")?;
         let agent_home = utf8_path(&self.agent_home, "agent home")?;
+        let user_home = utf8_path(&self.home, "user home")?;
         Ok(match self.platform {
             ServicePlatform::Launchd => {
                 let launchd_label = self.launchd_label();
                 let stdout = paths.logs.join("service.stdout.log");
                 let stderr = paths.logs.join("service.stderr.log");
                 format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key><string>{launchd_label}</string>\n  <key>ProgramArguments</key>\n  <array><string>{}</string><string>--profile</string><string>{}</string><string>daemon</string><string>serve</string></array>\n  <key>EnvironmentVariables</key><dict><key>LITTLE_MONKEY_HOME</key><string>{}</string></dict>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>ProcessType</key><string>Background</string>\n  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict>\n</plist>\n",
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key><string>{launchd_label}</string>\n  <key>ProgramArguments</key>\n  <array><string>{}</string><string>--profile</string><string>{}</string><string>daemon</string><string>serve</string></array>\n  <key>EnvironmentVariables</key>\n  <dict>\n    <key>LITTLE_MONKEY_HOME</key><string>{}</string>\n    <key>HOME</key><string>{}</string>\n  </dict>\n  <key>WorkingDirectory</key><string>{}</string>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>ProcessType</key><string>Background</string>\n  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict>\n</plist>\n",
                     xml_escape(&executable),
                     xml_escape(&self.profile_id),
                     xml_escape(&agent_home),
+                    xml_escape(user_home),
+                    xml_escape(user_home),
                     xml_escape(utf8_path(&stdout, "service stdout log")?),
                     xml_escape(utf8_path(&stderr, "service stderr log")?),
                 )
             }
             ServicePlatform::SystemdUser => format!(
-                "[Unit]\nDescription=Little Monkey durable local agent daemon\nAfter=network-online.target\n\n[Service]\nType=simple\nEnvironment={}\nExecStart={} --profile={} daemon serve\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=full\nWorkingDirectory={}\n\n[Install]\nWantedBy=default.target\n",
+                "[Unit]\nDescription=Little Monkey durable local agent daemon\nAfter=network-online.target\n\n[Service]\nType=simple\nEnvironment={}\nEnvironment={}\nEnvironment=\"XDG_RUNTIME_DIR=%t\"\nEnvironment=\"DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus\"\nExecStart={} --profile={} daemon serve\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=full\nWorkingDirectory=%h\n\n[Install]\nWantedBy=default.target\n",
                 systemd_environment_escape(&format!("LITTLE_MONKEY_HOME={agent_home}")),
+                systemd_environment_escape(&format!("HOME={user_home}")),
                 systemd_escape(&executable),
                 systemd_escape(&self.profile_id),
-                systemd_escape(utf8_path(&self.home, "user home")?),
             ),
             ServicePlatform::WindowsTask => {
                 let script = format!(
-                    "$env:LITTLE_MONKEY_HOME={}; & {} --profile {} daemon serve; exit $LASTEXITCODE",
+                    "$env:USERPROFILE={}; $env:HOME={}; $env:LITTLE_MONKEY_HOME={}; & {} --profile {} daemon serve; exit $LASTEXITCODE",
+                    powershell_single_quote(user_home),
+                    powershell_single_quote(user_home),
                     powershell_single_quote(&agent_home),
                     powershell_single_quote(&executable),
                     powershell_single_quote(&self.profile_id),
@@ -856,7 +859,7 @@ impl<R: CommandRunner> ServiceManager<R> {
                 let encoded = powershell_encoded_command(&script);
                 let arguments = format!("-NoProfile -NonInteractive -EncodedCommand {encoded}");
                 format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>\n  <Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>\n  <Actions Context=\"Author\"><Exec><Command>{}</Command><Arguments>{}</Arguments><WorkingDirectory>{}</WorkingDirectory></Exec></Actions>\n</Task>\n",
+                    "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>\n  <Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>\n  <Actions Context=\"Author\"><Exec><Command>{}</Command><Arguments>{}</Arguments><WorkingDirectory>{}</WorkingDirectory></Exec></Actions>\n</Task>\n",
                     "powershell.exe",
                     xml_escape(&arguments),
                     xml_escape(utf8_path(&paths.root, "daemon state root")?),
@@ -1266,7 +1269,7 @@ impl<R: CommandRunner> ServiceManager<R> {
     /// guessing which differences are benign is how a stale service survives
     /// an upgrade.
     pub fn manifest_is_current(&self, paths: &DaemonPaths) -> Result<bool, String> {
-        let Ok(published) = std::fs::read_to_string(self.manifest_path(paths)) else {
+        let Ok(published) = read_manifest_text(&self.manifest_path(paths)) else {
             return Ok(false);
         };
         Ok(published == self.render_manifest(paths)?)
@@ -1452,7 +1455,7 @@ fn publish_service_manifest(path: &Path, contents: &str) -> Result<(), String> {
         ".service-manifest-{}.tmp",
         uuid::Uuid::new_v4().simple()
     ));
-    if let Err(error) = std::fs::write(&temporary, contents) {
+    if let Err(error) = std::fs::write(&temporary, manifest_bytes(contents)) {
         let _ = std::fs::remove_file(&temporary);
         return Err(format!("Failed to write service manifest: {error}"));
     }
@@ -1548,9 +1551,33 @@ fn command_output_text(bytes: &[u8]) -> String {
     String::from_utf16_lossy(&units.collect::<Vec<_>>())
 }
 
-fn normalize_windows_task_xml(xml: &str) -> String {
-    xml.replacen("encoding=\"UTF-16\"", "encoding=\"UTF-8\"", 1)
-        .replacen("encoding=\"utf-16\"", "encoding=\"UTF-8\"", 1)
+/// Encode a rendered definition so its bytes match its own declaration.
+///
+/// `schtasks /Create /XML` hands the file to MSXML as text, so a Scheduled
+/// Task definition has to be the UTF-16 Windows itself writes — a UTF-8
+/// declaration is rejected with "unable to switch the encoding" before any
+/// task element is read. Everything else stays UTF-8.
+fn manifest_bytes(contents: &str) -> Vec<u8> {
+    if !declares_utf16(contents) {
+        return contents.as_bytes().to_vec();
+    }
+    let mut bytes = vec![0xff, 0xfe];
+    for unit in contents.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
+fn declares_utf16(contents: &str) -> bool {
+    let Some(declaration) = contents.split_once("?>").map(|(head, _)| head) else {
+        return false;
+    };
+    declaration.contains("encoding=\"UTF-16\"") || declaration.contains("encoding=\"utf-16\"")
+}
+
+/// Read a published definition back through the same encodings we write.
+fn read_manifest_text(path: &Path) -> std::io::Result<String> {
+    Ok(command_output_text(&std::fs::read(path)?))
 }
 
 /// Escape a value for XML markup. Shared with the carrier answer documents in
@@ -1905,6 +1932,27 @@ mod tests {
             assert!(command.contains("daemon"));
             assert!(command.contains("serve"));
             assert!(command.contains("LITTLE_MONKEY_HOME"));
+            match platform {
+                ServicePlatform::Launchd => {
+                    assert!(rendered.contains("<key>HOME</key><string>/home/test</string>"));
+                    assert!(
+                        rendered.contains("<key>WorkingDirectory</key><string>/home/test</string>")
+                    );
+                }
+                ServicePlatform::SystemdUser => {
+                    assert!(rendered.contains(r#"Environment="HOME=/home/test""#));
+                    assert!(rendered.contains(r#"Environment="XDG_RUNTIME_DIR=%t""#));
+                    assert!(rendered
+                        .contains(r#"Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus""#));
+                    assert!(rendered.contains("WorkingDirectory=%h"));
+                    assert!(!rendered.contains(r#"WorkingDirectory="/home/test""#));
+                }
+                ServicePlatform::WindowsTask => {
+                    assert!(command.contains("$env:USERPROFILE='/home/test'"));
+                    assert!(command.contains("$env:HOME='/home/test'"));
+                    assert!(rendered.contains("<LogonType>InteractiveToken</LogonType>"));
+                }
+            }
             assert!(!rendered.contains("--agent-home"));
             assert!(!command.contains("--agent-home"));
             assert!(command.contains("profile"));
@@ -2006,7 +2054,7 @@ mod tests {
 
         let windows = manager(ServicePlatform::WindowsTask, "work", agent_home);
         let windows_manifest = windows.render_manifest(&paths).unwrap();
-        assert!(windows_manifest.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
+        assert!(windows_manifest.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\"?>"));
         let script = decoded_windows_script(&windows_manifest);
         assert!(script.contains(
             "$env:LITTLE_MONKEY_HOME='/home/test/Agent $HOME % & <portable> \"quoted\"'"
@@ -2630,7 +2678,7 @@ mod tests {
 
         manager.install(&paths, &DaemonConfig::default()).unwrap();
         assert_eq!(health_calls.load(Ordering::Relaxed), 1);
-        let installed = std::fs::read_to_string(&manifest).unwrap();
+        let installed = read_manifest_text(&manifest).unwrap();
         let script = decoded_windows_script(&installed);
         assert!(script.contains("$env:LITTLE_MONKEY_HOME="));
         assert!(script.contains("--profile 'default'"));
@@ -2651,6 +2699,30 @@ mod tests {
         assert!(error.contains("Refusing to replace service manifest directory"));
         assert_eq!(std::fs::read_to_string(child).unwrap(), "preserved");
         assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn windows_task_manifests_are_published_as_the_utf16_schtasks_reads() {
+        let temp = TestDir::new();
+        let paths = DaemonPaths::under(&temp.0.join("state"));
+        let manager = manager(ServicePlatform::WindowsTask, "work", "/home/test/agent");
+        let rendered = manager.render_manifest(&paths).unwrap();
+        let manifest = manager.manifest_path(&paths);
+
+        publish_service_manifest(&manifest, &rendered).unwrap();
+
+        let bytes = std::fs::read(&manifest).unwrap();
+        assert_eq!(&bytes[..2], &[0xff, 0xfe]);
+        assert_eq!(bytes[2], b'<');
+        assert_eq!(bytes[3], 0);
+        assert_eq!(read_manifest_text(&manifest).unwrap(), rendered);
+        assert!(manager.manifest_is_current(&paths).unwrap());
+    }
+
+    #[test]
+    fn non_windows_manifests_stay_utf8_on_disk() {
+        let unit = "[Unit]\nDescription=Little Monkey\n";
+        assert_eq!(manifest_bytes(unit), unit.as_bytes());
     }
 
     #[test]
