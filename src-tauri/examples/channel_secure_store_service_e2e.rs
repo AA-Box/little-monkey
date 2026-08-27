@@ -56,6 +56,15 @@ fn run_cli(profile: Option<&str>, args: &[&str]) -> Result<Output, String> {
             binary.display()
         ));
     }
+    let size = std::fs::metadata(&binary)
+        .map_err(|error| format!("could not stat prebuilt monkey-cli at {}: {error}", binary.display()))?
+        .len();
+    if size == 0 {
+        return Err(format!(
+            "prebuilt monkey-cli at {} is the zero-byte Tauri bootstrap placeholder, not the real executable",
+            binary.display()
+        ));
+    }
     let mut command = Command::new(binary);
     command.args(args);
     if let Some(profile) = profile {
