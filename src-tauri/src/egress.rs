@@ -4711,6 +4711,11 @@ mod tests {
             // than an origin pin, and reqwest strips `Authorization` cross-host
             // anyway. It sets a connect timeout, `egress::READ_TIMEOUT`, a hop cap
             // and its own per-hop SSRF check.
+            // The MLX chat endpoint's own end-to-end test, driving the listener
+            // it just bound on `127.0.0.1`. Loopback by construction, carrying
+            // no credential and reaching no third party — the same case as the
+            // bare-client entries above, and `hardened()` refuses loopback.
+            ("mlx_chat.rs", 1, 0),
             ("model_sources.rs", 0, 1),
             // `download_to_file` and the Hugging Face repository-tree listing,
             // the same shape and the same reason, likewise on

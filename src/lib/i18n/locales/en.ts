@@ -966,7 +966,7 @@ export const en: Record<string, string> = {
   "AddCustomModelForm.bundleDirectoryLabel": "Model directory",
   "AddCustomModelForm.bundleFileCount": "({{count}} files)",
   "AddCustomModelForm.mlxRuntimeNote":
-    "A safetensors model for the MLX runtime. It installs and verifies, but chat currently runs on llama.cpp, which loads GGUF files only.",
+    "A safetensors model for the MLX runtime on Apple Silicon. Start it like any other local model.",
   "AddCustomModelForm.sizeLabel": "Size",
   "AddCustomModelForm.licenseLabel": "License",
   "AddCustomModelForm.toolCallingLabel": "Tool calling",
@@ -977,6 +977,7 @@ export const en: Record<string, string> = {
   "ModelCard.statusError": "Error",
   "ModelCard.statusSelected": "Selected",
   "ModelCard.toolCallingBadge": "Tool calling",
+  "ModelCard.mlxRuntimeBadge": "MLX",
   "ModelCard.visionConfiguredBadge": "Vision configured",
   "ModelCard.visionReadyBadge": "Vision ready",
   "ModelCard.projectorLabel": "Multimodal projector",
