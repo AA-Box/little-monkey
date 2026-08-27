@@ -231,7 +231,7 @@ export function CompanionPanel() {
           </label>
           {config.voice.backend === "local_whisper" ? (
             <div className="rounded-md border border-border bg-background p-3 text-xs text-muted md:col-span-2">
-              Local transcription is built in. Little Monkey installs and verifies its multilingual Whisper model automatically; there is no binary or model path to configure.
+              Local transcription is built in. Little Monkey ships its multilingual Whisper model with the app, so it works offline; there is no binary or model path to configure.
             </div>
           ) : config.voice.backend === "provider" ? <>
             <label className="text-xs text-muted">Provider id

@@ -100,6 +100,11 @@ jobs:
         if: startsWith(matrix.platform, 'macos')
         run: pnpm icon:mac-liquid
 
+      # The model ships inside the application. Staging it here is what makes
+      # the local speech backend work on a first run with no network.
+      - name: Verify and stage the built-in Whisper model
+        run: pnpm stage:whisper
+
       - name: Build and stage monkey-cli sidecar
         run: pnpm stage:cli
         env:

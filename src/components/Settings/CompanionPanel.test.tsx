@@ -111,7 +111,7 @@ describe("CompanionPanel executable transcription", () => {
 
     expect(screen.queryByLabelText("whisper.cpp binary")).toBeNull();
     expect(screen.queryByLabelText("Whisper model")).toBeNull();
-    expect(screen.getByText(/installs and verifies its multilingual Whisper model automatically/i)).toBeTruthy();
+    expect(screen.getByText(/ships its multilingual Whisper model with the app/i)).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Save voice settings" }));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("m7_config_save", {

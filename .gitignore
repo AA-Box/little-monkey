@@ -42,6 +42,9 @@ src-tauri/binaries
 src-tauri/resources/managed-runtime/*
 !src-tauri/resources/managed-runtime/README.md
 
+# Verified Whisper model staged by scripts/stage-whisper-model.mjs.
+src-tauri/resources/local-whisper/*
+
 # Downloaded GGUF model weights
 /models/
 *.gguf

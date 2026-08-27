@@ -31,12 +31,16 @@ const MODEL_FILE: &str = "ggml-base-q5_1.bin";
 const MODEL_URL: &str =
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/f281eb45af861ab5e5297d23694b7d46e090c02c/ggml-base-q5_1.bin";
 const MODEL_SHA256: &str = "422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898";
+const MODEL_BYTES: u64 = 59_707_625;
 const MAX_MODEL_BYTES: u64 = 128 * 1024 * 1024;
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 const MAX_AUDIO_SECONDS: usize = 60 * 60;
 const MAX_WHISPER_SAMPLES: usize = WHISPER_SAMPLE_RATE as usize * MAX_AUDIO_SECONDS;
 const MAX_OPUS_FRAME_SAMPLES: usize = WHISPER_SAMPLE_RATE as usize * 120 / 1_000;
 
+const BUNDLED_DIRECTORY: &str = "local-whisper";
+
+static BUNDLED_MODEL: OnceLock<Option<PathBuf>> = OnceLock::new();
 static PREPARE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static READY_MODEL: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static CONTEXT: OnceLock<Mutex<Option<Arc<WhisperContext>>>> = OnceLock::new();
@@ -52,6 +56,48 @@ pub struct LocalTranscriptSegment {
 pub struct LocalTranscript {
     pub text: String,
     pub segments: Vec<LocalTranscriptSegment>,
+}
+
+/// Record where the installed application keeps its bundled copy of the model.
+///
+/// Called once at startup. The model ships inside the application, so a first
+/// run with no network — or behind a proxy that will not reach huggingface.co —
+/// transcribes immediately rather than waiting on a 57MB download that may
+/// never succeed. Development trees that have not run `pnpm stage:whisper` have
+/// no bundled copy, and fall back to the download path below.
+pub fn set_resource_dir(resource_dir: Option<&Path>) {
+    let _ = BUNDLED_MODEL.set(resolve_bundled(resource_dir));
+}
+
+/// The bundled model, if this installation actually carries an intact one.
+///
+/// Size, not SHA-256: this file was installed as part of the signed application
+/// bundle and is already covered by the startup integrity check, so re-hashing
+/// 57MB on every launch would buy nothing. The *downloaded* copy is the
+/// untrusted one, and it is still verified byte for byte before activation.
+fn resolve_bundled(resource_dir: Option<&Path>) -> Option<PathBuf> {
+    let candidate = resource_dir?.join(BUNDLED_DIRECTORY).join(MODEL_FILE);
+    match std::fs::metadata(&candidate) {
+        Ok(metadata) if metadata.is_file() && metadata.len() == MODEL_BYTES => Some(candidate),
+        _ => None,
+    }
+}
+
+fn bundled_model() -> Option<PathBuf> {
+    BUNDLED_MODEL.get().cloned().flatten()
+}
+
+/// Whether a local transcription could start right now without waiting on a
+/// download. Talk and the telephony surface ask before claiming to be ready.
+#[must_use]
+pub fn is_ready() -> bool {
+    if bundled_model().is_some() {
+        return true;
+    }
+    matches!(
+        ready_model_slot().lock(),
+        Ok(slot) if slot.as_ref().is_some_and(|path| path.is_file())
+    )
 }
 
 fn prepare_lock() -> &'static tokio::sync::Mutex<()> {
@@ -203,6 +249,10 @@ async fn download_model(path: &Path) -> Result<(), String> {
 /// Ensure the built-in speech model is ready. Safe to call at startup and on
 /// every transcription: concurrent callers collapse behind one install lock.
 pub async fn prepare(app_data_dir: &Path) -> Result<PathBuf, String> {
+    // The installed application ships the model, so nothing is fetched at all.
+    if let Some(bundled) = bundled_model() {
+        return Ok(bundled);
+    }
     let path = model_path(app_data_dir);
     if let Some(cached) = lock(ready_model_slot(), "local speech model readiness")?.clone() {
         if cached == path && cached.is_file() {
@@ -555,6 +605,38 @@ pub async fn transcribe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bundled_model_is_taken_only_when_it_is_whole() {
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-bundled-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let dir = root.join(BUNDLED_DIRECTORY);
+        fs::create_dir_all(&dir).unwrap();
+        let model = dir.join(MODEL_FILE);
+
+        assert_eq!(resolve_bundled(None), None, "no resource dir, no model");
+        assert_eq!(
+            resolve_bundled(Some(&root)),
+            None,
+            "an absent model is not a bundled model"
+        );
+
+        // A truncated resource is the failure this guards: it would otherwise
+        // be handed to whisper.cpp as though it were the real thing.
+        fs::write(&model, b"not the whole model").unwrap();
+        assert_eq!(
+            resolve_bundled(Some(&root)),
+            None,
+            "a short model is not a bundled model"
+        );
+
+        fs::write(&model, vec![0u8; MODEL_BYTES as usize]).unwrap();
+        assert_eq!(resolve_bundled(Some(&root)), Some(model));
+
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn downmixes_stereo_frames() {

@@ -1130,10 +1130,12 @@ pub fn m7_talk_status(
     ensure_main_window(&window)?;
     let voice = state.config()?.voice;
     let configured = match voice.backend {
-        // Local Whisper is part of the application. The model is provisioned
-        // automatically in the background and lazily retried on first use, so
-        // no user-supplied executable/model paths are a configuration gate.
-        TranscriptionBackendKind::LocalWhisper => true,
+        // Local Whisper is part of the application and needs no user-supplied
+        // paths. It still has to be able to answer *now*: the installed app
+        // ships the model, but a development tree that has not staged it is
+        // waiting on a download, and saying "ready" then is how a user finds
+        // out by speaking into a Talk session that cannot hear them.
+        TranscriptionBackendKind::LocalWhisper => crate::local_whisper::is_ready(),
         TranscriptionBackendKind::Provider => voice.provider_id.is_some(),
         // Both halves, because either one alone resolves to nothing: the
         // capability names what to run and the extension id names whose copy
@@ -1776,9 +1778,18 @@ pub async fn m7_talk_transcribe(
 pub fn call_speech_readiness(app_data_dir: &Path) -> Result<(), String> {
     let voice = M7CompanionState::production(app_data_dir)?.config()?.voice;
     match voice.backend {
-        // The local engine ships with the app and provisions its verified model
-        // automatically. Readiness is no longer a user-configuration question.
-        TranscriptionBackendKind::LocalWhisper => {}
+        // The local engine ships with the app, so this is no longer a question
+        // about user configuration — but it is still a question. Answering a
+        // call whose every turn will fail is exactly what this guard exists to
+        // prevent, and an unstaged development tree can still be in that state.
+        TranscriptionBackendKind::LocalWhisper => {
+            if !crate::local_whisper::is_ready() {
+                return Err(
+                    "The built-in speech model is still being prepared, so nothing said on a call could be understood yet."
+                        .to_string(),
+                );
+            }
+        }
         TranscriptionBackendKind::Provider => {
             if voice.provider_id.as_deref().unwrap_or_default().is_empty() {
                 return Err(

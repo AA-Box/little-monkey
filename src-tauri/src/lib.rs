@@ -1106,6 +1106,9 @@ pub fn run() {
             // when the user actually speaks. No path selection or external runtime is
             // required on macOS, Windows, or Linux.
             {
+                // The installed app carries the model as a bundled resource;
+                // prepare() then has nothing to download at all.
+                local_whisper::set_resource_dir(app.path().resource_dir().ok().as_deref());
                 let speech_data_dir = app_data_dir.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Err(error) = local_whisper::prepare(&speech_data_dir).await {
