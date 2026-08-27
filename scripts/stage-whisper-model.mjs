@@ -11,7 +11,7 @@
 // Keep MODEL_URL, MODEL_SHA256 and MODEL_FILE in step with the constants of
 // the same name in src-tauri/src/local_whisper.rs.
 import { createHash } from "node:crypto";
-import { mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -29,14 +29,13 @@ const destination = join(destinationDir, MODEL_FILE);
 const digestOf = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
 // Already staged and intact: re-running the build must not re-download 57MB.
+// One read, deliberately: sizing the file and then opening it separately is a
+// race, and it answers a weaker question than the bytes themselves do.
 try {
-  const existing = statSync(destination);
-  if (existing.size === MODEL_BYTES) {
-    const { readFileSync } = await import("node:fs");
-    if (digestOf(readFileSync(destination)) === MODEL_SHA256) {
-      console.log(`[stage-whisper-model] already staged ${destination}`);
-      process.exit(0);
-    }
+  const staged = readFileSync(destination);
+  if (staged.byteLength === MODEL_BYTES && digestOf(staged) === MODEL_SHA256) {
+    console.log(`[stage-whisper-model] already staged ${destination}`);
+    process.exit(0);
   }
 } catch {
   // Not staged yet, which is the normal path on a clean checkout.
@@ -64,6 +63,11 @@ if (digest !== MODEL_SHA256) {
 mkdirSync(destinationDir, { recursive: true });
 const staging = `${destination}.staging`;
 try {
+  // codeql[js/http-to-file-access]: these bytes are pinned by MODEL_SHA256 and
+  // verified above, in memory, before anything reaches the filesystem — a
+  // mismatch throws and nothing is written. Downloading a pinned artefact to
+  // disk is the purpose of this script; the digest is what makes it safe, and
+  // scripts/stage-managed-runtime.mjs stages every other runtime the same way.
   writeFileSync(staging, bytes);
   renameSync(staging, destination);
 } catch (error) {
