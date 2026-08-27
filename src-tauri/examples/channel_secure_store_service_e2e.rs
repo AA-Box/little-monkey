@@ -382,14 +382,40 @@ fn run_real_service_case(case: &str) -> Result<(), String> {
 /// binary blocking on the native store, while an ordinary error means the read
 /// works and the daemon stopped somewhere else.
 fn probe_credential_through_cli(profile: &str, account_id: &str) {
-    match run_cli(Some(profile), &["channels", "probe", account_id, "--json"]) {
-        Ok(output) => eprintln!(
-            "--- CLI credential probe exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout).trim()
-        ),
-        Err(error) => eprintln!("--- CLI credential probe: {error}"),
-    }
+    // Every value derived from the probed account is reported as one of a fixed
+    // set of labels. The distinction that matters is whether the read returned
+    // at all, and an account payload copied into a public CI log is exactly the
+    // disclosure the credential lives in a native store to avoid.
+    let outcome = match run_cli(Some(profile), &["channels", "probe", account_id, "--json"]) {
+        Ok(output) => {
+            let health = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                .ok()
+                .and_then(|payload| {
+                    payload
+                        .get("health")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|health| match health {
+                            "connected" => "connected",
+                            "degraded" => "degraded",
+                            "error" => "error",
+                            "disconnected" => "disconnected",
+                            _ => "unknown",
+                        })
+                });
+            match (output.status.success(), health) {
+                (_, Some(health)) => format!("returned health {health}"),
+                (true, None) => "returned no health".to_string(),
+                (false, None) => "exited non-zero with no health".to_string(),
+            }
+        }
+        // Matched, never printed: the message names the command, and the
+        // command names the account.
+        Err(error) if error.contains("without finishing") => {
+            "never returned, which is the native store blocking".to_string()
+        }
+        Err(_) => "could not be run at all".to_string(),
+    };
+    eprintln!("--- CLI credential probe {outcome}");
     #[cfg(target_os = "macos")]
     match run_program("/usr/bin/security", &["list-keychains", "-d", "user"]) {
         Ok(output) => eprintln!(
