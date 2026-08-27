@@ -54,14 +54,18 @@ jobs:
           workspaces: src-tauri
           key: channel-secure-store-${{ matrix.os }}
 
-      # tauri-build expects the bundled CLI sidecar path to exist while the
-      # production CLI and acceptance harness are compiled. The harness itself
-      # invokes the real target/debug/monkey-cli binary, never this placeholder.
-      - name: Stage CLI sidecar placeholder
-        run: node scripts/ensure-cli-sidecar-placeholder.mjs
-
-      - name: Build production CLI
-        run: cargo build --manifest-path src-tauri/Cargo.toml --bin monkey-cli
+      # tauri-build checks/copies the externalBin during every build of this
+      # package. A cache-restored little-monkey fingerprint can otherwise let
+      # that zero-byte bootstrap placeholder become target/debug/monkey-cli
+      # without Cargo relinking the real CLI. Clean only this package (keeping
+      # dependency cache), build it fresh, then stage the real binary so later
+      # example builds can only copy valid executable bytes back onto the CLI.
+      - name: Build and pin real production CLI
+        run: |
+          cargo clean --manifest-path src-tauri/Cargo.toml -p little-monkey
+          node scripts/ensure-cli-sidecar-placeholder.mjs
+          cargo build --manifest-path src-tauri/Cargo.toml --bin monkey-cli
+          node scripts/ensure-cli-sidecar-placeholder.mjs
 
       - name: Native credential -> installed service -> Telegram worker
         run: >-
@@ -89,11 +93,12 @@ jobs:
           workspaces: src-tauri
           key: channel-secure-store-ubuntu
 
-      - name: Stage CLI sidecar placeholder
-        run: node scripts/ensure-cli-sidecar-placeholder.mjs
-
-      - name: Build production CLI
-        run: cargo build --manifest-path src-tauri/Cargo.toml --bin monkey-cli
+      - name: Build and pin real production CLI
+        run: |
+          cargo clean --manifest-path src-tauri/Cargo.toml -p little-monkey
+          node scripts/ensure-cli-sidecar-placeholder.mjs
+          cargo build --manifest-path src-tauri/Cargo.toml --bin monkey-cli
+          node scripts/ensure-cli-sidecar-placeholder.mjs
 
       # A nested `systemd --user` cannot allocate a cgroup inside GitHub's
       # hosted-compute-agent.service. Start the runner account's genuine
