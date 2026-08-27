@@ -87,9 +87,7 @@ dirs = "6.0.0"
 # Platform keystore features are required: without them keyring v3 falls back
 # to its in-memory mock store, where every `Entry::new` is an independent
 # credential — keys "save" but can never be read back (has_key stays false).
-# Linux uses keyutils + Secret Service together: persistent desktop storage when
-# available, with a native kernel-backed store for headless/user-service contexts.
-keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 rustyline = "17"

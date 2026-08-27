@@ -17,6 +17,13 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// No single child in this harness has a legitimate reason to run for minutes:
+/// every one of them either edits local state or waits on a bounded poll. A
+/// stuck child (a macOS keychain prompt with nobody to answer it, a service
+/// that never terminates) would otherwise wedge the whole CI job silently, so
+/// wait for it here and fail with the command that stopped.
+const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
+
 const REQUIRE_ENV: &str = "LITTLE_MONKEY_REQUIRE_CHANNEL_SECURE_STORE_SERVICE_E2E";
 const PROFILE_ENV: &str = "LITTLE_MONKEY_PROFILE";
 const EXPECTED_SHA_ENV: &str = "LM_CHANNEL_SECURE_STORE_EXPECTED_SHA256";
@@ -70,9 +77,35 @@ fn run_cli(profile: Option<&str>, args: &[&str]) -> Result<Output, String> {
     if let Some(profile) = profile {
         command.env(PROFILE_ENV, profile);
     }
-    command
-        .output()
-        .map_err(|error| format!("failed to start monkey-cli {args:?}: {error}"))
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to start monkey-cli {args:?}: {error}"))?;
+    bounded_output(child, &format!("monkey-cli {args:?}"))
+}
+
+/// Wait for a child, killing it once it is clearly stuck.
+fn bounded_output(mut child: std::process::Child, label: &str) -> Result<Output, String> {
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{label} was killed after {}s without finishing",
+                    CHILD_TIMEOUT.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(error) => return Err(format!("failed waiting for {label}: {error}")),
+        }
+    }
+    child
+        .wait_with_output()
+        .map_err(|error| format!("failed to collect {label} output: {error}"))
 }
 
 fn require_cli(profile: Option<&str>, args: &[&str]) -> Result<Output, String> {
@@ -153,9 +186,7 @@ fn run_boundary_child(
             .write_all(value.as_bytes())
             .map_err(|error| format!("failed to write native {mode} stdin: {error}"))?;
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("failed waiting for native {mode} child: {error}"))?;
+    let output = bounded_output(child, &format!("native {mode} child"))?;
     if output.status.success() {
         Ok(())
     } else {
@@ -206,7 +237,7 @@ fn wait_for_resident_credential_use(
 ) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut last_status = String::new();
-    let mut last_account = String::new();
+    let mut last_health = "unknown";
 
     while Instant::now() < deadline {
         if let Ok(output) = run_cli(Some(profile), &["daemon", "status", "--json"]) {
@@ -240,18 +271,25 @@ fn wait_for_resident_credential_use(
                                 })
                             })
                             .ok_or_else(|| format!("account {account_id} disappeared from channels list"))?;
-                        last_account = account.to_string();
-                        let health = account
-                            .get("health")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown");
+                        // Only a fixed label crosses back out of the account
+                        // payload: the harness reports why it is still waiting
+                        // without ever writing credential-bearing JSON to a log.
+                        last_health = match account.get("health").and_then(serde_json::Value::as_str)
+                        {
+                            Some("connected") => "connected",
+                            Some("degraded") => "degraded",
+                            Some("error") => "error",
+                            Some("disconnected") => "disconnected",
+                            Some(_) | None => "unknown",
+                        };
 
-                        if health == "error" {
-                            return Err(format!(
-                                "resident service started but failed to build the channel account: {last_account}"
-                            ));
+                        if last_health == "error" {
+                            return Err(
+                                "resident service started but failed to build the channel account"
+                                    .to_string(),
+                            );
                         }
-                        if matches!(health, "degraded" | "connected") {
+                        if matches!(last_health, "degraded" | "connected") {
                             if account.to_string().contains(secret) {
                                 return Err("Telegram credential leaked into channel status".to_string());
                             }
@@ -265,7 +303,7 @@ fn wait_for_resident_credential_use(
     }
 
     Err(format!(
-        "installed resident service never proved it consumed the desktop-written credential within 120s\nlast daemon status: {last_status}\nlast account: {last_account}"
+        "installed resident service never proved it consumed the desktop-written credential within 120s\nlast daemon status: {last_status}\nlast account health: {last_health}"
     ))
 }
 
@@ -328,7 +366,7 @@ fn run_real_service_case(case: &str) -> Result<(), String> {
 fn real_main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let mode = args.next().ok_or_else(|| {
-        "usage: channel_secure_store_service_e2e <desktop|headless|writer|reader> [account_id]"
+        "usage: channel_secure_store_service_e2e <desktop|writer|reader> [account_id]"
             .to_string()
     })?;
 
@@ -336,16 +374,6 @@ fn real_main() -> Result<(), String> {
         "writer" => writer(&args.next().ok_or_else(|| "writer requires account id".to_string())?),
         "reader" => reader(&args.next().ok_or_else(|| "reader requires account id".to_string())?),
         "desktop" => run_real_service_case("desktop"),
-        "headless" => {
-            #[cfg(target_os = "linux")]
-            {
-                run_real_service_case("headless")
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                Err("headless native-keyutils acceptance is Linux-only".to_string())
-            }
-        }
         other => Err(format!("unknown mode {other}")),
     }
 }
