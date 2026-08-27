@@ -29,25 +29,48 @@ jobs:
           path = Path("src-tauri/src/bin/monkey-cli/daemon/service.rs")
           source = path.read_text()
 
-          old_workdir = 'WorkingDirectory={}\\\n\\\n[Install]'
-          new_workdir = 'WorkingDirectory=%h\\\n\\\n[Install]'
-          if source.count(old_workdir) != 1:
-              raise SystemExit(f"expected exactly one systemd WorkingDirectory renderer, found {source.count(old_workdir)}")
-          source = source.replace(old_workdir, new_workdir, 1)
+          renderer_start = source.index("            ServicePlatform::SystemdUser => format!(")
+          renderer_end = source.index("            ServicePlatform::WindowsTask => {", renderer_start)
+          renderer = source[renderer_start:renderer_end]
 
-          old_arg = '                systemd_escape(user_home),\n'
-          if source.count(old_arg) != 1:
-              raise SystemExit(f"expected exactly one obsolete WorkingDirectory format argument, found {source.count(old_arg)}")
-          source = source.replace(old_arg, '', 1)
+          if renderer.count("WorkingDirectory={}") != 1:
+              raise SystemExit(
+                  f"expected exactly one systemd WorkingDirectory placeholder, found {renderer.count('WorkingDirectory={}')}"
+              )
+          renderer = renderer.replace("WorkingDirectory={}", "WorkingDirectory=%h", 1)
 
-          old_assert = '                    assert!(rendered.contains(r#"WorkingDirectory=\\"/home/test\\""#));\n'
-          new_assert = (
-              '                    assert!(rendered.contains("WorkingDirectory=%h"));\n'
-              '                    assert!(!rendered.contains(r#"WorkingDirectory=\\"/home/test\\""#));\n'
+          arg = "                systemd_escape(user_home),\n"
+          if renderer.count(arg) != 1:
+              raise SystemExit(
+                  f"expected exactly one obsolete WorkingDirectory format argument, found {renderer.count(arg)}"
+              )
+          renderer = renderer.replace(arg, "", 1)
+          source = source[:renderer_start] + renderer + source[renderer_end:]
+
+          test_marker = "    fn manifests_quote_executable_and_use_explicit_daemon_serve() {"
+          test_start = source.index(test_marker)
+          try:
+              test_end = source.index("\n    #[test]\n", test_start + len(test_marker))
+          except ValueError:
+              test_end = len(source)
+          test = source[test_start:test_end]
+          matching = [
+              line
+              for line in test.splitlines()
+              if "assert!(rendered.contains" in line and "WorkingDirectory=" in line
+          ]
+          if len(matching) != 1:
+              raise SystemExit(
+                  f"expected exactly one WorkingDirectory render assertion, found {len(matching)}: {matching}"
+              )
+          old_line = matching[0]
+          indent = old_line[: len(old_line) - len(old_line.lstrip())]
+          new_lines = (
+              f'{indent}assert!(rendered.contains("WorkingDirectory=%h"));\n'
+              f'{indent}assert!(!rendered.contains(r#"WorkingDirectory=\"/home/test\""#));'
           )
-          if source.count(old_assert) != 1:
-              raise SystemExit(f"expected exactly one obsolete WorkingDirectory assertion, found {source.count(old_assert)}")
-          source = source.replace(old_assert, new_assert, 1)
+          test = test.replace(old_line, new_lines, 1)
+          source = source[:test_start] + test + source[test_end:]
 
           path.write_text(source)
           PY
