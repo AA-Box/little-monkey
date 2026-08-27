@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import {
   cliDestination,
   ensureSidecarPlaceholder,
+  filesIdentical,
   hostTriple,
   RELEASE,
 } from "./lib/cliSidecarPlaceholder.mjs";
@@ -56,7 +57,13 @@ const builtPath = cliDestination(repoRoot, isWindows, { profile: RELEASE, explic
 if (statSync(builtPath).size === 0) {
   throw new Error(`${builtPath} is empty — refusing to stage it as the sidecar`);
 }
-copyFileSync(builtPath, stagedPath);
-if (!isWindows) chmodSync(stagedPath, 0o755);
-
-console.log(`[stage-cli-sidecar] staged ${stagedPath}`);
+// Same rerun-if-changed cycle the placeholder step avoids: rewriting the
+// staged path with bytes it already holds invalidates tauri-build's build
+// script and forces the next cargo build to redo everything.
+if (filesIdentical(builtPath, stagedPath)) {
+  console.log(`[stage-cli-sidecar] ${stagedPath} already current`);
+} else {
+  copyFileSync(builtPath, stagedPath);
+  if (!isWindows) chmodSync(stagedPath, 0o755);
+  console.log(`[stage-cli-sidecar] staged ${stagedPath}`);
+}

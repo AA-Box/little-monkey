@@ -1175,8 +1175,6 @@ const translated: Record<string, string> = {
   "ModelSwitcher.noOllamaModelsPulled": "Belum ada yang ditarik — tambahkan satu di Pengaturan",
   "ModelSwitcher.cloudBadge": "CLOUD",
   "ModelSwitcher.cloudSectionLabel": "Cloud",
-  "ModelSwitcher.noCloudModelsConfigured": "Belum ada yang dikonfigurasi — tambahkan kunci API di Pengaturan",
-  "ModelSwitcher.noCloudModelsSelected": "Tidak ada model yang dipilih — pilih model di Pengaturan",
   "AddCustomModelForm.openGgufDescription": "Buka berkas `.gguf` yang sudah ada di komputer Anda",
   "AddCustomModelForm.openingButton": "Membuka…",
   "AddCustomModelForm.openModelFileButton": "Buka berkas model…",

@@ -1174,8 +1174,6 @@ const translated: Record<string, string> = {
   "ModelSwitcher.noOllamaModelsPulled": "가져온 모델 없음 — 설정에서 추가하세요",
   "ModelSwitcher.cloudBadge": "클라우드",
   "ModelSwitcher.cloudSectionLabel": "클라우드",
-  "ModelSwitcher.noCloudModelsConfigured": "구성된 모델 없음 — 설정에서 API 키를 추가하세요",
-  "ModelSwitcher.noCloudModelsSelected": "선택된 모델 없음 — 설정에서 모델을 선택하세요",
   "AddCustomModelForm.openGgufDescription": "컴퓨터에 있는 `.gguf` 파일 열기",
   "AddCustomModelForm.openingButton": "여는 중…",
   "AddCustomModelForm.openModelFileButton": "모델 파일 열기…",

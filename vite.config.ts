@@ -63,10 +63,16 @@ export default defineConfig(async () => ({
   clearScreen: false,
   // 2. tauri expects a fixed port, fail if that port is not available
   // (PORT env override lets a second instance run for browser preview)
+  //
+  // `host` is pinned to 127.0.0.1 rather than left `false`: bare `false`
+  // binds the "localhost" name, which resolves to [::1] alone on macOS, and
+  // tauri.conf.json's devUrl polls http://127.0.0.1:1420 over IPv4 — so
+  // `tauri dev` waited out its full 180s timeout against a server that was
+  // up the whole time. Still loopback-only; nothing is exposed to the LAN.
   server: {
     port: Number(process.env.PORT) || 1420,
     strictPort: true,
-    host: host || false,
+    host: host || "127.0.0.1",
     hmr: host
       ? {
           protocol: "ws",

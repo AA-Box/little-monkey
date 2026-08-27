@@ -242,6 +242,14 @@ export interface ProviderConfig {
   is_extension: boolean;
 }
 
+/** Whether a provider can be selected as a chat target and have its model
+ * list fetched. An extension provider authenticates inside its own sandbox
+ * and owns no key here, so `has_key` alone under-reports it — every caller
+ * that means "connected" must ask this, not `has_key`. */
+export function providerIsConnected(provider: ProviderConfig): boolean {
+  return provider.has_key || provider.is_extension;
+}
+
 /** Mirrors the Rust `ProviderModelInfo` struct exactly. */
 export interface ProviderModelInfo {
   id: string;
@@ -801,7 +809,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     // "Cloud Models" list isn't empty just because the app was relaunched.
     const { providerModels } = get();
     for (const provider of providers) {
-      if (provider.has_key && !providerModels[provider.id]) {
+      if (providerIsConnected(provider) && !providerModels[provider.id]) {
         void get().refreshProviderModels(provider.id);
       }
     }
