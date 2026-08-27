@@ -1,0 +1,135 @@
+name: PR 452 CI repair
+
+on:
+  push:
+    branches:
+      - fix/zero-config-whisper
+    paths:
+      - .github/workflows/pr452-ci-repair.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/zero-config-whisper
+          fetch-depth: 0
+
+      - name: Apply deterministic cross-platform process fixtures
+        shell: python
+        run: |
+          from pathlib import Path
+
+          verify = Path("src-tauri/src/verify.rs")
+          text = verify.read_text()
+          old = 'command("c1", "sleep 30")'
+          count = text.count(old)
+          if count != 4:
+              raise SystemExit(f"expected 4 hard-coded long-running verify fixtures, found {count}")
+          text = text.replace(old, 'command("c1", &long_running_command())')
+          verify.write_text(text)
+
+          skill = Path("src-tauri/src/skill_learning.rs")
+          text = skill.read_text()
+          old_read = '            command: "test -f src/uploader.rs".to_string(),'
+          new_read = '''            command: if cfg!(target_os = "windows") {
+              "if exist src\\\\uploader.rs (exit /b 0) else (exit /b 1)".to_string()
+            } else {
+              "test -f src/uploader.rs".to_string()
+            },'''
+          if text.count(old_read) != 1:
+              raise SystemExit(f"expected one read-only verification fixture, found {text.count(old_read)}")
+          text = text.replace(old_read, new_read)
+
+          old_grep = '            command: "grep -q \'with_retry(\' src/uploader.rs".to_string(),'
+          new_grep = '''            command: if cfg!(target_os = "windows") {
+              r#"findstr /C:\"with_retry(\" src\\uploader.rs >nul"#.to_string()
+            } else {
+              "grep -q 'with_retry(' src/uploader.rs".to_string()
+            },'''
+          if text.count(old_grep) != 1:
+              raise SystemExit(f"expected one grep verification fixture, found {text.count(old_grep)}")
+          text = text.replace(old_grep, new_grep)
+          skill.write_text(text)
+
+          resource = Path("src-tauri/src/resource_control.rs")
+          text = resource.read_text()
+          old_resource = '''        let mut command = Command::new("sh");
+          command
+              .arg("-c")
+              .arg("sleep 5")
+              .stdin(Stdio::null())
+              .stdout(Stdio::null())
+              .stderr(Stdio::null());
+
+          let mut controller = ResourceController::new(EffectiveLimits::resolve(&[LimitLayer::new(
+              LimitSource::ClassDefault,
+              crate::process_table::ProcessKind::ForegroundShell.default_limits(),
+          )]));
+          controller
+              .prepare_std(&mut command)
+              .expect("the containment is installable");
+          let mut child = command.spawn().expect("the shell starts");
+          let root = ProcessIdentity::of(child.id()).expect("the shell has an identity");
+          controller.attach(child.id()).expect("the shell attaches");
+          let journal = TestJournal::new();
+          controller
+              .persist_ownership_to(journal.clone())
+              .expect("the first ownership write lands");
+          // Settle the owned set first, so what follows is a workload with nothing
+          // new to record rather than one that simply had not looked yet.
+          controller.sample().expect("the first sample runs");
+
+          journal.start_failing();'''
+          new_resource = '''        // Spawn the workload directly. Using `sh -c "sleep 5"` makes this
+          // test depend on whether the shell has already exec'd/forked when the
+          // first ownership sample lands; under load that can create a genuinely
+          // new identity only after the journal is deliberately made unavailable.
+          // This fixture is specifically the "owns nothing new" side of the
+          // contract, so give it exactly one stable process identity.
+          let mut command = Command::new("sleep");
+          command
+              .arg("5")
+              .stdin(Stdio::null())
+              .stdout(Stdio::null())
+              .stderr(Stdio::null());
+
+          let mut controller = ResourceController::new(EffectiveLimits::resolve(&[LimitLayer::new(
+              LimitSource::ClassDefault,
+              crate::process_table::ProcessKind::ForegroundShell.default_limits(),
+          )]));
+          controller
+              .prepare_std(&mut command)
+              .expect("the containment is installable");
+          let mut child = command.spawn().expect("sleep starts");
+          let root = ProcessIdentity::of(child.id()).expect("sleep has an identity");
+          controller.attach(child.id()).expect("sleep attaches");
+          let journal = TestJournal::new();
+          controller
+              .persist_ownership_to(journal.clone())
+              .expect("the first ownership write lands");
+          controller.sample().expect("the first sample runs");
+
+          journal.start_failing();'''
+          if text.count(old_resource) != 1:
+              raise SystemExit(f"expected one unstable no-new-ownership fixture, found {text.count(old_resource)}")
+          text = text.replace(old_resource, new_resource)
+          resource.write_text(text)
+
+      - name: Format Rust changes
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all
+
+      - name: Commit repair and remove one-shot workflow
+        shell: bash
+        run: |
+          rm .github/workflows/pr452-ci-repair.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/src/verify.rs src-tauri/src/skill_learning.rs src-tauri/src/resource_control.rs .github/workflows/pr452-ci-repair.yml
+          git diff --cached --check
+          git commit -m "test: stabilize cross-platform process fixtures"
+          git push origin HEAD:fix/zero-config-whisper
