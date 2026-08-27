@@ -70,12 +70,17 @@ describe("AddModelDialog point-of-use cloud setup", () => {
     const onClose = vi.fn();
     render(<AddModelDialog open onClose={onClose} />);
 
-    const keyInputs = await screen.findAllByPlaceholderText("ProviderCard.apiKeyPlaceholder");
-    expect(keyInputs).toHaveLength(2);
-    const keyInput = keyInputs[0];
-    fireEvent.change(keyInput, { target: { value: "sk-ant-test" } });
+    const providerHeading = await screen.findByRole("heading", { name: "Anthropic" });
+    const providerSetup = providerHeading.parentElement?.parentElement;
+    expect(providerSetup).toBeTruthy();
 
-    const connectButton = keyInput.parentElement?.querySelector("button");
+    const keyInput = providerSetup?.querySelector<HTMLInputElement>(
+      'input[placeholder="ProviderCard.apiKeyPlaceholder"]',
+    );
+    expect(keyInput).toBeTruthy();
+    fireEvent.change(keyInput!, { target: { value: "sk-ant-test" } });
+
+    const connectButton = providerSetup?.querySelector("button");
     expect(connectButton).toBeTruthy();
     fireEvent.click(connectButton!);
 
