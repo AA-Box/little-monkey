@@ -21,10 +21,43 @@
 
 import { createHash, sign as cryptoSign, createPrivateKey } from "node:crypto";
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { basename, join, relative, sep } from "node:path";
 
 /** Schema the Rust side accepts. Bump only alongside MLX_PACKAGE_SCHEMA_VERSION. */
 export const MLX_PACKAGE_SCHEMA_VERSION = 1;
+
+/**
+ * A short digest of the service sources a package carries, for its version.
+ *
+ * A package's version is otherwise assembled from the things it *installs* —
+ * the mlx-lm release, the pinned video commit, the Python minor. None of those
+ * move when the service file beside them is fixed, so a service-only change
+ * rebuilt to the same version name: the publish step falls through to
+ * `gh release upload --clobber`, the same version now names different bytes,
+ * and an installed client — which verifies against the manifest digest it
+ * recorded at install time — keeps running the old code with nothing to tell
+ * it otherwise. That is exactly how a fix to `mlx_server.py` reaches new
+ * installs only.
+ *
+ * Folding the service digest into the version makes such a change a genuinely
+ * new version, which is what the component hub upgrades on.
+ *
+ * Twelve hex characters: this identifies a build, it does not authenticate one
+ * — the manifest's per-file SHA-256 and the Ed25519 signature over it do that,
+ * and they are unchanged.
+ */
+export function serviceRevision(paths) {
+  const hash = createHash("sha256");
+  // Sorted and length-delimited by name, so the digest depends on the file set
+  // and its contents rather than on the order the caller happened to list them.
+  for (const path of [...paths].sort()) {
+    hash.update(basename(path));
+    hash.update("\0");
+    hash.update(readFileSync(path));
+    hash.update("\0");
+  }
+  return hash.digest("hex").slice(0, 12);
+}
 
 /** Recursively sorts object keys and serializes compactly, matching serde. */
 export function canonicalJson(value) {
