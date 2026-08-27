@@ -37,12 +37,24 @@ env:
   LITTLE_MONKEY_REQUIRE_CHANNEL_SECURE_STORE_SERVICE_E2E: "1"
 
 jobs:
-  macos-windows:
+  # macOS is deliberately absent. It admits a Keychain item to the binary that
+  # created it, and the resident service is a different binary — as in
+  # production, where the desktop writes and the service reads. That first read
+  # waits on a confirmation a person answers once and a runner never can: the
+  # service kept a fresh heartbeat while the account sat at `disconnected`, and
+  # reading the same credential back through the CLI had to be killed at 120s.
+  #
+  # Two ways of granting that access unattended were tried and rejected:
+  # `set-generic-password-partition-list` locked out even the writing binary,
+  # and storing the item with `security add-generic-password -A` blocks every
+  # keyring reader. Rendering of the launchd definition stays covered by the
+  # unit tests in daemon::service.
+  windows:
     name: native service (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [windows-latest]
     runs-on: ${{ matrix.os }}
     # A native credential prompt or a service that will not stop must fail this
     # job, not sit on a runner for the six-hour default.
