@@ -916,7 +916,7 @@ pub(crate) mod tests {
     pub(crate) fn long_running_command() -> String {
         #[cfg(target_os = "windows")]
         {
-            "powershell.exe -NoLogo -NoProfile -NonInteractive -Command Start-Sleep -Seconds 30".to_string()
+            "ping -n 31 127.0.0.1 > nul".to_string()
         }
         #[cfg(not(target_os = "windows"))]
         {

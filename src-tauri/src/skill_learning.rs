@@ -8410,7 +8410,7 @@ mod tests {
     /// task having been pre-solved.
     fn read_only_verification_command() -> crate::verify::VerifyCommand {
         #[cfg(target_os = "windows")]
-        let command = r#"if exist "src\uploader.rs" (exit /b 0) else (exit /b 1)"#;
+        let command = r#"if exist src\uploader.rs (exit /b 0) else (exit /b 1)"#;
         #[cfg(not(target_os = "windows"))]
         let command = "test -f src/uploader.rs";
         crate::verify::VerifyCommand {
