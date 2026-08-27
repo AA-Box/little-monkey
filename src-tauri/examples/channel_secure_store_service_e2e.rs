@@ -327,6 +327,7 @@ fn run_real_service_case(case: &str) -> Result<(), String> {
 
     let mut profile: Option<String> = None;
     let mut account_id: Option<String> = None;
+    let mut redact = String::new();
     let result = (|| -> Result<(), String> {
         let created = create_profile()?;
         profile = Some(created.clone());
@@ -335,6 +336,7 @@ fn run_real_service_case(case: &str) -> Result<(), String> {
 
         // Unique, syntactically token-like, deliberately non-live credential.
         let secret = format!("999999999:{case}-{}-{}", std::process::id(), nonce());
+        redact = secret.clone();
 
         // Process A: desktop boundary. Secret travels only via stdin.
         run_boundary_child("writer", &created, &account, Some(&secret), None)?;
@@ -359,8 +361,94 @@ fn run_real_service_case(case: &str) -> Result<(), String> {
         wait_for_resident_credential_use(&created, &account, &secret)
     })();
 
+    if result.is_err() {
+        if let Some(profile) = profile.as_deref() {
+            dump_daemon_logs(profile, &redact);
+            if let Some(account_id) = account_id.as_deref() {
+                probe_credential_through_cli(profile, account_id);
+            }
+        }
+    }
     cleanup(profile.as_deref(), account_id.as_deref());
     result
+}
+
+/// Read the same credential through the CLI, which is the daemon's own binary.
+///
+/// An account stuck at `disconnected` while the heartbeat stays fresh means the
+/// daemon's read never returned rather than failing, and the usual reason a
+/// Keychain read never returns is a prompt no CI runner can answer. This splits
+/// the two possibilities without the service in the way: a timeout here is the
+/// binary blocking on the native store, while an ordinary error means the read
+/// works and the daemon stopped somewhere else.
+fn probe_credential_through_cli(profile: &str, account_id: &str) {
+    match run_cli(Some(profile), &["channels", "probe", account_id, "--json"]) {
+        Ok(output) => eprintln!(
+            "--- CLI credential probe exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim()
+        ),
+        Err(error) => eprintln!("--- CLI credential probe: {error}"),
+    }
+    #[cfg(target_os = "macos")]
+    match run_program("/usr/bin/security", &["list-keychains", "-d", "user"]) {
+        Ok(output) => eprintln!(
+            "--- keychain search list: {}",
+            String::from_utf8_lossy(&output.stdout).trim()
+        ),
+        Err(error) => eprintln!("--- keychain search list unavailable: {error}"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_program(program: &str, args: &[&str]) -> Result<Output, String> {
+    let child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to start {program}: {error}"))?;
+    bounded_output(child, program)
+}
+
+/// Print what the installed service itself recorded, before cleanup deletes the
+/// profile that holds it.
+///
+/// A daemon that never reports a channel is indistinguishable from one that
+/// reported a failure until you read its own stderr: an unreadable credential
+/// marks the account `error`, so an account still sitting at `disconnected`
+/// means the read never returned at all.
+fn dump_daemon_logs(profile: &str, secret: &str) {
+    let Some(base) = little_monkey_lib::app_paths::base_data_dir() else {
+        eprintln!("--- no base data directory to read daemon logs from");
+        return;
+    };
+    let logs = little_monkey_lib::profiles::profile_root(&base, profile)
+        .join("daemon")
+        .join("logs");
+    let entries = match std::fs::read_dir(&logs) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("--- no daemon logs at {}: {error}", logs.display());
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match std::fs::read_to_string(&path) {
+            // The harness's own credential is the one secret known to be in
+            // scope here, and CI logs are public in a fork build.
+            Ok(text) => {
+                let lines: Vec<&str> = text.lines().collect();
+                let tail = lines.len().saturating_sub(40);
+                eprintln!("--- {} (last {} lines)", path.display(), lines.len() - tail);
+                for line in &lines[tail..] {
+                    eprintln!("{}", line.replace(secret, "<redacted>"));
+                }
+            }
+            Err(error) => eprintln!("--- {} unreadable: {error}", path.display()),
+        }
+    }
 }
 
 fn real_main() -> Result<(), String> {
