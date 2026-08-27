@@ -2849,8 +2849,11 @@ fn append_file_suffix(path: &Path, suffix: &str) -> Result<PathBuf, String> {
 }
 
 fn hugging_face_metadata_url(reference: &HuggingFaceReference) -> Result<Url, String> {
+    // No trailing slash: `path_segments_mut` would otherwise append after the
+    // empty final segment and build `/api/models//<owner>/<repo>`, which Hugging
+    // Face answers with 404.
     let mut url =
-        Url::parse("https://huggingface.co/api/models/").map_err(|error| error.to_string())?;
+        Url::parse("https://huggingface.co/api/models").map_err(|error| error.to_string())?;
     {
         let mut segments = url
             .path_segments_mut()
@@ -4060,6 +4063,28 @@ mod tests {
             })
         );
         assert!(parse_model_reference("hf:owner/repo@main#../../model.gguf").is_err());
+    }
+
+    #[test]
+    fn hf_metadata_url_has_no_empty_path_segment() {
+        let reference = HuggingFaceReference {
+            repo: "mlx-community/Qwen3.8-27B-OptiQ-4bit".to_string(),
+            requested_revision: "main".to_string(),
+            selector: HuggingFaceSelector::DefaultQ4Km,
+        };
+        assert_eq!(
+            hugging_face_metadata_url(&reference).unwrap().as_str(),
+            "https://huggingface.co/api/models/mlx-community/Qwen3.8-27B-OptiQ-4bit/revision/main?blobs=true"
+        );
+
+        let nested = HuggingFaceReference {
+            requested_revision: "refs/pr/7".to_string(),
+            ..reference
+        };
+        assert_eq!(
+            hugging_face_metadata_url(&nested).unwrap().as_str(),
+            "https://huggingface.co/api/models/mlx-community/Qwen3.8-27B-OptiQ-4bit/revision/refs/pr/7?blobs=true"
+        );
     }
 
     #[test]
