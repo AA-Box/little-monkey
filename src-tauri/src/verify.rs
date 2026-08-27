@@ -961,7 +961,7 @@ pub(crate) mod tests {
         assert_eq!(result.command_id, "c1");
         assert_eq!(result.code, Some(0));
         assert!(result.stdout.contains("hello"));
-        assert!(!result.timed_out);
+        assert!(!result.timed_out, "{result:?}");
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -984,7 +984,7 @@ pub(crate) mod tests {
         .await;
 
         assert_eq!(result.code, Some(3));
-        assert!(!result.timed_out);
+        assert!(!result.timed_out, "{result:?}");
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -1007,8 +1007,8 @@ pub(crate) mod tests {
         )
         .await;
 
-        assert!(result.timed_out);
-        assert!(result.code.is_none());
+        assert!(result.timed_out, "{result:?}");
+        assert!(result.code.is_none(), "{result:?}");
         // The whole call returned near the 1s timeout, not the 30s sleep —
         // proof the child was actually killed rather than awaited out.
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -1093,11 +1093,15 @@ pub(crate) mod tests {
         cmd.timeout_secs = Some(1);
 
         let result = run_command_impl(&state, &cwd, &cmd, None, projector.clone()).await;
-        assert!(result.timed_out);
+        assert!(result.timed_out, "{result:?}");
 
         let row = projector.only(ProcessKind::VerifyCommand);
         let exit = row.exit.expect("an exited row carries its exit");
-        assert_eq!(exit.status, crate::process_table::ExitStatus::LimitExceeded);
+        assert_eq!(
+            exit.status,
+            crate::process_table::ExitStatus::LimitExceeded,
+            "{result:?}"
+        );
         let breach = exit.breach.expect("a limit kill carries its typed breach");
         assert_eq!(breach.limit, ProcessLimitKind::Wall.as_str());
         assert_eq!(breach.configured, 1_000);
@@ -1142,11 +1146,11 @@ pub(crate) mod tests {
         });
 
         let result = run_command_impl(&state, &cwd, &cmd, Some(&turn_id), projector.clone()).await;
-        assert!(!result.timed_out);
+        assert!(!result.timed_out, "{result:?}");
 
         let row = projector.only(ProcessKind::VerifyCommand);
         let exit = row.exit.expect("an exited row carries its exit");
-        assert_eq!(exit.status, crate::process_table::ExitStatus::Cancelled);
+        assert_eq!(exit.status, crate::process_table::ExitStatus::Cancelled, "{result:?}");
         assert!(exit.breach.is_none(), "a Stop is not a resource kill");
 
         let _ = std::fs::remove_dir_all(&cwd);
@@ -1271,7 +1275,7 @@ pub(crate) mod tests {
             crate::test_support::RecordingProjector::shared(),
         )
         .await;
-        assert!(result.timed_out);
+        assert!(result.timed_out, "{result:?}");
 
         let grandchild: u32 = std::fs::read_to_string(&pid_file)
             .expect("the command wrote its background pid")
@@ -1382,9 +1386,9 @@ pub(crate) mod tests {
         )
         .await;
 
-        assert!(!result.timed_out);
-        assert!(result.code.is_none());
-        assert!(result.stderr.contains("cancelled"));
+        assert!(!result.timed_out, "{result:?}");
+        assert!(result.code.is_none(), "{result:?}");
+        assert!(result.stderr.contains("cancelled"), "{result:?}");
         // Returned promptly after the ~100ms cancel fired, not the 30s sleep.
         assert!(started.elapsed() < Duration::from_secs(10));
 
