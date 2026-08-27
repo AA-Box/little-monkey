@@ -7,7 +7,7 @@ on:
       - "src-tauri/src/daemon_commands.rs"
       - "src-tauri/src/bin/monkey-cli/channels_cli.rs"
       - "src-tauri/src/bin/monkey-cli/daemon/**"
-      - "src-tauri/tests/channel_secure_store_service_e2e.rs"
+      - "src-tauri/examples/channel_secure_store_service_e2e.rs"
       - "src-tauri/Cargo.toml"
       - "src-tauri/Cargo.lock"
       - ".github/workflows/channel-secure-store-service-e2e.yml"
@@ -18,7 +18,7 @@ on:
       - "src-tauri/src/daemon_commands.rs"
       - "src-tauri/src/bin/monkey-cli/channels_cli.rs"
       - "src-tauri/src/bin/monkey-cli/daemon/**"
-      - "src-tauri/tests/channel_secure_store_service_e2e.rs"
+      - "src-tauri/examples/channel_secure_store_service_e2e.rs"
       - "src-tauri/Cargo.toml"
       - "src-tauri/Cargo.lock"
       - ".github/workflows/channel-secure-store-service-e2e.yml"
@@ -55,17 +55,18 @@ jobs:
           key: channel-secure-store-${{ matrix.os }}
 
       # tauri-build expects the bundled CLI sidecar path to exist while the
-      # integration test is compiled. The test itself uses Cargo's real
-      # CARGO_BIN_EXE_monkey-cli artifact, never this placeholder.
+      # production CLI and acceptance harness are compiled. The harness itself
+      # invokes the real target/debug/monkey-cli binary, never this placeholder.
       - name: Stage CLI sidecar placeholder
         run: node scripts/ensure-cli-sidecar-placeholder.mjs
 
+      - name: Build production CLI
+        run: cargo build --manifest-path src-tauri/Cargo.toml --bin monkey-cli
+
       - name: Native credential -> installed service -> Telegram worker
         run: >-
-          cargo test --manifest-path src-tauri/Cargo.toml
-          --test channel_secure_store_service_e2e
-          real_os_service_reads_desktop_written_credential
-          -- --exact --nocapture --test-threads=1
+          cargo run --manifest-path src-tauri/Cargo.toml
+          --example channel_secure_store_service_e2e -- desktop
 
   linux:
     name: native service (ubuntu-22.04)
@@ -90,6 +91,9 @@ jobs:
 
       - name: Stage CLI sidecar placeholder
         run: node scripts/ensure-cli-sidecar-placeholder.mjs
+
+      - name: Build production CLI
+        run: cargo build --manifest-path src-tauri/Cargo.toml --bin monkey-cli
 
       # A nested `systemd --user` cannot allocate a cgroup inside GitHub's
       # hosted-compute-agent.service. Start the runner account's genuine
@@ -146,10 +150,8 @@ jobs:
             busctl --user --no-pager list || true
             exit 1
           fi
-          cargo test --manifest-path src-tauri/Cargo.toml \
-            --test channel_secure_store_service_e2e \
-            real_os_service_reads_desktop_written_credential \
-            -- --exact --nocapture --test-threads=1
+          cargo run --manifest-path src-tauri/Cargo.toml \
+            --example channel_secure_store_service_e2e -- desktop
 
       # Headless/user-service case: keep the real systemd user manager and its
       # bus, remove Secret Service entirely, and require the combined keyring
@@ -173,23 +175,18 @@ jobs:
             exit 1
           fi
           keyctl show >/dev/null
-          cargo test --manifest-path src-tauri/Cargo.toml \
-            --test channel_secure_store_service_e2e \
-            real_systemd_service_reads_headless_native_credential \
-            -- --exact --nocapture --test-threads=1
+          cargo run --manifest-path src-tauri/Cargo.toml \
+            --example channel_secure_store_service_e2e -- headless
           if busctl --user --no-pager list | grep -q 'org.freedesktop.secrets'; then
             echo "Secret Service auto-activated during the headless credential test; refusing a false keyutils pass" >&2
             exit 1
           fi
 
-      # This is the already-existing full Telegram pipeline acceptance. It uses
-      # production adapter/daemon/agent/outbox code with deterministic provider
-      # and model endpoints, so the native-boundary test above and this test
-      # together cover the complete bug path without a live bot token.
+      # Existing full Telegram pipeline acceptance: production adapter/daemon/
+      # agent/outbox code with deterministic provider and model endpoints.
       - name: Telegram inbound -> agent run -> outbound reply
         shell: bash
         run: |
-          cargo build --manifest-path src-tauri/Cargo.toml --bin monkey-cli
           cargo test --manifest-path src-tauri/Cargo.toml --bin monkey-cli \
             daemon::channel_agent_e2e::a_telegram_message_becomes_an_agent_reply_end_to_end \
             -- --exact --nocapture --test-threads=1
