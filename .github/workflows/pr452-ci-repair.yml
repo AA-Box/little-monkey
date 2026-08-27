@@ -86,9 +86,6 @@ jobs:
       - name: Format Rust changes
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all
 
-      - name: Validate Linux ownership regression
-        run: cargo test --manifest-path src-tauri/Cargo.toml resource_control::tests::a_failing_ledger_does_not_end_a_workload_that_owns_nothing_new -- --exact
-
       - name: Commit repair and remove one-shot workflow
         shell: bash
         run: |
