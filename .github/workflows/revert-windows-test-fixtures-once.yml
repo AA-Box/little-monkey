@@ -27,51 +27,22 @@ jobs:
           verify = Path("src-tauri/src/verify.rs")
           text = verify.read_text()
           old = 'command("c1", &long_running_command())'
-          count = text.count(old)
-          if count != 4:
-              raise SystemExit(f"expected four PR-only long-running replacements, found {count}")
-          text = text.replace(old, 'command("c1", "sleep 30")')
-          verify.write_text(text)
+          if text.count(old) != 4:
+              raise SystemExit(f"expected four PR-only long-running replacements, found {text.count(old)}")
+          verify.write_text(text.replace(old, 'command("c1", "sleep 30")'))
 
           learning = Path("src-tauri/src/skill_learning.rs")
           text = learning.read_text()
-
-          old = '''        #[cfg(target_os = "windows")]
-        let command = r#"if exist src\\uploader.rs (exit /b 0) else (exit /b 1)"#;
-        #[cfg(not(target_os = "windows"))]
-        let command = "test -f src/uploader.rs";
-        crate::verify::VerifyCommand {
-            id: "verify-1".to_string(),
-            label: "sources present".to_string(),
-            kind: "test".to_string(),
-            command: command.to_string(),'''
-          new = '''        crate::verify::VerifyCommand {
-            id: "verify-1".to_string(),
-            label: "sources present".to_string(),
-            kind: "test".to_string(),
-            command: "test -f src/uploader.rs".to_string(),'''
+          old = '        #[cfg(target_os = "windows")]\n        let command = r#"if exist src\\uploader.rs (exit /b 0) else (exit /b 1)"#;\n        #[cfg(not(target_os = "windows"))]\n        let command = "test -f src/uploader.rs";\n        crate::verify::VerifyCommand {\n            id: "verify-1".to_string(),\n            label: "sources present".to_string(),\n            kind: "test".to_string(),\n            command: command.to_string(),'
+          new = '        crate::verify::VerifyCommand {\n            id: "verify-1".to_string(),\n            label: "sources present".to_string(),\n            kind: "test".to_string(),\n            command: "test -f src/uploader.rs".to_string(),'
           if text.count(old) != 1:
               raise SystemExit(f"expected one read-only Windows fixture block, found {text.count(old)}")
           text = text.replace(old, new, 1)
-
-          old = '''        #[cfg(target_os = "windows")]
-        let command = r#"findstr /L /C:with_retry src\\uploader.rs > nul"#;
-        #[cfg(not(target_os = "windows"))]
-        let command = "grep -q 'with_retry(' src/uploader.rs";
-        crate::verify::VerifyCommand {
-            id: "verify-1".to_string(),
-            label: "retry present".to_string(),
-            kind: "test".to_string(),
-            command: command.to_string(),'''
-          new = '''        crate::verify::VerifyCommand {
-            id: "verify-1".to_string(),
-            label: "retry present".to_string(),
-            kind: "test".to_string(),
-            command: "grep -q 'with_retry(' src/uploader.rs".to_string(),'''
+          old = '        #[cfg(target_os = "windows")]\n        let command = r#"findstr /L /C:with_retry src\\uploader.rs > nul"#;\n        #[cfg(not(target_os = "windows"))]\n        let command = "grep -q \'with_retry(\' src/uploader.rs";\n        crate::verify::VerifyCommand {\n            id: "verify-1".to_string(),\n            label: "retry present".to_string(),\n            kind: "test".to_string(),\n            command: command.to_string(),'
+          new = '        crate::verify::VerifyCommand {\n            id: "verify-1".to_string(),\n            label: "retry present".to_string(),\n            kind: "test".to_string(),\n            command: "grep -q \'with_retry(\' src/uploader.rs".to_string(),'
           if text.count(old) != 1:
               raise SystemExit(f"expected one mutation verification Windows fixture block, found {text.count(old)}")
-          text = text.replace(old, new, 1)
-          learning.write_text(text)
+          learning.write_text(text.replace(old, new, 1))
 
           Path(".github/workflows/revert-windows-test-fixtures-once.yml").unlink()
 
