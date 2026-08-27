@@ -3109,10 +3109,9 @@ mod tests {
     fn a_failing_ledger_does_not_end_a_workload_that_owns_nothing_new() {
         use std::process::{Command, Stdio};
 
-        let mut command = Command::new("sh");
+        let mut command = Command::new("sleep");
         command
-            .arg("-c")
-            .arg("sleep 5")
+            .arg("5")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -3124,9 +3123,9 @@ mod tests {
         controller
             .prepare_std(&mut command)
             .expect("the containment is installable");
-        let mut child = command.spawn().expect("the shell starts");
-        let root = ProcessIdentity::of(child.id()).expect("the shell has an identity");
-        controller.attach(child.id()).expect("the shell attaches");
+        let mut child = command.spawn().expect("sleep starts");
+        let root = ProcessIdentity::of(child.id()).expect("sleep has an identity");
+        controller.attach(child.id()).expect("sleep attaches");
         let journal = TestJournal::new();
         controller
             .persist_ownership_to(journal.clone())
