@@ -1,5 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 
+import { resolveLoadedLocalEndpoint } from "./targetRouting";
+
 import {
   MENTION_NOTE_PREFIX,
   attachedStackPromptInfo,
@@ -79,12 +81,6 @@ const MAX_TOOL_RESULT_CHARS = 30_000;
 const MAX_REPORT_CHARS = 30_000;
 const MAX_MUTATION_PROPOSALS = 12;
 const CONSERVATIVE_PROVIDER_COST_PER_MILLION_TOKENS_USD = 50;
-
-interface LlamaStatusResult {
-  status: "stopped" | "starting" | "ready" | "error";
-  port: number;
-  model_path: string | null;
-}
 
 interface ActiveCrewExecution {
   controller: AbortController;
@@ -256,11 +252,8 @@ async function resolveTarget(target: ModelTargetSnapshot): Promise<ResolvedTarge
   if (target.kind === "ollama") {
     return { kind: "ollama", baseUrl: target.baseUrl, model: target.model };
   }
-  const status = await invoke<LlamaStatusResult>("llama_status");
-  if (status.status !== "ready" || status.model_path !== target.modelPath) {
-    throw new Error(`${target.displayName} is no longer loaded in the managed llama.cpp runtime.`);
-  }
-  return { kind: "local", baseUrl: `http://127.0.0.1:${status.port}`, modelLabel: target.displayName };
+  const baseUrl = await resolveLoadedLocalEndpoint(target.modelPath, target.displayName);
+  return { kind: "local", baseUrl, modelLabel: target.displayName };
 }
 
 function sourceSignature(source: {

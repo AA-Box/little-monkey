@@ -50,6 +50,8 @@ const MAX_PROVENANCE_BYTES: u64 = 64 * 1024;
 /// configs and tokenizers; anything larger is either LFS or not understood.
 const MAX_PLAIN_BLOB_BYTES: u64 = 64 * 1024 * 1024;
 const BUNDLE_PROVENANCE_SCHEMA_VERSION: u32 = 1;
+/// Cap for the optional text files a bundle's capabilities are read from.
+const MAX_CHAT_TEMPLATE_BYTES: u64 = 4 * 1024 * 1024;
 /// File name of the bundle sidecar, written inside the model directory so
 /// removing the directory removes its provenance with it.
 const BUNDLE_PROVENANCE_FILE: &str = ".little-monkey-bundle.json";
@@ -236,6 +238,11 @@ pub struct ManagedBundleProvenance {
     pub bundle_sha256: String,
     pub size_bytes: u64,
     pub runtime: ModelRuntimeKind,
+    /// Read out of the bundle's own chat template at install time, the same
+    /// evidence the GGUF path reads out of an embedded template. Defaulted for
+    /// sidecars written before the field existed.
+    #[serde(default)]
+    pub tool_calling: bool,
     pub files: Vec<ResolvedBundleFile>,
     pub license_name: Option<String>,
     pub license_url: Option<String>,
@@ -268,7 +275,7 @@ impl ManagedBundleProvenance {
             download_url: self.download_url.clone(),
             sha256: self.bundle_sha256.clone(),
             size_bytes: self.size_bytes,
-            tool_calling: false,
+            tool_calling: self.tool_calling,
             license_name: self.license_name.clone(),
             license_url: self.license_url.clone(),
             installed_at_ms: self.installed_at_ms,
@@ -1049,6 +1056,7 @@ where
     if cancel.is_some_and(|token| token.is_cancelled()) {
         return Err("Model bundle installation cancelled".to_string());
     }
+    let tool_calling = bundle_advertises_tools(&staging);
     let provenance = ManagedBundleProvenance {
         schema_version: BUNDLE_PROVENANCE_SCHEMA_VERSION,
         source: resolved.source,
@@ -1062,6 +1070,7 @@ where
         bundle_sha256: resolved.sha256.clone(),
         size_bytes: resolved.size_bytes,
         runtime: resolved.runtime,
+        tool_calling,
         files: resolved.bundle_files.clone(),
         license_name: resolved.license_name.clone(),
         license_url: resolved.license_url.clone(),
@@ -1096,6 +1105,79 @@ where
         projector_was_new: false,
         projector_install_lock: None,
     })
+}
+
+/// Whether a staged bundle's own chat template advertises tool calling.
+///
+/// The same question the GGUF path answers by reading the template out of the
+/// file header, asked of the two places an MLX repository keeps it: a
+/// `chat_template.jinja` beside the weights, or `chat_template` inside
+/// `tokenizer_config.json`. A repository that ships neither, or one whose
+/// template says nothing about tools, is recorded as not supporting them —
+/// the same fail-closed answer, for the same reason: a capability the app
+/// advertises but the model cannot honour produces a broken turn, while the
+/// reverse only leaves a feature unused.
+fn bundle_advertises_tools(directory: &Path) -> bool {
+    let jinja = directory.join("chat_template.jinja");
+    if let Some(template) = read_bounded_text(&jinja) {
+        return embedded_jinja_advertises_tools(&template);
+    }
+    let Some(config) = read_bounded_text(&directory.join("tokenizer_config.json")) else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&config) else {
+        return false;
+    };
+    parsed
+        .get("chat_template")
+        .and_then(|value| value.as_str())
+        .is_some_and(embedded_jinja_advertises_tools)
+}
+
+/// Reads a small text file, or `None` if it is missing, unreadable, oversized
+/// or not UTF-8. Every caller is reading optional metadata, so a failure here
+/// is an absent answer rather than an error.
+fn read_bounded_text(path: &Path) -> Option<String> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_CHAT_TEMPLATE_BYTES {
+        return None;
+    }
+    String::from_utf8(fs::read(path).ok()?).ok()
+}
+
+/// An installed directory-shaped model and the sidecar that describes it.
+pub struct InstalledBundle {
+    pub path: PathBuf,
+    pub provenance: ManagedBundleProvenance,
+}
+
+/// Every directory bundle installed under `models_dir`.
+///
+/// A directory without the app's sidecar is not a model and is skipped; one
+/// whose sidecar cannot be read is skipped too, with the reason on stderr,
+/// because a runtime inventory that fails to build over one bad entry would
+/// take every good one down with it.
+pub fn installed_bundles(models_dir: &Path) -> Vec<InstalledBundle> {
+    let Ok(entries) = fs::read_dir(models_dir) else {
+        return Vec::new();
+    };
+    let mut bundles = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        match load_bundle_provenance(&path) {
+            Ok(Some(provenance)) => bundles.push(InstalledBundle { path, provenance }),
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "little-monkey: ignoring unreadable model bundle {}: {error}",
+                path.display()
+            ),
+        }
+    }
+    bundles.sort_by(|left, right| left.path.cmp(&right.path));
+    bundles
 }
 
 /// Joins a repository-relative member path onto `root`, refusing anything that
@@ -5208,6 +5290,7 @@ mod tests {
             bundle_sha256: resolved.sha256.clone(),
             size_bytes: resolved.size_bytes,
             runtime: ModelRuntimeKind::Mlx,
+            tool_calling: false,
             files: resolved.bundle_files.clone(),
             license_name: None,
             license_url: None,
@@ -5407,6 +5490,7 @@ mod tests {
             bundle_sha256: bundle_digest(&files),
             size_bytes: 9,
             runtime: ModelRuntimeKind::Mlx,
+            tool_calling: false,
             files,
             license_name: None,
             license_url: None,

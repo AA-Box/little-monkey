@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
+import { resolveLoadedLocalEndpoint } from "./targetRouting";
+
 import {
   MENTION_NOTE_PREFIX,
   attachedStackPromptInfo,
@@ -62,12 +64,6 @@ const SYNTHESIS_SYSTEM_PROMPT = [
 ].join("\n");
 
 const MAX_SYNTHESIS_SOURCE_CHARS = 60_000;
-
-interface LlamaStatusResult {
-  status: "stopped" | "starting" | "ready" | "error";
-  port: number;
-  model_path: string | null;
-}
 
 export interface ComparisonRunHandle extends ComparisonCreationResult {
   done: Promise<PromiseSettledResult<void>[]>;
@@ -136,11 +132,8 @@ export async function resolveTarget(target: ModelTargetSnapshot): Promise<Resolv
   if (target.kind === "ollama") {
     return { kind: "ollama", baseUrl: target.baseUrl, model: target.model };
   }
-  const status = await invoke<LlamaStatusResult>("llama_status");
-  if (status.status !== "ready" || status.model_path !== target.modelPath) {
-    throw new Error(`${target.displayName} is no longer loaded in the managed llama.cpp runtime.`);
-  }
-  return { kind: "local", baseUrl: `http://127.0.0.1:${status.port}`, modelLabel: target.displayName };
+  const baseUrl = await resolveLoadedLocalEndpoint(target.modelPath, target.displayName);
+  return { kind: "local", baseUrl, modelLabel: target.displayName };
 }
 
 function unresolvedNotice(paths: readonly string[]): ChatMessage | null {

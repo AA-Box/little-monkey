@@ -532,20 +532,59 @@ describe("effortForTarget", () => {
 });
 
 describe("start", () => {
-  it("refuses an MLX model instead of handing a directory to llama-server", async () => {
+  const mlxModel = makeModel({
+    name: "Qwen3.8 27B OptiQ 4bit",
+    file: "mlx-0123456789ab-Qwen3.8-27B-OptiQ-4bit",
+    path: "/models/mlx-0123456789ab-Qwen3.8-27B-OptiQ-4bit",
+    runtime: "mlx",
+  });
+
+  it("starts an MLX model on its own runtime, never on llama-server", async () => {
     invokeMock.mockClear();
-    const store = useModelStore.getState();
-    const mlx = makeModel({
-      name: "Qwen3.8 27B OptiQ 4bit",
-      file: "mlx-0123456789ab-Qwen3.8-27B-OptiQ-4bit",
-      path: "/models/mlx-0123456789ab-Qwen3.8-27B-OptiQ-4bit",
-      runtime: "mlx",
+    invokeMock.mockImplementation((command: string) =>
+      command === "mlx_chat_start"
+        ? Promise.resolve({ running: true, port: 51234, modelId: "mlx-0123456789ab-Qwen3.8-27B-OptiQ-4bit", modelPath: mlxModel.path })
+        : Promise.resolve(undefined),
+    );
+
+    await useModelStore.getState().start(mlxModel);
+
+    expect(invokeMock).toHaveBeenCalledWith("mlx_chat_start", { modelPath: mlxModel.path });
+    // llama-server loads GGUF files; it must never be handed a directory.
+    expect(invokeMock).not.toHaveBeenCalledWith("llama_start", expect.anything());
+    const state = useModelStore.getState();
+    expect(state.llamaStatus).toBe("ready");
+    expect(state.mlxChat?.port).toBe(51234);
+    expect(state.activeProvider).toBe("local");
+  });
+
+  it("reports a failed MLX start instead of leaving the UI on \"starting\"", async () => {
+    invokeMock.mockClear();
+    invokeMock.mockImplementation((command: string) =>
+      command === "mlx_chat_start"
+        ? Promise.reject(new Error("verified MLX installation is corrupt"))
+        : Promise.resolve(undefined),
+    );
+
+    await expect(useModelStore.getState().start(mlxModel)).rejects.toThrow(/corrupt/);
+    const state = useModelStore.getState();
+    expect(state.llamaStatus).toBe("error");
+    expect(state.llamaError).toMatch(/corrupt/);
+    expect(state.mlxChat).toBeNull();
+  });
+
+  it("stops the MLX endpoint rather than llama-server when MLX is what is running", async () => {
+    invokeMock.mockClear();
+    invokeMock.mockImplementation(() => Promise.resolve(undefined));
+    useModelStore.setState({
+      mlxChat: { running: true, port: 51234, modelId: "m", modelPath: "/models/m" },
     });
 
-    await expect(store.start(mlx)).rejects.toThrow(/only loads GGUF/);
-    // The point of the guard: no llama_start call was ever made.
-    expect(invokeMock).not.toHaveBeenCalledWith("llama_start", expect.anything());
+    await useModelStore.getState().stop();
+
+    expect(invokeMock).toHaveBeenCalledWith("mlx_chat_stop");
+    expect(invokeMock).not.toHaveBeenCalledWith("llama_stop");
+    expect(useModelStore.getState().mlxChat).toBeNull();
     expect(useModelStore.getState().llamaStatus).toBe("stopped");
-    expect(useModelStore.getState().llamaError).toMatch(/MLX model/);
   });
 });
