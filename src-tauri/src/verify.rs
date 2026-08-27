@@ -926,11 +926,24 @@ pub(crate) mod tests {
         let path = std::env::var("PATH").unwrap_or_default();
         let separator = if cfg!(windows) { ';' } else { ':' };
         let entries: Vec<&str> = path.split(separator).collect();
+        // Which entry, if any, actually holds the program the command names.
+        // "not recognized" has two very different causes, and only this tells
+        // them apart: the directory is absent from PATH (a environment
+        // problem), or it is present and the child still could not use it (the
+        // shell is not carrying all of what it was handed).
+        let probe = if cfg!(windows) { "sleep.exe" } else { "sleep" };
+        let holders: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, dir)| !dir.is_empty() && std::path::Path::new(dir).join(probe).exists())
+            .map(|(index, _)| index)
+            .collect();
         format!(
-            " | PATH: {} chars, {} entries, last={:?}",
+            " | PATH: {} chars, {} entries; {probe} in entries {:?} of {}",
             path.len(),
             entries.len(),
-            entries.last().unwrap_or(&"")
+            holders,
+            entries.len()
         )
     }
 
