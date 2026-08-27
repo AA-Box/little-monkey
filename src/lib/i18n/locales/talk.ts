@@ -6,4 +6,5 @@
 export const talkLocale: Record<string, string> = {
   "AppMenu.talk": "Talk",
   "AppMenu.groupTalk": "Talk",
+  "ChatWindow.talkAriaLabel": "Talk",
 };

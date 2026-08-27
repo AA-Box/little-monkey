@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import type { ClipboardEvent, FormEvent, KeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { CornerDownLeft, Square } from "lucide-react";
+import { AudioLines, CornerDownLeft, Square } from "lucide-react";
 
 import { compactSessionNow, runAgentTurn, stopTurn } from "../../lib/agentLoop";
 import type { AttachmentRef } from "../../lib/agentLoop";
@@ -299,6 +299,7 @@ interface ChatWindowProps {
   onOpenBackgroundTasks?: () => void;
   onOpenPmCopilot?: () => void;
   onOpenStudio?: () => void;
+  onOpenTalk?: () => void;
 }
 
 interface ComposerDraftSnapshot {
@@ -307,7 +308,7 @@ interface ComposerDraftSnapshot {
   pastedPlacements: PastedTextPlacement[];
 }
 
-export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks, onOpenPmCopilot, onOpenStudio }: ChatWindowProps) {
+export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks, onOpenPmCopilot, onOpenStudio, onOpenTalk }: ChatWindowProps) {
   const messages = useSessionStore(selectSessionMessages(sessionId));
   const persistError = useSessionStore((state) => state.persistError);
   const roots = useWorkspaceStore((state) => state.roots);
@@ -1430,6 +1431,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const hasPastedTextDraft = attachments.some((attachment) =>
     isPastedTextPath(attachment.path) && Boolean(attachment.content)
   );
+  const showTalkButton = Boolean(onOpenTalk) && !sending && !input.trim() && !hasPastedTextDraft;
   const editingPastedAttachment = editingPastedPath
     ? attachments.find((attachment) => attachment.path === editingPastedPath && isPastedTextPath(attachment.path)) ?? null
     : null;
@@ -1624,21 +1626,33 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                 disabled={sending || preparingTurn || startingComparison || startingCrew}
               />
               <span className="group/action relative shrink-0">
+                {/* Nothing to send yet -> the same slot opens Talk, so the
+                    composer's primary button is never a dead control. */}
                 <button
                   type="button"
-                  onClick={sending ? handleStop : handleSend}
-                  disabled={preparingTurn || startingComparison || startingCrew || localModelStarting || (!sending && !input.trim() && !hasPastedTextDraft)}
-                  aria-label={sending ? t("ChatWindow.stopResponseAriaLabel") : t("ChatWindow.sendMessageAriaLabel")}
+                  onClick={sending ? handleStop : showTalkButton ? onOpenTalk : handleSend}
+                  disabled={preparingTurn || startingComparison || startingCrew || localModelStarting || (!sending && !showTalkButton && !input.trim() && !hasPastedTextDraft)}
+                  aria-label={sending
+                    ? t("ChatWindow.stopResponseAriaLabel")
+                    : showTalkButton
+                      ? t("ChatWindow.talkAriaLabel")
+                      : t("ChatWindow.sendMessageAriaLabel")}
                   className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full text-faint transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                 >
-                  {sending ? <Square size={13} className="fill-current" /> : <CornerDownLeft size={16} />}
+                  {sending
+                    ? <Square size={13} className="fill-current" />
+                    : showTalkButton
+                      ? <AudioLines size={16} />
+                      : <CornerDownLeft size={16} />}
                 </button>
-                {sending && (
+                {sending ? (
                   <Tooltip
                     text={t("ChatWindow.stopResponseAriaLabel")}
                     hint={t("ChatWindow.stopResponseHint")}
                   />
-                )}
+                ) : showTalkButton ? (
+                  <Tooltip text={t("ChatWindow.talkAriaLabel")} />
+                ) : null}
               </span>
             </div>
           </div>
