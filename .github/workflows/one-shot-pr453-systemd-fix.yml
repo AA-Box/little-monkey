@@ -1,0 +1,66 @@
+name: One-shot PR 453 systemd renderer fix
+
+on:
+  push:
+    branches:
+      - fix/channel-secret-daemon-ownership
+    paths:
+      - .github/workflows/one-shot-pr453-systemd-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/channel-secret-daemon-ownership
+          fetch-depth: 0
+
+      - name: Patch committed systemd renderer and regression assertion
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src-tauri/src/bin/monkey-cli/daemon/service.rs")
+          source = path.read_text()
+
+          old_workdir = 'WorkingDirectory={}\\\n\\\n[Install]'
+          new_workdir = 'WorkingDirectory=%h\\\n\\\n[Install]'
+          if source.count(old_workdir) != 1:
+              raise SystemExit(f"expected exactly one systemd WorkingDirectory renderer, found {source.count(old_workdir)}")
+          source = source.replace(old_workdir, new_workdir, 1)
+
+          old_arg = '                systemd_escape(user_home),\n'
+          if source.count(old_arg) != 1:
+              raise SystemExit(f"expected exactly one obsolete WorkingDirectory format argument, found {source.count(old_arg)}")
+          source = source.replace(old_arg, '', 1)
+
+          old_assert = '                    assert!(rendered.contains(r#"WorkingDirectory=\\"/home/test\\""#));\n'
+          new_assert = (
+              '                    assert!(rendered.contains("WorkingDirectory=%h"));\n'
+              '                    assert!(!rendered.contains(r#"WorkingDirectory=\\"/home/test\\""#));\n'
+          )
+          if source.count(old_assert) != 1:
+              raise SystemExit(f"expected exactly one obsolete WorkingDirectory assertion, found {source.count(old_assert)}")
+          source = source.replace(old_assert, new_assert, 1)
+
+          path.write_text(source)
+          PY
+
+          git diff --check
+          git diff -- src-tauri/src/bin/monkey-cli/daemon/service.rs
+
+      - name: Commit production fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/src/bin/monkey-cli/daemon/service.rs
+          git commit -m "fix(daemon): render valid systemd working directory"
+          git push origin HEAD:fix/channel-secret-daemon-ownership
