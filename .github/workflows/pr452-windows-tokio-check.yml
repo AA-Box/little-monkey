@@ -1,0 +1,69 @@
+name: PR 452 Windows Tokio check
+
+on:
+  push:
+    branches:
+      - fix/zero-config-whisper
+    paths:
+      - .github/workflows/pr452-windows-tokio-check.yml
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: windows-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/zero-config-whisper
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+
+      - name: Stage CLI sidecar placeholder
+        shell: pwsh
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+
+      - name: Restore develop Tokio runtime
+        shell: pwsh
+        run: |
+          cargo update --manifest-path src-tauri/Cargo.toml -p tokio --precise 1.52.3
+          cargo update --manifest-path src-tauri/Cargo.toml -p tokio-macros --precise 2.7.0
+          cargo tree --manifest-path src-tauri/Cargo.toml -p tokio
+
+      - name: Verify Windows timeout
+        shell: pwsh
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib verify::tests::run_command_impl_times_out_a_long_running_command -- --exact --nocapture --test-threads=1
+
+      - name: Verify Windows typed wall breach
+        shell: pwsh
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib verify::tests::a_verify_command_stopped_by_a_limit_persists_the_typed_breach -- --exact --nocapture --test-threads=1
+
+      - name: Verify Windows cancellation row
+        shell: pwsh
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib verify::tests::a_cancelled_verify_command_closes_as_cancelled_and_not_as_a_limit -- --exact --nocapture --test-threads=1
+
+      - name: Verify Windows cancellation result
+        shell: pwsh
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib verify::tests::run_command_impl_is_killed_by_tool_cancel_notify -- --exact --nocapture --test-threads=1
+
+      - name: Verify learning whole loop
+        shell: pwsh
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib skill_learning::tests::the_whole_loop_runs_end_to_end_across_a_restart -- --exact --nocapture --test-threads=1
+
+      - name: Commit proven lock correction and remove one-shot workflow
+        shell: pwsh
+        run: |
+          Remove-Item .github/workflows/pr452-windows-tokio-check.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/Cargo.lock .github/workflows/pr452-windows-tokio-check.yml
+          git diff --cached --check
+          git commit -m "fix: keep Tokio runtime at proven Windows version"
+          git push origin HEAD:fix/zero-config-whisper
