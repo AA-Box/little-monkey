@@ -913,6 +913,27 @@ pub(crate) mod tests {
     /// `cmd` has no `sleep`, so Windows gets the usual stand-in: a ping with a
     /// one-second interval, which is what makes this test's assertion about a
     /// *running* workload rather than about one that had already exited.
+    /// What the child shell could actually see, for when an assertion below
+    /// fails because a command did not resolve rather than because the
+    /// behaviour under test is wrong.
+    ///
+    /// `cargo test` puts every dependency's `rustc-link-search` directory on
+    /// PATH so DLLs resolve, and a native dependency can contribute enough of
+    /// them to matter. A `VerifyResult` reading `code: Some(1)` with a
+    /// "not recognized" stderr is a lookup failure, and the first question is
+    /// always what PATH held at the time.
+    pub(crate) fn lookup_context() -> String {
+        let path = std::env::var("PATH").unwrap_or_default();
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        let entries: Vec<&str> = path.split(separator).collect();
+        format!(
+            " | PATH: {} chars, {} entries, last={:?}",
+            path.len(),
+            entries.len(),
+            entries.last().unwrap_or(&"")
+        )
+    }
+
     pub(crate) fn long_running_command() -> String {
         #[cfg(target_os = "windows")]
         {
@@ -961,7 +982,7 @@ pub(crate) mod tests {
         assert_eq!(result.command_id, "c1");
         assert_eq!(result.code, Some(0));
         assert!(result.stdout.contains("hello"));
-        assert!(!result.timed_out, "{result:?}");
+        assert!(!result.timed_out, "{result:?}{}", lookup_context());
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -984,7 +1005,7 @@ pub(crate) mod tests {
         .await;
 
         assert_eq!(result.code, Some(3));
-        assert!(!result.timed_out, "{result:?}");
+        assert!(!result.timed_out, "{result:?}{}", lookup_context());
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -1007,8 +1028,8 @@ pub(crate) mod tests {
         )
         .await;
 
-        assert!(result.timed_out, "{result:?}");
-        assert!(result.code.is_none(), "{result:?}");
+        assert!(result.timed_out, "{result:?}{}", lookup_context());
+        assert!(result.code.is_none(), "{result:?}{}", lookup_context());
         // The whole call returned near the 1s timeout, not the 30s sleep —
         // proof the child was actually killed rather than awaited out.
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -1093,14 +1114,14 @@ pub(crate) mod tests {
         cmd.timeout_secs = Some(1);
 
         let result = run_command_impl(&state, &cwd, &cmd, None, projector.clone()).await;
-        assert!(result.timed_out, "{result:?}");
+        assert!(result.timed_out, "{result:?}{}", lookup_context());
 
         let row = projector.only(ProcessKind::VerifyCommand);
         let exit = row.exit.expect("an exited row carries its exit");
         assert_eq!(
             exit.status,
             crate::process_table::ExitStatus::LimitExceeded,
-            "{result:?}"
+            "{result:?}{}", lookup_context()
         );
         let breach = exit.breach.expect("a limit kill carries its typed breach");
         assert_eq!(breach.limit, ProcessLimitKind::Wall.as_str());
@@ -1146,11 +1167,11 @@ pub(crate) mod tests {
         });
 
         let result = run_command_impl(&state, &cwd, &cmd, Some(&turn_id), projector.clone()).await;
-        assert!(!result.timed_out, "{result:?}");
+        assert!(!result.timed_out, "{result:?}{}", lookup_context());
 
         let row = projector.only(ProcessKind::VerifyCommand);
         let exit = row.exit.expect("an exited row carries its exit");
-        assert_eq!(exit.status, crate::process_table::ExitStatus::Cancelled, "{result:?}");
+        assert_eq!(exit.status, crate::process_table::ExitStatus::Cancelled, "{result:?}{}", lookup_context());
         assert!(exit.breach.is_none(), "a Stop is not a resource kill");
 
         let _ = std::fs::remove_dir_all(&cwd);
@@ -1203,7 +1224,7 @@ pub(crate) mod tests {
         };
 
         let result = run_command_impl(&state, &cwd, &cmd, None, projector.clone()).await;
-        assert_eq!(result.code, Some(0), "{result:?}");
+        assert_eq!(result.code, Some(0), "{result:?}{}", lookup_context());
 
         let (usage, sampled_at) = watcher
             .await
@@ -1275,7 +1296,7 @@ pub(crate) mod tests {
             crate::test_support::RecordingProjector::shared(),
         )
         .await;
-        assert!(result.timed_out, "{result:?}");
+        assert!(result.timed_out, "{result:?}{}", lookup_context());
 
         let grandchild: u32 = std::fs::read_to_string(&pid_file)
             .expect("the command wrote its background pid")
@@ -1386,9 +1407,9 @@ pub(crate) mod tests {
         )
         .await;
 
-        assert!(!result.timed_out, "{result:?}");
-        assert!(result.code.is_none(), "{result:?}");
-        assert!(result.stderr.contains("cancelled"), "{result:?}");
+        assert!(!result.timed_out, "{result:?}{}", lookup_context());
+        assert!(result.code.is_none(), "{result:?}{}", lookup_context());
+        assert!(result.stderr.contains("cancelled"), "{result:?}{}", lookup_context());
         // Returned promptly after the ~100ms cancel fired, not the 30s sleep.
         assert!(started.elapsed() < Duration::from_secs(10));
 
