@@ -8413,11 +8413,7 @@ mod tests {
             id: "verify-1".to_string(),
             label: "sources present".to_string(),
             kind: "test".to_string(),
-            command: if cfg!(target_os = "windows") {
-                r#"if exist src\uploader.rs (exit /b 0) else (exit /b 1)"#.to_string()
-            } else {
-                "test -f src/uploader.rs".to_string()
-            },
+            command: "test -f src/uploader.rs".to_string(),
             enabled: true,
             timeout_secs: Some(30),
         }
@@ -9110,11 +9106,7 @@ mod tests {
             id: "verify-1".to_string(),
             label: "retry present".to_string(),
             kind: "test".to_string(),
-            command: if cfg!(target_os = "windows") {
-                r#"findstr /C:"with_retry(" src\uploader.rs >nul"#.to_string()
-            } else {
-                "grep -q 'with_retry(' src/uploader.rs".to_string()
-            },
+            command: "grep -q 'with_retry(' src/uploader.rs".to_string(),
             enabled: true,
             timeout_secs: Some(30),
         }
