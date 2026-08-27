@@ -29,7 +29,14 @@ export interface ModelInfo {
   kind: "chat" | "embedding";
   components?: ModelComponents;
   capabilities?: ModelCapabilities;
+  /** Which local runtime loads this model: a GGUF runs on the bundled
+   *  llama.cpp, a safetensors directory on MLX. Absent on anything installed
+   *  before the field existed, which was always a GGUF. */
+  runtime?: ModelRuntimeKind;
 }
+
+/** Mirrors `model_sources.rs::ModelRuntimeKind`. */
+export type ModelRuntimeKind = "llama_cpp" | "mlx";
 
 export type ComponentOwnership = "managed" | "external";
 
@@ -73,6 +80,21 @@ export interface ResolvedModelReference {
   licenseUrl: string | null;
   artifacts?: ResolvedModelArtifact[];
   projectorCandidates?: ResolvedModelArtifact[];
+  /** Every file of a directory-shaped repository. Non-empty exactly when this
+   *  installs a directory rather than a single GGUF; `sha256` above is then the
+   *  digest over this list. */
+  bundleFiles?: ResolvedBundleFile[];
+  runtime?: ModelRuntimeKind;
+}
+
+export interface ResolvedBundleFile {
+  path: string;
+  downloadUrl: string;
+  /** Git-LFS digest, for weights. */
+  sha256: string | null;
+  /** Git blob object id, for files not stored in LFS. */
+  blobSha1: string | null;
+  sizeBytes: number;
 }
 
 export type ModelArtifactRole = "model" | "projector";
@@ -598,6 +620,13 @@ export const useModelStore = create<ModelStore>((set, get) => ({
   start: async (model) => {
     if (!model.path) {
       throw new Error(`Model "${model.name}" has not been downloaded yet`);
+    }
+    // `start` is llama-server. An MLX model is a safetensors directory it
+    // cannot open, so say what is missing instead of surfacing a load failure.
+    if (model.runtime === "mlx") {
+      const message = `"${model.name}" is an MLX model. It is installed and verified, but chat still runs on llama.cpp, which only loads GGUF files.`;
+      set({ llamaStatus: "stopped", llamaError: message });
+      throw new Error(message);
     }
     set({
       active: model,
