@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Cloud, Cpu, Search, Server, X } from "lucide-react";
 
-import { useModelStore, type ProviderConfig } from "../../store/modelStore";
+import { providerIsConnected, useModelStore, type ProviderConfig } from "../../store/modelStore";
 import { useSettingsStore, DEFAULT_PROVIDER_MODEL_FILTER } from "../../store/settingsStore";
 import { errorMessage } from "../../lib/errors";
 import { useT } from "../../lib/i18n";
@@ -23,13 +23,9 @@ const SOURCE_TABS: Array<{ id: SourceTab; icon: typeof Cloud; labelKey: string }
   { id: "ollama", icon: Server, labelKey: "ModelSwitcher.ollamaSectionLabel" },
 ];
 
-function providerReady(provider: ProviderConfig): boolean {
-  return provider.has_key || provider.is_extension;
-}
-
 function providerSort(a: ProviderConfig, b: ProviderConfig): number {
-  const aReady = providerReady(a);
-  const bReady = providerReady(b);
+  const aReady = providerIsConnected(a);
+  const bReady = providerIsConnected(b);
   if (aReady !== bReady) return aReady ? -1 : 1;
   if (a.is_custom !== b.is_custom) return a.is_custom ? 1 : -1;
   return a.label.localeCompare(b.label);
@@ -143,7 +139,7 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
   const selectedProvider = selectedProviderId
     ? providers.find((provider) => provider.id === selectedProviderId) ?? null
     : null;
-  const selectedProviderReady = selectedProvider ? providerReady(selectedProvider) : false;
+  const selectedProviderReady = selectedProvider ? providerIsConnected(selectedProvider) : false;
   const selectedModels = selectedProvider ? providerModels[selectedProvider.id] ?? [] : [];
   const filteredModels = useMemo(() => {
     const needle = modelSearch.trim().toLowerCase();
@@ -157,7 +153,7 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
       (activeProvider === "provider" && activeProviderId
         ? sortedProviders.find((provider) => provider.id === activeProviderId)
         : undefined) ??
-      sortedProviders.find(providerReady) ??
+      sortedProviders.find(providerIsConnected) ??
       sortedProviders[0];
     setSelectedProviderId(preferred.id);
   }, [activeProvider, activeProviderId, open, selectedProviderId, sortedProviders]);
@@ -248,16 +244,23 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
         if (event.target === event.currentTarget) onClose();
       }}
     >
+      {/* Fixed height, not `max-h`: a content-driven frame resized itself every
+          time the tab changed. The cap and width match PastedTextEditorModal —
+          a task dialog has a natural size, unlike SettingsModal, which takes
+          85vh/90vw because its content genuinely scales with the window.
+          86vh rather than that dialog's 78vh is the one deliberate difference:
+          it only applies below ~884px of window height, where this form's
+          scrolling lists benefit from the extra room. */}
       <div
         role="dialog"
         aria-modal="true"
         aria-label={t("OllamaPanel.addModelLabel")}
-        className="flex max-h-[86vh] w-full max-w-4xl flex-col overflow-hidden rounded-xl border border-border bg-background shadow-2xl"
+        className="flex h-[min(86vh,760px)] w-full max-w-4xl flex-col overflow-hidden rounded-xl border border-border bg-background shadow-2xl"
       >
         <div className="flex shrink-0 items-center gap-3 border-b border-border px-5 py-4">
           <div className="min-w-0 flex-1">
             <h2 className="text-base font-semibold text-foreground">{t("OllamaPanel.addModelLabel")}</h2>
-            <p className="mt-0.5 text-xs text-muted">Choose where the model runs, then connect or install it here.</p>
+            <p className="mt-0.5 text-xs text-muted">{t("AddModelDialog.subtitle")}</p>
           </div>
           <IconButton size="sm" onClick={onClose} aria-label={t("Debate.close")}>
             <X size={16} />
@@ -290,8 +293,8 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
           {source === "local" && <ModelManager />}
           {source === "ollama" && <OllamaPanel />}
           {source === "cloud" && (
-            <div className="grid gap-4 lg:grid-cols-[15rem_minmax(0,1fr)]">
-              <div className="flex flex-col gap-1">
+            <div className="grid h-full min-h-0 gap-4 lg:grid-cols-[15rem_minmax(0,1fr)]">
+              <div className="flex min-h-0 flex-col gap-1 overflow-y-auto [overscroll-behavior:contain]">
                 {sortedProviders.map((provider) => (
                   <button
                     key={provider.id}
@@ -335,6 +338,7 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
                       value={customApiKey}
                       onChange={(event) => setCustomApiKey(event.target.value)}
                       placeholder={t("ProviderCard.apiKeyPlaceholder")}
+                      aria-label={t("AddModelDialog.customApiKeyLabel")}
                       className="h-8 rounded-md border border-border bg-surface px-2.5 font-mono text-sm text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
                     />
                     <Button
@@ -343,50 +347,60 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
                       onClick={() => void connectCustomProvider()}
                       disabled={!customLabel.trim() || !customBaseUrl.trim() || !customApiKey.trim() || customBusy}
                     >
-                      {customBusy ? t("AddCustomProviderForm.addingButton") : t("ProviderCard.save")}
+                      {customBusy ? t("AddCustomProviderForm.addingButton") : t("AddCustomProviderForm.addButton")}
                     </Button>
                     {customError && <p className="text-xs text-danger">{customError}</p>}
                   </div>
                 </div>
               </div>
 
-              <div className="min-w-0 rounded-lg border border-border bg-background p-4">
+              <div className="flex min-h-0 min-w-0 flex-col rounded-lg border border-border bg-background p-4">
                 {!selectedProvider ? (
-                  <div className="flex min-h-48 items-center justify-center text-center text-sm text-faint">
-                    Choose a provider to connect it and pick a model.
+                  <div className="flex min-h-0 flex-1 items-center justify-center px-6 text-center text-sm text-faint">
+                    {t("AddModelDialog.chooseProviderPrompt")}
                   </div>
                 ) : !selectedProviderReady ? (
-                  <div className="mx-auto flex max-w-lg flex-col gap-3 py-6">
-                    <div>
+                  // Centred in the pane rather than stacked at its top: the
+                  // dialog is a fixed height now, so a top-aligned three-field
+                  // form left most of the panel empty beneath it.
+                  <div className="flex min-h-0 flex-1 items-center justify-center">
+                    <div className="w-full max-w-sm">
                       <h3 className="text-sm font-semibold text-foreground">{selectedProvider.label}</h3>
-                      <p className="mt-1 text-xs text-muted">{selectedProvider.base_url}</p>
+                      {/* Gemini's base URL is long enough to run past the pane. */}
+                      <p className="mt-1 break-all font-mono text-xs text-muted">{selectedProvider.base_url}</p>
+                      <input
+                        type="password"
+                        autoComplete="off"
+                        value={apiKey}
+                        onChange={(event) => setApiKey(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") void connectSelectedProvider();
+                        }}
+                        placeholder={t("ProviderCard.apiKeyPlaceholder")}
+                        aria-label={t("AddModelDialog.apiKeyLabel", { provider: selectedProvider.label })}
+                        autoFocus
+                        className="mt-4 h-9 w-full rounded-md border border-border bg-surface px-3 font-mono text-sm text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+                      />
+                      <p className="mt-2 text-xs text-faint">{t("AddModelDialog.keyStorageHint")}</p>
+                      {providerKeyError[selectedProvider.id] && (
+                        <p className="mt-2 text-xs text-danger">{providerKeyError[selectedProvider.id]}</p>
+                      )}
+                      {/* A column stretches its children, which turned Save
+                          into a full-width slab. */}
+                      <div className="mt-3 flex justify-end">
+                        <Button
+                          variant="primary"
+                          size="sm"
+                          onClick={() => void connectSelectedProvider()}
+                          disabled={!apiKey.trim() || connecting}
+                        >
+                          {connecting ? t("ProviderCard.saving") : t("ProviderCard.save")}
+                        </Button>
+                      </div>
                     </div>
-                    <input
-                      type="password"
-                      autoComplete="off"
-                      value={apiKey}
-                      onChange={(event) => setApiKey(event.target.value)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") void connectSelectedProvider();
-                      }}
-                      placeholder={t("ProviderCard.apiKeyPlaceholder")}
-                      autoFocus
-                      className="h-9 rounded-md border border-border bg-surface px-3 font-mono text-sm text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
-                    />
-                    <Button
-                      variant="primary"
-                      size="sm"
-                      onClick={() => void connectSelectedProvider()}
-                      disabled={!apiKey.trim() || connecting}
-                    >
-                      {connecting ? t("ProviderCard.saving") : t("ProviderCard.save")}
-                    </Button>
-                    {providerKeyError[selectedProvider.id] && (
-                      <p className="text-xs text-danger">{providerKeyError[selectedProvider.id]}</p>
-                    )}
                   </div>
                 ) : (
-                  <div className="flex min-h-0 flex-col gap-3">
+                  <div className="flex min-h-0 flex-1 flex-col gap-3">
                     <div className="flex items-center justify-between gap-3">
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
@@ -397,7 +411,7 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
                             <StatusPill tone="success">{t("ProviderCard.connected")}</StatusPill>
                           )}
                         </div>
-                        <p className="mt-0.5 text-xs text-muted">Pick a model to use it in this chat.</p>
+                        <p className="mt-0.5 text-xs text-muted">{t("AddModelDialog.pickModelPrompt")}</p>
                       </div>
                       <Button variant="ghost" size="sm" onClick={() => void refreshSelectedModels()} disabled={refreshing}>
                         {refreshing ? t("ProviderCard.refreshing") : t("ProviderCard.refreshModels")}
@@ -416,7 +430,7 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
                       </div>
                     )}
 
-                    <div className="flex max-h-[48vh] flex-col gap-1 overflow-y-auto [overscroll-behavior:contain]">
+                    <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto [overscroll-behavior:contain]">
                       {filteredModels.map((model) => (
                         <button
                           key={model.id}
@@ -425,7 +439,7 @@ export function AddModelDialog({ open, onClose }: AddModelDialogProps) {
                           className="flex min-h-10 items-center justify-between gap-3 rounded-md px-3 py-2 text-left hover:bg-surface-2"
                         >
                           <span className="min-w-0 truncate font-mono text-xs text-foreground">{model.id}</span>
-                          <span className="shrink-0 text-xs text-accent">Use</span>
+                          <span className="shrink-0 text-xs text-accent">{t("AddModelDialog.useModelAction")}</span>
                         </button>
                       ))}
                       {selectedModels.length === 0 && !providerKeyError[selectedProvider.id] && (

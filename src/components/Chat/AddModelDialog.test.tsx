@@ -70,19 +70,14 @@ describe("AddModelDialog point-of-use cloud setup", () => {
     const onClose = vi.fn();
     render(<AddModelDialog open onClose={onClose} />);
 
-    const providerHeading = await screen.findByRole("heading", { name: "Anthropic" });
-    const providerSetup = providerHeading.parentElement?.parentElement;
-    expect(providerSetup).toBeTruthy();
+    // Queried by role and placeholder rather than by walking up from the
+    // heading: the setup pane's wrapper depth is layout, and this assertion is
+    // about the form, not about how many divs happen to surround it.
+    await screen.findByRole("heading", { name: "Anthropic" });
 
-    const keyInput = providerSetup?.querySelector<HTMLInputElement>(
-      'input[placeholder="ProviderCard.apiKeyPlaceholder"]',
-    );
-    expect(keyInput).toBeTruthy();
-    fireEvent.change(keyInput!, { target: { value: "sk-ant-test" } });
-
-    const connectButton = providerSetup?.querySelector("button");
-    expect(connectButton).toBeTruthy();
-    fireEvent.click(connectButton!);
+    const keyInput = screen.getByLabelText("AddModelDialog.apiKeyLabel");
+    fireEvent.change(keyInput, { target: { value: "sk-ant-test" } });
+    fireEvent.click(screen.getByRole("button", { name: "ProviderCard.save" }));
 
     await waitFor(() => {
       expect(setProviderKey).toHaveBeenCalledWith("anthropic", "sk-ant-test");

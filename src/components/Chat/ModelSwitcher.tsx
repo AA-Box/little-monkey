@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, Plus, Search, TriangleAlert } from "lucide-react";
 
-import { useModelStore, type CloudModelRetirementWarning } from "../../store/modelStore";
+import { providerIsConnected, useModelStore, type CloudModelRetirementWarning } from "../../store/modelStore";
 import type { ModelInfo, OllamaModelInfo } from "../../store/modelStore";
 import { useSettingsStore, DEFAULT_PROVIDER_MODEL_FILTER } from "../../store/settingsStore";
 import { cloudModelRetirementWarning } from "../../lib/modelRetirement";
@@ -11,16 +11,6 @@ import { visibleProviderModelsForProvider } from "../../lib/providerModelSelecti
 const AddModelDialog = lazy(() =>
   import("./AddModelDialog").then((module) => ({ default: module.AddModelDialog })),
 );
-
-/** Connected provider + loaded inventory but no curated rows is a selection
- * state, not a missing API-key/configuration state. */
-export function providerModelsEmptyStateKey(
-  availableModelCount: number,
-): "ModelSwitcher.noCloudModelsSelected" | "ModelSwitcher.noCloudModelsConfigured" {
-  return availableModelCount > 0
-    ? "ModelSwitcher.noCloudModelsSelected"
-    : "ModelSwitcher.noCloudModelsConfigured";
-}
 
 /** Shared search predicate kept pure so picker filtering remains cheap/testable. */
 export function modelMatchesQuery(query: string, ...values: Array<string | null | undefined>): boolean {
@@ -69,9 +59,7 @@ export function ModelSwitcher({ placement = "up" }: { placement?: "up" | "down" 
   const providerModelFilters = useSettingsStore((s) => s.providerModelFilters);
   const { t } = useT();
 
-  // Extension-contributed providers authenticate inside their sandbox and do
-  // not own a key, so `is_extension` is just as selectable as `has_key` here.
-  const connectedProviders = providers.filter((provider) => provider.has_key || provider.is_extension);
+  const connectedProviders = providers.filter(providerIsConnected);
   // Embedding-only GGUFs can be installed for Knowledge Stacks, but they
   // cannot answer chat requests and must never appear as chat targets.
   const installedChatModels = installed.filter((model) => model.kind === "chat");
@@ -80,6 +68,7 @@ export function ModelSwitcher({ placement = "up" }: { placement?: "up" | "down" 
   const [addModelOpen, setAddModelOpen] = useState(false);
   const [query, setQuery] = useState("");
   const containerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -89,7 +78,14 @@ export function ModelSwitcher({ placement = "up" }: { placement?: "up" | "down" 
       }
     }
     window.addEventListener("pointerdown", handlePointerDown);
-    return () => window.removeEventListener("pointerdown", handlePointerDown);
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") closePicker();
+    }
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown, true);
+    };
   }, [open]);
 
   useEffect(() => {
@@ -110,56 +106,66 @@ export function ModelSwitcher({ placement = "up" }: { placement?: "up" | "down" 
       ? cloudModelRetirementWarning(activeProviderId, activeProviderModel)
       : null;
 
+  // Section labels are searchable alongside model names, so "ollama" or the
+  // localized "Local" narrows to that section the way a provider name does.
+  const localSectionLabel = t("ModelSwitcher.localSectionLabel");
+  const ollamaSectionLabel = t("ModelSwitcher.ollamaSectionLabel");
+
+  // Resolved once and reused for both the count and the filtered groups —
+  // this runs on every render of a component subscribed to a dozen store
+  // slices, so sweeping the provider inventory twice is worth avoiding.
+  const providerInventory = connectedProviders.map((provider) => ({
+    provider,
+    models: visibleProviderModelsForProvider(
+      provider.id,
+      providerModels[provider.id] ?? [],
+      providerModelFilters[provider.id] ?? DEFAULT_PROVIDER_MODEL_FILTER,
+      { activeProvider, activeProviderId, activeProviderModel },
+    ),
+  }));
+
   const filteredLocalModels = installedChatModels.filter((model) =>
-    modelMatchesQuery(query, model.id, model.name),
+    modelMatchesQuery(query, localSectionLabel, model.id, model.name),
   );
-  const providerGroups = connectedProviders
-    .map((provider) => {
-      const filter = providerModelFilters[provider.id] ?? DEFAULT_PROVIDER_MODEL_FILTER;
-      const availableModels = providerModels[provider.id] ?? [];
-      const models = visibleProviderModelsForProvider(
-        provider.id,
-        availableModels,
-        filter,
-        { activeProvider, activeProviderId, activeProviderModel },
-      ).filter((model) => modelMatchesQuery(query, provider.label, model.id));
-      return { provider, models };
-    })
+  const providerGroups = providerInventory
+    .map(({ provider, models }) => ({
+      provider,
+      models: models.filter((model) => modelMatchesQuery(query, provider.label, model.id)),
+    }))
     .filter((group) => group.models.length > 0);
   const filteredOllamaModels = ollamaModels.filter((model) =>
-    modelMatchesQuery(query, "Ollama", model.name),
+    modelMatchesQuery(query, ollamaSectionLabel, model.name),
   );
   const hasAnyVisibleModel =
     filteredLocalModels.length > 0 || providerGroups.length > 0 || filteredOllamaModels.length > 0;
   const totalAvailableModelCount =
     installedChatModels.length +
     ollamaModels.length +
-    connectedProviders.reduce((count, provider) => {
-      const filter = providerModelFilters[provider.id] ?? DEFAULT_PROVIDER_MODEL_FILTER;
-      const availableModels = providerModels[provider.id] ?? [];
-      return count + visibleProviderModelsForProvider(
-        provider.id,
-        availableModels,
-        filter,
-        { activeProvider, activeProviderId, activeProviderModel },
-      ).length;
-    }, 0);
+    providerInventory.reduce((count, group) => count + group.models.length, 0);
+
+  /** Close and return focus to the trigger. Used by every close the user
+   * drives from the keyboard or from a row — not by outside-click, which has
+   * its own new focus target already. */
+  function closePicker() {
+    setOpen(false);
+    triggerRef.current?.focus();
+  }
 
   function handleSelectLocal(model: ModelInfo) {
     start(model).catch((error) => {
       console.error("Failed to start local model", error);
     });
-    setOpen(false);
+    closePicker();
   }
 
   function handleSelectOllama(model: OllamaModelInfo) {
     useOllamaModel(model.name);
-    setOpen(false);
+    closePicker();
   }
 
   function handleSelectProvider(providerId: string, modelId: string) {
     useProviderModel(providerId, modelId);
-    setOpen(false);
+    closePicker();
   }
 
   function openAddModel() {
@@ -171,6 +177,7 @@ export function ModelSwitcher({ placement = "up" }: { placement?: "up" | "down" 
     <>
       <div ref={containerRef} className="relative inline-block min-w-0 max-w-[10rem]">
         <button
+          ref={triggerRef}
           type="button"
           onClick={() => setOpen((prev) => !prev)}
           aria-haspopup="true"
@@ -188,7 +195,11 @@ export function ModelSwitcher({ placement = "up" }: { placement?: "up" | "down" 
 
         {open && (
           <div
-            className={`absolute right-0 z-20 flex max-h-[70vh] w-80 flex-col overflow-hidden rounded-lg border border-border bg-background shadow-lg ${
+            // 16rem, not the 20rem this panel first shipped at: it also renders
+            // inside the right sidebar (PmCopilotPanel, EvidenceBoardPanel),
+            // which is 288px by default, and a 320px panel overflowed left into
+            // a scroll container whose overflow-x is not visible.
+            className={`absolute right-0 z-20 flex max-h-[70vh] w-64 flex-col overflow-hidden rounded-lg border border-border bg-background shadow-lg ${
               placement === "down" ? "top-full mt-1" : "bottom-full mb-1"
             }`}
           >
@@ -288,7 +299,7 @@ export function ModelSwitcher({ placement = "up" }: { placement?: "up" | "down" 
                     {query.trim() ? t("ComparePicker.noResultsTitle") : t("ModelSwitcher.noModel")}
                   </p>
                   {!query.trim() && (
-                    <p className="mt-1 text-xs text-faint">Add a cloud, local, or Ollama model without leaving chat.</p>
+                    <p className="mt-1 text-xs text-faint">{t("ModelSwitcher.addModelHint")}</p>
                   )}
                 </div>
               )}

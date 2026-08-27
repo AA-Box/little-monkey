@@ -4,7 +4,7 @@ import {
   visibleProviderModels,
   visibleProviderModelsForProvider,
 } from "../../lib/providerModelSelection";
-import { modelMatchesQuery, providerModelsEmptyStateKey } from "./ModelSwitcher";
+import { modelMatchesQuery } from "./ModelSwitcher";
 
 const models = [{ id: "model-a" }, { id: "model-b" }, { id: "model-c" }];
 
@@ -61,13 +61,6 @@ describe("visibleProviderModels", () => {
     expect(
       visibleProviderModelsForProvider("openai", models, filter, active),
     ).toEqual([{ id: "model-a" }]);
-  });
-});
-
-describe("providerModelsEmptyStateKey", () => {
-  it("distinguishes an empty curation from a provider with no loaded inventory", () => {
-    expect(providerModelsEmptyStateKey(3)).toBe("ModelSwitcher.noCloudModelsSelected");
-    expect(providerModelsEmptyStateKey(0)).toBe("ModelSwitcher.noCloudModelsConfigured");
   });
 });
 
