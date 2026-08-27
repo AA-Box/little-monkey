@@ -530,3 +530,22 @@ describe("effortForTarget", () => {
     expect(fresh.effortForTarget({ kind: "local" })).toBeUndefined();
   });
 });
+
+describe("start", () => {
+  it("refuses an MLX model instead of handing a directory to llama-server", async () => {
+    invokeMock.mockClear();
+    const store = useModelStore.getState();
+    const mlx = makeModel({
+      name: "Qwen3.8 27B OptiQ 4bit",
+      file: "mlx-0123456789ab-Qwen3.8-27B-OptiQ-4bit",
+      path: "/models/mlx-0123456789ab-Qwen3.8-27B-OptiQ-4bit",
+      runtime: "mlx",
+    });
+
+    await expect(store.start(mlx)).rejects.toThrow(/only loads GGUF/);
+    // The point of the guard: no llama_start call was ever made.
+    expect(invokeMock).not.toHaveBeenCalledWith("llama_start", expect.anything());
+    expect(useModelStore.getState().llamaStatus).toBe("stopped");
+    expect(useModelStore.getState().llamaError).toMatch(/MLX model/);
+  });
+});

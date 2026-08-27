@@ -963,6 +963,10 @@ export const en: Record<string, string> = {
   "AddCustomModelForm.sourceHuggingFace": "Hugging Face",
   "AddCustomModelForm.licenseUnknown": "Unknown",
   "AddCustomModelForm.fileLabel": "File",
+  "AddCustomModelForm.bundleDirectoryLabel": "Model directory",
+  "AddCustomModelForm.bundleFileCount": "({{count}} files)",
+  "AddCustomModelForm.mlxRuntimeNote":
+    "A safetensors model for the MLX runtime. It installs and verifies, but chat currently runs on llama.cpp, which loads GGUF files only.",
   "AddCustomModelForm.sizeLabel": "Size",
   "AddCustomModelForm.licenseLabel": "License",
   "AddCustomModelForm.toolCallingLabel": "Tool calling",
