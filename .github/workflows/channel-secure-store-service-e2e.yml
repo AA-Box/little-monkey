@@ -70,30 +70,10 @@ jobs:
           cargo build --manifest-path src-tauri/Cargo.toml --bin monkey-cli
           node scripts/ensure-cli-sidecar-placeholder.mjs
 
-      # macOS admits a Keychain item to the binary that created it, and the
-      # resident service is a different binary. A person answers that
-      # confirmation once; a runner cannot, and the service's first read never
-      # returns. Give the test a keychain whose password it knows, so the
-      # writer can widen its own item's partition list instead of waiting on a
-      # dialog. Nothing outside this job is touched.
-      - name: Create the throwaway keychain this test authorizes itself against
-        if: runner.os == 'macOS'
-        run: |
-          set -euo pipefail
-          security create-keychain -p "$LM_CHANNEL_SECURE_STORE_KEYCHAIN_PASSWORD" lm-e2e.keychain-db
-          security set-keychain-settings -lut 21600 lm-e2e.keychain-db
-          security unlock-keychain -p "$LM_CHANNEL_SECURE_STORE_KEYCHAIN_PASSWORD" lm-e2e.keychain-db
-          security list-keychains -d user -s lm-e2e.keychain-db login.keychain-db
-          security default-keychain -s lm-e2e.keychain-db
-        env:
-          LM_CHANNEL_SECURE_STORE_KEYCHAIN_PASSWORD: channel-secure-store-e2e
-
       - name: Native credential -> installed service -> Telegram worker
         run: >-
           cargo run --manifest-path src-tauri/Cargo.toml
           --example channel_secure_store_service_e2e -- desktop
-        env:
-          LM_CHANNEL_SECURE_STORE_KEYCHAIN_PASSWORD: ${{ runner.os == 'macOS' && 'channel-secure-store-e2e' || '' }}
 
   linux:
     name: native service (ubuntu-22.04)

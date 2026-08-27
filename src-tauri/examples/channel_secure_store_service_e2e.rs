@@ -27,9 +27,6 @@ const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
 const REQUIRE_ENV: &str = "LITTLE_MONKEY_REQUIRE_CHANNEL_SECURE_STORE_SERVICE_E2E";
 const PROFILE_ENV: &str = "LITTLE_MONKEY_PROFILE";
 const EXPECTED_SHA_ENV: &str = "LM_CHANNEL_SECURE_STORE_EXPECTED_SHA256";
-/// Password of the throwaway keychain CI creates for this test. Absent on a
-/// developer machine, where a person can answer the confirmation themselves.
-const KEYCHAIN_PASSWORD_ENV: &str = "LM_CHANNEL_SECURE_STORE_KEYCHAIN_PASSWORD";
 
 fn target_dir() -> PathBuf {
     std::env::var_os("CARGO_TARGET_DIR")
@@ -213,53 +210,7 @@ fn writer(account_id: &str) -> Result<(), String> {
     keyring::Entry::new(&little_monkey_lib::channels::KEYCHAIN_SERVICE, &reference)
         .map_err(|error| format!("open native credential entry: {error}"))?
         .set_password(&secret)
-        .map_err(|error| format!("write native credential: {error}"))?;
-    grant_resident_service_read_access(&reference)
-}
-
-/// Stand in for the one confirmation a person gives on macOS.
-///
-/// macOS admits a Keychain item to the binary that created it. The resident
-/// service is a different binary — as it is in production, where the desktop
-/// writes and the service reads — so its first read waits on a confirmation
-/// dialog. A person answers that once and the service works from then on; an
-/// unattended runner never can, and the read simply never returns.
-///
-/// Widening this one item's partition list is that answer, scripted. It is
-/// deliberately conditional: without the throwaway keychain CI creates, this
-/// does nothing and the boundary stays exactly as a user meets it.
-#[cfg(target_os = "macos")]
-fn grant_resident_service_read_access(reference: &str) -> Result<(), String> {
-    let Ok(password) = std::env::var(KEYCHAIN_PASSWORD_ENV) else {
-        return Ok(());
-    };
-    let output = run_program(
-        "/usr/bin/security",
-        &[
-            "set-generic-password-partition-list",
-            "-S",
-            "apple:,apple-tool:,unsigned:",
-            "-s",
-            &little_monkey_lib::channels::KEYCHAIN_SERVICE,
-            "-a",
-            reference,
-            "-k",
-            &password,
-        ],
-    )?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "could not widen the credential's access list: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn grant_resident_service_read_access(_reference: &str) -> Result<(), String> {
-    Ok(())
+        .map_err(|error| format!("write native credential: {error}"))
 }
 
 fn reader(account_id: &str) -> Result<(), String> {
