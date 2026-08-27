@@ -26,6 +26,11 @@ jobs:
         with:
           toolchain: stable
 
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri
+          key: windows-latest
+
       - name: Stage CLI sidecar placeholder
         shell: pwsh
         run: node scripts/ensure-cli-sidecar-placeholder.mjs
@@ -36,6 +41,33 @@ jobs:
           cargo update --manifest-path src-tauri/Cargo.toml -p tokio --precise 1.52.3
           cargo update --manifest-path src-tauri/Cargo.toml -p tokio-macros --precise 2.7.0
           cargo tree --manifest-path src-tauri/Cargo.toml -p tokio
+
+      - name: Prove the Windows long-running fixture itself
+        shell: pwsh
+        run: |
+          $watch = [System.Diagnostics.Stopwatch]::StartNew()
+          cmd /C "ping -n 3 127.0.0.1 > nul"
+          $code = $LASTEXITCODE
+          $watch.Stop()
+          Write-Host "cmd/ping exit=$code elapsedMs=$($watch.ElapsedMilliseconds)"
+          if ($code -ne 0) { throw "cmd/ping fixture failed with $code" }
+          if ($watch.ElapsedMilliseconds -lt 1500) { throw "cmd/ping fixture exited too quickly: $($watch.ElapsedMilliseconds)ms" }
+
+      - name: Instrument timeout result without changing the commit
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path("src-tauri/src/verify.rs")
+          s = p.read_text()
+          start = "async fn run_command_impl_times_out_a_long_running_command() {"
+          end = "\n    /// A verify command's whole process-table lifecycle"
+          before, rest = s.split(start, 1)
+          body, after = rest.split(end, 1)
+          old = "        assert!(result.timed_out);"
+          if body.count(old) != 1:
+              raise SystemExit(f"expected one timeout assertion in scoped test, found {body.count(old)}")
+          body = body.replace(old, '        assert!(result.timed_out, "{result:?}");', 1)
+          p.write_text(before + start + body + end + after)
 
       - name: Verify Windows timeout
         shell: pwsh
@@ -60,6 +92,7 @@ jobs:
       - name: Commit proven lock correction and remove one-shot workflow
         shell: pwsh
         run: |
+          git restore src-tauri/src/verify.rs
           Remove-Item .github/workflows/pr452-windows-tokio-check.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
