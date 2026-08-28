@@ -96,6 +96,10 @@ pub struct MlxChatStatus {
     pub port: u16,
     pub model_id: String,
     pub model_path: String,
+    /// Whether the running model can read images, from its own `config.json`.
+    /// The chat UI offers an attachment on this, the way it does on
+    /// `llama_status.vision_enabled` for a GGUF with a projector.
+    pub vision: bool,
 }
 
 impl MlxChatStatus {
@@ -105,6 +109,7 @@ impl MlxChatStatus {
             port: 0,
             model_id: String::new(),
             model_path: String::new(),
+            vision: false,
         }
     }
 }
@@ -113,6 +118,7 @@ struct RunningServer {
     port: u16,
     model_id: String,
     model_path: String,
+    vision: bool,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
@@ -137,6 +143,7 @@ impl MlxChatState {
                     port: server.port,
                     model_id: server.model_id.clone(),
                     model_path: server.model_path.clone(),
+                    vision: server.vision,
                 })
                 .unwrap_or_else(MlxChatStatus::stopped),
             Err(_) => MlxChatStatus::stopped(),
@@ -189,6 +196,7 @@ pub async fn start(
     model_id: String,
     model_path: String,
     tool_calling: bool,
+    vision: bool,
 ) -> Result<MlxChatStatus, String> {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -231,6 +239,7 @@ pub async fn start(
         port,
         model_id: model_id.clone(),
         model_path: model_path.clone(),
+        vision,
         shutdown: Some(shutdown_sender),
         task,
     })?;
@@ -239,6 +248,7 @@ pub async fn start(
         port,
         model_id,
         model_path,
+        vision,
     })
 }
 
@@ -505,6 +515,7 @@ pub async fn mlx_chat_start(
         provenance.local_dir_name.clone(),
         model_path,
         provenance.tool_calling,
+        provenance.vision,
     )
     .await
 }
@@ -616,6 +627,7 @@ mod tests {
             model_id.clone(),
             bundle.path.to_string_lossy().to_string(),
             bundle.provenance.tool_calling,
+            bundle.provenance.vision,
         )
         .await
         .expect("the endpoint binds");

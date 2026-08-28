@@ -139,7 +139,11 @@ async function resolveMlxBaseUrl(): Promise<string | null> {
   try {
     const status = await invoke<MlxChatStatusPayload>('mlx_chat_status');
     if (!status?.running || !(status.port > 0)) return null;
-    useModelStore.setState({ mlxChat: status, llamaStatus: 'ready' });
+    useModelStore.setState({
+      mlxChat: status,
+      llamaStatus: 'ready',
+      llamaVisionEnabled: status.vision,
+    });
     return `http://127.0.0.1:${status.port}`;
   } catch {
     return null;

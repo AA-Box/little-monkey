@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { buildManifest, canonicalJson, signedPayload, signManifest } from "./mlxPackage.mjs";
+import { buildManifest, canonicalJson, signedPayload, signManifest, serviceRevision } from "./mlxPackage.mjs";
 
 const CANONICAL_FIXTURE =
   '{"files":[{"executable":true,"path":"bin/python","sha256":"' +
@@ -123,6 +123,33 @@ test("buildManifest sorts files, digests them, and refuses a missing entry point
         }),
       /missing from/,
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a service-only change is a new version", () => {
+  const root = mkdtempSync(join(tmpdir(), "mlx-service-revision-"));
+  try {
+    const first = join(root, "mlx_server.py");
+    const second = join(root, "mlx_video_server.py");
+    writeFileSync(first, "print('a')\n");
+    writeFileSync(second, "print('b')\n");
+
+    const revision = serviceRevision([first, second]);
+    ok(/^[0-9a-f]{12}$/.test(revision), revision);
+    // The caller's ordering is not part of the identity.
+    strictEqual(serviceRevision([second, first]), revision);
+
+    // The whole point: editing a service file moves the version, so the
+    // publish step creates a release instead of clobbering one and the
+    // component hub sees something to upgrade to.
+    writeFileSync(first, "print('a fix')\n");
+    ok(serviceRevision([first, second]) !== revision, "an edited service must change the version");
+
+    // So does dropping one, which would otherwise leave two different package
+    // contents sharing a name.
+    ok(serviceRevision([first]) !== serviceRevision([first, second]));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

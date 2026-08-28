@@ -2382,16 +2382,28 @@ mod tests {
             // A `HostLookup` is a plain `fn` pointer, so the answer has to come from
             // a `static` rather than from a captured argument. One indirection buys
             // a resolver that is otherwise exactly the production one.
-            static ANSWERS: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
-            *ANSWERS.lock().expect("answers lock") = addresses
+            //
+            // Thread-local, not global: the tests below run in parallel, and a
+            // single shared slot meant whichever set its answers second decided
+            // what the other one resolved — the loopback test would be handed
+            // the public address the mixed-answer test had just written and
+            // report that a private name was allowed through. `#[tokio::test]`
+            // runs each body to completion on its own thread, so one slot per
+            // thread is one slot per test.
+            thread_local! {
+                static ANSWERS: std::cell::RefCell<Vec<SocketAddr>> =
+                    const { std::cell::RefCell::new(Vec::new()) };
+            }
+            let resolved = addresses
                 .iter()
                 .map(|text| SocketAddr::new(text.parse().expect("test address parses"), 0))
                 .collect();
+            ANSWERS.with(|answers| *answers.borrow_mut() = resolved);
             fn lookup(
                 _host: String,
             ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>
             {
-                let answers = ANSWERS.lock().expect("answers lock").clone();
+                let answers = ANSWERS.with(|answers| answers.borrow().clone());
                 Box::pin(async move { Ok(answers) })
             }
             lookup
