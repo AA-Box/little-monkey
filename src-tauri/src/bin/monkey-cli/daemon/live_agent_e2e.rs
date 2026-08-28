@@ -41,8 +41,8 @@
 //!   cargo test --bin monkey-cli daemon::live_agent_e2e::slack -- --nocapture
 //! ```
 //!
-//! The run prints a nonce and waits for the operator to send it to the
-//! account. The reply the agent produces carries that nonce back, which is what
+//! The run prints a marker and waits for the operator to send it to the
+//! account. The reply the agent produces carries that marker back, which is what
 //! makes the provider-side check meaningful: the text the provider holds is
 //! the text the model asked for, in the conversation the message came from.
 
@@ -65,7 +65,7 @@ use super::channel_worker::poll_account_once;
 use super::store::{DaemonConfig, DaemonPaths, DaemonStore, JobState};
 use super::DaemonChannelQueue;
 
-/// How long the operator has to send the nonce before the run gives up. Long
+/// How long the operator has to send the marker before the run gives up. Long
 /// because a person has to read the instruction, switch to a client and type;
 /// bounded because a test that waits forever is a test nobody runs twice.
 const INBOUND_WAIT: Duration = Duration::from_secs(240);
@@ -75,7 +75,7 @@ const INBOUND_WAIT: Duration = Duration::from_secs(240);
 const ACK_WAIT: Duration = Duration::from_secs(180);
 
 /// What the deterministic model asks `send_message` to say, ahead of the
-/// nonce. Finding this on the provider's own side is the proof.
+/// marker. Finding this on the provider's own side is the proof.
 const REPLY_PREFIX: &str = "little-monkey live acceptance reply";
 
 fn env(name: &str) -> Option<String> {
@@ -97,10 +97,16 @@ struct LiveAccount {
     /// The credential again, for the provider-side observation call. The
     /// adapter does not hand its own secret back out, and asking the provider
     /// what it holds is a second, separate call.
-    secret: String,
+    ///
+    /// Wrapped rather than a bare field so nothing that prints an account can
+    /// reach it by accident: the only way to the string is `observe_reply`.
+    credential: LiveCredential,
     /// Printed to the operator: where this account can be reached.
     where_to_send: String,
 }
+
+/// The operator's credential, held apart from everything that gets printed.
+struct LiveCredential(String);
 
 fn telegram_account() -> Option<LiveAccount> {
     let token = env("LM_LIVE_TELEGRAM_BOT_TOKEN")?;
@@ -113,7 +119,7 @@ fn telegram_account() -> Option<LiveAccount> {
     Some(LiveAccount {
         kind: ChannelKind::Telegram,
         adapter: Arc::new(adapter),
-        secret: token,
+        credential: LiveCredential(token),
         where_to_send: "your bot's Telegram chat".to_string(),
     })
 }
@@ -129,7 +135,7 @@ fn discord_account() -> Option<LiveAccount> {
     Some(LiveAccount {
         kind: ChannelKind::Discord,
         adapter: Arc::new(adapter),
-        secret: token,
+        credential: LiveCredential(token),
         where_to_send: "a channel your bot can read".to_string(),
     })
 }
@@ -149,7 +155,7 @@ fn slack_account() -> Option<LiveAccount> {
     Some(LiveAccount {
         kind: ChannelKind::Slack,
         adapter: Arc::new(adapter),
-        secret,
+        credential: LiveCredential(secret),
         where_to_send: "a channel your app is in".to_string(),
     })
 }
@@ -159,15 +165,15 @@ fn slack_account() -> Option<LiveAccount> {
 // ---------------------------------------------------------------------------
 
 /// An OpenAI-compatible origin that answers with one `send_message` tool call
-/// carrying the nonce it was asked about.
+/// carrying the marker it was asked about.
 ///
 /// Deterministic rather than a real model because a live acceptance run must
 /// not depend on a model account, and because a reply nobody can predict
 /// cannot be looked for on the provider's side. It is still the production
 /// agent loop that decides to call the tool, dispatches it and writes the
 /// outbox row — this only chooses the words.
-fn live_model_fixture(nonce: &str) -> HttpFixture {
-    let nonce = nonce.to_string();
+fn live_model_fixture(marker: &str) -> HttpFixture {
+    let marker = marker.to_string();
     HttpFixture::spawn(move |head, body, _index| {
         if !head.contains("/chat/completions") {
             return super::channel_agent_e2e::json_response(
@@ -187,7 +193,7 @@ fn live_model_fixture(nonce: &str) -> HttpFixture {
             ]);
         }
         let arguments =
-            serde_json::json!({ "text": format!("{REPLY_PREFIX} {nonce}") }).to_string();
+            serde_json::json!({ "text": format!("{REPLY_PREFIX} {marker}") }).to_string();
         sse_response(&[
             serde_json::json!({
                 "choices": [{
@@ -246,13 +252,13 @@ async fn observe_reply(
 ) -> Observed {
     match account.kind {
         ChannelKind::Telegram => {
-            observe_telegram(&account.secret, conversation_id, provider_message_id).await
+            observe_telegram(&account.credential.0, conversation_id, provider_message_id).await
         }
         ChannelKind::Discord => {
-            observe_discord(&account.secret, conversation_id, provider_message_id).await
+            observe_discord(&account.credential.0, conversation_id, provider_message_id).await
         }
         ChannelKind::Slack => {
-            observe_slack(&account.secret, conversation_id, provider_message_id).await
+            observe_slack(&account.credential.0, conversation_id, provider_message_id).await
         }
         other => Observed::Unsupported(format!(
             "no provider-side read is implemented for {}",
@@ -376,11 +382,11 @@ async fn observe_slack(secret: &str, channel_id: &str, ts: &str) -> Observed {
 
 /// The fallback when the provider cannot be asked: the operator says whether
 /// the reply arrived. Blocks on a typed answer rather than assuming one.
-fn ask_the_operator(nonce: &str, reason: &str) {
+fn ask_the_operator(marker: &str, reason: &str) {
     eprintln!("==============================================================");
     eprintln!("  The provider could not be asked about the reply: {reason}");
     eprintln!("  Look at the conversation. Did a reply containing");
-    eprintln!("      {REPLY_PREFIX} {nonce}");
+    eprintln!("      {REPLY_PREFIX} {marker}");
     eprintln!(
         "  arrive? Type 'yes' and press return within {}s.",
         ACK_WAIT.as_secs()
@@ -416,8 +422,8 @@ async fn run_live_acceptance(root: &Path, account: LiveAccount) {
         return;
     }
 
-    let nonce = format!("lm-live-{}-{}", std::process::id(), now_ms());
-    let model = live_model_fixture(&nonce);
+    let marker = format!("lm-live-{}-{}", std::process::id(), now_ms());
+    let model = live_model_fixture(&marker);
 
     // ---- an isolated profile with one route, pointed at the deterministic
     // model origin. Identical to the fixture acceptance test's setup.
@@ -433,12 +439,14 @@ async fn run_live_acceptance(root: &Path, account: LiveAccount) {
     let mut store = DaemonStore::open(&paths).expect("daemon store");
     seed_channel(&mut store, account.kind, now_ms());
 
+    let provider = account.kind.label();
+    let destination = account.where_to_send.as_str();
     eprintln!("==============================================================");
-    eprintln!("  {} live acceptance", account.kind.label());
-    eprintln!("  Send a message containing exactly this nonce to");
-    eprintln!("  {} now:", account.where_to_send);
+    eprintln!("  {provider} live acceptance");
+    eprintln!("  Send a message containing exactly this marker to");
+    eprintln!("  {destination} now:");
     eprintln!();
-    eprintln!("      {nonce}");
+    eprintln!("      {marker}");
     eprintln!();
     eprintln!("  Waiting up to {}s ...", INBOUND_WAIT.as_secs());
     eprintln!("==============================================================");
@@ -451,7 +459,7 @@ async fn run_live_acceptance(root: &Path, account: LiveAccount) {
     let (job_id, conversation_id) = loop {
         assert!(
             Instant::now() < deadline,
-            "{} live acceptance timed out: no message containing '{nonce}' arrived",
+            "{} live acceptance timed out: no message containing '{marker}' arrived",
             account.kind.as_str()
         );
         poll_account_once(
@@ -469,7 +477,7 @@ async fn run_live_acceptance(root: &Path, account: LiveAccount) {
             .into_iter()
             .find(|event| {
                 event.direction == EventDirection::Inbound
-                    && event.envelope_json.contains(&nonce)
+                    && event.envelope_json.contains(&marker)
                     && event.job_id.is_some()
             });
         if let Some(event) = matched {
@@ -535,7 +543,7 @@ async fn run_live_acceptance(root: &Path, account: LiveAccount) {
         model
             .requests()
             .iter()
-            .any(|request| request.contains(&nonce)),
+            .any(|request| request.contains(&marker)),
         "the agent never sent the inbound message to the model"
     );
     assert!(
@@ -547,7 +555,7 @@ async fn run_live_acceptance(root: &Path, account: LiveAccount) {
     match observe_reply(&account, &conversation_id, &proof.provider_message_id).await {
         Observed::Confirmed(text) => {
             assert!(
-                text.contains(&nonce) && text.contains(REPLY_PREFIX),
+                text.contains(&marker) && text.contains(REPLY_PREFIX),
                 "the provider holds a different message at {}: {text:?}",
                 proof.provider_message_id
             );
@@ -557,7 +565,7 @@ async fn run_live_acceptance(root: &Path, account: LiveAccount) {
                 proof.provider_message_id
             );
         }
-        Observed::Unsupported(reason) => ask_the_operator(&nonce, &reason),
+        Observed::Unsupported(reason) => ask_the_operator(&marker, &reason),
     }
 
     // ---- one of everything: one message in, one run, one reply out.
