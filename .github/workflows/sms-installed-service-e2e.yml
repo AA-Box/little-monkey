@@ -43,15 +43,19 @@ jobs:
           key: sms-installed-service
       - name: Create the build-time CLI sidecar placeholder
         run: node scripts/ensure-cli-sidecar-placeholder.mjs
+      - name: Prove one switch controls the SMS shadow channel
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --bin monkey-cli sms_shadow_enablement_follows_the_number -- --nocapture
       - name: Compile black-box SMS harness
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml --example sms_installed_service_e2e
       - name: Explain live-provider boundary
         run: |
           cat <<'EOF'
-          Hosted PR CI only compiles this harness. Literal SMS acceptance is
-          intentionally run with an operator-owned Twilio, Telnyx or Plivo
-          account and a separate real handset. The carrier must deliver its
-          own signed webhook and delivery receipt; the harness never fabricates
-          either. Final recipient observation is proved by sending the exact
-          hidden-nonce reply back from the handset through the carrier.
+          Hosted PR CI compiles the real-carrier harness and proves the public
+          telecom enable/disable switch keeps the internal SMS channel in lockstep.
+          Literal SMS acceptance is intentionally run with an operator-owned
+          Twilio, Telnyx or Plivo account and a separate real handset. The carrier
+          must deliver its own signed webhook and delivery receipt; the harness
+          never fabricates either. Final recipient observation is proved by
+          sending the exact hidden-nonce reply back from the handset through the
+          carrier.
           EOF
