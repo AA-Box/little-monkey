@@ -308,8 +308,14 @@ async fn run_case(config: &LiveConfig) -> Result<(), String> {
         if pv.get("state").and_then(serde_json::Value::as_str) != Some("connected") { return Err(format!("carrier probe did not prove connected: {pv}")); }
         require_cli(Some(&created), &["channels","policy",&account_id,"--direct","pairing","--group","disabled","--activation","disabled"])?;
         require_cli(Some(&created), &["channels","add-route",RECIPE,"--account",&account_id,"--json"])?;
+        // One operator-visible switch owns the number. The internal SMS channel
+        // must become enabled as a consequence of this command; the harness
+        // deliberately does not call `channels enable` as a workaround.
         require_cli(Some(&created), &["telecom","enable",&account_id])?;
-        require_cli(Some(&created), &["channels","enable",&account_id])?;
+        let channels = require_cli(Some(&created), &["channels","list","--json"])?;
+        let channel_rows: serde_json::Value = serde_json::from_slice(&channels.stdout).map_err(|e| format!("channels list JSON: {e}"))?;
+        let shadow_enabled = channel_rows.as_array().and_then(|rows| rows.iter().find(|row| row.get("account_id").and_then(serde_json::Value::as_str) == Some(&account_id))).and_then(|row| row.get("enabled")).and_then(serde_json::Value::as_bool).unwrap_or(false);
+        if !shadow_enabled { return Err("telecom enable did not enable the SMS shadow channel".into()); }
         let cb = require_cli(Some(&created), &["telecom","callback-url",&account_id,"--json"])?;
         let cv: serde_json::Value = serde_json::from_slice(&cb.stdout).map_err(|e| format!("callback JSON: {e}"))?;
         let callback = cv.get("callback_url").and_then(serde_json::Value::as_str).ok_or_else(|| format!("no callback_url: {cv}"))?;
