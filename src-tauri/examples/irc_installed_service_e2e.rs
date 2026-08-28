@@ -36,9 +36,11 @@ fn target_dir() -> PathBuf {
 }
 
 fn cli() -> PathBuf {
-    target_dir()
-        .join("debug")
-        .join(if cfg!(windows) { "monkey-cli.exe" } else { "monkey-cli" })
+    target_dir().join("debug").join(if cfg!(windows) {
+        "monkey-cli.exe"
+    } else {
+        "monkey-cli"
+    })
 }
 
 fn unique() -> u128 {
@@ -128,13 +130,22 @@ fn require_cli(profile: Option<&str>, args: &[&str]) -> Result<Output, String> {
 fn create_profile() -> Result<String, String> {
     let name = format!("IRC installed-service E2E {}", unique());
     let output = require_cli(None, &["profiles", "create", &name, "--json"])?;
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("profile JSON was invalid: {error}\n{}", output_text(&output)))?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "profile JSON was invalid: {error}\n{}",
+            output_text(&output)
+        )
+    })?;
     payload
         .get("id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| format!("profile JSON had no id: {}", String::from_utf8_lossy(&output.stdout)))
+        .ok_or_else(|| {
+            format!(
+                "profile JSON had no id: {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })
 }
 
 fn add_irc_account(
@@ -155,10 +166,16 @@ fn add_irc_account(
     .to_string();
     let output = require_cli(
         Some(profile),
-        &["channels", "add", "irc", &label, "--config", &config, "--json"],
+        &[
+            "channels", "add", "irc", &label, "--config", &config, "--json",
+        ],
     )?;
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("account JSON was invalid: {error}\n{}", output_text(&output)))?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "account JSON was invalid: {error}\n{}",
+            output_text(&output)
+        )
+    })?;
     payload
         .get("account_id")
         .and_then(serde_json::Value::as_str)
@@ -255,7 +272,9 @@ impl ModelFixture {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
-    stream.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .ok()?;
     let mut received = Vec::new();
     let mut scratch = [0u8; 8192];
     let mut header_end = None;
@@ -372,14 +391,21 @@ fn write_recipe(profile: &str, workspace: &Path, model_base: &str) -> Result<(),
     .map_err(|error| format!("write recipe {}: {error}", path.display()))
 }
 
-fn wait_for_service_and_account(profile: &str, account_id: &str) -> Result<u64, String> {
-    let deadline = Instant::now() + SERVICE_WAIT;
+/// The pid of the installed resident service, once it is running and its
+/// heartbeat is fresh.
+///
+/// Split from the account check below rather than answered together, so the
+/// number this returns is read from `daemon status` and from nothing else. A
+/// pid that came back through a function which had also parsed an account row
+/// is a pid the reader — and code scanning — cannot tell apart from the row
+/// that carries the credential.
+fn wait_for_service_pid(profile: &str, deadline: Instant) -> Result<u64, String> {
     let mut last_status = String::new();
-    let mut last_health = "unknown".to_string();
     while Instant::now() < deadline {
         if let Ok(status_output) = run_cli(Some(profile), &["daemon", "status", "--json"]) {
             if status_output.status.success() {
-                if let Ok(status) = serde_json::from_slice::<serde_json::Value>(&status_output.stdout)
+                if let Ok(status) =
+                    serde_json::from_slice::<serde_json::Value>(&status_output.stdout)
                 {
                     last_status = status.to_string();
                     let running = status
@@ -395,31 +421,7 @@ fn wait_for_service_and_account(profile: &str, account_id: &str) -> Result<u64, 
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or_default();
                     if running && heartbeat && pid != u64::from(std::process::id()) {
-                        let listed = require_cli(Some(profile), &["channels", "list", "--json"])?;
-                        let payload: serde_json::Value = serde_json::from_slice(&listed.stdout)
-                            .map_err(|error| format!("channels list JSON was invalid: {error}"))?;
-                        let account = payload
-                            .get("accounts")
-                            .and_then(serde_json::Value::as_array)
-                            .and_then(|accounts| {
-                                accounts.iter().find(|account| {
-                                    account.get("account_id").and_then(serde_json::Value::as_str)
-                                        == Some(account_id)
-                                })
-                            })
-                            .ok_or_else(|| format!("account {account_id} disappeared"))?;
-                        last_health = account
-                            .get("health")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown")
-                            .to_string();
-                        if last_health == "error" {
-                            return Err("resident daemon could not build/connect the IRC account"
-                                .to_string());
-                        }
-                        if last_health == "connected" {
-                            return Ok(pid);
-                        }
+                        return Ok(pid);
                     }
                 }
             }
@@ -427,7 +429,53 @@ fn wait_for_service_and_account(profile: &str, account_id: &str) -> Result<u64, 
         std::thread::sleep(Duration::from_millis(500));
     }
     Err(format!(
-        "resident service never reached connected IRC health within {}s\nlast daemon status: {last_status}\nlast account health: {last_health}",
+        "installed service never reported a live pid of its own within {}s\nlast daemon status: {last_status}",
+        SERVICE_WAIT.as_secs()
+    ))
+}
+
+/// Whether the installed daemon has this account connected.
+///
+/// Returns nothing on success and a fixed label on failure: the account row is
+/// the one payload here that can carry credential-bearing fields, so no part of
+/// it travels back out to a caller that prints.
+fn wait_for_account_connected(
+    profile: &str,
+    account_id: &str,
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut last_health = "unknown".to_string();
+    while Instant::now() < deadline {
+        let listed = require_cli(Some(profile), &["channels", "list", "--json"])?;
+        let payload: serde_json::Value = serde_json::from_slice(&listed.stdout)
+            .map_err(|error| format!("channels list JSON was invalid: {error}"))?;
+        let account = payload
+            .get("accounts")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|accounts| {
+                accounts.iter().find(|account| {
+                    account
+                        .get("account_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(account_id)
+                })
+            })
+            .ok_or_else(|| format!("account {account_id} disappeared"))?;
+        last_health = account
+            .get("health")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        if last_health == "error" {
+            return Err("resident daemon could not build/connect the IRC account".to_string());
+        }
+        if last_health == "connected" {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Err(format!(
+        "resident service never reached connected IRC health within {}s\nlast account health: {last_health}",
         SERVICE_WAIT.as_secs()
     ))
 }
@@ -512,7 +560,9 @@ fn real_external_irc_round_trip(
                     break;
                 }
                 if line.contains(" 433 ") {
-                    return Err(format!("external IRC nick {external_nick} is already in use"));
+                    return Err(format!(
+                        "external IRC nick {external_nick} is already in use"
+                    ));
                 }
             }
             Ok(None) => return Err("IRC server closed before registration".to_string()),
@@ -611,7 +661,9 @@ fn assert_durable_events(profile: &str, account_id: &str) -> Result<(), String> 
         .iter()
         .filter(|event| {
             event.get("direction").and_then(serde_json::Value::as_str) == Some("inbound")
-                && event.get("ingress_id").is_some_and(|value| !value.is_null())
+                && event
+                    .get("ingress_id")
+                    .is_some_and(|value| !value.is_null())
                 && event.get("job_id").is_some_and(|value| !value.is_null())
         })
         .collect();
@@ -705,7 +757,14 @@ fn run_case(server: &str, port: u16) -> Result<(), String> {
         )?;
         require_cli(
             Some(&created),
-            &["channels", "add-route", RECIPE, "--account", &account, "--json"],
+            &[
+                "channels",
+                "add-route",
+                RECIPE,
+                "--account",
+                &account,
+                "--json",
+            ],
         )?;
         require_cli(Some(&created), &["channels", "enable", &account])?;
 
@@ -716,14 +775,18 @@ fn run_case(server: &str, port: u16) -> Result<(), String> {
                 String::from_utf8_lossy(&installed.stdout)
             ));
         }
-        let first_pid = wait_for_service_and_account(&created, &account)?;
+        let deadline = Instant::now() + SERVICE_WAIT;
+        let first_pid = wait_for_service_pid(&created, deadline)?;
+        wait_for_account_connected(&created, &account, deadline)?;
 
         // Prove the persistent socket is owned by a real resident lifecycle,
         // not merely by the process that configured it: stop/start and require
         // the service to reconnect before the external sender enters.
         require_cli(Some(&created), &["daemon", "stop"])?;
         require_cli(Some(&created), &["daemon", "start"])?;
-        let restarted_pid = wait_for_service_and_account(&created, &account)?;
+        let deadline = Instant::now() + SERVICE_WAIT;
+        let restarted_pid = wait_for_service_pid(&created, deadline)?;
+        wait_for_account_connected(&created, &account, deadline)?;
         if restarted_pid == u64::from(std::process::id()) {
             return Err("restarted daemon pid is the acceptance harness pid".to_string());
         }
