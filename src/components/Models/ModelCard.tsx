@@ -82,6 +82,11 @@ export function ModelCard({
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-2">
           <h3 className="truncate text-sm font-medium text-foreground">{model.name}</h3>
+          {model.runtime === "mlx" && (
+            <span className="inline-flex items-center rounded-full bg-surface-2 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-faint">
+              {t("ModelCard.mlxRuntimeBadge")}
+            </span>
+          )}
           {model.tool_calling && (
             <span className="inline-flex items-center rounded-full bg-surface-2 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-faint">
               {t("ModelCard.toolCallingBadge")}
