@@ -178,7 +178,11 @@ jobs:
         run: |
           set -euo pipefail
           pnpm tauri signer generate --ci -p "" -w "$RUNNER_TEMP/updater.key"
-          echo "TAURI_SIGNING_PRIVATE_KEY_PATH=$RUNNER_TEMP/updater.key" >> "$GITHUB_ENV"
+          # TAURI_SIGNING_PRIVATE_KEY, not _PATH: the generator's help text
+          # names both, but the bundler reads this one, and it takes a path as
+          # readily as the key itself. Passing the path keeps the key material
+          # out of the environment log.
+          echo "TAURI_SIGNING_PRIVATE_KEY=$RUNNER_TEMP/updater.key" >> "$GITHUB_ENV"
           echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
       # `cargo check --lib` proves the code compiles; it does not prove the
       # application still assembles into something a user can install, which is
