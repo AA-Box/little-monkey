@@ -416,16 +416,9 @@ fn set_token(account_id: &str) -> Result<(), String> {
     let mut account = store
         .telecom_account(account_id)?
         .ok_or_else(|| format!("No such account '{account_id}'"))?;
-    let mut secret = String::new();
-    std::io::stdin()
-        .read_line(&mut secret)
-        .map_err(|error| format!("Could not read the credential from stdin: {error}"))?;
-    let secret = secret.trim();
-    if secret.is_empty() {
-        return Err("No credential was supplied on stdin".to_string());
-    }
+    let secret = crate::channels_cli::read_secret_from_stdin()?;
     let reference = little_monkey_lib::channels::telecom_credential_ref(account_id);
-    KeyringChannelSecrets.put(&reference, secret)?;
+    KeyringChannelSecrets.put(&reference, &secret)?;
     account.credential_ref = Some(reference);
     record_credential_change(&mut store, account)?;
     println!(
