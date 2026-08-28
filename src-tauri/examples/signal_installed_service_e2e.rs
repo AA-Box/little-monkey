@@ -51,9 +51,11 @@ fn target_dir() -> PathBuf {
 }
 
 fn cli() -> PathBuf {
-    target_dir()
-        .join("debug")
-        .join(if cfg!(windows) { "monkey-cli.exe" } else { "monkey-cli" })
+    target_dir().join("debug").join(if cfg!(windows) {
+        "monkey-cli.exe"
+    } else {
+        "monkey-cli"
+    })
 }
 
 fn unique() -> u128 {
@@ -96,17 +98,26 @@ fn bounded_output(mut child: std::process::Child, label: &str) -> Result<Output,
 fn run_cli(profile: Option<&str>, args: &[&str]) -> Result<Output, String> {
     let binary = cli();
     if !binary.is_file() {
-        return Err(format!("prebuilt monkey-cli is missing at {}", binary.display()));
+        return Err(format!(
+            "prebuilt monkey-cli is missing at {}",
+            binary.display()
+        ));
     }
     if std::fs::metadata(&binary)
         .map_err(|error| format!("could not stat {}: {error}", binary.display()))?
         .len()
         == 0
     {
-        return Err(format!("{} is the zero-byte Tauri bootstrap placeholder", binary.display()));
+        return Err(format!(
+            "{} is the zero-byte Tauri bootstrap placeholder",
+            binary.display()
+        ));
     }
     let mut command = Command::new(binary);
-    command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     match profile {
         Some(profile) => {
             command.env(PROFILE_ENV, profile);
@@ -137,8 +148,12 @@ fn require_cli(profile: Option<&str>, args: &[&str]) -> Result<Output, String> {
 fn create_profile() -> Result<String, String> {
     let name = format!("Signal installed-service E2E {}", unique());
     let output = require_cli(None, &["profiles", "create", &name, "--json"])?;
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("profile JSON was invalid: {error}\n{}", output_text(&output)))?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "profile JSON was invalid: {error}\n{}",
+            output_text(&output)
+        )
+    })?;
     payload
         .get("id")
         .and_then(serde_json::Value::as_str)
@@ -155,10 +170,16 @@ fn add_account(profile: &str, helper: &Path, bot_account: &str) -> Result<String
     .to_string();
     let output = require_cli(
         Some(profile),
-        &["channels", "add", "signal", &label, "--config", &config, "--json"],
+        &[
+            "channels", "add", "signal", &label, "--config", &config, "--json",
+        ],
     )?;
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("account JSON was invalid: {error}\n{}", output_text(&output)))?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "account JSON was invalid: {error}\n{}",
+            output_text(&output)
+        )
+    })?;
     payload
         .get("account_id")
         .and_then(serde_json::Value::as_str)
@@ -184,7 +205,9 @@ impl ModelFixture {
         std::thread::spawn(move || {
             for incoming in listener.incoming() {
                 let Ok(mut stream) = incoming else { break };
-                let Some((head, body)) = read_http_request(&mut stream) else { continue };
+                let Some((head, body)) = read_http_request(&mut stream) else {
+                    continue;
+                };
                 log.lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .push(format!("{head}\n{body}"));
@@ -247,7 +270,9 @@ impl ModelFixture {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
-    stream.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .ok()?;
     let mut received = Vec::new();
     let mut scratch = [0u8; 8192];
     let mut header_end = None;
@@ -288,7 +313,9 @@ fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn json_response(body: &str) -> String {
@@ -342,37 +369,44 @@ fn write_recipe(profile: &str, workspace: &Path, model_base: &str) -> Result<(),
     .map_err(|error| format!("write recipe {}: {error}", path.display()))
 }
 
-fn wait_for_service_and_account(profile: &str, account_id: &str) -> Result<u64, String> {
-    let deadline = Instant::now() + SERVICE_WAIT;
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// The pid of the installed resident service, once it is running and its
+/// heartbeat is fresh.
+///
+/// Split from the account check below rather than answered together, so the
+/// number this returns is read from `daemon status` and from nothing else. A
+/// pid that came back through a function which had also parsed an account row
+/// is a pid the reader — and code scanning — cannot tell apart from the row
+/// that carries the credential.
+fn wait_for_service_pid(profile: &str, deadline: Instant) -> Result<u64, String> {
     let mut last_status = String::new();
-    let mut last_health = "unknown".to_string();
     while Instant::now() < deadline {
         if let Ok(status_output) = run_cli(Some(profile), &["daemon", "status", "--json"]) {
             if status_output.status.success() {
-                if let Ok(status) = serde_json::from_slice::<serde_json::Value>(&status_output.stdout) {
+                if let Ok(status) =
+                    serde_json::from_slice::<serde_json::Value>(&status_output.stdout)
+                {
                     last_status = status.to_string();
-                    let running = status.get("service_running").and_then(serde_json::Value::as_bool).unwrap_or(false);
-                    let heartbeat = status.get("heartbeat_fresh").and_then(serde_json::Value::as_bool).unwrap_or(false);
-                    let pid = status.get("pid").and_then(serde_json::Value::as_u64).unwrap_or_default();
+                    let running = status
+                        .get("service_running")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let heartbeat = status
+                        .get("heartbeat_fresh")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let pid = status
+                        .get("pid")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default();
                     if running && heartbeat && pid != u64::from(std::process::id()) {
-                        let listed = require_cli(Some(profile), &["channels", "list", "--json"])?;
-                        let payload: serde_json::Value = serde_json::from_slice(&listed.stdout)
-                            .map_err(|error| format!("channels list JSON was invalid: {error}"))?;
-                        let account = payload.get("accounts").and_then(serde_json::Value::as_array)
-                            .and_then(|accounts| accounts.iter().find(|account| {
-                                account.get("account_id").and_then(serde_json::Value::as_str) == Some(account_id)
-                            }))
-                            .ok_or_else(|| format!("account {account_id} disappeared"))?;
-                        last_health = account.get("health").and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown").to_string();
-                        if last_health == "error" || last_health == "unsupported" {
-                            return Err(format!(
-                                "resident daemon could not establish the real Signal helper/account: {last_health}"
-                            ));
-                        }
-                        if last_health == "connected" {
-                            return Ok(pid);
-                        }
+                        return Ok(pid);
                     }
                 }
             }
@@ -380,7 +414,69 @@ fn wait_for_service_and_account(profile: &str, account_id: &str) -> Result<u64, 
         std::thread::sleep(Duration::from_millis(500));
     }
     Err(format!(
-        "resident service never reached connected Signal health within {}s\nlast daemon status: {last_status}\nlast account health: {last_health}",
+        "installed service never reported a live pid of its own within {}s\nlast daemon status: {last_status}",
+        SERVICE_WAIT.as_secs()
+    ))
+}
+
+/// Whether the installed daemon has this account connected **now**.
+///
+/// `since_ms` is what makes this an answer rather than an echo. Account health
+/// is a stored row, and the daemon that wrote it may be a process that has
+/// since been stopped — so after a restart the row still says `connected` for
+/// as long as it takes the new process to reach the provider and write its own
+/// verdict. A harness that posts the moment it reads that row is posting into a
+/// window where nothing is listening, and a socket provider does not replay
+/// what it delivered to nobody. Requiring `last_probe_at_ms` to be at or after
+/// the moment this wait began is what makes `connected` mean the running
+/// process said so.
+///
+/// Returns nothing on success and a fixed label on failure: the account row is
+/// the one payload here that can carry credential-bearing fields, so no part of
+/// it travels back out to a caller that prints.
+fn wait_for_account_connected(
+    profile: &str,
+    account_id: &str,
+    since_ms: u64,
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut last_health = "unknown".to_string();
+    let mut last_probe: Option<u64> = None;
+    while Instant::now() < deadline {
+        let listed = require_cli(Some(profile), &["channels", "list", "--json"])?;
+        let payload: serde_json::Value = serde_json::from_slice(&listed.stdout)
+            .map_err(|error| format!("channels list JSON was invalid: {error}"))?;
+        let account = payload
+            .get("accounts")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|accounts| {
+                accounts.iter().find(|account| {
+                    account
+                        .get("account_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(account_id)
+                })
+            })
+            .ok_or_else(|| format!("account {account_id} disappeared"))?;
+        last_health = account
+            .get("health")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        last_probe = account
+            .get("last_probe_at_ms")
+            .and_then(serde_json::Value::as_u64);
+        let fresh = last_probe.is_some_and(|probed| probed >= since_ms);
+        if fresh && last_health == "error" {
+            return Err("resident daemon could not build/connect the Signal account".to_string());
+        }
+        if fresh && last_health == "connected" {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Err(format!(
+        "resident service never reported connected Signal health of its own within {}s\nlast account health: {last_health} (last probe {last_probe:?}, waiting for one at or after {since_ms})",
         SERVICE_WAIT.as_secs()
     ))
 }
@@ -424,7 +520,9 @@ fn assert_external_account(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let output = bounded_output(
-        command.spawn().map_err(|error| format!("start signal-cli listAccounts: {error}"))?,
+        command
+            .spawn()
+            .map_err(|error| format!("start signal-cli listAccounts: {error}"))?,
         "signal-cli listAccounts",
     )?;
     if !output.status.success() {
@@ -452,10 +550,20 @@ fn drain_external_pending(
         helper,
         external_data_dir,
         external_account,
-        &["receive", "--timeout", "1", "--max-messages", "100", "--ignore-attachments"],
+        &[
+            "receive",
+            "--timeout",
+            "1",
+            "--max-messages",
+            "100",
+            "--ignore-attachments",
+        ],
     )?;
     if !output.status.success() {
-        return Err(format!("external Signal pre-drain failed: {}", output_text(&output)));
+        return Err(format!(
+            "external Signal pre-drain failed: {}",
+            output_text(&output)
+        ));
     }
     Ok(())
 }
@@ -474,7 +582,10 @@ fn send_external_marker(
         &["send", "-m", marker, bot_account],
     )?;
     if !output.status.success() {
-        return Err(format!("external Signal send failed: {}", output_text(&output)));
+        return Err(format!(
+            "external Signal send failed: {}",
+            output_text(&output)
+        ));
     }
     Ok(())
 }
@@ -507,13 +618,25 @@ fn wait_for_external_reply(
             helper,
             external_data_dir,
             external_account,
-            &["receive", "--timeout", "10", "--max-messages", "25", "--ignore-attachments"],
+            &[
+                "receive",
+                "--timeout",
+                "10",
+                "--max-messages",
+                "25",
+                "--ignore-attachments",
+            ],
         )?;
         if !output.status.success() {
-            return Err(format!("external Signal receive failed: {}", output_text(&output)));
+            return Err(format!(
+                "external Signal receive failed: {}",
+                output_text(&output)
+            ));
         }
         for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
             if received_expected_reply(&value, bot_account, &expected) {
                 eprintln!("external Signal identity observed exact generated reply");
                 return Ok(());
@@ -537,16 +660,26 @@ fn assert_durable_events(profile: &str, account_id: &str) -> Result<(), String> 
     )?;
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("channel events JSON was invalid: {error}"))?;
-    let events = payload.get("events").and_then(serde_json::Value::as_array)
+    let events = payload
+        .get("events")
+        .and_then(serde_json::Value::as_array)
         .ok_or_else(|| "channel events JSON had no events array".to_string())?;
-    let inbound = events.iter().filter(|event| {
-        event.get("direction").and_then(serde_json::Value::as_str) == Some("inbound")
-            && event.get("ingress_id").is_some_and(|value| !value.is_null())
-            && event.get("job_id").is_some_and(|value| !value.is_null())
-    }).count();
-    let outbound = events.iter().filter(|event| {
-        event.get("direction").and_then(serde_json::Value::as_str) == Some("outbound")
-    }).count();
+    let inbound = events
+        .iter()
+        .filter(|event| {
+            event.get("direction").and_then(serde_json::Value::as_str) == Some("inbound")
+                && event
+                    .get("ingress_id")
+                    .is_some_and(|value| !value.is_null())
+                && event.get("job_id").is_some_and(|value| !value.is_null())
+        })
+        .count();
+    let outbound = events
+        .iter()
+        .filter(|event| {
+            event.get("direction").and_then(serde_json::Value::as_str) == Some("outbound")
+        })
+        .count();
     if inbound != 1 || outbound != 1 {
         return Err(format!(
             "expected exactly one accepted Signal inbound and one outbound event, got inbound={inbound}, outbound={outbound}: {payload}"
@@ -555,12 +688,24 @@ fn assert_durable_events(profile: &str, account_id: &str) -> Result<(), String> 
     Ok(())
 }
 
-fn dump_diagnostics(profile: &str) {
+fn dump_diagnostics(profile: &str, account_id: Option<&str>) {
     if let Ok(output) = run_cli(Some(profile), &["daemon", "status", "--json"]) {
         eprintln!("--- daemon status ---\n{}", output_text(&output));
     }
     if let Ok(output) = run_cli(Some(profile), &["channels", "list", "--json"]) {
         eprintln!("--- channels ---\n{}", output_text(&output));
+    }
+    // The question every failure here starts with: did anything arrive at all?
+    // Without this, "no reply within the timeout" cannot be told apart from
+    // "the provider never delivered the message", and the two have nothing in
+    // common to fix.
+    if let Some(account_id) = account_id {
+        if let Ok(output) = run_cli(
+            Some(profile),
+            &["channels", "events", account_id, "--limit", "20", "--json"],
+        ) {
+            eprintln!("--- channel events ---\n{}", output_text(&output));
+        }
     }
 }
 
@@ -583,7 +728,8 @@ fn run_case() -> Result<(), String> {
     }
 
     let helper = PathBuf::from(
-        std::env::var("SIGNAL_E2E_HELPER").map_err(|_| "SIGNAL_E2E_HELPER is required".to_string())?,
+        std::env::var("SIGNAL_E2E_HELPER")
+            .map_err(|_| "SIGNAL_E2E_HELPER is required".to_string())?,
     );
     let bot_account = std::env::var("SIGNAL_E2E_BOT_ACCOUNT")
         .map_err(|_| "SIGNAL_E2E_BOT_ACCOUNT is required".to_string())?;
@@ -594,7 +740,10 @@ fn run_case() -> Result<(), String> {
             .map_err(|_| "SIGNAL_E2E_EXTERNAL_DATA_DIR is required".to_string())?,
     );
     if !helper.is_file() {
-        return Err(format!("signal-cli helper does not exist: {}", helper.display()));
+        return Err(format!(
+            "signal-cli helper does not exist: {}",
+            helper.display()
+        ));
     }
     if bot_account == external_account {
         return Err("Signal E2E requires two independent registered identities".to_string());
@@ -619,18 +768,41 @@ fn run_case() -> Result<(), String> {
         account_id = Some(account.clone());
         require_cli(
             Some(&created),
-            &["channels", "policy", &account, "--direct", "open", "--group", "open", "--activation", "always"],
+            &[
+                "channels",
+                "policy",
+                &account,
+                "--direct",
+                "open",
+                "--group",
+                "open",
+                "--activation",
+                "always",
+            ],
         )?;
         require_cli(
             Some(&created),
-            &["channels", "add-route", RECIPE, "--account", &account, "--json"],
+            &[
+                "channels",
+                "add-route",
+                RECIPE,
+                "--account",
+                &account,
+                "--json",
+            ],
         )?;
         require_cli(Some(&created), &["channels", "enable", &account])?;
         require_cli(Some(&created), &["daemon", "install"])?;
-        let first_pid = wait_for_service_and_account(&created, &account)?;
+        let waiting_since_ms = now_ms();
+        let deadline = Instant::now() + SERVICE_WAIT;
+        let first_pid = wait_for_service_pid(&created, deadline)?;
+        wait_for_account_connected(&created, &account, waiting_since_ms, deadline)?;
         require_cli(Some(&created), &["daemon", "stop"])?;
         require_cli(Some(&created), &["daemon", "start"])?;
-        let restarted_pid = wait_for_service_and_account(&created, &account)?;
+        let waiting_since_ms = now_ms();
+        let deadline = Instant::now() + SERVICE_WAIT;
+        let restarted_pid = wait_for_service_pid(&created, deadline)?;
+        wait_for_account_connected(&created, &account, waiting_since_ms, deadline)?;
         if first_pid == restarted_pid {
             return Err(format!(
                 "daemon restart reused pid {first_pid}; installed-service process boundary was not independently demonstrated"
@@ -663,7 +835,10 @@ fn run_case() -> Result<(), String> {
                 "installed agent never sent the Signal marker to the model: {requests:?}"
             ));
         }
-        if !requests.iter().any(|request| request.contains(r#"\"name\":\"send_message\""#)) {
+        if !requests
+            .iter()
+            .any(|request| request.contains(r#"\"name\":\"send_message\""#))
+        {
             return Err("send_message was never offered to the installed Signal agent".to_string());
         }
         if requests.len() < 2 {
@@ -677,7 +852,7 @@ fn run_case() -> Result<(), String> {
 
     if result.is_err() {
         if let Some(profile) = profile.as_deref() {
-            dump_diagnostics(profile);
+            dump_diagnostics(profile, account_id.as_deref());
         }
     }
     cleanup(profile.as_deref(), account_id.as_deref());
