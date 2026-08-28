@@ -315,6 +315,18 @@ therefore **not** claimed as verified here.
   never on a command line or in a stored error, a failing tunnel client's own
   words reach the operator, the public base survives a restart, and a spoofed
   `X-Forwarded-*` cannot move the URL a carrier signature is verified against.
+- The credential boundary between the two programs that share one: you paste a
+  token into Settings, the desktop hands it to the bundled CLI on stdin, and
+  the **installed** background service — a launchd agent, a systemd `--user`
+  unit or a Scheduled Task — reads it back and builds the account's adapter
+  from it. Run against a real installed service on macOS, Windows and Linux.
+  The writing program is the point rather than an implementation detail: macOS
+  returns a keychain item only to the executable that created it and puts a
+  confirmation dialog in front of anybody else, which a background service has
+  nobody to answer, so the credential is written by the same binary the daemon
+  runs. Two programs share one credential and only one of them ever writes
+  it, so the item stays scoped to a single executable rather than being opened
+  up to anything running as you.
 
 ### Needs your own account, hardware or exposure to verify
 
@@ -337,5 +349,16 @@ silently when they are absent, and never bundles or defaults one.
   through your provider, and background behaviour.
 - `signal-cli` and the iMessage helper against a registered account and a real
   Messages database, including macOS Full Disk Access.
+- How narrowly macOS scopes that keychain item, and that the scope survives an
+  app update. CI runs the path itself against a real launchd service, but with
+  unsigned development binaries, whose keychain items are not scoped the way a
+  signed build's are — that half is a property of the identity your release is
+  signed with. The acceptance run on your own machine: install the release
+  build, add a channel and paste its token, start the daemon from Settings, and
+  confirm the account leaves `disconnected` on its own with no keychain prompt
+  — then install an update and confirm it still does. If a prompt ever appears,
+  answering it once with **Always Allow** is enough, and
+  `monkey channels probe <account>` from a terminal says whether the credential
+  can be read at all.
 - Two installations paired as peers over a real network and a real TLS identity.
 - Microphone and speaker behaviour for Talk on your own hardware.

@@ -6,13 +6,21 @@
 //! independent writer process -> OS credential store -> installed OS user
 //! service -> daemon process -> KeyringChannelSecrets -> Telegram poll loop.
 //!
+//! The writer is the production sidecar's own `channels set-token`, because
+//! that is what the desktop's `channels_set_credential` now runs: macOS admits
+//! a keychain item to the executable that created it and asks a person about
+//! any other, so the process that writes the credential decides whether the
+//! installed daemon can read it unattended. This harness is what proves that,
+//! and the same asymmetry is asserted from the other side — a binary that did
+//! not write the item must not be handed it.
+//!
 //! The successful Telegram transport/agent/reply half is covered separately by
 //! the existing `daemon::channel_agent_e2e` acceptance with deterministic
 //! Telegram/model fixtures. Keeping the two tests compositional avoids adding a
 //! production-only endpoint override to the resident daemon.
 
 use sha2::{Digest, Sha256};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -56,6 +64,16 @@ fn output_text(output: &Output) -> String {
 }
 
 fn run_cli(profile: Option<&str>, args: &[&str]) -> Result<Output, String> {
+    run_cli_stdin(profile, args, None)
+}
+
+/// Run the production CLI, optionally handing it a secret the way the desktop
+/// bridge does: one line on stdin, never an argument.
+fn run_cli_stdin(
+    profile: Option<&str>,
+    args: &[&str],
+    stdin: Option<&str>,
+) -> Result<Output, String> {
     let binary = cli();
     if !binary.is_file() {
         return Err(format!(
@@ -77,11 +95,22 @@ fn run_cli(profile: Option<&str>, args: &[&str]) -> Result<Output, String> {
     if let Some(profile) = profile {
         command.env(PROFILE_ENV, profile);
     }
-    let child = command
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("failed to start monkey-cli {args:?}: {error}"))?;
+    if let Some(secret) = stdin {
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("monkey-cli {args:?} had no stdin"))?
+            .write_all(format!("{secret}\n").as_bytes())
+            .map_err(|error| format!("failed to write monkey-cli {args:?} stdin: {error}"))?;
+    }
     bounded_output(child, &format!("monkey-cli {args:?}"))
 }
 
@@ -106,6 +135,23 @@ fn bounded_output(mut child: std::process::Child, label: &str) -> Result<Output,
     child
         .wait_with_output()
         .map_err(|error| format!("failed to collect {label} output: {error}"))
+}
+
+fn require_cli_with_stdin(
+    profile: Option<&str>,
+    args: &[&str],
+    stdin: &str,
+) -> Result<Output, String> {
+    let output = run_cli_stdin(profile, args, Some(stdin))?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(format!(
+            "monkey-cli {args:?} failed with {}\n{}",
+            output.status,
+            output_text(&output)
+        ))
+    }
 }
 
 fn require_cli(profile: Option<&str>, args: &[&str]) -> Result<Output, String> {
@@ -155,62 +201,34 @@ fn exact_digest(secret: &str) -> String {
         .collect()
 }
 
-fn run_boundary_child(
-    mode: &str,
+/// Spawn this harness's own binary to read back the credential the CLI wrote,
+/// checking the exact bytes survived the round trip through the native store.
+fn run_reader_child(
     profile: &str,
     account_id: &str,
-    stdin: Option<&str>,
-    expected_sha256: Option<&str>,
+    expected_sha256: &str,
 ) -> Result<(), String> {
     let mut command = Command::new(std::env::current_exe().map_err(|error| error.to_string())?);
     command
-        .arg(mode)
+        .arg("reader")
         .arg(account_id)
         .env(PROFILE_ENV, profile)
+        .env(EXPECTED_SHA_ENV, expected_sha256)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(expected) = expected_sha256 {
-        command.env(EXPECTED_SHA_ENV, expected);
-    }
-    if stdin.is_some() {
-        command.stdin(Stdio::piped());
-    }
-    let mut child = command
+    let child = command
         .spawn()
-        .map_err(|error| format!("failed to start native {mode} child: {error}"))?;
-    if let Some(value) = stdin {
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("native {mode} child had no stdin"))?
-            .write_all(value.as_bytes())
-            .map_err(|error| format!("failed to write native {mode} stdin: {error}"))?;
-    }
-    let output = bounded_output(child, &format!("native {mode} child"))?;
+        .map_err(|error| format!("failed to start native reader child: {error}"))?;
+    let output = bounded_output(child, "native reader child")?;
     if output.status.success() {
         Ok(())
     } else {
         Err(format!(
-            "native {mode} child failed with {}\n{}",
+            "native reader child failed with {}\n{}",
             output.status,
             output_text(&output)
         ))
     }
-}
-
-fn writer(account_id: &str) -> Result<(), String> {
-    let mut secret = String::new();
-    std::io::stdin()
-        .read_to_string(&mut secret)
-        .map_err(|error| format!("read writer secret from stdin: {error}"))?;
-    if secret.is_empty() || secret.len() > 8192 {
-        return Err("writer received an invalid credential length".to_string());
-    }
-    let reference = little_monkey_lib::channels::credential_ref(account_id);
-    keyring::Entry::new(&little_monkey_lib::channels::KEYCHAIN_SERVICE, &reference)
-        .map_err(|error| format!("open native credential entry: {error}"))?
-        .set_password(&secret)
-        .map_err(|error| format!("write native credential: {error}"))
 }
 
 fn reader(account_id: &str) -> Result<(), String> {
@@ -338,16 +356,28 @@ fn run_real_service_case(case: &str) -> Result<(), String> {
         let secret = format!("999999999:{case}-{}-{}", std::process::id(), nonce());
         redact = secret.clone();
 
-        // Process A: desktop boundary. Secret travels only via stdin.
-        run_boundary_child("writer", &created, &account, Some(&secret), None)?;
+        // Process A: the desktop boundary, which is `channels set-token` in the
+        // production sidecar with the secret on stdin — the same command, in
+        // the same executable, that `channels_set_credential` runs. It writes
+        // the keychain item and records the credential on the account row.
+        require_cli_with_stdin(
+            Some(&created),
+            &["channels", "set-token", &account],
+            &secret,
+        )?;
 
-        // Mirrors the production mutation after channels_set_credential writes
-        // the native keychain item.
-        require_cli(Some(&created), &["channels", "mark-credential", &account])?;
-
-        // Process B: exact byte persistence; only a digest crosses into it.
-        let digest = exact_digest(&secret);
-        run_boundary_child("reader", &created, &account, None, Some(&digest))?;
+        // Process B: exact byte persistence, with only a digest crossing into
+        // it. Everywhere but macOS: a Windows credential and a Secret Service
+        // item belong to the login, so any program of this user reads them
+        // back. On macOS a keychain item belongs to the program that stored it
+        // and every other one gets a confirmation dialog, so this harness — not
+        // the writer — is precisely the process that may be made to wait for an
+        // answer nobody is there to give. What macOS proves instead is the
+        // production path itself, below: the installed service reads the
+        // credential because it *is* the executable that wrote it.
+        if !cfg!(target_os = "macos") {
+            run_reader_child(&created, &account, &exact_digest(&secret))?;
+        }
 
         require_cli(Some(&created), &["channels", "enable", &account])?;
 
@@ -480,12 +510,10 @@ fn dump_daemon_logs(profile: &str, secret: &str) {
 fn real_main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let mode = args.next().ok_or_else(|| {
-        "usage: channel_secure_store_service_e2e <desktop|writer|reader> [account_id]"
-            .to_string()
+        "usage: channel_secure_store_service_e2e <desktop|reader> [account_id]".to_string()
     })?;
 
     match mode.as_str() {
-        "writer" => writer(&args.next().ok_or_else(|| "writer requires account id".to_string())?),
         "reader" => reader(&args.next().ok_or_else(|| "reader requires account id".to_string())?),
         "desktop" => run_real_service_case("desktop"),
         other => Err(format!("unknown mode {other}")),
