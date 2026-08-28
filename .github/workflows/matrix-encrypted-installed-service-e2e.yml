@@ -60,11 +60,12 @@ jobs:
             -e SYNAPSE_REPORT_STATS=no \
             "$SYNAPSE_IMAGE" generate
 
-          # This secret is disposable and local to this isolated CI homeserver.
-          # It exists only so the official Synapse registration helper can
-          # create two real users without exposing public registration.
+          # The official container deliberately owns /data as its unprivileged
+          # Synapse UID. Keep that ownership intact and append the disposable CI
+          # registration secret with runner privilege instead of chmod/chowning
+          # the production server's data directory.
           printf '\nregistration_shared_secret: "little-monkey-matrix-e2e-registration"\n' \
-            >> "$data/homeserver.yaml"
+            | sudo tee -a "$data/homeserver.yaml" >/dev/null
 
           docker run -d --name lm-synapse \
             -p 8008:8008 \
@@ -144,9 +145,6 @@ jobs:
             -d '{}' \
             "$base/_matrix/client/v3/rooms/$encoded_room/join" >/dev/null
 
-          # Ensure the room is actually encrypted before Little Monkey is
-          # installed. The Rust harness independently verifies both message
-          # events are m.room.encrypted on Synapse as well.
           encryption="$(curl --fail --silent --show-error \
             -H "Authorization: Bearer $external_token" \
             "$base/_matrix/client/v3/rooms/$encoded_room/state/m.room.encryption")"
