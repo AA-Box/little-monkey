@@ -331,9 +331,23 @@ therefore **not** claimed as verified here.
 ### Needs your own account, hardware or exposure to verify
 
 These have production code and protocol-level tests; what has not happened is a
-run against the real service. `cargo test --bin monkey-cli -- daemon::live_smoke`
-is the opt-in harness — it reads credentials from the environment, passes
-silently when they are absent, and never bundles or defaults one.
+run against the real service. Two opt-in harnesses exist, both reading
+credentials from the environment, both passing silently when they are absent,
+and neither bundling or defaulting one:
+
+- `cargo test --bin monkey-cli -- daemon::live_smoke` proves a real account's
+  outbound transport, through the same outbox path every reply takes.
+- `cargo test --bin monkey-cli -- daemon::live_agent_e2e` proves the whole
+  path: a message you send to your own account becomes a durable turn, a real
+  daemon run and a real agent reply, and the provider is then asked over its
+  own API whether it holds that reply. Telegram, Discord and Slack today; the
+  provider-independent middle is shared, so a further provider supplies only
+  its account, its credential and how to read the reply back.
+
+Signal, Mattermost, IRC and iMessage additionally have their own live round
+trips (`a_live_signal_round_trip` and its siblings), which prove a real
+helper or server connection and a real outbound send — not an inbound message
+from somebody else, and not the agent.
 
 - Any provider against a real account: that the live service behaves as the
   adapter expects, and that your token has the scopes it needs.
