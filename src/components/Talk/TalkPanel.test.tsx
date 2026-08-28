@@ -34,8 +34,8 @@ const CONFIG: CompanionConfig = {
   overlayShortcut: 'CommandOrControl+Shift+Space',
   voice: {
     backend: 'local_whisper',
-    whisperBinary: '/usr/local/bin/whisper',
-    whisperModel: '/models/base.bin',
+    whisperBinary: null,
+    whisperModel: null,
     providerId: null,
     extensionId: null,
     extensionCapabilityId: null,
