@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
+import { resolveLoadedLocalEndpoint } from "./targetRouting";
+
 import { beginDurableRun, defaultRunBudgets, type DurableRunRecorder } from "./durableRun";
 import {
   buildModelTargetInventory,
@@ -73,12 +75,6 @@ export interface GeneratePmPlanResult {
   target: ModelTargetSnapshot;
 }
 
-interface LlamaStatusResult {
-  status: "stopped" | "starting" | "ready" | "error";
-  port: number;
-  model_path: string | null;
-}
-
 const activeControllers = new Map<string, AbortController>();
 
 export function cancelPmPlanGeneration(key: string): boolean {
@@ -128,11 +124,8 @@ async function resolveTarget(target: ModelTargetSnapshot): Promise<ResolvedTarge
   if (target.kind === "ollama") {
     return { kind: "ollama", baseUrl: target.baseUrl, model: target.model };
   }
-  const status = await invoke<LlamaStatusResult>("llama_status");
-  if (status.status !== "ready" || status.model_path !== target.modelPath) {
-    throw new Error(`${target.displayName} is no longer loaded in the managed llama.cpp runtime.`);
-  }
-  return { kind: "local", baseUrl: `http://127.0.0.1:${status.port}`, modelLabel: target.displayName };
+  const baseUrl = await resolveLoadedLocalEndpoint(target.modelPath, target.displayName);
+  return { kind: "local", baseUrl, modelLabel: target.displayName };
 }
 
 const PM_COPILOT_SYSTEM_PROMPT = [

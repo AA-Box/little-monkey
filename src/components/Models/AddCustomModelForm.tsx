@@ -310,6 +310,10 @@ export function ResolvedModelReferenceDetails({
   const { t } = useT();
   const sourceKey = resolvedModelSourceKey(resolved.source);
   const licenseName = resolved.licenseName?.trim() || t("AddCustomModelForm.licenseUnknown");
+  // A directory-shaped repository installs every file it lists, so say how many
+  // and which runtime wants them rather than showing one file name and a digest
+  // that belongs to none of them.
+  const bundleFileCount = resolved.bundleFiles?.length ?? 0;
 
   return (
     <>
@@ -324,10 +328,24 @@ export function ResolvedModelReferenceDetails({
           {sourceKey ? t(sourceKey) : resolved.source}
         </span>
       </div>
+      {resolved.runtime === "mlx" && (
+        <p className="mt-2 text-[11px] text-faint">{t("AddCustomModelForm.mlxRuntimeNote")}</p>
+      )}
       <dl className="mt-3 grid gap-x-4 gap-y-2 text-xs sm:grid-cols-2">
         <div>
-          <dt className="text-faint">{t("AddCustomModelForm.fileLabel")}</dt>
-          <dd className="mt-0.5 break-all font-mono text-foreground">{resolved.fileName}</dd>
+          <dt className="text-faint">
+            {bundleFileCount > 0
+              ? t("AddCustomModelForm.bundleDirectoryLabel")
+              : t("AddCustomModelForm.fileLabel")}
+          </dt>
+          <dd className="mt-0.5 break-all font-mono text-foreground">
+            {resolved.fileName}
+            {bundleFileCount > 0 && (
+              <span className="ml-1 font-sans text-faint">
+                {t("AddCustomModelForm.bundleFileCount", { count: bundleFileCount })}
+              </span>
+            )}
+          </dd>
         </div>
         <div>
           <dt className="text-faint">{t("AddCustomModelForm.sizeLabel")}</dt>

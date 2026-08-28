@@ -171,6 +171,14 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
         "runtime process management for the production model service",
     ),
     (
+        "mlx_chat.rs",
+        Class::HostUtility,
+        "`cp -Rc` with two paths this test built, to stage a copy of the installed MLX \
+         runtime under a temporary root; spawns only in its own ignored end-to-end test. \
+         The MLX service process itself is not started here — `m3_production.rs` above \
+         owns that, and this file only speaks HTTP to the hub in front of it",
+    ),
+    (
         "m4_runtime.rs",
         Class::ManagedService,
         "workflow node execution, bounded by the definition's own per-node budgets",
