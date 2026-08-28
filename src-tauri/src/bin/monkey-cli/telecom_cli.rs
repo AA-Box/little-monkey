@@ -465,6 +465,30 @@ fn record_credential_change(
     Ok(())
 }
 
+/// Mirror the operator-visible telephony switch onto the internal SMS channel.
+///
+/// A number is one product account. The channel row is an implementation detail
+/// that exists so SMS can reuse messaging policy/routing/outbox semantics; users
+/// must not have to discover and enable that row separately. Keeping the mirror
+/// here also means disabling a number immediately stops its SMS worker on the
+/// next channel-runtime reconciliation.
+fn sync_sms_channel_enabled(
+    store: &mut DaemonStore,
+    account: &TelecomAccountRecord,
+    now: i64,
+) -> Result<(), String> {
+    crate::daemon::telecom_worker::ensure_sms_channel_account(store, account, now)?;
+    let mut channel = store
+        .channel_account(&account.account_id)?
+        .ok_or_else(|| format!("SMS channel for '{}' was not created", account.account_id))?;
+    if channel.enabled != account.enabled {
+        channel.enabled = account.enabled;
+        channel.updated_at_ms = now;
+        store.upsert_channel_account(&channel)?;
+    }
+    Ok(())
+}
+
 fn enable(account_id: &str, enabled: bool) -> Result<(), String> {
     let mut store = store()?;
     let mut account = store
@@ -475,9 +499,11 @@ fn enable(account_id: &str, enabled: bool) -> Result<(), String> {
             "Account '{account_id}' has no credential yet; run `monkey telecom set-token {account_id}` first"
         ));
     }
+    let now = now_ms();
     account.enabled = enabled;
-    account.updated_at_ms = now_ms();
+    account.updated_at_ms = now;
     store.upsert_telecom_account(&account)?;
+    sync_sms_channel_enabled(&mut store, &account, now)?;
     println!(
         "{account_id} is now {}.",
         if enabled { "enabled" } else { "disabled" }
@@ -672,7 +698,7 @@ fn calls(account_id: &str, limit: u32, json: bool) -> Result<(), String> {
 
 /// Point this account's carrier at a different place, or update its non-secret
 /// settings.
-///
+//!
 /// The public URL is the one value every signature check depends on: Twilio and
 /// Plivo sign the URL their callback was posted to, so a base that no longer
 /// matches the carrier console rejects every genuine callback. An operator
@@ -859,6 +885,48 @@ mod tests {
         );
         assert_eq!(value["limits"]["max_concurrent_calls"], 1);
         assert_eq!(value["limits"]["recording_enabled"], false);
+    }
+
+    #[test]
+    fn sms_shadow_enablement_follows_the_number() {
+        let mut store = DaemonStore::open_in_memory().expect("open store");
+        let mut telecom = account();
+        telecom.enabled = false;
+        store
+            .upsert_telecom_account(&telecom)
+            .expect("store telecom account");
+
+        sync_sms_channel_enabled(&mut store, &telecom, 1_700_000_000_100)
+            .expect("create disabled SMS shadow");
+        assert!(
+            !store
+                .channel_account(&telecom.account_id)
+                .expect("read SMS shadow")
+                .expect("SMS shadow exists")
+                .enabled
+        );
+
+        telecom.enabled = true;
+        sync_sms_channel_enabled(&mut store, &telecom, 1_700_000_000_200)
+            .expect("enable SMS shadow");
+        assert!(
+            store
+                .channel_account(&telecom.account_id)
+                .expect("read enabled SMS shadow")
+                .expect("SMS shadow exists")
+                .enabled
+        );
+
+        telecom.enabled = false;
+        sync_sms_channel_enabled(&mut store, &telecom, 1_700_000_000_300)
+            .expect("disable SMS shadow");
+        assert!(
+            !store
+                .channel_account(&telecom.account_id)
+                .expect("read disabled SMS shadow")
+                .expect("SMS shadow exists")
+                .enabled
+        );
     }
 
     #[test]
