@@ -2378,32 +2378,47 @@ mod tests {
             );
         }
 
-        fn answering(addresses: &'static [&'static str]) -> HostLookup {
-            // A `HostLookup` is a plain `fn` pointer, so the answer has to come from
-            // a `static` rather than from a captured argument. One indirection buys
-            // a resolver that is otherwise exactly the production one.
-            //
-            // Thread-local, not global: the tests below run in parallel, and a
-            // single shared slot meant whichever set its answers second decided
-            // what the other one resolved — the loopback test would be handed
-            // the public address the mixed-answer test had just written and
-            // report that a private name was allowed through. `#[tokio::test]`
-            // runs each body to completion on its own thread, so one slot per
-            // thread is one slot per test.
-            thread_local! {
-                static ANSWERS: std::cell::RefCell<Vec<SocketAddr>> =
-                    const { std::cell::RefCell::new(Vec::new()) };
-            }
+        /// Answers keyed by the name they answer for.
+        ///
+        /// A thread-local slot looked like enough — libtest gives each test its
+        /// own thread — but the answer is read inside the resolver's future,
+        /// which is `Send` and need not be polled on the thread that wrote it.
+        /// Six of these tests running at once could then hand each other their
+        /// addresses, and the mixed-answer test would be refused for a loopback
+        /// address it never asked about. Keying by name removes the question
+        /// rather than betting on where a future runs: [`resolved`] mints one
+        /// name per call and nothing else answers to it.
+        fn answers() -> &'static Mutex<std::collections::BTreeMap<String, Vec<SocketAddr>>> {
+            static ANSWERS: OnceLock<Mutex<std::collections::BTreeMap<String, Vec<SocketAddr>>>> =
+                OnceLock::new();
+            ANSWERS.get_or_init(Default::default)
+        }
+
+        fn answering(host: &str, addresses: &'static [&'static str]) -> HostLookup {
+            // A `HostLookup` is a plain `fn` pointer, so the answer has to come
+            // from a `static` rather than from a captured argument. One
+            // indirection buys a resolver that is otherwise exactly the
+            // production one.
             let resolved = addresses
                 .iter()
                 .map(|text| SocketAddr::new(text.parse().expect("test address parses"), 0))
                 .collect();
-            ANSWERS.with(|answers| *answers.borrow_mut() = resolved);
+            answers()
+                .lock()
+                .expect("test answers")
+                .insert(host.to_ascii_lowercase(), resolved);
             fn lookup(
-                _host: String,
+                host: String,
             ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>
             {
-                let answers = ANSWERS.with(|answers| answers.borrow().clone());
+                // An unknown name answers with nothing rather than with somebody
+                // else's addresses, which is also what a real lookup would do.
+                let answers = answers()
+                    .lock()
+                    .expect("test answers")
+                    .get(&host)
+                    .cloned()
+                    .unwrap_or_default();
                 Box::pin(async move { Ok(answers) })
             }
             lookup
@@ -2413,14 +2428,22 @@ mod tests {
             addresses: &'static [&'static str],
             destinations: PublicDestinations,
         ) -> Result<Vec<SocketAddr>, EgressRule> {
+            // One name per call: two tests resolving at the same moment must not
+            // be asking the same question.
+            static NEXT_NAME: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let host = format!(
+                "catalog-{}.test",
+                NEXT_NAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
             let resolver = PublicOnlyResolver {
                 destinations,
                 guard: "test",
-                lookup: answering(addresses),
+                lookup: answering(&host, addresses),
             };
             match reqwest::dns::Resolve::resolve(
                 &resolver,
-                reqwest::dns::Name::from_str("catalog.test").expect("test name parses"),
+                reqwest::dns::Name::from_str(&host).expect("test name parses"),
             )
             .await
             {
