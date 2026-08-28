@@ -6,6 +6,10 @@ Literal acceptance path:
 
 The daemon itself never reads `chat.db` and never sends Apple events. The production helper is the privileged macOS boundary, exactly as in the shipped adapter. The acceptance harness also never opens `chat.db`, never constructs the adapter, and never runs `osascript` directly.
 
+## Public-app provisioning model
+
+Little Monkey ships no shared Apple identity and asks for no Apple ID or Apple password. Each installer uses the Messages account already signed in on their own Mac, installs the matching helper, grants that helper the two normal macOS permissions it needs, and approves their own correspondents through Little Monkey's pairing/allow-list policy. The acceptance test uses exactly that production model rather than a repository-owned iMessage account.
+
 ## Required Mac setup
 
 Use a real Mac signed in to Messages. Install the matching `little-monkey-imessage-helper` and grant that exact helper binary:
