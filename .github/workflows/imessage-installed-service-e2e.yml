@@ -12,20 +12,6 @@ on:
       - "src-tauri/Cargo.toml"
       - "src-tauri/Cargo.lock"
   workflow_dispatch:
-    inputs:
-      helper_path:
-        description: "Absolute path to the already-authorized little-monkey-imessage-helper on the self-hosted Mac"
-        required: true
-        type: string
-      handle:
-        description: "Messages/iMessage handle label configured for this Little Monkey account"
-        required: true
-        type: string
-      destination:
-        description: "Human-readable destination shown while asking the independent iMessage user to send markers"
-        required: false
-        default: "the independent Messages conversation"
-        type: string
 
 permissions:
   contents: read
@@ -50,43 +36,15 @@ jobs:
         run: node scripts/ensure-cli-sidecar-placeholder.mjs
       - name: Compile black-box iMessage harness
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml --example imessage_installed_service_e2e
-      - name: Explain why hosted macOS CI does not execute Messages
+      - name: Explain the real-provider execution boundary
         run: |
           cat <<'EOF'
-          The live acceptance requires a Mac signed into a real Messages account,
-          the matching little-monkey-imessage-helper with Full Disk Access and
-          Messages Automation permission, and an independent iMessage identity.
-          Hosted CI has none of those user/TCC boundaries. The real harness must
-          run on an authorized Mac; it accepts only real helper-reported Messages
-          rows and requires the independent Messages client to observe the exact
-          agent-generated reply.
+          The literal acceptance is intentionally run from an interactive shell
+          on a Mac signed into the operator's own Messages account. That Mac must
+          have the matching little-monkey-imessage-helper with Full Disk Access
+          and Messages Automation permission, plus an independent iMessage user
+          who sends the pairing/execution markers and copy/pastes the received
+          reply. Hosted Actions cannot own those Apple/TCC boundaries or supply
+          interactive recipient observation, so CI compiles the exact harness
+          but does not mislabel a non-provider run as iMessage E2E evidence.
           EOF
-
-  live:
-    name: real iMessage -> installed daemon -> agent -> real iMessage
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, macOS]
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
-      - name: Validate the authorized helper boundary
-        env:
-          IMESSAGE_E2E_HELPER_PATH: ${{ inputs.helper_path }}
-        run: |
-          test -n "$IMESSAGE_E2E_HELPER_PATH"
-          test -x "$IMESSAGE_E2E_HELPER_PATH"
-          "$IMESSAGE_E2E_HELPER_PATH" --help >/dev/null 2>&1 || true
-      - name: Stage build-time CLI sidecar placeholder
-        run: node scripts/ensure-cli-sidecar-placeholder.mjs
-      - name: Build the real production CLI and acceptance harness
-        run: |
-          cargo build --locked --manifest-path src-tauri/Cargo.toml --bin monkey-cli
-          cargo build --locked --manifest-path src-tauri/Cargo.toml --example imessage_installed_service_e2e
-      - name: Run literal installed-service iMessage acceptance
-        env:
-          LITTLE_MONKEY_REQUIRE_IMESSAGE_INSTALLED_SERVICE_E2E: "1"
-          IMESSAGE_E2E_HELPER_PATH: ${{ inputs.helper_path }}
-          IMESSAGE_E2E_HANDLE: ${{ inputs.handle }}
-          IMESSAGE_E2E_DESTINATION: ${{ inputs.destination }}
-        run: src-tauri/target/debug/examples/imessage_installed_service_e2e

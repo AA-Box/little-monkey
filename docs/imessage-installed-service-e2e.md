@@ -32,12 +32,17 @@ IMESSAGE_E2E_DESTINATION=<optional human-readable conversation/identity for inst
 
 There is intentionally no `IMESSAGE_E2E_EXTERNAL_SENDER`. The real sender is discovered from the production pairing challenge and approved through `monkey channels approve`, just as a public Little Monkey installation discovers and authorizes its own users.
 
-## Run locally on an authorized Mac
+## Run on an authorized Mac
+
+Run this from an interactive terminal in the same macOS login session whose Messages account and TCC grants the helper uses:
 
 ```bash
 node scripts/ensure-cli-sidecar-placeholder.mjs
 cargo build --locked --manifest-path src-tauri/Cargo.toml --bin monkey-cli
 cargo build --locked --manifest-path src-tauri/Cargo.toml --example imessage_installed_service_e2e
+LITTLE_MONKEY_REQUIRE_IMESSAGE_INSTALLED_SERVICE_E2E=1 \
+IMESSAGE_E2E_HELPER_PATH=/absolute/path/to/little-monkey-imessage-helper \
+IMESSAGE_E2E_HANDLE=<handle> \
 src-tauri/target/debug/examples/imessage_installed_service_e2e
 ```
 
@@ -52,12 +57,12 @@ A full pass requires:
 3. the agent dispatches the production message tool and returns to the model after tool execution;
 4. the production helper reports the send successful, causing the exact generated reply to become a durable accepted outbound event in the same conversation;
 5. because Messages exposes no stable identifier for a just-sent message, the outbound event correctly keeps its `local:<outbox-id>` identifier rather than inventing a provider id;
-6. the independent iMessage client receives the reply and copy/pastes the exact text back to the harness for exact comparison apart from the terminal newline.
+6. the independent iMessage client receives the reply and the operator copy/pastes that exact text into the harness for exact comparison apart from the terminal newline.
 
-A successful helper RPC or a durable outbox row alone is not recipient delivery proof. The independent Messages client observation is required for the final assertion.
+A successful helper RPC or a durable outbox row alone is not recipient delivery proof. The independent Messages-client observation is required for the final assertion.
 
 ## GitHub Actions
 
-Pull-request CI runs the macOS compile job only. A hosted runner cannot honestly execute the live acceptance because it is not signed in to the operator's Messages account and cannot possess that user's Full Disk Access / Automation grants.
+Pull-request and manual GitHub Actions runs compile the exact macOS harness. They deliberately do **not** claim a live iMessage pass: hosted runners are not signed into the operator's Messages account and cannot possess that user's Full Disk Access / Automation grants, while a background Actions shell also cannot honestly substitute for interactive recipient observation.
 
-The workflow also exposes a manual `workflow_dispatch` live job on a trusted `self-hosted, macOS` runner. Supply the absolute path of the already-authorized helper plus the account handle. The live job first verifies that the helper path exists and is executable; the harness then performs the production `probe` through the installed daemon, which is the authoritative check for Full Disk Access, Automation authorization, and a usable Messages account. The job builds the production CLI/harness, installs the real daemon, and runs the same literal interactive pairing + round-trip acceptance described above.
+The literal live command therefore runs locally on the operator's authorized Mac. A live success may only be reported when that command completes with the real helper, installed daemon and independent iMessage identity; a green hosted compile is structural evidence only.
