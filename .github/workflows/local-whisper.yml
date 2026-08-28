@@ -167,6 +167,19 @@ jobs:
         run: node scripts/ensure-cli-sidecar-placeholder.mjs
       - name: Verify and stage the built-in Whisper model
         run: pnpm stage:whisper
+      # tauri.conf.json carries an updater public key, so the bundler refuses to
+      # run without the matching private key: "A public key has been found, but
+      # no private key". Release builds take that from secrets. This job must
+      # not, and on a pull request could not anyway, so it signs with a key
+      # generated seconds earlier and thrown away with the runner. Nothing here
+      # is published; the only claim is that the package assembles and carries
+      # the model.
+      - name: Generate a throwaway updater signing key
+        run: |
+          set -euo pipefail
+          pnpm tauri signer generate --ci -p "" -w "$RUNNER_TEMP/updater.key"
+          echo "TAURI_SIGNING_PRIVATE_KEY_PATH=$RUNNER_TEMP/updater.key" >> "$GITHUB_ENV"
+          echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
       # `cargo check --lib` proves the code compiles; it does not prove the
       # application still assembles into something a user can install, which is
       # the only form the built-in speech backend ever reaches them in.
