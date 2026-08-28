@@ -467,6 +467,22 @@ pub fn read_key_with_env(provider_id: &str) -> Result<String, String> {
     read_key(provider_id)
 }
 
+/// Stores a provider key, recreating the entry rather than replacing its
+/// value.
+///
+/// macOS keeps an item's original access list when only the password is
+/// replaced, so an entry an older desktop build wrote would stay scoped to the
+/// desktop binary however many times `monkey-cli` overwrote it. Deleting first
+/// makes the writer the owner, which is the entire point of the write living
+/// in the CLI — see [`providers_set_key`].
+pub fn write_key(provider_id: &str, api_key: &str) -> Result<(), String> {
+    let _ = remove_key_impl(provider_id);
+    keyring::Entry::new(&KEYCHAIN_SERVICE, provider_id)
+        .map_err(|e| format!("Failed to access keychain: {e}"))?
+        .set_password(api_key)
+        .map_err(|e| format!("Failed to save key to keychain: {e}"))
+}
+
 fn remove_key_impl(provider_id: &str) -> Result<(), String> {
     let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, provider_id)
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
@@ -731,6 +747,14 @@ pub fn providers_remove_custom(app: AppHandle, id: String) -> Result<(), String>
 /// touching the keychain — a bad key is never persisted — then saves it and
 /// returns the model list immediately so the caller doesn't need a second
 /// round trip.
+///
+/// The save itself is delegated to the bundled `monkey-cli`, over stdin, for
+/// the reason issue #457 named: macOS scopes a keychain item to the
+/// executable that created it, and a daemon-run agent reads this key from
+/// `monkey-cli` ([`read_key_with_env`], via `chat::stream_turn`) with nobody
+/// present to answer the confirmation a foreign-binary read raises. Writing
+/// it from the binary that reads it in the background is what makes that read
+/// silent.
 #[tauri::command]
 pub async fn providers_set_key(
     app: AppHandle,
@@ -742,14 +766,16 @@ pub async fn providers_set_key(
         return Err("API key is required".to_string());
     }
 
+    // Resolves an unknown or extension id to an error before it can become a
+    // positional argument.
     let base_url = find_base_url(&app, &id)?;
     let models = fetch_models(&base_url, &id, &api_key).await?;
 
-    let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, &id)
-        .map_err(|e| format!("Failed to access keychain: {e}"))?;
-    entry
-        .set_password(&api_key)
-        .map_err(|e| format!("Failed to save key to keychain: {e}"))?;
+    crate::daemon_commands::command_with_stdin(
+        vec!["providers".into(), "set-key".into(), id],
+        api_key,
+    )
+    .await?;
 
     Ok(models)
 }

@@ -202,6 +202,6 @@ describe("the telephony bridge", () => {
     expect(body).toContain('"set-token".into()');
     expect(body).not.toContain("set_password");
     expect(body).not.toMatch(/args\.push\(secret/);
-    expect(telecomCli).toContain("read_line(&mut secret)");
+    expect(telecomCli).toContain("read_secret_from_stdin()");
   });
 });

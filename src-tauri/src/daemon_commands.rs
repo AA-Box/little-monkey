@@ -519,9 +519,15 @@ fn run_cli_with_secret(args: Vec<String>, secret: String) -> Result<String, Stri
 /// sidecar *is* the daemon's executable, so writing through it makes the writer
 /// and the reader one identity and the daemon's read unattended. It stays off
 /// the argument vector for the original reason: argv is world-readable.
-fn run_cli_with_stdin(args: Vec<String>, secret: String) -> Result<String, String> {
+/// Taking the program as a parameter keeps the pipe plumbing testable
+/// without the bundled binary.
+fn run_cli_with_stdin(
+    program: PathBuf,
+    args: Vec<String>,
+    secret: String,
+) -> Result<String, String> {
     use std::io::Write;
-    let mut child = Command::new(cli_path())
+    let mut child = Command::new(program)
         .args(&args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -546,20 +552,19 @@ pub(crate) async fn command_with_stdin(
     args: Vec<String>,
     secret: String,
 ) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || run_cli_with_stdin(args, secret))
+    tokio::task::spawn_blocking(move || run_cli_with_stdin(cli_path(), args, secret))
         .await
         .map_err(|error| error.to_string())?
 }
 
-/// One line, because that is what the sidecar reads. A credential carrying a
-/// newline would otherwise be stored truncated and fail much later as a bad
-/// token, so it is refused here instead.
-fn one_line_secret(label: &str, secret: &str) -> Result<(), String> {
+/// The same bounds the sidecar's own store enforces, checked before a secret
+/// leaves the app so the failure names the field the user is looking at.
+///
+/// No line-break rule: the sidecar reads its stdin to EOF, and a Google Chat
+/// account's credential is a pasted service-account key file.
+fn bounded_secret(label: &str, secret: &str) -> Result<(), String> {
     if secret.is_empty() || secret.len() > 8192 {
         return Err(format!("A {label} must contain 1-8192 bytes"));
-    }
-    if secret.contains('\n') || secret.contains('\r') {
-        return Err(format!("A {label} may not contain a line break"));
     }
     Ok(())
 }
@@ -2872,6 +2877,31 @@ pub async fn remote_audit(limit: u32) -> Result<Value, String> {
 mod tests {
     use super::*;
 
+    /// A credential reaches the sidecar on stdin and nowhere else, and a
+    /// sidecar that refuses it fails the save instead of reporting success.
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_travels_on_stdin_and_a_failing_sidecar_is_an_error() {
+        let echoed = run_cli_with_stdin(
+            PathBuf::from("/bin/cat"),
+            Vec::new(),
+            "s3cret-token".to_string(),
+        )
+        .expect("the child should receive the secret on stdin");
+        assert_eq!(echoed, "s3cret-token\n");
+
+        let refused = run_cli_with_stdin(
+            PathBuf::from("/bin/sh"),
+            vec![
+                "-c".to_string(),
+                "cat >/dev/null; echo 'no such account' >&2; exit 1".to_string(),
+            ],
+            "s3cret-token".to_string(),
+        )
+        .expect_err("a non-zero sidecar exit must not read as a saved credential");
+        assert_eq!(refused, "no such account");
+    }
+
     #[test]
     fn fixed_bridge_rejects_unsafe_inputs() {
         assert!(validate_id("run", "run-1").is_ok());
@@ -4424,7 +4454,7 @@ pub async fn channels_set_public_url(url: Option<String>) -> Result<(), String> 
 #[tauri::command]
 pub async fn channels_set_credential(account_id: String, secret: String) -> Result<(), String> {
     let account_id = channel_id("account id", &account_id)?;
-    one_line_secret("messaging credential", &secret)?;
+    bounded_secret("messaging credential", &secret)?;
     command_with_stdin(
         vec!["channels".into(), "set-token".into(), account_id],
         secret,
@@ -4515,7 +4545,7 @@ pub async fn channels_exposure_set_tunnel(
 /// back, so the sidecar is also the process that has to have written it.
 #[tauri::command]
 pub async fn channels_exposure_set_token(token: String) -> Result<(), String> {
-    one_line_secret("tunnel credential", &token)?;
+    bounded_secret("tunnel credential", &token)?;
     command_with_stdin(
         vec![
             "channels".into(),
@@ -5354,7 +5384,7 @@ pub async fn telecom_remove(account_id: String) -> Result<(), String> {
 #[tauri::command]
 pub async fn telecom_set_credential(account_id: String, secret: String) -> Result<(), String> {
     let account_id = channel_id("account id", &account_id)?;
-    one_line_secret("carrier credential", &secret)?;
+    bounded_secret("carrier credential", &secret)?;
     command_with_stdin(
         vec!["telecom".into(), "set-token".into(), account_id],
         secret,
