@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,9 +52,131 @@ def _load_model(model_path: str):
     return load(model_path)
 
 
+class _Job:
+    """One generation, run on the worker thread, consumed by a request thread."""
+
+    _DONE = object()
+
+    def __init__(self, prompt: str, max_tokens: int, temperature) -> None:
+        self.prompt = prompt
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        # Bounded: a client that stops reading must slow the model down rather
+        # than let deltas pile up without limit in memory.
+        self._output: queue.Queue = queue.Queue(maxsize=256)
+        self._cancelled = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+    def run(self, model, tokenizer) -> None:
+        """Runs on the worker thread. Every MLX array stays on that thread."""
+        from mlx_lm import stream_generate  # noqa: PLC0415 - see _load_model
+
+        sampler = None
+        if self.temperature is not None:
+            from mlx_lm.sample_utils import make_sampler  # noqa: PLC0415
+
+            sampler = make_sampler(temp=float(self.temperature))
+        try:
+            for response in stream_generate(
+                model,
+                tokenizer,
+                self.prompt,
+                max_tokens=self.max_tokens,
+                **({"sampler": sampler} if sampler is not None else {}),
+            ):
+                if self._cancelled.is_set():
+                    break
+                if not self._put(response.text):
+                    break
+        except Exception as error:  # noqa: BLE001 - any failure must reach the user
+            self._put(error)
+        self._output.put(self._DONE)
+
+    def _put(self, item) -> bool:
+        """Hands one item to the reader, giving up if it has gone away.
+
+        A dropped connection is the supervisor cancelling. Blocking forever on
+        a full queue nobody is draining would wedge the worker thread, and with
+        it every later request.
+        """
+        while not self._cancelled.is_set():
+            try:
+                self._output.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def deltas(self):
+        """Yields text on the request thread until the generation ends."""
+        while True:
+            item = self._output.get()
+            if item is self._DONE:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+
+class _GenerationWorker:
+    """Owns the model, and every MLX array made from it.
+
+    MLX binds a stream to the thread that created the arrays. Generating on any
+    other thread raises "There is no Stream(gpu, 0) in current thread." (mlx
+    0.32.0), and no per-thread `set_default_device` or `set_default_stream`
+    recovers it — the weights were loaded elsewhere. A threading HTTP server
+    that generates inside the request handler therefore fails *every* request
+    while looking perfectly healthy: port connectable, model resident, each
+    generation dying inside `stream_generate`.
+
+    So one thread loads the model and runs every generation, and request
+    threads hand it work. The server stays threaded, which keeps `/health`,
+    unknown routes and a second caller answerable while a generation is in
+    flight — the alternative, a single-threaded server, would let one slow
+    reader block the supervisor's next connection entirely.
+    """
+
+    def __init__(self, model_path: str) -> None:
+        self.model = None
+        self.tokenizer = None
+        self._failure: BaseException | None = None
+        self._loaded = threading.Event()
+        self._jobs: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run, args=(model_path,), name="mlx-generate", daemon=True
+        )
+        self._thread.start()
+
+    def wait_until_loaded(self) -> None:
+        """Blocks until the weights are resident, re-raising a load failure.
+
+        The supervisor reads a connectable port as ready, so `main` must not
+        bind before this returns.
+        """
+        self._loaded.wait()
+        if self._failure is not None:
+            raise self._failure
+
+    def submit(self, job: _Job) -> None:
+        self._jobs.put(job)
+
+    def _run(self, model_path: str) -> None:
+        try:
+            self.model, self.tokenizer = _load_model(model_path)
+        except BaseException as error:  # noqa: BLE001 - reported by wait_until_loaded
+            self._failure = error
+            self._loaded.set()
+            return
+        self._loaded.set()
+        while True:
+            self._jobs.get().run(self.model, self.tokenizer)
+
+
 class _Handler(BaseHTTPRequestHandler):
-    # Set on the server instance by `main`.
-    model = None
+    # Set on the class by `main`.
+    worker = None
     tokenizer = None
 
     protocol_version = "HTTP/1.1"
@@ -137,21 +260,19 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _generate(self, prompt: str, max_tokens: int, temperature):
-        from mlx_lm import stream_generate  # noqa: PLC0415 - see _load_model
+        """Hands the work to the model's own thread and yields what comes back.
 
-        sampler = None
-        if temperature is not None:
-            from mlx_lm.sample_utils import make_sampler  # noqa: PLC0415
-
-            sampler = make_sampler(temp=float(temperature))
-        for response in stream_generate(
-            self.model,
-            self.tokenizer,
-            prompt,
-            max_tokens=max_tokens,
-            **({"sampler": sampler} if sampler is not None else {}),
-        ):
-            yield response.text
+        Nothing here touches an MLX array; see `_GenerationWorker` for why that
+        is the whole point.
+        """
+        job = _Job(prompt, max_tokens, temperature)
+        self.worker.submit(job)
+        try:
+            yield from job.deltas()
+        finally:
+            # Reached on a dropped connection too, which is how the supervisor
+            # cancels: the worker stops rather than generating into nothing.
+            job.cancel()
 
     def _prompt_from(self, request: dict) -> str:
         """Renders the turns with the model's own chat template.
@@ -182,7 +303,10 @@ def main(argv: list[str] | None = None) -> int:
         # tampered argument vector cannot turn this into a network service.
         parser.error("--host must be 127.0.0.1")
 
-    _Handler.model, _Handler.tokenizer = _load_model(arguments.model)
+    worker = _GenerationWorker(arguments.model)
+    worker.wait_until_loaded()
+    _Handler.worker = worker
+    _Handler.tokenizer = worker.tokenizer
 
     server = ThreadingHTTPServer((arguments.host, arguments.port), _Handler)
     # Only after the weights are resident: the supervisor reads a connectable

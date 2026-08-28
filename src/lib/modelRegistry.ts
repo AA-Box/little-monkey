@@ -35,6 +35,10 @@ export interface ModelInfo {
     text: boolean;
     image_input: boolean;
   };
+  /** Which local runtime loads this model: a GGUF runs on the bundled
+   *  llama.cpp, a safetensors directory on MLX. Absent on anything installed
+   *  before the field existed, which was always a GGUF. */
+  runtime?: "llama_cpp" | "mlx";
 }
 
 /**
