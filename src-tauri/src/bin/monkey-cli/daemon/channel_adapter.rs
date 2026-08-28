@@ -1140,7 +1140,18 @@ impl ChannelSecrets for KeyringChannelSecrets {
         if secret.is_empty() || secret.len() > 8192 {
             return Err("A messaging credential must contain 1-8192 bytes".to_string());
         }
-        Self::entry(credential_ref)?
+        let entry = Self::entry(credential_ref)?;
+        // Replacing a macOS keychain item's value keeps the access list it was
+        // created with, and that list names one executable: whoever stored it.
+        // A credential an older build wrote from the desktop process would
+        // therefore stay scoped to the desktop app and keep this binary — the
+        // one the resident daemon runs — waiting on a confirmation dialog.
+        // Removing it first means the item is always *created* here. Best
+        // effort on purpose: what has to succeed is the write below, and an
+        // entry that could not be removed is one `set_password` still replaces
+        // exactly as it used to.
+        let _ = entry.delete_credential();
+        entry
             .set_password(secret)
             .map_err(|error| format!("Failed to save the messaging credential: {error}"))
     }

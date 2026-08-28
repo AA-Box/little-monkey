@@ -57,8 +57,9 @@ pub enum TelecomCmd {
     },
     /// Store the carrier credential, read from stdin.
     SetToken { account_id: String },
-    /// Record that the app stored a credential in the keychain for this
-    /// account. The secret itself never travels through an argument.
+    /// Record that a credential was stored in the keychain for this account
+    /// outside this command. The app's own save runs `set-token` instead, so
+    /// the entry belongs to the binary the daemon reads it back from.
     MarkCredential { account_id: String },
     /// Enable or disable an account.
     Enable {

@@ -662,8 +662,9 @@ fn unverified_health(detail: &str, now_ms: i64) -> ChannelHealth {
 
 /// Record that `account_id`'s credential was just written: point the row at
 /// its keychain entry and drop the connectivity claim the old credential had
-/// earned. Every credential write path — the CLI's `set-token`, the desktop's
-/// save (which arrives here as `mark-credential`) — funnels through this.
+/// earned. Every credential write path funnels through this — `set-token`,
+/// which is also what the desktop's save runs, and `mark-credential` for a
+/// keychain entry somebody stored by hand.
 pub(crate) fn record_credential_change(
     store: &mut DaemonStore,
     account_id: &str,
@@ -724,7 +725,10 @@ fn read_secret_from_stdin() -> Result<String, String> {
     Ok(secret)
 }
 
-/// Point the account at its keychain entry after the app stored one there.
+/// Point the account at a keychain entry stored outside this command.
+///
+/// The desktop no longer needs this — its save runs `set-token` here, so the
+/// entry is written by this binary, the one the daemon reads it back from.
 pub fn mark_credential(account_id: &str) -> Result<(), String> {
     let mut store = store()?;
     record_credential_change(&mut store, account_id)?;

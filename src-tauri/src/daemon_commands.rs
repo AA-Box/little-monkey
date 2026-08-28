@@ -509,6 +509,61 @@ fn run_cli_with_secret(args: Vec<String>, secret: String) -> Result<String, Stri
     finish_cli_output(output)
 }
 
+/// Run the sidecar with a secret on its stdin.
+///
+/// The writer's identity is the point, not just the transport. macOS admits a
+/// keychain item to the executable that created it and asks a human about
+/// anybody else, so a credential the desktop wrote in its own process is one
+/// the installed daemon can only read behind a confirmation dialog — which,
+/// for a background LaunchAgent, means a read that never returns. The bundled
+/// sidecar *is* the daemon's executable, so writing through it makes the writer
+/// and the reader one identity and the daemon's read unattended. It stays off
+/// the argument vector for the original reason: argv is world-readable.
+fn run_cli_with_stdin(args: Vec<String>, secret: String) -> Result<String, String> {
+    use std::io::Write;
+    let mut child = Command::new(cli_path())
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Failed to start bundled monkey-cli: {error}"))?;
+    // Taken and dropped here, so the child sees end-of-input even if it reads
+    // past the newline.
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "Bundled monkey-cli did not accept a credential".to_string())?
+        .write_all(format!("{secret}\n").as_bytes())
+        .map_err(|error| format!("Failed to hand the credential to monkey-cli: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("Failed to run bundled monkey-cli: {error}"))?;
+    finish_cli_output(output)
+}
+
+pub(crate) async fn command_with_stdin(
+    args: Vec<String>,
+    secret: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || run_cli_with_stdin(args, secret))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// One line, because that is what the sidecar reads. A credential carrying a
+/// newline would otherwise be stored truncated and fail much later as a bad
+/// token, so it is refused here instead.
+fn one_line_secret(label: &str, secret: &str) -> Result<(), String> {
+    if secret.is_empty() || secret.len() > 8192 {
+        return Err(format!("A {label} must contain 1-8192 bytes"));
+    }
+    if secret.contains('\n') || secret.contains('\r') {
+        return Err(format!("A {label} may not contain a line break"));
+    }
+    Ok(())
+}
+
 pub(crate) async fn command(args: Vec<String>) -> Result<String, String> {
     tokio::task::spawn_blocking(move || run_cli(args))
         .await
@@ -2824,19 +2879,6 @@ mod tests {
         assert!(validate_token("recipe", "recipe.json\0--purge", 100).is_err());
     }
 
-    /// The desktop writes the tunnel credential and the daemon reads it. They
-    /// are separate processes and separate constants, so nothing but a test
-    /// stops them naming different keychain entries — a drift whose only
-    /// symptom is "the tunnel says it has no credential" while the settings
-    /// page says one is stored.
-    #[test]
-    fn the_desktop_and_the_daemon_agree_on_the_tunnel_keychain_entry() {
-        assert_eq!(
-            TUNNEL_CREDENTIAL_REF, "channel-exposure:tunnel-token",
-            "if this changes, change `daemon::callback_exposure::TUNNEL_CREDENTIAL_REF` with it"
-        );
-    }
-
     /// React names a provider from a closed set and nothing else. There is no
     /// argument on any exposure command that could become a program to run.
     #[test]
@@ -3979,8 +4021,9 @@ mod tests {
 // passes is validated before it reaches an argument vector.
 //
 // `channels_set_credential` is the single place a secret crosses this boundary,
-// and it writes straight to the keychain rather than through an argument
-// vector: a credential must never be visible in a process listing.
+// and it crosses on the sidecar's stdin rather than through an argument vector:
+// a credential must never be visible in a process listing, and the keychain
+// entry has to be created by the executable the daemon later reads it from.
 
 const MAX_CHANNEL_ID: usize = 128;
 
@@ -4372,28 +4415,20 @@ pub async fn channels_set_public_url(url: Option<String>) -> Result<(), String> 
 
 /// Store an account's credential.
 ///
-/// Writes to the same keychain entry the daemon's adapters read, named by the
-/// one definition both sides share, so the desktop and the CLI cannot drift
-/// into writing different entries. The value is never echoed back, never
-/// logged, and never returned — the account row only ever learns that a
-/// credential exists.
+/// Handed to the sidecar's own `set-token` on stdin rather than written here:
+/// that is the one command that writes this keychain entry, and it runs in the
+/// executable the daemon later reads it from — see [`run_cli_with_stdin`] for
+/// why the writing process is what decides whether the daemon's read prompts.
+/// The value is never echoed back, never logged, and never returned — the
+/// account row only ever learns that a credential exists.
 #[tauri::command]
 pub async fn channels_set_credential(account_id: String, secret: String) -> Result<(), String> {
     let account_id = channel_id("account id", &account_id)?;
-    if secret.is_empty() || secret.len() > 8192 {
-        return Err("A messaging credential must contain 1-8192 bytes".to_string());
-    }
-    let reference = crate::channels::credential_ref(&account_id);
-    keyring::Entry::new(&crate::channels::KEYCHAIN_SERVICE, &reference)
-        .map_err(|error| format!("Failed to open the messaging keychain entry: {error}"))?
-        .set_password(&secret)
-        .map_err(|error| format!("Failed to save the messaging credential: {error}"))?;
-    // The CLI owns the account row; this marks it as having a credential.
-    command(vec![
-        "channels".into(),
-        "mark-credential".into(),
-        account_id,
-    ])
+    one_line_secret("messaging credential", &secret)?;
+    command_with_stdin(
+        vec!["channels".into(), "set-token".into(), account_id],
+        secret,
+    )
     .await
     .map(|_| ())
 }
@@ -4475,19 +4510,22 @@ pub async fn channels_exposure_set_tunnel(
 
 /// Store the tunnel credential.
 ///
-/// Written straight to the keychain here rather than handed to the CLI, for
-/// the same reason an account's credential is: an argument is visible in a
-/// process listing, and there is no reason for the secret to exist in a second
-/// process at all.
+/// On the sidecar's stdin, never in an argument: an argument is visible in a
+/// process listing. The daemon's tunnel supervisor is what reads this entry
+/// back, so the sidecar is also the process that has to have written it.
 #[tauri::command]
 pub async fn channels_exposure_set_token(token: String) -> Result<(), String> {
-    if token.is_empty() || token.len() > 8192 {
-        return Err("A tunnel credential must contain 1-8192 bytes".to_string());
-    }
-    keyring::Entry::new(&crate::channels::KEYCHAIN_SERVICE, TUNNEL_CREDENTIAL_REF)
-        .map_err(|error| format!("Failed to open the tunnel keychain entry: {error}"))?
-        .set_password(&token)
-        .map_err(|error| format!("Failed to save the tunnel credential: {error}"))
+    one_line_secret("tunnel credential", &token)?;
+    command_with_stdin(
+        vec![
+            "channels".into(),
+            "exposure".into(),
+            "set-token".into(),
+        ],
+        token,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Forget the tunnel credential.
@@ -4501,13 +4539,6 @@ pub async fn channels_exposure_clear_token() -> Result<(), String> {
     .await
     .map(|_| ())
 }
-
-/// The keychain entry the daemon reads a managed tunnel's credential from.
-///
-/// Spelled once, here and in `daemon::callback_exposure`, and asserted equal by
-/// a contract test — the desktop and the daemon writing different entry names
-/// is the failure mode this constant exists to make impossible.
-const TUNNEL_CREDENTIAL_REF: &str = "channel-exposure:tunnel-token";
 
 // --- Peers -----------------------------------------------------------------
 //
@@ -5098,8 +5129,8 @@ pub async fn ingress_turn_resume(
 // desktop never gets an arbitrary command executor.
 //
 // `telecom_set_credential` is the only path a carrier secret takes across this
-// boundary, and it goes straight to the keychain rather than through an
-// argument vector.
+// boundary, and like a messaging credential it goes in on the sidecar's stdin
+// rather than through an argument vector.
 
 #[tauri::command]
 pub async fn telecom_list() -> Result<Value, String> {
@@ -5315,21 +5346,19 @@ pub async fn telecom_remove(account_id: String) -> Result<(), String> {
 
 /// Store a carrier credential.
 ///
-/// Writes the same keychain entry the daemon reads, named by the one definition
-/// both sides share. The value is never echoed back, never logged and never
-/// returned; the account row only ever learns that a credential exists.
+/// Same arrangement as a messaging credential: the sidecar's `set-token` reads
+/// it from stdin and writes the keychain entry, so the executable that created
+/// the entry is the one the daemon reads it back from. The value is never
+/// echoed back, never logged and never returned; the account row only ever
+/// learns that a credential exists.
 #[tauri::command]
 pub async fn telecom_set_credential(account_id: String, secret: String) -> Result<(), String> {
     let account_id = channel_id("account id", &account_id)?;
-    if secret.is_empty() || secret.len() > 8192 {
-        return Err("A carrier credential must contain 1-8192 bytes".to_string());
-    }
-    let reference = crate::channels::telecom_credential_ref(&account_id);
-    keyring::Entry::new(&crate::channels::KEYCHAIN_SERVICE, &reference)
-        .map_err(|error| format!("Failed to open the telephony keychain entry: {error}"))?
-        .set_password(&secret)
-        .map_err(|error| format!("Failed to save the carrier credential: {error}"))?;
-    command(vec!["telecom".into(), "mark-credential".into(), account_id])
-        .await
-        .map(|_| ())
+    one_line_secret("carrier credential", &secret)?;
+    command_with_stdin(
+        vec!["telecom".into(), "set-token".into(), account_id],
+        secret,
+    )
+    .await
+    .map(|_| ())
 }

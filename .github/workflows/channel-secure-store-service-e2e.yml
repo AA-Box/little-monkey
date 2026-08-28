@@ -37,18 +37,55 @@ env:
   LITTLE_MONKEY_REQUIRE_CHANNEL_SECURE_STORE_SERVICE_E2E: "1"
 
 jobs:
-  # macOS is deliberately absent. It admits a Keychain item to the binary that
-  # created it, and the resident service is a different binary — as in
-  # production, where the desktop writes and the service reads. That first read
-  # waits on a confirmation a person answers once and a runner never can: the
-  # service kept a fresh heartbeat while the account sat at `disconnected`, and
-  # reading the same credential back through the CLI had to be killed at 120s.
+  # macOS admits a Keychain item to the binary that created it and asks a person
+  # about any other, which is a question a background LaunchAgent has nobody to
+  # answer — this job used to be absent for exactly that reason. The desktop no
+  # longer writes the credential itself: `channels_set_credential` hands it to
+  # the bundled `monkey-cli` on stdin, and the resident service is that same
+  # executable, so the service's read is a same-program read that never reaches
+  # a dialog. Granting a *foreign* binary that access unattended was tried
+  # first and rejected twice — `set-generic-password-partition-list` locked out
+  # even the writing binary, and `security add-generic-password -A` blocks every
+  # keyring reader and would be far too broad regardless.
   #
-  # Two ways of granting that access unattended were tried and rejected:
-  # `set-generic-password-partition-list` locked out even the writing binary,
-  # and storing the item with `security add-generic-password -A` blocks every
-  # keyring reader. Rendering of the launchd definition stays covered by the
-  # unit tests in daemon::service.
+  # What this job proves is the production path: credential written by the CLI,
+  # read by the installed launchd service, adapter built from it. It does not
+  # prove how narrow the item's access list is — a runner builds unsigned, and
+  # an unsigned binary's items are not scoped the way a Developer ID app's are.
+  # That property belongs to a signed build, and is an acceptance step in
+  # docs/messaging-devices-and-phones.md rather than something CI can claim.
+  macos:
+    name: native service (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    runs-on: ${{ matrix.os }}
+    # A native credential prompt or a service that will not stop must fail this
+    # job, not sit on a runner for the six-hour default.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri
+          key: channel-secure-store-${{ matrix.os }}
+
+      - name: Build and pin real production CLI
+        run: |
+          cargo clean --manifest-path src-tauri/Cargo.toml -p little-monkey
+          node scripts/ensure-cli-sidecar-placeholder.mjs
+          cargo build --manifest-path src-tauri/Cargo.toml --bin monkey-cli
+          node scripts/ensure-cli-sidecar-placeholder.mjs
+
+      - name: Native credential -> installed service -> Telegram worker
+        run: >-
+          cargo run --manifest-path src-tauri/Cargo.toml
+          --example channel_secure_store_service_e2e -- desktop
+
   windows:
     name: native service (${{ matrix.os }})
     strategy:
