@@ -26,6 +26,9 @@ pub(crate) mod fail_points;
 mod ingress_contract;
 pub(crate) mod ingress_store;
 mod ledger;
+/// The whole path against a real provider account, agent included.
+#[cfg(test)]
+mod live_agent_e2e;
 #[cfg(test)]
 mod live_smoke;
 pub(crate) mod peer_audit;

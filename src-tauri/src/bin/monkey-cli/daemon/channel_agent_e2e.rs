@@ -72,10 +72,10 @@ const CHILD_ENV: &str = "LM_CHANNEL_E2E_CHILD";
 const ROOT_ENV: &str = "LM_CHANNEL_E2E_ROOT";
 /// Printed by the child when it declines to run; surfaced by the launcher so
 /// a skip is never silent.
-const SKIPPED: &str = "channel agent end-to-end SKIPPED";
+pub(crate) const SKIPPED: &str = "channel agent end-to-end SKIPPED";
 
-const ACCOUNT_ID: &str = "e2e-account";
-const RECIPE: &str = "channel-e2e";
+pub(crate) const ACCOUNT_ID: &str = "e2e-account";
+pub(crate) const RECIPE: &str = "channel-e2e";
 const BOT_TOKEN: &str = "e2e-bot-token";
 /// What the fixture model asks `send_message` to say. Distinctive on purpose:
 /// finding it on the provider's wire is the proof the whole chain ran.
@@ -172,14 +172,14 @@ fn is_the_cli(candidate: &Path) -> bool {
 /// time, which cannot answer a daemon child whose request order this test does
 /// not control. This one is a tiny router: `route` sees the request line and
 /// body and returns the raw response to write.
-struct HttpFixture {
-    base: String,
+pub(crate) struct HttpFixture {
+    pub(crate) base: String,
     seen: Arc<Mutex<Vec<String>>>,
     calls: Arc<AtomicUsize>,
 }
 
 impl HttpFixture {
-    fn spawn(
+    pub(crate) fn spawn(
         route: impl Fn(&str, &str, usize) -> String + Send + Sync + 'static,
     ) -> std::io::Result<Self> {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
@@ -214,11 +214,11 @@ impl HttpFixture {
     }
 
     /// Every request received so far, as "<request line + headers>\n<body>".
-    fn requests(&self) -> Vec<String> {
+    pub(crate) fn requests(&self) -> Vec<String> {
         self.seen.lock().unwrap().clone()
     }
 
-    fn count(&self) -> usize {
+    pub(crate) fn count(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
 }
@@ -284,14 +284,14 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn json_response(body: &str) -> String {
+pub(crate) fn json_response(body: &str) -> String {
     format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
 }
 
-fn sse_response(frames: &[serde_json::Value]) -> String {
+pub(crate) fn sse_response(frames: &[serde_json::Value]) -> String {
     let mut body = String::new();
     for frame in frames {
         body.push_str(&format!("data: {frame}\n\n"));
@@ -326,7 +326,7 @@ struct ProviderWorld {
     _sockets: Option<super::channel_restart_tests::WsFixture>,
 }
 
-fn account_record(kind: ChannelKind, now: i64) -> ChannelAccountRecord {
+pub(crate) fn account_record(kind: ChannelKind, now: i64) -> ChannelAccountRecord {
     ChannelAccountRecord {
         account_id: ACCOUNT_ID.into(),
         kind,
@@ -982,7 +982,7 @@ fn write_private(path: &Path, contents: &str) {
 /// `auto` is the mode a conversational route realistically uses; it does not
 /// auto-approve `send_message`, which is the point — the approval below is the
 /// operator's, made through the same durable path the phone app uses.
-fn write_recipe(authored: &Path, workspace: &Path, model_base: &str) {
+pub(crate) fn write_recipe(authored: &Path, workspace: &Path, model_base: &str) {
     let recipe = serde_json::json!({
         "version": 1,
         "name": RECIPE,
@@ -1000,7 +1000,7 @@ fn write_recipe(authored: &Path, workspace: &Path, model_base: &str) {
     );
 }
 
-fn seed_channel(store: &mut DaemonStore, kind: ChannelKind, now: i64) {
+pub(crate) fn seed_channel(store: &mut DaemonStore, kind: ChannelKind, now: i64) {
     store
         .upsert_channel_account(&account_record(kind, now))
         .expect("account");
@@ -1016,14 +1016,14 @@ fn seed_channel(store: &mut DaemonStore, kind: ChannelKind, now: i64) {
         .expect("route");
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
 }
 
-struct SilentNotifier;
+pub(crate) struct SilentNotifier;
 
 impl super::engine::NotificationAdapter for SilentNotifier {
     fn notify(&self, _notification: &super::engine::DaemonNotification) -> Result<(), String> {
@@ -1034,7 +1034,7 @@ impl super::engine::NotificationAdapter for SilentNotifier {
 /// Decides any approval the run is waiting on, the way the phone app does:
 /// read the pending request from the ledger, emit a `PermissionDecided` event
 /// carrying the same operation digest. Returns how many it answered.
-fn approve_pending(paths: &DaemonPaths, run_id: &str) -> usize {
+pub(crate) fn approve_pending(paths: &DaemonPaths, run_id: &str) -> usize {
     let Ok(shared) = SharedLedger::open(&paths.ledger_db) else {
         return 0;
     };
@@ -1086,6 +1086,7 @@ fn approve_pending(paths: &DaemonPaths, run_id: &str) -> usize {
 #[test]
 fn a_telegram_message_becomes_an_agent_reply_end_to_end() {
     in_isolated_process(
+        "channel_agent_e2e",
         "a_telegram_message_becomes_an_agent_reply_end_to_end",
         |root| {
             Box::pin(async move {
@@ -1101,6 +1102,7 @@ fn a_telegram_message_becomes_an_agent_reply_end_to_end() {
 #[test]
 fn a_discord_message_becomes_an_agent_reply_end_to_end() {
     in_isolated_process(
+        "channel_agent_e2e",
         "a_discord_message_becomes_an_agent_reply_end_to_end",
         |root| {
             Box::pin(async move {
@@ -1117,6 +1119,7 @@ fn a_discord_message_becomes_an_agent_reply_end_to_end() {
 #[test]
 fn a_slack_message_becomes_an_agent_reply_end_to_end() {
     in_isolated_process(
+        "channel_agent_e2e",
         "a_slack_message_becomes_an_agent_reply_end_to_end",
         |root| {
             Box::pin(async move {
@@ -1133,6 +1136,7 @@ fn a_slack_message_becomes_an_agent_reply_end_to_end() {
 #[test]
 fn autonomous_coordinator_runs_through_the_resident_daemon_end_to_end() {
     in_isolated_process(
+        "channel_agent_e2e",
         "autonomous_coordinator_runs_through_the_resident_daemon_end_to_end",
         |root| Box::pin(async move { run_autonomous_coordinator_end_to_end(&root).await }),
     );
@@ -1140,7 +1144,8 @@ fn autonomous_coordinator_runs_through_the_resident_daemon_end_to_end() {
 
 /// Runs `body` in a process whose home is a fresh directory, relaunching this
 /// test binary once to get there. See the module doc for why.
-fn in_isolated_process(
+pub(crate) fn in_isolated_process(
+    module: &'static str,
     name: &'static str,
     body: impl FnOnce(PathBuf) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
 ) {
@@ -1152,7 +1157,7 @@ fn in_isolated_process(
         let _guard = ONE_AT_A_TIME
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        relaunch(name);
+        relaunch(module, name);
         return;
     };
     tokio::runtime::Builder::new_multi_thread()
@@ -1170,8 +1175,153 @@ fn in_isolated_process(
 /// the environment. Where it does not — Windows resolves it through the Known
 /// Folder API, which no environment variable reaches — running this would
 /// write into the operator's real profile, so it does not run there.
-fn isolation_is_real(root: &Path) -> bool {
+pub(crate) fn isolation_is_real(root: &Path) -> bool {
     little_monkey_lib::app_paths::base_data_dir().is_some_and(|data| data.starts_with(root))
+}
+
+/// What one accepted turn produced once the daemon and the agent were done
+/// with it.
+pub(crate) struct AgentTurnProof {
+    /// The provider's own id for the reply, read off the durable outbound
+    /// event rather than off the send call.
+    pub(crate) provider_message_id: String,
+    /// The run's durable events, rendered, so a caller's failing assertion can
+    /// quote what the agent really did.
+    pub(crate) run_events_json: String,
+}
+
+/// The provider-independent middle of an acceptance run.
+///
+/// Given a turn that is already queued — however it arrived, from a protocol
+/// fixture or from a real account — this runs the resident daemon over it,
+/// proves the reply came from the agent rather than from the test, and drains
+/// the outbox through the adapter the caller supplied.
+///
+/// Factored out because it is the half no provider gets to influence. The
+/// fixture tests in this module and the live-account tests in
+/// [`super::live_agent_e2e`] run exactly this code; what a provider supplies
+/// is only how the message arrived and how the reply is observed on the far
+/// side.
+pub(crate) async fn execute_turn_through_the_daemon(
+    paths: &DaemonPaths,
+    config: &DaemonConfig,
+    account_id: &str,
+    job_id: &str,
+    run_id: &str,
+    adapter: &Arc<dyn ChannelAdapter>,
+    model: &HttpFixture,
+) -> AgentTurnProof {
+    // ---- the daemon executes it. Production engine, production process
+    // adapter: the child really is another monkey-cli running `task run`.
+    let mut engine = DaemonEngine::new(
+        DaemonStore::open(paths).expect("engine store"),
+        SharedLedger::open(&paths.ledger_db).expect("engine ledger"),
+        paths.clone(),
+        config.clone(),
+        RealProcessAdapter::current().expect("process adapter"),
+        SilentNotifier,
+        SystemClock,
+        "e2e-daemon".to_string(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let terminal = loop {
+        engine.tick().expect("engine tick");
+        // The operator's side of the external-mutation gate. A channel reply
+        // leaves the machine, so the run asks; this stands in for the phone.
+        approve_pending(paths, run_id);
+        let state = DaemonStore::open(paths)
+            .expect("state read")
+            .get_job(job_id)
+            .expect("job read")
+            .expect("job")
+            .state;
+        if matches!(
+            state,
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled
+        ) {
+            break state;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon run never reached a terminal state (still {state:?}); \
+             daemon log: {}",
+            std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    };
+    assert_eq!(
+        terminal,
+        JobState::Succeeded,
+        "the daemon run failed; log: {}",
+        std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default()
+    );
+
+    // ---- what the run actually did. The tool call has to have come from the
+    // model and been dispatched by the agent, not been written here.
+    let shared = SharedLedger::open(&paths.ledger_db).expect("ledger");
+    let events = shared
+        .run_ledger()
+        .expect("run ledger")
+        .load_events(run_id, 0, 500)
+        .expect("run events");
+    let rendered = serde_json::to_string(&events).expect("run events json");
+    // The agent offered the tool. This is read off the model's own request:
+    // whatever the fixture answers, the schema in front of it came from the
+    // production tool builder deciding this run could reach somewhere.
+    let asked = model.requests();
+    assert!(!asked.is_empty(), "the agent never called the model");
+    assert!(
+        asked
+            .iter()
+            .any(|request| request.contains(r#""name":"send_message""#)),
+        "send_message was not in the tool schema the agent offered: {asked:?}"
+    );
+    // The agent dispatched the call it got back, and the dispatch succeeded.
+    // A test that wrote an outbox row by hand would leave this absent.
+    let dispatched = events.iter().any(|event| {
+        let json = serde_json::to_string(event).unwrap_or_default();
+        json.contains("\"type\":\"tool_proposed\"") && json.contains("\"send_message\"")
+    });
+    assert!(
+        dispatched,
+        "no send_message tool call reached the dispatcher: {rendered}"
+    );
+    assert!(
+        !rendered.contains(r#""outcome":"failed""#),
+        "the tool call was dispatched and refused: {rendered}\n--- job log ---\n{}",
+        std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default()
+    );
+    assert!(
+        model.count() >= 2,
+        "the agent loop did not come back to the model with the tool result \
+         ({} request(s)) — the tool call was not dispatched",
+        model.count()
+    );
+
+    // ---- the outbox row the tool wrote, drained by the production worker
+    // into the production adapter.
+    let mut store = DaemonStore::open(paths).expect("store reopen");
+    let mut adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> = BTreeMap::new();
+    adapters.insert(account_id.to_string(), adapter.clone());
+    let drained = drain_outbox_once(&mut store, &adapters, now_ms())
+        .await
+        .expect("drain");
+    assert_eq!(
+        drained.sent, 1,
+        "the agent's reply did not leave the outbox: {drained:?}\n--- run events ---\n{rendered}\n--- job log ---\n{}",
+        std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default()
+    );
+
+    let outbound = store
+        .recent_channel_events(account_id, 50)
+        .expect("events")
+        .into_iter()
+        .find(|event| event.direction == EventDirection::Outbound)
+        .expect("a durable outbound event");
+    AgentTurnProof {
+        provider_message_id: outbound.provider_event_id,
+        run_events_json: rendered,
+    }
 }
 
 async fn run_end_to_end(root: &Path, world: ProviderWorld) {
@@ -1252,106 +1402,14 @@ async fn run_end_to_end(root: &Path, world: ProviderWorld) {
         paths.root
     );
 
-    // ---- the daemon executes it. Production engine, production process
-    // adapter: the child really is another monkey-cli running `task run`.
-    let mut engine = DaemonEngine::new(
-        DaemonStore::open(&paths).expect("engine store"),
-        SharedLedger::open(&paths.ledger_db).expect("engine ledger"),
-        paths.clone(),
-        config.clone(),
-        RealProcessAdapter::current().expect("process adapter"),
-        SilentNotifier,
-        SystemClock,
-        "e2e-daemon".to_string(),
-    );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-    let terminal = loop {
-        engine.tick().expect("engine tick");
-        // The operator's side of the external-mutation gate. A channel reply
-        // leaves the machine, so the run asks; this stands in for the phone.
-        approve_pending(&paths, &run_id);
-        let state = DaemonStore::open(&paths)
-            .expect("state read")
-            .get_job(&job_id)
-            .expect("job read")
-            .expect("job")
-            .state;
-        if matches!(
-            state,
-            JobState::Succeeded | JobState::Failed | JobState::Cancelled
-        ) {
-            break state;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the daemon run never reached a terminal state (still {state:?}); \
-             daemon log: {}",
-            std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default()
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    };
-    assert_eq!(
-        terminal,
-        JobState::Succeeded,
-        "the daemon run failed; log: {}",
-        std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default()
-    );
-
-    // ---- what the run actually did. The tool call has to have come from the
-    // model and been dispatched by the agent, not been written here.
-    let shared = SharedLedger::open(&paths.ledger_db).expect("ledger");
-    let events = shared
-        .run_ledger()
-        .expect("run ledger")
-        .load_events(&run_id, 0, 500)
-        .expect("run events");
-    let rendered = serde_json::to_string(&events).expect("run events json");
-    // The agent offered the tool. This is read off the model's own request:
-    // whatever the fixture answers, the schema in front of it came from the
-    // production tool builder deciding this run could reach somewhere.
-    let asked = model.requests();
-    assert!(!asked.is_empty(), "the agent never called the model");
-    assert!(
-        asked
-            .iter()
-            .any(|request| request.contains(r#""name":"send_message""#)),
-        "send_message was not in the tool schema the agent offered: {asked:?}"
-    );
-    // The agent dispatched the call it got back, and the dispatch succeeded.
-    // A test that wrote an outbox row by hand would leave this absent.
-    let dispatched = events.iter().any(|event| {
-        let json = serde_json::to_string(event).unwrap_or_default();
-        json.contains("\"type\":\"tool_proposed\"") && json.contains("\"send_message\"")
-    });
-    assert!(
-        dispatched,
-        "no send_message tool call reached the dispatcher: {rendered}"
-    );
-    assert!(
-        !rendered.contains(r#""outcome":"failed""#),
-        "the tool call was dispatched and refused: {rendered}\n--- job log ---\n{}",
-        std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default()
-    );
-    assert!(
-        model.count() >= 2,
-        "the agent loop did not come back to the model with the tool result \
-         ({} request(s)) — the tool call was not dispatched",
-        model.count()
-    );
-
-    // ---- the outbox row the tool wrote, drained by the production worker
-    // into the production adapter.
-    let mut store = DaemonStore::open(&paths).expect("store reopen");
-    let mut adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> = BTreeMap::new();
-    adapters.insert(ACCOUNT_ID.to_string(), adapter.clone());
-    let drained = drain_outbox_once(&mut store, &adapters, now_ms())
-        .await
-        .expect("drain");
-    assert_eq!(
-        drained.sent, 1,
-        "the agent's reply did not leave the outbox: {drained:?}\n--- run events ---\n{rendered}\n--- job log ---\n{}",
-        std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default()
-    );
+    // ---- the provider-independent middle: the daemon runs it, the agent
+    // answers, and the reply leaves through the production adapter. The
+    // live-account acceptance tests reach this same function.
+    let proof = execute_turn_through_the_daemon(
+        &paths, &config, ACCOUNT_ID, &job_id, &run_id, &adapter, &model,
+    )
+    .await;
+    let store = DaemonStore::open(&paths).expect("store reopen");
 
     // ---- and what the provider received.
     let sent = (world.requests)()
@@ -1359,9 +1417,10 @@ async fn run_end_to_end(root: &Path, world: ProviderWorld) {
         .find(|request| request.contains(world.send_marker))
         .unwrap_or_else(|| {
             panic!(
-                "the provider never received a {} request; it saw {:?}",
+                "the provider never received a {} request; it saw {:?}\n--- run events ---\n{}",
                 world.send_marker,
-                (world.requests)()
+                (world.requests)(),
+                proof.run_events_json
             )
         });
     assert!(
@@ -1416,7 +1475,7 @@ fn child_root() -> Option<PathBuf> {
 /// authored-config override) point at a fresh directory, so the isolated
 /// profile is real for every process in the tree and invisible to every other
 /// test in this one.
-fn relaunch(name: &str) {
+fn relaunch(module: &str, name: &str) {
     // Named per test as well as per process: three of these can start in the
     // same millisecond, and a shared root would have one delete another's.
     let root = std::env::temp_dir().join(format!(
@@ -1432,7 +1491,7 @@ fn relaunch(name: &str) {
 
     let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
         .arg("--exact")
-        .arg(format!("daemon::channel_agent_e2e::{name}"))
+        .arg(format!("daemon::{module}::{name}"))
         .arg("--nocapture")
         .arg("--test-threads=1")
         .env(CHILD_ENV, "1")
