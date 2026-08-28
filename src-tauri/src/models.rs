@@ -214,6 +214,11 @@ pub struct ModelInfo {
     pub components: ModelComponents,
     #[serde(default)]
     pub capabilities: ModelCapabilities,
+    /// Which local runtime can load this model. Everything installed before
+    /// this field existed was a GGUF, so the default is the honest answer for
+    /// old data as well as for curated entries.
+    #[serde(default)]
+    pub runtime: model_sources::ModelRuntimeKind,
 }
 
 /// The curated registry: a small, hand-picked set of instruct models known
@@ -235,6 +240,7 @@ pub fn curated_models() -> Vec<ModelInfo> {
             kind: ModelKind::Chat,
             components: ModelComponents::default(),
             capabilities: ModelCapabilities::default(),
+            runtime: Default::default(),
         },
         ModelInfo {
             id: "qwen2.5-coder-14b".to_string(),
@@ -249,6 +255,7 @@ pub fn curated_models() -> Vec<ModelInfo> {
             kind: ModelKind::Chat,
             components: ModelComponents::default(),
             capabilities: ModelCapabilities::default(),
+            runtime: Default::default(),
         },
         ModelInfo {
             id: "llama-3.1-8b".to_string(),
@@ -263,6 +270,7 @@ pub fn curated_models() -> Vec<ModelInfo> {
             kind: ModelKind::Chat,
             components: ModelComponents::default(),
             capabilities: ModelCapabilities::default(),
+            runtime: Default::default(),
         },
         ModelInfo {
             id: "hermes-3-8b".to_string(),
@@ -277,6 +285,7 @@ pub fn curated_models() -> Vec<ModelInfo> {
             kind: ModelKind::Chat,
             components: ModelComponents::default(),
             capabilities: ModelCapabilities::default(),
+            runtime: Default::default(),
         },
         ModelInfo {
             id: "mistral-nemo-12b".to_string(),
@@ -291,6 +300,7 @@ pub fn curated_models() -> Vec<ModelInfo> {
             kind: ModelKind::Chat,
             components: ModelComponents::default(),
             capabilities: ModelCapabilities::default(),
+            runtime: Default::default(),
         },
         // Embedding models for the RAG/Knowledge Stacks feature
         // (stacks.rs) — the managed-llama embedding backend. Repo/file
@@ -313,6 +323,7 @@ pub fn curated_models() -> Vec<ModelInfo> {
                 text: true,
                 image_input: false,
             },
+            runtime: Default::default(),
         },
         // Design doc named "bge-m3" without pinning an exact repo/quant;
         // `gpustack/bge-m3-GGUF` (a maintained third-party GGUF conversion —
@@ -336,6 +347,7 @@ pub fn curated_models() -> Vec<ModelInfo> {
                 text: true,
                 image_input: false,
             },
+            runtime: Default::default(),
         },
     ]
 }
@@ -388,7 +400,18 @@ fn managed_model_info(path: &Path, provenance: &ManagedModelProvenance) -> Model
         kind: ModelKind::Chat,
         components: ModelComponents::default(),
         capabilities: ModelCapabilities::default(),
+        runtime: Default::default(),
     }
+}
+
+/// A directory-shaped managed model, listed from its bundle sidecar.
+fn managed_bundle_model_info(
+    path: &Path,
+    provenance: &model_sources::ManagedBundleProvenance,
+) -> ModelInfo {
+    let mut info = managed_model_info(path, &provenance.as_model_provenance());
+    info.runtime = provenance.runtime;
+    info
 }
 
 fn unverified_managed_model_info(path: &Path, filename: &str, size_gb: f32) -> ModelInfo {
@@ -406,6 +429,7 @@ fn unverified_managed_model_info(path: &Path, filename: &str, size_gb: f32) -> M
         kind: ModelKind::Chat,
         components: ModelComponents::default(),
         capabilities: ModelCapabilities::default(),
+        runtime: Default::default(),
     }
 }
 
@@ -825,6 +849,24 @@ pub fn models_list_installed(app: AppHandle) -> Result<Vec<ModelInfo>, String> {
             Err(_) => continue,
         };
         let path = entry.path();
+        if path.is_dir() {
+            // A directory in the models folder is a model only when it carries
+            // the app's own bundle sidecar; anything else the user put there is
+            // left alone rather than guessed at.
+            match model_sources::load_bundle_provenance(&path) {
+                Ok(Some(provenance)) => {
+                    installed.push(managed_bundle_model_info(&path, &provenance))
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!(
+                        "little-monkey: ignoring unreadable model bundle {}: {error}",
+                        path.display()
+                    );
+                }
+            }
+            continue;
+        }
         if !path.is_file() {
             continue;
         }
@@ -898,6 +940,7 @@ pub fn models_list_installed(app: AppHandle) -> Result<Vec<ModelInfo>, String> {
             kind: ModelKind::Chat,
             components: ModelComponents::default(),
             capabilities: ModelCapabilities::default(),
+            runtime: Default::default(),
         });
         live_external.push(entry);
     }
@@ -1014,6 +1057,7 @@ pub fn models_add_external(app: AppHandle, path: String) -> Result<ModelInfo, St
             kind: ModelKind::Chat,
             components: ModelComponents::default(),
             capabilities: ModelCapabilities::default(),
+            runtime: Default::default(),
         });
     }
 
@@ -1044,6 +1088,7 @@ pub fn models_add_external(app: AppHandle, path: String) -> Result<ModelInfo, St
         kind: ModelKind::Chat,
         components: ModelComponents::default(),
         capabilities: ModelCapabilities::default(),
+        runtime: Default::default(),
     })
 }
 
@@ -1439,6 +1484,9 @@ pub async fn models_install_reference(
     if installed.projector_path.is_some() {
         debug_assert!(installed.projector_install_lock_is_held());
     }
+    if let Some(bundle) = installed.bundle.as_ref() {
+        return Ok(managed_bundle_model_info(&installed.local_path, bundle));
+    }
     let model = managed_model_info(&installed.local_path, &installed.provenance);
     if installed.projector_path.is_some() {
         let result = associate_installed_bundle(&profile_data_dir, &dir, &installed).await;
@@ -1716,6 +1764,24 @@ pub async fn models_delete(
             "'{}' is outside the models directory and cannot be deleted",
             path
         ));
+    }
+    if p.is_dir() {
+        // A directory-shaped model (MLX/safetensors) is deleted whole. It has
+        // no projector and no entry in the GGUF bundle registry, so it skips
+        // the component bookkeeping below entirely.
+        let detail = format!("Delete downloaded model weights at {}", p.display());
+        permissions::request_permission(
+            &app,
+            state.inner(),
+            "delete_model",
+            detail,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        return model_sources::delete_installed_bundle(&dir_canon, &p).await;
     }
     if !p.is_file() {
         return Err(format!("Not a file: {path}"));

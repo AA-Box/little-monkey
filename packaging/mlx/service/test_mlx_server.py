@@ -130,6 +130,91 @@ def check_happy_path():
     print("ok: happy path emits started, deltas, and exactly one completed")
 
 
+def check_generation_runs_on_the_thread_that_loaded_the_model():
+    """Every generation must run on the thread that created the model.
+
+    MLX binds a stream to the thread that created the arrays. Generating on any
+    other thread raises "There is no Stream(gpu, 0) in current thread." (mlx
+    0.32.0), and no per-thread device or stream setting recovers it. A server
+    that generates inside its request handler therefore fails every request
+    while looking healthy: port connectable, model resident, each generation
+    dying inside `stream_generate`.
+
+    A stubbed MLX cannot reproduce a Metal error, so this asserts the property
+    that prevents it: the thread `stream_generate` is called on is the one that
+    called `load`, however many request threads there are.
+    """
+    loaded_on = {}
+    generated_on = []
+    fake = sys.modules["mlx_lm"]
+    previous = (fake.load, fake.stream_generate)
+
+    def load(path):
+        loaded_on["thread"] = threading.current_thread()
+        return ("model", _Tokenizer())
+
+    def stream_generate(*args, **kwargs):
+        generated_on.append(threading.current_thread())
+        return iter([types.SimpleNamespace(text="hi")])
+
+    fake.load, fake.stream_generate = load, stream_generate
+    try:
+        worker = mlx_server._GenerationWorker("/models/whatever")
+        worker.wait_until_loaded()
+        # Two concurrent callers, neither of them the loading thread.
+        collected = []
+        def drive():
+            job = mlx_server._Job("prompt", 4, None)
+            worker.submit(job)
+            collected.append("".join(job.deltas()))
+        threads = [threading.Thread(target=drive) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "a generation never returned"
+    finally:
+        fake.load, fake.stream_generate = previous
+
+    assert collected == ["hi", "hi"], collected
+    assert len(generated_on) == 2, generated_on
+    for thread in generated_on:
+        assert thread is loaded_on["thread"], (
+            "generation ran on a thread that did not load the model"
+        )
+    print("ok: generation runs on the thread that loaded the model")
+
+
+def check_a_cancelled_reader_does_not_wedge_the_worker():
+    """A dropped connection must stop the generation, not block the worker.
+
+    The delta queue is bounded, so a reader that walks away mid-stream would
+    otherwise leave `put` blocking forever — and with one worker thread, that
+    wedges every later request rather than only this one.
+    """
+    fake = sys.modules["mlx_lm"]
+    previous = fake.stream_generate
+    fake.stream_generate = lambda *args, **kwargs: (
+        types.SimpleNamespace(text="x") for _ in range(100_000)
+    )
+    try:
+        job = mlx_server._Job("prompt", 1, None)
+        job.cancel()
+        finished = threading.Event()
+
+        def run():
+            job.run("model", _Tokenizer())
+            finished.set()
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join(timeout=5)
+        assert finished.is_set(), "a cancelled job never released the worker thread"
+    finally:
+        fake.stream_generate = previous
+    print("ok: a cancelled reader releases the worker")
+
+
 def check_generation_failure_still_terminates():
     """A model that dies mid-stream must still close the protocol.
 
@@ -186,6 +271,8 @@ def check_unknown_endpoint_is_404():
 
 if __name__ == "__main__":
     check_happy_path()
+    check_generation_runs_on_the_thread_that_loaded_the_model()
+    check_a_cancelled_reader_does_not_wedge_the_worker()
     check_generation_failure_still_terminates()
     check_rejects_non_loopback_host()
     check_unknown_endpoint_is_404()

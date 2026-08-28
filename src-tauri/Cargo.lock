@@ -3972,6 +3972,7 @@ dependencies = [
  "serde-saphyr",
  "serde_bytes",
  "serde_json",
+ "sha1",
  "sha2",
  "system-memory",
  "tar",

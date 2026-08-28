@@ -9,7 +9,12 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: () => Promise.resolve(() => {}),
 }));
 
-import { resolvedTargetSupportsVision, snapshotForResolvedTarget, resolveTarget } from "./targetRouting";
+import {
+  resolveLoadedLocalEndpoint,
+  resolveTarget,
+  resolvedTargetSupportsVision,
+  snapshotForResolvedTarget,
+} from "./targetRouting";
 import { useModelStore, type ModelInfo, type OllamaModelInfo } from "../store/modelStore";
 
 function localModel(): ModelInfo {
@@ -50,6 +55,75 @@ beforeEach(() => {
     activeOllamaModel: null,
     providers: [],
     providerModels: {},
+    mlxChat: null,
+  });
+});
+
+describe("MLX local runtime", () => {
+  const mlxModel = (): ModelInfo => ({
+    ...localModel(),
+    id: "mlx-qwen",
+    file: "mlx-0123456789ab-Qwen3.8-27B-OptiQ-4bit",
+    path: "/models/mlx-0123456789ab-Qwen3.8-27B-OptiQ-4bit",
+    runtime: "mlx",
+  });
+
+  it("resolves a local target to the MLX endpoint when an MLX model is active", async () => {
+    const model = mlxModel();
+    useModelStore.setState({ installed: [model], active: model });
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "mlx_chat_status") {
+        return Promise.resolve({ running: true, port: 51234, modelId: "m", modelPath: model.path });
+      }
+      // llama-server is legitimately stopped while MLX holds the slot; reading
+      // it here would resolve the turn to a port with nothing behind it.
+      if (command === "llama_status") {
+        return Promise.resolve({ status: "stopped", port: 8090, model_path: null, projector_path: null, vision_enabled: false });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const target = await resolveTarget();
+
+    expect(target).toMatchObject({ kind: "local", baseUrl: "http://127.0.0.1:51234" });
+    expect(useModelStore.getState().llamaStatus).toBe("ready");
+  });
+
+  it("falls back to llama-server when the active model is a GGUF", async () => {
+    const model = localModel();
+    useModelStore.setState({ installed: [model], active: model });
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "llama_status") {
+        return Promise.resolve({ status: "ready", port: 8090, model_path: model.path, projector_path: null, vision_enabled: false });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const target = await resolveTarget();
+
+    expect(target).toMatchObject({ kind: "local", baseUrl: "http://127.0.0.1:8090" });
+    // A GGUF model must not cost an MLX probe on every turn.
+    expect(invokeMock).not.toHaveBeenCalledWith("mlx_chat_status");
+  });
+
+  it("resolves a loaded model to whichever runtime holds it, and reports when neither does", async () => {
+    const mlx = mlxModel();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "mlx_chat_status") {
+        return Promise.resolve({ running: true, port: 51234, modelId: "m", modelPath: mlx.path });
+      }
+      return Promise.resolve({ status: "ready", port: 8090, model_path: "/models/other.gguf", projector_path: null, vision_enabled: false });
+    });
+
+    await expect(resolveLoadedLocalEndpoint(mlx.path!, "MLX model")).resolves.toBe(
+      "http://127.0.0.1:51234",
+    );
+    await expect(resolveLoadedLocalEndpoint("/models/other.gguf", "GGUF model")).resolves.toBe(
+      "http://127.0.0.1:8090",
+    );
+    await expect(resolveLoadedLocalEndpoint("/models/gone.gguf", "Missing model")).rejects.toThrow(
+      /no longer loaded/,
+    );
   });
 });
 

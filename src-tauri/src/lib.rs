@@ -158,6 +158,13 @@ pub mod desktop_control;
 // Apple-Silicon-only MLX lifecycle adapter. It is compiled only into the macOS
 // build: MLX needs Metal, so a Windows or Linux binary that carried this module
 // would ship an implementation it can never run.
+/// The loopback OpenAI-compatible endpoint that lets the ordinary chat path
+/// talk to an MLX model.
+///
+/// Not gated to macOS even though MLX is: this module names no MLX type, only
+/// the runtime hub. On a platform with no MLX driver the hub answers "unknown
+/// runtime", which is a clearer failure than a missing command.
+pub mod mlx_chat;
 #[cfg(target_os = "macos")]
 pub mod mlx_runtime;
 // Inbound OpenAI/Anthropic compatibility translations and the scoped,
@@ -505,6 +512,9 @@ pub struct AppState {
     /// speaking `studio_tools`' small HTTP contract.
     pub studio_tool: studio_tools::StudioToolState,
     pub llama: std::sync::Mutex<llama::LlamaState>,
+    /// The loopback OpenAI endpoint in front of the MLX runtime, when an MLX
+    /// model is the active chat model. See `mlx_chat`.
+    pub mlx_chat: mlx_chat::MlxChatState,
     /// The second, embeddings-only managed `llama-server` instance (port
     /// 8091, started with `--embeddings --pooling mean`) used by
     /// `stacks.rs`'s managed-llama embedding backend — a distinct
@@ -778,6 +788,7 @@ impl Default for AppState {
     fn default() -> Self {
         AppState {
             generation_engine: Default::default(),
+            mlx_chat: Default::default(),
             studio_tool: Default::default(),
             llama: Default::default(),
             embed_llama: std::sync::Mutex::new(llama::LlamaState::for_embeddings()),
@@ -1343,6 +1354,9 @@ pub fn run() {
             models::models_list_installed,
             models::models_download,
             models::models_cancel_download,
+            mlx_chat::mlx_chat_start,
+            mlx_chat::mlx_chat_status,
+            mlx_chat::mlx_chat_stop,
             models::models_resolve_reference,
             models::models_install_reference,
             models::models_delete,

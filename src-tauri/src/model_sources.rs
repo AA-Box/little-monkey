@@ -17,6 +17,7 @@ use reqwest::header::{
 };
 use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -45,6 +46,15 @@ const MAX_HF_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LICENSE_BYTES: u64 = 1024 * 1024;
 const MAX_MODEL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_PROVENANCE_BYTES: u64 = 64 * 1024;
+/// Ceiling for a repository file that is not stored in Git LFS. Real ones are
+/// configs and tokenizers; anything larger is either LFS or not understood.
+const MAX_PLAIN_BLOB_BYTES: u64 = 64 * 1024 * 1024;
+const BUNDLE_PROVENANCE_SCHEMA_VERSION: u32 = 1;
+/// Cap for the optional text files a bundle's capabilities are read from.
+const MAX_CHAT_TEMPLATE_BYTES: u64 = 4 * 1024 * 1024;
+/// File name of the bundle sidecar, written inside the model directory so
+/// removing the directory removes its provenance with it.
+const BUNDLE_PROVENANCE_FILE: &str = ".little-monkey-bundle.json";
 const PROVENANCE_SCHEMA_VERSION: u32 = 2;
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
@@ -91,6 +101,29 @@ pub struct ResolvedModelArtifact {
     pub size_bytes: u64,
 }
 
+/// One file of a directory-shaped model repository (MLX/safetensors), with
+/// whatever digest Hugging Face publishes for it.
+///
+/// Weights are Git-LFS objects and carry a SHA-256. Small plain files —
+/// `config.json`, the tokenizer, the chat template — are ordinary Git blobs and
+/// carry only the blob's SHA-1 object id. Both are content addresses, so both
+/// are checked; nothing is installed on size alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedBundleFile {
+    /// Repository-relative path, e.g. `optiq/metadata.json`.
+    pub path: String,
+    pub download_url: String,
+    /// Git-LFS SHA-256, for files stored in LFS.
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// Git blob object id (SHA-1 of `blob <len>\0` + content), for files that
+    /// are not in LFS.
+    #[serde(default)]
+    pub blob_sha1: Option<String>,
+    pub size_bytes: u64,
+}
+
 /// Public model-bundle resolution receipt returned over Tauri IPC.
 ///
 /// The casing is intentionally camelCase while `ModelInfo` stays in its
@@ -121,6 +154,45 @@ pub struct ResolvedModelReference {
     /// candidates only and are never installed until the user selects one.
     #[serde(default)]
     pub projector_candidates: Vec<ResolvedModelArtifact>,
+    /// Every file of a directory-shaped repository. Non-empty exactly when this
+    /// resolution installs a directory rather than a single GGUF, which is what
+    /// [`is_directory_bundle`](ResolvedModelReference::is_directory_bundle)
+    /// answers. `sha256` above is then the bundle digest over this list, so the
+    /// resolve/install consent boundary works unchanged.
+    #[serde(default)]
+    pub bundle_files: Vec<ResolvedBundleFile>,
+    /// Which runtime can load what was installed: `llama.cpp` for a GGUF,
+    /// `mlx` for a safetensors directory. The frontend routes Start on this
+    /// rather than inferring it from a file extension.
+    #[serde(default)]
+    pub runtime: ModelRuntimeKind,
+}
+
+/// Which local runtime loads a managed model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRuntimeKind {
+    /// A single GGUF served by the bundled llama.cpp build.
+    #[default]
+    LlamaCpp,
+    /// A safetensors model directory served by the MLX runtime.
+    Mlx,
+}
+
+impl ModelRuntimeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LlamaCpp => "llama.cpp",
+            Self::Mlx => "mlx",
+        }
+    }
+}
+
+impl ResolvedModelReference {
+    /// Whether installing this writes a directory of files instead of one GGUF.
+    pub fn is_directory_bundle(&self) -> bool {
+        !self.bundle_files.is_empty()
+    }
 }
 
 /// App-owned metadata stored beside a downloaded GGUF.
@@ -146,9 +218,76 @@ pub struct ManagedModelProvenance {
     pub installed_at_ms: u64,
 }
 
+/// App-owned metadata for a directory-shaped model, written inside the model
+/// directory so deleting the directory takes its provenance with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ManagedBundleProvenance {
+    pub schema_version: u32,
+    pub source: ModelReferenceSource,
+    #[serde(default)]
+    pub requested_reference: String,
+    pub canonical_reference: String,
+    pub display_name: String,
+    pub repo: String,
+    /// The immutable commit the bundle was taken at.
+    pub revision: String,
+    pub local_dir_name: String,
+    pub download_url: String,
+    /// Digest over the file list below, and the value the caller consented to.
+    pub bundle_sha256: String,
+    pub size_bytes: u64,
+    pub runtime: ModelRuntimeKind,
+    /// Read out of the bundle's own chat template at install time, the same
+    /// evidence the GGUF path reads out of an embedded template. Defaulted for
+    /// sidecars written before the field existed.
+    #[serde(default)]
+    pub tool_calling: bool,
+    pub files: Vec<ResolvedBundleFile>,
+    pub license_name: Option<String>,
+    pub license_url: Option<String>,
+    pub installed_at_ms: u64,
+}
+
+impl ManagedBundleProvenance {
+    /// The single-file provenance shape callers already render.
+    ///
+    /// `ModelInfo` and the install receipt are built from
+    /// [`ManagedModelProvenance`], and a bundle answers every field of it: the
+    /// bundle digest stands in for the file digest and the directory name for
+    /// the file name.
+    pub fn as_model_provenance(&self) -> ManagedModelProvenance {
+        ManagedModelProvenance {
+            schema_version: PROVENANCE_SCHEMA_VERSION,
+            source: self.source,
+            requested_reference: self.requested_reference.clone(),
+            canonical_reference: self.canonical_reference.clone(),
+            display_name: self.display_name.clone(),
+            repo: self.repo.clone(),
+            revision: self.revision.clone(),
+            source_file_name: self
+                .repo
+                .rsplit('/')
+                .next()
+                .unwrap_or(&self.repo)
+                .to_string(),
+            local_file_name: self.local_dir_name.clone(),
+            download_url: self.download_url.clone(),
+            sha256: self.bundle_sha256.clone(),
+            size_bytes: self.size_bytes,
+            tool_calling: self.tool_calling,
+            license_name: self.license_name.clone(),
+            license_url: self.license_url.clone(),
+            installed_at_ms: self.installed_at_ms,
+        }
+    }
+}
+
 pub struct InstalledModelReference {
     pub resolved: ResolvedModelReference,
     pub provenance: ManagedModelProvenance,
+    /// Present when `local_path` is a directory bundle rather than a GGUF.
+    pub bundle: Option<ManagedBundleProvenance>,
     pub local_path: PathBuf,
     pub projector_path: Option<PathBuf>,
     pub model_was_new: bool,
@@ -325,6 +464,11 @@ struct HfSibling {
     rfilename: String,
     size: Option<u64>,
     lfs: Option<HfLfs>,
+    /// Git object id of the blob. For an LFS file this is the id of the
+    /// *pointer*, not the content, so it is only used to verify files that are
+    /// not in LFS.
+    #[serde(default, rename = "blobId")]
+    blob_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -546,6 +690,17 @@ where
         return Err("Model bundle installation cancelled".to_string());
     }
     let expected_sha256 = validate_expected_digest(&resolution.public, expected_sha256)?;
+    if resolution.public.is_directory_bundle() {
+        return install_bundle_within_scope(
+            &client,
+            models_dir,
+            reference,
+            resolution,
+            cancel,
+            &mut on_progress,
+        )
+        .await;
+    }
     let selected_projector = select_projector_artifact(&resolution.public, &projector_selection)?;
     let projector_size = selected_projector
         .map(|artifact| artifact.size_bytes)
@@ -615,6 +770,7 @@ where
             return Ok(InstalledModelReference {
                 resolved: installed_resolution,
                 provenance,
+                bundle: None,
                 local_path: destination,
                 projector_path,
                 model_was_new: false,
@@ -745,12 +901,608 @@ where
     Ok(InstalledModelReference {
         resolved: installed_resolution,
         provenance,
+        bundle: None,
         local_path: destination,
         projector_path,
         model_was_new: true,
         projector_was_new,
         projector_install_lock,
     })
+}
+
+/// Installs a directory-shaped repository under `models_dir`.
+///
+/// Kept apart from the single-GGUF path above rather than threaded through it:
+/// that path validates a GGUF header, reads a chat template out of it, and
+/// treats the destination as one regular file at every step, and none of those
+/// hold for a directory of safetensors shards.
+///
+/// The shape mirrors the file path all the same. Bytes land in a staging
+/// directory beside the destination, every file is verified against the content
+/// address Hugging Face published for it before anything is published, and the
+/// directory is moved into place as a unit — so an interrupted install leaves
+/// staging behind, never a half-written model.
+async fn install_bundle_within_scope<F>(
+    client: &Client,
+    models_dir: &Path,
+    reference: &str,
+    resolution: InternalResolution,
+    cancel: Option<&CancellationToken>,
+    on_progress: &mut F,
+) -> Result<InstalledModelReference, String>
+where
+    F: FnMut(ModelDownloadProgress),
+{
+    let install_mutex = INSTALL_MUTEX.get_or_init(|| tokio::sync::Mutex::new(()));
+    let _process_guard = install_mutex.lock().await;
+    let models_dir = canonical_models_dir(models_dir)?;
+    let resolved = &resolution.public;
+
+    let mut disambiguated = false;
+    let (destination_name, destination, _install_lock) = loop {
+        let destination_name = local_bundle_dir_name(resolved, disambiguated);
+        let destination = models_dir.join(&destination_name);
+        validate_direct_child(&models_dir, &destination)?;
+        let install_lock = acquire_destination_lock(&models_dir, &destination).await?;
+        if path_entry_is_missing(&destination)? {
+            break (destination_name, destination, install_lock);
+        }
+        // An identical bundle already installed is the answer, not a conflict:
+        // re-running an install must be idempotent.
+        if let Some(provenance) = reusable_bundle_install(&destination, resolved)? {
+            on_progress(ModelDownloadProgress {
+                file: destination_name,
+                downloaded: resolved.size_bytes,
+                total: resolved.size_bytes,
+                role: ModelArtifactRole::Model,
+                overall_downloaded: resolved.size_bytes,
+                overall_total: resolved.size_bytes,
+            });
+            return Ok(InstalledModelReference {
+                resolved: resolved.clone(),
+                provenance: provenance.as_model_provenance(),
+                bundle: Some(provenance),
+                local_path: destination,
+                projector_path: None,
+                model_was_new: false,
+                projector_was_new: false,
+                projector_install_lock: None,
+            });
+        }
+        if !disambiguated {
+            disambiguated = true;
+            continue;
+        }
+        return Err(format!(
+            "A different model already occupies the managed model destination {}",
+            destination.display()
+        ));
+    };
+
+    let staging = append_file_suffix(&destination, ".part")?;
+    validate_direct_child(&models_dir, &staging)?;
+    fs::create_dir_all(&staging).map_err(|error| {
+        format!(
+            "Failed to create staging directory {}: {error}",
+            staging.display()
+        )
+    })?;
+
+    let mut overall_downloaded = 0_u64;
+    for file in &resolved.bundle_files {
+        if cancel.is_some_and(|token| token.is_cancelled()) {
+            return Err("Model bundle installation cancelled".to_string());
+        }
+        let staged_path = bundle_member_path(&staging, &file.path)?;
+        if let Some(parent) = staged_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
+        }
+        // A file already staged and verified survives a cancelled install, so a
+        // retry resumes at whole-file granularity instead of re-fetching tens
+        // of gigabytes of shards.
+        if verify_bundle_member(&staged_path, file).is_ok() {
+            overall_downloaded = overall_downloaded.saturating_add(file.size_bytes);
+            on_progress(ModelDownloadProgress {
+                file: file.path.clone(),
+                downloaded: file.size_bytes,
+                total: file.size_bytes,
+                role: ModelArtifactRole::Model,
+                overall_downloaded,
+                overall_total: resolved.size_bytes,
+            });
+            continue;
+        }
+        let partial = append_file_suffix(&staged_path, ".part")?;
+        prepare_partial_file(&partial, file.size_bytes)?;
+        let mut member_public = resolved.clone();
+        member_public.file_name = file.path.clone();
+        member_public.download_url = file.download_url.clone();
+        member_public.size_bytes = file.size_bytes;
+        member_public.bundle_files = Vec::new();
+        let member_resolution = InternalResolution {
+            public: member_public,
+            bearer_token: resolution.bearer_token.clone(),
+        };
+        let outcome = download_resumable(
+            client,
+            &member_resolution,
+            &partial,
+            &file.path,
+            ModelArtifactRole::Model,
+            overall_downloaded,
+            resolved.size_bytes,
+            cancel,
+            on_progress,
+        )
+        .await;
+        if let Err(error) = outcome {
+            if cancel.is_some_and(|token| token.is_cancelled()) {
+                let _ = fs::remove_file(&partial);
+            }
+            return Err(error);
+        }
+        if let Err(error) = verify_bundle_member(&partial, file) {
+            let _ = fs::remove_file(&partial);
+            return Err(error);
+        }
+        fs::rename(&partial, &staged_path).map_err(|error| {
+            let _ = fs::remove_file(&partial);
+            format!("Failed to stage {}: {error}", staged_path.display())
+        })?;
+        overall_downloaded = overall_downloaded.saturating_add(file.size_bytes);
+    }
+
+    if cancel.is_some_and(|token| token.is_cancelled()) {
+        return Err("Model bundle installation cancelled".to_string());
+    }
+    let tool_calling = bundle_advertises_tools(&staging);
+    let provenance = ManagedBundleProvenance {
+        schema_version: BUNDLE_PROVENANCE_SCHEMA_VERSION,
+        source: resolved.source,
+        requested_reference: reference.trim().to_string(),
+        canonical_reference: resolved.canonical_reference.clone(),
+        display_name: resolved.display_name.clone(),
+        repo: resolved.repo.clone(),
+        revision: resolved.revision.clone(),
+        local_dir_name: destination_name,
+        download_url: resolved.download_url.clone(),
+        bundle_sha256: resolved.sha256.clone(),
+        size_bytes: resolved.size_bytes,
+        runtime: resolved.runtime,
+        tool_calling,
+        files: resolved.bundle_files.clone(),
+        license_name: resolved.license_name.clone(),
+        license_url: resolved.license_url.clone(),
+        installed_at_ms: now_ms()?,
+    };
+    validate_bundle_provenance_metadata(&provenance)?;
+    let sidecar = staging.join(BUNDLE_PROVENANCE_FILE);
+    let encoded = serde_json::to_vec_pretty(&provenance)
+        .map_err(|error| format!("Failed to encode model bundle provenance: {error}"))?;
+    fs::write(&sidecar, &encoded)
+        .map_err(|error| format!("Failed to write {}: {error}", sidecar.display()))?;
+
+    if !path_entry_is_missing(&destination)? {
+        return Err(format!(
+            "Managed model destination appeared during install: {}",
+            destination.display()
+        ));
+    }
+    fs::rename(&staging, &destination).map_err(|error| {
+        format!(
+            "Failed to publish model bundle at {}: {error}",
+            destination.display()
+        )
+    })?;
+    Ok(InstalledModelReference {
+        resolved: resolved.clone(),
+        provenance: provenance.as_model_provenance(),
+        bundle: Some(provenance),
+        local_path: destination,
+        projector_path: None,
+        model_was_new: true,
+        projector_was_new: false,
+        projector_install_lock: None,
+    })
+}
+
+/// Whether a staged bundle's own chat template advertises tool calling.
+///
+/// The same question the GGUF path answers by reading the template out of the
+/// file header, asked of the two places an MLX repository keeps it: a
+/// `chat_template.jinja` beside the weights, or `chat_template` inside
+/// `tokenizer_config.json`. A repository that ships neither, or one whose
+/// template says nothing about tools, is recorded as not supporting them —
+/// the same fail-closed answer, for the same reason: a capability the app
+/// advertises but the model cannot honour produces a broken turn, while the
+/// reverse only leaves a feature unused.
+fn bundle_advertises_tools(directory: &Path) -> bool {
+    let jinja = directory.join("chat_template.jinja");
+    if let Some(template) = read_bounded_text(&jinja) {
+        return embedded_jinja_advertises_tools(&template);
+    }
+    let Some(config) = read_bounded_text(&directory.join("tokenizer_config.json")) else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&config) else {
+        return false;
+    };
+    parsed
+        .get("chat_template")
+        .and_then(|value| value.as_str())
+        .is_some_and(embedded_jinja_advertises_tools)
+}
+
+/// Reads a small text file, or `None` if it is missing, unreadable, oversized
+/// or not UTF-8. Every caller is reading optional metadata, so a failure here
+/// is an absent answer rather than an error.
+fn read_bounded_text(path: &Path) -> Option<String> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_CHAT_TEMPLATE_BYTES {
+        return None;
+    }
+    String::from_utf8(fs::read(path).ok()?).ok()
+}
+
+/// An installed directory-shaped model and the sidecar that describes it.
+pub struct InstalledBundle {
+    pub path: PathBuf,
+    pub provenance: ManagedBundleProvenance,
+}
+
+/// Every directory bundle installed under `models_dir`.
+///
+/// A directory without the app's sidecar is not a model and is skipped; one
+/// whose sidecar cannot be read is skipped too, with the reason on stderr,
+/// because a runtime inventory that fails to build over one bad entry would
+/// take every good one down with it.
+pub fn installed_bundles(models_dir: &Path) -> Vec<InstalledBundle> {
+    let Ok(entries) = fs::read_dir(models_dir) else {
+        return Vec::new();
+    };
+    let mut bundles = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        match load_bundle_provenance(&path) {
+            Ok(Some(provenance)) => bundles.push(InstalledBundle { path, provenance }),
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "little-monkey: ignoring unreadable model bundle {}: {error}",
+                path.display()
+            ),
+        }
+    }
+    bundles.sort_by(|left, right| left.path.cmp(&right.path));
+    bundles
+}
+
+/// Joins a repository-relative member path onto `root`, refusing anything that
+/// is not a plain relative path inside it.
+fn bundle_member_path(root: &Path, member: &str) -> Result<PathBuf, String> {
+    validate_hf_file_path(member)?;
+    let relative = Path::new(member);
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!("Model bundle member '{member}' is unsafe"));
+    }
+    Ok(root.join(relative))
+}
+
+/// Checks one staged file against the content address its metadata published.
+fn verify_bundle_member(path: &Path, file: &ResolvedBundleFile) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("Failed to inspect {}: {error}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.len() != file.size_bytes {
+        return Err(format!(
+            "Model bundle file {} is {} bytes, expected {}",
+            path.display(),
+            metadata.len(),
+            file.size_bytes
+        ));
+    }
+    if let Some(expected) = file.sha256.as_deref() {
+        let actual = sha256_file(path)?;
+        if !constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+            return Err(format!(
+                "Model bundle file {} failed SHA-256 verification: expected {expected}, got {actual}",
+                file.path
+            ));
+        }
+        return Ok(());
+    }
+    let expected = file
+        .blob_sha1
+        .as_deref()
+        .ok_or_else(|| format!("Model bundle file {} has no digest to verify", file.path))?;
+    let actual = git_blob_sha1_file(path)?;
+    if !constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+        return Err(format!(
+            "Model bundle file {} failed blob-id verification: expected {expected}, got {actual}",
+            file.path
+        ));
+    }
+    Ok(())
+}
+
+/// An already-installed bundle that is byte-for-byte what was just resolved.
+fn reusable_bundle_install(
+    directory: &Path,
+    resolved: &ResolvedModelReference,
+) -> Result<Option<ManagedBundleProvenance>, String> {
+    let Some(provenance) = load_bundle_provenance(directory)? else {
+        return Ok(None);
+    };
+    if provenance.canonical_reference != resolved.canonical_reference
+        || !constant_time_eq(
+            provenance.bundle_sha256.as_bytes(),
+            resolved.sha256.as_bytes(),
+        )
+    {
+        return Ok(None);
+    }
+    match verify_bundle_files_present(directory, &provenance) {
+        Ok(()) => Ok(Some(provenance)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Reads the bundle sidecar inside `directory`, if there is one.
+///
+/// A missing sidecar is `Ok(None)` — the directory is then not an app-owned
+/// model. A corrupt or mismatched one is an error, so callers fail closed
+/// rather than running weights whose provenance cannot be read.
+pub fn load_bundle_provenance(directory: &Path) -> Result<Option<ManagedBundleProvenance>, String> {
+    let sidecar = directory.join(BUNDLE_PROVENANCE_FILE);
+    let metadata = match fs::symlink_metadata(&sidecar) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Failed to inspect model bundle provenance {}: {error}",
+                sidecar.display()
+            ))
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.len() > MAX_PROVENANCE_BYTES {
+        return Err(format!(
+            "Model bundle provenance {} is not a readable regular file",
+            sidecar.display()
+        ));
+    }
+    let bytes = fs::read(&sidecar).map_err(|error| {
+        format!(
+            "Failed to read model bundle provenance {}: {error}",
+            sidecar.display()
+        )
+    })?;
+    let provenance: ManagedBundleProvenance = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "Model bundle provenance {} is invalid: {error}",
+            sidecar.display()
+        )
+    })?;
+    validate_bundle_provenance_metadata(&provenance)?;
+    let local_dir_name = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("Model bundle path has no UTF-8 directory name")?;
+    if provenance.local_dir_name != local_dir_name {
+        return Err(
+            "Model bundle provenance names a different directory than it sits in".to_string(),
+        );
+    }
+    Ok(Some(provenance))
+}
+
+/// Verifies an installed bundle before a runtime is pointed at it.
+///
+/// Every file the sidecar names must be present at its recorded size, and the
+/// sidecar's own file list must still hash to the bundle digest that was
+/// consented to — so neither a swapped shard of a different length nor an
+/// edited sidecar passes.
+///
+/// ponytail: sizes, not content, on the hot path. Re-hashing tens of gigabytes
+/// of shards on every start would cost minutes; `verify_bundle_contents` below
+/// does the full check for anything that can afford it.
+pub fn verify_bundle_for_runtime(directory: &Path) -> Result<(), String> {
+    let Some(provenance) = load_bundle_provenance(directory)? else {
+        return Ok(());
+    };
+    verify_bundle_files_present(directory, &provenance)
+}
+
+fn verify_bundle_files_present(
+    directory: &Path,
+    provenance: &ManagedBundleProvenance,
+) -> Result<(), String> {
+    for file in &provenance.files {
+        let path = bundle_member_path(directory, &file.path)?;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "Managed model bundle {} is missing {}: {error}",
+                directory.display(),
+                file.path
+            )
+        })?;
+        if !metadata.file_type().is_file() || metadata.len() != file.size_bytes {
+            return Err(format!(
+                "Managed model bundle {} has a modified {}; reinstall it before running",
+                directory.display(),
+                file.path
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The full content check `verify_bundle_for_runtime` deliberately skips.
+pub fn verify_bundle_contents(directory: &Path) -> Result<(), String> {
+    let Some(provenance) = load_bundle_provenance(directory)? else {
+        return Err(format!(
+            "{} is not an app-owned model bundle",
+            directory.display()
+        ));
+    };
+    for file in &provenance.files {
+        verify_bundle_member(&bundle_member_path(directory, &file.path)?, file)?;
+    }
+    Ok(())
+}
+
+/// Deletes an installed bundle directory and everything under it.
+pub async fn delete_installed_bundle(models_dir: &Path, directory: &Path) -> Result<(), String> {
+    let models_dir = canonical_models_dir(models_dir)?;
+    validate_direct_child(&models_dir, directory)?;
+    let _install_lock = acquire_destination_lock(&models_dir, directory).await?;
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "Failed to inspect managed model bundle {}: {error}",
+                directory.display()
+            ))
+        }
+    };
+    if !metadata.file_type().is_dir() {
+        return Err(format!(
+            "Managed model bundle {} is not a directory",
+            directory.display()
+        ));
+    }
+    // Only ever remove a directory this app wrote: without the sidecar there is
+    // nothing proving the target is a model rather than a directory the user
+    // put in the models folder themselves.
+    if load_bundle_provenance(directory)?.is_none() {
+        return Err(format!(
+            "{} has no app-owned bundle provenance and was not deleted",
+            directory.display()
+        ));
+    }
+    let canonical = directory.canonicalize().map_err(|error| {
+        format!(
+            "Failed to resolve managed model bundle {}: {error}",
+            directory.display()
+        )
+    })?;
+    if canonical != directory || canonical.parent() != Some(models_dir.as_path()) {
+        return Err(format!(
+            "Managed model bundle {} changed or escapes its models directory",
+            directory.display()
+        ));
+    }
+    fs::remove_dir_all(directory).map_err(|error| {
+        format!(
+            "Failed to delete managed model bundle {}: {error}",
+            directory.display()
+        )
+    })
+}
+
+fn validate_bundle_provenance_metadata(provenance: &ManagedBundleProvenance) -> Result<(), String> {
+    if provenance.schema_version != BUNDLE_PROVENANCE_SCHEMA_VERSION {
+        return Err("Unsupported model bundle provenance schema version".to_string());
+    }
+    if !is_safe_component(&provenance.local_dir_name) {
+        return Err("Model bundle provenance contains an unsafe directory name".to_string());
+    }
+    if !provenance.requested_reference.is_empty() {
+        validate_human_text(
+            &provenance.requested_reference,
+            "requestedReference",
+            MAX_REFERENCE_BYTES,
+        )?;
+    }
+    validate_human_text(
+        &provenance.canonical_reference,
+        "canonicalReference",
+        MAX_REFERENCE_BYTES,
+    )?;
+    validate_human_text(&provenance.display_name, "displayName", 4096)?;
+    validate_human_text(&provenance.repo, "repo", 4096)?;
+    validate_hf_commit_sha(&provenance.revision)?;
+    validate_model_size(provenance.size_bytes)?;
+    let download_url = Url::parse(&provenance.download_url)
+        .map_err(|error| format!("Invalid bundle provenance download URL: {error}"))?;
+    validate_public_https_url(&download_url)
+        .map_err(|denial| format!("Bundle provenance download URL refused: {denial}"))?;
+    if let Some(url) = &provenance.license_url {
+        let url =
+            Url::parse(url).map_err(|error| format!("Invalid provenance license URL: {error}"))?;
+        validate_public_https_url(&url)
+            .map_err(|denial| format!("Provenance license URL refused: {denial}"))?;
+    }
+    if let Some(name) = &provenance.license_name {
+        validate_human_text(name, "licenseName", 4096)?;
+    }
+    if provenance.files.is_empty() {
+        return Err("Model bundle provenance lists no files".to_string());
+    }
+    let mut total = 0_u64;
+    for file in &provenance.files {
+        validate_hf_file_path(&file.path)?;
+        match (&file.sha256, &file.blob_sha1) {
+            (Some(sha256), None) => {
+                if normalize_sha256(sha256, "bundle file sha256")? != *sha256 {
+                    return Err("Bundle file SHA-256 is not canonical lowercase hex".to_string());
+                }
+            }
+            (None, Some(blob)) => {
+                if normalize_blob_sha1(blob)? != *blob {
+                    return Err("Bundle file blob id is not canonical lowercase hex".to_string());
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "Bundle file {} must carry exactly one digest",
+                    file.path
+                ))
+            }
+        }
+        let url = Url::parse(&file.download_url)
+            .map_err(|error| format!("Invalid bundle file URL: {error}"))?;
+        validate_public_https_url(&url)
+            .map_err(|denial| format!("Bundle file URL refused: {denial}"))?;
+        total = total
+            .checked_add(file.size_bytes)
+            .ok_or("Model bundle size overflow")?;
+    }
+    if total != provenance.size_bytes {
+        return Err("Model bundle provenance size does not match its file list".to_string());
+    }
+    // The digest is what the user consented to at resolve time. Recomputing it
+    // from the stored list is what stops an edited sidecar from redirecting a
+    // reinstall or a verification at a different set of files.
+    let mut files = provenance.files.clone();
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    if bundle_digest(&files) != provenance.bundle_sha256 {
+        return Err("Model bundle provenance digest does not match its file list".to_string());
+    }
+    Ok(())
+}
+
+/// The directory name an installed bundle takes under the models directory.
+fn local_bundle_dir_name(resolved: &ResolvedModelReference, disambiguated: bool) -> String {
+    let repo_name = resolved.repo.rsplit('/').next().unwrap_or("model");
+    let canonical_suffix = if disambiguated {
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(resolved.canonical_reference.as_bytes())
+        );
+        format!("-{}", &digest[..12])
+    } else {
+        String::new()
+    };
+    sanitize_component(&format!(
+        "mlx-{}{canonical_suffix}-{repo_name}",
+        &resolved.sha256[..12]
+    ))
 }
 
 /// Reads and validates the app-owned sidecar for `model_path`.
@@ -823,6 +1575,17 @@ pub fn load_provenance(model_path: &Path) -> Result<Option<ManagedModelProvenanc
 /// avoids hashing multi-gigabyte payloads on every refresh, but the runtime
 /// boundary never trusts size/header/provenance alone.
 pub fn verify_managed_model_for_runtime(model_path: &Path) -> Result<(), String> {
+    // Every caller of this is starting llama.cpp, which loads a GGUF file. A
+    // directory here is a safetensors bundle for MLX, so refuse by name rather
+    // than letting the server fail later on a path it cannot open. The guard
+    // lives here because all three callers — `llama_start`,
+    // `embed_server_start` and monkey-cli — route through it.
+    if model_path.is_dir() {
+        return Err(format!(
+            "{} is an MLX model directory; the bundled llama.cpp server only loads GGUF files",
+            model_path.display()
+        ));
+    }
     let Some(provenance) = load_provenance(model_path)? else {
         return Ok(());
     };
@@ -916,10 +1679,13 @@ pub fn find_installed_reference(
             license_url: provenance.license_url.clone(),
             artifacts: Vec::new(),
             projector_candidates: Vec::new(),
+            bundle_files: Vec::new(),
+            runtime: ModelRuntimeKind::LlamaCpp,
         };
         return Ok(Some(InstalledModelReference {
             resolved,
             provenance,
+            bundle: None,
             local_path: path,
             projector_path: None,
             model_was_new: false,
@@ -995,6 +1761,60 @@ fn parse_ollama_reference(value: &str) -> Result<OllamaReference, String> {
     })
 }
 
+/// Rewrites the paths a person actually copies out of the Hugging Face web UI
+/// into the `<owner>/<repo>@<revision>` form the rest of this parser reads.
+///
+/// The repo landing page gives `<owner>/<repo>`, which already parses. Browsing
+/// gives `<owner>/<repo>/tree/<revision>`, and clicking a file gives
+/// `<owner>/<repo>/blob/<revision>/<path>` — both of which used to reach
+/// `validate_hf_repo` as four-or-more path components and be rejected as an
+/// unsafe repo name.
+///
+/// A revision may itself contain slashes (`refs/pr/7`), which makes `blob`
+/// ambiguous: nothing in the path says where the revision ends and the file
+/// begins. `tree` has no such problem — everything after it is the revision —
+/// so that form takes multi-segment revisions, and `blob`/`resolve` take the
+/// single-segment revision the web UI emits for a branch, tag or commit.
+fn rewrite_hugging_face_web_path(path: &str) -> Result<(String, Option<String>), String> {
+    let mut segments = path.split('/');
+    let Some(owner) = segments.next() else {
+        return Ok((path.to_string(), None));
+    };
+    let Some(name) = segments.next() else {
+        return Ok((path.to_string(), None));
+    };
+    let repo = format!("{owner}/{name}");
+    let Some(kind) = segments.next() else {
+        return Ok((repo, None));
+    };
+    let rest = segments.collect::<Vec<_>>();
+    if rest.is_empty() {
+        return Err(format!(
+            "Hugging Face URL '{path}' names no revision after '{kind}'"
+        ));
+    }
+    match kind {
+        "tree" => Ok((format!("{repo}@{}", rest.join("/")), None)),
+        "blob" | "resolve" => {
+            let (revision, file) = rest.split_at(1);
+            if file.is_empty() {
+                return Err(format!(
+                    "Hugging Face URL '{path}' names no file after '{kind}'"
+                ));
+            }
+            // The file rides in the same selector slot the explicit `#file=`
+            // form uses, so one code path validates both.
+            Ok((
+                format!("{repo}@{}", revision[0]),
+                Some(format!("file={}", file.join("/"))),
+            ))
+        }
+        other => Err(format!(
+            "Hugging Face URL path '{other}' is not a repo, tree or file link"
+        )),
+    }
+}
+
 fn parse_hugging_face_reference(value: &str) -> Result<HuggingFaceReference, String> {
     let (mut path_and_revision, mut selector_value) = if value.starts_with("https://") {
         let parsed =
@@ -1012,9 +1832,12 @@ fn parse_hugging_face_reference(value: &str) -> Result<HuggingFaceReference, Str
         {
             return Err("Hugging Face URL must use https://hf.co or https://huggingface.co with no credentials, port, or query".to_string());
         }
+        let (path, file_selector) = rewrite_hugging_face_web_path(parsed.path().trim_matches('/'))?;
+        // An explicit `#file=`/`#quant=` fragment is the caller being specific,
+        // so it wins over the file a `/blob/` path implies.
         (
-            parsed.path().trim_matches('/').to_string(),
-            parsed.fragment().map(str::to_string),
+            path,
+            parsed.fragment().map(str::to_string).or(file_selector),
         )
     } else {
         let stripped = value
@@ -1219,6 +2042,8 @@ async fn resolve_ollama(
                 artifacts
             },
             projector_candidates: Vec::new(),
+            bundle_files: Vec::new(),
+            runtime: ModelRuntimeKind::LlamaCpp,
         },
         bearer_token,
     })
@@ -1274,6 +2099,11 @@ async fn resolve_hugging_face(
         .as_deref()
         .ok_or("Hugging Face metadata did not include an immutable revision SHA")?;
     validate_hf_commit_sha(revision)?;
+    if matches!(reference.selector, HuggingFaceSelector::DefaultQ4Km)
+        && is_safetensors_repo(&metadata)
+    {
+        return hugging_face_bundle_resolution(reference, &metadata, revision);
+    }
     let sibling = select_hf_sibling(&metadata, &reference.selector)?;
     let lfs = sibling.lfs.as_ref().ok_or_else(|| {
         format!(
@@ -1349,9 +2179,194 @@ async fn resolve_hugging_face(
                 artifacts
             },
             projector_candidates,
+            bundle_files: Vec::new(),
+            runtime: ModelRuntimeKind::LlamaCpp,
         },
         bearer_token: None,
     })
+}
+
+/// Whether this repository is a directory-shaped weights checkout rather than a
+/// GGUF repository.
+///
+/// Deliberately narrow: a repo that ships any single-file GGUF still resolves
+/// down the GGUF path, because that is what the bundled llama.cpp can load and
+/// what every existing install of this app expects. Only a repo with no such
+/// file, real safetensors weights and the `config.json` an MLX loader needs is
+/// treated as a directory bundle.
+fn is_safetensors_repo(metadata: &HfModelMetadata) -> bool {
+    let mut has_config = false;
+    let mut has_weights = false;
+    for sibling in &metadata.siblings {
+        let name = sibling.rfilename.as_str();
+        if is_gguf_file(name) && !is_sharded_gguf(name) {
+            return false;
+        }
+        if name == "config.json" {
+            has_config = true;
+        }
+        if name.to_ascii_lowercase().ends_with(".safetensors") {
+            has_weights = true;
+        }
+    }
+    has_config && has_weights
+}
+
+/// Resolves a whole repository at `revision` into a directory bundle.
+///
+/// Every file is taken at the pinned commit, with the digest Hugging Face
+/// publishes for it, and the bundle as a whole gets one digest over that list.
+/// That digest is what the caller sees at resolve time and hands back at
+/// install time, so the existing two-step consent boundary keeps working for a
+/// bundle exactly as it does for a single file.
+fn hugging_face_bundle_resolution(
+    reference: &HuggingFaceReference,
+    metadata: &HfModelMetadata,
+    revision: &str,
+) -> Result<InternalResolution, String> {
+    let mut files = Vec::new();
+    let mut total: u64 = 0;
+    for sibling in &metadata.siblings {
+        let file = hf_bundle_file(sibling, &reference.repo, revision)?;
+        total = total
+            .checked_add(file.size_bytes)
+            .ok_or("Hugging Face repository size overflow")?;
+        files.push(file);
+    }
+    if files.is_empty() {
+        return Err("Hugging Face repository lists no files".to_string());
+    }
+    validate_model_size(total)?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut previous: Option<&str> = None;
+    for file in &files {
+        if previous == Some(file.path.as_str()) {
+            return Err(format!("Hugging Face metadata lists '{}' twice", file.path));
+        }
+        previous = Some(file.path.as_str());
+    }
+    let bundle_sha256 = bundle_digest(&files);
+    let (license_name, license_url) = hugging_face_license(metadata, &reference.repo, revision)?;
+    let repo_name = reference.repo.rsplit('/').next().unwrap_or(&reference.repo);
+    let tree_url = hugging_face_tree_url(&reference.repo, revision)?;
+    Ok(InternalResolution {
+        public: ResolvedModelReference {
+            source: ModelReferenceSource::HuggingFace,
+            canonical_reference: format!("hf:{}@{revision}", reference.repo),
+            display_name: repo_name.to_string(),
+            repo: reference.repo.clone(),
+            revision: revision.to_string(),
+            file_name: repo_name.to_string(),
+            download_url: tree_url.to_string(),
+            sha256: bundle_sha256,
+            size_bytes: total,
+            // Nothing about a repository listing proves a chat template
+            // advertises tools, and unlike a GGUF there is no header to read
+            // it out of locally either.
+            tool_calling: false,
+            license_name,
+            license_url,
+            artifacts: Vec::new(),
+            projector_candidates: Vec::new(),
+            bundle_files: files,
+            runtime: ModelRuntimeKind::Mlx,
+        },
+        bearer_token: None,
+    })
+}
+
+/// One repository file, with whatever content address Hugging Face publishes.
+fn hf_bundle_file(
+    sibling: &HfSibling,
+    repo: &str,
+    revision: &str,
+) -> Result<ResolvedBundleFile, String> {
+    validate_hf_file_path(&sibling.rfilename)?;
+    let download_url = hugging_face_file_url(repo, revision, &sibling.rfilename, "resolve")?;
+    if let Some(lfs) = sibling.lfs.as_ref() {
+        if sibling.size.is_some_and(|size| size != lfs.size) {
+            return Err(format!(
+                "Hugging Face metadata size mismatch for '{}'",
+                sibling.rfilename
+            ));
+        }
+        return Ok(ResolvedBundleFile {
+            path: sibling.rfilename.clone(),
+            download_url: download_url.to_string(),
+            sha256: Some(normalize_sha256(&lfs.sha256, "Hugging Face LFS SHA-256")?),
+            blob_sha1: None,
+            size_bytes: lfs.size,
+        });
+    }
+    let size = sibling.size.ok_or_else(|| {
+        format!(
+            "Hugging Face file '{}' has no size and cannot be verified",
+            sibling.rfilename
+        )
+    })?;
+    // A plain Git blob is small by construction — the large ones are what LFS
+    // exists for — so a file claiming otherwise is metadata this code does not
+    // understand rather than a model file worth streaming.
+    if size > MAX_PLAIN_BLOB_BYTES {
+        return Err(format!(
+            "Hugging Face file '{}' is {size} bytes but is not stored in LFS",
+            sibling.rfilename
+        ));
+    }
+    let blob_id = sibling.blob_id.as_deref().ok_or_else(|| {
+        format!(
+            "Hugging Face file '{}' has neither an LFS digest nor a blob id",
+            sibling.rfilename
+        )
+    })?;
+    Ok(ResolvedBundleFile {
+        path: sibling.rfilename.clone(),
+        download_url: download_url.to_string(),
+        sha256: None,
+        blob_sha1: Some(normalize_blob_sha1(blob_id)?),
+        size_bytes: size,
+    })
+}
+
+/// One digest standing for a whole directory bundle.
+///
+/// Over the sorted `path\0digest\0size` of every file, so it changes if any
+/// file's content, name or size changes, and does not depend on the order the
+/// metadata happened to arrive in.
+fn bundle_digest(files: &[ResolvedBundleFile]) -> String {
+    let mut hasher = Sha256::new();
+    for file in files {
+        let digest = file
+            .sha256
+            .as_deref()
+            .or(file.blob_sha1.as_deref())
+            .unwrap_or("");
+        hasher.update(file.path.as_bytes());
+        hasher.update([0]);
+        hasher.update(digest.as_bytes());
+        hasher.update([0]);
+        hasher.update(file.size_bytes.to_string().as_bytes());
+        hasher.update([b'\n']);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn hugging_face_tree_url(repo: &str, revision: &str) -> Result<Url, String> {
+    validate_hf_repo(repo)?;
+    validate_hf_commit_sha(revision)?;
+    let mut url = Url::parse("https://huggingface.co")
+        .map_err(|error| format!("Failed to build Hugging Face tree URL: {error}"))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| "Hugging Face tree URL cannot accept path segments")?;
+        segments.extend(repo.split('/'));
+        segments.push("tree");
+        segments.push(revision);
+    }
+    validate_public_https_url(&url)
+        .map_err(|denial| format!("Hugging Face tree URL refused: {denial}"))?;
+    Ok(url)
 }
 
 fn hf_projector_artifacts(
@@ -2807,6 +3822,16 @@ fn local_file_name(resolved: &ResolvedModelReference, disambiguated: bool) -> St
 }
 
 fn sanitize_file_name(value: &str) -> String {
+    let mut output = sanitize_component(value);
+    if !output.to_ascii_lowercase().ends_with(".gguf") {
+        output.push_str(".gguf");
+    }
+    output
+}
+
+/// The shared name cleaner: ASCII alphanumerics, dot, underscore and dash, with
+/// runs of dashes collapsed and a bounded length.
+fn sanitize_component(value: &str) -> String {
     let mut output = String::with_capacity(value.len().min(180));
     let mut previous_dash = false;
     for character in value.chars() {
@@ -2826,15 +3851,11 @@ fn sanitize_file_name(value: &str) -> String {
         output.push(accepted);
     }
     let trimmed = output.trim_matches(|character| character == '.' || character == '-');
-    let mut output = if trimmed.is_empty() {
+    if trimmed.is_empty() {
         "model".to_string()
     } else {
         trimmed.to_string()
-    };
-    if !output.to_ascii_lowercase().ends_with(".gguf") {
-        output.push_str(".gguf");
     }
-    output
 }
 
 fn append_file_suffix(path: &Path, suffix: &str) -> Result<PathBuf, String> {
@@ -2849,8 +3870,11 @@ fn append_file_suffix(path: &Path, suffix: &str) -> Result<PathBuf, String> {
 }
 
 fn hugging_face_metadata_url(reference: &HuggingFaceReference) -> Result<Url, String> {
+    // No trailing slash: `path_segments_mut` would otherwise append after the
+    // empty final segment and build `/api/models//<owner>/<repo>`, which Hugging
+    // Face answers with 404.
     let mut url =
-        Url::parse("https://huggingface.co/api/models/").map_err(|error| error.to_string())?;
+        Url::parse("https://huggingface.co/api/models").map_err(|error| error.to_string())?;
     {
         let mut segments = url
             .path_segments_mut()
@@ -3076,6 +4100,40 @@ fn normalize_sha256(value: &str, field: &str) -> Result<String, String> {
         return Err(format!("{field} must be a 64-character SHA-256 hex digest"));
     }
     Ok(value.to_ascii_lowercase())
+}
+
+fn normalize_blob_sha1(value: &str) -> Result<String, String> {
+    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Hugging Face blob id must be a 40-character SHA-1 hex digest".to_string());
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+/// Git's object id for a file's content: `SHA-1("blob <len>\0" || bytes)`.
+///
+/// This is what Hugging Face reports as `blobId` for anything not in LFS, so
+/// recomputing it locally verifies those files against the same content address
+/// the API published rather than against their length alone.
+fn git_blob_sha1_file(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path)
+        .map_err(|error| format!("Failed to open {} for hashing: {error}", path.display()))?;
+    let length = file
+        .metadata()
+        .map_err(|error| format!("Failed to inspect {}: {error}", path.display()))?
+        .len();
+    let mut hasher = Sha1::new();
+    hasher.update(format!("blob {length}\0").as_bytes());
+    let mut buffer = vec![0_u8; 128 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn validate_model_size(size: u64) -> Result<(), String> {
@@ -3582,7 +4640,34 @@ mod tests {
                 sha256: sha.to_string(),
                 size,
             }),
+            blob_id: None,
         }
+    }
+
+    /// A file stored as an ordinary Git blob, the way `config.json` and the
+    /// tokenizer are: a size and a blob id, no LFS entry.
+    fn plain_sibling(name: &str, blob_id: &str, size: u64) -> HfSibling {
+        HfSibling {
+            rfilename: name.to_string(),
+            size: Some(size),
+            lfs: None,
+            blob_id: Some(blob_id.to_string()),
+        }
+    }
+
+    fn blob_id(character: char) -> String {
+        std::iter::repeat(character).take(40).collect()
+    }
+
+    /// A minimal MLX-shaped repository: safetensors weights in LFS, plus the
+    /// plain files a loader needs.
+    fn mlx_metadata() -> HfModelMetadata {
+        hf_metadata(vec![
+            plain_sibling("config.json", &blob_id('1'), 1024),
+            plain_sibling("tokenizer.json", &blob_id('2'), 4096),
+            lfs_sibling("model-00001-of-00002.safetensors", &digest('a'), 8_000),
+            lfs_sibling("model-00002-of-00002.safetensors", &digest('b'), 9_000),
+        ])
     }
 
     fn hf_metadata(siblings: Vec<HfSibling>) -> HfModelMetadata {
@@ -4063,6 +5148,473 @@ mod tests {
     }
 
     #[test]
+    fn hugging_face_web_urls_resolve_to_repo_revision_and_file() {
+        assert_eq!(
+            parse_model_reference(
+                "https://huggingface.co/mlx-community/Qwen3.8-27B-OptiQ-4bit/tree/main"
+            )
+            .unwrap(),
+            ParsedModelReference::HuggingFace(HuggingFaceReference {
+                repo: "mlx-community/Qwen3.8-27B-OptiQ-4bit".to_string(),
+                requested_revision: "main".to_string(),
+                selector: HuggingFaceSelector::DefaultQ4Km,
+            })
+        );
+        // Everything after `tree` is the revision, so a multi-segment ref works.
+        assert_eq!(
+            parse_model_reference("https://huggingface.co/owner/repo/tree/refs/pr/7").unwrap(),
+            ParsedModelReference::HuggingFace(HuggingFaceReference {
+                repo: "owner/repo".to_string(),
+                requested_revision: "refs/pr/7".to_string(),
+                selector: HuggingFaceSelector::DefaultQ4Km,
+            })
+        );
+        // A file link installs that file, exactly as `#file=` would.
+        assert_eq!(
+            parse_model_reference("https://huggingface.co/owner/repo/blob/main/weights/model.gguf")
+                .unwrap(),
+            ParsedModelReference::HuggingFace(HuggingFaceReference {
+                repo: "owner/repo".to_string(),
+                requested_revision: "main".to_string(),
+                selector: HuggingFaceSelector::File("weights/model.gguf".to_string()),
+            })
+        );
+        // An explicit fragment still wins over the path.
+        assert_eq!(
+            parse_model_reference(
+                "https://huggingface.co/owner/repo/blob/main/model.gguf#quant=Q4_K_M"
+            )
+            .unwrap(),
+            ParsedModelReference::HuggingFace(HuggingFaceReference {
+                repo: "owner/repo".to_string(),
+                requested_revision: "main".to_string(),
+                selector: HuggingFaceSelector::Quantization("Q4_K_M".to_string()),
+            })
+        );
+        for rejected in [
+            "https://huggingface.co/owner/repo/tree",
+            "https://huggingface.co/owner/repo/blob/main",
+            "https://huggingface.co/owner/repo/discussions/3",
+        ] {
+            assert!(
+                parse_model_reference(rejected).is_err(),
+                "{rejected} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_safetensors_repo_resolves_to_a_verifiable_directory_bundle() {
+        let metadata = mlx_metadata();
+        assert!(is_safetensors_repo(&metadata));
+        let reference = HuggingFaceReference {
+            repo: "mlx-community/repo".to_string(),
+            requested_revision: "main".to_string(),
+            selector: HuggingFaceSelector::DefaultQ4Km,
+        };
+        let revision = "a".repeat(40);
+        let resolved = hugging_face_bundle_resolution(&reference, &metadata, &revision)
+            .unwrap()
+            .public;
+
+        assert!(resolved.is_directory_bundle());
+        assert_eq!(resolved.runtime, ModelRuntimeKind::Mlx);
+        assert_eq!(resolved.size_bytes, 1024 + 4096 + 8_000 + 9_000);
+        assert_eq!(resolved.bundle_files.len(), 4);
+        // LFS weights carry a SHA-256; plain files carry a blob id. Exactly one
+        // digest each, so nothing installs on size alone.
+        for file in &resolved.bundle_files {
+            assert_ne!(
+                file.sha256.is_some(),
+                file.blob_sha1.is_some(),
+                "{} must carry exactly one digest",
+                file.path
+            );
+        }
+        assert_eq!(
+            resolved.canonical_reference,
+            format!("hf:mlx-community/repo@{revision}")
+        );
+
+        // The bundle digest is the consent boundary: it must not depend on the
+        // order the metadata arrived in, and must move if any file does.
+        let mut reordered = resolved.bundle_files.clone();
+        reordered.reverse();
+        reordered.sort_by(|left, right| left.path.cmp(&right.path));
+        assert_eq!(bundle_digest(&reordered), resolved.sha256);
+        let mut altered = resolved.bundle_files.clone();
+        altered[0].size_bytes += 1;
+        assert_ne!(bundle_digest(&altered), resolved.sha256);
+    }
+
+    #[test]
+    fn a_repo_holding_a_single_file_gguf_still_resolves_as_a_gguf() {
+        // The GGUF path is what the bundled llama.cpp can load, so a repo that
+        // offers one is never re-read as a directory bundle.
+        let mixed = hf_metadata(vec![
+            plain_sibling("config.json", &blob_id('1'), 16),
+            lfs_sibling("model.safetensors", &digest('a'), 32),
+            lfs_sibling("model-Q4_K_M.gguf", &digest('b'), 64),
+        ]);
+        assert!(!is_safetensors_repo(&mixed));
+        // Weights without a config are not a loadable directory either.
+        assert!(!is_safetensors_repo(&hf_metadata(vec![lfs_sibling(
+            "model.safetensors",
+            &digest('a'),
+            32
+        )])));
+    }
+
+    #[test]
+    fn bundle_provenance_rejects_an_edited_file_list() {
+        let metadata = mlx_metadata();
+        let reference = HuggingFaceReference {
+            repo: "mlx-community/repo".to_string(),
+            requested_revision: "main".to_string(),
+            selector: HuggingFaceSelector::DefaultQ4Km,
+        };
+        let revision = "a".repeat(40);
+        let resolved = hugging_face_bundle_resolution(&reference, &metadata, &revision)
+            .unwrap()
+            .public;
+        let provenance = ManagedBundleProvenance {
+            schema_version: BUNDLE_PROVENANCE_SCHEMA_VERSION,
+            source: resolved.source,
+            requested_reference: "hf:mlx-community/repo".to_string(),
+            canonical_reference: resolved.canonical_reference.clone(),
+            display_name: resolved.display_name.clone(),
+            repo: resolved.repo.clone(),
+            revision: resolved.revision.clone(),
+            local_dir_name: "mlx-000000000000-repo".to_string(),
+            download_url: resolved.download_url.clone(),
+            bundle_sha256: resolved.sha256.clone(),
+            size_bytes: resolved.size_bytes,
+            runtime: ModelRuntimeKind::Mlx,
+            tool_calling: false,
+            files: resolved.bundle_files.clone(),
+            license_name: None,
+            license_url: None,
+            installed_at_ms: 1,
+        };
+        validate_bundle_provenance_metadata(&provenance).unwrap();
+
+        // Swapping a recorded digest without redoing the bundle digest — which
+        // the caller consented to — must not validate.
+        let mut tampered = provenance.clone();
+        tampered.files[0].blob_sha1 = Some(blob_id('9'));
+        assert!(validate_bundle_provenance_metadata(&tampered).is_err());
+
+        // Nor may the totals drift from the list.
+        let mut resized = provenance.clone();
+        resized.size_bytes += 1;
+        assert!(validate_bundle_provenance_metadata(&resized).is_err());
+    }
+
+    #[test]
+    fn bundle_members_are_verified_by_content_not_length() {
+        let root = test_dir("bundle-verify");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.json");
+        fs::write(&path, b"{\"hidden_size\": 8}").unwrap();
+        // Git's own object id for that content, which is what Hugging Face
+        // reports as `blobId` for a file that is not in LFS.
+        let expected = git_blob_sha1_file(&path).unwrap();
+        let file = ResolvedBundleFile {
+            path: "config.json".to_string(),
+            download_url: "https://huggingface.co/owner/repo/resolve/main/config.json".to_string(),
+            sha256: None,
+            blob_sha1: Some(expected.clone()),
+            size_bytes: fs::metadata(&path).unwrap().len(),
+        };
+        verify_bundle_member(&path, &file).unwrap();
+
+        // Same length, different bytes: length alone would accept this.
+        fs::write(&path, b"{\"hidden_size\": 9}").unwrap();
+        assert!(verify_bundle_member(&path, &file)
+            .unwrap_err()
+            .contains("blob-id verification"));
+
+        let mut mismatched = file.clone();
+        mismatched.size_bytes += 1;
+        assert!(verify_bundle_member(&path, &mismatched).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_bundle_member_may_not_escape_its_directory() {
+        let root = Path::new("/models/mlx-repo");
+        assert_eq!(
+            bundle_member_path(root, "optiq/metadata.json").unwrap(),
+            root.join("optiq").join("metadata.json")
+        );
+        for unsafe_member in ["../escape.json", "/etc/passwd", "a/../../b"] {
+            assert!(
+                bundle_member_path(root, unsafe_member).is_err(),
+                "{unsafe_member} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn llama_cpp_refuses_a_directory_shaped_model() {
+        let root = test_dir("mlx-runtime-guard");
+        fs::create_dir_all(&root).unwrap();
+        assert!(verify_managed_model_for_runtime(&root)
+            .unwrap_err()
+            .contains("only loads GGUF"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The real payload the API returns for an MLX repository, so the field
+    /// names this code reads (`blobId`, `lfs.sha256`) are checked against what
+    /// Hugging Face actually sends rather than against a hand-written mock.
+    #[test]
+    fn a_real_mlx_repository_payload_resolves() {
+        let metadata: HfModelMetadata = serde_json::from_str(include_str!(
+            "../fixtures/model_sources/hf-mlx-repo-metadata.json"
+        ))
+        .expect("fixture parses as Hugging Face model metadata");
+        assert!(is_safetensors_repo(&metadata));
+        let revision = metadata.sha.clone().unwrap();
+        let reference = HuggingFaceReference {
+            repo: "mlx-community/Qwen3.8-27B-OptiQ-4bit".to_string(),
+            requested_revision: "main".to_string(),
+            selector: HuggingFaceSelector::DefaultQ4Km,
+        };
+        let resolved = hugging_face_bundle_resolution(&reference, &metadata, &revision)
+            .unwrap()
+            .public;
+
+        assert_eq!(resolved.runtime, ModelRuntimeKind::Mlx);
+        assert_eq!(resolved.bundle_files.len(), metadata.siblings.len());
+        // Sharded weights and the files inside `optiq/` both come along; the
+        // whole repository is the model.
+        let paths: Vec<&str> = resolved
+            .bundle_files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert!(paths.contains(&"model-00004-of-00004.safetensors"));
+        assert!(paths.contains(&"optiq/metadata.json"));
+        assert!(paths.contains(&"config.json"));
+        for file in &resolved.bundle_files {
+            assert!(
+                file.download_url.starts_with(&format!(
+                    "https://huggingface.co/mlx-community/Qwen3.8-27B-OptiQ-4bit/resolve/{revision}/"
+                )),
+                "{} must download from the pinned commit",
+                file.path
+            );
+        }
+        // Which files are in LFS is a repository's own choice, not a rule about
+        // extensions — here the four shards, the two `optiq/` tensors and
+        // `tokenizer.json`, while `config.json` and the chat template are plain
+        // blobs. That mix is exactly why both digest kinds are handled.
+        let lfs = resolved
+            .bundle_files
+            .iter()
+            .filter(|file| file.sha256.is_some())
+            .count();
+        assert_eq!(lfs, 7);
+        assert_eq!(resolved.bundle_files.len() - lfs, 9);
+        assert!(resolved.size_bytes > 20_000_000_000);
+    }
+
+    /// End-to-end against the live Hugging Face API. Ignored by default so the
+    /// suite stays offline; run with
+    /// `cargo test --lib resolves_a_live_mlx_repository -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires network access to huggingface.co"]
+    async fn resolves_a_live_mlx_repository() {
+        let resolved = resolve_reference(
+            "https://huggingface.co/mlx-community/Qwen3.8-27B-OptiQ-4bit/tree/main",
+        )
+        .await
+        .expect("a public MLX repository resolves");
+        assert!(resolved.is_directory_bundle());
+        assert_eq!(resolved.runtime, ModelRuntimeKind::Mlx);
+        assert_eq!(resolved.repo, "mlx-community/Qwen3.8-27B-OptiQ-4bit");
+        // Resolution pins the mutable ref to the commit it saw.
+        assert_ne!(resolved.revision, "main");
+        validate_hf_commit_sha(&resolved.revision).unwrap();
+        assert!(resolved
+            .bundle_files
+            .iter()
+            .any(|file| file.path == "config.json"));
+    }
+
+    /// Builds a bundle on disk the way a finished install leaves one, then
+    /// exercises what every later read of it depends on: the sidecar loads, a
+    /// tampered file is caught, and delete refuses anything the app did not
+    /// write.
+    #[tokio::test]
+    async fn an_installed_bundle_loads_verifies_and_deletes() {
+        let models_dir = test_dir("bundle-lifecycle");
+        fs::create_dir_all(&models_dir).unwrap();
+        // Callers hand these functions canonical paths (`models_delete` does);
+        // on macOS the temp dir is a symlink, so canonicalize here too.
+        let models_dir = models_dir.canonicalize().unwrap();
+        let directory = models_dir.join("mlx-000000000000-repo");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("config.json"), b"{}").unwrap();
+        fs::write(directory.join("model.safetensors"), b"weights").unwrap();
+
+        let files = vec![
+            ResolvedBundleFile {
+                path: "config.json".to_string(),
+                download_url: "https://huggingface.co/owner/repo/resolve/main/config.json"
+                    .to_string(),
+                sha256: None,
+                blob_sha1: Some(git_blob_sha1_file(&directory.join("config.json")).unwrap()),
+                size_bytes: 2,
+            },
+            ResolvedBundleFile {
+                path: "model.safetensors".to_string(),
+                download_url: "https://huggingface.co/owner/repo/resolve/main/model.safetensors"
+                    .to_string(),
+                sha256: Some(sha256_file(&directory.join("model.safetensors")).unwrap()),
+                blob_sha1: None,
+                size_bytes: 7,
+            },
+        ];
+        let provenance = ManagedBundleProvenance {
+            schema_version: BUNDLE_PROVENANCE_SCHEMA_VERSION,
+            source: ModelReferenceSource::HuggingFace,
+            requested_reference: "https://huggingface.co/owner/repo/tree/main".to_string(),
+            canonical_reference: format!("hf:owner/repo@{}", "a".repeat(40)),
+            display_name: "repo".to_string(),
+            repo: "owner/repo".to_string(),
+            revision: "a".repeat(40),
+            local_dir_name: "mlx-000000000000-repo".to_string(),
+            download_url: format!("https://huggingface.co/owner/repo/tree/{}", "a".repeat(40)),
+            bundle_sha256: bundle_digest(&files),
+            size_bytes: 9,
+            runtime: ModelRuntimeKind::Mlx,
+            tool_calling: false,
+            files,
+            license_name: None,
+            license_url: None,
+            installed_at_ms: 1,
+        };
+        fs::write(
+            directory.join(BUNDLE_PROVENANCE_FILE),
+            serde_json::to_vec(&provenance).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_bundle_provenance(&directory).unwrap().unwrap();
+        assert_eq!(loaded, provenance);
+        verify_bundle_for_runtime(&directory).unwrap();
+        verify_bundle_contents(&directory).unwrap();
+
+        // Same length, different bytes: the cheap start-time check passes and
+        // the full one catches it, which is the trade the two halves make.
+        fs::write(directory.join("model.safetensors"), b"WEIGHTS").unwrap();
+        verify_bundle_for_runtime(&directory).unwrap();
+        assert!(verify_bundle_contents(&directory).is_err());
+        // A different length fails even the cheap check.
+        fs::write(directory.join("model.safetensors"), b"short").unwrap();
+        assert!(verify_bundle_for_runtime(&directory).is_err());
+
+        // A directory the user put here themselves is not the app's to remove.
+        let foreign = models_dir.join("notes");
+        fs::create_dir_all(&foreign).unwrap();
+        let refusal = delete_installed_bundle(&models_dir, &foreign)
+            .await
+            .unwrap_err();
+        assert!(
+            refusal.contains("no app-owned bundle provenance"),
+            "unexpected refusal: {refusal}"
+        );
+        assert!(foreign.is_dir());
+
+        delete_installed_bundle(&models_dir, &directory)
+            .await
+            .unwrap();
+        assert!(!directory.exists());
+        let _ = fs::remove_dir_all(&models_dir);
+    }
+
+    /// The whole install, against the live API and a real (small) MLX
+    /// repository: resolve a `/tree/` URL, download every file, verify each one
+    /// against its own content address, and publish the directory.
+    ///
+    /// Ignored by default — it transfers a few hundred megabytes. Run with
+    /// `cargo test --lib installs_a_live_mlx_repository -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "requires network access and downloads ~300MB"]
+    async fn installs_a_live_mlx_repository() {
+        let models_dir = test_dir("bundle-install-live");
+        fs::create_dir_all(&models_dir).unwrap();
+        let models_dir = models_dir.canonicalize().unwrap();
+        let reference = "https://huggingface.co/mlx-community/Qwen2.5-0.5B-Instruct-4bit/tree/main";
+
+        let resolved = resolve_reference(reference).await.unwrap();
+        assert!(resolved.is_directory_bundle());
+        let installed = install_within_scope(
+            &models_dir,
+            reference,
+            &resolved.sha256,
+            ProjectorSelection::Automatic,
+            None,
+            |_| {},
+        )
+        .await
+        .expect("a public MLX repository installs");
+
+        assert!(installed.model_was_new);
+        let bundle = installed.bundle.as_ref().expect("a bundle sidecar");
+        assert_eq!(bundle.runtime, ModelRuntimeKind::Mlx);
+        assert!(installed.local_path.is_dir());
+        // What an MLX loader is handed: real files at real paths, not an
+        // archive or a merged blob.
+        assert!(installed.local_path.join("config.json").is_file());
+        // Full content verification, not just the size check start-up does.
+        verify_bundle_contents(&installed.local_path).unwrap();
+
+        // Installing again is idempotent: same directory, nothing re-downloaded.
+        let again = install_within_scope(
+            &models_dir,
+            reference,
+            &resolved.sha256,
+            ProjectorSelection::Automatic,
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(!again.model_was_new);
+        assert_eq!(again.local_path, installed.local_path);
+
+        delete_installed_bundle(&models_dir, &installed.local_path)
+            .await
+            .unwrap();
+        let _ = fs::remove_dir_all(&models_dir);
+    }
+
+    #[test]
+    fn hf_metadata_url_has_no_empty_path_segment() {
+        let reference = HuggingFaceReference {
+            repo: "mlx-community/Qwen3.8-27B-OptiQ-4bit".to_string(),
+            requested_revision: "main".to_string(),
+            selector: HuggingFaceSelector::DefaultQ4Km,
+        };
+        assert_eq!(
+            hugging_face_metadata_url(&reference).unwrap().as_str(),
+            "https://huggingface.co/api/models/mlx-community/Qwen3.8-27B-OptiQ-4bit/revision/main?blobs=true"
+        );
+
+        let nested = HuggingFaceReference {
+            requested_revision: "refs/pr/7".to_string(),
+            ..reference
+        };
+        assert_eq!(
+            hugging_face_metadata_url(&nested).unwrap().as_str(),
+            "https://huggingface.co/api/models/mlx-community/Qwen3.8-27B-OptiQ-4bit/revision/refs/pr/7?blobs=true"
+        );
+    }
+
+    #[test]
     fn ollama_manifest_requires_exactly_one_model_layer() {
         let layer = OciLayer {
             media_type: OLLAMA_MODEL_MEDIA_TYPE.to_string(),
@@ -4197,6 +5749,8 @@ mod tests {
             license_url: None,
             artifacts: Vec::new(),
             projector_candidates: vec![first.clone(), second.clone()],
+            bundle_files: Vec::new(),
+            runtime: ModelRuntimeKind::LlamaCpp,
         };
 
         assert!(
@@ -4257,6 +5811,7 @@ mod tests {
             rfilename: "model-Q4_K_M.gguf".to_string(),
             size: Some(12),
             lfs: None,
+            blob_id: None,
         }]);
         assert!(select_hf_sibling(
             &missing_lfs,
@@ -4352,6 +5907,7 @@ mod tests {
             rfilename: "LICENSE".to_string(),
             size: Some(12),
             lfs: None,
+            blob_id: None,
         }]);
         metadata.card_data = Some(HfCardData {
             license: Some(serde_json::Value::String("apache-2.0".to_string())),
@@ -4610,6 +6166,7 @@ mod tests {
                 rfilename: "mmproj-old.gguf".to_string(),
                 size: Some(12),
                 lfs: None,
+                blob_id: None,
             },
         ]);
 
@@ -4651,6 +6208,8 @@ mod tests {
             license_url: None,
             artifacts: Vec::new(),
             projector_candidates: Vec::new(),
+            bundle_files: Vec::new(),
+            runtime: ModelRuntimeKind::LlamaCpp,
         };
         let provenance = provenance_for(
             &resolved,
@@ -4973,6 +6532,8 @@ mod tests {
             )),
             artifacts: Vec::new(),
             projector_candidates: Vec::new(),
+            bundle_files: Vec::new(),
+            runtime: ModelRuntimeKind::LlamaCpp,
         };
         let provenance = provenance_for(
             &resolved,
@@ -5035,6 +6596,8 @@ mod tests {
             license_url: None,
             artifacts: Vec::new(),
             projector_candidates: Vec::new(),
+            bundle_files: Vec::new(),
+            runtime: ModelRuntimeKind::LlamaCpp,
         };
         let provenance = provenance_for(
             &resolved,
@@ -5086,6 +6649,8 @@ mod tests {
             license_url: None,
             artifacts: Vec::new(),
             projector_candidates: Vec::new(),
+            bundle_files: Vec::new(),
+            runtime: ModelRuntimeKind::LlamaCpp,
         };
         let local_file_name = local_file_name(&resolved, false);
         let model_path = directory.join(&local_file_name);
@@ -5134,6 +6699,8 @@ mod tests {
             license_url: None,
             artifacts: Vec::new(),
             projector_candidates: Vec::new(),
+            bundle_files: Vec::new(),
+            runtime: ModelRuntimeKind::LlamaCpp,
         };
         let first_name = local_file_name(&first, true);
         first.canonical_reference.push_str("-different");
@@ -5175,6 +6742,8 @@ mod tests {
             license_url: None,
             artifacts: Vec::new(),
             projector_candidates: Vec::new(),
+            bundle_files: Vec::new(),
+            runtime: ModelRuntimeKind::LlamaCpp,
         };
         let provenance = provenance_for(
             &resolved,
@@ -5233,6 +6802,8 @@ mod tests {
             license_url: None,
             artifacts: Vec::new(),
             projector_candidates: Vec::new(),
+            bundle_files: Vec::new(),
+            runtime: ModelRuntimeKind::LlamaCpp,
         };
         let value = serde_json::to_value(dto).unwrap();
         assert_eq!(value["source"], "ollama_registry");

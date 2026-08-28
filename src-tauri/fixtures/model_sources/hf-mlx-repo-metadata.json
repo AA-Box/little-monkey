@@ -1,0 +1,123 @@
+{
+  "id": "mlx-community/Qwen3.8-27B-OptiQ-4bit",
+  "private": false,
+  "gated": false,
+  "sha": "b04599de95d7a9bfbd7f208d347c0f10d9432a42",
+  "siblings": [
+    {
+      "rfilename": ".gitattributes",
+      "blobId": "52373fe24473b1aa44333d318f578ae6bf04b49b",
+      "size": 1570
+    },
+    {
+      "rfilename": "README.md",
+      "blobId": "b6d59ec5441524afbb716a491a17cff86770d19f",
+      "size": 4176
+    },
+    {
+      "rfilename": "chat_template.jinja",
+      "blobId": "c0c686f9c38d70d179fb7b5f5aa7530bc913dda3",
+      "size": 8952
+    },
+    {
+      "rfilename": "config.json",
+      "blobId": "3814f090a1ef63f90aef559f911f94f52026f119",
+      "size": 109122
+    },
+    {
+      "rfilename": "generation_config.json",
+      "blobId": "023756cfadf88e5bf69eefeee3e172f38c448d64",
+      "size": 202
+    },
+    {
+      "rfilename": "model-00001-of-00004.safetensors",
+      "blobId": "e209b3f9d57a087a73e0d7de6d7e954ddaaecd96",
+      "size": 5324175241,
+      "lfs": {
+        "sha256": "d0dd221254f020175cf634ec2a471f2ef477e8c399fec8677cd7afdfef173b16",
+        "size": 5324175241,
+        "pointerSize": 135
+      }
+    },
+    {
+      "rfilename": "model-00002-of-00004.safetensors",
+      "blobId": "0802d4e81e64e9c9f36bc0d443bbada60b1f8431",
+      "size": 5334249716,
+      "lfs": {
+        "sha256": "ac8ce5aab800be50306de5ac8039581983afeab0f86a6b2eec4257b1dee65ad0",
+        "size": 5334249716,
+        "pointerSize": 135
+      }
+    },
+    {
+      "rfilename": "model-00003-of-00004.safetensors",
+      "blobId": "d29891b5e531c78f5ff4ba0d4b004b869dd1da2f",
+      "size": 5361861644,
+      "lfs": {
+        "sha256": "95c5e2414c4e9dd0923b1cac8ec198d832fed3a1ec431d4d96ba4207f5efa366",
+        "size": 5361861644,
+        "pointerSize": 135
+      }
+    },
+    {
+      "rfilename": "model-00004-of-00004.safetensors",
+      "blobId": "7859123fd3a334f8eafa60cfb53128db74e26ef1",
+      "size": 3405365120,
+      "lfs": {
+        "sha256": "990c5216374a1d6fe64c84abed76c07e510a8cf5440644df38f1c464f53226ee",
+        "size": 3405365120,
+        "pointerSize": 135
+      }
+    },
+    {
+      "rfilename": "model.safetensors.index.json",
+      "blobId": "448e5efe5e80bbd9f91222ba6f98d9c22ca4ff86",
+      "size": 208920
+    },
+    {
+      "rfilename": "optiq/metadata.json",
+      "blobId": "735650569aea2909fb49ab2e408c0ab30a298ee4",
+      "size": 52391
+    },
+    {
+      "rfilename": "optiq/mtp.safetensors",
+      "blobId": "3b1a05506cbf869411e83d7d0f8a18ca785bd06f",
+      "size": 314300461,
+      "lfs": {
+        "sha256": "e3054bcb1b6fa35f482f6cca7cb3032ba9aa31a3cfb4d1e358d5ebb20b78d0f8",
+        "size": 314300461,
+        "pointerSize": 134
+      }
+    },
+    {
+      "rfilename": "optiq/optiq_vision.safetensors",
+      "blobId": "ed6b244e376797e10f01f40e6ea7fec107cd079c",
+      "size": 921497211,
+      "lfs": {
+        "sha256": "68c8d91f021c7b8708bd29982a9ce4e7cbd896104109296f6d9d5521c0d30914",
+        "size": 921497211,
+        "pointerSize": 134
+      }
+    },
+    {
+      "rfilename": "optiq/sensitivity.json",
+      "blobId": "e73735a317deffa187f174307f543d3a2729684d",
+      "size": 110806
+    },
+    {
+      "rfilename": "tokenizer.json",
+      "blobId": "5520bfd2dd834ce386c1312c410fa71af56db5ad",
+      "size": 19989325,
+      "lfs": {
+        "sha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+        "size": 19989325,
+        "pointerSize": 133
+      }
+    },
+    {
+      "rfilename": "tokenizer_config.json",
+      "blobId": "ffb89ca03b544a12d5ef91127a6806384f9e8092",
+      "size": 1202
+    }
+  ]
+}
