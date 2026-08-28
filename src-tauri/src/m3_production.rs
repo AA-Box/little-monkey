@@ -3943,9 +3943,10 @@ fn mlx_models(
             capabilities: MlxModelCapabilities {
                 chat: true,
                 tool_calling: bundle.provenance.tool_calling,
-                // Neither is readable from a repository listing, and claiming a
-                // capability the weights do not have produces a broken turn.
-                vision: false,
+                vision: bundle.provenance.vision,
+                // Not readable from the model's own files the way the other two
+                // are, and claiming a capability the weights do not have
+                // produces a broken turn.
                 structured_output: false,
             },
         });

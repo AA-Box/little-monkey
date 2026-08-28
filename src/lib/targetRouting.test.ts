@@ -73,7 +73,7 @@ describe("MLX local runtime", () => {
     useModelStore.setState({ installed: [model], active: model });
     invokeMock.mockImplementation((command: string) => {
       if (command === "mlx_chat_status") {
-        return Promise.resolve({ running: true, port: 51234, modelId: "m", modelPath: model.path });
+        return Promise.resolve({ running: true, port: 51234, modelId: "m", modelPath: model.path, vision: true });
       }
       // llama-server is legitimately stopped while MLX holds the slot; reading
       // it here would resolve the turn to a port with nothing behind it.
@@ -87,6 +87,7 @@ describe("MLX local runtime", () => {
 
     expect(target).toMatchObject({ kind: "local", baseUrl: "http://127.0.0.1:51234" });
     expect(useModelStore.getState().llamaStatus).toBe("ready");
+    expect(useModelStore.getState().llamaVisionEnabled).toBe(true);
   });
 
   it("falls back to llama-server when the active model is a GGUF", async () => {
@@ -110,7 +111,7 @@ describe("MLX local runtime", () => {
     const mlx = mlxModel();
     invokeMock.mockImplementation((command: string) => {
       if (command === "mlx_chat_status") {
-        return Promise.resolve({ running: true, port: 51234, modelId: "m", modelPath: mlx.path });
+        return Promise.resolve({ running: true, port: 51234, modelId: "m", modelPath: mlx.path, vision: false });
       }
       return Promise.resolve({ status: "ready", port: 8090, model_path: "/models/other.gguf", projector_path: null, vision_enabled: false });
     });

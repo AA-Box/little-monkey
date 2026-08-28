@@ -243,6 +243,11 @@ pub struct ManagedBundleProvenance {
     /// sidecars written before the field existed.
     #[serde(default)]
     pub tool_calling: bool,
+    /// Whether the model carries a vision tower, read from its own
+    /// `config.json` at install time. Defaulted for sidecars written before the
+    /// field existed.
+    #[serde(default)]
+    pub vision: bool,
     pub files: Vec<ResolvedBundleFile>,
     pub license_name: Option<String>,
     pub license_url: Option<String>,
@@ -1057,6 +1062,7 @@ where
         return Err("Model bundle installation cancelled".to_string());
     }
     let tool_calling = bundle_advertises_tools(&staging);
+    let vision = bundle_has_vision_tower(&staging);
     let provenance = ManagedBundleProvenance {
         schema_version: BUNDLE_PROVENANCE_SCHEMA_VERSION,
         source: resolved.source,
@@ -1071,6 +1077,7 @@ where
         size_bytes: resolved.size_bytes,
         runtime: resolved.runtime,
         tool_calling,
+        vision,
         files: resolved.bundle_files.clone(),
         license_name: resolved.license_name.clone(),
         license_url: resolved.license_url.clone(),
@@ -1132,6 +1139,29 @@ fn bundle_advertises_tools(directory: &Path) -> bool {
         .get("chat_template")
         .and_then(|value| value.as_str())
         .is_some_and(embedded_jinja_advertises_tools)
+}
+
+/// Whether a staged bundle carries a vision tower.
+///
+/// `vision_config` is the transformers convention for a sub-config describing
+/// one, and it is what a multimodal MLX conversion keeps — the same evidence
+/// `mlx_server.py` uses to decide which stack to load the weights with, and
+/// deliberately the same rule, because a capability the app advertises and the
+/// service then refuses is worse than one it never offered.
+///
+/// Read from the model's own files rather than from its hub tags or its name:
+/// those are metadata a repository author writes, and this decides whether the
+/// app offers a user an image attachment.
+fn bundle_has_vision_tower(directory: &Path) -> bool {
+    let Some(config) = read_bounded_text(&directory.join("config.json")) else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&config) else {
+        return false;
+    };
+    parsed
+        .get("vision_config")
+        .is_some_and(serde_json::Value::is_object)
 }
 
 /// Reads a small text file, or `None` if it is missing, unreadable, oversized
@@ -5291,6 +5321,7 @@ mod tests {
             size_bytes: resolved.size_bytes,
             runtime: ModelRuntimeKind::Mlx,
             tool_calling: false,
+            vision: false,
             files: resolved.bundle_files.clone(),
             license_name: None,
             license_url: None,
@@ -5491,6 +5522,7 @@ mod tests {
             size_bytes: 9,
             runtime: ModelRuntimeKind::Mlx,
             tool_calling: false,
+            vision: false,
             files,
             license_name: None,
             license_url: None,
@@ -5590,6 +5622,43 @@ mod tests {
             .await
             .unwrap();
         let _ = fs::remove_dir_all(&models_dir);
+    }
+
+    /// The capability the app offers an image attachment on, read from the
+    /// model's own files rather than from what its repository calls itself.
+    #[test]
+    fn a_vision_tower_is_read_out_of_the_models_own_config() {
+        let root = test_dir("bundle-vision");
+        fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.json");
+
+        // The shape the 27B OptiQ conversion ships.
+        fs::write(
+            &config,
+            br#"{"model_type":"qwen3_5","vision_config":{"depth":2},"image_token_id":7}"#,
+        )
+        .unwrap();
+        assert!(bundle_has_vision_tower(&root));
+
+        for text_only in [
+            &br#"{"model_type":"llama"}"#[..],
+            // Present but not a config: a name is not a tower.
+            &br#"{"vision_config":"yes"}"#[..],
+            &br#"{"vision_config":null}"#[..],
+            b"not json at all",
+        ] {
+            fs::write(&config, text_only).unwrap();
+            assert!(
+                !bundle_has_vision_tower(&root),
+                "{}",
+                String::from_utf8_lossy(text_only)
+            );
+        }
+
+        // A bundle with no config at all claims nothing.
+        fs::remove_file(&config).unwrap();
+        assert!(!bundle_has_vision_tower(&root));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
