@@ -1,0 +1,229 @@
+name: Matrix encrypted installed-service E2E
+
+on:
+  pull_request:
+    paths:
+      - "src-tauri/examples/matrix_encrypted_installed_service_e2e.rs"
+      - "src-tauri/src/bin/monkey-cli/daemon/adapters/matrix.rs"
+      - "src-tauri/src/bin/monkey-cli/daemon/**"
+      - "src-tauri/src/bin/monkey-cli/channels_cli.rs"
+      - ".github/workflows/matrix-encrypted-installed-service-e2e.yml"
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: matrix-encrypted-installed-service-e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  acceptance:
+    name: encrypted Synapse -> installed daemon -> agent -> second device
+    runs-on: ubuntu-22.04
+    timeout-minutes: 50
+    env:
+      LITTLE_MONKEY_REQUIRE_MATRIX_INSTALLED_SERVICE_E2E: "1"
+      MATRIX_E2E_HOMESERVER: http://localhost:8008
+      SYNAPSE_IMAGE: matrixdotorg/synapse:v1.159.0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native service and keyring dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            build-essential dbus dbus-user-session dbus-x11 gnome-keyring \
+            libdbus-1-dev jq
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri
+          key: matrix-encrypted-installed-service
+
+      - name: Start official Synapse
+        shell: bash
+        run: |
+          set -euo pipefail
+          data="$RUNNER_TEMP/lm-synapse"
+          mkdir -p "$data"
+
+          docker run --rm \
+            -v "$data:/data" \
+            -e SYNAPSE_SERVER_NAME=localhost \
+            -e SYNAPSE_REPORT_STATS=no \
+            "$SYNAPSE_IMAGE" generate
+
+          # This secret is disposable and local to this isolated CI homeserver.
+          # It exists only so the official Synapse registration helper can
+          # create two real users without exposing public registration.
+          printf '\nregistration_shared_secret: "little-monkey-matrix-e2e-registration"\n' \
+            >> "$data/homeserver.yaml"
+
+          docker run -d --name lm-synapse \
+            -p 8008:8008 \
+            -v "$data:/data" \
+            "$SYNAPSE_IMAGE"
+
+          ready=0
+          for _ in $(seq 1 120); do
+            if curl --fail --silent http://localhost:8008/_matrix/client/versions >/dev/null; then
+              ready=1
+              break
+            fi
+            if ! docker inspect -f '{{.State.Running}}' lm-synapse 2>/dev/null | grep -q true; then
+              docker logs lm-synapse >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            docker logs lm-synapse >&2 || true
+            echo "Synapse did not become ready" >&2
+            exit 1
+          fi
+
+      - name: Create two real Matrix users and an encrypted room
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=http://localhost:8008
+          bot_password='LmMatrixBot-E2E-2026!strong'
+          external_password='LmMatrixUser-E2E-2026!strong'
+
+          docker exec lm-synapse register_new_matrix_user \
+            -c /data/homeserver.yaml \
+            -u lmbote2e -p "$bot_password" --no-admin \
+            http://localhost:8008
+          docker exec lm-synapse register_new_matrix_user \
+            -c /data/homeserver.yaml \
+            -u lmexternale2e -p "$external_password" --no-admin \
+            http://localhost:8008
+
+          login() {
+            local user="$1" password="$2" display="$3"
+            curl --fail --silent --show-error \
+              -H 'Content-Type: application/json' \
+              -d "{\"type\":\"m.login.password\",\"identifier\":{\"type\":\"m.id.user\",\"user\":\"$user\"},\"password\":\"$password\",\"initial_device_display_name\":\"$display\"}" \
+              "$base/_matrix/client/v3/login"
+          }
+
+          bot_login="$(login lmbote2e "$bot_password" 'Little Monkey installed-service E2E')"
+          external_login="$(login lmexternale2e "$external_password" 'Matrix E2E bootstrap observer')"
+
+          bot_token="$(jq -r .access_token <<<"$bot_login")"
+          bot_user_id="$(jq -r .user_id <<<"$bot_login")"
+          bot_device_id="$(jq -r .device_id <<<"$bot_login")"
+          external_token="$(jq -r .access_token <<<"$external_login")"
+          external_user_id="$(jq -r .user_id <<<"$external_login")"
+          test -n "$bot_token" -a "$bot_token" != null
+          test -n "$bot_user_id" -a "$bot_user_id" != null
+          test -n "$bot_device_id" -a "$bot_device_id" != null
+          test -n "$external_token" -a "$external_token" != null
+          test -n "$external_user_id" -a "$external_user_id" != null
+
+          room_json="$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer $bot_token" \
+            -H 'Content-Type: application/json' \
+            -d "{\"preset\":\"private_chat\",\"name\":\"Little Monkey encrypted E2E\",\"invite\":[\"$external_user_id\"],\"initial_state\":[{\"type\":\"m.room.encryption\",\"state_key\":\"\",\"content\":{\"algorithm\":\"m.megolm.v1.aes-sha2\"}}]}" \
+            "$base/_matrix/client/v3/createRoom")"
+          room_id="$(jq -r .room_id <<<"$room_json")"
+          test -n "$room_id" -a "$room_id" != null
+
+          encoded_room="$(jq -rn --arg v "$room_id" '$v|@uri')"
+          curl --fail --silent --show-error \
+            -X POST \
+            -H "Authorization: Bearer $external_token" \
+            -H 'Content-Type: application/json' \
+            -d '{}' \
+            "$base/_matrix/client/v3/rooms/$encoded_room/join" >/dev/null
+
+          # Ensure the room is actually encrypted before Little Monkey is
+          # installed. The Rust harness independently verifies both message
+          # events are m.room.encrypted on Synapse as well.
+          encryption="$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer $external_token" \
+            "$base/_matrix/client/v3/rooms/$encoded_room/state/m.room.encryption")"
+          test "$(jq -r .algorithm <<<"$encryption")" = 'm.megolm.v1.aes-sha2'
+
+          echo "::add-mask::$bot_token"
+          echo "::add-mask::$external_token"
+          echo "::add-mask::$bot_password"
+          echo "::add-mask::$external_password"
+          echo "MATRIX_E2E_BOT_TOKEN=$bot_token" >> "$GITHUB_ENV"
+          echo "MATRIX_E2E_BOT_USER_ID=$bot_user_id" >> "$GITHUB_ENV"
+          echo "MATRIX_E2E_BOT_DEVICE_ID=$bot_device_id" >> "$GITHUB_ENV"
+          echo "MATRIX_E2E_EXTERNAL_TOKEN=$external_token" >> "$GITHUB_ENV"
+          echo "MATRIX_E2E_EXTERNAL_USER=lmexternale2e" >> "$GITHUB_ENV"
+          echo "MATRIX_E2E_EXTERNAL_PASSWORD=$external_password" >> "$GITHUB_ENV"
+          echo "MATRIX_E2E_ROOM_ID=$room_id" >> "$GITHUB_ENV"
+
+      - name: Build and pin real production CLI
+        run: |
+          cargo clean --manifest-path src-tauri/Cargo.toml -p little-monkey
+          node scripts/ensure-cli-sidecar-placeholder.mjs
+          cargo build --locked --manifest-path src-tauri/Cargo.toml --bin monkey-cli
+          node scripts/ensure-cli-sidecar-placeholder.mjs
+
+      - name: Start real systemd user manager and Secret Service
+        shell: bash
+        run: |
+          set -euo pipefail
+          uid="$(id -u)"
+          runtime="/run/user/$uid"
+
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@${uid}.service"
+          ready=0
+          for _ in $(seq 1 60); do
+            if [ -S "$runtime/bus" ]; then
+              ready=1
+              break
+            fi
+            sleep 0.5
+          done
+          test "$ready" -eq 1
+
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime/bus" >> "$GITHUB_ENV"
+          export XDG_RUNTIME_DIR="$runtime"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus"
+
+          eval "$(printf '\n' | gnome-keyring-daemon --unlock --replace --components=secrets)"
+          found=0
+          for _ in $(seq 1 30); do
+            if busctl --user --no-pager list --acquired | grep -q 'org.freedesktop.secrets'; then
+              found=1
+              break
+            fi
+            sleep 0.25
+          done
+          test "$found" -eq 1
+          systemctl --user import-environment HOME PATH XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+
+      - name: Compile the encrypted black-box harness
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --example matrix_encrypted_installed_service_e2e
+
+      - name: Run literal encrypted Matrix installed-service acceptance
+        run: >-
+          cargo run --locked --manifest-path src-tauri/Cargo.toml
+          --example matrix_encrypted_installed_service_e2e
+
+      - name: Dump service and Synapse diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          systemctl --user --no-pager --full status || true
+          systemctl --user --no-pager --full list-units 'little-monkey-daemon*' || true
+          sudo systemctl --no-pager --full status "user@$(id -u).service" || true
+          docker logs lm-synapse || true
+
+      - name: Stop Synapse
+        if: always()
+        run: docker rm -f lm-synapse || true
