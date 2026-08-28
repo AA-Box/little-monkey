@@ -42,7 +42,8 @@
     "codesign:runtime": "node scripts/codesign-managed-runtime.mjs",
     "codesign:runtime:tts": "node scripts/codesign-managed-runtime.mjs llama-tts",
     "codesign:runtime:sd": "node scripts/codesign-managed-runtime.mjs sd",
-    "stage:cli": "node scripts/stage-cli-sidecar.mjs",
+    "stage:whisper": "node scripts/stage-whisper-model.mjs",
+  "stage:cli": "node scripts/stage-cli-sidecar.mjs",
     "stage:cli:placeholder": "node scripts/ensure-cli-sidecar-placeholder.mjs",
     "icon:mac-liquid": "tauri-liquid-icon --icon ./src-tauri/icons/AppIcon.icon --name AppIcon --output ./src-tauri/resources --tauri-dir ./src-tauri"
   },

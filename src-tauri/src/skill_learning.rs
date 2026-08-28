@@ -8413,7 +8413,14 @@ mod tests {
             id: "verify-1".to_string(),
             label: "sources present".to_string(),
             kind: "test".to_string(),
-            command: "test -f src/uploader.rs".to_string(),
+            // `if exist` is a cmd builtin, so this resolves nothing through
+            // PATH. See verify::tests::long_running_command for why that
+            // matters here.
+            command: if cfg!(target_os = "windows") {
+                r"if exist src\uploader.rs (exit /b 0) else (exit /b 1)".to_string()
+            } else {
+                "test -f src/uploader.rs".to_string()
+            },
             enabled: true,
             timeout_secs: Some(30),
         }
@@ -9106,7 +9113,15 @@ mod tests {
             id: "verify-1".to_string(),
             label: "retry present".to_string(),
             kind: "test".to_string(),
-            command: "grep -q 'with_retry(' src/uploader.rs".to_string(),
+            // Absolute findstr, and an unparenthesised needle so the string
+            // carries no quotes into `cmd /C`. Same PATH reason as above.
+            command: if cfg!(target_os = "windows") {
+                let system_root =
+                    std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+                format!(r"{system_root}\System32\findstr.exe with_retry src\uploader.rs >nul")
+            } else {
+                "grep -q 'with_retry(' src/uploader.rs".to_string()
+            },
             enabled: true,
             timeout_secs: Some(30),
         }

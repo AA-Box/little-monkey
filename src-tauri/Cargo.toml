@@ -125,6 +125,14 @@ schemars = "1"
 # doesn't re-export it. Version-matched to the copy already in Cargo.lock via
 # rmcp's own dependency so only one copy resolves.
 tokio-util = "0.7"
+# Built-in, zero-configuration local speech transcription. The pinned fork
+# carries the Windows ARM64 MSVC/Clang fixes missing from archived upstream.
+whisper-rs = { git = "https://github.com/screenpipe/whisper-rs", rev = "97e40705033724dee601e89f3bd701af8096c846", default-features = false }
+# Symphonia demuxes/decodes WAV/MP3/AAC/FLAC/etc. WebM/Opus is demuxed by
+# Symphonia and decoded by opus-decoder because Symphonia intentionally has
+# no Opus decoder. Both are pure Rust and ship inside the application.
+symphonia = { version = "0.6.1", features = ["all"] }
+opus-decoder = "0.1.1"
 # web.rs: HTML->Markdown conversion for tool_web_fetch (turndown.js-style,
 # html5ever-based). The design doc named ~0.2; 0.5 is current on crates.io as
 # of implementation time — API used here (the free `convert` fn) is stable
