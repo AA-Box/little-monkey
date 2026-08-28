@@ -543,7 +543,7 @@ describe("start", () => {
     invokeMock.mockClear();
     invokeMock.mockImplementation((command: string) =>
       command === "mlx_chat_start"
-        ? Promise.resolve({ running: true, port: 51234, modelId: "mlx-0123456789ab-Qwen3.8-27B-OptiQ-4bit", modelPath: mlxModel.path })
+        ? Promise.resolve({ running: true, port: 51234, modelId: "mlx-0123456789ab-Qwen3.8-27B-OptiQ-4bit", modelPath: mlxModel.path, vision: true })
         : Promise.resolve(undefined),
     );
 
@@ -556,6 +556,9 @@ describe("start", () => {
     expect(state.llamaStatus).toBe("ready");
     expect(state.mlxChat?.port).toBe(51234);
     expect(state.activeProvider).toBe("local");
+    // A vision-capable MLX model must offer attachments, the way a GGUF with a
+    // projector does — that is what `isVisionCapableLocalModel` reads.
+    expect(state.llamaVisionEnabled).toBe(true);
   });
 
   it("reports a failed MLX start instead of leaving the UI on \"starting\"", async () => {
@@ -577,7 +580,7 @@ describe("start", () => {
     invokeMock.mockClear();
     invokeMock.mockImplementation(() => Promise.resolve(undefined));
     useModelStore.setState({
-      mlxChat: { running: true, port: 51234, modelId: "m", modelPath: "/models/m" },
+      mlxChat: { running: true, port: 51234, modelId: "m", modelPath: "/models/m", vision: false },
     });
 
     await useModelStore.getState().stop();

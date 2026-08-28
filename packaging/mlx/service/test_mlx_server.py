@@ -43,11 +43,11 @@ def _serve(chunks, capture):
     """Stands the real handler up on a loopback port with a stubbed model."""
 
     class Handler(mlx_server._Handler):
-        model = object()
-        tokenizer = _Tokenizer()
+        runtime = mlx_server._TextRuntime(object(), _Tokenizer())
 
-        def _generate(self, prompt, max_tokens, temperature):
+        def _generate(self, prompt, images, max_tokens, temperature):
             capture["prompt"] = prompt
+            capture["images"] = images
             capture["max_tokens"] = max_tokens
             capture["temperature"] = temperature
             yield from chunks()
@@ -164,7 +164,7 @@ def check_generation_runs_on_the_thread_that_loaded_the_model():
         # Two concurrent callers, neither of them the loading thread.
         collected = []
         def drive():
-            job = mlx_server._Job("prompt", 4, None)
+            job = mlx_server._Job("prompt", [], 4, None)
             worker.submit(job)
             collected.append("".join(job.deltas()))
         threads = [threading.Thread(target=drive) for _ in range(2)]
@@ -198,12 +198,12 @@ def check_a_cancelled_reader_does_not_wedge_the_worker():
         types.SimpleNamespace(text="x") for _ in range(100_000)
     )
     try:
-        job = mlx_server._Job("prompt", 1, None)
+        job = mlx_server._Job("prompt", [], 1, None)
         job.cancel()
         finished = threading.Event()
 
         def run():
-            job.run("model", _Tokenizer())
+            job.run(mlx_server._TextRuntime("model", _Tokenizer()))
             finished.set()
 
         thread = threading.Thread(target=run)
@@ -213,6 +213,84 @@ def check_a_cancelled_reader_does_not_wedge_the_worker():
     finally:
         fake.stream_generate = previous
     print("ok: a cancelled reader releases the worker")
+
+
+def check_a_text_model_refuses_images_instead_of_ignoring_them():
+    """Dropping the images and answering anyway is the failure worth avoiding.
+
+    The reply then reads as though the picture was considered, and nothing in
+    the transcript says otherwise. A model with no vision tower says so.
+    """
+    capture = {}
+    server = _serve(lambda: iter(["hi"]), capture)
+    try:
+        events = _generate(
+            server,
+            {
+                "requestId": "req-img",
+                "modelId": "m",
+                "messages": [
+                    {"role": "user", "text": "what is this", "images": ["data:image/png;base64,AA=="]}
+                ],
+                "tools": [],
+                "maxTokens": 8,
+                "temperature": None,
+            },
+        )
+    finally:
+        server.shutdown()
+    kinds = [event["type"] for event in events]
+    assert "error" in kinds, kinds
+    assert "no vision tower" in next(e for e in events if e["type"] == "error")["message"]
+    # Still exactly one terminal event: a refusal is not an excuse to strand the
+    # supervisor waiting for `completed`.
+    assert kinds[-1] == "completed", kinds
+    assert kinds.count("completed") == 1, kinds
+    assert "text_delta" not in kinds, "a refused request must not also generate"
+    print("ok: a text-only model refuses images rather than ignoring them")
+
+
+def check_only_inline_images_are_accepted():
+    """`mlx_vlm.load_image` fetches `http(s)` URLs.
+
+    Left open, a request could name any URL and have this local service fetch
+    it. The Rust side only ever sends `data:` URIs; this refuses everything
+    else at the boundary rather than trusting that.
+    """
+    capture = {}
+    server = _serve(lambda: iter(["hi"]), capture)
+    try:
+        events = _generate(
+            server,
+            {
+                "requestId": "req-url",
+                "modelId": "m",
+                "messages": [
+                    {"role": "user", "text": "fetch", "images": ["https://example.com/a.png"]}
+                ],
+                "tools": [],
+                "maxTokens": 8,
+                "temperature": None,
+            },
+        )
+    finally:
+        server.shutdown()
+    error = next(e for e in events if e["type"] == "error")
+    assert "data:image/" in error["message"], error
+    assert "prompt" not in capture, "a refused request must never reach the model"
+    print("ok: only inline data: images are accepted")
+
+
+def check_vision_models_are_detected_from_their_own_config():
+    """A hub tag or a repository name is metadata; `config.json` is evidence."""
+    assert mlx_server._is_vision_model({"vision_config": {"hidden_size": 8}})
+    # The shape the 27B OptiQ conversion actually ships.
+    assert mlx_server._is_vision_model(
+        {"model_type": "qwen3_5", "vision_config": {"depth": 2}, "image_token_id": 7}
+    )
+    for text_only in ({}, {"model_type": "llama"}, {"vision_config": None}, {"vision_config": "yes"}):
+        assert not mlx_server._is_vision_model(text_only), text_only
+    print("ok: a vision tower is detected from config.json")
 
 
 def check_generation_failure_still_terminates():
@@ -273,6 +351,9 @@ if __name__ == "__main__":
     check_happy_path()
     check_generation_runs_on_the_thread_that_loaded_the_model()
     check_a_cancelled_reader_does_not_wedge_the_worker()
+    check_a_text_model_refuses_images_instead_of_ignoring_them()
+    check_only_inline_images_are_accepted()
+    check_vision_models_are_detected_from_their_own_config()
     check_generation_failure_still_terminates()
     check_rejects_non_loopback_host()
     check_unknown_endpoint_is_404()
