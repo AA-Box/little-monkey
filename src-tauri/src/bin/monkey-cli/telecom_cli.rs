@@ -698,7 +698,7 @@ fn calls(account_id: &str, limit: u32, json: bool) -> Result<(), String> {
 
 /// Point this account's carrier at a different place, or update its non-secret
 /// settings.
-//!
+///
 /// The public URL is the one value every signature check depends on: Twilio and
 /// Plivo sign the URL their callback was posted to, so a base that no longer
 /// matches the carrier console rejects every genuine callback. An operator
