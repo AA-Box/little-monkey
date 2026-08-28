@@ -45,6 +45,9 @@ export interface MlxChatStatus {
   port: number;
   modelId: string;
   modelPath: string;
+  /** Whether the running model can read images — the MLX equivalent of a GGUF
+   *  with a projector, and what the composer offers an attachment on. */
+  vision: boolean;
 }
 
 export type ComponentOwnership = "managed" | "external";
@@ -655,7 +658,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       });
       try {
         const status = await invoke<MlxChatStatus>("mlx_chat_start", { modelPath: model.path });
-        set({ mlxChat: status, llamaStatus: "ready" });
+        set({ mlxChat: status, llamaStatus: "ready", llamaVisionEnabled: status.vision });
       } catch (err) {
         set({ llamaStatus: "error", llamaError: errorMessage(err), mlxChat: null });
         throw err;
