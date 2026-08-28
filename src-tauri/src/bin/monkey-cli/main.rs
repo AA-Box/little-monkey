@@ -437,6 +437,12 @@ enum Cmd {
         #[command(subcommand)]
         action: peers_cli::PeersCmd,
     },
+    /// Store the credentials for cloud model providers, so the daemon can
+    /// read them back without a keychain prompt nobody is there to answer.
+    Providers {
+        #[command(subcommand)]
+        action: providers_cli::ProvidersCmd,
+    },
     /// Configure the operator's own carrier accounts — the numbers Little
     /// Monkey texts and calls from, what each may do, and what a call may cost.
     Telecom {
@@ -1604,6 +1610,7 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
         Cmd::Conversations { action } => conversations_cli::dispatch(action),
         Cmd::Ingress { action } => ingress_cli::dispatch(action),
         Cmd::Peers { action } => peers_cli::dispatch(action).await,
+        Cmd::Providers { action } => providers_cli::dispatch(action),
         Cmd::Telecom { action } => telecom_cli::dispatch(action).await,
         Cmd::Revisions { change, limit } => revisions_cli::list(change.as_deref(), *limit),
         Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
