@@ -41,6 +41,9 @@ jobs:
           workspaces: src-tauri
           key: signal-installed-service
 
+      - name: Create the build-time CLI sidecar placeholder
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+
       - name: Compile black-box Signal harness
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml --example signal_installed_service_e2e
 
