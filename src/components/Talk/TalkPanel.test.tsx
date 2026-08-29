@@ -203,7 +203,9 @@ function stubMedia(options: { routing?: boolean } = {}) {
         };
       }
       createMediaStreamSource() {
-        return { connect: () => undefined };
+        // Held by the hook for as long as the microphone is open, and
+        // disconnected when it closes — WebKit collects an unreferenced one.
+        return { connect: () => undefined, disconnect: () => undefined };
       }
       close() {
         return Promise.resolve();

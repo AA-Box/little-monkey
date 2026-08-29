@@ -87,6 +87,8 @@ export function useTalkSession(
   const chunksRef = useRef<Blob[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  /** Held for as long as the microphone is open — see `startRecording`. */
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const meterRef = useRef<number | null>(null);
   const grantRef = useRef<CaptureGrant | null>(null);
   /**
@@ -136,6 +138,8 @@ export function useTalkSession(
     }
     recorderRef.current = null;
     analyserRef.current = null;
+    sourceRef.current?.disconnect();
+    sourceRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     void audioContextRef.current?.close().catch(() => undefined);
@@ -170,7 +174,15 @@ export function useTalkSession(
         if (context.state === 'suspended') await context.resume();
         const analyser = context.createAnalyser();
         analyser.fftSize = 1024;
-        context.createMediaStreamSource(streamRef.current).connect(analyser);
+        // The source node is held, not dropped on the floor. WebKit collects a
+        // `MediaStreamAudioSourceNode` nothing references, and the analyser it
+        // fed then reads pure silence forever — a flat meter, a detector that
+        // never hears an utterance start or end, and Talk stuck on "Listening"
+        // while the recorder happily records. Chromium keeps it alive on the
+        // graph, which is why this only ever showed up in the desktop webview.
+        const source = context.createMediaStreamSource(streamRef.current);
+        source.connect(analyser);
+        sourceRef.current = source;
         audioContextRef.current = context;
         analyserRef.current = analyser;
         const buffer = new Float32Array(analyser.fftSize);
