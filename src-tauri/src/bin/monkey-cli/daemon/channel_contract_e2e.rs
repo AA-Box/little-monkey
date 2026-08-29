@@ -408,7 +408,11 @@ fn extension_model_fixture() -> agent_e2e::HttpFixture {
         if !head.contains("/chat/completions") {
             return agent_e2e::json_response(r#"{"error":"unexpected model route"}"#);
         }
-        if body.contains("\\\"role\\\":\\\"tool\\\"") {
+        // The tool result comes back as ordinary JSON in the request body, not
+        // escaped inside a string. Looking for the escaped form meant this
+        // never matched, so the fixture answered every turn with another
+        // `send_message` and the run died on its iteration budget.
+        if body.contains("\"role\":\"tool\"") {
             return agent_e2e::sse_response(&[
                 serde_json::json!({
                     "choices": [{"index": 0, "delta": {"content": "sent."}}]
