@@ -230,8 +230,13 @@ pub fn curated_models() -> Vec<ModelInfo> {
         ModelInfo {
             id: "qwen2.5-7b".to_string(),
             name: "Qwen2.5 7B Instruct".to_string(),
-            repo: "Qwen/Qwen2.5-7B-Instruct-GGUF".to_string(),
-            file: "qwen2.5-7b-instruct-q4_k_m.gguf".to_string(),
+            // Qwen's own GGUF repo publishes this quantization only as a
+            // two-part split (`…-00001-of-00002.gguf`), which this downloader
+            // cannot assemble — the single name the catalog asked for has
+            // never existed there, so every Pull 404'd. bartowski's build is
+            // one file, and is already where Llama and Mistral come from.
+            repo: "bartowski/Qwen2.5-7B-Instruct-GGUF".to_string(),
+            file: "Qwen2.5-7B-Instruct-Q4_K_M.gguf".to_string(),
             size_gb: 4.7,
             tool_calling: true,
             installed: false,
