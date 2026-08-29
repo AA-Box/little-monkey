@@ -1686,9 +1686,11 @@ mod tests {
             Err(keyring::Error::NoEntry) => {}
             // Never the payload itself: on a failure this runs in CI, and a
             // panic that prints the entry would put whatever the keychain
-            // still holds into the build log.
+            // still holds into the build log. That rules out `{error:?}` too
+            // — `Error` derives Debug, and `BadEncoding`/`Ambiguous` carry the
+            // stored bytes. Display is the variant that redacts them.
             Ok(_) => panic!("expected the keychain entry to be gone after clear(), but it still holds a credential"),
-            Err(error) => panic!("expected the keychain entry to be gone after clear(), got {error:?}"),
+            Err(error) => panic!("expected the keychain entry to be gone after clear(), got {error}"),
         }
     }
 
