@@ -1150,8 +1150,15 @@ impl MlxRuntimeAdapter {
         self.models.values().cloned().collect()
     }
 
-    pub fn has_verified_install(&self) -> bool {
-        self.installer.verify_active().is_ok()
+    /// Whether an install is there — for the buttons a view can offer, which
+    /// is a different question from whether it is safe to execute.
+    ///
+    /// Deliberately not `verify_active`: this answers a capability view, it is
+    /// called every time that view refreshes, and re-hashing the whole package
+    /// to decide whether a button is greyed out is how the window ends up
+    /// frozen. Loading and launching still verify.
+    pub fn has_install(&self) -> bool {
+        self.installer.active_install_present()
     }
 
     pub async fn status(&self, context: &MlxOperationContext) -> MlxResult<MlxRuntimeStatus> {
