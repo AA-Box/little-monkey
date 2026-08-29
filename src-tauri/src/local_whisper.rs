@@ -534,8 +534,13 @@ fn run_whisper(
     params.set_no_context(true);
     let language = language.trim().to_string();
     if language.is_empty() || language.eq_ignore_ascii_case("auto") {
-        params.set_language(None);
-        params.set_detect_language(true);
+        // "auto" is a language whisper.cpp understands: it detects, then
+        // transcribes. `set_detect_language` is a different request — it means
+        // detect and *stop*, and `whisper_full` returns right after detection
+        // with no segments at all. Setting it here made every transcription on
+        // the default configuration come back empty, which is a spoken turn
+        // that records, decodes, runs the model and then says nothing.
+        params.set_language(Some("auto"));
     } else {
         params.set_language(Some(&language));
     }
@@ -727,17 +732,25 @@ mod tests {
         assert!(prepared.is_file());
         assert_eq!(sha256_file(&prepared).await.unwrap(), MODEL_SHA256);
 
+        // Both containers, and both language settings. "auto" is what the
+        // shipped configuration uses and what every spoken turn asks for, and
+        // it was the one combination nothing covered — so it was the one that
+        // returned an empty transcript for every recording ever made.
         for fixture in [&wav, &webm] {
-            let transcript = transcribe(&root, fixture, "en", CancellationToken::new())
-                .await
-                .unwrap_or_else(|error| panic!("{} failed: {error}", fixture.display()));
-            let normalized = transcript.text.to_ascii_lowercase();
-            assert!(
-                normalized.contains("country") || normalized.contains("ask not"),
-                "unexpected transcript for {}: {}",
-                fixture.display(),
-                transcript.text
-            );
+            for language in ["en", "auto"] {
+                let transcript = transcribe(&root, fixture, language, CancellationToken::new())
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("{} as {language} failed: {error}", fixture.display())
+                    });
+                let normalized = transcript.text.to_ascii_lowercase();
+                assert!(
+                    normalized.contains("country") || normalized.contains("ask not"),
+                    "unexpected transcript for {} as {language}: {}",
+                    fixture.display(),
+                    transcript.text
+                );
+            }
         }
         let _ = tokio::fs::remove_dir_all(root).await;
     }
