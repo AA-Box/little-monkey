@@ -1684,7 +1684,13 @@ mod tests {
         assert!(store.load().await.unwrap().is_none());
         match raw_entry.get_password() {
             Err(keyring::Error::NoEntry) => {}
-            other => panic!("expected the keychain entry to be gone after clear(), got {other:?}"),
+            // Never the payload itself: on a failure this runs in CI, and a
+            // panic that prints the entry would put whatever the keychain
+            // still holds into the build log. That rules out `{error:?}` too
+            // — `Error` derives Debug, and `BadEncoding`/`Ambiguous` carry the
+            // stored bytes. Display is the variant that redacts them.
+            Ok(_) => panic!("expected the keychain entry to be gone after clear(), but it still holds a credential"),
+            Err(error) => panic!("expected the keychain entry to be gone after clear(), got {error}"),
         }
     }
 
