@@ -41,9 +41,11 @@ const CONFIG = {
 };
 
 const streams: { stopped: number }[] = [];
+let resumed = 0;
 
 function stubMedia() {
   streams.length = 0;
+  resumed = 0;
   Object.defineProperty(navigator, 'mediaDevices', {
     configurable: true,
     value: {
@@ -67,6 +69,13 @@ function stubMedia() {
   vi.stubGlobal(
     'AudioContext',
     class {
+      // What WebKit hands back for a context built outside a user gesture.
+      state = 'suspended';
+      resume() {
+        this.state = 'running';
+        resumed += 1;
+        return Promise.resolve();
+      }
       createAnalyser() {
         return { fftSize: 1_024, getFloatTimeDomainData: (buffer: Float32Array) => buffer.fill(0) };
       }
@@ -128,6 +137,14 @@ describe('useTalkSession', () => {
     await waitFor(() => expect(streams).toHaveLength(1));
     await waitFor(() => expect(result.current.snapshot?.capturing).toBe(true));
     expect(result.current.mode).toBe('continuous');
+  });
+
+  it('resumes the audio context, so the detector hears something', async () => {
+    renderHook(() => useTalkSession('session-1', { enabled: true, autoStartMode: 'continuous' }));
+    await waitFor(() => expect(streams).toHaveLength(1));
+    // A suspended context reads pure silence: the meter sits at zero, the
+    // utterance never ends, and Talk listens forever without answering.
+    await waitFor(() => expect(resumed).toBe(1));
   });
 
   it('closes the microphone when it is disabled again', async () => {

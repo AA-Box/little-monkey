@@ -159,6 +159,15 @@ export function useTalkSession(
         // analyser's output is one number per frame and it goes straight into
         // the detector.
         const context = new AudioContext();
+        // WebKit starts a context built outside a user gesture suspended, and a
+        // suspended analyser reads pure silence: the detector never hears an
+        // utterance end, so Talk sits on "Listening" forever and nothing is
+        // ever transcribed. The Talk button *is* a gesture, but the awaits
+        // above — the grant, the config read, `getUserMedia` — have spent it by
+        // the time the context exists. A refusal here is not silently ignored:
+        // it fails `startRecording`, and the engine says so rather than
+        // claiming to be listening with a dead meter.
+        if (context.state === 'suspended') await context.resume();
         const analyser = context.createAnalyser();
         analyser.fftSize = 1024;
         context.createMediaStreamSource(streamRef.current).connect(analyser);
