@@ -1,0 +1,55 @@
+name: Slack installed-service E2E
+
+on:
+  pull_request:
+    paths:
+      - "src-tauri/examples/slack_installed_service_e2e.rs"
+      - "src-tauri/src/bin/monkey-cli/daemon/adapters/slack.rs"
+      - "src-tauri/src/bin/monkey-cli/daemon/**"
+      - "src-tauri/src/bin/monkey-cli/channels_cli.rs"
+      - ".github/workflows/slack-installed-service-e2e.yml"
+      - "docs/slack-installed-service-e2e.md"
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: slack-installed-service-e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    name: compile two-app Slack acceptance harness
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            build-essential libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri
+          key: slack-installed-service
+      - name: Create the build-time CLI sidecar placeholder
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+      - name: Compile black-box Slack harness
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --example slack_installed_service_e2e
+      - name: Explain live-provider boundary
+        run: |
+          cat <<'EOF'
+          Hosted PR CI only compiles this acceptance harness. Literal execution
+          requires two operator-owned Slack apps/bots in one operator-owned test
+          channel. The Little Monkey app contributes its xoxb bot token and xapp
+          Socket Mode token only through channels set-token/keychain. A separate
+          bot token drives the real denied->approve->restart->accepted path and
+          reads the exact generated reply back through Slack's Web API.
+          No repository-owned Slack workspace, app, bot or token is required.
+          EOF

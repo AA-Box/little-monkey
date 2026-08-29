@@ -1074,7 +1074,18 @@ async fn execute_tool_call(
                 request.artifact_ids.join(", ")
             ));
         }
-        return match perms.request("send_message", &preview).await {
+        // A reply to the conversation this run came from is the send the
+        // operator approved when they routed the account, and the resident
+        // daemon answers with nobody present to approve anything else — so
+        // that one shape does not prompt. Every other destination, and any
+        // send carrying a file, still does.
+        let decision =
+            if crate::daemon::channel_tool::origin_reply_needs_no_prompt(&request, &authority) {
+                Ok(())
+            } else {
+                perms.request("send_message", &preview).await
+            };
+        return match decision {
             Ok(()) => match crate::daemon::channel_tool::send_message(
                 &request,
                 &authority,
