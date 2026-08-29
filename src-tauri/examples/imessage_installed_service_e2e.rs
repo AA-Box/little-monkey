@@ -779,7 +779,7 @@ mod macos {
                 if requests.iter().any(|request| request.contains(&marker))
                     && requests
                         .iter()
-                        .any(|request| request.contains(r#"\"name\":\"send_message\""#))
+                        .any(|request| request.contains(r#""name":"send_message""#))
                     && requests.len() >= 2
                 {
                     break;
@@ -834,7 +834,7 @@ mod macos {
             }
             if !requests
                 .iter()
-                .any(|request| request.contains(r#"\"name\":\"send_message\""#))
+                .any(|request| request.contains(r#""name":"send_message""#))
             {
                 return Err("send_message was never offered to the installed agent".to_string());
             }

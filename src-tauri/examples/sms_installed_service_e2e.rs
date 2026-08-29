@@ -352,12 +352,12 @@ async fn run_case(config: &LiveConfig) -> Result<(), String> {
         let deadline = Instant::now() + AGENT_WAIT;
         while Instant::now() < deadline {
             let reqs = model.requests();
-            if reqs.iter().any(|r| r.contains(&run_marker)) && reqs.iter().any(|r| r.contains(r#"\"name\":\"send_message\""#)) && reqs.len() >= 2 { break; }
+            if reqs.iter().any(|r| r.contains(&run_marker)) && reqs.iter().any(|r| r.contains(r#""name":"send_message""#)) && reqs.len() >= 2 { break; }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         let reqs = model.requests();
         if !reqs.iter().any(|r| r.contains(&run_marker)) { return Err("installed agent never sent the real SMS marker to the model".into()); }
-        if !reqs.iter().any(|r| r.contains(r#"\"name\":\"send_message\""#)) { return Err("send_message was never offered to the SMS agent".into()); }
+        if !reqs.iter().any(|r| r.contains(r#""name":"send_message""#)) { return Err("send_message was never offered to the SMS agent".into()); }
         if reqs.len() < 2 { return Err("agent never returned to the model after send_message".into()); }
         let provider_id = wait_for_outbound(&db, &account_id, &second.conversation_id, &expected_reply)?;
         if provider_id.trim().is_empty() || provider_id.starts_with("local:") { return Err(format!("carrier did not name generated SMS: {provider_id:?}")); }

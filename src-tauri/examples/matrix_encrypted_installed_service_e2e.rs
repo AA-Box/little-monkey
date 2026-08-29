@@ -814,7 +814,7 @@ async fn run_case() -> Result<(), String> {
                 "the installed agent never sent the decrypted Matrix marker to the model: {requests:?}"
             ));
         }
-        if !requests.iter().any(|request| request.contains(r#"\"name\":\"send_message\""#)) {
+        if !requests.iter().any(|request| request.contains(r#""name":"send_message""#)) {
             return Err("send_message was never offered to the installed agent".to_string());
         }
         if requests.len() < 2 {

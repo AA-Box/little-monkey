@@ -756,7 +756,7 @@ async fn run_case(
         }
         if !requests
             .iter()
-            .any(|request| request.contains(r#"\"name\":\"send_message\""#))
+            .any(|request| request.contains(r#""name":"send_message""#))
         {
             return Err("send_message was never offered to the installed agent".to_string());
         }

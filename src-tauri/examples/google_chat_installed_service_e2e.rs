@@ -702,7 +702,7 @@ async fn run_case(config: &LiveConfig) -> Result<(), String> {
         while Instant::now() < model_deadline {
             let requests = model.requests();
             if requests.iter().any(|request| request.contains(&marker))
-                && requests.iter().any(|request| request.contains(r#"\"name\":\"send_message\""#))
+                && requests.iter().any(|request| request.contains(r#""name":"send_message""#))
                 && requests.len() >= 2
             { break; }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -711,7 +711,7 @@ async fn run_case(config: &LiveConfig) -> Result<(), String> {
         if !requests.iter().any(|request| request.contains(&marker)) {
             return Err("installed agent never sent the real Google Chat marker to the model".to_string());
         }
-        if !requests.iter().any(|request| request.contains(r#"\"name\":\"send_message\""#)) {
+        if !requests.iter().any(|request| request.contains(r#""name":"send_message""#)) {
             return Err("send_message was never offered to the installed agent".to_string());
         }
         if requests.len() < 2 {

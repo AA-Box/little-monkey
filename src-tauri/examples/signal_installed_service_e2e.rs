@@ -837,7 +837,7 @@ fn run_case() -> Result<(), String> {
         }
         if !requests
             .iter()
-            .any(|request| request.contains(r#"\"name\":\"send_message\""#))
+            .any(|request| request.contains(r#""name":"send_message""#))
         {
             return Err("send_message was never offered to the installed Signal agent".to_string());
         }
