@@ -351,9 +351,18 @@ export function useTalkSession(
       if (!engine || !active) return;
       const session = store.sessions.find((entry) => entry.id === sessionId);
       if (!session) return;
-      const answer = session.messages.find(
-        (message, index) => index >= active.fromIndex && message.role === 'assistant',
-      );
+      // The turn's LAST assistant message, not its first. A turn that calls a
+      // tool writes one assistant message per round, and the first of them is
+      // the one that requested the tool — usually with empty content. Reading
+      // the first left every tool-using turn silent: the answer arrives in a
+      // later message the watcher never looked at.
+      let answer: (typeof session.messages)[number] | undefined;
+      for (let index = session.messages.length - 1; index >= active.fromIndex; index -= 1) {
+        if (session.messages[index].role === 'assistant') {
+          answer = session.messages[index];
+          break;
+        }
+      }
       if (!answer) return;
       const text = typeof answer.content === 'string' ? answer.content : '';
       if (!text || text === DAEMON_QUEUE_PLACEHOLDER) return;

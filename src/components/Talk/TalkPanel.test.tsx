@@ -447,6 +447,35 @@ describe('TalkPanel — a spoken turn end to end', () => {
     expect(spoken).toEqual(['The deploy finished cleanly.']);
   });
 
+  it('speaks the answer of a turn that called a tool', async () => {
+    const media = stubMedia();
+    mock();
+    const sessionId = liveSession();
+    runAgentTurn.mockImplementation(async () => {
+      const store = useSessionStore.getState();
+      store.addMessage(sessionId, { role: 'user', content: 'what is the deploy status' });
+      // A tool round writes its own assistant message first, and that one is
+      // empty. Watching the turn's *first* assistant message left every
+      // tool-using turn — which is most of them — silent.
+      store.addMessage(sessionId, {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'read_file', arguments: '{}' } }],
+      });
+      store.addMessage(sessionId, { role: 'tool', tool_call_id: 'call-1', content: 'deploy.log' });
+      await Promise.resolve();
+      store.addMessage(sessionId, { role: 'assistant', content: 'The deploy finished cleanly. ' });
+    });
+    render(<TalkPanel sessionId={sessionId} onClose={vi.fn()} />);
+
+    await saySomething(media);
+    await waitFor(() => expect(media.speakers).toHaveLength(1));
+    const spoken = invoke.mock.calls
+      .filter((call) => call[0] === 'm7_tts_synthesize')
+      .map((call) => (call[1] as { text: string }).text);
+    expect(spoken).toEqual(['The deploy finished cleanly.']);
+  });
+
   it('says nothing about a message typed in the composer', async () => {
     const media = stubMedia();
     mock();
