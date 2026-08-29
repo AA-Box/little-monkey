@@ -175,7 +175,17 @@ async fn every_channel_kind_obeys_the_same_ingress_and_outbox_contract() {
             }],
             NOW,
         );
-        assert_eq!(report.accepted, 1, "{} ingress: {report:?}", kind.label());
+        assert_eq!(
+            report.accepted,
+            1,
+            "{} ingress: accepted {} challenged {} ignored {} duplicates {} failed {}",
+            kind.label(),
+            report.accepted,
+            report.challenged,
+            report.ignored,
+            report.duplicates,
+            report.failed
+        );
         assert_eq!(
             queue.submitted.lock().unwrap().len(),
             1,
@@ -210,15 +220,30 @@ async fn every_channel_kind_obeys_the_same_ingress_and_outbox_contract() {
         .unwrap_or_else(|error| panic!("{} outbound queue: {error}", kind.label()));
 
         let (adapter, sent) = ContractAdapter::new(kind);
-        let adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> =
-            BTreeMap::from([(account_id.clone(), Arc::new(adapter))]);
+        let adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> = BTreeMap::from([(
+            account_id.clone(),
+            Arc::new(adapter) as Arc<dyn ChannelAdapter>,
+        )]);
         let drained = drain_outbox_once(&mut store, &adapters, NOW + 1)
             .await
             .unwrap_or_else(|error| panic!("{} outbox drain: {error}", kind.label()));
-        assert_eq!(drained.sent, 1, "{} outbox: {drained:?}", kind.label());
+        assert_eq!(
+            drained.sent,
+            1,
+            "{} outbox: sent {} retrying {} failed {}",
+            kind.label(),
+            drained.sent,
+            drained.retrying,
+            drained.failed
+        );
 
         let sent = sent.lock().unwrap();
-        assert_eq!(sent.len(), 1, "{} was delivered more than once", kind.label());
+        assert_eq!(
+            sent.len(),
+            1,
+            "{} was delivered more than once",
+            kind.label()
+        );
         assert_eq!(sent[0].kind, kind);
         assert_eq!(sent[0].account_id, account_id);
         assert_eq!(sent[0].conversation_id, "room-1");
@@ -437,7 +462,9 @@ fn seed_agent_extension_channel(store: &mut DaemonStore, now: i64) {
     };
     validate_non_secret_config(account.kind, &account.non_secret_config)
         .expect("reference extension account config");
-    store.upsert_channel_account(&account).expect("extension account");
+    store
+        .upsert_channel_account(&account)
+        .expect("extension account");
     store
         .insert_channel_route(&ChannelRoute {
             route_id: format!("route-{}", agent_e2e::ACCOUNT_ID),
@@ -498,7 +525,11 @@ async fn run_extension_agent_end_to_end(root: &Path) {
     )
     .await
     .expect("extension poll enters production ingress");
-    assert_eq!(report.accepted, 1, "extension inbound was not accepted: {report:?}");
+    assert_eq!(
+        report.accepted, 1,
+        "extension inbound was not accepted: accepted {} challenged {} ignored {} duplicates {} failed {}",
+        report.accepted, report.challenged, report.ignored, report.duplicates, report.failed
+    );
 
     let inbound = store
         .recent_channel_events(agent_e2e::ACCOUNT_ID, 10)
@@ -507,7 +538,10 @@ async fn run_extension_agent_end_to_end(root: &Path) {
         .find(|event| event.direction == EventDirection::Inbound)
         .expect("durable extension inbound event");
     let job_id = inbound.job_id.expect("extension inbound owns a daemon job");
-    let job = store.get_job(&job_id).unwrap().expect("extension daemon job");
+    let job = store
+        .get_job(&job_id)
+        .unwrap()
+        .expect("extension daemon job");
     assert_eq!(job.state, JobState::Queued);
     let run_id = job.run_id.expect("extension daemon job owns a run");
     assert_eq!(
@@ -547,8 +581,15 @@ async fn run_extension_agent_end_to_end(root: &Path) {
         .iter()
         .filter(|event| event.direction == EventDirection::Outbound)
         .collect();
-    assert_eq!(inbound_count, 1, "extension event became multiple inbound turns");
-    assert_eq!(outbound.len(), 1, "agent reply became multiple outbound events");
+    assert_eq!(
+        inbound_count, 1,
+        "extension event became multiple inbound turns"
+    );
+    assert_eq!(
+        outbound.len(),
+        1,
+        "agent reply became multiple outbound events"
+    );
     let payload: OutboxPayload = serde_json::from_str(&outbound[0].envelope_json)
         .expect("outbound extension event retains the production outbox payload");
     assert_eq!(payload.message.account_id, agent_e2e::ACCOUNT_ID);
