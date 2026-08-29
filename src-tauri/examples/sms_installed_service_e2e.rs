@@ -164,6 +164,17 @@ fn profile_state_db(profile: &str) -> Result<PathBuf, String> {
 fn read_only(path: &Path) -> Result<Connection, String> {
     Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(|e| format!("open {}: {e}", path.display()))
 }
+// A provider-derived sender is a phone number or account handle. The success
+// path only has to confirm which one paired, so it prints the tail; the
+// failure paths below keep the whole value, because there it is the diagnostic.
+fn masked_sender(identity: &str) -> String {
+    let chars: Vec<char> = identity.chars().collect();
+    if chars.len() <= 4 {
+        return "***".to_string();
+    }
+    format!("***{}", chars[chars.len() - 4..].iter().collect::<String>())
+}
+
 #[derive(Debug)]
 struct InboundProof { provider_event_id: String, conversation_id: String, sender_id: String, disposition: String, ingress_id: Option<String>, job_id: Option<String> }
 fn find_inbound(db: &Path, account: &str, marker: &str, expected_sender: Option<&str>) -> Result<Option<InboundProof>, String> {
@@ -321,7 +332,7 @@ async fn run_case(config: &LiveConfig) -> Result<(), String> {
         let callback = cv.get("callback_url").and_then(serde_json::Value::as_str).ok_or_else(|| format!("no callback_url: {cv}"))?;
         let expected_cb = format!("{}/v1/telecom/{account_id}", config.public_base);
         if callback != expected_cb { return Err(format!("callback mismatch: got {callback:?}, expected {expected_cb:?}")); }
-        eprintln!("\nConfigure the operator-owned {} number {} so inbound SMS/MMS posts to:\n\n    {}\n\nThe provider must send its real signature. Ensure {} routes to localhost port {}.\n", config.carrier, config.from_number, callback, config.public_base, config.webhook_port);
+        eprintln!("\nConfigure the operator-owned {} number in SMS_E2E_FROM_NUMBER so inbound SMS/MMS posts to:\n\n    {}\n\nThe provider must send its real signature. Ensure {} routes to localhost port {}.\n", config.carrier, callback, config.public_base, config.webhook_port);
         eprintln!("When that carrier configuration is active, send this exact SMS from an independent real handset:\n\n    {pair_marker}\n");
 
         let port = config.webhook_port.to_string(); require_cli(Some(&created), &["daemon","install","--webhook-port",&port])?;
@@ -334,7 +345,7 @@ async fn run_case(config: &LiveConfig) -> Result<(), String> {
 
         require_cli(Some(&created), &["daemon","stop"])?; require_cli(Some(&created), &["daemon","start"])?;
         let second_pid = wait_for_service_pid(&created)?; if first_pid == second_pid { return Err(format!("daemon restart reused pid {first_pid}")); }
-        eprintln!("Approved provider-derived SMS sender {} and restarted installed daemon {} -> {}.\nNow send this exact SMS from the SAME handset:\n\n    {run_marker}\n", first.sender_id, first_pid, second_pid);
+        eprintln!("Approved provider-derived SMS sender {} and restarted installed daemon {} -> {}.\nNow send this exact SMS from the SAME handset:\n\n    {run_marker}\n", masked_sender(&first.sender_id), first_pid, second_pid);
         let second = wait_for_inbound(&db, &account_id, &run_marker, Some(&first.sender_id))?;
         if second.disposition != "accepted" || second.ingress_id.is_none() || second.job_id.is_none() { return Err(format!("approved SMS did not become durable ingress/job: {second:?}")); }
 

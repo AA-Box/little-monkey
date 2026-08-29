@@ -686,8 +686,8 @@ async fn run_case(config: &LiveConfig) -> Result<(), String> {
             .map_err(|error| format!("read Teams endpoint confirmation: {error}"))?;
 
         eprintln!(
-            "From the independent Teams user whose Bot Framework sender id is {} send this exact text in {}:\n\n    {}\n",
-            config.external_sender_id, config.destination, marker
+            "From the independent Teams user named by TEAMS_E2E_EXTERNAL_SENDER_ID send this exact text in {}:\n\n    {}\n",
+            config.destination, marker
         );
 
         let db = profile_state_db(&created)?;
@@ -698,8 +698,7 @@ async fn run_case(config: &LiveConfig) -> Result<(), String> {
             }
             if Instant::now() >= inbound_deadline {
                 return Err(format!(
-                    "no Microsoft-authenticated Teams message from {} containing the marker became a durable ingress/job within {}s",
-                    config.external_sender_id,
+                    "no Microsoft-authenticated Teams message from the TEAMS_E2E_EXTERNAL_SENDER_ID user containing the marker became a durable ingress/job within {}s",
                     INBOUND_WAIT.as_secs()
                 ));
             }

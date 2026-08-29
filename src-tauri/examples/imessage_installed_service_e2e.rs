@@ -377,6 +377,17 @@ mod macos {
         .map_err(|error| format!("open daemon state {} read-only: {error}", path.display()))
     }
 
+    // A provider-derived sender is a phone number or account handle. The success
+    // path only has to confirm which one paired, so it prints the tail; the
+    // failure paths below keep the whole value, because there it is the diagnostic.
+    fn masked_sender(identity: &str) -> String {
+        let chars: Vec<char> = identity.chars().collect();
+        if chars.len() <= 4 {
+            return "***".to_string();
+        }
+        format!("***{}", chars[chars.len() - 4..].iter().collect::<String>())
+    }
+
     #[derive(Debug)]
     struct InboundProof {
         provider_event_id: String,
@@ -735,7 +746,7 @@ mod macos {
             )?;
             eprintln!(
                 "approved provider-derived Messages sender {} from GUID {}",
-                challenged.sender_id, challenged.provider_event_id
+                masked_sender(&challenged.sender_id), challenged.provider_event_id
             );
 
             eprintln!(
