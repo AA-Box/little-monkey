@@ -327,6 +327,55 @@ pub(crate) fn plan_send(
     Ok(SendPlan { destination, rule })
 }
 
+/// Whether this send is the origin reply the operator already consented to,
+/// and therefore needs no prompt of its own.
+///
+/// A channel route runs unattended by construction: the resident daemon answers
+/// a message that arrives while nobody is at the machine. Asking a person to
+/// approve each reply makes the feature work only while the desktop app is open
+/// to answer — every other run parks until it times out, which is what the
+/// installed-service acceptance harnesses were failing on.
+///
+/// What makes it safe to skip is that the operator has already decided, and the
+/// model cannot widen what was decided:
+///
+/// - the frozen route recorded on the durable turn is what grants the reply, and
+///   it was written when the account was routed, not by anything in this run;
+/// - the destination is [`SendRule::OriginReply`] — the conversation the inbound
+///   message came from, resolved from the durable event rather than from a tool
+///   argument, so a prompt-injected model cannot redirect it;
+/// - a send carrying artifacts is excluded, because files are chosen by the
+///   model and leaving the machine with one is a decision of its own.
+///
+/// Everything else — a named account, a different conversation, any attachment —
+/// falls through to the prompt exactly as before.
+pub(crate) fn is_preauthorized_origin_reply(
+    request: &ChannelSendRequest,
+    authority: &SendAuthority,
+    origin: Option<&ChannelOrigin>,
+) -> bool {
+    if !request.artifact_ids.is_empty() {
+        return false;
+    }
+    matches!(
+        plan_send(request, authority, origin),
+        Ok(SendPlan {
+            rule: SendRule::OriginReply,
+            ..
+        })
+    )
+}
+
+/// [`is_preauthorized_origin_reply`] against the run's own origin, resolved the
+/// same way [`send_message`] resolves it.
+pub(crate) fn origin_reply_needs_no_prompt(
+    request: &ChannelSendRequest,
+    authority: &SendAuthority,
+) -> bool {
+    let origin = current_channel_origin().map(|(_, origin)| origin);
+    is_preauthorized_origin_reply(request, authority, origin.as_ref())
+}
+
 /// Write the planned send into the durable outbox.
 ///
 /// Everything a provider will need is decided here and nowhere later: the
@@ -841,6 +890,67 @@ mod tests {
         );
         assert!(authorize("chan-origin", false, true, &authority).is_err());
         assert!(authorize("chan-second", false, false, &authority).is_err());
+    }
+
+    /// The one shape that answers without a prompt, and the shapes that must
+    /// keep asking. A regression here is a permission boundary moving, not a
+    /// test going stale.
+    #[test]
+    fn only_the_granted_origin_reply_skips_the_prompt() {
+        let authority = reply_authority();
+        assert!(is_preauthorized_origin_reply(
+            &request("hi"),
+            &authority,
+            Some(&origin())
+        ));
+
+        // A conversation the model named, on the same account.
+        let mut elsewhere = request("hi");
+        elsewhere.conversation_id = Some("conv-other".to_string());
+        assert!(!is_preauthorized_origin_reply(
+            &elsewhere,
+            &authority,
+            Some(&origin())
+        ));
+
+        // Another account entirely.
+        let mut other_account = request("hi");
+        other_account.account_id = Some("chan-second".to_string());
+        other_account.conversation_id = Some("conv-other".to_string());
+        assert!(!is_preauthorized_origin_reply(
+            &other_account,
+            &authority,
+            Some(&origin())
+        ));
+
+        // A file leaving the machine is its own decision, even back to the
+        // conversation that asked.
+        let mut with_artifact = request("hi");
+        with_artifact.artifact_ids = vec!["artifact-1".to_string()];
+        assert!(!is_preauthorized_origin_reply(
+            &with_artifact,
+            &authority,
+            Some(&origin())
+        ));
+
+        // No origin at all: nothing was granted, so nothing is pre-approved.
+        assert!(!is_preauthorized_origin_reply(
+            &request("hi"),
+            &authority,
+            None
+        ));
+
+        // And a run holding no reply grant does not acquire one here.
+        let ungranted = SendAuthority {
+            reply: false,
+            cross_conversation: false,
+            accounts: Vec::new(),
+        };
+        assert!(!is_preauthorized_origin_reply(
+            &request("hi"),
+            &ungranted,
+            Some(&origin())
+        ));
     }
 
     #[test]
