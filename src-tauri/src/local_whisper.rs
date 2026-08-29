@@ -363,6 +363,17 @@ fn open_media(path: &Path) -> Result<Box<dyn FormatReader + '_>, String> {
         .map_err(|error| format!("Decode recorded audio container: {error}"))
 }
 
+/// Whether a demux error is simply the end of the recording.
+///
+/// A browser's `MediaRecorder` writes a live stream: clusters as they happen,
+/// a segment of unknown size, and no terminator once the microphone closes.
+/// Symphonia reaches the last short element and reports `UnexpectedEof`, which
+/// is not a corrupt file — it is the end of one. Treating it as a failure threw
+/// away every utterance *after* decoding it, so nothing was ever transcribed.
+fn is_end_of_stream(error: &SymphoniaError) -> bool {
+    matches!(error, SymphoniaError::IoError(source) if source.kind() == std::io::ErrorKind::UnexpectedEof)
+}
+
 fn decode_opus(
     format: &mut dyn FormatReader,
     track_id: u32,
@@ -388,6 +399,7 @@ fn decode_opus(
             Err(SymphoniaError::ResetRequired) => {
                 return Err("Recorded audio changed tracks mid-stream".to_string())
             }
+            Err(ref error) if is_end_of_stream(error) => break,
             Err(error) => return Err(format!("Demux Opus audio: {error}")),
         };
         if packet.track_id != track_id {
@@ -446,6 +458,7 @@ fn decode_audio(path: &Path, cancellation: &CancellationToken) -> Result<Vec<f32
             Err(SymphoniaError::ResetRequired) => {
                 return Err("Recorded audio changed tracks mid-stream".to_string())
             }
+            Err(ref error) if is_end_of_stream(error) => break,
             Err(error) => return Err(format!("Read recorded audio: {error}")),
         };
         if packet.track_id != track_id {
@@ -605,6 +618,21 @@ pub async fn transcribe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_recordings_short_last_element_is_its_end_not_a_failure() {
+        // What Symphonia reports at the end of a `MediaRecorder` stream: the
+        // segment has no terminator, so the final element runs out early.
+        assert!(is_end_of_stream(&SymphoniaError::IoError(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "end of stream",
+        ))));
+        // A real read failure still is one.
+        assert!(!is_end_of_stream(&SymphoniaError::IoError(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        )));
+        assert!(!is_end_of_stream(&SymphoniaError::DecodeError("corrupt")));
+    }
 
     #[test]
     fn a_bundled_model_is_taken_only_when_it_is_whole() {
