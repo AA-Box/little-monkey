@@ -377,7 +377,7 @@ fn write_recipe(profile: &str, workspace: &Path, model_base: &str) -> Result<(),
         // Bypass is a real production permission mode. It keeps this acceptance
         // unattended; the route's frozen reply grant still constrains
         // send_message to the conversation that caused this run.
-        "permission_mode": "bypass",
+        "permission_mode": "auto",
         "prompt": "{{message}}",
         "params": { "message": null },
         "max_iterations": 4,

@@ -152,7 +152,7 @@ fn write_recipe(profile: &str, workspace: &Path, model_base: &str) -> Result<(),
     let roots = little_monkey_lib::app_paths::ensure_agent_config_roots().map_err(|e| format!("resolve config roots: {e}"));
     match old { Some(v) => std::env::set_var(PROFILE_ENV, v), None => std::env::remove_var(PROFILE_ENV) }
     let recipes = roots?.authored.join("recipes"); std::fs::create_dir_all(&recipes).map_err(|e| e.to_string())?;
-    let recipe = serde_json::json!({"version":1,"name":RECIPE,"target":{"local_url":model_base,"model":"sms-e2e-fixture"},"workspace":workspace.to_string_lossy(),"permission_mode":"bypass","prompt":"{{message}}","params":{"message":null},"max_iterations":4,"timeout_seconds":180});
+    let recipe = serde_json::json!({"version":1,"name":RECIPE,"target":{"local_url":model_base,"model":"sms-e2e-fixture"},"workspace":workspace.to_string_lossy(),"permission_mode":"auto","prompt":"{{message}}","params":{"message":null},"max_iterations":4,"timeout_seconds":180});
     std::fs::write(recipes.join(format!("{RECIPE}.json")), serde_json::to_vec_pretty(&recipe).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 fn profile_state_db(profile: &str) -> Result<PathBuf, String> {

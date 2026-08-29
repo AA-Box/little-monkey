@@ -343,7 +343,7 @@ mod macos {
             "name": RECIPE,
             "target": { "local_url": model_base, "model": "imessage-e2e-fixture" },
             "workspace": workspace.to_string_lossy(),
-            "permission_mode": "bypass",
+            "permission_mode": "auto",
             "prompt": "{{message}}",
             "params": { "message": null },
             "max_iterations": 4,
