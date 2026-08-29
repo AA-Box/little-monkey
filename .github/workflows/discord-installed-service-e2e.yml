@@ -1,0 +1,55 @@
+name: Discord installed-service E2E
+
+on:
+  pull_request:
+    paths:
+      - "src-tauri/examples/discord_installed_service_e2e.rs"
+      - "src-tauri/src/bin/monkey-cli/daemon/adapters/discord.rs"
+      - "src-tauri/src/bin/monkey-cli/daemon/**"
+      - "src-tauri/src/bin/monkey-cli/channels_cli.rs"
+      - "src-tauri/src/channels/policy.rs"
+      - ".github/workflows/discord-installed-service-e2e.yml"
+      - "docs/discord-installed-service-e2e.md"
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: discord-installed-service-e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    name: compile two-bot Discord acceptance harness
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            build-essential libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri
+          key: discord-installed-service
+      - name: Create the build-time CLI sidecar placeholder
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+      - name: Compile black-box Discord harness
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --example discord_installed_service_e2e
+      - name: Explain live-provider boundary
+        run: |
+          cat <<'EOF'
+          PR CI compiles but deliberately does not claim a live Discord pass.
+          Literal execution uses two arbitrary operator-owned Discord bot identities
+          in an operator-owned test channel. The production bot token enters through
+          Little Monkey's normal OS-keychain path; the second bot remains external
+          and supplies/observes real Discord traffic. No repository-owned Discord
+          application, guild, channel or bot token is required.
+          EOF
