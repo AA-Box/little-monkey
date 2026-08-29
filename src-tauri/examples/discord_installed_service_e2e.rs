@@ -649,7 +649,6 @@ fn wait_for_inbound(
 #[derive(Debug, Clone)]
 struct DiscordIdentity {
     id: String,
-    username: String,
 }
 
 #[derive(Debug, Clone)]
@@ -694,14 +693,7 @@ async fn discord_identity(token: &str) -> Result<DiscordIdentity, String> {
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "Discord users/@me response had no id".to_string())?;
-    let username = payload
-        .get("username")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("discord-bot");
-    Ok(DiscordIdentity {
-        id: id.to_string(),
-        username: username.to_string(),
-    })
+    Ok(DiscordIdentity { id: id.to_string() })
 }
 
 fn parse_discord_message(payload: &serde_json::Value) -> Result<DiscordMessage, String> {
@@ -1022,8 +1014,8 @@ async fn run_case(config: &LiveConfig) -> Result<(), String> {
             .as_deref()
             .ok_or_else(|| "accepted Discord event had no job id".to_string())?;
         eprintln!(
-            "Real Discord message {} from independent bot {} became ingress {} / job {} in installed daemon pid {}",
-            accepted.provider_event_id, external.username, ingress_id, job_id, restarted_pid
+            "Real Discord message {} from the independent bot became ingress {} / job {} in installed daemon pid {}",
+            accepted.provider_event_id, ingress_id, job_id, restarted_pid
         );
 
         let agent_deadline = Instant::now() + AGENT_WAIT;
@@ -1113,10 +1105,7 @@ async fn run_case(config: &LiveConfig) -> Result<(), String> {
         }
 
         eprintln!(
-            "Discord E2E passed: Gateway inbound from {} -> installed daemon -> real agent/tool/outbox -> REST send by {} -> independent {} exact-text read (message {}).",
-            external.username,
-            tested.username,
-            external.username,
+            "Discord E2E passed: Gateway inbound from the independent bot -> installed daemon -> real agent/tool/outbox -> REST send by the tested bot -> independent exact-text read (message {}).",
             outbound.provider_message_id
         );
         Ok(())

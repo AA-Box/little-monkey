@@ -21,7 +21,6 @@ LINE_E2E_CHANNEL_ACCESS_TOKEN=<channel access token>
 LINE_E2E_PUBLIC_BASE=https://<public-host-routing-to-this-machine>
 LINE_E2E_WEBHOOK_PORT=38444
 LINE_E2E_EXTERNAL_USER_ID=<LINE userId expected on the inbound webhook>
-LINE_E2E_OFFICIAL_ACCOUNT=<human-readable destination/account name>
 ```
 
 Optional, test channel only:

@@ -611,7 +611,6 @@ struct LiveConfig {
     channel_access_token: String,
     public_base: String,
     external_user_id: String,
-    official_account_label: String,
     webhook_port: u16,
     mutate_webhook: bool,
 }
@@ -642,7 +641,6 @@ impl LiveConfig {
             channel_access_token: required("LINE_E2E_CHANNEL_ACCESS_TOKEN")?,
             public_base,
             external_user_id: required("LINE_E2E_EXTERNAL_USER_ID")?,
-            official_account_label: required("LINE_E2E_OFFICIAL_ACCOUNT")?,
             webhook_port,
             mutate_webhook: std::env::var("LINE_E2E_MUTATE_WEBHOOK").as_deref() == Ok("1"),
         })
@@ -771,8 +769,8 @@ async fn run_case(config: &LiveConfig) -> Result<(), String> {
         test_line_webhook(&client, &config.channel_access_token, &callback_url).await?;
 
         eprintln!(
-            "\nLINE installed-service acceptance is ready.\nFrom the independent LINE user {} send this exact text to {}:\n\n    {}\n",
-            config.external_user_id, config.official_account_label, marker
+            "\nLINE installed-service acceptance is ready.\nFrom the independent LINE user named by LINE_E2E_EXTERNAL_USER_ID send this exact text to the official account under test:\n\n    {}\n",
+            marker
         );
 
         let db = profile_state_db(&created)?;
@@ -783,8 +781,7 @@ async fn run_case(config: &LiveConfig) -> Result<(), String> {
             }
             if Instant::now() >= inbound_deadline {
                 return Err(format!(
-                    "no signed LINE message from {} containing the marker became a durable ingress/job within {}s",
-                    config.external_user_id,
+                    "no signed LINE message from the LINE_E2E_EXTERNAL_USER_ID user containing the marker became a durable ingress/job within {}s",
                     INBOUND_WAIT.as_secs()
                 ));
             }

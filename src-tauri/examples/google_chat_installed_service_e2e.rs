@@ -675,8 +675,8 @@ async fn run_case(config: &LiveConfig) -> Result<(), String> {
             .map_err(|error| format!("read callback-configuration confirmation: {error}"))?;
 
         eprintln!(
-            "From the real Google Chat user {} send this exact text in {}:\n\n    {}\n",
-            config.external_user_name, config.space_name, marker
+            "From the real Google Chat user named by GCHAT_E2E_EXTERNAL_USER_NAME send this exact text in {}:\n\n    {}\n",
+            config.space_name, marker
         );
 
         let db = profile_state_db(&created)?;
@@ -687,8 +687,7 @@ async fn run_case(config: &LiveConfig) -> Result<(), String> {
             }
             if Instant::now() >= inbound_deadline {
                 return Err(format!(
-                    "no Google-signed Chat message from {} containing the marker became a durable ingress/job within {}s",
-                    config.external_user_name,
+                    "no Google-signed Chat message from the GCHAT_E2E_EXTERNAL_USER_NAME user containing the marker became a durable ingress/job within {}s",
                     INBOUND_WAIT.as_secs()
                 ));
             }
