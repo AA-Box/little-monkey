@@ -6,6 +6,7 @@ import {
   backpressureMessage,
   backpressureOf,
   daemonCancel,
+  daemonDecisions,
   daemonDesktopTurnSubmit,
   daemonStatus,
   type DaemonStatus,
@@ -35,6 +36,12 @@ import type { McpServerInfo } from "../store/mcpStore";
 export const DAEMON_DESKTOP_TURN_SCHEMA_VERSION = 4 as const;
 const ACTIVE_TURNS_KEY = "little-monkey-daemon-desktop-turns-v1";
 const POLL_INTERVAL_MS = 150;
+/** How often a still-queued turn asks the daemon why it is still queued. Far
+ * slower than the poll: the answer changes when the machine's free memory does,
+ * not four times a second, and the decision log is a shell-out. */
+const HOLD_REASON_INTERVAL_MS = 3_000;
+/** Newest-first rows scanned for this job's latest decision. */
+const MAX_DECISIONS_SCANNED = 64;
 
 export interface FrozenAttachmentInput {
   path: string;
@@ -166,6 +173,10 @@ export interface ActiveDaemonDesktopTurn {
    * of its durable identity, needed to ask the backend about it. Absent on a
    * link stored by an older build, which was always the composer. */
   source?: DesktopTurnSource;
+  /** The daemon's own id for this job, which is what the scheduling decision
+   * log is keyed by — the run id is not. Absent on a link stored by an older
+   * build, and the hold reason is simply not shown for those. */
+  jobId?: string;
 }
 
 export interface DaemonTurnProjection {
@@ -709,6 +720,8 @@ export async function watchDaemonDesktopTurn(
   let link = { ...initialLink };
   let projection = emptyProjection(link);
   const watched = new Set<string>([link.runId]);
+  let lastHoldLookupMs = 0;
+  let heldDetail: string | null = null;
   let cancelSent = false;
   const requestCancel = () => {
     if (cancelSent) return;
@@ -761,9 +774,45 @@ export async function watchDaemonDesktopTurn(
         }
         return projection;
       }
+      // A queued run says "Queued in the resident runner…" and nothing else,
+      // which is the same sentence whether it is next in line or waiting for
+      // 13 GiB that will not appear. The daemon already writes down why it held
+      // the job; read that and say it, so waiting is legible instead of
+      // indistinguishable from hanging. Only while it is still waiting, at a
+      // fraction of the poll rate, and never fatally: a decision log that
+      // cannot be read is not a reason to lose the turn.
+      if (!projection.terminal && !projection.output && link.jobId) {
+        const now = Date.now();
+        if (now - lastHoldLookupMs >= HOLD_REASON_INTERVAL_MS) {
+          lastHoldLookupMs = now;
+          const held = await heldReason(link.jobId);
+          if (held && held !== heldDetail) {
+            heldDetail = held;
+            projection = { ...projection, status: held };
+            callbacks.onProjection(projection);
+          }
+        }
+      }
       await wait(POLL_INTERVAL_MS);
     }
   } finally {
     signal.removeEventListener("abort", requestCancel);
+  }
+}
+
+/**
+ * The daemon's own explanation for a job that is still queued, or null.
+ *
+ * `held` is the outcome the scheduler records when it leaves a job in the queue
+ * on purpose; anything newer for the same job means it is no longer waiting for
+ * that, so only the newest row counts.
+ */
+async function heldReason(jobId: string): Promise<string | null> {
+  try {
+    const decisions = await daemonDecisions(MAX_DECISIONS_SCANNED);
+    const newest = decisions.find((decision) => decision.jobId === jobId);
+    return newest?.outcome === "held" && newest.detail ? newest.detail : null;
+  } catch {
+    return null;
   }
 }
