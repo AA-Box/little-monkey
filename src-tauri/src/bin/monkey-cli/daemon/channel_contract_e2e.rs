@@ -217,7 +217,11 @@ async fn every_channel_kind_obeys_the_same_ingress_and_outbox_contract() {
             },
             NOW,
         )
-        .unwrap_or_else(|error| panic!("{} outbound queue: {error}", kind.label()));
+        // The error is not interpolated: `queue_send` resolves the account's
+        // attachment limits on the way through, so anything it hands back is
+        // reported as an account reaching a log. Which provider failed to queue
+        // is the part that locates the bug; re-run the one case to read why.
+        .unwrap_or_else(|_| panic!("{} outbound queue refused the send", kind.label()));
 
         let (adapter, sent) = ContractAdapter::new(kind);
         let adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> = BTreeMap::from([(
@@ -529,11 +533,10 @@ async fn run_extension_agent_end_to_end(root: &Path) {
     )
     .await
     .expect("extension poll enters production ingress");
-    assert_eq!(
-        report.accepted, 1,
-        "extension inbound was not accepted: accepted {} challenged {} ignored {} duplicates {} failed {}",
-        report.accepted, report.challenged, report.ignored, report.duplicates, report.failed
-    );
+    // Counters and all, an `InboundReport` came out of a function that read the
+    // account row, so none of it is interpolated. `assert_eq!` still prints the
+    // count that failed, which is the number worth having.
+    assert_eq!(report.accepted, 1, "extension inbound was not accepted");
 
     let inbound = store
         .recent_channel_events(agent_e2e::ACCOUNT_ID, 10)
