@@ -95,3 +95,10 @@ pub(crate) fn arm(point: FailPoint) {
 pub(crate) fn fired() -> bool {
     ARMED.with(|armed| armed.get().is_none())
 }
+
+// Test-only because the contract suite intentionally imports the daemon's
+// private seams. Keeping it below an already test-aware module avoids exposing
+// any reference-transport harness from release builds.
+#[cfg(test)]
+#[path = "channel_contract_e2e.rs"]
+mod channel_contract_e2e;

@@ -59,8 +59,11 @@ import {
 } from "../../lib/agentLoop";
 import {
   isLearningNotice,
+  isSaveSkillNotice,
   parseLearningNotice,
+  parseSaveSkillNotice,
   type LearningNotice,
+  type SaveSkillNotice,
 } from "../../lib/skillLearning";
 import { useSkillLearningFocusStore } from "../../store/skillLearningFocusStore";
 import type { SettingsTab } from "../Settings/SettingsModal";
@@ -71,6 +74,7 @@ import { liveTurnTokens, selectTurnStatus, useTurnStatusStore, type TurnStatus }
 import { formatCompactTokens, formatElapsed } from "../../lib/taskFormat";
 import { useCheckpointStore } from "../../store/checkpointStore";
 import { useRulesStore } from "../../store/rulesStore";
+import { SaveSkillRow } from "./SaveSkillRow";
 import { useLocalAppsStore } from "../../store/localAppsStore";
 import MessageBubble from "./MessageBubble";
 import GeneratedImageCard from "./GeneratedImageCard";
@@ -148,6 +152,7 @@ type TimelineItem =
   | { kind: "memory"; key: string; notice: MemoryNotice; messageIndex: number }
   | { kind: "plan"; key: string; notice: PlanNotice; messageIndex: number }
   | { kind: "verify"; key: string; notice: VerifyNotice }
+  | { kind: "saveSkill"; key: string; notice: SaveSkillNotice }
   | { kind: "learning"; key: string; notice: LearningNotice }
   | { kind: "sources"; key: string; notice: SourcesNotice }
   | { kind: "recipe"; key: string; notice: RecipeNotice }
@@ -309,6 +314,13 @@ function buildTimeline(messages: ChatMessage[], messageIndexOffset = 0): Timelin
         const notice = parseLearningNotice(msg.content);
         if (notice) {
           items.push({ kind: "learning", key: `learning-${notice.candidateId}`, notice });
+        }
+        return;
+      }
+      if (isSaveSkillNotice(msg.content)) {
+        const notice = parseSaveSkillNotice(msg.content);
+        if (notice) {
+          items.push({ kind: "saveSkill", key: `save-skill-${notice.runId}`, notice });
         }
         return;
       }
@@ -1029,7 +1041,7 @@ const LearningRow = memo(function LearningRow({
             type="button"
             className="ml-auto shrink-0 cursor-pointer whitespace-nowrap underline decoration-dotted underline-offset-2 transition-colors duration-150 hover:text-foreground"
             onClick={() => {
-              useSkillLearningFocusStore.getState().focus(notice.candidateId);
+              useSkillLearningFocusStore.getState().focusCandidate(notice.candidateId);
               onOpenSettingsTab("prompts");
             }}
           >
@@ -1259,7 +1271,13 @@ function canRetry(messages: ChatMessage[]): boolean {
   return messages.some((m) => m.role === "user");
 }
 
-export default function MessageList({
+/**
+ * Memoized because its host re-renders for reasons that have nothing to do
+ * with the transcript — every keystroke in the composer, and every frame of
+ * Talk's level meter — and rebuilding the whole timeline for each of those is
+ * what makes the window stop responding.
+ */
+function MessageList({
   sessionId,
   messages,
   onEditUserMessage,
@@ -1421,6 +1439,9 @@ export default function MessageList({
             if (item.kind === "learning") {
               return <LearningRow key={item.key} notice={item.notice} onOpenSettingsTab={onOpenSettingsTab} />;
             }
+            if (item.kind === "saveSkill") {
+              return <SaveSkillRow key={item.key} notice={item.notice} onOpenSettingsTab={onOpenSettingsTab} />;
+            }
             if (item.kind === "sources") {
               return <SourcesRow key={item.key} notice={item.notice} />;
             }
@@ -1450,3 +1471,5 @@ export default function MessageList({
     </div>
   );
 }
+
+export default memo(MessageList);

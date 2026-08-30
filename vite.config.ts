@@ -3,6 +3,7 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
 const host = process.env.TAURI_DEV_HOST;
+const fullProductE2eBuild = process.env.VITE_COMPUTER_USE_FULL_PRODUCT_E2E === "1";
 
 const productionBuild = {
   manifest: true,
@@ -30,7 +31,25 @@ const productionBuild = {
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
-  plugins: [react(), tailwindcss()],
+  plugins: [
+    {
+      name: "computer-use-full-product-e2e-entry",
+      enforce: "pre" as const,
+      transformIndexHtml: {
+        order: "pre" as const,
+        handler(html: string) {
+          if (!fullProductE2eBuild) return html;
+          return html.replace("/src/main.tsx", "/src/fullProductE2eMain.ts");
+        },
+      },
+    },
+    react(),
+    tailwindcss(),
+  ],
+  // The full-product acceptance loads the built bundle through Tauri's local
+  // asset server; relative URLs also work when that server is not rooted at
+  // the repository's web origin.
+  base: fullProductE2eBuild ? "./" : "/",
 
   // Vite 7 resolves build settings per environment. Keep the top-level copy
   // for legacy/Tauri callers and the explicit client copy for the environment
@@ -44,10 +63,16 @@ export default defineConfig(async () => ({
   clearScreen: false,
   // 2. tauri expects a fixed port, fail if that port is not available
   // (PORT env override lets a second instance run for browser preview)
+  //
+  // `host` is pinned to 127.0.0.1 rather than left `false`: bare `false`
+  // binds the "localhost" name, which resolves to [::1] alone on macOS, and
+  // tauri.conf.json's devUrl polls http://127.0.0.1:1420 over IPv4 — so
+  // `tauri dev` waited out its full 180s timeout against a server that was
+  // up the whole time. Still loopback-only; nothing is exposed to the LAN.
   server: {
     port: Number(process.env.PORT) || 1420,
     strictPort: true,
-    host: host || false,
+    host: host || "127.0.0.1",
     hmr: host
       ? {
           protocol: "ws",

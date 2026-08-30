@@ -276,6 +276,10 @@ function timelineSummary(envelope: RunEventEnvelopeWire): { title: string; summa
     case "failed": return { title: "Failed", summary: `${event.payload.code}: ${shortText(event.payload.message)}` };
     case "cancelled": return { title: "Cancelled", summary: event.payload.reason ?? "Run cancelled." };
     case "needs_reconciliation": return { title: "Needs reconciliation", summary: event.payload.reason };
+    case "task_event": return {
+      title: `Task · ${event.payload.event_type.replace(/_/g, " ")}`,
+      summary: `Coordinator event for ${event.payload.task_id}.`,
+    };
   }
 }
 

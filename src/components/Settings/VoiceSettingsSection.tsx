@@ -24,9 +24,21 @@ import { dictationClient, type DictationCapabilities } from '../../lib/dictation
 import { errorMessage } from '../../lib/errors';
 import { useT } from '../../lib/i18n';
 import { base64AudioBlob } from '../../lib/talkAudio';
-import { latencySummary, talkClient, type TalkMetricsSnapshot } from '../../lib/talkClient';
+import {
+  latencySummary,
+  talkClient,
+  type TalkMetricsSnapshot,
+  type TranscriptionLanguage,
+  type TranscriptionModel,
+} from '../../lib/talkClient';
 import { createTalkPlayer } from '../../lib/talkPlayback';
 import { Button } from '../ui';
+
+/** Download size, in the units the choice is actually weighed in. */
+function formatModelSize(bytes: number): string {
+  const mb = bytes / 1_000_000;
+  return mb >= 1_000 ? `${(mb / 1_000).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+}
 
 const INPUT =
   'w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground outline-none focus:ring-1 focus:ring-accent';
@@ -196,6 +208,53 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
    * checkbox that turns it off is disabled by the same condition, so without a
    * way out of this the whole configuration becomes unsaveable. */
   const armedElsewhere = !localOnly && (voice.wakePhraseEnabled || voice.alwaysListening);
+  const [transcriptionLanguages, setTranscriptionLanguages] = useState<TranscriptionLanguage[]>([
+    { id: 'auto', label: 'Detect automatically' },
+  ]);
+  const [models, setModels] = useState<TranscriptionModel[]>([]);
+  const [installing, setInstalling] = useState<string | null>(null);
+  const [modelError, setModelError] = useState<string | null>(null);
+  const refreshModels = useCallback(() => {
+    void talkClient
+      .models()
+      .then((list) => {
+        if (Array.isArray(list)) setModels(list);
+      })
+      .catch(() => undefined);
+  }, []);
+  useEffect(refreshModels, [refreshModels]);
+
+  /** Choosing a model that is not here yet downloads it now, rather than
+   * stalling the first thing the operator says afterwards. */
+  const chooseModel = useCallback(
+    async (modelId: string) => {
+      setModelError(null);
+      patch({ transcriptionModel: modelId });
+      if (models.find((model) => model.id === modelId)?.installed) return;
+      setInstalling(modelId);
+      try {
+        await talkClient.installModel(modelId);
+        refreshModels();
+      } catch (reason) {
+        setModelError(errorMessage(reason));
+      } finally {
+        setInstalling(null);
+      }
+    },
+    [models, patch, refreshModels],
+  );
+  useEffect(() => {
+    // Whisper's own table, so this list cannot drift from what the model honours.
+    // Keep the built-in default unless a real list comes back: a backend
+    // without this command answers null, and "Detect automatically" alone is a
+    // working control while a missing list is a blank one.
+    void talkClient
+      .languages()
+      .then((list) => {
+        if (Array.isArray(list) && list.length > 0) setTranscriptionLanguages(list);
+      })
+      .catch(() => undefined);
+  }, []);
   const stt = metrics ? latencySummary(metrics.metrics, 'sttMs') : null;
   const firstToken = metrics ? latencySummary(metrics.metrics, 'modelFirstTokenMs') : null;
   const firstAudio = metrics ? latencySummary(metrics.metrics, 'ttsFirstAudioMs') : null;
@@ -267,6 +326,54 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
           <p className="mt-2 text-[11px] text-warning">{t('VoiceSettings.speechRecognitionUnavailable')}</p>
         )}
       </div>
+
+      <label className="mt-3 block text-xs text-muted">
+        Speech model
+        <select
+          className={`${INPUT} mt-1`}
+          value={voice.transcriptionModel || 'base'}
+          disabled={installing !== null}
+          onChange={(event) => void chooseModel(event.target.value)}
+        >
+          {models.map((model) => (
+            <option key={model.id} value={model.id}>
+              {model.label} · {formatModelSize(model.bytes)}
+              {model.installed ? '' : ' · downloads'}
+            </option>
+          ))}
+        </select>
+        <span className="mt-1 block text-[11px] text-faint">
+          {installing
+            ? `Downloading ${installing}… it is verified against its published checksum before anything uses it.`
+            : 'A bigger model hears names and accents the small one guesses at, and takes longer per utterance. Each one is downloaded once.'}
+        </span>
+        {modelError && (
+          <span role="alert" className="mt-1 block text-[11px] text-danger">
+            {modelError}
+          </span>
+        )}
+      </label>
+
+      <label className="mt-3 block text-xs text-muted">
+        Spoken language
+        <select
+          className={`${INPUT} mt-1`}
+          value={voice.language || 'auto'}
+          onChange={(event) => patch({ language: event.target.value })}
+        >
+          {transcriptionLanguages.map((language) => (
+            <option key={language.id} value={language.id}>
+              {language.label}
+            </option>
+          ))}
+        </select>
+        <span className="mt-1 block text-[11px] text-faint">
+          Automatic detection decides from the audio, and one sentence is not much to go on: a
+          mostly-English question with a Swedish name in it detects as English, and the name comes
+          back spelled the way an English speaker would have said it. Naming the language you
+          actually speak fixes that.
+        </span>
+      </label>
 
       <div className="mt-3 grid gap-3 sm:grid-cols-2">
         <label className="text-xs text-muted">

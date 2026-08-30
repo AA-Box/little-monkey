@@ -2781,6 +2781,15 @@ fn searchable_run_event(
             "mutation",
             format!("{mutation_id} {reason}"),
         ),
+        RunEvent::TaskEvent {
+            task_id,
+            event_type,
+            payload,
+        } => (
+            "task_event",
+            "task",
+            format!("{task_id} {event_type} {payload}"),
+        ),
         // Indexed under "node" rather than "run": what someone searches for
         // after a migration is the machine, and the run id is already the
         // column this row is keyed by.
@@ -3782,6 +3791,9 @@ mod tests {
                 max_artifact_bytes: 1_000_000,
                 max_event_count: 1_000,
             },
+            autonomous_task: None,
+            execution_target: None,
+            workspace_transfer: None,
         }
     }
 

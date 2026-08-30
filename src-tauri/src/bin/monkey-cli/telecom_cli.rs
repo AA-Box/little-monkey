@@ -57,8 +57,9 @@ pub enum TelecomCmd {
     },
     /// Store the carrier credential, read from stdin.
     SetToken { account_id: String },
-    /// Record that the app stored a credential in the keychain for this
-    /// account. The secret itself never travels through an argument.
+    /// Record that a credential was stored in the keychain for this account
+    /// outside this command. The app's own save runs `set-token` instead, so
+    /// the entry belongs to the binary the daemon reads it back from.
     MarkCredential { account_id: String },
     /// Enable or disable an account.
     Enable {
@@ -415,16 +416,9 @@ fn set_token(account_id: &str) -> Result<(), String> {
     let mut account = store
         .telecom_account(account_id)?
         .ok_or_else(|| format!("No such account '{account_id}'"))?;
-    let mut secret = String::new();
-    std::io::stdin()
-        .read_line(&mut secret)
-        .map_err(|error| format!("Could not read the credential from stdin: {error}"))?;
-    let secret = secret.trim();
-    if secret.is_empty() {
-        return Err("No credential was supplied on stdin".to_string());
-    }
+    let secret = crate::channels_cli::read_secret_from_stdin()?;
     let reference = little_monkey_lib::channels::telecom_credential_ref(account_id);
-    KeyringChannelSecrets.put(&reference, secret)?;
+    KeyringChannelSecrets.put(&reference, &secret)?;
     account.credential_ref = Some(reference);
     record_credential_change(&mut store, account)?;
     println!(
@@ -471,6 +465,30 @@ fn record_credential_change(
     Ok(())
 }
 
+/// Mirror the operator-visible telephony switch onto the internal SMS channel.
+///
+/// A number is one product account. The channel row is an implementation detail
+/// that exists so SMS can reuse messaging policy/routing/outbox semantics; users
+/// must not have to discover and enable that row separately. Keeping the mirror
+/// here also means disabling a number immediately stops its SMS worker on the
+/// next channel-runtime reconciliation.
+fn sync_sms_channel_enabled(
+    store: &mut DaemonStore,
+    account: &TelecomAccountRecord,
+    now: i64,
+) -> Result<(), String> {
+    crate::daemon::telecom_worker::ensure_sms_channel_account(store, account, now)?;
+    let mut channel = store
+        .channel_account(&account.account_id)?
+        .ok_or_else(|| format!("SMS channel for '{}' was not created", account.account_id))?;
+    if channel.enabled != account.enabled {
+        channel.enabled = account.enabled;
+        channel.updated_at_ms = now;
+        store.upsert_channel_account(&channel)?;
+    }
+    Ok(())
+}
+
 fn enable(account_id: &str, enabled: bool) -> Result<(), String> {
     let mut store = store()?;
     let mut account = store
@@ -481,9 +499,11 @@ fn enable(account_id: &str, enabled: bool) -> Result<(), String> {
             "Account '{account_id}' has no credential yet; run `monkey telecom set-token {account_id}` first"
         ));
     }
+    let now = now_ms();
     account.enabled = enabled;
-    account.updated_at_ms = now_ms();
+    account.updated_at_ms = now;
     store.upsert_telecom_account(&account)?;
+    sync_sms_channel_enabled(&mut store, &account, now)?;
     println!(
         "{account_id} is now {}.",
         if enabled { "enabled" } else { "disabled" }
@@ -865,6 +885,48 @@ mod tests {
         );
         assert_eq!(value["limits"]["max_concurrent_calls"], 1);
         assert_eq!(value["limits"]["recording_enabled"], false);
+    }
+
+    #[test]
+    fn sms_shadow_enablement_follows_the_number() {
+        let mut store = DaemonStore::open_in_memory().expect("open store");
+        let mut telecom = account();
+        telecom.enabled = false;
+        store
+            .upsert_telecom_account(&telecom)
+            .expect("store telecom account");
+
+        sync_sms_channel_enabled(&mut store, &telecom, 1_700_000_000_100)
+            .expect("create disabled SMS shadow");
+        assert!(
+            !store
+                .channel_account(&telecom.account_id)
+                .expect("read SMS shadow")
+                .expect("SMS shadow exists")
+                .enabled
+        );
+
+        telecom.enabled = true;
+        sync_sms_channel_enabled(&mut store, &telecom, 1_700_000_000_200)
+            .expect("enable SMS shadow");
+        assert!(
+            store
+                .channel_account(&telecom.account_id)
+                .expect("read enabled SMS shadow")
+                .expect("SMS shadow exists")
+                .enabled
+        );
+
+        telecom.enabled = false;
+        sync_sms_channel_enabled(&mut store, &telecom, 1_700_000_000_300)
+            .expect("disable SMS shadow");
+        assert!(
+            !store
+                .channel_account(&telecom.account_id)
+                .expect("read disabled SMS shadow")
+                .expect("SMS shadow exists")
+                .enabled
+        );
     }
 
     #[test]

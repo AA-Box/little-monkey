@@ -427,6 +427,26 @@ impl DaemonStore {
         Ok(())
     }
 
+    pub fn mark_queued_paused(
+        &mut self,
+        job_id: &str,
+        run_id: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE daemon_jobs SET run_id=?2, state='paused', pause_requested=1, updated_at_ms=?3
+                 WHERE job_id=?1 AND state='preparing'",
+                params![job_id, run_id, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err(format!("Job '{job_id}' is not preparing"));
+        }
+        Ok(())
+    }
+
     pub fn get_job(&self, id: &str) -> Result<Option<DaemonJob>, String> {
         self.connection
             .query_row(

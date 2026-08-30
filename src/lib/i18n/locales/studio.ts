@@ -19,7 +19,9 @@ export const studioLocale: Record<string, string> = {
   "Studio.mlx.preparing": "Preparing the MLX video service…",
   "Studio.mlx.notReady": "The MLX video service is not ready yet.",
   "Studio.mlx.retry": "Retry MLX setup",
-  "Studio.mflux.notReady": "Install the MFLUX Image Runtime from Settings → Runtime Hub → Components before generating.",
+  "Studio.mflux.preparing": "Preparing the MFLUX Image Runtime…",
+  "Studio.mflux.notReady": "The MFLUX Image Runtime could not be prepared automatically.",
+  "Studio.mflux.retry": "Retry MFLUX setup",
   "Studio.add.speechHint":
     "A speech model is its backbone on --model plus its projector on --mmproj.",
   "Studio.task.text_to_speech": "Text to speech",
@@ -105,6 +107,7 @@ export const studioLocale: Record<string, string> = {
   "Studio.tools.fromGallery": "Use the newest result",
   "Studio.tools.results": "Results",
   "Studio.tools.version": "Version {version}",
+  "Studio.tools.licenseDetails": "View license details",
 
   "Studio.noneForTab": "No model in your library can do this yet",
   "Studio.notDownloaded": "not downloaded",
@@ -177,8 +180,11 @@ export const studioLocale: Record<string, string> = {
     "For MLX conversions — a folder holding config.json beside model, t5_encoder and vae safetensors. Needs the MLX package from Settings → Runtime Hub, and makes video only.",
   "Studio.add.engineMfluxImageHint":
     "Native image generation with text-to-image and image-to-image. Needs the separate MFLUX Image Runtime from Settings → Runtime Hub.",
+  "Studio.add.engineAutoHint":
+    "Complete repositories and local model directories select MFLUX automatically; weight files use the bundled engine.",
   "Studio.add.mfluxSource": "Model source",
-  "Studio.add.mfluxRepository": "Repository",
+  "Studio.add.componentFiles": "Weight files",
+  "Studio.add.mfluxRepository": "Hugging Face repository",
   "Studio.add.mfluxRepositoryPlaceholder": "owner/model",
   "Studio.add.mfluxToken": "Access token (optional)",
   "Studio.add.mfluxTokenPlaceholder": "hf_…",
@@ -220,6 +226,20 @@ export const studioLocale: Record<string, string> = {
   "Studio.lora.empty": "No LoRAs in your library. Add one in the Models tab.",
   "Studio.lora.pick": "Which LoRA",
   "Studio.lora.forget": "Remove from library",
+  "Studio.plugins.title": "Plugins & tools",
+  "Studio.plugins.hint":
+    "Adapters and sidecar tools stay visible from every generation tab. Only controls supported by the selected model are enabled.",
+  "Studio.plugins.audioHint":
+    "Audio models use speech components and reference voices instead of image LoRAs.",
+  "Studio.plugins.audioComponents": "Audio components",
+  "Studio.plugins.loraUnavailable":
+    "This model or engine does not expose LoRA support.",
+  "Studio.plugins.remoteHint":
+    "Remote backends own their plugin graph; local LoRAs and model components are not sent.",
+  "Studio.plugins.mfluxHint":
+    "MFLUX currently supports prompt, canvas, steps, guidance, seed and an optional source image.",
+  "Studio.plugins.openModels": "Open model library",
+  "Studio.plugins.openTools": "Open tools",
   "Studio.parts": "Model parts",
   "Studio.partsHint":
     "Pick which CLIP, text encoder or VAE this run loads. Add them in the Models tab; this only chooses between them.",

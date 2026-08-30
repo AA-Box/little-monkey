@@ -5,7 +5,6 @@ import { StrictMode, useRef, useState } from 'react';
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
-  openUrl: vi.fn(),
   listeners: new Map<string, Set<(event: { payload: unknown }) => void>>(),
 }));
 
@@ -20,10 +19,6 @@ vi.mock('@tauri-apps/api/event', () => ({
     return () => handlers.delete(handler);
   },
 }));
-vi.mock('@tauri-apps/plugin-opener', () => ({
-  openUrl: (...args: unknown[]) => mocks.openUrl(...args),
-}));
-
 import { DictationButton, type DictationButtonHandle } from './DictationButton';
 
 const CONFIG = {
@@ -100,8 +95,6 @@ async function startDictation(): Promise<string> {
 
 beforeEach(() => {
   mocks.invoke.mockReset();
-  mocks.openUrl.mockReset();
-  mocks.openUrl.mockResolvedValue(undefined);
   mocks.listeners.clear();
   mocks.invoke.mockImplementation((command: string, args?: { sessionId?: string }) => {
     if (command === 'dictation_capabilities') {
@@ -126,8 +119,8 @@ afterEach(() => {
 });
 
 describe('DictationButton', () => {
-  it('opens macOS speech settings when native recognition is unavailable', async () => {
-    mocks.invoke.mockImplementation((command: string) => {
+  it('still attempts native dictation when capability metadata is unavailable', async () => {
+    mocks.invoke.mockImplementation((command: string, args?: { sessionId?: string }) => {
       if (command === 'dictation_capabilities') {
         return Promise.resolve({
           supported: false,
@@ -138,6 +131,8 @@ describe('DictationButton', () => {
           languages: [],
         });
       }
+      if (command === 'm7_config_get') return Promise.resolve(CONFIG);
+      if (command === 'dictation_start') return Promise.resolve({ sessionId: args?.sessionId });
       return Promise.resolve(undefined);
     });
 
@@ -146,9 +141,34 @@ describe('DictationButton', () => {
     expect(button.disabled).toBe(false);
     fireEvent.click(button);
 
-    await waitFor(() => expect(mocks.openUrl).toHaveBeenCalledWith(
-      'x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition',
+    await waitFor(() => expect(mocks.invoke.mock.calls.some(([command]) => command === 'dictation_start')).toBe(true));
+  });
+
+  it('opens native settings instead of starting when a permission is denied', async () => {
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'dictation_capabilities') {
+        return Promise.resolve({
+          supported: true,
+          platform: 'macos',
+          engine: 'Apple Speech',
+          supportsPartialResults: true,
+          supportsOnDevice: false,
+          languages: [],
+          permissions: { microphone: 'granted', speech: 'denied' },
+        });
+      }
+      if (command === 'm7_config_get') return Promise.resolve(CONFIG);
+      return Promise.resolve(undefined);
+    });
+
+    render(<Harness />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Start dictation' }));
+
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith(
+      'dictation_open_permission_settings',
+      { kind: 'speech' },
     ));
+    expect(mocks.invoke.mock.calls.some(([command]) => command === 'dictation_start')).toBe(false);
   });
 
   it('replaces provisional text, commits the final, and restores the caret', async () => {
@@ -201,8 +221,9 @@ describe('DictationButton', () => {
       message: 'Microphone access is disabled.',
     });
 
-    await waitFor(() => expect(mocks.openUrl).toHaveBeenCalledWith(
-      'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone',
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith(
+      'dictation_open_permission_settings',
+      { kind: 'microphone' },
     ));
   });
 

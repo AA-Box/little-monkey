@@ -240,21 +240,24 @@ async fn call_tool_cancellation_sends_a_real_cancelled_notification_to_the_serve
     .unwrap_err();
     assert_eq!(err, "test cancel");
 
-    // Give the (separate) server process a moment to receive the
-    // notification and write the marker before asserting on it.
-    let mut seen = false;
+    // `std::fs::write` creates/truncates the marker before its bytes are
+    // necessarily visible to this process. Poll the evidence we actually care
+    // about instead of treating mere file existence as a completed write.
+    let mut observed = String::new();
     for _ in 0..50 {
-        if marker.exists() {
-            seen = true;
-            break;
+        if let Ok(contents) = std::fs::read_to_string(&marker) {
+            if contents == "cancelled" {
+                observed = contents;
+                break;
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert!(
-        seen,
-        "server never observed a notifications/cancelled for the cancelled call"
+    assert_eq!(
+        observed,
+        "cancelled",
+        "server never completed the notifications/cancelled marker write"
     );
-    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "cancelled");
 
     let _ = std::fs::remove_file(&marker);
     disconnect_impl(&state, &entry.id).await;

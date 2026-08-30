@@ -23,7 +23,7 @@ Little Monkey separates portable, user-authored agent configuration from managed
 - `LITTLE_MONKEY_HOME` selects the agent home when set to an absolute path; otherwise it is `~/.littlemonkey`.
 - The default profile uses that directory directly. Named profiles use `<agent-home>/profiles/<id>` so rules and hooks retain the same profile isolation as the desktop app.
 - Global `MONKEY.md`/`AGENTS.md`, `hooks.json`, recipes, and `monkey` CLI input history use the agent home on new installations. Existing legacy files are discovered automatically and continue working in place, preserving rules history, recipe-relative workspace paths, and binary rollback; no manual copying or path edits are required. New items use the agent home.
-- Workspace-authored recipes and skills remain under the repository's `.littlemonkey/` directory.
+- Workspace-authored recipes and managed skills remain under the repository's `.littlemonkey/` directory. Little Monkey also discovers standard read-only skills from `<workspace>/.agents/skills/` and `~/.agents/skills/`, so skills shared with other agents can be used without being copied or rewritten.
 - Models, runtimes, sessions, memories, checkpoints, databases, MCP configuration, managed native skills/packages, caches, logs, and other managed data remain in the operating system's application-data locations. Credentials remain in the OS keychain.
 
 The app creates agent-home directories with mode `0700` on Unix and rejects a relative `LITTLE_MONKEY_HOME`, preventing GUI and CLI launches from resolving different directories because their working directories differ.

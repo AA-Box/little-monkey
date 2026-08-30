@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
 import { Button, ModelListRow, StatusPill } from "../ui";
-import { useModelStore, type ProviderConfig, type ProviderModelInfo } from "../../store/modelStore";
+import { providerIsConnected, useModelStore, type ProviderConfig, type ProviderModelInfo } from "../../store/modelStore";
 import { isVisionCapableProviderModel } from "../../lib/visionModels";
 import { cloudModelRetirementWarning } from "../../lib/modelRetirement";
 import { useSettingsStore } from "../../store/settingsStore";
@@ -178,7 +178,7 @@ export function ProviderCard({ provider }: ProviderCardProps) {
 
       {errorMessage && <p className="text-xs text-danger">{errorMessage}</p>}
 
-      {provider.has_key && providerModels.length > 0 && (
+      {providerIsConnected(provider) && providerModels.length > 0 && (
         <div className="flex flex-col gap-2">
           {providerModels.length > FILTER_THRESHOLD && (
             <input

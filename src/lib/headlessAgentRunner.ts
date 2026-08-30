@@ -14,13 +14,14 @@ import { beginDurableRun, type DurableRunRecorder } from './durableRun';
 import { toolResultOutcome } from './toolOutcome';
 import type { ChatMessage, ToolCall } from './llamaClient';
 import type { McpToolRegistry } from './mcpTools';
-import { toolsForProfile } from './tools';
+import { READ_SKILL_RESOURCE_TOOL, toolsForProfile } from './tools';
 import {
   attemptStream,
   CANCELLED_TOOL_RESULT,
   executeToolCall,
   isToolCallAllowed,
   stringifyToolError,
+  type SkillToolContext,
 } from './turnEngine';
 import { applyAllowedToolsRestriction } from './allowedTools';
 import { protectToolResult } from './untrustedContent';
@@ -97,6 +98,9 @@ export interface RunHeadlessAgentParams {
    * tool the skill will not have once installed. Empty or omitted leaves the
    * profile's own list alone; it can only ever narrow. */
   allowedTools?: string[];
+  /** Optional frozen skill context used by isolated evaluation arms to resolve
+   * bundled resources from their backend-owned snapshots. */
+  skill?: SkillToolContext;
   durableRun: HeadlessAgentDurableRunSpec;
   onToolActivity?: (label: string) => void;
   /** Optional feature-level validation of the final reply. Throwing converts
@@ -163,10 +167,12 @@ export async function runHeadlessAgent(params: RunHeadlessAgentParams): Promise<
     const target = await resolveTarget();
     const effort = effortForTarget(target);
     const toolProfile = params.toolProfile ?? 'code';
-    const tools = applyAllowedToolsRestriction(
+    const restrictedTools = applyAllowedToolsRestriction(
       toolsForProfile(toolProfile),
       params.allowedTools?.length ? new Set(params.allowedTools) : null,
     );
+    const hasSkillResources = params.skill?.availableSkills.some((skill) => (skill.resourceFiles?.length ?? 0) > 0) ?? false;
+    const tools = hasSkillResources ? [...restrictedTools, READ_SKILL_RESOURCE_TOOL] : restrictedTools;
     const mcpRegistry = emptyMcpRegistry();
     let messages: ChatMessage[] = [{ role: 'user', content: params.userContent ?? params.userMessage }];
 
@@ -256,7 +262,7 @@ export async function runHeadlessAgent(params: RunHeadlessAgentParams): Promise<
                 undefined,
                 undefined,
                 params.executionSource,
-                undefined,
+                params.skill,
                 undefined,
                 params.workspaceRootOverride,
               );

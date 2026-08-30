@@ -1,11 +1,12 @@
 import { Children, isValidElement, lazy, memo, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
-import { Eye, Languages, LoaderCircle, Pencil, Split, X } from "lucide-react";
+import { Eye, FileText, Languages, LoaderCircle, Pencil, Split, X } from "lucide-react";
 
 import { textContent, type ChatContentPart, type ChatMessage } from "../../lib/llamaClient";
 import { detectFenceKind, fingerprintArtifact, type ArtifactRef } from "../../lib/artifacts";
 import { isWorkspaceImageSrc } from "../../lib/imageGeneration";
+import { formatEstimatedTokens, formatPastedTextSize, shouldCollapsePastedText } from "../../lib/pastedText";
 import WorkspaceImagePreview from "./WorkspaceImagePreview";
 import MessageActions, { Tooltip } from "./MessageActions";
 import { useArtifactStore } from "../../store/artifactStore";
@@ -174,10 +175,6 @@ function buildAssistantMarkdownComponents(
 
       if (!codeProps) return <pre>{children}</pre>;
 
-      // Suspense's fallback is the same plain `<pre>` this fence rendered as
-      // before `CodeBlock` existed — the lazy chunk is small and typically
-      // cached after the first fence in a session, so this is a rare,
-      // brief flash rather than the normal path.
       if (!kind) {
         return (
           <Suspense fallback={<pre>{children}</pre>}>
@@ -230,15 +227,12 @@ function UserBubble({
   translationControls?: ReactNode;
   onStartSideTask?: () => void;
 }) {
-  // Editing only ever operates on the text portion — an edited-and-resubmitted
-  // message doesn't carry its original image attachment forward (matches
-  // `ChatWindow.tsx`'s `handleEditMessage`, which already resubmits edits
-  // with no attachments at all).
   const text = textContent(content);
   const images = typeof content === "string" ? [] : content.filter((part) => part.type === "image_url");
 
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(text);
+  const [largeTextOpen, setLargeTextOpen] = useState(false);
   const { t } = useT();
 
   const commit = () => {
@@ -272,7 +266,7 @@ function UserBubble({
               }
             }}
             rows={Math.min(8, draft.split("\n").length)}
-            className="w-full resize-none bg-transparent text-sm leading-relaxed text-foreground outline-none"
+            className="max-h-[60vh] w-full resize-y bg-transparent font-mono text-sm leading-relaxed text-foreground outline-none"
           />
           <div className="mt-1.5 flex justify-end gap-1.5">
             <button
@@ -295,6 +289,9 @@ function UserBubble({
       </div>
     );
   }
+
+  const renderedText = displayText ?? text;
+  const collapseAsPaste = displayText === undefined && shouldCollapsePastedText(text);
 
   return (
     <div className="group flex justify-end">
@@ -331,7 +328,7 @@ function UserBubble({
             )}
           </div>
         )}
-        <div className="flex flex-col gap-2 rounded-2xl border border-border bg-surface-2 px-4 py-2 text-sm text-foreground">
+        <div className="flex min-w-0 flex-col gap-2 rounded-2xl border border-border bg-surface-2 px-4 py-2 text-sm text-foreground">
           {images.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
               {images.map((part, index) => (
@@ -344,7 +341,31 @@ function UserBubble({
               ))}
             </div>
           )}
-          {(displayText ?? text) && <div className="whitespace-pre-wrap">{displayText ?? text}</div>}
+          {renderedText && collapseAsPaste ? (
+            <div className="min-w-[15rem] max-w-[28rem]">
+              <button
+                type="button"
+                onClick={() => setLargeTextOpen((open) => !open)}
+                className="flex w-full cursor-pointer items-center gap-2 rounded-lg border border-border bg-background px-3 py-2 text-left hover:bg-surface"
+              >
+                <FileText size={16} className="shrink-0 text-accent" />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-xs font-medium text-foreground">Pasted text.md</span>
+                  <span className="block text-[10px] text-faint">
+                    {formatPastedTextSize(text)} · {formatEstimatedTokens(text)}
+                  </span>
+                </span>
+                <span className="text-[10px] text-faint">{largeTextOpen ? "Hide" : "View"}</span>
+              </button>
+              {largeTextOpen && (
+                <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap rounded-lg border border-border bg-background p-3 font-mono text-xs leading-relaxed text-foreground">
+                  {text}
+                </pre>
+              )}
+            </div>
+          ) : renderedText ? (
+            <div className="whitespace-pre-wrap">{renderedText}</div>
+          ) : null}
         </div>
       </div>
     </div>
@@ -378,8 +399,6 @@ function AssistantMessage({
       </div>
       <div className="mt-1 flex items-center gap-0.5">
         {translationControls}
-        {/* A pinned answer keeps its footer visible: the filled bookmark is
-            the only place the chapter's own state shows on the message. */}
         <div
           className={`flex items-center gap-0.5 transition-opacity duration-150 ${pinned ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"}`}
         >
@@ -518,8 +537,6 @@ function TranslationControls({
         >
           {running ? <LoaderCircle size={13} className="animate-spin" /> : <Languages size={13} />}
         </button>
-        {/* Hidden while the language dialog is open — the tooltip would sit
-            on top of the panel it just opened. */}
         {!menuOpen && <Tooltip text={running ? t("Translation.cancel") : t("Translation.translate")} />}
       </span>
 

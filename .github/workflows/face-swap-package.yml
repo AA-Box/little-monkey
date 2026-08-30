@@ -1,0 +1,158 @@
+# Builds the managed GHOST face-swap sidecar for each supported desktop target,
+# publishes the binaries, and updates the rolling signed catalog Studio polls.
+# The assets are fetched by hash in CI and are never committed to the repo.
+name: Face Swap package
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "studio-tools/face-swap/**"
+      - "scripts/build-face-swap-package.mjs"
+      - "scripts/prepare-face-swap-assets.py"
+      - "scripts/lib/mlxPackage.mjs"
+      - ".github/workflows/face-swap-package.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: linux-x86_64
+            target_os: linux
+            target_arch: x86_64
+            extension: ""
+          - runner: windows-latest
+            target: windows-x86_64
+            target_os: windows
+            target_arch: x86_64
+            extension: .exe
+          - runner: macos-13
+            target: macos-x86_64
+            target_os: macos
+            target_arch: x86_64
+            extension: ""
+          - runner: macos-14
+            target: macos-aarch64
+            target_os: macos
+            target_arch: aarch64
+            extension: ""
+    runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: face-swap-ghost-3_256-${{ github.sha }}
+      ASSET_NAME: face-swap-ghost-3_256-${{ matrix.target }}${{ matrix.extension }}
+      FACE_SWAP_SIGNING_KEY: ${{ secrets.MLX_SIGNING_PRIVATE_KEY }}
+      FACE_SWAP_SIGNING_KEY_ID: release-2026-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install face-swap build dependencies
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check \
+            -r studio-tools/face-swap/studio-tool-face-swap-requirements.txt \
+            -r studio-tools/face-swap/studio-tool-face-swap-codeformer-requirements.txt
+          pnpm install --frozen-lockfile
+
+      - name: Fetch and verify model, source, checkpoint, and license assets
+        shell: bash
+        run: python scripts/prepare-face-swap-assets.py --root "$RUNNER_TEMP/face-swap-assets" --codeformer
+
+      - name: Build one-file managed sidecar
+        shell: bash
+        env:
+          FACE_SWAP_MODEL_ROOT: ${{ runner.temp }}/face-swap-assets
+          FACE_SWAP_MODEL_LICENSE_FILE: ${{ runner.temp }}/face-swap-assets/licenses/model-license.txt
+          FACE_SWAP_CODEFORMER_HOME: ${{ runner.temp }}/face-swap-assets/codeformer-source
+          FACE_SWAP_CODEFORMER_MODEL: ${{ runner.temp }}/face-swap-assets/models/codeformer.pth
+          FACE_SWAP_CODEFORMER_LICENSE_FILE: ${{ runner.temp }}/face-swap-assets/licenses/codeformer-license.txt
+          FACE_SWAP_VERSION: ghost-3_256-${{ github.sha }}-${{ matrix.target }}
+          FACE_SWAP_DOWNLOAD_URL: https://github.com/${{ github.repository }}/releases/download/face-swap-ghost-3_256-${{ github.sha }}/face-swap-ghost-3_256-${{ matrix.target }}${{ matrix.extension }}
+        run: |
+          export FACE_SWAP_PYTHON="$(python -c 'import sys; print(sys.executable)')"
+          pnpm face-swap:package
+          mkdir -p packaging/face-swap/publish
+          cp "packaging/face-swap/dist/studio-tool-face-swap${{ matrix.extension }}" \
+            "packaging/face-swap/publish/$ASSET_NAME"
+          cp packaging/face-swap/face-swap-catalog.json \
+            "packaging/face-swap/publish/$ASSET_NAME.catalog.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: face-swap-${{ matrix.target }}
+          path: packaging/face-swap/publish/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    env:
+      RELEASE_TAG: face-swap-ghost-3_256-${{ github.sha }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/face-swap-artifacts
+          pattern: face-swap-*
+          merge-multiple: true
+
+      - name: Publish binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t binaries < <(find "$RUNNER_TEMP/face-swap-artifacts" -type f ! -name '*.catalog.json' -print | sort)
+          if [ "${#binaries[@]}" -eq 0 ]; then
+            echo "No face-swap binaries were built" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" "${binaries[@]}" \
+            --title "Face Swap ${GITHUB_SHA::12}" \
+            --latest=false \
+            --notes "Signed GHOST 3_256 Studio sidecars. Non-commercial use only; see the license notice in Studio and the bundled license files." \
+            || for binary in "${binaries[@]}"; do gh release upload "$RELEASE_TAG" "$binary" --clobber; done
+
+      - name: Build and publish the rolling catalog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module - "$RUNNER_TEMP/face-swap-artifacts" <<'NODE'
+          import { readdirSync, readFileSync, writeFileSync } from "node:fs";
+          import { join } from "node:path";
+          const root = process.argv[2];
+          const entries = readdirSync(root)
+            .filter((name) => name.endsWith(".catalog.json"))
+            .sort()
+            .flatMap((name) => JSON.parse(readFileSync(join(root, name), "utf8")));
+          if (entries.length !== 4) throw new Error(`expected 4 catalog entries, got ${entries.length}`);
+          writeFileSync(join(root, "face-swap-catalog.json"), JSON.stringify(entries, null, 2) + "\n");
+          NODE
+          gh release create face-swap-catalog \
+            "$RUNNER_TEMP/face-swap-artifacts/face-swap-catalog.json" \
+            --title "Face Swap catalog" \
+            --latest=false \
+            --notes "Signed catalog for the managed GHOST 3_256 Studio tool. Studio refreshes this automatically; use Import catalog only for offline/self-hosted installs." \
+            || gh release upload face-swap-catalog \
+              "$RUNNER_TEMP/face-swap-artifacts/face-swap-catalog.json" --clobber

@@ -39,7 +39,7 @@ import {
   type RoutingDecision,
   type RoutingTaskClass,
 } from './modelRouting';
-import { getActiveChatTarget, useModelStore } from '../store/modelStore';
+import { getActiveChatTarget, useModelStore, type MlxChatStatus as MlxChatStatusPayload } from '../store/modelStore';
 import { useCostControlStore } from '../store/costControlStore';
 import { useRoutingPolicyStore } from '../store/routingPolicyStore';
 
@@ -64,6 +64,11 @@ interface LlamaStatusPayload {
  * than this function throwing before the user ever sees why.
  */
 async function resolveBaseUrl(): Promise<string> {
+  // An MLX model serves the same OpenAI-compatible shape from its own loopback
+  // endpoint (`mlx_chat.rs`), so resolving to that port is the whole of what
+  // the rest of the chat path needs to know about MLX.
+  const mlx = await resolveMlxBaseUrl();
+  if (mlx) return mlx;
   try {
     const status = await invoke<LlamaStatusPayload>('llama_status');
     // `llama_status` is the native source of truth. Keep the model store in
@@ -86,6 +91,62 @@ async function resolveBaseUrl(): Promise<string> {
     return `http://127.0.0.1:${port}`;
   } catch {
     return `http://127.0.0.1:${DEFAULT_LLAMA_PORT}`;
+  }
+}
+
+/**
+ * The loopback endpoint serving `modelPath`, whichever local runtime holds it.
+ *
+ * Four callers — Compare, Crew, the PM copilot and message translation — each
+ * carried their own copy of "ask `llama_status`, check it is ready and still
+ * holding this model, build a base URL". They now share one, because there are
+ * two local runtimes to ask and a copy that only knows about llama-server
+ * reports a loaded MLX model as unloaded.
+ *
+ * Throws with `displayName` in the message when nothing is serving that model,
+ * which is the same contract the four copies had.
+ */
+export async function resolveLoadedLocalEndpoint(
+  modelPath: string,
+  displayName: string,
+): Promise<string> {
+  try {
+    const mlx = await invoke<MlxChatStatusPayload>('mlx_chat_status');
+    if (mlx?.running && mlx.port > 0 && mlx.modelPath === modelPath) {
+      return `http://127.0.0.1:${mlx.port}`;
+    }
+  } catch {
+    // No MLX endpoint on this machine — fall through to llama-server.
+  }
+  const status = await invoke<LlamaStatusPayload>('llama_status');
+  if (status.status !== 'ready' || status.model_path !== modelPath) {
+    throw new Error(`${displayName} is no longer loaded in a local runtime.`);
+  }
+  return `http://127.0.0.1:${status.port}`;
+}
+
+/**
+ * The running MLX endpoint's base URL, or null when the local runtime in play
+ * is llama-server.
+ *
+ * Asks the backend rather than trusting the store: a chat turn may be the first
+ * thing to run after a reload, when the store has not yet learned that an MLX
+ * model is resident. A failure here is not an error — it just means no MLX
+ * endpoint, which is the ordinary case on every non-Apple-Silicon machine.
+ */
+async function resolveMlxBaseUrl(): Promise<string | null> {
+  if (useModelStore.getState().active?.runtime !== 'mlx') return null;
+  try {
+    const status = await invoke<MlxChatStatusPayload>('mlx_chat_status');
+    if (!status?.running || !(status.port > 0)) return null;
+    useModelStore.setState({
+      mlxChat: status,
+      llamaStatus: 'ready',
+      llamaVisionEnabled: status.vision,
+    });
+    return `http://127.0.0.1:${status.port}`;
+  } catch {
+    return null;
   }
 }
 

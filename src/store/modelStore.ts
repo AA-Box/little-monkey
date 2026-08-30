@@ -29,6 +29,25 @@ export interface ModelInfo {
   kind: "chat" | "embedding";
   components?: ModelComponents;
   capabilities?: ModelCapabilities;
+  /** Which local runtime loads this model: a GGUF runs on the bundled
+   *  llama.cpp, a safetensors directory on MLX. Absent on anything installed
+   *  before the field existed, which was always a GGUF. */
+  runtime?: ModelRuntimeKind;
+}
+
+/** Mirrors `model_sources.rs::ModelRuntimeKind`. */
+export type ModelRuntimeKind = "llama_cpp" | "mlx";
+
+/** Mirrors `mlx_chat.rs::MlxChatStatus` — the loopback OpenAI-compatible
+ *  endpoint that fronts a running MLX model. */
+export interface MlxChatStatus {
+  running: boolean;
+  port: number;
+  modelId: string;
+  modelPath: string;
+  /** Whether the running model can read images — the MLX equivalent of a GGUF
+   *  with a projector, and what the composer offers an attachment on. */
+  vision: boolean;
 }
 
 export type ComponentOwnership = "managed" | "external";
@@ -73,6 +92,21 @@ export interface ResolvedModelReference {
   licenseUrl: string | null;
   artifacts?: ResolvedModelArtifact[];
   projectorCandidates?: ResolvedModelArtifact[];
+  /** Every file of a directory-shaped repository. Non-empty exactly when this
+   *  installs a directory rather than a single GGUF; `sha256` above is then the
+   *  digest over this list. */
+  bundleFiles?: ResolvedBundleFile[];
+  runtime?: ModelRuntimeKind;
+}
+
+export interface ResolvedBundleFile {
+  path: string;
+  downloadUrl: string;
+  /** Git-LFS digest, for weights. */
+  sha256: string | null;
+  /** Git blob object id, for files not stored in LFS. */
+  blobSha1: string | null;
+  sizeBytes: number;
 }
 
 export type ModelArtifactRole = "model" | "projector";
@@ -242,6 +276,14 @@ export interface ProviderConfig {
   is_extension: boolean;
 }
 
+/** Whether a provider can be selected as a chat target and have its model
+ * list fetched. An extension provider authenticates inside its own sandbox
+ * and owns no key here, so `has_key` alone under-reports it — every caller
+ * that means "connected" must ask this, not `has_key`. */
+export function providerIsConnected(provider: ProviderConfig): boolean {
+  return provider.has_key || provider.is_extension;
+}
+
 /** Mirrors the Rust `ProviderModelInfo` struct exactly. */
 export interface ProviderModelInfo {
   id: string;
@@ -324,6 +366,9 @@ export interface ModelStore {
   llamaStatus: LlamaStatus;
   llamaVisionEnabled: boolean;
   llamaProjectorPath: string | null;
+  /** The running MLX endpoint, when the active model is an MLX one. Null means
+   *  the local runtime in play is llama-server. See `mlx_chat.rs`. */
+  mlxChat: MlxChatStatus | null;
   /** Why the last `start()` failed, verbatim from the backend. A generic
    * "llama-server failed to start" tells nobody whether the runtime is
    * unverified, the port is taken or the GGUF is corrupt — so the real message
@@ -478,6 +523,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
   llamaStatus: "stopped",
   llamaVisionEnabled: false,
   llamaProjectorPath: null,
+  mlxChat: null,
   llamaError: null,
   embeddingsEnabled: readInitialEmbeddingsEnabled(),
 
@@ -520,6 +566,11 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     // Best-effort sync of the live llama-server status, so the UI reflects
     // reality (e.g. after a fresh app launch) without requiring a separate
     // call. Failures here shouldn't blow up the model list refresh.
+    //
+    // Skipped while an MLX model is resident: llama-server is legitimately
+    // stopped then, and syncing from it would report the running model as
+    // stopped on every model-list refresh.
+    if (get().mlxChat?.running) return;
     try {
       const status = await invoke<LlamaStatusEvent>("llama_status");
       set((state) => ({
@@ -591,6 +642,31 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     if (!model.path) {
       throw new Error(`Model "${model.name}" has not been downloaded yet`);
     }
+    // An MLX model runs on the MLX runtime behind its own loopback
+    // OpenAI-compatible endpoint (`mlx_chat.rs`), not on llama-server. Every
+    // later step — `resolveBaseUrl`, streaming, tools — reads that endpoint
+    // exactly the way it reads llama-server's, so only the start differs.
+    if (model.runtime === "mlx") {
+      set({
+        active: model,
+        llamaStatus: "starting",
+        llamaVisionEnabled: false,
+        llamaProjectorPath: null,
+        llamaError: null,
+        activeProvider: "local",
+        mlxChat: null,
+      });
+      try {
+        const status = await invoke<MlxChatStatus>("mlx_chat_start", { modelPath: model.path });
+        set({ mlxChat: status, llamaStatus: "ready", llamaVisionEnabled: status.vision });
+      } catch (err) {
+        set({ llamaStatus: "error", llamaError: errorMessage(err), mlxChat: null });
+        throw err;
+      }
+      // The MLX service reports no context window of its own, so leave the
+      // usage store's limit alone rather than inventing a number for it.
+      return;
+    }
     set({
       active: model,
       llamaStatus: "starting",
@@ -635,6 +711,11 @@ export const useModelStore = create<ModelStore>((set, get) => ({
   },
 
   stop: async () => {
+    if (get().mlxChat?.running) {
+      await invoke("mlx_chat_stop");
+      set({ mlxChat: null, llamaStatus: "stopped", llamaError: null, llamaVisionEnabled: false, llamaProjectorPath: null });
+      return;
+    }
     await invoke("llama_stop");
     set({ llamaStatus: "stopped", llamaError: null, llamaVisionEnabled: false, llamaProjectorPath: null });
   },
@@ -801,7 +882,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     // "Cloud Models" list isn't empty just because the app was relaunched.
     const { providerModels } = get();
     for (const provider of providers) {
-      if (provider.has_key && !providerModels[provider.id]) {
+      if (providerIsConnected(provider) && !providerModels[provider.id]) {
         void get().refreshProviderModels(provider.id);
       }
     }

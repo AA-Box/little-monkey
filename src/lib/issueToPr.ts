@@ -30,6 +30,7 @@ export interface IssueToPrRun {
   issueBody: string;
   worktreeId: string;
   branch: string;
+  baseRef: string;
   workspaceLabel: string;
   status: IssueToPrStatus;
   prNumber: number | null;

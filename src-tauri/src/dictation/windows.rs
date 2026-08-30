@@ -12,10 +12,39 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED,
 };
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-use super::{DictationCapabilities, DictationLanguage, NativeCallback, NativeEvent};
+use super::{
+    DictationCapabilities, DictationLanguage, DictationPermissions, NativeCallback, NativeEvent,
+};
 
 const STOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub fn open_permission_settings(kind: &str) -> Result<(), String> {
+    let target = match kind {
+        "microphone" => "ms-settings:privacy-microphone",
+        "speech" => "ms-settings:privacy-speech",
+        _ => return Err("Invalid dictation permission kind".to_string()),
+    };
+    let operation: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let target: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            windows::core::PCWSTR(operation.as_ptr()),
+            windows::core::PCWSTR(target.as_ptr()),
+            windows::core::PCWSTR::null(),
+            windows::core::PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if (result.0 as usize) > 32 {
+        Ok(())
+    } else {
+        Err("Windows could not open the dictation permission settings".to_string())
+    }
+}
 
 enum Control {
     Stop,
@@ -62,6 +91,11 @@ pub fn capabilities() -> DictationCapabilities {
         supports_partial_results: true,
         supports_on_device: false,
         languages,
+        permissions: if supported {
+            DictationPermissions::unknown()
+        } else {
+            DictationPermissions::unavailable()
+        },
     }
 }
 

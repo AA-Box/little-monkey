@@ -13,3 +13,6 @@
 !/resources/managed-runtime/
 /resources/managed-runtime/*
 !/resources/managed-runtime/README.md
+!/resources/local-whisper/
+/resources/local-whisper/*
+!/resources/local-whisper/README.md

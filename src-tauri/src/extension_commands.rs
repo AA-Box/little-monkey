@@ -9,6 +9,16 @@ use crate::executable_extensions::{
 };
 use std::collections::BTreeMap;
 
+#[path = "marketplace_commands.rs"]
+pub(crate) mod marketplace_commands;
+#[path = "marketplace_provenance.rs"]
+pub(crate) mod marketplace_provenance;
+#[path = "marketplace_staging_integrity.rs"]
+pub(crate) mod marketplace_staging_integrity;
+
+const MARKETPLACE_PREPARE_PREFIX: &str = "little-monkey-marketplace-prepare:v2:";
+const MARKETPLACE_HANDLE_PREFIX: &str = "little-monkey-marketplace:v2:";
+
 fn manager() -> Result<ExtensionManager, String> {
     let app_data = crate::app_paths::data_dir()
         .ok_or_else(|| "Could not resolve the Little Monkey app-data directory".to_string())?;
@@ -16,13 +26,47 @@ fn manager() -> Result<ExtensionManager, String> {
 }
 
 #[tauri::command]
-pub async fn extensions_discover(source_path: String) -> Result<ExtensionPreview, String> {
+pub async fn extensions_discover(
+    window: tauri::Window,
+    state: tauri::State<'_, crate::m4_commands::M4CommandState>,
+    source_path: String,
+) -> Result<ExtensionPreview, String> {
+    if let Some(encoded) = source_path.strip_prefix(MARKETPLACE_PREPARE_PREFIX) {
+        let request = serde_json::from_str(encoded)
+            .map_err(|error| format!("Invalid marketplace prepare request: {error}"))?;
+        let preview = marketplace_commands::marketplace_prepare_extension(window, state, request).await?;
+        marketplace_staging_integrity::validate_handle(&preview.source_path)?;
+        return Ok(preview);
+    }
+    if source_path.starts_with(MARKETPLACE_HANDLE_PREFIX) {
+        marketplace_staging_integrity::validate_handle(&source_path)?;
+        return marketplace_commands::marketplace_preview_install(state, source_path).await;
+    }
     manager()?.discover(source_path)
 }
 
 #[tauri::command]
-pub async fn extensions_list() -> Result<Vec<ExtensionDetail>, String> {
-    manager()?.list()
+pub async fn extensions_list(
+    window: tauri::Window,
+    state: tauri::State<'_, crate::m4_commands::M4CommandState>,
+    refresh_marketplace: Option<bool>,
+    cleanup_marketplace_handle: Option<String>,
+) -> Result<Vec<ExtensionDetail>, String> {
+    if let Some(handle) = cleanup_marketplace_handle {
+        if window.label() != "main" {
+            return Err("Marketplace staging cleanup is allowed only from the main window".to_string());
+        }
+        if !handle.starts_with(MARKETPLACE_HANDLE_PREFIX) {
+            return Err("Invalid marketplace staging handle".to_string());
+        }
+        marketplace_commands::marketplace_cleanup_extension(handle)?;
+    }
+    if refresh_marketplace.unwrap_or(false) {
+        marketplace_commands::marketplace_refresh_registries(window, state).await?;
+    }
+    let installed = manager()?.list()?;
+    marketplace_provenance::reconcile(&installed)?;
+    Ok(installed)
 }
 
 #[tauri::command]
@@ -39,9 +83,30 @@ pub async fn extensions_inspect(extension_id: String) -> Result<ExtensionDetail,
 
 #[tauri::command]
 pub async fn extensions_install(
+    window: tauri::Window,
+    state: tauri::State<'_, crate::m4_commands::M4CommandState>,
     source_path: String,
     approval: Approval,
 ) -> Result<ExtensionDetail, String> {
+    if source_path.starts_with(MARKETPLACE_HANDLE_PREFIX) {
+        marketplace_staging_integrity::validate_handle(&source_path)?;
+        // Persist the native lease identity before mutation.  On a crash after
+        // runtime success, `extensions_list` reconciles this authorization into
+        // a committed receipt by matching the installed manifest/trust identity.
+        let receipt = marketplace_provenance::authorize_from_handle(
+            &source_path,
+            marketplace_provenance::MarketplaceMutationKind::Install,
+        )?;
+        let detail = marketplace_commands::marketplace_install_extension(
+            window,
+            state,
+            source_path,
+            approval,
+        )
+        .await?;
+        marketplace_provenance::commit(&receipt, &detail)?;
+        return Ok(detail);
+    }
     manager()?.install(source_path, approval).await
 }
 
@@ -67,15 +132,40 @@ pub async fn extensions_set_running(
 }
 
 #[tauri::command]
-pub async fn extensions_preview_update(source_path: String) -> Result<ExtensionPreview, String> {
+pub async fn extensions_preview_update(
+    state: tauri::State<'_, crate::m4_commands::M4CommandState>,
+    source_path: String,
+) -> Result<ExtensionPreview, String> {
+    if source_path.starts_with(MARKETPLACE_HANDLE_PREFIX) {
+        marketplace_staging_integrity::validate_handle(&source_path)?;
+        return marketplace_commands::marketplace_preview_update(state, source_path).await;
+    }
     manager()?.preview_update(source_path)
 }
 
 #[tauri::command]
 pub async fn extensions_update(
+    window: tauri::Window,
+    state: tauri::State<'_, crate::m4_commands::M4CommandState>,
     source_path: String,
     approval: Approval,
 ) -> Result<ExtensionDetail, String> {
+    if source_path.starts_with(MARKETPLACE_HANDLE_PREFIX) {
+        marketplace_staging_integrity::validate_handle(&source_path)?;
+        let receipt = marketplace_provenance::authorize_from_handle(
+            &source_path,
+            marketplace_provenance::MarketplaceMutationKind::Update,
+        )?;
+        let detail = marketplace_commands::marketplace_update_extension(
+            window,
+            state,
+            source_path,
+            approval,
+        )
+        .await?;
+        marketplace_provenance::commit(&receipt, &detail)?;
+        return Ok(detail);
+    }
     manager()?.update(source_path, approval).await
 }
 
@@ -110,9 +200,6 @@ pub async fn extensions_set_config(
     manager()?.set_config(&extension_id, values)
 }
 
-/// The only desktop boundary where an extension secret exists as plaintext.
-/// It is never put in a sidecar argument, returned, logged, or persisted in the
-/// registry; the UI receives only the slot's configured boolean on refresh.
 #[tauri::command]
 pub async fn extensions_set_secret(
     extension_id: String,
@@ -123,7 +210,10 @@ pub async fn extensions_set_secret(
 }
 
 #[tauri::command]
-pub async fn extensions_remove_secret(extension_id: String, slot_id: String) -> Result<(), String> {
+pub async fn extensions_remove_secret(
+    extension_id: String,
+    slot_id: String,
+) -> Result<(), String> {
     manager()?.remove_secret(&extension_id, &slot_id)
 }
 

@@ -1,4 +1,5 @@
 #import <AVFoundation/AVFoundation.h>
+#import <AppKit/AppKit.h>
 #import <Speech/Speech.h>
 
 #include <stdbool.h>
@@ -292,6 +293,49 @@ void little_monkey_dictation_macos_release(void *opaque_session) {
     }
 }
 
+bool little_monkey_dictation_macos_open_permission_settings(const char *kind) {
+    if (!kind) return false;
+    NSString *permissionKind = [NSString stringWithUTF8String:kind];
+    NSString *urlString = nil;
+    if ([permissionKind isEqualToString:@"microphone"]) {
+        urlString = @"x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
+    } else if ([permissionKind isEqualToString:@"speech"]) {
+        urlString = @"x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition";
+    } else {
+        return false;
+    }
+    NSURL *url = [NSURL URLWithString:urlString];
+    return url != nil && [[NSWorkspace sharedWorkspace] openURL:url];
+}
+
+static NSString *lm_speech_permission_status(void) {
+    switch ([SFSpeechRecognizer authorizationStatus]) {
+        case SFSpeechRecognizerAuthorizationStatusAuthorized:
+            return @"granted";
+        case SFSpeechRecognizerAuthorizationStatusDenied:
+            return @"denied";
+        case SFSpeechRecognizerAuthorizationStatusRestricted:
+            return @"restricted";
+        case SFSpeechRecognizerAuthorizationStatusNotDetermined:
+            return @"notDetermined";
+    }
+    return @"unknown";
+}
+
+static NSString *lm_microphone_permission_status(void) {
+    switch ([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio]) {
+        case AVAuthorizationStatusAuthorized:
+            return @"granted";
+        case AVAuthorizationStatusDenied:
+            return @"denied";
+        case AVAuthorizationStatusRestricted:
+            return @"restricted";
+        case AVAuthorizationStatusNotDetermined:
+            return @"notDetermined";
+    }
+    return @"unknown";
+}
+
 char *little_monkey_dictation_macos_capabilities_json(void) {
     @autoreleasepool {
         NSMutableArray *languages = [NSMutableArray array];
@@ -308,11 +352,16 @@ char *little_monkey_dictation_macos_capabilities_json(void) {
                 @"supportsOnDevice": @(supportsOnDevice),
             }];
         }
+        BOOL supported = defaultRecognizer != nil;
         NSData *data = [NSJSONSerialization dataWithJSONObject:@{
-            @"supported": @([SFSpeechRecognizer class] != Nil && languages.count > 0),
+            @"supported": @(supported),
             @"supportsPartialResults": @YES,
             @"supportsOnDevice": @(defaultSupportsOnDevice),
             @"languages": languages,
+            @"permissions": @{
+                @"microphone": lm_microphone_permission_status(),
+                @"speech": lm_speech_permission_status(),
+            },
         } options:0 error:nil];
         char *result = malloc(data.length + 1);
         if (!result) return NULL;

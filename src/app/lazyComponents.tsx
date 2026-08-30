@@ -19,6 +19,9 @@ export const BrowserWorkbench = lazy(() =>
 export const IssueToPrPanel = lazy(() =>
   import("../components/IssueToPr/IssueToPrPanel").then(({ IssueToPrPanel }) => ({ default: IssueToPrPanel })),
 );
+export const AutonomousTaskPanel = lazy(() =>
+  import("../components/AutonomousTask/AutonomousTaskPanel").then(({ AutonomousTaskPanel }) => ({ default: AutonomousTaskPanel })),
+);
 export const ProductionDebuggingPanel = lazy(() =>
   import("../components/ProductionDebugging/ProductionDebuggingPanel").then(({ ProductionDebuggingPanel }) => ({
     default: ProductionDebuggingPanel,

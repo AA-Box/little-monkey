@@ -203,7 +203,9 @@ export default function ChatSessionList() {
   const [gitStatus, setGitStatus] = useState<GitStatusSnapshot | null>(null);
   const [shortcutModifierPressed, setShortcutModifierPressed] = useState(false);
   const [hoveredRow, setHoveredRow] = useState<{ sessionId: string; anchorRect: DOMRect } | null>(null);
+  const [hoverReadySessionId, setHoverReadySessionId] = useState<string | null>(null);
   const [preview, setPreview] = useState<{ sessionId: string; anchorRect: DOMRect } | null>(null);
+  const previewOpenTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previewCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prefs = useSessionListViewStore((state) => state.prefs);
 
@@ -334,11 +336,11 @@ export default function ChatSessionList() {
 
   // Recent chats get the compact primary-modifier hints shown in the
   // reference UI. Pinned chats stay in their own section and do not consume
-  // the recent-chat number range, so Cmd/Ctrl+2…9 remains stable as the list
+  // the recent-chat number range, so Cmd/Ctrl+1…9 remains stable as the list
   // is reordered by pinning.
   const shortcutTargets = useMemo(() => {
     const targets = new Map<number, string>();
-    let key = 2;
+    let key = 1;
     for (const row of [...sections.flatMap((section) => section.items), ...pinned]) {
       if (key > 9 || row.kind !== "local" || row.session.pinned) continue;
       targets.set(key, row.session.id);
@@ -427,9 +429,21 @@ export default function ChatSessionList() {
   }, [renameRequestId]);
 
   const rowClass = (highlighted: boolean) =>
-    `group relative flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
+    `group/chat-row relative flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
       highlighted ? "bg-surface-2 text-foreground" : "hover:bg-surface-2"
     }`;
+
+  useEffect(() => {
+    setHoverReadySessionId(null);
+    if (!hoveredRow) return;
+    const timer = setTimeout(() => setHoverReadySessionId(hoveredRow.sessionId), 300);
+    return () => clearTimeout(timer);
+  }, [hoveredRow]);
+
+  const clearPreviewOpenTimer = () => {
+    if (previewOpenTimer.current) clearTimeout(previewOpenTimer.current);
+    previewOpenTimer.current = null;
+  };
 
   const clearPreviewCloseTimer = () => {
     if (previewCloseTimer.current) clearTimeout(previewCloseTimer.current);
@@ -443,15 +457,19 @@ export default function ChatSessionList() {
 
   const showPreview = (session: ChatSession, target: HTMLElement, gitContext: SessionGitContext | null) => {
     const anchorRect = target.getBoundingClientRect();
+    clearPreviewOpenTimer();
+    clearPreviewCloseTimer();
     setHoveredRow({ sessionId: session.id, anchorRect });
+    setPreview(null);
     if (gitContext) {
-      setPreview(null);
       return;
     }
     const workspacePath = session.workspacePath ?? primaryWorkspacePath;
     if (!workspacePath) return;
-    clearPreviewCloseTimer();
-    setPreview({ sessionId: session.id, anchorRect });
+    previewOpenTimer.current = setTimeout(() => {
+      setPreview({ sessionId: session.id, anchorRect });
+      previewOpenTimer.current = null;
+    }, 300);
   };
 
   const renderRow = (row: SessionRow) => {
@@ -490,6 +508,7 @@ export default function ChatSessionList() {
     const isMenuOpen = menuOpenId === session.id;
     const gitContext = sessionGitContexts.get(session.id) ?? null;
     const shortcutLabel = shortcutBySessionId.get(session.id) ?? null;
+    const isRowHovered = hoveredRow?.sessionId === session.id;
     const workspacePath = session.workspacePath ?? primaryWorkspacePath;
     const closeMenu = () => {
       setMenuOpenId(null);
@@ -510,12 +529,14 @@ export default function ChatSessionList() {
         onClick={() => !isRenaming && open()}
         onPointerEnter={(event) => showPreview(session, event.currentTarget, gitContext)}
         onPointerLeave={() => {
+          clearPreviewOpenTimer();
           setHoveredRow(null);
           schedulePreviewClose();
         }}
         onFocus={(event) => showPreview(session, event.currentTarget, gitContext)}
         onBlur={(event) => {
           if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+            clearPreviewOpenTimer();
             setHoveredRow(null);
             schedulePreviewClose();
           }
@@ -544,7 +565,7 @@ export default function ChatSessionList() {
             className="w-full rounded-md border border-border bg-surface px-1.5 py-0.5 text-sm text-foreground outline-none focus-visible:border-accent"
           />
         ) : (
-          <span className={`min-w-0 flex-1 truncate ${gitContext ? "pr-28" : "pr-20"} ${session.unread ? "font-semibold" : ""}`}>
+          <span className={`min-w-0 flex-1 truncate pr-28 ${session.unread ? "font-semibold" : ""}`}>
             <SessionTitle
               title={row.title}
               status={row.status}
@@ -556,21 +577,10 @@ export default function ChatSessionList() {
 
         {!isRenaming && (
           <div className={`absolute right-1 flex items-center gap-0.5 rounded-md pl-0.5 ${
-            gitContext || session.pinned || isMenuOpen ? "bg-surface-2/95" : "group-hover:bg-surface-2/95 group-focus-within:bg-surface-2/95"
+            session.pinned || isMenuOpen
+              ? "bg-surface-2/95"
+              : "group-hover/chat-row:bg-surface-2/95 group-focus-within/chat-row:bg-surface-2/95"
           }`}>
-            {shortcutLabel && !gitContext && shortcutModifierPressed && hoveredRow?.sessionId !== session.id && (
-              <kbd className="mr-0.5 shrink-0 rounded bg-surface px-1 font-mono text-[11px] text-faint">
-                {shortcutLabel}
-              </kbd>
-            )}
-            {gitContext && (
-              <SessionGitBadge
-                session={session}
-                context={gitContext}
-                rowHovered={hoveredRow?.sessionId === session.id}
-                rowAnchorRect={hoveredRow?.sessionId === session.id ? hoveredRow.anchorRect : null}
-              />
-            )}
             <button
               type="button"
               onClick={(event) => {
@@ -582,7 +592,9 @@ export default function ChatSessionList() {
               aria-pressed={session.pinned}
               title={session.pinned ? t("SessionMenu.unpin") : t("SessionMenu.pin")}
               className={`inline-flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded text-faint transition-colors duration-150 hover:bg-surface hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
-                session.pinned || isMenuOpen ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
+                session.pinned || isMenuOpen
+                  ? "opacity-100"
+                  : "opacity-0 group-hover/chat-row:opacity-100 group-focus-within/chat-row:opacity-100"
               }`}
             >
               <Pin size={14} aria-hidden />
@@ -597,30 +609,60 @@ export default function ChatSessionList() {
               aria-label={session.archived ? t("SessionMenu.unarchive") : t("SessionMenu.archive")}
               title={session.archived ? t("SessionMenu.unarchive") : t("SessionMenu.archive")}
               className={`inline-flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded text-faint transition-colors duration-150 hover:bg-surface hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
-                isMenuOpen ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
+                isMenuOpen
+                  ? "opacity-100"
+                  : "opacity-0 group-hover/chat-row:opacity-100 group-focus-within/chat-row:opacity-100"
               }`}
             >
               {session.archived ? <ArchiveRestore size={14} aria-hidden /> : <Archive size={14} aria-hidden />}
             </button>
-            <button
-              type="button"
-              onClick={(event) => {
-                event.stopPropagation();
-                if (isMenuOpen) {
-                  closeMenu();
-                } else {
-                  setMenuAnchor(event.currentTarget.getBoundingClientRect());
-                  setMenuOpenId(session.id);
-                }
-              }}
-              aria-label={t("ChatSessionList.sessionMenuAriaLabel")}
-              title={t("ChatSessionList.sessionMenuAriaLabel")}
-              className={`inline-flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded text-faint transition-colors duration-150 hover:bg-surface hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
-                isMenuOpen ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
-              }`}
-            >
-              <MoreVertical size={14} aria-hidden />
-            </button>
+            <div className="relative h-6 w-6 shrink-0">
+              {gitContext && (
+                <div
+                  className={`absolute inset-0 flex items-center justify-center transition-opacity duration-150 ${
+                    isRowHovered || shortcutModifierPressed || isMenuOpen
+                      ? "pointer-events-none opacity-0"
+                      : "group-hover/chat-row:pointer-events-none group-hover/chat-row:opacity-0 group-focus-within/chat-row:pointer-events-none group-focus-within/chat-row:opacity-0"
+                  }`}
+                >
+                  <SessionGitBadge
+                    session={session}
+                    context={gitContext}
+                    rowHovered={hoveredRow?.sessionId === session.id}
+                    rowHoverReady={hoverReadySessionId === session.id}
+                    closeImmediately={Boolean(hoveredRow && hoveredRow.sessionId !== session.id)}
+                    rowAnchorRect={hoveredRow?.sessionId === session.id ? hoveredRow.anchorRect : null}
+                  />
+                </div>
+              )}
+              {shortcutLabel && shortcutModifierPressed && !isRowHovered && (
+                <kbd className="absolute inset-0 inline-flex items-center justify-center rounded bg-surface px-1 font-mono text-[11px] text-faint group-hover/chat-row:hidden group-focus-within/chat-row:hidden">
+                  {shortcutLabel}
+                </kbd>
+              )}
+              <button
+                type="button"
+                data-session-menu-trigger="true"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  if (isMenuOpen) {
+                    closeMenu();
+                  } else {
+                    setMenuAnchor(event.currentTarget.getBoundingClientRect());
+                    setMenuOpenId(session.id);
+                  }
+                }}
+                aria-label={t("ChatSessionList.sessionMenuAriaLabel")}
+                title={t("ChatSessionList.sessionMenuAriaLabel")}
+                className={`absolute inset-0 inline-flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded text-faint transition-colors duration-150 hover:bg-surface hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
+                  isMenuOpen
+                    ? "pointer-events-auto opacity-100"
+                    : "pointer-events-none opacity-0 group-hover/chat-row:pointer-events-auto group-hover/chat-row:opacity-100 group-focus-within/chat-row:pointer-events-auto group-focus-within/chat-row:opacity-100"
+                }`}
+              >
+                <MoreVertical size={14} aria-hidden />
+              </button>
+            </div>
           </div>
         )}
 

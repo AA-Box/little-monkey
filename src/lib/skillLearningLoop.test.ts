@@ -76,6 +76,7 @@ function learnedDescriptor(sha = LEARNED_SHA): NativeSkillDescriptor {
     file_count: 1,
     total_bytes: LEARNED_INSTRUCTIONS.length,
     enabled: true,
+    managed: true,
     eligibility: { eligible: true, current_os: "macos", unsupported_os: false, missing_bins: [], missing_env: [] },
     supported_os: [],
     requirements: { bins: [], env: [] },

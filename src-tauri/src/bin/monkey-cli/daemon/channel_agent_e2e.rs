@@ -54,6 +54,7 @@ use crate::durable_run::CliRunEventSink;
 use little_monkey_lib::channels::policy::{AccessPolicy, ChannelAccessPolicy, GroupActivation};
 use little_monkey_lib::channels::routing::{ChannelRoute, RouteScope, RouteTarget};
 use little_monkey_lib::channels::types::{ChannelHealth, ChannelKind};
+use little_monkey_lib::run_protocol::RunEvent;
 
 use super::adapters::telegram::TelegramAdapter;
 use super::channel_adapter::{AdapterConfig, ChannelAdapter};
@@ -71,10 +72,10 @@ const CHILD_ENV: &str = "LM_CHANNEL_E2E_CHILD";
 const ROOT_ENV: &str = "LM_CHANNEL_E2E_ROOT";
 /// Printed by the child when it declines to run; surfaced by the launcher so
 /// a skip is never silent.
-const SKIPPED: &str = "channel agent end-to-end SKIPPED";
+pub(crate) const SKIPPED: &str = "channel agent end-to-end SKIPPED";
 
-const ACCOUNT_ID: &str = "e2e-account";
-const RECIPE: &str = "channel-e2e";
+pub(crate) const ACCOUNT_ID: &str = "e2e-account";
+pub(crate) const RECIPE: &str = "channel-e2e";
 const BOT_TOKEN: &str = "e2e-bot-token";
 /// What the fixture model asks `send_message` to say. Distinctive on purpose:
 /// finding it on the provider's wire is the proof the whole chain ran.
@@ -171,14 +172,14 @@ fn is_the_cli(candidate: &Path) -> bool {
 /// time, which cannot answer a daemon child whose request order this test does
 /// not control. This one is a tiny router: `route` sees the request line and
 /// body and returns the raw response to write.
-struct HttpFixture {
-    base: String,
+pub(crate) struct HttpFixture {
+    pub(crate) base: String,
     seen: Arc<Mutex<Vec<String>>>,
     calls: Arc<AtomicUsize>,
 }
 
 impl HttpFixture {
-    fn spawn(
+    pub(crate) fn spawn(
         route: impl Fn(&str, &str, usize) -> String + Send + Sync + 'static,
     ) -> std::io::Result<Self> {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
@@ -213,11 +214,11 @@ impl HttpFixture {
     }
 
     /// Every request received so far, as "<request line + headers>\n<body>".
-    fn requests(&self) -> Vec<String> {
+    pub(crate) fn requests(&self) -> Vec<String> {
         self.seen.lock().unwrap().clone()
     }
 
-    fn count(&self) -> usize {
+    pub(crate) fn count(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
 }
@@ -283,14 +284,14 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn json_response(body: &str) -> String {
+pub(crate) fn json_response(body: &str) -> String {
     format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
 }
 
-fn sse_response(frames: &[serde_json::Value]) -> String {
+pub(crate) fn sse_response(frames: &[serde_json::Value]) -> String {
     let mut body = String::new();
     for frame in frames {
         body.push_str(&format!("data: {frame}\n\n"));
@@ -325,7 +326,7 @@ struct ProviderWorld {
     _sockets: Option<super::channel_restart_tests::WsFixture>,
 }
 
-fn account_record(kind: ChannelKind, now: i64) -> ChannelAccountRecord {
+pub(crate) fn account_record(kind: ChannelKind, now: i64) -> ChannelAccountRecord {
     ChannelAccountRecord {
         account_id: ACCOUNT_ID.into(),
         kind,
@@ -583,6 +584,389 @@ fn model_fixture() -> HttpFixture {
     .expect("bind the model fixture")
 }
 
+/// The autonomous coordinator fixture uses the product's real model boundary
+/// as well. The planner response deliberately asks for two worktree workers so
+/// the test exercises the resident daemon, parallel scheduling, worktree
+/// creation/application, integration, configured verification, and structured
+/// review in one process-level run.
+fn autonomous_model_fixture() -> HttpFixture {
+    let planner = serde_json::json!({
+        "plan": {
+            "planId": "autonomous-e2e-plan",
+            "strategy": "PARALLEL_DELEGATE",
+            "revision": 1,
+            "rationale": "Two independent repository workers feed one integration barrier.",
+            "nodes": [
+                {
+                    "nodeId": "implement-frontend",
+                    "taskClass": "implementation",
+                    "objective": "Set a.txt to the initial frontend slice A1.",
+                    "dependencies": [],
+                    "mutationScope": ["a.txt"],
+                    "isolation": "worktree",
+                    "relevantFiles": ["a.txt"],
+                    "capabilities": ["read", "mutate"],
+                    "executionPlacement": {"kind": "worktree", "targetId": "local", "nodeId": "implement-frontend"},
+                    "executionRequirements": {"needsWorkspaceWrite": true, "needsNetwork": false, "isolation": "worktree"}
+                },
+                {
+                    "nodeId": "implement-backend",
+                    "taskClass": "implementation",
+                    "objective": "Set b.txt to the intentionally incomplete backend slice B1.",
+                    "dependencies": [],
+                    "mutationScope": ["b.txt"],
+                    "isolation": "worktree",
+                    "relevantFiles": ["b.txt"],
+                    "capabilities": ["read", "mutate"],
+                    "executionPlacement": {"kind": "worktree", "targetId": "local", "nodeId": "implement-backend"},
+                    "executionRequirements": {"needsWorkspaceWrite": true, "needsNetwork": false, "isolation": "worktree"}
+                },
+                {
+                    "nodeId": "integrate",
+                    "taskClass": "integration",
+                    "objective": "Integrate the worker results after scope inspection.",
+                    "dependencies": ["implement-frontend", "implement-backend"],
+                    "mutationScope": ["workspace"],
+                    "isolation": "shared",
+                    "relevantFiles": ["a.txt", "b.txt"],
+                    "capabilities": ["read", "mutate"],
+                    "executionRequirements": {"needsWorkspaceWrite": true, "needsNetwork": false, "isolation": "shared"}
+                },
+                {
+                    "nodeId": "verify",
+                    "taskClass": "verification",
+                    "objective": "Run the configured verification command.",
+                    "dependencies": ["integrate"],
+                    "mutationScope": ["workspace"],
+                    "isolation": "shared",
+                    "relevantFiles": ["a.txt", "b.txt"],
+                    "capabilities": ["read", "verify"]
+                },
+                {
+                    "nodeId": "review",
+                    "taskClass": "review",
+                    "objective": "Return a structured review of the integrated repository.",
+                    "dependencies": ["verify"],
+                    "mutationScope": ["workspace"],
+                    "isolation": "shared",
+                    "relevantFiles": ["a.txt", "b.txt"],
+                    "capabilities": ["read", "verify"]
+                }
+            ]
+        },
+        "acceptanceCriteria": [
+            {"id": "verify-files", "description": "The configured verification command passes for both files.", "method": "verification_command", "blocking": true, "provenance": {"kind": "planner", "fragment": "configured verification"}},
+            {"id": "review-files", "description": "The structured review passes against the actual diff.", "method": "review", "blocking": true, "provenance": {"kind": "planner", "fragment": "structured review"}},
+            {"id": "scope-files", "description": "Workers stay inside their individual file scopes.", "method": "workspace_boundary", "blocking": true, "provenance": {"kind": "planner", "fragment": "file scopes"}}
+        ],
+        "planningContext": {"relevantFiles": ["a.txt", "b.txt"]},
+        "summary": "parallel autonomous coordinator fixture"
+    });
+    let review = serde_json::json!({
+        "verdict": "pass",
+        "findings": [],
+        "filesReviewed": ["a.txt", "b.txt"],
+        "acceptanceCriteria": ["verify-files", "review-files", "scope-files"],
+        "securityFindings": [],
+        "testCoverageFindings": []
+    });
+    let sent_mutations = Arc::new(std::sync::Mutex::new(
+        std::collections::HashSet::<String>::new(),
+    ));
+    HttpFixture::spawn(move |head, body, _index| {
+        if !head.contains("/chat/completions") {
+            return json_response(r#"{"error":"unexpected autonomous model route"}"#);
+        }
+        let prompt_text = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|request| request["messages"].as_array().cloned())
+            .map(|messages| messages.iter().filter_map(|message| message["content"].as_str()).collect::<Vec<_>>().join("\n"))
+            .unwrap_or_else(|| body.to_string());
+        let implementation = prompt_text.contains("Universal AutonomousTask phase: implementation");
+        let repair = prompt_text.contains("Diagnose and repair");
+        let current_node_contract = prompt_text
+            .rsplit("Frozen node contract (do not change it):")
+            .next()
+            .unwrap_or(&prompt_text);
+        let mut path = if current_node_contract.contains("implement-backend")
+            || current_node_contract.contains("Set b.txt")
+            || (implementation && current_node_contract.contains("b.txt"))
+        {
+            "b.txt"
+        } else {
+            "a.txt"
+        };
+        if implementation {
+            let mut sent = sent_mutations.lock().expect("mutation fixture lock");
+            if repair && sent.contains("b.txt:repair") {
+                path = "a.txt";
+            }
+            let key = format!("{path}:{}", if repair { "repair" } else { "initial" });
+            if sent.insert(key.clone()) {
+                let content = if repair { if path == "a.txt" { "A2\n" } else { "B2\n" } } else if path == "a.txt" { "A1\n" } else { "B1\n" };
+                let arguments = serde_json::json!({ "path": path, "content": content }).to_string();
+                return sse_response(&[
+                    serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": format!("call-{key}"), "type": "function", "function": {"name": "write_file", "arguments": arguments}}]}}]}),
+                    serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                ]);
+            }
+        }
+        let content = if prompt_text.contains("phase: review") || prompt_text.contains("bounded 'review' phase") {
+            review.to_string()
+        } else if prompt_text.contains("phase: planner") {
+            planner.to_string()
+        } else {
+            "autonomous phase completed".to_string()
+        };
+        sse_response(&[
+            serde_json::json!({"choices": [{"index": 0, "delta": {"content": content}}]}),
+            serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        ])
+    })
+    .expect("bind the autonomous model fixture")
+}
+
+fn autonomous_e2e_git(root: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .expect("start git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn run_autonomous_coordinator_end_to_end(root: &Path) {
+    if !isolation_is_real(root) {
+        println!(
+            "{SKIPPED} on this platform: autonomous coordinator profile isolation is unavailable"
+        );
+        return;
+    }
+    let model = autonomous_model_fixture();
+    let workspace = root.join("autonomous-workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    autonomous_e2e_git(&workspace, &["init", "-q"]);
+    autonomous_e2e_git(&workspace, &["config", "user.email", "e2e@example.test"]);
+    autonomous_e2e_git(&workspace, &["config", "user.name", "Autonomous E2E"]);
+    std::fs::write(workspace.join("a.txt"), "A0\n").expect("a.txt");
+    std::fs::write(workspace.join("b.txt"), "B0\n").expect("b.txt");
+    autonomous_e2e_git(&workspace, &["add", "a.txt", "b.txt"]);
+    autonomous_e2e_git(&workspace, &["commit", "-q", "-m", "fixture baseline"]);
+
+    let roots = little_monkey_lib::app_paths::ensure_agent_config_roots().expect("config roots");
+    let data_dir = little_monkey_lib::app_paths::data_dir().expect("data dir");
+    std::fs::create_dir_all(&data_dir).expect("data directory");
+    let workspace_key = workspace.canonicalize().expect("canonical workspace");
+    let verify_config = serde_json::json!({
+        workspace_key.to_string_lossy(): {
+            "commands": [{
+                "id": "autonomous-e2e-verify",
+                "label": "Autonomous E2E verification",
+                "command": "git diff --check -- && git grep -F -e \"A2\" -- a.txt && git grep -F -e \"B2\" -- b.txt",
+                "kind": "custom",
+                "enabled": true,
+                "timeoutSecs": 30
+            }]
+        }
+    });
+    std::fs::write(
+        data_dir.join("verify_configs.json"),
+        serde_json::to_vec_pretty(&verify_config).expect("verify config JSON"),
+    )
+    .expect("verify config");
+    assert_eq!(
+        crate::verify_cli::enabled_commands_at(
+            &data_dir.join("verify_configs.json"),
+            &workspace_key
+        )
+        .len(),
+        1,
+        "the real CLI verification config was not visible to the coordinator"
+    );
+    let paths = DaemonPaths::under(&roots.legacy);
+    paths.ensure().expect("daemon paths");
+    let config = DaemonConfig::default();
+    config.save(&paths).expect("daemon config");
+    let cli = std::env::var(CLI_ENV).expect("real monkey-cli path");
+    let target = format!("local-url:{}|autonomous-e2e", model.base);
+    let started = std::process::Command::new(cli)
+        .args([
+            "task",
+            "start",
+            "Run the autonomous coordinator fixture",
+            "--target",
+            &target,
+            "--workspace",
+            workspace.to_str().expect("workspace UTF-8"),
+            "--json",
+        ])
+        .current_dir(&workspace)
+        .output()
+        .expect("start autonomous task process");
+    assert!(
+        started.status.success(),
+        "task start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let queued: serde_json::Value = serde_json::from_slice(&started.stdout).expect("queued JSON");
+    let job_id = queued["job_id"]
+        .as_str()
+        .expect("queued job id")
+        .to_string();
+    let run_id = queued["run_id"]
+        .as_str()
+        .expect("queued run id")
+        .to_string();
+
+    let mut engine = DaemonEngine::new(
+        DaemonStore::open(&paths).expect("engine store"),
+        SharedLedger::open(&paths.ledger_db).expect("engine ledger"),
+        paths.clone(),
+        config,
+        RealProcessAdapter::current().expect("process adapter"),
+        SilentNotifier,
+        SystemClock,
+        "autonomous-e2e-daemon".to_string(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let terminal = loop {
+        engine.tick().expect("daemon tick");
+        let state = DaemonStore::open(&paths)
+            .expect("state read")
+            .get_job(&job_id)
+            .expect("job read")
+            .expect("job")
+            .state;
+        if matches!(
+            state,
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled
+        ) {
+            break state;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "autonomous task did not finish: {state:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    };
+    let diagnostic_events = SharedLedger::open(&paths.ledger_db)
+        .expect("diagnostic ledger")
+        .run_ledger()
+        .expect("diagnostic run ledger")
+        .load_events(&run_id, 0, 1_000)
+        .expect("diagnostic events");
+    assert_eq!(
+        terminal,
+        JobState::Succeeded,
+        "autonomous task failed; log: {}\nevents: {}",
+        std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default(),
+        serde_json::to_string(&diagnostic_events).unwrap_or_default()
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("a.txt")).expect("a.txt result"),
+        "A2\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("b.txt")).expect("b.txt result"),
+        "B2\n"
+    );
+    let events = SharedLedger::open(&paths.ledger_db)
+        .expect("ledger")
+        .run_ledger()
+        .expect("run ledger")
+        .load_events(&run_id, 0, 1_000)
+        .expect("run events");
+    let rendered = serde_json::to_string(&events).expect("event JSON");
+    assert!(
+        rendered.contains("\"parallel\":true"),
+        "parallel workers missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"isolation\":\"worktree\""),
+        "worktree workers missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"verification_evidence\""),
+        "verification evidence missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"authoritative\":true"),
+        "authoritative evidence missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"review_evidence\""),
+        "review evidence missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"verdict\":\"pass\""),
+        "structured review missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"repair_of\""),
+        "verification did not trigger bounded repair: {rendered}"
+    );
+    let worker_mutations = events
+        .iter()
+        .filter_map(|event| {
+            if let RunEvent::TaskEvent {
+                event_type,
+                payload,
+                ..
+            } = &event.event
+            {
+                (event_type == "node_mutation"
+                    && payload.get("parallel") != Some(&serde_json::Value::Bool(true)))
+                .then_some(payload)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let parallel_mutations = events
+        .iter()
+        .filter_map(|event| {
+            if let RunEvent::TaskEvent {
+                event_type,
+                payload,
+                ..
+            } = &event.event
+            {
+                (event_type == "node_mutation" && payload.get("integration_revision").is_some())
+                    .then_some(payload)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        parallel_mutations.len() >= 2,
+        "isolated worker mutation evidence missing: {rendered}"
+    );
+    assert!(
+        parallel_mutations
+            .iter()
+            .all(|payload| payload["before_revision"].is_string()
+                && payload["patch_digest"]
+                    .as_str()
+                    .is_some_and(|digest| !digest.is_empty())
+                && payload["changed_files"].as_array().is_some()),
+        "worker evidence is not revision-bound: {parallel_mutations:?}"
+    );
+    assert!(
+        !worker_mutations.is_empty(),
+        "mutation-bearing worker events missing: {rendered}"
+    );
+    assert!(
+        model.count() >= 10,
+        "coordinator did not run planner, workers, repair, integration, verify, and review"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The isolated profile
 // ---------------------------------------------------------------------------
@@ -598,7 +982,7 @@ fn write_private(path: &Path, contents: &str) {
 /// `auto` is the mode a conversational route realistically uses; it does not
 /// auto-approve `send_message`, which is the point — the approval below is the
 /// operator's, made through the same durable path the phone app uses.
-fn write_recipe(authored: &Path, workspace: &Path, model_base: &str) {
+pub(crate) fn write_recipe(authored: &Path, workspace: &Path, model_base: &str) {
     let recipe = serde_json::json!({
         "version": 1,
         "name": RECIPE,
@@ -616,7 +1000,7 @@ fn write_recipe(authored: &Path, workspace: &Path, model_base: &str) {
     );
 }
 
-fn seed_channel(store: &mut DaemonStore, kind: ChannelKind, now: i64) {
+pub(crate) fn seed_channel(store: &mut DaemonStore, kind: ChannelKind, now: i64) {
     store
         .upsert_channel_account(&account_record(kind, now))
         .expect("account");
@@ -632,14 +1016,14 @@ fn seed_channel(store: &mut DaemonStore, kind: ChannelKind, now: i64) {
         .expect("route");
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
 }
 
-struct SilentNotifier;
+pub(crate) struct SilentNotifier;
 
 impl super::engine::NotificationAdapter for SilentNotifier {
     fn notify(&self, _notification: &super::engine::DaemonNotification) -> Result<(), String> {
@@ -650,7 +1034,7 @@ impl super::engine::NotificationAdapter for SilentNotifier {
 /// Decides any approval the run is waiting on, the way the phone app does:
 /// read the pending request from the ledger, emit a `PermissionDecided` event
 /// carrying the same operation digest. Returns how many it answered.
-fn approve_pending(paths: &DaemonPaths, run_id: &str) -> usize {
+pub(crate) fn approve_pending(paths: &DaemonPaths, run_id: &str) -> usize {
     let Ok(shared) = SharedLedger::open(&paths.ledger_db) else {
         return 0;
     };
@@ -702,6 +1086,7 @@ fn approve_pending(paths: &DaemonPaths, run_id: &str) -> usize {
 #[test]
 fn a_telegram_message_becomes_an_agent_reply_end_to_end() {
     in_isolated_process(
+        "channel_agent_e2e",
         "a_telegram_message_becomes_an_agent_reply_end_to_end",
         |root| {
             Box::pin(async move {
@@ -717,6 +1102,7 @@ fn a_telegram_message_becomes_an_agent_reply_end_to_end() {
 #[test]
 fn a_discord_message_becomes_an_agent_reply_end_to_end() {
     in_isolated_process(
+        "channel_agent_e2e",
         "a_discord_message_becomes_an_agent_reply_end_to_end",
         |root| {
             Box::pin(async move {
@@ -733,6 +1119,7 @@ fn a_discord_message_becomes_an_agent_reply_end_to_end() {
 #[test]
 fn a_slack_message_becomes_an_agent_reply_end_to_end() {
     in_isolated_process(
+        "channel_agent_e2e",
         "a_slack_message_becomes_an_agent_reply_end_to_end",
         |root| {
             Box::pin(async move {
@@ -743,9 +1130,22 @@ fn a_slack_message_becomes_an_agent_reply_end_to_end() {
     );
 }
 
+/// The real CLI start path queues an autonomous coordinator and the resident
+/// daemon executes the actual process, worktree, integration, verification,
+/// and structured-review boundaries against a temporary Git repository.
+#[test]
+fn autonomous_coordinator_runs_through_the_resident_daemon_end_to_end() {
+    in_isolated_process(
+        "channel_agent_e2e",
+        "autonomous_coordinator_runs_through_the_resident_daemon_end_to_end",
+        |root| Box::pin(async move { run_autonomous_coordinator_end_to_end(&root).await }),
+    );
+}
+
 /// Runs `body` in a process whose home is a fresh directory, relaunching this
 /// test binary once to get there. See the module doc for why.
-fn in_isolated_process(
+pub(crate) fn in_isolated_process(
+    module: &'static str,
     name: &'static str,
     body: impl FnOnce(PathBuf) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
 ) {
@@ -757,7 +1157,7 @@ fn in_isolated_process(
         let _guard = ONE_AT_A_TIME
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        relaunch(name);
+        relaunch(module, name);
         return;
     };
     tokio::runtime::Builder::new_multi_thread()
@@ -775,8 +1175,153 @@ fn in_isolated_process(
 /// the environment. Where it does not — Windows resolves it through the Known
 /// Folder API, which no environment variable reaches — running this would
 /// write into the operator's real profile, so it does not run there.
-fn isolation_is_real(root: &Path) -> bool {
+pub(crate) fn isolation_is_real(root: &Path) -> bool {
     little_monkey_lib::app_paths::base_data_dir().is_some_and(|data| data.starts_with(root))
+}
+
+/// What one accepted turn produced once the daemon and the agent were done
+/// with it.
+pub(crate) struct AgentTurnProof {
+    /// The provider's own id for the reply, read off the durable outbound
+    /// event rather than off the send call.
+    pub(crate) provider_message_id: String,
+    /// The run's durable events, rendered, so a caller's failing assertion can
+    /// quote what the agent really did.
+    pub(crate) run_events_json: String,
+}
+
+/// The provider-independent middle of an acceptance run.
+///
+/// Given a turn that is already queued — however it arrived, from a protocol
+/// fixture or from a real account — this runs the resident daemon over it,
+/// proves the reply came from the agent rather than from the test, and drains
+/// the outbox through the adapter the caller supplied.
+///
+/// Factored out because it is the half no provider gets to influence. The
+/// fixture tests in this module and the live-account tests in
+/// [`super::live_agent_e2e`] run exactly this code; what a provider supplies
+/// is only how the message arrived and how the reply is observed on the far
+/// side.
+pub(crate) async fn execute_turn_through_the_daemon(
+    paths: &DaemonPaths,
+    config: &DaemonConfig,
+    account_id: &str,
+    job_id: &str,
+    run_id: &str,
+    adapter: &Arc<dyn ChannelAdapter>,
+    model: &HttpFixture,
+) -> AgentTurnProof {
+    // ---- the daemon executes it. Production engine, production process
+    // adapter: the child really is another monkey-cli running `task run`.
+    let mut engine = DaemonEngine::new(
+        DaemonStore::open(paths).expect("engine store"),
+        SharedLedger::open(&paths.ledger_db).expect("engine ledger"),
+        paths.clone(),
+        config.clone(),
+        RealProcessAdapter::current().expect("process adapter"),
+        SilentNotifier,
+        SystemClock,
+        "e2e-daemon".to_string(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let terminal = loop {
+        engine.tick().expect("engine tick");
+        // The operator's side of the external-mutation gate. A channel reply
+        // leaves the machine, so the run asks; this stands in for the phone.
+        approve_pending(paths, run_id);
+        let state = DaemonStore::open(paths)
+            .expect("state read")
+            .get_job(job_id)
+            .expect("job read")
+            .expect("job")
+            .state;
+        if matches!(
+            state,
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled
+        ) {
+            break state;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon run never reached a terminal state (still {state:?}); \
+             daemon log: {}",
+            std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    };
+    assert_eq!(
+        terminal,
+        JobState::Succeeded,
+        "the daemon run failed; log: {}",
+        std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default()
+    );
+
+    // ---- what the run actually did. The tool call has to have come from the
+    // model and been dispatched by the agent, not been written here.
+    let shared = SharedLedger::open(&paths.ledger_db).expect("ledger");
+    let events = shared
+        .run_ledger()
+        .expect("run ledger")
+        .load_events(run_id, 0, 500)
+        .expect("run events");
+    let rendered = serde_json::to_string(&events).expect("run events json");
+    // The agent offered the tool. This is read off the model's own request:
+    // whatever the fixture answers, the schema in front of it came from the
+    // production tool builder deciding this run could reach somewhere.
+    let asked = model.requests();
+    assert!(!asked.is_empty(), "the agent never called the model");
+    assert!(
+        asked
+            .iter()
+            .any(|request| request.contains(r#""name":"send_message""#)),
+        "send_message was not in the tool schema the agent offered: {asked:?}"
+    );
+    // The agent dispatched the call it got back, and the dispatch succeeded.
+    // A test that wrote an outbox row by hand would leave this absent.
+    let dispatched = events.iter().any(|event| {
+        let json = serde_json::to_string(event).unwrap_or_default();
+        json.contains("\"type\":\"tool_proposed\"") && json.contains("\"send_message\"")
+    });
+    assert!(
+        dispatched,
+        "no send_message tool call reached the dispatcher: {rendered}"
+    );
+    assert!(
+        !rendered.contains(r#""outcome":"failed""#),
+        "the tool call was dispatched and refused: {rendered}\n--- job log ---\n{}",
+        std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default()
+    );
+    assert!(
+        model.count() >= 2,
+        "the agent loop did not come back to the model with the tool result \
+         ({} request(s)) — the tool call was not dispatched",
+        model.count()
+    );
+
+    // ---- the outbox row the tool wrote, drained by the production worker
+    // into the production adapter.
+    let mut store = DaemonStore::open(paths).expect("store reopen");
+    let mut adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> = BTreeMap::new();
+    adapters.insert(account_id.to_string(), adapter.clone());
+    let drained = drain_outbox_once(&mut store, &adapters, now_ms())
+        .await
+        .expect("drain");
+    assert_eq!(
+        drained.sent, 1,
+        "the agent's reply did not leave the outbox: {drained:?}\n--- run events ---\n{rendered}\n--- job log ---\n{}",
+        std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default()
+    );
+
+    let outbound = store
+        .recent_channel_events(account_id, 50)
+        .expect("events")
+        .into_iter()
+        .find(|event| event.direction == EventDirection::Outbound)
+        .expect("a durable outbound event");
+    AgentTurnProof {
+        provider_message_id: outbound.provider_event_id,
+        run_events_json: rendered,
+    }
 }
 
 async fn run_end_to_end(root: &Path, world: ProviderWorld) {
@@ -857,106 +1402,14 @@ async fn run_end_to_end(root: &Path, world: ProviderWorld) {
         paths.root
     );
 
-    // ---- the daemon executes it. Production engine, production process
-    // adapter: the child really is another monkey-cli running `task run`.
-    let mut engine = DaemonEngine::new(
-        DaemonStore::open(&paths).expect("engine store"),
-        SharedLedger::open(&paths.ledger_db).expect("engine ledger"),
-        paths.clone(),
-        config.clone(),
-        RealProcessAdapter::current().expect("process adapter"),
-        SilentNotifier,
-        SystemClock,
-        "e2e-daemon".to_string(),
-    );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-    let terminal = loop {
-        engine.tick().expect("engine tick");
-        // The operator's side of the external-mutation gate. A channel reply
-        // leaves the machine, so the run asks; this stands in for the phone.
-        approve_pending(&paths, &run_id);
-        let state = DaemonStore::open(&paths)
-            .expect("state read")
-            .get_job(&job_id)
-            .expect("job read")
-            .expect("job")
-            .state;
-        if matches!(
-            state,
-            JobState::Succeeded | JobState::Failed | JobState::Cancelled
-        ) {
-            break state;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the daemon run never reached a terminal state (still {state:?}); \
-             daemon log: {}",
-            std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default()
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    };
-    assert_eq!(
-        terminal,
-        JobState::Succeeded,
-        "the daemon run failed; log: {}",
-        std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default()
-    );
-
-    // ---- what the run actually did. The tool call has to have come from the
-    // model and been dispatched by the agent, not been written here.
-    let shared = SharedLedger::open(&paths.ledger_db).expect("ledger");
-    let events = shared
-        .run_ledger()
-        .expect("run ledger")
-        .load_events(&run_id, 0, 500)
-        .expect("run events");
-    let rendered = serde_json::to_string(&events).expect("run events json");
-    // The agent offered the tool. This is read off the model's own request:
-    // whatever the fixture answers, the schema in front of it came from the
-    // production tool builder deciding this run could reach somewhere.
-    let asked = model.requests();
-    assert!(!asked.is_empty(), "the agent never called the model");
-    assert!(
-        asked
-            .iter()
-            .any(|request| request.contains(r#""name":"send_message""#)),
-        "send_message was not in the tool schema the agent offered: {asked:?}"
-    );
-    // The agent dispatched the call it got back, and the dispatch succeeded.
-    // A test that wrote an outbox row by hand would leave this absent.
-    let dispatched = events.iter().any(|event| {
-        let json = serde_json::to_string(event).unwrap_or_default();
-        json.contains("\"type\":\"tool_proposed\"") && json.contains("\"send_message\"")
-    });
-    assert!(
-        dispatched,
-        "no send_message tool call reached the dispatcher: {rendered}"
-    );
-    assert!(
-        !rendered.contains(r#""outcome":"failed""#),
-        "the tool call was dispatched and refused: {rendered}\n--- job log ---\n{}",
-        std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default()
-    );
-    assert!(
-        model.count() >= 2,
-        "the agent loop did not come back to the model with the tool result \
-         ({} request(s)) — the tool call was not dispatched",
-        model.count()
-    );
-
-    // ---- the outbox row the tool wrote, drained by the production worker
-    // into the production adapter.
-    let mut store = DaemonStore::open(&paths).expect("store reopen");
-    let mut adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> = BTreeMap::new();
-    adapters.insert(ACCOUNT_ID.to_string(), adapter.clone());
-    let drained = drain_outbox_once(&mut store, &adapters, now_ms())
-        .await
-        .expect("drain");
-    assert_eq!(
-        drained.sent, 1,
-        "the agent's reply did not leave the outbox: {drained:?}\n--- run events ---\n{rendered}\n--- job log ---\n{}",
-        std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default()
-    );
+    // ---- the provider-independent middle: the daemon runs it, the agent
+    // answers, and the reply leaves through the production adapter. The
+    // live-account acceptance tests reach this same function.
+    let proof = execute_turn_through_the_daemon(
+        &paths, &config, ACCOUNT_ID, &job_id, &run_id, &adapter, &model,
+    )
+    .await;
+    let store = DaemonStore::open(&paths).expect("store reopen");
 
     // ---- and what the provider received.
     let sent = (world.requests)()
@@ -964,9 +1417,10 @@ async fn run_end_to_end(root: &Path, world: ProviderWorld) {
         .find(|request| request.contains(world.send_marker))
         .unwrap_or_else(|| {
             panic!(
-                "the provider never received a {} request; it saw {:?}",
+                "the provider never received a {} request; it saw {:?}\n--- run events ---\n{}",
                 world.send_marker,
-                (world.requests)()
+                (world.requests)(),
+                proof.run_events_json
             )
         });
     assert!(
@@ -1021,7 +1475,7 @@ fn child_root() -> Option<PathBuf> {
 /// authored-config override) point at a fresh directory, so the isolated
 /// profile is real for every process in the tree and invisible to every other
 /// test in this one.
-fn relaunch(name: &str) {
+fn relaunch(module: &str, name: &str) {
     // Named per test as well as per process: three of these can start in the
     // same millisecond, and a shared root would have one delete another's.
     let root = std::env::temp_dir().join(format!(
@@ -1037,7 +1491,7 @@ fn relaunch(name: &str) {
 
     let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
         .arg("--exact")
-        .arg(format!("daemon::channel_agent_e2e::{name}"))
+        .arg(format!("daemon::{module}::{name}"))
         .arg("--nocapture")
         .arg("--test-threads=1")
         .env(CHILD_ENV, "1")

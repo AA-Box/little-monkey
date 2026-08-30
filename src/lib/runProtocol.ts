@@ -24,6 +24,7 @@ export type RunKind =
   | "browser"
   | "acp"
   | "background"
+  | "autonomous_task"
   | "remote_desktop_control";
 export type RunStatus =
   | "queued"
@@ -156,6 +157,11 @@ export interface RunSpecWire {
   workspace: WorkspaceContextWire | null;
   permission_policy: PermissionPolicySnapshotWire;
   budgets: RunBudgetsWire;
+  autonomous_task?: Record<string, unknown> | null;
+  /** Frozen execution identity/capabilities, separate from the model target. */
+  execution_target?: Record<string, unknown> | null;
+  /** Content-addressed workspace manifest/delta for non-local targets. */
+  workspace_transfer?: Record<string, unknown> | null;
 }
 
 export interface UsageSnapshotWire {
@@ -174,6 +180,25 @@ export type CheckpointKind = "workspace" | "git" | "conversation" | "external_st
 export type MutationKind = "filesystem" | "git" | "network" | "external_service" | "other";
 
 type Event<T extends string, P> = { type: T; payload: P };
+export type AutonomousTaskEventType =
+  | "plan_created"
+  | "plan_changed"
+  | "criterion_added"
+  | "criterion_verified"
+  | "worker_started"
+  | "worker_finished"
+  | "worker_failed"
+  | "patch_ready"
+  | "patch_integrated"
+  | "verification_started"
+  | "verification_finished"
+  | "review_finished"
+  | "guidance_received"
+  | "delivery_started"
+  | "execution_handoff"
+  | "execution_handoff_rollback"
+  | "execution_owner_rollback"
+  | "task_completed";
 export type RunEventWire =
   | Event<"queued", { queue: string | null }>
   | Event<"started", { engine_id: string }>
@@ -277,6 +302,11 @@ export type RunEventWire =
   | Event<"failed", { code: string; message: string; retryable: boolean }>
   | Event<"cancelled", { reason: string | null }>
   | Event<"needs_reconciliation", { mutation_id: string; reason: string }>
+  | Event<"task_event", {
+      task_id: string;
+      event_type: AutonomousTaskEventType;
+      payload: Record<string, unknown>;
+    }>
   /** Mirrors `RunEvent::MigrationDeparted` — this run's frozen process image
    * left for another owned node (roadmap K18). Not terminal: the target can
    * still refuse it, and a run whose move was refused carries on here. */

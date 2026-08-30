@@ -10,6 +10,19 @@ export interface DictationLanguage {
   supportsOnDevice: boolean;
 }
 
+export type DictationPermissionStatus =
+  | "granted"
+  | "denied"
+  | "notDetermined"
+  | "restricted"
+  | "unknown"
+  | "unavailable";
+
+export interface DictationPermissions {
+  microphone: DictationPermissionStatus;
+  speech: DictationPermissionStatus;
+}
+
 export interface DictationCapabilities {
   supported: boolean;
   platform: DictationPlatform;
@@ -17,6 +30,7 @@ export interface DictationCapabilities {
   supportsPartialResults: boolean;
   supportsOnDevice: boolean;
   languages: DictationLanguage[];
+  permissions: DictationPermissions;
 }
 
 export interface DictationPartialEvent {
@@ -45,6 +59,8 @@ export interface DictationStartOptions {
   language: string | null;
   requireOnDevice: boolean;
 }
+
+export type DictationPermissionKind = "microphone" | "speech";
 
 export interface DictationStartResult {
   sessionId: string;
@@ -79,6 +95,8 @@ export const dictationClient = {
     }),
   stop: (sessionId: string) => invoke<void>("dictation_stop", { sessionId }),
   cancel: (sessionId: string) => invoke<void>("dictation_cancel", { sessionId }),
+  openPermissionSettings: (kind: DictationPermissionKind) =>
+    invoke<void>("dictation_open_permission_settings", { kind }),
   onState: (handler: (event: DictationStateEvent) => void) =>
     listen<DictationStateEvent>(STATE_EVENT, (event) => handler(event.payload)),
   onPartial: (handler: (event: DictationPartialEvent) => void) =>

@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { resolveLoadedLocalEndpoint } from "./targetRouting";
 
 import { beginDurableRun, defaultRunBudgets, type DurableRunRecorder } from "./durableRun";
 import { textContent, type ChatMessage } from "./llamaClient";
@@ -53,12 +53,6 @@ const TRANSLATION_SYSTEM_PROMPT = [
   "Preserve Markdown structure, fenced code, inline code, URLs, identifiers, placeholders, tables, and line breaks.",
   "Do not explain, summarize, censor, answer, or wrap the result. Return only the translated text.",
 ].join("\n");
-
-interface LlamaStatusResult {
-  status: "stopped" | "starting" | "ready" | "error";
-  port: number;
-  model_path: string | null;
-}
 
 const activeControllers = new Map<string, AbortController>();
 
@@ -132,11 +126,8 @@ async function resolveTarget(target: ModelTargetSnapshot): Promise<ResolvedTarge
   if (target.kind === "ollama") {
     return { kind: "ollama", baseUrl: target.baseUrl, model: target.model };
   }
-  const status = await invoke<LlamaStatusResult>("llama_status");
-  if (status.status !== "ready" || status.model_path !== target.modelPath) {
-    throw new Error(`${target.displayName} is no longer loaded in the managed llama.cpp runtime.`);
-  }
-  return { kind: "local", baseUrl: `http://127.0.0.1:${status.port}`, modelLabel: target.displayName };
+  const baseUrl = await resolveLoadedLocalEndpoint(target.modelPath, target.displayName);
+  return { kind: "local", baseUrl, modelLabel: target.displayName };
 }
 
 function sourceText(message: ChatMessage): string {
