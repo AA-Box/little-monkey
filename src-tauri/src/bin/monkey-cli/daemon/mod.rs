@@ -1977,14 +1977,34 @@ fn enqueue(
         .clone()
         .unwrap_or_else(|| format!("job-{}", uuid::Uuid::new_v4()));
     if let Some(existing) = store.get_job(&job_id)? {
-        let run_id = existing
-            .run_id
-            .ok_or_else(|| format!("Existing job '{job_id}' is still preparing"))?;
-        return Ok(QueuedRun {
-            job_id,
-            run_id,
-            state: existing.state,
-        });
+        match existing.run_id {
+            Some(run_id) => {
+                return Ok(QueuedRun {
+                    job_id,
+                    run_id,
+                    state: existing.state,
+                })
+            }
+            // A job that never reached a run and has stopped trying is not
+            // preparing. It failed before the queue — `submit_queued_snapshot`
+            // refused it, or the daemon restarted mid-preparation — and calling
+            // that "still preparing" hides the reason it recorded *and* makes
+            // the id permanently unusable: every resubmission of the same turn
+            // lands right back here, so the operator sees a sentence about
+            // preparation for a job that will never prepare again.
+            //
+            // Drop the dead row and let this attempt start over. Nothing is lost
+            // that ran: there is no run id, so no ledger entry hangs off it, and
+            // the reason it failed goes to the log before the row goes.
+            None if existing.state.is_terminal() => {
+                eprintln!(
+                    "monkey daemon: job '{job_id}' failed before it was queued ({}); starting it over",
+                    existing.last_error.as_deref().unwrap_or("no reason recorded"),
+                );
+                store.delete_terminal_job(&job_id)?;
+            }
+            None => return Err(format!("Existing job '{job_id}' is still preparing")),
+        }
     }
     // A conversational turn executes what was resolved when it was accepted.
     // Everything else resolves now, which is correct for it: a scheduled or
@@ -2081,13 +2101,30 @@ fn enqueue(
         None => effective_system,
     };
     snapshot.params.clear();
-    snapshot.workspace = Some(
-        workspace
-            .canonicalize()
-            .map_err(|error| format!("Cannot canonicalize daemon workspace: {error}"))?
-            .to_string_lossy()
-            .to_string(),
-    );
+    // A turn that declared no workspace of its own keeps none.
+    //
+    // The daemon still needs a directory to run the job in — that is `workspace`
+    // above, recorded on the job row — but writing it back into the snapshot
+    // turns a chat-only desktop turn into one that *carries* a workspace, and
+    // the turn's own frozen contract then refuses it on arrival: "desktop
+    // chat-only turns must not carry a workspace or execution roots". The
+    // resolved directory is `current_dir()` for a recipe that named none, and
+    // the desktop spawns this daemon with the filesystem root as its working
+    // directory — so what a plain question with no folder open acquired was `/`,
+    // and every such turn died before it ran.
+    let desktop_chat_only = snapshot
+        .desktop_turn
+        .as_ref()
+        .is_some_and(|turn| turn.workspace.is_none());
+    if keeps_resolved_workspace(snapshot.workspace.as_deref(), desktop_chat_only) {
+        snapshot.workspace = Some(
+            workspace
+                .canonicalize()
+                .map_err(|error| format!("Cannot canonicalize daemon workspace: {error}"))?
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
     snapshot.output.json = true;
     let snapshot_path = paths.snapshots.join(format!("{job_id}.json"));
     write_snapshot(&snapshot_path, &snapshot)?;
@@ -2251,6 +2288,17 @@ fn write_snapshot(path: &Path, recipe: &Recipe) -> Result<(), String> {
     std::fs::rename(&tmp, path)
         .map_err(|error| format!("Failed to publish immutable recipe snapshot: {error}"))?;
     store::restrict_file(path)
+}
+
+/// Whether the directory the daemon resolved to run in belongs in the snapshot.
+///
+/// It does for anything that named a workspace, and for every non-desktop
+/// recipe — a scheduled or hand-run recipe with no `workspace:` is meant to run
+/// where the CLI stands. It does not for a desktop turn that froze itself as
+/// chat-only: that turn promised no workspace and no execution roots, and
+/// recording one contradicts the promise it is validated against.
+fn keeps_resolved_workspace(declared: Option<&str>, desktop_chat_only: bool) -> bool {
+    declared.is_some() || !desktop_chat_only
 }
 
 fn resolve_recipe_workspace(recipe: &Recipe, recipe_path: &Path) -> Result<PathBuf, String> {
@@ -3621,6 +3669,23 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use little_monkey_lib::workflow_core::{workflow_core_fixtures, WorkflowRunStatus};
+
+    #[test]
+    fn a_chat_only_desktop_turn_does_not_acquire_the_daemons_working_directory() {
+        // A turn that named a workspace keeps it, whatever it froze.
+        assert!(keeps_resolved_workspace(Some("/repo"), false));
+        assert!(keeps_resolved_workspace(Some("/repo"), true));
+        // A recipe with no `workspace:` still runs where the CLI stands — that
+        // is what a scheduled or hand-run recipe means by omitting it.
+        assert!(keeps_resolved_workspace(None, false));
+        // But a desktop turn frozen as chat-only promised no workspace and no
+        // execution roots. Recording the resolved directory — `/`, when the app
+        // spawned the daemon from the filesystem root — contradicts the very
+        // contract the turn is validated against, and it was refused before it
+        // ran: "desktop chat-only turns must not carry a workspace or execution
+        // roots".
+        assert!(!keeps_resolved_workspace(None, true));
+    }
 
     #[test]
     fn ensure_repairs_a_service_left_behind_by_a_previous_app_install() {
