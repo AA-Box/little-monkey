@@ -46,6 +46,7 @@ const CONFIG: CompanionConfig = {
     realtimeExtensionCapabilityId: null,
     providerModel: 'whisper-1',
     language: 'auto',
+    transcriptionModel: 'base',
     ttsVoice: null,
     saveRawAudio: false,
     inputDeviceId: null,
@@ -447,6 +448,60 @@ describe('TalkPanel — a spoken turn end to end', () => {
       .filter((call) => call[0] === 'm7_tts_synthesize')
       .map((call) => (call[1] as { text: string }).text);
     expect(spoken).toEqual(['The deploy finished cleanly.']);
+  });
+
+  it('never narrates the run: no queue, no progress, no tool status', async () => {
+    const media = stubMedia();
+    mock();
+    const sessionId = liveSession();
+    runAgentTurn.mockImplementation(async () => {
+      const store = useSessionStore.getState();
+      store.addMessage(sessionId, { role: 'user', content: 'what is the deploy status' });
+      // Every status `projectDaemonTurnEvents` writes lands in the answer's own
+      // message, one after another. `started` reaches nearly every turn, which
+      // is why "Resident agent is working…" was read out before every answer.
+      store.addMessage(sessionId, { role: 'assistant', content: '⏳ Queued in the resident runner…' });
+      await Promise.resolve();
+      store.updateLastMessage(sessionId, { content: '⏳ Resident agent is working…' });
+      await Promise.resolve();
+      store.updateLastMessage(sessionId, { content: '⏳ Preparing read_file…' });
+      await Promise.resolve();
+      store.updateLastMessage(sessionId, { content: 'The deploy finished cleanly. ' });
+    });
+    render(<TalkPanel sessionId={sessionId} onClose={vi.fn()} />);
+
+    await saySomething(media);
+    await waitFor(() => expect(media.speakers).toHaveLength(1));
+    const spoken = invoke.mock.calls
+      .filter((call) => call[0] === 'm7_tts_synthesize')
+      .map((call) => (call[1] as { text: string }).text);
+    expect(spoken).toEqual(['The deploy finished cleanly.']);
+  });
+
+  it('offers the conversation to the recognizer, minus the plumbing', async () => {
+    const media = stubMedia();
+    mock();
+    const sessionId = liveSession();
+    await act(async () => {
+      const store = useSessionStore.getState();
+      store.addMessage(sessionId, { role: 'user', content: 'I live in Sundbyberg' });
+      store.addMessage(sessionId, { role: 'assistant', content: '⏳ Resident agent is working…' });
+    });
+    render(<TalkPanel sessionId={sessionId} onClose={vi.fn()} />);
+
+    await saySomething(media);
+    // The recorder stops, then the audio is transcribed a tick later.
+    await waitFor(() =>
+      expect(invoke.mock.calls.some((entry) => entry[0] === 'm7_talk_transcribe')).toBe(true),
+    );
+    const call = invoke.mock.calls.find((entry) => entry[0] === 'm7_talk_transcribe');
+    const context = (call?.[1] as { context: string | null } | undefined)?.context ?? '';
+    // A name already on screen is spelled for the decoder, so the next
+    // utterance is not decoded against a vocabulary that lacks it.
+    expect(context).toContain('Sundbyberg');
+    // Progress text is not conversation; priming with it teaches the decoder
+    // the plumbing's words.
+    expect(context).not.toContain('Resident agent');
   });
 
   it('speaks the answer of a turn that called a tool', async () => {

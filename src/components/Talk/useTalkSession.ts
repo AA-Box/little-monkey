@@ -39,12 +39,54 @@ const GRANT_LIFETIME_MS = 30 * 60_000;
 const METER_INTERVAL_MS = 20;
 
 /**
- * The message the daemon route parks in the answer's place while the run is
- * queued, replaced wholesale when the real text starts arriving. Reading it out
- * would announce the queue and then, because it is replaced rather than
- * appended to, swallow the first sentence of the answer that replaces it.
+ * How the durable routes mark text they park in the answer's place.
+ *
+ * A daemon-routed turn writes its progress into the message the answer will
+ * eventually occupy — "Queued in the resident runner…", "Resident agent is
+ * working…", "Preparing read_file…", "Waiting for approval: …", and the rest of
+ * `projectDaemonTurnEvents`'s status line. On screen that is exactly right. Read
+ * aloud it is the plumbing narrating itself, before every single answer.
+ *
+ * Matching one exact sentence caught only the queue placeholder; the one that
+ * actually reaches most turns is "Resident agent is working…", because the
+ * `started` event fires on all of them. They share this marker, so skip on the
+ * marker rather than on a list of sentences that will grow again.
  */
-const DAEMON_QUEUE_PLACEHOLDER = '⏳ Queued in the resident runner…';
+const PLACEHOLDER_MARKER = '⏳';
+
+/**
+ * How much of the conversation is offered to the recognizer as vocabulary.
+ *
+ * whisper.cpp conditions on the *tail* of this text, the same way it conditions
+ * on the previous window when transcribing a long recording, so the newest
+ * words are the ones that count and there is nothing to gain from sending the
+ * whole transcript.
+ */
+const CONTEXT_LIMIT = 800;
+
+/**
+ * The words this conversation has already used, for the recognizer to expect.
+ *
+ * A proper noun the model has never seen comes back as whatever it sounds like
+ * in the language it detected — "Sundbyberg" as "soon the B-Berry". Once the
+ * name is on screen, offering it back means the next utterance is decoded
+ * against a vocabulary that contains it.
+ *
+ * Placeholders are left out: priming the decoder with "Queued in the resident
+ * runner" teaches it the plumbing's words, not the conversation's.
+ */
+function recentConversation(sessionId: string): string | null {
+  const session = useSessionStore.getState().sessions.find((entry) => entry.id === sessionId);
+  if (!session) return null;
+  const text = session.messages
+    .slice(-6)
+    .map((message) => (typeof message.content === 'string' ? message.content : ''))
+    .filter((value) => value && !value.startsWith(PLACEHOLDER_MARKER))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return text ? text.slice(-CONTEXT_LIMIT) : null;
+}
 
 export interface UseTalkSessionOptions {
   /**
@@ -244,6 +286,7 @@ export function useTalkSession(
           jobId,
           audioBase64,
           recording.mediaType,
+          recentConversation(sessionId),
         );
         return result.text;
       },
@@ -386,7 +429,9 @@ export function useTalkSession(
       }
       if (!answer) return;
       const text = typeof answer.content === 'string' ? answer.content : '';
-      if (!text || text === DAEMON_QUEUE_PLACEHOLDER) return;
+      // A real answer that opens with an hourglass would be skipped too. That
+      // costs one unspoken turn; the alternative costs every turn a preamble.
+      if (!text || text.startsWith(PLACEHOLDER_MARKER)) return;
       // Both routes replace the message's content rather than appending to it,
       // so "longer than last time" is not the same question as "continues what
       // has already been spoken". When it does not continue it, the message was
