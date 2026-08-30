@@ -2234,6 +2234,9 @@ async function runDaemonAgentTurn(
     sessionId,
     turnId,
     runId: queued.run_id,
+    // Kept alongside the run id because the scheduler's decision log — the only
+    // place that says *why* a queued turn is still queued — is keyed by job id.
+    jobId: queued.job_id,
     assistantIndex,
     lastSequence: 0,
     output: '',
