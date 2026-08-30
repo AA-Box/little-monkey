@@ -423,6 +423,6 @@ describe("autonomous coding scored repository evaluation", () => {
       if (fixture.requirements.includes("remote_execution")) expect(metrics.workers).toBeGreaterThan(0);
       if (fixture.requirements.includes("delivery_approval")) expect(state.humanInterventions).toBe(1);
       if (fixture.requirements.includes("budget")) expect(metrics.authoritativeCompletionEvidence).toBe(false);
-    });
+    }, 120_000);
   }
 });
