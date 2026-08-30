@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
+import { resolveLoadedLocalEndpoint } from "./targetRouting";
+
 import {
   MENTION_NOTE_PREFIX,
   attachedStackPromptInfo,
@@ -11,6 +13,7 @@ import {
 import { composeReferencedText } from "./mentions";
 import { textContent, type ChatMessage } from "./llamaClient";
 import { currentSystemPrompt } from "./systemPrompt";
+import { freezeStandardsForTask } from "./standardsExecution";
 import { attemptStream, type ResolvedTarget } from "./turnEngine";
 import {
   assertValidComparisonTargets,
@@ -62,16 +65,7 @@ const SYNTHESIS_SYSTEM_PROMPT = [
 
 const MAX_SYNTHESIS_SOURCE_CHARS = 60_000;
 
-interface LlamaStatusResult {
-  status: "stopped" | "starting" | "ready" | "error";
-  port: number;
-  model_path: string | null;
-}
-
 export interface ComparisonRunHandle extends ComparisonCreationResult {
-  /** Resolves after every branch reaches a terminal state. One rejected
-   * branch is represented in its own persisted metadata and never rejects
-   * this aggregate promise or cancels a sibling. */
   done: Promise<PromiseSettledResult<void>[]>;
 }
 
@@ -114,12 +108,6 @@ function targetInventoryInput() {
   };
 }
 
-/** Rechecks availability without replacing the immutable values the user
- * selected. A disappearing provider/model fails before sessions are created
- * instead of producing four misleading empty result cards. Exported so
- * `compareLabRunner.ts` (Model Compare Lab, ROADMAP.md Phase 2) can reuse the
- * exact same availability check for its own batched/looped fan-out instead
- * of duplicating it. */
 export function preflightTarget(target: ModelTargetSnapshot): void {
   const fresh = buildModelTargetInventory(targetInventoryInput());
   const freshByKey = new Map(fresh.targets.map((target) => [target.key, target]));
@@ -137,10 +125,6 @@ function preflightTargets(targets: readonly ModelTargetSnapshot[]): void {
   for (const target of targets) preflightTarget(target);
 }
 
-/** Resolves a frozen `ModelTargetSnapshot` into the live wire target
- * `attemptStream` needs, re-checking a local llama.cpp target is still the
- * exact model resident in the managed runtime. Exported for
- * `compareLabRunner.ts`'s reuse — see `preflightTarget`'s doc comment. */
 export async function resolveTarget(target: ModelTargetSnapshot): Promise<ResolvedTarget> {
   if (target.kind === "provider") {
     return { kind: "provider", providerId: target.providerId, model: target.model };
@@ -148,11 +132,8 @@ export async function resolveTarget(target: ModelTargetSnapshot): Promise<Resolv
   if (target.kind === "ollama") {
     return { kind: "ollama", baseUrl: target.baseUrl, model: target.model };
   }
-  const status = await invoke<LlamaStatusResult>("llama_status");
-  if (status.status !== "ready" || status.model_path !== target.modelPath) {
-    throw new Error(`${target.displayName} is no longer loaded in the managed llama.cpp runtime.`);
-  }
-  return { kind: "local", baseUrl: `http://127.0.0.1:${status.port}`, modelLabel: target.displayName };
+  const baseUrl = await resolveLoadedLocalEndpoint(target.modelPath, target.displayName);
+  return { kind: "local", baseUrl, modelLabel: target.displayName };
 }
 
 function unresolvedNotice(paths: readonly string[]): ChatMessage | null {
@@ -184,8 +165,6 @@ async function retrieveSources(
       }),
     };
   } catch {
-    // Matches normal doc-chat behavior: retrieval failure cannot prevent a
-    // model response, and every branch still receives the same empty result.
     return null;
   }
 }
@@ -233,11 +212,6 @@ async function runBranch(
       target,
       roots: [],
       permissionMode: "manual",
-      // Declared, not defaulted. `allowNetwork` omitted means `false` in the
-      // frozen spec, and a comparison branch against a cloud provider does use
-      // the network — so omitting it froze a permission the run then contradicted.
-      // Rust now enforces this flag on the provider path, so an under-declaration
-      // is a refused run rather than a dormant inaccuracy.
       allowNetwork: target.kind === "provider" || (target.kind === "ollama" && target.isCloud === true),
       budgets: defaultRunBudgets(true),
     });
@@ -387,7 +361,6 @@ function scheduleBranch(
       const branch = useSessionStore
         .getState()
         .sessions.find((session) => session.id === sessionId)?.comparisonBranch;
-      // Stop can cancel a queued branch before its predecessor finishes.
       if (branch?.status !== "queued") return;
       try {
         await runBranch(sessionId, target, wireHistory, effort);
@@ -401,9 +374,7 @@ function scheduleBranch(
           try {
             await unloadComparisonOllamaModel(target.model);
           } catch (error) {
-            const message = `Could not release ${target.model} after its queued comparison branch: ${
-              errorMessage(error)
-            }`;
+            const message = `Could not release ${target.model} after its queued comparison branch: ${errorMessage(error)}`;
             const currentPlan = useSessionStore
               .getState()
               .groups.find((group) => group.id === groupId)?.comparison?.executionPlan;
@@ -436,15 +407,12 @@ function branchWireHistory(
   }
   return [
     { role: "system", content: metadata.systemPrompt },
-    // `/btw` side-question notices are display-only — never on any wire.
     ...cloneValue([...baseMessages]).filter((message) => !isBtwNotice(message)),
     { role: "user", content: cloneValue(metadata.wireContent) },
     ...cloneValue(metadata.contextMessages),
   ];
 }
 
-/** Resolves references/RAG/system context exactly once, creates persisted
- * branch sessions atomically, then fans out explicit no-tools model calls. */
 export async function startComparison(
   sourceSessionId: string,
   prompt: string,
@@ -454,8 +422,6 @@ export async function startComparison(
 ): Promise<ComparisonRunHandle> {
   const normalizedPrompt = prompt.trim();
   if (!normalizedPrompt) throw new Error("Enter a prompt before starting a comparison.");
-  // Detach from caller-owned picker values before the first await. The same
-  // immutable values are validated, persisted, displayed, and resolved.
   const targetSnapshots = cloneValue([...targets]);
   preflightTargets(targetSnapshots);
   const memoryInfoPromise = loadSystemMemoryInfo();
@@ -469,6 +435,10 @@ export async function startComparison(
   const sourceSignature = sourceSnapshotSignature(source);
 
   const { textRefs, images, unresolved } = await resolveReferences(normalizedPrompt, [...attachments]);
+  const standardsContext = await freezeStandardsForTask(
+    normalizedPrompt,
+    textRefs.filter((reference) => reference.source !== "terminal").map((reference) => reference.path),
+  );
   const historyContainsImages = baseMessages.some(
     (message) => Array.isArray(message.content) && message.content.some((part) => part.type === "image_url")
   );
@@ -486,7 +456,13 @@ export async function startComparison(
   await useRulesStore.getState().refresh();
   const stacks = useStackStore.getState().stacks.filter((stack) => source.attachedStackIds.includes(stack.id));
   const systemPrompt = `${composeSkillSystemPrompt(
-    currentSystemPrompt(source.personaId, attachedStackPromptInfo(stacks), source.docChatMode),
+    currentSystemPrompt(
+      source.personaId,
+      attachedStackPromptInfo(stacks),
+      source.docChatMode,
+      standardsContext.promptSection,
+      standardsContext.checkerCommandIds.length > 0,
+    ),
     cloneValue([...skillInvocations]),
   )}${COMPARE_SYSTEM_SUFFIX}`;
   const storedContent = toMessageContent(normalizedPrompt, images);
@@ -504,10 +480,6 @@ export async function startComparison(
       ? await loadResidentOllamaModels()
       : null;
 
-  // Reference reads/RAG can take long enough for another window to edit the
-  // source conversation or its persona/stacks. Never pair a stale wire
-  // snapshot with branches cloned from newer state; ask the user to retry so
-  // every persisted branch and provider payload share one exact base.
   const currentSource = useSessionStore.getState().sessions.find((session) => session.id === sourceSessionId);
   if (!currentSource || sourceSnapshotSignature(currentSource) !== sourceSignature) {
     throw new Error("The source session changed while the comparison was being prepared. Review it and try again.");
@@ -524,9 +496,6 @@ export async function startComparison(
     storedContent: cloneValue(storedContent),
     wireContent: cloneValue(wireContent),
     unresolvedReferences: [...unresolved],
-    // Effort is per-model now, frozen on each target snapshot itself;
-    // `metadata.effort` remains only so comparisons persisted before the
-    // per-model split still retry with their original global level.
     effort: null,
     systemPrompt,
     contextMessages: cloneValue(contextMessages),
@@ -541,7 +510,6 @@ export async function startComparison(
 
   const wireHistory: ChatMessage[] = [
     { role: "system", content: systemPrompt },
-    // `/btw` side-question notices are display-only — never on any wire.
     ...cloneValue(baseMessages).filter((message) => !isBtwNotice(message)),
     { role: "user", content: cloneValue(wireContent) },
     ...cloneValue(contextMessages).map(protectKnowledgeNoticeForModel),
@@ -590,9 +558,6 @@ export function stopComparison(groupId: string): void {
   stopComparisonSynthesis(groupId);
 }
 
-/** Retries exactly one branch from the persisted frozen input. Changed
- * files, persona/rules, stacks, per-model effort settings, and active model
- * are ignored. */
 export function retryComparisonBranch(sessionId: string): Promise<void> {
   if (branchControllers.has(sessionId)) {
     return Promise.reject(new Error("Wait for this branch to stop before retrying it."));
@@ -712,7 +677,6 @@ async function runSynthesis(groupId: string, synthesis: ComparisonSynthesis): Pr
       target: synthesis.target,
       roots: [],
       permissionMode: "manual",
-      // See the branch submission above.
       allowNetwork:
         synthesis.target.kind === "provider" ||
         (synthesis.target.kind === "ollama" && synthesis.target.isCloud === true),
@@ -830,8 +794,6 @@ function sourceResponse(sessionId: string, baseMessageCount: number): string | n
     : content;
 }
 
-/** Starts an explicit no-tools synthesis from frozen completed branch
- * responses. Re-running branches later cannot change Retry inputs. */
 export function startComparisonSynthesis(
   groupId: string,
   target: ModelTargetSnapshot,

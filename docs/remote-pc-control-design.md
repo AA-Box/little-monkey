@@ -1,10 +1,10 @@
 # Remote PC Control — Design and Threat Model (Research)
 
-**Status:** Research (ROADMAP.md, Phase 5 §"Remote PC Control"). This document is the
-entire deliverable for that roadmap item at its current status. It contains **no
-runtime code, no new dependency, and no change to `src-tauri/src/lib.rs` or any
-command registration** — by design. A "Research" item is a place to write down
-what we believe and what we still don't know, not a place to ship a feature.
+**Status:** The original remote-control design remains the protocol and
+threat-model reference. The runtime now reuses the local Computer Use grant,
+lock, consent, target verification, audit, screenshot, and revocation path;
+see [`computer-use.md`](computer-use.md). Remote pairing still cannot widen
+local permissions or grant OS security dialogs.
 
 ## 0. Roadmap framing and hard dependency
 

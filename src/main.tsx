@@ -1,10 +1,13 @@
 import React from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import "./index.css";
 import { applyAppearance, subscribeToSystemTheme } from "./lib/theme";
 import { resolveAppearanceSettings } from "./lib/appearanceProfiles";
+import { startExtensionMarketplaceUpdateCoordinator } from "./lib/extensionMarketplaceUpdateCoordinator";
 import { useSettingsStore } from "./store/settingsStore";
 import { primaryRoot, useWorkspaceStore } from "./store/workspaceStore";
 import { hydrateSessions, useSessionStore } from "./store/sessionStore";
@@ -12,6 +15,7 @@ import { hydratePrompts } from "./store/promptStore";
 import { CompanionOverlay } from "./components/Companion";
 import { loadLocaleTranslations } from "./lib/i18n";
 import { useLocaleStore } from "./store/localeStore";
+import { useSkillActivationPolicyStore } from "./store/skillActivationPolicyStore";
 
 function committedAppearance() {
   const settings = useSettingsStore.getState();
@@ -61,6 +65,29 @@ if (!import.meta.env.DEV) {
 
 const isCompanionOverlay = new URLSearchParams(window.location.search).get("overlay") === "1";
 const localeReady = loadLocaleTranslations(useLocaleStore.getState().locale);
+const isFullProductE2e = !isCompanionOverlay && import.meta.env.VITE_COMPUTER_USE_FULL_PRODUCT_E2E === "1";
+
+// The product golden is itself the boot-time health check. Start it as soon as
+// the webview module loads rather than making it wait behind optional store
+// hydration; a stuck unrelated hydration promise must not turn a live Tauri
+// process into an acceptance timeout with no evidence.
+if (isFullProductE2e) {
+  const reportBootstrapFailure = (error: unknown) => invoke("computer_use_full_product_report", {
+    report: {
+      status: "failed",
+      error: error instanceof Error ? error.message : String(error),
+      real_frontend_dispatcher: false,
+      real_tauri_ipc: false,
+    },
+  }).catch(() => undefined);
+  void import("./lib/computerUseFullProductE2e")
+    .then(({ runComputerUseFullProductE2e }) => {
+      window.setTimeout(() => {
+        void runComputerUseFullProductE2e().catch(reportBootstrapFailure);
+      }, 1_500);
+    })
+    .catch(reportBootstrapFailure);
+}
 
 if (isCompanionOverlay) {
   void localeReady.finally(() => {
@@ -72,7 +99,7 @@ if (isCompanionOverlay) {
       </React.StrictMode>,
     );
   });
-} else void Promise.all([hydrateSessions(), hydratePrompts(), localeReady]).finally(() => {
+} else void Promise.all([hydrateSessions(), hydratePrompts(), useSkillActivationPolicyStore.getState().hydrate(), localeReady]).finally(() => {
   // Secondary windows opened by the session menu's "Open in > Split view/New
   // window" (see src-tauri/src/system.rs `open_session_window`) load this
   // same entry point with `?session=<id>` — switch to it before the first
@@ -80,6 +107,13 @@ if (isCompanionOverlay) {
   const preselectedSessionId = new URLSearchParams(window.location.search).get("session");
   if (preselectedSessionId) {
     useSessionStore.getState().switchSession(preselectedSessionId);
+  }
+
+  // Marketplace update policy belongs to the application lifecycle, not to
+  // whether Settings happens to be open. Only the primary window owns the
+  // coordinator; secondary session windows load this entry point too.
+  if (getCurrentWindow().label === "main") {
+    startExtensionMarketplaceUpdateCoordinator();
   }
 
   // Top-level boundary: without it a render error anywhere unmounts the

@@ -27,17 +27,18 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { allowedToolsRestriction, applyAllowedToolsRestriction } from './allowedTools';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools, toolsForWorkspace } from './tools';
+import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SEARCH_SKILLS_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools, toolsForWorkspace } from './tools';
 import {
   candidateNotice,
   finalizeLearningForRun,
+  formatSaveSkillNotice,
   formatLearningNotice,
   learnFromFinishedRun,
+  selectFinishedRunNotice,
   type InvokedSkillUse,
   type ReflectionCall,
 } from './skillLearning';
-import { cachedLearningMode } from './skillLearningClient';
-import type { NativeSkillScope } from './nativeSkillsClient';
+import { cachedLearningMode, skillLearningClient } from './skillLearningClient';
 import { mcpToolDefs } from './mcpTools';
 import { executableExtensionToolDefs } from './executableExtensionTools';
 import { isVisionCapableLocalModel, isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
@@ -59,6 +60,7 @@ import {
   type ToolExecutionContext,
 } from './turnEngine';
 import { classifyToolCall, type RiskClassification } from './riskJudge';
+import { ComputerUseRunBudget } from './taskCoordinator';
 import {
   composeReferencedText,
   extractMentionPaths,
@@ -67,7 +69,9 @@ import {
   type ResolvedTextReference,
 } from './mentions';
 import { currentSystemPrompt, ULTRACODE_SYSTEM_SECTION, type AttachedStackPromptInfo } from './systemPrompt';
-import { composeSkillCatalog, composeSkillSystemPrompt, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
+import { freezeStandardsForTask } from './standardsExecution';
+import { planVerificationCommands } from './verificationPlan';
+import { composeSkillCatalog, composeSkillSystemPrompt, skillRankingSignalsFor, MAX_MODEL_SKILLS, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
 import { composeSavedWorkflowCatalog } from './workflow';
 import { selectSavedWorkflowList, useSavedWorkflowStore } from '../store/savedWorkflowStore';
 import { composeCustomAgentCatalog } from './customAgents';
@@ -90,6 +94,8 @@ import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import { admitProcess, exitProcess, exitStatusFor, linkProcessRun, markProcessRunning, reconcileProcess } from './processTable';
 import { honourPause, forgetPause, isPauseRequested } from './pauseRegistry';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
+import { requestSkillActivationApproval } from '../store/skillActivationApprovalStore';
+import { skillActivationPolicyFor, useSkillActivationPolicyStore } from '../store/skillActivationPolicyStore';
 import {
   describeRedactions,
   gatePrivacyWireMessages,
@@ -571,12 +577,43 @@ export const formatVerifyNotice = verifyNoticeCodec.format;
  * doc, which suggested reusing `VERIFY_NOTE_PREFIX` for this message. */
 export const VERIFY_FIX_NOTE_PREFIX = '[Verify Fix]';
 
+function computerScreenshotContent(toolName: string, result: string): ChatContentPart[] | null {
+  if (toolName !== 'computer_screenshot') return null;
+  try {
+    const parsed = JSON.parse(result) as { content_base64?: unknown };
+    if (typeof parsed.content_base64 !== 'string' || parsed.content_base64.length === 0) return null;
+    const { content_base64: _content, ...metadata } = parsed;
+    return [
+      { type: 'text', text: JSON.stringify(metadata) },
+      { type: 'image_url', image_url: { url: `data:image/png;base64,${parsed.content_base64}` } },
+    ];
+  } catch {
+    return null;
+  }
+}
+
 export function isVerifyFixNotice(message: ChatMessage): boolean {
   return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(VERIFY_FIX_NOTE_PREFIX);
 }
 
 /** Tool names gated by the `webToolsEnabled` settings toggle — see `toolsForSettings`. */
 const WEB_TOOL_NAMES = new Set(['web_fetch', 'web_search']);
+const COMPUTER_TOOL_NAMES = new Set([
+  'computer_list_targets',
+  'computer_screenshot',
+  'computer_clipboard_read',
+  'computer_inspect',
+  'computer_focus',
+  'computer_click',
+  'computer_double_click',
+  'computer_scroll',
+  'computer_type',
+  'computer_key',
+  'computer_hotkey',
+  'computer_wait',
+  'computer_select',
+  'computer_set_value',
+]);
 
 /**
  * Filters `remember` out of the tool list offered to the model this turn
@@ -601,8 +638,9 @@ const WEB_TOOL_NAMES = new Set(['web_fetch', 'web_search']);
  * pass it, so `task` is never accidentally offered by an existing caller
  * that hasn't been updated for it.
  *
- * `skillToolEnabled`/`readSkillResourceToolEnabled` follow the same posture,
- * appending `SKILL_INVOKE_TOOL`/`READ_SKILL_RESOURCE_TOOL` — see
+ * `skillToolEnabled`/`skillSearchToolEnabled`/`readSkillResourceToolEnabled`
+ * follow the same posture, appending `SKILL_INVOKE_TOOL`/
+ * `SEARCH_SKILLS_TOOL`/`READ_SKILL_RESOURCE_TOOL` — see
  * `runAgentTurnBody`'s call site for exactly what each is computed from.
  * They're independent: `readSkillResourceToolEnabled` is NOT gated on
  * `settingsStore.skillAutoInvokeEnabled` at all — reading a bundled file
@@ -617,10 +655,13 @@ export function toolsForSettings(
   skillToolEnabled = false,
   readSkillResourceToolEnabled = false,
   skillLearningToolEnabled = false,
+  skillSearchToolEnabled = false,
+  desktopControlEnabled = false,
 ): ToolDef[] {
   const filtered = tools.filter((tool) => {
     if (!memoryEnabled && tool.function.name === 'remember') return false;
     if (!webToolsEnabled && WEB_TOOL_NAMES.has(tool.function.name)) return false;
+    if (!desktopControlEnabled && COMPUTER_TOOL_NAMES.has(tool.function.name)) return false;
     return true;
   });
   return [
@@ -629,6 +670,7 @@ export function toolsForSettings(
     ...(skillToolEnabled ? [SKILL_INVOKE_TOOL] : []),
     ...(readSkillResourceToolEnabled ? [READ_SKILL_RESOURCE_TOOL] : []),
     ...(skillLearningToolEnabled ? [MANAGE_SKILL_LEARNING_TOOL] : []),
+    ...(skillSearchToolEnabled ? [SEARCH_SKILLS_TOOL] : []),
   ];
 }
 
@@ -971,6 +1013,10 @@ export interface VerifyFailure {
   label: string;
   code: number | null;
   output: string;
+  /** Required Standards checker failures are hard completion gates. */
+  required?: boolean;
+  /** False when another model edit cannot repair the failure (for example a missing binding). */
+  fixable?: boolean;
 }
 
 /**
@@ -985,7 +1031,7 @@ export interface VerifyFailure {
  * enabled commands) never triggers a round regardless of the round budget.
  */
 export function shouldFeedBackVerifyFailure(failure: VerifyFailure | null, verifyRound: number, verifyMaxRounds: number): boolean {
-  return failure !== null && verifyRound < verifyMaxRounds;
+  return failure !== null && failure.fixable !== false && verifyRound < verifyMaxRounds;
 }
 
 /**
@@ -1022,36 +1068,60 @@ export async function runVerificationPhase(
   sessionId: string,
   turnId: string,
   addMessage: (msg: ChatMessage) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  requiredCommandIds: readonly string[] = [],
 ): Promise<VerifyFailure | null> {
-  if (!useSettingsStore.getState().verifyEnabled) return null;
+  const includeConfiguredCommands = useSettingsStore.getState().verifyEnabled;
+  const requiredIds = [...new Set(requiredCommandIds.map((id) => id.trim()).filter(Boolean))];
+  if (!includeConfiguredCommands && requiredIds.length === 0) return null;
   if (usePermissionStore.getState().mode === 'plan') return null;
   if (signal?.aborted) return null;
 
   let config: VerifyConfig;
   try {
     config = await invoke<VerifyConfig>('verify_get_config', {});
-  } catch {
-    // No workspace open, or the config file couldn't be read — nothing to run.
-    return null;
+  } catch (error) {
+    if (requiredIds.length === 0) return null;
+    const output = `Could not load the Verification configuration required by selected Standards: ${errorMessage(error)}`;
+    addMessage({
+      role: 'system',
+      content: formatVerifyNotice({
+        label: 'Standards checker bindings',
+        kind: 'standards',
+        ok: false,
+        code: null,
+        output,
+        durationMs: 0,
+      }),
+    });
+    return { label: 'Standards checker bindings', code: null, output, required: true, fixable: false };
   }
 
-  const enabledCommands = config.commands.filter((c) => c.enabled);
-  if (enabledCommands.length === 0) return null;
+  const plan = planVerificationCommands(config, includeConfiguredCommands, requiredIds);
+  if (plan.missingRequiredIds.length > 0) {
+    const output = `Required Standards checker is disabled or missing: ${plan.missingRequiredIds.join(', ')}.`;
+    addMessage({
+      role: 'system',
+      content: formatVerifyNotice({
+        label: 'Standards checker bindings',
+        kind: 'standards',
+        ok: false,
+        code: null,
+        output,
+        durationMs: 0,
+      }),
+    });
+    return { label: 'Standards checker bindings', code: null, output, required: true, fixable: false };
+  }
+  if (plan.commands.length === 0) return null;
 
+  const requiredSet = new Set(requiredIds);
   let firstFailure: VerifyFailure | null = null;
+  let firstRequiredFailure: VerifyFailure | null = null;
 
-  for (const cmd of enabledCommands) {
-    // Stop fired either before this iteration or while the previous
-    // command's invoke was in flight (handled below) — either way, don't
-    // start another configured command.
+  for (const cmd of plan.commands) {
     if (signal?.aborted) break;
 
-    // Surfaced as a "running <label>…" row in the timeline
-    // (MessageList.tsx's VerifyRunningRow) — test suites can run long enough
-    // (up to `timeout_secs`, default 300s) that a bare typing indicator would
-    // read as a hang. Cleared in `finally` so a thrown/rejected invoke below
-    // never leaves a stale "running" row behind.
     useSessionStore.getState().setRunningVerifyLabel(sessionId, cmd.label || cmd.command);
     try {
       useUsageHistoryStore.getState().recordVerifyRun();
@@ -1059,12 +1129,6 @@ export async function runVerificationPhase(
       const result = signal ? await Promise.race([invocation, abortedPromise(signal).then(() => null)]) : await invocation;
 
       if (result === null) {
-        // Aborted mid-command: tell the Rust side to kill it via the same
-        // turn-keyed cancel channel `executeToolCall` uses for tool calls,
-        // then stop the phase entirely rather than starting the next
-        // configured command. The original invocation promise already has a
-        // handler attached (via Promise.race), so its eventual (discarded)
-        // result never becomes an unhandled rejection.
         void invoke('tools_cancel_running', { turnId }).catch(() => {});
         break;
       }
@@ -1082,15 +1146,19 @@ export async function runVerificationPhase(
           durationMs: result.durationMs,
         }),
       });
-      if (!ok && firstFailure === null) {
-        firstFailure = { label: result.label, code: result.code, output };
+      if (!ok) {
+        const required = requiredSet.has(cmd.id);
+        const failure: VerifyFailure = {
+          label: result.label,
+          code: result.code,
+          output,
+          ...(required ? { required: true, fixable: true } : {}),
+        };
+        if (firstFailure === null) firstFailure = failure;
+        if (required && firstRequiredFailure === null) firstRequiredFailure = failure;
       }
     } catch (err) {
-      // verify_run itself rejected (e.g. the command was deleted from the
-      // config in another window between the check above and this call) —
-      // surface it as a failed notice rather than silently dropping the
-      // round.
-      const message = errorMessage(err);
+      const output = errorMessage(err);
       addMessage({
         role: 'system',
         content: formatVerifyNotice({
@@ -1098,19 +1166,25 @@ export async function runVerificationPhase(
           kind: cmd.kind,
           ok: false,
           code: null,
-          output: message,
+          output,
           durationMs: 0,
         }),
       });
-      if (firstFailure === null) {
-        firstFailure = { label: cmd.label, code: null, output: message };
-      }
+      const required = requiredSet.has(cmd.id);
+      const failure: VerifyFailure = {
+        label: cmd.label,
+        code: null,
+        output,
+        ...(required ? { required: true, fixable: true } : {}),
+      };
+      if (firstFailure === null) firstFailure = failure;
+      if (required && firstRequiredFailure === null) firstRequiredFailure = failure;
     } finally {
       useSessionStore.getState().setRunningVerifyLabel(sessionId, null);
     }
   }
 
-  return firstFailure;
+  return firstRequiredFailure ?? firstFailure;
 }
 
 
@@ -1522,6 +1596,7 @@ function registerDurableController(
 interface DurableTurnContext {
   recorder: DurableRunRecorder | null;
   failure: string | null;
+  computerUseBudget: ComputerUseRunBudget | null;
   /** One-shot model call for the bounded learning reflection pass, built by
    * `runAgentTurnBody` (which owns the resolved target and the privacy gate)
    * and consumed by `runAgentTurn`'s `finally` — the learning step can only
@@ -1670,6 +1745,14 @@ export async function runAgentTurn(
     if (resume !== null) {
       await watchResumedDesktopTurn(sessionId, resume, controller, origin);
       return;
+    }
+    // Re-read the profile-owned policy file before each turn so CLI changes
+    // converge even when no Tauri event was available to this renderer.
+    if (availableSkills.length > 0) {
+      await useSkillActivationPolicyStore.getState().refresh();
+      availableSkills = availableSkills.map((candidate) => candidate.policyKey
+        ? { ...candidate, activationPolicy: skillActivationPolicyFor(candidate.policyKey) }
+        : candidate);
     }
     const mutationRequired = requiresWorkspaceMutation(
       userText,
@@ -1907,6 +1990,10 @@ async function runDaemonAgentTurn(
   store.addMessage(sessionId, { role: 'user', content: userText });
 
   const { textRefs, images, unresolved } = await resolveReferences(userText, attachments);
+  const frozenStandards = await freezeStandardsForTask(
+    userText,
+    textRefs.filter((reference) => reference.source !== 'terminal').map((reference) => reference.path),
+  );
   if (images.length > 0) {
     store.updateMessageAt(sessionId, anchorIndex, { content: toMessageContent(userText, images) });
   }
@@ -2088,7 +2175,13 @@ async function runDaemonAgentTurn(
     turnId,
     userText,
     systemPrompt: composeSkillSystemPrompt(
-      currentSystemPrompt(session?.personaId ?? null, attachedStacksForPrompt, docChatMode),
+      currentSystemPrompt(
+        session?.personaId ?? null,
+        attachedStacksForPrompt,
+        docChatMode,
+        frozenStandards.promptSection,
+        frozenStandards.checkerCommandIds.length > 0,
+      ),
       skillInvocations,
     ),
     history: targetHistory,
@@ -2100,6 +2193,7 @@ async function runDaemonAgentTurn(
     memoryEnabled: settings.memoryEnabled,
     verifyEnabled: settings.verifyEnabled,
     verifyMaxRounds: settings.verifyMaxRounds,
+    standardsCheckerCommandIds: frozenStandards.checkerCommandIds,
     subagentsEnabled: settings.subagentsEnabled,
     effort: effortForTarget(resolvedTarget) ?? null,
     mcpServers: useMcpStore.getState().servers,
@@ -2140,6 +2234,9 @@ async function runDaemonAgentTurn(
     sessionId,
     turnId,
     runId: queued.run_id,
+    // Kept alongside the run id because the scheduler's decision log — the only
+    // place that says *why* a queued turn is still queued — is keyed by job id.
+    jobId: queued.job_id,
     assistantIndex,
     lastSequence: 0,
     output: '',
@@ -2274,7 +2371,14 @@ async function runTurnGuarded(
   }).catch(() => null);
   // Distinct from checkpointId (which can be null): scopes shell,
   // cancellation, permission prompts, and durable run events to this turn.
-  const durable: DurableTurnContext = { recorder: null, failure: null, reflect: null, skills: null, toolFailures: [] };
+  const durable: DurableTurnContext = {
+    recorder: null,
+    failure: null,
+    computerUseBudget: useSettingsStore.getState().desktopControlEnabled ? new ComputerUseRunBudget() : null,
+    reflect: null,
+    skills: null,
+    toolFailures: [],
+  };
   let thrown: unknown = null;
   try {
     await runAgentTurnBody(
@@ -2347,20 +2451,38 @@ async function runTurnGuarded(
       // can be a candidate. Everything is best-effort — a turn that already
       // succeeded must never surface a learning failure as its own.
       await finalizeLearningForRun(sessionId, durable.recorder.runId, userText);
-      if (cleanlyCompleted && durable.reflect !== null) {
-        const scope: NativeSkillScope =
-          primaryRoot(useWorkspaceStore.getState().roots) !== null ? 'workspace' : 'global';
-        const candidate = await learnFromFinishedRun(
-          durable.recorder.runId,
-          userText,
-          scope,
-          durable.reflect,
-          signal,
-        );
-        if (candidate) {
+      if (cleanlyCompleted) {
+        const runScope = await skillLearningClient
+          .scopeForRun(durable.recorder.runId)
+          .catch(() => null);
+        const candidate = runScope && durable.reflect !== null
+          ? await learnFromFinishedRun(
+              durable.recorder.runId,
+              userText,
+              runScope,
+              durable.reflect,
+              signal,
+            )
+          : null;
+        const captureScope = candidate
+          ? null
+          : await skillLearningClient
+              .captureEligibility(durable.recorder.runId, userText)
+              .catch(() => null);
+        const notice = selectFinishedRunNotice(candidate, captureScope);
+        if (notice?.kind === 'learning') {
           useSessionStore.getState().addMessage(sessionId, {
             role: 'system',
-            content: formatLearningNotice(candidateNotice(candidate)),
+            content: formatLearningNotice(candidateNotice(notice.candidate)),
+          });
+        } else if (notice?.kind === 'save') {
+          useSessionStore.getState().addMessage(sessionId, {
+            role: 'system',
+            content: formatSaveSkillNotice({
+              runId: durable.recorder.runId,
+              userText,
+              scope: notice.scope,
+            }),
           });
         }
       }
@@ -2398,6 +2520,10 @@ async function runAgentTurnBody(
   // *wire* payload (sessionStore keeps the unexpanded text the user typed),
   // but images are promoted into the stored message itself, right below.
   const { textRefs, images, unresolved } = await resolveReferences(userText, attachments);
+  const frozenStandards = await freezeStandardsForTask(
+    userText,
+    textRefs.filter((reference) => reference.source !== 'terminal').map((reference) => reference.path),
+  );
 
   if (images.length > 0) {
     updateLastMessage({ content: toMessageContent(userText, images) });
@@ -2426,6 +2552,11 @@ async function runAgentTurnBody(
   const requireVision = images.length > 0;
 
   const settings = useSettingsStore.getState();
+  const consumeComputerUseModelCall = (): void => {
+    if (durable.computerUseBudget && !durable.computerUseBudget.consume('model_calls')) {
+      throw new Error('COMPUTER_USE_BUDGET_EXCEEDED: model call deadline or limit reached');
+    }
+  };
   const privacyWorkspaceId = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? 'global';
   const privacyWireCache: PrivacyWireCache = new Map();
   const surfacedRateLimitWarnings = new Set<string>();
@@ -2841,11 +2972,38 @@ async function runAgentTurnBody(
   // (`toolsOfferedThisIteration`, inside the loop) see later model-invoked
   // skills too, not just the ones known up front.
   const invokedSkillCommands = new Set(skillInvocations.map((invocation) => invocation.skill.command));
+  const explicitSkillCommands = new Set(skillInvocations.map((invocation) => invocation.skill.command.toLowerCase()));
+  const invokedSkillSnapshots = new Map<string, { sha256: string; sourcePath: string }>();
+  for (const invocation of skillInvocations) {
+    if (invocation.skill.sourcePath) {
+      invokedSkillSnapshots.set(invocation.skill.command.toLowerCase(), {
+        sha256: invocation.skill.contentSha256,
+        sourcePath: invocation.skill.sourcePath,
+      });
+    }
+  }
+  const skillPoliciesHydrated = useSkillActivationPolicyStore.getState().hydrated;
+  const workspaceRootPath = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? '';
+  let rankingSignals = new Map<string, import('./skills').SkillRankingSignals>();
+  if (skillPoliciesHydrated && availableSkills.length > 0 && isTauri()) {
+    try {
+      rankingSignals = skillRankingSignalsFor(availableSkills, await skillLearningClient.effectiveness(), workspaceRootPath);
+    } catch {
+      // Ranking remains lexical/policy-only when telemetry is unavailable.
+    }
+  }
+  const modelDiscoverableSkills = skillPoliciesHydrated
+    ? availableSkills.filter((candidate) => candidate.activationPolicy !== 'manual')
+    : [];
   const skillToolContext: SkillToolContext = {
     availableSkills,
     invokedCommands: invokedSkillCommands,
+    invokedSkillSnapshots,
+    explicitCommands: explicitSkillCommands,
     maxSkillsPerTurn: MAX_SKILLS_PER_TURN,
+    rankingSignals,
     runId: durable.recorder?.runId,
+    requestApproval: (skill, approvalSignal) => requestSkillActivationApproval(skill, approvalSignal),
     onInvoked: (skill) => recordSkillInvocation(durable, skill),
   };
   durable.skills = skillToolContext;
@@ -2855,7 +3013,9 @@ async function runAgentTurnBody(
   // the ones the model picked itself.
   for (const invocation of skillInvocations) recordSkillInvocation(durable, invocation.skill);
   const skillToolEnabled =
-    settings.skillAutoInvokeEnabled && availableSkills.some((candidate) => !invokedSkillCommands.has(candidate.command));
+    settings.skillAutoInvokeEnabled && modelDiscoverableSkills.some((candidate) => !invokedSkillCommands.has(candidate.command));
+  const skillSearchToolEnabled =
+    settings.skillAutoInvokeEnabled && modelDiscoverableSkills.length > MAX_MODEL_SKILLS;
   const readSkillResourceToolEnabled = availableSkills.some((candidate) => (candidate.resourceFiles?.length ?? 0) > 0);
   // `GENERATE_IMAGE_TOOL` is appended here (desktop chat's composition chain
   // only) rather than living in the base `TOOLS` array — see its doc comment
@@ -2888,6 +3048,8 @@ async function runAgentTurnBody(
       // "not offered" — see `cachedLearningMode`. It also needs a durable run:
       // without one there is no evidence chain for a proposal to append to.
       cachedLearningMode() !== null && cachedLearningMode() !== 'off' && durable.recorder !== null,
+      skillSearchToolEnabled,
+      settings.desktopControlEnabled,
     ),
     hasWorkspace,
   );
@@ -2905,6 +3067,7 @@ async function runAgentTurnBody(
     if (!prepared) {
       throw new Error('Privacy Firewall cancelled context summarization.');
     }
+    consumeComputerUseModelCall();
     const result = await attemptStream(
       prepared.target,
       prepared.messages,
@@ -2932,7 +3095,6 @@ async function runAgentTurnBody(
   // just wrapping `riskJudge.ts`'s `classifyToolCall` instead of a plain
   // summarization prompt (see that module's doc comment for why it takes this
   // callback as a parameter instead of importing `attemptStream` itself).
-  const workspaceRootPath = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? '';
   const riskAnnotation: RiskAnnotationContext = {
     // "smart" mode (Phase 3) needs a classification for every mutating call
     // to decide whether it can auto-approve — so classification runs
@@ -2950,6 +3112,7 @@ async function runAgentTurnBody(
           if (!prepared) {
             throw new Error('Privacy Firewall cancelled risk classification.');
           }
+          consumeComputerUseModelCall();
           return attemptStream(
               prepared.target,
               prepared.messages,
@@ -2980,6 +3143,7 @@ async function runAgentTurnBody(
     if (!prepared) {
       throw new Error('Privacy Firewall cancelled the learning reflection.');
     }
+    consumeComputerUseModelCall();
     const result = await attemptStream(
       prepared.target,
       prepared.messages,
@@ -3026,6 +3190,7 @@ async function runAgentTurnBody(
   // anything — this is what makes `verifyMaxRounds` a hard bound rather than
   // a "keep trying until it passes" loop.
   let verifyRound = 0;
+  let verificationRecheckPending = false;
 
   /**
    * The turn's safe point: freeze first if a suspend is latched, then park.
@@ -3174,6 +3339,7 @@ async function runAgentTurnBody(
       toolDefinitions: toolsForTurn,
       isToolAvailable,
       onCompleted: completeToolCall,
+      computerUseBudget: durable.computerUseBudget ?? undefined,
     };
     const programmaticToolOffered = toolsForTurn.some(
       (tool) => tool.function.name === PROGRAMMATIC_TOOL.function.name,
@@ -3182,12 +3348,18 @@ async function runAgentTurnBody(
       role: 'system',
       content: [
         composeSkillSystemPrompt(
-          currentSystemPrompt(personaId, attachedStacksForPrompt, docChatMode),
+          currentSystemPrompt(
+            personaId,
+            attachedStacksForPrompt,
+            docChatMode,
+            frozenStandards.promptSection,
+            frozenStandards.checkerCommandIds.length > 0,
+          ),
           skillInvocations,
         ),
         ...(ultracode ? [ULTRACODE_SYSTEM_SECTION] : []),
         ...(programmaticToolOffered ? [PROGRAMMATIC_SYSTEM_GUIDANCE] : []),
-        ...(settings.skillAutoInvokeEnabled ? [composeSkillCatalog(availableSkills, invokedSkillCommands)] : []),
+        ...(settings.skillAutoInvokeEnabled && skillPoliciesHydrated ? [composeSkillCatalog(availableSkills, invokedSkillCommands, userText, rankingSignals)] : []),
         // Saved workflows are only actionable when WORKFLOW_TOOL is offered,
         // so the catalog rides the same `subagentsEnabled` gate.
         ...(settings.subagentsEnabled
@@ -3245,6 +3417,7 @@ async function runAgentTurnBody(
     const assistantPlaceholder: ChatMessage = { role: 'assistant', content: '' };
     addMessage(assistantPlaceholder);
 
+    consumeComputerUseModelCall();
     let attempt = await attemptStream(
       target,
       outboundWireHistory,
@@ -3289,6 +3462,7 @@ async function runAgentTurnBody(
       });
       surfaceRateLimitWarnings(target);
       addMessage({ role: 'assistant', content: '' });
+      consumeComputerUseModelCall();
       attempt = await attemptStream(
         target,
         outboundWireHistory,
@@ -3351,6 +3525,7 @@ async function runAgentTurnBody(
           ? preparedFailoverWire.messages
           : wireHistoryFor(target);
       addMessage({ role: 'assistant', content: '' });
+      consumeComputerUseModelCall();
       attempt = await attemptStream(
         target,
         failoverWireHistory,
@@ -3431,34 +3606,42 @@ async function runAgentTurnBody(
       // verification commands (if any files were mutated and the user
       // hasn't hit Stop) before returning — see `runVerificationPhase`'s doc
       // comment for exactly what gates this.
-      if (!signal?.aborted && mutatedFiles.size > 0) {
+      if (!signal?.aborted && (mutatedFiles.size > 0 || verificationRecheckPending)) {
         const verificationStartedAt = Date.now();
-        const failure = await runVerificationPhase(sessionId, turnId, addMessage, signal);
-        if (settings.verifyEnabled && !signal?.aborted) {
+        verificationRecheckPending = false;
+        const failure = await runVerificationPhase(
+          sessionId,
+          turnId,
+          addMessage,
+          signal,
+          frozenStandards.checkerCommandIds,
+        );
+        if ((settings.verifyEnabled || frozenStandards.checkerCommandIds.length > 0) && !signal?.aborted) {
           durable.recorder?.recordVerification(
             failure?.label ?? 'Workspace verification',
             failure === null,
             failure === null
-              ? 'Configured verification completed without a reported failure.'
+              ? 'Configured and Standards-required verification completed without a reported failure.'
               : `Exit ${failure.code ?? 'timeout'}: ${failure.output}`,
             Date.now() - verificationStartedAt,
           );
         }
-        // A command failed and there's a feed-back round left to spend —
-        // append one fix instruction and send the loop around again instead
-        // of returning. `mutatedFiles` is cleared so only edits made in
-        // response to *this* failure trigger the next verification pass;
-        // `signal?.aborted` is re-checked since `runVerificationPhase` can
-        // return early (rather than run every command) once Stop fires
-        // mid-phase — see its doc comment.
         if (failure !== null && !signal?.aborted && shouldFeedBackVerifyFailure(failure, verifyRound, settings.verifyMaxRounds)) {
           verifyRound += 1;
           mutatedFiles.clear();
+          verificationRecheckPending = true;
           addMessage({
             role: 'system',
-            content: `${VERIFY_FIX_NOTE_PREFIX} The verification command "${failure.label}" failed (exit ${failure.code ?? 'timeout'}). Fix the reported problems, then stop.\n${failure.output}`,
+            content: `${VERIFY_FIX_NOTE_PREFIX} The verification command "${failure.label}" failed (exit ${failure.code ?? 'timeout'}). Fix the reported problems, then stop.
+${failure.output}`,
           });
           continue;
+        }
+        if (failure?.required && !signal?.aborted) {
+          const failureMessage = `Completion blocked: required Standards verification "${failure.label}" did not pass (exit ${failure.code ?? 'unavailable'}). ${failure.output}`;
+          durable.failure = failureMessage;
+          updateLastMessage({ content: failureMessage });
+          return;
         }
       }
       return;
@@ -3655,7 +3838,7 @@ async function runAgentTurnBody(
       const toolMessage: ChatMessage = {
         role: 'tool',
         tool_call_id: toolCall.id,
-        content: modelResultContent,
+        content: computerScreenshotContent(toolCall.function.name, resultContent) ?? modelResultContent,
       };
       addMessage(toolMessage);
 

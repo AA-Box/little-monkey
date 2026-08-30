@@ -1,0 +1,219 @@
+name: Mattermost installed-service E2E
+
+on:
+  pull_request:
+    paths:
+      - "src-tauri/examples/mattermost_installed_service_e2e.rs"
+      - "src-tauri/src/bin/monkey-cli/daemon/adapters/mattermost.rs"
+      - "src-tauri/src/bin/monkey-cli/daemon/**"
+      - "src-tauri/src/bin/monkey-cli/channels_cli.rs"
+      - ".github/workflows/mattermost-installed-service-e2e.yml"
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mattermost-installed-service-e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  acceptance:
+    name: official server -> installed daemon -> agent -> second user
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: mmuser
+          POSTGRES_PASSWORD: mm-e2e-password
+          POSTGRES_DB: mattermost
+        options: >-
+          --health-cmd="pg_isready -U mmuser -d mattermost"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+      mattermost:
+        image: mattermost/mattermost-team-edition:11.7.0
+        env:
+          MM_SQLSETTINGS_DRIVERNAME: postgres
+          MM_SQLSETTINGS_DATASOURCE: postgres://mmuser:mm-e2e-password@postgres:5432/mattermost?sslmode=disable&connect_timeout=10
+          MM_SERVICESETTINGS_SITEURL: http://localhost:8065
+          MM_TEAMSETTINGS_ENABLEOPENSERVER: "true"
+          MM_LOGSETTINGS_CONSOLELEVEL: INFO
+        ports:
+          - 8065:8065
+
+    env:
+      LITTLE_MONKEY_REQUIRE_MATTERMOST_INSTALLED_SERVICE_E2E: "1"
+      MM_E2E_BASE_URL: http://localhost:8065
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native service and keyring dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            build-essential dbus dbus-user-session dbus-x11 gnome-keyring \
+            libdbus-1-dev jq
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri
+          key: mattermost-installed-service
+
+      - name: Wait for the official Mattermost server
+        shell: bash
+        run: |
+          set -euo pipefail
+          ready=0
+          for _ in $(seq 1 120); do
+            if curl --fail --silent http://localhost:8065/api/v4/system/ping >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "Mattermost did not become ready" >&2
+            exit 1
+          fi
+
+      - name: Create two real Mattermost users, team and channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=http://localhost:8065
+          bot_password='LmBot-E2E-2026!strong'
+          user_password='LmUser-E2E-2026!strong'
+
+          bot_json="$(curl --fail --silent --show-error \
+            -H 'Content-Type: application/json' \
+            -d "{\"email\":\"lm-bot-e2e@example.invalid\",\"username\":\"lmbote2e\",\"password\":\"$bot_password\"}" \
+            "$base/api/v4/users")"
+          user_json="$(curl --fail --silent --show-error \
+            -H 'Content-Type: application/json' \
+            -d "{\"email\":\"lm-user-e2e@example.invalid\",\"username\":\"lmusere2e\",\"password\":\"$user_password\"}" \
+            "$base/api/v4/users")"
+          bot_id="$(jq -r .id <<<"$bot_json")"
+          user_id="$(jq -r .id <<<"$user_json")"
+          test -n "$bot_id" -a "$bot_id" != null
+          test -n "$user_id" -a "$user_id" != null
+
+          bot_headers="$(mktemp)"
+          curl --fail --silent --show-error -D "$bot_headers" -o /dev/null \
+            -H 'Content-Type: application/json' \
+            -d "{\"login_id\":\"lmbote2e\",\"password\":\"$bot_password\"}" \
+            "$base/api/v4/users/login"
+          bot_token="$(awk 'BEGIN{IGNORECASE=1} /^Token:/ {gsub("\r", "", $2); print $2}' "$bot_headers" | tail -1)"
+
+          user_headers="$(mktemp)"
+          curl --fail --silent --show-error -D "$user_headers" -o /dev/null \
+            -H 'Content-Type: application/json' \
+            -d "{\"login_id\":\"lmusere2e\",\"password\":\"$user_password\"}" \
+            "$base/api/v4/users/login"
+          user_token="$(awk 'BEGIN{IGNORECASE=1} /^Token:/ {gsub("\r", "", $2); print $2}' "$user_headers" | tail -1)"
+          test -n "$bot_token"
+          test -n "$user_token"
+
+          team_json="$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer $bot_token" \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"little-monkey-e2e","display_name":"Little Monkey E2E","type":"O"}' \
+            "$base/api/v4/teams")"
+          team_id="$(jq -r .id <<<"$team_json")"
+          test -n "$team_id" -a "$team_id" != null
+
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $bot_token" \
+            -H 'Content-Type: application/json' \
+            -d "{\"team_id\":\"$team_id\",\"user_id\":\"$user_id\"}" \
+            "$base/api/v4/teams/$team_id/members" >/dev/null
+
+          channel_json="$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer $bot_token" \
+            -H 'Content-Type: application/json' \
+            -d "{\"team_id\":\"$team_id\",\"name\":\"agent-e2e\",\"display_name\":\"Agent E2E\",\"type\":\"O\"}" \
+            "$base/api/v4/channels")"
+          channel_id="$(jq -r .id <<<"$channel_json")"
+          test -n "$channel_id" -a "$channel_id" != null
+
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $bot_token" \
+            -H 'Content-Type: application/json' \
+            -d "{\"user_id\":\"$user_id\"}" \
+            "$base/api/v4/channels/$channel_id/members" >/dev/null
+
+          # Mask disposable credentials anyway: public CI logs should never
+          # teach a habit of printing bearer tokens.
+          echo "::add-mask::$bot_token"
+          echo "::add-mask::$user_token"
+          echo "MM_E2E_BOT_TOKEN=$bot_token" >> "$GITHUB_ENV"
+          echo "MM_E2E_EXTERNAL_TOKEN=$user_token" >> "$GITHUB_ENV"
+          echo "MM_E2E_CHANNEL_ID=$channel_id" >> "$GITHUB_ENV"
+
+      - name: Build and pin real production CLI
+        run: |
+          cargo clean --manifest-path src-tauri/Cargo.toml -p little-monkey
+          node scripts/ensure-cli-sidecar-placeholder.mjs
+          cargo build --locked --manifest-path src-tauri/Cargo.toml --bin monkey-cli
+          node scripts/ensure-cli-sidecar-placeholder.mjs
+
+      - name: Start real systemd user manager and Secret Service
+        shell: bash
+        run: |
+          set -euo pipefail
+          uid="$(id -u)"
+          runtime="/run/user/$uid"
+
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@${uid}.service"
+          ready=0
+          for _ in $(seq 1 60); do
+            if [ -S "$runtime/bus" ]; then
+              ready=1
+              break
+            fi
+            sleep 0.5
+          done
+          test "$ready" -eq 1
+
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime/bus" >> "$GITHUB_ENV"
+          export XDG_RUNTIME_DIR="$runtime"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus"
+
+          eval "$(printf '\n' | gnome-keyring-daemon --unlock --replace --components=secrets)"
+          found=0
+          for _ in $(seq 1 30); do
+            if busctl --user --no-pager list --acquired | grep -q 'org.freedesktop.secrets'; then
+              found=1
+              break
+            fi
+            sleep 0.25
+          done
+          test "$found" -eq 1
+          systemctl --user import-environment HOME PATH XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+
+      - name: Compile the black-box harness
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --example mattermost_installed_service_e2e
+
+      - name: Run literal Mattermost installed-service acceptance
+        run: >-
+          cargo run --locked --manifest-path src-tauri/Cargo.toml
+          --example mattermost_installed_service_e2e
+
+      - name: Dump service diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          systemctl --user --no-pager --full status || true
+          systemctl --user --no-pager --full list-units 'little-monkey-daemon*' || true
+          sudo systemctl --no-pager --full status "user@$(id -u).service" || true

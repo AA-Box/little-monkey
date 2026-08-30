@@ -71,6 +71,7 @@ import {
   type ProviderSettingsTab,
 } from "./providerSettingsNavigation";
 import { RulesMemoryPanel } from "./RulesMemoryPanel";
+import { StandardsStudioPanel } from "./StandardsStudioPanel";
 import { MemoryStudioPanel } from "./MemoryStudioPanel";
 import { ConnectorsPanel } from "./ConnectorsPanel";
 import { PromptLibraryPanel } from "./PromptLibraryPanel";
@@ -99,6 +100,7 @@ import { UpdatesPanel } from "./UpdatesPanel";
 import { PrivacyFirewallPanel } from "./PrivacyFirewallPanel";
 import { DesktopControlPanel } from "./DesktopControlPanel";
 import { DiagnosticsPanel } from "./DiagnosticsPanel";
+import { ExecutionTargetsPanel } from "./ExecutionTargetsPanel";
 import { AppearancePanel } from "./AppearancePanel";
 import { ProfilesPanel } from "./ProfilesPanel";
 import { TeamModePanel } from "./TeamModePanel";
@@ -121,7 +123,7 @@ interface SettingsModalProps {
   initialTabRequest?: number;
 }
 
-type StaticSettingsTab = "local" | "ollama" | "providers" | "automation" | "rules" | "memorystudio" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "extensions" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "channels" | "telephony" | "peers" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "profiles" | "approvalchains" | "localapps" | "comparelab" | "resources" | "updates";
+type StaticSettingsTab = "local" | "ollama" | "providers" | "automation" | "rules" | "standards" | "memorystudio" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "extensions" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "channels" | "telephony" | "peers" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "profiles" | "approvalchains" | "localapps" | "comparelab" | "resources" | "updates" | "execution";
 export type SettingsTab = StaticSettingsTab | ProviderSettingsTab;
 
 const ICONS: Record<StaticSettingsTab, LucideIcon> = {
@@ -131,6 +133,7 @@ const ICONS: Record<StaticSettingsTab, LucideIcon> = {
   knowledge: BookOpen,
   automation: Zap,
   rules: ScrollText,
+  standards: ShieldCheck,
   memorystudio: Brain,
   connectors: PlugZap,
   prompts: MessageSquare,
@@ -162,13 +165,14 @@ const ICONS: Record<StaticSettingsTab, LucideIcon> = {
   comparelab: FlaskConical,
   resources: Gauge,
   updates: RefreshCw,
+  execution: Server,
 };
 
 const GROUPS: { labelKey: string; ids: StaticSettingsTab[] }[] = [
   { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "updates", "security", "privacy", "diagnostics", "approvalchains", "profiles", "team", "companion", "desktopcontrol", "shortcuts", "usage", "resources", "portability"] },
   { labelKey: "SettingsModal.groupModels", ids: ["runtimehub", "local", "ollama", "providers", "comparelab"] },
-  { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "memorystudio", "tasks", "localapps"] },
-  { labelKey: "SettingsModal.groupIntegrations", ids: ["extensions", "ecosystem", "browser", "gitdelivery", "triage", "background", "connectors", "channels", "telephony", "peers", "prompts", "apiserver"] },
+  { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "standards", "memorystudio", "tasks", "localapps"] },
+  { labelKey: "SettingsModal.groupIntegrations", ids: ["extensions", "ecosystem", "browser", "gitdelivery", "triage", "background", "execution", "connectors", "channels", "telephony", "peers", "prompts", "apiserver"] },
 ];
 
 const LABEL_KEYS: Record<StaticSettingsTab, string> = {
@@ -178,6 +182,9 @@ const LABEL_KEYS: Record<StaticSettingsTab, string> = {
   knowledge: "SettingsModal.tabKnowledge",
   automation: "SettingsModal.tabAutomation",
   rules: "SettingsModal.tabRules",
+  // Until the translation bundles gain this new product term, the nav uses
+  // the literal label below rather than showing a raw missing i18n key.
+  standards: "SettingsModal.tabRules",
   memorystudio: "SettingsModal.tabMemoryStudio",
   connectors: "SettingsModal.tabConnectors",
   prompts: "SettingsModal.tabPrompts",
@@ -209,6 +216,7 @@ const LABEL_KEYS: Record<StaticSettingsTab, string> = {
   comparelab: "SettingsModal.tabCompareLab",
   resources: "SettingsModal.tabResourceLedger",
   updates: "SettingsModal.tabUpdates",
+  execution: "SettingsModal.tabExecutionTargets",
 };
 
 const FOCUSABLE_SELECTOR = [
@@ -261,6 +269,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
   const selectedProvider = selectedProviderId
     ? providers.find((provider) => provider.id === selectedProviderId && provider.has_key)
     : undefined;
+  const staticLabel = (id: StaticSettingsTab) => id === "standards" ? "Standards Studio" : t(LABEL_KEYS[id]);
 
   // Connected providers get their own model-selection entry immediately
   // before the always-available provider configuration tab. This is derived
@@ -282,7 +291,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
           })),
         );
       }
-      items.push({ id, label: t(LABEL_KEYS[id]), icon: ICONS[id] });
+      items.push({ id, label: staticLabel(id), icon: ICONS[id] });
       return items;
     }),
   }))
@@ -295,7 +304,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
   const activeLabel =
     selectedProvider?.label ??
     navGroups.flatMap((group) => group.items).find((item) => item.id === tab)?.label ??
-    t(LABEL_KEYS[selectedProviderId ? "providers" : tab as StaticSettingsTab]);
+    (selectedProviderId ? t(LABEL_KEYS.providers) : staticLabel(tab as StaticSettingsTab));
 
   useEffect(() => {
     if (!open) return;
@@ -446,7 +455,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
 
           <div className="relative min-h-0 flex-1">
             <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-4 bg-gradient-to-b from-background to-transparent" />
-            <div className="h-full overflow-y-auto px-6 pb-6 pt-4 [overscroll-behavior:contain]">
+            <div className="settings-controls h-full overflow-y-auto px-6 pb-6 pt-4 [overscroll-behavior:contain]">
               {tab === "local" && <ModelManager />}
               {tab === "ollama" && <OllamaPanel />}
               {selectedProvider && (
@@ -471,6 +480,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
                 </Suspense>
               )}
               {tab === "rules" && <RulesMemoryPanel />}
+              {tab === "standards" && <StandardsStudioPanel />}
               {tab === "memorystudio" && <MemoryStudioPanel />}
               {tab === "connectors" && <ConnectorsPanel />}
               {tab === "prompts" && <PromptLibraryPanel />}
@@ -502,6 +512,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "profiles" && <ProfilesPanel />}
               {tab === "comparelab" && <CompareLabPanel />}
               {tab === "resources" && <ResourceLedgerPanel />}
+              {tab === "execution" && <ExecutionTargetsPanel />}
             </div>
           </div>
         </div>

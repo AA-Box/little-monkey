@@ -315,13 +315,39 @@ therefore **not** claimed as verified here.
   never on a command line or in a stored error, a failing tunnel client's own
   words reach the operator, the public base survives a restart, and a spoofed
   `X-Forwarded-*` cannot move the URL a carrier signature is verified against.
+- The credential boundary between the two programs that share one: you paste a
+  token into Settings, the desktop hands it to the bundled CLI on stdin, and
+  the **installed** background service — a launchd agent, a systemd `--user`
+  unit or a Scheduled Task — reads it back and builds the account's adapter
+  from it. Run against a real installed service on macOS, Windows and Linux.
+  The writing program is the point rather than an implementation detail: macOS
+  returns a keychain item only to the executable that created it and puts a
+  confirmation dialog in front of anybody else, which a background service has
+  nobody to answer, so the credential is written by the same binary the daemon
+  runs. Two programs share one credential and only one of them ever writes
+  it, so the item stays scoped to a single executable rather than being opened
+  up to anything running as you.
 
 ### Needs your own account, hardware or exposure to verify
 
 These have production code and protocol-level tests; what has not happened is a
-run against the real service. `cargo test --bin monkey-cli -- daemon::live_smoke`
-is the opt-in harness — it reads credentials from the environment, passes
-silently when they are absent, and never bundles or defaults one.
+run against the real service. Two opt-in harnesses exist, both reading
+credentials from the environment, both passing silently when they are absent,
+and neither bundling or defaulting one:
+
+- `cargo test --bin monkey-cli -- daemon::live_smoke` proves a real account's
+  outbound transport, through the same outbox path every reply takes.
+- `cargo test --bin monkey-cli -- daemon::live_agent_e2e` proves the whole
+  path: a message you send to your own account becomes a durable turn, a real
+  daemon run and a real agent reply, and the provider is then asked over its
+  own API whether it holds that reply. Telegram, Discord and Slack today; the
+  provider-independent middle is shared, so a further provider supplies only
+  its account, its credential and how to read the reply back.
+
+Signal, Mattermost, IRC and iMessage additionally have their own live round
+trips (`a_live_signal_round_trip` and its siblings), which prove a real
+helper or server connection and a real outbound send — not an inbound message
+from somebody else, and not the agent.
 
 - Any provider against a real account: that the live service behaves as the
   adapter expects, and that your token has the scopes it needs.
@@ -337,5 +363,16 @@ silently when they are absent, and never bundles or defaults one.
   through your provider, and background behaviour.
 - `signal-cli` and the iMessage helper against a registered account and a real
   Messages database, including macOS Full Disk Access.
+- How narrowly macOS scopes that keychain item, and that the scope survives an
+  app update. CI runs the path itself against a real launchd service, but with
+  unsigned development binaries, whose keychain items are not scoped the way a
+  signed build's are — that half is a property of the identity your release is
+  signed with. The acceptance run on your own machine: install the release
+  build, add a channel and paste its token, start the daemon from Settings, and
+  confirm the account leaves `disconnected` on its own with no keychain prompt
+  — then install an update and confirm it still does. If a prompt ever appears,
+  answering it once with **Always Allow** is enough, and
+  `monkey channels probe <account>` from a terminal says whether the credential
+  can be read at all.
 - Two installations paired as peers over a real network and a real TLS identity.
 - Microphone and speaker behaviour for Talk on your own hardware.

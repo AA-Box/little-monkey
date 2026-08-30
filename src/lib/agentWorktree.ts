@@ -20,10 +20,19 @@ export interface AgentWorktreeStatus {
   dirty: boolean;
   /** `git diff --stat` (plus untracked-file lines) — empty when clean. */
   diffstat: string;
+  changed_files: string[];
+  base_revision: string;
+  patch_digest: string;
 }
 
 export interface AgentWorktreeApplied {
   applied_files: string[];
+}
+
+export interface WorkspaceSnapshot {
+  id: string;
+  revision: string;
+  changed_files: string[];
 }
 
 export const agentWorktreeClient = {
@@ -36,4 +45,10 @@ export const agentWorktreeClient = {
   /** Applies the worktree's diff onto the primary workspace root. On
    * conflict the command errors and the worktree is left in place. */
   apply: (path: string) => invoke<AgentWorktreeApplied>("worktree_apply", { path }),
+  workspaceRevision: () => invoke<string>("worktree_workspace_revision"),
+  workspaceSnapshot: () => invoke<WorkspaceSnapshot>("worktree_workspace_snapshot"),
+  workspaceChangedFilesSinceSnapshot: (snapshotId: string) => invoke<string[]>("worktree_workspace_changed_files_since_snapshot", { snapshotId }),
+  workspaceRestorePaths: (snapshotId: string, paths: string[]) => invoke<void>("worktree_workspace_restore_paths", { snapshotId, paths }),
+  workspaceSnapshotDiscard: (snapshotId: string) => invoke<void>("worktree_workspace_snapshot_discard", { snapshotId }),
+  workspaceChangedFiles: async () => (await invoke<Array<{ path: string }>>("git_changed_files")).map((file) => file.path),
 };

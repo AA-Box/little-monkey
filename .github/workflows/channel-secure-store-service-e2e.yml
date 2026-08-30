@@ -1,0 +1,229 @@
+name: Channel secure-store native service E2E
+
+on:
+  pull_request:
+    paths:
+      - "src-tauri/src/channels/**"
+      - "src-tauri/src/daemon_commands.rs"
+      - "src-tauri/src/bin/monkey-cli/channels_cli.rs"
+      - "src-tauri/src/bin/monkey-cli/daemon/**"
+      - "src-tauri/examples/channel_secure_store_service_e2e.rs"
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+      - ".github/workflows/channel-secure-store-service-e2e.yml"
+  push:
+    branches: [main, develop]
+    paths:
+      - "src-tauri/src/channels/**"
+      - "src-tauri/src/daemon_commands.rs"
+      - "src-tauri/src/bin/monkey-cli/channels_cli.rs"
+      - "src-tauri/src/bin/monkey-cli/daemon/**"
+      - "src-tauri/examples/channel_secure_store_service_e2e.rs"
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+      - ".github/workflows/channel-secure-store-service-e2e.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: channel-secure-store-service-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  LITTLE_MONKEY_REQUIRE_CHANNEL_SECURE_STORE_SERVICE_E2E: "1"
+
+jobs:
+  # macOS admits a Keychain item to the binary that created it and asks a person
+  # about any other, which is a question a background LaunchAgent has nobody to
+  # answer — this job used to be absent for exactly that reason. The desktop no
+  # longer writes the credential itself: `channels_set_credential` hands it to
+  # the bundled `monkey-cli` on stdin, and the resident service is that same
+  # executable, so the service's read is a same-program read that never reaches
+  # a dialog. Granting a *foreign* binary that access unattended was tried
+  # first and rejected twice — `set-generic-password-partition-list` locked out
+  # even the writing binary, and `security add-generic-password -A` blocks every
+  # keyring reader and would be far too broad regardless.
+  #
+  # What this job proves is the production path: credential written by the CLI,
+  # read by the installed launchd service, adapter built from it. It does not
+  # prove how narrow the item's access list is — a runner builds unsigned, and
+  # an unsigned binary's items are not scoped the way a Developer ID app's are.
+  # That property belongs to a signed build, and is an acceptance step in
+  # docs/messaging-devices-and-phones.md rather than something CI can claim.
+  macos:
+    name: native service (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    runs-on: ${{ matrix.os }}
+    # A native credential prompt or a service that will not stop must fail this
+    # job, not sit on a runner for the six-hour default.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri
+          key: channel-secure-store-${{ matrix.os }}
+
+      - name: Build and pin real production CLI
+        run: |
+          cargo clean --manifest-path src-tauri/Cargo.toml -p little-monkey
+          node scripts/ensure-cli-sidecar-placeholder.mjs
+          cargo build --manifest-path src-tauri/Cargo.toml --bin monkey-cli
+          node scripts/ensure-cli-sidecar-placeholder.mjs
+
+      - name: Native credential -> installed service -> Telegram worker
+        run: >-
+          cargo run --manifest-path src-tauri/Cargo.toml
+          --example channel_secure_store_service_e2e -- desktop
+
+  windows:
+    name: native service (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest]
+    runs-on: ${{ matrix.os }}
+    # A native credential prompt or a service that will not stop must fail this
+    # job, not sit on a runner for the six-hour default.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri
+          key: channel-secure-store-${{ matrix.os }}
+
+      # tauri-build checks/copies the externalBin during every build of this
+      # package. A cache-restored little-monkey fingerprint can otherwise let
+      # that zero-byte bootstrap placeholder become target/debug/monkey-cli
+      # without Cargo relinking the real CLI. Clean only this package (keeping
+      # dependency cache), build it fresh, then stage the real binary so later
+      # example builds can only copy valid executable bytes back onto the CLI.
+      - name: Build and pin real production CLI
+        run: |
+          cargo clean --manifest-path src-tauri/Cargo.toml -p little-monkey
+          node scripts/ensure-cli-sidecar-placeholder.mjs
+          cargo build --manifest-path src-tauri/Cargo.toml --bin monkey-cli
+          node scripts/ensure-cli-sidecar-placeholder.mjs
+
+      - name: Native credential -> installed service -> Telegram worker
+        run: >-
+          cargo run --manifest-path src-tauri/Cargo.toml
+          --example channel_secure_store_service_e2e -- desktop
+
+  linux:
+    name: native service (ubuntu-22.04)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native desktop/service dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            build-essential dbus dbus-user-session dbus-x11 gnome-keyring \
+            libdbus-1-dev
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri
+          key: channel-secure-store-ubuntu
+
+      - name: Build and pin real production CLI
+        run: |
+          cargo clean --manifest-path src-tauri/Cargo.toml -p little-monkey
+          node scripts/ensure-cli-sidecar-placeholder.mjs
+          cargo build --manifest-path src-tauri/Cargo.toml --bin monkey-cli
+          node scripts/ensure-cli-sidecar-placeholder.mjs
+
+      # A nested `systemd --user` cannot allocate a cgroup inside GitHub's
+      # hosted-compute-agent.service. Start the runner account's genuine
+      # user@UID.service through PID 1 instead. This gives systemctl --user the
+      # same manager and canonical /run/user/UID/bus that a normal login owns.
+      - name: Start real systemd user manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          uid="$(id -u)"
+          runtime="/run/user/$uid"
+
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@${uid}.service"
+
+          ready=0
+          for _ in $(seq 1 60); do
+            if [ -S "$runtime/bus" ]; then
+              ready=1
+              break
+            fi
+            sleep 0.5
+          done
+          if [ "$ready" -ne 1 ]; then
+            sudo systemctl --no-pager --full status "user@${uid}.service" || true
+            exit 1
+          fi
+
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime/bus" >> "$GITHUB_ENV"
+          export XDG_RUNTIME_DIR="$runtime"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus"
+
+          systemctl --user show-environment >/dev/null
+          systemctl --user import-environment HOME PATH XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+
+      # Desktop case: prove the writer and systemd-launched daemon agree while
+      # org.freedesktop.secrets is really present on the canonical user bus.
+      - name: Secret Service desktop round-trip through real systemd service
+        shell: bash
+        run: |
+          set -euo pipefail
+          eval "$(printf '\n' | gnome-keyring-daemon --unlock --replace --components=secrets)"
+          found=0
+          for _ in $(seq 1 30); do
+            if busctl --user --no-pager list --acquired | grep -q 'org.freedesktop.secrets'; then
+              found=1
+              break
+            fi
+            sleep 0.25
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "Secret Service did not register on the user bus" >&2
+            busctl --user --no-pager list --acquired || true
+            exit 1
+          fi
+          cargo run --manifest-path src-tauri/Cargo.toml \
+            --example channel_secure_store_service_e2e -- desktop
+
+      # Existing full Telegram pipeline acceptance: production adapter/daemon/
+      # agent/outbox code with deterministic provider and model endpoints.
+      - name: Telegram inbound -> agent run -> outbound reply
+        shell: bash
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --bin monkey-cli \
+            daemon::channel_agent_e2e::a_telegram_message_becomes_an_agent_reply_end_to_end \
+            -- --exact --nocapture --test-threads=1
+
+      - name: Dump systemd diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          systemctl --user --no-pager --full status || true
+          systemctl --user --no-pager --full list-units 'little-monkey-daemon*' || true
+          sudo systemctl --no-pager --full status "user@$(id -u).service" || true

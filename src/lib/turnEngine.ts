@@ -48,9 +48,20 @@ import { usePermissionStore } from '../store/permissionStore';
 import { runSubagentTask } from './subagent';
 import { resolveWorkflowSpec, runWorkflow } from './workflow';
 import { protocolToolCallId } from './durableRun';
-import { formatSkillToolResult, type SlashSkill } from './skills';
+import { formatSkillSearchResults, formatSkillToolResult, type SkillRankingSignals, type SlashSkill } from './skills';
 import { rasterizeSvgToPng, type RasterizedPng } from './imageGeneration';
 import { errorMessage } from "./errors";
+import {
+  ComputerUseRunBudget,
+  CoordinatedInvocationError,
+  CoordinatedRetryableError,
+  computerUseFailure,
+  coordinateToolInvocation,
+  INPUT_SENT_UNVERIFIED,
+  parseComputerUseFailure,
+  runCoordinatedInvocation,
+  type ComputerUseFailure,
+} from './taskCoordinator';
 import {
   formatProgrammaticExecutionResult,
   PROGRAMMATIC_TOOL_NAME,
@@ -65,6 +76,8 @@ export interface ToolExecutionContext {
   isToolAvailable?: (toolName: string) => boolean;
   /** Shared completion lifecycle for direct and nested calls. */
   onCompleted?: (toolCall: ToolCall, result: string) => void | Promise<void>;
+  /** Shared run-wide native Computer Use counters and deadline. */
+  computerUseBudget?: ComputerUseRunBudget;
 }
 
 /** The canonical execution identity shared by run_program and its recorder. */
@@ -227,6 +240,53 @@ export function stringifyToolError(err: unknown): string {
   return JSON.stringify({ error: message });
 }
 
+/** Normalizes a native invoke rejection without ever turning an unknown
+ * transport failure into evidence that no input reached the OS. Rust action
+ * commands reject with the same five-field failure object; plain IPC errors
+ * become terminal/ambiguous here. */
+function stringifyComputerUseError(err: unknown): string {
+  const failure = parseComputerUseFailure(err);
+  return JSON.stringify({ error: failure });
+}
+
+function nativeFailureFromResult(result: string): ComputerUseFailure | null {
+  try {
+    const parsed: unknown = JSON.parse(result);
+    if (!parsed || typeof parsed !== 'object') return null;
+    const record = parsed as Record<string, unknown>;
+    if (record.error !== undefined) {
+      return parseComputerUseFailure(record.error);
+    }
+    if (record.failure !== undefined) {
+      return parseComputerUseFailure(record.failure);
+    }
+  } catch {
+    // A malformed native result is an unknown execution outcome.
+  }
+  return null;
+}
+
+function throwForNativeFailure(result: string): void {
+  const failure = nativeFailureFromResult(result);
+  if (!failure) return;
+  if (failure.safeToRetry === true && failure.inputSent === false) {
+    throw new CoordinatedRetryableError(failure);
+  }
+  throw new CoordinatedInvocationError(failure);
+}
+
+function parseNativeObservation(result: string): unknown {
+  throwForNativeFailure(result);
+  try {
+    return JSON.parse(result);
+  } catch {
+    throw new CoordinatedInvocationError(computerUseFailure(
+      'Native observation returned malformed data',
+      { code: 'UNKNOWN', inputSent: true, safeToRetry: false, phase: 'observe' },
+    ));
+  }
+}
+
 /** The tool-message content used for a call the user's Stop button cancelled
  * (either mid-execution, or before it ever started). A result message is
  * still recorded for every requested call so the persisted transcript never
@@ -345,7 +405,29 @@ const MUTATING_TOOLS = RISK_ELIGIBLE_TOOLS;
 /** Tools whose calls are permission-gated and therefore need `turn_id`, so
  * Rust can scope a permission prompt (and, for run_shell/web_fetch, Stop-button
  * cancellation) to the right in-flight turn. */
-const PERMISSION_GATED_TOOLS = new Set([...MUTATING_TOOLS, 'remember', 'web_fetch', 'web_search']);
+const COMPUTER_TOOL_NAMES = new Set([
+  'computer_list_targets',
+  'computer_screenshot',
+  'computer_clipboard_read',
+  'computer_inspect',
+  'computer_focus',
+  'computer_click',
+  'computer_double_click',
+  'computer_scroll',
+  'computer_type',
+  'computer_key',
+  'computer_hotkey',
+  'computer_wait',
+  'computer_select',
+  'computer_set_value',
+]);
+const PERMISSION_GATED_TOOLS = new Set([
+  ...MUTATING_TOOLS,
+  'remember',
+  'web_fetch',
+  'web_search',
+  ...COMPUTER_TOOL_NAMES,
+]);
 
 /**
  * Whether Plan Mode refuses `name` outright: every permission-gated tool
@@ -403,6 +485,9 @@ interface ReservedArgContext {
   workspaceRootOverride?: string;
   /** This turn's durable run id — see the `run_id` entry in `RESERVED_ARGS`. */
   learningRunId?: string;
+  /** Immutable native-skill provenance injected into a resource read after
+   * the corresponding skill was invoked. Model-supplied values are scrubbed. */
+  skillResourceSnapshot?: { sha256: string; sourcePath: string };
 }
 
 /** The tools whose path/cwd resolution honours a worktree override — the
@@ -482,11 +567,16 @@ const RESERVED_ARGS: ReadonlyArray<{ key: string; resolve: (ctx: ReservedArgCont
   // the reflection turn to a candidate's evidence — the runs a candidate is
   // founded on were written by the backend when it detected the signal.
   { key: 'run_id', resolve: (ctx) => (ctx.name === 'manage_skill_learning' ? ctx.learningRunId : undefined) },
+  // Binds a native resource read to the exact skill snapshot that was
+  // invoked this turn. The model can provide neither the hash nor the path.
+  { key: 'expected_sha256', resolve: (ctx) => (ctx.name === 'read_skill_resource' ? ctx.skillResourceSnapshot?.sha256 : undefined) },
+  { key: 'expected_source_path', resolve: (ctx) => (ctx.name === 'read_skill_resource' ? ctx.skillResourceSnapshot?.sourcePath : undefined) },
 ];
 
 function scrubReservedArgs(args: Record<string, unknown>): void {
   for (const { key } of RESERVED_ARGS) {
     delete args[key];
+    delete args[key.replace(/_([a-z])/g, (_match, letter: string) => letter.toUpperCase())];
   }
 }
 
@@ -614,16 +704,31 @@ export interface SkillToolContext {
    * rejected with a tool error rather than silently re-returning the same
    * instructions again. */
   invokedCommands: Set<string>;
+  /** Exact native skill provenance for commands invoked this turn. Resource
+   * reads use this map to prevent a mutable folder from being re-resolved at
+   * a different hash or source after discovery. */
+  invokedSkillSnapshots?: Map<string, { sha256: string; sourcePath: string }>;
+  /** Optional in-memory resource snapshots used by isolated evaluation arms;
+   * ordinary turns leave this unset and read through the native runtime. */
+  resourceSnapshots?: ReadonlyMap<string, ReadonlyMap<string, string>>;
+  /** Commands the user explicitly selected with `/command` this turn. These
+   * are the approval boundary for Ask and Manual skills. */
+  explicitCommands?: ReadonlySet<string>;
   /** Hard cap on total skills (explicit + model-invoked) per turn — mirrors
    * `skills.ts`'s `MAX_SKILLS_PER_TURN`, the same bound `parseSkillTurn`
    * already enforces for stacked explicit invocations. */
   maxSkillsPerTurn: number;
+  /** Shared deterministic ranking signals for the catalog and search tool. */
+  rankingSignals?: ReadonlyMap<string, SkillRankingSignals>;
   /** Called with each skill this turn actually invokes, at the moment the
    * invocation is recorded — the seam the durable `skill_invoked` event is
    * written from (see `agentLoop.ts`'s `recordSkillInvocation`). A callback
    * rather than a recorder handle for the same reason `onRoutingDecision` is:
    * this module never learns what a durable run is. */
   onInvoked?: (skill: SlashSkill) => void;
+  /** Ask-policy approval is a separate gate from normal tool permissions.
+   * Bypass mode must never satisfy it implicitly. */
+  requestApproval?: (skill: SlashSkill, signal?: AbortSignal) => Promise<boolean>;
   /** This turn's durable run id, injected as `manage_skill_learning`'s
    * `run_id` (see `RESERVED_ARGS`). Lives here rather than as a thirteenth
    * positional parameter because it is skill-adjacent bookkeeping and every
@@ -853,7 +958,13 @@ async function executeToolCallInner(
     riskClassification,
     workspaceRootOverride,
     learningRunId: skill?.runId,
+    skillResourceSnapshot: name === 'read_skill_resource' && typeof args.command === 'string'
+      ? skill?.invokedSkillSnapshots?.get(args.command.trim().replace(/^\//, '').toLowerCase())
+    : undefined,
   });
+
+  const coordination = coordinateToolInvocation(name, args);
+  if (coordination.error) return stringifyToolError(new Error(coordination.error));
 
   if (name === PROGRAMMATIC_TOOL_NAME) {
     if (!programmatic) {
@@ -1052,6 +1163,16 @@ async function executeToolCallInner(
       if (!matched) {
         return stringifyToolError(new Error(`No enabled skill named "/${command}".`));
       }
+      const policy = matched.activationPolicy ?? 'automatic';
+      if (!skill.explicitCommands?.has(command) && policy === 'manual') {
+        return stringifyToolError(new Error(`/${command} is Manual: it cannot be discovered or invoked implicitly. Ask the user to invoke /${command} explicitly.`));
+      }
+      if (!skill.explicitCommands?.has(command) && policy === 'ask') {
+        const approved = await skill.requestApproval?.(matched, signal) ?? false;
+        if (!approved || signal?.aborted) {
+          return stringifyToolError(new Error(`/${command} requires user approval before its instructions can load; the request was denied or cancelled.`));
+        }
+      }
       // Recorded BEFORE returning the result (not after) so a second call
       // for the same command later in this same batch of parallel tool
       // calls is still caught by the duplicate check above — `Promise.all`
@@ -1060,9 +1181,28 @@ async function executeToolCallInner(
       // synchronous bookkeeping (no `await` happens between the checks above
       // and this line).
       skill.invokedCommands.add(command);
+      if (matched.sourcePath) {
+        skill.invokedSkillSnapshots?.set(command, {
+          sha256: matched.contentSha256,
+          sourcePath: matched.sourcePath,
+        });
+      }
       skill.onInvoked?.(matched);
       const argumentsText = typeof args.arguments === 'string' ? args.arguments : '';
       return formatSkillToolResult(matched, argumentsText);
+    } catch (err) {
+      return stringifyToolError(err);
+    }
+  }
+
+  if (name === 'search_skills') {
+    try {
+      if (!skill) {
+        return stringifyToolError(new Error('The search_skills tool has no context configured for this turn.'));
+      }
+      const query = typeof args.query === 'string' ? args.query.trim() : '';
+      if (!query) return stringifyToolError(new Error('The search_skills tool requires a non-empty "query" argument.'));
+      return formatSkillSearchResults(skill.availableSkills, skill.invokedCommands, query, skill.rankingSignals);
     } catch (err) {
       return stringifyToolError(err);
     }
@@ -1084,6 +1224,17 @@ async function executeToolCallInner(
       return stringifyToolError(
         new Error(`/${command || '(missing)'} has not been invoked this turn — invoke it via the skill tool or /command first.`)
       );
+    }
+    if (!skill.invokedSkillSnapshots?.has(command)) {
+      const resources = skill.resourceSnapshots?.get(command);
+      if (!resources) {
+        return stringifyToolError(new Error(`/${command} has no immutable native-skill snapshot for this turn.`));
+      }
+      const path = typeof args.path === 'string' ? args.path : '';
+      const content = resources.get(path);
+      return content === undefined
+        ? stringifyToolError(new Error(`/${command} has no bundled resource at ${path || '(missing path)'}.`))
+        : content;
     }
   }
 
@@ -1171,23 +1322,109 @@ async function executeToolCallInner(
   const durableExtensionInvocationId = extensionBinding
     ? await extensionInvocationId(turnId, toolCall.id, extensionBinding)
     : undefined;
-  const invocation = name.startsWith('mcp__')
-    ? invokeMcpTool(name, args, turnId, protocolToolCallId(toolCall.id), mcpRegistry)
-    : name.startsWith('ext__')
-      ? invokeExecutableExtensionTool(
-          name,
-          args,
-          durableExtensionInvocationId ?? protocolToolCallId(`${turnId}:${toolCall.id}:${name}`),
-          extensionRegistry ?? new Map(),
-        )
-          .then((result) => result.tool_result ?? result.output_json, stringifyToolError)
-      : invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
-  return raceInvocationWithStop(
-    invocation,
-    turnId,
-    signal,
-    name.startsWith('ext__') ? durableExtensionInvocationId : undefined,
-  );
+  return runCoordinatedInvocation(coordination, {
+    budget: executionContext?.computerUseBudget,
+    onPhase: async (phase) => {
+      if (coordination.route !== 'native') return;
+      if (phase === 'authorize' && typeof args.session_id !== 'string') {
+        throw new CoordinatedInvocationError(computerUseFailure(
+          'Native Computer Use requires an active session grant.',
+          { code: 'SECURITY_REFUSED', inputSent: false, safeToRetry: false, phase: 'authorize' },
+        ));
+      }
+      if (phase === 'observe' && name !== 'computer_list_targets') {
+        const observation = await invoke('tool_computer_list_targets', {
+          session_id: args.session_id,
+          turn_id: turnId,
+          tool_call_id: protocolToolCallId(toolCall.id),
+        }).then(stringifyToolResult, stringifyComputerUseError);
+        parseNativeObservation(observation);
+      }
+      if (
+        phase === 'verify'
+        && name !== 'computer_list_targets'
+        && typeof args.target_application_id === 'string'
+      ) {
+        const observation = await invoke('tool_computer_inspect', {
+          session_id: args.session_id,
+          target_application_id: args.target_application_id,
+          target_window_id: args.target_window_id,
+          query: undefined,
+          turn_id: turnId,
+          tool_call_id: protocolToolCallId(toolCall.id),
+        }).then(stringifyToolResult, stringifyComputerUseError);
+        parseNativeObservation(observation);
+      }
+    },
+    execute: () => {
+      if (coordination.route === 'native' && executionContext?.computerUseBudget) {
+        const counter = name === 'computer_screenshot' ? 'screenshots' : 'actions';
+        if (!executionContext.computerUseBudget.consume(counter)) {
+          return JSON.stringify({ error: 'COMPUTER_USE_BUDGET_EXCEEDED', counter });
+        }
+      }
+      const invocation = name.startsWith('mcp__')
+        ? invokeMcpTool(name, args, turnId, protocolToolCallId(toolCall.id), mcpRegistry)
+        : name.startsWith('ext__')
+          ? invokeExecutableExtensionTool(
+              name,
+              args,
+              durableExtensionInvocationId ?? protocolToolCallId(`${turnId}:${toolCall.id}:${name}`),
+              extensionRegistry ?? new Map(),
+            )
+              .then((result) => result.tool_result ?? result.output_json, stringifyToolError)
+          : invoke(`tool_${name}`, args).then(
+            stringifyToolResult,
+            coordination.route === 'native' ? stringifyComputerUseError : stringifyToolError,
+          );
+      return raceInvocationWithStop(
+        invocation,
+        turnId,
+        signal,
+        name.startsWith('ext__') ? durableExtensionInvocationId : undefined,
+      );
+    },
+    verify: (result) => {
+      if (coordination.route !== 'native' || typeof result !== 'string') return true;
+      throwForNativeFailure(result);
+      try {
+        const parsed = JSON.parse(result) as {
+          error?: unknown;
+          executed?: boolean;
+          inputSent?: boolean;
+          stateVerified?: boolean;
+        };
+        if (parsed.executed === true && parsed.stateVerified === false && parsed.inputSent === true) {
+          throw new CoordinatedInvocationError(computerUseFailure(
+            `${INPUT_SENT_UNVERIFIED}: input was sent but the requested postcondition was not verified`,
+            { code: 'INPUT_SENT_UNVERIFIED', inputSent: true, safeToRetry: false, phase: 'verify' },
+          ));
+        }
+        if (parsed.error !== undefined) {
+          throw new CoordinatedInvocationError(parseComputerUseFailure(parsed.error));
+        }
+        if (parsed.executed === true && parsed.stateVerified === false) {
+          throw new CoordinatedInvocationError(computerUseFailure(
+            'Native action returned an unverified execution outcome',
+            { code: 'UNKNOWN', inputSent: true, safeToRetry: false, phase: 'verify' },
+          ));
+        }
+        return true;
+      } catch (error) {
+        if (error instanceof CoordinatedInvocationError || error instanceof CoordinatedRetryableError) throw error;
+        throw new CoordinatedInvocationError(parseComputerUseFailure(error));
+      }
+    },
+  }).catch((error) => {
+    if (coordination.route === 'native') {
+      return stringifyComputerUseError(
+        error instanceof CoordinatedInvocationError || error instanceof CoordinatedRetryableError
+          ? error.failure
+          : error,
+      );
+    }
+    return stringifyToolError(error);
+  });
 }
 
 /** Races an in-flight tool `invoke` against the Stop button: on abort, the

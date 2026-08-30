@@ -46,6 +46,24 @@ pub struct DesktopTurnSubmitResponse {
     pub job_id: String,
     pub run_id: String,
     pub state: String,
+    #[serde(default)]
+    pub rollback_owner: Option<recipes::AutonomousTaskOwnerSnapshot>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutonomousTaskSubmitRequest {
+    pub task_id: String,
+    pub recipe: Recipe,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutonomousTaskOwnerFenceRequest {
+    pub task_id: String,
+    pub owner: recipes::AutonomousTaskOwnerSnapshot,
 }
 
 fn validate_id(value: &str) -> Result<(), String> {
@@ -303,7 +321,7 @@ pub async fn m6a_desktop_turn_submit(
             .unwrap_or(30 * 60)
             .to_string(),
         "--branch-prefix".to_string(),
-        "codex/desktop/".to_string(),
+        "desktop/".to_string(),
         "--allow-commit".to_string(),
         "false".to_string(),
         "--json".to_string(),
@@ -320,6 +338,134 @@ pub async fn m6a_desktop_turn_submit(
         .map_err(|error| format!("Invalid desktop queue JSON: {error}"))?;
     serde_json::from_value(value)
         .map_err(|error| format!("Invalid desktop queue response: {error}"))
+}
+
+/// Moves a running desktop autonomous task to the same resident daemon queue
+/// used by the CLI. The recipe contains the frozen coordinator snapshot; the
+/// daemon never has to infer autonomy from a name or re-read desktop state.
+#[tauri::command]
+pub async fn autonomous_task_submit(
+    request: AutonomousTaskSubmitRequest,
+) -> Result<DesktopTurnSubmitResponse, String> {
+    named_id(&request.task_id, "autonomous task")?;
+    recipes::validate_recipe(&request.recipe)?;
+    let snapshot = request.recipe.autonomous_task.as_ref().ok_or_else(|| {
+        "Autonomous task submission requires an autonomous_task snapshot".to_string()
+    })?;
+    if snapshot.task_id != request.task_id {
+        return Err("Autonomous task id differs from its immutable recipe snapshot".to_string());
+    }
+    let owner = snapshot.execution_owner.as_ref().ok_or_else(|| {
+        "Autonomous task submission requires an execution owner lease".to_string()
+    })?;
+    let status_text = crate::daemon_commands::command(vec![
+        "daemon".to_string(),
+        "status".to_string(),
+        "--json".to_string(),
+    ])
+    .await?;
+    let status: Value = serde_json::from_str(status_text.trim())
+        .map_err(|error| format!("Invalid daemon status JSON: {error}"))?;
+    daemon_ready(&status)?;
+
+    let app_data = crate::app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve the Little Monkey data directory".to_string())?;
+    let path = app_data
+        .join("daemon")
+        .join("autonomous-submissions")
+        .join(format!("{}.json", request.task_id));
+    let bytes = serde_json::to_vec_pretty(&request.recipe).map_err(|error| error.to_string())?;
+    let published = publish_private_snapshot(&path, &bytes)?;
+    let output = crate::daemon_commands::command(vec![
+        "daemon".to_string(),
+        "run".to_string(),
+        path.to_string_lossy().into_owned(),
+        "--run-key".to_string(),
+        format!("autonomous-task:{}", request.task_id),
+        "--priority".to_string(),
+        "100".to_string(),
+        "--max-attempts".to_string(),
+        "1".to_string(),
+        "--max-runtime-seconds".to_string(),
+        request
+            .recipe
+            .timeout_seconds
+            .unwrap_or(30 * 60)
+            .to_string(),
+        "--initially-paused".to_string(),
+        "--json".to_string(),
+    ])
+    .await;
+    if published == Published::Created {
+        let _ = std::fs::remove_file(&path);
+    }
+    let value: Value = serde_json::from_str(output?.trim())
+        .map_err(|error| format!("Invalid autonomous queue JSON: {error}"))?;
+    let mut response: DesktopTurnSubmitResponse = serde_json::from_value(value)
+        .map_err(|error| format!("Invalid autonomous queue response: {error}"))?;
+    // Queueing is deliberately complete before ownership changes. The queued
+    // job is parked at the daemon's queue-only boundary; after this CAS there
+    // is no fallible activation step left that could strand a daemon-owned job
+    // while the desktop resumes it.
+    if let Some(previous) = snapshot.previous_execution_owner.as_ref() {
+        recipes::transfer_autonomous_task_owner(&snapshot.task_id, previous, owner)?;
+    } else {
+        recipes::claim_autonomous_task_owner(&snapshot.task_id, owner)?;
+    }
+    let activation = crate::daemon_commands::command(vec![
+        "daemon".to_string(),
+        "resume".to_string(),
+        response.run_id.clone(),
+    ])
+    .await;
+    if let Err(error) = activation {
+        let rollback = recipes::AutonomousTaskOwnerSnapshot {
+            kind: "desktop".to_string(),
+            instance_id: snapshot
+                .previous_execution_owner
+                .as_ref()
+                .map(|previous| previous.instance_id.clone())
+                .unwrap_or_else(|| format!("desktop-{}", snapshot.task_id)),
+            lease_epoch: owner.lease_epoch.saturating_add(1),
+            lease_expires_at_ms: owner.lease_expires_at_ms,
+        };
+        let _ = recipes::transfer_autonomous_task_owner(&snapshot.task_id, owner, &rollback);
+        response.state = "desktop_rollback".to_string();
+        response.rollback_owner = Some(rollback);
+        response.error = Some(format!(
+            "Could not activate parked autonomous daemon job: {error}"
+        ));
+        return Ok(response);
+    }
+    response.state = "queued".to_string();
+    Ok(response)
+}
+
+/// Fences every desktop-side mutation against the durable owner identity and
+/// epoch. A lease renewal may change only the expiry; a different owner or
+/// epoch is a hard stop, including for a stale in-flight tool call.
+#[tauri::command]
+pub fn autonomous_task_owner_fence(request: AutonomousTaskOwnerFenceRequest) -> Result<(), String> {
+    named_id(&request.task_id, "autonomous task")?;
+    if request.owner.kind != "desktop" || request.owner.lease_epoch == 0 {
+        return Err("Desktop side effects require a valid desktop execution owner".to_string());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("Could not read wall clock: {error}"))?
+        .as_millis() as u64;
+    if recipes::autonomous_task_owner_epoch_matches(&request.task_id, &request.owner)?.is_none() {
+        if request.owner.lease_epoch != 1 {
+            return Err("Autonomous task owner fence lost its durable owner epoch".to_string());
+        }
+        recipes::claim_autonomous_task_owner(&request.task_id, &request.owner)?;
+    }
+    let _ = recipes::renew_autonomous_task_owner(
+        &request.task_id,
+        &request.owner,
+        now.saturating_add(60_000),
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

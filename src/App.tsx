@@ -9,6 +9,7 @@ import { useExternalConversationStore } from "./store/externalConversationStore"
 import { StudioNav, type StudioMode } from "./components/Studio/StudioNav";
 import ChatWindow from "./components/Chat/ChatWindow";
 import { PrivacyFirewallGate } from "./components/Chat/PrivacyFirewallGate";
+import { SkillActivationApprovalModal } from "./components/Chat/SkillActivationApprovalModal";
 import { AppMenu } from "./components/AppMenu";
 import { UpdateCard } from "./components/Update";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -37,6 +38,7 @@ import { usePermissionStore } from "./store/permissionStore";
 import { useShortcutStore } from "./store/shortcutStore";
 import { useRecipeStore, subscribeToRecipeChanges } from "./store/recipeStore";
 import { subscribeToLocalAppsChanges, subscribeToLocalAppRunRequests } from "./store/localAppsStore";
+import { subscribeToNativeSkillChanges } from "./store/nativeSkillsStore";
 import { hydrateAutomations } from "./store/automationsStore";
 import { useOnboardingStore } from "./store/onboardingStore";
 import { startScheduler } from "./lib/scheduler";
@@ -67,6 +69,7 @@ import { studioClient } from "./lib/studioClient";
 import { SegmentedControl } from "./components/ui/SegmentedControl";
 import {
   AgentInbox,
+  AutonomousTaskPanel,
   ApiContractDiffLabPanel,
   ApprovalChainModal,
   ArtifactPane,
@@ -320,6 +323,7 @@ function App() {
   const browserWorkbenchOpen = activeFeaturePanel === "browser-workbench";
   const designToAppOpen = activeFeaturePanel === "design-to-app";
   const issueToPrOpen = activeFeaturePanel === "issue-to-pr";
+  const autonomousTaskOpen = activeFeaturePanel === "autonomous-task";
   const productionDebuggingOpen = activeFeaturePanel === "production-debugging";
   const incidentCommanderOpen = activeFeaturePanel === "incident-commander";
   const securityAutofixOpen = activeFeaturePanel === "security-autofix";
@@ -818,6 +822,10 @@ function App() {
     void subscribeToRecipeChanges();
   }, [refreshRecipes]);
 
+  useEffect(() => {
+    void subscribeToNativeSkillChanges();
+  }, []);
+
   // The scheduler tick loop (design doc slice 3) must run in exactly one
   // place — every window shares the same `automations.json`/recipes, so
   // running it in a secondary session window too (see
@@ -1062,6 +1070,7 @@ function App() {
           onOpenBrowserWorkbench={() => openFeaturePanel("browser-workbench")}
           onOpenCommandPalette={openCommandPalette}
           onOpenIssueToPr={() => openFeaturePanel("issue-to-pr")}
+          onOpenAutonomousTask={() => openFeaturePanel("autonomous-task")}
           onOpenDesignToApp={() => openFeaturePanel("design-to-app")}
           onOpenProductionDebugging={() => openFeaturePanel("production-debugging")}
           onOpenIncidentCommander={() => openFeaturePanel("incident-commander")}
@@ -1142,7 +1151,12 @@ function App() {
                 section === "studio" ? "flex min-h-0 flex-1 flex-col" : "hidden"
               }
             >
-              <StudioPanel mode={studioMode} railSlot={studioRail} />
+              <StudioPanel
+                mode={studioMode}
+                railSlot={studioRail}
+                onOpenModels={() => setStudioMode("models")}
+                onOpenTools={() => setStudioMode("tools")}
+              />
             </div>
             {section === "studio" ? null : globalSearchOpen ? (
               <GlobalSearch
@@ -1238,6 +1252,8 @@ function App() {
                   void useRunStore.getState().selectRun(runId);
                 }}
               />
+            ) : autonomousTaskOpen ? (
+              <AutonomousTaskPanel sessionId={activeSessionId} onClose={() => closeFeaturePanel("autonomous-task")} />
             ) : productionDebuggingOpen ? (
               <ProductionDebuggingPanel
                 onClose={() => closeFeaturePanel("production-debugging")}
@@ -1733,6 +1749,7 @@ function App() {
         </Suspense>
       )}
       <PrivacyFirewallGate />
+      {!permissionPending && <SkillActivationApprovalModal />}
       {(settingsOpen || settingsMounted) && (
         <Suspense fallback={null}>
           <SettingsModal

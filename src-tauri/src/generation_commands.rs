@@ -427,9 +427,11 @@ fn binary_starts(binary: &Path) -> bool {
 #[tauri::command]
 pub fn generation_engine_status(app: AppHandle) -> Result<GenerationEngineStatus, String> {
     let app_data = app.profile_data_dir().ok();
-    // Presence, not verification: this runs on every Studio refresh, and
-    // hashing the whole runtime tree here made switching tabs take seconds.
-    // The launch path still verifies before spawning anything.
+    // Presence, not verification — for the MFLUX runtime below as much as for
+    // this one: both run on every Studio refresh, and hashing a whole runtime
+    // tree here made switching tabs take seconds (and, in a debug build, hung
+    // the window outright — this command is sync, so it hashes on the main
+    // thread). The launch path still verifies before spawning anything.
     let target_supported = managed_runtime::runtime_supported_here(&STABLE_DIFFUSION);
     let present = target_supported
         .then(|| {
@@ -457,7 +459,7 @@ fn mflux_runtime_installed(app_data: &Path) -> bool {
     cfg!(target_arch = "aarch64")
         && crate::m3_production::production_mflux_installer(&app_data.join("m3"))
             .ok()
-            .is_some_and(|installer| installer.verify_active().is_ok())
+            .is_some_and(|installer| installer.active_install_present())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -592,6 +594,32 @@ pub fn generation_set_hugging_face_token(
     }
 }
 
+async fn install_component_file(
+    app: &AppHandle,
+    repo: &str,
+    file: &str,
+    destination: &Path,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    if destination.is_file() {
+        return Ok(());
+    }
+    let name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("component");
+    let temporary = destination.with_file_name(format!(".{name}.{}.part", Uuid::new_v4()));
+    let outcome = crate::models::download_to_file(app, repo, file, &temporary, cancel).await;
+    if let Err(error) = outcome {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    std::fs::rename(&temporary, destination).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("Failed to install {file}: {error}")
+    })
+}
+
 /// Downloads whatever components of `model_id` are missing, straight from each
 /// component's own Hugging Face repo. Progress rides the existing
 /// `models://download-progress` event so Studio and the model manager show the
@@ -688,27 +716,24 @@ pub async fn generation_download_model(
             else {
                 continue;
             };
-            let destination = model_dir.join(component.file_name());
-            if destination.is_file() {
-                continue;
+            let destination = component.resolved_path(&models_root, &spec.id);
+            install_component_file(&app, repo, file, &destination, &cancel).await?;
+
+            // The engine consumes the index itself and resolves every shard
+            // relative to it. Fetch the same set into the same repository
+            // layout so no merge or platform-specific conversion is needed.
+            if generation::is_safetensors_index_path(&destination) {
+                for shard in generation::safetensors_index_shards(&destination)? {
+                    let relative = shard.strip_prefix(&model_dir).map_err(|_| {
+                        format!(
+                            "Safetensors shard escapes model directory: {}",
+                            shard.display()
+                        )
+                    })?;
+                    let remote_file = relative.to_string_lossy().replace('\\', "/");
+                    install_component_file(&app, repo, &remote_file, &shard, &cancel).await?;
+                }
             }
-            // Download beside the destination and rename, so an interrupted
-            // transfer never leaves a half file that looks installed.
-            let temporary = model_dir.join(format!(
-                ".{}.{}.part",
-                component.file_name(),
-                Uuid::new_v4()
-            ));
-            let outcome =
-                crate::models::download_to_file(&app, repo, file, &temporary, &cancel).await;
-            if let Err(error) = outcome {
-                let _ = std::fs::remove_file(&temporary);
-                return Err(error);
-            }
-            std::fs::rename(&temporary, &destination).map_err(|error| {
-                let _ = std::fs::remove_file(&temporary);
-                format!("Failed to install {}: {error}", component.file_name())
-            })?;
         }
         Ok(())
     }
@@ -1399,6 +1424,11 @@ fn tool_client(timeout: Duration) -> Result<reqwest::Client, String> {
         .map_err(|error| error.to_string())
 }
 
+fn studio_tool_app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    app.profile_data_dir()
+        .map_err(|error| format!("Failed to resolve the Studio tool data directory: {error}"))
+}
+
 /// Starts a tool if it is not already running and returns what it declares.
 ///
 /// This is what makes a tool's UI appear: Studio draws its form from the
@@ -1410,8 +1440,12 @@ pub async fn studio_tool_manifest(
     tool_id: String,
 ) -> Result<studio_tools::ToolManifest, String> {
     let tool = find_tool(&app, &tool_id)?;
+    let app_data_dir = studio_tool_app_data_dir(&app)?;
     let client = tool_client(Duration::from_secs(30))?;
-    let (_, manifest) = state.studio_tool.ensure_ready(&tool, &client).await?;
+    let (_, manifest) = state
+        .studio_tool
+        .ensure_ready(&tool, &app_data_dir, &client)
+        .await?;
     Ok(manifest)
 }
 
@@ -1428,8 +1462,12 @@ pub async fn studio_tool_run(
     inputs: std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<Vec<GenerationEntry>, String> {
     let tool = find_tool(&app, &tool_id)?;
+    let app_data_dir = studio_tool_app_data_dir(&app)?;
     let client = tool_client(Duration::from_secs(30))?;
-    let (base_url, manifest) = state.studio_tool.ensure_ready(&tool, &client).await?;
+    let (base_url, manifest) = state
+        .studio_tool
+        .ensure_ready(&tool, &app_data_dir, &client)
+        .await?;
     let body = studio_tools::validate_inputs(&manifest, &inputs)?;
 
     let _ = app.emit(

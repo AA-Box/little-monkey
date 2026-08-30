@@ -40,6 +40,7 @@ import {
   copyFileSync,
   lstatSync,
   mkdirSync,
+  readFileSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -148,6 +149,10 @@ export function ensureSidecarPlaceholder(repoRoot, target, isWindows, options = 
     // Unlinked rather than written through, because a worktree that shares
     // one build with the main checkout stages this path as a symlink, and
     // writing through that would reach into another checkout's binaries.
+    //
+    // Skipped entirely when the staged bytes already match, so a no-op stage
+    // leaves this build-script input untouched (see `filesIdentical`).
+    if (!isSymlink(path) && filesIdentical(built, path)) return path;
     if (isSymlink(path)) unlinkSync(path);
     copyFileSync(built, path, constants.COPYFILE_FICLONE);
     if (!isWindows) chmodSync(path, 0o755);
@@ -163,6 +168,24 @@ export function ensureSidecarPlaceholder(repoRoot, target, isWindows, options = 
     if (error.code !== "EEXIST") throw error;
   }
   return path;
+}
+
+/**
+ * Whether two paths already hold exactly the same bytes.
+ *
+ * The staged sidecar is a `bundle.externalBin` path, which tauri-build
+ * registers as a `cargo:rerun-if-changed` input. Rewriting it with content it
+ * already has still bumps its mtime, which invalidates the build script, which
+ * rebuilds `little_monkey_lib` and every binary above it — so `pnpm stage:cli`
+ * re-ran a ~4 minute release build on a tree where nothing had changed, and
+ * dirtied the input again on its way out, forever. Comparing before copying is
+ * what breaks that cycle; a size check answers almost every call without
+ * reading either file.
+ */
+export function filesIdentical(a, b) {
+  const sizeA = fileSize(a);
+  if (sizeA === 0 || sizeA !== fileSize(b)) return false;
+  return readFileSync(a).equals(readFileSync(b));
 }
 
 export function hostTriple() {

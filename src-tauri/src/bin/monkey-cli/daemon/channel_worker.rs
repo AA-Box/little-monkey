@@ -116,6 +116,7 @@ pub(crate) fn test_frozen_execution(ingress: &ConversationIngress) -> FrozenExec
         channel_send: None,
         desktop_turn: None,
         placed_run: None,
+        autonomous_task: None,
     };
     FrozenExecutionContext::V1(
         FrozenExecutionContextV1 {

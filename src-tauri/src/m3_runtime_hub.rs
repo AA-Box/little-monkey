@@ -2327,7 +2327,7 @@ impl M3RuntimeDriver for MlxM3Driver {
             .adapter
             .capabilities()
             .is_ok_and(|capabilities| capabilities.is_available());
-        let installed = host_available && self.adapter.has_verified_install();
+        let installed = host_available && self.adapter.has_install();
         M3RuntimeCapabilityView {
             descriptor: self.descriptor(),
             can_load: installed,
@@ -6657,6 +6657,26 @@ pub(crate) fn component_kind_runs_here(kind: M3ComponentKind) -> bool {
     }
 }
 
+/// Applies the optional publisher target stamped by this project's package
+/// workflow. Entries without these fields remain usable for local/operator
+/// catalogs; published entries are filtered before they reach the Install UI.
+pub(crate) fn component_entry_runs_here(entry: &M3ComponentCatalogEntry) -> bool {
+    if !component_kind_runs_here(entry.kind) {
+        return false;
+    }
+    if let Some(target_os) = entry.metadata.get("targetOs") {
+        if target_os != std::env::consts::OS {
+            return false;
+        }
+    }
+    if let Some(target_arch) = entry.metadata.get("targetArch") {
+        if target_arch != std::env::consts::ARCH {
+            return false;
+        }
+    }
+    true
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum M3ComponentKind {
@@ -6885,24 +6905,27 @@ enum M3ComponentCatalogDocument {
 /// A catalog is discovery metadata. It names a URL, a size and a sha256, and a
 /// SHA-256 the catalog itself supplied proves only that the bytes are the bytes
 /// that catalog meant — whoever can replace the artifact can replace the digest
-/// beside it in the same document. For [`M3ComponentKind::MlxRuntime`] that is not
-/// the whole boundary: the installer re-derives every digest in the package
-/// manifest and verifies an Ed25519 signature against a key compiled into this app
-/// (`MLX_RELEASE_PUBLIC_KEY_HEX`), so a substituted archive fails to install no
-/// matter what the catalog claimed. No other kind has that today.
+/// beside it in the same document. For [`M3ComponentKind::MlxRuntime`] and
+/// [`M3ComponentKind::StudioTool`] that is not the whole boundary: the installer
+/// re-derives the artifact digest and the corresponding package/catalog path
+/// verifies an Ed25519 signature against a key compiled into this app, so a
+/// substituted artifact fails to install no matter what an unsigned catalog
+/// claimed.
 ///
 /// So [`fetch_component_catalog`] refuses a fetched catalog that lists any other
 /// kind. That is a rule in code and not a comment, and the match is exhaustive
 /// with no wildcard arm on purpose: a component kind added later is a compile
-/// error here, which is what stops "remotely installable" from becoming the silent
-/// default for the next executable component this app learns to run.
+/// error here, which is what stops "remotely installable" from becoming the
+/// silent default for the next executable component this app learns to run.
 ///
 /// Nothing stops an operator from registering those kinds by hand — **Import
 /// catalog** and a directly edited registry file both still work, and both are
 /// acts a person performed rather than a document a server served.
 pub(crate) fn kind_verifies_publisher_signature(kind: M3ComponentKind) -> bool {
     match kind {
-        M3ComponentKind::MlxRuntime | M3ComponentKind::MfluxImageRuntime => true,
+        M3ComponentKind::MlxRuntime
+        | M3ComponentKind::MfluxImageRuntime
+        | M3ComponentKind::StudioTool => true,
         M3ComponentKind::LlamaCppServer
         | M3ComponentKind::Tokenizer
         | M3ComponentKind::Converter
@@ -6910,8 +6933,7 @@ pub(crate) fn kind_verifies_publisher_signature(kind: M3ComponentKind) -> bool {
         | M3ComponentKind::MetalSupport
         | M3ComponentKind::CudaSupport
         | M3ComponentKind::RocmSupport
-        | M3ComponentKind::VulkanSupport
-        | M3ComponentKind::StudioTool => false,
+        | M3ComponentKind::VulkanSupport => false,
     }
 }
 
@@ -6967,6 +6989,9 @@ pub async fn fetch_component_catalog(
     let bytes = read_response_bounded(response, MAX_CATALOG_BODY_BYTES, context).await?;
     let entries = parse_component_catalog(&bytes)?;
     for entry in &entries {
+        if entry.kind == M3ComponentKind::StudioTool {
+            crate::m3_production::verify_published_component_signature(entry)?;
+        }
         if !kind_verifies_publisher_signature(entry.kind) {
             return Err(invalid(
                 "componentCatalog.kind",
@@ -6979,6 +7004,24 @@ pub async fn fetch_component_catalog(
         }
     }
     Ok(entries)
+}
+
+/// Canonical payload used by the publisher signature carried in metadata.
+/// Signature metadata is removed before serialization so the signer can add it
+/// after the payload is fixed. `canonical_json` sorts object keys recursively,
+/// matching the Node packaging helper used by the release workflow.
+pub(crate) fn canonical_component_catalog_payload(
+    entry: &M3ComponentCatalogEntry,
+) -> M3HubResult<Vec<u8>> {
+    let mut unsigned = entry.clone();
+    for key in [
+        "publisherSignatureAlgorithm",
+        "publisherSignatureKeyId",
+        "publisherSignatureBase64",
+    ] {
+        unsigned.metadata.remove(key);
+    }
+    canonical_json(&unsigned)
 }
 
 fn parse_component_catalog(bytes: &[u8]) -> M3HubResult<Vec<M3ComponentCatalogEntry>> {
@@ -7209,7 +7252,7 @@ impl M3ComponentHub {
             }
             for entry in listed {
                 entry.validate()?;
-                if !component_kind_runs_here(entry.kind) {
+                if !component_entry_runs_here(&entry) {
                     continue;
                 }
                 if entry.source_id != source.source_id() {
@@ -9478,9 +9521,9 @@ mod tests {
     ///
     /// A SHA-256 the catalog supplied proves the bytes are the ones that catalog
     /// meant, which is worth nothing against whoever can rewrite the catalog. Only
-    /// `mlx_runtime` installs through a pinned publisher key today, so only
-    /// `mlx_runtime` may arrive this way — and the refusal names the manual path
-    /// rather than pretending the kind does not exist.
+    /// `mlx_runtime` and signed Studio tools install through pinned publisher
+    /// keys today; unsigned executable kinds still name the manual path rather
+    /// than pretending the kind does not exist.
     #[tokio::test]
     async fn a_fetched_catalog_may_only_list_kinds_whose_install_verifies_a_publisher_key() {
         let mut entry: serde_json::Value = serde_json::from_str(PUBLISHED_CATALOG)
@@ -9542,7 +9585,8 @@ mod tests {
             verified,
             vec![
                 M3ComponentKind::MlxRuntime,
-                M3ComponentKind::MfluxImageRuntime
+                M3ComponentKind::MfluxImageRuntime,
+                M3ComponentKind::StudioTool
             ]
         );
     }

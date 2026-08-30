@@ -1402,11 +1402,19 @@ pub async fn tool_read_skill_resource(
     native: tauri::State<'_, native_skill_commands::NativeSkillsCommandState>,
     command: String,
     path: String,
+    expected_sha256: String,
+    expected_source_path: String,
 ) -> Result<String, String> {
     let workspace = native_skill_commands::optional_primary_workspace(&app)?;
     let manager = native.manager.clone();
     native_skill_commands::run_blocking(move || {
-        manager.read_resource(&command, &path, workspace.as_deref())
+        manager.read_resource_at_snapshot(
+            &command,
+            &path,
+            workspace.as_deref(),
+            &expected_sha256,
+            std::path::Path::new(&expected_source_path),
+        )
     })
     .await
 }

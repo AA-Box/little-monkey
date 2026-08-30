@@ -46,8 +46,6 @@ use base64::Engine as _;
 use futures_util::StreamExt;
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
-// Only the MLX release-key verifier checks a signature here.
-#[cfg(target_os = "macos")]
 use ring::signature;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -73,6 +71,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::process::Command;
 
 const M3_DIRECTORY: &str = "m3";
+/// Where `models::models_dir` keeps managed model weights, relative to the same
+/// profile data directory this module is built from.
+const MANAGED_MODELS_DIRECTORY: &str = "models";
 const M3_COMPONENTS_DIRECTORY: &str = "m3-components";
 const CATALOG_CONFIG_FILE: &str = "catalog-sources.json";
 const CATALOG_CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -105,11 +106,11 @@ const KEYCHAIN_ACCOUNT: &str = "lan-state-hmac-v1";
 /// component, the pinned publisher key both check out.
 pub const DEFAULT_COMPONENT_CATALOG_URL: &str =
     "https://github.com/AA-Box/little-monkey/releases/download/mlx-catalog/mlx-catalog.json";
-#[cfg(target_os = "macos")]
 const MLX_RELEASE_KEY_ID: &str = "release-2026-1";
-#[cfg(target_os = "macos")]
 const MLX_RELEASE_PUBLIC_KEY_HEX: &str =
     "84db8c4dfdca72589631be1513f45083e893c9c373ba5be6e49928e43c7b828c";
+const STUDIO_TOOL_SIGNATURE_ALGORITHM: &str = "ed25519";
+const STUDIO_TOOL_SIGNATURE_KEY_ID: &str = MLX_RELEASE_KEY_ID;
 
 fn lock<T>(mutex: &Mutex<T>) -> M3HubResult<MutexGuard<'_, T>> {
     mutex.lock().map_err(|_| M3HubError::LockPoisoned)
@@ -3221,6 +3222,56 @@ fn ensure_private_directory(path: &Path) -> M3HubResult<()> {
     Ok(())
 }
 
+pub(crate) fn verify_published_component_signature(
+    entry: &M3ComponentCatalogEntry,
+) -> M3HubResult<()> {
+    let algorithm = entry
+        .metadata
+        .get("publisherSignatureAlgorithm")
+        .ok_or_else(|| M3HubError::Invalid {
+            field: "componentCatalog.signature".to_string(),
+            message: "publisher signature algorithm is missing".to_string(),
+        })?;
+    let key_id = entry
+        .metadata
+        .get("publisherSignatureKeyId")
+        .ok_or_else(|| M3HubError::Invalid {
+            field: "componentCatalog.signature".to_string(),
+            message: "publisher signature key id is missing".to_string(),
+        })?;
+    let encoded = entry
+        .metadata
+        .get("publisherSignatureBase64")
+        .ok_or_else(|| M3HubError::Invalid {
+            field: "componentCatalog.signature".to_string(),
+            message: "publisher signature is missing".to_string(),
+        })?;
+    if algorithm != STUDIO_TOOL_SIGNATURE_ALGORITHM || key_id != STUDIO_TOOL_SIGNATURE_KEY_ID {
+        return Err(M3HubError::Invalid {
+            field: "componentCatalog.signature".to_string(),
+            message: "publisher signature is not from the pinned release key".to_string(),
+        });
+    }
+    let signature_bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| M3HubError::Invalid {
+            field: "componentCatalog.signature".to_string(),
+            message: format!("publisher signature is not valid base64: {error}"),
+        })?;
+    let payload = crate::m3_runtime_hub::canonical_component_catalog_payload(entry)?;
+    let public_key =
+        decode_hex(MLX_RELEASE_PUBLIC_KEY_HEX).map_err(|message| M3HubError::Invalid {
+            field: "componentCatalog.signature".to_string(),
+            message,
+        })?;
+    signature::UnparsedPublicKey::new(&signature::ED25519, public_key)
+        .verify(&payload, &signature_bytes)
+        .map_err(|_| M3HubError::Invalid {
+            field: "componentCatalog.signature".to_string(),
+            message: "publisher signature is invalid".to_string(),
+        })
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Default)]
 struct ProductionMlxSignatureVerifier;
@@ -3244,7 +3295,6 @@ impl MlxSignatureVerifier for ProductionMlxSignatureVerifier {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("pinned key is not valid hexadecimal".to_string());
@@ -3625,6 +3675,10 @@ struct ProductionMlxComponents {
 
 struct ProductionRuntimeFactory {
     root: PathBuf,
+    /// The app's managed models directory — the one `models::models_dir` writes
+    /// to. Directory-shaped MLX models live there rather than in the hub's own
+    /// single-payload store, so the MLX driver reads both.
+    models_dir: PathBuf,
     // Only the MLX driver needs a clock; the other drivers take their timestamps
     // from the runtime adapter they wrap.
     #[cfg(target_os = "macos")]
@@ -3681,7 +3735,7 @@ impl ProductionRuntimeFactory {
         }
         #[cfg(target_os = "macos")]
         if let Some(mlx) = production_mlx_components(&self.root, self.process_controller.clone())? {
-            let models = mlx_models(installed)?;
+            let models = mlx_models(installed, &self.models_dir)?;
             let adapter = Arc::new(
                 MlxRuntimeAdapter::new(
                     MlxRuntimeConfig::default(),
@@ -3717,21 +3771,41 @@ impl ProductionRuntimeReconciler {
         installed: &[M3InstalledModelView],
         current: &[Arc<dyn M3RuntimeDriver>],
     ) -> Self {
+        let signature = runtime_inventory_signature(installed, &factory.models_dir);
         Self {
             factory,
             current: Mutex::new(ProductionRuntimeSnapshot {
-                inventory_signature: runtime_inventory_signature(installed),
+                inventory_signature: signature,
                 drivers: current.to_vec(),
             }),
         }
     }
 }
 
-fn runtime_inventory_signature(installed: &[M3InstalledModelView]) -> Vec<(String, String)> {
+/// What a driver rebuild is keyed on.
+///
+/// Installed bundles belong here beside the hub's own models: they are part of
+/// what the MLX driver exposes, so installing or deleting one has to look like
+/// an inventory change or the reconciler would hand back drivers built from the
+/// previous set and the new model would be invisible until the next launch.
+fn runtime_inventory_signature(
+    installed: &[M3InstalledModelView],
+    models_dir: &Path,
+) -> Vec<(String, String)> {
     let mut signature = installed
         .iter()
         .map(|model| (model.asset_id.clone(), model.active_version_key.clone()))
         .collect::<Vec<_>>();
+    signature.extend(
+        crate::model_sources::installed_bundles(models_dir)
+            .into_iter()
+            .map(|bundle| {
+                (
+                    bundle.provenance.local_dir_name.clone(),
+                    bundle.provenance.bundle_sha256.clone(),
+                )
+            }),
+    );
     signature.sort();
     signature
 }
@@ -3747,7 +3821,8 @@ impl M3RuntimeReconciler for ProductionRuntimeReconciler {
                 let current = lock(&self.current)?;
                 (current.inventory_signature.clone(), current.drivers.clone())
             };
-            let requested_signature = runtime_inventory_signature(installed);
+            let requested_signature =
+                runtime_inventory_signature(installed, &self.factory.models_dir);
             let mut managed_running = false;
             for driver in current_drivers
                 .iter()
@@ -3828,8 +3903,108 @@ fn runtime_models(
         .collect()
 }
 
+/// Every MLX model this machine can load: the hub's own installed models, plus
+/// the directory-shaped bundles `model_sources` installs under the app's models
+/// directory.
+///
+/// The two stores exist because they hold different shapes. The hub's is
+/// content-addressed around one payload file, which a safetensors checkout —
+/// shards, config, tokenizer, a chat template — is not. Rather than reshape
+/// that store, the adapter reads both: `MlxRuntimeAdapter` only ever needs an
+/// id, a path and a size, and a bundle answers all three.
 #[cfg(target_os = "macos")]
-fn mlx_models(installed: &[M3InstalledModelView]) -> M3HubResult<Vec<MlxModelRecord>> {
+fn mlx_models(
+    installed: &[M3InstalledModelView],
+    models_dir: &Path,
+) -> M3HubResult<Vec<MlxModelRecord>> {
+    let mut records = hub_mlx_models(installed)?;
+    let mut model_ids = records
+        .iter()
+        .map(|record| record.model_id.clone())
+        .collect::<BTreeSet<_>>();
+    for bundle in crate::model_sources::installed_bundles(models_dir) {
+        if bundle.provenance.runtime != crate::model_sources::ModelRuntimeKind::Mlx {
+            continue;
+        }
+        // The directory name is already a safe, stable, collision-resistant
+        // identifier — it carries the bundle digest — so it is the model id.
+        let model_id = bundle.provenance.local_dir_name.clone();
+        if !model_ids.insert(model_id.clone()) {
+            return Err(M3HubError::Conflict(format!(
+                "MLX cannot expose multiple models named {model_id}"
+            )));
+        }
+        records.push(MlxModelRecord {
+            model_id,
+            display_name: bundle.provenance.display_name.clone(),
+            local_path: bundle.path,
+            size_bytes: bundle.provenance.size_bytes,
+            revision: Some(bundle.provenance.revision.clone()),
+            capabilities: MlxModelCapabilities {
+                chat: true,
+                tool_calling: bundle.provenance.tool_calling,
+                vision: bundle.provenance.vision,
+                // Not readable from the model's own files the way the other two
+                // are, and claiming a capability the weights do not have
+                // produces a broken turn.
+                structured_output: false,
+            },
+        });
+    }
+    Ok(records)
+}
+
+/// A hub carrying nothing but the MLX driver, for tests that need the real
+/// runtime without the rest of the production wiring.
+///
+/// `build_m3_command_state` reads the keychain for the LAN state protector,
+/// which a test binary cannot do unattended — a different code signature means
+/// macOS raises an authorization prompt nobody is there to answer. Nothing in
+/// an MLX chat turn needs that protector: the caller is
+/// [`M3ApiCaller::Internal`], which authorizes without consulting LAN policy at
+/// all. So this builds the same driver from the same components and leaves the
+/// LAN factory out.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn mlx_only_hub_for_tests(
+    app_data_dir: &Path,
+) -> M3HubResult<std::sync::Arc<crate::m3_runtime_hub::M3RuntimeHub>> {
+    let root = app_data_dir.join(M3_DIRECTORY);
+    ensure_private_directory(&root)?;
+    let clock: Arc<dyn M3Clock> = Arc::new(SystemM3Clock);
+    let process = Arc::new(SystemManagedProcessController::new(root.join("logs"))?);
+    let components = production_mlx_components(&root, process)?
+        .ok_or_else(|| M3HubError::Runtime("MLX is unavailable on this host".to_string()))?;
+    let models = mlx_models(&[], &app_data_dir.join(MANAGED_MODELS_DIRECTORY))?;
+    let adapter = Arc::new(
+        MlxRuntimeAdapter::new(
+            MlxRuntimeConfig::default(),
+            Arc::new(CurrentHostMlxProbe),
+            components.installer,
+            components.controller,
+            models,
+        )
+        .map_err(|error| M3HubError::Runtime(error.to_string()))?,
+    );
+    let driver = Arc::new(MlxM3Driver::new("mlx", adapter, clock.clone())?);
+    Ok(std::sync::Arc::new(
+        crate::m3_runtime_hub::M3RuntimeHub::new(
+            &root,
+            M3HubConfig::default(),
+            crate::m3_runtime_hub::M3RuntimeHubDependencies {
+                clock,
+                hardware: Arc::new(SystemM3HardwareProbe),
+                download: Arc::new(ReqwestM3DownloadTransport::new()?),
+                catalogs: Vec::new(),
+                runtimes: vec![driver as Arc<dyn M3RuntimeDriver>],
+                runtime_reconciler: None,
+                lan_factory: None,
+            },
+        )?,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn hub_mlx_models(installed: &[M3InstalledModelView]) -> M3HubResult<Vec<MlxModelRecord>> {
     let mut model_ids = BTreeSet::new();
     installed
         .iter()
@@ -3943,7 +4118,7 @@ pub fn production_mflux_installer(root: &Path) -> M3HubResult<Arc<MlxPackageInst
         MlxPackageInstaller::new(
             root.join("runtimes").join("mflux"),
             Arc::new(ProductionMlxSignatureVerifier),
-            MlxInstallLimits::default(),
+            MlxInstallLimits::for_mflux(),
         )
         .map_err(|error| M3HubError::Runtime(error.to_string()))?,
     ))
@@ -4066,7 +4241,7 @@ fn install_mflux_from_artifact_with_verifier(
     artifact_path: &Path,
     verifier: Arc<dyn MlxSignatureVerifier>,
 ) -> M3HubResult<MlxInstalledPackageView> {
-    let limits = MlxInstallLimits::default();
+    let limits = MlxInstallLimits::for_mflux();
     let staging = std::env::temp_dir().join(format!("mflux-unpack-{}", uuid::Uuid::new_v4()));
     let unpacked = (|| {
         mlx_runtime::extract_package_archive(artifact_path, &staging, &limits)?;
@@ -4117,15 +4292,16 @@ fn production_mlx_components(
         return Ok(None);
     }
     let installer = production_mlx_installer(root)?;
-    match installer.verify_active() {
-        Ok(_) | Err(MlxError::NotInstalled) => Ok(Some(ProductionMlxComponents {
-            installer,
-            controller: Arc::new(ProductionMlxServiceController::new(process)?),
-        })),
-        Err(error) => Err(M3HubError::Runtime(format!(
-            "verified MLX installation is corrupt: {error}"
-        ))),
-    }
+    // Assembling the runtime does not verify it. This runs while the app is
+    // starting, and `verify_active` re-hashes every file the signed manifest
+    // declares — in a debug build, minutes of SHA-256 on the thread that has
+    // yet to paint a window. A corrupt install is still caught, at the only
+    // moment where catching it protects anything: every load and launch path
+    // calls `verify_active` before spawning the interpreter.
+    Ok(Some(ProductionMlxComponents {
+        installer,
+        controller: Arc::new(ProductionMlxServiceController::new(process)?),
+    }))
 }
 
 fn build_ollama_driver(platform: PlatformCapabilities) -> M3HubResult<Arc<dyn M3RuntimeDriver>> {
@@ -4203,6 +4379,7 @@ pub fn build_m3_command_state(app_data_dir: impl AsRef<Path>) -> M3HubResult<M3C
     let process = Arc::new(SystemManagedProcessController::new(root.join("logs"))?);
     let factory = Arc::new(ProductionRuntimeFactory {
         root: root.clone(),
+        models_dir: app_data_dir.join(MANAGED_MODELS_DIRECTORY),
         #[cfg(target_os = "macos")]
         clock: clock.clone(),
         process_controller: process.clone(),

@@ -1175,8 +1175,6 @@ const translated: Record<string, string> = {
   "ModelSwitcher.noOllamaModelsPulled": "Keines abgerufen — fügen Sie eines in den Einstellungen hinzu",
   "ModelSwitcher.cloudBadge": "CLOUD",
   "ModelSwitcher.cloudSectionLabel": "Cloud",
-  "ModelSwitcher.noCloudModelsConfigured": "Keine konfiguriert — fügen Sie einen API-Schlüssel in den Einstellungen hinzu",
-  "ModelSwitcher.noCloudModelsSelected": "Keine Modelle ausgewählt — wählen Sie Modelle in den Einstellungen aus",
   "AddCustomModelForm.openGgufDescription": "Öffnen Sie eine bereits auf Ihrem Computer vorhandene `.gguf`-Datei",
   "AddCustomModelForm.openingButton": "Wird geöffnet…",
   "AddCustomModelForm.openModelFileButton": "Modelldatei öffnen…",

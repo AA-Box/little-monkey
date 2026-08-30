@@ -1,6 +1,5 @@
 import { create } from "zustand";
 
-import { nativeSkillsClient, type NativeSkillDescriptor } from "../lib/nativeSkillsClient";
 import {
   scoreConnector,
   scoreLocalModel,
@@ -18,6 +17,7 @@ import { useEcosystemStore } from "./ecosystemStore";
 import { useMcpStore } from "./mcpStore";
 import { useModelStore } from "./modelStore";
 import { useUsageHistoryStore } from "./usageHistoryStore";
+import { useNativeSkillsStore } from "./nativeSkillsStore";
 import { errorMessage } from "../lib/errors";
 
 function errorText(error: unknown): string {
@@ -30,22 +30,18 @@ function errorText(error: unknown): string {
  * never calls a source store's own `refresh()`/`connect()`/etc. itself
  * (that stays the panel's job, exactly like `TrustScorecardsPanel.tsx`'s
  * mount effect calls `modelStore.refresh()`, `connectorsStore.refresh()`,
- * etc. before calling `recompute()` here). Keeping this store a pure reader
- * of already-hydrated state — plus one real `invoke()` for native skills,
- * which has no dedicated store of its own (see `nativeSkillsStore.ts`'s doc
- * comment) — is what makes "reads already-known metadata" true rather than
- * aspirational, and keeps this store trivially testable by seeding the
- * source stores' state directly.
+ * etc. before calling `recompute()` here). Native skills are read from their
+ * shared live registry, so this store never starts a second discovery
+ * lifecycle.
  */
 export interface TrustScorecardsStore {
   scorecards: TrustScorecard[];
   loading: boolean;
   error: string | null;
   lastComputedAt: number | null;
-  /** Re-fetches native skills (the one entity kind with no store of its own)
-   * and recomputes every scorecard from whatever the other stores currently
-   * hold. Safe to call anytime; failures leave the previous scorecards in
-   * place rather than clearing the panel to empty. */
+  /** Refreshes the shared native-skill registry and recomputes every scorecard
+   * from the current source stores. Safe to call anytime; failures leave the
+   * previous scorecards in place rather than clearing the panel to empty. */
   recompute: () => Promise<void>;
 }
 
@@ -61,12 +57,14 @@ export const useTrustScorecardsStore = create<TrustScorecardsStore>((set) => ({
 
   recompute: async () => {
     set({ loading: true, error: null });
-    let skills: NativeSkillDescriptor[] = [];
+    let skills = useNativeSkillsStore.getState().descriptors;
     try {
-      skills = await nativeSkillsClient.discover();
+      await useNativeSkillsStore.getState().refresh();
+      skills = useNativeSkillsStore.getState().descriptors;
     } catch (err) {
       // A failed skill discovery shouldn't block scoring every other entity
       // kind — it just means the skill rows are missing this pass.
+      skills = [];
       set({ error: errorText(err) });
     }
 

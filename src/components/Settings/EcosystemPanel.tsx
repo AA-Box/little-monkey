@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { AlertTriangle, RefreshCw, ShieldCheck } from "lucide-react";
 import { Button, Tabs } from "../ui";
 import { useT } from "../../lib/i18n";
@@ -9,11 +9,21 @@ import { EcosystemPlugins } from "./EcosystemPlugins";
 import { EcosystemMcpApps, EcosystemOAuth } from "./EcosystemConnections";
 import { EcosystemWorkflowDesigner, EcosystemWorkflowRuns } from "./EcosystemWorkflows";
 
-type EcosystemTab = "marketplace" | "installed" | "plugins" | "connections" | "apps" | "workflows" | "runs";
+const UnifiedEcosystemDiscover = lazy(async () => {
+  const module = await import("./UnifiedEcosystemDiscover");
+  return { default: module.UnifiedEcosystemDiscover };
+});
+
+const ExtensionMarketplacePanel = lazy(async () => {
+  const module = await import("./ExtensionMarketplacePanel");
+  return { default: module.ExtensionMarketplacePanel };
+});
+
+type EcosystemTab = "discover" | "packages" | "extensions" | "installed" | "plugins" | "connections" | "apps" | "workflows" | "runs";
 
 export function EcosystemPanel() {
   const { t } = useT();
-  const [tab, setTab] = useState<EcosystemTab>("marketplace");
+  const [tab, setTab] = useState<EcosystemTab>("discover");
   const { error, clearError, busy, refreshPackages, refreshWorkflows } = useEcosystemStore();
 
   useEffect(() => {
@@ -21,7 +31,9 @@ export function EcosystemPanel() {
   }, [refreshPackages, refreshWorkflows]);
 
   const tabs = [
-    { id: "marketplace", label: t("EcosystemPanel.marketplace") },
+    { id: "discover", label: "Discover" },
+    { id: "packages", label: "Packages" },
+    { id: "extensions", label: "WASM" },
     { id: "installed", label: t("EcosystemPanel.installed") },
     { id: "plugins", label: t("EcosystemPanel.plugins") },
     { id: "connections", label: t("EcosystemPanel.connections") },
@@ -61,7 +73,21 @@ export function EcosystemPanel() {
         </div>
       )}
 
-      {tab === "marketplace" && <EcosystemDiscover />}
+      {tab === "discover" && (
+        <Suspense fallback={<div className="rounded-lg border border-border bg-surface p-5 text-center text-xs text-muted">Loading ecosystem catalog…</div>}>
+          <UnifiedEcosystemDiscover
+            onOpenPackages={() => setTab("packages")}
+            onOpenExtensions={() => setTab("extensions")}
+            onOpenMcp={() => setTab("apps")}
+          />
+        </Suspense>
+      )}
+      {tab === "packages" && <EcosystemDiscover />}
+      {tab === "extensions" && (
+        <Suspense fallback={<div className="rounded-lg border border-border bg-surface p-5 text-center text-xs text-muted">Loading executable extensions…</div>}>
+          <ExtensionMarketplacePanel />
+        </Suspense>
+      )}
       {tab === "installed" && <EcosystemPackages view="installed" />}
       {tab === "plugins" && <EcosystemPlugins />}
       {tab === "connections" && <EcosystemOAuth />}

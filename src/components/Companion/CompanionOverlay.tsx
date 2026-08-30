@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Camera, Clipboard, Mic, Octagon, Send, Volume2, X } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 import {
   blobToBase64,
@@ -13,6 +15,13 @@ import { Button, IconButton } from "../ui";
 import { errorMessage } from "../../lib/errors";
 
 const GRANT_LIFETIME_MS = 15 * 60_000;
+
+interface DesktopControlSession {
+  sessionId: string;
+  allowedApplications: string[];
+  active: boolean;
+  paused: boolean;
+}
 
 function message(error: unknown): string {
   return errorMessage(error);
@@ -30,6 +39,7 @@ export function CompanionOverlay() {
   // default — speaking into a machine that acts without showing you what it
   // heard is a thing to opt into, not a default.
   const [handsFree, setHandsFree] = useState(false);
+  const [desktopSessions, setDesktopSessions] = useState<DesktopControlSession[]>([]);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -45,8 +55,12 @@ export function CompanionOverlay() {
 
   useEffect(() => {
     void refreshGrants().catch((reason) => setError(message(reason)));
+    void invoke<DesktopControlSession[]>("desktop_control_sessions")
+      .then((sessions) => setDesktopSessions(sessions))
+      .catch(() => undefined);
     let disposed = false;
     let unlisten: (() => void) | null = null;
+    let unlistenDesktop: (() => void) | null = null;
     void companionClient.onEmergencyStop(() => {
       if (disposed) return;
       recorderRef.current?.stop();
@@ -59,9 +73,17 @@ export function CompanionOverlay() {
       if (disposed) cleanup();
       else unlisten = cleanup;
     });
+    void listen<DesktopControlSession | DesktopControlSession[]>("desktop-control://session-state", (event) => {
+      if (disposed) return;
+      setDesktopSessions(Array.isArray(event.payload) ? event.payload : [event.payload]);
+    }).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlistenDesktop = cleanup;
+    }).catch((reason) => setError(message(reason)));
     return () => {
       disposed = true;
       unlisten?.();
+      unlistenDesktop?.();
       streamRef.current?.getTracks().forEach((track) => track.stop());
     };
   }, [refreshGrants]);
@@ -190,6 +212,8 @@ export function CompanionOverlay() {
     setBusy("stop");
     try {
       await companionClient.emergencyStop();
+      await invoke("desktop_control_emergency_stop");
+      setDesktopSessions([]);
       await refreshGrants();
     } catch (reason) {
       setError(message(reason));
@@ -197,6 +221,22 @@ export function CompanionOverlay() {
       setBusy(null);
     }
   }, [refreshGrants]);
+
+  const pauseDesktopSession = useCallback(async (session: DesktopControlSession) => {
+    try {
+      await invoke("desktop_control_pause_session", { sessionId: session.sessionId, paused: !session.paused });
+    } catch (reason) {
+      setError(message(reason));
+    }
+  }, []);
+
+  const stopDesktopSession = useCallback(async (session: DesktopControlSession) => {
+    try {
+      await invoke("desktop_control_stop_session", { sessionId: session.sessionId });
+    } catch (reason) {
+      setError(message(reason));
+    }
+  }, []);
 
   const speak = useCallback(async () => {
     if (!text.trim()) return;
@@ -226,6 +266,25 @@ export function CompanionOverlay() {
           <X size={15} />
         </IconButton>
       </header>
+
+      {desktopSessions.some((session) => session.active) && (
+        <section className="flex shrink-0 flex-col gap-2 border-b border-warning/50 bg-warning/10 px-3 py-2">
+          <p className="text-xs font-semibold text-foreground">
+            Little Monkey is controlling {desktopSessions.filter((session) => session.active).map((session) => session.allowedApplications.join(", ")).join("; ")}
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {desktopSessions.filter((session) => session.active).map((session) => (
+              <span key={session.sessionId} className="flex items-center gap-1">
+                <Button size="sm" variant="secondary" onClick={() => void pauseDesktopSession(session)}>
+                  {session.paused ? "Resume" : "Pause"}
+                </Button>
+                <Button size="sm" variant="danger" onClick={() => void stopDesktopSession(session)}>Stop</Button>
+              </span>
+            ))}
+            <Button size="sm" variant="danger" onClick={() => void emergencyStop()}><Octagon size={13} />Emergency stop</Button>
+          </div>
+        </section>
+      )}
 
       <section className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
         <div className="rounded-lg border border-border bg-surface p-3">

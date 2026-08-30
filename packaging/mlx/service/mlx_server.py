@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import queue
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,26 +37,245 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # allocate without limit. The supervisor caps its own side of the stream at
 # 64 MiB; this is the request half of the same idea.
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
+# `config.json` is small by construction; a larger one is not a model config.
+MAX_CONFIG_BYTES = 4 * 1024 * 1024
+
+
+def _read_config(model_path: str) -> dict:
+    """The model's own `config.json`, or `{}` if it has none this can read."""
+    try:
+        with open(os.path.join(model_path, "config.json"), "rb") as handle:
+            return json.loads(handle.read(MAX_CONFIG_BYTES))
+    except (OSError, ValueError):
+        return {}
+
+
+def _is_vision_model(config: dict) -> bool:
+    """Whether this checkout carries a vision tower.
+
+    `vision_config` is the transformers convention for a sub-config describing
+    one, and it is what a multimodal MLX conversion keeps. Read from the model's
+    own files rather than from its name or its hub tags: those are metadata a
+    repository author writes, and loading a text model with the vision stack
+    (or the reverse) fails deep inside the loader with a shape error.
+    """
+    return isinstance(config.get("vision_config"), dict)
 
 
 def _load_model(model_path: str):
-    """Loads the weights before the port opens.
+    """Loads the weights before the port opens, with the stack this model needs.
 
-    Import is deferred to here so that `--help` and argument errors do not pay
+    Imports are deferred to here so that `--help` and argument errors do not pay
     for importing MLX, and so a broken install reports the missing dependency
     as a clean startup failure on stderr rather than an import traceback at the
     first request — by which time the supervisor has already called the service
     ready and a user is waiting on a reply.
     """
+    config = _read_config(model_path)
+    if _is_vision_model(config):
+        from mlx_vlm import load  # noqa: PLC0415 - deliberate: see docstring
+
+        model, processor = load(model_path)
+        return _VisionRuntime(model, processor, config)
     from mlx_lm import load  # noqa: PLC0415 - deliberate: see docstring
 
-    return load(model_path)
+    model, tokenizer = load(model_path)
+    return _TextRuntime(model, tokenizer)
+
+
+class _TextRuntime:
+    """A text-only model, generated with `mlx_lm`."""
+
+    supports_images = False
+
+    def __init__(self, model, tokenizer) -> None:
+        self.model = model
+        self.tokenizer = tokenizer
+
+    def render(self, messages: list[dict], image_count: int) -> str:
+        """Renders the turns with the model's own chat template.
+
+        Falling back to a plain join rather than failing: a base model with no
+        template still generates, and refusing to talk to one would be a
+        stricter rule than the runtime it replaces.
+        """
+        template = getattr(self.tokenizer, "apply_chat_template", None)
+        if template is not None and getattr(self.tokenizer, "chat_template", None):
+            return template(messages, tokenize=False, add_generation_prompt=True)
+        return "\n".join(message["content"] for message in messages)
+
+    def stream(self, prompt: str, images: list[str], max_tokens: int, temperature):
+        from mlx_lm import stream_generate  # noqa: PLC0415 - see _load_model
+
+        sampler = None
+        if temperature is not None:
+            from mlx_lm.sample_utils import make_sampler  # noqa: PLC0415
+
+            sampler = make_sampler(temp=float(temperature))
+        for response in stream_generate(
+            self.model,
+            self.tokenizer,
+            prompt,
+            max_tokens=max_tokens,
+            **({"sampler": sampler} if sampler is not None else {}),
+        ):
+            yield response.text
+
+
+class _VisionRuntime:
+    """A vision-language model, generated with `mlx_vlm`.
+
+    The two stacks are not interchangeable: `mlx_vlm` owns the image
+    preprocessing, and its chat template needs to know how many images a turn
+    carries so it can place the image tokens the model was trained on.
+    """
+
+    supports_images = True
+
+    def __init__(self, model, processor, config: dict) -> None:
+        self.model = model
+        self.processor = processor
+        self.config = config
+        # The handler counts prompt tokens with this; a processor exposes the
+        # tokenizer it wraps.
+        self.tokenizer = getattr(processor, "tokenizer", processor)
+
+    def render(self, messages: list[dict], image_count: int) -> str:
+        from mlx_vlm import apply_chat_template  # noqa: PLC0415 - see _load_model
+
+        return apply_chat_template(
+            self.processor, self.config, messages, num_images=image_count
+        )
+
+    def stream(self, prompt: str, images: list[str], max_tokens: int, temperature):
+        from mlx_vlm import stream_generate  # noqa: PLC0415 - see _load_model
+
+        for response in stream_generate(
+            self.model,
+            self.processor,
+            prompt,
+            image=images or None,
+            max_tokens=max_tokens,
+            **({"temperature": float(temperature)} if temperature is not None else {}),
+        ):
+            yield response.text
+
+
+class _Job:
+    """One generation, run on the worker thread, consumed by a request thread."""
+
+    _DONE = object()
+
+    def __init__(self, prompt: str, images: list[str], max_tokens: int, temperature) -> None:
+        self.prompt = prompt
+        self.images = images
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        # Bounded: a client that stops reading must slow the model down rather
+        # than let deltas pile up without limit in memory.
+        self._output: queue.Queue = queue.Queue(maxsize=256)
+        self._cancelled = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+    def run(self, runtime) -> None:
+        """Runs on the worker thread. Every MLX array stays on that thread."""
+        try:
+            for text in runtime.stream(
+                self.prompt, self.images, self.max_tokens, self.temperature
+            ):
+                if self._cancelled.is_set():
+                    break
+                if not self._put(text):
+                    break
+        except Exception as error:  # noqa: BLE001 - any failure must reach the user
+            self._put(error)
+        self._output.put(self._DONE)
+
+    def _put(self, item) -> bool:
+        """Hands one item to the reader, giving up if it has gone away.
+
+        A dropped connection is the supervisor cancelling. Blocking forever on
+        a full queue nobody is draining would wedge the worker thread, and with
+        it every later request.
+        """
+        while not self._cancelled.is_set():
+            try:
+                self._output.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def deltas(self):
+        """Yields text on the request thread until the generation ends."""
+        while True:
+            item = self._output.get()
+            if item is self._DONE:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+
+class _GenerationWorker:
+    """Owns the model, and every MLX array made from it.
+
+    MLX binds a stream to the thread that created the arrays. Generating on any
+    other thread raises "There is no Stream(gpu, 0) in current thread." (mlx
+    0.32.0), and no per-thread `set_default_device` or `set_default_stream`
+    recovers it — the weights were loaded elsewhere. A threading HTTP server
+    that generates inside the request handler therefore fails *every* request
+    while looking perfectly healthy: port connectable, model resident, each
+    generation dying inside `stream_generate`.
+
+    So one thread loads the model and runs every generation, and request
+    threads hand it work. The server stays threaded, which keeps `/health`,
+    unknown routes and a second caller answerable while a generation is in
+    flight — the alternative, a single-threaded server, would let one slow
+    reader block the supervisor's next connection entirely.
+    """
+
+    def __init__(self, model_path: str) -> None:
+        self.runtime = None
+        self._failure: BaseException | None = None
+        self._loaded = threading.Event()
+        self._jobs: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run, args=(model_path,), name="mlx-generate", daemon=True
+        )
+        self._thread.start()
+
+    def wait_until_loaded(self) -> None:
+        """Blocks until the weights are resident, re-raising a load failure.
+
+        The supervisor reads a connectable port as ready, so `main` must not
+        bind before this returns.
+        """
+        self._loaded.wait()
+        if self._failure is not None:
+            raise self._failure
+
+    def submit(self, job: _Job) -> None:
+        self._jobs.put(job)
+
+    def _run(self, model_path: str) -> None:
+        try:
+            self.runtime = _load_model(model_path)
+        except BaseException as error:  # noqa: BLE001 - reported by wait_until_loaded
+            self._failure = error
+            self._loaded.set()
+            return
+        self._loaded.set()
+        while True:
+            self._jobs.get().run(self.runtime)
 
 
 class _Handler(BaseHTTPRequestHandler):
-    # Set on the server instance by `main`.
-    model = None
-    tokenizer = None
+    # Set on the class by `main`.
+    worker = None
+    runtime = None
 
     protocol_version = "HTTP/1.1"
 
@@ -108,14 +329,22 @@ class _Handler(BaseHTTPRequestHandler):
         request_id = str(request.get("requestId", ""))
         self._emit({"type": "started", "request_id": request_id})
 
-        prompt = self._prompt_from(request)
+        try:
+            images = self._images_from(request)
+        except ValueError as error:
+            self._emit({"type": "error", "code": "invalid_request", "message": str(error)})
+            self._emit({"type": "completed", "input_tokens": 0, "output_tokens": 0})
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            return
+        prompt = self._prompt_from(request, len(images))
         max_tokens = int(request.get("maxTokens") or 512)
         temperature = request.get("temperature")
 
-        input_tokens = len(self.tokenizer.encode(prompt))
+        input_tokens = len(self.runtime.tokenizer.encode(prompt))
         output_tokens = 0
         try:
-            for text in self._generate(prompt, max_tokens, temperature):
+            for text in self._generate(prompt, images, max_tokens, temperature):
                 output_tokens += 1
                 if text:
                     self._emit({"type": "text_delta", "text": text})
@@ -136,38 +365,48 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"0\r\n\r\n")
         self.wfile.flush()
 
-    def _generate(self, prompt: str, max_tokens: int, temperature):
-        from mlx_lm import stream_generate  # noqa: PLC0415 - see _load_model
+    def _generate(self, prompt: str, images: list, max_tokens: int, temperature):
+        """Hands the work to the model's own thread and yields what comes back.
 
-        sampler = None
-        if temperature is not None:
-            from mlx_lm.sample_utils import make_sampler  # noqa: PLC0415
-
-            sampler = make_sampler(temp=float(temperature))
-        for response in stream_generate(
-            self.model,
-            self.tokenizer,
-            prompt,
-            max_tokens=max_tokens,
-            **({"sampler": sampler} if sampler is not None else {}),
-        ):
-            yield response.text
-
-    def _prompt_from(self, request: dict) -> str:
-        """Renders the turns with the model's own chat template.
-
-        Falling back to a plain join rather than failing: a base model with no
-        template still generates, and refusing to talk to one would be a
-        stricter rule than the runtime it replaces.
+        Nothing here touches an MLX array; see `_GenerationWorker` for why that
+        is the whole point.
         """
+        job = _Job(prompt, images, max_tokens, temperature)
+        self.worker.submit(job)
+        try:
+            yield from job.deltas()
+        finally:
+            # Reached on a dropped connection too, which is how the supervisor
+            # cancels: the worker stops rather than generating into nothing.
+            job.cancel()
+
+    def _prompt_from(self, request: dict, image_count: int) -> str:
         messages = [
             {"role": str(message.get("role", "user")), "content": str(message.get("text", ""))}
             for message in request.get("messages", [])
         ]
-        template = getattr(self.tokenizer, "apply_chat_template", None)
-        if template is not None and getattr(self.tokenizer, "chat_template", None):
-            return template(messages, tokenize=False, add_generation_prompt=True)
-        return "\n".join(message["content"] for message in messages)
+        return self.runtime.render(messages, image_count)
+
+    def _images_from(self, request: dict) -> list:
+        """The inline images of every turn, in order.
+
+        Two refusals rather than a silent best effort. A text-only model is told
+        it cannot see, because dropping the images and answering anyway is the
+        failure this service used to have: the reply reads as if the picture was
+        considered. And only `data:` URIs are accepted — `mlx_vlm.load_image`
+        will happily fetch an `http(s)` URL, which would turn a local model
+        server into a fetcher for whatever a request names.
+        """
+        images = []
+        for message in request.get("messages", []):
+            for image in message.get("images", []) or []:
+                image = str(image)
+                if not image.startswith("data:image/"):
+                    raise ValueError("images must be inline `data:image/...` URIs")
+                images.append(image)
+        if images and not self.runtime.supports_images:
+            raise ValueError("this model has no vision tower and cannot read images")
+        return images
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -182,7 +421,10 @@ def main(argv: list[str] | None = None) -> int:
         # tampered argument vector cannot turn this into a network service.
         parser.error("--host must be 127.0.0.1")
 
-    _Handler.model, _Handler.tokenizer = _load_model(arguments.model)
+    worker = _GenerationWorker(arguments.model)
+    worker.wait_until_loaded()
+    _Handler.worker = worker
+    _Handler.runtime = worker.runtime
 
     server = ThreadingHTTPServer((arguments.host, arguments.port), _Handler)
     # Only after the weights are resident: the supervisor reads a connectable

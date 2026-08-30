@@ -19,6 +19,16 @@ narrower than its name suggests, the boundary is in [Limitations](limitations.md
 
 ## Workspace: files, review, terminal, and browser
 
+### Execution targets and portable workspaces
+
+- Configure and probe local, Docker, paired Little Monkey, and SSH-backed
+  runner targets. Freeze target identity/capabilities into each placed run.
+- Transfer clean Git, dirty Git, and non-Git workspaces with bounded,
+  content-addressed manifests; materialize executor-owned workspaces and
+  retrieve reviewable diffs, artifacts, and verification evidence.
+- Apply returned changes only through digest/conflict checks and Git preflight;
+  local checkouts are never overwritten automatically.
+
 - Reopen into the folders you were working in. The attached set is snapshotted on change and reattached at launch; folders deleted or moved since the last run are dropped rather than blocking the restore. Permission grants stay session-scoped and are never restored with a workspace.
 - Work across eight right-sidebar tabs — code review, single-file diff, terminal, browser, side tasks, workspace files, background tasks, and processes. Tabs stay mounted, share one drag-resizable persisted width, support a region-wide fullscreen toggle, and each has a keyboard shortcut on every platform.
 - Review changes in a git-backed panel using real porcelain output, with a per-file diff view and PR awareness. Pick the base — the branch's merge-base with its upstream, or HEAD — and the layout — every diff stacked, or one file at a time. Against HEAD the file list is uncapped and each diff loads on open; against the merge-base the panel is bounded by a 300-file payload cap and says so.
@@ -81,6 +91,7 @@ narrower than its name suggests, the boundary is in [Limitations](limitations.md
 - Switch the main view between **Chat** and **Studio** to run text-to-image, image-to-image, text-to-video, image-to-video, and speech — optionally in a voice cloned from a reference clip — from weights on your own machine, with no provider account or remote endpoint involved.
 - Images and video run on an app-owned managed `sd-server` (stable-diffusion.cpp); speech runs on a separately pinned `llama-tts`. Both use the same rails as the managed `llama.cpp` chat runtime — pinned version, per-file SHA-256 against a manifest digest compiled into the app, atomic publish, and a per-runtime versioned directory and install lock — so installing or updating one cannot disturb another.
 - Describe a model as the set of component files it is, because `sd-server` binds its whole model set at launch: typed slots (all-in-one checkpoint, diffusion model plus a mixture's high-noise stage, CLIP-L, CLIP-G, CLIP-vision, T5-XXL or an LLM text encoder, VAE, audio VAE, TAESD, mmproj, vocoder), per-model defaults, a RAM floor, and license terms. The add form prefills family and slot guesses from a weight file's name and lets you overwrite each one; a name that says nothing gets no guess. Adding a family is a registry entry, not new code, and switching models relaunches the engine.
+- Load standard safetensors shard indexes directly on every supported native generation target: the index is passed to the engine unchanged, while the app preserves its relative layout and downloads every file named by `weight_map`.
 - Download weights through the same Hugging Face downloader the model manager uses, so Studio and Runtime Hub share one progress stream and one cancellation path and an interrupted transfer leaves no partial file. Keep a LoRA stack and reusable component parts, choose sampler, scheduler, seed, steps, CFG, and a hires upscaler, browse and prune a gallery, cancel a run or a download, and unload the engine.
 - Choose the engine per model, because two of them cannot read the same weights. The built-in `sd-server` reads safetensors and GGUF; an MLX conversion — packed `U32` groups with separate scales and biases — is unreadable to it, and the reverse is equally true of a GGUF under MLX. Selecting **MLX video** runs the video service inside the installed MLX package on Apple silicon, launched from the same signed tree and re-verified file by file at every launch, and speaking the same job protocol as the bundled engine, so progress, cancellation and the gallery are unchanged.
 - Use the native **MFLUX image** engine on Apple Silicon as a separately signed Runtime Hub component for text-to-image and image-to-image generation; it keeps a supervised service warm and records progress, cancellation, terms acceptance, and gallery artifacts through the same Studio path. See [MFLUX image generation](mflux-image-runtime.md).
@@ -88,11 +99,11 @@ narrower than its name suggests, the boundary is in [Limitations](limitations.md
 
 ## Skills, plugins, MCP Apps, and workflows
 
-- Install data-only `SKILL.md` skills globally or per workspace from a reviewed local folder or an immutable 40-character Git commit. Preview returns the exact SHA-256 approval digest; symlinks, special files, mutable Git refs, command collisions, oversized trees, and unmet OS, binary, or environment requirements fail closed.
+- Install data-only `SKILL.md` skills globally or per workspace from a reviewed local folder or an immutable 40-character Git commit. Little Monkey also discovers standard read-only skills from `.agents/skills` roots for interoperability with other agents; those external folders cannot be enabled, updated, rolled back, or uninstalled here. Preview returns the exact SHA-256 approval digest; symlinks, special files, mutable Git refs, command collisions, oversized trees, and unmet OS, binary, or environment requirements fail closed.
 - Invoke up to five installed skills at the start of a turn, for example `/review /testing check this patch`. The selected instructions, version, source, and digest are frozen into that turn and never expand tool permissions.
 - Create a quarantined skill proposal with `/learn command | instructions`. It activates only after its risk flags are reviewed and its exact digest approved, and it can be rejected or rolled back.
 - Learn a reusable skill from the agent's own verified work. After a run finishes, the backend classifies that run's durable events against fixed rules; only five things open a candidate: you explicitly asking for a procedure to be reusable, a correction of yours that then verified, a verification failure repaired inside the same run, a normalized failure that recurred and was finally resolved, or a multi-step procedure that changed files and ended with a passing verification. A turn without real execution evidence never opens one, whatever it says.
-- A candidate is drafted by one bounded reflection pass, then built into an ordinary `SKILL.md` package by deterministic code under an app-owned staging directory, deduplicated against installed native, workspace, learned, and signed-package skills, and evaluated by really running it — and a baseline without it — in disposable copies of the workspace, with real tool execution and the workspace's own verification. It becomes a real versioned native skill only on installation, which is where rollback, disable, and uninstall come from. Learning Mode is **Suggest only** by default; even **Auto-promote safe improvements** stops for approval at a widened tool list, a new executable or environment requirement, global scope, or a possible duplicate, and refuses outright anything that would weaken permission policy. See [Learned skills](#learned-skills) for the full loop.
+- A candidate is drafted by one bounded reflection pass, then built into an ordinary `SKILL.md` package by deterministic code under an app-owned staging directory, deduplicated against installed native, workspace, learned, and signed-package skills, and evaluated by really running it — and a baseline without it — in disposable copies of the workspace, with real tool execution and the workspace's own verification. It becomes a real versioned native skill only on installation, which is where rollback, disable, and uninstall come from. The three-state Learning Policy is **Ask** by default: **Manual** only learns from an explicit save, **Ask** surfaces detected candidates for review, and **Automatic** reflects, evaluates, and installs only safe improvements without approval. Automatic still stops for approval at a widened tool list, a new executable or environment requirement, global scope, or a possible duplicate, and refuses outright anything that would weaken permission policy. See [Learned skills](#learned-skills) for the full loop.
 - Manage signed declarative packages in **Settings → Ecosystem** with install and update permission previews, pins, enable and disable, rollback, revocation state, uninstall, offline cache, and portable export and import. Local unsigned development packages stay data-only behind an explicit warning; unsigned Git packages and executable payloads are rejected.
 - Start from a signed first-party catalog of six skills (review, testing, documentation, browser QA, release preparation, knowledge workflows) plus declarative GitHub, GitLab, WebDAV, and REST/webhook connector packages.
 - Inspect plugin health and component setup, use package assistants, activate package workflow templates, and apply verified package rules to normal, Compare, and Crew turns with provenance.
@@ -116,6 +127,13 @@ requires:
 Review the requested scope. Report evidence, severity, and a concrete fix.
 ```
 
+The native-skill registry is live across desktop windows. Managed mutations
+emit an invalidation event, and the app watches the managed global root, global
+`~/.agents/skills`, and workspace `.littlemonkey/skills`/`.agents/skills` roots. External
+edits trigger debounced rediscovery; a missing skill directory is watched
+through its nearest existing parent so creating the directory reattaches the
+recursive watch.
+
 ## Learned skills
 
 The loop, end to end:
@@ -135,21 +153,26 @@ source kinds: `explicit_user_instruction`, `user_correction`,
 the durable ledger, plus your turn text (the one input the ledger does not
 carry). A run only ever opens one candidate.
 
+An installed managed learned skill can also receive an explicit
+`manual_improvement` update candidate. That action is not autonomous
+classification: it validates selected effectiveness rows against the active
+version's exact hash before entering the same reflection and review flow.
+
 **What does not.** A conversational turn, a cancelled or failed run, a run
 with no successful tool call, and any web page, MCP result, subprocess output,
 or model claim that says it should be learned. Untrusted content can be
 evidence; it can never authorize its own installation.
 
 **Where they live.** Candidates, evaluations, provenance, effectiveness rows
-and the learning mode are in a durable store under the active profile's data
+and the learning policy are in a durable store under the active profile's data
 directory (`skill-learning-v1/`), so they survive a restart and are shared
 with the CLI. Staged packages are written under that store's own `staging/`
 directory; resource paths are validated relative paths and nothing may be
 written outside it. Once promoted, a skill is an ordinary native skill in the
 global or workspace skill root.
 
-**When approval is required.** Always, unless you selected **Auto-promote safe
-improvements** *and* the candidate passed evaluation, adds no tool access,
+**When approval is required.** Always, unless you selected **Automatic** *and*
+the candidate passed evaluation, adds no tool access,
 declares no executables or environment variables, is workspace-scoped, and is
 a new skill or an update to a learned one. Approval is required for a widened
 allowed-tools list, removing an existing restriction, any new executable or
@@ -158,8 +181,11 @@ a possible duplicate. Content that tries to talk a future turn out of its
 permission gates, and a command that collides with a skill this loop did not
 install, are refused outright rather than prompted for.
 
-**Evaluation.** Each candidate gets a positive case reproducing the observed
-task and a regression case an unrelated turn must not be hijacked by. Every arm
+**Evaluation.** Each ordinary candidate gets a positive case reproducing the
+observed task and a regression case an unrelated turn must not be hijacked by.
+An explicit improvement keeps each selected evidence run as an independent
+positive case, plus that unrelated regression case; it never unions unrelated
+prompts or tool requirements. Every arm
 of every case runs in its own disposable copy of the workspace the candidate
 was learned in, and all of those copies are made from the same starting state
 *before* any arm runs — the baseline never hands its mutated files to the
@@ -228,6 +254,41 @@ timestamp, keyed by the installed content hash. Nothing later rewrites it: an
 update writes a new record, and a rollback surfaces the restored version's own
 provenance, so a historical run's evidence stays true.
 
+An automatic update candidate freezes the exact matched parent descriptor when
+it is staged — instructions, title, scope, tools, and requirements — so its
+baseline is the version that produced the evidence. If that parent is no
+longer active, staging supersedes the candidate instead of retargeting it to a
+newer version.
+
+**Quality and improvement.** Settings shows quality for the exact active
+command, scope, and skill hash. **Healthy** means at least three
+verification-bearing runs with no hard negative signal; **Needs attention** is
+driven by a correction, a repeated failure signature, the latest verified
+failure, or two failures in the last five verification-bearing runs;
+**Not enough data** means fewer than three verification-bearing runs unless a
+hard negative already exists. Unknown verification is never counted as a
+success, and cancellation is never counted as a failure. Older-version rows
+remain in history but cannot make a newly promoted hash unhealthy.
+
+**Improve skill** is explicit and available even when Learning Policy is
+**Manual**. It is only available for managed learned skills with durable
+evidence. The backend validates selected runs against the exact active hash,
+deduplicates open update candidates, and freezes that hash as the parent.
+Reflection is told to make the smallest evidence-grounded change; it preserves
+scope, tools, binaries, environment requirements, and unrelated instructions
+by default. The result is reviewed as a bounded instruction diff plus
+structured capability changes, then uses the same real-isolated baseline vs
+candidate evaluation, digest-bound approval, versioned promotion, and rollback
+path. The active skill is never edited in place, and activation policy/pinning
+survive promotion because they belong to the stable skill identity.
+
+Cancelled rows are visible in quality history but cannot be selected as
+improvement evidence. A correction stores the corrected run's bounded evidence
+on the original version-specific row, so reflection receives both the failure
+and the successful corrected procedure even when the correction turn did not
+invoke the skill. Version history reports uses, failures, and corrections per
+SHA.
+
 **How approval works.** There is no "approved" flag a window can set. When you
 install a candidate, the app raises its ordinary permission prompt describing
 exactly what would be installed — the package digest, the tools it may use,
@@ -287,8 +348,10 @@ offered to the model *and* is refused if called anyway. The deny list on
 proposed skill text is defense in depth against a skill that tries to talk a
 future turn out of its gates — it is not the boundary.
 
-**Settings.** Learning Mode and whether this loop may work in global scope at
-all live in the backend store, so the UI and the CLI read the same values.
+**Settings.** Learning Policy and whether this loop may work in global scope at
+all live in the backend store, so the UI and the CLI read the same values. The
+CLI keeps the older granular `mode` command for compatibility; `policy` is the
+shared three-state interface.
 Turning global scope off confines every candidate to the workspace it was
 observed in. Nothing is ever re-scoped on its own in either direction; moving a
 workspace skill to global is a separate, explicitly approved change.
@@ -350,6 +413,7 @@ Each workbench is a real model-driven flow. Where its scope is narrower than its
 - Configure persistent cron, filesystem, signed webhook, and GitHub triggers with replay protection and deduplication.
 - Pair a user-owned remote runner over direct, Tailscale, or SSH-forwarded HTTPS with pinned TLS, mutually scoped credentials, rotation and revocation, replay protection, and audit history. A controller may view events, inspect bounded artifacts, approve digest-bound requests, cancel runs, or engage the kill switch only when its invitation grants that exact action. Inference, tools, workspaces, and provider keys stay on the runner; Little Monkey operates no relay.
 - Grant a paired controller a scoped Control Desktop action — real mouse and keyboard input on macOS, Windows, and Linux/X11, with Linux/Wayland failing closed. Every action is gated by local consent, per-action by default or batch only when the remote request and local operator agree. A cross-process session lock prevents the app and daemon from driving input at once, periodic screenshots are recorded to the run ledger, and revoking a device or engaging the kill switch force-stops a live session.
+- Use model-facing Computer Use for native applications through an explicit, expiring application/window grant: semantic accessibility inspection first, bounded screenshots and coordinates, frontmost/stale-target revalidation, per-action approval, sensitive-target refusal, redacted audit records, verification-aware outcomes, and a persistent pause/stop/emergency indicator. Browser work routes to the existing DOM/browser worker; terminal work routes to `run_shell`. See [Computer Use](computer-use.md) and the [E2E matrix](computer-use-e2e.md).
 
 ## Desktop companion and mobile
 

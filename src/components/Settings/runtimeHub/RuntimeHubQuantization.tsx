@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { FlaskConical, Gauge, PlayCircle, ShieldAlert } from "lucide-react";
-import { StatusPill, type PillTone } from "../../ui";
+import { open } from "@tauri-apps/plugin-dialog";
+import { File, FlaskConical, FolderOpen, Gauge, PlayCircle, ShieldAlert } from "lucide-react";
+import { Button, StatusPill, type PillTone } from "../../ui";
 import type { ConversionReport, LicenseRisk, QuantTypeDescriptor } from "../../../lib/runtimeHubClient";
 import { useRuntimeHubStore } from "../../../store/runtimeHubStore";
 import {
@@ -133,6 +134,22 @@ function ConvertForm() {
 
   const selectedNote = quantTypes.find((entry) => entry.id === quantChoice)?.note;
 
+  async function chooseSourcePath(directory: boolean) {
+    try {
+      const selected = await open({
+        directory,
+        multiple: false,
+        ...(directory ? {} : { filters: [{ name: "GGUF model", extensions: ["gguf"] }] }),
+      });
+      if (typeof selected === "string") {
+        setSourcePath(selected);
+        setLocalError(null);
+      }
+    } catch {
+      setLocalError("Could not open the source picker.");
+    }
+  }
+
   async function submit(event: FormEvent) {
     event.preventDefault();
     setLocalError(null);
@@ -177,7 +194,31 @@ function ConvertForm() {
           </Field>
         ) : (
           <Field label="Source path" hint="A .gguf file, or a directory containing .safetensors shards.">
-            <input value={sourcePath} onChange={(event) => setSourcePath(event.target.value)} className={`${CONTROL_CLASS} font-mono`} placeholder="/path/to/model.gguf" autoComplete="off" />
+            <div className="flex min-w-0 gap-2">
+              <input value={sourcePath} onChange={(event) => setSourcePath(event.target.value)} className={`${CONTROL_CLASS} min-w-0 flex-1 font-mono`} placeholder="/path/to/model.gguf" autoComplete="off" />
+              <Button
+                type="button"
+                size="sm"
+                variant="secondary"
+                className="min-h-11 shrink-0"
+                aria-label="Choose a GGUF file"
+                title="Choose a GGUF file"
+                onClick={() => void chooseSourcePath(false)}
+              >
+                <File size={14} aria-hidden="true" /> File
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="secondary"
+                className="min-h-11 shrink-0"
+                aria-label="Choose a safetensors folder"
+                title="Choose a safetensors folder"
+                onClick={() => void chooseSourcePath(true)}
+              >
+                <FolderOpen size={14} aria-hidden="true" /> Folder
+              </Button>
+            </div>
           </Field>
         )}
         <Field label="Quantization type" hint={selectedNote}>
@@ -190,7 +231,7 @@ function ConvertForm() {
             ))}
           </select>
         </Field>
-        <label className="flex min-h-11 cursor-pointer items-center gap-2 self-end text-xs text-foreground">
+        <label className="flex min-h-11 cursor-pointer items-center gap-2 text-xs text-foreground sm:mt-6 sm:self-start">
           <input
             type="checkbox"
             checked={allowRequantize}

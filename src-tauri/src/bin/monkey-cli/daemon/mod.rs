@@ -26,6 +26,9 @@ pub(crate) mod fail_points;
 mod ingress_contract;
 pub(crate) mod ingress_store;
 mod ledger;
+/// The whole path against a real provider account, agent included.
+#[cfg(test)]
+mod live_agent_e2e;
 #[cfg(test)]
 mod live_smoke;
 pub(crate) mod peer_audit;
@@ -200,6 +203,10 @@ pub struct DaemonRunArgs {
     pub run_key: Option<String>,
     #[arg(long, default_value_t = 0)]
     pub priority: i32,
+    /// Queue paused so an ownership handoff can activate it only after the
+    /// owner CAS commits.
+    #[arg(long)]
+    pub initially_paused: bool,
     #[arg(long, default_value_t = 1)]
     pub max_attempts: u32,
     #[arg(long, default_value_t = 7 * 24 * 60 * 60)]
@@ -1375,6 +1382,69 @@ impl DaemonPlacementQueue {
     }
 }
 
+/// Queue an immutable autonomous recipe through the resident daemon so task
+/// start has a real supervised executor rather than only a ledger row.
+pub(crate) fn enqueue_frozen_recipe(
+    recipe: Recipe,
+    submitted_run_id: &str,
+) -> Result<QueuedRun, String> {
+    if let Some(snapshot) = recipe.autonomous_task.as_ref() {
+        let owner = snapshot.execution_owner.as_ref().ok_or_else(|| {
+            "Autonomous task recipe requires an execution owner lease".to_string()
+        })?;
+        little_monkey_lib::recipes::claim_autonomous_task_owner(&snapshot.task_id, owner)?;
+    }
+    let paths = DaemonPaths::resolve()?;
+    let config = DaemonConfig::load(&paths)
+        .map_err(|error| format!("this node's background runner is not configured: {error}"))?;
+    let mut store = DaemonStore::open(&paths)?;
+    if store.kill_switch()? {
+        return Err("this node's global kill switch is engaged".to_string());
+    }
+    let mut shared = SharedLedger::open(&paths.ledger_db)?;
+    let job_id = format!(
+        "job-autonomous-{}",
+        &sha256_hex(format!("autonomous:{submitted_run_id}").as_bytes())[..32]
+    );
+    let snapshot_path = paths.snapshots.join(format!("{job_id}.json"));
+    write_snapshot(&snapshot_path, &recipe)?;
+    let global_config_roots = global_config_roots_for_paths(&paths)?;
+    enqueue(
+        None,
+        &paths,
+        &global_config_roots,
+        &config,
+        &mut store,
+        &mut shared,
+        QueueOptions {
+            recipe: snapshot_path.to_string_lossy().into_owned(),
+            params: Vec::new(),
+            origin: QueueOrigin::Local,
+            deterministic_job_id: Some(job_id),
+            priority: 0,
+            initially_paused: false,
+            max_attempts: 1,
+            max_runtime_ms: recipe
+                .timeout_seconds
+                .unwrap_or(7 * 24 * 60 * 60)
+                .saturating_mul(1_000),
+            max_memory_bytes: None,
+            owned_worktree: false,
+            repository: None,
+            branch_prefix: "autonomous/".to_string(),
+            allowed_remotes: vec!["origin".to_string()],
+            allow_commit: false,
+            allow_push: false,
+            allow_create_pull_request: false,
+            allow_review_comment: false,
+            parent_run_id: None,
+            snapshot_is_frozen: true,
+            frozen_execution: None,
+            appended_system: None,
+        },
+    )
+}
+
 /// The recipe target this node will execute a placed spec through.
 ///
 /// A `ManagedLlama` placement is resolved against **this node's** runtime hub,
@@ -1486,19 +1556,42 @@ fn placed_recipe(
     // refused rather than silently rehomed onto the daemon's working directory,
     // which would run the submitter's task against the wrong files — the
     // quietest possible way to get this wrong.
-    let workspace = match snapshot.primary_root() {
-        Some(root) => {
-            let canonical = PathBuf::from(root).canonicalize().map_err(|error| {
-                format!("this node cannot resolve the placed workspace root '{root}': {error}")
-            })?;
-            if !canonical.is_dir() {
-                return Err(format!(
-                    "the placed workspace root '{root}' is not a directory on this node"
-                ));
-            }
-            Some(canonical.to_string_lossy().to_string())
+    let workspace = if let Some(transfer) = &spec.workspace_transfer {
+        let path = little_monkey_lib::execution_target::app_owned_workspace(
+            &app_data,
+            &transfer.workspace_id,
+            &transfer.snapshot_id,
+        )
+        .map_err(|error| error.to_string())?;
+        if !path.exists() {
+            transfer
+                .materialize(&path)
+                .map_err(|error| error.to_string())?;
+            transfer
+                .mark_cached(&path)
+                .map_err(|error| error.to_string())?;
+        } else if !transfer
+            .cached_matches(&path)
+            .map_err(|error| error.to_string())?
+        {
+            return Err("cached placed workspace does not match the requested snapshot".into());
         }
-        None => None,
+        Some(path.to_string_lossy().to_string())
+    } else {
+        match snapshot.primary_root() {
+            Some(root) => {
+                let canonical = PathBuf::from(root).canonicalize().map_err(|error| {
+                    format!("this node cannot resolve the placed workspace root '{root}': {error}")
+                })?;
+                if !canonical.is_dir() {
+                    return Err(format!(
+                        "the placed workspace root '{root}' is not a directory on this node"
+                    ));
+                }
+                Some(canonical.to_string_lossy().to_string())
+            }
+            None => None,
+        }
     };
 
     let recipe = little_monkey_lib::recipes::Recipe {
@@ -1525,6 +1618,12 @@ fn placed_recipe(
         channel_send: None,
         desktop_turn: None,
         placed_run: Some(snapshot),
+        autonomous_task: spec
+            .autonomous_task
+            .clone()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| format!("placed autonomous task snapshot is invalid: {error}"))?,
     };
     little_monkey_lib::recipes::validate_recipe(&recipe)
         .map_err(|error| format!("the placed spec does not form a runnable recipe: {error}"))?;
@@ -1560,6 +1659,7 @@ impl remote::api::PlacementQueue for DaemonPlacementQueue {
             },
             deterministic_job_id: Some(placed_job_id(&spec.run_id)),
             priority: 0,
+            initially_paused: false,
             // A placed run is not retried on this node. A submitter that wants
             // another attempt places it again — possibly somewhere else — which
             // is the decision `node_placement::reconcile_placement` makes with
@@ -1610,6 +1710,26 @@ impl remote::api::PlacementQueue for DaemonPlacementQueue {
         let Some(job) = store.get_job(job_id)? else {
             return Ok(None);
         };
+        let result = little_monkey_lib::run_ledger::RunLedger::open(&self.paths.ledger_db)
+            .ok()
+            .and_then(|ledger| {
+                job.run_id
+                    .as_deref()
+                    .and_then(|run_id| ledger.load_events(run_id, 0, 10_000).ok())
+            })
+            .and_then(|events| {
+                events
+                    .into_iter()
+                    .rev()
+                    .find_map(|event| match event.event {
+                        RunEvent::TaskEvent {
+                            event_type,
+                            payload,
+                            ..
+                        } if event_type == "node_result" => Some(payload),
+                        _ => None,
+                    })
+            });
         Ok(Some(remote::api::PlacedJobState {
             state: format!("{:?}", job.state).to_ascii_lowercase(),
             terminal: matches!(
@@ -1618,6 +1738,7 @@ impl remote::api::PlacementQueue for DaemonPlacementQueue {
             ),
             updated_at_ms: job.updated_at_ms,
             last_error: job.last_error.clone(),
+            result,
         }))
     }
 }
@@ -1658,6 +1779,7 @@ struct QueueOptions {
     origin: QueueOrigin,
     deterministic_job_id: Option<String>,
     priority: i32,
+    initially_paused: bool,
     max_attempts: u32,
     max_runtime_ms: u64,
     max_memory_bytes: Option<u64>,
@@ -1706,6 +1828,7 @@ impl QueueOptions {
             params: args.param.clone(),
             deterministic_job_id,
             priority: args.priority,
+            initially_paused: args.initially_paused,
             max_attempts: args.max_attempts,
             max_runtime_ms: args.max_runtime_seconds.saturating_mul(1000),
             max_memory_bytes: args
@@ -1854,14 +1977,34 @@ fn enqueue(
         .clone()
         .unwrap_or_else(|| format!("job-{}", uuid::Uuid::new_v4()));
     if let Some(existing) = store.get_job(&job_id)? {
-        let run_id = existing
-            .run_id
-            .ok_or_else(|| format!("Existing job '{job_id}' is still preparing"))?;
-        return Ok(QueuedRun {
-            job_id,
-            run_id,
-            state: existing.state,
-        });
+        match existing.run_id {
+            Some(run_id) => {
+                return Ok(QueuedRun {
+                    job_id,
+                    run_id,
+                    state: existing.state,
+                })
+            }
+            // A job that never reached a run and has stopped trying is not
+            // preparing. It failed before the queue — `submit_queued_snapshot`
+            // refused it, or the daemon restarted mid-preparation — and calling
+            // that "still preparing" hides the reason it recorded *and* makes
+            // the id permanently unusable: every resubmission of the same turn
+            // lands right back here, so the operator sees a sentence about
+            // preparation for a job that will never prepare again.
+            //
+            // Drop the dead row and let this attempt start over. Nothing is lost
+            // that ran: there is no run id, so no ledger entry hangs off it, and
+            // the reason it failed goes to the log before the row goes.
+            None if existing.state.is_terminal() => {
+                eprintln!(
+                    "monkey daemon: job '{job_id}' failed before it was queued ({}); starting it over",
+                    existing.last_error.as_deref().unwrap_or("no reason recorded"),
+                );
+                store.delete_terminal_job(&job_id)?;
+            }
+            None => return Err(format!("Existing job '{job_id}' is still preparing")),
+        }
     }
     // A conversational turn executes what was resolved when it was accepted.
     // Everything else resolves now, which is correct for it: a scheduled or
@@ -1958,13 +2101,30 @@ fn enqueue(
         None => effective_system,
     };
     snapshot.params.clear();
-    snapshot.workspace = Some(
-        workspace
-            .canonicalize()
-            .map_err(|error| format!("Cannot canonicalize daemon workspace: {error}"))?
-            .to_string_lossy()
-            .to_string(),
-    );
+    // A turn that declared no workspace of its own keeps none.
+    //
+    // The daemon still needs a directory to run the job in — that is `workspace`
+    // above, recorded on the job row — but writing it back into the snapshot
+    // turns a chat-only desktop turn into one that *carries* a workspace, and
+    // the turn's own frozen contract then refuses it on arrival: "desktop
+    // chat-only turns must not carry a workspace or execution roots". The
+    // resolved directory is `current_dir()` for a recipe that named none, and
+    // the desktop spawns this daemon with the filesystem root as its working
+    // directory — so what a plain question with no folder open acquired was `/`,
+    // and every such turn died before it ran.
+    let desktop_chat_only = snapshot
+        .desktop_turn
+        .as_ref()
+        .is_some_and(|turn| turn.workspace.is_none());
+    if keeps_resolved_workspace(snapshot.workspace.as_deref(), desktop_chat_only) {
+        snapshot.workspace = Some(
+            workspace
+                .canonicalize()
+                .map_err(|error| format!("Cannot canonicalize daemon workspace: {error}"))?
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
     snapshot.output.json = true;
     let snapshot_path = paths.snapshots.join(format!("{job_id}.json"));
     write_snapshot(&snapshot_path, &snapshot)?;
@@ -2003,7 +2163,11 @@ fn enqueue(
                 return Err(error);
             }
         };
-    store.mark_queued(&job_id, &run_id, now_ms()?)?;
+    if options.initially_paused {
+        store.mark_queued_paused(&job_id, &run_id, now_ms()?)?;
+    } else {
+        store.mark_queued(&job_id, &run_id, now_ms()?)?;
+    }
     project_queue_origin(
         shared,
         &options.origin,
@@ -2126,6 +2290,17 @@ fn write_snapshot(path: &Path, recipe: &Recipe) -> Result<(), String> {
     store::restrict_file(path)
 }
 
+/// Whether the directory the daemon resolved to run in belongs in the snapshot.
+///
+/// It does for anything that named a workspace, and for every non-desktop
+/// recipe — a scheduled or hand-run recipe with no `workspace:` is meant to run
+/// where the CLI stands. It does not for a desktop turn that froze itself as
+/// chat-only: that turn promised no workspace and no execution roots, and
+/// recording one contradicts the promise it is validated against.
+fn keeps_resolved_workspace(declared: Option<&str>, desktop_chat_only: bool) -> bool {
+    declared.is_some() || !desktop_chat_only
+}
+
 fn resolve_recipe_workspace(recipe: &Recipe, recipe_path: &Path) -> Result<PathBuf, String> {
     let value = match &recipe.workspace {
         Some(value) => recipe_path
@@ -2211,6 +2386,7 @@ fn event_type(event: &RunEvent) -> &'static str {
         RunEvent::NeedsReconciliation { .. } => "needs_reconciliation",
         RunEvent::MigrationDeparted { .. } => "migration_departed",
         RunEvent::MigrationArrived { .. } => "migration_arrived",
+        RunEvent::TaskEvent { .. } => "task_event",
     }
 }
 
@@ -2295,6 +2471,7 @@ fn retry(cli: &crate::Cli, run_id: &str, acknowledge: bool) -> Result<(), String
         params: vec![],
         deterministic_job_id: None,
         priority: prior.priority,
+        initially_paused: false,
         max_attempts: prior.max_attempts,
         max_runtime_ms: prior.max_runtime_ms,
         max_memory_bytes: prior.max_memory_bytes,
@@ -3197,6 +3374,7 @@ async fn process_one_pending_delivery(
         params,
         deterministic_job_id: Some(deterministic_job_id),
         priority: 0,
+        initially_paused: false,
         max_attempts: 1,
         max_runtime_ms: 7 * 24 * 60 * 60 * 1_000,
         max_memory_bytes: None,
@@ -3493,6 +3671,23 @@ mod tests {
     use little_monkey_lib::workflow_core::{workflow_core_fixtures, WorkflowRunStatus};
 
     #[test]
+    fn a_chat_only_desktop_turn_does_not_acquire_the_daemons_working_directory() {
+        // A turn that named a workspace keeps it, whatever it froze.
+        assert!(keeps_resolved_workspace(Some("/repo"), false));
+        assert!(keeps_resolved_workspace(Some("/repo"), true));
+        // A recipe with no `workspace:` still runs where the CLI stands — that
+        // is what a scheduled or hand-run recipe means by omitting it.
+        assert!(keeps_resolved_workspace(None, false));
+        // But a desktop turn frozen as chat-only promised no workspace and no
+        // execution roots. Recording the resolved directory — `/`, when the app
+        // spawned the daemon from the filesystem root — contradicts the very
+        // contract the turn is validated against, and it was refused before it
+        // ran: "desktop chat-only turns must not carry a workspace or execution
+        // roots".
+        assert!(!keeps_resolved_workspace(None, true));
+    }
+
+    #[test]
     fn ensure_repairs_a_service_left_behind_by_a_previous_app_install() {
         use ServiceAction::*;
 
@@ -3621,6 +3816,7 @@ mod tests {
             param: vec![],
             run_key: Some("raw-secret-key".into()),
             priority: 0,
+            initially_paused: false,
             max_attempts: 1,
             max_runtime_seconds: 60,
             max_memory_mb: None,
@@ -3651,6 +3847,7 @@ mod tests {
             param: vec![],
             run_key: None,
             priority: 0,
+            initially_paused: false,
             max_attempts: 1,
             max_runtime_seconds: 60,
             max_memory_mb: None,

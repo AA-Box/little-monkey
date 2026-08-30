@@ -131,18 +131,19 @@ describe("ChatSessionList across environments", () => {
     });
     render(<ChatSessionList />);
 
-    expect(screen.queryByText(/⌘2|Ctrl\+2/)).toBeNull();
+    expect(screen.queryByText(/⌘1|Ctrl\+1/)).toBeNull();
     fireEvent.keyDown(window, { key: "Control", ctrlKey: true });
-    expect(screen.getByText(/⌘2|Ctrl\+2/)).toBeTruthy();
+    expect(screen.getByText(/⌘1|Ctrl\+1/)).toBeTruthy();
     const row = screen.getByText("Local session").closest("[role=button]")!;
     fireEvent.pointerEnter(row);
-    expect(screen.queryByText(/⌘2|Ctrl\+2/)).toBeNull();
+    expect(screen.queryByText(/⌘1|Ctrl\+1/)).toBeNull();
+    expect(screen.getByText(/⌘2|Ctrl\+2/)).toBeTruthy();
     fireEvent.pointerLeave(row);
     fireEvent.keyUp(window, { key: "Control", ctrlKey: false });
-    expect(screen.queryByText(/⌘2|Ctrl\+2/)).toBeNull();
+    expect(screen.queryByText(/⌘1|Ctrl\+1/)).toBeNull();
   });
 
-  it("shows the workspace in the hover preview for chats without Git context", () => {
+  it("shows the workspace after a short dwell for chats without Git context", async () => {
     useSessionStore.setState({
       sessions: [session({ workspacePath: "/work/newApp" })],
       activeSessionId: "local-1",
@@ -150,7 +151,7 @@ describe("ChatSessionList across environments", () => {
     render(<ChatSessionList />);
 
     fireEvent.pointerEnter(screen.getByText("Local session").closest("[role=button]")!);
-    expect(screen.getByText("newApp")).toBeTruthy();
+    expect(await screen.findByText("newApp")).toBeTruthy();
   });
 
   it("lists a conversation the daemon owns beside the local sessions", async () => {

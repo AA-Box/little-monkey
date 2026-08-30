@@ -26,7 +26,7 @@ import { cpSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } f
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { buildManifest, canonicalJson, signManifest } from "./lib/mlxPackage.mjs";
+import { buildManifest, canonicalJson, serviceRevision, signManifest } from "./lib/mlxPackage.mjs";
 
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SOURCE_SERVICE = join(REPOSITORY_ROOT, "packaging/mlx/service/mlx_server.py");
@@ -120,9 +120,11 @@ function build() {
   cpSync(SOURCE_VIDEO_SERVICE, join(OUTPUT_ROOT, "service/mlx_video_server.py"));
 
   const pythonExecutable = "runtime/bin/python3";
+  // `svc-` is what makes a service-only fix a new version rather than a
+  // same-named rebuild nothing upgrades to — see `serviceRevision`.
   const version = `mlx-lm-${MLX_LM_VERSION}+video-${MLX_VIDEO_COMMIT.slice(0, 12)}+${pythonVersion(
     join(OUTPUT_ROOT, pythonExecutable),
-  )}`;
+  )}+svc-${serviceRevision([SOURCE_SERVICE, SOURCE_VIDEO_SERVICE])}`;
   let manifest = buildManifest({
     root: OUTPUT_ROOT,
     packageVersion: version,

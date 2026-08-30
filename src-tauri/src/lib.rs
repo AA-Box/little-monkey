@@ -1,4 +1,4 @@
-#![recursion_limit = "2048"]
+#![recursion_limit = "4096"]
 
 // `pub` so every module below (and `monkey-cli`, which has no `AppHandle`)
 // resolves the app-data directory through one shared `data_dir()` instead of
@@ -101,6 +101,10 @@ pub mod support_bundle;
 // health). Self-contained: engine + thin command layer live in one file,
 // same convention as `ollama`/`llama`/`server`/`mcp`/`stacks`.
 pub mod diagnostics;
+// Stable execution-target contract shared by local, Docker, paired-node, and
+// SSH-runner execution. The module is Tauri-free so the CLI and remote runner
+// use the exact same identity, capability, transfer, and result validation.
+pub mod execution_target;
 pub mod workflow_core;
 // Runtime/model hub service plus its thin desktop command layer. The hub
 // composes Ollama, managed llama.cpp, MLX, catalog/download, and API policy
@@ -136,6 +140,7 @@ pub mod runtime_telemetry;
 // endpoints. The module owns its media jobs so normal app shutdown can revoke
 // every grant and cancel every child/network task before Tauri exits.
 pub mod dictation;
+pub mod local_whisper;
 pub mod m7_companion;
 // Global Command Palette (ROADMAP.md, Phase 1): owns only the OS-level
 // shortcut's persisted configuration and "bring the palette to the front"
@@ -154,6 +159,13 @@ pub mod desktop_control;
 // Apple-Silicon-only MLX lifecycle adapter. It is compiled only into the macOS
 // build: MLX needs Metal, so a Windows or Linux binary that carried this module
 // would ship an implementation it can never run.
+/// The loopback OpenAI-compatible endpoint that lets the ordinary chat path
+/// talk to an MLX model.
+///
+/// Not gated to macOS even though MLX is: this module names no MLX type, only
+/// the runtime hub. On a platform with no MLX driver the hub answers "unknown
+/// runtime", which is a clearer failure than a missing command.
+pub mod mlx_chat;
 #[cfg(target_os = "macos")]
 pub mod mlx_runtime;
 // Inbound OpenAI/Anthropic compatibility translations and the scoped,
@@ -248,6 +260,8 @@ pub mod config_revisions;
 // the CLI cannot drift into two different learning behaviours.
 mod login_path;
 mod sessions;
+pub mod skill_activation;
+mod skill_activation_commands;
 pub mod skill_learning;
 mod skill_learning_commands;
 mod system;
@@ -499,6 +513,9 @@ pub struct AppState {
     /// speaking `studio_tools`' small HTTP contract.
     pub studio_tool: studio_tools::StudioToolState,
     pub llama: std::sync::Mutex<llama::LlamaState>,
+    /// The loopback OpenAI endpoint in front of the MLX runtime, when an MLX
+    /// model is the active chat model. See `mlx_chat`.
+    pub mlx_chat: mlx_chat::MlxChatState,
     /// The second, embeddings-only managed `llama-server` instance (port
     /// 8091, started with `--embeddings --pooling mean`) used by
     /// `stacks.rs`'s managed-llama embedding backend — a distinct
@@ -772,6 +789,7 @@ impl Default for AppState {
     fn default() -> Self {
         AppState {
             generation_engine: Default::default(),
+            mlx_chat: Default::default(),
             studio_tool: Default::default(),
             llama: Default::default(),
             embed_llama: std::sync::Mutex::new(llama::LlamaState::for_embeddings()),
@@ -813,8 +831,62 @@ impl Default for AppState {
     }
 }
 
+/// Whether any window the user can actually see is still open.
+///
+/// `is_visible` is what separates a window that was closed from one that was
+/// only hidden: hiding leaves the window alive in `webview_windows()`, which is
+/// why counting windows instead of visible ones keeps the app running with
+/// nothing on screen.
+///
+/// A minimized window counts as one the user still has. `is_visible` is
+/// `NSWindow.isVisible` on macOS, which a miniaturized window answers `false`
+/// — so without the `is_minimized` arm, closing one window while another sits
+/// in the Dock would quit the app and take that window with it.
+fn any_window_visible<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
+    app.webview_windows().values().any(|window| {
+        window.is_visible().unwrap_or(false) || window.is_minimized().unwrap_or(false)
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let full_product_e2e = std::env::var("COMPUTER_USE_FULL_PRODUCT_E2E").as_deref() == Ok("1");
+    const FULL_PRODUCT_E2E_CAPABILITY: &str = r#"{
+  "identifier": "computer-use-full-product-e2e",
+  "description": "Runtime-only capability for the real frontend/native acceptance window",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:1420/**"]
+  },
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "opener:default",
+    "shell:default",
+    "dialog:default",
+    "fs:default",
+    "deep-link:default",
+    "updater:default",
+    "process:allow-restart",
+    "allow-computer-use-full-product-report",
+    "allow-desktop-control-start-session",
+    "allow-desktop-control-stop-session",
+    "allow-desktop-control-provider-info",
+    "allow-tool-computer-list-targets",
+    "allow-tool-computer-inspect",
+    "allow-tool-computer-click",
+    "allow-tool-computer-set-value",
+    "allow-tool-computer-screenshot",
+    {
+      "identifier": "fs:allow-write-text-file",
+      "allow": [{ "path": "$TEMP/**" }]
+    },
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [{ "path": "$TEMP/**" }]
+    }
+  ]
+}"#;
     // Before anything else, and before any thread exists: a GUI launch hands us
     // launchd's `PATH`, so every shell tool would miss the user's own binaries
     // (`~/.local/bin`, Homebrew, version-manager shims) until this runs.
@@ -849,6 +921,9 @@ pub fn run() {
     let skill_learning_state =
         skill_learning_commands::SkillLearningCommandState::production(&app_data_dir)
             .expect("failed to initialize the skill learning store");
+    let skill_activation_state =
+        skill_activation_commands::SkillActivationCommandState::production(&app_data_dir)
+            .expect("failed to initialize the skill activation store");
     // Resolves an interrupted promotion against what is actually installed
     // before anything can discover or invoke a half-published skill.
     skill_learning_commands::reconcile_at_startup(
@@ -882,47 +957,51 @@ pub fn run() {
     // plugin instance per app), disambiguated in the shared handler below by
     // comparing the fired `Shortcut` against this parsed constant.
     const DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT: &str = "CommandOrControl+Shift+Escape";
-    let desktop_control_emergency_stop_shortcut: tauri_plugin_global_shortcut::Shortcut =
-        DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT
-            .parse()
-            .expect("the desktop control emergency-stop hotkey must be valid");
-    // All three global OS-level shortcuts (the companion overlay's, the
-    // command palette's, and desktop control's fixed emergency stop) share
-    // one `tauri_plugin_global_shortcut` plugin registration — a Tauri app
-    // manages exactly one instance of each plugin — and one dispatching
-    // handler that tells them apart by comparing the fired `Shortcut`
-    // against each feature's configured, already-parsed value
-    // (`Shortcut`/`HotKey` derives `PartialEq`).
-    let companion_shortcut_parsed = configured_companion_shortcut
-        .parse::<tauri_plugin_global_shortcut::Shortcut>()
-        .expect("the configured companion shortcut must be valid");
-    let palette_shortcut_parsed = configured_palette_shortcut
-        .parse::<tauri_plugin_global_shortcut::Shortcut>()
-        .expect("the configured command palette shortcut must be valid");
-    let global_shortcuts = tauri_plugin_global_shortcut::Builder::new()
-        .with_shortcut(configured_companion_shortcut.as_str())
-        .expect("the configured companion shortcut must be valid")
-        .with_shortcut(configured_palette_shortcut.as_str())
-        .expect("the configured command palette shortcut must be valid")
-        .with_shortcut(DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT)
-        .expect("the desktop control emergency-stop hotkey must be valid")
-        .with_handler(move |app, shortcut, event| {
-            if event.state != tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                return;
-            }
-            if *shortcut == desktop_control_emergency_stop_shortcut {
-                let state = app.state::<desktop_control::DesktopControlState>();
-                let _ = state.emergency_stop();
-                if let Some(overlay) = app.get_webview_window("companion-overlay") {
-                    let _ = overlay.hide();
+    // The full-product acceptance process may run beside another Tauri app on
+    // the hosted desktop. It still exercises the emergency-stop implementation
+    // through the normal desktop-control state, but must not claim the user's
+    // machine-wide shortcuts and collide with that other process.
+    let global_shortcuts = if full_product_e2e {
+        tauri_plugin_global_shortcut::Builder::new().build()
+    } else {
+        let desktop_control_emergency_stop_shortcut: tauri_plugin_global_shortcut::Shortcut =
+            DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT
+                .parse()
+                .expect("the desktop control emergency-stop hotkey must be valid");
+        // All three global OS-level shortcuts share one plugin registration and
+        // one dispatching handler that tells them apart by comparing the fired
+        // Shortcut against each feature's configured value.
+        let companion_shortcut_parsed = configured_companion_shortcut
+            .parse::<tauri_plugin_global_shortcut::Shortcut>()
+            .expect("the configured companion shortcut must be valid");
+        let palette_shortcut_parsed = configured_palette_shortcut
+            .parse::<tauri_plugin_global_shortcut::Shortcut>()
+            .expect("the configured command palette shortcut must be valid");
+        tauri_plugin_global_shortcut::Builder::new()
+            .with_shortcut(configured_companion_shortcut.as_str())
+            .expect("the configured companion shortcut must be valid")
+            .with_shortcut(configured_palette_shortcut.as_str())
+            .expect("the configured command palette shortcut must be valid")
+            .with_shortcut(DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT)
+            .expect("the desktop control emergency-stop hotkey must be valid")
+            .with_handler(move |app, shortcut, event| {
+                if event.state != tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                    return;
                 }
-            } else if *shortcut == companion_shortcut_parsed {
-                let _ = m7_companion::show_overlay(app);
-            } else if *shortcut == palette_shortcut_parsed {
-                let _ = command_palette::show_palette(app);
-            }
-        })
-        .build();
+                if *shortcut == desktop_control_emergency_stop_shortcut {
+                    let state = app.state::<desktop_control::DesktopControlState>();
+                    let _ = state.emergency_stop();
+                    if let Some(overlay) = app.get_webview_window("companion-overlay") {
+                        let _ = overlay.hide();
+                    }
+                } else if *shortcut == companion_shortcut_parsed {
+                    let _ = m7_companion::show_overlay(app);
+                } else if *shortcut == palette_shortcut_parsed {
+                    let _ = command_palette::show_palette(app);
+                }
+            })
+            .build()
+    };
     let app = tauri::Builder::default()
         // Must be registered first (per tauri-plugin-single-instance's own
         // docs) so it can intercept a second launch before anything else
@@ -953,6 +1032,7 @@ pub fn run() {
         .manage(m4_state)
         .manage(native_skills_state)
         .manage(skill_learning_state)
+        .manage(skill_activation_state)
         .manage(browser_state)
         .manage(browser_pane::BrowserPaneState::default())
         .manage(m7_state)
@@ -969,7 +1049,32 @@ pub fn run() {
         .register_uri_scheme_protocol("artifact", |ctx, request| {
             artifacts::handle_request(ctx.app_handle().state::<AppState>().inner(), &request)
         })
-        .setup(|app| {
+        .setup(move |app| {
+            if full_product_e2e {
+                app.add_capability(FULL_PRODUCT_E2E_CAPABILITY)
+                    .expect("full product acceptance capability must be valid");
+            }
+            if full_product_e2e && app.get_webview_window("main").is_none() {
+                eprintln!("full product app had no main webview; creating the acceptance window");
+                tauri::WebviewWindowBuilder::new(
+                    app,
+                    "main",
+                    tauri::WebviewUrl::External(
+                        "http://127.0.0.1:1420/"
+                            .parse()
+                            .expect("full product dev URL must be valid"),
+                    ),
+                )
+                .title("Little Monkey")
+                .inner_size(1440.0, 800.0)
+                .build()
+                .expect("full product main window must be creatable");
+            }
+            // Keep the native-skill registry live for external edits and
+            // cross-window updates. Workspace restoration below triggers a
+            // second sync once the primary root is known.
+            native_skill_commands::sync_native_skill_watchers(app.handle());
+
             // Listens for `littlemonkey://` deep links (macOS/mobile live
             // events; Windows/Linux fresh-launch CLI-arg parsing — a
             // still-running instance on those platforms is covered by the
@@ -1004,6 +1109,30 @@ pub fn run() {
                         eprintln!("Managed {} runtime setup failed: {error}", spec.id);
                     }
                 }
+            }
+
+            // Prepare the built-in local speech model without blocking the UI.
+            // This is an optimization, not a gate: every local transcription calls
+            // prepare() again, so a first-launch network failure automatically retries
+            // when the user actually speaks. No path selection or external runtime is
+            // required on macOS, Windows, or Linux.
+            {
+                // The installed app carries the model as a bundled resource;
+                // prepare() then has nothing to download at all.
+                local_whisper::set_resource_dir(app.path().resource_dir().ok().as_deref());
+                let speech_data_dir = app_data_dir.clone();
+                tauri::async_runtime::spawn(async move {
+                    // The configured tier, not always the bundled one: an
+                    // operator who chose a larger model should have it fetched
+                    // now, not discover the download when they first speak.
+                    let model_id = m7_companion::M7CompanionState::production(&speech_data_dir)
+                        .and_then(|state| state.config())
+                        .map(|config| config.voice.transcription_model)
+                        .unwrap_or_else(|_| local_whisper::DEFAULT_MODEL_ID.to_string());
+                    if let Err(error) = local_whisper::prepare(&speech_data_dir, &model_id).await {
+                        eprintln!("Built-in local speech model setup failed; it will retry on use: {error}");
+                    }
+                });
             }
 
             // K22 startup self-integrity check. Runs *after* materialization on
@@ -1250,6 +1379,9 @@ pub fn run() {
             models::models_list_installed,
             models::models_download,
             models::models_cancel_download,
+            mlx_chat::mlx_chat_start,
+            mlx_chat::mlx_chat_status,
+            mlx_chat::mlx_chat_stop,
             models::models_resolve_reference,
             models::models_install_reference,
             models::models_delete,
@@ -1404,6 +1536,11 @@ pub fn run() {
             agent_worktrees::worktree_status,
             agent_worktrees::worktree_remove,
             agent_worktrees::worktree_apply,
+            agent_worktrees::worktree_workspace_revision,
+            agent_worktrees::worktree_workspace_snapshot,
+            agent_worktrees::worktree_workspace_changed_files_since_snapshot,
+            agent_worktrees::worktree_workspace_restore_paths,
+            agent_worktrees::worktree_workspace_snapshot_discard,
             mcp::mcp_list_servers,
             mcp::mcp_add_server,
             mcp::mcp_current_revision,
@@ -1597,6 +1734,9 @@ pub fn run() {
             skill_learning_commands::skill_learning_mode,
             skill_learning_commands::skill_learning_set_mode,
             skill_learning_commands::skill_learning_detect,
+            skill_learning_commands::skill_learning_capture_eligibility,
+            skill_learning_commands::skill_learning_scope_for_run,
+            skill_learning_commands::skill_learning_capture,
             skill_learning_commands::skill_learning_list_candidates,
             skill_learning_commands::skill_learning_candidate,
             skill_learning_commands::skill_learning_begin_reflection,
@@ -1615,9 +1755,17 @@ pub fn run() {
             skill_learning_commands::skill_learning_set_settings,
             skill_learning_commands::skill_learning_reflection_brief,
             skill_learning_commands::skill_learning_learned_skills,
+            skill_learning_commands::skill_learning_quality_summaries,
+            skill_learning_commands::skill_learning_improvement_evidence,
+            skill_learning_commands::skill_learning_run_evidence,
+            skill_learning_commands::skill_learning_begin_improvement,
             skill_learning_commands::skill_learning_effectiveness,
             skill_learning_commands::skill_learning_deprecate,
             skill_learning_commands::skill_learning_discover,
+            skill_activation_commands::skill_activation_list,
+            skill_activation_commands::skill_activation_get,
+            skill_activation_commands::skill_activation_set,
+            skill_activation_commands::skill_activation_migrate,
             security_commands::security_audit,
             self_integrity::self_integrity_report,
             update_rollback::update_install_info,
@@ -1775,6 +1923,8 @@ pub fn run() {
             daemon_commands::daemon_desktop_kill_switch,
             daemon_commands::daemon_desktop_triggers,
             m6a_desktop_bridge::m6a_desktop_turn_submit,
+            m6a_desktop_bridge::autonomous_task_submit,
+            m6a_desktop_bridge::autonomous_task_owner_fence,
             daemon_commands::daemon_desktop_sync_recipe_schedules,
             daemon_commands::remote_host_status,
             daemon_commands::remote_host_configure,
@@ -1797,6 +1947,18 @@ pub fn run() {
             daemon_commands::remote_placements,
             daemon_commands::remote_node_refresh,
             daemon_commands::remote_placement_sync,
+            daemon_commands::autonomous_task_place_node,
+            daemon_commands::autonomous_task_recover_node,
+            daemon_commands::autonomous_task_control_node,
+            daemon_commands::execution_targets_list,
+            daemon_commands::execution_target_probe,
+            daemon_commands::execution_target_add,
+            daemon_commands::execution_target_remove,
+            daemon_commands::execution_workspace_push,
+            daemon_commands::execution_result_review,
+            daemon_commands::execution_result_apply,
+            daemon_commands::execution_result_export,
+            daemon_commands::execution_result_discard,
             daemon_commands::remote_node_label,
             m5_delivery::m5_delivery_prepare_mutation,
             m5_delivery::m5_delivery_execute_mutation,
@@ -1830,6 +1992,9 @@ pub fn run() {
             m7_companion::m7_overlay_submit,
             m7_companion::m7_config_get,
             m7_companion::m7_config_save,
+            m7_companion::m7_transcription_languages,
+            m7_companion::m7_transcription_models,
+            m7_companion::m7_transcription_model_install,
             m7_companion::m7_talk_status,
             m7_companion::m7_talk_metrics,
             m7_companion::m7_talk_metric_record,
@@ -1884,6 +2049,7 @@ pub fn run() {
             m7_companion::m7_image_insert_chat,
             m7_companion::m7_emergency_stop,
             dictation::dictation_capabilities,
+            dictation::dictation_open_permission_settings,
             dictation::dictation_start,
             dictation::dictation_stop,
             dictation::dictation_cancel,
@@ -1897,10 +2063,27 @@ pub fn run() {
             privacy_firewall::privacy_firewall_execute_send,
             desktop_control::desktop_control_start_session,
             desktop_control::desktop_control_stop_session,
+            desktop_control::desktop_control_pause_session,
             desktop_control::desktop_control_sessions,
             desktop_control::desktop_control_request_action,
             desktop_control::desktop_control_respond_action,
             desktop_control::desktop_control_emergency_stop,
+            desktop_control::computer_use_full_product_report,
+            desktop_control::desktop_control_provider_info,
+            desktop_control::tool_computer_list_targets,
+            desktop_control::tool_computer_screenshot,
+            desktop_control::tool_computer_clipboard_read,
+            desktop_control::tool_computer_inspect,
+            desktop_control::tool_computer_focus,
+            desktop_control::tool_computer_click,
+            desktop_control::tool_computer_double_click,
+            desktop_control::tool_computer_scroll,
+            desktop_control::tool_computer_type,
+            desktop_control::tool_computer_key,
+            desktop_control::tool_computer_hotkey,
+            desktop_control::tool_computer_wait,
+            desktop_control::tool_computer_select,
+            desktop_control::tool_computer_set_value,
             runtime_pr_watcher::runtime_pr_watcher_state,
             runtime_pr_watcher::runtime_pr_watcher_check_now,
         ])
@@ -1908,6 +2091,23 @@ pub fn run() {
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {
+        // Closing the last window a user can see must quit the app. Windows
+        // the app hides rather than closes — `companion-overlay` is hidden on
+        // dismiss (see `m7_companion::hide_overlay`) and built with
+        // `skip_taskbar(true)` — still count as live windows to the runtime,
+        // so without this the process survives its own UI: menu bar owned, no
+        // window on screen, and a dock click that opens nothing because
+        // `RunEvent::Reopen` goes unhandled.
+        if let tauri::RunEvent::WindowEvent {
+            event: tauri::WindowEvent::Destroyed,
+            ..
+        } = &event
+        {
+            if !any_window_visible(app_handle) {
+                app_handle.exit(0);
+            }
+        }
+
         // `App::run` never returns — once the event loop is done, the
         // underlying `tao` runtime calls `std::process::exit` directly
         // (see its own doc comment), which skips Rust's Drop-based cleanup

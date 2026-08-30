@@ -12,12 +12,11 @@ import { Button } from "../ui";
 import { errorMessage } from "../../lib/errors";
 
 /**
- * Safe Desktop Control settings surface — a design-validation research
- * spike (ROADMAP.md Phase 5, Status: Research). See
+ * Native Computer Use grant surface. See
  * `docs/safe-desktop-control-design.md` and `src-tauri/src/desktop_control.rs`
- * for the full threat model. This panel is the ONLY way to reach the
- * feature: there is no agent tool for it, so nothing here is exposed to the
- * model's own initiative.
+ * for the full threat model. This panel owns the local grant that makes the
+ * model-facing tools available; the model cannot create, widen, pause, or
+ * approve the grant.
  */
 
 const INPUT =
@@ -84,8 +83,11 @@ export function DesktopControlPanel() {
   const emergencyStop = useDesktopControlStore((s) => s.emergencyStop);
 
   const [allowlistInput, setAllowlistInput] = useState("");
+  const [allowedWindowsInput, setAllowedWindowsInput] = useState("");
   const [lifetimeMinutes, setLifetimeMinutes] = useState("5");
   const [approvedBatch, setApprovedBatch] = useState(false);
+  const [allowScreenshots, setAllowScreenshots] = useState(true);
+  const [allowKeyboardInput, setAllowKeyboardInput] = useState(true);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
@@ -122,23 +124,33 @@ export function DesktopControlPanel() {
         .filter(Boolean),
     [allowlistInput],
   );
+  const allowedWindows = useMemo(
+    () => allowedWindowsInput.split(",").map((entry) => entry.trim()).filter(Boolean),
+    [allowedWindowsInput],
+  );
 
   const handleStart = useCallback(async () => {
     setBusy(true);
     setLocalError(null);
     try {
       const lifetimeMs = Math.max(1, Math.round(Number(lifetimeMinutes) || 0)) * 60_000;
-      const session = await startSession(allowlist, lifetimeMs, approvedBatch);
+      const session = await startSession(allowlist, lifetimeMs, approvedBatch, {
+        allowedWindows,
+        allowScreenshots,
+        allowKeyboardInput,
+        allowClipboardRead: false,
+      });
       setStatus(t("DesktopControlPanel.sessionStarted"));
       setTestSessionId(session.sessionId);
       setTestTarget(session.allowedApplications[0] ?? "");
       setAllowlistInput("");
+      setAllowedWindowsInput("");
     } catch (reason) {
       setLocalError(errorText(reason));
     } finally {
       setBusy(false);
     }
-  }, [allowlist, approvedBatch, lifetimeMinutes, startSession, t]);
+  }, [allowKeyboardInput, allowScreenshots, allowedWindows, allowlist, approvedBatch, lifetimeMinutes, startSession, t]);
 
   const handleStop = useCallback(
     async (sessionId: string) => {
@@ -194,6 +206,8 @@ export function DesktopControlPanel() {
           return t("DesktopControlPanel.actionDescriptionMouseClick", { button: action.button });
         case "key_press":
           return t("DesktopControlPanel.actionDescriptionKeyPress", { key: action.key });
+        default:
+          return action.kind;
       }
     },
     [t],
@@ -224,6 +238,11 @@ export function DesktopControlPanel() {
             description={t("DesktopControlPanel.enableDescription")}
           />
         </div>
+        {activeSessions.length > 0 && (
+          <div className="mt-3 rounded-md border border-warning/50 bg-warning/10 px-3 py-2 text-xs text-foreground">
+            Little Monkey is controlling: {activeSessions.map((session) => session.allowedApplications.join(", ")).join("; ")}
+          </div>
+        )}
       </section>
 
       {enabled && (
@@ -240,6 +259,15 @@ export function DesktopControlPanel() {
                 placeholder={t("DesktopControlPanel.allowlistPlaceholder")}
               />
             </label>
+            <label className="mt-2 block text-xs text-muted">
+              Allowed window ids (optional, comma-separated)
+              <input
+                className={`${INPUT} mt-1`}
+                value={allowedWindowsInput}
+                onChange={(event) => setAllowedWindowsInput(event.target.value)}
+                placeholder="e.g. Notes::window-0"
+              />
+            </label>
             <div className="mt-2 grid grid-cols-2 gap-2">
               <label className="text-xs text-muted">
                 {t("DesktopControlPanel.lifetimeLabel")}
@@ -254,6 +282,20 @@ export function DesktopControlPanel() {
                 <input type="checkbox" checked={approvedBatch} onChange={(event) => setApprovedBatch(event.target.checked)} />
                 {t("DesktopControlPanel.approvedBatchLabel")}
               </label>
+            </div>
+            <div className="mt-2 grid grid-cols-2 gap-2">
+              <Toggle
+                checked={allowScreenshots}
+                onChange={setAllowScreenshots}
+                label="Allow screenshots"
+                description="Required for visual verification; regions remain bounded to the target."
+              />
+              <Toggle
+                checked={allowKeyboardInput}
+                onChange={setAllowKeyboardInput}
+                label="Allow keyboard input"
+                description="Needed for typing, keys, hotkeys, and semantic value changes."
+              />
             </div>
             <Button
               className="mt-3"
@@ -288,7 +330,7 @@ export function DesktopControlPanel() {
                         )}
                       </p>
                       <p className="text-muted">
-                        {session.active ? t("DesktopControlPanel.statusActive") : t("DesktopControlPanel.statusInactive")}
+                        {session.active ? (session.paused ? "Paused" : t("DesktopControlPanel.statusActive")) : t("DesktopControlPanel.statusInactive")}
                       </p>
                     </div>
                     {session.active && (
@@ -315,7 +357,10 @@ export function DesktopControlPanel() {
                     key={pending.actionId}
                     className="flex items-center justify-between rounded-md border border-border bg-background px-3 py-2 text-xs"
                   >
-                    <span>{describeAction(pending.action)}</span>
+                    <span>
+                      <span className="mr-2 rounded-full border border-border px-1.5 py-0.5 text-[10px] uppercase text-muted">{pending.approvalLevel}</span>
+                      {describeAction(pending.action)}
+                    </span>
                     <div className="flex gap-2">
                       <Button size="sm" variant="primary" onClick={() => void respondAction(pending.actionId, true)}>
                         {t("DesktopControlPanel.approveButton")}

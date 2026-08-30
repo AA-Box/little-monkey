@@ -77,6 +77,10 @@ monkey stacks embed-server start --model-path <embedding.gguf> | status | stop
 monkey task list | validate <recipe-file>
 monkey task run <name-or-path> [--param key=value ...] [--json]
 monkey task schedule <name-or-path> --cron "<expr>"
+monkey task start "<objective>" --target ollama:<model> [--workspace <path>] [--json]
+monkey task status [--run-id <id>] [--json]
+monkey task attach <run-id> [--follow] [--json]
+monkey task guide|pause|resume|cancel <run-id> [<guidance>]
 
 monkey workflow list | validate <definition.json>
 monkey workflow run <workflow-id> [--inputs '{}'] [--secrets '{}']
@@ -145,3 +149,23 @@ The `device-*`, `voice-*` and `push-*` commands are documented in
 In the REPL, `/help` lists terminal-only controls such as `/set`, `/show`, `/save`, `/load`, `/revert`, `/persona`, `/prompts`, `/verify`, `/clear`, and `/bye`. Installed skill invocations use the same frozen, turn-scoped prompt composition as desktop chat.
 
 The desktop bundle stages `monkey-cli` as a Tauri sidecar and performs a best-effort, non-elevated install of the `monkey` command on first launch — `/usr/local/bin/monkey` when writable, otherwise `~/.local/bin/monkey`; on Windows `%LOCALAPPDATA%\Programs\monkey-cli\monkey.exe`, with that directory added to the user `PATH`. Shell startup files are not edited. The Rust target remains named `monkey-cli`.
+
+Execution targets and portable workspaces use the same frozen contracts as the
+desktop app:
+
+```sh
+monkey targets list [--json]
+monkey targets probe <id>
+monkey targets add docker <id> <image> [--runner-data <absolute-path>]
+monkey targets add ssh <id> <host> --known-hosts <absolute-path> [--user <name>] [--port <n>] [--key-file <absolute-path>]
+monkey targets remove <id>
+monkey workspace push <path> [--workspace-id <id>] [--output transfer.json]
+monkey workspace result <result.json> --workspace <path> --base-digest <digest>
+monkey runner probe
+monkey runner serve --stdio
+```
+
+`workspace result` refuses a changed base and checks Git patches before
+applying them. It never forwards the originating environment or SSH private
+key bytes. For the architecture and security boundary, read
+[Execution targets](execution-targets.md).

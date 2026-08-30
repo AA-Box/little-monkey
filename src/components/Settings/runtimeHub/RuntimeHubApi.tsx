@@ -188,7 +188,7 @@ export function RuntimeHubApi() {
         </div>
 
         <Field label="JSON request body" hint="Streaming is intentionally exercised through the HTTP SSE route, not this IPC diagnostic.">
-          <textarea value={body} onChange={(event) => setBody(event.target.value)} rows={14} spellCheck={false} className={`${CONTROL_CLASS} resize-y font-mono leading-5`} />
+          <textarea value={body} onChange={(event) => setBody(event.target.value)} rows={14} spellCheck={false} className={`${CONTROL_CLASS} min-h-72 resize-y font-mono leading-5`} />
         </Field>
 
         <ErrorNotice message={localError ?? backendError ?? cancelError} />

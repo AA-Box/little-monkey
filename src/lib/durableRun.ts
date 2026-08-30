@@ -631,6 +631,12 @@ export class DurableRunRecorder {
     await this.enqueue({ type: "cancelled", payload: { reason: safeReason } });
     await this.flush();
   }
+
+  async awaitApproval(reason: string, requestId = `approval-${this.runId}`): Promise<void> {
+    if (this.terminal) return this.flush();
+    await this.enqueue({ type: "awaiting_approval", payload: { request_id: requestId, operation_sha256: requestId, expires_at_ms: Date.now() + 30 * 60_000, reason: this.redact(reason) } });
+    await this.flush();
+  }
 }
 
 /** Starts a real ledger-backed desktop run inside Tauri. Browser-only UI
@@ -677,4 +683,10 @@ export async function beginDurableRun(options: BeginDurableRunOptions): Promise<
   await appendRunEvent(options.runId, { type: "queued", payload: { queue: "desktop-interactive" } }, recorder.actorId);
   await appendRunEvent(options.runId, { type: "started", payload: { engine_id: "desktop-turn-engine-v1" } }, recorder.actorId);
   return recorder;
+}
+
+export async function attachDurableRun(options: Pick<BeginDurableRunOptions, "runId" | "actorId" | "roots">): Promise<DurableRunRecorder | null> {
+  if (!isTauri()) return null;
+  if (await runProtocolVersion().catch(() => 0) !== RUN_PROTOCOL_SCHEMA_VERSION) return null;
+  return new DurableRunRecorder(options.runId, options.actorId ?? null, options.roots.map((root) => root.path));
 }

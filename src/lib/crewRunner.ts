@@ -1,5 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 
+import { resolveLoadedLocalEndpoint } from "./targetRouting";
+
 import {
   MENTION_NOTE_PREFIX,
   attachedStackPromptInfo,
@@ -10,6 +12,7 @@ import {
 } from "./agentLoop";
 import { composeReferencedText } from "./mentions";
 import { currentSystemPrompt } from "./systemPrompt";
+import { freezeStandardsForTask } from "./standardsExecution";
 import {
   attemptStream,
   executeToolCall,
@@ -78,12 +81,6 @@ const MAX_TOOL_RESULT_CHARS = 30_000;
 const MAX_REPORT_CHARS = 30_000;
 const MAX_MUTATION_PROPOSALS = 12;
 const CONSERVATIVE_PROVIDER_COST_PER_MILLION_TOKENS_USD = 50;
-
-interface LlamaStatusResult {
-  status: "stopped" | "starting" | "ready" | "error";
-  port: number;
-  model_path: string | null;
-}
 
 interface ActiveCrewExecution {
   controller: AbortController;
@@ -160,14 +157,6 @@ async function initializeActorRecorders(
     });
     if (!recorder) return;
     execution.recorders.set(actor.actorId, recorder);
-    // Projected onto the unified process table, keyed on the actor's durable run
-    // id (unique per attempt) rather than its `actorId`, which repeats when a
-    // crew is re-run and would collide with the previous run's record.
-    //
-    // No parent edge: the coordinator is initialized last and every actor is
-    // initialized concurrently, so a member's reference to it is not reliably
-    // resolvable. Crew actors are therefore siblings here, the same gap they
-    // already had in the ledger. Fail-soft — see `processTable.ts`.
     const processIdPromise = admitProcess({
       kind: 'crew_member',
       externalId: recorder.runId,
@@ -186,15 +175,6 @@ async function initializeActorRecorders(
   }));
 }
 
-/** Process-table ids for live crew actors, keyed `sessionId:actorId` — the
- * lookup `finalizeActorRecorder` needs to exit the right record, and
- * `honourActorPause` needs to mark suspended/running around a pause. Holds
- * the promise itself (set synchronously, before `admitProcess` resolves) so
- * a pause or finalize racing in immediately after admission still finds an
- * entry rather than nothing — `initializeActorRecorders`'s `Promise.all`
- * does not wait for this chain to settle. Mirrors `subagent.ts`'s
- * `activeSubagentControllers`; entries are removed on finalize so the map
- * only ever holds live actors. */
 const crewActorProcesses = new Map<string, Promise<string | null>>();
 
 async function finalizeActorRecorder(
@@ -272,11 +252,8 @@ async function resolveTarget(target: ModelTargetSnapshot): Promise<ResolvedTarge
   if (target.kind === "ollama") {
     return { kind: "ollama", baseUrl: target.baseUrl, model: target.model };
   }
-  const status = await invoke<LlamaStatusResult>("llama_status");
-  if (status.status !== "ready" || status.model_path !== target.modelPath) {
-    throw new Error(`${target.displayName} is no longer loaded in the managed llama.cpp runtime.`);
-  }
-  return { kind: "local", baseUrl: `http://127.0.0.1:${status.port}`, modelLabel: target.displayName };
+  const baseUrl = await resolveLoadedLocalEndpoint(target.modelPath, target.displayName);
+  return { kind: "local", baseUrl, modelLabel: target.displayName };
 }
 
 function sourceSignature(source: {
@@ -423,9 +400,6 @@ function appendPermissionAttribution(
         id: `${toolCall.id}:permission`,
         actorId,
         tool: toolCall.function.name,
-        // Crew never opens an interactive approval dialog: the immutable
-        // read-only profile is the authority. "approved" records a safe
-        // profile match; "denied" records the code-enforced fail-closed path.
         status: approved ? "approved" : "denied",
         requestedAt: at,
         decidedAt: at,
@@ -551,11 +525,6 @@ async function budgetedAttempt(
   const reservation = reserveBudget(sessionId, gate, actor.modelTarget, messages);
   const callController = new AbortController();
   const abortChild = () => callController.abort();
-  // `parentSignal` may already be aborted by the time this runs (a cooperative
-  // pause's wait, or any other await, can push us past the moment cancel
-  // fired) — an `addEventListener` added after the event already happened
-  // never fires, which would leave `callController` (and anything waiting on
-  // it) hung forever. Same defensive check `abortedPromise` uses.
   if (parentSignal.aborted) abortChild();
   else parentSignal.addEventListener("abort", abortChild, { once: true });
   let outputLimitHit = false;
@@ -598,9 +567,6 @@ async function budgetedAttempt(
     }
     return result;
   } catch (error) {
-    // An exception before `attemptStream` returned still consumes the model
-    // call reservation but no fabricated token usage. Release the token/cost
-    // reservation so siblings and a retry see the honest aggregate.
     if (gate.reservedTokens >= reservation.reservedTokens) gate.reservedTokens -= reservation.reservedTokens;
     if (gate.reservedCostUsd >= reservation.reservedCostUsd) gate.reservedCostUsd -= reservation.reservedCostUsd;
     useSessionStore.getState().updateCrewRun(sessionId, { budget: gateSnapshot(gate) });
@@ -732,12 +698,6 @@ async function recordBlockedTool(
   );
 }
 
-/** Holds `runActorModel`/`repairActorEnvelope` at their existing
- * `signal.aborted` checkpoints for as long as this actor's durable run id is
- * latched paused. Keyed the same way `registerRunCancellation` already keys
- * this actor (`recorder.runId`), so the same `processes://changed` fan-in
- * that delivers a stop delivers a pause too. A no-op if the actor has no
- * recorder yet (nothing latched, nothing to check). */
 async function honourActorPause(sessionId: string, actorId: string, signal: AbortSignal): Promise<void> {
   const pauseKey = actorRecorder(sessionId, actorId)?.runId;
   if (!pauseKey) return;
@@ -767,12 +727,7 @@ async function runActorModel(
   if (result.toolCalls.length > MAX_TOOL_CALLS_PER_ACTOR) {
     for (const toolCall of result.toolCalls) {
       const now = Date.now();
-      await recordBlockedTool(
-        sessionId,
-        actor.actorId,
-        toolCall,
-        "Crew per-actor tool-call limit exceeded.",
-      );
+      await recordBlockedTool(sessionId, actor.actorId, toolCall, "Crew per-actor tool-call limit exceeded.");
       appendToolRequest(sessionId, actor.actorId, {
         id: toolCall.id,
         actorId: actor.actorId,
@@ -874,9 +829,6 @@ async function runActorModel(
   await honourActorPause(sessionId, actor.actorId, signal);
   if (signal.aborted) throw new DOMException("Crew cancelled", "AbortError");
 
-  // Exactly one tool round. The follow-up receives no tool schema, and any
-  // nevertheless-emitted call is rejected below rather than opening a loop
-  // the model could use to evade the run's call/round limits.
   const followupMessages: ChatMessage[] = [
     ...messages,
     { role: "assistant", content: result.content, tool_calls: cloneValue(result.toolCalls) },
@@ -888,12 +840,7 @@ async function runActorModel(
   if (result.toolCalls.length > 0) {
     for (const toolCall of result.toolCalls) {
       const now = Date.now();
-      await recordBlockedTool(
-        sessionId,
-        actor.actorId,
-        toolCall,
-        "Crew one-tool-round limit was already used.",
-      );
+      await recordBlockedTool(sessionId, actor.actorId, toolCall, "Crew one-tool-round limit was already used.");
       appendTranscript(sessionId, actor.actorId, "tool_request", `${toolCall.function.name} ${toolCall.function.arguments}`, toolCall);
       appendToolRequest(sessionId, actor.actorId, {
         id: toolCall.id,
@@ -950,12 +897,7 @@ async function repairActorEnvelope(
   if (result.toolCalls.length > 0) {
     for (const toolCall of result.toolCalls) {
       const now = Date.now();
-      await recordBlockedTool(
-        sessionId,
-        actorId,
-        toolCall,
-        "Crew envelope repair does not permit tool execution.",
-      );
+      await recordBlockedTool(sessionId, actorId, toolCall, "Crew envelope repair does not permit tool execution.");
       appendTranscript(sessionId, actorId, "tool_request", `${toolCall.function.name} ${toolCall.function.arguments}`, toolCall);
       appendToolRequest(sessionId, actorId, {
         id: toolCall.id,
@@ -1252,8 +1194,6 @@ async function executeCrewRun(sessionId: string): Promise<void> {
   }
 }
 
-/** Freezes the source turn, Crew definition, personas, targets, system
- * prompts, references, stacks and hard limits before starting any model. */
 export async function startCrew(
   sourceSessionId: string,
   prompt: string,
@@ -1280,10 +1220,12 @@ export async function startCrew(
     throw new Error("Wait for the current response to finish before starting a Crew.");
   }
   const signature = sourceSignature(source);
-  // `/btw` side-question notices are display-only — they never join the base
-  // history any Crew actor receives.
   const baseMessages = cloneValue(source.messages).filter((message) => !isBtwNotice(message));
   const { textRefs, images, unresolved } = await resolveReferences(normalizedPrompt, [...attachments]);
+  const standardsContext = await freezeStandardsForTask(
+    normalizedPrompt,
+    textRefs.filter((reference) => reference.source !== "terminal").map((reference) => reference.path),
+  );
   const historyContainsImages = baseMessages.some(
     (message) => Array.isArray(message.content) && message.content.some((part) => part.type === "image_url"),
   );
@@ -1314,7 +1256,13 @@ export async function startCrew(
 
   const coordinatorSystem = [
     composeSkillSystemPrompt(
-      currentSystemPrompt(definition.coordinator.personaId, stackPrompt, source.docChatMode),
+      currentSystemPrompt(
+        definition.coordinator.personaId,
+        stackPrompt,
+        source.docChatMode,
+        standardsContext.promptSection,
+        standardsContext.checkerCommandIds.length > 0,
+      ),
       cloneValue([...skillInvocations]),
     ),
     `Crew role: ${definition.coordinator.role}`,
@@ -1326,7 +1274,13 @@ export async function startCrew(
     "member",
     [
       composeSkillSystemPrompt(
-        currentSystemPrompt(member.personaId, stackPrompt, source.docChatMode),
+        currentSystemPrompt(
+          member.personaId,
+          stackPrompt,
+          source.docChatMode,
+          standardsContext.promptSection,
+          standardsContext.checkerCommandIds.length > 0,
+        ),
         cloneValue([...skillInvocations]),
       ),
       `Crew role: ${member.role}`,
@@ -1375,9 +1329,6 @@ export function cancelCrewRun(sessionId: string): void {
   execution.controller.abort();
 }
 
-/** Retry only non-completed actors from the immutable snapshot. Successful
- * member reports remain frozen; prior calls/tokens/cost remain charged to
- * the same hard budget, so Retry cannot reset limits by model output. */
 export function retryCrewRun(sessionId: string): Promise<void> {
   if (activeCrewExecutions.has(sessionId)) {
     return Promise.reject(new Error("Wait for this Crew to stop before retrying it."));

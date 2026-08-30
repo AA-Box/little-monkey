@@ -1,5 +1,5 @@
 {
-  "contract_version": "1.7.0",
+  "contract_version": "2.0.0",
   "support_window_days": 180,
   "http_routes": [
     {
@@ -292,7 +292,7 @@
       "matcher": "exact_or_descendant"
     }
   ],
-  "remote_protocol_version": 1,
+  "remote_protocol_version": 2,
   "remote_routes": [
     {
       "plane": "pairing",
@@ -370,6 +370,42 @@
       "plane": "control",
       "method": "POST",
       "path": "/v1/remote/desktop-control/action",
+      "gate": "action:ControlDesktop"
+    },
+    {
+      "plane": "control",
+      "method": "POST",
+      "path": "/v1/remote/desktop-control/list-targets",
+      "gate": "action:ControlDesktop"
+    },
+    {
+      "plane": "control",
+      "method": "POST",
+      "path": "/v1/remote/desktop-control/inspect",
+      "gate": "action:ControlDesktop"
+    },
+    {
+      "plane": "control",
+      "method": "POST",
+      "path": "/v1/remote/desktop-control/screenshot",
+      "gate": "action:ControlDesktop"
+    },
+    {
+      "plane": "control",
+      "method": "POST",
+      "path": "/v1/remote/desktop-control/clipboard-read",
+      "gate": "action:ControlDesktop"
+    },
+    {
+      "plane": "control",
+      "method": "POST",
+      "path": "/v1/remote/desktop-control/pause",
+      "gate": "action:ControlDesktop"
+    },
+    {
+      "plane": "control",
+      "method": "POST",
+      "path": "/v1/remote/desktop-control/resume",
       "gate": "action:ControlDesktop"
     },
     {

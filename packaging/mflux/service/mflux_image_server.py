@@ -12,6 +12,7 @@ from contextlib import contextmanager
 import io
 import json
 import random
+import re
 import sys
 import tempfile
 import threading
@@ -82,6 +83,91 @@ class CancellableVae:
         return getattr(self._vae, name)
 
 
+def _flux_swift_key_targets(component: str, key: str) -> list[str]:
+    """Map flux.swift's MLX module names to MFLUX's module names."""
+
+    if component == "text_encoder_2":
+        if key == "relative_attention_bias.weight":
+            return [
+                f"t5_blocks.{index}.attention.SelfAttention.relative_attention_bias.weight"
+                for index in range(24)
+            ]
+        if key == "encoder.final_layer_norm.weight":
+            return ["final_layer_norm.weight"]
+        match = re.fullmatch(r"encoder\.block\.(\d+)\.layer\.(0|1)\.(.+)", key)
+        if match:
+            branch = "attention" if match.group(2) == "0" else "ff"
+            return [f"t5_blocks.{match.group(1)}.{branch}.{match.group(3)}"]
+
+    if component == "vae":
+        for prefix in (
+            "decoder.conv_in.",
+            "decoder.conv_out.",
+            "encoder.conv_in.",
+            "encoder.conv_out.",
+        ):
+            if key.startswith(prefix):
+                return [f"{prefix}conv2d.{key[len(prefix):]}"]
+
+    return [key]
+
+
+def _load_flux_swift_component(path: Any) -> tuple[dict[str, Any], int | None] | None:
+    """Load one flux.swift component, preserving its quantized MLX arrays."""
+
+    from pathlib import Path
+
+    import mlx.core as mx
+    from mlx.utils import tree_unflatten
+
+    component_path = Path(path)
+    shard_files = sorted(
+        file for file in component_path.glob("*.safetensors") if not file.name.startswith("._")
+    )
+    if not shard_files:
+        return None
+
+    first_data = mx.load(str(shard_files[0]), return_metadata=True)
+    metadata = first_data[1] if len(first_data) > 1 else {}
+    if "flux_swift_version" not in metadata:
+        return None
+
+    quantization_level = metadata.get("quantization_level")
+    stored_bits = int(quantization_level) if quantization_level not in (None, "", "None", "null") else None
+    normalized: dict[str, Any] = {}
+    component = component_path.name
+    for index, shard in enumerate(shard_files):
+        arrays = first_data[0] if index == 0 else mx.load(str(shard))
+        for key, value in arrays.items():
+            for target in _flux_swift_key_targets(component, key):
+                normalized[target] = value
+
+    return tree_unflatten(list(normalized.items())), stored_bits
+
+
+@contextmanager
+def _flux_swift_weight_loader():
+    """Temporarily adapt flux.swift component shards for MFLUX's loader."""
+
+    from mflux.models.common.weights.loading.weight_loader import WeightLoader
+
+    original_descriptor = WeightLoader.__dict__["_try_load_mflux_format"]
+    original_loader = WeightLoader._try_load_mflux_format
+
+    def compatible_loader(path: Any) -> tuple[dict | None, int | None, str | None]:
+        loaded = _load_flux_swift_component(path)
+        if loaded is not None:
+            weights, stored_bits = loaded
+            return weights, stored_bits, None
+        return original_loader(path)
+
+    WeightLoader._try_load_mflux_format = staticmethod(compatible_loader)
+    try:
+        yield
+    finally:
+        WeightLoader._try_load_mflux_format = original_descriptor
+
+
 class MfluxRunner:
     """Loads one model key and reuses it for subsequent requests."""
 
@@ -105,7 +191,8 @@ class MfluxRunner:
         from mflux.models.flux.variants.txt2img.flux import Flux1
 
         config = ModelConfig.from_name(model_name=base_model, base_model=base_model)
-        return Flux1(model_config=config, quantize=quantize, model_path=model_path or None)
+        with _flux_swift_weight_loader():
+            return Flux1(model_config=config, quantize=quantize, model_path=model_path or None)
 
     def _load(self) -> Any:
         key = (self.model_path, self.base_model, self.quantize)
