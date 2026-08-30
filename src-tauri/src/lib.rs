@@ -1122,7 +1122,14 @@ pub fn run() {
                 local_whisper::set_resource_dir(app.path().resource_dir().ok().as_deref());
                 let speech_data_dir = app_data_dir.clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Err(error) = local_whisper::prepare(&speech_data_dir).await {
+                    // The configured tier, not always the bundled one: an
+                    // operator who chose a larger model should have it fetched
+                    // now, not discover the download when they first speak.
+                    let model_id = m7_companion::M7CompanionState::production(&speech_data_dir)
+                        .and_then(|state| state.config())
+                        .map(|config| config.voice.transcription_model)
+                        .unwrap_or_else(|_| local_whisper::DEFAULT_MODEL_ID.to_string());
+                    if let Err(error) = local_whisper::prepare(&speech_data_dir, &model_id).await {
                         eprintln!("Built-in local speech model setup failed; it will retry on use: {error}");
                     }
                 });
@@ -1986,6 +1993,8 @@ pub fn run() {
             m7_companion::m7_config_get,
             m7_companion::m7_config_save,
             m7_companion::m7_transcription_languages,
+            m7_companion::m7_transcription_models,
+            m7_companion::m7_transcription_model_install,
             m7_companion::m7_talk_status,
             m7_companion::m7_talk_metrics,
             m7_companion::m7_talk_metric_record,
