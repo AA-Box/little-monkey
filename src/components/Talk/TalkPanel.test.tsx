@@ -449,6 +449,34 @@ describe('TalkPanel — a spoken turn end to end', () => {
     expect(spoken).toEqual(['The deploy finished cleanly.']);
   });
 
+  it('never narrates the run: no queue, no progress, no tool status', async () => {
+    const media = stubMedia();
+    mock();
+    const sessionId = liveSession();
+    runAgentTurn.mockImplementation(async () => {
+      const store = useSessionStore.getState();
+      store.addMessage(sessionId, { role: 'user', content: 'what is the deploy status' });
+      // Every status `projectDaemonTurnEvents` writes lands in the answer's own
+      // message, one after another. `started` reaches nearly every turn, which
+      // is why "Resident agent is working…" was read out before every answer.
+      store.addMessage(sessionId, { role: 'assistant', content: '⏳ Queued in the resident runner…' });
+      await Promise.resolve();
+      store.updateLastMessage(sessionId, { content: '⏳ Resident agent is working…' });
+      await Promise.resolve();
+      store.updateLastMessage(sessionId, { content: '⏳ Preparing read_file…' });
+      await Promise.resolve();
+      store.updateLastMessage(sessionId, { content: 'The deploy finished cleanly. ' });
+    });
+    render(<TalkPanel sessionId={sessionId} onClose={vi.fn()} />);
+
+    await saySomething(media);
+    await waitFor(() => expect(media.speakers).toHaveLength(1));
+    const spoken = invoke.mock.calls
+      .filter((call) => call[0] === 'm7_tts_synthesize')
+      .map((call) => (call[1] as { text: string }).text);
+    expect(spoken).toEqual(['The deploy finished cleanly.']);
+  });
+
   it('speaks the answer of a turn that called a tool', async () => {
     const media = stubMedia();
     mock();

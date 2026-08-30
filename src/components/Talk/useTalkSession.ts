@@ -39,12 +39,20 @@ const GRANT_LIFETIME_MS = 30 * 60_000;
 const METER_INTERVAL_MS = 20;
 
 /**
- * The message the daemon route parks in the answer's place while the run is
- * queued, replaced wholesale when the real text starts arriving. Reading it out
- * would announce the queue and then, because it is replaced rather than
- * appended to, swallow the first sentence of the answer that replaces it.
+ * How the durable routes mark text they park in the answer's place.
+ *
+ * A daemon-routed turn writes its progress into the message the answer will
+ * eventually occupy — "Queued in the resident runner…", "Resident agent is
+ * working…", "Preparing read_file…", "Waiting for approval: …", and the rest of
+ * `projectDaemonTurnEvents`'s status line. On screen that is exactly right. Read
+ * aloud it is the plumbing narrating itself, before every single answer.
+ *
+ * Matching one exact sentence caught only the queue placeholder; the one that
+ * actually reaches most turns is "Resident agent is working…", because the
+ * `started` event fires on all of them. They share this marker, so skip on the
+ * marker rather than on a list of sentences that will grow again.
  */
-const DAEMON_QUEUE_PLACEHOLDER = '⏳ Queued in the resident runner…';
+const PLACEHOLDER_MARKER = '⏳';
 
 export interface UseTalkSessionOptions {
   /**
@@ -386,7 +394,9 @@ export function useTalkSession(
       }
       if (!answer) return;
       const text = typeof answer.content === 'string' ? answer.content : '';
-      if (!text || text === DAEMON_QUEUE_PLACEHOLDER) return;
+      // A real answer that opens with an hourglass would be skipped too. That
+      // costs one unspoken turn; the alternative costs every turn a preamble.
+      if (!text || text.startsWith(PLACEHOLDER_MARKER)) return;
       // Both routes replace the message's content rather than appending to it,
       // so "longer than last time" is not the same question as "continues what
       // has already been spoken". When it does not continue it, the message was
