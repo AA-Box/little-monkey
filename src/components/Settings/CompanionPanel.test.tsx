@@ -24,6 +24,7 @@ const CONFIG: CompanionConfig = {
     extensionId: null,
     extensionCapabilityId: null,
     language: "auto",
+    transcriptionModel: "base",
     ttsVoice: null,
     ttsBackend: "system",
     ttsExtensionId: null,
