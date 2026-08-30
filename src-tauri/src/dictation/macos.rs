@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::ffi::{c_char, c_void, CStr, CString};
 
-use super::{DictationCapabilities, NativeCallback, NativeEvent};
+use super::{DictationCapabilities, DictationPermissions, NativeCallback, NativeEvent};
 
 type NativeCallbackFn = unsafe extern "C" fn(
     user_data: *mut c_void,
@@ -25,6 +25,7 @@ unsafe extern "C" {
     fn little_monkey_dictation_macos_stop(session: *mut c_void);
     fn little_monkey_dictation_macos_cancel(session: *mut c_void);
     fn little_monkey_dictation_macos_release(session: *mut c_void);
+    fn little_monkey_dictation_macos_open_permission_settings(kind: *const c_char) -> bool;
 }
 
 struct CallbackContext {
@@ -92,6 +93,7 @@ pub fn capabilities() -> DictationCapabilities {
             supports_partial_results: true,
             supports_on_device: false,
             languages: Vec::new(),
+            permissions: DictationPermissions::unavailable(),
         };
     }
     let json = unsafe { CStr::from_ptr(raw).to_string_lossy().into_owned() };
@@ -103,6 +105,8 @@ pub fn capabilities() -> DictationCapabilities {
         supports_partial_results: bool,
         supports_on_device: bool,
         languages: Vec<super::DictationLanguage>,
+        #[serde(default)]
+        permissions: DictationPermissions,
     }
     match serde_json::from_str::<NativeCapabilities>(&json) {
         Ok(native) => DictationCapabilities {
@@ -112,6 +116,7 @@ pub fn capabilities() -> DictationCapabilities {
             supports_partial_results: native.supports_partial_results,
             supports_on_device: native.supports_on_device,
             languages: native.languages,
+            permissions: native.permissions,
         },
         Err(_) => DictationCapabilities {
             supported: false,
@@ -120,6 +125,7 @@ pub fn capabilities() -> DictationCapabilities {
             supports_partial_results: true,
             supports_on_device: false,
             languages: Vec::new(),
+            permissions: DictationPermissions::unknown(),
         },
     }
 }
@@ -153,6 +159,16 @@ pub fn start(
         return Err("Apple Speech could not start".to_string());
     }
     Ok(Session { native, context })
+}
+
+pub fn open_permission_settings(kind: &str) -> Result<(), String> {
+    let kind = CString::new(kind).map_err(|_| "Invalid dictation permission kind".to_string())?;
+    let opened = unsafe { little_monkey_dictation_macos_open_permission_settings(kind.as_ptr()) };
+    if opened {
+        Ok(())
+    } else {
+        Err("macOS could not open the dictation permission settings".to_string())
+    }
 }
 
 impl Session {

@@ -19,6 +19,39 @@ vi.mock("../../lib/i18n", () => ({
   }),
 }));
 
+describe("ModelCard download failures", () => {
+  it("shows why a Pull failed, on a model that is not installed", () => {
+    const markup = renderToStaticMarkup(
+      <ModelCard
+        model={{
+          id: "curated:model",
+          name: "Curated model",
+          repo: "vendor/Model-GGUF",
+          file: "model.gguf",
+          size_gb: 4.7,
+          tool_calling: true,
+          installed: false,
+          path: null,
+          is_external: false,
+          kind: "chat",
+        }}
+        isActive={false}
+        llamaStatus="stopped"
+        // A catalog entry naming a file the repo does not have fails here, and
+        // used to fail invisibly: the card kept offering Pull and nothing else
+        // ever happened.
+        downloadError="Download failed: HTTP 404 Not Found"
+        onInstall={() => undefined}
+        onCancelDownload={() => undefined}
+        onDelete={() => undefined}
+        onStart={() => undefined}
+        onStop={() => undefined}
+      />,
+    );
+    expect(markup).toContain("Download failed: HTTP 404 Not Found");
+  });
+});
+
 describe("ModelCard multimodal state", () => {
   it("shows the attached projector and vision badge", () => {
     const markup = renderToStaticMarkup(

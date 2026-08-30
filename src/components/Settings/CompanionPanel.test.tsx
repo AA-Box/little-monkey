@@ -24,6 +24,7 @@ const CONFIG: CompanionConfig = {
     extensionId: null,
     extensionCapabilityId: null,
     language: "auto",
+    transcriptionModel: "base",
     ttsVoice: null,
     ttsBackend: "system",
     ttsExtensionId: null,
@@ -103,6 +104,25 @@ afterEach(() => {
 });
 
 describe("CompanionPanel executable transcription", () => {
+  it("uses built-in local Whisper without asking for binary or model paths", async () => {
+    render(<CompanionPanel />);
+
+    await screen.findByText("Voice and transcription");
+    fireEvent.change(screen.getByLabelText("Backend"), { target: { value: "local_whisper" } });
+
+    expect(screen.queryByLabelText("whisper.cpp binary")).toBeNull();
+    expect(screen.queryByLabelText("Whisper model")).toBeNull();
+    expect(screen.getByText(/ships its multilingual Whisper model with the app/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Save voice settings" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("m7_config_save", {
+      config: {
+        ...CONFIG,
+        voice: { ...CONFIG.voice, backend: "local_whisper" },
+      },
+    }));
+  });
+
   it("discovers healthy STT capabilities and saves the selected typed backend", async () => {
     render(<CompanionPanel />);
 

@@ -32,13 +32,17 @@ export type SpeechBackendKind = 'system' | 'executable_extension';
 
 export interface VoiceConfig {
   backend: TranscriptionBackendKind;
+  /** @deprecated Kept only for compatibility with older persisted configs; built-in local Whisper ignores it. */
   whisperBinary: string | null;
+  /** @deprecated Kept only for compatibility with older persisted configs; the model is app-managed. */
   whisperModel: string | null;
   providerId: string | null;
   providerModel: string;
   extensionId: string | null;
   extensionCapabilityId: string | null;
   language: string;
+  /** Which built-in speech model transcribes — an id from `talkClient.models()`. */
+  transcriptionModel: string;
   ttsVoice: string | null;
   ttsBackend: SpeechBackendKind;
   ttsExtensionId: string | null;

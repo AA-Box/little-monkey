@@ -26,6 +26,8 @@ export interface ModelCardProps {
   /** Backend reason the last start failed. Shown verbatim in place of the
    * generic message, which on its own is undiagnosable. */
   startError?: string | null;
+  /** Why the last Pull failed, if it did. */
+  downloadError?: string | null;
   onInstall: () => void;
   onCancelDownload: () => void;
   onDelete: () => void;
@@ -49,6 +51,7 @@ export function ModelCard({
   llamaVisionEnabled = false,
   downloadProgress,
   startError,
+  downloadError,
   onInstall,
   onCancelDownload,
   onDelete,
@@ -82,6 +85,11 @@ export function ModelCard({
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-2">
           <h3 className="truncate text-sm font-medium text-foreground">{model.name}</h3>
+          {model.runtime === "mlx" && (
+            <span className="inline-flex items-center rounded-full bg-surface-2 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-faint">
+              {t("ModelCard.mlxRuntimeBadge")}
+            </span>
+          )}
           {model.tool_calling && (
             <span className="inline-flex items-center rounded-full bg-surface-2 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-faint">
               {t("ModelCard.toolCallingBadge")}
@@ -108,11 +116,11 @@ export function ModelCard({
             {t("ModelCard.embeddingsUnavailableWithProjector")}
           </p>
         )}
-        {isErrored && (
+        {(isErrored || downloadError) && (
           <p className="mt-1 flex items-start gap-1 text-xs text-danger">
             <AlertTriangle size={12} className="mt-0.5 shrink-0" />
             <span className="break-words">
-              {startError || t("ModelCard.startFailedMessage")}
+              {downloadError || startError || t("ModelCard.startFailedMessage")}
             </span>
           </p>
         )}

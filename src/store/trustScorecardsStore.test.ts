@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const invokeMock = vi.fn();
+const { discoverMock, invokeMock } = vi.hoisted(() => ({ discoverMock: vi.fn(), invokeMock: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => false }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => {}) }));
+vi.mock("../lib/skillLearningClient", () => ({ skillLearningClient: { discover: discoverMock } }));
 
 import { useTrustScorecardsStore } from "./trustScorecardsStore";
 import { useModelStore, type ModelInfo } from "./modelStore";
@@ -10,6 +11,7 @@ import { useConnectorsStore, type ConnectorAccount } from "./connectorsStore";
 import { useMcpStore, type McpServerInfo } from "./mcpStore";
 import { useEcosystemStore } from "./ecosystemStore";
 import { useUsageHistoryStore } from "./usageHistoryStore";
+import { useNativeSkillsStore } from "./nativeSkillsStore";
 import type { NativeSkillDescriptor } from "../lib/nativeSkillsClient";
 
 function resetAllStores() {
@@ -33,11 +35,13 @@ function resetAllStores() {
     histories: [],
   } as Partial<ReturnType<typeof useEcosystemStore.getState>>);
   useUsageHistoryStore.getState().clear();
+  useNativeSkillsStore.setState({ descriptors: [], loading: false, error: null, generation: 0 });
   useTrustScorecardsStore.setState({ scorecards: [], loading: false, error: null, lastComputedAt: null });
 }
 
 beforeEach(() => {
   invokeMock.mockReset();
+  discoverMock.mockReset();
   resetAllStores();
 });
 
@@ -92,6 +96,7 @@ const skill: NativeSkillDescriptor = {
   file_count: 1,
   total_bytes: 100,
   enabled: true,
+  managed: true,
   eligibility: { eligible: true, current_os: "darwin", unsupported_os: false, missing_bins: [], missing_env: [] },
   supported_os: ["darwin"],
   requirements: { bins: [], env: [] },
@@ -103,8 +108,8 @@ const skill: NativeSkillDescriptor = {
 };
 
 describe("trustScorecardsStore.recompute", () => {
-  it("calls native_skills_discover and produces a scorecard per entity across all stores", async () => {
-    invokeMock.mockResolvedValueOnce([skill]);
+  it("uses the shared native registry and produces a scorecard per entity across all stores", async () => {
+    discoverMock.mockResolvedValueOnce([skill]);
 
     useModelStore.setState({ installed: [model] } as Partial<ReturnType<typeof useModelStore.getState>>);
     useConnectorsStore.setState({ accounts: [connector] });
@@ -112,7 +117,7 @@ describe("trustScorecardsStore.recompute", () => {
 
     await useTrustScorecardsStore.getState().recompute();
 
-    expect(invokeMock).toHaveBeenCalledWith("native_skills_discover");
+    expect(discoverMock).toHaveBeenCalledTimes(1);
     const { scorecards, error, lastComputedAt } = useTrustScorecardsStore.getState();
     expect(error).toBeNull();
     expect(lastComputedAt).not.toBeNull();
@@ -126,7 +131,7 @@ describe("trustScorecardsStore.recompute", () => {
   });
 
   it("still scores every other entity kind when native skill discovery fails", async () => {
-    invokeMock.mockRejectedValueOnce(new Error("boom"));
+    discoverMock.mockRejectedValueOnce(new Error("boom"));
     useConnectorsStore.setState({ accounts: [connector] });
 
     await useTrustScorecardsStore.getState().recompute();
@@ -138,7 +143,7 @@ describe("trustScorecardsStore.recompute", () => {
   });
 
   it("produces one scorecard per configured cloud-provider model", async () => {
-    invokeMock.mockResolvedValueOnce([]);
+    discoverMock.mockResolvedValueOnce([]);
     useModelStore.setState({
       providers: [{ id: "openai", label: "OpenAI", base_url: "https://api.openai.com", is_custom: false, has_key: true, is_extension: false }],
       providerModels: { openai: [{ id: "gpt-4o" }, { id: "gpt-4o-mini" }] },

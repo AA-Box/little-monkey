@@ -66,11 +66,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # cmake/clang/libclang-dev/ninja-build build the whisper.cpp the
+      # built-in local speech backend links, and generate its bindgen
+      # bindings. The ubuntu-22.04 image already carries them; the
+      # ubuntu-24.04-arm image does not, so both are named explicitly.
       - name: Install Linux system deps
         if: startsWith(matrix.platform, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential xdg-utils unzip
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential xdg-utils unzip cmake clang libclang-dev ninja-build
 
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
@@ -95,6 +99,11 @@ jobs:
       - name: Compile macOS Liquid icon (Assets.car)
         if: startsWith(matrix.platform, 'macos')
         run: pnpm icon:mac-liquid
+
+      # The model ships inside the application. Staging it here is what makes
+      # the local speech backend work on a first run with no network.
+      - name: Verify and stage the built-in Whisper model
+        run: pnpm stage:whisper
 
       - name: Build and stage monkey-cli sidecar
         run: pnpm stage:cli

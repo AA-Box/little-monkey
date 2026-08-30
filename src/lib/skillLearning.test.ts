@@ -13,12 +13,14 @@ import { describe, expect, it, vi } from "vitest";
 import {
   autoReflectAllowed,
   buildReflectionMessages,
+  captureAction,
   candidateNotice,
   finalizeLearningForRun,
   formatLearningNotice,
   parseLearningNotice,
   parseReflectionCall,
   reflectOnCandidate,
+  selectFinishedRunNotice,
 } from "./skillLearning";
 import { toolsForSettings } from "./agentLoop";
 import { composeSkillCatalog, nativeSkills } from "./skills";
@@ -139,6 +141,19 @@ describe("reflectOnCandidate", () => {
     expect(runId).toBe("run-2");
   });
 
+  it("preserves omitted resource files for the backend default", async () => {
+    const stage = vi.fn(async (..._args: unknown[]) => candidate({ status: "staged" }));
+    const reflectionWithoutResources: Record<string, unknown> = { ...validReflection.reflection };
+    delete reflectionWithoutResources.proposed_resource_files;
+    await reflectOnCandidate(
+      candidate(),
+      callWith([toolCall({ ...validReflection, reflection: reflectionWithoutResources })]),
+      { client: clientWith({ stage }) },
+    );
+    const [, proposal] = stage.mock.calls[0] as unknown as [string, Record<string, unknown>];
+    expect(Object.prototype.hasOwnProperty.call(proposal, "proposed_resource_files")).toBe(false);
+  });
+
   it("reads the backend's own evidence brief rather than assembling one", async () => {
     const reflectionBrief = vi.fn(async () => "1. edit_file [succeeded] (mutating)\n   arguments: {\"path\":\"src/lib.rs\"}\n");
     const callModel = callWith([toolCall(validReflection)]);
@@ -220,6 +235,44 @@ describe("candidateNotice", () => {
   });
 });
 
+describe("finished-run notice precedence", () => {
+  it("does not offer manual save when capture is not eligible", () => {
+    // A completed chat-only turn has no successful durable tool evidence.
+    expect(selectFinishedRunNotice(null, null)).toBeNull();
+  });
+
+  it("offers manual save for an eligible workspace run", () => {
+    expect(selectFinishedRunNotice(null, "workspace")).toEqual({ kind: "save", scope: "workspace" });
+  });
+
+  it("prefers the automatic candidate over the redundant save affordance", () => {
+    const learned = candidate({ status: "staged", proposed_command: "retry-wrapper" });
+    expect(selectFinishedRunNotice(learned, "workspace")).toEqual({ kind: "learning", candidate: learned });
+  });
+
+  it("keeps a no-workspace run global", () => {
+    expect(selectFinishedRunNotice(null, "global")).toEqual({ kind: "save", scope: "global" });
+  });
+});
+
+describe("captureAction", () => {
+  it("drafts a newly created or detected candidate", () => {
+    expect(captureAction({ kind: "created", candidate: candidate({ status: "detected" }) }).kind).toBe("draft");
+  });
+
+  it("focuses an existing staged candidate without regenerating it", () => {
+    expect(captureAction({ kind: "existing", candidate: candidate({ status: "staged" }) }).kind).toBe("focus");
+  });
+
+  it("presents an installed candidate as already saved", () => {
+    const installed = candidate({ status: "promoted", proposed_command: "retry-wrapper" });
+    expect(captureAction({ kind: "already_installed", candidate: installed })).toEqual({
+      kind: "already_installed",
+      candidate: installed,
+    });
+  });
+});
+
 describe("finalizeLearningForRun", () => {
   it("names only the run and the session — never a skill hash", async () => {
     const finalizeRun = vi.fn(async () => []);
@@ -291,6 +344,7 @@ describe("a promoted learned skill in the model's catalog", () => {
     file_count: 2,
     total_bytes: 400,
     enabled: true,
+    managed: true,
     eligibility: { eligible: true, current_os: "macos", unsupported_os: false, missing_bins: [], missing_env: [] },
     supported_os: [],
     requirements: { bins: [], env: [] },

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { FolderOpen, GitBranch, Loader2, Package, RefreshCw, RotateCcw, ShieldCheck, Trash2 } from "lucide-react";
+import { FolderOpen, GitBranch, Loader2, Package, Pin, RefreshCw, RotateCcw, ShieldCheck, Trash2 } from "lucide-react";
 
 import {
   nativeSkillsClient,
@@ -10,8 +10,12 @@ import {
   type NativeSkillInstallPreview,
   type NativeSkillScope,
 } from "../../lib/nativeSkillsClient";
-import { skillLearningClient } from "../../lib/skillLearningClient";
 import { useNativeSkillsStore } from "../../store/nativeSkillsStore";
+import {
+  skillActivationPolicyKey,
+  useSkillActivationPolicyStore,
+  type SkillActivationPolicy,
+} from "../../store/skillActivationPolicyStore";
 import { Button } from "../ui";
 import { errorMessage } from "../../lib/errors";
 
@@ -19,9 +23,50 @@ function descriptorScope(skill: NativeSkillDescriptor): NativeSkillScope | null 
   return skill.source.kind === "global" || skill.source.kind === "workspace" ? skill.source.kind : null;
 }
 
+function descriptorPolicyIdentity(skill: NativeSkillDescriptor): string {
+  if (skill.source.kind === "global") return skill.managed ? "global" : skill.source.path;
+  if (skill.source.kind === "workspace") return skill.source.path;
+  return `signed-package:${skill.source.package_id}`;
+}
+
 /** Strips the scheme/`.git` suffix so a card header reads `org/repo` instead of the full clone URL. */
 function repoDisplayName(url: string): string {
   return url.replace(/^https?:\/\//, "").replace(/\.git$/, "");
+}
+
+const ACTIVATION_POLICIES: Array<{ value: SkillActivationPolicy; label: string }> = [
+  { value: "automatic", label: "Automatic" },
+  { value: "ask", label: "Ask" },
+  { value: "manual", label: "Manual" },
+];
+
+function SkillPolicySelect({ command, identity, defaultPolicy = "automatic" }: { command: string; identity: string; defaultPolicy?: SkillActivationPolicy }) {
+  const key = skillActivationPolicyKey("native", command, identity);
+  const policy = useSkillActivationPolicyStore((state) => state.getPolicy(key, defaultPolicy));
+  const pinned = useSkillActivationPolicyStore((state) => state.isPinned(key));
+  const setPolicy = useSkillActivationPolicyStore((state) => state.setPolicy);
+  const setPinned = useSkillActivationPolicyStore((state) => state.setPinned);
+  return (
+    <div className="flex items-center gap-1 text-[10px] text-faint">
+      <label className="flex items-center gap-1">
+        Policy
+        <select
+          aria-label={`/${command} activation policy`}
+          value={policy}
+          onChange={(event) => {
+            void setPolicy(key, event.target.value as SkillActivationPolicy);
+          }}
+          className="h-6 rounded border border-border bg-background px-1 text-[10px] text-foreground"
+        >
+          {ACTIVATION_POLICIES.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+        </select>
+      </label>
+      <label className="ml-1 inline-flex items-center gap-0.5" title="Pin this skill higher in ranked discovery">
+        <input aria-label={`Pin /${command}`} type="checkbox" checked={pinned} onChange={(event) => void setPinned(key, event.target.checked)} />
+        <Pin size={10} />
+      </label>
+    </div>
+  );
 }
 
 interface RepoGroup {
@@ -37,7 +82,7 @@ function groupByRepository(skills: NativeSkillDescriptor[]): { groups: RepoGroup
   const standalone: NativeSkillDescriptor[] = [];
   for (const skill of skills) {
     const scope = descriptorScope(skill);
-    if (!scope || !skill.git_repository) {
+    if (!scope || !skill.git_repository || !skill.managed) {
       if (scope) standalone.push(skill);
       continue;
     }
@@ -56,7 +101,9 @@ function groupByRepository(skills: NativeSkillDescriptor[]): { groups: RepoGroup
 }
 
 export function NativeSkillsManager() {
-  const [skills, setSkills] = useState<NativeSkillDescriptor[]>([]);
+  const skills = useNativeSkillsStore((state) => state.descriptors);
+  const registryError = useNativeSkillsStore((state) => state.error);
+  const refreshNativeSkills = useNativeSkillsStore((state) => state.refresh);
   const [scope, setScope] = useState<NativeSkillScope>("global");
   const [localPath, setLocalPath] = useState("");
   const [gitUrl, setGitUrl] = useState("");
@@ -65,20 +112,14 @@ export function NativeSkillsManager() {
   const [gitCandidates, setGitCandidates] = useState<{ pinnedCommit: string; list: GitSkillCandidate[] } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const bumpNativeSkills = useNativeSkillsStore((state) => state.bump);
-
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      // The learning-aware discovery: identical descriptors plus `learned`
-      // provenance for whichever active content hashes this app's learning
-      // loop installed, so a learned skill is visibly one here rather than
-      // only in the learning panel.
-      setSkills(await skillLearningClient.discover());
+      await refreshNativeSkills();
     } catch (reason) {
       setError(errorMessage(reason));
     }
-  }, []);
+  }, [refreshNativeSkills]);
 
   useEffect(() => { void refresh(); }, [refresh]);
 
@@ -90,9 +131,6 @@ export function NativeSkillsManager() {
       setPreview(null);
       setPreviewSource(null);
       setGitCandidates(null);
-      // Chat's "/" catalog only refetches on workspace/package changes —
-      // bump so a skill installed/toggled here shows up there immediately.
-      bumpNativeSkills();
       await refresh();
     } catch (reason) {
       setError(errorMessage(reason));
@@ -190,7 +228,7 @@ export function NativeSkillsManager() {
         </Button>
       </div>
 
-      {error && <p className="rounded border border-danger bg-danger-soft px-2 py-1 text-xs text-danger">{error}</p>}
+      {(error ?? registryError) && <p className="rounded border border-danger bg-danger-soft px-2 py-1 text-xs text-danger">{error ?? registryError}</p>}
 
       <div className="grid gap-2 sm:grid-cols-[9rem_1fr_auto]">
         <select
@@ -341,12 +379,13 @@ export function NativeSkillsManager() {
                   </div>
                   <div className="mt-1.5 flex flex-wrap gap-1.5">
                     {group.skills.map((skill) => (
-                      <span
-                        key={skill.command}
-                        className={`rounded-md border border-border px-2 py-1 font-mono ${skill.enabled ? "text-foreground" : "text-faint line-through"}`}
-                        title={`${skill.name} · ${skill.version}`}
-                      >
-                        /{skill.command}
+                      <span key={skill.command} className="flex items-center gap-1 rounded-md border border-border px-2 py-1">
+                        <span className={`font-mono ${skill.enabled ? "text-foreground" : "text-faint line-through"}`} title={`${skill.name} · ${skill.version}`}>/{skill.command}</span>
+                        <SkillPolicySelect
+                          command={skill.command}
+                          identity={descriptorPolicyIdentity(skill)}
+                          defaultPolicy={skill.managed ? "automatic" : "ask"}
+                        />
                       </span>
                     ))}
                   </div>
@@ -357,13 +396,15 @@ export function NativeSkillsManager() {
             {standalone.map((skill) => {
               const skillScope = descriptorScope(skill);
               if (!skillScope) return null;
+              const managed = skill.managed;
               return (
                 <div key={`${skillScope}:${skill.command}:${skill.sha256}`} className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2 text-xs">
                   <span className="font-mono text-foreground">/{skill.command}</span>
                   <span className="text-muted">{skill.name} · {skill.version}</span>
                   <span className={`rounded px-1 py-0.5 text-[10px] ${skill.enabled && skill.eligibility.eligible ? "bg-success-soft text-success" : "bg-warning-soft text-warning"}`}>
-                    {!skill.enabled ? "disabled" : skill.eligibility.eligible ? skillScope : "ineligible"}
+                    {!skill.enabled ? "disabled" : skill.eligibility.eligible ? managed ? skillScope : "external" : "ineligible"}
                   </span>
+                  {!managed && <span className="text-faint">Read-only `.agents/skills`</span>}
                   {skill.learned && (
                     <span
                       className="rounded border border-border px-1 py-0.5 text-[10px] text-muted"
@@ -373,24 +414,33 @@ export function NativeSkillsManager() {
                     </span>
                   )}
                   <span className="ml-auto font-mono text-[10px] text-faint">{skill.sha256.slice(0, 12)}…</span>
-                  <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => void run(`toggle:${skill.command}`, () => nativeSkillsClient.setEnabled(skillScope, skill.command, !skill.enabled))}>
-                    {skill.enabled ? "Disable" : "Enable"}
-                  </Button>
-                  <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => void run(`rollback:${skill.command}`, () => nativeSkillsClient.rollback(skillScope, skill.command))}>
-                    <RotateCcw size={12} /> Rollback
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled={busy !== null}
-                    onClick={() => {
-                      if (window.confirm(`Uninstall /${skill.command}? Its active version is archived for rollback.`)) {
-                        void run(`uninstall:${skill.command}`, () => nativeSkillsClient.uninstall(skillScope, skill.command));
-                      }
-                    }}
-                  >
-                    <Trash2 size={12} /> Uninstall
-                  </Button>
+                  <SkillPolicySelect
+                    command={skill.command}
+                    identity={descriptorPolicyIdentity(skill)}
+                    defaultPolicy={skill.managed ? "automatic" : "ask"}
+                  />
+                  {managed ? (
+                    <>
+                      <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => void run(`toggle:${skill.command}`, () => nativeSkillsClient.setEnabled(skillScope, skill.command, !skill.enabled))}>
+                        {skill.enabled ? "Disable" : "Enable"}
+                      </Button>
+                      <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => void run(`rollback:${skill.command}`, () => nativeSkillsClient.rollback(skillScope, skill.command))}>
+                        <RotateCcw size={12} /> Rollback
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={busy !== null}
+                        onClick={() => {
+                          if (window.confirm(`Uninstall /${skill.command}? Its active version is archived for rollback.`)) {
+                            void run(`uninstall:${skill.command}`, () => nativeSkillsClient.uninstall(skillScope, skill.command));
+                          }
+                        }}
+                      >
+                        <Trash2 size={12} /> Uninstall
+                      </Button>
+                    </>
+                  ) : null}
                 </div>
               );
             })}

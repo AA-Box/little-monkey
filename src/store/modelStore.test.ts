@@ -530,3 +530,64 @@ describe("effortForTarget", () => {
     expect(fresh.effortForTarget({ kind: "local" })).toBeUndefined();
   });
 });
+
+describe("start", () => {
+  const mlxModel = makeModel({
+    name: "Qwen3.8 27B OptiQ 4bit",
+    file: "mlx-0123456789ab-Qwen3.8-27B-OptiQ-4bit",
+    path: "/models/mlx-0123456789ab-Qwen3.8-27B-OptiQ-4bit",
+    runtime: "mlx",
+  });
+
+  it("starts an MLX model on its own runtime, never on llama-server", async () => {
+    invokeMock.mockClear();
+    invokeMock.mockImplementation((command: string) =>
+      command === "mlx_chat_start"
+        ? Promise.resolve({ running: true, port: 51234, modelId: "mlx-0123456789ab-Qwen3.8-27B-OptiQ-4bit", modelPath: mlxModel.path, vision: true })
+        : Promise.resolve(undefined),
+    );
+
+    await useModelStore.getState().start(mlxModel);
+
+    expect(invokeMock).toHaveBeenCalledWith("mlx_chat_start", { modelPath: mlxModel.path });
+    // llama-server loads GGUF files; it must never be handed a directory.
+    expect(invokeMock).not.toHaveBeenCalledWith("llama_start", expect.anything());
+    const state = useModelStore.getState();
+    expect(state.llamaStatus).toBe("ready");
+    expect(state.mlxChat?.port).toBe(51234);
+    expect(state.activeProvider).toBe("local");
+    // A vision-capable MLX model must offer attachments, the way a GGUF with a
+    // projector does — that is what `isVisionCapableLocalModel` reads.
+    expect(state.llamaVisionEnabled).toBe(true);
+  });
+
+  it("reports a failed MLX start instead of leaving the UI on \"starting\"", async () => {
+    invokeMock.mockClear();
+    invokeMock.mockImplementation((command: string) =>
+      command === "mlx_chat_start"
+        ? Promise.reject(new Error("verified MLX installation is corrupt"))
+        : Promise.resolve(undefined),
+    );
+
+    await expect(useModelStore.getState().start(mlxModel)).rejects.toThrow(/corrupt/);
+    const state = useModelStore.getState();
+    expect(state.llamaStatus).toBe("error");
+    expect(state.llamaError).toMatch(/corrupt/);
+    expect(state.mlxChat).toBeNull();
+  });
+
+  it("stops the MLX endpoint rather than llama-server when MLX is what is running", async () => {
+    invokeMock.mockClear();
+    invokeMock.mockImplementation(() => Promise.resolve(undefined));
+    useModelStore.setState({
+      mlxChat: { running: true, port: 51234, modelId: "m", modelPath: "/models/m", vision: false },
+    });
+
+    await useModelStore.getState().stop();
+
+    expect(invokeMock).toHaveBeenCalledWith("mlx_chat_stop");
+    expect(invokeMock).not.toHaveBeenCalledWith("llama_stop");
+    expect(useModelStore.getState().mlxChat).toBeNull();
+    expect(useModelStore.getState().llamaStatus).toBe("stopped");
+  });
+});

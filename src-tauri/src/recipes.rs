@@ -23,6 +23,8 @@
 //! nothing should run unattended without an explicit policy choice.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
@@ -115,7 +117,7 @@ impl RecipeTarget {
     }
 }
 
-pub const DESKTOP_TURN_SCHEMA_VERSION: u32 = 3;
+pub const DESKTOP_TURN_SCHEMA_VERSION: u32 = 4;
 const MAX_DESKTOP_HISTORY_MESSAGES: usize = 2_000;
 const MAX_DESKTOP_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DESKTOP_MCP_SERVERS: usize = 64;
@@ -191,6 +193,8 @@ pub struct DesktopToolProfileSnapshot {
     pub web_tools_enabled: bool,
     pub verify_enabled: bool,
     pub verify_max_rounds: u32,
+    #[serde(default)]
+    pub standards_checker_command_ids: Vec<String>,
     pub subagents_enabled: bool,
 }
 
@@ -464,6 +468,21 @@ impl DesktopTurnSnapshot {
         if self.tool_profile.verify_max_rounds > 3 {
             return Err("desktop verify_max_rounds must be between 0 and 3".to_string());
         }
+        if self.tool_profile.standards_checker_command_ids.len() > 256
+            || self
+                .tool_profile
+                .standards_checker_command_ids
+                .iter()
+                .any(|id| !valid_snapshot_id(id))
+        {
+            return Err("desktop Standards checker ids are invalid".to_string());
+        }
+        let mut normalized_checker_ids = self.tool_profile.standards_checker_command_ids.clone();
+        normalized_checker_ids.sort();
+        normalized_checker_ids.dedup();
+        if normalized_checker_ids != self.tool_profile.standards_checker_command_ids {
+            return Err("desktop Standards checker ids must be sorted and unique".to_string());
+        }
         let system = recipe
             .system
             .as_deref()
@@ -640,6 +659,297 @@ pub struct RecipeOutput {
     pub json: bool,
 }
 
+pub const AUTONOMOUS_TASK_RECIPE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+pub struct AutonomousTaskGuidanceSnapshot {
+    pub guidance_id: String,
+    pub text: String,
+    pub applies_to: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct AutonomousTaskOwnerSnapshot {
+    pub kind: String,
+    pub instance_id: String,
+    pub lease_epoch: u64,
+    pub lease_expires_at_ms: u64,
+}
+
+fn autonomous_owner_path(task_id: &str) -> Result<PathBuf, String> {
+    if task_id.is_empty()
+        || task_id.len() > 256
+        || !task_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err("Autonomous task id contains unsupported path characters".to_string());
+    }
+    let data_dir = app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve the Little Monkey data directory".to_string())?;
+    Ok(data_dir
+        .join("daemon")
+        .join("autonomous-owners")
+        .join(format!("{task_id}.json")))
+}
+
+fn read_autonomous_task_owner(path: &Path) -> Result<Option<AutonomousTaskOwnerSnapshot>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| format!("Autonomous owner checkpoint is invalid: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Could not read autonomous owner: {error}")),
+    }
+}
+
+fn owner_identity_matches(
+    left: &AutonomousTaskOwnerSnapshot,
+    right: &AutonomousTaskOwnerSnapshot,
+) -> bool {
+    left.kind == right.kind
+        && left.instance_id == right.instance_id
+        && left.lease_epoch == right.lease_epoch
+}
+
+struct AutonomousOwnerLock {
+    path: PathBuf,
+}
+
+impl Drop for AutonomousOwnerLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn lock_autonomous_task_owner(path: &Path) -> Result<AutonomousOwnerLock, String> {
+    let lock_path = path.with_extension("json.lock");
+    let parent = lock_path
+        .parent()
+        .ok_or_else(|| "Autonomous owner lock path has no parent".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create autonomous owner directory: {error}"))?;
+    for _ in 0..200 {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis())
+                    .unwrap_or_default();
+                let _ = writeln!(file, "{} {now}", std::process::id());
+                let _ = file.sync_all();
+                return Ok(AutonomousOwnerLock { path: lock_path });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::read_to_string(&lock_path)
+                    .ok()
+                    .and_then(|contents| contents.split_whitespace().next()?.parse::<u32>().ok())
+                    .is_some_and(|pid| !crate::os_signal::process_is_alive(pid));
+                let malformed_old_lock = !stale
+                    && std::fs::metadata(&lock_path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > std::time::Duration::from_secs(60));
+                if stale || malformed_old_lock {
+                    let _ = std::fs::remove_file(&lock_path);
+                    continue;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(format!("Could not lock autonomous owner: {error}")),
+        }
+    }
+    Err("Autonomous owner checkpoint is busy; retry the compare-and-swap".to_string())
+}
+
+fn write_autonomous_task_owner_locked(
+    path: &Path,
+    owner: &AutonomousTaskOwnerSnapshot,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Autonomous owner path has no parent".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create autonomous owner directory: {error}"))?;
+    let bytes = serde_json::to_vec_pretty(owner)
+        .map_err(|error| format!("Could not serialize autonomous owner: {error}"))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name().unwrap().to_string_lossy(),
+        format!("{}-{nonce}", std::process::id())
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|error| format!("Could not create autonomous owner replacement: {error}"))?;
+    file.write_all(&bytes)
+        .map_err(|error| format!("Could not persist autonomous owner: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("Could not sync autonomous owner: {error}"))?;
+    std::fs::rename(&temp, path)
+        .map_err(|error| format!("Could not atomically replace autonomous owner: {error}"))?;
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+/// Claims the initial execution owner for a task. Retries with the exact same
+/// lease are idempotent; a competing owner cannot overwrite it.
+pub fn claim_autonomous_task_owner(
+    task_id: &str,
+    owner: &AutonomousTaskOwnerSnapshot,
+) -> Result<(), String> {
+    let path = autonomous_owner_path(task_id)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Autonomous owner path has no parent".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create autonomous owner directory: {error}"))?;
+    let bytes = serde_json::to_vec_pretty(owner)
+        .map_err(|error| format!("Could not serialize autonomous owner: {error}"))?;
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            file.write_all(&bytes)
+                .map_err(|error| format!("Could not persist autonomous owner: {error}"))?;
+            file.sync_all()
+                .map_err(|error| format!("Could not sync autonomous owner: {error}"))?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing: AutonomousTaskOwnerSnapshot =
+                serde_json::from_slice(&std::fs::read(&path).map_err(|read_error| {
+                    format!("Could not read autonomous owner: {read_error}")
+                })?)
+                .map_err(|read_error| {
+                    format!("Autonomous owner checkpoint is invalid: {read_error}")
+                })?;
+            if existing == *owner {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Autonomous task {task_id} is already owned by {} at lease epoch {}",
+                    existing.instance_id, existing.lease_epoch
+                ))
+            }
+        }
+        Err(error) => Err(format!("Could not claim autonomous task owner: {error}")),
+    }
+}
+
+/// Compare-and-swap the owner and advance its epoch. The expected identity is
+/// checked without using its expiry, because a lease renewal may have safely
+/// extended that expiry since the handoff snapshot was created.
+pub fn transfer_autonomous_task_owner(
+    task_id: &str,
+    expected: &AutonomousTaskOwnerSnapshot,
+    next: &AutonomousTaskOwnerSnapshot,
+) -> Result<(), String> {
+    if next.lease_epoch != expected.lease_epoch.saturating_add(1) {
+        return Err("Autonomous owner transfer must advance the lease epoch by one".to_string());
+    }
+    let path = autonomous_owner_path(task_id)?;
+    let _lock = lock_autonomous_task_owner(&path)?;
+    match read_autonomous_task_owner(&path)? {
+        None => claim_autonomous_task_owner(task_id, next),
+        Some(current) if current == *next => Ok(()),
+        Some(current) if owner_identity_matches(&current, expected) => {
+            write_autonomous_task_owner_locked(&path, next)
+        }
+        Some(current) => Err(format!(
+            "Autonomous task {task_id} owner CAS failed: current owner {} at lease epoch {}",
+            current.instance_id, current.lease_epoch
+        )),
+    }
+}
+
+/// Renew a live lease without changing its owner or epoch.
+pub fn renew_autonomous_task_owner(
+    task_id: &str,
+    owner: &AutonomousTaskOwnerSnapshot,
+    lease_expires_at_ms: u64,
+) -> Result<AutonomousTaskOwnerSnapshot, String> {
+    if lease_expires_at_ms == 0 {
+        return Err("Autonomous owner renewal requires a non-zero expiry".to_string());
+    }
+    let path = autonomous_owner_path(task_id)?;
+    let _lock = lock_autonomous_task_owner(&path)?;
+    let current = read_autonomous_task_owner(&path)?
+        .ok_or_else(|| "Autonomous task owner checkpoint is missing".to_string())?;
+    if !owner_identity_matches(&current, owner) {
+        return Err("Autonomous owner renewal lost its compare-and-swap race".to_string());
+    }
+    if lease_expires_at_ms <= current.lease_expires_at_ms {
+        return Ok(current);
+    }
+    let next = AutonomousTaskOwnerSnapshot {
+        lease_expires_at_ms,
+        ..current
+    };
+    write_autonomous_task_owner_locked(&path, &next)?;
+    Ok(next)
+}
+
+pub fn autonomous_task_owner_matches(
+    task_id: &str,
+    owner: &AutonomousTaskOwnerSnapshot,
+) -> Result<bool, String> {
+    let path = autonomous_owner_path(task_id)?;
+    Ok(read_autonomous_task_owner(&path)?.is_some_and(|existing| existing == *owner))
+}
+
+pub fn autonomous_task_owner_epoch_matches(
+    task_id: &str,
+    owner: &AutonomousTaskOwnerSnapshot,
+) -> Result<Option<AutonomousTaskOwnerSnapshot>, String> {
+    let path = autonomous_owner_path(task_id)?;
+    let Some(existing) = read_autonomous_task_owner(&path)? else {
+        return Ok(None);
+    };
+    Ok(owner_identity_matches(&existing, owner).then_some(existing))
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+pub struct AutonomousTaskSnapshot {
+    pub schema_version: u32,
+    pub task_id: String,
+    pub objective: String,
+    pub source: String,
+    #[serde(default)]
+    pub relevant_files: Vec<String>,
+    pub current_workspace_revision: String,
+    pub max_repair_rounds: u32,
+    pub max_workers: u32,
+    #[serde(default)]
+    pub guidance: Vec<AutonomousTaskGuidanceSnapshot>,
+    #[serde(default)]
+    pub delivery_intent: Option<String>,
+    #[serde(default)]
+    pub execution_owner: Option<AutonomousTaskOwnerSnapshot>,
+    #[serde(default)]
+    pub previous_execution_owner: Option<AutonomousTaskOwnerSnapshot>,
+    /// The exact durable task state captured at handoff, when submitted by
+    /// the desktop coordinator. CLI-created recipes may omit it.
+    #[serde(default)]
+    pub task_snapshot: Option<serde_json::Value>,
+    /// Succeeded node IDs from the desktop coordinator at handoff.
+    #[serde(default)]
+    pub completed_nodes: Vec<String>,
+    /// The node at the exact durable execution boundary.
+    #[serde(default)]
+    pub next_node_id: Option<String>,
+}
+
 /// A saved recipe, parsed from YAML or JSON (extension-sniffed — see
 /// [`parse_recipe`]). `permission_mode` deliberately has NO `#[serde(default)]`:
 /// omitting it from the recipe file is a hard parse error, not a silent
@@ -697,6 +1007,100 @@ pub struct Recipe {
     /// submitter's policy and budgets.
     #[serde(default)]
     pub placed_run: Option<crate::node_placement::PlacedRunSnapshot>,
+    /// Frozen Universal AutonomousTask coordinator input. The daemon owns the
+    /// execution after this snapshot is accepted; it never reconstructs the
+    /// task from a recipe name or mutable desktop state.
+    #[serde(default)]
+    pub autonomous_task: Option<AutonomousTaskSnapshot>,
+}
+
+/// Converts an immutable placement spec into the recipe consumed by the real
+/// headless runner. External runners must receive a recipe, not the protocol
+/// `RunSpec` itself: `task run` validates recipe fields and then reconstructs
+/// the exact frozen policy/target/budget from `placed_run`.
+pub fn placed_recipe_from_spec(
+    spec: &crate::run_protocol::RunSpec,
+    name: String,
+) -> Result<Recipe, String> {
+    spec.validate().map_err(|error| error.to_string())?;
+    let snapshot = crate::node_placement::PlacedRunSnapshot::from_spec(spec);
+    snapshot.validate()?;
+    let target = match &spec.target {
+        crate::run_protocol::ModelTargetSnapshot::Provider {
+            provider_id,
+            endpoint,
+            model,
+            ..
+        } if provider_id == "local-openai-compatible" => RecipeTarget {
+            provider: None,
+            model: Some(model.clone()),
+            ollama: None,
+            local_url: Some(endpoint.clone()),
+            managed_model: None,
+        },
+        crate::run_protocol::ModelTargetSnapshot::Provider {
+            provider_id, model, ..
+        } => RecipeTarget {
+            provider: Some(provider_id.clone()),
+            model: Some(model.clone()),
+            ollama: None,
+            local_url: None,
+            managed_model: None,
+        },
+        crate::run_protocol::ModelTargetSnapshot::Ollama { model, .. } => RecipeTarget {
+            provider: None,
+            model: None,
+            ollama: Some(model.clone()),
+            local_url: None,
+            managed_model: None,
+        },
+        crate::run_protocol::ModelTargetSnapshot::ManagedLlama { model_id, .. } => RecipeTarget {
+            provider: None,
+            model: None,
+            ollama: None,
+            local_url: None,
+            managed_model: Some(model_id.clone()),
+        },
+    };
+    let permission_mode =
+        match &spec.permission_policy.mode {
+            crate::run_protocol::PermissionMode::Manual => "manual",
+            crate::run_protocol::PermissionMode::AcceptEdits => "acceptEdits",
+            crate::run_protocol::PermissionMode::Smart => "smart",
+            crate::run_protocol::PermissionMode::Plan => "plan",
+            crate::run_protocol::PermissionMode::Auto => "auto",
+            crate::run_protocol::PermissionMode::Bypass => return Err(
+                "placed autonomous runs cannot use bypass permission mode on an unattended runner"
+                    .to_string(),
+            ),
+        }
+        .to_string();
+    let autonomous_task = spec
+        .autonomous_task
+        .clone()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| format!("placed autonomous task snapshot is invalid: {error}"))?;
+    let recipe = Recipe {
+        version: RECIPE_SCHEMA_VERSION,
+        name,
+        description: Some(format!("Placed autonomous run {}", spec.run_id)),
+        target,
+        workspace: snapshot.primary_root().map(str::to_string),
+        permission_mode,
+        system: spec.instructions.clone(),
+        prompt: spec.task.clone(),
+        params: HashMap::new(),
+        max_iterations: usize::try_from(spec.budgets.max_iterations).ok(),
+        timeout_seconds: Some(spec.budgets.wall_time_ms.div_ceil(1_000).max(1)),
+        output: RecipeOutput { json: true },
+        channel_send: None,
+        desktop_turn: None,
+        placed_run: Some(snapshot),
+        autonomous_task,
+    };
+    validate_recipe(&recipe).map_err(|error| format!("placed spec is not runnable: {error}"))?;
+    Ok(recipe)
 }
 
 fn is_valid_recipe_name(name: &str) -> bool {
@@ -773,6 +1177,80 @@ pub fn validate_recipe(recipe: &Recipe) -> Result<(), String> {
             return Err("a recipe cannot be both a desktop turn and a placed run".to_string());
         }
         placed.validate()?;
+    }
+    if let Some(task) = &recipe.autonomous_task {
+        if task.schema_version != AUTONOMOUS_TASK_RECIPE_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported autonomous task snapshot version {} (expected {})",
+                task.schema_version, AUTONOMOUS_TASK_RECIPE_SCHEMA_VERSION
+            ));
+        }
+        if task.task_id.trim().is_empty() || task.objective.trim().is_empty() {
+            return Err("autonomous task snapshot requires task_id and objective".to_string());
+        }
+        if task.current_workspace_revision.trim().is_empty() {
+            return Err("autonomous task snapshot requires a workspace revision".to_string());
+        }
+        if !(1..=16).contains(&task.max_workers) {
+            return Err("autonomous task max_workers must be between 1 and 16".to_string());
+        }
+        if task.max_repair_rounds > 8 {
+            return Err("autonomous task max_repair_rounds must be at most 8".to_string());
+        }
+        for file in &task.relevant_files {
+            let path = std::path::Path::new(file);
+            if path.is_absolute() || file.split('/').any(|part| part == "..") {
+                return Err(format!(
+                    "autonomous task file scope escapes the workspace: {file}"
+                ));
+            }
+        }
+        if task.guidance.len() > 32 {
+            return Err("autonomous task guidance exceeds 32 items".to_string());
+        }
+        if task.completed_nodes.len() > 64 {
+            return Err("autonomous task completed node list exceeds 64 items".to_string());
+        }
+        if let Some(task_snapshot) = &task.task_snapshot {
+            let snapshot_bytes = serde_json::to_vec(task_snapshot).map_err(|error| {
+                format!("autonomous task snapshot is not serializable: {error}")
+            })?;
+            if snapshot_bytes.len() > 512 * 1024 {
+                return Err("autonomous task snapshot exceeds 512 KiB".to_string());
+            }
+        }
+        let validate_owner = |owner: &AutonomousTaskOwnerSnapshot| -> Result<(), String> {
+            if owner.instance_id.trim().is_empty()
+                || owner.lease_epoch == 0
+                || owner.lease_expires_at_ms == 0
+            {
+                return Err("autonomous task execution owner has an invalid lease".to_string());
+            }
+            if !matches!(owner.kind.as_str(), "desktop" | "daemon" | "remote") {
+                return Err(format!(
+                    "unsupported autonomous task execution owner '{}'",
+                    owner.kind
+                ));
+            }
+            Ok(())
+        };
+        if let Some(owner) = &task.execution_owner {
+            validate_owner(owner)?;
+        }
+        if let Some(previous) = &task.previous_execution_owner {
+            validate_owner(previous)?;
+            let current = task.execution_owner.as_ref().ok_or_else(|| {
+                "autonomous task owner handoff requires a new execution owner".to_string()
+            })?;
+            if current.lease_epoch != previous.lease_epoch.saturating_add(1) {
+                return Err(
+                    "autonomous task owner handoff must advance the lease epoch by one".to_string(),
+                );
+            }
+        }
+        if recipe.desktop_turn.is_some() {
+            return Err("an autonomous task recipe cannot also be a desktop turn".to_string());
+        }
     }
     Ok(())
 }
@@ -1431,7 +1909,39 @@ mod tests {
             channel_send: None,
             desktop_turn: None,
             placed_run: None,
+            autonomous_task: None,
         }
+    }
+
+    #[test]
+    fn autonomous_snapshot_requires_bounded_scopes_and_a_valid_owner_lease() {
+        let mut recipe = valid_recipe();
+        recipe.autonomous_task = Some(AutonomousTaskSnapshot {
+            schema_version: AUTONOMOUS_TASK_RECIPE_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            objective: "update the parser".to_string(),
+            source: "cli".to_string(),
+            relevant_files: vec!["src/parser.rs".to_string()],
+            current_workspace_revision: "revision-1".to_string(),
+            max_repair_rounds: 2,
+            max_workers: 4,
+            guidance: Vec::new(),
+            delivery_intent: Some("leave_worktree".to_string()),
+            execution_owner: Some(AutonomousTaskOwnerSnapshot {
+                kind: "daemon".to_string(),
+                instance_id: "daemon-1".to_string(),
+                lease_epoch: 1,
+                lease_expires_at_ms: 10,
+            }),
+            previous_execution_owner: None,
+            task_snapshot: None,
+            completed_nodes: Vec::new(),
+            next_node_id: Some("plan".to_string()),
+        });
+        validate_recipe(&recipe).expect("valid autonomous snapshot");
+        recipe.autonomous_task.as_mut().unwrap().relevant_files = vec!["../secret".to_string()];
+        let error = validate_recipe(&recipe).unwrap_err();
+        assert!(error.contains("escapes the workspace"));
     }
 
     /// **The policy really does survive the trip** (roadmap K17 S3).
@@ -1471,6 +1981,30 @@ mod tests {
         );
         assert_eq!(placed.budgets.max_output_tokens, 4_321);
         assert_eq!(placed.submitted_run_id, "run:placed");
+    }
+
+    #[test]
+    fn a_placed_spec_becomes_a_runnable_local_executor_recipe() {
+        let mut spec = crate::node_placement::tests_support::placement_spec("run:docker");
+        if let crate::run_protocol::ModelTargetSnapshot::Provider {
+            provider_id,
+            endpoint,
+            ..
+        } = &mut spec.target
+        {
+            *provider_id = "local-openai-compatible".to_string();
+            *endpoint = "http://127.0.0.1:18080".to_string();
+        }
+        let recipe = placed_recipe_from_spec(&spec, "placed-docker-node".to_string()).unwrap();
+        assert_eq!(
+            recipe.target.local_url.as_deref(),
+            Some("http://127.0.0.1:18080")
+        );
+        assert_eq!(
+            recipe.placed_run.as_ref().unwrap().submitted_run_id,
+            "run:docker"
+        );
+        validate_recipe(&recipe).unwrap();
     }
 
     /// Both snapshots freeze the same four fields, so a recipe carrying both
@@ -1579,6 +2113,7 @@ mod tests {
                 web_tools_enabled: false,
                 verify_enabled: true,
                 verify_max_rounds: 2,
+                standards_checker_command_ids: Vec::new(),
                 subagents_enabled: false,
             },
             mcp_servers: Vec::new(),

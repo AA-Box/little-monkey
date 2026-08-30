@@ -190,15 +190,18 @@ describe("the telephony bridge", () => {
   });
 
   it("never sends a carrier credential as a command argument", () => {
-    // `telecom_set_credential` writes the keychain directly and then tells the
-    // CLI only that one exists. A secret in an argument vector would show up
-    // in a process listing.
+    // `telecom_set_credential` hands the secret to the CLI's own `set-token`
+    // on stdin. A secret in an argument vector would show up in a process
+    // listing — and the CLI has to be what writes the keychain entry, because
+    // macOS gives an item back only to the executable that stored it and the
+    // daemon that reads it is that same executable.
     const start = daemonCommands.indexOf("pub async fn telecom_set_credential(");
     expect(start).toBeGreaterThan(-1);
     const body = daemonCommands.slice(start, start + 1400);
-    expect(body).toContain("set_password");
-    expect(body).toContain("mark-credential");
+    expect(body).toContain("command_with_stdin(");
+    expect(body).toContain('"set-token".into()');
+    expect(body).not.toContain("set_password");
     expect(body).not.toMatch(/args\.push\(secret/);
-    expect(telecomCli).toContain("read_line(&mut secret)");
+    expect(telecomCli).toContain("read_secret_from_stdin()");
   });
 });

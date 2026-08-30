@@ -10,5 +10,7 @@
     <string>Little Monkey captures only the screen region you explicitly select for companion context.</string>
     <key>CFBundleIconName</key>
     <string>AppIcon</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.littlemonkey.app</string>
   </dict>
 </plist>

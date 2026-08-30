@@ -64,6 +64,7 @@ const mocks = vi.hoisted(() => ({
     componentSyncCatalog: vi.fn(),
     componentInstall: vi.fn(),
     mlxInstallComponent: vi.fn(),
+    mfluxInstallComponent: vi.fn(),
   },
 }));
 
@@ -258,6 +259,43 @@ describe("runtimeHubStore", () => {
       request: { entry },
     }));
     expect(useRuntimeHubStore.getState().errors["mlx-auto-install"]).toBeUndefined();
+  });
+
+  it("automatically fetches and installs the signed MFLUX component on Apple Silicon", async () => {
+    const entry = {
+      schemaVersion: 1,
+      sourceId: "local",
+      componentId: "mflux-image-runtime-apple-silicon",
+      kind: "mflux_image_runtime",
+      displayName: "MFLUX Image Runtime (Apple silicon)",
+      accelerator: null,
+      version: "mflux-0.18.0+py3.14",
+      channel: "stable",
+      downloadUrl: "https://components.example.test/mflux-runtime.tar.gz",
+      sha256: "a".repeat(64),
+      sizeBytes: 128,
+      publishedAtMs: 2,
+      compatibilityNote: null,
+      metadata: {},
+    };
+    useRuntimeHubStore.setState({
+      hardware: hardware as never,
+      runtimes: [],
+      componentRegistry: [entry] as never,
+    });
+    mocks.client.componentSyncCatalog.mockResolvedValue([entry]);
+    mocks.client.componentInstall.mockResolvedValue({});
+    mocks.client.componentInstalled.mockResolvedValue([]);
+    mocks.client.componentListRegistry.mockResolvedValue([entry]);
+    mocks.client.componentCheckUpdates.mockResolvedValue([]);
+
+    await useRuntimeHubStore.getState().ensureMfluxRuntime();
+
+    expect(mocks.client.componentSyncCatalog).toHaveBeenCalledOnce();
+    expect(mocks.client.componentInstall).toHaveBeenCalledWith(expect.objectContaining({
+      request: { entry },
+    }));
+    expect(useRuntimeHubStore.getState().errors["mflux-auto-install"]).toBeUndefined();
   });
 
   it("refreshes MLX readiness after repairing an active component", async () => {

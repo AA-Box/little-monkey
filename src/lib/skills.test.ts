@@ -1,17 +1,22 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { ActivePluginRuntimeSnapshot } from "./ecosystemClient";
 import type { NativeSkillDescriptor } from "./nativeSkillsClient";
 import {
+  MAX_MODEL_SKILLS,
   MAX_PACKAGE_RULES_PER_TURN,
   composeSkillCatalog,
   composeSkillSystemPrompt,
+  formatSkillSearchResults,
   nativeSkills,
   packageAssistantSkills,
   packageRuleInvocations,
   parseSkillTurn,
+  rankSkillCatalog,
+  skillRankingSignalsFor,
   skillCommandMap,
   type SlashSkill,
 } from "./skills";
+import { skillActivationPolicyKey, useSkillActivationPolicyStore } from "../store/skillActivationPolicyStore";
 
 function skill(command: string, id = command): SlashSkill {
   return {
@@ -186,6 +191,8 @@ describe("skill slash invocation", () => {
     expect(assistants[0].instructions).toContain("Act as a focused reviewer.");
     expect(assistants[0].instructions).toContain("Report concrete defects first.");
     expect(assistants[0].description).toContain("saved chat persona is unchanged");
+    expect(assistants[0].activationPolicy).toBe("manual");
+    expect(composeSkillCatalog(assistants, new Set(), "review")).toBe("");
 
     const parsed = parseSkillTurn(`/${assistants[0].command} auth.ts`, assistants)!;
     expect(parsed.invocations[0].activation).toBe("explicit");
@@ -207,6 +214,7 @@ function nativeDescriptor(overrides: Partial<NativeSkillDescriptor> = {}): Nativ
     file_count: 1,
     total_bytes: 10,
     enabled: true,
+    managed: true,
     eligibility: { eligible: true, current_os: "test", unsupported_os: false, missing_bins: [], missing_env: [] },
     supported_os: [],
     requirements: { bins: [], env: [] },
@@ -226,6 +234,11 @@ describe("allowed-tools and bundled resources", () => {
     ]);
     expect(mapped.allowedTools).toEqual(["read_file", "grep"]);
     expect(mapped.resourceFiles).toEqual(["references/info.md"]);
+  });
+
+  it("defaults unmanaged agents skills to Ask", () => {
+    const [mapped] = nativeSkills([nativeDescriptor({ managed: false })]);
+    expect(mapped.activationPolicy).toBe("ask");
   });
 
   it("lists allowed tools and bundled files in the composed system prompt", () => {
@@ -263,5 +276,138 @@ describe("composeSkillCatalog", () => {
   it("prefers the skill's description, falling back to its name", () => {
     const named: SlashSkill = { ...skill("review"), description: undefined, name: "Reviewer" };
     expect(composeSkillCatalog([named], new Set())).toContain("- /review — Reviewer");
+  });
+
+  it("ranks the catalog by request relevance", () => {
+    const available = [
+      { ...skill("testing"), description: "Run the test suite" },
+      { ...skill("review"), description: "Review the pull request" },
+    ];
+    const ranked = rankSkillCatalog(available, "please review this pull request");
+    expect(ranked.map((entry) => entry.command)).toEqual(["review", "testing"]);
+    const catalog = composeSkillCatalog(available, new Set(), "please review this pull request");
+    expect(catalog.indexOf("/review")).toBeLessThan(catalog.indexOf("/testing"));
+  });
+
+  it("bounds the model-facing catalog and advertises fallback search", () => {
+    const skills = Array.from({ length: MAX_MODEL_SKILLS + 2 }, (_, index) => skill(`skill-${index}`));
+    const catalog = composeSkillCatalog(skills, new Set(), "skill-11");
+    expect(catalog.match(/^- \/.*$/gm)).toHaveLength(MAX_MODEL_SKILLS);
+    expect(catalog).toContain("search_skills");
+    expect(catalog).toContain("/skill-11");
+  });
+
+  it("excludes Manual skills from implicit discovery and search", () => {
+    const manual = { ...skill("deploy"), activationPolicy: "manual" as const };
+    expect(composeSkillCatalog([manual], new Set())).toBe("");
+    expect(JSON.parse(formatSkillSearchResults([manual], new Set(), "deploy")).results).toEqual([]);
+  });
+
+  it("describes Ask skills as tool requests gated by user approval", () => {
+    const ask = { ...skill("review"), activationPolicy: "ask" as const };
+    const catalog = composeSkillCatalog([ask], new Set());
+    expect(catalog).toContain("may also be requested with the `skill` tool");
+    expect(catalog).toContain("pause and ask the user");
+    expect(catalog).not.toContain("explicit /command approval");
+  });
+
+  it("uses Unicode tokens and durable effectiveness signals", () => {
+    const preferred = { ...skill("deploy", "deploy-v1"), name: "Déployer", sourcePath: "/workspace/app/.agents/skills/deploy" };
+    const fallback = { ...skill("deploy-old", "old") };
+    const signals = skillRankingSignalsFor(
+      [preferred, fallback],
+      [{
+        command: "deploy",
+        scope: "workspace",
+        skill_sha256: preferred.contentSha256,
+        run_id: "run-1",
+        session_id: null,
+        outcome: "success",
+        verification_passed: true,
+        tool_failures: [],
+        failure_signature: null,
+        user_corrected: false,
+        recorded_at_unix_ms: Date.now(),
+      }],
+      "/workspace/app",
+    );
+    const ranked = rankSkillCatalog([preferred, fallback], "déployer", signals);
+    expect(ranked[0].id).toBe("deploy-v1");
+    expect(rankSkillCatalog([preferred], "déployer").length).toBe(1);
+  });
+
+  it("only counts verified successes and normalizes workspace paths", () => {
+    const windowsSkill = { ...skill("deploy", "windows"), sourcePath: "C:\\workspace\\app\\.agents\\skills\\deploy\\" };
+    const outsideSkill = { ...skill("other", "outside"), sourcePath: "C:\\workspace\\other\\.agents\\skills\\other" };
+    const records = [{
+      command: "deploy",
+      scope: "workspace" as const,
+      skill_sha256: windowsSkill.contentSha256,
+      run_id: "run-unverified",
+      session_id: null,
+      outcome: "success" as const,
+      verification_passed: null,
+      tool_failures: [],
+      failure_signature: null,
+      user_corrected: false,
+      recorded_at_unix_ms: Date.now(),
+    }];
+    const signals = skillRankingSignalsFor([windowsSkill, outsideSkill], records, "C:/workspace/app/");
+    expect(signals.get(windowsSkill.id)).toMatchObject({
+      workspaceRelevant: true,
+      verifiedSuccesses: 0,
+      recentSuccesses: 0,
+      lastSuccessfulAtUnixMs: undefined,
+    });
+    expect(signals.get(outsideSkill.id)?.workspaceRelevant).toBe(false);
+  });
+});
+
+describe("skill activation policy identity", () => {
+  afterEach(() => {
+    useSkillActivationPolicyStore.setState({
+      policies: {},
+      hydrated: false,
+      hydrating: false,
+      error: null,
+    });
+  });
+
+  it("does not let a disabled managed global skill authorize its external fallback", () => {
+    const managedKey = skillActivationPolicyKey("native", "review", "global");
+    useSkillActivationPolicyStore.setState({
+      policies: {
+        [managedKey]: { key: managedKey, policy: "automatic", pinned: true, updated_at_unix_ms: 1 },
+      },
+      hydrated: true,
+    });
+    const [external] = nativeSkills([
+      nativeDescriptor({
+        enabled: false,
+        managed: true,
+        source: { kind: "global", path: "/app-data/native-skills-v1/global/review" },
+      }),
+      nativeDescriptor({
+        managed: false,
+        source: { kind: "global", path: "/home/user/.agents/skills/review" },
+        sha256: "b".repeat(64),
+      }),
+    ]);
+
+    expect(external.activationPolicy).toBe("ask");
+    expect(external.policyKey).toBe("native:/home/user/.agents/skills/review:review");
+    expect(external.policyKey).not.toBe(managedKey);
+  });
+
+  it("separates native workspace identities", () => {
+    expect(skillActivationPolicyKey("native", "deploy", "/workspace/a/.agents/skills/deploy"))
+      .not.toBe(skillActivationPolicyKey("native", "deploy", "/workspace/b/.agents/skills/deploy"));
+    expect(skillActivationPolicyKey("native", "deploy", "global"))
+      .toBe("native:global:deploy");
+  });
+
+  it("separates skills within the same package", () => {
+    expect(skillActivationPolicyKey("package", "review", "github-tools"))
+      .not.toBe(skillActivationPolicyKey("package", "testing", "github-tools"));
   });
 });

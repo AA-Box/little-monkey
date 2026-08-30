@@ -239,6 +239,9 @@ pub struct SkillDescriptor {
     pub file_count: usize,
     pub total_bytes: u64,
     pub enabled: bool,
+    /// Whether this skill lives in Little Monkey's managed store. Skills
+    /// discovered from the standard `.agents/skills` roots are read-only.
+    pub managed: bool,
     pub eligibility: SkillEligibility,
     pub supported_os: BTreeSet<SupportedOs>,
     pub requirements: SkillRequirements,
@@ -447,6 +450,13 @@ struct HistoryRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeSkillHistory {
+    pub sha256: String,
+    pub version: String,
+    pub stored_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ManagedSkillState {
     #[serde(default = "default_true")]
@@ -576,6 +586,36 @@ impl NativeSkillManager {
         &self.global_root
     }
 
+    /// Returns the directories whose changes can affect native-skill
+    /// discovery. Existing skill directories are watched recursively; a
+    /// missing directory falls back to its nearest existing parent so the
+    /// watcher can notice the directory being created and resync itself.
+    pub fn watch_targets(
+        &self,
+        primary_workspace: Option<&Path>,
+    ) -> Result<Vec<(PathBuf, bool)>, SkillError> {
+        let mut targets = BTreeMap::<PathBuf, bool>::new();
+        add_watch_target(&mut targets, self.global_root.clone());
+        #[cfg(not(test))]
+        if let Some(home) = dirs::home_dir() {
+            add_watch_target(&mut targets, home.join(".agents").join("skills"));
+        }
+        if let Some(workspace) = primary_workspace {
+            let supplied = fs::symlink_metadata(workspace)
+                .map_err(|error| io_at("inspect primary workspace", workspace, error))?;
+            if supplied.file_type().is_symlink() || !supplied.is_dir() {
+                return Err(SkillError::Invalid(
+                    "primary workspace must be a real directory".to_string(),
+                ));
+            }
+            let workspace = fs::canonicalize(workspace)
+                .map_err(|error| io_at("canonicalize primary workspace", workspace, error))?;
+            add_watch_target(&mut targets, workspace.join(".littlemonkey").join("skills"));
+            add_watch_target(&mut targets, workspace.join(".agents").join("skills"));
+        }
+        Ok(targets.into_iter().collect())
+    }
+
     pub fn discover(
         &self,
         primary_workspace: Option<&Path>,
@@ -587,9 +627,20 @@ impl NativeSkillManager {
         self.discover_root(
             SkillScope::Global,
             &self.global_root,
+            true,
             &mut skills,
             &mut active_commands,
         )?;
+        #[cfg(not(test))]
+        if let Some(root) = global_agents_skill_root()? {
+            self.discover_root(
+                SkillScope::Global,
+                &root,
+                false,
+                &mut skills,
+                &mut active_commands,
+            )?;
+        }
         if let Some(workspace) = primary_workspace {
             if let Some(root) =
                 self.scope_root_if_present(SkillScope::Workspace, Some(workspace))?
@@ -597,6 +648,16 @@ impl NativeSkillManager {
                 self.discover_root(
                     SkillScope::Workspace,
                     &root,
+                    true,
+                    &mut skills,
+                    &mut active_commands,
+                )?;
+            }
+            if let Some(root) = workspace_agents_skill_root(workspace)? {
+                self.discover_root(
+                    SkillScope::Workspace,
+                    &root,
+                    false,
                     &mut skills,
                     &mut active_commands,
                 )?;
@@ -631,6 +692,7 @@ impl NativeSkillManager {
                 file_count: 1,
                 total_bytes: package.instructions.len() as u64,
                 enabled: true,
+                managed: false,
                 eligibility: eligible_everywhere(),
                 supported_os: BTreeSet::new(),
                 requirements: SkillRequirements {
@@ -653,6 +715,35 @@ impl NativeSkillManager {
                 .then_with(|| source_label(&left.source).cmp(&source_label(&right.source)))
         });
         Ok(skills)
+    }
+
+    /// Returns the native runtime's retained version metadata for one managed
+    /// command. Learning decorates this with its own provenance; it does not
+    /// maintain a second version database.
+    pub fn history(
+        &self,
+        scope: SkillScope,
+        primary_workspace: Option<&Path>,
+        command: &str,
+    ) -> Result<Vec<NativeSkillHistory>, SkillError> {
+        let _guard = self.lock()?;
+        let root = self.scope_root(scope, primary_workspace)?;
+        let state = load_state(&root)?;
+        Ok(state
+            .skills
+            .get(command)
+            .map(|entry| {
+                entry
+                    .history
+                    .iter()
+                    .map(|record| NativeSkillHistory {
+                        sha256: record.sha256.clone(),
+                        version: record.version.clone(),
+                        stored_at_unix_ms: record.stored_at_unix_ms,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// Reads one bundled file from an installed skill's folder by its
@@ -681,22 +772,97 @@ impl NativeSkillManager {
         relative_path: &str,
         primary_workspace: Option<&Path>,
     ) -> Result<String, SkillError> {
+        self.read_resource_with_snapshot(command, relative_path, primary_workspace, None, None)
+    }
+
+    /// Reads a resource only when the command still resolves to the exact
+    /// source folder and content hash that the frontend froze at invocation.
+    /// This is the trust boundary for mutable external `.agents/skills` roots.
+    pub fn read_resource_at_snapshot(
+        &self,
+        command: &str,
+        relative_path: &str,
+        primary_workspace: Option<&Path>,
+        expected_sha256: &str,
+        expected_source_path: &Path,
+    ) -> Result<String, SkillError> {
+        validate_sha256(expected_sha256, "expected skill digest")?;
+        self.read_resource_with_snapshot(
+            command,
+            relative_path,
+            primary_workspace,
+            Some(expected_sha256),
+            Some(expected_source_path),
+        )
+    }
+
+    fn read_resource_with_snapshot(
+        &self,
+        command: &str,
+        relative_path: &str,
+        primary_workspace: Option<&Path>,
+        expected_sha256: Option<&str>,
+        expected_source_path: Option<&Path>,
+    ) -> Result<String, SkillError> {
         let _guard = self.lock()?;
         let command = validate_command(command)?;
-        let candidate_roots = [
-            Some(self.global_root.clone()),
-            primary_workspace
-                .and_then(|workspace| workspace_skill_root(workspace, false).ok().flatten()),
-        ];
-        let skill_dir = candidate_roots
-            .into_iter()
-            .flatten()
-            .map(|root| root.join(&command))
-            .find(|candidate| {
-                fs::symlink_metadata(candidate)
-                    .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
-            })
-            .ok_or_else(|| SkillError::NotFound(format!("no skill installed at /{command}")))?;
+        let mut candidate_roots = vec![(self.global_root.clone(), true)];
+        #[cfg(not(test))]
+        if let Some(root) = global_agents_skill_root()? {
+            candidate_roots.push((root, false));
+        }
+        if let Some(workspace) = primary_workspace {
+            if let Some(root) = workspace_skill_root(workspace, false)? {
+                candidate_roots.push((root, true));
+            }
+            if let Some(root) = workspace_agents_skill_root(workspace)? {
+                candidate_roots.push((root, false));
+            }
+        }
+        let mut skill_dir = None;
+        let mut source_mismatch = false;
+        for (root, managed_root) in candidate_roots {
+            if managed_root
+                && load_state(&root)?
+                    .skills
+                    .get(&command)
+                    .is_some_and(|entry| !entry.enabled)
+            {
+                continue;
+            }
+            let candidate = root.join(&command);
+            if fs::symlink_metadata(&candidate)
+                .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
+            {
+                if let Some(expected_source_path) = expected_source_path {
+                    let current_source = fs::canonicalize(&candidate)
+                        .map_err(|error| io_at("canonicalize skill source", &candidate, error))?;
+                    let expected_source =
+                        fs::canonicalize(expected_source_path).map_err(|error| {
+                            io_at(
+                                "canonicalize expected skill source",
+                                expected_source_path,
+                                error,
+                            )
+                        })?;
+                    if current_source != expected_source {
+                        source_mismatch = true;
+                        continue;
+                    }
+                }
+                skill_dir = Some(candidate);
+                break;
+            }
+        }
+        let skill_dir = skill_dir.ok_or_else(|| {
+            if source_mismatch {
+                SkillError::Conflict(format!(
+                    "/{command} resolved to a different skill source after invocation"
+                ))
+            } else {
+                SkillError::NotFound(format!("no skill installed at /{command}"))
+            }
+        })?;
         let relative = validate_relative_subdirectory(relative_path)?;
         if relative == Path::new("SKILL.md") {
             return Err(SkillError::Invalid(
@@ -705,6 +871,13 @@ impl NativeSkillManager {
             ));
         }
         let scanned = scan_skill_folder(&skill_dir)?;
+        if let Some(expected_sha256) = expected_sha256 {
+            if scanned.sha256 != expected_sha256 {
+                return Err(SkillError::Conflict(format!(
+                    "/{command} changed after invocation; refusing to read a resource from a different snapshot"
+                )));
+            }
+        }
         let file = scanned
             .files
             .iter()
@@ -1242,10 +1415,15 @@ impl NativeSkillManager {
         &self,
         scope: SkillScope,
         root: &Path,
+        managed_root: bool,
         skills: &mut Vec<SkillDescriptor>,
         active_commands: &mut BTreeMap<String, String>,
     ) -> Result<(), SkillError> {
-        let state = load_state(root)?;
+        let state = if managed_root {
+            load_state(root)?
+        } else {
+            RootState::default()
+        };
         let mut entries = fs::read_dir(root)
             .map_err(|error| io_at("read skill root", root, error))?
             .collect::<Result<Vec<_>, _>>()
@@ -1283,8 +1461,8 @@ impl NativeSkillManager {
                     "skill folder {name} must match command {command}"
                 )));
             }
-            let managed = state.skills.get(&command);
-            if managed.is_some_and(|record| {
+            let record = state.skills.get(&command);
+            if record.is_some_and(|record| {
                 record.managed
                     && record
                         .active_sha256
@@ -1319,13 +1497,18 @@ impl NativeSkillManager {
                 sha256: scanned.sha256,
                 file_count: scanned.files.len(),
                 total_bytes: scanned.total_bytes,
-                enabled: managed.is_none_or(|entry| entry.enabled),
+                managed: managed_root,
+                enabled: if managed_root {
+                    record.is_none_or(|entry| entry.enabled)
+                } else {
+                    true
+                },
                 eligibility,
                 supported_os: scanned.parsed.manifest.os.clone(),
                 requirements: scanned.parsed.manifest.requires.clone(),
                 source,
                 permissions: BTreeSet::new(),
-                git_repository: managed.and_then(|record| record.origin_repository.clone()),
+                git_repository: record.and_then(|record| record.origin_repository.clone()),
                 allowed_tools: scanned.parsed.manifest.allowed_tools.clone(),
                 resource_files,
                 learned: None,
@@ -2488,6 +2671,105 @@ fn workspace_skill_root(workspace: &Path, create: bool) -> Result<Option<PathBuf
     Ok(Some(canonical))
 }
 
+/// Returns a standard `.agents/skills` root without creating or mutating it.
+/// These roots are interoperable user-authored content, not Little Monkey's
+/// managed install locations.
+fn external_skill_root(
+    root: &Path,
+    label: &str,
+    boundary: Option<&Path>,
+) -> Result<Option<PathBuf>, SkillError> {
+    let parent = root
+        .parent()
+        .ok_or_else(|| SkillError::Invalid(format!("{label} has no parent directory")))?;
+    match fs::symlink_metadata(parent) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_at(&format!("inspect {label} parent"), parent, error)),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(SkillError::Invalid(format!(
+                "{label} parent {} must be a real directory",
+                parent.display()
+            )))
+        }
+        Ok(_) => {}
+    }
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_at(&format!("inspect {label}"), root, error)),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(SkillError::Invalid(format!(
+                "{label} {} must be a real directory",
+                root.display()
+            )))
+        }
+        Ok(_) => {}
+    }
+    let canonical = fs::canonicalize(root)
+        .map_err(|error| io_at(&format!("canonicalize {label}"), root, error))?;
+    if let Some(boundary) = boundary {
+        if !canonical.starts_with(boundary) {
+            return Err(SkillError::Invalid(format!(
+                "{label} escapes the primary workspace"
+            )));
+        }
+    }
+    Ok(Some(canonical))
+}
+
+#[cfg(not(test))]
+fn global_agents_skill_root() -> Result<Option<PathBuf>, SkillError> {
+    let Some(home) = dirs::home_dir() else {
+        return Ok(None);
+    };
+    external_skill_root(
+        &home.join(".agents").join("skills"),
+        "global .agents skill directory",
+        None,
+    )
+}
+
+fn workspace_agents_skill_root(workspace: &Path) -> Result<Option<PathBuf>, SkillError> {
+    let supplied = fs::symlink_metadata(workspace)
+        .map_err(|error| io_at("inspect primary workspace", workspace, error))?;
+    if supplied.file_type().is_symlink() || !supplied.is_dir() {
+        return Err(SkillError::Invalid(
+            "primary workspace must be a real directory".to_string(),
+        ));
+    }
+    let canonical_workspace = fs::canonicalize(workspace)
+        .map_err(|error| io_at("canonicalize primary workspace", workspace, error))?;
+    external_skill_root(
+        &canonical_workspace.join(".agents").join("skills"),
+        "workspace .agents skill directory",
+        Some(&canonical_workspace),
+    )
+}
+
+fn add_watch_target(targets: &mut BTreeMap<PathBuf, bool>, path: PathBuf) {
+    let (target, recursive) = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => (path, true),
+        _ => (nearest_existing_directory(&path), false),
+    };
+    targets
+        .entry(target)
+        .and_modify(|existing| *existing |= recursive)
+        .or_insert(recursive);
+}
+
+fn nearest_existing_directory(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    loop {
+        if fs::symlink_metadata(&current)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        {
+            return current;
+        }
+        if !current.pop() {
+            return path.to_path_buf();
+        }
+    }
+}
+
 fn ensure_plain_directory(path: &Path, label: &str) -> Result<(), SkillError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -3016,6 +3298,32 @@ mod tests {
     }
 
     #[test]
+    fn watch_targets_follow_created_workspace_skill_directories() {
+        let root = TestDirectory::new("watch-targets");
+        let app_data = root.path().join("app-data");
+        let workspace = root.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let manager = NativeSkillManager::new(&app_data).unwrap();
+
+        let initial = manager.watch_targets(Some(&workspace)).unwrap();
+        let canonical_workspace = fs::canonicalize(&workspace).unwrap();
+        assert!(initial
+            .iter()
+            .any(|(path, recursive)| path == manager.global_root() && *recursive));
+        assert!(initial
+            .iter()
+            .any(|(path, recursive)| path == &canonical_workspace && !*recursive));
+
+        let workspace_skill_root = workspace.join(".agents").join("skills");
+        fs::create_dir_all(&workspace_skill_root).unwrap();
+        let workspace_skill_root = fs::canonicalize(workspace_skill_root).unwrap();
+        let refreshed = manager.watch_targets(Some(&workspace)).unwrap();
+        assert!(refreshed
+            .iter()
+            .any(|(path, recursive)| { path == &workspace_skill_root && *recursive }));
+    }
+
+    #[test]
     fn approval_rechecks_every_source_byte() {
         let root = TestDirectory::new("approval");
         let app_data = root.path().join("app-data");
@@ -3178,6 +3486,48 @@ mod tests {
             manager.discover(Some(&workspace), &[package]),
             Err(SkillError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn discovers_workspace_agents_skills_as_read_only() {
+        let root = TestDirectory::new("agents-skills-workspace");
+        let app_data = root.path().join("app-data");
+        let workspace = root.path().join("workspace");
+        let external = workspace.join(".agents/skills/review");
+        fs::create_dir_all(external.join("references")).unwrap();
+        let authored = write_skill(root.path(), "review", "1.0.0", "");
+        fs::copy(authored.join("SKILL.md"), external.join("SKILL.md")).unwrap();
+        fs::write(external.join("references/info.md"), "external reference").unwrap();
+
+        let manager = NativeSkillManager::new(&app_data).unwrap();
+        let preview = manager
+            .preview_local(&authored, SkillScope::Workspace, Some(&workspace))
+            .unwrap();
+        manager
+            .install_local(
+                &authored,
+                SkillScope::Workspace,
+                Some(&workspace),
+                &preview.approval_digest,
+                true,
+            )
+            .unwrap();
+        manager
+            .set_enabled(SkillScope::Workspace, Some(&workspace), "review", false)
+            .unwrap();
+        let skills = manager.discover(Some(&workspace), &[]).unwrap();
+        assert_eq!(skills.len(), 2);
+        let external_skill = skills.iter().find(|skill| !skill.managed).unwrap();
+        assert!(
+            matches!(external_skill.source, SkillSource::Workspace { ref path } if
+                Path::new(path).ends_with(Path::new(".agents").join("skills").join("review")))
+        );
+        assert_eq!(
+            manager
+                .read_resource("review", "references/info.md", Some(&workspace))
+                .unwrap(),
+            "external reference"
+        );
     }
 
     #[test]
@@ -3832,10 +4182,41 @@ esac
                 true,
             )
             .unwrap();
+        let descriptor = manager
+            .discover(None, &[])
+            .unwrap()
+            .into_iter()
+            .find(|skill| skill.command == "summarize")
+            .unwrap();
+        let source_path = match descriptor.source {
+            SkillSource::Global { path } => path,
+            _ => panic!("expected global source"),
+        };
         let contents = manager
-            .read_resource("summarize", "references/info.md", None)
+            .read_resource_at_snapshot(
+                "summarize",
+                "references/info.md",
+                None,
+                &descriptor.sha256,
+                Path::new(&source_path),
+            )
             .unwrap();
         assert_eq!(contents, "reference");
+        fs::write(
+            Path::new(&source_path).join("references/info.md"),
+            "changed",
+        )
+        .unwrap();
+        assert!(matches!(
+            manager.read_resource_at_snapshot(
+                "summarize",
+                "references/info.md",
+                None,
+                &descriptor.sha256,
+                Path::new(&source_path),
+            ),
+            Err(SkillError::Conflict(_))
+        ));
     }
 
     #[test]

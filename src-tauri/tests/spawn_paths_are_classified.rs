@@ -171,6 +171,14 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
         "runtime process management for the production model service",
     ),
     (
+        "mlx_chat.rs",
+        Class::HostUtility,
+        "`cp -Rc` with two paths this test built, to stage a copy of the installed MLX \
+         runtime under a temporary root; spawns only in its own ignored end-to-end test. \
+         The MLX service process itself is not started here — `m3_production.rs` above \
+         owns that, and this file only speaks HTTP to the hub in front of it",
+    ),
+    (
         "m4_runtime.rs",
         Class::ManagedService,
         "workflow node execution, bounded by the definition's own per-node budgets",
@@ -217,6 +225,20 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
         "m7_companion.rs",
         Class::ManagedService,
         "mobile companion pairing and capture helpers",
+    ),
+    (
+        "execution_target.rs",
+        Class::ManagedService,
+        "the configured execution-target runner owns its child lifecycle inside the target's \
+         transport and durable wall-time boundary",
+    ),
+    (
+        "execution_target/remote_node.rs",
+        Class::HostUtility,
+        "invokes only the bundled `monkey-cli daemon remote` control-plane surface with \
+         fixed subcommands and validated app-owned identifiers; it never accepts a \
+         model-authored program or free-form argv, and any future model-authored argv \
+         must instead enter the resource infrastructure",
     ),
     (
         "knowledge_service.rs",
@@ -343,6 +365,16 @@ const CLASSIFIED_CLI: &[(&str, Class, &str)] = &[
         "managed-runtime install and probe operations",
     ),
     (
+        "task.rs",
+        Class::HostUtility,
+        "autonomous executor Git inspection and verification use fixed arguments",
+    ),
+    (
+        "extension_dev_cli.rs",
+        Class::HostUtility,
+        "extension development invokes only fixed `cargo build --release --target wasm32-wasip2` and `git rev-parse HEAD` commands; project paths select the working directory but never become executable or shell-authored command text",
+    ),
+    (
         "daemon/callback_exposure.rs",
         Class::ManagedService,
         "the operator's own tunnel client, started and supervised by the daemon \
@@ -385,6 +417,11 @@ const CLASSIFIED_CLI: &[(&str, Class, &str)] = &[
         "daemon/remote/desktop.rs",
         Class::ManagedService,
         "remote-controlled desktop operations, gated by the pairing's granted scope",
+    ),
+    (
+        "daemon/remote/api.rs",
+        Class::HostUtility,
+        "the ignored Windows acceptance test launches the repository-owned WPF fixture with fixed arguments",
     ),
     (
         "daemon/adapters/signal.rs",

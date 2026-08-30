@@ -159,8 +159,9 @@ pub enum ChannelsCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Record that a credential was stored for this account by the app. The
-    /// secret itself never travels through an argument.
+    /// Record that a credential was stored for this account out of band — by
+    /// a secrets manager, or a restore. `set-token` already does this; this is
+    /// for the entry that was written without it.
     MarkCredential { account_id: String },
     /// Remove an account and its stored credential.
     Remove { account_id: String },
@@ -662,8 +663,9 @@ fn unverified_health(detail: &str, now_ms: i64) -> ChannelHealth {
 
 /// Record that `account_id`'s credential was just written: point the row at
 /// its keychain entry and drop the connectivity claim the old credential had
-/// earned. Every credential write path — the CLI's `set-token`, the desktop's
-/// save (which arrives here as `mark-credential`) — funnels through this.
+/// earned. Every credential write path funnels through this — `set-token`,
+/// which is also what the desktop's save runs, and `mark-credential` for a
+/// keychain entry somebody stored by hand.
 pub(crate) fn record_credential_change(
     store: &mut DaemonStore,
     account_id: &str,
@@ -690,18 +692,11 @@ pub fn set_token(account_id: &str) -> Result<(), String> {
         return Err(format!("No such account '{account_id}'"));
     }
 
-    let mut secret = String::new();
-    std::io::stdin()
-        .read_line(&mut secret)
-        .map_err(|error| format!("Could not read the credential from stdin: {error}"))?;
-    let secret = secret.trim();
-    if secret.is_empty() {
-        return Err("No credential was supplied on stdin".to_string());
-    }
+    let secret = read_secret_from_stdin()?;
 
     KeyringChannelSecrets.put(
         &little_monkey_lib::channels::credential_ref(account_id),
-        secret,
+        &secret,
     )?;
     record_credential_change(&mut store, account_id)?;
     println!("Credential stored for {account_id}. Run `monkey channels probe {account_id}` to verify it.");
@@ -710,12 +705,18 @@ pub fn set_token(account_id: &str) -> Result<(), String> {
 
 /// One secret, from stdin. Never an argument: an argument is visible to every
 /// process on the machine and lands in a shell history.
-fn read_secret_from_stdin() -> Result<String, String> {
-    use std::io::BufRead;
+///
+/// Everything up to EOF rather than one line: a Google Chat account's
+/// credential is a pasted service-account key file, and a line-at-a-time read
+/// would store its opening brace and call that a credential.
+pub(crate) fn read_secret_from_stdin() -> Result<String, String> {
+    use std::io::Read;
     let mut secret = String::new();
+    // Bounded: a channel store refuses more than 8 KiB anyway, and reading a
+    // pipe to EOF is otherwise a promise to accept a stream that never ends.
     std::io::stdin()
-        .lock()
-        .read_line(&mut secret)
+        .take(64 * 1024)
+        .read_to_string(&mut secret)
         .map_err(|error| format!("Could not read the credential from stdin: {error}"))?;
     let secret = secret.trim().to_string();
     if secret.is_empty() {
@@ -724,7 +725,10 @@ fn read_secret_from_stdin() -> Result<String, String> {
     Ok(secret)
 }
 
-/// Point the account at its keychain entry after the app stored one there.
+/// Point the account at a keychain entry stored outside this command.
+///
+/// The desktop no longer needs this — its save runs `set-token` here, so the
+/// entry is written by this binary, the one the daemon reads it back from.
 pub fn mark_credential(account_id: &str) -> Result<(), String> {
     let mut store = store()?;
     record_credential_change(&mut store, account_id)?;

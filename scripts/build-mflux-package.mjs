@@ -6,7 +6,7 @@ import { cpSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } f
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { buildManifest, canonicalJson, signManifest } from "./lib/mlxPackage.mjs";
+import { buildManifest, canonicalJson, serviceRevision, signManifest } from "./lib/mlxPackage.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SOURCE = join(ROOT, "packaging/mflux/service/mflux_image_server.py");
@@ -31,7 +31,9 @@ function build() {
   mkdirSync(join(OUTPUT, "service"), { recursive: true });
   cpSync(SOURCE, join(OUTPUT, "service/mflux_image_server.py"));
   const pythonExecutable = "runtime/bin/python3";
-  const version = `mflux-${VERSION}+${pythonVersion(python)}`;
+  // Same reason as the MLX package: without this, a fix to the service file
+  // rebuilds to a version that already exists and nothing upgrades to it.
+  const version = `mflux-${VERSION}+${pythonVersion(python)}+svc-${serviceRevision([SOURCE])}`;
   let manifest = buildManifest({
     root: OUTPUT,
     packageVersion: version,

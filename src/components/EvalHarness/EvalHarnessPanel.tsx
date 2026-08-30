@@ -30,10 +30,10 @@ import {
   type EvalRunStatus,
   type EvalTarget,
 } from "../../lib/evalHarness";
-import { nativeSkillsClient } from "../../lib/nativeSkillsClient";
 import { nativeSkills, type SlashSkill } from "../../lib/skills";
 import { useEvalHarnessStore } from "../../store/evalHarnessStore";
 import { useMcpStore } from "../../store/mcpStore";
+import { useNativeSkillsStore } from "../../store/nativeSkillsStore";
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
 import { errorMessage } from "../../lib/errors";
 import { statusTone as sharedStatusTone } from "../../lib/statusTone";
@@ -323,7 +323,9 @@ export function EvalHarnessPanel({ onClose }: EvalHarnessPanelProps) {
 
   const [selectedCaseId, setSelectedCaseId] = useState<string | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
-  const [skills, setSkills] = useState<SlashSkill[]>([]);
+  const nativeSkillDescriptors = useNativeSkillsStore((state) => state.descriptors);
+  const refreshNativeSkills = useNativeSkillsStore((state) => state.refresh);
+  const skills = useMemo(() => nativeSkills(nativeSkillDescriptors), [nativeSkillDescriptors]);
   const [workflows, setWorkflows] = useState<WorkflowDefinition[]>([]);
   const [targetsBusy, setTargetsBusy] = useState(false);
   const [targetError, setTargetError] = useState<string | null>(null);
@@ -345,7 +347,7 @@ export function EvalHarnessPanel({ onClose }: EvalHarnessPanelProps) {
     setTargetsBusy(true);
     const errors: string[] = [];
     try {
-      setSkills(nativeSkills(await nativeSkillsClient.discover()));
+      await refreshNativeSkills();
     } catch (error) {
       errors.push(`Skills: ${errorMessage(error)}`);
     }
@@ -361,7 +363,7 @@ export function EvalHarnessPanel({ onClose }: EvalHarnessPanelProps) {
     }
     setTargetError(errors.length > 0 ? errors.join(" · ") : null);
     setTargetsBusy(false);
-  }, [refreshMcp]);
+  }, [refreshMcp, refreshNativeSkills]);
 
   useEffect(() => { void loadTargets(); }, [loadTargets]);
 

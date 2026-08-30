@@ -7,11 +7,24 @@ rather than left for a reader to discover. Work that is not built yet lives in
 
 ## Runtimes and hardware
 
+- Execution target support is user-owned and opt-in: Docker requires a local
+  or explicitly configured Docker runtime, and SSH requires an installed,
+  compatible `monkey` runner plus a maintained `known_hosts` file. The generic
+  runner currently returns bounded event/artifact surfaces; provider secrets
+  remain executor-local unless an explicit forwarding map is supplied.
+- Workspace results represent safe snapshot deltas. Dirty Git bases are
+  returned as changed-file content rather than replaying the entire pre-run
+  `HEAD` diff, so a local apply cannot duplicate the user's original edits.
+- Existing paired-node placement and K18 migration retain their established
+  lifecycle semantics; the execution-target layer does not make operating
+  system process migration portable or infer undocumented remote capacity.
+
 - The published MLX catalog and signed Apple Silicon package are installed automatically from Runtime Hub → Runtimes on supported macOS/aarch64 hosts. If GitHub is unreachable, the local registry and Import catalog path remain available. ROCm, Vulkan, and DirectML are not advertised as maintained managed runtimes.
 - The MLX video engine carries mlx-video pinned to a commit, because that project publishes no releases or tags and the name `mlx-video` on PyPI belongs to an unrelated package. Its open issue #40 reports black output from quantized Wan 2.2 checkpoints at some frame counts; the frame counts affected have not been mapped on reference hardware here.
 - Hardware-fit estimates and runtime controls are implemented, but the ±15% memory matrix, clean-machine lifecycle checks, and the MLX release gate need maintained physical reference hardware. Edge-device profiles are still static heuristics; the Runtime Hub's Benchmark section measures throughput, time-to-first-token and peak memory on this machine, but those profiles do not yet read from it.
 - `/v1/embeddings` produces real vectors only when the resolved runtime reaches an embeddings-capable backend (Ollama today); otherwise it returns an unsupported error rather than a fabricated vector. Native Ollama `/api/generate`, `/api/pull`, and `/api/show` are not implemented, and `/api/chat` returns a complete response rather than per-token streaming — real SSE streaming is OpenAI-compatible only.
 - Vision is projector management and wire transport, not in-app vision chat: the main chat UI does not yet route attached images through that path, and the renderer cannot represent image blocks or reasoning content, so vision is never advertised as ready.
+- Computer Use is native-UI control, not unrestricted desktop autonomy. It requires a live local grant, OS accessibility/screen-recording permissions, a visible target, and a frontmost revalidation; it refuses password managers, authentication/security surfaces, hidden password fields, OS permission dialogs, and sensitive targets. Linux AT-SPI/provider availability varies, bounded X11 screenshots require `scrot` or ImageMagick, and Wayland remains fail-closed until the portal/RemoteDesktop/InputCapture/libei path is approved and implemented. The screenshot result can be sent as an image block only to a model/provider that supports image input; semantic text remains the fallback.
 - Studio ships no model catalog, and its RAM floor is a check rather than a guarantee. `sd-server` covers three host targets, and the surface is hidden elsewhere rather than offered and failed at launch.
 
 ## Enforcement and isolation

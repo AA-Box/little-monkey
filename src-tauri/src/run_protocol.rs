@@ -338,6 +338,7 @@ pub fn classify(kind: &RunKind, priority: i32) -> ProcessClass {
         | RunKind::CrewCoordinator
         | RunKind::Sandboxed => ProcessClass::Batch,
         RunKind::Background => ProcessClass::Background,
+        RunKind::AutonomousTask => ProcessClass::Background,
         RunKind::Scheduled => ProcessClass::Maintenance,
     };
     if priority < 0 && declared.rank() < ProcessClass::Background.rank() {
@@ -359,6 +360,9 @@ pub enum RunKind {
     Browser,
     Acp,
     Background,
+    /// Coordinator-owned task run whose plan, workers, evidence, and delivery
+    /// are projected from `TaskEvent` records.
+    AutonomousTask,
     /// Evidence ledger for a remote desktop-control session: periodic and
     /// start/stop screenshots recorded as `ArtifactAdded` events (see
     /// `daemon/remote/desktop.rs`).
@@ -1227,6 +1231,17 @@ pub struct RunSpec {
     pub workspace: Option<WorkspaceContext>,
     pub permission_policy: PermissionPolicySnapshot,
     pub budgets: RunBudgets,
+    /// Frozen autonomous coordinator state transported with a remote
+    /// placement. Ordinary runs leave this absent.
+    #[serde(default)]
+    pub autonomous_task: Option<serde_json::Value>,
+    /// Frozen executor identity/capability snapshot. The model target and
+    /// execution target are separate concerns.
+    #[serde(default)]
+    pub execution_target: Option<crate::execution_target::ExecutionTargetSnapshot>,
+    /// Portable workspace snapshot/delta for non-local executors.
+    #[serde(default)]
+    pub workspace_transfer: Option<crate::execution_target::WorkspaceTransfer>,
 }
 
 impl RunSpec {
@@ -1255,7 +1270,29 @@ impl RunSpec {
             workspace.validate()?;
         }
         self.permission_policy.validate()?;
-        self.budgets.validate()
+        self.budgets.validate()?;
+        if let Some(snapshot) = &self.autonomous_task {
+            let bytes = serde_json::to_vec(snapshot).map_err(|_| {
+                ProtocolValidationError::new("autonomous_task", "is not serializable")
+            })?;
+            if bytes.len() > 512 * 1024 {
+                return Err(ProtocolValidationError::new(
+                    "autonomous_task",
+                    "exceeds the 512 KiB limit",
+                ));
+            }
+        }
+        if let Some(target) = &self.execution_target {
+            target.validate().map_err(|error| {
+                ProtocolValidationError::new("execution_target", error.to_string())
+            })?;
+        }
+        if let Some(transfer) = &self.workspace_transfer {
+            transfer.validate().map_err(|error| {
+                ProtocolValidationError::new("workspace_transfer", error.to_string())
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -1720,6 +1757,14 @@ pub enum RunEvent {
         mutation_id: String,
         reason: String,
     },
+    /// Domain event emitted by the autonomous-task coordinator. The run ledger
+    /// stores it without interpreting task-specific state; the payload is
+    /// validated and the coordinator snapshot is the replay source of truth.
+    TaskEvent {
+        task_id: String,
+        event_type: String,
+        payload: serde_json::Value,
+    },
     /// This run's frozen process image left for another owned node (roadmap
     /// K18), recorded on the origin's half of the chain.
     ///
@@ -1784,7 +1829,18 @@ impl RunEvent {
                 text,
             } => {
                 validate_protocol_id("event.message_id", message_id)?;
-                validate_text("event.text", text, MAX_EVENT_TEXT_BYTES, false)?;
+                // A streamed delta is a raw slice of model output, so a chunk
+                // that is only whitespace ("\n\n" between paragraphs, a lone
+                // space token) is real content: dropping or rejecting it would
+                // silently reflow the replayed transcript. Only a zero-length
+                // chunk is meaningless.
+                if text.is_empty() {
+                    return Err(ProtocolValidationError::new(
+                        "event.text",
+                        "must not be empty",
+                    ));
+                }
+                validate_text("event.text", text, MAX_EVENT_TEXT_BYTES, true)?;
             }
             Self::ToolProposed {
                 tool_call_id,
@@ -1983,6 +2039,23 @@ impl RunEvent {
             } => {
                 validate_protocol_id("event.mutation_id", mutation_id)?;
                 validate_text("event.reason", reason, MAX_EVENT_TEXT_BYTES, false)?;
+            }
+            Self::TaskEvent {
+                task_id,
+                event_type,
+                payload,
+            } => {
+                validate_protocol_id("event.task_id", task_id)?;
+                validate_single_line("event.event_type", event_type, MAX_LABEL_BYTES)?;
+                let bytes = serde_json::to_vec(payload).map_err(|_| {
+                    ProtocolValidationError::new("event.payload", "must be valid JSON")
+                })?;
+                if bytes.len() > MAX_EVENT_JSON_BYTES {
+                    return Err(ProtocolValidationError::new(
+                        "event.payload",
+                        format!("exceeds the {MAX_EVENT_JSON_BYTES}-byte limit"),
+                    ));
+                }
             }
             Self::MigrationDeparted {
                 target_node_id,
@@ -2204,6 +2277,9 @@ mod tests {
                 max_artifact_bytes: 10_000_000,
                 max_event_count: 10_000,
             },
+            autonomous_task: None,
+            execution_target: None,
+            workspace_transfer: None,
         }
     }
 
@@ -2732,6 +2808,23 @@ mod tests {
             text: "x".repeat(MAX_EVENT_TEXT_BYTES + 1),
         };
         assert_eq!(event.validate().unwrap_err().field, "event.text");
+    }
+
+    /// Streamed deltas arrive one tokenizer token at a time, and models emit
+    /// standalone whitespace tokens ("\n\n" at a paragraph break, a trailing
+    /// newline before EOS). Rejecting those failed the whole run mid-answer
+    /// with `event.text: must not be empty`, so whitespace has to survive
+    /// while a zero-length chunk stays rejected.
+    #[test]
+    fn whitespace_only_model_deltas_are_accepted() {
+        let delta = |text: &str| RunEvent::ModelDelta {
+            message_id: "message-01".to_string(),
+            channel: OutputChannel::Assistant,
+            text: text.to_string(),
+        };
+        delta("\n\n").validate().expect("a paragraph-break delta");
+        delta(" ").validate().expect("a lone space delta");
+        assert_eq!(delta("").validate().unwrap_err().field, "event.text");
     }
 
     mod egress_allowlist {

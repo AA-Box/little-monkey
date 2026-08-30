@@ -4,8 +4,24 @@ import type {
   PackagePermission,
 } from "./ecosystemClient";
 import type { PromptEntry } from "../store/promptStore";
+import type { EffectivenessRecord } from "./skillLearningClient";
+import {
+  skillActivationIsPinned,
+  skillActivationPolicyFor,
+  skillActivationPolicyKey,
+  useSkillActivationPolicyStore,
+  type SkillActivationPolicy,
+} from "../store/skillActivationPolicyStore";
+
+function nativeSkillPolicyIdentity(entry: import("./nativeSkillsClient").NativeSkillDescriptor): string {
+  if (entry.source.kind === "global") return entry.managed ? "global" : entry.source.path;
+  if (entry.source.kind === "workspace") return entry.source.path;
+  return `signed-package:${entry.source.package_id}`;
+}
 
 export const MAX_SKILLS_PER_TURN = 5;
+export const MAX_MODEL_SKILLS = 10;
+export const MAX_SKILL_SEARCH_RESULTS = 20;
 export const MAX_PACKAGE_RULES_PER_TURN = 20;
 export const MAX_PACKAGE_RULE_BYTES_PER_TURN = 64 * 1024;
 export const MAX_PACKAGE_ASSISTANT_BYTES = 64 * 1024;
@@ -21,6 +37,9 @@ export interface SlashSkill {
   contentSha256: string;
   bundleSha256?: string;
   permissions: PackagePermission[];
+  /** How the model may discover and load this skill. Explicit `/command`
+   * invocations always remain available as the user's approval. */
+  activationPolicy?: SkillActivationPolicy;
   /** Tool names this skill restricts the model to while active — only ever
    * populated for `source: "native"` (ecosystem `SKILL.md`) skills, which
    * are the only ones with an `allowed-tools` frontmatter concept. Empty or
@@ -31,6 +50,120 @@ export interface SlashSkill {
    * disclosure, so their contents are never loaded until asked for. Only
    * ever populated for `source: "native"` skills. */
   resourceFiles?: string[];
+  /** Stable backend policy identity, also used for ranking pins. */
+  policyKey?: string;
+  /** Native source path, used for workspace-aware ranking. */
+  sourcePath?: string;
+}
+
+function catalogTokens(value: string): string[] {
+  return value.toLocaleLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}_-]*/gu) ?? [];
+}
+
+function normalizeRankingPath(path: string): string {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  // Windows drive and UNC paths are case-insensitive; preserve case for
+  // ordinary Unix paths, where it is significant.
+  return (/^[A-Za-z]:\//.test(normalized) || normalized.startsWith("//"))
+    ? normalized.toLowerCase()
+    : normalized;
+}
+
+function isWithinWorkspace(sourcePath: string, workspaceRoot: string): boolean {
+  const source = normalizeRankingPath(sourcePath);
+  const root = normalizeRankingPath(workspaceRoot);
+  return source === root || source.startsWith(`${root}/`);
+}
+
+export interface SkillRankingSignals {
+  pinned?: boolean;
+  workspaceRelevant?: boolean;
+  verifiedSuccesses?: number;
+  recentSuccesses?: number;
+  failures?: number;
+  corrections?: number;
+  lastSuccessfulAtUnixMs?: number;
+}
+
+function skillCatalogScore(
+  skill: SlashSkill,
+  requestText: string,
+  signals: ReadonlyMap<string, SkillRankingSignals> = new Map(),
+): number {
+  const query = requestText.trim().toLowerCase();
+  const ranking = signals.get(skill.id) ?? {};
+  const command = skill.command.toLowerCase();
+  const name = skill.name.toLowerCase();
+  const description = (skill.description ?? "").toLowerCase();
+  const searchable = `${name} ${description}`;
+  let score = query.includes(`/${command}`) ? 2_000 : 0;
+  if (ranking.pinned) score += 350;
+  if (ranking.workspaceRelevant) score += 160;
+  score += Math.min(ranking.verifiedSuccesses ?? 0, 5) * 60;
+  score += Math.min(ranking.recentSuccesses ?? 0, 5) * 35;
+  score -= Math.min(ranking.failures ?? 0, 5) * 80;
+  score -= Math.min(ranking.corrections ?? 0, 3) * 120;
+  if (ranking.lastSuccessfulAtUnixMs) {
+    const ageDays = Math.max(0, (Date.now() - ranking.lastSuccessfulAtUnixMs) / 86_400_000);
+    score += Math.max(0, 100 - ageDays * 3);
+  }
+  for (const token of catalogTokens(query)) {
+    if (token === command) score += 500;
+    else if (command.startsWith(token)) score += 160;
+    else if (command.includes(token)) score += 80;
+    if (token === name) score += 350;
+    else if (name.includes(token)) score += 120;
+    if (searchable.includes(token)) score += 25;
+  }
+  return score;
+}
+
+/** Orders the model-facing catalog by relevance to the current request. */
+export function rankSkillCatalog(
+  skills: readonly SlashSkill[],
+  requestText = "",
+  signals: ReadonlyMap<string, SkillRankingSignals> = new Map(),
+): SlashSkill[] {
+  return skills
+    .map((skill, index) => ({ skill, index, score: skillCatalogScore(skill, requestText, signals) }))
+    .sort((left, right) => right.score - left.score || left.skill.command.localeCompare(right.skill.command) || left.index - right.index)
+    .map(({ skill }) => skill);
+}
+
+/** Converts the durable effectiveness ledger into the same deterministic
+ * signal map used by both the initial catalog and fallback search. */
+export function skillRankingSignalsFor(
+  skills: readonly SlashSkill[],
+  records: readonly EffectivenessRecord[],
+  workspaceRoot = "",
+): Map<string, SkillRankingSignals> {
+  const signals = new Map<string, SkillRankingSignals>();
+  for (const skill of skills) {
+    const matching = records.filter((record) =>
+      record.command.toLowerCase() === skill.command.toLowerCase()
+      && record.skill_sha256 === skill.contentSha256,
+    );
+    const verifiedSuccesses = matching.filter((record) => record.outcome === "success" && record.verification_passed === true);
+    const failures = matching.filter((record) => record.outcome === "failure" || record.verification_passed === false);
+    const lastSuccessfulAtUnixMs = verifiedSuccesses.reduce(
+      (latest, record) => Math.max(latest, record.recorded_at_unix_ms),
+      0,
+    );
+    signals.set(skill.id, {
+      pinned: skill.policyKey ? skillActivationIsPinned(skill.policyKey) : false,
+      workspaceRelevant: Boolean(
+        skill.sourcePath
+        && workspaceRoot
+        && isWithinWorkspace(skill.sourcePath, workspaceRoot),
+      ),
+      verifiedSuccesses: verifiedSuccesses.length,
+      recentSuccesses: verifiedSuccesses.filter((record) => Date.now() - record.recorded_at_unix_ms <= 30 * 86_400_000).length,
+      failures: failures.length,
+      corrections: matching.filter((record) => record.user_corrected).length,
+      lastSuccessfulAtUnixMs: lastSuccessfulAtUnixMs || undefined,
+    });
+  }
+  return signals;
 }
 
 export function nativeSkills(entries: import("./nativeSkillsClient").NativeSkillDescriptor[]): SlashSkill[] {
@@ -46,6 +179,15 @@ export function nativeSkills(entries: import("./nativeSkillsClient").NativeSkill
       version: entry.version,
       contentSha256: entry.sha256,
       permissions: [],
+      activationPolicy: (() => {
+        const policyKey = skillActivationPolicyKey("native", entry.command, nativeSkillPolicyIdentity(entry));
+        const state = useSkillActivationPolicyStore.getState();
+        return state.hydrated
+          ? skillActivationPolicyFor(policyKey, entry.managed ? "automatic" : "ask")
+          : entry.managed ? "automatic" : "ask";
+      })(),
+      policyKey: skillActivationPolicyKey("native", entry.command, nativeSkillPolicyIdentity(entry)),
+      sourcePath: entry.source.kind === "signed_package" ? undefined : entry.source.path,
       allowedTools: entry.allowed_tools,
       resourceFiles: entry.resource_files,
     }));
@@ -75,6 +217,8 @@ export function localPromptSkills(entries: PromptEntry[]): SlashSkill[] {
       version: `local-${entry.updatedAt}`,
       contentSha256: `local:${entry.id}:${entry.updatedAt}`,
       permissions: [],
+      activationPolicy: skillActivationPolicyFor(skillActivationPolicyKey("local", entry.command, entry.id)),
+      policyKey: skillActivationPolicyKey("local", entry.command, entry.id),
     }));
 }
 
@@ -89,6 +233,8 @@ export function packageSkills(entries: ActiveSkillDescriptor[]): SlashSkill[] {
     version: entry.version,
     contentSha256: entry.content_sha256,
     permissions: entry.permissions,
+    activationPolicy: skillActivationPolicyFor(skillActivationPolicyKey("package", entry.command, entry.package_id)),
+    policyKey: skillActivationPolicyKey("package", entry.command, entry.package_id),
   }));
 }
 
@@ -194,6 +340,7 @@ export function packageAssistantSkills(
       command: packageAssistantCommand(snapshot.package_id),
       name: snapshot.manifest.display_name,
       description: `${snapshot.manifest.description} Explicit for one turn; the saved chat persona is unchanged.`,
+      activationPolicy: "manual",
       instructions: [
         "Use this explicitly selected package assistant for the current turn only. Do not change the saved chat persona. Do not auto-run starter workflows.",
         ...instructionBlocks,
@@ -373,28 +520,69 @@ export function composeSkillSystemPrompt(
 }
 
 /**
- * Compact `name`+`description` catalog of every available skill NOT already
+ * Compact `name`+`description` catalog of discoverable available skills NOT already
  * invoked this turn — the auto-invocation counterpart to
  * `composeSkillSystemPrompt` above: that function injects the FULL
  * instructions for skills already invoked (explicitly, or via an
  * always-on package rule); this one lists the rest by name only, so the
  * model can choose to invoke one itself (via the `skill` tool — see
  * `tools.ts`'s `SKILL_INVOKE_TOOL`) without every uninvoked skill's full
- * instructions being loaded into every turn's context up front. Returns
+ * instructions being loaded into every turn's context up front. The model
+ * sees only the bounded top-ranked slice; `search_skills` covers the rest.
+ * Returns
  * `""` when there's nothing left to list, so callers can `filter(Boolean)`
  * it straight into a section list without a separate emptiness check.
  */
 export function composeSkillCatalog(
   availableSkills: SlashSkill[],
   alreadyInvokedCommands: ReadonlySet<string>,
+  requestText = "",
+  signals: ReadonlyMap<string, SkillRankingSignals> = new Map(),
 ): string {
-  const remaining = availableSkills.filter((skill) => !alreadyInvokedCommands.has(skill.command));
+  const remaining = availableSkills.filter(
+    (skill) => !alreadyInvokedCommands.has(skill.command) && skill.activationPolicy !== "manual",
+  );
   if (remaining.length === 0) return "";
+  const ranked = rankSkillCatalog(remaining, requestText, signals);
+  const visible = ranked.slice(0, MAX_MODEL_SKILLS);
   return [
     "## Available skills",
-    "Call the `skill` tool with one of these commands to invoke it when it matches the user's request — its full instructions are then returned as the tool result. Do not invoke a skill the request doesn't actually need.",
-    ...remaining.map((skill) => `- /${skill.command} — ${skill.description ?? skill.name}`),
+    "These skills are ranked by relevance. Automatic skills may be loaded immediately with the `skill` tool. Ask skills may also be requested with the `skill` tool; Little Monkey will pause and ask the user before their instructions are loaded. Manual skills are available only through explicit /command invocation.",
+    ...visible.map((skill) => `- /${skill.command} — ${skill.description ?? skill.name} [policy: ${skill.activationPolicy ?? "automatic"}]`),
+    ...(ranked.length > visible.length
+      ? ["More skills are available. Use the `search_skills` tool when the relevant skill is not listed here."]
+      : []),
   ].join("\n");
+}
+
+/** Compact fallback search over the full installed registry. It never returns
+ * instructions, and manual-only skills are intentionally undiscoverable. */
+export function formatSkillSearchResults(
+  availableSkills: readonly SlashSkill[],
+  alreadyInvokedCommands: ReadonlySet<string>,
+  query: string,
+  signals: ReadonlyMap<string, SkillRankingSignals> = new Map(),
+): string {
+  const tokens = catalogTokens(query);
+  const candidates = availableSkills.filter(
+    (skill) => !alreadyInvokedCommands.has(skill.command) && skill.activationPolicy !== "manual",
+  );
+  const matches = rankSkillCatalog(candidates, query, signals)
+    .filter((skill) => {
+      const searchable = `${skill.command} ${skill.name} ${skill.description ?? ""}`.toLowerCase();
+      return query.toLowerCase().includes(`/${skill.command.toLowerCase()}`)
+        || tokens.some((token) => searchable.includes(token));
+    })
+    .slice(0, MAX_SKILL_SEARCH_RESULTS);
+  return JSON.stringify({
+    query,
+    results: matches.map((skill) => ({
+      command: `/${skill.command}`,
+      name: skill.name,
+      description: skill.description ?? skill.name,
+      policy: skill.activationPolicy ?? "automatic",
+    })),
+  });
 }
 
 /**

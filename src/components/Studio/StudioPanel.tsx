@@ -462,9 +462,12 @@ interface Props {
   /** Sidebar node to render the settings rail into. Null until the sidebar has
    *  mounted, and in Chat, where there is no rail to show. */
   railSlot: HTMLElement | null;
+  /** Entry points from the shared plugin card back to Studio's libraries. */
+  onOpenModels?: () => void;
+  onOpenTools?: () => void;
 }
 
-export function StudioPanel({ mode, railSlot }: Props) {
+export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props) {
   const { t } = useT();
   const [status, setStatus] = useState<GenerationEngineStatus | null>(null);
   /** What the running engine says it supports. Null until one has run — the
@@ -544,8 +547,6 @@ export function StudioPanel({ mode, railSlot }: Props) {
   const [savingEntryId, setSavingEntryId] = useState<string | null>(null);
   const [lightbox, setLightbox] = useState<GenerationEntry | null>(null);
   const lightboxRef = useRef<HTMLDialogElement>(null);
-  const lightboxOpenRef = useRef(false);
-  lightboxOpenRef.current = lightbox !== null;
 
   // `showModal` is the only way into the top layer, so open and close are
   // driven from state rather than the `open` attribute.
@@ -559,14 +560,21 @@ export function StudioPanel({ mode, railSlot }: Props) {
   // The macOS traffic-light close control belongs to the app window, not the
   // HTML dialog. If it is clicked while the lightbox is open, consume that
   // close request for the dialog so a near-miss cannot quit the whole app.
+  //
+  // Registered only while the lightbox is actually open, because the listener
+  // is not free: Tauri prevents the close for *any* window that has a JS
+  // close-requested listener and leaves it to JS to destroy the window (see
+  // `on_window_event` in tauri's `manager/window.rs`). A listener that outlives
+  // what it guards therefore disarms every close path — traffic light, ⌘W and
+  // the Window menu alike — and one that is registered but can no longer
+  // resolve its own state wedges the window shut for good.
   useEffect(() => {
-    if (!IN_DESKTOP_APP) return undefined;
+    if (!IN_DESKTOP_APP || lightbox === null) return undefined;
 
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void getCurrentWindow()
       .onCloseRequested((event) => {
-        if (!lightboxOpenRef.current) return;
         event.preventDefault();
         setLightbox(null);
       })
@@ -578,7 +586,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
       disposed = true;
       unlisten?.();
     };
-  }, []);
+  }, [lightbox]);
 
   // A segment shows only the models that can do something in it, so the
   // picker never offers a video model under Image.
@@ -600,12 +608,21 @@ export function StudioPanel({ mode, railSlot }: Props) {
   const remote = isRemoteModelId(selected?.id ?? null);
   const mlxModelSelected = !remote && selected?.engine === "mlx_video";
   const mfluxModelSelected = !remote && selected?.engine === "mflux_image";
+  const loraSupported =
+    !remote &&
+    !mfluxModelSelected &&
+    !isSpeechTask(task) &&
+    engineSupports(capabilities, "lora");
   const mlxRuntimeReady = useRuntimeHubStore((state) =>
     state.runtimes.some((runtime) => runtime.descriptor.kind === "mlx" && runtime.canInfer),
   );
   const mlxInstalling = useRuntimeHubStore((state) => Boolean(state.busy["mlx-auto-install"]));
   const mlxInstallError = useRuntimeHubStore((state) => state.errors["mlx-auto-install"]);
   const ensureMlxRuntime = useRuntimeHubStore((state) => state.ensureMlxRuntime);
+  const mfluxInstalling = useRuntimeHubStore((state) => Boolean(state.busy["mflux-auto-install"]));
+  const mfluxInstallError = useRuntimeHubStore((state) => state.errors["mflux-auto-install"]);
+  const ensureMfluxRuntime = useRuntimeHubStore((state) => state.ensureMfluxRuntime);
+  const mfluxAutoInstallAttempted = useRef(false);
 
   // MLX is a managed package shared by chat and Studio. Selecting an MLX video
   // model is enough to prepare it; users should not have to visit Runtime Hub
@@ -732,6 +749,32 @@ export function StudioPanel({ mode, railSlot }: Props) {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    if (!mfluxModelSelected) {
+      mfluxAutoInstallAttempted.current = false;
+      return;
+    }
+    if (
+      status?.mfluxInstalled ||
+      mfluxInstalling ||
+      mfluxInstallError ||
+      mfluxAutoInstallAttempted.current
+    ) {
+      return;
+    }
+    mfluxAutoInstallAttempted.current = true;
+    void ensureMfluxRuntime()
+      .then(() => refresh())
+      .catch(() => {});
+  }, [
+    ensureMfluxRuntime,
+    mfluxInstallError,
+    mfluxInstalling,
+    mfluxModelSelected,
+    refresh,
+    status?.mfluxInstalled,
+  ]);
 
   // A finished run put its images in the store the gallery is read from, and
   // may also have left the engine holding a different model.
@@ -1106,7 +1149,9 @@ export function StudioPanel({ mode, railSlot }: Props) {
       increaseRefIndex:
         conditioning.has("reference") && refImages.length > 1 && numberRefImages,
       // Blank rows are a half-typed path, not a LoRA the user meant.
-      loras: loras.filter((lora) => lora.path.trim().length > 0),
+      loras: loraSupported
+        ? loras.filter((lora) => lora.path.trim().length > 0)
+        : [],
       componentOverrides: overrides,
     });
   };
@@ -1225,8 +1270,26 @@ export function StudioPanel({ mode, railSlot }: Props) {
       )}
 
       {mfluxModelSelected && !status?.mfluxInstalled && (
-        <div className="mb-3 rounded border border-warning/40 bg-warning-soft px-3 py-2 text-xs text-warning">
-          {t("Studio.mflux.notReady")}
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded border border-warning/40 bg-warning-soft px-3 py-2 text-xs text-warning">
+          <span>
+            {mfluxInstalling
+              ? t("Studio.mflux.preparing")
+              : mfluxInstallError ?? t("Studio.mflux.notReady")}
+          </span>
+          {!mfluxInstalling && (
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => {
+                mfluxAutoInstallAttempted.current = true;
+                void ensureMfluxRuntime()
+                  .then(() => refresh())
+                  .catch(() => {});
+              }}
+            >
+              {t("Studio.mflux.retry")}
+            </Button>
+          )}
         </div>
       )}
 
@@ -2171,23 +2234,63 @@ export function StudioPanel({ mode, railSlot }: Props) {
             </>
           )}
 
-          {!isSpeechTask(task) && !remote && !mfluxModelSelected && (
-            <details className="rounded border border-border p-3">
-              <summary className="cursor-pointer text-xs font-medium">
-                {t("Studio.lora.title")}
-              </summary>
-              <div className="mt-3 grid [&>*]:min-w-0">
-                <LoraStack
-                  loras={loras}
-                  library={loraLibrary}
-                  onChange={setLoras}
-                  showHighNoise={selected.components.some(
-                    (component) => component.slot === "high_noise_diffusion_model",
-                  )}
-                />
+          <SettingsCard title={t("Studio.plugins.title")} hint={t("Studio.plugins.hint")}>
+            {isSpeechTask(task) ? (
+              <div className="grid gap-2">
+                <p className="text-[11px] text-faint">{t("Studio.plugins.audioHint")}</p>
+                {selected.components.some((component) =>
+                  ["audio_vae", "mmproj", "vocoder"].includes(component.slot),
+                ) ? (
+                  <div className="grid gap-1 rounded bg-background/60 p-2">
+                    <span className="text-[11px] font-medium text-muted">
+                      {t("Studio.plugins.audioComponents")}
+                    </span>
+                    {selected.components
+                      .filter((component) =>
+                        ["audio_vae", "mmproj", "vocoder"].includes(component.slot),
+                      )
+                      .map((component) => (
+                        <span key={component.slot} className="text-[11px] text-faint">
+                          {t(`Studio.slot.${component.slot}`)}
+                        </span>
+                      ))}
+                  </div>
+                ) : null}
+                {onOpenModels && (
+                  <Button size="sm" variant="secondary" onClick={onOpenModels}>
+                    {t("Studio.plugins.openModels")}
+                  </Button>
+                )}
               </div>
-            </details>
-          )}
+            ) : loraSupported ? (
+              <LoraStack
+                loras={loras}
+                library={loraLibrary}
+                onChange={setLoras}
+                showHighNoise={selected.components.some(
+                  (component) => component.slot === "high_noise_diffusion_model",
+                )}
+              />
+            ) : (
+              <p className="text-[11px] text-faint">
+                {remote
+                  ? t("Studio.plugins.remoteHint")
+                  : mfluxModelSelected
+                    ? t("Studio.plugins.mfluxHint")
+                    : t("Studio.plugins.loraUnavailable")}
+              </p>
+            )}
+            {loraSupported && onOpenModels && (
+              <Button size="sm" variant="secondary" onClick={onOpenModels}>
+                {t("Studio.plugins.openModels")}
+              </Button>
+            )}
+            {onOpenTools && (
+              <Button size="sm" variant="secondary" onClick={onOpenTools}>
+                {t("Studio.plugins.openTools")}
+              </Button>
+            )}
+          </SettingsCard>
 
           {/* Choosing only. Files are added in the Models tab, and a slot the
               model does not already load is a different model rather than a

@@ -358,10 +358,15 @@ describe("ExecutableExtensionsPanel", () => {
     ).toBe(true));
 
     const review = await screen.findByLabelText("Review extension");
-    const apply = within(review).getByRole("button", { name: "Update" }) as HTMLButtonElement;
-    const binding = within(review).getByPlaceholderText(
+    // Awaited, not queried. The dialog is on screen as soon as a preview
+    // exists, but the binding row is behind `grantedIds` — and the effect that
+    // clears a preview whose extension no longer matches the selection can
+    // blank it for a render. A `get*` samples one instant of that; `findBy*`
+    // waits for the state to settle, which is what the assertions below mean.
+    const binding = (await within(review).findByPlaceholderText(
       "Choose the directory bound to this opaque handle",
-    ) as HTMLInputElement;
+    )) as HTMLInputElement;
+    const apply = within(review).getByRole("button", { name: "Update" }) as HTMLButtonElement;
     expect(binding.value).toBe("");
     expect(apply.disabled).toBe(true);
     expect(within(review).getByText(/old-workspace/)).toBeTruthy();

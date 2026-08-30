@@ -243,6 +243,29 @@ describe("the provider configuration contract", () => {
     }
   });
 
+  it("writes a channel credential through the CLI the daemon itself runs", () => {
+    // Not a style preference. macOS hands a keychain item back only to the
+    // executable that created it and puts a confirmation dialog in front of
+    // anybody else, so a credential the desktop wrote in its own process is
+    // one the installed background daemon cannot read unattended — the read
+    // does not fail, it waits forever for an answer. Writing through the
+    // bundled sidecar, which is the daemon's own binary, is what makes the
+    // service's read a same-executable read. stdin rather than an argument,
+    // for the original reason: argv is visible in a process listing.
+    for (const command of ["channels_set_credential", "channels_exposure_set_token"]) {
+      const start = daemonCommands.indexOf(`pub async fn ${command}(`);
+      expect(start, `${command} not found`).toBeGreaterThan(-1);
+      const body = daemonCommands.slice(start, start + 1400);
+      expect(body, `${command} must hand the secret to the CLI on stdin`).toContain(
+        "command_with_stdin(",
+      );
+      expect(body).toContain('"set-token".into()');
+      expect(body, `${command} must not write the keychain in the desktop process`).not.toContain(
+        "set_password",
+      );
+    }
+  });
+
   it("keeps every secret out of the non-secret schema on both sides", () => {
     const schema = backendSchema();
     for (const guide of PROVIDER_GUIDES) {

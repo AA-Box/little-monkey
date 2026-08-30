@@ -25,6 +25,7 @@ mod conversations_cli;
 mod daemon;
 mod durable_run;
 mod embed_cli;
+mod execution_cli;
 mod extensions_cli;
 mod ingress_cli;
 mod launcher;
@@ -42,6 +43,7 @@ mod repl;
 mod revisions_cli;
 mod security_cli;
 mod skills_cli;
+mod standards_cli;
 mod sse;
 mod stacks_cli;
 mod support_bundle_cli;
@@ -435,6 +437,12 @@ enum Cmd {
         #[command(subcommand)]
         action: peers_cli::PeersCmd,
     },
+    /// Store the credentials for cloud model providers, so the daemon can
+    /// read them back without a keychain prompt nobody is there to answer.
+    Providers {
+        #[command(subcommand)]
+        action: providers_cli::ProvidersCmd,
+    },
     /// Configure the operator's own carrier accounts — the numbers Little
     /// Monkey texts and calls from, what each may do, and what a call may cost.
     Telecom {
@@ -482,6 +490,15 @@ enum Cmd {
     /// docs/roadmap/p3-scheduled-automation.md.
     #[command(subcommand)]
     Task(TaskCmd),
+    /// Configure and probe execution targets (local, Docker, paired node, SSH runner).
+    #[command(subcommand)]
+    Targets(execution_cli::TargetsCmd),
+    /// Create portable workspace transfers and safely apply remote results.
+    #[command(subcommand)]
+    Workspace(execution_cli::WorkspaceCmd),
+    /// Serve the Little Monkey runner protocol over stdio for SSH transport.
+    #[command(subcommand)]
+    Runner(execution_cli::RunnerCmd),
     /// Validate, run, inspect, and replay the same typed workflows as the
     /// desktop visual editor.
     #[command(subcommand)]
@@ -492,6 +509,9 @@ enum Cmd {
     /// Discover, preview, install, update, disable, and roll back data-only SKILL.md skills.
     #[command(subcommand)]
     Skills(skills_cli::SkillsCmd),
+    /// Discover and manage evidence-backed repository engineering standards.
+    #[command(subcommand)]
+    Standards(standards_cli::StandardsCmd),
     /// Inspect the same declarative plugin runtime and health aggregate as the desktop app.
     #[command(subcommand)]
     Plugins(plugins_cli::PluginsCmd),
@@ -569,6 +589,42 @@ enum TaskCmd {
         #[arg(long)]
         cron: String,
     },
+    /// Start a durable Universal Autonomous Task Coordinator run.
+    Start {
+        objective: String,
+        #[arg(long)]
+        target: String,
+        /// Stable executor target id, distinct from `--target`'s model/provider.
+        #[arg(long = "executor-target")]
+        executor_target: Option<String>,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show durable autonomous-task runs.
+    Status {
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print task events once, or keep following until the run is terminal.
+    Attach {
+        run_id: String,
+        #[arg(long)]
+        follow: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Append user guidance to a task's durable event stream.
+    Guide { run_id: String, guidance: String },
+    /// Pause a queued or running task.
+    Pause { run_id: String },
+    /// Resume a paused task.
+    Resume { run_id: String },
+    /// Cancel a task and record the cancellation request.
+    Cancel { run_id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1554,6 +1610,7 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
         Cmd::Conversations { action } => conversations_cli::dispatch(action),
         Cmd::Ingress { action } => ingress_cli::dispatch(action),
         Cmd::Peers { action } => peers_cli::dispatch(action).await,
+        Cmd::Providers { action } => providers_cli::dispatch(action),
         Cmd::Telecom { action } => telecom_cli::dispatch(action).await,
         Cmd::Revisions { change, limit } => revisions_cli::list(change.as_deref(), *limit),
         Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
@@ -1592,7 +1649,33 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             TaskCmd::Conformance { fixture } => task::conformance(fixture),
             TaskCmd::List => task::list(),
             TaskCmd::Schedule { name_or_path, cron } => task::schedule(name_or_path, cron),
+            TaskCmd::Start {
+                objective,
+                target,
+                executor_target,
+                workspace,
+                json,
+            } => task::autonomous_start(
+                objective,
+                target,
+                executor_target.as_deref(),
+                workspace.as_deref(),
+                *json,
+            ),
+            TaskCmd::Status { run_id, json } => task::autonomous_status(run_id.as_deref(), *json),
+            TaskCmd::Attach {
+                run_id,
+                follow,
+                json,
+            } => task::autonomous_attach(run_id, *follow, *json),
+            TaskCmd::Guide { run_id, guidance } => task::autonomous_guide(run_id, guidance),
+            TaskCmd::Pause { run_id } => task::autonomous_pause(run_id),
+            TaskCmd::Resume { run_id } => task::autonomous_resume(run_id),
+            TaskCmd::Cancel { run_id } => task::autonomous_cancel(run_id),
         },
+        Cmd::Targets(action) => execution_cli::targets(action.clone()),
+        Cmd::Workspace(action) => execution_cli::workspace(action.clone()),
+        Cmd::Runner(action) => execution_cli::runner(action.clone()),
         Cmd::Workflow(action) => {
             let data_dir = app_data_dir()
                 .ok_or_else(|| "Could not resolve the app data directory".to_string());
@@ -1623,6 +1706,12 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
                 }
                 Err(error) => Err(error),
             }
+        }
+        Cmd::Standards(action) => {
+            let workspace = cli.workspace.clone().unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            });
+            standards_cli::run(action, &workspace)
         }
         Cmd::Plugins(action) => {
             let data_dir = app_data_dir()

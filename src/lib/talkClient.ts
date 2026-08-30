@@ -51,8 +51,27 @@ export interface TalkTranscript {
   text: string;
 }
 
+/** One speech model that can be chosen, and what it would cost to install. */
+export interface TranscriptionModel {
+  id: string;
+  label: string;
+  bytes: number;
+  installed: boolean;
+}
+
+/** One language transcription can be pinned to. Whisper's own table. */
+export interface TranscriptionLanguage {
+  id: string;
+  label: string;
+}
+
 export const talkClient = {
   status: () => invoke<TalkStatus>('m7_talk_status'),
+  languages: () => invoke<TranscriptionLanguage[]>('m7_transcription_languages'),
+  models: () => invoke<TranscriptionModel[]>('m7_transcription_models'),
+  /** Fetch and verify one model. Resolves when it is ready to transcribe. */
+  installModel: (modelId: string) =>
+    invoke<void>('m7_transcription_model_install', { modelId }),
   metrics: () => invoke<TalkMetricsSnapshot>('m7_talk_metrics'),
   recordMetric: (metric: TalkMetric) =>
     invoke<TalkMetricsSnapshot>('m7_talk_metric_record', { metric }),
@@ -67,8 +86,21 @@ export const talkClient = {
    * phrase must leave nothing behind at all. This one holds the bytes for the
    * length of the call and publishes nothing.
    */
-  transcribe: (grantId: string, jobId: string, audioBase64: string, mediaType: string) =>
-    invoke<TalkTranscript>('m7_talk_transcribe', { grantId, jobId, audioBase64, mediaType }),
+  transcribe: (
+    grantId: string,
+    jobId: string,
+    audioBase64: string,
+    mediaType: string,
+    /** What has already been said here, as vocabulary for the decoder. */
+    context: string | null = null,
+  ) =>
+    invoke<TalkTranscript>('m7_talk_transcribe', {
+      grantId,
+      jobId,
+      audioBase64,
+      mediaType,
+      context,
+    }),
   /** Synthesize one chunk and hand back the bytes, rather than playing them on
    * this machine's default output — Talk chooses its own device. */
   synthesize: (jobId: string, text: string) =>
