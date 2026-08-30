@@ -27,12 +27,99 @@ use tokio_util::sync::CancellationToken;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 const MODEL_DIRECTORY: &str = "local-whisper-v1";
-const MODEL_FILE: &str = "ggml-base-q5_1.bin";
-const MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/f281eb45af861ab5e5297d23694b7d46e090c02c/ggml-base-q5_1.bin";
-const MODEL_SHA256: &str = "422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898";
-const MODEL_BYTES: u64 = 59_707_625;
-const MAX_MODEL_BYTES: u64 = 128 * 1024 * 1024;
+
+/// The upstream commit every model is fetched from.
+///
+/// A revision rather than a branch: the file behind a branch can change, and a
+/// weights file that changes under a pinned checksum is a download that starts
+/// failing for everyone at once.
+const MODEL_REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
+
+/// One speech model the operator can choose.
+///
+/// `bytes` is the exact published size and is enforced as the download's own
+/// ceiling — there is no separate limit to keep in step with the largest entry,
+/// and a body that runs past the size it claims is refused before it is hashed.
+#[derive(Clone, Copy, Debug)]
+pub struct WhisperModel {
+    pub id: &'static str,
+    /// What it is good for, in the terms the choice is actually made in.
+    pub label: &'static str,
+    pub file: &'static str,
+    pub sha256: &'static str,
+    pub bytes: u64,
+}
+
+/// Every installable model, smallest first.
+///
+/// Quantized builds throughout: a q5 file is roughly a third of the float one
+/// with no accuracy anybody has been able to measure in dictation, and the
+/// difference between tiers dwarfs it. Sizes and checksums are upstream's own,
+/// read from the release at `MODEL_REVISION`.
+pub const MODELS: &[WhisperModel] = &[
+    WhisperModel {
+        id: "base",
+        label: "Base — fastest, least accurate",
+        file: "ggml-base-q5_1.bin",
+        sha256: "422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898",
+        bytes: 59_707_625,
+    },
+    WhisperModel {
+        id: "small",
+        label: "Small — better with names and accents",
+        file: "ggml-small-q5_1.bin",
+        sha256: "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb",
+        bytes: 190_085_487,
+    },
+    WhisperModel {
+        id: "medium",
+        label: "Medium — stronger on non-English speech",
+        file: "ggml-medium-q5_0.bin",
+        sha256: "19fea4b380c3a618ec4723c3eef2eb785ffba0d0538cf43f8f235e7b3b34220f",
+        bytes: 539_212_467,
+    },
+    WhisperModel {
+        id: "large-v3-turbo",
+        label: "Large v3 Turbo — near-large accuracy, far faster",
+        file: "ggml-large-v3-turbo-q5_0.bin",
+        sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+        bytes: 574_041_195,
+    },
+    WhisperModel {
+        id: "large-v3",
+        label: "Large v3 — most accurate, slowest",
+        file: "ggml-large-v3-q5_0.bin",
+        sha256: "d75795ecff3f83b5faa89d1900604ad8c780abd5739fae406de19f23ecd98ad1",
+        bytes: 1_081_140_203,
+    },
+];
+
+/// What an installation that has never chosen uses, and what the installer
+/// ships inside the app: small enough to bundle and to start instantly.
+pub const DEFAULT_MODEL_ID: &str = "base";
+
+/// The chosen model, or the default when the id is unknown — a configuration
+/// naming a model this build does not have must not make speech unusable.
+#[must_use]
+pub fn model_for(id: &str) -> &'static WhisperModel {
+    let wanted = id.trim();
+    MODELS
+        .iter()
+        .find(|model| model.id == wanted)
+        .unwrap_or_else(|| {
+            MODELS
+                .iter()
+                .find(|model| model.id == DEFAULT_MODEL_ID)
+                .expect("the default model is in the table")
+        })
+}
+
+fn model_url(model: &WhisperModel) -> String {
+    format!(
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/{MODEL_REVISION}/{}",
+        model.file
+    )
+}
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 const MAX_AUDIO_SECONDS: usize = 60 * 60;
 const MAX_WHISPER_SAMPLES: usize = WHISPER_SAMPLE_RATE as usize * MAX_AUDIO_SECONDS;
@@ -43,7 +130,7 @@ const BUNDLED_DIRECTORY: &str = "local-whisper";
 static BUNDLED_MODEL: OnceLock<Option<PathBuf>> = OnceLock::new();
 static PREPARE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static READY_MODEL: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
-static CONTEXT: OnceLock<Mutex<Option<Arc<WhisperContext>>>> = OnceLock::new();
+static CONTEXT: OnceLock<Mutex<Option<(PathBuf, Arc<WhisperContext>)>>> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalTranscriptSegment {
@@ -76,9 +163,12 @@ pub fn set_resource_dir(resource_dir: Option<&Path>) {
 /// 57MB on every launch would buy nothing. The *downloaded* copy is the
 /// untrusted one, and it is still verified byte for byte before activation.
 fn resolve_bundled(resource_dir: Option<&Path>) -> Option<PathBuf> {
-    let candidate = resource_dir?.join(BUNDLED_DIRECTORY).join(MODEL_FILE);
+    // Only the default tier is shipped inside the bundle; every other one is
+    // fetched on request, which is why this is consulted for that id alone.
+    let bundled = model_for(DEFAULT_MODEL_ID);
+    let candidate = resource_dir?.join(BUNDLED_DIRECTORY).join(bundled.file);
     match std::fs::metadata(&candidate) {
-        Ok(metadata) if metadata.is_file() && metadata.len() == MODEL_BYTES => Some(candidate),
+        Ok(metadata) if metadata.is_file() && metadata.len() == bundled.bytes => Some(candidate),
         _ => None,
     }
 }
@@ -90,13 +180,30 @@ fn bundled_model() -> Option<PathBuf> {
 /// Whether a local transcription could start right now without waiting on a
 /// download. Talk and the telephony surface ask before claiming to be ready.
 #[must_use]
-pub fn is_ready() -> bool {
-    if bundled_model().is_some() {
+pub fn is_ready(model_id: &str) -> bool {
+    let model = model_for(model_id);
+    if model.id == DEFAULT_MODEL_ID && bundled_model().is_some() {
         return true;
     }
     matches!(
         ready_model_slot().lock(),
-        Ok(slot) if slot.as_ref().is_some_and(|path| path.is_file())
+        Ok(slot) if slot.as_ref().is_some_and(|path| path.is_file() && path.ends_with(model.file))
+    )
+}
+
+/// Whether this model is already on disk at the size it declares.
+///
+/// Size only. The listing behind it is a screen the operator opens, and hashing
+/// a gigabyte to draw a checkbox is not worth it; the byte-for-byte check
+/// belongs to `prepare`, which runs before anything is loaded.
+#[must_use]
+pub fn model_installed(app_data_dir: &Path, model: &WhisperModel) -> bool {
+    if model.id == DEFAULT_MODEL_ID && bundled_model().is_some() {
+        return true;
+    }
+    matches!(
+        std::fs::metadata(model_path(app_data_dir, model)),
+        Ok(metadata) if metadata.is_file() && metadata.len() == model.bytes
     )
 }
 
@@ -108,12 +215,12 @@ fn ready_model_slot() -> &'static Mutex<Option<PathBuf>> {
     READY_MODEL.get_or_init(|| Mutex::new(None))
 }
 
-fn context_slot() -> &'static Mutex<Option<Arc<WhisperContext>>> {
+fn context_slot() -> &'static Mutex<Option<(PathBuf, Arc<WhisperContext>)>> {
     CONTEXT.get_or_init(|| Mutex::new(None))
 }
 
-fn model_path(app_data_dir: &Path) -> PathBuf {
-    app_data_dir.join(MODEL_DIRECTORY).join(MODEL_FILE)
+fn model_path(app_data_dir: &Path, model: &WhisperModel) -> PathBuf {
+    app_data_dir.join(MODEL_DIRECTORY).join(model.file)
 }
 
 fn lock<'a, T>(mutex: &'a Mutex<T>, label: &str) -> Result<std::sync::MutexGuard<'a, T>, String> {
@@ -141,7 +248,7 @@ async fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-async fn verified_existing_model(path: &Path) -> Result<bool, String> {
+async fn verified_existing_model(path: &Path, model: &WhisperModel) -> Result<bool, String> {
     let metadata = match tokio::fs::metadata(path).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -152,14 +259,14 @@ async fn verified_existing_model(path: &Path) -> Result<bool, String> {
             ))
         }
     };
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_MODEL_BYTES {
+    if !metadata.is_file() || metadata.len() != model.bytes {
         return Ok(false);
     }
-    Ok(sha256_file(path).await? == MODEL_SHA256)
+    Ok(sha256_file(path).await? == model.sha256)
 }
 
-async fn download_model(path: &Path) -> Result<(), String> {
-    let url = reqwest::Url::parse(MODEL_URL)
+async fn download_model(path: &Path, model: &WhisperModel) -> Result<(), String> {
+    let url = reqwest::Url::parse(&model_url(model))
         .map_err(|error| format!("Built-in local speech model URL is invalid: {error}"))?;
     crate::egress::classify_public_download_url(&url, crate::egress::PublicDestinations::Only)
         .map_err(|error| format!("Local speech model download refused: {error}"))?;
@@ -186,7 +293,8 @@ async fn download_model(path: &Path) -> Result<(), String> {
         .await
         .map_err(|error| format!("Create local speech model directory: {error}"))?;
     let temp = parent.join(format!(
-        ".{MODEL_FILE}.download-{}",
+        ".{}.download-{}",
+        model.file,
         uuid::Uuid::new_v4().simple()
     ));
     let mut file = tokio::fs::OpenOptions::new()
@@ -204,7 +312,7 @@ async fn download_model(path: &Path) -> Result<(), String> {
             let chunk =
                 chunk.map_err(|error| format!("Read local speech model download: {error}"))?;
             written = written.saturating_add(chunk.len() as u64);
-            if written > MAX_MODEL_BYTES {
+            if written > model.bytes {
                 return Err("Local speech model download exceeds its size limit".to_string());
             }
             hasher.update(&chunk);
@@ -222,9 +330,16 @@ async fn download_model(path: &Path) -> Result<(), String> {
             .await
             .map_err(|error| format!("Sync local speech model: {error}"))?;
         let digest = format!("{:x}", hasher.finalize());
-        if digest != MODEL_SHA256 {
+        if written != model.bytes {
             return Err(format!(
-                "Local speech model checksum mismatch; expected {MODEL_SHA256}, got {digest}"
+                "Local speech model download is {written} bytes, not the {} it declares",
+                model.bytes
+            ));
+        }
+        if digest != model.sha256 {
+            return Err(format!(
+                "Local speech model checksum mismatch; expected {}, got {digest}",
+                model.sha256
             ));
         }
         drop(file);
@@ -248,12 +363,16 @@ async fn download_model(path: &Path) -> Result<(), String> {
 
 /// Ensure the built-in speech model is ready. Safe to call at startup and on
 /// every transcription: concurrent callers collapse behind one install lock.
-pub async fn prepare(app_data_dir: &Path) -> Result<PathBuf, String> {
-    // The installed application ships the model, so nothing is fetched at all.
-    if let Some(bundled) = bundled_model() {
-        return Ok(bundled);
+pub async fn prepare(app_data_dir: &Path, model_id: &str) -> Result<PathBuf, String> {
+    let model = model_for(model_id);
+    // The installed application ships the default model, so choosing that one
+    // fetches nothing at all. Any other tier is a download, once.
+    if model.id == DEFAULT_MODEL_ID {
+        if let Some(bundled) = bundled_model() {
+            return Ok(bundled);
+        }
     }
-    let path = model_path(app_data_dir);
+    let path = model_path(app_data_dir, model);
     if let Some(cached) = lock(ready_model_slot(), "local speech model readiness")?.clone() {
         if cached == path && cached.is_file() {
             return Ok(cached);
@@ -267,13 +386,13 @@ pub async fn prepare(app_data_dir: &Path) -> Result<PathBuf, String> {
         }
     }
 
-    if !verified_existing_model(&path).await? {
+    if !verified_existing_model(&path, model).await? {
         if path.exists() {
             tokio::fs::remove_file(&path)
                 .await
                 .map_err(|error| format!("Remove invalid local speech model: {error}"))?;
         }
-        download_model(&path).await?;
+        download_model(&path, model).await?;
     }
     *lock(ready_model_slot(), "local speech model readiness")? = Some(path.clone());
     Ok(path)
@@ -281,8 +400,13 @@ pub async fn prepare(app_data_dir: &Path) -> Result<PathBuf, String> {
 
 fn whisper_context(model: &Path) -> Result<Arc<WhisperContext>, String> {
     let mut slot = lock(context_slot(), "local Whisper context")?;
-    if let Some(context) = slot.as_ref() {
-        return Ok(Arc::clone(context));
+    // Keyed by path, not merely "is something loaded". Without this, choosing a
+    // different tier changes a setting and nothing else: the first model loaded
+    // would stay loaded for the life of the process.
+    if let Some((loaded, context)) = slot.as_ref() {
+        if loaded == model {
+            return Ok(Arc::clone(context));
+        }
     }
     let mut params = WhisperContextParameters::default();
     // CPU is the portable baseline and guarantees that the same installed app
@@ -292,7 +416,7 @@ fn whisper_context(model: &Path) -> Result<Arc<WhisperContext>, String> {
         WhisperContext::new_with_params(model, params)
             .map_err(|error| format!("Load built-in local Whisper model: {error}"))?,
     );
-    *slot = Some(Arc::clone(&context));
+    *slot = Some((model.to_path_buf(), Arc::clone(&context)));
     Ok(context)
 }
 
@@ -363,6 +487,31 @@ fn open_media(path: &Path) -> Result<Box<dyn FormatReader + '_>, String> {
         .map_err(|error| format!("Decode recorded audio container: {error}"))
 }
 
+/// Every language the bundled model can be asked for, as `(code, english_name)`.
+///
+/// Read from whisper.cpp's own table rather than restated here: a list written
+/// out by hand is a list that drifts from the model that has to honour it.
+pub fn supported_languages() -> Vec<(String, String)> {
+    (0..=whisper_rs::get_lang_max_id())
+        .filter_map(|id| {
+            let code = whisper_rs::get_lang_str(id)?;
+            let name = whisper_rs::get_lang_str_full(id).unwrap_or(code);
+            Some((code.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
+/// Whether a demux error is simply the end of the recording.
+///
+/// A browser's `MediaRecorder` writes a live stream: clusters as they happen,
+/// a segment of unknown size, and no terminator once the microphone closes.
+/// Symphonia reaches the last short element and reports `UnexpectedEof`, which
+/// is not a corrupt file — it is the end of one. Treating it as a failure threw
+/// away every utterance *after* decoding it, so nothing was ever transcribed.
+fn is_end_of_stream(error: &SymphoniaError) -> bool {
+    matches!(error, SymphoniaError::IoError(source) if source.kind() == std::io::ErrorKind::UnexpectedEof)
+}
+
 fn decode_opus(
     format: &mut dyn FormatReader,
     track_id: u32,
@@ -388,6 +537,7 @@ fn decode_opus(
             Err(SymphoniaError::ResetRequired) => {
                 return Err("Recorded audio changed tracks mid-stream".to_string())
             }
+            Err(ref error) if is_end_of_stream(error) => break,
             Err(error) => return Err(format!("Demux Opus audio: {error}")),
         };
         if packet.track_id != track_id {
@@ -446,6 +596,7 @@ fn decode_audio(path: &Path, cancellation: &CancellationToken) -> Result<Vec<f32
             Err(SymphoniaError::ResetRequired) => {
                 return Err("Recorded audio changed tracks mid-stream".to_string())
             }
+            Err(ref error) if is_end_of_stream(error) => break,
             Err(error) => return Err(format!("Read recorded audio: {error}")),
         };
         if packet.track_id != track_id {
@@ -504,6 +655,7 @@ fn run_whisper(
     model: &Path,
     pcm: Vec<f32>,
     language: String,
+    initial_prompt: Option<String>,
     cancellation: CancellationToken,
 ) -> Result<LocalTranscript, String> {
     if cancellation.is_cancelled() {
@@ -519,10 +671,24 @@ fn run_whisper(
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
     params.set_no_context(true);
+    // Words the decoder should expect. whisper.cpp conditions on this exactly as
+    // it conditions on the previous window's text, which is what makes a name
+    // already on screen come back spelled instead of guessed at phonetically —
+    // "Sundbyberg" rather than "soon the B-Berry". It is a hint, not a
+    // constraint: nothing here forces a token that was not said.
+    if let Some(prompt) = initial_prompt.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    {
+        params.set_initial_prompt(prompt);
+    }
     let language = language.trim().to_string();
     if language.is_empty() || language.eq_ignore_ascii_case("auto") {
-        params.set_language(None);
-        params.set_detect_language(true);
+        // "auto" is a language whisper.cpp understands: it detects, then
+        // transcribes. `set_detect_language` is a different request — it means
+        // detect and *stop*, and `whisper_full` returns right after detection
+        // with no segments at all. Setting it here made every transcription on
+        // the default configuration come back empty, which is a spoken turn
+        // that records, decodes, runs the model and then says nothing.
+        params.set_language(Some("auto"));
     } else {
         params.set_language(Some(&language));
     }
@@ -565,7 +731,7 @@ fn run_whisper(
             .map_err(|error| format!("Read local Whisper segment: {error}"))?
             .trim()
             .to_string();
-        if text.is_empty() {
+        if text.is_empty() || is_non_speech_annotation(&text) {
             continue;
         }
         parts.push(text.clone());
@@ -577,9 +743,32 @@ fn run_whisper(
     }
     let text = parts.join(" ").trim().to_string();
     if text.is_empty() {
-        return Err("Built-in local Whisper returned an empty transcript".to_string());
+        return Err(NO_SPEECH.to_string());
     }
     Ok(LocalTranscript { text, segments })
+}
+
+/// What the model returns when it decoded the window but heard no speech in it.
+///
+/// A distinct constant rather than a sentence written twice, because Talk has to
+/// recognise this case: a fragment of room noise is silence, not a failed turn.
+pub const NO_SPEECH: &str = "Built-in local Whisper returned an empty transcript";
+
+/// Whether a segment is Whisper's non-speech annotation rather than something
+/// somebody said.
+///
+/// Fed a fan, a keyboard or a room, the model narrates instead of transcribing:
+/// "[ Inaudible ]", "[BLANK_AUDIO]", "(wind blowing)", "*music*". Left in, each
+/// burst of noise becomes a spoken turn the assistant then answers. Matching the
+/// wrapper instead of a word list is what makes this hold for every language the
+/// model decodes — the brackets are Whisper's convention, the words inside them
+/// are not — and speech itself never comes back wrapped end to end.
+fn is_non_speech_annotation(text: &str) -> bool {
+    let mut characters = text.chars();
+    let (Some(first), Some(last)) = (characters.next(), characters.next_back()) else {
+        return false;
+    };
+    matches!((first, last), ('[', ']') | ('(', ')') | ('*', '*'))
 }
 
 /// Decode any supported recording container and transcribe it through the
@@ -588,15 +777,18 @@ pub async fn transcribe(
     app_data_dir: &Path,
     path: &Path,
     language: &str,
+    model_id: &str,
+    initial_prompt: Option<&str>,
     cancellation: CancellationToken,
 ) -> Result<LocalTranscript, String> {
-    let model = prepare(app_data_dir).await?;
+    let model = prepare(app_data_dir, model_id).await?;
     let path = path.to_path_buf();
     let language = language.to_string();
+    let initial_prompt = initial_prompt.map(str::to_string);
     let cancellation_for_worker = cancellation.clone();
     tokio::task::spawn_blocking(move || {
         let pcm = decode_audio(&path, &cancellation_for_worker)?;
-        run_whisper(&model, pcm, language, cancellation_for_worker)
+        run_whisper(&model, pcm, language, initial_prompt, cancellation_for_worker)
     })
     .await
     .map_err(|error| format!("Local transcription worker failed: {error}"))?
@@ -606,6 +798,57 @@ pub async fn transcribe(
 mod tests {
     use super::*;
 
+    /// Room noise came back as "[ Inaudible ] [ Inaudible ] ..." and was
+    /// submitted as a spoken turn, which the assistant then answered. Whisper's
+    /// annotations are not speech, in any language, and must not survive into a
+    /// transcript.
+    #[test]
+    fn whisper_narrating_the_room_is_not_a_transcript() {
+        for annotation in [
+            "[ Inaudible ]",
+            "[BLANK_AUDIO]",
+            "(wind blowing)",
+            "*music*",
+            "[ Ljud av tangentbord ]",
+        ] {
+            assert!(is_non_speech_annotation(annotation), "{annotation}");
+        }
+        for speech in [
+            "Tell me a joke.",
+            "The array [0] is empty",
+            "I said (quietly) that it works",
+            "*",
+        ] {
+            assert!(!is_non_speech_annotation(speech), "{speech}");
+        }
+    }
+
+    #[test]
+    fn the_language_list_comes_from_the_model_not_from_a_list_here() {
+        let languages = supported_languages();
+        // Whisper's own table, so it is neither empty nor a handful.
+        assert!(languages.len() > 90, "got {} languages", languages.len());
+        let code = |wanted: &str| languages.iter().any(|(id, _)| id == wanted);
+        assert!(code("en") && code("sv") && code("fa"));
+        // Every entry carries a name to show, not just a code.
+        assert!(languages.iter().all(|(id, label)| !id.is_empty() && !label.is_empty()));
+    }
+
+    #[test]
+    fn a_live_recordings_short_last_element_is_its_end_not_a_failure() {
+        // What Symphonia reports at the end of a `MediaRecorder` stream: the
+        // segment has no terminator, so the final element runs out early.
+        assert!(is_end_of_stream(&SymphoniaError::IoError(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "end of stream",
+        ))));
+        // A real read failure still is one.
+        assert!(!is_end_of_stream(&SymphoniaError::IoError(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        )));
+        assert!(!is_end_of_stream(&SymphoniaError::DecodeError("corrupt")));
+    }
+
     #[test]
     fn a_bundled_model_is_taken_only_when_it_is_whole() {
         let root = std::env::temp_dir().join(format!(
@@ -614,7 +857,8 @@ mod tests {
         ));
         let dir = root.join(BUNDLED_DIRECTORY);
         fs::create_dir_all(&dir).unwrap();
-        let model = dir.join(MODEL_FILE);
+        let bundled = model_for(DEFAULT_MODEL_ID);
+        let model = dir.join(bundled.file);
 
         assert_eq!(resolve_bundled(None), None, "no resource dir, no model");
         assert_eq!(
@@ -632,7 +876,7 @@ mod tests {
             "a short model is not a bundled model"
         );
 
-        fs::write(&model, vec![0u8; MODEL_BYTES as usize]).unwrap();
+        fs::write(&model, vec![0u8; bundled.bytes as usize]).unwrap();
         assert_eq!(resolve_bundled(Some(&root)), Some(model));
 
         let _ = fs::remove_dir_all(&root);
@@ -656,10 +900,50 @@ mod tests {
     #[test]
     fn automatic_model_path_is_app_owned() {
         let root = Path::new("/tmp/little-monkey-test-data");
-        assert_eq!(
-            model_path(root),
-            root.join(MODEL_DIRECTORY).join(MODEL_FILE)
-        );
+        for model in MODELS {
+            assert_eq!(
+                model_path(root, model),
+                root.join(MODEL_DIRECTORY).join(model.file)
+            );
+        }
+    }
+
+    #[test]
+    fn every_offered_model_is_pinned_and_distinct() {
+        assert!(MODELS.len() >= 5, "the whole ladder is offered");
+        for model in MODELS {
+            assert!(model.file.starts_with("ggml-") && model.file.ends_with(".bin"));
+            // A checksum is what makes the download safe to run; a size is what
+            // stops a body that never ends.
+            assert_eq!(model.sha256.len(), 64, "{} has no usable checksum", model.id);
+            assert!(model.sha256.chars().all(|value| value.is_ascii_hexdigit()));
+            assert!(model.bytes > 0);
+            assert!(model_url(model).contains(MODEL_REVISION));
+            assert!(model_url(model).ends_with(model.file));
+        }
+        // Ids and files are both identities; a duplicate of either would make
+        // two tiers share one download.
+        for (index, model) in MODELS.iter().enumerate() {
+            assert!(
+                !MODELS[index + 1..].iter().any(|other| other.id == model.id
+                    || other.file == model.file
+                    || other.sha256 == model.sha256),
+                "{} is not distinct",
+                model.id
+            );
+        }
+        // Smallest first, so the list reads as a ladder in the settings.
+        assert!(MODELS.windows(2).all(|pair| pair[0].bytes < pair[1].bytes));
+    }
+
+    #[test]
+    fn an_unknown_model_falls_back_rather_than_failing() {
+        assert_eq!(model_for("large-v3").id, "large-v3");
+        // A config from a build that offered something this one does not must
+        // not make speech unusable.
+        assert_eq!(model_for("gigantic-v9").id, DEFAULT_MODEL_ID);
+        assert_eq!(model_for("").id, DEFAULT_MODEL_ID);
+        assert_eq!(model_for(" large-v3 ").id, "large-v3");
     }
 
     #[test]
@@ -695,21 +979,39 @@ mod tests {
         ));
         tokio::fs::create_dir_all(&root).await.unwrap();
 
-        let prepared = prepare(&root).await.expect("model auto-provisions");
+        let default_model = model_for(DEFAULT_MODEL_ID);
+        let prepared = prepare(&root, DEFAULT_MODEL_ID)
+            .await
+            .expect("model auto-provisions");
         assert!(prepared.is_file());
-        assert_eq!(sha256_file(&prepared).await.unwrap(), MODEL_SHA256);
+        assert_eq!(sha256_file(&prepared).await.unwrap(), default_model.sha256);
 
+        // Both containers, and both language settings. "auto" is what the
+        // shipped configuration uses and what every spoken turn asks for, and
+        // it was the one combination nothing covered — so it was the one that
+        // returned an empty transcript for every recording ever made.
         for fixture in [&wav, &webm] {
-            let transcript = transcribe(&root, fixture, "en", CancellationToken::new())
-                .await
-                .unwrap_or_else(|error| panic!("{} failed: {error}", fixture.display()));
-            let normalized = transcript.text.to_ascii_lowercase();
-            assert!(
-                normalized.contains("country") || normalized.contains("ask not"),
-                "unexpected transcript for {}: {}",
-                fixture.display(),
-                transcript.text
-            );
+            for language in ["en", "auto"] {
+                let transcript = transcribe(
+                    &root,
+                    fixture,
+                    language,
+                    DEFAULT_MODEL_ID,
+                    None,
+                    CancellationToken::new(),
+                )
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("{} as {language} failed: {error}", fixture.display())
+                    });
+                let normalized = transcript.text.to_ascii_lowercase();
+                assert!(
+                    normalized.contains("country") || normalized.contains("ask not"),
+                    "unexpected transcript for {} as {language}: {}",
+                    fixture.display(),
+                    transcript.text
+                );
+            }
         }
         let _ = tokio::fs::remove_dir_all(root).await;
     }

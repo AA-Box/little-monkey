@@ -92,6 +92,10 @@ fn default_provider_model() -> String {
     "whisper-1".to_string()
 }
 
+fn default_transcription_model() -> String {
+    crate::local_whisper::DEFAULT_MODEL_ID.to_string()
+}
+
 fn default_language() -> String {
     "auto".to_string()
 }
@@ -130,6 +134,12 @@ pub struct VoiceConfig {
     pub extension_capability_id: Option<String>,
     #[serde(default = "default_language")]
     pub language: String,
+    /// Which built-in speech model transcribes. Ids from
+    /// `local_whisper::MODELS`; an unknown one falls back to the default rather
+    /// than making speech unusable, so an older config that never had this
+    /// field keeps working exactly as it did.
+    #[serde(default = "default_transcription_model")]
+    pub transcription_model: String,
     #[serde(default)]
     pub tts_voice: Option<String>,
     #[serde(default)]
@@ -185,6 +195,7 @@ impl Default for VoiceConfig {
             extension_id: None,
             extension_capability_id: None,
             language: "auto".to_string(),
+            transcription_model: default_transcription_model(),
             tts_voice: None,
             tts_backend: SpeechBackendKind::System,
             tts_extension_id: None,
@@ -514,7 +525,7 @@ impl M7CompanionState {
             .expect("fixture companion configuration is valid");
     }
 
-    fn config(&self) -> Result<CompanionConfig, String> {
+    pub(crate) fn config(&self) -> Result<CompanionConfig, String> {
         Ok(lock(&self.config, "companion config")?.clone())
     }
 
@@ -785,6 +796,12 @@ fn validate_config(config: &CompanionConfig) -> Result<(), String> {
         || config.voice.provider_model.is_empty()
         || config.voice.provider_model.len() > 256
         || config.voice.language.len() > 32
+        // A model this build does not have cannot be saved. `model_for` would
+        // fall back at use, but a setting that silently means something else is
+        // worse than one that refuses.
+        || !crate::local_whisper::MODELS
+            .iter()
+            .any(|model| model.id == config.voice.transcription_model)
         || config
             .voice
             .dictation_language
@@ -1122,6 +1139,79 @@ pub fn m7_config_save(
     Ok(state.config()?)
 }
 
+/// One speech model the operator can choose between.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptionModel {
+    pub id: String,
+    pub label: String,
+    /// Download size, so the choice can be made with the cost in view.
+    pub bytes: u64,
+    /// Already on this machine, so choosing it costs nothing.
+    pub installed: bool,
+}
+
+/// Every speech model, smallest first, with what each would cost to install.
+#[tauri::command]
+pub fn m7_transcription_models(
+    state: tauri::State<'_, M7CompanionState>,
+) -> Vec<TranscriptionModel> {
+    crate::local_whisper::MODELS
+        .iter()
+        .map(|model| TranscriptionModel {
+            id: model.id.to_string(),
+            label: model.label.to_string(),
+            bytes: model.bytes,
+            installed: crate::local_whisper::model_installed(&state.app_data_dir, model),
+        })
+        .collect()
+}
+
+/// Fetch and verify one model, so choosing a larger one downloads it there and
+/// then rather than stalling the first thing the operator says afterwards.
+#[tauri::command]
+pub async fn m7_transcription_model_install(
+    state: tauri::State<'_, M7CompanionState>,
+    model_id: String,
+) -> Result<(), String> {
+    crate::local_whisper::prepare(&state.app_data_dir, &model_id)
+        .await
+        .map(|_| ())
+}
+
+/// One language the built-in speech model can be told to expect.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptionLanguage {
+    /// Whisper's own code — `en`, `sv`, `zh`.
+    pub id: String,
+    /// Whisper's own English name for it.
+    pub label: String,
+}
+
+/// Every language transcription can be pinned to, plus the automatic default.
+///
+/// Read out of the model rather than listed here. The setting exists because
+/// automatic detection decides from the audio, and a short sentence that is
+/// mostly English with one Swedish place name in it detects as English — after
+/// which the place name is spelled the way an English speaker would have said
+/// it, and no amount of repeating it helps.
+#[tauri::command]
+pub fn m7_transcription_languages() -> Vec<TranscriptionLanguage> {
+    let mut languages = vec![TranscriptionLanguage {
+        id: "auto".to_string(),
+        label: "Detect automatically".to_string(),
+    }];
+    let mut model_languages = crate::local_whisper::supported_languages();
+    model_languages.sort_by(|left, right| left.1.cmp(&right.1));
+    languages.extend(
+        model_languages
+            .into_iter()
+            .map(|(id, label)| TranscriptionLanguage { id, label }),
+    );
+    languages
+}
+
 #[tauri::command]
 pub fn m7_talk_status(
     window: tauri::Window,
@@ -1135,7 +1225,9 @@ pub fn m7_talk_status(
         // ships the model, but a development tree that has not staged it is
         // waiting on a download, and saying "ready" then is how a user finds
         // out by speaking into a Talk session that cannot hear them.
-        TranscriptionBackendKind::LocalWhisper => crate::local_whisper::is_ready(),
+        TranscriptionBackendKind::LocalWhisper => {
+            crate::local_whisper::is_ready(&voice.transcription_model)
+        }
         TranscriptionBackendKind::Provider => voice.provider_id.is_some(),
         // Both halves, because either one alone resolves to nothing: the
         // capability names what to run and the extension id names whose copy
@@ -1435,6 +1527,11 @@ async fn transcribe_path(
     path: &Path,
     cancellation: &CancellationToken,
     diarize: bool,
+    // Vocabulary the decoder should expect, from the conversation this
+    // utterance belongs to. Local backend only: the audio is already going
+    // wherever the operator pointed transcription, but the words already said
+    // in a chat are not, and a hosted recognizer does not get them thrown in.
+    initial_prompt: Option<&str>,
 ) -> Result<(String, String, Vec<SpeakerSegment>), String> {
     let config = state.config()?.voice;
     match config.backend {
@@ -1443,6 +1540,8 @@ async fn transcribe_path(
                 &state.app_data_dir,
                 path,
                 &config.language,
+                &config.transcription_model,
+                initial_prompt,
                 cancellation.clone(),
             )
             .await?;
@@ -1604,6 +1703,7 @@ pub async fn m7_transcribe_file(
         &path,
         &cancellation,
         grant.kind == CaptureKind::Meeting,
+        None,
     )
     .await;
     state.finish_job(&job_id);
@@ -1632,6 +1732,22 @@ pub async fn m7_transcribe_file(
     })
 }
 
+/// The file extension a decoder should be handed for one recorded media type.
+///
+/// The desktop webview is WebKit, and WebKit's `MediaRecorder` produces MP4 —
+/// not the WebM every other browser gives. Writing those bytes to a `.webm`
+/// path hands the demuxer a hint that contradicts the file it is looking at.
+/// The telephony path already mapped this; Talk and the companion did not.
+fn recorded_audio_extension(media_type: &str) -> &'static str {
+    match media_type {
+        value if value.contains("wav") => "wav",
+        value if value.contains("ogg") => "ogg",
+        value if value.contains("mp4") => "m4a",
+        value if value.contains("mpeg") => "mp3",
+        _ => "webm",
+    }
+}
+
 #[tauri::command]
 pub async fn m7_transcribe_audio(
     state: tauri::State<'_, M7CompanionState>,
@@ -1655,11 +1771,7 @@ pub async fn m7_transcribe_audio(
     if bytes.is_empty() || bytes.len() as u64 > MAX_MEDIA_BYTES {
         return Err("Recorded audio is empty or exceeds its limit".to_string());
     }
-    let extension = if media_type.contains("wav") {
-        "wav"
-    } else {
-        "webm"
-    };
+    let extension = recorded_audio_extension(&media_type);
     let path = state.root.join("tmp").join(format!(
         "recording-{}.{}",
         Uuid::new_v4().simple(),
@@ -1673,6 +1785,7 @@ pub async fn m7_transcribe_audio(
         &path,
         &cancellation,
         grant.kind == CaptureKind::Meeting,
+        None,
     )
     .await;
     state.finish_job(&job_id);
@@ -1723,6 +1836,10 @@ pub async fn m7_talk_transcribe(
     job_id: String,
     audio_base64: String,
     media_type: String,
+    // What has already been said in this conversation, as vocabulary for the
+    // decoder. A name it has seen spelled comes back spelled instead of guessed
+    // at phonetically. Optional, bounded by the caller, local backend only.
+    context: Option<String>,
 ) -> Result<TalkTranscript, String> {
     ensure_main_window(&window)?;
     let grant = state.require_grant(
@@ -1740,11 +1857,7 @@ pub async fn m7_talk_transcribe(
     if bytes.is_empty() || bytes.len() as u64 > MAX_MEDIA_BYTES {
         return Err("Recorded audio is empty or exceeds its limit".to_string());
     }
-    let extension = if media_type.contains("wav") {
-        "wav"
-    } else {
-        "webm"
-    };
+    let extension = recorded_audio_extension(&media_type);
     let path =
         state
             .root
@@ -1758,6 +1871,7 @@ pub async fn m7_talk_transcribe(
         &path,
         &cancellation,
         grant.kind == CaptureKind::Meeting,
+        context.as_deref(),
     )
     .await;
     state.finish_job(&job_id);
@@ -1765,7 +1879,21 @@ pub async fn m7_talk_transcribe(
     // come through here, because the utterance's audio outliving the utterance
     // is the one thing this path must never do.
     let _ = fs::remove_file(&path);
-    let (text, _backend, _segments) = result?;
+    let (text, _backend, _segments) = match result {
+        Ok(transcript) => transcript,
+        // A fragment the model decoded but heard no speech in — a fan, a door,
+        // a room — is silence, and silence is not an error here. Reporting it
+        // as one puts a failure banner on the call every time the microphone
+        // picks up the room; the engine already knows what to do with an empty
+        // transcript, which is nothing.
+        Err(error) if error == crate::local_whisper::NO_SPEECH => {
+            return Ok(TalkTranscript {
+                job_id,
+                text: String::new(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
     Ok(TalkTranscript { job_id, text })
 }
 
@@ -1783,7 +1911,7 @@ pub fn call_speech_readiness(app_data_dir: &Path) -> Result<(), String> {
         // call whose every turn will fail is exactly what this guard exists to
         // prevent, and an unstaged development tree can still be in that state.
         TranscriptionBackendKind::LocalWhisper => {
-            if !crate::local_whisper::is_ready() {
+            if !crate::local_whisper::is_ready(&voice.transcription_model) {
                 return Err(
                     "The built-in speech model is still being prepared, so nothing said on a call could be understood yet."
                         .to_string(),
@@ -1859,13 +1987,7 @@ pub async fn transcribe_audio_bytes(
     if audio.is_empty() || audio.len() as u64 > MAX_MEDIA_BYTES {
         return Err("Spoken audio is empty or exceeds its limit".to_string());
     }
-    let extension = match media_type {
-        value if value.contains("wav") => "wav",
-        value if value.contains("ogg") => "ogg",
-        value if value.contains("mp4") => "m4a",
-        value if value.contains("mpeg") => "mp3",
-        _ => "webm",
-    };
+    let extension = recorded_audio_extension(media_type);
     let state = M7CompanionState::production(app_data_dir)?;
     let directory = state.root.join("tmp");
     ensure_private_directory(&directory)?;
@@ -1873,7 +1995,7 @@ pub async fn transcribe_audio_bytes(
     fs::write(&path, audio).map_err(|error| format!("Could not stage spoken audio: {error}"))?;
     let job_id = format!("talk-stt-{}", Uuid::new_v4().simple());
     let cancellation = state.begin_job(&job_id)?;
-    let result = transcribe_path(&state, &job_id, &path, &cancellation, false).await;
+    let result = transcribe_path(&state, &job_id, &path, &cancellation, false, None).await;
     state.finish_job(&job_id);
     let _ = fs::remove_file(&path);
     result.map(|(text, _backend, _segments)| text)
@@ -1883,7 +2005,7 @@ pub async fn transcribe_call_audio(app_data_dir: &Path, path: &Path) -> Result<S
     let state = M7CompanionState::production(app_data_dir)?;
     let job_id = format!("call-stt-{}", Uuid::new_v4().simple());
     let cancellation = state.begin_job(&job_id)?;
-    let result = transcribe_path(&state, &job_id, path, &cancellation, false).await;
+    let result = transcribe_path(&state, &job_id, path, &cancellation, false, None).await;
     state.finish_job(&job_id);
     result.map(|(text, _backend, _segments)| text)
 }
@@ -2985,6 +3107,17 @@ mod tests {
         assert!(!config.voice.always_listening);
         assert_eq!(config.voice.tts_backend, SpeechBackendKind::System);
         validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn recorded_audio_keeps_the_extension_its_container_needs() {
+        // The desktop webview is WebKit, and WebKit's MediaRecorder hands back
+        // MP4 — every one of these bytes used to be written to a `.webm` path,
+        // which is the one hint the demuxer must not be given.
+        assert_eq!(recorded_audio_extension("audio/mp4"), "m4a");
+        assert_eq!(recorded_audio_extension("audio/webm;codecs=opus"), "webm");
+        assert_eq!(recorded_audio_extension("audio/wav"), "wav");
+        assert_eq!(recorded_audio_extension("audio/ogg;codecs=opus"), "ogg");
     }
 
     #[test]

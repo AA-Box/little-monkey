@@ -41,9 +41,13 @@ const CONFIG = {
 };
 
 const streams: { stopped: number }[] = [];
+let resumed = 0;
+let sourceNodes: { connected: number; disconnected: number }[] = [];
 
 function stubMedia() {
   streams.length = 0;
+  resumed = 0;
+  sourceNodes = [];
   Object.defineProperty(navigator, 'mediaDevices', {
     configurable: true,
     value: {
@@ -67,10 +71,26 @@ function stubMedia() {
   vi.stubGlobal(
     'AudioContext',
     class {
+      // What WebKit hands back for a context built outside a user gesture.
+      state = 'suspended';
+      resume() {
+        this.state = 'running';
+        resumed += 1;
+        return Promise.resolve();
+      }
       createAnalyser() {
         return { fftSize: 1_024, getFloatTimeDomainData: (buffer: Float32Array) => buffer.fill(0) };
       }
-      createMediaStreamSource() { return { connect: () => undefined }; }
+      createMediaStreamSource() {
+        const node = {
+          connected: 0,
+          disconnected: 0,
+          connect() { this.connected += 1; },
+          disconnect() { this.disconnected += 1; },
+        };
+        sourceNodes.push(node);
+        return node;
+      }
       close() { return Promise.resolve(); }
     },
   );
@@ -128,6 +148,29 @@ describe('useTalkSession', () => {
     await waitFor(() => expect(streams).toHaveLength(1));
     await waitFor(() => expect(result.current.snapshot?.capturing).toBe(true));
     expect(result.current.mode).toBe('continuous');
+  });
+
+  it('resumes the audio context, so the detector hears something', async () => {
+    renderHook(() => useTalkSession('session-1', { enabled: true, autoStartMode: 'continuous' }));
+    await waitFor(() => expect(streams).toHaveLength(1));
+    // A suspended context reads pure silence: the meter sits at zero, the
+    // utterance never ends, and Talk listens forever without answering.
+    await waitFor(() => expect(resumed).toBe(1));
+  });
+
+  it('holds the source node, so the analyser keeps being fed', async () => {
+    const { rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) =>
+        useTalkSession('session-1', { enabled, autoStartMode: 'continuous' }),
+      { initialProps: { enabled: true } },
+    );
+    await waitFor(() => expect(sourceNodes).toHaveLength(1));
+
+    rerender({ enabled: false });
+    // Nothing can disconnect a node it never kept, and WebKit collects a source
+    // node nothing references — leaving the analyser reading silence, the
+    // meter flat, and Talk listening forever.
+    await waitFor(() => expect(sourceNodes[0].disconnected).toBe(1));
   });
 
   it('closes the microphone when it is disabled again', async () => {
