@@ -586,6 +586,77 @@ async fn spawn_and_wait_healthy(
 /// fixed number for every model. Returns the context size it actually
 /// launched with, so the caller can reflect the real limit (not a guess) in
 /// its own UI.
+/// Where the managed chat server's process id is recorded between runs.
+///
+/// Profile-scoped like everything else the app owns, so two profiles never reap
+/// each other's server.
+fn chat_server_pid_path(app: &AppHandle) -> Option<PathBuf> {
+    app.profile_data_dir().ok().map(|dir| dir.join("llama-chat-server.pid"))
+}
+
+fn record_chat_server_pid(app: &AppHandle, pid: u32) {
+    if let Some(path) = chat_server_pid_path(app) {
+        let _ = std::fs::write(path, pid.to_string());
+    }
+}
+
+fn forget_chat_server_pid(app: &AppHandle) {
+    if let Some(path) = chat_server_pid_path(app) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Kill a chat server this app left behind, before starting a new one.
+///
+/// `stop_all_blocking` kills the managed server on a clean quit, but a crash, a
+/// force quit, or a development rebuild never runs it, and the child outlives
+/// the app — still holding the fixed port with the model resident. The next
+/// start then cannot bind, and the health probe correctly refuses the stranger
+/// already answering there, so the local model is unusable until somebody finds
+/// and kills a process by hand. Nothing in the UI says that is what happened;
+/// the turn just reports that its target could not be frozen.
+///
+/// Adopting it instead is not an option: its alias was a nonce this process
+/// never saw, and trusting whatever answers on a fixed loopback port is exactly
+/// what `fresh_server_alias` exists to prevent.
+///
+/// Only ever kills a pid this app wrote down itself, and only while something is
+/// still answering on the port — a recorded pid that has since been recycled
+/// onto an unrelated process is left alone.
+async fn reap_recorded_chat_server(app: &AppHandle, port: u16) {
+    let Some(path) = chat_server_pid_path(app) else {
+        return;
+    };
+    let Ok(recorded) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&path);
+    let client = reqwest::Client::new();
+    let health = format!("http://127.0.0.1:{port}/health");
+    let answering = matches!(
+        crate::egress::send(client.get(health).timeout(Duration::from_secs(2))).await,
+        Ok(response) if response.status().is_success()
+    );
+    if let Some(pid) = pid_to_reap(&recorded, answering) {
+        let _ = crate::os_signal::kill_process_group(pid);
+    }
+}
+
+/// Which recorded pid, if any, this start should kill.
+///
+/// Split out from the IO so the rule is testable: a pid is only killed when it
+/// parses *and* something is still answering on the port. A recorded pid whose
+/// server has already exited says nothing about whatever owns that number now.
+fn pid_to_reap(recorded: &str, port_answering: bool) -> Option<u32> {
+    if !port_answering {
+        return None;
+    }
+    match recorded.trim().parse::<u32>() {
+        Ok(pid) if pid > 1 => Some(pid),
+        _ => None,
+    }
+}
+
 #[tauri::command]
 pub async fn llama_start(
     app: AppHandle,
@@ -611,6 +682,7 @@ pub async fn llama_start(
 
     let binary = find_llama_server_binary_for_app(&app)?;
     let port = state.llama.lock().map_err(|e| e.to_string())?.port;
+    reap_recorded_chat_server(&app, port).await;
 
     {
         let mut guard = state.llama.lock().map_err(|e| e.to_string())?;
@@ -642,12 +714,22 @@ pub async fn llama_start(
     )
     .await?;
 
+    if let Some(pid) = state
+        .llama
+        .lock()
+        .ok()
+        .and_then(|guard| guard.process.as_ref().map(|child| child.id()))
+    {
+        record_chat_server_pid(&app, pid);
+    }
+
     Ok(resolved_ctx_size)
 }
 
 /// Kill the managed chat `llama-server` process, if any, and mark it stopped.
 #[tauri::command]
 pub async fn llama_stop(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    forget_chat_server_pid(&app);
     let mut llama = state.llama.lock().map_err(|e| e.to_string())?;
     if let Some(mut child) = llama.process.take() {
         child
@@ -833,6 +915,19 @@ pub fn stop_all_blocking(state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_recorded_pid_is_reaped_only_while_the_port_still_answers() {
+        // The orphan case: a previous run's server is still holding the port.
+        assert_eq!(pid_to_reap("4242\n", true), Some(4242));
+        // Nothing is listening, so the number says nothing about what owns that
+        // pid now — a recycled pid must not be killed.
+        assert_eq!(pid_to_reap("4242", false), None);
+        // Never init, and never nonsense left by a partial write.
+        assert_eq!(pid_to_reap("1", true), None);
+        assert_eq!(pid_to_reap("", true), None);
+        assert_eq!(pid_to_reap("not-a-pid", true), None);
+    }
 
     #[test]
     fn startup_identity_requires_the_exact_model_alias() {
