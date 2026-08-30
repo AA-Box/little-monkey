@@ -24,7 +24,7 @@ import { dictationClient, type DictationCapabilities } from '../../lib/dictation
 import { errorMessage } from '../../lib/errors';
 import { useT } from '../../lib/i18n';
 import { base64AudioBlob } from '../../lib/talkAudio';
-import { latencySummary, talkClient, type TalkMetricsSnapshot } from '../../lib/talkClient';
+import { latencySummary, talkClient, type TalkMetricsSnapshot, type TranscriptionLanguage } from '../../lib/talkClient';
 import { createTalkPlayer } from '../../lib/talkPlayback';
 import { Button } from '../ui';
 
@@ -196,6 +196,21 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
    * checkbox that turns it off is disabled by the same condition, so without a
    * way out of this the whole configuration becomes unsaveable. */
   const armedElsewhere = !localOnly && (voice.wakePhraseEnabled || voice.alwaysListening);
+  const [transcriptionLanguages, setTranscriptionLanguages] = useState<TranscriptionLanguage[]>([
+    { id: 'auto', label: 'Detect automatically' },
+  ]);
+  useEffect(() => {
+    // Whisper's own table, so this list cannot drift from what the model honours.
+    // Keep the built-in default unless a real list comes back: a backend
+    // without this command answers null, and "Detect automatically" alone is a
+    // working control while a missing list is a blank one.
+    void talkClient
+      .languages()
+      .then((list) => {
+        if (Array.isArray(list) && list.length > 0) setTranscriptionLanguages(list);
+      })
+      .catch(() => undefined);
+  }, []);
   const stt = metrics ? latencySummary(metrics.metrics, 'sttMs') : null;
   const firstToken = metrics ? latencySummary(metrics.metrics, 'modelFirstTokenMs') : null;
   const firstAudio = metrics ? latencySummary(metrics.metrics, 'ttsFirstAudioMs') : null;
@@ -267,6 +282,27 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
           <p className="mt-2 text-[11px] text-warning">{t('VoiceSettings.speechRecognitionUnavailable')}</p>
         )}
       </div>
+
+      <label className="mt-3 block text-xs text-muted">
+        Spoken language
+        <select
+          className={`${INPUT} mt-1`}
+          value={voice.language || 'auto'}
+          onChange={(event) => patch({ language: event.target.value })}
+        >
+          {transcriptionLanguages.map((language) => (
+            <option key={language.id} value={language.id}>
+              {language.label}
+            </option>
+          ))}
+        </select>
+        <span className="mt-1 block text-[11px] text-faint">
+          Automatic detection decides from the audio, and one sentence is not much to go on: a
+          mostly-English question with a Swedish name in it detects as English, and the name comes
+          back spelled the way an English speaker would have said it. Naming the language you
+          actually speak fixes that.
+        </span>
+      </label>
 
       <div className="mt-3 grid gap-3 sm:grid-cols-2">
         <label className="text-xs text-muted">

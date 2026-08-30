@@ -54,6 +54,40 @@ const METER_INTERVAL_MS = 20;
  */
 const PLACEHOLDER_MARKER = '⏳';
 
+/**
+ * How much of the conversation is offered to the recognizer as vocabulary.
+ *
+ * whisper.cpp conditions on the *tail* of this text, the same way it conditions
+ * on the previous window when transcribing a long recording, so the newest
+ * words are the ones that count and there is nothing to gain from sending the
+ * whole transcript.
+ */
+const CONTEXT_LIMIT = 800;
+
+/**
+ * The words this conversation has already used, for the recognizer to expect.
+ *
+ * A proper noun the model has never seen comes back as whatever it sounds like
+ * in the language it detected — "Sundbyberg" as "soon the B-Berry". Once the
+ * name is on screen, offering it back means the next utterance is decoded
+ * against a vocabulary that contains it.
+ *
+ * Placeholders are left out: priming the decoder with "Queued in the resident
+ * runner" teaches it the plumbing's words, not the conversation's.
+ */
+function recentConversation(sessionId: string): string | null {
+  const session = useSessionStore.getState().sessions.find((entry) => entry.id === sessionId);
+  if (!session) return null;
+  const text = session.messages
+    .slice(-6)
+    .map((message) => (typeof message.content === 'string' ? message.content : ''))
+    .filter((value) => value && !value.startsWith(PLACEHOLDER_MARKER))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return text ? text.slice(-CONTEXT_LIMIT) : null;
+}
+
 export interface UseTalkSessionOptions {
   /**
    * Whether to build an engine at all. `false` keeps this hook inert — no
@@ -252,6 +286,7 @@ export function useTalkSession(
           jobId,
           audioBase64,
           recording.mediaType,
+          recentConversation(sessionId),
         );
         return result.text;
       },

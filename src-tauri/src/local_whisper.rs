@@ -363,6 +363,20 @@ fn open_media(path: &Path) -> Result<Box<dyn FormatReader + '_>, String> {
         .map_err(|error| format!("Decode recorded audio container: {error}"))
 }
 
+/// Every language the bundled model can be asked for, as `(code, english_name)`.
+///
+/// Read from whisper.cpp's own table rather than restated here: a list written
+/// out by hand is a list that drifts from the model that has to honour it.
+pub fn supported_languages() -> Vec<(String, String)> {
+    (0..=whisper_rs::get_lang_max_id())
+        .filter_map(|id| {
+            let code = whisper_rs::get_lang_str(id)?;
+            let name = whisper_rs::get_lang_str_full(id).unwrap_or(code);
+            Some((code.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
 /// Whether a demux error is simply the end of the recording.
 ///
 /// A browser's `MediaRecorder` writes a live stream: clusters as they happen,
@@ -517,6 +531,7 @@ fn run_whisper(
     model: &Path,
     pcm: Vec<f32>,
     language: String,
+    initial_prompt: Option<String>,
     cancellation: CancellationToken,
 ) -> Result<LocalTranscript, String> {
     if cancellation.is_cancelled() {
@@ -532,6 +547,15 @@ fn run_whisper(
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
     params.set_no_context(true);
+    // Words the decoder should expect. whisper.cpp conditions on this exactly as
+    // it conditions on the previous window's text, which is what makes a name
+    // already on screen come back spelled instead of guessed at phonetically —
+    // "Sundbyberg" rather than "soon the B-Berry". It is a hint, not a
+    // constraint: nothing here forces a token that was not said.
+    if let Some(prompt) = initial_prompt.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    {
+        params.set_initial_prompt(prompt);
+    }
     let language = language.trim().to_string();
     if language.is_empty() || language.eq_ignore_ascii_case("auto") {
         // "auto" is a language whisper.cpp understands: it detects, then
@@ -583,7 +607,7 @@ fn run_whisper(
             .map_err(|error| format!("Read local Whisper segment: {error}"))?
             .trim()
             .to_string();
-        if text.is_empty() {
+        if text.is_empty() || is_non_speech_annotation(&text) {
             continue;
         }
         parts.push(text.clone());
@@ -595,9 +619,32 @@ fn run_whisper(
     }
     let text = parts.join(" ").trim().to_string();
     if text.is_empty() {
-        return Err("Built-in local Whisper returned an empty transcript".to_string());
+        return Err(NO_SPEECH.to_string());
     }
     Ok(LocalTranscript { text, segments })
+}
+
+/// What the model returns when it decoded the window but heard no speech in it.
+///
+/// A distinct constant rather than a sentence written twice, because Talk has to
+/// recognise this case: a fragment of room noise is silence, not a failed turn.
+pub const NO_SPEECH: &str = "Built-in local Whisper returned an empty transcript";
+
+/// Whether a segment is Whisper's non-speech annotation rather than something
+/// somebody said.
+///
+/// Fed a fan, a keyboard or a room, the model narrates instead of transcribing:
+/// "[ Inaudible ]", "[BLANK_AUDIO]", "(wind blowing)", "*music*". Left in, each
+/// burst of noise becomes a spoken turn the assistant then answers. Matching the
+/// wrapper instead of a word list is what makes this hold for every language the
+/// model decodes — the brackets are Whisper's convention, the words inside them
+/// are not — and speech itself never comes back wrapped end to end.
+fn is_non_speech_annotation(text: &str) -> bool {
+    let mut characters = text.chars();
+    let (Some(first), Some(last)) = (characters.next(), characters.next_back()) else {
+        return false;
+    };
+    matches!((first, last), ('[', ']') | ('(', ')') | ('*', '*'))
 }
 
 /// Decode any supported recording container and transcribe it through the
@@ -606,15 +653,17 @@ pub async fn transcribe(
     app_data_dir: &Path,
     path: &Path,
     language: &str,
+    initial_prompt: Option<&str>,
     cancellation: CancellationToken,
 ) -> Result<LocalTranscript, String> {
     let model = prepare(app_data_dir).await?;
     let path = path.to_path_buf();
     let language = language.to_string();
+    let initial_prompt = initial_prompt.map(str::to_string);
     let cancellation_for_worker = cancellation.clone();
     tokio::task::spawn_blocking(move || {
         let pcm = decode_audio(&path, &cancellation_for_worker)?;
-        run_whisper(&model, pcm, language, cancellation_for_worker)
+        run_whisper(&model, pcm, language, initial_prompt, cancellation_for_worker)
     })
     .await
     .map_err(|error| format!("Local transcription worker failed: {error}"))?
@@ -623,6 +672,42 @@ pub async fn transcribe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Room noise came back as "[ Inaudible ] [ Inaudible ] ..." and was
+    /// submitted as a spoken turn, which the assistant then answered. Whisper's
+    /// annotations are not speech, in any language, and must not survive into a
+    /// transcript.
+    #[test]
+    fn whisper_narrating_the_room_is_not_a_transcript() {
+        for annotation in [
+            "[ Inaudible ]",
+            "[BLANK_AUDIO]",
+            "(wind blowing)",
+            "*music*",
+            "[ Ljud av tangentbord ]",
+        ] {
+            assert!(is_non_speech_annotation(annotation), "{annotation}");
+        }
+        for speech in [
+            "Tell me a joke.",
+            "The array [0] is empty",
+            "I said (quietly) that it works",
+            "*",
+        ] {
+            assert!(!is_non_speech_annotation(speech), "{speech}");
+        }
+    }
+
+    #[test]
+    fn the_language_list_comes_from_the_model_not_from_a_list_here() {
+        let languages = supported_languages();
+        // Whisper's own table, so it is neither empty nor a handful.
+        assert!(languages.len() > 90, "got {} languages", languages.len());
+        let code = |wanted: &str| languages.iter().any(|(id, _)| id == wanted);
+        assert!(code("en") && code("sv") && code("fa"));
+        // Every entry carries a name to show, not just a code.
+        assert!(languages.iter().all(|(id, label)| !id.is_empty() && !label.is_empty()));
+    }
 
     #[test]
     fn a_live_recordings_short_last_element_is_its_end_not_a_failure() {
@@ -738,7 +823,7 @@ mod tests {
         // returned an empty transcript for every recording ever made.
         for fixture in [&wav, &webm] {
             for language in ["en", "auto"] {
-                let transcript = transcribe(&root, fixture, language, CancellationToken::new())
+                let transcript = transcribe(&root, fixture, language, None, CancellationToken::new())
                     .await
                     .unwrap_or_else(|error| {
                         panic!("{} as {language} failed: {error}", fixture.display())

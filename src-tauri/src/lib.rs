@@ -1985,6 +1985,7 @@ pub fn run() {
             m7_companion::m7_overlay_submit,
             m7_companion::m7_config_get,
             m7_companion::m7_config_save,
+            m7_companion::m7_transcription_languages,
             m7_companion::m7_talk_status,
             m7_companion::m7_talk_metrics,
             m7_companion::m7_talk_metric_record,

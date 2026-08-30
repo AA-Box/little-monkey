@@ -1122,6 +1122,39 @@ pub fn m7_config_save(
     Ok(state.config()?)
 }
 
+/// One language the built-in speech model can be told to expect.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptionLanguage {
+    /// Whisper's own code — `en`, `sv`, `zh`.
+    pub id: String,
+    /// Whisper's own English name for it.
+    pub label: String,
+}
+
+/// Every language transcription can be pinned to, plus the automatic default.
+///
+/// Read out of the model rather than listed here. The setting exists because
+/// automatic detection decides from the audio, and a short sentence that is
+/// mostly English with one Swedish place name in it detects as English — after
+/// which the place name is spelled the way an English speaker would have said
+/// it, and no amount of repeating it helps.
+#[tauri::command]
+pub fn m7_transcription_languages() -> Vec<TranscriptionLanguage> {
+    let mut languages = vec![TranscriptionLanguage {
+        id: "auto".to_string(),
+        label: "Detect automatically".to_string(),
+    }];
+    let mut model_languages = crate::local_whisper::supported_languages();
+    model_languages.sort_by(|left, right| left.1.cmp(&right.1));
+    languages.extend(
+        model_languages
+            .into_iter()
+            .map(|(id, label)| TranscriptionLanguage { id, label }),
+    );
+    languages
+}
+
 #[tauri::command]
 pub fn m7_talk_status(
     window: tauri::Window,
@@ -1435,6 +1468,11 @@ async fn transcribe_path(
     path: &Path,
     cancellation: &CancellationToken,
     diarize: bool,
+    // Vocabulary the decoder should expect, from the conversation this
+    // utterance belongs to. Local backend only: the audio is already going
+    // wherever the operator pointed transcription, but the words already said
+    // in a chat are not, and a hosted recognizer does not get them thrown in.
+    initial_prompt: Option<&str>,
 ) -> Result<(String, String, Vec<SpeakerSegment>), String> {
     let config = state.config()?.voice;
     match config.backend {
@@ -1443,6 +1481,7 @@ async fn transcribe_path(
                 &state.app_data_dir,
                 path,
                 &config.language,
+                initial_prompt,
                 cancellation.clone(),
             )
             .await?;
@@ -1604,6 +1643,7 @@ pub async fn m7_transcribe_file(
         &path,
         &cancellation,
         grant.kind == CaptureKind::Meeting,
+        None,
     )
     .await;
     state.finish_job(&job_id);
@@ -1685,6 +1725,7 @@ pub async fn m7_transcribe_audio(
         &path,
         &cancellation,
         grant.kind == CaptureKind::Meeting,
+        None,
     )
     .await;
     state.finish_job(&job_id);
@@ -1735,6 +1776,10 @@ pub async fn m7_talk_transcribe(
     job_id: String,
     audio_base64: String,
     media_type: String,
+    // What has already been said in this conversation, as vocabulary for the
+    // decoder. A name it has seen spelled comes back spelled instead of guessed
+    // at phonetically. Optional, bounded by the caller, local backend only.
+    context: Option<String>,
 ) -> Result<TalkTranscript, String> {
     ensure_main_window(&window)?;
     let grant = state.require_grant(
@@ -1766,6 +1811,7 @@ pub async fn m7_talk_transcribe(
         &path,
         &cancellation,
         grant.kind == CaptureKind::Meeting,
+        context.as_deref(),
     )
     .await;
     state.finish_job(&job_id);
@@ -1773,7 +1819,21 @@ pub async fn m7_talk_transcribe(
     // come through here, because the utterance's audio outliving the utterance
     // is the one thing this path must never do.
     let _ = fs::remove_file(&path);
-    let (text, _backend, _segments) = result?;
+    let (text, _backend, _segments) = match result {
+        Ok(transcript) => transcript,
+        // A fragment the model decoded but heard no speech in — a fan, a door,
+        // a room — is silence, and silence is not an error here. Reporting it
+        // as one puts a failure banner on the call every time the microphone
+        // picks up the room; the engine already knows what to do with an empty
+        // transcript, which is nothing.
+        Err(error) if error == crate::local_whisper::NO_SPEECH => {
+            return Ok(TalkTranscript {
+                job_id,
+                text: String::new(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
     Ok(TalkTranscript { job_id, text })
 }
 
@@ -1875,7 +1935,7 @@ pub async fn transcribe_audio_bytes(
     fs::write(&path, audio).map_err(|error| format!("Could not stage spoken audio: {error}"))?;
     let job_id = format!("talk-stt-{}", Uuid::new_v4().simple());
     let cancellation = state.begin_job(&job_id)?;
-    let result = transcribe_path(&state, &job_id, &path, &cancellation, false).await;
+    let result = transcribe_path(&state, &job_id, &path, &cancellation, false, None).await;
     state.finish_job(&job_id);
     let _ = fs::remove_file(&path);
     result.map(|(text, _backend, _segments)| text)
@@ -1885,7 +1945,7 @@ pub async fn transcribe_call_audio(app_data_dir: &Path, path: &Path) -> Result<S
     let state = M7CompanionState::production(app_data_dir)?;
     let job_id = format!("call-stt-{}", Uuid::new_v4().simple());
     let cancellation = state.begin_job(&job_id)?;
-    let result = transcribe_path(&state, &job_id, path, &cancellation, false).await;
+    let result = transcribe_path(&state, &job_id, path, &cancellation, false, None).await;
     state.finish_job(&job_id);
     result.map(|(text, _backend, _segments)| text)
 }

@@ -477,6 +477,32 @@ describe('TalkPanel — a spoken turn end to end', () => {
     expect(spoken).toEqual(['The deploy finished cleanly.']);
   });
 
+  it('offers the conversation to the recognizer, minus the plumbing', async () => {
+    const media = stubMedia();
+    mock();
+    const sessionId = liveSession();
+    await act(async () => {
+      const store = useSessionStore.getState();
+      store.addMessage(sessionId, { role: 'user', content: 'I live in Sundbyberg' });
+      store.addMessage(sessionId, { role: 'assistant', content: '⏳ Resident agent is working…' });
+    });
+    render(<TalkPanel sessionId={sessionId} onClose={vi.fn()} />);
+
+    await saySomething(media);
+    // The recorder stops, then the audio is transcribed a tick later.
+    await waitFor(() =>
+      expect(invoke.mock.calls.some((entry) => entry[0] === 'm7_talk_transcribe')).toBe(true),
+    );
+    const call = invoke.mock.calls.find((entry) => entry[0] === 'm7_talk_transcribe');
+    const context = (call?.[1] as { context: string | null } | undefined)?.context ?? '';
+    // A name already on screen is spelled for the decoder, so the next
+    // utterance is not decoded against a vocabulary that lacks it.
+    expect(context).toContain('Sundbyberg');
+    // Progress text is not conversation; priming with it teaches the decoder
+    // the plumbing's words.
+    expect(context).not.toContain('Resident agent');
+  });
+
   it('speaks the answer of a turn that called a tool', async () => {
     const media = stubMedia();
     mock();
