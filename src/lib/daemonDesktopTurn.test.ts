@@ -6,7 +6,7 @@ const mocks = vi.hoisted(() => ({
   loadRunEvents: vi.fn(),
   getRun: vi.fn(),
   ingressTurnShow: vi.fn(),
-  daemonDecisions: vi.fn(async () => []),
+  daemonDecisions: vi.fn(async (): Promise<SchedulerDecision[]> => []),
 }));
 
 vi.mock("./daemonClient", async (importOriginal) => ({
@@ -30,6 +30,7 @@ vi.mock("./ingressClient", async (importOriginal) => ({
 import type { IngressTurn } from "./ingressClient";
 import type { ChatMessage } from "./llamaClient";
 import type { ModelTargetSnapshot } from "./modelTargets";
+import type { SchedulerDecision } from "./daemonClient";
 import type { RunEventEnvelopeWire, RunRecord } from "./runProtocol";
 import {
   buildDaemonDesktopRecipe,
@@ -324,8 +325,8 @@ describe("daemon desktop routing and event replay", () => {
   it("says why a queued turn is still queued", async () => {
     // First poll: still sitting in the queue with nothing streamed yet.
     mocks.loadRunEvents.mockResolvedValueOnce([
-      { sequence: 1, event: { type: "queued", payload: { queue: null } } } as RunEventEnvelopeWire,
-    ]);
+      { sequence: 1, event: { type: "queued", payload: { queue: null } } },
+    ] as RunEventEnvelopeWire[]);
     mocks.getRun.mockResolvedValueOnce({ status: "queued" } as RunRecord);
     mocks.daemonDecisions.mockResolvedValue([
       {
@@ -342,10 +343,9 @@ describe("daemon desktop routing and event replay", () => {
         measuredAtMs: null,
       },
     ]);
-    // Second poll: it got in and finished, so the loop returns.
-    mocks.loadRunEvents.mockResolvedValue([
-      { sequence: 2, event: { type: "completed", payload: { summary: "done", result_artifact_ids: [], usage: {} } } } as RunEventEnvelopeWire,
-    ]);
+    // Second poll: it got in and finished, so the loop returns. Terminality is
+    // the run record's, which is what `projectDaemonTurnEvents` reads.
+    mocks.loadRunEvents.mockResolvedValue([]);
     mocks.getRun.mockResolvedValue({ status: "succeeded" } as RunRecord);
 
     mocks.ingressTurnShow.mockResolvedValue(null);
@@ -365,9 +365,8 @@ describe("daemon desktop routing and event replay", () => {
   it("does not ask why once a turn is streaming", async () => {
     mocks.daemonDecisions.mockClear();
     mocks.loadRunEvents.mockResolvedValue([
-      { sequence: 1, event: { type: "model_delta", payload: { message_id: "a", channel: "assistant", text: "Hi" } } } as RunEventEnvelopeWire,
-      { sequence: 2, event: { type: "completed", payload: { summary: "Hi", result_artifact_ids: [], usage: {} } } } as RunEventEnvelopeWire,
-    ]);
+      { sequence: 1, event: { type: "model_delta", payload: { message_id: "a", channel: "assistant", text: "Hi" } } },
+    ] as RunEventEnvelopeWire[]);
     mocks.getRun.mockResolvedValue({ status: "succeeded" } as RunRecord);
     mocks.ingressTurnShow.mockResolvedValue(null);
     await watchDaemonDesktopTurn(
