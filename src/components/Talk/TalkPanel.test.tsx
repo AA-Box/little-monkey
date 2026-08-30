@@ -46,6 +46,7 @@ const CONFIG: CompanionConfig = {
     realtimeExtensionCapabilityId: null,
     providerModel: 'whisper-1',
     language: 'auto',
+    transcriptionModel: 'base',
     ttsVoice: null,
     saveRawAudio: false,
     inputDeviceId: null,

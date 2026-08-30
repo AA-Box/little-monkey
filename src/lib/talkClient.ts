@@ -51,6 +51,14 @@ export interface TalkTranscript {
   text: string;
 }
 
+/** One speech model that can be chosen, and what it would cost to install. */
+export interface TranscriptionModel {
+  id: string;
+  label: string;
+  bytes: number;
+  installed: boolean;
+}
+
 /** One language transcription can be pinned to. Whisper's own table. */
 export interface TranscriptionLanguage {
   id: string;
@@ -60,6 +68,10 @@ export interface TranscriptionLanguage {
 export const talkClient = {
   status: () => invoke<TalkStatus>('m7_talk_status'),
   languages: () => invoke<TranscriptionLanguage[]>('m7_transcription_languages'),
+  models: () => invoke<TranscriptionModel[]>('m7_transcription_models'),
+  /** Fetch and verify one model. Resolves when it is ready to transcribe. */
+  installModel: (modelId: string) =>
+    invoke<void>('m7_transcription_model_install', { modelId }),
   metrics: () => invoke<TalkMetricsSnapshot>('m7_talk_metrics'),
   recordMetric: (metric: TalkMetric) =>
     invoke<TalkMetricsSnapshot>('m7_talk_metric_record', { metric }),

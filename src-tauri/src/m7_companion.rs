@@ -92,6 +92,10 @@ fn default_provider_model() -> String {
     "whisper-1".to_string()
 }
 
+fn default_transcription_model() -> String {
+    crate::local_whisper::DEFAULT_MODEL_ID.to_string()
+}
+
 fn default_language() -> String {
     "auto".to_string()
 }
@@ -130,6 +134,12 @@ pub struct VoiceConfig {
     pub extension_capability_id: Option<String>,
     #[serde(default = "default_language")]
     pub language: String,
+    /// Which built-in speech model transcribes. Ids from
+    /// `local_whisper::MODELS`; an unknown one falls back to the default rather
+    /// than making speech unusable, so an older config that never had this
+    /// field keeps working exactly as it did.
+    #[serde(default = "default_transcription_model")]
+    pub transcription_model: String,
     #[serde(default)]
     pub tts_voice: Option<String>,
     #[serde(default)]
@@ -185,6 +195,7 @@ impl Default for VoiceConfig {
             extension_id: None,
             extension_capability_id: None,
             language: "auto".to_string(),
+            transcription_model: default_transcription_model(),
             tts_voice: None,
             tts_backend: SpeechBackendKind::System,
             tts_extension_id: None,
@@ -514,7 +525,7 @@ impl M7CompanionState {
             .expect("fixture companion configuration is valid");
     }
 
-    fn config(&self) -> Result<CompanionConfig, String> {
+    pub(crate) fn config(&self) -> Result<CompanionConfig, String> {
         Ok(lock(&self.config, "companion config")?.clone())
     }
 
@@ -785,6 +796,12 @@ fn validate_config(config: &CompanionConfig) -> Result<(), String> {
         || config.voice.provider_model.is_empty()
         || config.voice.provider_model.len() > 256
         || config.voice.language.len() > 32
+        // A model this build does not have cannot be saved. `model_for` would
+        // fall back at use, but a setting that silently means something else is
+        // worse than one that refuses.
+        || !crate::local_whisper::MODELS
+            .iter()
+            .any(|model| model.id == config.voice.transcription_model)
         || config
             .voice
             .dictation_language
@@ -1122,6 +1139,46 @@ pub fn m7_config_save(
     Ok(state.config()?)
 }
 
+/// One speech model the operator can choose between.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptionModel {
+    pub id: String,
+    pub label: String,
+    /// Download size, so the choice can be made with the cost in view.
+    pub bytes: u64,
+    /// Already on this machine, so choosing it costs nothing.
+    pub installed: bool,
+}
+
+/// Every speech model, smallest first, with what each would cost to install.
+#[tauri::command]
+pub fn m7_transcription_models(
+    state: tauri::State<'_, M7CompanionState>,
+) -> Vec<TranscriptionModel> {
+    crate::local_whisper::MODELS
+        .iter()
+        .map(|model| TranscriptionModel {
+            id: model.id.to_string(),
+            label: model.label.to_string(),
+            bytes: model.bytes,
+            installed: crate::local_whisper::model_installed(&state.app_data_dir, model),
+        })
+        .collect()
+}
+
+/// Fetch and verify one model, so choosing a larger one downloads it there and
+/// then rather than stalling the first thing the operator says afterwards.
+#[tauri::command]
+pub async fn m7_transcription_model_install(
+    state: tauri::State<'_, M7CompanionState>,
+    model_id: String,
+) -> Result<(), String> {
+    crate::local_whisper::prepare(&state.app_data_dir, &model_id)
+        .await
+        .map(|_| ())
+}
+
 /// One language the built-in speech model can be told to expect.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1168,7 +1225,9 @@ pub fn m7_talk_status(
         // ships the model, but a development tree that has not staged it is
         // waiting on a download, and saying "ready" then is how a user finds
         // out by speaking into a Talk session that cannot hear them.
-        TranscriptionBackendKind::LocalWhisper => crate::local_whisper::is_ready(),
+        TranscriptionBackendKind::LocalWhisper => {
+            crate::local_whisper::is_ready(&voice.transcription_model)
+        }
         TranscriptionBackendKind::Provider => voice.provider_id.is_some(),
         // Both halves, because either one alone resolves to nothing: the
         // capability names what to run and the extension id names whose copy
@@ -1481,6 +1540,7 @@ async fn transcribe_path(
                 &state.app_data_dir,
                 path,
                 &config.language,
+                &config.transcription_model,
                 initial_prompt,
                 cancellation.clone(),
             )
@@ -1851,7 +1911,7 @@ pub fn call_speech_readiness(app_data_dir: &Path) -> Result<(), String> {
         // call whose every turn will fail is exactly what this guard exists to
         // prevent, and an unstaged development tree can still be in that state.
         TranscriptionBackendKind::LocalWhisper => {
-            if !crate::local_whisper::is_ready() {
+            if !crate::local_whisper::is_ready(&voice.transcription_model) {
                 return Err(
                     "The built-in speech model is still being prepared, so nothing said on a call could be understood yet."
                         .to_string(),
