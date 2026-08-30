@@ -427,9 +427,11 @@ fn binary_starts(binary: &Path) -> bool {
 #[tauri::command]
 pub fn generation_engine_status(app: AppHandle) -> Result<GenerationEngineStatus, String> {
     let app_data = app.profile_data_dir().ok();
-    // Presence, not verification: this runs on every Studio refresh, and
-    // hashing the whole runtime tree here made switching tabs take seconds.
-    // The launch path still verifies before spawning anything.
+    // Presence, not verification — for the MFLUX runtime below as much as for
+    // this one: both run on every Studio refresh, and hashing a whole runtime
+    // tree here made switching tabs take seconds (and, in a debug build, hung
+    // the window outright — this command is sync, so it hashes on the main
+    // thread). The launch path still verifies before spawning anything.
     let target_supported = managed_runtime::runtime_supported_here(&STABLE_DIFFUSION);
     let present = target_supported
         .then(|| {
@@ -457,7 +459,7 @@ fn mflux_runtime_installed(app_data: &Path) -> bool {
     cfg!(target_arch = "aarch64")
         && crate::m3_production::production_mflux_installer(&app_data.join("m3"))
             .ok()
-            .is_some_and(|installer| installer.verify_active().is_ok())
+            .is_some_and(|installer| installer.active_install_present())
 }
 
 #[cfg(not(target_os = "macos"))]

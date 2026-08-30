@@ -666,6 +666,45 @@ impl MlxPackageInstaller {
         Ok(verified)
     }
 
+    /// Whether an activated install is on disk, without reading it.
+    ///
+    /// The MLX counterpart to `managed_server_path_unverified`: a status probe
+    /// runs on every Studio refresh, and `verify_active` re-hashes every file
+    /// the signed manifest declares. In a debug build that is minutes of
+    /// software SHA-256 on whatever thread asked — which, for a sync Tauri
+    /// command, is the main thread, and a blocked main thread is a white
+    /// window. This answers "is something installed" and nothing more; every
+    /// launch path still calls `verify_active` before spawning anything, so
+    /// nothing unverified is ever executed.
+    pub fn active_install_present(&self) -> bool {
+        let Ok(_guard) = lock(&self.operation_lock) else {
+            return false;
+        };
+        let Ok(bytes) = read_regular_bounded(
+            &self.root.join(ACTIVE_STATE_FILE),
+            self.limits.max_manifest_bytes,
+        ) else {
+            return false;
+        };
+        let Ok(active) = serde_json::from_slice::<MlxActiveState>(&bytes) else {
+            return false;
+        };
+        if active.schema_version != MLX_ACTIVE_STATE_SCHEMA_VERSION
+            || validate_id(&active.package_version, "active.packageVersion").is_err()
+            || validate_sha256(&active.manifest_sha256, "active.manifestSha256").is_err()
+        {
+            return false;
+        }
+        self.root
+            .join(VERSIONS_DIRECTORY)
+            .join(version_directory_name(
+                &active.package_version,
+                &active.manifest_sha256,
+            ))
+            .join(INSTALL_MANIFEST_FILE)
+            .is_file()
+    }
+
     pub fn verify_active(&self) -> MlxResult<VerifiedMlxInstall> {
         let _guard = lock(&self.operation_lock)?;
         let active_path = self.root.join(ACTIVE_STATE_FILE);
@@ -1111,8 +1150,15 @@ impl MlxRuntimeAdapter {
         self.models.values().cloned().collect()
     }
 
-    pub fn has_verified_install(&self) -> bool {
-        self.installer.verify_active().is_ok()
+    /// Whether an install is there — for the buttons a view can offer, which
+    /// is a different question from whether it is safe to execute.
+    ///
+    /// Deliberately not `verify_active`: this answers a capability view, it is
+    /// called every time that view refreshes, and re-hashing the whole package
+    /// to decide whether a button is greyed out is how the window ends up
+    /// frozen. Loading and launching still verify.
+    pub fn has_install(&self) -> bool {
+        self.installer.active_install_present()
     }
 
     pub async fn status(&self, context: &MlxOperationContext) -> MlxResult<MlxRuntimeStatus> {
@@ -2520,6 +2566,31 @@ pub(crate) mod tests {
                 Err(MlxError::Unavailable { .. })
             ));
         }
+    }
+
+    #[test]
+    fn presence_check_answers_without_reading_the_package() {
+        let directory = TestDirectory::new("presence");
+        let installer = installer(&directory.0);
+
+        // Nothing installed is not "present".
+        assert!(!installer.active_install_present());
+
+        let installed = installer
+            .install_and_activate(&package(), &supported_host())
+            .expect("verified install");
+        assert!(installer.active_install_present());
+
+        // The whole point: a status probe answers from the manifest's
+        // existence, so a corrupted payload still reads as installed here and
+        // is caught by `verify_active` on the launch path instead.
+        fs::write(installed.version_directory.join("service/mlx_server.py"), b"tampered")
+            .expect("tamper");
+        assert!(installer.active_install_present());
+        assert!(installer.verify_active().is_err());
+
+        fs::remove_file(directory.0.join(ACTIVE_STATE_FILE)).expect("deactivate");
+        assert!(!installer.active_install_present());
     }
 
     #[test]

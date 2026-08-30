@@ -1647,8 +1647,14 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                     style={{ width: `${Math.min(100, Math.round((talk.snapshot?.inputLevel ?? 0) * 100))}%` }}
                   />
                 </span>
-                {talk.setupError && (
-                  <span role="alert" className="shrink-0 text-danger">{talk.setupError}</span>
+                {/* The engine's own errors too, not just setup's. A failed
+                    transcription returns Talk to listening, and showing only
+                    `setupError` here meant the composer said "Listening" and
+                    nothing else while every turn died. */}
+                {(talk.setupError ?? talk.snapshot?.error) && (
+                  <span role="alert" className="min-w-0 truncate text-danger">
+                    {talk.setupError ?? talk.snapshot?.error}
+                  </span>
                 )}
               </div>
             )}

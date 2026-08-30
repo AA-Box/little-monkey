@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { APPROVAL_LAYER } from "../../lib/overlayLayers";
 import { AlertTriangle, Brain, FilePenLine, FileText, Folder, Globe, Plug, Search, TerminalSquare } from "lucide-react";
 import { usePermissionStore, type PermissionRequest } from "../../store/permissionStore";
 import { sessionDisplayTitle, useSessionStore } from "../../store/sessionStore";
@@ -168,7 +169,7 @@ export function PermissionModal() {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-[2px]"
+      className={`fixed inset-0 ${APPROVAL_LAYER} flex items-center justify-center bg-black/40 p-4 backdrop-blur-[2px]`}
       role="dialog"
       aria-modal="true"
       aria-labelledby="permission-modal-title"

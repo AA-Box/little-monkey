@@ -4724,8 +4724,12 @@ mod tests {
             // embedding core were extracted for the D2 collapse; the client itself is
             // unchanged and still talks only to the loopback embedding runtime.
             ("knowledge_core.rs", 1, 0),
-            // Bundled `llama-server` health/completion probes.
-            ("llama.rs", 2, 0),
+            // Bundled `llama-server` health/completion probes, plus the one that
+            // asks whether a server recorded by a previous run is still answering
+            // before its pid is reaped. All three are `127.0.0.1` literals on the
+            // managed port, carry no credential, and are bounded by a per-request
+            // timeout rather than a client-level deadline.
+            ("llama.rs", 3, 0),
             // Both talk to `OLLAMA_ENDPOINT`/`LLAMA_ENDPOINT`, which are literals
             // on `127.0.0.1`. No client-level deadline: every call is wrapped in
             // `tokio::time::timeout(context.timeout_ms)` instead, which is the

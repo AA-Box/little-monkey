@@ -41,6 +41,17 @@ export type TalkState =
 
 export type TalkMode = 'push_to_talk' | 'continuous';
 
+/**
+ * How often a level-only change reaches subscribers.
+ *
+ * The meter samples every 20 ms, and every snapshot re-renders whatever is
+ * subscribed — in the chat composer that is the whole transcript, rebuilt from
+ * scratch. Fifty renders a second of a real conversation is what "Talk froze
+ * the app" was. Anything that actually happened still publishes immediately;
+ * only a level that moved waits for this interval.
+ */
+const LEVEL_EMIT_INTERVAL_MS = 100;
+
 /** One recorded utterance, as the recorder produced it. */
 export interface TalkRecording {
   blob: Blob;
@@ -178,6 +189,8 @@ export class TalkSession {
   /** Serializes synthesis and playback so chunks are spoken in order. */
   private speechQueue: Promise<void> = Promise.resolve();
   private playbackGeneration = 0;
+  /** When the level meter was last published. See `LEVEL_EMIT_INTERVAL_MS`. */
+  private lastLevelEmitAt = 0;
 
   constructor(ports: TalkPorts, options: TalkOptions = {}) {
     this.ports = ports;
@@ -269,6 +282,7 @@ export class TalkSession {
    * held a sample.
    */
   observeLevel(rms: number, nowMs = this.ports.now()): VadFrame {
+    const stateBefore = this.state;
     const frame = this.vad.sample(rms, nowMs);
     this.inputLevel = frame.inputLevel;
     if (frame.event === 'speech-start') {
@@ -285,7 +299,16 @@ export class TalkSession {
       if (frame.event === 'utterance-end') void this.finishUtterance('silence');
       else if (frame.event === 'max-utterance') void this.finishUtterance('max_utterance');
     }
-    this.emit();
+    // An event, or a state one of the calls above reached, is news. A level
+    // that only moved is a meter, and a meter does not need every frame.
+    if (
+      frame.event !== 'none'
+      || this.state !== stateBefore
+      || nowMs - this.lastLevelEmitAt >= LEVEL_EMIT_INTERVAL_MS
+    ) {
+      this.lastLevelEmitAt = nowMs;
+      this.emit();
+    }
     return frame;
   }
 
