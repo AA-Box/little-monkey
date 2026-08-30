@@ -511,3 +511,23 @@ describe('TalkSession — failures and telemetry', () => {
     expect(session.snapshot().state).toBe('idle');
   });
 });
+
+describe('TalkSession — the level meter', () => {
+  it('does not publish a snapshot for every frame', async () => {
+    const harness = new Harness();
+    const session = new TalkSession(harness, { mode: 'continuous' });
+    let snapshots = 0;
+    session.subscribe(() => {
+      snapshots += 1;
+    });
+    await session.start();
+
+    const before = snapshots;
+    // One second of quiet room: fifty frames, nothing happening in any of them.
+    speak(session, harness, 0.001, 1_000);
+    // Every snapshot re-renders a subscriber, and in the chat composer that is
+    // the whole transcript. The meter is worth ~10 of those a second, not 50.
+    expect(snapshots - before).toBeGreaterThan(0);
+    expect(snapshots - before).toBeLessThanOrEqual(12);
+  });
+});

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ChevronDown, Plus } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { CURATED_MODELS, type ModelInfo } from "../../lib/modelRegistry";
@@ -6,6 +6,7 @@ import { ModelCard } from "./ModelCard";
 import { AddCustomModelForm } from "./AddCustomModelForm";
 import { useModelStore } from "../../store/modelStore";
 import { useT } from "../../lib/i18n";
+import { errorMessage } from "../../lib/errors";
 
 const CURATED_IDS = new Set(CURATED_MODELS.map((model) => model.id));
 
@@ -61,6 +62,23 @@ export function ModelManager() {
   const setProjector = useModelStore((s) => s.setProjector);
   const removeProjector = useModelStore((s) => s.removeProjector);
   const { t } = useT();
+  /** Why the last Pull failed, per model file. A rejected download used to be
+   * discarded by the `void` at the call site, so a catalog entry pointing at a
+   * file that no longer exists made the button look dead. */
+  const [downloadErrors, setDownloadErrors] = useState<Record<string, string>>({});
+
+  const handleInstall = useCallback(
+    (model: ModelInfo) => {
+      setDownloadErrors((current) => {
+        const { [model.file]: _cleared, ...rest } = current;
+        return rest;
+      });
+      void download(model).catch((error: unknown) => {
+        setDownloadErrors((current) => ({ ...current, [model.file]: errorMessage(error) }));
+      });
+    },
+    [download],
+  );
 
   useEffect(() => {
     void refresh();
@@ -151,8 +169,9 @@ export function ModelManager() {
             llamaStatus={llamaStatus}
             llamaVisionEnabled={llamaVisionEnabled}
             startError={llamaError}
+            downloadError={downloadErrors[model.file]}
             downloadProgress={downloadProgress[model.file]}
-            onInstall={() => void download(model)}
+            onInstall={() => handleInstall(model)}
             onCancelDownload={() => void cancelDownload(model)}
             onDelete={() => void handleDelete(model)}
             onStart={() => void start(model)}
@@ -175,8 +194,9 @@ export function ModelManager() {
               llamaStatus={llamaStatus}
               llamaVisionEnabled={llamaVisionEnabled}
               startError={llamaError}
+              downloadError={downloadErrors[model.file]}
               downloadProgress={downloadProgress[model.file]}
-              onInstall={() => void download(model)}
+              onInstall={() => handleInstall(model)}
               onCancelDownload={() => void cancelDownload(model)}
               onDelete={() => void handleDelete(model)}
               onStart={() => void start(model)}

@@ -87,6 +87,8 @@ export function useTalkSession(
   const chunksRef = useRef<Blob[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  /** Held for as long as the microphone is open — see `startRecording`. */
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const meterRef = useRef<number | null>(null);
   const grantRef = useRef<CaptureGrant | null>(null);
   /**
@@ -136,6 +138,8 @@ export function useTalkSession(
     }
     recorderRef.current = null;
     analyserRef.current = null;
+    sourceRef.current?.disconnect();
+    sourceRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     void audioContextRef.current?.close().catch(() => undefined);
@@ -159,9 +163,26 @@ export function useTalkSession(
         // analyser's output is one number per frame and it goes straight into
         // the detector.
         const context = new AudioContext();
+        // WebKit starts a context built outside a user gesture suspended, and a
+        // suspended analyser reads pure silence: the detector never hears an
+        // utterance end, so Talk sits on "Listening" forever and nothing is
+        // ever transcribed. The Talk button *is* a gesture, but the awaits
+        // above — the grant, the config read, `getUserMedia` — have spent it by
+        // the time the context exists. A refusal here is not silently ignored:
+        // it fails `startRecording`, and the engine says so rather than
+        // claiming to be listening with a dead meter.
+        if (context.state === 'suspended') await context.resume();
         const analyser = context.createAnalyser();
         analyser.fftSize = 1024;
-        context.createMediaStreamSource(streamRef.current).connect(analyser);
+        // The source node is held, not dropped on the floor. WebKit collects a
+        // `MediaStreamAudioSourceNode` nothing references, and the analyser it
+        // fed then reads pure silence forever — a flat meter, a detector that
+        // never hears an utterance start or end, and Talk stuck on "Listening"
+        // while the recorder happily records. Chromium keeps it alive on the
+        // graph, which is why this only ever showed up in the desktop webview.
+        const source = context.createMediaStreamSource(streamRef.current);
+        source.connect(analyser);
+        sourceRef.current = source;
         audioContextRef.current = context;
         analyserRef.current = analyser;
         const buffer = new Float32Array(analyser.fftSize);
@@ -351,9 +372,18 @@ export function useTalkSession(
       if (!engine || !active) return;
       const session = store.sessions.find((entry) => entry.id === sessionId);
       if (!session) return;
-      const answer = session.messages.find(
-        (message, index) => index >= active.fromIndex && message.role === 'assistant',
-      );
+      // The turn's LAST assistant message, not its first. A turn that calls a
+      // tool writes one assistant message per round, and the first of them is
+      // the one that requested the tool — usually with empty content. Reading
+      // the first left every tool-using turn silent: the answer arrives in a
+      // later message the watcher never looked at.
+      let answer: (typeof session.messages)[number] | undefined;
+      for (let index = session.messages.length - 1; index >= active.fromIndex; index -= 1) {
+        if (session.messages[index].role === 'assistant') {
+          answer = session.messages[index];
+          break;
+        }
+      }
       if (!answer) return;
       const text = typeof answer.content === 'string' ? answer.content : '';
       if (!text || text === DAEMON_QUEUE_PLACEHOLDER) return;

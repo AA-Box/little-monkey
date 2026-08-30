@@ -363,6 +363,17 @@ fn open_media(path: &Path) -> Result<Box<dyn FormatReader + '_>, String> {
         .map_err(|error| format!("Decode recorded audio container: {error}"))
 }
 
+/// Whether a demux error is simply the end of the recording.
+///
+/// A browser's `MediaRecorder` writes a live stream: clusters as they happen,
+/// a segment of unknown size, and no terminator once the microphone closes.
+/// Symphonia reaches the last short element and reports `UnexpectedEof`, which
+/// is not a corrupt file — it is the end of one. Treating it as a failure threw
+/// away every utterance *after* decoding it, so nothing was ever transcribed.
+fn is_end_of_stream(error: &SymphoniaError) -> bool {
+    matches!(error, SymphoniaError::IoError(source) if source.kind() == std::io::ErrorKind::UnexpectedEof)
+}
+
 fn decode_opus(
     format: &mut dyn FormatReader,
     track_id: u32,
@@ -388,6 +399,7 @@ fn decode_opus(
             Err(SymphoniaError::ResetRequired) => {
                 return Err("Recorded audio changed tracks mid-stream".to_string())
             }
+            Err(ref error) if is_end_of_stream(error) => break,
             Err(error) => return Err(format!("Demux Opus audio: {error}")),
         };
         if packet.track_id != track_id {
@@ -446,6 +458,7 @@ fn decode_audio(path: &Path, cancellation: &CancellationToken) -> Result<Vec<f32
             Err(SymphoniaError::ResetRequired) => {
                 return Err("Recorded audio changed tracks mid-stream".to_string())
             }
+            Err(ref error) if is_end_of_stream(error) => break,
             Err(error) => return Err(format!("Read recorded audio: {error}")),
         };
         if packet.track_id != track_id {
@@ -521,8 +534,13 @@ fn run_whisper(
     params.set_no_context(true);
     let language = language.trim().to_string();
     if language.is_empty() || language.eq_ignore_ascii_case("auto") {
-        params.set_language(None);
-        params.set_detect_language(true);
+        // "auto" is a language whisper.cpp understands: it detects, then
+        // transcribes. `set_detect_language` is a different request — it means
+        // detect and *stop*, and `whisper_full` returns right after detection
+        // with no segments at all. Setting it here made every transcription on
+        // the default configuration come back empty, which is a spoken turn
+        // that records, decodes, runs the model and then says nothing.
+        params.set_language(Some("auto"));
     } else {
         params.set_language(Some(&language));
     }
@@ -605,6 +623,21 @@ pub async fn transcribe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_recordings_short_last_element_is_its_end_not_a_failure() {
+        // What Symphonia reports at the end of a `MediaRecorder` stream: the
+        // segment has no terminator, so the final element runs out early.
+        assert!(is_end_of_stream(&SymphoniaError::IoError(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "end of stream",
+        ))));
+        // A real read failure still is one.
+        assert!(!is_end_of_stream(&SymphoniaError::IoError(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        )));
+        assert!(!is_end_of_stream(&SymphoniaError::DecodeError("corrupt")));
+    }
 
     #[test]
     fn a_bundled_model_is_taken_only_when_it_is_whole() {
@@ -699,17 +732,25 @@ mod tests {
         assert!(prepared.is_file());
         assert_eq!(sha256_file(&prepared).await.unwrap(), MODEL_SHA256);
 
+        // Both containers, and both language settings. "auto" is what the
+        // shipped configuration uses and what every spoken turn asks for, and
+        // it was the one combination nothing covered — so it was the one that
+        // returned an empty transcript for every recording ever made.
         for fixture in [&wav, &webm] {
-            let transcript = transcribe(&root, fixture, "en", CancellationToken::new())
-                .await
-                .unwrap_or_else(|error| panic!("{} failed: {error}", fixture.display()));
-            let normalized = transcript.text.to_ascii_lowercase();
-            assert!(
-                normalized.contains("country") || normalized.contains("ask not"),
-                "unexpected transcript for {}: {}",
-                fixture.display(),
-                transcript.text
-            );
+            for language in ["en", "auto"] {
+                let transcript = transcribe(&root, fixture, language, CancellationToken::new())
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("{} as {language} failed: {error}", fixture.display())
+                    });
+                let normalized = transcript.text.to_ascii_lowercase();
+                assert!(
+                    normalized.contains("country") || normalized.contains("ask not"),
+                    "unexpected transcript for {} as {language}: {}",
+                    fixture.display(),
+                    transcript.text
+                );
+            }
         }
         let _ = tokio::fs::remove_dir_all(root).await;
     }

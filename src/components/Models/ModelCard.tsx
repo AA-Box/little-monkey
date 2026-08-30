@@ -26,6 +26,8 @@ export interface ModelCardProps {
   /** Backend reason the last start failed. Shown verbatim in place of the
    * generic message, which on its own is undiagnosable. */
   startError?: string | null;
+  /** Why the last Pull failed, if it did. */
+  downloadError?: string | null;
   onInstall: () => void;
   onCancelDownload: () => void;
   onDelete: () => void;
@@ -49,6 +51,7 @@ export function ModelCard({
   llamaVisionEnabled = false,
   downloadProgress,
   startError,
+  downloadError,
   onInstall,
   onCancelDownload,
   onDelete,
@@ -113,11 +116,11 @@ export function ModelCard({
             {t("ModelCard.embeddingsUnavailableWithProjector")}
           </p>
         )}
-        {isErrored && (
+        {(isErrored || downloadError) && (
           <p className="mt-1 flex items-start gap-1 text-xs text-danger">
             <AlertTriangle size={12} className="mt-0.5 shrink-0" />
             <span className="break-words">
-              {startError || t("ModelCard.startFailedMessage")}
+              {downloadError || startError || t("ModelCard.startFailedMessage")}
             </span>
           </p>
         )}

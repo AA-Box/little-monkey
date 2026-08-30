@@ -2327,7 +2327,7 @@ impl M3RuntimeDriver for MlxM3Driver {
             .adapter
             .capabilities()
             .is_ok_and(|capabilities| capabilities.is_available());
-        let installed = host_available && self.adapter.has_verified_install();
+        let installed = host_available && self.adapter.has_install();
         M3RuntimeCapabilityView {
             descriptor: self.descriptor(),
             can_load: installed,

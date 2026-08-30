@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { APPROVAL_LAYER } from "../../lib/overlayLayers";
 import { Ban, Laptop, Lock, ShieldAlert, X } from "lucide-react";
 import { usePrivacyFirewallStore, type PrivacyFinding } from "../../store/privacyFirewallStore";
 import { Button } from "../ui";
@@ -33,7 +34,7 @@ export function PrivacyFirewallGate() {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-[2px]"
+      className={`fixed inset-0 ${APPROVAL_LAYER} flex items-center justify-center bg-black/40 p-4 backdrop-blur-[2px]`}
       role="dialog"
       aria-modal="true"
       aria-labelledby="privacy-firewall-gate-title"

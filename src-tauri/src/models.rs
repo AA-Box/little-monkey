@@ -14,7 +14,6 @@ use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncWriteExt;
 
 use crate::model_sources::{self, ManagedModelProvenance};
-use crate::permissions;
 use crate::process_lock::{
     acquire_cross_process_lock, try_acquire_cross_process_lock, CrossProcessFileLock,
 };
@@ -230,8 +229,13 @@ pub fn curated_models() -> Vec<ModelInfo> {
         ModelInfo {
             id: "qwen2.5-7b".to_string(),
             name: "Qwen2.5 7B Instruct".to_string(),
-            repo: "Qwen/Qwen2.5-7B-Instruct-GGUF".to_string(),
-            file: "qwen2.5-7b-instruct-q4_k_m.gguf".to_string(),
+            // Qwen's own GGUF repo publishes this quantization only as a
+            // two-part split (`…-00001-of-00002.gguf`), which this downloader
+            // cannot assemble — the single name the catalog asked for has
+            // never existed there, so every Pull 404'd. bartowski's build is
+            // one file, and is already where Llama and Mistral come from.
+            repo: "bartowski/Qwen2.5-7B-Instruct-GGUF".to_string(),
+            file: "Qwen2.5-7B-Instruct-Q4_K_M.gguf".to_string(),
             size_gb: 4.7,
             tool_calling: true,
             installed: false,
@@ -1746,11 +1750,7 @@ pub(crate) async fn download_repo_snapshot(
 /// this can only ever delete files this app itself downloaded — not an
 /// arbitrary file the OS user can write to.
 #[tauri::command]
-pub async fn models_delete(
-    app: AppHandle,
-    state: tauri::State<'_, AppState>,
-    path: String,
-) -> Result<(), String> {
+pub async fn models_delete(app: AppHandle, path: String) -> Result<(), String> {
     let dir_canon = models_dir(&app)?
         .canonicalize()
         .map_err(|e| format!("Failed to resolve models directory: {e}"))?;
@@ -1765,40 +1765,26 @@ pub async fn models_delete(
             path
         ));
     }
+
+    // No permission prompt here, deliberately. This command is reachable from
+    // exactly one place — the Delete button in Settings → Local Models, behind
+    // its own confirmation — and never from an agent: tools do not invoke Tauri
+    // commands. Asking the operator to approve a deletion they just asked for
+    // put an approval prompt *behind* the settings modal that raised it, so the
+    // only way to answer it was to close the window you were working in. The
+    // safety property that matters is above: the path must canonicalize inside
+    // the app's own models directory. Downloading a model — which writes
+    // gigabytes — has never asked either.
     if p.is_dir() {
         // A directory-shaped model (MLX/safetensors) is deleted whole. It has
         // no projector and no entry in the GGUF bundle registry, so it skips
         // the component bookkeeping below entirely.
-        let detail = format!("Delete downloaded model weights at {}", p.display());
-        permissions::request_permission(
-            &app,
-            state.inner(),
-            "delete_model",
-            detail,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await?;
         return model_sources::delete_installed_bundle(&dir_canon, &p).await;
     }
     if !p.is_file() {
         return Err(format!("Not a file: {path}"));
     }
 
-    let detail = format!("Delete downloaded model weights at {}", p.display());
-    permissions::request_permission(
-        &app,
-        state.inner(),
-        "delete_model",
-        detail,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await?;
     let bundle_registry_path = bundle_registry_path(&app)?;
     let _bundle_registry_lock = lock_bundle_registry(&bundle_registry_path)?;
     let mut registry = load_bundle_registry_from_path(&bundle_registry_path)?;

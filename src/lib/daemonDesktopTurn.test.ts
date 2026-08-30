@@ -6,11 +6,13 @@ const mocks = vi.hoisted(() => ({
   loadRunEvents: vi.fn(),
   getRun: vi.fn(),
   ingressTurnShow: vi.fn(),
+  daemonDecisions: vi.fn(async (): Promise<SchedulerDecision[]> => []),
 }));
 
 vi.mock("./daemonClient", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./daemonClient")>()),
   daemonCancel: mocks.daemonCancel,
+  daemonDecisions: mocks.daemonDecisions,
   daemonDesktopTurnSubmit: mocks.daemonDesktopTurnSubmit,
 }));
 
@@ -28,6 +30,7 @@ vi.mock("./ingressClient", async (importOriginal) => ({
 import type { IngressTurn } from "./ingressClient";
 import type { ChatMessage } from "./llamaClient";
 import type { ModelTargetSnapshot } from "./modelTargets";
+import type { SchedulerDecision } from "./daemonClient";
 import type { RunEventEnvelopeWire, RunRecord } from "./runProtocol";
 import {
   buildDaemonDesktopRecipe,
@@ -317,6 +320,61 @@ describe("daemon desktop routing and event replay", () => {
     expect(loadActiveDaemonTurns()).toEqual([
       { sessionId: "s2", turnId: "t2", runId: "r2", assistantIndex: 1, lastSequence: 0, output: "" },
     ]);
+  });
+
+  it("says why a queued turn is still queued", async () => {
+    // First poll: still sitting in the queue with nothing streamed yet.
+    mocks.loadRunEvents.mockResolvedValueOnce([
+      { sequence: 1, event: { type: "queued", payload: { queue: null } } },
+    ] as RunEventEnvelopeWire[]);
+    mocks.getRun.mockResolvedValueOnce({ status: "queued" } as RunRecord);
+    mocks.daemonDecisions.mockResolvedValue([
+      {
+        decidedAtMs: 2,
+        jobId: "job-1",
+        outcome: "held",
+        processClass: "interactive",
+        effectiveClass: "interactive",
+        workspace: null,
+        passedOver: [],
+        detail: "needs 13.5 GiB more system memory than is free",
+        measurement: "available_ram_bytes",
+        measuredValue: null,
+        measuredAtMs: null,
+      },
+    ]);
+    // Second poll: it got in and finished, so the loop returns. Terminality is
+    // the run record's, which is what `projectDaemonTurnEvents` reads.
+    mocks.loadRunEvents.mockResolvedValue([]);
+    mocks.getRun.mockResolvedValue({ status: "succeeded" } as RunRecord);
+
+    mocks.ingressTurnShow.mockResolvedValue(null);
+    const projections: DaemonTurnProjection[] = [];
+    await watchDaemonDesktopTurn(
+      { sessionId: "s", turnId: "t", runId: "r", jobId: "job-1", assistantIndex: 1, lastSequence: 0, output: "" },
+      new AbortController().signal,
+      { onProjection: (projection) => projections.push(projection) },
+    );
+    // Waiting is legible: the placeholder carries the daemon's own reason
+    // instead of a queue message that reads the same as a hang.
+    expect(projections.map((projection) => projection.status)).toContain(
+      "needs 13.5 GiB more system memory than is free",
+    );
+  });
+
+  it("does not ask why once a turn is streaming", async () => {
+    mocks.daemonDecisions.mockClear();
+    mocks.loadRunEvents.mockResolvedValue([
+      { sequence: 1, event: { type: "model_delta", payload: { message_id: "a", channel: "assistant", text: "Hi" } } },
+    ] as RunEventEnvelopeWire[]);
+    mocks.getRun.mockResolvedValue({ status: "succeeded" } as RunRecord);
+    mocks.ingressTurnShow.mockResolvedValue(null);
+    await watchDaemonDesktopTurn(
+      { sessionId: "s", turnId: "t", runId: "r", jobId: "job-1", assistantIndex: 1, lastSequence: 0, output: "" },
+      new AbortController().signal,
+      { onProjection: () => undefined },
+    );
+    expect(mocks.daemonDecisions).not.toHaveBeenCalled();
   });
 
   it("routes an abort to daemon cancellation while still consuming the terminal ledger event", async () => {

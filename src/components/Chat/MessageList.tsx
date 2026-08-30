@@ -1271,7 +1271,13 @@ function canRetry(messages: ChatMessage[]): boolean {
   return messages.some((m) => m.role === "user");
 }
 
-export default function MessageList({
+/**
+ * Memoized because its host re-renders for reasons that have nothing to do
+ * with the transcript — every keystroke in the composer, and every frame of
+ * Talk's level meter — and rebuilding the whole timeline for each of those is
+ * what makes the window stop responding.
+ */
+function MessageList({
   sessionId,
   messages,
   onEditUserMessage,
@@ -1465,3 +1471,5 @@ export default function MessageList({
     </div>
   );
 }
+
+export default memo(MessageList);

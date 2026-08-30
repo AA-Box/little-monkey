@@ -1632,6 +1632,22 @@ pub async fn m7_transcribe_file(
     })
 }
 
+/// The file extension a decoder should be handed for one recorded media type.
+///
+/// The desktop webview is WebKit, and WebKit's `MediaRecorder` produces MP4 —
+/// not the WebM every other browser gives. Writing those bytes to a `.webm`
+/// path hands the demuxer a hint that contradicts the file it is looking at.
+/// The telephony path already mapped this; Talk and the companion did not.
+fn recorded_audio_extension(media_type: &str) -> &'static str {
+    match media_type {
+        value if value.contains("wav") => "wav",
+        value if value.contains("ogg") => "ogg",
+        value if value.contains("mp4") => "m4a",
+        value if value.contains("mpeg") => "mp3",
+        _ => "webm",
+    }
+}
+
 #[tauri::command]
 pub async fn m7_transcribe_audio(
     state: tauri::State<'_, M7CompanionState>,
@@ -1655,11 +1671,7 @@ pub async fn m7_transcribe_audio(
     if bytes.is_empty() || bytes.len() as u64 > MAX_MEDIA_BYTES {
         return Err("Recorded audio is empty or exceeds its limit".to_string());
     }
-    let extension = if media_type.contains("wav") {
-        "wav"
-    } else {
-        "webm"
-    };
+    let extension = recorded_audio_extension(&media_type);
     let path = state.root.join("tmp").join(format!(
         "recording-{}.{}",
         Uuid::new_v4().simple(),
@@ -1740,11 +1752,7 @@ pub async fn m7_talk_transcribe(
     if bytes.is_empty() || bytes.len() as u64 > MAX_MEDIA_BYTES {
         return Err("Recorded audio is empty or exceeds its limit".to_string());
     }
-    let extension = if media_type.contains("wav") {
-        "wav"
-    } else {
-        "webm"
-    };
+    let extension = recorded_audio_extension(&media_type);
     let path =
         state
             .root
@@ -1859,13 +1867,7 @@ pub async fn transcribe_audio_bytes(
     if audio.is_empty() || audio.len() as u64 > MAX_MEDIA_BYTES {
         return Err("Spoken audio is empty or exceeds its limit".to_string());
     }
-    let extension = match media_type {
-        value if value.contains("wav") => "wav",
-        value if value.contains("ogg") => "ogg",
-        value if value.contains("mp4") => "m4a",
-        value if value.contains("mpeg") => "mp3",
-        _ => "webm",
-    };
+    let extension = recorded_audio_extension(media_type);
     let state = M7CompanionState::production(app_data_dir)?;
     let directory = state.root.join("tmp");
     ensure_private_directory(&directory)?;
@@ -2985,6 +2987,17 @@ mod tests {
         assert!(!config.voice.always_listening);
         assert_eq!(config.voice.tts_backend, SpeechBackendKind::System);
         validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn recorded_audio_keeps_the_extension_its_container_needs() {
+        // The desktop webview is WebKit, and WebKit's MediaRecorder hands back
+        // MP4 — every one of these bytes used to be written to a `.webm` path,
+        // which is the one hint the demuxer must not be given.
+        assert_eq!(recorded_audio_extension("audio/mp4"), "m4a");
+        assert_eq!(recorded_audio_extension("audio/webm;codecs=opus"), "webm");
+        assert_eq!(recorded_audio_extension("audio/wav"), "wav");
+        assert_eq!(recorded_audio_extension("audio/ogg;codecs=opus"), "ogg");
     }
 
     #[test]

@@ -4292,15 +4292,16 @@ fn production_mlx_components(
         return Ok(None);
     }
     let installer = production_mlx_installer(root)?;
-    match installer.verify_active() {
-        Ok(_) | Err(MlxError::NotInstalled) => Ok(Some(ProductionMlxComponents {
-            installer,
-            controller: Arc::new(ProductionMlxServiceController::new(process)?),
-        })),
-        Err(error) => Err(M3HubError::Runtime(format!(
-            "verified MLX installation is corrupt: {error}"
-        ))),
-    }
+    // Assembling the runtime does not verify it. This runs while the app is
+    // starting, and `verify_active` re-hashes every file the signed manifest
+    // declares — in a debug build, minutes of SHA-256 on the thread that has
+    // yet to paint a window. A corrupt install is still caught, at the only
+    // moment where catching it protects anything: every load and launch path
+    // calls `verify_active` before spawning the interpreter.
+    Ok(Some(ProductionMlxComponents {
+        installer,
+        controller: Arc::new(ProductionMlxServiceController::new(process)?),
+    }))
 }
 
 fn build_ollama_driver(platform: PlatformCapabilities) -> M3HubResult<Arc<dyn M3RuntimeDriver>> {
