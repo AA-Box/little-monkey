@@ -1829,7 +1829,18 @@ impl RunEvent {
                 text,
             } => {
                 validate_protocol_id("event.message_id", message_id)?;
-                validate_text("event.text", text, MAX_EVENT_TEXT_BYTES, false)?;
+                // A streamed delta is a raw slice of model output, so a chunk
+                // that is only whitespace ("\n\n" between paragraphs, a lone
+                // space token) is real content: dropping or rejecting it would
+                // silently reflow the replayed transcript. Only a zero-length
+                // chunk is meaningless.
+                if text.is_empty() {
+                    return Err(ProtocolValidationError::new(
+                        "event.text",
+                        "must not be empty",
+                    ));
+                }
+                validate_text("event.text", text, MAX_EVENT_TEXT_BYTES, true)?;
             }
             Self::ToolProposed {
                 tool_call_id,
@@ -2797,6 +2808,23 @@ mod tests {
             text: "x".repeat(MAX_EVENT_TEXT_BYTES + 1),
         };
         assert_eq!(event.validate().unwrap_err().field, "event.text");
+    }
+
+    /// Streamed deltas arrive one tokenizer token at a time, and models emit
+    /// standalone whitespace tokens ("\n\n" at a paragraph break, a trailing
+    /// newline before EOS). Rejecting those failed the whole run mid-answer
+    /// with `event.text: must not be empty`, so whitespace has to survive
+    /// while a zero-length chunk stays rejected.
+    #[test]
+    fn whitespace_only_model_deltas_are_accepted() {
+        let delta = |text: &str| RunEvent::ModelDelta {
+            message_id: "message-01".to_string(),
+            channel: OutputChannel::Assistant,
+            text: text.to_string(),
+        };
+        delta("\n\n").validate().expect("a paragraph-break delta");
+        delta(" ").validate().expect("a lone space delta");
+        assert_eq!(delta("").validate().unwrap_err().field, "event.text");
     }
 
     mod egress_allowlist {
