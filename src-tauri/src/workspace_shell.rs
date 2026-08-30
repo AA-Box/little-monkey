@@ -1495,6 +1495,28 @@ mod tests {
     // this app spawned is evaded by the normal case, not by a trick, which is
     // exactly the gap these exist to close.
 
+    /// The tree budget the memory tests install, and the hog they run against it.
+    ///
+    /// Three constraints fix these numbers, and the third is why they are not
+    /// larger:
+    ///
+    /// - **Above the baseline.** The workload is this test binary re-executed,
+    ///   which resides at roughly 17 MiB before it allocates anything. The ceiling
+    ///   clears that several times over, so the binary's own footprint can never
+    ///   be the thing that trips the bound — a pass for the wrong reason, and
+    ///   indistinguishable from the real one in the result.
+    /// - **Held, not grazed.** The hog touches every page and then sleeps 30
+    ///   seconds, so the tree sits at about twice the ceiling for that whole
+    ///   window, which no sampling interval here can miss.
+    /// - **Not the largest thing on the host.** A workload that makes itself the
+    ///   machine's biggest memory user invites the OS's own low-memory killer to
+    ///   end the tree first, and that arrives as an ordinary exit rather than as
+    ///   this budget firing — a working enforcement path reported as a plain
+    ///   failure. Halving the peak keeps the test out of that role on a loaded
+    ///   machine.
+    const MEMORY_CEILING: u64 = 128 * 1024 * 1024;
+    const HOG_MIB: usize = 256;
+
     /// Allocates and touches `LITTLE_MONKEY_MEMORY_HOG_MIB` mebibytes, then
     /// sleeps holding them.
     ///
@@ -1637,7 +1659,7 @@ mod tests {
         // the child, which is the confinement working and was the first thing
         // this test got wrong.
         let hog = format!(
-            "LITTLE_MONKEY_MEMORY_HOG_MIB=512 {} --exact \
+            "LITTLE_MONKEY_MEMORY_HOG_MIB={HOG_MIB} {} --exact \
              workspace_shell::tests::memory_hog_child --test-threads=1 >/dev/null 2>&1",
             quote(&place_test_binary_in(&workspace, "memory-hog"))
         );
@@ -1650,10 +1672,7 @@ mod tests {
             Duration::from_secs(60),
             None,
             ProcessLimits {
-                // 192 MiB against a 512 MiB hog: high enough that the test binary's
-                // own baseline is not the thing that trips it, low enough to fire
-                // within a sample or two.
-                max_memory_bytes: Some(192 * 1024 * 1024),
+                max_memory_bytes: Some(MEMORY_CEILING),
                 ..ProcessLimits::default()
             },
         )
@@ -1662,10 +1681,10 @@ mod tests {
 
         let breach = output
             .breach
-            .expect("512 MiB of touched pages must exceed a 192 MiB tree budget");
+            .expect("a hog of touched pages must exceed a tree budget half its size");
         assert_eq!(breach.limit, "max_memory_bytes");
         assert_enforced_by_a_real_backend(&breach);
-        assert_eq!(breach.configured, 192 * 1024 * 1024);
+        assert_eq!(breach.configured, MEMORY_CEILING);
         // The tree, not the shell: the hog is a grandchild, so this is the
         // assertion that would still pass against a bound measuring only the pid
         // we spawned — and would fail against one that killed only it.
