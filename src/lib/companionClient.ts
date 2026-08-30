@@ -41,6 +41,8 @@ export interface VoiceConfig {
   extensionId: string | null;
   extensionCapabilityId: string | null;
   language: string;
+  /** Which built-in speech model transcribes — an id from `talkClient.models()`. */
+  transcriptionModel: string;
   ttsVoice: string | null;
   ttsBackend: SpeechBackendKind;
   ttsExtensionId: string | null;
