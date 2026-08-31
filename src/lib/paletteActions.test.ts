@@ -206,6 +206,24 @@ function selectOllamaModel(tag: string) {
   });
 }
 
+/** The local runtime's selected model — a recipe cannot name the runtime
+ * itself, but it can name the hub artifact this is installed as. */
+const LOCAL_MODEL = {
+  id: "managed:abc",
+  name: "Qwen",
+  repo: "",
+  file: "qwen.gguf",
+  size_gb: 4,
+  tool_calling: true,
+  installed: true,
+  path: "/hub/qwen.gguf",
+  is_external: false,
+  kind: "chat",
+  components: {},
+  capabilities: {},
+  runtime: {},
+};
+
 describe("runCreateTask", () => {
   it("rejects a blank name or prompt without touching the recipe store", async () => {
     selectOllamaModel("qwen2.5:14b");
@@ -214,8 +232,49 @@ describe("runCreateTask", () => {
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
-  it("rejects when the active target is the local runtime (recipes have no local-target field)", async () => {
-    useModelStore.setState({ activeProvider: "local", active: null });
+  it("names the managed-hub id of the selected local model, which a recipe target can carry", async () => {
+    useModelStore.setState({
+      activeProvider: "local",
+      activeOllamaModel: null,
+      ollamaModels: [],
+      ollamaReachable: false,
+      llamaStatus: "ready",
+      active: LOCAL_MODEL as never,
+      installed: [LOCAL_MODEL] as never,
+    });
+    invokeMock.mockImplementation(async (...args: unknown[]) => {
+      const command = args[0] as string;
+      if (command === "m3_installed_models") {
+        return [
+          {
+            modelId: "qwen3-8b",
+            versions: [{ active: true, artifactPath: "/hub/qwen.gguf" }],
+          },
+        ];
+      }
+      if (command === "recipes_save") return makeRecipe({ name: "my task" });
+      if (command === "recipes_list") return [];
+      return null;
+    });
+
+    await runCreateTask("my task", "do the thing");
+    const saveCall = invokeMock.mock.calls.find(([cmd]) => cmd === "recipes_save");
+    const content = (saveCall![1] as { content: string }).content;
+    expect(content).toContain("managed_model: \"qwen3-8b\"");
+  });
+
+  it("rejects only when there is no model anywhere — no ollama, no provider, no hub install", async () => {
+    useModelStore.setState({
+      activeProvider: "local",
+      active: null,
+      installed: [],
+      activeOllamaModel: null,
+      ollamaModels: [],
+      ollamaReachable: false,
+    });
+    invokeMock.mockImplementation(async (...args: unknown[]) =>
+      (args[0] as string) === "m3_installed_models" ? [] : null,
+    );
     await expect(runCreateTask("my task", "do the thing")).rejects.toThrow("Ollama or cloud-provider");
   });
 
@@ -241,6 +300,26 @@ describe("runCreateTask", () => {
     expect(content).toContain("permission_mode: manual");
     expect(content).toContain("prompt: |");
     expect(content).toContain("  Do the thing.");
+  });
+
+  it("declares the params the caller renders, since an undeclared one is refused at run time", async () => {
+    selectOllamaModel("qwen2.5:14b");
+    invokeMock.mockImplementation(async (...args: unknown[]) => {
+      const command = args[0] as string;
+      if (command === "recipes_save") return makeRecipe({ name: "channel-chat" });
+      if (command === "recipes_list") return [];
+      return null;
+    });
+
+    await runCreateTask("channel-chat", "{{message}}", {
+      params: { message: "" },
+      description: "Answer a message that arrived on a messaging channel.",
+    });
+
+    const saveCall = invokeMock.mock.calls.find(([cmd]) => cmd === "recipes_save");
+    const content = (saveCall![1] as { content: string }).content;
+    expect(content).toContain("params:\n  \"message\": \"\"");
+    expect(content).toContain('description: "Answer a message that arrived on a messaging channel."');
   });
 });
 
