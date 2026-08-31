@@ -1972,16 +1972,37 @@ fn replace_target_block(raw: &str, target: &RecipeTarget) -> Result<String, Stri
         .ok_or_else(|| {
             "This recipe has no top-level `target:` key — edit it as YAML instead.".to_string()
         })?;
-    // A top-level key is unindented and not a comment; blank lines and indented
-    // lines belong to the block.
-    let end = lines[start + 1..]
-        .iter()
-        .position(|line| {
-            let trimmed = line.trim_end();
-            !trimmed.is_empty() && !line.starts_with([' ', '\t']) && !trimmed.starts_with('#')
-        })
-        .map(|offset| start + 1 + offset)
-        .unwrap_or(lines.len());
+    // Where the block stops. Indented lines and blank lines belong to it; an
+    // unindented non-blank line does not.
+    //
+    // A comment at column zero is the subtle one. Before any of the block's
+    // own lines it is still the target's — `target:` followed by a comment
+    // explaining the target — so scanning continues through it. *After* the
+    // block's content it belongs to whatever comes next, invariably the key
+    // below it, and swallowing it deleted a line the operator wrote about
+    // something this function never touched.
+    let mut seen_block_line = false;
+    let mut end = lines.len();
+    for (offset, line) in lines[start + 1..].iter().enumerate() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if line.starts_with([' ', '\t']) {
+            seen_block_line = true;
+            continue;
+        }
+        if trimmed.starts_with('#') && !seen_block_line {
+            continue;
+        }
+        end = start + 1 + offset;
+        break;
+    }
+    // Blank lines immediately before that boundary separate the block from
+    // what follows rather than belonging to it, so they are kept too.
+    while end > start + 1 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
 
     let mut out = String::with_capacity(raw.len());
     out.push_str(&lines[..start].concat());
@@ -2733,6 +2754,92 @@ params:
         .unwrap();
         assert_eq!(out.matches("model:").count(), 0, "{out}");
         assert!(parse_recipe(&out, "yml").is_ok(), "{out}");
+    }
+
+    /// A comment at column zero after the target block belongs to the key
+    /// below it, not to the target — an operator writes `# Do not remove` to
+    /// explain the *next* key, and swallowing it deleted a line this function
+    /// has no business touching. The blank line separating the two goes the
+    /// same way.
+    #[test]
+    fn a_top_level_comment_after_the_block_is_not_part_of_it() {
+        let raw = "version: 1\nname: \"t\"\ntarget:\n  ollama: \"qwen3:8b\"\n\n# Do not remove - explanation for permission mode\npermission_mode: plan\nprompt: \"hi\"\n";
+        let out = replace_target(
+            raw,
+            "yml",
+            &RecipeTarget {
+                managed_model: Some("Qwen2.5-7B".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            out.contains("\n\n# Do not remove - explanation for permission mode\npermission_mode: plan\n"),
+            "{out}"
+        );
+        assert!(!out.contains("qwen3:8b"), "{out}");
+        let parsed = parse_recipe(&out, "yml").unwrap();
+        assert_eq!(parsed.target.managed_model.as_deref(), Some("Qwen2.5-7B"));
+    }
+
+    /// The stated guarantee, held as a property rather than spot-checked:
+    /// every byte outside the `target:` block is the operator's, whatever sits
+    /// around the block.
+    #[test]
+    fn everything_outside_the_block_survives_byte_for_byte() {
+        let head = "# top of file\nversion: 1\nname: \"t\"\n";
+        // Each tail is what follows the target block, verbatim.
+        for tail in [
+            "permission_mode: plan\nprompt: \"hi\"\n",
+            "\npermission_mode: plan\nprompt: \"hi\"\n",
+            "\n# a note about the mode\npermission_mode: plan\nprompt: \"hi\"\n",
+            "# flush against the block\npermission_mode: plan\nprompt: \"hi\"\n",
+            "\n\n# two blanks first\n\npermission_mode: plan\nprompt: \"hi\"\n",
+            "permission_mode: plan\nsystem: |\n  # not a comment, a block scalar\n  target:\nprompt: \"hi\"\n",
+        ] {
+            let raw = format!("{head}target:\n  ollama: \"old\"\n{tail}");
+            let out = replace_target(
+                &raw,
+                "yml",
+                &RecipeTarget {
+                    ollama: Some("new".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("{error}\n{raw}"));
+            assert_eq!(
+                out,
+                format!("{head}target:\n  ollama: \"new\"\n{tail}"),
+                "tail: {tail:?}"
+            );
+            assert_eq!(
+                parse_recipe(&out, "yml").unwrap().target.ollama.as_deref(),
+                Some("new")
+            );
+        }
+    }
+
+    /// A comment *before* the block's own lines describes the target being
+    /// replaced, so it goes with it — the one comment this is allowed to eat.
+    #[test]
+    fn a_comment_introducing_the_target_goes_with_the_target() {
+        let raw = "version: 1\nname: \"t\"\ntarget:\n# the model this answers on\n  ollama: \"old\"\npermission_mode: plan\nprompt: \"hi\"\n";
+        let out = replace_target(
+            raw,
+            "yml",
+            &RecipeTarget {
+                ollama: Some("new".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Crucially the old mapping line does not survive underneath it.
+        assert!(!out.contains("\"old\""), "{out}");
+        assert_eq!(
+            parse_recipe(&out, "yml").unwrap().target.ollama.as_deref(),
+            Some("new")
+        );
+        assert!(out.contains("permission_mode: plan\n"), "{out}");
     }
 
     /// A JSON recipe is a recipe. `RECIPE_EXTENSIONS` lists `json` alongside
