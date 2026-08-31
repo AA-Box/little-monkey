@@ -165,6 +165,11 @@ const REQUEST_BUDGET: Duration = Duration::from_secs(10);
 // Harness
 // ---------------------------------------------------------------------
 
+/// How many times [`LegacyServer::start_with_endpoints`] re-picks a port when
+/// the listener never came up. Three is enough for a lost port race and few
+/// enough that a server that cannot start still fails fast.
+const START_ATTEMPTS: usize = 3;
+
 fn next_test_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
@@ -270,12 +275,44 @@ impl LegacyServer {
         Self::start_with_endpoints(label, config, unreachable_runtime_endpoints()).await
     }
 
+    /// The server binds its port *inside* the spawned task, and the window
+    /// between `free_loopback_port` releasing that port and `bind_listener`
+    /// claiming it back covers two HTTP client builds and opening the audit
+    /// ledger. A `spawn_fake_upstream` in a parallel test can take the port
+    /// during it — the same "a released ephemeral port is not a reserved one"
+    /// hazard [`UNREACHABLE_RUNTIME_PORT`] documents, except that here it is
+    /// recoverable: pick a new port and start again instead of failing the run.
+    ///
+    /// Bounded, and the last attempt still panics with the real exit, so a
+    /// genuinely broken startup is reported rather than retried into silence.
     async fn start_with_endpoints(
         label: &str,
         config: ApiServerConfig,
         endpoints: CliRuntimeEndpoints,
     ) -> Option<Self> {
-        let port = free_loopback_port().await?;
+        for attempt in 1..=START_ATTEMPTS {
+            match Self::try_start(label, config.clone(), endpoints.clone()).await {
+                Ok(server) => return server,
+                Err(outcome) if attempt < START_ATTEMPTS => eprintln!(
+                    "legacy server start attempt {attempt} exited before readiness \
+                     ({outcome}); retrying on a fresh port"
+                ),
+                Err(outcome) => panic!("the legacy server exited before readiness: {outcome}"),
+            }
+        }
+        unreachable!("the last attempt either returns or panics");
+    }
+
+    /// One start attempt. `Ok(None)` is the sandbox skip, `Err` is "the accept
+    /// loop exited before it answered `/health`" — which the caller retries.
+    async fn try_start(
+        label: &str,
+        config: ApiServerConfig,
+        endpoints: CliRuntimeEndpoints,
+    ) -> Result<Option<Self>, String> {
+        let Some(port) = free_loopback_port().await else {
+            return Ok(None);
+        };
         let data_dir = std::env::temp_dir().join(format!(
             "legacy-route-compat-{label}-{}-{}",
             std::process::id(),
@@ -315,15 +352,15 @@ impl LegacyServer {
         let client = http_client();
         for _ in 0..100 {
             if client.get(server.url("/health")).send().await.is_ok() {
-                return Some(server);
+                return Ok(Some(server));
             }
             if server.accept_loop.is_finished() {
                 let outcome = (&mut server.accept_loop).await;
-                panic!("the legacy server exited before readiness: {outcome:?}");
+                return Err(format!("{outcome:?}"));
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        panic!("the legacy server never answered /health — did the port get taken back?");
+        panic!("the legacy server never answered /health on 127.0.0.1:{port}");
     }
 
     fn url(&self, path: &str) -> String {
@@ -335,17 +372,26 @@ impl LegacyServer {
     }
 }
 
+/// A loopback port nothing in this binary ever binds and no ephemeral-port
+/// allocator ever hands out, so "unreachable" stays unreachable for the whole
+/// test.
+///
+/// Deliberately *not* the bind-an-ephemeral-port-then-drop-it trick used for
+/// the server's own port: the released port goes straight back into the pool,
+/// and a `spawn_fake_upstream` running in a parallel test can then bind it.
+/// From that moment the "unreachable" runtime points at another test's counted
+/// upstream — `model_sources_are_unobserved_before_auth_and_unknown_ids_are_not_guessed_as_ollama`
+/// failed on Windows CI with `ollama_requests == 1` before it had sent a single
+/// request, because a `LegacyServer::start` test's managed-local model fetch
+/// (which hits `llama_port` on every `GET /v1/models`) had landed on its fake.
+/// A fixed reserved port cannot be reallocated, so the class is gone rather
+/// than made rarer.
+const UNREACHABLE_RUNTIME_PORT: u16 = 1;
+
 fn unreachable_runtime_endpoints() -> CliRuntimeEndpoints {
-    let listener =
-        std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve an unused test runtime port");
-    let port = listener
-        .local_addr()
-        .expect("unused runtime address")
-        .port();
-    drop(listener);
     CliRuntimeEndpoints {
-        llama_port: port,
-        ollama_base_url: format!("http://127.0.0.1:{port}"),
+        llama_port: UNREACHABLE_RUNTIME_PORT,
+        ollama_base_url: format!("http://127.0.0.1:{UNREACHABLE_RUNTIME_PORT}"),
     }
 }
 
