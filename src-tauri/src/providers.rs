@@ -411,21 +411,45 @@ pub fn configured_endpoint(app: &AppHandle, id: &str) -> Result<String, String> 
     find_base_url(app, id).map(|value| value.trim_end_matches('/').to_string())
 }
 
+/// The message a caller gets when nothing usable is stored, whether the entry
+/// is missing outright or holds only blank text. Both name the same two ways
+/// to fix it, because a key the GUI wrote is not always a key the daemon can
+/// read back (see [`crate::providers::write_key`]).
+fn no_key_message(provider_id: &str) -> String {
+    format!(
+        "No API key saved for '{provider_id}' — add one in Settings, or store one \
+         the daemon can read with `monkey providers set-key {provider_id}`."
+    )
+}
+
+/// A stored credential of nothing but whitespace is not a credential. It
+/// reaches the wire as `Authorization: Bearer ` with an empty value, which a
+/// provider answers with its own generic 401 — OpenRouter says "Missing
+/// Authentication header" — and that error names neither this machine, the
+/// provider id, nor the fix. Refusing it here turns every such 401 into the
+/// message above, at the one place all callers read through.
+fn reject_blank_key(provider_id: &str, key: String) -> Result<String, String> {
+    if key.trim().is_empty() {
+        return Err(no_key_message(provider_id));
+    }
+    Ok(key)
+}
+
 pub fn has_key(id: &str) -> bool {
     keyring::Entry::new(&KEYCHAIN_SERVICE, id)
         .and_then(|e| e.get_password())
-        .is_ok()
+        .map(|key| !key.trim().is_empty())
+        .unwrap_or(false)
 }
 
 pub fn read_key(provider_id: &str) -> Result<String, String> {
     let entry = keyring::Entry::new(&KEYCHAIN_SERVICE, provider_id)
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
-    entry.get_password().map_err(|e| match e {
-        keyring::Error::NoEntry => {
-            format!("No API key saved for '{provider_id}' — add one in Settings.")
-        }
+    let key = entry.get_password().map_err(|e| match e {
+        keyring::Error::NoEntry => no_key_message(provider_id),
         other => format!("Failed to read saved key: {other}"),
-    })
+    })?;
+    reject_blank_key(provider_id, key)
 }
 
 /// Converts a provider id into its env-var name for [`read_key_with_env`]:
@@ -452,7 +476,9 @@ fn provider_env_var_name(provider_id: &str) -> String {
 /// run` in CI, where there is no OS keychain to read from at all (design doc
 /// slice 1). Scoped to reading only (never persisted anywhere), and the GUI
 /// never calls this — `read_key` itself, and its keychain-only behavior when
-/// neither env var is set, are both completely unchanged.
+/// neither env var is set, are both completely unchanged. All three branches
+/// agree on blankness: the two env reads have always skipped an empty value,
+/// and `read_key` now refuses one rather than passing it to the wire.
 pub fn read_key_with_env(provider_id: &str) -> Result<String, String> {
     if let Ok(key) = std::env::var(provider_env_var_name(provider_id)) {
         if !key.is_empty() {
@@ -476,6 +502,15 @@ pub fn read_key_with_env(provider_id: &str) -> Result<String, String> {
 /// makes the writer the owner, which is the entire point of the write living
 /// in the CLI — see [`providers_set_key`].
 pub fn write_key(provider_id: &str, api_key: &str) -> Result<(), String> {
+    // Before `remove_key_impl`, not after: this function deletes the existing
+    // entry to recreate it, so refusing a blank *later* would leave the
+    // provider with no key at all — a saved empty field would silently destroy
+    // the working credential it was meant to replace.
+    if api_key.trim().is_empty() {
+        return Err(format!(
+            "An API key for '{provider_id}' cannot be blank — remove the key instead of saving an empty one."
+        ));
+    }
     let _ = remove_key_impl(provider_id);
     keyring::Entry::new(&KEYCHAIN_SERVICE, provider_id)
         .map_err(|e| format!("Failed to access keychain: {e}"))?
@@ -1542,6 +1577,58 @@ mod tests {
         assert!(validate_base_url("api.openai.com/v1").is_err());
         assert!(validate_base_url("").is_err());
         assert!(validate_base_url("https://").is_err());
+    }
+
+    /// A blank stored credential used to reach the wire as `Authorization:
+    /// Bearer ` with nothing after it. Every Telegram turn on this machine
+    /// failed that way, and the only diagnostic was the provider's own 401 —
+    /// OpenRouter's "Missing Authentication header", which names neither the
+    /// provider id nor anything the operator can act on.
+    #[test]
+    fn a_blank_stored_key_is_not_a_key() {
+        for blank in ["", "   ", "\n", "\t \n"] {
+            assert!(
+                reject_blank_key("openrouter", blank.to_string()).is_err(),
+                "{blank:?} must not be usable as a credential"
+            );
+        }
+    }
+
+    /// The counter-test, so the guard above cannot become "refuse everything":
+    /// a real key passes through byte-for-byte, surrounding whitespace and all
+    /// — trimming is how it is *judged*, never how it is stored or sent.
+    #[test]
+    fn a_real_key_passes_through_unchanged() {
+        let key = "sk-or-v1-0123456789abcdef";
+        assert_eq!(
+            reject_blank_key("openrouter", key.to_string()).unwrap(),
+            key
+        );
+    }
+
+    /// The refusal has to be actionable: a key the GUI wrote is not always one
+    /// the daemon can read back, so the message names both places to fix it.
+    #[test]
+    fn the_refusal_names_the_provider_and_both_remedies() {
+        let message = reject_blank_key("openrouter", String::new()).unwrap_err();
+        assert!(message.contains("openrouter"), "{message}");
+        assert!(message.contains("Settings"), "{message}");
+        assert!(
+            message.contains("monkey providers set-key openrouter"),
+            "{message}"
+        );
+    }
+
+    /// `write_key` deletes the existing entry before recreating it, so this
+    /// refusal must come first. Saving an empty field would otherwise destroy
+    /// the working key it was meant to replace — the exact way a provider ends
+    /// up with a blank credential in the first place. Returns before any
+    /// keychain call, so this test touches no keychain.
+    #[test]
+    fn write_key_refuses_a_blank_without_deleting_anything() {
+        let error = write_key("openrouter", "   ").unwrap_err();
+        assert!(error.contains("cannot be blank"), "{error}");
+        assert!(error.contains("openrouter"), "{error}");
     }
 
     #[test]
