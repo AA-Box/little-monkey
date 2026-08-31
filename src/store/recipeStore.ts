@@ -21,6 +21,10 @@ export interface RecipeTarget {
   model?: string;
   ollama?: string;
   local_url?: string;
+  /** A model id installed in this machine's managed runtime hub, served by the
+   * app's own runtime for the life of the run — how a task names the local
+   * runtime, whose origin does not exist until the run starts. */
+  managed_model?: string;
 }
 
 export interface RecipeOutput {

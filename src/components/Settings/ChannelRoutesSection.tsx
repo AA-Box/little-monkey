@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Loader2, Pencil, Plus, Power, Trash2, X } from "lucide-react";
 import {
   type ChannelAccount,
@@ -17,6 +17,8 @@ import {
 import { Button } from "../ui";
 import { errorMessage } from "../../lib/errors";
 import { useT } from "../../lib/i18n";
+import { useRecipeStore } from "../../store/recipeStore";
+import { ensureStarterChannelRoute, ensureStarterRecipe } from "../../lib/starterChannelRoute";
 
 const INPUT =
   "w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground outline-none focus:ring-1 focus:ring-accent";
@@ -231,6 +233,13 @@ export function ChannelRoutesSection({
     senders: [],
   });
 
+  // The tasks a route may name. Offered as a list rather than typed: the
+  // daemon resolves a route's recipe by name at message time, so a typo is
+  // not refused here — it is a message that arrives, fails, and is only
+  // explicable from the event log.
+  const recipes = useRecipeStore((state) => state.recipes);
+  const refreshRecipes = useRecipeStore((state) => state.refresh);
+
   const load = useCallback(async () => {
     try {
       const listed = await channelsRoutes();
@@ -243,7 +252,18 @@ export function ChannelRoutesSection({
 
   useEffect(() => {
     void load();
-  }, [load]);
+    void refreshRecipes();
+  }, [load, refreshRecipes]);
+
+  const recipeNames = useMemo(
+    () => [
+      ...new Set(
+        recipes.flatMap((entry) => (entry.recipe && !entry.error ? [entry.recipe.name] : [])),
+      ),
+    ].sort(),
+    [recipes],
+  );
+
 
   // Recent activity for whichever account the draft names: the observed
   // conversation, thread and sender ids an operator can pick from instead of
@@ -296,6 +316,23 @@ export function ChannelRoutesSection({
     [load, onChanged],
   );
 
+  // A connected account with no route accepts messages and runs nothing, so
+  // the first route is created rather than waited for. Once per mount and only
+  // while there are no routes at all: an operator who deletes their last route
+  // inside this screen is not immediately given another one.
+  const setUpFirstRoute = useRef(false);
+  useEffect(() => {
+    if (setUpFirstRoute.current || routes === null || routes.length > 0) return;
+    // Never over the top of an operator who is already writing one.
+    if (draft !== null) return;
+    const ready = accounts.some(
+      (account) => account.enabled && (account.has_credential || !account.credential_required),
+    );
+    if (!ready) return;
+    setUpFirstRoute.current = true;
+    void run("starter", ensureStarterChannelRoute);
+  }, [accounts, draft, routes, run]);
+
   const ordered = useMemo(
     () =>
       [...(routes ?? [])].sort((left, right) => {
@@ -336,7 +373,18 @@ export function ChannelRoutesSection({
           {t("ChannelsPanel.loading")}
         </p>
       ) : ordered.length === 0 ? (
-        <p className="mt-3 text-xs text-muted">{t("ChannelsPanel.noRoutesYet")}</p>
+        <div className="mt-3 flex flex-col items-start gap-2">
+          <p className="text-xs text-muted">{t("ChannelsPanel.noRoutesYet")}</p>
+          <Button
+            size="sm"
+            disabled={busy !== null}
+            onClick={() => void run("starter", ensureStarterChannelRoute)}
+          >
+            {busy === "starter" ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
+            {t("ChannelsPanel.starterRoute")}
+          </Button>
+          <span className="text-xs text-faint">{t("ChannelsPanel.starterRouteHint")}</span>
+        </div>
       ) : (
         <ul className="mt-3 flex flex-col gap-2">
           {ordered.map((route) => (
@@ -401,15 +449,51 @@ export function ChannelRoutesSection({
           </div>
 
           <div className="mt-3 grid gap-2 sm:grid-cols-2">
-            <label className="text-xs text-muted">
-              {t("ChannelsPanel.recipe")}
-              <input
-                className={`${INPUT} mt-1`}
-                value={draft.recipe}
-                onChange={(event) => setDraft({ ...draft, recipe: event.target.value })}
-                placeholder="chat"
-              />
-            </label>
+            <div>
+              <label className="text-xs text-muted">
+                {t("ChannelsPanel.recipe")}
+                <select
+                  className={`${INPUT} mt-1`}
+                  value={draft.recipe}
+                  onChange={(event) => setDraft({ ...draft, recipe: event.target.value })}
+                >
+                  <option value="">{t("ChannelsPanel.recipePick")}</option>
+                  {/* A route saved against a task that has since been renamed
+                      or deleted keeps naming it here, rather than silently
+                      reading as some other task the moment it is opened. */}
+                  {draft.recipe.length > 0 && !recipeNames.includes(draft.recipe) && (
+                    <option value={draft.recipe}>
+                      {t("ChannelsPanel.recipeMissingOption", { name: draft.recipe })}
+                    </option>
+                  )}
+                  {recipeNames.map((name) => (
+                    <option key={name} value={name}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {draft.recipe.length > 0 && !recipeNames.includes(draft.recipe) && (
+                <span className="mt-1 block text-xs text-warning">
+                  {t("ChannelsPanel.recipeMissing")}
+                </span>
+              )}
+              {recipeNames.length === 0 && (
+                <Button
+                  size="sm"
+                  className="mt-2"
+                  disabled={busy !== null}
+                  onClick={() =>
+                    void run("starter-recipe", async () =>
+                      setDraft({ ...draft, recipe: await ensureStarterRecipe() }),
+                    )
+                  }
+                >
+                  <Plus size={12} />
+                  {t("ChannelsPanel.starterRecipe")}
+                </Button>
+              )}
+            </div>
             <label className="text-xs text-muted">
               {t("ChannelsPanel.scope")}
               <select
