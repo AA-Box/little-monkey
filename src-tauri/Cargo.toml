@@ -298,8 +298,8 @@ mime = "0.3"
 # Executable extensions are WebAssembly components only. Keep Wasmtime's
 # optional surface narrow: no cache/profiling/debug-server/native plugin path,
 # and Preview 2 is the sole WASI ABI linked into extension stores.
-wasmtime = { version = "=47.0.3", default-features = false, features = ["async", "cranelift", "component-model", "runtime", "std"] }
-wasmtime-wasi = { version = "=47.0.3", default-features = false, features = ["p2"] }
+wasmtime = { version = "=47.0.4", default-features = false, features = ["async", "cranelift", "component-model", "runtime", "std"] }
+wasmtime-wasi = { version = "=47.0.4", default-features = false, features = ["p2"] }
 
 # model_sources.rs: advisory cross-process install locks on macOS/Linux keep
 # desktop and CLI pulls from mutating the same resumable partial download.
