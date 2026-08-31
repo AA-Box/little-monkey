@@ -578,7 +578,10 @@ fn check_resource_limits(
             *held = Some(sample);
         }
     };
-    match controller.check(now_ms().ok()? as i64) {
+    // Bound before the `match` so the mutable borrow ends here: the arms below
+    // ask the same controller what it has recorded.
+    let checked = controller.check(now_ms().ok()? as i64);
+    match checked {
         // The tree is already reclaimed by `check`: a bound that reports a breach
         // and leaves the workload running has reclaimed nothing.
         Ok(ResourceCheck::Breached { breach, sample }) => {
@@ -592,12 +595,16 @@ fn check_resource_limits(
         Ok(ResourceCheck::Gone) => None,
         Err(error) => {
             eprintln!("background shell: could not check a command against its limits: {error}");
-            None
+            // A `check` that found a breach and then could not finish reclaiming
+            // the tree fails here, and the breach it found is the reason the tree
+            // is going. Reporting `None` dropped it, and the exit this loop
+            // observed a moment later was written down as an ordinary failure.
+            controller.recorded_breach()
         }
     }
 }
 
-/// Why this command became terminal, when the mechanism has an answer.
+/// Why this command became terminal, when its bounds have an answer.
 ///
 /// Asked *before* the exit status is classified, and that order is the whole
 /// point. A kernel limit fires, refuses the work, and the child becomes terminal
@@ -606,17 +613,31 @@ fn check_resource_limits(
 /// that ordinary failure, which is the same mistake in a different shape: the
 /// limit worked and the app could not say so.
 ///
-/// This is the rule [`crate::resource_control::run_under`] already applies to the
-/// foreground shell, through the same controller call.
+/// # Two questions, because one of them cannot be asked twice
+///
+/// [`crate::resource_control::ResourceController::mechanism_breach`] is the rule
+/// [`crate::resource_control::run_under`] already applies to the foreground
+/// shell, and it is the only one a *kernel* bound answers. It is also structurally
+/// silent on the supervisor — the backend macOS always uses and the fallback
+/// everywhere else — because a supervised bound is not a counter to read back but
+/// a comparison against a live tree, made by the loop above and made once. By the
+/// time this is asked the tree is gone and nothing can find it again.
+///
+/// So the controller's own record is consulted too. Without it the ordering
+/// between the two observations decided the answer: a tree that crossed its
+/// budget and became terminal before the next tick — or one whose breach was
+/// found and then lost to a reclaim that reported a survivor — was classified
+/// from the exit status alone, and `137` reads exactly like a command that failed.
 fn terminal_resource_breach(
     process: &Arc<BackgroundProcess>,
 ) -> Option<crate::resource_control::LimitBreach> {
     let mut controller = process.controller.lock().ok()?;
-    match controller.mechanism_breach(now_ms().ok()? as i64) {
-        Ok(breach) => breach,
+    let asked = controller.mechanism_breach(now_ms().ok()? as i64);
+    match asked {
+        Ok(breach) => breach.or_else(|| controller.recorded_breach()),
         Err(error) => {
             eprintln!("background shell: could not ask the mechanism why a command ended: {error}");
-            None
+            controller.recorded_breach()
         }
     }
 }
@@ -1438,6 +1459,29 @@ mod tests {
             }
         }
 
+        /// The tree budget the memory tests install, and the hog they run against
+        /// it.
+        ///
+        /// Three constraints fix these numbers, and the third is why they are not
+        /// larger:
+        ///
+        /// - **Above the baseline.** The workload is this test binary re-executed,
+        ///   which resides at roughly 17 MiB before it allocates anything. The
+        ///   ceiling clears that several times over, so the binary's own footprint
+        ///   can never be the thing that trips the bound — a pass for the wrong
+        ///   reason, and indistinguishable from the real one in the row.
+        /// - **Held, not grazed.** The hog touches every page and then sleeps 30
+        ///   seconds, so the tree sits at about twice the ceiling for that whole
+        ///   window. A 100 ms sampler cannot miss it.
+        /// - **Not the largest thing on the host.** A workload that makes itself
+        ///   the machine's biggest memory user invites the OS's own low-memory
+        ///   killer to end the tree first, and that arrives as an ordinary exit
+        ///   rather than as this budget firing — a green enforcement path
+        ///   reported as a plain failure. Halving the peak keeps the test out of
+        ///   that role on a loaded machine.
+        const MEMORY_CEILING: u64 = 128 * 1024 * 1024;
+        const HOG_MIB: usize = 256;
+
         /// A: a grandchild outgrows the budget, the whole tree goes, and the row
         /// says `limit_exceeded` with both numbers.
         #[test]
@@ -1447,7 +1491,7 @@ mod tests {
             }
             let harness = Harness::create();
             let hog = format!(
-                "LITTLE_MONKEY_MEMORY_HOG_MIB=512 {} --exact \
+                "LITTLE_MONKEY_MEMORY_HOG_MIB={HOG_MIB} {} --exact \
                  workspace_shell::tests::memory_hog_child --test-threads=1 >/dev/null 2>&1",
                 quote(&place_test_binary_in(&harness.workspace, "bg-memory-hog"))
             );
@@ -1455,7 +1499,7 @@ mod tests {
                 .start(
                     &hog,
                     ProcessLimits {
-                        max_memory_bytes: Some(192 * 1024 * 1024),
+                        max_memory_bytes: Some(MEMORY_CEILING),
                         ..ProcessLimits::default()
                     },
                 )
@@ -1471,7 +1515,7 @@ mod tests {
             );
             let breach = exit.breach.expect("a limit kill carries its typed breach");
             assert_eq!(breach.limit, "max_memory_bytes");
-            assert_eq!(breach.configured, 192 * 1024 * 1024);
+            assert_eq!(breach.configured, MEMORY_CEILING);
             assert_real_backend(&breach);
             assert!(
                 crate::process_tree::measure_tree(native_pid)

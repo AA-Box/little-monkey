@@ -107,6 +107,23 @@ monkey skills learned mode [off|suggest-only|auto-stage|auto-promote-safe]
 # isolated executor, which really runs the arms in disposable workspace copies,
 # produces a promotion-grade pass.
 
+monkey standards discover [--dry-run] [--json]
+monkey standards list | show <id> [--json]
+monkey standards approve <id> | reject <id>
+monkey standards drift [--no-write] | conflicts
+monkey standards preview "<task>" [--file <path>]
+monkey standards import <path> | export [path]
+
+monkey extensions init <dir> --id <id> --name <name> --template <template> --publisher <name>
+monkey extensions dev <dir> [--capability <id> --input '<json>'] [--once]
+monkey extensions test <dir> [--json]
+monkey extensions validate <project-or-installed-id>
+monkey extensions pack <dir> --output <file.lmx> [--json]
+monkey extensions sign <file.lmx> --private-key <pem> --trust-root-id <id> --key-id <id>
+monkey extensions publish <dir> --snapshot <index.json> --registry-root <dir> --publisher-private-key <pem> --trust-root-id <id> --key-id <id> --registry-private-key <pem>
+
+monkey providers set-key <id>    # key arrives on stdin, never in a process listing
+
 monkey plugins list [--json]
 monkey plugins health [--json]
 monkey security audit [--deep] [--fix] [--json]
@@ -144,7 +161,14 @@ monkey daemon remote push-status [--json] | push-disable | push-test <device-id>
 ```
 
 The `device-*`, `voice-*` and `push-*` commands are documented in
-[Paired devices](paired-devices.md).
+[Paired devices](paired-devices.md). The `standards` lifecycle is documented in
+[Standards Studio](standards-studio.md) — the CLI reads and writes the same
+`.little-monkey/standards/index.json` document as the desktop Studio. The
+`extensions` developer loop is documented in
+[Extension development](extension-development.md). Credential-writing commands
+(`providers set-key` and the channel/carrier/tunnel `set-token` family) read
+the secret from stdin so the keychain entry is created by the same binary the
+resident daemon reads it from.
 
 In the REPL, `/help` lists terminal-only controls such as `/set`, `/show`, `/save`, `/load`, `/revert`, `/persona`, `/prompts`, `/verify`, `/clear`, and `/bye`. Installed skill invocations use the same frozen, turn-scoped prompt composition as desktop chat.
 

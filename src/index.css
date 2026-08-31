@@ -248,12 +248,17 @@ body {
 
 ::selection { background-color: var(--color-accent-soft); }
 
-/* Settings uses one comfortable height for its interactive controls.
- * Checkboxes, switches, and multiline fields keep their purpose-built sizes. */
+/* Settings uses one comfortable height for its single-line text fields and
+ * selects. Checkboxes, switches, ranges, and textareas keep their purpose-built
+ * sizes. Buttons stay out on purpose: `:where()` contributes no specificity, so
+ * this rule ties with Tailwind's `h-*`/`min-h-*` utilities and wins on source
+ * order alone (utilities come from the `@import` above). Including buttons here
+ * flattened Button's h-7/h-8/h-9 scale, stretched square IconButtons into
+ * slivers, and pinned the multi-line option cards to 2.75rem so their
+ * descriptions spilled onto the row below. */
 .settings-controls :where(
   input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="hidden"]):not([type="color"]),
-  select,
-  button:not([role="switch"])
+  select
 ) {
   height: 2.75rem;
   min-height: 2.75rem;
