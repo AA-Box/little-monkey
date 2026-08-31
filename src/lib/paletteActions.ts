@@ -23,6 +23,7 @@ import { runAgentTurn } from "./agentLoop";
 import { runRecipeNow } from "./recipeRunner";
 import { wrapUntrustedContent } from "./untrustedContent";
 import { buildModelTargetInventory, findActiveModelTarget, type ModelTargetSnapshot } from "./modelTargets";
+import { runtimeHubClient } from "./runtimeHubClient";
 import { beginDurableRun } from "./durableRun";
 import { useSessionStore } from "../store/sessionStore";
 import { useModelStore } from "../store/modelStore";
@@ -169,45 +170,112 @@ function yamlScalar(value: string): string {
   return JSON.stringify(value);
 }
 
+/** The `target:` block of a saved recipe, as YAML.
+ *
+ * A recipe target names an Ollama tag, a cloud provider's model, or a model
+ * installed in this machine's managed runtime hub (`managed_model`) — never
+ * the desktop's ad-hoc local runtime, whose origin does not exist until a run
+ * starts. So a local selection is not a dead end: the same artifact is usually
+ * a hub install, and the hub's own id is what a recipe can name. Only a local
+ * GGUF that was never installed through the hub has nothing to point at, and
+ * that falls through to whatever else is configured rather than refusing to
+ * save.
+ */
+async function recipeTargetYaml(): Promise<string> {
+  const modelState = useModelStore.getState();
+  const inventory = buildModelTargetInventory(modelState);
+  const active = findActiveModelTarget(inventory, modelState);
+  const nameable = (target: ModelTargetSnapshot | null | undefined) =>
+    target && target.kind !== "local"
+      ? target.kind === "ollama"
+        ? `ollama: ${yamlScalar(target.model)}`
+        : `provider: ${yamlScalar(target.providerId)}\n  model: ${yamlScalar(target.model)}`
+      : null;
+
+  const chosen = nameable(active);
+  if (chosen) return chosen;
+
+  // Installed hub models, keyed by the artifact each one's active version
+  // serves — the only honest way to say "the local model that is selected" in
+  // a recipe. An installation with no hub answers with nothing rather than
+  // failing the save.
+  const installed = await runtimeHubClient
+    .installedModels()
+    .catch(() => [] as Awaited<ReturnType<typeof runtimeHubClient.installedModels>>);
+  const hubModels = Array.isArray(installed) ? installed : [];
+  if (active?.kind === "local") {
+    const match = hubModels.find((model) =>
+      model.versions.some(
+        (version) => version.active && version.artifactPath === active.modelPath,
+      ),
+    );
+    if (match) return `managed_model: ${yamlScalar(match.modelId)}`;
+  }
+
+  // Nothing the selection itself can name: fall back to anything configured,
+  // so the task saves and can be repointed in Settings > Tasks.
+  const fallback = nameable(inventory.targets.find((target) => target.kind !== "local"));
+  if (fallback) return fallback;
+  if (hubModels[0]) return `managed_model: ${yamlScalar(hubModels[0].modelId)}`;
+
+  throw new Error(
+    "Saved tasks need a model: select an Ollama or cloud-provider model, or install one in Settings > Runtime hub.",
+  );
+}
+
 /** Creates a new recipe ("task") from the palette, saved through the exact
  * same `recipes_save` command Settings > Tasks' recipe editor uses — the
  * result is an ordinary recipe file, immediately visible/runnable/
- * schedulable there, not a separate palette-only record. */
-export async function runCreateTask(name: string, prompt: string): Promise<Recipe> {
+ * schedulable there, not a separate palette-only record.
+ *
+ * `params` declares the recipe's `{{param}}` inputs. A caller that renders one
+ * has to declare it: a param supplied at run time but undeclared is refused
+ * outright (`recipes::resolve_param_values`), which is what a channel route
+ * hands its recipe as `message`. */
+export async function runCreateTask(
+  name: string,
+  prompt: string,
+  options: {
+    params?: Record<string, string>;
+    description?: string;
+    /** Mode the saved task runs under, when it must not inherit whatever the
+     * app happens to be set to — an unattended task answering strangers is
+     * not the place to pick up `auto`. */
+    permissionMode?: string;
+    /** System prompt for the saved task. */
+    system?: string;
+  } = {},
+): Promise<Recipe> {
   const trimmedName = name.trim();
   const trimmedPrompt = prompt.trim();
   if (!trimmedName) throw new Error("Give the task a name.");
   if (!trimmedPrompt) throw new Error("Give the task something to do.");
 
-  const modelState = useModelStore.getState();
-  const inventory = buildModelTargetInventory(modelState);
-  const active = findActiveModelTarget(inventory, modelState);
-  if (!active || active.kind === "local") {
-    throw new Error(
-      "Saved tasks need an Ollama or cloud-provider model selected — switch off the local runtime first.",
-    );
-  }
-  const targetYaml =
-    active.kind === "ollama"
-      ? `ollama: ${yamlScalar(active.model)}`
-      : `provider: ${yamlScalar(active.providerId)}\n  model: ${yamlScalar(active.model)}`;
-  const permissionMode = usePermissionStore.getState().mode;
+  const targetYaml = await recipeTargetYaml();
+  const permissionMode = options.permissionMode ?? usePermissionStore.getState().mode;
   // Recipes reject `bypass` outright (see `recipeRunner.ts::assertValidMode`)
   // — falling back to `manual` here means a task created while the app
   // happens to be in bypass mode still saves successfully, just under the
   // safest mode, rather than failing the save entirely.
   const safeMode = permissionMode === "bypass" ? "manual" : permissionMode;
 
+  const params = options.params ?? {};
+  const paramEntries = Object.entries(params);
   const yaml = [
     "version: 1",
     `name: ${yamlScalar(trimmedName)}`,
-    `description: ${yamlScalar("Created from the Global Command Palette")}`,
+    `description: ${yamlScalar(options.description ?? "Created from the Global Command Palette")}`,
     "target:",
     `  ${targetYaml}`,
     `permission_mode: ${safeMode}`,
+    ...(options.system
+      ? ["system: |", ...options.system.split("\n").map((line) => `  ${line}`)]
+      : []),
     "prompt: |",
     ...trimmedPrompt.split("\n").map((line) => `  ${line}`),
-    "params: {}",
+    ...(paramEntries.length === 0
+      ? ["params: {}"]
+      : ["params:", ...paramEntries.map(([key, value]) => `  ${yamlScalar(key)}: ${yamlScalar(value)}`)]),
   ].join("\n");
 
   return useRecipeStore.getState().save(trimmedName, yaml);
