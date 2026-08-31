@@ -6,6 +6,7 @@ and where the code lives.
 ## Prerequisites
 
 - Node.js, `pnpm`, Rust, Cargo, and the Tauri 2 prerequisites for your platform.
+- `cmake` and `libclang` — the built-in local Whisper engine compiles `whisper.cpp` through `whisper-rs-sys`, which drives cmake and generates bindings with bindgen. Release bundles ship the pinned Whisper model; source trees stage it with `pnpm stage:whisper` (without it, the app provisions the same pinned, SHA-256-verified model at launch instead).
 - Desktop releases include a pinned, checksum-verified `llama.cpp` runtime. Source builds stage the same official runtime before `tauri dev` and `tauri build`; a system `llama-server` is a development fallback only.
 - Studio generation (optional): the managed `sd-server` and `llama-tts` runtimes, staged with `pnpm stage:runtime:sd` and `pnpm stage:runtime:tts`. `sd-server` exists for Apple Silicon (Metal), x86_64 Linux (Vulkan), and x86_64 Windows (Vulkan) only. Model weights are yours to supply.
 - Ollama runtime (optional): reachable at `http://127.0.0.1:11434` for the explicit Ollama provider or daemon-management commands.
@@ -91,7 +92,8 @@ LITTLE_MONKEY_COMPLETION_MODEL='your-exact-fim-tag' npm run benchmark:completion
 
 ## Model setup
 
-1. **App-owned local model** — **Settings → Local Models → Add custom model**: enter an Ollama tag such as `llama3.2:3b` or a Hugging Face reference such as `hf.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF:Q4_K_M`, review the resolved file, size, license, and digest metadata, then install and start. No Ollama installation required.
+0. **From the composer** — the model picker above the composer is searchable across local, Ollama, and provider models and adds a new one inline, so none of the steps below require opening Settings first.
+1. **App-owned local model** — **Settings → Local Models → Add custom model**: enter an Ollama tag such as `llama3.2:3b`, a Hugging Face reference such as `hf.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF:Q4_K_M`, or a Hugging Face MLX safetensors repository URL (the `/tree/<revision>` form works), review the resolved file, size, license, and digest metadata, then install and start. No Ollama installation required.
 2. **User-managed Ollama** — **Settings → Ollama**: confirm the daemon is reachable, pull or import a model, and select it.
 3. **Cloud or BYOK** — **Settings → AI Providers**: store the key, refresh the model list, and select a model.
 4. **MLX** — **Settings → Runtime Hub → Runtimes**: the signed Apple Silicon runtime is fetched and installed automatically when needed.

@@ -71,7 +71,7 @@ choice and bounded observe/authorize/execute/verify phases.
 | macOS | System Events / Accessibility, normalized and bounded | Accessibility is required for input/tree access; Screen Recording is required for screenshots; the target must remain visible/frontmost |
 | Windows | UI Automation, normalized and bounded | Every target is checked with `GetWindowThreadProcessId` → `OpenProcessToken(TokenIntegrityLevel)` against the current process; native scripts use `SetThreadDpiAwarenessContext(PER_MONITOR_AWARE_V2)` and `GetDpiForWindow`; higher-integrity targets fail closed |
 | Linux/X11 | AT-SPI when `pyatspi` is available | enigo plus bounded `scrot`/ImageMagick region capture; missing providers return a typed error |
-| Linux/Wayland | No compositor bypass | Requires an approved xdg-desktop-portal RemoteDesktop/InputCapture/libei path; Little Monkey refuses to bypass Wayland security |
+| Linux/Wayland | AT-SPI when `pyatspi` is available | Compositor-mediated xdg-desktop-portal `RemoteDesktop`/`ScreenCast`/`Screenshot`: the portal owns the consent dialog, input uses the standard D-Bus `Notify*` transport (`ConnectToEIS` is never called, so the mutually exclusive transports cannot mix), capture is the active window, and a desktop without those portals fails closed — no XWayland or uinput fallback |
 
 Remote desktop control uses the existing paired-runner path. The runner must
 obtain local consent, hold the same machine-wide control lock, enforce the
