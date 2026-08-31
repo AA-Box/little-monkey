@@ -658,6 +658,19 @@ pub struct ResourceController {
     /// Kept so a tick that discovers nothing new writes nothing at all: the
     /// journal is consulted when the owned set *grows*, not on the clock.
     journalled: BTreeSet<(u32, u64)>,
+    /// The first bound this workload was ever found past.
+    ///
+    /// Kept because finding one is not repeatable. A supervised bound is found by
+    /// comparing a *live* tree against a budget, and the act of finding it
+    /// reclaims that tree — so the owner that later notices the workload is
+    /// terminal is asking a question nothing can answer a second time. Without
+    /// this, that owner had only the exit status to go on and wrote a working
+    /// budget down as an ordinary failure.
+    ///
+    /// First writer wins, on the same rule the browser session's own record
+    /// keeps: the bound that fired first is the cause, and anything a
+    /// half-reclaimed tree crosses afterwards is a consequence of the teardown.
+    found_breach: Option<LimitBreach>,
     /// The job handle a managed Windows spawn created the workload into.
     ///
     /// Held for the controller's life because a job dies with its last handle
@@ -718,6 +731,7 @@ impl ResourceController {
             session: None,
             journal: None,
             journalled: BTreeSet::new(),
+            found_breach: None,
             #[cfg(windows)]
             spawn_job: None,
         }
@@ -1383,8 +1397,35 @@ impl ResourceController {
         let Some(breach) = self.poll_limit_events(now_ms)? else {
             return Ok(None);
         };
+        let breach = self.remember_breach(breach);
         self.terminate_tree()?;
         Ok(Some(breach))
+    }
+
+    /// Keep the first bound this workload was found past, and answer with it.
+    ///
+    /// Called *before* the reclaim a breach triggers, and that order is the whole
+    /// point: [`Self::terminate_tree`] reports a survivor it could not signal as
+    /// an error, and the `?` on that error used to throw away the only record of
+    /// why the tree was being torn down at all. The owner that reaped it a tick
+    /// later then had nothing to consult and wrote the kill down as an ordinary
+    /// failure — the exact confusion the process table's `limit_exceeded` exit
+    /// exists to prevent.
+    fn remember_breach(&mut self, breach: LimitBreach) -> LimitBreach {
+        self.found_breach.get_or_insert(breach).clone()
+    }
+
+    /// The bound this workload was found past, if one ever was.
+    ///
+    /// **The question an owner must ask before it classifies a terminal
+    /// workload**, alongside [`Self::mechanism_breach`]. The two cover different
+    /// halves and neither covers both: a kernel mechanism keeps its own counter
+    /// and can still be asked after the fact, while a supervised bound is found
+    /// by comparison against a live tree and can only ever be found once. This is
+    /// what that one finding leaves behind.
+    #[must_use]
+    pub fn recorded_breach(&self) -> Option<LimitBreach> {
+        self.found_breach.clone()
     }
 
     /// The whole "is this workload still allowed to run" question, in one call.
@@ -1410,6 +1451,7 @@ impl ResourceController {
             return Ok(ResourceCheck::Gone);
         };
         if let Some(breach) = self.breach(&sample, now_ms) {
+            let breach = self.remember_breach(breach);
             self.terminate_tree()?;
             return Ok(ResourceCheck::Breached {
                 breach,
@@ -1669,6 +1711,23 @@ where
 /// bookkeeping write that could delay or fail the next resource check would put
 /// the ledger in front of the bound. Every implementation is expected to be
 /// fail-soft in the way [`crate::bounded_execution::BoundedExecution`] is.
+///
+/// # A failed reclaim is not an error once a bound has fired
+///
+/// [`ResourceController::terminate_tree`] reports a member that outlived its
+/// termination passes as an error, and that error surfaces from the same calls
+/// that *find* a breach — both of which reclaim the tree as part of finding one.
+/// Propagating it handed every caller here an anonymous `io::Error` for the one
+/// outcome they have typed fields for: the foreground shell's row closed as an
+/// ordinary "Failed to run command" with `limit_breach: None`, which is the
+/// working budget reported as an unexplained failure.
+///
+/// So when [`ResourceController::recorded_breach`] says a bound was found, that
+/// is what this returns — [`Supervised::Breached`], with the reclaim's failure
+/// written to stderr rather than handed back. The caller's contract is therefore
+/// narrower than the underlying calls': an `Err` from here means nothing was
+/// found past a bound. A survivor is a containment problem worth a log line, not
+/// a reason to lose the reason.
 pub async fn run_under_observed<F>(
     controller: &mut ResourceController,
     work: F,
@@ -1699,28 +1758,59 @@ where
                 // only record of *why* is the backend's own counter. Ask before
                 // believing the exit — otherwise the strongest enforcement this
                 // app has is also the enforcement it can never name.
-                if let Some(breach) = controller.mechanism_breach(now_ms())? {
-                    return Ok(Supervised::Breached(breach, last));
+                //
+                // Bound before the `match` so the mutable borrow ends here: the
+                // arms below ask the same controller what it has recorded.
+                let asked = controller.mechanism_breach(now_ms());
+                match asked {
+                    Ok(Some(breach)) => return Ok(Supervised::Breached(breach, last)),
+                    Ok(None) => {}
+                    Err(error) => return breached_despite_the_reclaim(controller, error, last),
                 }
                 return Ok(Supervised::Completed(output, last));
             }
             _ = ticker.tick() => {
-                match controller.check(now_ms())? {
-                    ResourceCheck::Breached { breach, sample } => {
+                let checked = controller.check(now_ms());
+                match checked {
+                    Ok(ResourceCheck::Breached { breach, sample }) => {
                         return Ok(Supervised::Breached(breach, sample.unwrap_or(last)));
                     }
-                    ResourceCheck::Running(sample) => {
+                    Ok(ResourceCheck::Running(sample)) => {
                         observe(&sample);
                         last = sample;
                     }
                     // The workload is gone but `work` has not resolved yet —
                     // usually a pipe still draining. Keep waiting for it rather
                     // than reporting a breach against a corpse.
-                    ResourceCheck::Gone => continue,
+                    Ok(ResourceCheck::Gone) => continue,
+                    Err(error) => return breached_despite_the_reclaim(controller, error, last),
                 }
             }
         }
     }
+}
+
+/// What [`run_under_observed`] answers when a check failed on its way out.
+///
+/// Both calls it makes on a tick find a breach and reclaim the tree in one step,
+/// so their `Err` is ambiguous by construction: it is either "nothing could be
+/// checked" or "a bound fired and a member survived the teardown". Only the
+/// controller's record tells them apart, and only the second is worth keeping —
+/// the survivor is a containment failure to log, while the breach is the fact
+/// four callers use to type the row.
+fn breached_despite_the_reclaim<T>(
+    controller: &ResourceController,
+    error: io::Error,
+    last: ResourceSample,
+) -> io::Result<Supervised<T>> {
+    let Some(breach) = controller.recorded_breach() else {
+        return Err(error);
+    };
+    eprintln!(
+        "resource control: {} fired, and reclaiming the workload's tree did not finish: {error}",
+        breach.limit
+    );
+    Ok(Supervised::Breached(breach, last))
 }
 
 /// The limit set to ask a host "what would you hold a workload with".
@@ -2970,6 +3060,74 @@ mod tests {
             self.sessions.lock().expect("not poisoned").push(session);
             Ok(())
         }
+    }
+
+    /// The record an owner reads once the workload it bounded is terminal.
+    ///
+    /// A supervised bound is not a counter that can be read back — it is a
+    /// comparison against a *live* tree, and making it reclaims that tree. So the
+    /// finding happens exactly once, and the owner that later notices the workload
+    /// has become terminal is asking a question nothing can answer again: the
+    /// mechanism is silent on this backend by construction, and there is no tree
+    /// left to measure. Without this record that owner has only the exit status,
+    /// and a tree the budget killed exits `137` — indistinguishable from a command
+    /// that simply failed.
+    #[cfg(unix)]
+    #[test]
+    fn a_breach_stays_readable_once_the_tree_it_reclaimed_is_gone() {
+        use std::process::{Command, Stdio};
+
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        // Wall rather than memory, because it is the one bound every host
+        // measures and the supervisor always holds — so this asserts the record,
+        // not the machine.
+        let mut controller = ResourceController::new(EffectiveLimits::resolve(&[LimitLayer::new(
+            LimitSource::UserOverride,
+            limits(Some(1), None),
+        )]));
+        controller
+            .prepare_std(&mut command)
+            .expect("the containment is installable");
+        let mut child = command.spawn().expect("the shell starts");
+        controller.attach(child.id()).expect("the shell attaches");
+        assert_eq!(
+            controller.recorded_breach(),
+            None,
+            "nothing has been found past a bound yet"
+        );
+
+        // `attach` restarts the wall clock, so the budget is crossed here and not
+        // by whatever the test spent getting to this line.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let checked = controller
+            .check(now_ms_for_breach())
+            .expect("the check runs");
+        let ResourceCheck::Breached { breach, .. } = checked else {
+            panic!("a workload past its wall budget is breached: {checked:?}");
+        };
+        assert_eq!(breach.limit, "max_wall_ms");
+        let _ = child.wait();
+
+        // The two questions a reaper asks, in the order it asks them.
+        assert_eq!(
+            controller
+                .mechanism_breach(now_ms_for_breach())
+                .expect("the mechanism answers"),
+            None,
+            "a supervised bound leaves no counter for the mechanism to report"
+        );
+        assert_eq!(
+            controller.recorded_breach(),
+            Some(breach),
+            "the only thing left that says why this tree was reclaimed"
+        );
     }
 
     /// Ownership is durable from the attach onwards, and each identity is handed
