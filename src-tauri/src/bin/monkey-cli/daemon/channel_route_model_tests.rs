@@ -457,3 +457,62 @@ fn a_route_naming_a_missing_recipe_freezes_nothing() {
         super::freeze_execution_for(&route.target, Some(&route.route_id), &roots, None).unwrap_err();
     assert!(error.contains("not-saved"), "{error}");
 }
+
+/// A route may name a recipe written as JSON or in flow-style YAML, because
+/// `RECIPE_EXTENSIONS` accepts `json` and YAML has more than one way to write a
+/// mapping. Both are discovered, frozen and run like any other — so both have
+/// to be changeable, or the picker is a control that silently does not apply to
+/// some of the operator's own files.
+#[test]
+fn a_json_or_flow_style_recipe_changes_model_through_the_same_chain() {
+    let root = temp_root("formats");
+    let roots = vec![root.clone()];
+
+    std::fs::write(
+        root.join("recipes").join("channel-json.json"),
+        "{\n  \"version\": 1,\n  \"name\": \"channel-json\",\n  \"target\": { \"managed_model\": \"Qwen2.5-7B-Instruct\" },\n  \"permission_mode\": \"plan\",\n  \"prompt\": \"{{message}}\",\n  \"params\": { \"message\": \"\" }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("recipes").join("channel-flow.yml"),
+        "version: 1\nname: \"channel-flow\"\ntarget: {ollama: \"qwen2.5:7b\"}\npermission_mode: plan\nprompt: \"{{message}}\"\nparams:\n  \"message\": \"\"\n",
+    )
+    .unwrap();
+
+    for (recipe, before, after, expected) in [
+        (
+            "channel-json",
+            "managed:Qwen2.5-7B-Instruct",
+            RecipeTarget {
+                provider: Some("openrouter".into()),
+                model: Some("anthropic/claude-sonnet-4".into()),
+                ..Default::default()
+            },
+            "provider:openrouter/anthropic/claude-sonnet-4",
+        ),
+        (
+            "channel-flow",
+            "ollama:qwen2.5:7b",
+            RecipeTarget {
+                managed_model: Some("Llama-3.1-8B-Instruct".into()),
+                ..Default::default()
+            },
+            "managed:Llama-3.1-8B-Instruct",
+        ),
+    ] {
+        let routes = vec![global_route(recipe)];
+        let (frozen, _, _) = resolve_through_the_daemon(&routes, &roots);
+        assert_eq!(frozen, before, "{recipe} starts where its file says");
+
+        recipes::set_recipe_target(recipe, None, &roots, &after)
+            .unwrap_or_else(|error| panic!("{recipe} must be changeable: {error}"));
+
+        let (frozen, resolved, parsed) = resolve_through_the_daemon(&routes, &roots);
+        assert_eq!(frozen, expected);
+        assert_eq!(backend_description(&resolved), expected);
+        // The rest of the recipe came through the rewrite intact.
+        assert_eq!(parsed.permission_mode, "plan");
+        assert_eq!(parsed.prompt.trim(), "{{message}}");
+        assert!(parsed.params.contains_key("message"));
+    }
+}

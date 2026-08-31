@@ -1866,23 +1866,87 @@ fn yaml_scalar(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
 }
 
+/// The key/value pairs a validated target is made of, in the order they are
+/// written. One source of truth for the XOR, so the YAML block and the JSON
+/// object cannot drift into disagreeing about which fields a target has.
+fn target_fields(target: &RecipeTarget) -> Vec<(&'static str, &str)> {
+    let mut fields = Vec::new();
+    if let Some(provider) = &target.provider {
+        fields.push(("provider", provider.as_str()));
+        if let Some(model) = &target.model {
+            fields.push(("model", model.as_str()));
+        }
+    } else if let Some(ollama) = &target.ollama {
+        fields.push(("ollama", ollama.as_str()));
+    } else if let Some(local_url) = &target.local_url {
+        fields.push(("local_url", local_url.as_str()));
+    } else if let Some(managed_model) = &target.managed_model {
+        fields.push(("managed_model", managed_model.as_str()));
+    }
+    fields
+}
+
 /// The `target:` block body for a validated target, indented two spaces, no
 /// trailing newline.
 fn target_block_body(target: &RecipeTarget) -> String {
-    let mut lines = Vec::new();
-    if let Some(provider) = &target.provider {
-        lines.push(format!("  provider: {}", yaml_scalar(provider)));
-        if let Some(model) = &target.model {
-            lines.push(format!("  model: {}", yaml_scalar(model)));
-        }
-    } else if let Some(ollama) = &target.ollama {
-        lines.push(format!("  ollama: {}", yaml_scalar(ollama)));
-    } else if let Some(local_url) = &target.local_url {
-        lines.push(format!("  local_url: {}", yaml_scalar(local_url)));
-    } else if let Some(managed_model) = &target.managed_model {
-        lines.push(format!("  managed_model: {}", yaml_scalar(managed_model)));
+    target_fields(target)
+        .into_iter()
+        .map(|(key, value)| format!("  {key}: {}", yaml_scalar(value)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Points a recipe's target at a new model, in whatever format the file is
+/// written in.
+///
+/// `RECIPE_EXTENSIONS` accepts `json` next to `yml`/`yaml`, so a JSON recipe is
+/// discovered, parsed and run exactly like a YAML one. It has no line reading
+/// `target:` for the block swap below to find, so it gets its own path rather
+/// than an error telling its author to go and edit YAML they never wrote.
+fn replace_target(raw: &str, extension: &str, target: &RecipeTarget) -> Result<String, String> {
+    if extension.eq_ignore_ascii_case("json") {
+        return replace_target_json(raw, target);
     }
-    lines.join("\n")
+    replace_target_block(raw, target)
+}
+
+/// Replaces the `target` member of a JSON recipe.
+///
+/// Unlike the YAML path this reprints the document, because JSON has no
+/// comments to lose and no block scalars to reflow — the only casualty is key
+/// order, and `serde_json`'s object is ordered by key here regardless of what
+/// the file said. A targeted byte swap would need a JSON span parser to buy
+/// back nothing an author can see.
+fn replace_target_json(raw: &str, target: &RecipeTarget) -> Result<String, String> {
+    let mut document: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("Failed to parse recipe JSON: {error}"))?;
+    let object = document
+        .as_object_mut()
+        .ok_or("This recipe is not a JSON object, so it has no `target` to change.")?;
+    let fields = target_fields(target)
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), serde_json::Value::String(value.to_string())))
+        .collect::<serde_json::Map<_, _>>();
+    // Replaced wholesale, never merged: a provider target left behind next to
+    // a new `ollama` would be two targets at once, which the XOR refuses.
+    object.insert("target".to_string(), serde_json::Value::Object(fields));
+    let mut out = serde_json::to_string_pretty(&document)
+        .map_err(|error| format!("Could not write the recipe back: {error}"))?;
+    out.push('\n');
+    Ok(out)
+}
+
+/// Whether `line` is the top-level `target` key.
+///
+/// The key must sit at column zero — a `target:` inside a block scalar or
+/// nested under another key is somebody else's — but what follows it on the
+/// line is free: nothing (a block mapping underneath), a flow mapping
+/// (`target: {ollama: "x"}`), or a trailing comment. YAML needs a space after
+/// the colon for any of those, so the bare key and the `target: ` prefix are
+/// the whole set.
+fn is_target_key_line(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    trimmed == "target:" || trimmed.starts_with("target: ") || trimmed.starts_with("target:\t")
 }
 
 /// Replaces just the top-level `target:` block in `raw`, leaving every other
@@ -1904,10 +1968,9 @@ fn replace_target_block(raw: &str, target: &RecipeTarget) -> Result<String, Stri
     let lines: Vec<&str> = raw.split_inclusive('\n').collect();
     let start = lines
         .iter()
-        .position(|line| line.trim_end() == "target:")
+        .position(|line| is_target_key_line(line))
         .ok_or_else(|| {
-            "This recipe has no `target:` block on its own line — edit it as YAML instead."
-                .to_string()
+            "This recipe has no top-level `target:` key — edit it as YAML instead.".to_string()
         })?;
     // A top-level key is unindented and not a comment; blank lines and indented
     // lines belong to the block.
@@ -1955,7 +2018,12 @@ pub fn set_recipe_target(
     let (_recipe, path) = resolve_recipe_with_path(name, workspace_root, global_config_roots)?;
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read '{}': {e}", path.display()))?;
-    let updated = replace_target_block(&raw, target)?;
+    // The file's own format, the same way `parse_recipe` picks a parser for it.
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("yml");
+    let updated = replace_target(&raw, extension, target)?;
     // Through the same writer as the YAML editor, so the parse-before-write
     // check and the atomic replace apply here too: a target that somehow makes
     // the file invalid fails before anything is overwritten.
@@ -2667,6 +2735,80 @@ params:
         assert!(parse_recipe(&out, "yml").is_ok(), "{out}");
     }
 
+    /// A JSON recipe is a recipe. `RECIPE_EXTENSIONS` lists `json` alongside
+    /// `yml`/`yaml`, so one is discovered, parsed and run like any other — and
+    /// before this it could not have its model changed at all, because there is
+    /// no line in it that reads `target:`.
+    #[test]
+    fn a_json_recipe_can_have_its_model_changed() {
+        let raw = "{\n  \"version\": 1,\n  \"name\": \"channel-chat\",\n  \"target\": { \"provider\": \"openrouter\", \"model\": \"a/b\" },\n  \"permission_mode\": \"plan\",\n  \"prompt\": \"hi\"\n}\n";
+        let out = replace_target(
+            raw,
+            "json",
+            &RecipeTarget {
+                ollama: Some("qwen3:8b".into()),
+                ..Default::default()
+            },
+        )
+        .expect("a JSON recipe's target is changeable");
+        let parsed = parse_recipe(&out, "json").expect("the result is still a recipe");
+        assert_eq!(parsed.target.ollama.as_deref(), Some("qwen3:8b"));
+        // The old shape is gone, not merged alongside the new one.
+        assert_eq!(parsed.target.provider, None);
+        assert_eq!(parsed.target.model, None);
+        // And nothing else about the recipe moved.
+        assert_eq!(parsed.name, "channel-chat");
+        assert_eq!(parsed.permission_mode, "plan");
+        assert_eq!(parsed.prompt, "hi");
+    }
+
+    /// `target: {ollama: "x"}` is the same mapping written in flow style, and
+    /// `target:` followed by a comment is the same key with a note on it.
+    /// Neither line equals the string "target:", and refusing them sent an
+    /// operator to hand-edit YAML over a formatting choice.
+    #[test]
+    fn a_flow_style_or_commented_target_is_still_a_target() {
+        for raw in [
+            "version: 1\nname: \"t\"\ntarget: {ollama: \"old\"}\npermission_mode: plan\nprompt: \"hi\"\n",
+            "version: 1\nname: \"t\"\ntarget: # the model this answers on\n  ollama: \"old\"\npermission_mode: plan\nprompt: \"hi\"\n",
+        ] {
+            let out = replace_target(
+                raw,
+                "yml",
+                &RecipeTarget {
+                    managed_model: Some("Qwen2.5-7B".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("{error}\n{raw}"));
+            let parsed = parse_recipe(&out, "yml").unwrap_or_else(|e| panic!("{e}\n{out}"));
+            assert_eq!(parsed.target.managed_model.as_deref(), Some("Qwen2.5-7B"));
+            assert_eq!(parsed.target.ollama, None, "{out}");
+            assert_eq!(parsed.permission_mode, "plan", "{out}");
+            assert_eq!(parsed.prompt, "hi", "{out}");
+        }
+    }
+
+    /// A `target:` that is not at column zero belongs to something else, and
+    /// rewriting it would move a key the operator never pointed at.
+    #[test]
+    fn only_the_top_level_target_is_replaced() {
+        let raw = "version: 1\nname: \"t\"\ntarget:\n  ollama: \"old\"\npermission_mode: plan\nsystem: |\n  target:\n    not a key\nprompt: \"hi\"\n";
+        let out = replace_target(
+            raw,
+            "yml",
+            &RecipeTarget {
+                ollama: Some("new".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let parsed = parse_recipe(&out, "yml").unwrap();
+        assert_eq!(parsed.target.ollama.as_deref(), Some("new"));
+        // The block scalar that merely contains the word survives verbatim.
+        assert!(out.contains("system: |\n  target:\n    not a key\n"), "{out}");
+    }
+
     /// A file with no `target:` line of its own is refused rather than guessed
     /// at — the operator is sent to the YAML editor instead of having a block
     /// inserted somewhere this cannot know is right.
@@ -2677,7 +2819,7 @@ params:
             &RecipeTarget { ollama: Some("x".into()), ..Default::default() },
         )
         .unwrap_err();
-        assert!(error.contains("no `target:` block"), "{error}");
+        assert!(error.contains("no top-level `target:` key"), "{error}");
     }
 
     #[test]
