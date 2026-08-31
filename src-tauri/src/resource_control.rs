@@ -1711,6 +1711,23 @@ where
 /// bookkeeping write that could delay or fail the next resource check would put
 /// the ledger in front of the bound. Every implementation is expected to be
 /// fail-soft in the way [`crate::bounded_execution::BoundedExecution`] is.
+///
+/// # A failed reclaim is not an error once a bound has fired
+///
+/// [`ResourceController::terminate_tree`] reports a member that outlived its
+/// termination passes as an error, and that error surfaces from the same calls
+/// that *find* a breach — both of which reclaim the tree as part of finding one.
+/// Propagating it handed every caller here an anonymous `io::Error` for the one
+/// outcome they have typed fields for: the foreground shell's row closed as an
+/// ordinary "Failed to run command" with `limit_breach: None`, which is the
+/// working budget reported as an unexplained failure.
+///
+/// So when [`ResourceController::recorded_breach`] says a bound was found, that
+/// is what this returns — [`Supervised::Breached`], with the reclaim's failure
+/// written to stderr rather than handed back. The caller's contract is therefore
+/// narrower than the underlying calls': an `Err` from here means nothing was
+/// found past a bound. A survivor is a containment problem worth a log line, not
+/// a reason to lose the reason.
 pub async fn run_under_observed<F>(
     controller: &mut ResourceController,
     work: F,
@@ -1741,28 +1758,59 @@ where
                 // only record of *why* is the backend's own counter. Ask before
                 // believing the exit — otherwise the strongest enforcement this
                 // app has is also the enforcement it can never name.
-                if let Some(breach) = controller.mechanism_breach(now_ms())? {
-                    return Ok(Supervised::Breached(breach, last));
+                //
+                // Bound before the `match` so the mutable borrow ends here: the
+                // arms below ask the same controller what it has recorded.
+                let asked = controller.mechanism_breach(now_ms());
+                match asked {
+                    Ok(Some(breach)) => return Ok(Supervised::Breached(breach, last)),
+                    Ok(None) => {}
+                    Err(error) => return breached_despite_the_reclaim(controller, error, last),
                 }
                 return Ok(Supervised::Completed(output, last));
             }
             _ = ticker.tick() => {
-                match controller.check(now_ms())? {
-                    ResourceCheck::Breached { breach, sample } => {
+                let checked = controller.check(now_ms());
+                match checked {
+                    Ok(ResourceCheck::Breached { breach, sample }) => {
                         return Ok(Supervised::Breached(breach, sample.unwrap_or(last)));
                     }
-                    ResourceCheck::Running(sample) => {
+                    Ok(ResourceCheck::Running(sample)) => {
                         observe(&sample);
                         last = sample;
                     }
                     // The workload is gone but `work` has not resolved yet —
                     // usually a pipe still draining. Keep waiting for it rather
                     // than reporting a breach against a corpse.
-                    ResourceCheck::Gone => continue,
+                    Ok(ResourceCheck::Gone) => continue,
+                    Err(error) => return breached_despite_the_reclaim(controller, error, last),
                 }
             }
         }
     }
+}
+
+/// What [`run_under_observed`] answers when a check failed on its way out.
+///
+/// Both calls it makes on a tick find a breach and reclaim the tree in one step,
+/// so their `Err` is ambiguous by construction: it is either "nothing could be
+/// checked" or "a bound fired and a member survived the teardown". Only the
+/// controller's record tells them apart, and only the second is worth keeping —
+/// the survivor is a containment failure to log, while the breach is the fact
+/// four callers use to type the row.
+fn breached_despite_the_reclaim<T>(
+    controller: &ResourceController,
+    error: io::Error,
+    last: ResourceSample,
+) -> io::Result<Supervised<T>> {
+    let Some(breach) = controller.recorded_breach() else {
+        return Err(error);
+    };
+    eprintln!(
+        "resource control: {} fired, and reclaiming the workload's tree did not finish: {error}",
+        breach.limit
+    );
+    Ok(Supervised::Breached(breach, last))
 }
 
 /// The limit set to ask a host "what would you hold a workload with".
