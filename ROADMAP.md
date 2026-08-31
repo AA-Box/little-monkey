@@ -174,8 +174,8 @@ Rust and npm advisory audit, and publishes a CycloneDX SBOM, which is also
 attached to every release. What is missing: signing beyond macOS (Windows needs
 a code-signing certificate; Linux has no OS-level signature to produce),
 clean-machine install/upgrade tests, an accessibility audit in CI, and a release
-penetration test. Ten locales are each missing the same ~650 of 1,726 keys (they
-fall back to English at runtime).
+penetration test. The ten non-English locales each fall back to English for
+roughly a third of their keys.
 
 **Acceptance:** signed, verifiable in-app updates with rollback on every
 supported platform; signed/notarized installers per platform; clean-machine
@@ -186,13 +186,13 @@ SBOM in CI; an accessibility audit in CI; and a release penetration test.
 
 These are not features, but they change what shipping the above costs.
 
-- **Two live HTTP servers.** `server.rs` (legacy proxy, ~4.6k lines) and
-  `m3_http_server.rs` (~2.1k) both serve requests. Every route policy change
+- **Two live HTTP servers.** `server.rs` (legacy proxy, ~7.9k lines) and
+  `m3_http_server.rs` (~3.7k) both serve requests. Every route policy change
   has to be made twice, correctly, or the two disagree.
-- **Two live knowledge-index systems.** `stacks.rs` v1 (15 commands, still
-  invoked) runs in parallel with Knowledge 2.0 (`knowledge_v*`). Retrieval
-  changes must be duplicated or a user's results depend on which path their
-  stack happens to use.
+
+The second entry that used to sit here — two live knowledge-index systems —
+is resolved: the v1 `chunks.jsonl`/`vectors.bin` index is deleted and every
+stack retrieves through its Knowledge 2.0 generation.
 
 ---
 
