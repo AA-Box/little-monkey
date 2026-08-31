@@ -1857,6 +1857,128 @@ pub fn recipes_save(
     Ok(recipe)
 }
 
+/// A JSON string literal is also a valid YAML flow scalar — the simplest
+/// correct way to quote a model id without hand-rolling YAML escaping. Same
+/// helper, and the same reasoning, as `channels_cli::yaml_scalar`; there is no
+/// YAML *serializer* in the dependency tree (`serde-saphyr` deserializes only),
+/// and a whole crate is not worth one quoted scalar.
+fn yaml_scalar(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
+}
+
+/// The `target:` block body for a validated target, indented two spaces, no
+/// trailing newline.
+fn target_block_body(target: &RecipeTarget) -> String {
+    let mut lines = Vec::new();
+    if let Some(provider) = &target.provider {
+        lines.push(format!("  provider: {}", yaml_scalar(provider)));
+        if let Some(model) = &target.model {
+            lines.push(format!("  model: {}", yaml_scalar(model)));
+        }
+    } else if let Some(ollama) = &target.ollama {
+        lines.push(format!("  ollama: {}", yaml_scalar(ollama)));
+    } else if let Some(local_url) = &target.local_url {
+        lines.push(format!("  local_url: {}", yaml_scalar(local_url)));
+    } else if let Some(managed_model) = &target.managed_model {
+        lines.push(format!("  managed_model: {}", yaml_scalar(managed_model)));
+    }
+    lines.join("\n")
+}
+
+/// Replaces just the top-level `target:` block in `raw`, leaving every other
+/// byte of the file alone.
+///
+/// # Why not re-serialize the whole recipe
+///
+/// Because a recipe is a file a person may have written and commented, and
+/// round-tripping it through a struct would silently delete those comments,
+/// reorder keys, and reflow strings — a model change is not a licence to
+/// rewrite someone's file. Only the block being changed is touched; the
+/// comments *inside* that one block are the sole casualty, and they described
+/// the target that is being replaced anyway.
+///
+/// The block runs from a line matching `target:` at column zero up to the next
+/// line that starts a new top-level key, so nested keys and blank lines inside
+/// it are consumed and anything after it is preserved verbatim.
+fn replace_target_block(raw: &str, target: &RecipeTarget) -> Result<String, String> {
+    let lines: Vec<&str> = raw.split_inclusive('\n').collect();
+    let start = lines
+        .iter()
+        .position(|line| line.trim_end() == "target:")
+        .ok_or_else(|| {
+            "This recipe has no `target:` block on its own line — edit it as YAML instead."
+                .to_string()
+        })?;
+    // A top-level key is unindented and not a comment; blank lines and indented
+    // lines belong to the block.
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| {
+            let trimmed = line.trim_end();
+            !trimmed.is_empty() && !line.starts_with([' ', '\t']) && !trimmed.starts_with('#')
+        })
+        .map(|offset| start + 1 + offset)
+        .unwrap_or(lines.len());
+
+    let mut out = String::with_capacity(raw.len());
+    out.push_str(&lines[..start].concat());
+    out.push_str("target:\n");
+    out.push_str(&target_block_body(target));
+    out.push('\n');
+    out.push_str(&lines[end..].concat());
+    Ok(out)
+}
+
+/// Points a saved recipe at a different model, without disturbing the rest of
+/// the file.
+///
+/// This exists because the model a channel answers on lives in its recipe's
+/// `target:`, and nothing in the desktop app could see or change it: a channel
+/// route names a *recipe*, and the starter recipe's model was chosen once, at
+/// account-creation time, by `channels_cli::starter_recipe_target`. An operator
+/// had no way to find out what it picked, let alone change it, short of editing
+/// YAML by hand.
+///
+/// Resolution is the *same* resolution the runner does
+/// ([`resolve_recipe_with_path`]), so the file this writes is by construction
+/// the file `daemon::freeze_execution_for` will read for the next message —
+/// there is no second copy of "which file is this recipe" to drift.
+///
+/// Returns the reparsed recipe and the path it was written to.
+pub fn set_recipe_target(
+    name: &str,
+    workspace_root: Option<&Path>,
+    global_config_roots: &[PathBuf],
+    target: &RecipeTarget,
+) -> Result<(Recipe, PathBuf), String> {
+    target.validate()?;
+    let (_recipe, path) = resolve_recipe_with_path(name, workspace_root, global_config_roots)?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read '{}': {e}", path.display()))?;
+    let updated = replace_target_block(&raw, target)?;
+    // Through the same writer as the YAML editor, so the parse-before-write
+    // check and the atomic replace apply here too: a target that somehow makes
+    // the file invalid fails before anything is overwritten.
+    let recipe = save_recipe_at_path(&path, name, &updated)?;
+    Ok((recipe, path))
+}
+
+#[tauri::command]
+pub fn recipes_set_target(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    state: tauri::State<'_, crate::AppState>,
+    name: String,
+    target: RecipeTarget,
+) -> Result<Recipe, String> {
+    let workspace_root = crate::workspace::primary_root_canon(state.inner()).ok();
+    let roots = app_paths::ensure_agent_config_roots()?.ordered();
+    let (recipe, _path) =
+        set_recipe_target(&name, workspace_root.as_deref(), &roots, &target)?;
+    let _ = app.emit(RECIPES_CHANGED_EVENT, window.label());
+    Ok(recipe)
+}
+
 #[tauri::command]
 pub fn recipes_delete(
     app: tauri::AppHandle,
@@ -2489,6 +2611,73 @@ params:
             recipe.params.get("manifest"),
             Some(&Some("package.json".to_string()))
         );
+    }
+
+    /// The whole point of a targeted block swap: everything that is not the
+    /// `target:` block survives byte-for-byte, comments included. Re-serializing
+    /// the recipe through its struct would have deleted all of this.
+    #[test]
+    fn replacing_the_target_leaves_the_rest_of_the_file_alone() {
+        let raw = "# hand-written, keep me\nversion: 1\nname: \"channel-chat\"\ntarget:\n  provider: \"openrouter\"\n  model: \"aion-labs/aion-2.0\"\npermission_mode: plan\nsystem: |\n  Answer briefly.\n";
+        let target = RecipeTarget {
+            ollama: Some("qwen3.8:27b-mlx".to_string()),
+            ..Default::default()
+        };
+        let out = replace_target_block(raw, &target).unwrap();
+        assert!(out.starts_with("# hand-written, keep me\nversion: 1\n"), "{out}");
+        assert!(out.contains("target:\n  ollama: \"qwen3.8:27b-mlx\"\n"), "{out}");
+        assert!(!out.contains("openrouter"), "{out}");
+        assert!(!out.contains("aion-labs"), "{out}");
+        // Everything after the block is untouched, block scalar and all.
+        assert!(out.ends_with("permission_mode: plan\nsystem: |\n  Answer briefly.\n"), "{out}");
+    }
+
+    /// The replacement has to parse as the recipe it claims to be, or the swap
+    /// has produced a file the runner cannot read.
+    #[test]
+    fn a_swapped_target_still_parses_as_a_recipe() {
+        let raw = "version: 1\nname: \"channel-chat\"\ntarget:\n  ollama: \"qwen2.5:7b\"\npermission_mode: plan\nprompt: |\n  {{message}}\nparams:\n  \"message\": \"\"\n";
+        for target in [
+            RecipeTarget { ollama: Some("qwen3.8:27b-mlx".into()), ..Default::default() },
+            RecipeTarget { managed_model: Some("Qwen2.5-7B-Instruct".into()), ..Default::default() },
+            RecipeTarget {
+                provider: Some("openrouter".into()),
+                model: Some("anthropic/claude-sonnet".into()),
+                ..Default::default()
+            },
+        ] {
+            let out = replace_target_block(raw, &target).unwrap();
+            let parsed = parse_recipe(&out, "yml")
+                .unwrap_or_else(|e| panic!("swapped recipe must parse: {e}\n{out}"));
+            assert_eq!(parsed.target, target);
+        }
+    }
+
+    /// A provider target carries two keys; the old single-key block must not
+    /// leave its `model:` behind, which would be read as a second top-level key.
+    #[test]
+    fn swapping_between_target_shapes_drops_the_old_keys() {
+        let raw = "version: 1\nname: \"t\"\ntarget:\n  provider: \"openrouter\"\n  model: \"a/b\"\npermission_mode: plan\nprompt: \"hi\"\n";
+        let out = replace_target_block(
+            raw,
+            &RecipeTarget { ollama: Some("qwen2.5:7b".into()), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(out.matches("model:").count(), 0, "{out}");
+        assert!(parse_recipe(&out, "yml").is_ok(), "{out}");
+    }
+
+    /// A file with no `target:` line of its own is refused rather than guessed
+    /// at — the operator is sent to the YAML editor instead of having a block
+    /// inserted somewhere this cannot know is right.
+    #[test]
+    fn a_recipe_without_a_target_block_is_refused() {
+        let error = replace_target_block(
+            "version: 1\nname: \"t\"\nprompt: \"hi\"\n",
+            &RecipeTarget { ollama: Some("x".into()), ..Default::default() },
+        )
+        .unwrap_err();
+        assert!(error.contains("no `target:` block"), "{error}");
     }
 
     #[test]

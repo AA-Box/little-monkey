@@ -1599,6 +1599,7 @@ pub fn run() {
             recipes::recipes_read_raw,
             recipes::recipes_render,
             recipes::recipes_save,
+            recipes::recipes_set_target,
             recipes::recipes_delete,
             recipes::recipes_validate,
             automations::automations_load,
