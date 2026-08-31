@@ -20,7 +20,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 const invoke = vi.fn();
-vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invoke(...args) }));
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (...args: unknown[]) => invoke(...args),
+  isTauri: () => true,
+}));
 
 import { ChannelRoutesSection, draftFrom, draftIncomplete, draftOptions } from "./ChannelRoutesSection";
 import type { ChannelAccount, ChannelRoute } from "../../lib/channelsClient";
@@ -67,10 +70,30 @@ const FULL_ROUTE: ChannelRoute = {
   updated_at_ms: 1,
 };
 
-function mockRoutes(routes: ChannelRoute[]) {
+/** One saved task, as `recipes_list` reports it — the editor offers these
+ * instead of a free-text name, so a test that picks one has to have it. */
+function discovered(name: string) {
+  return {
+    path: `/tasks/${name}.yml`,
+    source: "global",
+    error: null,
+    recipe: {
+      version: 1,
+      name,
+      target: { ollama: "qwen2.5:7b" },
+      permission_mode: "manual",
+      prompt: "{{message}}",
+      params: { message: "" },
+      output: { json: false },
+    },
+  };
+}
+
+function mockRoutes(routes: ChannelRoute[], recipes = ["chat", "triage", "triage-2"]) {
   invoke.mockImplementation((command: string) => {
     if (command === "channels_routes") return Promise.resolve({ routes });
     if (command === "channels_events") return Promise.resolve({ events: [] });
+    if (command === "recipes_list") return Promise.resolve(recipes.map(discovered));
     return Promise.resolve(null);
   });
 }
@@ -146,7 +169,9 @@ describe("the route draft", () => {
 
 describe("the routes section", () => {
   it("keeps Save disabled until a Thread route names its thread", async () => {
-    mockRoutes([]);
+    // A route already exists, so the empty state's automatic first route does
+    // not run underneath the form this test drives.
+    mockRoutes([FULL_ROUTE]);
     render(<ChannelRoutesSection accounts={[ACCOUNT]} />);
     fireEvent.click(await screen.findByText("Add route"));
 
@@ -162,7 +187,7 @@ describe("the routes section", () => {
   });
 
   it("keeps Save disabled until a Sender route names both its thread and its sender", async () => {
-    mockRoutes([]);
+    mockRoutes([FULL_ROUTE]);
     render(<ChannelRoutesSection accounts={[ACCOUNT]} />);
     fireEvent.click(await screen.findByText("Add route"));
 
@@ -205,6 +230,57 @@ describe("the routes section", () => {
         },
       }),
     );
+  });
+
+  it("sets the first route up on its own for an account that is already connected", async () => {
+    mockRoutes([], ["channel-chat"]);
+    render(<ChannelRoutesSection accounts={[ACCOUNT]} />);
+
+    // Nobody clicked anything: an account with a credential is already
+    // accepting messages, and a message with no route runs nothing.
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("channels_add_route", {
+        recipe: "channel-chat",
+        options: {},
+      }),
+    );
+  });
+
+  it("leaves an account that cannot receive anything alone", async () => {
+    mockRoutes([], ["channel-chat"]);
+    render(<ChannelRoutesSection accounts={[{ ...ACCOUNT, enabled: false }]} />);
+
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("channels_routes"));
+    expect(invoke.mock.calls.some(([command]) => command === "channels_add_route")).toBe(false);
+  });
+
+  it("names an existing starter task when setting the first route up in one click", async () => {
+    mockRoutes([], ["channel-chat"]);
+    render(<ChannelRoutesSection accounts={[ACCOUNT]} />);
+
+    fireEvent.click(await screen.findByText("Set up a starter task and route"));
+    // The global default: no scope flags, so every account reaches it.
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("channels_add_route", {
+        recipe: "channel-chat",
+        options: {},
+      }),
+    );
+    // The task already existed, so nothing wrote a second copy over it.
+    expect(invoke.mock.calls.some(([command]) => command === "recipes_save")).toBe(false);
+  });
+
+  it("refuses to save a route naming a task that is not there", async () => {
+    mockRoutes([FULL_ROUTE], ["chat"]);
+    render(<ChannelRoutesSection accounts={[ACCOUNT]} />);
+    fireEvent.click(await screen.findByText("Edit"));
+
+    // The route points at "triage", which is not saved any more: the editor
+    // says so rather than reading as some other task.
+    expect(screen.getByText(/No task by this name is saved/)).toBeTruthy();
+    const picker = screen.getByLabelText("Task") as HTMLSelectElement;
+    expect(picker.value).toBe("triage");
+    expect([...picker.options].map((option) => option.value)).toContain("chat");
   });
 
   it("turns a route off and on and removes it by id", async () => {

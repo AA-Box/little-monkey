@@ -258,7 +258,7 @@ pub async fn dispatch(action: &ChannelsCmd) -> Result<(), String> {
             label,
             config,
             json,
-        } => add(kind, label, config.as_deref(), *json),
+        } => add(kind, label, config.as_deref(), *json).await,
         ChannelsCmd::SetToken { account_id } => set_token(account_id),
         ChannelsCmd::SetConfig {
             account_id,
@@ -266,7 +266,7 @@ pub async fn dispatch(action: &ChannelsCmd) -> Result<(), String> {
             label,
             json,
         } => set_config(account_id, config.as_deref(), label.as_deref(), *json),
-        ChannelsCmd::Enable { account_id, off } => enable(account_id, !*off),
+        ChannelsCmd::Enable { account_id, off } => enable(account_id, !*off).await,
         ChannelsCmd::Probe { account_id, json } => probe(account_id, *json).await,
         ChannelsCmd::Policy {
             account_id,
@@ -425,6 +425,148 @@ fn store() -> Result<DaemonStore, String> {
     DaemonStore::open(&DaemonPaths::resolve()?)
 }
 
+/// The task a machine's first route runs, and the recipe written for it when
+/// no task exists yet.
+///
+/// # Why this is created rather than asked for
+///
+/// An account with a credential starts accepting messages the moment it is
+/// enabled, and a route is what decides which task those messages run as.
+/// Every message arriving before the first route is recorded and then fails,
+/// which reads as a broken app rather than as an unconfigured one — the
+/// failure is one line in `channels events`, and the operator has no reason to
+/// look there. So the pair is made here, at the moment an account appears,
+/// instead of waiting for a route the operator does not know is missing.
+///
+/// Nothing about it is special-cased afterwards: it is an ordinary recipe file
+/// and an ordinary global route, editable and deletable like any other. It is
+/// created **only** when there is no route at all, so an operator who has
+/// configured their own routing is never given a second opinion.
+const STARTER_RECIPE: &str = "channel-chat";
+
+/// A JSON string literal is also a valid YAML flow scalar — the simplest
+/// correct way to quote a model id without hand-rolling YAML escaping.
+fn yaml_scalar(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
+}
+
+/// The starter task, given the `target:` line naming the model it runs on.
+///
+/// `message` is declared because the route supplies it, and a parameter passed
+/// but not declared is refused outright (`recipes::resolve_param_values`).
+/// `plan` because this task runs unattended on text written by whoever
+/// messaged the account: it answers, and it cannot write files or run
+/// commands. Replying is unaffected — the route's own grant carries that, not
+/// the permission mode.
+fn starter_recipe_yaml(target_line: &str) -> String {
+    format!(
+        "version: 1\n\
+         name: {STARTER_RECIPE}\n\
+         description: Answer a message that arrived on a messaging channel.\n\
+         target:\n  {target_line}\n\
+         permission_mode: plan\n\
+         params:\n  message: \"\"\n\
+         system: |\n\
+         \u{20}\u{20}You are answering a person who messaged this machine on a messaging channel.\n\
+         \u{20}\u{20}Send your answer by calling the send_message tool. Text you write outside a tool call is NOT delivered to them.\n\
+         \u{20}\u{20}Reply once, briefly, in the language they wrote in.\n\
+         prompt: |\n  {{{{message}}}}\n"
+    )
+}
+
+/// The model the starter task runs on.
+///
+/// Deliberately the same default `monkey` itself applies when no model is
+/// named (see `main::resolve_target`): the first Ollama tag, then this
+/// machine's managed runtime hub. A cloud provider is never guessed at — that
+/// picks a bill as well as a model.
+async fn starter_recipe_target() -> Result<String, String> {
+    // Through `egress::hardened()` like every other outbound call in this
+    // binary: a bare client carries no connect or read budget, so an Ollama
+    // daemon that accepts the connection and never answers would hang account
+    // creation instead of falling through to the next option.
+    let client = little_monkey_lib::egress::hardened()
+        .build()
+        .map_err(|error| format!("could not build the HTTP client: {error}"))?;
+    if let Ok(tags) = crate::ollama_api::tags(&client).await {
+        if let Some(model) = tags.models.first() {
+            return Ok(format!("ollama: {}", yaml_scalar(&model.name)));
+        }
+    }
+    let app_data =
+        crate::app_data_dir().ok_or_else(|| "Could not resolve the app data directory".to_string())?;
+    if let Some(model) =
+        little_monkey_lib::m3_runtime_hub::installed_model_inventory(&app_data).first()
+    {
+        return Ok(format!("managed_model: {}", yaml_scalar(&model.model_id)));
+    }
+    Err(
+        "no model is installed to answer messages with — install one, then run `monkey channels add-route <task>`"
+            .to_string(),
+    )
+}
+
+/// The starter task's name, writing the recipe first if this machine does not
+/// have it. An existing task of that name is never overwritten: it may be the
+/// operator's own edit of this one.
+async fn ensure_starter_recipe() -> Result<String, String> {
+    let roots = little_monkey_lib::recipes::global_config_roots()?;
+    if little_monkey_lib::recipes::resolve_recipe(STARTER_RECIPE, None, &roots).is_ok() {
+        return Ok(STARTER_RECIPE.to_string());
+    }
+    let root = roots
+        .first()
+        .ok_or_else(|| "Could not resolve the global recipes directory".to_string())?;
+    let yaml = starter_recipe_yaml(&starter_recipe_target().await?);
+    little_monkey_lib::recipes::save_recipe_impl(root, STARTER_RECIPE, &yaml)?;
+    Ok(STARTER_RECIPE.to_string())
+}
+
+/// Creates the starter task and one global route to it, when and only when the
+/// machine has no route at all. `None` means there was already routing.
+pub(crate) async fn ensure_starter_route(
+    store: &mut DaemonStore,
+) -> Result<Option<ChannelRoute>, String> {
+    if !store.channel_routes()?.is_empty() {
+        return Ok(None);
+    }
+    let recipe = ensure_starter_recipe().await?;
+    let now = now_ms();
+    let route = ChannelRoute {
+        route_id: format!("route-{}", uuid::Uuid::new_v4().simple()),
+        scope: RouteScope::default(),
+        target: RouteTarget::new(&recipe),
+        enabled: true,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    store.insert_channel_route(&route)?;
+    Ok(Some(route))
+}
+
+/// Reports the starter route, if one was needed and made.
+///
+/// A failure here is never the caller's failure: an account still gets added
+/// and enabled on a machine with no model installed, it just answers nothing
+/// until one exists. Saying so on stderr keeps `--json` output parseable.
+async fn report_starter_route() {
+    let mut store = match store() {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("monkey: no starter route was created: {error}");
+            return;
+        }
+    };
+    match ensure_starter_route(&mut store).await {
+        Ok(Some(route)) => eprintln!(
+            "Added route {} -> {} so accepted messages have something to run.",
+            route.route_id, route.target.recipe
+        ),
+        Ok(None) => {}
+        Err(error) => eprintln!("monkey: no starter route was created: {error}"),
+    }
+}
+
 fn now_ms() -> i64 {
     i64::try_from(
         std::time::SystemTime::now()
@@ -530,7 +672,12 @@ pub fn list(json: bool) -> Result<(), String> {
 
 /// Add an account. The credential is set separately so it never appears in a
 /// shell history alongside the rest of the configuration.
-pub fn add(kind: &str, label: &str, config_json: Option<&str>, json: bool) -> Result<(), String> {
+pub async fn add(
+    kind: &str,
+    label: &str,
+    config_json: Option<&str>,
+    json: bool,
+) -> Result<(), String> {
     let kind = ChannelKind::parse(kind).ok_or_else(|| {
         format!("Unknown provider '{kind}'. Try one of: telegram, discord, slack, whatsapp, signal, teams, google_chat, matrix, mattermost, line, imessage, irc, sms")
     })?;
@@ -561,6 +708,9 @@ pub fn add(kind: &str, label: &str, config_json: Option<&str>, json: bool) -> Re
         updated_at_ms: now,
     };
     store()?.upsert_channel_account(&record)?;
+    // Before the account is told about: the operator's next step is a
+    // credential, not a routing decision they have no way to know is missing.
+    report_starter_route().await;
     if json {
         println!("{}", account_json(&record));
     } else {
@@ -736,7 +886,7 @@ pub fn mark_credential(account_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn enable(account_id: &str, enabled: bool) -> Result<(), String> {
+pub async fn enable(account_id: &str, enabled: bool) -> Result<(), String> {
     let mut store = store()?;
     let mut account = store
         .channel_account(account_id)?
@@ -749,6 +899,12 @@ pub fn enable(account_id: &str, enabled: bool) -> Result<(), String> {
     account.enabled = enabled;
     account.updated_at_ms = now_ms();
     store.upsert_channel_account(&account)?;
+    // Also here, not only on `add`: an account configured before this existed
+    // reaches "enabled with a credential" without ever passing through `add`
+    // again, and that is the moment it starts accepting messages.
+    if enabled {
+        report_starter_route().await;
+    }
     println!(
         "{account_id} is now {}.",
         if enabled { "enabled" } else { "disabled" }
@@ -1189,6 +1345,68 @@ pub fn remove(account_id: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The starter task has to be a task the daemon can actually run: an
+    /// invalid mode, or a `message` it forgets to declare, fails every message
+    /// the route matches — exactly the silence this whole path exists to end.
+    #[test]
+    fn the_starter_task_is_a_recipe_the_daemon_accepts() {
+        let recipe = little_monkey_lib::recipes::parse_recipe(
+            &starter_recipe_yaml(&format!("ollama: {}", yaml_scalar("qwen2.5:7b"))),
+            "yml",
+        )
+        .expect("the starter task must parse and validate");
+
+        assert_eq!(recipe.name, STARTER_RECIPE);
+        assert_eq!(recipe.target.ollama.as_deref(), Some("qwen2.5:7b"));
+        // Declared, because the route hands it over as `message=...`, and an
+        // undeclared parameter is refused at run time.
+        assert!(recipe.params.contains_key("message"));
+        assert!(recipe.prompt.contains("{{message}}"));
+        // A reply is a tool call, not the run's own output. Without this the
+        // model answers into the void and the run still succeeds.
+        let system = recipe.system.as_deref().unwrap_or_default();
+        assert!(system.contains("send_message"), "system prompt: {system}");
+        // Read-only: nobody is at the keyboard, and the text came from
+        // whoever messaged the account.
+        assert_eq!(recipe.permission_mode, "plan");
+    }
+
+    /// A model id is quoted rather than pasted, so a tag YAML would otherwise
+    /// read as something else survives the round trip.
+    #[test]
+    fn a_model_tag_that_needs_quoting_survives() {
+        let recipe = little_monkey_lib::recipes::parse_recipe(
+            &starter_recipe_yaml(&format!("ollama: {}", yaml_scalar("qwen3.8:27b-mlx"))),
+            "yml",
+        )
+        .expect("a tag with a colon is still one scalar");
+        assert_eq!(recipe.target.ollama.as_deref(), Some("qwen3.8:27b-mlx"));
+    }
+
+    /// Routing the operator already configured is never given a second
+    /// opinion — including the route this same function created earlier.
+    #[tokio::test]
+    async fn an_existing_route_is_left_alone() {
+        let mut store = DaemonStore::open_in_memory().expect("store");
+        let existing = ChannelRoute {
+            route_id: "route-existing".to_string(),
+            scope: RouteScope::default(),
+            target: RouteTarget::new("their-own-task"),
+            enabled: true,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        store.insert_channel_route(&existing).expect("seed");
+
+        assert!(ensure_starter_route(&mut store)
+            .await
+            .expect("asking is not an error")
+            .is_none());
+        let routes = store.channel_routes().expect("routes");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].target.recipe, "their-own-task");
+    }
 
     #[test]
     fn an_account_is_never_born_connected() {

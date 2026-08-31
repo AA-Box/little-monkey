@@ -5982,6 +5982,27 @@ async fn run_inner(
             retryable: false,
         })?;
     } else {
+        // A run that arrived from a messaging conversation answers it by
+        // calling `send_message`; a model that only *wrote* an answer has said
+        // nothing to the person who wrote in. Delivering it here is the
+        // difference between a succeeded run and a reply — see
+        // `channel_tool::deliver_unsent_answer` for why it may send without
+        // asking, and for the cases where it declines to.
+        if let Some(answer) = final_message.as_deref() {
+            match crate::daemon::channel_tool::deliver_unsent_answer(answer) {
+                // The row's own id and destination are already in the log
+                // line `queue_send` writes for every queued message. This one
+                // adds only what that cannot say: the answer was queued for
+                // the run rather than by it.
+                Ok(Some(_)) => {
+                    eprintln!("channel-send: queued the run's own answer to its conversation")
+                }
+                Ok(None) => {}
+                // Never fatal: the run itself succeeded, and its answer is in
+                // the ledger either way.
+                Err(error) => eprintln!("channel-send: the run's answer was not queued: {error}"),
+            }
+        }
         recorder.emit(RunEvent::Completed {
             summary: final_message.clone(),
             result_artifact_ids: Vec::new(),
