@@ -92,13 +92,13 @@ platform. Full list in
 
 ```sh
 pnpm install
-pnpm tauri dev       # stage llama.cpp + the CLI sidecar, then run the app
+pnpm dev:app         # stage llama.cpp + the CLI sidecar, then run the app
 pnpm dev             # Vite frontend only
 pnpm build           # TypeScript check + frontend production build
 pnpm tauri build     # desktop bundle containing the managed runtime
 ```
 
-`pnpm tauri dev` verifies and stages the pinned, checksum-verified `llama.cpp`
+`pnpm dev:app` verifies and stages the pinned, checksum-verified `llama.cpp`
 runtime before it starts. A system `llama-server` is a development fallback
 only — don't build a feature that assumes one is installed.
 
