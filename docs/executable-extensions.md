@@ -6,6 +6,12 @@ declarative package ecosystem: a declarative package still rejects `.wasm` and
 other executable payloads, while an executable extension uses its own manifest,
 store, grants, lifecycle and trust decision.
 
+This document is the runtime and trust contract. Building, testing, packing,
+signing, and publishing an extension is the `monkey extensions` developer loop
+in [Extension development](extension-development.md); how signed extensions are
+distributed and updated through M4 registry snapshots is
+[Extension marketplace](extension-marketplace.md).
+
 The host contract is
 [`little-monkey:extension@1.0.0`](../src-tauri/wit/little-monkey-extension.wit).
 A guest exports `guest.run(capability-id, input-json)` and receives only the
