@@ -5990,8 +5990,12 @@ async fn run_inner(
         // asking, and for the cases where it declines to.
         if let Some(answer) = final_message.as_deref() {
             match crate::daemon::channel_tool::deliver_unsent_answer(answer) {
-                Ok(Some(outbox_id)) => {
-                    eprintln!("channel-send: queued the run's own answer outbox_id={outbox_id}")
+                // The row's own id and destination are already in the log
+                // line `queue_send` writes for every queued message. This one
+                // adds only what that cannot say: the answer was queued for
+                // the run rather than by it.
+                Ok(Some(_)) => {
+                    eprintln!("channel-send: queued the run's own answer to its conversation")
                 }
                 Ok(None) => {}
                 // Never fatal: the run itself succeeded, and its answer is in
