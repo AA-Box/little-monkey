@@ -1938,12 +1938,12 @@ impl DaemonStore {
 
     /// How many outbound rows this job queued.
     ///
-    /// Test-only: the send path used to derive its idempotency key from this
-    /// count, which shifted under a replayed run and let the first message go
-    /// out twice. The key is derived from the invocation identity now, and
-    /// this remains only as the assertion tests make about how many rows a
-    /// run produced.
-    #[cfg(test)]
+    /// The send path no longer derives its idempotency key from this count —
+    /// that shifted under a replayed run and let the first message go out
+    /// twice; the key is the invocation identity now. What remains is the one
+    /// question `deliver_unsent_answer` asks at the end of a run ("did this
+    /// run say anything to the conversation itself?"), plus the assertion
+    /// tests make about how many rows a run produced.
     pub fn outbox_count_for_job(&self, job_id: &str) -> Result<u32, String> {
         self.connection
             .query_row(

@@ -366,6 +366,106 @@ pub(crate) fn is_preauthorized_origin_reply(
     )
 }
 
+/// The tool-call id an answer the run never sent is queued under. Fixed rather
+/// than random: a replayed run recomputes the same invocation identity, and
+/// the outbox refuses the second copy instead of sending the answer twice.
+const UNSENT_ANSWER_CALL_ID: &str = "auto-reply";
+
+/// Deliver a finished run's own answer to the conversation it came from, when
+/// the run never said anything itself.
+///
+/// # Why this exists
+///
+/// A reply reaches a person only by *calling* `send_message`. Text the model
+/// merely writes is the run's own output: recorded in the ledger, delivered to
+/// nobody. So a model that answers without calling the tool produces the worst
+/// shape of failure this path has — the message is accepted, the run is marked
+/// succeeded, the ledger holds a perfectly good answer, and the person who
+/// wrote in sees silence. No prompt fixes that reliably; a small model, a
+/// distracted one, or one behind a provider that dropped the tool call all
+/// reproduce it, and each looks like a broken app rather than a missed tool
+/// call.
+///
+/// # Why it is allowed to send without asking
+///
+/// It is the same decision [`is_preauthorized_origin_reply`] already rests on,
+/// with strictly less latitude:
+///
+/// - the frozen route on the durable turn is what grants the reply, written
+///   when the account was routed — not by anything in this run. A run whose
+///   route did not grant it sends nothing here, whatever its permission
+///   snapshot says;
+/// - the destination is the origin conversation, resolved from the durable
+///   inbound event rather than from any argument, so nothing the model wrote
+///   can redirect it;
+/// - it carries text only, never artifacts;
+/// - and it happens only when the run queued *nothing*, so a run that chose
+///   what to say keeps that choice — this never appends to it.
+///
+/// Reply depth comes from [`queue_send`] like any other message, so two
+/// automated systems answering each other stay bounded.
+///
+/// Returns the outbox id when something was queued. Every "nothing to do" case
+/// is `None`, and a genuine failure is `Err` — the caller reports it without
+/// failing the run, which has already succeeded.
+pub(crate) fn deliver_unsent_answer(text: &str) -> Result<Option<String>, String> {
+    let Some((job_id, origin)) = current_channel_origin() else {
+        return Ok(None);
+    };
+    let paths = DaemonPaths::resolve()?;
+    let mut store = DaemonStore::open(&paths)?;
+    deliver_unsent_answer_with(&mut store, &paths, &job_id, &origin, text, now_ms()?)
+}
+
+/// [`deliver_unsent_answer`] with the store, job and origin injected — the same
+/// seam [`queue_send`] has, and for the same reason: every rule above is
+/// testable against a store the test owns rather than the operator's own.
+pub(crate) fn deliver_unsent_answer_with(
+    store: &mut DaemonStore,
+    paths: &DaemonPaths,
+    job_id: &str,
+    origin: &ChannelOrigin,
+    text: &str,
+    now_ms: i64,
+) -> Result<Option<String>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    // Deliberately not the run's own permission snapshot: what may answer this
+    // conversation is the operator's route, and nothing else.
+    let authority = send_authority_for_job(store, job_id, false, None);
+    if !authority.reply {
+        return Ok(None);
+    }
+    if store.outbox_count_for_job(job_id)? > 0 {
+        return Ok(None);
+    }
+    let request = ChannelSendRequest {
+        // A long answer is cut rather than refused: the alternative is
+        // silence, which is the thing this function exists to prevent.
+        text: text.chars().take(MAX_REPLY_CHARS).collect(),
+        ..Default::default()
+    };
+    let plan = plan_send(&request, &authority, Some(origin))?;
+    let queued = queue_send(
+        store,
+        paths,
+        &request,
+        &plan,
+        Some(origin),
+        &SendInvocation {
+            job_id: Some(job_id.to_string()),
+            tool_call_id: Some(UNSENT_ANSWER_CALL_ID.to_string()),
+        },
+        now_ms,
+    )?;
+    Ok(queued
+        .get("outbox_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string))
+}
+
 /// [`is_preauthorized_origin_reply`] against the run's own origin, resolved the
 /// same way [`send_message`] resolves it.
 pub(crate) fn origin_reply_needs_no_prompt(
