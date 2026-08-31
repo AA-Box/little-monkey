@@ -91,6 +91,12 @@ jobs:
         # replaces a working CLI with a zero-byte file that cargo never rebuilds.
         run: pnpm test:cli-sidecar
 
+      - name: Tauri dev staging placement
+        # The Tauri CLI gives `build.devUrl` a fixed 180s and offers no way to
+        # lengthen it, so a staging step in front of `pnpm dev` spends that
+        # budget before Vite is ever started.
+        run: pnpm test:tauri-dev-command
+
       - name: Managed-runtime archive extraction
         # Linux and macOS ZIP runtime assets require `unzip`; GNU tar rejects
         # them. Keep the platform-specific selector covered before release.
