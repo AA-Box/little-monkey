@@ -108,7 +108,8 @@ fn store(paths: &DaemonPaths) -> DaemonStore {
 /// gate has nothing to hand the message to and records it as failed.
 fn add_default_route(paths: &DaemonPaths) {
     use little_monkey_lib::channels::routing::{ChannelRoute, RouteScope, RouteTarget};
-    store(paths)
+    let mut store = store(paths);
+    store
         .insert_channel_route(&ChannelRoute {
             route_id: "route-wire".to_string(),
             scope: RouteScope::global_default(),
@@ -118,6 +119,9 @@ fn add_default_route(paths: &DaemonPaths) {
             updated_at_ms: NOW,
         })
         .expect("route");
+    // A machine whose model was already chosen; the first-run gate is covered
+    // in `channel_commands` and `channel_ingress`.
+    super::channel_commands::mark_model_chosen(&mut store).expect("model chosen");
 }
 
 fn approve_sender(paths: &DaemonPaths, sender_id: &str) {

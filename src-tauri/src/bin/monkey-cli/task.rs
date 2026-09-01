@@ -1210,7 +1210,7 @@ pub fn autonomous_cancel(run_id: &str) -> Result<(), String> {
 /// type) into `monkey-cli`'s `chat::Target` (resolved against live
 /// provider/keychain state) — mirrors `main.rs::resolve_target`'s exact XOR
 /// logic, just reading from a `Recipe` instead of CLI flags.
-fn resolve_recipe_chat_target(recipe: &Recipe) -> Result<ResolvedTarget, String> {
+pub(crate) fn resolve_recipe_chat_target(recipe: &Recipe) -> Result<ResolvedTarget, String> {
     let target = &recipe.target;
     // The node's own managed runtime is not listening yet — it is started for
     // the life of this run — so it resolves to an intent rather than to an
@@ -1303,7 +1303,7 @@ fn desktop_execution_target(
 /// [`Self::ManagedModel`] names a model this machine has installed and the
 /// caller starts the app's own verified `llama-server` for it, on a fresh
 /// loopback port, for exactly the life of the run.
-enum ResolvedTarget {
+pub(crate) enum ResolvedTarget {
     Ready(Target),
     ManagedModel { model_id: String },
 }

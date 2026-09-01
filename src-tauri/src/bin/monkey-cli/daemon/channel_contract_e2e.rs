@@ -131,6 +131,9 @@ fn seed_contract_account(store: &mut DaemonStore, kind: ChannelKind, account_id:
             updated_at_ms: NOW,
         })
         .expect("behavioral route");
+    // A machine whose model was already chosen; the first-run gate is covered
+    // in `channel_commands` and `channel_ingress`.
+    crate::daemon::channel_commands::mark_model_chosen(store).expect("model chosen");
 }
 
 /// Hermes-class behavioral E2E: the provider is doubled, the messaging core is
@@ -483,6 +486,9 @@ fn seed_agent_extension_channel(store: &mut DaemonStore, now: i64) {
             updated_at_ms: now,
         })
         .expect("extension route");
+    // A machine whose model was already chosen; the first-run gate is covered
+    // in `channel_commands` and `channel_ingress`.
+    crate::daemon::channel_commands::mark_model_chosen(store).expect("model chosen");
 }
 
 async fn run_extension_agent_end_to_end(root: &Path) {
