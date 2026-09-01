@@ -274,8 +274,6 @@ describe("the route draft", () => {
 
 describe("the routes section", () => {
   it("keeps Save disabled until a Thread route names its thread", async () => {
-    // A route already exists, so the empty state's automatic first route does
-    // not run underneath the form this test drives.
     mockRoutes([FULL_ROUTE]);
     render(<ChannelRoutesSection accounts={[ACCOUNT]} />);
     fireEvent.click(await screen.findByText("Add route"));
@@ -337,26 +335,30 @@ describe("the routes section", () => {
     );
   });
 
-  it("sets the first route up on its own for an account that is already connected", async () => {
+  // Adding an account already creates the first route, in the CLI, and only
+  // when there is no route at all. This screen doing it too raced that: both
+  // wrote a global-default scope and the loser surfaced "already owns this
+  // scope" to an operator who had clicked nothing.
+  it("never creates a route on its own, however ready the account looks", async () => {
     mockRoutes([], ["channel-chat"]);
     render(<ChannelRoutesSection accounts={[ACCOUNT]} />);
 
-    // Nobody clicked anything: an account with a credential is already
-    // accepting messages, and a message with no route runs nothing.
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("channels_routes"));
+    expect(invoke.mock.calls.some(([command]) => command === "channels_add_route")).toBe(false);
+  });
+
+  it("offers the starter route instead, for the operator to ask for", async () => {
+    mockRoutes([], ["channel-chat"]);
+    render(<ChannelRoutesSection accounts={[ACCOUNT]} />);
+
+    fireEvent.click(await screen.findByText("Set up a starter task and route"));
+
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("channels_add_route", {
         recipe: "channel-chat",
         options: {},
       }),
     );
-  });
-
-  it("leaves an account that cannot receive anything alone", async () => {
-    mockRoutes([], ["channel-chat"]);
-    render(<ChannelRoutesSection accounts={[{ ...ACCOUNT, enabled: false }]} />);
-
-    await waitFor(() => expect(invoke).toHaveBeenCalledWith("channels_routes"));
-    expect(invoke.mock.calls.some(([command]) => command === "channels_add_route")).toBe(false);
   });
 
   it("names an existing starter task when setting the first route up in one click", async () => {
