@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Loader2, Pencil, Plus, Power, Trash2, X } from "lucide-react";
 import {
   type ChannelAccount,
@@ -468,22 +468,14 @@ export function ChannelRoutesSection({
     [load, onChanged],
   );
 
-  // A connected account with no route accepts messages and runs nothing, so
-  // the first route is created rather than waited for. Once per mount and only
-  // while there are no routes at all: an operator who deletes their last route
-  // inside this screen is not immediately given another one.
-  const setUpFirstRoute = useRef(false);
-  useEffect(() => {
-    if (setUpFirstRoute.current || routes === null || routes.length > 0) return;
-    // Never over the top of an operator who is already writing one.
-    if (draft !== null) return;
-    const ready = accounts.some(
-      (account) => account.enabled && (account.has_credential || !account.credential_required),
-    );
-    if (!ready) return;
-    setUpFirstRoute.current = true;
-    void run("starter", ensureStarterChannelRoute);
-  }, [accounts, draft, routes, run]);
+  // The first route is *not* created here. Adding an account already creates
+  // one, in `channels_cli::report_starter_route`, which makes it only when the
+  // machine has no route at all. This screen creating a second one raced that:
+  // both wrote a global-default scope, and the loser came back as "Route
+  // '<id>' already owns this scope" on a screen the operator had only opened
+  // to look at. The empty state's button is the same call, kept for a machine
+  // whose accounts predate that guarantee — a person asking for it cannot race
+  // themselves.
 
   const ordered = useMemo(
     () =>
