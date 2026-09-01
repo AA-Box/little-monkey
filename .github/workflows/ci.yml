@@ -18,6 +18,11 @@ jobs:
     # TS/JS checks are platform-independent — one OS is enough, no reason to
     # triplicate tsc/vitest/i18n-lint across the Rust test matrix below.
     runs-on: ubuntu-22.04
+    # The whole job is minutes; this is the wall it hits when something hangs
+    # rather than fails. Without it the job inherits the 360-minute default,
+    # and a browser that never came back once burned six hours of runner time
+    # before anyone was told anything.
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v4
@@ -77,6 +82,10 @@ jobs:
         # remove. The runner image ships Chrome, so it runs.
         env:
           REQUIRE_BROWSER: "1"
+        # The step that hangs when a headless Chrome fails to come up, and the
+        # one the job's own limit exists for. Capped tighter than the job so
+        # the log says which step wedged instead of only that the job ran out.
+        timeout-minutes: 8
         run: pnpm test:browser-policy
 
       - name: Install/upgrade smoke-test logic
