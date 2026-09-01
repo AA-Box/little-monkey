@@ -112,6 +112,46 @@ describe("recipeStore.save", () => {
   });
 });
 
+describe("recipeStore.setTarget", () => {
+  it("calls recipes_set_target with the name and target, then re-reads", async () => {
+    // The channel routes screen changes a model this way rather than through
+    // `save`: `save` takes the whole file, so changing one line would mean
+    // re-serializing a recipe the UI never parsed — deleting the operator's
+    // comments to move a model.
+    const saved = makeRecipe({ name: "channel-chat", target: { ollama: "qwen3:8b" } });
+    invokeMock.mockResolvedValueOnce(saved); // recipes_set_target
+    invokeMock.mockResolvedValueOnce([makeDiscovered({ recipe: saved })]); // recipes_list
+
+    const result = await useRecipeStore
+      .getState()
+      .setTarget("channel-chat", { ollama: "qwen3:8b" });
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "recipes_set_target", {
+      name: "channel-chat",
+      target: { ollama: "qwen3:8b" },
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "recipes_list");
+    expect(result).toEqual(saved);
+    expect(useRecipeStore.getState().recipes).toEqual([makeDiscovered({ recipe: saved })]);
+  });
+
+  it("leaves the cached recipes alone when the write fails", async () => {
+    // A picker that moved on a failed write would claim a model the runner is
+    // not going to use, so nothing may be refreshed or mutated here.
+    const before = useRecipeStore.getState().recipes;
+    invokeMock.mockRejectedValueOnce(
+      new Error("recipe target must set exactly one of provider, ollama, local_url, or managed_model"),
+    );
+
+    await expect(
+      useRecipeStore.getState().setTarget("channel-chat", {}),
+    ).rejects.toThrow("exactly one of");
+
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(useRecipeStore.getState().recipes).toBe(before);
+  });
+});
+
 describe("recipeStore.remove", () => {
   it("calls recipes_delete then refreshes", async () => {
     invokeMock.mockResolvedValueOnce(undefined); // recipes_delete

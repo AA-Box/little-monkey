@@ -8,9 +8,13 @@ pub(crate) mod channel_adapter;
 #[cfg(test)]
 mod channel_agent_e2e;
 pub(crate) mod channel_audit;
+pub(crate) mod channel_commands;
 pub(crate) mod channel_ingress;
 #[cfg(test)]
 mod channel_restart_tests;
+/// The model a channel route answers on, route to backend.
+#[cfg(test)]
+mod channel_route_model_tests;
 pub(crate) mod channel_store;
 pub(crate) mod channel_tool;
 /// Acknowledgement semantics for the four providers that are delivered to.
