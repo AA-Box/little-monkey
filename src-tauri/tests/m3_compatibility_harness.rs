@@ -41,7 +41,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 
@@ -494,35 +494,111 @@ fn hub_with(
     )
 }
 
+/// Every port this process has already handed out.
+///
+/// The pick below releases its listener so the server under test can rebind
+/// the port, and until that rebind lands the port is genuinely free — which
+/// means a pick running in a parallel test can be handed the very same port,
+/// and one of the two servers then loses the bind. Refusing to issue a port
+/// twice closes that window inside this binary; the retry in
+/// [`start_test_server`] covers the rest.
+static HANDED_OUT_PORTS: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+
+/// How many times [`start_test_server`] re-picks a port when the listener
+/// would not bind. Three is enough for a lost port race and few enough that a
+/// harness that cannot start still fails fast.
+const START_ATTEMPTS: usize = 3;
+
+/// Bind, keep the port, drop the listener so the server under test can rebind
+/// it, and treat a sandbox that forbids listeners as "skip", not "fail".
+///
+/// Never answers with a port this binary has already used: the rejected
+/// listeners are held until a fresh one comes back, so the OS cannot keep
+/// offering the same port.
 async fn free_loopback_port() -> Option<u16> {
-    match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
-        Ok(listener) => Some(listener.local_addr().expect("ephemeral address").port()),
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            eprintln!("skipping compatibility harness: sandbox forbids local listeners");
-            None
+    let mut rejected = Vec::new();
+    for _ in 0..16 {
+        let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping compatibility harness: sandbox forbids local listeners");
+                return None;
+            }
+            Err(error) => panic!("bind ephemeral test port: {error}"),
+        };
+        let port = listener.local_addr().expect("ephemeral address").port();
+        if HANDED_OUT_PORTS
+            .lock()
+            .expect("handed-out port registry")
+            .insert(port)
+        {
+            return Some(port);
         }
-        Err(error) => panic!("bind ephemeral test port: {error}"),
+        rejected.push(listener);
     }
+    panic!("the OS kept handing back ports this test binary has already used");
 }
 
 /// Starts the real M3 HTTP server (loopback, unauthenticated — a
 /// pre-existing, deliberate policy for `127.0.0.1` when
 /// `require_authentication` is false) in front of `hub` and returns
 /// `(state, base_url)`. The caller must stop the harness when done.
+///
+/// Re-picks the port when the bind loses it to another process between the
+/// pick and the bind. The last attempt still panics with the real error, so a
+/// harness that genuinely cannot start is reported rather than retried into
+/// silence.
 async fn start_test_server(hub: Arc<M3RuntimeHub>) -> Option<(CompatibilityHarnessServer, String)> {
-    let Some(port) = free_loopback_port().await else {
-        return None;
-    };
-    let mut policy = LanServerPolicy::default();
-    policy.port = port;
-    policy.require_authentication = false;
-    hub.configure_lan(policy)
-        .expect("configure loopback policy");
-    let (state, started) = start_compatibility_harness(hub)
-        .await
-        .expect("start M3 HTTP server");
-    assert_eq!(started.status, "running");
-    Some((state, format!("http://127.0.0.1:{port}")))
+    for attempt in 1..=START_ATTEMPTS {
+        let port = free_loopback_port().await?;
+        let mut policy = LanServerPolicy::default();
+        policy.port = port;
+        policy.require_authentication = false;
+        hub.configure_lan(policy)
+            .expect("configure loopback policy");
+        match start_compatibility_harness(hub.clone()).await {
+            Ok((state, started)) => {
+                assert_eq!(started.status, "running");
+                return Some((state, format!("http://127.0.0.1:{port}")));
+            }
+            Err(error) if attempt < START_ATTEMPTS => eprintln!(
+                "harness start attempt {attempt} on port {port} failed ({error}); \
+                 retrying on a fresh port"
+            ),
+            Err(error) => panic!("start M3 HTTP server: {error}"),
+        }
+    }
+    unreachable!("the last attempt either returns or panics");
+}
+
+/// Waits for a `run_cli_server_*` task to answer `/health`, and says why when
+/// it never will.
+///
+/// That server binds inside the spawned task, so a port lost between the pick
+/// and the bind surfaces here — as a silent ten-second timeout unless the
+/// task's own error is read, which is what this reads. Same budget as the
+/// `tokio::time::timeout` it replaces: 500 tries, 20ms apart.
+async fn await_cli_server_readiness(
+    server: &mut tokio::task::JoinHandle<Result<(), String>>,
+    base: &str,
+    client: &reqwest::Client,
+) {
+    for _ in 0..500 {
+        if client
+            .get(format!("{base}/health"))
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            return;
+        }
+        if server.is_finished() {
+            let outcome = server.await;
+            panic!("the server exited before readiness: {outcome:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the server never answered /health on {base}");
 }
 
 fn http_client() -> reqwest::Client {
@@ -569,6 +645,20 @@ fn pair_harness_token(hub: &M3RuntimeHub, label: &str, now_ms: u64) -> String {
     )
     .expect("complete harness token pairing")
     .token
+}
+
+/// The registry is the whole reason two harnesses in this binary cannot be
+/// handed the same port during the window between a pick and its rebind, so it
+/// is worth one direct assertion rather than only the tests that depend on it.
+#[tokio::test]
+async fn a_loopback_port_is_never_handed_out_twice() {
+    let mut seen = BTreeSet::new();
+    for _ in 0..64 {
+        let Some(port) = free_loopback_port().await else {
+            return;
+        };
+        assert!(seen.insert(port), "port {port} was handed out twice");
+    }
 }
 
 #[tokio::test]
@@ -1213,7 +1303,7 @@ async fn legacy_routes_dispatch_resolved_m3_targets_directly_for_chat_and_embedd
     }];
     let config_path = root.0.join("api_server.json");
     save_config_impl(&config_path, &config).expect("save legacy direct-M3 config");
-    let server = tokio::spawn(run_cli_server_with_m3_hub_and_endpoints(
+    let mut server = tokio::spawn(run_cli_server_with_m3_hub_and_endpoints(
         port,
         config_path,
         hub,
@@ -1225,21 +1315,7 @@ async fn legacy_routes_dispatch_resolved_m3_targets_directly_for_chat_and_embedd
     ));
     let client = http_client();
     let base = format!("http://127.0.0.1:{port}");
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if client
-                .get(format!("{base}/health"))
-                .send()
-                .await
-                .is_ok_and(|response| response.status().is_success())
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("legacy unified listener readiness");
+    await_cli_server_readiness(&mut server, &base, &client).await;
 
     let chat = client
         .post(format!("{base}/v1/chat/completions"))
@@ -1409,7 +1485,7 @@ async fn one_primary_socket_accepts_both_token_families_and_routes_each_to_its_o
     let config_path = root.0.join("api_server.json");
     save_config_impl(&config_path, &config).expect("save dual-accept config");
 
-    let server = tokio::spawn(run_cli_server_with_m3_hub_and_endpoints(
+    let mut server = tokio::spawn(run_cli_server_with_m3_hub_and_endpoints(
         port,
         config_path,
         hub,
@@ -1421,21 +1497,7 @@ async fn one_primary_socket_accepts_both_token_families_and_routes_each_to_its_o
     ));
     let client = http_client();
     let base = format!("http://127.0.0.1:{port}");
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if client
-                .get(format!("{base}/health"))
-                .send()
-                .await
-                .is_ok_and(|response| response.status().is_success())
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("unified primary endpoint readiness");
+    await_cli_server_readiness(&mut server, &base, &client).await;
 
     let models = |token: &str| {
         client

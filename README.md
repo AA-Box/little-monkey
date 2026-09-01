@@ -248,7 +248,7 @@ Node.js, `pnpm`, Rust, Cargo and your platform's Tauri 2 prerequisites are requi
 
 ```sh
 pnpm install
-pnpm tauri dev       # stage llama.cpp + the CLI sidecar, then run the app
+pnpm dev:app         # stage llama.cpp + the CLI sidecar, then run the app
 pnpm dev             # Vite front end only
 pnpm build           # TypeScript check and production front-end build
 pnpm tauri build     # desktop bundle containing the managed runtime

@@ -1210,7 +1210,7 @@ pub fn autonomous_cancel(run_id: &str) -> Result<(), String> {
 /// type) into `monkey-cli`'s `chat::Target` (resolved against live
 /// provider/keychain state) — mirrors `main.rs::resolve_target`'s exact XOR
 /// logic, just reading from a `Recipe` instead of CLI flags.
-fn resolve_recipe_chat_target(recipe: &Recipe) -> Result<ResolvedTarget, String> {
+pub(crate) fn resolve_recipe_chat_target(recipe: &Recipe) -> Result<ResolvedTarget, String> {
     let target = &recipe.target;
     // The node's own managed runtime is not listening yet — it is started for
     // the life of this run — so it resolves to an intent rather than to an
@@ -1303,7 +1303,7 @@ fn desktop_execution_target(
 /// [`Self::ManagedModel`] names a model this machine has installed and the
 /// caller starts the app's own verified `llama-server` for it, on a fresh
 /// loopback port, for exactly the life of the run.
-enum ResolvedTarget {
+pub(crate) enum ResolvedTarget {
     Ready(Target),
     ManagedModel { model_id: String },
 }
@@ -5982,6 +5982,27 @@ async fn run_inner(
             retryable: false,
         })?;
     } else {
+        // A run that arrived from a messaging conversation answers it by
+        // calling `send_message`; a model that only *wrote* an answer has said
+        // nothing to the person who wrote in. Delivering it here is the
+        // difference between a succeeded run and a reply — see
+        // `channel_tool::deliver_unsent_answer` for why it may send without
+        // asking, and for the cases where it declines to.
+        if let Some(answer) = final_message.as_deref() {
+            match crate::daemon::channel_tool::deliver_unsent_answer(answer) {
+                // The row's own id and destination are already in the log
+                // line `queue_send` writes for every queued message. This one
+                // adds only what that cannot say: the answer was queued for
+                // the run rather than by it.
+                Ok(Some(_)) => {
+                    eprintln!("channel-send: queued the run's own answer to its conversation")
+                }
+                Ok(None) => {}
+                // Never fatal: the run itself succeeded, and its answer is in
+                // the ledger either way.
+                Err(error) => eprintln!("channel-send: the run's answer was not queued: {error}"),
+            }
+        }
         recorder.emit(RunEvent::Completed {
             summary: final_message.clone(),
             result_artifact_ids: Vec::new(),

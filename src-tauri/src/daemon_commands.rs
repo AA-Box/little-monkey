@@ -4029,6 +4029,38 @@ mod tests {
         assert!(validate_id("thread id", "thread-9f2c4a").is_ok());
     }
 
+    /// The ids the daemon hands the desktop have to come back through the
+    /// bridge unchanged, or the conversation they name can never be opened.
+    #[test]
+    fn a_providers_own_identifier_reaches_the_cli_and_a_forged_one_does_not() {
+        for real in [
+            // What `conversations list` actually returns for a channel.
+            "channel:telegram:chan-d9d972559ad540bdb51f8e9055b38068:931819457",
+            // A Matrix sender, and an SMS conversation.
+            "@someone:server.org",
+            "+15555550123",
+            "chan-d9d972559ad540bdb51f8e9055b38068",
+        ] {
+            assert!(
+                channel_id("conversation id", real).is_ok(),
+                "'{real}' is an id this app itself minted"
+            );
+        }
+        for forged in [
+            // Read as a flag by the CLI's parser, not as a value.
+            "--limit=9999",
+            "../../escape",
+            "id with spaces",
+            "",
+        ] {
+            assert!(
+                channel_id("conversation id", forged).is_err(),
+                "'{forged}' must not reach an argument vector"
+            );
+        }
+        assert!(channel_id("conversation id", &"a".repeat(257)).is_err());
+    }
+
     /// A grant the peer surface must never hand out is refused at the bridge,
     /// before an argument is built.
     #[test]
@@ -4055,13 +4087,32 @@ mod tests {
 // a credential must never be visible in a process listing, and the keychain
 // entry has to be created by the executable the daemon later reads it from.
 
-const MAX_CHANNEL_ID: usize = 128;
+const MAX_CHANNEL_ID: usize = 256;
 
+/// One identifier the daemon itself minted, on its way back into an argument
+/// vector.
+///
+/// Deliberately wider than [`validate_id`]: these are *providers'* ids, not
+/// this app's, and the shapes they really take carry punctuation — a
+/// conversation is addressed as `channel:<provider>:<account>:<conversation>`,
+/// a Matrix sender is `@someone:server.org`, an SMS conversation is an E.164
+/// number. Rejecting those is not a safety property, it is a permanently
+/// unopenable conversation.
+///
+/// What is actually load-bearing stays: nothing empty or unbounded, no `..`
+/// path segment, and no leading dash — a value starting with one would be read
+/// as a flag by the CLI's own parser even though nothing here goes through a
+/// shell.
 fn channel_id(label: &str, value: &str) -> Result<String, String> {
-    validate_id(label, value)?;
-    if value.len() > MAX_CHANNEL_ID || value.starts_with('-') {
-        // A value that starts with a dash would be read as a flag by the CLI's
-        // own parser even though nothing here goes through a shell.
+    let allowed = |ch: char| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '@' | '+')
+    };
+    if value.is_empty()
+        || value.len() > MAX_CHANNEL_ID
+        || value.contains("..")
+        || value.starts_with('-')
+        || !value.chars().all(allowed)
+    {
         return Err(format!("Invalid {label}"));
     }
     Ok(value.to_string())

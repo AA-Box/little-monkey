@@ -583,6 +583,9 @@ mod tests {
                 updated_at_ms: NOW,
             })
             .expect("route");
+        // A machine whose model was already chosen; the first-run gate is
+        // covered in `channel_commands`.
+        super::super::channel_commands::mark_model_chosen(&mut store).expect("model chosen");
         let queue = FakeQueue::default();
 
         let outcome = handle_carrier_event(
@@ -627,6 +630,9 @@ mod tests {
                 updated_at_ms: NOW,
             })
             .expect("route");
+        // A machine whose model was already chosen; the first-run gate is
+        // covered in `channel_commands`.
+        super::super::channel_commands::mark_model_chosen(&mut store).expect("model chosen");
         let queue = FakeQueue::default();
         // First text creates the paired channel account.
         let _ = handle_carrier_event(
@@ -688,6 +694,9 @@ mod tests {
                 updated_at_ms: NOW,
             })
             .expect("route");
+        // A machine whose model was already chosen; the first-run gate is
+        // covered in `channel_commands`.
+        super::super::channel_commands::mark_model_chosen(&mut store).expect("model chosen");
         let queue = FakeQueue::default();
         // The account's first text is what creates the paired channel account,
         // so approve the sender through one before the interesting delivery.

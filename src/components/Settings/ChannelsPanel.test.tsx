@@ -14,7 +14,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 const invoke = vi.fn();
-vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invoke(...args) }));
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (...args: unknown[]) => invoke(...args),
+  isTauri: () => true,
+}));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 
 import { ChannelsPanel } from "./ChannelsPanel";
@@ -60,12 +63,31 @@ const ROUTE: ChannelRoute = {
   updated_at_ms: 0,
 };
 
+/** One saved task, as `recipes_list` reports it. */
+function savedTask(name: string) {
+  return {
+    path: `/tasks/${name}.yml`,
+    source: "global",
+    error: null,
+    recipe: {
+      version: 1,
+      name,
+      target: { ollama: "qwen2.5:7b" },
+      permission_mode: "manual",
+      prompt: "{{message}}",
+      params: { message: "" },
+      output: { json: false },
+    },
+  };
+}
+
 function mockChannels(options: {
   accounts: ChannelAccount[];
   routes?: ChannelRoute[];
   events?: ChannelEvent[];
   callback?: ChannelCallback;
   exposure?: ExposureStatus | null;
+  recipes?: string[];
   onCommand?: (command: string, args: unknown) => unknown;
 }) {
   invoke.mockImplementation((command: string, args: unknown) => {
@@ -81,6 +103,12 @@ function mockChannels(options: {
     }
     if (command === "channels_routes") return Promise.resolve({ routes: options.routes ?? [ROUTE] });
     if (command === "channels_senders") return Promise.resolve({ pending: [] });
+    // The route editor offers saved tasks rather than a typed name, so it
+    // lists them on mount like Settings > Tasks does — a route can only name
+    // a task that exists.
+    if (command === "recipes_list") {
+      return Promise.resolve((options.recipes ?? ["chat", "triage", "triage-2"]).map(savedTask));
+    }
     if (command === "channels_events") return Promise.resolve({ events: options.events ?? [] });
     if (command === "channels_callback_url") {
       return Promise.resolve(
@@ -429,6 +457,7 @@ describe("route management", () => {
           target: { ...ROUTE.target, params: { focus: "deps", depth: "3" } },
         },
       ],
+      recipes: ["chat", "chat-2"],
     });
     render(<ChannelsPanel />);
     await screen.findByText("Everything");
@@ -510,6 +539,7 @@ describe("ChannelsPanel state matrix", () => {
     invoke.mockImplementation((command: string) => {
       if (command === "channels_list")
         return new Promise((resolve) => (release = resolve));
+      if (command === "recipes_list") return Promise.resolve([]);
       return Promise.resolve(null);
     });
     render(<ChannelsPanel />);

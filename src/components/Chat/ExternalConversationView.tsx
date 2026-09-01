@@ -78,7 +78,13 @@ export function ExternalConversationView({ selection }: { selection: ExternalSel
             </p>
           )}
           {messages === undefined ? (
-            <p className="text-sm text-faint">{t("ExternalConversation.loading")}</p>
+            // Only while it is genuinely still in flight: a transcript that
+            // failed to load has its reason printed above, and saying
+            // "loading" underneath it says the app is still trying when it is
+            // not.
+            error ? null : (
+              <p className="text-sm text-faint">{t("ExternalConversation.loading")}</p>
+            )
           ) : messages.length === 0 ? (
             <p className="text-sm text-faint">{t("ExternalConversation.empty")}</p>
           ) : (

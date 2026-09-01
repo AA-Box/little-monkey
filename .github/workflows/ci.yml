@@ -91,6 +91,12 @@ jobs:
         # replaces a working CLI with a zero-byte file that cargo never rebuilds.
         run: pnpm test:cli-sidecar
 
+      - name: Tauri dev staging placement
+        # The Tauri CLI gives `build.devUrl` a fixed 180s and offers no way to
+        # lengthen it, so a staging step in front of `pnpm dev` spends that
+        # budget before Vite is ever started.
+        run: pnpm test:tauri-dev-command
+
       - name: Managed-runtime archive extraction
         # Linux and macOS ZIP runtime assets require `unzip`; GNU tar rejects
         # them. Keep the platform-specific selector covered before release.
@@ -277,8 +283,27 @@ jobs:
           }
           move_into_cgroup
           dbus-run-session -- bash -lc '
+            set -euo pipefail
             unset GNOME_KEYRING_CONTROL
             eval "$(printf "\\n" | gnome-keyring-daemon --unlock --replace --components=secrets)"
+            # Wait for the name to actually be on the bus before running the
+            # suite, the same way the secure-store E2E workflow does. Starting
+            # the daemon returns as soon as it has forked, not when it owns
+            # org.freedesktop.secrets, and a keychain test that runs in that
+            # window fails against a bus with no secret service on it.
+            acquired=0
+            for _ in $(seq 1 40); do
+              if busctl --user --no-pager list --acquired | grep -q org.freedesktop.secrets; then
+                acquired=1
+                break
+              fi
+              sleep 0.25
+            done
+            if [ "$acquired" -ne 1 ]; then
+              echo "Secret Service did not register on the user bus" >&2
+              busctl --user --no-pager list --acquired || true
+              exit 1
+            fi
             pnpm test:rust
           '
 

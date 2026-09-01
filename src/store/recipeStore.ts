@@ -21,6 +21,10 @@ export interface RecipeTarget {
   model?: string;
   ollama?: string;
   local_url?: string;
+  /** A model id installed in this machine's managed runtime hub, served by the
+   * app's own runtime for the life of the run — how a task names the local
+   * runtime, whose origin does not exist until the run starts. */
+  managed_model?: string;
 }
 
 export interface RecipeOutput {
@@ -70,6 +74,21 @@ export interface RecipeStore {
    * refreshes. Throws on validation/write failure — callers show the error
    * inline rather than losing the user's edits. */
   save: (name: string, content: string) => Promise<Recipe>;
+  /** Points a saved recipe at a different model, leaving every other byte of
+   * its file alone (`recipes_set_target` rewrites only the `target:` block),
+   * then refreshes.
+   *
+   * Not `save`: that takes the whole file, so a caller changing only the model
+   * would have to re-serialize a recipe it never parsed — deleting the
+   * operator's comments and reflowing their prompt to change one line.
+   *
+   * Throws on validation/write failure, and refreshes only after the write
+   * succeeded: a picker that moved on a failed save would claim a model the
+   * runner is not going to use. A stale cached `recipes` list cannot corrupt
+   * anything either — the backend re-reads the file it is about to rewrite,
+   * so the only thing staleness can cost is a mislabelled row until the next
+   * refresh. */
+  setTarget: (name: string, target: RecipeTarget) => Promise<Recipe>;
   /** Deletes the global recipe named `name`, then refreshes. */
   remove: (name: string) => Promise<void>;
   /** Validates `content` without saving — the editor's live-validate
@@ -99,6 +118,12 @@ export const useRecipeStore = create<RecipeStore>((set, get) => ({
 
   save: async (name, content) => {
     const recipe = await invoke<Recipe>("recipes_save", { name, content });
+    await get().refresh();
+    return recipe;
+  },
+
+  setTarget: async (name, target) => {
+    const recipe = await invoke<Recipe>("recipes_set_target", { name, target });
     await get().refresh();
     return recipe;
   },
