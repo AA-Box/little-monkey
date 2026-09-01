@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Loader2, Pencil, Plus, Power, Trash2, X } from "lucide-react";
 import {
   type ChannelAccount,
@@ -17,6 +17,16 @@ import {
 import { Button } from "../ui";
 import { errorMessage } from "../../lib/errors";
 import { useT } from "../../lib/i18n";
+import { useRecipeStore, type Recipe, type RecipeTarget } from "../../store/recipeStore";
+import { useModelStore } from "../../store/modelStore";
+import {
+  buildRecipeTargetOptions,
+  isTargetAvailable,
+  recipeTargetKey,
+  recipeTargetLabel,
+  type RecipeTargetOption,
+} from "../../lib/channelRouteModel";
+import { ensureStarterChannelRoute, ensureStarterRecipe } from "../../lib/starterChannelRoute";
 
 const INPUT =
   "w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground outline-none focus:ring-1 focus:ring-accent";
@@ -198,6 +208,109 @@ export function draftIncomplete(draft: RouteDraft): boolean {
   );
 }
 
+/**
+ * The model a route's task answers on, shown and changeable in place.
+ *
+ * The model is not a property of the route: a route names a *task*, and the
+ * model lives in that task's own `target:` — which is exactly what the daemon
+ * reads when a message arrives (`daemon::freeze_execution_for`). So this reads
+ * the task's target and writes the task's target, and nothing here invents a
+ * per-route model that the runner would never look at.
+ *
+ * The consequence, said out loud rather than discovered: two routes naming one
+ * task share one model.
+ */
+export function RouteModelPicker({
+  recipeName,
+  recipe,
+  options,
+  sharedWith,
+  busy,
+  onPick,
+}: {
+  recipeName: string;
+  /** The saved task, or null when the route names one that is not on disk. */
+  recipe: Recipe | null;
+  options: readonly RecipeTargetOption[];
+  /** How many routes name this same task, this one included. */
+  sharedWith: number;
+  busy: boolean;
+  onPick: (recipeName: string, target: RecipeTarget) => void;
+}) {
+  const { t } = useT();
+  const target = recipe?.target ?? null;
+  const savedKey = recipeTargetKey(target);
+  const available = isTargetAvailable(target, options);
+  const groups = useMemo(() => {
+    const byGroup = new Map<string, RecipeTargetOption[]>();
+    for (const option of options) {
+      const bucket = byGroup.get(option.group);
+      if (bucket) bucket.push(option);
+      else byGroup.set(option.group, [option]);
+    }
+    return [...byGroup];
+  }, [options]);
+
+  if (!recipe) {
+    return <span className="block text-xs text-warning">{t("ChannelsPanel.routeModelUnknownRecipe")}</span>;
+  }
+
+  return (
+    <div className="mt-1">
+      <label className="flex flex-wrap items-center gap-2 text-xs text-muted">
+        {t("ChannelsPanel.routeModel")}
+        <select
+          className="min-w-0 max-w-full rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground outline-none focus:ring-1 focus:ring-accent"
+          disabled={busy}
+          value={savedKey ?? ""}
+          onChange={(event) => {
+            const picked = options.find((option) => option.key === event.target.value);
+            // The saved-but-unavailable entry and the "no model set" entry are
+            // not choices: neither maps to an option, and re-selecting either
+            // must not write anything.
+            if (picked) onPick(recipeName, picked.target);
+          }}
+        >
+          {/* A task whose target this machine cannot currently offer still
+              shows the target it actually has. Replacing it with "unknown", or
+              quietly snapping the control to the first available model, would
+              hide the one thing this row exists to report — and merely opening
+              settings must not change what a route answers on. */}
+          {savedKey === null && <option value="">{t("ChannelsPanel.routeModelUnset")}</option>}
+          {savedKey !== null && !available && (
+            <option value={savedKey}>
+              {t("ChannelsPanel.routeModelUnavailableOption", { label: recipeTargetLabel(target) })}
+            </option>
+          )}
+          {groups.map(([group, entries]) => (
+            <optgroup key={group} label={group}>
+              {entries.map((option) => (
+                <option key={option.key} value={option.key}>
+                  {option.displayName}
+                </option>
+              ))}
+            </optgroup>
+          ))}
+        </select>
+        {busy && <Loader2 size={12} className="animate-spin" />}
+      </label>
+      {savedKey !== null && !available && (
+        <span className="mt-1 block text-xs text-warning">
+          {t("ChannelsPanel.routeModelUnavailable")}
+        </span>
+      )}
+      {options.length === 0 && (
+        <span className="mt-1 block text-xs text-faint">{t("ChannelsPanel.routeModelEmpty")}</span>
+      )}
+      {sharedWith > 1 && (
+        <span className="mt-1 block text-xs text-faint">
+          {t("ChannelsPanel.routeModelShared", { count: String(sharedWith) })}
+        </span>
+      )}
+    </div>
+  );
+}
+
 /** A one-line description of what a route matches, in the operator's terms. */
 function scopeSummary(scope: ChannelRouteScope, accounts: ChannelAccount[]): string {
   const parts: string[] = [];
@@ -231,6 +344,24 @@ export function ChannelRoutesSection({
     senders: [],
   });
 
+  // The tasks a route may name. Offered as a list rather than typed: the
+  // daemon resolves a route's recipe by name at message time, so a typo is
+  // not refused here — it is a message that arrives, fails, and is only
+  // explicable from the event log.
+  const recipes = useRecipeStore((state) => state.recipes);
+  const refreshRecipes = useRecipeStore((state) => state.refresh);
+  const setRecipeTarget = useRecipeStore((state) => state.setTarget);
+
+  // Everything this machine could answer a channel message on. The same
+  // inventory the Models, Ollama and provider panels show — read from the same
+  // store rather than fetched again here, and refreshed on mount because a
+  // settings screen may well be the first thing opened after a restart.
+  const installed = useModelStore((state) => state.installed);
+  const ollamaModels = useModelStore((state) => state.ollamaModels);
+  const ollamaReachable = useModelStore((state) => state.ollamaReachable);
+  const providers = useModelStore((state) => state.providers);
+  const providerModels = useModelStore((state) => state.providerModels);
+
   const load = useCallback(async () => {
     try {
       const listed = await channelsRoutes();
@@ -243,7 +374,48 @@ export function ChannelRoutesSection({
 
   useEffect(() => {
     void load();
-  }, [load]);
+    void refreshRecipes();
+    const models = useModelStore.getState();
+    // Failures are deliberately swallowed: a machine with no Ollama daemon and
+    // no provider keys is a normal machine, and its route list must still
+    // render. The picker simply offers what did answer.
+    void models.refresh().catch(() => {});
+    void models.refreshOllama().catch(() => {});
+    // Re-hydrates each connected provider's model list too — see
+    // `modelStore.refreshProviders`.
+    void models.refreshProviders().catch(() => {});
+  }, [load, refreshRecipes]);
+
+  const recipeNames = useMemo(
+    () => [
+      ...new Set(
+        recipes.flatMap((entry) => (entry.recipe && !entry.error ? [entry.recipe.name] : [])),
+      ),
+    ].sort(),
+    [recipes],
+  );
+
+  /** Task name -> the saved task, so a route row can read its model. */
+  const recipesByName = useMemo(() => {
+    const byName = new Map<string, Recipe>();
+    for (const entry of recipes) {
+      if (entry.recipe && !entry.error) byName.set(entry.recipe.name, entry.recipe);
+    }
+    return byName;
+  }, [recipes]);
+
+  const modelOptions = useMemo(
+    () =>
+      buildRecipeTargetOptions({
+        installed,
+        ollamaModels,
+        ollamaReachable,
+        providers,
+        providerModels,
+      }),
+    [installed, ollamaModels, ollamaReachable, providers, providerModels],
+  );
+
 
   // Recent activity for whichever account the draft names: the observed
   // conversation, thread and sender ids an operator can pick from instead of
@@ -296,6 +468,23 @@ export function ChannelRoutesSection({
     [load, onChanged],
   );
 
+  // A connected account with no route accepts messages and runs nothing, so
+  // the first route is created rather than waited for. Once per mount and only
+  // while there are no routes at all: an operator who deletes their last route
+  // inside this screen is not immediately given another one.
+  const setUpFirstRoute = useRef(false);
+  useEffect(() => {
+    if (setUpFirstRoute.current || routes === null || routes.length > 0) return;
+    // Never over the top of an operator who is already writing one.
+    if (draft !== null) return;
+    const ready = accounts.some(
+      (account) => account.enabled && (account.has_credential || !account.credential_required),
+    );
+    if (!ready) return;
+    setUpFirstRoute.current = true;
+    void run("starter", ensureStarterChannelRoute);
+  }, [accounts, draft, routes, run]);
+
   const ordered = useMemo(
     () =>
       [...(routes ?? [])].sort((left, right) => {
@@ -306,6 +495,29 @@ export function ChannelRoutesSection({
         return rank(left) - rank(right) || left.route_id.localeCompare(right.route_id);
       }),
     [routes],
+  );
+
+  /** How many routes name each task, so a row can say when a model change
+   * moves more than the route the operator is looking at. */
+  const routesPerRecipe = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const route of routes ?? []) {
+      counts.set(route.target.recipe, (counts.get(route.target.recipe) ?? 0) + 1);
+    }
+    return counts;
+  }, [routes]);
+
+  /** Writes the picked model into the task's own `target:` and re-reads it.
+   *
+   * Nothing is mirrored locally: the select's value is derived from the store's
+   * copy of the task, which is only replaced once the backend has written and
+   * re-parsed the file. A failed write therefore leaves the control showing the
+   * model the runner will really use, and puts the reason in the error line. */
+  const pickModel = useCallback(
+    (recipeName: string, target: RecipeTarget) => {
+      void run(`model-${recipeName}`, () => setRecipeTarget(recipeName, target));
+    },
+    [run, setRecipeTarget],
   );
 
   const uses = draft ? scopeFields(draft.level) : null;
@@ -336,7 +548,18 @@ export function ChannelRoutesSection({
           {t("ChannelsPanel.loading")}
         </p>
       ) : ordered.length === 0 ? (
-        <p className="mt-3 text-xs text-muted">{t("ChannelsPanel.noRoutesYet")}</p>
+        <div className="mt-3 flex flex-col items-start gap-2">
+          <p className="text-xs text-muted">{t("ChannelsPanel.noRoutesYet")}</p>
+          <Button
+            size="sm"
+            disabled={busy !== null}
+            onClick={() => void run("starter", ensureStarterChannelRoute)}
+          >
+            {busy === "starter" ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
+            {t("ChannelsPanel.starterRoute")}
+          </Button>
+          <span className="text-xs text-faint">{t("ChannelsPanel.starterRouteHint")}</span>
+        </div>
       ) : (
         <ul className="mt-3 flex flex-col gap-2">
           {ordered.map((route) => (
@@ -355,6 +578,14 @@ export function ChannelRoutesSection({
                 <span className="block truncate text-xs text-muted">
                   {scopeSummary(route.scope, accounts) || t("ChannelsPanel.scopeGlobal")}
                 </span>
+                <RouteModelPicker
+                  recipeName={route.target.recipe}
+                  recipe={recipesByName.get(route.target.recipe) ?? null}
+                  options={modelOptions}
+                  sharedWith={routesPerRecipe.get(route.target.recipe) ?? 1}
+                  busy={busy === `model-${route.target.recipe}`}
+                  onPick={pickModel}
+                />
               </span>
               <span className="flex gap-1">
                 <Button size="sm" disabled={busy !== null} onClick={() => setDraft(draftFrom(route))}>
@@ -401,15 +632,51 @@ export function ChannelRoutesSection({
           </div>
 
           <div className="mt-3 grid gap-2 sm:grid-cols-2">
-            <label className="text-xs text-muted">
-              {t("ChannelsPanel.recipe")}
-              <input
-                className={`${INPUT} mt-1`}
-                value={draft.recipe}
-                onChange={(event) => setDraft({ ...draft, recipe: event.target.value })}
-                placeholder="chat"
-              />
-            </label>
+            <div>
+              <label className="text-xs text-muted">
+                {t("ChannelsPanel.recipe")}
+                <select
+                  className={`${INPUT} mt-1`}
+                  value={draft.recipe}
+                  onChange={(event) => setDraft({ ...draft, recipe: event.target.value })}
+                >
+                  <option value="">{t("ChannelsPanel.recipePick")}</option>
+                  {/* A route saved against a task that has since been renamed
+                      or deleted keeps naming it here, rather than silently
+                      reading as some other task the moment it is opened. */}
+                  {draft.recipe.length > 0 && !recipeNames.includes(draft.recipe) && (
+                    <option value={draft.recipe}>
+                      {t("ChannelsPanel.recipeMissingOption", { name: draft.recipe })}
+                    </option>
+                  )}
+                  {recipeNames.map((name) => (
+                    <option key={name} value={name}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {draft.recipe.length > 0 && !recipeNames.includes(draft.recipe) && (
+                <span className="mt-1 block text-xs text-warning">
+                  {t("ChannelsPanel.recipeMissing")}
+                </span>
+              )}
+              {recipeNames.length === 0 && (
+                <Button
+                  size="sm"
+                  className="mt-2"
+                  disabled={busy !== null}
+                  onClick={() =>
+                    void run("starter-recipe", async () =>
+                      setDraft({ ...draft, recipe: await ensureStarterRecipe() }),
+                    )
+                  }
+                >
+                  <Plus size={12} />
+                  {t("ChannelsPanel.starterRecipe")}
+                </Button>
+              )}
+            </div>
             <label className="text-xs text-muted">
               {t("ChannelsPanel.scope")}
               <select

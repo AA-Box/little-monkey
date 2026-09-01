@@ -1465,6 +1465,9 @@ mod tests {
                 updated_at_ms: NOW,
             })
             .expect("route");
+        // A machine whose model was already chosen — the steady state. The
+        // first-run gate is exercised in `channel_commands`.
+        super::super::channel_commands::mark_model_chosen(&mut store).expect("model chosen");
         store
     }
 
@@ -2895,6 +2898,131 @@ mod tests {
             assert!(error.contains("consistency"), "{error}");
         }
         assert_eq!(store.outbox_count_for_job("job-1").unwrap(), 1);
+    }
+
+    /// The failure this exists to end: the model wrote a perfectly good answer
+    /// and never called the tool, so the run succeeded and the person who
+    /// wrote in got silence.
+    #[test]
+    fn an_answer_the_run_never_sent_is_delivered_to_the_conversation_it_came_from() {
+        let mut store = seeded_store();
+        let queue = FakeQueue::default();
+        ingest_batch(&mut store, &queue, &[envelope("evt-1")], NOW);
+        let job_id = queue.submitted.lock().unwrap()[0].clone();
+        let origin = store
+            .channel_origin_for_job(&job_id)
+            .expect("origin")
+            .expect("the job came from a conversation");
+        let paths = scratch_paths();
+
+        let queued = super::super::channel_tool::deliver_unsent_answer_with(
+            &mut store,
+            &paths,
+            &job_id,
+            &origin,
+            "Hi Ahmad! What can I help you with today?",
+            NOW + 1_000,
+        )
+        .expect("delivering an answer is not an error");
+        assert!(queued.is_some(), "the answer must reach the outbox");
+        assert_eq!(store.outbox_count_for_job(&job_id).unwrap(), 1);
+
+        // A replayed run recomputes the same invocation identity, so the
+        // person is not answered twice.
+        super::super::channel_tool::deliver_unsent_answer_with(
+            &mut store,
+            &paths,
+            &job_id,
+            &origin,
+            "Hi Ahmad! What can I help you with today?",
+            NOW + 2_000,
+        )
+        .expect("replay");
+        assert_eq!(store.outbox_count_for_job(&job_id).unwrap(), 1);
+    }
+
+    /// A run that chose what to say keeps that choice: this never appends a
+    /// second message to one the model already sent.
+    #[test]
+    fn a_run_that_spoke_for_itself_is_not_answered_for() {
+        let mut store = seeded_store();
+        let queue = FakeQueue::default();
+        ingest_batch(&mut store, &queue, &[envelope("evt-1")], NOW);
+        let job_id = queue.submitted.lock().unwrap()[0].clone();
+        let origin = store
+            .channel_origin_for_job(&job_id)
+            .expect("origin")
+            .expect("origin");
+        let paths = scratch_paths();
+        let request = send_to("chat-7", "the model's own words");
+        // The run's own send, under the same origin-reply grant the route gave
+        // it — exactly what a model that calls the tool produces.
+        let its_own_grant = SendAuthority {
+            reply: true,
+            ..SendAuthority::default()
+        };
+        let plan = super::super::channel_tool::plan_send(&request, &its_own_grant, Some(&origin))
+            .expect("authorized");
+        super::super::channel_tool::queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            Some(&origin),
+            &invocation(&job_id, "call-1"),
+            NOW,
+        )
+        .expect("the run's own send");
+
+        assert!(super::super::channel_tool::deliver_unsent_answer_with(
+            &mut store,
+            &paths,
+            &job_id,
+            &origin,
+            "a summary nobody asked to be sent",
+            NOW + 1_000,
+        )
+        .expect("asking is not an error")
+        .is_none());
+        assert_eq!(store.outbox_count_for_job(&job_id).unwrap(), 1);
+    }
+
+    /// The operator's route decides, not the run: a route that does not grant
+    /// a reply produces no message, however the run ended.
+    #[test]
+    fn a_route_that_grants_no_reply_delivers_nothing() {
+        let mut store = seeded_store();
+        let mut target = RouteTarget::new("chat");
+        target.reply_to_conversation = false;
+        store
+            .update_channel_route(&ChannelRoute {
+                route_id: "route-1".into(),
+                scope: RouteScope::account("acct-1"),
+                target,
+                enabled: true,
+                created_at_ms: NOW,
+                updated_at_ms: NOW,
+            })
+            .expect("route without a reply grant");
+        let queue = FakeQueue::default();
+        ingest_batch(&mut store, &queue, &[envelope("evt-1")], NOW);
+        let job_id = queue.submitted.lock().unwrap()[0].clone();
+        let origin = store
+            .channel_origin_for_job(&job_id)
+            .expect("origin")
+            .expect("origin");
+
+        assert!(super::super::channel_tool::deliver_unsent_answer_with(
+            &mut store,
+            &scratch_paths(),
+            &job_id,
+            &origin,
+            "an answer nobody granted",
+            NOW + 1_000,
+        )
+        .expect("asking is not an error")
+        .is_none());
+        assert_eq!(store.outbox_count_for_job(&job_id).unwrap(), 0);
     }
 
     /// A replay does not need the process that wrote the row: the invocation
