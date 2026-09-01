@@ -2,9 +2,17 @@
 // Builds `monkey-cli` and stages it into src-tauri/binaries/ under the
 // target-triple-suffixed name Tauri's `externalBin` sidecar convention
 // expects (see src-tauri/tauri.conf.json's bundle.externalBin), so
-// `pnpm tauri dev` / `pnpm tauri build` never trip "sidecar binary not
-// found" — wired in as the first half of both beforeDevCommand and
-// beforeBuildCommand.
+// `pnpm dev:app` / `pnpm tauri build` never trip "sidecar binary not
+// found" — wired in as the last step of `pnpm stage:all` (which
+// `dev:app` runs before handing over to `tauri dev`) and as the first
+// half of beforeBuildCommand.
+//
+// It deliberately does *not* run from beforeDevCommand: the Tauri CLI
+// starts a 180s countdown for `build.devUrl` the moment it spawns that
+// command, and a cold `cargo build --release` here outlasts it, so the
+// dev run died with "Could not connect to http://127.0.0.1:1420/ after
+// 180s" before Vite was ever reached. Staging ahead of `tauri dev`
+// leaves Vite as the only thing that countdown is timing.
 //
 // Local dev: builds for the host triple (no `--target` flag, so it doesn't
 // require a rustup target to be installed beyond the default host one).

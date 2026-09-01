@@ -1014,6 +1014,10 @@ pub(crate) fn seed_channel(store: &mut DaemonStore, kind: ChannelKind, now: i64)
             updated_at_ms: now,
         })
         .expect("route");
+    // A machine whose model was already chosen — the steady state. The
+    // first-run gate is exercised in `channel_commands` and in
+    // `channel_ingress`, not by every provider's path through here.
+    super::channel_commands::mark_model_chosen(store).expect("model chosen");
 }
 
 pub(crate) fn now_ms() -> i64 {

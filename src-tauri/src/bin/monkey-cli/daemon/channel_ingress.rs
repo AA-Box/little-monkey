@@ -252,6 +252,29 @@ pub(crate) fn accept_channel_envelope_with(
     };
 
     match decide_access(envelope, context, || candidate_code) {
+        // A command the activation gate would have dropped. Telegram only
+        // appends `@botname` when the person picks the command from a menu that
+        // knows which bot it is for, so requiring the mention here would mean a
+        // group member has to know the bot's username to ask it anything about
+        // itself. Every other ignore stands: this is the activation gate only,
+        // reached by a sender already allowed to talk to us, and a command we
+        // do not implement parses to nothing and is dropped as before.
+        AccessDecision::Ignore(IgnoreReason::NotMentioned)
+            if super::channel_commands::command_for(envelope).is_some() =>
+        {
+            let command = super::channel_commands::command_for(envelope)
+                .expect("the guard just matched this command");
+            answer_command(
+                store,
+                queue,
+                &account,
+                envelope,
+                &event,
+                command,
+                IgnoreReason::Command,
+                now_ms,
+            )
+        }
         AccessDecision::Ignore(reason) => commit_settled(
             store,
             &event,
@@ -298,11 +321,46 @@ pub(crate) fn accept_channel_envelope_with(
             .map(|event_id| ChannelAcceptance::Challenge { event_id })
         }
         AccessDecision::Accept => {
+            // Answered by the daemon, not by a run: a command asks about state
+            // the model cannot see, and `/settings` changes what the *next*
+            // message runs on. Placed after the access gate so a stranger still
+            // meets the pairing challenge rather than a menu.
+            if let Some(command) = super::channel_commands::command_for(envelope) {
+                return answer_command(
+                    store,
+                    queue,
+                    &account,
+                    envelope,
+                    &event,
+                    command,
+                    IgnoreReason::Command,
+                    now_ms,
+                );
+            }
             let routes = store.channel_routes()?;
             let route = match resolve_route(&routes, envelope) {
                 Ok(route) => route.clone(),
                 Err(error) => return refuse(store, &event, &error.to_string(), now_ms),
             };
+            // Nobody has chosen a model yet, so the menu is the answer and this
+            // message does not run. Machine-wide and one-time: the first choice
+            // opens the gate for every conversation, which is the same scope the
+            // choice itself has.
+            if !super::channel_commands::model_chosen(
+                store,
+                super::channel_commands::routed_target(Some(&route)).as_deref(),
+            )? {
+                return answer_command(
+                    store,
+                    queue,
+                    &account,
+                    envelope,
+                    &event,
+                    super::channel_commands::Command::ChooseFirst,
+                    IgnoreReason::ModelNotChosen,
+                    now_ms,
+                );
+            }
 
             let mut ingress = ConversationIngress::from_channel(envelope, &route);
             if depth > 0 {
@@ -465,6 +523,46 @@ fn commit_settled(
         DurableAcceptance::Settled { event_id, .. } => Ok(event_id),
         DurableAcceptance::Runnable { event_id, .. } => Ok(event_id),
     }
+}
+
+/// Answer a command the daemon handles itself: no run, one reply, one settled
+/// event.
+///
+/// The reply is queued *before* the event settles, and both writes are keyed —
+/// the outbox row by the provider's own event id — so a crash between them is
+/// replayed by the provider's redelivery rather than losing the answer, and a
+/// redelivery that arrives after the settle is a duplicate that sends nothing.
+#[allow(clippy::too_many_arguments)]
+fn answer_command(
+    store: &mut DaemonStore,
+    queue: &dyn super::channel_worker::RunQueue,
+    account: &ChannelAccountRecord,
+    envelope: &ChannelEnvelope,
+    event: &NewChannelEvent,
+    command: super::channel_commands::Command,
+    reason: IgnoreReason,
+    now_ms: i64,
+) -> Result<ChannelAcceptance, String> {
+    let text = super::channel_commands::reply(store, queue, account, envelope, command, now_ms)?;
+    let reply = outbound_row(
+        account,
+        envelope,
+        text,
+        format!("command-{}", envelope.provider_event_id),
+        0,
+        None,
+        now_ms,
+    )?;
+    store.enqueue_channel_message(&reply)?;
+    commit_settled(
+        store,
+        event,
+        EnvelopeDecision::Ignore {
+            reason: reason.as_str(),
+        },
+        now_ms,
+    )
+    .map(|event_id| ChannelAcceptance::Ignore { event_id, reason })
 }
 
 /// Record a message this daemon cannot act on, without answering its sender.
@@ -1229,6 +1327,11 @@ mod tests {
                 updated_at_ms: NOW,
             })
             .expect("route");
+        // These tests are about the acceptance path, not the first-run model
+        // gate: the machine is set up as one where a model was already chosen.
+        // `a_first_message_before_any_pick_shows_the_menu` covers the other
+        // side.
+        super::super::channel_commands::mark_model_chosen(&mut store).expect("model chosen");
         store
     }
 
@@ -1305,6 +1408,16 @@ mod tests {
         )?;
         store.enqueue_channel_message(&row)?;
         Ok(())
+    }
+
+    /// Put the machine back in the state it is in before anyone has chosen a
+    /// model, armed against the model this store's route actually names — the
+    /// same string the acceptance path computes, so the gate is pinned shut
+    /// whatever this machine has installed.
+    fn arm_gate(store: &mut DaemonStore) {
+        let routes = store.channel_routes().expect("routes");
+        let target = super::super::channel_commands::routed_target(routes.first());
+        super::super::channel_commands::arm_model_gate(store, target.as_deref()).expect("arm");
     }
 
     fn ignored_reason(accepted: &ChannelAcceptance) -> IgnoreReason {
@@ -1628,6 +1741,108 @@ mod tests {
         assert!(!payload.message.text.contains("let me in"));
     }
 
+    /// A command is the daemon's own answer: the sender hears back, and no run
+    /// is queued for a message the model was never meant to see.
+    #[test]
+    fn a_command_is_answered_by_the_daemon_and_never_becomes_a_run() {
+        let mut store = store_with_account(open_policy());
+        let planned = plan(&mut store, &dm("/help", "1"));
+
+        assert_eq!(ignored_reason(&planned), IgnoreReason::Command);
+        let queued = store.claim_outbox_batch(NOW, 10).unwrap();
+        assert_eq!(queued.len(), 1);
+        let payload: OutboxPayload = serde_json::from_str(&queued[0].payload_json).unwrap();
+        assert!(payload.message.text.contains("/settings"), "{payload:?}");
+        assert!(store.recent_ingress_turns(10).unwrap().is_empty());
+    }
+
+    /// The first message on a machine where nobody has chosen a model is met
+    /// with the menu, and is not run: the gate is the whole point of asking.
+    #[test]
+    fn a_first_message_before_any_choice_is_answered_with_the_menu() {
+        let mut store = store_with_account(open_policy());
+        arm_gate(&mut store);
+
+        let planned = plan(&mut store, &dm("what is the weather", "1"));
+
+        assert_eq!(ignored_reason(&planned), IgnoreReason::ModelNotChosen);
+        assert!(store.recent_ingress_turns(10).unwrap().is_empty());
+        let queued = store.claim_outbox_batch(NOW, 10).unwrap();
+        let payload: OutboxPayload = serde_json::from_str(&queued[0].payload_json).unwrap();
+        assert!(
+            payload.message.text.contains("Pick a model first"),
+            "{payload:?}"
+        );
+    }
+
+    /// And once a model is chosen, the same conversation runs normally.
+    #[test]
+    fn a_message_after_the_choice_runs() {
+        let mut store = store_with_account(open_policy());
+        arm_gate(&mut store);
+        assert_eq!(
+            ignored_reason(&plan(&mut store, &dm("hello", "1"))),
+            IgnoreReason::ModelNotChosen
+        );
+
+        super::super::channel_commands::mark_model_chosen(&mut store).expect("chosen");
+
+        assert!(matches!(
+            plan(&mut store, &dm("hello", "2")),
+            ChannelAcceptance::Run { .. }
+        ));
+    }
+
+    /// A gated machine still answers its own commands: `/model` is how the
+    /// person gets past the gate, so it cannot be behind it.
+    #[test]
+    fn a_command_is_answered_even_while_the_gate_is_shut() {
+        let mut store = store_with_account(open_policy());
+        arm_gate(&mut store);
+
+        assert_eq!(
+            ignored_reason(&plan(&mut store, &dm("/model", "1"))),
+            IgnoreReason::Command
+        );
+    }
+
+    /// The same redelivery rule every other decision follows: the provider
+    /// resending a command must not answer it twice.
+    #[test]
+    fn a_redelivered_command_is_a_duplicate_and_answers_once() {
+        let mut store = store_with_account(open_policy());
+        let first = plan(&mut store, &dm("/help", "1"));
+        let second = plan(&mut store, &dm("/help", "1"));
+
+        assert_eq!(ignored_reason(&first), IgnoreReason::Command);
+        assert!(matches!(second, ChannelAcceptance::Duplicate { .. }));
+        assert_eq!(store.claim_outbox_batch(NOW, 10).unwrap().len(), 1);
+    }
+
+    /// Commands are for senders the account already talks to. An unpaired
+    /// stranger typing `/settings` must not learn what this machine runs, let
+    /// alone change it.
+    #[test]
+    fn an_unpaired_sender_gets_the_challenge_rather_than_the_command() {
+        let mut store = store_with_account(ChannelAccessPolicy::default());
+        let planned = plan(&mut store, &dm("/settings 1", "1"));
+
+        assert!(matches!(planned, ChannelAcceptance::Challenge { .. }));
+        let queued = store.claim_outbox_batch(NOW, 10).unwrap();
+        let payload: OutboxPayload = serde_json::from_str(&queued[0].payload_json).unwrap();
+        assert!(payload.message.text.contains("PAIR1234"));
+    }
+
+    /// A message that merely mentions a command word is a message.
+    #[test]
+    fn ordinary_text_still_runs() {
+        let mut store = store_with_account(open_policy());
+        assert!(matches!(
+            plan(&mut store, &dm("what is the status of the deploy?", "1")),
+            ChannelAcceptance::Run { .. }
+        ));
+    }
+
     #[test]
     fn a_second_message_while_a_code_is_live_does_not_mint_another() {
         let mut store = store_with_account(ChannelAccessPolicy::default());
@@ -1691,6 +1906,61 @@ mod tests {
             plan(&mut store, &mentioned),
             ChannelAcceptance::Run { .. }
         ));
+    }
+
+    /// Telegram only appends `@botname` when the person picks the command from
+    /// a menu that knows which bot it is for. Typing `/status` in a group has to
+    /// work without them learning the bot's username.
+    #[test]
+    fn an_unaddressed_command_in_a_group_is_answered_without_a_mention() {
+        let mut store = store_with_account(ChannelAccessPolicy {
+            group: AccessPolicy::Open,
+            ..ChannelAccessPolicy::default()
+        });
+        let mut envelope = dm("/help", "1");
+        envelope.conversation = ChannelConversation::group("room-1");
+
+        assert_eq!(
+            ignored_reason(&plan(&mut store, &envelope)),
+            IgnoreReason::Command
+        );
+        assert_eq!(store.claim_outbox_batch(NOW, 10).unwrap().len(), 1);
+    }
+
+    /// Groups hold more than one bot. A command addressed to a different one is
+    /// not ours to answer, and only the adapter knows which name is ours — so
+    /// an addressed command runs on `mentions_self` and nothing else.
+    #[test]
+    fn a_command_addressed_to_another_bot_is_left_alone() {
+        let mut store = store_with_account(ChannelAccessPolicy {
+            group: AccessPolicy::Open,
+            ..ChannelAccessPolicy::default()
+        });
+        let mut envelope = dm("/help@some_other_bot", "1");
+        envelope.conversation = ChannelConversation::group("room-1");
+
+        assert_eq!(
+            ignored_reason(&plan(&mut store, &envelope)),
+            IgnoreReason::NotMentioned
+        );
+        assert!(store.claim_outbox_batch(NOW, 10).unwrap().is_empty());
+    }
+
+    /// The same command, addressed to us, is ours.
+    #[test]
+    fn a_command_addressed_to_us_is_answered() {
+        let mut store = store_with_account(ChannelAccessPolicy {
+            group: AccessPolicy::Open,
+            ..ChannelAccessPolicy::default()
+        });
+        let mut envelope = dm("/help@little_monkey_bot", "1");
+        envelope.conversation = ChannelConversation::group("room-1");
+        envelope.mentions_self = true;
+
+        assert_eq!(
+            ignored_reason(&plan(&mut store, &envelope)),
+            IgnoreReason::Command
+        );
     }
 
     #[test]
@@ -2139,6 +2409,11 @@ mod tests {
                 updated_at_ms: NOW,
             })
             .expect("route");
+        // These tests are about the acceptance path, not the first-run model
+        // gate: the machine is set up as one where a model was already chosen.
+        // `a_first_message_before_any_pick_shows_the_menu` covers the other
+        // side.
+        super::super::channel_commands::mark_model_chosen(&mut store).expect("model chosen");
         store
     }
 

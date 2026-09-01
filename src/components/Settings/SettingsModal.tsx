@@ -63,6 +63,14 @@ const AutomationPanel = lazy(() =>
   import("./AutomationPanel").then((module) => ({ default: module.AutomationPanel })),
 );
 
+// Split out for the same reason as the panel above: it carries the whole
+// channel surface — accounts, exposure, routes, ingress turns — into a chunk
+// every other settings tab pays for, and it is opened by the few people who
+// connect a messaging account.
+const ChannelsPanel = lazy(() =>
+  import("./ChannelsPanel").then((module) => ({ default: module.ChannelsPanel })),
+);
+
 import { ProviderModelsPanel } from "./OpenRouterModelsPanel";
 import {
   connectedProviderNavigationItems,
@@ -86,7 +94,6 @@ import { ExecutableExtensionsPanel } from "./ExecutableExtensionsPanel";
 import { RuntimeHubPanel } from "./RuntimeHubPanel";
 import { BrowserVerificationPanel } from "./BrowserVerificationPanel";
 import { BackgroundAgentsPanel } from "./BackgroundAgentsPanel";
-import { ChannelsPanel } from "./ChannelsPanel";
 import { PeersPanel } from "./PeersPanel";
 import { TelephonyPanel } from "./TelephonyPanel";
 import { ResourceLedgerPanel } from "./ResourceLedgerPanel";
@@ -498,7 +505,11 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "triage" && <TriagePanel />}
               {tab === "approvalchains" && <ApprovalChainsPanel />}
               {tab === "background" && <BackgroundAgentsPanel />}
-              {tab === "channels" && <ChannelsPanel />}
+              {tab === "channels" && (
+                <Suspense fallback={<PanelFallback />}>
+                  <ChannelsPanel />
+                </Suspense>
+              )}
               {tab === "peers" && <PeersPanel />}
               {tab === "telephony" && <TelephonyPanel />}
               {tab === "companion" && <CompanionPanel />}
