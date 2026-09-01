@@ -102,7 +102,13 @@ pub(super) fn model_chosen(
             None => Ok(true),
         },
         None => {
-            if catalogue().is_empty() {
+            let models = catalogue();
+            // Nothing to offer, or the route already names a model this machine
+            // can actually run: either way there is nothing to ask. Asking a
+            // person to choose while their bot is working is not a first-run
+            // question, it is an obstacle — and the recipe naming a model that
+            // *is* installed is as good an answer as one typed into a chat.
+            if models.is_empty() || runnable_target(&models, current_target) {
                 open_gate(store)?;
                 return Ok(true);
             }
@@ -120,6 +126,18 @@ pub(super) fn routed_target(route: Option<&ChannelRoute>) -> Option<String> {
     let roots = recipes::global_config_roots().ok()?;
     let recipe = recipes::resolve_recipe(&route.target.recipe, None, &roots).ok()?;
     Some(super::describe_recipe_target(&recipe.target))
+}
+
+/// Whether `target` is one of the models on the menu — that is, one this
+/// machine can start. A target naming something uninstalled is what makes the
+/// question worth asking.
+fn runnable_target(models: &[ModelChoice], target: Option<&str>) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    models
+        .iter()
+        .any(|model| super::describe_recipe_target(&model.target) == target)
 }
 
 fn open_gate(store: &mut DaemonStore) -> Result<(), String> {
@@ -491,16 +509,31 @@ fn render(models: &[ModelChoice]) -> String {
 /// targets are set by the operator, from the desktop app or the recipe file.
 fn catalogue() -> Vec<ModelChoice> {
     let mut models = ollama_models();
-    if let Some(app_data) = crate::app_data_dir() {
-        for installed in little_monkey_lib::m3_runtime_hub::installed_model_inventory(&app_data) {
-            models.push(ModelChoice {
-                label: format!("Local · {}", installed.model_id),
-                target: RecipeTarget {
-                    managed_model: Some(installed.model_id),
-                    ..Default::default()
-                },
-            });
+    let Some(app_data) = crate::app_data_dir() else {
+        return models;
+    };
+    // Both stores a `managed_model` id can resolve from, in the order the
+    // runner tries them: the M3 hub, then the app's own managed models
+    // directory. Listing only the hub hid the model the desktop app downloaded
+    // — the one most machines actually answer on.
+    let mut seen = std::collections::BTreeSet::new();
+    let hub = little_monkey_lib::m3_runtime_hub::installed_model_inventory(&app_data)
+        .into_iter()
+        .map(|installed| installed.model_id);
+    let app_models = little_monkey_lib::models::app_managed_chat_models(&app_data)
+        .into_iter()
+        .map(|(model_id, _)| model_id);
+    for model_id in hub.chain(app_models) {
+        if !seen.insert(model_id.clone()) {
+            continue;
         }
+        models.push(ModelChoice {
+            label: format!("Local · {model_id}"),
+            target: RecipeTarget {
+                managed_model: Some(model_id),
+                ..Default::default()
+            },
+        });
     }
     models
 }
@@ -724,6 +757,24 @@ mod tests {
         } else {
             assert_eq!(recorded.as_deref(), Some("pending:ollama:qwen"));
         }
+    }
+
+    /// The complaint this came from: a machine already answering on an
+    /// installed model was told to pick one before it would answer at all.
+    /// A route naming a model the machine can run is not a machine with an
+    /// unanswered question.
+    #[test]
+    fn a_route_already_naming_a_runnable_model_is_never_gated() {
+        assert!(runnable_target(&models(), Some("managed:llama")));
+        assert!(runnable_target(&models(), Some("ollama:qwen")));
+    }
+
+    /// And the case that is worth asking about: the recipe names something
+    /// this machine cannot start, so every message would fail.
+    #[test]
+    fn a_route_naming_a_model_that_is_not_installed_is_asked_about() {
+        assert!(!runnable_target(&models(), Some("managed:not-installed")));
+        assert!(!runnable_target(&models(), None));
     }
 
     /// `/model` is `/settings` under the name a person looks for mid-chat.
