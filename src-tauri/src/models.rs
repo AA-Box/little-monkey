@@ -224,6 +224,42 @@ pub struct ModelInfo {
 /// to work well with llama.cpp's OpenAI-compatible tool calling. `pub` so
 /// monkey-cli's launcher can offer the same "Recommended" list the desktop
 /// app's model tab shows, rather than keeping a second copy of it.
+/// The chat models this machine has in the app's own managed models directory,
+/// as `(model id, weights path)`.
+///
+/// # Why this exists next to the M3 hub's inventory
+///
+/// There are two places a "managed" model can live. The hub
+/// (`<app data>/m3`) holds models installed through the M3 runtime, and
+/// `<app data>/models` holds the ones the desktop app downloaded — the pair
+/// the app's own chat has always run on. A recipe's `managed_model` names an
+/// id, not a store, and an id installed in the second place used to resolve in
+/// neither: `monkey task run` reported "this machine has no managed model
+/// '<id>' installed" for a model the app was happily chatting with.
+///
+/// Curated ids only, matched by the file the catalog names. An external model
+/// registered by path has no catalog entry to match, and inventing one from a
+/// filename would let any `.gguf` dropped in that directory claim an id.
+pub fn app_managed_chat_models(app_data_dir: &Path) -> Vec<(String, PathBuf)> {
+    let models_dir = app_data_dir.join("models");
+    curated_models()
+        .into_iter()
+        .filter(|model| model.kind == ModelKind::Chat)
+        .filter_map(|model| {
+            let path = models_dir.join(&model.file);
+            path.is_file().then_some((model.id, path))
+        })
+        .collect()
+}
+
+/// The weights for one curated id in the app's managed models directory.
+pub fn app_managed_model_path(app_data_dir: &Path, model_id: &str) -> Option<PathBuf> {
+    app_managed_chat_models(app_data_dir)
+        .into_iter()
+        .find(|(id, _)| id == model_id)
+        .map(|(_, path)| path)
+}
+
 pub fn curated_models() -> Vec<ModelInfo> {
     vec![
         ModelInfo {
