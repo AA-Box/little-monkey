@@ -1925,8 +1925,14 @@ fn snapshot_target(target: &recipes::RecipeTarget) -> Result<ModelTargetSnapshot
         // this spec resolves the `model_id` against its own hub inventory rather
         // than trusting the path (see `daemon::placed_recipe_target`).
         let app_data = crate::app_data_dir().ok_or("Could not resolve the app data directory")?;
+        // Both stores an id can resolve from, in the order the runner starts
+        // them: the M3 hub, then the app's own managed models directory. See
+        // `models::app_managed_chat_models` — a model the desktop app
+        // downloaded is installed on this machine by every meaning of the word,
+        // and reporting it missing here failed the run before it began.
         let artifact =
             little_monkey_lib::m3_runtime_hub::installed_model_artifact(&app_data, model_id)
+                .or_else(|| little_monkey_lib::models::app_managed_model_path(&app_data, model_id))
                 .ok_or_else(|| {
                     format!("this machine has no managed model '{model_id}' installed")
                 })?;
@@ -5679,10 +5685,20 @@ async fn run_inner(
         ResolvedTarget::Ready(target) => (target, None),
         ResolvedTarget::ManagedModel { model_id } => {
             let started = async {
+                // The hub first, then the app's own managed models directory.
+                // A recipe names an id, not a store, and the desktop app's
+                // model picker offers ids from the second one — so resolving
+                // only the hub told a person their installed model was not
+                // installed. Both paths are verified by `start_server` before
+                // anything is launched, so the fallback widens where the
+                // weights may live and nothing else.
                 let artifact = little_monkey_lib::m3_runtime_hub::installed_model_artifact(
                     &app_data_dir,
                     &model_id,
                 )
+                .or_else(|| {
+                    little_monkey_lib::models::app_managed_model_path(&app_data_dir, &model_id)
+                })
                 .ok_or_else(|| {
                     format!("this machine has no managed model '{model_id}' installed")
                 })?;
