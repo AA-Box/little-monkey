@@ -8,6 +8,7 @@ pub(crate) mod channel_adapter;
 #[cfg(test)]
 mod channel_agent_e2e;
 pub(crate) mod channel_audit;
+pub(crate) mod channel_commands;
 pub(crate) mod channel_ingress;
 #[cfg(test)]
 mod channel_restart_tests;

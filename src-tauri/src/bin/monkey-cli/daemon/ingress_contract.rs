@@ -140,6 +140,9 @@ fn store_with_channel_account() -> DaemonStore {
             updated_at_ms: NOW,
         })
         .expect("route");
+    // A machine whose model was already chosen; the first-run gate is covered
+    // in `channel_commands` and `channel_ingress`.
+    super::channel_commands::mark_model_chosen(&mut store).expect("model chosen");
     store
 }
 

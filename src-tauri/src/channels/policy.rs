@@ -340,6 +340,13 @@ pub enum IgnoreReason {
     EmptyMessage,
     /// Automated replies have chained too deep in this conversation.
     ReplyDepthExceeded,
+    /// A message the daemon answered itself instead of running — see
+    /// `daemon::channel_commands`. Recorded as ignored because no turn ran,
+    /// with its own reason so a listing does not read it as a message dropped.
+    Command,
+    /// The first message on a machine where nobody has chosen a model yet. The
+    /// sender was shown the menu instead; the message itself never ran.
+    ModelNotChosen,
 }
 
 impl IgnoreReason {
@@ -354,6 +361,8 @@ impl IgnoreReason {
             IgnoreReason::NotMentioned => "not_mentioned",
             IgnoreReason::EmptyMessage => "empty_message",
             IgnoreReason::ReplyDepthExceeded => "reply_depth_exceeded",
+            IgnoreReason::Command => "command",
+            IgnoreReason::ModelNotChosen => "model_not_chosen",
         }
     }
 }

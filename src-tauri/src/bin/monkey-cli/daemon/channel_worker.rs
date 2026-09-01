@@ -1465,6 +1465,9 @@ mod tests {
                 updated_at_ms: NOW,
             })
             .expect("route");
+        // A machine whose model was already chosen — the steady state. The
+        // first-run gate is exercised in `channel_commands`.
+        super::super::channel_commands::mark_model_chosen(&mut store).expect("model chosen");
         store
     }
 
@@ -2958,9 +2961,8 @@ mod tests {
             reply: true,
             ..SendAuthority::default()
         };
-        let plan =
-            super::super::channel_tool::plan_send(&request, &its_own_grant, Some(&origin))
-                .expect("authorized");
+        let plan = super::super::channel_tool::plan_send(&request, &its_own_grant, Some(&origin))
+            .expect("authorized");
         super::super::channel_tool::queue_send(
             &mut store,
             &paths,
