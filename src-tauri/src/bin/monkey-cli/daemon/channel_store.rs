@@ -143,6 +143,22 @@ pub struct ChannelConversationRow {
     pub message_count: u32,
 }
 
+/// What erasing a conversation did — or why it did nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PurgeOutcome {
+    /// No such conversation here. Not an error: the sidebar may ask twice.
+    NotFound,
+    /// Something about it is still in flight; nothing was touched. The text
+    /// says what, in words for the person who clicked.
+    Refused(String),
+    Purged {
+        events: u32,
+        sends: u32,
+        turns: u32,
+        jobs: u32,
+    },
+}
+
 /// One message in a channel conversation, in either direction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChannelConversationMessage {
@@ -798,7 +814,27 @@ impl DaemonStore {
         upsert_sender(&self.connection, account_id, sender_id, record)
     }
 
-    pub fn pending_channel_senders(
+    /// Forget a sender entirely, so their next message is a stranger's again
+    /// and meets the pairing challenge. Distinct from blocking, which is
+    /// sticky; this is how an operator hands somebody a fresh code.
+    pub fn delete_channel_sender(
+        &mut self,
+        account_id: &str,
+        sender_id: &str,
+    ) -> Result<bool, String> {
+        self.connection
+            .execute(
+                "DELETE FROM channel_sender_authorizations WHERE account_id=?1 AND sender_id=?2",
+                params![account_id, sender_id],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Every sender this account has a decision about — waiting, approved and
+    /// blocked — so an operator can see who may talk to it and take that back.
+    /// Waiting first, then in the order the decisions were asked for.
+    pub fn channel_senders(
         &self,
         account_id: &str,
     ) -> Result<Vec<StoredSenderAuthorization>, String> {
@@ -808,8 +844,9 @@ impl DaemonStore {
                 "SELECT sender_id, state, pairing_code_digest, requested_at_ms, expires_at_ms,
                         approved_at_ms, blocked_at_ms, display_label, metadata_json
                  FROM channel_sender_authorizations
-                 WHERE account_id=?1 AND state='pending'
-                 ORDER BY requested_at_ms ASC",
+                 WHERE account_id=?1
+                 ORDER BY CASE state WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END,
+                          requested_at_ms ASC",
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
@@ -1779,7 +1816,7 @@ impl DaemonStore {
                           WHERE e.account_id = m.account_id
                             AND e.conversation_id = m.conversation_id
                             AND (m.thread_id IS NULL OR e.thread_id IS m.thread_id)
-                            AND e.direction = 'inbound'
+                            AND e.direction = 'inbound' AND e.disposition = 'accepted'
                           ORDER BY e.received_at_ms DESC LIMIT 1)
                  FROM channel_session_map m
                  JOIN channel_accounts a ON a.account_id = m.account_id
@@ -1818,11 +1855,191 @@ impl DaemonStore {
                         row.title = envelope
                             .as_deref()
                             .and_then(|json| serde_json::from_str::<ChannelEnvelope>(json).ok())
-                            .and_then(|envelope| envelope.conversation.title);
+                            .and_then(|envelope| {
+                                envelope.conversation.title.or_else(|| {
+                                    // A one-to-one chat is the other person, so
+                                    // their name is its title. Never in a group:
+                                    // the row would rename itself to whoever
+                                    // spoke last.
+                                    matches!(
+                                        envelope.conversation.kind,
+                                        little_monkey_lib::channels::types::ConversationKind::Direct
+                                    )
+                                    .then_some(envelope.sender.display_label)
+                                    .flatten()
+                                })
+                            });
                         row
                     })
                     .collect()
             })
+    }
+
+    /// Forget one conversation here: drop its session row, which is the only
+    /// thing the session list and the transcript reader key off.
+    ///
+    /// Deliberately *not* a purge. The event log is the provider-redelivery
+    /// dedupe key and the reply address of any turn still running, the outbox
+    /// holds sends that may already have reached the provider, and the echo
+    /// ledger is what stops this machine answering itself — deleting any of
+    /// them re-runs, re-sends or loops. Returns whether a row was there.
+    // ponytail: the conversation comes back, history included, on the next
+    // inbound message because `bind_session` re-inserts the row. A
+    // "cleared before" watermark on the listing is the upgrade if that jars.
+    pub fn delete_channel_conversation(&mut self, session_key: &str) -> Result<bool, String> {
+        self.connection
+            .execute(
+                "DELETE FROM channel_session_map WHERE session_key=?1",
+                [session_key],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Erase one conversation from this machine: its session row, every
+    /// message recorded in either direction, the turns those messages became,
+    /// and the finished jobs that ran them. The provider keeps its own copy.
+    ///
+    /// Refused — nothing touched — while anything about it is still moving: a
+    /// turn accepted or running (its reply would have no address to go to, and
+    /// `/stop` would lose the turn it stops), or a reply mid-send or awaiting
+    /// reconciliation (the only record of a request that may have reached the
+    /// provider). Queued replies are dropped: nothing left the machine.
+    ///
+    /// Two ledgers stay on purpose. The self-echo ledger holds no text, is
+    /// bounded by its retention window, and is the one thing that stops this
+    /// machine answering its own message when the provider echoes it back. The
+    /// conversation reference (a Teams `serviceUrl`) is shared by every thread
+    /// of the conversation and holds no text either.
+    // ponytail: a provider redelivering a message that arrived *before* the
+    // purge is a new message afterwards — the dedupe row went with the rest.
+    // Providers stop redelivering once acknowledged, which every purged
+    // message was; a tombstone of provider event ids is the upgrade if a
+    // provider ever proves otherwise.
+    pub fn purge_channel_conversation(
+        &mut self,
+        session_key: &str,
+    ) -> Result<PurgeOutcome, String> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let Some((account_id, conversation_id, thread_id)) = transaction
+            .query_row(
+                "SELECT account_id, conversation_id, thread_id FROM channel_session_map
+                 WHERE session_key=?1",
+                [session_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(PurgeOutcome::NotFound);
+        };
+        let scope = params![account_id, conversation_id, thread_id];
+
+        // The turns this conversation's messages became, found by the event
+        // they answered rather than by session key: a session scope wider
+        // than one conversation shares its key with others, and their turns
+        // are not ours to touch.
+        let live_turns: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM ingress_turns t
+                  LEFT JOIN daemon_jobs j ON j.job_id = t.job_id
+                 WHERE t.source='messaging_channel' AND t.source_account_id=?1
+                   AND t.source_event_id IN (
+                       SELECT provider_event_id FROM channel_events
+                        WHERE account_id=?1 AND conversation_id=?2
+                          AND (?3 IS NULL OR thread_id IS ?3) AND direction='inbound')
+                   AND (t.state='accepted'
+                        OR (j.job_id IS NOT NULL
+                            AND j.state NOT IN ('succeeded','failed','cancelled')))",
+                scope,
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if live_turns > 0 {
+            return Ok(PurgeOutcome::Refused(
+                "A turn for this conversation is still running. Stop it, or wait for it to \
+                 finish, then delete again."
+                    .to_string(),
+            ));
+        }
+        let live_sends: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM channel_outbox
+                 WHERE account_id=?1 AND conversation_id=?2
+                   AND (?3 IS NULL OR thread_id IS ?3)
+                   AND state IN ('sending','needs_reconciliation')",
+                scope,
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if live_sends > 0 {
+            return Ok(PurgeOutcome::Refused(
+                "A reply to this conversation is still being sent. Wait for it to settle, \
+                 then delete again."
+                    .to_string(),
+            ));
+        }
+
+        let jobs = transaction
+            .execute(
+                "DELETE FROM daemon_jobs WHERE job_id IN (
+                     SELECT t.job_id FROM ingress_turns t
+                      WHERE t.source='messaging_channel' AND t.source_account_id=?1
+                        AND t.job_id IS NOT NULL
+                        AND t.source_event_id IN (
+                            SELECT provider_event_id FROM channel_events
+                             WHERE account_id=?1 AND conversation_id=?2
+                               AND (?3 IS NULL OR thread_id IS ?3) AND direction='inbound'))",
+                scope,
+            )
+            .map_err(|error| error.to_string())?;
+        let turns = transaction
+            .execute(
+                "DELETE FROM ingress_turns
+                 WHERE source='messaging_channel' AND source_account_id=?1
+                   AND source_event_id IN (
+                       SELECT provider_event_id FROM channel_events
+                        WHERE account_id=?1 AND conversation_id=?2
+                          AND (?3 IS NULL OR thread_id IS ?3) AND direction='inbound')",
+                scope,
+            )
+            .map_err(|error| error.to_string())?;
+        let sends = transaction
+            .execute(
+                "DELETE FROM channel_outbox
+                 WHERE account_id=?1 AND conversation_id=?2 AND (?3 IS NULL OR thread_id IS ?3)",
+                scope,
+            )
+            .map_err(|error| error.to_string())?;
+        let events = transaction
+            .execute(
+                "DELETE FROM channel_events
+                 WHERE account_id=?1 AND conversation_id=?2 AND (?3 IS NULL OR thread_id IS ?3)",
+                scope,
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM channel_session_map WHERE session_key=?1",
+                [session_key],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(PurgeOutcome::Purged {
+            events: u32::try_from(events).unwrap_or(u32::MAX),
+            sends: u32::try_from(sends).unwrap_or(u32::MAX),
+            turns: u32::try_from(turns).unwrap_or(u32::MAX),
+            jobs: u32::try_from(jobs).unwrap_or(u32::MAX),
+        })
     }
 
     /// One conversation's messages, oldest first: what the provider delivered
@@ -1890,7 +2107,14 @@ impl DaemonStore {
             };
             messages.push(ChannelConversationMessage {
                 outbound: false,
-                author: sender_id.or_else(|| Some(envelope.sender.sender_id.clone())),
+                // The name the provider gave when it gave one; the bare id is
+                // what a reader gets otherwise, which at least stays stable.
+                author: envelope
+                    .sender
+                    .display_label
+                    .clone()
+                    .or(sender_id)
+                    .or_else(|| Some(envelope.sender.sender_id.clone())),
                 text: envelope.text,
                 at_ms,
             });
@@ -2846,7 +3070,12 @@ mod tests {
             2
         );
         assert_eq!(
-            store.pending_channel_senders("acct-1").expect("list").len(),
+            store
+                .channel_senders("acct-1")
+                .expect("list")
+                .iter()
+                .filter(|sender| sender.state == SenderState::Pending)
+                .count(),
             2
         );
 
@@ -3266,6 +3495,339 @@ mod tests {
         assert!(store
             .channel_conversation_messages("key-missing", 50)
             .expect("missing")
+            .is_empty());
+    }
+
+    /// The complaint this came from: a Telegram DM listed as "931819457". A
+    /// one-to-one chat is the other person, so the name the provider sent for
+    /// them titles the row and signs their messages. A group never borrows its
+    /// last speaker's name — the row would rename itself as members took turns.
+    #[test]
+    fn a_direct_conversation_is_titled_by_the_person_in_it() {
+        let mut store = seeded();
+        for (key, conversation, kind, label) in [
+            ("key-dm", "931819457", "direct", "ahmad"),
+            ("key-group", "-100", "group", "bo"),
+        ] {
+            store
+                .bind_channel_session(key, "acct-1", conversation, None, key, 1_000)
+                .expect("bind");
+            let envelope = serde_json::json!({
+                "account_id": "acct-1",
+                "kind": "telegram",
+                "provider_event_id": format!("evt-{key}"),
+                "conversation": { "conversation_id": conversation, "kind": kind },
+                "sender": { "sender_id": "555", "display_label": label },
+                "text": "hi",
+                "received_at_ms": 2_000,
+            })
+            .to_string();
+            store
+                .record_channel_event(&NewChannelEvent {
+                    account_id: "acct-1".into(),
+                    source: ConversationSource::MessagingChannel,
+                    direction: EventDirection::Inbound,
+                    provider_event_id: format!("evt-{key}"),
+                    conversation_id: conversation.into(),
+                    thread_id: None,
+                    sender_id: Some("555".into()),
+                    envelope_json: envelope,
+                    disposition: EventDisposition::Accepted,
+                    received_at_ms: 2_000,
+                })
+                .expect("record inbound");
+        }
+
+        let rows = store.channel_conversations(50).expect("list");
+        let title = |key: &str| {
+            rows.iter()
+                .find(|row| row.session_key == key)
+                .expect("row")
+                .title
+                .clone()
+        };
+        assert_eq!(title("key-dm").as_deref(), Some("ahmad"));
+        assert_eq!(title("key-group"), None);
+        let messages = store
+            .channel_conversation_messages("key-dm", 50)
+            .expect("messages");
+        assert_eq!(messages[0].author.as_deref(), Some("ahmad"));
+    }
+
+    /// Forgetting a conversation removes it from the list and empties its
+    /// transcript, and nothing else: the durable event (the dedupe key) and the
+    /// queued send are exactly where they were.
+    #[test]
+    fn deleting_a_conversation_forgets_the_row_and_keeps_the_ledgers() {
+        let mut store = seeded();
+        store
+            .bind_channel_session("key-1", "acct-1", "conv-1", None, "sess-1", 1_000)
+            .expect("bind");
+        store
+            .record_channel_event(&NewChannelEvent {
+                account_id: "acct-1".into(),
+                source: ConversationSource::MessagingChannel,
+                direction: EventDirection::Inbound,
+                provider_event_id: "evt-1".into(),
+                conversation_id: "conv-1".into(),
+                thread_id: None,
+                sender_id: Some("user-3".into()),
+                envelope_json: "{}".into(),
+                disposition: EventDisposition::Accepted,
+                received_at_ms: 2_000,
+            })
+            .expect("record inbound");
+        store
+            .enqueue_channel_message(&NewOutboxMessage {
+                account_id: "acct-1".into(),
+                conversation_id: "conv-1".into(),
+                thread_id: None,
+                reply_to_provider_id: None,
+                payload_json: "{}".into(),
+                payload_digest: "digest-1".into(),
+                idempotency_key: "idem-1".into(),
+                invocation_id: None,
+                max_attempts: 3,
+                job_id: None,
+                created_at_ms: 3_000,
+            })
+            .expect("enqueue outbound");
+        assert_eq!(store.channel_conversations(50).expect("list").len(), 1);
+
+        assert!(store.delete_channel_conversation("key-1").expect("delete"));
+        // Gone twice is not an error either.
+        assert!(!store.delete_channel_conversation("key-1").expect("again"));
+
+        assert!(store.channel_conversations(50).expect("list").is_empty());
+        assert!(store
+            .channel_conversation_messages("key-1", 50)
+            .expect("messages")
+            .is_empty());
+        assert!(store
+            .existing_channel_event(
+                ConversationSource::MessagingChannel,
+                "acct-1",
+                EventDirection::Inbound,
+                "evt-1"
+            )
+            .expect("event")
+            .is_some());
+        assert_eq!(
+            store.claim_outbox_batch(4_000, 10).expect("outbox").len(),
+            1
+        );
+    }
+
+    /// Erasing takes the messages, the replies, the turn and the finished
+    /// job with it, and leaves nothing for the list or the transcript to find.
+    #[test]
+    fn purging_a_conversation_erases_its_record_here() {
+        let mut store = seeded();
+        store
+            .bind_channel_session("key-1", "acct-1", "conv-1", None, "sess-1", 1_000)
+            .expect("bind");
+        store
+            .record_channel_event(&NewChannelEvent {
+                account_id: "acct-1".into(),
+                source: ConversationSource::MessagingChannel,
+                direction: EventDirection::Inbound,
+                provider_event_id: "evt-1".into(),
+                conversation_id: "conv-1".into(),
+                thread_id: None,
+                sender_id: Some("user-3".into()),
+                envelope_json: "{}".into(),
+                disposition: EventDisposition::Accepted,
+                received_at_ms: 2_000,
+            })
+            .expect("record inbound");
+        store
+            .enqueue_channel_message(&NewOutboxMessage {
+                account_id: "acct-1".into(),
+                conversation_id: "conv-1".into(),
+                thread_id: None,
+                reply_to_provider_id: None,
+                payload_json: "{}".into(),
+                payload_digest: "digest-1".into(),
+                idempotency_key: "idem-1".into(),
+                invocation_id: None,
+                max_attempts: 3,
+                job_id: None,
+                created_at_ms: 3_000,
+            })
+            .expect("enqueue outbound");
+        // A neighbouring conversation on the same account is not ours.
+        store
+            .bind_channel_session("key-2", "acct-1", "conv-2", None, "sess-2", 1_000)
+            .expect("bind other");
+        store
+            .record_channel_event(&NewChannelEvent {
+                account_id: "acct-1".into(),
+                source: ConversationSource::MessagingChannel,
+                direction: EventDirection::Inbound,
+                provider_event_id: "evt-2".into(),
+                conversation_id: "conv-2".into(),
+                thread_id: None,
+                sender_id: Some("user-4".into()),
+                envelope_json: "{}".into(),
+                disposition: EventDisposition::Accepted,
+                received_at_ms: 2_000,
+            })
+            .expect("record other");
+
+        let outcome = store.purge_channel_conversation("key-1").expect("purge");
+        assert_eq!(
+            outcome,
+            PurgeOutcome::Purged {
+                events: 1,
+                sends: 1,
+                turns: 0,
+                jobs: 0
+            }
+        );
+        assert_eq!(
+            store.purge_channel_conversation("key-1").expect("again"),
+            PurgeOutcome::NotFound
+        );
+
+        let listed = store.channel_conversations(50).expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_key, "key-2");
+        assert!(store
+            .existing_channel_event(
+                ConversationSource::MessagingChannel,
+                "acct-1",
+                EventDirection::Inbound,
+                "evt-1"
+            )
+            .expect("event")
+            .is_none());
+        assert!(store
+            .existing_channel_event(
+                ConversationSource::MessagingChannel,
+                "acct-1",
+                EventDirection::Inbound,
+                "evt-2"
+            )
+            .expect("other event")
+            .is_some());
+        assert!(store
+            .claim_outbox_batch(4_000, 10)
+            .expect("outbox")
+            .is_empty());
+    }
+
+    /// A reply still on its way out is the one record of a request that may
+    /// have reached the provider. The purge waits for it rather than losing it.
+    #[test]
+    fn purging_is_refused_while_a_reply_is_mid_send() {
+        let mut store = seeded();
+        store
+            .bind_channel_session("key-1", "acct-1", "conv-1", None, "sess-1", 1_000)
+            .expect("bind");
+        store
+            .enqueue_channel_message(&NewOutboxMessage {
+                account_id: "acct-1".into(),
+                conversation_id: "conv-1".into(),
+                thread_id: None,
+                reply_to_provider_id: None,
+                payload_json: "{}".into(),
+                payload_digest: "digest-1".into(),
+                idempotency_key: "idem-1".into(),
+                invocation_id: None,
+                max_attempts: 3,
+                job_id: None,
+                created_at_ms: 3_000,
+            })
+            .expect("enqueue outbound");
+        // Claiming moves the row to `sending`.
+        assert_eq!(store.claim_outbox_batch(4_000, 10).expect("claim").len(), 1);
+
+        let outcome = store.purge_channel_conversation("key-1").expect("purge");
+        assert!(matches!(outcome, PurgeOutcome::Refused(_)), "{outcome:?}");
+        assert_eq!(store.channel_conversations(50).expect("list").len(), 1);
+    }
+
+    /// Forgetting a sender is not blocking them: the row is gone, so their
+    /// next message is a stranger's and meets the challenge again.
+    #[test]
+    fn forgetting_a_sender_removes_their_row() {
+        let mut store = seeded();
+        store
+            .upsert_channel_sender(
+                "acct-1",
+                "ada",
+                &StoredSenderAuthorization {
+                    sender_id: "ada".into(),
+                    state: SenderState::Approved,
+                    pairing_code_digest: None,
+                    requested_at_ms: 1_000,
+                    expires_at_ms: None,
+                    approved_at_ms: Some(1_000),
+                    blocked_at_ms: None,
+                    display_label: None,
+                    metadata: Default::default(),
+                },
+            )
+            .expect("sender");
+
+        assert!(store
+            .delete_channel_sender("acct-1", "ada")
+            .expect("forget"));
+        assert!(!store.delete_channel_sender("acct-1", "ada").expect("again"));
+        assert!(store
+            .channel_sender("acct-1", "ada")
+            .expect("read")
+            .is_none());
+    }
+
+    /// The operator's view of who may talk to an account: everyone with a
+    /// decision, waiting first, and the name each arrived with.
+    #[test]
+    fn every_sender_with_a_decision_is_listed_waiting_first() {
+        let mut store = seeded();
+        for (sender, state, at) in [
+            ("approved-early", SenderState::Approved, 1_000),
+            ("waiting", SenderState::Pending, 2_000),
+            ("blocked", SenderState::Blocked, 3_000),
+        ] {
+            store
+                .upsert_channel_sender(
+                    "acct-1",
+                    sender,
+                    &StoredSenderAuthorization {
+                        sender_id: sender.into(),
+                        state,
+                        pairing_code_digest: None,
+                        requested_at_ms: at,
+                        expires_at_ms: None,
+                        approved_at_ms: None,
+                        blocked_at_ms: None,
+                        display_label: Some(format!("{sender} name")),
+                        metadata: Default::default(),
+                    },
+                )
+                .expect("sender");
+        }
+
+        let listed = store.channel_senders("acct-1").expect("senders");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|sender| (sender.sender_id.as_str(), sender.state))
+                .collect::<Vec<_>>(),
+            vec![
+                ("waiting", SenderState::Pending),
+                ("approved-early", SenderState::Approved),
+                ("blocked", SenderState::Blocked),
+            ]
+        );
+        assert_eq!(
+            listed[1].display_label.as_deref(),
+            Some("approved-early name")
+        );
+        assert!(store
+            .channel_senders("acct-other")
+            .expect("none")
             .is_empty());
     }
 

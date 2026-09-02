@@ -400,10 +400,19 @@ mod macos {
             return None;
         }
 
+        // `displayName` is the *chat's* name — a group's title, or the
+        // contact's name in a one-to-one chat. It is the conversation's title
+        // either way, never the sender's: in a group it would label every
+        // member's message with the group's name.
+        let display_name = record
+            .get("displayName")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let conversation = match (is_group, &chat_id) {
             (true, Some(chat_id)) => ChannelConversation::group(chat_id.clone()),
             _ => ChannelConversation::direct(sender.clone()),
-        };
+        }
+        .with_title(display_name.clone());
 
         Some(ChannelEnvelope {
             account_id: String::new(),
@@ -415,10 +424,9 @@ mod macos {
             conversation,
             sender: ChannelSender {
                 sender_id: sender,
-                display_label: record
-                    .get("displayName")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                // A one-to-one chat's name is the other person's; a group's is
+                // not anybody's.
+                display_label: if is_group { None } else { display_name },
                 // The helper never reports our own outbound messages: an agent
                 // answering its own send is a loop, and the filter belongs
                 // where the `is_from_me` column is.
@@ -710,10 +718,12 @@ mod macos {
             .expect("envelope");
             assert_eq!(envelope.conversation.conversation_id, "chat9001");
             assert_eq!(envelope.conversation.kind, ConversationKind::Group);
+            // The chat's name titles the conversation; it is not the sender's.
             assert_eq!(
-                envelope.sender.display_label.as_deref(),
+                envelope.conversation.title.as_deref(),
                 Some("Weekend plans")
             );
+            assert_eq!(envelope.sender.display_label, None);
         }
 
         #[test]
