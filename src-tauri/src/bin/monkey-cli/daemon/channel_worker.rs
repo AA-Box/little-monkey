@@ -1465,9 +1465,10 @@ mod tests {
                 updated_at_ms: NOW,
             })
             .expect("route");
-        // A machine whose model was already chosen — the steady state. The
-        // first-run gate is exercised in `channel_commands`.
-        super::super::channel_commands::mark_model_chosen(&mut store).expect("model chosen");
+        // A machine whose people were already told which model answers — the
+        // steady state. The first-contact notice is exercised in
+        // `channel_commands` and `channel_ingress`.
+        super::super::channel_commands::suppress_first_run_notice(&mut store).expect("told");
         store
     }
 

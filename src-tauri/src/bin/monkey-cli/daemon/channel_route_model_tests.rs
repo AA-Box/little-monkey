@@ -121,7 +121,7 @@ fn resolve_through_the_daemon(
     roots: &[PathBuf],
 ) -> (String, ResolvedTarget, Recipe) {
     let route = resolve_route(routes, &envelope()).expect("the global route matches everything");
-    let frozen = super::freeze_execution_for(&route.target, Some(&route.route_id), roots, None)
+    let frozen = super::freeze_execution_for(&route.target, Some(&route.route_id), roots, None, None)
         .expect("the daemon freezes this turn");
     let v1 = frozen.as_v1();
     // Exactly what `enqueue` does with a frozen context before it runs.
@@ -254,7 +254,7 @@ fn every_target_kind_the_picker_offers_resolves_to_its_own_backend() {
 
         let route = resolve_route(&routes, &envelope()).unwrap();
         let frozen =
-            super::freeze_execution_for(&route.target, Some(&route.route_id), &roots, None).unwrap();
+            super::freeze_execution_for(&route.target, Some(&route.route_id), &roots, None, None).unwrap();
         let v1 = frozen.as_v1();
         assert_eq!(v1.model_target, expected_frozen);
         assert_eq!(
@@ -454,7 +454,7 @@ fn a_route_naming_a_missing_recipe_freezes_nothing() {
     let roots = vec![root.clone()];
     let route = global_route("not-saved");
     let error =
-        super::freeze_execution_for(&route.target, Some(&route.route_id), &roots, None).unwrap_err();
+        super::freeze_execution_for(&route.target, Some(&route.route_id), &roots, None, None).unwrap_err();
     assert!(error.contains("not-saved"), "{error}");
 }
 

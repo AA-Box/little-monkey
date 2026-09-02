@@ -904,7 +904,7 @@ fn queue_conversation_turn(
     // Frozen here rather than inside the submission service because the turn's
     // own text comes out of the resolved recipe: the context has to exist
     // before the ingress record can be built.
-    let execution = freeze_execution_for(&target, None, global_config_roots, None)?;
+    let execution = freeze_execution_for(&target, None, global_config_roots, None, None)?;
     let recipe: recipes::Recipe = serde_json::from_str(&execution.as_v1().recipe_json)
         .map_err(|error| format!("The frozen recipe for this turn is unreadable: {error}"))?;
 
@@ -1020,7 +1020,7 @@ pub(crate) fn queue_client_recipe(
     // operator's rules and facts are merged in — once, and then frozen. A
     // recovered turn runs the prompt the editor sent under the rules that were
     // in force when it sent it.
-    let execution = freeze_execution_for(&target, None, &global_config_roots, Some(cli))?;
+    let execution = freeze_execution_for(&target, None, &global_config_roots, Some(cli), None)?;
     let recipe: recipes::Recipe = serde_json::from_str(&execution.as_v1().recipe_json)
         .map_err(|error| format!("The frozen recipe for this turn is unreadable: {error}"))?;
     let ingress = ConversationIngress::direct(
@@ -1169,11 +1169,18 @@ pub(crate) fn queue_mobile_chat_recipe(
 /// facts are merged into the system prompt here, at accept time, so the merged
 /// prompt is part of what gets frozen instead of being recomputed later against
 /// a rules file that has since changed.
+///
+/// `model_override` is the sender's own `/model` pick. It replaces the recipe's
+/// target in the frozen copy only — the file on disk stays the default every
+/// other conversation runs on — and validated here so a stored pick that no
+/// longer parses fails the turn at accept time, where the sender is told,
+/// rather than inside the run.
 pub(crate) fn freeze_execution_for(
     target: &little_monkey_lib::channels::routing::RouteTarget,
     route_id: Option<&str>,
     global_config_roots: &[PathBuf],
     merge_rules_from: Option<&crate::Cli>,
+    model_override: Option<&recipes::RecipeTarget>,
 ) -> Result<little_monkey_lib::channels::ingress::FrozenExecutionContext, String> {
     use little_monkey_lib::channels::ingress::{FrozenExecutionContext, FrozenExecutionContextV1};
 
@@ -1183,6 +1190,12 @@ pub(crate) fn freeze_execution_for(
         workspace_root.as_deref(),
         global_config_roots,
     )?;
+    if let Some(chosen) = model_override {
+        chosen.validate().map_err(|error| {
+            format!("The model chosen for this conversation is invalid: {error}")
+        })?;
+        recipe.target = chosen.clone();
+    }
     let workspace = resolve_recipe_workspace(&recipe, &recipe_path)?;
     if let Some(cli) = merge_rules_from {
         let state = crate::build_state(&Some(workspace.clone()))?;
@@ -1265,6 +1278,7 @@ impl channel_worker::RunQueue for DaemonChannelQueue {
             // ambient rules into them would let whatever sits in its working
             // directory rewrite what a stranger's message runs under.
             None,
+            ingress.model_override.as_ref(),
         )
     }
 

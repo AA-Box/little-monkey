@@ -80,12 +80,25 @@ export interface ChannelAccount {
   updated_at_ms: number;
 }
 
+/** One sender the account has a decision about — waiting, approved or
+ * blocked. `display_label` is the name the provider sent with their first
+ * message: theirs to claim, shown, never trusted for a decision. */
 export interface PendingSender {
   sender_id: string;
   state: string;
   display_label: string | null;
   requested_at_ms: number;
   expires_at_ms: number | null;
+  /** The model they picked for themselves with `/model`, in the daemon's
+   * one-line form (`ollama:qwen`); null means the machine's default. */
+  model: string | null;
+}
+
+/** Who may talk to an account and who is waiting to, as the daemon lists them. */
+export interface ChannelSenders {
+  pending: PendingSender[];
+  approved: PendingSender[];
+  blocked: PendingSender[];
 }
 
 export interface ChannelEvent {
@@ -408,9 +421,13 @@ export const channelsSetPolicy = (
   activation: GroupActivation | null,
 ) => invoke<void>("channels_set_policy", { accountId, direct, group, activation });
 export const channelsSenders = (accountId: string) =>
-  invoke<{ pending: PendingSender[] }>("channels_senders", { accountId });
+  invoke<ChannelSenders>("channels_senders", { accountId });
 export const channelsDecideSender = (accountId: string, senderId: string, approve: boolean) =>
   invoke<void>("channels_decide_sender", { accountId, senderId, approve });
+/** Forget a sender: their approval or block, their model pick, and that they
+ * were greeted. Their next message meets the pairing challenge afresh. */
+export const channelsForgetSender = (accountId: string, senderId: string) =>
+  invoke<void>("channels_forget_sender", { accountId, senderId });
 export const channelsRoutes = () => invoke<{ routes: ChannelRoute[] }>("channels_routes");
 export const channelsAddRoute = (recipe: string, options: RouteOptions) =>
   invoke<{ route: ChannelRoute }>("channels_add_route", { recipe, options });

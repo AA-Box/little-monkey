@@ -69,6 +69,64 @@ own file write, shell command, network call, or reply. Provider metadata — a
 display name, a role, a channel topic — is untrusted text and never becomes
 permission to do something.
 
+### Taking approval back
+
+Settings › Channels lists, per account, who is waiting for approval, who has
+been approved, and who is blocked, each with the model they are answered on.
+**Revoke access** on an approved sender blocks them: their messages are ignored
+from then on, and they are not handed a fresh pairing code. **Forget** removes
+the decision altogether — approval or block, their model pick, and that they
+were ever greeted — so their next message is a stranger's and meets the pairing
+challenge again; it is the way to let somebody pair afresh, and the way to
+undo a block without approving outright. The name beside each entry is the one
+the provider sent with their first message — theirs to claim, shown so you can
+tell people apart, and never what a decision is made on. `monkey channels
+senders <account>` prints the same three lists; `approve`, `block` and `forget`
+are the three decisions.
+
+### Talking to it, and the model that answers
+
+A person who has been let in is answered on the task the route names, on that
+task's model — this machine's default. Nobody is asked to pick a model first.
+With the answer to their first message they are told, once, which model that is
+and that `/model` changes it.
+
+`/model` (or `/settings`) lists the models installed on this machine; `/model 2`
+picks one **for that person alone**. The pick is recorded per sender and per
+account, is read into each of their turns when the turn is accepted, and never
+touches the task's recipe file — so two people on the same bot can be answered
+on two different models at the same time, and one person's pick changes nothing
+for anybody else. Cloud models are not on the menu: picking one picks a bill,
+and the person typing `/model` is not necessarily the one paying it. The other
+commands the daemon answers itself are `/start`, `/help`, `/status`, `/stop`,
+`/resume`, and `/new` (which, honestly, has nothing to clear: each message is
+answered on its own).
+
+### Reading, filing and deleting a conversation
+
+Every conversation the daemon is answering appears in the desktop sidebar
+beside your own sessions, titled by the group's name or — for a one-to-one
+chat — by the person's name as the provider gave it. Its row has what a local
+chat's row has: pin, mark as unread, rename, move to a group, archive, export,
+fork and delete. Pin, unread, name, group and archive are this desktop's own
+notes about the conversation and never reach the daemon or the provider.
+**Fork** copies the transcript into a local session of your own — the way to
+carry on about it with the agent here, and the way to reach the things only a
+local session can do, such as translating the thread or opening it in an
+editor. The transcript pane itself stays read-only: a reply to a Telegram chat
+goes out on Telegram, by the agent, under the routing you configured.
+
+**Delete** erases the conversation from this machine — its messages in both
+directions, the turns they became and the finished jobs that ran them. The
+provider keeps its own copy. It is refused, with the reason shown, while a turn
+for that conversation is still running or a reply is mid-send, because those
+records are how the reply finds its way back; stop the turn or wait, then
+delete again. Two things stay: the self-echo ledger (no text; it is what stops
+the agent answering its own message when the provider echoes it) and a Teams
+conversation's reply address, which every thread of it shares. From a terminal,
+`monkey conversations delete` is the same erase, and `--forget` only drops the
+row from the list — cheaper, and undone by the next message in it.
+
 ### Files somebody sends
 
 An inbound attachment is size-checked against the account's limit *before* a
@@ -285,6 +343,13 @@ therefore **not** claimed as verified here.
 
 - Inbound normalization, access policy, pairing, routing, durable turn creation
   and run submission for every provider, driven through the production ingress.
+- The first message from a person runs, and is answered with one notice naming
+  the model — once per sender, once across a redelivery, never for a
+  `/command`, and not after a `/start` that already named it; a sender's
+  `/model` pick reaches their own turns' frozen recipe and nobody else's, and
+  forgetting the sender clears it; deleting a conversation erases its events,
+  replies, turns and jobs and nothing of a neighbouring conversation's, is
+  refused while a reply is mid-send, and forgetting one drops only its row.
 - Webhook signature verification for WhatsApp, Teams, Google Chat and LINE, and
   carrier callback verification for Twilio, Plivo and Telnyx, over exact bytes,
   including forged and replayed bodies.
