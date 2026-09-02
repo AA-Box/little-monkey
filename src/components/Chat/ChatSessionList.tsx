@@ -20,6 +20,11 @@ import { SessionListMenu, useEnvironmentLabel } from "./SessionListMenu";
 import { usePermissionStore } from "../../store/permissionStore";
 import { useSessionListViewStore } from "../../store/sessionListViewStore";
 import { useExternalConversationStore } from "../../store/externalConversationStore";
+import {
+  EMPTY_META,
+  useExternalConversationMetaStore,
+} from "../../store/externalConversationMetaStore";
+import { ExternalConversationMenu } from "./ExternalConversationMenu";
 import { useGitDeliveryStore } from "../../store/gitDeliveryStore";
 import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
 import { REMOTE_CONTROL_ENVIRONMENT } from "../../lib/conversationsClient";
@@ -182,6 +187,8 @@ export default function ChatSessionList() {
   const selectedExternal = useExternalConversationStore((state) => state.selected);
   const selectExternal = useExternalConversationStore((state) => state.select);
   const refreshExternal = useExternalConversationStore((state) => state.refresh);
+  const externalMeta = useExternalConversationMetaStore((state) => state.meta);
+  const updateExternalMeta = useExternalConversationMetaStore((state) => state.update);
   const primaryWorkspacePath = useWorkspaceStore((state) => primaryRoot(state.roots)?.path ?? null);
   const deliveryWorktrees = useGitDeliveryStore((state) => state.worktrees);
   const deliverySelectedWorktreeId = useGitDeliveryStore((state) => state.selectedWorktreeId);
@@ -273,12 +280,14 @@ export default function ChatSessionList() {
             ),
           ),
         ),
-      ...conversations.map(externalRow),
+      ...conversations.map((conversation) =>
+        externalRow(conversation, externalMeta[`${conversation.environment} ${conversation.id}`]),
+      ),
     ],
     // `awaitingPermission` is a fresh Set every render; the queue it derives
     // from is the real input.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [sessions, conversations, runningTurns, turnOutcomes, permissionQueue],
+    [sessions, conversations, externalMeta, runningTurns, turnOutcomes, permissionQueue],
   );
 
   const environments = useMemo(() => environmentOptions(rows), [rows]);
@@ -475,29 +484,143 @@ export default function ChatSessionList() {
   const renderRow = (row: SessionRow) => {
     if (row.kind === "external") {
       const label = environmentLabel(row.environment);
+      const key = row.id;
+      const selection = { environment: row.conversation.environment, id: row.conversation.id };
+      const rowMeta = externalMeta[key] ?? EMPTY_META;
       const isSelected =
-        selectedExternal?.environment === row.conversation.environment &&
-        selectedExternal.id === row.conversation.id;
+        selectedExternal?.environment === selection.environment &&
+        selectedExternal.id === selection.id;
+      const isRenaming = renamingId === key;
+      const isMenuOpen = menuOpenId === key;
+      const closeMenu = () => {
+        setMenuOpenId(null);
+        setMenuAnchor(null);
+      };
+      // Opening reads it, as opening a local session does.
+      const open = () => {
+        if (rowMeta.unread) updateExternalMeta(key, { unread: false });
+        selectExternal(selection);
+      };
+      const commitExternalRename = () => {
+        updateExternalMeta(key, { title: renameValue.trim() || null });
+        setRenamingId(null);
+      };
+      const revealed = (always: boolean) =>
+        always
+          ? "opacity-100"
+          : "opacity-0 group-hover/chat-row:opacity-100 group-focus-within/chat-row:opacity-100";
+      const iconButtonClass =
+        "inline-flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded text-faint transition-colors duration-150 hover:bg-surface hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent";
       return (
         <div
           key={row.id}
           role="button"
           tabIndex={0}
-          onClick={() =>
-            selectExternal({ environment: row.conversation.environment, id: row.conversation.id })
-          }
+          onClick={() => !isRenaming && open()}
           onKeyDown={(event) => {
+            if (isRenaming) return;
             if (event.key === "Enter" || event.key === " ") {
               event.preventDefault();
-              selectExternal({ environment: row.conversation.environment, id: row.conversation.id });
+              open();
             }
           }}
-          className={rowClass(isSelected)}
+          className={rowClass(isSelected || isMenuOpen)}
         >
-          <span className="truncate">
-            <EnvironmentMarker environment={row.environment} label={label} />
-            {row.title}
-          </span>
+          {isRenaming ? (
+            <input
+              autoFocus
+              value={renameValue}
+              onChange={(event) => setRenameValue(event.target.value)}
+              onClick={(event) => event.stopPropagation()}
+              onBlur={commitExternalRename}
+              onKeyDown={(event) => {
+                event.stopPropagation();
+                if (event.key === "Enter") commitExternalRename();
+                if (event.key === "Escape") setRenamingId(null);
+              }}
+              className="w-full rounded-md border border-border bg-surface px-1.5 py-0.5 text-sm text-foreground outline-none focus-visible:border-accent"
+            />
+          ) : (
+            <span className={`min-w-0 flex-1 truncate pr-20 ${rowMeta.unread ? "font-semibold" : ""}`}>
+              <EnvironmentMarker environment={row.environment} label={label} />
+              {row.title}
+            </span>
+          )}
+
+          {/* The same affordances a local row has — pin and archive on hover,
+              a kebab for the rest — backed by this desktop's own notes about
+              the conversation rather than by the session store. */}
+          {!isRenaming && (
+            <div
+              className={`absolute right-1 flex items-center gap-0.5 rounded-md pl-0.5 ${
+                row.pinned || isMenuOpen
+                  ? "bg-surface-2/95"
+                  : "group-hover/chat-row:bg-surface-2/95 group-focus-within/chat-row:bg-surface-2/95"
+              }`}
+            >
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  updateExternalMeta(key, { pinned: !row.pinned });
+                  closeMenu();
+                }}
+                aria-label={row.pinned ? t("SessionMenu.unpin") : t("SessionMenu.pin")}
+                aria-pressed={row.pinned}
+                title={row.pinned ? t("SessionMenu.unpin") : t("SessionMenu.pin")}
+                className={`${iconButtonClass} ${revealed(row.pinned || isMenuOpen)}`}
+              >
+                <Pin size={14} aria-hidden />
+              </button>
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  updateExternalMeta(
+                    key,
+                    row.archived ? { archived: false } : { archived: true, pinned: false },
+                  );
+                  closeMenu();
+                }}
+                aria-label={row.archived ? t("SessionMenu.unarchive") : t("SessionMenu.archive")}
+                title={row.archived ? t("SessionMenu.unarchive") : t("SessionMenu.archive")}
+                className={`${iconButtonClass} ${revealed(isMenuOpen)}`}
+              >
+                {row.archived ? <ArchiveRestore size={14} aria-hidden /> : <Archive size={14} aria-hidden />}
+              </button>
+              <button
+                type="button"
+                data-session-menu-trigger="true"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  if (isMenuOpen) {
+                    closeMenu();
+                  } else {
+                    setMenuAnchor(event.currentTarget.getBoundingClientRect());
+                    setMenuOpenId(key);
+                  }
+                }}
+                aria-label={t("ChatSessionList.sessionMenuAriaLabel")}
+                title={t("ChatSessionList.sessionMenuAriaLabel")}
+                className={`${iconButtonClass} ${revealed(isMenuOpen)}`}
+              >
+                <MoreVertical size={14} aria-hidden />
+              </button>
+            </div>
+          )}
+
+          {isMenuOpen && menuAnchor && (
+            <ExternalConversationMenu
+              row={row}
+              meta={rowMeta}
+              anchorRect={menuAnchor}
+              onClose={closeMenu}
+              onRename={() => {
+                setRenameValue(row.title);
+                setRenamingId(key);
+              }}
+            />
+          )}
         </div>
       );
     }

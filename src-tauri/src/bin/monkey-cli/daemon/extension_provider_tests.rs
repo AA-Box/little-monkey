@@ -489,9 +489,10 @@ fn seed_extension_channel(
             updated_at_ms: super::channel_restart_tests::NOW,
         })
         .expect("route");
-    // A machine whose model was already chosen; the first-run gate is covered
-    // in `channel_commands` and `channel_ingress`.
-    super::channel_commands::mark_model_chosen(store).expect("model chosen");
+    // A machine whose people were already told which model answers; the
+    // first-contact notice is covered in `channel_commands` and
+    // `channel_ingress`.
+    super::channel_commands::suppress_first_run_notice(store).expect("told");
 }
 
 /// The application-level claim: an extension channel is a channel.

@@ -1560,6 +1560,18 @@ impl RemoteStore {
             .map_err(|error| error.to_string())
     }
 
+    /// Forget one phone session's transcript here. Returns how many messages
+    /// went; zero means the session was already gone, which is not an error.
+    pub fn delete_mobile_session(&mut self, session_id: &str) -> Result<u32, String> {
+        self.connection
+            .execute(
+                "DELETE FROM remote_mobile_messages WHERE session_id=?1",
+                [session_id],
+            )
+            .map(|changed| u32::try_from(changed).unwrap_or(u32::MAX))
+            .map_err(|error| error.to_string())
+    }
+
     pub fn mobile_session_summaries(&self) -> Result<Vec<MobileSessionSummary>, String> {
         let mut statement = self
             .connection

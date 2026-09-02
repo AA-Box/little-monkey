@@ -26,6 +26,7 @@ import type {
   ChannelCallback,
   ChannelEvent,
   ChannelRoute,
+  ChannelSenders,
   ExposureStatus,
 } from "../../lib/channelsClient";
 
@@ -88,6 +89,7 @@ function mockChannels(options: {
   callback?: ChannelCallback;
   exposure?: ExposureStatus | null;
   recipes?: string[];
+  senders?: ChannelSenders;
   onCommand?: (command: string, args: unknown) => unknown;
 }) {
   invoke.mockImplementation((command: string, args: unknown) => {
@@ -102,7 +104,9 @@ function mockChannels(options: {
         : Promise.resolve(options.exposure ?? MANUAL_EXPOSURE);
     }
     if (command === "channels_routes") return Promise.resolve({ routes: options.routes ?? [ROUTE] });
-    if (command === "channels_senders") return Promise.resolve({ pending: [] });
+    if (command === "channels_senders") {
+      return Promise.resolve(options.senders ?? { pending: [], approved: [], blocked: [] });
+    }
     // The route editor offers saved tasks rather than a typed name, so it
     // lists them on mount like Settings > Tasks does — a route can only name
     // a task that exists.
@@ -615,6 +619,90 @@ describe("ChannelsPanel state matrix", () => {
       expect(
         invoke.mock.calls.some(([command]) => command === "channels_probe"),
       ).toBe(true),
+    );
+  });
+
+  /**
+   * Approval used to be a one-way door: the panel listed who was waiting and
+   * nothing else, so an approved person could neither be seen nor shown out.
+   * The approved list names them — by the name they arrived with, with the id
+   * beside it — and "Revoke access" is the existing block decision, which is
+   * what "they can no longer use this" means; forgetting them would hand them a
+   * fresh pairing code instead.
+   */
+  it("lists approved senders by name and revokes one by blocking them", async () => {
+    mockChannels({
+      accounts: [BASE],
+      senders: {
+        pending: [],
+        approved: [
+          {
+            sender_id: "931819457",
+            state: "approved",
+            display_label: "ahmad",
+            requested_at_ms: 1,
+            expires_at_ms: null,
+            model: "managed:qwen2.5-7b",
+          },
+        ],
+        blocked: [],
+      },
+    });
+    render(<ChannelsPanel />);
+    fireEvent.click(await screen.findByText("Family Signal"));
+
+    expect(await screen.findByText("ahmad")).toBeTruthy();
+    expect(screen.getByText("931819457")).toBeTruthy();
+    // The model they picked for themselves rides along, so the operator can
+    // see who is answered on what.
+    expect(screen.getByText(/managed:qwen2\.5-7b/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Revoke access" }));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("channels_decide_sender", {
+        accountId: "chan-1",
+        senderId: "931819457",
+        approve: false,
+      }),
+    );
+  });
+
+  /**
+   * Forgetting is the other way out, and the opposite of blocking: the row
+   * goes, so the person's next message is a stranger's and earns a fresh
+   * pairing code. It is what an operator wants for someone they let in by
+   * mistake and would let in again — and it is offered on a blocked sender
+   * too, which is how a block is undone without approving them outright.
+   */
+  it("forgets a sender so they can pair again", async () => {
+    mockChannels({
+      accounts: [BASE],
+      senders: {
+        pending: [],
+        approved: [],
+        blocked: [
+          {
+            sender_id: "555",
+            state: "blocked",
+            display_label: "Bo",
+            requested_at_ms: 1,
+            expires_at_ms: null,
+            model: null,
+          },
+        ],
+      },
+    });
+    render(<ChannelsPanel />);
+    fireEvent.click(await screen.findByText("Family Signal"));
+
+    expect(await screen.findByText("Bo")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Forget" }));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("channels_forget_sender", {
+        accountId: "chan-1",
+        senderId: "555",
+      }),
     );
   });
 

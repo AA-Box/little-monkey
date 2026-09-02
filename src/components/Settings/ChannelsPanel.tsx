@@ -9,7 +9,7 @@ import {
   type ChannelHealthState,
   type ExposureStatus,
   type GroupActivation,
-  type PendingSender,
+  type ChannelSenders,
   PROVIDER_GUIDES,
   UNIVERSAL_CONFIG_FIELDS,
   buildProviderConfig,
@@ -28,6 +28,7 @@ import {
   channelsRemove,
   channelsRoutes,
   channelsSenders,
+  channelsForgetSender,
   channelsSetConfig,
   channelsSetCredential,
   channelsSetPolicy,
@@ -116,7 +117,7 @@ export function ChannelsPanel() {
   const { t } = useT();
   const [accounts, setAccounts] = useState<ChannelAccount[] | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
-  const [senders, setSenders] = useState<PendingSender[]>([]);
+  const [senders, setSenders] = useState<ChannelSenders>({ pending: [], approved: [], blocked: [] });
   const [events, setEvents] = useState<ChannelEvent[]>([]);
   const [routeCount, setRouteCount] = useState<number | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -166,7 +167,7 @@ export function ChannelsPanel() {
   const loadDetail = useCallback(async (accountId: string, kind: string) => {
     try {
       const [waiting, recent] = await Promise.all([channelsSenders(accountId), channelsEvents(accountId, 20)]);
-      setSenders(waiting.pending);
+      setSenders(waiting);
       setEvents(recent.events);
       // Only webhook providers have a callback to show, and asking the daemon
       // is the only way to learn whether one is reachable at all.
@@ -689,11 +690,11 @@ export function ChannelsPanel() {
 
           <div className="mt-3 border-t border-border pt-3">
             <h5 className="text-xs font-semibold">{t("ChannelsPanel.pendingSenders")}</h5>
-            {senders.length === 0 ? (
+            {senders.pending.length === 0 ? (
               <p className="mt-1 text-xs text-faint">{t("ChannelsPanel.noPendingSenders")}</p>
             ) : (
               <ul className="mt-2 flex flex-col gap-1">
-                {senders.map((sender) => (
+                {senders.pending.map((sender) => (
                   <li key={sender.sender_id} className="flex items-center justify-between gap-2 rounded-md border border-border bg-background px-2 py-1 text-xs">
                     <span className="min-w-0 truncate">{sender.display_label ?? sender.sender_id}</span>
                     <span className="flex gap-1">
@@ -709,6 +710,59 @@ export function ChannelsPanel() {
               </ul>
             )}
             <p className="mt-1 text-xs text-faint">{t("ChannelsPanel.approvalScope")}</p>
+
+            {/* Who was let in, and the way to take it back. A revoked sender is
+                blocked, not forgotten: forgetting would hand them a fresh
+                pairing code, which is the opposite of what "revoke" means. */}
+            <h5 className="mt-3 text-xs font-semibold">{t("ChannelsPanel.approvedSenders")}</h5>
+            {senders.approved.length === 0 ? (
+              <p className="mt-1 text-xs text-faint">{t("ChannelsPanel.noApprovedSenders")}</p>
+            ) : (
+              <ul className="mt-2 flex flex-col gap-1">
+                {senders.approved.map((sender) => (
+                  <li key={sender.sender_id} className="flex items-center justify-between gap-2 rounded-md border border-border bg-background px-2 py-1 text-xs">
+                    <span className="min-w-0 truncate" title={sender.sender_id}>
+                      {sender.display_label ?? sender.sender_id}
+                      {sender.display_label && <span className="ml-1 text-faint">{sender.sender_id}</span>}
+                      {/* Their own `/model` pick, or the machine's default. */}
+                      <span className="ml-1 text-faint">· {sender.model ?? t("ChannelsPanel.defaultModel")}</span>
+                    </span>
+                    <span className="flex gap-1">
+                      <Button size="sm" variant="danger" disabled={busy !== null} onClick={() => void run("revoke", () => channelsDecideSender(account.account_id, sender.sender_id, false), t("ChannelsPanel.senderRevoked"))}>
+                        <Ban size={12} />{t("ChannelsPanel.revoke")}
+                      </Button>
+                      <Button size="sm" disabled={busy !== null} onClick={() => void run("forget", () => channelsForgetSender(account.account_id, sender.sender_id), t("ChannelsPanel.senderForgotten"))}>
+                        <Trash2 size={12} />{t("ChannelsPanel.forgetSender")}
+                      </Button>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            {senders.blocked.length > 0 && (
+              <>
+                <h5 className="mt-3 text-xs font-semibold">{t("ChannelsPanel.blockedSenders")}</h5>
+                <ul className="mt-2 flex flex-col gap-1">
+                  {senders.blocked.map((sender) => (
+                    <li key={sender.sender_id} className="flex items-center justify-between gap-2 rounded-md border border-border bg-background px-2 py-1 text-xs">
+                      <span className="min-w-0 truncate" title={sender.sender_id}>
+                        {sender.display_label ?? sender.sender_id}
+                        {sender.display_label && <span className="ml-1 text-faint">{sender.sender_id}</span>}
+                      </span>
+                      <span className="flex gap-1">
+                        <Button size="sm" disabled={busy !== null} onClick={() => void run("approve", () => channelsDecideSender(account.account_id, sender.sender_id, true), t("ChannelsPanel.senderApproved"))}>
+                          <Check size={12} />{t("ChannelsPanel.approve")}
+                        </Button>
+                        <Button size="sm" disabled={busy !== null} onClick={() => void run("forget", () => channelsForgetSender(account.account_id, sender.sender_id), t("ChannelsPanel.senderForgotten"))}>
+                          <Trash2 size={12} />{t("ChannelsPanel.forgetSender")}
+                        </Button>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
           </div>
 
           <div className="mt-3 border-t border-border pt-3">
