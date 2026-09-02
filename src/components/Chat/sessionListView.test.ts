@@ -250,4 +250,31 @@ describe("buildSessionListView", () => {
     expect(external({ title: "  ", account_label: "Ahmad's iPhone" }).title).toBe("Ahmad's iPhone");
     expect(external({ title: "", account_label: null, id: "phone-9" }).title).toBe("phone-9");
   });
+
+  it("carries the desktop's own notes about an outside conversation", () => {
+    const conversation: ExternalConversation = {
+      environment: "channel:telegram",
+      provider: "telegram",
+      id: "c-1",
+      title: "931819457",
+      account_label: "Little",
+      updated_at_ms: NOW,
+      message_count: 1,
+    };
+    const row = externalRow(conversation, {
+      pinned: true,
+      unread: false,
+      archived: true,
+      groupId: "g-1",
+      title: "  Ahmad  ",
+    });
+    expect(row).toMatchObject({ title: "Ahmad", pinned: true, archived: true, groupId: "g-1" });
+    // No notes is the plain row, exactly as before they existed.
+    expect(externalRow(conversation)).toMatchObject({
+      title: "931819457",
+      pinned: false,
+      archived: false,
+      groupId: null,
+    });
+  });
 });

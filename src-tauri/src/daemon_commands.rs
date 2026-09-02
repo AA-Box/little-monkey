@@ -4170,6 +4170,27 @@ pub async fn conversations_show(
     )
 }
 
+/// Erase one outside conversation from this machine. The CLI refuses — with
+/// a reason the sidebar shows — while a turn or a reply for it is in flight.
+#[tauri::command]
+pub async fn conversations_delete(environment: String, id: String) -> Result<(), String> {
+    validate_token("environment", &environment, 64)?;
+    let id = channel_id("conversation id", &id)?;
+    if environment.starts_with('-') {
+        return Err("Invalid environment".to_string());
+    }
+    command(vec![
+        "conversations".into(),
+        "delete".into(),
+        "--environment".into(),
+        environment,
+        "--id".into(),
+        id,
+    ])
+    .await
+    .map(|_| ())
+}
+
 #[tauri::command]
 pub async fn channels_list() -> Result<Value, String> {
     parse_json(&command(vec!["channels".into(), "list".into(), "--json".into()]).await?)
@@ -4258,7 +4279,8 @@ pub async fn channels_senders(account_id: String) -> Result<Value, String> {
     )
 }
 
-/// Approve or block a waiting sender.
+/// Approve or block a sender — a waiting one, or an approved one whose access
+/// the operator is taking back.
 ///
 /// Approval is the ability to send messages and nothing else — no tool, device
 /// or telephony authority follows from it.
@@ -4277,6 +4299,22 @@ pub async fn channels_decide_sender(
         } else {
             "block".into()
         },
+        account_id,
+        sender_id,
+    ])
+    .await
+    .map(|_| ())
+}
+
+/// Forget a sender: their approval or block, their model pick, and that they
+/// were greeted. Their next message meets the pairing challenge afresh.
+#[tauri::command]
+pub async fn channels_forget_sender(account_id: String, sender_id: String) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let sender_id = channel_id("sender id", &sender_id)?;
+    command(vec![
+        "channels".into(),
+        "forget".into(),
         account_id,
         sender_id,
     ])

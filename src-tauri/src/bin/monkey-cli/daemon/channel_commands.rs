@@ -11,13 +11,18 @@
 //! pairing challenge, never a menu — commands are for senders the account has
 //! already decided to talk to.
 //!
+//! A model pick is the *sender's own*. `/model 2` records a target for that
+//! person on that account and nothing else changes: the routed recipe stays the
+//! machine's default, everybody else is still answered on it, and two people in
+//! the same group can be answered on two models at once. Nobody is asked to
+//! pick before being answered — the first message runs on the default and the
+//! sender is told, once, what that is and how to change it.
+//!
 //! Nothing here queues a run, and nothing here writes the outbox: this module
 //! decides *what to say*, and `channel_ingress` commits the answer with the
 //! event, the same way it commits a pairing challenge. Keeping the durable
 //! write there is what leaves the outbox with the few producers
 //! `channel_restart_tests` guards.
-
-use std::path::PathBuf;
 
 use little_monkey_lib::channels::ingress::ConversationSource;
 use little_monkey_lib::channels::routing::{resolve_route, ChannelRoute};
@@ -46,118 +51,119 @@ pub(super) enum Command {
     Resume,
     /// `/settings`, optionally carrying a model choice.
     Settings(Option<usize>),
-    /// Not typed by anyone: the answer to the first message on a machine where
-    /// nobody has picked a model yet. See [`model_chosen`].
-    ChooseFirst,
 }
 
-/// Where the first-run model gate stands on this machine. Machine-wide, because
-/// the pick is: a pick writes the routed recipe, which is the one file every
-/// conversation on that route runs.
+/// The meta row the first-run *gate* this module used to have wrote. Any value
+/// means the machine already went through the model conversation once — the
+/// menu was shown, or a pick was made — so nobody here is introduced again.
 const MODEL_GATE_KEY: &str = "channel_model_chosen";
 
-/// A model has been chosen; nothing is gated again.
-const GATE_OPEN: &str = "1";
+/// One meta row per sender who has been told, once, which model answers them.
+const INTRODUCED_KEY_PREFIX: &str = "channel_introduced:";
 
-/// Armed, and the model the route named when it was armed. A target that no
-/// longer matches means somebody chose since — see [`model_chosen`].
-const GATE_ARMED_PREFIX: &str = "pending:";
+/// One meta row per sender who picked a model for themselves.
+const SENDER_MODEL_KEY_PREFIX: &str = "channel_sender_model:";
 
-/// The target string recorded when the routed recipe could not be read. Any
-/// real target differs from it, which is the answer that fails safe: an
-/// unreadable recipe leaves the gate armed rather than opening it by accident.
-const UNKNOWN_TARGET: &str = "unknown";
-
-/// Whether the machine may answer, or owes the sender a model menu first.
-///
-/// Three states, in one meta row:
-///
-/// - **Unset** — nobody has been asked yet. Arms the gate against the model the
-///   route names *now*, and answers with the menu. A machine with nothing
-///   installed opens instead: a menu with no options and no way past it is
-///   worse than answering on whatever the recipe already says.
-/// - **Armed** — gated, until the routed recipe names a different model than it
-///   did when armed. That is what lets a choice made anywhere else count: the
-///   desktop app's model picker, `monkey channels`, or an operator editing the
-///   recipe by hand all change the same file, and none of them can reach into
-///   this database to say so.
-/// - **Open** — answered normally, forever.
-pub(super) fn model_chosen(
-    store: &mut DaemonStore,
-    current_target: Option<&str>,
-) -> Result<bool, String> {
-    let target = current_target.unwrap_or(UNKNOWN_TARGET);
-    match store.get_meta(MODEL_GATE_KEY)? {
-        Some(value) if value == GATE_OPEN => Ok(true),
-        Some(value) => match value.strip_prefix(GATE_ARMED_PREFIX) {
-            // Same model as when we armed: nobody has chosen yet.
-            Some(armed) if armed == target => Ok(false),
-            // Changed since, so somebody chose — wherever they did it.
-            Some(_) => {
-                open_gate(store)?;
-                Ok(true)
-            }
-            // A value this build does not recognise. Answering is the safe
-            // reading of a row we cannot interpret.
-            None => Ok(true),
-        },
-        None => {
-            let models = catalogue();
-            // Nothing to offer, or the route already names a model this machine
-            // can actually run: either way there is nothing to ask. Asking a
-            // person to choose while their bot is working is not a first-run
-            // question, it is an obstacle — and the recipe naming a model that
-            // *is* installed is as good an answer as one typed into a chat.
-            if models.is_empty() || runnable_target(&models, current_target) {
-                open_gate(store)?;
-                return Ok(true);
-            }
-            store.set_meta(MODEL_GATE_KEY, &format!("{GATE_ARMED_PREFIX}{target}"))?;
-            Ok(false)
-        }
-    }
+fn sender_model_key(account_id: &str, sender_id: &str) -> String {
+    format!("{SENDER_MODEL_KEY_PREFIX}{account_id}:{sender_id}")
 }
 
-/// The model the route's recipe names right now, in the same words
-/// [`current_model_line`] shows. `None` when there is no route or the recipe
-/// cannot be read.
-pub(super) fn routed_target(route: Option<&ChannelRoute>) -> Option<String> {
-    let route = route?;
-    let roots = recipes::global_config_roots().ok()?;
-    let recipe = recipes::resolve_recipe(&route.target.recipe, None, &roots).ok()?;
-    Some(super::describe_recipe_target(&recipe.target))
-}
-
-/// Whether `target` is one of the models on the menu — that is, one this
-/// machine can start. A target naming something uninstalled is what makes the
-/// question worth asking.
-fn runnable_target(models: &[ModelChoice], target: Option<&str>) -> bool {
-    let Some(target) = target else {
-        return false;
+/// The model this sender picked for themselves, if they have.
+///
+/// A row this build cannot read counts as no pick: the default answers, and the
+/// person can pick again. Refusing their messages over a stale row would be
+/// worse than either.
+pub(super) fn sender_model(
+    store: &DaemonStore,
+    account_id: &str,
+    sender_id: &str,
+) -> Result<Option<RecipeTarget>, String> {
+    let Some(raw) = store.get_meta(&sender_model_key(account_id, sender_id))? else {
+        return Ok(None);
     };
-    models
-        .iter()
-        .any(|model| super::describe_recipe_target(&model.target) == target)
+    Ok(serde_json::from_str(&raw).ok())
 }
 
-fn open_gate(store: &mut DaemonStore) -> Result<(), String> {
-    store.set_meta(MODEL_GATE_KEY, GATE_OPEN)
+pub(super) fn set_sender_model(
+    store: &mut DaemonStore,
+    account_id: &str,
+    sender_id: &str,
+    target: &RecipeTarget,
+) -> Result<(), String> {
+    let raw = serde_json::to_string(target).map_err(|error| error.to_string())?;
+    store.set_meta(&sender_model_key(account_id, sender_id), &raw)
 }
 
-/// A machine whose model was already chosen, for the fixtures that are about
-/// something other than the first-run gate.
+/// Whether this is the first message this account has answered from this
+/// sender — and, if it is, records that it no longer is.
+///
+/// Written *before* the caller queues the notice on purpose: a crash between
+/// the two loses one line of courtesy, where the other order would send it
+/// twice. A machine that went through the old first-run gate has already had
+/// the model conversation with its people and introduces nobody.
+pub(super) fn first_contact(
+    store: &mut DaemonStore,
+    account_id: &str,
+    sender_id: &str,
+) -> Result<bool, String> {
+    if store.get_meta(MODEL_GATE_KEY)?.is_some() {
+        return Ok(false);
+    }
+    if store
+        .get_meta(&introduced_key(account_id, sender_id))?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    mark_introduced(store, account_id, sender_id)?;
+    Ok(true)
+}
+
+fn introduced_key(account_id: &str, sender_id: &str) -> String {
+    format!("{INTRODUCED_KEY_PREFIX}{account_id}:{sender_id}")
+}
+
+/// This sender has been told which model answers them — by the notice, or by a
+/// command whose answer already says so, which is why `/start` and then a
+/// message does not name the model twice.
+fn mark_introduced(
+    store: &mut DaemonStore,
+    account_id: &str,
+    sender_id: &str,
+) -> Result<(), String> {
+    store.set_meta(&introduced_key(account_id, sender_id), "1")
+}
+
+/// Everything this module remembers about one sender — their model pick and
+/// that they were introduced — gone, for an operator forgetting them. Their
+/// next message is a stranger's, and is greeted as one.
+pub(crate) fn forget_sender_state(
+    store: &mut DaemonStore,
+    account_id: &str,
+    sender_id: &str,
+) -> Result<(), String> {
+    store.delete_meta(&sender_model_key(account_id, sender_id))?;
+    store.delete_meta(&introduced_key(account_id, sender_id))?;
+    Ok(())
+}
+
+/// The sender's own pick, in the one line a listing shows — `None` when they
+/// are answered on the machine's default.
+pub(crate) fn sender_model_label(
+    store: &DaemonStore,
+    account_id: &str,
+    sender_id: &str,
+) -> Result<Option<String>, String> {
+    Ok(sender_model(store, account_id, sender_id)?
+        .map(|target| super::describe_recipe_target(&target)))
+}
+
+/// A machine whose people were all told already, for the fixtures that are
+/// about something other than the first-contact notice — without it every
+/// fixture's first message would grow an extra outbox row.
 #[cfg(test)]
-pub(crate) fn mark_model_chosen(store: &mut DaemonStore) -> Result<(), String> {
-    open_gate(store)
-}
-
-/// A machine that has been asked and has not answered — the gated state, armed
-/// against `target` so a test pins the gate without depending on what this
-/// machine happens to have installed.
-#[cfg(test)]
-pub(crate) fn arm_model_gate(store: &mut DaemonStore, target: Option<&str>) -> Result<(), String> {
-    let target = target.unwrap_or(UNKNOWN_TARGET);
-    store.set_meta(MODEL_GATE_KEY, &format!("{GATE_ARMED_PREFIX}{target}"))
+pub(crate) fn suppress_first_run_notice(store: &mut DaemonStore) -> Result<(), String> {
+    store.set_meta(MODEL_GATE_KEY, "1")
 }
 
 /// The command in `text`, if it is one.
@@ -221,25 +227,36 @@ pub(super) fn reply(
         .channel_routes()
         .ok()
         .and_then(|routes| resolve_route(&routes, envelope).ok().cloned());
+    let who = Who {
+        account_id: &account.account_id,
+        sender_id: &envelope.sender.sender_id,
+    };
+    // These answers name the model; a person who has read one needs no notice.
+    if matches!(
+        command,
+        Command::Start(None) | Command::Settings(None) | Command::Status
+    ) {
+        mark_introduced(store, who.account_id, who.sender_id)?;
+    }
     Ok(match command {
-        Command::Start(None) => start_text(route.as_ref()),
+        Command::Start(None) => start_text(store, who, route.as_ref()),
         Command::Start(Some(choice)) | Command::Settings(Some(choice)) => {
-            let (text, picked) = choose_model(route.as_ref(), choice);
-            // Written only on a pick that reached the file: a menu shown, or a
-            // number off the end of it, must not open the gate.
-            if picked {
-                open_gate(store)?;
-            }
-            text
+            apply_choice(store, who, route.as_ref(), choice, &catalogue())
         }
-        Command::ChooseFirst => first_run_text(route.as_ref()),
-        Command::Settings(None) => settings_text(route.as_ref()),
+        Command::Settings(None) => settings_text(store, who, route.as_ref()),
         Command::Help => HELP.to_string(),
         Command::Clear => CLEAR.to_string(),
-        Command::Status => status_text(store, account, envelope, route.as_ref())?,
+        Command::Status => status_text(store, who, account, envelope, route.as_ref())?,
         Command::Stop => stop_text(store, envelope, route.as_ref(), now_ms)?,
         Command::Resume => resume_text(store, queue, account, envelope, route.as_ref(), now_ms)?,
     })
+}
+
+/// The person a model line or a pick is about: one sender on one account.
+#[derive(Clone, Copy)]
+pub(super) struct Who<'a> {
+    pub(super) account_id: &'a str,
+    pub(super) sender_id: &'a str,
 }
 
 const HELP: &str = "\
@@ -249,7 +266,7 @@ const HELP: &str = "\
 /status — connection, model, and whether a turn is running
 /stop — cancel the turn running now
 /resume — retry a turn that failed to start
-/model, /settings — show the model, or `/model 2` to change it";
+/model, /settings — show the model answering you, or `/model 2` to pick another for yourself";
 
 /// `/new` and `/clear` both mean "forget what we said", and there is nothing to
 /// forget: a channel turn is queued with the message as its only parameter, so
@@ -259,42 +276,58 @@ const CLEAR: &str = "\
 Nothing to clear — each message is answered on its own, with no memory of the \
 ones before it.";
 
-fn start_text(route: Option<&ChannelRoute>) -> String {
+fn start_text(store: &DaemonStore, who: Who<'_>, route: Option<&ChannelRoute>) -> String {
     format!(
         "Send a message and it is answered by this machine.\n\n{}\n\n{}",
-        current_model_line(route),
+        current_model_line(store, who, route),
         menu_text()
     )
 }
 
-/// The answer to a message that arrived before anyone picked a model.
+/// What a person is told, once, with the answer to their first message: which
+/// model is answering and that `/model` changes it — for them alone.
 ///
-/// Says to send the message again, because this one is not queued: it settled
-/// as answered-by-the-daemon, and silently running it after the pick would
-/// answer something the person may have moved on from.
-fn first_run_text(route: Option<&ChannelRoute>) -> String {
+/// No menu here. This also goes out over SMS, where a machine with a dozen
+/// models installed would bill its inventory to somebody's first text.
+pub(super) fn first_run_notice(
+    store: &DaemonStore,
+    who: Who<'_>,
+    route: Option<&ChannelRoute>,
+) -> String {
     format!(
-        "Pick a model first, then send your message again.\n\n{}\n\n{}",
-        current_model_line(route),
+        "{}\nSend /model to see the models on this machine, or `/model 2` to be \
+         answered on another one. Your pick changes nothing for anybody else.",
+        current_model_line(store, who, route)
+    )
+}
+
+fn settings_text(store: &DaemonStore, who: Who<'_>, route: Option<&ChannelRoute>) -> String {
+    format!(
+        "{}\n\n{}",
+        current_model_line(store, who, route),
         menu_text()
     )
 }
 
-fn settings_text(route: Option<&ChannelRoute>) -> String {
-    format!("{}\n\n{}", current_model_line(route), menu_text())
-}
-
-/// The model the route's recipe names, read the same way the runner reads it.
-fn current_model_line(route: Option<&ChannelRoute>) -> String {
+/// The model answering this person: their own pick when they made one, else
+/// the routed recipe's target, read the same way the runner reads it.
+fn current_model_line(store: &DaemonStore, who: Who<'_>, route: Option<&ChannelRoute>) -> String {
     let Some(route) = route else {
         return "No task is routed to this conversation yet.".to_string();
     };
+    if let Ok(Some(chosen)) = sender_model(store, who.account_id, who.sender_id) {
+        return format!(
+            "Answering you on {} — your own pick (task '{}').",
+            super::describe_recipe_target(&chosen),
+            route.target.recipe
+        );
+    }
     let Ok(roots) = recipes::global_config_roots() else {
         return format!("Task: {}", route.target.recipe);
     };
     match recipes::resolve_recipe(&route.target.recipe, None, &roots) {
         Ok(recipe) => format!(
-            "Answering on {} (task '{}').",
+            "Answering on {} — this machine's default (task '{}').",
             super::describe_recipe_target(&recipe.target),
             route.target.recipe
         ),
@@ -302,61 +335,39 @@ fn current_model_line(route: Option<&ChannelRoute>) -> String {
     }
 }
 
-/// Point the route's recipe at the model the sender picked.
+/// Record the model the sender picked, for that sender alone.
 ///
-/// The recipe file is what the runner resolves for the next message, so writing
-/// it is the whole change — but it is also the recipe *every* conversation on
-/// this route runs, and this is deliberately machine-wide rather than per-chat.
-/// A route scoped to one conversation is how an operator narrows that, and it
-/// is set from the desktop app or `monkey channels add-route`, not from here.
-fn choose_model(route: Option<&ChannelRoute>, choice: usize) -> (String, bool) {
-    let roots = match recipes::global_config_roots() {
-        Ok(roots) => roots,
-        Err(error) => {
-            return (
-                format!("Could not find this machine's tasks: {error}"),
-                false,
-            )
-        }
-    };
-    apply_choice(route, choice, &roots, &catalogue())
-}
-
-/// The choice itself, against a given inventory and set of config roots — the
-/// two things a test can supply and a chat cannot.
+/// The pick lives in this database, keyed by account and sender, and is read
+/// back at accept time into the turn's frozen recipe. The recipe file is never
+/// written: it is the default every *other* conversation runs on, and one
+/// person changing it for everybody is the bug this replaced.
 fn apply_choice(
+    store: &mut DaemonStore,
+    who: Who<'_>,
     route: Option<&ChannelRoute>,
     choice: usize,
-    roots: &[PathBuf],
     models: &[ModelChoice],
-) -> (String, bool) {
-    let Some(route) = route else {
-        return (
-            "No task is routed to this conversation yet, so there is no model to change."
-                .to_string(),
-            false,
-        );
-    };
+) -> String {
+    if route.is_none() {
+        return "No task is routed to this conversation yet, so there is no model to change."
+            .to_string();
+    }
     let Some(model) = choice.checked_sub(1).and_then(|index| models.get(index)) else {
-        return (
-            format!("No model {choice} in the list.\n\n{}", render(models)),
-            false,
-        );
+        return format!("No model {choice} in the list.\n\n{}", render(models));
     };
-    match recipes::set_recipe_target(&route.target.recipe, None, roots, &model.target) {
-        Ok(_) => (
-            format!(
-                "Now answering on {}. A turn already running keeps the model it started with.",
-                model.label
-            ),
-            true,
+    match set_sender_model(store, who.account_id, who.sender_id, &model.target) {
+        Ok(()) => format!(
+            "Now answering you on {}. Nobody else's model changes, and a turn already \
+             running keeps the model it started with.",
+            model.label
         ),
-        Err(error) => (format!("Could not change the model: {error}"), false),
+        Err(error) => format!("Could not change the model: {error}"),
     }
 }
 
 fn status_text(
     store: &mut DaemonStore,
+    who: Who<'_>,
     account: &ChannelAccountRecord,
     envelope: &ChannelEnvelope,
     route: Option<&ChannelRoute>,
@@ -381,7 +392,7 @@ fn status_text(
         } else {
             ", account disabled"
         },
-        current_model_line(route),
+        current_model_line(store, who, route),
     ))
 }
 
@@ -496,7 +507,10 @@ fn render(models: &[ModelChoice]) -> String {
     for (index, model) in models.iter().enumerate() {
         out.push_str(&format!("{}. {}\n", index + 1, model.label));
     }
-    out.push_str("\nSend `/model 1` to answer on that one instead.");
+    out.push_str(
+        "\nSend `/model 1` to be answered on that one instead. Your pick changes nothing for \
+         anybody else.",
+    );
     out
 }
 
@@ -631,13 +645,6 @@ mod tests {
         assert!(render(&[]).contains("No model is installed"));
     }
 
-    fn scratch_root() -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("lm-command-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(root.join("recipes")).expect("scratch root");
-        root
-    }
-
     fn route_to(recipe: &str) -> ChannelRoute {
         ChannelRoute {
             route_id: "route-1".into(),
@@ -668,113 +675,132 @@ mod tests {
         ]
     }
 
-    /// The pick has to reach the file the runner reads, or the next message is
-    /// still answered by the old model and the confirmation was a lie.
+    const ADA: Who<'static> = Who {
+        account_id: "acct-1",
+        sender_id: "ada",
+    };
+    const BO: Who<'static> = Who {
+        account_id: "acct-1",
+        sender_id: "bo",
+    };
+
+    /// The pick is the sender's own: it is read back for them and for nobody
+    /// else, and the same person on another account is another person.
     #[test]
-    fn a_pick_rewrites_the_routed_recipes_model() {
-        let root = scratch_root();
-        let path = root.join("recipes").join("chat.yml");
-        std::fs::write(
-            &path,
-            "version: 1\nname: \"chat\"\ntarget:\n  ollama: \"old-model\"\npermission_mode: plan\nprompt: |\n  {{message}}\n",
-        )
-        .expect("recipe");
+    fn a_pick_is_the_senders_own() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
 
-        let (said, picked) = apply_choice(Some(&route_to("chat")), 2, &[root.clone()], &models());
+        let said = apply_choice(&mut store, ADA, Some(&route_to("chat")), 2, &models());
 
-        assert!(
-            picked,
-            "a pick that wrote the file must report itself: {said}"
-        );
         assert!(said.contains("Local · llama"), "{said}");
-        let raw = std::fs::read_to_string(&path).expect("read back");
-        assert!(raw.contains("managed_model: \"llama\""), "{raw}");
-        assert!(!raw.contains("old-model"), "{raw}");
-    }
-
-    /// Armed against the model the route named: still nobody's choice, so the
-    /// next message meets the menu rather than the model.
-    #[test]
-    fn an_armed_gate_stays_shut_while_the_model_is_the_one_it_armed_against() {
-        let mut store = DaemonStore::open_in_memory().expect("open");
-        store
-            .set_meta(MODEL_GATE_KEY, "pending:ollama:qwen")
-            .expect("arm");
-
-        assert!(!model_chosen(&mut store, Some("ollama:qwen")).expect("gate"));
-    }
-
-    #[test]
-    fn a_pick_opens_the_gate_for_good() {
-        let mut store = DaemonStore::open_in_memory().expect("open");
-        mark_model_chosen(&mut store).expect("mark");
-        assert!(model_chosen(&mut store, Some("ollama:qwen")).expect("gate"));
-    }
-
-    /// A model chosen anywhere but a chat — the desktop app's picker, `monkey
-    /// channels`, an operator editing the recipe — is still a choice, and none
-    /// of those can write this database. The routed recipe naming something
-    /// else is the evidence, and it is durable.
-    #[test]
-    fn a_model_changed_outside_the_chat_opens_the_gate() {
-        let mut store = DaemonStore::open_in_memory().expect("open");
-        store
-            .set_meta(MODEL_GATE_KEY, "pending:ollama:qwen")
-            .expect("arm");
-
-        assert!(model_chosen(&mut store, Some("managed:llama")).expect("gate"));
-        // Recorded as open, so it stays open once the new model is the one a
-        // fresh arm would have chosen.
+        assert!(said.contains("Nobody else"), "{said}");
         assert_eq!(
-            store.get_meta(MODEL_GATE_KEY).expect("meta").as_deref(),
-            Some(GATE_OPEN)
+            sender_model(&store, "acct-1", "ada").expect("read"),
+            Some(models()[1].target.clone())
         );
-        assert!(model_chosen(&mut store, Some("managed:llama")).expect("gate"));
+        assert_eq!(sender_model(&store, "acct-1", "bo").expect("read"), None);
+        assert_eq!(sender_model(&store, "acct-2", "ada").expect("read"), None);
     }
 
-    /// An unreadable recipe must not be mistaken for a change: the gate stays
-    /// shut rather than opening on a missing file.
+    /// Two people, two models, at the same time — the complaint this came from
+    /// was one person's `/model` changing what everybody else was answered on.
     #[test]
-    fn an_unreadable_recipe_does_not_open_the_gate() {
+    fn two_senders_keep_two_picks() {
         let mut store = DaemonStore::open_in_memory().expect("open");
-        arm_model_gate(&mut store, None).expect("arm");
+        apply_choice(&mut store, ADA, Some(&route_to("chat")), 1, &models());
+        apply_choice(&mut store, BO, Some(&route_to("chat")), 2, &models());
 
-        assert!(!model_chosen(&mut store, None).expect("gate"));
+        assert_eq!(
+            sender_model(&store, "acct-1", "ada").expect("ada"),
+            Some(models()[0].target.clone())
+        );
+        assert_eq!(
+            sender_model(&store, "acct-1", "bo").expect("bo"),
+            Some(models()[1].target.clone())
+        );
     }
 
-    /// Arming reads this machine's own inventory, so the assertion is about the
-    /// two states that follow from it: nothing installed means never gated,
-    /// and anything installed means armed against the model in hand. Either
-    /// way the answer is recorded, so the inventory is asked once.
+    /// A number outside the menu changes nothing and shows the menu again.
     #[test]
-    fn the_first_message_arms_or_opens_and_records_which() {
+    fn a_choice_off_the_end_of_the_menu_changes_nothing() {
         let mut store = DaemonStore::open_in_memory().expect("open");
-
-        let open = model_chosen(&mut store, Some("ollama:qwen")).expect("gate");
-        let recorded = store.get_meta(MODEL_GATE_KEY).expect("meta");
-        if open {
-            assert_eq!(recorded.as_deref(), Some(GATE_OPEN), "{recorded:?}");
-        } else {
-            assert_eq!(recorded.as_deref(), Some("pending:ollama:qwen"));
+        for choice in [0, 3] {
+            let said = apply_choice(&mut store, ADA, Some(&route_to("chat")), choice, &models());
+            assert!(said.contains("No model"), "{said}");
         }
+        assert_eq!(sender_model(&store, "acct-1", "ada").expect("read"), None);
     }
 
-    /// The complaint this came from: a machine already answering on an
-    /// installed model was told to pick one before it would answer at all.
-    /// A route naming a model the machine can run is not a machine with an
-    /// unanswered question.
+    /// A pick that no longer parses is no pick: the default answers rather
+    /// than the person's messages being refused over a stale row.
     #[test]
-    fn a_route_already_naming_a_runnable_model_is_never_gated() {
-        assert!(runnable_target(&models(), Some("managed:llama")));
-        assert!(runnable_target(&models(), Some("ollama:qwen")));
+    fn an_unreadable_pick_reads_as_none() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        store
+            .set_meta(&sender_model_key("acct-1", "ada"), "not json")
+            .expect("meta");
+        assert_eq!(sender_model(&store, "acct-1", "ada").expect("read"), None);
     }
 
-    /// And the case that is worth asking about: the recipe names something
-    /// this machine cannot start, so every message would fail.
+    /// A person is introduced once, per account; a machine that already had
+    /// the model conversation under the old gate introduces nobody.
     #[test]
-    fn a_route_naming_a_model_that_is_not_installed_is_asked_about() {
-        assert!(!runnable_target(&models(), Some("managed:not-installed")));
-        assert!(!runnable_target(&models(), None));
+    fn a_sender_is_a_first_contact_exactly_once() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        assert!(first_contact(&mut store, "acct-1", "ada").expect("first"));
+        assert!(!first_contact(&mut store, "acct-1", "ada").expect("again"));
+        assert!(first_contact(&mut store, "acct-1", "bo").expect("someone else"));
+        assert!(first_contact(&mut store, "acct-2", "ada").expect("another account"));
+
+        let mut told = DaemonStore::open_in_memory().expect("open");
+        suppress_first_run_notice(&mut told).expect("mark");
+        assert!(!first_contact(&mut told, "acct-1", "ada").expect("introduced machine"));
+    }
+
+    /// Reading `/start`'s answer is being introduced: the notice would say the
+    /// same thing again.
+    #[test]
+    fn a_command_that_names_the_model_counts_as_the_introduction() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        mark_introduced(&mut store, "acct-1", "ada").expect("mark");
+        assert!(!first_contact(&mut store, "acct-1", "ada").expect("told already"));
+    }
+
+    /// Forgetting a sender forgets their pick and their introduction, and
+    /// nobody else's.
+    #[test]
+    fn forgetting_a_sender_clears_only_their_state() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        set_sender_model(&mut store, "acct-1", "ada", &models()[0].target).expect("ada");
+        set_sender_model(&mut store, "acct-1", "bo", &models()[1].target).expect("bo");
+        assert!(first_contact(&mut store, "acct-1", "ada").expect("ada first"));
+
+        forget_sender_state(&mut store, "acct-1", "ada").expect("forget");
+
+        assert_eq!(sender_model(&store, "acct-1", "ada").expect("ada"), None);
+        assert_eq!(
+            sender_model_label(&store, "acct-1", "ada").expect("ada label"),
+            None
+        );
+        assert_eq!(
+            sender_model_label(&store, "acct-1", "bo").expect("bo label"),
+            Some("managed:llama".to_string())
+        );
+        assert!(first_contact(&mut store, "acct-1", "ada").expect("ada again"));
+    }
+
+    /// The notice says which model and how to change it, and never carries the
+    /// menu — it also goes out over SMS.
+    #[test]
+    fn the_first_contact_notice_names_the_model_and_the_command_without_the_menu() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        set_sender_model(&mut store, "acct-1", "ada", &models()[1].target).expect("pick");
+
+        let notice = first_run_notice(&store, ADA, Some(&route_to("chat")));
+
+        assert!(notice.contains("managed:llama"), "{notice}");
+        assert!(notice.contains("/model"), "{notice}");
+        assert!(!notice.contains("Models on this machine"), "{notice}");
     }
 
     /// `/model` is `/settings` under the name a person looks for mid-chat.
@@ -786,23 +812,5 @@ mod tests {
             parse("/model@little_monkey_bot 2"),
             Some(Command::Settings(Some(2)))
         );
-    }
-
-    /// A number outside the menu changes nothing and shows the menu again.
-    #[test]
-    fn a_choice_off_the_end_of_the_menu_changes_no_file() {
-        let root = scratch_root();
-        let path = root.join("recipes").join("chat.yml");
-        let raw = "version: 1\nname: \"chat\"\ntarget:\n  ollama: \"old-model\"\npermission_mode: plan\nprompt: |\n  {{message}}\n";
-        std::fs::write(&path, raw).expect("recipe");
-
-        for choice in [0, 3] {
-            let (said, picked) =
-                apply_choice(Some(&route_to("chat")), choice, &[root.clone()], &models());
-            assert!(said.contains("No model"), "{said}");
-            // Nothing was chosen, so the first-message gate must stay shut.
-            assert!(!picked, "{said}");
-        }
-        assert_eq!(std::fs::read_to_string(&path).expect("read back"), raw);
     }
 }

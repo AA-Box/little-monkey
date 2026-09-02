@@ -703,9 +703,14 @@ fn assert_durable_events(profile: &str, account_id: &str) -> Result<(), String> 
             accepted_inbound.len()
         ));
     }
-    if outbound != 1 {
+    // Two outbound rows, not one: the daemon greets a person's first message
+    // with a one-time notice naming the model, and every harness runs a fresh
+    // profile, so its sender is always a first contact. The count stays exact
+    // on purpose — a third row would be a reply sent twice, which is the bug
+    // this assertion exists to catch.
+    if outbound != 2 {
         return Err(format!(
-            "expected exactly one durable outbound event, got {outbound}: {payload}"
+            "expected exactly two durable outbound events (the first-contact notice and the reply), got {outbound}: {payload}"
         ));
     }
     Ok(())

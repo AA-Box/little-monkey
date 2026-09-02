@@ -339,6 +339,13 @@ impl DaemonStore {
         Ok(())
     }
 
+    pub fn delete_meta(&mut self, key: &str) -> Result<bool, String> {
+        self.connection
+            .execute("DELETE FROM daemon_meta WHERE key = ?1", [key])
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn get_meta(&self, key: &str) -> Result<Option<String>, String> {
         self.connection
             .query_row(

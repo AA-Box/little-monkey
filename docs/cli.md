@@ -160,6 +160,20 @@ monkey daemon remote push-configure --project-id <id> --service-account <file> [
 monkey daemon remote push-status [--json] | push-disable | push-test <device-id>
 ```
 
+Conversations the daemon holds outside the desktop — a paired phone's chat, a
+messaging conversation the agent is answering — and who may start one:
+
+```sh
+monkey conversations list [--environment remote_control|channel|channel:<provider>] [--json]
+monkey conversations show --environment <env> --id <id> [--json]
+monkey conversations delete --environment <env> --id <id> [--forget] [--json]   # erases it here; --forget only drops the row
+monkey channels senders <account-id> [--json]                        # waiting, approved and blocked, with names and each one's model
+monkey channels approve <account-id> <sender-id>
+monkey channels block <account-id> <sender-id>                       # also how an approved sender's access is revoked
+monkey channels forget <account-id> <sender-id>                      # their next message meets the pairing challenge again
+```
+
+
 The `device-*`, `voice-*` and `push-*` commands are documented in
 [Paired devices](paired-devices.md). The `standards` lifecycle is documented in
 [Standards Studio](standards-studio.md) — the CLI reads and writes the same
