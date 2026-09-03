@@ -354,8 +354,18 @@ impl ExternalEffectKind {
             // The one effect of the four this app can genuinely take back. A
             // remembered fact is this app's own record, `Fact::source_turn_id`
             // already names the turn that added it, and `delete_fact_impl`
-            // already removes one — so reverting the turn can remove exactly the
-            // facts that turn added, and nothing else.
+            // already removes one — so reverting the turn removes the facts
+            // that turn added, and nothing else.
+            //
+            // One boundary, stated in docs/limitations.md rather than papered
+            // over here: if the user has since merged one of those facts in
+            // Memory Studio, its text now lives in the merged memory, and
+            // `forget_remembered` deletes only the retired original — so the
+            // revert un-remembers nothing that reaches a prompt. Deleting the
+            // merged memory instead would take *other* turns' remembered text
+            // with it (`delete_fact_impl` cascades), and undoing the merge
+            // would discard whatever the user edited into it; under-deleting
+            // is the least destructive of the three.
             //
             // The old reason said remembered facts "are not part of the
             // checkpointed workspace". That is still true and was never the

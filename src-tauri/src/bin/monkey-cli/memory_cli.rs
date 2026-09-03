@@ -200,6 +200,14 @@ pub fn expire(id: &str, at: Option<&str>, clear: bool) -> Result<(), String> {
     let scope = scope_of(&path, id)?;
     let fact = memory::set_expiry_impl(&path, &scope, id, value)?;
     match fact.expires_at {
+        // A pinned fact is exempt from expiry (`reaches_prompt`), so saying
+        // only "expires <when>" would state an end state the store will not
+        // honour. The desktop panel disables the date input on a pinned row
+        // and explains why; this is the CLI's version of that honesty.
+        Some(when) if fact.pinned => println!(
+            "{} expires {} — but it is pinned, so it stays in the prompt until you `monkey memory unpin {}`.",
+            fact.id, when, fact.id
+        ),
         Some(when) => println!("{} expires {}", fact.id, when),
         None => println!("{} no longer expires", fact.id),
     }

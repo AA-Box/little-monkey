@@ -159,7 +159,7 @@ Each section below states what the capability means, how the fifteen competitors
 
 **Little Monkey status:** `docs/features.md` lists a **memory** agent tool alongside file, shell, web, knowledge, MCP, subagent, plan and verification tools; Knowledge Stacks 2.0 fuses lexical retrieval with vector similarity and optional reranking and lets you inspect retrieval end to end (normalized query, filters, candidates, lexical and vector scores, fused rank, reranker score, exclusions, token budget, final context); and learned skills act as durable procedural memory derived only from a run's own verified events. Memory Studio is now described in `docs/features.md` as a shipped surface — pin, merge with kept provenance, optional expiry, a last-used stamp, and `monkey memory` parity — and `docs/limitations.md` states where each of those stops (two scopes only, lazy expiry, a global purge, a soft-retire undo, a 100 + 20 per-scope ceiling, an hourly last-used stamp, and no effect on a turn already queued to the daemon).
 
-**Risk if open:** Medium — the retrieval foundation is strong and better instrumented than most competitors', but the governance layer a user would use to ask "why do you know this?" is documented only by its limits.
+**Risk if open:** Medium — the retrieval foundation is strong and better instrumented than most competitors', and the governance layer a user would use to ask "why do you know this?" now ships and is described in `docs/features.md`; what remains open is that a chat answer still does not cite which memory it drew on.
 
 **Priority:** Medium
 
