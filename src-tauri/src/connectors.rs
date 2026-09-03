@@ -1900,6 +1900,39 @@ mod tests {
         )
         .await;
         assert!(s3_result.is_err());
+
+        // Every OAuth-only provider is refused the same way, and nothing is
+        // written — a pasted token is not a substitute for browser consent.
+        for provider in [
+            ConnectorProvider::GoogleDrive,
+            ConnectorProvider::MicrosoftGraph,
+            ConnectorProvider::Linear,
+            ConnectorProvider::Asana,
+            ConnectorProvider::Dropbox,
+            ConnectorProvider::Box,
+            ConnectorProvider::Airtable,
+            ConnectorProvider::Zendesk,
+            ConnectorProvider::Hubspot,
+            ConnectorProvider::Discord,
+            ConnectorProvider::Gitlab,
+        ] {
+            let error = add_token_impl(
+                &state,
+                &path,
+                provider,
+                "Wrong".to_string(),
+                "tok".to_string(),
+                vec!["read".to_string()],
+                None,
+                None,
+            )
+            .await
+            .expect_err(&format!("{provider:?} must refuse a pasted token"));
+            assert!(
+                error.contains("connects over OAuth"),
+                "{provider:?}: {error}"
+            );
+        }
         assert!(load_config_impl(&path).unwrap().accounts.is_empty());
     }
 
@@ -2004,6 +2037,37 @@ mod tests {
         assert!(!serialized.contains("jane@acme.example"));
     }
 
+    #[test]
+    fn export_audit_redacts_an_oauth_rows_host_and_keychain_reference() {
+        let path = temp_path("export_audit_oauth.json");
+        let account = ConnectorAccount {
+            id: "acct-gl".to_string(),
+            provider: ConnectorProvider::Gitlab,
+            label: "Work GitLab".to_string(),
+            scopes: vec!["read_user".to_string()],
+            credential_ref: Some(crate::connector_oauth::token_keychain_account("acct-gl")),
+            identity: Some("ada".to_string()),
+            created_at: 1,
+            last_verified_at: Some(2),
+            last_error: None,
+            connection: Some(serde_json::json!({ "host": "gitlab.example.com" })),
+        };
+        save_config_impl(
+            &path,
+            &ConnectorCatalogFile {
+                version: SCHEMA_VERSION,
+                accounts: vec![account],
+            },
+        )
+        .unwrap();
+
+        let serialized = serde_json::to_string(&export_audit_impl(&path).unwrap()).unwrap();
+        assert!(serialized.contains("gitlab"), "provider is kept");
+        assert!(!serialized.contains("gitlab.example.com"), "{serialized}");
+        assert!(!serialized.contains("connector-oauth:"), "{serialized}");
+        assert!(!serialized.contains("ada"), "{serialized}");
+    }
+
     // --- SSRF / origin pinning for the verification HTTP call ---------------
 
     fn spawn_fixture(
@@ -2030,6 +2094,72 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// Records the raw request so the assertion can be about what actually
+    /// went on the wire, which the `&'static str`-bodied `spawn_fixture`
+    /// above cannot do.
+    fn spawn_recording_fixture() -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                recorder
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let body = "{\"ok\":true}";
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (addr, seen)
+    }
+
+    #[tokio::test]
+    async fn verified_call_sends_a_url_encoded_form_body() {
+        let (addr, seen) = spawn_recording_fixture();
+        let origin = format!("http://{addr}");
+        let url = Url::parse(&format!("{origin}/token")).unwrap();
+        let pairs = [
+            ("grant_type", "authorization_code".to_string()),
+            ("code", "a code with spaces".to_string()),
+        ];
+        verified_call_with_body(
+            reqwest::Method::POST,
+            &url,
+            &origin,
+            true,
+            &[],
+            None,
+            RequestBody::Form(&pairs),
+        )
+        .await
+        .unwrap();
+
+        let request = seen.lock().unwrap()[0].clone();
+        assert!(
+            request.contains("content-type: application/x-www-form-urlencoded")
+                || request.contains("Content-Type: application/x-www-form-urlencoded"),
+            "{request}"
+        );
+        assert!(request.contains("grant_type=authorization_code"), "{request}");
+        assert!(request.contains("code=a+code+with+spaces"), "{request}");
     }
 
     #[tokio::test]
