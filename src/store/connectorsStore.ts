@@ -241,13 +241,25 @@ export const useConnectorsStore = create<ConnectorsStore>((set, get) => ({
     set((state) => ({
       oauthStatus: { ...state.oauthStatus, [provider]: { phase: "opening_browser", error: null } },
     }));
-    const account = await invoke<ConnectorAccount>("connectors_oauth_connect", {
-      provider,
-      label,
-      host: host ?? null,
-      client_id: clientId ?? null,
-      client_secret: clientSecret ?? null,
-    });
+    let account: ConnectorAccount;
+    try {
+      account = await invoke<ConnectorAccount>("connectors_oauth_connect", {
+        provider,
+        label,
+        host: host ?? null,
+        client_id: clientId ?? null,
+        client_secret: clientSecret ?? null,
+      });
+    } catch (err) {
+      // The backend emits a terminal phase for every failure it reaches, but
+      // an invoke that rejects before it gets there (bad payload, a panic in
+      // the command) would otherwise leave the pill stuck mid-flight.
+      const message = errorMessage(err);
+      set((state) => ({
+        oauthStatus: { ...state.oauthStatus, [provider]: { phase: "error", error: message } },
+      }));
+      throw err;
+    }
     await get().refresh();
     return account;
   },

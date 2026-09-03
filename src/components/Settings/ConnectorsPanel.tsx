@@ -122,38 +122,41 @@ const TOKEN_PROVIDERS: TokenProviderInfo[] = [
 interface OAuthProviderInfo {
   provider: ConnectorOAuthProvider;
   copyKey: string;
-  /** The provider's token endpoint refuses a request without a client secret. */
-  needsSecret: boolean;
+  /** Mirrors `connector_oauth::SecretPolicy`: `required` — the token endpoint
+   * refuses a request without a client secret; `optional` — accepted either
+   * way, depending on how the app was registered; `never` — the provider
+   * registers public clients only and its token endpoint rejects a secret. */
+  secret: "required" | "optional" | "never";
   /** Placeholder key for the instance-host / tenant field, when the provider
    * needs one. */
   hostPlaceholderKey?: string;
 }
 
-const OAUTH_PROVIDERS: OAuthProviderInfo[] = [
-  { provider: "google_drive", copyKey: "ConnectorsPanel.googleDriveCopy", needsSecret: true },
+export const OAUTH_PROVIDERS: OAuthProviderInfo[] = [
+  { provider: "google_drive", copyKey: "ConnectorsPanel.googleDriveCopy", secret: "required" },
   {
     provider: "microsoft_graph",
     copyKey: "ConnectorsPanel.microsoftGraphCopy",
-    needsSecret: false,
+    secret: "never",
     hostPlaceholderKey: "ConnectorsPanel.oauthHostPlaceholderMicrosoft",
   },
-  { provider: "linear", copyKey: "ConnectorsPanel.linearCopy", needsSecret: true },
-  { provider: "asana", copyKey: "ConnectorsPanel.asanaCopy", needsSecret: true },
-  { provider: "dropbox", copyKey: "ConnectorsPanel.dropboxCopy", needsSecret: false },
-  { provider: "box", copyKey: "ConnectorsPanel.boxCopy", needsSecret: true },
-  { provider: "airtable", copyKey: "ConnectorsPanel.airtableCopy", needsSecret: false },
+  { provider: "linear", copyKey: "ConnectorsPanel.linearCopy", secret: "required" },
+  { provider: "asana", copyKey: "ConnectorsPanel.asanaCopy", secret: "required" },
+  { provider: "dropbox", copyKey: "ConnectorsPanel.dropboxCopy", secret: "optional" },
+  { provider: "box", copyKey: "ConnectorsPanel.boxCopy", secret: "required" },
+  { provider: "airtable", copyKey: "ConnectorsPanel.airtableCopy", secret: "optional" },
   {
     provider: "zendesk",
     copyKey: "ConnectorsPanel.zendeskCopy",
-    needsSecret: false,
+    secret: "optional",
     hostPlaceholderKey: "ConnectorsPanel.oauthHostPlaceholderZendesk",
   },
-  { provider: "hubspot", copyKey: "ConnectorsPanel.hubspotCopy", needsSecret: true },
-  { provider: "discord", copyKey: "ConnectorsPanel.discordCopy", needsSecret: true },
+  { provider: "hubspot", copyKey: "ConnectorsPanel.hubspotCopy", secret: "required" },
+  { provider: "discord", copyKey: "ConnectorsPanel.discordCopy", secret: "required" },
   {
     provider: "gitlab",
     copyKey: "ConnectorsPanel.gitlabCopy",
-    needsSecret: false,
+    secret: "optional",
     hostPlaceholderKey: "ConnectorsPanel.oauthHostPlaceholderGitlab",
   },
 ];
@@ -261,7 +264,7 @@ const CONNECTOR_OAUTH_PHASE_TONE: Partial<Record<ConnectorOAuthPhase, PillTone>>
 };
 
 /** Terminal phases: the Connect button is usable again and Cancel is not. */
-const CONNECTOR_OAUTH_DONE: ConnectorOAuthPhase[] = ["idle", "connected", "error", "cancelled", "needs_client_id"];
+export const CONNECTOR_OAUTH_DONE: ConnectorOAuthPhase[] = ["idle", "connected", "error", "cancelled", "needs_client_id"];
 
 function lastAppErrorLine(message: string): string {
   const lines = message.trim().split("\n").filter((line) => line.trim().length > 0);
@@ -679,7 +682,7 @@ function TokenConnectForm({ info, onDone }: { info: TokenProviderInfo; onDone: (
  * provider *before* the client id exists — and it never changes for that
  * provider (see `connector_oauth::preferred_redirect_uri`). Nothing is saved
  * until the backend's live read-only identity call has succeeded. */
-function OAuthConnectForm({ info, onDone }: { info: OAuthProviderInfo; onDone: () => void }) {
+export function OAuthConnectForm({ info, onDone }: { info: OAuthProviderInfo; onDone: () => void }) {
   const { t } = useT();
   const oauthConnect = useConnectorsStore((s) => s.oauthConnect);
   const oauthCancel = useConnectorsStore((s) => s.oauthCancel);
@@ -697,10 +700,12 @@ function OAuthConnectForm({ info, onDone }: { info: OAuthProviderInfo; onDone: (
 
   const phase: ConnectorOAuthPhase = status?.phase ?? "idle";
   const inFlight = connecting && !CONNECTOR_OAUTH_DONE.includes(phase);
-  // Same one-line condition `McpPanel`'s helper encodes, inlined rather than
-  // imported because that helper is typed to `McpOAuthPhase`.
-  const showSecretField = info.needsSecret || phase === "needs_client_id";
-  const canSubmit = label.trim().length > 0 && clientId.trim().length > 0 && !connecting;
+  const showSecretField = info.secret !== "never";
+  // The client ID is deliberately not required: left blank, the backend reuses
+  // the registration already saved in the keychain for this provider, which is
+  // what makes a second account of the same provider one click. Blank with
+  // nothing stored comes back as the `needs_client_id` phase.
+  const canSubmit = label.trim().length > 0 && !connecting;
 
   useEffect(() => {
     if (redirectUri !== null) return;
@@ -718,7 +723,7 @@ function OAuthConnectForm({ info, onDone }: { info: OAuthProviderInfo; onDone: (
         provider: info.provider,
         label: label.trim(),
         host: info.hostPlaceholderKey ? host.trim() || undefined : undefined,
-        clientId: clientId.trim(),
+        clientId: clientId.trim() || undefined,
         clientSecret: clientSecret.trim() || undefined,
       });
       onDone();
@@ -741,7 +746,10 @@ function OAuthConnectForm({ info, onDone }: { info: OAuthProviderInfo; onDone: (
               variant="ghost"
               size="sm"
               onClick={() => {
-                void navigator.clipboard.writeText(redirectUri).then(() => setCopied(true));
+                void navigator.clipboard.writeText(redirectUri).then(() => {
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 2000);
+                });
               }}
             >
               {copied ? t("ConnectorsPanel.oauthRedirectUriCopied") : t("ConnectorsPanel.oauthRedirectUriCopy")}
@@ -786,7 +794,7 @@ function OAuthConnectForm({ info, onDone }: { info: OAuthProviderInfo; onDone: (
           />
         )}
         <p className="text-[11px] leading-4 text-muted">
-          {info.needsSecret ? t("ConnectorsPanel.oauthSecretRequiredHint") : t("ConnectorsPanel.oauthSecretOptionalHint")}
+          {t(`ConnectorsPanel.oauthSecretHint_${info.secret}`)}
         </p>
       </div>
       {phase !== "idle" && (
