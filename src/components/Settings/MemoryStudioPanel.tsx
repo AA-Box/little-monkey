@@ -16,6 +16,7 @@ import {
   setMemoryPinned,
   unmergeMemories,
   updateMemory,
+  wouldReachPrompt,
   type MemoryEntry,
 } from "../../lib/memoryStudio";
 import { errorMessage } from "../../lib/errors";
@@ -102,7 +103,9 @@ function MemoryRow({
   const overLimit = charCount(text) > MAX_FACT_CHARS;
   const expired = isExpired(entry, now);
   const retired = entry.retired_at !== null;
-  const dimmed = !entry.enabled || expired || retired;
+  // The same predicate the store filters on, mirrored from Rust's
+  // `reaches_prompt` — one definition of "this isn't reaching the model".
+  const dimmed = !wouldReachPrompt(entry, now);
 
   /** Every row mutation is the same shape: clear the error, run, refresh. */
   async function runRow(operation: () => Promise<unknown>) {
@@ -333,14 +336,18 @@ function MemoryRow({
           <input
             type="date"
             value={entry.expires_at?.slice(0, 10) ?? ""}
-            disabled={rowBusy}
+            // A pinned memory is exempt from expiry, so an expiry set here
+            // would persist and do nothing — the control says so instead.
+            disabled={rowBusy || entry.pinned}
             onChange={(e) =>
               void runRow(() => setMemoryExpiry(entry.id, entry.project_root, e.target.value || null))
             }
             className="rounded-md border border-border bg-surface px-1.5 py-0.5 text-[10px] text-foreground"
           />
         </label>
-        {entry.expires_at ? (
+        {entry.pinned ? (
+          <span>{t("MemoryStudioPanel.expiryPinnedHint")}</span>
+        ) : entry.expires_at ? (
           <button
             type="button"
             disabled={rowBusy}
@@ -385,6 +392,12 @@ function MemoryRow({
  * `expired_and_merge_retired_facts_are_excluded_from_list_impl` and
  * `pinned_facts_are_listed_first_by_list_impl` for the direct proofs. This
  * panel adds no filter of its own beyond what it displays.
+ *
+ * "The very next prompt" means the next one *built*: a turn already queued
+ * to the background daemon replays the system prompt frozen when it was
+ * queued (`task.rs`) and re-reads no memory, so a memory disabled, expired
+ * or merged while that turn waits still reaches that turn's model. The
+ * honesty note says so in the panel itself.
  */
 export function MemoryStudioPanel() {
   const { t } = useT();
