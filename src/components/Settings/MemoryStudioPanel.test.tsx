@@ -64,6 +64,20 @@ const RETIRED = entry({
   retired_at: "2026-02-01T00:00:00.000Z",
   merged_into: "merged-1",
 });
+/** A merge that was itself merged into a newer one: `unmerge_impl` refuses
+ * its undo until the newer merge is undone. */
+const RETIRED_MERGE = entry({
+  id: "retired-merge-1",
+  text: "a merge that was merged again",
+  merged_from: ["a-1", "b-1"],
+  retired_at: "2026-02-01T00:00:00.000Z",
+  merged_into: "merged-2",
+});
+const LIVE_MERGE = entry({
+  id: "merged-2",
+  text: "the outer merge",
+  merged_from: ["retired-merge-1", "c-1"],
+});
 
 function listing(entries: MemoryEntry[]) {
   invoke.mockImplementation((cmd: string) => {
@@ -145,5 +159,36 @@ describe("Memory Studio panel", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Retired by merge" }));
     await waitFor(() => expect(screen.queryByText(/needs at least two memories/)).toBeNull());
+  });
+
+  it("drops the merge selection when a search hides the selected rows", async () => {
+    listing([PLAIN_GLOBAL, PLAIN_PROJECT]);
+    render(<MemoryStudioPanel />);
+
+    await screen.findByText("a plain global memory");
+    fireEvent.click(screen.getAllByLabelText("Select for merge")[0]);
+    await screen.findByText(/needs at least two memories/);
+
+    fireEvent.change(screen.getByPlaceholderText("Search memory text…"), {
+      target: { value: "nothing matches this" },
+    });
+    await waitFor(() => expect(screen.queryByText(/needs at least two memories/)).toBeNull());
+    expect(screen.queryByRole("button", { name: /Merge \d+ selected/ })).toBeNull();
+  });
+
+  it("offers no Undo merge on a merge that was itself merged into a newer one", async () => {
+    listing([LIVE_MERGE, RETIRED_MERGE]);
+    render(<MemoryStudioPanel />);
+
+    // The live outer merge can be undone.
+    await screen.findByText("the outer merge");
+    expect(screen.getAllByRole("button", { name: "Undo merge" })).toHaveLength(1);
+
+    // The inner one is retired: `unmerge_impl` would refuse it, so the
+    // button that can only fail is not rendered.
+    fireEvent.click(screen.getByRole("button", { name: "Retired by merge" }));
+    await screen.findByText("a merge that was merged again");
+    expect(screen.queryByText("the outer merge")).toBeNull();
+    expect(screen.queryAllByRole("button", { name: "Undo merge" })).toHaveLength(0);
   });
 });

@@ -241,7 +241,9 @@ function MemoryRow({
                 {entry.pinned ? <PinOff size={11} /> : <Pin size={11} />}
                 {entry.pinned ? t("MemoryStudioPanel.unpinButton") : t("MemoryStudioPanel.pinButton")}
               </button>
-              {entry.merged_from.length > 0 && (
+              {/* A merge that was itself merged into a newer one cannot be undone on
+                  its own — `unmerge_impl` refuses it — so don't offer the action. */}
+              {entry.merged_from.length > 0 && !retired && (
                 <button
                   type="button"
                   onClick={() =>
@@ -491,9 +493,12 @@ export function MemoryStudioPanel() {
     });
   }, [entries, scopeFilter, stateFilter, search, now]);
 
+  /** Derived from the *visible* rows, not from every entry: a selection that
+   * outlived the filter or search that hid it would let a user merge rows
+   * they can no longer see. */
   const selected = useMemo(
-    () => entries.filter((entry) => selectedIds.has(entry.id)),
-    [entries, selectedIds],
+    () => filtered.filter((entry) => selectedIds.has(entry.id)),
+    [filtered, selectedIds],
   );
   /** Merging is single-scope by construction backend-side (one storage root
    * per call), so the button refuses a mixed selection here rather than
