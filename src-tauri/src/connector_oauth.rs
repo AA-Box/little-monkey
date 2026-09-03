@@ -701,18 +701,22 @@ fn identity_from(verify: &VerifySpec, body: &[u8]) -> Result<String, String> {
     Err("The provider accepted the token but returned no identity".to_string())
 }
 
-/// The one shape every "your consent is gone" failure takes, so the UI (and
-/// `monkey connectors list`) can recognise it without parsing provider prose.
+/// The marker every [`reconnect_error`] carries, and the only thing
+/// [`is_reconnect_error`] matches on — so the CLI and the UI can recognise
+/// this failure without parsing provider prose.
+const RECONNECT_MARKER: &str = "remove it and connect it again in Settings → Connectors";
+
+/// The one shape every "your consent is gone" failure takes. It says *remove
+/// and reconnect* rather than *reconnect*, because there is no in-place
+/// reconnect: a new connect mints a new account row (`docs/limitations.md`
+/// says the same).
 pub fn reconnect_error(provider: ConnectorProvider, detail: &str) -> String {
-    format!(
-        "{} authorization was revoked or expired — reconnect it in Settings → Connectors ({detail}).",
-        provider.as_str()
-    )
+    format!("{provider:?} authorization was revoked or expired — {RECONNECT_MARKER} ({detail}).")
 }
 
 /// True for a `last_error` produced by [`reconnect_error`].
 pub fn is_reconnect_error(message: &str) -> bool {
-    message.contains("reconnect it in Settings → Connectors")
+    message.contains(RECONNECT_MARKER)
 }
 
 /// The loopback redirect URI this app uses for `provider` — the exact string
