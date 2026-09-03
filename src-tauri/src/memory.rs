@@ -95,6 +95,7 @@
 //! validation — there is no frontend equivalent for "add a fact to an
 //! arbitrary project scope" to build that from.
 
+use crate::process_lock::CrossProcessFileLock;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -361,21 +362,49 @@ pub fn load_impl(path: &Path) -> Result<MemoriesFile, String> {
 /// `sessions.rs`'s `save_to`, so a crash mid-write can never leave a
 /// truncated/corrupt memories file behind.
 ///
-/// The temp file carries a random suffix rather than the fixed
-/// `memories.json.tmp` the other stores use, because this one is written by
-/// concurrent *processes*: the daemon spawns several `monkey-cli` children,
-/// and each composes a system prompt and stamps `last_used_at`. Two of them
-/// sharing one temp path could interleave into a corrupt file before either
-/// rename. It does not make the read-modify-write itself atomic across
-/// processes — a lost update is still possible, which is why
-/// [`mark_used_impl`] is throttled rather than per-turn.
+/// One fixed temp name, not a random one per writer: every caller that
+/// reaches here holds [`write_lock`], so two processes can no longer be
+/// mid-write at the same time, and a fixed name means a writer killed
+/// between write and rename leaves at most *one* stale file — which the next
+/// write overwrites — rather than an unbounded pile of full plaintext copies
+/// of every memory. A failed rename removes it immediately.
 pub fn save_impl(path: &Path, memories: &MemoriesFile) -> Result<(), String> {
     let payload = serde_json::to_string_pretty(memories)
         .map_err(|e| format!("Failed to serialize memories: {}", e))?;
-    let tmp = path.with_extension(format!("json.tmp.{}", uuid::Uuid::new_v4()));
+    let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &payload).map_err(|e| format!("Failed to write memories file: {}", e))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("Failed to finalize memories file: {}", e))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Failed to finalize memories file: {}", e));
+    }
     Ok(())
+}
+
+/// Path of the cross-process lock guarding this store's read-modify-write.
+fn lock_file_path(path: &Path) -> PathBuf {
+    path.with_extension("json.lock")
+}
+
+/// Serializes one whole load -> mutate -> [`save_impl`] against every *other
+/// process* writing the same store. This file is not the desktop app's
+/// alone: an interactive `monkey`, a launchd `monkey task`, and every
+/// `monkey-cli` child the daemon spawns (each of which composes a system
+/// prompt and stamps `last_used_at`) write it too, and `AppState`'s
+/// `memory_lock` is an in-process mutex that cannot see any of them. Without
+/// this, a `remember` saved between another writer's load and its save is
+/// silently erased.
+///
+/// `flock` is per descriptor, not per process, so a locked function must
+/// never call another locked one — [`import_impl`] deliberately locks per
+/// write rather than around the batch for exactly that reason.
+fn write_lock(path: &Path) -> Result<CrossProcessFileLock, String> {
+    crate::process_lock::acquire_cross_process_lock(&lock_file_path(path))
+}
+
+/// [`write_lock`] for a write that would rather be skipped than queued —
+/// [`mark_used_impl`]'s stamp, which the next prompt build re-attempts.
+fn try_write_lock(path: &Path) -> Result<Option<CrossProcessFileLock>, String> {
+    crate::process_lock::try_acquire_cross_process_lock(&lock_file_path(path))
 }
 
 /// Formats the current time as an RFC 3339 UTC timestamp (e.g.
@@ -469,6 +498,7 @@ pub fn add_fact_impl(
         ));
     }
 
+    let _lock = write_lock(path)?;
     let mut memories = load_impl(path)?;
     let project = memories.projects.entry(root.to_string()).or_default();
 
@@ -534,6 +564,7 @@ pub fn update_fact_impl(path: &Path, root: &str, id: &str, text: &str) -> Result
         ));
     }
 
+    let _lock = write_lock(path)?;
     let mut memories = load_impl(path)?;
     let updated = {
         let project = memories
@@ -559,6 +590,7 @@ pub fn update_fact_impl(path: &Path, root: &str, id: &str, text: &str) -> Result
 /// Mirrors [`update_fact_impl`]'s "fact not found" error for an unknown
 /// `root`/`id` pair.
 pub fn set_enabled_impl(path: &Path, root: &str, id: &str, enabled: bool) -> Result<Fact, String> {
+    let _lock = write_lock(path)?;
     let mut memories = load_impl(path)?;
     let updated = {
         let project = memories
@@ -584,13 +616,22 @@ pub fn set_enabled_impl(path: &Path, root: &str, id: &str, enabled: bool) -> Res
 /// fact is an idempotent success (same stance as `set_enabled_impl`), so the
 /// ceiling is only checked on a real transition.
 pub fn set_pinned_impl(path: &Path, root: &str, id: &str, pinned: bool) -> Result<Fact, String> {
+    let _lock = write_lock(path)?;
     let mut memories = load_impl(path)?;
     let updated = {
         let project = memories
             .projects
             .get_mut(root)
             .ok_or_else(|| "Fact not found — it may have already been forgotten.".to_string())?;
-        let already_pinned = project.facts.iter().filter(|f| f.pinned).count();
+        // Merge-retired pins are bookkeeping for `unmerge_impl`, not
+        // memories the user can see or unpin, so they do not occupy the
+        // ceiling — the same rule `add_fact_impl` states for the fact cap
+        // and `merge_impl` applies below.
+        let already_pinned = project
+            .facts
+            .iter()
+            .filter(|f| f.pinned && f.retired_at.is_none())
+            .count();
         let fact = project
             .facts
             .iter_mut()
@@ -615,10 +656,15 @@ pub fn set_pinned_impl(path: &Path, root: &str, id: &str, pinned: bool) -> Resul
 /// expanded to the **end** of that day (`T23:59:59.999Z`), so "expires
 /// 2026-12-31" means "valid through the 31st" rather than expiring the
 /// instant it is saved — or an already-full `YYYY-MM-DDTHH:MM:SS...Z`.
-/// Byte-position checks, no regex crate: this is a shape check, not a
-/// calendar validator.
+/// Byte-position checks plus a calendar/clock range check, no regex or
+/// date crate. The range check is not pedantry: `2026-13-45` is digit-shaped
+/// and sorts *after* every real 2026 date, so storing it would quietly keep
+/// the memory alive until 2027 instead of expiring it when the user asked.
+/// `memory_import` runs untrusted export values back through here, and the
+/// CLI's `--at` takes whatever is typed.
 fn normalize_expiry(input: &str) -> Result<String, String> {
     const BAD: &str = "Expiry must be a date (2026-12-31) or an RFC 3339 UTC timestamp ending in Z.";
+    const UNREAL: &str = "Expiry is not a real date or time.";
     let trimmed = input.trim();
     let b = trimmed.as_bytes();
     let date_shaped = b.len() >= 10
@@ -631,6 +677,12 @@ fn normalize_expiry(input: &str) -> Result<String, String> {
         });
     if !date_shaped {
         return Err(BAD.to_string());
+    }
+    let year: i64 = trimmed[0..4].parse().map_err(|_| BAD.to_string())?;
+    let month: u32 = trimmed[5..7].parse().map_err(|_| BAD.to_string())?;
+    let day: u32 = trimmed[8..10].parse().map_err(|_| BAD.to_string())?;
+    if !is_real_date(year, month, day) {
+        return Err(UNREAL.to_string());
     }
     if b.len() == 10 {
         return Ok(format!("{trimmed}T23:59:59.999Z"));
@@ -650,9 +702,30 @@ fn normalize_expiry(input: &str) -> Result<String, String> {
     if !ok {
         return Err(BAD.to_string());
     }
+    let hour: u32 = trimmed[11..13].parse().map_err(|_| BAD.to_string())?;
+    let minute: u32 = trimmed[14..16].parse().map_err(|_| BAD.to_string())?;
+    let second: u32 = trimmed[17..19].parse().map_err(|_| BAD.to_string())?;
+    // 60 is a real leap second in RFC 3339, so it is allowed through.
+    if hour > 23 || minute > 59 || second > 60 {
+        return Err(UNREAL.to_string());
+    }
     let mut out = trimmed.to_string();
     out.replace_range(10..11, "T");
     Ok(out)
+}
+
+/// Whether `(year, month, day)` names a date that exists — the check
+/// [`normalize_expiry`]'s byte-shape pass cannot make.
+fn is_real_date(year: i64, month: u32, day: u32) -> bool {
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    day >= 1 && day <= days_in_month
 }
 
 /// Core set/clear-expiry logic behind `memory_studio_set_expiry`. `None`
@@ -670,6 +743,7 @@ pub fn set_expiry_impl(
         Some(raw) => Some(normalize_expiry(raw)?),
         None => None,
     };
+    let _lock = write_lock(path)?;
     let mut memories = load_impl(path)?;
     let updated = {
         let project = memories
@@ -693,18 +767,33 @@ pub fn set_expiry_impl(
 /// purges the whole store in one pass, not the caller's current filter.
 /// Pinned facts are exempt (they never expire), and merge-retired facts are
 /// never purged here whatever their expiry — they are [`unmerge_impl`]'s
-/// undo material. Nothing expired is `Ok(0)`, not an error, and writes
+/// undo material. Purging an expired *merged* fact does take its retired
+/// originals with it, via [`merge_closure`], exactly as [`delete_fact_impl`]
+/// does: leaving them behind would strand them with a `merged_into` pointing
+/// at nothing, invisible to every prompt and un-restorable. The returned
+/// count is how many expired memories were purged, not how many rows the
+/// cascade removed. Nothing expired is `Ok(0)`, not an error, and writes
 /// nothing.
 pub fn purge_expired_impl(path: &Path) -> Result<usize, String> {
+    let _lock = write_lock(path)?;
     let mut memories = load_impl(path)?;
     let now = now_rfc3339();
     let mut removed = 0usize;
     for project in memories.projects.values_mut() {
-        let before = project.facts.len();
-        project
+        let expired: Vec<String> = project
             .facts
-            .retain(|f| f.pinned || f.retired_at.is_some() || !is_expired(f, &now));
-        removed += before - project.facts.len();
+            .iter()
+            .filter(|f| !f.pinned && f.retired_at.is_none() && is_expired(f, &now))
+            .map(|f| f.id.clone())
+            .collect();
+        if expired.is_empty() {
+            continue;
+        }
+        // Counted before the cascade: the number reported is how many
+        // *expired* memories went, not how many rows the file lost.
+        removed += expired.len();
+        let doomed = merge_closure(&project.facts, expired);
+        project.facts.retain(|f| !doomed.iter().any(|d| d == &f.id));
     }
     if removed > 0 {
         save_impl(path, &memories)?;
@@ -753,6 +842,7 @@ pub fn merge_impl(
         return Err("Merging needs at least two memories.".to_string());
     }
 
+    let _lock = write_lock(path)?;
     let mut memories = load_impl(path)?;
     let now = now_rfc3339();
     let project = memories
@@ -801,7 +891,9 @@ pub fn merge_impl(
         let surviving = project
             .facts
             .iter()
-            .filter(|f| f.pinned && !parents.iter().any(|p| p.id == f.id))
+            .filter(|f| {
+                f.pinned && f.retired_at.is_none() && !parents.iter().any(|p| p.id == f.id)
+            })
             .count();
         if surviving >= MAX_PINNED_PER_PROJECT {
             return Err(format!(
@@ -858,6 +950,7 @@ pub fn merge_impl(
 /// dropping a pin. There is no revision history in
 /// this module (unlike `rules.rs`), and the soft-retire is the whole undo.
 pub fn unmerge_impl(path: &Path, root: &str, id: &str) -> Result<usize, String> {
+    let _lock = write_lock(path)?;
     let mut memories = load_impl(path)?;
     let Some(project) = memories.projects.get_mut(root) else {
         return Ok(0);
@@ -890,15 +983,20 @@ pub fn unmerge_impl(path: &Path, root: &str, id: &str) -> Result<usize, String> 
 ///
 /// Throttled by [`MARK_USED_THROTTLE_SECS`]: a fact whose stamp is already
 /// newer than that is left alone, and when nothing needs stamping this
-/// writes nothing at all. That matters for more than IO — this is an
-/// unlocked whole-file read-modify-write, and `state.memory_lock` is an
-/// in-process mutex that does not serialize against the CLI or daemon in
-/// another process, so a per-turn write would turn a rare lost-`remember`
-/// race into a per-turn one.
+/// writes nothing at all. Prompt composition is a *writer* to this file
+/// because of it, which is why it takes [`try_write_lock`] and skips the
+/// stamp — rather than queueing — when another process is mid-write: a
+/// last-used stamp is worth no wait at all, and the next prompt build
+/// re-attempts it.
 pub fn mark_used_impl(path: &Path, ids: &[String]) -> Result<usize, String> {
     if ids.is_empty() {
         return Ok(0);
     }
+    // Best effort: if another process is mid-write, skip this stamp rather
+    // than queue behind it. The next prompt build re-attempts it.
+    let Some(_lock) = try_write_lock(path)? else {
+        return Ok(0);
+    };
     let mut memories = load_impl(path)?;
     let now = now_rfc3339();
     let cutoff = stale_before(MARK_USED_THROTTLE_SECS);
@@ -965,6 +1063,7 @@ pub fn scope_of_impl(path: &Path, id: &str) -> Result<Option<String>, String> {
 /// `delete_fact_impl`'s "already gone" tolerance. Other projects' facts are
 /// untouched.
 pub fn clear_impl(path: &Path, root: &str) -> Result<(), String> {
+    let _lock = write_lock(path)?;
     let mut memories = load_impl(path)?;
     if memories.projects.remove(root).is_some() {
         save_impl(path, &memories)?;
@@ -977,8 +1076,9 @@ pub fn clear_impl(path: &Path, root: &str) -> Result<(), String> {
 /// different project) is a no-op success rather than an error — the
 /// caller's desired end state (the fact is gone) already holds.
 ///
-/// Deleting a *merged* fact cascades to the originals it retired. Every
-/// delete path routes through here (the transcript's Forget button,
+/// Deleting a *merged* fact cascades — transitively, via [`merge_closure`],
+/// so deleting a merge of a merge takes the grandparent originals too — to
+/// the originals it retired. Every delete path routes through here (the transcript's Forget button,
 /// `memory_studio_delete`, checkpoint compensation), so this is the one
 /// place the rule can live. The alternative — restoring the parents — would
 /// make "forget" *add* two memories to the next prompt, and would also make
@@ -986,17 +1086,48 @@ pub fn clear_impl(path: &Path, root: &str) -> Result<(), String> {
 /// dangling `merged_into`. Undo is [`unmerge_impl`]'s job, not delete's; the
 /// UI's confirm text says so.
 pub fn delete_fact_impl(path: &Path, root: &str, id: &str) -> Result<(), String> {
+    let _lock = write_lock(path)?;
     let mut memories = load_impl(path)?;
     if let Some(project) = memories.projects.get_mut(root) {
         let before = project.facts.len();
-        project
-            .facts
-            .retain(|f| f.id != id && f.merged_into.as_deref() != Some(id));
+        let doomed = merge_closure(&project.facts, vec![id.to_string()]);
+        project.facts.retain(|f| !doomed.iter().any(|d| d == &f.id));
         if project.facts.len() != before {
             save_impl(path, &memories)?;
         }
     }
     Ok(())
+}
+
+/// Every fact that must go when the facts named by `seed` go: the seeds
+/// themselves plus, transitively, every fact one of them retired by merging.
+/// [`delete_fact_impl`] and [`purge_expired_impl`] both route through it, so
+/// neither can strand a retired original whose `merged_into` names a fact
+/// that no longer exists — [`list_impl`] hides such a fact from every prompt
+/// forever and [`unmerge_impl`] can no longer restore it, because it looks
+/// the merged fact up by id first.
+///
+/// ponytail: re-scans one scope's facts until the set stops growing, so
+/// O(n²) worst case on a list capped at a few hundred; a real graph walk if
+/// a scope ever holds thousands.
+fn merge_closure(facts: &[Fact], seed: Vec<String>) -> Vec<String> {
+    let mut doomed = seed;
+    loop {
+        let mut grew = false;
+        for fact in facts {
+            let Some(parent) = fact.merged_into.as_deref() else {
+                continue;
+            };
+            if doomed.iter().any(|d| d == parent) && !doomed.iter().any(|d| d == &fact.id) {
+                doomed.push(fact.id.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    doomed
 }
 
 /// Whether `fact`'s expiry has passed as of `now`. Both sides are
@@ -1101,7 +1232,8 @@ pub fn list_all_impl(path: &Path) -> Result<Vec<MemoryEntry>, String> {
 /// lifecycle state `add_fact_impl` cannot know about: `enabled`, `pinned`,
 /// `expires_at`, `last_used_at`, `retired_at`, and the merge relationship,
 /// with `merged_from`/`merged_into` remapped from the export's ids to the
-/// freshly generated ones. Without that remap an export taken after a merge
+/// freshly generated ones — or, for an entry skipped as a duplicate, to the
+/// id of the fact already on disk with that text. Without that remap an export taken after a merge
 /// would re-import the retired originals as live facts and the merged
 /// content would reach the prompt twice.
 ///
@@ -1126,6 +1258,8 @@ pub fn import_impl(path: &Path, entries: &[MemoryExportEntry]) -> MemoryImportSu
     let mut errors = Vec::new();
     // (exported id, newly generated id, storage root, source entry)
     let mut restored: Vec<(String, String, String, &MemoryEntry)> = Vec::new();
+    // (exported id, id of the already-stored fact with the same text)
+    let mut duplicates: Vec<(String, String)> = Vec::new();
 
     for wrapped in entries {
         let entry = &wrapped.entry;
@@ -1151,8 +1285,15 @@ pub fn import_impl(path: &Path, entries: &[MemoryExportEntry]) -> MemoryImportSu
             }
         };
 
-        if text_already_stored(path, &root, entry.text.trim()) {
+        if let Some(existing_id) = stored_fact_id(path, &root, entry.text.trim()) {
             skipped_duplicate += 1;
+            // Skipped, but still remapped: if this entry is a merged memory
+            // the store already holds, its retired originals — which are
+            // *not* duplicates and will be added below — must point at the
+            // stored copy. Without this their `merged_into` fails to remap,
+            // the fix-up pass restores them as live memories, and the merged
+            // text reaches the prompt three times over.
+            duplicates.push((entry.id.clone(), existing_id));
             continue;
         }
 
@@ -1172,7 +1313,7 @@ pub fn import_impl(path: &Path, entries: &[MemoryExportEntry]) -> MemoryImportSu
     }
 
     if !restored.is_empty() {
-        if let Err(e) = apply_imported_lifecycle(path, &restored, &mut errors) {
+        if let Err(e) = apply_imported_lifecycle(path, &restored, &duplicates, &mut errors) {
             errors.push(e);
         }
     }
@@ -1184,18 +1325,17 @@ pub fn import_impl(path: &Path, entries: &[MemoryExportEntry]) -> MemoryImportSu
     }
 }
 
-/// Whether `root` already holds a fact with exactly this text — including
-/// merge-retired ones, unlike [`add_fact_impl`]'s own check. See
-/// [`import_impl`]'s doc comment for why the two differ.
-fn text_already_stored(path: &Path, root: &str, text: &str) -> bool {
-    load_impl(path)
-        .ok()
-        .and_then(|m| {
-            m.projects
-                .get(root)
-                .map(|p| p.facts.iter().any(|f| f.text == text))
-        })
-        .unwrap_or(false)
+/// The id of the fact `root` already holds with exactly this text —
+/// including merge-retired ones, unlike [`add_fact_impl`]'s own check. See
+/// [`import_impl`]'s doc comment for why the two differ, and why the id
+/// (not just "yes") is what the caller needs.
+fn stored_fact_id(path: &Path, root: &str, text: &str) -> Option<String> {
+    load_impl(path).ok().and_then(|m| {
+        m.projects
+            .get(root)
+            .and_then(|p| p.facts.iter().find(|f| f.text == text))
+            .map(|f| f.id.clone())
+    })
 }
 
 /// [`import_impl`]'s single fix-up pass: re-apply the lifecycle fields
@@ -1204,18 +1344,38 @@ fn text_already_stored(path: &Path, root: &str, text: &str) -> bool {
 fn apply_imported_lifecycle(
     path: &Path,
     restored: &[(String, String, String, &MemoryEntry)],
+    duplicates: &[(String, String)],
     errors: &mut Vec<String>,
 ) -> Result<(), String> {
-    let remap: HashMap<&str, &str> = restored
+    let mut remap: HashMap<&str, &str> = restored
         .iter()
         .map(|(old, new, _, _)| (old.as_str(), new.as_str()))
         .collect();
+    // Entries skipped as duplicates still resolve — to the fact already on
+    // disk carrying that text. See [`import_impl`].
+    remap.extend(
+        duplicates
+            .iter()
+            .map(|(old, existing)| (old.as_str(), existing.as_str())),
+    );
+    let _lock = write_lock(path)?;
     let mut memories = load_impl(path)?;
     // Pins already on disk before this import still count toward the ceiling.
     let mut pin_counts: HashMap<String, usize> = HashMap::new();
     for (root, project) in memories.projects.iter() {
-        pin_counts.insert(root.clone(), project.facts.iter().filter(|f| f.pinned).count());
+        pin_counts.insert(
+            root.clone(),
+            project
+                .facts
+                .iter()
+                .filter(|f| f.pinned && f.retired_at.is_none())
+                .count(),
+        );
     }
+
+    // (root, parent id, child id) pairs to reconcile once the loop lets go
+    // of its `&mut` borrow — see the comment where they are applied.
+    let mut adoptions: Vec<(String, String, String)> = Vec::new();
 
     for (_, new_id, root, entry) in restored {
         let expires_at = match entry.expires_at.as_deref() {
@@ -1262,10 +1422,31 @@ fn apply_imported_lifecycle(
             .merged_into
             .as_deref()
             .and_then(|old| remap.get(old).map(|s| s.to_string()));
-        // A retired fact whose merged child did not survive the import would
-        // be invisible forever with no way back — restore it instead.
+        // A retired fact whose merged child did not survive the import at
+        // all would be invisible forever with no way back — restore it
+        // instead. (A child that was *skipped as a duplicate* did survive:
+        // the remap resolved it to the copy already on disk.)
         if fact.merged_into.is_none() {
             fact.retired_at = None;
+        } else if let Some(parent_id) = fact.merged_into.clone() {
+            adoptions.push((root.clone(), parent_id, new_id.clone()));
+        }
+    }
+
+    // The merge has to be visible from both ends: `unmerge_impl` reads
+    // `merged_from`, so a parent already on disk (its export entry skipped as
+    // a duplicate) must adopt the originals now pointing at it, or the
+    // restored merge could never be undone. A no-op for a parent imported in
+    // this same batch, which set its own `merged_from` above.
+    for (root, parent_id, child_id) in adoptions {
+        let Some(project) = memories.projects.get_mut(&root) else {
+            continue;
+        };
+        let Some(parent) = project.facts.iter_mut().find(|f| f.id == parent_id) else {
+            continue;
+        };
+        if !parent.merged_from.contains(&child_id) {
+            parent.merged_from.push(child_id);
         }
     }
     save_impl(path, &memories)
@@ -2711,6 +2892,160 @@ mod tests {
         assert_eq!(unmerge_impl(&path, GLOBAL_SCOPE_KEY, &merged.id).unwrap(), 2);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn purging_an_expired_merged_fact_takes_its_retired_originals_with_it() {
+        // The mirror of `deleting_a_merged_fact_also_deletes_the_originals_it_retired`.
+        // Leaving them behind strands two memories that `list_impl` hides
+        // forever and `unmerge_impl` can no longer restore, because it looks
+        // the merged fact up by id first.
+        let path = temp_path();
+        let one = add_fact_impl(&path, "/ws/project", "first", "agent", None).unwrap();
+        let two = add_fact_impl(&path, "/ws/project", "second", "agent", None).unwrap();
+        let merged =
+            merge_impl(&path, "/ws/project", &[one.id.clone(), two.id.clone()], None).unwrap();
+        set_expiry_impl(&path, "/ws/project", &merged.id, Some(PAST)).unwrap();
+
+        assert_eq!(
+            purge_expired_impl(&path).unwrap(),
+            1,
+            "the count reports expired memories purged, not rows the cascade removed"
+        );
+        assert!(
+            load_impl(&path).unwrap().projects["/ws/project"]
+                .facts
+                .is_empty(),
+            "no orphaned retired originals with a dangling merged_into"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deleting_a_merge_of_a_merge_deletes_the_grandparent_originals_too() {
+        // A merged fact keeps `retired_at == null`, so Memory Studio lists it
+        // under "Active" and it can be selected for a second merge. One level
+        // of cascade would leave the first merge's originals dangling.
+        let path = temp_path();
+        let a = add_fact_impl(&path, "/ws/project", "a", "agent", None).unwrap();
+        let b = add_fact_impl(&path, "/ws/project", "b", "agent", None).unwrap();
+        let c = add_fact_impl(&path, "/ws/project", "c", "agent", None).unwrap();
+        let first = merge_impl(&path, "/ws/project", &[a.id.clone(), b.id.clone()], None).unwrap();
+        let second =
+            merge_impl(&path, "/ws/project", &[first.id.clone(), c.id.clone()], None).unwrap();
+
+        delete_fact_impl(&path, "/ws/project", &second.id).unwrap();
+        assert!(
+            load_impl(&path).unwrap().projects["/ws/project"]
+                .facts
+                .is_empty(),
+            "the cascade is transitive: a, b, c, and both merges all go"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn merge_retired_pins_do_not_occupy_the_pin_ceiling() {
+        // Merging two pinned memories leaves both parents `pinned` under a
+        // `retired_at`. Counting those would burn ceiling slots the user
+        // cannot see in Studio and cannot unpin.
+        let path = temp_path();
+        let one = add_fact_impl(&path, "/ws/project", "first", "agent", None).unwrap();
+        let two = add_fact_impl(&path, "/ws/project", "second", "agent", None).unwrap();
+        set_pinned_impl(&path, "/ws/project", &one.id, true).unwrap();
+        set_pinned_impl(&path, "/ws/project", &two.id, true).unwrap();
+        let merged =
+            merge_impl(&path, "/ws/project", &[one.id.clone(), two.id.clone()], None).unwrap();
+        assert!(merged.pinned, "a merge of pins stays pinned");
+
+        // One visible pin, so the scope has room for MAX_PINNED_PER_PROJECT - 1
+        // more — not MAX_PINNED_PER_PROJECT - 3.
+        for i in 1..MAX_PINNED_PER_PROJECT {
+            let fact =
+                add_fact_impl(&path, "/ws/project", &format!("pin {i}"), "agent", None).unwrap();
+            set_pinned_impl(&path, "/ws/project", &fact.id, true).unwrap();
+        }
+        let over = add_fact_impl(&path, "/ws/project", "one pin too many", "agent", None).unwrap();
+        let err = set_pinned_impl(&path, "/ws/project", &over.id, true).unwrap_err();
+        assert!(err.contains("the limit"), "{err}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn normalize_expiry_refuses_a_date_that_does_not_exist() {
+        // `2026-13-45` is digit-shaped and sorts after every real 2026 date,
+        // so storing it would quietly keep the memory alive until 2027.
+        for bad in [
+            "2026-13-01",
+            "2026-02-31",
+            "2025-02-29",
+            "2026-00-10",
+            "2026-01-00",
+            "2026-01-01T25:00:00.000Z",
+            "2026-01-01T00:61:00.000Z",
+        ] {
+            assert!(
+                normalize_expiry(bad).is_err(),
+                "{bad} must be refused, not stored"
+            );
+        }
+        // ...and real ones still pass, leap day included.
+        assert_eq!(
+            normalize_expiry("2024-02-29").unwrap(),
+            "2024-02-29T23:59:59.999Z"
+        );
+        assert!(normalize_expiry("2026-12-31T23:59:59.999Z").is_ok());
+    }
+
+    #[test]
+    fn importing_a_merge_whose_merged_memory_is_already_stored_keeps_the_originals_retired() {
+        // The merged entry is skipped as a duplicate, so its export id has no
+        // freshly generated id to remap to. Restoring the originals here would
+        // put the merged text into the prompt three times over.
+        let source_path = temp_path();
+        let one = add_fact_impl(&source_path, "/ws/project", "part one", "agent", None).unwrap();
+        let two = add_fact_impl(&source_path, "/ws/project", "part two", "agent", None).unwrap();
+        merge_impl(
+            &source_path,
+            "/ws/project",
+            &[one.id.clone(), two.id.clone()],
+            Some("both parts"),
+        )
+        .unwrap();
+        let entries: Vec<MemoryExportEntry> = list_all_impl(&source_path)
+            .unwrap()
+            .into_iter()
+            .map(|entry| MemoryExportEntry {
+                entry,
+                redacted: false,
+            })
+            .collect();
+
+        // A destination that already holds the merged text (typed by hand,
+        // or imported from an earlier export) but neither original.
+        let dest_path = temp_path();
+        let stored = add_fact_impl(&dest_path, "/ws/project", "both parts", "user", None).unwrap();
+
+        let summary = import_impl(&dest_path, &entries);
+        assert_eq!(summary.skipped_duplicate, 1);
+        assert_eq!(summary.added, 2);
+
+        let listed = list_impl(&dest_path, Some("/ws/project")).unwrap();
+        let texts: Vec<&str> = listed.iter().map(|f| f.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["both parts"],
+            "the originals stay retired behind the memory already stored"
+        );
+        // ...and they point at it, so the merge is still undoable.
+        assert_eq!(unmerge_impl(&dest_path, "/ws/project", &stored.id).unwrap(), 2);
+        assert_eq!(list_impl(&dest_path, Some("/ws/project")).unwrap().len(), 2);
+
+        let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&dest_path);
     }
 
     #[test]
