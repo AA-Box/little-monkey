@@ -76,8 +76,11 @@
 //! `rulesStore.facts` and `systemPrompt.ts`'s `factsLines`) calls, and the
 //! one `monkey-cli`'s `compose_system_prompt_impl` calls — is the single
 //! filter and ordering point, so a disabled, expired or merge-retired fact
-//! is provably excluded from every subsequent prompt (see this module's
-//! tests). A `memories.json` written at v1 loads unchanged: every v2 field
+//! is provably excluded from every prompt built after the change (see this
+//! module's tests). A turn already queued to the daemon is the exception:
+//! it replays the system prompt frozen when it was queued (`task.rs`) and
+//! re-reads no memory, so the change lands from the next prompt build, not
+//! for queued work. A `memories.json` written at v1 loads unchanged: every v2 field
 //! is `#[serde(default)]` and [`load_impl`] re-stamps the version.
 //!
 //! Export intentionally has no Rust-side command: `src/lib/memoryStudio.ts`'s
@@ -122,8 +125,11 @@ const MAX_FACTS_PER_PROJECT: usize = 100;
 
 /// Per-scope cap on pinned facts, enforced by [`set_pinned_impl`]. Pinned
 /// facts are exempt from [`MAX_FACTS_PER_PROJECT`], so without this "exempt
-/// from the cap" would mean "unbounded"; the real per-scope ceiling is
-/// therefore 100 + 20 = 120. A chosen number, not a measured one.
+/// from the cap" would mean "unbounded"; the per-scope ceiling is therefore
+/// 100 + 20 = 120. A chosen number, not a measured one. It bounds *new*
+/// pins: [`unmerge_impl`] restores exactly the pins a merge retired, so a
+/// scope that gained a pin between the merge and its undo can come back one
+/// over the ceiling rather than lose a pin the user never unpinned.
 const MAX_PINNED_PER_PROJECT: usize = 20;
 
 /// How stale a fact's `last_used_at` must be before [`mark_used_impl`] will
@@ -354,10 +360,19 @@ pub fn load_impl(path: &Path) -> Result<MemoriesFile, String> {
 /// Core save logic: atomic sibling temp file + rename, same idiom as
 /// `sessions.rs`'s `save_to`, so a crash mid-write can never leave a
 /// truncated/corrupt memories file behind.
+///
+/// The temp file carries a random suffix rather than the fixed
+/// `memories.json.tmp` the other stores use, because this one is written by
+/// concurrent *processes*: the daemon spawns several `monkey-cli` children,
+/// and each composes a system prompt and stamps `last_used_at`. Two of them
+/// sharing one temp path could interleave into a corrupt file before either
+/// rename. It does not make the read-modify-write itself atomic across
+/// processes — a lost update is still possible, which is why
+/// [`mark_used_impl`] is throttled rather than per-turn.
 pub fn save_impl(path: &Path, memories: &MemoriesFile) -> Result<(), String> {
     let payload = serde_json::to_string_pretty(memories)
         .map_err(|e| format!("Failed to serialize memories: {}", e))?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("json.tmp.{}", uuid::Uuid::new_v4()));
     std::fs::write(&tmp, &payload).map_err(|e| format!("Failed to write memories file: {}", e))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("Failed to finalize memories file: {}", e))?;
     Ok(())
@@ -476,7 +491,7 @@ pub fn add_fact_impl(
         .count();
     if unpinned >= MAX_FACTS_PER_PROJECT {
         return Err(format!(
-            "This project already has {} un-pinned remembered facts (the limit) — forget one, or pin one, before adding another.",
+            "This project already has {} un-pinned remembered facts (the limit) — forget one, purge expired ones, or pin one, before adding another.",
             MAX_FACTS_PER_PROJECT
         ));
     }
@@ -836,7 +851,11 @@ pub fn merge_impl(
 /// state already holds.
 ///
 /// Note the direction: this *discards* the merged fact, so any edit made to
-/// the merged text after the merge is lost. There is no revision history in
+/// the merged text after the merge is lost. Restoring pinned parents does
+/// not re-check [`MAX_PINNED_PER_PROJECT`] either: putting back exactly what
+/// a merge retired is the undo's whole contract, so a scope that was pinned
+/// up to the ceiling in the meantime lands one over it rather than silently
+/// dropping a pin. There is no revision history in
 /// this module (unlike `rules.rs`), and the soft-retire is the whole undo.
 pub fn unmerge_impl(path: &Path, root: &str, id: &str) -> Result<usize, String> {
     let mut memories = load_impl(path)?;
@@ -1004,7 +1023,12 @@ fn reaches_prompt(fact: &Fact, now: &str) -> bool {
 /// `currentSystemPrompt` reads that array straight into `factsLines`;
 /// `monkey-cli`'s `compose_system_prompt_impl` calls this same function.
 /// Three lifecycle states are filtered out right here, so none of them can
-/// ever appear in a subsequent prompt on either surface:
+/// appear in any prompt built after the change, on either surface. The one
+/// gap is a turn *already queued* to the daemon: `task.rs`'s desktop-turn
+/// branch deliberately replays `rendered.system`, the prompt frozen when the
+/// turn was queued, and re-reads no memory — so disabling, expiring or
+/// merging takes effect from the next prompt build, not for work already in
+/// the queue. The filtered states are:
 /// - `enabled: false` (soft-disabled via [`set_enabled_impl`]),
 /// - expired (`expires_at` reached — unless the fact is `pinned`, which is
 ///   exempt), and

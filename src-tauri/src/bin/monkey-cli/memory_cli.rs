@@ -115,6 +115,28 @@ fn scope_of(path: &Path, id: &str) -> Result<String, String> {
     memory::scope_of_impl(path, id)?.ok_or_else(|| format!("No memory with id '{id}'."))
 }
 
+/// The one scope every id in `ids` lives in. Resolving them all (rather than
+/// trusting the first) is what makes a cross-scope merge report the refusal
+/// `merge_impl` actually enforces, instead of "no memory with id …" from
+/// looking the second id up under the first one's scope.
+fn one_scope(path: &Path, ids: &[String]) -> Result<String, String> {
+    let mut scope: Option<String> = None;
+    for id in ids {
+        let found = scope_of(path, id)?;
+        match &scope {
+            Some(first) if first != &found => {
+                return Err(
+                    "Memories can only be merged within one scope — every id must be in the same project, or all global."
+                        .to_string(),
+                );
+            }
+            Some(_) => {}
+            None => scope = Some(found),
+        }
+    }
+    scope.ok_or_else(|| "Merging needs at least two memories.".to_string())
+}
+
 pub fn list(all: bool) -> Result<(), String> {
     let path = path_or_err()?;
     let entries = memory::list_all_impl(&path)?;
@@ -154,16 +176,28 @@ pub fn set_pinned(id: &str, pinned: bool) -> Result<(), String> {
     Ok(())
 }
 
-pub fn expire(id: &str, at: Option<&str>, clear: bool) -> Result<(), String> {
-    let path = path_or_err()?;
-    let scope = scope_of(&path, id)?;
-    let value = if clear { None } else { at };
-    if value.is_none() && !clear {
-        return Err(
+/// Which expiry `expire` should write: `Some(stamp)` to set one, `None` to
+/// clear. Pure so the argument rules are testable without a store. `--at`
+/// together with `--clear` is refused rather than letting one win silently —
+/// the two ask for opposite end states.
+fn expiry_arg<'a>(at: Option<&'a str>, clear: bool) -> Result<Option<&'a str>, String> {
+    match (at, clear) {
+        (Some(_), true) => {
+            Err("Pass either --at <YYYY-MM-DD|RFC3339> or --clear, not both.".to_string())
+        }
+        (Some(value), false) => Ok(Some(value)),
+        (None, true) => Ok(None),
+        (None, false) => Err(
             "Pass --at <YYYY-MM-DD|RFC3339> to set an expiry, or --clear to remove one."
                 .to_string(),
-        );
+        ),
     }
+}
+
+pub fn expire(id: &str, at: Option<&str>, clear: bool) -> Result<(), String> {
+    let value = expiry_arg(at, clear)?;
+    let path = path_or_err()?;
+    let scope = scope_of(&path, id)?;
     let fact = memory::set_expiry_impl(&path, &scope, id, value)?;
     match fact.expires_at {
         Some(when) => println!("{} expires {}", fact.id, when),
@@ -174,10 +208,7 @@ pub fn expire(id: &str, at: Option<&str>, clear: bool) -> Result<(), String> {
 
 pub fn merge(ids: &[String], text: Option<&str>) -> Result<(), String> {
     let path = path_or_err()?;
-    let first = ids
-        .first()
-        .ok_or_else(|| "Merging needs at least two memories.".to_string())?;
-    let scope = scope_of(&path, first)?;
+    let scope = one_scope(&path, ids)?;
     let fact = memory::merge_impl(&path, &scope, ids, text)?;
     println!(
         "Merged {} memories into {} (the originals are retired, not deleted — `monkey memory unmerge {}` restores them)",
@@ -262,6 +293,62 @@ mod tests {
         let mut merged = entry();
         merged.merged_from = vec!["a".to_string(), "b".to_string()];
         assert_eq!(flags(&merged, NOW), "merged");
+    }
+
+    /// A store of our own, so the id->scope resolution can be exercised
+    /// without `app_paths::data_dir()` (which the verbs resolve internally).
+    fn temp_store() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "little_monkey_memory_cli_test_{}_{}.json",
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    #[test]
+    fn expiry_arg_refuses_at_and_clear_together_and_neither_alone() {
+        assert_eq!(
+            expiry_arg(Some("2026-12-31"), false),
+            Ok(Some("2026-12-31"))
+        );
+        assert_eq!(expiry_arg(None, true), Ok(None));
+        // `--at` must not be silently discarded by `--clear`.
+        assert!(expiry_arg(Some("2026-12-31"), true)
+            .unwrap_err()
+            .contains("not both"));
+        assert!(expiry_arg(None, false).unwrap_err().contains("--clear"));
+    }
+
+    #[test]
+    fn one_scope_resolves_a_single_scope_and_names_a_cross_scope_merge() {
+        let path = temp_store();
+        let global = memory::add_fact_impl(&path, "__global__", "a global fact", "user", None)
+            .expect("global fact");
+        let second =
+            memory::add_fact_impl(&path, "__global__", "another global fact", "user", None)
+                .expect("second global fact");
+        let project = memory::add_fact_impl(&path, "/tmp/project", "a project fact", "user", None)
+            .expect("project fact");
+
+        assert_eq!(
+            one_scope(&path, &[global.id.clone(), second.id.clone()]),
+            Ok("__global__".to_string())
+        );
+        // The refusal names the real reason instead of "no memory with id".
+        let err = one_scope(&path, &[global.id.clone(), project.id.clone()]).unwrap_err();
+        assert!(err.contains("within one scope"), "unexpected error: {err}");
+        assert!(one_scope(&path, &[])
+            .unwrap_err()
+            .contains("at least two memories"));
+        assert!(one_scope(&path, &["nope".to_string()])
+            .unwrap_err()
+            .contains("No memory with id"));
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
