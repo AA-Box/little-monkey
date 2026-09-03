@@ -365,7 +365,7 @@ describe("ExecutableExtensionsPanel", () => {
     // button sit behind conditionals, so a held reference can outlive its own
     // element and go on answering for a subtree the component has dropped.
     const review = () => screen.getByLabelText("Review extension");
-    const binding = () => screen.getByPlaceholderText(
+    const binding = () => within(review()).getByPlaceholderText(
       "Choose the directory bound to this opaque handle",
     ) as HTMLInputElement;
     const apply = () => within(review()).getByRole("button", { name: "Update" }) as HTMLButtonElement;
