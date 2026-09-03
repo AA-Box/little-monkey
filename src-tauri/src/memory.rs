@@ -367,7 +367,7 @@ pub fn save_impl(path: &Path, memories: &MemoriesFile) -> Result<(), String> {
 /// `"2026-07-10T12:34:56.789Z"`) without pulling in a date/time crate for
 /// this one field — see [`civil_from_days`] for the day-count-to-calendar-date
 /// conversion this relies on.
-fn now_rfc3339() -> String {
+pub fn now_rfc3339() -> String {
     let dur = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();

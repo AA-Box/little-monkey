@@ -31,6 +31,7 @@ mod ingress_cli;
 mod launcher;
 mod managed_model_cli;
 mod mcp_cli;
+mod memory_cli;
 mod modelfile;
 mod ollama_api;
 mod peers_cli;
@@ -479,6 +480,12 @@ enum Cmd {
         #[arg(long)]
         port: Option<u16>,
     },
+    /// Memory Studio parity: inspect stored memories and drive their
+    /// lifecycle (pin, expire, merge, purge) against the same
+    /// `memories.json` the desktop app writes. Remembering itself stays
+    /// with the `remember` tool.
+    #[command(subcommand)]
+    Memory(memory_cli::MemoryCmd),
     /// Knowledge Stacks parity (RAG design doc, slice 4): list stacks
     /// created in the desktop app's Settings > Knowledge tab, reindex one by
     /// name, or import one's older index into Knowledge 2.0. Read-only
@@ -1059,8 +1066,18 @@ fn compose_system_prompt_impl(
     let root = workspace::primary_root_canon(state)
         .ok()
         .map(|root| root.to_string_lossy().to_string());
-    let facts =
-        memory::list_impl(&data_dir.join("memories.json"), root.as_deref()).unwrap_or_default();
+    let memories_path = data_dir.join("memories.json");
+    let facts = memory::list_impl(&memories_path, root.as_deref()).unwrap_or_default();
+    // The CLI's own `last_used_at` seam, mirroring `systemPrompt.ts`'s
+    // `currentSystemPrompt`: a prompt is being assembled from exactly these
+    // facts. Throttled inside `mark_used_impl` (see its doc comment) so this
+    // is not a whole-file rewrite on every tool-calling iteration, and
+    // deliberately best-effort — a memory-store hiccup must never block a
+    // turn from composing its prompt.
+    let _ = memory::mark_used_impl(
+        &memories_path,
+        &facts.iter().map(|f| f.id.clone()).collect::<Vec<_>>(),
+    );
 
     let mut sections: Vec<String> = Vec::new();
     if !rule_files.is_empty() {
@@ -1621,6 +1638,17 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             Err(e) => Err(e),
         },
         Cmd::ApiServe { port } => run_api_serve(*port).await,
+        Cmd::Memory(action) => match action {
+            memory_cli::MemoryCmd::List { all } => memory_cli::list(*all),
+            memory_cli::MemoryCmd::Pin { id } => memory_cli::set_pinned(&id, true),
+            memory_cli::MemoryCmd::Unpin { id } => memory_cli::set_pinned(&id, false),
+            memory_cli::MemoryCmd::Expire { id, at, clear } => {
+                memory_cli::expire(id, at.as_deref(), *clear)
+            }
+            memory_cli::MemoryCmd::Merge { ids, text } => memory_cli::merge(&ids, text.as_deref()),
+            memory_cli::MemoryCmd::Unmerge { id } => memory_cli::unmerge(&id),
+            memory_cli::MemoryCmd::Purge => memory_cli::purge(),
+        },
         Cmd::Stacks(action) => match action {
             StacksCmd::List => stacks_cli::list(),
             StacksCmd::Reindex { name } => stacks_cli::reindex(name).await,
@@ -2340,6 +2368,127 @@ mod tests {
         .unwrap();
         assert!(prompt.contains("- keep me"));
         assert!(!prompt.contains("disable me"));
+    }
+
+    #[test]
+    fn an_expired_or_merged_away_fact_is_excluded_from_the_cli_system_prompt() {
+        // The CLI half of `memory.rs`'s
+        // `expired_and_merge_retired_facts_are_excluded_from_list_impl`: the
+        // two lifecycle states added alongside `enabled` must be excluded
+        // from a real composed prompt, not just from `list_impl` in
+        // isolation.
+        let data_dir = TempDir::new();
+        let ws = TempDir::new();
+        let ws_canon = ws.path.canonicalize().unwrap();
+        let root = ws_canon.to_string_lossy().to_string();
+        let state = state_with_primary_root(&ws.path);
+        let memories_path = data_dir.path.join("memories.json");
+
+        memory::add_fact_impl(&memories_path, &root, "plain fact", "agent", None).unwrap();
+        let expired =
+            memory::add_fact_impl(&memories_path, &root, "expired fact", "agent", None).unwrap();
+        memory::set_expiry_impl(
+            &memories_path,
+            &root,
+            &expired.id,
+            Some("2000-01-01T00:00:00.000Z"),
+        )
+        .unwrap();
+        let one =
+            memory::add_fact_impl(&memories_path, &root, "merge parent one", "agent", None).unwrap();
+        let two =
+            memory::add_fact_impl(&memories_path, &root, "merge parent two", "agent", None).unwrap();
+        memory::merge_impl(
+            &memories_path,
+            &root,
+            &[one.id, two.id],
+            Some("the merged fact"),
+        )
+        .unwrap();
+
+        let prompt = compose_system_prompt_impl(
+            &data_dir.path,
+            &data_dir.path.join("MONKEY.md"),
+            &state,
+            None,
+        )
+        .unwrap();
+        assert!(prompt.contains("- plain fact"));
+        assert!(prompt.contains("- the merged fact"));
+        assert!(!prompt.contains("expired fact"));
+        assert!(!prompt.contains("merge parent one"));
+        assert!(!prompt.contains("merge parent two"));
+    }
+
+    #[test]
+    fn a_pinned_fact_is_composed_first_under_remembered_facts() {
+        let data_dir = TempDir::new();
+        let ws = TempDir::new();
+        let ws_canon = ws.path.canonicalize().unwrap();
+        let root = ws_canon.to_string_lossy().to_string();
+        let state = state_with_primary_root(&ws.path);
+        let memories_path = data_dir.path.join("memories.json");
+
+        memory::add_fact_impl(&memories_path, &root, "ordinary fact", "agent", None).unwrap();
+        let pinned =
+            memory::add_fact_impl(&memories_path, &root, "pinned fact", "agent", None).unwrap();
+        memory::set_pinned_impl(&memories_path, &root, &pinned.id, true).unwrap();
+
+        let prompt = compose_system_prompt_impl(
+            &data_dir.path,
+            &data_dir.path.join("MONKEY.md"),
+            &state,
+            None,
+        )
+        .unwrap();
+        assert!(
+            prompt.find("- pinned fact").unwrap() < prompt.find("- ordinary fact").unwrap(),
+            "a pinned memory is folded in first:\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn composing_the_cli_prompt_stamps_last_used_at() {
+        let data_dir = TempDir::new();
+        let ws = TempDir::new();
+        let ws_canon = ws.path.canonicalize().unwrap();
+        let root = ws_canon.to_string_lossy().to_string();
+        let state = state_with_primary_root(&ws.path);
+        let memories_path = data_dir.path.join("memories.json");
+
+        let composed =
+            memory::add_fact_impl(&memories_path, &root, "composed fact", "agent", None).unwrap();
+        let disabled =
+            memory::add_fact_impl(&memories_path, &root, "disabled fact", "agent", None).unwrap();
+        memory::set_enabled_impl(&memories_path, &root, &disabled.id, false).unwrap();
+
+        compose_system_prompt_impl(
+            &data_dir.path,
+            &data_dir.path.join("MONKEY.md"),
+            &state,
+            None,
+        )
+        .unwrap();
+
+        let stored = memory::load_impl(&memories_path).unwrap();
+        let find = |id: &str| {
+            stored.projects[&root]
+                .facts
+                .iter()
+                .find(|f| f.id == id)
+                .unwrap()
+                .last_used_at
+                .clone()
+        };
+        assert!(
+            find(&composed.id).is_some(),
+            "a fact folded into the prompt records that it was"
+        );
+        assert_eq!(
+            find(&disabled.id),
+            None,
+            "a fact that never reached the prompt is never stamped"
+        );
     }
 
     #[test]
