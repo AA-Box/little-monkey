@@ -732,13 +732,46 @@ fn wait_for_pending_sender(
     ))
 }
 
-fn assert_durable_events(profile: &str, account_id: &str) -> Result<(), String> {
+fn channel_events(profile: &str, account_id: &str) -> Result<serde_json::Value, String> {
     let output = require_cli(
         Some(profile),
         &["channels", "events", account_id, "--limit", "50", "--json"],
     )?;
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("channel events JSON was invalid: {error}"))?;
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("channel events JSON was invalid: {error}"))
+}
+
+fn direction_count(payload: &serde_json::Value, direction: &str) -> usize {
+    payload
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .map(|events| {
+            events
+                .iter()
+                .filter(|event| {
+                    event.get("direction").and_then(serde_json::Value::as_str) == Some(direction)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// What the durable log holds once the outbox has caught up.
+///
+/// Polled rather than read once, and that is the only concession made here.
+/// The page reads `channel_outbox` — queued rows included, because on this
+/// surface a queued reply is already readable by the visitor — so a reply the
+/// page has shown is not yet a durable *outbound event*: it becomes one when
+/// the daemon's outbox drain sends it, on a tick of its own. Reading the log
+/// the instant the page showed the reply raced that drain and saw the pairing
+/// code and the first-contact notice without it. The counts below stay exact.
+fn assert_durable_events(profile: &str, account_id: &str) -> Result<(), String> {
+    let deadline = Instant::now() + SERVICE_WAIT;
+    let mut payload = channel_events(profile, account_id)?;
+    while direction_count(&payload, "outbound") < 3 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+        payload = channel_events(profile, account_id)?;
+    }
     let events = payload
         .get("events")
         .and_then(serde_json::Value::as_array)
@@ -754,18 +787,8 @@ fn assert_durable_events(profile: &str, account_id: &str) -> Result<(), String> 
                 && event.get("job_id").is_some_and(|value| !value.is_null())
         })
         .collect();
-    let inbound = events
-        .iter()
-        .filter(|event| {
-            event.get("direction").and_then(serde_json::Value::as_str) == Some("inbound")
-        })
-        .count();
-    let outbound = events
-        .iter()
-        .filter(|event| {
-            event.get("direction").and_then(serde_json::Value::as_str) == Some("outbound")
-        })
-        .count();
+    let inbound = direction_count(&payload, "inbound");
+    let outbound = direction_count(&payload, "outbound");
 
     // Two inbound messages arrived; exactly one of them earned a run. The
     // first was answered with a pairing code and must NOT have run — that is
