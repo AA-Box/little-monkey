@@ -48,8 +48,10 @@ use little_monkey_lib::channels::types::{
 
 use crate::daemon::channel_adapter::{AdapterConfig, ChannelAdapter, InboundBatch};
 
-/// Mail bodies are long; this is the ceiling one outbound message is chunked
-/// at, well under every relay's own line/message limits.
+/// What one outbound mail may carry. Nothing outside this file reads
+/// `ProviderCapabilities::max_text_chars` — there is no worker-side chunker —
+/// so this is a declaration to the agent's tool schema and the setup UI, and
+/// `send` is what has to honour it.
 const EMAIL_MAX_TEXT_CHARS: usize = 16_384;
 
 /// Ports whose only protocol is cleartext. Refused by number so there is no

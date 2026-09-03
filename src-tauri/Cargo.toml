@@ -227,8 +227,11 @@ async-imap = { version = "0.11.3", default-features = false, features = ["runtim
 # `mail-parser` decodes inbound RFC 5322/2045: typed `Message-ID`/`In-Reply-To`
 # /`References` (which is what the reply-threading contract is written
 # against), RFC 2047 encoded words, quoted-printable and base64 transfer
-# encodings, nested multiparts and per-part decoded sizes.
-mail-parser = { version = "0.11.8", default-features = false }
+# encodings, nested multiparts and per-part decoded sizes. `full_encoding` is
+# on because without it a Latin-1, Shift-JIS or GB2312 subject decodes to
+# mojibake rather than text; it pulls `encoding_rs`, which `reqwest` already
+# locks in this workspace, so nothing new resolves.
+mail-parser = { version = "0.11.8", default-features = false, features = ["full_encoding"] }
 # `mail-builder` writes the outbound side of the same RFCs. Default features
 # off on purpose: the only one is `gethostname`, which would put this machine's
 # hostname into a generated Message-ID; the adapter mints its own from the

@@ -352,7 +352,7 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
     kind: "webchat", label: "Web chat", transport: "served", credentialOptional: true,
     credentialLabel: "None \u2014 visitors pair like any other sender",
     whereToGetIt: "A chat page this app serves on the resident daemon\u2019s own TLS listener, at your runner origin under /webchat/<account id>. Configure the remote host first (Settings \u2192 Remote, or `monkey daemon remote configure`); without one there is nothing to serve on. Loopback is the default, and a listener bound to a wildcard or multicast address, or to port zero, is refused rather than served. A first-time visitor is answered with a pairing code, exactly like a stranger on any other provider; approve them from the pending list with `monkey channels approve`. No files in either direction, and a visitor reads only their own conversation.",
-    docsUrl: "https://github.com/sarollahi/little-monkey/blob/develop/docs/messaging-devices-and-phones.md",
+    docsUrl: "https://github.com/AA-Box/little-monkey/blob/develop/docs/messaging-devices-and-phones.md",
     configFields: [],
   },
   {
@@ -364,7 +364,7 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
     credentialLabel: "None here — the extension holds its own credentials in its declared secret slots",
     credentialOptional: true,
     whereToGetIt: "Install a channel extension under Settings > Extensions, grant it the origins it asks for, fill in its secret slots, then name it here.",
-    docsUrl: "https://github.com/sarollahi/little-monkey/blob/develop/docs/executable-extensions.md",
+    docsUrl: "https://github.com/AA-Box/little-monkey/blob/develop/docs/executable-extensions.md",
     configFields: [
       { key: "extension_id", label: "Extension", type: "text", required: true, placeholder: "dev.example.chat", hint: "The installed extension that speaks for this account. Both this and the capability are required: naming only the capability would resolve to whichever extension declares that id today." },
       { key: "capability_id", label: "Channel capability", type: "text", required: true, placeholder: "room", hint: "Which of that extension's declared channel capabilities this account uses." },

@@ -52,8 +52,11 @@ use crate::daemon::channel_adapter::{AdapterConfig, ChannelAdapter, InboundBatch
 const DEFAULT_EVENT_TYPE: &str = "little_monkey_message";
 
 /// Home Assistant imposes no message length on `notify`; this is the host's own
-/// chunking ceiling, chosen to be comfortably under what a push transport
-/// behind a notify service will carry.
+/// ceiling, chosen to be comfortably under what a push transport behind a
+/// notify service will carry. Nothing outside this file reads
+/// `ProviderCapabilities::max_text_chars` — there is no worker-side chunker —
+/// so it is a declaration to the agent's tool schema and the setup UI, and
+/// `send` is what has to honour it.
 const HOME_ASSISTANT_MAX_TEXT_CHARS: usize = 4_000;
 
 pub struct HomeAssistantAdapter {

@@ -882,12 +882,19 @@ fn health_after_poll(
 
 /// Whether this account's health can only come from asking the adapter.
 ///
-/// True exactly for the helper providers: their poll succeeding is compatible
-/// with an account that cannot send or receive a single message.
+/// True for the helper providers — their poll succeeding is compatible with an
+/// account that cannot send or receive a single message — and for a served
+/// surface, whose poll never leaves this process at all. Without this arm the
+/// only thing that would ever write a served account's health is somebody
+/// typing `monkey channels probe`, so the desktop panel would show it
+/// disconnected forever while the page was answering.
 fn needs_probe_for_health(adapter: &dyn ChannelAdapter) -> bool {
+    use little_monkey_lib::channels::types::InboundTransport;
     adapter.live_transport().is_none()
-        && adapter.capabilities().inbound_transport
-            == little_monkey_lib::channels::types::InboundTransport::Helper
+        && matches!(
+            adapter.capabilities().inbound_transport,
+            InboundTransport::Helper | InboundTransport::Served
+        )
 }
 
 /// Persist one probe's own answer, debounced on the state the way a
@@ -1392,6 +1399,15 @@ mod tests {
         fn helper() -> Self {
             Self {
                 transport: InboundTransport::Helper,
+                ..Self::new()
+            }
+        }
+
+        /// Web chat: `poll` returns an empty batch without speaking to anyone,
+        /// because the daemon's own listener is what receives.
+        fn served() -> Self {
+            Self {
+                transport: InboundTransport::Served,
                 ..Self::new()
             }
         }
@@ -2102,6 +2118,11 @@ mod tests {
             HealthState::Connected
         )));
         assert!(!needs_probe_for_health(&FakeAdapter::new()));
+        // A served surface is in the same position: its poll spoke to nobody,
+        // so the probe is the only thing that can answer for it.
+        let served = FakeAdapter::served();
+        assert_eq!(health_after_poll(&served), None);
+        assert!(needs_probe_for_health(&served));
 
         let mut store = seeded_store();
         let mut account = store.channel_account("acct-1").unwrap().unwrap();

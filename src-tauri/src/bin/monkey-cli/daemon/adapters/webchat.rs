@@ -22,9 +22,9 @@
 //!
 //! # A visitor is a name, not a permission
 //!
-//! The page mints a random identifier and keeps it in its own browser storage.
-//! It grants nothing whatsoever: it names a conversation, and that is all. Who
-//! may actually cause a run is decided where it always is —
+//! The daemon mints the identifier — not the page — and the browser keeps it in
+//! its own storage. It grants no authority to *run* anything: who may cause a
+//! run is decided where it always is —
 //! `channel_ingress::accept_channel_envelope`, under the account's ordinary
 //! sender policy, which for a direct conversation defaults to pairing. A
 //! first-time visitor is therefore answered with a pairing code through this
@@ -35,9 +35,12 @@
 //! [`credential_required`](crate::daemon::channel_adapter::credential_required)
 //! answers `false` for this kind.
 //!
-//! The identifier is hashed at the trust boundary before it becomes a
-//! conversation or sender id, so the durable database never holds the bearer a
-//! browser presents. A copied database stays useless.
+//! It is not nothing, though, and the doc that says so would be wrong: the
+//! identifier *addresses* one conversation's transcript, which the page reads
+//! back, so it is that conversation's bearer and is minted here rather than
+//! chosen by the browser. It is hashed at the trust boundary before it becomes
+//! a conversation or sender id, so the durable database never holds the bearer
+//! a browser presents and a copied database stays useless.
 //!
 //! # What it deliberately does not do
 //!
@@ -57,8 +60,10 @@ use crate::daemon::channel_adapter::{
     WebhookChannelAdapter,
 };
 
-/// What one browser message may carry. The route caps the request body too;
-/// this is the reply-side ceiling the worker chunks on.
+/// What one browser message may carry. The route caps the request body too.
+/// Nothing outside this file reads `ProviderCapabilities::max_text_chars` —
+/// there is no worker-side chunker — so this is a declaration to the agent's
+/// tool schema and the setup UI, and this adapter is what has to honour it.
 const WEBCHAT_MAX_TEXT_CHARS: usize = 4_000;
 
 pub struct WebChatAdapter {
