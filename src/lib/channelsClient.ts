@@ -226,7 +226,7 @@ export interface ProviderGuide {
   label: string;
   /** How inbound messages arrive, which decides whether a public callback URL
    * is part of setup at all. */
-  transport: "long_poll" | "socket" | "webhook" | "helper";
+  transport: "long_poll" | "socket" | "webhook" | "helper" | "served";
   credentialLabel: string;
   whereToGetIt: string;
   docsUrl: string;
@@ -319,6 +319,41 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
       { key: "webhook_public_key", label: "Webhook public key (optional)", type: "text", hint: "The carrier's signing key for inbound webhook verification, when the carrier publishes one." },
       { key: "session_scope", label: "Session scope (optional)", type: "text", placeholder: "conversation", hint: "Which durable session a text thread maps onto." },
     ],
+  },
+  {
+    kind: "email", label: "Email", transport: "long_poll", credentialLabel: "Mailbox passwords (JSON)",
+    secretFields: [
+      { key: "imap_password", label: "IMAP password" },
+      { key: "smtp_password", label: "SMTP password (leave empty to reuse the IMAP one)" },
+    ],
+    whereToGetIt: "Your own mailbox. Use an app password where your provider issues one \u2014 OAuth sign-in is not implemented. TLS is required on both legs and there is no cleartext configuration to get wrong: the adapter always opens an implicit-TLS socket and refuses ports 143 and 25 outright. One conversation per correspondent address, so a reply goes to the sender rather than to a mailing list, and it carries In-Reply-To and References so it lands in the same thread. The mailbox is polled rather than held open with IDLE.",
+    docsUrl: "https://datatracker.ietf.org/doc/html/rfc5322",
+    configFields: [
+      { key: "imap_host", label: "IMAP server", type: "text", required: true, placeholder: "imap.example.org" },
+      { key: "imap_port", label: "IMAP port", type: "number", placeholder: "993", hint: "Implicit TLS only; 993 is the usual port and 143 is refused." },
+      { key: "smtp_host", label: "SMTP server", type: "text", required: true, placeholder: "smtp.example.org" },
+      { key: "smtp_port", label: "SMTP port", type: "number", placeholder: "465", hint: "Implicit TLS only; 465 is the usual port and 25 is refused." },
+      { key: "username", label: "Login name", type: "text", required: true, placeholder: "you@example.org" },
+      { key: "from_address", label: "Send replies from", type: "text", required: true, placeholder: "you@example.org", hint: "The address replies are sent from, and the one used to recognise this account's own messages." },
+      { key: "mailbox", label: "Mailbox (optional)", type: "text", placeholder: "INBOX", hint: "Which folder is polled. Defaults to INBOX." },
+    ],
+  },
+  {
+    kind: "home_assistant", label: "Home Assistant", transport: "socket", credentialLabel: "Long-lived access token",
+    whereToGetIt: "Your Home Assistant profile \u2192 Security \u2192 Long-lived access tokens. Messages arrive over the WebSocket API subscribed to one event type, so health reports the connection as well as the token. Replies go to the one notify service this account names \u2014 a notify service has no per-recipient address and no file upload, so a reply reaches whatever that service is configured to reach. The server URL must be https unless it is localhost: the token is attached to every request, and a stock http://homeassistant.local:8123 install has to be put behind TLS first.",
+    docsUrl: "https://developers.home-assistant.io/docs/api/websocket/",
+    configFields: [
+      { key: "base_url", label: "Server URL", type: "text", required: true, placeholder: "https://ha.example.org", hint: "Your own instance's origin, with no path. Plain http is accepted only for localhost." },
+      { key: "notify_service", label: "Notify service", type: "text", required: true, placeholder: "mobile_app_pixel", hint: "The bare service name under notify. Lowercase letters, digits and underscores only." },
+      { key: "event_type", label: "Event type (optional)", type: "text", placeholder: "little_monkey_message", hint: "The event your automation fires. Defaults to little_monkey_message." },
+    ],
+  },
+  {
+    kind: "webchat", label: "Web chat", transport: "served", credentialOptional: true,
+    credentialLabel: "None \u2014 visitors pair like any other sender",
+    whereToGetIt: "A chat page this app serves on the resident daemon\u2019s own TLS listener, at your runner origin under /webchat/<account id>. Configure the remote host first (Settings \u2192 Remote, or `monkey daemon remote configure`); without one there is nothing to serve on. Loopback is the default, and a listener bound to a wildcard or multicast address, or to port zero, is refused rather than served. A first-time visitor is answered with a pairing code, exactly like a stranger on any other provider; approve them from the pending list with `monkey channels approve`. No files in either direction, and a visitor reads only their own conversation.",
+    docsUrl: "https://github.com/sarollahi/little-monkey/blob/develop/docs/messaging-devices-and-phones.md",
+    configFields: [],
   },
   {
     // One entry for every extension-backed provider, because the persisted

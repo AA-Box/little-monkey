@@ -8,8 +8,10 @@
 //! once, which is why a new provider cannot bring its own security posture.
 
 pub(crate) mod discord;
+pub(crate) mod email;
 pub(crate) mod extension;
 pub(crate) mod google_chat;
+pub(crate) mod home_assistant;
 pub(crate) mod imessage;
 pub(crate) mod irc;
 pub(crate) mod jwt;
@@ -21,6 +23,7 @@ pub(crate) mod slack;
 pub(crate) mod sms;
 pub(crate) mod teams;
 pub(crate) mod telegram;
+pub(crate) mod webchat;
 pub(crate) mod whatsapp;
 
 use std::sync::Arc;
@@ -46,6 +49,10 @@ pub(crate) fn sends_attachments(kind: ChannelKind) -> bool {
             | ChannelKind::Mattermost
             | ChannelKind::Matrix
             | ChannelKind::Signal
+            // Both halves are implemented: the IMAP part fetch pulls one
+            // decoded body part under the account's cap, and the outbound
+            // build is a real MIME multipart.
+            | ChannelKind::Email
             // The extension adapter hands the outbound artifact to the guest
             // under an exact read grant and downloads an inbound URL through
             // the host's own hardened client, so both halves are implemented.
@@ -131,11 +138,14 @@ const UNIVERSAL_CONFIG_FIELDS: &[ConfigField] = &[
 /// silently defaulting into a class whose audit questions do not apply to it.
 pub(crate) fn inbound_transport_for(kind: ChannelKind) -> InboundTransport {
     match kind {
-        ChannelKind::Telegram => InboundTransport::LongPoll,
+        // Email is polled on the worker's own cadence. IMAP IDLE would cut
+        // latency, not change the classification, and is not implemented.
+        ChannelKind::Telegram | ChannelKind::Email => InboundTransport::LongPoll,
         ChannelKind::Discord
         | ChannelKind::Slack
         | ChannelKind::Mattermost
         | ChannelKind::Irc
+        | ChannelKind::HomeAssistant
         | ChannelKind::Matrix => InboundTransport::Socket,
         ChannelKind::WhatsApp
         | ChannelKind::Teams
@@ -143,6 +153,10 @@ pub(crate) fn inbound_transport_for(kind: ChannelKind) -> InboundTransport {
         | ChannelKind::Line
         | ChannelKind::Sms => InboundTransport::Webhook,
         ChannelKind::Signal | ChannelKind::IMessage => InboundTransport::Helper,
+        // Not `Webhook`: nothing outside this machine has to be told a URL,
+        // and the listener is the daemon's own already-configured one. See
+        // `InboundTransport::Served`.
+        ChannelKind::WebChat => InboundTransport::Served,
         // An extension speaks for whatever it speaks for, and the host does not
         // know which until the guest is resolved. Reported as its own delivery
         // mechanism rather than guessed: the guest is what receives, and the
@@ -210,6 +224,26 @@ pub(crate) fn config_fields(kind: ChannelKind) -> &'static [ConfigField] {
         required("project_number", ConfigFieldKind::Text),
         optional("bot_user_name", ConfigFieldKind::Text),
     ];
+    // The mailbox itself. No port defaults live here — the adapter refuses
+    // the cleartext ports by number, so an omitted port means implicit TLS
+    // rather than "whatever the server offers".
+    const EMAIL: &[ConfigField] = &[
+        required("imap_host", ConfigFieldKind::Text),
+        optional("imap_port", ConfigFieldKind::Number),
+        required("smtp_host", ConfigFieldKind::Text),
+        optional("smtp_port", ConfigFieldKind::Number),
+        required("username", ConfigFieldKind::Text),
+        required("from_address", ConfigFieldKind::Text),
+        optional("mailbox", ConfigFieldKind::Text),
+    ];
+    // `notify_service` is path-concatenated into the REST call and
+    // `event_type` is what the socket subscribes to, so both are validated as
+    // bare identifiers by the adapter rather than only as non-empty strings.
+    const HOME_ASSISTANT: &[ConfigField] = &[
+        required("base_url", ConfigFieldKind::Text),
+        required("notify_service", ConfigFieldKind::Text),
+        optional("event_type", ConfigFieldKind::Text),
+    ];
     const SMS: &[ConfigField] = &[
         optional("webhook_public_key", ConfigFieldKind::Text),
         optional("session_scope", ConfigFieldKind::Text),
@@ -224,9 +258,15 @@ pub(crate) fn config_fields(kind: ChannelKind) -> &'static [ConfigField] {
     ];
     match kind {
         // Secret-only providers: the token carries everything.
-        ChannelKind::Telegram | ChannelKind::Discord | ChannelKind::Slack | ChannelKind::Line => {
-            NONE
-        }
+        // Secret-only providers: the token carries everything. WebChat is here
+        // for the opposite reason — it has no provider, no token and nothing
+        // to configure; the listener it is served on is configured once, under
+        // the remote host, for every served surface at once.
+        ChannelKind::Telegram
+        | ChannelKind::Discord
+        | ChannelKind::Slack
+        | ChannelKind::Line
+        | ChannelKind::WebChat => NONE,
         ChannelKind::Mattermost => MATTERMOST,
         ChannelKind::Irc => IRC,
         ChannelKind::Matrix => MATRIX,
@@ -236,6 +276,8 @@ pub(crate) fn config_fields(kind: ChannelKind) -> &'static [ConfigField] {
         ChannelKind::Teams => TEAMS,
         ChannelKind::GoogleChat => GOOGLE_CHAT,
         ChannelKind::Sms => SMS,
+        ChannelKind::Email => EMAIL,
+        ChannelKind::HomeAssistant => HOME_ASSISTANT,
         ChannelKind::Extension => EXTENSION,
     }
 }
@@ -360,6 +402,9 @@ pub(crate) fn build_adapter(
         ChannelKind::Sms => {
             return Err("An SMS account is built from its telephony account".to_string())
         }
+        ChannelKind::Email => Arc::new(email::EmailAdapter::new(config)?),
+        ChannelKind::HomeAssistant => Arc::new(home_assistant::HomeAssistantAdapter::new(config)?),
+        ChannelKind::WebChat => Arc::new(webchat::WebChatAdapter::new(config)?),
         ChannelKind::Extension => Arc::new(extension::ExtensionChannelAdapter::new(config, state)?),
     })
 }
@@ -480,6 +525,43 @@ mod tests {
         )
         .expect("the edited row builds");
         assert_eq!(adapter.kind(), ChannelKind::Mattermost);
+    }
+
+    #[test]
+    fn the_served_chat_page_is_not_a_second_public_webhook() {
+        // `webhook::handle_channel_delivery` serves `POST /v1/channels/<id>`
+        // for every kind `build_webhook_adapter` can build, on the listener
+        // operators are told to publish through a proxy or a tunnel. WebChat
+        // is admitted by the remote listener's own route instead — the one
+        // that checks the listen address, caps the body and rate-limits the
+        // peer — so it must stay refused here, or "served on the resident
+        // daemon's own TLS listener and on nothing else" stops being true.
+        let account = config(ChannelKind::WebChat, serde_json::json!({}));
+        let error = match build_webhook_adapter(
+            &AdapterConfig {
+                account: &account,
+                secret: String::new(),
+            },
+            None,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("web chat must not be reachable over the public channel webhook"),
+        };
+        assert!(error.contains("Web chat"), "{error}");
+    }
+
+    #[test]
+    fn a_served_poll_reports_no_provider_transport_to_expose() {
+        // The whole reason `Served` is its own variant: Security Doctor and
+        // the setup UI ask a webhook provider for a public callback URL, and
+        // there is none to ask for here.
+        assert_eq!(
+            inbound_transport_for(ChannelKind::WebChat),
+            InboundTransport::Served
+        );
+        assert!(!sends_attachments(ChannelKind::WebChat));
+        assert!(!sends_attachments(ChannelKind::HomeAssistant));
+        assert!(sends_attachments(ChannelKind::Email));
     }
 }
 

@@ -36,14 +36,15 @@ Concretely, that means:
 
 ## Messaging channels
 
-Thirteen providers reach the same durable ingress: Telegram, Discord, Slack,
+Sixteen providers reach the same durable ingress: Telegram, Discord, Slack,
 WhatsApp, Microsoft Teams, Google Chat, LINE, Matrix, Mattermost, Signal,
-iMessage, IRC, and SMS. A sandboxed extension can speak for a fourteenth of its
-own.
+iMessage, IRC, SMS, email, Home Assistant, and a web chat page this app serves
+itself. A sandboxed extension can speak for a seventeenth of its own.
 
-They arrive four different ways — a long poll, a socket the app holds open, a
-webhook the provider posts to, or a local helper process — and *converge before
-anything is decided*. One gate answers who may talk to this account, one router
+They arrive five different ways — a long poll, a socket the app holds open, a
+webhook the provider posts to, a local helper process, or a page this app
+serves to a browser on its own listener — and *converge before anything is
+decided*. One gate answers who may talk to this account, one router
 decides what recipe runs, and one durable turn is what actually runs. No
 provider has its own copy of an access rule.
 
@@ -139,7 +140,7 @@ freely and can only raise them so far.
 
 ### Loops
 
-An account never answers itself, and for the twelve built-in providers that is
+An account never answers itself, and for the sixteen built-in providers that is
 the host's own conclusion: the code reading the provider's payload is this app's,
 holding the account's credential.
 
@@ -183,6 +184,13 @@ loopback. There are two ways to bridge that, and both of them are yours:
 There is no relay in either case. No hostname, account, credential or endpoint
 here belongs to anybody but you, and a managed tunnel is your tunnel — this app
 supplies the supervision, not the address.
+
+The three newest providers add nothing to this obligation, and that is the
+point of listing them apart. Email polls a mailbox outward; Home Assistant
+opens a WebSocket outward; the web chat page is served by this machine's own
+already-configured remote listener rather than by a provider calling in. None
+of them has a callback URL to paste anywhere, and none of them is reachable
+through the webhook listener above.
 
 A named tunnel specifically: a quick tunnel mints a fresh random hostname on
 every start, which cannot be pasted into a provider console and would break
@@ -350,6 +358,20 @@ therefore **not** claimed as verified here.
   forgetting the sender clears it; deleting a conversation erases its events,
   replies, turns and jobs and nothing of a neighbouring conversation's, is
   refused while a reply is mid-send, and forgetting one drops only its row.
+- Email, Home Assistant and the served web chat page are registered providers
+  like any other: each one ingests, routes, queues and drains through the same
+  production ingress and outbox as the thirteen before them, driven by the
+  contract test that enumerates every kind. What is additionally proven for
+  each is its *refusals*, because that is where these three differ from the
+  rest — an email account whose IMAP port is 143 or whose SMTP port is 25 is
+  refused at construction rather than downgraded, a Home Assistant `base_url`
+  that is not a bare `https` origin (or a `notify_service` name that could
+  select a different endpoint) is refused before a token is ever attached to a
+  request, and the web chat kind is refused by the public channel-webhook
+  builder outright, so the page is reachable only through the daemon's own
+  listener. A provider that holds no credential of ours — the helper providers,
+  SMS, and the served page — is no longer reported by Security Doctor as an
+  enabled account missing one.
 - Webhook signature verification for WhatsApp, Teams, Google Chat and LINE, and
   carrier callback verification for Twilio, Plivo and Telnyx, over exact bytes,
   including forged and replayed bodies.
@@ -416,6 +438,17 @@ from somebody else, and not the agent.
 
 - Any provider against a real account: that the live service behaves as the
   adapter expects, and that your token has the scopes it needs.
+- A real mailbox: that your provider's IMAP and SMTP behave as the adapter
+  expects on their implicit-TLS ports, and that your app password has the
+  access it needs.
+- A real Home Assistant instance: that your long-lived token authenticates over
+  the WebSocket API, that your automation fires the event type this account
+  subscribes to, and that your notify service delivers where you expect.
+- A browser on another machine reaching the served chat page: the daemon's
+  listener bound to a real interface, a certificate that browser trusts, and
+  what your network actually allows to reach it. The loopback leg needs no
+  account of yours and is exercised by its own harness; the non-loopback leg is
+  yours to expose.
 - A publicly reachable callback URL, and the provider console accepting it.
 - A real Cloudflare tunnel account: that `cloudflared` connects with your token,
   that the hostname routes to this machine, and that a provider's delivery

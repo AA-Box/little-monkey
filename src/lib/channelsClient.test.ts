@@ -128,6 +128,36 @@ describe("channels setup guidance", () => {
     expect(transport("telegram")).toBe("long_poll");
     expect(transport("signal")).toBe("helper");
     expect(transport("imessage")).toBe("helper");
+    // Email polls IMAP rather than holding IDLE open; Home Assistant holds
+    // `/api/websocket`; web chat is served by this machine's own listener and
+    // is neither polled nor called by a provider.
+    expect(transport("email")).toBe("long_poll");
+    expect(transport("home_assistant")).toBe("socket");
+    expect(transport("webchat")).toBe("served");
+  });
+
+  it("asks for no public callback URL where this machine is the surface", () => {
+    // None of the three is a webhook: email polls out, Home Assistant
+    // connects out, and the web chat page is served on the daemon's own
+    // already-configured listener. Telling an operator to expose a URL for
+    // any of them would be a setup step that does nothing.
+    expect(needsPublicCallback("email")).toBe(false);
+    expect(needsPublicCallback("home_assistant")).toBe(false);
+    expect(needsPublicCallback("webchat")).toBe(false);
+  });
+
+  it("says up front where each of the three new providers stops", () => {
+    // Each guide carries its own boundary, because the setup screen is where
+    // an operator decides whether the account will do what they want.
+    const text = (kind: string) => PROVIDER_GUIDES.find((guide) => guide.kind === kind)!.whereToGetIt;
+    expect(text("email")).toMatch(/refuses ports 143 and 25/i);
+    expect(text("email")).toMatch(/polled rather than held open with IDLE/i);
+    expect(text("home_assistant")).toMatch(/no file upload/i);
+    expect(text("home_assistant")).toMatch(/https unless it is localhost/i);
+    expect(text("webchat")).toMatch(/pairing code/i);
+    expect(text("webchat")).toMatch(/refused rather than served/i);
+    // No credential exists for a served page, so setup must not imply one.
+    expect(PROVIDER_GUIDES.find((guide) => guide.kind === "webchat")?.credentialOptional).toBe(true);
   });
 
   it("says what health actually checks, for the providers where a process is not an account", () => {
@@ -209,6 +239,11 @@ describe("provider settings", () => {
     // Google Chat's credential is a key file pasted whole, so there is nothing
     // to split apart.
     expect(parts("google_chat")).toEqual([]);
+    // A mailbox has two legs and they are not always the same password.
+    expect(parts("email")).toEqual(["imap_password", "smtp_password"]);
+    // One long-lived access token, pasted whole.
+    expect(parts("home_assistant")).toEqual([]);
+    expect(parts("webchat")).toEqual([]);
   });
 
   it("names the one Google Chat authentication audience the daemon verifies", () => {

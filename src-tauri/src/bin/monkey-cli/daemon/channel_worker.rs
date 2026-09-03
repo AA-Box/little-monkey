@@ -867,6 +867,9 @@ fn health_after_poll(
     }
     match adapter.capabilities().inbound_transport {
         little_monkey_lib::channels::types::InboundTransport::Webhook => None,
+        // A served surface's poll is a local no-op that spoke to nobody, so
+        // it proves exactly as much as a webhook adapter's does: nothing.
+        little_monkey_lib::channels::types::InboundTransport::Served => None,
         // A helper's poll proves the helper answered, and nothing more. For
         // Signal that is a running process, not a registered number; for
         // iMessage it is a readable database, not permission to reply. Both
