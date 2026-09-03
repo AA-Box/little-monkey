@@ -15,6 +15,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => {}) }));
 
 import { OAUTH_PROVIDERS, CONNECTOR_OAUTH_DONE, OAuthConnectForm } from "./ConnectorsPanel";
+import { useConnectorsStore } from "../../store/connectorsStore";
 
 afterEach(cleanup);
 
@@ -66,5 +67,17 @@ describe("OAuth connect card", () => {
   it("treats needs_client_id as a terminal phase, so Connect becomes usable again", () => {
     expect(CONNECTOR_OAUTH_DONE).toContain("needs_client_id");
     expect(CONNECTOR_OAUTH_DONE).not.toContain("waiting_for_browser");
+  });
+
+  it("does not show an earlier attempt's status on a freshly opened card", () => {
+    // `oauthStatus` is keyed by provider and outlives the form. Reopening the
+    // card to add a *second* Linear account must not greet the user with the
+    // first one's green "Connected" pill or its red error line.
+    useConnectorsStore.setState({
+      oauthStatus: { linear: { phase: "error", error: "consent was denied" } },
+    });
+    card("linear");
+    expect(document.body.textContent).not.toContain("consent was denied");
+    useConnectorsStore.setState({ oauthStatus: {} });
   });
 });

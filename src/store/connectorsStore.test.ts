@@ -230,6 +230,33 @@ describe("connectorsStore", () => {
     expect(invokeMock).toHaveBeenNthCalledWith(2, "connectors_oauth_cancel", { provider: "asana" });
   });
 
+  it("keeps the backend's terminal phase when the invoke rejects after emitting it", async () => {
+    // A user closing the consent tab: the command emits `cancelled` and then
+    // rejects with the same reason. Overwriting that with a generic `error`
+    // would paint the card red for something the user did on purpose.
+    const handler = eventHandlers.get("connector-oauth://status")!;
+    invokeMock.mockImplementationOnce(() => {
+      handler({ payload: { provider: "box", phase: "cancelled", error: null } });
+      return Promise.reject(new Error("OAuth connection cancelled"));
+    });
+
+    await expect(
+      useConnectorsStore.getState().oauthConnect({ provider: "box", label: "Box" }),
+    ).rejects.toThrow("OAuth connection cancelled");
+    expect(useConnectorsStore.getState().oauthStatus.box?.phase).toBe("cancelled");
+  });
+
+  it("seeds an error phase when the invoke rejects before the backend emitted anything", async () => {
+    invokeMock.mockRejectedValueOnce(new Error("bad payload"));
+    await expect(
+      useConnectorsStore.getState().oauthConnect({ provider: "box", label: "Box" }),
+    ).rejects.toThrow("bad payload");
+    expect(useConnectorsStore.getState().oauthStatus.box).toEqual<ConnectorOAuthStatus>({
+      phase: "error",
+      error: "bad payload",
+    });
+  });
+
   it("updates oauthStatus keyed by provider from connector-oauth://status events", () => {
     const handler = eventHandlers.get("connector-oauth://status");
     expect(handler).toBeDefined();

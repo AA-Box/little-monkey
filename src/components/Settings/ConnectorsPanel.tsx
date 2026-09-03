@@ -36,6 +36,7 @@ import {
 } from "lucide-react";
 import { Button, StatusPill, type PillTone } from "../ui";
 import {
+  CONNECTOR_OAUTH_TERMINAL,
   useConnectorsStore,
   type ConnectorAccount,
   type ConnectorAuditEntry,
@@ -263,8 +264,9 @@ const CONNECTOR_OAUTH_PHASE_TONE: Partial<Record<ConnectorOAuthPhase, PillTone>>
   cancelled: "neutral",
 };
 
-/** Terminal phases: the Connect button is usable again and Cancel is not. */
-export const CONNECTOR_OAUTH_DONE: ConnectorOAuthPhase[] = ["idle", "connected", "error", "cancelled", "needs_client_id"];
+/** Terminal phases: the Connect button is usable again and Cancel is not.
+ * `idle` plus the store's own terminal set, so the two cannot drift. */
+export const CONNECTOR_OAUTH_DONE: ConnectorOAuthPhase[] = ["idle", ...CONNECTOR_OAUTH_TERMINAL];
 
 function lastAppErrorLine(message: string): string {
   const lines = message.trim().split("\n").filter((line) => line.trim().length > 0);
@@ -696,8 +698,13 @@ export function OAuthConnectForm({ info, onDone }: { info: OAuthProviderInfo; on
   const [redirectUri, setRedirectUri] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const [attempted, setAttempted] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // `oauthStatus` is keyed by provider and outlives this form, so an earlier
+  // attempt's terminal phase is still there when the card is reopened — for a
+  // *second* account of the same provider that would be a green "Connected"
+  // pill over an untouched form. Only this mount's own attempt is rendered.
   const phase: ConnectorOAuthPhase = status?.phase ?? "idle";
   const inFlight = connecting && !CONNECTOR_OAUTH_DONE.includes(phase);
   const showSecretField = info.secret !== "never";
@@ -717,6 +724,7 @@ export function OAuthConnectForm({ info, onDone }: { info: OAuthProviderInfo; on
   async function handleConnect() {
     if (!canSubmit) return;
     setConnecting(true);
+    setAttempted(true);
     setError(null);
     try {
       await oauthConnect({
@@ -797,14 +805,14 @@ export function OAuthConnectForm({ info, onDone }: { info: OAuthProviderInfo; on
           {t(`ConnectorsPanel.oauthSecretHint_${info.secret}`)}
         </p>
       </div>
-      {phase !== "idle" && (
+      {attempted && phase !== "idle" && (
         <div className="mt-2">
           <StatusPill tone={CONNECTOR_OAUTH_PHASE_TONE[phase] ?? "neutral"}>
             {t(`McpPanel.oauthPhase_${phase}`)}
           </StatusPill>
         </div>
       )}
-      {(error || status?.error) && (
+      {(error || (attempted && status?.error)) && (
         <p className="mt-2 text-xs text-danger">{lastAppErrorLine(error ?? status?.error ?? "")}</p>
       )}
       <div className="mt-3 flex justify-end gap-2">
@@ -1064,8 +1072,9 @@ function AuditExport() {
  *   live read-only identity call before it is saved and stored in the OS
  *   keychain only.
  * - **App connectors** (the grid above): each card adds an *MCP server* and
- *   connects it through `mcpStore.oauthConnect`. Six providers appear in both
- *   places under the same brand name; they are separate connections with
+ *   connects it through `mcpStore.oauthConnect`. Eight providers appear in both
+ *   places under the same brand name (Slack, Notion, Google Drive, Linear,
+ *   Asana, Box, Dropbox, HubSpot); they are separate connections with
  *   separate keychain entries, which is why their copy says so.
  */
 export function ConnectorsPanel() {

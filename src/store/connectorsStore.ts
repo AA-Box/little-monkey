@@ -47,6 +47,17 @@ export type ConnectorOAuthProvider = Exclude<
  * identity call that runs before the account is saved. */
 export type ConnectorOAuthPhase = Exclude<McpOAuthPhase, "discovering"> | "verifying";
 
+/** The phases the backend only ever emits as the last word on one attempt.
+ * `oauthConnect`'s catch checks against these so a rejection arriving after
+ * the event cannot overwrite the more specific reason with a generic
+ * `error` — a user cancellation would otherwise render as a red "Failed". */
+export const CONNECTOR_OAUTH_TERMINAL: ConnectorOAuthPhase[] = [
+  "connected",
+  "error",
+  "cancelled",
+  "needs_client_id",
+];
+
 export interface ConnectorOAuthStatus {
   phase: ConnectorOAuthPhase;
   error: string | null;
@@ -251,13 +262,18 @@ export const useConnectorsStore = create<ConnectorsStore>((set, get) => ({
         client_secret: clientSecret ?? null,
       });
     } catch (err) {
-      // The backend emits a terminal phase for every failure it reaches, but
-      // an invoke that rejects before it gets there (bad payload, a panic in
-      // the command) would otherwise leave the pill stuck mid-flight.
+      // The backend emits a terminal phase for every failure it reaches, and
+      // that phase is the better one to show — "cancelled" rather than
+      // "error", or `needs_client_id` with its own copy. Only an invoke that
+      // rejects before the command got that far (bad payload, a panic) leaves
+      // the pill mid-flight, and only that case is seeded here.
       const message = errorMessage(err);
-      set((state) => ({
-        oauthStatus: { ...state.oauthStatus, [provider]: { phase: "error", error: message } },
-      }));
+      const reached = get().oauthStatus[provider]?.phase;
+      if (reached === undefined || !CONNECTOR_OAUTH_TERMINAL.includes(reached)) {
+        set((state) => ({
+          oauthStatus: { ...state.oauthStatus, [provider]: { phase: "error", error: message } },
+        }));
+      }
       throw err;
     }
     await get().refresh();
