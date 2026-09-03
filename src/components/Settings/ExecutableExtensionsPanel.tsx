@@ -129,6 +129,7 @@ export function ExecutableExtensionsPanel() {
   const [items, setItems] = useState<ExtensionDetail[] | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const selectedIdRef = useRef<string | null>(null);
+  const draftsResetFor = useRef<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -201,7 +202,12 @@ export function ExecutableExtensionsPanel() {
     return () => window.clearInterval(timer);
   }, [items, refresh]);
 
-  useEffect(() => {
+  // Cleared while rendering the new selection, not from an effect. A passive
+  // effect runs after its commit, so a reset belonging to the previous
+  // selection lands after — and silently wipes — an approval or a secret
+  // entered in between.
+  if (draftsResetFor.current !== selectedId) {
+    draftsResetFor.current = selectedId;
     setGrantedIds(new Set());
     setWorkspaceBindings({});
     setAllowUnsigned(false);
@@ -217,7 +223,7 @@ export function ExecutableExtensionsPanel() {
     setWebhookTriggerId("");
     setWebhookHandlerId("");
     setWebhookSecret("");
-  }, [selectedId]);
+  }
 
   useEffect(() => {
     if (preview && preview.manifest.extension_id !== selectedId) setPreview(null);
