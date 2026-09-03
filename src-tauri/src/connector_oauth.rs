@@ -785,12 +785,33 @@ const RECONNECT_MARKER: &str = "remove it and connect it again in Settings → C
 /// reconnect: a new connect mints a new account row (`docs/limitations.md`
 /// says the same).
 pub fn reconnect_error(provider: ConnectorProvider, detail: &str) -> String {
-    format!("{provider:?} authorization was revoked or expired — {RECONNECT_MARKER} ({detail}).")
+    format!(
+        "{} authorization was revoked or expired — {RECONNECT_MARKER} ({detail}).",
+        provider.as_str()
+    )
 }
 
 /// True for a `last_error` produced by [`reconnect_error`].
 pub fn is_reconnect_error(message: &str) -> bool {
     message.contains(RECONNECT_MARKER)
+}
+
+/// True when the token endpoint actually *refused the grant*, as opposed to
+/// being unreachable, rate limited, slow or answering with something this
+/// code could not read. Only a refusal may become a [`reconnect_error`]:
+/// that message tells the user to destroy the account and redo browser
+/// consent, which is the wrong instruction for a provider outage.
+///
+/// The two shapes a refusal takes here are `verified_call_with_body`'s
+/// `Verification failed with HTTP 400`/`401` — RFC 6749 5.2 makes 400 the
+/// refusal status, and 401 is the same answer from a provider that treats
+/// client authentication as the failing part — and
+/// [`parse_token_response`]'s "refused the exchange", for a provider that
+/// answers 200 with an `error` body.
+fn is_grant_refusal(error: &str) -> bool {
+    error.contains("Verification failed with HTTP 400")
+        || error.contains("Verification failed with HTTP 401")
+        || error.contains("refused the exchange")
 }
 
 /// The loopback redirect URI this app uses for `provider` — the exact string
@@ -1086,26 +1107,35 @@ fn merge_client(
     pasted
 }
 
-/// Returns whether the registration was actually forgotten — false when the
-/// provider still has an account, or when the catalog could not be read (in
-/// which case the safe answer is to keep the registration).
-pub fn forget_client_if_unused(config_path: &std::path::Path, provider: ConnectorProvider) -> bool {
+/// Whether the shared client registration for `provider` is now unreferenced.
+/// False when the provider still has an account, when it is not an OAuth
+/// provider, or when the catalog could not be read — in which case the safe
+/// answer is to keep the registration rather than make the user re-paste a
+/// client id.
+///
+/// Split from [`forget_client_if_unused`] so the decision can be tested
+/// without deleting a keychain entry that belongs to the real app.
+fn client_is_unused(config_path: &std::path::Path, provider: ConnectorProvider) -> bool {
     if spec_for(provider).is_none() {
         return false;
     }
-    let still_used = crate::connectors::load_config_impl(config_path)
+    crate::connectors::load_config_impl(config_path)
         .map(|config| {
-            config
+            !config
                 .accounts
                 .iter()
                 .any(|account| account.provider == provider)
         })
-        .unwrap_or(true);
-    if still_used {
-        return false;
+        .unwrap_or(false)
+}
+
+/// Returns whether the registration was actually forgotten — false when
+/// [`client_is_unused`] says something still references it.
+pub fn forget_client_if_unused(config_path: &std::path::Path, provider: ConnectorProvider) -> bool {
+    client_is_unused(config_path, provider) && {
+        delete_client(provider);
+        true
     }
-    delete_client(provider);
-    true
 }
 
 /// The non-secret provider metadata an OAuth account stores in `connection`.
@@ -1188,7 +1218,16 @@ async fn refresh_if_expired(
         now_ms,
     )
     .await
-    .map_err(|e| reconnect_error(spec.provider, &e))?;
+    .map_err(|e| {
+        if is_grant_refusal(&e) {
+            reconnect_error(spec.provider, &e)
+        } else {
+            // A 503, a rate limit, a connect timeout or a size-cap trip is a
+            // "try again later", not a revoked grant. Report it verbatim so
+            // `last_error` names the real cause.
+            e
+        }
+    })?;
     // A provider that does not rotate refresh tokens omits the field; keeping
     // the old one is what makes the *next* refresh possible.
     if refreshed.refresh_token.is_none() {
@@ -1967,24 +2006,44 @@ mod tests {
         }
     }
 
+    /// The six providers that are deliberately not OAuth. Listed by hand so
+    /// a new enum variant left out of `OAUTH_PROVIDERS` *and* out of this
+    /// list trips the count assertion below.
+    const NON_OAUTH_PROVIDERS: [ConnectorProvider; 6] = [
+        ConnectorProvider::Github,
+        ConnectorProvider::Slack,
+        ConnectorProvider::Notion,
+        ConnectorProvider::Jira,
+        ConnectorProvider::S3,
+        ConnectorProvider::Extension,
+    ];
+
     #[test]
     fn every_connector_provider_is_either_oauth_or_an_explicitly_listed_scheme() {
         // What actually catches a variant added to `ConnectorProvider` and
         // nowhere else is `as_str`'s exhaustive match (a compile error). This
         // test guards the *counts*: the 11/6/17 split that features.md,
         // limitations.md and the README row all state in prose.
-        let non_oauth = [
-            ConnectorProvider::Github,
-            ConnectorProvider::Slack,
-            ConnectorProvider::Notion,
-            ConnectorProvider::Jira,
-            ConnectorProvider::S3,
-            ConnectorProvider::Extension,
-        ];
         assert_eq!(OAUTH_PROVIDERS.len(), 11);
-        assert_eq!(OAUTH_PROVIDERS.len() + non_oauth.len(), 17);
-        for provider in non_oauth {
+        assert_eq!(OAUTH_PROVIDERS.len() + NON_OAUTH_PROVIDERS.len(), 17);
+        for provider in NON_OAUTH_PROVIDERS {
             assert!(spec_for(provider).is_none(), "{provider:?}");
+        }
+    }
+
+    #[test]
+    fn every_provider_serializes_to_the_same_string_as_as_str() {
+        // `emit_progress` keys the `connector-oauth://status` payload off
+        // `as_str()`, while the store's union and every `invoke` payload use
+        // the serde name. A divergence would break the phase pill silently,
+        // with no compile error anywhere.
+        let all = OAUTH_PROVIDERS
+            .iter()
+            .map(|spec| spec.provider)
+            .chain(NON_OAUTH_PROVIDERS);
+        for provider in all {
+            let wire = serde_json::to_value(provider).unwrap();
+            assert_eq!(wire.as_str(), Some(provider.as_str()), "{provider:?}");
         }
     }
 
@@ -2391,7 +2450,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_persists_a_rotated_refresh_token_and_keeps_the_old_one_when_none_returns() {
+    async fn refresh_returns_a_rotated_refresh_token_and_keeps_the_old_one_when_none_returns() {
         let (addr, seen) = spawn_fixture(vec![json_ok(
             r#"{"access_token":"new-access","refresh_token":"rotated","expires_in":3600}"#,
         )]);
@@ -2474,6 +2533,54 @@ mod tests {
         assert!(is_reconnect_error(&error), "{error}");
         assert!(error.contains("refused the exchange"), "{error}");
         assert!(error.contains("revoked"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_transient_refresh_failure_is_reported_verbatim_not_as_a_revoked_grant() {
+        // A provider outage must not tell the user to destroy a working
+        // account: `reconnect_error` says "remove it and connect it again",
+        // and both the panel and `monkey connectors list` repeat that.
+        for status in [429u16, 500, 503] {
+            let (addr, _) = spawn_fixture_status(vec![(
+                status,
+                r#"{"message":"service unavailable"}"#.to_string(),
+            )]);
+            let error = refresh_if_expired(
+                spec(ConnectorProvider::Linear),
+                &endpoints_at(addr),
+                true,
+                &test_client(),
+                &tokens_expiring_at(Some(0), Some("rt-old")),
+                1_000,
+            )
+            .await
+            .expect_err("must fail");
+            assert!(
+                !is_reconnect_error(&error),
+                "{status} must not read as revoked consent: {error}"
+            );
+            assert!(error.contains(&status.to_string()), "{error}");
+        }
+    }
+
+    #[test]
+    fn only_a_refused_grant_counts_as_a_refusal() {
+        assert!(is_grant_refusal(
+            "Verification failed with HTTP 400 Bad Request: x"
+        ));
+        assert!(is_grant_refusal(
+            "Verification failed with HTTP 401 Unauthorized: x"
+        ));
+        assert!(is_grant_refusal(
+            "The token endpoint refused the exchange: invalid_grant"
+        ));
+        assert!(!is_grant_refusal(
+            "Verification failed with HTTP 503 Service Unavailable: x"
+        ));
+        assert!(!is_grant_refusal("Verification request failed: dns error"));
+        assert!(!is_grant_refusal(
+            "Verification response exceeds the size limit"
+        ));
     }
 
     #[tokio::test]
@@ -2595,7 +2702,7 @@ mod tests {
     }
 
     #[test]
-    fn forget_client_leaves_a_provider_that_still_has_an_account() {
+    fn the_unused_client_decision_leaves_a_provider_that_still_has_an_account() {
         let path = std::env::temp_dir().join(unique_id("still-used.json"));
         let config = crate::connectors::ConnectorCatalogFile {
             version: 1,
@@ -2614,13 +2721,16 @@ mod tests {
         };
         crate::connectors::save_config_impl(&path, &config).unwrap();
         // A surviving account of the provider keeps the shared registration;
-        // a provider with no account left releases it. The return value is
-        // the branch, so the keychain (which this test never wrote to) does
-        // not have to be inspected.
-        assert!(!forget_client_if_unused(&path, ConnectorProvider::Gitlab));
-        assert!(forget_client_if_unused(&path, ConnectorProvider::Dropbox));
+        // a provider with no account left releases it. This asserts on
+        // `client_is_unused`, never `forget_client_if_unused`: the latter
+        // deletes from the *real* app keychain — the client namespace is
+        // per-provider, not per-account-id, so a test that called it would
+        // destroy the OAuth app registration of whoever is running the
+        // suite.
+        assert!(!client_is_unused(&path, ConnectorProvider::Gitlab));
+        assert!(client_is_unused(&path, ConnectorProvider::Dropbox));
         // A non-OAuth provider has no registration to forget.
-        assert!(!forget_client_if_unused(&path, ConnectorProvider::Slack));
+        assert!(!client_is_unused(&path, ConnectorProvider::Slack));
         let _ = std::fs::remove_file(&path);
     }
 
