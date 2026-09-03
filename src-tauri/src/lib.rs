@@ -666,7 +666,10 @@ pub struct AppState {
     /// namespaces cannot collide (an MCP server id containing a `:` is
     /// rejected by `mcp::validate_id`), so sharing the map is just reusing the
     /// "one token per in-flight flow" bookkeeping rather than standing up a
-    /// second identical map — the same note `mcp_oauth_refresh_locks` carries. `mcp_oauth_cancel` calls the
+    /// second identical map — the same note `mcp_oauth_refresh_locks`
+    /// carries.
+    ///
+    /// `mcp_oauth_cancel` calls the
     /// shared `CancellationToken`'s `cancel()` method; every overlapping
     /// connect races against `cancelled()`. Cancellation is sticky, so a
     /// cancel arriving immediately before the waiter is polled cannot be lost

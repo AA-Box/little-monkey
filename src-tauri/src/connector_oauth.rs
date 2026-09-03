@@ -11,11 +11,13 @@
 //! `connector-oauth-client:<provider>`. This is exactly the posture
 //! `docs/byo-oauth-clients.md` already documents for remote MCP servers.
 //!
-//! Endpoints come from [`OAUTH_PROVIDERS`], a static table confirmed against
-//! each provider's own documentation (the confirmation date and doc URL are
-//! recorded above every row), rather than from RFC 8414 discovery the way
-//! `mcp_oauth.rs` does — none of these providers publishes an authorization
-//! server metadata document at a URL this app could know in advance.
+//! Endpoints come from [`OAUTH_PROVIDERS`], a static table transcribed from
+//! each provider's own published documentation — the doc URL is cited above
+//! every row, and nothing in the table was re-verified against a live
+//! endpoint, so a row is only as current as the page it was read from. It is
+//! a table rather than RFC 8414 discovery the way `mcp_oauth.rs` does because
+//! none of these providers publishes an authorization server metadata
+//! document at a URL this app could know in advance.
 //!
 //! Everything about the browser round trip is *borrowed*, not copied, from
 //! `mcp_oauth.rs`: [`crate::mcp_oauth::LoopbackListener`] (via its
@@ -186,8 +188,9 @@ pub(crate) struct OAuthProviderSpec {
     /// Whether to send `code_challenge`/`code_challenge_method=S256`.
     pub pkce: bool,
     pub secret: SecretPolicy,
-    /// All eleven rows were confirmed to accept the IP-literal `127.0.0.1`
-    /// form on 2026-09-03. Kept per-row rather than hardcoded because
+    /// Every row records the IP-literal `127.0.0.1` form, which is the
+    /// loopback shape each provider's own documentation describes. Kept
+    /// per-row rather than hardcoded because
     /// `mcp_oauth` already had to special-case a provider that accepts only
     /// the literal `localhost`, and the next row here may be one too.
     redirect_host: &'static str,
@@ -195,11 +198,12 @@ pub(crate) struct OAuthProviderSpec {
     verify: VerifySpec,
 }
 
-/// The eleven providers, each confirmed against the provider's own current
-/// documentation on 2026-09-03. A row is only here because all five of
-/// authorize URL, token URL, PKCE support, client-secret policy and a
-/// loopback redirect were confirmed; anything that could not be confirmed is
-/// named as an exclusion in `docs/limitations.md` instead of guessed at.
+/// The eleven providers, each row transcribed from the provider's own
+/// published documentation (cited directly above it) and not re-verified
+/// against a live endpoint. A row is only here because all five of authorize
+/// URL, token URL, PKCE support, client-secret policy and a loopback redirect
+/// are documented; anything the documentation leaves open is named as an
+/// exclusion in `docs/limitations.md` instead of guessed at.
 const OAUTH_PROVIDERS: &[OAuthProviderSpec] = &[
     // Google — https://developers.google.com/identity/protocols/oauth2/native-app
     // `access_type=offline` + `prompt=consent` are what make Google issue a
@@ -389,10 +393,10 @@ const OAUTH_PROVIDERS: &[OAuthProviderSpec] = &[
     // Zendesk —
     // https://support.zendesk.com/hc/en-us/articles/4408845965210 and
     // https://developer.zendesk.com/api-reference/ticketing/oauth/oauth_tokens/
-    // PKCE is supported (and makes `client_secret` optional). An OAuth client
-    // created before 2026-04-30 issues a non-expiring token with no refresh
-    // token; newer ones expire and do refresh — both shapes are handled by
-    // `expires_at` being optional.
+    // PKCE is supported (and makes `client_secret` optional). Older Zendesk
+    // OAuth clients issue a non-expiring token with no refresh token; newer
+    // ones expire and do refresh — both shapes are handled by `expires_at`
+    // being optional.
     OAuthProviderSpec {
         provider: ConnectorProvider::Zendesk,
         authorize_url: "https://{host}/oauth/authorizations/new",
@@ -577,11 +581,37 @@ pub(crate) fn normalize_host(raw: &str) -> Result<String, String> {
     })
 }
 
+/// Validates a Microsoft directory — a tenant id (a GUID), a verified domain,
+/// or `common`. Unlike [`normalize_host`] this is a *path* segment, so a `?`,
+/// `#` or `/` would not just point somewhere else, it would reshape the URL's
+/// path and query. An ASCII allowlist is the whole check.
+pub(crate) fn normalize_tenant(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(format!(
+            "'{raw}' is not a Microsoft directory — use a tenant id, a verified domain, or 'common'"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 pub(crate) fn resolve_endpoints(
     spec: &OAuthProviderSpec,
     host: Option<&str>,
     tenant: &str,
 ) -> Result<ResolvedEndpoints, String> {
+    // Both values are spliced straight into four URL templates, and both are
+    // read back out of `connectors.json` — a file on disk this app does not
+    // own — on every refresh, reverify and revoke. Validating here rather
+    // than only where the user first typed them is what stops an edited
+    // catalog row reshaping a URL and sending the access token elsewhere.
+    let host = host.map(normalize_host).transpose()?;
+    let tenant = normalize_tenant(tenant)?;
+    let (host, tenant) = (host.as_deref(), tenant.as_str());
     let revoke = match spec.revoke {
         Some((method, url, _)) => Some((
             reqwest::Method::from_bytes(method.as_bytes())
@@ -641,6 +671,19 @@ fn authorize_url(
 /// Parses an RFC 6749 token response. A body with no `access_token` is an
 /// error that repeats the provider's own `error`/`error_description`, since
 /// that is the only part a user can act on.
+///
+/// RFC 6749 5.2 says a refused exchange is a 400, and a 400 never reaches
+/// here: `verified_call_with_body` turns any non-2xx into `Verification
+/// failed with HTTP <status>: <snippet>` — which still carries the provider's
+/// `error` string, in its body snippet. What this branch is for is the
+/// provider that answers 200 with an `error` field instead, which is common
+/// enough (Slack's whole API does it) to be worth naming rather than
+/// reporting as "no access_token".
+///
+/// `scope` is provider-supplied text that ends up in `connectors.json` and in
+/// CLI output, so an entry carrying control characters — which could forge
+/// lines or emit ANSI sequences in a terminal — is dropped rather than
+/// stored.
 fn parse_token_response(bytes: &[u8], now_ms: u64) -> Result<StoredTokens, String> {
     let json: Value = serde_json::from_slice(bytes)
         .map_err(|e| format!("The token endpoint returned a body that is not JSON: {e}"))?;
@@ -671,7 +714,7 @@ fn parse_token_response(bytes: &[u8], now_ms: u64) -> Result<StoredTokens, Strin
         .and_then(Value::as_str)
         .map(|raw| {
             raw.split([' ', ','])
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         })
@@ -696,17 +739,35 @@ const IDENTITY_MAX_CHARS: usize = 200;
 
 /// The first identity pointer that resolves to a non-empty string (or a
 /// number, stringified) wins.
+///
+/// A control character is refused outright rather than stripped. This string
+/// is written to `connectors.json` and printed raw by `monkey connectors
+/// list`, so a newline in it forges a line in the operator's terminal and an
+/// escape byte emits ANSI — the same reason `knowledge_pipeline`'s
+/// `EgressRule::UrlControlCharacters` treats one in a URL as an injection
+/// signal. Refusing fails the connect loudly; stripping would save an account
+/// under a name the provider never returned.
 fn identity_from(verify: &VerifySpec, body: &[u8]) -> Result<String, String> {
     let json: Value = serde_json::from_slice(body)
         .map_err(|e| format!("The identity endpoint returned a body that is not JSON: {e}"))?;
     for pointer in verify.identity_pointers {
         match json.pointer(pointer) {
-            Some(Value::String(value)) if !value.is_empty() => return Ok(truncated(value)),
-            Some(Value::Number(value)) => return Ok(truncated(&value.to_string())),
+            Some(Value::String(value)) if !value.is_empty() => return checked_identity(value),
+            Some(Value::Number(value)) => return checked_identity(&value.to_string()),
             _ => {}
         }
     }
     Err("The provider accepted the token but returned no identity".to_string())
+}
+
+fn checked_identity(value: &str) -> Result<String, String> {
+    if value.chars().any(char::is_control) {
+        return Err(
+            "The provider returned an identity containing control characters — refusing it"
+                .to_string(),
+        );
+    }
+    Ok(truncated(value))
 }
 
 /// Char-boundary-safe truncation to [`IDENTITY_MAX_CHARS`].
@@ -862,9 +923,16 @@ async fn verify_identity(
 /// Best-effort revocation. Every caller ignores the result: a provider that
 /// publishes no endpoint, a network failure, or an already-dead token must
 /// never stop the user removing an account.
+///
+/// The form-body providers (Google, Asana, Box, Discord, GitLab) are sent the
+/// **refresh** token when there is one. All five accept either token in that
+/// field, and revoking the refresh token kills the whole grant rather than
+/// one short-lived access token — which matters because the usual moment to
+/// remove an account is long after its access token expired.
 async fn revoke(
     spec: &OAuthProviderSpec,
     endpoints: &ResolvedEndpoints,
+    allow_loopback: bool,
     client: &ClientRegistration,
     tokens: &StoredTokens,
 ) -> Result<(), String> {
@@ -874,14 +942,17 @@ async fn revoke(
     let origin = crate::connectors::origin_of(url)?;
     match body_kind {
         RevokeBody::FormToken => {
-            let mut pairs: Vec<(&'static str, String)> =
-                vec![("token", tokens.access_token.clone())];
+            let token = tokens
+                .refresh_token
+                .as_deref()
+                .unwrap_or(&tokens.access_token);
+            let mut pairs: Vec<(&'static str, String)> = vec![("token", token.to_string())];
             client_form_fields(spec, client, &mut pairs);
             crate::connectors::verified_call_with_body(
                 method.clone(),
                 url,
                 &origin,
-                false,
+                allow_loopback,
                 &[],
                 None,
                 RequestBody::Form(&pairs),
@@ -893,7 +964,7 @@ async fn revoke(
                 method.clone(),
                 url,
                 &origin,
-                false,
+                allow_loopback,
                 &[("authorization", format!("Bearer {}", tokens.access_token))],
                 None,
                 RequestBody::None,
@@ -994,6 +1065,27 @@ fn refuse_client_id_swap(
     ))
 }
 
+/// The registration a connect attempt will actually use.
+///
+/// A pasted client id with the secret box left blank is the case that matters:
+/// `persist` overwrites the one shared registration, so writing
+/// `client_secret: None` over a stored secret would break every existing
+/// account of that provider on its next refresh. It goes unnoticed for the
+/// four `SecretPolicy::Optional` providers, whose PKCE exchange succeeds
+/// without a secret, so nothing fails before the overwrite. The panel and
+/// `docs/byo-oauth-clients.md` both say a blank field reuses what is saved;
+/// this is where that is true.
+fn merge_client(
+    stored: Option<ClientRegistration>,
+    mut pasted: ClientRegistration,
+) -> ClientRegistration {
+    if pasted.client_secret.is_none() {
+        let same_registration = stored.filter(|s| s.client_id == pasted.client_id);
+        pasted.client_secret = same_registration.and_then(|s| s.client_secret);
+    }
+    pasted
+}
+
 /// Returns whether the registration was actually forgotten — false when the
 /// provider still has an account, or when the catalog could not be read (in
 /// which case the safe answer is to keep the registration).
@@ -1029,7 +1121,10 @@ fn connection_metadata(
     }
 }
 
-/// Reads back the host/tenant an account was saved with.
+/// Reads back the host/tenant an account was saved with. Untrusted: this is
+/// whatever `connectors.json` currently holds, not necessarily what
+/// `connect_inner` validated. [`resolve_endpoints`] re-validates both before
+/// either reaches a URL — every caller here goes straight there.
 fn account_host_and_tenant(
     spec: &OAuthProviderSpec,
     account: &ConnectorAccount,
@@ -1171,6 +1266,14 @@ pub(crate) async fn verify_account(
 /// Revokes an account at the provider, if the provider publishes an endpoint
 /// this app can call. Failures are swallowed on purpose: removal must succeed
 /// regardless.
+///
+/// The stored access token is refreshed first when it has expired. Removal is
+/// normally days or weeks after the connect, and every provider here but
+/// Zendesk's older clients issues an access token that lives about an hour —
+/// so without this the bearer-token endpoints (Linear, Dropbox, Zendesk)
+/// would be handed a dead token and revoke nothing at all. A refresh that
+/// fails is ignored: the stale token is still tried, and nothing stops the
+/// removal either way.
 pub async fn revoke_and_forget(account: &ConnectorAccount) {
     let Some(spec) = spec_for(account.provider) else {
         return;
@@ -1185,7 +1288,15 @@ pub async fn revoke_and_forget(account: &ConnectorAccount) {
     ) else {
         return;
     };
-    let _ = revoke(spec, &endpoints, &client, &tokens).await;
+    let tokens = match crate::run_commands::unix_time_ms() {
+        Ok(now) => refresh_if_expired(spec, &endpoints, false, &client, &tokens, now)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(tokens),
+        Err(_) => tokens,
+    };
+    let _ = revoke(spec, &endpoints, false, &client, &tokens).await;
 }
 
 // --- the connect state machine ---------------------------------------------
@@ -1430,7 +1541,7 @@ async fn connect_inner(
             // that names consent rather than the real cause — so refuse here,
             // before the browser is opened, not after.
             refuse_client_id_swap(&config_path, provider, stored.as_ref(), &pasted)?;
-            pasted
+            merge_client(stored, pasted)
         }
         // The `needs_client_id` phase is emitted by the caller's terminal
         // match, so this arm just names the condition.
@@ -1586,6 +1697,16 @@ mod tests {
     /// `mcp_oauth::tests::spawn_fake_oauth_server`'s hand-rolled idiom — no
     /// mocking crate, no real network.
     fn spawn_fixture(responses: Vec<String>) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+        spawn_fixture_status(responses.into_iter().map(|body| (200, body)).collect())
+    }
+
+    /// [`spawn_fixture`] with the HTTP status spelled out, for the paths where
+    /// the status is the behaviour under test — RFC 6749 5.2 makes a refused
+    /// token exchange a 400, and `verified_call_with_body` turns any non-2xx
+    /// into its own message before a body is ever parsed.
+    fn spawn_fixture_status(
+        responses: Vec<(u16, String)>,
+    ) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
         let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind fixture");
         let addr = listener.local_addr().unwrap();
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1602,9 +1723,9 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(String::from_utf8_lossy(&buf[..n]).to_string());
-                let body = remaining.next().unwrap_or_else(|| "{}".to_string());
+                let (status, body) = remaining.next().unwrap_or((200, "{}".to_string()));
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
@@ -2309,8 +2430,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_refresh_returns_a_reconnect_error_and_leaves_the_record_untouched() {
-        let (addr, _) = spawn_fixture(vec![json_ok(
-            r#"{"error":"invalid_grant","error_description":"revoked"}"#,
+        // The shape RFC 6749 5.2 mandates, and the one users actually hit: a
+        // 400. `verified_call_with_body` reports the status and the body
+        // snippet, so the provider's own `invalid_grant` still reaches the
+        // message even though `parse_token_response` never sees the body.
+        let (addr, _) = spawn_fixture_status(vec![(
+            400,
+            r#"{"error":"invalid_grant","error_description":"revoked"}"#.to_string(),
         )]);
         let stored = tokens_expiring_at(Some(0), Some("rt-old"));
         let error = refresh_if_expired(
@@ -2324,10 +2450,30 @@ mod tests {
         .await
         .expect_err("must fail");
         assert!(is_reconnect_error(&error), "{error}");
+        assert!(error.contains("400"), "{error}");
         assert!(error.contains("invalid_grant"), "{error}");
         // The caller was handed an error, never a replacement record.
         assert_eq!(stored.access_token, "old-access");
         assert_eq!(stored.refresh_token.as_deref(), Some("rt-old"));
+
+        // And the other shape, which is what `parse_token_response`'s error
+        // branch is for: HTTP 200 with an `error` field in the body.
+        let (addr, _) = spawn_fixture(vec![json_ok(
+            r#"{"error":"invalid_grant","error_description":"revoked"}"#,
+        )]);
+        let error = refresh_if_expired(
+            spec(ConnectorProvider::Linear),
+            &endpoints_at(addr),
+            true,
+            &test_client(),
+            &stored,
+            1_000,
+        )
+        .await
+        .expect_err("must fail");
+        assert!(is_reconnect_error(&error), "{error}");
+        assert!(error.contains("refused the exchange"), "{error}");
+        assert!(error.contains("revoked"), "{error}");
     }
 
     #[tokio::test]
@@ -2531,5 +2677,130 @@ mod tests {
         let body = serde_json::to_vec(&serde_json::json!({ "name": long })).unwrap();
         let identity = identity_from(&verify, &body).unwrap();
         assert_eq!(identity.chars().count(), IDENTITY_MAX_CHARS);
+
+        // A newline would forge a line in `monkey connectors list`, and an
+        // escape byte would emit ANSI there. Both are refused, not stripped.
+        for hostile in [
+            "ada\n    → reconnect this account in Settings",
+            "ada\u{1b}[2K",
+            "ada\u{0}",
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({ "name": hostile })).unwrap();
+            let error = identity_from(&verify, &body).expect_err("must refuse");
+            assert!(error.contains("control characters"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_scope_string_carrying_control_characters_is_dropped_rather_than_stored() {
+        let tokens = parse_token_response(
+            b"{\"access_token\":\"at\",\"scope\":\"read ada\\u001b[2K write\"}",
+            0,
+        )
+        .unwrap();
+        assert_eq!(tokens.scopes, vec!["read", "write"]);
+    }
+
+    #[test]
+    fn a_blank_secret_box_with_the_same_client_id_keeps_the_stored_secret() {
+        let stored = ClientRegistration {
+            client_id: "app-1".to_string(),
+            client_secret: Some("kept".to_string()),
+        };
+        let blank = |id: &str| ClientRegistration {
+            client_id: id.to_string(),
+            client_secret: None,
+        };
+        // Same id, nothing pasted: the saved secret survives, which is what
+        // the card's "leave it blank to reuse" copy promises.
+        assert_eq!(
+            merge_client(Some(stored.clone()), blank("app-1")).client_secret,
+            Some("kept".to_string())
+        );
+        // A different id is a different registration; there is nothing of its
+        // own to inherit. (`refuse_client_id_swap` is what stops this
+        // overwriting a registration accounts still depend on.)
+        assert_eq!(
+            merge_client(Some(stored.clone()), blank("app-2")).client_secret,
+            None
+        );
+        // A pasted secret replaces the stored one — that is a rotation.
+        let rotated = ClientRegistration {
+            client_id: "app-1".to_string(),
+            client_secret: Some("new".to_string()),
+        };
+        assert_eq!(
+            merge_client(Some(stored), rotated).client_secret,
+            Some("new".to_string())
+        );
+        assert_eq!(merge_client(None, blank("app-1")).client_secret, None);
+    }
+
+    #[tokio::test]
+    async fn form_revocation_sends_the_refresh_token_so_the_whole_grant_dies() {
+        let (addr, seen) = spawn_fixture(vec![json_ok("{}")]);
+        let mut endpoints = endpoints_at(addr);
+        endpoints.revoke = Some((
+            reqwest::Method::POST,
+            Url::parse(&format!("http://{addr}/revoke")).unwrap(),
+        ));
+        // An account removed a week after it was connected: the access token
+        // is long dead, the refresh token is what still kills the grant.
+        revoke(
+            spec(ConnectorProvider::GoogleDrive),
+            &endpoints,
+            true,
+            &test_client(),
+            &tokens_expiring_at(Some(0), Some("rt-old")),
+        )
+        .await
+        .unwrap();
+        let sent = seen.lock().unwrap()[0].clone();
+        assert!(sent.contains("token=rt-old"), "{sent}");
+        assert!(!sent.contains("old-access"), "{sent}");
+
+        // With no refresh token there is only the access token to send.
+        let (addr, seen) = spawn_fixture(vec![json_ok("{}")]);
+        let mut endpoints = endpoints_at(addr);
+        endpoints.revoke = Some((
+            reqwest::Method::POST,
+            Url::parse(&format!("http://{addr}/revoke")).unwrap(),
+        ));
+        revoke(
+            spec(ConnectorProvider::GoogleDrive),
+            &endpoints,
+            true,
+            &test_client(),
+            &tokens_expiring_at(Some(0), None),
+        )
+        .await
+        .unwrap();
+        assert!(seen.lock().unwrap()[0].contains("token=old-access"));
+    }
+
+    #[test]
+    fn a_host_or_tenant_read_back_from_the_catalog_is_re_validated_before_it_reaches_a_url() {
+        // `connectors.json` is a file on disk this app does not own, so the
+        // value `account_host_and_tenant` hands back was not necessarily the
+        // one `connect_inner` validated.
+        for bad in [
+            "evil.test/x?a=",
+            "evil.test/api",
+            "http://evil.test",
+            "user:pw@evil.test",
+        ] {
+            assert!(
+                resolve_endpoints(spec(ConnectorProvider::Gitlab), Some(bad), "common").is_err(),
+                "{bad} must be refused"
+            );
+        }
+        for bad in ["contoso?x=", "contoso/evil", "contoso#f", "", "  "] {
+            assert!(
+                resolve_endpoints(spec(ConnectorProvider::MicrosoftGraph), None, bad).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        assert_eq!(normalize_tenant(" common ").unwrap(), "common");
+        assert!(normalize_tenant("contoso.onmicrosoft.com").is_ok());
     }
 }
