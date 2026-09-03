@@ -142,8 +142,11 @@ export async function unmergeMemories(id: string, projectRoot: string | null): P
 }
 
 /** Permanently delete every expired memory, in *every* scope — not just the
- * scope currently being filtered. Merge-retired originals are never purged;
- * they are what makes a merge undoable. Resolves to the number removed. */
+ * scope currently being filtered. A merge-retired original is never purged on
+ * its own — it is what makes a merge undoable — but purging an *expired
+ * merged* memory takes its retired originals with it, the same cascade a
+ * delete does. Resolves to the number of expired memories removed, which does
+ * not count the rows that cascade removed. */
 export async function purgeExpiredMemories(): Promise<number> {
   return invoke("memory_studio_purge_expired");
 }
