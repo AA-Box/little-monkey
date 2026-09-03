@@ -3,9 +3,26 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
+  // The store registers its `connector-oauth://status` listener behind this,
+  // same as `mcpStore.ts` does for its own events.
+  isTauri: () => true,
 }));
 
-import { useConnectorsStore, type ConnectorAccount } from "./connectorsStore";
+// `vi.hoisted` because `vi.mock`'s factory is hoisted above module-scope
+// consts — the same reason mcpStore's own event test does this.
+const eventHandlers = vi.hoisted(() => new Map<string, (event: { payload: unknown }) => void>());
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: (name: string, handler: (event: { payload: unknown }) => void) => {
+    eventHandlers.set(name, handler);
+    return Promise.resolve(() => {});
+  },
+}));
+
+import {
+  useConnectorsStore,
+  type ConnectorAccount,
+  type ConnectorOAuthStatus,
+} from "./connectorsStore";
 
 const account: ConnectorAccount = {
   id: "acct-1",
@@ -22,7 +39,7 @@ const account: ConnectorAccount = {
 
 beforeEach(() => {
   invokeMock.mockReset();
-  useConnectorsStore.setState({ accounts: [], loading: false, error: null });
+  useConnectorsStore.setState({ accounts: [], loading: false, error: null, oauthStatus: {} });
 });
 
 describe("connectorsStore", () => {
@@ -156,5 +173,76 @@ describe("connectorsStore", () => {
     await stalePromise;
 
     expect(useConnectorsStore.getState().accounts).toEqual([freshAccount]);
+  });
+
+  it("sends the snake_case payload connectors_oauth_connect expects, and keeps the client secret out of store state", async () => {
+    const gitlabAccount: ConnectorAccount = {
+      ...account,
+      id: "acct-gl",
+      provider: "gitlab",
+      credential_ref: "connector-oauth:acct-gl",
+      connection: { host: "gitlab.example.com" },
+    };
+    invokeMock.mockResolvedValueOnce(gitlabAccount).mockResolvedValueOnce([gitlabAccount]);
+
+    await useConnectorsStore.getState().oauthConnect({
+      provider: "gitlab",
+      label: "Work GitLab",
+      host: "gitlab.example.com",
+      clientId: "client-abc",
+      clientSecret: "shhh-secret",
+    });
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "connectors_oauth_connect", {
+      provider: "gitlab",
+      label: "Work GitLab",
+      host: "gitlab.example.com",
+      client_id: "client-abc",
+      client_secret: "shhh-secret",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "connectors_list");
+    const state = JSON.stringify(useConnectorsStore.getState());
+    expect(state).not.toContain("shhh-secret");
+    expect(state).not.toContain("client-abc");
+  });
+
+  it("normalises an omitted host and client secret to null", async () => {
+    invokeMock.mockResolvedValueOnce(account).mockResolvedValueOnce([account]);
+    await useConnectorsStore.getState().oauthConnect({ provider: "linear", label: "Linear" });
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "connectors_oauth_connect", {
+      provider: "linear",
+      label: "Linear",
+      host: null,
+      client_id: null,
+      client_secret: null,
+    });
+  });
+
+  it("passes the provider through to connectors_oauth_redirect_uri and connectors_oauth_cancel", async () => {
+    invokeMock.mockResolvedValueOnce("http://127.0.0.1:52001/");
+    await expect(useConnectorsStore.getState().oauthRedirectUri("asana")).resolves.toBe(
+      "http://127.0.0.1:52001/",
+    );
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "connectors_oauth_redirect_uri", { provider: "asana" });
+
+    invokeMock.mockResolvedValueOnce(undefined);
+    await useConnectorsStore.getState().oauthCancel("asana");
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "connectors_oauth_cancel", { provider: "asana" });
+  });
+
+  it("updates oauthStatus keyed by provider from connector-oauth://status events", () => {
+    const handler = eventHandlers.get("connector-oauth://status");
+    expect(handler).toBeDefined();
+
+    handler!({ payload: { provider: "dropbox", phase: "verifying", error: null } });
+    expect(useConnectorsStore.getState().oauthStatus.dropbox).toEqual<ConnectorOAuthStatus>({
+      phase: "verifying",
+      error: null,
+    });
+
+    handler!({ payload: { provider: "dropbox", phase: "connected", error: null } });
+    expect(useConnectorsStore.getState().oauthStatus.dropbox?.phase).toBe("connected");
+    // Another provider's card is untouched.
+    expect(useConnectorsStore.getState().oauthStatus.linear).toBeUndefined();
   });
 });
