@@ -2709,6 +2709,29 @@ mod tests {
         assert!(error.contains("connector_oauth::access_token"), "{error}");
     }
 
+    #[test]
+    fn stored_tokens_survive_a_keychain_round_trip() {
+        // The token namespace is per account id, so a unique one touches
+        // nothing a real install owns. What this catches is a field renamed
+        // on `StoredTokens`: its `Debug` is hand-written to redact the
+        // tokens, so a serde drift would otherwise be silent.
+        let id = unique_id("round-trip");
+        let tokens = StoredTokens {
+            access_token: "at".to_string(),
+            refresh_token: Some("rt".to_string()),
+            expires_at: Some(1_700_000_000_000),
+            scopes: vec!["read".to_string(), "profile".to_string()],
+        };
+        save_tokens(&id, &tokens).expect("save");
+        let read = load_tokens(&id).expect("load");
+        assert_eq!(read.access_token, "at");
+        assert_eq!(read.refresh_token.as_deref(), Some("rt"));
+        assert_eq!(read.expires_at, Some(1_700_000_000_000));
+        assert_eq!(read.scopes, vec!["read", "profile"]);
+        delete_tokens(&id);
+        assert!(load_tokens(&id).is_err(), "the entry must be gone");
+    }
+
     #[tokio::test]
     async fn revocation_failure_does_not_block_removal() {
         // No stored tokens and no stored client for this id, so every branch

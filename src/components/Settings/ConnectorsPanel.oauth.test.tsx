@@ -64,6 +64,35 @@ describe("OAuth connect card", () => {
     expect((connect as HTMLButtonElement).disabled).toBe(false);
   });
 
+  it("keeps Connect disabled until a provider with no default host has one", () => {
+    // Zendesk's row is `ApiHost { default: None }` in connector_oauth.rs, so a
+    // blank host is refused by the backend. Catching it in the form keeps the
+    // failure out of the red status pill.
+    const required = OAUTH_PROVIDERS.filter((p) => p.hostRequired).map((p) => p.provider);
+    expect(required).toEqual(["zendesk"]);
+    card("zendesk");
+    const connect = screen
+      .getAllByRole("button")
+      .find((button) => button.textContent?.includes("Connect")) as HTMLButtonElement;
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    const type = (input: HTMLInputElement, value: string) => {
+      setter?.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    const inputs = document.querySelectorAll('input[type="text"]');
+    type(inputs[0] as HTMLInputElement, "Support");
+    expect(connect.disabled).toBe(true);
+    type(inputs[1] as HTMLInputElement, "acme.zendesk.com");
+    expect(connect.disabled).toBe(false);
+  });
+
+  it("labels every field for a screen reader, not only with a placeholder", () => {
+    card("gitlab");
+    for (const input of document.querySelectorAll("input")) {
+      expect(input.getAttribute("aria-label"), input.getAttribute("placeholder") ?? "").toBeTruthy();
+    }
+  });
+
   it("treats needs_client_id as a terminal phase, so Connect becomes usable again", () => {
     expect(CONNECTOR_OAUTH_DONE).toContain("needs_client_id");
     expect(CONNECTOR_OAUTH_DONE).not.toContain("waiting_for_browser");
