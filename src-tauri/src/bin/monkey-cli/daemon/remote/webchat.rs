@@ -58,7 +58,6 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::header::{CACHE_CONTROL, CONTENT_TYPE};
 use hyper::{Response, StatusCode};
-use ring::rand::SecureRandom;
 
 use crate::daemon::adapters::webchat::{visitor_conversation_id, WebChatAdapter};
 use crate::daemon::channel_adapter::AdapterConfig;
@@ -220,10 +219,12 @@ fn visitor_key(paths: &DaemonPaths) -> Result<ring::hmac::Key, String> {
         Err(_) => {}
     }
     paths.ensure()?;
-    let mut fresh = [0u8; 32];
-    ring::rand::SystemRandom::new()
-        .fill(&mut fresh)
-        .map_err(|_| "Could not generate a web chat visitor key".to_string())?;
+    // Generated as a value rather than filled into a zeroed buffer: the buffer
+    // form reads — to a human and to a static analyser alike — as a hard-coded
+    // key that something happens to overwrite.
+    let fresh = ring::rand::generate::<[u8; 32]>(&ring::rand::SystemRandom::new())
+        .map_err(|_| "Could not generate a web chat visitor key".to_string())?
+        .expose();
     // `create_new`, so two connections racing on the first request cannot end
     // up with two different keys: the loser re-reads the winner's.
     match std::fs::OpenOptions::new()
@@ -268,10 +269,11 @@ fn tag(key: &ring::hmac::Key, account_id: &str, nonce: &[u8]) -> [u8; 16] {
 }
 
 pub(crate) fn mint_visitor(key: &ring::hmac::Key, account_id: &str) -> Result<String, String> {
-    let mut nonce = [0u8; 16];
-    ring::rand::SystemRandom::new()
-        .fill(&mut nonce)
-        .map_err(|_| "Could not generate a visitor identifier".to_string())?;
+    // Same reason as the key above: nothing here is ever a zero nonce, and the
+    // shape should not be able to suggest one.
+    let nonce = ring::rand::generate::<[u8; 16]>(&ring::rand::SystemRandom::new())
+        .map_err(|_| "Could not generate a visitor identifier".to_string())?
+        .expose();
     let mut raw = [0u8; 32];
     raw[..16].copy_from_slice(&nonce);
     raw[16..].copy_from_slice(&tag(key, account_id, &nonce));
