@@ -124,6 +124,11 @@ monkey extensions publish <dir> --snapshot <index.json> --registry-root <dir> --
 
 monkey providers set-key <id>    # key arrives on stdin, never in a process listing
 
+monkey connectors list [--json]           # id, provider, label, identity, last verification
+monkey connectors reverify <id> [--json]  # re-runs the live check; refreshes an OAuth token first
+monkey connectors remove <id>             # best-effort revoke where the provider publishes an endpoint, then deletes
+# Connecting a new OAuth account is desktop-only: consent opens a system browser.
+
 monkey plugins list [--json]
 monkey plugins health [--json]
 monkey security audit [--deep] [--fix] [--json]
