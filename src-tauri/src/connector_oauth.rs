@@ -1370,15 +1370,10 @@ async fn connect_inner(
     });
     let client = match pasted {
         Some(client) => client,
-        None => load_client(provider)?.ok_or_else(|| {
-            emit_progress(
-                app,
-                provider,
-                "needs_client_id",
-                Some(CONNECTOR_CLIENT_ID_REQUIRED_MESSAGE.to_string()),
-            );
-            CONNECTOR_CLIENT_ID_REQUIRED_MESSAGE.to_string()
-        })?,
+        // The `needs_client_id` phase is emitted by the caller's terminal
+        // match, so this arm just names the condition.
+        None => load_client(provider)?
+            .ok_or_else(|| CONNECTOR_CLIENT_ID_REQUIRED_MESSAGE.to_string())?,
     };
     if spec.secret == SecretPolicy::Required && client.client_secret.is_none() {
         return Err(format!(
