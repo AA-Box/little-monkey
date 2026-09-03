@@ -231,9 +231,11 @@ so it is the same string for every account of that provider and never changes:
 | GitLab | optional | instance host, defaults to `gitlab.com` |
 
 Leave the secret blank for a public PKCE client — sending an empty secret is not
-the same request as sending none, and the app treats a blank field as "none".
-Microsoft Graph is the one provider with no secret field at all; every other card
-shows one.
+the same request as sending none, and the app sends none. If a secret is already
+saved against the *same* client id, a blank field keeps it rather than erasing
+it, since that one registration is what every existing account of the provider
+refreshes against. Microsoft Graph is the one provider with no secret field at
+all; every other card shows one.
 
 The client id and secret are saved in your keychain per *provider*, so the second
 account of the same provider only needs a label: leave both fields blank and the
