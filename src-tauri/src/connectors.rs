@@ -20,17 +20,29 @@
 //! `ConnectorAccount::connection` is the one exception worth calling out: it
 //! holds non-secret provider metadata an account needs to re-verify or (in a
 //! later ROADMAP stage) actually call its API again — Jira's site URL/email,
-//! or S3's endpoint/bucket/region/access key. This is a deliberate, narrow
+//! S3's endpoint/bucket/region/access key, a GitLab or Zendesk instance
+//! `host`, or a Microsoft `tenant`. This is a deliberate, narrow
 //! extension beyond a bare id/label/scopes shape, mirroring exactly what
 //! `knowledge_service.rs`'s `ConnectorConfig::WebDav` already does (storing
 //! `url`/`username` alongside a `credential_ref`, never the password).
 //!
-//! Non-goals, explicitly: GitHub, Slack, Notion, and Jira all offer a "real"
-//! OAuth app flow instead of the token schemes above — none of that is built
-//! here, by design (see the top-level task brief). Google Drive, SharePoint/
-//! Graph, and anything else that genuinely requires a registered OAuth app
-//! with a redirect URI are out of scope for this catalog entirely; they are
-//! not faked with a token workaround.
+//! The catalog holds seventeen providers across five credential schemes: one
+//! `gh`-CLI bridge (GitHub), three pasted tokens (Slack, Notion, Jira —
+//! which covers Confluence Cloud on the same Atlassian API-token scheme),
+//! one access-key pair (S3/R2), one extension-backed account, and eleven
+//! authorization-code OAuth providers. The OAuth half lives entirely in
+//! [`crate::connector_oauth`]: it ships no OAuth client credentials of its
+//! own (this is a public binary — anything baked in would be extractable),
+//! so the user registers their own OAuth app once per provider against a
+//! fixed loopback redirect URI.
+//!
+//! Boundaries worth stating, because they are choices rather than gaps:
+//! GitHub, Slack and Notion keep their `gh`/token schemes rather than
+//! growing a second OAuth path, which would strand accounts already saved.
+//! Trello has no authorization-code flow at all (OAuth 1.0a only), so it is
+//! absent rather than faked with a key+token scheme. Confluence stays
+//! covered by the `Jira` variant, so there is no separate Atlassian 3LO
+//! provider double-covering the same sites.
 //!
 //! Every outbound verification call goes through [`verified_call`]: DNS is
 //! resolved once and pinned to the exact socket the TLS/TCP connection uses
@@ -89,6 +101,33 @@ pub enum ConnectorProvider {
     Notion,
     Jira,
     S3,
+    /// Google Drive over authorization-code OAuth — proves which Google
+    /// account consented and that Drive metadata is readable.
+    GoogleDrive,
+    /// Microsoft Graph (SharePoint/OneDrive/Teams files) over
+    /// authorization-code OAuth — proves the signed-in work account.
+    MicrosoftGraph,
+    /// Linear over authorization-code OAuth — proves the Linear viewer.
+    Linear,
+    /// Asana over authorization-code OAuth — proves the Asana user.
+    Asana,
+    /// Dropbox over authorization-code OAuth — proves the Dropbox account.
+    Dropbox,
+    /// Box over authorization-code OAuth — proves the Box login. Box scopes
+    /// are configured on the app itself, not requested per authorization.
+    Box,
+    /// Airtable over authorization-code OAuth (PKCE is mandatory there).
+    Airtable,
+    /// Zendesk over authorization-code OAuth against the user's own
+    /// subdomain, recorded as `connection.host`.
+    Zendesk,
+    /// HubSpot over authorization-code OAuth — proves which portal consented.
+    Hubspot,
+    /// Discord over authorization-code OAuth — proves the Discord user.
+    Discord,
+    /// GitLab over authorization-code OAuth against gitlab.com or a
+    /// self-hosted instance recorded as `connection.host`.
+    Gitlab,
     /// A sandboxed executable extension supplies the documents. The account
     /// holds no credential of its own: the extension authenticates from
     /// inside the sandbox through the secret slots it declared and the user
@@ -98,13 +137,24 @@ pub enum ConnectorProvider {
 }
 
 impl ConnectorProvider {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             ConnectorProvider::Github => "github",
             ConnectorProvider::Slack => "slack",
             ConnectorProvider::Notion => "notion",
             ConnectorProvider::Jira => "jira",
             ConnectorProvider::S3 => "s3",
+            ConnectorProvider::GoogleDrive => "google_drive",
+            ConnectorProvider::MicrosoftGraph => "microsoft_graph",
+            ConnectorProvider::Linear => "linear",
+            ConnectorProvider::Asana => "asana",
+            ConnectorProvider::Dropbox => "dropbox",
+            ConnectorProvider::Box => "box",
+            ConnectorProvider::Airtable => "airtable",
+            ConnectorProvider::Zendesk => "zendesk",
+            ConnectorProvider::Hubspot => "hubspot",
+            ConnectorProvider::Discord => "discord",
+            ConnectorProvider::Gitlab => "gitlab",
             ConnectorProvider::Extension => "extension",
         }
     }
@@ -284,6 +334,52 @@ pub(crate) async fn verified_call(
     basic_auth: Option<(&str, &str)>,
     json_body: Option<&Value>,
 ) -> Result<Vec<u8>, String> {
+    verified_call_with_body(
+        method,
+        url,
+        allowed_origin,
+        allow_loopback,
+        headers,
+        basic_auth,
+        json_body.map_or(RequestBody::None, RequestBody::Json),
+    )
+    .await
+}
+
+/// What one [`verified_call_with_body`] sends as a request body.
+///
+/// `Form` exists for the OAuth token/refresh/revoke endpoints
+/// (`connector_oauth.rs`), which are `application/x-www-form-urlencoded` by
+/// spec (RFC 6749 4.1.3) rather than JSON.
+pub(crate) enum RequestBody<'a> {
+    None,
+    Json(&'a Value),
+    Form(&'a [(&'a str, String)]),
+}
+
+/// [`verified_call`] with the body shape spelled out — same SSRF hardening,
+/// same size/redirect/timeout bounds, and the same run-scope caveat.
+///
+/// # Why the run scope is entered here
+///
+/// Identical to [`verified_call`]'s: this is a `scoped`, so it *shadows* an
+/// outer scope. Every caller — the thirteen connector/triage ones through
+/// [`verified_call`], plus `connector_oauth.rs`'s code exchange, refresh,
+/// revoke and identity verification — is a person clicking something in
+/// Settings (connect, reverify, remove), so
+/// [`crate::run_scope::Unattributed::UserAction`] is honest for all of them.
+/// `connectors::read_credential` refuses an OAuth account precisely so a
+/// durable run can never drive a token refresh through here and have its
+/// egress silently relabelled as a user action.
+pub(crate) async fn verified_call_with_body(
+    method: reqwest::Method,
+    url: &Url,
+    allowed_origin: &str,
+    allow_loopback: bool,
+    headers: &[(&'static str, String)],
+    basic_auth: Option<(&str, &str)>,
+    body: RequestBody<'_>,
+) -> Result<Vec<u8>, String> {
     crate::run_scope::scoped(
         crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
         verified_call_within_scope(
@@ -293,7 +389,7 @@ pub(crate) async fn verified_call(
             allow_loopback,
             headers,
             basic_auth,
-            json_body,
+            body,
         ),
     )
     .await
@@ -312,7 +408,7 @@ async fn verified_call_within_scope(
     allow_loopback: bool,
     headers: &[(&'static str, String)],
     basic_auth: Option<(&str, &str)>,
-    json_body: Option<&Value>,
+    body: RequestBody<'_>,
 ) -> Result<Vec<u8>, String> {
     let policy =
         crate::knowledge_pipeline::UrlSourcePolicy::new([allowed_origin], allow_loopback, false)
@@ -344,8 +440,10 @@ async fn verified_call_within_scope(
     if let Some((username, password)) = basic_auth {
         request = request.basic_auth(username, Some(password));
     }
-    if let Some(body) = json_body {
-        request = request.json(body);
+    match body {
+        RequestBody::None => {}
+        RequestBody::Json(value) => request = request.json(value),
+        RequestBody::Form(pairs) => request = request.form(pairs),
     }
 
     let response = crate::egress::send(request)
@@ -720,6 +818,18 @@ pub fn credential_for_account(account: &ConnectorAccount) -> Result<String, Stri
 }
 
 pub(crate) fn read_credential(account: &ConnectorAccount) -> Result<String, String> {
+    // An OAuth account's keychain entry holds a token *record* (access token,
+    // refresh token, expiry), not a bearer credential, and reading it raw
+    // would skip the refresh. Refusing here also keeps a durable run
+    // (knowledge sync, triage) from triggering a refresh inside
+    // `verified_call`'s `Unattributed::UserAction` scope and mislabelling
+    // that run's egress — see `verified_call_with_body`'s run-scope note.
+    if crate::connector_oauth::spec_for(account.provider).is_some() {
+        return Err(format!(
+            "'{}' is an OAuth account — read its token through connector_oauth::access_token, which refreshes it",
+            account.id
+        ));
+    }
     let credential_ref = account
         .credential_ref
         .as_deref()
@@ -905,6 +1015,18 @@ async fn verify_token(
         ConnectorProvider::S3 => {
             Err("S3 connects via connectors_add_s3, not a pasted token".to_string())
         }
+        // Every provider with an entry in `connector_oauth::OAUTH_PROVIDERS`
+        // needs a registered OAuth app and a browser consent step; there is
+        // no pasted-token shape for them that would be anything but a
+        // workaround, so this path refuses rather than inventing one.
+        provider if crate::connector_oauth::spec_for(provider).is_some() => Err(format!(
+            "{} connects over OAuth — use connectors_oauth_connect instead of a pasted token",
+            provider.as_str()
+        )),
+        other => Err(format!(
+            "{} does not support a pasted token",
+            other.as_str()
+        )),
     }
 }
 
@@ -1247,8 +1369,33 @@ fn remove_impl(state: &AppState, path: &Path, id: &str) -> Result<(), String> {
 /// keychain secret. Removing an unknown id is a no-op success, not an error
 /// — the caller's desired end state (the account is gone) already holds.
 #[tauri::command]
-pub fn connectors_remove(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-    remove_impl(state.inner(), &config_file_path()?, &id)
+pub async fn connectors_remove(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let path = config_file_path()?;
+    // Best-effort revocation happens *before* `remove_impl`, and outside it:
+    // `remove_impl` holds `connectors_config_lock` (a `std::sync::Mutex`) for
+    // its whole body, so an `.await` inside would make this future non-`Send`.
+    // A provider that publishes no callable revocation endpoint, or a network
+    // failure, must never block the user from removing the account.
+    let removed = load_config_impl(&path)?
+        .accounts
+        .into_iter()
+        .find(|account| account.id == id);
+    if let Some(account) = &removed {
+        crate::connector_oauth::revoke_and_forget(account).await;
+    }
+    remove_impl(state.inner(), &path, &id)?;
+    // The per-provider client registration (id + secret) is shared by every
+    // account of that provider, so it is only cleared once the last one is
+    // gone — otherwise disconnecting one Google account would send the other
+    // back to the Google console. Best-effort, same stance as the keychain
+    // cleanup in `remove_impl`.
+    if let Some(account) = &removed {
+        crate::connector_oauth::forget_client_if_unused(&path, account.provider);
+    }
+    Ok(())
 }
 
 /// Core logic behind `reverify_impl`'s GitHub branch, parameterized by the
@@ -1328,6 +1475,22 @@ async fn reverify_impl(
                 let secret_key = read_credential(&account)?;
                 let (endpoint, bucket, region, access_key) = s3_connection(&account)?;
                 verify_s3(&endpoint, &bucket, &region, &access_key, &secret_key).await
+            }
+            // Every OAuth provider reverifies the same way: take a currently
+            // valid access token (refreshing it first if it expired) and make
+            // the one read-only identity call its spec names.
+            ConnectorProvider::GoogleDrive
+            | ConnectorProvider::MicrosoftGraph
+            | ConnectorProvider::Linear
+            | ConnectorProvider::Asana
+            | ConnectorProvider::Dropbox
+            | ConnectorProvider::Box
+            | ConnectorProvider::Airtable
+            | ConnectorProvider::Zendesk
+            | ConnectorProvider::Hubspot
+            | ConnectorProvider::Discord
+            | ConnectorProvider::Gitlab => {
+                crate::connector_oauth::verify_account(state, &account).await
             }
             // Reverifying an extension connector asks the runtime, not a
             // remote service: the question is whether the capability this
