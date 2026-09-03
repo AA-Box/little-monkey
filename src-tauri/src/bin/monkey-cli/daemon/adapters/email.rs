@@ -85,7 +85,7 @@ use base64::Engine;
 use futures_util::StreamExt;
 use mail_parser::MimeHeaders;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_rustls::TlsConnector;
@@ -466,7 +466,10 @@ impl EmailAdapter {
             // Addressing only, and bounded: this is what a reply threads with.
             let _ = self.refs.put(
                 &self.account_id,
-                &normalized.envelope.conversation.conversation_id,
+                &ref_key(
+                    &normalized.envelope.conversation.conversation_id,
+                    normalized.envelope.conversation.thread_id.as_deref(),
+                ),
                 &normalized.reference,
             );
             parts.push_all(normalized.parts);
@@ -612,7 +615,18 @@ impl ChannelAdapter for EmailAdapter {
             Ok(files) => files,
             Err(outcome) => return outcome,
         };
-        let reference = self.refs.get(&self.account_id, &recipient);
+        // Per thread, not per correspondent: one address can hold several
+        // live threads, and a reply carrying another thread's `References` is
+        // exactly how a mail client merges the two. The bare key is the
+        // fallback for rows written before threads were keyed, and for a
+        // reply the caller sent with no thread at all.
+        let reference = self
+            .refs
+            .get(
+                &self.account_id,
+                &ref_key(&recipient, message.thread_id.as_deref()),
+            )
+            .or_else(|| self.refs.get(&self.account_id, &recipient));
         let message_id = mint_message_id(
             &self.account_id,
             &message.idempotency_key,
@@ -810,7 +824,7 @@ pub(crate) fn normalize_message(
         .subject()
         .map(|subject| bounded_text(subject, MAX_STORED_SUBJECT_CHARS))
         .filter(|subject| !subject.is_empty());
-    let message_id = message.message_id().map(strip_angles).map(str::to_string);
+    let message_id = message.message_id().and_then(sane_message_id);
     let in_reply_to = header_ids(message.in_reply_to()).into_iter().next();
     let references = header_ids(message.references());
 
@@ -943,11 +957,14 @@ fn oversized_envelope(
     ChannelEnvelope {
         account_id: identity.account_id.to_string(),
         kind: ChannelKind::Email,
+        // The clock is deliberately *not* in the id: this pass never fetches
+        // INTERNALDATE, so a wall-clock reading would give the same UID a new
+        // id on every re-read and defeat the dedupe this function exists for.
         provider_event_id: deterministic_event_id(
             identity.account_id,
             uid_validity,
             uid,
-            received_at_ms,
+            i64::from(size),
             "oversized",
             "",
         ),
@@ -1002,13 +1019,41 @@ fn deterministic_event_id(
 fn header_ids(value: &mail_parser::HeaderValue<'_>) -> Vec<String> {
     value
         .as_text_list()
-        .map(|ids| {
-            ids.iter()
-                .map(|id| strip_angles(id).to_string())
-                .filter(|id| !id.is_empty())
-                .collect()
-        })
+        .map(|ids| ids.iter().filter_map(|id| sane_message_id(id)).collect())
         .unwrap_or_default()
+}
+
+/// The longest `Message-ID` this adapter will store or write back out.
+const MAX_MESSAGE_ID_BYTES: usize = 200;
+
+/// One `Message-ID`-shaped value, or nothing.
+///
+/// A stranger picks these: they become a unique-index key, a durable
+/// `reference` entry, and an unfoldable `References:` line on the way back
+/// out. So the same shape check addresses get — printable ASCII, bounded
+/// length, nothing that could fold a header — is applied on the way in,
+/// where a 200 KB id or one carrying a bare CR is dropped rather than
+/// escaped later.
+fn sane_message_id(id: &str) -> Option<String> {
+    let id = strip_angles(id);
+    if id.is_empty() || id.len() > MAX_MESSAGE_ID_BYTES {
+        return None;
+    }
+    if id.bytes().any(|byte| !(0x21..=0x7e).contains(&byte)) {
+        return None;
+    }
+    if id.contains(['<', '>']) {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+/// The key one thread's reply chain is stored under.
+fn ref_key(conversation_id: &str, thread_id: Option<&str>) -> String {
+    match thread_id.filter(|thread| !thread.is_empty()) {
+        Some(thread) => format!("{conversation_id}#{thread}"),
+        None => conversation_id.to_string(),
+    }
 }
 
 fn strip_angles(id: &str) -> &str {
@@ -1369,17 +1414,44 @@ async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, line: &str) -> std::i
     writer.flush().await
 }
 
+/// The most one SMTP reply line, and one whole reply, may be.
+///
+/// The timeout bounds how long the dialogue may take, not how much it may
+/// allocate: a relay answering the greeting with one multi-gigabyte line, or
+/// an endless run of `250-` continuations, would be buffered whole long
+/// before the deadline fires.
+const MAX_SMTP_LINE_BYTES: u64 = 4_096;
+const MAX_SMTP_REPLY_LINES: usize = 64;
+
 /// Read one reply, joining the `250-`-continued lines into one string.
 async fn read_reply<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<(u16, String)> {
     let mut collected = String::new();
+    let mut lines = 0usize;
     loop {
+        lines += 1;
+        if lines > MAX_SMTP_REPLY_LINES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the SMTP server sent more continuation lines than one reply may have",
+            ));
+        }
         let mut line = String::new();
-        if reader.read_line(&mut line).await? == 0 {
+        let read = (&mut *reader)
+            .take(MAX_SMTP_LINE_BYTES)
+            .read_line(&mut line)
+            .await?;
+        if read == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "the SMTP server closed the connection",
+            ));
+        }
+        if read as u64 == MAX_SMTP_LINE_BYTES && !line.ends_with('\n') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "an SMTP reply line was longer than this client will read",
             ));
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
@@ -1932,6 +2004,79 @@ mod tests {
             "{:?}",
             refused.fetch_error
         );
+    }
+
+    /// One correspondent, two live threads. The stored reply chain is keyed on
+    /// the thread as well as the address, so a reply to one cannot go out
+    /// carrying the other's `References` — which is exactly how a mail client
+    /// merges two threads into one.
+    #[test]
+    fn two_threads_from_one_correspondent_do_not_share_a_reply_chain() {
+        let second = concat!(
+            "From: ada@example.com\r\n",
+            "To: you@example.org\r\n",
+            "Subject: Gears\r\n",
+            "Message-ID: <g2@example.com>\r\n",
+            "In-Reply-To: <g1@example.com>\r\n",
+            "References: <g0@example.com> <g1@example.com>\r\n",
+            "\r\n",
+            "and a second thread\r\n",
+        );
+        let refs = MemoryConversationReferences::default();
+        let mut keys = Vec::new();
+        for raw in [PLAIN, second] {
+            let normalized = normalize(raw);
+            let key = ref_key(
+                &normalized.envelope.conversation.conversation_id,
+                normalized.envelope.conversation.thread_id.as_deref(),
+            );
+            refs.put(ACCOUNT, &key, &normalized.reference).expect("put");
+            keys.push(key);
+        }
+        assert_ne!(keys[0], keys[1], "one address, two threads, two keys");
+
+        // A reply naming the first thread gets the first thread's chain.
+        let stored = refs.get(ACCOUNT, &keys[0]).expect("a stored chain");
+        let chain = stored["references"].as_array().expect("references");
+        assert!(
+            chain.iter().all(|id| id.as_str().unwrap().starts_with('m')),
+            "{chain:?}"
+        );
+        // And a reply with no thread at all still finds something, because the
+        // bare conversation id is the fallback `send` reads second.
+        assert_eq!(ref_key("ada@example.com", None), "ada@example.com");
+    }
+
+    /// A stranger picks these, and they end up as a unique-index key and as an
+    /// unfoldable `References:` line on the way back out.
+    #[test]
+    fn a_message_id_that_could_break_a_header_is_dropped_rather_than_stored() {
+        let huge = "a".repeat(MAX_MESSAGE_ID_BYTES + 1);
+        for hostile in [
+            huge.as_str(),
+            "a\rb@example.com",
+            "a b@example.com",
+            "a<b@example.com",
+            "",
+        ] {
+            assert_eq!(sane_message_id(hostile), None, "{hostile:?}");
+        }
+        assert_eq!(
+            sane_message_id("<m2@example.com>"),
+            Some("m2@example.com".to_string())
+        );
+    }
+
+    /// The note is the dedupe key's whole reason to exist: this pass never
+    /// fetches INTERNALDATE, so a clock reading would give one UID a new id on
+    /// every re-read.
+    #[test]
+    fn the_oversized_note_keeps_the_same_id_when_it_is_read_again() {
+        let first = oversized_envelope(&identity(), 42, 7, 9_000_000, 1_700_000_000_000);
+        let again = oversized_envelope(&identity(), 42, 7, 9_000_000, 1_800_000_000_000);
+        assert_eq!(first.provider_event_id, again.provider_event_id);
+        let other_uid = oversized_envelope(&identity(), 43, 7, 9_000_000, 1_700_000_000_000);
+        assert_ne!(first.provider_event_id, other_uid.provider_event_id);
     }
 
     // ---- outbound headers ----

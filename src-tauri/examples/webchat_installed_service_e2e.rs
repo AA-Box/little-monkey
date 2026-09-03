@@ -22,7 +22,9 @@
 //!
 //! What it does not prove is a browser on another machine reaching a
 //! non-loopback bind with a certificate it trusts. That needs a certificate
-//! authority and a network the operator owns, and stays theirs to verify.
+//! authority and a network the operator owns, and stays theirs to verify — and
+//! the account's `public` flag, without which a peer that is not loopback is
+//! answered `404` whatever the listener is bound to.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;

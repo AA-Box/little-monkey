@@ -135,7 +135,11 @@ connection is opened, streamed under that limit rather than trusted to be the
 size it claimed, verified against the declared size afterwards, and stored in
 the shared content store. A file whose bytes do not match its description is
 refused rather than stored under the wrong name. Nothing is auto-extracted and
-nothing is executed. Limits are per account and clamped: you can lower them
+nothing is executed. Email is the exception to the first half of that: an
+inbound file is a part of the message the poll already read, no second
+connection is opened for it, it is held only until the next poll, and the event
+says so if the bytes could not be stored (see
+[limitations](limitations.md)). Limits are per account and clamped: you can lower them
 freely and can only raise them so far.
 
 ### Loops
@@ -408,9 +412,9 @@ therefore **not** claimed as verified here.
     header CSP is asserted equal to the page's own, and the kind is refused by
     the public channel-webhook builder outright, so the page is reachable only
     through the daemon's own listener.
-  A provider that holds no credential of ours — the helper providers, SMS, and
-  the served page — is no longer reported by Security Doctor as an enabled
-  account missing one.
+  A provider that holds no credential of ours — the helper providers, SMS,
+  IRC without SASL, and the served page — is no longer reported by Security
+  Doctor as an enabled account missing one.
 - Webhook signature verification for WhatsApp, Teams, Google Chat and LINE, and
   carrier callback verification for Twilio, Plivo and Telnyx, over exact bytes,
   including forged and replayed bodies.
@@ -483,11 +487,12 @@ from somebody else, and not the agent.
 - A real Home Assistant instance: that your long-lived token authenticates over
   the WebSocket API, that your automation fires the event type this account
   subscribes to, and that your notify service delivers where you expect.
-- A browser on another machine reaching the served chat page: the daemon's
-  listener bound to a real interface, a certificate that browser trusts, and
-  what your network actually allows to reach it. The loopback leg needs no
-  account of yours and is exercised by its own harness; the non-loopback leg is
-  yours to expose.
+- A browser on another machine reaching the served chat page: the account's
+  `public` flag turned on, the daemon's listener bound to a real interface, a
+  certificate that browser trusts, and what your network actually allows to
+  reach it. Without `public` a non-loopback peer is answered `404`, whatever
+  the listener is bound to. The loopback leg needs no account of yours and is
+  exercised by its own harness; the non-loopback leg is yours to expose.
 - A publicly reachable callback URL, and the provider console accepting it.
 - A real Cloudflare tunnel account: that `cloudflared` connects with your token,
   that the hostname routes to this machine, and that a provider's delivery

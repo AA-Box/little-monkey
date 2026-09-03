@@ -7282,6 +7282,7 @@ mod tests {
                     let _ = super::super::server::serve_upgradable(
                         hyper_util::rt::TokioIo::new(stream),
                         served,
+                        None,
                     )
                     .await;
                 });
@@ -7640,6 +7641,7 @@ mod tests {
                     let _ = super::super::server::serve_upgradable(
                         hyper_util::rt::TokioIo::new(stream),
                         api,
+                        None,
                     )
                     .await;
                 });

@@ -213,7 +213,7 @@ async fn serve_bound(
                     .accept(stream)
                     .await
                     .map_err(|error| format!("TLS handshake from {peer} failed: {error}"))?;
-                serve_upgradable(TokioIo::new(tls), api).await
+                serve_upgradable(TokioIo::new(tls), api, Some(peer)).await
             }
             .await;
             if let Err(error) = result {
@@ -232,7 +232,15 @@ async fn serve_bound(
 /// invisible to every test that does not open a real WebSocket — so the test
 /// that does opens it through *this* function, and a future edit that drops the
 /// call takes the end-to-end Talk test down with it.
-pub(super) async fn serve_upgradable<I>(io: I, api: RemoteApi) -> Result<(), String>
+/// `peer` is the accepted socket's own address, and the only thing on this
+/// listener that can tell a loopback client from a remote one: the web chat
+/// routes are unauthenticated, so they are the one branch that needs it.
+/// `None` is an in-process caller with no socket behind it.
+pub(super) async fn serve_upgradable<I>(
+    io: I,
+    api: RemoteApi,
+    peer: Option<std::net::SocketAddr>,
+) -> Result<(), String>
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
@@ -240,7 +248,7 @@ where
         .keep_alive(true)
         .serve_connection(
             io,
-            service_fn(move |request| handle_http(api.clone(), request)),
+            service_fn(move |request| handle_http(api.clone(), request, peer)),
         )
         .with_upgrades()
         .await
@@ -250,6 +258,7 @@ where
 pub(super) async fn handle_http(
     api: RemoteApi,
     mut request: Request<Incoming>,
+    peer: Option<std::net::SocketAddr>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let method = request.method().as_str().to_ascii_uppercase();
     let path_and_query = request
@@ -290,6 +299,7 @@ pub(super) async fn handle_http(
         return Ok(super::webchat::handle(
             api.paths(),
             route,
+            peer,
             visitor,
             content_type,
             body,

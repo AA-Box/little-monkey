@@ -246,6 +246,12 @@ pub(crate) fn config_fields(kind: ChannelKind) -> &'static [ConfigField] {
         required("notify_service", ConfigFieldKind::Text),
         optional("event_type", ConfigFieldKind::Text),
     ];
+    // The one thing there is to decide about a page the daemon serves itself:
+    // whether a peer that is not loopback may reach it. Off by default, so
+    // widening the remote listener for the signed device plane does not turn
+    // these unauthenticated routes into a network-reachable write surface by
+    // side effect.
+    const WEBCHAT: &[ConfigField] = &[optional("public", ConfigFieldKind::Boolean)];
     const SMS: &[ConfigField] = &[
         optional("webhook_public_key", ConfigFieldKind::Text),
         optional("session_scope", ConfigFieldKind::Text),
@@ -260,15 +266,12 @@ pub(crate) fn config_fields(kind: ChannelKind) -> &'static [ConfigField] {
     ];
     match kind {
         // Secret-only providers: the token carries everything.
-        // Secret-only providers: the token carries everything. WebChat is here
-        // for the opposite reason — it has no provider, no token and nothing
-        // to configure; the listener it is served on is configured once, under
-        // the remote host, for every served surface at once.
-        ChannelKind::Telegram
-        | ChannelKind::Discord
-        | ChannelKind::Slack
-        | ChannelKind::Line
-        | ChannelKind::WebChat => NONE,
+        ChannelKind::Telegram | ChannelKind::Discord | ChannelKind::Slack | ChannelKind::Line => {
+            NONE
+        }
+        // WebChat has no provider and no token; its one setting is who may
+        // reach the page the daemon serves.
+        ChannelKind::WebChat => WEBCHAT,
         ChannelKind::Mattermost => MATTERMOST,
         ChannelKind::Irc => IRC,
         ChannelKind::Matrix => MATRIX,

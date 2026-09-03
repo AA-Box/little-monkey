@@ -391,11 +391,14 @@ fn audit_account(
     // -- Can what arrives be authenticated at all -------------------------
 
     // Guarded on whether this provider has a credential at all. Signal and
-    // iMessage hand the account to a helper, IRC needs a password only for
-    // SASL, SMS's credential lives on the telephony account, and a served chat
-    // page has no provider to hold one for — for all of them the finding's own
-    // sentence ("can neither authenticate what arrives nor send anything") is
-    // simply false, and it can never be cleared.
+    // iMessage hand the account to a helper, IRC without SASL needs no
+    // password, SMS's credential lives on the telephony account, and a served
+    // chat page has no provider to hold one for — for all of them the
+    // finding's own sentence ("can neither authenticate what arrives nor send
+    // anything") is simply false, and it can never be cleared. The cost is
+    // real and is written down in docs/limitations.md: an IRC account that
+    // *meant* to use SASL and never set `use_sasl` is exempt too, and learns
+    // it from a failed connection rather than from the doctor.
     if credential_required(account) && account.credential_ref.is_none() {
         findings.push(f(
             &format!("channels.no_credential.{id}"),
@@ -1133,12 +1136,15 @@ mod tests {
     fn a_provider_that_holds_no_credential_is_not_reported_as_missing_one() {
         // A warning nobody can clear is a warning everybody learns to ignore.
         // The served chat page has no provider and therefore no token; Signal
-        // hands its account to signal-cli. For both, the finding's own
-        // sentence would be false.
+        // hands its account to signal-cli; IRC needs a password only for SASL,
+        // and this one is not using it. For all three the finding's own
+        // sentence would be false, so the doctor's exempt list — the one
+        // docs/messaging-devices-and-phones.md enumerates — is pinned here.
         let (_root, paths) = store();
         for (id, kind) in [
             ("acct-web", ChannelKind::WebChat),
             ("acct-signal", ChannelKind::Signal),
+            ("acct-irc", ChannelKind::Irc),
         ] {
             let mut account = account(id, kind);
             account.credential_ref = None;

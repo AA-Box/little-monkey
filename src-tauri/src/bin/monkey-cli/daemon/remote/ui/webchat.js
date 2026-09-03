@@ -15,28 +15,46 @@ const HIDDEN_POLL_MS = 60000;
 
 let visitor = null;
 let rendered = '';
+// The last transcript the server gave us, so a local echo can be re-rendered
+// without waiting for a poll.
+let latest = [];
+// Text this browser has sent that the transcript does not carry back yet. The
+// transcript is accepted messages only, and a first message waits on pairing,
+// so without this the visitor's own words would disappear on the next poll.
+let pending = [];
 
 function say(text) {
   status.textContent = text;
 }
 
+function bubble(outbound, text) {
+  const row = document.createElement('div');
+  row.className = outbound ? 'msg' : 'msg mine';
+  const who = document.createElement('span');
+  who.className = 'who';
+  who.textContent = outbound ? 'Little Monkey' : 'You';
+  row.appendChild(who);
+  const body = document.createElement('span');
+  body.textContent = text;
+  row.appendChild(body);
+  transcript.appendChild(row);
+}
+
 function render(messages) {
-  const key = JSON.stringify(messages);
+  latest = messages;
+  // One pending echo is dropped per matching row the transcript now carries,
+  // so sending the same text twice keeps the second echo.
+  for (const message of messages) {
+    if (message.outbound) continue;
+    const at = pending.indexOf(message.text);
+    if (at >= 0) pending.splice(at, 1);
+  }
+  const key = JSON.stringify([messages, pending]);
   if (key === rendered) return;
   rendered = key;
   transcript.replaceChildren();
-  for (const message of messages) {
-    const row = document.createElement('div');
-    row.className = message.outbound ? 'msg' : 'msg mine';
-    const who = document.createElement('span');
-    who.className = 'who';
-    who.textContent = message.outbound ? 'Little Monkey' : 'You';
-    row.appendChild(who);
-    const body = document.createElement('span');
-    body.textContent = message.text;
-    row.appendChild(body);
-    transcript.appendChild(row);
-  }
+  for (const message of messages) bubble(message.outbound, message.text);
+  for (const text of pending) bubble(false, text);
   transcript.scrollTop = transcript.scrollHeight;
 }
 
@@ -59,6 +77,7 @@ async function poll() {
     window.localStorage.removeItem(storageKey);
     say('This browser is no longer recognised. Reload to start again.');
     visitor = null;
+    pending = [];
     return;
   }
   if (!response.ok) return;
@@ -83,14 +102,11 @@ form.addEventListener('submit', async (event) => {
   }
   // The transcript only carries messages the daemon accepted for a run, and a
   // first message waits on pairing, so the local echo is what keeps a visitor
-  // from thinking their message vanished.
+  // from thinking their message vanished. It survives every poll until the
+  // server shows it back.
   say('Sent.');
-  const echo = document.createElement('div');
-  echo.className = 'msg mine';
-  echo.textContent = text;
-  transcript.appendChild(echo);
-  transcript.scrollTop = transcript.scrollHeight;
-  rendered = '';
+  pending.push(text);
+  render(latest);
   await poll();
 });
 

@@ -246,6 +246,11 @@ describe("provider settings", () => {
     expect(parts("google_chat")).toEqual([]);
     // A mailbox has two legs and they are not always the same password.
     expect(parts("email")).toEqual(["imap_password", "smtp_password"]);
+    // …and the SMTP one is optional, because the adapter falls back on the
+    // IMAP password when it is empty. Without the flag the Save button stays
+    // disabled forever for the single-app-password setup the guide describes.
+    const email = PROVIDER_GUIDES.find((guide) => guide.kind === "email")!;
+    expect(email.secretFields!.map((field) => Boolean(field.optional))).toEqual([false, true]);
     // One long-lived access token, pasted whole.
     expect(parts("home_assistant")).toEqual([]);
     expect(parts("webchat")).toEqual([]);

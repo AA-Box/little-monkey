@@ -246,8 +246,10 @@ export interface ProviderGuide {
   /** The parts the credential is made of, when it is more than one value.
    * Setup collects each one and saves them as the single JSON bundle the
    * adapter parses, so nobody has to know the wire shape. Omitted means the
-   * credential is one value pasted whole. */
-  secretFields?: { key: string; label: string }[];
+   * credential is one value pasted whole. A part marked optional may be left
+   * empty: the adapter falls back on another part (email reuses the IMAP
+   * password for SMTP), and the empty key is dropped from the bundle. */
+  secretFields?: { key: string; label: string; optional?: boolean }[];
 }
 
 export const PROVIDER_GUIDES: ProviderGuide[] = [
@@ -324,7 +326,7 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
     kind: "email", label: "Email", transport: "long_poll", credentialLabel: "Mailbox passwords (JSON)",
     secretFields: [
       { key: "imap_password", label: "IMAP password" },
-      { key: "smtp_password", label: "SMTP password (leave empty to reuse the IMAP one)" },
+      { key: "smtp_password", label: "SMTP password (leave empty to reuse the IMAP one)", optional: true },
     ],
     whereToGetIt: "Your own mailbox. Use an app password where your provider issues one \u2014 OAuth sign-in is not implemented. TLS is required on both legs and there is no cleartext configuration to get wrong: the adapter always opens an implicit-TLS socket and refuses ports 143 and 25 outright. One conversation per correspondent address, so a reply goes to the sender alone and never to everyone on a thread, and it carries In-Reply-To and References so it lands in the same thread. Automated mail — autoresponders, bounces and mailing-list posts — is never answered at all. The mailbox is polled about every thirty seconds rather than held open with IDLE.",
     docsUrl: "https://datatracker.ietf.org/doc/html/rfc5322",
@@ -351,9 +353,11 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
   {
     kind: "webchat", label: "Web chat", transport: "served", credentialOptional: true,
     credentialLabel: "None \u2014 visitors pair like any other sender",
-    whereToGetIt: "A chat page this app serves on the resident daemon\u2019s own TLS listener, at your runner origin under /webchat/<account id>. Configure the remote host first (Settings \u203a Background Agents, or `monkey daemon remote host-configure`); without one there is nothing to serve on. Loopback is the default; bind that listener wider and the page is answered wherever the remote controller shell already is, with pairing and the route’s own rate limit as the gate. Each browser is minted a visitor identifier the daemon can verify, so one a browser invented is refused rather than opening a conversation. A first-time visitor is answered with a pairing code, exactly like a stranger on any other provider — up to sixteen waiting at once, after which a new visitor’s page stays quiet until you clear the list; approve them with `monkey channels approve`. No files in either direction, and a visitor reads only their own conversation.",
+    whereToGetIt: "A chat page this app serves on the resident daemon\u2019s own TLS listener, at your runner origin under /webchat/<account id>. Configure the remote host first (Settings \u203a Background Agents, or `monkey daemon remote host-configure`); without one there is nothing to serve on. These three routes are unauthenticated, so they do not follow that listener’s bind: a peer that is not loopback is answered 404 until you turn this account’s “Answer non-loopback visitors” on, whatever address the listener holds. With it on, pairing and the route’s own rate limit are the gate. Each browser is minted a visitor identifier the daemon can verify, so one a browser invented is refused rather than opening a conversation. A first-time visitor is answered with a pairing code, exactly like a stranger on any other provider — up to sixteen waiting at once, after which a new visitor’s page stays quiet until you clear the list; approve them with `monkey channels approve`. No files in either direction, and a visitor reads only their own conversation.",
     docsUrl: "https://github.com/AA-Box/little-monkey/blob/develop/docs/messaging-devices-and-phones.md",
-    configFields: [],
+    configFields: [
+      { key: "public", label: "Answer non-loopback visitors", type: "boolean", hint: "Off by default. These routes carry no signature, so a peer that is not loopback is refused whatever the remote listener is bound to. Turning this on exposes the page to everyone who can reach that listener, and there is no per-visitor revocation." },
+    ],
   },
   {
     // One entry for every extension-backed provider, because the persisted

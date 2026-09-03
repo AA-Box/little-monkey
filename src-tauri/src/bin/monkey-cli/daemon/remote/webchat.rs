@@ -37,18 +37,19 @@
 //! are the *hash* of it: the durable database never holds the value a browser
 //! presents, so a copied database is no way to read or send as anybody.
 //!
-//! # Where the listener may be
+//! # Which peers may reach it
 //!
-//! Wherever the operator already put it. This page is served by the same
-//! listener, over the same TLS, on the same address as the controller shell and
-//! the signed device API, so a rule refusing (say) a wildcard bind here would
-//! protect nothing that is not already answered on that bind — and would
-//! silently break `monkey daemon remote host-configure --listen 0.0.0.0:8443`,
-//! which this repository's own peer-live documentation tells operators to run.
-//! The default listen address is loopback; a wider one is the operator's
-//! decision, taken once, for every served surface at once.
+//! Loopback, unless the account says otherwise. The listener itself stays
+//! wherever the operator put it — `monkey daemon remote host-configure --listen
+//! 0.0.0.0:8443` keeps working, and the controller shell and the signed device
+//! API keep answering on it — but those two demand a signed paired device or a
+//! one-use ticket, and these three JSON routes demand nothing. They are this
+//! listener's only unauthenticated *writing* surface, so widening the bind must
+//! not widen them by side effect: a non-loopback peer is answered `404` exactly
+//! as an unknown account is, until the account's own `public` flag is set.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Mutex;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -97,6 +98,12 @@ pub(crate) const VISITOR_HEADER: &str = "x-webchat-visitor";
 /// endpoint of the logical server, and a browser visitor is none of those.
 const WINDOW_MS: i64 = 60_000;
 const MAX_PER_WINDOW: u32 = 60;
+/// The whole account's ceiling, checked before any state is opened. Generous
+/// next to the per-visitor one because every visitor of one account shares it
+/// — a page polls every five seconds while its tab is visible — and it exists
+/// to stop an unauthenticated loop making this daemon open SQLite forever,
+/// not to ration ordinary use.
+const MAX_PER_WINDOW_ACCOUNT: u32 = 600;
 
 #[derive(Default)]
 struct RateLimit {
@@ -105,6 +112,10 @@ struct RateLimit {
 
 impl RateLimit {
     fn allow(&self, key: &str, now_ms: i64) -> bool {
+        self.allow_up_to(key, now_ms, MAX_PER_WINDOW)
+    }
+
+    fn allow_up_to(&self, key: &str, now_ms: i64, ceiling: u32) -> bool {
         let mut hits = self.hits.lock().unwrap_or_else(|error| error.into_inner());
         // Cheap sweep, so a long-running daemon does not accumulate a row per
         // visitor that ever loaded the page.
@@ -116,7 +127,7 @@ impl RateLimit {
             *entry = (now_ms, 0);
         }
         entry.1 += 1;
-        entry.1 <= MAX_PER_WINDOW
+        entry.1 <= ceiling
     }
 }
 
@@ -140,6 +151,21 @@ pub(crate) enum Route {
     Post(String),
     /// This visitor's own transcript.
     Fetch(String),
+}
+
+impl Route {
+    /// The account this route names, when it names one. `Asset` does not: it
+    /// is the page's own script and stylesheet, the same static bytes for
+    /// every account.
+    fn account_id(&self) -> Option<&str> {
+        match self {
+            Route::Asset(_) => None,
+            Route::Page(account)
+            | Route::Session(account)
+            | Route::Post(account)
+            | Route::Fetch(account) => Some(account),
+        }
+    }
 }
 
 /// Account ids are minted by `channels add`; anything else is not a route.
@@ -214,8 +240,15 @@ fn visitor_key(paths: &DaemonPaths) -> Result<ring::hmac::Key, String> {
             Ok(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &fresh))
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // The winner may still be mid-`write_all`, so the loser re-reads
+            // through the same length check rather than keying an HMAC over
+            // however many bytes had landed — an empty key would verify
+            // nothing the file's real key ever will.
             let bytes = std::fs::read(&path)
                 .map_err(|error| format!("Could not read the web chat visitor key: {error}"))?;
+            if bytes.len() != 32 {
+                return Err("The web chat visitor key is the wrong length".to_string());
+            }
             Ok(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &bytes))
         }
         Err(error) => Err(format!(
@@ -302,13 +335,32 @@ fn refuse(status: u16, code: &str) -> Response<Full<Bytes>> {
 
 // --- The handler ------------------------------------------------------------
 
-/// The account this route names, if it is an enabled web chat account.
-fn open_account(paths: &DaemonPaths, account_id: &str) -> Option<DaemonStore> {
-    let store = DaemonStore::open(paths).ok()?;
-    match store.channel_account(account_id) {
-        Ok(Some(account)) if account.enabled && account.kind == ChannelKind::WebChat => Some(store),
-        _ => None,
+/// Whether a connection from this peer may reach this account's page at all.
+///
+/// `None` is the in-process caller — a test, or a served connection with no
+/// socket behind it — and is treated as loopback. Anything else has to be
+/// loopback, or the account has to have said `public`.
+fn peer_admitted(config: &serde_json::Value, peer: Option<SocketAddr>) -> bool {
+    if config.get("public").and_then(serde_json::Value::as_bool) == Some(true) {
+        return true;
     }
+    peer.is_none_or(|peer| peer.ip().is_loopback())
+}
+
+/// The account this route names, if it is an enabled web chat account this
+/// peer may reach. A peer that may not is not told the difference: it gets the
+/// same `404` an unknown account gets.
+fn open_account(
+    paths: &DaemonPaths,
+    account_id: &str,
+    peer: Option<SocketAddr>,
+) -> Option<DaemonStore> {
+    let store = DaemonStore::open(paths).ok()?;
+    let account = match store.channel_account(account_id) {
+        Ok(Some(account)) if account.enabled && account.kind == ChannelKind::WebChat => account,
+        _ => return None,
+    };
+    peer_admitted(&account.non_secret_config, peer).then_some(store)
 }
 
 /// Serve one web chat request. `visitor_header` is the value of
@@ -323,11 +375,21 @@ fn open_account(paths: &DaemonPaths, account_id: &str) -> Option<DaemonStore> {
 pub(crate) async fn handle(
     paths: &DaemonPaths,
     route: Route,
+    peer: Option<SocketAddr>,
     visitor_header: Option<String>,
     content_type: Option<String>,
     body: Vec<u8>,
     now_ms: i64,
 ) -> Response<Full<Bytes>> {
+    // Before anything opens the store: every one of these routes is reachable
+    // without a credential, so the first gate has to be one that costs this
+    // daemon nothing.
+    if let Some(account_id) = route.account_id() {
+        if !limiter().allow_up_to(&format!("account:{account_id}"), now_ms, MAX_PER_WINDOW_ACCOUNT)
+        {
+            return rate_limited();
+        }
+    }
     match route {
         Route::Asset("js") => respond(
             200,
@@ -336,7 +398,7 @@ pub(crate) async fn handle(
         ),
         Route::Asset(_) => respond(200, "text/css; charset=utf-8", PAGE_CSS.as_bytes().to_vec()),
         Route::Page(account_id) => {
-            if open_account(paths, &account_id).is_none() {
+            if open_account(paths, &account_id, peer).is_none() {
                 return refuse(404, "not_found");
             }
             respond(
@@ -346,7 +408,7 @@ pub(crate) async fn handle(
             )
         }
         Route::Session(account_id) => {
-            if open_account(paths, &account_id).is_none() {
+            if open_account(paths, &account_id, peer).is_none() {
                 return refuse(404, "not_found");
             }
             if !limiter().allow(&format!("session:{account_id}"), now_ms) {
@@ -369,7 +431,7 @@ pub(crate) async fn handle(
             }) {
                 return refuse(415, "unsupported_media_type");
             }
-            let Some(mut store) = open_account(paths, &account_id) else {
+            let Some(mut store) = open_account(paths, &account_id, peer) else {
                 return refuse(404, "not_found");
             };
             let Ok(key) = visitor_key(paths) else {
@@ -412,7 +474,7 @@ pub(crate) async fn handle(
             }
         }
         Route::Fetch(account_id) => {
-            let Some(store) = open_account(paths, &account_id) else {
+            let Some(store) = open_account(paths, &account_id, peer) else {
                 return refuse(404, "not_found");
             };
             let Ok(key) = visitor_key(paths) else {
@@ -652,12 +714,47 @@ mod tests {
         handle(
             paths,
             route,
+            None,
             visitor,
             Some("application/json; charset=utf-8".to_string()),
             body,
             now_ms,
         )
         .await
+    }
+
+    /// These three routes are unauthenticated, so widening the listener for
+    /// the signed device plane must not widen them too. A peer that is not
+    /// loopback is answered exactly as an unknown account is, until the
+    /// account itself says `public`.
+    #[tokio::test]
+    async fn a_peer_that_is_not_loopback_is_refused_until_the_account_says_public() {
+        let (paths, account_id) = world(ChannelKind::WebChat, true);
+        let remote: SocketAddr = "203.0.113.7:52000".parse().expect("peer");
+        let local: SocketAddr = "127.0.0.1:52000".parse().expect("peer");
+        let page = |peer| {
+            handle(
+                &paths,
+                Route::Page(account_id.clone()),
+                Some(peer),
+                None,
+                None,
+                Vec::new(),
+                NOW,
+            )
+        };
+        assert_eq!(page(remote).await.status().as_u16(), 404);
+        assert_eq!(page(local).await.status().as_u16(), 200);
+
+        let mut store = DaemonStore::open(&paths).expect("open store");
+        let mut account = store
+            .channel_account(&account_id)
+            .expect("read")
+            .expect("account");
+        account.non_secret_config = serde_json::json!({ "public": true });
+        store.upsert_channel_account(&account).expect("update");
+        drop(store);
+        assert_eq!(page(remote).await.status().as_u16(), 200);
     }
 
     #[tokio::test]
@@ -674,6 +771,7 @@ mod tests {
             let response = handle(
                 &paths,
                 Route::Post(account_id.clone()),
+                None,
                 None,
                 declared,
                 body.clone(),
