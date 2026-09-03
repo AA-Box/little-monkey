@@ -169,14 +169,19 @@ function MemoryRow({
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-1.5">
-          <input
-            type="checkbox"
-            checked={selected}
-            onChange={onToggleSelected}
-            aria-label={t("MemoryStudioPanel.selectLabel")}
-            title={t("MemoryStudioPanel.selectLabel")}
-            className="h-3.5 w-3.5"
-          />
+          {/* Only rows `merge_impl` would accept are selectable — it refuses
+              a disabled, expired or already-retired parent, and offering the
+              checkbox there is offering an action that can only fail. */}
+          {!dimmed && (
+            <input
+              type="checkbox"
+              checked={selected}
+              onChange={onToggleSelected}
+              aria-label={t("MemoryStudioPanel.selectLabel")}
+              title={t("MemoryStudioPanel.selectLabel")}
+              className="h-3.5 w-3.5"
+            />
+          )}
           <StatusPill tone="neutral">
             {entry.source === "agent" ? t("MemoryStudioPanel.sourceAgent") : t("MemoryStudioPanel.sourceUser")}
           </StatusPill>
@@ -347,18 +352,18 @@ function MemoryRow({
           <input
             type="date"
             value={entry.expires_at?.slice(0, 10) ?? ""}
-            // A pinned memory is exempt from expiry, so an expiry set here
-            // would persist and do nothing — the control says so instead.
-            disabled={rowBusy || entry.pinned}
+            disabled={rowBusy}
             onChange={(e) =>
               void runRow(() => setMemoryExpiry(entry.id, entry.project_root, e.target.value || null))
             }
             className="rounded-md border border-border bg-surface px-1.5 py-0.5 text-[10px] text-foreground"
           />
         </label>
-        {entry.pinned ? (
-          <span>{t("MemoryStudioPanel.expiryPinnedHint")}</span>
-        ) : entry.expires_at ? (
+        {/* `set_pinned_impl` never clears `expires_at`, so a pinned memory can
+            hold a date it is currently exempt from — and that date applies
+            again the moment it is unpinned. Say that, and keep Clear expiry
+            reachable, rather than showing the date beside "never expires". */}
+        {entry.expires_at && (
           <button
             type="button"
             disabled={rowBusy}
@@ -367,8 +372,15 @@ function MemoryRow({
           >
             {t("MemoryStudioPanel.expiryClearButton")}
           </button>
+        )}
+        {entry.pinned ? (
+          <span>
+            {entry.expires_at
+              ? t("MemoryStudioPanel.expiryPinnedRetainedHint", { date: formatDate(entry.expires_at) })
+              : t("MemoryStudioPanel.expiryPinnedHint")}
+          </span>
         ) : (
-          <span>{t("MemoryStudioPanel.expiryHint")}</span>
+          !entry.expires_at && <span>{t("MemoryStudioPanel.expiryHint")}</span>
         )}
       </div>
 
@@ -489,6 +501,14 @@ export function MemoryStudioPanel() {
   const mergeScopeKey = (entry: MemoryEntry) => `${entry.scope}:${entry.project_root ?? ""}`;
   const sameScope = selected.length > 1 && selected.every((e) => mergeScopeKey(e) === mergeScopeKey(selected[0]));
 
+  /** Changing a filter drops the merge selection: a selection that survived
+   * one would let a user merge rows they can no longer see. */
+  const selectFilter = (apply: () => void) => {
+    apply();
+    setSelectedIds(new Set());
+    setMergeOpen(false);
+  };
+
   const toggleSelected = (id: string) =>
     setSelectedIds((prev) => {
       const next = new Set(prev);
@@ -588,7 +608,7 @@ export function MemoryStudioPanel() {
             <button
               key={btn.id}
               type="button"
-              onClick={() => setScopeFilter(btn.id)}
+              onClick={() => selectFilter(() => setScopeFilter(btn.id))}
               className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
                 scopeFilter === btn.id ? "bg-surface text-foreground shadow-sm" : "text-muted hover:text-foreground"
               }`}
@@ -602,7 +622,7 @@ export function MemoryStudioPanel() {
             <button
               key={btn.id}
               type="button"
-              onClick={() => setStateFilter(btn.id)}
+              onClick={() => selectFilter(() => setStateFilter(btn.id))}
               className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
                 stateFilter === btn.id ? "bg-surface text-foreground shadow-sm" : "text-muted hover:text-foreground"
               }`}
@@ -681,8 +701,10 @@ export function MemoryStudioPanel() {
             <Button size="sm" variant="ghost" onClick={() => setSelectedIds(new Set())} disabled={busy !== null}>
               {t("MemoryStudioPanel.cancelButton")}
             </Button>
-            {!sameScope && selected.length > 1 && (
-              <span className="text-[11px] text-warning">{t("MemoryStudioPanel.mergeScopeWarning")}</span>
+            {selected.length < 2 ? (
+              <span className="text-[11px] text-warning">{t("MemoryStudioPanel.mergeMinWarning")}</span>
+            ) : (
+              !sameScope && <span className="text-[11px] text-warning">{t("MemoryStudioPanel.mergeScopeWarning")}</span>
             )}
           </div>
           {mergeOpen && sameScope && (
