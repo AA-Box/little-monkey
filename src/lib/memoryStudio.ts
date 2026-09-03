@@ -70,10 +70,17 @@ export interface MemoryImportSummary {
   errors: string[];
 }
 
-/** Current (and, so far, only) memory export file schema version — mirrors
- * `memory.rs`'s internal `SCHEMA_VERSION`, though the two are independent:
- * this only versions the export file shape. */
-const MEMORY_EXPORT_SCHEMA_VERSION = 1;
+/** Memory export file schema version. Independent of `memory.rs`'s on-disk
+ * `SCHEMA_VERSION`, though bumped for the same reason: v2 entries carry the
+ * lifecycle fields (`pinned`, `expires_at`, `last_used_at`, `merged_from`,
+ * `merged_into`, `retired_at`) that v1 files did not.
+ *
+ * Nothing *validates* this on import — `import_impl` reads whatever fields
+ * are present and defaults the rest, which is what lets it still accept a v1
+ * file. The consequence, stated in `docs/limitations.md`, is that
+ * compatibility runs one way only: an older build importing a v2 file drops
+ * the lifecycle fields and restores merge originals as live memories. */
+const MEMORY_EXPORT_SCHEMA_VERSION = 2;
 
 /** Every memory ever recorded, across every project root and the global
  * scope, whatever its lifecycle state — Memory Studio's full listing.
