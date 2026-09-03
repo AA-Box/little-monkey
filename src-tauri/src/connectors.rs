@@ -1015,18 +1015,20 @@ async fn verify_token(
         ConnectorProvider::S3 => {
             Err("S3 connects via connectors_add_s3, not a pasted token".to_string())
         }
-        // Every provider with an entry in `connector_oauth::OAUTH_PROVIDERS`
-        // needs a registered OAuth app and a browser consent step; there is
-        // no pasted-token shape for them that would be anything but a
-        // workaround, so this path refuses rather than inventing one.
-        provider if crate::connector_oauth::spec_for(provider).is_some() => Err(format!(
-            "{} connects over OAuth — use connectors_oauth_connect instead of a pasted token",
-            provider.as_str()
-        )),
-        other => Err(format!(
-            "{} does not support a pasted token",
-            other.as_str()
-        )),
+        // Every remaining variant has an entry in
+        // `connector_oauth::OAUTH_PROVIDERS`: it needs a registered OAuth app
+        // and a browser consent step, and there is no pasted-token shape for
+        // it that would be anything but a workaround. The `None` half is a
+        // refusal rather than an `unreachable!()` so that a variant added to
+        // the enum and nowhere else fails closed here — `as_str` and
+        // `reverify_impl` are what force the compile error.
+        other => Err(match crate::connector_oauth::spec_for(other) {
+            Some(_) => format!(
+                "{} connects over OAuth — use connectors_oauth_connect instead of a pasted token",
+                other.as_str()
+            ),
+            None => format!("{} does not support a pasted token", other.as_str()),
+        }),
     }
 }
 
@@ -1401,7 +1403,7 @@ pub async fn remove_account(state: &AppState, path: &Path, id: &str) -> Result<(
     // back to the Google console. Best-effort, same stance as the keychain
     // cleanup in `remove_impl`.
     if let Some(account) = &removed {
-        crate::connector_oauth::forget_client_if_unused(path, account.provider);
+        let _ = crate::connector_oauth::forget_client_if_unused(path, account.provider);
     }
     Ok(())
 }

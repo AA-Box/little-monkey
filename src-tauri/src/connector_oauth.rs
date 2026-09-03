@@ -186,8 +186,10 @@ pub(crate) struct OAuthProviderSpec {
     /// Whether to send `code_challenge`/`code_challenge_method=S256`.
     pub pkce: bool,
     pub secret: SecretPolicy,
-    /// `127.0.0.1` everywhere confirmed so far; kept per-row because some
-    /// providers only accept the literal `localhost` form.
+    /// All eleven rows were confirmed to accept the IP-literal `127.0.0.1`
+    /// form on 2026-09-03. Kept per-row rather than hardcoded because
+    /// `mcp_oauth` already had to special-case a provider that accepts only
+    /// the literal `localhost`, and the next row here may be one too.
     redirect_host: &'static str,
     pub host_field: Option<HostField>,
     verify: VerifySpec,
@@ -686,6 +688,12 @@ fn parse_token_response(bytes: &[u8], now_ms: u64) -> Result<StoredTokens, Strin
     })
 }
 
+/// The longest identity this app will store. The provider's response is
+/// untrusted data, and the label it sits next to is bounded the same way in
+/// `connect_inner`; without this a broken or hostile response could put an
+/// arbitrarily long string into connectors.json and the account list.
+const IDENTITY_MAX_CHARS: usize = 200;
+
 /// The first identity pointer that resolves to a non-empty string (or a
 /// number, stringified) wins.
 fn identity_from(verify: &VerifySpec, body: &[u8]) -> Result<String, String> {
@@ -693,12 +701,17 @@ fn identity_from(verify: &VerifySpec, body: &[u8]) -> Result<String, String> {
         .map_err(|e| format!("The identity endpoint returned a body that is not JSON: {e}"))?;
     for pointer in verify.identity_pointers {
         match json.pointer(pointer) {
-            Some(Value::String(value)) if !value.is_empty() => return Ok(value.clone()),
-            Some(Value::Number(value)) => return Ok(value.to_string()),
+            Some(Value::String(value)) if !value.is_empty() => return Ok(truncated(value)),
+            Some(Value::Number(value)) => return Ok(truncated(&value.to_string())),
             _ => {}
         }
     }
     Err("The provider accepted the token but returned no identity".to_string())
+}
+
+/// Char-boundary-safe truncation to [`IDENTITY_MAX_CHARS`].
+fn truncated(value: &str) -> String {
+    value.chars().take(IDENTITY_MAX_CHARS).collect()
 }
 
 /// The marker every [`reconnect_error`] carries, and the only thing
@@ -947,9 +960,46 @@ fn delete_tokens(id: &str) {
 /// Clears a provider's shared client registration once no account of that
 /// provider is left. Best-effort — the same stance `remove_impl` takes toward
 /// its own keychain cleanup.
-pub fn forget_client_if_unused(config_path: &std::path::Path, provider: ConnectorProvider) {
+/// Refuses a pasted client id that would overwrite the shared registration
+/// other accounts of this provider still refresh against. Unreadable catalog
+/// counts as zero accounts: the only use is refusing an overwrite, and
+/// refusing on an unreadable file would strand the user with no way forward.
+fn refuse_client_id_swap(
+    path: &std::path::Path,
+    provider: ConnectorProvider,
+    stored: Option<&ClientRegistration>,
+    pasted: &ClientRegistration,
+) -> Result<(), String> {
+    let Some(stored) = stored else { return Ok(()) };
+    if stored.client_id == pasted.client_id {
+        return Ok(());
+    }
+    let in_use = crate::connectors::load_config_impl(path)
+        .map(|config| {
+            config
+                .accounts
+                .iter()
+                .filter(|account| account.provider == provider)
+                .count()
+        })
+        .unwrap_or(0);
+    if in_use == 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "{} already has a registered OAuth app, used by {in_use} connected account(s). \
+         Leave the client ID blank to reuse it, or remove those accounts before registering \
+         a different client ID.",
+        provider.as_str()
+    ))
+}
+
+/// Returns whether the registration was actually forgotten — false when the
+/// provider still has an account, or when the catalog could not be read (in
+/// which case the safe answer is to keep the registration).
+pub fn forget_client_if_unused(config_path: &std::path::Path, provider: ConnectorProvider) -> bool {
     if spec_for(provider).is_none() {
-        return;
+        return false;
     }
     let still_used = crate::connectors::load_config_impl(config_path)
         .map(|config| {
@@ -959,9 +1009,11 @@ pub fn forget_client_if_unused(config_path: &std::path::Path, provider: Connecto
                 .any(|account| account.provider == provider)
         })
         .unwrap_or(true);
-    if !still_used {
-        delete_client(provider);
+    if still_used {
+        return false;
     }
+    delete_client(provider);
+    true
 }
 
 /// The non-secret provider metadata an OAuth account stores in `connection`.
@@ -1368,12 +1420,21 @@ async fn connect_inner(
         client_id,
         client_secret: cleaned(client_secret),
     });
+    let config_path = crate::connectors::config_file_path()?;
+    let stored = load_client(provider)?;
     let client = match pasted {
-        Some(client) => client,
+        Some(pasted) => {
+            // `persist` overwrites the one shared registration, and every
+            // existing account of this provider refreshes against it. Swapping
+            // it out under them would break their next refresh with a message
+            // that names consent rather than the real cause — so refuse here,
+            // before the browser is opened, not after.
+            refuse_client_id_swap(&config_path, provider, stored.as_ref(), &pasted)?;
+            pasted
+        }
         // The `needs_client_id` phase is emitted by the caller's terminal
         // match, so this arm just names the condition.
-        None => load_client(provider)?
-            .ok_or_else(|| CONNECTOR_CLIENT_ID_REQUIRED_MESSAGE.to_string())?,
+        None => stored.ok_or_else(|| CONNECTOR_CLIENT_ID_REQUIRED_MESSAGE.to_string())?,
     };
     if spec.secret == SecretPolicy::Required && client.client_secret.is_none() {
         return Err(format!(
@@ -1420,7 +1481,7 @@ async fn connect_inner(
 
     persist(
         state,
-        &crate::connectors::config_file_path()?,
+        &config_path,
         spec,
         label,
         host.as_deref(),
@@ -1626,11 +1687,7 @@ mod tests {
         for (provider, key, value) in [
             (ConnectorProvider::GoogleDrive, "access_type", "offline"),
             (ConnectorProvider::GoogleDrive, "prompt", "consent"),
-            (
-                ConnectorProvider::Dropbox,
-                "token_access_type",
-                "offline",
-            ),
+            (ConnectorProvider::Dropbox, "token_access_type", "offline"),
         ] {
             let spec = spec(provider);
             let base = Url::parse(spec.authorize_url).unwrap();
@@ -1667,7 +1724,14 @@ mod tests {
             },
         };
         let base = Url::parse(HOSTILE.authorize_url).unwrap();
-        let url = authorize_url(&HOSTILE, &base, "c", "http://127.0.0.1:1/", "real-state", None);
+        let url = authorize_url(
+            &HOSTILE,
+            &base,
+            "c",
+            "http://127.0.0.1:1/",
+            "real-state",
+            None,
+        );
         let states: Vec<_> = url
             .query_pairs()
             .filter(|(k, _)| k == "state")
@@ -1706,15 +1770,30 @@ mod tests {
     #[test]
     fn loopback_redirect_uri_is_stable_per_provider_and_inside_the_dynamic_range() {
         let first = preferred_redirect_uri(ConnectorProvider::Linear).unwrap();
-        assert_eq!(first, preferred_redirect_uri(ConnectorProvider::Linear).unwrap());
-        assert_ne!(first, preferred_redirect_uri(ConnectorProvider::Asana).unwrap());
+        assert_eq!(
+            first,
+            preferred_redirect_uri(ConnectorProvider::Linear).unwrap()
+        );
         assert!(preferred_redirect_uri(ConnectorProvider::Slack).is_none());
-        let port: u16 = first
-            .trim_start_matches("http://127.0.0.1:")
-            .trim_end_matches('/')
-            .parse()
-            .unwrap();
-        assert!((49152..=65535).contains(&port), "{first}");
+
+        // Two providers sharing a port would share a redirect URI, which the
+        // user registers by hand — a collision has to fail here, at build
+        // time, not in someone's Settings pane.
+        let mut seen: Vec<(ConnectorProvider, String)> = Vec::new();
+        for spec in OAUTH_PROVIDERS {
+            let uri = preferred_redirect_uri(spec.provider).unwrap();
+            let port: u16 = uri
+                .trim_start_matches("http://127.0.0.1:")
+                .trim_end_matches('/')
+                .parse()
+                .unwrap_or_else(|e| panic!("{:?}: {uri}: {e}", spec.provider));
+            assert!((49152..=65535).contains(&port), "{:?} {uri}", spec.provider);
+            if let Some((other, _)) = seen.iter().find(|(_, known)| known == &uri) {
+                panic!("{:?} and {:?} both claim {uri}", other, spec.provider);
+            }
+            seen.push((spec.provider, uri));
+        }
+        assert_eq!(seen.len(), OAUTH_PROVIDERS.len());
     }
 
     #[test]
@@ -1758,15 +1837,21 @@ mod tests {
                 assert_eq!(url.scheme(), "https", "{:?} {url}", spec.provider);
             }
             if spec.secret == SecretPolicy::Never {
-                assert!(spec.pkce, "{:?} must use PKCE with no secret", spec.provider);
+                assert!(
+                    spec.pkce,
+                    "{:?} must use PKCE with no secret",
+                    spec.provider
+                );
             }
         }
     }
 
     #[test]
     fn every_connector_provider_is_either_oauth_or_an_explicitly_listed_scheme() {
-        // Keeps the enum, the OAuth table and the counts in features.md /
-        // limitations.md from silently drifting apart.
+        // What actually catches a variant added to `ConnectorProvider` and
+        // nowhere else is `as_str`'s exhaustive match (a compile error). This
+        // test guards the *counts*: the 11/6/17 split that features.md,
+        // limitations.md and the README row all state in prose.
         let non_oauth = [
             ConnectorProvider::Github,
             ConnectorProvider::Slack,
@@ -1919,7 +2004,10 @@ mod tests {
 
     #[test]
     fn a_user_supplied_host_is_pinned_to_its_own_origin_and_junk_is_refused() {
-        assert_eq!(normalize_host(" gitlab.example.com/ ").unwrap(), "gitlab.example.com");
+        assert_eq!(
+            normalize_host(" gitlab.example.com/ ").unwrap(),
+            "gitlab.example.com"
+        );
         assert_eq!(
             normalize_host("https://acme.zendesk.com").unwrap(),
             "acme.zendesk.com"
@@ -1935,9 +2023,12 @@ mod tests {
         }
         // The verification call is pinned to the *resolved* verify URL's own
         // origin, so a host can never be used to reach a different one.
-        let endpoints =
-            resolve_endpoints(spec(ConnectorProvider::Gitlab), Some("gitlab.example.com"), "common")
-                .unwrap();
+        let endpoints = resolve_endpoints(
+            spec(ConnectorProvider::Gitlab),
+            Some("gitlab.example.com"),
+            "common",
+        )
+        .unwrap();
         assert_eq!(
             crate::connectors::origin_of(&endpoints.verify).unwrap(),
             "https://gitlab.example.com"
@@ -1950,7 +2041,9 @@ mod tests {
 
     // --- the connect state machine (fake AS + fake browser) ----------------
 
-    fn fake_browser(then: impl Fn(&Url) -> String + Send + Sync + 'static) -> impl Fn(&str) -> Result<(), String> + Sync {
+    fn fake_browser(
+        then: impl Fn(&Url) -> String + Send + Sync + 'static,
+    ) -> impl Fn(&str) -> Result<(), String> + Sync {
         move |authorize_url: &str| {
             let url = Url::parse(authorize_url).map_err(|e| e.to_string())?;
             let redirect = url
@@ -1960,15 +2053,14 @@ mod tests {
                 .ok_or("no redirect_uri")?;
             let query = then(&url);
             let target = Url::parse(&redirect).map_err(|e| e.to_string())?;
-            let addr = format!(
-                "127.0.0.1:{}",
-                target.port().ok_or("redirect has no port")?
-            );
+            let addr = format!("127.0.0.1:{}", target.port().ok_or("redirect has no port")?);
             let mut stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
             stream
                 .write_all(
-                    format!("GET /?{query} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                        .as_bytes(),
+                    format!(
+                        "GET /?{query} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
                 )
                 .map_err(|e| e.to_string())?;
             Ok(())
@@ -1990,10 +2082,14 @@ mod tests {
     #[tokio::test]
     async fn connect_flow_exchanges_the_code_and_returns_the_verified_identity() {
         let (addr, seen) = spawn_fixture(vec![
-            json_ok(r#"{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600,"scope":"read"}"#),
+            json_ok(
+                r#"{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600,"scope":"read"}"#,
+            ),
             json_ok(r#"{"data":{"viewer":{"name":"Ada","email":"ada@example.com"}}}"#),
         ]);
         let cancel = CancellationToken::new();
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&phases);
         let (tokens, identity) = run_connect_flow(
             inputs(addr, ConnectorProvider::Linear),
             &cancel,
@@ -2005,11 +2101,25 @@ mod tests {
                     .unwrap();
                 format!("code=the-code&state={state}")
             }),
-            &|_, _| {},
+            &move |phase: &str, _: Option<String>| {
+                recorder.lock().unwrap().push(phase.to_string());
+            },
         )
         .await
         .expect("connect flow");
 
+        // The exact strings `ConnectorsPanel` keys its phase pill off; the
+        // terminal phases (`connected` / `error` / `cancelled` /
+        // `needs_client_id`) are emitted by the command, not the flow.
+        assert_eq!(
+            phases.lock().unwrap().as_slice(),
+            [
+                "opening_browser",
+                "waiting_for_browser",
+                "exchanging_token",
+                "verifying"
+            ]
+        );
         assert_eq!(identity, "ada@example.com");
         assert_eq!(tokens.access_token, "at-1");
         assert_eq!(tokens.refresh_token.as_deref(), Some("rt-1"));
@@ -2018,7 +2128,10 @@ mod tests {
         let requests = seen.lock().unwrap().clone();
         assert_eq!(requests.len(), 2, "{requests:?}");
         assert!(requests[0].contains("grant_type=authorization_code"));
-        assert!(requests[0].contains("code_verifier="), "PKCE verifier must be sent");
+        assert!(
+            requests[0].contains("code_verifier="),
+            "PKCE verifier must be sent"
+        );
         assert!(requests[0].contains("code=the-code"));
         assert!(requests[1].contains("Bearer at-1"));
     }
@@ -2036,7 +2149,10 @@ mod tests {
         .await
         .expect_err("must refuse");
         assert!(error.contains("never issued"), "{error}");
-        assert!(seen.lock().unwrap().is_empty(), "no token request may be sent");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no token request may be sent"
+        );
     }
 
     #[tokio::test]
@@ -2046,9 +2162,7 @@ mod tests {
         let error = run_connect_flow(
             inputs(addr, ConnectorProvider::Dropbox),
             &cancel,
-            &fake_browser(|_| {
-                "error=access_denied&error_description=The+user+said+no".to_string()
-            }),
+            &fake_browser(|_| "error=access_denied&error_description=The+user+said+no".to_string()),
             &|_, _| {},
         )
         .await
@@ -2108,30 +2222,6 @@ mod tests {
         // `run_connect_flow` writes nothing by construction — the only proof
         // needed is that no request was ever sent and nothing was persisted.
         assert!(seen.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn the_phases_the_flow_streams_are_the_ones_the_ui_maps() {
-        // The UI keys its pill off these exact strings.
-        for phase in [
-            "needs_client_id",
-            "opening_browser",
-            "waiting_for_browser",
-            "exchanging_token",
-            "verifying",
-            "connected",
-            "error",
-            "cancelled",
-        ] {
-            assert!(!phase.is_empty());
-        }
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let recorder = Arc::clone(&seen);
-        let progress = move |phase: &str, _: Option<String>| {
-            recorder.lock().unwrap().push(phase.to_string());
-        };
-        progress("opening_browser", None);
-        assert_eq!(seen.lock().unwrap().as_slice(), ["opening_browser"]);
     }
 
     // --- refresh ------------------------------------------------------------
@@ -2310,8 +2400,14 @@ mod tests {
         ] {
             assert!(!raw.contains(secret), "{secret} leaked into {raw}");
         }
-        assert!(raw.contains("connector-oauth:"), "credential_ref is a keychain name");
-        assert!(raw.contains("gitlab.example.com"), "non-secret host is kept");
+        assert!(
+            raw.contains("connector-oauth:"),
+            "credential_ref is a keychain name"
+        );
+        assert!(
+            raw.contains("gitlab.example.com"),
+            "non-secret host is kept"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2371,16 +2467,69 @@ mod tests {
             }],
         };
         crate::connectors::save_config_impl(&path, &config).unwrap();
-        // Not asserting on the keychain (which this test never wrote to):
-        // the contract under test is that a provider with a surviving account
-        // is never considered unused.
-        let still_used = crate::connectors::load_config_impl(&path)
-            .unwrap()
-            .accounts
-            .iter()
-            .any(|a| a.provider == ConnectorProvider::Gitlab);
-        assert!(still_used);
-        forget_client_if_unused(&path, ConnectorProvider::Gitlab);
+        // A surviving account of the provider keeps the shared registration;
+        // a provider with no account left releases it. The return value is
+        // the branch, so the keychain (which this test never wrote to) does
+        // not have to be inspected.
+        assert!(!forget_client_if_unused(&path, ConnectorProvider::Gitlab));
+        assert!(forget_client_if_unused(&path, ConnectorProvider::Dropbox));
+        // A non-OAuth provider has no registration to forget.
+        assert!(!forget_client_if_unused(&path, ConnectorProvider::Slack));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_different_client_id_is_refused_while_accounts_of_that_provider_exist() {
+        let path = std::env::temp_dir().join(unique_id("client-swap.json"));
+        let stored = ClientRegistration {
+            client_id: "first-app".to_string(),
+            client_secret: None,
+        };
+        let pasted = ClientRegistration {
+            client_id: "second-app".to_string(),
+            client_secret: None,
+        };
+        let account = ConnectorAccount {
+            id: "keep".to_string(),
+            provider: ConnectorProvider::Gitlab,
+            label: "Other GitLab".to_string(),
+            scopes: vec![],
+            credential_ref: None,
+            identity: None,
+            created_at: 0,
+            last_verified_at: None,
+            last_error: None,
+            connection: None,
+        };
+        let config = crate::connectors::ConnectorCatalogFile {
+            version: 1,
+            accounts: vec![account],
+        };
+        crate::connectors::save_config_impl(&path, &config).unwrap();
+
+        let error = refuse_client_id_swap(&path, ConnectorProvider::Gitlab, Some(&stored), &pasted)
+            .expect_err("must refuse");
+        assert!(error.contains("1 connected account"), "{error}");
+        // The same id is not a swap; a provider with no account may re-register;
+        // and nothing stored means nothing to protect.
+        refuse_client_id_swap(&path, ConnectorProvider::Gitlab, Some(&stored), &stored).unwrap();
+        refuse_client_id_swap(&path, ConnectorProvider::Dropbox, Some(&stored), &pasted).unwrap();
+        refuse_client_id_swap(&path, ConnectorProvider::Gitlab, None, &pasted).unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_hostile_identity_response_is_truncated_to_the_label_bound() {
+        let verify = VerifySpec {
+            method: "GET",
+            url: "https://example.com/me",
+            headers: &[],
+            json_body: None,
+            identity_pointers: &["/name"],
+        };
+        let long = "é".repeat(5_000);
+        let body = serde_json::to_vec(&serde_json::json!({ "name": long })).unwrap();
+        let identity = identity_from(&verify, &body).unwrap();
+        assert_eq!(identity.chars().count(), IDENTITY_MAX_CHARS);
     }
 }
