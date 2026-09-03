@@ -224,7 +224,7 @@ so it is the same string for every account of that provider and never changes:
 | Asana | required | — |
 | Dropbox | optional | — |
 | Box | required | — |
-| Airtable | optional (PKCE is mandatory) | — |
+| Airtable | **never** — register a public client (PKCE is mandatory, and its confidential flow needs the secret in an HTTP Basic header, which this app does not send) | — |
 | Zendesk | optional with PKCE | your subdomain host, e.g. `acme.zendesk.com` |
 | HubSpot | required | — |
 | Discord | required | — |
@@ -234,8 +234,8 @@ Leave the secret blank for a public PKCE client — sending an empty secret is n
 the same request as sending none, and the app sends none. If a secret is already
 saved against the *same* client id, a blank field keeps it rather than erasing
 it, since that one registration is what every existing account of the provider
-refreshes against. Microsoft Graph is the one provider with no secret field at
-all; every other card shows one.
+refreshes against. Microsoft Graph and Airtable are the two providers with no
+secret field at all; every other card shows one.
 
 The client id and secret are saved in your keychain per *provider*, so the second
 account of the same provider only needs a label: leave both fields blank and the
