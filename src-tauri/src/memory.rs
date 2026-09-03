@@ -940,7 +940,8 @@ pub fn merge_impl(
 /// prompts again) and remove the merged fact itself. Returns how many
 /// parents were restored. An unknown id, or a fact with an empty
 /// `merged_from`, is a no-op success (`Ok(0)`) — the caller's desired end
-/// state already holds.
+/// state already holds. A merged fact that has itself been merged into a
+/// newer one is an error, not a no-op: see the guard below.
 ///
 /// Note the direction: this *discards* the merged fact, so any edit made to
 /// the merged text after the merge is lost. Restoring pinned parents does
@@ -960,6 +961,18 @@ pub fn unmerge_impl(path: &Path, root: &str, id: &str) -> Result<usize, String> 
     };
     if merged.merged_from.is_empty() {
         return Ok(0);
+    }
+    // A merge that has itself been merged into another one cannot be undone
+    // on its own: restoring its parents would put their text back into every
+    // prompt *while the outer merge still carries it*, and would leave the
+    // outer merge's `merged_from` naming an id this call is about to delete.
+    // Refused rather than cascaded — undoing the newer merge first is the
+    // only order that leaves the store consistent.
+    if merged.retired_at.is_some() {
+        return Err(
+            "Undo the newer merge first — this memory was itself merged into another one."
+                .to_string(),
+        );
     }
     let mut restored = 0usize;
     for fact in project.facts.iter_mut() {
@@ -1411,16 +1424,21 @@ fn apply_imported_lifecycle(
         fact.enabled = entry.enabled;
         fact.pinned = pinned;
         fact.expires_at = expires_at;
-        // Validated exactly like `expires_at`, and for the same reason: an
-        // import file is untrusted input, and a non-timestamp here sorts
-        // above `stale_before()` forever, so `mark_used_impl`'s throttle
-        // would never re-stamp this memory again (and the Studio row would
-        // print the junk verbatim). Dropped rather than rejected — a bad
-        // "last used" costs nothing but the stamp.
+        // Normalized *and* clamped to the past, for the same reason
+        // `expires_at` is validated: an import file is untrusted input, and
+        // junk or a future stamp here sorts above `stale_before()` forever,
+        // so `mark_used_impl`'s throttle would never re-stamp this memory
+        // again (and the Studio row would print the value verbatim).
+        // Normalizing also stores the fixed-width shape `now_rfc3339()`
+        // produces, which the throttle's lexicographic compare assumes.
+        // Dropped rather than rejected — a bad "last used" costs nothing but
+        // the stamp.
+        let now_stamp = now_rfc3339();
         fact.last_used_at = entry
             .last_used_at
-            .clone()
-            .filter(|raw| normalize_expiry(raw).is_ok());
+            .as_deref()
+            .and_then(|raw| normalize_expiry(raw).ok())
+            .filter(|stamp| stamp <= &now_stamp);
         fact.retired_at = entry.retired_at.clone();
         fact.merged_from = entry
             .merged_from
@@ -2956,6 +2974,39 @@ mod tests {
     }
 
     #[test]
+    fn undoing_a_merge_that_was_itself_merged_is_refused() {
+        // Restoring the inner merge's parents while the outer merge still
+        // carries their text would fold that text into every prompt twice,
+        // and leave the outer merge's `merged_from` naming a deleted id.
+        let path = temp_path();
+        let a = add_fact_impl(&path, "/ws/project", "a", "agent", None).unwrap();
+        let b = add_fact_impl(&path, "/ws/project", "b", "agent", None).unwrap();
+        let c = add_fact_impl(&path, "/ws/project", "c", "agent", None).unwrap();
+        let first = merge_impl(&path, "/ws/project", &[a.id.clone(), b.id.clone()], None).unwrap();
+        let second =
+            merge_impl(&path, "/ws/project", &[first.id.clone(), c.id.clone()], None).unwrap();
+
+        let err = unmerge_impl(&path, "/ws/project", &first.id).unwrap_err();
+        assert!(err.contains("newer merge"), "unexpected error: {err}");
+        let listed = list_impl(&path, Some("/ws/project")).unwrap();
+        assert_eq!(
+            listed.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            vec![second.id.as_str()],
+            "only the outer merge reaches the prompt"
+        );
+
+        // The outer merge is still undoable, and its undo restores exactly
+        // the two facts it retired.
+        assert_eq!(unmerge_impl(&path, "/ws/project", &second.id).unwrap(), 2);
+        assert_eq!(unmerge_impl(&path, "/ws/project", &first.id).unwrap(), 2);
+        let listed = list_impl(&path, Some("/ws/project")).unwrap();
+        assert_eq!(listed.len(), 3, "a, b and c are all back");
+        let _ = c;
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn merge_retired_pins_do_not_occupy_the_pin_ceiling() {
         // Merging two pinned memories leaves both parents `pinned` under a
         // `retired_at`. Counting those would burn ceiling slots the user
@@ -3164,11 +3215,12 @@ mod tests {
                     } else {
                         None
                     },
-                    // Junk on the first entry, a real stamp on the second:
-                    // one must be dropped, the other kept verbatim.
+                    // Junk on the first entry, a real stamp on the second, a
+                    // far-future one on the third: only the middle survives.
                     last_used_at: match n {
                         0 => Some("whenever".to_string()),
                         1 => Some("2026-02-03T04:05:06.000Z".to_string()),
+                        2 => Some("9999-12-31".to_string()),
                         _ => None,
                     },
                     merged_from: Vec::new(),
@@ -3200,8 +3252,9 @@ mod tests {
             facts.iter().all(|f| f.expires_at.is_none()),
             "an unparseable expiry is dropped, not stored"
         );
-        // A junk "last used" would sort above `stale_before()` forever and
-        // wedge `mark_used_impl`'s throttle for that memory.
+        // A junk *or* future-dated "last used" would sort above
+        // `stale_before()` forever and wedge `mark_used_impl`'s throttle for
+        // that memory.
         let last_used: Vec<Option<&str>> = facts
             .iter()
             .map(|f| f.last_used_at.as_deref())
