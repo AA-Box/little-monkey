@@ -83,12 +83,14 @@ function MemoryRow({
   selected,
   onToggleSelected,
   onChanged,
+  onNotice,
 }: {
   entry: MemoryEntry;
   now: string;
   selected: boolean;
   onToggleSelected: () => void;
   onChanged: () => Promise<void>;
+  onNotice: (message: string) => void;
 }) {
   const { t } = useT();
   const [editing, setEditing] = useState(false);
@@ -237,7 +239,16 @@ function MemoryRow({
               {entry.merged_from.length > 0 && (
                 <button
                   type="button"
-                  onClick={() => void runRow(() => unmergeMemories(entry.id, entry.project_root))}
+                  onClick={() =>
+                    void runRow(async () => {
+                      // `unmergeMemories` resolves to 0 — not an error — for an
+                      // id the backend can no longer find, so without this
+                      // message a silently failed undo looks like a successful
+                      // one: the row just refreshes either way.
+                      const restored = await unmergeMemories(entry.id, entry.project_root);
+                      onNotice(t("MemoryStudioPanel.unmergeComplete", { count: restored }));
+                    })
+                  }
                   disabled={rowBusy}
                   className="flex cursor-pointer items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-xs text-muted transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                 >
@@ -454,7 +465,10 @@ export function MemoryStudioPanel() {
         case "active":
           return entry.retired_at === null;
         case "pinned":
-          return entry.pinned;
+          // A merge-retired pin is bookkeeping for the undo, not a pin the
+          // user has: the backend stopped counting it against the ceiling,
+          // so this filter must not list it either.
+          return entry.pinned && entry.retired_at === null;
         case "expired":
           return isExpired(entry, now);
         case "merged":
@@ -711,6 +725,7 @@ export function MemoryStudioPanel() {
                     selected={selectedIds.has(entry.id)}
                     onToggleSelected={() => toggleSelected(entry.id)}
                     onChanged={refresh}
+                    onNotice={setSuccess}
                   />
                 ))}
               </div>
@@ -732,6 +747,7 @@ export function MemoryStudioPanel() {
                     selected={selectedIds.has(entry.id)}
                     onToggleSelected={() => toggleSelected(entry.id)}
                     onChanged={refresh}
+                    onNotice={setSuccess}
                   />
                 ))}
               </div>
