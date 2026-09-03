@@ -260,6 +260,28 @@ pub(super) async fn handle_http(
     if let Some(response) = super::web::asset(&method, &path_and_query) {
         return Ok(to_http(response));
     }
+    // The served web chat page and its three JSON routes. Placed before the
+    // signed dispatch because nothing here is signed: this surface's whole
+    // authentication is that the request reached *this* listener carrying a
+    // visitor identifier the daemon itself minted. Only the routes
+    // `webchat::target` recognises are taken, so nothing else changes shape.
+    if let Some(route) = super::webchat::target(&method, &path_and_query) {
+        let visitor = request
+            .headers()
+            .get("x-webchat-visitor")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        // Its own, much smaller cap: one browser message is a few lines of
+        // text, not a device report.
+        let body = match Limited::new(request.into_body(), super::webchat::MAX_BODY_BYTES)
+            .collect()
+            .await
+        {
+            Ok(value) => value.to_bytes().to_vec(),
+            Err(_) => return Ok(to_http(ApiResponse::error(413, "Request body is too large"))),
+        };
+        return Ok(super::webchat::handle(api.paths(), route, visitor, body, now_ms() as i64).await);
+    }
     // Checked before the body is collected, because there is no body: this is
     // the one route on the plane that becomes a socket instead of answering.
     if method == "GET" {
