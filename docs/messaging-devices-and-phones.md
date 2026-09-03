@@ -361,17 +361,53 @@ therefore **not** claimed as verified here.
 - Email, Home Assistant and the served web chat page are registered providers
   like any other: each one ingests, routes, queues and drains through the same
   production ingress and outbox as the thirteen before them, driven by the
-  contract test that enumerates every kind. What is additionally proven for
-  each is its *refusals*, because that is where these three differ from the
-  rest — an email account whose IMAP port is 143 or whose SMTP port is 25 is
-  refused at construction rather than downgraded, a Home Assistant `base_url`
-  that is not a bare `https` origin (or a `notify_service` name that could
-  select a different endpoint) is refused before a token is ever attached to a
-  request, and the web chat kind is refused by the public channel-webhook
-  builder outright, so the page is reachable only through the daemon's own
-  listener. A provider that holds no credential of ours — the helper providers,
-  SMS, and the served page — is no longer reported by Security Doctor as an
-  enabled account missing one.
+  contract test that enumerates every kind. Beyond that, each has its own
+  network-free suite over recorded payloads:
+  - **Email** — normalization of recorded RFC 5322 messages, including the
+    reply chain the next message must carry (`References` root, then
+    `In-Reply-To`, then the message's own `Message-ID`), RFC 2047 encoded
+    words, a deterministic event id that is stable across two reads and moves
+    with the UID, and `is_self` decided by the account's own configured address
+    rather than by anything the message claims. The refusals: an account whose
+    IMAP port is 143 or whose SMTP port is 25 is refused at construction rather
+    than downgraded; autoresponders, bounces and mailing-list posts
+    (`Auto-Submitted`, `Precedence: bulk|list|junk`, `List-Id`,
+    `List-Unsubscribe`, an empty `Return-Path`) are never answered; a
+    conversation id cannot inject a header or a second recipient. Outbound is
+    built by a pure function under test — `Re:` exactly once, the reference
+    chain bounded, a `Message-ID` minted deterministically from the idempotency
+    key so a retry re-uses it — and the SMTP exchange itself runs against an
+    in-process scripted relay: `AUTH PLAIN`/`LOGIN` only when that server's own
+    EHLO advertised it, dot-stuffing, the 4xx / 5xx / failed-at-the-dot outcome
+    mapping, and a hostile relay that echoes the password back cannot get it
+    into a rendered error.
+  - **Home Assistant** — normalization of recorded WebSocket event frames, and
+    the handshake that authenticates before it subscribes: the account reaches
+    *connected* only after a successful subscribe result, an event that arrives
+    before then produces nothing, and a rejected token or a refused
+    subscription stops the socket rather than being retried. The notify
+    outcomes are mapped against a loopback fixture (2xx, 429 with its
+    `Retry-After`, 401, 404, 5xx, and a connection that never left this
+    machine); an attachment is refused before any request is made; a `base_url`
+    that is not a bare `https` origin, or a `notify_service` name that could
+    select a different endpoint, is refused before a token is ever attached to
+    a request; and the token appears in no rendered error.
+  - **Web chat** — the whole loopback leg, run for real on every pull request
+    by `examples/webchat_installed_service_e2e.rs`: an HTTP client that is not
+    Little Monkey reaches the installed daemon's own listener, is answered with
+    a pairing code, is approved, and its next message becomes a durable turn and
+    a real agent reply on the page's transcript. The visitor identifier is
+    minted by the daemon and self-verifying — an invented one is refused, and
+    one minted for another account does not verify here — the request body may
+    carry nothing but `{visitor_id, text}`, and the sender the adapter reports
+    is computed from its own account id, so no client-controlled header reaches
+    the policy. The page has its own request budget and body cap, its response
+    header CSP is asserted equal to the page's own, and the kind is refused by
+    the public channel-webhook builder outright, so the page is reachable only
+    through the daemon's own listener.
+  A provider that holds no credential of ours — the helper providers, SMS, and
+  the served page — is no longer reported by Security Doctor as an enabled
+  account missing one.
 - Webhook signature verification for WhatsApp, Teams, Google Chat and LINE, and
   carrier callback verification for Twilio, Plivo and Telnyx, over exact bytes,
   including forged and replayed bodies.

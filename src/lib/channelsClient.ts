@@ -326,7 +326,7 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
       { key: "imap_password", label: "IMAP password" },
       { key: "smtp_password", label: "SMTP password (leave empty to reuse the IMAP one)" },
     ],
-    whereToGetIt: "Your own mailbox. Use an app password where your provider issues one \u2014 OAuth sign-in is not implemented. TLS is required on both legs and there is no cleartext configuration to get wrong: the adapter always opens an implicit-TLS socket and refuses ports 143 and 25 outright. One conversation per correspondent address, so a reply goes to the sender rather than to a mailing list, and it carries In-Reply-To and References so it lands in the same thread. The mailbox is polled rather than held open with IDLE.",
+    whereToGetIt: "Your own mailbox. Use an app password where your provider issues one \u2014 OAuth sign-in is not implemented. TLS is required on both legs and there is no cleartext configuration to get wrong: the adapter always opens an implicit-TLS socket and refuses ports 143 and 25 outright. One conversation per correspondent address, so a reply goes to the sender alone and never to everyone on a thread, and it carries In-Reply-To and References so it lands in the same thread. Automated mail — autoresponders, bounces and mailing-list posts — is never answered at all. The mailbox is polled about every thirty seconds rather than held open with IDLE.",
     docsUrl: "https://datatracker.ietf.org/doc/html/rfc5322",
     configFields: [
       { key: "imap_host", label: "IMAP server", type: "text", required: true, placeholder: "imap.example.org" },
@@ -351,7 +351,7 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
   {
     kind: "webchat", label: "Web chat", transport: "served", credentialOptional: true,
     credentialLabel: "None \u2014 visitors pair like any other sender",
-    whereToGetIt: "A chat page this app serves on the resident daemon\u2019s own TLS listener, at your runner origin under /webchat/<account id>. Configure the remote host first (Settings \u2192 Remote, or `monkey daemon remote configure`); without one there is nothing to serve on. Loopback is the default, and a listener bound to a wildcard or multicast address, or to port zero, is refused rather than served. A first-time visitor is answered with a pairing code, exactly like a stranger on any other provider; approve them from the pending list with `monkey channels approve`. No files in either direction, and a visitor reads only their own conversation.",
+    whereToGetIt: "A chat page this app serves on the resident daemon\u2019s own TLS listener, at your runner origin under /webchat/<account id>. Configure the remote host first (Settings \u2192 Remote, or `monkey daemon remote configure`); without one there is nothing to serve on. Loopback is the default; bind that listener wider and the page is answered wherever the remote controller shell already is, with pairing and the route’s own rate limit as the gate. Each browser is minted a visitor identifier the daemon can verify, so one a browser invented is refused rather than opening a conversation. A first-time visitor is answered with a pairing code, exactly like a stranger on any other provider — up to sixteen waiting at once, after which a new visitor’s page stays quiet until you clear the list; approve them with `monkey channels approve`. No files in either direction, and a visitor reads only their own conversation.",
     docsUrl: "https://github.com/AA-Box/little-monkey/blob/develop/docs/messaging-devices-and-phones.md",
     configFields: [],
   },

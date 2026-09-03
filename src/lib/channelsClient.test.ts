@@ -151,11 +151,11 @@ describe("channels setup guidance", () => {
     // an operator decides whether the account will do what they want.
     const text = (kind: string) => PROVIDER_GUIDES.find((guide) => guide.kind === kind)!.whereToGetIt;
     expect(text("email")).toMatch(/refuses ports 143 and 25/i);
-    expect(text("email")).toMatch(/polled rather than held open with IDLE/i);
+    expect(text("email")).toMatch(/polled about every thirty seconds rather than held open with IDLE/i);
     expect(text("home_assistant")).toMatch(/no file upload/i);
     expect(text("home_assistant")).toMatch(/https unless it is localhost/i);
     expect(text("webchat")).toMatch(/pairing code/i);
-    expect(text("webchat")).toMatch(/refused rather than served/i);
+    expect(text("webchat")).toMatch(/invented is refused rather than opening a conversation/i);
     // No credential exists for a served page, so setup must not imply one.
     expect(PROVIDER_GUIDES.find((guide) => guide.kind === "webchat")?.credentialOptional).toBe(true);
   });
