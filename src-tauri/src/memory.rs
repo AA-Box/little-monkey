@@ -1430,8 +1430,8 @@ pub fn memory_studio_update(
     update_fact_impl(&path, &studio_scope(project_root), &id, &text)
 }
 
-/// Enable/disable a memory that Memory Studio is showing — the "disable
-/// (soft-off without deleting)" action from ROADMAP.md's Memory Studio spec.
+/// Enable/disable a memory that Memory Studio is showing — the soft-off
+/// action (turn a memory off without deleting it).
 /// See [`set_enabled_impl`] for why this is what actually keeps a disabled
 /// memory out of future prompts.
 #[tauri::command]
@@ -1621,7 +1621,7 @@ mod tests {
     /// Shared with `rulesStore.test.ts`'s canonical-fixture test (which reads
     /// the same file via a JSON import) — a single fixture, not two
     /// independently hand-typed literals, is what actually pins the
-    /// TS<->Rust `Fact` schema against drift, per ROADMAP.md §3.6.
+    /// TS<->Rust `Fact` schema against drift.
     const CANONICAL_FACT_JSON: &str = include_str!("../fixtures/memory-fact.canonical.json");
 
     /// The fixture is deliberately still v1-shaped (no `pinned`,
@@ -2022,9 +2022,8 @@ mod tests {
         assert!(err.contains("not found"), "unexpected error: {err}");
     }
 
-    /// The CRITICAL, independently-testable proof ROADMAP.md's Memory Studio
-    /// acceptance criteria asks for: "deleting or disabling a memory
-    /// prevents it from entering future prompts." `list_impl` is the exact
+    /// The CRITICAL, independently-testable proof that deleting or disabling
+    /// a memory prevents it from entering future prompts. `list_impl` is the exact
     /// function `memory_list` calls, which `rulesStore.facts` is populated
     /// from every turn, which `systemPrompt.ts`'s `factsLines` reads
     /// straight into the outgoing system prompt — so proving a disabled or
