@@ -6,9 +6,13 @@
 //! account is desktop-only. A half-built terminal version would be a worse
 //! claim than saying so, which `docs/limitations.md` does.
 //!
-//! Secrets are never printed. The listing shows `credential_ref` — a keychain
-//! account name, not a credential — and whatever the last real verification
-//! call recorded.
+//! Secrets are never printed. The human listing shows the account id,
+//! provider, label, recorded identity and verification time. `--json`
+//! serializes the stored `ConnectorAccount` as-is, which additionally includes
+//! `credential_ref` (a keychain account name, not a credential) and
+//! `connection` (non-secret provider metadata — a GitLab host, an S3 endpoint
+//! and access key id). That is a wider shape than `export_audit_impl`'s
+//! redacted one, and is meant for a local operator reading their own catalog.
 
 use little_monkey_lib::connector_oauth::is_reconnect_error;
 use little_monkey_lib::connectors::{self, ConnectorAccount};
@@ -101,4 +105,58 @@ async fn remove(id: &str) -> Result<(), String> {
     connectors::remove_account(&state, &connectors::config_file_path()?, id).await?;
     println!("Removed {id}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use little_monkey_lib::connector_oauth::reconnect_error;
+    use little_monkey_lib::connectors::ConnectorProvider;
+
+    fn account(provider: ConnectorProvider) -> ConnectorAccount {
+        ConnectorAccount {
+            id: "acct-1".to_string(),
+            provider,
+            label: "Work".to_string(),
+            scopes: vec!["read".to_string()],
+            credential_ref: Some("connector-oauth:acct-1".to_string()),
+            identity: Some("ada@example.com".to_string()),
+            created_at: 1,
+            last_verified_at: None,
+            last_error: None,
+            connection: None,
+        }
+    }
+
+    #[test]
+    fn describe_renders_the_identity_and_the_verification_state() {
+        let mut row = account(ConnectorProvider::GoogleDrive);
+        let never = describe(&row);
+        assert!(never.contains("acct-1"), "{never}");
+        assert!(never.contains("google_drive"), "{never}");
+        assert!(never.contains("Work"), "{never}");
+        assert!(never.contains("(ada@example.com)"), "{never}");
+        assert!(never.contains("never verified"), "{never}");
+
+        row.last_verified_at = Some(1_700_000_000_000);
+        assert!(describe(&row).contains("verified at 1700000000000"));
+
+        row.identity = None;
+        assert!(describe(&row).contains("(—)"));
+    }
+
+    #[test]
+    fn describe_prints_no_keychain_reference_for_an_oauth_row() {
+        // `credential_ref` is a keychain account name, not a credential, but
+        // the human listing has no reason to show it — only `--json` does.
+        let line = describe(&account(ConnectorProvider::Linear));
+        assert!(!line.contains("connector-oauth:"), "{line}");
+    }
+
+    #[test]
+    fn a_reconnect_shaped_error_is_recognised_and_an_ordinary_one_is_not() {
+        let reconnect = reconnect_error(ConnectorProvider::Dropbox, "invalid_grant");
+        assert!(is_reconnect_error(&reconnect), "{reconnect}");
+        assert!(!is_reconnect_error("Dropbox returned HTTP 500"));
+    }
 }
