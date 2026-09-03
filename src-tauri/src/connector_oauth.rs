@@ -943,7 +943,7 @@ fn delete_tokens(id: &str) {
 /// Clears a provider's shared client registration once no account of that
 /// provider is left. Best-effort — the same stance `remove_impl` takes toward
 /// its own keychain cleanup.
-pub(crate) fn forget_client_if_unused(config_path: &std::path::Path, provider: ConnectorProvider) {
+pub fn forget_client_if_unused(config_path: &std::path::Path, provider: ConnectorProvider) {
     if spec_for(provider).is_none() {
         return;
     }
@@ -1115,7 +1115,7 @@ pub(crate) async fn verify_account(
 /// Revokes an account at the provider, if the provider publishes an endpoint
 /// this app can call. Failures are swallowed on purpose: removal must succeed
 /// regardless.
-pub(crate) async fn revoke_and_forget(account: &ConnectorAccount) {
+pub async fn revoke_and_forget(account: &ConnectorAccount) {
     let Some(spec) = spec_for(account.provider) else {
         return;
     };

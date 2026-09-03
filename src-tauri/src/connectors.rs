@@ -137,7 +137,7 @@ pub enum ConnectorProvider {
 }
 
 impl ConnectorProvider {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             ConnectorProvider::Github => "github",
             ConnectorProvider::Slack => "slack",
@@ -210,7 +210,7 @@ fn keychain_account(provider: ConnectorProvider, id: &str) -> String {
 /// path. AppHandle-free via `app_paths::data_dir()` — unlike `mcp.rs`'s
 /// `config_file_path`, this needs no `AppHandle` at all, so every command
 /// below (bar the ones that also need `AppState`) is a plain function.
-pub(crate) fn config_file_path() -> Result<PathBuf, String> {
+pub fn config_file_path() -> Result<PathBuf, String> {
     let dir =
         crate::app_paths::data_dir().ok_or_else(|| "Failed to resolve app data dir".to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {e}"))?;
@@ -1338,7 +1338,9 @@ pub async fn connectors_add_s3(
     .await
 }
 
-fn remove_impl(state: &AppState, path: &Path, id: &str) -> Result<(), String> {
+/// `pub` because `monkey connectors remove` in the CLI bin (a separate
+/// crate from this lib) calls it directly.
+pub fn remove_impl(state: &AppState, path: &Path, id: &str) -> Result<(), String> {
     let _guard = state
         .connectors_config_lock
         .lock()
@@ -1373,27 +1375,33 @@ pub async fn connectors_remove(
     state: tauri::State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
-    let path = config_file_path()?;
+    remove_account(state.inner(), &config_file_path()?, &id).await
+}
+
+/// Removal end to end: best-effort revocation at the provider, then the
+/// catalog row and its keychain entries. `pub` because `monkey connectors
+/// remove` in the CLI bin (a separate crate) is the second caller.
+pub async fn remove_account(state: &AppState, path: &Path, id: &str) -> Result<(), String> {
     // Best-effort revocation happens *before* `remove_impl`, and outside it:
     // `remove_impl` holds `connectors_config_lock` (a `std::sync::Mutex`) for
     // its whole body, so an `.await` inside would make this future non-`Send`.
     // A provider that publishes no callable revocation endpoint, or a network
     // failure, must never block the user from removing the account.
-    let removed = load_config_impl(&path)?
+    let removed = load_config_impl(path)?
         .accounts
         .into_iter()
         .find(|account| account.id == id);
     if let Some(account) = &removed {
         crate::connector_oauth::revoke_and_forget(account).await;
     }
-    remove_impl(state.inner(), &path, &id)?;
+    remove_impl(state, path, id)?;
     // The per-provider client registration (id + secret) is shared by every
     // account of that provider, so it is only cleared once the last one is
     // gone — otherwise disconnecting one Google account would send the other
     // back to the Google console. Best-effort, same stance as the keychain
     // cleanup in `remove_impl`.
     if let Some(account) = &removed {
-        crate::connector_oauth::forget_client_if_unused(&path, account.provider);
+        crate::connector_oauth::forget_client_if_unused(path, account.provider);
     }
     Ok(())
 }
@@ -1435,7 +1443,9 @@ fn reverify_github_identity_impl(
     }
 }
 
-async fn reverify_impl(
+/// `pub` because `monkey connectors reverify` in the CLI bin (a separate
+/// crate from this lib) calls it directly.
+pub async fn reverify_impl(
     state: &AppState,
     path: &Path,
     id: &str,

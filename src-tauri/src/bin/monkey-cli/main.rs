@@ -20,6 +20,7 @@ mod chat;
 mod checkpoints_cli;
 mod cmds;
 mod conformance_cli;
+mod connectors_cli;
 mod contract_cli;
 mod conversations_cli;
 mod daemon;
@@ -418,6 +419,12 @@ enum Cmd {
     Channels {
         #[command(subcommand)]
         action: channels_cli::ChannelsCmd,
+    },
+    /// Inspect, reverify and remove connector accounts. Connecting a new
+    /// OAuth account is desktop-only: consent opens a system browser.
+    Connectors {
+        #[command(subcommand)]
+        action: connectors_cli::ConnectorsCmd,
     },
     /// Read conversations that live outside this desktop — a paired phone's
     /// chat, a messaging conversation the agent is answering.
@@ -1607,6 +1614,7 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             return;
         }
         Cmd::Channels { action } => channels_cli::dispatch(action).await,
+        Cmd::Connectors { action } => connectors_cli::dispatch(action).await,
         Cmd::Conversations { action } => conversations_cli::dispatch(action),
         Cmd::Ingress { action } => ingress_cli::dispatch(action),
         Cmd::Peers { action } => peers_cli::dispatch(action).await,
