@@ -5,17 +5,17 @@ Supersedes: the 2026-07-16 revision of this file.
 
 This file has no owning roadmap item today. The item that commissioned it shipped, and `ROADMAP.md` must not accumulate "Done" entries, so the audit is refreshed on demand rather than tracked as future work.
 
-It compares Little Monkey's **actually shipped** capabilities (as documented in `README.md`, `docs/features.md`, and `docs/limitations.md`) against public capability claims for fifteen named competitors, across ten gap categories. It is meant to be re-run periodically, not treated as a one-time snapshot. The 2026-07-16 revision is the evidence for that: three of its findings — no mobile app, no in-app terminal, no desktop control — were falsified by shipped work within seven weeks, and a fourth category (PC control) went from "no competitor creates pressure" to three competitors documenting it.
+It compares Little Monkey's **actually shipped** capabilities (as documented in `README.md`, `docs/features.md`, and `docs/limitations.md`) against public capability claims for fifteen named competitors, across ten gap categories. It is meant to be re-run periodically, not treated as a one-time snapshot. The 2026-07-16 revision is the evidence for that: three of its findings — no mobile app, no in-app terminal, no desktop control — were falsified by shipped work within seven weeks, and one of those categories (PC control) changed a second time: it went from "no competitor creates pressure" to three competitors documenting it.
 
 ## Methodology and honesty rules
 
-- **Little Monkey column**: grounded in `README.md`, `docs/features.md`, and `docs/limitations.md` as they stand on `develop`, plus the docs those files themselves link where a capability lives in one of them. `ROADMAP.md` is consulted only for the linkage line — and because shipped work leaves that file, an absent roadmap item is evidence a capability shipped, not evidence it is missing.
-- **Competitor columns**: based on public product pages, docs, and press coverage checked on the audit date. Where a claim could not be verified from a primary or reputable secondary source, it is marked **"unclear / not publicly documented"** rather than guessed. Fast-moving vendor claims (private beta features, changelog entries) are noted with their approximate date so staleness is visible later.
+- **Little Monkey column**: grounded in `README.md`, `docs/features.md`, and `docs/limitations.md` as they stand on `develop`, plus the docs those files themselves link where a capability lives in one of them. `ROADMAP.md` is consulted only for the linkage line. It holds future work, so an absent item means this audit found no open roadmap commitment for the capability — not that the capability exists. Items marked *(built)* remain in the file for their stated remainder.
+- **Competitor columns**: based on public product pages, docs, and press coverage checked on the audit date. Where a claim could not be verified from a primary or reputable secondary source, it is marked **"unclear / not publicly documented"** rather than guessed. Beta and preview status is flagged in the note; where the source gives a date it is recorded, so staleness is visible later.
 - **Support levels**: `Yes` (shipped and documented), `Partial` (shipped but narrower/beta/opt-in/third-party), `No` (not offered), `Unclear` (could not verify).
 - **Risk** describes what happens to Little Monkey's competitive position if the gap is left open, not a security risk rating.
 - **Priority** is the audit's recommendation for roadmap sequencing pressure, not a commitment — actual sequencing stays with `ROADMAP.md`.
 
-One consequence of the second rule is worth stating plainly: most competitors here are scored from a single landing page or README, so categories 4, 5, 9, and 10 read heavily "unclear / not publicly documented". That marker means the source consulted does not say, not that the vendor lacks the capability.
+One consequence of the second rule is worth stating plainly: most competitors here are scored from a single landing page or README, so several categories read heavily "unclear / not publicly documented" — model comparison worst at 12 of fifteen rows, then PC control at 8, then memory, mobile and governance at 5 each. That marker means the source consulted does not say, not that the vendor lacks the capability.
 
 ## Competitors at a glance
 
@@ -37,13 +37,13 @@ One consequence of the second rule is worth stating plainly: most competitors he
 | OpenAI Codex desktop app (in the ChatGPT app) | Desktop coding agent | Codex inside the ChatGPT desktop app; the only surface the documentation maps a feature to by name (browser work in Edge, Brave, Opera, Vivaldi and Chrome "from the ChatGPT desktop app") | [learn.chatgpt.com/codex](https://learn.chatgpt.com/codex) |
 | Claude Desktop (Chat / Cowork / Code) | Desktop agent workspace | Anthropic's desktop app with Chat, Cowork, and Code tabs: per-session Git worktrees, a draggable pane layout including terminal and browser, computer use, cloud and SSH environments, and Dispatch from a phone | [code.claude.com/docs/en/desktop](https://code.claude.com/docs/en/desktop) |
 
-Rows 1-8 are the local-first / self-hosted block, 9-12 the hosted coding agents, 13-15 the desktop-app agents. Rows 13 and 14 are two surfaces of one OpenAI product, kept separate because the desktop app is where the documentation locates the in-app browser and where categories 3 and 10 would otherwise silently merge two different things. The source consulted maps very few features to a named surface, so wherever it does not, both rows carry the same verdict and say so rather than inventing a difference.
+Rows 1-8 are the local-first / self-hosted block, 9-13 the hosted and CLI coding agents, 14-15 the desktop-app agents. Rows 13 and 14 are two surfaces of one OpenAI product, kept separate because the desktop app is where the documentation locates the in-app browser and where categories 3 and 10 would otherwise silently merge two different things. The source consulted maps very few features to a named surface, so wherever it does not, both rows carry the same verdict and say so rather than inventing a difference.
 
 Little Monkey itself: a local-first Tauri desktop workspace with a shared Rust/React contract across chat, workflows, background daemon runs, knowledge, an in-app PTY terminal and browser pane, Git delivery, paired remote runners, a paired mobile companion, and scoped desktop control — see `docs/features.md` for the shipped list this audit draws from and `docs/limitations.md` for where each claim stops.
 
 ## Gap category matrix
 
-Each section below states what the capability means, how the fifteen competitors currently stack up, Little Monkey's actual current status, the risk of leaving the gap open, a priority recommendation, and the roadmap item (or explicit non-goal) it maps to.
+Each section below states what the capability means, how the fifteen competitors currently stack up, Little Monkey's actual current status, the risk of leaving the gap open, a priority recommendation, and the roadmap linkage it maps to: a live roadmap item, an explicit non-goal, or shipped-with-no-open-item.
 
 ### 1. Autonomous task orchestration
 
@@ -58,8 +58,8 @@ Each section below states what the capability means, how the fifteen competitors
 | AnythingLLM | Partial | AI Agents and Agent Flows are documented; long-horizon self-testing autonomy is not |
 | Open WebUI | Partial | "Models maintain structured task lists for multi-step workflows" and agentic retrieval; no first-party long-horizon orchestrator documented |
 | Jan | Unclear | Not documented on the docs home |
-| LM Studio | No | The MCP page documents tool connection only; no autonomous task runner |
-| Cursor | Yes | Background and cloud agents: "Delegate implementation to focus on higher-level direction", with subagents running in parallel |
+| LM Studio | Unclear | Not mentioned on the MCP page consulted |
+| Cursor | Yes | Cloud agents and parallel subagents: "Delegate implementation to focus on higher-level direction", "Run cloud agents from your browser or phone" |
 | Devin | Yes | "Autonomous AI software engineer that can write, run and test code" |
 | Replit Agent | Yes | "Agent 3 runs on its own for up to 200 minutes, handling full tasks autonomously—building, testing and fixing your app" |
 | GitHub Copilot (coding agent) | Yes | Starts from the agents panel or an `@copilot` mention and works in "its own ephemeral development environment, powered by GitHub Actions, where it can explore your code, make changes, execute automated tests and linters" |
@@ -73,7 +73,7 @@ Each section below states what the capability means, how the fifteen competitors
 
 **Priority:** Medium
 
-**Roadmap linkage:** shipped — see `docs/features.md`; no roadmap item. The capability itself is documented in `docs/autonomous-tasks.md`; the gap this audit records is that `docs/features.md` does not describe it.
+**Roadmap linkage:** shipped — see `docs/autonomous-tasks.md`; no roadmap item. `docs/features.md` does not describe it, which is the defect this row records.
 
 ### 2. Model comparison
 
@@ -89,13 +89,13 @@ Each section below states what the capability means, how the fifteen competitors
 | Open WebUI | Yes | "Run two models side-by-side and compare responses" |
 | Jan | Unclear | Not documented on the docs home |
 | LM Studio | Unclear | Not mentioned on the MCP page consulted |
-| Cursor | No | Model selection per agent and per subagent; no side-by-side comparison documented |
+| Cursor | Unclear | Model selection per agent and per subagent is documented; side-by-side comparison is not mentioned on the product page consulted |
 | Devin | Unclear | Not documented |
 | Replit Agent | Unclear | Not mentioned in the Agent 3 announcement |
 | GitHub Copilot (coding agent) | Partial | "Depending on how you start your Copilot cloud agent task, you may be able to select the model used" — selection, not comparison |
-| OpenAI Codex (CLI, IDE extension, cloud) | No | Model selection is documented; comparison is not |
-| OpenAI Codex desktop app | No | Same; the page does not scope this by surface |
-| Claude Desktop | No | One model per session with per-session selection and `availableModels` restrictions; no side-by-side comparison documented |
+| OpenAI Codex (CLI, IDE extension, cloud) | Unclear | Model selection is documented; comparison is not mentioned on the page consulted |
+| OpenAI Codex desktop app | Unclear | Same; the page does not scope this by surface |
+| Claude Desktop | Unclear | One model per session with per-session selection and `availableModels` restrictions; side-by-side comparison is not mentioned on the page consulted |
 
 **Little Monkey status:** Shipped and comparatively strong. `docs/features.md` describes Compare over two to four explicit targets with independent streaming, stop, retry, timing, usage, persistence and response promotion, defaulting to no tools and keeping target snapshots when global model settings change; Ultracode fans one turn across up to four available models through the same Compare pipeline and runs a synthesis pass; and the workbenches add Model Compare Lab, a Golden Dataset Builder over real model calls, multi-model debate, Trust Scorecards that cite the field each dimension read, and a Workflow and Agent Test Harness whose release-gate suites block a target workflow from starting until a complete passing run of the current suite revision exists. The one boundary: "Release-gate eval state is desktop-local, so CLI and API-server workflow starts are not gated."
 
@@ -112,10 +112,10 @@ Each section below states what the capability means, how the fifteen competitors
 | Competitor | Support | Notes |
 | --- | --- | --- |
 | Agent-Zoey / Zoey | Partial | A CLI/terminal interface and a Web UI/REST API exist; no in-app terminal or browser panel documented |
-| Hermes Agent | Yes (terminal) / Unclear (browser) | "Seven terminal backends — local, Docker, SSH, Singularity, Modal, Daytona, and Vercel Sandbox"; no browser surface documented in the README |
+| Hermes Agent | Partial | "Seven terminal backends — local, Docker, SSH, Singularity, Modal, Daytona, and Vercel Sandbox" are execution backends for agent commands, not a shared in-app terminal surface; no browser surface documented in the README |
 | OpenClaw | Partial | Companion nodes expose "voice, Canvas, camera, screen, and device-local actions on supported platforms", and there is a Control UI, CLI and TUI; a first-class in-app terminal or browser is not documented in the README |
 | Msty | Unclear | Neither surface is documented on the features page |
-| AnythingLLM | Unclear | Neither surface is documented on the docs home |
+| AnythingLLM | Partial | A "Private Browser Tool" for authenticated scraping, a browser extension, and Web Browsing and Web Scraping agent skills are documented; there is no in-app terminal and no user-facing browser pane |
 | Open WebUI | Partial | "Live preview of web projects inside Open WebUI" plus in-chat code execution; no terminal panel documented |
 | Jan | Unclear | Not documented |
 | LM Studio | Unclear | Not mentioned on the MCP page consulted |
@@ -145,7 +145,7 @@ Each section below states what the capability means, how the fifteen competitors
 | Hermes Agent | Yes | "FTS5 session search with LLM summarization for cross-session recall. Honcho dialectic user modeling", plus "Agent-curated memory with periodic nudges" |
 | OpenClaw | Unclear | No memory mechanism described in the README |
 | Msty | Partial | Versioned Knowledge Stacks are governed document context, not a cross-session personal memory feature |
-| AnythingLLM | Partial | Workspace vector knowledge; no dedicated cross-session memory surface on the docs home |
+| AnythingLLM | Yes | "Memories & Personalization": a memories sidebar with workspace (20) and global (5) scopes, manual add, edit, delete and scope moves, plus automatic extraction through an Observer/Reflector pipeline on a configurable schedule (default every three hours) |
 | Open WebUI | Yes | "The AI remembers facts about you across conversations" |
 | Jan | Unclear | Not documented |
 | LM Studio | Unclear | Not mentioned on the MCP page consulted |
@@ -187,9 +187,9 @@ Each section below states what the capability means, how the fifteen competitors
 | OpenAI Codex desktop app | Partial | Same; the page does not scope this by surface |
 | Claude Desktop | Partial | Per-session model selection, `availableModels` managed-setting restrictions, and third-party providers — Amazon Bedrock, Google Cloud's Agent Platform, Microsoft Foundry, or a self-hosted gateway — with "Anthropic's API by default", so it is not Anthropic-only; no user-authored routing policy |
 
-**Little Monkey status:** Shipped and ahead of every competitor checked on the policy dimension. `docs/features.md` describes chat against managed `llama.cpp`, Ollama, MLX or configured cloud/BYOK providers "with capability-aware routing, provider failover, context compaction, usage accounting, and rate-limit warnings", and the Privacy Firewall overrides routing rather than being overridden by it. `ROADMAP.md`'s first item names what is already authored in **Settings → Automation → Dispatch policies** — named policies evaluated top to bottom, each scoped by task class and constrained by a cost-rate ceiling, a measured-latency target, data sensitivity, a tool requirement and an ordered list of preferred models, with the winning policy and every rejected model and its reason surfaced.
+**Little Monkey status:** Shipped at the mechanism level. `docs/features.md` describes chat against managed `llama.cpp`, Ollama, MLX or configured cloud/BYOK providers "with capability-aware routing, provider failover, context compaction, usage accounting, and rate-limit warnings", and the Privacy Firewall overrides routing rather than being overridden by it. A user-authored routing-policy surface is described only in `ROADMAP.md`'s first item and appears in none of the three shipped-behaviour files, so — as with Memory Studio and Team Mode — this audit records the boundary and does not describe the feature.
 
-**Risk if open:** Low — a forward differentiation, not a catch-up gap.
+**Risk if open:** Low — capability-aware routing and failover are shipped, and no competitor checked here documents a user-authored routing policy either, so the policy dimension is open ground rather than ground being lost.
 
 **Priority:** Medium
 
@@ -223,7 +223,7 @@ The **messaging** side is strong: `docs/limitations.md` names "messaging channel
 
 The **app/data connector** side is the gap. `docs/features.md` describes MCP with remote OAuth metadata and tokens, BYO OAuth clients, preserved structured content, routed tools that never bypass allowlists, and MCP Apps in an opaque-origin window; signed declarative packages with install and update permission previews, pins, rollback, revocation and an offline cache; signed WASM extensions from verified M4 registry snapshots with a full `monkey extensions` developer loop; one **Discover** catalog; and "a signed first-party catalog of six skills (review, testing, documentation, browser QA, release preparation, knowledge workflows) plus declarative GitHub, GitLab, WebDAV, and REST/webhook connector packages". `docs/limitations.md` bounds it differently: "The connector catalog covers 5 of roughly 17 providers with pasted tokens rather than branded OAuth." Those two sentences do not agree about the catalog's size — four named packages against five of roughly seventeen providers — and this audit reports both rather than picking one; reconciling them is a change to those files, not to this one. Also in force: "Inbox triage is read-only with no rules engine", and the non-goals **"No Gmail/Outlook inbox integration. Inbox triage covers Slack, Jira, and GitHub read-only."** and **"No Google Drive knowledge connector."**
 
-**Risk if open:** High — connector breadth is a recurring adoption blocker for knowledge-worker use cases, and Claude Desktop, both Codex surfaces, GitHub Copilot, Open WebUI and AnythingLLM all reach the common work-app set (Calendar, Slack, Linear, Notion, Drive) that Little Monkey's own catalog does not.
+**Risk if open:** High — connector breadth is a recurring adoption blocker for knowledge-worker use cases, and the named work-app catalogs sit with the hosted competitors: Claude Desktop names Google Calendar, Slack, GitHub, Linear and Notion behind a graphical setup flow, Codex names Gmail, Slack and GitHub event triggers plus Apple Messages and Linear, and Replit surfaces a UI flow onto Notion, Linear, Dropbox and SharePoint. Copilot ships the GitHub and Playwright MCP servers by default, and Open WebUI and AnythingLLM document MCP support generically with no named work-app catalog — so the rating rests on those three named catalogs, not on all six. Little Monkey's own catalog reaches none of Calendar, Notion or Drive.
 
 **Priority:** High
 
@@ -275,7 +275,7 @@ The **app/data connector** side is the gap. `docs/features.md` describes MCP wit
 | LM Studio | Unclear | Not mentioned on the MCP page consulted |
 | Cursor | Yes | "Cursor is available as a native iOS app on your phone, now in public beta" |
 | Devin | Unclear | Web app plus Slack and Teams entry points; no native mobile app documented |
-| Replit Agent | Partial | Browser-hosted by default; the Agent 3 post makes no mobile-app claim |
+| Replit Agent | Partial | Browser-hosted by default; "live monitoring on your phone" is documented, a native mobile app is not |
 | GitHub Copilot (coding agent) | Unclear | The page consulted makes no mention of GitHub Mobile |
 | OpenAI Codex (CLI, IDE extension, cloud) | Partial | Reachable through the ChatGPT surfaces; the page does not document a mobile Codex surface explicitly |
 | OpenAI Codex desktop app | Partial | Same |
@@ -301,7 +301,7 @@ The **app/data connector** side is the gap. `docs/features.md` describes MCP wit
 | Msty | Yes | "Team controls — Add SSO, role-based access, model and feature controls, and administrative audit logs when you need shared governance" |
 | AnythingLLM | Partial | Multi-user self-hosted server mode is documented; specific role names are not on the docs home |
 | Open WebUI | Yes | "Roles, groups, and per-resource permissions", "Restrict models to specific users or groups", and "SSO, RBAC, audit logs, data residency, and on-premises or air-gapped deployment" |
-| Jan | Unclear | Not documented |
+| Jan | Partial | Tokamak is "Self-hosted router, fusion model, and governance/audit"; no roles, RBAC model, or audit-export detail is documented on the docs home |
 | LM Studio | Unclear | Not mentioned on the MCP page consulted |
 | Cursor | Unclear | A Teams product section exists; RBAC and audit specifics are not on the product page |
 | Devin | Unclear | Not documented on the docs home |
@@ -333,10 +333,10 @@ The **app/data connector** side is the gap. `docs/features.md` describes MCP wit
 | Open WebUI | Unclear | A product called "Computer" is linked from the landing page with no detail there |
 | Jan | Unclear | Not documented |
 | LM Studio | Unclear | Not mentioned on the MCP page consulted |
-| Cursor | No | Editor, shell and Design Mode scope; no desktop control documented |
-| Devin | No | Shell and Browser workspace tools; no desktop control documented |
-| Replit Agent | No | Browser-hosted IDE scope; no desktop control documented |
-| GitHub Copilot (coding agent) | No | Ephemeral Actions environment; no desktop control documented |
+| Cursor | Unclear | Editor, shell and Design Mode surfaces are documented; desktop control is not mentioned on the product page consulted |
+| Devin | Unclear | Shell and Browser workspace tools are documented; desktop control is not mentioned on the docs home |
+| Replit Agent | No | Browser-hosted IDE with no access to the local host, so desktop control is outside the product's architecture rather than merely undocumented |
+| GitHub Copilot (coding agent) | No | Runs in an ephemeral GitHub Actions environment with no access to the user's machine, so desktop control is architecturally out of scope |
 | OpenAI Codex (CLI, IDE extension, cloud) | Partial | Computer use is a documented Codex feature; the page maps it to no surface and states no platform, plan or regional limits — unclear / not publicly documented |
 | OpenAI Codex desktop app | Partial | Same; the surface split for computer use is unclear / not publicly documented |
 | Claude Desktop | Yes | "Computer use lets Claude open your apps, control your screen, and work directly on your machine the way you would." A research preview on macOS and Windows requiring a Pro or Max plan, "not available on Team or Enterprise plans", off by default, needing Accessibility and Screen Recording on macOS, with per-action checks, prompt-injection flagging of on-screen content, and per-app tiers capping browsers at view-only and terminals and IDEs at click-only |
@@ -351,15 +351,15 @@ The **app/data connector** side is the gap. `docs/features.md` describes MCP wit
 
 ## Master gap ledger
 
-Compact view of the ten categories: Little Monkey's current status, risk of leaving the gap open, recommended priority, and the roadmap linkage that satisfies "linked roadmap item or explicit non-goal."
+Compact view of the ten categories: Little Monkey's current status, risk of leaving the gap open, recommended priority, and the roadmap linkage: a live roadmap item, an explicit non-goal, or shipped-with-no-open-item.
 
 | # | Gap category | Little Monkey status today | Risk if open | Priority | Roadmap item(s) / non-goal |
 | --- | --- | --- | --- | --- | --- |
-| 1 | Autonomous task orchestration | Shipped: bounded coordinator (`monkey task`, Autonomous Task panel) with validated DAG, worktree workers, verification and acceptance evidence, on top of workflow DAGs, the daemon and triggers; remaining: delivery still needs explicit confirmation, a task with no verification command stays `WAITING_USER`, and `docs/features.md` documents none of it | Medium | Medium | shipped — see docs/features.md; no roadmap item |
+| 1 | Autonomous task orchestration | Shipped: bounded coordinator (`monkey task`, Autonomous Task panel) with validated DAG, worktree workers, verification and acceptance evidence, on top of workflow DAGs, the daemon and triggers; remaining: delivery still needs explicit confirmation, a task with no verification command stays `WAITING_USER`, and `docs/features.md` documents none of it | Medium | Medium | shipped — see docs/autonomous-tasks.md; no roadmap item. docs/features.md does not describe it, which is the defect this row records |
 | 2 | Model comparison | Shipped: Compare over two to four targets, Ultracode fan-out, Model Compare Lab, Golden Dataset Builder, debate, Trust Scorecards, release-gate eval suites; remaining: release-gate state is desktop-local so CLI and API-server starts are not gated | Low | Low | shipped — see docs/features.md; no roadmap item |
-| 3 | Browser/terminal integration | Shipped: xterm.js PTY terminal tab and tabbed webview browser pane among the eight sidebar tabs, plus disposable-Chromium Browser Verification; remaining: the pane rides Tauri's unstable multiwebview API and verification profiles stay disposable | Low | Low | non-goal "Browser verification stays disposable" |
-| 4 | Memory | Shipped: `memory` agent tool, Knowledge Stacks 2.0 with end-to-end retrieval inspection, learned skills as procedural memory; remaining: Memory Studio "has two scopes and no pin, merge, or expiry" and appears in no feature documentation | Medium | Medium | shipped — see docs/features.md; no roadmap item |
-| 5 | Model routing | Shipped: capability-aware routing, provider failover, and named Dispatch policies with cost, latency, sensitivity and tool constraints, under the Privacy Firewall; remaining: subagent task classes, managed llama.cpp for local-only policies, and the decision in the durable run ledger | Low | Medium | `1. Policy-driven model routing` *(partially built)* |
+| 3 | Browser/terminal integration | Shipped: xterm.js PTY terminal tab and tabbed webview browser pane among the eight sidebar tabs, plus disposable-Chromium Browser Verification; remaining: the pane rides Tauri's unstable multiwebview API and verification profiles stay disposable | Low | Low | non-goal "Browser verification stays disposable"; otherwise shipped — see docs/features.md; no roadmap item |
+| 4 | Memory | Shipped: `memory` agent tool, Knowledge Stacks 2.0 with end-to-end retrieval inspection, learned skills as procedural memory; remaining: Memory Studio "has two scopes and no pin, merge, or expiry" and appears in no feature documentation | Medium | Medium | shipped — see docs/features.md for the memory tool and Knowledge Stacks; Memory Studio itself is documented only by its limits |
+| 5 | Model routing | Shipped: capability-aware routing and provider failover under the Privacy Firewall; remaining: the user-authored routing-policy surface is described only in `ROADMAP.md` (subagent task classes, managed llama.cpp for local-only policies, and the decision in the durable run ledger) | Low | Medium | `1. Policy-driven model routing` *(partially built)* |
 | 6 | Connector ecosystems | Shipped: MCP with OAuth and BYO clients, signed packages, WASM extensions, one Discover catalog, six first-party skills, and thirteen messaging providers on one ingress; remaining: the app/data catalog is four named packages by `docs/features.md` and "5 of roughly 17 providers" by `docs/limitations.md`, and reaches none of Calendar, Notion or Drive | High | High | non-goals "No Gmail/Outlook inbox integration" and "No Google Drive knowledge connector"; otherwise shipped — see docs/features.md; no roadmap item |
 | 7 | Remote execution | Shipped: local, Docker, paired-node and SSH execution targets with frozen identity, bounded workspace transfer, and a user-owned paired runner over pinned TLS with scoped grants; remaining: no relay, account service, RBAC/SSO plane or hosted GPU, by design | Medium | Medium | non-goal "No hosted Little Monkey service — no relay, account service, hosted GPU, or RBAC/SSO plane. Remote access is user-owned infrastructure only." |
 | 8 | Mobile | Shipped: paired iOS/Android companion with pinned-TLS invitation, run and approval browsing, digest approval, cancel and kill switch, chat, workflow launch, phone Talk and offline capture queueing; remaining: online-only browsing, operator-selected push, and unmet device, signing and store gates | Medium | Medium | `5. Mobile companion — remaining gaps` *(partially built)* |
@@ -370,15 +370,15 @@ Compact view of the ten categories: Little Monkey's current status, risk of leav
 
 In priority order, the audit's three highest-confidence, highest-priority findings:
 
-1. **Connector ecosystem breadth still trails the leaders.** The only survivor of the 2026-07-16 top three. Claude Desktop, both Codex surfaces, GitHub Copilot, Open WebUI and AnythingLLM all reach the common work-app set; Little Monkey's own app/data catalog does not. This refresh also found that the two grounding files disagree about how big that catalog is — `docs/features.md` names four connector packages, `docs/limitations.md` says "5 of roughly 17 providers" — which is a documentation defect worth fixing before the capability gap is argued about. Note the asymmetry in the other direction too: thirteen messaging providers reach one durable ingress, more than any competitor's channel list found here, and `docs/features.md` does not say so either.
+1. **Connector ecosystem breadth still trails the leaders.** The only survivor of the 2026-07-16 top three. Claude Desktop names Calendar, Slack, GitHub, Linear and Notion behind a graphical setup flow, Codex names Gmail, Slack, GitHub, Apple Messages and Linear, and Replit names Notion, Linear, Dropbox and SharePoint; Little Monkey's own app/data catalog reaches none of Calendar, Notion or Drive. (Copilot ships two MCP servers by default, and Open WebUI and AnythingLLM document MCP generically without a named work-app catalog, so this rests on three named catalogs, not six.) This refresh also found that the two grounding files disagree about how big that catalog is — `docs/features.md` names four connector packages, `docs/limitations.md` says "5 of roughly 17 providers" — which is a documentation defect worth fixing before the capability gap is argued about. Note the asymmetry in the other direction too: thirteen messaging providers reach one durable ingress, more than any competitor's channel list found here, and `docs/features.md` does not say so either.
 2. **The autonomous run stops one step short of delivery.** The coordinator, the worktree workers, the verification and the acceptance evidence are all shipped and in places stricter than the competition. What differs is the last mile: `monkey task start` runs "with network/external mutations disabled by default; delivery still requires the relevant repository policy and explicit confirmation", and GitHub delivery and merge stay outside the worker. Competitors default to opening the PR. That is a defensible boundary rather than a missing feature — but a reader of `docs/features.md` cannot find the capability at all, which is the part worth fixing.
 3. **Governance stops at one desktop user by design.** Team Mode's RBAC is enforced at one defined point and its audit trail attributes the exporter rather than the approver; approval chains are sequential and answered by the same desktop user; and the multi-user plane is closed by an explicit non-goal. This is a positioning decision to restate deliberately, not a backlog item — but it is the reason four competitors clear a bar Little Monkey does not intend to clear.
 
-Where Little Monkey is at or ahead of parity today: **model comparison** (two-to-four-target Compare, Ultracode fan-out, and release-gate eval suites, against two competitors documenting side-by-side chat and none documenting scored suites); **model routing** (named policies over cost, latency, sensitivity and tool requirements, which no competitor checked here exposes to a user); **the in-app terminal and browser pane** (a real PTY and a tabbed webview pane, now level with Claude Desktop and the Codex desktop app); **the user-owned remote-runner model** (scoped invitations, pinned TLS, no relay); and **the Computer Use safety envelope** — an expiring application/window grant, frontmost revalidation, sensitive-target refusal, and screenshots recorded to the run ledger — which is narrower and better documented than any competitor's screen control found in this refresh.
+Where Little Monkey is at or ahead of parity today: **model comparison** (two-to-four-target Compare, Ultracode fan-out, and release-gate eval suites, against two competitors documenting side-by-side chat and none documenting scored suites); **the in-app terminal and browser pane** (a real PTY and a tabbed webview pane, now level with Claude Desktop and the Codex desktop app); **the user-owned remote-runner model** (scoped invitations, pinned TLS, no relay); and **the Computer Use safety envelope** — an expiring application/window grant, frontmost revalidation, sensitive-target refusal, and screenshots recorded to the run ledger — which is narrower and better documented than any competitor's screen control found in this refresh.
 
-Direction of travel since 2026-07-16 matters more than any single verdict here. Three of that revision's findings — no mobile app, no in-app terminal, no desktop control — were falsified by shipped work within seven weeks. One category went the other way: PC control moved from "no named competitor creates pressure" to three competitors documenting it plus a fourth exposing device screens. A parity audit that is re-run twice a year would have been wrong about four of ten categories for months at a time; the cadence is the finding.
+Direction of travel since 2026-07-16 matters more than any single verdict here. Three of that revision's findings — no mobile app, no in-app terminal, no desktop control — were falsified by shipped work within seven weeks. One category went the other way: PC control moved from "no named competitor creates pressure" to three competitors documenting it plus a fourth exposing device screens. A parity audit that is re-run twice a year would have been wrong about three of ten categories — one of them for two independent reasons — for months at a time; the cadence is the finding.
 
-This audit proposes no `ROADMAP.md` change. The highest-priority gaps either map to a live partially-built item or fall inside a stated non-goal, and the work that shipped since the last revision correctly carries no roadmap item at all under that file's no-Done-items rule. What it does propose is documentation work in the files it is grounded in: `docs/features.md` describes no Autonomous Task, Memory Studio, or Team Mode surface and carries no messaging-channel roster, and it disagrees with `docs/limitations.md` about the connector catalog's size. Each of those needs a source-of-truth decision from a code owner rather than an edit from this file.
+This audit proposes no `ROADMAP.md` change. The highest-priority gaps either map to a live partially-built item or fall inside a stated non-goal, and the work that shipped since the last revision correctly carries no roadmap item at all under that file's no-Done-items rule. What it does propose is documentation work in the files it is grounded in: `docs/features.md` describes no Autonomous Task, Memory Studio, Team Mode, or routing-policy surface and carries no messaging-channel roster, and it disagrees with `docs/limitations.md` about the connector catalog's size. Each of those needs a source-of-truth decision from a code owner rather than an edit from this file.
 
 ## Sources consulted
 
