@@ -131,6 +131,10 @@ interface OAuthProviderInfo {
   /** Placeholder key for the instance-host / tenant field, when the provider
    * needs one. */
   hostPlaceholderKey?: string;
+  /** True when `connector_oauth.rs` has no default for that field (Zendesk's
+   * `ApiHost { default: None }`), so a blank one is refused by the backend.
+   * Catching it here keeps the failure in the form instead of a red pill. */
+  hostRequired?: boolean;
 }
 
 export const OAUTH_PROVIDERS: OAuthProviderInfo[] = [
@@ -151,6 +155,7 @@ export const OAUTH_PROVIDERS: OAuthProviderInfo[] = [
     copyKey: "ConnectorsPanel.zendeskCopy",
     secret: "optional",
     hostPlaceholderKey: "ConnectorsPanel.oauthHostPlaceholderZendesk",
+    hostRequired: true,
   },
   { provider: "hubspot", copyKey: "ConnectorsPanel.hubspotCopy", secret: "required" },
   { provider: "discord", copyKey: "ConnectorsPanel.discordCopy", secret: "required" },
@@ -712,7 +717,8 @@ export function OAuthConnectForm({ info, onDone }: { info: OAuthProviderInfo; on
   // the registration already saved in the keychain for this provider, which is
   // what makes a second account of the same provider one click. Blank with
   // nothing stored comes back as the `needs_client_id` phase.
-  const canSubmit = label.trim().length > 0 && !connecting;
+  const canSubmit =
+    label.trim().length > 0 && (!info.hostRequired || host.trim().length > 0) && !connecting;
 
   useEffect(() => {
     if (redirectUri !== null) return;
@@ -772,6 +778,7 @@ export function OAuthConnectForm({ info, onDone }: { info: OAuthProviderInfo; on
           value={label}
           onChange={(event) => setLabel(event.target.value)}
           placeholder={t("ConnectorsPanel.labelPlaceholder")}
+          aria-label={t("ConnectorsPanel.labelPlaceholder")}
           className="h-8 rounded-md border border-border bg-surface px-2.5 text-sm text-foreground placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
         />
         {info.hostPlaceholderKey && (
@@ -780,6 +787,7 @@ export function OAuthConnectForm({ info, onDone }: { info: OAuthProviderInfo; on
             value={host}
             onChange={(event) => setHost(event.target.value)}
             placeholder={t(info.hostPlaceholderKey)}
+            aria-label={t(info.hostPlaceholderKey)}
             className="h-8 rounded-md border border-border bg-surface px-2.5 font-mono text-sm text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
           />
         )}
@@ -788,6 +796,7 @@ export function OAuthConnectForm({ info, onDone }: { info: OAuthProviderInfo; on
           value={clientId}
           onChange={(event) => setClientId(event.target.value)}
           placeholder={t("ConnectorsPanel.oauthClientIdPlaceholder")}
+          aria-label={t("ConnectorsPanel.oauthClientIdPlaceholder")}
           autoComplete="off"
           className="h-8 rounded-md border border-border bg-surface px-2.5 font-mono text-sm text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
         />
@@ -797,6 +806,7 @@ export function OAuthConnectForm({ info, onDone }: { info: OAuthProviderInfo; on
             value={clientSecret}
             onChange={(event) => setClientSecret(event.target.value)}
             placeholder={t("ConnectorsPanel.oauthClientSecretPlaceholder")}
+            aria-label={t("ConnectorsPanel.oauthClientSecretPlaceholder")}
             autoComplete="off"
             className="h-8 rounded-md border border-border bg-surface px-2.5 font-mono text-sm text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
           />

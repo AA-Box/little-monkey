@@ -1328,11 +1328,17 @@ pub async fn revoke_and_forget(account: &ConnectorAccount) {
         return;
     };
     let tokens = match crate::run_commands::unix_time_ms() {
-        Ok(now) => refresh_if_expired(spec, &endpoints, false, &client, &tokens, now)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(tokens),
+        Ok(now) => match refresh_if_expired(spec, &endpoints, false, &client, &tokens, now).await {
+            // Persisted before the revoke call, not after: a provider that
+            // rotates refresh tokens has already invalidated the stored one,
+            // so if the catalog write below this fails and the row survives,
+            // it survives pointing at the token the provider still knows.
+            Ok(Some(refreshed)) => {
+                let _ = save_tokens(&account.id, &refreshed);
+                refreshed
+            }
+            _ => tokens,
+        },
         Err(_) => tokens,
     };
     let _ = revoke(spec, &endpoints, false, &client, &tokens).await;
@@ -1347,6 +1353,11 @@ pub(crate) struct ConnectInputs<'a> {
     /// `true` only in tests, where the fixture authorization server is on
     /// loopback. Every production caller passes `false`.
     pub allow_loopback: bool,
+    /// Set only by tests. Production passes `None` and gets the
+    /// provider-derived port the user registered — but that port lives in the
+    /// OS's own ephemeral range, so a test that insisted on it would fail
+    /// whenever anything else on the machine happened to hold it.
+    pub redirect_port: Option<u16>,
     pub callback_timeout: Duration,
 }
 
@@ -1364,7 +1375,9 @@ pub(crate) async fn run_connect_flow(
     progress: &(dyn Fn(&str, Option<String>) + Sync),
 ) -> Result<(StoredTokens, String), String> {
     let spec = inputs.spec;
-    let port = crate::mcp_oauth::loopback_port_for(&cancel_key(spec.provider));
+    let port = inputs
+        .redirect_port
+        .unwrap_or_else(|| crate::mcp_oauth::loopback_port_for(&cancel_key(spec.provider)));
     let listener = cancellable(
         cancel,
         crate::mcp_oauth::LoopbackListener::bind_port(port, spec.redirect_host),
@@ -1619,6 +1632,7 @@ async fn connect_inner(
             endpoints,
             client: &client,
             allow_loopback: false,
+            redirect_port: None,
             callback_timeout: CALLBACK_TIMEOUT,
         },
         &cancel,
@@ -1735,6 +1749,18 @@ mod tests {
     /// assert what actually went on the wire. Mirrors
     /// `mcp_oauth::tests::spawn_fake_oauth_server`'s hand-rolled idiom — no
     /// mocking crate, no real network.
+    /// An OS-picked free loopback port. Production derives the redirect port
+    /// from the provider so the user registers one stable URI; a test that
+    /// bound that exact port would collide with whatever else on the machine
+    /// is using the ephemeral range.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("loopback bind")
+            .local_addr()
+            .expect("local addr")
+            .port()
+    }
+
     fn spawn_fixture(responses: Vec<String>) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
         spawn_fixture_status(responses.into_iter().map(|body| (200, body)).collect())
     }
@@ -2255,6 +2281,7 @@ mod tests {
             endpoints: endpoints_at(addr),
             client: &CLIENT,
             allow_loopback: true,
+            redirect_port: Some(free_port()),
             callback_timeout: Duration::from_secs(5),
         }
     }
