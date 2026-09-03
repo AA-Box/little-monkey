@@ -39,11 +39,16 @@ describe("OAuth connect card", () => {
     }
   });
 
-  it("hides the client-secret field for a provider that registers public clients only", () => {
+  it("hides the client-secret field for the providers connected as public clients", () => {
+    // Airtable is here because its confidential flow wants the secret in an
+    // HTTP Basic header, which this app never sends — offering the field
+    // would take a secret it would then silently drop.
     const never = OAUTH_PROVIDERS.filter((p) => p.secret === "never");
-    expect(never.map((p) => p.provider)).toEqual(["microsoft_graph"]);
-    card("microsoft_graph");
-    expect(document.querySelector('input[type="password"]')).toBeNull();
+    expect(never.map((p) => p.provider)).toEqual(["microsoft_graph", "airtable"]);
+    for (const provider of never) {
+      card(provider.provider);
+      expect(document.querySelector('input[type="password"]')).toBeNull();
+    }
   });
 
   it("enables Connect with a label alone, so a blank client ID reuses the saved app", () => {

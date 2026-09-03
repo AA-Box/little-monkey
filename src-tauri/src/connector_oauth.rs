@@ -95,8 +95,8 @@ fn entry(account: &str) -> Result<keyring::Entry, String> {
 pub(crate) struct ClientRegistration {
     pub client_id: String,
     /// `None` for a public client (pure PKCE, no secret) — Microsoft Graph
-    /// never issues one, and GitLab/Dropbox/Airtable/Zendesk apps may be
-    /// registered either way.
+    /// never issues one, Airtable is connected as one, and GitLab/Dropbox/
+    /// Zendesk apps may be registered either way.
     #[serde(default)]
     pub client_secret: Option<String>,
 }
@@ -370,7 +370,13 @@ const OAUTH_PROVIDERS: &[OAuthProviderSpec] = &[
         },
     },
     // Airtable — https://airtable.com/developers/web/api/oauth-reference
-    // PKCE is mandatory. Airtable publishes no revocation endpoint.
+    // PKCE is mandatory. Airtable publishes no revocation endpoint. Register
+    // the integration as a *public* client: Airtable's confidential flow
+    // requires the secret in an HTTP Basic header ("Required if your
+    // integration has a client_secret"), and this module only ever sends
+    // client credentials as form parameters — so a secret here would be
+    // silently ignored and the exchange refused. `SecretPolicy::Never` says
+    // that up front instead.
     OAuthProviderSpec {
         provider: ConnectorProvider::Airtable,
         authorize_url: "https://airtable.com/oauth2/v1/authorize",
@@ -379,7 +385,7 @@ const OAUTH_PROVIDERS: &[OAuthProviderSpec] = &[
         scopes: &["user.email:read", "schema.bases:read"],
         extra_authorize_params: &[],
         pkce: true,
-        secret: SecretPolicy::Optional,
+        secret: SecretPolicy::Never,
         redirect_host: "127.0.0.1",
         host_field: None,
         verify: VerifySpec {
@@ -441,7 +447,10 @@ const OAUTH_PROVIDERS: &[OAuthProviderSpec] = &[
             url: "https://api.hubapi.com/account-info/v3/details",
             headers: &[],
             json_body: None,
-            identity_pointers: &["/uiDomain", "/portalId"],
+            // The portal id first: `uiDomain` is a per-region constant
+            // (`app.hubspot.com` / `app-eu1.hubspot.com`), so recording it
+            // would give every HubSpot account the same identity.
+            identity_pointers: &["/portalId", "/uiDomain"],
         },
     },
     // Discord — https://discord.com/developers/docs/topics/oauth2
@@ -587,7 +596,11 @@ pub(crate) fn normalize_host(raw: &str) -> Result<String, String> {
 /// path and query. An ASCII allowlist is the whole check.
 pub(crate) fn normalize_tenant(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
+    // `.` and `..` pass the allowlist but are path traversal once `Url::parse`
+    // normalizes them, which would move the token request to a different path
+    // on login.microsoftonline.com — so a dot-only value is refused outright.
     if trimmed.is_empty()
+        || trimmed.chars().all(|c| c == '.')
         || !trimmed
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
@@ -683,7 +696,9 @@ fn authorize_url(
 /// `scope` is provider-supplied text that ends up in `connectors.json` and in
 /// CLI output, so an entry carrying control characters — which could forge
 /// lines or emit ANSI sequences in a terminal — is dropped rather than
-/// stored.
+/// stored, and the list is bounded by [`MAX_SCOPES`]/[`IDENTITY_MAX_CHARS`]
+/// for the same reason the identity string is: a broken or hostile response
+/// must not be able to write 64 KiB into the account list.
 fn parse_token_response(bytes: &[u8], now_ms: u64) -> Result<StoredTokens, String> {
     let json: Value = serde_json::from_slice(bytes)
         .map_err(|e| format!("The token endpoint returned a body that is not JSON: {e}"))?;
@@ -705,9 +720,17 @@ fn parse_token_response(bytes: &[u8], now_ms: u64) -> Result<StoredTokens, Strin
             });
         }
     };
+    // Several OAuth servers return `expires_in` as a JSON string. Reading
+    // only the number shape would leave `expires_at: None`, which the rest of
+    // this module reads as "the provider issues a non-expiring token" — the
+    // account would then never refresh and start 401ing an hour later.
     let expires_at = json
         .get("expires_in")
-        .and_then(Value::as_u64)
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
+        })
         .map(|seconds| now_ms.saturating_add(seconds.saturating_mul(1000)));
     let scopes = json
         .get("scope")
@@ -715,7 +738,8 @@ fn parse_token_response(bytes: &[u8], now_ms: u64) -> Result<StoredTokens, Strin
         .map(|raw| {
             raw.split([' ', ','])
                 .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
-                .map(str::to_string)
+                .take(MAX_SCOPES)
+                .map(truncated)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -736,6 +760,10 @@ fn parse_token_response(bytes: &[u8], now_ms: u64) -> Result<StoredTokens, Strin
 /// `connect_inner`; without this a broken or hostile response could put an
 /// arbitrarily long string into connectors.json and the account list.
 const IDENTITY_MAX_CHARS: usize = 200;
+
+/// The most scopes one token response may record. No real grant is near this;
+/// it exists so a hostile token endpoint cannot fill `connectors.json`.
+const MAX_SCOPES: usize = 64;
 
 /// The first identity pointer that resolves to a non-empty string (or a
 /// number, stringified) wins.
@@ -1049,9 +1077,6 @@ fn delete_tokens(id: &str) {
     });
 }
 
-/// Clears a provider's shared client registration once no account of that
-/// provider is left. Best-effort — the same stance `remove_impl` takes toward
-/// its own keychain cleanup.
 /// Refuses a pasted client id that would overwrite the shared registration
 /// other accounts of this provider still refresh against. Unreadable catalog
 /// counts as zero accounts: the only use is refusing an overwrite, and
@@ -1105,37 +1130,6 @@ fn merge_client(
         pasted.client_secret = same_registration.and_then(|s| s.client_secret);
     }
     pasted
-}
-
-/// Whether the shared client registration for `provider` is now unreferenced.
-/// False when the provider still has an account, when it is not an OAuth
-/// provider, or when the catalog could not be read — in which case the safe
-/// answer is to keep the registration rather than make the user re-paste a
-/// client id.
-///
-/// Split from [`forget_client_if_unused`] so the decision can be tested
-/// without deleting a keychain entry that belongs to the real app.
-fn client_is_unused(config_path: &std::path::Path, provider: ConnectorProvider) -> bool {
-    if spec_for(provider).is_none() {
-        return false;
-    }
-    crate::connectors::load_config_impl(config_path)
-        .map(|config| {
-            !config
-                .accounts
-                .iter()
-                .any(|account| account.provider == provider)
-        })
-        .unwrap_or(false)
-}
-
-/// Returns whether the registration was actually forgotten — false when
-/// [`client_is_unused`] says something still references it.
-pub fn forget_client_if_unused(config_path: &std::path::Path, provider: ConnectorProvider) -> bool {
-    client_is_unused(config_path, provider) && {
-        delete_client(provider);
-        true
-    }
 }
 
 /// The non-secret provider metadata an OAuth account stores in `connection`.
@@ -1236,6 +1230,12 @@ async fn refresh_if_expired(
     if refreshed.scopes.is_empty() {
         refreshed.scopes = tokens.scopes.clone();
     }
+    // RFC 6749 5.1 makes `expires_in` optional on a refresh response. Without
+    // this a record that was expiring would become one with no expiry at all,
+    // which `access_token`'s fast path reads as "never refresh again".
+    if refreshed.expires_at.is_none() {
+        refreshed.expires_at = tokens.expires_at;
+    }
     Ok(Some(refreshed))
 }
 
@@ -1313,7 +1313,11 @@ pub(crate) async fn verify_account(
 /// would be handed a dead token and revoke nothing at all. A refresh that
 /// fails is ignored: the stale token is still tried, and nothing stops the
 /// removal either way.
-pub async fn revoke_and_forget(account: &ConnectorAccount) {
+///
+/// That refresh runs under the same `connector:<id>` lock [`access_token`]
+/// takes, so a removal racing a reverify in this process cannot redeem a
+/// rotating refresh token twice.
+pub async fn revoke_and_forget(state: &AppState, account: &ConnectorAccount) {
     let Some(spec) = spec_for(account.provider) else {
         return;
     };
@@ -1327,6 +1331,8 @@ pub async fn revoke_and_forget(account: &ConnectorAccount) {
     ) else {
         return;
     };
+    let lock = crate::mcp_oauth::refresh_lock_for(state, &format!("connector:{}", account.id));
+    let _guard = lock.lock().await;
     let tokens = match crate::run_commands::unix_time_ms() {
         Ok(now) => match refresh_if_expired(spec, &endpoints, false, &client, &tokens, now).await {
             // Persisted before the revoke call, not after: a provider that
@@ -1438,17 +1444,22 @@ pub(crate) async fn run_connect_flow(
     )
     .await?;
     if tokens.scopes.is_empty() {
-        // Box configures scopes on the app rather than issuing them per
-        // authorization, so there is nothing honest to record but that.
+        // Neither branch may claim a grant the provider did not state. Box
+        // configures scopes on the app rather than issuing them per
+        // authorization; every other provider that omits `scope` has answered
+        // nothing about what it actually granted, which may be less than was
+        // asked for.
         tokens.scopes = if spec.scopes.is_empty() {
             vec!["(granted by the provider's app configuration)".to_string()]
         } else {
-            spec.scopes.iter().map(|s| (*s).to_string()).collect()
+            std::iter::once("(requested; the provider returned no scope list)".to_string())
+                .chain(spec.scopes.iter().map(|s| (*s).to_string()))
+                .collect()
         };
     }
 
     progress("verifying", None);
-    let identity = cancellable(
+    let verified = cancellable(
         cancel,
         verify_identity(
             spec,
@@ -1457,8 +1468,25 @@ pub(crate) async fn run_connect_flow(
             &tokens.access_token,
         ),
     )
-    .await?;
-    Ok((tokens, identity))
+    .await;
+    match verified {
+        Ok(identity) => Ok((tokens, identity)),
+        Err(error) => {
+            // The code exchange already succeeded, so the grant is live at the
+            // provider while nothing local will point at it. Hand it back
+            // rather than leaving the user to find it in the provider's own
+            // app settings. Best-effort, like every other `revoke` caller.
+            let _ = revoke(
+                spec,
+                &inputs.endpoints,
+                inputs.allow_loopback,
+                inputs.client,
+                &tokens,
+            )
+            .await;
+            Err(error)
+        }
+    }
 }
 
 async fn cancellable<T>(
@@ -1607,7 +1635,8 @@ async fn connect_inner(
     }
     if spec.secret == SecretPolicy::Never && client.client_secret.is_some() {
         return Err(format!(
-            "{} registers public clients only — its token endpoint rejects a client secret",
+            "{} is connected as a public client (PKCE, no secret) — register your OAuth app \
+             without a client secret and leave the secret field blank",
             provider.as_str()
         ));
     }
@@ -1643,7 +1672,7 @@ async fn connect_inner(
     crate::mcp_oauth::release_oauth_cancel_token(state, &cancel_key(provider));
     let (tokens, identity) = flow?;
 
-    persist(
+    let saved = persist(
         state,
         &config_path,
         spec,
@@ -1653,7 +1682,16 @@ async fn connect_inner(
         &client,
         &tokens,
         identity,
-    )
+    );
+    if saved.is_err() {
+        // `persist` rolled the local records back, so — as on the verify
+        // failure above — the grant would otherwise stand at the provider
+        // with nothing here pointing at it.
+        if let Ok(endpoints) = resolve_endpoints(spec, host.as_deref(), &tenant) {
+            let _ = revoke(spec, &endpoints, false, &client, &tokens).await;
+        }
+    }
+    saved
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2098,6 +2136,27 @@ mod tests {
         // No `expires_in` means a non-expiring token (a legacy Zendesk client).
         let forever = parse_token_response(br#"{"access_token":"at"}"#, 1_000).unwrap();
         assert_eq!(forever.expires_at, None);
+        // Some OAuth servers send `expires_in` as a string; reading only the
+        // number shape would make this indistinguishable from `forever`.
+        let stringly =
+            parse_token_response(br#"{"access_token":"at","expires_in":"3600"}"#, 1_000).unwrap();
+        assert_eq!(stringly.expires_at, Some(1_000 + 3_600_000));
+    }
+
+    #[test]
+    fn a_token_response_cannot_write_an_unbounded_scope_list() {
+        let scope = format!(
+            "{} {}",
+            "s".repeat(500),
+            (0..200)
+                .map(|i| format!("s{i}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let body = serde_json::json!({ "access_token": "at", "scope": scope }).to_string();
+        let tokens = parse_token_response(body.as_bytes(), 0).unwrap();
+        assert_eq!(tokens.scopes.len(), MAX_SCOPES);
+        assert_eq!(tokens.scopes[0].chars().count(), IDENTITY_MAX_CHARS);
     }
 
     // --- identity parsing, table-driven over the shipped specs -------------
@@ -2158,7 +2217,9 @@ mod tests {
             (
                 ConnectorProvider::Hubspot,
                 r#"{"portalId":1234567,"uiDomain":"app.hubspot.com"}"#,
-                "app.hubspot.com",
+                // The portal, not the region-wide UI domain — otherwise every
+                // HubSpot account would be saved under the same identity.
+                "1234567",
                 r#"{"status":"error","message":"expired authentication"}"#,
             ),
             (
@@ -2297,15 +2358,19 @@ mod tests {
         let cancel = CancellationToken::new();
         let phases = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&phases);
+        let challenge: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let seen_challenge = Arc::clone(&challenge);
         let (tokens, identity) = run_connect_flow(
             inputs(addr, ConnectorProvider::Linear),
             &cancel,
-            &fake_browser(|url| {
-                let state = url
-                    .query_pairs()
-                    .find(|(k, _)| k == "state")
-                    .map(|(_, v)| v.into_owned())
-                    .unwrap();
+            &fake_browser(move |url| {
+                let pair = |key: &str| {
+                    url.query_pairs()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.into_owned())
+                };
+                *seen_challenge.lock().unwrap() = pair("code_challenge");
+                let state = pair("state").unwrap();
                 format!("code=the-code&state={state}")
             }),
             &move |phase: &str, _: Option<String>| {
@@ -2335,12 +2400,68 @@ mod tests {
         let requests = seen.lock().unwrap().clone();
         assert_eq!(requests.len(), 2, "{requests:?}");
         assert!(requests[0].contains("grant_type=authorization_code"));
-        assert!(
-            requests[0].contains("code_verifier="),
-            "PKCE verifier must be sent"
+        // Not just *a* verifier: the one that hashes to the challenge the
+        // authorize URL carried. Without this a regression that minted a
+        // second, unrelated pair would leave every assertion green while
+        // silently disabling PKCE.
+        let verifier = requests[0]
+            .split("code_verifier=")
+            .nth(1)
+            .expect("PKCE verifier must be sent")
+            .split(|c: char| c == '&' || c.is_whitespace())
+            .next()
+            .unwrap();
+        assert_eq!(
+            Some(b64(&Sha256::digest(verifier.as_bytes()))),
+            *challenge.lock().unwrap(),
+            "the verifier must match the challenge sent to the authorize endpoint"
         );
         assert!(requests[0].contains("code=the-code"));
         assert!(requests[1].contains("Bearer at-1"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_verification_hands_the_grant_back_to_the_provider() {
+        // The code exchange succeeded, so the grant is live; the identity call
+        // then fails (a registered app missing a scope is the realistic case).
+        // Nothing local will point at that grant, so it must be revoked rather
+        // than left for the user to find in the provider's app settings.
+        let (addr, seen) = spawn_fixture_status(vec![
+            (
+                200,
+                r#"{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600}"#.to_string(),
+            ),
+            (401, r#"{"error":"insufficient_scope"}"#.to_string()),
+            (200, "{}".to_string()),
+        ]);
+        let mut inputs = inputs(addr, ConnectorProvider::Asana);
+        inputs.endpoints.revoke = Some((
+            reqwest::Method::POST,
+            Url::parse(&format!("http://{addr}/revoke")).unwrap(),
+        ));
+        let cancel = CancellationToken::new();
+        let error = run_connect_flow(
+            inputs,
+            &cancel,
+            &fake_browser(|url| {
+                let state = url
+                    .query_pairs()
+                    .find(|(k, _)| k == "state")
+                    .map(|(_, v)| v.into_owned())
+                    .unwrap();
+                format!("code=the-code&state={state}")
+            }),
+            &|_, _| {},
+        )
+        .await
+        .expect_err("verification must fail");
+        assert!(error.contains("401"), "{error}");
+
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert!(requests[2].starts_with("POST /revoke"), "{}", requests[2]);
+        // The refresh token: revoking it kills the whole grant.
+        assert!(requests[2].contains("token=rt-1"), "{}", requests[2]);
     }
 
     #[tokio::test]
@@ -2512,6 +2633,22 @@ mod tests {
         .unwrap()
         .expect("must refresh");
         assert_eq!(kept.refresh_token.as_deref(), Some("rt-old"));
+
+        // RFC 6749 5.1 makes `expires_in` optional on a refresh. A record that
+        // was expiring must stay expiring, or it is never refreshed again.
+        let (addr, _) = spawn_fixture(vec![json_ok(r#"{"access_token":"new-access"}"#)]);
+        let no_expiry = refresh_if_expired(
+            spec(ConnectorProvider::Linear),
+            &endpoints_at(addr),
+            true,
+            &test_client(),
+            &tokens_expiring_at(Some(0), Some("rt-old")),
+            1_000,
+        )
+        .await
+        .unwrap()
+        .expect("must refresh");
+        assert_eq!(no_expiry.expires_at, Some(0));
     }
 
     #[tokio::test]
@@ -2748,40 +2885,7 @@ mod tests {
             last_error: None,
             connection: None,
         };
-        revoke_and_forget(&account).await;
-    }
-
-    #[test]
-    fn the_unused_client_decision_leaves_a_provider_that_still_has_an_account() {
-        let path = std::env::temp_dir().join(unique_id("still-used.json"));
-        let config = crate::connectors::ConnectorCatalogFile {
-            version: 1,
-            accounts: vec![ConnectorAccount {
-                id: "keep".to_string(),
-                provider: ConnectorProvider::Gitlab,
-                label: "Other GitLab".to_string(),
-                scopes: vec![],
-                credential_ref: None,
-                identity: None,
-                created_at: 0,
-                last_verified_at: None,
-                last_error: None,
-                connection: None,
-            }],
-        };
-        crate::connectors::save_config_impl(&path, &config).unwrap();
-        // A surviving account of the provider keeps the shared registration;
-        // a provider with no account left releases it. This asserts on
-        // `client_is_unused`, never `forget_client_if_unused`: the latter
-        // deletes from the *real* app keychain — the client namespace is
-        // per-provider, not per-account-id, so a test that called it would
-        // destroy the OAuth app registration of whoever is running the
-        // suite.
-        assert!(!client_is_unused(&path, ConnectorProvider::Gitlab));
-        assert!(client_is_unused(&path, ConnectorProvider::Dropbox));
-        // A non-OAuth provider has no registration to forget.
-        assert!(!client_is_unused(&path, ConnectorProvider::Slack));
-        let _ = std::fs::remove_file(&path);
+        revoke_and_forget(&AppState::default(), &account).await;
     }
 
     #[test]
@@ -2954,7 +3058,15 @@ mod tests {
                 "{bad} must be refused"
             );
         }
-        for bad in ["contoso?x=", "contoso/evil", "contoso#f", "", "  "] {
+        for bad in [
+            "contoso?x=",
+            "contoso/evil",
+            "contoso#f",
+            "",
+            "  ",
+            ".",
+            "..",
+        ] {
             assert!(
                 resolve_endpoints(spec(ConnectorProvider::MicrosoftGraph), None, bad).is_err(),
                 "{bad} must be refused"

@@ -149,7 +149,7 @@ export const OAUTH_PROVIDERS: OAuthProviderInfo[] = [
   { provider: "asana", copyKey: "ConnectorsPanel.asanaCopy", secret: "required" },
   { provider: "dropbox", copyKey: "ConnectorsPanel.dropboxCopy", secret: "optional" },
   { provider: "box", copyKey: "ConnectorsPanel.boxCopy", secret: "required" },
-  { provider: "airtable", copyKey: "ConnectorsPanel.airtableCopy", secret: "optional" },
+  { provider: "airtable", copyKey: "ConnectorsPanel.airtableCopy", secret: "never" },
   {
     provider: "zendesk",
     copyKey: "ConnectorsPanel.zendeskCopy",

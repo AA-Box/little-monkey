@@ -116,7 +116,8 @@ pub enum ConnectorProvider {
     /// Box over authorization-code OAuth — proves the Box login. Box scopes
     /// are configured on the app itself, not requested per authorization.
     Box,
-    /// Airtable over authorization-code OAuth (PKCE is mandatory there).
+    /// Airtable over authorization-code OAuth, as a public client (PKCE is
+    /// mandatory there, and its confidential flow wants HTTP Basic).
     Airtable,
     /// Zendesk over authorization-code OAuth against the user's own
     /// subdomain, recorded as `connection.host`.
@@ -468,7 +469,16 @@ async fn verified_call_within_scope(
         body.extend_from_slice(&chunk);
     }
     if !status.is_success() {
-        let snippet: String = String::from_utf8_lossy(&body).chars().take(300).collect();
+        // The body is provider-controlled and this snippet is stored in
+        // `last_error`, printed raw by `monkey connectors list` and included
+        // in the audit export — so a control character in it could forge a
+        // line or emit ANSI in an operator's terminal. Same rule
+        // `connector_oauth::checked_identity` applies to the identity string.
+        let snippet: String = String::from_utf8_lossy(&body)
+            .chars()
+            .take(300)
+            .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+            .collect();
         return Err(format!("Verification failed with HTTP {status}: {snippet}"));
     }
     Ok(body)
@@ -1394,18 +1404,14 @@ pub async fn remove_account(state: &AppState, path: &Path, id: &str) -> Result<(
         .into_iter()
         .find(|account| account.id == id);
     if let Some(account) = &removed {
-        crate::connector_oauth::revoke_and_forget(account).await;
+        crate::connector_oauth::revoke_and_forget(state, account).await;
     }
-    remove_impl(state, path, id)?;
-    // The per-provider client registration (id + secret) is shared by every
-    // account of that provider, so it is only cleared once the last one is
-    // gone — otherwise disconnecting one Google account would send the other
-    // back to the Google console. Best-effort, same stance as the keychain
-    // cleanup in `remove_impl`.
-    if let Some(account) = &removed {
-        let _ = crate::connector_oauth::forget_client_if_unused(path, account.provider);
-    }
-    Ok(())
+    // The per-provider OAuth app registration is deliberately *kept*: it is
+    // shared by every account of that provider, and both the Connectors panel
+    // and `docs/byo-oauth-clients.md` promise that a blank client id reuses
+    // the app you already registered. Erasing it when the last account goes
+    // would break that promise the next time the user reconnects.
+    remove_impl(state, path, id)
 }
 
 /// Core logic behind `reverify_impl`'s GitHub branch, parameterized by the
