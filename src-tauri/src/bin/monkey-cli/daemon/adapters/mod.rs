@@ -49,9 +49,11 @@ pub(crate) fn sends_attachments(kind: ChannelKind) -> bool {
             | ChannelKind::Mattermost
             | ChannelKind::Matrix
             | ChannelKind::Signal
-            // Both halves are implemented: the IMAP part fetch pulls one
-            // decoded body part under the account's cap, and the outbound
-            // build is a real MIME multipart.
+            // Both halves are implemented: the poll decodes each body part
+            // under the account's cap into a per-poll cache the hydration
+            // path reads back, and the outbound build is a real MIME
+            // multipart. The inbound half is bounded by that cache: see
+            // `email`'s module doc for what a restart loses.
             | ChannelKind::Email
             // The extension adapter hands the outbound artifact to the guest
             // under an exact read grant and downloads an inbound URL through

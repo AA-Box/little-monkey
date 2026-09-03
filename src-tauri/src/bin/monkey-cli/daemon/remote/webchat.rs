@@ -312,13 +312,19 @@ fn open_account(paths: &DaemonPaths, account_id: &str) -> Option<DaemonStore> {
 }
 
 /// Serve one web chat request. `visitor_header` is the value of
-/// [`VISITOR_HEADER`], and it is the **only** thing taken from the request's
-/// headers: nothing else about them is trusted, and none of them reach the
-/// adapter.
+/// [`VISITOR_HEADER`] and `content_type` the request's declared type; those
+/// two are the **only** things taken from the request's headers, nothing else
+/// about them is trusted, and none of them reach the adapter.
+///
+/// `content_type` is not authentication — it is the one header a cross-site
+/// form cannot set. Requiring `application/json` on the route that writes
+/// means a page on another origin cannot post a well-formed body at all,
+/// rather than relying on it being unable to read the visitor id back.
 pub(crate) async fn handle(
     paths: &DaemonPaths,
     route: Route,
     visitor_header: Option<String>,
+    content_type: Option<String>,
     body: Vec<u8>,
     now_ms: i64,
 ) -> Response<Full<Bytes>> {
@@ -355,6 +361,14 @@ pub(crate) async fn handle(
             }
         }
         Route::Post(account_id) => {
+            if !content_type.is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+            }) {
+                return refuse(415, "unsupported_media_type");
+            }
             let Some(mut store) = open_account(paths, &account_id) else {
                 return refuse(404, "not_found");
             };
@@ -625,11 +639,61 @@ mod tests {
         assert!(!visitor_is_ours(&key, "acc-1", &tampered));
     }
 
+    /// Every route in these tests is reached the way the page reaches it,
+    /// declaring JSON. The one test that does *not* is the one below that
+    /// asserts what happens without it.
+    async fn serve(
+        paths: &DaemonPaths,
+        route: Route,
+        visitor: Option<String>,
+        body: Vec<u8>,
+        now_ms: i64,
+    ) -> Response<Full<Bytes>> {
+        handle(
+            paths,
+            route,
+            visitor,
+            Some("application/json; charset=utf-8".to_string()),
+            body,
+            now_ms,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_body_that_does_not_declare_json_writes_nothing() {
+        // A cross-site form can post `text/plain` with a well-formed body and
+        // cannot set `content-type`, so the route that writes insists on it.
+        let (paths, account_id) = world(ChannelKind::WebChat, true);
+        let key = visitor_key(&paths).expect("key");
+        let minted = mint_visitor(&key, &account_id).expect("mint");
+        let body = serde_json::json!({ "visitor_id": minted, "text": "hello" })
+            .to_string()
+            .into_bytes();
+        for declared in [None, Some("text/plain".to_string())] {
+            let response = handle(
+                &paths,
+                Route::Post(account_id.clone()),
+                None,
+                declared,
+                body.clone(),
+                NOW,
+            )
+            .await;
+            assert_eq!(response.status().as_u16(), 415);
+        }
+        let store = DaemonStore::open(&paths).expect("open store");
+        assert!(store
+            .recent_channel_events(&account_id, 10)
+            .expect("events")
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn a_non_webchat_account_and_a_disabled_one_serve_no_page() {
         for (kind, enabled) in [(ChannelKind::Irc, true), (ChannelKind::WebChat, false)] {
             let (paths, account_id) = world(kind, enabled);
-            let response = handle(
+            let response = serve(
                 &paths,
                 Route::Page(account_id.clone()),
                 None,
@@ -638,7 +702,7 @@ mod tests {
             )
             .await;
             assert_eq!(response.status().as_u16(), 404);
-            let response = handle(&paths, Route::Session(account_id), None, Vec::new(), NOW).await;
+            let response = serve(&paths, Route::Session(account_id), None, Vec::new(), NOW).await;
             assert_eq!(response.status().as_u16(), 404);
         }
     }
@@ -651,10 +715,10 @@ mod tests {
             .to_string()
             .into_bytes();
         let (status, _) =
-            body_of(handle(&paths, Route::Post(account_id.clone()), None, body, NOW).await).await;
+            body_of(serve(&paths, Route::Post(account_id.clone()), None, body, NOW).await).await;
         assert_eq!(status, 401);
         let (status, _) = body_of(
-            handle(
+            serve(
                 &paths,
                 Route::Fetch(account_id.clone()),
                 Some(invented),
@@ -678,7 +742,7 @@ mod tests {
         let (paths, account_id) = world(ChannelKind::WebChat, true);
         let mut last = 200;
         for _ in 0..(MAX_PER_WINDOW + 2) {
-            last = handle(
+            last = serve(
                 &paths,
                 Route::Session(account_id.clone()),
                 None,
@@ -691,7 +755,7 @@ mod tests {
         }
         assert_eq!(last, 429);
         // The next window opens again.
-        let response = handle(
+        let response = serve(
             &paths,
             Route::Session(account_id),
             None,
@@ -720,7 +784,7 @@ mod tests {
             .to_string()
             .into_bytes();
         let (status, _) =
-            body_of(handle(&paths, Route::Post(account_id.clone()), None, body, NOW).await).await;
+            body_of(serve(&paths, Route::Post(account_id.clone()), None, body, NOW).await).await;
         assert_eq!(status, 202);
 
         let mut store = DaemonStore::open(&paths).expect("open store");
@@ -744,7 +808,7 @@ mod tests {
             .is_empty());
 
         let (status, payload) = body_of(
-            handle(
+            serve(
                 &paths,
                 Route::Fetch(account_id.clone()),
                 Some(minted.clone()),
@@ -768,7 +832,7 @@ mod tests {
         // And a second visitor of the same account reads none of it.
         let other = mint_visitor(&key, &account_id).expect("mint");
         let (status, payload) = body_of(
-            handle(
+            serve(
                 &paths,
                 Route::Fetch(account_id),
                 Some(other),

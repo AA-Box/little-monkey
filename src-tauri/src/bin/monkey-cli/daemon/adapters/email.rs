@@ -64,8 +64,16 @@
 //! hydration path downloading four at a time that is a fistful of concurrent
 //! logins for one poll. The account's own cap is still enforced by
 //! `hydrate_attachments`, which refuses an over-cap `declared_size_bytes`
-//! before this adapter is asked for the bytes at all. Outbound, the reply is a
-//! real MIME multipart built by `mail-builder`.
+//! before this adapter is asked for the bytes at all.
+//!
+//! That cache is the boundary, and it is narrower than it looks: hydration
+//! runs in a different task from polling, the cursor has already advanced
+//! past the UID, and the cache is replaced wholesale by the next poll. So a
+//! daemon restart, or a hydration backlog long enough that another poll
+//! lands first, loses those bytes permanently — the message text still
+//! arrives and the attachment is still listed on the event, but the file is
+//! not re-offered. Outbound, the reply is a real MIME multipart built by
+//! `mail-builder`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -559,16 +567,32 @@ impl ChannelAdapter for EmailAdapter {
     async fn fetch_attachment(
         &self,
         attachment: &ChannelAttachment,
-        _limits: AttachmentLimits,
+        limits: AttachmentLimits,
     ) -> Result<Vec<u8>, String> {
         let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
             return Err("An email attachment is always a part of its own message".to_string());
         };
-        self.parts.lock().await.get(handle).cloned().ok_or_else(|| {
-            "That attachment's message is no longer in this poll's cache; it will be offered \
-             again on the next poll"
-                .to_string()
-        })
+        let bytes = self
+            .parts
+            .lock()
+            .await
+            .get(handle)
+            .cloned()
+            .ok_or_else(|| {
+                "Those attachment bytes were held only for the poll that read them, and that poll \
+             has been replaced; the message is not offered again"
+                    .to_string()
+            })?;
+        // The cap is checked upstream on the declared size too, but the
+        // function that hands the bytes back is the honest place for it.
+        if bytes.len() as u64 > limits.max_bytes {
+            return Err(format!(
+                "That attachment decodes to {} bytes, over this account's {} byte cap",
+                bytes.len(),
+                limits.max_bytes
+            ));
+        }
+        Ok(bytes)
     }
 
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
@@ -929,7 +953,17 @@ fn oversized_envelope(
         ),
         provider_message_id: None,
         conversation: ChannelConversation::direct(identity.from_address.to_string()),
-        sender: ChannelSender::new(identity.from_address.to_string()),
+        sender: ChannelSender {
+            // A record for the operator, not a message from anybody. Without
+            // `is_self` the note is a first-contact message *from the
+            // operator's own address*: on a pairing-policy account it mints a
+            // challenge, spends one of the account's pending slots and emails
+            // the code to the mailbox that could not read the mail. Flagged,
+            // `decide_access` ignores it as `OwnMessage`, so it stays a
+            // durable event nobody is asked to answer.
+            is_self: true,
+            ..ChannelSender::new(identity.from_address.to_string())
+        },
         text: format!(
             "[a message of {size} bytes was skipped: it is larger than the {MAX_MESSAGE_BYTES}-byte \
              limit this mailbox reads]"
@@ -1796,6 +1830,72 @@ mod tests {
         assert_eq!(stored.fetch_error, None);
         assert_eq!(stored.stored_size_bytes, Some(2_048));
         assert!(stored.stored_artifact_id.is_some());
+    }
+
+    #[test]
+    fn a_note_about_an_unreadable_message_asks_the_operator_for_nothing() {
+        let identity = identity();
+        let note = oversized_envelope(&identity, 42, 7, 9 * 1024 * 1024, 1_700_000_000_000);
+        assert!(note.text.contains("was skipped"));
+        assert!(note.sender.is_self, "the note is a record, not a message");
+
+        // The consequence, on the default pairing policy: recorded and
+        // ignored, so no challenge, no pending slot and no reply email.
+        use little_monkey_lib::channels::policy::{
+            AccessContext, AccessDecision, ChannelAccessPolicy, IgnoreReason,
+        };
+        let policy = ChannelAccessPolicy::default();
+        let decision = little_monkey_lib::channels::policy::decide_access(
+            &note,
+            AccessContext {
+                policy: &policy,
+                sender: None,
+                pending_pairings: 0,
+                automated_reply_depth: 0,
+                consecutive_machine_messages: 0,
+                own_outbound_echo: false,
+                now_ms: 1_700_000_000_000,
+            },
+            || "unused".to_string(),
+        );
+        assert_eq!(decision, AccessDecision::Ignore(IgnoreReason::OwnMessage));
+    }
+
+    #[tokio::test]
+    async fn bytes_a_later_poll_replaced_are_reported_as_gone_and_not_promised_again() {
+        // The cache is this adapter's one boundary, so the miss path must say
+        // plainly that the file is gone rather than imply a retry.
+        let raw = with_attachment(2_048);
+        let normalized = normalize(&raw);
+        let attachment = normalized.envelope.attachments[0].clone();
+        let adapter = build(valid()).ok().expect("valid mailbox");
+        // A later poll replaced the cache, exactly as `poll` does.
+        *adapter.parts.lock().await = HashMap::new();
+
+        let error = adapter
+            .fetch_attachment(&attachment, AttachmentLimits::default())
+            .await
+            .expect_err("no bytes are cached");
+        assert!(error.contains("not offered again"), "{error}");
+        assert!(!error.contains("next poll"), "{error}");
+
+        // And the shared hydration path records that refusal on the event
+        // rather than inventing an empty artifact.
+        let blobs = MemoryBlobs(std::sync::Mutex::new(Vec::new()));
+        let mut envelopes = vec![normalized.envelope];
+        hydrate_attachments(
+            &adapter,
+            &blobs,
+            AttachmentLimits::default(),
+            &mut envelopes,
+        )
+        .await;
+        let stored = &envelopes[0].attachments[0];
+        assert!(stored.stored_artifact_id.is_none());
+        assert!(stored
+            .fetch_error
+            .as_deref()
+            .is_some_and(|error| error.contains("not offered again")));
     }
 
     #[tokio::test]

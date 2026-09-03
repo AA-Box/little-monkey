@@ -141,8 +141,10 @@ freely and can only raise them so far.
 ### Loops
 
 An account never answers itself, and for the sixteen built-in providers that is
-the host's own conclusion: the code reading the provider's payload is this app's,
-holding the account's credential.
+the host's own conclusion: the code reading the provider's payload is this app's.
+(For most of them that code also holds the account's credential; a served page
+and the phone-bridge kinds hold none, and the conclusion is the host's either
+way.)
 
 A sandboxed extension speaking for a provider is the case that cannot work that
 way — the thing deciding is the thing being checked. So for those accounts the
@@ -393,7 +395,8 @@ therefore **not** claimed as verified here.
     select a different endpoint, is refused before a token is ever attached to
     a request; and the token appears in no rendered error.
   - **Web chat** — the whole loopback leg, run for real on every pull request
-    by `examples/webchat_installed_service_e2e.rs`: an HTTP client that is not
+    that touches these files by `examples/webchat_installed_service_e2e.rs`
+    (the workflow is paths-filtered): an HTTP client that is not
     Little Monkey reaches the installed daemon's own listener, is answered with
     a pairing code, is approved, and its next message becomes a durable turn and
     a real agent reply on the page's transcript. The visitor identifier is

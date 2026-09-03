@@ -271,6 +271,13 @@ pub(super) async fn handle_http(
             .get("x-webchat-visitor")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
+        // The one header a cross-site form cannot set, so the route that
+        // writes can insist on it. Not authentication: see `webchat::handle`.
+        let content_type = request
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         // Its own, much smaller cap: one browser message is a few lines of
         // text, not a device report.
         let body = match Limited::new(request.into_body(), super::webchat::MAX_BODY_BYTES)
@@ -280,7 +287,15 @@ pub(super) async fn handle_http(
             Ok(value) => value.to_bytes().to_vec(),
             Err(_) => return Ok(to_http(ApiResponse::error(413, "Request body is too large"))),
         };
-        return Ok(super::webchat::handle(api.paths(), route, visitor, body, now_ms() as i64).await);
+        return Ok(super::webchat::handle(
+            api.paths(),
+            route,
+            visitor,
+            content_type,
+            body,
+            now_ms() as i64,
+        )
+        .await);
     }
     // Checked before the body is collected, because there is no body: this is
     // the one route on the plane that becomes a socket instead of answering.

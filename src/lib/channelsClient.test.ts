@@ -156,6 +156,11 @@ describe("channels setup guidance", () => {
     expect(text("home_assistant")).toMatch(/https unless it is localhost/i);
     expect(text("webchat")).toMatch(/pairing code/i);
     expect(text("webchat")).toMatch(/invented is refused rather than opening a conversation/i);
+    // The setup step it names has to be one that exists: the remote host
+    // controls live in Background Agents, and the subcommand the harness
+    // itself shells is `host-configure`.
+    expect(text("webchat")).toContain("monkey daemon remote host-configure");
+    expect(text("webchat")).toContain("Settings \u203a Background Agents");
     // No credential exists for a served page, so setup must not imply one.
     expect(PROVIDER_GUIDES.find((guide) => guide.kind === "webchat")?.credentialOptional).toBe(true);
   });
