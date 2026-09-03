@@ -137,29 +137,36 @@ fn one_scope(path: &Path, ids: &[String]) -> Result<String, String> {
     scope.ok_or_else(|| "Merging needs at least two memories.".to_string())
 }
 
+/// The lines `list` prints, given a listing. Pure so the one branch that is
+/// not just a `*_impl` call — hiding merge-retired rows unless `--all` — is
+/// testable without `app_paths::data_dir()`.
+fn list_rows(entries: &[MemoryEntry], all: bool, now: &str) -> Vec<String> {
+    let rows: Vec<String> = entries
+        .iter()
+        .filter(|entry| all || entry.retired_at.is_none())
+        .map(|entry| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                entry.id,
+                entry.project_root.as_deref().unwrap_or("global"),
+                flags(entry, now),
+                entry.created_at,
+                entry.last_used_at.as_deref().unwrap_or("never"),
+                one_line(&entry.text),
+            )
+        })
+        .collect();
+    if rows.is_empty() {
+        return vec!["No memories stored yet.".to_string()];
+    }
+    rows
+}
+
 pub fn list(all: bool) -> Result<(), String> {
     let path = path_or_err()?;
     let entries = memory::list_all_impl(&path)?;
-    let now = memory::now_rfc3339();
-    let mut shown = 0usize;
-    for entry in &entries {
-        if !all && entry.retired_at.is_some() {
-            continue;
-        }
-        shown += 1;
-        let scope = entry.project_root.as_deref().unwrap_or("global");
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            entry.id,
-            scope,
-            flags(entry, &now),
-            entry.created_at,
-            entry.last_used_at.as_deref().unwrap_or("never"),
-            one_line(&entry.text),
-        );
-    }
-    if shown == 0 {
-        println!("No memories stored yet.");
+    for row in list_rows(&entries, all, &memory::now_rfc3339()) {
+        println!("{row}");
     }
     Ok(())
 }
@@ -202,8 +209,9 @@ pub fn expire(id: &str, at: Option<&str>, clear: bool) -> Result<(), String> {
     match fact.expires_at {
         // A pinned fact is exempt from expiry (`reaches_prompt`), so saying
         // only "expires <when>" would state an end state the store will not
-        // honour. The desktop panel disables the date input on a pinned row
-        // and explains why; this is the CLI's version of that honesty.
+        // honour — while the date is still stored, and applies again on
+        // unpin. `MemoryStudioPanel`'s `expiryPinnedRetainedHint` says the
+        // same thing on the desktop side.
         Some(when) if fact.pinned => println!(
             "{} expires {} — but it is pinned, so it stays in the prompt until you `monkey memory unpin {}`.",
             fact.id, when, fact.id
@@ -357,6 +365,32 @@ mod tests {
             .contains("No memory with id"));
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn list_rows_hides_a_merge_retired_memory_unless_all_is_passed() {
+        let mut plain = entry();
+        plain.id = "keeper".to_string();
+        let mut retired = entry();
+        retired.id = "retired-one".to_string();
+        retired.retired_at = Some(NOW.to_string());
+        retired.merged_into = Some("keeper".to_string());
+        let entries = vec![plain, retired];
+
+        let default = list_rows(&entries, false, NOW);
+        assert_eq!(default.len(), 1);
+        assert!(default[0].starts_with("keeper\tglobal\t-\t"));
+
+        let all = list_rows(&entries, true, NOW);
+        assert_eq!(all.len(), 2);
+        assert!(all[1].contains("\tretired\t"));
+
+        // A store holding nothing but retired rows still says so out loud
+        // rather than printing an empty listing that reads like "no store".
+        assert_eq!(
+            list_rows(&entries[1..], false, NOW),
+            vec!["No memories stored yet.".to_string()]
+        );
     }
 
     #[test]
