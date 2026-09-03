@@ -36,6 +36,19 @@ export interface MemoryFact {
   /** The chat turn this fact was remembered from, when known — `null`/absent
    * for facts added via the Settings "Add fact" affordance. */
   source_turn_id?: string | null;
+  /** The v2 lifecycle fields (`memory.rs`). Optional here for the same
+   * reason as `enabled`: hand-written fixtures — including the deliberately
+   * v1-shaped `src-tauri/fixtures/memory-fact.canonical.json` this store's
+   * test asserts `toEqual` against — predate them. `memory_list` already
+   * applies every one of them (pinned first; disabled, expired and
+   * merge-retired excluded), so nothing in this store needs to re-check
+   * them; they are here so a fact's shape stays honest end to end. */
+  pinned?: boolean;
+  expires_at?: string | null;
+  last_used_at?: string | null;
+  merged_from?: string[];
+  merged_into?: string | null;
+  retired_at?: string | null;
 }
 
 export interface RulesStore {
