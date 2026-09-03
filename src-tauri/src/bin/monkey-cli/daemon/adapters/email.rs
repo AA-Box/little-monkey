@@ -182,7 +182,10 @@ pub(crate) struct Endpoint {
 /// providers take the same app password on both, and the ones that do not need
 /// somewhere to say so. `smtp_password` falling back to `imap_password` is what
 /// the setup guide promises.
-#[derive(Debug, Clone, serde::Deserialize)]
+/// Deliberately neither `Debug` nor `Clone`: a `{:?}` of this type anywhere —
+/// in a future error path, in a panic message — would put the mailbox password
+/// in a log, and there is nothing here worth copying.
+#[derive(serde::Deserialize)]
 pub(crate) struct EmailSecrets {
     imap_password: String,
     #[serde(default)]
