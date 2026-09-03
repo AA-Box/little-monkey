@@ -1473,7 +1473,6 @@ const translated: Record<string, string> = {
   "RulesMemoryPanel.memoryDeleteButton": "Hapus",
   "RulesMemoryPanel.memoryDeletingButton": "Menghapus…",
   "RulesMemoryPanel.memoryClearAllButton": "Hapus semua",
-  "RulesMemoryPanel.memoryClearConfirmPrompt": "Hapus semua {{count}} fakta yang diingat? Ini tidak dapat dibatalkan.",
   "RulesMemoryPanel.memoryClearConfirmButton": "Ya, hapus semua",
   "RulesMemoryPanel.memoryClearCancelButton": "Batal",
   "RulesMemoryPanel.memoryClearingButton": "Menghapus…",
