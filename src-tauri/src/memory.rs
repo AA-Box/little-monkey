@@ -1411,7 +1411,16 @@ fn apply_imported_lifecycle(
         fact.enabled = entry.enabled;
         fact.pinned = pinned;
         fact.expires_at = expires_at;
-        fact.last_used_at = entry.last_used_at.clone();
+        // Validated exactly like `expires_at`, and for the same reason: an
+        // import file is untrusted input, and a non-timestamp here sorts
+        // above `stale_before()` forever, so `mark_used_impl`'s throttle
+        // would never re-stamp this memory again (and the Studio row would
+        // print the junk verbatim). Dropped rather than rejected — a bad
+        // "last used" costs nothing but the stamp.
+        fact.last_used_at = entry
+            .last_used_at
+            .clone()
+            .filter(|raw| normalize_expiry(raw).is_ok());
         fact.retired_at = entry.retired_at.clone();
         fact.merged_from = entry
             .merged_from
@@ -3155,7 +3164,13 @@ mod tests {
                     } else {
                         None
                     },
-                    last_used_at: None,
+                    // Junk on the first entry, a real stamp on the second:
+                    // one must be dropped, the other kept verbatim.
+                    last_used_at: match n {
+                        0 => Some("whenever".to_string()),
+                        1 => Some("2026-02-03T04:05:06.000Z".to_string()),
+                        _ => None,
+                    },
                     merged_from: Vec::new(),
                     merged_into: None,
                     retired_at: None,
@@ -3185,6 +3200,14 @@ mod tests {
             facts.iter().all(|f| f.expires_at.is_none()),
             "an unparseable expiry is dropped, not stored"
         );
+        // A junk "last used" would sort above `stale_before()` forever and
+        // wedge `mark_used_impl`'s throttle for that memory.
+        let last_used: Vec<Option<&str>> = facts
+            .iter()
+            .map(|f| f.last_used_at.as_deref())
+            .filter(|v| v.is_some())
+            .collect();
+        assert_eq!(last_used, vec![Some("2026-02-03T04:05:06.000Z")]);
 
         let _ = std::fs::remove_file(&path);
     }
