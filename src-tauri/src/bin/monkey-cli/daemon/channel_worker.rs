@@ -1032,6 +1032,15 @@ async fn run_account_inbound(
                     // Paced rather than run every poll: for iMessage this
                     // sends Messages an Apple event, and a health check is not
                     // a reason to drive somebody's Messages.app in a loop.
+                    //
+                    // Probing inside the `Ok(_)` arm is also load-bearing for
+                    // anything that watches health to know a cursor exists.
+                    // The email acceptance waits for a fresh probe before it
+                    // sends its marker, and that only means "the mailbox has
+                    // been read once" while the probe follows a successful
+                    // poll. Reordering these — probing before or independently
+                    // of the poll — would let a message land before the first
+                    // cursor and be counted past forever.
                     last_probed = Some(std::time::Instant::now());
                     let health = adapter.probe().await;
                     record_probe_health(&mut store, &mut posted_health, &account_id, &health);

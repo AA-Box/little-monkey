@@ -328,7 +328,7 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
       { key: "imap_password", label: "IMAP password" },
       { key: "smtp_password", label: "SMTP password (leave empty to reuse the IMAP one)", optional: true },
     ],
-    whereToGetIt: "Your own mailbox. Use an app password where your provider issues one \u2014 OAuth sign-in is not implemented. TLS is required on both legs and there is no cleartext configuration to get wrong: the adapter always opens an implicit-TLS socket and refuses ports 143 and 25 outright. One conversation per correspondent address, so a reply goes to the sender alone and never to everyone on a thread, and it carries In-Reply-To and References so it lands in the same thread. Automated mail — autoresponders, bounces and mailing-list posts — is never answered at all. The mailbox is polled about every thirty seconds rather than held open with IDLE.",
+    whereToGetIt: "Your own mailbox. Use an app password where your provider issues one \u2014 OAuth sign-in is not implemented. TLS is required on both legs and there is no cleartext configuration to get wrong: the adapter always opens an implicit-TLS socket and refuses ports 143 and 25 outright. One conversation per correspondent address, so a reply goes to the sender alone and never to everyone on a thread, and it carries In-Reply-To and References so it lands in the same thread. Automated mail — autoresponders, bounces and mailing-list posts — is never answered at all. The mailbox is polled about every thirty seconds rather than held open with IDLE. A server behind your own certificate authority is reached by naming a PEM file of extra trust anchors below; there is no setting that turns certificate or hostname checking off.",
     docsUrl: "https://datatracker.ietf.org/doc/html/rfc5322",
     configFields: [
       { key: "imap_host", label: "IMAP server", type: "text", required: true, placeholder: "imap.example.org" },
@@ -338,6 +338,7 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
       { key: "username", label: "Login name", type: "text", required: true, placeholder: "you@example.org" },
       { key: "from_address", label: "Send replies from", type: "text", required: true, placeholder: "you@example.org", hint: "The address replies are sent from, and the one used to recognise this account's own messages." },
       { key: "mailbox", label: "Mailbox (optional)", type: "text", placeholder: "INBOX", hint: "Which folder is polled. Defaults to INBOX." },
+      { key: "tls_ca_file", label: "Extra CA certificate file (optional)", type: "text", placeholder: "/etc/ssl/certs/my-mail-ca.pem", hint: "A PEM file of certificate authorities to trust in addition to the public ones, for a mail server behind your own CA. Added to the public set, never instead of it, and hostname verification still applies. A file that is missing, unreadable, unparseable or holding no certificate stops the account rather than being ignored. It is read when the account connects, so a rotated CA takes a daemon restart." },
     ],
   },
   {

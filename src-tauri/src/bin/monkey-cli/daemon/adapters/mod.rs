@@ -228,7 +228,10 @@ pub(crate) fn config_fields(kind: ChannelKind) -> &'static [ConfigField] {
     ];
     // The mailbox itself. No port defaults live here — the adapter refuses
     // the cleartext ports by number, so an omitted port means implicit TLS
-    // rather than "whatever the server offers".
+    // rather than "whatever the server offers". `tls_ca_file` is a path to a
+    // file of public certificates, so it is account configuration and not a
+    // keychain secret; what it can do is add trust anchors to the public web
+    // set, never replace them and never turn verification off.
     const EMAIL: &[ConfigField] = &[
         required("imap_host", ConfigFieldKind::Text),
         optional("imap_port", ConfigFieldKind::Number),
@@ -237,6 +240,7 @@ pub(crate) fn config_fields(kind: ChannelKind) -> &'static [ConfigField] {
         required("username", ConfigFieldKind::Text),
         required("from_address", ConfigFieldKind::Text),
         optional("mailbox", ConfigFieldKind::Text),
+        optional("tls_ca_file", ConfigFieldKind::Text),
     ];
     // `notify_service` is path-concatenated into the REST call and
     // `event_type` is what the socket subscribes to, so both are validated as
