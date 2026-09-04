@@ -15,7 +15,7 @@ The event count in that last step is asserted against a log the acceptance waits
 
 The model endpoint is deterministic by design and is the only fixture. It is reached through a recipe's ordinary `target.local_url` field; it cannot create channel events, write the outbox, or answer a request on the chat page. The test additionally asserts the original marker reached that model request and that `send_message` was in the tool schema.
 
-Unlike the IRC and email acceptances, the live leg here runs automatically on every pull request that touches these files, because there is no third party to contact and no operator secret to supply. `workflow_dispatch` runs the same job on demand.
+Unlike the IRC acceptance, the live leg here runs automatically on every pull request that touches these files, because there is no third party to contact and no operator secret to supply — as is now also true of the email and Home Assistant acceptances, which each start their own server in a container on the runner. This one needs no server at all. `workflow_dispatch` runs the same job on demand.
 
 What that run does **not** prove is a browser on another machine reaching a non-loopback bind with a certificate it trusts. That needs a certificate authority and a network you own, and it stays yours to verify — and it needs the account's `public` flag turned on first: these three routes are unauthenticated, so unlike the controller shell and the signed device API they do not follow the listener's bind. A peer that is not loopback is answered `404` until you say otherwise, with the account's pairing policy and the route's own rate limit as the gate after that.
 
