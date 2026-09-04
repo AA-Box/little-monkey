@@ -13,9 +13,16 @@
 //! outbox or send mail. The reply exists only if the installed daemon queues a
 //! real run and the production agent dispatches `send_message`.
 //!
-//! This harness intentionally needs two real mailboxes chosen by the operator.
-//! The accompanying workflow compiles it on every PR but only runs the mail
-//! acceptance on `workflow_dispatch`. See `docs/email-installed-service-e2e.md`.
+//! This harness needs two real mailboxes that can send to each other. On every
+//! pull request the accompanying workflow supplies them from a real Postfix and
+//! Dovecot server it starts in a container on the runner, reached over implicit
+//! TLS on 993 and 465 with a certificate minted from a certificate authority
+//! the job creates; `EMAIL_E2E_CA_FILE` names that authority, and both this
+//! harness's own mail client and the account it configures trust it *in
+//! addition to* the public web anchors. `workflow_dispatch` is the additional
+//! way to run the same acceptance against mailboxes an operator owns, where no
+//! extra authority is named and the public anchors are all there is. See
+//! `docs/email-installed-service-e2e.md`.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -226,7 +233,7 @@ fn create_profile() -> Result<String, String> {
 
 fn add_email_account(profile: &str, mailbox: &Mailbox) -> Result<String, String> {
     let label = format!("email-e2e-{}", unique());
-    let config = serde_json::json!({
+    let mut config = serde_json::json!({
         "imap_host": mailbox.imap_host,
         "imap_port": mailbox.imap_port,
         "smtp_host": mailbox.smtp_host,
@@ -234,8 +241,15 @@ fn add_email_account(profile: &str, mailbox: &Mailbox) -> Result<String, String>
         "username": mailbox.username,
         "from_address": mailbox.address,
         "mailbox": "INBOX",
-    })
-    .to_string();
+    });
+    // Omitted entirely when unset, so a dispatch run against an operator's own
+    // provider is configured exactly as it is today.
+    if let Ok(ca_file) = std::env::var("EMAIL_E2E_CA_FILE") {
+        if !ca_file.trim().is_empty() {
+            config["tls_ca_file"] = serde_json::json!(ca_file.trim());
+        }
+    }
+    let config = config.to_string();
     let output = require_cli(
         Some(profile),
         &[
@@ -583,10 +597,38 @@ fn wait_for_account_connected(
 // The independent mail client
 // ---------------------------------------------------------------------------
 
+/// The independent mail client's own trust. `EMAIL_E2E_CA_FILE` is honoured
+/// exactly as the product's `tls_ca_file` is — added to the public anchors,
+/// never instead of them — because this client talks to the same server the
+/// account under test does. A silent fallback to the public set here would
+/// fail the run six hundred seconds later with the wrong story, so a named
+/// file that cannot be used panics with its path.
 fn tls_config() -> Arc<rustls::ClientConfig> {
-    let roots = rustls::RootCertStore {
+    use rustls::pki_types::pem::PemObject;
+
+    let mut roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
+    if let Ok(path) = std::env::var("EMAIL_E2E_CA_FILE") {
+        let path = path.trim().to_string();
+        if !path.is_empty() {
+            let certificates = rustls::pki_types::CertificateDer::pem_file_iter(&path)
+                .unwrap_or_else(|error| panic!("EMAIL_E2E_CA_FILE {path} could not be read: {error}"));
+            let mut added = 0usize;
+            for certificate in certificates {
+                let certificate = certificate
+                    .unwrap_or_else(|error| panic!("EMAIL_E2E_CA_FILE {path} is not PEM: {error}"));
+                roots
+                    .add(certificate)
+                    .unwrap_or_else(|error| panic!("EMAIL_E2E_CA_FILE {path}: {error}"));
+                added += 1;
+            }
+            assert!(added > 0, "EMAIL_E2E_CA_FILE {path} contains no certificate");
+        }
+    }
+    // Both `ring` and `aws-lc-rs` are compiled in, so rustls refuses to pick
+    // one and `ClientConfig::builder()` would panic without this.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     Arc::new(
         rustls::ClientConfig::builder()
             .with_root_certificates(roots)
