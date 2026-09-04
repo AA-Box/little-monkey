@@ -1,21 +1,24 @@
 //! The operator's own Home Assistant -> native credential store -> installed
 //! resident daemon -> agent -> the same Home Assistant, as an acceptance.
 //!
-//! The provider is a real instance the person running this names. Little Monkey
-//! is configured only through the production CLI; its long-lived access token
-//! is written with `channels set-token`, so the installed daemon must recover
-//! it through `KeyringChannelSecrets` rather than from anything this harness
-//! holds. The independent client is the instance's own REST API: it fires the
-//! subscribed event with a unique marker and then watches the instance's states
-//! for the notification the agent's reply produces.
+//! The provider is a real instance whoever runs this names — in CI, one the job
+//! starts on loopback; on a dispatch or a local run, an operator's own house.
+//! Little Monkey is configured only through the production CLI; its access
+//! token is written with `channels set-token`, so the installed daemon must
+//! recover it through `KeyringChannelSecrets` rather than from anything this
+//! harness holds. The independent client is the instance's own REST API: it
+//! fires the subscribed event with a unique marker and then watches the
+//! instance's states for the notification the agent's reply produces.
 //!
 //! The sole deterministic component is the model HTTP origin, reached through
 //! an ordinary recipe `target.local_url`. It cannot create channel events,
 //! write the outbox or call a notify service.
 //!
-//! The accompanying workflow compiles this on every pull request and only runs
-//! the live acceptance on `workflow_dispatch`, because the destination is an
-//! operator-owned house.
+//! The accompanying workflow compiles this on every pull request and runs the
+//! live acceptance there too, against an official Home Assistant container the
+//! job starts on `127.0.0.1:8123` and onboards through Home Assistant's own
+//! APIs. A dispatch or a local run points the same four environment variables
+//! at an operator's own instance instead.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -562,11 +565,15 @@ async fn fire_event_as_external(
 
 /// Watch the instance's own states for the reply.
 ///
-/// `notify.persistent_notification` is what the workflow points the account at,
-/// because its result is readable back over the same REST API. Any state whose
-/// JSON carries the expected reply counts, so an operator who points the
-/// account at a different service that also surfaces as an entity still gets a
-/// meaningful run.
+/// The workflow points the account at a `command_line` notify service whose
+/// message a `command_line` sensor republishes as its own state, because that
+/// is what makes the round trip readable over this REST API.
+/// `notify.persistent_notification` cannot serve here: since 2023.6 a
+/// persistent notification is a WebSocket-only object that never becomes a
+/// state, so `GET /api/states` can never carry one. Any state whose JSON
+/// carries the expected reply counts, so an operator who points the account at
+/// a different service that also surfaces as an entity still gets a meaningful
+/// run.
 async fn wait_for_reply(
     client: &reqwest::Client,
     base_url: &str,
@@ -806,10 +813,13 @@ async fn main() {
     let token = std::env::var("HA_E2E_TOKEN").unwrap_or_default();
     let event_type =
         std::env::var("HA_E2E_EVENT_TYPE").unwrap_or_else(|_| "little_monkey_message".to_string());
-    let notify_service = std::env::var("HA_E2E_NOTIFY_SERVICE")
-        .unwrap_or_else(|_| "persistent_notification".to_string());
-    if base_url.is_empty() || token.is_empty() {
-        eprintln!("HA_E2E_BASE_URL and HA_E2E_TOKEN are required");
+    // No default notify service. `persistent_notification` used to be it, but a
+    // persistent notification never becomes a state, so that default silently
+    // produced a run that could only ever time out. Naming the service is the
+    // caller's job.
+    let notify_service = std::env::var("HA_E2E_NOTIFY_SERVICE").unwrap_or_default();
+    if base_url.is_empty() || token.is_empty() || notify_service.is_empty() {
+        eprintln!("HA_E2E_BASE_URL, HA_E2E_TOKEN and HA_E2E_NOTIFY_SERVICE are required");
         std::process::exit(2);
     }
     if let Err(error) = run_case(&base_url, &token, &event_type, &notify_service).await {
