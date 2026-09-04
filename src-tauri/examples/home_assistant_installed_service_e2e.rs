@@ -562,11 +562,15 @@ async fn fire_event_as_external(
 
 /// Watch the instance's own states for the reply.
 ///
-/// `notify.persistent_notification` is what the workflow points the account at,
-/// because its result is readable back over the same REST API. Any state whose
-/// JSON carries the expected reply counts, so an operator who points the
-/// account at a different service that also surfaces as an entity still gets a
-/// meaningful run.
+/// The workflow points the account at a `command_line` notify service whose
+/// message a `command_line` sensor republishes as its own state, because that
+/// is what makes the round trip readable over this REST API.
+/// `notify.persistent_notification` cannot serve here: since 2023.6 a
+/// persistent notification is a WebSocket-only object that never becomes a
+/// state, so `GET /api/states` can never carry one. Any state whose JSON
+/// carries the expected reply counts, so an operator who points the account at
+/// a different service that also surfaces as an entity still gets a meaningful
+/// run.
 async fn wait_for_reply(
     client: &reqwest::Client,
     base_url: &str,
@@ -806,10 +810,13 @@ async fn main() {
     let token = std::env::var("HA_E2E_TOKEN").unwrap_or_default();
     let event_type =
         std::env::var("HA_E2E_EVENT_TYPE").unwrap_or_else(|_| "little_monkey_message".to_string());
-    let notify_service = std::env::var("HA_E2E_NOTIFY_SERVICE")
-        .unwrap_or_else(|_| "persistent_notification".to_string());
-    if base_url.is_empty() || token.is_empty() {
-        eprintln!("HA_E2E_BASE_URL and HA_E2E_TOKEN are required");
+    // No default notify service. `persistent_notification` used to be it, but a
+    // persistent notification never becomes a state, so that default silently
+    // produced a run that could only ever time out. Naming the service is the
+    // caller's job.
+    let notify_service = std::env::var("HA_E2E_NOTIFY_SERVICE").unwrap_or_default();
+    if base_url.is_empty() || token.is_empty() || notify_service.is_empty() {
+        eprintln!("HA_E2E_BASE_URL, HA_E2E_TOKEN and HA_E2E_NOTIFY_SERVICE are required");
         std::process::exit(2);
     }
     if let Err(error) = run_case(&base_url, &token, &event_type, &notify_service).await {
