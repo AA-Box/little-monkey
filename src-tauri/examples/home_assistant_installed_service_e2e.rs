@@ -1,21 +1,24 @@
 //! The operator's own Home Assistant -> native credential store -> installed
 //! resident daemon -> agent -> the same Home Assistant, as an acceptance.
 //!
-//! The provider is a real instance the person running this names. Little Monkey
-//! is configured only through the production CLI; its long-lived access token
-//! is written with `channels set-token`, so the installed daemon must recover
-//! it through `KeyringChannelSecrets` rather than from anything this harness
-//! holds. The independent client is the instance's own REST API: it fires the
-//! subscribed event with a unique marker and then watches the instance's states
-//! for the notification the agent's reply produces.
+//! The provider is a real instance whoever runs this names — in CI, one the job
+//! starts on loopback; on a dispatch or a local run, an operator's own house.
+//! Little Monkey is configured only through the production CLI; its access
+//! token is written with `channels set-token`, so the installed daemon must
+//! recover it through `KeyringChannelSecrets` rather than from anything this
+//! harness holds. The independent client is the instance's own REST API: it
+//! fires the subscribed event with a unique marker and then watches the
+//! instance's states for the notification the agent's reply produces.
 //!
 //! The sole deterministic component is the model HTTP origin, reached through
 //! an ordinary recipe `target.local_url`. It cannot create channel events,
 //! write the outbox or call a notify service.
 //!
-//! The accompanying workflow compiles this on every pull request and only runs
-//! the live acceptance on `workflow_dispatch`, because the destination is an
-//! operator-owned house.
+//! The accompanying workflow compiles this on every pull request and runs the
+//! live acceptance there too, against an official Home Assistant container the
+//! job starts on `127.0.0.1:8123` and onboards through Home Assistant's own
+//! APIs. A dispatch or a local run points the same four environment variables
+//! at an operator's own instance instead.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
