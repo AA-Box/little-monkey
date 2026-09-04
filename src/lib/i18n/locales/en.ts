@@ -1371,6 +1371,7 @@ export const en: Record<string, string> = {
   "ChannelsPanel.transport_socket": "an open connection (no public URL needed)",
   "ChannelsPanel.transport_webhook": "the provider calling you (a public callback URL is required)",
   "ChannelsPanel.transport_helper": "a helper app you install yourself",
+  "ChannelsPanel.transport_served": "a page this app serves to a browser (no public URL needed)",
   "ChannelsPanel.needsCredential": "No credential saved yet, so this account cannot connect.",
   "ChannelsPanel.callbacksRejected":
     "{{count}} delivery attempt(s) have failed verification since one last succeeded. Check that the callback URL in the provider's console matches the one shown here, and that its signing secret matches the credential saved here.",

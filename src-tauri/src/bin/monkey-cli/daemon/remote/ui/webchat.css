@@ -1,0 +1,85 @@
+:root {
+  color-scheme: light dark;
+  --ink: #14161a;
+  --paper: #f6f7f9;
+  --card: #ffffff;
+  --line: #d8dce3;
+  --mine: #dbeafe;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #e8eaee;
+    --paper: #16181c;
+    --card: #1e2126;
+    --line: #333840;
+    --mine: #1e3a5f;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 16px/1.45 system-ui, -apple-system, Segoe UI, sans-serif;
+}
+main {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  gap: 0.75rem;
+}
+h1 { font-size: 1.1rem; margin: 0; }
+#status { font-size: 0.85rem; opacity: 0.75; margin: 0; }
+#transcript {
+  flex: 1;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: var(--card);
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.msg {
+  padding: 0.5rem 0.7rem;
+  border-radius: 0.6rem;
+  border: 1px solid var(--line);
+  max-width: 80%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.msg.mine { align-self: flex-end; background: var(--mine); }
+.msg .who { display: block; font-size: 0.75rem; opacity: 0.7; }
+form { display: flex; gap: 0.5rem; align-items: flex-end; }
+textarea {
+  flex: 1;
+  min-height: 3rem;
+  font: inherit;
+  color: inherit;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  padding: 0.5rem;
+  resize: vertical;
+}
+button {
+  font: inherit;
+  padding: 0.6rem 1rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: inherit;
+  cursor: pointer;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}

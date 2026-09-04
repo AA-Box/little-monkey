@@ -1,18 +1,28 @@
-//! Real IRC -> installed resident daemon -> agent -> real IRC acceptance.
+//! Real mailbox -> installed resident daemon -> agent -> real mailbox acceptance.
 //!
 //! This is deliberately a black-box harness. It configures Little Monkey only
-//! through `monkey-cli`, installs the real user service, connects a second IRC
-//! client over TLS, and proves that the message that client sends becomes a
-//! durable turn and an agent-produced reply that the second client receives.
+//! through `monkey-cli` (the mailbox password goes in through
+//! `channels set-token` on stdin, never as an argument), installs the real user
+//! service, sends one message from a *second* mailbox over a real SMTP relay,
+//! and proves that message becomes a durable turn and an agent-produced reply
+//! the second mailbox receives — threaded, with `In-Reply-To` naming the
+//! marker's own `Message-ID`.
 //!
 //! The only deterministic component is the OpenAI-compatible model origin. It
 //! is the same `target.local_url` seam a real recipe uses; it cannot write the
-//! outbox or speak IRC. The reply exists only if the installed daemon queues a
+//! outbox or send mail. The reply exists only if the installed daemon queues a
 //! real run and the production agent dispatches `send_message`.
 //!
-//! This harness intentionally needs a real, TLS IRC network chosen by the
-//! operator. The accompanying workflow compiles it on every PR but only runs
-//! the network acceptance on `workflow_dispatch`.
+//! This harness needs two real mailboxes that can send to each other. On every
+//! pull request the accompanying workflow supplies them from a real Postfix and
+//! Dovecot server it starts in a container on the runner, reached over implicit
+//! TLS on 993 and 465 with a certificate minted from a certificate authority
+//! the job creates; `EMAIL_E2E_CA_FILE` names that authority, and both this
+//! harness's own mail client and the account it configures trust it *in
+//! addition to* the public web anchors. `workflow_dispatch` is the additional
+//! way to run the same acceptance against mailboxes an operator owns, where no
+//! extra authority is named and the public anchors are all there is. See
+//! `docs/email-installed-service-e2e.md`.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -21,13 +31,64 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+use futures_util::StreamExt;
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio_rustls::TlsConnector;
+
 const PROFILE_ENV: &str = "LITTLE_MONKEY_PROFILE";
-const REQUIRE_ENV: &str = "LITTLE_MONKEY_REQUIRE_IRC_INSTALLED_SERVICE_E2E";
-const RECIPE: &str = "irc-installed-service-e2e";
-const REPLY_PREFIX: &str = "little-monkey irc installed-service reply";
+const REQUIRE_ENV: &str = "LITTLE_MONKEY_REQUIRE_EMAIL_INSTALLED_SERVICE_E2E";
+const RECIPE: &str = "email-installed-service-e2e";
+const REPLY_PREFIX: &str = "little-monkey email installed-service reply";
 const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
-const SERVICE_WAIT: Duration = Duration::from_secs(120);
-const IRC_WAIT: Duration = Duration::from_secs(240);
+const SERVICE_WAIT: Duration = Duration::from_secs(180);
+/// The adapter paces itself to one IMAP session about every thirty seconds and
+/// a relay may sit on a message for a while, so the reply window is generous.
+const MAIL_WAIT: Duration = Duration::from_secs(600);
+
+/// One mailbox, as the harness needs it: enough to log in and to send.
+#[derive(Clone)]
+struct Mailbox {
+    imap_host: String,
+    imap_port: u16,
+    smtp_host: String,
+    smtp_port: u16,
+    username: String,
+    password: String,
+    address: String,
+}
+
+impl Mailbox {
+    /// Read one mailbox out of the environment. `prefix` is `EMAIL_E2E` for the
+    /// account under test and `EMAIL_E2E_PEER` for the independent sender.
+    fn from_env(prefix: &str, address_var: &str) -> Result<Self, String> {
+        let var = |suffix: &str| -> Result<String, String> {
+            let name = format!("{prefix}_{suffix}");
+            std::env::var(&name)
+                .map_err(|_| format!("{name} must name the mailbox for this acceptance"))
+        };
+        let port = |suffix: &str, default: u16| -> Result<u16, String> {
+            match std::env::var(format!("{prefix}_{suffix}")) {
+                Ok(value) if !value.trim().is_empty() => value
+                    .trim()
+                    .parse()
+                    .map_err(|error| format!("{prefix}_{suffix} is not a port: {error}")),
+                _ => Ok(default),
+            }
+        };
+        Ok(Self {
+            imap_host: var("IMAP_HOST")?,
+            imap_port: port("IMAP_PORT", 993)?,
+            smtp_host: var("SMTP_HOST")?,
+            smtp_port: port("SMTP_PORT", 465)?,
+            username: var("USERNAME")?,
+            password: var("PASSWORD")?,
+            address: std::env::var(address_var)
+                .map_err(|_| format!("{address_var} must name the mailbox address"))?,
+        })
+    }
+}
 
 fn target_dir() -> PathBuf {
     std::env::var_os("CARGO_TARGET_DIR")
@@ -80,7 +141,11 @@ fn bounded_output(mut child: std::process::Child, label: &str) -> Result<Output,
         .map_err(|error| format!("failed to collect {label} output: {error}"))
 }
 
-fn run_cli(profile: Option<&str>, args: &[&str]) -> Result<Output, String> {
+fn run_cli_stdin(
+    profile: Option<&str>,
+    args: &[&str],
+    stdin_bytes: Option<&[u8]>,
+) -> Result<Output, String> {
     let binary = cli();
     if !binary.is_file() {
         return Err(format!(
@@ -106,12 +171,30 @@ fn run_cli(profile: Option<&str>, args: &[&str]) -> Result<Output, String> {
     } else {
         command.env_remove(PROFILE_ENV);
     }
-    let child = command
+    let mut child = command
+        .stdin(if stdin_bytes.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("failed to start monkey-cli {args:?}: {error}"))?;
+    if let Some(bytes) = stdin_bytes {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "monkey-cli stdin was not piped".to_string())?;
+        stdin
+            .write_all(bytes)
+            .map_err(|error| format!("failed to write the credential to stdin: {error}"))?;
+    }
     bounded_output(child, &format!("monkey-cli {args:?}"))
+}
+
+fn run_cli(profile: Option<&str>, args: &[&str]) -> Result<Output, String> {
+    run_cli_stdin(profile, args, None)
 }
 
 fn require_cli(profile: Option<&str>, args: &[&str]) -> Result<Output, String> {
@@ -128,7 +211,7 @@ fn require_cli(profile: Option<&str>, args: &[&str]) -> Result<Output, String> {
 }
 
 fn create_profile() -> Result<String, String> {
-    let name = format!("IRC installed-service E2E {}", unique());
+    let name = format!("Email installed-service E2E {}", unique());
     let output = require_cli(None, &["profiles", "create", &name, "--json"])?;
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
         format!(
@@ -148,26 +231,29 @@ fn create_profile() -> Result<String, String> {
         })
 }
 
-fn add_irc_account(
-    profile: &str,
-    server: &str,
-    port: u16,
-    nick: &str,
-    channel: &str,
-) -> Result<String, String> {
-    let label = format!("irc-e2e-{}", unique());
-    let config = serde_json::json!({
-        "server": server,
-        "port": port,
-        "nick": nick,
-        "channels": [channel],
-        "use_sasl": false,
-    })
-    .to_string();
+fn add_email_account(profile: &str, mailbox: &Mailbox) -> Result<String, String> {
+    let label = format!("email-e2e-{}", unique());
+    let mut config = serde_json::json!({
+        "imap_host": mailbox.imap_host,
+        "imap_port": mailbox.imap_port,
+        "smtp_host": mailbox.smtp_host,
+        "smtp_port": mailbox.smtp_port,
+        "username": mailbox.username,
+        "from_address": mailbox.address,
+        "mailbox": "INBOX",
+    });
+    // Omitted entirely when unset, so a dispatch run against an operator's own
+    // provider is configured exactly as it is today.
+    if let Ok(ca_file) = std::env::var("EMAIL_E2E_CA_FILE") {
+        if !ca_file.trim().is_empty() {
+            config["tls_ca_file"] = serde_json::json!(ca_file.trim());
+        }
+    }
+    let config = config.to_string();
     let output = require_cli(
         Some(profile),
         &[
-            "channels", "add", "irc", &label, "--config", &config, "--json",
+            "channels", "add", "email", &label, "--config", &config, "--json",
         ],
     )?;
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
@@ -176,7 +262,7 @@ fn add_irc_account(
             output_text(&output)
         )
     })?;
-    payload
+    let account_id = payload
         .get("account_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
@@ -185,7 +271,25 @@ fn add_irc_account(
                 "account JSON had no account_id: {}",
                 String::from_utf8_lossy(&output.stdout)
             )
-        })
+        })?;
+
+    // The credential goes in the way an operator's does: as a JSON bundle on
+    // stdin, so it never appears in a process listing.
+    let bundle = serde_json::json!({ "imap_password": mailbox.password }).to_string();
+    let stored = run_cli_stdin(
+        Some(profile),
+        &["channels", "set-token", &account_id],
+        Some(bundle.as_bytes()),
+    )?;
+    if !stored.status.success() {
+        // Deliberately not `output_text`: the failure path of a credential
+        // write is the one place an echoed secret would leak into CI logs.
+        return Err(format!(
+            "channels set-token failed with {} for the email account",
+            stored.status
+        ));
+    }
+    Ok(account_id)
 }
 
 struct ModelFixture {
@@ -235,7 +339,7 @@ impl ModelFixture {
                                 "index": 0,
                                 "delta": { "tool_calls": [{
                                     "index": 0,
-                                    "id": "call_irc_installed_1",
+                                    "id": "call_email_installed_1",
                                     "type": "function",
                                     "function": {
                                         "name": "send_message",
@@ -372,11 +476,8 @@ fn write_recipe(profile: &str, workspace: &Path, model_base: &str) -> Result<(),
     let recipe = serde_json::json!({
         "version": 1,
         "name": RECIPE,
-        "target": { "local_url": model_base, "model": "irc-e2e-fixture" },
+        "target": { "local_url": model_base, "model": "email-e2e-fixture" },
         "workspace": workspace.to_string_lossy(),
-        // Bypass is a real production permission mode. It keeps this acceptance
-        // unattended; the route's frozen reply grant still constrains
-        // send_message to the conversation that caused this run.
         "permission_mode": "auto",
         "prompt": "{{message}}",
         "params": { "message": null },
@@ -400,12 +501,6 @@ fn now_ms() -> u64 {
 
 /// The pid of the installed resident service, once it is running and its
 /// heartbeat is fresh.
-///
-/// Split from the account check below rather than answered together, so the
-/// number this returns is read from `daemon status` and from nothing else. A
-/// pid that came back through a function which had also parsed an account row
-/// is a pid the reader — and code scanning — cannot tell apart from the row
-/// that carries the credential.
 fn wait_for_service_pid(profile: &str, deadline: Instant) -> Result<u64, String> {
     let mut last_status = String::new();
     while Instant::now() < deadline {
@@ -443,15 +538,10 @@ fn wait_for_service_pid(profile: &str, deadline: Instant) -> Result<u64, String>
 
 /// Whether the installed daemon has this account connected **now**.
 ///
-/// `since_ms` is what makes this an answer rather than an echo. Account health
-/// is a stored row, and the daemon that wrote it may be a process that has
-/// since been stopped — so after a restart the row still says `connected` for
-/// as long as it takes the new process to reach the provider and write its own
-/// verdict. A harness that posts the moment it reads that row is posting into a
-/// window where nothing is listening, and a socket provider does not replay
-/// what it delivered to nobody. Requiring `last_probe_at_ms` to be at or after
-/// the moment this wait began is what makes `connected` mean the running
-/// process said so.
+/// `since_ms` is what makes this an answer rather than an echo: account health
+/// is a stored row, and the process that wrote it may already have been
+/// stopped. Requiring `last_probe_at_ms` to be at or after the moment this wait
+/// began is what makes `connected` mean the running process said so.
 ///
 /// Returns nothing on success and a fixed label on failure: the account row is
 /// the one payload here that can carry credential-bearing fields, so no part of
@@ -490,7 +580,7 @@ fn wait_for_account_connected(
             .and_then(serde_json::Value::as_u64);
         let fresh = last_probe.is_some_and(|probed| probed >= since_ms);
         if fresh && last_health == "error" {
-            return Err("resident daemon could not build/connect the IRC account".to_string());
+            return Err("resident daemon could not reach the mailbox over IMAP".to_string());
         }
         if fresh && last_health == "connected" {
             return Ok(());
@@ -498,177 +588,247 @@ fn wait_for_account_connected(
         std::thread::sleep(Duration::from_millis(500));
     }
     Err(format!(
-        "resident service never reported connected IRC health of its own within {}s\nlast account health: {last_health} (last probe {last_probe:?}, waiting for one at or after {since_ms})",
+        "resident service never reported connected mailbox health of its own within {}s\nlast account health: {last_health} (last probe {last_probe:?}, waiting for one at or after {since_ms})",
         SERVICE_WAIT.as_secs()
     ))
 }
 
-fn write_irc_line<S: Write>(stream: &mut S, line: &str) -> Result<(), String> {
-    stream
-        .write_all(line.as_bytes())
-        .and_then(|_| stream.write_all(b"\r\n"))
-        .and_then(|_| stream.flush())
-        .map_err(|error| format!("IRC write {line:?}: {error}"))
-}
+// ---------------------------------------------------------------------------
+// The independent mail client
+// ---------------------------------------------------------------------------
 
-fn read_irc_line<S: Read>(stream: &mut S) -> std::io::Result<Option<String>> {
-    let mut bytes = Vec::new();
-    loop {
-        let mut one = [0u8; 1];
-        match stream.read(&mut one) {
-            Ok(0) if bytes.is_empty() => return Ok(None),
-            Ok(0) => break,
-            Ok(_) if one[0] == b'\n' => break,
-            Ok(_) if one[0] != b'\r' => bytes.push(one[0]),
-            Ok(_) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(Some(String::from_utf8_lossy(&bytes).to_string()))
-}
+/// The independent mail client's own trust. `EMAIL_E2E_CA_FILE` is honoured
+/// exactly as the product's `tls_ca_file` is — added to the public anchors,
+/// never instead of them — because this client talks to the same server the
+/// account under test does. A silent fallback to the public set here would
+/// fail the run six hundred seconds later with the wrong story, so a named
+/// file that cannot be used panics with its path.
+fn tls_config() -> Arc<rustls::ClientConfig> {
+    use rustls::pki_types::pem::PemObject;
 
-fn handle_ping<S: Write>(stream: &mut S, line: &str) -> Result<bool, String> {
-    if let Some(payload) = line.strip_prefix("PING ") {
-        write_irc_line(stream, &format!("PONG {payload}"))?;
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-fn real_external_irc_round_trip(
-    server: &str,
-    port: u16,
-    external_nick: &str,
-    bot_nick: &str,
-    channel: &str,
-    marker: &str,
-) -> Result<String, String> {
-    let tcp = TcpStream::connect((server, port))
-        .map_err(|error| format!("external IRC TCP connect to {server}:{port}: {error}"))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|error| format!("set IRC read timeout: {error}"))?;
-    tcp.set_write_timeout(Some(Duration::from_secs(10)))
-        .map_err(|error| format!("set IRC write timeout: {error}"))?;
-
-    // Both `ring` and `aws-lc-rs` are compiled in, so rustls will not pick
-    // one and `ClientConfig::builder()` would panic without this.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let roots = rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
-    let config = Arc::new(
+    if let Ok(path) = std::env::var("EMAIL_E2E_CA_FILE") {
+        let path = path.trim().to_string();
+        if !path.is_empty() {
+            let certificates = rustls::pki_types::CertificateDer::pem_file_iter(&path)
+                .unwrap_or_else(|error| panic!("EMAIL_E2E_CA_FILE {path} could not be read: {error}"));
+            let mut added = 0usize;
+            for certificate in certificates {
+                let certificate = certificate
+                    .unwrap_or_else(|error| panic!("EMAIL_E2E_CA_FILE {path} is not PEM: {error}"));
+                roots
+                    .add(certificate)
+                    .unwrap_or_else(|error| panic!("EMAIL_E2E_CA_FILE {path}: {error}"));
+                added += 1;
+            }
+            assert!(added > 0, "EMAIL_E2E_CA_FILE {path} contains no certificate");
+        }
+    }
+    // Both `ring` and `aws-lc-rs` are compiled in, so rustls refuses to pick
+    // one and `ClientConfig::builder()` would panic without this.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Arc::new(
         rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth(),
+    )
+}
+
+async fn tls_stream(
+    host: &str,
+    port: u16,
+) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, String> {
+    let tcp = tokio::net::TcpStream::connect((host, port))
+        .await
+        .map_err(|error| format!("TCP connect to {host}:{port}: {error}"))?;
+    let name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|error| format!("invalid TLS server name {host}: {error}"))?;
+    TlsConnector::from(tls_config())
+        .connect(name, tcp)
+        .await
+        .map_err(|error| format!("TLS handshake with {host}:{port}: {error}"))
+}
+
+async fn read_smtp_reply<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> Result<(u16, String), String> {
+    let mut collected = String::new();
+    loop {
+        let mut line = String::new();
+        let read = reader
+            .read_line(&mut line)
+            .await
+            .map_err(|error| format!("SMTP read: {error}"))?;
+        if read == 0 {
+            return Err("the SMTP server closed the connection".to_string());
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+        if !collected.is_empty() {
+            collected.push(' ');
+        }
+        collected.push_str(&trimmed);
+        let bytes = trimmed.as_bytes();
+        if bytes.len() < 4 || bytes[3] != b'-' {
+            let code = trimmed
+                .get(..3)
+                .and_then(|code| code.parse().ok())
+                .unwrap_or(0);
+            return Ok((code, collected));
+        }
+    }
+}
+
+async fn expect_smtp<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    stage: &str,
+) -> Result<String, String> {
+    let (code, line) = read_smtp_reply(reader).await?;
+    if (200..400).contains(&code) {
+        Ok(line)
+    } else {
+        Err(format!("SMTP {stage} answered {code}"))
+    }
+}
+
+async fn write_smtp<W: AsyncWrite + Unpin>(writer: &mut W, line: &str) -> Result<(), String> {
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|error| format!("SMTP write: {error}"))?;
+    writer
+        .write_all(b"\r\n")
+        .await
+        .map_err(|error| format!("SMTP write: {error}"))?;
+    writer
+        .flush()
+        .await
+        .map_err(|error| format!("SMTP flush: {error}"))
+}
+
+/// Send one message from the independent mailbox, and return its `Message-ID`.
+///
+/// A second, self-contained SMTP client on purpose: the acceptance must be able
+/// to send *to* Little Monkey from code that is not Little Monkey's own send
+/// path, or it would only ever be testing that path against itself.
+async fn send_marker_mail(peer: &Mailbox, to: &str, marker: &str) -> Result<String, String> {
+    let message_id = format!("{marker}.peer@{}", domain_of(&peer.address));
+    let body = format!(
+        "From: <{from}>\r\nTo: <{to}>\r\nSubject: {marker}\r\nMessage-ID: <{message_id}>\r\n\
+         MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{marker}\r\n",
+        from = peer.address,
     );
-    let name = rustls::pki_types::ServerName::try_from(server.to_string())
-        .map_err(|error| format!("invalid IRC TLS server name {server}: {error}"))?;
-    let connection = rustls::ClientConnection::new(config, name)
-        .map_err(|error| format!("build IRC TLS client: {error}"))?;
-    let mut stream = rustls::StreamOwned::new(connection, tcp);
 
-    write_irc_line(&mut stream, &format!("NICK {external_nick}"))?;
-    write_irc_line(
-        &mut stream,
-        &format!("USER {external_nick} 0 * :Little Monkey IRC E2E"),
-    )?;
+    let stream = tls_stream(&peer.smtp_host, peer.smtp_port).await?;
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader);
+    expect_smtp(&mut reader, "greeting").await?;
+    write_smtp(&mut writer, &format!("EHLO {}", domain_of(&peer.address))).await?;
+    let greeting = expect_smtp(&mut reader, "EHLO").await?;
+    if !greeting.to_ascii_uppercase().contains("AUTH") {
+        return Err("the peer SMTP relay offered no AUTH".to_string());
+    }
+    let credential = BASE64.encode(format!("\0{}\0{}", peer.username, peer.password).as_bytes());
+    write_smtp(&mut writer, &format!("AUTH PLAIN {credential}")).await?;
+    expect_smtp(&mut reader, "AUTH").await?;
+    write_smtp(&mut writer, &format!("MAIL FROM:<{}>", peer.address)).await?;
+    expect_smtp(&mut reader, "MAIL FROM").await?;
+    write_smtp(&mut writer, &format!("RCPT TO:<{to}>")).await?;
+    expect_smtp(&mut reader, "RCPT TO").await?;
+    write_smtp(&mut writer, "DATA").await?;
+    expect_smtp(&mut reader, "DATA").await?;
+    writer
+        .write_all(body.trim_end().as_bytes())
+        .await
+        .map_err(|error| format!("SMTP body: {error}"))?;
+    writer
+        .write_all(b"\r\n.\r\n")
+        .await
+        .map_err(|error| format!("SMTP terminator: {error}"))?;
+    writer
+        .flush()
+        .await
+        .map_err(|error| format!("SMTP flush: {error}"))?;
+    expect_smtp(&mut reader, "message body").await?;
+    let _ = write_smtp(&mut writer, "QUIT").await;
+    Ok(message_id)
+}
 
-    let registered_deadline = Instant::now() + Duration::from_secs(60);
-    let mut registered = false;
-    while Instant::now() < registered_deadline {
-        match read_irc_line(&mut stream) {
-            Ok(Some(line)) => {
-                if handle_ping(&mut stream, &line)? {
-                    continue;
-                }
-                if line.contains(" 001 ") {
-                    registered = true;
-                    break;
-                }
-                if line.contains(" 433 ") {
-                    return Err(format!(
-                        "external IRC nick {external_nick} is already in use"
-                    ));
-                }
-            }
-            Ok(None) => return Err("IRC server closed before registration".to_string()),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(error) => return Err(format!("IRC registration read: {error}")),
-        }
-    }
-    if !registered {
-        return Err("external IRC client did not receive 001 welcome".to_string());
-    }
+fn domain_of(address: &str) -> &str {
+    address
+        .rsplit_once('@')
+        .map(|(_, domain)| domain)
+        .unwrap_or("localhost")
+}
 
-    write_irc_line(&mut stream, &format!("JOIN {channel}"))?;
-    let join_deadline = Instant::now() + Duration::from_secs(60);
-    let mut saw_bot = false;
-    let mut names_done = false;
-    while Instant::now() < join_deadline {
-        match read_irc_line(&mut stream) {
-            Ok(Some(line)) => {
-                if handle_ping(&mut stream, &line)? {
-                    continue;
-                }
-                if line.contains(" 353 ") && line.contains(channel) {
-                    saw_bot |= line.split_whitespace().any(|word| {
-                        word.trim_start_matches([':', '@', '+', '%', '~', '&']) == bot_nick
-                    });
-                }
-                if line.contains(" 366 ") && line.contains(channel) {
-                    names_done = true;
-                    break;
-                }
-            }
-            Ok(None) => return Err("IRC server closed while joining channel".to_string()),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(error) => return Err(format!("IRC join read: {error}")),
-        }
-    }
-    if !names_done {
-        return Err(format!("IRC channel {channel} never completed NAMES"));
-    }
-    if !saw_bot {
-        return Err(format!(
-            "installed Little Monkey nick {bot_nick} was not present in {channel} before the test message"
-        ));
-    }
-
-    write_irc_line(&mut stream, &format!("PRIVMSG {channel} :{marker}"))?;
-
-    let expected = format!("{REPLY_PREFIX} {marker}");
-    let deadline = Instant::now() + IRC_WAIT;
+/// Poll the independent mailbox until the agent's reply lands, then return the
+/// `(subject-carrying body, In-Reply-To)` pair the assertion needs.
+async fn await_reply(peer: &Mailbox, expected: &str, deadline: Instant) -> Result<String, String> {
+    let mut last_error = "no message matched yet".to_string();
     while Instant::now() < deadline {
-        match read_irc_line(&mut stream) {
-            Ok(Some(line)) => {
-                if handle_ping(&mut stream, &line)? {
-                    continue;
-                }
-                if line.contains(&format!("PRIVMSG {channel} :")) && line.contains(&expected) {
-                    return Ok(line);
-                }
-            }
-            Ok(None) => return Err("IRC server closed before the agent reply arrived".to_string()),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(error) => return Err(format!("IRC reply read: {error}")),
+        match scan_mailbox_once(peer, expected).await {
+            Ok(Some(in_reply_to)) => return Ok(in_reply_to),
+            Ok(None) => last_error = "the reply has not arrived yet".to_string(),
+            Err(error) => last_error = error,
         }
+        tokio::time::sleep(Duration::from_secs(10)).await;
     }
     Err(format!(
-        "external IRC client did not observe {expected:?} within {}s",
-        IRC_WAIT.as_secs()
+        "the independent mailbox never received {expected:?} within {}s: {last_error}",
+        MAIL_WAIT.as_secs()
     ))
+}
+
+async fn scan_mailbox_once(peer: &Mailbox, expected: &str) -> Result<Option<String>, String> {
+    let stream = tls_stream(&peer.imap_host, peer.imap_port).await?;
+    let mut client = async_imap::Client::new(stream);
+    client
+        .read_response()
+        .await
+        .map_err(|error| format!("peer IMAP greeting: {error}"))?
+        .ok_or_else(|| "peer IMAP closed before greeting".to_string())?;
+    let mut session = client
+        .login(&peer.username, &peer.password)
+        .await
+        .map_err(|(error, _)| format!("peer IMAP login: {error}"))?;
+    let mailbox = session
+        .select("INBOX")
+        .await
+        .map_err(|error| format!("peer IMAP SELECT INBOX: {error}"))?;
+    let next = mailbox.uid_next.unwrap_or(1);
+    // The last few messages are enough: the reply is the newest thing in a
+    // mailbox this harness is the only writer of.
+    let first = next.saturating_sub(20).max(1);
+    let mut found = None;
+    {
+        let mut fetches = session
+            .uid_fetch(format!("{first}:*"), "(UID BODY.PEEK[])")
+            .await
+            .map_err(|error| format!("peer IMAP UID FETCH: {error}"))?;
+        while let Some(fetch) = fetches.next().await {
+            let fetch = fetch.map_err(|error| format!("peer IMAP fetch stream: {error}"))?;
+            let Some(raw) = fetch.body() else { continue };
+            let Some(message) = mail_parser::MessageParser::default().parse(raw) else {
+                continue;
+            };
+            let body = message.body_text(0).unwrap_or_default();
+            if !body.contains(expected) {
+                continue;
+            }
+            found = Some(
+                message
+                    .in_reply_to()
+                    .as_text_list()
+                    .and_then(|ids| ids.last().cloned())
+                    .map(|id| id.trim().trim_matches(['<', '>']).to_string())
+                    .unwrap_or_default(),
+            );
+            break;
+        }
+    }
+    let _ = session.logout().await;
+    Ok(found)
 }
 
 fn assert_durable_events(profile: &str, account_id: &str) -> Result<(), String> {
@@ -709,8 +869,7 @@ fn assert_durable_events(profile: &str, account_id: &str) -> Result<(), String> 
     // Two outbound rows, not one: the daemon greets a person's first message
     // with a one-time notice naming the model, and every harness runs a fresh
     // profile, so its sender is always a first contact. The count stays exact
-    // on purpose — a third row would be a reply sent twice, which is the bug
-    // this assertion exists to catch.
+    // on purpose — a third row would be a reply sent twice.
     if outbound != 2 {
         return Err(format!(
             "expected exactly two durable outbound events (the first-contact notice and the reply), got {outbound}: {payload}"
@@ -726,10 +885,6 @@ fn dump_diagnostics(profile: &str, account_id: Option<&str>) {
     if let Ok(output) = run_cli(Some(profile), &["channels", "list", "--json"]) {
         eprintln!("--- channels ---\n{}", output_text(&output));
     }
-    // The question every failure here starts with: did anything arrive at all?
-    // Without this, "no reply within the timeout" cannot be told apart from
-    // "the provider never delivered the message", and the two have nothing in
-    // common to fix.
     if let Some(account_id) = account_id {
         if let Ok(output) = run_cli(
             Some(profile),
@@ -751,25 +906,36 @@ fn cleanup(profile: Option<&str>, account_id: Option<&str>) {
     }
 }
 
-fn run_case(server: &str, port: u16) -> Result<(), String> {
+fn run_case() -> Result<(), String> {
     if std::env::var(REQUIRE_ENV).as_deref() != Ok("1") {
         return Err(format!(
-            "refusing to install a real OS service and contact a real IRC network unless {REQUIRE_ENV}=1"
+            "refusing to install a real OS service and send real mail unless {REQUIRE_ENV}=1"
         ));
     }
     if cfg!(target_os = "macos") {
         return Err("this acceptance currently targets Linux/Windows service semantics; macOS service acceptance remains tracked separately".to_string());
     }
 
+    let account_mailbox = Mailbox::from_env("EMAIL_E2E", "EMAIL_E2E_FROM")?;
+    let peer_mailbox = Mailbox::from_env("EMAIL_E2E_PEER", "EMAIL_E2E_PEER_ADDRESS")?;
+    if account_mailbox
+        .address
+        .eq_ignore_ascii_case(&peer_mailbox.address)
+    {
+        return Err(
+            "the independent sender must be a different mailbox, or the account would only be \
+             talking to itself"
+                .to_string(),
+        );
+    }
+
     let stamp = unique();
-    let suffix = format!("{:06x}", (stamp as u64) & 0x00ff_ffff);
-    // Eight characters keeps the harness valid even on old networks with a
-    // nine-character NICKLEN.
-    let bot_nick = format!("lmB{suffix}");
-    let external_nick = format!("lmU{suffix}");
-    let channel = format!("#little-monkey-e2e-{stamp:x}");
-    let marker = format!("lm-irc-installed-{stamp:x}");
+    let marker = format!("lm-email-installed-{stamp:x}");
     let model = ModelFixture::spawn(marker.clone())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("build the mail runtime: {error}"))?;
 
     let mut profile: Option<String> = None;
     let mut account_id: Option<String> = None;
@@ -777,12 +943,12 @@ fn run_case(server: &str, port: u16) -> Result<(), String> {
         let created = create_profile()?;
         profile = Some(created.clone());
 
-        let workspace = std::env::temp_dir().join(format!("lm-irc-e2e-workspace-{stamp:x}"));
+        let workspace = std::env::temp_dir().join(format!("lm-email-e2e-workspace-{stamp:x}"));
         std::fs::create_dir_all(&workspace)
             .map_err(|error| format!("create workspace {}: {error}", workspace.display()))?;
         write_recipe(&created, &workspace, &model.base)?;
 
-        let account = add_irc_account(&created, server, port, &bot_nick, &channel)?;
+        let account = add_email_account(&created, &account_mailbox)?;
         account_id = Some(account.clone());
         require_cli(
             Some(&created),
@@ -823,9 +989,8 @@ fn run_case(server: &str, port: u16) -> Result<(), String> {
         let first_pid = wait_for_service_pid(&created, deadline)?;
         wait_for_account_connected(&created, &account, waiting_since_ms, deadline)?;
 
-        // Prove the persistent socket is owned by a real resident lifecycle,
-        // not merely by the process that configured it: stop/start and require
-        // the service to reconnect before the external sender enters.
+        // Prove the mailbox session is owned by a real resident lifecycle, not
+        // merely by the process that configured it.
         require_cli(Some(&created), &["daemon", "stop"])?;
         require_cli(Some(&created), &["daemon", "start"])?;
         let waiting_since_ms = now_ms();
@@ -836,23 +1001,36 @@ fn run_case(server: &str, port: u16) -> Result<(), String> {
             return Err("restarted daemon pid is the acceptance harness pid".to_string());
         }
         eprintln!(
-            "installed IRC daemon ready (initial pid {first_pid}, after restart {restarted_pid})"
+            "installed email daemon ready (initial pid {first_pid}, after restart {restarted_pid})"
         );
 
-        let observed = real_external_irc_round_trip(
-            server,
-            port,
-            &external_nick,
-            &bot_nick,
-            &channel,
+        let sent_id = runtime.block_on(send_marker_mail(
+            &peer_mailbox,
+            &account_mailbox.address,
             &marker,
-        )?;
-        eprintln!("external IRC client observed: {observed}");
+        ))?;
+        eprintln!("independent mailbox sent {sent_id}");
+
+        let expected = format!("{REPLY_PREFIX} {marker}");
+        let in_reply_to = runtime.block_on(await_reply(
+            &peer_mailbox,
+            &expected,
+            Instant::now() + MAIL_WAIT,
+        ))?;
+        eprintln!("independent mailbox observed the reply, In-Reply-To: {in_reply_to}");
+        // Threading is the half of this channel a body match cannot prove: a
+        // reply that does not name what it answers lands as a new conversation
+        // in every mail client there is.
+        if in_reply_to != sent_id {
+            return Err(format!(
+                "the reply's In-Reply-To was {in_reply_to:?}, not the marker's own {sent_id:?}"
+            ));
+        }
 
         let requests = model.requests();
         if !requests.iter().any(|request| request.contains(&marker)) {
             return Err(format!(
-                "the installed agent never sent the real IRC message to the model: {requests:?}"
+                "the installed agent never sent the real mail to the model: {requests:?}"
             ));
         }
         if !requests
@@ -880,26 +1058,9 @@ fn run_case(server: &str, port: u16) -> Result<(), String> {
     result
 }
 
-fn real_main() -> Result<(), String> {
-    let mut args = std::env::args().skip(1);
-    let server = args
-        .next()
-        .ok_or_else(|| "usage: irc_installed_service_e2e <tls-server> [port]".to_string())?;
-    let port = args
-        .next()
-        .map(|value| {
-            value
-                .parse::<u16>()
-                .map_err(|error| format!("invalid IRC port {value:?}: {error}"))
-        })
-        .transpose()?
-        .unwrap_or(6697);
-    run_case(&server, port)
-}
-
 fn main() {
-    if let Err(error) = real_main() {
-        eprintln!("IRC installed-service E2E failed: {error}");
+    if let Err(error) = run_case() {
+        eprintln!("Email installed-service E2E failed: {error}");
         std::process::exit(1);
     }
 }

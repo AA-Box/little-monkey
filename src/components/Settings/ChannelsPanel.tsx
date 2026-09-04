@@ -216,10 +216,14 @@ export function ChannelsPanel() {
   // rejected as malformed.
   const fields = guide?.secretFields ?? [];
   const credentialValue = fields.length > 0
-    ? JSON.stringify(Object.fromEntries(fields.map((field) => [field.key, secretParts[field.key] ?? ""])))
+    ? JSON.stringify(Object.fromEntries(
+      fields
+        .map((field) => [field.key, secretParts[field.key] ?? ""] as const)
+        .filter(([, value]) => value.length > 0),
+    ))
     : secret;
   const credentialReady = fields.length > 0
-    ? fields.every((field) => (secretParts[field.key] ?? "").length > 0)
+    ? fields.every((field) => field.optional || (secretParts[field.key] ?? "").length > 0)
     : secret.length > 0;
 
   if (accounts === null) {
