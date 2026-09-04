@@ -107,12 +107,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install native service dependencies
+      - name: Install native service and keyring dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
-            build-essential dbus dbus-user-session dbus-x11 libdbus-1-dev openssl
+            build-essential dbus dbus-user-session dbus-x11 gnome-keyring \
+            libdbus-1-dev openssl
 
       # An operator's own provider chains to a public root, so this branch
       # names no extra certificate authority.
@@ -260,7 +261,11 @@ jobs:
       # Use PID 1's real user manager, exactly like the native secure-store
       # acceptance. A nested systemd instance cannot own a cgroup inside the
       # hosted runner's service.
-      - name: Start real systemd user manager
+      # The Secret Service is not optional: the harness writes the mailbox
+      # password with `channels set-token`, which goes through the real keyring
+      # crate to org.freedesktop.secrets. Without it the account stays
+      # `has_credential: false` and never opens a connection at all.
+      - name: Start real systemd user manager and Secret Service
         shell: bash
         run: |
           set -euo pipefail
@@ -287,6 +292,17 @@ jobs:
           echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime/bus" >> "$GITHUB_ENV"
           export XDG_RUNTIME_DIR="$runtime"
           export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus"
+
+          eval "$(printf '\n' | gnome-keyring-daemon --unlock --replace --components=secrets)"
+          found=0
+          for _ in $(seq 1 30); do
+            if busctl --user --no-pager list --acquired | grep -q 'org.freedesktop.secrets'; then
+              found=1
+              break
+            fi
+            sleep 0.25
+          done
+          test "$found" -eq 1
           systemctl --user import-environment HOME PATH XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
 
       # A protocol gate, not a port check, and it doubles as proof that the
