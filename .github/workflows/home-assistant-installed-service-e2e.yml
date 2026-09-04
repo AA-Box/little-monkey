@@ -58,7 +58,10 @@ jobs:
       # Docker Hub only to avoid anonymous pull limits; the image is the same.
       HA_IMAGE: ghcr.io/home-assistant/home-assistant:2026.8.3
       HA_CONTAINER: little-monkey-home-assistant-e2e
-      HA_CONFIG_DIR: ${{ runner.temp }}/home-assistant-e2e-config
+      # HA_CONFIG_DIR is exported to $GITHUB_ENV by the first step rather than
+      # written here: the `runner` context is not one of the contexts a
+      # job-level `env:` may read, and naming it makes the whole workflow
+      # invalid, which shows up as a run that never starts a job.
       # The literal 127.0.0.1, never `localhost`: the container's port is
       # published on loopback IPv4 only, and `localhost` can resolve to ::1
       # first, which looks exactly like a dead container.
@@ -74,6 +77,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          HA_CONFIG_DIR="$RUNNER_TEMP/home-assistant-e2e-config"
+          echo "HA_CONFIG_DIR=$HA_CONFIG_DIR" >> "$GITHUB_ENV"
           mkdir -p "$HA_CONFIG_DIR"
           # No `default_config:`. Home Assistant's bootstrap sets up its own
           # default integrations whatever the YAML says, and `frontend` pulls
