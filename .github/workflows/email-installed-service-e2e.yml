@@ -92,23 +92,18 @@ jobs:
 
   live-installed-service:
     name: real mailbox -> installed daemon -> agent -> real mailbox
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-22.04
     timeout-minutes: 60
+    # Every EMAIL_E2E_* value is written to $GITHUB_ENV by exactly one of two
+    # mutually exclusive steps below, so there is no job-env-versus-GITHUB_ENV
+    # precedence question and each branch reads top to bottom.
     env:
       LITTLE_MONKEY_REQUIRE_EMAIL_INSTALLED_SERVICE_E2E: "1"
-      EMAIL_E2E_IMAP_HOST: ${{ inputs.imap_host }}
-      EMAIL_E2E_IMAP_PORT: ${{ inputs.imap_port }}
-      EMAIL_E2E_SMTP_HOST: ${{ inputs.smtp_host }}
-      EMAIL_E2E_SMTP_PORT: ${{ inputs.smtp_port }}
-      EMAIL_E2E_USERNAME: ${{ inputs.username }}
-      EMAIL_E2E_FROM: ${{ inputs.from_address }}
-      EMAIL_E2E_PASSWORD: ${{ secrets.EMAIL_E2E_PASSWORD }}
-      EMAIL_E2E_PEER_IMAP_HOST: ${{ inputs.peer_imap_host }}
-      EMAIL_E2E_PEER_SMTP_HOST: ${{ inputs.peer_smtp_host }}
-      EMAIL_E2E_PEER_USERNAME: ${{ inputs.peer_username }}
-      EMAIL_E2E_PEER_ADDRESS: ${{ inputs.peer_address }}
-      EMAIL_E2E_PEER_PASSWORD: ${{ secrets.EMAIL_E2E_PEER_PASSWORD }}
+      # Real Postfix and Dovecot, pinned. `mailserver/docker-mailserver` is the
+      # software the account's own `tls_ca_file` key exists for: someone
+      # running their own mail server behind their own certificate authority.
+      DMS_IMAGE: mailserver/docker-mailserver:15.1.0
+      MAIL_HOST: mail.lm.test
     steps:
       - uses: actions/checkout@v4
 
@@ -117,7 +112,136 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
-            build-essential dbus dbus-user-session dbus-x11 libdbus-1-dev
+            build-essential dbus dbus-user-session dbus-x11 libdbus-1-dev openssl
+
+      # An operator's own provider chains to a public root, so this branch
+      # names no extra certificate authority.
+      - name: Point the acceptance at the operator's own mailboxes
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        # Through the environment rather than interpolated into the script: a
+        # dispatch input is operator text, and `${{ }}` inside `run:` is
+        # substituted before bash ever sees it.
+        env:
+          INPUT_IMAP_HOST: ${{ inputs.imap_host }}
+          INPUT_IMAP_PORT: ${{ inputs.imap_port }}
+          INPUT_SMTP_HOST: ${{ inputs.smtp_host }}
+          INPUT_SMTP_PORT: ${{ inputs.smtp_port }}
+          INPUT_USERNAME: ${{ inputs.username }}
+          INPUT_FROM: ${{ inputs.from_address }}
+          INPUT_PEER_IMAP_HOST: ${{ inputs.peer_imap_host }}
+          INPUT_PEER_SMTP_HOST: ${{ inputs.peer_smtp_host }}
+          INPUT_PEER_USERNAME: ${{ inputs.peer_username }}
+          INPUT_PEER_ADDRESS: ${{ inputs.peer_address }}
+          INPUT_PASSWORD: ${{ secrets.EMAIL_E2E_PASSWORD }}
+          INPUT_PEER_PASSWORD: ${{ secrets.EMAIL_E2E_PEER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          {
+            echo "EMAIL_E2E_IMAP_HOST=$INPUT_IMAP_HOST"
+            echo "EMAIL_E2E_IMAP_PORT=$INPUT_IMAP_PORT"
+            echo "EMAIL_E2E_SMTP_HOST=$INPUT_SMTP_HOST"
+            echo "EMAIL_E2E_SMTP_PORT=$INPUT_SMTP_PORT"
+            echo "EMAIL_E2E_USERNAME=$INPUT_USERNAME"
+            echo "EMAIL_E2E_FROM=$INPUT_FROM"
+            echo "EMAIL_E2E_PEER_IMAP_HOST=$INPUT_PEER_IMAP_HOST"
+            echo "EMAIL_E2E_PEER_SMTP_HOST=$INPUT_PEER_SMTP_HOST"
+            echo "EMAIL_E2E_PEER_USERNAME=$INPUT_PEER_USERNAME"
+            echo "EMAIL_E2E_PEER_ADDRESS=$INPUT_PEER_ADDRESS"
+          } >> "$GITHUB_ENV"
+          # Heredoc form: a secret that happens to contain a newline would
+          # otherwise set arbitrary further environment variables.
+          {
+            echo "EMAIL_E2E_PASSWORD<<LM_EOF_PASSWORD"
+            echo "$INPUT_PASSWORD"
+            echo "LM_EOF_PASSWORD"
+            echo "EMAIL_E2E_PEER_PASSWORD<<LM_EOF_PEER_PASSWORD"
+            echo "$INPUT_PEER_PASSWORD"
+            echo "LM_EOF_PEER_PASSWORD"
+          } >> "$GITHUB_ENV"
+
+      # Started before the Rust build, exactly as the Synapse acceptance does,
+      # so the image pull and the server's boot overlap with the compile
+      # instead of adding to the job's wall clock.
+      - name: Start a real IMAP/SMTP server on this runner
+        if: github.event_name != 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ca="$RUNNER_TEMP/mail-ca"
+          leaf="$RUNNER_TEMP/mail-leaf"
+          dms="$RUNNER_TEMP/dms"
+          mkdir -p "$ca" "$leaf" "$dms/config" "$dms/mail-data"
+
+          # A certificate authority this job owns, and one leaf for the name
+          # the daemon connects to. rustls ignores CN entirely, so the SAN and
+          # the serverAuth EKU below are load-bearing, and RootCertStore::add
+          # refuses an authority without a CA:TRUE basic constraint.
+          openssl req -x509 -newkey rsa:2048 -sha256 -days 2 -nodes \
+            -keyout "$ca/ca.key" -out "$ca/ca.pem" \
+            -subj "/CN=Little Monkey email E2E CA" \
+            -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign"
+          openssl req -newkey rsa:2048 -sha256 -nodes \
+            -keyout "$leaf/mail.key" -out "$leaf/mail.csr" -subj "/CN=$MAIL_HOST"
+          printf 'subjectAltName=DNS:%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' \
+            "$MAIL_HOST" > "$leaf/leaf.ext"
+          openssl x509 -req -in "$leaf/mail.csr" -CA "$ca/ca.pem" -CAkey "$ca/ca.key" \
+            -CAcreateserial -days 2 -sha256 -extfile "$leaf/leaf.ext" -out "$leaf/mail.pem"
+          rm -f "$leaf/mail.csr" "$leaf/leaf.ext"
+          # Only the leaf is mounted into the mail server; the authority's own
+          # private key never enters the container.
+          chmod 600 "$leaf/mail.key"
+          chmod 644 "$leaf/mail.pem"
+
+          echo "127.0.0.1 $MAIL_HOST" | sudo tee -a /etc/hosts >/dev/null
+
+          # Both mailboxes, written before the server starts: no exec into the
+          # container, and `openssl passwd -6` produces exactly the
+          # {SHA512-CRYPT} hash this file wants. Both are on one local domain
+          # so Postfix holds it itself and nothing looks up MX.
+          lm_pw="$(openssl rand -hex 16)"
+          peer_pw="$(openssl rand -hex 16)"
+          echo "::add-mask::$lm_pw"
+          echo "::add-mask::$peer_pw"
+          lm_hash="$(printf '%s' "$lm_pw" | openssl passwd -6 -stdin)"
+          peer_hash="$(printf '%s' "$peer_pw" | openssl passwd -6 -stdin)"
+          {
+            printf 'lm@lm.test|{SHA512-CRYPT}%s\n' "$lm_hash"
+            printf 'peer@lm.test|{SHA512-CRYPT}%s\n' "$peer_hash"
+          } > "$dms/config/postfix-accounts.cf"
+
+          docker run -d --name lm-mail --hostname "$MAIL_HOST" \
+            -p 127.0.0.1:993:993 -p 127.0.0.1:465:465 \
+            -v "$dms/config":/tmp/docker-mailserver \
+            -v "$dms/mail-data":/var/mail \
+            -v "$leaf":/tmp/dms/custom-certs:ro \
+            -e ACCOUNT_PROVISIONER=FILE \
+            -e SSL_TYPE=manual \
+            -e SSL_CERT_PATH=/tmp/dms/custom-certs/mail.pem \
+            -e SSL_KEY_PATH=/tmp/dms/custom-certs/mail.key \
+            -e ENABLE_CLAMAV=0 -e ENABLE_AMAVIS=0 -e ENABLE_SPAMASSASSIN=0 \
+            -e ENABLE_RSPAMD=0 -e ENABLE_OPENDKIM=0 -e ENABLE_OPENDMARC=0 \
+            -e ENABLE_POLICYD_SPF=0 -e ENABLE_POSTGREY=0 -e ENABLE_FAIL2BAN=0 \
+            -e ENABLE_UPDATE_CHECK=0 -e PERMIT_DOCKER=none -e LOG_LEVEL=info \
+            "$DMS_IMAGE"
+
+          # The peer's ports default correctly in the harness's `Mailbox::from_env`.
+          {
+            echo "EMAIL_E2E_IMAP_HOST=$MAIL_HOST"
+            echo "EMAIL_E2E_IMAP_PORT=993"
+            echo "EMAIL_E2E_SMTP_HOST=$MAIL_HOST"
+            echo "EMAIL_E2E_SMTP_PORT=465"
+            echo "EMAIL_E2E_USERNAME=lm@lm.test"
+            echo "EMAIL_E2E_FROM=lm@lm.test"
+            echo "EMAIL_E2E_PASSWORD=$lm_pw"
+            echo "EMAIL_E2E_PEER_IMAP_HOST=$MAIL_HOST"
+            echo "EMAIL_E2E_PEER_SMTP_HOST=$MAIL_HOST"
+            echo "EMAIL_E2E_PEER_USERNAME=peer@lm.test"
+            echo "EMAIL_E2E_PEER_ADDRESS=peer@lm.test"
+            echo "EMAIL_E2E_PEER_PASSWORD=$peer_pw"
+            echo "EMAIL_E2E_CA_FILE=$ca/ca.pem"
+          } >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
 
@@ -165,17 +289,91 @@ jobs:
           export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus"
           systemctl --user import-environment HOME PATH XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
 
+      # A protocol gate, not a port check, and it doubles as proof that the
+      # chain verifies against our own authority before any Rust runs. It also
+      # logs both mailboxes in: Dovecot greets and Postfix advertises AUTH on a
+      # server with no accounts at all, so a provisioning failure would
+      # otherwise sail through and surface three minutes later as "the daemon
+      # could not reach the mailbox over IMAP", naming no cause.
+      - name: Wait until the mail server actually speaks
+        if: github.event_name != 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ca="$EMAIL_E2E_CA_FILE"
+          test -s "$ca"
+
+          # Capture, then match. A pipeline into `grep -q` under `pipefail`
+          # reports 141 when grep closes the pipe on its first match, so a
+          # healthy server would read as a failure every time.
+          speak() {
+            local port="$1"
+            openssl s_client -connect "$MAIL_HOST:$port" -CAfile "$ca" \
+              -verify_return_error -verify_hostname "$MAIL_HOST" -quiet 2>/dev/null || true
+          }
+
+          ok=0
+          for _ in $(seq 1 120); do
+            if ! docker inspect -f '{{.State.Running}}' lm-mail 2>/dev/null | grep -q true; then
+              docker logs lm-mail >&2 || true
+              echo "the mail server container is not running" >&2
+              exit 1
+            fi
+            greeting="$(printf 'a LOGOUT\r\n' | speak 993)"
+            case "$greeting" in
+              *'* OK'*) ok=1; break ;;
+            esac
+            sleep 2
+          done
+          if [ "$ok" -ne 1 ]; then
+            docker logs lm-mail >&2 || true
+            echo "imaps never greeted over a chain to our own authority" >&2
+            exit 1
+          fi
+
+          login="$(printf 'a LOGIN %s %s\r\nb LOGOUT\r\n' \
+            "$EMAIL_E2E_USERNAME" "$EMAIL_E2E_PASSWORD" | speak 993)"
+          case "$login" in
+            *'a OK'*) ;;
+            *) docker logs lm-mail >&2 || true
+               echo "imaps refused the account mailbox login" >&2; exit 1 ;;
+          esac
+
+          # AUTH on submissions, asserted rather than assumed: the harness's own
+          # sender aborts outright unless EHLO advertises it, and `smtp_exchange`
+          # aborts unless PLAIN or LOGIN is among the mechanisms.
+          auth="$(printf '\0%s\0%s' "$EMAIL_E2E_PEER_USERNAME" "$EMAIL_E2E_PEER_PASSWORD" | base64 -w0)"
+          smtp="$(printf 'EHLO lm.test\r\nAUTH PLAIN %s\r\nQUIT\r\n' "$auth" | speak 465)"
+          case "$smtp" in
+            *235*) ;;
+            *) docker logs lm-mail >&2 || true
+               echo "submissions did not authenticate the peer mailbox" >&2; exit 1 ;;
+          esac
+
+      - name: Compile the black-box email harness
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --example email_installed_service_e2e
+
       - name: Run the literal installed-service email acceptance
         shell: bash
         run: |
           set -euo pipefail
+          if [ "${{ github.event_name }}" != 'workflow_dispatch' ] && [ -z "${EMAIL_E2E_CA_FILE:-}" ]; then
+            echo "the container run must name its own certificate authority" >&2
+            exit 1
+          fi
           cargo run --locked --manifest-path src-tauri/Cargo.toml \
             --example email_installed_service_e2e
 
-      - name: Dump systemd diagnostics on failure
+      - name: Dump systemd and mail server diagnostics on failure
         if: failure()
         shell: bash
         run: |
           systemctl --user --no-pager --full status || true
           systemctl --user --no-pager --full list-units 'little-monkey-daemon*' || true
           sudo systemctl --no-pager --full status "user@$(id -u).service" || true
+          docker logs lm-mail || true
+          docker exec lm-mail supervisorctl status || true
+
+      - name: Stop the mail server
+        if: always()
+        run: docker rm -f lm-mail || true

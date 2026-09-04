@@ -18,7 +18,7 @@
 //! loop can go. Outbound is a plain SMTP dialogue, written by hand over the
 //! same kind of socket.
 //!
-//! # TLS is structural, not configured
+//! # TLS is structural; only its trust anchors are configured
 //!
 //! IMAP and SMTP are not HTTP, so neither leg can go through
 //! `egress::hardened()` — the socket is a raw `tokio_rustls` client stream,
@@ -27,6 +27,14 @@
 //! no cleartext path: [`EmailAdapter::new`] refuses the cleartext ports (IMAP
 //! 143, SMTP 25) by number, so a downgrade is not a configuration mistake an
 //! operator can make — it is a state this adapter cannot be built in.
+//!
+//! The one thing an account may say about TLS is *which* authorities it
+//! trusts, and it may only ever add: `tls_ca_file` names a PEM file whose
+//! certificates join the public web anchors, for the self-hosted Dovecot or
+//! Postfix behind an operator's own CA. There is no setting that removes an
+//! anchor, skips verification or accepts a mismatched hostname, and a file
+//! that is missing, unparseable or holds no certificate refuses the account
+//! rather than quietly falling back to the public set — see [`trust_roots`].
 //!
 //! # Threading and trust
 //!
@@ -168,6 +176,12 @@ pub struct EmailAdapter {
     from_address: String,
     mailbox: String,
     secrets: EmailSecrets,
+    /// The extra trust anchors `tls_ca_file` named, if it named any: parsed
+    /// here at construction so a bad file refuses the account, but kept as a
+    /// store rather than a finished `ClientConfig` because
+    /// `ClientConfig::builder()` needs a process-wide crypto provider that
+    /// account setup has no business installing.
+    extra_roots: Option<rustls::RootCertStore>,
     limits: AttachmentLimits,
     refs: Arc<dyn ConversationReferences>,
     blobs: Arc<dyn BlobSource>,
@@ -292,12 +306,29 @@ impl EmailAdapter {
             from_address,
             mailbox: text(config, "mailbox").unwrap_or_else(|| "INBOX".to_string()),
             secrets: EmailSecrets::parse(&config.secret)?,
+            // The `?` is the point: a named-but-unusable CA file refuses the
+            // account here, where an operator sees it, rather than becoming a
+            // handshake failure against the public anchors later.
+            extra_roots: match text(config, "tls_ca_file") {
+                Some(path) => Some(trust_roots(&path)?),
+                None => None,
+            },
             limits: AttachmentLimits::for_account(&config.account.non_secret_config),
             refs: Arc::new(DaemonConversationReferences::new()),
             blobs: Arc::new(DaemonBlobs),
             parts: AsyncMutex::new(HashMap::new()),
             next_poll_at: AsyncMutex::new(None),
         })
+    }
+
+    /// This account's TLS client config. Built per connection when the
+    /// account named its own anchors — cloning a hundred-odd trust anchors
+    /// twice a minute is cheaper than a cache nobody has measured needing.
+    fn tls(&self) -> Arc<rustls::ClientConfig> {
+        match &self.extra_roots {
+            None => tls_config(),
+            Some(roots) => client_config(roots.clone()),
+        }
     }
 
     fn identity(&self) -> EmailIdentity<'_> {
@@ -319,7 +350,7 @@ impl EmailAdapter {
     }
 
     async fn open_session(&self) -> Result<ImapSession, String> {
-        let stream = tls_stream(&self.imap.host, self.imap.port).await?;
+        let stream = tls_stream(&self.tls(), &self.imap.host, self.imap.port).await?;
         let mut client = async_imap::Client::new(stream);
         client
             .read_response()
@@ -646,7 +677,7 @@ impl ChannelAdapter for EmailAdapter {
             Err(error) => return SendOutcome::PermanentFailure { error },
         };
 
-        let stream = match tls_stream(&self.smtp.host, self.smtp.port).await {
+        let stream = match tls_stream(&self.tls(), &self.smtp.host, self.smtp.port).await {
             Ok(stream) => stream,
             // Nothing left the machine: the socket never opened.
             Err(error) => {
@@ -687,9 +718,15 @@ impl ChannelAdapter for EmailAdapter {
 // TLS
 // ---------------------------------------------------------------------------
 
-/// The process-wide TLS client config, built once — the same shape `irc.rs`
-/// uses, for the same reason: `rustls::ClientConfig`'s root store is immutable
-/// after construction, so there is nothing per-connection to configure.
+/// The default TLS client config — the public web anchors and nothing else —
+/// built once and shared by every account that names no `tls_ca_file`.
+///
+/// `rustls::ClientConfig`'s root store is immutable after construction, so an
+/// account that wants more anchors cannot amend this one; it builds its own
+/// from [`trust_roots`] instead. `irc.rs` keeps this webpki-only
+/// shape alone because no IRC account has asked for extra anchors yet; when
+/// one does, the helper below belongs in `channel_adapter.rs` rather than
+/// copied a third time.
 fn tls_config() -> Arc<rustls::ClientConfig> {
     static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
     CONFIG
@@ -697,16 +734,72 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
             let roots = rustls::RootCertStore {
                 roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
             };
-            Arc::new(
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(roots)
-                    .with_no_client_auth(),
-            )
+            client_config(roots)
         })
         .clone()
 }
 
+/// Turn a root store into a client config, having first made sure rustls has
+/// a provider to build one with.
+///
+/// `ClientConfig::builder()` reads a process-wide default provider and
+/// *panics* when it cannot pick one on its own — and this build compiles
+/// rustls with both `ring` and `aws-lc-rs` present, so it never can. The
+/// remote listener installs `ring` for the same reason, but a daemon with a
+/// mail account and no remote host never reaches that code, so relying on it
+/// would make the first poll of an otherwise fine account abort the process.
+/// Installing here is idempotent and deliberately tolerant of losing the race:
+/// any installed provider beats the panic that follows from none.
+fn client_config(roots: rustls::RootCertStore) -> Arc<rustls::ClientConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
+/// The public web anchors *plus* every certificate in `path`.
+///
+/// Additive by construction: the webpki set is the starting point and the file
+/// can only append to it. There is no branch here that empties the store, and
+/// nothing in this file installs a `dangerous()` verifier, so hostname and
+/// chain verification stay rustls's own whatever the file contains.
+///
+/// Every way the file can disappoint is an error naming the path. The one
+/// worth spelling out is the last: `pem_file_iter` filters by PEM section
+/// kind, so a file holding only a private key — or no PEM armour at all —
+/// yields zero certificates rather than an error of its own, and would
+/// otherwise leave the caller silently on the public anchors.
+fn trust_roots(path: &str) -> Result<rustls::RootCertStore, String> {
+    use rustls::pki_types::pem::PemObject;
+
+    let mut roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let certificates = rustls::pki_types::CertificateDer::pem_file_iter(path)
+        .map_err(|error| format!("Email tls_ca_file '{path}' could not be read: {error}"))?;
+    let mut added = 0usize;
+    for certificate in certificates {
+        let certificate = certificate.map_err(|error| {
+            format!("Email tls_ca_file '{path}' is not a PEM certificate file: {error}")
+        })?;
+        roots.add(certificate).map_err(|error| {
+            format!(
+                "Email tls_ca_file '{path}' holds a certificate that is not a usable trust \
+                 anchor: {error}"
+            )
+        })?;
+        added += 1;
+    }
+    if added == 0 {
+        return Err(format!("Email tls_ca_file '{path}' contains no certificate"));
+    }
+    Ok(roots)
+}
+
 async fn tls_stream(
+    tls: &Arc<rustls::ClientConfig>,
     host: &str,
     port: u16,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
@@ -715,7 +808,7 @@ async fn tls_stream(
         .map_err(|error| format!("TCP connect to {host}:{port} failed: {error}"))?;
     let name = rustls::pki_types::ServerName::try_from(host.to_string())
         .map_err(|error| format!("invalid mail server name {host}: {error}"))?;
-    TlsConnector::from(tls_config())
+    TlsConnector::from(tls.clone())
         .connect(name, tcp)
         .await
         .map_err(|error| format!("TLS handshake with {host}:{port} failed: {error}"))
@@ -1671,6 +1764,100 @@ mod tests {
         settings["smtp_port"] = serde_json::json!(25);
         let error = build_error(settings);
         assert!(error.contains("implicit TLS"), "{error}");
+    }
+
+    // ---- trust anchors ----
+
+    /// A real self-signed CA, minted once with the same openssl invocation the
+    /// live workflow uses and given a twenty-year life: `RootCertStore::add`
+    /// does not check validity dates today, and a far-future certificate keeps
+    /// this test honest if it ever starts to.
+    const CA_PEM: &str = concat!(
+        "-----BEGIN CERTIFICATE-----\n",
+        "MIIDPjCCAiagAwIBAgIUZ59mHGpa93bS6VwxoaKK9jJRX5UwDQYJKoZIhvcNAQEL\n",
+        "BQAwJTEjMCEGA1UEAwwaTGl0dGxlIE1vbmtleSBlbWFpbCBFMkUgQ0EwHhcNMjYw\n",
+        "OTA0MDYwMjEwWhcNNDYwODMwMDYwMjEwWjAlMSMwIQYDVQQDDBpMaXR0bGUgTW9u\n",
+        "a2V5IGVtYWlsIEUyRSBDQTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB\n",
+        "ALsH6tp/ocKjZs71UIVRaHq4qtkRqYGl9/pO4Uju8TMjb7ZLxfNHGo0HtkYaYZVH\n",
+        "FSsznKXJuz3fyxHpeoU3oNo8n4LHU7g/0WNoTZLhZiAwydux6qsX0mK8ePByLutU\n",
+        "MaPT5iR49VeLforuFwlbrmEpx10GxHndtpYMsqfbV1QA1YPiDDsVpCf7oygPdK+4\n",
+        "pPVyWmbiT8nKVSMKauJXNTbBmWdM2Ovi+L11S89+amMFhXE3o1njTLeLG4Qf+rbl\n",
+        "64vN4AbUn5jRsE8q2Oq2WeAbSUTm9HWK+3djy2EiZvrmOjKsqMQkuvZYXamzN313\n",
+        "7HKazqUZPJ0IpHV2AAu2VFUCAwEAAaNmMGQwHQYDVR0OBBYEFDWXLNnVfXEv+cIL\n",
+        "GYrADXC8SIplMB8GA1UdIwQYMBaAFDWXLNnVfXEv+cILGYrADXC8SIplMBIGA1Ud\n",
+        "EwEB/wQIMAYBAf8CAQAwDgYDVR0PAQH/BAQDAgEGMA0GCSqGSIb3DQEBCwUAA4IB\n",
+        "AQBRCAquQmf6g8xhgsyzAJ85D904CSkQGxrm32zE7Xv4gjKDHkb/pcCR1TTOy276\n",
+        "mimL2R6iaJxlyXBy/tZUL2Y0ez/1TlA9Mlzlq5whhGGXJlASnN6Y4PtIISXyO6y+\n",
+        "k3visFsY26tcgT7w+RHHGoiskKDYGFfIDQj8QUbS1xtc0P8luPmsAqwfFhKE+uRa\n",
+        "gx6J3U0Q7bKaRedqG9yFinjqrpH38icFTB7QgIBbgkudHOBFVExJ7JL/KRHoHkAl\n",
+        "0gnsACGlGwinZH1Fhv3+iZt7/ynrBQZAiBq8pMwQS6UNNrimngJKdquNmpCpp9fm\n",
+        "TYs415Img/6X4UJnlW3Tg7oN\n",
+        "-----END CERTIFICATE-----\n",
+    );
+
+    /// Write `body` to a throwaway file and hand its path to `check`. No
+    /// `tempfile` dev-dependency exists here, so this is the same
+    /// `temp_dir()`-plus-a-unique-name shape the rest of the crate's tests use.
+    fn with_ca_file<T>(body: &str, check: impl FnOnce(&str) -> T) -> T {
+        let dir = std::env::temp_dir().join(format!(
+            "lm-email-ca-{}-{:?}",
+            now_ms(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create the fixture directory");
+        let path = dir.join("anchors.pem");
+        std::fs::write(&path, body).expect("write the fixture");
+        let outcome = check(path.to_str().expect("utf-8 fixture path"));
+        let _ = std::fs::remove_dir_all(&dir);
+        outcome
+    }
+
+    #[test]
+    fn a_named_ca_file_adds_to_the_public_anchors_rather_than_replacing_them() {
+        // The whole point of the key, and the only thing that proves "plus"
+        // rather than "instead of".
+        let roots = with_ca_file(CA_PEM, |path| trust_roots(path).expect("a real CA"));
+        assert_eq!(roots.roots.len(), webpki_roots::TLS_SERVER_ROOTS.len() + 1);
+
+        with_ca_file(CA_PEM, |path| {
+            let mut settings = valid();
+            settings["tls_ca_file"] = serde_json::json!(path);
+            build(settings).ok().expect("an account with its own CA");
+        });
+    }
+
+    #[test]
+    fn a_ca_file_that_cannot_be_used_refuses_the_account_and_names_the_path() {
+        // Missing, and through `EmailAdapter::new` rather than the helper: the
+        // refusal has to reach account construction, not merely exist.
+        let missing = std::env::temp_dir().join("lm-email-ca-does-not-exist.pem");
+        let mut settings = valid();
+        settings["tls_ca_file"] = serde_json::json!(missing.to_str().expect("utf-8"));
+        let error = build_error(settings);
+        assert!(error.contains("lm-email-ca-does-not-exist.pem"), "{error}");
+        assert!(error.contains("could not be read"), "{error}");
+
+        // No PEM armour at all, and a file holding only a private key. Both
+        // yield zero certificates rather than an error of their own, which is
+        // exactly the quiet fallback this guard exists to prevent.
+        for body in [
+            "this is not a certificate\n",
+            "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIA==\n-----END PRIVATE KEY-----\n",
+        ] {
+            let error = with_ca_file(body, |path| {
+                trust_roots(path).err().expect("expected a refusal")
+            });
+            assert!(error.contains("contains no certificate"), "{error}");
+            assert!(error.contains("anchors.pem"), "{error}");
+        }
+
+        // Armoured, decodable base64, and not a certificate underneath.
+        let error = with_ca_file(
+            "-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n",
+            |path| trust_roots(path).err().expect("expected a refusal"),
+        );
+        assert!(error.contains("not a usable trust anchor"), "{error}");
+        assert!(error.contains("anchors.pem"), "{error}");
     }
 
     #[test]
