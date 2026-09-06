@@ -36,14 +36,15 @@ Concretely, that means:
 
 ## Messaging channels
 
-Thirteen providers reach the same durable ingress: Telegram, Discord, Slack,
+Sixteen providers reach the same durable ingress: Telegram, Discord, Slack,
 WhatsApp, Microsoft Teams, Google Chat, LINE, Matrix, Mattermost, Signal,
-iMessage, IRC, and SMS. A sandboxed extension can speak for a fourteenth of its
-own.
+iMessage, IRC, SMS, email, Home Assistant, and a web chat page this app serves
+itself. A sandboxed extension can speak for a seventeenth of its own.
 
-They arrive four different ways — a long poll, a socket the app holds open, a
-webhook the provider posts to, or a local helper process — and *converge before
-anything is decided*. One gate answers who may talk to this account, one router
+They arrive five different ways — a long poll, a socket the app holds open, a
+webhook the provider posts to, a local helper process, or a page this app
+serves to a browser on its own listener — and *converge before anything is
+decided*. One gate answers who may talk to this account, one router
 decides what recipe runs, and one durable turn is what actually runs. No
 provider has its own copy of an access rule.
 
@@ -134,14 +135,20 @@ connection is opened, streamed under that limit rather than trusted to be the
 size it claimed, verified against the declared size afterwards, and stored in
 the shared content store. A file whose bytes do not match its description is
 refused rather than stored under the wrong name. Nothing is auto-extracted and
-nothing is executed. Limits are per account and clamped: you can lower them
+nothing is executed. Email is the exception to the first half of that: an
+inbound file is a part of the message the poll already read, no second
+connection is opened for it, it is held only until the next poll, and the event
+says so if the bytes could not be stored (see
+[limitations](limitations.md)). Limits are per account and clamped: you can lower them
 freely and can only raise them so far.
 
 ### Loops
 
-An account never answers itself, and for the twelve built-in providers that is
-the host's own conclusion: the code reading the provider's payload is this app's,
-holding the account's credential.
+An account never answers itself, and for the sixteen built-in providers that is
+the host's own conclusion: the code reading the provider's payload is this app's.
+(For most of them that code also holds the account's credential; a served page
+and the phone-bridge kinds hold none, and the conclusion is the host's either
+way.)
 
 A sandboxed extension speaking for a provider is the case that cannot work that
 way — the thing deciding is the thing being checked. So for those accounts the
@@ -183,6 +190,13 @@ loopback. There are two ways to bridge that, and both of them are yours:
 There is no relay in either case. No hostname, account, credential or endpoint
 here belongs to anybody but you, and a managed tunnel is your tunnel — this app
 supplies the supervision, not the address.
+
+The three newest providers add nothing to this obligation, and that is the
+point of listing them apart. Email polls a mailbox outward; Home Assistant
+opens a WebSocket outward; the web chat page is served by this machine's own
+already-configured remote listener rather than by a provider calling in. None
+of them has a callback URL to paste anywhere, and none of them is reachable
+through the webhook listener above.
 
 A named tunnel specifically: a quick tunnel mints a fresh random hostname on
 every start, which cannot be pasted into a provider console and would break
@@ -350,6 +364,99 @@ therefore **not** claimed as verified here.
   forgetting the sender clears it; deleting a conversation erases its events,
   replies, turns and jobs and nothing of a neighbouring conversation's, is
   refused while a reply is mid-send, and forgetting one drops only its row.
+- Email, Home Assistant and the served web chat page are registered providers
+  like any other: each one ingests, routes, queues and drains through the same
+  production ingress and outbox as the thirteen before them, driven by the
+  contract test that enumerates every kind. Beyond that, each has its own
+  network-free suite over recorded payloads, and each also has a live
+  installed-service acceptance that runs on every pull request touching its
+  files — email and Home Assistant against a real server the job starts in a
+  container on the runner, web chat against the daemon's own listener, and
+  none of the three against anybody's account. What such a run proves is the
+  protocol against that server software: Postfix and Dovecot really speak IMAP
+  and SMTP to us, a real Home Assistant really authenticates, subscribes and
+  notifies. It is not
+  evidence that Gmail, Microsoft 365 or a particular cloud behaves the same
+  way — that is in the second list below, and stays there. The email and Home
+  Assistant legs are new: they describe what those workflows now do on every
+  pull request, and the first green run of each — not this paragraph — is what
+  makes them evidence.
+  - **Email** — normalization of recorded RFC 5322 messages, including the
+    reply chain the next message must carry (`References` root, then
+    `In-Reply-To`, then the message's own `Message-ID`), RFC 2047 encoded
+    words, a deterministic event id that is stable across two reads and moves
+    with the UID, and `is_self` decided by the account's own configured address
+    rather than by anything the message claims. The refusals: an account whose
+    IMAP port is 143 or whose SMTP port is 25 is refused at construction rather
+    than downgraded; an account whose `tls_ca_file` names a file that is
+    missing, unreadable, unparseable or holds no certificate is refused at
+    construction too, with the path named, rather than quietly continuing on
+    the public anchors alone; autoresponders, bounces and mailing-list posts
+    (`Auto-Submitted`, `Precedence: bulk|list|junk`, `List-Id`,
+    `List-Unsubscribe`, an empty `Return-Path`) are never answered; a
+    conversation id cannot inject a header or a second recipient. Outbound is
+    built by a pure function under test — `Re:` exactly once, the reference
+    chain bounded, a `Message-ID` minted deterministically from the idempotency
+    key so a retry re-uses it — and the SMTP exchange itself runs against an
+    in-process scripted relay: `AUTH PLAIN`/`LOGIN` only when that server's own
+    EHLO advertised it, dot-stuffing, the 4xx / 5xx / failed-at-the-dot outcome
+    mapping, and a hostile relay that echoes the password back cannot get it
+    into a rendered error. On top of that,
+    `examples/email_installed_service_e2e.rs` runs for real on every pull
+    request that touches these files, against Postfix and Dovecot in a
+    container the job starts and publishes on `127.0.0.1:993` and
+    `127.0.0.1:465`: both legs implicit TLS under a certificate authority the
+    job mints, which the account trusts by naming it in `tls_ca_file` *on top
+    of* the public web anchors. The installed `systemd --user` service logs in
+    over real IMAP, is restarted and logs in again, a marker sent from a
+    second mailbox over real implicit-TLS SMTP becomes one durable turn and a
+    real agent run, and the reply arrives back in that second mailbox threaded
+    by `In-Reply-To`. What that does not settle is a provider: app passwords,
+    a cloud's own rate limits and connection caps, a chain to a public root,
+    and OAuth-only accounts still need the `workflow_dispatch` run against a
+    mailbox somebody owns.
+  - **Home Assistant** — normalization of recorded WebSocket event frames, and
+    the handshake that authenticates before it subscribes: the account reaches
+    *connected* only after a successful subscribe result, an event that arrives
+    before then produces nothing, and a rejected token or a refused
+    subscription stops the socket rather than being retried. The notify
+    outcomes are mapped against a loopback fixture (2xx, 429 with its
+    `Retry-After`, 401, 404, 5xx, and a connection that never left this
+    machine); an attachment is refused before any request is made; a `base_url`
+    that is not a bare `https` origin, or a `notify_service` name that could
+    select a different endpoint, is refused before a token is ever attached to
+    a request; and the token appears in no rendered error. On top of that,
+    `examples/home_assistant_installed_service_e2e.rs` runs for real on every
+    pull request that touches these files, against an official Home Assistant
+    container the job starts on `127.0.0.1:8123` — no secret and no operator
+    input, so it runs on fork pull requests too. The job creates the owner and
+    mints the access token through Home Assistant's own onboarding and token
+    APIs; the installed service authenticates and subscribes over
+    `/api/websocket`, is restarted and must subscribe again, an event fired
+    over that instance's own `POST /api/events/<type>` becomes one durable
+    turn and a real agent run, and the reply goes out through
+    `POST /api/services/notify/<service>` and is read back from that
+    instance's own `GET /api/states`. What that does not settle is somebody's
+    house: their automation firing the event, their notify service reaching
+    the phone or speaker they meant, and a non-loopback instance behind TLS
+    this adapter will accept.
+  - **Web chat** — the whole loopback leg, run for real on every pull request
+    that touches these files by `examples/webchat_installed_service_e2e.rs`
+    (the workflow is paths-filtered): an HTTP client that is not
+    Little Monkey reaches the installed daemon's own listener, is answered with
+    a pairing code, is approved, and its next message becomes a durable turn and
+    a real agent reply on the page's transcript. The visitor identifier is
+    minted by the daemon and self-verifying — an invented one is refused, and
+    one minted for another account does not verify here — the request body may
+    carry nothing but `{visitor_id, text}`, and the sender the adapter reports
+    is computed from its own account id, so no client-controlled header reaches
+    the policy. The page has its own request budget and body cap, its response
+    header CSP is asserted equal to the page's own, and the kind is refused by
+    the public channel-webhook builder outright, so the page is reachable only
+    through the daemon's own listener.
+  A provider that holds no credential of ours — the helper providers, SMS,
+  IRC without SASL, and the served page — is no longer reported by Security
+  Doctor as an enabled account missing one.
 - Webhook signature verification for WhatsApp, Teams, Google Chat and LINE, and
   carrier callback verification for Twilio, Plivo and Telnyx, over exact bytes,
   including forged and replayed bodies.
@@ -395,8 +502,12 @@ therefore **not** claimed as verified here.
 
 ### Needs your own account, hardware or exposure to verify
 
-These have production code and protocol-level tests; what has not happened is a
-run against the real service. Two opt-in harnesses exist, both reading
+These have production code and protocol-level tests — and, for email, Home
+Assistant and the served page, a live installed-service run against server
+software the CI job starts. What has not happened is a run against *your*
+service: the account, credential, hardware, number, operating-system
+permission or public URL that only you can supply, and which no container on a
+runner can stand in for. Two opt-in harnesses exist, both reading
 credentials from the environment, both passing silently when they are absent,
 and neither bundling or defaulting one:
 
@@ -416,6 +527,25 @@ from somebody else, and not the agent.
 
 - Any provider against a real account: that the live service behaves as the
   adapter expects, and that your token has the scopes it needs.
+- A real mail *provider*: that your app password has the access it needs, that
+  the provider's own rate limits and concurrent-connection caps leave the
+  poll alone, that its certificate chains to a public root, and — for an
+  account that offers OAuth only — that there is any way in at all. That IMAP
+  and SMTP themselves behave as the adapter expects on their implicit-TLS
+  ports is now proven automatically against real Postfix and Dovecot; what a
+  particular cloud does with the same protocol is not.
+- Your own Home Assistant instance: that *your* automation fires the event type
+  this account subscribes to, that *your* notify service delivers where you
+  expect, and that a non-loopback instance is behind TLS this adapter accepts.
+  That a token authenticates over the WebSocket API, that the subscription
+  carries an event through to a turn, and that the notify round trip works are
+  proven automatically against a real Home Assistant the CI job starts.
+- A browser on another machine reaching the served chat page: the account's
+  `public` flag turned on, the daemon's listener bound to a real interface, a
+  certificate that browser trusts, and what your network actually allows to
+  reach it. Without `public` a non-loopback peer is answered `404`, whatever
+  the listener is bound to. The loopback leg needs no account of yours and is
+  exercised by its own harness; the non-loopback leg is yours to expose.
 - A publicly reachable callback URL, and the provider console accepting it.
 - A real Cloudflare tunnel account: that `cloudflared` connects with your token,
   that the hostname routes to this machine, and that a provider's delivery

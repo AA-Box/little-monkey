@@ -1,0 +1,331 @@
+name: Home Assistant installed-service E2E
+
+on:
+  pull_request:
+    paths:
+      - "src-tauri/examples/home_assistant_installed_service_e2e.rs"
+      - "src-tauri/src/bin/monkey-cli/daemon/adapters/home_assistant.rs"
+      - "src-tauri/src/bin/monkey-cli/daemon/**"
+      - "src-tauri/src/bin/monkey-cli/channels_cli.rs"
+      - ".github/workflows/home-assistant-installed-service-e2e.yml"
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: home-assistant-installed-service-e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile-harness:
+    name: compile black-box Home Assistant acceptance
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            build-essential dbus dbus-user-session dbus-x11 libdbus-1-dev
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri
+          key: home-assistant-installed-service-compile
+
+      - name: Stage CLI sidecar placeholder
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+
+      - name: Compile the external acceptance harness
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --example home_assistant_installed_service_e2e
+
+  live-installed-service:
+    name: official Home Assistant container -> installed daemon -> agent -> the same instance
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      LITTLE_MONKEY_REQUIRE_HOME_ASSISTANT_INSTALLED_SERVICE_E2E: "1"
+      # Pinned to an exact release, never `stable`: a Home Assistant release
+      # must not be able to break this workflow on a Tuesday. ghcr rather than
+      # Docker Hub only to avoid anonymous pull limits; the image is the same.
+      HA_IMAGE: ghcr.io/home-assistant/home-assistant:2026.8.3
+      HA_CONTAINER: little-monkey-home-assistant-e2e
+      # HA_CONFIG_DIR is exported to $GITHUB_ENV by the first step rather than
+      # written here: the `runner` context is not one of the contexts a
+      # job-level `env:` may read, and naming it makes the whole workflow
+      # invalid, which shows up as a run that never starts a job.
+      # The literal 127.0.0.1, never `localhost`: the container's port is
+      # published on loopback IPv4 only, and `localhost` can resolve to ::1
+      # first, which looks exactly like a dead container.
+      HA_E2E_BASE_URL: http://127.0.0.1:8123
+      HA_E2E_EVENT_TYPE: little_monkey_message
+      HA_E2E_NOTIFY_SERVICE: little_monkey_e2e
+      # HA_E2E_TOKEN is not here. The job mints it from the instance it starts,
+      # so there is no repository secret and this runs on fork pull requests.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start the official Home Assistant container
+        shell: bash
+        run: |
+          set -euo pipefail
+          HA_CONFIG_DIR="$RUNNER_TEMP/home-assistant-e2e-config"
+          echo "HA_CONFIG_DIR=$HA_CONFIG_DIR" >> "$GITHUB_ENV"
+          mkdir -p "$HA_CONFIG_DIR"
+          # No `default_config:`. Home Assistant's bootstrap sets up its own
+          # default integrations whatever the YAML says, and `frontend` pulls
+          # in api, auth, http, onboarding and websocket_api -- every endpoint
+          # this acceptance touches. Omitting it costs nothing and drops
+          # bluetooth, ssdp, zeroconf, usb, cloud, go2rtc and the recorder,
+          # which is most of what makes a containerised instance slow to boot.
+          #
+          # The notify service is `command_line`, not
+          # `notify.persistent_notification`. Since 2023.6 a persistent
+          # notification is a WebSocket-only object: the component registers
+          # only WebSocket commands and never writes a state, so it can never
+          # appear in `GET /api/states`, which is exactly where the harness
+          # reads the reply back. Appending to a file that a `command_line`
+          # sensor republishes as its state is what makes the round trip
+          # visible over REST.
+          #
+          # The trailing `echo` is load-bearing: the notify platform writes the
+          # message with no trailing newline, so without it the daemon's
+          # first-contact notice and the agent's reply would run together on
+          # one line and could breach Home Assistant's 255-character state
+          # ceiling. One append per notification, and the reply is a single
+          # line, so `tail -n 1` lands on the reply once it arrives.
+          #
+          # notifications.log is also the first failure artefact: it shows
+          # everything Home Assistant was actually asked to notify.
+          cat > "$HA_CONFIG_DIR/configuration.yaml" <<'YAML'
+          command_line:
+            - notify:
+                name: little_monkey_e2e
+                command: "cat >> /config/notifications.log; echo >> /config/notifications.log"
+            - sensor:
+                name: little_monkey_e2e_reply
+                command: "tail -n 1 /config/notifications.log"
+                scan_interval: 5
+          YAML
+          # Pre-create the file so the sensor has a state from its first scan
+          # instead of logging an error until something is notified.
+          printf 'no notification yet\n' > "$HA_CONFIG_DIR/notifications.log"
+          docker run -d --name "$HA_CONTAINER" -e TZ=UTC \
+            -p 127.0.0.1:8123:8123 -v "$HA_CONFIG_DIR:/config" "$HA_IMAGE"
+
+      - name: Install native service and keyring dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            build-essential dbus dbus-user-session dbus-x11 gnome-keyring \
+            libdbus-1-dev jq
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri
+          key: home-assistant-installed-service-live
+
+      # Before the build, so a registry failure or an image that will not run
+      # fails in about two minutes rather than after a ten-minute compile.
+      # `/api/onboarding` needs no credential -- its view is the unauthenticated
+      # onboarding status -- so a 200 means the HTTP site is up and the
+      # onboarding integration is loaded.
+      - name: Wait for Home Assistant to answer
+        shell: bash
+        run: |
+          set -euo pipefail
+          ready=0
+          for _ in $(seq 1 300); do
+            if curl --fail --silent "$HA_E2E_BASE_URL/api/onboarding" >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            docker logs "$HA_CONTAINER" || true
+            echo "Home Assistant never answered /api/onboarding within 300s" >&2
+            exit 1
+          fi
+
+      - name: Build and pin the production CLI and the harness
+        run: |
+          cargo clean --manifest-path src-tauri/Cargo.toml -p little-monkey
+          node scripts/ensure-cli-sidecar-placeholder.mjs
+          cargo build --locked --manifest-path src-tauri/Cargo.toml --bin monkey-cli
+          node scripts/ensure-cli-sidecar-placeholder.mjs
+          # The harness too, so nothing is left to compile inside the lifetime
+          # of the access token minted in the next step.
+          cargo build --locked --manifest-path src-tauri/Cargo.toml \
+            --example home_assistant_installed_service_e2e
+
+      # After the build on purpose. An access token minted by `/auth/token`
+      # lives 30 minutes; the harness's own worst case after this point is
+      # install 120s + restart 120s + reply 240s, about nine minutes, so
+      # minting it here removes the long-lived-token WebSocket dance entirely.
+      - name: Create the owner and mint an access token
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A loopback URL is a valid IndieAuth client id and is only parsed,
+          # never fetched, so no second server is needed for the exchange.
+          client_id="$HA_E2E_BASE_URL/"
+          password="$(openssl rand -hex 24)"
+          echo "::add-mask::$password"
+
+          auth_code="$(curl --fail --silent --show-error \
+            -H 'Content-Type: application/json' \
+            -d "{\"client_id\":\"$client_id\",\"name\":\"Little Monkey E2E\",\"username\":\"little-monkey-e2e\",\"password\":\"$password\",\"language\":\"en\"}" \
+            "$HA_E2E_BASE_URL/api/onboarding/users" | jq -er .auth_code)"
+          echo "::add-mask::$auth_code"
+
+          # Exchanged in the same step it was minted: auth codes are short-lived.
+          token="$(curl --fail --silent --show-error \
+            --data-urlencode grant_type=authorization_code \
+            --data-urlencode "code=$auth_code" \
+            --data-urlencode "client_id=$client_id" \
+            "$HA_E2E_BASE_URL/auth/token" | jq -er .access_token)"
+          test -n "$token"
+          # Mask the disposable credential anyway: public CI logs should never
+          # teach a habit of printing bearer tokens.
+          echo "::add-mask::$token"
+          echo "HA_E2E_TOKEN=$token" >> "$GITHUB_ENV"
+
+          # The remaining onboarding steps (core_config, analytics, integration)
+          # are deliberately not called: nothing here needs them, and each is
+          # one more version-coupled request that can start failing.
+
+      - name: Prove the notify service and the state read-back
+        shell: bash
+        run: |
+          set -euo pipefail
+          auth=(-H "Authorization: Bearer $HA_E2E_TOKEN")
+
+          message="$(curl --fail --silent --show-error "${auth[@]}" "$HA_E2E_BASE_URL/api/" | jq -er .message)"
+          test "$message" = "API running."
+
+          # A poll, not a single check. `/api/onboarding` answers as soon as
+          # http and onboarding are up, while `command_line` is a YAML
+          # integration set up in a later bootstrap stage, so the service can
+          # legitimately not exist yet.
+          found=0
+          for _ in $(seq 1 120); do
+            if curl --fail --silent "${auth[@]}" "$HA_E2E_BASE_URL/api/services" \
+              | jq -e --arg s "$HA_E2E_NOTIFY_SERVICE" \
+                'map(select(.domain == "notify")) | .[0].services | has($s)' >/dev/null 2>&1; then
+              found=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$found" -ne 1 ]; then
+            docker logs "$HA_CONTAINER" || true
+            echo "notify.$HA_E2E_NOTIFY_SERVICE never appeared in GET /api/services" >&2
+            exit 1
+          fi
+
+          # The gate that earns its keep. The command_line notify platform only
+          # *logs* a non-zero exit and the service call still answers 200, so a
+          # broken shell command would otherwise surface as an unexplained
+          # timeout deep inside the harness. The probe text deliberately avoids
+          # the harness's own reply prefix, so it can never satisfy the
+          # harness's wait by accident.
+          probe="lm-ha-e2e-preflight-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          curl --fail --silent --show-error "${auth[@]}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"message\":\"$probe\"}" \
+            "$HA_E2E_BASE_URL/api/services/notify/$HA_E2E_NOTIFY_SERVICE" >/dev/null
+
+          seen=0
+          for _ in $(seq 1 60); do
+            # No --fail: the entity is a 404 until its first scan publishes it.
+            state="$(curl --silent "${auth[@]}" \
+              "$HA_E2E_BASE_URL/api/states/sensor.little_monkey_e2e_reply" \
+              | jq -r '.state // empty')"
+            if [ "$state" = "$probe" ]; then
+              seen=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$seen" -ne 1 ]; then
+            docker logs "$HA_CONTAINER" || true
+            cat "$HA_CONFIG_DIR/notifications.log" || true
+            echo "a notification sent to notify.$HA_E2E_NOTIFY_SERVICE never reached sensor.little_monkey_e2e_reply" >&2
+            exit 1
+          fi
+
+      # Use PID 1's real user manager, exactly like the native secure-store
+      # acceptance. A nested systemd instance cannot own a cgroup inside the
+      # hosted runner's service. The Secret Service is not optional either:
+      # the harness writes the token with `channels set-token`, which goes
+      # through the real keyring crate to org.freedesktop.secrets.
+      - name: Start real systemd user manager and Secret Service
+        shell: bash
+        run: |
+          set -euo pipefail
+          uid="$(id -u)"
+          runtime="/run/user/$uid"
+
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@${uid}.service"
+          ready=0
+          for _ in $(seq 1 60); do
+            if [ -S "$runtime/bus" ]; then
+              ready=1
+              break
+            fi
+            sleep 0.5
+          done
+          if [ "$ready" -ne 1 ]; then
+            sudo systemctl --no-pager --full status "user@${uid}.service" || true
+            exit 1
+          fi
+
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime/bus" >> "$GITHUB_ENV"
+          export XDG_RUNTIME_DIR="$runtime"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus"
+
+          eval "$(printf '\n' | gnome-keyring-daemon --unlock --replace --components=secrets)"
+          found=0
+          for _ in $(seq 1 30); do
+            if busctl --user --no-pager list --acquired | grep -q 'org.freedesktop.secrets'; then
+              found=1
+              break
+            fi
+            sleep 0.25
+          done
+          test "$found" -eq 1
+          systemctl --user import-environment HOME PATH XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+
+      - name: Run the literal installed-service Home Assistant acceptance
+        run: >-
+          cargo run --locked --manifest-path src-tauri/Cargo.toml
+          --example home_assistant_installed_service_e2e
+
+      # The four things a failure here starts with: did the notify call reach
+      # Home Assistant, and did Home Assistant surface it.
+      - name: Dump diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          systemctl --user --no-pager --full status || true
+          systemctl --user --no-pager --full list-units 'little-monkey-daemon*' || true
+          sudo systemctl --no-pager --full status "user@$(id -u).service" || true
+          docker logs "$HA_CONTAINER" || true
+          cat "$HA_CONFIG_DIR/notifications.log" || true
+          tail -n 200 "$HA_CONFIG_DIR/home-assistant.log" || true
+          curl --silent -H "Authorization: Bearer ${HA_E2E_TOKEN:-}" \
+            "$HA_E2E_BASE_URL/api/states/sensor.little_monkey_e2e_reply" || true
