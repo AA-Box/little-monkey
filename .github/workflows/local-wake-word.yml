@@ -18,6 +18,8 @@ on:
       - 'src/lib/talkAudio*'
       - 'src/lib/talkClient.ts'
       - 'src/lib/talkEngine*'
+      - 'src/lib/wakeWordWalkthrough.e2e.test.ts'
+      - 'src-tauri/src/bin/wake-word-e2e.rs'
       - '.github/workflows/local-wake-word.yml'
   push:
     branches: [main, develop]
@@ -32,6 +34,8 @@ on:
       - 'src-tauri/src/local_whisper.rs'
       - 'src-tauri/src/m7_companion.rs'
       - 'src-tauri/tauri.conf.json'
+      - 'src-tauri/src/bin/wake-word-e2e.rs'
+      - 'src/lib/wakeWordWalkthrough.e2e.test.ts'
       - '.github/workflows/local-wake-word.yml'
 
 permissions:
@@ -129,6 +133,10 @@ jobs:
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib local_wake_word::tests::real_model_detects_positive_audio_and_rejects_negative_audio -- --nocapture
       - name: Real KWS hands only post-keyword PCM to real local Whisper
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib local_wake_word::tests::real_wake_event_feeds_only_command_pcm_to_local_whisper -- --nocapture
+      - name: A session armed through silence still places the keyword inside the ring
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib local_wake_word::tests::a_long_armed_session_never_places_the_keyword_before_the_audio_that_revealed_it -- --nocapture
+      - name: Fifteen-step acceptance walkthrough across both runtimes
+        run: pnpm test:wake-walkthrough
 
   bundle:
     name: Linux installer carries verified KWS assets

@@ -816,7 +816,9 @@ fn validate_url(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_config(config: &CompanionConfig) -> Result<(), String> {
+/// Exposed so the wake-word acceptance harness in `bin/wake-word-e2e.rs` runs
+/// the operator's real save-time validator rather than a copy of its rules.
+pub fn validate_config(config: &CompanionConfig) -> Result<(), String> {
     if config.schema_version != CONFIG_SCHEMA_VERSION
         || config.overlay_shortcut.is_empty()
         || config.overlay_shortcut.len() > 128
@@ -1308,6 +1310,17 @@ pub fn m7_wake_word_status(
 ) -> Result<crate::local_wake_word::WakeWordRuntimeStatus, String> {
     ensure_main_window(&window)?;
     state.wake_word.status()
+}
+
+/// The operator says a wake event was not them. Nothing but the count is kept,
+/// and no grant is required: reporting a false wake is not a capture.
+#[tauri::command]
+pub fn m7_wake_word_report_false_trigger(
+    window: tauri::Window,
+    state: tauri::State<'_, M7CompanionState>,
+) -> Result<crate::local_wake_word::WakeWordRuntimeStatus, String> {
+    ensure_main_window(&window)?;
+    state.wake_word.report_false_trigger()
 }
 
 #[tauri::command]

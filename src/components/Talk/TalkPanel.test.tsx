@@ -92,6 +92,7 @@ function mock(status: Partial<TalkStatus> = {}, config: CompanionConfig = CONFIG
             averageInferenceMs: null,
             averageDetectionLatencyMs: null,
             detections: 0,
+            falseTriggerReports: 0,
             droppedFrames: 0,
             lastError: null,
           },

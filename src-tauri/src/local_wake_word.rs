@@ -26,6 +26,13 @@ pub const DEFAULT_SENSITIVITY: f32 = 0.5;
 const BUNDLED_DIRECTORY: &str = "local-wake-word";
 const MAX_FRAME_SAMPLES: usize = SAMPLE_RATE as usize / 5; // 200 ms
 const MAX_PHRASE_BYTES: usize = 128;
+/// The tail sherpa's last token timestamp does not include.
+const KEYWORD_TAIL_SECONDS: f32 = 0.08;
+/// How far behind the frame that surfaced a detection the keyword may
+/// plausibly have ended. The model decodes in 16-frame chunks — about 640 ms of
+/// audio — so a second is generous for a real decoder lag and far too tight for
+/// a segment origin that has silently drifted by the length of a conversation.
+const MAX_TRUSTED_DETECTION_LAG_SAMPLES: u64 = SAMPLE_RATE as u64;
 
 #[derive(Clone, Copy)]
 struct ModelFile {
@@ -123,6 +130,9 @@ pub struct WakeWordRuntimeStatus {
     pub average_detection_latency_ms: Option<f64>,
     pub detections: u64,
     pub dropped_frames: u64,
+    /// Operator-reported wake events that were not the operator. Bounded
+    /// counter only: nothing about the audio that triggered them is kept.
+    pub false_trigger_reports: u64,
     pub last_error: Option<String>,
 }
 
@@ -209,6 +219,16 @@ struct WakeWordSession {
     id: String,
     stream: OnlineStream,
     accepted_samples: u64,
+    /// Where the decoding segment sherpa is currently in began, in samples
+    /// accepted by this session.
+    ///
+    /// Known exactly at stream creation and after each reset this module
+    /// performs — and only until sherpa starts a new segment on trailing
+    /// silence, which the 1.13.3 keyword API neither reports nor exposes
+    /// (`KeywordResult::start_time` is left at zero and there is no processed-
+    /// frame counter). So it is a hypothesis to be checked against the frame
+    /// the detection actually surfaced on, never a fact to slice audio by.
+    segment_origin: u64,
 }
 
 #[derive(Default)]
@@ -219,7 +239,22 @@ struct RuntimeMetrics {
     total_detection_micros: u128,
     detections: u64,
     dropped_frames: u64,
+    false_trigger_reports: u64,
     last_error: Option<String>,
+}
+
+/// The process's own CPU across an armed session.
+///
+/// Sampled when the session arms and again only when somebody asks for status,
+/// so measuring idle cost never becomes a background poll that would change the
+/// number it reports.
+struct CpuWindow {
+    started: Instant,
+    cpu_time_ms: u64,
+}
+
+fn own_usage() -> crate::process_usage::ProcessUsageSample {
+    crate::process_usage::sample(i64::from(std::process::id()))
 }
 
 #[derive(Default)]
@@ -227,6 +262,12 @@ struct ManagerInner {
     engine: Option<Arc<WakeWordEngine>>,
     session: Option<WakeWordSession>,
     metrics: RuntimeMetrics,
+    /// Resident growth measured across the one model load, not an estimate
+    /// from the file size. `None` when the platform does not report resident
+    /// bytes, or when the process peak was already above the loaded model and
+    /// the model's share therefore cannot be separated from it.
+    model_memory_bytes: Option<u64>,
+    armed_cpu: Option<CpuWindow>,
 }
 
 #[derive(Default)]
@@ -252,8 +293,15 @@ impl WakeWordManager {
             return Err("A wake-word session is already accepting audio".to_string());
         }
         if inner.engine.is_none() {
+            let before = own_usage().peak_rss_bytes;
             match WakeWordEngine::load(&paths) {
-                Ok(engine) => inner.engine = Some(Arc::new(engine)),
+                Ok(engine) => {
+                    inner.engine = Some(Arc::new(engine));
+                    inner.model_memory_bytes = match (before, own_usage().peak_rss_bytes) {
+                        (Some(before), Some(after)) if after > before => Some(after - before),
+                        _ => None,
+                    };
+                }
                 Err(error) => {
                     inner.metrics.last_error = Some(error.clone());
                     return Err(error);
@@ -267,6 +315,11 @@ impl WakeWordManager {
             id: id.clone(),
             stream: engine.spotter.create_stream_with_keywords(&keywords),
             accepted_samples: 0,
+            segment_origin: 0,
+        });
+        inner.armed_cpu = own_usage().cpu_time_ms.map(|cpu_time_ms| CpuWindow {
+            started: Instant::now(),
+            cpu_time_ms,
         });
         inner.metrics.last_error = None;
         Ok(WakeWordSessionStarted {
@@ -309,6 +362,7 @@ impl WakeWordManager {
                 .accepted_samples
                 .saturating_add(samples.len() as u64);
             let mut detection_end = None;
+            let mut trusted_lag_samples = None;
             while engine.spotter.is_ready(&session.stream) {
                 engine.spotter.decode(&session.stream);
                 if let Some(result) = engine.spotter.get_result(&session.stream) {
@@ -319,17 +373,47 @@ impl WakeWordManager {
                             .copied()
                             .filter(|value| value.is_finite() && *value >= 0.0)
                             .fold(0.0_f32, f32::max);
-                        let estimated_end = ((timestamp_end + 0.08) * SAMPLE_RATE as f32) as u64;
-                        detection_end = Some(estimated_end.min(session.accepted_samples));
+                        let relative_end =
+                            ((timestamp_end + KEYWORD_TAIL_SECONDS) * SAMPLE_RATE as f32) as u64;
+                        let hypothesis = session.segment_origin.saturating_add(relative_end);
+                        // sherpa 1.13.3's keyword API reports `timestamps`
+                        // relative to the segment its decoder is in, leaves
+                        // `start_time` at zero, exposes no processed-frame
+                        // counter, and starts a new segment on trailing silence
+                        // without saying so. In a session armed for a
+                        // conversation the origin above has therefore usually
+                        // drifted, and the keyword looks like it ended twenty
+                        // seconds ago.
+                        //
+                        // The keyword cannot have ended after the audio that
+                        // revealed it, and a real decoder lag is bounded by the
+                        // model's chunk. A hypothesis failing either test is a
+                        // drifted origin, not a late keyword — and slicing the
+                        // ring by it hands Whisper the wake phrase and the
+                        // seconds before it, which is the one thing this module
+                        // exists to prevent. Fall back to the last position
+                        // still provable: the end of the frame in hand.
+                        let lag = session.accepted_samples.checked_sub(hypothesis);
+                        detection_end = Some(match lag {
+                            Some(lag) if lag <= MAX_TRUSTED_DETECTION_LAG_SAMPLES => {
+                                trusted_lag_samples = Some(lag);
+                                hypothesis
+                            }
+                            _ => session.accepted_samples,
+                        });
+                        // The next segment starts here, and is knowable again
+                        // until sherpa decides otherwise.
+                        session.segment_origin = session.accepted_samples;
                         engine.spotter.reset(&session.stream);
                         break;
                     }
                 }
             }
-            let detection_lag_micros = detection_end.map(|keyword_end| {
-                u128::from(session.accepted_samples.saturating_sub(keyword_end)) * 1_000_000
-                    / SAMPLE_RATE as u128
-            });
+            // Only a keyword end this module could prove produces a latency.
+            // Reporting the fall back's zero as a measurement would advertise
+            // an instant detector.
+            let detection_lag_micros = trusted_lag_samples
+                .map(|lag| u128::from(lag) * 1_000_000 / SAMPLE_RATE as u128);
             (detection_end, detection_lag_micros)
         };
         let inference_micros = inference_started.elapsed().as_micros();
@@ -341,15 +425,14 @@ impl WakeWordManager {
         let Some(keyword_end_sample) = detection_end else {
             return Ok(None);
         };
-        let detection_micros = detection_micros
-            .expect("present with detection end")
-            .saturating_add(inference_micros);
         inner.metrics.detections = inner.metrics.detections.saturating_add(1);
-        inner.metrics.detection_samples = inner.metrics.detection_samples.saturating_add(1);
-        inner.metrics.total_detection_micros = inner
-            .metrics
-            .total_detection_micros
-            .saturating_add(detection_micros);
+        if let Some(detection_micros) = detection_micros {
+            inner.metrics.detection_samples = inner.metrics.detection_samples.saturating_add(1);
+            inner.metrics.total_detection_micros = inner
+                .metrics
+                .total_detection_micros
+                .saturating_add(detection_micros.saturating_add(inference_micros));
+        }
         Ok(Some(WakeWordDetection {
             detected: true,
             session_id: session_id.to_string(),
@@ -366,10 +449,21 @@ impl WakeWordManager {
             .is_some_and(|session| session.id == session_id);
         if matches {
             inner.session = None;
+            inner.armed_cpu = None;
             inner.metrics.dropped_frames =
                 inner.metrics.dropped_frames.saturating_add(dropped_frames);
         }
         Ok(matches)
+    }
+
+    /// "That was not me." The operator is the only oracle for a false wake, so
+    /// the count is the only thing worth keeping — never the audio, the
+    /// decoded tokens, or when it happened.
+    pub fn report_false_trigger(&self) -> Result<WakeWordRuntimeStatus, String> {
+        let mut inner = lock(&self.inner)?;
+        inner.metrics.false_trigger_reports =
+            inner.metrics.false_trigger_reports.saturating_add(1);
+        Ok(status_from(&inner))
     }
 }
 
@@ -394,11 +488,19 @@ fn status_from(inner: &ManagerInner) -> WakeWordRuntimeStatus {
         accepting_audio: inner.session.is_some(),
         sample_rate: SAMPLE_RATE,
         model_bytes: MODEL_BYTES,
-        // ONNX Runtime has no portable resident-set query. Reporting the model
-        // bytes and leaving process memory unknown is more accurate than
-        // presenting an estimate as a measurement.
-        model_memory_bytes: None,
-        idle_cpu_percent: None,
+        model_memory_bytes: inner.model_memory_bytes,
+        // Whole-process CPU over the armed window, which is the number the
+        // feature exists to keep small. Below a second the OS counter's own
+        // quantum dominates the ratio, so there is no reading rather than a
+        // loud wrong one.
+        idle_cpu_percent: inner.armed_cpu.as_ref().and_then(|window| {
+            let elapsed_ms = window.started.elapsed().as_millis();
+            if elapsed_ms < 1_000 {
+                return None;
+            }
+            let cpu_time_ms = own_usage().cpu_time_ms?;
+            Some(cpu_time_ms.saturating_sub(window.cpu_time_ms) as f64 * 100.0 / elapsed_ms as f64)
+        }),
         average_inference_ms: average(
             inner.metrics.total_inference_micros,
             inner.metrics.inference_samples,
@@ -409,6 +511,7 @@ fn status_from(inner: &ManagerInner) -> WakeWordRuntimeStatus {
         ),
         detections: inner.metrics.detections,
         dropped_frames: inner.metrics.dropped_frames,
+        false_trigger_reports: inner.metrics.false_trigger_reports,
         last_error: inner.metrics.last_error.clone(),
     }
 }
@@ -450,6 +553,12 @@ mod tests {
     use sherpa_onnx::Wave;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
+    fn num_cpus_for_test() -> f64 {
+        std::thread::available_parallelism()
+            .map(|count| count.get() as f64)
+            .unwrap_or(1.0)
+    }
+
     fn real_inference_guard() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
@@ -488,6 +597,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Nothing is loaded and nothing is armed, so there is nothing to measure.
+    /// A number here would be an estimate wearing a measurement's clothes.
     #[test]
     fn status_never_claims_unmeasured_memory_or_cpu() {
         let manager = WakeWordManager::default();
@@ -499,6 +610,21 @@ mod tests {
         assert_eq!(status.idle_cpu_percent, None);
         assert!(!status.loaded);
         assert!(!status.accepting_audio);
+        assert_eq!(status.false_trigger_reports, 0);
+    }
+
+    /// The one thing only the operator can know. It counts, and it counts
+    /// without the runtime being loaded, because a false wake is reported after
+    /// the fact.
+    #[test]
+    fn a_reported_false_trigger_counts_and_carries_nothing_else() {
+        let manager = WakeWordManager::default();
+        let first = manager.report_false_trigger().unwrap();
+        assert_eq!(first.false_trigger_reports, 1);
+        assert_eq!(first.detections, 0);
+        let second = manager.report_false_trigger().unwrap();
+        assert_eq!(second.false_trigger_reports, 2);
+        assert!(!second.loaded);
     }
 
     fn samples_trigger(
@@ -612,6 +738,72 @@ mod tests {
         ));
     }
 
+    /// **The regression that only a long-armed session can show.**
+    ///
+    /// sherpa restarts its keyword timestamps on trailing silence and never
+    /// says so, so a session armed through a stretch of silence and unrelated
+    /// speech reports a keyword that ended seconds before it really did.
+    /// Slicing the renderer's three-second ring by that number falls back to
+    /// the whole window, and the wake phrase and the audio before it go to
+    /// Whisper as the operator's command. Always Listening is exactly this
+    /// case, so the fixture is pushed the way that feature pushes audio:
+    /// through one session that was armed long before the phrase arrived.
+    #[test]
+    fn a_long_armed_session_never_places_the_keyword_before_the_audio_that_revealed_it() {
+        if std::env::var_os("LITTLE_MONKEY_KWS_E2E").is_none() {
+            return;
+        }
+        let _guard = real_inference_guard();
+        let resource_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources");
+        set_resource_dir(Some(&resource_root));
+        let root = resource_root.join(BUNDLED_DIRECTORY);
+        let negative = Wave::read(root.join("test_wavs/1.wav").to_str().unwrap())
+            .expect("read the unrelated-speech fixture");
+        let positive = Wave::read(root.join("test_wavs/0.wav").to_str().unwrap())
+            .expect("read the wake + command fixture");
+
+        let manager = WakeWordManager::default();
+        let started = manager.start("light up", DEFAULT_SENSITIVITY).unwrap();
+        let mut accepted = 0_u64;
+        let mut detection = None;
+        let silence = vec![0.0_f32; SAMPLE_RATE as usize * 2];
+        for stretch in [
+            silence.as_slice(),
+            negative.samples(),
+            silence.as_slice(),
+            positive.samples(),
+        ] {
+            for frame in stretch.chunks(1_600) {
+                let result = manager
+                    .push(&started.session_id, SAMPLE_RATE, frame)
+                    .expect("stream real PCM");
+                accepted += frame.len() as u64;
+                if let Some(found) = result {
+                    detection = Some((found, accepted));
+                    break;
+                }
+            }
+            if detection.is_some() {
+                break;
+            }
+        }
+        let (found, accepted_at_detection) = detection
+            .expect("the phrase is in the last fixture, however long the session has been armed");
+        // Roughly twenty seconds of audio preceded the phrase here. The keyword
+        // must still be placed inside the window the renderer can actually
+        // slice, not at the start of the session.
+        assert!(
+            found.keyword_end_sample <= accepted_at_detection,
+            "the keyword cannot end after the audio that revealed it"
+        );
+        assert!(
+            accepted_at_detection - found.keyword_end_sample <= MAX_TRUSTED_DETECTION_LAG_SAMPLES,
+            "keyword placed {} samples before the frame that revealed it, which the ring cannot hold",
+            accepted_at_detection - found.keyword_end_sample
+        );
+        assert!(manager.stop(&started.session_id, 0).unwrap());
+    }
+
     /// The executable privacy boundary: native KWS receives the whole fixture,
     /// but Whisper receives only samples after sherpa's keyword-end timestamp.
     #[tokio::test]
@@ -646,11 +838,43 @@ mod tests {
         let live_status = manager.status().unwrap();
         assert!(live_status.accepting_audio);
         assert_eq!(live_status.detections, 1);
+        // Measured across the real load, not derived from the file size. A
+        // platform that will not report resident bytes says so with `None`
+        // rather than with the model's own byte count.
+        if let Some(resident) = live_status.model_memory_bytes {
+            assert!(
+                resident > 0,
+                "a reported resident growth must be a real one"
+            );
+        }
         assert!(live_status.average_inference_ms.is_some_and(f64::is_finite));
         assert!(live_status
             .average_detection_latency_ms
             .is_some_and(f64::is_finite));
+        // The armed window has to outlast the OS counter's quantum before a
+        // ratio means anything, which is exactly why status refuses to answer
+        // before then. Confirm both halves against the real process.
+        assert!(
+            manager.status().unwrap().idle_cpu_percent.is_none()
+                || started.status.idle_cpu_percent.is_none(),
+            "a just-armed session cannot have an idle-CPU reading yet"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        let settled = manager.status().unwrap();
+        match settled.idle_cpu_percent {
+            Some(percent) => assert!(
+                percent.is_finite() && (0.0..=100.0 * num_cpus_for_test()).contains(&percent),
+                "armed CPU must be a real ratio: {percent}"
+            ),
+            // Only legitimate where the platform reports no CPU time at all.
+            None => assert!(own_usage().cpu_time_ms.is_none()),
+        }
         assert!(manager.stop(&started.session_id, 0).unwrap());
+        assert_eq!(
+            manager.status().unwrap().idle_cpu_percent,
+            None,
+            "a stopped session stops being measured"
+        );
         assert!(!manager.stop(&started.session_id, 42).unwrap());
         assert_eq!(manager.status().unwrap().dropped_frames, 0);
         assert!(manager

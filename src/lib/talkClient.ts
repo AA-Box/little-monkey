@@ -38,6 +38,8 @@ export interface WakeWordRuntimeStatus {
   averageInferenceMs: number | null;
   averageDetectionLatencyMs: number | null;
   detections: number;
+  /** Wake events the operator said were not them. A count, never the audio. */
+  falseTriggerReports: number;
   droppedFrames: number;
   lastError: string | null;
 }
@@ -120,6 +122,8 @@ export const talkClient = {
     }),
   wakeWordStop: (sessionId: string, droppedFrames = 0) =>
     invoke<boolean>('m7_wake_word_stop', { sessionId, droppedFrames }),
+  wakeWordReportFalseTrigger: () =>
+    invoke<WakeWordRuntimeStatus>('m7_wake_word_report_false_trigger'),
   /**
    * Transcribe one utterance for Talk.
    *

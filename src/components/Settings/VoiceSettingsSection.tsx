@@ -229,6 +229,20 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
     }
   }, [player, voice.outputDeviceId]);
 
+  /** The operator is the only oracle for a false wake. Count it; keep nothing else. */
+  const reportFalseTrigger = useCallback(async () => {
+    setError(null);
+    try {
+      const status = await talkClient.wakeWordReportFalseTrigger();
+      setWakeStatus(status);
+      setNote(
+        `Recorded. ${status.falseTriggerReports} false ${status.falseTriggerReports === 1 ? 'trigger' : 'triggers'} reported this session.`,
+      );
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }, [setError, setNote]);
+
   const testWakeWord = useCallback(async () => {
     setBusy('wake');
     setError(null);
@@ -661,12 +675,28 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
             <dd className="tabular-nums">{wakeStatus?.droppedFrames ?? 0}</dd>
           </div>
           <div className="flex justify-between gap-2">
-            <dt className="text-muted">Idle CPU</dt>
-            <dd>{wakeStatus?.idleCpuPercent == null ? 'unavailable' : `${wakeStatus.idleCpuPercent.toFixed(1)}%`}</dd>
+            <dt className="text-muted" title="Whole-process CPU across the armed window, sampled only when this panel asks.">
+              Idle CPU while armed
+            </dt>
+            <dd className="tabular-nums">
+              {wakeStatus?.idleCpuPercent == null
+                ? 'not measured yet'
+                : `${wakeStatus.idleCpuPercent.toFixed(1)}%`}
+            </dd>
           </div>
           <div className="flex justify-between gap-2">
-            <dt className="text-muted">Resident model memory</dt>
-            <dd>{wakeStatus?.modelMemoryBytes == null ? 'unavailable' : formatModelSize(wakeStatus.modelMemoryBytes)}</dd>
+            <dt className="text-muted" title="Resident growth measured across the one model load, not derived from the file size.">
+              Resident model memory
+            </dt>
+            <dd>{wakeStatus?.modelMemoryBytes == null ? 'not measured yet' : formatModelSize(wakeStatus.modelMemoryBytes)}</dd>
+          </div>
+          <div className="flex justify-between gap-2">
+            <dt className="text-muted">Detections</dt>
+            <dd className="tabular-nums">{wakeStatus?.detections ?? 0}</dd>
+          </div>
+          <div className="flex justify-between gap-2">
+            <dt className="text-muted">False triggers reported</dt>
+            <dd className="tabular-nums">{wakeStatus?.falseTriggerReports ?? 0}</dd>
           </div>
           <div className="flex justify-between gap-2 sm:col-span-2">
             <dt className="text-muted">Measured detection latency</dt>
@@ -762,15 +792,28 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
           </span>
         </label>
 
-        <Button
-          className="mt-3"
-          size="sm"
-          disabled={busy !== null || !voice.wakePhraseEnabled || !wakeAvailable}
-          onClick={() => void testWakeWord()}
-        >
-          <Mic size={14} />
-          {busy === 'wake' ? 'Listening for wake word…' : 'Test wake word'}
-        </Button>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            disabled={busy !== null || !voice.wakePhraseEnabled || !wakeAvailable}
+            onClick={() => void testWakeWord()}
+          >
+            <Mic size={14} />
+            {busy === 'wake' ? 'Listening for wake word…' : 'Test wake word'}
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={busy !== null || !voice.wakePhraseEnabled}
+            onClick={() => void reportFalseTrigger()}
+          >
+            That was not me
+          </Button>
+        </div>
+        <span className="mt-1 block text-[11px] text-faint">
+          Reporting a false wake keeps a count and nothing else — no audio, no phrase, no time. Lower
+          Sensitivity if the count climbs.
+        </span>
 
         {voice.alwaysListening ? (
           <div className="mt-3 rounded border border-danger/40 bg-danger/10 p-2">

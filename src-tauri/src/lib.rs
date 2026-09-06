@@ -2006,6 +2006,7 @@ pub fn run() {
             m7_companion::m7_wake_word_start,
             m7_companion::m7_wake_word_push,
             m7_companion::m7_wake_word_stop,
+            m7_companion::m7_wake_word_report_false_trigger,
             m7_companion::m7_talk_metrics,
             m7_companion::m7_talk_metric_record,
             m7_companion::m7_talk_metrics_clear,

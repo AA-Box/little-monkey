@@ -54,6 +54,26 @@ Pinned components:
 - Runtime model payload: 14,129,713 bytes across encoder, decoder, joiner,
   tokens, and BPE. The bundle also carries the archive's 726-byte README.
 
+### Placing the keyword in time
+
+sherpa's `KeywordResult` reports token timestamps relative to the decoding
+segment it is in. In 1.13.3's keyword API `start_time` is left at zero, there is
+no processed-frame counter, and the decoder starts a new segment on trailing
+silence without reporting it. A session armed through a stretch of silence —
+which is what Always Listening is — therefore reports a keyword that appears to
+have ended near the start of the session.
+
+So the timestamp is treated as a hypothesis, not a fact. The keyword cannot have
+ended after the audio that revealed it, and a real decoder lag is bounded by the
+model's 16-frame chunk; a hypothesis that fails either test is a segment origin
+that drifted, and the command is taken from the end of the frame in hand
+instead. Both branches are safe for the boundary this module exists to hold. The
+cost of the fall back is precision: up to one decode chunk of the command's
+first moments can be lost when the keyword is spotted late, because the position
+the ring would need is not one this API can prove. Trigger latency is only
+recorded for detections whose position was provable, so the reported average is
+never the fall back's zero.
+
 The 1.13.3 runtime is deliberate. sherpa-onnx 1.13.4 and newer currently hit a
 native ONNX Runtime abort on SME-capable Apple Silicon; the upstream report is
 [k2-fsa/sherpa-onnx#3791](https://github.com/k2-fsa/sherpa-onnx/issues/3791).
@@ -98,10 +118,25 @@ post-wake transcription is not local Whisper.
 
 Settings reports the actual native backend, exact runtime/model identifiers,
 verification/load/accepting state, payload bytes, detections, dropped frames,
-average native inference time per submitted frame, and average trigger latency.
-There is no portable resident-set or idle-CPU reading in the selected native
-API, so those values are explicitly `unavailable`, not estimates. Inference is
-driven only by incoming worklet frames; there is no polling loop.
+average native inference time per submitted frame, average trigger latency,
+resident model memory, idle CPU while armed, and the number of false triggers
+the operator reported.
+
+The last three are measurements, with the scope their labels say. Resident model
+memory is the process's resident growth across the one model load — not the
+model's file size, and reported as unmeasured where the platform will not answer
+or where the process peak was already above the loaded model. Idle CPU is
+whole-process CPU across the armed window, which is the number this feature
+exists to keep small; below a second the operating system counter's own quantum
+dominates the ratio, so there is no reading rather than a loud wrong one. Both
+are sampled only when the panel asks, so measuring the idle cost never becomes
+the poll that changes it. Inference is driven only by incoming worklet frames;
+there is no polling loop anywhere in the path.
+
+**That was not me** records one false wake. The count is all that is kept: not
+the audio, not the phrase, not the time. It is the only signal the operator can
+give that the threshold is too low, and lowering Sensitivity is the fix it
+points at.
 
 Test Wake Word opens the microphone and starts the same Rust manager, tokenizer,
 model, threshold, queue, and PCM path used by Talk. Microphone volume cannot
@@ -132,6 +167,8 @@ LITTLE_MONKEY_KWS_E2E=1 \
 LITTLE_MONKEY_WAKE_TO_WHISPER_E2E=1 \
   cargo test --manifest-path src-tauri/Cargo.toml --lib \
   local_wake_word::tests::real_wake_event_feeds_only_command_pcm_to_local_whisper
+
+pnpm test:wake-walkthrough
 ```
 
 The deterministic real-model fixtures cover the configured wake word, no wake
@@ -139,7 +176,34 @@ word, a similar but incorrect phrase, an immediate command, an inserted pause,
 and deterministic background noise. The second test drives the production
 manager, rejects audio from its stopped generation, writes only samples after
 the native keyword-end timestamp, and transcribes them with the real bundled
-Whisper model while asserting the wake phrase is absent.
+Whisper model while asserting the wake phrase is absent. A third pushes roughly
+twenty seconds of silence and unrelated speech through one armed session before
+the phrase, which is the only shape in which a drifted segment origin shows
+itself.
+
+### The acceptance walkthrough
+
+The fifteen-step acceptance script is executed rather than described.
+`src/lib/wakeWordWalkthrough.e2e.test.ts` drives the real `TalkSession` — the
+same class the chat window constructs — through the real ring, queue, resampler
+and WAV encoder, against the real native keyword spotter and the real bundled
+Whisper running in `src-tauri/src/bin/wake-word-e2e.rs`. Configuration steps go
+through the operator's own save-time validator. Nothing about detection,
+transcription or configuration is mocked:
+
+```sh
+pnpm stage:wake-word && pnpm stage:whisper
+pnpm test:wake-walkthrough
+```
+
+It arms the session, pushes silence and unrelated speech and proves no
+transcription and no turn happen, says the phrase and its command, proves only
+the command reaches Whisper, talks over the answer, proves the second sentence
+becomes its own turn without a second wake word, and proves the session re-arms
+and the microphone closes. Two things it does not cover, because no test can
+click them: `getUserMedia` and the operating system's permission dialog. What
+the microphone does once granted has its own coverage in
+`useTalkSession.test.tsx`; that a human granted it does not.
 
 The dedicated Local Wake Word workflow stages authenticated archives and
 compiles all six desktop targets. A Linux host opens the real runtime and runs
