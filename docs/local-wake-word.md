@@ -200,13 +200,18 @@ It arms the session, pushes silence and unrelated speech and proves no
 transcription and no turn happen, says the phrase and its command, proves only
 the command reaches Whisper, talks over the answer, proves the second sentence
 becomes its own turn without a second wake word, and proves the session re-arms
-and the microphone closes. Two things it does not cover, because no test can
-click them: `getUserMedia` and the operating system's permission dialog. What
-the microphone does once granted has its own coverage in
-`useTalkSession.test.tsx`; that a human granted it does not.
+and the microphone closes. One thing it does not cover, because no test can
+click it: the operating system's own microphone prompt. Both of that prompt's
+answers do have coverage — `useTalkSession.test.tsx` asserts that a refusal is
+reported rather than dressed up as listening, that no wake session is started
+without a grant, and that a grant revoked mid-session ends the track and fails
+the engine closed. The click itself is the operator's.
 
-The dedicated Local Wake Word workflow stages authenticated archives and
-compiles all six desktop targets. A Linux host opens the real runtime and runs
-the positive/negative and KWS-to-Whisper tests. A separate bundle job inspects
-the generated installer for all six model files. Compilation is not described
-as runtime verification: only hosts that execute the native tests are verified.
+The dedicated Local Wake Word workflow runs the native runtime on every
+supported desktop target — macOS arm64 and x86_64, Linux arm64 and x86_64,
+Windows arm64 and x86_64 — rather than compiling five of them and executing one.
+Each host authenticates its own archive, stages the verified model, opens the
+real runtime, runs the positive/negative, KWS-to-Whisper and long-armed-session
+tests, and then the fifteen-step walkthrough. There is no compile-only matrix:
+compiling proved the archive mapping and nothing about whether the model opens.
+A separate bundle job inspects the generated installer for all six model files.

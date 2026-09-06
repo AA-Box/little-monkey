@@ -62,9 +62,9 @@ rather than left for a reader to discover. Work that is not built yet lives in
   bundled; the archive README declares Apache License 2.0, while upstream's
   model-license provenance clarification remains open. Native execution has
   been exercised on macOS arm64. The dedicated workflow is configured to run
-  real inference on Linux x86_64 and compile all six release targets, but those
-  jobs remain unverified until the first green hosted run; the other platforms
-  are not claimed from compilation alone. sherpa's keyword API reports token
+  the real runtime and the acceptance walkthrough natively on all six supported
+  targets rather than inferring five of them from compilation, but those
+  jobs remain unverified until the first green hosted run. sherpa's keyword API reports token
   timestamps relative to a decoding segment it restarts on silence without
   saying so, and exposes no absolute position, so a keyword spotted late in a
   long-armed session is anchored to the frame that revealed it rather than to a
@@ -76,7 +76,8 @@ rather than left for a reader to discover. Work that is not built yet lives in
   reported as unmeasured where the platform will not answer. The fifteen-step
   acceptance walkthrough runs against the real spotter and the real Whisper but
   cannot click an operating-system microphone prompt; that grant is the one step
-  no test performs. See [Local wake-word detection](local-wake-word.md).
+  no test performs, though both of its answers — refusal and mid-session
+  revocation — are covered. See [Local wake-word detection](local-wake-word.md).
 - The executable extension marketplace distributes only what a verified registry actually serves: the bundled first-party M4 catalog currently contains declarative built-ins, so acquiring an executable extension requires adding a verified source with artifact locations. `automatic_safe` updates pause for review whenever a granted permission has a host-only binding, because the canonical workspace binding is deliberately never reconstructed from a display label.
 - Standards Studio discovery is deterministic and bounded — file count, recursion depth, per-evidence and total scan bytes — and repository text only ever creates unapproved candidates. A convention the detectors do not model is not discovered, and injection requires both approval and task relevance, so an approved standard may legitimately be absent from a turn that never touched its scope.
 - Remote handoff requires a user-owned reachable network and valid TLS identity. There is no relay, account service, RBAC/SSO plane, or hosted GPU.

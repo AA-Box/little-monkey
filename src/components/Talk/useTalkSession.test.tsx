@@ -40,13 +40,23 @@ const CONFIG = {
   },
 };
 
-const streams: { stopped: number }[] = [];
+interface StubTrack {
+  stopped: number;
+  listeners: Record<string, Array<() => void>>;
+  stop(): void;
+  addEventListener(kind: string, listener: () => void): void;
+}
+
+const streams: StubTrack[] = [];
+/** The operating system's answer to the microphone prompt, per test. */
+let microphoneGrant: 'granted' | 'denied' = 'granted';
 let resumed = 0;
 let sourceNodes: { connected: number; disconnected: number }[] = [];
 let workletNodes: Array<{ port: { onmessage: ((event: MessageEvent<Float32Array>) => void) | null; close(): void }; disconnect(): void }> = [];
 
 function stubMedia() {
   streams.length = 0;
+  microphoneGrant = 'granted';
   resumed = 0;
   sourceNodes = [];
   workletNodes = [];
@@ -54,7 +64,21 @@ function stubMedia() {
     configurable: true,
     value: {
       getUserMedia: async () => {
-        const track = { stopped: 0, stop() { this.stopped += 1; } };
+        if (microphoneGrant === 'denied') {
+          // What every browser throws when the operator says no, or when the
+          // platform has already said no on their behalf.
+          const refusal = new Error('Permission denied');
+          refusal.name = 'NotAllowedError';
+          throw refusal;
+        }
+        const track: StubTrack = {
+          stopped: 0,
+          listeners: {},
+          stop() { this.stopped += 1; },
+          addEventListener(kind: string, listener: () => void) {
+            (this.listeners[kind] ??= []).push(listener);
+          },
+        };
         streams.push(track);
         return { getTracks: () => [track] };
       },
@@ -174,6 +198,44 @@ describe('useTalkSession', () => {
     // node nothing references — leaving the worklet without PCM, the
     // meter flat, and Talk listening forever.
     await waitFor(() => expect(sourceNodes[0].disconnected).toBe(1));
+  });
+
+  /**
+   * The one step of the acceptance script no test can perform is a human
+   * clicking the operating system's microphone prompt. What the hook does with
+   * each of that prompt's two answers is not, and this is it: a refusal is
+   * reported and nothing claims to be listening.
+   */
+  it('reports a refused microphone instead of claiming to listen', async () => {
+    microphoneGrant = 'denied';
+    const { result } = renderHook(() =>
+      useTalkSession('session-1', { enabled: true, autoStartMode: 'continuous' }),
+    );
+    await waitFor(() => expect(result.current.snapshot?.error ?? result.current.setupError).toBeTruthy());
+    expect(streams).toHaveLength(0);
+    expect(result.current.snapshot?.capturing).not.toBe(true);
+    expect(result.current.snapshot?.state).not.toBe('armed');
+    expect(invoke).not.toHaveBeenCalledWith('m7_wake_word_start', expect.anything());
+  });
+
+  /**
+   * A grant can be taken back while Talk holds it — the operator revokes it in
+   * system settings, or the device disappears. The track ends, and an engine
+   * that kept saying "listening" would be lying about an open microphone.
+   */
+  it('fails closed when the grant is revoked mid-session', async () => {
+    const { result } = renderHook(() =>
+      useTalkSession('session-1', { enabled: true, autoStartMode: 'continuous' }),
+    );
+    await waitFor(() => expect(streams).toHaveLength(1));
+    await waitFor(() => expect(result.current.snapshot?.capturing).toBe(true));
+
+    const ended = streams[0].listeners.ended ?? [];
+    expect(ended.length).toBeGreaterThan(0);
+    for (const listener of ended) listener();
+
+    await waitFor(() => expect(result.current.snapshot?.state).toBe('error'));
+    expect(result.current.snapshot?.capturing).toBe(false);
   });
 
   it('closes the microphone when it is disabled again', async () => {

@@ -29,10 +29,16 @@ const MAX_PHRASE_BYTES: usize = 128;
 /// The tail sherpa's last token timestamp does not include.
 const KEYWORD_TAIL_SECONDS: f32 = 0.08;
 /// How far behind the frame that surfaced a detection the keyword may
-/// plausibly have ended. The model decodes in 16-frame chunks — about 640 ms of
-/// audio — so a second is generous for a real decoder lag and far too tight for
-/// a segment origin that has silently drifted by the length of a conversation.
-const MAX_TRUSTED_DETECTION_LAG_SAMPLES: u64 = SAMPLE_RATE as u64;
+/// plausibly have ended: one decode chunk. The model is
+/// `chunk-16-left-64` at a 10 ms frame shift with 4x subsampling, so it commits
+/// a keyword at most 16 * 4 * 10 ms of audio after hearing it.
+///
+/// This is the bound that keeps the wake phrase out of the command. A drifted
+/// segment origin is always *early*, which makes the estimated keyword end
+/// early too, which is what would slice backwards over the phrase itself — so
+/// the tighter this is, the less a wrong guess can reach. One chunk is the
+/// largest value a correct guess ever needs.
+const MAX_TRUSTED_DETECTION_LAG_SAMPLES: u64 = SAMPLE_RATE as u64 * 16 * 4 / 100;
 
 #[derive(Clone, Copy)]
 struct ModelFile {
@@ -380,19 +386,21 @@ impl WakeWordManager {
                         // relative to the segment its decoder is in, leaves
                         // `start_time` at zero, exposes no processed-frame
                         // counter, and starts a new segment on trailing silence
-                        // without saying so. In a session armed for a
-                        // conversation the origin above has therefore usually
-                        // drifted, and the keyword looks like it ended twenty
+                        // without saying so. Reading the timestamps as if they
+                        // were session-absolute makes a keyword spoken twenty
+                        // seconds into a session look like it ended twenty
                         // seconds ago.
                         //
-                        // The keyword cannot have ended after the audio that
-                        // revealed it, and a real decoder lag is bounded by the
-                        // model's chunk. A hypothesis failing either test is a
-                        // drifted origin, not a late keyword — and slicing the
-                        // ring by it hands Whisper the wake phrase and the
-                        // seconds before it, which is the one thing this module
-                        // exists to prevent. Fall back to the last position
-                        // still provable: the end of the frame in hand.
+                        // The origin above is the best guess available. It is
+                        // still a guess, so it is checked: the keyword cannot
+                        // have ended after the audio that revealed it, and a
+                        // real decoder lag is bounded by the model's chunk. A
+                        // hypothesis failing either test is a drifted origin,
+                        // not a late keyword — and slicing the ring by it hands
+                        // Whisper the wake phrase and the seconds before it,
+                        // which is the one thing this module exists to prevent.
+                        // Fall back to the last position still provable: the end
+                        // of the frame in hand.
                         let lag = session.accepted_samples.checked_sub(hypothesis);
                         detection_end = Some(match lag {
                             Some(lag) if lag <= MAX_TRUSTED_DETECTION_LAG_SAMPLES => {

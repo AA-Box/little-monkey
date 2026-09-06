@@ -67,7 +67,13 @@ const WAKE_PHRASE = 'light up';
 const REPOSITORY_ROOT = path.resolve(__dirname, '..', '..');
 const HARNESS_BINARY =
   process.env.LITTLE_MONKEY_WAKE_E2E_BIN
-  ?? path.join(REPOSITORY_ROOT, 'src-tauri', 'target', 'debug', 'wake-word-e2e');
+  ?? path.join(
+    REPOSITORY_ROOT,
+    'src-tauri',
+    'target',
+    'debug',
+    process.platform === 'win32' ? 'wake-word-e2e.exe' : 'wake-word-e2e',
+  );
 
 interface Detection {
   detected: boolean;
@@ -442,8 +448,18 @@ describe.skipIf(!process.env.LITTLE_MONKEY_WAKE_WALKTHROUGH_E2E)(
       expect(observed).toContain<TalkState>('wake_detected');
       expect(observed).toContain<TalkState>('capturing_command');
       expect(microphoneOpens).toBe(1);
-      const afterWake = await harness.call<{ detections: number }>({ op: 'status' });
+      const afterWake = await harness.call<{
+        detections: number;
+        averageDetectionLatencyMs: number | null;
+      }>({ op: 'status' });
       expect(afterWake.detections).toBe(1);
+      // Nineteen seconds into an armed session sherpa's timestamps are offsets
+      // into a segment it restarted without reporting, so this keyword's exact
+      // position is not provable and the command is anchored to the frame that
+      // revealed it. A latency is recorded only where the position *was*
+      // provable, so there is deliberately none here — the alternative is
+      // publishing the anchor's zero as a measured trigger latency.
+      expect(afterWake.averageDetectionLatencyMs).toBeNull();
 
       // The utterance ends the way a real one does: the operator stops talking.
       await speak(silence(1_500));
