@@ -132,7 +132,13 @@ export async function stageWakeWordModel() {
       throw new Error(`model archive checksum mismatch: expected ${MODEL_ARCHIVE_SHA256}, got ${digest}`);
     }
     writeFileSync(archive, bytes);
-    const unpack = spawnSync("tar", ["-xjf", archive, "-C", transaction], {
+    // Run from inside the transaction directory and name the archive
+    // relatively. An absolute Windows path reaches `tar` as `D:\a\...`, and a
+    // GNU tar reads everything before the colon as a host to fetch from:
+    // "Cannot connect to D: resolve failed". There is no colon in a bare
+    // filename.
+    const unpack = spawnSync("tar", ["-xjf", basename(archive)], {
+      cwd: transaction,
       encoding: "utf8",
       windowsHide: true,
     });

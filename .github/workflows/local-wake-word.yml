@@ -101,6 +101,10 @@ jobs:
       - name: Verify manifests and stage this host's authenticated assets
         run: |
           pnpm test:wake-assets
+          # `tauri-build` resolves every declared resource and external binary
+          # from its build script, so the CLI sidecar has to exist before any
+          # cargo command in this repository — `cargo test` included.
+          pnpm stage:cli:placeholder
           pnpm stage:sherpa-runtime
           pnpm stage:wake-word
           pnpm stage:whisper

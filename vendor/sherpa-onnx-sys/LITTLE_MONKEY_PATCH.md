@@ -11,8 +11,14 @@ covered by the included upstream Apache-2.0 license. Little Monkey changes only
 - map the official Windows arm64 archive, which 1.13.3 published but omitted
   from its Rust build script; and
 - link only the libraries required by keyword spotting. The unrelated
-  `piper_phonemize`, `espeak-ng`, `ucd`, and `ssentencepiece_core` libraries in
-  the upstream all-features archive are not linked or shipped.
+  `piper_phonemize`, `espeak-ng`, and `ucd` libraries in the upstream
+  all-features archive are not linked or shipped.
+
+  `ssentencepiece_core` was in that exclusion list and should not have been:
+  it is sherpa's own Apache-2.0 SentencePiece implementation, and
+  `sherpa-onnx-core`'s recognizer objects reference it unconditionally, so
+  excluding it only moved the failure from the licence audit to the linker.
+  macOS tolerated the undefined symbols; `lld` on Linux does not.
 
 The Rust API crate remains the exact upstream 1.13.3 release. Keep this patch
 until upstream provides equivalent authenticated staging and the Apple SME

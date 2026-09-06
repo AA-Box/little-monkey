@@ -21,6 +21,10 @@ const SHERPA_ONNX_STATIC_LIBS: &[&str] = &[
     "sherpa-onnx-fst",
     "kaldi-native-fbank-core",
     "kissfft-float",
+    // sherpa's own SentencePiece implementation, Apache-2.0 like the rest of
+    // the project. `sherpa-onnx-core`'s recognizer objects reference it
+    // unconditionally, so leaving it out only moves the failure to the linker.
+    "ssentencepiece_core",
     "onnxruntime",
 ];
 
