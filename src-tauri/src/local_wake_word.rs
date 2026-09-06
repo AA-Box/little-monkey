@@ -24,6 +24,10 @@ pub const SAMPLE_RATE: i32 = 16_000;
 pub const DEFAULT_SENSITIVITY: f32 = 0.5;
 
 const BUNDLED_DIRECTORY: &str = "local-wake-word";
+/// Deterministic test audio lives beside the bundle, never inside it: Tauri
+/// packages `resources/local-wake-word/**/*`, so anything staged in there ships.
+#[cfg(test)]
+const FIXTURE_DIRECTORY: &str = "local-wake-word-fixtures";
 const MAX_FRAME_SAMPLES: usize = SAMPLE_RATE as usize / 5; // 200 ms
 const MAX_PHRASE_BYTES: usize = 128;
 /// The tail sherpa's last token timestamp does not include.
@@ -690,8 +694,9 @@ mod tests {
         let paths = resolve_bundled(Some(&resource_root))
             .expect("run `pnpm stage:wake-word` before the real KWS test");
         let engine = WakeWordEngine::load(&paths).expect("load authenticated KWS model");
-        let positive_path = paths.root.join("test_wavs/0.wav");
-        let negative_path = paths.root.join("test_wavs/1.wav");
+        let fixtures = resource_root.join(FIXTURE_DIRECTORY);
+        let positive_path = fixtures.join("0.wav");
+        let negative_path = fixtures.join("1.wav");
         let positive = Wave::read(positive_path.to_str().unwrap()).expect("read positive fixture");
         let negative = Wave::read(negative_path.to_str().unwrap()).expect("read negative fixture");
         assert!(fixture_triggers(&engine, &positive, "light up"));
@@ -764,10 +769,10 @@ mod tests {
         let _guard = real_inference_guard();
         let resource_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources");
         set_resource_dir(Some(&resource_root));
-        let root = resource_root.join(BUNDLED_DIRECTORY);
-        let negative = Wave::read(root.join("test_wavs/1.wav").to_str().unwrap())
+        let root = resource_root.join(FIXTURE_DIRECTORY);
+        let negative = Wave::read(root.join("1.wav").to_str().unwrap())
             .expect("read the unrelated-speech fixture");
-        let positive = Wave::read(root.join("test_wavs/0.wav").to_str().unwrap())
+        let positive = Wave::read(root.join("0.wav").to_str().unwrap())
             .expect("read the wake + command fixture");
 
         let manager = WakeWordManager::default();
@@ -823,9 +828,7 @@ mod tests {
         let resource_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources");
         set_resource_dir(Some(&resource_root));
         crate::local_whisper::set_resource_dir(Some(&resource_root));
-        let fixture = resource_root
-            .join(BUNDLED_DIRECTORY)
-            .join("test_wavs/0.wav");
+        let fixture = resource_root.join(FIXTURE_DIRECTORY).join("0.wav");
         let wave = Wave::read(fixture.to_str().unwrap()).expect("read wake + command fixture");
         let manager = WakeWordManager::default();
         let started = manager.start("light up", DEFAULT_SENSITIVITY).unwrap();

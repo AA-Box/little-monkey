@@ -15,7 +15,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -53,6 +53,11 @@ export const MODEL_FILES = Object.freeze({
   },
 });
 
+/// Deterministic test audio, keyed by its path inside the archive. Staged
+/// beside the bundle rather than inside it: Tauri packages
+/// `resources/local-wake-word/**/*`, so "the installer carries no test audio"
+/// holds because the directory contains none, not because a list of six
+/// filenames was kept in step with the model.
 export const FIXTURE_FILES = Object.freeze({
   "test_wavs/0.wav": {
     bytes: 212_044,
@@ -64,12 +69,12 @@ export const FIXTURE_FILES = Object.freeze({
   },
 });
 
-const BUNDLED_FILES = Object.freeze({ ...MODEL_FILES, ...FIXTURE_FILES });
+export const FIXTURE_DIRECTORY = "local-wake-word-fixtures";
 
 const digestOf = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
-export function verifyModelDirectory(directory) {
-  return Object.entries(BUNDLED_FILES).every(([name, expected]) => {
+function verifyFiles(directory, manifest) {
+  return Object.entries(manifest).every(([name, expected]) => {
     try {
       const bytes = readFileSync(join(directory, name));
       return bytes.byteLength === expected.bytes && digestOf(bytes) === expected.sha256;
@@ -79,11 +84,28 @@ export function verifyModelDirectory(directory) {
   });
 }
 
+/** The packaged directory: the runtime files, and nothing that is not one. */
+export function verifyModelDirectory(directory) {
+  return verifyFiles(directory, MODEL_FILES);
+}
+
+/** The unpackaged fixtures, flattened out of the archive's `test_wavs/`. */
+export function verifyFixtureDirectory(directory) {
+  return verifyFiles(directory, fixtureManifestByBasename());
+}
+
+export function fixtureManifestByBasename() {
+  return Object.fromEntries(
+    Object.entries(FIXTURE_FILES).map(([name, expected]) => [basename(name), expected]),
+  );
+}
+
 export async function stageWakeWordModel() {
   const root = join(dirname(fileURLToPath(import.meta.url)), "..");
   const resources = join(root, "src-tauri", "resources");
   const destination = join(resources, "local-wake-word");
-  if (verifyModelDirectory(destination)) {
+  const fixtures = join(resources, FIXTURE_DIRECTORY);
+  if (verifyModelDirectory(destination) && verifyFixtureDirectory(fixtures)) {
     console.log(`[stage-wake-word-model] already staged ${destination}`);
     return;
   }
@@ -93,7 +115,9 @@ export async function stageWakeWordModel() {
   const archive = join(transaction, `${MODEL_ID}.tar.bz2`);
   const extracted = join(transaction, MODEL_ID);
   const candidate = join(transaction, "candidate");
+  const fixtureCandidate = join(transaction, "fixtures");
   const previous = join(resources, `.local-wake-word-previous-${randomUUID()}`);
+  const previousFixtures = join(resources, `.local-wake-word-fixtures-previous-${randomUUID()}`);
   try {
     mkdirSync(transaction, { recursive: false });
     console.log(`[stage-wake-word-model] downloading ${MODEL_URL}`);
@@ -115,17 +139,24 @@ export async function stageWakeWordModel() {
     if (unpack.status !== 0) {
       throw new Error(`could not extract KWS model: ${(unpack.stderr || unpack.stdout).trim()}`);
     }
-    if (!verifyModelDirectory(extracted)) {
+    if (!verifyModelDirectory(extracted) || !verifyFiles(extracted, FIXTURE_FILES)) {
       throw new Error("the extracted KWS model does not match its pinned file manifest");
     }
     mkdirSync(candidate);
-    for (const name of Object.keys(BUNDLED_FILES)) {
+    for (const name of Object.keys(MODEL_FILES)) {
       const destinationFile = join(candidate, name);
       mkdirSync(dirname(destinationFile), { recursive: true });
       cpSync(join(extracted, name), destinationFile);
     }
+    mkdirSync(fixtureCandidate);
+    for (const name of Object.keys(FIXTURE_FILES)) {
+      cpSync(join(extracted, name), join(fixtureCandidate, basename(name)));
+    }
     if (!verifyModelDirectory(candidate)) {
       throw new Error("the minimal KWS bundle does not match its pinned file manifest");
+    }
+    if (!verifyFixtureDirectory(fixtureCandidate)) {
+      throw new Error("the staged KWS fixtures do not match their pinned file manifest");
     }
     if (existsSync(destination)) renameSync(destination, previous);
     try {
@@ -134,7 +165,17 @@ export async function stageWakeWordModel() {
       if (existsSync(previous) && !existsSync(destination)) renameSync(previous, destination);
       throw error;
     }
+    if (existsSync(fixtures)) renameSync(fixtures, previousFixtures);
+    try {
+      renameSync(fixtureCandidate, fixtures);
+    } catch (error) {
+      if (existsSync(previousFixtures) && !existsSync(fixtures)) {
+        renameSync(previousFixtures, fixtures);
+      }
+      throw error;
+    }
     rmSync(previous, { recursive: true, force: true });
+    rmSync(previousFixtures, { recursive: true, force: true });
     console.log(
       `[stage-wake-word-model] staged ${destination} (${statSync(destination).isDirectory() ? "verified" : "invalid"}, archive sha256 ${digest})`,
     );

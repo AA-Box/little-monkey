@@ -162,3 +162,9 @@ jobs:
             joiner-epoch-12-avg-2-chunk-16-left-64.onnx; do
             grep -F "local-wake-word/$file" "$RUNNER_TEMP/bundle-contents.txt"
           done
+          # The packaged resource is a directory glob, so what does *not* ship is
+          # only true while nothing stages test audio into it.
+          if grep -E "local-wake-word/.*\.wav" "$RUNNER_TEMP/bundle-contents.txt"; then
+            echo "test audio was packaged into the installer" >&2
+            exit 1
+          fi

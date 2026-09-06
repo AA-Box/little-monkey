@@ -72,14 +72,14 @@ fn string_field(request: &Value, name: &str) -> Result<String, String> {
 
 /// One of the two pinned upstream fixtures, handed over as PCM so the
 /// TypeScript side needs no WAV decoder of its own.
+///
+/// Staged beside the model bundle, never inside it — Tauri packages that
+/// directory whole, and test audio has no business in an installer.
 fn fixture(name: &str) -> Result<Value, String> {
     if name.contains('/') || name.contains('\\') || !name.ends_with(".wav") {
         return Err("fixture must be a bare .wav name".to_string());
     }
-    let path = resource_root()
-        .join("local-wake-word")
-        .join("test_wavs")
-        .join(name);
+    let path = resource_root().join("local-wake-word-fixtures").join(name);
     let wave = sherpa_onnx::Wave::read(
         path.to_str()
             .ok_or_else(|| "fixture path is not UTF-8".to_string())?,

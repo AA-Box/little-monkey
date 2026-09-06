@@ -62,12 +62,7 @@
     "resources": [
       "resources/managed-runtime/**/*",
       "resources/local-whisper/**/*",
-      "resources/local-wake-word/README.md",
-      "resources/local-wake-word/bpe.model",
-      "resources/local-wake-word/tokens.txt",
-      "resources/local-wake-word/encoder-epoch-12-avg-2-chunk-16-left-64.onnx",
-      "resources/local-wake-word/decoder-epoch-12-avg-2-chunk-16-left-64.onnx",
-      "resources/local-wake-word/joiner-epoch-12-avg-2-chunk-16-left-64.onnx"
+      "resources/local-wake-word/**/*"
     ],
     "macOS": {
       "files": {

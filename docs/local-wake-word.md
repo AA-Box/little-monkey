@@ -89,11 +89,21 @@ Rust build script.
 
 `scripts/stage-wake-word-model.mjs` authenticates the exact official model
 archive, extracts into a transaction directory, verifies every runtime file
-again, copies only the required runtime files plus two pinned test WAVs, and
-atomically swaps the verified directory into place. Tauri packages only the six
-runtime files, so a production install works offline on first launch. Missing,
-partial, wrong-size, or wrong-digest files report `unavailable`; application
-code never downloads a wake model at runtime.
+again, and atomically swaps two verified directories into place: the six
+runtime files into `src-tauri/resources/local-wake-word/`, and the two pinned
+test WAVs into `src-tauri/resources/local-wake-word-fixtures/`, which nothing
+packages. Tauri bundles the model directory whole
+(`resources/local-wake-word/**/*`), so "the installer carries no test audio" is
+a property of what that directory contains rather than a list of six filenames
+somebody has to keep in step with the model. A production install works offline
+on first launch. Missing, partial, wrong-size, or wrong-digest files report
+`unavailable`; application code never downloads a wake model at runtime.
+
+That directory also carries one tracked file, `PLACEHOLDER.md`, which staging
+never overwrites. `tauri-build` resolves packaged resource paths at compile
+time, so a directory that matches nothing fails every `cargo build` in a fresh
+checkout — including `cargo test`, before a single test runs. The same
+arrangement already exists for the bundled Whisper model.
 
 The sherpa-onnx code/runtime is Apache-2.0. The upstream 1.x static archive also
 contains optional Piper/eSpeak libraries that KWS does not use; the vendored
