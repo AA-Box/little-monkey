@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="content-security-policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'" />
+    <title>Little Monkey chat</title>
+    <link rel="stylesheet" href="/webchat/ui/webchat.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Little Monkey</h1>
+      <p id="status" role="status">Starting…</p>
+      <div id="transcript" aria-live="polite" aria-label="Conversation"></div>
+      <form id="composer">
+        <label class="sr-only" for="text">Message</label>
+        <textarea id="text" name="text" required maxlength="4000" placeholder="Write a message"></textarea>
+        <button type="submit">Send</button>
+      </form>
+    </main>
+    <script type="module" src="/webchat/ui/webchat.js"></script>
+  </body>
+</html>

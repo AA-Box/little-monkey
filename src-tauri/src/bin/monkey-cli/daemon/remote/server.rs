@@ -213,7 +213,7 @@ async fn serve_bound(
                     .accept(stream)
                     .await
                     .map_err(|error| format!("TLS handshake from {peer} failed: {error}"))?;
-                serve_upgradable(TokioIo::new(tls), api).await
+                serve_upgradable(TokioIo::new(tls), api, Some(peer)).await
             }
             .await;
             if let Err(error) = result {
@@ -232,7 +232,15 @@ async fn serve_bound(
 /// invisible to every test that does not open a real WebSocket — so the test
 /// that does opens it through *this* function, and a future edit that drops the
 /// call takes the end-to-end Talk test down with it.
-pub(super) async fn serve_upgradable<I>(io: I, api: RemoteApi) -> Result<(), String>
+/// `peer` is the accepted socket's own address, and the only thing on this
+/// listener that can tell a loopback client from a remote one: the web chat
+/// routes are unauthenticated, so they are the one branch that needs it.
+/// `None` is an in-process caller with no socket behind it.
+pub(super) async fn serve_upgradable<I>(
+    io: I,
+    api: RemoteApi,
+    peer: Option<std::net::SocketAddr>,
+) -> Result<(), String>
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
@@ -240,7 +248,7 @@ where
         .keep_alive(true)
         .serve_connection(
             io,
-            service_fn(move |request| handle_http(api.clone(), request)),
+            service_fn(move |request| handle_http(api.clone(), request, peer)),
         )
         .with_upgrades()
         .await
@@ -250,6 +258,7 @@ where
 pub(super) async fn handle_http(
     api: RemoteApi,
     mut request: Request<Incoming>,
+    peer: Option<std::net::SocketAddr>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let method = request.method().as_str().to_ascii_uppercase();
     let path_and_query = request
@@ -259,6 +268,44 @@ pub(super) async fn handle_http(
         .unwrap_or_else(|| "/".to_string());
     if let Some(response) = super::web::asset(&method, &path_and_query) {
         return Ok(to_http(response));
+    }
+    // The served web chat page and its three JSON routes. Placed before the
+    // signed dispatch because nothing here is signed: this surface's whole
+    // authentication is that the request reached *this* listener carrying a
+    // visitor identifier the daemon itself minted. Only the routes
+    // `webchat::target` recognises are taken, so nothing else changes shape.
+    if let Some(route) = super::webchat::target(&method, &path_and_query) {
+        let visitor = request
+            .headers()
+            .get("x-webchat-visitor")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        // The one header a cross-site form cannot set, so the route that
+        // writes can insist on it. Not authentication: see `webchat::handle`.
+        let content_type = request
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        // Its own, much smaller cap: one browser message is a few lines of
+        // text, not a device report.
+        let body = match Limited::new(request.into_body(), super::webchat::MAX_BODY_BYTES)
+            .collect()
+            .await
+        {
+            Ok(value) => value.to_bytes().to_vec(),
+            Err(_) => return Ok(to_http(ApiResponse::error(413, "Request body is too large"))),
+        };
+        return Ok(super::webchat::handle(
+            api.paths(),
+            route,
+            peer,
+            visitor,
+            content_type,
+            body,
+            now_ms() as i64,
+        )
+        .await);
     }
     // Checked before the body is collected, because there is no body: this is
     // the one route on the plane that becomes a socket instead of answering.
