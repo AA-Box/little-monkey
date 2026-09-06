@@ -20,6 +20,14 @@ covered by the included upstream Apache-2.0 license. Little Monkey changes only
   excluding it only moved the failure from the licence audit to the linker.
   macOS tolerated the undefined symbols; `lld` on Linux does not.
 
+  `piper_phonemize` and `espeak-ng` stay excluded — eSpeak NG is GPL-3.0 and
+  this is an MIT binary — but their symbols are still demanded, because the
+  Rust bindings declare externs across the whole C API and that pulls the
+  text-to-speech objects in. `src/little_monkey_tts_stubs.cc` defines the two
+  the linker asks for and aborts if either is ever called, which keeps the
+  licence boundary without pretending the dependency is not there. Delete it
+  when the exclusion goes away.
+
 The Rust API crate remains the exact upstream 1.13.3 release. Keep this patch
 until upstream provides equivalent authenticated staging and the Apple SME
 regression in later releases has been verified fixed.

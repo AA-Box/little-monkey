@@ -7390,6 +7390,7 @@ name = "sherpa-onnx-sys"
 version = "1.13.3"
 dependencies = [
  "bzip2",
+ "cc",
  "sha2",
  "tar",
  "ureq",

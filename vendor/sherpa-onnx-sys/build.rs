@@ -348,10 +348,25 @@ fn emit_shared_link_directives() {
     println!("cargo:rustc-link-lib=dylib=onnxruntime");
 }
 
+/// The text-to-speech symbols this build answers for rather than links.
+///
+/// Emitted after the sherpa archives on purpose: a Unix linker resolves an
+/// archive's undefined symbols from what follows it, so a stub placed first
+/// satisfies nothing.
+fn emit_tts_stub_directives() {
+    let stubs = Path::new("src").join("little_monkey_tts_stubs.cc");
+    println!("cargo:rerun-if-changed={}", stubs.display());
+    cc::Build::new()
+        .cpp(true)
+        .file(&stubs)
+        .compile("little_monkey_tts_stubs");
+}
+
 fn emit_static_link_directives(target_os: &str) {
     for lib in SHERPA_ONNX_STATIC_LIBS {
         println!("cargo:rustc-link-lib=static={lib}");
     }
+    emit_tts_stub_directives();
 
     match target_os {
         "linux" => {
