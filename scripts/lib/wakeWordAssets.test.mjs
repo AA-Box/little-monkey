@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import test from "node:test";
 
@@ -18,6 +17,21 @@ import {
   RUNTIME_VERSION,
   verifyRuntimeArchive,
 } from "../stage-sherpa-runtime.mjs";
+
+/**
+ * Scratch space inside the repository's own ignored cache, not the operating
+ * system's temp directory.
+ *
+ * `mkdtemp` under `/tmp` is safe in itself, but everything written beneath it
+ * still lands in a world-writable directory, which is what a scanner sees and
+ * what an attacker on a shared build host would go looking for. A fixture that
+ * exists for the length of one assertion has no reason to be there at all.
+ */
+function scratchDirectory(prefix) {
+  const cache = join(process.cwd(), "node_modules", ".cache");
+  mkdirSync(cache, { recursive: true });
+  return mkdtempSync(join(cache, prefix));
+}
 
 test("wake assets pin one runtime for all six desktop targets", () => {
   assert.equal(RUNTIME_VERSION, "1.13.3");
@@ -59,10 +73,7 @@ test("model manifest is exact and rejects a partial directory", () => {
   // Keyed by their path inside the archive; staged flat, outside the bundle.
   assert.deepEqual(Object.keys(FIXTURE_FILES).sort(), ["test_wavs/0.wav", "test_wavs/1.wav"]);
   assert.deepEqual(Object.keys(fixtureManifestByBasename()).sort(), ["0.wav", "1.wav"]);
-  // `mkdtemp`, not a name built from the pid and the clock: the os temp dir is
-  // shared and writable, so a predictable path is one another process can win
-  // the race for.
-  const directory = mkdtempSync(join(tmpdir(), "little-monkey-kws-assets-"));
+  const directory = scratchDirectory("little-monkey-kws-assets-");
   try {
     writeFileSync(join(directory, "tokens.txt"), "partial");
     assert.equal(verifyModelDirectory(directory), false);
@@ -103,7 +114,7 @@ test("a fresh checkout can still resolve the packaged glob", () => {
 });
 
 test("runtime verification rejects an archive with the right size but wrong digest", () => {
-  const directory = mkdtempSync(join(tmpdir(), "little-monkey-kws-runtime-"));
+  const directory = scratchDirectory("little-monkey-kws-runtime-");
   const archive = join(directory, "runtime.tar.bz2");
   try {
     writeFileSync(archive, Buffer.alloc(32));
