@@ -74,6 +74,13 @@ monkey profiles current [--json]
 monkey stacks list | reindex <name>
 monkey stacks embed-server start --model-path <embedding.gguf> | status | stop
 
+monkey memory list [--all]
+monkey memory pin <id> | unpin <id>
+monkey memory expire <id> --at <YYYY-MM-DD|RFC3339> | expire <id> --clear
+monkey memory merge <id> <id> [<id> ...] [--text "the combined memory"]
+monkey memory unmerge <id>
+monkey memory purge
+
 monkey task list | validate <recipe-file>
 monkey task run <name-or-path> [--param key=value ...] [--json]
 monkey task schedule <name-or-path> --cron "<expr>"
