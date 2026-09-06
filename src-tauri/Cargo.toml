@@ -213,6 +213,30 @@ tokio-tungstenite = { version = "0.28.0", default-features = false, features = [
 # 0.26.11, the exact version already resolved by `tokio-tungstenite`'s own
 # `rustls-tls-webpki-roots` feature above, so this adds no new resolution.
 webpki-roots = "0.26"
+# daemon/adapters/email.rs: the operator's own mailbox, over IMAP in and SMTP
+# out. All three are pure parsing and protocol crates with no TLS of their own —
+# the socket handed to them is the `tokio_rustls` client stream irc.rs already
+# proves out, so no second TLS stack resolves.
+#
+# `async-imap` reads IMAP responses: literals (`{1234}`), continuation lines
+# and untagged replies interleaved with tagged ones are exactly where a
+# hand-rolled reader silently truncates somebody's mail. Pinned to the tokio
+# runtime rather than its default `async-std`, so the daemon keeps one
+# executor.
+async-imap = { version = "0.11.3", default-features = false, features = ["runtime-tokio"] }
+# `mail-parser` decodes inbound RFC 5322/2045: typed `Message-ID`/`In-Reply-To`
+# /`References` (which is what the reply-threading contract is written
+# against), RFC 2047 encoded words, quoted-printable and base64 transfer
+# encodings, nested multiparts and per-part decoded sizes. `full_encoding` is
+# on because without it a Latin-1, Shift-JIS or GB2312 subject decodes to
+# mojibake rather than text; it pulls `encoding_rs`, which `reqwest` already
+# locks in this workspace, so nothing new resolves.
+mail-parser = { version = "0.11.8", default-features = false, features = ["full_encoding"] }
+# `mail-builder` writes the outbound side of the same RFCs. Default features
+# off on purpose: the only one is `gethostname`, which would put this machine's
+# hostname into a generated Message-ID; the adapter mints its own from the
+# account's `from_address` domain instead.
+mail-builder = { version = "0.5.0", default-features = false }
 # knowledge_adapters.rs: bounded, inert Office Open XML extraction. These are
 # already locked transitively in this workspace; making them direct lets the
 # app decode ZIP/Deflate containers and stream XML without executing macros,
