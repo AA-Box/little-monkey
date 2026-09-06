@@ -238,7 +238,7 @@ Boundaries in full: **[docs/security.md](docs/security.md)**. Vulnerabilities go
 | Build and publish an extension | [Extension development](docs/extension-development.md) |
 | Speak to it with local transcription | [Zero-config local Whisper](docs/zero-config-local-whisper.md) |
 | Arm a wake word that keeps passive audio on this machine | [Local wake-word detection](docs/local-wake-word.md) |
-| Connect remote MCP over OAuth | [BYO OAuth clients](docs/byo-oauth-clients.md) |
+| Connect remote MCP servers and work accounts over OAuth | [BYO OAuth clients](docs/byo-oauth-clients.md) |
 | Use a paired phone's camera, mic or location | [Paired devices](docs/paired-devices.md) |
 | Reach an agent by message, phone, device or peer | [Messaging, devices and phones](docs/messaging-devices-and-phones.md) |
 | Check the conformance suite | [Conformance suite](docs/conformance-suite.md) |

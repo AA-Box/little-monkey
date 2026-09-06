@@ -2074,7 +2074,26 @@ impl DaemonStore {
         else {
             return Ok(Vec::new());
         };
+        self.messages_in_conversation(&account_id, &conversation_id, thread_id.as_deref(), limit)
+    }
 
+    /// The same transcript, for a caller that already knows which conversation
+    /// it may read.
+    ///
+    /// Split out of [`Self::channel_conversation_messages`] rather than copied:
+    /// the served web chat page reads one visitor's own conversation by its
+    /// hashed id, which is not a Talk session key, and a second projection of
+    /// the same two tables would be a second thing to keep correct.
+    pub fn messages_in_conversation(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        thread_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<ChannelConversationMessage>, String> {
+        let account_id = account_id.to_string();
+        let conversation_id = conversation_id.to_string();
+        let thread_id = thread_id.map(str::to_string);
         let bound = i64::from(limit.clamp(1, 2_000));
         let mut messages = Vec::new();
 

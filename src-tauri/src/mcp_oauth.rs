@@ -953,6 +953,30 @@ impl LoopbackListener {
         }
     }
 
+    /// Binds a caller-chosen loopback port with a caller-chosen redirect
+    /// host, always requiring that exact port.
+    ///
+    /// `connector_oauth.rs` needs this because its port is derived from the
+    /// *provider* (stable, and registered with the provider once) rather than
+    /// from an MCP server id, and a provider that was handed one redirect URI
+    /// rejects any other — so there is never an ephemeral fallback to offer.
+    ///
+    /// Always `127.0.0.1` specifically (never `0.0.0.0`/`::`): this listener
+    /// must only ever be reachable from the same machine's browser.
+    pub(crate) async fn bind_port(port: u16, redirect_host: &str) -> Result<Self, String> {
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.map_err(|e| {
+            format!(
+                "Could not bind the registered OAuth callback port {port}: {e}. \
+                 Close the process using that port, then retry — this provider \
+                 may reject a callback on any other port."
+            )
+        })?;
+        Ok(Self {
+            listener,
+            redirect_uri: format!("http://{redirect_host}:{port}/"),
+        })
+    }
+
     /// Binds to an OS-assigned ephemeral port on `127.0.0.1` specifically
     /// (never `0.0.0.0`/`::`) — this listener must only ever be reachable
     /// from the same machine's browser, not the network.
@@ -1160,7 +1184,7 @@ async fn resolve_http_base_url(app: &tauri::AppHandle, server_id: &str) -> Resul
     }
 }
 
-async fn cancellable_oauth_step<T>(
+pub(crate) async fn cancellable_oauth_step<T>(
     cancel: &CancellationToken,
     future: impl std::future::Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
@@ -1394,7 +1418,7 @@ fn complete_oauth_exchange<T>(
 /// Returns the sticky, shared cancellation token for every overlapping OAuth
 /// connect attempt for one server id. Unlike `Notify`, cancellation is retained
 /// if it happens immediately before a caller starts awaiting it.
-fn oauth_cancel_token_for(
+pub(crate) fn oauth_cancel_token_for(
     state: &AppState,
     server_id: &str,
 ) -> Result<std::sync::Arc<CancellationToken>, String> {
@@ -1414,7 +1438,7 @@ fn oauth_cancel_token_for(
 /// Removes a server id's shared token only after the final overlapping connect
 /// call has finished. A later, genuinely new attempt therefore receives a
 /// fresh non-cancelled token.
-fn release_oauth_cancel_token(state: &AppState, server_id: &str) {
+pub(crate) fn release_oauth_cancel_token(state: &AppState, server_id: &str) {
     if let Ok(mut guard) = state.mcp_oauth_cancel.lock() {
         if let std::collections::hash_map::Entry::Occupied(mut entry) =
             guard.entry(server_id.to_string())
@@ -1965,6 +1989,38 @@ mod tests {
         let server_id = "port-fallback-probe";
         let base_url = "https://mcp.example.com/mcp";
         let expected = preferred_redirect_uri(server_id, base_url);
+        let preferred_port = loopback_port_for(server_id);
+
+        // Probe the deterministic port before asserting that `bind_for` gets
+        // it, because a host where it is unbindable is an environment this
+        // assertion cannot run in rather than a defect. Windows reserves large
+        // blocks *inside* the IANA dynamic range the port is derived from
+        // (`netsh int ipv4 show excludedportrange tcp`, typically claimed by
+        // Hyper-V/WinNAT), and against a reserved port the listener falling
+        // back to an ephemeral one is exactly the documented behaviour. Without
+        // this probe such a runner failed the assertion below and reported a
+        // bug that was not there — see this test's own git history for the
+        // `windows-latest` flake that passed on a rerun of the same commit.
+        let preferred_is_bindable = match TcpListener::bind(("127.0.0.1", preferred_port)).await {
+            // Release it immediately: `bind_for` has to be the call that takes
+            // the port, or the assertion proves nothing about it.
+            Ok(probe) => {
+                drop(probe);
+                true
+            }
+            // Not a silent pass: name the port and the range to inspect, so a
+            // leg that ran fewer assertions says so in its log.
+            Err(error) => {
+                eprintln!(
+                    "SKIPPED (the preferred-port assertion only): 127.0.0.1:{preferred_port} \
+                     cannot be bound on this host ({error}) — it is either already in use or \
+                     inside a reserved port range; on Windows, check \
+                     `netsh int ipv4 show excludedportrange tcp`. The ephemeral-fallback and \
+                     RequirePreferred assertions below still run."
+                );
+                false
+            }
+        };
 
         let listener = LoopbackListener::bind_for(
             server_id,
@@ -1973,7 +2029,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(listener.redirect_uri, expected);
+        if preferred_is_bindable {
+            assert_eq!(listener.redirect_uri, expected);
+        }
 
         // CIMD/DCR learns the URI used for this attempt, so falling back is
         // safe when no manual registration exists.

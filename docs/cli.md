@@ -74,6 +74,13 @@ monkey profiles current [--json]
 monkey stacks list | reindex <name>
 monkey stacks embed-server start --model-path <embedding.gguf> | status | stop
 
+monkey memory list [--all]
+monkey memory pin <id> | unpin <id>
+monkey memory expire <id> --at <YYYY-MM-DD|RFC3339> | expire <id> --clear
+monkey memory merge <id> <id> [<id> ...] [--text "the combined memory"]
+monkey memory unmerge <id>
+monkey memory purge
+
 monkey task list | validate <recipe-file>
 monkey task run <name-or-path> [--param key=value ...] [--json]
 monkey task schedule <name-or-path> --cron "<expr>"
@@ -123,6 +130,11 @@ monkey extensions sign <file.lmx> --private-key <pem> --trust-root-id <id> --key
 monkey extensions publish <dir> --snapshot <index.json> --registry-root <dir> --publisher-private-key <pem> --trust-root-id <id> --key-id <id> --registry-private-key <pem>
 
 monkey providers set-key <id>    # key arrives on stdin, never in a process listing
+
+monkey connectors list [--json]           # id, provider, label, identity, last verification
+monkey connectors reverify <id> [--json]  # re-runs the live check; refreshes an OAuth token first
+monkey connectors remove <id>             # best-effort revoke where the provider publishes an endpoint, then deletes
+# Connecting a new OAuth account is desktop-only: consent opens a system browser.
 
 monkey plugins list [--json]
 monkey plugins health [--json]

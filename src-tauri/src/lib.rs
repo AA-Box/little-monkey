@@ -217,6 +217,7 @@ pub mod hosted_oauth;
 // connections, verified live before saving, secrets in the OS keychain only.
 // AppHandle-free core (bar the `AppState` config lock), same *_impl split as
 // `mcp`/`providers` above.
+pub mod connector_oauth;
 pub mod connectors;
 // Inbox Triage Agents (ROADMAP.md, Phase 3): read-only ranking/summarization
 // of GitHub/Slack/Jira work queues built on the Connector Catalog above, plus
@@ -661,7 +662,15 @@ pub struct AppState {
     /// `call_tool`/`connect`/`disconnect` await.
     pub mcp: tokio::sync::Mutex<std::collections::HashMap<String, mcp::McpConnection>>,
     /// Per-server cancellation signal for an in-flight `mcp_oauth_connect`
-    /// (see `mcp_oauth.rs`) — keyed by server id. `mcp_oauth_cancel` calls the
+    /// (see `mcp_oauth.rs`) — keyed by MCP server id, or by
+    /// `connector:<provider>` for `connector_oauth.rs`'s catalog flow. The two
+    /// namespaces cannot collide (an MCP server id containing a `:` is
+    /// rejected by `mcp::validate_id`), so sharing the map is just reusing the
+    /// "one token per in-flight flow" bookkeeping rather than standing up a
+    /// second identical map — the same note `mcp_oauth_refresh_locks`
+    /// carries.
+    ///
+    /// `mcp_oauth_cancel` calls the
     /// shared `CancellationToken`'s `cancel()` method; every overlapping
     /// connect races against `cancelled()`. Cancellation is sticky, so a
     /// cancel arriving immediately before the waiter is polled cannot be lost
@@ -676,7 +685,8 @@ pub struct AppState {
         >,
     >,
     /// Per-server async lock serializing OAuth access-token retrieval/refresh
-    /// (see `mcp_oauth::get_access_token_if_connected`) — keyed by server id.
+    /// (see `mcp_oauth::get_access_token_if_connected`) — keyed by server id,
+    /// or by `connector:<account id>` for `connector_oauth::access_token`.
     /// `connect_impl`'s `Http` branch calls that function on every
     /// `mcp_connect`, and nothing else serializes concurrent connects for the
     /// same server id; without this, two overlapping connects (e.g. a
@@ -1365,6 +1375,9 @@ pub fn run() {
             connectors::connectors_remove,
             connectors::connectors_reverify,
             connectors::connectors_export_audit,
+            connector_oauth::connectors_oauth_redirect_uri,
+            connector_oauth::connectors_oauth_connect,
+            connector_oauth::connectors_oauth_cancel,
             triage::triage_refresh,
             triage::triage_list,
             triage::triage_generate_draft,
@@ -1467,6 +1480,12 @@ pub fn run() {
             memory::memory_studio_set_enabled,
             memory::memory_studio_delete,
             memory::memory_import,
+            memory::memory_studio_set_pinned,
+            memory::memory_studio_set_expiry,
+            memory::memory_studio_merge,
+            memory::memory_studio_unmerge,
+            memory::memory_studio_purge_expired,
+            memory::memory_mark_used,
             sessions::sessions_load,
             sessions::sessions_save,
             profiles::profiles_list,

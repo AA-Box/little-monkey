@@ -550,6 +550,9 @@ fn real_external_irc_round_trip(
     tcp.set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|error| format!("set IRC write timeout: {error}"))?;
 
+    // Both `ring` and `aws-lc-rs` are compiled in, so rustls will not pick
+    // one and `ClientConfig::builder()` would panic without this.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
