@@ -1,18 +1,30 @@
-//! Real IRC -> installed resident daemon -> agent -> real IRC acceptance.
+//! A real browser exchange -> installed resident daemon -> agent -> a real
+//! reply read back off the page.
 //!
-//! This is deliberately a black-box harness. It configures Little Monkey only
-//! through `monkey-cli`, installs the real user service, connects a second IRC
-//! client over TLS, and proves that the message that client sends becomes a
-//! durable turn and an agent-produced reply that the second client receives.
+//! This is deliberately a black-box harness, and it is the one of the three
+//! newest channels that needs **nothing of the operator's**: no account, no
+//! network, no hardware. Little Monkey is configured only through `monkey-cli`,
+//! the real user service is installed, and the visitor is an ordinary HTTPS
+//! client pinned to the daemon's own self-signed loopback certificate — which
+//! `openssl` mints here exactly as `daemon/peer_live.rs` mints one.
 //!
 //! The only deterministic component is the OpenAI-compatible model origin. It
 //! is the same `target.local_url` seam a real recipe uses; it cannot write the
-//! outbox or speak IRC. The reply exists only if the installed daemon queues a
-//! real run and the production agent dispatches `send_message`.
+//! outbox and it cannot answer an HTTP request on the chat page. The reply
+//! exists only if the installed daemon queued a real run and the production
+//! agent dispatched `send_message`.
 //!
-//! This harness intentionally needs a real, TLS IRC network chosen by the
-//! operator. The accompanying workflow compiles it on every PR but only runs
-//! the network acceptance on `workflow_dispatch`.
+//! What it proves, in order: an unknown visitor's first message is answered
+//! with a **pairing code** and nothing runs; the operator approving that sender
+//! through the CLI is what changes the answer; and the second message becomes a
+//! durable turn whose agent-produced reply the same visitor reads back — and
+//! which a *second* visitor of the same account cannot.
+//!
+//! What it does not prove is a browser on another machine reaching a
+//! non-loopback bind with a certificate it trusts. That needs a certificate
+//! authority and a network the operator owns, and stays theirs to verify — and
+//! the account's `public` flag, without which a peer that is not loopback is
+//! answered `404` whatever the listener is bound to.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -22,12 +34,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROFILE_ENV: &str = "LITTLE_MONKEY_PROFILE";
-const REQUIRE_ENV: &str = "LITTLE_MONKEY_REQUIRE_IRC_INSTALLED_SERVICE_E2E";
-const RECIPE: &str = "irc-installed-service-e2e";
-const REPLY_PREFIX: &str = "little-monkey irc installed-service reply";
+const REQUIRE_ENV: &str = "LITTLE_MONKEY_REQUIRE_WEBCHAT_INSTALLED_SERVICE_E2E";
+const RECIPE: &str = "webchat-installed-service-e2e";
+const REPLY_PREFIX: &str = "little-monkey webchat installed-service reply";
 const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
 const SERVICE_WAIT: Duration = Duration::from_secs(120);
-const IRC_WAIT: Duration = Duration::from_secs(240);
+const PAGE_WAIT: Duration = Duration::from_secs(240);
+const VISITOR_HEADER: &str = "x-webchat-visitor";
 
 fn target_dir() -> PathBuf {
     std::env::var_os("CARGO_TARGET_DIR")
@@ -48,6 +61,13 @@ fn unique() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn output_text(output: &Output) -> String {
@@ -128,7 +148,7 @@ fn require_cli(profile: Option<&str>, args: &[&str]) -> Result<Output, String> {
 }
 
 fn create_profile() -> Result<String, String> {
-    let name = format!("IRC installed-service E2E {}", unique());
+    let name = format!("WebChat installed-service E2E {}", unique());
     let output = require_cli(None, &["profiles", "create", &name, "--json"])?;
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
         format!(
@@ -148,27 +168,11 @@ fn create_profile() -> Result<String, String> {
         })
 }
 
-fn add_irc_account(
-    profile: &str,
-    server: &str,
-    port: u16,
-    nick: &str,
-    channel: &str,
-) -> Result<String, String> {
-    let label = format!("irc-e2e-{}", unique());
-    let config = serde_json::json!({
-        "server": server,
-        "port": port,
-        "nick": nick,
-        "channels": [channel],
-        "use_sasl": false,
-    })
-    .to_string();
+fn add_webchat_account(profile: &str) -> Result<String, String> {
+    let label = format!("webchat-e2e-{}", unique());
     let output = require_cli(
         Some(profile),
-        &[
-            "channels", "add", "irc", &label, "--config", &config, "--json",
-        ],
+        &["channels", "add", "webchat", &label, "--json"],
     )?;
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
         format!(
@@ -186,6 +190,56 @@ fn add_irc_account(
                 String::from_utf8_lossy(&output.stdout)
             )
         })
+}
+
+/// A self-signed loopback certificate, minted by the `openssl` CLI exactly as
+/// `daemon/peer_live.rs` mints one. `None` means openssl is absent, which is a
+/// skip rather than a failure.
+fn self_signed_certificate(directory: &Path) -> Option<(PathBuf, PathBuf)> {
+    let certificate = directory.join("cert.pem");
+    let key = directory.join("key.pem");
+    let output = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=127.0.0.1",
+            "-addext",
+            "subjectAltName=IP:127.0.0.1",
+            // Deliberately not a CA: rustls refuses a certificate marked as one
+            // when it is presented as the end entity, which is exactly what a
+            // self-signed host certificate is.
+            "-addext",
+            "basicConstraints=critical,CA:FALSE",
+            "-keyout",
+        ])
+        .arg(&key)
+        .arg("-out")
+        .arg(&certificate)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        eprintln!(
+            "openssl could not mint a test certificate: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return None;
+    }
+    Some((certificate, key))
+}
+
+fn free_port() -> Result<u16, String> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|error| format!("reserve a port: {error}"))?;
+    listener
+        .local_addr()
+        .map(|address| address.port())
+        .map_err(|error| format!("read the reserved port: {error}"))
 }
 
 struct ModelFixture {
@@ -235,7 +289,7 @@ impl ModelFixture {
                                 "index": 0,
                                 "delta": { "tool_calls": [{
                                     "index": 0,
-                                    "id": "call_irc_installed_1",
+                                    "id": "call_webchat_installed_1",
                                     "type": "function",
                                     "function": {
                                         "name": "send_message",
@@ -372,11 +426,8 @@ fn write_recipe(profile: &str, workspace: &Path, model_base: &str) -> Result<(),
     let recipe = serde_json::json!({
         "version": 1,
         "name": RECIPE,
-        "target": { "local_url": model_base, "model": "irc-e2e-fixture" },
+        "target": { "local_url": model_base, "model": "webchat-e2e-fixture" },
         "workspace": workspace.to_string_lossy(),
-        // Bypass is a real production permission mode. It keeps this acceptance
-        // unattended; the route's frozen reply grant still constrains
-        // send_message to the conversation that caused this run.
         "permission_mode": "auto",
         "prompt": "{{message}}",
         "params": { "message": null },
@@ -391,21 +442,8 @@ fn write_recipe(profile: &str, workspace: &Path, model_base: &str) -> Result<(),
     .map_err(|error| format!("write recipe {}: {error}", path.display()))
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 /// The pid of the installed resident service, once it is running and its
 /// heartbeat is fresh.
-///
-/// Split from the account check below rather than answered together, so the
-/// number this returns is read from `daemon status` and from nothing else. A
-/// pid that came back through a function which had also parsed an account row
-/// is a pid the reader — and code scanning — cannot tell apart from the row
-/// that carries the credential.
 fn wait_for_service_pid(profile: &str, deadline: Instant) -> Result<u64, String> {
     let mut last_status = String::new();
     while Instant::now() < deadline {
@@ -443,19 +481,12 @@ fn wait_for_service_pid(profile: &str, deadline: Instant) -> Result<u64, String>
 
 /// Whether the installed daemon has this account connected **now**.
 ///
-/// `since_ms` is what makes this an answer rather than an echo. Account health
-/// is a stored row, and the daemon that wrote it may be a process that has
-/// since been stopped — so after a restart the row still says `connected` for
-/// as long as it takes the new process to reach the provider and write its own
-/// verdict. A harness that posts the moment it reads that row is posting into a
-/// window where nothing is listening, and a socket provider does not replay
-/// what it delivered to nobody. Requiring `last_probe_at_ms` to be at or after
-/// the moment this wait began is what makes `connected` mean the running
-/// process said so.
-///
-/// Returns nothing on success and a fixed label on failure: the account row is
-/// the one payload here that can carry credential-bearing fields, so no part of
-/// it travels back out to a caller that prints.
+/// `since_ms` is what makes this an answer rather than an echo: account health
+/// is a stored row, and after a restart it still says `connected` until the new
+/// process writes its own verdict. For a served surface that verdict is "there
+/// is a remote host enabled to serve the page on", written by the running
+/// service's own probe — which is exactly the thing this harness needs to be
+/// true before a visitor knocks.
 fn wait_for_account_connected(
     profile: &str,
     account_id: &str,
@@ -490,7 +521,9 @@ fn wait_for_account_connected(
             .and_then(serde_json::Value::as_u64);
         let fresh = last_probe.is_some_and(|probed| probed >= since_ms);
         if fresh && last_health == "error" {
-            return Err("resident daemon could not build/connect the IRC account".to_string());
+            return Err(
+                "resident daemon reports no listener to serve the chat page on".to_string(),
+            );
         }
         if fresh && last_health == "connected" {
             return Ok(());
@@ -498,192 +531,253 @@ fn wait_for_account_connected(
         std::thread::sleep(Duration::from_millis(500));
     }
     Err(format!(
-        "resident service never reported connected IRC health of its own within {}s\nlast account health: {last_health} (last probe {last_probe:?}, waiting for one at or after {since_ms})",
+        "resident service never reported connected web chat health of its own within {}s\nlast account health: {last_health} (last probe {last_probe:?}, waiting for one at or after {since_ms})",
         SERVICE_WAIT.as_secs()
     ))
 }
 
-fn write_irc_line<S: Write>(stream: &mut S, line: &str) -> Result<(), String> {
-    stream
-        .write_all(line.as_bytes())
-        .and_then(|_| stream.write_all(b"\r\n"))
-        .and_then(|_| stream.flush())
-        .map_err(|error| format!("IRC write {line:?}: {error}"))
+/// An HTTPS client pinned to the daemon's own certificate and nothing else —
+/// the same pin a real browser would be asked to make, and the reason a
+/// substituted certificate fails the handshake rather than being noticed later.
+fn pinned_client(certificate: &Path) -> Result<reqwest::Client, String> {
+    let pem = std::fs::read(certificate)
+        .map_err(|error| format!("read {}: {error}", certificate.display()))?;
+    reqwest::Client::builder()
+        .tls_certs_only([reqwest::tls::Certificate::from_pem(&pem)
+            .map_err(|error| format!("parse the test certificate: {error}"))?])
+        .build()
+        .map_err(|error| format!("build the pinned visitor client: {error}"))
 }
 
-fn read_irc_line<S: Read>(stream: &mut S) -> std::io::Result<Option<String>> {
-    let mut bytes = Vec::new();
-    loop {
-        let mut one = [0u8; 1];
-        match stream.read(&mut one) {
-            Ok(0) if bytes.is_empty() => return Ok(None),
-            Ok(0) => break,
-            Ok(_) if one[0] == b'\n' => break,
-            Ok(_) if one[0] != b'\r' => bytes.push(one[0]),
-            Ok(_) => {}
-            Err(error) => return Err(error),
+/// One browser: a visitor identifier the daemon minted, and the two calls the
+/// page makes with it.
+struct Visitor {
+    client: reqwest::Client,
+    base: String,
+    account_id: String,
+    visitor_id: String,
+}
+
+impl Visitor {
+    async fn open(client: &reqwest::Client, base: &str, account_id: &str) -> Result<Self, String> {
+        // The page itself first, exactly as a browser would load it.
+        let page = client
+            .get(format!("{base}/webchat/{account_id}"))
+            .send()
+            .await
+            .map_err(|error| format!("GET the chat page: {error}"))?;
+        if !page.status().is_success() {
+            return Err(format!("the chat page answered {}", page.status()));
         }
+        let policy = page
+            .headers()
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        if !policy.contains("default-src 'none'") || !policy.contains("frame-ancestors 'none'") {
+            return Err(format!(
+                "the chat page was served without its policy: {policy:?}"
+            ));
+        }
+        let html = page
+            .text()
+            .await
+            .map_err(|error| format!("read the chat page: {error}"))?;
+        if !html.contains("/webchat/ui/webchat.js") {
+            return Err("the chat page did not reference its own script".to_string());
+        }
+
+        let session = client
+            .post(format!("{base}/webchat/{account_id}/session"))
+            .send()
+            .await
+            .map_err(|error| format!("POST a session: {error}"))?;
+        if !session.status().is_success() {
+            return Err(format!("the session route answered {}", session.status()));
+        }
+        let payload: serde_json::Value = session
+            .json()
+            .await
+            .map_err(|error| format!("session JSON: {error}"))?;
+        let visitor_id = payload
+            .get("visitor_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("the session route minted no identifier: {payload}"))?
+            .to_string();
+        if visitor_id.len() != 43 {
+            return Err(format!(
+                "a minted identifier has 43 characters: {visitor_id:?}"
+            ));
+        }
+        Ok(Self {
+            client: client.clone(),
+            base: base.to_string(),
+            account_id: account_id.to_string(),
+            visitor_id,
+        })
     }
-    Ok(Some(String::from_utf8_lossy(&bytes).to_string()))
+
+    async fn say(&self, text: &str) -> Result<(), String> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/webchat/{}/messages",
+                self.base, self.account_id
+            ))
+            .json(&serde_json::json!({ "visitor_id": self.visitor_id, "text": text }))
+            .send()
+            .await
+            .map_err(|error| format!("POST a message: {error}"))?;
+        if response.status().as_u16() != 202 {
+            return Err(format!(
+                "the message route answered {} rather than 202",
+                response.status()
+            ));
+        }
+        Ok(())
+    }
+
+    async fn transcript(&self) -> Result<Vec<serde_json::Value>, String> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/webchat/{}/messages",
+                self.base, self.account_id
+            ))
+            .header(VISITOR_HEADER, &self.visitor_id)
+            .send()
+            .await
+            .map_err(|error| format!("GET the transcript: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "the transcript route answered {}",
+                response.status()
+            ));
+        }
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| format!("transcript JSON: {error}"))?;
+        Ok(payload
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Poll until an outbound message contains `needle`, exactly as the page's
+    /// own loop does.
+    async fn wait_for_reply(&self, needle: &str) -> Result<String, String> {
+        let deadline = Instant::now() + PAGE_WAIT;
+        let mut last = String::new();
+        while Instant::now() < deadline {
+            let messages = self.transcript().await?;
+            last = serde_json::Value::Array(messages.clone()).to_string();
+            for message in &messages {
+                if message.get("outbound") == Some(&serde_json::Value::Bool(true)) {
+                    let text = message
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    if text.contains(needle) {
+                        return Ok(text.to_string());
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+        Err(format!(
+            "the page never showed {needle:?} within {}s\nlast transcript: {last}",
+            PAGE_WAIT.as_secs()
+        ))
+    }
 }
 
-fn handle_ping<S: Write>(stream: &mut S, line: &str) -> Result<bool, String> {
-    if let Some(payload) = line.strip_prefix("PING ") {
-        write_irc_line(stream, &format!("PONG {payload}"))?;
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-fn real_external_irc_round_trip(
-    server: &str,
-    port: u16,
-    external_nick: &str,
-    bot_nick: &str,
-    channel: &str,
-    marker: &str,
+/// The sender id waiting for approval on this account, once the pairing
+/// challenge has been recorded. This is the hashed visitor, which is the only
+/// form of it the durable store ever holds.
+fn wait_for_pending_sender(
+    profile: &str,
+    account_id: &str,
+    deadline: Instant,
 ) -> Result<String, String> {
-    let tcp = TcpStream::connect((server, port))
-        .map_err(|error| format!("external IRC TCP connect to {server}:{port}: {error}"))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|error| format!("set IRC read timeout: {error}"))?;
-    tcp.set_write_timeout(Some(Duration::from_secs(10)))
-        .map_err(|error| format!("set IRC write timeout: {error}"))?;
-
-    // Both `ring` and `aws-lc-rs` are compiled in, so rustls will not pick
-    // one and `ClientConfig::builder()` would panic without this.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    let config = Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    );
-    let name = rustls::pki_types::ServerName::try_from(server.to_string())
-        .map_err(|error| format!("invalid IRC TLS server name {server}: {error}"))?;
-    let connection = rustls::ClientConnection::new(config, name)
-        .map_err(|error| format!("build IRC TLS client: {error}"))?;
-    let mut stream = rustls::StreamOwned::new(connection, tcp);
-
-    write_irc_line(&mut stream, &format!("NICK {external_nick}"))?;
-    write_irc_line(
-        &mut stream,
-        &format!("USER {external_nick} 0 * :Little Monkey IRC E2E"),
-    )?;
-
-    let registered_deadline = Instant::now() + Duration::from_secs(60);
-    let mut registered = false;
-    while Instant::now() < registered_deadline {
-        match read_irc_line(&mut stream) {
-            Ok(Some(line)) => {
-                if handle_ping(&mut stream, &line)? {
-                    continue;
-                }
-                if line.contains(" 001 ") {
-                    registered = true;
-                    break;
-                }
-                if line.contains(" 433 ") {
-                    return Err(format!(
-                        "external IRC nick {external_nick} is already in use"
-                    ));
-                }
-            }
-            Ok(None) => return Err("IRC server closed before registration".to_string()),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(error) => return Err(format!("IRC registration read: {error}")),
-        }
-    }
-    if !registered {
-        return Err("external IRC client did not receive 001 welcome".to_string());
-    }
-
-    write_irc_line(&mut stream, &format!("JOIN {channel}"))?;
-    let join_deadline = Instant::now() + Duration::from_secs(60);
-    let mut saw_bot = false;
-    let mut names_done = false;
-    while Instant::now() < join_deadline {
-        match read_irc_line(&mut stream) {
-            Ok(Some(line)) => {
-                if handle_ping(&mut stream, &line)? {
-                    continue;
-                }
-                if line.contains(" 353 ") && line.contains(channel) {
-                    saw_bot |= line.split_whitespace().any(|word| {
-                        word.trim_start_matches([':', '@', '+', '%', '~', '&']) == bot_nick
-                    });
-                }
-                if line.contains(" 366 ") && line.contains(channel) {
-                    names_done = true;
-                    break;
-                }
-            }
-            Ok(None) => return Err("IRC server closed while joining channel".to_string()),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(error) => return Err(format!("IRC join read: {error}")),
-        }
-    }
-    if !names_done {
-        return Err(format!("IRC channel {channel} never completed NAMES"));
-    }
-    if !saw_bot {
-        return Err(format!(
-            "installed Little Monkey nick {bot_nick} was not present in {channel} before the test message"
-        ));
-    }
-
-    write_irc_line(&mut stream, &format!("PRIVMSG {channel} :{marker}"))?;
-
-    let expected = format!("{REPLY_PREFIX} {marker}");
-    let deadline = Instant::now() + IRC_WAIT;
+    let mut last = String::new();
     while Instant::now() < deadline {
-        match read_irc_line(&mut stream) {
-            Ok(Some(line)) => {
-                if handle_ping(&mut stream, &line)? {
-                    continue;
-                }
-                if line.contains(&format!("PRIVMSG {channel} :")) && line.contains(&expected) {
-                    return Ok(line);
-                }
+        let output = require_cli(
+            Some(profile),
+            &["channels", "senders", account_id, "--json"],
+        )?;
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("senders JSON was invalid: {error}"))?;
+        last = payload.to_string();
+        if let Some(sender) = payload
+            .get("pending")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|pending| pending.first())
+            .and_then(|sender| sender.get("sender_id"))
+            .and_then(serde_json::Value::as_str)
+        {
+            if !sender.starts_with("web-") {
+                return Err(format!(
+                    "a web chat visitor reaches the store hashed, not raw: {sender:?}"
+                ));
             }
-            Ok(None) => return Err("IRC server closed before the agent reply arrived".to_string()),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(error) => return Err(format!("IRC reply read: {error}")),
+            return Ok(sender.to_string());
         }
+        std::thread::sleep(Duration::from_millis(500));
     }
     Err(format!(
-        "external IRC client did not observe {expected:?} within {}s",
-        IRC_WAIT.as_secs()
+        "no visitor was ever waiting for approval\nlast senders: {last}"
     ))
 }
 
-fn assert_durable_events(profile: &str, account_id: &str) -> Result<(), String> {
+fn channel_events(profile: &str, account_id: &str) -> Result<serde_json::Value, String> {
     let output = require_cli(
         Some(profile),
         &["channels", "events", account_id, "--limit", "50", "--json"],
     )?;
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("channel events JSON was invalid: {error}"))?;
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("channel events JSON was invalid: {error}"))
+}
+
+fn direction_count(payload: &serde_json::Value, direction: &str) -> usize {
+    payload
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .map(|events| {
+            events
+                .iter()
+                .filter(|event| {
+                    event.get("direction").and_then(serde_json::Value::as_str) == Some(direction)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// What the durable log holds once the outbox has caught up.
+///
+/// Polled rather than read once, and that is the only concession made here.
+/// The page reads `channel_outbox` — queued rows included, because on this
+/// surface a queued reply is already readable by the visitor — so a reply the
+/// page has shown is not yet a durable *outbound event*: it becomes one when
+/// the daemon's outbox drain sends it, on a tick of its own. Reading the log
+/// the instant the page showed the reply raced that drain and saw the pairing
+/// code and the first-contact notice without it. The counts below stay exact.
+fn assert_durable_events(profile: &str, account_id: &str) -> Result<(), String> {
+    let deadline = Instant::now() + SERVICE_WAIT;
+    let mut payload = channel_events(profile, account_id)?;
+    while direction_count(&payload, "outbound") < 3 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+        payload = channel_events(profile, account_id)?;
+    }
     let events = payload
         .get("events")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| "channel events JSON had no events array".to_string())?;
 
-    let accepted_inbound: Vec<&serde_json::Value> = events
+    let ran: Vec<&serde_json::Value> = events
         .iter()
         .filter(|event| {
             event.get("direction").and_then(serde_json::Value::as_str) == Some("inbound")
@@ -693,27 +787,29 @@ fn assert_durable_events(profile: &str, account_id: &str) -> Result<(), String> 
                 && event.get("job_id").is_some_and(|value| !value.is_null())
         })
         .collect();
-    let outbound = events
-        .iter()
-        .filter(|event| {
-            event.get("direction").and_then(serde_json::Value::as_str) == Some("outbound")
-        })
-        .count();
+    let inbound = direction_count(&payload, "inbound");
+    let outbound = direction_count(&payload, "outbound");
 
-    if accepted_inbound.len() != 1 {
+    // Two inbound messages arrived; exactly one of them earned a run. The
+    // first was answered with a pairing code and must NOT have run — that is
+    // the whole reason an unknown visitor is not an authorized one.
+    if inbound != 2 {
         return Err(format!(
-            "expected exactly one durable accepted inbound event, got {}: {payload}",
-            accepted_inbound.len()
+            "expected two durable inbound events (the challenged one and the approved one), got {inbound}: {payload}"
         ));
     }
-    // Two outbound rows, not one: the daemon greets a person's first message
-    // with a one-time notice naming the model, and every harness runs a fresh
-    // profile, so its sender is always a first contact. The count stays exact
-    // on purpose — a third row would be a reply sent twice, which is the bug
-    // this assertion exists to catch.
-    if outbound != 2 {
+    if ran.len() != 1 {
         return Err(format!(
-            "expected exactly two durable outbound events (the first-contact notice and the reply), got {outbound}: {payload}"
+            "expected exactly one inbound event to own a run, got {}: {payload}",
+            ran.len()
+        ));
+    }
+    // Three outbound rows: the pairing code, the one-time first-contact notice
+    // naming the model, and the agent's reply. Exact on purpose — a fourth
+    // would be a reply sent twice.
+    if outbound != 3 {
+        return Err(format!(
+            "expected exactly three durable outbound events (the pairing code, the first-contact notice and the reply), got {outbound}: {payload}"
         ));
     }
     Ok(())
@@ -726,11 +822,13 @@ fn dump_diagnostics(profile: &str, account_id: Option<&str>) {
     if let Ok(output) = run_cli(Some(profile), &["channels", "list", "--json"]) {
         eprintln!("--- channels ---\n{}", output_text(&output));
     }
-    // The question every failure here starts with: did anything arrive at all?
-    // Without this, "no reply within the timeout" cannot be told apart from
-    // "the provider never delivered the message", and the two have nothing in
-    // common to fix.
     if let Some(account_id) = account_id {
+        if let Ok(output) = run_cli(
+            Some(profile),
+            &["channels", "senders", account_id, "--json"],
+        ) {
+            eprintln!("--- senders ---\n{}", output_text(&output));
+        }
         if let Ok(output) = run_cli(
             Some(profile),
             &["channels", "events", account_id, "--limit", "20", "--json"],
@@ -751,10 +849,10 @@ fn cleanup(profile: Option<&str>, account_id: Option<&str>) {
     }
 }
 
-fn run_case(server: &str, port: u16) -> Result<(), String> {
+fn run_case() -> Result<(), String> {
     if std::env::var(REQUIRE_ENV).as_deref() != Ok("1") {
         return Err(format!(
-            "refusing to install a real OS service and contact a real IRC network unless {REQUIRE_ENV}=1"
+            "refusing to install a real OS service unless {REQUIRE_ENV}=1"
         ));
     }
     if cfg!(target_os = "macos") {
@@ -762,14 +860,22 @@ fn run_case(server: &str, port: u16) -> Result<(), String> {
     }
 
     let stamp = unique();
-    let suffix = format!("{:06x}", (stamp as u64) & 0x00ff_ffff);
-    // Eight characters keeps the harness valid even on old networks with a
-    // nine-character NICKLEN.
-    let bot_nick = format!("lmB{suffix}");
-    let external_nick = format!("lmU{suffix}");
-    let channel = format!("#little-monkey-e2e-{stamp:x}");
-    let marker = format!("lm-irc-installed-{stamp:x}");
+    let first_marker = format!("lm-webchat-first-{stamp:x}");
+    let marker = format!("lm-webchat-installed-{stamp:x}");
     let model = ModelFixture::spawn(marker.clone())?;
+
+    let scratch = std::env::temp_dir().join(format!("lm-webchat-e2e-{stamp:x}"));
+    std::fs::create_dir_all(&scratch)
+        .map_err(|error| format!("create scratch {}: {error}", scratch.display()))?;
+    let Some((certificate, key)) = self_signed_certificate(&scratch) else {
+        eprintln!("skipping: the openssl CLI is required to mint a loopback certificate");
+        return Ok(());
+    };
+    let port = free_port()?;
+    let base = format!("https://127.0.0.1:{port}");
+
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|error| format!("build a tokio runtime: {error}"))?;
 
     let mut profile: Option<String> = None;
     let mut account_id: Option<String> = None;
@@ -777,13 +883,32 @@ fn run_case(server: &str, port: u16) -> Result<(), String> {
         let created = create_profile()?;
         profile = Some(created.clone());
 
-        let workspace = std::env::temp_dir().join(format!("lm-irc-e2e-workspace-{stamp:x}"));
+        let workspace = scratch.join("workspace");
         std::fs::create_dir_all(&workspace)
             .map_err(|error| format!("create workspace {}: {error}", workspace.display()))?;
         write_recipe(&created, &workspace, &model.base)?;
 
-        let account = add_irc_account(&created, server, port, &bot_nick, &channel)?;
+        require_cli(
+            Some(&created),
+            &[
+                "daemon",
+                "remote",
+                "host-configure",
+                "--listen",
+                &format!("127.0.0.1:{port}"),
+                "--advertise-url",
+                &base,
+                "--tls-certificate",
+                &certificate.to_string_lossy(),
+                "--tls-private-key",
+                &key.to_string_lossy(),
+            ],
+        )?;
+
+        let account = add_webchat_account(&created)?;
         account_id = Some(account.clone());
+        // Pairing, not open: the point of this harness is that an unknown
+        // visitor is challenged and an approved one is answered.
         require_cli(
             Some(&created),
             &[
@@ -791,9 +916,9 @@ fn run_case(server: &str, port: u16) -> Result<(), String> {
                 "policy",
                 &account,
                 "--direct",
-                "open",
+                "pairing",
                 "--group",
-                "open",
+                "pairing",
                 "--activation",
                 "always",
             ],
@@ -823,9 +948,8 @@ fn run_case(server: &str, port: u16) -> Result<(), String> {
         let first_pid = wait_for_service_pid(&created, deadline)?;
         wait_for_account_connected(&created, &account, waiting_since_ms, deadline)?;
 
-        // Prove the persistent socket is owned by a real resident lifecycle,
-        // not merely by the process that configured it: stop/start and require
-        // the service to reconnect before the external sender enters.
+        // Prove the listener belongs to a real resident lifecycle rather than
+        // to the process that configured it.
         require_cli(Some(&created), &["daemon", "stop"])?;
         require_cli(Some(&created), &["daemon", "start"])?;
         let waiting_since_ms = now_ms();
@@ -836,23 +960,54 @@ fn run_case(server: &str, port: u16) -> Result<(), String> {
             return Err("restarted daemon pid is the acceptance harness pid".to_string());
         }
         eprintln!(
-            "installed IRC daemon ready (initial pid {first_pid}, after restart {restarted_pid})"
+            "installed web chat daemon ready (initial pid {first_pid}, after restart {restarted_pid})"
         );
 
-        let observed = real_external_irc_round_trip(
-            server,
-            port,
-            &external_nick,
-            &bot_nick,
-            &channel,
-            &marker,
-        )?;
-        eprintln!("external IRC client observed: {observed}");
+        let client = pinned_client(&certificate)?;
+        let visitor = runtime.block_on(Visitor::open(&client, &base, &account))?;
+
+        // 1. An unknown visitor is answered with a pairing code, and nothing
+        //    runs.
+        runtime.block_on(visitor.say(&first_marker))?;
+        let challenge = runtime.block_on(visitor.wait_for_reply("code"))?;
+        eprintln!("the page showed the pairing challenge: {challenge}");
+        if model
+            .requests()
+            .iter()
+            .any(|request| request.contains(&first_marker))
+        {
+            return Err(
+                "an unapproved visitor's message reached the model; pairing decided nothing"
+                    .to_string(),
+            );
+        }
+
+        // 2. The operator approves that sender through the CLI, exactly as on
+        //    any other provider.
+        let sender = wait_for_pending_sender(&created, &account, Instant::now() + SERVICE_WAIT)?;
+        require_cli(Some(&created), &["channels", "approve", &account, &sender])?;
+
+        // 3. Now the same visitor gets a real agent reply.
+        runtime.block_on(visitor.say(&marker))?;
+        let observed = runtime.block_on(visitor.wait_for_reply(REPLY_PREFIX))?;
+        eprintln!("the page showed the agent reply: {observed}");
+        if !observed.contains(&marker) {
+            return Err(format!("the reply did not carry the marker: {observed}"));
+        }
+
+        // 4. A second visitor of the same account reads none of it.
+        let stranger = runtime.block_on(Visitor::open(&client, &base, &account))?;
+        let theirs = runtime.block_on(stranger.transcript())?;
+        if !theirs.is_empty() {
+            return Err(format!(
+                "a second visitor read somebody else's conversation: {theirs:?}"
+            ));
+        }
 
         let requests = model.requests();
         if !requests.iter().any(|request| request.contains(&marker)) {
             return Err(format!(
-                "the installed agent never sent the real IRC message to the model: {requests:?}"
+                "the installed agent never sent the real page message to the model: {requests:?}"
             ));
         }
         if !requests
@@ -877,29 +1032,13 @@ fn run_case(server: &str, port: u16) -> Result<(), String> {
         }
     }
     cleanup(profile.as_deref(), account_id.as_deref());
+    let _ = std::fs::remove_dir_all(&scratch);
     result
 }
 
-fn real_main() -> Result<(), String> {
-    let mut args = std::env::args().skip(1);
-    let server = args
-        .next()
-        .ok_or_else(|| "usage: irc_installed_service_e2e <tls-server> [port]".to_string())?;
-    let port = args
-        .next()
-        .map(|value| {
-            value
-                .parse::<u16>()
-                .map_err(|error| format!("invalid IRC port {value:?}: {error}"))
-        })
-        .transpose()?
-        .unwrap_or(6697);
-    run_case(&server, port)
-}
-
 fn main() {
-    if let Err(error) = real_main() {
-        eprintln!("IRC installed-service E2E failed: {error}");
+    if let Err(error) = run_case() {
+        eprintln!("WebChat installed-service E2E failed: {error}");
         std::process::exit(1);
     }
 }

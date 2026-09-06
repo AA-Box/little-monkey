@@ -17,6 +17,7 @@ pub(crate) mod talk_socket;
 pub(crate) mod voice;
 pub(crate) mod watch;
 mod web;
+pub(crate) mod webchat;
 
 /// The bound-listener entry point the opt-in peer live-validation test serves
 /// through. Test-only so the module itself stays private.

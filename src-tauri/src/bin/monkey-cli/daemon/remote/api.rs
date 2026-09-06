@@ -321,6 +321,12 @@ impl Clone for RemoteApi {
 }
 
 impl RemoteApi {
+    /// Where this daemon keeps its state. Read by the served web chat routes,
+    /// which open the daemon store rather than this API's own.
+    pub(crate) fn paths(&self) -> &DaemonPaths {
+        &self.paths
+    }
+
     pub fn production(
         paths: DaemonPaths,
         host: RemoteHostConfig,
@@ -7276,6 +7282,7 @@ mod tests {
                     let _ = super::super::server::serve_upgradable(
                         hyper_util::rt::TokioIo::new(stream),
                         served,
+                        None,
                     )
                     .await;
                 });
@@ -7634,6 +7641,7 @@ mod tests {
                     let _ = super::super::server::serve_upgradable(
                         hyper_util::rt::TokioIo::new(stream),
                         api,
+                        None,
                     )
                     .await;
                 });

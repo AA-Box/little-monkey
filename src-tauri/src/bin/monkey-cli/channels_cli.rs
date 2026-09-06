@@ -31,7 +31,8 @@ pub enum ChannelsCmd {
     /// Add an account. It starts disabled and with no credential.
     Add {
         /// Provider: telegram, discord, slack, whatsapp, teams, google_chat,
-        /// line, mattermost, irc, matrix, signal, imessage, sms.
+        /// line, mattermost, irc, matrix, signal, imessage, sms, email,
+        /// home_assistant, webchat.
         kind: String,
         /// Name shown in listings and in the app.
         label: String,
@@ -690,7 +691,7 @@ pub async fn add(
     json: bool,
 ) -> Result<(), String> {
     let kind = ChannelKind::parse(kind).ok_or_else(|| {
-        format!("Unknown provider '{kind}'. Try one of: telegram, discord, slack, whatsapp, signal, teams, google_chat, matrix, mattermost, line, imessage, irc, sms")
+        format!("Unknown provider '{kind}'. Try one of: telegram, discord, slack, whatsapp, signal, teams, google_chat, matrix, mattermost, line, imessage, irc, sms, email, home_assistant, webchat")
     })?;
     let non_secret_config: serde_json::Value = match config_json {
         Some(raw) => serde_json::from_str(raw)
