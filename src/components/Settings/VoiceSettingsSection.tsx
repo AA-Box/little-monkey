@@ -3,7 +3,7 @@
  * whether anything listens on its own, and what the last hundred turns cost in
  * milliseconds.
  *
- * The wake phrase and always-listening are the two settings here that can make
+ * The wake word and always-listening are the two settings here that can make
  * a machine listen without anyone pressing anything, so they are the two that
  * are gated: a plain checkbox arms nothing, and the arming step spells out what
  * it turns on. The Rust side refuses the pair unless transcription is local, so
@@ -23,13 +23,19 @@ import {
 import { dictationClient, type DictationCapabilities } from '../../lib/dictationClient';
 import { errorMessage } from '../../lib/errors';
 import { useT } from '../../lib/i18n';
-import { base64AudioBlob } from '../../lib/talkAudio';
+import {
+  BoundedPcmQueue,
+  PCM_AUDIO_WORKLET_SOURCE,
+  StreamingLinearResampler,
+  base64AudioBlob,
+} from '../../lib/talkAudio';
 import {
   latencySummary,
   talkClient,
   type TalkMetricsSnapshot,
   type TranscriptionLanguage,
   type TranscriptionModel,
+  type WakeWordRuntimeStatus,
 } from '../../lib/talkClient';
 import { createTalkPlayer } from '../../lib/talkPlayback';
 import { Button } from '../ui';
@@ -45,10 +51,11 @@ const INPUT =
 
 /** How long the microphone test records before playing itself back. */
 const MIC_TEST_MS = 3_000;
+const WAKE_TEST_MS = 10_000;
 
 /**
  * The transcription backend is chosen in “Voice and transcription” above, not
- * here — but it decides whether the wake phrase can be armed at all, so this
+ * here — but it decides whether the wake word can be armed at all, so this
  * section has to be able to say which one is selected instead of asking the
  * operator to go and find out.
  */
@@ -73,6 +80,7 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
   const [inputs, setInputs] = useState<DeviceOption[]>([]);
   const [outputs, setOutputs] = useState<DeviceOption[]>([]);
   const [metrics, setMetrics] = useState<TalkMetricsSnapshot | null>(null);
+  const [wakeStatus, setWakeStatus] = useState<WakeWordRuntimeStatus | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -111,6 +119,24 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
     void talkClient.metrics().then(setMetrics).catch(() => undefined);
     void dictationClient.capabilities().then(setDictationCapabilities).catch(() => undefined);
   }, [loadDevices]);
+
+  useEffect(() => {
+    let active = true;
+    const refresh = () => {
+      void talkClient
+        .wakeWordStatus()
+        .then((status) => {
+          if (active) setWakeStatus(status);
+        })
+        .catch(() => undefined);
+    };
+    refresh();
+    const interval = window.setInterval(refresh, 2_000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, []);
 
   useEffect(() => {
     const selected = voice.dictationLanguage;
@@ -203,7 +229,109 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
     }
   }, [player, voice.outputDeviceId]);
 
+  const testWakeWord = useCallback(async () => {
+    setBusy('wake');
+    setError(null);
+    setNote('Listening for the configured wake word…');
+    let stream: MediaStream | null = null;
+    let context: AudioContext | null = null;
+    let source: MediaStreamAudioSourceNode | null = null;
+    let worklet: AudioWorkletNode | null = null;
+    let workletUrl: string | null = null;
+    let wakeSessionId: string | null = null;
+    let grantId: string | null = null;
+    let timeoutId: number | null = null;
+    try {
+      await onSave(config, 'Wake word settings saved for the production-path test.');
+      const grant = await companionClient.grant('microphone', 60_000, 'wake-word-test');
+      grantId = grant.grantId;
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: voice.inputDeviceId ? { deviceId: { exact: voice.inputDeviceId } } : true,
+        video: false,
+      });
+      context = new AudioContext();
+      if (context.state === 'suspended') await context.resume();
+      if (!context.audioWorklet || typeof AudioWorkletNode === 'undefined') {
+        throw new Error('This webview does not support the required AudioWorklet PCM path');
+      }
+      workletUrl = URL.createObjectURL(
+        new Blob([PCM_AUDIO_WORKLET_SOURCE], { type: 'text/javascript' }),
+      );
+      await context.audioWorklet.addModule(workletUrl);
+      worklet = new AudioWorkletNode(context, 'little-monkey-pcm-capture', {
+        numberOfInputs: 1,
+        numberOfOutputs: 0,
+        channelCount: 1,
+      });
+      source = context.createMediaStreamSource(stream);
+      source.connect(worklet);
+      const started = await talkClient.wakeWordStart(grantId);
+      wakeSessionId = started.sessionId;
+      setWakeStatus(started.status);
+      const resampler = new StreamingLinearResampler(16_000);
+      const queue = new BoundedPcmQueue(3_200);
+      let pushing = false;
+      let settled = false;
+      let resolveDetected!: () => void;
+      let rejectDetected!: (reason: unknown) => void;
+      const detected = new Promise<void>((resolve, reject) => {
+        resolveDetected = resolve;
+        rejectDetected = reject;
+      });
+      const pump = async (): Promise<void> => {
+        if (pushing || settled || !grantId || !wakeSessionId) return;
+        const frame = queue.take();
+        if (frame.length === 0) return;
+        pushing = true;
+        try {
+          const result = await talkClient.wakeWordPush(grantId, wakeSessionId, frame);
+          if (result) {
+            settled = true;
+            resolveDetected();
+          }
+        } catch (reason) {
+          settled = true;
+          rejectDetected(reason);
+        } finally {
+          pushing = false;
+          if (!settled && queue.length > 0) void pump();
+        }
+      };
+      worklet.port.onmessage = (event: MessageEvent<Float32Array | ArrayBuffer>) => {
+        const raw = event.data instanceof Float32Array ? event.data : new Float32Array(event.data);
+        const pcm = resampler.process(raw, context?.sampleRate ?? 16_000);
+        if (pcm.length === 0) return;
+        queue.enqueue(pcm);
+        void pump();
+      };
+      const timedOut = new Promise<never>((_, reject) => {
+        timeoutId = window.setTimeout(
+          () => reject(new Error('No wake word was detected in 10 seconds')),
+          WAKE_TEST_MS,
+        );
+      });
+      await Promise.race([detected, timedOut]);
+      setNote('Wake word detected by the production local KWS path.');
+    } catch (reason) {
+      setError(errorMessage(reason));
+      setNote(null);
+    } finally {
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+      if (wakeSessionId) await talkClient.wakeWordStop(wakeSessionId).catch(() => false);
+      worklet?.port.close();
+      worklet?.disconnect();
+      source?.disconnect();
+      stream?.getTracks().forEach((track) => track.stop());
+      if (context) await context.close().catch(() => undefined);
+      if (workletUrl) URL.revokeObjectURL(workletUrl);
+      if (grantId) await companionClient.revoke(grantId).catch(() => false);
+      void talkClient.wakeWordStatus().then(setWakeStatus).catch(() => undefined);
+      setBusy(null);
+    }
+  }, [config, onSave, voice.inputDeviceId]);
+
   const localOnly = voice.backend === 'local_whisper';
+  const wakeAvailable = wakeStatus?.available === true && wakeStatus.local;
   /** Wake listening left armed under a backend that cannot have it: the
    * checkbox that turns it off is disabled by the same condition, so without a
    * way out of this the whole configuration becomes unsaveable. */
@@ -478,14 +606,88 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
 
       <div className="mt-4 rounded-md border border-border p-3">
         <div className="flex items-center gap-2">
-          <Radio size={14} className={voice.alwaysListening ? 'animate-pulse text-danger' : ''} />
-          <h4 className="text-xs font-semibold">Wake phrase</h4>
+          <Radio size={14} className={wakeStatus?.acceptingAudio ? 'animate-pulse text-danger' : ''} />
+          <h4 className="text-xs font-semibold">Wake word</h4>
           {voice.alwaysListening && (
             <span className="rounded-full bg-danger/15 px-2 py-0.5 text-[11px] font-medium text-danger">
-              Listening now
+              {wakeStatus?.acceptingAudio ? 'Listening now' : 'Always listening enabled'}
             </span>
           )}
+          <span className="ml-auto rounded-full bg-success/15 px-2 py-0.5 text-[11px] font-medium text-success">
+            Local · offline
+          </span>
         </div>
+        <dl className="mt-2 grid gap-1 text-[11px] sm:grid-cols-2">
+          <div className="flex justify-between gap-2">
+            <dt className="text-muted">Backend</dt>
+            <dd>{wakeStatus?.backend === 'sherpa_onnx' ? 'sherpa-onnx' : (wakeStatus?.backend ?? 'checking…')}</dd>
+          </div>
+          <div className="flex justify-between gap-2">
+            <dt className="text-muted">Model/runtime</dt>
+            <dd>
+              {wakeStatus?.lastError
+                ? 'load failed'
+                : wakeStatus?.available
+                  ? (wakeStatus.loaded ? 'loaded and verified' : 'files verified; runtime not opened')
+                  : 'unavailable'}
+            </dd>
+          </div>
+          <div className="flex justify-between gap-2 sm:col-span-2">
+            <dt className="text-muted">Pinned runtime</dt>
+            <dd className="break-all text-right">{wakeStatus?.runtimeVersion ?? 'checking…'}</dd>
+          </div>
+          <div className="flex justify-between gap-2 sm:col-span-2">
+            <dt className="text-muted">Pinned model</dt>
+            <dd className="break-all text-right">{wakeStatus?.modelId ?? 'checking…'}</dd>
+          </div>
+          <div className="flex justify-between gap-2">
+            <dt className="text-muted">Model files</dt>
+            <dd>{wakeStatus ? formatModelSize(wakeStatus.modelBytes) : 'checking…'}</dd>
+          </div>
+          <div className="flex justify-between gap-2">
+            <dt className="text-muted">License metadata</dt>
+            <dd>{wakeStatus?.modelLicense ?? 'checking…'}</dd>
+          </div>
+          <div className="flex justify-between gap-2">
+            <dt className="text-muted">Inference/frame</dt>
+            <dd className="tabular-nums">
+              {wakeStatus?.averageInferenceMs == null
+                ? 'not measured yet'
+                : `${wakeStatus.averageInferenceMs.toFixed(1)} ms average`}
+            </dd>
+          </div>
+          <div className="flex justify-between gap-2">
+            <dt className="text-muted">Dropped frames</dt>
+            <dd className="tabular-nums">{wakeStatus?.droppedFrames ?? 0}</dd>
+          </div>
+          <div className="flex justify-between gap-2">
+            <dt className="text-muted">Idle CPU</dt>
+            <dd>{wakeStatus?.idleCpuPercent == null ? 'unavailable' : `${wakeStatus.idleCpuPercent.toFixed(1)}%`}</dd>
+          </div>
+          <div className="flex justify-between gap-2">
+            <dt className="text-muted">Resident model memory</dt>
+            <dd>{wakeStatus?.modelMemoryBytes == null ? 'unavailable' : formatModelSize(wakeStatus.modelMemoryBytes)}</dd>
+          </div>
+          <div className="flex justify-between gap-2 sm:col-span-2">
+            <dt className="text-muted">Measured detection latency</dt>
+            <dd className="tabular-nums">
+              {wakeStatus?.averageDetectionLatencyMs == null
+                ? 'not measured yet'
+                : `${wakeStatus.averageDetectionLatencyMs.toFixed(1)} ms average`}
+            </dd>
+          </div>
+        </dl>
+        {wakeStatus && !wakeStatus.available && (
+          <p role="alert" className="mt-2 text-[11px] text-danger">
+            The checksum-verified KWS model is missing. Run <code>pnpm stage:wake-word</code> and
+            rebuild; Talk will not claim wake listening is ready until the native runtime opens it.
+          </p>
+        )}
+        {wakeStatus?.lastError && (
+          <p role="alert" className="mt-2 text-[11px] text-danger">
+            Native KWS error: {wakeStatus.lastError}
+          </p>
+        )}
         {!localOnly && (
           <div className="mt-2 flex items-start gap-2 rounded border border-warning/40 bg-warning/10 p-2 text-[11px]">
             <AlertTriangle size={12} className="mt-0.5 shrink-0" />
@@ -516,7 +718,7 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
         <label className="mt-2 flex items-center gap-2 text-xs">
           <input
             type="checkbox"
-            disabled={!localOnly}
+            disabled={!localOnly || !wakeAvailable}
             checked={voice.wakePhraseEnabled}
             onChange={(event) => {
               const enabled = event.target.checked;
@@ -527,11 +729,11 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
               });
             }}
           />
-          Require the wake phrase before anything spoken is sent
+          Enable local wake-word gating for Continuous Talk
         </label>
         <span className="mt-1 block text-[11px] text-faint">
-          Applies while Talk is capturing continuously. Everything else said is transcribed on this
-          machine, matched against the phrase, and dropped.
+          Applies while Talk is in Continuous mode. While armed, bounded PCM goes only to the local
+          keyword spotter; Whisper does not run until the wake word is detected.
         </span>
         <label className="mt-2 block text-xs text-muted">
           Phrase
@@ -543,13 +745,39 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
             onChange={(event) => patch({ wakePhrase: event.target.value })}
           />
         </label>
+        <label className="mt-2 block text-xs text-muted">
+          Sensitivity: {voice.wakeWordSensitivity ?? 50}
+          <input
+            className="mt-1 w-full"
+            type="range"
+            min={0}
+            max={100}
+            step={1}
+            disabled={!voice.wakePhraseEnabled}
+            value={voice.wakeWordSensitivity ?? 50}
+            onChange={(event) => patch({ wakeWordSensitivity: Number(event.target.value) })}
+          />
+          <span className="mt-1 block text-[11px] text-faint">
+            Higher detects more easily and may trigger more often in background speech.
+          </span>
+        </label>
+
+        <Button
+          className="mt-3"
+          size="sm"
+          disabled={busy !== null || !voice.wakePhraseEnabled || !wakeAvailable}
+          onClick={() => void testWakeWord()}
+        >
+          <Mic size={14} />
+          {busy === 'wake' ? 'Listening for wake word…' : 'Test wake word'}
+        </Button>
 
         {voice.alwaysListening ? (
           <div className="mt-3 rounded border border-danger/40 bg-danger/10 p-2">
             <p className="text-[11px] text-danger">
-              Opening Talk starts capturing straight away, with nobody pressing Start. This machine
-              transcribes locally to hear the phrase, and nothing is uploaded or sent to a model
-              until it is heard. Closing Talk closes the microphone.
+              Opening Talk keeps the microphone active. Detection uses local sherpa-onnx only;
+              passive audio is not retained, Whisper starts only after a wake event, and closing
+              Talk closes the microphone.
             </p>
             <Button
               className="mt-2"
@@ -566,10 +794,9 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
         ) : confirmingAlwaysListening ? (
           <div className="mt-3 rounded border border-danger/40 bg-danger/10 p-2">
             <p className="text-[11px] text-danger">
-              Turning this on makes Talk start capturing the moment it is opened, without pressing
-              Start, and keep the microphone open until it is closed. Detection runs on this machine
-              and no audio is uploaded until the phrase is heard — but the microphone is open the
-              whole time.
+              Turning this on keeps the microphone active whenever Talk is open. Wake detection is
+              fully local, passive audio is not retained, and full transcription begins only after
+              the wake word — but the microphone remains open until Talk is closed.
             </p>
             <div className="mt-2 flex gap-2">
               <Button
@@ -591,7 +818,7 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
           <Button
             className="mt-3"
             size="sm"
-            disabled={!voice.wakePhraseEnabled}
+            disabled={!voice.wakePhraseEnabled || !wakeAvailable}
             onClick={() => setConfirmingAlwaysListening(true)}
           >
             <Radio size={14} />

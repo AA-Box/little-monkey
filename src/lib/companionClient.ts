@@ -64,6 +64,10 @@ export interface VoiceConfig {
    * enable it unless transcription runs on this machine. */
   wakePhraseEnabled: boolean;
   wakePhrase: string;
+  /** Native local keyword spotter. Currently `sherpa_onnx`. */
+  wakeWordBackend?: string;
+  /** 0 is strictest, 100 is most sensitive. */
+  wakeWordSensitivity?: number;
   /** Continuous local listening for the wake phrase. Requires the phrase. */
   alwaysListening: boolean;
   /** Native composer dictation locale; null means the operating-system default. */

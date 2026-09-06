@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "pnpm stage:runtime && pnpm codesign:runtime && pnpm stage:runtime:tts && pnpm codesign:runtime:tts && pnpm stage:runtime:sd && pnpm codesign:runtime:sd && pnpm stage:cli && pnpm build",
+    "beforeBuildCommand": "pnpm stage:runtime && pnpm codesign:runtime && pnpm stage:runtime:tts && pnpm codesign:runtime:tts && pnpm stage:runtime:sd && pnpm codesign:runtime:sd && pnpm stage:whisper && pnpm stage:sherpa-runtime && pnpm stage:wake-word && pnpm stage:cli && pnpm build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -61,7 +61,13 @@
     ],
     "resources": [
       "resources/managed-runtime/**/*",
-      "resources/local-whisper/**/*"
+      "resources/local-whisper/**/*",
+      "resources/local-wake-word/README.md",
+      "resources/local-wake-word/bpe.model",
+      "resources/local-wake-word/tokens.txt",
+      "resources/local-wake-word/encoder-epoch-12-avg-2-chunk-16-left-64.onnx",
+      "resources/local-wake-word/decoder-epoch-12-avg-2-chunk-16-left-64.onnx",
+      "resources/local-wake-word/joiner-epoch-12-avg-2-chunk-16-left-64.onnx"
     ],
     "macOS": {
       "files": {

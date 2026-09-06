@@ -43,11 +43,13 @@ const CONFIG = {
 const streams: { stopped: number }[] = [];
 let resumed = 0;
 let sourceNodes: { connected: number; disconnected: number }[] = [];
+let workletNodes: Array<{ port: { onmessage: ((event: MessageEvent<Float32Array>) => void) | null; close(): void }; disconnect(): void }> = [];
 
 function stubMedia() {
   streams.length = 0;
   resumed = 0;
   sourceNodes = [];
+  workletNodes = [];
   Object.defineProperty(navigator, 'mediaDevices', {
     configurable: true,
     value: {
@@ -58,28 +60,22 @@ function stubMedia() {
       },
     },
   });
-  vi.stubGlobal(
-    'MediaRecorder',
-    class {
-      static isTypeSupported = () => true;
-      state = 'inactive';
-      mimeType = 'audio/webm';
-      start() { this.state = 'recording'; }
-      stop() { this.state = 'inactive'; }
-    },
-  );
+  vi.stubGlobal('AudioWorkletNode', class {
+    port = { onmessage: null as ((event: MessageEvent<Float32Array>) => void) | null, close() {} };
+    constructor() { workletNodes.push(this); }
+    disconnect() {}
+  });
   vi.stubGlobal(
     'AudioContext',
     class {
+      sampleRate = 48_000;
+      audioWorklet = { addModule: () => Promise.resolve() };
       // What WebKit hands back for a context built outside a user gesture.
       state = 'suspended';
       resume() {
         this.state = 'running';
         resumed += 1;
         return Promise.resolve();
-      }
-      createAnalyser() {
-        return { fftSize: 1_024, getFloatTimeDomainData: (buffer: Float32Array) => buffer.fill(0) };
       }
       createMediaStreamSource() {
         const node = {
@@ -120,6 +116,13 @@ beforeEach(() => {
           expiresAtMs: Date.now() + 60_000,
           active: true,
         });
+      case 'm7_wake_word_start':
+        return Promise.resolve({
+          sessionId: 'wake-1',
+          status: { backend: 'sherpa_onnx', local: true, available: true, loaded: true },
+        });
+      case 'm7_wake_word_stop':
+        return Promise.resolve(true);
       default:
         return Promise.resolve(null);
     }
@@ -158,7 +161,7 @@ describe('useTalkSession', () => {
     await waitFor(() => expect(resumed).toBe(1));
   });
 
-  it('holds the source node, so the analyser keeps being fed', async () => {
+  it('holds the source node, so the worklet keeps being fed', async () => {
     const { rerender } = renderHook(
       ({ enabled }: { enabled: boolean }) =>
         useTalkSession('session-1', { enabled, autoStartMode: 'continuous' }),
@@ -168,7 +171,7 @@ describe('useTalkSession', () => {
 
     rerender({ enabled: false });
     // Nothing can disconnect a node it never kept, and WebKit collects a source
-    // node nothing references — leaving the analyser reading silence, the
+    // node nothing references — leaving the worklet without PCM, the
     // meter flat, and Talk listening forever.
     await waitFor(() => expect(sourceNodes[0].disconnected).toBe(1));
   });

@@ -193,7 +193,7 @@ Serves the OpenAI-compatible routes, the Anthropic Messages subset, and native-O
 | | |
 | :-- | :-- |
 | **Chat &amp; collaboration** | Compare one frozen prompt across up to four targets, run Crew chats with a coordinator and parallel members, fork sessions, split-pane, search everything, set up models from the searchable picker itself, and paste big blobs as editable Markdown cards |
-| **Voice** | Talk holds a spoken conversation in the chat window — a bundled zero-config Whisper engine on every desktop platform, five selectable speech-model tiers, a spoken-language control, and interruption by talking over the answer |
+| **Voice** | Talk holds a spoken conversation in the chat window — a bundled zero-config Whisper engine on every desktop platform, five selectable speech-model tiers, a spoken-language control, an opt-in local wake word that never uploads passive audio, and interruption by talking over the answer |
 | **Workspace** | Code review over real git porcelain, acceptance-criteria mapping whose citations are checked against the diff, a real PTY terminal, a tabbed browser pane |
 | **Agent tools** | File, shell, memory, web, knowledge, MCP, subagent, plan and verification tools — every one behind the permission gate, with checkpoints you can rewind |
 | **Knowledge 2.0** | Ingest files, sites, chats and WebDAV; hybrid lexical and vector retrieval with reranking; inspect the whole pipeline end to end |
@@ -237,6 +237,7 @@ Boundaries in full: **[docs/security.md](docs/security.md)**. Vulnerabilities go
 | Install executable extensions from a signed registry | [Extension marketplace](docs/extension-marketplace.md) |
 | Build and publish an extension | [Extension development](docs/extension-development.md) |
 | Speak to it with local transcription | [Zero-config local Whisper](docs/zero-config-local-whisper.md) |
+| Arm a wake word that keeps passive audio on this machine | [Local wake-word detection](docs/local-wake-word.md) |
 | Connect remote MCP over OAuth | [BYO OAuth clients](docs/byo-oauth-clients.md) |
 | Use a paired phone's camera, mic or location | [Paired devices](docs/paired-devices.md) |
 | Reach an agent by message, phone, device or peer | [Messaging, devices and phones](docs/messaging-devices-and-phones.md) |

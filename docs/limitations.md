@@ -55,6 +55,18 @@ rather than left for a reader to discover. Work that is not built yet lives in
 - VS Code completion requires an installed Ollama model advertising `insert`; its latency and compile gate cannot be claimed without one.
 - GitHub delivery needs local `git` and authenticated `gh`; hosted Actions need user-supplied provider credentials, and Ollama review needs a user-owned self-hosted runner.
 - Local OCR, meeting, and image paths require configured binaries, models, or endpoints. Transcription is built in ([zero-config local Whisper](zero-config-local-whisper.md)), but the bundled default is the `base` tier — the second-smallest — and larger tiers are downloads, not bundled. WER, diarization error rate, real-time factor, and image hardware behavior are not claimed until run against the documented external fixtures and hardware.
+- The desktop wake-word backend is an English GigaSpeech BPE model: custom
+  phrases need no retraining, but this build deliberately rejects characters
+  outside its bounded English phrase grammar and does not claim multilingual
+  wake accuracy. Exact model bytes and the native runtime are verified and
+  bundled; the archive README declares Apache License 2.0, while upstream's
+  model-license provenance clarification remains open. Native execution has
+  been exercised on macOS arm64. The dedicated workflow is configured to run
+  real inference on Linux x86_64 and compile all six release targets, but those
+  jobs remain unverified until the first green hosted run; the other platforms
+  are not claimed from compilation alone. The selected API exposes inference and trigger
+  timing but not portable idle CPU or resident model memory, so those status
+  fields remain unavailable. See [Local wake-word detection](local-wake-word.md).
 - The executable extension marketplace distributes only what a verified registry actually serves: the bundled first-party M4 catalog currently contains declarative built-ins, so acquiring an executable extension requires adding a verified source with artifact locations. `automatic_safe` updates pause for review whenever a granted permission has a host-only binding, because the canonical workspace binding is deliberately never reconstructed from a display label.
 - Standards Studio discovery is deterministic and bounded — file count, recursion depth, per-evidence and total scan bytes — and repository text only ever creates unapproved candidates. A convention the detectors do not model is not discovered, and injection requires both approval and task relevance, so an approved standard may legitimately be absent from a turn that never touched its scope.
 - Remote handoff requires a user-owned reachable network and valid TLS identity. There is no relay, account service, RBAC/SSO plane, or hosted GPU.
