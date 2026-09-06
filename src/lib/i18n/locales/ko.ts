@@ -1472,7 +1472,6 @@ const translated: Record<string, string> = {
   "RulesMemoryPanel.memoryDeleteButton": "삭제",
   "RulesMemoryPanel.memoryDeletingButton": "삭제 중…",
   "RulesMemoryPanel.memoryClearAllButton": "모두 지우기",
-  "RulesMemoryPanel.memoryClearConfirmPrompt": "기억된 {{count}}개의 사실을 모두 삭제할까요? 되돌릴 수 없습니다.",
   "RulesMemoryPanel.memoryClearConfirmButton": "예, 모두 삭제",
   "RulesMemoryPanel.memoryClearCancelButton": "취소",
   "RulesMemoryPanel.memoryClearingButton": "삭제 중…",
