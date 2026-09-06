@@ -953,6 +953,30 @@ impl LoopbackListener {
         }
     }
 
+    /// Binds a caller-chosen loopback port with a caller-chosen redirect
+    /// host, always requiring that exact port.
+    ///
+    /// `connector_oauth.rs` needs this because its port is derived from the
+    /// *provider* (stable, and registered with the provider once) rather than
+    /// from an MCP server id, and a provider that was handed one redirect URI
+    /// rejects any other — so there is never an ephemeral fallback to offer.
+    ///
+    /// Always `127.0.0.1` specifically (never `0.0.0.0`/`::`): this listener
+    /// must only ever be reachable from the same machine's browser.
+    pub(crate) async fn bind_port(port: u16, redirect_host: &str) -> Result<Self, String> {
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.map_err(|e| {
+            format!(
+                "Could not bind the registered OAuth callback port {port}: {e}. \
+                 Close the process using that port, then retry — this provider \
+                 may reject a callback on any other port."
+            )
+        })?;
+        Ok(Self {
+            listener,
+            redirect_uri: format!("http://{redirect_host}:{port}/"),
+        })
+    }
+
     /// Binds to an OS-assigned ephemeral port on `127.0.0.1` specifically
     /// (never `0.0.0.0`/`::`) — this listener must only ever be reachable
     /// from the same machine's browser, not the network.
@@ -1160,7 +1184,7 @@ async fn resolve_http_base_url(app: &tauri::AppHandle, server_id: &str) -> Resul
     }
 }
 
-async fn cancellable_oauth_step<T>(
+pub(crate) async fn cancellable_oauth_step<T>(
     cancel: &CancellationToken,
     future: impl std::future::Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
@@ -1394,7 +1418,7 @@ fn complete_oauth_exchange<T>(
 /// Returns the sticky, shared cancellation token for every overlapping OAuth
 /// connect attempt for one server id. Unlike `Notify`, cancellation is retained
 /// if it happens immediately before a caller starts awaiting it.
-fn oauth_cancel_token_for(
+pub(crate) fn oauth_cancel_token_for(
     state: &AppState,
     server_id: &str,
 ) -> Result<std::sync::Arc<CancellationToken>, String> {
@@ -1414,7 +1438,7 @@ fn oauth_cancel_token_for(
 /// Removes a server id's shared token only after the final overlapping connect
 /// call has finished. A later, genuinely new attempt therefore receives a
 /// fresh non-cancelled token.
-fn release_oauth_cancel_token(state: &AppState, server_id: &str) {
+pub(crate) fn release_oauth_cancel_token(state: &AppState, server_id: &str) {
     if let Ok(mut guard) = state.mcp_oauth_cancel.lock() {
         if let std::collections::hash_map::Entry::Occupied(mut entry) =
             guard.entry(server_id.to_string())
