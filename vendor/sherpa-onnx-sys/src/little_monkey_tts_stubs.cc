@@ -39,10 +39,26 @@ namespace {
 // espeak-ng's C entry point. `extern "C"`, so the parameter types only have to
 // be layout-compatible for a call that never returns; the symbol name is what
 // the linker is looking for.
+//
+// Defined once. On Linux this file is compiled twice — see below — and a C
+// symbol has one name in both passes, so the second pass must skip it or the
+// link fails on a duplicate instead of a missing one.
+#ifndef LITTLE_MONKEY_TTS_STUBS_NO_C_SYMBOLS
 extern "C" int espeak_Initialize(int, int, const char *, int) {
   little_monkey_no_tts_backend("espeak_Initialize");
 }
+#endif
 
+// libstdc++ has two incompatible `std::string` types, and which one a C++
+// symbol mangles with depends on `_GLIBCXX_USE_CXX11_ABI` at *its* compile
+// time. sherpa-onnx's published Linux archives are built for broad
+// compatibility; this crate is built with whatever the runner defaults to.
+// Guessing wrong leaves the symbol as undefined as it was before, which is
+// exactly what the first attempt at this file did.
+//
+// So on Linux the build compiles this translation unit under both settings and
+// links both. The two mangle to different names, so they cannot collide, and
+// the one the archive does not reference is simply never called.
 namespace piper {
 
 // Incomplete by design: a reference parameter mangles from the class's name and

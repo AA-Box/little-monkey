@@ -10,6 +10,7 @@ import {
   MODEL_ARCHIVE_SHA256,
   MODEL_FILES,
   MODEL_ID,
+  PLACEHOLDER_FILE,
   verifyModelDirectory,
 } from "../stage-wake-word-model.mjs";
 import {
@@ -104,13 +105,30 @@ test("the installer packages the model directory whole, and test audio is not in
 });
 
 test("a fresh checkout can still resolve the packaged glob", () => {
-  // `tauri-build` fails the build outright when a resource path matches
-  // nothing, so the directory carries one tracked file that staging never
-  // overwrites. Without it, cloning the repository and running `cargo test`
-  // fails before any test runs.
-  const placeholder = join(process.cwd(), "src-tauri/resources/local-wake-word/PLACEHOLDER.md");
+  // `tauri-build` fails the build outright when a declared resource glob
+  // matches nothing — "path not found or didn't match any files" — so the
+  // directory carries one tracked file. Without it, cloning the repository and
+  // running `cargo test` fails before any test runs.
+  const placeholder = join(
+    process.cwd(),
+    "src-tauri/resources/local-wake-word",
+    PLACEHOLDER_FILE,
+  );
   assert.ok(readFileSync(placeholder, "utf8").length > 0);
-  assert.equal(Object.keys(MODEL_FILES).includes("PLACEHOLDER.md"), false);
+  assert.equal(Object.keys(MODEL_FILES).includes(PLACEHOLDER_FILE), false);
+});
+
+test("staging carries the placeholder across the directory swap", () => {
+  // Staging replaces the packaged directory wholesale. It once replaced the
+  // tracked placeholder along with it, `git add -A` recorded the deletion, and
+  // every job in the repository that compiles the crate failed on the empty
+  // glob. Scanned rather than executed because the alternative is a 14 MB
+  // download inside a unit test.
+  const source = readFileSync(join(process.cwd(), "scripts/stage-wake-word-model.mjs"), "utf8");
+  const swap = source.split("mkdirSync(candidate);")[1] ?? "";
+  const beforeSwap = swap.split("renameSync(candidate, destination)")[0] ?? "";
+  assert.match(beforeSwap, /PLACEHOLDER_FILE/);
+  assert.match(beforeSwap, /cpSync\(placeholder/);
 });
 
 test("runtime verification rejects an archive with the right size but wrong digest", () => {

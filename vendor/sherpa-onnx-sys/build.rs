@@ -353,20 +353,33 @@ fn emit_shared_link_directives() {
 /// Emitted after the sherpa archives on purpose: a Unix linker resolves an
 /// archive's undefined symbols from what follows it, so a stub placed first
 /// satisfies nothing.
-fn emit_tts_stub_directives() {
+fn emit_tts_stub_directives(target_os: &str) {
     let stubs = Path::new("src").join("little_monkey_tts_stubs.cc");
     println!("cargo:rerun-if-changed={}", stubs.display());
     cc::Build::new()
         .cpp(true)
         .file(&stubs)
         .compile("little_monkey_tts_stubs");
+
+    // libstdc++'s two `std::string` types mangle differently, and which one the
+    // published archive references is not something this build can read. Both
+    // are defined; the unreferenced one is dead weight rather than a guess that
+    // leaves the symbol undefined.
+    if target_os == "linux" {
+        cc::Build::new()
+            .cpp(true)
+            .file(&stubs)
+            .define("_GLIBCXX_USE_CXX11_ABI", "0")
+            .define("LITTLE_MONKEY_TTS_STUBS_NO_C_SYMBOLS", None)
+            .compile("little_monkey_tts_stubs_legacy_abi");
+    }
 }
 
 fn emit_static_link_directives(target_os: &str) {
     for lib in SHERPA_ONNX_STATIC_LIBS {
         println!("cargo:rustc-link-lib=static={lib}");
     }
-    emit_tts_stub_directives();
+    emit_tts_stub_directives(target_os);
 
     match target_os {
         "linux" => {

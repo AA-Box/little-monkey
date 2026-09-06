@@ -71,6 +71,18 @@ export const FIXTURE_FILES = Object.freeze({
 
 export const FIXTURE_DIRECTORY = "local-wake-word-fixtures";
 
+/**
+ * The one tracked file in the packaged directory.
+ *
+ * `tauri-build` fails the entire build when a declared resource glob matches
+ * nothing — "path not found or didn't match any files" — so in a checkout where
+ * the model has not been staged, this file is the only reason `cargo build`
+ * works at all. Staging replaces the directory wholesale, so it has to be
+ * carried across the swap or the first `pnpm stage:wake-word` quietly deletes
+ * the thing every compile depends on.
+ */
+export const PLACEHOLDER_FILE = "PLACEHOLDER.md";
+
 const digestOf = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
 function verifyFiles(directory, manifest) {
@@ -154,6 +166,8 @@ export async function stageWakeWordModel() {
       mkdirSync(dirname(destinationFile), { recursive: true });
       cpSync(join(extracted, name), destinationFile);
     }
+    const placeholder = join(destination, PLACEHOLDER_FILE);
+    if (existsSync(placeholder)) cpSync(placeholder, join(candidate, PLACEHOLDER_FILE));
     mkdirSync(fixtureCandidate);
     for (const name of Object.keys(FIXTURE_FILES)) {
       cpSync(join(extracted, name), join(fixtureCandidate, basename(name)));
