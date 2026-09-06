@@ -20,17 +20,29 @@
 //! `ConnectorAccount::connection` is the one exception worth calling out: it
 //! holds non-secret provider metadata an account needs to re-verify or (in a
 //! later ROADMAP stage) actually call its API again — Jira's site URL/email,
-//! or S3's endpoint/bucket/region/access key. This is a deliberate, narrow
+//! S3's endpoint/bucket/region/access key, a GitLab or Zendesk instance
+//! `host`, or a Microsoft `tenant`. This is a deliberate, narrow
 //! extension beyond a bare id/label/scopes shape, mirroring exactly what
 //! `knowledge_service.rs`'s `ConnectorConfig::WebDav` already does (storing
 //! `url`/`username` alongside a `credential_ref`, never the password).
 //!
-//! Non-goals, explicitly: GitHub, Slack, Notion, and Jira all offer a "real"
-//! OAuth app flow instead of the token schemes above — none of that is built
-//! here, by design (see the top-level task brief). Google Drive, SharePoint/
-//! Graph, and anything else that genuinely requires a registered OAuth app
-//! with a redirect URI are out of scope for this catalog entirely; they are
-//! not faked with a token workaround.
+//! The catalog holds seventeen providers across five credential schemes: one
+//! `gh`-CLI bridge (GitHub), three pasted tokens (Slack, Notion, Jira —
+//! which covers Confluence Cloud on the same Atlassian API-token scheme),
+//! one access-key pair (S3/R2), one extension-backed account, and eleven
+//! authorization-code OAuth providers. The OAuth half lives entirely in
+//! [`crate::connector_oauth`]: it ships no OAuth client credentials of its
+//! own (this is a public binary — anything baked in would be extractable),
+//! so the user registers their own OAuth app once per provider against a
+//! fixed loopback redirect URI.
+//!
+//! Boundaries worth stating, because they are choices rather than gaps:
+//! GitHub, Slack and Notion keep their `gh`/token schemes rather than
+//! growing a second OAuth path, which would strand accounts already saved.
+//! Trello has no authorization-code flow at all (OAuth 1.0a only), so it is
+//! absent rather than faked with a key+token scheme. Confluence stays
+//! covered by the `Jira` variant, so there is no separate Atlassian 3LO
+//! provider double-covering the same sites.
 //!
 //! Every outbound verification call goes through [`verified_call`]: DNS is
 //! resolved once and pinned to the exact socket the TLS/TCP connection uses
@@ -89,6 +101,34 @@ pub enum ConnectorProvider {
     Notion,
     Jira,
     S3,
+    /// Google Drive over authorization-code OAuth — proves which Google
+    /// account consented and that Drive metadata is readable.
+    GoogleDrive,
+    /// Microsoft Graph (SharePoint/OneDrive/Teams files) over
+    /// authorization-code OAuth — proves the signed-in work account.
+    MicrosoftGraph,
+    /// Linear over authorization-code OAuth — proves the Linear viewer.
+    Linear,
+    /// Asana over authorization-code OAuth — proves the Asana user.
+    Asana,
+    /// Dropbox over authorization-code OAuth — proves the Dropbox account.
+    Dropbox,
+    /// Box over authorization-code OAuth — proves the Box login. Box scopes
+    /// are configured on the app itself, not requested per authorization.
+    Box,
+    /// Airtable over authorization-code OAuth, as a public client (PKCE is
+    /// mandatory there, and its confidential flow wants HTTP Basic).
+    Airtable,
+    /// Zendesk over authorization-code OAuth against the user's own
+    /// subdomain, recorded as `connection.host`.
+    Zendesk,
+    /// HubSpot over authorization-code OAuth — proves which portal consented.
+    Hubspot,
+    /// Discord over authorization-code OAuth — proves the Discord user.
+    Discord,
+    /// GitLab over authorization-code OAuth against gitlab.com or a
+    /// self-hosted instance recorded as `connection.host`.
+    Gitlab,
     /// A sandboxed executable extension supplies the documents. The account
     /// holds no credential of its own: the extension authenticates from
     /// inside the sandbox through the secret slots it declared and the user
@@ -98,13 +138,24 @@ pub enum ConnectorProvider {
 }
 
 impl ConnectorProvider {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             ConnectorProvider::Github => "github",
             ConnectorProvider::Slack => "slack",
             ConnectorProvider::Notion => "notion",
             ConnectorProvider::Jira => "jira",
             ConnectorProvider::S3 => "s3",
+            ConnectorProvider::GoogleDrive => "google_drive",
+            ConnectorProvider::MicrosoftGraph => "microsoft_graph",
+            ConnectorProvider::Linear => "linear",
+            ConnectorProvider::Asana => "asana",
+            ConnectorProvider::Dropbox => "dropbox",
+            ConnectorProvider::Box => "box",
+            ConnectorProvider::Airtable => "airtable",
+            ConnectorProvider::Zendesk => "zendesk",
+            ConnectorProvider::Hubspot => "hubspot",
+            ConnectorProvider::Discord => "discord",
+            ConnectorProvider::Gitlab => "gitlab",
             ConnectorProvider::Extension => "extension",
         }
     }
@@ -160,7 +211,7 @@ fn keychain_account(provider: ConnectorProvider, id: &str) -> String {
 /// path. AppHandle-free via `app_paths::data_dir()` — unlike `mcp.rs`'s
 /// `config_file_path`, this needs no `AppHandle` at all, so every command
 /// below (bar the ones that also need `AppState`) is a plain function.
-pub(crate) fn config_file_path() -> Result<PathBuf, String> {
+pub fn config_file_path() -> Result<PathBuf, String> {
     let dir =
         crate::app_paths::data_dir().ok_or_else(|| "Failed to resolve app data dir".to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {e}"))?;
@@ -284,6 +335,52 @@ pub(crate) async fn verified_call(
     basic_auth: Option<(&str, &str)>,
     json_body: Option<&Value>,
 ) -> Result<Vec<u8>, String> {
+    verified_call_with_body(
+        method,
+        url,
+        allowed_origin,
+        allow_loopback,
+        headers,
+        basic_auth,
+        json_body.map_or(RequestBody::None, RequestBody::Json),
+    )
+    .await
+}
+
+/// What one [`verified_call_with_body`] sends as a request body.
+///
+/// `Form` exists for the OAuth token/refresh/revoke endpoints
+/// (`connector_oauth.rs`), which are `application/x-www-form-urlencoded` by
+/// spec (RFC 6749 4.1.3) rather than JSON.
+pub(crate) enum RequestBody<'a> {
+    None,
+    Json(&'a Value),
+    Form(&'a [(&'a str, String)]),
+}
+
+/// [`verified_call`] with the body shape spelled out — same SSRF hardening,
+/// same size/redirect/timeout bounds, and the same run-scope caveat.
+///
+/// # Why the run scope is entered here
+///
+/// Identical to [`verified_call`]'s: this is a `scoped`, so it *shadows* an
+/// outer scope. Every caller — the thirteen connector/triage ones through
+/// [`verified_call`], plus `connector_oauth.rs`'s code exchange, refresh,
+/// revoke and identity verification — is a person clicking something in
+/// Settings (connect, reverify, remove), so
+/// [`crate::run_scope::Unattributed::UserAction`] is honest for all of them.
+/// `connectors::read_credential` refuses an OAuth account precisely so a
+/// durable run can never drive a token refresh through here and have its
+/// egress silently relabelled as a user action.
+pub(crate) async fn verified_call_with_body(
+    method: reqwest::Method,
+    url: &Url,
+    allowed_origin: &str,
+    allow_loopback: bool,
+    headers: &[(&'static str, String)],
+    basic_auth: Option<(&str, &str)>,
+    body: RequestBody<'_>,
+) -> Result<Vec<u8>, String> {
     crate::run_scope::scoped(
         crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
         verified_call_within_scope(
@@ -293,7 +390,7 @@ pub(crate) async fn verified_call(
             allow_loopback,
             headers,
             basic_auth,
-            json_body,
+            body,
         ),
     )
     .await
@@ -312,7 +409,7 @@ async fn verified_call_within_scope(
     allow_loopback: bool,
     headers: &[(&'static str, String)],
     basic_auth: Option<(&str, &str)>,
-    json_body: Option<&Value>,
+    body: RequestBody<'_>,
 ) -> Result<Vec<u8>, String> {
     let policy =
         crate::knowledge_pipeline::UrlSourcePolicy::new([allowed_origin], allow_loopback, false)
@@ -344,8 +441,10 @@ async fn verified_call_within_scope(
     if let Some((username, password)) = basic_auth {
         request = request.basic_auth(username, Some(password));
     }
-    if let Some(body) = json_body {
-        request = request.json(body);
+    match body {
+        RequestBody::None => {}
+        RequestBody::Json(value) => request = request.json(value),
+        RequestBody::Form(pairs) => request = request.form(pairs),
     }
 
     let response = crate::egress::send(request)
@@ -370,7 +469,16 @@ async fn verified_call_within_scope(
         body.extend_from_slice(&chunk);
     }
     if !status.is_success() {
-        let snippet: String = String::from_utf8_lossy(&body).chars().take(300).collect();
+        // The body is provider-controlled and this snippet is stored in
+        // `last_error`, printed raw by `monkey connectors list` and included
+        // in the audit export — so a control character in it could forge a
+        // line or emit ANSI in an operator's terminal. Same rule
+        // `connector_oauth::checked_identity` applies to the identity string.
+        let snippet: String = String::from_utf8_lossy(&body)
+            .chars()
+            .take(300)
+            .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+            .collect();
         return Err(format!("Verification failed with HTTP {status}: {snippet}"));
     }
     Ok(body)
@@ -720,6 +828,18 @@ pub fn credential_for_account(account: &ConnectorAccount) -> Result<String, Stri
 }
 
 pub(crate) fn read_credential(account: &ConnectorAccount) -> Result<String, String> {
+    // An OAuth account's keychain entry holds a token *record* (access token,
+    // refresh token, expiry), not a bearer credential, and reading it raw
+    // would skip the refresh. Refusing here also keeps a durable run
+    // (knowledge sync, triage) from triggering a refresh inside
+    // `verified_call`'s `Unattributed::UserAction` scope and mislabelling
+    // that run's egress — see `verified_call_with_body`'s run-scope note.
+    if crate::connector_oauth::spec_for(account.provider).is_some() {
+        return Err(format!(
+            "'{}' is an OAuth account — read its token through connector_oauth::access_token, which refreshes it",
+            account.id
+        ));
+    }
     let credential_ref = account
         .credential_ref
         .as_deref()
@@ -905,6 +1025,20 @@ async fn verify_token(
         ConnectorProvider::S3 => {
             Err("S3 connects via connectors_add_s3, not a pasted token".to_string())
         }
+        // Every remaining variant has an entry in
+        // `connector_oauth::OAUTH_PROVIDERS`: it needs a registered OAuth app
+        // and a browser consent step, and there is no pasted-token shape for
+        // it that would be anything but a workaround. The `None` half is a
+        // refusal rather than an `unreachable!()` so that a variant added to
+        // the enum and nowhere else fails closed here — `as_str` and
+        // `reverify_impl` are what force the compile error.
+        other => Err(match crate::connector_oauth::spec_for(other) {
+            Some(_) => format!(
+                "{} connects over OAuth — use connectors_oauth_connect instead of a pasted token",
+                other.as_str()
+            ),
+            None => format!("{} does not support a pasted token", other.as_str()),
+        }),
     }
 }
 
@@ -1216,7 +1350,9 @@ pub async fn connectors_add_s3(
     .await
 }
 
-fn remove_impl(state: &AppState, path: &Path, id: &str) -> Result<(), String> {
+/// `pub` because `monkey connectors remove` in the CLI bin (a separate
+/// crate from this lib) calls it directly.
+pub fn remove_impl(state: &AppState, path: &Path, id: &str) -> Result<(), String> {
     let _guard = state
         .connectors_config_lock
         .lock()
@@ -1247,8 +1383,35 @@ fn remove_impl(state: &AppState, path: &Path, id: &str) -> Result<(), String> {
 /// keychain secret. Removing an unknown id is a no-op success, not an error
 /// — the caller's desired end state (the account is gone) already holds.
 #[tauri::command]
-pub fn connectors_remove(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-    remove_impl(state.inner(), &config_file_path()?, &id)
+pub async fn connectors_remove(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    remove_account(state.inner(), &config_file_path()?, &id).await
+}
+
+/// Removal end to end: best-effort revocation at the provider, then the
+/// catalog row and its keychain entries. `pub` because `monkey connectors
+/// remove` in the CLI bin (a separate crate) is the second caller.
+pub async fn remove_account(state: &AppState, path: &Path, id: &str) -> Result<(), String> {
+    // Best-effort revocation happens *before* `remove_impl`, and outside it:
+    // `remove_impl` holds `connectors_config_lock` (a `std::sync::Mutex`) for
+    // its whole body, so an `.await` inside would make this future non-`Send`.
+    // A provider that publishes no callable revocation endpoint, or a network
+    // failure, must never block the user from removing the account.
+    let removed = load_config_impl(path)?
+        .accounts
+        .into_iter()
+        .find(|account| account.id == id);
+    if let Some(account) = &removed {
+        crate::connector_oauth::revoke_and_forget(state, account).await;
+    }
+    // The per-provider OAuth app registration is deliberately *kept*: it is
+    // shared by every account of that provider, and both the Connectors panel
+    // and `docs/byo-oauth-clients.md` promise that a blank client id reuses
+    // the app you already registered. Erasing it when the last account goes
+    // would break that promise the next time the user reconnects.
+    remove_impl(state, path, id)
 }
 
 /// Core logic behind `reverify_impl`'s GitHub branch, parameterized by the
@@ -1288,7 +1451,9 @@ fn reverify_github_identity_impl(
     }
 }
 
-async fn reverify_impl(
+/// `pub` because `monkey connectors reverify` in the CLI bin (a separate
+/// crate from this lib) calls it directly.
+pub async fn reverify_impl(
     state: &AppState,
     path: &Path,
     id: &str,
@@ -1328,6 +1493,22 @@ async fn reverify_impl(
                 let secret_key = read_credential(&account)?;
                 let (endpoint, bucket, region, access_key) = s3_connection(&account)?;
                 verify_s3(&endpoint, &bucket, &region, &access_key, &secret_key).await
+            }
+            // Every OAuth provider reverifies the same way: take a currently
+            // valid access token (refreshing it first if it expired) and make
+            // the one read-only identity call its spec names.
+            ConnectorProvider::GoogleDrive
+            | ConnectorProvider::MicrosoftGraph
+            | ConnectorProvider::Linear
+            | ConnectorProvider::Asana
+            | ConnectorProvider::Dropbox
+            | ConnectorProvider::Box
+            | ConnectorProvider::Airtable
+            | ConnectorProvider::Zendesk
+            | ConnectorProvider::Hubspot
+            | ConnectorProvider::Discord
+            | ConnectorProvider::Gitlab => {
+                crate::connector_oauth::verify_account(state, &account).await
             }
             // Reverifying an extension connector asks the runtime, not a
             // remote service: the question is whether the capability this
@@ -1727,6 +1908,39 @@ mod tests {
         )
         .await;
         assert!(s3_result.is_err());
+
+        // Every OAuth-only provider is refused the same way, and nothing is
+        // written — a pasted token is not a substitute for browser consent.
+        for provider in [
+            ConnectorProvider::GoogleDrive,
+            ConnectorProvider::MicrosoftGraph,
+            ConnectorProvider::Linear,
+            ConnectorProvider::Asana,
+            ConnectorProvider::Dropbox,
+            ConnectorProvider::Box,
+            ConnectorProvider::Airtable,
+            ConnectorProvider::Zendesk,
+            ConnectorProvider::Hubspot,
+            ConnectorProvider::Discord,
+            ConnectorProvider::Gitlab,
+        ] {
+            let error = add_token_impl(
+                &state,
+                &path,
+                provider,
+                "Wrong".to_string(),
+                "tok".to_string(),
+                vec!["read".to_string()],
+                None,
+                None,
+            )
+            .await
+            .expect_err(&format!("{provider:?} must refuse a pasted token"));
+            assert!(
+                error.contains("connects over OAuth"),
+                "{provider:?}: {error}"
+            );
+        }
         assert!(load_config_impl(&path).unwrap().accounts.is_empty());
     }
 
@@ -1831,6 +2045,37 @@ mod tests {
         assert!(!serialized.contains("jane@acme.example"));
     }
 
+    #[test]
+    fn export_audit_redacts_an_oauth_rows_host_and_keychain_reference() {
+        let path = temp_path("export_audit_oauth.json");
+        let account = ConnectorAccount {
+            id: "acct-gl".to_string(),
+            provider: ConnectorProvider::Gitlab,
+            label: "Work GitLab".to_string(),
+            scopes: vec!["read_user".to_string()],
+            credential_ref: Some(crate::connector_oauth::token_keychain_account("acct-gl")),
+            identity: Some("ada".to_string()),
+            created_at: 1,
+            last_verified_at: Some(2),
+            last_error: None,
+            connection: Some(serde_json::json!({ "host": "gitlab.example.com" })),
+        };
+        save_config_impl(
+            &path,
+            &ConnectorCatalogFile {
+                version: SCHEMA_VERSION,
+                accounts: vec![account],
+            },
+        )
+        .unwrap();
+
+        let serialized = serde_json::to_string(&export_audit_impl(&path).unwrap()).unwrap();
+        assert!(serialized.contains("gitlab"), "provider is kept");
+        assert!(!serialized.contains("gitlab.example.com"), "{serialized}");
+        assert!(!serialized.contains("connector-oauth:"), "{serialized}");
+        assert!(!serialized.contains("ada"), "{serialized}");
+    }
+
     // --- SSRF / origin pinning for the verification HTTP call ---------------
 
     fn spawn_fixture(
@@ -1857,6 +2102,72 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// Records the raw request so the assertion can be about what actually
+    /// went on the wire, which the `&'static str`-bodied `spawn_fixture`
+    /// above cannot do.
+    fn spawn_recording_fixture() -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                recorder
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let body = "{\"ok\":true}";
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (addr, seen)
+    }
+
+    #[tokio::test]
+    async fn verified_call_sends_a_url_encoded_form_body() {
+        let (addr, seen) = spawn_recording_fixture();
+        let origin = format!("http://{addr}");
+        let url = Url::parse(&format!("{origin}/token")).unwrap();
+        let pairs = [
+            ("grant_type", "authorization_code".to_string()),
+            ("code", "a code with spaces".to_string()),
+        ];
+        verified_call_with_body(
+            reqwest::Method::POST,
+            &url,
+            &origin,
+            true,
+            &[],
+            None,
+            RequestBody::Form(&pairs),
+        )
+        .await
+        .unwrap();
+
+        let request = seen.lock().unwrap()[0].clone();
+        assert!(
+            request.contains("content-type: application/x-www-form-urlencoded")
+                || request.contains("Content-Type: application/x-www-form-urlencoded"),
+            "{request}"
+        );
+        assert!(request.contains("grant_type=authorization_code"), "{request}");
+        assert!(request.contains("code=a+code+with+spaces"), "{request}");
     }
 
     #[tokio::test]
