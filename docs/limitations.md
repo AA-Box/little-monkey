@@ -79,8 +79,11 @@ rather than left for a reader to discover. Work that is not built yet lives in
   bundled; the archive README declares Apache License 2.0, while upstream's
   model-license provenance clarification remains open. Native execution has
   been exercised on macOS arm64. The dedicated workflow is configured to run
-  the real runtime and the acceptance walkthrough natively on all six supported
-  targets rather than inferring five of them from compilation, but those
+  the real runtime and the acceptance walkthrough natively on five of the six
+  supported targets rather than inferring them from compilation. Intel macOS is
+  the exception and is compiled, not run: GitHub's `macos-13` image is retired
+  and is cancelled without executing a step, so there is no host to run it on.
+  Those
   jobs remain unverified until the first green hosted run. sherpa's keyword API reports token
   timestamps relative to a decoding segment it restarts on silence without
   saying so, and exposes no absolute position, so a keyword spotted late in a

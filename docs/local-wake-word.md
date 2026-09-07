@@ -229,9 +229,12 @@ reported rather than dressed up as listening, that no wake session is started
 without a grant, and that a grant revoked mid-session ends the track and fails
 the engine closed. The click itself is the operator's.
 
-The dedicated Local Wake Word workflow runs the native runtime on every
-supported desktop target — macOS arm64 and x86_64, Linux arm64 and x86_64,
-Windows arm64 and x86_64 — rather than compiling five of them and executing one.
+The dedicated Local Wake Word workflow runs the native runtime on five of the
+six supported desktop targets — macOS arm64, Linux arm64 and x86_64, Windows
+arm64 and x86_64 — rather than compiling all of them and executing one. Intel
+macOS is compiled against its own authenticated archive and not run, because
+GitHub's `macos-13` image is retired and is cancelled without executing a step;
+that is stated as a compile, never as a verified runtime.
 Each host authenticates its own archive, stages the verified model, opens the
 real runtime, runs the positive/negative, KWS-to-Whisper and long-armed-session
 tests, and then the fifteen-step walkthrough. There is no compile-only matrix:

@@ -24,7 +24,7 @@
     "test:manifest": "node scripts/lib/runtimeManifest.test.mjs",
     "test:runtime-archive": "node --test scripts/lib/managedRuntimeArchive.test.mjs",
     "test:wake-assets": "node --test scripts/lib/wakeWordAssets.test.mjs",
-    "test:wake-walkthrough": "cargo build --manifest-path src-tauri/Cargo.toml --bin wake-word-e2e && LITTLE_MONKEY_WAKE_WALKTHROUGH_E2E=1 vitest run src/lib/wakeWordWalkthrough.e2e.test.ts",
+    "test:wake-walkthrough": "node scripts/run-wake-walkthrough.mjs",
     "test:rust": "pnpm stage:cli:placeholder && pnpm stage:sherpa-runtime && cargo test --manifest-path src-tauri/Cargo.toml",
     "contract:check": "cargo test --manifest-path src-tauri/Cargo.toml --test contract_abi",
     "i18n:lint": "vitest run src/lib/i18n/keyLint.test.ts src/lib/i18n/localeSync.test.ts",

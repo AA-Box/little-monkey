@@ -59,8 +59,6 @@ jobs:
         include:
           - os: macos-latest
             label: macOS arm64
-          - os: macos-13
-            label: macOS x86_64
           - os: ubuntu-22.04
             label: Linux x86_64
           - os: ubuntu-24.04-arm
@@ -116,6 +114,17 @@ jobs:
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib local_wake_word::tests::a_long_armed_session_never_places_the_keyword_before_the_audio_that_revealed_it -- --nocapture
       - name: Fifteen-step acceptance walkthrough across both runtimes
         run: pnpm test:wake-walkthrough
+      # There is no working Intel macOS runner here: `macos-13` is retired and
+      # is cancelled without running a single step in this repository's other
+      # workflows too, so that target cannot execute the runtime at all. It gets
+      # the authenticated archive and a compile instead, and
+      # docs/limitations.md says plainly that it is compiled rather than run.
+      - name: Cross-check the Intel macOS target, which has no runtime host
+        if: matrix.os == 'macos-latest'
+        run: |
+          rustup target add x86_64-apple-darwin
+          node scripts/stage-sherpa-runtime.mjs x86_64-apple-darwin
+          cargo check --locked --manifest-path src-tauri/Cargo.toml --lib --target x86_64-apple-darwin
 
   bundle:
     name: Linux installer carries verified KWS assets
