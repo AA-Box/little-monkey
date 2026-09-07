@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """One-shot branch finalizer for PR #506.
 
-Applied in CI so the large Rust files are formatted/compiled before the
-verified patch is committed. The workflow deletes this script afterwards.
+Applied in CI so the large Rust files are formatted, compiled, and exercised
+before the verified production patch is committed. The workflow deletes this
+script afterwards.
 """
 
 from pathlib import Path
