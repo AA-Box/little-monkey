@@ -294,6 +294,20 @@ describe("toolsForSettings", () => {
 
   const toolsWithWeb = [toolDef("write_file"), toolDef("web_fetch"), toolDef("web_search"), toolDef("run_shell")];
 
+  // Mirrors monkey-cli's own `any_device_is_capable()` gate: a model told it
+  // has a camera will try to use one, and "no paired device can do this" is a
+  // worse answer than never having been offered the tool. Default `false`, so a
+  // caller that never probes never offers it.
+  it("hides device_action until a paired device can actually perform an action", () => {
+    const withDevice = [toolDef("device_action"), toolDef("write_file")];
+    expect(toolsForSettings(withDevice, true).map((tool) => tool.function.name)).toEqual(["write_file"]);
+    expect(
+      toolsForSettings(withDevice, true, true, false, false, false, false, false, false, true).map(
+        (tool) => tool.function.name,
+      ),
+    ).toEqual(["device_action", "write_file"]);
+  });
+
   it("hides Computer Use until the user enables the desktop-control capability", () => {
     const computer = [toolDef("computer_list_targets"), toolDef("computer_click"), toolDef("write_file")];
     expect(toolsForSettings(computer, true).map((tool) => tool.function.name)).toEqual(["write_file"]);

@@ -4526,6 +4526,7 @@ pub async fn desktop_control_request_action(
     action: ControlAction,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     ensure_main_window(&window)?;
     request_action_impl(
@@ -4537,10 +4538,52 @@ pub async fn desktop_control_request_action(
         action,
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
 
+/// Notes that a control action delivered (or may have delivered) input to
+/// another application during this turn.
+///
+/// The `AppState` is fetched from the handle rather than taken as a parameter
+/// because `DesktopControlState` is its own Tauri-managed state and none of the
+/// `computer_*` commands hold both; every one of them already has the handle.
+fn record_desktop_control_effect(
+    app: &tauri::AppHandle,
+    checkpoint_id: Option<&str>,
+) -> Result<(), String> {
+    crate::checkpoints::record_external_effect(
+        app.state::<crate::AppState>().inner(),
+        checkpoint_id,
+        crate::checkpoints::ExternalEffectKind::DesktopControl,
+    )
+}
+
+/// The success half of [`record_desktop_control_effect`] — the action returned
+/// an outcome, so it was watched to completion rather than merely believed to
+/// have happened.
+fn commit_desktop_control_effect(
+    app: &tauri::AppHandle,
+    checkpoint_id: Option<&str>,
+) -> Result<(), String> {
+    crate::checkpoints::commit_external_effect(
+        app.state::<crate::AppState>().inner(),
+        checkpoint_id,
+        crate::checkpoints::ExternalEffectKind::DesktopControl,
+    )
+}
+
+/// `checkpoint_id` is the turn's open checkpoint, and the only reason this
+/// function takes it: an action that actually reaches another application is an
+/// external effect a file restore cannot undo, so it is recorded on the two
+/// arms below that executed one (see [`crate::checkpoints::ExternalEffectKind::DesktopControl`]).
+/// Threaded like `turn_id`/`tool_call_id` rather than special-cased per action:
+/// which tools get a checkpoint id at all is decided in the frontend
+/// (`turnEngine.ts`'s `RESERVED_ARGS`, keyed off `classifyExternalTool`), and it
+/// deliberately supplies none for `computer_wait` — sleeping delivers no input,
+/// so there is nothing for a revert to reconcile. `None` records nothing.
+#[allow(clippy::too_many_arguments)]
 async fn request_action_impl(
     app: &tauri::AppHandle,
     state: &DesktopControlState,
@@ -4550,6 +4593,7 @@ async fn request_action_impl(
     action: ControlAction,
     run_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     let context = AuditContext {
         run_id,
@@ -4584,6 +4628,12 @@ async fn request_action_impl(
     };
     match gate {
         ActionGate::Executed(result) => {
+            // Declared here rather than before the gate, because the gate is
+            // also what refuses: a refused or denied action records nothing.
+            // Declared before the result is unwrapped, because an action that
+            // failed part-way may still have delivered its input — the same
+            // pessimism `tool_web_fetch` applies to a failed request.
+            record_desktop_control_effect(app, checkpoint_id.as_deref())?;
             let result = result.map_err(|error| {
                 if error.trim_start().starts_with('{') {
                     error
@@ -4595,6 +4645,7 @@ async fn request_action_impl(
                     )
                 }
             })?;
+            commit_desktop_control_effect(app, checkpoint_id.as_deref())?;
             Ok(ActionOutcome {
                 action_id: format!("batch-{}", Uuid::new_v4()),
                 executed: true,
@@ -4626,12 +4677,17 @@ async fn request_action_impl(
             );
             match tokio::time::timeout(ACTION_APPROVAL_TIMEOUT, receiver).await {
                 Ok(Ok(true)) => {
+                    // The operator approved, so from here the input is about to
+                    // be delivered — declared before that happens, for the
+                    // Executed arm's reason.
+                    record_desktop_control_effect(app, checkpoint_id.as_deref())?;
                     let result =
                         state
                             .take_approved_pending(&action_id, &action)
                             .map_err(|error| {
                                 wire_control_error(error, ComputerUseFailurePhase::Authorize)
                             })?;
+                    commit_desktop_control_effect(app, checkpoint_id.as_deref())?;
                     Ok(ActionOutcome {
                         action_id,
                         executed: true,
@@ -4805,6 +4861,7 @@ pub async fn tool_computer_focus(
     target_window_id: Option<String>,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     request_action_impl(
         &app,
@@ -4815,6 +4872,7 @@ pub async fn tool_computer_focus(
         ControlAction::Focus,
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -4833,6 +4891,7 @@ pub async fn tool_computer_click(
     expected_value: Option<String>,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     let button = button.unwrap_or(MouseButtonKind::Left);
     let action = if let Some(element_id) = element_id {
@@ -4867,6 +4926,7 @@ pub async fn tool_computer_click(
         action,
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -4885,6 +4945,7 @@ pub async fn tool_computer_double_click(
     expected_value: Option<String>,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     let button = button.unwrap_or(MouseButtonKind::Left);
     let action = if let Some(element_id) = element_id {
@@ -4919,6 +4980,7 @@ pub async fn tool_computer_double_click(
         action,
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -4934,6 +4996,7 @@ pub async fn tool_computer_scroll(
     delta_y: i32,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     request_action_impl(
         &app,
@@ -4944,6 +5007,7 @@ pub async fn tool_computer_scroll(
         ControlAction::Scroll { delta_x, delta_y },
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -4958,6 +5022,7 @@ pub async fn tool_computer_type(
     text: String,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     request_action_impl(
         &app,
@@ -4968,6 +5033,7 @@ pub async fn tool_computer_type(
         ControlAction::TypeText { text },
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -4982,6 +5048,7 @@ pub async fn tool_computer_key(
     key: String,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     request_action_impl(
         &app,
@@ -4992,6 +5059,7 @@ pub async fn tool_computer_key(
         ControlAction::KeyPress { key },
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -5006,6 +5074,7 @@ pub async fn tool_computer_hotkey(
     keys: Vec<String>,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     request_action_impl(
         &app,
@@ -5016,6 +5085,7 @@ pub async fn tool_computer_hotkey(
         ControlAction::Hotkey { keys },
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -5030,6 +5100,7 @@ pub async fn tool_computer_wait(
     milliseconds: u64,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     request_action_impl(
         &app,
@@ -5040,6 +5111,7 @@ pub async fn tool_computer_wait(
         ControlAction::Wait { milliseconds },
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -5055,6 +5127,7 @@ pub async fn tool_computer_select(
     value: String,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     request_action_impl(
         &app,
@@ -5065,6 +5138,7 @@ pub async fn tool_computer_select(
         ControlAction::Select { element_id, value },
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -5080,6 +5154,7 @@ pub async fn tool_computer_set_value(
     value: String,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     request_action_impl(
         &app,
@@ -5090,6 +5165,7 @@ pub async fn tool_computer_set_value(
         ControlAction::SetValue { element_id, value },
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
