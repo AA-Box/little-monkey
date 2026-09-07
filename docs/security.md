@@ -25,4 +25,15 @@ An origin outside this machine — a message on a channel, a text or a caller, a
 
 Security Doctor is a posture aid, not a substitute for operating-system updates, endpoint security, or a release penetration test. It covers storage, network listeners, MCP origins, extensions, skills, process isolation, browser and companion grants, voice, paired devices, messaging channels, telephony and peers; the desktop panel and `monkey security audit` run the same checks over the same state.
 
+Desktop realtime Talk is brokered natively: the WebView sends an SDP offer,
+the native host reads the ordinary OpenAI key from the existing OS keychain and
+contacts only the compiled-in OpenAI Realtime calls origin, then returns an SDP
+answer. The credential is never exposed to JavaScript, a URL, logs, transcript,
+or metrics. A privacy acknowledgement is required before the microphone opens,
+and Security Doctor reports realtime voice as a separate configured/active
+status. Provider function calls do not create a permission shortcut; they enter
+the same schema validation, permission prompt, plan-mode, sandbox, workspace,
+network, MCP, extension, and hook boundary as typed turns. Details and teardown
+semantics are in [Desktop realtime voice](realtime-voice.md).
+
 A support bundle is built to be handed over: it carries a bounded trace of what the messaging, telephony, peer and device subsystems did, and no message text, transcript, audio, key, session or credential — those have no field in the format. Identifiers are pseudonymized with a salt generated per bundle and never recorded, so a party is consistent within one document and correlates with nothing outside it.

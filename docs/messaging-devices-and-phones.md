@@ -264,6 +264,11 @@ you allow it on a lock screen.
 
 ## Talk
 
+This section describes Talk reached through the paired-phone/daemon protocol.
+The desktop app also has an opt-in OpenAI WebRTC engine; it is intentionally
+separate from the phone socket and the live-call extension backend. See
+[Desktop realtime voice](realtime-voice.md).
+
 A spoken conversation with the agent, on the desktop and on a foregrounded
 phone. Speech recognition and synthesis use whatever backend you configured;
 a number set to answer calls with no transcription backend is a critical finding

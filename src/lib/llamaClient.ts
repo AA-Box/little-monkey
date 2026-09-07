@@ -43,6 +43,15 @@ export interface ChatMessage {
    * index map so it survives forks, edits, and truncation without any
    * index bookkeeping; stripped from the wire like `at`. */
   chapter?: string;
+  /** Local-only provenance used to make realtime transcript/event replay
+   * idempotent across reconnects. Never sent to a model provider. */
+  realtime?: {
+    sessionId: string;
+    itemId: string;
+    eventId?: string;
+    turnId?: string;
+    kind: 'input_transcript' | 'output_transcript' | 'tool_call' | 'tool_result';
+  };
 }
 
 /** Strips the local-only fields above so a request body carries nothing but
@@ -50,7 +59,7 @@ export interface ChatMessage {
  * providers reject unknown message properties outright, and the Rust proxy
  * forwards `messages` as opaque JSON, so it can't do the filtering for us. */
 export function toWireMessages(messages: ChatMessage[]): ChatMessage[] {
-  return messages.map(({ at: _at, chapter: _chapter, ...wire }) => wire);
+  return messages.map(({ at: _at, chapter: _chapter, realtime: _realtime, ...wire }) => wire);
 }
 
 /** Extracts the plain-text portion of a message's `content` — a no-op for

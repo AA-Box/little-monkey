@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::browser_worker::BrowserCommandState;
 use crate::m4_commands::M4CommandState;
 use crate::m7_companion::{CaptureKind, M7CompanionState};
+use crate::realtime_voice::RealtimeVoiceState;
 use crate::native_skill_commands::NativeSkillsCommandState;
 use crate::native_skills::{ExternalSignedSkill, SkillSource};
 use crate::security_doctor::{
@@ -29,6 +30,7 @@ pub async fn security_audit(
     m4: tauri::State<'_, M4CommandState>,
     browser: tauri::State<'_, BrowserCommandState>,
     companion: tauri::State<'_, M7CompanionState>,
+    realtime_voice: tauri::State<'_, RealtimeVoiceState>,
     app: tauri::State<'_, AppState>,
     deep: bool,
     fix: bool,
@@ -79,10 +81,14 @@ pub async fn security_audit(
     // read that fails leaves `None`, which the audit reads as "not observed"
     // rather than as "nothing is listening".
     if let Ok(voice) = companion.security_voice_privacy() {
+        let realtime_active = realtime_voice.active_session_count().unwrap_or(0) > 0;
         runtime.voice = Some(VoicePrivacySnapshot {
             wake_phrase_enabled: voice.wake_phrase_enabled,
             always_listening: voice.always_listening,
             local_only: voice.local_only,
+            realtime_configured: voice.realtime_configured,
+            realtime_active,
+            realtime_provider_id: voice.realtime_provider_id,
         });
     }
 

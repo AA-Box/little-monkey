@@ -16,7 +16,10 @@ import { AlertTriangle, Gauge, Mic, Radio, Save, Trash2, Volume2 } from 'lucide-
 import {
   blobToBase64,
   companionClient,
+  realtimeVoiceClient,
   type CompanionConfig,
+  type RealtimeVoiceMetricsSnapshot,
+  type RealtimeVoiceStatus,
   type TranscriptionBackendKind,
   type VoiceConfig,
 } from '../../lib/companionClient';
@@ -73,6 +76,8 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
   const [inputs, setInputs] = useState<DeviceOption[]>([]);
   const [outputs, setOutputs] = useState<DeviceOption[]>([]);
   const [metrics, setMetrics] = useState<TalkMetricsSnapshot | null>(null);
+  const [realtimeMetrics, setRealtimeMetrics] = useState<RealtimeVoiceMetricsSnapshot | null>(null);
+  const [realtimeStatus, setRealtimeStatus] = useState<RealtimeVoiceStatus | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -109,6 +114,8 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
   useEffect(() => {
     void loadDevices().catch((reason) => setError(errorMessage(reason)));
     void talkClient.metrics().then(setMetrics).catch(() => undefined);
+    void realtimeVoiceClient.metrics().then(setRealtimeMetrics).catch(() => undefined);
+    void realtimeVoiceClient.status().then(setRealtimeStatus).catch(() => undefined);
     void dictationClient.capabilities().then(setDictationCapabilities).catch(() => undefined);
   }, [loadDevices]);
 
@@ -259,6 +266,7 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
   const firstToken = metrics ? latencySummary(metrics.metrics, 'modelFirstTokenMs') : null;
   const firstAudio = metrics ? latencySummary(metrics.metrics, 'ttsFirstAudioMs') : null;
   const endToEnd = metrics ? latencySummary(metrics.metrics, 'endToEndMs') : null;
+  const latestRealtime = realtimeMetrics?.metrics[realtimeMetrics.metrics.length - 1] ?? null;
 
   return (
     <section className="rounded-lg border border-border bg-surface p-4">
@@ -267,14 +275,127 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
         <h3 className="text-sm font-semibold">Talk</h3>
       </div>
       <p className="mt-1 text-xs text-muted">
-        Devices, how Talk decides you have stopped speaking, and whether anything listens on its own.
+        Choose the classic speech pipeline or one low-latency provider session. The classic pipeline remains the default.
       </p>
       <p className="mt-1 text-[11px] text-faint">
-        Transcription runs through {BACKEND_LABEL[voice.backend]}, chosen under “Voice and
-        transcription” above. A spoken turn goes through Talk&apos;s own transcription, which keeps
-        nothing: “Persist raw audio artifacts” there does not apply to a conversation, and no
-        recording of one is written anywhere.
+        {(voice.engineKind ?? 'pipeline') === 'pipeline'
+          ? <>Transcription runs through {BACKEND_LABEL[voice.backend]}, chosen under “Voice and transcription” above. A spoken turn uses the ordinary configured model route and speech backend. No Talk recording is written anywhere.</>
+          : <>Realtime uses a native audio-in/audio-out model session. The local Whisper, chat-model route, TTS, and wake controls below are not used or shown in this mode.</>}
       </p>
+
+      <div className="mt-4 rounded-md border border-border p-3">
+        <h4 className="text-xs font-semibold">Voice mode</h4>
+        <div className="mt-2 grid gap-2 sm:grid-cols-2">
+          <label className={`rounded-md border p-3 text-xs ${(voice.engineKind ?? 'pipeline') === 'pipeline' ? 'border-accent bg-accent/5' : 'border-border'}`}>
+            <input
+              className="mr-2"
+              type="radio"
+              name="voice-engine"
+              checked={(voice.engineKind ?? 'pipeline') === 'pipeline'}
+              onChange={() => patch({ engineKind: 'pipeline' })}
+            />
+            <span className="font-medium">Classic pipeline</span>
+            <span className="mt-1 block text-[11px] text-faint">Microphone → VAD → transcription → normal agent turn → speech. Existing behavior and routing.</span>
+          </label>
+          <label className={`rounded-md border p-3 text-xs ${voice.engineKind === 'realtime' ? 'border-accent bg-accent/5' : 'border-border'}`}>
+            <input
+              className="mr-2"
+              type="radio"
+              name="voice-engine"
+              checked={voice.engineKind === 'realtime'}
+              onChange={() => {
+                setConfirmingAlwaysListening(false);
+                patch({ engineKind: 'realtime', wakePhraseEnabled: false, alwaysListening: false });
+              }}
+            />
+            <span className="font-medium">Realtime WebRTC</span>
+            <span className="mt-1 block text-[11px] text-faint">A direct live audio session. It does not silently fall back to the pipeline or another provider.</span>
+          </label>
+        </div>
+      </div>
+
+      {voice.engineKind === 'realtime' && (
+        <div className="mt-4 rounded-md border border-warning/40 bg-warning/5 p-3">
+          <div className="flex items-center gap-2">
+            <AlertTriangle size={14} />
+            <h4 className="text-xs font-semibold">Realtime provider</h4>
+            <span className={`ml-auto text-[11px] ${realtimeStatus?.configured ? 'text-success' : 'text-warning'}`}>
+              {realtimeStatus?.configured ? `${realtimeStatus.activeSessions} active · key in OS keychain` : 'OpenAI key required'}
+            </span>
+          </div>
+          <p className="mt-1 text-[11px] text-faint">
+            During an active session, microphone audio and a bounded text context are sent to OpenAI.
+            The ordinary API key stays in the native keychain broker and is never exposed to the WebView, logs, storage, or a URL.
+          </p>
+          <p className="mt-1 text-[11px] text-faint">
+            Capabilities: audio in/out, input and assistant transcripts, semantic or manual VAD, barge-in, function tools, and provider usage events.
+          </p>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <label className="text-xs text-muted">Provider
+              <select className={`${INPUT} mt-1`} value={voice.realtimeProviderId ?? 'openai'} disabled>
+                <option value="openai">OpenAI (fixed official origin)</option>
+              </select>
+            </label>
+            <label className="text-xs text-muted">Model
+              <input className={`${INPUT} mt-1`} value={voice.realtimeModel ?? 'gpt-realtime-2.1'} maxLength={128} onChange={(event) => patch({ realtimeModel: event.target.value })} />
+            </label>
+            <label className="text-xs text-muted">Voice
+              <select className={`${INPUT} mt-1`} value={voice.realtimeVoice ?? 'marin'} onChange={(event) => patch({ realtimeVoice: event.target.value })}>
+                {['marin', 'cedar', 'alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse'].map((value) => <option key={value} value={value}>{value}</option>)}
+              </select>
+            </label>
+            <label className="text-xs text-muted">Turn detection
+              <select className={`${INPUT} mt-1`} value={voice.realtimeTurnDetection ?? 'semantic_vad'} onChange={(event) => patch({ realtimeTurnDetection: event.target.value as VoiceConfig['realtimeTurnDetection'] })}>
+                <option value="semantic_vad">Semantic VAD · automatic interruption</option>
+                <option value="manual">Push to talk</option>
+              </select>
+            </label>
+          </div>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <label className="text-xs text-muted">Microphone
+              <select className={`${INPUT} mt-1`} value={voice.inputDeviceId ?? ''} onChange={(event) => patch({ inputDeviceId: event.target.value || null })}>
+                <option value="">System default</option>
+                {inputs.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}
+              </select>
+            </label>
+            <label className="text-xs text-muted">Speaker
+              <select className={`${INPUT} mt-1`} value={voice.outputDeviceId ?? ''} onChange={(event) => patch({ outputDeviceId: event.target.value || null })}>
+                <option value="">System default</option>
+                {outputs.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}
+              </select>
+            </label>
+          </div>
+          <div className="mt-3 flex items-center gap-2 text-[11px] text-faint">
+            <Gauge size={13} />
+            <span>{realtimeMetrics ? `${realtimeMetrics.metrics.length} realtime sessions · ${realtimeMetrics.interruptCount} interrupted · ${realtimeMetrics.reconnectCount} reconnects` : 'Realtime metrics loading…'}</span>
+            <Button
+              className="ml-auto"
+              size="sm"
+              disabled={!realtimeMetrics?.metrics.length}
+              onClick={() => void realtimeVoiceClient.clearMetrics().then(() => realtimeVoiceClient.metrics()).then(setRealtimeMetrics).catch((reason) => setError(errorMessage(reason)))}
+            ><Trash2 size={13} />Clear realtime metrics</Button>
+          </div>
+          {latestRealtime && (
+            <dl className="mt-2 grid gap-1 text-[11px] sm:grid-cols-2">
+              {[
+                ['Connect', latestRealtime.connectionMs],
+                ['First recognized speech', latestRealtime.firstRecognizedSpeechMs],
+                ['First model event', latestRealtime.firstModelEventMs],
+                ['First output audio', latestRealtime.firstAudioMs],
+                ['End to end', latestRealtime.endToEndMs],
+              ].map(([label, value]) => (
+                <div key={String(label)} className="flex justify-between gap-2">
+                  <dt className="text-muted">{String(label)}</dt>
+                  <dd className="tabular-nums">{typeof value === 'number' ? `${value} ms` : '—'}</dd>
+                </div>
+              ))}
+              <div className="flex justify-between gap-2"><dt className="text-muted">Tool round trips</dt><dd>{latestRealtime.toolRoundTripMs.length}</dd></div>
+              <div className="flex justify-between gap-2"><dt className="text-muted">Output underruns</dt><dd>{latestRealtime.outputUnderruns}</dd></div>
+              <div className="flex justify-between gap-2"><dt className="text-muted">Provider tokens</dt><dd>{latestRealtime.inputTokens} in · {latestRealtime.outputTokens} out</dd></div>
+            </dl>
+          )}
+        </div>
+      )}
 
       <div className="mt-4 rounded-md border border-border p-3">
         <div className="flex items-center gap-2">
@@ -327,8 +448,18 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
         )}
       </div>
 
+      {(voice.engineKind ?? 'pipeline') === 'pipeline' && (
+        <>
+      <p className="mt-4 text-xs font-semibold">Classic pipeline settings</p>
       <label className="mt-3 block text-xs text-muted">
-        Speech model
+        Agent model route
+        <select className={`${INPUT} mt-1`} value="session" disabled>
+          <option value="session">The session&apos;s ordinary selected chat model</option>
+        </select>
+        <span className="mt-1 block text-[11px] text-faint">Voice and typed turns share the same routing, failover policy, durable run, tools, and permissions.</span>
+      </label>
+      <label className="mt-3 block text-xs text-muted">
+        Transcription model
         <select
           className={`${INPUT} mt-1`}
           value={voice.transcriptionModel || 'base'}
@@ -651,6 +782,8 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
           </div>
         </dl>
       </div>
+        </>
+      )}
 
       {note && <p className="mt-3 text-xs text-muted">{note}</p>}
       {error && (

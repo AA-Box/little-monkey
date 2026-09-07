@@ -88,6 +88,16 @@ pub enum SpeechBackendKind {
     ExecutableExtension,
 }
 
+/// Desktop Talk engine. `Pipeline` is deliberately the default so existing
+/// installations retain the mic -> STT -> normal turn -> TTS path.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceEngineKind {
+    #[default]
+    Pipeline,
+    Realtime,
+}
+
 fn default_provider_model() -> String {
     "whisper-1".to_string()
 }
@@ -116,9 +126,35 @@ fn default_wake_phrase() -> String {
     "hey little monkey".to_string()
 }
 
+fn default_realtime_provider_id() -> String {
+    "openai".to_string()
+}
+
+fn default_realtime_model() -> String {
+    "gpt-realtime-2.1".to_string()
+}
+
+fn default_realtime_voice() -> String {
+    "marin".to_string()
+}
+
+fn default_realtime_turn_detection() -> String {
+    "semantic_vad".to_string()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VoiceConfig {
+    #[serde(default)]
+    pub engine_kind: VoiceEngineKind,
+    #[serde(default = "default_realtime_provider_id")]
+    pub realtime_provider_id: String,
+    #[serde(default = "default_realtime_model")]
+    pub realtime_model: String,
+    #[serde(default = "default_realtime_voice")]
+    pub realtime_voice: String,
+    #[serde(default = "default_realtime_turn_detection")]
+    pub realtime_turn_detection: String,
     pub backend: TranscriptionBackendKind,
     #[serde(default)]
     pub whisper_binary: Option<String>,
@@ -187,6 +223,11 @@ pub struct VoiceConfig {
 impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
+            engine_kind: VoiceEngineKind::Pipeline,
+            realtime_provider_id: default_realtime_provider_id(),
+            realtime_model: default_realtime_model(),
+            realtime_voice: default_realtime_voice(),
+            realtime_turn_detection: default_realtime_turn_detection(),
             backend: TranscriptionBackendKind::LocalWhisper,
             whisper_binary: None,
             whisper_model: None,
@@ -272,6 +313,8 @@ pub struct VoicePrivacySnapshot {
     pub wake_phrase_enabled: bool,
     pub always_listening: bool,
     pub local_only: bool,
+    pub realtime_configured: bool,
+    pub realtime_provider_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -563,7 +606,11 @@ impl M7CompanionState {
         Ok(VoicePrivacySnapshot {
             wake_phrase_enabled: voice.wake_phrase_enabled,
             always_listening: voice.always_listening,
-            local_only: voice.backend == TranscriptionBackendKind::LocalWhisper,
+            local_only: voice.engine_kind == VoiceEngineKind::Pipeline
+                && voice.backend == TranscriptionBackendKind::LocalWhisper,
+            realtime_configured: voice.engine_kind == VoiceEngineKind::Realtime,
+            realtime_provider_id: (voice.engine_kind == VoiceEngineKind::Realtime)
+                .then_some(voice.realtime_provider_id),
         })
     }
 
@@ -813,6 +860,23 @@ fn validate_config(config: &CompanionConfig) -> Result<(), String> {
         || !(400..=2_000).contains(&config.voice.vad_silence_ms)
         || !(1_000..=90_000).contains(&config.voice.vad_max_utterance_ms)
         || config.voice.vad_min_speech_ms >= config.voice.vad_max_utterance_ms
+        || config.voice.realtime_provider_id != "openai"
+        || config.voice.realtime_model.is_empty()
+        || config.voice.realtime_model.len() > 128
+        || !config
+            .voice
+            .realtime_model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        || !matches!(
+            config.voice.realtime_voice.as_str(),
+            "alloy" | "ash" | "ballad" | "coral" | "echo" | "sage" | "shimmer"
+                | "verse" | "marin" | "cedar"
+        )
+        || !matches!(
+            config.voice.realtime_turn_detection.as_str(),
+            "semantic_vad" | "manual"
+        )
     {
         return Err("Companion configuration is invalid".to_string());
     }
@@ -836,6 +900,14 @@ fn validate_config(config: &CompanionConfig) -> Result<(), String> {
     }
     if config.voice.always_listening && !config.voice.wake_phrase_enabled {
         return Err("Always-listening requires the wake phrase to be enabled".to_string());
+    }
+    if config.voice.engine_kind == VoiceEngineKind::Realtime
+        && (config.voice.wake_phrase_enabled || config.voice.always_listening)
+    {
+        return Err(
+            "Wake phrase and always-listening are available only in Classic pipeline mode"
+                .to_string(),
+        );
     }
     if (config.voice.wake_phrase_enabled || config.voice.always_listening)
         && config.voice.backend != TranscriptionBackendKind::LocalWhisper
@@ -3106,6 +3178,11 @@ mod tests {
         assert!(!config.voice.wake_phrase_enabled);
         assert!(!config.voice.always_listening);
         assert_eq!(config.voice.tts_backend, SpeechBackendKind::System);
+        assert_eq!(config.voice.engine_kind, VoiceEngineKind::Pipeline);
+        assert_eq!(config.voice.realtime_provider_id, "openai");
+        assert_eq!(config.voice.realtime_model, "gpt-realtime-2.1");
+        assert_eq!(config.voice.realtime_voice, "marin");
+        assert_eq!(config.voice.realtime_turn_detection, "semantic_vad");
         validate_config(&config).unwrap();
     }
 

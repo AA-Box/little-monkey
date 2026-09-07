@@ -138,6 +138,11 @@ pub struct VoicePrivacySnapshot {
     /// True when transcription runs on this machine. False means audio is
     /// uploaded to a provider the operator configured.
     pub local_only: bool,
+    /// A hosted desktop realtime engine is selected, separately from the
+    /// classic STT/TTS pipeline and phone-call extension setting.
+    pub realtime_configured: bool,
+    pub realtime_active: bool,
+    pub realtime_provider_id: Option<String>,
 }
 
 /// Everything about the machine's security posture that only the daemon can
@@ -2059,6 +2064,29 @@ fn audit_voice_privacy(runtime: &SecurityRuntimeSnapshot, findings: &mut Vec<Sec
     let Some(voice) = &runtime.voice else {
         return;
     };
+    if voice.realtime_active {
+        findings.push(finding(
+            "voice.realtime_active",
+            "voice",
+            "A realtime voice provider session is active",
+            "The desktop microphone is streaming to the configured realtime provider now. Tool calls still use the normal permission and sandbox boundary.",
+            FindingStatus::Warning,
+            false,
+            None,
+            Some("End Talk to close the WebRTC peer, data channel, microphone tracks, and provider session."),
+        ));
+    } else if voice.realtime_configured {
+        findings.push(finding(
+            "voice.realtime_configured",
+            "voice",
+            "Realtime provider voice is configured",
+            "Talk is configured to send live microphone audio to OpenAI only after the privacy warning is accepted and a session is started.",
+            FindingStatus::Info,
+            false,
+            None,
+            Some("Choose Classic pipeline in Settings → Talk to keep the voice engine local/turn-based."),
+        ));
+    }
     if voice.always_listening && !voice.local_only {
         findings.push(finding(
             "voice.passive_cloud_upload",
@@ -2112,7 +2140,7 @@ fn audit_voice_privacy(runtime: &SecurityRuntimeSnapshot, findings: &mut Vec<Sec
             None,
         ));
     }
-    if !voice.local_only {
+    if !voice.local_only && !voice.realtime_configured {
         findings.push(finding(
             "voice.hosted_transcription",
             "voice",
@@ -2247,6 +2275,7 @@ mod tests {
             wake_phrase_enabled: true,
             always_listening: true,
             local_only: false,
+            ..VoicePrivacySnapshot::default()
         }));
         assert!(has(&leaking, "voice.passive_cloud_upload"));
         assert_eq!(
@@ -2264,6 +2293,7 @@ mod tests {
             wake_phrase_enabled: true,
             always_listening: true,
             local_only: true,
+            ..VoicePrivacySnapshot::default()
         }));
         assert!(has(&local, "voice.always_listening"));
         assert!(!has(&local, "voice.passive_cloud_upload"));
@@ -2275,12 +2305,14 @@ mod tests {
             wake_phrase_enabled: true,
             always_listening: false,
             local_only: true,
+            ..VoicePrivacySnapshot::default()
         }));
         assert!(has(&armed, "voice.wake_phrase_enabled"));
         let quiet = voice_findings(Some(VoicePrivacySnapshot {
             wake_phrase_enabled: false,
             always_listening: false,
             local_only: true,
+            ..VoicePrivacySnapshot::default()
         }));
         assert!(has(&quiet, "voice.wake_disabled"));
         assert_eq!(quiet[0].status, FindingStatus::Pass);
@@ -2288,6 +2320,26 @@ mod tests {
         // Nothing observed says nothing, rather than claiming the microphone is
         // quiet on evidence it does not have.
         assert!(voice_findings(None).is_empty());
+    }
+
+    #[test]
+    fn the_doctor_reports_realtime_voice_separately_when_configured_and_active() {
+        let configured = voice_findings(Some(VoicePrivacySnapshot {
+            realtime_configured: true,
+            realtime_provider_id: Some("openai".to_string()),
+            ..VoicePrivacySnapshot::default()
+        }));
+        assert!(has(&configured, "voice.realtime_configured"));
+        assert!(!has(&configured, "voice.hosted_transcription"));
+
+        let active = voice_findings(Some(VoicePrivacySnapshot {
+            realtime_configured: true,
+            realtime_active: true,
+            realtime_provider_id: Some("openai".to_string()),
+            ..VoicePrivacySnapshot::default()
+        }));
+        assert!(has(&active, "voice.realtime_active"));
+        assert!(!has(&active, "voice.realtime_configured"));
     }
 
     /// An open Talk socket is a running `voice_stream` command, so the device
