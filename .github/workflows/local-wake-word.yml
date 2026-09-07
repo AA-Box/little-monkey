@@ -173,10 +173,17 @@ jobs:
             label: Windows arm64 installer
             bundles: nsis
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    defaults:
-      run:
-        shell: bash
+    # A cold release build of the whole application on the slowest of these
+    # hosts, not a `cargo check`.
+    timeout-minutes: 120
+    # Deliberately *not* `shell: bash` for the job.
+    #
+    # Bash on a Windows runner puts Git's GNU tar ahead of the Windows one, and
+    # `stage-managed-runtime.mjs` extracts with an absolute path, which GNU tar
+    # reads as a remote host: "tar: Cannot connect to C: resolve failed". The
+    # build step therefore runs under each platform's default shell, exactly as
+    # the release workflow's bundling does; the steps that genuinely need bash
+    # ask for it by name.
     env:
       # Every staging script in `beforeBuildCommand` resolves its archive from
       # one of these; naming the target explicitly keeps a bundle job from
@@ -213,6 +220,7 @@ jobs:
         if: startsWith(matrix.os, 'macos')
         run: pnpm icon:mac-liquid
       - name: Generate throwaway updater signing key
+        shell: bash
         run: |
           set -euo pipefail
           pnpm tauri signer generate --ci -p "" -w "$RUNNER_TEMP/updater.key"
@@ -224,6 +232,7 @@ jobs:
       # The shared rule below normalizes separators and ignores the columns.
       - name: List what the Debian package installs
         if: startsWith(matrix.os, 'ubuntu')
+        shell: bash
         run: |
           set -euo pipefail
           package="$(find src-tauri/target/${{ matrix.target }}/release/bundle/deb -name '*.deb' -print -quit)"
@@ -235,6 +244,7 @@ jobs:
       # tree is what the operator installs. Both are required to exist.
       - name: List what the macOS application bundle carries
         if: startsWith(matrix.os, 'macos')
+        shell: bash
         run: |
           set -euo pipefail
           image="$(find src-tauri/target/${{ matrix.target }}/release/bundle/dmg -name '*.dmg' -print -quit)"
@@ -245,6 +255,7 @@ jobs:
           find "$application" > "$RUNNER_TEMP/packaged.txt"
       - name: List what the Windows installer installs
         if: startsWith(matrix.os, 'windows')
+        shell: bash
         run: |
           set -euo pipefail
           installer="$(find src-tauri/target/${{ matrix.target }}/release/bundle/nsis -name '*-setup.exe' -print -quit)"
@@ -255,4 +266,5 @@ jobs:
           command -v "$seven_zip" > /dev/null || seven_zip="$PROGRAMFILES/7-Zip/7z.exe"
           "$seven_zip" l "$installer" > "$RUNNER_TEMP/packaged.txt"
       - name: Verify the package carries every model file and no test audio
+        shell: bash
         run: node scripts/verify-packaged-wake-assets.mjs "$RUNNER_TEMP/packaged.txt"
