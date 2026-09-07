@@ -87,7 +87,7 @@ rather than left for a reader to discover. Work that is not built yet lives in
   it on, and a target that compiles has proved the archive mapping and nothing
   about whether the model opens. A separate job builds one installer per
   release target that has a runner — Linux `.deb` on both architectures, the
-  macOS `.dmg`'s own application bundle, and the Windows installer on both
+  macOS `.dmg` mounted, and the Windows installer on both
   architectures — and asserts each one carries every model file and no test
   audio; Intel macOS has no such job for the same reason. The one acceptance
   step nothing here performs is a person speaking into a real microphone: the

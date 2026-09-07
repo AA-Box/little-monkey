@@ -160,7 +160,7 @@ test("the Intel macOS cross-check stages its target-specific CLI sidecar", () =>
 
 /**
  * The installer audit's own rules, checked against the listing shapes the three
- * bundlers actually produce — a `dpkg-deb -c` table, `find` over a macOS .app,
+ * bundlers actually produce — a `dpkg-deb -c` table, `find` over a mounted .dmg,
  * and a `7z l` listing of an NSIS installer with Windows separators.
  *
  * Checked here because the audit runs only inside a job that first spends
@@ -173,11 +173,11 @@ const DEB_LISTING = Object.keys(MODEL_FILES)
 
 test("the installer audit accepts a listing that carries every model file", () => {
   assert.equal(packagedWakeAssetProblem(DEB_LISTING), null);
-  // A macOS .app, as `find` prints it.
+  // A mounted macOS disk image, as `find` prints it.
   assert.equal(
     packagedWakeAssetProblem(
       Object.keys(MODEL_FILES)
-        .map((file) => `/x/bundle/macos/Little Monkey.app/Contents/Resources/resources/local-wake-word/${file}`)
+        .map((file) => `/tmp/dmg-mount/Little Monkey.app/Contents/Resources/resources/local-wake-word/${file}`)
         .join("\n"),
     ),
     null,

@@ -299,7 +299,7 @@ and inspects what it would install:
 | --- | --- | --- |
 | Linux x86_64 | `.deb` | `dpkg-deb -c` |
 | Linux arm64 | `.deb` | `dpkg-deb -c` |
-| macOS arm64 | `.dmg`, and the `.app` it wraps | `find` over the bundle |
+| macOS arm64 | `.dmg` | `find` over the mounted image |
 | Windows x86_64 | `-setup.exe` | `7z l` |
 | Windows arm64 | `-setup.exe` | `7z l` |
 

@@ -239,20 +239,28 @@ jobs:
           test -n "$package"
           echo "inspecting $package"
           dpkg-deb -c "$package" > "$RUNNER_TEMP/packaged.txt"
-      # The .dmg is a container around exactly this .app — the bundler builds
-      # the app first and the disk image from it — so the app's own resource
-      # tree is what the operator installs. Both are required to exist.
-      - name: List what the macOS application bundle carries
+      # The disk image itself, mounted — not the .app it was built from.
+      #
+      # `--bundles dmg` *deletes* that .app once the image exists ("Cleaning
+      # …/bundle/macos/Little Monkey.app"), so there is nothing left beside the
+      # image to inspect. Which is the better question anyway: what the operator
+      # downloads is this image, and mounting it needs no argument about whether
+      # its contents match something that used to be next to it.
+      - name: List what the macOS disk image installs
         if: startsWith(matrix.os, 'macos')
         shell: bash
         run: |
           set -euo pipefail
           image="$(find src-tauri/target/${{ matrix.target }}/release/bundle/dmg -name '*.dmg' -print -quit)"
           test -n "$image"
-          application="$(find src-tauri/target/${{ matrix.target }}/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
-          test -n "$application"
-          echo "inspecting $application, shipped as $image"
-          find "$application" > "$RUNNER_TEMP/packaged.txt"
+          echo "inspecting $image"
+          mount="$RUNNER_TEMP/dmg-mount"
+          mkdir -p "$mount"
+          hdiutil attach "$image" -nobrowse -readonly -noverify -mountpoint "$mount"
+          find "$mount" > "$RUNNER_TEMP/packaged.txt"
+          # The listing is already written; a stubborn unmount on a throwaway
+          # runner is not a packaging failure.
+          hdiutil detach "$mount" || true
       - name: List what the Windows installer installs
         if: startsWith(matrix.os, 'windows')
         shell: bash
