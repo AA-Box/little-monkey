@@ -89,12 +89,18 @@ def _lily_compatible(request: dict) -> bool:
     if request.get("structuredOutputSchema") is not None:
         return False
     temperature = request.get("temperature")
-    if temperature is not None and float(temperature) != 0.0:
-        return False
+    if temperature is not None:
+        try:
+            if float(temperature) != 0.0:
+                return False
+        except (TypeError, ValueError):
+            return False
     messages = request.get("messages") or []
-    if not messages or str(messages[-1].get("role", "")) != "user":
+    if not messages or not isinstance(messages[-1], dict) or str(messages[-1].get("role", "")) != "user":
         return False
     for message in messages:
+        if not isinstance(message, dict):
+            return False
         if message.get("images"):
             return False
         if str(message.get("role", "")) not in {"system", "user", "assistant"}:
@@ -105,16 +111,23 @@ def _lily_compatible(request: dict) -> bool:
 class _Backend:
     """Owns exactly one heavy inference child at a time."""
 
-    def __init__(self, lily_binary: Path, model: Path, fallback_service: Path, python: Path) -> None:
+    def __init__(
+        self,
+        lily_binary: Path,
+        model: Path,
+        fallback_service: Path,
+        python: Path,
+        startup_timeout: float = STARTUP_TIMEOUT_SECONDS,
+    ) -> None:
         self.lily_binary = lily_binary
         self.model = model
         self.fallback_service = fallback_service
         self.python = python
+        self.startup_timeout = max(0.1, float(startup_timeout))
         self._lock = threading.RLock()
         self._mode = "lily"
         self._port = _free_port()
         self._process: subprocess.Popen | None = None
-        self._start_lily()
 
     @property
     def mode(self) -> str:
@@ -125,6 +138,19 @@ class _Backend:
     def port(self) -> int:
         with self._lock:
             return self._port
+
+    def start(self) -> None:
+        try:
+            self._start_lily()
+            return
+        except Exception as error:  # Lily validation is stricter than the router gate.
+            sys.stderr.write(f"mlx-service engine=lily startup_failed={error!s} fallback=mlx\n")
+            sys.stderr.flush()
+        try:
+            self.ensure_fallback()
+        except Exception:
+            self.close()
+            raise
 
     def _start_lily(self) -> None:
         args = [
@@ -137,19 +163,18 @@ class _Backend:
             "262144",
         ]
         self._process = subprocess.Popen(args, stdin=subprocess.DEVNULL)
-        _wait_http(self._port, "/health", self._process, STARTUP_TIMEOUT_SECONDS)
+        _wait_http(self._port, "/health", self._process, self.startup_timeout)
         with urllib.request.urlopen(f"http://127.0.0.1:{self._port}/v1/models", timeout=2.0) as response:
             models = json.load(response)
-        ids = {str(item.get("id")) for item in models.get("data", [])}
+        ids = {str(item.get("id")) for item in models.get("data", []) if isinstance(item, dict)}
         if LILY_MODEL_ID not in ids:
-            _terminate(self._process)
             raise RuntimeError(f"Lily did not expose required model {LILY_MODEL_ID}")
         sys.stderr.write("mlx-service engine=lily status=ready\n")
         sys.stderr.flush()
 
     def ensure_fallback(self) -> int:
         with self._lock:
-            if self._mode == "mlx":
+            if self._mode == "mlx" and self._process is not None and self._process.poll() is None:
                 return self._port
             _terminate(self._process)
             self._port = _free_port()
@@ -169,7 +194,12 @@ class _Backend:
                 stdin=subprocess.DEVNULL,
                 env=env,
             )
-            _wait_port(self._port, self._process, STARTUP_TIMEOUT_SECONDS)
+            try:
+                _wait_port(self._port, self._process, self.startup_timeout)
+            except Exception:
+                _terminate(self._process)
+                self._process = None
+                raise
             self._mode = "mlx"
             sys.stderr.write("mlx-service engine=mlx reason=lily_capability_fallback status=ready\n")
             sys.stderr.flush()
@@ -182,7 +212,7 @@ class _Backend:
 
     def lily_generate(self, request: dict) -> dict:
         with self._lock:
-            if self._mode != "lily":
+            if self._mode != "lily" or self._process is None or self._process.poll() is not None:
                 raise RuntimeError("Lily is no longer active")
             port = self._port
         body = {
@@ -218,11 +248,16 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         sys.stderr.write("lily-managed %s\n" % (format % args))
 
+    def _backend(self) -> _Backend:
+        if self.backend is None:
+            raise RuntimeError("managed backend is not initialized")
+        return self.backend
+
     def do_GET(self) -> None:  # noqa: N802
         if self.path != "/health":
             self.send_error(404)
             return
-        payload = json.dumps({"ok": True, "engine": self.backend.mode}).encode("utf-8")
+        payload = json.dumps({"ok": True, "engine": self._backend().mode}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -246,8 +281,12 @@ class _Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError):
             self.send_error(400, "body is not JSON")
             return
+        if not isinstance(request, dict):
+            self.send_error(400, "body must be a JSON object")
+            return
 
-        if not _lily_compatible(request) or self.backend.mode != "lily":
+        backend = self._backend()
+        if not _lily_compatible(request) or backend.mode != "lily":
             self._proxy_fallback(request)
             return
         self._serve_lily(request)
@@ -275,7 +314,7 @@ class _Handler(BaseHTTPRequestHandler):
         request_id = str(request.get("requestId", ""))
         self._event({"type": "started", "request_id": request_id})
         try:
-            response = self.backend.lily_generate(request)
+            response = self._backend().lily_generate(request)
             choices = response.get("choices") or []
             content = str((choices[0].get("message") or {}).get("content") or "") if choices else ""
             if content:
@@ -311,8 +350,9 @@ class _Handler(BaseHTTPRequestHandler):
         self._finish()
 
     def _proxy_fallback(self, request: dict) -> None:
+        connection: http.client.HTTPConnection | None = None
         try:
-            port = self.backend.ensure_fallback()
+            port = self._backend().ensure_fallback()
             encoded = json.dumps(request, separators=(",", ":")).encode("utf-8")
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3600.0)
             connection.request("POST", "/v1/generate", body=encoded, headers={"Content-Type": "application/json"})
@@ -320,7 +360,6 @@ class _Handler(BaseHTTPRequestHandler):
             if response.status != 200:
                 detail = response.read(4096)
                 self.send_error(response.status, detail.decode("utf-8", "replace"))
-                connection.close()
                 return
             self._begin_sse()
             while True:
@@ -329,11 +368,13 @@ class _Handler(BaseHTTPRequestHandler):
                     break
                 self._chunk(chunk)
             self._finish()
-            connection.close()
         except BrokenPipeError:
             return
         except Exception as error:  # noqa: BLE001
             self.send_error(500, str(error))
+        finally:
+            if connection is not None:
+                connection.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -344,30 +385,45 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lily-binary", required=True)
     parser.add_argument("--fallback-service", required=True)
     parser.add_argument("--python", required=True)
+    parser.add_argument("--startup-timeout-seconds", type=float, default=STARTUP_TIMEOUT_SECONDS)
     args = parser.parse_args(argv)
     if args.host != "127.0.0.1":
         parser.error("--host must be 127.0.0.1")
+    if args.startup_timeout_seconds <= 0:
+        parser.error("--startup-timeout-seconds must be positive")
 
-    backend = _Backend(Path(args.lily_binary), Path(args.model), Path(args.fallback_service), Path(args.python))
-    _Handler.backend = backend
-    server = ThreadingHTTPServer((args.host, args.port), _Handler)
-
+    backend = _Backend(
+        Path(args.lily_binary),
+        Path(args.model),
+        Path(args.fallback_service),
+        Path(args.python),
+        args.startup_timeout_seconds,
+    )
+    server: ThreadingHTTPServer | None = None
     stopping = threading.Event()
 
     def stop(_signum=None, _frame=None):
         if stopping.is_set():
-            return
+            raise SystemExit(0)
         stopping.set()
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        backend.close()
+        if server is not None:
+            threading.Thread(target=server.shutdown, daemon=True).start()
+        raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    sys.stderr.write(f"mlx-service listening on {args.host}:{args.port} engine=lily\n")
-    sys.stderr.flush()
+
     try:
+        backend.start()
+        _Handler.backend = backend
+        server = ThreadingHTTPServer((args.host, args.port), _Handler)
+        sys.stderr.write(f"mlx-service listening on {args.host}:{args.port} engine={backend.mode}\n")
+        sys.stderr.flush()
         server.serve_forever()
     finally:
-        server.server_close()
+        if server is not None:
+            server.server_close()
         backend.close()
     return 0
 
