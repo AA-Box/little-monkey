@@ -1152,6 +1152,19 @@ pub fn m7_config_get(state: tauri::State<'_, M7CompanionState>) -> Result<Compan
     state.config()
 }
 
+/// Broadcast whenever a saved configuration replaces the one in memory.
+///
+/// Voice settings are not inert preferences: Always Listening is the only
+/// reason this application ever opens a microphone nobody pressed anything
+/// for, and it is turned off from Settings while the surface that opened that
+/// microphone is on screen somewhere else. A setting that changed and told
+/// nobody leaves that surface running on the configuration it read once, which
+/// is how "Always Listening off" became a claim rather than an act. Carries
+/// the saving window's label like every other changed-event here, and no
+/// configuration: a listener re-reads `m7_config_get`, which it is already
+/// allowed to call, so nothing is broadcast that was not already readable.
+pub const CONFIG_CHANGED_EVENT: &str = "m7://config-changed";
+
 #[tauri::command]
 pub fn m7_config_save(
     app: tauri::AppHandle,
@@ -1161,6 +1174,19 @@ pub fn m7_config_save(
 ) -> Result<CompanionConfig, String> {
     ensure_main_window(&window)?;
     validate_config(&config)?;
+    let saved = save_validated_config(&app, &state, config)?;
+    // Best-effort fan-out; the save itself already succeeded.
+    let _ = app.emit(CONFIG_CHANGED_EVENT, window.label());
+    Ok(saved)
+}
+
+/// The save itself, minus the window check, the validator and the fan-out, so
+/// that every path out of it is announced exactly once.
+fn save_validated_config(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, M7CompanionState>,
+    config: CompanionConfig,
+) -> Result<CompanionConfig, String> {
     let previous_config = state.config()?;
     let previous = previous_config.overlay_shortcut.clone();
     if previous == config.overlay_shortcut {

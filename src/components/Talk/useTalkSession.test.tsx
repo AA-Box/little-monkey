@@ -16,7 +16,32 @@ vi.mock('@tauri-apps/api/core', () => ({
   invoke: (...args: unknown[]) => invoke(...args),
   isTauri: () => true,
 }));
-vi.mock('@tauri-apps/api/event', () => ({ listen: () => Promise.resolve(() => undefined) }));
+/**
+ * The real `listen`, minus Tauri: a saved configuration reaches every window as
+ * an event, and the regression below turns Always Listening off the only way an
+ * operator can — by saving it somewhere else and letting that event arrive.
+ */
+// A hoisted function, not a `const` array: stores subscribe to their own
+// events while this module is still being imported, which is before any
+// top-level binding here is initialized.
+function eventListeners(): Array<{ name: string; handler: () => void }> {
+  const store = globalThis as { __talkEventListeners?: Array<{ name: string; handler: () => void }> };
+  return (store.__talkEventListeners ??= []);
+}
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: (name: string, handler: () => void) => {
+    const entry = { name, handler };
+    eventListeners().push(entry);
+    return Promise.resolve(() => {
+      const index = eventListeners().indexOf(entry);
+      if (index >= 0) eventListeners().splice(index, 1);
+    });
+  },
+}));
+
+function emit(name: string): void {
+  for (const listener of [...eventListeners()]) if (listener.name === name) listener.handler();
+}
 vi.mock('../../lib/agentLoop', () => ({
   runAgentTurn: () => Promise.resolve(),
   stopTurn: () => undefined,
@@ -39,6 +64,13 @@ const CONFIG = {
     outputDeviceId: null,
   },
 };
+
+/**
+ * What `m7_config_get` answers right now, which is not a constant: the whole
+ * point of the always-listening regression is that this changes underneath a
+ * running session, exactly as a save in Settings changes it.
+ */
+let voice: Record<string, unknown> = { ...CONFIG.voice };
 
 interface StubTrack {
   stopped: number;
@@ -130,7 +162,7 @@ beforeEach(() => {
           activeMicrophoneGrants: 0,
         });
       case 'm7_config_get':
-        return Promise.resolve(CONFIG);
+        return Promise.resolve({ ...CONFIG, voice });
       case 'm7_capture_grant':
         return Promise.resolve({
           grantId: 'grant-1',
@@ -152,6 +184,8 @@ beforeEach(() => {
     }
   });
   stubMedia();
+  eventListeners().length = 0;
+  voice = { ...CONFIG.voice };
 });
 
 afterEach(() => {
@@ -236,6 +270,83 @@ describe('useTalkSession', () => {
 
     await waitFor(() => expect(result.current.snapshot?.state).toBe('error'));
     expect(result.current.snapshot?.capturing).toBe(false);
+  });
+
+  /**
+   * The acceptance script's own step, performed the way an operator performs it.
+   *
+   * Always Listening is the only reason Talk opens a microphone nobody pressed
+   * anything for, so its switch has to close that microphone. Nothing here
+   * calls `stop()`, and nothing unmounts the surface: the configuration is
+   * saved somewhere else — Settings, the other panel, another window — and the
+   * only thing that reaches this session is the event saying so. A test that
+   * stopped the session itself would prove `stop()` works, which was never the
+   * question.
+   */
+  it('closes the microphone when Always Listening alone is turned off', async () => {
+    voice = { ...CONFIG.voice, wakePhraseEnabled: true, alwaysListening: true };
+    const { result } = renderHook(() => useTalkSession('session-1'));
+
+    await waitFor(() => expect(streams).toHaveLength(1));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith('m7_wake_word_start', expect.anything()),
+    );
+    await waitFor(() => expect(result.current.snapshot?.state).toBe('armed'));
+    expect(result.current.snapshot?.awaitingWakeWord).toBe(true);
+
+    // The operator turns it off in Settings. This is the entire act.
+    voice = { ...voice, alwaysListening: false, wakePhraseEnabled: false };
+    emit('m7://config-changed');
+
+    await waitFor(() => expect(streams[0].stopped).toBeGreaterThan(0));
+    await waitFor(() => expect(result.current.snapshot?.state).toBe('off'));
+    // The native generation is closed, not merely unsubscribed from, and the
+    // capture grant it was pushing under is handed back.
+    expect(invoke).toHaveBeenCalledWith('m7_wake_word_stop', expect.anything());
+    expect(invoke).toHaveBeenCalledWith('m7_capture_revoke', expect.anything());
+    expect(sourceNodes[0].disconnected).toBe(1);
+    expect(result.current.snapshot?.capturing).toBe(false);
+    // And the banner above it is re-read, so nothing on screen still claims the
+    // microphone this just closed is active.
+    await waitFor(() =>
+      expect(invoke.mock.calls.filter(([command]) => command === 'm7_talk_status').length)
+        .toBeGreaterThan(1),
+    );
+  });
+
+  /** Saving an output device is not a reason to end a conversation. */
+  it('keeps listening when a save leaves Always Listening on', async () => {
+    voice = { ...CONFIG.voice, wakePhraseEnabled: true, alwaysListening: true };
+    const { result } = renderHook(() => useTalkSession('session-1'));
+    await waitFor(() => expect(result.current.snapshot?.state).toBe('armed'));
+
+    voice = { ...voice, outputDeviceId: 'headphones' };
+    emit('m7://config-changed');
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(streams[0].stopped).toBe(0);
+    expect(result.current.snapshot?.state).toBe('armed');
+  });
+
+  /**
+   * A press is not the setting. Talk opened from the composer was asked for
+   * directly, and revoking a setting the operator did not use to open it does
+   * not retract that ask — the session keeps the microphone it was given and
+   * the next one is built from the new configuration.
+   */
+  it('leaves a session somebody pressed Talk for running', async () => {
+    voice = { ...CONFIG.voice, wakePhraseEnabled: true, alwaysListening: true };
+    const { result } = renderHook(() =>
+      useTalkSession('session-1', { enabled: true, autoStartMode: 'continuous' }),
+    );
+    await waitFor(() => expect(streams).toHaveLength(1));
+
+    voice = { ...voice, alwaysListening: false, wakePhraseEnabled: false };
+    emit('m7://config-changed');
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(streams[0].stopped).toBe(0);
+    expect(result.current.snapshot?.state).not.toBe('off');
   });
 
   it('closes the microphone when it is disabled again', async () => {

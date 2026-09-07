@@ -77,14 +77,25 @@ rather than left for a reader to discover. Work that is not built yet lives in
   outside its bounded English phrase grammar and does not claim multilingual
   wake accuracy. Exact model bytes and the native runtime are verified and
   bundled; the archive README declares Apache License 2.0, while upstream's
-  model-license provenance clarification remains open. Native execution has
-  been exercised on macOS arm64. The dedicated workflow is configured to run
-  the real runtime and the acceptance walkthrough natively on five of the six
-  supported targets rather than inferring them from compilation. Intel macOS is
-  the exception and is compiled, not run: GitHub's `macos-13` image is retired
-  and is cancelled without executing a step, so there is no host to run it on.
-  Those
-  jobs remain unverified until the first green hosted run. sherpa's keyword API reports token
+  model-license provenance clarification remains open. The dedicated workflow
+  runs the real runtime and the acceptance walkthrough natively on **five** of
+  the six supported targets — macOS arm64, Linux arm64 and x86_64, Windows
+  arm64 and x86_64 — rather than inferring them from compilation, and those
+  five have run green on hosted runners. **Intel macOS is compiled and not
+  run**, and that is all that is claimed for it: GitHub's `macos-13` image is
+  retired and is cancelled without executing a step, so there is no host to run
+  it on, and a target that compiles has proved the archive mapping and nothing
+  about whether the model opens. A separate job builds one installer per
+  release target that has a runner — Linux `.deb` on both architectures, the
+  macOS `.dmg`'s own application bundle, and the Windows installer on both
+  architectures — and asserts each one carries every model file and no test
+  audio; Intel macOS has no such job for the same reason. The one acceptance
+  step nothing here performs is a person speaking into a real microphone: the
+  walkthrough drives the real spotter and the real Whisper from an audio
+  fixture, and the physical-device run — real `getUserMedia`, real AudioWorklet,
+  real model answer, real speaker — is an operator procedure
+  ([local-wake-word.md](local-wake-word.md#what-no-test-performs)) and is not
+  recorded as done. sherpa's keyword API reports token
   timestamps relative to a decoding segment it restarts on silence without
   saying so, and exposes no absolute position, so a keyword spotted late in a
   long-armed session is anchored to the frame that revealed it rather than to a

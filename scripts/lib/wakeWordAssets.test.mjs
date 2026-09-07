@@ -18,6 +18,7 @@ import {
   RUNTIME_VERSION,
   verifyRuntimeArchive,
 } from "../stage-sherpa-runtime.mjs";
+import { packagedWakeAssetProblem } from "../verify-packaged-wake-assets.mjs";
 
 /**
  * Scratch space inside the repository's own ignored cache, not the operating
@@ -155,4 +156,58 @@ test("the Intel macOS cross-check stages its target-specific CLI sidecar", () =>
   const stage = crossCheck.indexOf("pnpm stage:cli:placeholder");
   const cargo = crossCheck.indexOf("cargo check --locked");
   assert.ok(stage >= 0 && cargo > stage);
+});
+
+/**
+ * The installer audit's own rules, checked against the listing shapes the three
+ * bundlers actually produce — a `dpkg-deb -c` table, `find` over a macOS .app,
+ * and a `7z l` listing of an NSIS installer with Windows separators.
+ *
+ * Checked here because the audit runs only inside a job that first spends
+ * three quarters of an hour building an installer: a bug in the rule that let
+ * an empty listing pass would be discovered by shipping.
+ */
+const DEB_LISTING = Object.keys(MODEL_FILES)
+  .map((file) => `-rw-r--r-- root/root 12174219 2026-01-01 00:00 ./usr/lib/little-monkey/resources/local-wake-word/${file}`)
+  .join("\n");
+
+test("the installer audit accepts a listing that carries every model file", () => {
+  assert.equal(packagedWakeAssetProblem(DEB_LISTING), null);
+  // A macOS .app, as `find` prints it.
+  assert.equal(
+    packagedWakeAssetProblem(
+      Object.keys(MODEL_FILES)
+        .map((file) => `/x/bundle/macos/Little Monkey.app/Contents/Resources/resources/local-wake-word/${file}`)
+        .join("\n"),
+    ),
+    null,
+  );
+  // An NSIS installer, as `7z l` prints it: Windows separators.
+  assert.equal(
+    packagedWakeAssetProblem(
+      Object.keys(MODEL_FILES)
+        .map((file) => `2026-01-01 00:00:00 ....A  12174219  $INSTDIR\\resources\\local-wake-word\\${file}`)
+        .join("\n"),
+    ),
+    null,
+  );
+});
+
+test("the installer audit refuses a package the wake word cannot work from", () => {
+  const withoutTokens = DEB_LISTING.split("\n")
+    .filter((line) => !line.includes("tokens.txt"))
+    .join("\n");
+  assert.match(packagedWakeAssetProblem(withoutTokens), /missing 1 required model file/);
+  assert.match(packagedWakeAssetProblem(withoutTokens), /tokens\.txt/);
+
+  // Test audio inside the packaged directory is the privacy claim failing, not
+  // a missing file, and it has to be named as such.
+  assert.match(
+    packagedWakeAssetProblem(`${DEB_LISTING}\n./resources/local-wake-word/test_wavs/0.wav`),
+    /test audio was packaged/,
+  );
+
+  // A listing no tool could read must not be mistaken for a clean one.
+  assert.match(packagedWakeAssetProblem(""), /found none of the 6 model files/);
+  assert.match(packagedWakeAssetProblem("Listing archive: setup.exe\n"), /not a list of paths/);
 });

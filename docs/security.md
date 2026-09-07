@@ -32,7 +32,11 @@ ledger, diagnostic, database, artifact, or crash-report field; Whisper and the
 agent are not invoked. After wake, only the command portion is passed to the
 built-in local Whisper path — and where the keyword's exact position cannot be
 proven, that portion starts at the audio frame that revealed the keyword rather
-than at a guess that could reach back over the phrase itself. Security Doctor reports wake enabled, Always
+than at a guess that could reach back over the phrase itself. Switching Always
+Listening off is an act rather than a preference: the hook that owns the
+devices re-reads the saved configuration and closes the microphone that setting
+opened, so the finding below and the open device cannot disagree. Security
+Doctor reports wake enabled, Always
 Listening enabled, local/non-local processing, and passive off-device audio as
 four independent findings; any passive network path is Critical. Details and
 the executable boundary test are in [Local wake-word detection](local-wake-word.md).

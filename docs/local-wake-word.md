@@ -29,7 +29,8 @@ The explicit states are `off`, `starting`, `armed`, `wake_detected`,
 `rearming`, and `error`. The UI cannot show `armed` until the microphone grant
 exists, the track and AudioWorklet are live, the model files verify, the runtime
 opens, and the native session accepts audio. A stop, closed Talk surface, ended
-track, or revoked grant disarms native inference and closes the microphone.
+track, revoked grant, or Always Listening switched off disarms native inference
+and closes the microphone (see [Turning it off](#turning-it-off)).
 
 During an active exchange, speech over `thinking` or `speaking` is barge-in: it
 stops playback, drops queued speech, requests best-effort turn cancellation,
@@ -138,6 +139,40 @@ starts only after a wake event. The Rust configuration refuses Always
 Listening when wake gating is off, the backend is not the local KWS backend, or
 post-wake transcription is not local Whisper.
 
+### Turning it off
+
+Always Listening is the only reason this application ever opens a microphone
+nobody pressed anything for, so switching it off closes that microphone —
+whichever surface it is switched off on, and with no further click.
+
+The setting is read once, when a Talk surface builds its engine, and that
+surface can be open for hours; a panel armed since breakfast is exactly the
+session an operator goes to Settings to turn off. So `m7_config_save` announces
+every saved configuration as `m7://config-changed`, and `useTalkSession` — the
+hook that owns the devices, shared by the Talk panel and the chat composer's
+Talk button — re-reads the configuration when one arrives. If Always Listening
+is now off, it stops the engine, closes the native keyword-spotting generation,
+stops the media tracks, tears down the worklet and audio context, replaces the
+ring and the wake queue, and hands the capture grant back. Reacting inside the
+Settings switch or the panel's own **Stop listening** button would only cover
+the surface holding that control; every other route to the same save — the
+other panel, a second window, an imported configuration — would have left a
+live microphone behind.
+
+Two deliberate asymmetries:
+
+- **A press is not the setting.** Talk opened from the composer was asked for
+  directly, and revoking a setting the operator did not use to open it does not
+  retract that ask. Only the microphone Always Listening opened is closed by
+  Always Listening going away.
+- **Turning it on does not open one.** The event arrives in the background, and
+  the engine on screen was built without wake gating, so acting on it would
+  open an *ungated* microphone. Arming waits for the next mount, with the wake
+  word compiled in.
+
+A configuration that cannot be re-read is treated as revoked rather than as a
+reason to keep listening on the strength of a stale copy.
+
 Settings reports the actual native backend, exact runtime/model identifiers,
 verification/load/accepting state, payload bytes, detections, dropped frames,
 average native inference time per submitted frame, average trigger latency,
@@ -219,24 +254,94 @@ pnpm test:wake-walkthrough
 ```
 
 It arms the session, pushes silence and unrelated speech and proves no
-transcription and no turn happen, says the phrase and its command, proves only
-the command reaches Whisper, talks over the answer, proves the second sentence
-becomes its own turn without a second wake word, and proves the session re-arms
-and the microphone closes. One thing it does not cover, because no test can
-click it: the operating system's own microphone prompt. Both of that prompt's
-answers do have coverage — `useTalkSession.test.tsx` asserts that a refusal is
-reported rather than dressed up as listening, that no wake session is started
-without a grant, and that a grant revoked mid-session ends the track and fails
-the engine closed. The click itself is the operator's.
+transcription and no turn happen — its evidence log prints that as
+`before wake — transcriptions: 0, turns: 0` beside the seconds of passive audio
+it pushed — says the phrase and its command, proves only the command reaches
+Whisper, talks over the answer, proves the second sentence becomes its own turn
+without a second wake word, and proves the session re-arms.
+
+What it deliberately does **not** claim is that the microphone closed. The
+engine has never held one: `TalkPorts` has no close, because in the product the
+devices belong to `useTalkSession`. An earlier version of the last step called
+the walkthrough's own microphone stub closed and then asserted it was closed,
+which asserted this file's arithmetic. The microphone's lifecycle is asserted
+where it lives, against the real hook in `useTalkSession.test.tsx`:
+
+- turning Always Listening off closes it, on the saved configuration alone,
+  with nothing in the test calling `stop()` (see
+  [Turning it off](#turning-it-off));
+- disabling the surface closes it;
+- a refused grant is reported rather than dressed up as listening, and no wake
+  session is started without one;
+- a grant revoked mid-session ends the track and fails the engine closed.
+
+The operating system's own microphone prompt is the one thing no test can
+click. Both of its answers are covered above; the click itself is the
+operator's.
 
 The dedicated Local Wake Word workflow runs the native runtime on five of the
 six supported desktop targets — macOS arm64, Linux arm64 and x86_64, Windows
 arm64 and x86_64 — rather than compiling all of them and executing one. Intel
 macOS is compiled against its own authenticated archive and not run, because
 GitHub's `macos-13` image is retired and is cancelled without executing a step;
-that is stated as a compile, never as a verified runtime.
+that is stated as a compile, never as a verified runtime. Five runtime-verified
+targets and one compile-verified target is the claim, and it is not rounded up
+to six.
 Each host authenticates its own archive, stages the verified model, opens the
 real runtime, runs the positive/negative, KWS-to-Whisper and long-armed-session
 tests, and then the fifteen-step walkthrough. There is no compile-only matrix:
 compiling proved the archive mapping and nothing about whether the model opens.
-A separate bundle job inspects the generated installer for all six model files.
+
+A second matrix builds a real installer per release target that has a runner
+and inspects what it would install:
+
+| Target | Package | Read with |
+| --- | --- | --- |
+| Linux x86_64 | `.deb` | `dpkg-deb -c` |
+| Linux arm64 | `.deb` | `dpkg-deb -c` |
+| macOS arm64 | `.dmg`, and the `.app` it wraps | `find` over the bundle |
+| Windows x86_64 | `-setup.exe` | `7z l` |
+| Windows arm64 | `-setup.exe` | `7z l` |
+
+Each listing goes through one shared rule,
+`scripts/verify-packaged-wake-assets.mjs`, which requires every file in
+`MODEL_FILES` under the packaged `local-wake-word/` path and fails on any
+`.wav` there. The required names come from the staging manifest rather than
+from a list repeated in YAML, so a model file added there is required in every
+package without anyone remembering; the rule's own cases are asserted in
+`scripts/lib/wakeWordAssets.test.mjs`, because a job that first spends three
+quarters of an hour building an installer is a bad place to discover that an
+unreadable listing passes. Packaging is asked per bundler because it fails per
+bundler: a `.deb` proving the resource glob resolved on Debian says nothing
+about `Contents/Resources` in a `.app` or `$INSTDIR` in an NSIS installer.
+Intel macOS has no packaging job either, for the same missing host.
+
+### What no test performs
+
+Two things, and both are stated rather than implied.
+
+**A physical microphone.** Every automated run reaches the spotter from an
+audio fixture. The chain from a real device — `getUserMedia`, a real
+AudioWorklet at the host's own sample rate, real room noise, a real model
+answer and a real speaker — is an operator procedure, and this repository does
+not record it as done:
+
+1. Settings → Voice: enable the wake word, set a phrase, then enable Always
+   Listening and confirm it. Talk should show `armed` only once the microphone
+   grant, the track, the worklet, the verified model files and the native
+   session are all live.
+2. Stay silent for a minute, then hold an unrelated conversation near the
+   machine. Settings → Voice should report detections `0`; nothing should appear
+   in the transcript, and no turn should appear in the run ledger.
+3. Say the phrase, then ask something. The transcript should contain the
+   question without the phrase, the answer should be spoken, and the run ledger
+   should show one ordinary turn.
+4. Talk over the answer. Playback should stop, the run should be asked to stop,
+   and the interrupting sentence should become the next turn with no second
+   wake word.
+5. Let it re-arm, then turn Always Listening off **in Settings** while Talk is
+   still open. The operating system's microphone indicator should go out
+   without touching the Talk panel.
+
+**The microphone prompt itself.** Nobody can click it from a test; both of its
+answers are covered against the real hook.

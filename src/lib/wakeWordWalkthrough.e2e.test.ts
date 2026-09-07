@@ -20,9 +20,12 @@
  *
  * - `getUserMedia` and the operating system's permission dialog. A grant
  *   nobody can click cannot be clicked here. What the microphone *does* once
- *   granted — open before "armed" is shown, stay open across a wake event,
- *   close on stop — is asserted, and the browser-side lifecycle has its own
- *   coverage in `useTalkSession.test.tsx`.
+ *   granted — open before "armed" is shown, and stay open across a wake event —
+ *   is asserted. Its *closing* is not, and cannot be: `TalkPorts` has no close,
+ *   because the devices belong to `useTalkSession`. That half is asserted
+ *   against the real hook in `useTalkSession.test.tsx`, including the step
+ *   below that this file can only configure — turning Always Listening off,
+ *   which closes the microphone there with nobody calling `stop()`.
  * - The speaker. Synthesis and playback are the operator's configured backend,
  *   which has nothing to do with wake detection; playback here is a promise
  *   this file resolves, so a barge-in can be delivered at an exact moment
@@ -224,7 +227,6 @@ describe.skipIf(!process.env.LITTLE_MONKEY_WAKE_WALKTHROUGH_E2E)(
       let queue = new BoundedPcmQueue(KWS_PENDING_SAMPLES);
       let microphoneOpen = false;
       let microphoneOpens = 0;
-      let microphoneCloses = 0;
       let recording: Float32Array[] | null = null;
       let lastRecordedPcm: Float32Array | null = null;
       /** `startSample` is why a wake event lands in the right place in the ring:
@@ -246,11 +248,6 @@ describe.skipIf(!process.env.LITTLE_MONKEY_WAKE_WALKTHROUGH_E2E)(
         if (microphoneOpen) return;
         microphoneOpen = true;
         microphoneOpens += 1;
-      };
-      const closeMicrophone = () => {
-        if (!microphoneOpen) return;
-        microphoneOpen = false;
-        microphoneCloses += 1;
       };
 
       const ports: TalkPorts = {
@@ -443,6 +440,15 @@ describe.skipIf(!process.env.LITTLE_MONKEY_WAKE_WALKTHROUGH_E2E)(
       const afterUnrelated = await harness.call<{ detections: number }>({ op: 'status' });
       expect(afterUnrelated.detections).toBe(0);
 
+      // Everything the microphone heard before the phrase, and what it cost:
+      // nothing was transcribed and nothing was submitted. Captured here rather
+      // than restated in the log, so the evidence is the counters themselves.
+      const passiveSamplesBeforeWake = ring.totalWritten;
+      const transcriptionsBeforeWake = transcribed.length;
+      const turnsBeforeWake = submitted.length;
+      expect(transcriptionsBeforeWake).toBe(0);
+      expect(turnsBeforeWake).toBe(0);
+
       // 7. The wake phrase, then the question, on the same open microphone.
       await speak(wakeAndCommand);
       expect(observed).toContain<TalkState>('wake_detected');
@@ -509,7 +515,10 @@ describe.skipIf(!process.env.LITTLE_MONKEY_WAKE_WALKTHROUGH_E2E)(
       expect(wakeSession).not.toBeNull();
       expect(microphoneOpens).toBe(1);
 
-      // 14. Always Listening off — accepted, and the wake word with it.
+      // 14. Always Listening off — accepted by the operator's own validator,
+      //     and the wake word with it. What a *running* surface does when this
+      //     save lands is the hook's, and `useTalkSession.test.tsx` asserts it
+      //     on the real hook: the microphone closes on the event alone.
       const disabled = await harness.call<{ accepted: boolean; alwaysListening: boolean }>({
         op: 'configure',
         wakePhraseEnabled: false,
@@ -518,11 +527,21 @@ describe.skipIf(!process.env.LITTLE_MONKEY_WAKE_WALKTHROUGH_E2E)(
       expect(disabled.accepted).toBe(true);
       expect(disabled.alwaysListening).toBe(false);
 
-      // 15. Stopping closes the microphone and the native session with it.
+      // 15. Stopping ends the native session, and the runtime confirms it is no
+      //      longer accepting audio.
+      //
+      //      Not the microphone. The engine has never held one — `TalkPorts` has
+      //      no close, because in the product the devices belong to
+      //      `useTalkSession`, which releases them in `releaseDevices`. An
+      //      earlier version of this step called the stub's own
+      //      `closeMicrophone()` here and then asserted the microphone had
+      //      closed, which asserted this file's arithmetic and nothing about the
+      //      product. The two claims that step is really making are the hook's,
+      //      and both are made against the real hook in
+      //      `useTalkSession.test.tsx`: turning Always Listening off closes the
+      //      microphone with nobody calling `stop()`, and disabling the surface
+      //      does the same.
       await session.stop();
-      closeMicrophone();
-      expect(microphoneOpen).toBe(false);
-      expect(microphoneCloses).toBe(1);
       expect(wakeSession).toBeNull();
       expect(session.snapshot().state).toBe<TalkState>('off');
       const stopped = await harness.call<{ acceptingAudio: boolean; detections: number }>({
@@ -538,12 +557,13 @@ describe.skipIf(!process.env.LITTLE_MONKEY_WAKE_WALKTHROUGH_E2E)(
         [
           'wake-word acceptance walkthrough',
           `  states: ${observed.join(' -> ')}`,
-          `  passive audio pushed before wake: ${(32_000 + unrelatedSpeech.length + 16_000) / KWS_SAMPLE_RATE}s`,
+          `  passive audio pushed before wake: ${passiveSamplesBeforeWake / KWS_SAMPLE_RATE}s`,
+          `  before wake — transcriptions: ${transcriptionsBeforeWake}, turns: ${turnsBeforeWake}`,
           `  transcriptions: ${transcribed.length} (${transcribed.join(', ')} samples)`,
           `  turns submitted: ${submitted.length}`,
           `  wake events: ${stopped.detections}`,
           `  playback chunks: ${played.length}, stopPlayback: ${stopPlaybackCalls}, cancelTurn: ${cancelTurnCalls}`,
-          `  microphone opens/closes: ${microphoneOpens}/${microphoneCloses}`,
+          `  microphone opens: ${microphoneOpens} (closing is useTalkSession's; see its own tests)`,
           `  ring window: ${ring.totalWritten} samples written`,
         ].join('\n'),
       );

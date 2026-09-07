@@ -449,7 +449,9 @@ Each workbench is a real model-driven flow. Where its scope is narrower than its
   audio has no network or persistence path. The post-keyword command reuses the
   microphone and follows ordinary Talk/VAD, local Whisper, durable turn, and
   speech output. Always Listening is a separate confirmed setting and is
-  refused unless both wake processing and command transcription are local. See
+  refused unless both wake processing and command transcription are local —
+  and switching it off closes the microphone it opened, from whichever surface
+  it is switched off on, without a second click. See
   [Local wake-word detection](local-wake-word.md).
 - Talk's desktop transcription publishes no audio artifact. Passive wake PCM
   is never transcribed or retained; post-wake command bytes live only for the

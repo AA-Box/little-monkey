@@ -156,6 +156,17 @@ export function useTalkSession(
   const wakeSessionRef = useRef<{ sessionId: string; startSample: number } | null>(null);
   const wakeQueueRef = useRef(new BoundedPcmQueue(KWS_PENDING_SAMPLES));
   const wakePushBusyRef = useRef(false);
+  /**
+   * True while this session is listening *because of the setting* rather than
+   * because somebody pressed something.
+   *
+   * That distinction is the whole authority question. A press is the operator
+   * asking for a microphone, and revoking Always Listening does not retract a
+   * press. Always Listening is the operator asking for one they never have to
+   * press for — so when it goes away, the microphone it opened has to go with
+   * it, from whichever surface it was switched off on.
+   */
+  const autoListeningRef = useRef(false);
   const grantRef = useRef<CaptureGrant | null>(null);
   /**
    * The turn Talk is waiting on: the utterance id the durable ingress was given,
@@ -468,6 +479,7 @@ export function useTalkSession(
         // no earlier than this, and closes with the surface that opened it:
         // there is no listening behind the operator's back.
         const auto = autoStartMode ?? (config.voice.alwaysListening ? 'continuous' : null);
+        autoListeningRef.current = autoStartMode === null && config.voice.alwaysListening;
         if (auto) {
           setMode(auto);
           engine.setMode(auto);
@@ -485,6 +497,7 @@ export function useTalkSession(
       // would point the next session's watcher at an index in the last one's
       // transcript.
       activeTurnRef.current = null;
+      autoListeningRef.current = false;
       releaseDevices();
     };
     // `ports` is memoized on the session; `mode` is applied through `setMode`
@@ -553,6 +566,62 @@ export function useTalkSession(
     await sessionRef.current?.stop();
     releaseDevices();
   }, [releaseDevices]);
+
+  /**
+   * Turning Always Listening off closes the microphone it opened. Here, not in
+   * the switch.
+   *
+   * The setting is read once, when the engine is built, and the surface that
+   * read it can be open for hours — a Talk panel armed since breakfast is
+   * exactly the session an operator goes to Settings to turn off. Reacting in
+   * the Settings switch, or in the panel's own "Stop listening" button, only
+   * covers the surface that happens to hold the switch; every other route to
+   * the same save — the other panel, an imported configuration, a second
+   * window — left a live microphone behind. So the reaction lives in the hook
+   * that owns the devices, and every route to a saved configuration reaches it.
+   *
+   * `stop()` is the same one the Stop button calls: engine to `off`, native KWS
+   * generation closed, tracks stopped, worklet and context torn down, ring and
+   * wake queue replaced, grant revoked.
+   *
+   * Only the microphone the *setting* opened is closed — `autoListeningRef` —
+   * and only turning it off closes anything. Turning it *on* here would open a
+   * microphone from a background event, and the engine on screen was built
+   * without wake gating, so it would be an ungated one: that stays a decision
+   * the next mount makes, with the wake word compiled in.
+   */
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    const subscription = companionClient.onConfigChanged(() => {
+      if (cancelled || !autoListeningRef.current) return;
+      void companionClient
+        .config()
+        .then(async (config) => {
+          if (cancelled || !autoListeningRef.current || config.voice.alwaysListening) return;
+          autoListeningRef.current = false;
+          await stop();
+          // The Talk panel's "Always listening is on: the microphone is active"
+          // banner is drawn from `TalkStatus`, which was read when the surface
+          // opened. Leaving it stale would put a claim that the microphone is
+          // active directly above a microphone this just closed.
+          await talkClient.status().then(setStatus).catch(() => undefined);
+        })
+        .catch((reason) => {
+          // A configuration that cannot be read is not a reason to keep a
+          // microphone open on the strength of a stale copy of it.
+          if (cancelled) return;
+          autoListeningRef.current = false;
+          setSetupError(errorMessage(reason));
+          void stop();
+        });
+    });
+    return () => {
+      cancelled = true;
+      void subscription.then((unlisten) => unlisten()).catch(() => undefined);
+    };
+  }, [enabled, stop]);
+
   return {
     snapshot,
     status,
