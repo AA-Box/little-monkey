@@ -39,6 +39,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 # `config.json` is small by construction; a larger one is not a model config.
 MAX_CONFIG_BYTES = 4 * 1024 * 1024
+MAX_PROMPT_CACHE_KEY_BYTES = 256
+PROMPT_CACHE_ENTRIES = 2
 
 
 def _read_config(model_path: str) -> dict:
@@ -83,6 +85,70 @@ def _load_model(model_path: str):
     return _TextRuntime(model, tokenizer)
 
 
+def _strict_prefix(prefix: list, full: list) -> bool:
+    return len(prefix) < len(full) and full[: len(prefix)] == prefix
+
+
+class _PromptCacheEntry:
+    def __init__(self, key, tokens: list, prompt_cache, last_used: int) -> None:
+        self.key = key
+        self.tokens = list(tokens)
+        self.prompt_cache = prompt_cache
+        self.last_used = last_used
+
+
+class _SessionPrefixCache:
+    """Fixed two-entry LRU of model decode states.
+
+    The rule intentionally mirrors Lily's safety property: a state is reused
+    only when its token sequence is a *strict* prefix of the new prompt. An
+    explicit key merely prefers the matching entry; it never bypasses token
+    equality. Entries are checked out while a generation owns them, so no MLX
+    cache object is shared by two requests.
+    """
+
+    def __init__(self, capacity: int = PROMPT_CACHE_ENTRIES) -> None:
+        self.capacity = max(0, int(capacity))
+        self.entries: list[_PromptCacheEntry] = []
+        self.clock = 0
+        self.total_hits = 0
+        self.total_cached_tokens = 0
+
+    def acquire(self, model, prompt_tokens: list, key):
+        candidates = [
+            (index, entry)
+            for index, entry in enumerate(self.entries)
+            if _strict_prefix(entry.tokens, prompt_tokens)
+        ]
+        if candidates:
+            index, entry = max(
+                candidates,
+                key=lambda item: (
+                    key is not None and item[1].key == key,
+                    len(item[1].tokens),
+                    item[1].last_used,
+                ),
+            )
+            self.entries.pop(index)
+            reused = len(entry.tokens)
+            self.total_hits += 1
+            self.total_cached_tokens += reused
+            return entry.prompt_cache, reused
+
+        from mlx_lm.models.cache import make_prompt_cache  # noqa: PLC0415
+
+        return make_prompt_cache(model), 0
+
+    def release(self, key, tokens: list, prompt_cache) -> None:
+        if self.capacity == 0 or not tokens:
+            return
+        self.clock += 1
+        self.entries.append(_PromptCacheEntry(key, tokens, prompt_cache, self.clock))
+        while len(self.entries) > self.capacity:
+            oldest = min(range(len(self.entries)), key=lambda index: self.entries[index].last_used)
+            self.entries.pop(oldest)
+
+
 class _TextRuntime:
     """A text-only model, generated with `mlx_lm`."""
 
@@ -91,6 +157,7 @@ class _TextRuntime:
     def __init__(self, model, tokenizer) -> None:
         self.model = model
         self.tokenizer = tokenizer
+        self.prefix_cache = _SessionPrefixCache()
 
     def render(self, messages: list[dict], image_count: int) -> str:
         """Renders the turns with the model's own chat template.
@@ -104,22 +171,62 @@ class _TextRuntime:
             return template(messages, tokenize=False, add_generation_prompt=True)
         return "\n".join(message["content"] for message in messages)
 
-    def stream(self, prompt: str, images: list[str], max_tokens: int, temperature):
+    def stream(
+        self,
+        prompt: str,
+        images: list[str],
+        max_tokens: int,
+        temperature,
+        prompt_cache_key=None,
+        on_cache_hit=lambda _count: None,
+    ):
         from mlx_lm import stream_generate  # noqa: PLC0415 - see _load_model
+
+        prompt_tokens = list(self.tokenizer.encode(prompt))
+        prompt_cache, cached_input_tokens = self.prefix_cache.acquire(
+            self.model, prompt_tokens, prompt_cache_key
+        )
+        on_cache_hit(cached_input_tokens)
+        suffix = prompt_tokens[cached_input_tokens:]
 
         sampler = None
         if temperature is not None:
             from mlx_lm.sample_utils import make_sampler  # noqa: PLC0415
 
             sampler = make_sampler(temp=float(temperature))
-        for response in stream_generate(
-            self.model,
-            self.tokenizer,
-            prompt,
-            max_tokens=max_tokens,
-            **({"sampler": sampler} if sampler is not None else {}),
-        ):
-            yield response.text
+
+        generated_tokens = []
+        cacheable = True
+        completed = False
+        try:
+            for response in stream_generate(
+                self.model,
+                self.tokenizer,
+                suffix,
+                max_tokens=max_tokens,
+                prompt_cache=prompt_cache,
+                **({"sampler": sampler} if sampler is not None else {}),
+            ):
+                token = getattr(response, "token", None)
+                if token is None:
+                    # A future mlx-lm response shape that stops exposing token
+                    # ids can still generate text, but cannot prove that cache
+                    # state and our token ledger describe the same prefix.
+                    cacheable = False
+                else:
+                    generated_tokens.append(token)
+                yield response.text
+            completed = True
+        finally:
+            # A cancelled/dropped/erroring generation is not cached. Its decode
+            # state may have advanced to a token sequence we did not observe all
+            # the way to a clean iterator end.
+            if completed and cacheable:
+                self.prefix_cache.release(
+                    prompt_cache_key,
+                    prompt_tokens + generated_tokens,
+                    prompt_cache,
+                )
 
 
 class _VisionRuntime:
@@ -147,9 +254,21 @@ class _VisionRuntime:
             self.processor, self.config, messages, num_images=image_count
         )
 
-    def stream(self, prompt: str, images: list[str], max_tokens: int, temperature):
+    def stream(
+        self,
+        prompt: str,
+        images: list[str],
+        max_tokens: int,
+        temperature,
+        prompt_cache_key=None,
+        on_cache_hit=lambda _count: None,
+    ):
         from mlx_vlm import stream_generate  # noqa: PLC0415 - see _load_model
 
+        # Image preprocessing and multimodal cache ownership are separate from
+        # mlx-lm's text prompt cache. Do not advertise reuse until the VLM stack
+        # can prove equivalent token/image state.
+        on_cache_hit(0)
         for response in stream_generate(
             self.model,
             self.processor,
@@ -166,11 +285,20 @@ class _Job:
 
     _DONE = object()
 
-    def __init__(self, prompt: str, images: list[str], max_tokens: int, temperature) -> None:
+    def __init__(
+        self,
+        prompt: str,
+        images: list[str],
+        max_tokens: int,
+        temperature,
+        prompt_cache_key=None,
+    ) -> None:
         self.prompt = prompt
         self.images = images
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.prompt_cache_key = prompt_cache_key
+        self.cached_input_tokens = 0
         # Bounded: a client that stops reading must slow the model down rather
         # than let deltas pile up without limit in memory.
         self._output: queue.Queue = queue.Queue(maxsize=256)
@@ -183,7 +311,12 @@ class _Job:
         """Runs on the worker thread. Every MLX array stays on that thread."""
         try:
             for text in runtime.stream(
-                self.prompt, self.images, self.max_tokens, self.temperature
+                self.prompt,
+                self.images,
+                self.max_tokens,
+                self.temperature,
+                self.prompt_cache_key,
+                self._record_cache_hit,
             ):
                 if self._cancelled.is_set():
                     break
@@ -192,6 +325,9 @@ class _Job:
         except Exception as error:  # noqa: BLE001 - any failure must reach the user
             self._put(error)
         self._output.put(self._DONE)
+
+    def _record_cache_hit(self, cached_input_tokens: int) -> None:
+        self.cached_input_tokens = max(0, int(cached_input_tokens))
 
     def _put(self, item) -> bool:
         """Hands one item to the reader, giving up if it has gone away.
@@ -331,6 +467,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         try:
             images = self._images_from(request)
+            prompt_cache_key = self._prompt_cache_key_from(request)
         except ValueError as error:
             self._emit({"type": "error", "code": "invalid_request", "message": str(error)})
             self._emit({"type": "completed", "input_tokens": 0, "output_tokens": 0})
@@ -343,8 +480,15 @@ class _Handler(BaseHTTPRequestHandler):
 
         input_tokens = len(self.runtime.tokenizer.encode(prompt))
         output_tokens = 0
+        self._cached_input_tokens = 0
         try:
-            for text in self._generate(prompt, images, max_tokens, temperature):
+            for text in self._generate(
+                prompt,
+                images,
+                max_tokens,
+                temperature,
+                prompt_cache_key,
+            ):
                 output_tokens += 1
                 if text:
                     self._emit({"type": "text_delta", "text": text})
@@ -354,7 +498,9 @@ class _Handler(BaseHTTPRequestHandler):
             # the reason the model actually stopped.
             self._emit({"type": "error", "code": "generation_failed", "message": str(error)})
         # Exactly one terminal event, on every path including the error one:
-        # the supervisor fails the whole request without it.
+        # the supervisor fails the whole request without it. Cache evidence is
+        # intentionally logged rather than added to this event until the Rust
+        # wire enum is versioned for the extra field.
         self._emit(
             {
                 "type": "completed",
@@ -362,20 +508,33 @@ class _Handler(BaseHTTPRequestHandler):
                 "output_tokens": output_tokens,
             }
         )
+        sys.stderr.write(
+            "mlx-service request=%s input_tokens=%d output_tokens=%d cached_input_tokens=%d\n"
+            % (request_id, input_tokens, output_tokens, self._cached_input_tokens)
+        )
+        sys.stderr.flush()
         self.wfile.write(b"0\r\n\r\n")
         self.wfile.flush()
 
-    def _generate(self, prompt: str, images: list, max_tokens: int, temperature):
+    def _generate(
+        self,
+        prompt: str,
+        images: list,
+        max_tokens: int,
+        temperature,
+        prompt_cache_key=None,
+    ):
         """Hands the work to the model's own thread and yields what comes back.
 
         Nothing here touches an MLX array; see `_GenerationWorker` for why that
         is the whole point.
         """
-        job = _Job(prompt, images, max_tokens, temperature)
+        job = _Job(prompt, images, max_tokens, temperature, prompt_cache_key)
         self.worker.submit(job)
         try:
             yield from job.deltas()
         finally:
+            self._cached_input_tokens = job.cached_input_tokens
             # Reached on a dropped connection too, which is how the supervisor
             # cancels: the worker stops rather than generating into nothing.
             job.cancel()
@@ -386,6 +545,19 @@ class _Handler(BaseHTTPRequestHandler):
             for message in request.get("messages", [])
         ]
         return self.runtime.render(messages, image_count)
+
+    def _prompt_cache_key_from(self, request: dict):
+        # `promptCacheKey` is optional and backwards-compatible with the current
+        # Rust request shape. The cache works without one; a future caller can
+        # supply a stable conversation key to prefer its own entry.
+        value = request.get("promptCacheKey")
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value:
+            raise ValueError("promptCacheKey must be a non-empty string")
+        if len(value.encode("utf-8")) > MAX_PROMPT_CACHE_KEY_BYTES:
+            raise ValueError("promptCacheKey is too long")
+        return value
 
     def _images_from(self, request: dict) -> list:
         """The inline images of every turn, in order.
