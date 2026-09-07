@@ -32,6 +32,14 @@ jobs:
       - name: Verify Python MLX service contract
         run: python3 packaging/mlx/service/test_mlx_server.py
 
+      - name: Stage required Tauri CLI sidecar placeholder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src-tauri/binaries
+          : > src-tauri/binaries/monkey-cli-aarch64-apple-darwin
+          chmod +x src-tauri/binaries/monkey-cli-aarch64-apple-darwin
+
       - name: Compile production Rust path
         run: cargo check --manifest-path src-tauri/Cargo.toml --lib
 
