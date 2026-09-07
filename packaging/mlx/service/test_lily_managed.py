@@ -116,7 +116,13 @@ def _raw_http_helpers() -> str:
                 while True:
                     connection, _address = server.accept()
                     with connection:
-                        method, path, body = receive_request(connection)
+                        try:
+                            method, path, body = receive_request(connection)
+                        except (OSError, RuntimeError):
+                            # The production parent's readiness check only opens
+                            # the port and closes it. A real HTTP server accepts
+                            # that probe without terminating the service.
+                            continue
                         handler(connection, method, path, body)
         '''
     )
