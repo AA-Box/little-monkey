@@ -265,6 +265,14 @@ jobs:
           seven_zip=7z
           command -v "$seven_zip" > /dev/null || seven_zip="$PROGRAMFILES/7-Zip/7z.exe"
           "$seven_zip" l "$installer" > "$RUNNER_TEMP/packaged.txt"
+      # The listing itself is printed only on failure, and only its head: this
+      # job's whole purpose is to fail on a package nobody can install, and a
+      # failure that does not show what it read costs another hour to diagnose.
       - name: Verify the package carries every model file and no test audio
         shell: bash
-        run: node scripts/verify-packaged-wake-assets.mjs "$RUNNER_TEMP/packaged.txt"
+        run: |
+          node scripts/verify-packaged-wake-assets.mjs "$RUNNER_TEMP/packaged.txt" || {
+            echo "--- first 60 lines of the listing this read ---"
+            head -60 "$RUNNER_TEMP/packaged.txt"
+            exit 1
+          }
