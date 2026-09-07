@@ -23,10 +23,16 @@ def replace_once(path: str, old: str, new: str) -> None:
 runpy.run_path("scripts/pr506-wire-mlx-cache.py", run_name="__main__")
 
 # The public Runtime Hub service port is assigned before the managed adapter
-# starts. Reserve it from every private child allocation and, more importantly,
-# bind the parent listener before starting Lily. This removes both the direct
-# child collision and the general free-port TOCTOU window between Runtime Hub's
-# port selection and the service actually owning that port.
+# starts. Reserve it from every private child allocation and bind the parent
+# listener before starting Lily. Also bypass HTTPServer.server_bind: Python's
+# HTTPServer performs socket.getfqdn(host) after bind, and reverse DNS for the
+# loopback literal can stall on managed macOS hosts even though the socket is
+# already listening. A local runtime must never depend on DNS to bind 127.0.0.1.
+replace_once(
+    "packaging/mlx/service/lily_managed.py",
+    '''from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\nfrom pathlib import Path''',
+    '''from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\nfrom pathlib import Path\nfrom socketserver import TCPServer''',
+)
 replace_once(
     "packaging/mlx/service/lily_managed.py",
     '''def _free_port() -> int:\n    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:\n        sock.bind(("127.0.0.1", 0))\n        return int(sock.getsockname()[1])\n''',
@@ -54,8 +60,13 @@ replace_once(
 )
 replace_once(
     "packaging/mlx/service/lily_managed.py",
+    '''class _Handler(BaseHTTPRequestHandler):''',
+    '''class _LoopbackHTTPServer(ThreadingHTTPServer):\n    """Threaded loopback server with no reverse-DNS dependency."""\n\n    def server_bind(self) -> None:\n        # HTTPServer.server_bind calls socket.getfqdn(host) after binding. That\n        # is irrelevant for this private 127.0.0.1 ABI and can block startup on\n        # hosts with slow/broken reverse DNS. TCPServer performs only the bind.\n        TCPServer.server_bind(self)\n        host, port = self.server_address[:2]\n        self.server_name = str(host)\n        self.server_port = int(port)\n\n\nclass _Handler(BaseHTTPRequestHandler):''',
+)
+replace_once(
+    "packaging/mlx/service/lily_managed.py",
     '''    server: ThreadingHTTPServer | None = None\n    stopping = threading.Event()''',
-    '''    # Own the externally assigned Runtime Hub port before any child process\n    # starts. The listener is activated now but `serve_forever` begins only after\n    # the selected heavy backend is genuinely ready, so a successful health\n    # response can never mean "Lily is still loading".\n    _Handler.backend = backend\n    server: ThreadingHTTPServer | None = ThreadingHTTPServer((args.host, args.port), _Handler)\n    stopping = threading.Event()''',
+    '''    # Own the externally assigned Runtime Hub port before any child process\n    # starts. The listener is activated now but `serve_forever` begins only after\n    # the selected heavy backend is genuinely ready, so a successful health\n    # response can never mean "Lily is still loading".\n    _Handler.backend = backend\n    server: _LoopbackHTTPServer | None = _LoopbackHTTPServer((args.host, args.port), _Handler)\n    stopping = threading.Event()''',
 )
 replace_once(
     "packaging/mlx/service/lily_managed.py",
