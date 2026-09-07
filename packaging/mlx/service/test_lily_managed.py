@@ -35,7 +35,7 @@ def _load(path: Path, name: str):
 
 
 def _port() -> int:
-    with socket.socket() as sock:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
 
@@ -61,7 +61,7 @@ def _wait_health(port: int, process: subprocess.Popen, stderr_file, timeout: flo
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.4) as response:
                 return json.load(response)
-        except Exception as error:  # noqa: BLE001 - retrying readiness
+        except Exception as error:  # noqa: BLE001 - readiness is intentionally retried
             last_error = error
             time.sleep(0.05)
     raise AssertionError(
@@ -81,74 +81,125 @@ def _post(port: int, body: dict, timeout: float = 10.0) -> str:
         return response.read().decode()
 
 
-def _fake_lily_source() -> str:
+def _raw_http_helpers() -> str:
+    # Deliberately avoid any \r/\n string escaping in the generated child. The
+    # previous fixtures accidentally tested literal backslashes on hosted macOS.
     return textwrap.dedent(
-        r'''
+        '''
+        import socket
+        import sys
+
+        CRLF = bytes((13, 10))
+        HEADER_END = CRLF + CRLF
+        LF = bytes((10,))
+
+        def receive_request(connection):
+            data = b''
+            while HEADER_END not in data:
+                chunk = connection.recv(65536)
+                if not chunk:
+                    return None
+                data += chunk
+                if len(data) > 2 * 1024 * 1024:
+                    raise RuntimeError('headers too large')
+            head, body = data.split(HEADER_END, 1)
+            lines = head.split(CRLF)
+            method, path, _version = lines[0].decode('ascii').split(' ', 2)
+            headers = {}
+            for raw in lines[1:]:
+                name, value = raw.decode('iso-8859-1').split(':', 1)
+                headers[name.lower()] = value.strip()
+            length = int(headers.get('content-length', '0'))
+            while len(body) < length:
+                chunk = connection.recv(65536)
+                if not chunk:
+                    raise RuntimeError('client closed before body')
+                body += chunk
+            return method, path, body[:length]
+
+        def respond(connection, body, content_type='application/json', status='200 OK'):
+            lines = [
+                'HTTP/1.1 ' + status,
+                'Content-Type: ' + content_type,
+                'Content-Length: ' + str(len(body)),
+                'Connection: close',
+            ]
+            head = CRLF.join(line.encode('ascii') for line in lines)
+            connection.sendall(head + HEADER_END + body)
+
+        def serve(host, port, handler, label):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server.bind((host, port))
+                server.listen(16)
+                print(label + ' listening ' + host + ':' + str(port), file=sys.stderr, flush=True)
+                while True:
+                    connection, _address = server.accept()
+                    with connection:
+                        try:
+                            request = receive_request(connection)
+                            if request is None:
+                                continue
+                            method, path, body = request
+                            handler(connection, method, path, body)
+                        except (ConnectionResetError, BrokenPipeError, OSError, RuntimeError):
+                            continue
+        '''
+    )
+
+
+def _fake_lily_source() -> str:
+    return _raw_http_helpers() + textwrap.dedent(
+        '''
         import argparse
         import json
         import time
-        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
         parser = argparse.ArgumentParser()
         parser.add_argument('--model')
         parser.add_argument('--bind', required=True)
         parser.add_argument('--max-seq')
         args = parser.parse_args()
-        host, port = args.bind.rsplit(':', 1)
+        host, port_text = args.bind.rsplit(':', 1)
+        port = int(port_text)
 
-        class Handler(BaseHTTPRequestHandler):
-            protocol_version = 'HTTP/1.1'
-
-            def log_message(self, *_args):
+        def handler(connection, method, path, body):
+            if method == 'GET' and path == '/health':
+                respond(connection, b'{"ok":true}')
                 return
-
-            def send_json(self, payload, status=200):
-                body = json.dumps(payload, separators=(',', ':')).encode()
-                self.send_response(status)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Content-Length', str(len(body)))
-                self.send_header('Connection', 'close')
-                self.end_headers()
-                self.wfile.write(body)
-
-            def do_GET(self):
-                if self.path == '/health':
-                    self.send_json({'ok': True})
-                    return
-                if self.path == '/v1/models':
-                    self.send_json({'data': [{'id': 'Qwen3.6-35B-A3B'}]})
-                    return
-                self.send_error(404)
-
-            def do_POST(self):
-                if self.path != '/v1/chat/completions':
-                    self.send_error(404)
-                    return
-                length = int(self.headers.get('Content-Length', '0'))
-                request = json.loads(self.rfile.read(length))
+            if method == 'GET' and path == '/v1/models':
+                respond(connection, b'{"data":[{"id":"Qwen3.6-35B-A3B"}]}')
+                return
+            if method == 'POST' and path == '/v1/chat/completions':
+                request = json.loads(body)
                 assert request['model'] == 'Qwen3.6-35B-A3B'
                 if any(message.get('content') == 'block' for message in request.get('messages', [])):
                     time.sleep(15)
-                self.send_json({
-                    'choices': [{'message': {'content': 'lily-ok'}}],
-                    'usage': {
-                        'prompt_tokens': 11,
-                        'completion_tokens': 2,
-                        'prompt_tokens_details': {'cached_tokens': 7},
+                payload = json.dumps(
+                    {
+                        'choices': [{'message': {'content': 'lily-ok'}}],
+                        'usage': {
+                            'prompt_tokens': 11,
+                            'completion_tokens': 2,
+                            'prompt_tokens_details': {'cached_tokens': 7},
+                        },
                     },
-                })
+                    separators=(',', ':'),
+                ).encode()
+                respond(connection, payload)
+                return
+            respond(connection, b'not found', 'text/plain', '404 Not Found')
 
-        ThreadingHTTPServer((host, int(port)), Handler).serve_forever()
+        serve(host, port, handler, 'fake-lily')
         '''
     )
 
 
 def _fake_fallback_source() -> str:
-    return textwrap.dedent(
-        r'''
+    return _raw_http_helpers() + textwrap.dedent(
+        '''
         import argparse
         import json
-        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
         parser = argparse.ArgumentParser()
         parser.add_argument('--host', required=True)
@@ -156,41 +207,29 @@ def _fake_fallback_source() -> str:
         parser.add_argument('--model', required=True)
         args = parser.parse_args()
 
-        class Handler(BaseHTTPRequestHandler):
-            protocol_version = 'HTTP/1.1'
-
-            def log_message(self, *_args):
+        def handler(connection, method, path, body):
+            if method != 'POST' or path != '/v1/generate':
+                respond(connection, b'not found', 'text/plain', '404 Not Found')
                 return
+            request = json.loads(body)
+            assert request.get('tools') == [{'name': 'clock'}]
+            events = [
+                {'type': 'started', 'request_id': request['requestId']},
+                {'type': 'text_delta', 'text': 'mlx-fallback'},
+                {
+                    'type': 'completed',
+                    'input_tokens': 5,
+                    'output_tokens': 1,
+                    'cached_input_tokens': 0,
+                },
+            ]
+            payload = b''.join(
+                b'data: ' + json.dumps(event, separators=(',', ':')).encode() + LF
+                for event in events
+            )
+            respond(connection, payload, 'text/event-stream')
 
-            def do_POST(self):
-                if self.path != '/v1/generate':
-                    self.send_error(404)
-                    return
-                length = int(self.headers.get('Content-Length', '0'))
-                request = json.loads(self.rfile.read(length))
-                assert request.get('tools') == [{'name': 'clock'}]
-                events = [
-                    {'type': 'started', 'request_id': request['requestId']},
-                    {'type': 'text_delta', 'text': 'mlx-fallback'},
-                    {
-                        'type': 'completed',
-                        'input_tokens': 5,
-                        'output_tokens': 1,
-                        'cached_input_tokens': 0,
-                    },
-                ]
-                body = ''.join(
-                    'data: ' + json.dumps(event, separators=(',', ':')) + '\n'
-                    for event in events
-                ).encode()
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/event-stream')
-                self.send_header('Content-Length', str(len(body)))
-                self.send_header('Connection', 'close')
-                self.end_headers()
-                self.wfile.write(body)
-
-        ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+        serve(args.host, args.port, handler, 'fake-mlx-fallback')
         '''
     )
 
