@@ -676,7 +676,10 @@ fn run_whisper(
     // already on screen come back spelled instead of guessed at phonetically —
     // "Sundbyberg" rather than "soon the B-Berry". It is a hint, not a
     // constraint: nothing here forces a token that was not said.
-    if let Some(prompt) = initial_prompt.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    if let Some(prompt) = initial_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
     {
         params.set_initial_prompt(prompt);
     }
@@ -788,7 +791,13 @@ pub async fn transcribe(
     let cancellation_for_worker = cancellation.clone();
     tokio::task::spawn_blocking(move || {
         let pcm = decode_audio(&path, &cancellation_for_worker)?;
-        run_whisper(&model, pcm, language, initial_prompt, cancellation_for_worker)
+        run_whisper(
+            &model,
+            pcm,
+            language,
+            initial_prompt,
+            cancellation_for_worker,
+        )
     })
     .await
     .map_err(|error| format!("Local transcription worker failed: {error}"))?
@@ -831,17 +840,18 @@ mod tests {
         let code = |wanted: &str| languages.iter().any(|(id, _)| id == wanted);
         assert!(code("en") && code("sv") && code("fa"));
         // Every entry carries a name to show, not just a code.
-        assert!(languages.iter().all(|(id, label)| !id.is_empty() && !label.is_empty()));
+        assert!(languages
+            .iter()
+            .all(|(id, label)| !id.is_empty() && !label.is_empty()));
     }
 
     #[test]
     fn a_live_recordings_short_last_element_is_its_end_not_a_failure() {
         // What Symphonia reports at the end of a `MediaRecorder` stream: the
         // segment has no terminator, so the final element runs out early.
-        assert!(is_end_of_stream(&SymphoniaError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "end of stream",
-        ))));
+        assert!(is_end_of_stream(&SymphoniaError::IoError(
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "end of stream",)
+        )));
         // A real read failure still is one.
         assert!(!is_end_of_stream(&SymphoniaError::IoError(
             std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
@@ -915,7 +925,12 @@ mod tests {
             assert!(model.file.starts_with("ggml-") && model.file.ends_with(".bin"));
             // A checksum is what makes the download safe to run; a size is what
             // stops a body that never ends.
-            assert_eq!(model.sha256.len(), 64, "{} has no usable checksum", model.id);
+            assert_eq!(
+                model.sha256.len(),
+                64,
+                "{} has no usable checksum",
+                model.id
+            );
             assert!(model.sha256.chars().all(|value| value.is_ascii_hexdigit()));
             assert!(model.bytes > 0);
             assert!(model_url(model).contains(MODEL_REVISION));
@@ -1000,10 +1015,10 @@ mod tests {
                     None,
                     CancellationToken::new(),
                 )
-                    .await
-                    .unwrap_or_else(|error| {
-                        panic!("{} as {language} failed: {error}", fixture.display())
-                    });
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{} as {language} failed: {error}", fixture.display())
+                });
                 let normalized = transcript.text.to_ascii_lowercase();
                 assert!(
                     normalized.contains("country") || normalized.contains("ask not"),

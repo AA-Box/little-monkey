@@ -4990,9 +4990,7 @@ impl<'a> MlxCanonicalSink<'a> {
                 usage: CanonicalUsage {
                     input_tokens: summary.input_tokens,
                     output_tokens: summary.output_tokens,
-                    // MLX reports no prompt-cache reuse, so `None` — see
-                    // `CanonicalUsage::cached_input_tokens` on why not zero.
-                    cached_input_tokens: None,
+                    cached_input_tokens: Some(summary.cached_input_tokens),
                 },
             })
             .map_err(stream_sink_error)?;
@@ -5062,6 +5060,7 @@ impl MlxStreamSink for MlxCanonicalSink<'_> {
             MlxStreamEvent::Completed {
                 input_tokens,
                 output_tokens,
+                cached_input_tokens,
             } => {
                 if !self.tool_indices.is_empty() {
                     return Err("MLX completed with unfinished tool calls".to_string());
@@ -5078,7 +5077,7 @@ impl MlxStreamSink for MlxCanonicalSink<'_> {
                         usage: CanonicalUsage {
                             input_tokens,
                             output_tokens,
-                            cached_input_tokens: None,
+                            cached_input_tokens: Some(cached_input_tokens),
                         },
                     })?;
                 self.completed = true;
@@ -8473,6 +8472,7 @@ mod tests {
         events.push(MlxStreamEvent::Completed {
             input_tokens: 3,
             output_tokens: 5,
+            cached_input_tokens: 2,
         });
         let response =
             run_mlx_pipeline(&request, events).expect("mlx pipeline assembles a response");
@@ -8485,6 +8485,7 @@ mod tests {
             }]
         );
         assert_eq!(response.finish_reason, "tool_use");
+        assert_eq!(response.usage.cached_input_tokens, Some(2));
     }
 
     #[cfg(target_os = "macos")]
@@ -8558,6 +8559,7 @@ mod tests {
                 MlxStreamEvent::Completed {
                     input_tokens: 1,
                     output_tokens: 1,
+                    cached_input_tokens: 0,
                 },
             ],
         );
@@ -8588,6 +8590,7 @@ mod tests {
                 MlxStreamEvent::Completed {
                     input_tokens: 1,
                     output_tokens: 1,
+                    cached_input_tokens: 0,
                 },
             ],
         );

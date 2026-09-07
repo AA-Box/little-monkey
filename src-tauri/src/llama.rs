@@ -591,7 +591,9 @@ async fn spawn_and_wait_healthy(
 /// Profile-scoped like everything else the app owns, so two profiles never reap
 /// each other's server.
 fn chat_server_pid_path(app: &AppHandle) -> Option<PathBuf> {
-    app.profile_data_dir().ok().map(|dir| dir.join("llama-chat-server.pid"))
+    app.profile_data_dir()
+        .ok()
+        .map(|dir| dir.join("llama-chat-server.pid"))
 }
 
 fn record_chat_server_pid(app: &AppHandle, pid: u32) {

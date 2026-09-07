@@ -470,7 +470,7 @@ class _Handler(BaseHTTPRequestHandler):
             prompt_cache_key = self._prompt_cache_key_from(request)
         except ValueError as error:
             self._emit({"type": "error", "code": "invalid_request", "message": str(error)})
-            self._emit({"type": "completed", "input_tokens": 0, "output_tokens": 0})
+            self._emit({"type": "completed", "input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0})
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
             return
@@ -497,15 +497,15 @@ class _Handler(BaseHTTPRequestHandler):
             # not, and would surface as an unexplained "stream ended" instead of
             # the reason the model actually stopped.
             self._emit({"type": "error", "code": "generation_failed", "message": str(error)})
-        # Exactly one terminal event, on every path including the error one:
-        # the supervisor fails the whole request without it. Cache evidence is
-        # intentionally logged rather than added to this event until the Rust
-        # wire enum is versioned for the extra field.
+        # Exactly one terminal event, on every path including the error one.
+        # `cached_input_tokens` is measured by the MLX decode cache itself and
+        # crosses the supervised ABI so M3 can persist it as canonical usage.
         self._emit(
             {
                 "type": "completed",
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "cached_input_tokens": self._cached_input_tokens,
             }
         )
         sys.stderr.write(
@@ -547,9 +547,9 @@ class _Handler(BaseHTTPRequestHandler):
         return self.runtime.render(messages, image_count)
 
     def _prompt_cache_key_from(self, request: dict):
-        # `promptCacheKey` is optional and backwards-compatible with the current
-        # Rust request shape. The cache works without one; a future caller can
-        # supply a stable conversation key to prefer its own entry.
+        # `promptCacheKey` is supplied by the production Rust supervisor from a
+        # deterministic conversation-prefix digest. The cache still works without
+        # one for protocol compatibility, and token equality remains authoritative.
         value = request.get("promptCacheKey")
         if value is None:
             return None

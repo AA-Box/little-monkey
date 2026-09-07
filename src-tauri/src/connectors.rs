@@ -2166,7 +2166,10 @@ mod tests {
                 || request.contains("Content-Type: application/x-www-form-urlencoded"),
             "{request}"
         );
-        assert!(request.contains("grant_type=authorization_code"), "{request}");
+        assert!(
+            request.contains("grant_type=authorization_code"),
+            "{request}"
+        );
         assert!(request.contains("code=a+code+with+spaces"), "{request}");
     }
 

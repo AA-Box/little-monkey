@@ -114,7 +114,7 @@ ALLOWED = {
     "tool_call_start": {"call_id", "name"},
     "tool_call_arguments_delta": {"call_id", "json"},
     "tool_call_end": {"call_id"},
-    "completed": {"input_tokens", "output_tokens"},
+    "completed": {"input_tokens", "output_tokens", "cached_input_tokens"},
     "error": {"code", "message"},
 }
 
@@ -140,6 +140,7 @@ def check_happy_path():
     assert terminal[0] is events[-1], "completed must be last"
     assert terminal[0]["output_tokens"] == 2
     assert terminal[0]["input_tokens"] == 2, "input tokens come from the rendered prompt"
+    assert terminal[0]["cached_input_tokens"] == 0
 
     assert capture["max_tokens"] == 16
     assert capture["temperature"] == 0.5

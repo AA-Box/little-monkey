@@ -29,6 +29,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 STARTUP_TIMEOUT_SECONDS = 180.0
@@ -37,10 +38,15 @@ LILY_KEEPALIVE_SECONDS = 0.25
 LILY_MODEL_ID = "Qwen3.6-35B-A3B"
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+def _free_port(*, exclude: set[int] | None = None) -> int:
+    excluded = exclude or set()
+    for _attempt in range(32):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = int(sock.getsockname()[1])
+        if port not in excluded:
+            return port
+    raise RuntimeError("could not allocate a private managed-runtime port")
 
 
 def _wait_http(port: int, path: str, process: subprocess.Popen, timeout: float) -> None:
@@ -120,6 +126,7 @@ class _Backend:
         fallback_service: Path,
         python: Path,
         startup_timeout: float = STARTUP_TIMEOUT_SECONDS,
+        reserved_ports: set[int] | None = None,
     ) -> None:
         self.lily_binary = lily_binary
         self.model = model
@@ -132,7 +139,8 @@ class _Backend:
         # session cache or mutate backend state around a cancellation.
         self.generation_lock = threading.Lock()
         self._mode = "lily"
-        self._port = _free_port()
+        self._reserved_ports = set(reserved_ports or ())
+        self._port = _free_port(exclude=self._reserved_ports)
         self._process: subprocess.Popen | None = None
 
     @property
@@ -183,7 +191,7 @@ class _Backend:
             if self._mode == "mlx" and self._process is not None and self._process.poll() is None:
                 return self._port
             _terminate(self._process)
-            self._port = _free_port()
+            self._port = _free_port(exclude=self._reserved_ports)
             env = dict(os.environ)
             env["LITTLE_MONKEY_DISABLE_LILY"] = "1"
             self._process = subprocess.Popen(
@@ -258,6 +266,19 @@ class _Backend:
         except urllib.error.HTTPError as error:
             detail = error.read(4096).decode("utf-8", "replace")
             raise RuntimeError(f"Lily HTTP {error.code}: {detail}") from error
+
+
+class _LoopbackHTTPServer(ThreadingHTTPServer):
+    """Threaded loopback server with no reverse-DNS dependency."""
+
+    def server_bind(self) -> None:
+        # HTTPServer.server_bind calls socket.getfqdn(host) after binding. That
+        # is irrelevant for this private 127.0.0.1 ABI and can block startup on
+        # hosts with slow/broken reverse DNS. TCPServer performs only the bind.
+        TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -487,8 +508,14 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.fallback_service),
         Path(args.python),
         args.startup_timeout_seconds,
+        reserved_ports={args.port},
     )
-    server: ThreadingHTTPServer | None = None
+    # Own the externally assigned Runtime Hub port before any child process
+    # starts. The listener is activated now but `serve_forever` begins only after
+    # the selected heavy backend is genuinely ready, so a successful health
+    # response can never mean "Lily is still loading".
+    _Handler.backend = backend
+    server: _LoopbackHTTPServer | None = _LoopbackHTTPServer((args.host, args.port), _Handler)
     stopping = threading.Event()
 
     def stop(_signum=None, _frame=None):
@@ -505,8 +532,6 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         backend.start()
-        _Handler.backend = backend
-        server = ThreadingHTTPServer((args.host, args.port), _Handler)
         sys.stderr.write(f"mlx-service listening on {args.host}:{args.port} engine={backend.mode}\n")
         sys.stderr.flush()
         server.serve_forever()

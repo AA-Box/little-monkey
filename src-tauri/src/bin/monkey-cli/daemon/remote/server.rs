@@ -294,7 +294,12 @@ pub(super) async fn handle_http(
             .await
         {
             Ok(value) => value.to_bytes().to_vec(),
-            Err(_) => return Ok(to_http(ApiResponse::error(413, "Request body is too large"))),
+            Err(_) => {
+                return Ok(to_http(ApiResponse::error(
+                    413,
+                    "Request body is too large",
+                )))
+            }
         };
         return Ok(super::webchat::handle(
             api.paths(),
