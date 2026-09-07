@@ -51,31 +51,38 @@ turns clear the input buffer before capture and commit it before
 `response.create`.
 
 Because the spoken audio travels on the media track rather than the data
-channel, generation and playback are reported as separate facts and never
-conflated. A data-channel output event — an audio delta if one arrives,
-otherwise the first transcript delta — reports that the model began *generating*
-and drives the responding state. The remote track's arrival is reported on its
-own, because over WebRTC it is the only path audio can take. Playback itself is
-*measured*: receiver statistics and the audio element's position are sampled
-while output is being generated, and audio is only reported as playing once the
-accumulated audio energy or received sample count has actually advanced. Energy
-is the decisive figure — bytes and packets keep flowing for a track carrying
-silence — so first-audio latency reflects sound the operator could hear rather
-than text the model produced. A transcript arriving while the speaker stays
-silent is therefore visible instead of indistinguishable from a working answer.
+channel, three different facts are reported separately and never conflated,
+each at the layer that can actually observe it.
 
-Those statistics are standard but not universal: WebKit's `getStats` is
-narrower than Chromium's, and this app ships to WKWebView and WebKitGTK as well
-as WebView2. A reading of zero therefore has two meanings, and each reading
-records which of the two it is. A webview that reports neither audio energy nor
-a sample count is reported as unable to prove playback, naming the webview
-rather than the application, instead of being reported as a silent speaker.
+*Generation* is a data-channel signal: an audio delta if one arrives, otherwise
+the first transcript delta. It reports that the model began producing output and
+drives the responding state, and it says nothing about sound.
 
-The same measurement proves a barge-in took effect. "No further audio event" is
-not evidence of silence, since that event fires once per response; the numbers
-that only move while sound is produced are sampled across a window after the
-interruption and have to stop advancing. A transport that cannot measure
-playback reports the stop as unproven rather than as silence.
+*Non-silent audio at the receiver* is an `inbound-rtp` measurement. Accumulated
+audio energy is the only figure that separates sound from silence, and it is the
+only one accepted: bytes and packets keep flowing for a track carrying silence,
+and `totalSamplesReceived` counts samples whether or not they hold any signal,
+so treating it as a fallback would let a silent stream certify itself. This is
+receive-side, so first-audio latency excludes whatever the output device adds.
+It is also standard but not universal — WebKit's `getStats` is narrower than
+Chromium's, and this ships to WKWebView and WebKitGTK as well as WebView2 — so
+each reading records whether the figure was reported at all. A webview that
+reports none is described as unable to tell sound from silence, naming the
+webview rather than the application, and never as a silent speaker.
+
+*The local playback path* is the audio element: whether `play()` resolved,
+whether it is paused, and whether its position advances. That is the end of what
+the application can see. The output device, the OS mixer, and the physical
+speaker are past it, so nothing here is ever reported as proof that a person
+heard anything — the live run asks the operator instead, and a run whose every
+measurable step passes is still only unverified until they answer.
+
+Barge-in is judged at the layer `interrupt()` acts on: the element stops and its
+position stops advancing. Inbound RTP is not `interrupt()`'s to stop — packets
+already in flight keep arriving and being decoded after playback has ceased — so
+judging the stop on receiver energy would condemn a barge-in that did exactly
+what was asked. Continued inbound audio is reported alongside the pass as the
+expected settling it is.
 
 Interruption is counted the same however it starts. A local Stop and a
 provider-VAD barge-in both produce one normalized interruption, so the metric
@@ -197,12 +204,15 @@ It needs an OpenAI key saved through Settings, a workspace open on that file,
 network access, and microphone permission. The app starts with the acceptance
 harness enabled, prints `Speak now`, and the operator asks it once to read the
 file. The harness drives the same response ledger and the same tool bridge the
-product uses and reports eleven steps — provider configured at the fixed egress
+product uses and reports twelve steps — provider configured at the fixed egress
 origin, session connected, microphone audio reached the provider, transcript
 persisted, tool call bridged to the normal executor, host result returned,
-spoken follow-up after that result, audio measurably reaching the speaker,
-barge-in proven by measured silence, durable conversation rows, clean
-disconnect. The native side writes the evidence and exits, so the run cannot
+spoken follow-up after that result, non-silent audio measured at the receiver,
+the local playback element advancing unpaused, barge-in proven by local playback
+stopping, durable conversation rows, clean disconnect. It then asks whether the
+answer was audible and reports the speaker as PASS, FAIL, or UNVERIFIED; only a
+confirmed yes exits zero, an unconfirmed speaker exits 2, and any failure exits
+1, so a green exit cannot close the definition of done on its own. The native side writes the evidence and exits, so the run cannot
 pass on a webview that stalled. The report carries step outcomes and bounded
 timings only: no transcript, audio, file content, or credential. The same
 harness is exercised in CI against a scripted provider, including the case

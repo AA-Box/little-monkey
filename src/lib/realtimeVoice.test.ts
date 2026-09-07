@@ -29,8 +29,8 @@ function respondingController(responseId = 'r1'): RealtimeVoiceController {
  * numbers — it trusts the adapter to emit this only once they moved. */
 function playedAudio(overrides: Partial<RealtimeAudioProgress> = {}): RealtimeAudioProgress {
   return {
-    bytesReceived: 4_096, samplesReceived: 24_000, audioEnergy: 0.42, playbackSeconds: 0.5,
-    measured: true, ...overrides,
+    bytesReceived: 4_096, samplesReceived: 24_000, audioEnergy: 0.42, audioEnergyReported: true,
+    playbackSeconds: 0.5, playbackPaused: false, playbackStarted: true, ...overrides,
   };
 }
 
@@ -62,7 +62,7 @@ describe('RealtimeVoiceController', () => {
   it('tracks a complete voice turn and deduplicates replayed events', () => {
     // Seven readings, in the order the reducer takes them: `connecting`,
     // `connected`, `speech_started` (the connection-relative latency, then the
-    // turn clock it restarts), `response_started`, `output_audio_playing` and
+    // turn clock it restarts), `response_started`, `non_silent_remote_audio` and
     // `response_done`. The generation, track and transcript events read the
     // clock not at all, which is why they are absent from this queue.
     vi.spyOn(performance, 'now')
@@ -79,7 +79,7 @@ describe('RealtimeVoiceController', () => {
     controller.consume({ type: 'output_generation_started', eventId: 'generation' });
     controller.consume({ type: 'remote_audio_track', eventId: 'track' });
     // The one event in this turn that says a human could hear anything.
-    controller.consume({ type: 'output_audio_playing', eventId: 'playing', progress: playedAudio() });
+    controller.consume({ type: 'non_silent_remote_audio', eventId: 'playing', progress: playedAudio() });
     controller.consume({ type: 'output_underrun', eventId: 'underrun' });
     controller.consume({ type: 'response_done', eventId: '5', responseId: 'r1', status: 'completed' });
     expect(controller.state).toBe('ready');
@@ -108,7 +108,7 @@ describe('RealtimeVoiceController', () => {
     expect(controller.metrics.firstAudioMs).toBeNull();
     // And the null is a real absence of playback rather than a turn clock that
     // never started: the same turn did measure its first model event, so an
-    // `output_audio_playing` arriving here would have been measured too.
+    // `non_silent_remote_audio` arriving here would have been measured too.
     expect(controller.metrics.firstModelEventMs).not.toBeNull();
   });
 
@@ -135,14 +135,14 @@ describe('RealtimeVoiceController', () => {
     controller.connecting();
     controller.consume({ type: 'connected', eventId: 'connected' });
     controller.consume({ type: 'listening', eventId: 'listening' });
-    controller.consume({ type: 'output_audio_playing', eventId: 'playing:1', progress: playedAudio() });
+    controller.consume({ type: 'non_silent_remote_audio', eventId: 'playing:1', progress: playedAudio() });
     expect(controller.state).toBe('responding');
     expect(controller.metrics.firstAudioMs).toBe(80);
     // The probe keeps sampling for as long as the answer plays. Latency means
     // the moment sound started, so a later reading is not allowed to restate
     // it — nor to be mistaken for the first one because its numbers are bigger.
     controller.consume({
-      type: 'output_audio_playing', eventId: 'playing:2',
+      type: 'non_silent_remote_audio', eventId: 'playing:2',
       progress: playedAudio({ audioEnergy: 3.9, samplesReceived: 96_000, playbackSeconds: 2 }),
     });
     expect(controller.metrics.firstAudioMs).toBe(80);

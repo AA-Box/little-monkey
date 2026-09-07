@@ -72,23 +72,33 @@ export type RealtimeResponseDisposition = 'continue' | 'await_tools' | 'complete
  * turn has to be closed out by the caller. */
 export type RealtimeToolSettlement = 'continue' | 'wait' | 'closed';
 
-/** Measured evidence that model audio is arriving and being played out, read
- * from the transport rather than inferred from data-channel events.
- * `audioEnergy` is the decisive one: it only accumulates while non-silent
- * audio is rendered, so it distinguishes "the speaker is producing sound" from
- * "a media track exists". */
+/** What the transport can measure about model audio, in two layers that must
+ * not be confused.
+ *
+ * The `*Received` figures and `audioEnergy` are `inbound-rtp` receiver
+ * statistics: they describe audio that arrived and was decoded by the WebRTC
+ * receiver. `audioEnergy` is the only one that separates sound from silence —
+ * `samplesReceived` counts samples whether or not they carry any signal, so it
+ * is evidence of a stream, never of audibility.
+ *
+ * The `playback*` figures describe the local `HTMLAudioElement`: the end of the
+ * application's own playback path. Neither layer can observe the output device,
+ * the OS mixer, or the physical speaker, so nothing here may be reported as
+ * proof that a person heard anything. */
 export interface RealtimeAudioProgress {
   bytesReceived: number;
   samplesReceived: number;
   audioEnergy: number;
+  /** Whether `totalAudioEnergy` was reported at all. WebKit's `getStats` is
+   * narrower than Chromium's, and this ships to WKWebView and WebKitGTK as
+   * well as WebView2, so a zero has two meanings and only this separates
+   * "silent" from "not told". Unreported must never be read as either. */
+  audioEnergyReported: boolean;
   playbackSeconds: number;
-  /** Whether this webview reported either statistic that distinguishes sound
-   * from a silent track. `totalAudioEnergy` and `totalSamplesReceived` are
-   * standard but WebKit's `getStats` is narrower than Chromium's, so a reading
-   * of zero has two meanings and only this separates them. A caller must
-   * report unmeasurable playback as unproven, never as silence — otherwise a
-   * working answer looks like a broken one on half the platforms this ships to. */
-  measured: boolean;
+  playbackPaused: boolean;
+  /** Whether the element's `play()` ever resolved, which is the difference
+   * between a playback path that started and one that was blocked. */
+  playbackStarted: boolean;
 }
 
 export type RealtimeVoiceEvent =
@@ -105,10 +115,11 @@ export type RealtimeVoiceEvent =
    * audio travels, so its absence means nothing can be heard however many
    * transcript deltas the data channel delivers. */
   | { type: 'remote_audio_track'; eventId: string }
-  /** Audio is measurably being played out — receiver statistics advanced while
-   * the model was generating. This, not a transcript delta, is what "the
-   * assistant is speaking" means. */
-  | { type: 'output_audio_playing'; eventId: string; progress: RealtimeAudioProgress }
+  /** Non-silent audio arrived at the WebRTC receiver while the model was
+   * generating — accumulated audio energy advanced. This is a receive-side
+   * fact: it proves the answer was rendered as sound somewhere upstream of the
+   * local element, and says nothing about the output device or the speaker. */
+  | { type: 'non_silent_remote_audio'; eventId: string; progress: RealtimeAudioProgress }
   | { type: 'output_underrun'; eventId: string }
   | { type: 'output_transcript_delta'; eventId: string; itemId: string; delta: string }
   | { type: 'output_transcript_done'; eventId: string; itemId: string; text: string }
@@ -308,10 +319,11 @@ export class RealtimeVoiceController {
         break;
       case 'remote_audio_track':
         break;
-      case 'output_audio_playing':
-        // Anchored on measured playback, not on the first transcript delta: a
-        // model that generates while the speaker stays silent is exactly the
-        // failure this metric has to be able to show.
+      case 'non_silent_remote_audio':
+        // Anchored on measured non-silent audio, not on the first transcript
+        // delta: a model that generates while no sound is produced is exactly
+        // the failure this metric has to be able to show. It is receive-side
+        // latency, so it excludes whatever the output device adds.
         if (this.metrics.firstAudioMs === null && this.turnStartedAt > 0) {
           this.metrics.firstAudioMs = Math.max(0, Math.round(performance.now() - this.turnStartedAt));
         }

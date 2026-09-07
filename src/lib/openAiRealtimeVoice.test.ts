@@ -96,13 +96,17 @@ function harness(
   const peer = new FakePeer();
   const track = new FakeTrack();
   const stream = { getAudioTracks: () => [track], getTracks: () => [track] } as unknown as MediaStream;
-  const play = vi.fn(async () => undefined);
-  const pause = vi.fn();
-  const audio = {
-    autoplay: false, srcObject: null, play, pause,
+  // `paused` is modelled rather than left undefined: the acceptance run reads
+  // it to decide whether the local playback path carried the answer, so a fake
+  // that always reported paused would hide exactly that.
+  const element: Record<string, unknown> = {
+    autoplay: false, srcObject: null, paused: false,
     addEventListener: vi.fn(), removeEventListener: vi.fn(),
-    ...audioExtras,
-  } as unknown as HTMLAudioElement;
+  };
+  const play = vi.fn(async () => { element.paused = false; });
+  const pause = vi.fn(() => { element.paused = true; });
+  Object.assign(element, { play, pause }, audioExtras);
+  const audio = element as unknown as HTMLAudioElement;
   const connectBroker = vi.fn(async (_request: BrokerRequest) => brokerAnswer());
   const disconnectBroker = vi.fn(async () => undefined);
   const environment: OpenAiRealtimeEnvironment = {
@@ -133,8 +137,8 @@ const sentTypes = (peer: FakePeer): string[] => peer.channel.sent.map((value) =>
 const remoteTrackEvent = () => ({ streams: [{} as MediaStream] } as unknown as RTCTrackEvent);
 
 const playing = (events: readonly RealtimeVoiceEvent[]) => events.filter(
-  (event): event is Extract<RealtimeVoiceEvent, { type: 'output_audio_playing' }> =>
-    event.type === 'output_audio_playing',
+  (event): event is Extract<RealtimeVoiceEvent, { type: 'non_silent_remote_audio' }> =>
+    event.type === 'non_silent_remote_audio',
 );
 
 /** `audioProgress` is optional on the session interface, and the acceptance run
@@ -212,7 +216,7 @@ describe('OpenAI realtime response pacing', () => {
     // is a WebSocket-only event and the transcript delta is the only
     // generation-timing signal this transport gets. It marks the model
     // starting to produce output, and nothing more — whether any of it reached
-    // the speaker is `output_audio_playing`, measured off the receiver.
+    // the speaker is `non_silent_remote_audio`, measured off the receiver.
     const { peer, session, events } = harness();
     await session.connect();
     peer.channel.receive({ type: 'response.created', event_id: 'created', response: { id: 'r1' } });
@@ -589,6 +593,36 @@ describe('OpenAI realtime measured audio output', () => {
     await session.close();
   });
 
+  it('never accepts a rising sample count as evidence of sound', async () => {
+    // `totalSamplesReceived` counts samples whether or not they hold any
+    // signal, so allowing it as a fallback would let a silent stream certify
+    // itself as audible on exactly the webviews that report no energy.
+    const { session, receiver, events, attachRemoteTrack, peer } = harness({}, {}, undefined, PROBE_MS);
+    await session.connect();
+    attachRemoteTrack();
+    peer.channel.receive({ type: 'response.created', event_id: 'created', response: { id: 'r1' } });
+    peer.channel.receive({
+      type: 'response.output_audio_transcript.delta', event_id: 'delta', item_id: 'a1', delta: 'hi',
+    });
+    receiver.reads({
+      id: 'inbound-audio', type: 'inbound-rtp', kind: 'audio',
+      bytesReceived: 1_000, totalSamplesReceived: 10_000,
+    });
+    await tick();
+    receiver.reads({
+      id: 'inbound-audio', type: 'inbound-rtp', kind: 'audio',
+      bytesReceived: 9_000, totalSamplesReceived: 20_000,
+    });
+    await tick(3);
+    expect(playing(events)).toHaveLength(0);
+    // A positive control, so the assertion above cannot pass because the probe
+    // was never running: the same stream with energy does confirm.
+    receiver.reads(audioStat({ bytesReceived: 18_000, totalSamplesReceived: 30_000, totalAudioEnergy: 0.3 }));
+    await tick(2);
+    expect(playing(events)).toHaveLength(1);
+    await session.close();
+  });
+
   it('does not count a track carrying silence as audio the operator can hear', async () => {
     const { peer, receiver, attachRemoteTrack, events, session } = harness({}, { currentTime: 1.5 }, undefined, PROBE_MS);
     await session.connect();
@@ -607,7 +641,8 @@ describe('OpenAI realtime measured audio output', () => {
     receiver.reads(audioStat({ bytesReceived: 12_000, totalSamplesReceived: 5_000, totalAudioEnergy: 0.62 }));
     await tick();
     expect(playing(events).map((event) => event.progress)).toEqual([{
-      bytesReceived: 12_000, samplesReceived: 5_000, audioEnergy: 0.62, measured: true, playbackSeconds: 1.5,
+      bytesReceived: 12_000, samplesReceived: 5_000, audioEnergy: 0.62, audioEnergyReported: true,
+      playbackPaused: false, playbackStarted: true, playbackSeconds: 1.5,
     }]);
     await session.close();
   });
@@ -641,7 +676,7 @@ describe('OpenAI realtime measured audio output', () => {
     await session.close();
   });
 
-  it('separates a webview that reports no audio energy from a speaker that was silent', async () => {
+  it('separates a webview that reports no audio energy from a stream that was silent', async () => {
     // WebKit's getStats is narrower than Chromium's and this ships to WKWebView
     // and WebKitGTK too. Zeros there mean "not reported", so a caller must be
     // able to tell that apart from measured silence — otherwise a working
@@ -651,9 +686,11 @@ describe('OpenAI realtime measured audio output', () => {
     attachRemoteTrack();
     receiver.reads({ id: 'inbound-audio', type: 'inbound-rtp', kind: 'audio', bytesReceived: 9_000 });
     const bare = await progressOf(session);
-    expect(bare).toMatchObject({ bytesReceived: 9_000, audioEnergy: 0, samplesReceived: 0, measured: false });
+    expect(bare).toMatchObject({
+      bytesReceived: 9_000, audioEnergy: 0, samplesReceived: 0, audioEnergyReported: false,
+    });
     receiver.reads(audioStat({ bytesReceived: 9_000, totalAudioEnergy: 0 }));
-    expect(await progressOf(session)).toMatchObject({ measured: true });
+    expect(await progressOf(session)).toMatchObject({ audioEnergyReported: true });
     await session.close();
   });
 
@@ -672,7 +709,8 @@ describe('OpenAI realtime measured audio output', () => {
       { id: 'x1', type: 'remote-inbound-rtp', kind: 'audio', bytesReceived: 40, totalSamplesReceived: 4, totalAudioEnergy: 4 },
     );
     await expect(progressOf(session)).resolves.toEqual({
-      bytesReceived: 1_500, samplesReceived: 30_000, audioEnergy: 0.75, measured: true, playbackSeconds: 4.25,
+      bytesReceived: 1_500, samplesReceived: 30_000, audioEnergy: 0.75, audioEnergyReported: true,
+      playbackPaused: false, playbackStarted: true, playbackSeconds: 4.25,
     });
 
     // Unmeasurable is not silent. Null is what makes the barge-in check fail

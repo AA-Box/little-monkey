@@ -172,6 +172,7 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
   private audioProbe: ReturnType<typeof setInterval> | null = null;
   private lastProgress: RealtimeAudioProgress | null = null;
   private audioConfirmed = false;
+  private playbackStarted = false;
   private closed = false;
   private outputStarted = false;
   private responseActive = false;
@@ -211,7 +212,7 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
         this.responseActive = true;
         this.outputStarted = false;
         this.audioConfirmed = false;
-        void this.audio?.play().catch(() => undefined);
+        void this.audio?.play().then(() => { this.playbackStarted = true; }).catch(() => undefined);
       }
       if (data.type === 'response.done') {
         this.responseActive = false;
@@ -300,7 +301,7 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
         if (this.config.outputDeviceId && routed.setSinkId) {
           void routed.setSinkId(this.config.outputDeviceId).catch(() => undefined);
         }
-        void this.audio.play().catch(() => undefined);
+        void this.audio.play().then(() => { this.playbackStarted = true; }).catch(() => undefined);
         // This is the only path model audio takes over WebRTC, so its arrival
         // is reported on its own and playback is measured from here on.
         const receiver = (event as RTCTrackEvent & { receiver?: AudioReceiverLike }).receiver ?? null;
@@ -352,24 +353,23 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
     let bytesReceived = 0;
     let samplesReceived = 0;
     let audioEnergy = 0;
-    let measured = false;
+    let audioEnergyReported = false;
     report.forEach((entry) => {
       const stat = entry as Record<string, unknown>;
       if (stat.type !== 'inbound-rtp') return;
       if (typeof stat.kind === 'string' && stat.kind !== 'audio') return;
       bytesReceived += Number(stat.bytesReceived ?? 0);
-      if (typeof stat.totalSamplesReceived === 'number') {
-        samplesReceived += stat.totalSamplesReceived;
-        measured = true;
-      }
+      if (typeof stat.totalSamplesReceived === 'number') samplesReceived += stat.totalSamplesReceived;
       if (typeof stat.totalAudioEnergy === 'number') {
         audioEnergy += stat.totalAudioEnergy;
-        measured = true;
+        audioEnergyReported = true;
       }
     });
     return {
-      bytesReceived, samplesReceived, audioEnergy, measured,
+      bytesReceived, samplesReceived, audioEnergy, audioEnergyReported,
       playbackSeconds: this.audio?.currentTime ?? 0,
+      playbackPaused: this.audio?.paused ?? true,
+      playbackStarted: this.playbackStarted,
     };
   }
 
@@ -386,16 +386,21 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
     const previous = this.lastProgress;
     this.lastProgress = progress;
     if (!previous || this.audioConfirmed || !this.outputStarted) return;
-    // Energy is the honest signal: bytes and packets keep flowing for a track
-    // carrying silence, and a transcript proves only that the model generated
-    // text. Samples advancing is accepted as well, because a browser that
-    // reports no energy statistic would otherwise never confirm anything.
-    const heard = progress.audioEnergy > previous.audioEnergy
-      || progress.samplesReceived > previous.samplesReceived;
-    if (!heard) return;
+    // Energy, and only energy. Bytes and packets keep flowing for a track
+    // carrying silence, and `totalSamplesReceived` counts samples whether or
+    // not they hold any signal — accepting it as a fallback would let a silent
+    // stream certify itself as audible on exactly the webviews that do not
+    // report energy. A webview that reports none is reported as unable to
+    // prove this, which is a different answer from "silent".
+    // Only the current reading has to report energy: the figure is cumulative
+    // from zero, so a previous reading that lacked the field contributes a zero
+    // baseline and any positive energy is still a real increase. A silent
+    // stream holds at zero and can never satisfy this.
+    const nonSilent = progress.audioEnergyReported && progress.audioEnergy > previous.audioEnergy;
+    if (!nonSilent) return;
     this.audioConfirmed = true;
     this.emit({
-      type: 'output_audio_playing', eventId: `local:audio-playing:${crypto.randomUUID()}`, progress,
+      type: 'non_silent_remote_audio', eventId: `local:non-silent-audio:${crypto.randomUUID()}`, progress,
     });
   }
 

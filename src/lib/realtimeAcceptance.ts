@@ -25,7 +25,8 @@ export const REALTIME_ACCEPTANCE_STEPS = [
   'tool_call_bridged',
   'tool_result_returned',
   'spoken_followup',
-  'audio_reached_the_speaker',
+  'non_silent_remote_audio_received',
+  'playback_element_advancing',
   'barge_in',
   'durable_conversation',
   'clean_disconnect',
@@ -150,6 +151,9 @@ export async function runRealtimeAcceptance(
     let generationAfterToolResult = false;
     let remoteTrackReceived = false;
     let playingAfterToolResult: RealtimeAudioProgress | null = null;
+    // Held on an object because it is only ever written from inside a callback,
+    // which control-flow narrowing would otherwise read as "always null".
+    const playback: { beforeInterrupt: RealtimeAudioProgress | null } = { beforeInterrupt: null };
     let spokenTranscriptLength = 0;
     let interrupted = false;
     let audioEventsAfterInterrupt = 0;
@@ -198,17 +202,23 @@ export async function runRealtimeAcceptance(
         }
         return;
       }
-      if (event.type === 'output_audio_playing') {
+      if (event.type === 'non_silent_remote_audio') {
         if (interrupted) audioEventsAfterInterrupt += 1;
         if (toolResultsReturned > 0 && !interrupted) {
           playingAfterToolResult = event.progress;
           pass(
-            'audio_reached_the_speaker',
-            `receiver statistics advanced while the answer played: ${Math.round(event.progress.bytesReceived)} bytes, energy ${event.progress.audioEnergy.toExponential(2)}`,
+            'non_silent_remote_audio_received',
+            `accumulated audio energy advanced to ${event.progress.audioEnergy.toExponential(2)} over ${Math.round(event.progress.bytesReceived)} received bytes, so the answer was rendered as sound rather than silence`,
           );
           if (!bargeInRequested) {
             bargeInRequested = true;
-            void current?.interrupt();
+            // Read while the answer is still playing: after `interrupt()` the
+            // element is paused, and its state then says nothing about whether
+            // the playback path ever worked.
+            void (async () => {
+              playback.beforeInterrupt = await current?.audioProgress?.() ?? event.progress;
+              await current?.interrupt();
+            })();
           }
         }
         maybeFinish();
@@ -301,38 +311,65 @@ export async function runRealtimeAcceptance(
     if (error) throw new Error(error);
     const meter = await session.audioProgress?.() ?? null;
     if (!remoteTrackReceived) {
-      fail('audio_reached_the_speaker', 'no remote audio track ever arrived, so nothing could be heard');
-    } else if (playingAfterToolResult === null && meter !== null && !meter.measured) {
-      // Not the app's failure: this webview reports neither audio energy nor a
-      // sample count, so nothing here can tell sound from a silent track.
+      fail('non_silent_remote_audio_received', 'no remote audio track ever arrived, so nothing could be heard');
+    } else if (playingAfterToolResult === null && meter !== null && !meter.audioEnergyReported) {
+      // Not the app's failure: this webview does not report totalAudioEnergy,
+      // so nothing here can tell sound from a silent stream.
       fail(
-        'audio_reached_the_speaker',
-        'this webview reports no audio energy or sample count on inbound-rtp, so playback cannot be proven either way — re-run the acceptance on a webview whose getStats reports them',
+        'non_silent_remote_audio_received',
+        'this webview reports no totalAudioEnergy on inbound-rtp, so sound cannot be told from silence either way — re-run the acceptance on a webview whose getStats reports it',
       );
     } else if (!generationAfterToolResult) {
       fail('spoken_followup', 'the provider never generated an answer after the host tool result');
     }
 
-    // "No further audio event" is not evidence of silence: the playing event
-    // fires once per response. The only honest check is to watch the numbers
-    // that only move while sound is being produced, and see them stop.
+    // Two different claims, measured at two different layers. Receiver
+    // statistics say the answer was sound; the element says the application's
+    // own playback path carried it. Neither can see the output device, the OS
+    // mixer, or the speaker, so neither is reported as proof a person heard it.
+    const playing = playback.beforeInterrupt;
+    if (playing === null) {
+      fail('playback_element_advancing', 'the transport could not report the local playback element');
+    } else if (!playing.playbackStarted) {
+      fail('playback_element_advancing', 'the audio element never started playing, so autoplay or the output device blocked the answer');
+    } else if (playing.playbackPaused) {
+      fail('playback_element_advancing', 'the audio element was paused while the answer was arriving');
+    } else if (playing.playbackSeconds <= 0) {
+      fail('playback_element_advancing', 'the audio element never advanced its playback position');
+    } else {
+      pass(
+        'playback_element_advancing',
+        `the local audio element played unpaused to ${playing.playbackSeconds.toFixed(2)}s; the output device, OS mixer, and speaker are past what this can observe`,
+      );
+    }
+
+    // Barge-in is judged where `interrupt()` actually acts: the local element.
+    // Inbound RTP can keep arriving and being decoded for packets already in
+    // flight after playback has stopped, so failing on receiver energy would
+    // condemn a barge-in that worked.
     const before = await session.audioProgress?.() ?? null;
     await wait(options.silenceWindowMs ?? 1_500);
     const after = await session.audioProgress?.() ?? null;
     if (!interrupted) {
       fail('barge_in', 'the interruption was never acknowledged');
-    } else if (audioEventsAfterInterrupt > 0) {
-      fail('barge_in', `${audioEventsAfterInterrupt} further output-audio starts arrived after the interruption`);
-    } else if (before === null || after === null || !before.measured || !after.measured) {
-      fail('barge_in', 'the transport could not measure played-out audio, so the stop is unproven');
-    } else if (after.audioEnergy > before.audioEnergy) {
-      const played = (after.audioEnergy - before.audioEnergy).toExponential(2);
-      fail('barge_in', `audio kept playing for ${options.silenceWindowMs ?? 1_500}ms after the interruption (energy +${played})`);
+    } else if (before === null || after === null) {
+      fail('barge_in', 'the transport could not report the local playback element, so the stop is unproven');
+    } else if (!after.playbackPaused) {
+      fail('barge_in', 'the audio element was still playing after the interruption');
+    } else if (after.playbackSeconds > before.playbackSeconds) {
+      const advanced = (after.playbackSeconds - before.playbackSeconds).toFixed(2);
+      fail('barge_in', `local playback kept advancing ${advanced}s over the ${options.silenceWindowMs ?? 1_500}ms after the interruption`);
     } else {
+      const settling = before.audioEnergyReported && after.audioEnergy > before.audioEnergy
+        ? '; inbound audio was still arriving, which is expected for packets already in flight'
+        : '';
       pass(
         'barge_in',
-        `played-out audio stopped advancing within ${options.silenceWindowMs ?? 1_500}ms of the interruption (energy held at ${after.audioEnergy.toExponential(2)}, playback at ${after.playbackSeconds.toFixed(2)}s)`,
+        `local playback stopped at ${after.playbackSeconds.toFixed(2)}s and did not advance over the following ${options.silenceWindowMs ?? 1_500}ms${settling}`,
       );
+    }
+    if (audioEventsAfterInterrupt > 0) {
+      fail('barge_in', `${audioEventsAfterInterrupt} further non-silent-audio events were attributed to the abandoned response`);
     }
 
 

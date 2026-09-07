@@ -77,31 +77,53 @@ const surface: RealtimeToolSurface = {
 };
 
 /**
- * A controllable stand-in for the RTCRtpReceiver statistics the real adapter
- * reads. `advance()` is the only thing that moves the numbers, so a test —
- * not the transport — decides whether the speaker is still producing sound
- * across the silence window.
+ * A controllable stand-in for what the transport can measure, with the two
+ * layers moving independently — which is the whole point. Receiver statistics
+ * describe audio that arrived and was decoded; the playback figures describe
+ * the local element. A real barge-in stops the second while the first keeps
+ * advancing for packets already in flight, so a meter that could not express
+ * that would hide the harness condemning a working interruption.
  *
  * Every read hands back a fresh snapshot on purpose. Sharing one mutable
- * object would make the harness compare a reading with itself, and then a
- * transport that never stops playing would sail through the barge-in step.
+ * object would make the harness compare a reading with itself.
  */
 function audioMeter() {
-  let ticks = 0;
+  let remoteTicks = 0;
+  let playbackTicks = 0;
+  let paused = false;
+  let started = true;
+  let energyReported = true;
   const read = (): RealtimeAudioProgress & { audioFingerprint: string } => ({
-    bytesReceived: 4_800 * ticks,
-    samplesReceived: 24_000 * ticks,
-    audioEnergy: 0.25 * ticks,
-    playbackSeconds: 0.5 * ticks,
-    measured: true,
+    bytesReceived: 4_800 * remoteTicks,
+    samplesReceived: 24_000 * remoteTicks,
+    audioEnergy: energyReported ? 0.25 * remoteTicks : 0,
+    audioEnergyReported: energyReported,
+    playbackSeconds: 0.5 * playbackTicks,
+    playbackPaused: paused,
+    playbackStarted: started,
     audioFingerprint: AUDIO_FINGERPRINT,
   });
   return {
     read,
+    /** Both layers move, the way an answer actually playing does. */
     advance() {
-      ticks += 1;
+      remoteTicks += 1;
+      playbackTicks += 1;
       return read();
     },
+    /** Packets still arriving and being decoded after playback has stopped. */
+    advanceRemoteOnly() {
+      remoteTicks += 1;
+      return read();
+    },
+    /** The element still playing on — a barge-in that did not take effect. */
+    advancePlaybackOnly() {
+      playbackTicks += 1;
+      return read();
+    },
+    pause() { paused = true; },
+    neverStarted() { started = false; },
+    withoutEnergyStatistic() { energyReported = false; },
   };
 }
 
@@ -122,6 +144,12 @@ interface ScriptOptions {
    * `unreported` answers with a reading whose zeros mean "this webview does not
    * report audio energy or sample counts" rather than "the speaker was silent". */
   playbackMeasurement?: 'measured' | 'unmeasurable' | 'unimplemented' | 'unreported';
+  /** The element keeps playing after `interrupt()` — the barge-in that did not
+   * take effect where it matters to the operator. */
+  playbackIgnoresInterrupt?: boolean;
+  /** The playback element never started, so autoplay or the output device
+   * blocked the answer even though non-silent audio arrived. */
+  playbackNeverStarted?: boolean;
   /** A transport error arriving between the tool result and the spoken answer. */
   errorAfterToolResult?: string;
   toolName?: string;
@@ -146,6 +174,8 @@ function scriptedProvider(script: ScriptOptions = {}) {
   const toolResults: Array<{ callId: string; output: string }> = [];
   const meter = audioMeter();
   const measurement = script.playbackMeasurement ?? 'measured';
+  if (script.playbackNeverStarted) meter.neverStarted();
+  if (measurement === 'unreported') meter.withoutEnergyStatistic();
   let closes = 0;
   let seq = 0;
 
@@ -210,15 +240,19 @@ function scriptedProvider(script: ScriptOptions = {}) {
           emit({ type: 'output_transcript_delta', itemId: 'item_answer', delta: SPOKEN_ANSWER.slice(0, 12) });
           emit({ type: 'output_transcript_done', itemId: 'item_answer', text: SPOKEN_ANSWER });
           if (!script.generatesWithoutPlaying) {
-            emit({ type: 'output_audio_playing', progress: meter.advance() });
+            emit({ type: 'non_silent_remote_audio', progress: meter.advance() });
           }
           emit({ type: 'response_done', responseId: 'resp_2', status: 'cancelled' });
         },
         async interrupt() {
           state = 'listening';
+          // What `interrupt()` genuinely controls: the local element stops.
+          // Inbound RTP is not its to stop, and a script that models otherwise
+          // would hide the harness judging the wrong layer.
+          if (!script.playbackIgnoresInterrupt) meter.pause();
           emit({ type: 'interrupted', itemId: 'item_answer' });
           for (let extra = script.audioEventsAfterInterrupt ?? 0; extra > 0; extra -= 1) {
-            emit({ type: 'output_audio_playing', progress: meter.advance() });
+            emit({ type: 'non_silent_remote_audio', progress: meter.advanceRemoteOnly() });
           }
         },
         async close() {
@@ -233,7 +267,7 @@ function scriptedProvider(script: ScriptOptions = {}) {
               // 'unreported' is the WebKit shape: getStats answers, but with
               // neither `totalAudioEnergy` nor `totalSamplesReceived`, so the
               // zeros it carries mean "not told" rather than "silent".
-              if (measurement === 'unreported') return { ...meter.read(), measured: false };
+              if (measurement === 'unreported') return meter.read();
               return meter.read();
             },
           }),
@@ -266,9 +300,12 @@ async function run(options: {
   script?: ScriptOptions;
   status?: Partial<RealtimeVoiceStatus>;
   surface?: RealtimeToolSurface;
-  /** Keeps the meter climbing while the run observes silence, which is what a
-   * speaker that ignored the interruption looks like from the outside. */
+  /** The local element keeps advancing across the silence window: a barge-in
+   * that never reached the operator's ears. */
   keepsPlayingAcrossWindow?: boolean;
+  /** Only inbound RTP keeps advancing across the window, with local playback
+   * already stopped. This is a barge-in that WORKED, and it must not fail. */
+  remoteKeepsArrivingAcrossWindow?: boolean;
 } = {}) {
   const fake = scriptedProvider(options.script);
   let deadlineReached!: () => void;
@@ -294,7 +331,8 @@ async function run(options: {
     wait: async (ms) => {
       waits.push(ms);
       if (ms === EXCHANGE_TIMEOUT_MS) return deadline;
-      if (ms === SILENCE_WINDOW_MS && options.keepsPlayingAcrossWindow) fake.meter.advance();
+      if (ms === SILENCE_WINDOW_MS && options.keepsPlayingAcrossWindow) fake.meter.advancePlaybackOnly();
+      if (ms === SILENCE_WINDOW_MS && options.remoteKeepsArrivingAcrossWindow) fake.meter.advanceRemoteOnly();
       return undefined;
     },
   });
@@ -334,11 +372,11 @@ beforeEach(() => {
 });
 
 describe('realtime acceptance run against a scripted provider', () => {
-  it('passes all eleven steps, in order, for one tool call and one continuation', async () => {
+  it('passes all twelve steps, in order, for one tool call and one continuation', async () => {
     const { report, fake } = await run();
     expect(report.error).toBeNull();
     expect(report.status).toBe('passed');
-    expect(REALTIME_ACCEPTANCE_STEPS).toHaveLength(11);
+    expect(REALTIME_ACCEPTANCE_STEPS).toHaveLength(12);
     expect(report.steps.map((entry) => entry.id)).toEqual([...REALTIME_ACCEPTANCE_STEPS]);
     expect(report.steps.filter((entry) => entry.status !== 'passed')).toEqual([]);
     // The ask for the spoken follow-up happens exactly once whichever of
@@ -354,22 +392,27 @@ describe('realtime acceptance run against a scripted provider', () => {
     // began, and the receiver statistics said sound came out.
     expect(step(report, 'spoken_followup').detail)
       .toBe('the provider generated a further answer after the host tool result (1 continuation requested)');
-    expect(step(report, 'audio_reached_the_speaker').detail)
-      .toBe('receiver statistics advanced while the answer played: 4800 bytes, energy 2.50e-1');
+    expect(step(report, 'non_silent_remote_audio_received').detail)
+      .toBe('accumulated audio energy advanced to 2.50e-1 over 4800 received bytes,'
+        + ' so the answer was rendered as sound rather than silence');
+    // A separate claim at a separate layer, and deliberately modest about it.
+    expect(step(report, 'playback_element_advancing').detail)
+      .toBe('the local audio element played unpaused to 0.50s;'
+        + ' the output device, OS mixer, and speaker are past what this can observe');
     // firstAudioMs is anchored on measured playback, so it exists only because
     // audio actually played.
     expect(report.metrics.firstAudioMs).toBeGreaterThanOrEqual(0);
   });
 
-  it('FALSE PASS 1: a provider that generates a transcript but never plays audio fails audio_reached_the_speaker', async () => {
+  it('FALSE PASS 1: a provider that generates a transcript but never plays audio fails non_silent_remote_audio_received', async () => {
     const { report, fake } = await run({ script: { generatesWithoutPlaying: true } });
     expect(report.status).toBe('failed');
     // Generation after the tool result is genuinely proven — a transcript
     // delta is evidence of that and of nothing else — so the run must not
     // blame the follow-up for a silent speaker.
     expect(step(report, 'spoken_followup').status).toBe('passed');
-    expect(firstFailure(report)).toBe('audio_reached_the_speaker');
-    expect(step(report, 'audio_reached_the_speaker').status).toBe('failed');
+    expect(firstFailure(report)).toBe('non_silent_remote_audio_received');
+    expect(step(report, 'non_silent_remote_audio_received').status).toBe('failed');
     // Never anchored, because nothing was ever measured playing.
     expect(report.metrics.firstAudioMs).toBeNull();
     // The run waits for measured playback rather than settling on the
@@ -380,20 +423,20 @@ describe('realtime acceptance run against a scripted provider', () => {
     expect(fake.closes()).toBe(1);
   });
 
-  it('fails audio_reached_the_speaker when no remote audio track ever arrived', async () => {
+  it('fails non_silent_remote_audio_received when no remote audio track ever arrived', async () => {
     const { report } = await run({ script: { noRemoteTrack: true } });
     expect(report.status).toBe('failed');
     // Over WebRTC the remote track is the only path audio can travel, so its
     // absence outranks every playing event the data channel could imply.
-    expect(step(report, 'audio_reached_the_speaker')).toMatchObject({
+    expect(step(report, 'non_silent_remote_audio_received')).toMatchObject({
       status: 'failed',
       detail: 'no remote audio track ever arrived, so nothing could be heard',
     });
-    expect(failedSteps(report)).toEqual(['audio_reached_the_speaker']);
+    expect(failedSteps(report)).toEqual(['non_silent_remote_audio_received']);
     expect(report.error).toBeNull();
   });
 
-  it('FALSE PASS 2: audio that keeps playing across the silence window fails barge_in', async () => {
+  it('FALSE PASS 2: local playback that keeps advancing across the silence window fails barge_in', async () => {
     const { report } = await run({ keepsPlayingAcrossWindow: true });
     expect(report.status).toBe('failed');
     expect(firstFailure(report)).toBe('barge_in');
@@ -401,23 +444,47 @@ describe('realtime acceptance run against a scripted provider', () => {
     // silence. The numbers that only move while sound is rendered say the
     // speaker never stopped.
     expect(step(report, 'barge_in').detail)
-      .toBe('audio kept playing for 30000ms after the interruption (energy +2.50e-1)');
+      .toBe('local playback kept advancing 0.50s over the 30000ms after the interruption');
     expect(report.metrics.interrupted).toBe(true);
     // Everything else still held, so the report points at the one guarantee
     // that broke rather than collapsing the whole run.
     expect(failedSteps(report)).toEqual(['barge_in']);
   });
 
-  it('passes barge_in when played-out audio stops advancing across the window, and says what it held at', async () => {
+  it('passes barge_in when local playback stops advancing across the window, and says where it stopped', async () => {
     const { report } = await run();
     expect(step(report, 'barge_in')).toMatchObject({
       status: 'passed',
-      detail: 'played-out audio stopped advancing within 30000ms of the interruption '
-        + '(energy held at 2.50e-1, playback at 0.50s)',
+      detail: 'local playback stopped at 0.50s and did not advance over the following 30000ms',
     });
   });
 
-  it('blames the webview, not the app, when getStats reports no audio energy or sample count', async () => {
+  it('does not condemn a working barge-in for inbound packets still in flight', async () => {
+    // `interrupt()` stops the local element; it does not and cannot stop RTP
+    // already on the wire. Judging the stop on receiver energy would fail a
+    // barge-in that did exactly what the operator asked.
+    const { report } = await run({ remoteKeepsArrivingAcrossWindow: true });
+    expect(report.status).toBe('passed');
+    expect(step(report, 'barge_in')).toMatchObject({
+      status: 'passed',
+      detail: 'local playback stopped at 0.50s and did not advance over the following 30000ms'
+        + '; inbound audio was still arriving, which is expected for packets already in flight',
+    });
+  });
+
+  it('fails playback_element_advancing when the element never started, however much audio arrived', async () => {
+    // Non-silent audio reaching the receiver says nothing about whether
+    // autoplay, the sink, or the output device let it through.
+    const { report } = await run({ script: { playbackNeverStarted: true } });
+    expect(report.status).toBe('failed');
+    expect(step(report, 'non_silent_remote_audio_received').status).toBe('passed');
+    expect(step(report, 'playback_element_advancing')).toMatchObject({
+      status: 'failed',
+      detail: 'the audio element never started playing, so autoplay or the output device blocked the answer',
+    });
+  });
+
+  it('blames the webview, not the app, when getStats reports no audio energy', async () => {
     // WebKit's getStats is narrower than Chromium's, and this ships to
     // WKWebView and WebKitGTK as well as WebView2. A reading of zero there
     // means "not reported", so failing with the ordinary silent-speaker
@@ -426,18 +493,23 @@ describe('realtime acceptance run against a scripted provider', () => {
       script: { playbackMeasurement: 'unreported', generatesWithoutPlaying: true },
     });
     expect(report.status).toBe('failed');
-    expect(step(report, 'audio_reached_the_speaker')).toMatchObject({
+    expect(step(report, 'non_silent_remote_audio_received')).toMatchObject({
       status: 'failed',
-      detail: 'this webview reports no audio energy or sample count on inbound-rtp, so playback cannot be proven either way'
-        + ' — re-run the acceptance on a webview whose getStats reports them',
+      detail: 'this webview reports no totalAudioEnergy on inbound-rtp, so sound cannot be told from silence either way'
+        + ' — re-run the acceptance on a webview whose getStats reports it',
     });
     // The generation half still passed: the model did answer, and only the
     // proof that it was audible is missing.
     expect(step(report, 'spoken_followup').status).toBe('passed');
-    expect(failedSteps(report)).toEqual(['audio_reached_the_speaker', 'barge_in']);
+    // Nothing played in this scenario at all, so the playback claims fail too
+    // — but each for its own stated reason, and none of them blaming silence
+    // on a statistic the webview never reported.
+    expect(failedSteps(report)).toEqual([
+      'non_silent_remote_audio_received', 'playback_element_advancing', 'barge_in',
+    ]);
   });
 
-  it.each(['unimplemented', 'unmeasurable', 'unreported'] as const)(
+  it.each(['unimplemented', 'unmeasurable'] as const)(
     'fails barge_in as unproven when the transport answers %s for played-out audio',
     async (playbackMeasurement) => {
       const { report } = await run({ script: { playbackMeasurement } });
@@ -446,7 +518,7 @@ describe('realtime acceptance run against a scripted provider', () => {
       // must not be able to certify that it stopped.
       expect(step(report, 'barge_in')).toMatchObject({
         status: 'failed',
-        detail: 'the transport could not measure played-out audio, so the stop is unproven',
+        detail: 'the transport could not report the local playback element, so the stop is unproven',
       });
       expect(failedSteps(report)).toEqual(['barge_in']);
       // The interruption itself was acknowledged; only the proof is missing.
@@ -459,7 +531,7 @@ describe('realtime acceptance run against a scripted provider', () => {
     expect(report.status).toBe('failed');
     expect(firstFailure(report)).toBe('barge_in');
     expect(step(report, 'barge_in').detail)
-      .toBe('2 further output-audio starts arrived after the interruption');
+      .toBe('2 further non-silent-audio events were attributed to the abandoned response');
     expect(failedSteps(report)).toEqual(['barge_in']);
   });
 
@@ -472,7 +544,7 @@ describe('realtime acceptance run against a scripted provider', () => {
     // wall of "not reached" for the operator to interpret.
     expect(step(report, 'spoken_followup').detail)
       .toBe('the provider never generated an answer after the host tool result');
-    expect(step(report, 'audio_reached_the_speaker').detail).toBe('not reached');
+    expect(step(report, 'non_silent_remote_audio_received').detail).toBe('not reached');
     // The failure is squarely the provider's silence: the host closed the
     // function call and the ledger did ask for the follow-up.
     expect(fake.toolResults).toHaveLength(1);
@@ -558,7 +630,7 @@ describe('realtime acceptance run against a scripted provider', () => {
     // Counters describing the audio are the evidence; the audio is not. A
     // detail assembled by stringifying a progress reading would carry the
     // marker the fake transport attaches to every one of them.
-    expect(evidence).toContain('4800 bytes');
+    expect(evidence).toContain('4800 received bytes');
     expect(evidence).not.toContain('AUDIO_WAVEFORM_ECHO');
     expect(evidence).not.toContain('audioFingerprint');
     // The words really were in play — otherwise this test proves nothing.
