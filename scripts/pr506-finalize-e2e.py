@@ -23,11 +23,10 @@ def replace_once(path: str, old: str, new: str) -> None:
 runpy.run_path("scripts/pr506-wire-mlx-cache.py", run_name="__main__")
 
 # The public Runtime Hub service port is assigned before the managed adapter
-# starts, but the adapter historically allocated Lily's private child port first.
-# On macOS that TOCTOU can return the same supposedly-free port for both. Lily
-# then owns the port the parent is about to expose, so the child reports ready
-# while the parent never becomes reachable. Explicitly exclude the public port
-# from every private child allocation (including the later MLX fallback).
+# starts. Reserve it from every private child allocation and, more importantly,
+# bind the parent listener before starting Lily. This removes both the direct
+# child collision and the general free-port TOCTOU window between Runtime Hub's
+# port selection and the service actually owning that port.
 replace_once(
     "packaging/mlx/service/lily_managed.py",
     '''def _free_port() -> int:\n    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:\n        sock.bind(("127.0.0.1", 0))\n        return int(sock.getsockname()[1])\n''',
@@ -52,6 +51,16 @@ replace_once(
     "packaging/mlx/service/lily_managed.py",
     '''        Path(args.python),\n        args.startup_timeout_seconds,\n    )''',
     '''        Path(args.python),\n        args.startup_timeout_seconds,\n        reserved_ports={args.port},\n    )''',
+)
+replace_once(
+    "packaging/mlx/service/lily_managed.py",
+    '''    server: ThreadingHTTPServer | None = None\n    stopping = threading.Event()''',
+    '''    # Own the externally assigned Runtime Hub port before any child process\n    # starts. The listener is activated now but `serve_forever` begins only after\n    # the selected heavy backend is genuinely ready, so a successful health\n    # response can never mean "Lily is still loading".\n    _Handler.backend = backend\n    server: ThreadingHTTPServer | None = ThreadingHTTPServer((args.host, args.port), _Handler)\n    stopping = threading.Event()''',
+)
+replace_once(
+    "packaging/mlx/service/lily_managed.py",
+    '''    try:\n        backend.start()\n        _Handler.backend = backend\n        server = ThreadingHTTPServer((args.host, args.port), _Handler)\n        sys.stderr.write(f"mlx-service listening on {args.host}:{args.port} engine={backend.mode}\\n")\n        sys.stderr.flush()\n        server.serve_forever()''',
+    '''    try:\n        backend.start()\n        sys.stderr.write(f"mlx-service listening on {args.host}:{args.port} engine={backend.mode}\\n")\n        sys.stderr.flush()\n        server.serve_forever()''',
 )
 
 # When Lily is active, the supervised Python service is only a lightweight
