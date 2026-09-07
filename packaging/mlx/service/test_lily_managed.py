@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
+import shlex
 import socket
 import stat
 import subprocess
@@ -36,16 +36,23 @@ def _port() -> int:
 
 
 def _wait(port: int, process: subprocess.Popen) -> None:
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise AssertionError(f"service exited early: {process.returncode}")
+            stderr = process.stderr.read() if process.stderr is not None else ""
+            raise AssertionError(f"service exited early: {process.returncode}\n{stderr}")
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.2):
                 return
         except Exception:
             time.sleep(0.05)
-    raise AssertionError("service did not become healthy")
+    process.terminate()
+    try:
+        _stdout, stderr = process.communicate(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        _stdout, stderr = process.communicate(timeout=3)
+    raise AssertionError(f"service did not become healthy\n{stderr}")
 
 
 def _post(port: int, body: dict) -> str:
@@ -101,31 +108,43 @@ def test_full_managed_lily_then_capability_fallback() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         fake_lily = root / "lily"
+        fake_lily_impl = root / "fake_lily.py"
         fallback = root / "fallback.py"
         model = root / "model"
         model.mkdir()
 
+        fake_lily_impl.write_text(
+            textwrap.dedent(
+                r'''
+                import argparse, json
+                from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+                p=argparse.ArgumentParser(); p.add_argument('--model'); p.add_argument('--bind'); p.add_argument('--max-seq'); a=p.parse_args()
+                host,port=a.bind.rsplit(':',1)
+                class H(BaseHTTPRequestHandler):
+                  def log_message(self,*a): pass
+                  def do_GET(self):
+                    if self.path=='/health': body=b'{"ok":true}'
+                    elif self.path=='/v1/models': body=b'{"data":[{"id":"Qwen3.6-35B-A3B"}]}'
+                    else: self.send_error(404); return
+                    self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
+                  def do_POST(self):
+                    n=int(self.headers.get('Content-Length','0')); json.loads(self.rfile.read(n))
+                    body=json.dumps({'choices':[{'message':{'content':'lily-ok'}}], 'usage':{'prompt_tokens':11,'completion_tokens':2,'prompt_tokens_details':{'cached_tokens':7}}}).encode()
+                    self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
+                ThreadingHTTPServer((host,int(port)),H).serve_forever()
+                '''
+            )
+        )
+        # Execute the fixture through the exact interpreter running the test.
+        # This avoids relying on /usr/bin/env/shebang resolution on hosted macOS
+        # while still exercising lily_managed's "binary child" process boundary.
         _write_executable(
             fake_lily,
-            r'''#!/usr/bin/env python3
-import argparse, json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-p=argparse.ArgumentParser(); p.add_argument('--model'); p.add_argument('--bind'); p.add_argument('--max-seq'); a=p.parse_args()
-host,port=a.bind.rsplit(':',1)
-class H(BaseHTTPRequestHandler):
-  def log_message(self,*a): pass
-  def do_GET(self):
-    if self.path=='/health': body=b'{"ok":true}'
-    elif self.path=='/v1/models': body=b'{"data":[{"id":"Qwen3.6-35B-A3B"}]}'
-    else: self.send_error(404); return
-    self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
-  def do_POST(self):
-    n=int(self.headers.get('Content-Length','0')); req=json.loads(self.rfile.read(n));
-    body=json.dumps({'choices':[{'message':{'content':'lily-ok'}}], 'usage':{'prompt_tokens':11,'completion_tokens':2,'prompt_tokens_details':{'cached_tokens':7}}}).encode()
-    self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
-ThreadingHTTPServer((host,int(port)),H).serve_forever()
+            f'''#!/bin/sh
+exec {shlex.quote(sys.executable)} {shlex.quote(str(fake_lily_impl))} "$@"
 ''',
         )
+
         fallback.write_text(
             textwrap.dedent(
                 r'''
@@ -199,12 +218,13 @@ ThreadingHTTPServer((host,int(port)),H).serve_forever()
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/health") as response:
                 assert json.load(response)["engine"] == "mlx"
         finally:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
 
 
 def main() -> None:
