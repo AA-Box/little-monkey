@@ -1,0 +1,50 @@
+name: PR506 wire MLX cache
+
+on:
+  push:
+    branches:
+      - feat/mlx-prefix-cache-lily-runtime
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    if: contains(github.event.head_commit.message, 'bootstrap PR506 E2E MLX cache wiring')
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/mlx-prefix-cache-lily-runtime
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Apply cache ABI wiring
+        run: python3 scripts/pr506-wire-mlx-cache.py
+
+      - name: Format Rust
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all
+
+      - name: Verify Python MLX service contract
+        run: python3 packaging/mlx/service/test_mlx_server.py
+
+      - name: Compile production Rust path
+        run: cargo check --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Run MLX runtime tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib mlx_runtime::tests -- --nocapture
+
+      - name: Commit verified wiring and remove bootstrap files
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm scripts/pr506-wire-mlx-cache.py .github/workflows/pr506-wire-mlx-cache.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: wire MLX prompt cache through canonical usage"
+          git push origin HEAD:feat/mlx-prefix-cache-lily-runtime
