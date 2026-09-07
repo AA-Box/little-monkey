@@ -18,6 +18,7 @@ import argparse
 import http.client
 import json
 import os
+import queue
 import signal
 import socket
 import subprocess
@@ -32,6 +33,7 @@ from pathlib import Path
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 STARTUP_TIMEOUT_SECONDS = 180.0
 SHUTDOWN_TIMEOUT_SECONDS = 8.0
+LILY_KEEPALIVE_SECONDS = 0.25
 LILY_MODEL_ID = "Qwen3.6-35B-A3B"
 
 
@@ -109,7 +111,7 @@ def _lily_compatible(request: dict) -> bool:
 
 
 class _Backend:
-    """Owns exactly one heavy inference child at a time."""
+    """Owns exactly one heavy inference child and one generation at a time."""
 
     def __init__(
         self,
@@ -125,6 +127,10 @@ class _Backend:
         self.python = python
         self.startup_timeout = max(0.1, float(startup_timeout))
         self._lock = threading.RLock()
+        # mlx_server owns MLX arrays on one worker thread. Keep Lily on the same
+        # one-generation-at-a-time model so concurrent agent jobs cannot race its
+        # session cache or mutate backend state around a cancellation.
+        self.generation_lock = threading.Lock()
         self._mode = "lily"
         self._port = _free_port()
         self._process: subprocess.Popen | None = None
@@ -209,6 +215,19 @@ class _Backend:
         with self._lock:
             _terminate(self._process)
             self._process = None
+
+    def abort_lily_request(self) -> None:
+        """Stop in-flight Lily compute after the downstream request is cancelled."""
+        with self._lock:
+            if self._mode != "lily":
+                return
+            _terminate(self._process)
+            self._process = None
+            # The next request starts normal managed MLX lazily. Starting it here
+            # would make cancellation wait for a second heavyweight model load.
+            self._mode = "mlx_pending"
+            sys.stderr.write("mlx-service engine=lily reason=request_cancelled status=stopped\n")
+            sys.stderr.flush()
 
     def lily_generate(self, request: dict) -> dict:
         with self._lock:
@@ -310,44 +329,111 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _serve_lily(self, request: dict) -> None:
-        self._begin_sse()
-        request_id = str(request.get("requestId", ""))
-        self._event({"type": "started", "request_id": request_id})
-        try:
-            response = self._backend().lily_generate(request)
+        backend = self._backend()
+        # Match mlx_server's single-worker execution model. We acquire before
+        # emitting response headers so a request queued behind another request
+        # can still switch cleanly to fallback if the active Lily child dies.
+        with backend.generation_lock:
+            if backend.mode != "lily":
+                self._proxy_fallback(request)
+                return
+            try:
+                self._begin_sse()
+                request_id = str(request.get("requestId", ""))
+                self._event({"type": "started", "request_id": request_id})
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+
+            result: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
+
+            def generate() -> None:
+                try:
+                    result.put(("ok", backend.lily_generate(request)))
+                except Exception as error:  # noqa: BLE001 - handed back to request thread
+                    result.put(("error", error))
+
+            threading.Thread(target=generate, name=f"lily-request-{request_id}", daemon=True).start()
+            while True:
+                try:
+                    outcome, payload = result.get(timeout=LILY_KEEPALIVE_SECONDS)
+                    break
+                except queue.Empty:
+                    # Lily is blocking, but M3 cancellation is expressed by
+                    # dropping this streaming response. SSE comments keep the
+                    # connection observable without adding protocol events.
+                    try:
+                        self._chunk(b": keepalive\n\n")
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        backend.abort_lily_request()
+                        return
+
+            if outcome == "error":
+                error = payload if isinstance(payload, Exception) else RuntimeError(str(payload))
+                try:
+                    self._event({"type": "error", "code": "generation_failed", "message": str(error)})
+                    self._event(
+                        {
+                            "type": "completed",
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cached_input_tokens": 0,
+                        }
+                    )
+                    self._finish()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+                return
+
+            if not isinstance(payload, dict):
+                try:
+                    self._event(
+                        {
+                            "type": "error",
+                            "code": "generation_failed",
+                            "message": "Lily returned a non-object completion",
+                        }
+                    )
+                    self._event(
+                        {
+                            "type": "completed",
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cached_input_tokens": 0,
+                        }
+                    )
+                    self._finish()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+                return
+
+            response = payload
             choices = response.get("choices") or []
             content = str((choices[0].get("message") or {}).get("content") or "") if choices else ""
-            if content:
-                self._event({"type": "text_delta", "text": content})
             usage = response.get("usage") or {}
             details = usage.get("prompt_tokens_details") or {}
             cached = max(0, int(details.get("cached_tokens") or 0))
             input_tokens = max(0, int(usage.get("prompt_tokens") or 0))
             output_tokens = max(0, int(usage.get("completion_tokens") or 0))
-            self._event(
-                {
-                    "type": "completed",
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "cached_input_tokens": cached,
-                }
-            )
+            try:
+                if content:
+                    self._event({"type": "text_delta", "text": content})
+                self._event(
+                    {
+                        "type": "completed",
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cached_input_tokens": cached,
+                    }
+                )
+                self._finish()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                # Generation has already finished; there is no compute left to abort.
+                return
             sys.stderr.write(
                 f"mlx-service engine=lily request={request_id} input_tokens={input_tokens} "
                 f"output_tokens={output_tokens} cached_input_tokens={cached}\n"
             )
             sys.stderr.flush()
-        except Exception as error:  # noqa: BLE001 - protocol must surface terminal failure
-            self._event({"type": "error", "code": "generation_failed", "message": str(error)})
-            self._event(
-                {
-                    "type": "completed",
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cached_input_tokens": 0,
-                }
-            )
-        self._finish()
 
     def _proxy_fallback(self, request: dict) -> None:
         connection: http.client.HTTPConnection | None = None
@@ -368,10 +454,13 @@ class _Handler(BaseHTTPRequestHandler):
                     break
                 self._chunk(chunk)
             self._finish()
-        except BrokenPipeError:
+        except (BrokenPipeError, ConnectionResetError):
             return
         except Exception as error:  # noqa: BLE001
-            self.send_error(500, str(error))
+            try:
+                self.send_error(500, str(error))
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
         finally:
             if connection is not None:
                 connection.close()
