@@ -2,27 +2,30 @@
 /**
  * Builds — and, given a key, signs — the MLX service package the app installs.
  *
- *   pnpm mlx:keygen                    # once: print a publisher keypair
- *   pnpm mlx:package                   # build the tree, leave it unsigned
- *   MLX_SIGNING_KEY=... pnpm mlx:package   # build and sign
+ *   pnpm mlx:keygen
+ *   pnpm mlx:package
+ *   MLX_SIGNING_KEY=... pnpm mlx:package
  *
- * The private key is never read from a file in this repository and is never
- * written to one. It arrives in `MLX_SIGNING_KEY` as a PKCS#8 PEM (the same
- * shape as TAURI_SIGNING_PRIVATE_KEY, which release.yml already supplies from
- * a CI secret) because signing a package is authorization to place executable
- * code inside the app's private runtime directory.
- *
- * Without the key the build still runs and writes an unsigned manifest. That
- * is deliberate: it lets the tree, the digests, and the Python service be
- * exercised locally, and the installer refuses the result — `signatureAlgorithm:
- * "none"` is rejected outright by validate_manifest — so an unsigned package
- * can never be mistaken for an installable one. This mirrors
- * codesign-managed-runtime.mjs, which likewise no-ops without its identity.
+ * The package is self-contained and signed. In addition to the pinned MLX
+ * Python stack it carries a Lily binary built from one immutable upstream
+ * commit. `service/runtime_router.py` is the only serviceEntry: it selects Lily
+ * conservatively on supported M5+/macOS 26+ Qwen3.6 hosts and otherwise execs
+ * the normal MLX service. No user PATH executable is trusted at runtime.
  */
 
 import { execFileSync } from "node:child_process";
 import { createHash, generateKeyPairSync } from "node:crypto";
-import { cpSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -31,39 +34,28 @@ import { buildManifest, canonicalJson, serviceRevision, signManifest } from "./l
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SOURCE_SERVICE = join(REPOSITORY_ROOT, "packaging/mlx/service/mlx_server.py");
 const SOURCE_VIDEO_SERVICE = join(REPOSITORY_ROOT, "packaging/mlx/service/mlx_video_server.py");
+const SOURCE_ROUTER = join(REPOSITORY_ROOT, "packaging/mlx/service/runtime_router.py");
+const SOURCE_LILY_MANAGED = join(REPOSITORY_ROOT, "packaging/mlx/service/lily_managed.py");
 const OUTPUT_ROOT = join(REPOSITORY_ROOT, "packaging/mlx/dist");
 
 /** Must match MLX_RELEASE_KEY_ID in src-tauri/src/m3_production.rs. */
 const KEY_ID = "release-2026-1";
-/**
- * Runtime versions are pinned as a compatible set, not merely through
- * mlx-lm's lower bound. The core MLX pin matters because kernel/cache behavior
- * changes independently of mlx-lm; the VLM pin keeps the model loader from
- * drifting every time this package is rebuilt.
- */
 const MLX_VERSION = "0.32.2";
 const MLX_LM_VERSION = "0.31.3";
 const MLX_VLM_VERSION = "0.6.17";
-/**
- * The video engine, pinned to a commit rather than a version.
- *
- * mlx-video publishes no releases and no tags, its `__version__` has read
- * "0.0.1" since the repository was created, and the name `mlx-video` on PyPI
- * belongs to an unrelated project — so a version range would be meaningless and
- * a bare `pip install mlx-video` would install the wrong software. A commit is
- * the only thing that identifies what this package actually carries.
- */
 const MLX_VIDEO_COMMIT = "87db56a51758fefb748a359b90a5283bb8ba4837";
-/** Catalog identity. `componentId` is the stable key the component hub
- *  versions against, so it must not carry the version. */
+/**
+ * Audited Lily source revision. Do not use a branch/tag here: a managed
+ * executable must be reproducibly attributable to the source we reviewed.
+ */
+const LILY_GARDEN_COMMIT = "1ed972ed3f0bd5616c997c9507c25616c63394fc";
+const LILY_REPOSITORY = "https://github.com/perplexityai/pplx-garden.git";
 const SOURCE_ID = "little-monkey-mlx";
 const COMPONENT_ID = "mlx-runtime-apple-silicon";
 const ARCHIVE_PREFIX = "mlx-runtime";
 
 function keygen() {
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
-  // The raw 32 bytes are the tail of the DER SubjectPublicKeyInfo; that hex is
-  // what MLX_RELEASE_PUBLIC_KEY_HEX holds.
   const raw = publicKey.export({ type: "spki", format: "der" }).subarray(-32);
   process.stdout.write(
     [
@@ -78,18 +70,56 @@ function keygen() {
   );
 }
 
+function buildLily() {
+  const checkout = mkdtempSync(join(tmpdir(), "little-monkey-lily-"));
+  try {
+    execFileSync("git", ["init", "--quiet", checkout], { stdio: "inherit" });
+    execFileSync("git", ["-C", checkout, "remote", "add", "origin", LILY_REPOSITORY], {
+      stdio: "inherit",
+    });
+    execFileSync(
+      "git",
+      ["-C", checkout, "fetch", "--quiet", "--depth=1", "origin", LILY_GARDEN_COMMIT],
+      { stdio: "inherit" },
+    );
+    const fetched = execFileSync("git", ["-C", checkout, "rev-parse", "FETCH_HEAD"])
+      .toString()
+      .trim();
+    if (fetched !== LILY_GARDEN_COMMIT) {
+      throw new Error(`Lily source identity mismatch: wanted ${LILY_GARDEN_COMMIT}, got ${fetched}`);
+    }
+    execFileSync("git", ["-C", checkout, "checkout", "--quiet", "--detach", "FETCH_HEAD"], {
+      stdio: "inherit",
+    });
+
+    const lilyRoot = join(checkout, "lily");
+    // Lily pins Rust 1.92 in its own rust-toolchain.toml. Build from its own
+    // directory so rustup honors that file and Cargo.lock is mandatory.
+    execFileSync("cargo", ["build", "--release", "--locked"], {
+      cwd: lilyRoot,
+      stdio: "inherit",
+    });
+    const built = join(lilyRoot, "target/release/lily");
+    const destination = join(OUTPUT_ROOT, "bin/lily");
+    mkdirSync(dirname(destination), { recursive: true });
+    cpSync(built, destination);
+    chmodSync(destination, 0o755);
+
+    mkdirSync(join(OUTPUT_ROOT, "licenses/lily"), { recursive: true });
+    cpSync(join(lilyRoot, "LICENSE"), join(OUTPUT_ROOT, "licenses/lily/LICENSE"));
+    cpSync(join(lilyRoot, "NOTICE"), join(OUTPUT_ROOT, "licenses/lily/NOTICE"));
+  } finally {
+    rmSync(checkout, { recursive: true, force: true });
+  }
+}
+
 function build() {
   if (process.platform !== "darwin" || process.arch !== "arm64") {
-    // The manifest hard-pins macos/aarch64 and the installer re-checks it
-    // against the probed host, so a package built anywhere else is a package
-    // nothing can install.
     throw new Error(`MLX packages are macOS arm64 only; this is ${process.platform}/${process.arch}`);
   }
   rmSync(OUTPUT_ROOT, { recursive: true, force: true });
   mkdirSync(OUTPUT_ROOT, { recursive: true });
 
-  // A self-contained interpreter, not the user's: the manifest names the
-  // interpreter it was signed with, and the installer execs that exact file.
   console.log("creating the packaged interpreter…");
   execFileSync("python3", ["-m", "venv", "--copies", join(OUTPUT_ROOT, "runtime")], {
     stdio: "inherit",
@@ -109,10 +139,7 @@ function build() {
     ],
     { stdio: "inherit" },
   );
-  // Installed into the same interpreter rather than a second one: both services
-  // are launched from this venv. Install the video project at its immutable
-  // commit after the three direct pins; its declared `mlx>=0.22` requirement is
-  // compatible with the exact core version above.
+
   console.log("adding the video engine…");
   execFileSync(
     python,
@@ -125,11 +152,6 @@ function build() {
     ],
     { stdio: "inherit" },
   );
-
-  // Fail the package build if a transitive install moved any direct pin or left
-  // an inconsistent dependency graph. A signed runtime must identify what it
-  // actually executes rather than trusting the command that attempted to
-  // install it.
   execFileSync(python, ["-m", "pip", "check"], { stdio: "inherit" });
   execFileSync(
     python,
@@ -145,29 +167,27 @@ function build() {
     { stdio: "inherit" },
   );
 
-  // Compiled bytecode is regenerable cache, not payload: it is nearly half the
-  // files a fresh venv contains, every one of which would otherwise be
-  // digested, signed, and re-verified on each launch for no benefit.
+  console.log(`building Lily at ${LILY_GARDEN_COMMIT.slice(0, 12)}…`);
+  buildLily();
   pruneBytecode(OUTPUT_ROOT);
 
   mkdirSync(join(OUTPUT_ROOT, "service"), { recursive: true });
   cpSync(SOURCE_SERVICE, join(OUTPUT_ROOT, "service/mlx_server.py"));
-  // The second service. It is not the manifest's `serviceEntry` — that names
-  // the one the M3 runtime adapter launches — but it is covered by the same
-  // digests, so Studio can only ever run a file this package signed for.
   cpSync(SOURCE_VIDEO_SERVICE, join(OUTPUT_ROOT, "service/mlx_video_server.py"));
+  cpSync(SOURCE_ROUTER, join(OUTPUT_ROOT, "service/runtime_router.py"));
+  cpSync(SOURCE_LILY_MANAGED, join(OUTPUT_ROOT, "service/lily_managed.py"));
 
   const pythonExecutable = "runtime/bin/python3";
-  // `svc-` is what makes a service-only fix a new version rather than a
-  // same-named rebuild nothing upgrades to — see `serviceRevision`.
-  const version = `mlx-${MLX_VERSION}+mlx-lm-${MLX_LM_VERSION}+mlx-vlm-${MLX_VLM_VERSION}+video-${MLX_VIDEO_COMMIT.slice(0, 12)}+${pythonVersion(
-    join(OUTPUT_ROOT, pythonExecutable),
-  )}+svc-${serviceRevision([SOURCE_SERVICE, SOURCE_VIDEO_SERVICE])}`;
+  const sources = [SOURCE_SERVICE, SOURCE_VIDEO_SERVICE, SOURCE_ROUTER, SOURCE_LILY_MANAGED];
+  const version =
+    `mlx-${MLX_VERSION}+mlx-lm-${MLX_LM_VERSION}+mlx-vlm-${MLX_VLM_VERSION}` +
+    `+video-${MLX_VIDEO_COMMIT.slice(0, 12)}+lily-${LILY_GARDEN_COMMIT.slice(0, 12)}` +
+    `+${pythonVersion(join(OUTPUT_ROOT, pythonExecutable))}+svc-${serviceRevision(sources)}`;
   let manifest = buildManifest({
     root: OUTPUT_ROOT,
     packageVersion: version,
     pythonExecutable,
-    serviceEntry: "service/mlx_server.py",
+    serviceEntry: "service/runtime_router.py",
     keyId: KEY_ID,
   });
 
@@ -186,22 +206,8 @@ function build() {
   publish(version, manifest);
 }
 
-/**
- * Packs the tree for distribution and writes the catalog entry that points at
- * it.
- *
- * The archive is what a feed serves and the component hub downloads; the entry
- * is what a catalog source lists. Both are emitted here so the digest in the
- * entry is, by construction, the digest of the archive beside it — the one
- * pair that must never be assembled by hand.
- */
 function publish(version, manifest) {
   const archive = join(REPOSITORY_ROOT, "packaging/mlx", `${ARCHIVE_PREFIX}-${version}.tar.gz`);
-  // Top-level names are listed explicitly rather than packing `.`, because BSD
-  // tar writes `./runtime/...` for the latter and the extractor rejects a `.`
-  // path segment. COPYFILE_DISABLE stops macOS adding `._` AppleDouble
-  // entries, which are not in the manifest and so would be dropped anyway —
-  // but only after being downloaded.
   const entries = readdirSync(OUTPUT_ROOT).sort();
   execFileSync("tar", ["-czf", archive, "-C", OUTPUT_ROOT, ...entries], {
     stdio: "inherit",
@@ -215,24 +221,28 @@ function publish(version, manifest) {
     componentId: COMPONENT_ID,
     kind: "mlx_runtime",
     displayName: "MLX runtime (Apple silicon)",
-    accelerator: null,
+    accelerator: "Lily on M5+ / macOS 26+ for Qwen3.6-35B-A3B",
     version,
     channel: "stable",
-    // Rewritten by the release workflow once the asset has a real URL. Left
-    // as the file name locally so the entry is still valid JSON to inspect.
     downloadUrl: process.env.MLX_DOWNLOAD_URL ?? `file://${archive}`,
     sha256: createHash("sha256").update(bytes).digest("hex"),
     sizeBytes: bytes.length,
     publishedAtMs: Number(process.env.SOURCE_DATE_EPOCH ?? 0) * 1000,
     compatibilityNote:
       `Requires Apple silicon. Carries MLX ${MLX_VERSION}, mlx-lm ${MLX_LM_VERSION}, ` +
-      `mlx-vlm ${MLX_VLM_VERSION}, and the pinned MLX video engine. ` +
+      `mlx-vlm ${MLX_VLM_VERSION}, the pinned MLX video engine, and Lily ${LILY_GARDEN_COMMIT.slice(0, 12)}. ` +
+      `Lily acceleration is selected only on M5+/macOS 26+ with its exact Qwen3.6 affine-Q4 model; ` +
+      `all other models and unsupported Lily request surfaces use the normal MLX engine. ` +
       `Ships ${manifest.files.length} files.`,
     metadata: {
       mlxVersion: MLX_VERSION,
       mlxLmVersion: MLX_LM_VERSION,
       mlxVlmVersion: MLX_VLM_VERSION,
       mlxVideoCommit: MLX_VIDEO_COMMIT,
+      lilyGardenCommit: LILY_GARDEN_COMMIT,
+      lilyModel: "Qwen3.6-35B-A3B",
+      lilyMinimumMacos: "26",
+      lilyMinimumAppleMGeneration: 5,
     },
   };
   const catalog = join(REPOSITORY_ROOT, "packaging/mlx", "mlx-catalog.json");
