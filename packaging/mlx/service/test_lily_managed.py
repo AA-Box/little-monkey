@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Hardware-free contract tests for the managed Lily acceleration path."""
+"""Hardware-free production-contract tests for managed Lily acceleration."""
 
 from __future__ import annotations
 
-import faulthandler
 import importlib.util
 import json
+import os
 import socket
 import stat
 import struct
@@ -40,95 +40,157 @@ def _port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _wait(port: int, process: subprocess.Popen) -> None:
-    deadline = time.monotonic() + 12
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            stderr = process.stderr.read() if process.stderr is not None else ""
-            raise AssertionError(f"service exited early: {process.returncode}\n{stderr}")
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.2):
-                return
-        except Exception:
-            time.sleep(0.05)
-    process.terminate()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5)
-    stderr = process.stderr.read() if process.stderr is not None else ""
-    raise AssertionError(f"service did not become healthy\n{stderr}")
-
-
-def _post(port: int, body: dict) -> str:
-    request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/v1/generate",
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=10) as response:
-        return response.read().decode()
-
-
 def _write_executable(path: Path, source: str) -> None:
     path.write_text(source)
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def _raw_http_helpers() -> str:
+def _diagnostics(process: subprocess.Popen, stderr_file) -> str:
+    stderr_file.flush()
+    stderr_file.seek(0)
+    text = stderr_file.read()
+    return f"parent_rc={process.poll()}\n{text}"
+
+
+def _wait_health(port: int, process: subprocess.Popen, stderr_file, timeout: float = 12.0) -> dict:
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise AssertionError(f"managed parent exited early\n{_diagnostics(process, stderr_file)}")
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.4) as response:
+                return json.load(response)
+        except Exception as error:  # noqa: BLE001 - retrying readiness
+            last_error = error
+            time.sleep(0.05)
+    raise AssertionError(
+        f"managed parent did not become healthy: {last_error!r}\n{_diagnostics(process, stderr_file)}"
+    )
+
+
+def _post(port: int, body: dict, timeout: float = 10.0) -> str:
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/generate",
+        data=json.dumps(body, separators=(",", ":")).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        assert response.status == 200
+        return response.read().decode()
+
+
+def _fake_lily_source() -> str:
     return textwrap.dedent(
         r'''
-        import socket
+        import argparse
+        import json
+        import time
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-        def receive_request(connection):
-            data = b''
-            while b'\r\n\r\n' not in data:
-                chunk = connection.recv(65536)
-                if not chunk:
-                    raise RuntimeError('client closed before headers')
-                data += chunk
-            head, body = data.split(b'\r\n\r\n', 1)
-            lines = head.decode('iso-8859-1').split('\r\n')
-            method, path, _version = lines[0].split(' ', 2)
-            headers = {}
-            for line in lines[1:]:
-                name, value = line.split(':', 1)
-                headers[name.lower()] = value.strip()
-            length = int(headers.get('content-length', '0'))
-            while len(body) < length:
-                chunk = connection.recv(65536)
-                if not chunk:
-                    raise RuntimeError('client closed before body')
-                body += chunk
-            return method, path, body[:length]
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--model')
+        parser.add_argument('--bind', required=True)
+        parser.add_argument('--max-seq')
+        args = parser.parse_args()
+        host, port = args.bind.rsplit(':', 1)
 
-        def respond(connection, body, content_type='application/json', status='200 OK'):
-            head = (
-                f'HTTP/1.1 {status}\r\n'
-                f'Content-Type: {content_type}\r\n'
-                f'Content-Length: {len(body)}\r\n'
-                'Connection: close\r\n\r\n'
-            ).encode('ascii')
-            connection.sendall(head + body)
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
 
-        def serve(host, port, handler):
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                server.bind((host, port))
-                server.listen(16)
-                while True:
-                    connection, _address = server.accept()
-                    with connection:
-                        try:
-                            method, path, body = receive_request(connection)
-                        except (OSError, RuntimeError):
-                            # The production parent's readiness check only opens
-                            # the port and closes it. A real HTTP server accepts
-                            # that probe without terminating the service.
-                            continue
-                        handler(connection, method, path, body)
+            def log_message(self, *_args):
+                return
+
+            def send_json(self, payload, status=200):
+                body = json.dumps(payload, separators=(',', ':')).encode()
+                self.send_response(status)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path == '/health':
+                    self.send_json({'ok': True})
+                    return
+                if self.path == '/v1/models':
+                    self.send_json({'data': [{'id': 'Qwen3.6-35B-A3B'}]})
+                    return
+                self.send_error(404)
+
+            def do_POST(self):
+                if self.path != '/v1/chat/completions':
+                    self.send_error(404)
+                    return
+                length = int(self.headers.get('Content-Length', '0'))
+                request = json.loads(self.rfile.read(length))
+                assert request['model'] == 'Qwen3.6-35B-A3B'
+                if any(message.get('content') == 'block' for message in request.get('messages', [])):
+                    time.sleep(15)
+                self.send_json({
+                    'choices': [{'message': {'content': 'lily-ok'}}],
+                    'usage': {
+                        'prompt_tokens': 11,
+                        'completion_tokens': 2,
+                        'prompt_tokens_details': {'cached_tokens': 7},
+                    },
+                })
+
+        ThreadingHTTPServer((host, int(port)), Handler).serve_forever()
+        '''
+    )
+
+
+def _fake_fallback_source() -> str:
+    return textwrap.dedent(
+        r'''
+        import argparse
+        import json
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--host', required=True)
+        parser.add_argument('--port', required=True, type=int)
+        parser.add_argument('--model', required=True)
+        args = parser.parse_args()
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def log_message(self, *_args):
+                return
+
+            def do_POST(self):
+                if self.path != '/v1/generate':
+                    self.send_error(404)
+                    return
+                length = int(self.headers.get('Content-Length', '0'))
+                request = json.loads(self.rfile.read(length))
+                assert request.get('tools') == [{'name': 'clock'}]
+                events = [
+                    {'type': 'started', 'request_id': request['requestId']},
+                    {'type': 'text_delta', 'text': 'mlx-fallback'},
+                    {
+                        'type': 'completed',
+                        'input_tokens': 5,
+                        'output_tokens': 1,
+                        'cached_input_tokens': 0,
+                    },
+                ]
+                body = ''.join(
+                    'data: ' + json.dumps(event, separators=(',', ':')) + '\n'
+                    for event in events
+                ).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                self.wfile.write(body)
+
+        ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
         '''
     )
 
@@ -173,188 +235,132 @@ def test_full_managed_lily_then_cancel_then_capability_fallback() -> None:
         fallback = root / "fallback.py"
         model = root / "model"
         model.mkdir()
-
-        fake_source = _raw_http_helpers() + textwrap.dedent(
-            r'''
-            import argparse, json, time
-            parser=argparse.ArgumentParser()
-            parser.add_argument('--model'); parser.add_argument('--bind'); parser.add_argument('--max-seq')
-            args=parser.parse_args()
-            host,port=args.bind.rsplit(':',1)
-
-            def handler(connection, method, path, body):
-                if method == 'GET' and path == '/health':
-                    respond(connection, b'{"ok":true}')
-                elif method == 'GET' and path == '/v1/models':
-                    respond(connection, b'{"data":[{"id":"Qwen3.6-35B-A3B"}]}')
-                elif method == 'POST' and path == '/v1/chat/completions':
-                    request=json.loads(body)
-                    assert request['model'] == 'Qwen3.6-35B-A3B'
-                    if any(message.get('content') == 'block' for message in request.get('messages', [])):
-                        time.sleep(15)
-                    payload=json.dumps({
-                        'choices':[{'message':{'content':'lily-ok'}}],
-                        'usage':{
-                            'prompt_tokens':11,
-                            'completion_tokens':2,
-                            'prompt_tokens_details':{'cached_tokens':7},
-                        },
-                    }, separators=(',', ':')).encode()
-                    respond(connection, payload)
-                else:
-                    respond(connection, b'not found', 'text/plain', '404 Not Found')
-
-            serve(host, int(port), handler)
-            '''
-        )
-        _write_executable(fake_lily, f"#!{sys.executable}\n{fake_source}")
-
-        fallback.write_text(
-            _raw_http_helpers()
-            + textwrap.dedent(
-                r'''
-                import argparse, json
-                parser=argparse.ArgumentParser()
-                parser.add_argument('--host'); parser.add_argument('--port',type=int); parser.add_argument('--model')
-                args=parser.parse_args()
-
-                def handler(connection, method, path, body):
-                    if method != 'POST' or path != '/v1/generate':
-                        respond(connection, b'not found', 'text/plain', '404 Not Found')
-                        return
-                    json.loads(body)
-                    events=[
-                        {'type':'started','request_id':'r2'},
-                        {'type':'text_delta','text':'mlx-fallback'},
-                        {'type':'completed','input_tokens':5,'output_tokens':1,'cached_input_tokens':0},
-                    ]
-                    payload=''.join('data: '+json.dumps(x,separators=(',',':'))+'\n' for x in events).encode()
-                    respond(connection, payload, 'text/event-stream')
-
-                serve(args.host, args.port, handler)
-                '''
-            )
-        )
+        _write_executable(fake_lily, f"#!{sys.executable}\n{_fake_lily_source()}")
+        fallback.write_text(_fake_fallback_source())
 
         port = _port()
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                str(SERVICE),
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--model",
-                str(model),
-                "--lily-binary",
-                str(fake_lily),
-                "--fallback-service",
-                str(fallback),
-                "--python",
-                sys.executable,
-                "--startup-timeout-seconds",
-                "5",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        try:
-            _stage("waiting for managed parent")
-            _wait(port, process)
-            _stage("verifying Lily inference translation and cache usage")
-            lily = _post(
-                port,
-                {
-                    "requestId": "r1",
-                    "messages": [{"role": "user", "text": "hello", "images": []}],
-                    "tools": [],
-                    "maxTokens": 8,
-                    "promptCacheKey": "conversation",
-                },
+        stderr_path = root / "managed.stderr.log"
+        with stderr_path.open("w+") as stderr_file:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(SERVICE),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--model",
+                    str(model),
+                    "--lily-binary",
+                    str(fake_lily),
+                    "--fallback-service",
+                    str(fallback),
+                    "--python",
+                    sys.executable,
+                    "--startup-timeout-seconds",
+                    "4",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_file,
+                text=True,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
             )
-            assert "lily-ok" in lily
-            assert '"cached_input_tokens":7' in lily
+            try:
+                _stage("waiting for managed parent")
+                health = _wait_health(port, process, stderr_file)
+                assert health["engine"] == "lily", _diagnostics(process, stderr_file)
 
-            _stage("starting cancellable Lily request")
-            cancel_body = json.dumps(
-                {
-                    "requestId": "cancel-me",
-                    "messages": [{"role": "user", "text": "block", "images": []}],
-                    "tools": [],
-                    "maxTokens": 8,
-                },
-                separators=(",", ":"),
-            ).encode()
-            cancelled = socket.create_connection(("127.0.0.1", port), timeout=2)
-            cancelled.settimeout(3)
-            cancelled.sendall(
-                (
-                    "POST /v1/generate HTTP/1.1\r\n"
-                    "Host: 127.0.0.1\r\n"
-                    "Content-Type: application/json\r\n"
-                    f"Content-Length: {len(cancel_body)}\r\n"
-                    "Connection: close\r\n\r\n"
+                _stage("verifying Lily inference translation and cache usage")
+                lily = _post(
+                    port,
+                    {
+                        "requestId": "r1",
+                        "messages": [{"role": "user", "text": "hello", "images": []}],
+                        "tools": [],
+                        "maxTokens": 8,
+                        "promptCacheKey": "conversation",
+                    },
+                )
+                assert "lily-ok" in lily
+                assert '"cached_input_tokens":7' in lily
+
+                _stage("starting cancellable Lily request")
+                cancel_body = json.dumps(
+                    {
+                        "requestId": "cancel-me",
+                        "messages": [{"role": "user", "text": "block", "images": []}],
+                        "tools": [],
+                        "maxTokens": 8,
+                    },
+                    separators=(",", ":"),
                 ).encode()
-                + cancel_body
-            )
-            observed = b""
-            while b'"type":"started"' not in observed:
-                chunk = cancelled.recv(4096)
-                assert chunk, "managed Lily stream closed before started"
-                observed += chunk
-            _stage("dropping downstream stream")
-            cancelled.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-            cancelled.close()
+                cancelled = socket.create_connection(("127.0.0.1", port), timeout=2)
+                cancelled.settimeout(3)
+                cancelled.sendall(
+                    (
+                        "POST /v1/generate HTTP/1.1\r\n"
+                        "Host: 127.0.0.1\r\n"
+                        "Content-Type: application/json\r\n"
+                        f"Content-Length: {len(cancel_body)}\r\n"
+                        "Connection: close\r\n\r\n"
+                    ).encode()
+                    + cancel_body
+                )
+                observed = b""
+                while b'"type":"started"' not in observed:
+                    chunk = cancelled.recv(4096)
+                    assert chunk, "managed Lily stream closed before started"
+                    observed += chunk
+                _stage("dropping downstream stream")
+                cancelled.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                cancelled.close()
 
-            deadline = time.monotonic() + 6
-            while time.monotonic() < deadline:
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.5) as response:
-                    engine = json.load(response)["engine"]
-                if engine == "mlx_pending":
-                    break
-                time.sleep(0.05)
-            else:
-                raise AssertionError("dropping the stream did not stop Lily compute")
+                deadline = time.monotonic() + 6
+                while time.monotonic() < deadline:
+                    try:
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.5) as response:
+                            engine = json.load(response)["engine"]
+                    except Exception:
+                        time.sleep(0.05)
+                        continue
+                    if engine == "mlx_pending":
+                        break
+                    time.sleep(0.05)
+                else:
+                    raise AssertionError(
+                        "dropping the stream did not stop Lily compute\n" + _diagnostics(process, stderr_file)
+                    )
 
-            _stage("verifying lazy managed-MLX fallback")
-            fallback_response = _post(
-                port,
-                {
-                    "requestId": "r2",
-                    "messages": [{"role": "user", "text": "use a tool", "images": []}],
-                    "tools": [{"name": "clock"}],
-                    "maxTokens": 8,
-                },
-            )
-            assert "mlx-fallback" in fallback_response
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health") as response:
-                assert json.load(response)["engine"] == "mlx"
-            _stage("full managed lifecycle passed")
-        finally:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
+                _stage("verifying lazy managed-MLX fallback")
+                fallback_response = _post(
+                    port,
+                    {
+                        "requestId": "r2",
+                        "messages": [{"role": "user", "text": "use a tool", "images": []}],
+                        "tools": [{"name": "clock"}],
+                        "maxTokens": 8,
+                    },
+                )
+                assert "mlx-fallback" in fallback_response
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as response:
+                    assert json.load(response)["engine"] == "mlx"
+                _stage("full managed lifecycle passed")
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
 
 
 def main() -> None:
-    # Never allow this contract gate to mask a lifecycle deadlock until the
-    # workflow timeout. If it stalls, dump every Python thread and exit hard so
-    # the failing location is visible in the job log.
-    faulthandler.dump_traceback_later(45, repeat=False, exit=True)
-    try:
-        _stage("router gate")
-        test_router_model_gate()
-        _stage("request capability gate")
-        test_request_capability_gate()
-        test_full_managed_lily_then_cancel_then_capability_fallback()
-    finally:
-        faulthandler.cancel_dump_traceback_later()
+    _stage("router gate")
+    test_router_model_gate()
+    _stage("request capability gate")
+    test_request_capability_gate()
+    test_full_managed_lily_then_cancel_then_capability_fallback()
     print("managed Lily contract checks passed", flush=True)
 
 
