@@ -12,9 +12,9 @@ export const RUNTIME_VERSION = "1.13.3";
 
 export const RUNTIME_ARCHIVES = Object.freeze({
   "x86_64-unknown-linux-gnu": {
-    name: "sherpa-onnx-v1.13.3-linux-x64-static-lib.tar.bz2",
-    bytes: 20_289_645,
-    sha256: "f4908b2abdaadb24fc8885c2e671598b922a1a97fd07db14afea648bab459aac",
+    name: "sherpa-onnx-v1.13.3-linux-x64-static-no-tts-lib.tar.bz2",
+    bytes: 19_115_962,
+    sha256: "89851a2d6bf5e4cdf3f6bef5b8cbcc2c2982eb87e7aea2e40aaec2806887263c",
   },
   "aarch64-unknown-linux-gnu": {
     name: "sherpa-onnx-v1.13.3-linux-aarch64-static-lib.tar.bz2",
@@ -22,24 +22,24 @@ export const RUNTIME_ARCHIVES = Object.freeze({
     sha256: "19b345d73048774452baa775782d0ba75d705a31356ba78acba5521b3faf0933",
   },
   "x86_64-apple-darwin": {
-    name: "sherpa-onnx-v1.13.3-osx-x64-static-lib.tar.bz2",
-    bytes: 18_330_073,
-    sha256: "9469e3a03a28756e85a2f1125ac997da5a182c539c45b191bfc59ba6903c06e2",
+    name: "sherpa-onnx-v1.13.3-osx-x64-static-no-tts-lib.tar.bz2",
+    bytes: 17_343_674,
+    sha256: "887803fc313c49601916172e981d824074b157f426c9af2106deabb9bd7d1af4",
   },
   "aarch64-apple-darwin": {
-    name: "sherpa-onnx-v1.13.3-osx-arm64-static-lib.tar.bz2",
-    bytes: 18_735_820,
-    sha256: "8a524849ea13db3abe667f5f785280b2396dee17856c912e22cb24d0344b9a5a",
+    name: "sherpa-onnx-v1.13.3-osx-arm64-static-no-tts-lib.tar.bz2",
+    bytes: 17_561_024,
+    sha256: "49105e206cf229f1c4cb4707275bc904874c899a1304c506707ba56b40580123",
   },
   "x86_64-pc-windows-msvc": {
-    name: "sherpa-onnx-v1.13.3-win-x64-static-MT-Release-lib.tar.bz2",
-    bytes: 114_663_805,
-    sha256: "f6555701d6397d74f1302b0666a661f32708b599a14a5fde80835d4902fcd315",
+    name: "sherpa-onnx-v1.13.3-win-x64-static-MD-Release-no-tts-lib.tar.bz2",
+    bytes: 86_255_473,
+    sha256: "e4fd99f97ceb288144882d40d05d8e667289bd629c5ff67f0f65f806dd8f25b0",
   },
   "aarch64-pc-windows-msvc": {
-    name: "sherpa-onnx-v1.13.3-win-arm64-static-MT-Release-lib.tar.bz2",
-    bytes: 119_074_753,
-    sha256: "b198b3227e5b87018bc99584d0e8a7b5f895e07550b39c6b0db7f577d632a5b3",
+    name: "sherpa-onnx-v1.13.3-win-arm64-static-MD-Release-no-tts-lib.tar.bz2",
+    bytes: 89_129_055,
+    sha256: "412e0ff0dfc94c8f5abf73faf4ed68fdef8fc9b361e4ab78d13624ac2a0b539d",
   },
 });
 

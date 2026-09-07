@@ -20,13 +20,19 @@ covered by the included upstream Apache-2.0 license. Little Monkey changes only
   excluding it only moved the failure from the licence audit to the linker.
   macOS tolerated the undefined symbols; `lld` on Linux does not.
 
-  `piper_phonemize` and `espeak-ng` stay excluded — eSpeak NG is GPL-3.0 and
-  this is an MIT binary — but their symbols are still demanded, because the
-  Rust bindings declare externs across the whole C API and that pulls the
-  text-to-speech objects in. `src/little_monkey_tts_stubs.cc` defines the two
-  the linker asks for and aborts if either is ever called, which keeps the
-  licence boundary without pretending the dependency is not there. Delete it
-  when the exclusion goes away.
+  Five of the six targets now pin upstream's `no-tts` archive, which ships no
+  `piper_phonemize`, `espeak-ng` or `ucd` at all and therefore asks for none of
+  their symbols. 1.13.3 published no `no-tts` static archive for Linux arm64,
+  so that target keeps the exclusion and
+  `src/little_monkey_tts_stubs.cc` answers for the two symbols
+  `sherpa-onnx-core` references anyway, aborting if either is ever called.
+  Excluding the libraries without answering for their symbols links on macOS
+  and fails under `lld`; the stub is what makes the exclusion real. Delete it
+  when upstream publishes a `no-tts` build for Linux arm64.
+
+- pin the `MD` Windows archives. MSVC refuses to mix C runtime models, and this
+  build — Rust and `whisper-rs-sys` included — uses the dynamic CRT, so the
+  `MT` archive upstream's Rust build script selects fails with `LNK2038`.
 
 The Rust API crate remains the exact upstream 1.13.3 release. Keep this patch
 until upstream provides equivalent authenticated staging and the Apple SME

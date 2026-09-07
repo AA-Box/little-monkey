@@ -71,7 +71,7 @@ fn try_main() -> Result<(), DynError> {
     }
 
     match link_mode {
-        LinkMode::Static => emit_static_link_directives(&target_os),
+        LinkMode::Static => emit_static_link_directives(&target_os, &target_arch),
         LinkMode::Shared => emit_shared_link_directives(),
     }
 
@@ -219,29 +219,29 @@ struct ExpectedArchive {
 
 fn expected_archive(name: &str) -> Result<ExpectedArchive, DynError> {
     let expected = match name {
-        "sherpa-onnx-v1.13.3-linux-x64-static-lib.tar.bz2" => ExpectedArchive {
-            bytes: 20_289_645,
-            sha256: "f4908b2abdaadb24fc8885c2e671598b922a1a97fd07db14afea648bab459aac",
+        "sherpa-onnx-v1.13.3-linux-x64-static-no-tts-lib.tar.bz2" => ExpectedArchive {
+            bytes: 19_115_962,
+            sha256: "89851a2d6bf5e4cdf3f6bef5b8cbcc2c2982eb87e7aea2e40aaec2806887263c",
         },
         "sherpa-onnx-v1.13.3-linux-aarch64-static-lib.tar.bz2" => ExpectedArchive {
             bytes: 19_327_721,
             sha256: "19b345d73048774452baa775782d0ba75d705a31356ba78acba5521b3faf0933",
         },
-        "sherpa-onnx-v1.13.3-osx-x64-static-lib.tar.bz2" => ExpectedArchive {
-            bytes: 18_330_073,
-            sha256: "9469e3a03a28756e85a2f1125ac997da5a182c539c45b191bfc59ba6903c06e2",
+        "sherpa-onnx-v1.13.3-osx-x64-static-no-tts-lib.tar.bz2" => ExpectedArchive {
+            bytes: 17_343_674,
+            sha256: "887803fc313c49601916172e981d824074b157f426c9af2106deabb9bd7d1af4",
         },
-        "sherpa-onnx-v1.13.3-osx-arm64-static-lib.tar.bz2" => ExpectedArchive {
-            bytes: 18_735_820,
-            sha256: "8a524849ea13db3abe667f5f785280b2396dee17856c912e22cb24d0344b9a5a",
+        "sherpa-onnx-v1.13.3-osx-arm64-static-no-tts-lib.tar.bz2" => ExpectedArchive {
+            bytes: 17_561_024,
+            sha256: "49105e206cf229f1c4cb4707275bc904874c899a1304c506707ba56b40580123",
         },
-        "sherpa-onnx-v1.13.3-win-x64-static-MT-Release-lib.tar.bz2" => ExpectedArchive {
-            bytes: 114_663_805,
-            sha256: "f6555701d6397d74f1302b0666a661f32708b599a14a5fde80835d4902fcd315",
+        "sherpa-onnx-v1.13.3-win-x64-static-MD-Release-no-tts-lib.tar.bz2" => ExpectedArchive {
+            bytes: 86_255_473,
+            sha256: "e4fd99f97ceb288144882d40d05d8e667289bd629c5ff67f0f65f806dd8f25b0",
         },
-        "sherpa-onnx-v1.13.3-win-arm64-static-MT-Release-lib.tar.bz2" => ExpectedArchive {
-            bytes: 119_074_753,
-            sha256: "b198b3227e5b87018bc99584d0e8a7b5f895e07550b39c6b0db7f577d632a5b3",
+        "sherpa-onnx-v1.13.3-win-arm64-static-MD-Release-no-tts-lib.tar.bz2" => ExpectedArchive {
+            bytes: 89_129_055,
+            sha256: "412e0ff0dfc94c8f5abf73faf4ed68fdef8fc9b361e4ab78d13624ac2a0b539d",
         },
         _ => {
             return Err(
@@ -300,22 +300,22 @@ fn archive_name(
     let version = env!("CARGO_PKG_VERSION");
     let name = match (link_mode, target_os, target_arch) {
         (LinkMode::Static, "linux", "x86_64") => {
-            format!("sherpa-onnx-v{version}-linux-x64-static-lib.tar.bz2")
+            format!("sherpa-onnx-v{version}-linux-x64-static-no-tts-lib.tar.bz2")
         }
         (LinkMode::Static, "linux", "aarch64") => {
             format!("sherpa-onnx-v{version}-linux-aarch64-static-lib.tar.bz2")
         }
         (LinkMode::Static, "macos", "x86_64") => {
-            format!("sherpa-onnx-v{version}-osx-x64-static-lib.tar.bz2")
+            format!("sherpa-onnx-v{version}-osx-x64-static-no-tts-lib.tar.bz2")
         }
         (LinkMode::Static, "macos", "aarch64") => {
-            format!("sherpa-onnx-v{version}-osx-arm64-static-lib.tar.bz2")
+            format!("sherpa-onnx-v{version}-osx-arm64-static-no-tts-lib.tar.bz2")
         }
         (LinkMode::Static, "windows", "x86_64") => {
-            format!("sherpa-onnx-v{version}-win-x64-static-MT-Release-lib.tar.bz2")
+            format!("sherpa-onnx-v{version}-win-x64-static-MD-Release-no-tts-lib.tar.bz2")
         }
         (LinkMode::Static, "windows", "aarch64") => {
-            format!("sherpa-onnx-v{version}-win-arm64-static-MT-Release-lib.tar.bz2")
+            format!("sherpa-onnx-v{version}-win-arm64-static-MD-Release-no-tts-lib.tar.bz2")
         }
         (LinkMode::Shared, "linux", "x86_64") => {
             format!("sherpa-onnx-v{version}-linux-x64-shared-lib.tar.bz2")
@@ -348,12 +348,21 @@ fn emit_shared_link_directives() {
     println!("cargo:rustc-link-lib=dylib=onnxruntime");
 }
 
-/// The text-to-speech symbols this build answers for rather than links.
+/// The text-to-speech symbols one archive still demands.
+///
+/// Every target but this one uses upstream's `no-tts` build, which contains no
+/// eSpeak NG, piper_phonemize or ucd at all and so asks for none of their
+/// symbols. Linux arm64 is the exception: 1.13.3 published no `no-tts` static
+/// archive for it, so its `sherpa-onnx-core` still references the phonemizer
+/// even though keyword spotting never calls it.
 ///
 /// Emitted after the sherpa archives on purpose: a Unix linker resolves an
 /// archive's undefined symbols from what follows it, so a stub placed first
 /// satisfies nothing.
-fn emit_tts_stub_directives(target_os: &str) {
+fn emit_tts_stub_directives(target_os: &str, target_arch: &str) {
+    if !(target_os == "linux" && target_arch == "aarch64") {
+        return;
+    }
     let stubs = Path::new("src").join("little_monkey_tts_stubs.cc");
     println!("cargo:rerun-if-changed={}", stubs.display());
     cc::Build::new()
@@ -365,21 +374,19 @@ fn emit_tts_stub_directives(target_os: &str) {
     // published archive references is not something this build can read. Both
     // are defined; the unreferenced one is dead weight rather than a guess that
     // leaves the symbol undefined.
-    if target_os == "linux" {
-        cc::Build::new()
-            .cpp(true)
-            .file(&stubs)
-            .define("_GLIBCXX_USE_CXX11_ABI", "0")
-            .define("LITTLE_MONKEY_TTS_STUBS_NO_C_SYMBOLS", None)
-            .compile("little_monkey_tts_stubs_legacy_abi");
-    }
+    cc::Build::new()
+        .cpp(true)
+        .file(&stubs)
+        .define("_GLIBCXX_USE_CXX11_ABI", "0")
+        .define("LITTLE_MONKEY_TTS_STUBS_NO_C_SYMBOLS", None)
+        .compile("little_monkey_tts_stubs_legacy_abi");
 }
 
-fn emit_static_link_directives(target_os: &str) {
+fn emit_static_link_directives(target_os: &str, target_arch: &str) {
     for lib in SHERPA_ONNX_STATIC_LIBS {
         println!("cargo:rustc-link-lib=static={lib}");
     }
-    emit_tts_stub_directives(target_os);
+    emit_tts_stub_directives(target_os, target_arch);
 
     match target_os {
         "linux" => {

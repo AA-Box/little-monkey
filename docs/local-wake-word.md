@@ -105,11 +105,23 @@ time, so a directory that matches nothing fails every `cargo build` in a fresh
 checkout — including `cargo test`, before a single test runs. The same
 arrangement already exists for the bundled Whisper model.
 
-The sherpa-onnx code/runtime is Apache-2.0. The upstream 1.x static archive also
-contains optional Piper/eSpeak libraries that KWS does not use; the vendored
-link list excludes those libraries rather than importing their separate
-licensing obligations. Upstream is tracking their removal in
+The sherpa-onnx code/runtime is Apache-2.0. Upstream publishes a `no-tts`
+static archive that contains no Piper, eSpeak NG or ucd at all, and this build
+pins it for five of the six targets — so their separate licensing obligations,
+eSpeak NG's GPL-3.0 among them, are not imported rather than merely unlinked.
+1.13.3 published no `no-tts` static archive for Linux arm64, so that one target
+still carries them; its link list excludes them, and
+`vendor/sherpa-onnx-sys/src/little_monkey_tts_stubs.cc` answers for the two
+symbols `sherpa-onnx-core` references anyway, aborting if either is ever
+reached. Excluding the libraries without answering for their symbols is not
+enough on its own: it links on macOS and fails under `lld`. Upstream tracks
+removing them from the default archive in
 [k2-fsa/sherpa-onnx#3731](https://github.com/k2-fsa/sherpa-onnx/issues/3731).
+
+The Windows archives are the `MD` variants. MSVC refuses to mix C runtime
+models, and the rest of this build — Rust and `whisper-rs-sys` included —
+compiles against the dynamic CRT, so the `MT` archive fails the link with
+`LNK2038` rather than anything to do with wake words.
 The model archive's own README
 declares `Apache License 2.0`, which is the redistribution metadata used for
 bundling. Upstream also has an open request for clearer model-license
