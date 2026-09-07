@@ -1,7 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { OpenAiRealtimeVoiceProvider, normalizeOpenAiRealtimeEvent, type OpenAiRealtimeEnvironment } from './openAiRealtimeVoice';
-import type { RealtimeVoiceEvent, RealtimeVoiceSessionConfig } from './realtimeVoice';
+import type { RealtimeVoiceEvent, RealtimeVoiceSession, RealtimeVoiceSessionConfig } from './realtimeVoice';
 
 class FakeChannel {
   readyState = 'open';
@@ -55,11 +55,43 @@ class FakePeer {
 
 type BrokerRequest = Parameters<OpenAiRealtimeEnvironment['connectBroker']>[0];
 
+/** An `RTCStatsReport` is a `Map`, and the adapter only ever walks it with
+ * `forEach`, so a Map keyed by stat id is the entire fake. */
+const statsReport = (entries: readonly Record<string, unknown>[]): RTCStatsReport =>
+  new Map(entries.map((entry, index) => [String(entry.id ?? `stat-${index}`), entry])) as unknown as RTCStatsReport;
+
+const audioStat = (stats: Record<string, unknown>): Record<string, unknown> =>
+  ({ id: 'inbound-audio', type: 'inbound-rtp', kind: 'audio', ...stats });
+
+/** The receiver the transport hands over with the remote track. `reads()` sets
+ * what the next `getStats()` resolves with, which is how a test drives the
+ * probe: it only ever compares one reading against the one before it. */
+function fakeReceiver() {
+  let gate: Promise<void> | null = null;
+  let release: (() => void) | null = null;
+  const receiver = {
+    report: statsReport([audioStat({ bytesReceived: 0, totalSamplesReceived: 0, totalAudioEnergy: 0 })]),
+    rejects: false,
+    getStats: vi.fn(async () => {
+      if (receiver.rejects) throw new Error('getStats is unavailable on this platform');
+      await gate;
+      return receiver.report;
+    }),
+    reads(...entries: Record<string, unknown>[]) { receiver.report = statsReport(entries); },
+    /** Parks `getStats()` so a probe can still be in flight when the session is
+     * torn down under it — otherwise that race is unreachable from a test. */
+    park() { gate = new Promise((resolve) => { release = resolve; }); },
+    resume() { gate = null; release?.(); release = null; },
+  };
+  return receiver;
+}
+
 function harness(
   config: Partial<RealtimeVoiceSessionConfig> = {},
   audioExtras: Record<string, unknown> = {},
   brokerAnswer: () => Promise<{ sessionId: string; sdpAnswer: string; providerRequestId: string | null }> =
   async () => ({ sessionId: 'rv_test', sdpAnswer: 'v=0\r\nanswer', providerRequestId: null }),
+  probeMs?: number,
 ) {
   const peer = new FakePeer();
   const track = new FakeTrack();
@@ -79,6 +111,7 @@ function harness(
     createAudio: () => audio,
     connectBroker,
     disconnectBroker,
+    ...(probeMs === undefined ? {} : { audioProbeIntervalMs: probeMs }),
   };
   const events: RealtimeVoiceEvent[] = [];
   const session = new OpenAiRealtimeVoiceProvider(environment).createSession({
@@ -87,12 +120,42 @@ function harness(
     tools: [{ type: 'function', function: { name: 'read_file', description: 'read', parameters: { type: 'object' } } }],
     ...config,
   }, (event) => events.push(event));
-  return { peer, track, audio, play, pause, connectBroker, disconnectBroker, events, session };
+  const receiver = fakeReceiver();
+  const remoteStream = { id: 'remote-model-audio' } as unknown as MediaStream;
+  return {
+    peer, track, audio, play, pause, connectBroker, disconnectBroker, events, session, receiver, remoteStream,
+    attachRemoteTrack: () => peer.ontrack?.({ streams: [remoteStream], receiver } as unknown as RTCTrackEvent),
+  };
 }
 
 const sentTypes = (peer: FakePeer): string[] => peer.channel.sent.map((value) => JSON.parse(value).type as string);
 
 const remoteTrackEvent = () => ({ streams: [{} as MediaStream] } as unknown as RTCTrackEvent);
+
+const playing = (events: readonly RealtimeVoiceEvent[]) => events.filter(
+  (event): event is Extract<RealtimeVoiceEvent, { type: 'output_audio_playing' }> =>
+    event.type === 'output_audio_playing',
+);
+
+/** `audioProgress` is optional on the session interface, and the acceptance run
+ * fails its barge-in step outright without it, so a session that does not
+ * implement it fails here too rather than quietly skipping the assertion. */
+const progressOf = (session: RealtimeVoiceSession) => {
+  if (!session.audioProgress) throw new Error('the session exposes no audioProgress()');
+  return session.audioProgress();
+};
+
+const PROBE_MS = 20;
+
+/** One probe period, plus the microtasks `probeAudioOnce` awaits before it can
+ * emit: advancing the clock alone can return before `getStats()` has settled. */
+const tick = async (periods = 1): Promise<void> => {
+  for (let index = 0; index < periods; index += 1) {
+    await vi.advanceTimersByTimeAsync(PROBE_MS);
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+};
 
 describe('OpenAI realtime response pacing', () => {
   it('holds a continuation until the response in flight finishes', async () => {
@@ -144,10 +207,12 @@ describe('OpenAI realtime response pacing', () => {
     await session.close();
   });
 
-  it('anchors first output on the transcript delta the WebRTC transport does deliver', async () => {
+  it('anchors output generation on the transcript delta the WebRTC transport does deliver', async () => {
     // Model audio arrives on the media track, so `response.output_audio.delta`
-    // is a WebSocket-only event. Anchoring on it alone left first-audio
-    // latency, the underrun counter and the barge-in guards dead here.
+    // is a WebSocket-only event and the transcript delta is the only
+    // generation-timing signal this transport gets. It marks the model
+    // starting to produce output, and nothing more — whether any of it reached
+    // the speaker is `output_audio_playing`, measured off the receiver.
     const { peer, session, events } = harness();
     await session.connect();
     peer.channel.receive({ type: 'response.created', event_id: 'created', response: { id: 'r1' } });
@@ -157,7 +222,7 @@ describe('OpenAI realtime response pacing', () => {
     peer.channel.receive({
       type: 'response.output_audio_transcript.delta', event_id: 'd2', item_id: 'a1', delta: 'llo',
     });
-    expect(events.filter((event) => event.type === 'output_audio_started')).toHaveLength(1);
+    expect(events.filter((event) => event.type === 'output_generation_started')).toHaveLength(1);
     await session.close();
   });
 
@@ -264,7 +329,7 @@ describe('OpenAI realtime adapter', () => {
     peer.channel.receive({ type: 'response.created', event_id: 'response-created', response: { id: 'response-1' } });
     peer.channel.receive({ type: 'response.output_audio.delta', event_id: 'audio-delta', item_id: 'answer-1', delta: 'ignored-over-webrtc' });
     peer.channel.receive({ type: 'response.output_audio.delta', event_id: 'audio-delta-2', item_id: 'answer-1', delta: 'ignored-over-webrtc' });
-    expect(events.filter((event) => event.type === 'output_audio_started')).toHaveLength(1);
+    expect(events.filter((event) => event.type === 'output_generation_started')).toHaveLength(1);
     await session.startManualTurn();
     expect(peer.channel.sent.slice(-3).map((value) => JSON.parse(value).type)).toEqual([
       'response.cancel', 'output_audio_buffer.clear', 'input_audio_buffer.clear',
@@ -427,5 +492,282 @@ describe('OpenAI realtime adapter', () => {
     await plain.session.connect();
     expect(() => plain.peer.ontrack?.(remoteTrackEvent())).not.toThrow();
     expect(plain.play).toHaveBeenCalled();
+  });
+});
+
+/** A response the model has begun producing output for. The two events always
+ * travel together on this transport, and the probe refuses to confirm playback
+ * unless generation has started, so every measurement test needs both. */
+const beginResponse = (peer: FakePeer, responseId: string): void => {
+  peer.channel.receive({ type: 'response.created', event_id: `created-${responseId}`, response: { id: responseId } });
+  peer.channel.receive({
+    type: 'response.output_audio_transcript.delta',
+    event_id: `delta-${responseId}`, item_id: `item-${responseId}`, delta: 'The file says',
+  });
+};
+
+describe('OpenAI realtime measured audio output', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('does not claim audio reached the speaker from a transcript delta alone', async () => {
+    // The false pass the reviewer found. Over WebRTC the spoken answer travels
+    // on the remote media track, so a transcript delta proves only that the
+    // model generated text: with no track and no advancing receiver statistics
+    // an acceptance run could report real audio output on a session whose
+    // speaker never made a sound.
+    const { peer, events, session } = harness({}, {}, undefined, PROBE_MS);
+    await session.connect();
+    beginResponse(peer, 'r1');
+    peer.channel.receive({
+      type: 'response.output_audio_transcript.delta', event_id: 'd2', item_id: 'item-r1', delta: ' hello',
+    });
+    await tick(8);
+    expect(events.filter((event) => event.type === 'output_generation_started')).toHaveLength(1);
+    expect(playing(events)).toEqual([]);
+    expect(events.filter((event) => event.type === 'remote_audio_track')).toEqual([]);
+    await session.close();
+  });
+
+  it('reports the remote track, routes it into the element, and starts measuring from there', async () => {
+    const { audio, receiver, remoteStream, attachRemoteTrack, events, session } = harness({}, {}, undefined, PROBE_MS);
+    await session.connect();
+    expect(receiver.getStats).not.toHaveBeenCalled();
+
+    attachRemoteTrack();
+    expect(events.filter((event) => event.type === 'remote_audio_track')).toHaveLength(1);
+    expect(audio.srcObject).toBe(remoteStream);
+    // Nothing can measure playback before the track exists, so the probe
+    // starting here is what makes every later measurement reachable at all.
+    await tick();
+    expect(receiver.getStats).toHaveBeenCalledTimes(1);
+
+    // A renegotiation fires `ontrack` again; a second interval would double
+    // every sampling period and race itself over `lastProgress`.
+    attachRemoteTrack();
+    await tick();
+    expect(receiver.getStats).toHaveBeenCalledTimes(2);
+    await session.close();
+  });
+
+  it('emits no playing event while receiver statistics stand still', async () => {
+    const { peer, receiver, attachRemoteTrack, events, session } = harness({}, {}, undefined, PROBE_MS);
+    await session.connect();
+    attachRemoteTrack();
+    receiver.reads(audioStat({ bytesReceived: 4_000, totalSamplesReceived: 8_000, totalAudioEnergy: 0.4 }));
+    beginResponse(peer, 'r1');
+
+    // Generation is under way and a track exists, so this is exactly the case
+    // a credulous probe would confirm: a receiver whose readings never move is
+    // a stalled one, and the operator is hearing nothing.
+    await tick(6);
+    expect(playing(events)).toEqual([]);
+
+    receiver.reads(audioStat({ bytesReceived: 9_000, totalSamplesReceived: 20_000, totalAudioEnergy: 0.9 }));
+    await tick();
+    expect(playing(events)).toHaveLength(1);
+    await session.close();
+  });
+
+  it('emits no playing event for statistics that advance before the model generates anything', async () => {
+    // Comfort noise and keepalive packets arrive as soon as the track is up.
+    // Confirming on those would time first audio to the connection rather than
+    // to the answer, and would report playback for a turn that never spoke.
+    const { peer, receiver, attachRemoteTrack, events, session } = harness({}, {}, undefined, PROBE_MS);
+    await session.connect();
+    attachRemoteTrack();
+    receiver.reads(audioStat({ bytesReceived: 800, totalSamplesReceived: 1_000, totalAudioEnergy: 0.01 }));
+    await tick();
+    receiver.reads(audioStat({ bytesReceived: 1_600, totalSamplesReceived: 3_000, totalAudioEnergy: 0.05 }));
+    await tick(3);
+    expect(playing(events)).toEqual([]);
+
+    beginResponse(peer, 'r1');
+    receiver.reads(audioStat({ bytesReceived: 6_400, totalSamplesReceived: 24_000, totalAudioEnergy: 0.42 }));
+    await tick();
+    expect(playing(events)).toHaveLength(1);
+    await session.close();
+  });
+
+  it('does not count a track carrying silence as audio the operator can hear', async () => {
+    const { peer, receiver, attachRemoteTrack, events, session } = harness({}, { currentTime: 1.5 }, undefined, PROBE_MS);
+    await session.connect();
+    attachRemoteTrack();
+    beginResponse(peer, 'r1');
+    receiver.reads(audioStat({ bytesReceived: 1_000, totalSamplesReceived: 5_000, totalAudioEnergy: 0.5 }));
+    await tick();
+
+    // Packets keep flowing on a muted or silence-filled track, so bytes alone
+    // measure the network, not the speaker. Only rendered samples and
+    // accumulated energy say the answer was audible.
+    receiver.reads(audioStat({ bytesReceived: 9_000, totalSamplesReceived: 5_000, totalAudioEnergy: 0.5 }));
+    await tick(3);
+    expect(playing(events)).toEqual([]);
+
+    receiver.reads(audioStat({ bytesReceived: 12_000, totalSamplesReceived: 5_000, totalAudioEnergy: 0.62 }));
+    await tick();
+    expect(playing(events).map((event) => event.progress)).toEqual([{
+      bytesReceived: 12_000, samplesReceived: 5_000, audioEnergy: 0.62, measured: true, playbackSeconds: 1.5,
+    }]);
+    await session.close();
+  });
+
+  it('emits the playing event once per response and re-arms it on the next one', async () => {
+    const { peer, receiver, attachRemoteTrack, events, session } = harness({}, {}, undefined, PROBE_MS);
+    await session.connect();
+    attachRemoteTrack();
+    beginResponse(peer, 'r1');
+    receiver.reads(audioStat({ bytesReceived: 1_000, totalSamplesReceived: 8_000, totalAudioEnergy: 0.1 }));
+    await tick();
+    receiver.reads(audioStat({ bytesReceived: 2_000, totalSamplesReceived: 16_000, totalAudioEnergy: 0.2 }));
+    await tick();
+    expect(playing(events)).toHaveLength(1);
+
+    // The rest of the answer keeps the statistics climbing for as long as it
+    // plays; one event per response is a latency anchor, not a sample stream.
+    receiver.reads(audioStat({ bytesReceived: 3_000, totalSamplesReceived: 24_000, totalAudioEnergy: 0.3 }));
+    await tick(2);
+    receiver.reads(audioStat({ bytesReceived: 4_000, totalSamplesReceived: 32_000, totalAudioEnergy: 0.4 }));
+    await tick(2);
+    expect(playing(events)).toHaveLength(1);
+
+    // The next turn has to be able to prove its own audio: a session that
+    // confirmed once and never again cannot show a later turn going silent.
+    peer.channel.receive({ type: 'response.done', event_id: 'done-r1', response: { id: 'r1', status: 'completed' } });
+    beginResponse(peer, 'r2');
+    receiver.reads(audioStat({ bytesReceived: 5_000, totalSamplesReceived: 40_000, totalAudioEnergy: 0.5 }));
+    await tick();
+    expect(playing(events)).toHaveLength(2);
+    await session.close();
+  });
+
+  it('separates a webview that reports no audio energy from a speaker that was silent', async () => {
+    // WebKit's getStats is narrower than Chromium's and this ships to WKWebView
+    // and WebKitGTK too. Zeros there mean "not reported", so a caller must be
+    // able to tell that apart from measured silence — otherwise a working
+    // answer reads as a broken one on those platforms.
+    const { session, receiver, attachRemoteTrack } = harness();
+    await session.connect();
+    attachRemoteTrack();
+    receiver.reads({ id: 'inbound-audio', type: 'inbound-rtp', kind: 'audio', bytesReceived: 9_000 });
+    const bare = await progressOf(session);
+    expect(bare).toMatchObject({ bytesReceived: 9_000, audioEnergy: 0, samplesReceived: 0, measured: false });
+    receiver.reads(audioStat({ bytesReceived: 9_000, totalAudioEnergy: 0 }));
+    expect(await progressOf(session)).toMatchObject({ measured: true });
+    await session.close();
+  });
+
+  it('sums inbound audio statistics, ignores every other entry, and reports the element position', async () => {
+    const { receiver, attachRemoteTrack, session } = harness({}, { currentTime: 4.25 });
+    await session.connect();
+    attachRemoteTrack();
+    receiver.reads(
+      audioStat({ id: 'a1', bytesReceived: 1_200, totalSamplesReceived: 24_000, totalAudioEnergy: 0.5 }),
+      audioStat({ id: 'a2', bytesReceived: 300, totalSamplesReceived: 6_000, totalAudioEnergy: 0.25 }),
+      // A video receiver's bytes are not audio; an outbound entry is the
+      // operator's own microphone, which is loud precisely when the model is
+      // being interrupted. Counting either would make a mute answer measurable.
+      { id: 'v1', type: 'inbound-rtp', kind: 'video', bytesReceived: 900_000, totalSamplesReceived: 90, totalAudioEnergy: 9 },
+      { id: 'o1', type: 'outbound-rtp', kind: 'audio', bytesReceived: 500_000, totalSamplesReceived: 70, totalAudioEnergy: 7 },
+      { id: 'x1', type: 'remote-inbound-rtp', kind: 'audio', bytesReceived: 40, totalSamplesReceived: 4, totalAudioEnergy: 4 },
+    );
+    await expect(progressOf(session)).resolves.toEqual({
+      bytesReceived: 1_500, samplesReceived: 30_000, audioEnergy: 0.75, measured: true, playbackSeconds: 4.25,
+    });
+
+    // Unmeasurable is not silent. Null is what makes the barge-in check fail
+    // loudly on a transport it cannot read instead of recording a quiet pass.
+    receiver.rejects = true;
+    await expect(progressOf(session)).resolves.toBeNull();
+    await session.close();
+
+    const detached = harness();
+    await detached.session.connect();
+    await expect(progressOf(detached.session)).resolves.toBeNull();
+    await detached.session.close();
+  });
+
+  it('counts a provider-VAD barge-in as an interruption and an opening utterance as none', async () => {
+    const { peer, pause, events, session } = harness({ turnDetection: 'semantic_vad' }, {}, undefined, PROBE_MS);
+    await session.connect();
+
+    // The operator's first words, with nothing in flight. Counting this would
+    // set the interruption metric on every ordinary hands-free turn and the
+    // number would stop meaning anything.
+    peer.channel.receive({ type: 'input_audio_buffer.speech_started', event_id: 's1', item_id: 'u1' });
+    expect(events.filter((event) => event.type === 'speech_started')).toHaveLength(1);
+    expect(events.filter((event) => event.type === 'interrupted')).toEqual([]);
+
+    beginResponse(peer, 'r1');
+    // Pausing an idle element is a no-op, so the adapter does it on every
+    // detected utterance; what matters is that the one interrupting an answer
+    // in progress silences the queued audio still on its way to the speaker.
+    const pausesBeforeBargeIn = pause.mock.calls.length;
+    peer.channel.receive({ type: 'input_audio_buffer.speech_started', event_id: 's2', item_id: 'u2' });
+    // Provider VAD cut the answer off mid-sentence. This handler cleared the
+    // in-flight flags but emitted no normalized event, so the metric counted
+    // only a local Stop and every hands-free barge-in was invisible.
+    expect(events.filter((event) => event.type === 'interrupted')).toHaveLength(1);
+    expect(pause.mock.calls.length).toBe(pausesBeforeBargeIn + 1);
+
+    peer.channel.receive({ type: 'response.created', event_id: 'created-r2', response: { id: 'r2' } });
+    peer.channel.receive({ type: 'response.done', event_id: 'done-r2', response: { id: 'r2', status: 'completed' } });
+    peer.channel.receive({ type: 'input_audio_buffer.speech_started', event_id: 's3', item_id: 'u3' });
+    expect(events.filter((event) => event.type === 'interrupted')).toHaveLength(1);
+    await session.close();
+  });
+
+  it('stops probing on close, and a probe still in flight cannot emit against a torn down session', async () => {
+    const { peer, receiver, attachRemoteTrack, events, session } = harness({}, {}, undefined, PROBE_MS);
+    await session.connect();
+    attachRemoteTrack();
+    beginResponse(peer, 'r1');
+    receiver.reads(audioStat({ bytesReceived: 100, totalSamplesReceived: 1_000, totalAudioEnergy: 0.1 }));
+    await tick();
+
+    // Parked mid-call across the teardown, and the reading it will come back
+    // with says audio advanced — so only the close-time guards stand between a
+    // released peer connection and an event claiming it is playing audio.
+    receiver.reads(audioStat({ bytesReceived: 900, totalSamplesReceived: 9_000, totalAudioEnergy: 0.9 }));
+    receiver.park();
+    await tick();
+    await session.close();
+    receiver.resume();
+    await tick(4);
+    expect(playing(events)).toEqual([]);
+
+    // An interval outliving `close()` keeps a webview timer polling statistics
+    // for a session that has already dropped its peer connection.
+    const settled = receiver.getStats.mock.calls.length;
+    await tick(10);
+    expect(receiver.getStats.mock.calls.length).toBe(settled);
+  });
+
+  it('stays quiet after an interruption until the next response begins', async () => {
+    const { peer, receiver, attachRemoteTrack, events, session } = harness({}, {}, undefined, PROBE_MS);
+    await session.connect();
+    attachRemoteTrack();
+    beginResponse(peer, 'r1');
+    receiver.reads(audioStat({ bytesReceived: 1_000, totalSamplesReceived: 8_000, totalAudioEnergy: 0.1 }));
+    await tick();
+    receiver.reads(audioStat({ bytesReceived: 2_000, totalSamplesReceived: 16_000, totalAudioEnergy: 0.2 }));
+    await tick();
+    expect(playing(events)).toHaveLength(1);
+
+    await session.interrupt();
+    // Buffered audio drains for a moment after a barge-in, so the receiver
+    // keeps advancing. Confirming there would report the abandoned answer as
+    // freshly playing and mask the stall the barge-in check is looking for.
+    receiver.reads(audioStat({ bytesReceived: 3_000, totalSamplesReceived: 24_000, totalAudioEnergy: 0.3 }));
+    await tick(2);
+    receiver.reads(audioStat({ bytesReceived: 4_000, totalSamplesReceived: 32_000, totalAudioEnergy: 0.4 }));
+    await tick(2);
+    expect(playing(events)).toHaveLength(1);
+
+    beginResponse(peer, 'r2');
+    receiver.reads(audioStat({ bytesReceived: 5_000, totalSamplesReceived: 40_000, totalAudioEnergy: 0.5 }));
+    await tick();
+    expect(playing(events)).toHaveLength(2);
+    await session.close();
   });
 });

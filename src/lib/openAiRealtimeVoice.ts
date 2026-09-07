@@ -1,5 +1,6 @@
 import { realtimeVoiceClient } from './companionClient';
 import type {
+  RealtimeAudioProgress,
   RealtimeResponseStatus,
   RealtimeVoiceCapabilities,
   RealtimeVoiceEvent,
@@ -37,6 +38,16 @@ export interface OpenAiRealtimeEnvironment {
   createAudio(): HTMLAudioElement;
   connectBroker: typeof realtimeVoiceClient.connect;
   disconnectBroker: typeof realtimeVoiceClient.disconnect;
+  /** How often played-out audio is sampled once the remote track arrives.
+   * Only the tests set it; the default is fine for a metric and a barge-in
+   * check, and a tighter loop would burn battery for nothing. */
+  audioProbeIntervalMs?: number;
+}
+
+/** The half of `RTCRtpReceiver` this adapter needs. Kept structural so a test
+ * can supply statistics without standing up a peer connection. */
+interface AudioReceiverLike {
+  getStats(): Promise<RTCStatsReport>;
 }
 
 const capabilities: RealtimeVoiceCapabilities = {
@@ -157,6 +168,10 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
   private channel: DataChannelLike | null = null;
   private stream: MediaStream | null = null;
   private audio: HTMLAudioElement | null = null;
+  private receiver: AudioReceiverLike | null = null;
+  private audioProbe: ReturnType<typeof setInterval> | null = null;
+  private lastProgress: RealtimeAudioProgress | null = null;
+  private audioConfirmed = false;
   private closed = false;
   private outputStarted = false;
   private responseActive = false;
@@ -179,13 +194,23 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
     try {
       const data = JSON.parse(String((event as MessageEvent).data)) as Record<string, unknown>;
       if (data.type === 'input_audio_buffer.speech_started') {
+        // Provider VAD interrupting an answer in progress is a barge-in, and
+        // the interruption metric has to count it the same as a local Stop.
+        // Read before the flags are cleared, or the condition is always false.
+        const bargedIn = this.responseActive || this.outputStarted;
         this.responseActive = false;
         this.outputStarted = false;
+        this.audioConfirmed = false;
+        this.pendingResponseRequest = false;
         this.audio?.pause();
+        if (bargedIn) {
+          this.emit({ type: 'interrupted', eventId: `${eventId(data)}:barge-in` });
+        }
       }
       if (data.type === 'response.created') {
         this.responseActive = true;
         this.outputStarted = false;
+        this.audioConfirmed = false;
         void this.audio?.play().catch(() => undefined);
       }
       if (data.type === 'response.done') {
@@ -203,11 +228,11 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
       // so whichever arrives first anchors "the model started speaking".
       // Without this, first-audio latency and every barge-in guard would be
       // dead code on the transport this adapter actually uses.
-      const speaking = data.type === 'response.output_audio.delta'
+      const generating = data.type === 'response.output_audio.delta'
         || data.type === 'response.output_audio_transcript.delta';
-      if (speaking && !this.outputStarted) {
+      if (generating && !this.outputStarted) {
         this.outputStarted = true;
-        this.emit({ type: 'output_audio_started', eventId: `${eventId(data)}:first-audio` });
+        this.emit({ type: 'output_generation_started', eventId: `${eventId(data)}:first-output` });
       }
       const normalized = normalizeOpenAiRealtimeEvent(data);
       if (normalized) this.emit(normalized);
@@ -276,6 +301,12 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
           void routed.setSinkId(this.config.outputDeviceId).catch(() => undefined);
         }
         void this.audio.play().catch(() => undefined);
+        // This is the only path model audio takes over WebRTC, so its arrival
+        // is reported on its own and playback is measured from here on.
+        const receiver = (event as RTCTrackEvent & { receiver?: AudioReceiverLike }).receiver ?? null;
+        if (receiver) this.receiver = receiver;
+        this.emit({ type: 'remote_audio_track', eventId: `local:remote-track:${this.config.sessionId}` });
+        this.startAudioProbe();
       };
       this.channel = this.peer.createDataChannel('oai-events');
       this.channel.addEventListener('message', this.onMessage);
@@ -308,6 +339,64 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
       await this.close();
       throw error;
     }
+  }
+
+  /** Reads inbound audio statistics and the element's playback position. Null
+   * when the transport gave us no receiver to ask, which a caller must treat as
+   * "cannot verify" rather than as silence. */
+  async audioProgress(): Promise<RealtimeAudioProgress | null> {
+    const receiver = this.receiver;
+    if (!receiver) return null;
+    const report = await receiver.getStats().catch(() => null);
+    if (!report) return null;
+    let bytesReceived = 0;
+    let samplesReceived = 0;
+    let audioEnergy = 0;
+    let measured = false;
+    report.forEach((entry) => {
+      const stat = entry as Record<string, unknown>;
+      if (stat.type !== 'inbound-rtp') return;
+      if (typeof stat.kind === 'string' && stat.kind !== 'audio') return;
+      bytesReceived += Number(stat.bytesReceived ?? 0);
+      if (typeof stat.totalSamplesReceived === 'number') {
+        samplesReceived += stat.totalSamplesReceived;
+        measured = true;
+      }
+      if (typeof stat.totalAudioEnergy === 'number') {
+        audioEnergy += stat.totalAudioEnergy;
+        measured = true;
+      }
+    });
+    return {
+      bytesReceived, samplesReceived, audioEnergy, measured,
+      playbackSeconds: this.audio?.currentTime ?? 0,
+    };
+  }
+
+  private startAudioProbe(): void {
+    if (this.audioProbe !== null || this.closed) return;
+    const interval = this.environment.audioProbeIntervalMs ?? 250;
+    this.audioProbe = setInterval(() => { void this.probeAudioOnce(); }, interval);
+  }
+
+  private async probeAudioOnce(): Promise<void> {
+    if (this.closed) return;
+    const progress = await this.audioProgress();
+    if (!progress) return;
+    const previous = this.lastProgress;
+    this.lastProgress = progress;
+    if (!previous || this.audioConfirmed || !this.outputStarted) return;
+    // Energy is the honest signal: bytes and packets keep flowing for a track
+    // carrying silence, and a transcript proves only that the model generated
+    // text. Samples advancing is accepted as well, because a browser that
+    // reports no energy statistic would otherwise never confirm anything.
+    const heard = progress.audioEnergy > previous.audioEnergy
+      || progress.samplesReceived > previous.samplesReceived;
+    if (!heard) return;
+    this.audioConfirmed = true;
+    this.emit({
+      type: 'output_audio_playing', eventId: `local:audio-playing:${crypto.randomUUID()}`, progress,
+    });
   }
 
   private waitForDataChannel(): Promise<void> {
@@ -353,6 +442,7 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
     this.send({ type: 'output_audio_buffer.clear' });
     this.responseActive = false;
     this.outputStarted = false;
+    this.audioConfirmed = false;
     this.pendingResponseRequest = false;
     this.audio?.pause();
     this.emit({ type: 'interrupted', eventId: `local:interrupt:${crypto.randomUUID()}` });
@@ -372,6 +462,7 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
     if (interrupted) {
       this.responseActive = false;
       this.outputStarted = false;
+      this.audioConfirmed = false;
       this.pendingResponseRequest = false;
       this.audio?.pause();
       this.emit({ type: 'interrupted', eventId: `local:manual-interrupt:${crypto.randomUUID()}` });
@@ -421,6 +512,10 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
     if (this.closed) return;
     this.closed = true;
     this.state = 'closed';
+    if (this.audioProbe !== null) {
+      clearInterval(this.audioProbe);
+      this.audioProbe = null;
+    }
     this.channel?.removeEventListener('message', this.onMessage);
     this.channel?.close();
     if (this.peer) {
@@ -444,6 +539,8 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
     this.channel = null;
     this.stream = null;
     this.audio = null;
+    this.receiver = null;
+    this.lastProgress = null;
     await this.environment.disconnectBroker(this.config.sessionId).catch(() => undefined);
   }
 }

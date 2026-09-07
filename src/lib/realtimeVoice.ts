@@ -72,13 +72,43 @@ export type RealtimeResponseDisposition = 'continue' | 'await_tools' | 'complete
  * turn has to be closed out by the caller. */
 export type RealtimeToolSettlement = 'continue' | 'wait' | 'closed';
 
+/** Measured evidence that model audio is arriving and being played out, read
+ * from the transport rather than inferred from data-channel events.
+ * `audioEnergy` is the decisive one: it only accumulates while non-silent
+ * audio is rendered, so it distinguishes "the speaker is producing sound" from
+ * "a media track exists". */
+export interface RealtimeAudioProgress {
+  bytesReceived: number;
+  samplesReceived: number;
+  audioEnergy: number;
+  playbackSeconds: number;
+  /** Whether this webview reported either statistic that distinguishes sound
+   * from a silent track. `totalAudioEnergy` and `totalSamplesReceived` are
+   * standard but WebKit's `getStats` is narrower than Chromium's, so a reading
+   * of zero has two meanings and only this separates them. A caller must
+   * report unmeasurable playback as unproven, never as silence — otherwise a
+   * working answer looks like a broken one on half the platforms this ships to. */
+  measured: boolean;
+}
+
 export type RealtimeVoiceEvent =
   | { type: 'connected'; eventId: string }
   | { type: 'listening'; eventId: string }
   | { type: 'speech_started'; eventId: string; itemId?: string }
   | { type: 'input_transcript'; eventId: string; itemId: string; text: string }
   | { type: 'response_started'; eventId: string; responseId: string }
-  | { type: 'output_audio_started'; eventId: string }
+  /** The model began producing output for this response. Named for what it is:
+   * a generation-timing signal read off the data channel. It says nothing
+   * about whether any audio reached the speaker. */
+  | { type: 'output_generation_started'; eventId: string }
+  /** The remote media track arrived. Over WebRTC this is the only path model
+   * audio travels, so its absence means nothing can be heard however many
+   * transcript deltas the data channel delivers. */
+  | { type: 'remote_audio_track'; eventId: string }
+  /** Audio is measurably being played out — receiver statistics advanced while
+   * the model was generating. This, not a transcript delta, is what "the
+   * assistant is speaking" means. */
+  | { type: 'output_audio_playing'; eventId: string; progress: RealtimeAudioProgress }
   | { type: 'output_underrun'; eventId: string }
   | { type: 'output_transcript_delta'; eventId: string; itemId: string; delta: string }
   | { type: 'output_transcript_done'; eventId: string; itemId: string; text: string }
@@ -122,6 +152,10 @@ export interface RealtimeVoiceSession {
   readonly capabilities: RealtimeVoiceCapabilities;
   readonly state: RealtimeVoiceState;
   connect(): Promise<void>;
+  /** A fresh reading of played-out audio, or null when the transport cannot
+   * measure it. Sampling it twice across a window is how a caller proves audio
+   * started, and how it proves audio stopped after an interruption. */
+  audioProgress?(): Promise<RealtimeAudioProgress | null>;
   interrupt(): Promise<void>;
   startManualTurn(): Promise<void>;
   finishManualTurn(): Promise<void>;
@@ -269,7 +303,15 @@ export class RealtimeVoiceController {
         this.record(event.responseId);
         this.state = 'responding';
         break;
-      case 'output_audio_started':
+      case 'output_generation_started':
+        this.state = 'responding';
+        break;
+      case 'remote_audio_track':
+        break;
+      case 'output_audio_playing':
+        // Anchored on measured playback, not on the first transcript delta: a
+        // model that generates while the speaker stays silent is exactly the
+        // failure this metric has to be able to show.
         if (this.metrics.firstAudioMs === null && this.turnStartedAt > 0) {
           this.metrics.firstAudioMs = Math.max(0, Math.round(performance.now() - this.turnStartedAt));
         }

@@ -4,6 +4,7 @@ import { realtimeVoiceClient, type RealtimeVoiceStatus } from './companionClient
 import { OpenAiRealtimeVoiceProvider } from './openAiRealtimeVoice';
 import {
   RealtimeVoiceController,
+  type RealtimeAudioProgress,
   type RealtimeVoiceEvent,
   type RealtimeVoiceProvider,
   type RealtimeVoiceSession,
@@ -24,6 +25,7 @@ export const REALTIME_ACCEPTANCE_STEPS = [
   'tool_call_bridged',
   'tool_result_returned',
   'spoken_followup',
+  'audio_reached_the_speaker',
   'barge_in',
   'durable_conversation',
   'clean_disconnect',
@@ -48,6 +50,7 @@ export interface RealtimeAcceptanceReport {
   metrics: {
     connectionMs: number | null;
     firstRecognizedSpeechMs: number | null;
+    /** Time to *measured* playback, not to the first transcript delta. */
     firstAudioMs: number | null;
     endToEndMs: number | null;
     interrupted: boolean;
@@ -74,6 +77,9 @@ export interface RealtimeAcceptanceOptions {
   /** How long the operator has to speak the request after capture opens. */
   speakWindowMs?: number;
   exchangeTimeoutMs?: number;
+  /** How long silence is observed after the interruption before barge-in is
+   * called proven. Long enough that audio still in flight would show up. */
+  silenceWindowMs?: number;
   wait?: (ms: number) => Promise<void>;
   log?: (line: string) => void;
 }
@@ -141,7 +147,9 @@ export async function runRealtimeAcceptance(
     let inputTranscriptLength = 0;
     let toolCallsBridged = 0;
     let toolResultsReturned = 0;
-    let audioAfterToolResult = false;
+    let generationAfterToolResult = false;
+    let remoteTrackReceived = false;
+    let playingAfterToolResult: RealtimeAudioProgress | null = null;
     let spokenTranscriptLength = 0;
     let interrupted = false;
     let audioEventsAfterInterrupt = 0;
@@ -149,7 +157,7 @@ export async function runRealtimeAcceptance(
     let settled!: () => void;
     const finished = new Promise<void>((resolve) => { settled = resolve; });
     const maybeFinish = () => {
-      if (inputTranscriptLength > 0 && toolResultsReturned > 0 && audioAfterToolResult
+      if (inputTranscriptLength > 0 && toolResultsReturned > 0 && playingAfterToolResult !== null
         && spokenTranscriptLength > 0 && interrupted) settled();
     };
     let tail: Promise<void> = Promise.resolve();
@@ -179,11 +187,25 @@ export async function runRealtimeAcceptance(
         maybeFinish();
         return;
       }
-      if (event.type === 'output_audio_started') {
+      if (event.type === 'remote_audio_track') {
+        remoteTrackReceived = true;
+        return;
+      }
+      if (event.type === 'output_generation_started') {
+        if (toolResultsReturned > 0 && !interrupted) {
+          generationAfterToolResult = true;
+          pass('spoken_followup', `the provider generated a further answer after the host tool result (${continuationsRequested} continuation requested)`);
+        }
+        return;
+      }
+      if (event.type === 'output_audio_playing') {
         if (interrupted) audioEventsAfterInterrupt += 1;
         if (toolResultsReturned > 0 && !interrupted) {
-          audioAfterToolResult = true;
-          pass('spoken_followup', `the provider spoke again after the host tool result (${continuationsRequested} continuation requested)`);
+          playingAfterToolResult = event.progress;
+          pass(
+            'audio_reached_the_speaker',
+            `receiver statistics advanced while the answer played: ${Math.round(event.progress.bytesReceived)} bytes, energy ${event.progress.audioEnergy.toExponential(2)}`,
+          );
           if (!bargeInRequested) {
             bargeInRequested = true;
             void current?.interrupt();
@@ -266,20 +288,54 @@ export async function runRealtimeAcceptance(
     await wait(options.speakWindowMs ?? 8_000);
     if (turnDetection === 'manual') await session.finishManualTurn();
 
+    // A timeout is recorded rather than thrown, so the evidence below is still
+    // gathered and the report says which steps were proven before the run ran
+    // out of patience. Thrown here, every remaining step would read
+    // "not reached" and the operator would learn nothing about why.
+    let timedOut = false;
     await Promise.race([
       finished,
-      wait(options.exchangeTimeoutMs ?? 90_000).then(() => {
-        throw new Error('Timed out waiting for the spoken exchange, host tool result, and follow-up answer.');
-      }),
+      wait(options.exchangeTimeoutMs ?? 90_000).then(() => { timedOut = true; }),
     ]);
     await tail.catch(() => undefined);
     if (error) throw new Error(error);
-    if (toolCallsBridged === 0) throw new Error('The provider never requested the host tool.');
-    if (audioEventsAfterInterrupt > 0) {
-      fail('barge_in', `${audioEventsAfterInterrupt} further output-audio starts arrived after the interruption`);
-    } else if (interrupted) {
-      pass('barge_in', 'the spoken answer stopped on interruption and no further output audio began');
+    const meter = await session.audioProgress?.() ?? null;
+    if (!remoteTrackReceived) {
+      fail('audio_reached_the_speaker', 'no remote audio track ever arrived, so nothing could be heard');
+    } else if (playingAfterToolResult === null && meter !== null && !meter.measured) {
+      // Not the app's failure: this webview reports neither audio energy nor a
+      // sample count, so nothing here can tell sound from a silent track.
+      fail(
+        'audio_reached_the_speaker',
+        'this webview reports no audio energy or sample count on inbound-rtp, so playback cannot be proven either way — re-run the acceptance on a webview whose getStats reports them',
+      );
+    } else if (!generationAfterToolResult) {
+      fail('spoken_followup', 'the provider never generated an answer after the host tool result');
     }
+
+    // "No further audio event" is not evidence of silence: the playing event
+    // fires once per response. The only honest check is to watch the numbers
+    // that only move while sound is being produced, and see them stop.
+    const before = await session.audioProgress?.() ?? null;
+    await wait(options.silenceWindowMs ?? 1_500);
+    const after = await session.audioProgress?.() ?? null;
+    if (!interrupted) {
+      fail('barge_in', 'the interruption was never acknowledged');
+    } else if (audioEventsAfterInterrupt > 0) {
+      fail('barge_in', `${audioEventsAfterInterrupt} further output-audio starts arrived after the interruption`);
+    } else if (before === null || after === null || !before.measured || !after.measured) {
+      fail('barge_in', 'the transport could not measure played-out audio, so the stop is unproven');
+    } else if (after.audioEnergy > before.audioEnergy) {
+      const played = (after.audioEnergy - before.audioEnergy).toExponential(2);
+      fail('barge_in', `audio kept playing for ${options.silenceWindowMs ?? 1_500}ms after the interruption (energy +${played})`);
+    } else {
+      pass(
+        'barge_in',
+        `played-out audio stopped advancing within ${options.silenceWindowMs ?? 1_500}ms of the interruption (energy held at ${after.audioEnergy.toExponential(2)}, playback at ${after.playbackSeconds.toFixed(2)}s)`,
+      );
+    }
+
+
 
     const realtime = messagesOf(options.chatSessionId).filter((message) => message.realtime?.voiceTurnId === voiceTurnId);
     const kinds = new Set(realtime.map((message) => message.realtime?.kind));
@@ -291,6 +347,13 @@ export async function runRealtimeAcceptance(
     await session.close();
     session = null;
     pass('clean_disconnect', 'peer, data channel, microphone tracks, and the native broker were released');
+
+    // Reported last, so a run that ran out of patience still says what it
+    // proved about every step rather than stopping the report at the timeout.
+    if (timedOut) {
+      throw new Error('Timed out waiting for the spoken exchange, host tool result, and follow-up answer.');
+    }
+    if (toolCallsBridged === 0) throw new Error('The provider never requested the host tool.');
   } catch (reason) {
     error = reason instanceof Error ? reason.message : String(reason);
   } finally {

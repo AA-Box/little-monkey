@@ -51,11 +51,36 @@ turns clear the input buffer before capture and commit it before
 `response.create`.
 
 Because the spoken audio travels on the media track rather than the data
-channel, "the model started speaking" is anchored on the first output event the
-WebRTC transport actually delivers — an output-audio delta if one arrives, and
-otherwise the first output transcript delta. First-audio latency, the underrun
-counter, and the barge-in guards all hang off that single anchor rather than off
-a WebSocket-only event.
+channel, generation and playback are reported as separate facts and never
+conflated. A data-channel output event — an audio delta if one arrives,
+otherwise the first transcript delta — reports that the model began *generating*
+and drives the responding state. The remote track's arrival is reported on its
+own, because over WebRTC it is the only path audio can take. Playback itself is
+*measured*: receiver statistics and the audio element's position are sampled
+while output is being generated, and audio is only reported as playing once the
+accumulated audio energy or received sample count has actually advanced. Energy
+is the decisive figure — bytes and packets keep flowing for a track carrying
+silence — so first-audio latency reflects sound the operator could hear rather
+than text the model produced. A transcript arriving while the speaker stays
+silent is therefore visible instead of indistinguishable from a working answer.
+
+Those statistics are standard but not universal: WebKit's `getStats` is
+narrower than Chromium's, and this app ships to WKWebView and WebKitGTK as well
+as WebView2. A reading of zero therefore has two meanings, and each reading
+records which of the two it is. A webview that reports neither audio energy nor
+a sample count is reported as unable to prove playback, naming the webview
+rather than the application, instead of being reported as a silent speaker.
+
+The same measurement proves a barge-in took effect. "No further audio event" is
+not evidence of silence, since that event fires once per response; the numbers
+that only move while sound is produced are sampled across a window after the
+interruption and have to stop advancing. A transport that cannot measure
+playback reports the stop as unproven rather than as silence.
+
+Interruption is counted the same however it starts. A local Stop and a
+provider-VAD barge-in both produce one normalized interruption, so the metric
+does not silently omit the automatic case — while the operator's first utterance
+of a turn, with nothing in flight, is not counted as interrupting anything.
 
 ## Durable transcript and context
 
@@ -150,7 +175,8 @@ Provider-independent tests cover the state machine and the response ledger
 (server and manual VAD, interruption during speech and during tool execution,
 response cancellation and failure, stale and duplicate provider events, failed
 reconnect, credential rejection and retry, device removal, microphone
-revocation), OpenAI event translation, response pacing, the SDP broker shape,
+revocation), OpenAI event translation, response pacing, the separation of
+generation from measured playback, the SDP broker shape,
 full resource teardown, and the tool boundary across a reconnect: a reissued
 operation under a new provider session and item id is not executed twice, while
 an ordinary repeat inside one session still runs. Two of those tests are named
@@ -160,8 +186,8 @@ that had them. Rust tests cover the fixed-provider validation and the session
 payload.
 
 The real-provider acceptance runs the app itself, because a real microphone,
-real WebRTC, the native keychain broker, and the ordinary tool executor only
-exist together in the desktop webview:
+real WebRTC, a real speaker path, the native keychain broker, and the ordinary
+tool executor only exist together in the desktop webview:
 
 ```bash
 pnpm test:realtime:live --path README.md
@@ -171,10 +197,11 @@ It needs an OpenAI key saved through Settings, a workspace open on that file,
 network access, and microphone permission. The app starts with the acceptance
 harness enabled, prints `Speak now`, and the operator asks it once to read the
 file. The harness drives the same response ledger and the same tool bridge the
-product uses and reports ten steps — provider configured at the fixed egress
+product uses and reports eleven steps — provider configured at the fixed egress
 origin, session connected, microphone audio reached the provider, transcript
 persisted, tool call bridged to the normal executor, host result returned,
-spoken follow-up after that result, barge-in, durable conversation rows, clean
+spoken follow-up after that result, audio measurably reaching the speaker,
+barge-in proven by measured silence, durable conversation rows, clean
 disconnect. The native side writes the evidence and exits, so the run cannot
 pass on a webview that stalled. The report carries step outcomes and bounded
 timings only: no transcript, audio, file content, or credential. The same

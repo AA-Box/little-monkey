@@ -1,6 +1,15 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { boundedRealtimeContext, RealtimeVoiceController, type RealtimeVoiceEvent } from './realtimeVoice';
+import {
+  boundedRealtimeContext, RealtimeVoiceController,
+  type RealtimeAudioProgress, type RealtimeVoiceEvent,
+} from './realtimeVoice';
+
+// Every timing test drives `performance.now()` through a fixed queue, so a
+// leaked spy would hand the next test the tail of someone else's clock.
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 /** A controller that has already reached the point where a provider response is
  * streaming, which is the only state in which tool calls and `response.done`
@@ -13,6 +22,16 @@ function respondingController(responseId = 'r1'): RealtimeVoiceController {
   controller.consume({ type: 'listening', eventId: 'listening' });
   controller.consume({ type: 'response_started', eventId: `started:${responseId}`, responseId });
   return controller;
+}
+
+/** A plausible reading of the transport's own statistics. Only the shape and
+ * the fact that it advances matter to the reducer, which never inspects the
+ * numbers — it trusts the adapter to emit this only once they moved. */
+function playedAudio(overrides: Partial<RealtimeAudioProgress> = {}): RealtimeAudioProgress {
+  return {
+    bytesReceived: 4_096, samplesReceived: 24_000, audioEnergy: 0.42, playbackSeconds: 0.5,
+    measured: true, ...overrides,
+  };
 }
 
 function toolCall(callId: string, responseId: string | null): RealtimeVoiceEvent {
@@ -41,7 +60,15 @@ describe('RealtimeVoiceController', () => {
   });
 
   it('tracks a complete voice turn and deduplicates replayed events', () => {
-    vi.spyOn(performance, 'now').mockReturnValueOnce(10).mockReturnValueOnce(30).mockReturnValueOnce(50).mockReturnValueOnce(80);
+    // Seven readings, in the order the reducer takes them: `connecting`,
+    // `connected`, `speech_started` (the connection-relative latency, then the
+    // turn clock it restarts), `response_started`, `output_audio_playing` and
+    // `response_done`. The generation, track and transcript events read the
+    // clock not at all, which is why they are absent from this queue.
+    vi.spyOn(performance, 'now')
+      .mockReturnValueOnce(10).mockReturnValueOnce(30)
+      .mockReturnValueOnce(50).mockReturnValueOnce(80)
+      .mockReturnValueOnce(100).mockReturnValueOnce(140).mockReturnValueOnce(200);
     const controller = new RealtimeVoiceController();
     controller.connecting();
     expect(controller.consume({ type: 'connected', eventId: '1' })).toBe(true);
@@ -49,16 +76,92 @@ describe('RealtimeVoiceController', () => {
     controller.consume({ type: 'speech_started', eventId: '2' });
     controller.consume({ type: 'response_started', eventId: '3', responseId: 'r1' });
     controller.consume({ type: 'output_transcript_delta', eventId: '4', itemId: 'a1', delta: 'Hi' });
-    controller.consume({ type: 'output_audio_started', eventId: 'audio' });
+    controller.consume({ type: 'output_generation_started', eventId: 'generation' });
+    controller.consume({ type: 'remote_audio_track', eventId: 'track' });
+    // The one event in this turn that says a human could hear anything.
+    controller.consume({ type: 'output_audio_playing', eventId: 'playing', progress: playedAudio() });
     controller.consume({ type: 'output_underrun', eventId: 'underrun' });
     controller.consume({ type: 'response_done', eventId: '5', responseId: 'r1', status: 'completed' });
     expect(controller.state).toBe('ready');
-    expect(controller.metrics.connectionMs).not.toBeNull();
-    expect(controller.metrics.firstRecognizedSpeechMs).not.toBeNull();
-    expect(controller.metrics.firstModelEventMs).not.toBeNull();
-    expect(controller.metrics.firstAudioMs).not.toBeNull();
+    expect(controller.metrics.connectionMs).toBe(20);
+    expect(controller.metrics.firstRecognizedSpeechMs).toBe(40);
+    expect(controller.metrics.firstModelEventMs).toBe(20);
+    // Measured from the turn clock at 80 to the playback reading at 140, not
+    // from the transcript delta or the generation signal that preceded both.
+    expect(controller.metrics.firstAudioMs).toBe(60);
+    expect(controller.metrics.endToEndMs).toBe(120);
     expect(controller.metrics.outputUnderruns).toBe(1);
     expect(controller.consume({ type: 'response_done', eventId: '5', responseId: 'r1', status: 'completed' })).toBe(false);
+  });
+
+  it('reports a generating model with a silent speaker as responding with no first-audio latency', () => {
+    // The defect this splits apart: first audio used to be anchored on a
+    // transcript delta, so a session whose remote track carried nothing
+    // produced exactly the same metrics as one the operator could hear. A
+    // model talking to a dead speaker now has to be visible, and the only way
+    // it can be is a `firstAudioMs` that stays null while the state advances.
+    const controller = respondingController();
+    controller.consume({ type: 'output_transcript_delta', eventId: 'delta', itemId: 'a1', delta: 'Hi' });
+    controller.consume({ type: 'output_generation_started', eventId: 'generation' });
+    controller.consume({ type: 'remote_audio_track', eventId: 'track' });
+    expect(controller.state).toBe('responding');
+    expect(controller.metrics.firstAudioMs).toBeNull();
+    // And the null is a real absence of playback rather than a turn clock that
+    // never started: the same turn did measure its first model event, so an
+    // `output_audio_playing` arriving here would have been measured too.
+    expect(controller.metrics.firstModelEventMs).not.toBeNull();
+  });
+
+  it('takes remote_audio_track as evidence only, changing no state and no metric', () => {
+    // Over WebRTC this is the one channel audio can arrive on, so the
+    // acceptance harness needs to see it — but a track existing is not a track
+    // carrying sound, and the reducer must not upgrade one into the other.
+    const controller = respondingController();
+    const before = structuredClone(controller.metrics);
+    const state = controller.state;
+    expect(controller.consume({ type: 'remote_audio_track', eventId: 'track' })).toBe(true);
+    expect(controller.state).toBe(state);
+    expect(controller.metrics).toEqual(before);
+    // A reconnect replaying the transport events must not read as a second
+    // track arriving; deduplication is not waived for the events that no-op.
+    expect(controller.consume({ type: 'remote_audio_track', eventId: 'track' })).toBe(false);
+  });
+
+  it('anchors firstAudioMs on the first measured playback and never moves it again', () => {
+    vi.spyOn(performance, 'now')
+      .mockReturnValueOnce(10).mockReturnValueOnce(30)
+      .mockReturnValueOnce(100).mockReturnValueOnce(180).mockReturnValueOnce(900);
+    const controller = new RealtimeVoiceController();
+    controller.connecting();
+    controller.consume({ type: 'connected', eventId: 'connected' });
+    controller.consume({ type: 'listening', eventId: 'listening' });
+    controller.consume({ type: 'output_audio_playing', eventId: 'playing:1', progress: playedAudio() });
+    expect(controller.state).toBe('responding');
+    expect(controller.metrics.firstAudioMs).toBe(80);
+    // The probe keeps sampling for as long as the answer plays. Latency means
+    // the moment sound started, so a later reading is not allowed to restate
+    // it — nor to be mistaken for the first one because its numbers are bigger.
+    controller.consume({
+      type: 'output_audio_playing', eventId: 'playing:2',
+      progress: playedAudio({ audioEnergy: 3.9, samplesReceived: 96_000, playbackSeconds: 2 }),
+    });
+    expect(controller.metrics.firstAudioMs).toBe(80);
+  });
+
+  it('counts an interruption from the provider-VAD barge-in as well as a local stop', () => {
+    // The adapter synthesises `interrupted` from
+    // `input_audio_buffer.speech_started` with a `:barge-in` event id. Before
+    // that it emitted nothing there, so the metric only ever saw the local Stop
+    // button and a talked-over answer was reported as an untouched turn. The
+    // reducer must not care which of the two produced the event.
+    const bargedIn = respondingController();
+    bargedIn.consume({ type: 'output_generation_started', eventId: 'generation' });
+    expect(bargedIn.consume({ type: 'interrupted', eventId: 'event_C9RtE0mhSjA:barge-in' })).toBe(true);
+    expect(bargedIn.metrics.interrupted).toBe(true);
+    expect(bargedIn.state).toBe('listening');
+    const stopped = respondingController('r2');
+    stopped.consume({ type: 'interrupted', eventId: 'local:interrupt:6f1d9c2a' });
+    expect(stopped.metrics.interrupted).toBe(true);
   });
 
   it('represents approval, interruption, reconnect, failure, and close explicitly', () => {
