@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import shlex
 import socket
 import stat
 import subprocess
@@ -36,7 +35,7 @@ def _port() -> int:
 
 
 def _wait(port: int, process: subprocess.Popen) -> None:
-    deadline = time.monotonic() + 15
+    deadline = time.monotonic() + 12
     while time.monotonic() < deadline:
         if process.poll() is not None:
             stderr = process.stderr.read() if process.stderr is not None else ""
@@ -48,10 +47,11 @@ def _wait(port: int, process: subprocess.Popen) -> None:
             time.sleep(0.05)
     process.terminate()
     try:
-        _stdout, stderr = process.communicate(timeout=3)
+        process.wait(timeout=5)
     except subprocess.TimeoutExpired:
         process.kill()
-        _stdout, stderr = process.communicate(timeout=3)
+        process.wait(timeout=5)
+    stderr = process.stderr.read() if process.stderr is not None else ""
     raise AssertionError(f"service did not become healthy\n{stderr}")
 
 
@@ -67,7 +67,7 @@ def _post(port: int, body: dict) -> str:
 
 
 def _write_executable(path: Path, source: str) -> None:
-    path.write_text(textwrap.dedent(source))
+    path.write_text(source)
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
@@ -108,42 +108,34 @@ def test_full_managed_lily_then_capability_fallback() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         fake_lily = root / "lily"
-        fake_lily_impl = root / "fake_lily.py"
         fallback = root / "fallback.py"
         model = root / "model"
         model.mkdir()
 
-        fake_lily_impl.write_text(
-            textwrap.dedent(
-                r'''
-                import argparse, json
-                from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-                p=argparse.ArgumentParser(); p.add_argument('--model'); p.add_argument('--bind'); p.add_argument('--max-seq'); a=p.parse_args()
-                host,port=a.bind.rsplit(':',1)
-                class H(BaseHTTPRequestHandler):
-                  def log_message(self,*a): pass
-                  def do_GET(self):
-                    if self.path=='/health': body=b'{"ok":true}'
-                    elif self.path=='/v1/models': body=b'{"data":[{"id":"Qwen3.6-35B-A3B"}]}'
-                    else: self.send_error(404); return
-                    self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
-                  def do_POST(self):
-                    n=int(self.headers.get('Content-Length','0')); json.loads(self.rfile.read(n))
-                    body=json.dumps({'choices':[{'message':{'content':'lily-ok'}}], 'usage':{'prompt_tokens':11,'completion_tokens':2,'prompt_tokens_details':{'cached_tokens':7}}}).encode()
-                    self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
-                ThreadingHTTPServer((host,int(port)),H).serve_forever()
-                '''
-            )
-        )
-        # Execute the fixture through the exact interpreter running the test.
-        # This avoids relying on /usr/bin/env/shebang resolution on hosted macOS
-        # while still exercising lily_managed's "binary child" process boundary.
-        _write_executable(
-            fake_lily,
-            f'''#!/bin/sh
-exec {shlex.quote(sys.executable)} {shlex.quote(str(fake_lily_impl))} "$@"
-''',
-        )
+        fake_source = textwrap.dedent(
+            r'''
+            import argparse, json
+            from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+            p=argparse.ArgumentParser(); p.add_argument('--model'); p.add_argument('--bind'); p.add_argument('--max-seq'); a=p.parse_args()
+            host,port=a.bind.rsplit(':',1)
+            class H(BaseHTTPRequestHandler):
+              def log_message(self,*a): pass
+              def do_GET(self):
+                if self.path=='/health': body=b'{"ok":true}'
+                elif self.path=='/v1/models': body=b'{"data":[{"id":"Qwen3.6-35B-A3B"}]}'
+                else: self.send_error(404); return
+                self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
+              def do_POST(self):
+                n=int(self.headers.get('Content-Length','0')); json.loads(self.rfile.read(n))
+                body=json.dumps({'choices':[{'message':{'content':'lily-ok'}}], 'usage':{'prompt_tokens':11,'completion_tokens':2,'prompt_tokens_details':{'cached_tokens':7}}}).encode()
+                self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
+            ThreadingHTTPServer((host,int(port)),H).serve_forever()
+            '''
+        ).lstrip()
+        # Use the exact Python interpreter running the test as the shebang.
+        # This avoids PATH/env/shebang drift on hosted macOS while still crossing
+        # the real executable-child boundary used by the managed adapter.
+        _write_executable(fake_lily, f"#!{sys.executable}\n{fake_source}")
 
         fallback.write_text(
             textwrap.dedent(
@@ -185,6 +177,8 @@ exec {shlex.quote(sys.executable)} {shlex.quote(str(fake_lily_impl))} "$@"
                 str(fallback),
                 "--python",
                 sys.executable,
+                "--startup-timeout-seconds",
+                "5",
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
