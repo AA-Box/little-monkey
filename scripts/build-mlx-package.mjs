@@ -35,8 +35,15 @@ const OUTPUT_ROOT = join(REPOSITORY_ROOT, "packaging/mlx/dist");
 
 /** Must match MLX_RELEASE_KEY_ID in src-tauri/src/m3_production.rs. */
 const KEY_ID = "release-2026-1";
-/** Pinned so a package states exactly which MLX it carries. */
-const MLX_LM_VERSION = "0.28.4";
+/**
+ * Runtime versions are pinned as a compatible set, not merely through
+ * mlx-lm's lower bound. The core MLX pin matters because kernel/cache behavior
+ * changes independently of mlx-lm; the VLM pin keeps the model loader from
+ * drifting every time this package is rebuilt.
+ */
+const MLX_VERSION = "0.32.2";
+const MLX_LM_VERSION = "0.31.3";
+const MLX_VLM_VERSION = "0.6.17";
 /**
  * The video engine, pinned to a commit rather than a version.
  *
@@ -87,22 +94,53 @@ function build() {
   execFileSync("python3", ["-m", "venv", "--copies", join(OUTPUT_ROOT, "runtime")], {
     stdio: "inherit",
   });
+  const python = join(OUTPUT_ROOT, "runtime/bin/python3");
   execFileSync(
-    join(OUTPUT_ROOT, "runtime/bin/python3"),
-    ["-m", "pip", "install", "--quiet", "--upgrade", `mlx-lm==${MLX_LM_VERSION}`],
+    python,
+    [
+      "-m",
+      "pip",
+      "install",
+      "--quiet",
+      "--upgrade",
+      `mlx==${MLX_VERSION}`,
+      `mlx-lm==${MLX_LM_VERSION}`,
+      `mlx-vlm==${MLX_VLM_VERSION}`,
+    ],
     { stdio: "inherit" },
   );
   // Installed into the same interpreter rather than a second one: both services
-  // are launched from this venv, and mlx-lm and mlx-video agree on mlx itself.
+  // are launched from this venv. Install the video project at its immutable
+  // commit after the three direct pins; its declared `mlx>=0.22` requirement is
+  // compatible with the exact core version above.
   console.log("adding the video engine…");
   execFileSync(
-    join(OUTPUT_ROOT, "runtime/bin/python3"),
+    python,
     [
       "-m",
       "pip",
       "install",
       "--quiet",
       `mlx-video @ git+https://github.com/Blaizzy/mlx-video.git@${MLX_VIDEO_COMMIT}`,
+    ],
+    { stdio: "inherit" },
+  );
+
+  // Fail the package build if a transitive install moved any direct pin or left
+  // an inconsistent dependency graph. A signed runtime must identify what it
+  // actually executes rather than trusting the command that attempted to
+  // install it.
+  execFileSync(python, ["-m", "pip", "check"], { stdio: "inherit" });
+  execFileSync(
+    python,
+    [
+      "-c",
+      [
+        "import importlib.metadata as m",
+        `assert m.version('mlx') == '${MLX_VERSION}', m.version('mlx')`,
+        `assert m.version('mlx-lm') == '${MLX_LM_VERSION}', m.version('mlx-lm')`,
+        `assert m.version('mlx-vlm') == '${MLX_VLM_VERSION}', m.version('mlx-vlm')`,
+      ].join(";"),
     ],
     { stdio: "inherit" },
   );
@@ -122,7 +160,7 @@ function build() {
   const pythonExecutable = "runtime/bin/python3";
   // `svc-` is what makes a service-only fix a new version rather than a
   // same-named rebuild nothing upgrades to — see `serviceRevision`.
-  const version = `mlx-lm-${MLX_LM_VERSION}+video-${MLX_VIDEO_COMMIT.slice(0, 12)}+${pythonVersion(
+  const version = `mlx-${MLX_VERSION}+mlx-lm-${MLX_LM_VERSION}+mlx-vlm-${MLX_VLM_VERSION}+video-${MLX_VIDEO_COMMIT.slice(0, 12)}+${pythonVersion(
     join(OUTPUT_ROOT, pythonExecutable),
   )}+svc-${serviceRevision([SOURCE_SERVICE, SOURCE_VIDEO_SERVICE])}`;
   let manifest = buildManifest({
@@ -187,9 +225,15 @@ function publish(version, manifest) {
     sizeBytes: bytes.length,
     publishedAtMs: Number(process.env.SOURCE_DATE_EPOCH ?? 0) * 1000,
     compatibilityNote:
-      `Requires Apple silicon. Carries the MLX chat runtime and the MLX video ` +
-      `engine. Ships ${manifest.files.length} files.`,
-    metadata: {},
+      `Requires Apple silicon. Carries MLX ${MLX_VERSION}, mlx-lm ${MLX_LM_VERSION}, ` +
+      `mlx-vlm ${MLX_VLM_VERSION}, and the pinned MLX video engine. ` +
+      `Ships ${manifest.files.length} files.`,
+    metadata: {
+      mlxVersion: MLX_VERSION,
+      mlxLmVersion: MLX_LM_VERSION,
+      mlxVlmVersion: MLX_VLM_VERSION,
+      mlxVideoCommit: MLX_VIDEO_COMMIT,
+    },
   };
   const catalog = join(REPOSITORY_ROOT, "packaging/mlx", "mlx-catalog.json");
   writeFileSync(catalog, `${JSON.stringify([entry], null, 2)}\n`);
