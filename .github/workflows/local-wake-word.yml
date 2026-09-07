@@ -121,8 +121,11 @@ jobs:
       # docs/limitations.md says plainly that it is compiled rather than run.
       - name: Cross-check the Intel macOS target, which has no runtime host
         if: matrix.os == 'macos-latest'
+        env:
+          CLI_SIDECAR_TARGET: x86_64-apple-darwin
         run: |
           rustup target add x86_64-apple-darwin
+          pnpm stage:cli:placeholder
           node scripts/stage-sherpa-runtime.mjs x86_64-apple-darwin
           cargo check --locked --manifest-path src-tauri/Cargo.toml --lib --target x86_64-apple-darwin
 

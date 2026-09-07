@@ -144,3 +144,15 @@ test("runtime verification rejects an archive with the right size but wrong dige
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("the Intel macOS cross-check stages its target-specific CLI sidecar", () => {
+  const workflow = readFileSync(
+    join(process.cwd(), ".github/workflows/local-wake-word.yml"),
+    "utf8",
+  );
+  const crossCheck = workflow.split("Cross-check the Intel macOS target")[1] ?? "";
+  assert.match(crossCheck, /CLI_SIDECAR_TARGET: x86_64-apple-darwin/);
+  const stage = crossCheck.indexOf("pnpm stage:cli:placeholder");
+  const cargo = crossCheck.indexOf("cargo check --locked");
+  assert.ok(stage >= 0 && cargo > stage);
+});
