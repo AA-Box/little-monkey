@@ -1,0 +1,83 @@
+name: PR506 finalize E2E
+
+on:
+  push:
+    branches:
+      - feat/mlx-prefix-cache-lily-runtime
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: contains(github.event.head_commit.message, 'bootstrap PR506 final E2E verification trigger')
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/mlx-prefix-cache-lily-runtime
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Apply production E2E wiring
+        run: python3 scripts/pr506-finalize-e2e.py
+
+      - name: Format Rust
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all
+
+      - name: Verify MLX cache private ABI
+        run: python3 packaging/mlx/service/test_mlx_server.py
+
+      - name: Verify managed Lily lifecycle and fallback
+        run: python3 packaging/mlx/service/test_lily_managed.py
+
+      - name: Compile managed service entrypoints
+        run: python3 -m py_compile packaging/mlx/service/runtime_router.py packaging/mlx/service/lily_managed.py packaging/mlx/service/mlx_server.py
+
+      - name: Verify package-manifest helpers
+        run: pnpm test:mlx-package
+
+      - name: Stage required Tauri CLI sidecar placeholder
+        run: pnpm stage:cli:placeholder
+
+      - name: Compile production Rust path
+        run: cargo check --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Run MLX runtime tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib mlx_runtime::tests -- --nocapture
+
+      - name: Remove superseded manual bridge and bootstrap files
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f packaging/lily/lily_bridge.py packaging/lily/test_lily_bridge.py
+          rmdir packaging/lily 2>/dev/null || true
+          rm -f scripts/pr506-wire-mlx-cache.py scripts/pr506-finalize-e2e.py
+          rm -f .github/workflows/pr506-wire-mlx-cache.yml .github/workflows/pr506-finalize-e2e.yml
+
+      - name: Commit verified production integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "feat: finish MLX cache and managed Lily E2E integration"
+          git push origin HEAD:feat/mlx-prefix-cache-lily-runtime
