@@ -50,6 +50,15 @@ export interface ChatMessage {
     itemId: string;
     eventId?: string;
     turnId?: string;
+    /** Identity of the spoken turn, preserved across a reconnect and across an
+     * app restart. A new provider session gets a new `sessionId`/`itemId`, so
+     * this is the only stable handle on "the turn that was already running". */
+    voiceTurnId?: string;
+    /** Digest of tool name + canonical arguments. Together with `voiceTurnId`
+     * it identifies one host-side execution independently of the provider, so
+     * a reconnect that reissues the same operation under a fresh item id
+     * cannot execute it twice. */
+    callKey?: string;
     kind: 'input_transcript' | 'output_transcript' | 'tool_call' | 'tool_result';
   };
 }

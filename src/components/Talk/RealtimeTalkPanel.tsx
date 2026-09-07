@@ -82,7 +82,9 @@ export function RealtimeTalkPanel({
           <p className="mt-1 min-h-6 whitespace-pre-wrap text-sm">{session.outputTranscript || <span className="text-faint">Nothing yet.</span>}</p>
         </div>
         {session.awaitingApproval && (
-          <p className="rounded-md border border-warning/40 bg-warning/10 p-3 text-xs">A normal Little Monkey permission request is waiting for your decision.</p>
+          <p className="rounded-md border border-warning/40 bg-warning/10 p-3 text-xs">
+            Little Monkey is running a tool through its normal boundary. If it needs a decision, the usual permission prompt appears.
+          </p>
         )}
         {session.error && (
           <div role="alert" className="rounded-md border border-danger/40 bg-danger/10 p-3 text-xs">

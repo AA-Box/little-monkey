@@ -408,6 +408,28 @@ pub fn realtime_voice_metrics_clear(
     state.persist_metrics(&[])
 }
 
+/// Acceptance-only product seam used by `scripts/realtime-live-acceptance.mjs`.
+/// It is inert unless the runner both sets the flag and names a report path, so
+/// an ordinary build cannot be made to write one. The report holds step
+/// outcomes and bounded timings only; the app then exits so the gate cannot
+/// pass on a webview that never finished.
+#[tauri::command]
+pub fn realtime_voice_acceptance_report(
+    app: tauri::AppHandle,
+    report: serde_json::Value,
+) -> Result<(), String> {
+    if std::env::var("LITTLE_MONKEY_REALTIME_ACCEPTANCE").as_deref() != Ok("1") {
+        return Err("realtime voice acceptance is disabled".to_string());
+    }
+    let path = std::env::var("LITTLE_MONKEY_REALTIME_ACCEPTANCE_REPORT")
+        .map_err(|_| "LITTLE_MONKEY_REALTIME_ACCEPTANCE_REPORT is not configured".to_string())?;
+    let bytes = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
+    crate::m4_runtime::atomic_write_private(Path::new(&path), &bytes, true)
+        .map_err(|error| format!("could not write realtime acceptance evidence: {error}"))?;
+    app.exit(0);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

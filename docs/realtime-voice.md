@@ -50,6 +50,13 @@ position. Speech-start also pauses the local audio element immediately. Manual
 turns clear the input buffer before capture and commit it before
 `response.create`.
 
+Because the spoken audio travels on the media track rather than the data
+channel, "the model started speaking" is anchored on the first output event the
+WebRTC transport actually delivers — an output-audio delta if one arrives, and
+otherwise the first output transcript delta. First-audio latency, the underrun
+counter, and the barge-in guards all hang off that single anchor rather than off
+a WebSocket-only event.
+
 ## Durable transcript and context
 
 Final input and output transcripts enter the same saved chat session as typed
@@ -75,9 +82,46 @@ policy, MCP/extension routing, hooks, cancellation, and error formatting.
 
 The provider receives exactly one function result for an allowed call, denied
 approval, malformed arguments, unavailable tool, cancellation, or runtime
-error. Completed provider item ids are persisted, so the tool is not executed a
-second time after reconnect. Realtime voice does not offer nested-agent or
-skill-invocation tools because it is already the active agent loop.
+error.
+
+A function result on its own does not make the model speak: after every
+`function_call_output` the client must send a fresh `response.create`. That ask
+is driven by a per-response ledger rather than by a "tools still running"
+counter, because a fast tool can settle before `response.done` is processed.
+The ledger records which function calls a response asked for and which are
+answered, and answering one settles as `continue`, `wait`, or `closed` — so the
+continuation is sent exactly once, by whichever of `response.done` and the last
+tool result arrives second, and a response that will never speak again still
+closes its durable turn out. A response the provider reports as `cancelled` or
+`failed`, and any response abandoned by a barge-in, is never continued, so a
+late tool result cannot resurrect an interrupted answer. With provider VAD the
+model can open a response of its own while a tool is still running; the
+provider refuses a second concurrent response, so a continuation asked for
+during one is held until that response finishes.
+
+Each executed call is persisted against two identities. The provider item id
+makes a replayed provider event harmless. A host-side identity — the spoken
+turn plus a digest of the tool name and its canonical arguments — makes a
+*reconnect* harmless: the replacement session is a different provider
+conversation with different item ids, so item ids alone cannot tell that the
+model is asking again for something the host already did. The turn identity
+survives the reconnect, and the stored result is returned instead of executing.
+That identity is scoped to a *different* provider session on purpose: inside
+one session the model may legitimately call the same tool with the same
+arguments twice — read a file it just wrote, re-run a check — and only the item
+id may deduplicate there.
+
+A call dispatched by an earlier session of the turn whose outcome was never
+recorded is refused with an explanatory result rather than reissued, for every
+tool rather than only the ones a read-only marking calls dangerous: the
+frontend has no per-tool idempotency contract complete enough to bet a side
+effect on. The operator clears that refusal by asking again, which starts a
+fresh turn and runs normally. A reconnect is not blocked merely because a tool
+is executing — that is the window this identity exists for — only while a
+permission prompt is actually waiting for a decision.
+
+Realtime voice does not offer nested-agent or skill-invocation tools because it
+is already the active agent loop.
 
 ## Lifecycle, privacy, and observability
 
@@ -102,16 +146,41 @@ not route through, configure, or fall back to this desktop WebRTC engine.
 
 ## Verification
 
-Unit tests cover state transitions, duplicate events, interruption, errors,
-reconnect state, OpenAI event translation, SDP broker shape, full resource
-teardown, and allowed/refused/error/duplicate tool results. Rust tests cover
-the fixed-provider validation and session payload. A real-provider smoke test
-is present but opt-in because it requires a saved OpenAI key, a desktop-hosted
-test runner, network access, and microphone permission:
+Provider-independent tests cover the state machine and the response ledger
+(server and manual VAD, interruption during speech and during tool execution,
+response cancellation and failure, stale and duplicate provider events, failed
+reconnect, credential rejection and retry, device removal, microphone
+revocation), OpenAI event translation, response pacing, the SDP broker shape,
+full resource teardown, and the tool boundary across a reconnect: a reissued
+operation under a new provider session and item id is not executed twice, while
+an ordinary repeat inside one session still runs. Two of those tests are named
+for the defects they pin — the tool result that landed before `response.done`,
+and the reconnect that executed a tool twice — and both fail against the code
+that had them. Rust tests cover the fixed-provider validation and the session
+payload.
 
-```text
-LITTLE_MONKEY_REALTIME_INTEGRATION=1
+The real-provider acceptance runs the app itself, because a real microphone,
+real WebRTC, the native keychain broker, and the ordinary tool executor only
+exist together in the desktop webview:
+
+```bash
+pnpm test:realtime:live --path README.md
 ```
+
+It needs an OpenAI key saved through Settings, a workspace open on that file,
+network access, and microphone permission. The app starts with the acceptance
+harness enabled, prints `Speak now`, and the operator asks it once to read the
+file. The harness drives the same response ledger and the same tool bridge the
+product uses and reports ten steps — provider configured at the fixed egress
+origin, session connected, microphone audio reached the provider, transcript
+persisted, tool call bridged to the normal executor, host result returned,
+spoken follow-up after that result, barge-in, durable conversation rows, clean
+disconnect. The native side writes the evidence and exits, so the run cannot
+pass on a webview that stalled. The report carries step outcomes and bounded
+timings only: no transcript, audio, file content, or credential. The same
+harness is exercised in CI against a scripted provider, including the case
+where the provider never speaks after a tool result — the harness fails that
+run rather than hanging.
 
 For manual acceptance, select **Settings → Talk → Realtime WebRTC**, confirm
 the provider status, choose devices, accept the privacy warning, start Talk,

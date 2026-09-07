@@ -8,6 +8,7 @@ import { OpenAiRealtimeVoiceProvider } from '../../lib/openAiRealtimeVoice';
 import {
   RealtimeVoiceController,
   boundedRealtimeContext,
+  type RealtimeToolSettlement,
   type RealtimeVoiceEvent,
   type RealtimeVoiceSession,
   type RealtimeVoiceState,
@@ -102,8 +103,18 @@ export function useRealtimeVoiceSession(
   const turnIdRef = useRef<string | null>(null);
   const outputByItemRef = useRef(new Map<string, string>());
   const reconnectAttemptedRef = useRef(false);
-  const pendingToolsRef = useRef(0);
+  /** Identity of the spoken turn in progress. It deliberately survives a
+   * reconnect: the replacement provider session has new item ids, so this is
+   * what stops an already-executed tool from running a second time. */
+  const voiceTurnIdRef = useRef<string | null>(null);
   const toolTailRef = useRef<Promise<void>>(Promise.resolve());
+  /** Cancels a tool still running when the operator ends Talk, so the durable
+   * run is not cancelled out from under work that keeps going. */
+  const toolAbortRef = useRef<AbortController | null>(null);
+  /** True while no spoken turn is waiting to be finalized. Both the ordinary
+   * `response.done` path and the tool tail can be the last thing to happen in
+   * a turn, and the durable run must be closed by exactly one of them. */
+  const turnFinalizedRef = useRef(true);
   const lastOutputTextRef = useRef('');
   const startingRef = useRef(false);
   const metricRecordedRef = useRef(false);
@@ -167,6 +178,43 @@ export function useRealtimeVoiceSession(
     recorderRef.current = await promise;
   }, [chatSessionId, voice.realtimeModel]);
 
+  /** Closes out the spoken turn: ends its checkpoint, completes its durable
+   * run, and releases the turn identity so a later identical tool call runs
+   * normally. `awaitTools` is false when the caller is itself inside the tool
+   * tail, which cannot await its own chain. */
+  const finalizeTurn = useCallback((
+    recorderPromise: Promise<DurableRunRecorder | null> | null,
+    checkpointPromise: Promise<string | null> | null,
+    awaitTools = true,
+  ) => {
+    if (turnFinalizedRef.current) return;
+    turnFinalizedRef.current = true;
+    const voiceTurnId = voiceTurnIdRef.current;
+    const toolTail = awaitTools ? toolTailRef.current : null;
+    void (async () => {
+      // A cancelled response can finish while a tool is still running. The
+      // durable run must still record that result before it is closed.
+      await toolTail?.catch(() => undefined);
+      const recorder = recorderRef.current ?? await recorderPromise;
+      const checkpointId = await checkpointPromise;
+      if (checkpointId) {
+        const summary = await invoke<{ id: string; label?: string }>('checkpoint_end', { id: checkpointId }).catch(() => null);
+        if (summary) recorder?.recordCheckpoint(summary.id, summary.label ?? 'Realtime voice turn');
+      }
+      await recorder?.complete(lastOutputTextRef.current || null);
+      // Compared against the turn identity rather than the recorder promise:
+      // a turn created lazily from a tool call has no recorder, and `null ===
+      // null` would let it clear the next turn's bookkeeping.
+      if (voiceTurnIdRef.current === voiceTurnId) {
+        recorderRef.current = null;
+        recorderPromiseRef.current = null;
+        checkpointPromiseRef.current = null;
+        turnIdRef.current = null;
+        voiceTurnIdRef.current = null;
+      }
+    })();
+  }, []);
+
   const handleEvent = useCallback((event: RealtimeVoiceEvent) => {
     if (!controller.consume(event)) return;
     setState(controller.state);
@@ -175,8 +223,13 @@ export function useRealtimeVoiceSession(
     if (event.type === 'input_transcript') {
       setInputTranscript(event.text);
       const anchorIndex = useSessionStore.getState().sessions.find((candidate) => candidate.id === chatSessionId)?.messages.length ?? 0;
-      if (appendRealtimeTranscript(chatSessionId, realtimeSessionId, event.itemId, event.eventId, 'user', event.text)) {
-        pendingToolsRef.current = 0;
+      // A finalized user transcript starts a new spoken turn, so it also
+      // starts a new host-side turn identity. Everything the turn executes is
+      // keyed to it, including after a reconnect.
+      const voiceTurnId = `vt_${crypto.randomUUID()}`;
+      if (appendRealtimeTranscript(chatSessionId, realtimeSessionId, event.itemId, event.eventId, 'user', event.text, voiceTurnId)) {
+        voiceTurnIdRef.current = voiceTurnId;
+        turnFinalizedRef.current = false;
         lastOutputTextRef.current = '';
         void startRecorder(event.itemId, event.text, realtimeSessionId, anchorIndex);
       }
@@ -198,19 +251,42 @@ export function useRealtimeVoiceSession(
       outputByItemRef.current.set(event.itemId, text);
       lastOutputTextRef.current = text;
       setOutputTranscript(text);
-      appendRealtimeTranscript(chatSessionId, realtimeSessionId, event.itemId, event.eventId, 'assistant', text);
+      appendRealtimeTranscript(
+        chatSessionId, realtimeSessionId, event.itemId, event.eventId, 'assistant', text,
+        voiceTurnIdRef.current ?? undefined,
+      );
       return;
     }
     if (event.type === 'tool_call') {
-      pendingToolsRef.current += 1;
+      // A tool can be requested before any transcript was finalized (a barge-in
+      // mid-turn, or a reconnect that resumes straight into a tool). The turn
+      // still needs an identity for dedupe, so create one lazily.
+      if (voiceTurnIdRef.current === null) {
+        voiceTurnIdRef.current = `vt_${crypto.randomUUID()}`;
+        turnFinalizedRef.current = false;
+      }
+      // Captured now, not read inside the continuation: `toolTailRef` serializes
+      // executions, so a tool queued behind a slow one can otherwise run after
+      // the next turn has replaced these refs and be recorded against it.
+      const voiceTurnId = voiceTurnIdRef.current;
+      const turnId = turnIdRef.current ?? undefined;
+      const recorderPromise = recorderPromiseRef.current;
+      const checkpointPromise = checkpointPromiseRef.current;
+      const signal = toolAbortRef.current?.signal;
       toolTailRef.current = toolTailRef.current.catch(() => undefined).then(async () => {
         const toolStartedAt = performance.now();
         const current = sessionRef.current;
+        let settlement: RealtimeToolSettlement = 'wait';
         try {
-          const recorder = recorderRef.current ?? await recorderPromiseRef.current;
-          const checkpointId = await checkpointPromiseRef.current;
+          const recorder = recorderRef.current ?? await recorderPromise;
+          const checkpointId = await checkpointPromise;
           const surface = surfaceRef.current;
-          if (!surface || !current) return;
+          if (!surface || !current) {
+            // Nothing can answer this call any more, but the ledger must not be
+            // left waiting on it or the turn would never finalize.
+            settlement = controller.settleToolCall(event.call.id) === 'wait' ? 'wait' : 'closed';
+            return;
+          }
           let result: string;
           try {
             result = await executeRealtimeToolCall(event.call, {
@@ -219,7 +295,9 @@ export function useRealtimeVoiceSession(
               surface,
               recorder,
               checkpointId,
-              turnId: turnIdRef.current ?? undefined,
+              turnId,
+              voiceTurnId,
+              signal,
               onAwaitingApproval: (waiting) => {
                 awaitingApprovalRef.current = waiting;
                 setAwaitingApproval(waiting);
@@ -230,41 +308,60 @@ export function useRealtimeVoiceSession(
           } catch (reason) {
             result = JSON.stringify({ error: reason instanceof Error ? reason.message : String(reason) });
           }
-          if (sessionRef.current === current) current.sendToolResult(event.call.id, result);
           controller.recordToolRoundTrip(performance.now() - toolStartedAt);
+          // The provider only speaks again when it is asked to. Whether this
+          // result settles before or after `response.done`, exactly one of the
+          // two paths asks — the ledger decides which, so a fast tool can
+          // never leave the answer unspoken. A send that throws (the data
+          // channel closed under us) must still settle the ledger, or the turn
+          // would wait on this call forever.
+          try {
+            if (sessionRef.current === current) current.sendToolResult(event.call.id, result);
+            settlement = controller.settleToolCall(event.call.id);
+            if (settlement === 'continue' && sessionRef.current === current) current.requestResponse();
+          } catch (reason) {
+            // The data channel closed under us. The ledger must still settle or
+            // the turn waits on this call forever, and the failure has to be
+            // visible rather than looking like a model that went quiet.
+            controller.settleToolCall(event.call.id);
+            settlement = 'closed';
+            const message = 'The realtime connection dropped before the tool result could be delivered.';
+            setError(message);
+            controller.consume({
+              type: 'error', eventId: `local:tool-delivery:${crypto.randomUUID()}`,
+              code: reason instanceof Error && reason.message.includes('data channel')
+                ? 'data_channel_closed'
+                : 'tool_result_undeliverable',
+              message,
+            });
+            setState(controller.state);
+            recordMetric();
+            void closeCurrent();
+          }
         } finally {
-          pendingToolsRef.current = Math.max(0, pendingToolsRef.current - 1);
           awaitingApprovalRef.current = false;
           setAwaitingApproval(false);
+          // Only a response that will never speak again ends the turn here.
+          // A `continue` means another response is on its way and finalizing
+          // now would clear the turn identity the reconnect protection needs.
+          if (settlement === 'closed' && !controller.hasOutstandingToolCalls()) {
+            finalizeTurn(recorderPromise, checkpointPromise, false);
+          }
         }
       });
       return;
     }
     if (event.type === 'response_done') {
-      if (pendingToolsRef.current > 0) {
+      const disposition = controller.responseDisposition(event.responseId);
+      if (disposition === 'continue') {
         const current = sessionRef.current;
-        void toolTailRef.current.then(() => {
-          if (sessionRef.current === current) current?.requestResponse();
-        });
+        current?.requestResponse();
         return;
       }
-      const recorderPromise = recorderPromiseRef.current;
-      const checkpointPromise = checkpointPromiseRef.current;
-      void (async () => {
-        const recorder = recorderRef.current ?? await recorderPromise;
-        const checkpointId = await checkpointPromise;
-        if (checkpointId) {
-          const summary = await invoke<{ id: string; label?: string }>('checkpoint_end', { id: checkpointId }).catch(() => null);
-          if (summary) recorder?.recordCheckpoint(summary.id, summary.label ?? 'Realtime voice turn');
-        }
-        await recorder?.complete(lastOutputTextRef.current || null);
-        if (recorderPromiseRef.current === recorderPromise) {
-          recorderRef.current = null;
-          recorderPromiseRef.current = null;
-          checkpointPromiseRef.current = null;
-          turnIdRef.current = null;
-        }
-      })();
+      // Its function calls are still running; the last one to settle asks for
+      // the spoken follow-up and the turn is finalized by that response.
+      if (disposition === 'await_tools') return;
+      finalizeTurn(recorderPromiseRef.current, checkpointPromiseRef.current);
       return;
     }
     if (event.type === 'error') {
@@ -275,12 +372,20 @@ export function useRealtimeVoiceSession(
       return;
     }
     if (event.type === 'connection_lost') {
-      void recorderRef.current?.fail(event.code, event.recoverable);
-      if (event.recoverable && !awaitingApprovalRef.current && !reconnectAttemptedRef.current) {
+      // Only a permission prompt the operator is actually looking at blocks the
+      // reconnect. A tool merely executing must not: a drop during a long tool
+      // is the exact window the durable call identity was built to survive, and
+      // treating it as unrecoverable throws the turn away instead.
+      const decisionPending = usePermissionStore.getState().pending !== null;
+      if (event.recoverable && !decisionPending && !reconnectAttemptedRef.current) {
+        // The durable run is not failed here: the same turn continues in the
+        // replacement session, and a terminal recorder would drop the tool and
+        // output events that reconnect is meant to preserve.
         reconnectAttemptedRef.current = true;
         setError('The realtime connection was lost. Reconnecting once to the same provider…');
         void closeCurrent().then(() => restartRef.current());
       } else {
+        void recorderRef.current?.fail(event.code, event.recoverable);
         const message = event.code === 'microphone_revoked'
           ? 'Microphone access ended. Check the selected device and system permission.'
           : 'The realtime connection was lost. Start again to retry the same provider.';
@@ -294,7 +399,7 @@ export function useRealtimeVoiceSession(
         recordMetric();
       }
     }
-  }, [chatSessionId, closeCurrent, controller, recordMetric, startRecorder]);
+  }, [chatSessionId, closeCurrent, controller, finalizeTurn, recordMetric, startRecorder]);
 
   const start = useCallback(async () => {
     if (startingRef.current || sessionRef.current) return;
@@ -310,6 +415,10 @@ export function useRealtimeVoiceSession(
     awaitingApprovalRef.current = false;
     setAwaitingApproval(false);
     lastOutputTextRef.current = '';
+    // A reconnect keeps the turn identity it already has. A cold start adopts
+    // the identity of a turn the durable transcript shows as unanswered, so a
+    // restart cannot re-run what a previous process already executed.
+    toolAbortRef.current ??= new AbortController();
     const realtimeSessionId = `rv_${crypto.randomUUID()}`;
     realtimeSessionIdRef.current = realtimeSessionId;
     try {
@@ -357,6 +466,10 @@ export function useRealtimeVoiceSession(
   useEffect(() => { restartRef.current = start; }, [start]);
 
   const stop = useCallback(async () => {
+    // Ending Talk cancels the tool too. Without this the durable run is
+    // cancelled while the work it describes keeps running to completion.
+    toolAbortRef.current?.abort();
+    toolAbortRef.current = null;
     await closeCurrent();
     const recorder = recorderRef.current ?? await recorderPromiseRef.current;
     const checkpointId = await checkpointPromiseRef.current;
@@ -366,6 +479,8 @@ export function useRealtimeVoiceSession(
     recorderPromiseRef.current = null;
     checkpointPromiseRef.current = null;
     turnIdRef.current = null;
+    voiceTurnIdRef.current = null;
+    turnFinalizedRef.current = true;
     awaitingApprovalRef.current = false;
     setAwaitingApproval(false);
     recordMetric();

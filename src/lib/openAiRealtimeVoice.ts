@@ -1,5 +1,6 @@
 import { realtimeVoiceClient } from './companionClient';
 import type {
+  RealtimeResponseStatus,
   RealtimeVoiceCapabilities,
   RealtimeVoiceEvent,
   RealtimeVoiceProvider,
@@ -62,7 +63,21 @@ function defaultEnvironment(): OpenAiRealtimeEnvironment {
 function eventId(raw: Record<string, unknown>): string {
   const id = raw.event_id;
   if (typeof id === 'string' && id) return id;
-  return `openai:${String(raw.type ?? 'unknown')}:${String(raw.item_id ?? raw.response_id ?? crypto.randomUUID())}`;
+  // `response.output_item.done` carries no `item_id`, so two parallel function
+  // calls in one response would otherwise share a fallback id and the second
+  // would be deduplicated away — never executed, never answered.
+  const item = typeof raw.item === 'object' && raw.item ? raw.item as Record<string, unknown> : {};
+  const discriminator = raw.item_id ?? item.id ?? item.call_id ?? raw.response_id ?? crypto.randomUUID();
+  return `openai:${String(raw.type ?? 'unknown')}:${String(discriminator)}`;
+}
+
+const RESPONSE_STATUSES: readonly RealtimeResponseStatus[] = ['completed', 'cancelled', 'incomplete', 'failed'];
+
+/** A response without a recognizable status is treated as completed, which is
+ * the only reading that still produces the spoken answer a tool result owes
+ * the operator. Cancellation and failure are the states that must be explicit. */
+function readResponseStatus(value: unknown): RealtimeResponseStatus {
+  return RESPONSE_STATUSES.find((status) => status === value) ?? 'completed';
 }
 
 function readError(raw: Record<string, unknown>): { code: string; message: string } {
@@ -105,6 +120,7 @@ export function normalizeOpenAiRealtimeEvent(raw: Record<string, unknown>): Real
       if (item.type !== 'function_call') return null;
       return {
         type: 'tool_call', eventId: id,
+        responseId: typeof raw.response_id === 'string' && raw.response_id ? raw.response_id : null,
         call: {
           id: String(item.call_id ?? item.id ?? id),
           itemId: String(item.id ?? id),
@@ -118,6 +134,7 @@ export function normalizeOpenAiRealtimeEvent(raw: Record<string, unknown>): Real
       const usage = typeof response.usage === 'object' && response.usage ? response.usage as Record<string, unknown> : null;
       return {
         type: 'response_done', eventId: id, responseId: String(response.id ?? id),
+        status: readResponseStatus(response.status),
         ...(usage ? { usage: {
           inputTokens: Number(usage.input_tokens ?? 0),
           outputTokens: Number(usage.output_tokens ?? 0),
@@ -143,6 +160,10 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
   private closed = false;
   private outputStarted = false;
   private responseActive = false;
+  /** A continuation asked for while the provider still had a response in
+   * flight. The provider rejects a second concurrent response, so the ask is
+   * held and sent when the active one finishes. */
+  private pendingResponseRequest = false;
 
   constructor(
     private readonly config: RealtimeVoiceSessionConfig,
@@ -167,8 +188,24 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
         this.outputStarted = false;
         void this.audio?.play().catch(() => undefined);
       }
-      if (data.type === 'response.done') this.responseActive = false;
-      if (data.type === 'response.output_audio.delta' && !this.outputStarted) {
+      if (data.type === 'response.done') {
+        this.responseActive = false;
+        // Left set, this makes the next manual turn report an interruption that
+        // never happened, which in turn marks a live response non-continuable
+        // and silently drops the answer a tool result was owed.
+        this.outputStarted = false;
+        this.flushPendingResponseRequest();
+      }
+      // Over WebRTC the spoken audio arrives on the media track, so a session
+      // may never see `response.output_audio.delta` on the data channel — that
+      // event belongs to the WebSocket transport. The transcript deltas are
+      // emitted for both transports and accompany the audio being generated,
+      // so whichever arrives first anchors "the model started speaking".
+      // Without this, first-audio latency and every barge-in guard would be
+      // dead code on the transport this adapter actually uses.
+      const speaking = data.type === 'response.output_audio.delta'
+        || data.type === 'response.output_audio_transcript.delta';
+      if (speaking && !this.outputStarted) {
         this.outputStarted = true;
         this.emit({ type: 'output_audio_started', eventId: `${eventId(data)}:first-audio` });
       }
@@ -316,6 +353,7 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
     this.send({ type: 'output_audio_buffer.clear' });
     this.responseActive = false;
     this.outputStarted = false;
+    this.pendingResponseRequest = false;
     this.audio?.pause();
     this.emit({ type: 'interrupted', eventId: `local:interrupt:${crypto.randomUUID()}` });
   }
@@ -334,6 +372,7 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
     if (interrupted) {
       this.responseActive = false;
       this.outputStarted = false;
+      this.pendingResponseRequest = false;
       this.audio?.pause();
       this.emit({ type: 'interrupted', eventId: `local:manual-interrupt:${crypto.randomUUID()}` });
     }
@@ -357,7 +396,25 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
   }
 
   requestResponse(): void {
+    // With semantic VAD the provider can open its own response while a host
+    // tool is still running, so a tool result can land mid-response. Asking
+    // then is an error the provider refuses outright and the spoken follow-up
+    // would be lost, so the ask waits for `response.done`.
+    if (this.responseActive) {
+      this.pendingResponseRequest = true;
+      return;
+    }
     this.send({ type: 'response.create' });
+  }
+
+  private flushPendingResponseRequest(): void {
+    if (!this.pendingResponseRequest || this.closed) return;
+    this.pendingResponseRequest = false;
+    try {
+      this.send({ type: 'response.create' });
+    } catch {
+      // The channel closed under us; the session-level teardown reports it.
+    }
   }
 
   async close(): Promise<void> {

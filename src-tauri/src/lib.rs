@@ -2080,6 +2080,7 @@ pub fn run() {
             realtime_voice::realtime_voice_metric_record,
             realtime_voice::realtime_voice_metrics,
             realtime_voice::realtime_voice_metrics_clear,
+            realtime_voice::realtime_voice_acceptance_report,
             dictation::dictation_capabilities,
             dictation::dictation_open_permission_settings,
             dictation::dictation_start,

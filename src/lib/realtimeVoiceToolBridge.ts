@@ -1,6 +1,6 @@
 import { toolsForMode, toolsForSettings } from './agentLoop';
 import { executableExtensionToolDefs, type ExtensionToolRegistry } from './executableExtensionTools';
-import type { ToolCall, ToolDef } from './llamaClient';
+import type { ChatMessage, ToolCall, ToolDef } from './llamaClient';
 import { mcpToolDefs, type McpToolRegistry } from './mcpTools';
 import type { RealtimeVoiceToolCall } from './realtimeVoice';
 import { executeToolCall } from './turnEngine';
@@ -51,6 +51,111 @@ function hasRealtimeItem(sessionId: string, itemId: string, kind: string): boole
   ) ?? false;
 }
 
+function canonicalArguments(raw: string): string {
+  // A call with no arguments arrives as '' or as '{}' depending on what the
+  // provider put in the item, and those must hash to the same operation.
+  if (raw.trim() === '') return '{}';
+  try {
+    const sort = (value: unknown): unknown => {
+      if (Array.isArray(value)) return value.map(sort);
+      if (value && typeof value === 'object') {
+        return Object.fromEntries(
+          Object.entries(value as Record<string, unknown>)
+            .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+            .map(([key, entry]) => [key, sort(entry)]),
+        );
+      }
+      return value;
+    };
+    return JSON.stringify(sort(JSON.parse(raw)));
+  } catch {
+    // Malformed arguments still identify one operation; the executor is the
+    // component that rejects them, and it must reject them exactly once.
+    return raw;
+  }
+}
+
+/** Host-side identity of one tool execution: the tool plus its arguments,
+ * independent of any provider session, response, item, or call id. Argument
+ * key order is normalized so a re-serialized reissue matches. */
+export async function realtimeCallKey(name: string, args: string): Promise<string> {
+  const identity = new TextEncoder().encode(`${name}\n${canonicalArguments(args)}`);
+  const digest = await crypto.subtle.digest('SHA-256', identity);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function realtimeMessages(sessionId: string) {
+  const session = useSessionStore.getState().sessions.find((candidate) => candidate.id === sessionId);
+  return session?.messages ?? [];
+}
+
+/** Whether a persisted row belongs to the same operation carried out earlier in
+ * this spoken turn by a *previous* provider conversation.
+ *
+ * The `sessionId` half is what keeps the reconnect protection from swallowing
+ * ordinary work: inside one provider conversation the model may legitimately
+ * call the same tool with the same arguments twice — read a file it just wrote,
+ * re-run a check — and only the provider item id may deduplicate there. A
+ * reconnect always brings a fresh `rv_` session id, which is exactly the case
+ * the host-side identity exists for. */
+function reissuedFromAnotherSession(
+  realtime: NonNullable<ChatMessage['realtime']>,
+  realtimeSessionId: string,
+  voiceTurnId: string | undefined,
+  callKey: string,
+): boolean {
+  return Boolean(voiceTurnId)
+    && realtime.voiceTurnId === voiceTurnId
+    && realtime.callKey === callKey
+    && realtime.sessionId !== realtimeSessionId;
+}
+
+/** A tool result already persisted for this operation, whether it was recorded
+ * against the same provider item or against the same host-side call key in an
+ * earlier provider session of the same spoken turn. */
+function persistedToolResult(
+  chatSessionId: string,
+  call: RealtimeVoiceToolCall,
+  options: RealtimeToolBridgeOptions,
+  callKey: string,
+): string | null {
+  for (const message of realtimeMessages(chatSessionId)) {
+    const realtime = message.realtime;
+    if (realtime?.kind !== 'tool_result') continue;
+    const sameProviderItem = realtime.itemId === call.itemId;
+    if (!sameProviderItem
+      && !reissuedFromAnotherSession(realtime, options.realtimeSessionId, options.voiceTurnId, callKey)) continue;
+    return typeof message.content === 'string' ? message.content : '{"error":"Duplicate tool call ignored."}';
+  }
+  return null;
+}
+
+/** True when an earlier provider session in this spoken turn dispatched this
+ * exact operation and no result was ever recorded for it — the connection
+ * dropped between dispatch and result, so whether it took effect is unknown.
+ *
+ * This fails closed for every tool rather than consulting a read-only/mutating
+ * classification. The frontend has no per-tool idempotency contract that is
+ * complete enough to bet a side effect on, and the cost of failing closed is
+ * one refusal the operator resolves by asking again — a fresh spoken turn gets
+ * a fresh identity and runs normally. */
+function startedWithUnknownOutcome(
+  chatSessionId: string,
+  call: RealtimeVoiceToolCall,
+  options: RealtimeToolBridgeOptions,
+  callKey: string,
+): boolean {
+  if (!options.voiceTurnId) return false;
+  const messages = realtimeMessages(chatSessionId);
+  const dispatched = messages.some((message) => message.realtime?.kind === 'tool_call'
+    && message.realtime.itemId !== call.itemId
+    && reissuedFromAnotherSession(message.realtime, options.realtimeSessionId, options.voiceTurnId, callKey));
+  if (!dispatched) return false;
+  return !messages.some((message) => message.realtime?.kind === 'tool_result'
+    && message.realtime.voiceTurnId === options.voiceTurnId
+    && message.realtime.callKey === callKey);
+}
+
 export function appendRealtimeTranscript(
   chatSessionId: string,
   realtimeSessionId: string,
@@ -58,6 +163,10 @@ export function appendRealtimeTranscript(
   eventId: string,
   role: 'user' | 'assistant',
   text: string,
+  /** Stamped so a finished spoken answer closes the turn for
+   * `recoverRealtimeVoiceTurnId`; without it a later session would treat the
+   * completed turn as still unresolved. */
+  voiceTurnId?: string,
 ): boolean {
   const clean = text.trim();
   const kind = role === 'user' ? 'input_transcript' : 'output_transcript';
@@ -65,7 +174,7 @@ export function appendRealtimeTranscript(
   useSessionStore.getState().addMessage(chatSessionId, {
     role,
     content: clean,
-    realtime: { sessionId: realtimeSessionId, itemId, eventId, kind },
+    realtime: { sessionId: realtimeSessionId, itemId, eventId, ...(voiceTurnId ? { voiceTurnId } : {}), kind },
   });
   return true;
 }
@@ -80,22 +189,31 @@ export interface RealtimeToolBridgeOptions {
   recorder?: DurableRunRecorder | null;
   /** Durable run/permission identity for the current spoken turn. */
   turnId?: string;
+  /** Identity of the spoken turn that survives a reconnect into a brand-new
+   * provider session. Without it, dedupe degrades to provider item ids only. */
+  voiceTurnId?: string;
   checkpointId?: string | null;
 }
 
-/** Executes one provider call through the exact normal tool boundary. The
- * transcript entries are written before/after execution and keyed by the
- * provider item id so reconnect replay is harmless. */
+/** Executes one provider call through the exact normal tool boundary.
+ *
+ * Every execution is persisted against two identities: the provider item id,
+ * which makes a replayed provider event harmless, and `voiceTurnId` + a digest
+ * of tool name and canonical arguments, which makes a *reconnect* harmless.
+ * The reconnected session is a different provider conversation with different
+ * item ids, so item ids alone cannot tell that the model is asking for an
+ * operation the host already performed. */
 export async function executeRealtimeToolCall(
   call: RealtimeVoiceToolCall,
   options: RealtimeToolBridgeOptions,
 ): Promise<string> {
-  if (hasRealtimeItem(options.chatSessionId, call.itemId, 'tool_result')) {
-    const session = useSessionStore.getState().sessions.find((candidate) => candidate.id === options.chatSessionId);
-    const existing = session?.messages.find((message) =>
-      message.realtime?.itemId === call.itemId && message.realtime.kind === 'tool_result',
-    );
-    return typeof existing?.content === 'string' ? existing.content : '{"error":"Duplicate tool call ignored."}';
+  const callKey = await realtimeCallKey(call.name, call.arguments);
+  const persisted = persistedToolResult(options.chatSessionId, call, options, callKey);
+  if (persisted !== null) return persisted;
+  if (startedWithUnknownOutcome(options.chatSessionId, call, options, callKey)) {
+    return JSON.stringify({
+      error: `${call.name} was already started in this voice turn and its outcome is unknown. It was not run a second time; ask again to retry it deliberately.`,
+    });
   }
   const turnId = options.turnId ?? `realtime:${options.realtimeSessionId}:${call.itemId}`;
   const toolCall: ToolCall = {
@@ -112,6 +230,8 @@ export async function executeRealtimeToolCall(
         sessionId: options.realtimeSessionId,
         itemId: call.itemId,
         turnId,
+        ...(options.voiceTurnId ? { voiceTurnId: options.voiceTurnId } : {}),
+        callKey,
         kind: 'tool_call',
       },
     });
@@ -165,6 +285,8 @@ export async function executeRealtimeToolCall(
         sessionId: options.realtimeSessionId,
         itemId: call.itemId,
         turnId,
+        ...(options.voiceTurnId ? { voiceTurnId: options.voiceTurnId } : {}),
+        callKey,
         kind: 'tool_result',
       },
     });
