@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import faulthandler
 import importlib.util
 import json
 import socket
@@ -19,6 +20,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SERVICE = HERE / "lily_managed.py"
 ROUTER = HERE / "runtime_router.py"
+
+
+def _stage(message: str) -> None:
+    print(f"managed-lily-test: {message}", flush=True)
 
 
 def _load(path: Path, name: str):
@@ -186,7 +191,7 @@ def test_full_managed_lily_then_cancel_then_capability_fallback() -> None:
                     request=json.loads(body)
                     assert request['model'] == 'Qwen3.6-35B-A3B'
                     if any(message.get('content') == 'block' for message in request.get('messages', [])):
-                        time.sleep(30)
+                        time.sleep(15)
                     payload=json.dumps({
                         'choices':[{'message':{'content':'lily-ok'}}],
                         'usage':{
@@ -256,7 +261,9 @@ def test_full_managed_lily_then_cancel_then_capability_fallback() -> None:
             text=True,
         )
         try:
+            _stage("waiting for managed parent")
             _wait(port, process)
+            _stage("verifying Lily inference translation and cache usage")
             lily = _post(
                 port,
                 {
@@ -270,9 +277,7 @@ def test_full_managed_lily_then_cancel_then_capability_fallback() -> None:
             assert "lily-ok" in lily
             assert '"cached_input_tokens":7' in lily
 
-            # This is the same cancellation signal the Rust controller produces:
-            # it drops the streaming HTTP response. Force an RST so the adapter's
-            # SSE keepalive observes it deterministically and must kill Lily.
+            _stage("starting cancellable Lily request")
             cancel_body = json.dumps(
                 {
                     "requestId": "cancel-me",
@@ -299,6 +304,7 @@ def test_full_managed_lily_then_cancel_then_capability_fallback() -> None:
                 chunk = cancelled.recv(4096)
                 assert chunk, "managed Lily stream closed before started"
                 observed += chunk
+            _stage("dropping downstream stream")
             cancelled.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
             cancelled.close()
 
@@ -312,9 +318,7 @@ def test_full_managed_lily_then_cancel_then_capability_fallback() -> None:
             else:
                 raise AssertionError("dropping the stream did not stop Lily compute")
 
-            # A queued/next request must not talk to the killed Lily process. It
-            # enters the existing managed MLX service and preserves the original
-            # tool request unchanged.
+            _stage("verifying lazy managed-MLX fallback")
             fallback_response = _post(
                 port,
                 {
@@ -327,6 +331,7 @@ def test_full_managed_lily_then_cancel_then_capability_fallback() -> None:
             assert "mlx-fallback" in fallback_response
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/health") as response:
                 assert json.load(response)["engine"] == "mlx"
+            _stage("full managed lifecycle passed")
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -338,10 +343,19 @@ def test_full_managed_lily_then_cancel_then_capability_fallback() -> None:
 
 
 def main() -> None:
-    test_router_model_gate()
-    test_request_capability_gate()
-    test_full_managed_lily_then_cancel_then_capability_fallback()
-    print("managed Lily contract checks passed")
+    # Never allow this contract gate to mask a lifecycle deadlock until the
+    # workflow timeout. If it stalls, dump every Python thread and exit hard so
+    # the failing location is visible in the job log.
+    faulthandler.dump_traceback_later(45, repeat=False, exit=True)
+    try:
+        _stage("router gate")
+        test_router_model_gate()
+        _stage("request capability gate")
+        test_request_capability_gate()
+        test_full_managed_lily_then_cancel_then_capability_fallback()
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+    print("managed Lily contract checks passed", flush=True)
 
 
 if __name__ == "__main__":
