@@ -7,6 +7,7 @@ import importlib.util
 import json
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -154,7 +155,7 @@ def test_request_capability_gate() -> None:
     assert not managed._lily_compatible({**base, "structuredOutputSchema": {"type": "object"}})
 
 
-def test_full_managed_lily_then_capability_fallback() -> None:
+def test_full_managed_lily_then_cancel_then_capability_fallback() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         fake_lily = root / "lily"
@@ -164,7 +165,7 @@ def test_full_managed_lily_then_capability_fallback() -> None:
 
         fake_source = _raw_http_helpers() + textwrap.dedent(
             r'''
-            import argparse, json
+            import argparse, json, time
             parser=argparse.ArgumentParser()
             parser.add_argument('--model'); parser.add_argument('--bind'); parser.add_argument('--max-seq')
             args=parser.parse_args()
@@ -178,6 +179,8 @@ def test_full_managed_lily_then_capability_fallback() -> None:
                 elif method == 'POST' and path == '/v1/chat/completions':
                     request=json.loads(body)
                     assert request['model'] == 'Qwen3.6-35B-A3B'
+                    if any(message.get('content') == 'block' for message in request.get('messages', [])):
+                        time.sleep(30)
                     payload=json.dumps({
                         'choices':[{'message':{'content':'lily-ok'}}],
                         'usage':{
@@ -261,6 +264,51 @@ def test_full_managed_lily_then_capability_fallback() -> None:
             assert "lily-ok" in lily
             assert '"cached_input_tokens":7' in lily
 
+            # This is the same cancellation signal the Rust controller produces:
+            # it drops the streaming HTTP response. Force an RST so the adapter's
+            # SSE keepalive observes it deterministically and must kill Lily.
+            cancel_body = json.dumps(
+                {
+                    "requestId": "cancel-me",
+                    "messages": [{"role": "user", "text": "block", "images": []}],
+                    "tools": [],
+                    "maxTokens": 8,
+                },
+                separators=(",", ":"),
+            ).encode()
+            cancelled = socket.create_connection(("127.0.0.1", port), timeout=2)
+            cancelled.settimeout(3)
+            cancelled.sendall(
+                (
+                    "POST /v1/generate HTTP/1.1\r\n"
+                    "Host: 127.0.0.1\r\n"
+                    "Content-Type: application/json\r\n"
+                    f"Content-Length: {len(cancel_body)}\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode()
+                + cancel_body
+            )
+            observed = b""
+            while b'"type":"started"' not in observed:
+                chunk = cancelled.recv(4096)
+                assert chunk, "managed Lily stream closed before started"
+                observed += chunk
+            cancelled.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            cancelled.close()
+
+            deadline = time.monotonic() + 6
+            while time.monotonic() < deadline:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.5) as response:
+                    engine = json.load(response)["engine"]
+                if engine == "mlx_pending":
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("dropping the stream did not stop Lily compute")
+
+            # A queued/next request must not talk to the killed Lily process. It
+            # enters the existing managed MLX service and preserves the original
+            # tool request unchanged.
             fallback_response = _post(
                 port,
                 {
@@ -286,7 +334,7 @@ def test_full_managed_lily_then_capability_fallback() -> None:
 def main() -> None:
     test_router_model_gate()
     test_request_capability_gate()
-    test_full_managed_lily_then_capability_fallback()
+    test_full_managed_lily_then_cancel_then_capability_fallback()
     print("managed Lily contract checks passed")
 
 
