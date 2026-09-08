@@ -2,7 +2,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   TalkSession,
-  wakePhraseMatch,
   type TalkLatencyMetric,
   type TalkPorts,
   type TalkRecording,
@@ -32,6 +31,8 @@ class Harness implements TalkPorts {
   nextBlobSize = 1_024;
   failTranscription = false;
   failSynthesis = false;
+  wakeArmed = false;
+  wakeArmCalls = 0;
 
   now() {
     return this.clock;
@@ -51,6 +52,15 @@ class Harness implements TalkPorts {
     };
     this.recordings.push(recording);
     return recording;
+  }
+
+  async armWakeWord() {
+    this.wakeArmed = true;
+    this.wakeArmCalls += 1;
+  }
+
+  async disarmWakeWord() {
+    this.wakeArmed = false;
   }
 
   async transcribe(recording: TalkRecording) {
@@ -145,13 +155,14 @@ describe('TalkSession — push to talk', () => {
     expect(harness.synthesized).toEqual(['The deploy finished.', 'Nothing is pending.']);
     expect(harness.played).toEqual(['The deploy finished.', 'Nothing is pending.']);
     expect(states).toEqual([
-      'idle',
+      'off',
       'starting',
-      'listening',
+      'armed',
+      'capturing_command',
       'transcribing',
       'thinking',
       'speaking',
-      'listening',
+      'armed',
     ]);
   });
 
@@ -163,7 +174,7 @@ describe('TalkSession — push to talk', () => {
     await session.press();
     await session.release();
     expect(harness.submitted).toHaveLength(0);
-    expect(session.snapshot().state).toBe('listening');
+    expect(session.snapshot().state).toBe('armed');
   });
 
   it('never submits a turn for an empty transcript', async () => {
@@ -290,7 +301,7 @@ describe('TalkSession — barge-in', () => {
     expect(states.slice(states.indexOf('speaking'))).toEqual([
       'speaking',
       'interrupted',
-      'listening',
+      'capturing_command',
       'transcribing',
       'thinking',
     ]);
@@ -377,39 +388,87 @@ describe('TalkSession — barge-in', () => {
   });
 });
 
-describe('TalkSession — wake phrase', () => {
-  it('drops everything that does not contain the phrase, without submitting it', async () => {
+describe('TalkSession — native wake word', () => {
+  it('does no recording or transcription while armed, then submits only after a native event', async () => {
     const harness = new Harness();
-    harness.transcripts = [
-      'the weather is nice today',
-      'hey little monkey what is the deploy status',
-    ];
+    harness.transcripts = ['what is the deploy status'];
     const session = new TalkSession(harness, {
       mode: 'continuous',
-      wakePhrase: 'hey little monkey',
+      wakeWordEnabled: true,
     });
     await session.start();
 
+    expect(session.snapshot().state).toBe('armed');
+    expect(harness.wakeArmed).toBe(true);
+    expect(harness.recording).toBe(false);
     speak(session, harness, 0.4, 400);
     speak(session, harness, 0.001, 1_000);
     await settle();
+    expect(harness.heard).toHaveLength(0);
     expect(harness.submitted).toHaveLength(0);
-    expect(session.snapshot().transcript).toBe('');
 
+    await session.onWakeDetected(8_000);
+    expect(harness.wakeArmed).toBe(false);
+    expect(harness.recording).toBe(true);
     speak(session, harness, 0.4, 400);
     speak(session, harness, 0.001, 1_000);
     await settle();
-    // Only what was said *after* the phrase becomes the turn.
     expect(harness.submitted.map((turn) => turn.text)).toEqual(['what is the deploy status']);
   });
 
-  it('matches the phrase through punctuation and casing', () => {
-    expect(wakePhraseMatch('Hey, Little Monkey! deploy please', 'hey little monkey')).toBe(
-      'deploy please',
-    );
-    expect(wakePhraseMatch('hey little monkeys are great', 'hey little monkey')).toBe('s are great');
-    expect(wakePhraseMatch('nothing here', 'hey little monkey')).toBeNull();
-    expect(wakePhraseMatch('anything', '')).toBeNull();
+  it('ignores stale and repeated native events', async () => {
+    const harness = new Harness();
+    const session = new TalkSession(harness, { mode: 'continuous', wakeWordEnabled: true });
+    await session.start();
+    await session.onWakeDetected(1_000);
+    await session.onWakeDetected(2_000);
+    expect(harness.recordings).toHaveLength(0);
+    expect(harness.recording).toBe(true);
+    expect(session.snapshot().state).toBe('capturing_command');
+  });
+
+  it('stops the native detector and microphone while armed', async () => {
+    const harness = new Harness();
+    const session = new TalkSession(harness, { mode: 'continuous', wakeWordEnabled: true });
+    await session.start();
+    expect(harness.wakeArmed).toBe(true);
+
+    await session.stop();
+
+    expect(session.snapshot().state).toBe('off');
+    expect(harness.wakeArmed).toBe(false);
+    expect(harness.recording).toBe(false);
+  });
+
+  it('rearms only after the durable turn and speech queue finish', async () => {
+    const harness = new Harness();
+    harness.transcripts = ['deploy status'];
+    const session = new TalkSession(harness, { mode: 'continuous', wakeWordEnabled: true });
+    await session.start();
+    await session.onWakeDetected(2_000);
+    speak(session, harness, 0.4, 400);
+    speak(session, harness, 0.001, 1_000);
+    await settle();
+    expect(session.snapshot().state).toBe('thinking');
+    expect(harness.wakeArmed).toBe(false);
+
+    session.onAssistantDelta('Complete.');
+    session.onTurnFinished();
+    await settle();
+    expect(session.snapshot().state).toBe('armed');
+    expect(harness.wakeArmed).toBe(true);
+    expect(harness.wakeArmCalls).toBe(2);
+  });
+
+  it('fails closed if the microphone disappears while armed', async () => {
+    const harness = new Harness();
+    const session = new TalkSession(harness, { mode: 'continuous', wakeWordEnabled: true });
+    await session.start();
+    session.microphoneRevoked();
+    await settle();
+    expect(session.snapshot().state).toBe('error');
+    expect(session.snapshot().error).toContain('revoked');
+    expect(harness.wakeArmed).toBe(false);
   });
 
   it('is inert in push-to-talk, where the press is the wake signal', async () => {
@@ -417,7 +476,7 @@ describe('TalkSession — wake phrase', () => {
     harness.transcripts = ['no phrase in this one'];
     const session = new TalkSession(harness, {
       mode: 'push_to_talk',
-      wakePhrase: 'hey little monkey',
+      wakeWordEnabled: true,
     });
     await session.start();
     await session.press();
@@ -508,7 +567,7 @@ describe('TalkSession — failures and telemetry', () => {
     expect(harness.recording).toBe(true);
     await session.stop();
     expect(harness.recording).toBe(false);
-    expect(session.snapshot().state).toBe('idle');
+    expect(session.snapshot().state).toBe('off');
   });
 });
 

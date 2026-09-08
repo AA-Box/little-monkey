@@ -21,7 +21,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { runAgentTurn, stopTurn } from '../../lib/agentLoop';
 import { blobToBase64, companionClient, type CaptureGrant } from '../../lib/companionClient';
 import { errorMessage } from '../../lib/errors';
-import { base64AudioBlob } from '../../lib/talkAudio';
+import {
+  BoundedPcmQueue,
+  PCM_AUDIO_WORKLET_SOURCE,
+  PcmRingBuffer,
+  StreamingLinearResampler,
+  base64AudioBlob,
+  pcm16WavBlob,
+  rmsOf,
+} from '../../lib/talkAudio';
 import { talkClient, type TalkStatus } from '../../lib/talkClient';
 import { createTalkPlayer } from '../../lib/talkPlayback';
 import {
@@ -35,8 +43,20 @@ import { useSessionStore } from '../../store/sessionStore';
 
 /** Long enough for a conversation, short enough that a forgotten tab expires. */
 const GRANT_LIFETIME_MS = 30 * 60_000;
-/** How often the level meter samples the microphone. Matches the VAD's frame. */
-const METER_INTERVAL_MS = 20;
+const KWS_SAMPLE_RATE = 16_000;
+const KWS_RING_SAMPLES = KWS_SAMPLE_RATE * 3;
+const KWS_PENDING_SAMPLES = KWS_SAMPLE_RATE / 5;
+
+function joinPcm(chunks: readonly Float32Array[]): Float32Array {
+  const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const output = new Float32Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return output;
+}
 
 /**
  * How the durable routes mark text they park in the answer's place.
@@ -125,13 +145,28 @@ export function useTalkSession(
 
   const sessionRef = useRef<TalkSession | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
   /** Held for as long as the microphone is open — see `startRecording`. */
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const meterRef = useRef<number | null>(null);
+  const workletRef = useRef<AudioWorkletNode | null>(null);
+  const workletUrlRef = useRef<string | null>(null);
+  const resamplerRef = useRef(new StreamingLinearResampler(KWS_SAMPLE_RATE));
+  const ringRef = useRef(new PcmRingBuffer(KWS_RING_SAMPLES));
+  const recordingPcmRef = useRef<Float32Array[] | null>(null);
+  const wakeSessionRef = useRef<{ sessionId: string; startSample: number } | null>(null);
+  const wakeQueueRef = useRef(new BoundedPcmQueue(KWS_PENDING_SAMPLES));
+  const wakePushBusyRef = useRef(false);
+  /**
+   * True while this session is listening *because of the setting* rather than
+   * because somebody pressed something.
+   *
+   * That distinction is the whole authority question. A press is the operator
+   * asking for a microphone, and revoking Always Listening does not retract a
+   * press. Always Listening is the operator asking for one they never have to
+   * press for — so when it goes away, the microphone it opened has to go with
+   * it, from whichever surface it was switched off on.
+   */
+  const autoListeningRef = useRef(false);
   const grantRef = useRef<CaptureGrant | null>(null);
   /**
    * The turn Talk is waiting on: the utterance id the durable ingress was given,
@@ -174,25 +209,78 @@ export function useTalkSession(
 
   /** Close the microphone and every node hanging off it. Safe to call twice. */
   const releaseDevices = useCallback(() => {
-    if (meterRef.current !== null) {
-      window.clearInterval(meterRef.current);
-      meterRef.current = null;
+    const wake = wakeSessionRef.current;
+    wakeSessionRef.current = null;
+    if (wake) {
+      void talkClient
+        .wakeWordStop(wake.sessionId, wakeQueueRef.current.droppedFrames)
+        .catch(() => undefined);
     }
-    recorderRef.current = null;
-    analyserRef.current = null;
+    recordingPcmRef.current = null;
+    workletRef.current?.port.close();
+    workletRef.current?.disconnect();
+    workletRef.current = null;
     sourceRef.current?.disconnect();
     sourceRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     void audioContextRef.current?.close().catch(() => undefined);
     audioContextRef.current = null;
+    resamplerRef.current.reset();
+    ringRef.current = new PcmRingBuffer(KWS_RING_SAMPLES);
+    wakeQueueRef.current = new BoundedPcmQueue(KWS_PENDING_SAMPLES);
+    wakePushBusyRef.current = false;
+    if (workletUrlRef.current) URL.revokeObjectURL(workletUrlRef.current);
+    workletUrlRef.current = null;
+    const activeGrant = grantRef.current;
+    grantRef.current = null;
+    setGrant(null);
+    if (activeGrant) void companionClient.revoke(activeGrant.grantId).catch(() => undefined);
   }, []);
 
   const ports = useMemo<TalkPorts>(() => {
-    const startRecording = async () => {
-      const grantForCapture = await ensureGrant();
-      void grantForCapture;
+    const pumpWakeQueue = async (): Promise<void> => {
+      if (wakePushBusyRef.current) return;
+      const wake = wakeSessionRef.current;
+      const activeGrant = grantRef.current;
+      const frame = wakeQueueRef.current.take();
+      if (!wake || !activeGrant || frame.length === 0) return;
+      wakePushBusyRef.current = true;
+      try {
+        const detection = await talkClient.wakeWordPush(
+          activeGrant.grantId,
+          wake.sessionId,
+          frame,
+        );
+        if (detection && wakeSessionRef.current?.sessionId === detection.sessionId) {
+          // Stop forwarding immediately and close the native generation before
+          // command capture. Clearing the ref first makes a rapid duplicate
+          // response inert; the explicit stop ensures native state does not
+          // remain accepting after that clear.
+          wakeSessionRef.current = null;
+          await talkClient
+            .wakeWordStop(detection.sessionId, wakeQueueRef.current.droppedFrames)
+            .catch(() => false);
+          const commandStart = wake.startSample + detection.keywordEndSample;
+          await sessionRef.current?.onWakeDetected(commandStart);
+        }
+      } catch (reason) {
+        // A stopped generation can still have one IPC response in flight. It
+        // is stale, not a session error.
+        if (wakeSessionRef.current?.sessionId === wake.sessionId) {
+          wakeSessionRef.current = null;
+          sessionRef.current?.wakeWordFailed(errorMessage(reason));
+        }
+      } finally {
+        wakePushBusyRef.current = false;
+        if (wakeSessionRef.current && wakeQueueRef.current.length > 0) void pumpWakeQueue();
+      }
+    };
+
+    const openPcmDevices = async () => {
       if (!streamRef.current) {
+        const grantForCapture = await ensureGrant();
+        void grantForCapture;
         const config = await companionClient.config();
         const deviceId = config.voice.inputDeviceId ?? undefined;
         streamRef.current = await navigator.mediaDevices.getUserMedia({
@@ -201,12 +289,14 @@ export function useTalkSession(
             : { echoCancellation: true, noiseSuppression: true },
           video: false,
         });
-        // The meter reads levels, never samples anybody else can see: the
-        // analyser's output is one number per frame and it goes straight into
-        // the detector.
+        for (const track of streamRef.current.getTracks()) {
+          track.addEventListener?.('ended', () => sessionRef.current?.microphoneRevoked(), {
+            once: true,
+          });
+        }
         const context = new AudioContext();
         // WebKit starts a context built outside a user gesture suspended, and a
-        // suspended analyser reads pure silence: the detector never hears an
+        // suspended worklet receives no samples: the detector never hears an
         // utterance end, so Talk sits on "Listening" forever and nothing is
         // ever transcribed. The Talk button *is* a gesture, but the awaits
         // above — the grant, the config read, `getUserMedia` — have spent it by
@@ -214,64 +304,82 @@ export function useTalkSession(
         // it fails `startRecording`, and the engine says so rather than
         // claiming to be listening with a dead meter.
         if (context.state === 'suspended') await context.resume();
-        const analyser = context.createAnalyser();
-        analyser.fftSize = 1024;
-        // The source node is held, not dropped on the floor. WebKit collects a
-        // `MediaStreamAudioSourceNode` nothing references, and the analyser it
-        // fed then reads pure silence forever — a flat meter, a detector that
-        // never hears an utterance start or end, and Talk stuck on "Listening"
-        // while the recorder happily records. Chromium keeps it alive on the
-        // graph, which is why this only ever showed up in the desktop webview.
+        if (!context.audioWorklet || typeof AudioWorkletNode === 'undefined') {
+          streamRef.current.getTracks().forEach((track) => track.stop());
+          streamRef.current = null;
+          await context.close();
+          throw new Error('This webview does not support the AudioWorklet PCM path required by Talk');
+        }
+        const workletUrl = URL.createObjectURL(
+          new Blob([PCM_AUDIO_WORKLET_SOURCE], { type: 'text/javascript' }),
+        );
+        workletUrlRef.current = workletUrl;
+        await context.audioWorklet.addModule(workletUrl);
+        const worklet = new AudioWorkletNode(context, 'little-monkey-pcm-capture', {
+          numberOfInputs: 1,
+          numberOfOutputs: 0,
+          channelCount: 1,
+        });
         const source = context.createMediaStreamSource(streamRef.current);
-        source.connect(analyser);
+        source.connect(worklet);
         sourceRef.current = source;
+        workletRef.current = worklet;
         audioContextRef.current = context;
-        analyserRef.current = analyser;
-        const buffer = new Float32Array(analyser.fftSize);
-        meterRef.current = window.setInterval(() => {
-          const active = analyserRef.current;
-          const talk = sessionRef.current;
-          if (!active || !talk) return;
-          active.getFloatTimeDomainData(buffer);
-          let squares = 0;
-          for (const sample of buffer) squares += sample * sample;
-          talk.observeLevel(Math.sqrt(squares / buffer.length));
-        }, METER_INTERVAL_MS);
+        worklet.port.onmessage = (event: MessageEvent<Float32Array | ArrayBuffer>) => {
+          const raw = event.data instanceof Float32Array ? event.data : new Float32Array(event.data);
+          const pcm = resamplerRef.current.process(raw, context.sampleRate);
+          if (pcm.length === 0) return;
+          ringRef.current.write(pcm);
+          recordingPcmRef.current?.push(pcm.slice());
+          sessionRef.current?.observeLevel(rmsOf(pcm));
+          if (wakeSessionRef.current) {
+            wakeQueueRef.current.enqueue(pcm);
+            void pumpWakeQueue();
+          }
+        };
       }
-      const preferred = ['audio/webm;codecs=opus', 'audio/webm'].find((type) =>
-        MediaRecorder.isTypeSupported(type),
-      );
-      const recorder = preferred
-        ? new MediaRecorder(streamRef.current, { mimeType: preferred })
-        : new MediaRecorder(streamRef.current);
-      chunksRef.current = [];
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) chunksRef.current.push(event.data);
-      };
-      recorderRef.current = recorder;
-      recorder.start(250);
     };
 
-    const stopRecording = () =>
-      new Promise<TalkRecording | null>((resolve) => {
-        const recorder = recorderRef.current;
-        if (!recorder || recorder.state === 'inactive') {
-          resolve(null);
-          return;
-        }
-        recorder.onstop = () => {
-          const mediaType = recorder.mimeType || 'audio/webm';
-          const blob = new Blob(chunksRef.current, { type: mediaType });
-          chunksRef.current = [];
-          recorderRef.current = null;
-          resolve(blob.size > 0 ? { blob, mediaType } : null);
-        };
-        recorder.stop();
-      });
+    const startRecording = async (options?: { afterSample?: number }) => {
+      await openPcmDevices();
+      const buffered = options?.afterSample === undefined
+        ? new Float32Array()
+        : ringRef.current.sliceFrom(options.afterSample);
+      recordingPcmRef.current = buffered.length > 0 ? [buffered] : [];
+    };
+
+    const stopRecording = async (): Promise<TalkRecording | null> => {
+      const chunks = recordingPcmRef.current;
+      recordingPcmRef.current = null;
+      if (!chunks) return null;
+      const pcm = joinPcm(chunks);
+      if (pcm.length === 0) return null;
+      const blob = pcm16WavBlob(pcm, KWS_SAMPLE_RATE);
+      return { blob, mediaType: blob.type };
+    };
 
     return {
       startRecording,
       stopRecording,
+      armWakeWord: async () => {
+        await openPcmDevices();
+        const active = await ensureGrant();
+        const started = await talkClient.wakeWordStart(active.grantId);
+        wakeQueueRef.current = new BoundedPcmQueue(KWS_PENDING_SAMPLES);
+        wakeSessionRef.current = {
+          sessionId: started.sessionId,
+          startSample: ringRef.current.totalWritten,
+        };
+        setStatus((current) => current ? { ...current, wakeWord: started.status } : current);
+      },
+      disarmWakeWord: async () => {
+        const wake = wakeSessionRef.current;
+        wakeSessionRef.current = null;
+        if (!wake) return;
+        await talkClient
+          .wakeWordStop(wake.sessionId, wakeQueueRef.current.droppedFrames)
+          .catch(() => false);
+      },
       now: () => Date.now(),
       transcribe: async (recording, jobId) => {
         const active = await ensureGrant();
@@ -354,9 +462,10 @@ export function useTalkSession(
             silenceMs: config.voice.vadSilenceMs,
             maxUtteranceMs: config.voice.vadMaxUtteranceMs,
           },
-          // Wake detection only ever arms when the operator turned it on, and
-          // the Rust side refuses the setting unless transcription is local.
-          wakePhrase: config.voice.wakePhraseEnabled ? config.voice.wakePhrase : null,
+          // Phrase compilation, runtime readiness and audio acceptance all live
+          // behind the native boundary. The engine owns only the transition
+          // from an authenticated wake event into ordinary command capture.
+          wakeWordEnabled: config.voice.wakePhraseEnabled,
         });
         sessionRef.current = engine;
         engine.subscribe(setSnapshot);
@@ -370,6 +479,7 @@ export function useTalkSession(
         // no earlier than this, and closes with the surface that opened it:
         // there is no listening behind the operator's back.
         const auto = autoStartMode ?? (config.voice.alwaysListening ? 'continuous' : null);
+        autoListeningRef.current = autoStartMode === null && config.voice.alwaysListening;
         if (auto) {
           setMode(auto);
           engine.setMode(auto);
@@ -387,6 +497,7 @@ export function useTalkSession(
       // would point the next session's watcher at an index in the last one's
       // transcript.
       activeTurnRef.current = null;
+      autoListeningRef.current = false;
       releaseDevices();
     };
     // `ports` is memoized on the session; `mode` is applied through `setMode`
@@ -455,6 +566,62 @@ export function useTalkSession(
     await sessionRef.current?.stop();
     releaseDevices();
   }, [releaseDevices]);
+
+  /**
+   * Turning Always Listening off closes the microphone it opened. Here, not in
+   * the switch.
+   *
+   * The setting is read once, when the engine is built, and the surface that
+   * read it can be open for hours — a Talk panel armed since breakfast is
+   * exactly the session an operator goes to Settings to turn off. Reacting in
+   * the Settings switch, or in the panel's own "Stop listening" button, only
+   * covers the surface that happens to hold the switch; every other route to
+   * the same save — the other panel, an imported configuration, a second
+   * window — left a live microphone behind. So the reaction lives in the hook
+   * that owns the devices, and every route to a saved configuration reaches it.
+   *
+   * `stop()` is the same one the Stop button calls: engine to `off`, native KWS
+   * generation closed, tracks stopped, worklet and context torn down, ring and
+   * wake queue replaced, grant revoked.
+   *
+   * Only the microphone the *setting* opened is closed — `autoListeningRef` —
+   * and only turning it off closes anything. Turning it *on* here would open a
+   * microphone from a background event, and the engine on screen was built
+   * without wake gating, so it would be an ungated one: that stays a decision
+   * the next mount makes, with the wake word compiled in.
+   */
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    const subscription = companionClient.onConfigChanged(() => {
+      if (cancelled || !autoListeningRef.current) return;
+      void companionClient
+        .config()
+        .then(async (config) => {
+          if (cancelled || !autoListeningRef.current || config.voice.alwaysListening) return;
+          autoListeningRef.current = false;
+          await stop();
+          // The Talk panel's "Always listening is on: the microphone is active"
+          // banner is drawn from `TalkStatus`, which was read when the surface
+          // opened. Leaving it stale would put a claim that the microphone is
+          // active directly above a microphone this just closed.
+          await talkClient.status().then(setStatus).catch(() => undefined);
+        })
+        .catch((reason) => {
+          // A configuration that cannot be read is not a reason to keep a
+          // microphone open on the strength of a stale copy of it.
+          if (cancelled) return;
+          autoListeningRef.current = false;
+          setSetupError(errorMessage(reason));
+          void stop();
+        });
+    });
+    return () => {
+      cancelled = true;
+      void subscription.then((unlisten) => unlisten()).catch(() => undefined);
+    };
+  }, [enabled, stop]);
+
   return {
     snapshot,
     status,

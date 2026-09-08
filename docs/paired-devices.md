@@ -257,6 +257,11 @@ world is not undone, and nothing claims it was. The audio that interrupted is
 kept and becomes the next turn, because it is the next question and nobody
 should have to say it twice.
 
+This paired-device path is not desktop Always Listening. The bundled native
+wake model runs only in the desktop Talk renderer/runtime boundary; a phone
+must remain foregrounded and uses the socket/VAD behavior described here. It
+does not gain background wake-word support from the desktop setting.
+
 **One conversation.** Talk speaks into the session the operator already has
 selected in the controller's own chat surface, rather than minting one of its
 own — so a spoken turn and a typed one are the same thread, and the message list

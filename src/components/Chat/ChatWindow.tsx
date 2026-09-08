@@ -295,24 +295,30 @@ export async function switchModelFromSlash(selector: string): Promise<string> {
 
 /** Talk's state, as the composer's status line shows it. */
 const TALK_STATE_TONE: Record<TalkState, string> = {
-  idle: "bg-muted",
+  off: "bg-muted",
   starting: "bg-accent animate-pulse",
-  listening: "bg-success animate-pulse",
+  armed: "bg-success animate-pulse",
+  wake_detected: "bg-success",
+  capturing_command: "bg-success animate-pulse",
   transcribing: "bg-accent animate-pulse",
   thinking: "bg-accent animate-pulse",
   speaking: "bg-accent",
   interrupted: "bg-warning",
+  rearming: "bg-accent animate-pulse",
   error: "bg-danger",
 };
 
 const TALK_STATE_LABEL_KEY: Record<TalkState, string> = {
-  idle: "ChatWindow.talkStateIdle",
+  off: "ChatWindow.talkStateIdle",
   starting: "ChatWindow.talkStateStarting",
-  listening: "ChatWindow.talkStateListening",
+  armed: "ChatWindow.talkStateListening",
+  wake_detected: "ChatWindow.talkStateListening",
+  capturing_command: "ChatWindow.talkStateListening",
   transcribing: "ChatWindow.talkStateTranscribing",
   thinking: "ChatWindow.talkStateThinking",
   speaking: "ChatWindow.talkStateSpeaking",
   interrupted: "ChatWindow.talkStateInterrupted",
+  rearming: "ChatWindow.talkStateStarting",
   error: "ChatWindow.talkStateError",
 };
 
@@ -374,7 +380,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   // so a chat nobody has spoken to opens no devices.
   const [talkActive, setTalkActive] = useState(false);
   const talk = useTalkSession(sessionId, { enabled: talkActive, autoStartMode: "continuous" });
-  const talkState: TalkState = talkActive ? talk.snapshot?.state ?? "starting" : "idle";
+  const talkState: TalkState = talkActive ? talk.snapshot?.state ?? "starting" : "off";
 
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   const [mentionEntries, setMentionEntries] = useState<MentionEntry[]>([]);
@@ -1630,7 +1636,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                 <span className={`h-2 w-2 shrink-0 rounded-full ${TALK_STATE_TONE[talkState]}`} aria-hidden />
                 <span role="status" aria-live="polite" className="shrink-0 text-muted">
                   {t(TALK_STATE_LABEL_KEY[talkState])}
-                  {talk.snapshot?.awaitingWakePhrase && talkState === "listening"
+                  {talk.snapshot?.awaitingWakeWord && talkState === "armed"
                     ? ` — ${t("ChatWindow.talkAwaitingWakePhrase")}`
                     : ""}
                 </span>

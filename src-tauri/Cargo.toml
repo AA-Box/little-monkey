@@ -128,6 +128,19 @@ tokio-util = "0.7"
 # Built-in, zero-configuration local speech transcription. The pinned fork
 # carries the Windows ARM64 MSVC/Clang fixes missing from archived upstream.
 whisper-rs = { git = "https://github.com/screenpipe/whisper-rs", rev = "97e40705033724dee601e89f3bd701af8096c846", default-features = false }
+# Streaming, open-vocabulary keyword spotting. Exact pins matter here: the
+# crate statically links the matching native sherpa-onnx/ONNX Runtime archive
+# for each supported desktop target at build time, so an unbounded semver range
+# would silently change executable code in release artifacts.
+sherpa-onnx = "=1.13.3"
+# Keep the native wrapper from floating independently through sherpa-onnx's
+# compatible range; 1.13.4+ bundles the Apple SME regression documented in
+# k2-fsa/sherpa-onnx#3791.
+sherpa-onnx-sys = "=1.13.3"
+# The KWS model uses SentencePiece BPE. This implementation is pure Rust and is
+# used only to compile the operator's phrase into sherpa's keyword-token format;
+# it adds no Python or tokenizer sidecar to the listening path.
+sentencepiece-rs = "=0.2.2"
 # Symphonia demuxes/decodes WAV/MP3/AAC/FLAC/etc. WebM/Opus is demuxed by
 # Symphonia and decoded by opus-decoder because Symphonia intentionally has
 # no Opus decoder. Both are pure Rust and ship inside the application.
@@ -415,3 +428,8 @@ matrix-sdk-test = "0.18"
 # Tiny hostile/limit fixtures compile from WAT during host tests; contributors
 # do not need a guest-language toolchain for the sandbox test suite.
 wat = "1"
+
+[patch.crates-io]
+# Keep upstream's API/FFI intact while authenticating every native runtime
+# archive before extraction. See vendor/sherpa-onnx-sys/build.rs.
+sherpa-onnx-sys = { path = "../vendor/sherpa-onnx-sys" }
