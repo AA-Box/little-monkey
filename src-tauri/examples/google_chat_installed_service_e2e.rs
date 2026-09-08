@@ -39,9 +39,11 @@ fn target_dir() -> PathBuf {
 }
 
 fn cli() -> PathBuf {
-    target_dir()
-        .join("debug")
-        .join(if cfg!(windows) { "monkey-cli.exe" } else { "monkey-cli" })
+    target_dir().join("debug").join(if cfg!(windows) {
+        "monkey-cli.exe"
+    } else {
+        "monkey-cli"
+    })
 }
 
 fn output_text(output: &Output) -> String {
@@ -91,10 +93,16 @@ fn run_cli_with_stdin(
         .len()
         == 0
     {
-        return Err(format!("{} is the zero-byte Tauri bootstrap placeholder", binary.display()));
+        return Err(format!(
+            "{} is the zero-byte Tauri bootstrap placeholder",
+            binary.display()
+        ));
     }
     let mut command = Command::new(binary);
-    command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if stdin.is_some() {
         command.stdin(Stdio::piped());
     }
@@ -159,11 +167,7 @@ fn create_profile() -> Result<String, String> {
         .ok_or_else(|| format!("profile JSON had no id: {payload}"))
 }
 
-fn add_account(
-    profile: &str,
-    project_number: &str,
-    bot_user_name: &str,
-) -> Result<String, String> {
+fn add_account(profile: &str, project_number: &str, bot_user_name: &str) -> Result<String, String> {
     let label = format!("google-chat-e2e-{}", unique());
     let config = serde_json::json!({
         "project_number": project_number,
@@ -173,8 +177,13 @@ fn add_account(
     let output = require_cli(
         Some(profile),
         &[
-            "channels", "add", "google_chat", &label,
-            "--config", &config, "--json",
+            "channels",
+            "add",
+            "google_chat",
+            &label,
+            "--config",
+            &config,
+            "--json",
         ],
     )?;
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
@@ -204,7 +213,9 @@ impl ModelFixture {
         std::thread::spawn(move || {
             for incoming in listener.incoming() {
                 let Ok(mut stream) = incoming else { break };
-                let Some((head, body)) = read_http_request(&mut stream) else { continue };
+                let Some((head, body)) = read_http_request(&mut stream) else {
+                    continue;
+                };
                 log.lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .push(format!("{head}\n{body}"));
@@ -245,7 +256,10 @@ impl ModelFixture {
                 let _ = stream.flush();
             }
         });
-        Ok(Self { base: format!("http://127.0.0.1:{port}"), seen })
+        Ok(Self {
+            base: format!("http://127.0.0.1:{port}"),
+            seen,
+        })
     }
 
     fn requests(&self) -> Vec<String> {
@@ -257,7 +271,9 @@ impl ModelFixture {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
-    stream.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .ok()?;
     let mut received = Vec::new();
     let mut scratch = [0u8; 8192];
     let mut header_end = None;
@@ -280,7 +296,9 @@ fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
                                     .then(|| value.trim().parse::<usize>().ok())?
                             })
                             .unwrap_or(0);
-                        chunked = headers.to_ascii_lowercase().contains("transfer-encoding: chunked");
+                        chunked = headers
+                            .to_ascii_lowercase()
+                            .contains("transfer-encoding: chunked");
                     }
                 }
                 if let Some(start) = header_end {
@@ -291,7 +309,9 @@ fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
                     } else {
                         true
                     };
-                    if complete { break; }
+                    if complete {
+                        break;
+                    }
                 }
             }
             Err(_) => break,
@@ -305,7 +325,9 @@ fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn json_response(body: &str) -> String {
@@ -317,7 +339,9 @@ fn json_response(body: &str) -> String {
 
 fn sse_response(frames: &[serde_json::Value]) -> String {
     let mut body = String::new();
-    for frame in frames { body.push_str(&format!("data: {frame}\n\n")); }
+    for frame in frames {
+        body.push_str(&format!("data: {frame}\n\n"));
+    }
     body.push_str("data: [DONE]\n\n");
     format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -390,7 +414,9 @@ fn find_inbound(
     sender_name: &str,
     marker: &str,
 ) -> Result<Option<InboundProof>, String> {
-    if !db.is_file() { return Ok(None); }
+    if !db.is_file() {
+        return Ok(None);
+    }
     let connection = read_only(db)?;
     let like = format!("%{marker}%");
     connection
@@ -423,7 +449,9 @@ fn find_outbound(
     space_name: &str,
     expected_reply: &str,
 ) -> Result<Option<String>, String> {
-    if !db.is_file() { return Ok(None); }
+    if !db.is_file() {
+        return Ok(None);
+    }
     let connection = read_only(db)?;
     let like = format!("%{expected_reply}%");
     connection
@@ -451,10 +479,21 @@ fn wait_for_service(profile: &str) -> Result<u64, String> {
             if output.status.success() {
                 if let Ok(status) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
                     last = status.to_string();
-                    let running = status.get("service_running").and_then(serde_json::Value::as_bool).unwrap_or(false);
-                    let heartbeat = status.get("heartbeat_fresh").and_then(serde_json::Value::as_bool).unwrap_or(false);
-                    let pid = status.get("pid").and_then(serde_json::Value::as_u64).unwrap_or_default();
-                    if running && heartbeat && pid != u64::from(std::process::id()) { return Ok(pid); }
+                    let running = status
+                        .get("service_running")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let heartbeat = status
+                        .get("heartbeat_fresh")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let pid = status
+                        .get("pid")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default();
+                    if running && heartbeat && pid != u64::from(std::process::id()) {
+                        return Ok(pid);
+                    }
                 }
             }
         }
@@ -473,7 +512,9 @@ async fn observe_chat_message(
     expected_reply: &str,
 ) -> Result<(), String> {
     if !message_name.starts_with("spaces/") || !message_name.contains("/messages/") {
-        return Err(format!("Google Chat did not return a message resource name: {message_name:?}"));
+        return Err(format!(
+            "Google Chat did not return a message resource name: {message_name:?}"
+        ));
     }
     let response = client
         .get(format!("{CHAT_API_BASE}/v1/{message_name}"))
@@ -487,7 +528,9 @@ async fn observe_chat_message(
         .await
         .map_err(|error| format!("Google Chat observer response was not JSON: {error}"))?;
     if !status.is_success() {
-        return Err(format!("Google Chat observer GET failed ({status}): {payload}"));
+        return Err(format!(
+            "Google Chat observer GET failed ({status}): {payload}"
+        ));
     }
     let text = payload
         .get("text")
@@ -564,7 +607,9 @@ impl LiveConfig {
             .unwrap_or_else(|_| "38445".to_string())
             .parse::<u16>()
             .map_err(|_| "GCHAT_E2E_WEBHOOK_PORT must be a non-zero u16".to_string())?;
-        if webhook_port == 0 { return Err("GCHAT_E2E_WEBHOOK_PORT must be non-zero".to_string()); }
+        if webhook_port == 0 {
+            return Err("GCHAT_E2E_WEBHOOK_PORT must be non-zero".to_string());
+        }
         Ok(Self {
             project_number: required("GCHAT_E2E_PROJECT_NUMBER")?,
             bot_user_name: required("GCHAT_E2E_BOT_USER_NAME")?,

@@ -613,7 +613,9 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
         let path = path.trim().to_string();
         if !path.is_empty() {
             let certificates = rustls::pki_types::CertificateDer::pem_file_iter(&path)
-                .unwrap_or_else(|error| panic!("EMAIL_E2E_CA_FILE {path} could not be read: {error}"));
+                .unwrap_or_else(|error| {
+                    panic!("EMAIL_E2E_CA_FILE {path} could not be read: {error}")
+                });
             let mut added = 0usize;
             for certificate in certificates {
                 let certificate = certificate
@@ -623,7 +625,10 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
                     .unwrap_or_else(|error| panic!("EMAIL_E2E_CA_FILE {path}: {error}"));
                 added += 1;
             }
-            assert!(added > 0, "EMAIL_E2E_CA_FILE {path} contains no certificate");
+            assert!(
+                added > 0,
+                "EMAIL_E2E_CA_FILE {path} contains no certificate"
+            );
         }
     }
     // Both `ring` and `aws-lc-rs` are compiled in, so rustls refuses to pick

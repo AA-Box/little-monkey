@@ -251,7 +251,7 @@ pub struct CanonicalUsage {
     /// a figure derived here.
     ///
     /// `None` is the whole point of the `Option`: a runtime that never reports
-    /// prompt-cache reuse (Ollama and MLX today) must not be recorded as
+    /// prompt-cache reuse (Ollama today) must not be recorded as
     /// having reused nothing, because "unknown" and "zero" would then average
     /// together into a hit rate that is neither.
     #[serde(default)]

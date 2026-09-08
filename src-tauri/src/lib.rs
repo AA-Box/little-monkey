@@ -141,7 +141,9 @@ pub mod runtime_telemetry;
 // every grant and cancel every child/network task before Tauri exits.
 pub mod dictation;
 pub mod local_whisper;
+pub mod local_wake_word;
 pub mod m7_companion;
+pub mod realtime_voice;
 // Global Command Palette (ROADMAP.md, Phase 1): owns only the OS-level
 // shortcut's persisted configuration and "bring the palette to the front"
 // action. The palette itself renders inside the main window and dispatches
@@ -945,6 +947,8 @@ pub fn run() {
         .expect("failed to initialize the isolated browser worker");
     let m7_state = m7_companion::M7CompanionState::production(&app_data_dir)
         .expect("failed to initialize the desktop companion");
+    let realtime_voice_state = realtime_voice::RealtimeVoiceState::production(&app_data_dir)
+        .expect("failed to initialize realtime voice metrics");
     let configured_companion_shortcut = m7_state
         .overlay_shortcut()
         .expect("failed to load the configured companion shortcut");
@@ -1046,6 +1050,7 @@ pub fn run() {
         .manage(browser_state)
         .manage(browser_pane::BrowserPaneState::default())
         .manage(m7_state)
+        .manage(realtime_voice_state)
         .manage(dictation::DictationRuntime::default())
         .manage(palette_state)
         .manage(desktop_control_state)
@@ -1129,7 +1134,9 @@ pub fn run() {
             {
                 // The installed app carries the model as a bundled resource;
                 // prepare() then has nothing to download at all.
-                local_whisper::set_resource_dir(app.path().resource_dir().ok().as_deref());
+                let speech_resource_dir = app.path().resource_dir().ok();
+                local_whisper::set_resource_dir(speech_resource_dir.as_deref());
+                local_wake_word::set_resource_dir(speech_resource_dir.as_deref());
                 let speech_data_dir = app_data_dir.clone();
                 tauri::async_runtime::spawn(async move {
                     // The configured tier, not always the bundled one: an
@@ -2018,6 +2025,11 @@ pub fn run() {
             m7_companion::m7_transcription_models,
             m7_companion::m7_transcription_model_install,
             m7_companion::m7_talk_status,
+            m7_companion::m7_wake_word_status,
+            m7_companion::m7_wake_word_start,
+            m7_companion::m7_wake_word_push,
+            m7_companion::m7_wake_word_stop,
+            m7_companion::m7_wake_word_report_false_trigger,
             m7_companion::m7_talk_metrics,
             m7_companion::m7_talk_metric_record,
             m7_companion::m7_talk_metrics_clear,
@@ -2070,6 +2082,13 @@ pub fn run() {
             m7_companion::m7_image_data_url,
             m7_companion::m7_image_insert_chat,
             m7_companion::m7_emergency_stop,
+            realtime_voice::realtime_voice_connect,
+            realtime_voice::realtime_voice_disconnect,
+            realtime_voice::realtime_voice_status,
+            realtime_voice::realtime_voice_metric_record,
+            realtime_voice::realtime_voice_metrics,
+            realtime_voice::realtime_voice_metrics_clear,
+            realtime_voice::realtime_voice_acceptance_report,
             dictation::dictation_capabilities,
             dictation::dictation_open_permission_settings,
             dictation::dictation_start,

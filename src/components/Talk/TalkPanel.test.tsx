@@ -76,6 +76,26 @@ function mock(status: Partial<TalkStatus> = {}, config: CompanionConfig = CONFIG
           backend: 'local_whisper',
           activeJobs: 0,
           activeMicrophoneGrants: 0,
+          wakeWord: {
+            backend: 'sherpa_onnx',
+            local: true,
+            runtimeVersion: '1.13.3',
+            modelId: 'test-model',
+            modelLicense: 'Apache-2.0',
+            available: true,
+            loaded: false,
+            acceptingAudio: false,
+            sampleRate: 16_000,
+            modelBytes: 1,
+            modelMemoryBytes: null,
+            idleCpuPercent: null,
+            averageInferenceMs: null,
+            averageDetectionLatencyMs: null,
+            detections: 0,
+            falseTriggerReports: 0,
+            droppedFrames: 0,
+            lastError: null,
+          },
           ...status,
         } satisfies TalkStatus);
       case 'm7_config_get':
@@ -85,6 +105,11 @@ function mock(status: Partial<TalkStatus> = {}, config: CompanionConfig = CONFIG
         return Promise.resolve(args?.config);
       case 'm7_talk_metric_record':
         return Promise.resolve({ metrics: [], interruptCount: 0, fallbackCount: 0 });
+      case 'realtime_voice_status':
+        return Promise.resolve({
+          providerId: 'openai', configured: true, activeSessions: 0,
+          endpoint: 'https://api.openai.com/v1/realtime/calls',
+        });
       case 'm7_capture_grant':
         return Promise.resolve({
           grantId: 'grant-1',
@@ -102,6 +127,15 @@ function mock(status: Partial<TalkStatus> = {}, config: CompanionConfig = CONFIG
           mediaType: 'audio/wav',
           audioBase64: btoa('spoken'),
         });
+      case 'm7_wake_word_start':
+        return Promise.resolve({
+          sessionId: 'wake-1',
+          status: { backend: 'sherpa_onnx', local: true, available: true, loaded: true },
+        });
+      case 'm7_wake_word_push':
+        return Promise.resolve(null);
+      case 'm7_wake_word_stop':
+        return Promise.resolve(true);
       default:
         return Promise.resolve(null);
     }
@@ -136,26 +170,20 @@ class FakeStream {
  */
 function stubMedia(options: { routing?: boolean } = {}) {
   const streams: FakeStream[] = [];
-  const recorders: FakeRecorder[] = [];
+  const recorders: FakeWorklet[] = [];
   const speakers: FakeSpeaker[] = [];
 
-  class FakeRecorder {
-    static isTypeSupported = () => true;
-    state = 'inactive';
-    mimeType = 'audio/webm';
-    ondataavailable: ((event: { data: Blob }) => void) | null = null;
-    onstop: (() => void) | null = null;
-    constructor(_stream: unknown, init?: { mimeType?: string }) {
-      if (init?.mimeType) this.mimeType = init.mimeType;
+  class FakeWorklet {
+    port = {
+      onmessage: null as ((event: MessageEvent<Float32Array>) => void) | null,
+      close: () => undefined,
+    };
+    constructor() {
       recorders.push(this);
     }
-    start() {
-      this.state = 'recording';
-      this.ondataavailable?.({ data: new Blob(['pretend-audio']) });
-    }
-    stop() {
-      this.state = 'inactive';
-      this.onstop?.();
+    disconnect() {}
+    emit(samples = new Float32Array(2_048).fill(0.2)) {
+      this.port.onmessage?.({ data: samples } as MessageEvent<Float32Array>);
     }
   }
 
@@ -192,11 +220,14 @@ function stubMedia(options: { routing?: boolean } = {}) {
       enumerateDevices: async () => [],
     },
   });
-  vi.stubGlobal('MediaRecorder', FakeRecorder);
+  vi.stubGlobal('AudioWorkletNode', FakeWorklet);
   vi.stubGlobal('Audio', FakeSpeaker);
   vi.stubGlobal(
     'AudioContext',
     class {
+      sampleRate = 48_000;
+      state = 'running';
+      audioWorklet = { addModule: () => Promise.resolve() };
       createAnalyser() {
         return {
           fftSize: 1_024,
@@ -226,6 +257,7 @@ async function saySomething(media: ReturnType<typeof stubMedia>): Promise<void> 
   const hold = await screen.findByRole('button', { name: /hold to talk/i });
   fireEvent.keyDown(hold, { key: ' ' });
   await waitFor(() => expect(media.recorders).toHaveLength(1));
+  media.recorders[0].emit();
   fireEvent.keyUp(hold, { key: ' ' });
 }
 
@@ -254,6 +286,36 @@ afterEach(() => {
 });
 
 describe('TalkPanel', () => {
+  it('does not guess a voice engine when settings cannot be loaded', async () => {
+    invoke.mockRejectedValue(new Error('config unavailable'));
+    render(<TalkPanel sessionId="session-1" onClose={vi.fn()} />);
+    expect((await screen.findByRole('alert')).textContent).toContain('No voice engine was started');
+    expect(commands()).not.toContain('m7_talk_status');
+    expect(commands()).not.toContain('realtime_voice_connect');
+  });
+
+  it('requires an explicit privacy acknowledgement before realtime Talk can connect', async () => {
+    mock({}, {
+      ...CONFIG,
+      voice: {
+        ...CONFIG.voice,
+        engineKind: 'realtime',
+        realtimeProviderId: 'openai',
+        realtimeModel: 'gpt-realtime-2.1',
+        realtimeVoice: 'marin',
+        realtimeTurnDetection: 'semantic_vad',
+      },
+    });
+    render(<TalkPanel sessionId="session-1" onClose={vi.fn()} />);
+
+    const start = await screen.findByRole('button', { name: 'Start realtime Talk' });
+    expect((start as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/microphone audio and the bounded conversation context are sent to OpenAI/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole('checkbox'));
+    await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(false));
+    expect(commands()).not.toContain('realtime_voice_connect');
+  });
+
   it('refuses to start when nothing can transcribe, and points at the fix', async () => {
     mock({ configured: false });
     const openSettings = vi.fn();
@@ -288,7 +350,7 @@ describe('TalkPanel', () => {
     const saved = mock({ alwaysListening: true, wakePhraseEnabled: true });
     render(<TalkPanel sessionId="session-1" onClose={vi.fn()} />);
 
-    const banner = await screen.findByText(/Always-listening is on/i);
+    const banner = await screen.findByText(/Always listening is on/i);
     expect(banner).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: /stop listening/i }));
@@ -359,7 +421,7 @@ describe('TalkPanel — always listening', () => {
     // The first `status` is the header's; the second is the banner that admits
     // what is going on.
     await waitFor(() =>
-      expect(screen.getAllByRole('status')[0].textContent).toContain('waiting for the wake phrase'),
+      expect(screen.getAllByRole('status')[0].textContent).toContain('listening for the wake word'),
     );
     expect((await screen.findByRole('checkbox', { name: /continuous/i }) as HTMLInputElement).checked).toBe(true);
   });
