@@ -793,7 +793,9 @@ fn trust_roots(path: &str) -> Result<rustls::RootCertStore, String> {
         added += 1;
     }
     if added == 0 {
-        return Err(format!("Email tls_ca_file '{path}' contains no certificate"));
+        return Err(format!(
+            "Email tls_ca_file '{path}' contains no certificate"
+        ));
     }
     Ok(roots)
 }

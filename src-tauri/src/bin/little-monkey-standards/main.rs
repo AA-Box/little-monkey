@@ -1,12 +1,19 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fs, path::{Path, PathBuf}, process::ExitCode};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 const RELATIVE_INDEX: &str = ".little-monkey/standards/index.json";
 
 #[derive(Parser)]
-#[command(name = "little-monkey-standards", about = "Headless audit and lifecycle commands for Standards Studio")]
+#[command(
+    name = "little-monkey-standards",
+    about = "Headless audit and lifecycle commands for Standards Studio"
+)]
 struct Cli {
     /// Repository/workspace root. Defaults to the current directory.
     #[arg(long, default_value = ".")]
@@ -140,24 +147,33 @@ fn index_path(workspace: &Path) -> PathBuf {
 
 fn load(workspace: &Path) -> Result<StandardsDocument, String> {
     let path = index_path(workspace);
-    let bytes = fs::read(&path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let bytes =
+        fs::read(&path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     let document: StandardsDocument = serde_json::from_slice(&bytes)
         .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
     if document.schema_version != 1 {
-        return Err(format!("unsupported standards schema version {}", document.schema_version));
+        return Err(format!(
+            "unsupported standards schema version {}",
+            document.schema_version
+        ));
     }
     Ok(document)
 }
 
 fn save(workspace: &Path, document: &StandardsDocument) -> Result<(), String> {
     let path = index_path(workspace);
-    let parent = path.parent().ok_or_else(|| "invalid standards path".to_string())?;
-    fs::create_dir_all(parent).map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "invalid standards path".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
     let mut bytes = serde_json::to_vec_pretty(document).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
     let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, bytes).map_err(|error| format!("failed to write {}: {error}", temporary.display()))?;
-    fs::rename(&temporary, &path).map_err(|error| format!("failed to replace {}: {error}", path.display()))
+    fs::write(&temporary, bytes)
+        .map_err(|error| format!("failed to write {}: {error}", temporary.display()))?;
+    fs::rename(&temporary, &path)
+        .map_err(|error| format!("failed to replace {}: {error}", path.display()))
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
@@ -166,11 +182,20 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 }
 
 fn compute_drift(workspace: &Path, standard: &Standard) -> DriftReport {
-    let supporting: Vec<&Evidence> = standard.evidence.iter().filter(|evidence| evidence.supports).collect();
-    let unchanged = supporting.iter().filter(|evidence| {
-        let evidence_path = workspace.join(&evidence.path);
-        sha256_file(&evidence_path).map(|digest| digest.eq_ignore_ascii_case(&evidence.sha256)).unwrap_or(false)
-    }).count();
+    let supporting: Vec<&Evidence> = standard
+        .evidence
+        .iter()
+        .filter(|evidence| evidence.supports)
+        .collect();
+    let unchanged = supporting
+        .iter()
+        .filter(|evidence| {
+            let evidence_path = workspace.join(&evidence.path);
+            sha256_file(&evidence_path)
+                .map(|digest| digest.eq_ignore_ascii_case(&evidence.sha256))
+                .unwrap_or(false)
+        })
+        .count();
     let current = if supporting.is_empty() {
         DriftState::Unknown
     } else if unchanged == supporting.len() {
@@ -191,12 +216,17 @@ fn compute_drift(workspace: &Path, standard: &Standard) -> DriftReport {
 
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn audit(document: &StandardsDocument) -> AuditReport {
     use std::collections::BTreeSet;
-    let approved: BTreeSet<&str> = document.standards.iter()
+    let approved: BTreeSet<&str> = document
+        .standards
+        .iter()
         .filter(|standard| standard.status == LifecycleStatus::Approved)
         .map(|standard| standard.standard_id.as_str())
         .collect();
@@ -225,38 +255,75 @@ fn audit(document: &StandardsDocument) -> AuditReport {
 }
 
 fn run(cli: Cli) -> Result<ExitCode, String> {
-    let workspace = cli.workspace.canonicalize().map_err(|error| format!("invalid workspace {}: {error}", cli.workspace.display()))?;
+    let workspace = cli
+        .workspace
+        .canonicalize()
+        .map_err(|error| format!("invalid workspace {}: {error}", cli.workspace.display()))?;
     let mut document = load(&workspace)?;
     match cli.command {
         Command::List { status, json } => {
-            let standards: Vec<&Standard> = document.standards.iter().filter(|standard| status.map(|wanted| standard.status == wanted).unwrap_or(true)).collect();
+            let standards: Vec<&Standard> = document
+                .standards
+                .iter()
+                .filter(|standard| {
+                    status
+                        .map(|wanted| standard.status == wanted)
+                        .unwrap_or(true)
+                })
+                .collect();
             if json {
-                println!("{}", serde_json::to_string_pretty(&standards).map_err(|error| error.to_string())?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&standards).map_err(|error| error.to_string())?
+                );
             } else {
                 for standard in standards {
-                    println!("{}@v{}\t{:?}\t{:?}\t{}", standard.standard_id, standard.version, standard.status, standard.drift, standard.title);
+                    println!(
+                        "{}@v{}\t{:?}\t{:?}\t{}",
+                        standard.standard_id,
+                        standard.version,
+                        standard.status,
+                        standard.drift,
+                        standard.title
+                    );
                 }
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::SetStatus { standard_id, status } => {
-            let standard = document.standards.iter_mut().find(|standard| standard.standard_id == standard_id)
+        Command::SetStatus {
+            standard_id,
+            status,
+        } => {
+            let standard = document
+                .standards
+                .iter_mut()
+                .find(|standard| standard.standard_id == standard_id)
                 .ok_or_else(|| format!("unknown standard id {standard_id}"))?;
             standard.status = status.into();
-            standard.approved_at_ms = if standard.status == LifecycleStatus::Approved { Some(now_ms()) } else { standard.approved_at_ms };
+            standard.approved_at_ms = if standard.status == LifecycleStatus::Approved {
+                Some(now_ms())
+            } else {
+                standard.approved_at_ms
+            };
             document.generated_at_ms = now_ms();
             save(&workspace, &document)?;
             println!("{} -> {:?}", standard_id, LifecycleStatus::from(status));
             Ok(ExitCode::SUCCESS)
         }
         Command::Drift { write, json } => {
-            let reports: Vec<DriftReport> = document.standards.iter().map(|standard| compute_drift(&workspace, standard)).collect();
+            let reports: Vec<DriftReport> = document
+                .standards
+                .iter()
+                .map(|standard| compute_drift(&workspace, standard))
+                .collect();
             if write {
                 let verified_at = now_ms();
                 for (standard, report) in document.standards.iter_mut().zip(&reports) {
                     standard.drift = report.current;
                     standard.last_verified_at_ms = Some(verified_at);
-                    if standard.status == LifecycleStatus::Approved && report.current == DriftState::Contradicted {
+                    if standard.status == LifecycleStatus::Approved
+                        && report.current == DriftState::Contradicted
+                    {
                         standard.status = LifecycleStatus::Stale;
                     }
                 }
@@ -264,10 +331,20 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 save(&workspace, &document)?;
             }
             if json {
-                println!("{}", serde_json::to_string_pretty(&reports).map_err(|error| error.to_string())?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&reports).map_err(|error| error.to_string())?
+                );
             } else {
                 for report in reports {
-                    println!("{}\t{:?} -> {:?}\t{}/{} supporting evidence unchanged", report.standard_id, report.previous, report.current, report.unchanged_supporting, report.supporting_total);
+                    println!(
+                        "{}\t{:?} -> {:?}\t{}/{} supporting evidence unchanged",
+                        report.standard_id,
+                        report.previous,
+                        report.current,
+                        report.unchanged_supporting,
+                        report.supporting_total
+                    );
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -275,14 +352,28 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         Command::Audit { json } => {
             let report = audit(&document);
             if json {
-                println!("{}", serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+                );
             } else if report.ok {
-                println!("Standards audit passed ({} standards).", document.standards.len());
+                println!(
+                    "Standards audit passed ({} standards).",
+                    document.standards.len()
+                );
             } else {
-                for conflict in &report.unresolved_conflicts { eprintln!("conflict: {conflict}"); }
-                for failure in &report.drift_failures { eprintln!("drift: {failure}"); }
+                for conflict in &report.unresolved_conflicts {
+                    eprintln!("conflict: {conflict}");
+                }
+                for failure in &report.drift_failures {
+                    eprintln!("drift: {failure}");
+                }
             }
-            Ok(if report.ok { ExitCode::SUCCESS } else { ExitCode::from(2) })
+            Ok(if report.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            })
         }
     }
 }
@@ -304,13 +395,27 @@ mod tests {
     #[test]
     fn audit_rejects_approved_conflict() {
         let standard = |id: &str, conflicts_with: Vec<String>| Standard {
-            standard_id: id.to_string(), version: 1, title: id.to_string(), body: "body".to_string(),
-            status: LifecycleStatus::Approved, evidence: vec![], conflicts_with, content_sha256: "a".repeat(64),
-            drift: DriftState::Healthy, approved_at_ms: Some(1), last_verified_at_ms: None, extra: Default::default(),
+            standard_id: id.to_string(),
+            version: 1,
+            title: id.to_string(),
+            body: "body".to_string(),
+            status: LifecycleStatus::Approved,
+            evidence: vec![],
+            conflicts_with,
+            content_sha256: "a".repeat(64),
+            drift: DriftState::Healthy,
+            approved_at_ms: Some(1),
+            last_verified_at_ms: None,
+            extra: Default::default(),
         };
         let document = StandardsDocument {
-            schema_version: 1, workspace_id: "test".to_string(), generated_at_ms: 1,
-            standards: vec![standard("one", vec!["two".to_string()]), standard("two", vec![])],
+            schema_version: 1,
+            workspace_id: "test".to_string(),
+            generated_at_ms: 1,
+            standards: vec![
+                standard("one", vec!["two".to_string()]),
+                standard("two", vec![]),
+            ],
         };
         assert!(!audit(&document).ok);
     }

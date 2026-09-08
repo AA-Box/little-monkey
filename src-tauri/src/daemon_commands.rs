@@ -4104,9 +4104,8 @@ const MAX_CHANNEL_ID: usize = 256;
 /// as a flag by the CLI's own parser even though nothing here goes through a
 /// shell.
 fn channel_id(label: &str, value: &str) -> Result<String, String> {
-    let allowed = |ch: char| {
-        ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '@' | '+')
-    };
+    let allowed =
+        |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '@' | '+');
     if value.is_empty()
         || value.len() > MAX_CHANNEL_ID
         || value.contains("..")
@@ -4636,11 +4635,7 @@ pub async fn channels_exposure_set_tunnel(
 pub async fn channels_exposure_set_token(token: String) -> Result<(), String> {
     bounded_secret("tunnel credential", &token)?;
     command_with_stdin(
-        vec![
-            "channels".into(),
-            "exposure".into(),
-            "set-token".into(),
-        ],
+        vec!["channels".into(), "exposure".into(), "set-token".into()],
         token,
     )
     .await

@@ -38,9 +38,11 @@ fn target_dir() -> PathBuf {
 }
 
 fn cli() -> PathBuf {
-    target_dir()
-        .join("debug")
-        .join(if cfg!(windows) { "monkey-cli.exe" } else { "monkey-cli" })
+    target_dir().join("debug").join(if cfg!(windows) {
+        "monkey-cli.exe"
+    } else {
+        "monkey-cli"
+    })
 }
 
 fn unique() -> u128 {
@@ -163,8 +165,12 @@ fn require_cli_stdin(profile: &str, args: &[&str], stdin: &str) -> Result<Output
 fn create_profile() -> Result<String, String> {
     let name = format!("WhatsApp installed-service E2E {}", unique());
     let output = require_cli(None, &["profiles", "create", &name, "--json"])?;
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("profile JSON was invalid: {error}\n{}", output_text(&output)))?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "profile JSON was invalid: {error}\n{}",
+            output_text(&output)
+        )
+    })?;
     payload
         .get("id")
         .and_then(serde_json::Value::as_str)
@@ -178,17 +184,15 @@ fn add_account(profile: &str, phone_number_id: &str) -> Result<String, String> {
     let output = require_cli(
         Some(profile),
         &[
-            "channels",
-            "add",
-            "whatsapp",
-            &label,
-            "--config",
-            &config,
-            "--json",
+            "channels", "add", "whatsapp", &label, "--config", &config, "--json",
         ],
     )?;
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("account JSON was invalid: {error}\n{}", output_text(&output)))?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "account JSON was invalid: {error}\n{}",
+            output_text(&output)
+        )
+    })?;
     payload
         .get("account_id")
         .and_then(serde_json::Value::as_str)
@@ -563,7 +567,9 @@ async fn meta_subscriptions(
     if status.is_success() {
         Ok(payload)
     } else {
-        Err(format!("Meta rejected subscribed_apps GET ({status}): {payload}"))
+        Err(format!(
+            "Meta rejected subscribed_apps GET ({status}): {payload}"
+        ))
     }
 }
 
@@ -596,7 +602,9 @@ async fn configure_disposable_waba_override(
     if !baseline.status().is_success() {
         let status = baseline.status();
         let body = baseline.text().await.unwrap_or_default();
-        return Err(format!("Meta rejected baseline WABA subscription ({status}): {body}"));
+        return Err(format!(
+            "Meta rejected baseline WABA subscription ({status}): {body}"
+        ));
     }
 
     let response = client
@@ -612,7 +620,9 @@ async fn configure_disposable_waba_override(
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("Meta rejected callback override ({status}): {body}"));
+        return Err(format!(
+            "Meta rejected callback override ({status}): {body}"
+        ));
     }
     Ok(())
 }

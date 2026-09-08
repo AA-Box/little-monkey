@@ -3,16 +3,17 @@
 Run: `python3 packaging/mlx/service/test_mlx_server.py`
 
 MLX itself is stubbed. What is under test is the wire contract — the event
-names, the terminal `completed`, the framing — none of which depends on real
-weights, and all of which fails the whole request when it drifts. Requiring an
-Apple-silicon machine with a model on disk to catch a renamed JSON key would
-mean never catching it.
+names, the terminal `completed`, the framing — plus the ownership and prefix
+cache rules, none of which need real weights. Requiring an Apple-silicon
+machine with a model on disk to catch a renamed JSON key or a cache-state bug
+would mean never catching it.
 """
 
 import json
 import sys
 import threading
 import types
+import urllib.error
 import urllib.request
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
@@ -28,6 +29,13 @@ _fake.stream_generate = lambda *args, **kwargs: iter(())
 sys.modules["mlx_lm"] = _fake
 sys.modules["mlx_lm.sample_utils"] = types.ModuleType("mlx_lm.sample_utils")
 sys.modules["mlx_lm.sample_utils"].make_sampler = lambda temp: ("sampler", temp)
+sys.modules["mlx_lm.models"] = types.ModuleType("mlx_lm.models")
+sys.modules["mlx_lm.models.cache"] = types.ModuleType("mlx_lm.models.cache")
+_prompt_cache_ids = iter(range(1, 10_000))
+sys.modules["mlx_lm.models.cache"].make_prompt_cache = lambda model: {
+    "id": next(_prompt_cache_ids),
+    "model": model,
+}
 
 import mlx_server  # noqa: E402
 
@@ -45,11 +53,20 @@ def _serve(chunks, capture):
     class Handler(mlx_server._Handler):
         runtime = mlx_server._TextRuntime(object(), _Tokenizer())
 
-        def _generate(self, prompt, images, max_tokens, temperature):
+        def _generate(
+            self,
+            prompt,
+            images,
+            max_tokens,
+            temperature,
+            prompt_cache_key=None,
+        ):
             capture["prompt"] = prompt
             capture["images"] = images
             capture["max_tokens"] = max_tokens
             capture["temperature"] = temperature
+            capture["prompt_cache_key"] = prompt_cache_key
+            self._cached_input_tokens = 0
             yield from chunks()
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -97,7 +114,7 @@ ALLOWED = {
     "tool_call_start": {"call_id", "name"},
     "tool_call_arguments_delta": {"call_id", "json"},
     "tool_call_end": {"call_id"},
-    "completed": {"input_tokens", "output_tokens"},
+    "completed": {"input_tokens", "output_tokens", "cached_input_tokens"},
     "error": {"code", "message"},
 }
 
@@ -123,9 +140,11 @@ def check_happy_path():
     assert terminal[0] is events[-1], "completed must be last"
     assert terminal[0]["output_tokens"] == 2
     assert terminal[0]["input_tokens"] == 2, "input tokens come from the rendered prompt"
+    assert terminal[0]["cached_input_tokens"] == 0
 
     assert capture["max_tokens"] == 16
     assert capture["temperature"] == 0.5
+    assert capture["prompt_cache_key"] is None
     assert "hello there" in capture["prompt"]
     print("ok: happy path emits started, deltas, and exactly one completed")
 
@@ -155,7 +174,7 @@ def check_generation_runs_on_the_thread_that_loaded_the_model():
 
     def stream_generate(*args, **kwargs):
         generated_on.append(threading.current_thread())
-        return iter([types.SimpleNamespace(text="hi")])
+        return iter([types.SimpleNamespace(text="hi", token="assistant")])
 
     fake.load, fake.stream_generate = load, stream_generate
     try:
@@ -163,10 +182,12 @@ def check_generation_runs_on_the_thread_that_loaded_the_model():
         worker.wait_until_loaded()
         # Two concurrent callers, neither of them the loading thread.
         collected = []
+
         def drive():
             job = mlx_server._Job("prompt", [], 4, None)
             worker.submit(job)
             collected.append("".join(job.deltas()))
+
         threads = [threading.Thread(target=drive) for _ in range(2)]
         for thread in threads:
             thread.start()
@@ -185,6 +206,99 @@ def check_generation_runs_on_the_thread_that_loaded_the_model():
     print("ok: generation runs on the thread that loaded the model")
 
 
+def check_text_prefix_cache_reuses_only_proven_prefixes():
+    """The second turn should execute only the suffix after a verified prefix."""
+    fake = sys.modules["mlx_lm"]
+    previous = fake.stream_generate
+    calls = []
+
+    def stream_generate(model, tokenizer, prompt, **kwargs):
+        calls.append(
+            {
+                "prompt": list(prompt),
+                "prompt_cache": kwargs.get("prompt_cache"),
+            }
+        )
+        return iter([types.SimpleNamespace(text=" assistant", token="assistant")])
+
+    fake.stream_generate = stream_generate
+    runtime = mlx_server._TextRuntime("model", _Tokenizer())
+    hits = []
+    try:
+        first = "".join(
+            runtime.stream(
+                "system user",
+                [],
+                8,
+                None,
+                "conversation-1",
+                hits.append,
+            )
+        )
+        second = "".join(
+            runtime.stream(
+                "system user assistant next",
+                [],
+                8,
+                None,
+                "conversation-1",
+                hits.append,
+            )
+        )
+        # Similar but not token-equal at the start: must not reuse anything.
+        third = "".join(
+            runtime.stream(
+                "different user",
+                [],
+                8,
+                None,
+                "conversation-1",
+                hits.append,
+            )
+        )
+    finally:
+        fake.stream_generate = previous
+
+    assert first == second == third == " assistant"
+    assert hits == [0, 3, 0], hits
+    assert calls[0]["prompt"] == ["system", "user"]
+    assert calls[1]["prompt"] == ["next"], calls[1]
+    assert calls[1]["prompt_cache"] is calls[0]["prompt_cache"], (
+        "the verified prefix must resume the same decode cache"
+    )
+    assert calls[2]["prompt"] == ["different", "user"]
+    assert calls[2]["prompt_cache"] is not calls[1]["prompt_cache"]
+    print("ok: text generation reuses only a strict token-equal prefix")
+
+
+def check_cache_key_prefers_its_conversation_without_bypassing_equality():
+    cache = mlx_server._SessionPrefixCache(capacity=2)
+    cache.release("a", [1, 2], {"id": "a"})
+    cache.release("b", [1, 2, 3], {"id": "b"})
+
+    prompt_cache, reused = cache.acquire("model", [1, 2, 3, 4], "a")
+    assert prompt_cache == {"id": "a"}, prompt_cache
+    assert reused == 2, reused
+    # Put it back so both candidates exist again.
+    cache.release("a", [1, 2], prompt_cache)
+
+    # A matching key cannot authorize an unrelated token sequence.
+    prompt_cache, reused = cache.acquire("model", [9, 9, 9], "a")
+    assert reused == 0
+    assert prompt_cache not in ({"id": "a"}, {"id": "b"})
+    print("ok: cache key is preference, never authority")
+
+
+def check_cache_is_fixed_two_entry_lru():
+    cache = mlx_server._SessionPrefixCache(capacity=2)
+    cache.release("one", [1], {"id": 1})
+    cache.release("two", [2], {"id": 2})
+    cache.release("three", [3], {"id": 3})
+    assert len(cache.entries) == 2
+    assert {entry.key for entry in cache.entries} == {"two", "three"}
+    print("ok: prompt cache is bounded to two LRU entries")
+
+
 def check_a_cancelled_reader_does_not_wedge_the_worker():
     """A dropped connection must stop the generation, not block the worker.
 
@@ -195,7 +309,7 @@ def check_a_cancelled_reader_does_not_wedge_the_worker():
     fake = sys.modules["mlx_lm"]
     previous = fake.stream_generate
     fake.stream_generate = lambda *args, **kwargs: (
-        types.SimpleNamespace(text="x") for _ in range(100_000)
+        types.SimpleNamespace(text="x", token=index) for index in range(100_000)
     )
     try:
         job = mlx_server._Job("prompt", [], 1, None)
@@ -318,6 +432,21 @@ def check_generation_failure_still_terminates():
     print("ok: a failed generation still emits error then completed")
 
 
+def check_prompt_cache_key_is_bounded():
+    capture = {}
+    server = _serve(lambda: iter(["hi"]), capture)
+    try:
+        body = dict(REQUEST)
+        body["promptCacheKey"] = "x" * (mlx_server.MAX_PROMPT_CACHE_KEY_BYTES + 1)
+        events = _generate(server, body)
+    finally:
+        server.shutdown()
+    error = next(e for e in events if e["type"] == "error")
+    assert "promptCacheKey is too long" in error["message"], error
+    assert "prompt" not in capture
+    print("ok: prompt cache keys are bounded before generation")
+
+
 def check_rejects_non_loopback_host():
     """The supervisor always passes loopback; refusing anything else means a
     tampered argument vector cannot expose this on the network."""
@@ -350,11 +479,15 @@ def check_unknown_endpoint_is_404():
 if __name__ == "__main__":
     check_happy_path()
     check_generation_runs_on_the_thread_that_loaded_the_model()
+    check_text_prefix_cache_reuses_only_proven_prefixes()
+    check_cache_key_prefers_its_conversation_without_bypassing_equality()
+    check_cache_is_fixed_two_entry_lru()
     check_a_cancelled_reader_does_not_wedge_the_worker()
     check_a_text_model_refuses_images_instead_of_ignoring_them()
     check_only_inline_images_are_accepted()
     check_vision_models_are_detected_from_their_own_config()
     check_generation_failure_still_terminates()
+    check_prompt_cache_key_is_bounded()
     check_rejects_non_loopback_host()
     check_unknown_endpoint_is_404()
     print("all mlx_server contract checks passed")

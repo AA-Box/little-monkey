@@ -66,9 +66,6 @@ use uuid::Uuid;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-// `ps`-based resident-memory sampling, reached only from MLX metrics.
-#[cfg(target_os = "macos")]
-use std::process::Command;
 
 const M3_DIRECTORY: &str = "m3";
 /// Where `models::models_dir` keeps managed model weights, relative to the same
@@ -3353,6 +3350,18 @@ impl ProductionMlxServiceController {
             message: error.to_string(),
         }
     }
+
+    fn prompt_cache_key(request: &MlxGenerationRequest) -> Result<String, MlxError> {
+        // First two turns are stable as a conversation grows. Hashing keeps the
+        // wire bounded and prevents user text from becoming an opaque cache id.
+        // The service still verifies exact token-prefix equality before reuse.
+        let stable = serde_json::to_vec(&(
+            request.model_id.as_str(),
+            request.messages.iter().take(2).collect::<Vec<_>>(),
+        ))
+        .map_err(|error| Self::controller_error("derive MLX prompt cache key", error))?;
+        Ok(format!("m3-{:x}", Sha256::digest(stable)))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -3472,7 +3481,22 @@ impl MlxServiceController for ProductionMlxServiceController {
                 let response = tokio::select! {
                     _ = context.cancellation.cancelled() => return Err(MlxError::Cancelled { operation: "stream".to_string() }),
                     _ = cancellation.cancelled() => return Err(MlxError::Cancelled { operation: "stream".to_string() }),
-                    response = crate::egress::send(self.client.post(format!("http://127.0.0.1:{}/v1/generate", handle.port)).json(request)) => {
+                    response = {
+                        let mut wire = serde_json::to_value(request)
+                            .map_err(|error| Self::controller_error("encode MLX request", error))?;
+                        let object = wire.as_object_mut().ok_or_else(||
+                            Self::controller_error("encode MLX request", "request did not encode as an object")
+                        )?;
+                        object.insert(
+                            "promptCacheKey".to_string(),
+                            Value::String(Self::prompt_cache_key(request)?),
+                        );
+                        crate::egress::send(
+                            self.client
+                                .post(format!("http://127.0.0.1:{}/v1/generate", handle.port))
+                                .json(&wire),
+                        )
+                    } => {
                         response.map_err(|error| Self::controller_error("start MLX stream", error))?
                     }
                 };
@@ -3519,7 +3543,7 @@ impl MlxServiceController for ProductionMlxServiceController {
                 if !buffer.is_empty() {
                     ingest_mlx_service_line(&buffer, sink, &mut completed, &mut used_tool)?;
                 }
-                let (input_tokens, output_tokens) = completed.ok_or_else(|| {
+                let (input_tokens, output_tokens, cached_input_tokens) = completed.ok_or_else(|| {
                     MlxError::StreamProtocol(
                         "MLX service stream ended without a completed event".to_string(),
                     )
@@ -3528,6 +3552,7 @@ impl MlxServiceController for ProductionMlxServiceController {
                     request_id: request.request_id.clone(),
                     input_tokens,
                     output_tokens,
+                    cached_input_tokens,
                     finish_reason: if used_tool { "tool_use" } else { "stop" }.to_string(),
                 })
             }
@@ -3621,7 +3646,7 @@ impl MlxServiceController for ProductionMlxServiceController {
 fn ingest_mlx_service_line(
     raw_line: &[u8],
     sink: &mut dyn MlxStreamSink,
-    completed: &mut Option<(u64, u64)>,
+    completed: &mut Option<(u64, u64, u64)>,
     used_tool: &mut bool,
 ) -> Result<(), MlxError> {
     let line = std::str::from_utf8(raw_line)
@@ -3641,30 +3666,24 @@ fn ingest_mlx_service_line(
     if let MlxStreamEvent::Completed {
         input_tokens,
         output_tokens,
+        cached_input_tokens,
     } = &event
     {
-        *completed = Some((*input_tokens, *output_tokens));
+        *completed = Some((*input_tokens, *output_tokens, *cached_input_tokens));
     }
     sink.emit(event).map_err(MlxError::StreamProtocol)
 }
 
-// MLX metrics only; macOS is always unix, so there is no non-unix variant to
-// keep alive here.
+// MLX may supervise an inference child (for example Lily). Report the native
+// tree footprint so Runtime Hub memory accounting follows the workload rather
+// than only the lightweight service parent.
 #[cfg(target_os = "macos")]
 fn process_resident_memory_bytes(pid: u32) -> Option<u64> {
-    let output = Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    let usage = crate::process_tree::measure_tree(pid).ok().flatten()?;
+    if usage.unmeasured_members != 0 {
         return None;
     }
-    String::from_utf8(output.stdout)
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()?
-        .checked_mul(1_024)
+    usage.rss_bytes
 }
 
 #[cfg(target_os = "macos")]

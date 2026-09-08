@@ -387,8 +387,11 @@ pub(crate) async fn handle(
     // without a credential, so the first gate has to be one that costs this
     // daemon nothing.
     if let Some(account_id) = route.account_id() {
-        if !limiter().allow_up_to(&format!("account:{account_id}"), now_ms, MAX_PER_WINDOW_ACCOUNT)
-        {
+        if !limiter().allow_up_to(
+            &format!("account:{account_id}"),
+            now_ms,
+            MAX_PER_WINDOW_ACCOUNT,
+        ) {
             return rate_limited();
         }
     }

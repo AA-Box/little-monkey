@@ -663,7 +663,8 @@ pub fn set_pinned_impl(path: &Path, root: &str, id: &str, pinned: bool) -> Resul
 /// `memory_import` runs untrusted export values back through here, and the
 /// CLI's `--at` takes whatever is typed.
 fn normalize_expiry(input: &str) -> Result<String, String> {
-    const BAD: &str = "Expiry must be a date (2026-12-31) or an RFC 3339 UTC timestamp ending in Z.";
+    const BAD: &str =
+        "Expiry must be a date (2026-12-31) or an RFC 3339 UTC timestamp ending in Z.";
     const UNREAL: &str = "Expiry is not a real date or time.";
     let trimmed = input.trim();
     let b = trimmed.as_bytes();
@@ -852,11 +853,10 @@ pub fn merge_impl(
 
     let mut parents: Vec<Fact> = Vec::new();
     for id in &unique {
-        let fact = project
-            .facts
-            .iter()
-            .find(|f| &&f.id == id)
-            .ok_or_else(|| "Fact not found — it may have already been forgotten.".to_string())?;
+        let fact =
+            project.facts.iter().find(|f| &&f.id == id).ok_or_else(|| {
+                "Fact not found — it may have already been forgotten.".to_string()
+            })?;
         if !reaches_prompt(fact, &now) {
             return Err(
                 "Only memories that currently reach the prompt can be merged — enable or clear the expiry on the ones you selected first."
@@ -891,9 +891,7 @@ pub fn merge_impl(
         let surviving = project
             .facts
             .iter()
-            .filter(|f| {
-                f.pinned && f.retired_at.is_none() && !parents.iter().any(|p| p.id == f.id)
-            })
+            .filter(|f| f.pinned && f.retired_at.is_none() && !parents.iter().any(|p| p.id == f.id))
             .count();
         if surviving >= MAX_PINNED_PER_PROJECT {
             return Err(format!(
@@ -2584,8 +2582,7 @@ mod tests {
         let path = temp_path();
         add_fact_impl(&path, GLOBAL_SCOPE_KEY, "ordinary global", "agent", None).unwrap();
         add_fact_impl(&path, "/ws/project", "ordinary project", "agent", None).unwrap();
-        let pinned =
-            add_fact_impl(&path, "/ws/project", "pinned project", "agent", None).unwrap();
+        let pinned = add_fact_impl(&path, "/ws/project", "pinned project", "agent", None).unwrap();
         set_pinned_impl(&path, "/ws/project", &pinned.id, true).unwrap();
 
         let facts = list_impl(&path, Some("/ws/project")).unwrap();
@@ -2665,8 +2662,8 @@ mod tests {
         // 20 of the 100 are now pinned, so only 80 count — room for 20 more.
         add_fact_impl(&path, "/ws/project", "now there is room", "agent", None).unwrap();
 
-        let err = set_pinned_impl(&path, "/ws/project", &ids[MAX_PINNED_PER_PROJECT], true)
-            .unwrap_err();
+        let err =
+            set_pinned_impl(&path, "/ws/project", &ids[MAX_PINNED_PER_PROJECT], true).unwrap_err();
         assert!(err.contains("pinned memories"), "unexpected error: {err}");
         // Re-pinning an already-pinned fact stays an idempotent success.
         set_pinned_impl(&path, "/ws/project", &ids[0], true).unwrap();
@@ -2680,8 +2677,13 @@ mod tests {
         let one = add_fact_impl(&path, "/ws/project", "prefers pnpm", "agent", None).unwrap();
         let two = add_fact_impl(&path, "/ws/project", "never npm", "agent", None).unwrap();
 
-        let merged = merge_impl(&path, "/ws/project", &[one.id.clone(), two.id.clone()], None)
-            .unwrap();
+        let merged = merge_impl(
+            &path,
+            "/ws/project",
+            &[one.id.clone(), two.id.clone()],
+            None,
+        )
+        .unwrap();
         assert_eq!(merged.text, "prefers pnpm never npm");
         assert_eq!(merged.merged_from, vec![one.id.clone(), two.id.clone()]);
         assert_eq!(
@@ -2721,8 +2723,13 @@ mod tests {
         let path = temp_path();
         let one = add_fact_impl(&path, "/ws/project", "first", "agent", None).unwrap();
         let two = add_fact_impl(&path, "/ws/project", "second", "agent", None).unwrap();
-        let merged =
-            merge_impl(&path, "/ws/project", &[one.id.clone(), two.id.clone()], None).unwrap();
+        let merged = merge_impl(
+            &path,
+            "/ws/project",
+            &[one.id.clone(), two.id.clone()],
+            None,
+        )
+        .unwrap();
 
         assert_eq!(unmerge_impl(&path, "/ws/project", &merged.id).unwrap(), 2);
 
@@ -2777,12 +2784,24 @@ mod tests {
         set_expiry_impl(&path, "/ws/project", &stale.id, Some(PAST)).unwrap();
 
         for parent in [&off, &stale] {
-            let err =
-                merge_impl(&path, "/ws/project", &[live.id.clone(), parent.id.clone()], None)
-                    .unwrap_err();
-            assert!(err.contains("currently reach the prompt"), "unexpected: {err}");
+            let err = merge_impl(
+                &path,
+                "/ws/project",
+                &[live.id.clone(), parent.id.clone()],
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("currently reach the prompt"),
+                "unexpected: {err}"
+            );
         }
-        assert_eq!(load_impl(&path).unwrap().projects["/ws/project"].facts.len(), 3);
+        assert_eq!(
+            load_impl(&path).unwrap().projects["/ws/project"]
+                .facts
+                .len(),
+            3
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2794,8 +2813,13 @@ mod tests {
         let path = temp_path();
         let one = add_fact_impl(&path, "/ws/project", "first", "agent", None).unwrap();
         let two = add_fact_impl(&path, "/ws/project", "second", "agent", None).unwrap();
-        let merged =
-            merge_impl(&path, "/ws/project", &[one.id.clone(), two.id.clone()], None).unwrap();
+        let merged = merge_impl(
+            &path,
+            "/ws/project",
+            &[one.id.clone(), two.id.clone()],
+            None,
+        )
+        .unwrap();
 
         delete_fact_impl(&path, "/ws/project", &merged.id).unwrap();
         assert!(
@@ -2894,8 +2918,13 @@ mod tests {
         set_expiry_impl(&path, "/ws/project", &future.id, Some(FUTURE)).unwrap();
         set_expiry_impl(&path, "/ws/project", &pinned.id, Some(PAST)).unwrap();
         set_pinned_impl(&path, "/ws/project", &pinned.id, true).unwrap();
-        let merged =
-            merge_impl(&path, GLOBAL_SCOPE_KEY, &[one.id.clone(), two.id.clone()], None).unwrap();
+        let merged = merge_impl(
+            &path,
+            GLOBAL_SCOPE_KEY,
+            &[one.id.clone(), two.id.clone()],
+            None,
+        )
+        .unwrap();
         set_expiry_impl(&path, GLOBAL_SCOPE_KEY, &one.id, Some(PAST)).unwrap();
 
         assert_eq!(purge_expired_impl(&path).unwrap(), 1);
@@ -2916,7 +2945,10 @@ mod tests {
         // Nothing left to purge is Ok(0), not an error.
         assert_eq!(purge_expired_impl(&path).unwrap(), 0);
         // ...and the retired original is still there to be restored.
-        assert_eq!(unmerge_impl(&path, GLOBAL_SCOPE_KEY, &merged.id).unwrap(), 2);
+        assert_eq!(
+            unmerge_impl(&path, GLOBAL_SCOPE_KEY, &merged.id).unwrap(),
+            2
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2930,8 +2962,13 @@ mod tests {
         let path = temp_path();
         let one = add_fact_impl(&path, "/ws/project", "first", "agent", None).unwrap();
         let two = add_fact_impl(&path, "/ws/project", "second", "agent", None).unwrap();
-        let merged =
-            merge_impl(&path, "/ws/project", &[one.id.clone(), two.id.clone()], None).unwrap();
+        let merged = merge_impl(
+            &path,
+            "/ws/project",
+            &[one.id.clone(), two.id.clone()],
+            None,
+        )
+        .unwrap();
         set_expiry_impl(&path, "/ws/project", &merged.id, Some(PAST)).unwrap();
 
         assert_eq!(
@@ -2959,8 +2996,13 @@ mod tests {
         let b = add_fact_impl(&path, "/ws/project", "b", "agent", None).unwrap();
         let c = add_fact_impl(&path, "/ws/project", "c", "agent", None).unwrap();
         let first = merge_impl(&path, "/ws/project", &[a.id.clone(), b.id.clone()], None).unwrap();
-        let second =
-            merge_impl(&path, "/ws/project", &[first.id.clone(), c.id.clone()], None).unwrap();
+        let second = merge_impl(
+            &path,
+            "/ws/project",
+            &[first.id.clone(), c.id.clone()],
+            None,
+        )
+        .unwrap();
 
         delete_fact_impl(&path, "/ws/project", &second.id).unwrap();
         assert!(
@@ -2983,8 +3025,13 @@ mod tests {
         let b = add_fact_impl(&path, "/ws/project", "b", "agent", None).unwrap();
         let c = add_fact_impl(&path, "/ws/project", "c", "agent", None).unwrap();
         let first = merge_impl(&path, "/ws/project", &[a.id.clone(), b.id.clone()], None).unwrap();
-        let second =
-            merge_impl(&path, "/ws/project", &[first.id.clone(), c.id.clone()], None).unwrap();
+        let second = merge_impl(
+            &path,
+            "/ws/project",
+            &[first.id.clone(), c.id.clone()],
+            None,
+        )
+        .unwrap();
 
         let err = unmerge_impl(&path, "/ws/project", &first.id).unwrap_err();
         assert!(err.contains("newer merge"), "unexpected error: {err}");
@@ -3016,8 +3063,13 @@ mod tests {
         let two = add_fact_impl(&path, "/ws/project", "second", "agent", None).unwrap();
         set_pinned_impl(&path, "/ws/project", &one.id, true).unwrap();
         set_pinned_impl(&path, "/ws/project", &two.id, true).unwrap();
-        let merged =
-            merge_impl(&path, "/ws/project", &[one.id.clone(), two.id.clone()], None).unwrap();
+        let merged = merge_impl(
+            &path,
+            "/ws/project",
+            &[one.id.clone(), two.id.clone()],
+            None,
+        )
+        .unwrap();
         assert!(merged.pinned, "a merge of pins stays pinned");
 
         // One visible pin, so the scope has room for MAX_PINNED_PER_PROJECT - 1
@@ -3101,7 +3153,10 @@ mod tests {
             "the originals stay retired behind the memory already stored"
         );
         // ...and they point at it, so the merge is still undoable.
-        assert_eq!(unmerge_impl(&dest_path, "/ws/project", &stored.id).unwrap(), 2);
+        assert_eq!(
+            unmerge_impl(&dest_path, "/ws/project", &stored.id).unwrap(),
+            2
+        );
         assert_eq!(list_impl(&dest_path, Some("/ws/project")).unwrap().len(), 2);
 
         let _ = std::fs::remove_file(&source_path);

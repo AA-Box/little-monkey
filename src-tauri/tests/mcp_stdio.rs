@@ -254,8 +254,7 @@ async fn call_tool_cancellation_sends_a_real_cancelled_notification_to_the_serve
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert_eq!(
-        observed,
-        "cancelled",
+        observed, "cancelled",
         "server never completed the notifications/cancelled marker write"
     );
 

@@ -1153,7 +1153,9 @@ mod tests {
         let findings = channel_findings(&paths, NOW);
         let found = ids(&findings);
         assert!(
-            !found.iter().any(|id| id.starts_with("channels.no_credential")),
+            !found
+                .iter()
+                .any(|id| id.starts_with("channels.no_credential")),
             "{found:?}"
         );
     }

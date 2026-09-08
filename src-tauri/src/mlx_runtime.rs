@@ -1008,6 +1008,7 @@ pub enum MlxStreamEvent {
     Completed {
         input_tokens: u64,
         output_tokens: u64,
+        cached_input_tokens: u64,
     },
     Error {
         code: String,
@@ -1025,6 +1026,8 @@ pub struct MlxGenerationSummary {
     pub request_id: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Input tokens the runtime proved were resumed from its decode cache.
+    pub cached_input_tokens: u64,
     pub finish_reason: String,
 }
 
@@ -2584,8 +2587,11 @@ pub(crate) mod tests {
         // The whole point: a status probe answers from the manifest's
         // existence, so a corrupted payload still reads as installed here and
         // is caught by `verify_active` on the launch path instead.
-        fs::write(installed.version_directory.join("service/mlx_server.py"), b"tampered")
-            .expect("tamper");
+        fs::write(
+            installed.version_directory.join("service/mlx_server.py"),
+            b"tampered",
+        )
+        .expect("tamper");
         assert!(installer.active_install_present());
         assert!(installer.verify_active().is_err());
 
@@ -2808,6 +2814,7 @@ pub(crate) mod tests {
                     sink.emit(MlxStreamEvent::Completed {
                         input_tokens: 5,
                         output_tokens: 1,
+                        cached_input_tokens: 3,
                     })
                 })
                 .map_err(|message| MlxError::Controller {
@@ -2818,6 +2825,7 @@ pub(crate) mod tests {
                     request_id: request.request_id.clone(),
                     input_tokens: 5,
                     output_tokens: 1,
+                    cached_input_tokens: 3,
                     finish_reason: "stop".to_string(),
                 })
             })
@@ -2972,6 +2980,7 @@ pub(crate) mod tests {
             .await
             .expect("stream");
         assert_eq!(summary.output_tokens, 1);
+        assert_eq!(summary.cached_input_tokens, 3);
         assert!(matches!(sink.0[0], MlxStreamEvent::Started { .. }));
         assert!(matches!(sink.0[1], MlxStreamEvent::TextDelta { .. }));
         assert!(matches!(sink.0[2], MlxStreamEvent::Completed { .. }));
