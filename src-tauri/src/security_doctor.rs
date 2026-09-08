@@ -128,8 +128,10 @@ pub struct PushPrivacySnapshot {
     pub registered_devices: usize,
 }
 
-/// The operator's voice configuration, reduced to the four independent claims
-/// Security Doctor must make about passive listening.
+/// The operator's voice configuration, reduced to the independent claims
+/// Security Doctor must make about passive listening and about the hosted
+/// realtime engine, which is selected separately from the classic STT/TTS
+/// pipeline and from the phone-call extension setting.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VoicePrivacySnapshot {
     pub wake_phrase_enabled: bool,
@@ -137,6 +139,9 @@ pub struct VoicePrivacySnapshot {
     pub wake_processing_local: bool,
     pub passive_audio_off_device: bool,
     pub transcription_local: bool,
+    pub realtime_configured: bool,
+    pub realtime_active: bool,
+    pub realtime_provider_id: Option<String>,
 }
 
 /// Everything about the machine's security posture that only the daemon can
@@ -2155,7 +2160,31 @@ fn audit_voice_privacy(runtime: &SecurityRuntimeSnapshot, findings: &mut Vec<Sec
         ));
     }
 
-    if !voice.transcription_local {
+    if voice.realtime_active {
+        findings.push(finding(
+            "voice.realtime_active",
+            "voice",
+            "A realtime voice provider session is active",
+            "The desktop microphone is streaming to the configured realtime provider now. Tool calls still use the normal permission and sandbox boundary.",
+            FindingStatus::Warning,
+            false,
+            None,
+            Some("End Talk to close the WebRTC peer, data channel, microphone tracks, and provider session."),
+        ));
+    } else if voice.realtime_configured {
+        findings.push(finding(
+            "voice.realtime_configured",
+            "voice",
+            "Realtime provider voice is configured",
+            "Talk is configured to send live microphone audio to OpenAI only after the privacy warning is accepted and a session is started.",
+            FindingStatus::Info,
+            false,
+            None,
+            Some("Choose Classic pipeline in Settings → Talk to keep the voice engine local/turn-based."),
+        ));
+    }
+
+    if !voice.transcription_local && !voice.realtime_configured {
         findings.push(finding(
             "voice.hosted_transcription",
             "voice",
@@ -2262,6 +2291,28 @@ mod tests {
         findings
     }
 
+    #[test]
+    fn the_doctor_reports_realtime_voice_separately_when_configured_and_active() {
+        let configured = voice_findings(Some(VoicePrivacySnapshot {
+            realtime_configured: true,
+            realtime_provider_id: Some("openai".to_string()),
+            ..VoicePrivacySnapshot::default()
+        }));
+        assert!(has(&configured, "voice.realtime_configured"));
+        // The realtime findings already say where the audio goes; the hosted
+        // transcription notice would be a second finding for one choice.
+        assert!(!has(&configured, "voice.hosted_transcription"));
+
+        let active = voice_findings(Some(VoicePrivacySnapshot {
+            realtime_configured: true,
+            realtime_active: true,
+            realtime_provider_id: Some("openai".to_string()),
+            ..VoicePrivacySnapshot::default()
+        }));
+        assert!(has(&active, "voice.realtime_active"));
+        assert!(!has(&active, "voice.realtime_configured"));
+    }
+
     fn has(findings: &[SecurityFinding], id: &str) -> bool {
         findings.iter().any(|finding| finding.id == id)
     }
@@ -2288,6 +2339,7 @@ mod tests {
             wake_processing_local: false,
             passive_audio_off_device: true,
             transcription_local: false,
+            ..VoicePrivacySnapshot::default()
         }));
         assert!(has(&leaking, "voice.wake_phrase_enabled"));
         assert!(has(&leaking, "voice.always_listening"));
@@ -2309,6 +2361,7 @@ mod tests {
             wake_processing_local: true,
             passive_audio_off_device: false,
             transcription_local: true,
+            ..VoicePrivacySnapshot::default()
         }));
         assert!(has(&local, "voice.always_listening"));
         assert!(!has(&local, "voice.passive_cloud_upload"));
@@ -2323,6 +2376,7 @@ mod tests {
             wake_processing_local: true,
             passive_audio_off_device: false,
             transcription_local: true,
+            ..VoicePrivacySnapshot::default()
         }));
         assert!(has(&armed, "voice.wake_phrase_enabled"));
         let quiet = voice_findings(Some(VoicePrivacySnapshot {
@@ -2331,6 +2385,7 @@ mod tests {
             wake_processing_local: true,
             passive_audio_off_device: false,
             transcription_local: true,
+            ..VoicePrivacySnapshot::default()
         }));
         assert!(has(&quiet, "voice.wake_disabled"));
         assert_eq!(quiet[0].status, FindingStatus::Pass);
