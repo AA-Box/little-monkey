@@ -29,8 +29,16 @@ export interface CompanionArtifact {
 /** Which synthesizer speaks. `system` is this machine's own voice; an
  * executable extension is a sandboxed provider the operator installed. */
 export type SpeechBackendKind = 'system' | 'executable_extension';
+export type VoiceEngineKind = 'pipeline' | 'realtime';
+export type RealtimeTurnDetectionKind = 'semantic_vad' | 'manual';
 
 export interface VoiceConfig {
+  /** Desktop Talk engine. Absent in an older saved/test config means pipeline. */
+  engineKind?: VoiceEngineKind;
+  realtimeProviderId?: 'openai';
+  realtimeModel?: string;
+  realtimeVoice?: string;
+  realtimeTurnDetection?: RealtimeTurnDetectionKind;
   backend: TranscriptionBackendKind;
   /** @deprecated Kept only for compatibility with older persisted configs; built-in local Whisper ignores it. */
   whisperBinary: string | null;
@@ -75,6 +83,64 @@ export interface VoiceConfig {
   /** macOS only: refuse network-backed recognition when on-device is unavailable. */
   dictationRequireOnDevice: boolean;
 }
+
+export interface RealtimeVoiceConnectRequest {
+  sessionId: string;
+  providerId: 'openai';
+  model: string;
+  voice: string;
+  turnDetection: RealtimeTurnDetectionKind;
+  sdp: string;
+  instructions: string;
+  tools: Array<{ type: 'function'; name: string; description: string; parameters: object }>;
+}
+
+export interface RealtimeVoiceConnectResponse {
+  sessionId: string;
+  sdpAnswer: string;
+  providerRequestId: string | null;
+}
+
+export interface RealtimeVoiceStatus {
+  providerId: 'openai';
+  configured: boolean;
+  activeSessions: number;
+  endpoint: string;
+}
+
+export interface RealtimeVoiceMetric {
+  createdAtMs: number;
+  connectionMs: number | null;
+  firstRecognizedSpeechMs: number | null;
+  firstModelEventMs: number | null;
+  firstAudioMs: number | null;
+  endToEndMs: number | null;
+  interrupted: boolean;
+  reconnectCount: number;
+  errorCode: string | null;
+  toolRoundTripMs: number[];
+  outputUnderruns: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+export interface RealtimeVoiceMetricsSnapshot {
+  metrics: RealtimeVoiceMetric[];
+  interruptCount: number;
+  reconnectCount: number;
+}
+
+export const realtimeVoiceClient = {
+  connect: (request: RealtimeVoiceConnectRequest) =>
+    invoke<RealtimeVoiceConnectResponse>('realtime_voice_connect', { request }),
+  disconnect: (sessionId: string) =>
+    invoke<void>('realtime_voice_disconnect', { sessionId }),
+  status: () => invoke<RealtimeVoiceStatus>('realtime_voice_status'),
+  recordMetric: (metric: RealtimeVoiceMetric) =>
+    invoke<void>('realtime_voice_metric_record', { metric }),
+  metrics: () => invoke<RealtimeVoiceMetricsSnapshot>('realtime_voice_metrics'),
+  clearMetrics: () => invoke<void>('realtime_voice_metrics_clear'),
+};
 
 export interface ImageEndpointConfig {
   endpointId: string;

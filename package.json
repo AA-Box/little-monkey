@@ -19,6 +19,7 @@
     "test:autonomous-eval": "vitest run src/lib/autonomousTaskEval.e2e.test.ts src/lib/autonomousTask.productionBoundary.test.ts",
     "test:autonomous-eval:live": "node scripts/autonomous-task-live-eval.mjs",
     "test:compare:live": "node scripts/smoke-compare-ollama.mjs",
+    "test:realtime:live": "node scripts/realtime-live-acceptance.mjs",
     "test:git-delivery-action": "node .github/actions/little-monkey-review/review.test.mjs",
     "test:machO": "node scripts/lib/machO.test.mjs",
     "test:manifest": "node scripts/lib/runtimeManifest.test.mjs",

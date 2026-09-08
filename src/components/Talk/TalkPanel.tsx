@@ -8,13 +8,15 @@
  */
 
 import { AlertTriangle, Loader2, Mic, MicOff, Radio, Square, Type, Volume2, X } from 'lucide-react';
+import { useEffect, useState } from 'react';
 
-import { companionClient } from '../../lib/companionClient';
+import { companionClient, type VoiceConfig } from '../../lib/companionClient';
 import { errorMessage } from '../../lib/errors';
 import { talkClient } from '../../lib/talkClient';
 import { type TalkState } from '../../lib/talkEngine';
 import { Button, IconButton } from '../ui';
 import { useTalkSession } from './useTalkSession';
+import { RealtimeTalkPanel } from './RealtimeTalkPanel';
 
 const STATE_LABEL: Record<TalkState, string> = {
   off: 'Not listening',
@@ -52,7 +54,7 @@ export interface TalkPanelProps {
   onOpenVoiceSettings?: () => void;
 }
 
-export function TalkPanel({
+function PipelineTalkPanel({
   sessionId,
   onClose,
   onReturnToChat,
@@ -247,4 +249,32 @@ export function TalkPanel({
       </footer>
     </section>
   );
+}
+
+/** Chooses the explicitly configured desktop engine. Missing legacy config
+ * fields resolve to `pipeline`, preserving the existing behavior exactly. */
+export function TalkPanel(props: TalkPanelProps) {
+  const [voice, setVoice] = useState<VoiceConfig | null | undefined>(undefined);
+  useEffect(() => {
+    let active = true;
+    void companionClient.config()
+      .then((config) => { if (active) setVoice(config.voice); })
+      .catch(() => { if (active) setVoice(null); });
+    return () => { active = false; };
+  }, []);
+  if (voice === undefined) {
+    return <section className="flex h-full items-center justify-center bg-background" aria-label="Talk"><Loader2 className="animate-spin" aria-label="Loading Talk settings" /></section>;
+  }
+  if (voice === null) {
+    return (
+      <section className="flex h-full flex-col items-center justify-center gap-3 bg-background p-6 text-center" aria-label="Talk">
+        <p role="alert" className="text-sm text-danger">Talk settings could not be loaded. No voice engine was started.</p>
+        {props.onOpenVoiceSettings && <Button variant="secondary" onClick={props.onOpenVoiceSettings}>Open voice settings</Button>}
+      </section>
+    );
+  }
+  if ((voice.engineKind ?? 'pipeline') === 'realtime') {
+    return <RealtimeTalkPanel {...props} voice={voice} />;
+  }
+  return <PipelineTalkPanel {...props} />;
 }

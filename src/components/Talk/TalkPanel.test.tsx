@@ -105,6 +105,11 @@ function mock(status: Partial<TalkStatus> = {}, config: CompanionConfig = CONFIG
         return Promise.resolve(args?.config);
       case 'm7_talk_metric_record':
         return Promise.resolve({ metrics: [], interruptCount: 0, fallbackCount: 0 });
+      case 'realtime_voice_status':
+        return Promise.resolve({
+          providerId: 'openai', configured: true, activeSessions: 0,
+          endpoint: 'https://api.openai.com/v1/realtime/calls',
+        });
       case 'm7_capture_grant':
         return Promise.resolve({
           grantId: 'grant-1',
@@ -281,6 +286,36 @@ afterEach(() => {
 });
 
 describe('TalkPanel', () => {
+  it('does not guess a voice engine when settings cannot be loaded', async () => {
+    invoke.mockRejectedValue(new Error('config unavailable'));
+    render(<TalkPanel sessionId="session-1" onClose={vi.fn()} />);
+    expect((await screen.findByRole('alert')).textContent).toContain('No voice engine was started');
+    expect(commands()).not.toContain('m7_talk_status');
+    expect(commands()).not.toContain('realtime_voice_connect');
+  });
+
+  it('requires an explicit privacy acknowledgement before realtime Talk can connect', async () => {
+    mock({}, {
+      ...CONFIG,
+      voice: {
+        ...CONFIG.voice,
+        engineKind: 'realtime',
+        realtimeProviderId: 'openai',
+        realtimeModel: 'gpt-realtime-2.1',
+        realtimeVoice: 'marin',
+        realtimeTurnDetection: 'semantic_vad',
+      },
+    });
+    render(<TalkPanel sessionId="session-1" onClose={vi.fn()} />);
+
+    const start = await screen.findByRole('button', { name: 'Start realtime Talk' });
+    expect((start as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/microphone audio and the bounded conversation context are sent to OpenAI/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole('checkbox'));
+    await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(false));
+    expect(commands()).not.toContain('realtime_voice_connect');
+  });
+
   it('refuses to start when nothing can transcribe, and points at the fix', async () => {
     mock({ configured: false });
     const openSettings = vi.fn();
