@@ -427,6 +427,14 @@ const PERMISSION_GATED_TOOLS = new Set([
   'web_fetch',
   'web_search',
   ...COMPUTER_TOOL_NAMES,
+  // `tool_device_action` calls `request_permission` like every name above, so
+  // it belongs here for the plan-mode half too. But the load-bearing reason is
+  // the `turn_id`/`tool_call_id` half: that command only passes
+  // `--invocation-id` (`{turn_id}:{tool_call_id}`) to the daemon when BOTH
+  // arrive, and that id is the sole thing the daemon's unique index on
+  // `remote_device_actions(invocation_id)` has to dedupe on. Omitted from this
+  // set, a replayed turn took a second photograph.
+  'device_action',
 ]);
 
 /**
