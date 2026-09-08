@@ -82,7 +82,9 @@ pub async fn security_audit(
         runtime.voice = Some(VoicePrivacySnapshot {
             wake_phrase_enabled: voice.wake_phrase_enabled,
             always_listening: voice.always_listening,
-            local_only: voice.local_only,
+            wake_processing_local: voice.wake_processing_local,
+            passive_audio_off_device: voice.passive_audio_off_device,
+            transcription_local: voice.transcription_local,
         });
     }
 

@@ -291,6 +291,13 @@ field for audio in any of them. Wake-phrase and always-listening are off unless
 you turn them on, and Security Doctor reports both — and separately reports any
 path that would send audio off this machine.
 
+On desktop, optional wake gating is a local AudioWorklet-to-native-KWS path:
+neither Whisper nor a durable turn starts before the event, and the live
+microphone is reused for the post-wake command. On a paired phone, Talk remains
+a foreground authenticated socket with on-device VAD; it does not claim the
+desktop sherpa-onnx wake runtime or background/lock-screen wake detection. See
+[Local wake-word detection](local-wake-word.md).
+
 ## Peers
 
 Another Little Monkey installation can be paired as a peer, to exchange

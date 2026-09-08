@@ -72,6 +72,43 @@ rather than left for a reader to discover. Work that is not built yet lives in
 - VS Code completion requires an installed Ollama model advertising `insert`; its latency and compile gate cannot be claimed without one.
 - GitHub delivery needs local `git` and authenticated `gh`; hosted Actions need user-supplied provider credentials, and Ollama review needs a user-owned self-hosted runner.
 - Local OCR, meeting, and image paths require configured binaries, models, or endpoints. Transcription is built in ([zero-config local Whisper](zero-config-local-whisper.md)), but the bundled default is the `base` tier — the second-smallest — and larger tiers are downloads, not bundled. WER, diarization error rate, real-time factor, and image hardware behavior are not claimed until run against the documented external fixtures and hardware.
+- The desktop wake-word backend is an English GigaSpeech BPE model: custom
+  phrases need no retraining, but this build deliberately rejects characters
+  outside its bounded English phrase grammar and does not claim multilingual
+  wake accuracy. Exact model bytes and the native runtime are verified and
+  bundled; the archive README declares Apache License 2.0, while upstream's
+  model-license provenance clarification remains open. The dedicated workflow
+  runs the real runtime and the acceptance walkthrough natively on **five** of
+  the six supported targets — macOS arm64, Linux arm64 and x86_64, Windows
+  arm64 and x86_64 — rather than inferring them from compilation, and those
+  five have run green on hosted runners. **Intel macOS is compiled and not
+  run**, and that is all that is claimed for it: GitHub's `macos-13` image is
+  retired and is cancelled without executing a step, so there is no host to run
+  it on, and a target that compiles has proved the archive mapping and nothing
+  about whether the model opens. A separate job builds one installer per
+  release target that has a runner — Linux `.deb` on both architectures, the
+  macOS `.dmg` mounted, and the Windows installer on both
+  architectures — and asserts each one carries every model file and no test
+  audio; Intel macOS has no such job for the same reason. The one acceptance
+  step nothing here performs is a person speaking into a real microphone: the
+  walkthrough drives the real spotter and the real Whisper from an audio
+  fixture, and the physical-device run — real `getUserMedia`, real AudioWorklet,
+  real model answer, real speaker — is an operator procedure
+  ([local-wake-word.md](local-wake-word.md#what-no-test-performs)) and is not
+  recorded as done. sherpa's keyword API reports token
+  timestamps relative to a decoding segment it restarts on silence without
+  saying so, and exposes no absolute position, so a keyword spotted late in a
+  long-armed session is anchored to the frame that revealed it rather than to a
+  position the ring cannot prove: the wake phrase never reaches transcription,
+  and up to one decode chunk of the command's first moments can. Trigger latency
+  is reported only for detections whose position was provable. Idle CPU is
+  whole-process CPU across the armed window and resident model memory is the
+  process's resident growth across the one model load — both measured, both
+  reported as unmeasured where the platform will not answer. The fifteen-step
+  acceptance walkthrough runs against the real spotter and the real Whisper but
+  cannot click an operating-system microphone prompt; that grant is the one step
+  no test performs, though both of its answers — refusal and mid-session
+  revocation — are covered. See [Local wake-word detection](local-wake-word.md).
 - The executable extension marketplace distributes only what a verified registry actually serves: the bundled first-party M4 catalog currently contains declarative built-ins, so acquiring an executable extension requires adding a verified source with artifact locations. `automatic_safe` updates pause for review whenever a granted permission has a host-only binding, because the canonical workspace binding is deliberately never reconstructed from a display label.
 - Standards Studio discovery is deterministic and bounded — file count, recursion depth, per-evidence and total scan bytes — and repository text only ever creates unapproved candidates. A convention the detectors do not model is not discovered, and injection requires both approval and task relevance, so an approved standard may legitimately be absent from a turn that never touched its scope.
 - Remote handoff requires a user-owned reachable network and valid TLS identity. There is no relay, account service, RBAC/SSO plane, or hosted GPU.

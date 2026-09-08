@@ -19,6 +19,41 @@ export interface TalkStatus {
   activeJobs: number;
   /** Live microphone/meeting capture grants. Non-zero means something can hear. */
   activeMicrophoneGrants: number;
+  wakeWord?: WakeWordRuntimeStatus;
+}
+
+export interface WakeWordRuntimeStatus {
+  backend: string;
+  local: boolean;
+  runtimeVersion: string;
+  modelId: string;
+  modelLicense: string;
+  available: boolean;
+  loaded: boolean;
+  acceptingAudio: boolean;
+  sampleRate: number;
+  modelBytes: number;
+  modelMemoryBytes: number | null;
+  idleCpuPercent: number | null;
+  averageInferenceMs: number | null;
+  averageDetectionLatencyMs: number | null;
+  detections: number;
+  /** Wake events the operator said were not them. A count, never the audio. */
+  falseTriggerReports: number;
+  droppedFrames: number;
+  lastError: string | null;
+}
+
+export interface WakeWordSessionStarted {
+  sessionId: string;
+  status: WakeWordRuntimeStatus;
+}
+
+export interface WakeWordDetection {
+  detected: true;
+  sessionId: string;
+  keywordEndSample: number;
+  inferenceMs: number;
 }
 
 /** One turn's bounded latency sample. Never carries a transcript or audio. */
@@ -76,15 +111,28 @@ export const talkClient = {
   recordMetric: (metric: TalkMetric) =>
     invoke<TalkMetricsSnapshot>('m7_talk_metric_record', { metric }),
   clearMetrics: () => invoke<TalkMetricsSnapshot>('m7_talk_metrics_clear'),
+  wakeWordStatus: () => invoke<WakeWordRuntimeStatus>('m7_wake_word_status'),
+  wakeWordStart: (grantId: string) =>
+    invoke<WakeWordSessionStarted>('m7_wake_word_start', { grantId }),
+  wakeWordPush: (grantId: string, sessionId: string, samples: ArrayLike<number>) =>
+    invoke<WakeWordDetection | null>('m7_wake_word_push', {
+      grantId,
+      sessionId,
+      samples: Array.from(samples),
+    }),
+  wakeWordStop: (sessionId: string, droppedFrames = 0) =>
+    invoke<boolean>('m7_wake_word_stop', { sessionId, droppedFrames }),
+  wakeWordReportFalseTrigger: () =>
+    invoke<WakeWordRuntimeStatus>('m7_wake_word_report_false_trigger'),
   /**
    * Transcribe one utterance for Talk.
    *
    * Deliberately not `m7_transcribe_audio`: that command publishes the
    * transcript — and, when the operator turned `saveRawAudio` on, the audio
    * itself — as artifacts. A spoken conversation is not a recording somebody
-   * asked to keep, and a wake-phrase fragment that turns out not to contain the
-   * phrase must leave nothing behind at all. This one holds the bytes for the
-   * length of the call and publishes nothing.
+   * asked to keep. Passive wake audio never calls this command; this one holds
+   * only the post-wake command bytes for the length of the call and publishes
+   * nothing.
    */
   transcribe: (
     grantId: string,
