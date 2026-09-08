@@ -72,6 +72,10 @@ export interface VoiceConfig {
    * enable it unless transcription runs on this machine. */
   wakePhraseEnabled: boolean;
   wakePhrase: string;
+  /** Native local keyword spotter. Currently `sherpa_onnx`. */
+  wakeWordBackend?: string;
+  /** 0 is strictest, 100 is most sensitive. */
+  wakeWordSensitivity?: number;
   /** Continuous local listening for the wake phrase. Requires the phrase. */
   alwaysListening: boolean;
   /** Native composer dictation locale; null means the operating-system default. */
@@ -278,6 +282,16 @@ export const companionClient = {
     listen<ImageProgressPayload>("m7://image-progress", (event) => listener(event.payload)),
   onEmergencyStop: (listener: () => void): Promise<UnlistenFn> =>
     listen("m7://emergency-stop", () => listener()),
+  /**
+   * A saved configuration replaced the one in memory — somewhere, by somebody.
+   *
+   * Emitted by `m7_config_save` and carrying only the saving window's label:
+   * re-read `config()` rather than trusting a payload. What this exists for is
+   * Always Listening, which is switched off in Settings while the surface it
+   * opened a microphone for is running on the configuration it read once.
+   */
+  onConfigChanged: (listener: () => void): Promise<UnlistenFn> =>
+    listen("m7://config-changed", () => listener()),
 };
 
 export function blobToBase64(blob: Blob): Promise<string> {

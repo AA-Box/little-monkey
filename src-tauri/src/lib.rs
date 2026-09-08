@@ -141,6 +141,7 @@ pub mod runtime_telemetry;
 // every grant and cancel every child/network task before Tauri exits.
 pub mod dictation;
 pub mod local_whisper;
+pub mod local_wake_word;
 pub mod m7_companion;
 pub mod realtime_voice;
 // Global Command Palette (ROADMAP.md, Phase 1): owns only the OS-level
@@ -1133,7 +1134,9 @@ pub fn run() {
             {
                 // The installed app carries the model as a bundled resource;
                 // prepare() then has nothing to download at all.
-                local_whisper::set_resource_dir(app.path().resource_dir().ok().as_deref());
+                let speech_resource_dir = app.path().resource_dir().ok();
+                local_whisper::set_resource_dir(speech_resource_dir.as_deref());
+                local_wake_word::set_resource_dir(speech_resource_dir.as_deref());
                 let speech_data_dir = app_data_dir.clone();
                 tauri::async_runtime::spawn(async move {
                     // The configured tier, not always the bundled one: an
@@ -2022,6 +2025,11 @@ pub fn run() {
             m7_companion::m7_transcription_models,
             m7_companion::m7_transcription_model_install,
             m7_companion::m7_talk_status,
+            m7_companion::m7_wake_word_status,
+            m7_companion::m7_wake_word_start,
+            m7_companion::m7_wake_word_push,
+            m7_companion::m7_wake_word_stop,
+            m7_companion::m7_wake_word_report_false_trigger,
             m7_companion::m7_talk_metrics,
             m7_companion::m7_talk_metric_record,
             m7_companion::m7_talk_metrics_clear,

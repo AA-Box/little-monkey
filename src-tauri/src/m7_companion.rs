@@ -142,6 +142,14 @@ fn default_realtime_turn_detection() -> String {
     "semantic_vad".to_string()
 }
 
+fn default_wake_word_backend() -> String {
+    crate::local_wake_word::BACKEND_ID.to_string()
+}
+
+fn default_wake_word_sensitivity() -> u8 {
+    50
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VoiceConfig {
@@ -210,6 +218,13 @@ pub struct VoiceConfig {
     pub wake_phrase_enabled: bool,
     #[serde(default = "default_wake_phrase")]
     pub wake_phrase: String,
+    /// Native KWS implementation. There is deliberately one supported value;
+    /// persisting it makes migrations and capability truth explicit.
+    #[serde(default = "default_wake_word_backend")]
+    pub wake_word_backend: String,
+    /// 0 is strictest and 100 is most sensitive.
+    #[serde(default = "default_wake_word_sensitivity")]
+    pub wake_word_sensitivity: u8,
     #[serde(default)]
     pub always_listening: bool,
     /// Native composer dictation locale; None selects the system default.
@@ -252,6 +267,8 @@ impl Default for VoiceConfig {
             vad_max_utterance_ms: default_vad_max_utterance_ms(),
             wake_phrase_enabled: false,
             wake_phrase: default_wake_phrase(),
+            wake_word_backend: default_wake_word_backend(),
+            wake_word_sensitivity: default_wake_word_sensitivity(),
             always_listening: false,
             dictation_language: None,
             dictation_require_on_device: false,
@@ -280,7 +297,7 @@ pub struct TalkMetricsSnapshot {
     pub fallback_count: usize,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TalkStatus {
     pub configured: bool,
@@ -289,6 +306,7 @@ pub struct TalkStatus {
     pub backend: TranscriptionBackendKind,
     pub active_jobs: usize,
     pub active_microphone_grants: usize,
+    pub wake_word: crate::local_wake_word::WakeWordRuntimeStatus,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -312,7 +330,9 @@ pub struct TalkTranscript {
 pub struct VoicePrivacySnapshot {
     pub wake_phrase_enabled: bool,
     pub always_listening: bool,
-    pub local_only: bool,
+    pub wake_processing_local: bool,
+    pub passive_audio_off_device: bool,
+    pub transcription_local: bool,
     pub realtime_configured: bool,
     pub realtime_provider_id: Option<String>,
 }
@@ -432,6 +452,7 @@ pub struct M7CompanionState {
     jobs: Mutex<BTreeMap<String, CancellationToken>>,
     gallery: Mutex<Vec<ImageGalleryEntry>>,
     talk_metrics: Mutex<Vec<TalkMetric>>,
+    wake_word: crate::local_wake_word::WakeWordManager,
     artifacts: ArtifactStore,
 }
 
@@ -545,6 +566,7 @@ impl M7CompanionState {
             jobs: Mutex::new(BTreeMap::new()),
             gallery: Mutex::new(gallery),
             talk_metrics: Mutex::new(talk_metrics),
+            wake_word: crate::local_wake_word::WakeWordManager::default(),
             artifacts: ArtifactStore::with_max_blob_size(
                 app_data_dir.join("content-v1"),
                 MAX_MEDIA_BYTES,
@@ -606,7 +628,17 @@ impl M7CompanionState {
         Ok(VoicePrivacySnapshot {
             wake_phrase_enabled: voice.wake_phrase_enabled,
             always_listening: voice.always_listening,
-            local_only: voice.engine_kind == VoiceEngineKind::Pipeline
+            wake_processing_local: voice.wake_word_backend == crate::local_wake_word::BACKEND_ID,
+            // The wake subsystem accepts PCM only through a native in-process
+            // API. Transcription begins after detection, so even a separately
+            // configured hosted STT backend has no passive-audio path.
+            passive_audio_off_device: false,
+            // The realtime engine streams live microphone audio to the provider
+            // instead of transcribing on this machine, so selecting it makes
+            // this false however local the classic STT backend is. Reading only
+            // `backend` here would claim local transcription for a session
+            // whose audio never reaches Whisper.
+            transcription_local: voice.engine_kind == VoiceEngineKind::Pipeline
                 && voice.backend == TranscriptionBackendKind::LocalWhisper,
             realtime_configured: voice.engine_kind == VoiceEngineKind::Realtime,
             realtime_provider_id: (voice.engine_kind == VoiceEngineKind::Realtime)
@@ -836,7 +868,9 @@ fn validate_url(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_config(config: &CompanionConfig) -> Result<(), String> {
+/// Exposed so the wake-word acceptance harness in `bin/wake-word-e2e.rs` runs
+/// the operator's real save-time validator rather than a copy of its rules.
+pub fn validate_config(config: &CompanionConfig) -> Result<(), String> {
     if config.schema_version != CONFIG_SCHEMA_VERSION
         || config.overlay_shortcut.is_empty()
         || config.overlay_shortcut.len() > 128
@@ -898,6 +932,12 @@ fn validate_config(config: &CompanionConfig) -> Result<(), String> {
     {
         return Err("Wake phrase is invalid".to_string());
     }
+    if config.voice.wake_word_backend != crate::local_wake_word::BACKEND_ID {
+        return Err("Only the local sherpa-onnx wake-word backend is supported".to_string());
+    }
+    if config.voice.wake_word_sensitivity > 100 {
+        return Err("Wake-word sensitivity must be between 0 and 100".to_string());
+    }
     if config.voice.always_listening && !config.voice.wake_phrase_enabled {
         return Err("Always-listening requires the wake phrase to be enabled".to_string());
     }
@@ -912,7 +952,18 @@ fn validate_config(config: &CompanionConfig) -> Result<(), String> {
     if (config.voice.wake_phrase_enabled || config.voice.always_listening)
         && config.voice.backend != TranscriptionBackendKind::LocalWhisper
     {
-        return Err("Wake phrase listening is local-only and requires local Whisper".to_string());
+        return Err(
+            "Wake-word listening requires local Whisper for command transcription".to_string(),
+        );
+    }
+    // Old versions accepted punctuation and non-English text here. Preserve a
+    // disabled legacy value so saving an unrelated setting remains possible;
+    // require the real model's grammar before the microphone can be armed.
+    if config.voice.wake_phrase_enabled || config.voice.always_listening {
+        crate::local_wake_word::validate_configuration(
+            &config.voice.wake_phrase,
+            config.voice.wake_word_sensitivity,
+        )?;
     }
     config
         .overlay_shortcut
@@ -1178,6 +1229,19 @@ pub fn m7_config_get(state: tauri::State<'_, M7CompanionState>) -> Result<Compan
     state.config()
 }
 
+/// Broadcast whenever a saved configuration replaces the one in memory.
+///
+/// Voice settings are not inert preferences: Always Listening is the only
+/// reason this application ever opens a microphone nobody pressed anything
+/// for, and it is turned off from Settings while the surface that opened that
+/// microphone is on screen somewhere else. A setting that changed and told
+/// nobody leaves that surface running on the configuration it read once, which
+/// is how "Always Listening off" became a claim rather than an act. Carries
+/// the saving window's label like every other changed-event here, and no
+/// configuration: a listener re-reads `m7_config_get`, which it is already
+/// allowed to call, so nothing is broadcast that was not already readable.
+pub const CONFIG_CHANGED_EVENT: &str = "m7://config-changed";
+
 #[tauri::command]
 pub fn m7_config_save(
     app: tauri::AppHandle,
@@ -1187,6 +1251,19 @@ pub fn m7_config_save(
 ) -> Result<CompanionConfig, String> {
     ensure_main_window(&window)?;
     validate_config(&config)?;
+    let saved = save_validated_config(&app, &state, config)?;
+    // Best-effort fan-out; the save itself already succeeded.
+    let _ = app.emit(CONFIG_CHANGED_EVENT, window.label());
+    Ok(saved)
+}
+
+/// The save itself, minus the window check, the validator and the fan-out, so
+/// that every path out of it is announced exactly once.
+fn save_validated_config(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, M7CompanionState>,
+    config: CompanionConfig,
+) -> Result<CompanionConfig, String> {
     let previous_config = state.config()?;
     let previous = previous_config.overlay_shortcut.clone();
     if previous == config.overlay_shortcut {
@@ -1325,7 +1402,75 @@ pub fn m7_talk_status(
         backend: voice.backend,
         active_jobs: lock(&state.jobs, "companion jobs")?.len(),
         active_microphone_grants,
+        wake_word: state.wake_word.status()?,
     })
+}
+
+#[tauri::command]
+pub fn m7_wake_word_status(
+    window: tauri::Window,
+    state: tauri::State<'_, M7CompanionState>,
+) -> Result<crate::local_wake_word::WakeWordRuntimeStatus, String> {
+    ensure_main_window(&window)?;
+    state.wake_word.status()
+}
+
+/// The operator says a wake event was not them. Nothing but the count is kept,
+/// and no grant is required: reporting a false wake is not a capture.
+#[tauri::command]
+pub fn m7_wake_word_report_false_trigger(
+    window: tauri::Window,
+    state: tauri::State<'_, M7CompanionState>,
+) -> Result<crate::local_wake_word::WakeWordRuntimeStatus, String> {
+    ensure_main_window(&window)?;
+    state.wake_word.report_false_trigger()
+}
+
+#[tauri::command]
+pub fn m7_wake_word_start(
+    window: tauri::Window,
+    state: tauri::State<'_, M7CompanionState>,
+    grant_id: String,
+) -> Result<crate::local_wake_word::WakeWordSessionStarted, String> {
+    ensure_main_window(&window)?;
+    state.require_grant(&grant_id, &BTreeSet::from([CaptureKind::Microphone]))?;
+    let voice = state.config()?.voice;
+    if !voice.wake_phrase_enabled {
+        return Err("Wake word is off".to_string());
+    }
+    if voice.wake_word_backend != crate::local_wake_word::BACKEND_ID {
+        return Err("Always-listening requires a local wake-word backend".to_string());
+    }
+    state.wake_word.start(
+        &voice.wake_phrase,
+        voice.wake_word_sensitivity as f32 / 100.0,
+    )
+}
+
+#[tauri::command]
+pub fn m7_wake_word_push(
+    window: tauri::Window,
+    state: tauri::State<'_, M7CompanionState>,
+    grant_id: String,
+    session_id: String,
+    samples: Vec<f32>,
+) -> Result<Option<crate::local_wake_word::WakeWordDetection>, String> {
+    ensure_main_window(&window)?;
+    state.require_grant(&grant_id, &BTreeSet::from([CaptureKind::Microphone]))?;
+    state
+        .wake_word
+        .push(&session_id, crate::local_wake_word::SAMPLE_RATE, &samples)
+}
+
+#[tauri::command]
+pub fn m7_wake_word_stop(
+    window: tauri::Window,
+    state: tauri::State<'_, M7CompanionState>,
+    session_id: String,
+    dropped_frames: u64,
+) -> Result<bool, String> {
+    ensure_main_window(&window)?;
+    state.wake_word.stop(&session_id, dropped_frames)
 }
 
 #[tauri::command]
@@ -3177,6 +3322,11 @@ mod tests {
         assert_eq!(config.voice.vad_max_utterance_ms, 90_000);
         assert!(!config.voice.wake_phrase_enabled);
         assert!(!config.voice.always_listening);
+        assert_eq!(
+            config.voice.wake_word_backend,
+            crate::local_wake_word::BACKEND_ID
+        );
+        assert_eq!(config.voice.wake_word_sensitivity, 50);
         assert_eq!(config.voice.tts_backend, SpeechBackendKind::System);
         assert_eq!(config.voice.engine_kind, VoiceEngineKind::Pipeline);
         assert_eq!(config.voice.realtime_provider_id, "openai");
@@ -3200,6 +3350,9 @@ mod tests {
     #[test]
     fn wake_phrase_is_opt_in_and_local_only() {
         let mut config = CompanionConfig::default();
+        config.voice.wake_phrase = "hey, little monkey!".to_string();
+        assert!(validate_config(&config).is_ok());
+        config.voice.wake_phrase = default_wake_phrase();
         config.voice.backend = TranscriptionBackendKind::Provider;
         config.voice.provider_id = Some("operator-provider".to_string());
         config.voice.wake_phrase_enabled = true;
@@ -3208,6 +3361,13 @@ mod tests {
         config.voice.backend = TranscriptionBackendKind::LocalWhisper;
         config.voice.always_listening = true;
         assert!(validate_config(&config).is_ok());
+
+        config.voice.wake_word_backend = "hosted_kws".to_string();
+        assert!(validate_config(&config).is_err());
+        config.voice.wake_word_backend = crate::local_wake_word::BACKEND_ID.to_string();
+        config.voice.wake_word_sensitivity = 101;
+        assert!(validate_config(&config).is_err());
+        config.voice.wake_word_sensitivity = 50;
 
         config.voice.wake_phrase_enabled = false;
         assert!(validate_config(&config).is_err());
@@ -3220,9 +3380,8 @@ mod tests {
     /// publishing the transcript and, when it is on, the audio. A conversation
     /// is not a recording somebody asked for, so Talk transcribes through its
     /// own command, which publishes nothing at all. It is also what makes the
-    /// wake phrase's promise true: a fragment that turns out not to contain the
-    /// phrase is dropped by the engine, and if transcription had already
-    /// published it, "the detection stops on this machine" would be false.
+    /// wake word's promise true: passive PCM never calls this command at all,
+    /// and post-wake command audio is removed as soon as inference completes.
     ///
     /// Scanned rather than executed because the alternative needs a whisper
     /// build and a window. The defect class is a call site that looks fine on

@@ -19,24 +19,30 @@ import { useTalkSession } from './useTalkSession';
 import { RealtimeTalkPanel } from './RealtimeTalkPanel';
 
 const STATE_LABEL: Record<TalkState, string> = {
-  idle: 'Not listening',
+  off: 'Not listening',
   starting: 'Starting…',
-  listening: 'Listening',
+  armed: 'Ready',
+  wake_detected: 'Wake word detected',
+  capturing_command: 'Listening',
   transcribing: 'Transcribing',
   thinking: 'Thinking',
   speaking: 'Speaking',
   interrupted: 'Interrupted',
+  rearming: 'Rearming wake word…',
   error: 'Something went wrong',
 };
 
 const STATE_TONE: Record<TalkState, string> = {
-  idle: 'bg-muted',
+  off: 'bg-muted',
   starting: 'bg-accent animate-pulse',
-  listening: 'bg-success animate-pulse',
+  armed: 'bg-success animate-pulse',
+  wake_detected: 'bg-success',
+  capturing_command: 'bg-success animate-pulse',
   transcribing: 'bg-accent animate-pulse',
   thinking: 'bg-accent animate-pulse',
   speaking: 'bg-accent',
   interrupted: 'bg-warning',
+  rearming: 'bg-accent animate-pulse',
   error: 'bg-danger',
 };
 
@@ -67,8 +73,8 @@ function PipelineTalkPanel({
     sessionRef,
   } = useTalkSession(sessionId);
 
-  const state = snapshot?.state ?? 'idle';
-  const running = state !== 'idle';
+  const state = snapshot?.state ?? 'off';
+  const running = state !== 'off';
   const answering = state === 'thinking' || state === 'speaking';
 
   return (
@@ -79,7 +85,7 @@ function PipelineTalkPanel({
           <h2 className="text-sm font-semibold">Talk</h2>
           <p role="status" aria-live="polite" className="truncate text-xs text-muted">
             {STATE_LABEL[state]}
-            {snapshot?.awaitingWakePhrase && state === 'listening' ? ' — waiting for the wake phrase' : ''}
+            {snapshot?.awaitingWakeWord && state === 'armed' ? ' — listening for the wake word' : ''}
           </p>
         </div>
         <div className="ml-auto flex items-center gap-2">
@@ -118,8 +124,9 @@ function PipelineTalkPanel({
           className="flex items-center gap-2 border-b border-danger/40 bg-danger/10 px-4 py-2 text-xs font-medium text-danger"
         >
           <Radio size={14} className="shrink-0 animate-pulse" />
-          Always-listening is on: opening Talk starts capturing on this machine and closing it stops,
-          and only what follows the wake phrase is sent anywhere.
+          {state === 'armed'
+            ? 'Always listening is on: the microphone is active, local keyword spotting is armed, and full transcription starts only after the wake word.'
+            : 'Always listening is on, but Talk is not claiming wake readiness until the microphone and local keyword spotter are armed.'}
           <Button
             className="ml-auto"
             size="sm"

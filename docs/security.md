@@ -25,6 +25,21 @@ An origin outside this machine — a message on a channel, a text or a caller, a
 
 Security Doctor is a posture aid, not a substitute for operating-system updates, endpoint security, or a release penetration test. It covers storage, network listeners, MCP origins, extensions, skills, process isolation, browser and companion grants, voice, paired devices, messaging channels, telephony and peers; the desktop panel and `monkey security audit` run the same checks over the same state.
 
+Desktop wake-word listening has a narrower audio boundary than transcription.
+Before a native wake event, bounded PCM exists only in renderer memory and the
+local sherpa-onnx stream. It has no application-log, support-bundle, analytics,
+ledger, diagnostic, database, artifact, or crash-report field; Whisper and the
+agent are not invoked. After wake, only the command portion is passed to the
+built-in local Whisper path — and where the keyword's exact position cannot be
+proven, that portion starts at the audio frame that revealed the keyword rather
+than at a guess that could reach back over the phrase itself. Switching Always
+Listening off is an act rather than a preference: the hook that owns the
+devices re-reads the saved configuration and closes the microphone that setting
+opened, so the finding below and the open device cannot disagree. Security
+Doctor reports wake enabled, Always
+Listening enabled, local/non-local processing, and passive off-device audio as
+four independent findings; any passive network path is Critical. Details and
+the executable boundary test are in [Local wake-word detection](local-wake-word.md).
 Desktop realtime Talk is brokered natively: the WebView sends an SDP offer,
 the native host reads the ordinary OpenAI key from the existing OS keychain and
 contacts only the compiled-in OpenAI Realtime calls origin, then returns an SDP
