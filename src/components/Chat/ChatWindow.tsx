@@ -330,6 +330,9 @@ interface ChatWindowProps {
   onOpenBackgroundTasks?: () => void;
   onOpenPmCopilot?: () => void;
   onOpenStudio?: () => void;
+  /** Realtime mode needs the full surface so its privacy warning is shown
+   * before any microphone is opened. */
+  onOpenTalk?: () => void;
 }
 
 interface ComposerDraftSnapshot {
@@ -338,7 +341,7 @@ interface ComposerDraftSnapshot {
   pastedPlacements: PastedTextPlacement[];
 }
 
-export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks, onOpenPmCopilot, onOpenStudio }: ChatWindowProps) {
+export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks, onOpenPmCopilot, onOpenStudio, onOpenTalk }: ChatWindowProps) {
   const messages = useSessionStore(selectSessionMessages(sessionId));
   const persistError = useSessionStore((state) => state.persistError);
   const roots = useWorkspaceStore((state) => state.roots);
@@ -1472,8 +1475,14 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   // the microphone when `talkActive` goes false; stopping the engine first is
   // what makes the speaker go quiet in the same moment rather than a chunk later.
   const startTalk = useCallback(() => {
-    setTalkActive(true);
-  }, []);
+    void companionClient.config()
+      .then((config) => {
+        if (config.voice.engineKind === 'realtime' && onOpenTalk) onOpenTalk();
+        else setTalkActive(true);
+      })
+      // Unknown configuration must not silently select a voice/privacy path.
+      .catch(() => { onOpenTalk?.(); });
+  }, [onOpenTalk]);
   const stopTalk = useCallback(() => {
     void talk.stop();
     setTalkActive(false);
