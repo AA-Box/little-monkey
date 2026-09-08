@@ -233,9 +233,12 @@ describe('realtime tool identity across a reconnect', () => {
 
   it('refuses even a read-only tool of unknown outcome, because the classification cannot be trusted', async () => {
     // Deciding this per tool would mean betting a side effect on a read-only
-    // marking the frontend does not actually have: `isBlockedInPlanMode` misses
-    // `device_action`, for one. The cost of failing closed is a single refusal
-    // the operator clears by asking again, which starts a fresh voice turn.
+    // marking the frontend does not actually have. The nearest thing to one is
+    // `isBlockedInPlanMode`, and it answers a different question — "does this
+    // need permission", not "is a second run of it harmless" — so a tool absent
+    // from it is not thereby known to be safe to reissue. The cost of failing
+    // closed is a single refusal the operator clears by asking again, which
+    // starts a fresh voice turn.
     const execute = vi.fn(async () => '{"ok":true}');
     await persistStartedToolCall('read_file', '{"path":"a"}', 'vt-1', 'item_A');
     const result = await issue(

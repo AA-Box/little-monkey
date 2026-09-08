@@ -291,6 +291,27 @@ pub enum ExternalEffectKind {
     /// a turn that is reverted should not keep proposing work it proposed while
     /// doing something the user has since taken back.
     TaskSuggestion,
+    /// A paired phone or tablet used its own hardware (`device_action`): a
+    /// photograph was taken, a notification appeared in a room somebody is in,
+    /// a location fix was read, audio was played aloud.
+    ///
+    /// Its own variant rather than folded into [`ExternalEffectKind::Network`]
+    /// because the two call for different judgement, which is the whole point
+    /// of the set being enumerated: an un-sent request is a wasted round trip,
+    /// and a photograph is a thing that happened in a room.
+    Device,
+    /// Input was delivered to another application on this machine by one of the
+    /// actuating `computer_*` tools — a click, a keystroke, a scroll, a
+    /// selection.
+    ///
+    /// Distinct from [`ExternalEffectKind::Shell`] even though both are
+    /// "arbitrary local effects": a shell command is text this app ran, while
+    /// this drove a UI whose state nothing here recorded. Only the tools that
+    /// actually send input record it; the observing ones
+    /// (`computer_list_targets`, `computer_inspect`, `computer_screenshot`,
+    /// `computer_clipboard_read`) and `computer_wait` record nothing, because
+    /// reading is not an effect to reconcile.
+    DesktopControl,
 }
 
 /// Whether reverting a checkpoint can undo an effect, and what does it.
@@ -325,12 +346,14 @@ impl ExternalEffectKind {
             ExternalEffectKind::McpTool => "mcp-tool",
             ExternalEffectKind::Memory => "memory",
             ExternalEffectKind::TaskSuggestion => "task-suggestion",
+            ExternalEffectKind::Device => "device",
+            ExternalEffectKind::DesktopControl => "desktop-control",
         }
     }
 
     /// What, if anything, undoes this effect.
     ///
-    /// One arm of the four has a real undo. The type was deliberately an enum
+    /// Two arms have a real undo. The type was deliberately an enum
     /// with a single `None` variant while that was true of none of them, and
     /// adding [`Compensation::Undo`] was then a compile error at every match
     /// rather than a bool somebody forgets to flip — which is the whole reason
@@ -351,7 +374,7 @@ impl ExternalEffectKind {
             ExternalEffectKind::McpTool => Compensation::None {
                 reason: "an MCP server's effects are outside this app entirely",
             },
-            // The one effect of the four this app can genuinely take back. A
+            // The first effect this app can genuinely take back. A
             // remembered fact is this app's own record, `Fact::source_turn_id`
             // already names the turn that added it, and `delete_fact_impl`
             // already removes one — so reverting the turn removes the facts
@@ -386,6 +409,15 @@ impl ExternalEffectKind {
             // store happens to sit on.
             ExternalEffectKind::TaskSuggestion => Compensation::Undo {
                 action: "withdraw the follow-up task chips this turn proposed",
+            },
+            ExternalEffectKind::Device => Compensation::None {
+                reason: "the device already did it — a photograph is taken, a \
+                         notification is seen, and neither is on this machine \
+                         to take back",
+            },
+            ExternalEffectKind::DesktopControl => Compensation::None {
+                reason: "the input reached another application, and nothing \
+                         here recorded what that application did with it",
             },
         }
     }
@@ -2805,7 +2837,7 @@ mod tests {
         record_remembered_fact(&state, Some("nope"), fact).unwrap();
     }
 
-    /// Two of the five effects this app can take back, and three it cannot —
+    /// Two of the effects this app can take back, and the rest it cannot —
     /// which is what K14's acceptance means by `needs_reconciliation` becoming
     /// the exception for an enumerated set rather than the default answer for
     /// everything outside the workspace files.
@@ -2814,7 +2846,7 @@ mod tests {
     /// something can be done. An uncompensated one says why nothing can, in its
     /// own words rather than a shared caveat.
     #[test]
-    fn the_two_undoable_effects_are_compensated_and_the_other_three_say_why_not() {
+    fn the_two_undoable_effects_are_compensated_and_the_others_say_why_not() {
         for kind in [
             ExternalEffectKind::Memory,
             ExternalEffectKind::TaskSuggestion,
@@ -2831,12 +2863,88 @@ mod tests {
             ExternalEffectKind::Shell,
             ExternalEffectKind::Network,
             ExternalEffectKind::McpTool,
+            ExternalEffectKind::Device,
+            ExternalEffectKind::DesktopControl,
         ] {
             let Compensation::None { reason } = kind.compensator() else {
                 panic!("{kind:?} has no undo in this app and must not claim one");
             };
             assert!(reason.len() > 20, "{kind:?} refuses without a reason");
         }
+    }
+
+    /// Every kind's persisted code is distinct and non-empty. `code()` is the
+    /// stable identity the manifest is written with and the frontend switches
+    /// its wording on, so two kinds sharing one — the shape a copy-pasted new
+    /// arm takes — would silently merge them on read.
+    #[test]
+    fn every_effect_kind_has_its_own_stable_code() {
+        let kinds = [
+            ExternalEffectKind::Shell,
+            ExternalEffectKind::Network,
+            ExternalEffectKind::McpTool,
+            ExternalEffectKind::Memory,
+            ExternalEffectKind::TaskSuggestion,
+            ExternalEffectKind::Device,
+            ExternalEffectKind::DesktopControl,
+        ];
+        let codes: std::collections::BTreeSet<&str> =
+            kinds.iter().map(|kind| kind.code()).collect();
+        assert_eq!(codes.len(), kinds.len(), "two effect kinds share a code");
+        assert!(kinds.iter().all(|kind| !kind.code().is_empty()));
+        // Pinned rather than merely derived: these strings are already in
+        // written manifests and in `en.ts`'s `CheckpointPreview.effectKind.*`
+        // keys, so renaming one is a migration, not a rewording.
+        assert_eq!(ExternalEffectKind::Device.code(), "device");
+        assert_eq!(
+            ExternalEffectKind::DesktopControl.code(),
+            "desktop-control"
+        );
+    }
+
+    /// A device action and a control action are separate entries rather than one
+    /// merged "something happened outside the files": the preview shows one line
+    /// per kind, and "a photograph was taken" and "a keystroke reached another
+    /// application" are different things to reconcile.
+    #[test]
+    fn a_device_action_and_a_control_action_are_recorded_as_distinct_effects() {
+        let state = AppState::default();
+        let base = TempDir::new("device-effects");
+        let ws = TempDir::new("device-effects-ws");
+        let file = ws.path.join("f.txt");
+        std::fs::write(&file, "v1").unwrap();
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &file).unwrap();
+        std::fs::write(&file, "v2").unwrap();
+
+        commit_external_effect(&state, Some(&id), ExternalEffectKind::Device).unwrap();
+        // Declared and never committed — the action reached the application but
+        // this app never saw it finish, which must read as "may have happened".
+        record_external_effect(&state, Some(&id), ExternalEffectKind::DesktopControl).unwrap();
+        end_impl(&state, &id).unwrap();
+
+        let manifest = read_manifest(&base.path, &id).unwrap();
+        assert!(manifest
+            .external_effects
+            .contains(&ExternalEffectKind::Device));
+        assert!(manifest
+            .external_effects
+            .contains(&ExternalEffectKind::DesktopControl));
+        let committed = manifest.committed_effects.clone().unwrap_or_default();
+        assert!(committed.contains(&ExternalEffectKind::Device));
+        assert!(
+            !committed.contains(&ExternalEffectKind::DesktopControl),
+            "an uncommitted control action must not read as observed to complete"
+        );
+        // Neither kind is undoable, so a turn that did either still needs a
+        // human — and neither implies a shell command ran.
+        assert!(!manifest.shell_ran);
+        assert!(
+            simulate_restore_impl(&base.path, &id)
+                .unwrap()
+                .needs_reconciliation,
+            "a photograph and a keystroke are both outside this app's undo"
+        );
     }
 
     /// A turn whose only external effect is a staged chip no longer reports as

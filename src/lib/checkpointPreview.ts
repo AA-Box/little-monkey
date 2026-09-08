@@ -96,16 +96,17 @@ export interface RestorePlanEntry {
 
 /** One external effect the backend recorded, and what undoes it. */
 export interface ExternalEffectRecord {
-  kind: 'shell' | 'network' | 'mcp-tool' | 'memory' | 'task-suggestion';
+  kind: 'shell' | 'network' | 'mcp-tool' | 'memory' | 'task-suggestion' | 'device' | 'desktop-control';
   /** A tagged object rather than a bool, which is what made adding the first
    * real undo a compile error at every reader instead of a flag somebody
    * forgets to check.
    *
-   * `undo` exists for `memory`: a remembered fact is this app's own record, and
-   * reverting the turn forgets exactly the facts that turn added. The other
-   * three are still `none`, each with its own reason — a shell command can
-   * change anything, a request cannot be un-sent, an MCP server is outside this
-   * app. */
+   * `undo` exists for `memory` and `task-suggestion`: both are this app's own
+   * records, and reverting the turn takes back exactly what that turn added.
+   * The rest are `none`, each with its own reason — a shell command can change
+   * anything, a request cannot be un-sent, an MCP server is outside this app, a
+   * device already took the photograph, and a keystroke already reached another
+   * application. */
   compensation: { kind: 'none'; reason: string } | { kind: 'undo'; action: string };
   /** How far the effect got through the declare-then-commit contract.
    *

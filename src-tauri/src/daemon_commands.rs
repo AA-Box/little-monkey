@@ -2575,6 +2575,7 @@ pub async fn tool_device_action(
     wait_ms: Option<u64>,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<Value, String> {
     validate_token("device action", &action, 64)?;
     let detail = match &device_id {
@@ -2592,6 +2593,17 @@ pub async fn tool_device_action(
         None,
     )
     .await?;
+
+    // After the gate, so a refused action records nothing, and before the
+    // dispatch, because a command the daemon accepted and then stopped waiting
+    // for may still have reached the device — the same pessimistic ordering
+    // `tool_web_fetch` uses, and the reason the declaration is separate from
+    // the commit below.
+    crate::checkpoints::record_external_effect(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        crate::checkpoints::ExternalEffectKind::Device,
+    )?;
 
     let mut args = vec![
         "daemon".into(),
@@ -2641,7 +2653,15 @@ pub async fn tool_device_action(
             format!("{turn_id}:{tool_call_id}"),
         ]);
     }
-    parse_json(&command(args).await?)
+    let outcome = parse_json(&command(args).await?)?;
+    // Only here: the daemon answered, so this effect was watched to completion
+    // rather than merely believed to have happened.
+    crate::checkpoints::commit_external_effect(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        crate::checkpoints::ExternalEffectKind::Device,
+    )?;
+    Ok(outcome)
 }
 
 /// Fixed, pre-authorized device bridge for the Wasm permission broker. The

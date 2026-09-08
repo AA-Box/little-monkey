@@ -133,7 +133,7 @@ export {
   type RoutingContext,
 };
 import { beginDurableRun, type DurableRunRecorder } from './durableRun';
-import { daemonCancel } from './daemonClient';
+import { daemonCancel, deviceActionAvailable } from './daemonClient';
 import { requestRunCancellation } from './runProtocol';
 import { registerRunCancellation } from './runCancellationRegistry';
 import {
@@ -638,6 +638,15 @@ const COMPUTER_TOOL_NAMES = new Set([
  * pass it, so `task` is never accidentally offered by an existing caller
  * that hasn't been updated for it.
  *
+ * `deviceActionAvailable` is not a settings toggle at all but a capability
+ * probe (`daemonClient.ts`'s `deviceActionAvailable()`), filtered here for the
+ * same reason the toggles are: this is the one place to audit what the model is
+ * offered. monkey-cli gates the same tool the same way
+ * (`any_device_is_capable()` in `daemon/remote/device.rs`) and for a sharp
+ * reason — a model told it has a camera will try to use one, and "no paired
+ * device can do this" is a worse answer than never having been offered it.
+ * Default `false` keeps it fail-closed for callers that don't probe.
+ *
  * `skillToolEnabled`/`skillSearchToolEnabled`/`readSkillResourceToolEnabled`
  * follow the same posture, appending `SKILL_INVOKE_TOOL`/
  * `SEARCH_SKILLS_TOOL`/`READ_SKILL_RESOURCE_TOOL` — see
@@ -657,11 +666,13 @@ export function toolsForSettings(
   skillLearningToolEnabled = false,
   skillSearchToolEnabled = false,
   desktopControlEnabled = false,
+  deviceActionAvailable = false,
 ): ToolDef[] {
   const filtered = tools.filter((tool) => {
     if (!memoryEnabled && tool.function.name === 'remember') return false;
     if (!webToolsEnabled && WEB_TOOL_NAMES.has(tool.function.name)) return false;
     if (!desktopControlEnabled && COMPUTER_TOOL_NAMES.has(tool.function.name)) return false;
+    if (!deviceActionAvailable && tool.function.name === 'device_action') return false;
     return true;
   });
   return [
@@ -3050,6 +3061,7 @@ async function runAgentTurnBody(
       cachedLearningMode() !== null && cachedLearningMode() !== 'off' && durable.recorder !== null,
       skillSearchToolEnabled,
       settings.desktopControlEnabled,
+      deviceActionAvailable(),
     ),
     hasWorkspace,
   );
