@@ -74,8 +74,11 @@ webview rather than the application, and never as a silent speaker.
 whether it is paused, and whether its position advances. That is the end of what
 the application can see. The output device, the OS mixer, and the physical
 speaker are past it, so nothing here is ever reported as proof that a person
-heard anything — the live run asks the operator instead, and a run whose every
-measurable step passes is still only unverified until they answer.
+heard anything. The live run asks the operator two questions instead — whether
+the answer was audible, and whether it stopped the moment it was interrupted —
+and a run whose every measurable step passes is still only unverified until both
+are answered. There is deliberately no flag that can answer them: a
+confirmation a script can assert is not a confirmation.
 
 Barge-in is judged at the layer `interrupt()` acts on: the element stops and its
 position stops advancing. Inbound RTP is not `interrupt()`'s to stop — packets
@@ -210,9 +213,10 @@ persisted, tool call bridged to the normal executor, host result returned,
 spoken follow-up after that result, non-silent audio measured at the receiver,
 the local playback element advancing unpaused, barge-in proven by local playback
 stopping, durable conversation rows, clean disconnect. It then asks whether the
-answer was audible and reports the speaker as PASS, FAIL, or UNVERIFIED; only a
-confirmed yes exits zero, an unconfirmed speaker exits 2, and any failure exits
-1, so a green exit cannot close the definition of done on its own. The native side writes the evidence and exits, so the run cannot
+answer was audible and whether it stopped the instant it was interrupted,
+reporting each as PASS, FAIL, or UNVERIFIED; only two confirmed yeses exit zero,
+anything unwitnessed exits 2, and any failure exits 1, so a green exit cannot
+close the definition of done on its own. The native side writes the evidence and exits, so the run cannot
 pass on a webview that stalled. The report carries step outcomes and bounded
 timings only: no transcript, audio, file content, or credential. The same
 harness is exercised in CI against a scripted provider, including the case
