@@ -1635,7 +1635,15 @@ fn command_json(record: &self::store::DeviceCommandRecord) -> serde_json::Value 
 fn device_list(paths: &DaemonPaths, json: bool) -> Result<(), String> {
     let rows = device_rows(paths)?;
     if json {
-        return print_json(serde_json::json!({ "devices": rows }));
+        // `any_capable` is the same predicate that gates offering the
+        // `device_action` tool on this machine, published here so the desktop
+        // app can gate its own tool list on it without re-deriving it from
+        // `devices` — the extension-device-provider half of the answer has no
+        // row to appear in.
+        return print_json(serde_json::json!({
+            "devices": rows,
+            "any_capable": device::any_device_is_capable(),
+        }));
     }
     if rows.is_empty() {
         println!("No paired devices.");

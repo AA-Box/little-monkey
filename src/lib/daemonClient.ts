@@ -346,7 +346,45 @@ export interface RemoteDeviceRow {
   recent_commands: RemoteDeviceCommandRow[];
 }
 
-export const remoteDeviceList = () => invoke<{ devices: RemoteDeviceRow[] }>("remote_device_list");
+/** Last answer `remote_device_list` gave for `any_capable`; `null` until one
+ * has been asked for. `null` means "not yet known", which callers treat as
+ * "no device" — offering `device_action` is a capability, so an unknown state
+ * must not grant it. Same posture as `skillLearningClient`'s `cachedMode`. */
+let deviceCapable: boolean | null = null;
+
+/** `monkey daemon remote device-list --json`.
+ *
+ * `any_capable` is the daemon's own answer to "could any paired device (or
+ * executable-extension device provider) perform a physical action right now" —
+ * the exact predicate monkey-cli gates offering the `device_action` tool on.
+ * Computed there rather than re-derived from `devices` here, because the
+ * extension-provider half of it has no row to appear in.
+ */
+export const remoteDeviceList = async (): Promise<{ devices: RemoteDeviceRow[]; any_capable: boolean }> => {
+  const response = await invoke<{ devices: RemoteDeviceRow[]; any_capable?: boolean }>("remote_device_list");
+  deviceCapable = response.any_capable === true;
+  return { devices: response.devices, any_capable: deviceCapable };
+};
+
+/**
+ * Whether the `device_action` tool should be offered this turn — see
+ * `agentLoop.ts`'s `toolsForSettings`, and monkey-cli's own
+ * `any_device_is_capable()` gate, which this mirrors.
+ *
+ * Reading it kicks off the probe when nothing has asked yet and answers `false`
+ * meanwhile, rather than making every turn wait on a subprocess: pairing a
+ * device happens in Settings, which calls `remoteDeviceList` itself, so the
+ * cache is already warm by the time a paired device exists. The cost of the
+ * cold read is that the first turn after launch does not offer the tool.
+ */
+export function deviceActionAvailable(): boolean {
+  if (deviceCapable === null) {
+    deviceCapable = false;
+    void remoteDeviceList().catch(() => undefined);
+  }
+  return deviceCapable;
+}
+
 export const remoteDeviceGrant = (deviceId: string, capabilities: string[]) =>
   invoke<string>("remote_device_grant", { deviceId, capabilities });
 export const remoteDeviceCommands = (deviceId: string, limit = 20) =>

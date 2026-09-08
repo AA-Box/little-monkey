@@ -80,6 +80,26 @@ describe('classifyExternalTool / isMcpToolName', () => {
     expect(classifyExternalTool('mcp__stripe__create_charge')).toBe('mcp');
   });
 
+  it('classifies device_action as device', () => {
+    expect(classifyExternalTool('device_action')).toBe('device');
+  });
+
+  it('classifies every input-sending computer_* tool as desktop-control', () => {
+    for (const name of [
+      'computer_focus',
+      'computer_click',
+      'computer_double_click',
+      'computer_scroll',
+      'computer_type',
+      'computer_key',
+      'computer_hotkey',
+      'computer_select',
+      'computer_set_value',
+    ]) {
+      expect(classifyExternalTool(name), name).toBe('desktop-control');
+    }
+  });
+
   it('returns null for file tools and pure-read tools', () => {
     expect(classifyExternalTool('write_file')).toBeNull();
     expect(classifyExternalTool('edit_file')).toBeNull();
@@ -87,6 +107,22 @@ describe('classifyExternalTool / isMcpToolName', () => {
     expect(classifyExternalTool('grep')).toBeNull();
     expect(classifyExternalTool('list_dir')).toBeNull();
     expect(classifyExternalTool('present_plan')).toBeNull();
+  });
+
+  // The observing half of Computer Use, plus the one action that does nothing
+  // at all. Reading a screen or a clipboard is not an effect to reconcile, and
+  // neither is sleeping — warning about a revert that changed nothing outside
+  // the files is how a real warning stops being read.
+  it('returns null for the observing computer_* tools and for computer_wait', () => {
+    for (const name of [
+      'computer_list_targets',
+      'computer_inspect',
+      'computer_screenshot',
+      'computer_clipboard_read',
+      'computer_wait',
+    ]) {
+      expect(classifyExternalTool(name), name).toBeNull();
+    }
   });
 });
 
