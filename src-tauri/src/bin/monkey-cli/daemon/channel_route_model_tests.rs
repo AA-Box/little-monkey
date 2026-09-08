@@ -30,9 +30,7 @@
 
 use std::path::{Path, PathBuf};
 
-use little_monkey_lib::channels::routing::{
-    resolve_route, ChannelRoute, RouteScope, RouteTarget,
-};
+use little_monkey_lib::channels::routing::{resolve_route, ChannelRoute, RouteScope, RouteTarget};
 use little_monkey_lib::channels::types::{
     BoundedMetadata, ChannelConversation, ChannelEnvelope, ChannelKind, ChannelSender,
     ConversationKind,
@@ -121,8 +119,9 @@ fn resolve_through_the_daemon(
     roots: &[PathBuf],
 ) -> (String, ResolvedTarget, Recipe) {
     let route = resolve_route(routes, &envelope()).expect("the global route matches everything");
-    let frozen = super::freeze_execution_for(&route.target, Some(&route.route_id), roots, None, None)
-        .expect("the daemon freezes this turn");
+    let frozen =
+        super::freeze_execution_for(&route.target, Some(&route.route_id), roots, None, None)
+            .expect("the daemon freezes this turn");
     let v1 = frozen.as_v1();
     // Exactly what `enqueue` does with a frozen context before it runs.
     assert!(
@@ -168,7 +167,10 @@ fn changing_a_routes_model_changes_what_the_runner_resolves() {
 
     let (frozen, resolved, _) = resolve_through_the_daemon(&routes, &roots);
     assert_eq!(frozen, "managed:Qwen2.5-7B-Instruct");
-    assert_eq!(backend_description(&resolved), "managed:Qwen2.5-7B-Instruct");
+    assert_eq!(
+        backend_description(&resolved),
+        "managed:Qwen2.5-7B-Instruct"
+    );
 
     // The operator picks a different model. This is the function the
     // `recipes_set_target` command wraps, nothing test-only.
@@ -254,7 +256,8 @@ fn every_target_kind_the_picker_offers_resolves_to_its_own_backend() {
 
         let route = resolve_route(&routes, &envelope()).unwrap();
         let frozen =
-            super::freeze_execution_for(&route.target, Some(&route.route_id), &roots, None, None).unwrap();
+            super::freeze_execution_for(&route.target, Some(&route.route_id), &roots, None, None)
+                .unwrap();
         let v1 = frozen.as_v1();
         assert_eq!(v1.model_target, expected_frozen);
         assert_eq!(
@@ -320,7 +323,9 @@ fn changing_the_model_leaves_every_other_recipe_field_alone() {
     // the recipe through its struct would have quietly rewritten all of it.
     let raw_after = std::fs::read_to_string(root.join("recipes").join("channel-chat.yml")).unwrap();
     let split = |raw: &str| {
-        let (head, rest) = raw.split_once("target:\n").expect("the file has a target block");
+        let (head, rest) = raw
+            .split_once("target:\n")
+            .expect("the file has a target block");
         let tail = rest
             .split_once("permission_mode:")
             .expect("the file has a key after its target block")
@@ -333,7 +338,9 @@ fn changing_the_model_leaves_every_other_recipe_field_alone() {
     assert_eq!(head_before, head_after, "{raw_after}");
     assert_eq!(tail_before, tail_after, "{raw_after}");
     assert!(
-        raw_after.contains("target:\n  provider: \"openrouter\"\n  model: \"anthropic/claude-sonnet-4\"\n"),
+        raw_after.contains(
+            "target:\n  provider: \"openrouter\"\n  model: \"anthropic/claude-sonnet-4\"\n"
+        ),
         "{raw_after}"
     );
     assert!(!raw_after.contains("managed_model"), "{raw_after}");
@@ -454,7 +461,8 @@ fn a_route_naming_a_missing_recipe_freezes_nothing() {
     let roots = vec![root.clone()];
     let route = global_route("not-saved");
     let error =
-        super::freeze_execution_for(&route.target, Some(&route.route_id), &roots, None, None).unwrap_err();
+        super::freeze_execution_for(&route.target, Some(&route.route_id), &roots, None, None)
+            .unwrap_err();
     assert!(error.contains("not-saved"), "{error}");
 }
 

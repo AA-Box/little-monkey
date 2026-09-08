@@ -81,7 +81,8 @@ fn now_unix_ms() -> Result<u64, String> {
         .duration_since(UNIX_EPOCH)
         .map_err(|error| format!("System clock is before Unix epoch: {error}"))?
         .as_millis();
-    u64::try_from(millis).map_err(|_| "System clock exceeds marketplace timestamp range".to_string())
+    u64::try_from(millis)
+        .map_err(|_| "System clock exceeds marketplace timestamp range".to_string())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -246,7 +247,9 @@ fn atomic_write_json(path: &Path, receipt: &MarketplaceProvenanceReceipt) -> Res
 fn detail_registry_id(detail: &ExtensionDetail) -> Result<&str, String> {
     match &detail.manifest.provenance.source {
         InstallSource::CuratedRegistry { registry_id } => Ok(registry_id.as_str()),
-        _ => Err("Marketplace runtime result lost its curated-registry manifest provenance".to_string()),
+        _ => Err(
+            "Marketplace runtime result lost its curated-registry manifest provenance".to_string(),
+        ),
     }
 }
 
@@ -258,21 +261,34 @@ fn validate_result_identity(
     registry_id: &str,
 ) -> Result<(), String> {
     if extension_id != receipt.extension_id {
-        return Err("Marketplace runtime result extension id differs from its signed receipt".to_string());
+        return Err(
+            "Marketplace runtime result extension id differs from its signed receipt".to_string(),
+        );
     }
     if version != receipt.version {
-        return Err("Marketplace runtime result version differs from its signed receipt".to_string());
+        return Err(
+            "Marketplace runtime result version differs from its signed receipt".to_string(),
+        );
     }
     if manifest_sha256.to_ascii_lowercase() != receipt.manifest_sha256.to_ascii_lowercase() {
-        return Err("Marketplace runtime result manifest digest differs from its signed receipt".to_string());
+        return Err(
+            "Marketplace runtime result manifest digest differs from its signed receipt"
+                .to_string(),
+        );
     }
     if registry_id != receipt.registry_id {
-        return Err("Marketplace runtime result registry provenance differs from its signed receipt".to_string());
+        return Err(
+            "Marketplace runtime result registry provenance differs from its signed receipt"
+                .to_string(),
+        );
     }
     Ok(())
 }
 
-fn receipt_matches_detail(receipt: &MarketplaceProvenanceReceipt, detail: &ExtensionDetail) -> bool {
+fn receipt_matches_detail(
+    receipt: &MarketplaceProvenanceReceipt,
+    detail: &ExtensionDetail,
+) -> bool {
     detail_registry_id(detail)
         .and_then(|registry_id| {
             validate_result_identity(
@@ -346,7 +362,8 @@ pub fn reconcile(installed: &[ExtensionDetail]) -> Result<(), String> {
     for entry in fs::read_dir(&root)
         .map_err(|error| format!("Cannot scan marketplace provenance receipts: {error}"))?
     {
-        let entry = entry.map_err(|error| format!("Cannot inspect marketplace provenance receipt: {error}"))?;
+        let entry = entry
+            .map_err(|error| format!("Cannot inspect marketplace provenance receipt: {error}"))?;
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| format!("Cannot inspect marketplace provenance receipt: {error}"))?;
@@ -370,15 +387,19 @@ pub fn reconcile(installed: &[ExtensionDetail]) -> Result<(), String> {
         if receipt.state == ReceiptState::Committed {
             continue;
         }
-        if installed.iter().any(|detail| receipt_matches_detail(&receipt, detail)) {
+        if installed
+            .iter()
+            .any(|detail| receipt_matches_detail(&receipt, detail))
+        {
             receipt.state = ReceiptState::Committed;
             receipt.committed_unix_ms = Some(now);
             atomic_write_json(&path, &receipt)?;
             continue;
         }
         if now.saturating_sub(receipt.authorized_unix_ms) > AUTHORIZED_RECEIPT_TTL_MS {
-            fs::remove_file(&path)
-                .map_err(|error| format!("Cannot prune stale marketplace authorization receipt: {error}"))?;
+            fs::remove_file(&path).map_err(|error| {
+                format!("Cannot prune stale marketplace authorization receipt: {error}")
+            })?;
         }
     }
     Ok(())
@@ -486,10 +507,9 @@ mod tests {
         receipt.committed_unix_ms = Some(30);
         atomic_write_json(&path, &receipt).expect("replace committed receipt");
 
-        let stored: MarketplaceProvenanceReceipt = serde_json::from_slice(
-            &fs::read(&path).expect("read committed receipt"),
-        )
-        .expect("decode committed receipt");
+        let stored: MarketplaceProvenanceReceipt =
+            serde_json::from_slice(&fs::read(&path).expect("read committed receipt"))
+                .expect("decode committed receipt");
         assert_eq!(stored.state, ReceiptState::Committed);
         assert_eq!(stored.committed_unix_ms, Some(30));
 

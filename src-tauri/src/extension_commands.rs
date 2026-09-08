@@ -34,7 +34,8 @@ pub async fn extensions_discover(
     if let Some(encoded) = source_path.strip_prefix(MARKETPLACE_PREPARE_PREFIX) {
         let request = serde_json::from_str(encoded)
             .map_err(|error| format!("Invalid marketplace prepare request: {error}"))?;
-        let preview = marketplace_commands::marketplace_prepare_extension(window, state, request).await?;
+        let preview =
+            marketplace_commands::marketplace_prepare_extension(window, state, request).await?;
         marketplace_staging_integrity::validate_handle(&preview.source_path)?;
         return Ok(preview);
     }
@@ -54,7 +55,9 @@ pub async fn extensions_list(
 ) -> Result<Vec<ExtensionDetail>, String> {
     if let Some(handle) = cleanup_marketplace_handle {
         if window.label() != "main" {
-            return Err("Marketplace staging cleanup is allowed only from the main window".to_string());
+            return Err(
+                "Marketplace staging cleanup is allowed only from the main window".to_string(),
+            );
         }
         if !handle.starts_with(MARKETPLACE_HANDLE_PREFIX) {
             return Err("Invalid marketplace staging handle".to_string());
@@ -210,10 +213,7 @@ pub async fn extensions_set_secret(
 }
 
 #[tauri::command]
-pub async fn extensions_remove_secret(
-    extension_id: String,
-    slot_id: String,
-) -> Result<(), String> {
+pub async fn extensions_remove_secret(extension_id: String, slot_id: String) -> Result<(), String> {
     manager()?.remove_secret(&extension_id, &slot_id)
 }
 

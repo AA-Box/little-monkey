@@ -55,9 +55,11 @@ fn target_dir() -> PathBuf {
 }
 
 fn cli() -> PathBuf {
-    target_dir()
-        .join("debug")
-        .join(if cfg!(windows) { "monkey-cli.exe" } else { "monkey-cli" })
+    target_dir().join("debug").join(if cfg!(windows) {
+        "monkey-cli.exe"
+    } else {
+        "monkey-cli"
+    })
 }
 
 fn output_text(output: &Output) -> String {
@@ -173,8 +175,12 @@ fn require_cli_stdin(profile: &str, args: &[&str], stdin: &str) -> Result<Output
 fn create_profile() -> Result<String, String> {
     let name = format!("Discord installed-service E2E {}", unique());
     let output = require_cli(None, &["profiles", "create", &name, "--json"])?;
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("profile JSON was invalid: {error}\n{}", output_text(&output)))?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "profile JSON was invalid: {error}\n{}",
+            output_text(&output)
+        )
+    })?;
     payload
         .get("id")
         .and_then(serde_json::Value::as_str)
@@ -188,8 +194,12 @@ fn add_account(profile: &str) -> Result<String, String> {
         Some(profile),
         &["channels", "add", "discord", &label, "--json"],
     )?;
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("account JSON was invalid: {error}\n{}", output_text(&output)))?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "account JSON was invalid: {error}\n{}",
+            output_text(&output)
+        )
+    })?;
     payload
         .get("account_id")
         .and_then(serde_json::Value::as_str)
@@ -280,7 +290,9 @@ impl ModelFixture {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
-    stream.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .ok()?;
     let mut received = Vec::new();
     let mut scratch = [0u8; 8192];
     let mut header_end = None;
@@ -332,7 +344,9 @@ fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn json_response(body: &str) -> String {
@@ -722,7 +736,11 @@ fn parse_discord_message(payload: &serde_json::Value) -> Result<DiscordMessage, 
     })
 }
 
-async fn discord_send(token: &str, channel_id: &str, content: &str) -> Result<DiscordMessage, String> {
+async fn discord_send(
+    token: &str,
+    channel_id: &str,
+    content: &str,
+) -> Result<DiscordMessage, String> {
     let client = discord_client()?;
     let request = client
         .post(format!("{API_BASE}/channels/{channel_id}/messages"))
@@ -850,7 +868,10 @@ async fn run_case(config: &LiveConfig) -> Result<(), String> {
     let tested = discord_identity(&config.bot_token).await?;
     let external = discord_identity(&config.external_bot_token).await?;
     if tested.id == external.id {
-        return Err("the Discord bot under test and the external sender must be different bot identities".to_string());
+        return Err(
+            "the Discord bot under test and the external sender must be different bot identities"
+                .to_string(),
+        );
     }
 
     let stamp = unique();
