@@ -1,0 +1,286 @@
+name: Local Wake Word
+
+on:
+  pull_request:
+    paths:
+      - 'vendor/sherpa-onnx-sys/**'
+      - 'scripts/stage-sherpa-runtime.mjs'
+      - 'scripts/stage-wake-word-model.mjs'
+      - 'scripts/verify-packaged-wake-assets.mjs'
+      - 'scripts/lib/wakeWordAssets.test.mjs'
+      - 'src-tauri/Cargo.toml'
+      - 'src-tauri/Cargo.lock'
+      - 'src-tauri/src/local_wake_word.rs'
+      - 'src-tauri/src/local_whisper.rs'
+      - 'src-tauri/src/m7_companion.rs'
+      - 'src-tauri/tauri.conf.json'
+      - 'src/components/Talk/**'
+      - 'src/components/Settings/VoiceSettingsSection.tsx'
+      - 'src/lib/companionClient.ts'
+      - 'src/lib/talkAudio*'
+      - 'src/lib/talkClient.ts'
+      - 'src/lib/talkEngine*'
+      - 'src/lib/wakeWordWalkthrough.e2e.test.ts'
+      - 'src-tauri/src/bin/wake-word-e2e.rs'
+      - '.github/workflows/local-wake-word.yml'
+  push:
+    branches: [main, develop]
+    paths:
+      - 'vendor/sherpa-onnx-sys/**'
+      - 'scripts/stage-sherpa-runtime.mjs'
+      - 'scripts/stage-wake-word-model.mjs'
+      - 'scripts/verify-packaged-wake-assets.mjs'
+      - 'scripts/lib/wakeWordAssets.test.mjs'
+      - 'src-tauri/Cargo.toml'
+      - 'src-tauri/Cargo.lock'
+      - 'src-tauri/src/local_wake_word.rs'
+      - 'src-tauri/src/local_whisper.rs'
+      - 'src-tauri/src/m7_companion.rs'
+      - 'src-tauri/tauri.conf.json'
+      - 'src-tauri/src/bin/wake-word-e2e.rs'
+      - 'src/lib/wakeWordWalkthrough.e2e.test.ts'
+      - '.github/workflows/local-wake-word.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: local-wake-word-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Every supported desktop target runs the native runtime here. There is no
+  # separate compile-only matrix: compiling proved the archive mapping and
+  # nothing about whether the model opens, so the hosts that can execute the
+  # tests execute them, and the claim in docs/limitations.md is about hosts that
+  # ran rather than hosts that built.
+  real-runtime:
+    name: real KWS runtime (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            label: macOS arm64
+          - os: ubuntu-22.04
+            label: Linux x86_64
+          - os: ubuntu-24.04-arm
+            label: Linux arm64
+          - os: windows-latest
+            label: Windows x86_64
+          - os: windows-11-arm
+            label: Windows arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_TEST_DEBUG: 0
+      LITTLE_MONKEY_KWS_E2E: 1
+      LITTLE_MONKEY_WAKE_TO_WHISPER_E2E: 1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential cmake clang libclang-dev ninja-build
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri
+          key: local-wake-word-${{ matrix.os }}
+      - run: pnpm install --frozen-lockfile
+      - name: Verify manifests and stage this host's authenticated assets
+        run: |
+          pnpm test:wake-assets
+          # `tauri-build` resolves every declared resource and external binary
+          # from its build script, so the CLI sidecar has to exist before any
+          # cargo command in this repository — `cargo test` included.
+          pnpm stage:cli:placeholder
+          pnpm stage:sherpa-runtime
+          pnpm stage:wake-word
+          pnpm stage:whisper
+      - name: Real native positive, negative, near-phrase, pause and noise fixtures
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib local_wake_word::tests::real_model_detects_positive_audio_and_rejects_negative_audio -- --nocapture
+      - name: Real KWS hands only post-keyword PCM to real local Whisper
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib local_wake_word::tests::real_wake_event_feeds_only_command_pcm_to_local_whisper -- --nocapture
+      - name: A session armed through silence still places the keyword inside the ring
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib local_wake_word::tests::a_long_armed_session_never_places_the_keyword_before_the_audio_that_revealed_it -- --nocapture
+      - name: Fifteen-step acceptance walkthrough across both runtimes
+        run: pnpm test:wake-walkthrough
+      # There is no working Intel macOS runner here: `macos-13` is retired and
+      # is cancelled without running a single step in this repository's other
+      # workflows too, so that target cannot execute the runtime at all. It gets
+      # the authenticated archive and a compile instead, and
+      # docs/limitations.md says plainly that it is compiled rather than run.
+      - name: Cross-check the Intel macOS target, which has no runtime host
+        if: matrix.os == 'macos-latest'
+        env:
+          CLI_SIDECAR_TARGET: x86_64-apple-darwin
+        run: |
+          rustup target add x86_64-apple-darwin
+          pnpm stage:cli:placeholder
+          node scripts/stage-sherpa-runtime.mjs x86_64-apple-darwin
+          cargo check --locked --manifest-path src-tauri/Cargo.toml --lib --target x86_64-apple-darwin
+
+  # One built installer per release target that has a runner, inspected for the
+  # model files the wake word cannot work without.
+  #
+  # Packaging is per-bundler, not per-repository: a `.deb` proving the resource
+  # glob resolved on Debian says nothing about whether the same glob reached
+  # `Contents/Resources` in a `.app` or `$INSTDIR` in an NSIS installer, and
+  # those are the two formats most operators install. So each bundler is asked
+  # its own question, with one shared rule
+  # (`scripts/verify-packaged-wake-assets.mjs`) reading whatever listing that
+  # platform's tooling can produce.
+  #
+  # Intel macOS is absent for the same reason it is absent above: `macos-13` is
+  # retired and cancelled without executing a step, so there is no host to
+  # build it on. docs/limitations.md says so rather than implying six.
+  bundle:
+    name: installer carries verified KWS assets (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            label: Linux x86_64 deb
+            bundles: deb
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            label: Linux arm64 deb
+            bundles: deb
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            label: macOS arm64 dmg
+            bundles: dmg
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: Windows x86_64 installer
+            bundles: nsis
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            label: Windows arm64 installer
+            bundles: nsis
+    runs-on: ${{ matrix.os }}
+    # A cold release build of the whole application on the slowest of these
+    # hosts, not a `cargo check`.
+    timeout-minutes: 120
+    # Deliberately *not* `shell: bash` for the job.
+    #
+    # Bash on a Windows runner puts Git's GNU tar ahead of the Windows one, and
+    # `stage-managed-runtime.mjs` extracts with an absolute path, which GNU tar
+    # reads as a remote host: "tar: Cannot connect to C: resolve failed". The
+    # build step therefore runs under each platform's default shell, exactly as
+    # the release workflow's bundling does; the steps that genuinely need bash
+    # ask for it by name.
+    env:
+      # Every staging script in `beforeBuildCommand` resolves its archive from
+      # one of these; naming the target explicitly keeps a bundle job from
+      # quietly packaging whatever the host guessed.
+      CLI_SIDECAR_TARGET: ${{ matrix.target }}
+      MANAGED_RUNTIME_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential xdg-utils unzip cmake clang libclang-dev ninja-build
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri
+          key: local-wake-word-bundle-${{ matrix.target }}
+      - run: pnpm install --frozen-lockfile
+      - name: Stage CLI sidecar placeholder
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+      # tauri.conf.json maps `resources/Assets.car` into the .app, so the macOS
+      # bundler refuses to run without it. Release compiles it the same way.
+      - name: Compile macOS Liquid icon (Assets.car)
+        if: startsWith(matrix.os, 'macos')
+        run: pnpm icon:mac-liquid
+      - name: Generate throwaway updater signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm tauri signer generate --ci -p "" -w "$RUNNER_TEMP/updater.key"
+          echo "TAURI_SIGNING_PRIVATE_KEY=$RUNNER_TEMP/updater.key" >> "$GITHUB_ENV"
+          echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
+      - name: Build installable package through production staging
+        run: pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+      # One path per line, from whatever tool can read this platform's package.
+      # The shared rule below normalizes separators and ignores the columns.
+      - name: List what the Debian package installs
+        if: startsWith(matrix.os, 'ubuntu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="$(find src-tauri/target/${{ matrix.target }}/release/bundle/deb -name '*.deb' -print -quit)"
+          test -n "$package"
+          echo "inspecting $package"
+          dpkg-deb -c "$package" > "$RUNNER_TEMP/packaged.txt"
+      # The disk image itself, mounted — not the .app it was built from.
+      #
+      # `--bundles dmg` *deletes* that .app once the image exists ("Cleaning
+      # …/bundle/macos/Little Monkey.app"), so there is nothing left beside the
+      # image to inspect. Which is the better question anyway: what the operator
+      # downloads is this image, and mounting it needs no argument about whether
+      # its contents match something that used to be next to it.
+      - name: List what the macOS disk image installs
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$(find src-tauri/target/${{ matrix.target }}/release/bundle/dmg -name '*.dmg' -print -quit)"
+          test -n "$image"
+          echo "inspecting $image"
+          mount="$RUNNER_TEMP/dmg-mount"
+          mkdir -p "$mount"
+          hdiutil attach "$image" -nobrowse -readonly -noverify -mountpoint "$mount"
+          find "$mount" > "$RUNNER_TEMP/packaged.txt"
+          # The listing is already written; a stubborn unmount on a throwaway
+          # runner is not a packaging failure.
+          hdiutil detach "$mount" || true
+      - name: List what the Windows installer installs
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          set -euo pipefail
+          installer="$(find src-tauri/target/${{ matrix.target }}/release/bundle/nsis -name '*-setup.exe' -print -quit)"
+          test -n "$installer"
+          echo "inspecting $installer"
+          # `7z` is on the runner's PATH, but the image has moved it before.
+          seven_zip=7z
+          command -v "$seven_zip" > /dev/null || seven_zip="$PROGRAMFILES/7-Zip/7z.exe"
+          "$seven_zip" l "$installer" > "$RUNNER_TEMP/packaged.txt"
+      # The listing itself is printed only on failure, and only its head: this
+      # job's whole purpose is to fail on a package nobody can install, and a
+      # failure that does not show what it read costs another hour to diagnose.
+      - name: Verify the package carries every model file and no test audio
+        shell: bash
+        run: |
+          node scripts/verify-packaged-wake-assets.mjs "$RUNNER_TEMP/packaged.txt" || {
+            echo "--- first 60 lines of the listing this read ---"
+            head -60 "$RUNNER_TEMP/packaged.txt"
+            exit 1
+          }

@@ -7,6 +7,11 @@ and where the code lives.
 
 - Node.js, `pnpm`, Rust, Cargo, and the Tauri 2 prerequisites for your platform.
 - `cmake` and `libclang` — the built-in local Whisper engine compiles `whisper.cpp` through `whisper-rs-sys`, which drives cmake and generates bindings with bindgen. Release bundles ship the pinned Whisper model; source trees stage it with `pnpm stage:whisper` (without it, the app provisions the same pinned, SHA-256-verified model at launch instead).
+- Desktop wake-word builds stage the exact sherpa-onnx static archive for the
+  build target with `pnpm stage:sherpa-runtime` and the verified KWS model with
+  `pnpm stage:wake-word`. The build hook re-verifies native archives before
+  extraction. Installers include the KWS model; there is no first-launch wake
+  download. See [Local wake-word detection](local-wake-word.md).
 - Desktop releases include a pinned, checksum-verified `llama.cpp` runtime. Source builds stage the same official runtime before `tauri dev` and `tauri build`; a system `llama-server` is a development fallback only.
 - Studio generation (optional): the managed `sd-server` and `llama-tts` runtimes, staged with `pnpm stage:runtime:sd` and `pnpm stage:runtime:tts`. `sd-server` exists for Apple Silicon (Metal), x86_64 Linux (Vulkan), and x86_64 Windows (Vulkan) only. Model weights are yours to supply.
 - Ollama runtime (optional): reachable at `http://127.0.0.1:11434` for the explicit Ollama provider or daemon-management commands.
@@ -41,6 +46,7 @@ pnpm dev:app         # stage llama.cpp + the CLI sidecar, then run the app
 pnpm dev             # Vite front end only
 pnpm build           # TypeScript check and production front-end build
 pnpm tauri build     # desktop bundle containing the managed runtime
+pnpm stage:sherpa-runtime && pnpm stage:wake-word # wake assets only
 ```
 
 ## Testing
@@ -49,6 +55,7 @@ pnpm tauri build     # desktop bundle containing the managed runtime
 pnpm test
 pnpm i18n:lint
 pnpm test:rust
+pnpm test:wake-assets
 pnpm test:git-delivery-action
 ```
 

@@ -1033,8 +1033,25 @@ const MAX_NATIVE_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const NATIVE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(not(target_os = "windows"))]
 const NATIVE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
+/// What the real UIA provider is allowed to take on a hosted CI runner.
+///
+/// A hosted Windows runner is not somebody's desktop: the provider is a cold
+/// `powershell.exe` loading the UIAutomation assemblies and enumerating a WPF
+/// fixture on a shared vCPU, and 45 s is a guess about a machine nobody else
+/// is using. Every acceptance leg that drives the real provider on such a
+/// runner gets this bound; the product keeps the short one, because a
+/// three-minute wait is not something an operator should ever be asked for.
 #[cfg(target_os = "windows")]
-const FULL_PRODUCT_E2E_PROVIDER_TIMEOUT: Duration = Duration::from_secs(180);
+const HOSTED_E2E_PROVIDER_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// The acceptance legs that run the real provider on a hosted runner. Both set
+/// their own variable, and both drive the same `powershell.exe`; keying the
+/// long bound to one of their names left the other timing out at 45 s.
+#[cfg(target_os = "windows")]
+const HOSTED_E2E_VARIABLES: [&str; 2] = [
+    "COMPUTER_USE_FULL_PRODUCT_E2E",
+    "COMPUTER_USE_REMOTE_WINDOWS_E2E",
+];
 const MAX_TARGETS: usize = 64;
 const MAX_ELEMENTS: usize = 256;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -1173,8 +1190,11 @@ fn run_native_command_with_env(
         let _ = stdout_sender.send(result);
     });
     #[cfg(target_os = "windows")]
-    let provider_timeout = if std::env::var("COMPUTER_USE_FULL_PRODUCT_E2E").as_deref() == Ok("1") {
-        FULL_PRODUCT_E2E_PROVIDER_TIMEOUT
+    let provider_timeout = if HOSTED_E2E_VARIABLES
+        .iter()
+        .any(|name| std::env::var(name).as_deref() == Ok("1"))
+    {
+        HOSTED_E2E_PROVIDER_TIMEOUT
     } else {
         NATIVE_PROVIDER_TIMEOUT
     };
