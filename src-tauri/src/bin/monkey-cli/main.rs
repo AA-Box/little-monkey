@@ -45,9 +45,9 @@ mod repl;
 mod revisions_cli;
 mod security_cli;
 mod skills_cli;
-mod standards_cli;
 mod sse;
 mod stacks_cli;
+mod standards_cli;
 mod support_bundle_cli;
 mod task;
 mod telecom_audit;
@@ -1744,9 +1744,10 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             }
         }
         Cmd::Standards(action) => {
-            let workspace = cli.workspace.clone().unwrap_or_else(|| {
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-            });
+            let workspace = cli
+                .workspace
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
             standards_cli::run(action, &workspace)
         }
         Cmd::Plugins(action) => {
@@ -2402,10 +2403,10 @@ mod tests {
             Some("2000-01-01T00:00:00.000Z"),
         )
         .unwrap();
-        let one =
-            memory::add_fact_impl(&memories_path, &root, "merge parent one", "agent", None).unwrap();
-        let two =
-            memory::add_fact_impl(&memories_path, &root, "merge parent two", "agent", None).unwrap();
+        let one = memory::add_fact_impl(&memories_path, &root, "merge parent one", "agent", None)
+            .unwrap();
+        let two = memory::add_fact_impl(&memories_path, &root, "merge parent two", "agent", None)
+            .unwrap();
         memory::merge_impl(
             &memories_path,
             &root,

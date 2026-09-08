@@ -88,7 +88,8 @@ fn now_unix_ms() -> Result<u64, String> {
         .duration_since(UNIX_EPOCH)
         .map_err(|error| format!("System clock is before Unix epoch: {error}"))?
         .as_millis();
-    u64::try_from(millis).map_err(|_| "System clock exceeds marketplace timestamp range".to_string())
+    u64::try_from(millis)
+        .map_err(|_| "System clock exceeds marketplace timestamp range".to_string())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -196,7 +197,9 @@ fn active_release_identity(
     version: SemanticVersion,
     now: u64,
 ) -> Option<(String, String)> {
-    if now >= snapshot.expires_unix_ms || package_revoked(snapshot, package_id, version, now).is_some() {
+    if now >= snapshot.expires_unix_ms
+        || package_revoked(snapshot, package_id, version, now).is_some()
+    {
         return None;
     }
     snapshot
@@ -243,7 +246,8 @@ fn require_consistent_registry_identity(
     // but it is still part of the M4 trust namespace. If a future bundled
     // snapshot indexes the same extension/version, a conflicting remote source
     // must fail closed rather than bypassing first-party provenance.
-    let (_, first_party_snapshot, _) = signed_first_party_catalog().map_err(|error| error.to_string())?;
+    let (_, first_party_snapshot, _) =
+        signed_first_party_catalog().map_err(|error| error.to_string())?;
     if let Some((bundle_sha256, manifest_sha256)) =
         active_release_identity(&first_party_snapshot, package_id, version, now)
     {
@@ -324,15 +328,12 @@ fn marketplace_artifact_url(entry: &ResolvedMarketplaceEntry) -> Result<Url, Str
     url.set_query(None);
     url.set_fragment(None);
     let path = url.path().to_string();
-    let directory = path
-        .rfind('/')
-        .map(|index| &path[..=index])
-        .unwrap_or("/");
+    let directory = path.rfind('/').map(|index| &path[..=index]).unwrap_or("/");
     url.set_path(directory);
     {
-        let mut segments = url
-            .path_segments_mut()
-            .map_err(|_| "Marketplace registry URL cannot be used as a hierarchical base".to_string())?;
+        let mut segments = url.path_segments_mut().map_err(|_| {
+            "Marketplace registry URL cannot be used as a hierarchical base".to_string()
+        })?;
         segments
             .push("extensions")
             .push(&entry.extension_id)
@@ -352,7 +353,10 @@ async fn fetch_text(url: &Url, max_bytes: usize) -> Result<String, String> {
         .await
         .map_err(|error| format!("Marketplace fetch failed: {error}"))?;
     if !response.status().is_success() {
-        return Err(format!("Marketplace fetch returned HTTP {}", response.status()));
+        return Err(format!(
+            "Marketplace fetch returned HTTP {}",
+            response.status()
+        ));
     }
     if response.url().origin() != url.origin() {
         return Err("Marketplace fetch escaped the verified registry origin".to_string());
@@ -373,7 +377,11 @@ async fn fetch_text(url: &Url, max_bytes: usize) -> Result<String, String> {
     {
         return Err(format!(
             "Marketplace content must be JSON/text, received {}",
-            if content_type.is_empty() { "unknown content type" } else { &content_type }
+            if content_type.is_empty() {
+                "unknown content type"
+            } else {
+                &content_type
+            }
         ));
     }
     let mut bytes = Vec::new();
@@ -394,10 +402,16 @@ fn marketplace_cache_root() -> Result<PathBuf, String> {
     let app_data = crate::app_paths::data_dir()
         .ok_or_else(|| "Could not resolve the Little Monkey app-data directory".to_string())?;
     let root = app_data.join(MARKETPLACE_CACHE_DIR);
-    if root.exists() && fs::symlink_metadata(&root).map_err(|e| e.to_string())?.file_type().is_symlink() {
+    if root.exists()
+        && fs::symlink_metadata(&root)
+            .map_err(|e| e.to_string())?
+            .file_type()
+            .is_symlink()
+    {
         return Err("Marketplace cache root cannot be a symlink".to_string());
     }
-    fs::create_dir_all(&root).map_err(|error| format!("Cannot create marketplace cache: {error}"))?;
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("Cannot create marketplace cache: {error}"))?;
     Ok(root)
 }
 
@@ -425,7 +439,8 @@ fn cleanup_handle(handle: &str) -> Result<bool, String> {
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err("Marketplace staging lease is not a real directory".to_string());
     }
-    fs::remove_dir_all(root).map_err(|error| format!("Cannot remove marketplace staging lease: {error}"))?;
+    fs::remove_dir_all(root)
+        .map_err(|error| format!("Cannot remove marketplace staging lease: {error}"))?;
     Ok(true)
 }
 
@@ -438,13 +453,19 @@ fn prune_stale_leases(now: u64) -> Result<(), String> {
     for entry in fs::read_dir(&root).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
-        let Ok(metadata) = fs::symlink_metadata(&path) else { continue };
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             continue;
         }
         let marker = path.join("lease.json");
-        let Ok(raw) = fs::read_to_string(&marker) else { continue };
-        let Ok(lease) = serde_json::from_str::<MarketplaceLease>(&raw) else { continue };
+        let Ok(raw) = fs::read_to_string(&marker) else {
+            continue;
+        };
+        let Ok(lease) = serde_json::from_str::<MarketplaceLease>(&raw) else {
+            continue;
+        };
         if lease_is_expired(lease.created_unix_ms, now) {
             let _ = fs::remove_dir_all(path);
         }
@@ -459,9 +480,14 @@ fn validate_marketplace_provenance(
     let declared = manifest
         .pointer("/provenance/source/curated_registry/registry_id")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "Marketplace extension provenance must name its curated M4 registry".to_string())?;
+        .ok_or_else(|| {
+            "Marketplace extension provenance must name its curated M4 registry".to_string()
+        })?;
     if declared != registry_id {
-        return Err("Marketplace extension provenance registry differs from the verified M4 registry".to_string());
+        return Err(
+            "Marketplace extension provenance registry differs from the verified M4 registry"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -475,18 +501,25 @@ fn stage_package(
         return Err("Marketplace .lmx exceeds its bounded encoded size".to_string());
     }
     if sha256_hex(raw.as_bytes()) != entry.package_sha256.to_ascii_lowercase() {
-        return Err("Marketplace .lmx does not match the native-resolved M4 package digest".to_string());
+        return Err(
+            "Marketplace .lmx does not match the native-resolved M4 package digest".to_string(),
+        );
     }
     let envelope: MarketplaceEnvelope = serde_json::from_str(raw)
         .map_err(|error| format!("Marketplace .lmx is not valid JSON: {error}"))?;
-    if envelope.schema_version != 1 || envelope.files_base64.is_empty() || envelope.files_base64.len() > MAX_LMX_FILES {
+    if envelope.schema_version != 1
+        || envelope.files_base64.is_empty()
+        || envelope.files_base64.len() > MAX_LMX_FILES
+    {
         return Err("Marketplace .lmx has an invalid schema or file count".to_string());
     }
     let manifest_canonical = canonical_json(&envelope.manifest)?;
     if manifest_canonical.len() > MAX_LMX_MANIFEST_BYTES
         || sha256_hex(manifest_canonical.as_bytes()) != entry.manifest_sha256.to_ascii_lowercase()
     {
-        return Err("Marketplace manifest does not match native-resolved signed M4 metadata".to_string());
+        return Err(
+            "Marketplace manifest does not match native-resolved signed M4 metadata".to_string(),
+        );
     }
     let manifest_id = envelope
         .manifest
@@ -499,7 +532,9 @@ fn stage_package(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "Marketplace manifest is missing version".to_string())?;
     if manifest_id != entry.extension_id || manifest_version != entry.version {
-        return Err("Marketplace manifest identity/version disagrees with native M4 metadata".to_string());
+        return Err(
+            "Marketplace manifest identity/version disagrees with native M4 metadata".to_string(),
+        );
     }
     validate_marketplace_provenance(&envelope.manifest, &entry.registry_id)?;
     let component = safe_marketplace_path(
@@ -516,13 +551,17 @@ fn stage_package(
     for (raw_path, encoded) in envelope.files_base64 {
         let relative = safe_marketplace_path(&raw_path)?;
         if !claim_marketplace_package_path(&mut collisions, &relative) {
-            return Err(format!("Marketplace .lmx contains a duplicate/reserved path: {raw_path}"));
+            return Err(format!(
+                "Marketplace .lmx contains a duplicate/reserved path: {raw_path}"
+            ));
         }
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .map_err(|_| format!("Marketplace .lmx contains invalid base64 for {raw_path}"))?;
         if bytes.len() > MAX_LMX_FILE_BYTES {
-            return Err(format!("Marketplace file exceeds its size limit: {raw_path}"));
+            return Err(format!(
+                "Marketplace file exceeds its size limit: {raw_path}"
+            ));
         }
         total = total
             .checked_add(bytes.len())
@@ -541,7 +580,8 @@ fn stage_package(
     let root = marketplace_cache_root()?.join(id.to_string());
     fs::create_dir(&root).map_err(|error| format!("Cannot create marketplace lease: {error}"))?;
     let package = root.join("package");
-    fs::create_dir(&package).map_err(|error| format!("Cannot create marketplace package directory: {error}"))?;
+    fs::create_dir(&package)
+        .map_err(|error| format!("Cannot create marketplace package directory: {error}"))?;
     let lease = MarketplaceLease {
         registry_source_id: entry.registry_source_id.clone(),
         registry_id: entry.registry_id.clone(),
@@ -558,14 +598,24 @@ fn stage_package(
             serde_json::to_vec_pretty(&lease).map_err(|error| error.to_string())?,
         )
         .map_err(|error| format!("Cannot write marketplace lease: {error}"))?;
-        fs::write(package.join("extension.json"), format!("{}\n", serde_json::to_string_pretty(&envelope.manifest).map_err(|error| error.to_string())?))
-            .map_err(|error| format!("Cannot stage marketplace manifest: {error}"))?;
+        fs::write(
+            package.join("extension.json"),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&envelope.manifest)
+                    .map_err(|error| error.to_string())?
+            ),
+        )
+        .map_err(|error| format!("Cannot stage marketplace manifest: {error}"))?;
         for (relative, bytes) in decoded {
             let target = package.join(relative);
             if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|error| format!("Cannot create marketplace package directory: {error}"))?;
+                fs::create_dir_all(parent).map_err(|error| {
+                    format!("Cannot create marketplace package directory: {error}")
+                })?;
             }
-            fs::write(target, bytes).map_err(|error| format!("Cannot stage marketplace file: {error}"))?;
+            fs::write(target, bytes)
+                .map_err(|error| format!("Cannot stage marketplace file: {error}"))?;
         }
         Ok(())
     })();
@@ -584,7 +634,11 @@ fn load_lease(handle: &str) -> Result<(MarketplaceLease, PathBuf), String> {
         return Err("Marketplace staging lease is not a real directory".to_string());
     }
     let marker = root.join("lease.json");
-    if fs::symlink_metadata(&marker).map_err(|_| "Marketplace lease metadata is missing".to_string())?.file_type().is_symlink() {
+    if fs::symlink_metadata(&marker)
+        .map_err(|_| "Marketplace lease metadata is missing".to_string())?
+        .file_type()
+        .is_symlink()
+    {
         return Err("Marketplace lease metadata cannot be a symlink".to_string());
     }
     let lease: MarketplaceLease = serde_json::from_slice(
@@ -594,15 +648,14 @@ fn load_lease(handle: &str) -> Result<(MarketplaceLease, PathBuf), String> {
     Ok((lease, root.join("package")))
 }
 
-fn resolve_handle(
-    state: &M4CommandState,
-    handle: &str,
-    now: u64,
-) -> Result<PathBuf, String> {
+fn resolve_handle(state: &M4CommandState, handle: &str, now: u64) -> Result<PathBuf, String> {
     let (lease, package) = load_lease(handle)?;
     if lease_is_expired(lease.created_unix_ms, now) {
         let _ = cleanup_handle(handle);
-        return Err("Marketplace staging lease has expired; prepare and review the release again".to_string());
+        return Err(
+            "Marketplace staging lease has expired; prepare and review the release again"
+                .to_string(),
+        );
     }
     let request = MarketplacePrepareRequest {
         registry_source_id: lease.registry_source_id.clone(),
@@ -617,7 +670,12 @@ fn resolve_handle(
     {
         return Err("Marketplace signed identity changed after preview; review again".to_string());
     }
-    if !package.exists() || fs::symlink_metadata(&package).map_err(|e| e.to_string())?.file_type().is_symlink() {
+    if !package.exists()
+        || fs::symlink_metadata(&package)
+            .map_err(|e| e.to_string())?
+            .file_type()
+            .is_symlink()
+    {
         return Err("Marketplace staged package is missing or unsafe".to_string());
     }
     Ok(package)
@@ -634,19 +692,25 @@ pub async fn marketplace_refresh_registries(
 ) -> Result<Vec<AdditionalRegistryRecord>, String> {
     require_main_window(&window)?;
     let now = now_unix_ms()?;
-    let records = state.packages.list_registry_sources().map_err(|error| error.to_string())?;
+    let records = state
+        .packages
+        .list_registry_sources()
+        .map_err(|error| error.to_string())?;
     let mut output = Vec::with_capacity(records.len());
     for record in records {
         let refreshed = async {
             let url = Url::parse(&record.source.location)
                 .map_err(|error| format!("Invalid registry URL: {error}"))?;
             if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
-                return Err("Executable marketplace registries must use credential-free HTTPS".to_string());
+                return Err(
+                    "Executable marketplace registries must use credential-free HTTPS".to_string(),
+                );
             }
             let raw = fetch_text(&url, MAX_REGISTRY_BYTES).await?;
             let snapshot: RegistrySnapshot = serde_json::from_str(&raw)
                 .map_err(|error| format!("Registry snapshot is not valid M4 JSON: {error}"))?;
-            let fetched_sha = sha256_hex(&serde_json::to_vec(&snapshot).map_err(|error| error.to_string())?);
+            let fetched_sha =
+                sha256_hex(&serde_json::to_vec(&snapshot).map_err(|error| error.to_string())?);
             if record
                 .verified
                 .as_ref()

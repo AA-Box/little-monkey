@@ -505,8 +505,8 @@ async fn starter_recipe_target() -> Result<String, String> {
             return Ok(format!("ollama: {}", yaml_scalar(&model.name)));
         }
     }
-    let app_data =
-        crate::app_data_dir().ok_or_else(|| "Could not resolve the app data directory".to_string())?;
+    let app_data = crate::app_data_dir()
+        .ok_or_else(|| "Could not resolve the app data directory".to_string())?;
     if let Some(model) =
         little_monkey_lib::m3_runtime_hub::installed_model_inventory(&app_data).first()
     {
