@@ -1,0 +1,269 @@
+diff --git a/src-tauri/src/bin/monkey-cli/daemon/remote/api.rs b/src-tauri/src/bin/monkey-cli/daemon/remote/api.rs
+index 3ee52ed..29da04e 100644
+--- a/src-tauri/src/bin/monkey-cli/daemon/remote/api.rs
++++ b/src-tauri/src/bin/monkey-cli/daemon/remote/api.rs
+@@ -2314,9 +2314,6 @@ impl RemoteApi {
+                     if route.state != "active" || route.generation != generation {
+                         return Err((409, "This VoiceRoute generation is stale".to_string()));
+                     }
+-                    if route.engine != "pipeline" {
+-                        return Err((409, "Paired Realtime Voice needs a direct media bridge; it is not routed through transcription.".to_string()));
+-                    }
+                     let expected_input = format!("paired:{}:input", device.device_id);
+                     let expected_output = format!("paired:{}:output", device.device_id);
+                     match role {
+@@ -2620,6 +2617,25 @@ impl RemoteApi {
+             && effective.contains(&DeviceCapability::AudioPlayback)
+     }
+ 
++    pub(crate) fn realtime_route_live(&self, session_id: &str, generation: u64) -> bool {
++        self.locked_store()
++            .ok()
++            .and_then(|store| store.voice_route(session_id).ok().flatten())
++            .is_some_and(|route| {
++                route.state == "active" && route.generation == generation && route.engine == "realtime"
++            })
++    }
++
++    pub(crate) fn talk_route_engine(&self, authorization: &TalkSocketAuthorization) -> Option<String> {
++        let route_id = authorization.route_id.as_deref()?;
++        let generation = authorization.route_generation?;
++        self.locked_store()
++            .ok()
++            .and_then(|store| store.voice_route_by_id(route_id).ok().flatten())
++            .filter(|route| route.state == "active" && route.generation == generation)
++            .map(|route| route.engine)
++    }
++
+     pub(crate) fn talk_route_command_id(&self, authorization: &TalkSocketAuthorization) -> Option<String> {
+         let route_id = authorization.route_id.as_deref()?;
+         let store = self.store.lock().ok()?;
+diff --git a/src-tauri/src/bin/monkey-cli/daemon/remote/mod.rs b/src-tauri/src/bin/monkey-cli/daemon/remote/mod.rs
+index 87b6712..01a4997 100644
+--- a/src-tauri/src/bin/monkey-cli/daemon/remote/mod.rs
++++ b/src-tauri/src/bin/monkey-cli/daemon/remote/mod.rs
+@@ -8,6 +8,7 @@ pub(crate) mod device;
+ mod device_e2e;
+ pub(crate) mod migrate;
+ pub(crate) mod protocol;
++pub(crate) mod realtime_bridge;
+ pub(crate) mod push;
+ pub(crate) mod qr;
+ mod server;
+diff --git a/src-tauri/src/bin/monkey-cli/daemon/remote/protocol.rs b/src-tauri/src/bin/monkey-cli/daemon/remote/protocol.rs
+index f8b8b77..583065a 100644
+--- a/src-tauri/src/bin/monkey-cli/daemon/remote/protocol.rs
++++ b/src-tauri/src/bin/monkey-cli/daemon/remote/protocol.rs
+@@ -43,7 +43,7 @@ pub const MAX_REMOTE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
+ /// would offer to re-send *every* turn — including ones already answered. That
+ /// is exactly the "tell somebody to repeat what is already running" failure the
+ /// journal exists to prevent, so the two sides are pinned to each other.
+-pub const TALK_PROTOCOL_VERSION: u32 = 5;
++pub const TALK_PROTOCOL_VERSION: u32 = 6;
+ 
+ /// The version whose only difference from [`TALK_PROTOCOL_VERSION`] is the
+ /// missing utterance id — so a client speaking it can be told precisely what is
+@@ -57,6 +57,8 @@ const TALK_PROTOCOL_VERSION_WITHOUT_ACCEPTANCE: u32 = 2;
+ const TALK_PROTOCOL_VERSION_WITHOUT_VOICE_ROUTE: u32 = 3;
+ /// Version 4 can bind a route, but cannot bind independent input/output Talk roles.
+ const TALK_PROTOCOL_VERSION_WITHOUT_ROUTE_ROLE: u32 = 4;
++/// Version 5 has routed roles and playback ACKs but no raw Realtime PCM frames.
++const TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_PCM: u32 = 5;
+ pub const MAX_TALK_AUDIO_BYTES: usize = MAX_VOICE_CHUNK_BYTES;
+ pub const MAX_TALK_AUDIO_BASE64_BYTES: usize = MAX_TALK_AUDIO_BYTES.div_ceil(3) * 4;
+ pub const MAX_TALK_FRAME_BYTES: usize = MAX_TALK_AUDIO_BASE64_BYTES + 16 * 1024;
+@@ -1790,6 +1792,14 @@ pub enum TalkClientFrameKind {
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+         utterance_id: Option<String>,
+     },
++    /// Raw signed 16-bit little-endian PCM used only by a routed Realtime
++    /// session. It bypasses transcription and is never persisted.
++    RealtimeAudio {
++        audio_sequence: u64,
++        sample_rate_hz: u32,
++        channels: u8,
++        pcm_base64: String,
++    },
+     State {
+         state: TalkState,
+     },
+@@ -1876,6 +1886,12 @@ impl TalkClientFrame {
+                     (false, _) => {}
+                 }
+             }
++            TalkClientFrameKind::RealtimeAudio {
++                audio_sequence, sample_rate_hz, channels, pcm_base64,
++            } => {
++                validate_talk_audio_sequence(*audio_sequence)?;
++                validate_realtime_pcm(*sample_rate_hz, *channels, pcm_base64)?;
++            }
+             TalkClientFrameKind::State { .. } => {}
+             TalkClientFrameKind::Interrupt { reason } => {
+                 if let Some(reason) = reason {
+@@ -1911,7 +1927,8 @@ impl TalkClientFrame {
+ 
+     pub fn audio_sequence(&self) -> Option<u64> {
+         match &self.kind {
+-            TalkClientFrameKind::Audio { audio_sequence, .. } => Some(*audio_sequence),
++            TalkClientFrameKind::Audio { audio_sequence, .. }
++            | TalkClientFrameKind::RealtimeAudio { audio_sequence, .. } => Some(*audio_sequence),
+             _ => None,
+         }
+     }
+@@ -1972,6 +1989,18 @@ pub enum TalkServerFrameKind {
+         media_type: String,
+         audio_base64: String,
+     },
++    /// Raw PCM from the provider media track for a paired Realtime speaker.
++    RealtimeOutputAudio {
++        audio_sequence: u64,
++        sample_rate_hz: u32,
++        channels: u8,
++        pcm_base64: String,
++    },
++    /// Host-side manual turn detection gate for a paired Realtime microphone.
++    /// `false` means the device keeps its microphone open but emits no PCM.
++    RealtimeCapture {
++        enabled: bool,
++    },
+     Error {
+         code: String,
+         message: String,
+@@ -1988,7 +2017,7 @@ impl TalkServerFrame {
+             self.frame_sequence,
+         )?;
+         match &self.kind {
+-            TalkServerFrameKind::Ready | TalkServerFrameKind::State { .. } => {}
++            TalkServerFrameKind::Ready | TalkServerFrameKind::State { .. } | TalkServerFrameKind::RealtimeCapture { .. } => {}
+             TalkServerFrameKind::TurnAccepted {
+                 utterance_id,
+                 run_id,
+@@ -2013,6 +2042,12 @@ impl TalkServerFrame {
+                 validate_talk_media_type(media_type)?;
+                 validate_talk_audio(audio_base64)?;
+             }
++            TalkServerFrameKind::RealtimeOutputAudio {
++                audio_sequence, sample_rate_hz, channels, pcm_base64,
++            } => {
++                validate_talk_audio_sequence(*audio_sequence)?;
++                validate_realtime_pcm(*sample_rate_hz, *channels, pcm_base64)?;
++            }
+             TalkServerFrameKind::Error { code, message, .. } => {
+                 if code.is_empty()
+                     || code.len() > 128
+@@ -2075,6 +2110,28 @@ impl TalkSequenceTracker {
+     }
+ }
+ 
++fn validate_realtime_pcm(sample_rate_hz: u32, channels: u8, pcm_base64: &str) -> Result<(), String> {
++    if sample_rate_hz != super::realtime_bridge::BRIDGE_SAMPLE_RATE_HZ {
++        return Err(format!(
++            "Realtime Talk PCM must be {} Hz",
++            super::realtime_bridge::BRIDGE_SAMPLE_RATE_HZ
++        ));
++    }
++    if channels != super::realtime_bridge::BRIDGE_CHANNELS {
++        return Err("Realtime Talk PCM must be mono".to_string());
++    }
++    if pcm_base64.is_empty() || pcm_base64.len() > MAX_TALK_AUDIO_BASE64_BYTES {
++        return Err("Realtime Talk PCM is empty or exceeds one frame".to_string());
++    }
++    let bytes = STANDARD
++        .decode(pcm_base64)
++        .map_err(|_| "Realtime Talk PCM is not valid base64".to_string())?;
++    if bytes.is_empty() || bytes.len() > MAX_TALK_AUDIO_BYTES || bytes.len() % 2 != 0 {
++        return Err("Realtime Talk PCM must contain aligned signed 16-bit samples".to_string());
++    }
++    Ok(())
++}
++
+ fn validate_talk_protocol_version(protocol_version: u32) -> Result<(), String> {
+     if protocol_version == TALK_PROTOCOL_VERSION {
+         return Ok(());
+@@ -2088,6 +2145,7 @@ fn validate_talk_protocol_version(protocol_version: u32) -> Result<(), String> {
+             | TALK_PROTOCOL_VERSION_WITHOUT_ACCEPTANCE
+             | TALK_PROTOCOL_VERSION_WITHOUT_VOICE_ROUTE
+             | TALK_PROTOCOL_VERSION_WITHOUT_ROUTE_ROLE
++            | TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_PCM
+     ) {
+         return Err(
+             "This Talk client is from an older version of the app; reload the page to continue"
+@@ -3065,6 +3123,15 @@ mod tests {
+                     reason: Some("barge_in".into()),
+                 },
+             ),
++            client_talk_frame(
++                5,
++                TalkClientFrameKind::RealtimeAudio {
++                    audio_sequence: 2,
++                    sample_rate_hz: 24_000,
++                    channels: 1,
++                    pcm_base64: STANDARD.encode([0u8, 0, 1, 0]),
++                },
++            ),
+         ];
+         for frame in client_frames {
+             frame.validate().unwrap();
+@@ -3101,6 +3168,16 @@ mod tests {
+             ),
+             server_talk_frame(
+                 6,
++                TalkServerFrameKind::RealtimeOutputAudio {
++                    audio_sequence: 2,
++                    sample_rate_hz: 24_000,
++                    channels: 1,
++                    pcm_base64: STANDARD.encode([0u8, 0, 1, 0]),
++                },
++            ),
++            server_talk_frame(7, TalkServerFrameKind::RealtimeCapture { enabled: false }),
++            server_talk_frame(
++                8,
+                 TalkServerFrameKind::Error {
+                     code: "provider_unavailable".into(),
+                     message: "Try again".into(),
+@@ -3153,6 +3230,27 @@ mod tests {
+         };
+         assert!(frame.validate().is_err());
+ 
++        let bad_realtime_rate = client_talk_frame(
++            2,
++            TalkClientFrameKind::RealtimeAudio {
++                audio_sequence: 2,
++                sample_rate_hz: 48_000,
++                channels: 1,
++                pcm_base64: STANDARD.encode([0u8, 0]),
++            },
++        );
++        assert!(bad_realtime_rate.validate().is_err());
++        let odd_realtime_pcm = client_talk_frame(
++            3,
++            TalkClientFrameKind::RealtimeAudio {
++                audio_sequence: 3,
++                sample_rate_hz: 24_000,
++                channels: 1,
++                pcm_base64: STANDARD.encode([0u8]),
++            },
++        );
++        assert!(odd_realtime_pcm.validate().is_err());
++
+         let oversized_text = server_talk_frame(
+             1,
+             TalkServerFrameKind::AssistantDelta {
+diff --git a/src-tauri/src/bin/monkey-cli/daemon/remote/server.rs b/src-tauri/src/bin/monkey-cli/daemon/remote/server.rs
+index 0a6b49f..cf616aa 100644
+--- a/src-tauri/src/bin/monkey-cli/daemon/remote/server.rs
++++ b/src-tauri/src/bin/monkey-cli/daemon/remote/server.rs
+@@ -129,6 +129,7 @@ pub async fn spawn_if_configured(
+         placement,
+         peer_runs,
+     )?;
++    super::realtime_bridge::spawn(api.clone()).await?;
+     tokio::spawn(async move {
+         if let Err(error) = serve_bound(listener, acceptor, api).await {
+             eprintln!("remote runner listener stopped: {error}");
+@@ -152,6 +153,7 @@ pub async fn serve(
+     let listener = bind(&config).await?;
+     let acceptor = acceptor(&config)?;
+     let api = RemoteApi::production(paths, config, desktop, mobile_chat, placement, peer_runs)?;
++    super::realtime_bridge::spawn(api.clone()).await?;
+     serve_bound(listener, ac
