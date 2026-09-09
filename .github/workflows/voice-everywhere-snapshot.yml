@@ -1,4 +1,4 @@
-name: voice-everywhere-snapshot
+name: voice-everywhere-apply
 
 on:
   push:
@@ -8,20 +8,27 @@ on:
       - .github/workflows/voice-everywhere-snapshot.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  snapshot:
+  apply:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-      - name: Pack checkout
-        run: tar --exclude=.git -czf /tmp/little-monkey-source.tar.gz .
-      - uses: actions/upload-artifact@v4
-        with:
-          name: little-monkey-source
-          path: /tmp/little-monkey-source.tar.gz
-          if-no-files-found: error
-          retention-days: 1
+          fetch-depth: 0
+      - name: Apply Voice Everywhere implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .github/voice-everywhere-patch/part-* > /tmp/voice-everywhere.patch
+          echo "b19e8e7fc592e8b1e28973c97021be3d7e5e8bca61a73c6e6517dfc5e60da372  /tmp/voice-everywhere.patch" | sha256sum -c -
+          git apply --check /tmp/voice-everywhere.patch
+          git apply /tmp/voice-everywhere.patch
+          git diff --check
+          git rm -r .github/voice-everywhere-patch
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(voice): add host-authoritative cross-device Talk routes"
+          git push origin HEAD:feat/voice-everywhere
