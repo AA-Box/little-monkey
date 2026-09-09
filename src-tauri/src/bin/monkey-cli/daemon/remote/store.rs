@@ -1734,6 +1734,17 @@ impl RemoteStore {
         })
     }
 
+    pub fn latest_voice_route_event_id(&self, session_id: &str) -> Result<u64, String> {
+        let value: i64 = self.connection
+            .query_row(
+                "SELECT COALESCE(MAX(event_id), 0) FROM remote_voice_route_events WHERE session_id=?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        from_i64(value)
+    }
+
     pub fn voice_route_events(
         &self,
         session_id: &str,

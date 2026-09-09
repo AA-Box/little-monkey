@@ -27,8 +27,6 @@ import {
   voiceRouteDeactivate,
   voiceRouteEmit,
   voiceRouteEvents,
-  voiceRouteOutputAudio,
-  voiceRouteOutputStop,
 } from '../../lib/daemonClient';
 import {
   BoundedPcmQueue,
@@ -195,6 +193,7 @@ export function useTalkSession(
   const routeRef = useRef<VoiceRouteRecord | null>(route);
   const routeCursorRef = useRef<{ generation: number; eventId: number } | null>(null);
   const routeEmitQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+  const routedSpeechRef = useRef(new Map<string, { resolve: () => void; reject: (reason: Error) => void }>());
   const player = useMemo(() => createTalkPlayer(), []);
 
   const pairedInputDevice = (value: string | undefined | null) => {
@@ -219,6 +218,44 @@ export function useTalkSession(
       .then(() => voiceRouteEmit(sessionId, currentRoute.generation, kind, payload))
       .catch(() => undefined);
   };
+
+  const activateAndWaitForRoute = useCallback(async (): Promise<VoiceRouteRecord | null> => {
+    const selected = routeRef.current;
+    if (!selected || selected.state !== 'active') return selected;
+    const activated = await voiceRouteActivate(sessionId);
+    routeRef.current = activated;
+    const required = new Map<string, 'input_ready' | 'output_ready'>();
+    if (pairedInputDevice(activated.input_endpoint) && activated.input_command_id) {
+      required.set(activated.input_command_id, 'input_ready');
+    }
+    const pairedOutput = pairedOutputDevice(activated.output_endpoint);
+    if (pairedOutput
+        && pairedInputDevice(activated.input_endpoint) !== pairedOutput
+        && activated.output_command_id) {
+      required.set(activated.output_command_id, 'output_ready');
+    }
+    if (required.size === 0) return activated;
+    let cursor = routeCursorRef.current?.generation === activated.generation
+      ? routeCursorRef.current.eventId
+      : 0;
+    const deadline = Date.now() + 20_000;
+    while (required.size > 0 && Date.now() < deadline) {
+      const events = await voiceRouteEvents(sessionId, cursor, 100);
+      for (const event of events) {
+        cursor = Math.max(cursor, event.event_id);
+        if (event.generation !== activated.generation || !event.payload || typeof event.payload !== 'object') continue;
+        const payload = event.payload as Record<string, unknown>;
+        const commandId = typeof payload.command_id === 'string' ? payload.command_id : '';
+        if (commandId && required.get(commandId) === event.kind) required.delete(commandId);
+      }
+      routeCursorRef.current = { generation: activated.generation, eventId: cursor };
+      if (required.size > 0) await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    if (required.size > 0) {
+      throw new Error('A paired VoiceRoute endpoint did not become ready within 20 seconds');
+    }
+    return activated;
+  }, [sessionId]);
 
   useEffect(() => {
     grantRef.current = grant;
@@ -476,26 +513,37 @@ export function useTalkSession(
         }
       },
       cancelTurn: () => stopTurn(sessionId),
+      speakText: async (text, jobId) => {
+        const currentRoute = routeRef.current;
+        const pairedOutput = pairedOutputDevice(currentRoute?.output_endpoint);
+        if (!currentRoute || currentRoute.state !== 'active' || !pairedOutput) return false;
+        // A same-device duplex route already synthesizes the same assistant
+        // deltas on the input Talk socket. Do not emit a second speech job.
+        if (pairedInputDevice(currentRoute.input_endpoint) === pairedOutput) return true;
+        const completion = new Promise<void>((resolve, reject) => {
+          routedSpeechRef.current.set(jobId, { resolve, reject });
+        });
+        try {
+          await voiceRouteEmit(sessionId, currentRoute.generation, 'speak_text', {
+            job_id: jobId,
+            turn_id: activeTurnRef.current?.turnId ?? '',
+            text,
+          });
+          await Promise.race([
+            completion,
+            new Promise<void>((_, reject) => setTimeout(() => reject(new Error('Paired speaker did not acknowledge playback')), 90_000)),
+          ]);
+          return true;
+        } finally {
+          routedSpeechRef.current.delete(jobId);
+        }
+      },
       synthesize: async (text, jobId) => {
         const speech = await talkClient.synthesize(jobId, text);
         return { audioBase64: speech.audioBase64, mediaType: speech.mediaType };
       },
       play: async (audioBase64, mediaType) => {
         const currentRoute = routeRef.current;
-        const pairedOutput = pairedOutputDevice(currentRoute?.output_endpoint);
-        if (currentRoute?.state === 'active' && pairedOutput) {
-          // Duplex uses the input device's authenticated Talk socket; the host
-          // copy of TTS must not make the phone speak the same sentence twice.
-          if (pairedInputDevice(currentRoute.input_endpoint) === pairedOutput) return;
-          await voiceRouteOutputAudio(
-            sessionId,
-            currentRoute.generation,
-            `clip-${crypto.randomUUID()}`,
-            mediaType,
-            audioBase64,
-          );
-          return;
-        }
         try {
           const configured = (await companionClient.config()).voice.outputDeviceId;
           const routedLocal = localDevice(currentRoute?.output_endpoint, 'output');
@@ -512,8 +560,12 @@ export function useTalkSession(
         if (currentRoute?.state === 'active'
             && pairedOutput
             && pairedInputDevice(currentRoute.input_endpoint) !== pairedOutput) {
-          void voiceRouteOutputStop(sessionId, currentRoute.generation).catch(() => undefined);
+          emitRoute(currentRoute, 'output_stop', { reason: 'host_interrupt' });
         }
+        for (const pending of routedSpeechRef.current.values()) {
+          pending.reject(new Error('Playback interrupted'));
+        }
+        routedSpeechRef.current.clear();
       },
       recordMetric: (metric) => {
         void talkClient.recordMetric(metric).catch(() => undefined);
@@ -591,13 +643,13 @@ export function useTalkSession(
     // itself never opens a microphone; activation here preserves that privacy
     // boundary while making live handoff take effect immediately.
     if (route?.state === 'active' && snapshot?.state && snapshot.state !== 'off') {
-      void voiceRouteActivate(sessionId).catch((reason) => setSetupError(errorMessage(reason)));
+      void activateAndWaitForRoute().catch((reason) => setSetupError(errorMessage(reason)));
     }
-  }, [releaseDevices, route, sessionId]);
+  }, [activateAndWaitForRoute, releaseDevices, route, sessionId]);
 
   useEffect(() => {
     if (!enabled || snapshot?.state === 'off' || !route || route.state !== 'active'
-        || !pairedInputDevice(route.input_endpoint)) return;
+        || (!pairedInputDevice(route.input_endpoint) && !pairedOutputDevice(route.output_endpoint))) return;
     let disposed = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const poll = async () => {
@@ -625,6 +677,14 @@ export function useTalkSession(
             sessionRef.current?.interrupt(
               typeof payload.reason === 'string' ? payload.reason : 'remote_barge_in',
             );
+          } else if (event.kind === 'output_played' || event.kind === 'output_failed') {
+            const jobId = typeof payload.job_id === 'string' ? payload.job_id : '';
+            const pending = jobId ? routedSpeechRef.current.get(jobId) : undefined;
+            if (pending) {
+              if (event.kind === 'output_played') pending.resolve();
+              else pending.reject(new Error(typeof payload.error === 'string' ? payload.error : 'Paired speaker playback failed'));
+              routedSpeechRef.current.delete(jobId);
+            }
           }
         }
         routeCursorRef.current = { generation: route.generation, eventId: next };
@@ -702,12 +762,12 @@ export function useTalkSession(
       sessionRef.current?.setExternalInput(Boolean(
         currentRoute?.state === 'active' && pairedInputDevice(currentRoute.input_endpoint),
       ));
-      if (currentRoute?.state === 'active') await voiceRouteActivate(sessionId);
+      if (currentRoute?.state === 'active') await activateAndWaitForRoute();
       await sessionRef.current?.start();
     } catch (reason) {
       setSetupError(errorMessage(reason));
     }
-  }, [sessionId]);
+  }, [activateAndWaitForRoute, sessionId]);
 
   const stop = useCallback(async () => {
     await sessionRef.current?.stop();

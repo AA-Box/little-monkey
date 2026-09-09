@@ -19,7 +19,7 @@
 // durably accepted utterance with `turn_accepted`, and that frame is the only
 // thing this client deletes a recording on. Both sides are pinned to v3 — see
 // the Rust constant's own note for why an additive frame was not enough.
-export const TALK_PROTOCOL_VERSION = 4;
+export const TALK_PROTOCOL_VERSION = 5;
 
 /// Exactly `TALK_MEDIA_TYPES` in `protocol.rs`. A container that is not on this
 /// list is refused outright, so guessing one is the same as dropping the
@@ -285,13 +285,18 @@ export function createTalkFrames({ sessionId, sessionGeneration, mediaType, samp
     },
     interrupt(reason) {
       requireGreeted("interrupt");
-      // `reason` is optional on the wire and the runner denies unknown fields,
-      // so an absent reason is an absent key rather than a null.
       return envelope(
         reason === undefined || reason === null
           ? { type: "interrupt" }
           : { type: "interrupt", reason: String(reason) },
       );
+    },
+    playbackAck(audioSequence, played = true) {
+      requireGreeted("playback acknowledgement");
+      if (!Number.isInteger(audioSequence) || audioSequence < 1) {
+        throw new Error("A Talk playback acknowledgement needs a positive audio sequence");
+      }
+      return envelope({ type: "playback_ack", audio_sequence: audioSequence, played: Boolean(played) });
     },
     /**
      * Durations, and nothing else. No transcript, no audio, no text of any kind

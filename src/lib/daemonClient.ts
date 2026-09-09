@@ -455,17 +455,7 @@ export const voiceRouteEmit = (
   kind: string,
   payload: unknown,
 ) => invoke<VoiceRouteEvent>("voice_route_emit", { sessionId, generation, kind, payload });
-export const voiceRouteOutputAudio = (
-  sessionId: string,
-  generation: number,
-  clipId: string,
-  mediaType: string,
-  audioBase64: string,
-) => invoke<{ queued_chunks: number }>("voice_route_output_audio", {
-  sessionId, generation, clipId, mediaType, audioBase64,
-});
-export const voiceRouteOutputStop = (sessionId: string, generation: number) =>
-  invoke<{ stopped: boolean }>("voice_route_output_stop", { sessionId, generation });
+
 
 /** One node this machine may place work on, as `monkey daemon remote node-list --json` reports it (roadmap K17 S1). */
 export interface RemoteNodeRow {

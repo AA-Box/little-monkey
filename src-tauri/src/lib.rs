@@ -1972,8 +1972,6 @@ pub fn run() {
             daemon_commands::voice_route_stop,
             daemon_commands::voice_route_events,
             daemon_commands::voice_route_emit,
-            daemon_commands::voice_route_output_audio,
-            daemon_commands::voice_route_output_stop,
             daemon_commands::remote_device_list,
             daemon_commands::remote_device_grant,
             daemon_commands::remote_device_commands,

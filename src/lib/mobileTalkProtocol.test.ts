@@ -73,6 +73,23 @@ function feed(
 }
 
 describe("the Talk frame builder", () => {
+  it("builds playback acknowledgements after the hello", () => {
+    const frames = newFrames();
+    frames.hello();
+    expect(frames.playbackAck(7, true)).toEqual({
+      ...envelope(2),
+      type: "playback_ack",
+      audio_sequence: 7,
+      played: true,
+    });
+    expect(frames.playbackAck(8, false)).toEqual({
+      ...envelope(3),
+      type: "playback_ack",
+      audio_sequence: 8,
+      played: false,
+    });
+  });
+
   it("opens with a hello and numbers every later frame after it", () => {
     const frames = newFrames();
 

@@ -7,7 +7,6 @@
 //! audio never lands here.
 
 use super::protocol::{validate_id, DeviceCapability};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use super::store::{DeviceCommandRequest, RemoteStore, VoiceRouteEventRecord, VoiceRouteRecord};
 use crate::daemon::store::DaemonPaths;
 
@@ -234,7 +233,17 @@ pub fn set_route(
     validate_endpoint(&store, &input)?;
     validate_endpoint(&store, &output)?;
     let previous = store.voice_route(session_id)?;
-    let route = store.replace_voice_route(
+    // Prepare -> retire -> commit. The new endpoints are validated above while
+    // the old route is untouched. We then wait for the old microphone command
+    // to acknowledge cancellation before minting the new generation, so there
+    // is never an intentional two-microphone ownership window.
+    if let Some(previous) = previous.as_ref() {
+        retire_input_command(&mut store, previous.input_command_id.as_deref(), now_ms)?;
+        if previous.output_command_id != previous.input_command_id {
+            cancel_command(&mut store, previous.output_command_id.as_deref(), now_ms);
+        }
+    }
+    store.replace_voice_route(
         session_id,
         engine,
         &input.token(),
@@ -242,20 +251,7 @@ pub fn set_route(
         None,
         None,
         now_ms,
-    )?;
-
-    if let Some(previous) = previous.as_ref() {
-        retire_input_command(&mut store, previous.input_command_id.as_deref(), now_ms)?;
-        if previous.output_command_id != previous.input_command_id {
-            cancel_command(&mut store, previous.output_command_id.as_deref(), now_ms);
-        }
-    }
-
-    // Selection is not microphone authority. A route row can exist while Talk
-    // is off; `activate_route` is called only by the live Talk surface. Moving
-    // a route still retires an old paired input immediately, so a stale socket
-    // cannot remain a second microphone owner.
-    Ok(route)
+    )
 }
 
 pub fn activate_route(paths: &DaemonPaths, session_id: &str, now_ms: u64) -> Result<VoiceRouteRecord, String> {
@@ -271,31 +267,59 @@ pub fn activate_route(paths: &DaemonPaths, session_id: &str, now_ms: u64) -> Res
     {
         return Err("Paired Realtime Voice needs a direct media bridge; use local endpoints or Pipeline".to_string());
     }
-    if route.input_command_id.is_some() {
+    if route.input_command_id.is_some() || route.output_command_id.is_some() {
         return Ok(route);
     }
     let input = AudioEndpoint::parse(&route.input_endpoint)?;
     let output = AudioEndpoint::parse(&route.output_endpoint)?;
     validate_endpoint(&store, &input)?;
     validate_endpoint(&store, &output)?;
-    let input_command_id = match input {
-        AudioEndpoint::PairedInput(device_id) => Some(enqueue_role(
+
+    let paired_input = match &input { AudioEndpoint::PairedInput(id) => Some(id.as_str()), _ => None };
+    let paired_output = match &output { AudioEndpoint::PairedOutput(id) => Some(id.as_str()), _ => None };
+    let mut input_command_id = None;
+    let mut output_command_id = None;
+
+    if let Some(device_id) = paired_input {
+        let role = if paired_output == Some(device_id) { "duplex" } else { "input" };
+        input_command_id = Some(enqueue_role(
             &mut store,
-            &device_id,
+            device_id,
             DeviceCapability::VoiceStream,
             session_id,
             &route.route_id,
             route.generation,
-            if output.paired_device() == Some(device_id.as_str()) { "duplex" } else { "input" },
+            role,
             now_ms,
-        )?),
-        _ => None,
-    };
+        )?);
+    }
+    if let Some(device_id) = paired_output {
+        if paired_input != Some(device_id) {
+            match enqueue_role(
+                &mut store,
+                device_id,
+                DeviceCapability::AudioPlayback,
+                session_id,
+                &route.route_id,
+                route.generation,
+                "output",
+                now_ms,
+            ) {
+                Ok(command_id) => output_command_id = Some(command_id),
+                Err(error) => {
+                    cancel_command(&mut store, input_command_id.as_deref(), now_ms);
+                    return Err(error);
+                }
+            }
+        } else {
+            output_command_id = input_command_id.clone();
+        }
+    }
     store.set_voice_route_commands(
         session_id,
         route.generation,
         input_command_id.as_deref(),
-        None,
+        output_command_id.as_deref(),
         now_ms,
     )
 }
@@ -304,6 +328,9 @@ pub fn deactivate_route(paths: &DaemonPaths, session_id: &str, now_ms: u64) -> R
     let mut store = RemoteStore::open(&paths.root)?;
     let Some(route) = store.voice_route(session_id)? else { return Ok(None); };
     cancel_command(&mut store, route.input_command_id.as_deref(), now_ms);
+    if route.output_command_id != route.input_command_id {
+        cancel_command(&mut store, route.output_command_id.as_deref(), now_ms);
+    }
     if route.state != "active" {
         return Ok(Some(route));
     }
@@ -346,122 +373,6 @@ pub fn events(
     limit: u32,
 ) -> Result<Vec<VoiceRouteEventRecord>, String> {
     RemoteStore::open(&paths.root)?.voice_route_events(session_id, after, limit)
-}
-
-pub fn output_audio(
-    paths: &DaemonPaths,
-    session_id: &str,
-    generation: u64,
-    clip_id: &str,
-    media_type: &str,
-    audio_base64: &str,
-    now_ms: u64,
-) -> Result<usize, String> {
-    validate_id(session_id)?;
-    validate_id(clip_id)?;
-    if !media_type.starts_with("audio/") || media_type.len() > 128 || media_type.chars().any(char::is_control) {
-        return Err("Voice route output media type is invalid".to_string());
-    }
-    let bytes = STANDARD
-        .decode(audio_base64.trim())
-        .map_err(|_| "Voice route output audio is not valid base64".to_string())?;
-    if bytes.is_empty() || bytes.len() > 4 * 1024 * 1024 {
-        return Err("Voice route output must contain 1 byte to 4 MiB".to_string());
-    }
-    let mut store = RemoteStore::open(&paths.root)?;
-    let route = store
-        .voice_route(session_id)?
-        .ok_or_else(|| "No voice route exists for this conversation".to_string())?;
-    if route.state != "active" || route.generation != generation {
-        return Err("Voice route generation is stale".to_string());
-    }
-    let output = AudioEndpoint::parse(&route.output_endpoint)?;
-    let device_id = match output {
-        AudioEndpoint::PairedOutput(device_id) => device_id,
-        _ => return Err("Voice route output is not a paired speaker".to_string()),
-    };
-    // Same-device duplex audio already rides the authenticated Talk socket.
-    if route.input_endpoint == format!("paired:{device_id}:input") {
-        return Ok(0);
-    }
-    super::device::resolve_target(&store, DeviceCapability::AudioPlayback, Some(&device_id))?;
-
-    // 4.5 KiB raw stays comfortably below the physical command's 8 KiB JSON
-    // ceiling after base64 and metadata. Each chunk is independently durable
-    // and idempotent through its invocation id.
-    const RAW_CHUNK: usize = 4_500;
-    let chunks = bytes.chunks(RAW_CHUNK).collect::<Vec<_>>();
-    for (sequence, chunk) in chunks.iter().enumerate() {
-        let last = sequence + 1 == chunks.len();
-        store.enqueue_device_command(
-            &DeviceCommandRequest {
-                device_id: device_id.clone(),
-                capability: DeviceCapability::AudioPlayback,
-                arguments: serde_json::json!({
-                    "mode": "voice_route_audio_chunk",
-                    "session_id": session_id,
-                    "route_id": route.route_id,
-                    "route_generation": generation,
-                    "clip_id": clip_id,
-                    "chunk_sequence": sequence,
-                    "last": last,
-                    "media_type": media_type,
-                    "audio_base64": STANDARD.encode(chunk),
-                }),
-                source_run_id: None,
-                source_session_id: Some(session_id.to_string()),
-                source_tool_call_id: None,
-                invocation_id: Some(format!(
-                    "voice-route-audio:{}:{}:{}:{}", route.route_id, generation, clip_id, sequence
-                )),
-                expires_at_ms: now_ms.saturating_add(5 * 60 * 1_000),
-            },
-            now_ms,
-        )?;
-    }
-    Ok(chunks.len())
-}
-
-pub fn stop_output(
-    paths: &DaemonPaths,
-    session_id: &str,
-    generation: u64,
-    now_ms: u64,
-) -> Result<(), String> {
-    let mut store = RemoteStore::open(&paths.root)?;
-    let route = store
-        .voice_route(session_id)?
-        .ok_or_else(|| "No voice route exists for this conversation".to_string())?;
-    if route.state != "active" || route.generation != generation {
-        return Err("Voice route generation is stale".to_string());
-    }
-    let AudioEndpoint::PairedOutput(device_id) = AudioEndpoint::parse(&route.output_endpoint)? else {
-        return Ok(());
-    };
-    if route.input_endpoint == format!("paired:{device_id}:input") {
-        // Same-device playback is stopped by Talk's interrupt frame.
-        return Ok(());
-    }
-    super::device::resolve_target(&store, DeviceCapability::AudioPlayback, Some(&device_id))?;
-    store.enqueue_device_command(
-        &DeviceCommandRequest {
-            device_id,
-            capability: DeviceCapability::AudioPlayback,
-            arguments: serde_json::json!({
-                "mode": "voice_route_audio_stop",
-                "session_id": session_id,
-                "route_id": route.route_id,
-                "route_generation": generation,
-            }),
-            source_run_id: None,
-            source_session_id: Some(session_id.to_string()),
-            source_tool_call_id: None,
-            invocation_id: Some(format!("voice-route-stop:{}:{}:{}", route.route_id, generation, now_ms)),
-            expires_at_ms: now_ms.saturating_add(60_000),
-        },
-        now_ms,
-    )?;
-    Ok(())
 }
 
 pub fn route_json(route: &VoiceRouteRecord) -> serde_json::Value {

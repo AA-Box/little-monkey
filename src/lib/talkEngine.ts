@@ -88,6 +88,8 @@ export interface TalkPorts {
   submitTurn(text: string, utteranceId: string): Promise<void>;
   /** Ask the running turn to stop. Best effort — see `interrupt`. */
   cancelTurn(): void;
+  /** Optional routed speech sink. Return true when this chunk was played remotely. */
+  speakText?(text: string, jobId: string): Promise<boolean>;
   /** The operator's own configured speech synthesizer. */
   synthesize(text: string, jobId: string): Promise<{ audioBase64: string; mediaType: string }>;
   /** Queue one synthesized chunk for playback. Resolves when it has been played. */
@@ -651,6 +653,12 @@ export class TalkSession {
         if (generation !== this.playbackGeneration) return;
         try {
           const jobId = `talk-tts-${crypto.randomUUID()}`;
+          if (this.ports.speakText && await this.ports.speakText(chunk, jobId)) {
+            if (generation !== this.playbackGeneration) return;
+            if (this.firstAudioAt === null) this.firstAudioAt = this.ports.now();
+            this.spokenChunks += 1;
+            return;
+          }
           const audio = await this.ports.synthesize(chunk, jobId);
           if (generation !== this.playbackGeneration) return;
           if (this.firstAudioAt === null) this.firstAudioAt = this.ports.now();

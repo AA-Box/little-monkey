@@ -8,14 +8,20 @@
 //! provable without any of it.
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
+use std::collections::VecDeque;
 use hyper_util::rt::TokioIo;
 use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocketConfig};
 use tokio_tungstenite::WebSocketStream;
 
 use super::api::{RemoteApi, TalkSessionTurns, TalkSocketAuthorization};
-use super::protocol::MAX_TALK_FRAME_BYTES;
-use super::talk::{run_talk_session, TalkIdentity, TalkSocket, TalkSpeech};
+use super::protocol::{
+    TalkClientFrame, TalkClientFrameKind, TalkSequenceTracker, TalkServerFrame,
+    TalkServerFrameKind, TalkState, MAX_TALK_AUDIO_BYTES, MAX_TALK_FRAME_BYTES,
+    TALK_PROTOCOL_VERSION,
+};
+use super::talk::{run_talk_session, TalkIdentity, TalkSessionReport, TalkSocket, TalkSpeech};
 
 /// How long a Talk socket may stay open. A conversation that outlives this is
 /// reopened with a fresh ticket; a tab left open overnight is not a microphone
@@ -124,6 +130,241 @@ impl TalkSpeech for ConfiguredTalkSpeech {
     }
 }
 
+
+async fn send_output_frame(
+    socket: &mut dyn TalkSocket,
+    authorization: &TalkSocketAuthorization,
+    sequence: &mut u64,
+    kind: TalkServerFrameKind,
+) -> Result<(), String> {
+    *sequence = sequence.saturating_add(1);
+    let frame = TalkServerFrame {
+        protocol_version: TALK_PROTOCOL_VERSION,
+        session_id: authorization.session_id.clone(),
+        session_generation: authorization.session_generation.clone(),
+        frame_sequence: *sequence,
+        kind,
+    };
+    frame.validate()?;
+    socket.send(serde_json::to_string(&frame).map_err(|error| error.to_string())?).await
+}
+
+fn parse_output_client_frame(
+    raw: &str,
+    authorization: &TalkSocketAuthorization,
+    tracker: &mut TalkSequenceTracker,
+) -> Result<TalkClientFrame, String> {
+    let frame: TalkClientFrame = serde_json::from_str(raw)
+        .map_err(|error| format!("Invalid Talk frame: {error}"))?;
+    frame.validate()?;
+    if frame.session_id != authorization.session_id
+        || frame.session_generation != authorization.session_generation
+    {
+        return Err("Talk frame belongs to a different session generation".to_string());
+    }
+    tracker.accept(frame.frame_sequence, frame.audio_sequence())?;
+    Ok(frame)
+}
+
+async fn output_wait_for_ack(
+    socket: &mut dyn TalkSocket,
+    api: &RemoteApi,
+    authorization: &TalkSocketAuthorization,
+    tracker: &mut TalkSequenceTracker,
+    outbound_sequence: &mut u64,
+    audio_sequence: u64,
+    cursor: &mut u64,
+    backlog: &mut VecDeque<super::store::VoiceRouteEventRecord>,
+) -> Result<bool, String> {
+    let generation = authorization.route_generation.ok_or_else(|| "Output route has no generation".to_string())?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        if !api.talk_output_route_live(authorization) {
+            return Err("VoiceRoute output authority was revoked or moved".to_string());
+        }
+        for event in api.talk_route_events(&authorization.session_id, *cursor)? {
+            *cursor = (*cursor).max(event.event_id);
+            if event.generation != generation { continue; }
+            if event.kind == "output_stop" {
+                send_output_frame(
+                    socket,
+                    authorization,
+                    outbound_sequence,
+                    TalkServerFrameKind::State { state: TalkState::Interrupted },
+                ).await?;
+                return Ok(false);
+            }
+            backlog.push_back(event);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("Timed out waiting for paired speaker playback acknowledgement".to_string());
+        }
+        match tokio::time::timeout(std::time::Duration::from_millis(100), socket.recv()).await {
+            Ok(Some(raw)) => {
+                let frame = parse_output_client_frame(&raw, authorization, tracker)?;
+                match frame.kind {
+                    TalkClientFrameKind::PlaybackAck { audio_sequence: ack, played } if ack == audio_sequence => {
+                        return Ok(played);
+                    }
+                    TalkClientFrameKind::Interrupt { .. } => return Ok(false),
+                    TalkClientFrameKind::State { .. } | TalkClientFrameKind::PlaybackAck { .. } => {}
+                    _ => return Err("An output-only Talk socket received a microphone frame".to_string()),
+                }
+            }
+            Ok(None) => return Err("Paired speaker Talk socket closed".to_string()),
+            Err(_) => {}
+        }
+    }
+}
+
+async fn run_output_route_session(
+    socket: &mut dyn TalkSocket,
+    speech: &dyn TalkSpeech,
+    api: &RemoteApi,
+    authorization: &TalkSocketAuthorization,
+) -> TalkSessionReport {
+    let mut report = TalkSessionReport::default();
+    let mut outbound_sequence = 0u64;
+    let mut outbound_audio_sequence = 0u64;
+    let mut inbound = TalkSequenceTracker::default();
+    let mut cursor = authorization.route_event_cursor;
+    let mut backlog = VecDeque::new();
+    let generation = match authorization.route_generation {
+        Some(value) => value,
+        None => { report.errors += 1; return report; }
+    };
+
+    if send_output_frame(socket, authorization, &mut outbound_sequence, TalkServerFrameKind::Ready).await.is_err() {
+        report.stream_dropped = true;
+        return report;
+    }
+    // The first client frame remains the normal Talk hello. Output-only roles
+    // carry no microphone bytes after it.
+    let Some(raw) = socket.recv().await else { report.stream_dropped = true; return report; };
+    match parse_output_client_frame(&raw, authorization, &mut inbound) {
+        Ok(TalkClientFrame { kind: TalkClientFrameKind::Hello { .. }, .. }) => {}
+        _ => {
+            report.errors += 1;
+            let _ = send_output_frame(
+                socket,
+                authorization,
+                &mut outbound_sequence,
+                TalkServerFrameKind::Error {
+                    code: "hello_required".into(),
+                    message: "An output-only Talk socket must start with hello.".into(),
+                    retryable: false,
+                },
+            ).await;
+            return report;
+        }
+    }
+    let _ = send_output_frame(
+        socket,
+        authorization,
+        &mut outbound_sequence,
+        TalkServerFrameKind::State { state: TalkState::Idle },
+    ).await;
+    if let Some(command_id) = api.talk_route_command_id(authorization) {
+        let _ = api.append_talk_route_event(
+            &authorization.session_id,
+            generation,
+            "output_ready",
+            &serde_json::json!({ "command_id": command_id, "device_id": authorization.device_id }),
+        );
+    }
+
+    loop {
+        if !api.talk_output_route_live(authorization) {
+            report.grant_revoked = true;
+            break;
+        }
+        if backlog.is_empty() {
+            match api.talk_route_events(&authorization.session_id, cursor) {
+                Ok(events) => {
+                    for event in events {
+                        cursor = cursor.max(event.event_id);
+                        if event.generation == generation { backlog.push_back(event); }
+                    }
+                }
+                Err(_) => { report.errors += 1; break; }
+            }
+        }
+        let Some(event) = backlog.pop_front() else {
+            match tokio::time::timeout(std::time::Duration::from_millis(120), socket.recv()).await {
+                Ok(Some(raw)) => {
+                    match parse_output_client_frame(&raw, authorization, &mut inbound) {
+                        Ok(TalkClientFrame { kind: TalkClientFrameKind::State { .. } | TalkClientFrameKind::PlaybackAck { .. }, .. }) => {}
+                        Ok(TalkClientFrame { kind: TalkClientFrameKind::Interrupt { .. }, .. }) => {
+                            let _ = send_output_frame(socket, authorization, &mut outbound_sequence, TalkServerFrameKind::State { state: TalkState::Interrupted }).await;
+                        }
+                        Ok(_) | Err(_) => { report.errors += 1; break; }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {}
+            }
+            continue;
+        };
+        match event.kind.as_str() {
+            "output_stop" => {
+                let _ = send_output_frame(socket, authorization, &mut outbound_sequence, TalkServerFrameKind::State { state: TalkState::Interrupted }).await;
+            }
+            "speak_text" => {
+                let Some(text) = event.payload.get("text").and_then(serde_json::Value::as_str) else { continue; };
+                let job_id = event.payload.get("job_id").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+                let turn_id = event.payload.get("turn_id").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+                let (bytes, media_type) = match speech.synthesize(text).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        report.errors += 1;
+                        let _ = api.append_talk_route_event(&authorization.session_id, generation, "output_failed", &serde_json::json!({"job_id": job_id, "turn_id": turn_id, "error": error}));
+                        continue;
+                    }
+                };
+                if bytes.is_empty() || bytes.len() > MAX_TALK_AUDIO_BYTES {
+                    report.errors += 1;
+                    let _ = api.append_talk_route_event(&authorization.session_id, generation, "output_failed", &serde_json::json!({"job_id": job_id, "turn_id": turn_id, "error": "Synthesized audio exceeded the Talk frame limit"}));
+                    continue;
+                }
+                outbound_audio_sequence = outbound_audio_sequence.saturating_add(1);
+                if send_output_frame(socket, authorization, &mut outbound_sequence, TalkServerFrameKind::State { state: TalkState::Speaking }).await.is_err() {
+                    report.stream_dropped = true; break;
+                }
+                if send_output_frame(
+                    socket,
+                    authorization,
+                    &mut outbound_sequence,
+                    TalkServerFrameKind::OutputAudio {
+                        audio_sequence: outbound_audio_sequence,
+                        media_type,
+                        audio_base64: STANDARD.encode(bytes),
+                    },
+                ).await.is_err() { report.stream_dropped = true; break; }
+                match output_wait_for_ack(
+                    socket, api, authorization, &mut inbound, &mut outbound_sequence,
+                    outbound_audio_sequence, &mut cursor, &mut backlog,
+                ).await {
+                    Ok(true) => {
+                        report.spoken_chunks = report.spoken_chunks.saturating_add(1);
+                        let _ = api.append_talk_route_event(&authorization.session_id, generation, "output_played", &serde_json::json!({"job_id": job_id, "turn_id": turn_id, "audio_sequence": outbound_audio_sequence}));
+                    }
+                    Ok(false) => {
+                        let _ = api.append_talk_route_event(&authorization.session_id, generation, "output_failed", &serde_json::json!({"job_id": job_id, "turn_id": turn_id, "error": "Playback was interrupted"}));
+                    }
+                    Err(error) => {
+                        report.stream_dropped = true;
+                        let _ = api.append_talk_route_event(&authorization.session_id, generation, "output_failed", &serde_json::json!({"job_id": job_id, "turn_id": turn_id, "error": error}));
+                        break;
+                    }
+                }
+                let _ = send_output_frame(socket, authorization, &mut outbound_sequence, TalkServerFrameKind::State { state: TalkState::Idle }).await;
+            }
+            _ => {}
+        }
+    }
+    report
+}
+
 /// Runs one admitted Talk socket to completion.
 pub(crate) async fn serve(
     api: RemoteApi,
@@ -151,38 +392,50 @@ pub(crate) async fn serve(
         Some(speech) => speech,
         None => &configured,
     };
-    let identity = TalkIdentity {
-        device_id: authorization.device_id.clone(),
-        session_id: authorization.session_id.clone(),
-        session_generation: authorization.session_generation.clone(),
+    let output_only = authorization.route_role.as_deref() == Some("output");
+    let mut report = if output_only {
+        run_output_route_session(&mut socket, speech, &api, &authorization).await
+    } else {
+        let identity = TalkIdentity {
+            device_id: authorization.device_id.clone(),
+            session_id: authorization.session_id.clone(),
+            session_generation: authorization.session_generation.clone(),
+        };
+        // Only input/duplex roles register microphone capture. Output-only
+        // routes never request or report microphone ownership.
+        let capture = api.open_talk_capture(
+            &authorization.device_id,
+            &authorization.session_id,
+            started_ms.saturating_add(MAX_SESSION_MS),
+        );
+        if let (Some(generation), Some(command_id)) =
+            (authorization.route_generation, api.talk_route_command_id(&authorization))
+        {
+            let _ = api.append_talk_route_event(
+                &authorization.session_id,
+                generation,
+                "input_ready",
+                &serde_json::json!({ "command_id": command_id, "device_id": authorization.device_id }),
+            );
+        }
+        let turns = TalkSessionTurns::new(api.clone(), &authorization);
+        let report = run_talk_session(&mut socket, speech, &turns, identity).await;
+        if let Some(command_id) = capture {
+            let ended = if report.grant_revoked {
+                Some("The voice_stream grant was withdrawn while the socket was open.")
+            } else {
+                socket.violation.map(|violation| match violation {
+                    "timeout" => "The Talk socket reached its deadline.",
+                    "binary frame" => "The device sent a frame this protocol does not carry.",
+                    _ => "The Talk socket stopped carrying frames.",
+                })
+            };
+            api.close_talk_capture(&authorization.device_id, &command_id, ended);
+        }
+        report
     };
-    // Registered before the first frame and closed after the last, so "this
-    // device is capturing right now" is true exactly while it is true.
-    let capture = api.open_talk_capture(
-        &authorization.device_id,
-        &authorization.session_id,
-        started_ms.saturating_add(MAX_SESSION_MS),
-    );
-    let turns = TalkSessionTurns::new(api.clone(), &authorization);
-    // The session's bound is the socket's own deadline rather than a timeout
-    // wrapped around the conversation: cancelling the future here would drop the
-    // report with it, and a session that ran for an hour would be audited as
-    // though nothing had happened.
-    let mut report = run_talk_session(&mut socket, speech, &turns, identity).await;
     if socket.violation.is_some() {
         report.stream_dropped = true;
-    }
-    if let Some(command_id) = capture {
-        let ended = if report.grant_revoked {
-            Some("The voice_stream grant was withdrawn while the socket was open.")
-        } else {
-            socket.violation.map(|violation| match violation {
-                "timeout" => "The Talk socket reached its deadline.",
-                "binary frame" => "The device sent a frame this protocol does not carry.",
-                _ => "The Talk socket stopped carrying frames.",
-            })
-        };
-        api.close_talk_capture(&authorization.device_id, &command_id, ended);
     }
     // Counters only. What was said, and the audio it was said in, stop at this
     // function — see `talk.rs`'s header.

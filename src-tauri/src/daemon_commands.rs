@@ -2594,39 +2594,6 @@ pub async fn voice_route_emit(
     ]).await?)
 }
 
-#[tauri::command]
-pub async fn voice_route_output_audio(
-    session_id: String,
-    generation: u64,
-    clip_id: String,
-    media_type: String,
-    audio_base64: String,
-) -> Result<Value, String> {
-    validate_id("session id", &session_id)?;
-    validate_id("voice clip id", &clip_id)?;
-    validate_token("voice media type", &media_type, 128)?;
-    if audio_base64.is_empty() || audio_base64.len() > 6 * 1024 * 1024 {
-        return Err("Voice route audio payload must contain 1 byte to 6 MiB of base64".to_string());
-    }
-    parse_json(&command_with_stdin(
-        vec![
-            "voice".into(), "route".into(), "output".into(), session_id,
-            "--generation".into(), generation.to_string(),
-            "--clip-id".into(), clip_id,
-            "--media-type".into(), media_type,
-        ],
-        audio_base64,
-    ).await?)
-}
-
-#[tauri::command]
-pub async fn voice_route_output_stop(session_id: String, generation: u64) -> Result<Value, String> {
-    validate_id("session id", &session_id)?;
-    parse_json(&command(vec![
-        "voice".into(), "route".into(), "output-stop".into(), session_id,
-        "--generation".into(), generation.to_string(),
-    ]).await?)
-}
 
 #[tauri::command]
 pub async fn remote_device_list() -> Result<Value, String> {

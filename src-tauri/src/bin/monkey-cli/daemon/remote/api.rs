@@ -206,7 +206,9 @@ struct PendingTalkTicket {
     session_generation: String,
     route_id: Option<String>,
     route_generation: Option<u64>,
+    route_role: Option<String>,
     route_output_to_socket: bool,
+    route_event_cursor: u64,
     expires_at_ms: u64,
 }
 
@@ -224,9 +226,12 @@ pub(crate) struct TalkSocketAuthorization {
     /// Present only when the desktop owns this Talk socket through VoiceRoute.
     pub route_id: Option<String>,
     pub route_generation: Option<u64>,
-    /// Same paired endpoint is both microphone and speaker. Its existing Talk
-    /// socket is then the output transport, avoiding a second device executor.
+    /// input, output, or duplex for desktop-owned VoiceRoute sockets.
+    pub route_role: Option<String>,
+    /// Same paired endpoint is both microphone and speaker.
     pub route_output_to_socket: bool,
+    /// Output-only sockets begin after this event, so old speech is never replayed.
+    pub route_event_cursor: u64,
 }
 
 impl ApiResponse {
@@ -906,8 +911,7 @@ impl RemoteApi {
             // key generation as any other route — and receives a one-use,
             // 30-second bearer it immediately spends. See `consume_talk_ticket`.
             ("POST", ["v1", "remote", "device", "talk", "ticket"]) => {
-                require_capability(device, DeviceCapability::VoiceStream)
-                    .and_then(|_| self.talk_ticket(&request.body, device, request_sha256, now_ms))
+                self.talk_ticket(&request.body, device, request_sha256, now_ms)
             }
             // The upgrade itself never reaches this match — `server.rs` answers
             // it before a body is collected. A *signed* GET that is not an
@@ -2296,23 +2300,13 @@ impl RemoteApi {
             .map_err(|error| (400, format!("Invalid Talk ticket request: {error}")))?;
         request.validate().map_err(|error| (400, error))?;
 
-        let (session_id, route_id, route_generation, route_output_to_socket) = {
+        let (session_id, route_id, route_generation, route_role, route_output_to_socket, route_event_cursor) = {
             let store = self.locked_store()?;
-            // The surface matters as much as the grant: a device whose OS refused
-            // the microphone must not be handed a socket that can only fail.
             let surface = store.device_surface(&device.device_id).map_err(internal)?;
             let effective = effective_capabilities(&device.capabilities, surface.as_ref());
-            if !effective.contains(&DeviceCapability::VoiceStream) {
-                return Err((
-                    403,
-                    "This device's microphone is not effective: the grant, the device's own \
-                     advertisement and its operating system permission must all allow it."
-                        .to_string(),
-                ));
-            }
 
-            match (&request.route_id, request.route_generation) {
-                (Some(route_id), Some(generation)) => {
+            match (&request.route_id, request.route_generation, request.route_role.as_deref()) {
+                (Some(route_id), Some(generation), Some(role)) => {
                     let route = store
                         .voice_route_by_id(route_id)
                         .map_err(internal)?
@@ -2320,27 +2314,56 @@ impl RemoteApi {
                     if route.state != "active" || route.generation != generation {
                         return Err((409, "This VoiceRoute generation is stale".to_string()));
                     }
-                    // Routed Talk is deliberately host authoritative. The session id
-                    // in the browser request is compatibility data only and can never
-                    // redirect this socket into a different conversation.
-                    let expected_input = format!("paired:{}:input", device.device_id);
-                    if route.input_endpoint != expected_input {
-                        return Err((403, "This paired device is not the selected VoiceRoute microphone".to_string()));
-                    }
                     if route.engine != "pipeline" {
-                        return Err((
-                            409,
-                            "Paired Realtime Voice needs a direct media bridge; it is not routed through transcription.".to_string(),
-                        ));
+                        return Err((409, "Paired Realtime Voice needs a direct media bridge; it is not routed through transcription.".to_string()));
                     }
-                    let output_to_socket =
-                        route.output_endpoint == format!("paired:{}:output", device.device_id);
-                    if output_to_socket && !effective.contains(&DeviceCapability::AudioPlayback) {
-                        return Err((403, "This device is selected as the VoiceRoute speaker but audio_playback is not effective".to_string()));
+                    let expected_input = format!("paired:{}:input", device.device_id);
+                    let expected_output = format!("paired:{}:output", device.device_id);
+                    match role {
+                        "input" => {
+                            if route.input_endpoint != expected_input {
+                                return Err((403, "This paired device is not the selected VoiceRoute microphone".to_string()));
+                            }
+                            if !effective.contains(&DeviceCapability::VoiceStream) {
+                                return Err((403, "This device's voice_stream capability is not effective".to_string()));
+                            }
+                        }
+                        "output" => {
+                            if route.output_endpoint != expected_output || route.input_endpoint == expected_input {
+                                return Err((403, "This paired device is not the independent VoiceRoute speaker".to_string()));
+                            }
+                            if !effective.contains(&DeviceCapability::AudioPlayback) {
+                                return Err((403, "This device's audio_playback capability is not effective".to_string()));
+                            }
+                        }
+                        "duplex" => {
+                            if route.input_endpoint != expected_input || route.output_endpoint != expected_output {
+                                return Err((403, "This paired device is not both VoiceRoute microphone and speaker".to_string()));
+                            }
+                            if !effective.contains(&DeviceCapability::VoiceStream)
+                                || !effective.contains(&DeviceCapability::AudioPlayback)
+                            {
+                                return Err((403, "This device needs effective voice_stream and audio_playback for duplex Talk".to_string()));
+                            }
+                        }
+                        _ => unreachable!("TalkTicketRequest::validate checks role"),
                     }
-                    (route.session_id, Some(route.route_id), Some(route.generation), output_to_socket)
+                    let cursor = store.latest_voice_route_event_id(&route.session_id).map_err(internal)?;
+                    (
+                        route.session_id,
+                        Some(route.route_id),
+                        Some(route.generation),
+                        Some(role.to_string()),
+                        role == "duplex",
+                        cursor,
+                    )
                 }
-                (None, None) => (request.session_id.clone(), None, None, true),
+                (None, None, None) => {
+                    if !effective.contains(&DeviceCapability::VoiceStream) {
+                        return Err((403, "This device's microphone is not effective".to_string()));
+                    }
+                    (request.session_id.clone(), None, None, None, true, 0)
+                }
                 _ => unreachable!("TalkTicketRequest::validate rejects partial routes"),
             }
         };
@@ -2369,7 +2392,9 @@ impl RemoteApi {
                 session_generation: issued.session_generation.clone(),
                 route_id,
                 route_generation,
+                route_role,
                 route_output_to_socket,
+                route_event_cursor,
                 expires_at_ms: issued.expires_at_ms,
             },
         );
@@ -2419,26 +2444,31 @@ impl RemoteApi {
             }
             let surface = store.device_surface(&pending.device_id).ok().flatten();
             let effective = effective_capabilities(&device.capabilities, surface.as_ref());
-            if !effective.contains(&DeviceCapability::VoiceStream) {
-                return None;
-            }
-            if let (Some(route_id), Some(generation)) =
-                (pending.route_id.as_deref(), pending.route_generation)
-            {
+            if let (Some(route_id), Some(generation), Some(role)) = (
+                pending.route_id.as_deref(),
+                pending.route_generation,
+                pending.route_role.as_deref(),
+            ) {
                 let route = store.voice_route_by_id(route_id).ok().flatten()?;
-                if route.state != "active"
-                    || route.generation != generation
-                    || route.session_id != pending.session_id
-                    || route.input_endpoint != format!("paired:{}:input", pending.device_id)
-                {
+                if route.state != "active" || route.generation != generation || route.session_id != pending.session_id {
                     return None;
                 }
-                if pending.route_output_to_socket
-                    && (route.output_endpoint != format!("paired:{}:output", pending.device_id)
-                        || !effective.contains(&DeviceCapability::AudioPlayback))
-                {
-                    return None;
-                }
+                let expected_input = format!("paired:{}:input", pending.device_id);
+                let expected_output = format!("paired:{}:output", pending.device_id);
+                let valid = match role {
+                    "input" => route.input_endpoint == expected_input && effective.contains(&DeviceCapability::VoiceStream),
+                    "output" => route.output_endpoint == expected_output
+                        && route.input_endpoint != expected_input
+                        && effective.contains(&DeviceCapability::AudioPlayback),
+                    "duplex" => route.input_endpoint == expected_input
+                        && route.output_endpoint == expected_output
+                        && effective.contains(&DeviceCapability::VoiceStream)
+                        && effective.contains(&DeviceCapability::AudioPlayback),
+                    _ => false,
+                };
+                if !valid { return None; }
+            } else if !effective.contains(&DeviceCapability::VoiceStream) {
+                return None;
             }
         }
         Some(TalkSocketAuthorization {
@@ -2448,7 +2478,9 @@ impl RemoteApi {
             session_generation: pending.session_generation,
             route_id: pending.route_id,
             route_generation: pending.route_generation,
+            route_role: pending.route_role,
             route_output_to_socket: pending.route_output_to_socket,
+            route_event_cursor: pending.route_event_cursor,
         })
     }
 
@@ -2569,6 +2601,63 @@ impl RemoteApi {
         let surface = store.device_surface(device_id).ok().flatten();
         effective_capabilities(&device.capabilities, surface.as_ref())
             .contains(&DeviceCapability::VoiceStream)
+    }
+
+    pub(crate) fn talk_output_route_live(&self, authorization: &TalkSocketAuthorization) -> bool {
+        let (Some(route_id), Some(generation)) =
+            (authorization.route_id.as_deref(), authorization.route_generation)
+        else { return false; };
+        let Ok(store) = self.store.lock() else { return false; };
+        let Some(device) = store.device(&authorization.device_id).ok().flatten() else { return false; };
+        if !device.active() { return false; }
+        let surface = store.device_surface(&authorization.device_id).ok().flatten();
+        let effective = effective_capabilities(&device.capabilities, surface.as_ref());
+        let Ok(Some(route)) = store.voice_route_by_id(route_id) else { return false; };
+        route.state == "active"
+            && route.generation == generation
+            && route.session_id == authorization.session_id
+            && route.output_endpoint == format!("paired:{}:output", authorization.device_id)
+            && effective.contains(&DeviceCapability::AudioPlayback)
+    }
+
+    pub(crate) fn talk_route_command_id(&self, authorization: &TalkSocketAuthorization) -> Option<String> {
+        let route_id = authorization.route_id.as_deref()?;
+        let store = self.store.lock().ok()?;
+        let route = store.voice_route_by_id(route_id).ok().flatten()?;
+        if route.generation != authorization.route_generation? || route.session_id != authorization.session_id {
+            return None;
+        }
+        match authorization.route_role.as_deref() {
+            Some("output") => route.output_command_id,
+            Some("input") | Some("duplex") => route.input_command_id,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn talk_route_events(
+        &self,
+        session_id: &str,
+        after: u64,
+    ) -> Result<Vec<super::store::VoiceRouteEventRecord>, String> {
+        self.store
+            .lock()
+            .map_err(|_| "Remote state lock was poisoned".to_string())?
+            .voice_route_events(session_id, after, 256)
+    }
+
+    pub(crate) fn append_talk_route_event(
+        &self,
+        session_id: &str,
+        generation: u64,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), String> {
+        let now_ms = super::now_ms_public()?;
+        self.store
+            .lock()
+            .map_err(|_| "Remote state lock was poisoned".to_string())?
+            .append_voice_route_event(session_id, generation, kind, payload, now_ms)
+            .map(|_| ())
     }
 
     fn talk_stream_needs_upgrade(
@@ -7664,7 +7753,9 @@ mod tests {
                 session_generation: "generation-one".to_string(),
                 route_id: None,
                 route_generation: None,
+                route_role: None,
                 route_output_to_socket: true,
+                route_event_cursor: 0,
             },
         );
 

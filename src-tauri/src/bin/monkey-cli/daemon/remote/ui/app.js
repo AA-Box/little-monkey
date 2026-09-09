@@ -2601,116 +2601,6 @@ function base64ToBytes(encoded) {
   return bytes;
 }
 
-// Cross-device VoiceRoute playback. Raw audio exists only in this bounded
-// in-memory assembler and the browser player; route state itself persists only
-// identities/generations/text coordination events.
-const routedPlayback = {
-  latestGeneration: new Map(),
-  clips: new Map(),
-  pendingBytes: 0,
-  player: null,
-  playing: Promise.resolve(),
-  activeRouteId: null,
-};
-const MAX_ROUTED_CLIP_BYTES = 4 * 1024 * 1024;
-const MAX_ROUTED_PENDING_BYTES = 8 * 1024 * 1024;
-
-function stopRoutedPlayback(routeId, generation) {
-  const current = Number(routedPlayback.latestGeneration.get(routeId) || 0);
-  if (generation < current) return;
-  routedPlayback.latestGeneration.set(routeId, generation);
-  for (const [key, clip] of routedPlayback.clips) {
-    if (clip.routeId === routeId && clip.generation <= generation) {
-      routedPlayback.pendingBytes = Math.max(0, routedPlayback.pendingBytes - clip.bytes);
-      routedPlayback.clips.delete(key);
-    }
-  }
-  if (routedPlayback.activeRouteId === routeId && routedPlayback.player) {
-    routedPlayback.player.pause();
-    routedPlayback.player = null;
-  }
-  routedPlayback.playing = Promise.resolve();
-}
-
-async function playRoutedBlob(routeId, generation, bytes, mediaType) {
-  const latest = Number(routedPlayback.latestGeneration.get(routeId) || 0);
-  if (generation !== latest) return;
-  const url = URL.createObjectURL(new Blob([bytes], { type: mediaType }));
-  const player = new Audio(url);
-  routedPlayback.player = player;
-  routedPlayback.activeRouteId = routeId;
-  try {
-    await player.play();
-    await new Promise((resolve) => {
-      player.onended = resolve;
-      player.onerror = resolve;
-    });
-  } finally {
-    URL.revokeObjectURL(url);
-    if (routedPlayback.player === player) routedPlayback.player = null;
-    if (routedPlayback.activeRouteId === routeId) routedPlayback.activeRouteId = null;
-  }
-}
-
-async function playRoutedAudio(argumentsValue) {
-  const routeId = String(argumentsValue.route_id || "");
-  const generation = Number(argumentsValue.route_generation || 0);
-  if (!validId(routeId) || !Number.isSafeInteger(generation) || generation <= 0) {
-    throw new Error("The runner sent an invalid VoiceRoute generation");
-  }
-  if (argumentsValue.mode === "voice_route_audio_stop") {
-    stopRoutedPlayback(routeId, generation);
-    return { stopped: true, route_id: routeId, route_generation: generation };
-  }
-  const clipId = String(argumentsValue.clip_id || "");
-  const sequence = Number(argumentsValue.chunk_sequence);
-  const mediaType = String(argumentsValue.media_type || "");
-  if (!validId(clipId) || !Number.isSafeInteger(sequence) || sequence < 0 || !mediaType.startsWith("audio/")) {
-    throw new Error("The runner sent an invalid routed audio chunk");
-  }
-  const current = Number(routedPlayback.latestGeneration.get(routeId) || 0);
-  if (generation < current) throw new Error("This routed audio generation is stale");
-  if (generation > current) stopRoutedPlayback(routeId, generation);
-
-  const key = `${routeId}:${generation}:${clipId}`;
-  const chunk = base64ToBytes(argumentsValue.audio_base64);
-  let clip = routedPlayback.clips.get(key);
-  if (!clip) {
-    if (sequence !== 0) throw new Error("Routed audio started after chunk zero");
-    clip = { routeId, generation, next: 0, mediaType, chunks: [], bytes: 0 };
-    routedPlayback.clips.set(key, clip);
-  }
-  if (sequence !== clip.next) throw new Error("Routed audio chunk sequence is stale or out of order");
-  if (clip.bytes + chunk.length > MAX_ROUTED_CLIP_BYTES
-      || routedPlayback.pendingBytes + chunk.length > MAX_ROUTED_PENDING_BYTES) {
-    routedPlayback.clips.delete(key);
-    routedPlayback.pendingBytes = Math.max(0, routedPlayback.pendingBytes - clip.bytes);
-    throw new Error("Routed audio exceeded this device's in-memory bound");
-  }
-  clip.chunks.push(chunk);
-  clip.bytes += chunk.length;
-  clip.next += 1;
-  routedPlayback.pendingBytes += chunk.length;
-  if (argumentsValue.last !== true) {
-    return { buffered: true, clip_id: clipId, next_sequence: clip.next };
-  }
-  routedPlayback.clips.delete(key);
-  routedPlayback.pendingBytes = Math.max(0, routedPlayback.pendingBytes - clip.bytes);
-  const joined = new Uint8Array(clip.bytes);
-  let offset = 0;
-  for (const part of clip.chunks) {
-    joined.set(part, offset);
-    offset += part.length;
-  }
-  // Playback is serialized. Awaiting only the final chunk creates natural
-  // backpressure without preventing earlier chunks from being leased.
-  routedPlayback.playing = routedPlayback.playing.then(() =>
-    playRoutedBlob(routeId, generation, joined, clip.mediaType),
-  );
-  await routedPlayback.playing;
-  return { played: true, clip_id: clipId, bytes: clip.bytes };
-}
-
 // Plays a stored artifact rather than speaking a sentence about it.
 //
 // The bytes are fetched over the ordinary signed artifact route, under the run
@@ -2753,9 +2643,8 @@ async function playArtifact(runId, artifactId, signal) {
 }
 
 async function playAudio(argumentsValue, signal) {
-  if (argumentsValue.mode === "voice_route_audio_chunk" || argumentsValue.mode === "voice_route_audio_stop") {
-    if (aborted(signal)) return { cancelledBeforeEffect: true };
-    return { result: await playRoutedAudio(argumentsValue) };
+  if (argumentsValue.mode === "talk_route" && argumentsValue.role === "output") {
+    return await runTalkRouteOutput(argumentsValue, signal);
   }
   if (argumentsValue.artifact_id && argumentsValue.run_id) {
     return await playArtifact(argumentsValue.run_id, argumentsValue.artifact_id, signal);
@@ -2984,6 +2873,7 @@ const talk = {
   playing: Promise.resolve(),
   playbackGeneration: 0,
   player: null,
+  playerFinish: null,
   running: false,
   /**
    * The utterance a socket is currently open only to re-send, or null.
@@ -3065,7 +2955,11 @@ function talkSendFrame(frame) {
 function talkStopPlayback() {
   talk.playbackGeneration += 1;
   talk.playing = Promise.resolve();
-  if (talk.player) {
+  if (talk.playerFinish) {
+    const finish = talk.playerFinish;
+    talk.playerFinish = null;
+    finish(false);
+  } else if (talk.player) {
     talk.player.pause();
     talk.player = null;
   }
@@ -3073,19 +2967,19 @@ function talkStopPlayback() {
 
 function talkInterrupt(reason) {
   talkStopPlayback();
-  // The runner will confirm with an `interrupted` state, but this device stops
-  // believing it is being answered right now — otherwise the next confirmed
-  // syllable sends a second interrupt for an answer already abandoned.
   talk.answering = false;
   if (talk.frames) talkSendFrame(talk.frames.interrupt(reason));
 }
 
-function talkQueueAudio(audioBase64, mediaType) {
+function talkQueueAudio(audioBase64, mediaType, audioSequence) {
   const generation = talk.playbackGeneration;
   talk.playing = talk.playing.then(
     () =>
       new Promise((resolve) => {
         if (generation !== talk.playbackGeneration) {
+          if (talk.frames && Number.isInteger(audioSequence)) {
+            talkSendFrame(talk.frames.playbackAck(audioSequence, false));
+          }
           resolve();
           return;
         }
@@ -3093,14 +2987,23 @@ function talkQueueAudio(audioBase64, mediaType) {
         const url = URL.createObjectURL(new Blob([bytes], { type: mediaType || "audio/wav" }));
         const player = new Audio(url);
         talk.player = player;
-        const finish = () => {
+        let settled = false;
+        const finish = (played) => {
+          if (settled) return;
+          settled = true;
+          player.pause();
           URL.revokeObjectURL(url);
           if (talk.player === player) talk.player = null;
+          if (talk.playerFinish === finish) talk.playerFinish = null;
+          if (talk.frames && Number.isInteger(audioSequence)) {
+            talkSendFrame(talk.frames.playbackAck(audioSequence, played));
+          }
           resolve();
         };
-        player.onended = finish;
-        player.onerror = finish;
-        player.play().catch(finish);
+        talk.playerFinish = finish;
+        player.onended = () => finish(true);
+        player.onerror = () => finish(false);
+        player.play().catch(() => finish(false));
       }),
   );
 }
@@ -3148,7 +3051,7 @@ function talkHandleFrame(raw) {
         ui.talkAnswer.textContent === "—" ? frame.text : ui.talkAnswer.textContent + frame.text;
       break;
     case "output_audio":
-      talkQueueAudio(frame.audio_base64, frame.media_type);
+      talkQueueAudio(frame.audio_base64, frame.media_type, frame.audio_sequence);
       break;
     case "turn_accepted":
       // The one frame a recording may be deleted on. Everything before it —
@@ -3220,7 +3123,7 @@ async function runTalkRoute(argumentsValue, signal) {
     throw new Error("The runner sent an invalid VoiceRoute input command");
   }
   if (role !== "input" && role !== "duplex") throw new Error("This VoiceRoute command is not a microphone role");
-  if (talk.running) throw new Error("A Talk microphone is already active on this device");
+  if (talk.running) throw new Error("A Talk role is already active on this device");
   const startedAt = Date.now();
   try {
     const capture = await prepareTalkCapture();
@@ -3232,23 +3135,49 @@ async function runTalkRoute(argumentsValue, signal) {
       channels: capture.channels,
       routeId,
       routeGeneration: generation,
+      routeRole: role,
     });
     talk.routeRole = role;
     talkStartCapture(capture.context);
     setTalkState("Listening — controlled by this computer", "listening");
-    while (talk.running && !aborted(signal)) {
-      await delayUntilAborted(250, signal);
-    }
-    const cancelled = aborted(signal);
+    while (talk.running && !aborted(signal)) await delayUntilAborted(250, signal);
     return {
-      cancelledDuringEffect: cancelled,
-      result: {
-        session_id: talk.sessionId || sessionId,
-        route_id: routeId,
-        route_generation: generation,
-        role,
-        duration_ms: Date.now() - startedAt,
-      },
+      cancelledDuringEffect: aborted(signal),
+      result: { session_id: talk.sessionId || sessionId, route_id: routeId, route_generation: generation, role, duration_ms: Date.now() - startedAt },
+    };
+  } finally {
+    await stopTalk();
+  }
+}
+
+async function runTalkRouteOutput(argumentsValue, signal) {
+  const sessionId = String(argumentsValue.session_id || "");
+  const routeId = String(argumentsValue.route_id || "");
+  const generation = Number(argumentsValue.route_generation || 0);
+  if (!validId(sessionId) || !validId(routeId) || !Number.isSafeInteger(generation) || generation <= 0) {
+    throw new Error("The runner sent an invalid VoiceRoute output command");
+  }
+  if (talk.running) throw new Error("A Talk role is already active on this device");
+  const startedAt = Date.now();
+  try {
+    if (aborted(signal)) return { cancelledBeforeEffect: true };
+    // No microphone is opened for an output-only role. The hello still carries
+    // a valid media descriptor because it is part of the shared Talk envelope.
+    await talkConnect({
+      sessionId,
+      mediaType: "audio/webm",
+      sampleRateHz: 48_000,
+      channels: 1,
+      routeId,
+      routeGeneration: generation,
+      routeRole: "output",
+    });
+    talk.routeRole = "output";
+    setTalkState("Speaker — controlled by this computer", "speaking");
+    while (talk.running && !aborted(signal)) await delayUntilAborted(250, signal);
+    return {
+      cancelledDuringEffect: aborted(signal),
+      result: { session_id: talk.sessionId || sessionId, route_id: routeId, route_generation: generation, role: "output", duration_ms: Date.now() - startedAt },
     };
   } finally {
     await stopTalk();
@@ -3300,18 +3229,20 @@ async function startTalk() {
  * already wrote down survives the reconnect, and it is what makes the second
  * arrival collapse onto the first turn instead of becoming another one.
  */
-async function talkConnect({ sessionId, mediaType, sampleRateHz, channels, routeId = null, routeGeneration = null }) {
+async function talkConnect({ sessionId, mediaType, sampleRateHz, channels, routeId = null, routeGeneration = null, routeRole = null }) {
   const body = {
     protocol_version: TALK_PROTOCOL_VERSION,
     session_id: sessionId,
   };
-  if (routeId !== null || routeGeneration !== null) {
+  if (routeId !== null || routeGeneration !== null || routeRole !== null) {
     body.route_id = routeId;
     body.route_generation = routeGeneration;
+    body.route_role = routeRole;
   }
   const ticket = await signedRequest("POST", "/v1/remote/device/talk/ticket", body);
   talk.routeId = routeId;
   talk.routeGeneration = routeGeneration;
+  talk.routeRole = routeRole;
   talk.sessionId = ticket.session_id;
   talk.sessionGeneration = ticket.session_generation;
   // Same origin as this page, by construction: pairing already refused an

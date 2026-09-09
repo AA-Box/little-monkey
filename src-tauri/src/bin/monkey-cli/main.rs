@@ -627,24 +627,7 @@ enum VoiceRouteCmd {
         #[arg(long)]
         payload_json: String,
     },
-    /// Internal desktop bridge: stdin is the synthesized clip as base64.
-    #[command(hide = true)]
-    Output {
-        session_id: String,
-        #[arg(long)]
-        generation: u64,
-        #[arg(long)]
-        clip_id: String,
-        #[arg(long)]
-        media_type: String,
-    },
-    /// Internal desktop bridge: stop cross-device routed playback.
-    #[command(hide = true)]
-    OutputStop {
-        session_id: String,
-        #[arg(long)]
-        generation: u64,
-    },
+
 }
 
 fn voice_endpoint_json(endpoint: &daemon::remote::voice_route::EndpointDescriptor) -> serde_json::Value {
@@ -759,21 +742,7 @@ fn run_voice_command(action: &VoiceCmd) -> Result<(), String> {
                 println!("{}", serde_json::to_string(&voice_route::event_json(&event)).map_err(|error| error.to_string())?);
                 Ok(())
             }
-            VoiceRouteCmd::Output { session_id, generation, clip_id, media_type } => {
-                let mut audio_base64 = String::new();
-                std::io::stdin().read_to_string(&mut audio_base64).map_err(|error| error.to_string())?;
-                let chunks = voice_route::output_audio(
-                    &paths, session_id, *generation, clip_id, media_type, &audio_base64,
-                    daemon::remote::now_ms_public()?,
-                )?;
-                println!("{}", serde_json::json!({ "queued_chunks": chunks }));
-                Ok(())
-            }
-            VoiceRouteCmd::OutputStop { session_id, generation } => {
-                voice_route::stop_output(&paths, session_id, *generation, daemon::remote::now_ms_public()?)?;
-                println!("{}", serde_json::json!({ "stopped": true }));
-                Ok(())
-            }
+
         },
     }
 }

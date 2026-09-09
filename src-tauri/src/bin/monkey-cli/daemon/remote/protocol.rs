@@ -43,7 +43,7 @@ pub const MAX_REMOTE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 /// would offer to re-send *every* turn — including ones already answered. That
 /// is exactly the "tell somebody to repeat what is already running" failure the
 /// journal exists to prevent, so the two sides are pinned to each other.
-pub const TALK_PROTOCOL_VERSION: u32 = 4;
+pub const TALK_PROTOCOL_VERSION: u32 = 5;
 
 /// The version whose only difference from [`TALK_PROTOCOL_VERSION`] is the
 /// missing utterance id — so a client speaking it can be told precisely what is
@@ -55,6 +55,8 @@ const TALK_PROTOCOL_VERSION_WITHOUT_UTTERANCE_ID: u32 = 1;
 const TALK_PROTOCOL_VERSION_WITHOUT_ACCEPTANCE: u32 = 2;
 /// Version 3 predates host-authoritative routed Talk tickets.
 const TALK_PROTOCOL_VERSION_WITHOUT_VOICE_ROUTE: u32 = 3;
+/// Version 4 can bind a route, but cannot bind independent input/output Talk roles.
+const TALK_PROTOCOL_VERSION_WITHOUT_ROUTE_ROLE: u32 = 4;
 pub const MAX_TALK_AUDIO_BYTES: usize = MAX_VOICE_CHUNK_BYTES;
 pub const MAX_TALK_AUDIO_BASE64_BYTES: usize = MAX_TALK_AUDIO_BYTES.div_ceil(3) * 4;
 pub const MAX_TALK_FRAME_BYTES: usize = MAX_TALK_AUDIO_BASE64_BYTES + 16 * 1024;
@@ -1648,22 +1650,28 @@ pub struct TalkTicketRequest {
     pub route_id: Option<String>,
     #[serde(default)]
     pub route_generation: Option<u64>,
+    /// Routed Talk role selected by the host: input, output, or duplex.
+    #[serde(default)]
+    pub route_role: Option<String>,
 }
 
 impl TalkTicketRequest {
     pub fn validate(&self) -> Result<(), String> {
         validate_talk_protocol_version(self.protocol_version)?;
         validate_talk_session_id(&self.session_id)?;
-        match (&self.route_id, self.route_generation) {
-            (None, None) => Ok(()),
-            (Some(route_id), Some(generation)) => {
+        match (&self.route_id, self.route_generation, self.route_role.as_deref()) {
+            (None, None, None) => Ok(()),
+            (Some(route_id), Some(generation), Some(role)) => {
                 validate_id(route_id)?;
                 if generation == 0 {
                     return Err("Talk route generation must be positive".to_string());
                 }
+                if !matches!(role, "input" | "output" | "duplex") {
+                    return Err("Talk route role must be input, output, or duplex".to_string());
+                }
                 Ok(())
             }
-            _ => Err("Routed Talk requires both route_id and route_generation".to_string()),
+            _ => Err("Routed Talk requires route_id, route_generation, and route_role".to_string()),
         }
     }
 }
@@ -1789,6 +1797,12 @@ pub enum TalkClientFrameKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// Confirms that one runner-to-device audio frame actually finished (or
+    /// failed) playback. Output-only routed Talk uses this as backpressure.
+    PlaybackAck {
+        audio_sequence: u64,
+        played: bool,
+    },
     /// What the device's half of one utterance cost, in milliseconds.
     ///
     /// The runner can time everything from transcription onwards itself, but
@@ -1867,6 +1881,9 @@ impl TalkClientFrame {
                 if let Some(reason) = reason {
                     validate_talk_text("interrupt reason", reason, MAX_TALK_ERROR_BYTES)?;
                 }
+            }
+            TalkClientFrameKind::PlaybackAck { audio_sequence, .. } => {
+                validate_talk_audio_sequence(*audio_sequence)?;
             }
             TalkClientFrameKind::Metrics {
                 audio_sequence,
@@ -2070,6 +2087,7 @@ fn validate_talk_protocol_version(protocol_version: u32) -> Result<(), String> {
         TALK_PROTOCOL_VERSION_WITHOUT_UTTERANCE_ID
             | TALK_PROTOCOL_VERSION_WITHOUT_ACCEPTANCE
             | TALK_PROTOCOL_VERSION_WITHOUT_VOICE_ROUTE
+            | TALK_PROTOCOL_VERSION_WITHOUT_ROUTE_ROLE
     ) {
         return Err(
             "This Talk client is from an older version of the app; reload the page to continue"
@@ -3314,4 +3332,31 @@ mod tests {
         expanded.max_artifact_bytes = 2_048;
         assert!(!expanded.is_subset_of(&parent));
     }
+
+    #[test]
+    fn routed_talk_requires_an_explicit_role() {
+        let request = TalkTicketRequest {
+            protocol_version: TALK_PROTOCOL_VERSION,
+            session_id: "session-one".into(),
+            route_id: Some("route-one".into()),
+            route_generation: Some(1),
+            route_role: None,
+        };
+        assert!(request.validate().is_err());
+        let request = TalkTicketRequest { route_role: Some("output".into()), ..request };
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn playback_ack_is_a_valid_ordered_client_frame() {
+        let frame = TalkClientFrame {
+            protocol_version: TALK_PROTOCOL_VERSION,
+            session_id: "session-one".into(),
+            session_generation: "generation-one".into(),
+            frame_sequence: 2,
+            kind: TalkClientFrameKind::PlaybackAck { audio_sequence: 3, played: true },
+        };
+        assert!(frame.validate().is_ok());
+    }
+
 }
