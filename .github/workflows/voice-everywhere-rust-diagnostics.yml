@@ -1,0 +1,31 @@
+name: Voice Everywhere Rust Diagnostics
+
+on:
+  push:
+    branches:
+      - feat/voice-everywhere-stage8
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/voice-everywhere
+      - name: Install Linux deps
+        run: |
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential >/dev/null
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Stage CLI placeholder
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+      - name: Rust check
+        run: cargo check --quiet --manifest-path src-tauri/Cargo.toml --bin monkey-cli
