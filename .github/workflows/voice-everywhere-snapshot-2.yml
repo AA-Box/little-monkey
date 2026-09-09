@@ -1,0 +1,24 @@
+name: Voice Everywhere Snapshot 2
+
+on:
+  push:
+    branches:
+      - feat/voice-everywhere-stage8
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/voice-everywhere
+      - run: tar --exclude=.git -czf /tmp/voice-everywhere-current2.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-everywhere-current2
+          path: /tmp/voice-everywhere-current2.tar.gz
+          retention-days: 1
