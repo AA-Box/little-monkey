@@ -60,7 +60,7 @@ mod workflow_cli;
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
@@ -601,6 +601,12 @@ enum VoiceRouteCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Internal desktop bridge: acquire the selected microphone for live Talk.
+    #[command(hide = true)]
+    Activate { session_id: String },
+    /// Internal desktop bridge: release a live routed microphone without forgetting the selection.
+    #[command(hide = true)]
+    Deactivate { session_id: String },
     Events {
         session_id: String,
         #[arg(long, default_value_t = 0)]
@@ -620,6 +626,24 @@ enum VoiceRouteCmd {
         kind: String,
         #[arg(long)]
         payload_json: String,
+    },
+    /// Internal desktop bridge: stdin is the synthesized clip as base64.
+    #[command(hide = true)]
+    Output {
+        session_id: String,
+        #[arg(long)]
+        generation: u64,
+        #[arg(long)]
+        clip_id: String,
+        #[arg(long)]
+        media_type: String,
+    },
+    /// Internal desktop bridge: stop cross-device routed playback.
+    #[command(hide = true)]
+    OutputStop {
+        session_id: String,
+        #[arg(long)]
+        generation: u64,
     },
 }
 
@@ -706,6 +730,17 @@ fn run_voice_command(action: &VoiceCmd) -> Result<(), String> {
                 else { println!("Stopped voice route for {session_id}."); }
                 Ok(())
             }
+            VoiceRouteCmd::Activate { session_id } => {
+                let route = voice_route::activate_route(&paths, session_id, daemon::remote::now_ms_public()?)?;
+                println!("{}", serde_json::to_string(&voice_route::route_json(&route)).map_err(|error| error.to_string())?);
+                Ok(())
+            }
+            VoiceRouteCmd::Deactivate { session_id } => {
+                let route = voice_route::deactivate_route(&paths, session_id, daemon::remote::now_ms_public()?)?;
+                let value = route.as_ref().map(voice_route::route_json);
+                println!("{}", serde_json::to_string(&value).map_err(|error| error.to_string())?);
+                Ok(())
+            }
             VoiceRouteCmd::Events { session_id, after, limit, json } => {
                 let events = voice_route::events(&paths, session_id, *after, *limit)?;
                 let values = events.iter().map(voice_route::event_json).collect::<Vec<_>>();
@@ -722,6 +757,21 @@ fn run_voice_command(action: &VoiceCmd) -> Result<(), String> {
                     &paths, session_id, *generation, kind, &payload, daemon::remote::now_ms_public()?
                 )?;
                 println!("{}", serde_json::to_string(&voice_route::event_json(&event)).map_err(|error| error.to_string())?);
+                Ok(())
+            }
+            VoiceRouteCmd::Output { session_id, generation, clip_id, media_type } => {
+                let mut audio_base64 = String::new();
+                std::io::stdin().read_to_string(&mut audio_base64).map_err(|error| error.to_string())?;
+                let chunks = voice_route::output_audio(
+                    &paths, session_id, *generation, clip_id, media_type, &audio_base64,
+                    daemon::remote::now_ms_public()?,
+                )?;
+                println!("{}", serde_json::json!({ "queued_chunks": chunks }));
+                Ok(())
+            }
+            VoiceRouteCmd::OutputStop { session_id, generation } => {
+                voice_route::stop_output(&paths, session_id, *generation, daemon::remote::now_ms_public()?)?;
+                println!("{}", serde_json::json!({ "stopped": true }));
                 Ok(())
             }
         },

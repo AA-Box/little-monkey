@@ -1541,6 +1541,33 @@ impl RemoteStore {
             .map_err(|error| error.to_string())
     }
 
+    pub fn voice_route_by_id(&self, route_id: &str) -> Result<Option<VoiceRouteRecord>, String> {
+        self.connection
+            .query_row(
+                "SELECT session_id,route_id,generation,engine,input_endpoint,output_endpoint,state,
+                        input_command_id,output_command_id,created_at_ms,updated_at_ms
+                 FROM remote_voice_routes WHERE route_id=?1",
+                [route_id],
+                |row| {
+                    Ok(VoiceRouteRecord {
+                        session_id: row.get(0)?,
+                        route_id: row.get(1)?,
+                        generation: from_i64(row.get(2)?)?,
+                        engine: row.get(3)?,
+                        input_endpoint: row.get(4)?,
+                        output_endpoint: row.get(5)?,
+                        state: row.get(6)?,
+                        input_command_id: row.get(7)?,
+                        output_command_id: row.get(8)?,
+                        created_at_ms: from_i64(row.get(9)?)?,
+                        updated_at_ms: from_i64(row.get(10)?)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
     /// Replaces the route atomically. Callers prepare/validate endpoints before
     /// this boundary; the monotonically increasing generation is minted here so
     /// two controller processes cannot accidentally reuse one.

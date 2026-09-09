@@ -22,6 +22,15 @@ import { runAgentTurn, stopTurn } from '../../lib/agentLoop';
 import { blobToBase64, companionClient, type CaptureGrant } from '../../lib/companionClient';
 import { errorMessage } from '../../lib/errors';
 import {
+  type VoiceRouteRecord,
+  voiceRouteActivate,
+  voiceRouteDeactivate,
+  voiceRouteEmit,
+  voiceRouteEvents,
+  voiceRouteOutputAudio,
+  voiceRouteOutputStop,
+} from '../../lib/daemonClient';
+import {
   BoundedPcmQueue,
   PCM_AUDIO_WORKLET_SOURCE,
   PcmRingBuffer,
@@ -117,6 +126,8 @@ export interface UseTalkSessionOptions {
   enabled?: boolean;
   /** Start in this mode as soon as the engine exists. */
   autoStartMode?: TalkMode | null;
+  /** Host-authoritative route selected for this ordinary conversation. */
+  route?: VoiceRouteRecord | null;
 }
 
 export interface UseTalkSession {
@@ -135,7 +146,7 @@ export interface UseTalkSession {
 
 export function useTalkSession(
   sessionId: string,
-  { enabled = true, autoStartMode = null }: UseTalkSessionOptions = {},
+  { enabled = true, autoStartMode = null, route = null }: UseTalkSessionOptions = {},
 ): UseTalkSession {
   const [snapshot, setSnapshot] = useState<TalkSnapshot | null>(null);
   const [status, setStatus] = useState<TalkStatus | null>(null);
@@ -181,7 +192,33 @@ export function useTalkSession(
   const activeTurnRef = useRef<{ turnId: string; fromIndex: number; spoken: string } | null>(null);
   /** The last output device successfully read from settings. */
   const outputDeviceRef = useRef<string | null>(null);
+  const routeRef = useRef<VoiceRouteRecord | null>(route);
+  const routeCursorRef = useRef<{ generation: number; eventId: number } | null>(null);
+  const routeEmitQueueRef = useRef<Promise<unknown>>(Promise.resolve());
   const player = useMemo(() => createTalkPlayer(), []);
+
+  const pairedInputDevice = (value: string | undefined | null) => {
+    const match = value?.match(/^paired:(.+):input$/);
+    return match?.[1] ?? null;
+  };
+  const pairedOutputDevice = (value: string | undefined | null) => {
+    const match = value?.match(/^paired:(.+):output$/);
+    return match?.[1] ?? null;
+  };
+  const localDevice = (value: string | undefined | null, direction: 'input' | 'output') => {
+    const prefix = `local:${direction}:`;
+    return value?.startsWith(prefix) ? value.slice(prefix.length) || 'default' : null;
+  };
+  const emitRoute = (
+    currentRoute: VoiceRouteRecord,
+    kind: string,
+    payload: unknown,
+  ) => {
+    routeEmitQueueRef.current = routeEmitQueueRef.current
+      .catch(() => undefined)
+      .then(() => voiceRouteEmit(sessionId, currentRoute.generation, kind, payload))
+      .catch(() => undefined);
+  };
 
   useEffect(() => {
     grantRef.current = grant;
@@ -282,7 +319,14 @@ export function useTalkSession(
         const grantForCapture = await ensureGrant();
         void grantForCapture;
         const config = await companionClient.config();
-        const deviceId = config.voice.inputDeviceId ?? undefined;
+        const selected = routeRef.current?.state === 'active'
+          ? routeRef.current.input_endpoint
+          : null;
+        if (pairedInputDevice(selected)) {
+          throw new Error('The paired VoiceRoute endpoint owns microphone capture for this Talk session');
+        }
+        const routedLocal = localDevice(selected, 'input');
+        const deviceId = (routedLocal && routedLocal !== 'default' ? routedLocal : config.voice.inputDeviceId) ?? undefined;
         streamRef.current = await navigator.mediaDevices.getUserMedia({
           audio: deviceId
             ? { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true }
@@ -400,6 +444,8 @@ export function useTalkSession(
       },
       submitTurn: async (text, utteranceId) => {
         // The composer's own call. `voice` only labels where the turn was made.
+        // A paired microphone enters here too, so both sources are literally the
+        // same ordinary conversation execution path.
         const session = useSessionStore
           .getState()
           .sessions.find((entry) => entry.id === sessionId);
@@ -408,16 +454,25 @@ export function useTalkSession(
           fromIndex: session?.messages.length ?? 0,
           spoken: '',
         };
+        let failure: string | null = null;
         try {
           await runAgentTurn(sessionId, text, [], undefined, utteranceId, [], [], false, null, 'voice');
+        } catch (reason) {
+          failure = errorMessage(reason);
+          throw reason;
         } finally {
-          // The turn is over when the call that ran it settles — a turn that
-          // only ran tools and said nothing included, which is why the
-          // microphone is released here and not on the arrival of some text.
-          // The store's running flag cannot tell two overlapping turns apart;
-          // this can, and the engine drops the id it has moved past.
-          activeTurnRef.current = null;
-          sessionRef.current?.onTurnFinished(utteranceId);
+          const currentRoute = routeRef.current;
+          if (currentRoute?.state === 'active' && pairedInputDevice(currentRoute.input_endpoint)) {
+            emitRoute(
+              currentRoute,
+              failure ? 'turn_failed' : 'turn_finished',
+              failure ? { turn_id: utteranceId, error: failure } : { turn_id: utteranceId },
+            );
+          }
+          if (activeTurnRef.current?.turnId === utteranceId) {
+            activeTurnRef.current = null;
+            sessionRef.current?.onTurnFinished(utteranceId, failure ?? undefined);
+          }
         }
       },
       cancelTurn: () => stopTurn(sessionId),
@@ -426,19 +481,40 @@ export function useTalkSession(
         return { audioBase64: speech.audioBase64, mediaType: speech.mediaType };
       },
       play: async (audioBase64, mediaType) => {
-        // Read the chosen output before every chunk rather than freezing it for
-        // the session: moving to headphones mid-conversation should be audible
-        // on the next sentence. `config()` is an in-memory read on the Rust
-        // side, and a read that fails is not worth dropping a sentence over —
-        // the device the operator last chose is still the best guess.
+        const currentRoute = routeRef.current;
+        const pairedOutput = pairedOutputDevice(currentRoute?.output_endpoint);
+        if (currentRoute?.state === 'active' && pairedOutput) {
+          // Duplex uses the input device's authenticated Talk socket; the host
+          // copy of TTS must not make the phone speak the same sentence twice.
+          if (pairedInputDevice(currentRoute.input_endpoint) === pairedOutput) return;
+          await voiceRouteOutputAudio(
+            sessionId,
+            currentRoute.generation,
+            `clip-${crypto.randomUUID()}`,
+            mediaType,
+            audioBase64,
+          );
+          return;
+        }
         try {
-          outputDeviceRef.current = (await companionClient.config()).voice.outputDeviceId;
+          const configured = (await companionClient.config()).voice.outputDeviceId;
+          const routedLocal = localDevice(currentRoute?.output_endpoint, 'output');
+          outputDeviceRef.current = routedLocal && routedLocal !== 'default' ? routedLocal : configured;
         } catch {
           /* keep the last known output */
         }
         await player.play(base64AudioBlob(audioBase64, mediaType), outputDeviceRef.current);
       },
-      stopPlayback: () => player.stop(),
+      stopPlayback: () => {
+        player.stop();
+        const currentRoute = routeRef.current;
+        const pairedOutput = pairedOutputDevice(currentRoute?.output_endpoint);
+        if (currentRoute?.state === 'active'
+            && pairedOutput
+            && pairedInputDevice(currentRoute.input_endpoint) !== pairedOutput) {
+          void voiceRouteOutputStop(sessionId, currentRoute.generation).catch(() => undefined);
+        }
+      },
       recordMetric: (metric) => {
         void talkClient.recordMetric(metric).catch(() => undefined);
       },
@@ -506,6 +582,66 @@ export function useTalkSession(
   }, [autoStartMode, enabled, ports, releaseDevices, sessionId]);
 
   useEffect(() => {
+    routeRef.current = route;
+    const external = Boolean(route?.state === 'active' && pairedInputDevice(route.input_endpoint));
+    sessionRef.current?.setExternalInput(external);
+    if (external) releaseDevices();
+    routeCursorRef.current = route ? { generation: route.generation, eventId: 0 } : null;
+    // A selector can move the route while Talk is already running. Selection
+    // itself never opens a microphone; activation here preserves that privacy
+    // boundary while making live handoff take effect immediately.
+    if (route?.state === 'active' && snapshot?.state && snapshot.state !== 'off') {
+      void voiceRouteActivate(sessionId).catch((reason) => setSetupError(errorMessage(reason)));
+    }
+  }, [releaseDevices, route, sessionId]);
+
+  useEffect(() => {
+    if (!enabled || snapshot?.state === 'off' || !route || route.state !== 'active'
+        || !pairedInputDevice(route.input_endpoint)) return;
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = async () => {
+      try {
+        const cursor = routeCursorRef.current?.generation === route.generation
+          ? routeCursorRef.current.eventId
+          : 0;
+        const events = await voiceRouteEvents(sessionId, cursor, 100);
+        if (disposed) return;
+        let next = cursor;
+        for (const event of events) {
+          next = Math.max(next, event.event_id);
+          if (event.generation !== route.generation || typeof event.payload !== 'object' || !event.payload) continue;
+          const payload = event.payload as Record<string, unknown>;
+          if (event.kind === 'input_transcript') {
+            const text = typeof payload.text === 'string' ? payload.text : '';
+            const turnId = typeof payload.turn_id === 'string' ? payload.turn_id : '';
+            if (text && turnId) {
+              void sessionRef.current?.acceptExternalTranscript(text, turnId, {
+                speechDetectionMs: typeof payload.speech_detection_ms === 'number' ? payload.speech_detection_ms : null,
+                sttMs: typeof payload.stt_ms === 'number' ? payload.stt_ms : null,
+              });
+            }
+          } else if (event.kind === 'interrupt') {
+            sessionRef.current?.interrupt(
+              typeof payload.reason === 'string' ? payload.reason : 'remote_barge_in',
+            );
+          }
+        }
+        routeCursorRef.current = { generation: route.generation, eventId: next };
+      } catch (reason) {
+        if (!disposed) setSetupError(errorMessage(reason));
+      } finally {
+        if (!disposed) timer = setTimeout(() => void poll(), 180);
+      }
+    };
+    void poll();
+    return () => {
+      disposed = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [enabled, route, sessionId, snapshot?.state]);
+
+  useEffect(() => {
     sessionRef.current?.setMode(mode);
   }, [mode]);
 
@@ -549,23 +685,35 @@ export function useTalkSession(
       // rewritten and none of what is there now has been said out loud.
       const delta = text.startsWith(active.spoken) ? text.slice(active.spoken.length) : text;
       active.spoken = text;
-      if (delta) engine.onAssistantDelta(delta, active.turnId);
+      if (delta) {
+        engine.onAssistantDelta(delta, active.turnId);
+        const currentRoute = routeRef.current;
+        if (currentRoute?.state === 'active' && pairedInputDevice(currentRoute.input_endpoint)) {
+          emitRoute(currentRoute, 'assistant_delta', { turn_id: active.turnId, text: delta });
+        }
+      }
     });
   }, [sessionId]);
 
   const start = useCallback(async () => {
     setSetupError(null);
     try {
+      const currentRoute = routeRef.current;
+      sessionRef.current?.setExternalInput(Boolean(
+        currentRoute?.state === 'active' && pairedInputDevice(currentRoute.input_endpoint),
+      ));
+      if (currentRoute?.state === 'active') await voiceRouteActivate(sessionId);
       await sessionRef.current?.start();
     } catch (reason) {
       setSetupError(errorMessage(reason));
     }
-  }, []);
+  }, [sessionId]);
 
   const stop = useCallback(async () => {
     await sessionRef.current?.stop();
+    await voiceRouteDeactivate(sessionId).catch(() => null);
     releaseDevices();
-  }, [releaseDevices]);
+  }, [releaseDevices, sessionId]);
 
   /**
    * Turning Always Listening off closes the microphone it opened. Here, not in

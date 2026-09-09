@@ -441,6 +441,10 @@ export const voiceRouteSet = (
 ) => invoke<VoiceRouteRecord>("voice_route_set", { sessionId, input, output, engine });
 export const voiceRouteMove = (sessionId: string, input?: string, output?: string) =>
   invoke<VoiceRouteRecord>("voice_route_move", { sessionId, input: input ?? null, output: output ?? null });
+export const voiceRouteActivate = (sessionId: string) =>
+  invoke<VoiceRouteRecord>("voice_route_activate", { sessionId });
+export const voiceRouteDeactivate = (sessionId: string) =>
+  invoke<VoiceRouteRecord | null>("voice_route_deactivate", { sessionId });
 export const voiceRouteStop = (sessionId: string) =>
   invoke<VoiceRouteRecord | null>("voice_route_stop", { sessionId });
 export const voiceRouteEvents = (sessionId: string, after = 0, limit = 100) =>
@@ -451,6 +455,17 @@ export const voiceRouteEmit = (
   kind: string,
   payload: unknown,
 ) => invoke<VoiceRouteEvent>("voice_route_emit", { sessionId, generation, kind, payload });
+export const voiceRouteOutputAudio = (
+  sessionId: string,
+  generation: number,
+  clipId: string,
+  mediaType: string,
+  audioBase64: string,
+) => invoke<{ queued_chunks: number }>("voice_route_output_audio", {
+  sessionId, generation, clipId, mediaType, audioBase64,
+});
+export const voiceRouteOutputStop = (sessionId: string, generation: number) =>
+  invoke<{ stopped: boolean }>("voice_route_output_stop", { sessionId, generation });
 
 /** One node this machine may place work on, as `monkey daemon remote node-list --json` reports it (roadmap K17 S1). */
 export interface RemoteNodeRow {

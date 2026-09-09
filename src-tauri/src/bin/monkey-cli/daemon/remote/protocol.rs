@@ -43,7 +43,7 @@ pub const MAX_REMOTE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 /// would offer to re-send *every* turn — including ones already answered. That
 /// is exactly the "tell somebody to repeat what is already running" failure the
 /// journal exists to prevent, so the two sides are pinned to each other.
-pub const TALK_PROTOCOL_VERSION: u32 = 3;
+pub const TALK_PROTOCOL_VERSION: u32 = 4;
 
 /// The version whose only difference from [`TALK_PROTOCOL_VERSION`] is the
 /// missing utterance id — so a client speaking it can be told precisely what is
@@ -53,6 +53,8 @@ const TALK_PROTOCOL_VERSION_WITHOUT_UTTERANCE_ID: u32 = 1;
 /// The version that names its utterances but has nowhere to hear that one was
 /// durably accepted. Refused by version for the reason above.
 const TALK_PROTOCOL_VERSION_WITHOUT_ACCEPTANCE: u32 = 2;
+/// Version 3 predates host-authoritative routed Talk tickets.
+const TALK_PROTOCOL_VERSION_WITHOUT_VOICE_ROUTE: u32 = 3;
 pub const MAX_TALK_AUDIO_BYTES: usize = MAX_VOICE_CHUNK_BYTES;
 pub const MAX_TALK_AUDIO_BASE64_BYTES: usize = MAX_TALK_AUDIO_BYTES.div_ceil(3) * 4;
 pub const MAX_TALK_FRAME_BYTES: usize = MAX_TALK_AUDIO_BASE64_BYTES + 16 * 1024;
@@ -1639,13 +1641,30 @@ pub enum TalkState {
 #[serde(deny_unknown_fields)]
 pub struct TalkTicketRequest {
     pub protocol_version: u32,
+    /// Legacy/manual Talk conversation. In routed Talk this value is deliberately
+    /// ignored: the host-owned route is the authority for the conversation.
     pub session_id: String,
+    #[serde(default)]
+    pub route_id: Option<String>,
+    #[serde(default)]
+    pub route_generation: Option<u64>,
 }
 
 impl TalkTicketRequest {
     pub fn validate(&self) -> Result<(), String> {
         validate_talk_protocol_version(self.protocol_version)?;
-        validate_talk_session_id(&self.session_id)
+        validate_talk_session_id(&self.session_id)?;
+        match (&self.route_id, self.route_generation) {
+            (None, None) => Ok(()),
+            (Some(route_id), Some(generation)) => {
+                validate_id(route_id)?;
+                if generation == 0 {
+                    return Err("Talk route generation must be positive".to_string());
+                }
+                Ok(())
+            }
+            _ => Err("Routed Talk requires both route_id and route_generation".to_string()),
+        }
     }
 }
 
@@ -2048,7 +2067,9 @@ fn validate_talk_protocol_version(protocol_version: u32) -> Result<(), String> {
     // "unsupported version" would not tell them to.
     if matches!(
         protocol_version,
-        TALK_PROTOCOL_VERSION_WITHOUT_UTTERANCE_ID | TALK_PROTOCOL_VERSION_WITHOUT_ACCEPTANCE
+        TALK_PROTOCOL_VERSION_WITHOUT_UTTERANCE_ID
+            | TALK_PROTOCOL_VERSION_WITHOUT_ACCEPTANCE
+            | TALK_PROTOCOL_VERSION_WITHOUT_VOICE_ROUTE
     ) {
         return Err(
             "This Talk client is from an older version of the app; reload the page to continue"

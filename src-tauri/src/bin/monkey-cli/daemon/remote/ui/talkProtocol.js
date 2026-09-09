@@ -19,7 +19,7 @@
 // durably accepted utterance with `turn_accepted`, and that frame is the only
 // thing this client deletes a recording on. Both sides are pinned to v3 — see
 // the Rust constant's own note for why an additive frame was not enough.
-export const TALK_PROTOCOL_VERSION = 3;
+export const TALK_PROTOCOL_VERSION = 4;
 
 /// Exactly `TALK_MEDIA_TYPES` in `protocol.rs`. A container that is not on this
 /// list is refused outright, so guessing one is the same as dropping the

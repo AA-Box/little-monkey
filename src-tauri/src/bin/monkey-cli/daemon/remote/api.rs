@@ -204,6 +204,9 @@ struct PendingTalkTicket {
     signed_request_sha256: String,
     session_id: String,
     session_generation: String,
+    route_id: Option<String>,
+    route_generation: Option<u64>,
+    route_output_to_socket: bool,
     expires_at_ms: u64,
 }
 
@@ -218,6 +221,12 @@ pub(crate) struct TalkSocketAuthorization {
     pub signed_request_sha256: String,
     pub session_id: String,
     pub session_generation: String,
+    /// Present only when the desktop owns this Talk socket through VoiceRoute.
+    pub route_id: Option<String>,
+    pub route_generation: Option<u64>,
+    /// Same paired endpoint is both microphone and speaker. Its existing Talk
+    /// socket is then the output transport, avoiding a second device executor.
+    pub route_output_to_socket: bool,
 }
 
 impl ApiResponse {
@@ -2286,24 +2295,58 @@ impl RemoteApi {
         let request: TalkTicketRequest = serde_json::from_slice(body)
             .map_err(|error| (400, format!("Invalid Talk ticket request: {error}")))?;
         request.validate().map_err(|error| (400, error))?;
-        // The surface matters as much as the grant: a device whose OS refused
-        // the microphone must not be handed a socket that can only fail.
-        let surface = self
-            .locked_store()?
-            .device_surface(&device.device_id)
-            .map_err(internal)?;
-        if !effective_capabilities(&device.capabilities, surface.as_ref())
-            .contains(&DeviceCapability::VoiceStream)
-        {
-            return Err((
-                403,
-                "This device's microphone is not effective: the grant, the device's own \
-                 advertisement and its operating system permission must all allow it."
-                    .to_string(),
-            ));
-        }
+
+        let (session_id, route_id, route_generation, route_output_to_socket) = {
+            let store = self.locked_store()?;
+            // The surface matters as much as the grant: a device whose OS refused
+            // the microphone must not be handed a socket that can only fail.
+            let surface = store.device_surface(&device.device_id).map_err(internal)?;
+            let effective = effective_capabilities(&device.capabilities, surface.as_ref());
+            if !effective.contains(&DeviceCapability::VoiceStream) {
+                return Err((
+                    403,
+                    "This device's microphone is not effective: the grant, the device's own \
+                     advertisement and its operating system permission must all allow it."
+                        .to_string(),
+                ));
+            }
+
+            match (&request.route_id, request.route_generation) {
+                (Some(route_id), Some(generation)) => {
+                    let route = store
+                        .voice_route_by_id(route_id)
+                        .map_err(internal)?
+                        .ok_or_else(|| (409, "This VoiceRoute no longer exists".to_string()))?;
+                    if route.state != "active" || route.generation != generation {
+                        return Err((409, "This VoiceRoute generation is stale".to_string()));
+                    }
+                    // Routed Talk is deliberately host authoritative. The session id
+                    // in the browser request is compatibility data only and can never
+                    // redirect this socket into a different conversation.
+                    let expected_input = format!("paired:{}:input", device.device_id);
+                    if route.input_endpoint != expected_input {
+                        return Err((403, "This paired device is not the selected VoiceRoute microphone".to_string()));
+                    }
+                    if route.engine != "pipeline" {
+                        return Err((
+                            409,
+                            "Paired Realtime Voice needs a direct media bridge; it is not routed through transcription.".to_string(),
+                        ));
+                    }
+                    let output_to_socket =
+                        route.output_endpoint == format!("paired:{}:output", device.device_id);
+                    if output_to_socket && !effective.contains(&DeviceCapability::AudioPlayback) {
+                        return Err((403, "This device is selected as the VoiceRoute speaker but audio_playback is not effective".to_string()));
+                    }
+                    (route.session_id, Some(route.route_id), Some(route.generation), output_to_socket)
+                }
+                (None, None) => (request.session_id.clone(), None, None, true),
+                _ => unreachable!("TalkTicketRequest::validate rejects partial routes"),
+            }
+        };
+
         let issued = TalkTicketResponse::issue(
-            request.session_id.clone(),
+            session_id,
             now_ms,
             DEFAULT_TALK_TICKET_TTL_MS,
         )
@@ -2312,15 +2355,9 @@ impl RemoteApi {
             .talk_tickets
             .lock()
             .map_err(|_| (500, "Talk ticket state was poisoned".to_string()))?;
-        // Expired admissions are swept on every issue rather than on a timer:
-        // this is the only path that adds to the map, so it is the only place
-        // it can grow.
         tickets.retain(|_, pending| pending.expires_at_ms > now_ms);
         if tickets.len() >= MAX_PENDING_TALK_TICKETS {
-            return Err((
-                429,
-                "Too many Talk sockets are being opened at once.".to_string(),
-            ));
+            return Err((429, "Too many Talk sockets are being opened at once.".to_string()));
         }
         tickets.insert(
             sha256_hex(issued.ticket.as_bytes()),
@@ -2330,6 +2367,9 @@ impl RemoteApi {
                 signed_request_sha256: request_sha256.to_string(),
                 session_id: issued.session_id.clone(),
                 session_generation: issued.session_generation.clone(),
+                route_id,
+                route_generation,
+                route_output_to_socket,
                 expires_at_ms: issued.expires_at_ms,
             },
         );
@@ -2369,24 +2409,46 @@ impl RemoteApi {
             pending
         };
         // Re-checked at the moment of admission, not only at issue: thirty
-        // seconds is long enough for an operator to revoke a device, and the
-        // socket that follows can stay open for an hour.
-        let device = self
-            .store
-            .lock()
-            .ok()?
-            .device(&pending.device_id)
-            .ok()
-            .flatten()?;
-        if !device.active() || device.secret_generation != pending.secret_generation {
-            return None;
+        // seconds is long enough for an operator to revoke, re-key, or move a
+        // route. Routed sockets additionally bind the exact current generation.
+        {
+            let store = self.store.lock().ok()?;
+            let device = store.device(&pending.device_id).ok().flatten()?;
+            if !device.active() || device.secret_generation != pending.secret_generation {
+                return None;
+            }
+            let surface = store.device_surface(&pending.device_id).ok().flatten();
+            let effective = effective_capabilities(&device.capabilities, surface.as_ref());
+            if !effective.contains(&DeviceCapability::VoiceStream) {
+                return None;
+            }
+            if let (Some(route_id), Some(generation)) =
+                (pending.route_id.as_deref(), pending.route_generation)
+            {
+                let route = store.voice_route_by_id(route_id).ok().flatten()?;
+                if route.state != "active"
+                    || route.generation != generation
+                    || route.session_id != pending.session_id
+                    || route.input_endpoint != format!("paired:{}:input", pending.device_id)
+                {
+                    return None;
+                }
+                if pending.route_output_to_socket
+                    && (route.output_endpoint != format!("paired:{}:output", pending.device_id)
+                        || !effective.contains(&DeviceCapability::AudioPlayback))
+                {
+                    return None;
+                }
+            }
         }
-        require_capability(&device, DeviceCapability::VoiceStream).ok()?;
         Some(TalkSocketAuthorization {
             device_id: pending.device_id,
             signed_request_sha256: pending.signed_request_sha256,
             session_id: pending.session_id,
             session_generation: pending.session_generation,
+            route_id: pending.route_id,
+            route_generation: pending.route_generation,
+            route_output_to_socket: pending.route_output_to_socket,
         })
     }
 
@@ -4266,6 +4328,10 @@ pub(crate) struct TalkSessionTurns {
     device_id: String,
     /// See [`TalkSocketAuthorization::signed_request_sha256`].
     admission_sha256: String,
+    route_id: Option<String>,
+    route_generation: Option<u64>,
+    route_session_id: String,
+    route_output_to_socket: bool,
 }
 
 impl TalkSessionTurns {
@@ -4274,12 +4340,38 @@ impl TalkSessionTurns {
             api,
             device_id: authorization.device_id.clone(),
             admission_sha256: authorization.signed_request_sha256.clone(),
+            route_id: authorization.route_id.clone(),
+            route_generation: authorization.route_generation,
+            route_session_id: authorization.session_id.clone(),
+            route_output_to_socket: authorization.route_output_to_socket,
         }
     }
 }
 
 impl super::talk::TalkTurns for TalkSessionTurns {
     fn submit(&self, session_id: &str, client_key: &str, text: &str) -> Result<String, String> {
+        if let (Some(_route_id), Some(generation)) = (self.route_id.as_deref(), self.route_generation) {
+            if session_id != self.route_session_id {
+                return Err("Routed Talk session binding changed".to_string());
+            }
+            let now_ms = super::now_ms_public()?;
+            self.api
+                .store
+                .lock()
+                .map_err(|_| "Remote state lock was poisoned".to_string())?
+                .append_voice_route_event(
+                    &self.route_session_id,
+                    generation,
+                    "input_transcript",
+                    &serde_json::json!({
+                        "turn_id": client_key,
+                        "text": text,
+                        "device_id": self.device_id,
+                    }),
+                    now_ms,
+                )?;
+            return Ok(format!("voice-route:{client_key}"));
+        }
         let queue = self
             .api
             .mobile_chat
@@ -4326,6 +4418,52 @@ impl super::talk::TalkTurns for TalkSessionTurns {
         run_id: &str,
         from_index: u64,
     ) -> Result<super::talk::TalkRunProgress, String> {
+        if let (Some(_route_id), Some(generation)) = (self.route_id.as_deref(), self.route_generation) {
+            let turn_id = run_id
+                .strip_prefix("voice-route:")
+                .ok_or_else(|| "Routed Talk run id is invalid".to_string())?;
+            let store = self
+                .api
+                .store
+                .lock()
+                .map_err(|_| "Remote state lock was poisoned".to_string())?;
+            let events = store.voice_route_events(&self.route_session_id, from_index, 500)?;
+            let mut progress = super::talk::TalkRunProgress {
+                next_index: events.last().map(|event| event.event_id).unwrap_or(from_index),
+                ..super::talk::TalkRunProgress::default()
+            };
+            for event in events {
+                if event.generation != generation
+                    || event.payload.get("turn_id").and_then(serde_json::Value::as_str) != Some(turn_id)
+                {
+                    continue;
+                }
+                match event.kind.as_str() {
+                    "assistant_delta" => {
+                        if let Some(text) = event.payload.get("text").and_then(serde_json::Value::as_str) {
+                            progress.delta.push_str(text);
+                        }
+                    }
+                    "turn_finished" => progress.finished = true,
+                    "turn_failed" => {
+                        progress.finished = true;
+                        progress.error = Some(
+                            event.payload.get("error").and_then(serde_json::Value::as_str)
+                                .unwrap_or("The routed turn failed")
+                                .to_string(),
+                        );
+                    }
+                    "host_interrupt" => {
+                        progress.finished = true;
+                        if progress.delta.is_empty() {
+                            progress.error = Some("This turn was interrupted on the host.".to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(progress);
+        }
         let ledger =
             RunLedger::open(&self.api.paths.ledger_db).map_err(|error| error.to_string())?;
         let events = match ledger.load_events(run_id, from_index, 500) {
@@ -4368,6 +4506,24 @@ impl super::talk::TalkTurns for TalkSessionTurns {
     }
 
     fn cancel(&self, run_id: &str) -> Result<(), String> {
+        if let (Some(_route_id), Some(generation)) = (self.route_id.as_deref(), self.route_generation) {
+            let turn_id = run_id
+                .strip_prefix("voice-route:")
+                .ok_or_else(|| "Routed Talk run id is invalid".to_string())?;
+            let now_ms = super::now_ms_public()?;
+            self.api
+                .store
+                .lock()
+                .map_err(|_| "Remote state lock was poisoned".to_string())?
+                .append_voice_route_event(
+                    &self.route_session_id,
+                    generation,
+                    "interrupt",
+                    &serde_json::json!({ "turn_id": turn_id, "reason": "device_barge_in" }),
+                    now_ms,
+                )?;
+            return Ok(());
+        }
         // The same two steps the run centre and the phone's cancel button take:
         // ask the store to stop the job, and append the durable cancellation
         // event. What a tool already did in the world is not undone by either,
@@ -4381,7 +4537,33 @@ impl super::talk::TalkTurns for TalkSessionTurns {
     }
 
     fn still_granted(&self, device_id: &str) -> bool {
-        self.api.talk_capability_live(device_id)
+        if !self.api.talk_capability_live(device_id) {
+            return false;
+        }
+        let (Some(route_id), Some(generation)) = (self.route_id.as_deref(), self.route_generation) else {
+            return true;
+        };
+        let Ok(store) = self.api.store.lock() else { return false; };
+        let Ok(Some(route)) = store.voice_route_by_id(route_id) else { return false; };
+        if route.state != "active"
+            || route.generation != generation
+            || route.session_id != self.route_session_id
+            || route.input_endpoint != format!("paired:{}:input", self.device_id)
+        {
+            return false;
+        }
+        if self.route_output_to_socket {
+            let Ok(Some(device)) = store.device(&self.device_id) else { return false; };
+            let surface = store.device_surface(&self.device_id).ok().flatten();
+            return route.output_endpoint == format!("paired:{}:output", self.device_id)
+                && effective_capabilities(&device.capabilities, surface.as_ref())
+                    .contains(&DeviceCapability::AudioPlayback);
+        }
+        true
+    }
+
+    fn output_to_socket(&self) -> bool {
+        self.route_id.is_none() || self.route_output_to_socket
     }
 }
 
@@ -7480,6 +7662,9 @@ mod tests {
                 signed_request_sha256: "a".repeat(64),
                 session_id: "mobile-session".to_string(),
                 session_generation: "generation-one".to_string(),
+                route_id: None,
+                route_generation: None,
+                route_output_to_socket: true,
             },
         );
 

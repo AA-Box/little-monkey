@@ -13,6 +13,7 @@ import { useEffect, useState } from 'react';
 import { companionClient, type VoiceConfig } from '../../lib/companionClient';
 import { errorMessage } from '../../lib/errors';
 import { talkClient } from '../../lib/talkClient';
+import { type VoiceRouteRecord } from '../../lib/daemonClient';
 import { type TalkState } from '../../lib/talkEngine';
 import { Button, IconButton } from '../ui';
 import { useTalkSession } from './useTalkSession';
@@ -61,6 +62,7 @@ function PipelineTalkPanel({
   onReturnToChat,
   onOpenVoiceSettings,
 }: TalkPanelProps) {
+  const [voiceRoute, setVoiceRoute] = useState<VoiceRouteRecord | null>(null);
   const {
     snapshot,
     status,
@@ -72,7 +74,7 @@ function PipelineTalkPanel({
     start,
     stop,
     sessionRef,
-  } = useTalkSession(sessionId);
+  } = useTalkSession(sessionId, { route: voiceRoute });
 
   const state = snapshot?.state ?? 'off';
   const running = state !== 'off';
@@ -153,7 +155,7 @@ function PipelineTalkPanel({
       )}
 
       <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
-        <VoiceRouteSelector sessionId={sessionId} engine="pipeline" />
+        <VoiceRouteSelector sessionId={sessionId} engine="pipeline" onRoute={setVoiceRoute} />
         <div className="rounded-lg border border-border bg-surface p-3">
           <p className="text-xs font-medium text-muted">What you said</p>
           <p className="mt-1 min-h-6 text-sm">

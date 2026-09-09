@@ -100,6 +100,12 @@ pub trait TalkTurns: Send + Sync {
     /// grant revoked mid-conversation closes the microphone rather than waiting
     /// for the socket to break.
     fn still_granted(&self, device_id: &str) -> bool;
+    /// Whether assistant audio belongs on this same Talk socket. Routed Talk
+    /// may use this device only as the microphone while the host sends speech
+    /// to a local or different paired speaker.
+    fn output_to_socket(&self) -> bool {
+        true
+    }
 }
 
 /// Which conversation a socket belongs to.
@@ -836,6 +842,7 @@ impl Session {
         let mut since_grant_check_ms = 0u64;
         let mut first_token_seen = false;
         let mut first_audio_seen = false;
+        let output_to_socket = turns.output_to_socket();
         loop {
             // A grant is withdrawn by an operator, not by the device, so a
             // silent phone must not be able to hold the microphone open for the
@@ -923,49 +930,53 @@ impl Session {
                     },
                 )
                 .await?;
-                for chunk in chunker.push(&progress.delta, false) {
-                    if spoken_bytes + chunk.len() > MAX_SPOKEN_TEXT_BYTES {
-                        break;
-                    }
-                    spoken_bytes += chunk.len();
-                    if !speaking {
-                        speaking = true;
-                        self.emit(
-                            socket,
-                            TalkServerFrameKind::State {
-                                state: TalkState::Speaking,
-                            },
-                        )
-                        .await?;
-                    }
-                    let spoken_before = self.report.spoken_chunks;
-                    self.speak(socket, speech, &chunk).await?;
-                    if !first_audio_seen && self.report.spoken_chunks > spoken_before {
-                        first_audio_seen = true;
-                        self.report
-                            .latency
-                            .tts_first_audio
-                            .observe(elapsed_ms(turn_started));
+                if output_to_socket {
+                    for chunk in chunker.push(&progress.delta, false) {
+                        if spoken_bytes + chunk.len() > MAX_SPOKEN_TEXT_BYTES {
+                            break;
+                        }
+                        spoken_bytes += chunk.len();
+                        if !speaking {
+                            speaking = true;
+                            self.emit(
+                                socket,
+                                TalkServerFrameKind::State {
+                                    state: TalkState::Speaking,
+                                },
+                            )
+                            .await?;
+                        }
+                        let spoken_before = self.report.spoken_chunks;
+                        self.speak(socket, speech, &chunk).await?;
+                        if !first_audio_seen && self.report.spoken_chunks > spoken_before {
+                            first_audio_seen = true;
+                            self.report
+                                .latency
+                                .tts_first_audio
+                                .observe(elapsed_ms(turn_started));
+                        }
                     }
                 }
             }
             if progress.finished {
-                for chunk in chunker.push("", true) {
-                    if spoken_bytes + chunk.len() > MAX_SPOKEN_TEXT_BYTES {
-                        break;
+                if output_to_socket {
+                    for chunk in chunker.push("", true) {
+                        if spoken_bytes + chunk.len() > MAX_SPOKEN_TEXT_BYTES {
+                            break;
+                        }
+                        spoken_bytes += chunk.len();
+                        if !speaking {
+                            speaking = true;
+                            self.emit(
+                                socket,
+                                TalkServerFrameKind::State {
+                                    state: TalkState::Speaking,
+                                },
+                            )
+                            .await?;
+                        }
+                        self.speak(socket, speech, &chunk).await?;
                     }
-                    spoken_bytes += chunk.len();
-                    if !speaking {
-                        speaking = true;
-                        self.emit(
-                            socket,
-                            TalkServerFrameKind::State {
-                                state: TalkState::Speaking,
-                            },
-                        )
-                        .await?;
-                    }
-                    self.speak(socket, speech, &chunk).await?;
                 }
                 if let Some(error) = progress.error {
                     self.report.fallbacks += 1;
