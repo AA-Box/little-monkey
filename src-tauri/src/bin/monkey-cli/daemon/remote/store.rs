@@ -1742,7 +1742,7 @@ impl RemoteStore {
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        from_i64(value)
+        from_i64(value).map_err(|error| error.to_string())
     }
 
     pub fn voice_route_events(
