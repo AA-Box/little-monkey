@@ -292,6 +292,37 @@ CREATE TABLE IF NOT EXISTS remote_voice_sessions (
 CREATE INDEX IF NOT EXISTS remote_voice_sessions_device_idx
     ON remote_voice_sessions(device_id,created_at_ms);
 
+
+-- One authoritative Talk route per ordinary conversation. Audio never lives
+-- here: this is only the durable coordination plane shared by the desktop and
+-- the resident remote server. A generation changes on every route mutation so
+-- stale sockets/commands can be rejected without guessing which endpoint won.
+CREATE TABLE IF NOT EXISTS remote_voice_routes (
+    session_id TEXT PRIMARY KEY,
+    route_id TEXT NOT NULL UNIQUE,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    engine TEXT NOT NULL CHECK(engine IN ('pipeline','realtime')),
+    input_endpoint TEXT NOT NULL,
+    output_endpoint TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('active','stopped')),
+    input_command_id TEXT,
+    output_command_id TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS remote_voice_route_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    kind TEXT NOT NULL,
+    payload_json BLOB NOT NULL,
+    created_at_ms INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS remote_voice_route_events_session_idx
+    ON remote_voice_route_events(session_id,event_id);
+
 -- What the run watcher has already told the devices about. One row per job
 -- holding the last state a notification was raised for, so a watcher that polls
 -- every couple of seconds does not send "run finished" forty times, and a
@@ -634,6 +665,32 @@ pub struct DeviceCommandRecord {
     /// command, and on one completed by a build that predates this column.
     pub terminal_sha256: Option<String>,
     pub invocation_id: Option<String>,
+}
+
+/// Host-authoritative routing state for one ordinary conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceRouteRecord {
+    pub session_id: String,
+    pub route_id: String,
+    pub generation: u64,
+    pub engine: String,
+    pub input_endpoint: String,
+    pub output_endpoint: String,
+    pub state: String,
+    pub input_command_id: Option<String>,
+    pub output_command_id: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceRouteEventRecord {
+    pub event_id: u64,
+    pub session_id: String,
+    pub generation: u64,
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub created_at_ms: u64,
 }
 
 /// One microphone stream's ledger row. The audio lives beside the database —
@@ -1453,6 +1510,234 @@ impl RemoteStore {
             )
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    // --- Voice Everywhere route authority ---------------------------------
+
+    pub fn voice_route(&self, session_id: &str) -> Result<Option<VoiceRouteRecord>, String> {
+        self.connection
+            .query_row(
+                "SELECT session_id,route_id,generation,engine,input_endpoint,output_endpoint,state,
+                        input_command_id,output_command_id,created_at_ms,updated_at_ms
+                 FROM remote_voice_routes WHERE session_id=?1",
+                [session_id],
+                |row| {
+                    Ok(VoiceRouteRecord {
+                        session_id: row.get(0)?,
+                        route_id: row.get(1)?,
+                        generation: from_i64(row.get(2)?)?,
+                        engine: row.get(3)?,
+                        input_endpoint: row.get(4)?,
+                        output_endpoint: row.get(5)?,
+                        state: row.get(6)?,
+                        input_command_id: row.get(7)?,
+                        output_command_id: row.get(8)?,
+                        created_at_ms: from_i64(row.get(9)?)?,
+                        updated_at_ms: from_i64(row.get(10)?)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Replaces the route atomically. Callers prepare/validate endpoints before
+    /// this boundary; the monotonically increasing generation is minted here so
+    /// two controller processes cannot accidentally reuse one.
+    pub fn replace_voice_route(
+        &mut self,
+        session_id: &str,
+        engine: &str,
+        input_endpoint: &str,
+        output_endpoint: &str,
+        input_command_id: Option<&str>,
+        output_command_id: Option<&str>,
+        now_ms: u64,
+    ) -> Result<VoiceRouteRecord, String> {
+        if session_id.is_empty() || session_id.len() > 256 {
+            return Err("Voice route session id must be 1-256 characters".to_string());
+        }
+        if !matches!(engine, "pipeline" | "realtime") {
+            return Err("Voice route engine must be pipeline or realtime".to_string());
+        }
+        for (label, value) in [("input", input_endpoint), ("output", output_endpoint)] {
+            if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+                return Err(format!("Voice route {label} endpoint is invalid"));
+            }
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let existing = transaction
+            .query_row(
+                "SELECT route_id,generation,created_at_ms FROM remote_voice_routes WHERE session_id=?1",
+                [session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+            )
+             .optional()
+            .map_err(|error| error.to_string())?;
+        let (route_id, generation, created_at_ms) = match existing {
+            Some((route_id, generation, created_at_ms)) => {
+                let next = generation
+                    .checked_add(1)
+                    .ok_or_else(|| "Voice route generation is exhausted".to_string())?;
+                (route_id, next, created_at_ms)
+            }
+            None => (
+                format!("vr-{}", random_token_id(18)?),
+                1,
+                to_i64(now_ms)?,
+            ),
+        };
+        transaction
+            .execute(
+                "INSERT INTO remote_voice_routes(
+                    session_id,route_id,generation,engine,input_endpoint,output_endpoint,state,
+                    input_command_id,output_command_id,created_at_ms,updated_at_ms
+                 ) VALUES(?1,?2,?3,?4,?5,?6,'active',?7,?8,?9,?10)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    route_id=excluded.route_id,generation=excluded.generation,engine=excluded.engine,
+                    input_endpoint=excluded.input_endpoint,output_endpoint=excluded.output_endpoint,
+                    state='active',input_command_id=excluded.input_command_id,
+                    output_command_id=excluded.output_command_id,updated_at_ms=excluded.updated_at_ms",
+                params![
+                    session_id,
+                    route_id,
+                    generation,
+                    engine,
+                    input_endpoint,
+                    output_endpoint,
+                    input_command_id,
+                    output_command_id,
+                    created_at_ms,
+                    to_i64(now_ms)?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        self.voice_route(session_id)?
+            .ok_or_else(|| "Voice route disappeared after commit".to_string())
+    }
+
+    pub fn set_voice_route_commands(
+        &mut self,
+        session_id: &str,
+        generation: u64,
+        input_command_id: Option<&str>,
+        output_command_id: Option<&str>,
+        now_ms: u64,
+    ) -> Result<VoiceRouteRecord, String> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE remote_voice_routes SET input_command_id=?3,output_command_id=?4,updated_at_ms=?5
+                 WHERE session_id=?1 AND generation=?2 AND state='active'",
+                params![session_id, to_i64(generation)?, input_command_id, output_command_id, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("Voice route generation changed before endpoint activation finished".to_string());
+        }
+        self.voice_route(session_id)?
+            .ok_or_else(|| "Voice route disappeared after command update".to_string())
+    }
+
+    pub fn stop_voice_route(&mut self, session_id: &str, now_ms: u64) -> Result<Option<VoiceRouteRecord>, String> {
+        let Some(existing) = self.voice_route(session_id)? else { return Ok(None); };
+        let next_generation = existing.generation
+            .checked_add(1)
+            .ok_or_else(|| "Voice route generation is exhausted".to_string())?;
+        self.connection
+            .execute(
+                "UPDATE remote_voice_routes SET generation=?2,state='stopped',input_command_id=NULL,
+                    output_command_id=NULL,updated_at_ms=?3 WHERE session_id=?1",
+                params![session_id, to_i64(next_generation)?, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        self.voice_route(session_id)
+    }
+
+    pub fn append_voice_route_event(
+        &mut self,
+        session_id: &str,
+        generation: u64,
+        kind: &str,
+        payload: &serde_json::Value,
+        now_ms: u64,
+    ) -> Result<VoiceRouteEventRecord, String> {
+        let route = self.voice_route(session_id)?
+            .ok_or_else(|| "No voice route exists for this conversation".to_string())?;
+        if route.state != "active" || route.generation != generation {
+            return Err("Voice route generation is stale".to_string());
+        }
+        if kind.is_empty() || kind.len() > 64 || !kind.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')) {
+            return Err("Voice route event kind is invalid".to_string());
+        }
+        let encoded = serde_json::to_vec(payload).map_err(|error| error.to_string())?;
+        if encoded.len() > 64 * 1024 {
+            return Err("Voice route event payload exceeds 64 KiB".to_string());
+        }
+        self.connection
+            .execute(
+                "INSERT INTO remote_voice_route_events(session_id,generation,kind,payload_json,created_at_ms)
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![session_id, to_i64(generation)?, kind, encoded, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        let event_id = u64::try_from(self.connection.last_insert_rowid())
+            .map_err(|_| "Voice route event id overflowed".to_string())?;
+        // Bounded coordination log: keep the newest 512 events per session.
+        self.connection
+            .execute(
+                "DELETE FROM remote_voice_route_events WHERE session_id=?1 AND event_id NOT IN (
+                    SELECT event_id FROM remote_voice_route_events WHERE session_id=?1
+                    ORDER BY event_id DESC LIMIT 512
+                 )",
+                [session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(VoiceRouteEventRecord {
+            event_id,
+            session_id: session_id.to_string(),
+            generation,
+            kind: kind.to_string(),
+            payload: payload.clone(),
+            created_at_ms: now_ms,
+        })
+    }
+
+    pub fn voice_route_events(
+        &self,
+        session_id: &str,
+        after: u64,
+        limit: u32,
+    ) -> Result<Vec<VoiceRouteEventRecord>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT event_id,session_id,generation,kind,payload_json,created_at_ms
+                 FROM remote_voice_route_events WHERE session_id=?1 AND event_id>?2
+                 ORDER BY event_id ASC LIMIT ?3",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![session_id, to_i64(after)?, i64::from(limit.clamp(1, 512))],
+                |row| {
+                    let payload: Vec<u8> = row.get(4)?;
+                    Ok(VoiceRouteEventRecord {
+                        event_id: from_i64(row.get(0)?)?,
+                        session_id: row.get(1)?,
+                        generation: from_i64(row.get(2)?)?,
+                        kind: row.get(3)?,
+                        payload: serde_json::from_slice(&payload).unwrap_or(serde_json::Value::Null),
+                        created_at_ms: from_i64(row.get(5)?)?,
+                    })
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
     }
 
     pub fn audit_entries(&self, limit: u32) -> Result<Vec<AuditEntry>, String> {

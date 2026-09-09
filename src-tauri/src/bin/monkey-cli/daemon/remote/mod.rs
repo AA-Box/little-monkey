@@ -15,6 +15,7 @@ pub(crate) mod store;
 pub(crate) mod talk;
 pub(crate) mod talk_socket;
 pub(crate) mod voice;
+pub(crate) mod voice_route;
 pub(crate) mod watch;
 mod web;
 pub(crate) mod webchat;

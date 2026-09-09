@@ -520,6 +520,9 @@ enum Cmd {
     /// Explicitly installed persistent local background-agent service.
     #[command(subcommand)]
     Daemon(daemon::DaemonCmd),
+    /// Route Talk microphones and speakers across this computer and paired devices.
+    #[command(subcommand)]
+    Voice(VoiceCmd),
     /// Discover, preview, install, update, disable, and roll back data-only SKILL.md skills.
     #[command(subcommand)]
     Skills(skills_cli::SkillsCmd),
@@ -552,6 +555,177 @@ enum Cmd {
     /// credentials and machine share on one machine (K23).
     #[command(subcommand, alias = "profile")]
     Profiles(profiles_cli::ProfilesCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum VoiceCmd {
+    /// List local defaults and every paired microphone/speaker with readiness.
+    Endpoints {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect or change the route bound to one ordinary conversation.
+    #[command(subcommand)]
+    Route(VoiceRouteCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum VoiceRouteCmd {
+    Get {
+        session_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Set {
+        session_id: String,
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        output: String,
+        #[arg(long, default_value = "pipeline")]
+        engine: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Move {
+        session_id: String,
+        #[arg(long)]
+        input: Option<String>,
+        #[arg(long)]
+        output: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Stop {
+        session_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Events {
+        session_id: String,
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Internal/controller bridge for bounded route coordination events.
+    #[command(hide = true)]
+    Emit {
+        session_id: String,
+        #[arg(long)]
+        generation: u64,
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        payload_json: String,
+    },
+}
+
+fn voice_endpoint_json(endpoint: &daemon::remote::voice_route::EndpointDescriptor) -> serde_json::Value {
+    serde_json::json!({
+        "id": endpoint.id,
+        "label": endpoint.label,
+        "direction": endpoint.direction,
+        "locality": endpoint.locality,
+        "device_id": endpoint.device_id,
+        "ready": endpoint.ready,
+        "blocked_by": endpoint.blocked_by,
+    })
+}
+
+fn run_voice_command(action: &VoiceCmd) -> Result<(), String> {
+    use daemon::remote::voice_route;
+    let paths = daemon::store::DaemonPaths::resolve()?;
+    match action {
+        VoiceCmd::Endpoints { json } => {
+            let endpoints = voice_route::endpoints(&paths)?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({
+                            "endpoints": endpoints.iter().map(voice_endpoint_json).collect::<Vec<_>>()
+                        })
+                    ).map_err(|error| error.to_string())?
+                );
+            } else {
+                for endpoint in endpoints {
+                    println!(
+                        "{:<7} {:<7} {:<5} {}{}",
+                        endpoint.direction,
+                        endpoint.locality,
+                        if endpoint.ready { "ready" } else { "no" },
+                        endpoint.id,
+                        endpoint.blocked_by.as_deref().map(|reason| format!(" — {reason}")).unwrap_or_default(),
+                    );
+                }
+            }
+            Ok(())
+        }
+        VoiceCmd::Route(route) => match route {
+            VoiceRouteCmd::Get { session_id, json } => {
+                let route = voice_route::route(&paths, session_id)?;
+                let value = route.as_ref().map(voice_route::route_json);
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?);
+                } else if let Some(route) = route {
+                    println!("{} generation={} {} -> {} ({})", route.session_id, route.generation, route.input_endpoint, route.output_endpoint, route.state);
+                } else {
+                    println!("No voice route for {session_id}.");
+                }
+                Ok(())
+            }
+            VoiceRouteCmd::Set { session_id, input, output, engine, json } => {
+                let route = voice_route::set_route(&paths, session_id, engine, input, output, daemon::remote::now_ms_public()?)?;
+                let value = voice_route::route_json(&route);
+                if *json { println!("{}", serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?); }
+                else { println!("{} generation={} {} -> {}", route.session_id, route.generation, route.input_endpoint, route.output_endpoint); }
+                Ok(())
+            }
+            VoiceRouteCmd::Move { session_id, input, output, json } => {
+                let current = voice_route::route(&paths, session_id)?.ok_or_else(|| format!("No active voice route for '{session_id}'"))?;
+                let route = voice_route::set_route(
+                    &paths,
+                    session_id,
+                    &current.engine,
+                    input.as_deref().unwrap_or(&current.input_endpoint),
+                    output.as_deref().unwrap_or(&current.output_endpoint),
+                    daemon::remote::now_ms_public()?,
+                )?;
+                let value = voice_route::route_json(&route);
+                if *json { println!("{}", serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?); }
+                else { println!("{} generation={} {} -> {}", route.session_id, route.generation, route.input_endpoint, route.output_endpoint); }
+                Ok(())
+            }
+            VoiceRouteCmd::Stop { session_id, json } => {
+                let route = voice_route::stop_route(&paths, session_id, daemon::remote::now_ms_public()?)?;
+                let value = route.as_ref().map(voice_route::route_json);
+                if *json { println!("{}", serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?); }
+                else { println!("Stopped voice route for {session_id}."); }
+                Ok(())
+            }
+            VoiceRouteCmd::Events { session_id, after, limit, json } => {
+                let events = voice_route::events(&paths, session_id, *after, *limit)?;
+                let values = events.iter().map(voice_route::event_json).collect::<Vec<_>>();
+                if *json { println!("{}", serde_json::to_string_pretty(&values).map_err(|error| error.to_string())?); }
+                else {
+                    for event in events { println!("{} g{} {}", event.event_id, event.generation, event.kind); }
+                }
+                Ok(())
+            }
+            VoiceRouteCmd::Emit { session_id, generation, kind, payload_json } => {
+                let payload: serde_json::Value = serde_json::from_str(payload_json)
+                    .map_err(|error| format!("Invalid voice route event JSON: {error}"))?;
+                let event = voice_route::append_event(
+                    &paths, session_id, *generation, kind, &payload, daemon::remote::now_ms_public()?
+                )?;
+                println!("{}", serde_json::to_string(&voice_route::event_json(&event)).map_err(|error| error.to_string())?);
+                Ok(())
+            }
+        },
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -1721,6 +1895,7 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             }
         }
         Cmd::Daemon(action) => daemon::run(cli, action).await,
+        Cmd::Voice(action) => run_voice_command(action),
         Cmd::Skills(action) => {
             let data_dir = app_data_dir()
                 .ok_or_else(|| "Could not resolve the app data directory".to_string());

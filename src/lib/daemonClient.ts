@@ -392,6 +392,66 @@ export const remoteDeviceCommands = (deviceId: string, limit = 20) =>
 export const remoteDeviceCancel = (commandId: string) =>
   invoke<string>("remote_device_cancel", { commandId });
 
+export type AudioEndpointDirection = "input" | "output";
+export type AudioEndpointLocality = "local" | "paired";
+export type VoiceRouteEngine = "pipeline" | "realtime";
+
+export interface AudioEndpointDescriptor {
+  id: string;
+  label: string;
+  direction: AudioEndpointDirection;
+  locality: AudioEndpointLocality;
+  device_id: string | null;
+  ready: boolean;
+  blocked_by: string | null;
+}
+
+export interface VoiceRouteRecord {
+  session_id: string;
+  route_id: string;
+  generation: number;
+  engine: VoiceRouteEngine;
+  input_endpoint: string;
+  output_endpoint: string;
+  state: "active" | "stopped";
+  input_command_id: string | null;
+  output_command_id: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface VoiceRouteEvent {
+  event_id: number;
+  session_id: string;
+  generation: number;
+  kind: string;
+  payload: unknown;
+  created_at_ms: number;
+}
+
+export const voiceRouteEndpoints = () =>
+  invoke<{ endpoints: AudioEndpointDescriptor[] }>("voice_route_endpoints");
+export const voiceRouteGet = (sessionId: string) =>
+  invoke<VoiceRouteRecord | null>("voice_route_get", { sessionId });
+export const voiceRouteSet = (
+  sessionId: string,
+  input: string,
+  output: string,
+  engine: VoiceRouteEngine,
+) => invoke<VoiceRouteRecord>("voice_route_set", { sessionId, input, output, engine });
+export const voiceRouteMove = (sessionId: string, input?: string, output?: string) =>
+  invoke<VoiceRouteRecord>("voice_route_move", { sessionId, input: input ?? null, output: output ?? null });
+export const voiceRouteStop = (sessionId: string) =>
+  invoke<VoiceRouteRecord | null>("voice_route_stop", { sessionId });
+export const voiceRouteEvents = (sessionId: string, after = 0, limit = 100) =>
+  invoke<VoiceRouteEvent[]>("voice_route_events", { sessionId, after, limit });
+export const voiceRouteEmit = (
+  sessionId: string,
+  generation: number,
+  kind: string,
+  payload: unknown,
+) => invoke<VoiceRouteEvent>("voice_route_emit", { sessionId, generation, kind, payload });
+
 /** One node this machine may place work on, as `monkey daemon remote node-list --json` reports it (roadmap K17 S1). */
 export interface RemoteNodeRow {
   alias: string;

@@ -17,6 +17,7 @@ import { type TalkState } from '../../lib/talkEngine';
 import { Button, IconButton } from '../ui';
 import { useTalkSession } from './useTalkSession';
 import { RealtimeTalkPanel } from './RealtimeTalkPanel';
+import { VoiceRouteSelector } from './VoiceRouteSelector';
 
 const STATE_LABEL: Record<TalkState, string> = {
   off: 'Not listening',
@@ -152,6 +153,7 @@ function PipelineTalkPanel({
       )}
 
       <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
+        <VoiceRouteSelector sessionId={sessionId} engine="pipeline" />
         <div className="rounded-lg border border-border bg-surface p-3">
           <p className="text-xs font-medium text-muted">What you said</p>
           <p className="mt-1 min-h-6 text-sm">

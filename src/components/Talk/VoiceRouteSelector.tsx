@@ -1,0 +1,159 @@
+import { Loader2, RefreshCw } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+
+import { companionClient, type VoiceConfig } from '../../lib/companionClient';
+import {
+  type AudioEndpointDescriptor,
+  type VoiceRouteEngine,
+  type VoiceRouteRecord,
+  voiceRouteEndpoints,
+  voiceRouteGet,
+  voiceRouteSet,
+} from '../../lib/daemonClient';
+import { errorMessage } from '../../lib/errors';
+import { IconButton } from '../ui';
+
+const localId = (direction: 'input' | 'output', id: string | null | undefined) =>
+  `local:${direction}:${id || 'default'}`;
+
+async function localEndpoints(): Promise<AudioEndpointDescriptor[]> {
+  if (!navigator.mediaDevices?.enumerateDevices) return [];
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  return devices
+    .filter((device) => device.kind === 'audioinput' || device.kind === 'audiooutput')
+    .map((device, index) => ({
+      id: localId(device.kind === 'audioinput' ? 'input' : 'output', device.deviceId),
+      label:
+        device.label ||
+        `${device.kind === 'audioinput' ? 'Microphone' : 'Speaker'} ${index + 1}`,
+      direction: device.kind === 'audioinput' ? 'input' : 'output',
+      locality: 'local',
+      device_id: null,
+      ready: true,
+      blocked_by: null,
+    }));
+}
+
+function defaultRoute(voice: VoiceConfig): Pick<VoiceRouteRecord, 'input_endpoint' | 'output_endpoint'> {
+  return {
+    input_endpoint: localId('input', voice.inputDeviceId),
+    output_endpoint: localId('output', voice.outputDeviceId),
+  };
+}
+
+export function VoiceRouteSelector({
+  sessionId,
+  engine,
+  disabled = false,
+  onRoute,
+}: {
+  sessionId: string;
+  engine: VoiceRouteEngine;
+  disabled?: boolean;
+  onRoute?: (route: VoiceRouteRecord) => void;
+}) {
+  const [endpoints, setEndpoints] = useState<AudioEndpointDescriptor[]>([]);
+  const [route, setRoute] = useState<VoiceRouteRecord | null>(null);
+  const [fallback, setFallback] = useState<Pick<VoiceRouteRecord, 'input_endpoint' | 'output_endpoint'> | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const [remote, local, saved, config] = await Promise.all([
+        voiceRouteEndpoints(),
+        localEndpoints().catch(() => []),
+        voiceRouteGet(sessionId).catch(() => null),
+        companionClient.config(),
+      ]);
+      // The daemon advertises generic local defaults for CLI users. The webview
+      // knows the actual MediaDeviceInfo ids, so prefer those here and keep the
+      // generic default only when the browser cannot enumerate that direction.
+      const merged = [...local];
+      for (const endpoint of remote.endpoints) {
+        if (endpoint.locality === 'paired') merged.push(endpoint);
+      }
+      if (!merged.some((endpoint) => endpoint.direction === 'input')) {
+        merged.push(remote.endpoints.find((endpoint) => endpoint.id === 'local:input:default')!);
+      }
+      if (!merged.some((endpoint) => endpoint.direction === 'output')) {
+        merged.push(remote.endpoints.find((endpoint) => endpoint.id === 'local:output:default')!);
+      }
+      setEndpoints(merged.filter(Boolean));
+      setFallback(defaultRoute(config.voice));
+      setRoute(saved?.state === 'active' ? saved : null);
+      if (saved?.state === 'active') onRoute?.(saved);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  }, [onRoute, sessionId]);
+
+  useEffect(() => {
+    void refresh();
+    const listener = () => void refresh();
+    navigator.mediaDevices?.addEventListener?.('devicechange', listener);
+    return () => navigator.mediaDevices?.removeEventListener?.('devicechange', listener);
+  }, [refresh]);
+
+  const input = route?.input_endpoint ?? fallback?.input_endpoint ?? 'local:input:default';
+  const output = route?.output_endpoint ?? fallback?.output_endpoint ?? 'local:output:default';
+  const inputs = useMemo(() => endpoints.filter((endpoint) => endpoint.direction === 'input'), [endpoints]);
+  const outputs = useMemo(() => endpoints.filter((endpoint) => endpoint.direction === 'output'), [endpoints]);
+
+  const apply = async (nextInput: string, nextOutput: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await voiceRouteSet(sessionId, nextInput, nextOutput, engine);
+      setRoute(next);
+      onRoute?.(next);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-wrap items-end gap-2 rounded-md border border-border bg-background p-2">
+      <label className="min-w-48 flex-1 text-[11px] text-muted">
+        Microphone
+        <select
+          className="mt-1 w-full rounded border border-border bg-surface px-2 py-1.5 text-xs text-foreground"
+          value={input}
+          disabled={disabled || busy}
+          onChange={(event) => void apply(event.target.value, output)}
+        >
+          {inputs.map((endpoint) => (
+            <option key={endpoint.id} value={endpoint.id} disabled={!endpoint.ready}>
+              {endpoint.label}{endpoint.ready ? '' : ` — ${endpoint.blocked_by ?? 'not ready'}`}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="min-w-48 flex-1 text-[11px] text-muted">
+        Speaker
+        <select
+          className="mt-1 w-full rounded border border-border bg-surface px-2 py-1.5 text-xs text-foreground"
+          value={output}
+          disabled={disabled || busy}
+          onChange={(event) => void apply(input, event.target.value)}
+        >
+          {outputs.map((endpoint) => (
+            <option key={endpoint.id} value={endpoint.id} disabled={!endpoint.ready}>
+              {endpoint.label}{endpoint.ready ? '' : ` — ${endpoint.blocked_by ?? 'not ready'}`}
+            </option>
+          ))}
+        </select>
+      </label>
+      <IconButton size="sm" aria-label="Refresh audio endpoints" disabled={busy} onClick={() => void refresh()}>
+        {busy ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+      </IconButton>
+      {error && <p role="alert" className="w-full text-[11px] text-danger">{error}</p>}
+    </div>
+  );
+}
