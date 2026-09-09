@@ -148,17 +148,19 @@ fn cancel_command(store: &mut RemoteStore, command_id: Option<&str>, now_ms: u64
     }
 }
 
-fn retire_input_command(
+fn retire_command(
     store: &mut RemoteStore,
     command_id: Option<&str>,
     now_ms: u64,
+    role: &str,
 ) -> Result<(), String> {
     let Some(command_id) = command_id else { return Ok(()); };
     store.request_device_cancel(command_id, now_ms)?;
-    // The device's physical executor watches `cancel_requested` while a routed
-    // microphone is running. Do not return control to a handoff until that old
-    // owner has acknowledged termination, otherwise a newly selected endpoint
-    // could overlap it for one lease tick.
+    // The physical executor watches `cancel_requested` while a routed role is
+    // running. A handoff does not commit its next generation until the previous
+    // owner has acknowledged termination. That keeps microphone ownership
+    // exclusive and also prevents old speaker work from bleeding into the new
+    // route after the UI already says the move completed.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let Some(command) = store.device_command(command_id)? else { return Ok(()); };
@@ -166,7 +168,9 @@ fn retire_input_command(
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            return Err("The previous VoiceRoute microphone did not release within 5 seconds; the new microphone was not activated".to_string());
+            return Err(format!(
+                "The previous VoiceRoute {role} did not release within 5 seconds; the new route was not committed"
+            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -238,9 +242,19 @@ pub fn set_route(
     // to acknowledge cancellation before minting the new generation, so there
     // is never an intentional two-microphone ownership window.
     if let Some(previous) = previous.as_ref() {
-        retire_input_command(&mut store, previous.input_command_id.as_deref(), now_ms)?;
+        retire_command(
+            &mut store,
+            previous.input_command_id.as_deref(),
+            now_ms,
+            "microphone",
+        )?;
         if previous.output_command_id != previous.input_command_id {
-            cancel_command(&mut store, previous.output_command_id.as_deref(), now_ms);
+            retire_command(
+                &mut store,
+                previous.output_command_id.as_deref(),
+                now_ms,
+                "speaker",
+            )?;
         }
     }
     store.replace_voice_route(
@@ -315,13 +329,88 @@ pub fn activate_route(paths: &DaemonPaths, session_id: &str, now_ms: u64) -> Res
             output_command_id = input_command_id.clone();
         }
     }
-    store.set_voice_route_commands(
+    match store.set_voice_route_commands(
         session_id,
         route.generation,
         input_command_id.as_deref(),
         output_command_id.as_deref(),
         now_ms,
-    )
+    ) {
+        Ok(route) => Ok(route),
+        Err(error) => {
+            cancel_command(&mut store, input_command_id.as_deref(), now_ms);
+            if output_command_id != input_command_id {
+                cancel_command(&mut store, output_command_id.as_deref(), now_ms);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Changes a route that may already be live. Selection itself stays privacy
+/// preserving — an inactive route never opens a microphone — but when an old
+/// generation already owns a paired role this performs the full handoff before
+/// returning. A failed destination activation rolls forward to a fresh
+/// generation containing the previous endpoints and re-acquires those roles.
+/// Reusing the old generation would make delayed frames from the failed move
+/// indistinguishable from current media, so rollback is deliberately another
+/// generation rather than a database rewind.
+pub fn move_route(
+    paths: &DaemonPaths,
+    session_id: &str,
+    input: Option<&str>,
+    output: Option<&str>,
+    now_ms: u64,
+) -> Result<VoiceRouteRecord, String> {
+    let previous = route(paths, session_id)?
+        .ok_or_else(|| format!("No active voice route for '{session_id}'"))?;
+    let was_live = previous.input_command_id.is_some() || previous.output_command_id.is_some();
+    let selected = set_route(
+        paths,
+        session_id,
+        &previous.engine,
+        input.unwrap_or(&previous.input_endpoint),
+        output.unwrap_or(&previous.output_endpoint),
+        now_ms,
+    )?;
+    if !was_live {
+        return Ok(selected);
+    }
+    match activate_route(paths, session_id, now_ms) {
+        Ok(active) => Ok(active),
+        Err(activation_error) => {
+            // Best effort retirement of anything the failed activation managed
+            // to publish. `activate_route` also cancels its local command ids
+            // on failure, but reading the authoritative row here closes the
+            // race where command ids were committed immediately before another
+            // endpoint rejected.
+            if let Ok(mut store) = RemoteStore::open(&paths.root) {
+                if let Ok(Some(failed)) = store.voice_route(session_id) {
+                    cancel_command(&mut store, failed.input_command_id.as_deref(), now_ms);
+                    if failed.output_command_id != failed.input_command_id {
+                        cancel_command(&mut store, failed.output_command_id.as_deref(), now_ms);
+                    }
+                }
+                let _ = store.replace_voice_route(
+                    session_id,
+                    &previous.engine,
+                    &previous.input_endpoint,
+                    &previous.output_endpoint,
+                    None,
+                    None,
+                    now_ms,
+                );
+            }
+            match activate_route(paths, session_id, now_ms) {
+                Ok(_) => Err(format!(
+                    "VoiceRoute handoff failed ({activation_error}); the previous endpoints were restored under a fresh generation"
+                )),
+                Err(rollback_error) => Err(format!(
+                    "VoiceRoute handoff failed ({activation_error}); restoring the previous endpoints also failed ({rollback_error})"
+                )),
+            }
+        }
+    }
 }
 
 pub fn deactivate_route(paths: &DaemonPaths, session_id: &str, now_ms: u64) -> Result<Option<VoiceRouteRecord>, String> {

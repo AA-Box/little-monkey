@@ -51,5 +51,14 @@
     "frame_sequence": 5,
     "type": "interrupt",
     "reason": "barge_in"
+  },
+  {
+    "protocol_version": 5,
+    "session_id": "mobile-device-Ab_3-xY",
+    "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+    "frame_sequence": 6,
+    "type": "playback_ack",
+    "audio_sequence": 7,
+    "played": true
   }
 ]

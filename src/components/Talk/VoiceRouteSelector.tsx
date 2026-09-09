@@ -8,6 +8,7 @@ import {
   type VoiceRouteRecord,
   voiceRouteEndpoints,
   voiceRouteGet,
+  voiceRouteMove,
   voiceRouteSet,
 } from '../../lib/daemonClient';
 import { errorMessage } from '../../lib/errors';
@@ -108,11 +109,24 @@ export function VoiceRouteSelector({
     setBusy(true);
     setError(null);
     try {
-      const next = await voiceRouteSet(sessionId, nextInput, nextOutput, engine);
+      const next = route
+        ? await voiceRouteMove(
+            sessionId,
+            nextInput === input ? undefined : nextInput,
+            nextOutput === output ? undefined : nextOutput,
+          )
+        : await voiceRouteSet(sessionId, nextInput, nextOutput, engine);
       setRoute(next);
       onRoute?.(next);
     } catch (reason) {
       setError(errorMessage(reason));
+      // A failed live move may have rolled back under a newer generation. Read
+      // the daemon's authoritative selection before rendering another choice.
+      const restored = await voiceRouteGet(sessionId).catch(() => null);
+      if (restored?.state === 'active') {
+        setRoute(restored);
+        onRoute?.(restored);
+      }
     } finally {
       setBusy(false);
     }

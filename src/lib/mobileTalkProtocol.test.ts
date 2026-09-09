@@ -589,6 +589,7 @@ describe("the frames the runner will actually receive", () => {
       frames.audio({ audioBase64: "AAECAwQ=", last: false }),
       frames.audio({ audioBase64: "BQYHCA==", last: true }),
       frames.interrupt("barge_in"),
+      frames.playbackAck(7, true),
     ];
 
     const fixture = fileURLToPath(

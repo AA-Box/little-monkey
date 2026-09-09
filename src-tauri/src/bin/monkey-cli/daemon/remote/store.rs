@@ -1685,6 +1685,62 @@ impl RemoteStore {
         self.voice_route(session_id)
     }
 
+    fn validate_voice_route_event(kind: &str, payload: &serde_json::Value) -> Result<(), String> {
+        const KINDS: &[&str] = &[
+            "input_ready",
+            "output_ready",
+            "input_transcript",
+            "assistant_delta",
+            "turn_finished",
+            "turn_failed",
+            "host_interrupt",
+            "interrupt",
+            "speak_text",
+            "output_stop",
+            "output_played",
+            "output_failed",
+            // Realtime bridge lifecycle is metadata only. The actual PCM
+            // crosses the in-memory bridge and must never use this ledger.
+            "realtime_bridge_ready",
+            "realtime_input_started",
+            "realtime_input_ended",
+            "realtime_output_started",
+            "realtime_output_ended",
+            "realtime_bridge_closed",
+        ];
+        if !KINDS.contains(&kind) {
+            return Err(format!("Unknown VoiceRoute coordination event '{kind}'"));
+        }
+        if !payload.is_object() {
+            return Err("VoiceRoute coordination event payload must be a JSON object".to_string());
+        }
+        fn contains_media(value: &serde_json::Value) -> bool {
+            match value {
+                serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+                    let key = key.to_ascii_lowercase();
+                    matches!(
+                        key.as_str(),
+                        "audio"
+                            | "audio_base64"
+                            | "audio_bytes"
+                            | "raw_audio"
+                            | "pcm"
+                            | "pcm_base64"
+                            | "media_base64"
+                            | "chunk_base64"
+                            | "waveform"
+                    ) || contains_media(value)
+                }),
+                serde_json::Value::Array(values) => values.iter().any(contains_media),
+                _ => false,
+            }
+        }
+        if contains_media(payload) {
+            return Err("VoiceRoute coordination events may not contain raw or encoded media".to_string());
+        }
+        Ok(())
+    }
+
     pub fn append_voice_route_event(
         &mut self,
         session_id: &str,
@@ -1698,6 +1754,7 @@ impl RemoteStore {
         if route.state != "active" || route.generation != generation {
             return Err("Voice route generation is stale".to_string());
         }
+        Self::validate_voice_route_event(kind, payload)?;
         if kind.is_empty() || kind.len() > 64 || !kind.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')) {
             return Err("Voice route event kind is invalid".to_string());
         }
@@ -3735,6 +3792,101 @@ mod tests {
             max_artifact_bytes: 1_024,
         };
         (root, store, FakeSecrets::default(), scopes)
+    }
+
+
+    #[test]
+    fn voice_route_coordination_log_rejects_media_and_stale_generations() {
+        let (root, mut store, _secrets, _scopes) = fixture();
+        let route = store
+            .replace_voice_route(
+                "chat-route-privacy",
+                "pipeline",
+                "local:input:default",
+                "local:output:default",
+                None,
+                None,
+                1_000,
+            )
+            .unwrap();
+        store
+            .append_voice_route_event(
+                &route.session_id,
+                route.generation,
+                "input_ready",
+                &serde_json::json!({"command_id": "command-one", "device_id": "phone-one"}),
+                1_001,
+            )
+            .unwrap();
+        let media = store.append_voice_route_event(
+            &route.session_id,
+            route.generation,
+            "assistant_delta",
+            &serde_json::json!({"turn_id": "turn-one", "audio_base64": "AAECAw=="}),
+            1_002,
+        );
+        assert!(media.unwrap_err().contains("may not contain raw or encoded media"));
+        let unknown = store.append_voice_route_event(
+            &route.session_id,
+            route.generation,
+            "audio_chunk",
+            &serde_json::json!({"sequence": 1}),
+            1_003,
+        );
+        assert!(unknown.unwrap_err().contains("Unknown VoiceRoute coordination event"));
+        let next = store
+            .replace_voice_route(
+                &route.session_id,
+                "pipeline",
+                "local:input:default",
+                "local:output:default",
+                None,
+                None,
+                1_004,
+            )
+            .unwrap();
+        assert!(next.generation > route.generation);
+        let stale = store.append_voice_route_event(
+            &route.session_id,
+            route.generation,
+            "turn_finished",
+            &serde_json::json!({"turn_id": "turn-one"}),
+            1_005,
+        );
+        assert_eq!(stale.unwrap_err(), "Voice route generation is stale");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn voice_route_coordination_log_is_bounded() {
+        let (root, mut store, _secrets, _scopes) = fixture();
+        let route = store
+            .replace_voice_route(
+                "chat-route-bounded",
+                "pipeline",
+                "local:input:default",
+                "local:output:default",
+                None,
+                None,
+                2_000,
+            )
+            .unwrap();
+        for index in 0..520u64 {
+            store
+                .append_voice_route_event(
+                    &route.session_id,
+                    route.generation,
+                    "turn_finished",
+                    &serde_json::json!({"turn_id": format!("turn-{index}")}),
+                    2_001 + index,
+                )
+                .unwrap();
+        }
+        let events = store.voice_route_events(&route.session_id, 0, 512).unwrap();
+        assert_eq!(events.len(), 512);
+        assert_eq!(events.first().unwrap().payload["turn_id"], "turn-8");
+        assert_eq!(events.last().unwrap().payload["turn_id"], "turn-519");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

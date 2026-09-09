@@ -692,13 +692,11 @@ fn run_voice_command(action: &VoiceCmd) -> Result<(), String> {
                 Ok(())
             }
             VoiceRouteCmd::Move { session_id, input, output, json } => {
-                let current = voice_route::route(&paths, session_id)?.ok_or_else(|| format!("No active voice route for '{session_id}'"))?;
-                let route = voice_route::set_route(
+                let route = voice_route::move_route(
                     &paths,
                     session_id,
-                    &current.engine,
-                    input.as_deref().unwrap_or(&current.input_endpoint),
-                    output.as_deref().unwrap_or(&current.output_endpoint),
+                    input.as_deref(),
+                    output.as_deref(),
                     daemon::remote::now_ms_public()?,
                 )?;
                 let value = voice_route::route_json(&route);
