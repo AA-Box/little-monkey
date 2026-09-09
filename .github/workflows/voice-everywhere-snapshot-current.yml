@@ -1,0 +1,22 @@
+name: Voice Everywhere Snapshot Current
+
+on:
+  push:
+    branches:
+      - feat/voice-everywhere-stage3
+  workflow_dispatch:
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/voice-everywhere
+          fetch-depth: 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-everywhere-current
+          path: .
+          include-hidden-files: true
+          retention-days: 1
