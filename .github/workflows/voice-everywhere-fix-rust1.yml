@@ -1,0 +1,39 @@
+name: Voice Everywhere Fix Rust 1
+
+on:
+  push:
+    branches:
+      - feat/voice-everywhere-stage8
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/voice-everywhere
+          fetch-depth: 0
+      - name: Fix route event id error conversion and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src-tauri/src/bin/monkey-cli/daemon/remote/store.rs')
+          s = p.read_text()
+          old = '        from_i64(value)\n    }\n\n    pub fn voice_route_events'
+          new = '        from_i64(value).map_err(|error| error.to_string())\n    }\n\n    pub fn voice_route_events'
+          if old not in s:
+              raise SystemExit('expected Rust source not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src-tauri/src/bin/monkey-cli/daemon/remote/store.rs
+          git commit -m "fix(voice): normalize route event id errors"
+          git push origin HEAD:feat/voice-everywhere
