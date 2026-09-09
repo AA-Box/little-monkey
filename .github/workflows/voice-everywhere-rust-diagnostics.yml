@@ -29,3 +29,5 @@ jobs:
         run: node scripts/ensure-cli-sidecar-placeholder.mjs
       - name: Rust check
         run: cargo check --quiet --manifest-path src-tauri/Cargo.toml --bin monkey-cli
+
+# rerun after route event id fix
