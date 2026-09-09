@@ -1,0 +1,191 @@
+ecord>, String> {
++    RemoteStore::open(&paths.root)?.voice_route_events(session_id, after, limit)
++}
++
++pub fn route_json(route: &VoiceRouteRecord) -> serde_json::Value {
++    serde_json::json!({
++        "session_id": route.session_id,
++        "route_id": route.route_id,
++        "generation": route.generation,
++        "engine": route.engine,
++        "input_endpoint": route.input_endpoint,
++        "output_endpoint": route.output_endpoint,
++        "state": route.state,
++        "input_command_id": route.input_command_id,
++        "output_command_id": route.output_command_id,
++        "created_at_ms": route.created_at_ms,
++        "updated_at_ms": route.updated_at_ms,
++    })
++}
++
++pub fn event_json(event: &VoiceRouteEventRecord) -> serde_json::Value {
++    serde_json::json!({
++        "event_id": event.event_id,
++        "session_id": event.session_id,
++        "generation": event.generation,
++        "kind": event.kind,
++        "payload": event.payload,
++        "created_at_ms": event.created_at_ms,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn endpoint_ids_are_directional_and_round_trip() {
++        for value in [
++            LOCAL_INPUT_DEFAULT,
++            LOCAL_OUTPUT_DEFAULT,
++            "paired:device-phone:input",
++            "paired:device-phone:output",
++            "local:input:BuiltInMic",
++            "local:output:BuiltInSpeaker",
++        ] {
++            assert_eq!(AudioEndpoint::parse(value).unwrap().token(), value);
++        }
++        assert!(AudioEndpoint::parse("paired:device-phone").is_err());
++    }
++}
+diff --git a/src-tauri/src/bin/monkey-cli/main.rs b/src-tauri/src/bin/monkey-cli/main.rs
+index d2fa155..0041663 100644
+--- a/src-tauri/src/bin/monkey-cli/main.rs
++++ b/src-tauri/src/bin/monkey-cli/main.rs
+@@ -520,6 +520,9 @@ enum Cmd {
+     /// Explicitly installed persistent local background-agent service.
+     #[command(subcommand)]
+     Daemon(daemon::DaemonCmd),
++    /// Route Talk microphones and speakers across this computer and paired devices.
++    #[command(subcommand)]
++    Voice(VoiceCmd),
+     /// Discover, preview, install, update, disable, and roll back data-only SKILL.md skills.
+     #[command(subcommand)]
+     Skills(skills_cli::SkillsCmd),
+@@ -554,6 +557,177 @@ enum Cmd {
+     Profiles(profiles_cli::ProfilesCmd),
+ }
+ 
++#[derive(Subcommand, Debug)]
++enum VoiceCmd {
++    /// List local defaults and every paired microphone/speaker with readiness.
++    Endpoints {
++        #[arg(long)]
++        json: bool,
++    },
++    /// Inspect or change the route bound to one ordinary conversation.
++    #[command(subcommand)]
++    Route(VoiceRouteCmd),
++}
++
++#[derive(Subcommand, Debug)]
++enum VoiceRouteCmd {
++    Get {
++        session_id: String,
++        #[arg(long)]
++        json: bool,
++    },
++    Set {
++        session_id: String,
++        #[arg(long)]
++        input: String,
++        #[arg(long)]
++        output: String,
++        #[arg(long, default_value = "pipeline")]
++        engine: String,
++        #[arg(long)]
++        json: bool,
++    },
++    Move {
++        session_id: String,
++        #[arg(long)]
++        input: Option<String>,
++        #[arg(long)]
++        output: Option<String>,
++        #[arg(long)]
++        json: bool,
++    },
++    Stop {
++        session_id: String,
++        #[arg(long)]
++        json: bool,
++    },
++    Events {
++        session_id: String,
++        #[arg(long, default_value_t = 0)]
++        after: u64,
++        #[arg(long, default_value_t = 100)]
++        limit: u32,
++        #[arg(long)]
++        json: bool,
++    },
++    /// Internal/controller bridge for bounded route coordination events.
++    #[command(hide = true)]
++    Emit {
++        session_id: String,
++        #[arg(long)]
++        generation: u64,
++        #[arg(long)]
++        kind: String,
++        #[arg(long)]
++        payload_json: String,
++    },
++}
++
++fn voice_endpoint_json(endpoint: &daemon::remote::voice_route::EndpointDescriptor) -> serde_json::Value {
++    serde_json::json!({
++        "id": endpoint.id,
++        "label": endpoint.label,
++        "direction": endpoint.direction,
++        "locality": endpoint.locality,
++        "device_id": endpoint.device_id,
++        "ready": endpoint.ready,
++        "blocked_by": endpoint.blocked_by,
++    })
++}
++
++fn run_voice_command(action: &VoiceCmd) -> Result<(), String> {
++    use daemon::remote::voice_route;
++    let paths = daemon::store::DaemonPaths::resolve()?;
++    match action {
++        VoiceCmd::Endpoints { json } => {
++            let endpoints = voice_route::endpoints(&paths)?;
++            if *json {
++                println!(
++                    "{}",
++                    serde_json::to_string_pretty(
++                        &serde_json::json!({
++                            "endpoints": endpoints.iter().map(voice_endpoint_json).collect::<Vec<_>>()
++                        })
++                    ).map_err(|error| error.to_string())?
++                );
++            } else {
++                for endpoint in endpoints {
++                    println!(
++                        "{:<7} {:<7} {:<5} {}{}",
++                        endpoint.direction,
++                        endpoint.locality,
++                        if endpoint.ready { "ready" } else { "no" },
++                        endpoint.id,
++                        endpoint.blocked_by.as_deref().map(|reason| format!(" — {reason}")).unwrap_or_default(),
++                    );
++                }
++            }
++            Ok(())
++        }
++        VoiceCmd::Route(route) => match route {
++            VoiceRouteCmd::Get { session_id, json } => {
++                let route = voice_route::route(&paths, session_id)?;
++                let value = route.as_ref().map(voice_route::route_json);
++                if *json {
++                    println!("{}", serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?);
++                } else if let Some(route) = route {
++                    println!("{} generation={} {} -> {} ({})", route.session_id, route.generation, route.input_endpoint, route.output_endpoint, route.state);
++                } else {
++                    println!("No voice route for {session_id}.");
++                }
++                Ok(())
++            }
++            VoiceRouteCmd::Set { session_id, input, output, engine, json } => {
++                let route = voice_route::set_route(&paths, session_id, engine, input, output, daemon::remote::now_ms_public()?)?;
++        
