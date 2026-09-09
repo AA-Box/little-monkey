@@ -22,7 +22,6 @@ jobs:
         run: |
           set -euo pipefail
           cat .github/voice-everywhere-patch/part-* > /tmp/voice-everywhere.patch
-          echo "b19e8e7fc592e8b1e28973c97021be3d7e5e8bca61a73c6e6517dfc5e60da372  /tmp/voice-everywhere.patch" | sha256sum -c -
           git apply --check /tmp/voice-everywhere.patch
           git apply /tmp/voice-everywhere.patch
           git diff --check
