@@ -41,3 +41,5 @@ jobs:
         run: cargo check --manifest-path src-tauri/Cargo.toml --bin monkey-cli
       - name: Rust voice tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --bin monkey-cli remote -- --nocapture
+
+# validation trigger 2
