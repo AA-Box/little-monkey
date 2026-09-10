@@ -1,0 +1,151 @@
+ &str, now_ms: u64) -> Res
+     }
+     let input = AudioEndpoint::parse(&route.input_endpoint)?;
+     let output = AudioEndpoint::parse(&route.output_endpoint)?;
+-    validate_endpoint(&store, &input)?;
+-    validate_endpoint(&store, &output)?;
++    validate_endpoint(&store, &input, now_ms)?;
++    validate_endpoint(&store, &output, now_ms)?;
+ 
+     let paired_input = match &input { AudioEndpoint::PairedInput(id) => Some(id.as_str()), _ => None };
+     let paired_output = match &output { AudioEndpoint::PairedOutput(id) => Some(id.as_str()), _ => None };
+@@ -365,6 +515,23 @@ pub fn move_route(
+     let previous = route(paths, session_id)?
+         .ok_or_else(|| format!("No active voice route for '{session_id}'"))?;
+     let was_live = previous.input_command_id.is_some() || previous.output_command_id.is_some();
++    let next_input = AudioEndpoint::parse(input.unwrap_or(&previous.input_endpoint))?;
++    let next_output = AudioEndpoint::parse(output.unwrap_or(&previous.output_endpoint))?;
++    // Real prepare phase: while the working route is still untouched, require
++    // each changed paired destination to execute a bounded, non-media command
++    // and report its current surface readiness. Only after those acknowledgements
++    // do we retire the old capture owner and commit the new generation.
++    if was_live {
++        let mut store = RemoteStore::open(&paths.root)?;
++        let next_generation = previous.generation.checked_add(1)
++            .ok_or_else(|| "Voice route generation is exhausted".to_string())?;
++        if next_input.token() != previous.input_endpoint {
++            prepare_paired_endpoint(&mut store, &next_input, session_id, &previous.route_id, next_generation, now_ms)?;
++        }
++        if next_output.token() != previous.output_endpoint {
++            prepare_paired_endpoint(&mut store, &next_output, session_id, &previous.route_id, next_generation, now_ms)?;
++        }
++    }
+     let selected = set_route(
+         paths,
+         session_id,
+diff --git a/src-tauri/src/bin/monkey-cli/fixtures/talk_client_frames.json b/src-tauri/src/bin/monkey-cli/fixtures/talk_client_frames.json
+index ff0a450..1af0c6d 100644
+--- a/src-tauri/src/bin/monkey-cli/fixtures/talk_client_frames.json
++++ b/src-tauri/src/bin/monkey-cli/fixtures/talk_client_frames.json
+@@ -1,6 +1,6 @@
+ [
+   {
+-    "protocol_version": 5,
++    "protocol_version": 6,
+     "session_id": "mobile-device-Ab_3-xY",
+     "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+     "frame_sequence": 1,
+@@ -10,7 +10,7 @@
+     "channels": 1
+   },
+   {
+-    "protocol_version": 5,
++    "protocol_version": 6,
+     "session_id": "mobile-device-Ab_3-xY",
+     "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+     "frame_sequence": 2,
+@@ -21,7 +21,7 @@
+     "upload_ms": 96
+   },
+   {
+-    "protocol_version": 5,
++    "protocol_version": 6,
+     "session_id": "mobile-device-Ab_3-xY",
+     "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+     "frame_sequence": 3,
+@@ -33,7 +33,7 @@
+     "utterance_id": "utt-fixed-for-tests"
+   },
+   {
+-    "protocol_version": 5,
++    "protocol_version": 6,
+     "session_id": "mobile-device-Ab_3-xY",
+     "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+     "frame_sequence": 4,
+@@ -45,7 +45,7 @@
+     "utterance_id": "utt-fixed-for-tests"
+   },
+   {
+-    "protocol_version": 5,
++    "protocol_version": 6,
+     "session_id": "mobile-device-Ab_3-xY",
+     "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+     "frame_sequence": 5,
+@@ -53,7 +53,7 @@
+     "reason": "barge_in"
+   },
+   {
+-    "protocol_version": 5,
++    "protocol_version": 6,
+     "session_id": "mobile-device-Ab_3-xY",
+     "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+     "frame_sequence": 6,
+diff --git a/src-tauri/src/bin/monkey-cli/main.rs b/src-tauri/src/bin/monkey-cli/main.rs
+index 2b04393..d1ba034 100644
+--- a/src-tauri/src/bin/monkey-cli/main.rs
++++ b/src-tauri/src/bin/monkey-cli/main.rs
+@@ -637,7 +637,18 @@ fn voice_endpoint_json(endpoint: &daemon::remote::voice_route::EndpointDescripto
+         "direction": endpoint.direction,
+         "locality": endpoint.locality,
+         "device_id": endpoint.device_id,
++        "input_supported": endpoint.input_supported,
++        "output_supported": endpoint.output_supported,
++        "voice_stream_supported": endpoint.voice_stream_supported,
++        "os_permission": endpoint.os_permission,
++        "readiness": endpoint.readiness,
++        "foreground_required": endpoint.foreground_required,
++        "interaction_required": endpoint.interaction_required,
++        "online": endpoint.online,
++        "last_seen_at_ms": endpoint.last_seen_at_ms,
++        "latency_ms": endpoint.latency_ms,
+         "ready": endpoint.ready,
++        "blocked_code": endpoint.blocked_code,
+         "blocked_by": endpoint.blocked_by,
+     })
+ }
+diff --git a/src/components/Talk/VoiceRouteSelector.tsx b/src/components/Talk/VoiceRouteSelector.tsx
+index 126efe6..587123b 100644
+--- a/src/components/Talk/VoiceRouteSelector.tsx
++++ b/src/components/Talk/VoiceRouteSelector.tsx
+@@ -17,22 +17,70 @@ import { IconButton } from '../ui';
+ const localId = (direction: 'input' | 'output', id: string | null | undefined) =>
+   `local:${direction}:${id || 'default'}`;
+ 
++async function localMicrophonePermission(): Promise<AudioEndpointDescriptor['os_permission']> {
++  if (!navigator.permissions?.query) return 'undetermined';
++  try {
++    // `microphone` is implemented by Chromium/WebKit even though older DOM
++    // typings do not include it in PermissionName. The runtime result is the
++    // authority; an unsupported query remains fail-honest as undetermined.
++    const status = await navigator.permissions.query(
++      { name: 'microphone' } as Parameters<Permissions['query']>[0],
++    );
++    if (status.state === 'granted') return 'granted';
++    if (status.state === 'denied') return 'denied';
++    return 'promptable';
++  } catch {
++    return 'undetermined';
++  }
++}
++
+ async function localEndpoints(): Promise<AudioEndpointDescriptor[]> {
+   if (!navigator.mediaDevices?.enumerateDevices) return [];
+-  const devices = await navigator.mediaDevices.enumerateDevices();
++  const [devices, microphonePermission] = await Promise.all([
++    navigator.mediaDevices.enumerateDevices(),
++    localMicrophonePermission(),
++  ]);
+   return devices
+     .filter((device) => device.kind === 'audioinput' || device.kind === 'audiooutput')
+-    .map((device, index) => ({
+-      id: localId(device.kind === 'audioinput' ? 'input' : 'out
