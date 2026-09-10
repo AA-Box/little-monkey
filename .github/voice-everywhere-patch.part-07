@@ -1,0 +1,93 @@
+put', device.deviceId),
+-      label:
+-        device.label ||
+-        `${device.kind === 'audioinput' ? 'Microphone' : 'Speaker'} ${index + 1}`,
+-      direction: device.kind === 'audioinput' ? 'input' : 'output',
+-      locality: 'local',
+-      device_id: null,
+-      ready: true,
+-      blocked_by: null,
+-    }));
++    .map((device, index) => {
++      const input = device.kind === 'audioinput';
++      const permission = input ? microphonePermission : 'not_required';
++      const permissionBlocked = input && permission !== 'granted';
++      const denied = permission === 'denied';
++      return {
++        id: localId(input ? 'input' : 'output', device.deviceId),
++        label: device.label || `${input ? 'Microphone' : 'Speaker'} ${index + 1}`,
++        direction: input ? 'input' : 'output',
++        locality: 'local',
++        device_id: null,
++        input_supported: input,
++        output_supported: !input,
++        voice_stream_supported: input,
++        os_permission: permission,
++        readiness: denied ? 'unavailable' : permissionBlocked ? 'interaction_required' : 'ready',
++        foreground_required: false,
++        interaction_required: permissionBlocked && !denied,
++        online: true,
++        last_seen_at_ms: null,
++        latency_ms: null,
++        ready: !permissionBlocked,
++        blocked_code: permissionBlocked ? (denied ? 'permission_denied' : 'permission_required') : null,
++        blocked_by: permissionBlocked
++          ? denied
++            ? 'Microphone permission denied'
++            : 'Microphone permission will be requested when Talk starts'
++          : null,
++      } satisfies AudioEndpointDescriptor;
++    });
++}
++
++function endpointSelectable(endpoint: AudioEndpointDescriptor): boolean {
++  if (endpoint.ready) return true;
++  // A local desktop microphone may be selected while permission is promptable:
++  // Talk opens it from the user's start gesture. A paired device cannot be
++  // prompted by the host and therefore remains disabled until it advertises
++  // effective readiness itself.
++  return endpoint.locality === 'local' && endpoint.blocked_code === 'permission_required';
+ }
+ 
+ function defaultRoute(voice: VoiceConfig): Pick<VoiceRouteRecord, 'input_endpoint' | 'output_endpoint'> {
+@@ -143,7 +191,7 @@ export function VoiceRouteSelector({
+           onChange={(event) => void apply(event.target.value, output)}
+         >
+           {inputs.map((endpoint) => (
+-            <option key={endpoint.id} value={endpoint.id} disabled={!endpoint.ready}>
++            <option key={endpoint.id} value={endpoint.id} disabled={!endpointSelectable(endpoint)}>
+               {endpoint.label}{endpoint.ready ? '' : ` — ${endpoint.blocked_by ?? 'not ready'}`}
+             </option>
+           ))}
+@@ -158,7 +206,7 @@ export function VoiceRouteSelector({
+           onChange={(event) => void apply(input, event.target.value)}
+         >
+           {outputs.map((endpoint) => (
+-            <option key={endpoint.id} value={endpoint.id} disabled={!endpoint.ready}>
++            <option key={endpoint.id} value={endpoint.id} disabled={!endpointSelectable(endpoint)}>
+               {endpoint.label}{endpoint.ready ? '' : ` — ${endpoint.blocked_by ?? 'not ready'}`}
+             </option>
+           ))}
+diff --git a/src/lib/daemonClient.ts b/src/lib/daemonClient.ts
+index d74386f..932dfc7 100644
+--- a/src/lib/daemonClient.ts
++++ b/src/lib/daemonClient.ts
+@@ -402,7 +402,18 @@ export interface AudioEndpointDescriptor {
+   direction: AudioEndpointDirection;
+   locality: AudioEndpointLocality;
+   device_id: string | null;
++  input_supported: boolean;
++  output_supported: boolean;
++  voice_stream_supported: boolean;
++  os_permission: 'granted' | 'denied' | 'undetermined' | 'promptable' | 'not_required' | 'unsupported' | null;
++  readiness: 'ready' | 'foreground_required' | 'interaction_required' | 'armed_required' | 'unavailable' | null;
++  foreground_required: boolean;
++  interaction_required: boolean;
++  online: boolean;
++  last_seen_at_ms: number | null;
++  latency_ms: number | null;
+   ready: boolean;
++  blocked_code: string | null;
+   blocked_by: string | null;
+ }
+ 
