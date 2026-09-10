@@ -32,8 +32,11 @@ jobs:
             exit 1
           fi
           cat "${parts[@]}" > /tmp/voice-everywhere.patch
-          git apply --check /tmp/voice-everywhere.patch
-          git apply /tmp/voice-everywhere.patch
+          # Workflow changes are written separately through the connected GitHub
+          # app. The Actions token is intentionally not allowed to rewrite
+          # workflow files, so this atomic source commit excludes them.
+          git apply --check --exclude='.github/workflows/*' /tmp/voice-everywhere.patch
+          git apply --exclude='.github/workflows/*' /tmp/voice-everywhere.patch
           rm -f "$ready" "${parts[@]}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
