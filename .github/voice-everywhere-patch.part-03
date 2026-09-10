@@ -1,0 +1,116 @@
+ interrupted".to_string());
++                            break;
++                        }
++                        Err(error) => {
++                            report.stream_dropped = true;
++                            playback_error = Some(error);
++                            break;
++                        }
++                    }
++                }
++                if let Some(error) = playback_error {
++                    let _ = api.append_talk_route_event(
++                        &authorization.session_id, generation, "output_failed",
++                        &serde_json::json!({"job_id": job_id, "turn_id": turn_id, "error": error}),
++                    );
++                    if report.stream_dropped { break; }
++                } else {
++                    report.spoken_chunks = report.spoken_chunks.saturating_add(1);
++                    let _ = api.append_talk_route_event(
++                        &authorization.session_id, generation, "output_played",
++                        &serde_json::json!({
++                            "job_id": job_id, "turn_id": turn_id,
++                            "audio_sequence": outbound_audio_sequence, "chunk_count": chunk_count,
++                        }),
++                    );
+                 }
+-                let _ = send_output_frame(socket, authorization, &mut outbound_sequence, TalkServerFrameKind::State { state: TalkState::Idle }).await;
++                let _ = send_output_frame(
++                    socket, authorization, &mut outbound_sequence,
++                    TalkServerFrameKind::State { state: TalkState::Idle },
++                ).await;
+             }
+             _ => {}
+         }
+@@ -400,6 +452,7 @@ pub(crate) async fn serve(
+             device_id: authorization.device_id.clone(),
+             session_id: authorization.session_id.clone(),
+             session_generation: authorization.session_generation.clone(),
++            route_generation: authorization.route_generation,
+         };
+         // Only input/duplex roles register microphone capture. Output-only
+         // routes never request or report microphone ownership.
+diff --git a/src-tauri/src/bin/monkey-cli/daemon/remote/ui/app.js b/src-tauri/src/bin/monkey-cli/daemon/remote/ui/app.js
+index a431753..9b20ed1 100644
+--- a/src-tauri/src/bin/monkey-cli/daemon/remote/ui/app.js
++++ b/src-tauri/src/bin/monkey-cli/daemon/remote/ui/app.js
+@@ -2788,8 +2788,10 @@ async function performCommand(command, signal) {
+     case "notification_post":
+       return plainOutcome(await postNotification(argumentsValue, signal));
+     case "audio_playback":
++      if (argumentsValue.mode === "talk_route_prepare") return plainOutcome(await prepareTalkRoute(argumentsValue));
+       return plainOutcome(await playAudio(argumentsValue, signal));
+     case "voice_stream":
++      if (argumentsValue.mode === "talk_route_prepare") return plainOutcome(await prepareTalkRoute(argumentsValue));
+       if (argumentsValue.mode === "talk_route") return plainOutcome(await runTalkRoute(argumentsValue, signal));
+       return plainOutcome(await streamVoice(argumentsValue, signal));
+     default:
+@@ -3051,6 +3053,15 @@ function talkHandleFrame(raw) {
+         ui.talkAnswer.textContent === "—" ? frame.text : ui.talkAnswer.textContent + frame.text;
+       break;
+     case "output_audio":
++      if (talk.routeGeneration !== null && frame.route_generation !== talk.routeGeneration) {
++        // A delayed speaker frame from the previous route generation is never
++        // allowed to leak through a handoff. Negative acknowledgement also
++        // releases the host's bounded backpressure wait.
++        if (talk.frames && Number.isInteger(frame.audio_sequence)) {
++          talkSendFrame(talk.frames.playbackAck(frame.audio_sequence, false));
++        }
++        break;
++      }
+       talkQueueAudio(frame.audio_base64, frame.media_type, frame.audio_sequence);
+       break;
+     case "turn_accepted":
+@@ -3114,6 +3125,31 @@ async function prepareTalkCapture() {
+   };
+ }
+ 
++async function prepareTalkRoute(argumentsValue) {
++  const sessionId = String(argumentsValue.session_id || "");
++  const routeId = String(argumentsValue.route_id || "");
++  const generation = Number(argumentsValue.route_generation || 0);
++  const role = String(argumentsValue.role || "");
++  if (!validId(sessionId) || !validId(routeId) || !Number.isSafeInteger(generation) || generation <= 0) {
++    throw new Error("The runner sent an invalid VoiceRoute prepare command");
++  }
++  if (role !== "input" && role !== "output") throw new Error("VoiceRoute prepare role is invalid");
++  // This is deliberately non-media: opening getUserMedia here would overlap
++  // the still-active old route. Re-read the same capability/permission/readiness
++  // truth advertised to the host and acknowledge only when the endpoint can be
++  // activated immediately after commit.
++  const surface = await describeDevice();
++  const capability = role === "input" ? "voice_stream" : "audio_playback";
++  if (!surface.capabilities.includes(capability)) throw new Error(`This device does not support ${capability}`);
++  const permission = surface.permissions?.[capability];
++  if (permission !== "granted" && permission !== "not_required") {
++    throw new Error(`${capability} permission is ${permission || "undetermined"}`);
++  }
++  const readiness = surface.readiness?.[capability];
++  if (readiness !== "ready") throw new Error(`${capability} readiness is ${readiness || "unavailable"}`);
++  return { result: { ready: true, role, route_id: routeId, route_generation: generation } };
++}
++
+ async function runTalkRoute(argumentsValue, signal) {
+   const sessionId = String(argumentsValue.session_id || "");
+   const routeId = String(argumentsValue.route_id || "");
+diff --git a/src-tauri/src/bin/monkey-cli/daemon/remote/ui/talkProtocol.js b/src-tauri/src/bin/monkey-cli/daemon/remote/ui/talkProtocol.js
+index e0e9857..a982006 100644
+--- a/src-tauri/src/bin/monkey-cli/daemon/remote/ui/talkProtocol.js
++++ b/src-tauri/src/bin/monkey-cli/daemon/remote/ui/talkProtocol.js
+@@ -18,8 +18,9 @@
+ // v2: a closing audio frame carries `utterance_id`. v3: the runner answers a
+ // durably accepted utterance with `turn_accepted`, and that frame is the only
+ // thing this client deletes a recording on. Both sides are pinned to v3 — see
+-// the Rust constant's own note for why an additive frame was not enough.
+-export const TALK_PROTOCOL_VERSION = 5;
++// the Rust constant's own note for why add
