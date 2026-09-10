@@ -364,6 +364,20 @@ pub async fn stream_turn_observed(
         )?;
     }
 
+    // A model that wrote its tool call as prose rather than emitting it on the
+    // wire leaves this turn looking like a plain answer that happens to
+    // contain wire JSON. Turn it back into the call the model meant, and take
+    // the JSON out of the answer the user sees. See
+    // `sse::recover_text_tool_calls`.
+    if tool_calls.is_empty() {
+        let (recovered_content, recovered_calls) =
+            crate::sse::recover_text_tool_calls(&content, tools);
+        if !recovered_calls.is_empty() {
+            content = recovered_content;
+            tool_calls = recovered_calls;
+        }
+    }
+
     Ok(TurnResult {
         content,
         tool_calls,
@@ -558,6 +572,20 @@ async fn stream_turn_native(
             total_tokens: prompt_tokens + completion_tokens,
         }
     });
+    // Same rescue the OpenAI-compat path above does, for the same reason. This
+    // path already recovers the qwen3-coder XML block Ollama's own parser can
+    // miss (`parse_leaked_tool_calls` below); a model that leaks the OpenAI
+    // JSON shape into `content` instead is the same failure with different
+    // syntax.
+    if tool_calls.is_empty() {
+        let (recovered_content, recovered_calls) =
+            crate::sse::recover_text_tool_calls(&content, tools);
+        if !recovered_calls.is_empty() {
+            content = recovered_content;
+            tool_calls = recovered_calls;
+        }
+    }
+
     Ok(TurnResult {
         content,
         tool_calls,
