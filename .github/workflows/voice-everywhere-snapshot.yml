@@ -1,4 +1,8 @@
 name: Voice Everywhere source snapshot
+
+permissions:
+  contents: read
+
 on:
   push:
     branches:
