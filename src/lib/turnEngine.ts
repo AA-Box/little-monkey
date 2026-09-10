@@ -12,7 +12,7 @@
  * two loop-exit-adjacent primitives themselves.
  */
 import { invoke } from '@tauri-apps/api/core';
-import { streamChat } from './llamaClient';
+import { recoverTextToolCalls, streamChat } from './llamaClient';
 import type { RoutingDecision } from './modelRouting';
 import type { ChatMessage, StreamEvent, ToolCall, ToolDef } from './llamaClient';
 import { streamProviderChat } from './providerClient';
@@ -1723,6 +1723,19 @@ export async function attemptStream(
     }
   } catch (err) {
     streamError = errorMessage(err);
+  }
+
+  // A model that wrote its tool call as prose rather than emitting it on the
+  // wire (see `recoverTextToolCalls`) leaves this attempt looking like a plain
+  // answer that happens to contain wire JSON. Turn it back into the call the
+  // model meant, and take the JSON out of the visible answer.
+  if (streamError === null && toolCalls.length === 0 && tools.length > 0) {
+    const recovered = recoverTextToolCalls(content, tools);
+    if (recovered.toolCalls.length > 0) {
+      content = recovered.content;
+      toolCalls.push(...recovered.toolCalls);
+      onDelta?.(content);
+    }
   }
 
   // An endpoint that never reports `usage` (or a stream that died mid-answer)

@@ -501,6 +501,19 @@ function App() {
     if (kind === "sideTasks") useSideTaskStore.getState().closePane();
   }, []);
 
+  // A chat code block's "Open in terminal" hands its command to the terminal
+  // store and needs the panel actually visible for the user to press Enter in
+  // — the panel itself does the typing (`TerminalPanel.tsx`) once it mounts on
+  // the requested session. "Run in terminal" deliberately does NOT come
+  // through here: it runs in the background and shows its output under the
+  // code block, so opening the panel over the transcript would be wrong.
+  const pendingTerminalCommand = useTerminalStore((state) => state.pendingCommand);
+  useEffect(() => {
+    if (!pendingTerminalCommand) return;
+    if (useTerminalStore.getState().dock === "right") openRightTab("terminal");
+    else setTerminalOpen(true);
+  }, [openRightTab, pendingTerminalCommand]);
+
   // With every surface living in this one strip, the active chip can easily
   // sit outside the scrolled viewport (the strip also gives up its right end
   // to the dock cluster) — so bring it into view whenever it changes, rather
