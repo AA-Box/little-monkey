@@ -10,7 +10,6 @@ permissions:
 
 jobs:
   apply:
-    if: github.event.head_commit.message == 'chore: stage realtime bridge ready'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -20,6 +19,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [ "$(git log -1 --pretty=%s)" != "fix: trigger realtime bridge apply" ]; then
+            exit 0
+          fi
           cat .voice-everywhere-realtime/part* > /tmp/voice-everywhere-realtime.patch
           echo "106c594d251180bf75f9623f0aa89fe134d2f32b2a9e2e08602096b6d67b4a5b  /tmp/voice-everywhere-realtime.patch" | sha256sum -c -
           git apply --check /tmp/voice-everywhere-realtime.patch
