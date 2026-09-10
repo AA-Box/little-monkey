@@ -1,0 +1,27 @@
+name: Voice Everywhere Snapshot Stage9
+
+on:
+  push:
+    branches:
+      - feat/voice-everywhere-snapshot-stage9
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/voice-everywhere
+          fetch-depth: 0
+      - name: Package source
+        run: |
+          set -euo pipefail
+          tar --exclude=.git --exclude=node_modules --exclude=src-tauri/target -czf /tmp/voice-everywhere-stage9.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-everywhere-stage9
+          path: /tmp/voice-everywhere-stage9.tar.gz
+          retention-days: 1
