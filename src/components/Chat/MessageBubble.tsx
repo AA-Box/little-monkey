@@ -16,6 +16,7 @@ import { useSessionStore } from "../../store/sessionStore";
 // via `lazyComponents.tsx` — see `CodeBlock.tsx`'s doc comment.
 const CodeBlock = lazy(() => import("./CodeBlock"));
 import { useT } from "../../lib/i18n";
+import { textToolCallShellCommand } from "./textToolCallFence";
 import {
   cancelTranslation,
   defaultTranslationLocale,
@@ -169,8 +170,14 @@ function buildAssistantMarkdownComponents(
       const codeProps = isValidElement(onlyChild)
         ? (onlyChild.props as { className?: string; children?: ReactNode })
         : null;
-      const lang = /language-(\S+)/.exec(codeProps?.className ?? "")?.[1] ?? "";
-      const body = codeProps ? flattenToString(codeProps.children).replace(/\n$/, "") : "";
+      const rawLang = /language-(\S+)/.exec(codeProps?.className ?? "")?.[1] ?? "";
+      const rawBody = codeProps ? flattenToString(codeProps.children).replace(/\n$/, "") : "";
+      // A tool call the model wrote as prose is displayed as the shell
+      // command it meant, not as the wire JSON it came out as — see
+      // `textToolCallFence.ts`.
+      const emittedCommand = textToolCallShellCommand(rawLang, rawBody);
+      const lang = emittedCommand === null ? rawLang : "bash";
+      const body = emittedCommand ?? rawBody;
       const kind = codeProps ? detectFenceKind(lang, body) : null;
 
       if (!codeProps) return <pre>{children}</pre>;
@@ -358,13 +365,17 @@ function UserBubble({
                 <span className="text-[10px] text-faint">{largeTextOpen ? "Hide" : "View"}</span>
               </button>
               {largeTextOpen && (
-                <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap rounded-lg border border-border bg-background p-3 font-mono text-xs leading-relaxed text-foreground">
+                <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-background p-3 font-mono text-xs leading-relaxed text-foreground">
                   {text}
                 </pre>
               )}
             </div>
           ) : renderedText ? (
-            <div className="whitespace-pre-wrap">{renderedText}</div>
+            // `break-words` as well as `pre-wrap`: pasted terminal output and
+            // shell scripts carry long unbroken paths (`WINE="/Applications/
+            // CrossOver.app/…/bin/wine"`) with no space to wrap at, and those
+            // painted straight through the bubble's right edge.
+            <div className="whitespace-pre-wrap break-words">{renderedText}</div>
           ) : null}
         </div>
       </div>
