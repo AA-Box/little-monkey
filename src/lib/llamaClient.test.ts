@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { SseEventParser, streamChat, textContent, type StreamEvent } from './llamaClient';
+import {
+  recoverTextToolCalls,
+  SseEventParser,
+  streamChat,
+  textContent,
+  type StreamEvent,
+  type ToolDef,
+} from './llamaClient';
 
 function collect(parser: SseEventParser, chunks: string[]): StreamEvent[] {
   const events: StreamEvent[] = [];
@@ -160,5 +167,62 @@ describe('streamChat request shape', () => {
     const body = JSON.parse(init.body as string) as Record<string, unknown>;
     expect(body.max_tokens).toBe(2048);
     fetchMock.mockRestore();
+  });
+});
+
+describe('recoverTextToolCalls', () => {
+  const tools: ToolDef[] = [
+    { type: 'function', function: { name: 'run_shell', description: '', parameters: {} } },
+    { type: 'function', function: { name: 'edit_file', description: '', parameters: {} } },
+  ];
+
+  it('recovers a fenced tool call the model wrote as prose and strips it from the answer', () => {
+    const recovered = recoverTextToolCalls(
+      'Let me check the log.\n\n```json\n{\n  "name": "run_shell",\n  "arguments": {\n    "command": "cat ~/Library/Logs/bf6.log"\n  }\n}\n```\n',
+      tools,
+    );
+    expect(recovered.toolCalls).toEqual([
+      {
+        id: 'call_text_0',
+        type: 'function',
+        function: { name: 'run_shell', arguments: '{"command":"cat ~/Library/Logs/bf6.log"}' },
+      },
+    ]);
+    expect(recovered.content).toBe('Let me check the log.');
+  });
+
+  it('collapses a call the model restated twice in one message', () => {
+    const block = '```json\n{"name": "run_shell", "arguments": {"command": "ls"}}\n```';
+    const recovered = recoverTextToolCalls(`Do it.\n\n${block}\n\nRunning it now.\n${block}`, tools);
+    expect(recovered.toolCalls).toHaveLength(1);
+    expect(recovered.content).toBe('Do it.\n\nRunning it now.');
+  });
+
+  it('recovers a Hermes-style tool_call tag the server template did not parse', () => {
+    const recovered = recoverTextToolCalls(
+      '<tool_call>{"name": "edit_file", "arguments": {"path": "a.ts", "old_string": "}", "new_string": "{"}}</tool_call>',
+      tools,
+    );
+    expect(recovered.toolCalls[0]?.function).toEqual({
+      name: 'edit_file',
+      arguments: '{"path":"a.ts","old_string":"}","new_string":"{"}',
+    });
+    expect(recovered.content).toBe('');
+  });
+
+  it('leaves JSON that is not a call for an offered tool completely alone', () => {
+    const prose = 'The config is `{"name": "little-monkey", "arguments": {"command": "x"}}` — note the name.';
+    expect(recoverTextToolCalls(prose, tools)).toEqual({ content: prose, toolCalls: [] });
+
+    const documented = '{"name": "run_shell", "arguments": {"command": "ls"}, "note": "example only"}';
+    expect(recoverTextToolCalls(documented, tools)).toEqual({ content: documented, toolCalls: [] });
+
+    const noArgs = '{"name": "run_shell"}';
+    expect(recoverTextToolCalls(noArgs, tools)).toEqual({ content: noArgs, toolCalls: [] });
+  });
+
+  it('recovers nothing when no tools were offered this turn', () => {
+    const content = '{"name": "run_shell", "arguments": {"command": "ls"}}';
+    expect(recoverTextToolCalls(content, [])).toEqual({ content, toolCalls: [] });
   });
 });

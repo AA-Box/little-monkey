@@ -339,3 +339,120 @@ export async function* streamChat(
 
   yield { type: 'done' };
 }
+
+/** Keys a text-emitted tool-call object may carry and still be recognized as
+ * one. Anything else in the object means it isn't a tool call the model meant
+ * to make — see {@link recoverTextToolCalls}. */
+const TEXT_TOOL_CALL_KEYS = new Set(['name', 'arguments', 'parameters', 'id', 'type', 'index']);
+
+/** Spans of the top-level `{…}` objects in `text`, brace-matched with
+ * string/escape awareness so a `}` inside a JSON string value can't end a
+ * span early. */
+function* topLevelObjectSpans(text: string): Generator<{ start: number; end: number }> {
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === '{') {
+      if (depth === 0) start = index;
+      depth += 1;
+    } else if (char === '}' && depth > 0) {
+      depth -= 1;
+      if (depth === 0) yield { start, end: index + 1 };
+    }
+  }
+}
+
+/** Parses one candidate span as a tool call for a tool that was actually
+ * offered, or returns null. Deliberately strict: a name the model wasn't
+ * given, a missing argument object, or any unexpected key disqualifies it. */
+function parseTextToolCall(
+  candidate: string,
+  offered: Set<string>,
+): { name: string; arguments: string } | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(candidate);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const record = parsed as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !TEXT_TOOL_CALL_KEYS.has(key))) return null;
+  const name = record.name;
+  if (typeof name !== 'string' || !offered.has(name)) return null;
+  const args = record.arguments ?? record.parameters;
+  if (typeof args === 'string') return { name, arguments: args };
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return null;
+  return { name, arguments: JSON.stringify(args) };
+}
+
+/** Removes the fences and Hermes tags the extracted JSON was wrapped in, now
+ * that they would otherwise be left behind empty. */
+function tidyRecoveredContent(text: string): string {
+  return text
+    .replace(/<\/?tool_call>/g, '')
+    .replace(/```[a-zA-Z]*\s*```/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/**
+ * Recovers a tool call a model wrote as prose instead of emitting on the
+ * wire, and returns the content with that JSON removed.
+ *
+ * Small local models do this routinely: the system prompt names the tools, so
+ * the model knows they exist, but it answers with a fenced
+ * `{"name": …, "arguments": {…}}` block (or a bare `<tool_call>` one the
+ * server's chat template parser didn't recognize) instead of a real
+ * `tool_calls` delta. Qwen2.5-7B on llama.cpp — the model this app ships —
+ * does it several turns into a session. Nothing executes, and the user is
+ * shown wire JSON and left to run the command themselves.
+ *
+ * A recovered call runs through the same execution and permission path as a
+ * native one, so this only makes the model's stated intent actually happen.
+ * The match is kept strict so an answer that merely *documents* a call does
+ * not become one: only when the attempt produced no real tool call, only for
+ * a tool offered this turn, and only for an object carrying nothing but the
+ * tool-call keys. Identical repeated blocks (models often restate the same
+ * call twice in one message) collapse to a single call.
+ */
+export function recoverTextToolCalls(
+  content: string,
+  tools: ToolDef[],
+): { content: string; toolCalls: ToolCall[] } {
+  if (tools.length === 0 || !content.includes('{')) return { content, toolCalls: [] };
+  const offered = new Set(tools.map((tool) => tool.function.name));
+  const toolCalls: ToolCall[] = [];
+  const seen = new Set<string>();
+  let kept = '';
+  let cursor = 0;
+
+  for (const span of topLevelObjectSpans(content)) {
+    const call = parseTextToolCall(content.slice(span.start, span.end), offered);
+    if (!call) continue;
+    const key = `${call.name} ${call.arguments}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      toolCalls.push({
+        id: `call_text_${toolCalls.length}`,
+        type: 'function',
+        function: { name: call.name, arguments: call.arguments },
+      });
+    }
+    kept += content.slice(cursor, span.start);
+    cursor = span.end;
+  }
+
+  if (toolCalls.length === 0) return { content, toolCalls: [] };
+  return { content: tidyRecoveredContent(kept + content.slice(cursor)), toolCalls };
+}
