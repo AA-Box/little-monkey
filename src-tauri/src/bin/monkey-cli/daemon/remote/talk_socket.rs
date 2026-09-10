@@ -10,7 +10,7 @@
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use hyper_util::rt::TokioIo;
 use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocketConfig};
 use tokio_tungstenite::WebSocketStream;
@@ -20,6 +20,7 @@ use super::protocol::{
     TalkClientFrame, TalkClientFrameKind, TalkSequenceTracker, TalkServerFrame,
     TalkServerFrameKind, TalkState, MAX_TALK_FRAME_BYTES, TALK_PROTOCOL_VERSION,
 };
+use super::realtime_bridge::REALTIME_PCM_MEDIA_TYPE;
 use super::talk::{
     bounded_output_audio_chunks, run_talk_session, TalkIdentity, TalkSessionReport, TalkSocket, TalkSpeech,
 };
@@ -216,6 +217,259 @@ async fn output_wait_for_ack(
             Err(_) => {}
         }
     }
+}
+
+async fn run_realtime_route_session(
+    socket: &mut dyn TalkSocket,
+    api: &RemoteApi,
+    authorization: &TalkSocketAuthorization,
+) -> TalkSessionReport {
+    const MAX_IN_FLIGHT_OUTPUT: usize = 8;
+    let mut report = TalkSessionReport::default();
+    let mut outbound_sequence = 0u64;
+    let mut outbound_audio_sequence = 0u64;
+    let mut inbound = TalkSequenceTracker::default();
+    let mut pending_output_acks = HashSet::<u64>::new();
+    let generation = match authorization.route_generation {
+        Some(value) => value,
+        None => {
+            report.errors = report.errors.saturating_add(1);
+            return report;
+        }
+    };
+    let input_role = matches!(authorization.route_role.as_deref(), Some("input" | "duplex"));
+    let output_role = matches!(authorization.route_role.as_deref(), Some("output" | "duplex"));
+
+    if send_output_frame(socket, authorization, &mut outbound_sequence, TalkServerFrameKind::Ready)
+        .await
+        .is_err()
+    {
+        report.stream_dropped = true;
+        return report;
+    }
+    let Some(raw) = socket.recv().await else {
+        report.stream_dropped = true;
+        return report;
+    };
+    let hello_ok = matches!(
+        parse_output_client_frame(&raw, authorization, &mut inbound),
+        Ok(TalkClientFrame {
+            kind: TalkClientFrameKind::Hello {
+                ref media_type,
+                sample_rate_hz: 48_000,
+                channels: 1,
+            },
+            ..
+        }) if media_type == REALTIME_PCM_MEDIA_TYPE
+    );
+    if !hello_ok {
+        report.errors = report.errors.saturating_add(1);
+        let _ = send_output_frame(
+            socket,
+            authorization,
+            &mut outbound_sequence,
+            TalkServerFrameKind::Error {
+                code: "realtime_pcm_required".into(),
+                message: "Paired Realtime Talk requires mono 48 kHz PCM16 audio.".into(),
+                retryable: false,
+            },
+        )
+        .await;
+        return report;
+    }
+
+    let _ = send_output_frame(
+        socket,
+        authorization,
+        &mut outbound_sequence,
+        TalkServerFrameKind::State {
+            state: TalkState::Listening,
+        },
+    )
+    .await;
+    if let Some(command_id) = api.talk_route_command_id(authorization) {
+        if input_role {
+            let _ = api.append_talk_route_event(
+                &authorization.session_id,
+                generation,
+                "input_ready",
+                &serde_json::json!({ "command_id": command_id, "device_id": authorization.device_id }),
+            );
+        }
+        if output_role {
+            let _ = api.append_talk_route_event(
+                &authorization.session_id,
+                generation,
+                "output_ready",
+                &serde_json::json!({ "command_id": command_id, "device_id": authorization.device_id }),
+            );
+        }
+    }
+
+    loop {
+        if input_role && !api.talk_input_route_live(authorization) {
+            report.grant_revoked = true;
+            break;
+        }
+        if output_role && !api.talk_output_route_live(authorization) {
+            report.grant_revoked = true;
+            break;
+        }
+
+        if output_role {
+            while pending_output_acks.len() < MAX_IN_FLIGHT_OUTPUT {
+                let chunk = match api.take_realtime_output_for_device(authorization) {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break,
+                    Err(_) => {
+                        report.grant_revoked = true;
+                        break;
+                    }
+                };
+                outbound_audio_sequence = outbound_audio_sequence.saturating_add(1);
+                let audio_sequence = outbound_audio_sequence;
+                if send_output_frame(
+                    socket,
+                    authorization,
+                    &mut outbound_sequence,
+                    TalkServerFrameKind::OutputAudio {
+                        audio_sequence,
+                        response_id: format!("realtime-{generation}-{}", chunk.sequence),
+                        chunk_index: 0,
+                        chunk_count: 1,
+                        route_generation: Some(generation),
+                        media_type: REALTIME_PCM_MEDIA_TYPE.to_string(),
+                        audio_base64: STANDARD.encode(chunk.bytes),
+                    },
+                )
+                .await
+                .is_err()
+                {
+                    report.stream_dropped = true;
+                    break;
+                }
+                pending_output_acks.insert(audio_sequence);
+                report.spoken_chunks = report.spoken_chunks.saturating_add(1);
+            }
+            if report.stream_dropped || report.grant_revoked {
+                break;
+            }
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_millis(20), socket.recv()).await {
+            Ok(Some(raw)) => {
+                let frame = match parse_output_client_frame(&raw, authorization, &mut inbound) {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        report.errors = report.errors.saturating_add(1);
+                        let _ = send_output_frame(
+                            socket,
+                            authorization,
+                            &mut outbound_sequence,
+                            TalkServerFrameKind::Error {
+                                code: "invalid_realtime_frame".into(),
+                                message: error,
+                                retryable: false,
+                            },
+                        )
+                        .await;
+                        break;
+                    }
+                };
+                match frame.kind {
+                    TalkClientFrameKind::Audio {
+                        media_type,
+                        audio_base64,
+                        last,
+                        ..
+                    } if input_role => {
+                        if media_type != REALTIME_PCM_MEDIA_TYPE || last {
+                            report.errors = report.errors.saturating_add(1);
+                            let _ = send_output_frame(
+                                socket,
+                                authorization,
+                                &mut outbound_sequence,
+                                TalkServerFrameKind::Error {
+                                    code: "invalid_realtime_audio".into(),
+                                    message: "Realtime PCM is a continuous stream and cannot contain a closing utterance frame.".into(),
+                                    retryable: false,
+                                },
+                            )
+                            .await;
+                            break;
+                        }
+                        let bytes = match STANDARD.decode(audio_base64) {
+                            Ok(bytes) => bytes,
+                            Err(_) => {
+                                report.errors = report.errors.saturating_add(1);
+                                break;
+                            }
+                        };
+                        if let Err(error) = api.push_realtime_input_from_device(authorization, bytes) {
+                            report.errors = report.errors.saturating_add(1);
+                            let _ = send_output_frame(
+                                socket,
+                                authorization,
+                                &mut outbound_sequence,
+                                TalkServerFrameKind::Error {
+                                    code: "realtime_backpressure".into(),
+                                    message: error,
+                                    retryable: true,
+                                },
+                            )
+                            .await;
+                            break;
+                        }
+                    }
+                    TalkClientFrameKind::PlaybackAck { audio_sequence, played } if output_role => {
+                        if pending_output_acks.remove(&audio_sequence) && !played {
+                            report.errors = report.errors.saturating_add(1);
+                            let _ = api.append_talk_route_event(
+                                &authorization.session_id,
+                                generation,
+                                "output_failed",
+                                &serde_json::json!({
+                                    "audio_sequence": audio_sequence,
+                                    "error": "paired Realtime speaker could not play PCM",
+                                }),
+                            );
+                            break;
+                        }
+                    }
+                    TalkClientFrameKind::Interrupt { reason } => {
+                        report.interruptions = report.interruptions.saturating_add(1);
+                        let _ = api.append_talk_route_event(
+                            &authorization.session_id,
+                            generation,
+                            "interrupt",
+                            &serde_json::json!({ "reason": reason.unwrap_or_else(|| "paired_device".to_string()) }),
+                        );
+                        let _ = send_output_frame(
+                            socket,
+                            authorization,
+                            &mut outbound_sequence,
+                            TalkServerFrameKind::State {
+                                state: TalkState::Interrupted,
+                            },
+                        )
+                        .await;
+                    }
+                    TalkClientFrameKind::State { .. }
+                    | TalkClientFrameKind::Metrics { .. }
+                    | TalkClientFrameKind::PlaybackAck { .. } => {}
+                    _ => {
+                        report.errors = report.errors.saturating_add(1);
+                        break;
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+
+    api.discard_realtime_media(&authorization.session_id, generation);
+    report
 }
 
 async fn run_output_route_session(
@@ -436,6 +690,8 @@ pub(crate) async fn serve(
         idle_deadline: started + std::time::Duration::from_millis(MAX_IDLE_MS),
         violation: None,
     };
+    let realtime_route = authorization.route_engine.as_deref() == Some("realtime");
+    let output_only = authorization.route_role.as_deref() == Some("output");
     let configured = ConfiguredTalkSpeech {
         app_data_dir: api.app_data_dir_for_talk(),
     };
@@ -444,8 +700,30 @@ pub(crate) async fn serve(
         Some(speech) => speech,
         None => &configured,
     };
-    let output_only = authorization.route_role.as_deref() == Some("output");
-    let mut report = if output_only {
+    let mut report = if realtime_route {
+        let input_role = matches!(authorization.route_role.as_deref(), Some("input" | "duplex"));
+        let capture = if input_role {
+            api.open_talk_capture(
+                &authorization.device_id,
+                &authorization.session_id,
+                started_ms.saturating_add(MAX_SESSION_MS),
+            )
+        } else {
+            None
+        };
+        let report = run_realtime_route_session(&mut socket, &api, &authorization).await;
+        if let Some(command_id) = capture {
+            let ended = if report.grant_revoked {
+                Some("The routed Realtime microphone authority was withdrawn while the socket was open.")
+            } else if report.stream_dropped {
+                Some("The routed Realtime Talk socket stopped carrying PCM.")
+            } else {
+                None
+            };
+            api.close_talk_capture(&authorization.device_id, &command_id, ended);
+        }
+        report
+    } else if output_only {
         run_output_route_session(&mut socket, speech, &api, &authorization).await
     } else {
         let identity = TalkIdentity {

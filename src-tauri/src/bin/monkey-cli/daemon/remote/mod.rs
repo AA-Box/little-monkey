@@ -8,6 +8,7 @@ pub(crate) mod device;
 mod device_e2e;
 pub(crate) mod migrate;
 pub(crate) mod protocol;
+pub(crate) mod realtime_bridge;
 pub(crate) mod push;
 pub(crate) mod qr;
 mod server;

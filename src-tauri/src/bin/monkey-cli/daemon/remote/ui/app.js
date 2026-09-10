@@ -23,6 +23,7 @@ import {
 } from "./device-core.js";
 import {
   TALK_PROTOCOL_VERSION,
+  REALTIME_PCM_MEDIA_TYPE,
   chooseTalkMediaType,
   clampTalkChannels,
   clampTalkSampleRateHz,
@@ -30,7 +31,9 @@ import {
   createTalkFrames,
   createTalkJournal,
   defaultUtteranceId,
+  float32ToRealtimePcmBase64,
   normalizeTalkMediaType,
+  realtimePcmBase64ToFloat32,
   splitTalkAudioBase64,
   talkUtterancePending,
 } from "./talkProtocol.js";
@@ -139,6 +142,10 @@ const state = {
   // Autoplay policy cleared by an explicit gesture. Never assumed: a browser
   // that refuses to play a sound would otherwise be advertised as ready.
   audioEnabled: false,
+  // Kept alive after the explicit playback gesture. Routed Realtime PCM uses
+  // this context; recreating it from a background device command would put us
+  // back behind the browser autoplay gate we already proved was cleared.
+  audioContext: null,
   // Permission names this session has obtained itself, by running the real
   // browser permission operation from a real user gesture and having it
   // succeed. Only consulted for a permission this browser cannot query at all
@@ -2361,6 +2368,15 @@ async function promptForNotifications() {
 
 // Autoplay policy, cleared the only way it can be: by playing something
 // silently inside the gesture that asked for it.
+async function playbackAudioContext() {
+  if (!window.AudioContext) throw new Error("This browser has no Web Audio output");
+  if (!state.audioContext || state.audioContext.state === "closed") {
+    state.audioContext = new AudioContext();
+  }
+  if (state.audioContext.state === "suspended") await state.audioContext.resume();
+  return state.audioContext;
+}
+
 async function enableAudioPlayback() {
   if (window.speechSynthesis) {
     // A zero-length utterance counts as the page having spoken.
@@ -2373,6 +2389,10 @@ async function enableAudioPlayback() {
     silence.volume = 0;
     await silence.play().catch(() => {});
   }
+  // Realtime paired output is PCM, not an encoded <audio> resource. Unlock the
+  // exact Web Audio path it will use while this call still runs in the user's
+  // gesture. A later leased command must never manufacture permission.
+  await playbackAudioContext();
   state.audioEnabled = true;
   return true;
 }
@@ -2863,6 +2883,13 @@ const talk = {
   routeId: null,
   routeGeneration: null,
   routeRole: null,
+  routeEngine: null,
+  pcmCaptureSource: null,
+  pcmCaptureProcessor: null,
+  pcmCaptureMute: null,
+  /** Scheduled Web Audio sources keyed by Talk audio_sequence. */
+  pcmPlayers: new Map(),
+  pcmPlaybackAt: 0,
   /**
    * Whether the runner is mid-answer, as this client last heard it.
    *
@@ -2957,6 +2984,9 @@ function talkSendFrame(frame) {
 function talkStopPlayback() {
   talk.playbackGeneration += 1;
   talk.playing = Promise.resolve();
+  for (const finish of [...talk.pcmPlayers.values()]) finish(false);
+  talk.pcmPlayers.clear();
+  talk.pcmPlaybackAt = 0;
   if (talk.playerFinish) {
     const finish = talk.playerFinish;
     talk.playerFinish = null;
@@ -2973,7 +3003,51 @@ function talkInterrupt(reason) {
   if (talk.frames) talkSendFrame(talk.frames.interrupt(reason));
 }
 
+function talkQueueRealtimePcm(audioBase64, audioSequence) {
+  const generation = talk.playbackGeneration;
+  void (async () => {
+    let context;
+    try {
+      context = await playbackAudioContext();
+      if (generation !== talk.playbackGeneration) throw new Error("Playback was interrupted");
+      const samples = realtimePcmBase64ToFloat32(audioBase64);
+      if (!samples.length) throw new Error("Realtime PCM frame was empty or malformed");
+      const buffer = context.createBuffer(1, samples.length, 48_000);
+      buffer.copyToChannel(samples, 0);
+      const source = context.createBufferSource();
+      source.buffer = buffer;
+      source.connect(context.destination);
+      const startAt = Math.max(context.currentTime + 0.025, talk.pcmPlaybackAt || 0);
+      talk.pcmPlaybackAt = startAt + buffer.duration;
+      let settled = false;
+      const finish = (played) => {
+        if (settled) return;
+        settled = true;
+        talk.pcmPlayers.delete(audioSequence);
+        try { source.disconnect(); } catch {}
+        if (talk.frames && Number.isInteger(audioSequence)) {
+          talkSendFrame(talk.frames.playbackAck(audioSequence, played));
+        }
+      };
+      talk.pcmPlayers.set(audioSequence, (played) => {
+        try { source.stop(); } catch {}
+        finish(played);
+      });
+      source.onended = () => finish(generation === talk.playbackGeneration);
+      source.start(startAt);
+    } catch {
+      if (talk.frames && Number.isInteger(audioSequence)) {
+        talkSendFrame(talk.frames.playbackAck(audioSequence, false));
+      }
+    }
+  })();
+}
+
 function talkQueueAudio(audioBase64, mediaType, audioSequence) {
+  if (mediaType === REALTIME_PCM_MEDIA_TYPE) {
+    talkQueueRealtimePcm(audioBase64, audioSequence);
+    return;
+  }
   const generation = talk.playbackGeneration;
   talk.playing = talk.playing.then(
     () =>
@@ -3125,15 +3199,63 @@ async function prepareTalkCapture() {
   };
 }
 
+async function prepareRealtimeTalkCapture() {
+  talk.stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    video: false,
+  });
+  const context = new AudioContext();
+  talk.context = context;
+  if (context.state === "suspended") await context.resume();
+  return {
+    context,
+    mediaType: REALTIME_PCM_MEDIA_TYPE,
+    sampleRateHz: 48_000,
+    channels: 1,
+  };
+}
+
+function talkStartRealtimeCapture(context) {
+  if (!talk.stream || !talk.frames) throw new Error("Realtime capture is not prepared");
+  const source = context.createMediaStreamSource(talk.stream);
+  // ScriptProcessor is deliberately used here rather than an AudioWorklet
+  // fetched from another URL: this controller is a single self-contained
+  // origin with a strict CSP, and the processor gives every WebView we support
+  // one bounded block without introducing a new executable asset.
+  const processor = context.createScriptProcessor(4096, 1, 1);
+  const mute = context.createGain();
+  mute.gain.value = 0;
+  processor.onaudioprocess = (event) => {
+    if (!talk.running || !talk.frames || talk.routeEngine !== "realtime") return;
+    const samples = event.inputBuffer.getChannelData(0);
+    const audioBase64 = float32ToRealtimePcmBase64(samples, event.inputBuffer.sampleRate || context.sampleRate);
+    if (!audioBase64) return;
+    try {
+      talkSendFrame(talk.frames.audio({ audioBase64, last: false }));
+    } catch (error) {
+      showTalkError(String(error?.message || error));
+      void stopTalk("Realtime microphone stream could not be encoded");
+    }
+  };
+  source.connect(processor);
+  processor.connect(mute);
+  mute.connect(context.destination);
+  talk.pcmCaptureSource = source;
+  talk.pcmCaptureProcessor = processor;
+  talk.pcmCaptureMute = mute;
+}
+
 async function prepareTalkRoute(argumentsValue) {
   const sessionId = String(argumentsValue.session_id || "");
   const routeId = String(argumentsValue.route_id || "");
   const generation = Number(argumentsValue.route_generation || 0);
   const role = String(argumentsValue.role || "");
+  const engine = String(argumentsValue.engine || "pipeline");
   if (!validId(sessionId) || !validId(routeId) || !Number.isSafeInteger(generation) || generation <= 0) {
     throw new Error("The runner sent an invalid VoiceRoute prepare command");
   }
   if (role !== "input" && role !== "output") throw new Error("VoiceRoute prepare role is invalid");
+  if (engine !== "pipeline" && engine !== "realtime") throw new Error("VoiceRoute prepare engine is invalid");
   // This is deliberately non-media: opening getUserMedia here would overlap
   // the still-active old route. Re-read the same capability/permission/readiness
   // truth advertised to the host and acknowledge only when the endpoint can be
@@ -3147,7 +3269,7 @@ async function prepareTalkRoute(argumentsValue) {
   }
   const readiness = surface.readiness?.[capability];
   if (readiness !== "ready") throw new Error(`${capability} readiness is ${readiness || "unavailable"}`);
-  return { result: { ready: true, role, route_id: routeId, route_generation: generation } };
+  return { result: { ready: true, role, engine, route_id: routeId, route_generation: generation } };
 }
 
 async function runTalkRoute(argumentsValue, signal) {
@@ -3155,14 +3277,16 @@ async function runTalkRoute(argumentsValue, signal) {
   const routeId = String(argumentsValue.route_id || "");
   const generation = Number(argumentsValue.route_generation || 0);
   const role = String(argumentsValue.role || "input");
+  const engine = String(argumentsValue.engine || "pipeline");
   if (!validId(sessionId) || !validId(routeId) || !Number.isSafeInteger(generation) || generation <= 0) {
     throw new Error("The runner sent an invalid VoiceRoute input command");
   }
   if (role !== "input" && role !== "duplex") throw new Error("This VoiceRoute command is not a microphone role");
+  if (engine !== "pipeline" && engine !== "realtime") throw new Error("VoiceRoute engine is invalid");
   if (talk.running) throw new Error("A Talk role is already active on this device");
   const startedAt = Date.now();
   try {
-    const capture = await prepareTalkCapture();
+    const capture = engine === "realtime" ? await prepareRealtimeTalkCapture() : await prepareTalkCapture();
     if (aborted(signal)) return { cancelledBeforeEffect: true };
     await talkConnect({
       sessionId,
@@ -3174,12 +3298,14 @@ async function runTalkRoute(argumentsValue, signal) {
       routeRole: role,
     });
     talk.routeRole = role;
-    talkStartCapture(capture.context);
+    talk.routeEngine = engine;
+    if (engine === "realtime") talkStartRealtimeCapture(capture.context);
+    else talkStartCapture(capture.context);
     setTalkState("Listening — controlled by this computer", "listening");
     while (talk.running && !aborted(signal)) await delayUntilAborted(250, signal);
     return {
       cancelledDuringEffect: aborted(signal),
-      result: { session_id: talk.sessionId || sessionId, route_id: routeId, route_generation: generation, role, duration_ms: Date.now() - startedAt },
+      result: { session_id: talk.sessionId || sessionId, route_id: routeId, route_generation: generation, role, engine, duration_ms: Date.now() - startedAt },
     };
   } finally {
     await stopTalk();
@@ -3190,9 +3316,11 @@ async function runTalkRouteOutput(argumentsValue, signal) {
   const sessionId = String(argumentsValue.session_id || "");
   const routeId = String(argumentsValue.route_id || "");
   const generation = Number(argumentsValue.route_generation || 0);
+  const engine = String(argumentsValue.engine || "pipeline");
   if (!validId(sessionId) || !validId(routeId) || !Number.isSafeInteger(generation) || generation <= 0) {
     throw new Error("The runner sent an invalid VoiceRoute output command");
   }
+  if (engine !== "pipeline" && engine !== "realtime") throw new Error("VoiceRoute engine is invalid");
   if (talk.running) throw new Error("A Talk role is already active on this device");
   const startedAt = Date.now();
   try {
@@ -3201,7 +3329,7 @@ async function runTalkRouteOutput(argumentsValue, signal) {
     // a valid media descriptor because it is part of the shared Talk envelope.
     await talkConnect({
       sessionId,
-      mediaType: "audio/webm",
+      mediaType: engine === "realtime" ? REALTIME_PCM_MEDIA_TYPE : "audio/webm",
       sampleRateHz: 48_000,
       channels: 1,
       routeId,
@@ -3209,11 +3337,13 @@ async function runTalkRouteOutput(argumentsValue, signal) {
       routeRole: "output",
     });
     talk.routeRole = "output";
+    talk.routeEngine = engine;
+    if (engine === "realtime") await playbackAudioContext();
     setTalkState("Speaker — controlled by this computer", "speaking");
     while (talk.running && !aborted(signal)) await delayUntilAborted(250, signal);
     return {
       cancelledDuringEffect: aborted(signal),
-      result: { session_id: talk.sessionId || sessionId, route_id: routeId, route_generation: generation, role: "output", duration_ms: Date.now() - startedAt },
+      result: { session_id: talk.sessionId || sessionId, route_id: routeId, route_generation: generation, role: "output", engine, duration_ms: Date.now() - startedAt },
     };
   } finally {
     await stopTalk();
@@ -3651,6 +3781,19 @@ async function stopTalk(reason) {
   talk.detector = null;
   talk.frames = null;
   talk.recorderOptions = null;
+  if (talk.pcmCaptureProcessor) {
+    talk.pcmCaptureProcessor.onaudioprocess = null;
+    try { talk.pcmCaptureProcessor.disconnect(); } catch {}
+    talk.pcmCaptureProcessor = null;
+  }
+  if (talk.pcmCaptureSource) {
+    try { talk.pcmCaptureSource.disconnect(); } catch {}
+    talk.pcmCaptureSource = null;
+  }
+  if (talk.pcmCaptureMute) {
+    try { talk.pcmCaptureMute.disconnect(); } catch {}
+    talk.pcmCaptureMute = null;
+  }
   // Always: a microphone left open after a failed conversation is the failure
   // that matters here.
   stopTracks(talk.stream);
@@ -3670,6 +3813,7 @@ async function stopTalk(reason) {
   talk.routeId = null;
   talk.routeGeneration = null;
   talk.routeRole = null;
+  talk.routeEngine = null;
   setTalkState(reason || "Not connected", "idle");
   if (reason) showTalkError(reason);
   // Last, and always: the buttons that offer a retry only exist while nothing

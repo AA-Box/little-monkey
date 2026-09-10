@@ -20,7 +20,9 @@
 // thing this client deletes a recording on. Both sides are pinned to v3 — see
 // the Rust constant's own note for why additive wire changes still require an explicit reload boundary.
 // v6 adds bounded streamed output metadata (response/chunk/route generation).
-export const TALK_PROTOCOL_VERSION = 6;
+// v7 adds direct mono 48 kHz PCM16 media for paired Realtime WebRTC routing.
+export const TALK_PROTOCOL_VERSION = 7;
+export const REALTIME_PCM_MEDIA_TYPE = "audio/pcm16;rate=48000";
 
 /// Exactly `TALK_MEDIA_TYPES` in `protocol.rs`. A container that is not on this
 /// list is refused outright, so guessing one is the same as dropping the
@@ -33,6 +35,7 @@ export const TALK_MEDIA_TYPES = [
   "audio/mp4",
   "audio/wav",
   "audio/mpeg",
+  REALTIME_PCM_MEDIA_TYPE,
 ];
 
 // What this client asks a recorder for, best first. Opus in WebM everywhere
@@ -133,6 +136,52 @@ export function clampTalkSampleRateHz(value) {
 export function clampTalkChannels(value) {
   if (!Number.isFinite(value)) return 1;
   return Math.min(2, Math.max(1, Math.round(value)));
+}
+
+/**
+ * Converts one Web Audio float block into the Realtime bridge's canonical
+ * little-endian mono PCM16 stream. Resampling is linear on purpose: WebRTC's
+ * Opus encoder performs the final voice-band shaping, while this step only
+ * normalizes device AudioContext rates into one bounded wire format.
+ */
+export function float32ToRealtimePcmBase64(samples, sourceSampleRate) {
+  const source = samples instanceof Float32Array ? samples : new Float32Array(samples || []);
+  const sourceRate = Number(sourceSampleRate);
+  if (!source.length || !Number.isFinite(sourceRate) || sourceRate < 8_000 || sourceRate > 192_000) return "";
+  const targetRate = 48_000;
+  const outputLength = Math.max(1, Math.round(source.length * targetRate / sourceRate));
+  const bytes = new Uint8Array(outputLength * 2);
+  const view = new DataView(bytes.buffer);
+  for (let index = 0; index < outputLength; index += 1) {
+    const position = index * sourceRate / targetRate;
+    const left = Math.min(source.length - 1, Math.floor(position));
+    const right = Math.min(source.length - 1, left + 1);
+    const fraction = position - left;
+    const sample = Math.max(-1, Math.min(1, source[left] + (source[right] - source[left]) * fraction));
+    const integer = sample < 0 ? Math.round(sample * 0x8000) : Math.round(sample * 0x7fff);
+    view.setInt16(index * 2, integer, true);
+  }
+  let binary = "";
+  const stride = 0x4000;
+  for (let at = 0; at < bytes.length; at += stride) {
+    binary += String.fromCharCode(...bytes.subarray(at, Math.min(bytes.length, at + stride)));
+  }
+  return btoa(binary);
+}
+
+/** Decode canonical Realtime PCM for Web Audio playback. */
+export function realtimePcmBase64ToFloat32(encoded) {
+  const binary = atob(String(encoded || ""));
+  if (!binary.length || binary.length % 2 !== 0) return new Float32Array();
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  const view = new DataView(bytes.buffer);
+  const samples = new Float32Array(bytes.length / 2);
+  for (let index = 0; index < samples.length; index += 1) {
+    const value = view.getInt16(index * 2, true);
+    samples[index] = value < 0 ? value / 0x8000 : value / 0x7fff;
+  }
+  return samples;
 }
 
 /** The runner's own bound and character set for an utterance id. */

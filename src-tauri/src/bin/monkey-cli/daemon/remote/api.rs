@@ -207,6 +207,7 @@ struct PendingTalkTicket {
     route_id: Option<String>,
     route_generation: Option<u64>,
     route_role: Option<String>,
+    route_engine: Option<String>,
     route_output_to_socket: bool,
     route_event_cursor: u64,
     expires_at_ms: u64,
@@ -228,6 +229,8 @@ pub(crate) struct TalkSocketAuthorization {
     pub route_generation: Option<u64>,
     /// input, output, or duplex for desktop-owned VoiceRoute sockets.
     pub route_role: Option<String>,
+    /// Pipeline or realtime for a host-owned routed socket.
+    pub route_engine: Option<String>,
     /// Same paired endpoint is both microphone and speaker.
     pub route_output_to_socket: bool,
     /// Output-only sockets begin after this event, so old speech is never replayed.
@@ -306,6 +309,9 @@ pub struct RemoteApi {
     /// Short-lived, one-use WebSocket admissions keyed by a digest of the
     /// opaque ticket. Device secrets never enter this map or a URL.
     talk_tickets: Arc<Mutex<HashMap<String, PendingTalkTicket>>>,
+    /// Raw Realtime PCM exists only here, in bounded memory shared by Talk sockets
+    /// and the loopback-only desktop bridge. It is never written to SQLite.
+    realtime_media: Arc<super::realtime_bridge::RealtimeMediaBridge>,
     /// Speech backends for Talk sockets. `None` — always, in production — means
     /// the operator's own configured stack, resolved per session. A test
     /// substitutes the two things that are genuinely outside this process, a
@@ -329,6 +335,7 @@ impl Clone for RemoteApi {
             terminal_commits: Arc::clone(&self.terminal_commits),
             audit: self.audit.clone(),
             talk_tickets: Arc::clone(&self.talk_tickets),
+            realtime_media: Arc::clone(&self.realtime_media),
             talk_speech: self.talk_speech.clone(),
         }
     }
@@ -363,6 +370,7 @@ impl RemoteApi {
             terminal_commits: Arc::new(Mutex::new(HashMap::new())),
             audit,
             talk_tickets: Arc::new(Mutex::new(HashMap::new())),
+            realtime_media: Arc::new(super::realtime_bridge::RealtimeMediaBridge::default()),
             talk_speech: None,
         })
     }
@@ -394,6 +402,7 @@ impl RemoteApi {
             terminal_commits: Arc::new(Mutex::new(HashMap::new())),
             audit,
             talk_tickets: Arc::new(Mutex::new(HashMap::new())),
+            realtime_media: Arc::new(super::realtime_bridge::RealtimeMediaBridge::default()),
             talk_speech: None,
         }
     }
@@ -2300,7 +2309,7 @@ impl RemoteApi {
             .map_err(|error| (400, format!("Invalid Talk ticket request: {error}")))?;
         request.validate().map_err(|error| (400, error))?;
 
-        let (session_id, route_id, route_generation, route_role, route_output_to_socket, route_event_cursor) = {
+        let (session_id, route_id, route_generation, route_role, route_engine, route_output_to_socket, route_event_cursor) = {
             let store = self.locked_store()?;
             let surface = store.device_surface(&device.device_id).map_err(internal)?;
             let effective = effective_capabilities(&device.capabilities, surface.as_ref());
@@ -2313,9 +2322,6 @@ impl RemoteApi {
                         .ok_or_else(|| (409, "This VoiceRoute no longer exists".to_string()))?;
                     if route.state != "active" || route.generation != generation {
                         return Err((409, "This VoiceRoute generation is stale".to_string()));
-                    }
-                    if route.engine != "pipeline" {
-                        return Err((409, "Paired Realtime Voice needs a direct media bridge; it is not routed through transcription.".to_string()));
                     }
                     let expected_input = format!("paired:{}:input", device.device_id);
                     let expected_output = format!("paired:{}:output", device.device_id);
@@ -2354,6 +2360,7 @@ impl RemoteApi {
                         Some(route.route_id),
                         Some(route.generation),
                         Some(role.to_string()),
+                        Some(route.engine),
                         role == "duplex",
                         cursor,
                     )
@@ -2362,7 +2369,7 @@ impl RemoteApi {
                     if !effective.contains(&DeviceCapability::VoiceStream) {
                         return Err((403, "This device's microphone is not effective".to_string()));
                     }
-                    (request.session_id.clone(), None, None, None, true, 0)
+                    (request.session_id.clone(), None, None, None, None, true, 0)
                 }
                 _ => unreachable!("TalkTicketRequest::validate rejects partial routes"),
             }
@@ -2393,6 +2400,7 @@ impl RemoteApi {
                 route_id,
                 route_generation,
                 route_role,
+                route_engine,
                 route_output_to_socket,
                 route_event_cursor,
                 expires_at_ms: issued.expires_at_ms,
@@ -2479,6 +2487,7 @@ impl RemoteApi {
             route_id: pending.route_id,
             route_generation: pending.route_generation,
             route_role: pending.route_role,
+            route_engine: pending.route_engine,
             route_output_to_socket: pending.route_output_to_socket,
             route_event_cursor: pending.route_event_cursor,
         })
@@ -2658,6 +2667,108 @@ impl RemoteApi {
             .map_err(|_| "Remote state lock was poisoned".to_string())?
             .append_voice_route_event(session_id, generation, kind, payload, now_ms)
             .map(|_| ())
+    }
+
+    pub(crate) fn talk_input_route_live(&self, authorization: &TalkSocketAuthorization) -> bool {
+        let (Some(route_id), Some(generation)) =
+            (authorization.route_id.as_deref(), authorization.route_generation)
+        else { return false; };
+        let Ok(store) = self.store.lock() else { return false; };
+        let Some(device) = store.device(&authorization.device_id).ok().flatten() else { return false; };
+        if !device.active() { return false; }
+        let surface = store.device_surface(&authorization.device_id).ok().flatten();
+        let effective = effective_capabilities(&device.capabilities, surface.as_ref());
+        let Ok(Some(route)) = store.voice_route_by_id(route_id) else { return false; };
+        route.state == "active"
+            && route.generation == generation
+            && route.session_id == authorization.session_id
+            && route.input_endpoint == format!("paired:{}:input", authorization.device_id)
+            && effective.contains(&DeviceCapability::VoiceStream)
+    }
+
+    fn realtime_host_route(&self, session_id: &str, generation: u64) -> Result<super::store::VoiceRouteRecord, String> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "Remote state lock was poisoned".to_string())?;
+        let route = store
+            .voice_route(session_id)?
+            .ok_or_else(|| "Realtime VoiceRoute no longer exists".to_string())?;
+        if route.state != "active" || route.generation != generation || route.engine != "realtime" {
+            return Err("Realtime VoiceRoute generation is stale or inactive".to_string());
+        }
+        Ok(route)
+    }
+
+    pub(crate) fn push_realtime_input_from_device(
+        &self,
+        authorization: &TalkSocketAuthorization,
+        bytes: Vec<u8>,
+    ) -> Result<u64, String> {
+        if authorization.route_engine.as_deref() != Some("realtime")
+            || !matches!(authorization.route_role.as_deref(), Some("input" | "duplex"))
+            || !self.talk_input_route_live(authorization)
+        {
+            return Err("Realtime microphone authority was revoked or moved".to_string());
+        }
+        let generation = authorization
+            .route_generation
+            .ok_or_else(|| "Realtime microphone route has no generation".to_string())?;
+        super::realtime_bridge::validate_pcm(&bytes)?;
+        self.realtime_media
+            .push_input(&authorization.session_id, generation, bytes)
+    }
+
+    pub(crate) fn take_realtime_input_for_host(
+        &self,
+        session_id: &str,
+        generation: u64,
+    ) -> Result<Option<super::realtime_bridge::RealtimePcmChunk>, String> {
+        let route = self.realtime_host_route(session_id, generation)?;
+        if !route.input_endpoint.starts_with("paired:") {
+            return Ok(None);
+        }
+        if route.input_command_id.is_none() {
+            return Err("Realtime paired microphone is not activated".to_string());
+        }
+        self.realtime_media.pop_input(session_id, generation)
+    }
+
+    pub(crate) fn push_realtime_output_from_host(
+        &self,
+        session_id: &str,
+        generation: u64,
+        bytes: Vec<u8>,
+    ) -> Result<u64, String> {
+        let route = self.realtime_host_route(session_id, generation)?;
+        if !route.output_endpoint.starts_with("paired:") {
+            return Err("Realtime VoiceRoute does not currently use a paired speaker".to_string());
+        }
+        if route.output_command_id.is_none() {
+            return Err("Realtime paired speaker is not activated".to_string());
+        }
+        super::realtime_bridge::validate_pcm(&bytes)?;
+        self.realtime_media.push_output(session_id, generation, bytes)
+    }
+
+    pub(crate) fn take_realtime_output_for_device(
+        &self,
+        authorization: &TalkSocketAuthorization,
+    ) -> Result<Option<super::realtime_bridge::RealtimePcmChunk>, String> {
+        if authorization.route_engine.as_deref() != Some("realtime")
+            || !matches!(authorization.route_role.as_deref(), Some("output" | "duplex"))
+            || !self.talk_output_route_live(authorization)
+        {
+            return Err("Realtime speaker authority was revoked or moved".to_string());
+        }
+        let generation = authorization
+            .route_generation
+            .ok_or_else(|| "Realtime speaker route has no generation".to_string())?;
+        self.realtime_media.pop_output(&authorization.session_id, generation)
+    }
+
+    pub(crate) fn discard_realtime_media(&self, session_id: &str, generation: u64) {
+        self.realtime_media.discard(session_id, generation);
     }
 
     fn talk_stream_needs_upgrade(

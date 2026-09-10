@@ -293,6 +293,7 @@ fn prepare_paired_endpoint(
     session_id: &str,
     route_id: &str,
     generation: u64,
+    engine: &str,
     now_ms: u64,
 ) -> Result<(), String> {
     let (device_id, capability, role) = match endpoint {
@@ -311,6 +312,7 @@ fn prepare_paired_endpoint(
                 "session_id": session_id,
                 "route_id": route_id,
                 "route_generation": generation,
+                "engine": engine,
             }),
             source_run_id: None,
             source_session_id: Some(session_id.to_string()),
@@ -331,6 +333,7 @@ fn enqueue_role(
     route_id: &str,
     generation: u64,
     role: &str,
+    engine: &str,
     now_ms: u64,
 ) -> Result<String, String> {
     let expires_at_ms = now_ms.saturating_add(ROUTE_COMMAND_TTL_MS);
@@ -344,6 +347,7 @@ fn enqueue_role(
                 "session_id": session_id,
                 "route_id": route_id,
                 "route_generation": generation,
+                "engine": engine,
                 "duration_ms": ROUTE_COMMAND_TTL_MS,
             }),
             source_run_id: None,
@@ -426,11 +430,6 @@ pub fn activate_route(paths: &DaemonPaths, session_id: &str, now_ms: u64) -> Res
     if route.state != "active" {
         return Err("Voice route is stopped".to_string());
     }
-    if route.engine == "realtime"
-        && (route.input_endpoint.starts_with("paired:") || route.output_endpoint.starts_with("paired:"))
-    {
-        return Err("Paired Realtime Voice needs a direct media bridge; use local endpoints or Pipeline".to_string());
-    }
     if route.input_command_id.is_some() || route.output_command_id.is_some() {
         return Ok(route);
     }
@@ -454,6 +453,7 @@ pub fn activate_route(paths: &DaemonPaths, session_id: &str, now_ms: u64) -> Res
             &route.route_id,
             route.generation,
             role,
+            &route.engine,
             now_ms,
         )?);
     }
@@ -467,6 +467,7 @@ pub fn activate_route(paths: &DaemonPaths, session_id: &str, now_ms: u64) -> Res
                 &route.route_id,
                 route.generation,
                 "output",
+                &route.engine,
                 now_ms,
             ) {
                 Ok(command_id) => output_command_id = Some(command_id),
@@ -526,10 +527,10 @@ pub fn move_route(
         let next_generation = previous.generation.checked_add(1)
             .ok_or_else(|| "Voice route generation is exhausted".to_string())?;
         if next_input.token() != previous.input_endpoint {
-            prepare_paired_endpoint(&mut store, &next_input, session_id, &previous.route_id, next_generation, now_ms)?;
+            prepare_paired_endpoint(&mut store, &next_input, session_id, &previous.route_id, next_generation, &previous.engine, now_ms)?;
         }
         if next_output.token() != previous.output_endpoint {
-            prepare_paired_endpoint(&mut store, &next_output, session_id, &previous.route_id, next_generation, now_ms)?;
+            prepare_paired_endpoint(&mut store, &next_output, session_id, &previous.route_id, next_generation, &previous.engine, now_ms)?;
         }
     }
     let selected = set_route(

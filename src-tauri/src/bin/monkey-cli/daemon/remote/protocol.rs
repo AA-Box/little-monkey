@@ -43,7 +43,7 @@ pub const MAX_REMOTE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 /// would offer to re-send *every* turn — including ones already answered. That
 /// is exactly the "tell somebody to repeat what is already running" failure the
 /// journal exists to prevent, so the two sides are pinned to each other.
-pub const TALK_PROTOCOL_VERSION: u32 = 6;
+pub const TALK_PROTOCOL_VERSION: u32 = 7;
 
 /// The version whose only difference from [`TALK_PROTOCOL_VERSION`] is the
 /// missing utterance id — so a client speaking it can be told precisely what is
@@ -61,6 +61,9 @@ const TALK_PROTOCOL_VERSION_WITHOUT_ROUTE_ROLE: u32 = 4;
 /// per frame, so it could neither stream long output nor bind each chunk to the
 /// route generation/response that produced it.
 const TALK_PROTOCOL_VERSION_WITHOUT_BOUNDED_OUTPUT_STREAM: u32 = 5;
+/// Version 6 has bounded routed output, but no raw PCM media type for the direct
+/// paired-device Realtime WebRTC bridge.
+const TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_PCM: u32 = 6;
 pub const MAX_TALK_AUDIO_BYTES: usize = MAX_VOICE_CHUNK_BYTES;
 pub const MAX_TALK_AUDIO_BASE64_BYTES: usize = MAX_TALK_AUDIO_BYTES.div_ceil(3) * 4;
 pub const MAX_TALK_FRAME_BYTES: usize = MAX_TALK_AUDIO_BASE64_BYTES + 16 * 1024;
@@ -1628,6 +1631,7 @@ pub const TALK_MEDIA_TYPES: &[&str] = &[
     "audio/mp4",
     "audio/wav",
     "audio/mpeg",
+    super::realtime_bridge::REALTIME_PCM_MEDIA_TYPE,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2116,6 +2120,7 @@ fn validate_talk_protocol_version(protocol_version: u32) -> Result<(), String> {
             | TALK_PROTOCOL_VERSION_WITHOUT_VOICE_ROUTE
             | TALK_PROTOCOL_VERSION_WITHOUT_ROUTE_ROLE
             | TALK_PROTOCOL_VERSION_WITHOUT_BOUNDED_OUTPUT_STREAM
+            | TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_PCM
     ) {
         return Err(
             "This Talk client is from an older version of the app; reload the page to continue"
