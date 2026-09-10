@@ -1,0 +1,151 @@
+"audio/wav" {
++        return Err(format!(
++            "Synthesized {media_type} speech exceeded the Talk frame ceiling; this codec must stream bounded playable chunks"
++        ));
++    }
++    split_wav_output(bytes)
++}
++
++fn split_wav_output(bytes: Vec<u8>) -> Result<Vec<Vec<u8>>, String> {
++    if bytes.len() < 44 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
++        return Err("Oversized audio/wav output is not a valid RIFF/WAVE container".to_string());
++    }
++    let mut at = 12usize;
++    let mut fmt: Option<Vec<u8>> = None;
++    let mut data: Option<Vec<u8>> = None;
++    while at.checked_add(8).is_some_and(|end| end <= bytes.len()) {
++        let id = &bytes[at..at + 4];
++        let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
++        let start = at + 8;
++        let end = start.checked_add(size).ok_or_else(|| "WAV chunk size overflow".to_string())?;
++        if end > bytes.len() {
++            return Err("WAV chunk extends past the synthesized payload".to_string());
++        }
++        if id == b"fmt " && fmt.is_none() {
++            fmt = Some(bytes[start..end].to_vec());
++        } else if id == b"data" && data.is_none() {
++            data = Some(bytes[start..end].to_vec());
++        }
++        at = end.saturating_add(size & 1);
++    }
++    let fmt = fmt.ok_or_else(|| "WAV output has no fmt chunk".to_string())?;
++    let data = data.ok_or_else(|| "WAV output has no data chunk".to_string())?;
++    if fmt.len() < 16 {
++        return Err("WAV fmt chunk is too short".to_string());
++    }
++    let block_align = usize::from(u16::from_le_bytes([fmt[12], fmt[13]]));
++    if block_align == 0 {
++        return Err("WAV block alignment is zero".to_string());
++    }
++    let fmt_padded = fmt.len() + (fmt.len() & 1);
++    let header_bytes = 12usize
++        .checked_add(8 + fmt_padded)
++        .and_then(|value| value.checked_add(8))
++        .ok_or_else(|| "WAV header size overflow".to_string())?;
++    if header_bytes >= MAX_TALK_AUDIO_BYTES {
++        return Err("WAV header alone exceeds the Talk frame ceiling".to_string());
++    }
++    let max_data = ((MAX_TALK_AUDIO_BYTES - header_bytes) / block_align) * block_align;
++    if max_data == 0 {
++        return Err("Talk frame ceiling cannot hold one WAV sample block".to_string());
++    }
++    let mut result = Vec::new();
++    for payload in data.chunks(max_data) {
++        let riff_size = 4usize + 8 + fmt_padded + 8 + payload.len();
++        let riff_size = u32::try_from(riff_size)
++            .map_err(|_| "WAV Talk chunk is too large for RIFF".to_string())?;
++        let fmt_size = u32::try_from(fmt.len())
++            .map_err(|_| "WAV fmt chunk is too large".to_string())?;
++        let data_size = u32::try_from(payload.len())
++            .map_err(|_| "WAV data chunk is too large".to_string())?;
++        let mut chunk = Vec::with_capacity(header_bytes + payload.len());
++        chunk.extend_from_slice(b"RIFF");
++        chunk.extend_from_slice(&riff_size.to_le_bytes());
++        chunk.extend_from_slice(b"WAVEfmt ");
++        chunk.extend_from_slice(&fmt_size.to_le_bytes());
++        chunk.extend_from_slice(&fmt);
++        if fmt.len() & 1 == 1 { chunk.push(0); }
++        chunk.extend_from_slice(b"data");
++        chunk.extend_from_slice(&data_size.to_le_bytes());
++        chunk.extend_from_slice(payload);
++        debug_assert!(chunk.len() <= MAX_TALK_AUDIO_BYTES);
++        result.push(chunk);
++    }
++    if result.is_empty() {
++        return Err("WAV output contained no audio data".to_string());
++    }
++    Ok(result)
++}
++
+ /// Run one Talk session until the device closes the socket.
+ ///
+ /// Errors from transcription, the queue or synthesis end that *turn* and are
+@@ -1036,31 +1136,43 @@ impl Session {
+                     .await;
+             }
+         };
+-        if bytes.is_empty() || bytes.len() > MAX_TALK_AUDIO_BYTES {
+-            self.report.errors += 1;
+-            return self
+-                .emit(
+-                    socket,
+-                    TalkServerFrameKind::Error {
+-                        code: "synthesis_too_large".into(),
+-                        message: "Synthesized speech passed this runner's frame ceiling.".into(),
+-                        retryable: true,
+-                    },
+-                )
+-                .await;
++        let chunks = match bounded_output_audio_chunks(bytes, &media_type) {
++            Ok(chunks) => chunks,
++            Err(error) => {
++                self.report.errors += 1;
++                return self
++                    .emit(
++                        socket,
++                        TalkServerFrameKind::Error {
++                            code: "synthesis_too_large".into(),
++                            message: bounded(&error, 1_024),
++                            retryable: true,
++                        },
++                    )
++                    .await;
++            }
++        };
++        let chunk_count = u32::try_from(chunks.len())
++            .map_err(|_| "Synthesized speech produced too many Talk chunks".to_string())?;
++        let response_id = format!("speech-{}", self.report.spoken_chunks.saturating_add(1));
++        for (chunk_index, bytes) in chunks.into_iter().enumerate() {
++            self.outbound_audio_sequence = self.outbound_audio_sequence.saturating_add(1);
++            self.emit(
++                socket,
++                TalkServerFrameKind::OutputAudio {
++                    audio_sequence: self.outbound_audio_sequence,
++                    response_id: response_id.clone(),
++                    chunk_index: u32::try_from(chunk_index).unwrap_or(u32::MAX),
++                    chunk_count,
++                    route_generation: self.identity.route_generation,
++                    media_type: media_type.clone(),
++                    audio_base64: STANDARD.encode(bytes),
++                },
++            )
++            .await?;
+         }
+-        self.outbound_audio_sequence += 1;
+-        self.report.spoken_chunks += 1;
+-        let audio_sequence = self.outbound_audio_sequence;
+-        self.emit(
+-            socket,
+-            TalkServerFrameKind::OutputAudio {
+-                audio_sequence,
+-                media_type,
+-                audio_base64: STANDARD.encode(bytes),
+-            },
+-        )
+-        .await
++        self.report.spoken_chunks = self.report.spoken_chunks.saturating_add(1);
++        Ok(())
+     }
+ 
+     async fn fail_turn(
+diff --git a/src-tauri/src/bin/monk
