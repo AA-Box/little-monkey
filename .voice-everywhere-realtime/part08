@@ -1,0 +1,192 @@
+% 2 != 0 {
++        return Err("Realtime PCM16 chunk has an incomplete sample".to_string());
++    }
++    Ok(())
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++struct HostMediaConfig {
++    protocol_version: u32,
++    listen: String,
++    token: String,
++}
++
++fn config_path(paths: &DaemonPaths) -> std::path::PathBuf {
++    paths.root.join("realtime-host-media.json")
++}
++
++fn save_config(paths: &DaemonPaths, config: &HostMediaConfig) -> Result<(), String> {
++    paths.ensure()?;
++    let path = config_path(paths);
++    let temporary = path.with_extension("json.tmp");
++    std::fs::write(
++        &temporary,
++        serde_json::to_vec(config).map_err(|error| error.to_string())?,
++    )
++    .map_err(|error| format!("Could not write Realtime host-media config: {error}"))?;
++    restrict_file(&temporary)?;
++    std::fs::rename(&temporary, &path)
++        .map_err(|error| format!("Could not publish Realtime host-media config: {error}"))?;
++    restrict_file(&path)
++}
++
++fn fresh_token() -> Result<String, String> {
++    let mut bytes = [0u8; 32];
++    SystemRandom::new()
++        .fill(&mut bytes)
++        .map_err(|_| "Could not generate Realtime host-media token".to_string())?;
++    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
++}
++
++/// Starts a loopback-only transport used by the desktop process to exchange raw PCM with
++/// the daemon-owned paired Talk sockets. The token is rewritten on every daemon start.
++pub(crate) async fn spawn_host_media_bridge(
++    paths: &DaemonPaths,
++    api: RemoteApi,
++) -> Result<SocketAddr, String> {
++    let listener = TcpListener::bind("127.0.0.1:0")
++        .await
++        .map_err(|error| format!("Could not bind Realtime host-media bridge: {error}"))?;
++    let address = listener
++        .local_addr()
++        .map_err(|error| format!("Could not read Realtime host-media address: {error}"))?;
++    let token = fresh_token()?;
++    save_config(
++        paths,
++        &HostMediaConfig {
++            protocol_version: HOST_MEDIA_PROTOCOL_VERSION,
++            listen: address.to_string(),
++            token: token.clone(),
++        },
++    )?;
++    tokio::spawn(async move {
++        loop {
++            let Ok((stream, peer)) = listener.accept().await else {
++                break;
++            };
++            if !peer.ip().is_loopback() {
++                continue;
++            }
++            let api = api.clone();
++            let token = token.clone();
++            tokio::spawn(async move {
++                let _ = http1::Builder::new()
++                    .keep_alive(true)
++                    .serve_connection(
++                        TokioIo::new(stream),
++                        service_fn(move |request| handle_host_media(api.clone(), token.clone(), request)),
++                    )
++                    .await;
++            });
++        }
++    });
++    Ok(address)
++}
++
++#[cfg(test)]
++pub(crate) async fn spawn_host_media_bridge_for_test(
++    paths: &DaemonPaths,
++    api: RemoteApi,
++) -> Result<SocketAddr, String> {
++    spawn_host_media_bridge(paths, api).await
++}
++
++async fn handle_host_media(
++    api: RemoteApi,
++    expected_token: String,
++    request: Request<Incoming>,
++) -> Result<Response<Full<Bytes>>, Infallible> {
++    let supplied = request
++        .headers()
++        .get(HOST_MEDIA_TOKEN_HEADER)
++        .and_then(|value| value.to_str().ok())
++        .unwrap_or("");
++    if ring::constant_time::verify_slices_are_equal(supplied.as_bytes(), expected_token.as_bytes())
++        .is_err()
++    {
++        return Ok(host_response(StatusCode::UNAUTHORIZED, Bytes::new()));
++    }
++    let Some((session_id, generation, direction)) = parse_target(request.uri().path()) else {
++        return Ok(host_response(StatusCode::NOT_FOUND, Bytes::new()));
++    };
++    let result = match (request.method(), direction) {
++        (&Method::GET, "input") => match api.take_realtime_input_for_host(&session_id, generation) {
++            Ok(Some(chunk)) => {
++                let mut response = host_response(StatusCode::OK, Bytes::from(chunk.bytes));
++                if let Ok(value) = hyper::header::HeaderValue::from_str(&chunk.sequence.to_string()) {
++                    response.headers_mut().insert("x-little-monkey-audio-sequence", value);
++                }
++                response
++            }
++            Ok(None) => host_response(StatusCode::NO_CONTENT, Bytes::new()),
++            Err(_) => host_response(StatusCode::CONFLICT, Bytes::new()),
++        },
++        (&Method::POST, "output") => {
++            let body = match Limited::new(request.into_body(), MAX_REALTIME_PCM_CHUNK_BYTES)
++                .collect()
++                .await
++            {
++                Ok(value) => value.to_bytes().to_vec(),
++                Err(_) => return Ok(host_response(StatusCode::PAYLOAD_TOO_LARGE, Bytes::new())),
++            };
++            match api.push_realtime_output_from_host(&session_id, generation, body) {
++                Ok(_) => host_response(StatusCode::ACCEPTED, Bytes::new()),
++                Err(_) => host_response(StatusCode::CONFLICT, Bytes::new()),
++            }
++        }
++        _ => host_response(StatusCode::METHOD_NOT_ALLOWED, Bytes::new()),
++    };
++    Ok(result)
++}
++
++fn host_response(status: StatusCode, body: Bytes) -> Response<Full<Bytes>> {
++    Response::builder()
++        .status(status)
++        .header("cache-control", "no-store")
++        .header("x-content-type-options", "nosniff")
++        .header("content-type", "application/octet-stream")
++        .body(Full::new(body))
++        .expect("static host-media response is valid")
++}
++
++fn parse_target(path: &str) -> Option<(String, u64, &'static str)> {
++    let parts: Vec<_> = path.split('/').filter(|part| !part.is_empty()).collect();
++    let ["v1", "host", "realtime", raw_session, raw_generation, direction] = parts.as_slice() else {
++        return None;
++    };
++    let session_id = percent_decode(raw_session);
++    validate_id(&session_id).ok()?;
++    let generation = raw_generation.parse::<u64>().ok().filter(|value| *value > 0)?;
++    let direction = match *direction {
++        "input" => "input",
++        "output" => "output",
++        _ => return None,
++    };
++    Some((session_id, generation, direction))
++}
++
++fn percent_decode(value: &str) -> String {
++    let bytes = value.as_bytes();
++    let mut out = Vec::with_capacity(bytes.len());
++    let mut index = 0;
++    while index < bytes.len() {
++        if bytes[index] == b'%' && index + 2 < bytes.len() {
++            if let Ok(byte) = u8::from_str_radix(&value[index + 1..index + 3], 16) {
++                out.push(byte);
++                index += 3;
++                continue;
++            }
++        }
++        out.push(bytes[index]);
++        index += 1;
++    }
++    String::from_utf8_lossy(&out).into_owned()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn media_queue_is_bounded_and_pcm_aligned() {
++        let bridge = RealtimeMediaBridge::default();

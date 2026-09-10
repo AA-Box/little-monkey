@@ -1,0 +1,133 @@
+diff --git a/src-tauri/src/bin/monkey-cli/daemon/remote/api.rs b/src-tauri/src/bin/monkey-cli/daemon/remote/api.rs
+index 3ee52ed..7d5acda 100644
+--- a/src-tauri/src/bin/monkey-cli/daemon/remote/api.rs
++++ b/src-tauri/src/bin/monkey-cli/daemon/remote/api.rs
+@@ -207,6 +207,7 @@ struct PendingTalkTicket {
+     route_id: Option<String>,
+     route_generation: Option<u64>,
+     route_role: Option<String>,
++    route_engine: Option<String>,
+     route_output_to_socket: bool,
+     route_event_cursor: u64,
+     expires_at_ms: u64,
+@@ -228,6 +229,8 @@ pub(crate) struct TalkSocketAuthorization {
+     pub route_generation: Option<u64>,
+     /// input, output, or duplex for desktop-owned VoiceRoute sockets.
+     pub route_role: Option<String>,
++    /// Pipeline or realtime for a host-owned routed socket.
++    pub route_engine: Option<String>,
+     /// Same paired endpoint is both microphone and speaker.
+     pub route_output_to_socket: bool,
+     /// Output-only sockets begin after this event, so old speech is never replayed.
+@@ -306,6 +309,9 @@ pub struct RemoteApi {
+     /// Short-lived, one-use WebSocket admissions keyed by a digest of the
+     /// opaque ticket. Device secrets never enter this map or a URL.
+     talk_tickets: Arc<Mutex<HashMap<String, PendingTalkTicket>>>,
++    /// Raw Realtime PCM exists only here, in bounded memory shared by Talk sockets
++    /// and the loopback-only desktop bridge. It is never written to SQLite.
++    realtime_media: Arc<super::realtime_bridge::RealtimeMediaBridge>,
+     /// Speech backends for Talk sockets. `None` — always, in production — means
+     /// the operator's own configured stack, resolved per session. A test
+     /// substitutes the two things that are genuinely outside this process, a
+@@ -329,6 +335,7 @@ impl Clone for RemoteApi {
+             terminal_commits: Arc::clone(&self.terminal_commits),
+             audit: self.audit.clone(),
+             talk_tickets: Arc::clone(&self.talk_tickets),
++            realtime_media: Arc::clone(&self.realtime_media),
+             talk_speech: self.talk_speech.clone(),
+         }
+     }
+@@ -363,6 +370,7 @@ impl RemoteApi {
+             terminal_commits: Arc::new(Mutex::new(HashMap::new())),
+             audit,
+             talk_tickets: Arc::new(Mutex::new(HashMap::new())),
++            realtime_media: Arc::new(super::realtime_bridge::RealtimeMediaBridge::default()),
+             talk_speech: None,
+         })
+     }
+@@ -394,6 +402,7 @@ impl RemoteApi {
+             terminal_commits: Arc::new(Mutex::new(HashMap::new())),
+             audit,
+             talk_tickets: Arc::new(Mutex::new(HashMap::new())),
++            realtime_media: Arc::new(super::realtime_bridge::RealtimeMediaBridge::default()),
+             talk_speech: None,
+         }
+     }
+@@ -2300,7 +2309,7 @@ impl RemoteApi {
+             .map_err(|error| (400, format!("Invalid Talk ticket request: {error}")))?;
+         request.validate().map_err(|error| (400, error))?;
+ 
+-        let (session_id, route_id, route_generation, route_role, route_output_to_socket, route_event_cursor) = {
++        let (session_id, route_id, route_generation, route_role, route_engine, route_output_to_socket, route_event_cursor) = {
+             let store = self.locked_store()?;
+             let surface = store.device_surface(&device.device_id).map_err(internal)?;
+             let effective = effective_capabilities(&device.capabilities, surface.as_ref());
+@@ -2314,9 +2323,6 @@ impl RemoteApi {
+                     if route.state != "active" || route.generation != generation {
+                         return Err((409, "This VoiceRoute generation is stale".to_string()));
+                     }
+-                    if route.engine != "pipeline" {
+-                        return Err((409, "Paired Realtime Voice needs a direct media bridge; it is not routed through transcription.".to_string()));
+-                    }
+                     let expected_input = format!("paired:{}:input", device.device_id);
+                     let expected_output = format!("paired:{}:output", device.device_id);
+                     match role {
+@@ -2354,6 +2360,7 @@ impl RemoteApi {
+                         Some(route.route_id),
+                         Some(route.generation),
+                         Some(role.to_string()),
++                        Some(route.engine),
+                         role == "duplex",
+                         cursor,
+                     )
+@@ -2362,7 +2369,7 @@ impl RemoteApi {
+                     if !effective.contains(&DeviceCapability::VoiceStream) {
+                         return Err((403, "This device's microphone is not effective".to_string()));
+                     }
+-                    (request.session_id.clone(), None, None, None, true, 0)
++                    (request.session_id.clone(), None, None, None, None, true, 0)
+                 }
+                 _ => unreachable!("TalkTicketRequest::validate rejects partial routes"),
+             }
+@@ -2393,6 +2400,7 @@ impl RemoteApi {
+                 route_id,
+                 route_generation,
+                 route_role,
++                route_engine,
+                 route_output_to_socket,
+                 route_event_cursor,
+                 expires_at_ms: issued.expires_at_ms,
+@@ -2479,6 +2487,7 @@ impl RemoteApi {
+             route_id: pending.route_id,
+             route_generation: pending.route_generation,
+             route_role: pending.route_role,
++            route_engine: pending.route_engine,
+             route_output_to_socket: pending.route_output_to_socket,
+             route_event_cursor: pending.route_event_cursor,
+         })
+@@ -2660,6 +2669,108 @@ impl RemoteApi {
+             .map(|_| ())
+     }
+ 
++    pub(crate) fn talk_input_route_live(&self, authorization: &TalkSocketAuthorization) -> bool {
++        let (Some(route_id), Some(generation)) =
++            (authorization.route_id.as_deref(), authorization.route_generation)
++        else { return false; };
++        let Ok(store) = self.store.lock() else { return false; };
++        let Some(device) = store.device(&authorization.device_id).ok().flatten() else { return false; };
++        if !device.active() { return false; }
++        let surface = store.device_surface(&authorization.device_id).ok().flatten();
++        let effective = effective_capabilities(&device.capabilities, surface.as_ref());
++        let Ok(Some(route)) = store.voice_route_by_id(route_id) else { return false; };
++        route.state == "active"
++            && route.generation == generation
++            && route.session_id == authorization.session_id
++            && route.input_endpoint == format!("paired:{}:input", authorization.device_id)
++            && effective.contains(&DeviceCapability::VoiceStream)
++    }
++
++    fn realtime_host_route(&self, session_id: &str, generation: u64) -> Result<super::store::VoiceRouteRecord, String> {
++        let store = self
++            .store
++            .lock()
++            .map_err(|_| "Remote state lock

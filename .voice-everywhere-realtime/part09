@@ -1,0 +1,18 @@
+();
++        assert!(bridge.push_input("chat-one", 1, vec![0]).is_err());
++        assert!(bridge.push_input("chat-one", 1, vec![0, 1, 2, 3]).is_ok());
++        let chunk = bridge.pop_input("chat-one", 1).unwrap().unwrap();
++        assert_eq!(chunk.bytes, vec![0, 1, 2, 3]);
++        assert_eq!(chunk.sequence, 1);
++    }
++
++    #[test]
++    fn host_path_is_generation_scoped() {
++        assert_eq!(
++            parse_target("/v1/host/realtime/chat-one/9/input"),
++            Some(("chat-one".to_string(), 9, "input"))
++        );
++        assert!(parse_target("/v1/host/realtime/chat-one/0/input").is_none());
++        assert!(parse_target("/v1/host/realtime/chat-one/9/other").is_none());
++    }
++}

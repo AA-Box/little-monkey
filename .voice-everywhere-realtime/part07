@@ -1,0 +1,202 @@
+           prepare_paired_endpoint(&mut store, &next_output, session_id, &previous.route_id, next_generation, now_ms)?;
++            prepare_paired_endpoint(&mut store, &next_output, session_id, &previous.route_id, next_generation, &previous.engine, now_ms)?;
+         }
+     }
+     let selected = set_route(
+diff --git a/src-tauri/src/bin/monkey-cli/daemon/remote/realtime_bridge.rs b/src-tauri/src/bin/monkey-cli/daemon/remote/realtime_bridge.rs
+new file mode 100644
+index 0000000..2d238ff
+--- /dev/null
++++ b/src-tauri/src/bin/monkey-cli/daemon/remote/realtime_bridge.rs
+@@ -0,0 +1,399 @@
++//! Ephemeral PCM bridge between paired Talk sockets and the desktop Realtime WebRTC session.
++//!
++//! This is intentionally not part of the VoiceRoute ledger. Audio exists only in bounded
++//! in-memory queues and on a loopback-only HTTP socket authenticated by a process-local token.
++//! Route generation is re-checked on every ingress/egress operation so media from a moved or
++//! revoked route cannot become current again.
++
++use std::collections::{HashMap, VecDeque};
++use std::convert::Infallible;
++use std::net::SocketAddr;
++use std::sync::Mutex;
++
++use http_body_util::{BodyExt, Full, Limited};
++use hyper::body::{Bytes, Incoming};
++use hyper::server::conn::http1;
++use hyper::service::service_fn;
++use hyper::{Method, Request, Response, StatusCode};
++use hyper_util::rt::TokioIo;
++use ring::rand::{SecureRandom, SystemRandom};
++use serde::{Deserialize, Serialize};
++use tokio::net::TcpListener;
++
++use crate::daemon::store::{restrict_file, DaemonPaths};
++
++use super::api::{RemoteApi, TalkSocketAuthorization};
++use super::protocol::validate_id;
++
++pub const REALTIME_PCM_MEDIA_TYPE: &str = "audio/pcm16;rate=48000";
++pub const REALTIME_PCM_SAMPLE_RATE_HZ: u32 = 48_000;
++pub const REALTIME_PCM_CHANNELS: u8 = 1;
++pub const MAX_REALTIME_PCM_CHUNK_BYTES: usize = 64 * 1024;
++const MAX_REALTIME_PCM_QUEUE_BYTES: usize = 1024 * 1024;
++const MAX_REALTIME_PCM_QUEUE_CHUNKS: usize = 128;
++const MAX_REALTIME_ROUTE_QUEUES: usize = 32;
++const HOST_MEDIA_PROTOCOL_VERSION: u32 = 1;
++const HOST_MEDIA_TOKEN_HEADER: &str = "x-little-monkey-host-media-token";
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) struct RealtimePcmChunk {
++    pub sequence: u64,
++    pub bytes: Vec<u8>,
++}
++
++#[derive(Default)]
++struct DirectionQueue {
++    chunks: VecDeque<RealtimePcmChunk>,
++    bytes: usize,
++    next_sequence: u64,
++}
++
++impl DirectionQueue {
++    fn push(&mut self, bytes: Vec<u8>) -> Result<u64, String> {
++        validate_pcm(&bytes)?;
++        if self.chunks.len() >= MAX_REALTIME_PCM_QUEUE_CHUNKS
++            || self.bytes.saturating_add(bytes.len()) > MAX_REALTIME_PCM_QUEUE_BYTES
++        {
++            return Err("Realtime media bridge backpressure limit reached".to_string());
++        }
++        self.next_sequence = self.next_sequence.saturating_add(1);
++        let sequence = self.next_sequence;
++        self.bytes = self.bytes.saturating_add(bytes.len());
++        self.chunks.push_back(RealtimePcmChunk { sequence, bytes });
++        Ok(sequence)
++    }
++
++    fn pop(&mut self) -> Option<RealtimePcmChunk> {
++        let chunk = self.chunks.pop_front()?;
++        self.bytes = self.bytes.saturating_sub(chunk.bytes.len());
++        Some(chunk)
++    }
++}
++
++#[derive(Default)]
++struct RouteQueue {
++    input: DirectionQueue,
++    output: DirectionQueue,
++    last_touched: u64,
++}
++
++#[derive(Default)]
++pub(crate) struct RealtimeMediaBridge {
++    routes: Mutex<HashMap<(String, u64), RouteQueue>>,
++}
++
++impl RealtimeMediaBridge {
++    fn queue_mut<'a>(
++        routes: &'a mut HashMap<(String, u64), RouteQueue>,
++        session_id: &str,
++        generation: u64,
++    ) -> &'a mut RouteQueue {
++        if !routes.contains_key(&(session_id.to_string(), generation))
++            && routes.len() >= MAX_REALTIME_ROUTE_QUEUES
++        {
++            if let Some(oldest) = routes
++                .iter()
++                .min_by_key(|(_, queue)| queue.last_touched)
++                .map(|(key, _)| key.clone())
++            {
++                routes.remove(&oldest);
++            }
++        }
++        routes
++            .entry((session_id.to_string(), generation))
++            .or_default()
++    }
++
++    pub(crate) fn push_input(
++        &self,
++        session_id: &str,
++        generation: u64,
++        bytes: Vec<u8>,
++    ) -> Result<u64, String> {
++        let mut routes = self
++            .routes
++            .lock()
++            .map_err(|_| "Realtime media bridge lock was poisoned".to_string())?;
++        let queue = Self::queue_mut(&mut routes, session_id, generation);
++        queue.last_touched = monotonic_tick();
++        queue.input.push(bytes)
++    }
++
++    pub(crate) fn pop_input(
++        &self,
++        session_id: &str,
++        generation: u64,
++    ) -> Result<Option<RealtimePcmChunk>, String> {
++        let mut routes = self
++            .routes
++            .lock()
++            .map_err(|_| "Realtime media bridge lock was poisoned".to_string())?;
++        let Some(queue) = routes.get_mut(&(session_id.to_string(), generation)) else {
++            return Ok(None);
++        };
++        queue.last_touched = monotonic_tick();
++        Ok(queue.input.pop())
++    }
++
++    pub(crate) fn push_output(
++        &self,
++        session_id: &str,
++        generation: u64,
++        bytes: Vec<u8>,
++    ) -> Result<u64, String> {
++        let mut routes = self
++            .routes
++            .lock()
++            .map_err(|_| "Realtime media bridge lock was poisoned".to_string())?;
++        let queue = Self::queue_mut(&mut routes, session_id, generation);
++        queue.last_touched = monotonic_tick();
++        queue.output.push(bytes)
++    }
++
++    pub(crate) fn pop_output(
++        &self,
++        session_id: &str,
++        generation: u64,
++    ) -> Result<Option<RealtimePcmChunk>, String> {
++        let mut routes = self
++            .routes
++            .lock()
++            .map_err(|_| "Realtime media bridge lock was poisoned".to_string())?;
++        let Some(queue) = routes.get_mut(&(session_id.to_string(), generation)) else {
++            return Ok(None);
++        };
++        queue.last_touched = monotonic_tick();
++        Ok(queue.output.pop())
++    }
++
++    pub(crate) fn discard(&self, session_id: &str, generation: u64) {
++        if let Ok(mut routes) = self.routes.lock() {
++            routes.remove(&(session_id.to_string(), generation));
++        }
++    }
++}
++
++fn monotonic_tick() -> u64 {
++    use std::sync::atomic::{AtomicU64, Ordering};
++    static TICK: AtomicU64 = AtomicU64::new(0);
++    TICK.fetch_add(1, Ordering::Relaxed)
++}
++
++pub(crate) fn validate_pcm(bytes: &[u8]) -> Result<(), String> {
++    if bytes.is_empty() {
++        return Err("Realtime PCM chunk is empty".to_string());
++    }
++    if bytes.len() > MAX_REALTIME_PCM_CHUNK_BYTES {
++        return Err(format!(
++            "Realtime PCM chunk exceeds {MAX_REALTIME_PCM_CHUNK_BYTES} bytes"
++        ));
++    }
++    if bytes.len() 

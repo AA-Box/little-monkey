@@ -1,0 +1,154 @@
+ was poisoned".to_string())?;
++        let route = store
++            .voice_route(session_id)?
++            .ok_or_else(|| "Realtime VoiceRoute no longer exists".to_string())?;
++        if route.state != "active" || route.generation != generation || route.engine != "realtime" {
++            return Err("Realtime VoiceRoute generation is stale or inactive".to_string());
++        }
++        Ok(route)
++    }
++
++    pub(crate) fn push_realtime_input_from_device(
++        &self,
++        authorization: &TalkSocketAuthorization,
++        bytes: Vec<u8>,
++    ) -> Result<u64, String> {
++        if authorization.route_engine.as_deref() != Some("realtime")
++            || !matches!(authorization.route_role.as_deref(), Some("input" | "duplex"))
++            || !self.talk_input_route_live(authorization)
++        {
++            return Err("Realtime microphone authority was revoked or moved".to_string());
++        }
++        let generation = authorization
++            .route_generation
++            .ok_or_else(|| "Realtime microphone route has no generation".to_string())?;
++        super::realtime_bridge::validate_pcm(&bytes)?;
++        self.realtime_media
++            .push_input(&authorization.session_id, generation, bytes)
++    }
++
++    pub(crate) fn take_realtime_input_for_host(
++        &self,
++        session_id: &str,
++        generation: u64,
++    ) -> Result<Option<super::realtime_bridge::RealtimePcmChunk>, String> {
++        let route = self.realtime_host_route(session_id, generation)?;
++        if !route.input_endpoint.starts_with("paired:") {
++            return Ok(None);
++        }
++        if route.input_command_id.is_none() {
++            return Err("Realtime paired microphone is not activated".to_string());
++        }
++        self.realtime_media.pop_input(session_id, generation)
++    }
++
++    pub(crate) fn push_realtime_output_from_host(
++        &self,
++        session_id: &str,
++        generation: u64,
++        bytes: Vec<u8>,
++    ) -> Result<u64, String> {
++        let route = self.realtime_host_route(session_id, generation)?;
++        if !route.output_endpoint.starts_with("paired:") {
++            return Err("Realtime VoiceRoute does not currently use a paired speaker".to_string());
++        }
++        if route.output_command_id.is_none() {
++            return Err("Realtime paired speaker is not activated".to_string());
++        }
++        super::realtime_bridge::validate_pcm(&bytes)?;
++        self.realtime_media.push_output(session_id, generation, bytes)
++    }
++
++    pub(crate) fn take_realtime_output_for_device(
++        &self,
++        authorization: &TalkSocketAuthorization,
++    ) -> Result<Option<super::realtime_bridge::RealtimePcmChunk>, String> {
++        if authorization.route_engine.as_deref() != Some("realtime")
++            || !matches!(authorization.route_role.as_deref(), Some("output" | "duplex"))
++            || !self.talk_output_route_live(authorization)
++        {
++            return Err("Realtime speaker authority was revoked or moved".to_string());
++        }
++        let generation = authorization
++            .route_generation
++            .ok_or_else(|| "Realtime speaker route has no generation".to_string())?;
++        self.realtime_media.pop_output(&authorization.session_id, generation)
++    }
++
++    pub(crate) fn discard_realtime_media(&self, session_id: &str, generation: u64) {
++        self.realtime_media.discard(session_id, generation);
++    }
++
+     fn talk_stream_needs_upgrade(
+         &self,
+         session_id: &str,
+diff --git a/src-tauri/src/bin/monkey-cli/daemon/remote/mod.rs b/src-tauri/src/bin/monkey-cli/daemon/remote/mod.rs
+index 87b6712..01a4997 100644
+--- a/src-tauri/src/bin/monkey-cli/daemon/remote/mod.rs
++++ b/src-tauri/src/bin/monkey-cli/daemon/remote/mod.rs
+@@ -8,6 +8,7 @@ pub(crate) mod device;
+ mod device_e2e;
+ pub(crate) mod migrate;
+ pub(crate) mod protocol;
++pub(crate) mod realtime_bridge;
+ pub(crate) mod push;
+ pub(crate) mod qr;
+ mod server;
+diff --git a/src-tauri/src/bin/monkey-cli/daemon/remote/protocol.rs b/src-tauri/src/bin/monkey-cli/daemon/remote/protocol.rs
+index a32ea89..cf59957 100644
+--- a/src-tauri/src/bin/monkey-cli/daemon/remote/protocol.rs
++++ b/src-tauri/src/bin/monkey-cli/daemon/remote/protocol.rs
+@@ -43,7 +43,7 @@ pub const MAX_REMOTE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
+ /// would offer to re-send *every* turn — including ones already answered. That
+ /// is exactly the "tell somebody to repeat what is already running" failure the
+ /// journal exists to prevent, so the two sides are pinned to each other.
+-pub const TALK_PROTOCOL_VERSION: u32 = 6;
++pub const TALK_PROTOCOL_VERSION: u32 = 7;
+ 
+ /// The version whose only difference from [`TALK_PROTOCOL_VERSION`] is the
+ /// missing utterance id — so a client speaking it can be told precisely what is
+@@ -61,6 +61,9 @@ const TALK_PROTOCOL_VERSION_WITHOUT_ROUTE_ROLE: u32 = 4;
+ /// per frame, so it could neither stream long output nor bind each chunk to the
+ /// route generation/response that produced it.
+ const TALK_PROTOCOL_VERSION_WITHOUT_BOUNDED_OUTPUT_STREAM: u32 = 5;
++/// Version 6 has bounded routed output, but no raw PCM media type for the direct
++/// paired-device Realtime WebRTC bridge.
++const TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_PCM: u32 = 6;
+ pub const MAX_TALK_AUDIO_BYTES: usize = MAX_VOICE_CHUNK_BYTES;
+ pub const MAX_TALK_AUDIO_BASE64_BYTES: usize = MAX_TALK_AUDIO_BYTES.div_ceil(3) * 4;
+ pub const MAX_TALK_FRAME_BYTES: usize = MAX_TALK_AUDIO_BASE64_BYTES + 16 * 1024;
+@@ -1628,6 +1631,7 @@ pub const TALK_MEDIA_TYPES: &[&str] = &[
+     "audio/mp4",
+     "audio/wav",
+     "audio/mpeg",
++    super::realtime_bridge::REALTIME_PCM_MEDIA_TYPE,
+ ];
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+@@ -2116,6 +2120,7 @@ fn validate_talk_protocol_version(protocol_version: u32) -> Result<(), String> {
+             | TALK_PROTOCOL_VERSION_WITHOUT_VOICE_ROUTE
+             | TALK_PROTOCOL_VERSION_WITHOUT_ROUTE_ROLE
+             | TALK_PROTOCOL_VERSION_WITHOUT_BOUNDED_OUTPUT_STREAM
++            | TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_PCM
+     ) {
+         return Err(
+             "This Talk client is from an older version of the app; reload the page to continue"
+diff --git a/src-tauri/src/bin/monkey-cli/daemon/remote/server.rs b/src-tauri/src/bin/monkey-cli/daemon/remote/server.rs
+index 0a6b49f..56556ee 100644
+--- a/src-tauri/src/bin/monkey-cli/daemon/remote/server.rs
++++ b/src-tauri/src/bin/monkey-cli/daemon/remote/server.rs
+@@ -121,6 +121,7 @@ pub async fn spawn_if_configured(
+     }
+     let listener = bind(&config).await?;
+     let acceptor = acceptor(&config)?;
++    let bridge_paths = paths.clone();
+     let api = RemoteApi::production(
+         paths,
+         config.clone(),
+@@ -129,6 +130,7 @@ pub async fn spawn_if_configured(
+         placement,
+         peer_runs,
+     )?;
++    super::realtime_bridge::spawn_host_media_bridge(&bridge_paths, api.clone()).await?;
+     tokio::spawn(async move {
+         if let 
