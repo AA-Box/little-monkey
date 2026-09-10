@@ -43,7 +43,7 @@ pub const MAX_REMOTE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 /// would offer to re-send *every* turn — including ones already answered. That
 /// is exactly the "tell somebody to repeat what is already running" failure the
 /// journal exists to prevent, so the two sides are pinned to each other.
-pub const TALK_PROTOCOL_VERSION: u32 = 5;
+pub const TALK_PROTOCOL_VERSION: u32 = 6;
 
 /// The version whose only difference from [`TALK_PROTOCOL_VERSION`] is the
 /// missing utterance id — so a client speaking it can be told precisely what is
@@ -57,6 +57,10 @@ const TALK_PROTOCOL_VERSION_WITHOUT_ACCEPTANCE: u32 = 2;
 const TALK_PROTOCOL_VERSION_WITHOUT_VOICE_ROUTE: u32 = 3;
 /// Version 4 can bind a route, but cannot bind independent input/output Talk roles.
 const TALK_PROTOCOL_VERSION_WITHOUT_ROUTE_ROLE: u32 = 4;
+/// Version 5 routed independent speakers but could only send one whole TTS blob
+/// per frame, so it could neither stream long output nor bind each chunk to the
+/// route generation/response that produced it.
+const TALK_PROTOCOL_VERSION_WITHOUT_BOUNDED_OUTPUT_STREAM: u32 = 5;
 pub const MAX_TALK_AUDIO_BYTES: usize = MAX_VOICE_CHUNK_BYTES;
 pub const MAX_TALK_AUDIO_BASE64_BYTES: usize = MAX_TALK_AUDIO_BYTES.div_ceil(3) * 4;
 pub const MAX_TALK_FRAME_BYTES: usize = MAX_TALK_AUDIO_BASE64_BYTES + 16 * 1024;
@@ -1968,7 +1972,19 @@ pub enum TalkServerFrameKind {
         text: String,
     },
     OutputAudio {
+        /// Monotonic across every playable output chunk on this socket.
         audio_sequence: u64,
+        /// Identity of the synthesized response fragment these chunks belong to.
+        /// It is not authority; the authenticated route/session envelope is.
+        response_id: String,
+        /// Zero-based position inside this response fragment.
+        chunk_index: u32,
+        /// Total number of bounded, individually playable chunks.
+        chunk_count: u32,
+        /// Present for a host-owned VoiceRoute so stale output can be rejected
+        /// even before the surrounding socket is torn down.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route_generation: Option<u64>,
         media_type: String,
         audio_base64: String,
     },
@@ -2006,10 +2022,21 @@ impl TalkServerFrame {
             }
             TalkServerFrameKind::OutputAudio {
                 audio_sequence,
+                response_id,
+                chunk_index,
+                chunk_count,
+                route_generation,
                 media_type,
                 audio_base64,
             } => {
                 validate_talk_audio_sequence(*audio_sequence)?;
+                validate_id(response_id)?;
+                if *chunk_count == 0 || *chunk_index >= *chunk_count {
+                    return Err("Talk output chunk position is invalid".to_string());
+                }
+                if matches!(route_generation, Some(0)) {
+                    return Err("Talk route generation must be positive".to_string());
+                }
                 validate_talk_media_type(media_type)?;
                 validate_talk_audio(audio_base64)?;
             }
@@ -2088,6 +2115,7 @@ fn validate_talk_protocol_version(protocol_version: u32) -> Result<(), String> {
             | TALK_PROTOCOL_VERSION_WITHOUT_ACCEPTANCE
             | TALK_PROTOCOL_VERSION_WITHOUT_VOICE_ROUTE
             | TALK_PROTOCOL_VERSION_WITHOUT_ROUTE_ROLE
+            | TALK_PROTOCOL_VERSION_WITHOUT_BOUNDED_OUTPUT_STREAM
     ) {
         return Err(
             "This Talk client is from an older version of the app; reload the page to continue"
@@ -3095,6 +3123,10 @@ mod tests {
                 5,
                 TalkServerFrameKind::OutputAudio {
                     audio_sequence: 1,
+                    response_id: "response-one".into(),
+                    chunk_index: 0,
+                    chunk_count: 1,
+                    route_generation: Some(7),
                     media_type: "audio/mpeg".into(),
                     audio_base64: audio,
                 },

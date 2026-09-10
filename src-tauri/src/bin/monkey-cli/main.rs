@@ -637,7 +637,18 @@ fn voice_endpoint_json(endpoint: &daemon::remote::voice_route::EndpointDescripto
         "direction": endpoint.direction,
         "locality": endpoint.locality,
         "device_id": endpoint.device_id,
+        "input_supported": endpoint.input_supported,
+        "output_supported": endpoint.output_supported,
+        "voice_stream_supported": endpoint.voice_stream_supported,
+        "os_permission": endpoint.os_permission,
+        "readiness": endpoint.readiness,
+        "foreground_required": endpoint.foreground_required,
+        "interaction_required": endpoint.interaction_required,
+        "online": endpoint.online,
+        "last_seen_at_ms": endpoint.last_seen_at_ms,
+        "latency_ms": endpoint.latency_ms,
         "ready": endpoint.ready,
+        "blocked_code": endpoint.blocked_code,
         "blocked_by": endpoint.blocked_by,
     })
 }
@@ -678,9 +689,9 @@ fn run_voice_command(action: &VoiceCmd) -> Result<(), String> {
                 if *json {
                     println!("{}", serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?);
                 } else if let Some(route) = route {
-                    println!("{} generation={} {} -> {} ({})", route.session_id, route.generation, route.input_endpoint, route.output_endpoint, route.state);
+                    println!("generation={} {} -> {} ({})", route.generation, route.input_endpoint, route.output_endpoint, route.state);
                 } else {
-                    println!("No voice route for {session_id}.");
+                    println!("No voice route for that conversation.");
                 }
                 Ok(())
             }
@@ -688,7 +699,7 @@ fn run_voice_command(action: &VoiceCmd) -> Result<(), String> {
                 let route = voice_route::set_route(&paths, session_id, engine, input, output, daemon::remote::now_ms_public()?)?;
                 let value = voice_route::route_json(&route);
                 if *json { println!("{}", serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?); }
-                else { println!("{} generation={} {} -> {}", route.session_id, route.generation, route.input_endpoint, route.output_endpoint); }
+                else { println!("generation={} {} -> {}", route.generation, route.input_endpoint, route.output_endpoint); }
                 Ok(())
             }
             VoiceRouteCmd::Move { session_id, input, output, json } => {
@@ -701,14 +712,14 @@ fn run_voice_command(action: &VoiceCmd) -> Result<(), String> {
                 )?;
                 let value = voice_route::route_json(&route);
                 if *json { println!("{}", serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?); }
-                else { println!("{} generation={} {} -> {}", route.session_id, route.generation, route.input_endpoint, route.output_endpoint); }
+                else { println!("generation={} {} -> {}", route.generation, route.input_endpoint, route.output_endpoint); }
                 Ok(())
             }
             VoiceRouteCmd::Stop { session_id, json } => {
                 let route = voice_route::stop_route(&paths, session_id, daemon::remote::now_ms_public()?)?;
                 let value = route.as_ref().map(voice_route::route_json);
                 if *json { println!("{}", serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?); }
-                else { println!("Stopped voice route for {session_id}."); }
+                else { println!("Stopped voice route."); }
                 Ok(())
             }
             VoiceRouteCmd::Activate { session_id } => {

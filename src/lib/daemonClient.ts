@@ -402,7 +402,18 @@ export interface AudioEndpointDescriptor {
   direction: AudioEndpointDirection;
   locality: AudioEndpointLocality;
   device_id: string | null;
+  input_supported: boolean;
+  output_supported: boolean;
+  voice_stream_supported: boolean;
+  os_permission: 'granted' | 'denied' | 'undetermined' | 'promptable' | 'not_required' | 'unsupported' | null;
+  readiness: 'ready' | 'foreground_required' | 'interaction_required' | 'armed_required' | 'unavailable' | null;
+  foreground_required: boolean;
+  interaction_required: boolean;
+  online: boolean;
+  last_seen_at_ms: number | null;
+  latency_ms: number | null;
   ready: boolean;
+  blocked_code: string | null;
   blocked_by: string | null;
 }
 

@@ -17,22 +17,70 @@ import { IconButton } from '../ui';
 const localId = (direction: 'input' | 'output', id: string | null | undefined) =>
   `local:${direction}:${id || 'default'}`;
 
+async function localMicrophonePermission(): Promise<AudioEndpointDescriptor['os_permission']> {
+  if (!navigator.permissions?.query) return 'undetermined';
+  try {
+    // `microphone` is implemented by Chromium/WebKit even though older DOM
+    // typings do not include it in PermissionName. The runtime result is the
+    // authority; an unsupported query remains fail-honest as undetermined.
+    const status = await navigator.permissions.query(
+      { name: 'microphone' } as Parameters<Permissions['query']>[0],
+    );
+    if (status.state === 'granted') return 'granted';
+    if (status.state === 'denied') return 'denied';
+    return 'promptable';
+  } catch {
+    return 'undetermined';
+  }
+}
+
 async function localEndpoints(): Promise<AudioEndpointDescriptor[]> {
   if (!navigator.mediaDevices?.enumerateDevices) return [];
-  const devices = await navigator.mediaDevices.enumerateDevices();
+  const [devices, microphonePermission] = await Promise.all([
+    navigator.mediaDevices.enumerateDevices(),
+    localMicrophonePermission(),
+  ]);
   return devices
     .filter((device) => device.kind === 'audioinput' || device.kind === 'audiooutput')
-    .map((device, index) => ({
-      id: localId(device.kind === 'audioinput' ? 'input' : 'output', device.deviceId),
-      label:
-        device.label ||
-        `${device.kind === 'audioinput' ? 'Microphone' : 'Speaker'} ${index + 1}`,
-      direction: device.kind === 'audioinput' ? 'input' : 'output',
-      locality: 'local',
-      device_id: null,
-      ready: true,
-      blocked_by: null,
-    }));
+    .map((device, index) => {
+      const input = device.kind === 'audioinput';
+      const permission = input ? microphonePermission : 'not_required';
+      const permissionBlocked = input && permission !== 'granted';
+      const denied = permission === 'denied';
+      return {
+        id: localId(input ? 'input' : 'output', device.deviceId),
+        label: device.label || `${input ? 'Microphone' : 'Speaker'} ${index + 1}`,
+        direction: input ? 'input' : 'output',
+        locality: 'local',
+        device_id: null,
+        input_supported: input,
+        output_supported: !input,
+        voice_stream_supported: input,
+        os_permission: permission,
+        readiness: denied ? 'unavailable' : permissionBlocked ? 'interaction_required' : 'ready',
+        foreground_required: false,
+        interaction_required: permissionBlocked && !denied,
+        online: true,
+        last_seen_at_ms: null,
+        latency_ms: null,
+        ready: !permissionBlocked,
+        blocked_code: permissionBlocked ? (denied ? 'permission_denied' : 'permission_required') : null,
+        blocked_by: permissionBlocked
+          ? denied
+            ? 'Microphone permission denied'
+            : 'Microphone permission will be requested when Talk starts'
+          : null,
+      } satisfies AudioEndpointDescriptor;
+    });
+}
+
+function endpointSelectable(endpoint: AudioEndpointDescriptor): boolean {
+  if (endpoint.ready) return true;
+  // A local desktop microphone may be selected while permission is promptable:
+  // Talk opens it from the user's start gesture. A paired device cannot be
+  // prompted by the host and therefore remains disabled until it advertises
+  // effective readiness itself.
+  return endpoint.locality === 'local' && endpoint.blocked_code === 'permission_required';
 }
 
 function defaultRoute(voice: VoiceConfig): Pick<VoiceRouteRecord, 'input_endpoint' | 'output_endpoint'> {
@@ -143,7 +191,7 @@ export function VoiceRouteSelector({
           onChange={(event) => void apply(event.target.value, output)}
         >
           {inputs.map((endpoint) => (
-            <option key={endpoint.id} value={endpoint.id} disabled={!endpoint.ready}>
+            <option key={endpoint.id} value={endpoint.id} disabled={!endpointSelectable(endpoint)}>
               {endpoint.label}{endpoint.ready ? '' : ` — ${endpoint.blocked_by ?? 'not ready'}`}
             </option>
           ))}
@@ -158,7 +206,7 @@ export function VoiceRouteSelector({
           onChange={(event) => void apply(input, event.target.value)}
         >
           {outputs.map((endpoint) => (
-            <option key={endpoint.id} value={endpoint.id} disabled={!endpoint.ready}>
+            <option key={endpoint.id} value={endpoint.id} disabled={!endpointSelectable(endpoint)}>
               {endpoint.label}{endpoint.ready ? '' : ` — ${endpoint.blocked_by ?? 'not ready'}`}
             </option>
           ))}

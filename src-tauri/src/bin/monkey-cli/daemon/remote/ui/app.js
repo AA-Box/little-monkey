@@ -2788,8 +2788,10 @@ async function performCommand(command, signal) {
     case "notification_post":
       return plainOutcome(await postNotification(argumentsValue, signal));
     case "audio_playback":
+      if (argumentsValue.mode === "talk_route_prepare") return plainOutcome(await prepareTalkRoute(argumentsValue));
       return plainOutcome(await playAudio(argumentsValue, signal));
     case "voice_stream":
+      if (argumentsValue.mode === "talk_route_prepare") return plainOutcome(await prepareTalkRoute(argumentsValue));
       if (argumentsValue.mode === "talk_route") return plainOutcome(await runTalkRoute(argumentsValue, signal));
       return plainOutcome(await streamVoice(argumentsValue, signal));
     default:
@@ -3051,6 +3053,15 @@ function talkHandleFrame(raw) {
         ui.talkAnswer.textContent === "—" ? frame.text : ui.talkAnswer.textContent + frame.text;
       break;
     case "output_audio":
+      if (talk.routeGeneration !== null && frame.route_generation !== talk.routeGeneration) {
+        // A delayed speaker frame from the previous route generation is never
+        // allowed to leak through a handoff. Negative acknowledgement also
+        // releases the host's bounded backpressure wait.
+        if (talk.frames && Number.isInteger(frame.audio_sequence)) {
+          talkSendFrame(talk.frames.playbackAck(frame.audio_sequence, false));
+        }
+        break;
+      }
       talkQueueAudio(frame.audio_base64, frame.media_type, frame.audio_sequence);
       break;
     case "turn_accepted":
@@ -3112,6 +3123,31 @@ async function prepareTalkCapture() {
     sampleRateHz: clampTalkSampleRateHz(context.sampleRate),
     channels: clampTalkChannels(settings.channelCount),
   };
+}
+
+async function prepareTalkRoute(argumentsValue) {
+  const sessionId = String(argumentsValue.session_id || "");
+  const routeId = String(argumentsValue.route_id || "");
+  const generation = Number(argumentsValue.route_generation || 0);
+  const role = String(argumentsValue.role || "");
+  if (!validId(sessionId) || !validId(routeId) || !Number.isSafeInteger(generation) || generation <= 0) {
+    throw new Error("The runner sent an invalid VoiceRoute prepare command");
+  }
+  if (role !== "input" && role !== "output") throw new Error("VoiceRoute prepare role is invalid");
+  // This is deliberately non-media: opening getUserMedia here would overlap
+  // the still-active old route. Re-read the same capability/permission/readiness
+  // truth advertised to the host and acknowledge only when the endpoint can be
+  // activated immediately after commit.
+  const surface = await describeDevice();
+  const capability = role === "input" ? "voice_stream" : "audio_playback";
+  if (!surface.capabilities.includes(capability)) throw new Error(`This device does not support ${capability}`);
+  const permission = surface.permissions?.[capability];
+  if (permission !== "granted" && permission !== "not_required") {
+    throw new Error(`${capability} permission is ${permission || "undetermined"}`);
+  }
+  const readiness = surface.readiness?.[capability];
+  if (readiness !== "ready") throw new Error(`${capability} readiness is ${readiness || "unavailable"}`);
+  return { result: { ready: true, role, route_id: routeId, route_generation: generation } };
 }
 
 async function runTalkRoute(argumentsValue, signal) {

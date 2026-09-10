@@ -18,8 +18,9 @@
 // v2: a closing audio frame carries `utterance_id`. v3: the runner answers a
 // durably accepted utterance with `turn_accepted`, and that frame is the only
 // thing this client deletes a recording on. Both sides are pinned to v3 — see
-// the Rust constant's own note for why an additive frame was not enough.
-export const TALK_PROTOCOL_VERSION = 5;
+// the Rust constant's own note for why additive wire changes still require an explicit reload boundary.
+// v6 adds bounded streamed output metadata (response/chunk/route generation).
+export const TALK_PROTOCOL_VERSION = 6;
 
 /// Exactly `TALK_MEDIA_TYPES` in `protocol.rs`. A container that is not on this
 /// list is refused outright, so guessing one is the same as dropping the
