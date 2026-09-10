@@ -59,7 +59,7 @@ jobs:
         with:
           workspaces: src-tauri
       - name: Create Tauri sidecar placeholder
-        run: node scripts/lib/cliSidecarPlaceholder.mjs
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
       - name: Compile and focused remote voice tests
         shell: bash
         run: |
