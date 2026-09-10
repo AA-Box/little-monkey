@@ -159,7 +159,19 @@ function RunOutput({ run }: { run: RunState }) {
  * budget (`scripts/check-bundle-budget.mjs`) the same way it did before this
  * file was split out.
  */
-export default function CodeBlock({ lang, body, headerExtra }: { lang: string; body: string; headerExtra?: ReactNode }) {
+export default function CodeBlock({
+  lang,
+  body,
+  label,
+  headerExtra,
+}: {
+  lang: string;
+  body: string;
+  /** Header text in place of the language label — the file name, for a block
+   * that is a written file's content rather than a loose snippet. */
+  label?: string;
+  headerExtra?: ReactNode;
+}) {
   const { t } = useT();
   const [copied, setCopied] = useState(false);
   const [run, setRun] = useState<RunState | null>(null);
@@ -186,7 +198,7 @@ export default function CodeBlock({ lang, body, headerExtra }: { lang: string; b
   return (
     <div className="my-2 overflow-hidden rounded-lg border border-border bg-surface-2 not-prose">
       <div className="flex items-center justify-between gap-2 border-b border-border bg-foreground/[0.04] px-3 py-1.5">
-        <span className="font-mono text-[11px] uppercase tracking-wide text-muted">{displayLangLabel(lang)}</span>
+        <span className="font-mono text-[11px] uppercase tracking-wide text-muted">{label ?? displayLangLabel(lang)}</span>
         <div className="flex items-center gap-1">
           {headerExtra}
           {shell && <ShellActions body={body} onRun={setRun} />}

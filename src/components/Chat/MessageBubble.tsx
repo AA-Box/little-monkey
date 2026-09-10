@@ -16,7 +16,7 @@ import { useSessionStore } from "../../store/sessionStore";
 // via `lazyComponents.tsx` — see `CodeBlock.tsx`'s doc comment.
 const CodeBlock = lazy(() => import("./CodeBlock"));
 import { useT } from "../../lib/i18n";
-import { textToolCallShellCommand } from "./textToolCallFence";
+import { textToolCallFence } from "./textToolCallFence";
 import {
   cancelTranslation,
   defaultTranslationLocale,
@@ -172,12 +172,13 @@ function buildAssistantMarkdownComponents(
         : null;
       const rawLang = /language-(\S+)/.exec(codeProps?.className ?? "")?.[1] ?? "";
       const rawBody = codeProps ? flattenToString(codeProps.children).replace(/\n$/, "") : "";
-      // A tool call the model wrote as prose is displayed as the shell
-      // command it meant, not as the wire JSON it came out as — see
+      // A tool call the model wrote as prose is displayed as what it meant —
+      // the shell command, the written file's content, the edit as a diff —
+      // rather than as the wire JSON it came out as. See
       // `textToolCallFence.ts`.
-      const emittedCommand = textToolCallShellCommand(rawLang, rawBody);
-      const lang = emittedCommand === null ? rawLang : "bash";
-      const body = emittedCommand ?? rawBody;
+      const emitted = textToolCallFence(rawLang, rawBody);
+      const lang = emitted?.lang ?? rawLang;
+      const body = emitted?.body ?? rawBody;
       const kind = codeProps ? detectFenceKind(lang, body) : null;
 
       if (!codeProps) return <pre>{children}</pre>;
@@ -185,7 +186,7 @@ function buildAssistantMarkdownComponents(
       if (!kind) {
         return (
           <Suspense fallback={<pre>{children}</pre>}>
-            <CodeBlock lang={lang} body={body} />
+            <CodeBlock lang={lang} body={body} label={emitted?.label} />
           </Suspense>
         );
       }
