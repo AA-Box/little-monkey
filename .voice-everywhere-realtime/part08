@@ -189,4 +189,4 @@
 +
 +    #[test]
 +    fn media_queue_is_bounded_and_pcm_aligned() {
-+        let bridge = RealtimeMediaBridge::default();
++        let bridge = RealtimeMediaBridge::default
