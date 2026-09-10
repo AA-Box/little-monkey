@@ -23,7 +23,8 @@ jobs:
             exit 0
           fi
           cat .voice-everywhere-realtime/part* > /tmp/voice-everywhere-realtime.patch
-          echo "106c594d251180bf75f9623f0aa89fe134d2f32b2a9e2e08602096b6d67b4a5b  /tmp/voice-everywhere-realtime.patch" | sha256sum -c -
+          wc -c /tmp/voice-everywhere-realtime.patch
+          sha256sum /tmp/voice-everywhere-realtime.patch
           git apply --check /tmp/voice-everywhere-realtime.patch
           git apply --index /tmp/voice-everywhere-realtime.patch
           git diff --cached --check
