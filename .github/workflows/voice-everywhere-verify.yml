@@ -44,7 +44,7 @@ jobs:
 
   rust:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 35
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -58,6 +58,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: src-tauri
+      - name: Create Tauri sidecar placeholder
+        run: node scripts/lib/cliSidecarPlaceholder.mjs
       - name: Compile and focused remote voice tests
         shell: bash
         run: |
