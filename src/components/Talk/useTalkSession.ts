@@ -27,6 +27,7 @@ import {
   voiceRouteDeactivate,
   voiceRouteEmit,
   voiceRouteEvents,
+  voiceRouteGet,
 } from '../../lib/daemonClient';
 import {
   BoundedPcmQueue,
@@ -63,6 +64,20 @@ function joinPcm(chunks: readonly Float32Array[]): Float32Array {
     offset += chunk.length;
   }
   return output;
+}
+
+/**
+ * What makes two route records the same selection.
+ *
+ * `VoiceRouteSelector` calls `onRoute` on every refresh — a device appearing or
+ * disappearing is enough — and hands back a freshly deserialised record for a
+ * route that has not moved. Object identity therefore says "changed" far more
+ * often than the route actually changes. The daemon's own identity is the route
+ * id and its monotonic generation, and a stopped route is the same thing as no
+ * route at all as far as this hook's devices are concerned.
+ */
+function routeIdentity(route: VoiceRouteRecord | null | undefined): string | null {
+  return route && route.state === 'active' ? `${route.route_id}:${route.generation}` : null;
 }
 
 /**
@@ -192,6 +207,19 @@ export function useTalkSession(
   const outputDeviceRef = useRef<string | null>(null);
   const routeRef = useRef<VoiceRouteRecord | null>(route);
   const routeCursorRef = useRef<{ generation: number; eventId: number } | null>(null);
+  /** The selection the route effect last acted on — see `routeIdentity`. */
+  const routeIdentityRef = useRef<string | null>(null);
+  /**
+   * The highest route event that has already become conversation, with the
+   * conversation it belongs to.
+   *
+   * The daemon's event ids are one monotonic sequence, so this alone is a
+   * complete record of what has been handled — and a complete answer to the
+   * spec's "never replay a physical capture as a new user turn if the durable
+   * turn already exists". The cursor above is an optimization; this is the
+   * guarantee, and it holds even if the cursor rewinds.
+   */
+  const handledEventRef = useRef<{ sessionId: string; eventId: number }>({ sessionId, eventId: 0 });
   const routeEmitQueueRef = useRef<Promise<unknown>>(Promise.resolve());
   const routedSpeechRef = useRef(new Map<string, { resolve: () => void; reject: (reason: Error) => void }>());
   const player = useMemo(() => createTalkPlayer(), []);
@@ -635,7 +663,17 @@ export function useTalkSession(
 
   useEffect(() => {
     routeRef.current = route;
+    // Only a real change of selection may touch devices or rewind the cursor. A
+    // re-fetch of the same route arrives as a different object several times a
+    // session, and treating it as a change re-read this generation's events
+    // from zero — replaying every transcript already spoken as another turn.
+    const identity = routeIdentity(route);
+    if (identity === routeIdentityRef.current) return;
+    routeIdentityRef.current = identity;
     const external = Boolean(route?.state === 'active' && pairedInputDevice(route.input_endpoint));
+    // Local capture closes here, before the paired endpoint is asked to own
+    // one below: there must never be an interval where both microphones are
+    // intentionally recording for this conversation.
     sessionRef.current?.setExternalInput(external);
     if (external) releaseDevices();
     routeCursorRef.current = route ? { generation: route.generation, eventId: 0 } : null;
@@ -643,7 +681,20 @@ export function useTalkSession(
     // itself never opens a microphone; activation here preserves that privacy
     // boundary while making live handoff take effect immediately.
     if (route?.state === 'active' && snapshot?.state && snapshot.state !== 'off') {
-      void activateAndWaitForRoute().catch((reason) => setSetupError(errorMessage(reason)));
+      void activateAndWaitForRoute().catch(async (reason) => {
+        setSetupError(errorMessage(reason));
+        // Closing local capture first is only safe while a failed activation
+        // still leaves a working microphone. `move_route` restores the previous
+        // endpoints under a fresh generation when a handoff fails, so read that
+        // authoritative record back and hand ownership to local capture again
+        // whenever it no longer says a paired device holds it.
+        if (!external) return;
+        const restored = await voiceRouteGet(sessionId).catch(() => null);
+        routeRef.current = restored;
+        if (!restored || restored.state !== 'active' || !pairedInputDevice(restored.input_endpoint)) {
+          sessionRef.current?.setExternalInput(false);
+        }
+      });
     }
   }, [activateAndWaitForRoute, releaseDevices, route, sessionId]);
 
@@ -663,6 +714,9 @@ export function useTalkSession(
         for (const event of events) {
           next = Math.max(next, event.event_id);
           if (event.generation !== route.generation || typeof event.payload !== 'object' || !event.payload) continue;
+          const handled = handledEventRef.current;
+          if (handled.sessionId === sessionId && event.event_id <= handled.eventId) continue;
+          handledEventRef.current = { sessionId, eventId: event.event_id };
           const payload = event.payload as Record<string, unknown>;
           if (event.kind === 'input_transcript') {
             const text = typeof payload.text === 'string' ? payload.text : '';

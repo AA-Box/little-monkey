@@ -3416,14 +3416,33 @@ mod tests {
 
     #[test]
     fn playback_ack_is_a_valid_ordered_client_frame() {
-        let frame = TalkClientFrame {
-            protocol_version: TALK_PROTOCOL_VERSION,
-            session_id: "session-one".into(),
-            session_generation: "generation-one".into(),
-            frame_sequence: 2,
-            kind: TalkClientFrameKind::PlaybackAck { audio_sequence: 3, played: true },
-        };
-        assert!(frame.validate().is_ok());
+        // The ack is what paces remote playback, so it has to survive the same
+        // envelope the runner applies to every other client frame -- and it has
+        // to name a real chunk, because an ack that numbers nothing cannot
+        // release the next one.
+        let frame = client_talk_frame(
+            2,
+            TalkClientFrameKind::PlaybackAck { audio_sequence: 3, played: true },
+        );
+        frame.validate().expect("a playback ack is an ordinary client frame");
+
+        let unnumbered = client_talk_frame(
+            3,
+            TalkClientFrameKind::PlaybackAck { audio_sequence: 0, played: true },
+        );
+        assert_eq!(
+            unnumbered.validate(),
+            Err("Talk audio sequence must be positive".to_string()),
+        );
+
+        // A failed playback is still a valid frame: the host needs to hear
+        // "this chunk did not play" to stop the stream rather than to hang.
+        client_talk_frame(
+            4,
+            TalkClientFrameKind::PlaybackAck { audio_sequence: 4, played: false },
+        )
+        .validate()
+        .expect("a negative playback ack must reach the host");
     }
 
 }

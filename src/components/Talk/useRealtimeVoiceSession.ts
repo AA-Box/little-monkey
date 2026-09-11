@@ -85,6 +85,19 @@ function pairedOutputDevice(value: string | undefined | null): string | null {
   return value?.match(/^paired:(.+):output$/)?.[1] ?? null;
 }
 
+/**
+ * What makes two route records the same selection.
+ *
+ * `VoiceRouteSelector` hands `onRoute` a freshly deserialised record on every
+ * refresh, so object identity says "changed" far more often than the route
+ * moves. The daemon's identity is the route id and its monotonic generation,
+ * and a stopped route is the same thing as no route as far as the media bridge
+ * below is concerned.
+ */
+function routeIdentity(route: VoiceRouteRecord | null | undefined): string | null {
+  return route && route.state === 'active' ? `${route.route_id}:${route.generation}` : null;
+}
+
 function localDevice(value: string | undefined | null, direction: 'input' | 'output'): string | null {
   const prefix = `local:${direction}:`;
   if (!value?.startsWith(prefix)) return null;
@@ -119,6 +132,17 @@ export function useRealtimeVoiceSession(
   const [awaitingApproval, setAwaitingApproval] = useState(false);
   const awaitingApprovalRef = useRef(false);
   const sessionRef = useRef<RealtimeVoiceSession | null>(null);
+  /**
+   * Whether a provider session is live, as state rather than only as the ref
+   * above.
+   *
+   * The remote-interrupt poll needs a route *and* a session, and the two arrive
+   * in either order — the route selector sits above the Connect button, so the
+   * ordinary order is route first. A ref cannot wake an effect, so an effect
+   * that only read `sessionRef` never re-ran after Connect and barge-in from
+   * the paired microphone never reached the provider at all.
+   */
+  const [sessionLive, setSessionLive] = useState(false);
   const realtimeSessionIdRef = useRef<string | null>(null);
   const surfaceRef = useRef<RealtimeToolSurface | null>(null);
   const recorderRef = useRef<DurableRunRecorder | null>(null);
@@ -145,6 +169,11 @@ export function useRealtimeVoiceSession(
   const restartRef = useRef<() => Promise<void>>(async () => undefined);
   const routeRef = useRef<VoiceRouteRecord | null>(route);
   const routeCursorRef = useRef<{ generation: number; eventId: number } | null>(null);
+  /** The selection the route effect and `start` last configured — see
+   * `routeIdentity`. Reconfiguring stops the paired media bridge and starts a
+   * new one, which is a gap in the operator's microphone; a selector refresh is
+   * not a reason to open one. */
+  const routeIdentityRef = useRef<string | null>(null);
   const bridgeRef = useRef<RealtimeRouteBridge | null>(null);
   const manualExternalInputRef = useRef(false);
 
@@ -175,6 +204,7 @@ export function useRealtimeVoiceSession(
     manualExternalInputRef.current = false;
     const current = sessionRef.current;
     sessionRef.current = null;
+    setSessionLive(false);
     await current?.close();
   }, []);
 
@@ -583,11 +613,13 @@ export function useRealtimeVoiceSession(
         tools: surface.tools,
       }, handleEvent);
       sessionRef.current = session;
+      setSessionLive(true);
       await session.connect();
       if (selectedRoute) {
         const activated = await activateAndWaitForRoute(selectedRoute);
         await configureRoute(session, activated);
       }
+      routeIdentityRef.current = routeIdentity(routeRef.current);
     } catch (reason) {
       await closeCurrent();
       const message = reason instanceof Error ? reason.message : String(reason);
@@ -639,6 +671,9 @@ export function useRealtimeVoiceSession(
     routeRef.current = route;
     const current = sessionRef.current;
     if (!current) return;
+    const identity = routeIdentity(route);
+    if (identity === routeIdentityRef.current) return;
+    routeIdentityRef.current = identity;
     void (async () => {
       try {
         if (route?.state === 'active') {
@@ -663,7 +698,7 @@ export function useRealtimeVoiceSession(
 
   useEffect(() => {
     const selected = route;
-    if (!selected || selected.state !== 'active' || selected.engine !== 'realtime' || !sessionRef.current) return undefined;
+    if (!selected || selected.state !== 'active' || selected.engine !== 'realtime' || !sessionLive) return undefined;
     let stopped = false;
     let cursor = routeCursorRef.current?.generation === selected.generation
       ? routeCursorRef.current.eventId
@@ -692,7 +727,7 @@ export function useRealtimeVoiceSession(
     };
     void poll();
     return () => { stopped = true; };
-  }, [chatSessionId, route]);
+  }, [chatSessionId, route, sessionLive]);
 
   useEffect(() => {
     const mediaDevices = navigator.mediaDevices;

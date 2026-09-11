@@ -281,8 +281,16 @@ const ui = Object.fromEntries(
     "talkDot",
     "talkState",
     "talkUnavailable",
+    "talkRoute",
+    "talkRunner",
+    "talkSession",
+    "talkRouteId",
+    "talkEndpoint",
+    "talkForeground",
     "talkButton",
+    "talkMicButton",
     "talkInterruptButton",
+    "talkAudioButton",
     "talkMeter",
     "talkMeterFill",
     "talkTranscript",
@@ -1965,7 +1973,29 @@ function bindEvents() {
     if (talk.running) void stopTalk();
     else void startTalk();
   });
+  // Purely local, and no `await` on anything that could be waiting for a
+  // runner: the microphone is released before this handler returns whether or
+  // not a socket is still alive.
+  ui.talkMicButton?.addEventListener("click", () => {
+    talkStopMicrophone();
+    renderTalkStatus();
+  });
   ui.talkInterruptButton?.addEventListener("click", () => talkInterrupt("stop_button"));
+  ui.talkAudioButton?.addEventListener("click", async () => {
+    setButtonBusy(ui.talkAudioButton, true, "Enabling…");
+    try {
+      await enableAudioPlayback();
+    } catch (error) {
+      handleError(error, "Audio playback could not be enabled");
+    } finally {
+      setButtonBusy(ui.talkAudioButton, false);
+      renderTalkStatus();
+      // The runner routes audio here on the strength of the readiness this
+      // device advertises, so the unlock has to reach it before the next
+      // handoff decision rather than at the next poll.
+      scheduleAdvertise();
+    }
+  });
   ui.killButton.addEventListener("click", () => void engageKillSwitch());
   ui.artifactForm.addEventListener("submit", fetchArtifact);
   ui.forgetButton.addEventListener("click", async () => {
@@ -2087,7 +2117,31 @@ async function collectProbe() {
     screenShareLive: screenShareIsLive(),
     audioEnabled: state.audioEnabled === true,
     foreground: document.visibilityState === "visible",
+    mobile: mobileBrowser(),
   };
+}
+
+// Whether this companion is running on a phone or tablet, where a hidden page
+// is suspended outright rather than throttled — which is what decides whether a
+// backgrounded speaker endpoint can still make a sound.
+//
+// Sniffing is not the preferred way to know anything, but there is no feature
+// to test for here: the platform suspends the page, and asking an AudioContext
+// about it would mean already being in the background with a routed
+// conversation to lose. `userAgentData.mobile` is the one honest answer and
+// only Chromium gives it; the rest is the narrowest string check that covers
+// the platforms this companion actually runs on, including iPadOS Safari, which
+// claims to be a Mac and is given away by having a touchscreen.
+//
+// Unknown reads as mobile. `describeCapability` only treats a companion as
+// capable of background playback on an explicit `false`, so a browser this
+// cannot place stays foreground-only rather than advertising a speaker it may
+// not have.
+function mobileBrowser() {
+  if (typeof navigator.userAgentData?.mobile === "boolean") return navigator.userAgentData.mobile;
+  const agent = navigator.userAgent || "";
+  if (/Android|iPhone|iPod|iPad/i.test(agent)) return true;
+  return /Macintosh/i.test(agent) && navigator.maxTouchPoints > 1;
 }
 
 async function queryPermission(name) {
@@ -2119,7 +2173,7 @@ async function describeDevice() {
     platform: navigator.userAgentData?.platform || navigator.platform || "web",
     platform_version: String(navigator.userAgentData?.brands?.[0]?.version || "unknown"),
     app_version: "web-1",
-    device_model: navigator.userAgentData?.mobile ? "mobile browser" : "browser",
+    device_model: mobileBrowser() ? "mobile browser" : "browser",
     capabilities,
     permissions,
     readiness,
@@ -2918,6 +2972,16 @@ const talk = {
   resending: null,
   /** What the journal last held, for rendering. Never the audio itself. */
   pending: [],
+  /**
+   * The last state this device is prepared to claim, in this page's vocabulary.
+   *
+   * Held here rather than read back off the panel's `data-state`: the badge is
+   * a rendering of this, and the two corrections `renderTalkStatus` applies —
+   * a microphone that is not open, a host-closed input gate — have to be
+   * re-applied every time either fact changes, which a value already flattened
+   * into the DOM cannot be.
+   */
+  state: "disconnected",
 };
 
 function talkSupported() {
@@ -2929,10 +2993,152 @@ function talkSupported() {
   );
 }
 
-function setTalkState(label, key) {
-  ui.talkState.textContent = label;
+// The words this device is allowed to say about itself. `transcribing` folds
+// into "Thinking" on purpose: it is the host reasoning about audio it already
+// holds, and a separate word here would claim the device can see a stage of the
+// pipeline that never reaches it.
+const TALK_STATE_LABELS = {
+  preparing: "Preparing",
+  listening: "Listening",
+  thinking: "Thinking",
+  speaking: "Speaking",
+  interrupted: "Interrupted",
+  paused: "Paused",
+  disconnected: "Disconnected",
+  idle: "Idle",
+  error: "Error",
+};
+
+const TALK_HOST_STATES = {
+  idle: "idle",
+  starting: "preparing",
+  listening: "listening",
+  transcribing: "thinking",
+  thinking: "thinking",
+  speaking: "speaking",
+  interrupted: "interrupted",
+  error: "error",
+};
+
+const TALK_ENDPOINT_WORDS = {
+  input: "Input endpoint — microphone only",
+  output: "Output endpoint — speaker only",
+  duplex: "Duplex endpoint — microphone and speaker",
+};
+
+/**
+ * Whether this device is holding a live microphone track right now.
+ *
+ * The only honest basis for the word "Listening". The host publishes one state
+ * for the whole conversation, and the Realtime route greets every role with
+ * `listening` — including a speaker-only endpoint, which is how this page came
+ * to claim it was listening with no microphone open at all. A claim about this
+ * device's microphone belongs to this device, and this is the fact it rests on.
+ */
+function talkMicrophoneOpen() {
+  return Boolean(talk.stream?.getAudioTracks?.().some((track) => track.readyState === "live"));
+}
+
+// Whether this device is carrying the microphone half of the route. A session
+// started from this page has no route row at all and is both halves, which is
+// why `null` counts as an input endpoint.
+function talkIsInputEndpoint() {
+  return talk.routeRole === null || talk.routeRole === "input" || talk.routeRole === "duplex";
+}
+
+/** Whether this device has audio scheduled or playing right now. */
+function talkPlaybackBusy() {
+  return talk.pcmPlayers.size > 0 || Boolean(talk.player);
+}
+
+function setTalkState(key) {
+  talk.state = key;
+  renderTalkStatus();
+}
+
+/**
+ * The badge, the route card and every control, computed together.
+ *
+ * They were independent writes before, and that is exactly how the page came to
+ * show "Listening" over a silent speaker and an End Talk button that a lost
+ * connection had greyed out. All of them are functions of the same four facts —
+ * the route this device was handed, whether a microphone is open, what the host
+ * last said, and what the operator granted — so they are rendered from those
+ * facts in one place or they contradict each other.
+ */
+function renderTalkStatus() {
+  if (!ui.talkPanel) return;
+  const running = talk.running;
+  let key = talk.state;
+  // Two corrections to the host's word, because only this device knows them: a
+  // host-closed input gate is this microphone being held shut, and a device
+  // with no microphone open cannot be listening whatever the host is doing.
+  if (key === "listening" && talk.routeEngine === "realtime" && !talk.realtimeInputEnabled) {
+    key = "paused";
+  } else if (key === "listening" && !talkMicrophoneOpen()) {
+    key = talkIsInputEndpoint() ? "paused" : "idle";
+  }
+  // A speaker knows it is speaking without being told. The Realtime topology
+  // publishes no state at all — it streams PCM and narrates nothing — so a
+  // phone playing an answer out loud read as idle until it checked its own
+  // queue, which is the one fact about output this device is the authority on.
+  if (running && key !== "interrupted" && talkPlaybackBusy()) key = "speaking";
+  ui.talkState.textContent = TALK_STATE_LABELS[key] || TALK_STATE_LABELS.idle;
   ui.talkPanel.dataset.state = key;
-  ui.talkInterruptButton.disabled = !(key === "thinking" || key === "speaking");
+
+  const effective = state.deviceState?.effective || [];
+  const canStart = effective.includes("voice_stream") && talkSupported() && !state.stale;
+  // Never gated on the grant or on reaching the runner once a session is up:
+  // this is the control that ends this device's role, and the moment somebody
+  // needs it most is the one where the runner has stopped answering. Starting
+  // a conversation from here is the only thing voice_stream decides.
+  ui.talkButton.disabled = running ? false : !canStart;
+  ui.talkButton.textContent = running
+    ? talk.routeId
+      ? "Return control to the computer"
+      : "End Talk"
+    : "Start Talk";
+  // Closing the microphone is separate from ending the role: a duplex or
+  // speaker endpoint goes on playing without it, and the handler touches no
+  // socket, so a broken connection cannot take the control away.
+  ui.talkMicButton.hidden = !talkMicrophoneOpen();
+  ui.talkMicButton.disabled = false;
+  // Interrupt used to be gated on a `speaking` or `thinking` state, which the
+  // Realtime topology never publishes — it streams PCM and narrates nothing —
+  // so the button could not be pressed for the entire life of a Realtime
+  // conversation. What it needs is a live session: the host accepts the frame
+  // in every topology, and an interrupt with nothing in flight is a no-op it
+  // already tolerates.
+  ui.talkInterruptButton.disabled = !running;
+  // Autoplay is a user gesture this page cannot manufacture. Offered wherever
+  // playback is still locked, and deliberately not disabled while offline —
+  // unlocking a speaker is entirely local and needs no runner.
+  ui.talkAudioButton.hidden = state.audioEnabled === true;
+  ui.talkAudioButton.disabled = false;
+  // A microphone level meter over a speaker-only endpoint measures nothing.
+  ui.talkMeter.hidden = running && !talkMicrophoneOpen();
+
+  // Said plainly and always, because the platform decides it and not this page:
+  // a hidden tab loses its microphone on both mobile platforms, which is what
+  // this device reports as `foreground_required` and why a role here ends
+  // rather than pretending to continue. It is as true of a routed endpoint the
+  // operator chose as of a conversation somebody started from this screen.
+  ui.talkForeground.textContent =
+    "Foreground only. This browser companion reports foreground_required: locking the phone or " +
+    "switching apps ends whatever role this device is serving, and nothing here listens or plays " +
+    "in the background.";
+  ui.talkRoute.hidden = !running;
+  if (running) {
+    ui.talkRunner.textContent = state.profile
+      ? `${state.profile.runnerId} · ${state.profile.deviceId}`
+      : "—";
+    ui.talkSession.textContent = talk.sessionId || "—";
+    ui.talkRouteId.textContent = talk.routeId
+      ? `${talk.routeId} · generation ${talk.routeGeneration} · ${talk.routeEngine || "pipeline"} engine`
+      : "Not routed — started from this device";
+    ui.talkEndpoint.textContent =
+      TALK_ENDPOINT_WORDS[talk.routeRole] || "Microphone and speaker, started here";
+  }
 }
 
 function showTalkError(message) {
@@ -2948,26 +3154,26 @@ function renderTalkPanel() {
   const granted = state.deviceState?.granted || [];
   const permitted = effective.includes("voice_stream");
   ui.talkPanel.hidden = !state.profile;
-  ui.talkButton.disabled = !permitted || state.stale;
-  // Before every early return below. A device that has lost the grant, or is
-  // in a browser that cannot record at all, may still be holding a recording
-  // from when it could — and must still be able to see it and discard it.
+  // A device that has lost the grant, or is in a browser that cannot record at
+  // all, may still be holding a recording from when it could — and must still
+  // be able to see it and discard it.
   void renderTalkPending();
   if (!talkSupported()) {
     ui.talkUnavailable.hidden = false;
     ui.talkUnavailable.textContent =
       "This browser cannot open a microphone stream, so Talk is unavailable here.";
-    ui.talkButton.disabled = true;
-    return;
-  }
-  if (!permitted) {
+  } else if (!permitted) {
     ui.talkUnavailable.hidden = false;
+    // Named as what it actually blocks. The old sentence read as "Talk is
+    // unavailable", which is false on a device the operator routed audio to:
+    // a speaker endpoint needs audio_playback and no microphone grant at all.
     ui.talkUnavailable.textContent = granted.includes("voice_stream")
       ? "Talk is granted, but this device's microphone permission has not been given. Allow the microphone and reload."
-      : "Talk needs the voice_stream grant. Grant it on the runner's device card.";
-    return;
+      : "Talk needs the voice_stream grant to start a conversation from this device. A routed speaker role needs only the audio_playback grant.";
+  } else {
+    ui.talkUnavailable.hidden = true;
   }
-  ui.talkUnavailable.hidden = true;
+  renderTalkStatus();
 }
 
 /**
@@ -2997,6 +3203,7 @@ function talkStopPlayback() {
     talk.player.pause();
     talk.player = null;
   }
+  renderTalkStatus();
 }
 
 function talkInterrupt(reason) {
@@ -3030,6 +3237,7 @@ function talkQueueRealtimePcm(audioBase64, audioSequence) {
         if (talk.frames && Number.isInteger(audioSequence)) {
           talkSendFrame(talk.frames.playbackAck(audioSequence, played));
         }
+        renderTalkStatus();
       };
       talk.pcmPlayers.set(audioSequence, (played) => {
         try { source.stop(); } catch {}
@@ -3037,6 +3245,7 @@ function talkQueueRealtimePcm(audioBase64, audioSequence) {
       });
       source.onended = () => finish(generation === talk.playbackGeneration);
       source.start(startAt);
+      renderTalkStatus();
     } catch {
       if (talk.frames && Number.isInteger(audioSequence)) {
         talkSendFrame(talk.frames.playbackAck(audioSequence, false));
@@ -3076,12 +3285,14 @@ function talkQueueAudio(audioBase64, mediaType, audioSequence) {
           if (talk.frames && Number.isInteger(audioSequence)) {
             talkSendFrame(talk.frames.playbackAck(audioSequence, played));
           }
+          renderTalkStatus();
           resolve();
         };
         talk.playerFinish = finish;
         player.onended = () => finish(true);
         player.onerror = () => finish(false);
         player.play().catch(() => finish(false));
+        renderTalkStatus();
       }),
   );
 }
@@ -3099,25 +3310,20 @@ function talkHandleFrame(raw) {
       if (!Number.isInteger(frame.gate_sequence) || frame.gate_sequence < 1) break;
       talk.realtimeInputEnabled = frame.open === true;
       if (talk.frames) talkSendFrame(talk.frames.inputGateAck(frame.gate_sequence, talk.realtimeInputEnabled));
+      // A gate the host has closed is this microphone held shut, which is the
+      // one thing "Paused" honestly means here.
+      renderTalkStatus();
       break;
     }
     case "ready":
-      setTalkState("Listening", "listening");
+      // The socket is up and the host has greeted; nothing is captured or
+      // played yet. Saying "Listening" here was the claim an output-only
+      // endpoint had no microphone to back — the real state follows in the
+      // next frame, for every topology.
+      setTalkState("preparing");
       break;
     case "state":
-      setTalkState(
-        {
-          idle: "Idle",
-          starting: "Starting",
-          listening: "Listening",
-          transcribing: "Transcribing",
-          thinking: "Thinking",
-          speaking: "Speaking",
-          interrupted: "Interrupted",
-          error: "Error",
-        }[frame.state] || frame.state,
-        frame.state,
-      );
+      setTalkState(TALK_HOST_STATES[frame.state] || "idle");
       // An answer is in flight from the moment the model starts generating, not
       // from the moment audio arrives. Talking during "thinking" has to reach
       // the runner, or the first thing the speaker does is talk over the user.
@@ -3310,7 +3516,9 @@ async function runTalkRoute(argumentsValue, signal) {
     talk.realtimeInputEnabled = true;
     if (engine === "realtime") talkStartRealtimeCapture(capture.context);
     else talkStartCapture(capture.context);
-    setTalkState("Listening — controlled by this computer", "listening");
+    // The host's own state frames drive the badge; opening the microphone only
+    // changes what this device may claim about them.
+    renderTalkStatus();
     while (talk.running && !aborted(signal)) await delayUntilAborted(250, signal);
     return {
       cancelledDuringEffect: aborted(signal),
@@ -3349,7 +3557,9 @@ async function runTalkRouteOutput(argumentsValue, signal) {
     talk.routeEngine = engine;
     talk.realtimeInputEnabled = true;
     if (engine === "realtime") await playbackAudioContext();
-    setTalkState("Speaker — controlled by this computer", "speaking");
+    // Deliberately not "Speaking": nothing is coming out of this speaker until
+    // the host sends audio, and it says so itself when it does.
+    renderTalkStatus();
     while (talk.running && !aborted(signal)) await delayUntilAborted(250, signal);
     return {
       cancelledDuringEffect: aborted(signal),
@@ -3385,13 +3595,13 @@ async function startTalk() {
     // Only now: the detector and the recorder it arms cannot run before the
     // greeting they belong to.
     talkStartCapture(capture.context);
-    setTalkState("Listening", "listening");
+    renderTalkStatus();
   } catch (error) {
     await stopTalk();
     handleError(error, "Talk could not be started");
   } finally {
     setButtonBusy(ui.talkButton, false);
-    if (talk.running) ui.talkButton.textContent = "End Talk";
+    renderTalkStatus();
   }
 }
 
@@ -3440,7 +3650,7 @@ async function talkConnect({ sessionId, mediaType, sampleRateHz, channels, route
   };
   talk.running = true;
   talk.answering = false;
-  ui.talkButton.textContent = "End Talk";
+  setTalkState("preparing");
   // Frame 1 is the hello, before anything can produce a frame 2: the runner
   // refuses any other opening frame with `retryable: false`, which this
   // client's own error handler turns into a torn-down session.
@@ -3673,7 +3883,7 @@ async function retryPendingUtterance(utteranceId) {
   }
   talk.resending = utteranceId;
   showTalkError("");
-  setTalkState("Re-sending", "starting");
+  setTalkState("preparing");
   try {
     // The original session, so the turn lands in the conversation it belongs
     // to, and the original media description, so the runner is told what the
@@ -3696,7 +3906,7 @@ async function retryPendingUtterance(utteranceId) {
         }),
       );
     });
-    setTalkState("Waiting for confirmation", "thinking");
+    setTalkState("thinking");
   } catch (error) {
     await talkJournal.failed(utteranceId, error?.message || error).catch(() => undefined);
     talk.resending = null;
@@ -3779,18 +3989,27 @@ async function renderTalkPending() {
   );
 }
 
-async function stopTalk(reason) {
-  talk.running = false;
-  talk.answering = false;
-  talkStopPlayback();
+/**
+ * Close this device's microphone, and nothing else.
+ *
+ * Split out of `stopTalk` for two reasons. The phone needs a control that hands
+ * the microphone back without ending the conversation — a duplex or speaker
+ * endpoint goes on playing perfectly well without one — and both paths have to
+ * release exactly the same things, which two copies of this list would not.
+ *
+ * Nothing here touches the socket, and nothing here can fail because the runner
+ * is unreachable. That is the property that matters: the moment somebody
+ * reaches for this control is usually the moment the connection has gone, and a
+ * microphone that could only be closed by asking the host permission would stay
+ * open precisely then.
+ */
+function talkStopMicrophone() {
   if (talk.meterTimer) {
     clearInterval(talk.meterTimer);
     talk.meterTimer = null;
   }
   talkDiscardRecorder();
   talk.detector = null;
-  talk.frames = null;
-  talk.recorderOptions = null;
   if (talk.pcmCaptureProcessor) {
     talk.pcmCaptureProcessor.onaudioprocess = null;
     try { talk.pcmCaptureProcessor.disconnect(); } catch {}
@@ -3804,15 +4023,29 @@ async function stopTalk(reason) {
     try { talk.pcmCaptureMute.disconnect(); } catch {}
     talk.pcmCaptureMute = null;
   }
-  // Always: a microphone left open after a failed conversation is the failure
-  // that matters here.
   stopTracks(talk.stream);
   talk.stream = null;
+  // The capture context, not the playback one: `playbackAudioContext` owns a
+  // separate context on `state`, and closing that here would silence a speaker
+  // whose microphone is the only thing being given up.
   if (talk.context) {
     void talk.context.close().catch(() => undefined);
     talk.context = null;
   }
   talk.analyser = null;
+  if (ui.talkMeterFill) ui.talkMeterFill.style.width = "0%";
+  ui.talkMeter?.setAttribute("aria-valuenow", "0");
+}
+
+async function stopTalk(reason) {
+  talk.running = false;
+  talk.answering = false;
+  talkStopPlayback();
+  // Always: a microphone left open after a failed conversation is the failure
+  // that matters here.
+  talkStopMicrophone();
+  talk.frames = null;
+  talk.recorderOptions = null;
   if (talk.socket) {
     talk.socket.onclose = null;
     if (talk.socket.readyState === WebSocket.OPEN) talk.socket.close();
@@ -3825,7 +4058,7 @@ async function stopTalk(reason) {
   talk.routeRole = null;
   talk.routeEngine = null;
   talk.realtimeInputEnabled = true;
-  setTalkState(reason || "Not connected", "idle");
+  setTalkState("disconnected");
   if (reason) showTalkError(reason);
   // Last, and always: the buttons that offer a retry only exist while nothing
   // is running, and this is the moment that becomes true.

@@ -75,6 +75,93 @@ async function localEndpoints(): Promise<AudioEndpointDescriptor[]> {
     });
 }
 
+/**
+ * The daemon's generic local defaults, restated here.
+ *
+ * A webview with no daemon reachable still has microphones and speakers, so the
+ * absence of the daemon must cost the user paired endpoints and nothing else.
+ */
+function localDefaultEndpoint(direction: 'input' | 'output'): AudioEndpointDescriptor {
+  const input = direction === 'input';
+  return {
+    id: `local:${direction}:default`,
+    label: input ? 'This computer — default microphone' : 'This computer — default speaker',
+    direction,
+    locality: 'local',
+    device_id: null,
+    input_supported: input,
+    output_supported: !input,
+    voice_stream_supported: input,
+    os_permission: null,
+    readiness: null,
+    foreground_required: false,
+    interaction_required: false,
+    online: true,
+    last_seen_at_ms: null,
+    latency_ms: null,
+    ready: true,
+    blocked_code: null,
+    blocked_by: null,
+  };
+}
+
+/**
+ * The routed endpoint when it is not among the ones on offer — a paired device
+ * that went offline, or a saved default for a microphone that is gone.
+ *
+ * A `<select>` whose value matches no option displays the first option while
+ * holding a different value, so the operator reads one device and commits
+ * another. Naming the absent endpoint keeps the displayed selection truthful.
+ */
+function missingEndpoint(id: string, direction: 'input' | 'output'): AudioEndpointDescriptor {
+  return {
+    ...localDefaultEndpoint(direction),
+    id,
+    label: id,
+    locality: id.startsWith('paired:') ? 'paired' : 'local',
+    ready: false,
+    blocked_code: 'unavailable',
+    blocked_by: 'This endpoint is no longer available',
+  };
+}
+
+/**
+ * The short phrase for each reason the daemon computes, in the vocabulary of
+ * the fix rather than of the protocol. `blocked_by` carries the daemon's full
+ * sentence and stands in for anything this list does not know yet.
+ */
+const BLOCK_STATUS: Record<string, string> = {
+  offline: 'offline',
+  not_granted: 'capability not granted',
+  no_surface: 'device has not said what it can do',
+  unsupported: 'not supported by this device',
+  foreground_required: 'bring device to foreground',
+  interaction_required: 'tap device to enable audio',
+  screen_capture_not_armed: 'screen capture not armed',
+  unavailable: 'unavailable',
+};
+
+function endpointStatus(endpoint: AudioEndpointDescriptor): string | null {
+  if (endpoint.ready) return null;
+  if (!endpoint.online) return 'offline';
+  const noun = endpoint.direction === 'input' ? 'microphone' : 'audio';
+  if (endpoint.blocked_code === 'permission_required') return `needs ${noun} permission`;
+  if (endpoint.blocked_code === 'permission_denied') return `${noun} permission denied`;
+  return BLOCK_STATUS[endpoint.blocked_code ?? ''] ?? endpoint.blocked_by ?? 'not ready';
+}
+
+/** The options for one direction, always including whatever is selected. */
+function offered(
+  list: AudioEndpointDescriptor[],
+  selected: string,
+  direction: 'input' | 'output',
+): AudioEndpointDescriptor[] {
+  // While the first refresh is still running there is nothing to be untruthful
+  // about, and an "unavailable" flash would be a lie of its own.
+  if (list.length === 0 || list.some((endpoint) => endpoint.id === selected)) return list;
+  return [...list, missingEndpoint(selected, direction)];
+}
+
 function endpointSelectable(endpoint: AudioEndpointDescriptor): boolean {
   if (endpoint.ready) return true;
   // A local desktop microphone may be selected while permission is promptable:
@@ -112,27 +199,34 @@ export function VoiceRouteSelector({
     setBusy(true);
     setError(null);
     try {
+      // Only the local enumeration is indispensable. A daemon that is not
+      // running — the ordinary case in a webview — costs the operator paired
+      // endpoints and the saved default, never Talk itself. A daemon that is
+      // not there answers by rejecting *or* by resolving null, and both used to
+      // reach `remote.endpoints` and turn Talk into an error banner.
       const [remote, local, saved, config] = await Promise.all([
-        voiceRouteEndpoints(),
+        voiceRouteEndpoints().catch(() => null),
         localEndpoints().catch(() => []),
         voiceRouteGet(sessionId).catch(() => null),
-        companionClient.config(),
+        companionClient.config().catch(() => null),
       ]);
+      const advertised = remote?.endpoints ?? [];
       // The daemon advertises generic local defaults for CLI users. The webview
       // knows the actual MediaDeviceInfo ids, so prefer those here and keep the
       // generic default only when the browser cannot enumerate that direction.
       const merged = [...local];
-      for (const endpoint of remote.endpoints) {
+      for (const endpoint of advertised) {
         if (endpoint.locality === 'paired') merged.push(endpoint);
       }
-      if (!merged.some((endpoint) => endpoint.direction === 'input')) {
-        merged.push(remote.endpoints.find((endpoint) => endpoint.id === 'local:input:default')!);
+      for (const direction of ['input', 'output'] as const) {
+        if (merged.some((endpoint) => endpoint.direction === direction)) continue;
+        merged.push(
+          advertised.find((endpoint) => endpoint.id === `local:${direction}:default`)
+            ?? localDefaultEndpoint(direction),
+        );
       }
-      if (!merged.some((endpoint) => endpoint.direction === 'output')) {
-        merged.push(remote.endpoints.find((endpoint) => endpoint.id === 'local:output:default')!);
-      }
-      setEndpoints(merged.filter(Boolean));
-      setFallback(defaultRoute(config.voice));
+      setEndpoints(merged);
+      setFallback(config?.voice ? defaultRoute(config.voice) : null);
       let matching = saved?.state === 'active' && saved.engine === engine ? saved : null;
       // Switching Talk engines is also a capture-boundary change. Retire an
       // active route from the other engine before exposing this engine's route.
@@ -159,8 +253,14 @@ export function VoiceRouteSelector({
 
   const input = route?.input_endpoint ?? fallback?.input_endpoint ?? 'local:input:default';
   const output = route?.output_endpoint ?? fallback?.output_endpoint ?? 'local:output:default';
-  const inputs = useMemo(() => endpoints.filter((endpoint) => endpoint.direction === 'input'), [endpoints]);
-  const outputs = useMemo(() => endpoints.filter((endpoint) => endpoint.direction === 'output'), [endpoints]);
+  const inputs = useMemo(
+    () => offered(endpoints.filter((endpoint) => endpoint.direction === 'input'), input, 'input'),
+    [endpoints, input],
+  );
+  const outputs = useMemo(
+    () => offered(endpoints.filter((endpoint) => endpoint.direction === 'output'), output, 'output'),
+    [endpoints, output],
+  );
 
   const apply = async (nextInput: string, nextOutput: string) => {
     setBusy(true);
@@ -201,7 +301,7 @@ export function VoiceRouteSelector({
         >
           {inputs.map((endpoint) => (
             <option key={endpoint.id} value={endpoint.id} disabled={!endpointSelectable(endpoint)}>
-              {endpoint.label}{endpoint.ready ? '' : ` — ${endpoint.blocked_by ?? 'not ready'}`}
+              {endpoint.label}{endpointStatus(endpoint) ? ` — ${endpointStatus(endpoint)}` : ''}
             </option>
           ))}
         </select>
@@ -216,7 +316,7 @@ export function VoiceRouteSelector({
         >
           {outputs.map((endpoint) => (
             <option key={endpoint.id} value={endpoint.id} disabled={!endpointSelectable(endpoint)}>
-              {endpoint.label}{endpoint.ready ? '' : ` — ${endpoint.blocked_by ?? 'not ready'}`}
+              {endpoint.label}{endpointStatus(endpoint) ? ` — ${endpointStatus(endpoint)}` : ''}
             </option>
           ))}
         </select>

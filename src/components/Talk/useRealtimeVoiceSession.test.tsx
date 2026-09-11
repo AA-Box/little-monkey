@@ -20,6 +20,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 
 import type { VoiceConfig } from '../../lib/companionClient';
+import type { VoiceRouteEvent, VoiceRouteRecord } from '../../lib/daemonClient';
 import type { ToolDef } from '../../lib/llamaClient';
 import type {
   RealtimeVoiceCapabilities,
@@ -30,7 +31,7 @@ import type {
 } from '../../lib/realtimeVoice';
 import type { RealtimeToolSurface } from '../../lib/realtimeVoiceToolBridge';
 
-const invoke = vi.fn(async (_command: string, _args?: unknown): Promise<unknown> => null);
+const invoke = vi.fn(async (command: string, args?: unknown): Promise<unknown> => voiceRouteIpc(command, args));
 const executeToolCall = vi.fn(async (..._args: unknown[]) => '{"ok":true}');
 
 /** `isTauri` is false so the pieces that only exist inside the desktop shell —
@@ -117,7 +118,11 @@ class FakeSession implements RealtimeVoiceSession {
     this.interrupts += 1;
   }
 
-  async setInputRoute(_external: boolean, _deviceId: string | null): Promise<void> {}
+  readonly inputRoutes: { external: boolean; deviceId: string | null }[] = [];
+
+  async setInputRoute(external: boolean, deviceId: string | null): Promise<void> {
+    this.inputRoutes.push({ external, deviceId });
+  }
 
   appendInputPcm16(_audioBase64: string): void {}
 
@@ -192,6 +197,63 @@ const VOICE: VoiceConfig = {
   dictationRequireOnDevice: false,
 };
 
+/**
+ * The daemon's VoiceRoute half, as far as this hook can see it: one record the
+ * host is handed back by every route command, and an append-only event log it
+ * polls with a cursor. Only the tests that select a route populate them; every
+ * other command answers null exactly as it did before.
+ */
+let voiceRoute: VoiceRouteRecord | null = null;
+let voiceRouteLog: VoiceRouteEvent[] = [];
+let voiceRouteEmits: { kind: string; generation: number }[] = [];
+
+async function voiceRouteIpc(command: string, args?: unknown): Promise<unknown> {
+  const input = (args ?? {}) as { after?: number; kind?: string; generation?: number };
+  switch (command) {
+    case 'voice_route_get':
+    case 'voice_route_activate':
+    case 'voice_route_deactivate':
+      return voiceRoute;
+    case 'voice_route_events':
+      // The daemon answers strictly after the cursor. A host that rewinds its
+      // cursor therefore sees the same event again, which is the whole reason
+      // replay is observable from here at all.
+      return voiceRouteLog.filter((event) => event.event_id > (input.after ?? 0));
+    case 'voice_route_emit': {
+      voiceRouteEmits.push({ kind: input.kind ?? '', generation: input.generation ?? 0 });
+      const event: VoiceRouteEvent = {
+        event_id: voiceRouteLog.length + 1000,
+        session_id: 'chat',
+        generation: input.generation ?? 0,
+        kind: input.kind ?? '',
+        payload: {},
+        created_at_ms: 1,
+      };
+      return event;
+    }
+    case 'realtime_voice_media_bridge':
+      return { protocolVersion: 1, baseUrl: 'http://127.0.0.1:8731', token: 'a'.repeat(64) };
+    default:
+      return null;
+  }
+}
+
+function pairedRoute(generation: number): VoiceRouteRecord {
+  return {
+    session_id: 'chat',
+    route_id: 'route-1',
+    generation,
+    engine: 'realtime',
+    input_endpoint: 'paired:phone-1:input',
+    output_endpoint: 'paired:phone-1:output',
+    state: 'active',
+    input_command_id: null,
+    output_command_id: null,
+    created_at_ms: 1,
+    updated_at_ms: 1,
+  };
+}
+
 /** jsdom has no `navigator.mediaDevices`, and the hook watches it for the
  * microphone disappearing mid-session. A real EventTarget lets a test unplug a
  * device the way the browser reports it. */
@@ -244,6 +306,12 @@ const metricsRecorded = () =>
 beforeEach(() => {
   sessions.length = 0;
   eventSeq = 0;
+  voiceRoute = null;
+  voiceRouteLog = [];
+  voiceRouteEmits = [];
+  // The paired media bridge polls this for microphone bytes. 204 is "nothing
+  // to forward yet", which keeps it idle for the length of a test.
+  vi.stubGlobal('fetch', async () => ({ status: 204, ok: true, headers: { get: () => null } }));
   connectBehaviour = async () => undefined;
   invoke.mockClear();
   executeToolCall.mockClear();
@@ -263,6 +331,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
 });
 
 describe('a spoken turn that calls a tool', () => {
@@ -616,5 +685,88 @@ describe('the durable transcript of a finished turn', () => {
     expect([...turnIds][0]).toMatch(/^vt_/);
     expect(recorded[1].realtime?.callKey).toMatch(/^[0-9a-f]{64}$/);
     expect(recorded[2].realtime?.callKey).toBe(recorded[1].realtime?.callKey);
+  });
+});
+
+/**
+ * The ordering the product actually produces.
+ *
+ * `VoiceRouteSelector` is drawn above the Connect button, so an operator picks
+ * the paired phone and only then connects. The poll that carries the phone's
+ * barge-in used to be started by an effect that gave up unless a session was
+ * already live, and nothing re-ran it when one appeared — so in this, the
+ * common order, pressing the phone's interrupt reached nothing at all and the
+ * assistant talked over the operator until it was finished.
+ */
+describe('barge-in from the paired microphone', () => {
+  it('reaches the provider when the route was selected before connecting', async () => {
+    voiceRoute = pairedRoute(3);
+    const view = renderHook(
+      ({ route }: { route: VoiceRouteRecord | null }) => useRealtimeVoiceSession('chat', VOICE, route),
+      { initialProps: { route: voiceRoute } },
+    );
+    // The selection is live before anything is connected, which is the whole
+    // point: no session exists for the poll to attach to yet.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    await act(async () => { await view.result.current.start(); });
+    const session = sessions[sessions.length - 1];
+    feed(session, { type: 'connected' });
+
+    voiceRouteLog.push({
+      event_id: 7, session_id: 'chat', generation: 3, kind: 'interrupt',
+      payload: { reason: 'remote_barge_in' }, created_at_ms: 2,
+    });
+
+    await waitFor(() => expect(session.interrupts).toBe(1));
+    // And the paired speaker is told to stop, not merely the provider: the
+    // phone is still playing the answer the operator interrupted.
+    await waitFor(() => expect(voiceRouteEmits.some((emit) => emit.kind === 'output_stop')).toBe(true));
+  });
+
+  it('still reaches the provider when the route is selected after connecting', async () => {
+    const view = renderHook(
+      ({ route }: { route: VoiceRouteRecord | null }) => useRealtimeVoiceSession('chat', VOICE, route),
+      { initialProps: { route: null as VoiceRouteRecord | null } },
+    );
+    await act(async () => { await view.result.current.start(); });
+    const session = sessions[sessions.length - 1];
+    feed(session, { type: 'connected' });
+
+    voiceRoute = pairedRoute(3);
+    await act(async () => { view.rerender({ route: voiceRoute }); await Promise.resolve(); });
+
+    voiceRouteLog.push({
+      event_id: 7, session_id: 'chat', generation: 3, kind: 'interrupt',
+      payload: { reason: 'remote_barge_in' }, created_at_ms: 2,
+    });
+
+    await waitFor(() => expect(session.interrupts).toBe(1));
+  });
+
+  it('does not rebuild the paired media bridge when the same route is handed back', async () => {
+    voiceRoute = pairedRoute(3);
+    const view = renderHook(
+      ({ route }: { route: VoiceRouteRecord | null }) => useRealtimeVoiceSession('chat', VOICE, route),
+      { initialProps: { route: voiceRoute } },
+    );
+    await act(async () => { await view.result.current.start(); });
+    const session = sessions[sessions.length - 1];
+    feed(session, { type: 'connected' });
+    await waitFor(() => expect(session.inputRoutes).toEqual([{ external: true, deviceId: null }]));
+
+    // A refresh of the selector, twice. Reconfiguring here stops the media
+    // bridge and starts a replacement, so the phone's microphone goes silent
+    // for the length of the handshake — in the middle of a sentence, every time
+    // anything on the machine touches an audio device.
+    view.rerender({ route: { ...pairedRoute(3) } });
+    view.rerender({ route: { ...pairedRoute(3) } });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(session.inputRoutes).toHaveLength(1);
+
+    // A real move is still applied: the generation is what says so.
+    voiceRoute = pairedRoute(4);
+    view.rerender({ route: voiceRoute });
+    await waitFor(() => expect(session.inputRoutes).toHaveLength(2));
   });
 });

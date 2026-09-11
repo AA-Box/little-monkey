@@ -172,6 +172,10 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
   private channel: DataChannelLike | null = null;
   private sender: RTCRtpSender | null = null;
   private stream: MediaStream | null = null;
+  /** The track the sender is carrying right now. A swapped-out track also
+   * fires `ended`, so the handler needs to know which one ending means the
+   * operator lost the microphone rather than us having moved the route. */
+  private inputTrack: MediaStreamTrack | null = null;
   private audio: HTMLAudioElement | null = null;
   private remoteStream: MediaStream | null = null;
   private externalInput = false;
@@ -364,14 +368,12 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
       throw new Error('Selected microphone did not provide an audio track.');
     }
     if (this.config.turnDetection === 'manual') track.enabled = false;
-    track.addEventListener('ended', this.onTrackEnded, { once: true });
+    track.addEventListener('ended', () => this.onTrackEnded(track), { once: true });
     const previous = this.stream;
     this.stream = next;
+    this.inputTrack = track;
     await this.sender?.replaceTrack(track);
-    previous?.getTracks().forEach((candidate) => {
-      candidate.removeEventListener('ended', this.onTrackEnded);
-      candidate.stop();
-    });
+    previous?.getTracks().forEach((candidate) => candidate.stop());
   }
 
   async setInputRoute(external: boolean, deviceId: string | null): Promise<void> {
@@ -379,11 +381,9 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
     if (external) {
       const previous = this.stream;
       this.stream = null;
+      this.inputTrack = null;
       await this.sender?.replaceTrack(null);
-      previous?.getTracks().forEach((track) => {
-        track.removeEventListener('ended', this.onTrackEnded);
-        track.stop();
-      });
+      previous?.getTracks().forEach((track) => track.stop());
       return;
     }
     await this.openLocalInput(deviceId);
@@ -536,8 +536,12 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
     });
   }
 
-  private readonly onTrackEnded = (): void => {
-    if (this.closed) return;
+  /** Only the track the session is currently sending ending is a revocation.
+   * A route move to a paired device ends the local track deliberately, and
+   * tearing the conversation down for that would end the call the move was
+   * meant to keep alive. */
+  private readonly onTrackEnded = (track: MediaStreamTrack): void => {
+    if (this.closed || this.inputTrack !== track) return;
     this.emit({
       type: 'connection_lost', eventId: `local:microphone-ended:${crypto.randomUUID()}`,
       recoverable: false, code: 'microphone_revoked',
@@ -633,8 +637,12 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
       this.audioProbe = null;
     }
     this.channel?.removeEventListener('message', this.onMessage);
-    await this.sender?.replaceTrack(null).catch(() => undefined);
+    // Nothing here may sit behind an await: a revoked microphone tears the
+    // session down from a synchronous event handler, and every awaited step
+    // before `peer.close()` leaves a billable session live in the meantime.
+    // `close()` stops the sender anyway, so releasing its track first is noise.
     this.sender = null;
+    this.inputTrack = null;
     this.teardownOutputCapture();
     this.channel?.close();
     if (this.peer) {
@@ -643,10 +651,7 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
       this.peer.ontrack = null;
       this.peer.close();
     }
-    this.stream?.getTracks().forEach((track) => {
-      track.removeEventListener('ended', this.onTrackEnded);
-      track.stop();
-    });
+    this.stream?.getTracks().forEach((track) => track.stop());
     if (this.audio) {
       this.audio.removeEventListener('playing', this.onAudioPlaying);
       this.audio.removeEventListener('waiting', this.onAudioWaiting);

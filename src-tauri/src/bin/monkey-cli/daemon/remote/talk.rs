@@ -190,6 +190,52 @@ pub struct TalkSessionReport {
     pub latency: TalkSessionLatency,
 }
 
+/// What a *routed* session used, beside the counters above: which endpoints, of
+/// which kinds, how long the route took to come up and how long it then lasted.
+///
+/// None of this is visible to the session loops — a socket knows it is on a
+/// route but not what the other end of that route is, nor when the host
+/// activated the generation — so it is stamped where it is known, at admission
+/// and at close, by `RemoteApi::record_talk_session`.
+///
+/// Endpoint *ids* are here because they are the operator's own names for their
+/// own hardware, and an id is the only way a metric row can say which speaker
+/// was the slow one. What is deliberately absent is anything that would make
+/// the row a credential or a recording: no ticket, no device secret, no
+/// transcript, and no audio.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TalkRouteReport {
+    pub route_id: String,
+    pub generation: u64,
+    /// pipeline or realtime.
+    pub engine: String,
+    /// input, output or duplex — which half of the route this socket was.
+    pub role: String,
+    pub input_kind: &'static str,
+    pub input_endpoint: String,
+    pub output_kind: &'static str,
+    pub output_endpoint: String,
+    /// From the host activating this generation to this device's socket being
+    /// admitted on it. The wait an operator experiences as "why is it not
+    /// listening yet".
+    pub setup_ms: u64,
+    /// How long that admission then lasted.
+    pub duration_ms: u64,
+}
+
+impl TalkRouteReport {
+    /// `local` or `paired`, from an endpoint token. An unrecognized shape is
+    /// named as such rather than guessed at: a metric that quietly says "local"
+    /// for something it did not understand is worse than one that admits it.
+    pub fn endpoint_kind(endpoint: &str) -> &'static str {
+        match endpoint.split(':').next() {
+            Some("local") => "local",
+            Some("paired") => "paired",
+            _ => "unknown",
+        }
+    }
+}
+
 /// Cuts streamed assistant text into sentence- or phrase-sized pieces safe to
 /// speak.
 ///
@@ -1554,6 +1600,7 @@ mod tests {
             device_id: "device-one".into(),
             session_id: "session-one".into(),
             session_generation: generation(),
+            route_generation: None,
         }
     }
 
