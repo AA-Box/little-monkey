@@ -632,30 +632,76 @@ async fn reap_recorded_chat_server(app: &AppHandle, port: u16) {
     let Ok(recorded) = std::fs::read_to_string(&path) else {
         return;
     };
-    let _ = std::fs::remove_file(&path);
-    let client = reqwest::Client::new();
-    let health = format!("http://127.0.0.1:{port}/health");
-    let answering = matches!(
-        crate::egress::send(client.get(health).timeout(Duration::from_secs(2))).await,
-        Ok(response) if response.status().is_success()
-    );
-    if let Some(pid) = pid_to_reap(&recorded, answering) {
-        let _ = crate::os_signal::kill_process_group(pid);
+    let occupied = port_occupied(port).await;
+    match record_disposition(&recorded, occupied) {
+        RecordDisposition::Kill(pid) => {
+            let _ = crate::os_signal::kill_process_group(pid);
+            let _ = std::fs::remove_file(&path);
+        }
+        RecordDisposition::Forget => {
+            let _ = std::fs::remove_file(&path);
+        }
+        RecordDisposition::Keep => {}
     }
 }
 
-/// Which recorded pid, if any, this start should kill.
+/// Whether anything holds `port`, established by connecting to it rather than
+/// by asking it how it feels.
 ///
-/// Split out from the IO so the rule is testable: a pid is only killed when it
-/// parses *and* something is still answering on the port. A recorded pid whose
-/// server has already exited says nothing about whatever owns that number now.
-fn pid_to_reap(recorded: &str, port_answering: bool) -> Option<u32> {
-    if !port_answering {
-        return None;
+/// The conflict a start has to clear is a *bind* conflict, and llama.cpp binds
+/// its port before the model is loaded — answering `/health` with 503
+/// `{"status": "loading model"}` until it finishes. Reading a non-200 health
+/// response as "nothing there" is what stranded orphans permanently: the kill
+/// was skipped for a server that was very much holding the port, and every
+/// later start died on
+/// `couldn't bind HTTP server socket, hostname: 127.0.0.1, port: 8090`.
+async fn port_occupied(port: u16) -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+/// What a start should do about the pid a previous one recorded.
+#[derive(Debug, PartialEq, Eq)]
+enum RecordDisposition {
+    /// The recorded server is still holding the port: kill it, then drop the
+    /// record it came from.
+    Kill(u32),
+    /// The record cannot name anything worth killing — either the port is free
+    /// (so the number says nothing about whatever owns it now) or the file is
+    /// not a pid at all.
+    Forget,
+    /// Something holds the port and the record still describes it, but this
+    /// start could not act. Keep the record so the next one can.
+    Keep,
+}
+
+/// Which recorded pid, if any, this start should kill — and whether the record
+/// survives the decision.
+///
+/// Split out from the IO so the rule is testable. Two properties matter, and
+/// the second is the one that used to be missing: a pid is only killed while
+/// something still holds the port (a recycled pid must never be killed), and
+/// the record is only forgotten once it can no longer name the holder.
+/// Consuming the record unconditionally — as this did — meant a single start
+/// that declined to kill destroyed the only handle on the orphan, leaving the
+/// port unusable until someone killed it by hand.
+fn record_disposition(recorded: &str, port_occupied: bool) -> RecordDisposition {
+    let Ok(pid) = recorded.trim().parse::<u32>() else {
+        return RecordDisposition::Forget;
+    };
+    if pid <= 1 {
+        return RecordDisposition::Forget;
     }
-    match recorded.trim().parse::<u32>() {
-        Ok(pid) if pid > 1 => Some(pid),
-        _ => None,
+    if port_occupied {
+        RecordDisposition::Kill(pid)
+    } else {
+        RecordDisposition::Forget
     }
 }
 
@@ -919,16 +965,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_recorded_pid_is_reaped_only_while_the_port_still_answers() {
+    fn a_recorded_pid_is_reaped_only_while_the_port_is_still_held() {
         // The orphan case: a previous run's server is still holding the port.
-        assert_eq!(pid_to_reap("4242\n", true), Some(4242));
+        assert_eq!(
+            record_disposition("4242\n", true),
+            RecordDisposition::Kill(4242)
+        );
         // Nothing is listening, so the number says nothing about what owns that
-        // pid now — a recycled pid must not be killed.
-        assert_eq!(pid_to_reap("4242", false), None);
+        // pid now — a recycled pid must not be killed, and the record is spent.
+        assert_eq!(record_disposition("4242", false), RecordDisposition::Forget);
         // Never init, and never nonsense left by a partial write.
-        assert_eq!(pid_to_reap("1", true), None);
-        assert_eq!(pid_to_reap("", true), None);
-        assert_eq!(pid_to_reap("not-a-pid", true), None);
+        assert_eq!(record_disposition("1", true), RecordDisposition::Forget);
+        assert_eq!(record_disposition("", true), RecordDisposition::Forget);
+        assert_eq!(
+            record_disposition("not-a-pid", true),
+            RecordDisposition::Forget
+        );
+    }
+
+    #[tokio::test]
+    async fn a_port_held_by_a_server_that_is_not_ready_yet_still_counts_as_occupied() {
+        // llama.cpp binds before it loads and answers /health with 503 until it
+        // is ready. A listener that never answers HTTP at all is the extreme of
+        // that case, and it is exactly the one the old health-status check read
+        // as "nothing there" — stranding the orphan holding the port.
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(
+            port_occupied(port).await,
+            "a bound port is occupied whether or not anything answers HTTP on it"
+        );
+
+        drop(listener);
+        assert!(
+            !port_occupied(port).await,
+            "and a released port is free again"
+        );
     }
 
     #[test]
