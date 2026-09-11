@@ -1,0 +1,146 @@
+ #[serde(rename_all = "camelCase", deny_unknown_fields)]
+ pub struct RealtimeVoiceMetric {
+@@ -331,6 +347,39 @@ pub fn realtime_voice_disconnect(
+     Ok(())
+ }
+ 
++#[tauri::command]
++pub fn realtime_voice_media_bridge(
++    state: tauri::State<'_, RealtimeVoiceState>,
++) -> Result<RealtimeVoiceMediaBridge, String> {
++    let root = state
++        .root
++        .as_ref()
++        .ok_or_else(|| "Realtime host-media bridge is unavailable".to_string())?;
++    let path = root.join("daemon").join("realtime-host-media.json");
++    let bytes = fs::read(&path)
++        .map_err(|_| "Realtime host-media bridge is not running".to_string())?;
++    let config: RealtimeHostMediaConfig = serde_json::from_slice(&bytes)
++        .map_err(|_| "Realtime host-media bridge configuration is invalid".to_string())?;
++    if config.protocol_version != 1 {
++        return Err("Unsupported Realtime host-media bridge protocol".to_string());
++    }
++    let address: std::net::SocketAddr = config
++        .listen
++        .parse()
++        .map_err(|_| "Realtime host-media bridge address is invalid".to_string())?;
++    if !address.ip().is_loopback() {
++        return Err("Realtime host-media bridge is not loopback-only".to_string());
++    }
++    if config.token.len() != 64 || !config.token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
++        return Err("Realtime host-media bridge token is invalid".to_string());
++    }
++    Ok(RealtimeVoiceMediaBridge {
++        protocol_version: config.protocol_version,
++        base_url: format!("http://{address}"),
++        token: config.token,
++    })
++}
++
+ #[tauri::command]
+ pub fn realtime_voice_status(
+     state: tauri::State<'_, RealtimeVoiceState>,
+diff --git a/src/components/Talk/RealtimeTalkPanel.tsx b/src/components/Talk/RealtimeTalkPanel.tsx
+index b93fc90..045b4ae 100644
+--- a/src/components/Talk/RealtimeTalkPanel.tsx
++++ b/src/components/Talk/RealtimeTalkPanel.tsx
+@@ -2,10 +2,12 @@ import { AlertTriangle, Loader2, Mic, MicOff, ShieldAlert, Square, Type, Volume2
+ import { useEffect, useState } from 'react';
+ 
+ import { realtimeVoiceClient, type RealtimeVoiceStatus, type VoiceConfig } from '../../lib/companionClient';
++import type { VoiceRouteRecord } from '../../lib/daemonClient';
+ import type { RealtimeVoiceState } from '../../lib/realtimeVoice';
+ import { Button, IconButton } from '../ui';
+ import type { TalkPanelProps } from './TalkPanel';
+ import { useRealtimeVoiceSession } from './useRealtimeVoiceSession';
++import { VoiceRouteSelector } from './VoiceRouteSelector';
+ 
+ const LABEL: Record<RealtimeVoiceState, string> = {
+   idle: 'Not connected', connecting: 'Connecting securely…', ready: 'Ready',
+@@ -26,7 +28,8 @@ export function RealtimeTalkPanel({
+   onOpenVoiceSettings,
+   voice,
+ }: TalkPanelProps & { voice: VoiceConfig }) {
+-  const session = useRealtimeVoiceSession(sessionId, voice);
++  const [voiceRoute, setVoiceRoute] = useState<VoiceRouteRecord | null>(null);
++  const session = useRealtimeVoiceSession(sessionId, voice, voiceRoute);
+   const [providerStatus, setProviderStatus] = useState<RealtimeVoiceStatus | null>(null);
+   const [privacyAccepted, setPrivacyAccepted] = useState(false);
+   const running = !['idle', 'closed', 'error'].includes(session.state);
+@@ -60,11 +63,12 @@ export function RealtimeTalkPanel({
+       )}
+ 
+       <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
++        <VoiceRouteSelector sessionId={sessionId} engine="realtime" onRoute={setVoiceRoute} />
+         {!running && (
+           <label className="flex items-start gap-3 rounded-lg border border-warning/40 bg-warning/10 p-3 text-xs">
+             <input className="mt-0.5" type="checkbox" checked={privacyAccepted} onChange={(event) => setPrivacyAccepted(event.target.checked)} />
+             <span><span className="mb-1 flex items-center gap-1 font-semibold"><ShieldAlert size={14} />Before connecting</span>
+-              Your microphone audio and the bounded conversation context are sent to OpenAI for this live session.
++              Audio from the selected microphone and the bounded conversation context are sent to OpenAI for this live session.
+               Tool calls still pass through Little Monkey’s existing permission, sandbox, workspace, network, and MCP controls.
+               Audio is not stored by Little Monkey.
+             </span>
+diff --git a/src/components/Talk/VoiceRouteSelector.tsx b/src/components/Talk/VoiceRouteSelector.tsx
+index 587123b..a630e92 100644
+--- a/src/components/Talk/VoiceRouteSelector.tsx
++++ b/src/components/Talk/VoiceRouteSelector.tsx
+@@ -6,6 +6,7 @@ import {
+   type AudioEndpointDescriptor,
+   type VoiceRouteEngine,
+   type VoiceRouteRecord,
++  voiceRouteDeactivate,
+   voiceRouteEndpoints,
+   voiceRouteGet,
+   voiceRouteMove,
+@@ -132,14 +133,22 @@ export function VoiceRouteSelector({
+       }
+       setEndpoints(merged.filter(Boolean));
+       setFallback(defaultRoute(config.voice));
+-      setRoute(saved?.state === 'active' ? saved : null);
+-      if (saved?.state === 'active') onRoute?.(saved);
++      let matching = saved?.state === 'active' && saved.engine === engine ? saved : null;
++      // Switching Talk engines is also a capture-boundary change. Retire an
++      // active route from the other engine before exposing this engine's route.
++      if (saved?.state === 'active' && saved.engine !== engine
++          && (saved.input_command_id || saved.output_command_id)) {
++        await voiceRouteDeactivate(sessionId);
++        matching = null;
++      }
++      setRoute(matching);
++      if (matching) onRoute?.(matching);
+     } catch (reason) {
+       setError(errorMessage(reason));
+     } finally {
+       setBusy(false);
+     }
+-  }, [onRoute, sessionId]);
++  }, [engine, onRoute, sessionId]);
+ 
+   useEffect(() => {
+     void refresh();
+diff --git a/src/components/Talk/useRealtimeVoiceSession.test.tsx b/src/components/Talk/useRealtimeVoiceSession.test.tsx
+index b2d5915..897fd7e 100644
+--- a/src/components/Talk/useRealtimeVoiceSession.test.tsx
++++ b/src/components/Talk/useRealtimeVoiceSession.test.tsx
+@@ -117,6 +117,12 @@ class FakeSession implements RealtimeVoiceSession {
+     this.interrupts += 1;
+   }
+ 
++  async setInputRoute(_external: boolean, _deviceId: string | null): Promise<void> {}
++
++  appendInputPcm16(_audioBase64: string): void {}
++
++  async setOutputRoute(_external: boolean, _deviceId: string | null): Promise<void> {}
++
+   async startManualTurn(): Promise<void> {}
+ 
+   async finishManualTurn(): Promise<void> {}
+diff --git a/src/components/Talk/useRealtimeVoiceSession.ts b/src/components/Talk/useRealtimeVoiceSession.ts
+index 24fdd83..7fb3bf2 100644
+--- a/src/components/Talk/useRealtimeVoiceSession.ts
++++ b/src/components/Talk/useRealtimeVoiceSession.ts
+@@ -3,8 +3,16 @@ import { invoke } from '@tauri-apps/api/core';
+ 
+ import { realtimeVoiceClient, type VoiceConfig } from '../../lib/companionClient';
+ import { beginDurableRun, type DurableRunRecorder } from '../../lib/durableRun';

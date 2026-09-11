@@ -1,0 +1,4 @@
++  setOutputRoute(external: boolean, deviceId: string | null, consumer?: RealtimePcmConsumer | null): Promise<void>;
+   interrupt(): Promise<void>;
+   startManualTurn(): Promise<void>;
+   finishManualTurn(): Promise<void>;

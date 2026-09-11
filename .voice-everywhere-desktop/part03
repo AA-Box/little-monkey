@@ -1,0 +1,173 @@
+     await talkConnect({
+       sessionId,
+       mediaType: engine === "realtime" ? REALTIME_PCM_MEDIA_TYPE : "audio/webm",
+-      sampleRateHz: 48_000,
++      sampleRateHz: engine === "realtime" ? 24_000 : 48_000,
+       channels: 1,
+       routeId,
+       routeGeneration: generation,
+@@ -3338,6 +3347,7 @@ async function runTalkRouteOutput(argumentsValue, signal) {
+     });
+     talk.routeRole = "output";
+     talk.routeEngine = engine;
++    talk.realtimeInputEnabled = true;
+     if (engine === "realtime") await playbackAudioContext();
+     setTalkState("Speaker — controlled by this computer", "speaking");
+     while (talk.running && !aborted(signal)) await delayUntilAborted(250, signal);
+@@ -3814,6 +3824,7 @@ async function stopTalk(reason) {
+   talk.routeGeneration = null;
+   talk.routeRole = null;
+   talk.routeEngine = null;
++  talk.realtimeInputEnabled = true;
+   setTalkState(reason || "Not connected", "idle");
+   if (reason) showTalkError(reason);
+   // Last, and always: the buttons that offer a retry only exist while nothing
+diff --git a/src-tauri/src/bin/monkey-cli/daemon/remote/ui/talkProtocol.js b/src-tauri/src/bin/monkey-cli/daemon/remote/ui/talkProtocol.js
+index 73c9a23..2d2764b 100644
+--- a/src-tauri/src/bin/monkey-cli/daemon/remote/ui/talkProtocol.js
++++ b/src-tauri/src/bin/monkey-cli/daemon/remote/ui/talkProtocol.js
+@@ -20,9 +20,10 @@
+ // thing this client deletes a recording on. Both sides are pinned to v3 — see
+ // the Rust constant's own note for why additive wire changes still require an explicit reload boundary.
+ // v6 adds bounded streamed output metadata (response/chunk/route generation).
+-// v7 adds direct mono 48 kHz PCM16 media for paired Realtime WebRTC routing.
+-export const TALK_PROTOCOL_VERSION = 7;
+-export const REALTIME_PCM_MEDIA_TYPE = "audio/pcm16;rate=48000";
++// v7 added direct Realtime PCM, v8 corrected it to provider-native 24 kHz,
++// and v9 adds the causal input gate used by remote manual push-to-talk.
++export const TALK_PROTOCOL_VERSION = 9;
++export const REALTIME_PCM_MEDIA_TYPE = "audio/pcm16;rate=24000";
+ 
+ /// Exactly `TALK_MEDIA_TYPES` in `protocol.rs`. A container that is not on this
+ /// list is refused outright, so guessing one is the same as dropping the
+@@ -148,7 +149,7 @@ export function float32ToRealtimePcmBase64(samples, sourceSampleRate) {
+   const source = samples instanceof Float32Array ? samples : new Float32Array(samples || []);
+   const sourceRate = Number(sourceSampleRate);
+   if (!source.length || !Number.isFinite(sourceRate) || sourceRate < 8_000 || sourceRate > 192_000) return "";
+-  const targetRate = 48_000;
++  const targetRate = 24_000;
+   const outputLength = Math.max(1, Math.round(source.length * targetRate / sourceRate));
+   const bytes = new Uint8Array(outputLength * 2);
+   const view = new DataView(bytes.buffer);
+@@ -348,6 +349,13 @@ export function createTalkFrames({ sessionId, sessionGeneration, mediaType, samp
+       }
+       return envelope({ type: "playback_ack", audio_sequence: audioSequence, played: Boolean(played) });
+     },
++    inputGateAck(gateSequence, open) {
++      requireGreeted("input gate acknowledgement");
++      if (!Number.isInteger(gateSequence) || gateSequence < 1) {
++        throw new Error("A Talk input gate acknowledgement needs a positive gate sequence");
++      }
++      return envelope({ type: "input_gate_ack", gate_sequence: gateSequence, open: Boolean(open) });
++    },
+     /**
+      * Durations, and nothing else. No transcript, no audio, no text of any kind
+      * can reach this frame — the shape is an utterance number and three optional
+diff --git a/src-tauri/src/bin/monkey-cli/fixtures/talk_client_frames.json b/src-tauri/src/bin/monkey-cli/fixtures/talk_client_frames.json
+index 1af0c6d..e6b2a1d 100644
+--- a/src-tauri/src/bin/monkey-cli/fixtures/talk_client_frames.json
++++ b/src-tauri/src/bin/monkey-cli/fixtures/talk_client_frames.json
+@@ -1,6 +1,6 @@
+ [
+   {
+-    "protocol_version": 6,
++    "protocol_version": 9,
+     "session_id": "mobile-device-Ab_3-xY",
+     "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+     "frame_sequence": 1,
+@@ -10,7 +10,7 @@
+     "channels": 1
+   },
+   {
+-    "protocol_version": 6,
++    "protocol_version": 9,
+     "session_id": "mobile-device-Ab_3-xY",
+     "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+     "frame_sequence": 2,
+@@ -21,7 +21,7 @@
+     "upload_ms": 96
+   },
+   {
+-    "protocol_version": 6,
++    "protocol_version": 9,
+     "session_id": "mobile-device-Ab_3-xY",
+     "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+     "frame_sequence": 3,
+@@ -33,7 +33,7 @@
+     "utterance_id": "utt-fixed-for-tests"
+   },
+   {
+-    "protocol_version": 6,
++    "protocol_version": 9,
+     "session_id": "mobile-device-Ab_3-xY",
+     "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+     "frame_sequence": 4,
+@@ -45,7 +45,7 @@
+     "utterance_id": "utt-fixed-for-tests"
+   },
+   {
+-    "protocol_version": 6,
++    "protocol_version": 9,
+     "session_id": "mobile-device-Ab_3-xY",
+     "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+     "frame_sequence": 5,
+@@ -53,12 +53,21 @@
+     "reason": "barge_in"
+   },
+   {
+-    "protocol_version": 6,
++    "protocol_version": 9,
+     "session_id": "mobile-device-Ab_3-xY",
+     "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+     "frame_sequence": 6,
+     "type": "playback_ack",
+     "audio_sequence": 7,
+     "played": true
++  },
++  {
++    "protocol_version": 9,
++    "session_id": "mobile-device-Ab_3-xY",
++    "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
++    "frame_sequence": 7,
++    "type": "input_gate_ack",
++    "gate_sequence": 23,
++    "open": false
+   }
+ ]
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index a02d0ae..d8f4f08 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -2094,6 +2094,7 @@ pub fn run() {
+             realtime_voice::realtime_voice_connect,
+             realtime_voice::realtime_voice_disconnect,
+             realtime_voice::realtime_voice_status,
++            realtime_voice::realtime_voice_media_bridge,
+             realtime_voice::realtime_voice_metric_record,
+             realtime_voice::realtime_voice_metrics,
+             realtime_voice::realtime_voice_metrics_clear,
+diff --git a/src-tauri/src/realtime_voice.rs b/src-tauri/src/realtime_voice.rs
+index c3af372..c315df0 100644
+--- a/src-tauri/src/realtime_voice.rs
++++ b/src-tauri/src/realtime_voice.rs
+@@ -106,6 +106,22 @@ pub struct RealtimeVoiceStatus {
+     pub endpoint: &'static str,
+ }
+ 
++#[derive(Clone, Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct RealtimeHostMediaConfig {
++    protocol_version: u32,
++    listen: String,
++    token: String,
++}
++
++#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
++#[serde(rename_all = "camelCase")]
++pub struct RealtimeVoiceMediaBridge {
++    pub protocol_version: u32,
++    pub base_url: String,
++    pub token: String,
++}
++
+ #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

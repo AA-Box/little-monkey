@@ -1,0 +1,142 @@
+@@ -286,6 +300,12 @@ async fn handle_host_media(
+     expected_token: String,
+     request: Request<Incoming>,
+ ) -> Result<Response<Full<Bytes>>, Infallible> {
++    // Browser WebViews reach this loopback socket cross-origin. Preflight is
++    // intentionally unauthenticated; every media request still needs the
++    // process-local 256-bit token, and the listener itself is loopback-only.
++    if request.method() == Method::OPTIONS {
++        return Ok(host_response(StatusCode::NO_CONTENT, Bytes::new()));
++    }
+     let supplied = request
+         .headers()
+         .get(HOST_MEDIA_TOKEN_HEADER)
+@@ -324,6 +344,10 @@ async fn handle_host_media(
+                 Err(_) => host_response(StatusCode::CONFLICT, Bytes::new()),
+             }
+         }
++        (&Method::DELETE, "output") => match api.clear_realtime_output_from_host(&session_id, generation) {
++            Ok(()) => host_response(StatusCode::NO_CONTENT, Bytes::new()),
++            Err(_) => host_response(StatusCode::CONFLICT, Bytes::new()),
++        },
+         _ => host_response(StatusCode::METHOD_NOT_ALLOWED, Bytes::new()),
+     };
+     Ok(result)
+@@ -335,6 +359,13 @@ fn host_response(status: StatusCode, body: Bytes) -> Response<Full<Bytes>> {
+         .header("cache-control", "no-store")
+         .header("x-content-type-options", "nosniff")
+         .header("content-type", "application/octet-stream")
++        .header("access-control-allow-origin", "*")
++        .header("access-control-allow-methods", "GET, POST, DELETE, OPTIONS")
++        .header(
++            "access-control-allow-headers",
++            "content-type, x-little-monkey-host-media-token",
++        )
++        .header("access-control-expose-headers", "x-little-monkey-audio-sequence")
+         .body(Full::new(body))
+         .expect("static host-media response is valid")
+ }
+diff --git a/src-tauri/src/bin/monkey-cli/daemon/remote/talk.rs b/src-tauri/src/bin/monkey-cli/daemon/remote/talk.rs
+index b66afae..e5b7f52 100644
+--- a/src-tauri/src/bin/monkey-cli/daemon/remote/talk.rs
++++ b/src-tauri/src/bin/monkey-cli/daemon/remote/talk.rs
+@@ -550,7 +550,9 @@ pub async fn run_talk_session(
+                 session.greeted = true;
+                 session.utterance_media_type = Some(media_type);
+             }
+-            TalkClientFrameKind::State { .. } | TalkClientFrameKind::PlaybackAck { .. } => {}
++            TalkClientFrameKind::State { .. }
++            | TalkClientFrameKind::PlaybackAck { .. }
++            | TalkClientFrameKind::InputGateAck { .. } => {}
+             TalkClientFrameKind::Metrics {
+                 audio_sequence,
+                 speech_detection_ms,
+diff --git a/src-tauri/src/bin/monkey-cli/daemon/remote/talk_socket.rs b/src-tauri/src/bin/monkey-cli/daemon/remote/talk_socket.rs
+index 760990b..bf39719 100644
+--- a/src-tauri/src/bin/monkey-cli/daemon/remote/talk_socket.rs
++++ b/src-tauri/src/bin/monkey-cli/daemon/remote/talk_socket.rs
+@@ -10,7 +10,7 @@
+ use async_trait::async_trait;
+ use base64::{engine::general_purpose::STANDARD, Engine as _};
+ use futures_util::{SinkExt, StreamExt};
+-use std::collections::{HashSet, VecDeque};
++use std::collections::{HashMap, HashSet, VecDeque};
+ use hyper_util::rt::TokioIo;
+ use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocketConfig};
+ use tokio_tungstenite::WebSocketStream;
+@@ -209,7 +209,9 @@ async fn output_wait_for_ack(
+                         return Ok(played);
+                     }
+                     TalkClientFrameKind::Interrupt { .. } => return Ok(false),
+-                    TalkClientFrameKind::State { .. } | TalkClientFrameKind::PlaybackAck { .. } => {}
++                    TalkClientFrameKind::State { .. }
++                    | TalkClientFrameKind::PlaybackAck { .. }
++                    | TalkClientFrameKind::InputGateAck { .. } => {}
+                     _ => return Err("An output-only Talk socket received a microphone frame".to_string()),
+                 }
+             }
+@@ -230,6 +232,8 @@ async fn run_realtime_route_session(
+     let mut outbound_audio_sequence = 0u64;
+     let mut inbound = TalkSequenceTracker::default();
+     let mut pending_output_acks = HashSet::<u64>::new();
++    let mut pending_input_gates = HashMap::<u64, bool>::new();
++    let mut route_cursor = authorization.route_event_cursor;
+     let generation = match authorization.route_generation {
+         Some(value) => value,
+         None => {
+@@ -256,7 +260,7 @@ async fn run_realtime_route_session(
+         Ok(TalkClientFrame {
+             kind: TalkClientFrameKind::Hello {
+                 ref media_type,
+-                sample_rate_hz: 48_000,
++                sample_rate_hz: 24_000,
+                 channels: 1,
+             },
+             ..
+@@ -270,7 +274,7 @@ async fn run_realtime_route_session(
+             &mut outbound_sequence,
+             TalkServerFrameKind::Error {
+                 code: "realtime_pcm_required".into(),
+-                message: "Paired Realtime Talk requires mono 48 kHz PCM16 audio.".into(),
++                message: "Paired Realtime Talk requires mono 24 kHz PCM16 audio.".into(),
+                 retryable: false,
+             },
+         )
+@@ -316,6 +320,42 @@ async fn run_realtime_route_session(
+             break;
+         }
+ 
++        for event in api.talk_route_events(&authorization.session_id, route_cursor).unwrap_or_default() {
++            route_cursor = route_cursor.max(event.event_id);
++            if event.generation != generation { continue; }
++            match event.kind.as_str() {
++                "output_stop" if output_role => {
++                    let _ = api.clear_realtime_output_from_host(&authorization.session_id, generation);
++                    pending_output_acks.clear();
++                    let _ = send_output_frame(
++                        socket,
++                        authorization,
++                        &mut outbound_sequence,
++                        TalkServerFrameKind::State { state: TalkState::Interrupted },
++                    ).await;
++                }
++                "input_gate" if input_role => {
++                    let Some(open) = event.payload.get("open").and_then(serde_json::Value::as_bool) else { continue; };
++                    if pending_input_gates.len() >= 8 {
++                        report.errors = report.errors.saturating_add(1);
++                        break;
++                    }
++                    if send_output_frame(
++                        socket,
++                        authorization,
++                        &mut outbound_sequence,
++                        TalkServerFrameKind::InputGate { gate_sequence: event.event_id, open },
++                    ).await.is_err() {
++                        report.stream_dropped = true;
++                        break;
++                    }
++                    pending_input_gates.insert(event.event_id, open);
++                }
++                _ => {}
++            }
++        }

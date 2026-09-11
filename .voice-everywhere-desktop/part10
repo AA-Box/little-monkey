@@ -1,0 +1,162 @@
++    const descriptor = await realtimeVoiceClient.mediaBridge();
++    validateDescriptor(descriptor);
++    this.descriptor = descriptor;
++    return descriptor;
++  }
++
++  private async url(direction: 'input' | 'output'): Promise<{ url: string; token: string }> {
++    const descriptor = await this.config();
++    const base = descriptor.baseUrl.replace(/\/$/, '');
++    return {
++      url: `${base}/v1/host/realtime/${encodeURIComponent(this.sessionId)}/${this.generation}/${direction}`,
++      token: descriptor.token,
++    };
++  }
++
++  async startInput(onPcm16: (audioBase64: string) => void, shouldForward: () => boolean): Promise<void> {
++    this.inputAbort?.abort();
++    const abort = new AbortController();
++    this.inputAbort = abort;
++    this.stopped = false;
++    const endpoint = await this.url('input');
++    void (async () => {
++      while (!this.stopped && !abort.signal.aborted) {
++        try {
++          const response = await fetch(endpoint.url, {
++            method: 'GET', cache: 'no-store', signal: abort.signal,
++            headers: { [TOKEN_HEADER]: endpoint.token },
++          });
++          if (response.status === 204) {
++            this.inputIdleSequence += 1;
++            for (const wake of [...this.inputIdleWaiters]) wake();
++            await new Promise((resolve) => setTimeout(resolve, POLL_IDLE_MS));
++            continue;
++          }
++          if (!response.ok) throw new Error(`Realtime paired microphone bridge returned HTTP ${response.status}.`);
++          const bytes = new Uint8Array(await response.arrayBuffer());
++          if (!bytes.length || bytes.length > MAX_CHUNK_BYTES || bytes.length % 2 !== 0) {
++            throw new Error('Realtime paired microphone returned an invalid PCM16 chunk.');
++          }
++          const sequence = Number(response.headers.get('x-little-monkey-audio-sequence') || 0);
++          if (!Number.isSafeInteger(sequence) || sequence <= this.inputSequence) {
++            throw new Error('Realtime paired microphone sequence is stale or invalid.');
++          }
++          this.inputSequence = sequence;
++          if (shouldForward()) onPcm16(bytesToBase64(bytes));
++        } catch (reason) {
++          if (abort.signal.aborted || this.stopped) return;
++          this.onError(reason instanceof Error ? reason : new Error(String(reason)));
++          return;
++        }
++      }
++    })();
++  }
++
++  async waitForInputIdle(timeoutMs = 1_000): Promise<void> {
++    if (this.stopped) throw new Error('Realtime paired microphone bridge is stopped.');
++    const after = this.inputIdleSequence;
++    if (timeoutMs <= 0) throw new Error('Realtime paired microphone drain timeout must be positive.');
++    await new Promise<void>((resolve, reject) => {
++      let timer: ReturnType<typeof setTimeout>;
++      const check = () => {
++        if (this.inputIdleSequence <= after) return;
++        cleanup();
++        resolve();
++      };
++      const cleanup = () => {
++        clearTimeout(timer);
++        this.inputIdleWaiters.delete(check);
++      };
++      timer = setTimeout(() => {
++        cleanup();
++        reject(new Error('Timed out draining the paired Realtime microphone before commit.'));
++      }, timeoutMs);
++      this.inputIdleWaiters.add(check);
++    });
++  }
++
++  pushOutput(samples: Float32Array, sampleRate: number): void {
++    if (this.stopped || this.outputPaused) return;
++    const bytes = pcm16Bytes(samples, sampleRate);
++    if (!bytes.length) return;
++    if (bytes.length > MAX_CHUNK_BYTES
++        || this.pendingOutputChunks >= MAX_PENDING_CHUNKS
++        || this.pendingOutputBytes + bytes.length > MAX_PENDING_BYTES) {
++      this.onError(new Error('Realtime paired speaker bridge reached its bounded backpressure limit.'));
++      return;
++    }
++    this.pendingOutputChunks += 1;
++    this.pendingOutputBytes += bytes.length;
++    this.outputTail = this.outputTail.catch(() => undefined).then(async () => {
++      try {
++        const endpoint = await this.url('output');
++        const response = await fetch(endpoint.url, {
++          method: 'POST', cache: 'no-store',
++          headers: { [TOKEN_HEADER]: endpoint.token, 'content-type': 'application/octet-stream' },
++          body: bytes,
++        });
++        if (response.status !== 202) throw new Error(`Realtime paired speaker bridge returned HTTP ${response.status}.`);
++      } finally {
++        this.pendingOutputChunks -= 1;
++        this.pendingOutputBytes -= bytes.length;
++      }
++    }).catch((reason) => {
++      if (!this.stopped) this.onError(reason instanceof Error ? reason : new Error(String(reason)));
++    });
++  }
++
++  async interruptOutput(): Promise<void> {
++    if (this.stopped) return;
++    this.outputPaused = true;
++    await this.outputTail.catch(() => undefined);
++    try {
++      const endpoint = await this.url('output');
++      const response = await fetch(endpoint.url, {
++        method: 'DELETE', cache: 'no-store',
++        headers: { [TOKEN_HEADER]: endpoint.token },
++      });
++      if (response.status !== 204) throw new Error(`Realtime paired speaker clear returned HTTP ${response.status}.`);
++    } finally {
++      this.outputPaused = false;
++    }
++  }
++
++  stop(): void {
++    this.stopped = true;
++    this.outputPaused = true;
++    this.inputAbort?.abort();
++    this.inputAbort = null;
++    for (const wake of [...this.inputIdleWaiters]) wake();
++    this.inputIdleWaiters.clear();
++  }
++}
+diff --git a/src/lib/realtimeVoice.ts b/src/lib/realtimeVoice.ts
+index 5fa753e..aa217d3 100644
+--- a/src/lib/realtimeVoice.ts
++++ b/src/lib/realtimeVoice.ts
+@@ -155,10 +155,16 @@ export interface RealtimeVoiceSessionConfig {
+   turnDetection: 'semantic_vad' | 'manual';
+   inputDeviceId: string | null;
+   outputDeviceId: string | null;
++  /** Negotiate WebRTC audio without opening the local microphone. */
++  externalInput?: boolean;
++  /** Expose provider audio as PCM instead of playing it on this computer. */
++  externalOutput?: boolean;
+   instructions: string;
+   tools: ToolDef[];
+ }
+ 
++export type RealtimePcmConsumer = (samples: Float32Array, sampleRate: number) => void;
++
+ export interface RealtimeVoiceSession {
+   readonly capabilities: RealtimeVoiceCapabilities;
+   readonly state: RealtimeVoiceState;
+@@ -167,6 +173,12 @@ export interface RealtimeVoiceSession {
+    * measure it. Sampling it twice across a window is how a caller proves audio
+    * started, and how it proves audio stopped after an interruption. */
+   audioProgress?(): Promise<RealtimeAudioProgress | null>;
++  /** Switch the live sender between a local microphone and externally supplied PCM. */
++  setInputRoute(external: boolean, deviceId: string | null): Promise<void>;
++  /** Append mono PCM16 directly to the provider's active Realtime input buffer. */
++  appendInputPcm16(audioBase64: string): void;
++  /** Switch provider audio between local playback and an external PCM consumer. */

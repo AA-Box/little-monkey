@@ -1,0 +1,125 @@
++        if report.stream_dropped || report.errors > 0 { break; }
++
+         if output_role {
+             while pending_output_acks.len() < MAX_IN_FLIGHT_OUTPUT {
+                 let chunk = match api.take_realtime_output_for_device(authorization) {
+@@ -422,18 +462,30 @@ async fn run_realtime_route_session(
+                         }
+                     }
+                     TalkClientFrameKind::PlaybackAck { audio_sequence, played } if output_role => {
+-                        if pending_output_acks.remove(&audio_sequence) && !played {
+-                            report.errors = report.errors.saturating_add(1);
++                        if pending_output_acks.remove(&audio_sequence) {
++                            let (kind, payload) = if played {
++                                ("output_played", serde_json::json!({ "audio_sequence": audio_sequence }))
++                            } else {
++                                report.errors = report.errors.saturating_add(1);
++                                ("output_failed", serde_json::json!({
++                                    "audio_sequence": audio_sequence,
++                                    "error": "paired Realtime speaker could not play PCM",
++                                }))
++                            };
++                            let _ = api.append_talk_route_event(
++                                &authorization.session_id, generation, kind, &payload,
++                            );
++                            if !played { break; }
++                        }
++                    }
++                    TalkClientFrameKind::InputGateAck { gate_sequence, open } if input_role => {
++                        if pending_input_gates.remove(&gate_sequence).is_some_and(|expected| expected == open) {
+                             let _ = api.append_talk_route_event(
+                                 &authorization.session_id,
+                                 generation,
+-                                "output_failed",
+-                                &serde_json::json!({
+-                                    "audio_sequence": audio_sequence,
+-                                    "error": "paired Realtime speaker could not play PCM",
+-                                }),
++                                "input_gate_ack",
++                                &serde_json::json!({ "gate_sequence": gate_sequence, "open": open }),
+                             );
+-                            break;
+                         }
+                     }
+                     TalkClientFrameKind::Interrupt { reason } => {
+@@ -456,7 +508,8 @@ async fn run_realtime_route_session(
+                     }
+                     TalkClientFrameKind::State { .. }
+                     | TalkClientFrameKind::Metrics { .. }
+-                    | TalkClientFrameKind::PlaybackAck { .. } => {}
++                    | TalkClientFrameKind::PlaybackAck { .. }
++                    | TalkClientFrameKind::InputGateAck { .. } => {}
+                     _ => {
+                         report.errors = report.errors.saturating_add(1);
+                         break;
+@@ -548,7 +601,7 @@ async fn run_output_route_session(
+             match tokio::time::timeout(std::time::Duration::from_millis(120), socket.recv()).await {
+                 Ok(Some(raw)) => {
+                     match parse_output_client_frame(&raw, authorization, &mut inbound) {
+-                        Ok(TalkClientFrame { kind: TalkClientFrameKind::State { .. } | TalkClientFrameKind::PlaybackAck { .. }, .. }) => {}
++                        Ok(TalkClientFrame { kind: TalkClientFrameKind::State { .. } | TalkClientFrameKind::PlaybackAck { .. } | TalkClientFrameKind::InputGateAck { .. }, .. }) => {}
+                         Ok(TalkClientFrame { kind: TalkClientFrameKind::Interrupt { .. }, .. }) => {
+                             let _ = send_output_frame(socket, authorization, &mut outbound_sequence, TalkServerFrameKind::State { state: TalkState::Interrupted }).await;
+                         }
+diff --git a/src-tauri/src/bin/monkey-cli/daemon/remote/ui/app.js b/src-tauri/src/bin/monkey-cli/daemon/remote/ui/app.js
+index 5d7e2b7..97364c6 100644
+--- a/src-tauri/src/bin/monkey-cli/daemon/remote/ui/app.js
++++ b/src-tauri/src/bin/monkey-cli/daemon/remote/ui/app.js
+@@ -2884,6 +2884,8 @@ const talk = {
+   routeGeneration: null,
+   routeRole: null,
+   routeEngine: null,
++  /** Host-controlled capture gate for Realtime manual push-to-talk. */
++  realtimeInputEnabled: true,
+   pcmCaptureSource: null,
+   pcmCaptureProcessor: null,
+   pcmCaptureMute: null,
+@@ -3012,7 +3014,7 @@ function talkQueueRealtimePcm(audioBase64, audioSequence) {
+       if (generation !== talk.playbackGeneration) throw new Error("Playback was interrupted");
+       const samples = realtimePcmBase64ToFloat32(audioBase64);
+       if (!samples.length) throw new Error("Realtime PCM frame was empty or malformed");
+-      const buffer = context.createBuffer(1, samples.length, 48_000);
++      const buffer = context.createBuffer(1, samples.length, 24_000);
+       buffer.copyToChannel(samples, 0);
+       const source = context.createBufferSource();
+       source.buffer = buffer;
+@@ -3093,6 +3095,12 @@ function talkHandleFrame(raw) {
+   }
+   if (frame.session_generation !== talk.sessionGeneration) return;
+   switch (frame.type) {
++    case "input_gate": {
++      if (!Number.isInteger(frame.gate_sequence) || frame.gate_sequence < 1) break;
++      talk.realtimeInputEnabled = frame.open === true;
++      if (talk.frames) talkSendFrame(talk.frames.inputGateAck(frame.gate_sequence, talk.realtimeInputEnabled));
++      break;
++    }
+     case "ready":
+       setTalkState("Listening", "listening");
+       break;
+@@ -3210,7 +3218,7 @@ async function prepareRealtimeTalkCapture() {
+   return {
+     context,
+     mediaType: REALTIME_PCM_MEDIA_TYPE,
+-    sampleRateHz: 48_000,
++    sampleRateHz: 24_000,
+     channels: 1,
+   };
+ }
+@@ -3226,7 +3234,7 @@ function talkStartRealtimeCapture(context) {
+   const mute = context.createGain();
+   mute.gain.value = 0;
+   processor.onaudioprocess = (event) => {
+-    if (!talk.running || !talk.frames || talk.routeEngine !== "realtime") return;
++    if (!talk.running || !talk.frames || talk.routeEngine !== "realtime" || !talk.realtimeInputEnabled) return;
+     const samples = event.inputBuffer.getChannelData(0);
+     const audioBase64 = float32ToRealtimePcmBase64(samples, event.inputBuffer.sampleRate || context.sampleRate);
+     if (!audioBase64) return;
+@@ -3299,6 +3307,7 @@ async function runTalkRoute(argumentsValue, signal) {
+     });
+     talk.routeRole = role;
+     talk.routeEngine = engine;
++    talk.realtimeInputEnabled = true;
+     if (engine === "realtime") talkStartRealtimeCapture(capture.context);
+     else talkStartCapture(capture.context);
+     setTalkState("Listening — controlled by this computer", "listening");
+@@ -3330,7 +3339,7 @@ async function runTalkRouteOutput(argumentsValue, signal) {
