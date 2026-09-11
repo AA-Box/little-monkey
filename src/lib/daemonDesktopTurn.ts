@@ -1,3 +1,4 @@
+import { demoteInlineSystemMessages } from "./llamaClient";
 import type { ChatContentPart, ChatMessage } from "./llamaClient";
 import { isTauri } from "@tauri-apps/api/core";
 import type { ResolvedTarget } from "./turnEngine";
@@ -215,9 +216,13 @@ function base64FromDataUrl(value: string): string {
  * shape accepted by the frozen target. In particular, native Ollama expects
  * top-level `images` and object-valued tool arguments. */
 export function historyForDaemonTarget(history: readonly ChatMessage[], target: ResolvedTarget): unknown[] {
-  if (target.kind !== "ollama") return history.map((message) => structuredClone(message));
+  // The envelope carries the system prompt in its own `system` field, so every
+  // `system` message in this history is one of the app's own mid-conversation
+  // notices — `keepLeading: false`. See `demoteInlineSystemMessages`.
+  const wire = demoteInlineSystemMessages([...history], { keepLeading: false });
+  if (target.kind !== "ollama") return wire.map((message) => structuredClone(message));
   const toolNames = new Map<string, string>();
-  return history.map((message) => {
+  return wire.map((message) => {
     const { text, images } = textParts(message.content);
     if (message.role === "assistant" && message.tool_calls) {
       const tool_calls = message.tool_calls.map((call) => {
