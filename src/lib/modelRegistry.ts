@@ -17,7 +17,7 @@ export interface ModelInfo {
   tool_calling: boolean;
   installed: boolean;
   path: string | null;
-  /** True for a model registered via `models_add_external` (a `.gguf` file outside the app's models dir) — the app never owns or deletes that file. */
+  /** True for a model registered via `models_add_external` (a `.gguf` file) or `models_add_external_folder` (a weights directory), both outside the app's models dir — the app never owns or deletes what it points at. */
   is_external: boolean;
   /** "chat" or "embedding" — see `models.rs::ModelKind`. Every entry in this frontend copy is a chat model; the two curated embedding models (nomic-embed-text-v1.5, bge-m3) are fetched live from the backend instead (see `stackStore.ts`), not duplicated here. */
   kind: "chat" | "embedding";

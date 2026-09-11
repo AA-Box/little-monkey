@@ -865,8 +865,9 @@ fn known_main_model(app: &AppHandle, path: &Path) -> Result<(), String> {
 /// match where possible (`installed: true`, curated metadata + `path`
 /// populated), and surfaced as an ad-hoc entry otherwise (e.g. a file
 /// fetched via a custom, non-curated Hugging Face repo/file pull) — plus
-/// every live entry from the external-file registry (`.gguf` files outside
-/// the app's models directory, registered via `models_add_external`).
+/// every live entry from the external registry (a `.gguf` file or an MLX
+/// weights directory outside the app's models directory, registered via
+/// `models_add_external` or `models_add_external_folder`).
 #[tauri::command]
 pub fn models_list_installed(app: AppHandle) -> Result<Vec<ModelInfo>, String> {
     let dir = models_dir(&app)?;
@@ -959,29 +960,10 @@ pub fn models_list_installed(app: AppHandle) -> Result<Vec<ModelInfo>, String> {
     let external_len_before = external.len();
     let mut live_external = Vec::with_capacity(external.len());
     for entry in external {
-        if !Path::new(&entry.path).is_file() {
+        if !external_entry_is_live(&entry) {
             continue;
         }
-        let filename = Path::new(&entry.path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| entry.name.clone());
-        installed.push(ModelInfo {
-            id: entry.id.clone(),
-            name: entry.name.clone(),
-            repo: String::new(),
-            file: filename,
-            size_gb: entry.size_gb,
-            tool_calling: false,
-            installed: true,
-            path: Some(entry.path.clone()),
-            is_external: true,
-            kind: ModelKind::Chat,
-            components: ModelComponents::default(),
-            capabilities: ModelCapabilities::default(),
-            runtime: Default::default(),
-        });
+        installed.push(external_model_info(&entry));
         live_external.push(entry);
     }
     if live_external.len() != external_len_before {
@@ -998,17 +980,43 @@ pub fn models_list_installed(app: AppHandle) -> Result<Vec<ModelInfo>, String> {
     Ok(installed)
 }
 
-/// A model file living outside the app's managed models directory, added by
-/// the user via a native file picker. Only this reference (path + display
-/// metadata) is persisted — the app never owns, copies, or deletes the
-/// underlying file.
+/// A model living outside the app's managed models directory, added by the
+/// user via a native picker — either a single `.gguf` file or a directory of
+/// safetensors weights the MLX runtime can load. Only this reference (path +
+/// display metadata) is persisted — the app never owns, copies, or deletes
+/// what it points at.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct ExternalModelEntry {
-    id: String,
-    name: String,
-    path: String,
-    size_gb: f32,
+pub(crate) struct ExternalModelEntry {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) size_gb: f32,
+    /// Which runtime loads this model, and what its own files say it can do.
+    /// Sniffed once, when the user adds it, and stored from then on: the list
+    /// path runs on every refresh and would otherwise re-read a user folder
+    /// that may live on a slow or unmounted volume.
+    ///
+    /// ponytail: a snapshot, so editing the folder afterwards (dropping in a
+    /// `config.json` that declares a vision tower, say) leaves a stale answer
+    /// until the model is removed and added again. Re-sniff on list if that
+    /// ever bites.
+    ///
+    /// Every one of these carries `#[serde(default)]` because
+    /// `load_external_registry` ends in `unwrap_or_default()`: a field that an
+    /// older registry file does not have would otherwise fail the whole parse
+    /// and silently empty the model list of every existing user.
+    #[serde(default)]
+    pub(crate) runtime: model_sources::ModelRuntimeKind,
+    #[serde(default)]
+    pub(crate) tool_calling: bool,
+    #[serde(default)]
+    pub(crate) vision: bool,
 }
+
+/// File name of the external-model registry inside the profile data
+/// directory. Named once because the MLX runtime inventory reaches the same
+/// file by path rather than through the `AppHandle`.
+const EXTERNAL_REGISTRY_FILE: &str = "external_models.json";
 
 /// Path to the JSON file backing the external-model registry, creating the
 /// app data directory if needed.
@@ -1024,7 +1032,7 @@ fn external_registry_path(app: &AppHandle) -> Result<PathBuf, String> {
             )
         })?;
     }
-    Ok(base.join("external_models.json"))
+    Ok(base.join(EXTERNAL_REGISTRY_FILE))
 }
 
 /// Loads the external-model registry, treating a missing or unparsable file
@@ -1045,6 +1053,329 @@ fn save_external_registry(app: &AppHandle, entries: &[ExternalModelEntry]) -> Re
     let raw = serde_json::to_string_pretty(entries)
         .map_err(|e| format!("Failed to serialize external model registry: {e}"))?;
     std::fs::write(&path, raw).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
+/// Every registered external MLX folder, read straight from the registry file
+/// in `profile_data_dir`.
+///
+/// The MLX driver inventory is built from a directory path, not from an
+/// `AppHandle`, so it needs this door onto the same file
+/// `load_external_registry` reads. A missing or unparsable registry means no
+/// external MLX models, never an error: it is app-owned bookkeeping, and the
+/// whole runtime inventory would otherwise fail to build over it.
+pub(crate) fn external_mlx_entries(profile_data_dir: &Path) -> Vec<ExternalModelEntry> {
+    let Ok(raw) = std::fs::read_to_string(profile_data_dir.join(EXTERNAL_REGISTRY_FILE)) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<ExternalModelEntry>>(&raw)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| entry.runtime == model_sources::ModelRuntimeKind::Mlx)
+        .collect()
+}
+
+/// The registry row for the external MLX folder at `path`, if there is one.
+///
+/// `mlx_chat_start` uses it to start a folder the user picked, which has no
+/// managed-bundle sidecar and never will — the app does not write into a
+/// user's own directory.
+pub(crate) fn external_mlx_entry(
+    app: &AppHandle,
+    path: &Path,
+) -> Result<Option<ExternalModelEntry>, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("Folder not found: {} ({e})", path.display()))?
+        .to_string_lossy()
+        .to_string();
+    Ok(load_external_registry(app)?.into_iter().find(|entry| {
+        entry.path == canonical && entry.runtime == model_sources::ModelRuntimeKind::Mlx
+    }))
+}
+
+/// The `ModelInfo` the frontend sees for one external registry row.
+///
+/// Both the list path and the folder-add command go through here so a
+/// directory-shaped model reports its stored runtime and capabilities rather
+/// than the llama.cpp defaults that were right when every external model was
+/// a single GGUF.
+fn external_model_info(entry: &ExternalModelEntry) -> ModelInfo {
+    let file = Path::new(&entry.path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| entry.name.clone());
+    ModelInfo {
+        id: entry.id.clone(),
+        name: entry.name.clone(),
+        repo: String::new(),
+        file,
+        size_gb: entry.size_gb,
+        tool_calling: entry.tool_calling,
+        installed: true,
+        path: Some(entry.path.clone()),
+        is_external: true,
+        kind: ModelKind::Chat,
+        components: ModelComponents::default(),
+        capabilities: ModelCapabilities {
+            text: true,
+            image_input: entry.vision,
+        },
+        runtime: entry.runtime,
+    }
+}
+
+/// Whether an external registry row still points at something on disk. An MLX
+/// model is a directory of weights, a llama.cpp one a single file, so the two
+/// answer this question differently — asking `is_file()` of a folder would
+/// prune every MLX entry on the next refresh.
+fn external_entry_is_live(entry: &ExternalModelEntry) -> bool {
+    let path = Path::new(&entry.path);
+    match entry.runtime {
+        model_sources::ModelRuntimeKind::Mlx => path.is_dir(),
+        model_sources::ModelRuntimeKind::LlamaCpp => path.is_file(),
+    }
+}
+
+/// How many models one picked folder may contribute. A user pointing at their
+/// whole Downloads directory should get a bounded answer, not a scan.
+const MAX_DISCOVERED_LOCAL_MODELS: usize = 64;
+
+/// A path on disk the app worked out it can run, and everything the registry
+/// needs to know about it. Deliberately `AppHandle`-free so the rules below
+/// are testable without a Tauri app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalModelShape {
+    path: PathBuf,
+    name: String,
+    runtime: model_sources::ModelRuntimeKind,
+    size_bytes: u64,
+    tool_calling: bool,
+    vision: bool,
+}
+
+/// Whether a folder name says only *which* conversion this is rather than
+/// which model it is — `4-bit`, `q4_k_m`, `bf16`, `mlx-4bit`. Such a name is
+/// meaningless on its own in a model list, so the parent folder carries the
+/// identity and this becomes a suffix.
+fn is_quantization_tag(name: &str) -> bool {
+    let compact: String = name
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+    let without_vendor = compact.strip_prefix("mlx").unwrap_or(compact.as_str());
+    let without_unit = without_vendor.strip_suffix("bit").unwrap_or(without_vendor);
+    // What is left is a tag when a number starts it, with or without the
+    // format prefix conversions use: `4`, `int4`, `fp16`, `q4km`.
+    ["int", "fp", "bf", "f", "q"]
+        .iter()
+        .find_map(|prefix| without_unit.strip_prefix(prefix))
+        .unwrap_or(without_unit)
+        .starts_with(|character: char| character.is_ascii_digit())
+}
+
+/// The name to show for a model the user picked off their own disk.
+fn display_name_for(path: &Path) -> String {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return path.to_string_lossy().to_string();
+    };
+    if !path.is_dir() {
+        return strip_gguf_extension(name);
+    }
+    if is_quantization_tag(name) {
+        if let Some(parent) = path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|parent| parent.to_str())
+        {
+            return format!("{parent} ({name})");
+        }
+    }
+    name.to_string()
+}
+
+/// Whether a `.gguf` is a shard past the first of a split model. llama.cpp is
+/// handed the first shard and opens the rest itself, so the later shards are
+/// parts of a model rather than models of their own: registering each one
+/// would give the user N identically-named cards of which only the first
+/// loads.
+fn is_trailing_gguf_shard(file_name: &str) -> bool {
+    if !model_sources::is_sharded_gguf(file_name) {
+        return false;
+    }
+    let lower = file_name.to_ascii_lowercase();
+    let Some(stem) = lower.strip_suffix(".gguf") else {
+        return false;
+    };
+    let Some(of_index) = stem.rfind("-of-") else {
+        return false;
+    };
+    // `is_sharded_gguf` already established that this is five-plus digits.
+    stem[..of_index]
+        .rsplit('-')
+        .next()
+        .and_then(|index| index.parse::<u32>().ok())
+        .is_some_and(|index| index != 1)
+}
+
+/// A single `.gguf` file the app can serve, or `None` for anything else —
+/// including a projector, which is a component of a model rather than one.
+fn classify_local_gguf(path: &Path, size_bytes: u64) -> Option<LocalModelShape> {
+    let file_name = path.file_name().and_then(|name| name.to_str())?;
+    if !model_sources::is_gguf_file(file_name) {
+        return None;
+    }
+    if classify_gguf_artifact(path, file_name) == GgufArtifactKind::Projector {
+        return None;
+    }
+    if is_trailing_gguf_shard(file_name) {
+        return None;
+    }
+    Some(LocalModelShape {
+        path: path.to_path_buf(),
+        name: display_name_for(path),
+        runtime: model_sources::ModelRuntimeKind::LlamaCpp,
+        size_bytes,
+        // Nothing about a GGUF on disk proves it takes tools or images; the
+        // llama.cpp path has always answered this the same fail-closed way.
+        tool_calling: false,
+        vision: false,
+    })
+}
+
+/// What a path the user picked is, if the app can run it at all.
+///
+/// The directory rule mirrors `is_safetensors_repo`, which decides the same
+/// question for a Hugging Face repository: any non-sharded GGUF present means
+/// this is a GGUF checkout and not an MLX one, and an MLX one needs both the
+/// `config.json` its loader reads and real safetensors weights. Kept the same
+/// deliberately — a folder the app accepts here must be a folder the MLX
+/// service can then load.
+fn classify_local_model(path: &Path) -> Option<LocalModelShape> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.is_file() {
+        return classify_local_gguf(path, metadata.len());
+    }
+    if !metadata.is_dir() {
+        return None;
+    }
+
+    let mut language_ggufs: Vec<(PathBuf, u64)> = Vec::new();
+    let mut sharded_gguf_bytes = 0_u64;
+    let mut has_unsharded_gguf = false;
+    let mut has_config = false;
+    let mut has_weights = false;
+    let mut size_bytes = 0_u64;
+    for entry in std::fs::read_dir(path).ok()?.flatten() {
+        let child = entry.path();
+        let Ok(child_metadata) = std::fs::metadata(&child) else {
+            continue;
+        };
+        if !child_metadata.is_file() {
+            continue;
+        }
+        let Some(file_name) = child.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        size_bytes = size_bytes.saturating_add(child_metadata.len());
+        if model_sources::is_gguf_file(file_name) {
+            let sharded = model_sources::is_sharded_gguf(file_name);
+            if !sharded {
+                has_unsharded_gguf = true;
+            }
+            if classify_gguf_artifact(&child, file_name) == GgufArtifactKind::Projector {
+                continue;
+            }
+            if sharded {
+                sharded_gguf_bytes = sharded_gguf_bytes.saturating_add(child_metadata.len());
+            }
+            // Only the first shard stands for the model; see
+            // `is_trailing_gguf_shard`.
+            if !is_trailing_gguf_shard(file_name) {
+                language_ggufs.push((child, child_metadata.len()));
+            }
+            continue;
+        }
+        if file_name == "config.json" {
+            has_config = true;
+        }
+        if file_name.to_ascii_lowercase().ends_with(".safetensors") {
+            has_weights = true;
+        }
+    }
+
+    // A folder holding one GGUF is the other thing a user reaches for, and the
+    // model there is the file, not the folder. A split model counts as one:
+    // the shards were collapsed to their first above, and the size the user is
+    // shown has to be the whole set rather than the first piece of it.
+    if language_ggufs.len() == 1 {
+        let (child, child_size) = language_ggufs.remove(0);
+        let size_bytes = if sharded_gguf_bytes > 0 {
+            sharded_gguf_bytes
+        } else {
+            child_size
+        };
+        return classify_local_gguf(&child, size_bytes);
+    }
+    if has_unsharded_gguf || !has_config || !has_weights {
+        return None;
+    }
+    Some(LocalModelShape {
+        path: path.to_path_buf(),
+        name: display_name_for(path),
+        runtime: model_sources::ModelRuntimeKind::Mlx,
+        size_bytes,
+        tool_calling: model_sources::bundle_advertises_tools(path),
+        vision: model_sources::bundle_has_vision_tower(path),
+    })
+}
+
+/// Every model a picked folder yields: itself when it is one, otherwise the
+/// ones sitting directly inside it — the common shape being a repository
+/// directory holding `4-bit/` and `8-bit/`.
+///
+/// Exactly one level down, never deeper: a deep walk of a folder the user
+/// pointed at by mistake reads an unbounded amount of their disk. Entries
+/// whose name starts with a dot are skipped, which is what keeps `.cache` and
+/// `.DS_Store` out of the model list.
+fn discover_local_models(root: &Path) -> Vec<LocalModelShape> {
+    if let Some(shape) = classify_local_model(root) {
+        return vec![shape];
+    }
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let child = entry.path();
+        let hidden = child
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.'));
+        if hidden {
+            continue;
+        }
+        if found.len() >= MAX_DISCOVERED_LOCAL_MODELS {
+            eprintln!(
+                "little-monkey: stopping at {MAX_DISCOVERED_LOCAL_MODELS} models found in {}; pick a narrower folder to add the rest",
+                root.display()
+            );
+            break;
+        }
+        if let Some(shape) = classify_local_model(&child) {
+            found.push(shape);
+        }
+    }
+    found.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    found
 }
 
 /// Registers an arbitrary `.gguf` file already on disk — picked via a native
@@ -1112,6 +1443,11 @@ pub fn models_add_external(app: AppHandle, path: String) -> Result<ModelInfo, St
         name: name.clone(),
         path: canonical.clone(),
         size_gb,
+        // This command only ever accepts a single `.gguf`, so the answers are
+        // fixed; a folder goes through `models_add_external_folder`.
+        runtime: model_sources::ModelRuntimeKind::LlamaCpp,
+        tool_calling: false,
+        vision: false,
     });
     save_external_registry(&app, &entries)?;
 
@@ -1130,6 +1466,67 @@ pub fn models_add_external(app: AppHandle, path: String) -> Result<ModelInfo, St
         capabilities: ModelCapabilities::default(),
         runtime: Default::default(),
     })
+}
+
+/// Registers every model found in a folder the user picked, so adding a local
+/// model is one gesture with nothing to fill in.
+///
+/// Idempotent on the canonical path, the same way `models_add_external` is,
+/// and it returns already-registered models too: re-picking the same folder
+/// is then a no-op that still shows the user what is there.
+#[tauri::command]
+pub fn models_add_external_folder(app: AppHandle, path: String) -> Result<Vec<ModelInfo>, String> {
+    let root = PathBuf::from(&path)
+        .canonicalize()
+        .map_err(|e| format!("Folder not found: {path} ({e})"))?;
+    let shapes = discover_local_models(&root);
+    if shapes.is_empty() {
+        return Err(format!(
+            "No model found in {}. Looked for a model directory holding config.json and *.safetensors files, or a .gguf file — either the folder itself or one of the folders directly inside it.",
+            root.display()
+        ));
+    }
+
+    let mut entries = load_external_registry(&app)?;
+    let mut added = false;
+    let mut models = Vec::with_capacity(shapes.len());
+    for shape in shapes {
+        // The registry holds resolved paths and nothing else: `external_mlx_entry`
+        // canonicalizes the path it is handed before looking a row up, so a child
+        // stored as the symlink it was reached through — `~/models/qwen` pointing
+        // at an external volume — would list fine and never start. Only the root
+        // was canonicalized above; `read_dir` hands back joined paths.
+        let canonical = shape
+            .path
+            .canonicalize()
+            .unwrap_or(shape.path)
+            .to_string_lossy()
+            .to_string();
+        let entry = match entries.iter().find(|entry| entry.path == canonical) {
+            Some(existing) => existing.clone(),
+            None => {
+                let entry = ExternalModelEntry {
+                    id: format!("external:{canonical}"),
+                    name: shape.name,
+                    path: canonical,
+                    size_gb: shape.size_bytes as f32 / 1_000_000_000.0,
+                    runtime: shape.runtime,
+                    tool_calling: shape.tool_calling,
+                    vision: shape.vision,
+                };
+                entries.push(entry.clone());
+                added = true;
+                entry
+            }
+        };
+        models.push(external_model_info(&entry));
+    }
+    // One write for the batch: a folder of eight quantizations should not
+    // rewrite the registry eight times.
+    if added {
+        save_external_registry(&app, &entries)?;
+    }
+    Ok(models)
 }
 
 /// Forgets a previously-registered external model reference by id. Never
@@ -2045,5 +2442,219 @@ mod tests {
         let second = begin_bundle_install(&reference).unwrap();
         assert!(begin_bundle_install(&reference).is_err());
         drop(second);
+    }
+    fn shape_test_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-{label}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Writes the file shape the reference 27B MLX conversion ships: a
+    /// `config.json` declaring a vision tower, plus sharded safetensors.
+    fn write_mlx_bundle(directory: &Path) {
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::write(
+            directory.join("config.json"),
+            br#"{"model_type":"qwen3_5","vision_config":{"hidden_size":1152}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("model-00001-of-00002.safetensors"),
+            vec![7_u8; 400],
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("model-00002-of-00002.safetensors"),
+            vec![7_u8; 600],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn safetensors_directory_classifies_as_mlx_with_summed_size_and_vision() {
+        let root = shape_test_root("mlx-shape");
+        let bundle = root.join("4-bit");
+        write_mlx_bundle(&bundle);
+        let config_size = std::fs::metadata(bundle.join("config.json")).unwrap().len();
+
+        let shape = classify_local_model(&bundle).expect("reference bundle must classify");
+        assert_eq!(shape.runtime, model_sources::ModelRuntimeKind::Mlx);
+        assert_eq!(shape.path, bundle);
+        assert_eq!(shape.size_bytes, 1_000 + config_size);
+        assert!(shape.vision);
+        // No chat template in this fixture, so tools stay off.
+        assert!(!shape.tool_calling);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_holding_one_gguf_classifies_as_that_file() {
+        let root = shape_test_root("gguf-folder");
+        let model = root.join("tiny-instruct.gguf");
+        std::fs::write(&model, minimal_gguf("llama")).unwrap();
+        std::fs::write(root.join("mmproj-tiny.gguf"), minimal_gguf("clip")).unwrap();
+
+        let shape = classify_local_model(&root).expect("a folder with one GGUF is that model");
+        assert_eq!(shape.runtime, model_sources::ModelRuntimeKind::LlamaCpp);
+        assert_eq!(shape.path, model);
+        assert_eq!(shape.name, "tiny-instruct");
+        assert_eq!(
+            shape.size_bytes,
+            std::fs::metadata(&model).unwrap().len(),
+            "size is the file's, not the folder's"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discover_local_models_looks_one_level_down_and_ignores_dot_directories() {
+        let root = shape_test_root("discover");
+        let repository = root.join("Qwen3.8-27B-Uncensored-MLX");
+        write_mlx_bundle(&repository.join("4-bit"));
+        // Shaped like a model on purpose: it is skipped for its name, not for
+        // its contents.
+        write_mlx_bundle(&repository.join(".cache"));
+        std::fs::write(repository.join(".DS_Store"), b"junk").unwrap();
+
+        let found = discover_local_models(&repository);
+        assert_eq!(found.len(), 1, "found: {found:?}");
+        assert_eq!(found[0].path, repository.join("4-bit"));
+        assert_eq!(found[0].name, "Qwen3.8-27B-Uncensored-MLX (4-bit)");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn display_name_for_qualifies_a_quantization_folder_with_its_parent() {
+        let root = shape_test_root("display-name");
+        let repository = root.join("Qwen3.8-27B-Uncensored-MLX");
+        let bundle = repository.join("4-bit");
+        std::fs::create_dir_all(&bundle).unwrap();
+        assert_eq!(
+            display_name_for(&bundle),
+            "Qwen3.8-27B-Uncensored-MLX (4-bit)"
+        );
+        // A folder whose own name identifies the model keeps it.
+        assert_eq!(display_name_for(&repository), "Qwen3.8-27B-Uncensored-MLX");
+
+        for tag in [
+            "4bit", "q4_k_m", "int4", "fp16", "bf16", "8-bit", "mlx-4bit",
+        ] {
+            assert!(is_quantization_tag(tag), "{tag} is a quantization tag");
+        }
+        for name in ["Qwen3.8-27B-Uncensored-MLX", "gemma-3-4b-it", "llama3"] {
+            assert!(!is_quantization_tag(name), "{name} names a model");
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_external_registry_entries_survive_the_new_fields() {
+        // The shape every existing user's external_models.json has on disk.
+        // `load_external_registry` ends in `unwrap_or_default()`, so a missing
+        // `#[serde(default)]` here would empty their model list instead of
+        // failing visibly.
+        let legacy = r#"[{"id":"external:/models/a.gguf","name":"a","path":"/models/a.gguf","size_gb":4.2}]"#;
+        let entries: Vec<ExternalModelEntry> = serde_json::from_str(legacy).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "/models/a.gguf");
+        assert_eq!(
+            entries[0].runtime,
+            model_sources::ModelRuntimeKind::LlamaCpp
+        );
+        assert!(!entries[0].tool_calling);
+        assert!(!entries[0].vision);
+    }
+
+    /// `addExternalFolder` calls `refresh()` the moment the add returns, so
+    /// this predicate is what stops a just-added folder from pruning itself
+    /// back out of the registry before the UI ever renders it.
+    #[test]
+    fn liveness_asks_a_directory_model_whether_it_is_a_directory() {
+        let root = shape_test_root("liveness");
+        let bundle = root.join("4-bit");
+        write_mlx_bundle(&bundle);
+        let mut entry = ExternalModelEntry {
+            id: "external:x".to_string(),
+            name: "Qwen3.8-27B-Uncensored-MLX (4-bit)".to_string(),
+            path: bundle.to_string_lossy().to_string(),
+            size_gb: 16.1,
+            runtime: model_sources::ModelRuntimeKind::Mlx,
+            tool_calling: true,
+            vision: true,
+        };
+        assert!(external_entry_is_live(&entry));
+        // The same path judged by the llama.cpp rule is a file that is not
+        // there, which is exactly the prune this replaced.
+        entry.runtime = model_sources::ModelRuntimeKind::LlamaCpp;
+        assert!(!external_entry_is_live(&entry));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The only place a registry row's runtime and capabilities reach the UI:
+    /// the MLX, tools and vision badges on the card are these three fields.
+    #[test]
+    fn external_model_info_carries_the_row_runtime_and_capabilities() {
+        let entry = ExternalModelEntry {
+            id: "external:/weights/Qwen3.8-27B-Uncensored-MLX/4-bit".to_string(),
+            name: "Qwen3.8-27B-Uncensored-MLX (4-bit)".to_string(),
+            path: "/weights/Qwen3.8-27B-Uncensored-MLX/4-bit".to_string(),
+            size_gb: 16.1,
+            runtime: model_sources::ModelRuntimeKind::Mlx,
+            tool_calling: true,
+            vision: true,
+        };
+
+        let info = external_model_info(&entry);
+        assert_eq!(info.runtime, model_sources::ModelRuntimeKind::Mlx);
+        assert!(info.tool_calling);
+        assert!(info.capabilities.image_input);
+        assert!(info.capabilities.text);
+        assert!(info.is_external && info.installed);
+        // A directory has no extension, so `file` is the directory's own name.
+        assert_eq!(info.file, "4-bit");
+        assert_eq!(info.path.as_deref(), Some(entry.path.as_str()));
+    }
+
+    /// llama.cpp opens a split model from its first shard and finds the rest
+    /// itself. Registering each shard would put three identically-named cards
+    /// in the list, two of which cannot load.
+    #[test]
+    fn a_split_gguf_is_one_model_at_its_first_shard() {
+        let root = shape_test_root("gguf-shards");
+        let folder = root.join("Llama-3.3-70B-Instruct-Q4_K_M");
+        std::fs::create_dir_all(&folder).unwrap();
+        let first = folder.join("Llama-3.3-70B-Instruct-Q4_K_M-00001-of-00003.gguf");
+        for shard in 1..=3 {
+            std::fs::write(
+                folder.join(format!(
+                    "Llama-3.3-70B-Instruct-Q4_K_M-0000{shard}-of-00003.gguf"
+                )),
+                minimal_gguf("llama"),
+            )
+            .unwrap();
+        }
+        let shard_bytes = minimal_gguf("llama").len() as u64 * 3;
+
+        let shape = classify_local_model(&folder).expect("a shard set is one model");
+        assert_eq!(shape.path, first);
+        assert_eq!(
+            shape.size_bytes, shard_bytes,
+            "the size shown is the whole set, not the first piece of it"
+        );
+
+        // And picking the parent finds it exactly once rather than three times.
+        let found = discover_local_models(&root);
+        assert_eq!(found.len(), 1, "found: {found:?}");
+        assert_eq!(found[0].path, first);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
