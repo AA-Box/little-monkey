@@ -1124,7 +1124,7 @@ where
 /// the same fail-closed answer, for the same reason: a capability the app
 /// advertises but the model cannot honour produces a broken turn, while the
 /// reverse only leaves a feature unused.
-fn bundle_advertises_tools(directory: &Path) -> bool {
+pub(crate) fn bundle_advertises_tools(directory: &Path) -> bool {
     let jinja = directory.join("chat_template.jinja");
     if let Some(template) = read_bounded_text(&jinja) {
         return embedded_jinja_advertises_tools(&template);
@@ -1152,7 +1152,7 @@ fn bundle_advertises_tools(directory: &Path) -> bool {
 /// Read from the model's own files rather than from its hub tags or its name:
 /// those are metadata a repository author writes, and this decides whether the
 /// app offers a user an image attachment.
-fn bundle_has_vision_tower(directory: &Path) -> bool {
+pub(crate) fn bundle_has_vision_tower(directory: &Path) -> bool {
     let Some(config) = read_bounded_text(&directory.join("config.json")) else {
         return false;
     };
@@ -4077,11 +4077,11 @@ fn is_safe_component(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
-fn is_gguf_file(file_name: &str) -> bool {
+pub(crate) fn is_gguf_file(file_name: &str) -> bool {
     file_name.to_ascii_lowercase().ends_with(".gguf")
 }
 
-fn is_sharded_gguf(file_name: &str) -> bool {
+pub(crate) fn is_sharded_gguf(file_name: &str) -> bool {
     let lower = file_name.to_ascii_lowercase();
     let Some(stem) = lower.strip_suffix(".gguf") else {
         return false;
