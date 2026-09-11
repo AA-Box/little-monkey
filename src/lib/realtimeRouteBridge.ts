@@ -1,6 +1,12 @@
 import { realtimeVoiceClient, type RealtimeVoiceMediaBridge } from './companionClient';
 
 const TOKEN_HEADER = 'x-little-monkey-host-media-token';
+// The route rides in headers rather than in the path. A URL is the part of a
+// request that gets written down — proxy logs, crash reports, the WebView's own
+// history — and a conversation id written down next to an audio stream records
+// who was talking and when. The path names only the direction.
+const SESSION_HEADER = 'x-little-monkey-route-session';
+const GENERATION_HEADER = 'x-little-monkey-route-generation';
 const MAX_CHUNK_BYTES = 64 * 1024;
 const MAX_PENDING_BYTES = 512 * 1024;
 const MAX_PENDING_CHUNKS = 32;
@@ -66,12 +72,16 @@ export class RealtimeRouteBridge {
     return descriptor;
   }
 
-  private async url(direction: 'input' | 'output'): Promise<{ url: string; token: string }> {
+  private async url(direction: 'input' | 'output'): Promise<{ url: string; headers: Record<string, string> }> {
     const descriptor = await this.config();
     const base = descriptor.baseUrl.replace(/\/$/, '');
     return {
-      url: `${base}/v1/host/realtime/${encodeURIComponent(this.sessionId)}/${this.generation}/${direction}`,
-      token: descriptor.token,
+      url: `${base}/v1/host/realtime/${direction}`,
+      headers: {
+        [TOKEN_HEADER]: descriptor.token,
+        [SESSION_HEADER]: this.sessionId,
+        [GENERATION_HEADER]: String(this.generation),
+      },
     };
   }
 
@@ -86,7 +96,7 @@ export class RealtimeRouteBridge {
         try {
           const response = await fetch(endpoint.url, {
             method: 'GET', cache: 'no-store', signal: abort.signal,
-            headers: { [TOKEN_HEADER]: endpoint.token },
+            headers: endpoint.headers,
           });
           if (response.status === 204) {
             this.inputIdleSequence += 1;
@@ -154,7 +164,7 @@ export class RealtimeRouteBridge {
         const endpoint = await this.url('output');
         const response = await fetch(endpoint.url, {
           method: 'POST', cache: 'no-store',
-          headers: { [TOKEN_HEADER]: endpoint.token, 'content-type': 'application/octet-stream' },
+          headers: { ...endpoint.headers, 'content-type': 'application/octet-stream' },
           body: bytes,
         });
         if (response.status !== 202) throw new Error(`Realtime paired speaker bridge returned HTTP ${response.status}.`);
@@ -175,7 +185,7 @@ export class RealtimeRouteBridge {
       const endpoint = await this.url('output');
       const response = await fetch(endpoint.url, {
         method: 'DELETE', cache: 'no-store',
-        headers: { [TOKEN_HEADER]: endpoint.token },
+        headers: endpoint.headers,
       });
       if (response.status !== 204) throw new Error(`Realtime paired speaker clear returned HTTP ${response.status}.`);
     } finally {

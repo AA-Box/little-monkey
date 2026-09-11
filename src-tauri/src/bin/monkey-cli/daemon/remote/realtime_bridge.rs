@@ -34,6 +34,13 @@ const MAX_REALTIME_PCM_QUEUE_CHUNKS: usize = 128;
 const MAX_REALTIME_ROUTE_QUEUES: usize = 32;
 const HOST_MEDIA_PROTOCOL_VERSION: u32 = 1;
 const HOST_MEDIA_TOKEN_HEADER: &str = "x-little-monkey-host-media-token";
+// The route a media request belongs to travels in headers, not in the path.
+// A URL is the part of a request that gets written down -- proxy logs, crash
+// reports, a WebView's own history -- and a conversation id written down beside
+// an audio stream is a record of who was talking and when. The path names only
+// the direction, which is not about anybody.
+const HOST_MEDIA_SESSION_HEADER: &str = "x-little-monkey-route-session";
+const HOST_MEDIA_GENERATION_HEADER: &str = "x-little-monkey-route-generation";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RealtimePcmChunk {
@@ -316,8 +323,11 @@ async fn handle_host_media(
     {
         return Ok(host_response(StatusCode::UNAUTHORIZED, Bytes::new()));
     }
-    let Some((session_id, generation, direction)) = parse_target(request.uri().path()) else {
+    let Some(direction) = parse_direction(request.uri().path()) else {
         return Ok(host_response(StatusCode::NOT_FOUND, Bytes::new()));
+    };
+    let Some((session_id, generation)) = parse_route(request.headers()) else {
+        return Ok(host_response(StatusCode::BAD_REQUEST, Bytes::new()));
     };
     let result = match (request.method(), direction) {
         (&Method::GET, "input") => match api.take_realtime_input_for_host(&session_id, generation) {
@@ -363,45 +373,44 @@ fn host_response(status: StatusCode, body: Bytes) -> Response<Full<Bytes>> {
         .header("access-control-allow-methods", "GET, POST, DELETE, OPTIONS")
         .header(
             "access-control-allow-headers",
-            "content-type, x-little-monkey-host-media-token",
+            "content-type, x-little-monkey-host-media-token, x-little-monkey-route-session, \
+             x-little-monkey-route-generation",
         )
         .header("access-control-expose-headers", "x-little-monkey-audio-sequence")
         .body(Full::new(body))
         .expect("static host-media response is valid")
 }
 
-fn parse_target(path: &str) -> Option<(String, u64, &'static str)> {
+fn parse_direction(path: &str) -> Option<&'static str> {
     let parts: Vec<_> = path.split('/').filter(|part| !part.is_empty()).collect();
-    let ["v1", "host", "realtime", raw_session, raw_generation, direction] = parts.as_slice() else {
+    let ["v1", "host", "realtime", direction] = parts.as_slice() else {
         return None;
     };
-    let session_id = percent_decode(raw_session);
-    validate_id(&session_id).ok()?;
-    let generation = raw_generation.parse::<u64>().ok().filter(|value| *value > 0)?;
-    let direction = match *direction {
-        "input" => "input",
-        "output" => "output",
-        _ => return None,
-    };
-    Some((session_id, generation, direction))
+    match *direction {
+        "input" => Some("input"),
+        "output" => Some("output"),
+        _ => None,
+    }
 }
 
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&value[index + 1..index + 3], 16) {
-                out.push(byte);
-                index += 3;
-                continue;
-            }
-        }
-        out.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
+/// The route this request claims, read from headers and validated exactly as it
+/// was when it rode in the path: a well-formed id and a positive generation.
+/// Reading it from a header changes where it is written, never whether it is
+/// checked -- the queues are still keyed by `(session, generation)` and a claim
+/// that names no live route reaches nothing.
+fn parse_route(headers: &hyper::HeaderMap) -> Option<(String, u64)> {
+    let session_id = headers
+        .get(HOST_MEDIA_SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())?
+        .to_string();
+    validate_id(&session_id).ok()?;
+    let generation = headers
+        .get(HOST_MEDIA_GENERATION_HEADER)
+        .and_then(|value| value.to_str().ok())?
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)?;
+    Some((session_id, generation))
 }
 
 #[cfg(test)]
@@ -418,13 +427,37 @@ mod tests {
         assert_eq!(chunk.sequence, 1);
     }
 
+    /// The path says which way the audio is going and nothing else. A
+    /// conversation id in a URL ends up in every log that records the URL, so
+    /// the route rides in headers -- and is validated there just as strictly.
     #[test]
-    fn host_path_is_generation_scoped() {
-        assert_eq!(
-            parse_target("/v1/host/realtime/chat-one/9/input"),
-            Some(("chat-one".to_string(), 9, "input"))
-        );
-        assert!(parse_target("/v1/host/realtime/chat-one/0/input").is_none());
-        assert!(parse_target("/v1/host/realtime/chat-one/9/other").is_none());
+    fn the_path_names_only_a_direction() {
+        assert_eq!(parse_direction("/v1/host/realtime/input"), Some("input"));
+        assert_eq!(parse_direction("/v1/host/realtime/output"), Some("output"));
+        assert!(parse_direction("/v1/host/realtime/other").is_none());
+        assert!(parse_direction("/v1/host/realtime/chat-one/9/input").is_none());
+    }
+
+    #[test]
+    fn the_route_is_read_from_headers_and_still_validated() {
+        let route = |session: &str, generation: &str| {
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert(
+                HOST_MEDIA_SESSION_HEADER,
+                hyper::header::HeaderValue::from_str(session).unwrap(),
+            );
+            headers.insert(
+                HOST_MEDIA_GENERATION_HEADER,
+                hyper::header::HeaderValue::from_str(generation).unwrap(),
+            );
+            parse_route(&headers)
+        };
+        assert_eq!(route("chat-one", "9"), Some(("chat-one".to_string(), 9)));
+        // Generation 0 is not a route anybody can own, and an id that would not
+        // have been accepted in the path is not accepted in a header either.
+        assert!(route("chat-one", "0").is_none());
+        assert!(route("chat one", "9").is_none());
+        assert!(route("chat-one", "not-a-number").is_none());
+        assert!(parse_route(&hyper::HeaderMap::new()).is_none());
     }
 }

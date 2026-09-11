@@ -9730,8 +9730,10 @@ mod tests {
         generation: u64,
     ) -> (u16, Vec<u8>, Option<u64>) {
         let response = reqwest::Client::new()
-            .get(format!("{}/{session_id}/{generation}/input", bridge.0))
+            .get(format!("{}/input", bridge.0))
             .header("x-little-monkey-host-media-token", &bridge.1)
+            .header("x-little-monkey-route-session", session_id)
+            .header("x-little-monkey-route-generation", generation.to_string())
             .send()
             .await
             .expect("the loopback bridge answers");
@@ -9771,8 +9773,10 @@ mod tests {
         pcm: &[u8],
     ) -> u16 {
         reqwest::Client::new()
-            .post(format!("{}/{session_id}/{generation}/output", bridge.0))
+            .post(format!("{}/output", bridge.0))
             .header("x-little-monkey-host-media-token", &bridge.1)
+            .header("x-little-monkey-route-session", session_id)
+            .header("x-little-monkey-route-generation", generation.to_string())
             .body(pcm.to_vec())
             .send()
             .await
