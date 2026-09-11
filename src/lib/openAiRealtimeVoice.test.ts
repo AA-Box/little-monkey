@@ -36,7 +36,9 @@ class FakePeer {
   // peer-failure paths are only reachable by firing the listener the session
   // registered, and a fake that drops it silently reports coverage it lacks.
   listeners = new Map<string, Set<EventListener>>();
-  addTrack() { return {} as RTCRtpSender; }
+  sender = { replaceTrack: vi.fn(async (_track: MediaStreamTrack | null) => undefined) } as unknown as RTCRtpSender;
+  addTrack() { return this.sender; }
+  addTransceiver() { return { sender: this.sender } as RTCRtpTransceiver; }
   createDataChannel() { return this.channel as unknown as RTCDataChannel; }
   async createOffer() { return { type: 'offer' as RTCSdpType, sdp: 'v=0\r\n' }; }
   async setLocalDescription() {}
@@ -107,12 +109,14 @@ function harness(
   const pause = vi.fn(() => { element.paused = true; });
   Object.assign(element, { play, pause }, audioExtras);
   const audio = element as unknown as HTMLAudioElement;
+  const mic = vi.fn(async () => stream);
   const connectBroker = vi.fn(async (_request: BrokerRequest) => brokerAnswer());
   const disconnectBroker = vi.fn(async () => undefined);
   const environment: OpenAiRealtimeEnvironment = {
     createPeer: () => peer as never,
-    getUserMedia: vi.fn(async () => stream),
+    getUserMedia: mic,
     createAudio: () => audio,
+    createAudioContext: () => ({}) as AudioContext,
     connectBroker,
     disconnectBroker,
     ...(probeMs === undefined ? {} : { audioProbeIntervalMs: probeMs }),
@@ -127,7 +131,7 @@ function harness(
   const receiver = fakeReceiver();
   const remoteStream = { id: 'remote-model-audio' } as unknown as MediaStream;
   return {
-    peer, track, audio, play, pause, connectBroker, disconnectBroker, events, session, receiver, remoteStream,
+    peer, track, audio, play, pause, mic, connectBroker, disconnectBroker, events, session, receiver, remoteStream,
     attachRemoteTrack: () => peer.ontrack?.({ streams: [remoteStream], receiver } as unknown as RTCTrackEvent),
   };
 }
@@ -449,6 +453,37 @@ describe('OpenAI realtime adapter', () => {
     ]);
     // Revocation is not recoverable, so holding the peer and the broker session
     // open would only bill for a conversation nobody can be heard in.
+    expect(peer.closed).toBe(true);
+    expect(peer.channel.closed).toBe(true);
+    expect(disconnectBroker).toHaveBeenCalledWith('rv_test');
+    expect(session.state).toBe('closed');
+  });
+
+  it('survives a route move that swaps the local microphone out, and still dies when the routed one is revoked', async () => {
+    /** The local track is ended on purpose when the conversation moves to a
+     * paired device. A teardown keyed on *any* track ending — which is what a
+     * single shared `ended` listener amounts to — would drop the very call the
+     * move was meant to carry over, and the operator would hear it die as they
+     * walked to the other device. The mirror defect is just as bad: dropping
+     * the listener on a swap and never re-arming it leaves the new microphone's
+     * revocation unnoticed, which is the leak this file's other test names. */
+    const { peer, track, disconnectBroker, events, session, mic } = harness();
+    await session.connect();
+
+    await session.setInputRoute(true, null);
+    expect(track.stopped).toBe(true);
+    track.listeners.get('ended')?.({} as Event);
+    expect(events.filter((event) => event.type === 'connection_lost')).toEqual([]);
+    expect(peer.closed).toBe(false);
+    expect(session.state).toBe('ready');
+
+    const routed = new FakeTrack();
+    mic.mockResolvedValue({ getAudioTracks: () => [routed], getTracks: () => [routed] } as unknown as MediaStream);
+    await session.setInputRoute(false, 'mic-2');
+    routed.listeners.get('ended')?.({} as Event);
+    expect(events.filter((event) => event.type === 'connection_lost')).toEqual([
+      expect.objectContaining({ type: 'connection_lost', recoverable: false, code: 'microphone_revoked' }),
+    ]);
     expect(peer.closed).toBe(true);
     expect(peer.channel.closed).toBe(true);
     expect(disconnectBroker).toHaveBeenCalledWith('rv_test');

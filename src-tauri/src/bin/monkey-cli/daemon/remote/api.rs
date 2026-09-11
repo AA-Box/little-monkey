@@ -204,6 +204,12 @@ struct PendingTalkTicket {
     signed_request_sha256: String,
     session_id: String,
     session_generation: String,
+    route_id: Option<String>,
+    route_generation: Option<u64>,
+    route_role: Option<String>,
+    route_engine: Option<String>,
+    route_output_to_socket: bool,
+    route_event_cursor: u64,
     expires_at_ms: u64,
 }
 
@@ -218,6 +224,17 @@ pub(crate) struct TalkSocketAuthorization {
     pub signed_request_sha256: String,
     pub session_id: String,
     pub session_generation: String,
+    /// Present only when the desktop owns this Talk socket through VoiceRoute.
+    pub route_id: Option<String>,
+    pub route_generation: Option<u64>,
+    /// input, output, or duplex for desktop-owned VoiceRoute sockets.
+    pub route_role: Option<String>,
+    /// Pipeline or realtime for a host-owned routed socket.
+    pub route_engine: Option<String>,
+    /// Same paired endpoint is both microphone and speaker.
+    pub route_output_to_socket: bool,
+    /// Output-only sockets begin after this event, so old speech is never replayed.
+    pub route_event_cursor: u64,
 }
 
 impl ApiResponse {
@@ -292,12 +309,31 @@ pub struct RemoteApi {
     /// Short-lived, one-use WebSocket admissions keyed by a digest of the
     /// opaque ticket. Device secrets never enter this map or a URL.
     talk_tickets: Arc<Mutex<HashMap<String, PendingTalkTicket>>>,
+    /// Raw Realtime PCM exists only here, in bounded memory shared by Talk sockets
+    /// and the loopback-only desktop bridge. It is never written to SQLite.
+    realtime_media: Arc<super::realtime_bridge::RealtimeMediaBridge>,
     /// Speech backends for Talk sockets. `None` — always, in production — means
     /// the operator's own configured stack, resolved per session. A test
     /// substitutes the two things that are genuinely outside this process, a
     /// transcriber and a synthesizer, and nothing else.
     talk_speech: Option<Arc<dyn super::talk::TalkSpeech>>,
+    /// Routed sockets that have been admitted and have not yet recorded their
+    /// session: the device they belong to, when they were admitted, and the
+    /// route they were bound to at that moment.
+    ///
+    /// The session loops cannot carry this — they never see the route row, and
+    /// by the time one ends the route may have moved — so it is held here
+    /// between [`consume_talk_ticket`](Self::consume_talk_ticket) and
+    /// [`record_talk_session`](Self::record_talk_session). Bounded, because an
+    /// admission whose socket dies before it records anything must not
+    /// accumulate.
+    talk_route_sessions: Arc<Mutex<Vec<(String, u64, super::talk::TalkRouteReport)>>>,
 }
+
+/// Admitted routed sockets remembered at once. A socket that never records is
+/// a connection that died between the `101` and its first frame, which is rare
+/// and bounded by this rather than by anything the peer controls.
+const MAX_OPEN_ROUTE_METRICS: usize = 64;
 
 impl Clone for RemoteApi {
     fn clone(&self) -> Self {
@@ -315,7 +351,9 @@ impl Clone for RemoteApi {
             terminal_commits: Arc::clone(&self.terminal_commits),
             audit: self.audit.clone(),
             talk_tickets: Arc::clone(&self.talk_tickets),
+            realtime_media: Arc::clone(&self.realtime_media),
             talk_speech: self.talk_speech.clone(),
+            talk_route_sessions: Arc::clone(&self.talk_route_sessions),
         }
     }
 }
@@ -349,7 +387,9 @@ impl RemoteApi {
             terminal_commits: Arc::new(Mutex::new(HashMap::new())),
             audit,
             talk_tickets: Arc::new(Mutex::new(HashMap::new())),
+            realtime_media: Arc::new(super::realtime_bridge::RealtimeMediaBridge::default()),
             talk_speech: None,
+            talk_route_sessions: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -380,7 +420,9 @@ impl RemoteApi {
             terminal_commits: Arc::new(Mutex::new(HashMap::new())),
             audit,
             talk_tickets: Arc::new(Mutex::new(HashMap::new())),
+            realtime_media: Arc::new(super::realtime_bridge::RealtimeMediaBridge::default()),
             talk_speech: None,
+            talk_route_sessions: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -897,8 +939,7 @@ impl RemoteApi {
             // key generation as any other route — and receives a one-use,
             // 30-second bearer it immediately spends. See `consume_talk_ticket`.
             ("POST", ["v1", "remote", "device", "talk", "ticket"]) => {
-                require_capability(device, DeviceCapability::VoiceStream)
-                    .and_then(|_| self.talk_ticket(&request.body, device, request_sha256, now_ms))
+                self.talk_ticket(&request.body, device, request_sha256, now_ms)
             }
             // The upgrade itself never reaches this match — `server.rs` answers
             // it before a body is collected. A *signed* GET that is not an
@@ -2286,24 +2327,75 @@ impl RemoteApi {
         let request: TalkTicketRequest = serde_json::from_slice(body)
             .map_err(|error| (400, format!("Invalid Talk ticket request: {error}")))?;
         request.validate().map_err(|error| (400, error))?;
-        // The surface matters as much as the grant: a device whose OS refused
-        // the microphone must not be handed a socket that can only fail.
-        let surface = self
-            .locked_store()?
-            .device_surface(&device.device_id)
-            .map_err(internal)?;
-        if !effective_capabilities(&device.capabilities, surface.as_ref())
-            .contains(&DeviceCapability::VoiceStream)
-        {
-            return Err((
-                403,
-                "This device's microphone is not effective: the grant, the device's own \
-                 advertisement and its operating system permission must all allow it."
-                    .to_string(),
-            ));
-        }
+
+        let (session_id, route_id, route_generation, route_role, route_engine, route_output_to_socket, route_event_cursor) = {
+            let store = self.locked_store()?;
+            let surface = store.device_surface(&device.device_id).map_err(internal)?;
+            let effective = effective_capabilities(&device.capabilities, surface.as_ref());
+
+            match (&request.route_id, request.route_generation, request.route_role.as_deref()) {
+                (Some(route_id), Some(generation), Some(role)) => {
+                    let route = store
+                        .voice_route_by_id(route_id)
+                        .map_err(internal)?
+                        .ok_or_else(|| (409, "This VoiceRoute no longer exists".to_string()))?;
+                    if route.state != "active" || route.generation != generation {
+                        return Err((409, "This VoiceRoute generation is stale".to_string()));
+                    }
+                    let expected_input = format!("paired:{}:input", device.device_id);
+                    let expected_output = format!("paired:{}:output", device.device_id);
+                    match role {
+                        "input" => {
+                            if route.input_endpoint != expected_input {
+                                return Err((403, "This paired device is not the selected VoiceRoute microphone".to_string()));
+                            }
+                            if !effective.contains(&DeviceCapability::VoiceStream) {
+                                return Err((403, "This device's voice_stream capability is not effective".to_string()));
+                            }
+                        }
+                        "output" => {
+                            if route.output_endpoint != expected_output || route.input_endpoint == expected_input {
+                                return Err((403, "This paired device is not the independent VoiceRoute speaker".to_string()));
+                            }
+                            if !effective.contains(&DeviceCapability::AudioPlayback) {
+                                return Err((403, "This device's audio_playback capability is not effective".to_string()));
+                            }
+                        }
+                        "duplex" => {
+                            if route.input_endpoint != expected_input || route.output_endpoint != expected_output {
+                                return Err((403, "This paired device is not both VoiceRoute microphone and speaker".to_string()));
+                            }
+                            if !effective.contains(&DeviceCapability::VoiceStream)
+                                || !effective.contains(&DeviceCapability::AudioPlayback)
+                            {
+                                return Err((403, "This device needs effective voice_stream and audio_playback for duplex Talk".to_string()));
+                            }
+                        }
+                        _ => unreachable!("TalkTicketRequest::validate checks role"),
+                    }
+                    let cursor = store.latest_voice_route_event_id(&route.session_id).map_err(internal)?;
+                    (
+                        route.session_id,
+                        Some(route.route_id),
+                        Some(route.generation),
+                        Some(role.to_string()),
+                        Some(route.engine),
+                        role == "duplex",
+                        cursor,
+                    )
+                }
+                (None, None, None) => {
+                    if !effective.contains(&DeviceCapability::VoiceStream) {
+                        return Err((403, "This device's microphone is not effective".to_string()));
+                    }
+                    (request.session_id.clone(), None, None, None, None, true, 0)
+                }
+                _ => unreachable!("TalkTicketRequest::validate rejects partial routes"),
+            }
+        };
+
         let issued = TalkTicketResponse::issue(
-            request.session_id.clone(),
+            session_id,
             now_ms,
             DEFAULT_TALK_TICKET_TTL_MS,
         )
@@ -2312,15 +2404,9 @@ impl RemoteApi {
             .talk_tickets
             .lock()
             .map_err(|_| (500, "Talk ticket state was poisoned".to_string()))?;
-        // Expired admissions are swept on every issue rather than on a timer:
-        // this is the only path that adds to the map, so it is the only place
-        // it can grow.
         tickets.retain(|_, pending| pending.expires_at_ms > now_ms);
         if tickets.len() >= MAX_PENDING_TALK_TICKETS {
-            return Err((
-                429,
-                "Too many Talk sockets are being opened at once.".to_string(),
-            ));
+            return Err((429, "Too many Talk sockets are being opened at once.".to_string()));
         }
         tickets.insert(
             sha256_hex(issued.ticket.as_bytes()),
@@ -2330,6 +2416,12 @@ impl RemoteApi {
                 signed_request_sha256: request_sha256.to_string(),
                 session_id: issued.session_id.clone(),
                 session_generation: issued.session_generation.clone(),
+                route_id,
+                route_generation,
+                route_role,
+                route_engine,
+                route_output_to_socket,
+                route_event_cursor,
                 expires_at_ms: issued.expires_at_ms,
             },
         );
@@ -2369,24 +2461,78 @@ impl RemoteApi {
             pending
         };
         // Re-checked at the moment of admission, not only at issue: thirty
-        // seconds is long enough for an operator to revoke a device, and the
-        // socket that follows can stay open for an hour.
-        let device = self
-            .store
-            .lock()
-            .ok()?
-            .device(&pending.device_id)
-            .ok()
-            .flatten()?;
-        if !device.active() || device.secret_generation != pending.secret_generation {
-            return None;
+        // seconds is long enough for an operator to revoke, re-key, or move a
+        // route. Routed sockets additionally bind the exact current generation.
+        let mut route_metrics = None;
+        {
+            let store = self.store.lock().ok()?;
+            let device = store.device(&pending.device_id).ok().flatten()?;
+            if !device.active() || device.secret_generation != pending.secret_generation {
+                return None;
+            }
+            let surface = store.device_surface(&pending.device_id).ok().flatten();
+            let effective = effective_capabilities(&device.capabilities, surface.as_ref());
+            if let (Some(route_id), Some(generation), Some(role)) = (
+                pending.route_id.as_deref(),
+                pending.route_generation,
+                pending.route_role.as_deref(),
+            ) {
+                let route = store.voice_route_by_id(route_id).ok().flatten()?;
+                if route.state != "active" || route.generation != generation || route.session_id != pending.session_id {
+                    return None;
+                }
+                let expected_input = format!("paired:{}:input", pending.device_id);
+                let expected_output = format!("paired:{}:output", pending.device_id);
+                let valid = match role {
+                    "input" => route.input_endpoint == expected_input && effective.contains(&DeviceCapability::VoiceStream),
+                    "output" => route.output_endpoint == expected_output
+                        && route.input_endpoint != expected_input
+                        && effective.contains(&DeviceCapability::AudioPlayback),
+                    "duplex" => route.input_endpoint == expected_input
+                        && route.output_endpoint == expected_output
+                        && effective.contains(&DeviceCapability::VoiceStream)
+                        && effective.contains(&DeviceCapability::AudioPlayback),
+                    _ => false,
+                };
+                if !valid { return None; }
+                // Measured here rather than at issue time: a ticket is minted
+                // thirty seconds before it is spent, and what an operator waits
+                // for is the socket, not the bearer.
+                route_metrics = Some(super::talk::TalkRouteReport {
+                    generation: route.generation,
+                    engine: route.engine.clone(),
+                    role: role.to_string(),
+                    input_kind: super::talk::TalkRouteReport::endpoint_kind(&route.input_endpoint),
+                    output_kind: super::talk::TalkRouteReport::endpoint_kind(&route.output_endpoint),
+                    setup_ms: now_ms.saturating_sub(route.updated_at_ms),
+                    duration_ms: 0,
+                    route_id: route.route_id,
+                    input_endpoint: route.input_endpoint,
+                    output_endpoint: route.output_endpoint,
+                });
+            } else if !effective.contains(&DeviceCapability::VoiceStream) {
+                return None;
+            }
         }
-        require_capability(&device, DeviceCapability::VoiceStream).ok()?;
+        if let Some(route) = route_metrics {
+            if let Ok(mut open) = self.talk_route_sessions.lock() {
+                if open.len() >= MAX_OPEN_ROUTE_METRICS {
+                    open.remove(0);
+                }
+                open.push((pending.device_id.clone(), now_ms, route));
+            }
+        }
         Some(TalkSocketAuthorization {
             device_id: pending.device_id,
             signed_request_sha256: pending.signed_request_sha256,
             session_id: pending.session_id,
             session_generation: pending.session_generation,
+            route_id: pending.route_id,
+            route_generation: pending.route_generation,
+            route_role: pending.route_role,
+            route_engine: pending.route_engine,
+            route_output_to_socket: pending.route_output_to_socket,
+            route_event_cursor: pending.route_event_cursor,
         })
     }
 
@@ -2411,6 +2557,7 @@ impl RemoteApi {
         device_id: &str,
         report: &super::talk::TalkSessionReport,
     ) {
+        let route = self.close_route_metrics(device_id);
         self.audit
             .record(little_monkey_lib::subsystem_audit::SubsystemAction {
                 subsystem: little_monkey_lib::run_ledger::Subsystem::Remote,
@@ -2422,7 +2569,8 @@ impl RemoteApi {
                 } else {
                     little_monkey_lib::subsystem_audit::outcome_for_status(200)
                 },
-                detail: Some(serde_json::json!({
+                detail: Some({
+                    let mut detail = serde_json::json!({
                     "deviceId": device_id,
                     "utterances": report.utterances,
                     "turns": report.turns_submitted,
@@ -2435,8 +2583,38 @@ impl RemoteApi {
                     // Means and worst cases rather than samples, so a long
                     // conversation cannot grow this row.
                     "latencyMs": talk_latency_detail(&report.latency),
-                })),
+                    });
+                    // Absent, rather than null, when the socket was not on a
+                    // route: "this was not routed" and "this route measured
+                    // nothing" are different facts and a reader has to be able
+                    // to tell them apart.
+                    if let Some(route) = &route {
+                        detail["route"] = talk_route_detail(route);
+                    }
+                    detail
+                }),
             });
+    }
+
+    /// Closes out the admission opened for this device's routed socket, filling
+    /// in the one number that is only knowable now.
+    ///
+    /// Oldest first: a device holding two routed sockets at once — its
+    /// microphone on one conversation, its speaker on another — has two
+    /// admissions here, and the first one opened is the first to end far more
+    /// often than not. Both describe a real route this device was on, so the
+    /// worst a mispairing costs is which of two durations is attributed to
+    /// which, never a fabricated one.
+    fn close_route_metrics(&self, device_id: &str) -> Option<super::talk::TalkRouteReport> {
+        let mut open = self.talk_route_sessions.lock().ok()?;
+        let index = open.iter().position(|(owner, _, _)| owner == device_id)?;
+        let (_, opened_at_ms, mut route) = open.remove(index);
+        drop(open);
+        route.duration_ms = super::now_ms_public()
+            .ok()
+            .unwrap_or_default()
+            .saturating_sub(opened_at_ms);
+        Some(route)
     }
 
     /// Registers an open Talk socket as a live capture, and hands back the row
@@ -2507,6 +2685,177 @@ impl RemoteApi {
         let surface = store.device_surface(device_id).ok().flatten();
         effective_capabilities(&device.capabilities, surface.as_ref())
             .contains(&DeviceCapability::VoiceStream)
+    }
+
+    pub(crate) fn talk_output_route_live(&self, authorization: &TalkSocketAuthorization) -> bool {
+        let (Some(route_id), Some(generation)) =
+            (authorization.route_id.as_deref(), authorization.route_generation)
+        else { return false; };
+        let Ok(store) = self.store.lock() else { return false; };
+        let Some(device) = store.device(&authorization.device_id).ok().flatten() else { return false; };
+        if !device.active() { return false; }
+        let surface = store.device_surface(&authorization.device_id).ok().flatten();
+        let effective = effective_capabilities(&device.capabilities, surface.as_ref());
+        let Ok(Some(route)) = store.voice_route_by_id(route_id) else { return false; };
+        route.state == "active"
+            && route.generation == generation
+            && route.session_id == authorization.session_id
+            && route.output_endpoint == format!("paired:{}:output", authorization.device_id)
+            && effective.contains(&DeviceCapability::AudioPlayback)
+    }
+
+    pub(crate) fn talk_route_command_id(&self, authorization: &TalkSocketAuthorization) -> Option<String> {
+        let route_id = authorization.route_id.as_deref()?;
+        let store = self.store.lock().ok()?;
+        let route = store.voice_route_by_id(route_id).ok().flatten()?;
+        if route.generation != authorization.route_generation? || route.session_id != authorization.session_id {
+            return None;
+        }
+        match authorization.route_role.as_deref() {
+            Some("output") => route.output_command_id,
+            Some("input") | Some("duplex") => route.input_command_id,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn talk_route_events(
+        &self,
+        session_id: &str,
+        after: u64,
+    ) -> Result<Vec<super::store::VoiceRouteEventRecord>, String> {
+        self.store
+            .lock()
+            .map_err(|_| "Remote state lock was poisoned".to_string())?
+            .voice_route_events(session_id, after, 256)
+    }
+
+    pub(crate) fn append_talk_route_event(
+        &self,
+        session_id: &str,
+        generation: u64,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), String> {
+        let now_ms = super::now_ms_public()?;
+        self.store
+            .lock()
+            .map_err(|_| "Remote state lock was poisoned".to_string())?
+            .append_voice_route_event(session_id, generation, kind, payload, now_ms)
+            .map(|_| ())
+    }
+
+    pub(crate) fn talk_input_route_live(&self, authorization: &TalkSocketAuthorization) -> bool {
+        let (Some(route_id), Some(generation)) =
+            (authorization.route_id.as_deref(), authorization.route_generation)
+        else { return false; };
+        let Ok(store) = self.store.lock() else { return false; };
+        let Some(device) = store.device(&authorization.device_id).ok().flatten() else { return false; };
+        if !device.active() { return false; }
+        let surface = store.device_surface(&authorization.device_id).ok().flatten();
+        let effective = effective_capabilities(&device.capabilities, surface.as_ref());
+        let Ok(Some(route)) = store.voice_route_by_id(route_id) else { return false; };
+        route.state == "active"
+            && route.generation == generation
+            && route.session_id == authorization.session_id
+            && route.input_endpoint == format!("paired:{}:input", authorization.device_id)
+            && effective.contains(&DeviceCapability::VoiceStream)
+    }
+
+    fn realtime_host_route(&self, session_id: &str, generation: u64) -> Result<super::store::VoiceRouteRecord, String> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "Remote state lock was poisoned".to_string())?;
+        let route = store
+            .voice_route(session_id)?
+            .ok_or_else(|| "Realtime VoiceRoute no longer exists".to_string())?;
+        if route.state != "active" || route.generation != generation || route.engine != "realtime" {
+            return Err("Realtime VoiceRoute generation is stale or inactive".to_string());
+        }
+        Ok(route)
+    }
+
+    pub(crate) fn push_realtime_input_from_device(
+        &self,
+        authorization: &TalkSocketAuthorization,
+        bytes: Vec<u8>,
+    ) -> Result<u64, String> {
+        if authorization.route_engine.as_deref() != Some("realtime")
+            || !matches!(authorization.route_role.as_deref(), Some("input" | "duplex"))
+            || !self.talk_input_route_live(authorization)
+        {
+            return Err("Realtime microphone authority was revoked or moved".to_string());
+        }
+        let generation = authorization
+            .route_generation
+            .ok_or_else(|| "Realtime microphone route has no generation".to_string())?;
+        super::realtime_bridge::validate_pcm(&bytes)?;
+        self.realtime_media
+            .push_input(&authorization.session_id, generation, bytes)
+    }
+
+    pub(crate) fn take_realtime_input_for_host(
+        &self,
+        session_id: &str,
+        generation: u64,
+    ) -> Result<Option<super::realtime_bridge::RealtimePcmChunk>, String> {
+        let route = self.realtime_host_route(session_id, generation)?;
+        if !route.input_endpoint.starts_with("paired:") {
+            return Ok(None);
+        }
+        if route.input_command_id.is_none() {
+            return Err("Realtime paired microphone is not activated".to_string());
+        }
+        self.realtime_media.pop_input(session_id, generation)
+    }
+
+    pub(crate) fn push_realtime_output_from_host(
+        &self,
+        session_id: &str,
+        generation: u64,
+        bytes: Vec<u8>,
+    ) -> Result<u64, String> {
+        let route = self.realtime_host_route(session_id, generation)?;
+        if !route.output_endpoint.starts_with("paired:") {
+            return Err("Realtime VoiceRoute does not currently use a paired speaker".to_string());
+        }
+        if route.output_command_id.is_none() {
+            return Err("Realtime paired speaker is not activated".to_string());
+        }
+        super::realtime_bridge::validate_pcm(&bytes)?;
+        self.realtime_media.push_output(session_id, generation, bytes)
+    }
+
+    pub(crate) fn clear_realtime_output_from_host(
+        &self,
+        session_id: &str,
+        generation: u64,
+    ) -> Result<(), String> {
+        let route = self.realtime_host_route(session_id, generation)?;
+        if !route.output_endpoint.starts_with("paired:") {
+            return Err("Realtime VoiceRoute does not currently use a paired speaker".to_string());
+        }
+        self.realtime_media.clear_output(session_id, generation)
+    }
+
+    pub(crate) fn take_realtime_output_for_device(
+        &self,
+        authorization: &TalkSocketAuthorization,
+    ) -> Result<Option<super::realtime_bridge::RealtimePcmChunk>, String> {
+        if authorization.route_engine.as_deref() != Some("realtime")
+            || !matches!(authorization.route_role.as_deref(), Some("output" | "duplex"))
+            || !self.talk_output_route_live(authorization)
+        {
+            return Err("Realtime speaker authority was revoked or moved".to_string());
+        }
+        let generation = authorization
+            .route_generation
+            .ok_or_else(|| "Realtime speaker route has no generation".to_string())?;
+        self.realtime_media.pop_output(&authorization.session_id, generation)
+    }
+
+    pub(crate) fn discard_realtime_media(&self, session_id: &str, generation: u64) {
+        self.realtime_media.discard(session_id, generation);
     }
 
     fn talk_stream_needs_upgrade(
@@ -4251,6 +4600,27 @@ fn talk_latency_detail(latency: &super::talk::TalkSessionLatency) -> serde_json:
     serde_json::Value::Object(detail)
 }
 
+/// One routed session's shape and timing, as the audit is allowed to see it:
+/// which endpoints of which kinds, how long the route took to come up and how
+/// long it lasted.
+///
+/// Every value here is either a duration or an identifier the operator chose.
+/// Nothing derived from what was said, and — as everywhere else on this row —
+/// no audio: raw PCM lives in `realtime_bridge`'s bounded memory and ends
+/// there.
+fn talk_route_detail(route: &super::talk::TalkRouteReport) -> serde_json::Value {
+    serde_json::json!({
+        "routeId": route.route_id,
+        "generation": route.generation,
+        "engine": route.engine,
+        "role": route.role,
+        "input": { "kind": route.input_kind, "endpoint": route.input_endpoint },
+        "output": { "kind": route.output_kind, "endpoint": route.output_endpoint },
+        "setupMs": route.setup_ms,
+        "durationMs": route.duration_ms,
+    })
+}
+
 /// A Talk session's turns, running through exactly the surface the typed mobile
 /// chat uses.
 ///
@@ -4266,6 +4636,10 @@ pub(crate) struct TalkSessionTurns {
     device_id: String,
     /// See [`TalkSocketAuthorization::signed_request_sha256`].
     admission_sha256: String,
+    route_id: Option<String>,
+    route_generation: Option<u64>,
+    route_session_id: String,
+    route_output_to_socket: bool,
 }
 
 impl TalkSessionTurns {
@@ -4274,12 +4648,38 @@ impl TalkSessionTurns {
             api,
             device_id: authorization.device_id.clone(),
             admission_sha256: authorization.signed_request_sha256.clone(),
+            route_id: authorization.route_id.clone(),
+            route_generation: authorization.route_generation,
+            route_session_id: authorization.session_id.clone(),
+            route_output_to_socket: authorization.route_output_to_socket,
         }
     }
 }
 
 impl super::talk::TalkTurns for TalkSessionTurns {
     fn submit(&self, session_id: &str, client_key: &str, text: &str) -> Result<String, String> {
+        if let (Some(_route_id), Some(generation)) = (self.route_id.as_deref(), self.route_generation) {
+            if session_id != self.route_session_id {
+                return Err("Routed Talk session binding changed".to_string());
+            }
+            let now_ms = super::now_ms_public()?;
+            self.api
+                .store
+                .lock()
+                .map_err(|_| "Remote state lock was poisoned".to_string())?
+                .append_voice_route_event(
+                    &self.route_session_id,
+                    generation,
+                    "input_transcript",
+                    &serde_json::json!({
+                        "turn_id": client_key,
+                        "text": text,
+                        "device_id": self.device_id,
+                    }),
+                    now_ms,
+                )?;
+            return Ok(format!("voice-route:{client_key}"));
+        }
         let queue = self
             .api
             .mobile_chat
@@ -4326,6 +4726,52 @@ impl super::talk::TalkTurns for TalkSessionTurns {
         run_id: &str,
         from_index: u64,
     ) -> Result<super::talk::TalkRunProgress, String> {
+        if let (Some(_route_id), Some(generation)) = (self.route_id.as_deref(), self.route_generation) {
+            let turn_id = run_id
+                .strip_prefix("voice-route:")
+                .ok_or_else(|| "Routed Talk run id is invalid".to_string())?;
+            let store = self
+                .api
+                .store
+                .lock()
+                .map_err(|_| "Remote state lock was poisoned".to_string())?;
+            let events = store.voice_route_events(&self.route_session_id, from_index, 500)?;
+            let mut progress = super::talk::TalkRunProgress {
+                next_index: events.last().map(|event| event.event_id).unwrap_or(from_index),
+                ..super::talk::TalkRunProgress::default()
+            };
+            for event in events {
+                if event.generation != generation
+                    || event.payload.get("turn_id").and_then(serde_json::Value::as_str) != Some(turn_id)
+                {
+                    continue;
+                }
+                match event.kind.as_str() {
+                    "assistant_delta" => {
+                        if let Some(text) = event.payload.get("text").and_then(serde_json::Value::as_str) {
+                            progress.delta.push_str(text);
+                        }
+                    }
+                    "turn_finished" => progress.finished = true,
+                    "turn_failed" => {
+                        progress.finished = true;
+                        progress.error = Some(
+                            event.payload.get("error").and_then(serde_json::Value::as_str)
+                                .unwrap_or("The routed turn failed")
+                                .to_string(),
+                        );
+                    }
+                    "host_interrupt" => {
+                        progress.finished = true;
+                        if progress.delta.is_empty() {
+                            progress.error = Some("This turn was interrupted on the host.".to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(progress);
+        }
         let ledger =
             RunLedger::open(&self.api.paths.ledger_db).map_err(|error| error.to_string())?;
         let events = match ledger.load_events(run_id, from_index, 500) {
@@ -4368,6 +4814,24 @@ impl super::talk::TalkTurns for TalkSessionTurns {
     }
 
     fn cancel(&self, run_id: &str) -> Result<(), String> {
+        if let (Some(_route_id), Some(generation)) = (self.route_id.as_deref(), self.route_generation) {
+            let turn_id = run_id
+                .strip_prefix("voice-route:")
+                .ok_or_else(|| "Routed Talk run id is invalid".to_string())?;
+            let now_ms = super::now_ms_public()?;
+            self.api
+                .store
+                .lock()
+                .map_err(|_| "Remote state lock was poisoned".to_string())?
+                .append_voice_route_event(
+                    &self.route_session_id,
+                    generation,
+                    "interrupt",
+                    &serde_json::json!({ "turn_id": turn_id, "reason": "device_barge_in" }),
+                    now_ms,
+                )?;
+            return Ok(());
+        }
         // The same two steps the run centre and the phone's cancel button take:
         // ask the store to stop the job, and append the durable cancellation
         // event. What a tool already did in the world is not undone by either,
@@ -4381,7 +4845,33 @@ impl super::talk::TalkTurns for TalkSessionTurns {
     }
 
     fn still_granted(&self, device_id: &str) -> bool {
-        self.api.talk_capability_live(device_id)
+        if !self.api.talk_capability_live(device_id) {
+            return false;
+        }
+        let (Some(route_id), Some(generation)) = (self.route_id.as_deref(), self.route_generation) else {
+            return true;
+        };
+        let Ok(store) = self.api.store.lock() else { return false; };
+        let Ok(Some(route)) = store.voice_route_by_id(route_id) else { return false; };
+        if route.state != "active"
+            || route.generation != generation
+            || route.session_id != self.route_session_id
+            || route.input_endpoint != format!("paired:{}:input", self.device_id)
+        {
+            return false;
+        }
+        if self.route_output_to_socket {
+            let Ok(Some(device)) = store.device(&self.device_id) else { return false; };
+            let surface = store.device_surface(&self.device_id).ok().flatten();
+            return route.output_endpoint == format!("paired:{}:output", self.device_id)
+                && effective_capabilities(&device.capabilities, surface.as_ref())
+                    .contains(&DeviceCapability::AudioPlayback);
+        }
+        true
+    }
+
+    fn output_to_socket(&self) -> bool {
+        self.route_id.is_none() || self.route_output_to_socket
     }
 }
 
@@ -6834,6 +7324,23 @@ mod tests {
         capabilities: &[DeviceCapability],
         permissions: &[(DeviceCapability, OsPermission)],
     ) -> ApiResponse {
+        advertise_at(api, device_id, secret, sequence, capabilities, permissions, 2_000)
+    }
+
+    /// The same surface against a caller-chosen clock. VoiceRoute refuses to
+    /// select an endpoint whose last signed contact is older than its online
+    /// window, so a routed test has to advertise on the same clock it selects
+    /// the route on — a surface reported in 1970 is an offline phone.
+    #[allow(clippy::too_many_arguments)]
+    fn advertise_at(
+        api: &RemoteApi,
+        device_id: &str,
+        secret: &[u8],
+        sequence: u64,
+        capabilities: &[DeviceCapability],
+        permissions: &[(DeviceCapability, OsPermission)],
+        now_ms: u64,
+    ) -> ApiResponse {
         let surface = DeviceSurface {
             protocol_version: REMOTE_PROTOCOL_VERSION,
             platform: "android".into(),
@@ -6854,7 +7361,7 @@ mod tests {
         };
         let body = serde_json::to_vec(&surface).unwrap();
         api.handle(
-            signed(
+            signed_at(
                 device_id,
                 secret,
                 sequence,
@@ -6862,8 +7369,9 @@ mod tests {
                 "POST",
                 "/v1/remote/device/surface",
                 &body,
+                now_ms,
             ),
-            2_000,
+            now_ms,
         )
     }
 
@@ -7164,6 +7672,11 @@ mod tests {
         transcripts: Mutex<std::collections::VecDeque<String>>,
         heard_bytes: Mutex<Vec<usize>>,
         spoken: Mutex<Vec<String>>,
+        /// Length of the synthesized WAV's data chunk. Zero keeps the tiny
+        /// stand-in below; a routed speaker test asks for one that genuinely
+        /// exceeds the Talk frame ceiling, because playback backpressure is
+        /// only observable across more than one chunk.
+        wav_data_bytes: usize,
     }
 
     #[async_trait::async_trait]
@@ -7180,7 +7693,10 @@ mod tests {
 
         async fn synthesize(&self, text: &str) -> Result<(Vec<u8>, String), String> {
             self.spoken.lock().unwrap().push(text.to_string());
-            Ok((b"RIFFfake".to_vec(), "audio/wav".to_string()))
+            if self.wav_data_bytes == 0 {
+                return Ok((b"RIFFfake".to_vec(), "audio/wav".to_string()));
+            }
+            Ok((wav_of(self.wav_data_bytes), "audio/wav".to_string()))
         }
     }
 
@@ -7259,6 +7775,7 @@ mod tests {
             ),
             heard_bytes: Mutex::new(Vec::new()),
             spoken: Mutex::new(Vec::new()),
+            wav_data_bytes: 0,
         });
         let api = api
             .with_mobile_chat(queue.clone())
@@ -7480,6 +7997,12 @@ mod tests {
                 signed_request_sha256: "a".repeat(64),
                 session_id: "mobile-session".to_string(),
                 session_generation: "generation-one".to_string(),
+                route_id: None,
+                route_generation: None,
+                route_role: None,
+                route_engine: None,
+                route_output_to_socket: true,
+                route_event_cursor: 0,
             },
         );
 
@@ -7543,6 +8066,7 @@ mod tests {
             transcripts: Mutex::new(Default::default()),
             heard_bytes: Mutex::new(Vec::new()),
             spoken: Mutex::new(Vec::new()),
+            wav_data_bytes: 0,
         });
         let api = api
             .with_mobile_chat(Arc::new(IngressTalkQueue::new(paths.clone())))
@@ -7775,6 +8299,2234 @@ mod tests {
         store
             .set_device_capabilities(device_id, &capabilities, 2_000)
             .expect("revoke");
+    }
+
+    // --- Voice Everywhere: routed Talk, over a real socket -----------------
+    //
+    // Everything below drives the production connection path: a real listener,
+    // a real ticket minted by a signed request, a real WebSocket, and a real
+    // route row written by the same control plane a desktop selection uses. The
+    // pre-existing socket test above mints a ticket with no route fields, so
+    // none of the routing this feature is made of crossed a socket before these.
+
+    type RoutedSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// One more paired device on the same runner, so a route can put the
+    /// microphone on one phone and the speaker on another.
+    fn pair_extra_device(
+        api: &RemoteApi,
+        secrets: &Arc<FakeSecrets>,
+        device_name: &str,
+    ) -> (String, Vec<u8>) {
+        let mut store = api.store.lock().unwrap();
+        let scopes = RemoteScopes {
+            actions: BTreeSet::from([RemoteAction::ViewRuns]),
+            run_ids: BTreeSet::from(["run-one".to_string()]),
+            workspace_ids: BTreeSet::new(),
+            max_artifact_bytes: 1_024,
+        };
+        let invite = store.create_invitation(&scopes, 1_000, 3_000).unwrap();
+        let accepted = store
+            .accept_invitation(
+                &invite.pairing_id,
+                &invite.token,
+                device_name,
+                "runner-one",
+                1_100,
+                secrets.as_ref(),
+            )
+            .unwrap();
+        (
+            accepted.device_id,
+            accepted.device_secret.as_bytes().to_vec(),
+        )
+    }
+
+    /// Grants a device the physical capabilities a route needs and has it say
+    /// it can do them, right now. Both halves are load-bearing: the grant is the
+    /// operator's authority and the surface is the phone's own truth, and
+    /// VoiceRoute refuses an endpoint missing either.
+    fn ready_voice_device(
+        api: &RemoteApi,
+        device_id: &str,
+        secret: &[u8],
+        sequence: u64,
+        capabilities: &[DeviceCapability],
+        now_ms: u64,
+    ) {
+        grant(api, device_id, capabilities);
+        let permissions = capabilities
+            .iter()
+            .map(|capability| {
+                // Audio playback has no OS permission anywhere; autoplay is
+                // readiness. Saying "granted" for it would be a fiction the
+                // surface validator has no reason to catch.
+                let permission = if matches!(capability, DeviceCapability::AudioPlayback) {
+                    OsPermission::NotRequired
+                } else {
+                    OsPermission::Granted
+                };
+                (*capability, permission)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            advertise_at(
+                api,
+                device_id,
+                secret,
+                sequence,
+                capabilities,
+                &permissions,
+                now_ms,
+            )
+            .status,
+            200,
+            "the device surface is accepted"
+        );
+    }
+
+    /// Selects and activates a route through the production control plane, so
+    /// the sockets below bind to exactly the row a desktop selection writes —
+    /// generation, route id, endpoint tokens and the device commands that own
+    /// each role.
+    fn active_route(
+        paths: &DaemonPaths,
+        session_id: &str,
+        input: &str,
+        output: &str,
+        now_ms: u64,
+    ) -> super::super::store::VoiceRouteRecord {
+        active_engine_route(paths, session_id, "pipeline", input, output, now_ms)
+    }
+
+    /// The same, for the engine the conversation is actually on. Realtime routes
+    /// carry PCM straight to the provider session and never touch the speech
+    /// backends, so the engine has to be the route row's — not a test's idea of
+    /// one.
+    fn active_engine_route(
+        paths: &DaemonPaths,
+        session_id: &str,
+        engine: &str,
+        input: &str,
+        output: &str,
+        now_ms: u64,
+    ) -> super::super::store::VoiceRouteRecord {
+        super::super::voice_route::set_route(paths, session_id, engine, input, output, now_ms)
+            .expect("the host selects the route");
+        super::super::voice_route::activate_route(paths, session_id, now_ms)
+            .expect("the host activates the route")
+    }
+
+    /// A fresh generation over the same endpoints, taken the way the host takes
+    /// one: release the roles the previous generation owned, then replace the
+    /// row. The generation is the whole of the staleness defence, so every test
+    /// that bumps it goes through here rather than editing the row.
+    fn bump_route_generation(
+        paths: &DaemonPaths,
+        route: &super::super::store::VoiceRouteRecord,
+        now_ms: u64,
+    ) -> super::super::store::VoiceRouteRecord {
+        super::super::voice_route::deactivate_route(paths, &route.session_id, now_ms)
+            .expect("release the previous roles");
+        active_engine_route(
+            paths,
+            &route.session_id,
+            &route.engine,
+            &route.input_endpoint,
+            &route.output_endpoint,
+            now_ms,
+        )
+    }
+
+    /// Asks for a routed Talk ticket over the ordinary signed plane.
+    ///
+    /// `claimed_session` is what the *device* says the conversation is. Routed
+    /// Talk ignores it — the route is the authority — and the tests below pass
+    /// a deliberately wrong one to prove that.
+    #[allow(clippy::too_many_arguments)]
+    fn route_ticket(
+        api: &RemoteApi,
+        device_id: &str,
+        secret: &[u8],
+        sequence: u64,
+        route: &super::super::store::VoiceRouteRecord,
+        role: &str,
+        claimed_session: &str,
+        now_ms: u64,
+    ) -> ApiResponse {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "protocol_version": super::super::protocol::TALK_PROTOCOL_VERSION,
+            "session_id": claimed_session,
+            "route_id": route.route_id,
+            "route_generation": route.generation,
+            "route_role": role,
+        }))
+        .unwrap();
+        api.handle(
+            signed_at(
+                device_id,
+                secret,
+                sequence,
+                &format!("cmd-route-ticket-{sequence}"),
+                "POST",
+                "/v1/remote/device/talk/ticket",
+                &body,
+                now_ms,
+            ),
+            now_ms,
+        )
+    }
+
+    /// Spends a routed ticket on a real socket, returning the socket and the
+    /// two identities the host — not the device — chose for it.
+    #[allow(clippy::too_many_arguments)]
+    async fn open_route_socket(
+        api: &RemoteApi,
+        device_id: &str,
+        secret: &[u8],
+        sequence: u64,
+        route: &super::super::store::VoiceRouteRecord,
+        role: &str,
+        address: std::net::SocketAddr,
+        now_ms: u64,
+    ) -> (RoutedSocket, String, String) {
+        let issued = route_ticket(
+            api,
+            device_id,
+            secret,
+            sequence,
+            route,
+            role,
+            "device-invented-session",
+            now_ms,
+        );
+        assert_eq!(
+            issued.status,
+            201,
+            "a routed ticket: {}",
+            String::from_utf8_lossy(&issued.body)
+        );
+        let ticket: serde_json::Value = serde_json::from_slice(&issued.body).unwrap();
+        let session_id = ticket["session_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            session_id, route.session_id,
+            "the conversation is the route's, never the one the device asked for"
+        );
+        let url = format!(
+            "ws://{address}{}?ticket={}",
+            ticket["websocket_path"].as_str().unwrap(),
+            ticket["ticket"].as_str().unwrap()
+        );
+        let (socket, response) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("the routed ticket admits a real WebSocket");
+        assert_eq!(response.status().as_u16(), 101);
+        (
+            socket,
+            ticket["session_generation"].as_str().unwrap().to_string(),
+            session_id,
+        )
+    }
+
+    /// What the host would append when the desktop half of the conversation has
+    /// something for a paired speaker to say. This is the same durable
+    /// coordination row `useTalkSession` writes through the route event API.
+    fn host_says(
+        api: &RemoteApi,
+        session_id: &str,
+        generation: u64,
+        kind: &str,
+        payload: serde_json::Value,
+    ) {
+        api.append_talk_route_event(session_id, generation, kind, &payload)
+            .expect("the host appends a route coordination event");
+    }
+
+    /// True when nothing at all arrives for `ms`. Backpressure is the *absence*
+    /// of a frame, so this is the only shape that assertion can take.
+    async fn silent_for(socket: &mut RoutedSocket, ms: u64) -> bool {
+        use futures_util::StreamExt;
+        tokio::time::timeout(std::time::Duration::from_millis(ms), socket.next())
+            .await
+            .is_err()
+    }
+
+    /// True when the runner ends the socket itself, with or without a parting
+    /// frame. An output-only route has no `capability_revoked` frame to send —
+    /// what it lost was the speaker, not the microphone — so for that half the
+    /// close is the whole of the evidence.
+    async fn socket_ends(socket: &mut RoutedSocket) -> bool {
+        use futures_util::StreamExt;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            match tokio::time::timeout_at(deadline, socket.next()).await {
+                Err(_) => return false,
+                Ok(None) | Ok(Some(Err(_))) => return true,
+                Ok(Some(Ok(_))) => {}
+            }
+        }
+    }
+
+    /// A real RIFF/WAVE with `data_bytes` of samples. Oversized synthesized
+    /// speech is re-containerized into several complete WAVs, and that is the
+    /// only way a response arrives as more than one playable chunk.
+    fn wav_of(data_bytes: usize) -> Vec<u8> {
+        let mut wav = Vec::with_capacity(44 + data_bytes);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&u32::try_from(36 + data_bytes).unwrap().to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&24_000u32.to_le_bytes());
+        wav.extend_from_slice(&48_000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&u32::try_from(data_bytes).unwrap().to_le_bytes());
+        wav.resize(44 + data_bytes, 0);
+        wav
+    }
+
+    fn speech_saying(transcripts: &[&str], wav_data_bytes: usize) -> Arc<ScriptedSpeech> {
+        Arc::new(ScriptedSpeech {
+            transcripts: Mutex::new(transcripts.iter().map(|value| value.to_string()).collect()),
+            heard_bytes: Mutex::new(Vec::new()),
+            spoken: Mutex::new(Vec::new()),
+            wav_data_bytes,
+        })
+    }
+
+    /// The route's own coordination log, as the host wrote it.
+    fn route_events(api: &RemoteApi, session_id: &str) -> Vec<super::super::store::VoiceRouteEventRecord> {
+        api.talk_route_events(session_id, 0).expect("route events")
+    }
+
+    /// **A routed microphone answers into the conversation the host chose, not
+    /// the one the phone named.**
+    ///
+    /// A paired device on a VoiceRoute is an endpoint, not a participant: it
+    /// supplies audio, and the desktop decides which conversation that audio
+    /// belongs to. Three different layers could get that wrong — the ticket, the
+    /// socket's route binding, and the frame envelope — so this device lies on
+    /// two of them. It asks for a ticket naming a conversation of its own
+    /// invention and opens with a frame carrying that same invented session.
+    /// Neither is honoured: the turn lands under the route's session id, and the
+    /// misdirected frame is refused rather than quietly accepted.
+    ///
+    /// The defect this would have caught is the obvious implementation of
+    /// routed Talk — trusting `session_id` from the ticket request, or from the
+    /// frame envelope — which lets any paired phone inject speech into any
+    /// conversation on the desktop.
+    #[tokio::test]
+    async fn a_routed_paired_microphone_lands_its_turn_in_the_host_chosen_conversation() {
+        use futures_util::SinkExt;
+
+        let (root, api, _secrets, device_id, secret) = fixture();
+        let paths = DaemonPaths::under(&root);
+        let now_ms = crate::daemon::remote::now_ms_public().unwrap();
+        ready_voice_device(
+            &api,
+            &device_id,
+            &secret,
+            1,
+            &[
+                DeviceCapability::MicrophoneCapture,
+                DeviceCapability::VoiceStream,
+            ],
+            now_ms,
+        );
+        let queue = Arc::new(IngressTalkQueue::new(paths.clone()));
+        let speech = speech_saying(&["what is the deploy status"], 0);
+        let api = api
+            .with_mobile_chat(queue.clone())
+            .with_talk_speech(speech.clone());
+
+        let route = active_route(
+            &paths,
+            "voice-route-session-one",
+            &format!("paired:{device_id}:input"),
+            super::super::voice_route::LOCAL_OUTPUT_DEFAULT,
+            now_ms,
+        );
+        let address = spawn_talk_server(api.clone()).await;
+        let (mut socket, generation, session_id) = open_route_socket(
+            &api,
+            &device_id,
+            &secret,
+            2,
+            &route,
+            "input",
+            address,
+            now_ms,
+        )
+        .await;
+        let _ = read_until(&mut socket, "ready").await;
+
+        // The device's own idea of which conversation this is, on the wire.
+        socket
+            .send(talk_frame(
+                "device-invented-session",
+                &generation,
+                1,
+                serde_json::json!({
+                    "type": "hello",
+                    "media_type": "audio/webm;codecs=opus",
+                    "sample_rate_hz": 48_000,
+                    "channels": 1,
+                }),
+            ))
+            .await
+            .unwrap();
+        let refused = read_until(&mut socket, "error").await;
+        assert_eq!(refused["code"], "invalid_frame");
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("another Talk session"),
+            "a frame naming another conversation is refused, not routed: {refused}"
+        );
+
+        let mut sequence = 1u64;
+        let mut next = |kind: serde_json::Value| {
+            sequence += 1;
+            talk_frame(&session_id, &generation, sequence, kind)
+        };
+        socket
+            .send(next(serde_json::json!({
+                "type": "hello",
+                "media_type": "audio/webm;codecs=opus",
+                "sample_rate_hz": 48_000,
+                "channels": 1,
+            })))
+            .await
+            .unwrap();
+        socket
+            .send(next(serde_json::json!({
+                "type": "audio",
+                "audio_sequence": 1,
+                "media_type": "audio/webm;codecs=opus",
+                "audio_base64": STANDARD.encode(b"routed utterance head"),
+            })))
+            .await
+            .unwrap();
+        socket
+            .send(next(serde_json::json!({
+                "type": "audio",
+                "audio_sequence": 2,
+                "media_type": "audio/webm;codecs=opus",
+                "audio_base64": STANDARD.encode(b"routed utterance tail"),
+                "last": true,
+                "utterance_id": "utt-routed-one",
+            })))
+            .await
+            .unwrap();
+
+        let transcript = read_until(&mut socket, "transcript").await;
+        assert_eq!(transcript["text"], "what is the deploy status");
+        assert_eq!(
+            speech.heard_bytes.lock().unwrap().as_slice(),
+            &[42],
+            "both audio frames were transcribed as one utterance"
+        );
+        let accepted = read_until(&mut socket, "turn_accepted").await;
+        let turn_id = format!("talk-{session_id}-utt-routed-one");
+        assert_eq!(
+            accepted["run_id"],
+            format!("voice-route:{turn_id}"),
+            "a routed turn is owned by the route, not by the mobile chat queue"
+        );
+
+        // The conversation the words landed in is the host's.
+        let transcripts = route_events(&api, &route.session_id)
+            .into_iter()
+            .filter(|event| event.kind == "input_transcript")
+            .collect::<Vec<_>>();
+        assert_eq!(transcripts.len(), 1);
+        assert_eq!(transcripts[0].generation, route.generation);
+        assert_eq!(transcripts[0].payload["text"], "what is the deploy status");
+        assert_eq!(transcripts[0].payload["turn_id"], turn_id);
+        assert!(
+            api.talk_route_events("device-invented-session", 0)
+                .unwrap_or_default()
+                .is_empty(),
+            "nothing at all was written under the conversation the device named"
+        );
+        assert!(
+            queue.accepted.lock().unwrap().is_empty(),
+            "a routed turn must not also be queued as an unrouted mobile chat turn"
+        );
+
+        // The host answers, and the answer reaches the phone as text only: the
+        // speaker on this route is the desktop's own.
+        host_says(
+            &api,
+            &route.session_id,
+            route.generation,
+            "assistant_delta",
+            serde_json::json!({ "turn_id": turn_id, "text": "The deploy finished." }),
+        );
+        host_says(
+            &api,
+            &route.session_id,
+            route.generation,
+            "turn_finished",
+            serde_json::json!({ "turn_id": turn_id }),
+        );
+        let delta = read_until(&mut socket, "assistant_delta").await;
+        assert_eq!(delta["text"], "The deploy finished.");
+        let listening = read_until(&mut socket, "state").await;
+        assert_eq!(listening["state"], "listening", "the routed turn completed");
+        assert!(
+            speech.spoken.lock().unwrap().is_empty(),
+            "this route's speaker is the desktop's own: nothing is synthesized into this socket"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A paired speaker is given one chunk at a time, and the next one only
+    /// after it says the last one played.**
+    ///
+    /// A synthesized answer can be megabytes; a phone's playback buffer cannot.
+    /// Without backpressure the host streams the whole response into a socket
+    /// the device is still draining, and the memory ceiling moves from the host
+    /// to whichever phone is slowest. The bound is only real if the host is
+    /// genuinely *waiting*, which cannot be shown by reading frames — only by
+    /// proving none arrive. So the middle of this test is a silence.
+    #[tokio::test]
+    async fn a_routed_paired_speaker_gets_the_next_chunk_only_after_acknowledging_the_last() {
+        use futures_util::SinkExt;
+
+        let (root, api, _secrets, device_id, secret) = fixture();
+        let paths = DaemonPaths::under(&root);
+        let now_ms = crate::daemon::remote::now_ms_public().unwrap();
+        ready_voice_device(
+            &api,
+            &device_id,
+            &secret,
+            1,
+            &[DeviceCapability::AudioPlayback],
+            now_ms,
+        );
+        // Three bounded chunks out of one response: two full frames and a tail.
+        let speech = speech_saying(&[], 1_100_000);
+        let api = api.with_talk_speech(speech.clone());
+
+        let route = active_route(
+            &paths,
+            "voice-route-session-two",
+            super::super::voice_route::LOCAL_INPUT_DEFAULT,
+            &format!("paired:{device_id}:output"),
+            now_ms,
+        );
+        let address = spawn_talk_server(api.clone()).await;
+        let (mut socket, generation, session_id) = open_route_socket(
+            &api,
+            &device_id,
+            &secret,
+            2,
+            &route,
+            "output",
+            address,
+            now_ms,
+        )
+        .await;
+        let _ = read_until(&mut socket, "ready").await;
+        socket
+            .send(talk_frame(
+                &session_id,
+                &generation,
+                1,
+                serde_json::json!({
+                    "type": "hello",
+                    "media_type": "audio/wav",
+                    "sample_rate_hz": 24_000,
+                    "channels": 1,
+                }),
+            ))
+            .await
+            .unwrap();
+
+        host_says(
+            &api,
+            &route.session_id,
+            route.generation,
+            "speak_text",
+            serde_json::json!({
+                "job_id": "job-one",
+                "turn_id": "turn-one",
+                "text": "The deploy finished.",
+            }),
+        );
+
+        let mut client_sequence = 1u64;
+        let mut response_id = String::new();
+        for chunk_index in 0..3u64 {
+            let audio = read_until(&mut socket, "output_audio").await;
+            assert_eq!(
+                audio["audio_sequence"],
+                chunk_index + 1,
+                "audio sequence is monotonic across the response"
+            );
+            assert_eq!(audio["chunk_index"], chunk_index);
+            assert_eq!(audio["chunk_count"], 3);
+            assert_eq!(audio["route_generation"], route.generation);
+            assert_eq!(audio["media_type"], "audio/wav");
+            let named = audio["response_id"].as_str().unwrap().to_string();
+            if chunk_index == 0 {
+                response_id = named.clone();
+            }
+            assert_eq!(named, response_id, "one response, one identity");
+            assert!(
+                STANDARD
+                    .decode(audio["audio_base64"].as_str().unwrap())
+                    .unwrap()
+                    .starts_with(b"RIFF"),
+                "each chunk is a complete, independently playable container"
+            );
+
+            assert!(
+                silent_for(&mut socket, 300).await,
+                "chunk {} was sent before the previous one was acknowledged",
+                chunk_index + 1
+            );
+
+            client_sequence += 1;
+            socket
+                .send(talk_frame(
+                    &session_id,
+                    &generation,
+                    client_sequence,
+                    serde_json::json!({
+                        "type": "playback_ack",
+                        "audio_sequence": chunk_index + 1,
+                        "played": true,
+                    }),
+                ))
+                .await
+                .unwrap();
+        }
+
+        // The last ack completes the response: the host stops speaking and
+        // says so durably, which is what the desktop half reads to know the
+        // answer was actually heard in the room.
+        let idle = read_until(&mut socket, "state").await;
+        assert_eq!(idle["state"], "idle");
+        let played = route_events(&api, &route.session_id)
+            .into_iter()
+            .filter(|event| event.kind == "output_played")
+            .collect::<Vec<_>>();
+        assert_eq!(played.len(), 1, "one completed response, one completion row");
+        assert_eq!(played[0].payload["turn_id"], "turn-one");
+        assert_eq!(played[0].payload["chunk_count"], 3);
+        assert_eq!(played[0].payload["audio_sequence"], 3);
+        assert_eq!(played[0].generation, route.generation);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **One device, one socket, audio in both directions.**
+    ///
+    /// Duplex is not two half routes that happen to share a phone: it is a
+    /// single admission carrying the microphone up and the speaker down, and
+    /// the runner has to answer *into the socket it is listening on*. The defect
+    /// worth catching is a duplex role that takes the input path and then routes
+    /// the answer to the host's speaker — the phone hears nothing back and the
+    /// room hears the reply out of the desktop.
+    #[tokio::test]
+    async fn a_duplex_paired_device_hears_the_answer_on_the_socket_it_spoke_into() {
+        use futures_util::SinkExt;
+
+        let (root, api, _secrets, device_id, secret) = fixture();
+        let paths = DaemonPaths::under(&root);
+        let now_ms = crate::daemon::remote::now_ms_public().unwrap();
+        ready_voice_device(
+            &api,
+            &device_id,
+            &secret,
+            1,
+            &[
+                DeviceCapability::MicrophoneCapture,
+                DeviceCapability::VoiceStream,
+                DeviceCapability::AudioPlayback,
+            ],
+            now_ms,
+        );
+        let speech = speech_saying(&["read me the deploy status"], 0);
+        let api = api.with_talk_speech(speech.clone());
+
+        let route = active_route(
+            &paths,
+            "voice-route-session-duplex",
+            &format!("paired:{device_id}:input"),
+            &format!("paired:{device_id}:output"),
+            now_ms,
+        );
+        let address = spawn_talk_server(api.clone()).await;
+        let (mut socket, generation, session_id) = open_route_socket(
+            &api,
+            &device_id,
+            &secret,
+            2,
+            &route,
+            "duplex",
+            address,
+            now_ms,
+        )
+        .await;
+        let _ = read_until(&mut socket, "ready").await;
+
+        let mut sequence = 0u64;
+        let mut next = |kind: serde_json::Value| {
+            sequence += 1;
+            talk_frame(&session_id, &generation, sequence, kind)
+        };
+        socket
+            .send(next(serde_json::json!({
+                "type": "hello",
+                "media_type": "audio/webm;codecs=opus",
+                "sample_rate_hz": 48_000,
+                "channels": 1,
+            })))
+            .await
+            .unwrap();
+        socket
+            .send(next(serde_json::json!({
+                "type": "audio",
+                "audio_sequence": 1,
+                "media_type": "audio/webm;codecs=opus",
+                "audio_base64": STANDARD.encode(b"duplex utterance"),
+                "last": true,
+                "utterance_id": "utt-duplex-one",
+            })))
+            .await
+            .unwrap();
+
+        let transcript = read_until(&mut socket, "transcript").await;
+        assert_eq!(transcript["text"], "read me the deploy status");
+        let turn_id = format!("talk-{session_id}-utt-duplex-one");
+        host_says(
+            &api,
+            &route.session_id,
+            route.generation,
+            "assistant_delta",
+            serde_json::json!({ "turn_id": turn_id, "text": "The deploy finished. " }),
+        );
+        host_says(
+            &api,
+            &route.session_id,
+            route.generation,
+            "turn_finished",
+            serde_json::json!({ "turn_id": turn_id }),
+        );
+
+        let audio = read_until(&mut socket, "output_audio").await;
+        assert_eq!(audio["media_type"], "audio/wav");
+        assert_eq!(audio["chunk_count"], 1);
+        assert_eq!(
+            speech.spoken.lock().unwrap().as_slice(),
+            &["The deploy finished."],
+            "the answer to what this device said is synthesized back to it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Two phones, one conversation — and neither can take the other's
+    /// role.**
+    ///
+    /// The interesting case for VoiceRoute is the one no single-device design
+    /// survives: the microphone on the phone in your pocket and the speaker on
+    /// the one in the kitchen, both bound to the same desktop conversation.
+    /// Authority here is per role, not per device, so the test also spends each
+    /// device's identity against the other's role: a phone that is merely paired
+    /// must not be able to promote itself from speaker to microphone.
+    #[tokio::test]
+    async fn two_paired_devices_split_microphone_and_speaker_across_one_conversation() {
+        use futures_util::SinkExt;
+
+        let (root, api, secrets, microphone_id, microphone_secret) = fixture();
+        let paths = DaemonPaths::under(&root);
+        let now_ms = crate::daemon::remote::now_ms_public().unwrap();
+        let (speaker_id, speaker_secret) = pair_extra_device(&api, &secrets, "kitchen");
+        ready_voice_device(
+            &api,
+            &microphone_id,
+            &microphone_secret,
+            1,
+            &[
+                DeviceCapability::MicrophoneCapture,
+                DeviceCapability::VoiceStream,
+            ],
+            now_ms,
+        );
+        ready_voice_device(
+            &api,
+            &speaker_id,
+            &speaker_secret,
+            1,
+            &[DeviceCapability::AudioPlayback],
+            now_ms,
+        );
+        let speech = speech_saying(&["is the deploy finished"], 0);
+        let api = api.with_talk_speech(speech.clone());
+
+        let route = active_route(
+            &paths,
+            "voice-route-session-split",
+            &format!("paired:{microphone_id}:input"),
+            &format!("paired:{speaker_id}:output"),
+            now_ms,
+        );
+
+        // Neither device may take the other's half of the route.
+        let stolen_output = route_ticket(
+            &api,
+            &microphone_id,
+            &microphone_secret,
+            2,
+            &route,
+            "output",
+            &route.session_id,
+            now_ms,
+        );
+        assert_eq!(stolen_output.status, 403);
+        assert!(String::from_utf8_lossy(&stolen_output.body).contains("speaker"));
+        let stolen_input = route_ticket(
+            &api,
+            &speaker_id,
+            &speaker_secret,
+            2,
+            &route,
+            "input",
+            &route.session_id,
+            now_ms,
+        );
+        assert_eq!(stolen_input.status, 403);
+        assert!(String::from_utf8_lossy(&stolen_input.body).contains("microphone"));
+
+        let address = spawn_talk_server(api.clone()).await;
+        let (mut microphone, microphone_generation, session_id) = open_route_socket(
+            &api,
+            &microphone_id,
+            &microphone_secret,
+            3,
+            &route,
+            "input",
+            address,
+            now_ms,
+        )
+        .await;
+        let (mut speaker, speaker_generation, speaker_session) = open_route_socket(
+            &api,
+            &speaker_id,
+            &speaker_secret,
+            3,
+            &route,
+            "output",
+            address,
+            now_ms,
+        )
+        .await;
+        assert_eq!(
+            session_id, speaker_session,
+            "both devices were admitted to the same conversation"
+        );
+        let _ = read_until(&mut microphone, "ready").await;
+        let _ = read_until(&mut speaker, "ready").await;
+        speaker
+            .send(talk_frame(
+                &speaker_session,
+                &speaker_generation,
+                1,
+                serde_json::json!({
+                    "type": "hello",
+                    "media_type": "audio/wav",
+                    "sample_rate_hz": 24_000,
+                    "channels": 1,
+                }),
+            ))
+            .await
+            .unwrap();
+
+        let mut sequence = 0u64;
+        let mut next = |kind: serde_json::Value| {
+            sequence += 1;
+            talk_frame(&session_id, &microphone_generation, sequence, kind)
+        };
+        microphone
+            .send(next(serde_json::json!({
+                "type": "hello",
+                "media_type": "audio/webm;codecs=opus",
+                "sample_rate_hz": 48_000,
+                "channels": 1,
+            })))
+            .await
+            .unwrap();
+        microphone
+            .send(next(serde_json::json!({
+                "type": "audio",
+                "audio_sequence": 1,
+                "media_type": "audio/webm;codecs=opus",
+                "audio_base64": STANDARD.encode(b"split route utterance"),
+                "last": true,
+                "utterance_id": "utt-split-one",
+            })))
+            .await
+            .unwrap();
+        let transcript = read_until(&mut microphone, "transcript").await;
+        assert_eq!(transcript["text"], "is the deploy finished");
+
+        // What one phone heard is answered out of the other one.
+        host_says(
+            &api,
+            &route.session_id,
+            route.generation,
+            "speak_text",
+            serde_json::json!({
+                "job_id": "job-split",
+                "turn_id": format!("talk-{session_id}-utt-split-one"),
+                "text": "The deploy finished.",
+            }),
+        );
+        let audio = read_until(&mut speaker, "output_audio").await;
+        assert_eq!(audio["chunk_count"], 1);
+        assert_eq!(audio["route_generation"], route.generation);
+        speaker
+            .send(talk_frame(
+                &speaker_session,
+                &speaker_generation,
+                2,
+                serde_json::json!({
+                    "type": "playback_ack",
+                    "audio_sequence": 1,
+                    "played": true,
+                }),
+            ))
+            .await
+            .unwrap();
+        let idle = read_until(&mut speaker, "state").await;
+        assert_eq!(idle["state"], "idle");
+        assert!(
+            route_events(&api, &route.session_id)
+                .iter()
+                .any(|event| event.kind == "output_played"),
+            "the speaker's acknowledgement is what closes the response"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A generation the host has moved past buys nothing — before the socket
+    /// or during it.**
+    ///
+    /// The generation is the whole defence against a route that moved: a ticket
+    /// minted for the phone on the desk must not open a microphone after the
+    /// operator sent the conversation to the kitchen, and a socket already open
+    /// on the old generation must not keep feeding it. Time passes between
+    /// minting and spending, and again between spending and the next frame, so
+    /// both windows are checked here.
+    #[tokio::test]
+    async fn a_stale_route_generation_is_refused_at_the_handshake_and_closed_mid_socket() {
+        use futures_util::SinkExt;
+
+        let (root, api, _secrets, device_id, secret) = fixture();
+        let paths = DaemonPaths::under(&root);
+        let now_ms = crate::daemon::remote::now_ms_public().unwrap();
+        ready_voice_device(
+            &api,
+            &device_id,
+            &secret,
+            1,
+            &[
+                DeviceCapability::MicrophoneCapture,
+                DeviceCapability::VoiceStream,
+            ],
+            now_ms,
+        );
+        let speech = speech_saying(&["this should never be transcribed"], 0);
+        let api = api.with_talk_speech(speech.clone());
+
+        let route = active_route(
+            &paths,
+            "voice-route-session-stale",
+            &format!("paired:{device_id}:input"),
+            super::super::voice_route::LOCAL_OUTPUT_DEFAULT,
+            now_ms,
+        );
+        let address = spawn_talk_server(api.clone()).await;
+
+        // Minted, then overtaken before it is spent.
+        let issued = route_ticket(
+            &api,
+            &device_id,
+            &secret,
+            2,
+            &route,
+            "input",
+            &route.session_id,
+            now_ms,
+        );
+        assert_eq!(issued.status, 201);
+        let ticket: serde_json::Value = serde_json::from_slice(&issued.body).unwrap();
+        let moved = bump_route_generation(&paths, &route, now_ms);
+        assert!(
+            moved.generation > route.generation,
+            "the host has moved past the generation this ticket names"
+        );
+        assert_eq!(
+            moved.input_endpoint, route.input_endpoint,
+            "the same phone, a generation the ticket does not belong to"
+        );
+        let stale_url = format!(
+            "ws://{address}{}?ticket={}",
+            ticket["websocket_path"].as_str().unwrap(),
+            ticket["ticket"].as_str().unwrap()
+        );
+        assert!(
+            tokio_tungstenite::connect_async(&stale_url).await.is_err(),
+            "a ticket for a generation the host has left must not open a socket"
+        );
+
+        // Spent while current, then overtaken underneath.
+        let (mut socket, generation, session_id) = open_route_socket(
+            &api,
+            &device_id,
+            &secret,
+            3,
+            &moved,
+            "input",
+            address,
+            now_ms,
+        )
+        .await;
+        let _ = read_until(&mut socket, "ready").await;
+        socket
+            .send(talk_frame(
+                &session_id,
+                &generation,
+                1,
+                serde_json::json!({
+                    "type": "hello",
+                    "media_type": "audio/webm;codecs=opus",
+                    "sample_rate_hz": 48_000,
+                    "channels": 1,
+                }),
+            ))
+            .await
+            .unwrap();
+        let _ = bump_route_generation(&paths, &moved, now_ms);
+        // A device that has not noticed keeps talking. Nothing it says now
+        // belongs to this conversation any more.
+        let _ = socket
+            .send(talk_frame(
+                &session_id,
+                &generation,
+                2,
+                serde_json::json!({
+                    "type": "audio",
+                    "audio_sequence": 1,
+                    "media_type": "audio/webm;codecs=opus",
+                    "audio_base64": STANDARD.encode(b"speech after the route moved"),
+                    "last": true,
+                    "utterance_id": "utt-stale-one",
+                }),
+            ))
+            .await;
+        assert!(
+            read_until_closed(&mut socket).await,
+            "the socket ends on the old generation rather than answering into it"
+        );
+        assert!(
+            speech.heard_bytes.lock().unwrap().is_empty(),
+            "audio sent after the route moved is never even transcribed"
+        );
+        assert!(
+            route_events(&api, "voice-route-session-stale")
+                .iter()
+                .all(|event| event.kind != "input_transcript"),
+            "no turn was recorded for speech the route no longer owned"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A routed ticket admits exactly one socket.**
+    ///
+    /// The ticket is the only credential a WebSocket handshake can carry, and it
+    /// travels as a query parameter — the one place a bearer can end up in a
+    /// proxy log. Single use is what makes that survivable. The unrouted ticket
+    /// already has this property under test; a routed one carries the route
+    /// binding as well, and re-checks it at admission, which is exactly the kind
+    /// of second code path where "spend it" quietly becomes "look at it".
+    #[tokio::test]
+    async fn a_routed_ticket_cannot_admit_a_second_socket() {
+        let (root, api, _secrets, device_id, secret) = fixture();
+        let paths = DaemonPaths::under(&root);
+        let now_ms = crate::daemon::remote::now_ms_public().unwrap();
+        ready_voice_device(
+            &api,
+            &device_id,
+            &secret,
+            1,
+            &[
+                DeviceCapability::MicrophoneCapture,
+                DeviceCapability::VoiceStream,
+            ],
+            now_ms,
+        );
+        let api = api.with_talk_speech(speech_saying(&[], 0));
+        let route = active_route(
+            &paths,
+            "voice-route-session-replay",
+            &format!("paired:{device_id}:input"),
+            super::super::voice_route::LOCAL_OUTPUT_DEFAULT,
+            now_ms,
+        );
+        let address = spawn_talk_server(api.clone()).await;
+
+        let issued = route_ticket(
+            &api,
+            &device_id,
+            &secret,
+            2,
+            &route,
+            "input",
+            &route.session_id,
+            now_ms,
+        );
+        assert_eq!(issued.status, 201);
+        let ticket: serde_json::Value = serde_json::from_slice(&issued.body).unwrap();
+        let url = format!(
+            "ws://{address}{}?ticket={}",
+            ticket["websocket_path"].as_str().unwrap(),
+            ticket["ticket"].as_str().unwrap()
+        );
+        let (mut first, response) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("the routed ticket admits its socket");
+        assert_eq!(response.status().as_u16(), 101);
+        let _ = read_until(&mut first, "ready").await;
+
+        assert!(
+            tokio_tungstenite::connect_async(&url).await.is_err(),
+            "a captured routed ticket must not open a second microphone"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Withdrawing a capability closes the half of the route it authorized,
+    /// while the socket is open and without waiting for the device.**
+    ///
+    /// An operator revokes in the middle of a conversation, and the device has
+    /// no reason to send anything at that moment — a microphone waiting for
+    /// speech and a speaker waiting for something to say are both silent. If the
+    /// close only happened on the next frame, a revoked microphone would stay
+    /// open until the idle deadline: fifteen minutes of capture on authority
+    /// that is gone. Both halves are checked, because they are two different
+    /// loops watching two different capabilities.
+    #[tokio::test]
+    async fn revoking_a_capability_mid_route_closes_that_half_of_the_conversation() {
+        use futures_util::SinkExt;
+
+        let (root, api, secrets, microphone_id, microphone_secret) = fixture();
+        let paths = DaemonPaths::under(&root);
+        let now_ms = crate::daemon::remote::now_ms_public().unwrap();
+        let (speaker_id, speaker_secret) = pair_extra_device(&api, &secrets, "kitchen");
+        ready_voice_device(
+            &api,
+            &microphone_id,
+            &microphone_secret,
+            1,
+            &[
+                DeviceCapability::MicrophoneCapture,
+                DeviceCapability::VoiceStream,
+            ],
+            now_ms,
+        );
+        ready_voice_device(
+            &api,
+            &speaker_id,
+            &speaker_secret,
+            1,
+            &[DeviceCapability::AudioPlayback],
+            now_ms,
+        );
+        let api = api.with_talk_speech(speech_saying(&[], 0));
+        let route = active_route(
+            &paths,
+            "voice-route-session-revoked",
+            &format!("paired:{microphone_id}:input"),
+            &format!("paired:{speaker_id}:output"),
+            now_ms,
+        );
+        let address = spawn_talk_server(api.clone()).await;
+
+        let (mut microphone, microphone_generation, session_id) = open_route_socket(
+            &api,
+            &microphone_id,
+            &microphone_secret,
+            2,
+            &route,
+            "input",
+            address,
+            now_ms,
+        )
+        .await;
+        let (mut speaker, speaker_generation, _) = open_route_socket(
+            &api,
+            &speaker_id,
+            &speaker_secret,
+            2,
+            &route,
+            "output",
+            address,
+            now_ms,
+        )
+        .await;
+        let _ = read_until(&mut microphone, "ready").await;
+        let _ = read_until(&mut speaker, "ready").await;
+        microphone
+            .send(talk_frame(
+                &session_id,
+                &microphone_generation,
+                1,
+                serde_json::json!({
+                    "type": "hello",
+                    "media_type": "audio/webm;codecs=opus",
+                    "sample_rate_hz": 48_000,
+                    "channels": 1,
+                }),
+            ))
+            .await
+            .unwrap();
+        speaker
+            .send(talk_frame(
+                &session_id,
+                &speaker_generation,
+                1,
+                serde_json::json!({
+                    "type": "hello",
+                    "media_type": "audio/wav",
+                    "sample_rate_hz": 24_000,
+                    "channels": 1,
+                }),
+            ))
+            .await
+            .unwrap();
+        let _ = read_until(&mut speaker, "state").await;
+
+        // Nothing else is sent on either socket from here on.
+        revoke(&api, &microphone_id, DeviceCapability::VoiceStream);
+        assert!(
+            read_until_closed(&mut microphone).await,
+            "a revoked voice_stream ends the microphone socket on the runner's own clock"
+        );
+        assert!(
+            silent_for(&mut speaker, 300).await,
+            "the speaker keeps its half of the route: one revoked capability closes one role"
+        );
+
+        revoke(&api, &speaker_id, DeviceCapability::AudioPlayback);
+        assert!(
+            socket_ends(&mut speaker).await,
+            "a revoked audio_playback ends the speaker socket without another frame from it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Pairing is not permission: a routed role needs the capability that
+    /// role actually uses.**
+    ///
+    /// A paired device is one the operator trusts enough to show run status to.
+    /// That is not the same as letting it open the microphone in the room, and
+    /// VoiceRoute adds a second way to ask — through a route rather than
+    /// directly — which is exactly the sort of side door where a grant check
+    /// gets forgotten. The device below advertises that it *can* do both, which
+    /// is the phone's own truth and never an authority, and is refused for both
+    /// roles until the operator grants one of them.
+    #[tokio::test]
+    async fn a_paired_device_without_the_grant_gets_no_routed_microphone_or_speaker() {
+        let (root, api, _secrets, device_id, secret) = fixture();
+        let paths = DaemonPaths::under(&root);
+        let now_ms = crate::daemon::remote::now_ms_public().unwrap();
+        // The build can do all of it; the operator has granted none of it.
+        assert_eq!(
+            advertise_at(
+                &api,
+                &device_id,
+                &secret,
+                1,
+                &[
+                    DeviceCapability::MicrophoneCapture,
+                    DeviceCapability::VoiceStream,
+                    DeviceCapability::AudioPlayback,
+                ],
+                &[
+                    (DeviceCapability::MicrophoneCapture, OsPermission::Granted),
+                    (DeviceCapability::VoiceStream, OsPermission::Granted),
+                    (DeviceCapability::AudioPlayback, OsPermission::NotRequired),
+                ],
+                now_ms,
+            )
+            .status,
+            200
+        );
+
+        // The control plane will not even select an ungranted endpoint, so the
+        // rows below are written directly: the question is whether the ticket
+        // stands on its own check rather than on that one.
+        assert!(
+            super::super::voice_route::set_route(
+                &paths,
+                "voice-route-session-ungranted",
+                "pipeline",
+                &format!("paired:{device_id}:input"),
+                super::super::voice_route::LOCAL_OUTPUT_DEFAULT,
+                now_ms,
+            )
+            .is_err(),
+            "selecting an ungranted microphone is refused by the control plane too"
+        );
+        let (microphone_route, speaker_route) = {
+            let mut store = api.store.lock().unwrap();
+            let microphone_route = store
+                .replace_voice_route(
+                    "voice-route-session-ungranted",
+                    "pipeline",
+                    &format!("paired:{device_id}:input"),
+                    super::super::voice_route::LOCAL_OUTPUT_DEFAULT,
+                    None,
+                    None,
+                    now_ms,
+                )
+                .unwrap();
+            let speaker_route = store
+                .replace_voice_route(
+                    "voice-route-session-ungranted-out",
+                    "pipeline",
+                    super::super::voice_route::LOCAL_INPUT_DEFAULT,
+                    &format!("paired:{device_id}:output"),
+                    None,
+                    None,
+                    now_ms,
+                )
+                .unwrap();
+            (microphone_route, speaker_route)
+        };
+
+        let refused_microphone = route_ticket(
+            &api,
+            &device_id,
+            &secret,
+            2,
+            &microphone_route,
+            "input",
+            &microphone_route.session_id,
+            now_ms,
+        );
+        assert_eq!(refused_microphone.status, 403);
+        assert!(String::from_utf8_lossy(&refused_microphone.body).contains("voice_stream"));
+        let refused_speaker = route_ticket(
+            &api,
+            &device_id,
+            &secret,
+            3,
+            &speaker_route,
+            "output",
+            &speaker_route.session_id,
+            now_ms,
+        );
+        assert_eq!(refused_speaker.status, 403);
+        assert!(String::from_utf8_lossy(&refused_speaker.body).contains("audio_playback"));
+
+        // One capability granted is one role admitted — and only that one.
+        grant(
+            &api,
+            &device_id,
+            &[
+                DeviceCapability::MicrophoneCapture,
+                DeviceCapability::VoiceStream,
+            ],
+        );
+        assert_eq!(
+            route_ticket(
+                &api,
+                &device_id,
+                &secret,
+                4,
+                &microphone_route,
+                "input",
+                &microphone_route.session_id,
+                now_ms,
+            )
+            .status,
+            201,
+            "the grant is what was missing, not the route"
+        );
+        assert_eq!(
+            route_ticket(
+                &api,
+                &device_id,
+                &secret,
+                5,
+                &speaker_route,
+                "output",
+                &speaker_route.session_id,
+                now_ms,
+            )
+            .status,
+            403,
+            "granting the microphone grants nothing to the speaker"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- Voice Everywhere: the Realtime engine, over a real socket ----------
+    //
+    // The routed tests above are all `engine="pipeline"`: audio goes up as a
+    // recording, through the operator's speech-to-text, and comes back as
+    // synthesized speech. Realtime is the other engine on the same socket and
+    // shares none of that — PCM goes straight to the provider session the
+    // desktop holds, reached over the loopback bridge started below exactly the
+    // way the daemon starts it.
+
+    /// The desktop half's loopback transport, plus the process-local token it
+    /// published. Both come from the bridge itself: the token and the loopback
+    /// bind are the whole of its access control, so a test that invented its
+    /// own would be proving nothing about the real one.
+    async fn host_media_bridge(paths: &DaemonPaths, api: &RemoteApi) -> (String, String) {
+        let address =
+            super::super::realtime_bridge::spawn_host_media_bridge_for_test(paths, api.clone())
+                .await
+                .expect("the host media bridge binds a loopback port");
+        let published: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(paths.root.join("realtime-host-media.json"))
+                .expect("the bridge publishes where it listens"),
+        )
+        .unwrap();
+        assert_eq!(
+            published["listen"], address.to_string(),
+            "the desktop finds the bridge through this file and nothing else"
+        );
+        (
+            format!("http://{address}/v1/host/realtime"),
+            published["token"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// The desktop taking one microphone chunk for its provider session: the
+    /// status, the PCM, and the sequence the bridge stamped on it.
+    async fn host_takes_input(
+        bridge: &(String, String),
+        session_id: &str,
+        generation: u64,
+    ) -> (u16, Vec<u8>, Option<u64>) {
+        let response = reqwest::Client::new()
+            .get(format!("{}/input", bridge.0))
+            .header("x-little-monkey-host-media-token", &bridge.1)
+            .header("x-little-monkey-route-session", session_id)
+            .header("x-little-monkey-route-generation", generation.to_string())
+            .send()
+            .await
+            .expect("the loopback bridge answers");
+        let status = response.status().as_u16();
+        let sequence = response
+            .headers()
+            .get("x-little-monkey-audio-sequence")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok());
+        (status, response.bytes().await.unwrap().to_vec(), sequence)
+    }
+
+    /// The same take, retried until the socket's own loop has had a chance to
+    /// forward what the device just sent. Polling is the honest shape: the
+    /// device and the runner are genuinely concurrent here.
+    async fn host_waits_for_input(
+        bridge: &(String, String),
+        session_id: &str,
+        generation: u64,
+    ) -> (Vec<u8>, Option<u64>) {
+        for _ in 0..200 {
+            let (status, bytes, sequence) = host_takes_input(bridge, session_id, generation).await;
+            if status == 200 {
+                return (bytes, sequence);
+            }
+            assert_eq!(status, 204, "the host ingress is open and empty, not refused");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the device's realtime PCM never reached the host ingress");
+    }
+
+    /// The desktop handing one chunk of the provider's speech to the route.
+    async fn host_pushes_output(
+        bridge: &(String, String),
+        session_id: &str,
+        generation: u64,
+        pcm: &[u8],
+    ) -> u16 {
+        reqwest::Client::new()
+            .post(format!("{}/output", bridge.0))
+            .header("x-little-monkey-host-media-token", &bridge.1)
+            .header("x-little-monkey-route-session", session_id)
+            .header("x-little-monkey-route-generation", generation.to_string())
+            .body(pcm.to_vec())
+            .send()
+            .await
+            .expect("the loopback bridge answers")
+            .status()
+            .as_u16()
+    }
+
+    /// A realtime device's opening frame — the PCM hello this engine demands —
+    /// and the `listening` the runner answers it with. Frame 1 of the socket,
+    /// so callers continue from 2.
+    async fn realtime_hello(socket: &mut RoutedSocket, session_id: &str, generation: &str) {
+        use futures_util::SinkExt;
+        socket
+            .send(talk_frame(
+                session_id,
+                generation,
+                1,
+                serde_json::json!({
+                    "type": "hello",
+                    "media_type": super::super::realtime_bridge::REALTIME_PCM_MEDIA_TYPE,
+                    "sample_rate_hz": 24_000,
+                    "channels": 1,
+                }),
+            ))
+            .await
+            .unwrap();
+        let state = read_until(socket, "state").await;
+        assert_eq!(state["state"], "listening");
+    }
+
+    /// PCM16 that is recognisably itself, so a chunk that arrives can be
+    /// matched to the chunk that was sent.
+    fn pcm_chunk(marker: u8, samples: usize) -> Vec<u8> {
+        (0..samples)
+            .flat_map(|index| [marker, u8::try_from(index % 251).unwrap()])
+            .collect()
+    }
+
+    /// **Realtime microphone PCM reaches the host ingress without ever touching
+    /// transcription.**
+    ///
+    /// Both engines share one ticket route, one socket and one authorization
+    /// struct, and differ in exactly one thing: pipeline audio is a recording to
+    /// be transcribed, realtime audio is a live stream the provider itself
+    /// hears. The defect worth catching is the natural one — a routed socket
+    /// that falls through to the pipeline loop when the route says
+    /// `engine="realtime"` — because it *works*. Words come back, a turn is
+    /// queued, and nobody notices that every syllable spoken in the room was
+    /// sent to the operator's speech-to-text vendor on a conversation that was
+    /// meant to bypass it. So the speech backend here is loaded with an answer
+    /// it must never give, and the transcription seam has to prove it was never
+    /// called at all.
+    #[tokio::test]
+    async fn realtime_microphone_pcm_reaches_the_host_without_passing_through_transcription() {
+        use futures_util::SinkExt;
+
+        let (root, api, _secrets, device_id, secret) = fixture();
+        let paths = DaemonPaths::under(&root);
+        let now_ms = crate::daemon::remote::now_ms_public().unwrap();
+        ready_voice_device(
+            &api,
+            &device_id,
+            &secret,
+            1,
+            &[
+                DeviceCapability::MicrophoneCapture,
+                DeviceCapability::VoiceStream,
+            ],
+            now_ms,
+        );
+        // Both stand-ins are loaded: a transcript to hand back and a queue to
+        // accept a turn. A realtime route must reach neither.
+        let queue = Arc::new(IngressTalkQueue::new(paths.clone()));
+        let speech = speech_saying(&["this must never be transcribed"], 0);
+        let api = api
+            .with_mobile_chat(queue.clone())
+            .with_talk_speech(speech.clone());
+
+        let route = active_engine_route(
+            &paths,
+            "voice-route-realtime-in",
+            "realtime",
+            &format!("paired:{device_id}:input"),
+            super::super::voice_route::LOCAL_OUTPUT_DEFAULT,
+            now_ms,
+        );
+        let bridge = host_media_bridge(&paths, &api).await;
+        let address = spawn_talk_server(api.clone()).await;
+        let (mut socket, generation, session_id) =
+            open_route_socket(&api, &device_id, &secret, 2, &route, "input", address, now_ms).await;
+        let _ = read_until(&mut socket, "ready").await;
+        realtime_hello(&mut socket, &session_id, &generation).await;
+
+        let spoken = pcm_chunk(0xA7, 480);
+        socket
+            .send(talk_frame(
+                &session_id,
+                &generation,
+                2,
+                serde_json::json!({
+                    "type": "audio",
+                    "audio_sequence": 1,
+                    "media_type": super::super::realtime_bridge::REALTIME_PCM_MEDIA_TYPE,
+                    "audio_base64": STANDARD.encode(&spoken),
+                    "last": false,
+                }),
+            ))
+            .await
+            .unwrap();
+
+        // The host's own side of the bridge, over real loopback HTTP.
+        let (received, sequence) =
+            host_waits_for_input(&bridge, &route.session_id, route.generation).await;
+        assert_eq!(
+            received, spoken,
+            "the provider session receives the device's samples unaltered"
+        );
+        assert_eq!(sequence, Some(1), "ingress sequences start at one and are stamped");
+        assert_eq!(
+            host_takes_input(&bridge, &route.session_id, route.generation).await.0,
+            204,
+            "one chunk in, one chunk out: the queue is not replaying"
+        );
+
+        // The whole point of the engine.
+        assert!(
+            speech.heard_bytes.lock().unwrap().is_empty(),
+            "realtime PCM must not reach the operator's speech-to-text backend"
+        );
+        assert!(
+            speech.spoken.lock().unwrap().is_empty(),
+            "nor its synthesizer: the provider speaks on this engine"
+        );
+        assert!(
+            queue.accepted.lock().unwrap().is_empty(),
+            "a realtime stream is not an utterance and queues no turn"
+        );
+        let kinds = route_events(&api, &route.session_id)
+            .into_iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&"input_ready".to_string()), "the route came up: {kinds:?}");
+        assert!(
+            !kinds.iter().any(|kind| kind == "input_transcript"),
+            "nothing on a realtime route is transcribed: {kinds:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The provider's speech reaches the paired speaker as bounded, sequenced
+    /// frames, and stops until the speaker says it played them.**
+    ///
+    /// A realtime provider emits continuously and does not care whether a phone
+    /// on a hotel network is keeping up. Without the device's acknowledgements
+    /// pacing it, the host reads as fast as the provider writes and the backlog
+    /// moves from the provider's session into a socket the device is still
+    /// draining — the memory ceiling becomes whichever speaker is slowest, and
+    /// the room hears speech seconds after the conversation moved on. The bound
+    /// is only real if the host genuinely *waits*, which no frame can show, so
+    /// the middle of this test is a silence.
+    #[tokio::test]
+    async fn host_realtime_output_is_streamed_to_the_paired_speaker_at_the_pace_it_acknowledges() {
+        use futures_util::SinkExt;
+
+        let (root, api, _secrets, device_id, secret) = fixture();
+        let paths = DaemonPaths::under(&root);
+        let now_ms = crate::daemon::remote::now_ms_public().unwrap();
+        ready_voice_device(
+            &api,
+            &device_id,
+            &secret,
+            1,
+            &[DeviceCapability::AudioPlayback],
+            now_ms,
+        );
+        let speech = speech_saying(&[], 0);
+        let api = api.with_talk_speech(speech.clone());
+
+        let route = active_engine_route(
+            &paths,
+            "voice-route-realtime-out",
+            "realtime",
+            super::super::voice_route::LOCAL_INPUT_DEFAULT,
+            &format!("paired:{device_id}:output"),
+            now_ms,
+        );
+        let bridge = host_media_bridge(&paths, &api).await;
+        let address = spawn_talk_server(api.clone()).await;
+        let (mut socket, generation, session_id) =
+            open_route_socket(&api, &device_id, &secret, 2, &route, "output", address, now_ms).await;
+        let _ = read_until(&mut socket, "ready").await;
+        realtime_hello(&mut socket, &session_id, &generation).await;
+
+        // Ten chunks of provider speech, more than the socket may hold
+        // unacknowledged.
+        let pushed = (0..10u8).map(|index| pcm_chunk(index, 32)).collect::<Vec<_>>();
+        for chunk in &pushed {
+            assert_eq!(
+                host_pushes_output(&bridge, &route.session_id, route.generation, chunk).await,
+                202,
+                "the host hands the route its provider audio"
+            );
+        }
+
+        for index in 0..8usize {
+            let audio = read_until(&mut socket, "output_audio").await;
+            assert_eq!(
+                audio["audio_sequence"],
+                u64::try_from(index).unwrap() + 1,
+                "audio sequence is monotonic across the stream"
+            );
+            assert_eq!(
+                audio["route_generation"], route.generation,
+                "every frame names the generation it belongs to, so a moved route's audio is identifiable"
+            );
+            assert_eq!(
+                audio["media_type"],
+                super::super::realtime_bridge::REALTIME_PCM_MEDIA_TYPE
+            );
+            assert_eq!(
+                STANDARD.decode(audio["audio_base64"].as_str().unwrap()).unwrap(),
+                pushed[index],
+                "chunks reach the speaker in the order the provider produced them"
+            );
+        }
+        assert!(
+            silent_for(&mut socket, 400).await,
+            "the ninth chunk was sent while eight were still unacknowledged"
+        );
+
+        socket
+            .send(talk_frame(
+                &session_id,
+                &generation,
+                2,
+                serde_json::json!({
+                    "type": "playback_ack",
+                    "audio_sequence": 1,
+                    "played": true,
+                }),
+            ))
+            .await
+            .unwrap();
+        let ninth = read_until(&mut socket, "output_audio").await;
+        assert_eq!(ninth["audio_sequence"], 9, "one acknowledgement releases one chunk");
+        assert_eq!(
+            STANDARD.decode(ninth["audio_base64"].as_str().unwrap()).unwrap(),
+            pushed[8]
+        );
+        assert!(
+            route_events(&api, &route.session_id)
+                .iter()
+                .any(|event| event.kind == "output_played"
+                    && event.payload["audio_sequence"] == 1
+                    && event.generation == route.generation),
+            "what the speaker actually played is recorded durably for the desktop half"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A generation the host has moved past is refused in both directions,
+    /// while the socket that was using it is still open.**
+    ///
+    /// Realtime is the engine where staleness is most dangerous: there is no
+    /// utterance boundary to resynchronise on, so a queue keyed only by
+    /// conversation would let PCM captured before a handoff be played out of the
+    /// new endpoint, or the new provider's speech be delivered to the phone that
+    /// was just released. Both queues are keyed by `(session, generation)` for
+    /// that reason, and this drives both of them across a real socket and the
+    /// real loopback bridge.
+    #[tokio::test]
+    async fn a_stale_realtime_generation_is_refused_in_both_directions() {
+        use futures_util::SinkExt;
+
+        let (root, api, _secrets, device_id, secret) = fixture();
+        let paths = DaemonPaths::under(&root);
+        let now_ms = crate::daemon::remote::now_ms_public().unwrap();
+        ready_voice_device(
+            &api,
+            &device_id,
+            &secret,
+            1,
+            &[
+                DeviceCapability::MicrophoneCapture,
+                DeviceCapability::VoiceStream,
+                DeviceCapability::AudioPlayback,
+            ],
+            now_ms,
+        );
+        let speech = speech_saying(&[], 0);
+        let api = api.with_talk_speech(speech.clone());
+
+        let route = active_engine_route(
+            &paths,
+            "voice-route-realtime-stale",
+            "realtime",
+            &format!("paired:{device_id}:input"),
+            &format!("paired:{device_id}:output"),
+            now_ms,
+        );
+        let bridge = host_media_bridge(&paths, &api).await;
+        let address = spawn_talk_server(api.clone()).await;
+        let (mut socket, generation, session_id) =
+            open_route_socket(&api, &device_id, &secret, 2, &route, "duplex", address, now_ms).await;
+        let _ = read_until(&mut socket, "ready").await;
+        realtime_hello(&mut socket, &session_id, &generation).await;
+
+        // Both directions work on the current generation, so what follows is
+        // about the generation and not about the plumbing.
+        let heard = pcm_chunk(0x11, 64);
+        socket
+            .send(talk_frame(
+                &session_id,
+                &generation,
+                2,
+                serde_json::json!({
+                    "type": "audio",
+                    "audio_sequence": 1,
+                    "media_type": super::super::realtime_bridge::REALTIME_PCM_MEDIA_TYPE,
+                    "audio_base64": STANDARD.encode(&heard),
+                    "last": false,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            host_waits_for_input(&bridge, &route.session_id, route.generation).await.0,
+            heard
+        );
+        let answered = pcm_chunk(0x22, 64);
+        assert_eq!(
+            host_pushes_output(&bridge, &route.session_id, route.generation, &answered).await,
+            202
+        );
+        let audio = read_until(&mut socket, "output_audio").await;
+        assert_eq!(
+            STANDARD.decode(audio["audio_base64"].as_str().unwrap()).unwrap(),
+            answered
+        );
+
+        // A second chunk the host has not taken yet, so there is buffered media
+        // at the generation about to be left behind.
+        socket
+            .send(talk_frame(
+                &session_id,
+                &generation,
+                3,
+                serde_json::json!({
+                    "type": "audio",
+                    "audio_sequence": 2,
+                    "media_type": super::super::realtime_bridge::REALTIME_PCM_MEDIA_TYPE,
+                    "audio_base64": STANDARD.encode(pcm_chunk(0x33, 64)),
+                    "last": false,
+                }),
+            ))
+            .await
+            .unwrap();
+
+        let moved = bump_route_generation(&paths, &route, now_ms);
+        assert!(moved.generation > route.generation);
+        assert_eq!(moved.engine, "realtime", "a handoff does not change the engine");
+
+        assert_eq!(
+            host_takes_input(&bridge, &route.session_id, route.generation).await.0,
+            409,
+            "the host cannot keep reading the microphone of a generation it has left"
+        );
+        assert_eq!(
+            host_pushes_output(&bridge, &route.session_id, route.generation, &answered).await,
+            409,
+            "nor speak into it"
+        );
+        assert_eq!(
+            host_takes_input(&bridge, &moved.session_id, moved.generation).await.0,
+            204,
+            "and the media buffered under the old generation does not become the new one's"
+        );
+        assert!(
+            socket_ends(&mut socket).await,
+            "the socket admitted on the old generation is closed rather than left streaming"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Switching a conversation between the two engines is one conversation
+    /// and, at any moment, one realtime session.**
+    ///
+    /// The engine is a property of the route, not of the conversation: an
+    /// operator who starts in pipeline and switches to realtime is still in the
+    /// same chat and expects their history to still be theirs. Two defects are
+    /// worth catching. The conversation id could be minted per engine — the
+    /// device asks for a ticket and gets a different session back, so the answer
+    /// lands in a chat nobody is looking at. And the previous engine's ingress
+    /// could survive the switch, leaving two live realtime sessions for one
+    /// conversation, with the provider hearing the room twice.
+    #[tokio::test]
+    async fn switching_between_pipeline_and_realtime_keeps_one_conversation_and_one_session() {
+        use futures_util::SinkExt;
+
+        let (root, api, _secrets, device_id, secret) = fixture();
+        let paths = DaemonPaths::under(&root);
+        let now_ms = crate::daemon::remote::now_ms_public().unwrap();
+        ready_voice_device(
+            &api,
+            &device_id,
+            &secret,
+            1,
+            &[
+                DeviceCapability::MicrophoneCapture,
+                DeviceCapability::VoiceStream,
+                DeviceCapability::AudioPlayback,
+            ],
+            now_ms,
+        );
+        let queue = Arc::new(IngressTalkQueue::new(paths.clone()));
+        let speech = speech_saying(&["what is the deploy status"], 0);
+        let api = api
+            .with_mobile_chat(queue.clone())
+            .with_talk_speech(speech.clone());
+
+        let conversation = "voice-route-engine-switch";
+        let pipeline = active_engine_route(
+            &paths,
+            conversation,
+            "pipeline",
+            &format!("paired:{device_id}:input"),
+            &format!("paired:{device_id}:output"),
+            now_ms,
+        );
+        let bridge = host_media_bridge(&paths, &api).await;
+        let address = spawn_talk_server(api.clone()).await;
+
+        // Leg one: genuinely on the pipeline engine, proved by the transcript.
+        let (mut socket, generation, session_id) = open_route_socket(
+            &api, &device_id, &secret, 2, &pipeline, "duplex", address, now_ms,
+        )
+        .await;
+        let _ = read_until(&mut socket, "ready").await;
+        socket
+            .send(talk_frame(
+                &session_id,
+                &generation,
+                1,
+                serde_json::json!({
+                    "type": "hello",
+                    "media_type": "audio/webm;codecs=opus",
+                    "sample_rate_hz": 48_000,
+                    "channels": 1,
+                }),
+            ))
+            .await
+            .unwrap();
+        socket
+            .send(talk_frame(
+                &session_id,
+                &generation,
+                2,
+                serde_json::json!({
+                    "type": "audio",
+                    "audio_sequence": 1,
+                    "media_type": "audio/webm;codecs=opus",
+                    "audio_base64": STANDARD.encode(b"a pipeline utterance"),
+                    "last": true,
+                    "utterance_id": "utt-switch-one",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_until(&mut socket, "transcript").await["text"],
+            "what is the deploy status"
+        );
+
+        // The switch: stop the route, reselect the same endpoints on the other
+        // engine. Exactly what the desktop does when the operator changes it.
+        super::super::voice_route::deactivate_route(&paths, conversation, now_ms)
+            .expect("the host stops the pipeline route");
+        assert!(
+            socket_ends(&mut socket).await,
+            "the pipeline socket ends with the generation it was admitted on"
+        );
+        let realtime = active_engine_route(
+            &paths,
+            conversation,
+            "realtime",
+            &pipeline.input_endpoint,
+            &pipeline.output_endpoint,
+            now_ms,
+        );
+        assert_eq!(
+            realtime.session_id, pipeline.session_id,
+            "the conversation survives the engine change"
+        );
+        assert_eq!(
+            realtime.route_id, pipeline.route_id,
+            "and so does the route: this is one route on a new generation, not a second one"
+        );
+        assert!(realtime.generation > pipeline.generation);
+
+        // Leg two: the same conversation, now realtime.
+        let (mut socket, generation, realtime_session) = open_route_socket(
+            &api, &device_id, &secret, 3, &realtime, "duplex", address, now_ms,
+        )
+        .await;
+        assert_eq!(
+            realtime_session, session_id,
+            "the device is handed the same conversation it was already in"
+        );
+        let _ = read_until(&mut socket, "ready").await;
+        realtime_hello(&mut socket, &realtime_session, &generation).await;
+        let spoken = pcm_chunk(0x5C, 96);
+        socket
+            .send(talk_frame(
+                &realtime_session,
+                &generation,
+                2,
+                serde_json::json!({
+                    "type": "audio",
+                    "audio_sequence": 1,
+                    "media_type": super::super::realtime_bridge::REALTIME_PCM_MEDIA_TYPE,
+                    "audio_base64": STANDARD.encode(&spoken),
+                    "last": false,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            host_waits_for_input(&bridge, conversation, realtime.generation).await.0,
+            spoken
+        );
+        assert_eq!(
+            host_takes_input(&bridge, conversation, pipeline.generation).await.0,
+            409,
+            "the generation the pipeline leg ran on is not a second realtime ingress"
+        );
+        {
+            let store = api.store.lock().unwrap();
+            assert_eq!(
+                store.voice_routes_for_device(&device_id).unwrap().len(),
+                1,
+                "one active route for this device, whichever engine it is on"
+            );
+            let current = store.voice_route(conversation).unwrap().unwrap();
+            assert_eq!(current.engine, "realtime");
+            assert_eq!(current.generation, realtime.generation);
+        }
+
+        // And back: leaving realtime leaves no realtime ingress behind.
+        super::super::voice_route::deactivate_route(&paths, conversation, now_ms)
+            .expect("the host stops the realtime route");
+        assert!(socket_ends(&mut socket).await);
+        let back = active_engine_route(
+            &paths,
+            conversation,
+            "pipeline",
+            &pipeline.input_endpoint,
+            &pipeline.output_endpoint,
+            now_ms,
+        );
+        assert_eq!(back.session_id, pipeline.session_id);
+        assert_eq!(
+            host_takes_input(&bridge, conversation, realtime.generation).await.0,
+            409,
+            "the realtime session does not outlive the engine that owned it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every `TALK` row the subsystem event stream holds, read out of the
+    /// ledger itself rather than through anything written for this test. The
+    /// detail is deliberately not exposed by `RunLedger` — it is permanent and
+    /// hash-covered — so the only honest way to assert on what was persisted is
+    /// to read the column.
+    fn recorded_talk_sessions(paths: &DaemonPaths) -> Vec<serde_json::Value> {
+        let connection = rusqlite::Connection::open(&paths.ledger_db).expect("the ledger opens");
+        let mut statement = connection
+            .prepare(
+                "SELECT detail_json FROM subsystem_events
+                 WHERE action LIKE 'TALK %' ORDER BY sequence",
+            )
+            .expect("subsystem events are queryable");
+        let rows = statement
+            .query_map([], |row| row.get::<_, Option<Vec<u8>>>(0))
+            .expect("read the recorded detail")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read the recorded detail");
+        rows.into_iter()
+            .filter_map(|detail| detail.map(|bytes| serde_json::from_slice(&bytes).unwrap()))
+            .collect()
+    }
+
+    /// **A finished routed session leaves a metric row that names the route it
+    /// used, times it, and carries none of what was said on it.**
+    ///
+    /// The spec asks for route metrics, and a metric that is computed and then
+    /// dropped is worse than none at all: it reads as observability in review
+    /// and produces nothing an operator can look at when a paired speaker is
+    /// the thing that went wrong. So the assertions below are on the persisted
+    /// row, not on a value returned in memory.
+    ///
+    /// The second half is the constraint that matters more. This session
+    /// carried real PCM from a microphone in somebody's room, and the row it
+    /// leaves is permanent and hash-chained — it cannot be edited later if it
+    /// turns out to have audio in it. Endpoint ids and durations are the whole
+    /// of what may be there.
+    #[tokio::test]
+    async fn a_finished_routed_session_records_the_routes_shape_and_timing_and_no_audio() {
+        use futures_util::SinkExt;
+
+        let (root, api, _secrets, device_id, secret) = fixture();
+        let paths = DaemonPaths::under(&root);
+        let now_ms = crate::daemon::remote::now_ms_public().unwrap();
+        // The route is selected and activated before the device connects, which
+        // is the order it happens in: setup latency is that gap, and it is only
+        // a real measurement if the two moments are actually apart.
+        let selected_ms = now_ms.saturating_sub(400);
+        ready_voice_device(
+            &api,
+            &device_id,
+            &secret,
+            1,
+            &[
+                DeviceCapability::MicrophoneCapture,
+                DeviceCapability::VoiceStream,
+                DeviceCapability::AudioPlayback,
+            ],
+            selected_ms,
+        );
+        let speech = speech_saying(&[], 0);
+        let api = api.with_talk_speech(speech.clone());
+
+        let route = active_engine_route(
+            &paths,
+            "voice-route-realtime-metrics",
+            "realtime",
+            &format!("paired:{device_id}:input"),
+            &format!("paired:{device_id}:output"),
+            selected_ms,
+        );
+        let bridge = host_media_bridge(&paths, &api).await;
+        let address = spawn_talk_server(api.clone()).await;
+        let (mut socket, generation, session_id) =
+            open_route_socket(&api, &device_id, &secret, 2, &route, "duplex", address, now_ms).await;
+        let _ = read_until(&mut socket, "ready").await;
+        realtime_hello(&mut socket, &session_id, &generation).await;
+
+        let spoken = pcm_chunk(0x7E, 512);
+        socket
+            .send(talk_frame(
+                &session_id,
+                &generation,
+                2,
+                serde_json::json!({
+                    "type": "audio",
+                    "audio_sequence": 1,
+                    "media_type": super::super::realtime_bridge::REALTIME_PCM_MEDIA_TYPE,
+                    "audio_base64": STANDARD.encode(&spoken),
+                    "last": false,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            host_waits_for_input(&bridge, &route.session_id, route.generation).await.0,
+            spoken,
+            "the session really did carry this audio"
+        );
+
+        // Hold the route open for a known interval before hanging up. Without
+        // it the assertion below races the machine: the measurement is real
+        // either way, but how long a round trip happens to take is not
+        // something a test may depend on.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+        // The device hangs up, which is what ends the session and writes the row.
+        socket.close(None).await.unwrap();
+        let mut recorded = Vec::new();
+        for _ in 0..200 {
+            recorded = recorded_talk_sessions(&paths);
+            if !recorded.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(recorded.len(), 1, "one finished session, one row");
+        let detail = &recorded[0];
+        assert_eq!(detail["deviceId"], device_id);
+
+        let measured = &detail["route"];
+        assert_eq!(measured["routeId"], route.route_id);
+        assert_eq!(measured["generation"], route.generation);
+        assert_eq!(measured["engine"], "realtime");
+        assert_eq!(measured["role"], "duplex");
+        assert_eq!(measured["input"]["kind"], "paired");
+        assert_eq!(measured["input"]["endpoint"], format!("paired:{device_id}:input"));
+        assert_eq!(measured["output"]["kind"], "paired");
+        assert_eq!(measured["output"]["endpoint"], format!("paired:{device_id}:output"));
+
+        let setup_ms = measured["setupMs"].as_u64().expect("setup latency is a number");
+        assert!(
+            (400..60_000).contains(&setup_ms),
+            "setup latency is the real gap between activating the route and admitting the socket, not a placeholder: {setup_ms}"
+        );
+        let duration_ms = measured["durationMs"]
+            .as_u64()
+            .expect("route duration is a number");
+        assert!(
+            (100..600_000).contains(&duration_ms),
+            "route duration is how long the socket actually carried audio -- at least the \
+             120ms the test deliberately held it open, and never a placeholder: {duration_ms}"
+        );
+
+        // Nothing anybody said, in any encoding, on a row that cannot be edited
+        // once it is written.
+        let raw = serde_json::to_string(detail).unwrap();
+        assert!(
+            !raw.contains(&STANDARD.encode(&spoken)),
+            "the audio the device sent must not be quoted back into the audit row"
+        );
+        assert!(
+            !raw.contains("audio_base64") && !raw.contains("pcm"),
+            "no audio payload field reaches the record: {raw}"
+        );
+        assert!(
+            !recorded_detail_bytes(&paths).windows(spoken.len()).any(|window| window == spoken),
+            "nor do the raw samples, in any encoding this row could carry them in"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every recorded `TALK` detail, concatenated as stored bytes — so "no
+    /// audio reached the record" can be asserted against the bytes rather than
+    /// against a re-serialization of them.
+    fn recorded_detail_bytes(paths: &DaemonPaths) -> Vec<u8> {
+        let connection = rusqlite::Connection::open(&paths.ledger_db).expect("the ledger opens");
+        let mut statement = connection
+            .prepare("SELECT detail_json FROM subsystem_events WHERE action LIKE 'TALK %'")
+            .expect("subsystem events are queryable");
+        let rows = statement
+            .query_map([], |row| row.get::<_, Option<Vec<u8>>>(0))
+            .expect("read the recorded detail")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read the recorded detail");
+        rows.into_iter().flatten().flatten().collect()
     }
 
     /// A whole voice stream over the signed plane: leased, started, audio

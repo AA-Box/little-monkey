@@ -2,10 +2,12 @@ import { AlertTriangle, Loader2, Mic, MicOff, ShieldAlert, Square, Type, Volume2
 import { useEffect, useState } from 'react';
 
 import { realtimeVoiceClient, type RealtimeVoiceStatus, type VoiceConfig } from '../../lib/companionClient';
+import type { VoiceRouteRecord } from '../../lib/daemonClient';
 import type { RealtimeVoiceState } from '../../lib/realtimeVoice';
 import { Button, IconButton } from '../ui';
 import type { TalkPanelProps } from './TalkPanel';
 import { useRealtimeVoiceSession } from './useRealtimeVoiceSession';
+import { VoiceRouteSelector } from './VoiceRouteSelector';
 
 const LABEL: Record<RealtimeVoiceState, string> = {
   idle: 'Not connected', connecting: 'Connecting securely…', ready: 'Ready',
@@ -26,7 +28,8 @@ export function RealtimeTalkPanel({
   onOpenVoiceSettings,
   voice,
 }: TalkPanelProps & { voice: VoiceConfig }) {
-  const session = useRealtimeVoiceSession(sessionId, voice);
+  const [voiceRoute, setVoiceRoute] = useState<VoiceRouteRecord | null>(null);
+  const session = useRealtimeVoiceSession(sessionId, voice, voiceRoute);
   const [providerStatus, setProviderStatus] = useState<RealtimeVoiceStatus | null>(null);
   const [privacyAccepted, setPrivacyAccepted] = useState(false);
   const running = !['idle', 'closed', 'error'].includes(session.state);
@@ -60,11 +63,12 @@ export function RealtimeTalkPanel({
       )}
 
       <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
+        <VoiceRouteSelector sessionId={sessionId} engine="realtime" onRoute={setVoiceRoute} />
         {!running && (
           <label className="flex items-start gap-3 rounded-lg border border-warning/40 bg-warning/10 p-3 text-xs">
             <input className="mt-0.5" type="checkbox" checked={privacyAccepted} onChange={(event) => setPrivacyAccepted(event.target.checked)} />
             <span><span className="mb-1 flex items-center gap-1 font-semibold"><ShieldAlert size={14} />Before connecting</span>
-              Your microphone audio and the bounded conversation context are sent to OpenAI for this live session.
+              Audio from the selected microphone and the bounded conversation context are sent to OpenAI for this live session.
               Tool calls still pass through Little Monkey’s existing permission, sandbox, workspace, network, and MCP controls.
               Audio is not stored by Little Monkey.
             </span>

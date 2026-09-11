@@ -42,12 +42,16 @@ vi.mock('@tauri-apps/api/event', () => ({
 function emit(name: string): void {
   for (const listener of [...eventListeners()]) if (listener.name === name) listener.handler();
 }
+/** A spy, because the route regressions below are all questions about how many
+ * times one physical utterance became a turn in the conversation. */
+const runAgentTurn = vi.fn(async (..._args: unknown[]) => undefined);
 vi.mock('../../lib/agentLoop', () => ({
-  runAgentTurn: () => Promise.resolve(),
+  runAgentTurn: (...args: unknown[]) => runAgentTurn(...args),
   stopTurn: () => undefined,
 }));
 
 import { useTalkSession } from './useTalkSession';
+import type { VoiceRouteEvent, VoiceRouteRecord } from '../../lib/daemonClient';
 
 const CONFIG = {
   schemaVersion: 1,
@@ -71,6 +75,46 @@ const CONFIG = {
  * running session, exactly as a save in Settings changes it.
  */
 let voice: Record<string, unknown> = { ...CONFIG.voice };
+
+/**
+ * The daemon's VoiceRoute half: the record every route command answers with,
+ * and the append-only coordination log the hook polls with a cursor.
+ */
+let voiceRoute: VoiceRouteRecord | null = null;
+let voiceRouteLog: VoiceRouteEvent[] = [];
+/** Whether `voice_route_activate` refuses, the way a paired device that never
+ * acknowledged its command makes it refuse. */
+let activationFails = false;
+/** How many local microphone tracks had already been stopped at the moment the
+ * daemon was asked to give capture to the paired device. */
+let stoppedTracksWhenActivated: number | null = null;
+
+function pairedRoute(generation: number): VoiceRouteRecord {
+  return {
+    session_id: 'session-1',
+    route_id: 'route-1',
+    generation,
+    engine: 'pipeline',
+    input_endpoint: 'paired:phone-1:input',
+    output_endpoint: 'local:output:default',
+    state: 'active',
+    input_command_id: null,
+    output_command_id: null,
+    created_at_ms: 1,
+    updated_at_ms: 1,
+  };
+}
+
+function transcript(eventId: number, generation: number, text: string): VoiceRouteEvent {
+  return {
+    event_id: eventId,
+    session_id: 'session-1',
+    generation,
+    kind: 'input_transcript',
+    payload: { text, turn_id: `turn-${eventId}` },
+    created_at_ms: 2,
+  };
+}
 
 interface StubTrack {
   stopped: number;
@@ -150,8 +194,24 @@ function stubMedia() {
 
 beforeEach(() => {
   invoke.mockReset();
-  invoke.mockImplementation((command: string) => {
+  invoke.mockImplementation((command: string, args?: unknown) => {
+    const input = (args ?? {}) as { after?: number };
     switch (command) {
+      case 'voice_route_get':
+      case 'voice_route_deactivate':
+        return Promise.resolve(voiceRoute);
+      case 'voice_route_activate':
+        stoppedTracksWhenActivated = streams.reduce((total, track) => total + track.stopped, 0);
+        return activationFails
+          ? Promise.reject(new Error('A paired VoiceRoute endpoint did not become ready'))
+          : Promise.resolve(voiceRoute);
+      case 'voice_route_events':
+        // Strictly after the cursor, as the daemon answers. A host that rewinds
+        // its cursor therefore sees the same event a second time, which is what
+        // makes a replayed turn observable at all.
+        return Promise.resolve(voiceRouteLog.filter((event) => event.event_id > (input.after ?? 0)));
+      case 'voice_route_emit':
+        return Promise.resolve({ event_id: 900 + voiceRouteLog.length });
       case 'm7_talk_status':
         return Promise.resolve({
           configured: true,
@@ -186,6 +246,11 @@ beforeEach(() => {
   stubMedia();
   eventListeners().length = 0;
   voice = { ...CONFIG.voice };
+  runAgentTurn.mockClear();
+  voiceRoute = null;
+  voiceRouteLog = [];
+  activationFails = false;
+  stoppedTracksWhenActivated = null;
 });
 
 afterEach(() => {
@@ -358,5 +423,107 @@ describe('useTalkSession', () => {
     await waitFor(() => expect(streams).toHaveLength(1));
     rerender({ enabled: false });
     await waitFor(() => expect(streams[0].stopped).toBeGreaterThan(0));
+  });
+});
+
+/**
+ * One physical utterance is one turn in the conversation, however many times
+ * the selector re-reads the route it was captured under.
+ *
+ * `VoiceRouteSelector` calls `onRoute` on every refresh — a headset plugged in
+ * anywhere on the machine is enough — and hands back a freshly deserialised
+ * record for a route that has not moved. Keying the event cursor off that
+ * object rewound it to zero on each of those, and the poll then re-submitted
+ * every transcript of the live generation as another user turn: one sentence
+ * spoken into the phone, answered again and again for as long as the panel
+ * stayed open.
+ */
+describe('a paired microphone routed into an ordinary conversation', () => {
+  /** Local Talk running, then the paired phone selected: the live handoff. */
+  async function handOffToPhone(generation = 2) {
+    const view = renderHook(
+      ({ route }: { route: VoiceRouteRecord | null }) =>
+        useTalkSession('session-1', { enabled: true, autoStartMode: 'continuous', route }),
+      { initialProps: { route: null as VoiceRouteRecord | null } },
+    );
+    await waitFor(() => expect(streams).toHaveLength(1));
+    await waitFor(() => expect(view.result.current.snapshot?.capturing).toBe(true));
+    voiceRoute = pairedRoute(generation);
+    view.rerender({ route: voiceRoute });
+    await waitFor(() => expect(stoppedTracksWhenActivated).not.toBeNull());
+    return view;
+  }
+
+  it('does not replay a transcript when the same route is handed back again', async () => {
+    const view = await handOffToPhone();
+    voiceRouteLog.push(transcript(4, 2, 'what is on my calendar'));
+    await waitFor(() => expect(runAgentTurn).toHaveBeenCalledTimes(1));
+    expect(runAgentTurn.mock.calls[0][1]).toBe('what is on my calendar');
+
+    // Exactly what a refresh produces: the same route, deserialised again.
+    view.rerender({ route: { ...pairedRoute(2) } });
+    view.rerender({ route: { ...pairedRoute(2) } });
+    // Several poll cycles — the poll runs every 180ms — with nothing new to
+    // find. The question is whether it re-finds what it already answered.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(runAgentTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it('accepts the next transcript after the route really moves to a new generation', async () => {
+    const view = await handOffToPhone();
+    voiceRouteLog.push(transcript(4, 2, 'what is on my calendar'));
+    await waitFor(() => expect(runAgentTurn).toHaveBeenCalledTimes(1));
+
+    // A real move: the daemon retired the old capture owner and minted a new
+    // generation. Its transcripts are new utterances and must be answered.
+    voiceRoute = pairedRoute(3);
+    view.rerender({ route: voiceRoute });
+    voiceRouteLog.push(transcript(9, 3, 'and tomorrow'));
+    await waitFor(() => expect(runAgentTurn).toHaveBeenCalledTimes(2));
+    expect(runAgentTurn.mock.calls[1][1]).toBe('and tomorrow');
+  });
+
+  /**
+   * The spec's two-microphone rule, checked at the only moment it can be
+   * violated. The daemon has already retired the previous capture owner by the
+   * time this record arrives; if the webview still held its own microphone open
+   * while asking the phone to start recording, both would be recording this
+   * conversation at once.
+   */
+  it('closes local capture before the paired microphone is asked to own it', async () => {
+    await handOffToPhone();
+    expect(stoppedTracksWhenActivated).toBeGreaterThan(0);
+    expect(streams).toHaveLength(1);
+    expect(invoke).toHaveBeenCalledWith('voice_route_activate', expect.anything());
+  });
+
+  /**
+   * Closing local capture first is only safe while a failed handoff gives it
+   * back. `move_route` restores the previous endpoints under a fresh generation
+   * when activation fails, and a conversation left with neither microphone —
+   * the phone refused, the laptop already closed — is the worse outcome of the
+   * two this ordering trades between.
+   */
+  it('brings local capture back when the paired activation fails', async () => {
+    const view = renderHook(
+      ({ route }: { route: VoiceRouteRecord | null }) =>
+        useTalkSession('session-1', { enabled: true, autoStartMode: 'continuous', route }),
+      { initialProps: { route: null as VoiceRouteRecord | null } },
+    );
+    await waitFor(() => expect(streams).toHaveLength(1));
+    await waitFor(() => expect(view.result.current.snapshot?.capturing).toBe(true));
+
+    activationFails = true;
+    const restored: VoiceRouteRecord = {
+      ...pairedRoute(3),
+      input_endpoint: 'local:input:default',
+    };
+    view.rerender({ route: pairedRoute(2) });
+    // The daemon's authoritative record after its own rollback.
+    voiceRoute = restored;
+
+    await waitFor(() => expect(view.result.current.setupError).toBeTruthy());
+    await waitFor(() => expect(streams).toHaveLength(2));
+    expect(streams[1].stopped).toBe(0);
   });
 });

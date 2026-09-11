@@ -3,8 +3,16 @@ import { invoke } from '@tauri-apps/api/core';
 
 import { realtimeVoiceClient, type VoiceConfig } from '../../lib/companionClient';
 import { beginDurableRun, type DurableRunRecorder } from '../../lib/durableRun';
+import {
+  type VoiceRouteRecord,
+  voiceRouteActivate,
+  voiceRouteDeactivate,
+  voiceRouteEmit,
+  voiceRouteEvents,
+} from '../../lib/daemonClient';
 import type { ProviderModelTargetSnapshot } from '../../lib/modelTargets';
 import { OpenAiRealtimeVoiceProvider } from '../../lib/openAiRealtimeVoice';
+import { RealtimeRouteBridge } from '../../lib/realtimeRouteBridge';
 import {
   RealtimeVoiceController,
   boundedRealtimeContext,
@@ -69,6 +77,34 @@ async function stableRunId(realtimeSessionId: string, itemId: string): Promise<s
   return `realtime-${hex}`;
 }
 
+function pairedInputDevice(value: string | undefined | null): string | null {
+  return value?.match(/^paired:(.+):input$/)?.[1] ?? null;
+}
+
+function pairedOutputDevice(value: string | undefined | null): string | null {
+  return value?.match(/^paired:(.+):output$/)?.[1] ?? null;
+}
+
+/**
+ * What makes two route records the same selection.
+ *
+ * `VoiceRouteSelector` hands `onRoute` a freshly deserialised record on every
+ * refresh, so object identity says "changed" far more often than the route
+ * moves. The daemon's identity is the route id and its monotonic generation,
+ * and a stopped route is the same thing as no route as far as the media bridge
+ * below is concerned.
+ */
+function routeIdentity(route: VoiceRouteRecord | null | undefined): string | null {
+  return route && route.state === 'active' ? `${route.route_id}:${route.generation}` : null;
+}
+
+function localDevice(value: string | undefined | null, direction: 'input' | 'output'): string | null {
+  const prefix = `local:${direction}:`;
+  if (!value?.startsWith(prefix)) return null;
+  const id = value.slice(prefix.length);
+  return !id || id === 'default' ? null : id;
+}
+
 export interface UseRealtimeVoiceSession {
   state: RealtimeVoiceState;
   inputTranscript: string;
@@ -85,6 +121,7 @@ export interface UseRealtimeVoiceSession {
 export function useRealtimeVoiceSession(
   chatSessionId: string,
   voice: VoiceConfig,
+  route: VoiceRouteRecord | null = null,
 ): UseRealtimeVoiceSession {
   const controller = useMemo(() => new RealtimeVoiceController(), []);
   const provider = useMemo(() => new OpenAiRealtimeVoiceProvider(), []);
@@ -95,6 +132,17 @@ export function useRealtimeVoiceSession(
   const [awaitingApproval, setAwaitingApproval] = useState(false);
   const awaitingApprovalRef = useRef(false);
   const sessionRef = useRef<RealtimeVoiceSession | null>(null);
+  /**
+   * Whether a provider session is live, as state rather than only as the ref
+   * above.
+   *
+   * The remote-interrupt poll needs a route *and* a session, and the two arrive
+   * in either order — the route selector sits above the Connect button, so the
+   * ordinary order is route first. A ref cannot wake an effect, so an effect
+   * that only read `sessionRef` never re-ran after Connect and barge-in from
+   * the paired microphone never reached the provider at all.
+   */
+  const [sessionLive, setSessionLive] = useState(false);
   const realtimeSessionIdRef = useRef<string | null>(null);
   const surfaceRef = useRef<RealtimeToolSurface | null>(null);
   const recorderRef = useRef<DurableRunRecorder | null>(null);
@@ -119,6 +167,15 @@ export function useRealtimeVoiceSession(
   const startingRef = useRef(false);
   const metricRecordedRef = useRef(false);
   const restartRef = useRef<() => Promise<void>>(async () => undefined);
+  const routeRef = useRef<VoiceRouteRecord | null>(route);
+  const routeCursorRef = useRef<{ generation: number; eventId: number } | null>(null);
+  /** The selection the route effect and `start` last configured — see
+   * `routeIdentity`. Reconfiguring stops the paired media bridge and starts a
+   * new one, which is a gap in the operator's microphone; a selector refresh is
+   * not a reason to open one. */
+  const routeIdentityRef = useRef<string | null>(null);
+  const bridgeRef = useRef<RealtimeRouteBridge | null>(null);
+  const manualExternalInputRef = useRef(false);
 
   const recordMetric = useCallback(() => {
     if (metricRecordedRef.current) return;
@@ -142,10 +199,111 @@ export function useRealtimeVoiceSession(
   }, [controller]);
 
   const closeCurrent = useCallback(async () => {
+    bridgeRef.current?.stop();
+    bridgeRef.current = null;
+    manualExternalInputRef.current = false;
     const current = sessionRef.current;
     sessionRef.current = null;
+    setSessionLive(false);
     await current?.close();
   }, []);
+
+  const activateAndWaitForRoute = useCallback(async (selected: VoiceRouteRecord): Promise<VoiceRouteRecord> => {
+    if (selected.engine !== 'realtime') throw new Error('This audio route belongs to Pipeline Talk, not Realtime.');
+    const activated = await voiceRouteActivate(chatSessionId);
+    routeRef.current = activated;
+    const required = new Map<string, 'input_ready' | 'output_ready'>();
+    const inputDevice = pairedInputDevice(activated.input_endpoint);
+    const outputDevice = pairedOutputDevice(activated.output_endpoint);
+    if (inputDevice && activated.input_command_id) required.set(activated.input_command_id, 'input_ready');
+    if (outputDevice && outputDevice !== inputDevice && activated.output_command_id) {
+      required.set(activated.output_command_id, 'output_ready');
+    }
+    if (required.size === 0) return activated;
+    let cursor = routeCursorRef.current?.generation === activated.generation
+      ? routeCursorRef.current.eventId
+      : 0;
+    const deadline = Date.now() + 20_000;
+    while (required.size && Date.now() < deadline) {
+      const events = await voiceRouteEvents(chatSessionId, cursor, 100);
+      for (const event of events) {
+        cursor = Math.max(cursor, event.event_id);
+        if (event.generation !== activated.generation || !event.payload || typeof event.payload !== 'object') continue;
+        const commandId = (event.payload as Record<string, unknown>).command_id;
+        if (typeof commandId === 'string' && required.get(commandId) === event.kind) required.delete(commandId);
+      }
+      routeCursorRef.current = { generation: activated.generation, eventId: cursor };
+      if (required.size) await new Promise((resolve) => setTimeout(resolve, 120));
+    }
+    if (required.size) throw new Error('A paired Realtime endpoint did not become ready within 20 seconds.');
+    return activated;
+  }, [chatSessionId]);
+
+  const setRemoteInputGate = useCallback(async (open: boolean): Promise<void> => {
+    const selected = routeRef.current;
+    if (!selected || selected.state !== 'active' || !pairedInputDevice(selected.input_endpoint)) return;
+    const requested = await voiceRouteEmit(chatSessionId, selected.generation, 'input_gate', { open });
+    const deadline = Date.now() + 8_000;
+    let cursor = requested.event_id;
+    while (Date.now() < deadline) {
+      const events = await voiceRouteEvents(chatSessionId, cursor, 100);
+      for (const event of events) {
+        cursor = Math.max(cursor, event.event_id);
+        if (event.generation !== selected.generation || event.kind !== 'input_gate_ack'
+            || !event.payload || typeof event.payload !== 'object') continue;
+        const payload = event.payload as Record<string, unknown>;
+        if (payload.gate_sequence === requested.event_id && payload.open === open) return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    throw new Error(`Paired Realtime microphone did not ${open ? 'open' : 'close'} its input gate in time.`);
+  }, [chatSessionId]);
+
+  const configureRoute = useCallback(async (
+    session: RealtimeVoiceSession,
+    selected: VoiceRouteRecord | null,
+  ) => {
+    bridgeRef.current?.stop();
+    bridgeRef.current = null;
+    manualExternalInputRef.current = false;
+    if (!selected || selected.state !== 'active') {
+      await session.setInputRoute(false, voice.inputDeviceId);
+      await session.setOutputRoute(false, voice.outputDeviceId);
+      return;
+    }
+    const pairedInput = pairedInputDevice(selected.input_endpoint);
+    const pairedOutput = pairedOutputDevice(selected.output_endpoint);
+    const bridge = pairedInput || pairedOutput
+      ? new RealtimeRouteBridge(chatSessionId, selected.generation, (reason) => {
+          const message = reason.message || 'Realtime paired-device media bridge failed.';
+          setError(message);
+          controller.consume({
+            type: 'connection_lost', eventId: `local:route-bridge:${crypto.randomUUID()}`,
+            recoverable: false, code: 'paired_media_bridge_failed',
+          });
+          setState(controller.state);
+          void closeCurrent();
+          void voiceRouteDeactivate(chatSessionId).catch(() => null);
+        })
+      : null;
+    bridgeRef.current = bridge;
+    await session.setInputRoute(Boolean(pairedInput), pairedInput ? null : localDevice(selected.input_endpoint, 'input'));
+    await session.setOutputRoute(
+      Boolean(pairedOutput),
+      pairedOutput ? null : localDevice(selected.output_endpoint, 'output'),
+      pairedOutput && bridge ? (samples, sampleRate) => bridge.pushOutput(samples, sampleRate) : null,
+    );
+    if (pairedInput && bridge) {
+      await bridge.startInput(
+        (audioBase64) => session.appendInputPcm16(audioBase64),
+        () => (voice.realtimeTurnDetection ?? 'semantic_vad') !== 'manual' || manualExternalInputRef.current,
+      );
+      if ((voice.realtimeTurnDetection ?? 'semantic_vad') === 'manual') {
+        manualExternalInputRef.current = false;
+        await setRemoteInputGate(false);
+      }
+    }
+  }, [chatSessionId, closeCurrent, controller, setRemoteInputGate, voice.inputDeviceId, voice.outputDeviceId, voice.realtimeTurnDetection]);
 
   const startRecorder = useCallback(async (
     itemId: string,
@@ -436,18 +594,32 @@ export function useRealtimeVoiceSession(
       ].filter(Boolean).join('\n\n');
       controller.connecting(reconnectAttemptedRef.current);
       setState(controller.state);
+      const selectedRoute = routeRef.current?.state === 'active' ? routeRef.current : null;
+      if (selectedRoute && selectedRoute.engine !== 'realtime') {
+        throw new Error('The selected audio route belongs to Pipeline Talk, not Realtime.');
+      }
+      const pairedInput = pairedInputDevice(selectedRoute?.input_endpoint);
+      const pairedOutput = pairedOutputDevice(selectedRoute?.output_endpoint);
       const session = provider.createSession({
         sessionId: realtimeSessionId,
         model: voice.realtimeModel ?? 'gpt-realtime-2.1',
         voice: voice.realtimeVoice ?? 'marin',
         turnDetection: voice.realtimeTurnDetection ?? 'semantic_vad',
-        inputDeviceId: voice.inputDeviceId,
-        outputDeviceId: voice.outputDeviceId,
+        inputDeviceId: selectedRoute ? localDevice(selectedRoute.input_endpoint, 'input') : voice.inputDeviceId,
+        outputDeviceId: selectedRoute ? localDevice(selectedRoute.output_endpoint, 'output') : voice.outputDeviceId,
+        externalInput: Boolean(pairedInput),
+        externalOutput: Boolean(pairedOutput),
         instructions,
         tools: surface.tools,
       }, handleEvent);
       sessionRef.current = session;
+      setSessionLive(true);
       await session.connect();
+      if (selectedRoute) {
+        const activated = await activateAndWaitForRoute(selectedRoute);
+        await configureRoute(session, activated);
+      }
+      routeIdentityRef.current = routeIdentity(routeRef.current);
     } catch (reason) {
       await closeCurrent();
       const message = reason instanceof Error ? reason.message : String(reason);
@@ -461,7 +633,7 @@ export function useRealtimeVoiceSession(
     } finally {
       startingRef.current = false;
     }
-  }, [chatSessionId, closeCurrent, controller, handleEvent, provider, recordMetric, voice]);
+  }, [activateAndWaitForRoute, chatSessionId, closeCurrent, configureRoute, controller, handleEvent, provider, recordMetric, voice]);
 
   useEffect(() => { restartRef.current = start; }, [start]);
 
@@ -471,6 +643,7 @@ export function useRealtimeVoiceSession(
     toolAbortRef.current?.abort();
     toolAbortRef.current = null;
     await closeCurrent();
+    await voiceRouteDeactivate(chatSessionId).catch(() => null);
     const recorder = recorderRef.current ?? await recorderPromiseRef.current;
     const checkpointId = await checkpointPromiseRef.current;
     if (checkpointId) await invoke('checkpoint_end', { id: checkpointId }).catch(() => undefined);
@@ -487,17 +660,86 @@ export function useRealtimeVoiceSession(
     controller.close();
     setState('closed');
     reconnectAttemptedRef.current = false;
-  }, [closeCurrent, controller, recordMetric]);
+  }, [chatSessionId, closeCurrent, controller, recordMetric]);
 
-  useEffect(() => () => { void closeCurrent(); }, [closeCurrent]);
+  useEffect(() => () => {
+    void closeCurrent();
+    void voiceRouteDeactivate(chatSessionId).catch(() => null);
+  }, [chatSessionId, closeCurrent]);
+
+  useEffect(() => {
+    routeRef.current = route;
+    const current = sessionRef.current;
+    if (!current) return;
+    const identity = routeIdentity(route);
+    if (identity === routeIdentityRef.current) return;
+    routeIdentityRef.current = identity;
+    void (async () => {
+      try {
+        if (route?.state === 'active') {
+          const activated = await activateAndWaitForRoute(route);
+          if (sessionRef.current === current) await configureRoute(current, activated);
+        } else if (sessionRef.current === current) {
+          await configureRoute(current, null);
+        }
+      } catch (reason) {
+        if (sessionRef.current !== current) return;
+        const message = reason instanceof Error ? reason.message : String(reason);
+        setError(message);
+        controller.consume({
+          type: 'connection_lost', eventId: `local:route-change:${crypto.randomUUID()}`,
+          recoverable: false, code: 'voice_route_change_failed',
+        });
+        setState(controller.state);
+        await closeCurrent();
+      }
+    })();
+  }, [activateAndWaitForRoute, closeCurrent, configureRoute, controller, route]);
+
+  useEffect(() => {
+    const selected = route;
+    if (!selected || selected.state !== 'active' || selected.engine !== 'realtime' || !sessionLive) return undefined;
+    let stopped = false;
+    let cursor = routeCursorRef.current?.generation === selected.generation
+      ? routeCursorRef.current.eventId
+      : 0;
+    const poll = async () => {
+      while (!stopped && sessionRef.current) {
+        try {
+          const events = await voiceRouteEvents(chatSessionId, cursor, 100);
+          for (const event of events) {
+            cursor = Math.max(cursor, event.event_id);
+            if (event.generation !== selected.generation) continue;
+            if (event.kind === 'interrupt') {
+              await sessionRef.current?.interrupt();
+              if (pairedOutputDevice(selected.output_endpoint)) {
+                await bridgeRef.current?.interruptOutput().catch(() => undefined);
+                await voiceRouteEmit(chatSessionId, selected.generation, 'output_stop', {}).catch(() => null);
+              }
+            }
+          }
+          routeCursorRef.current = { generation: selected.generation, eventId: cursor };
+          await new Promise((resolve) => setTimeout(resolve, 120));
+        } catch {
+          if (!stopped) await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+      }
+    };
+    void poll();
+    return () => { stopped = true; };
+  }, [chatSessionId, route, sessionLive]);
 
   useEffect(() => {
     const mediaDevices = navigator.mediaDevices;
     if (!mediaDevices) return undefined;
     const onDeviceChange = async () => {
-      if (!sessionRef.current || !voice.inputDeviceId) return;
+      if (!sessionRef.current) return;
+      const routedInput = routeRef.current?.state === 'active'
+        ? localDevice(routeRef.current.input_endpoint, 'input')
+        : voice.inputDeviceId;
+      if (!routedInput) return;
       const devices = await mediaDevices.enumerateDevices().catch(() => []);
-      if (!devices.some((device) => device.kind === 'audioinput' && device.deviceId === voice.inputDeviceId)) {
+      if (!devices.some((device) => device.kind === 'audioinput' && device.deviceId === routedInput)) {
         setError('The selected microphone was removed. Reconnect it or choose another device.');
         await closeCurrent();
         controller.consume({
@@ -531,9 +773,36 @@ export function useRealtimeVoiceSession(
     };
   }, [closeCurrent, controller, recordMetric, voice.inputDeviceId]);
 
-  const interrupt = useCallback(async () => sessionRef.current?.interrupt(), []);
-  const startManualTurn = useCallback(async () => sessionRef.current?.startManualTurn(), []);
-  const finishManualTurn = useCallback(async () => sessionRef.current?.finishManualTurn(), []);
+  const interrupt = useCallback(async () => {
+    await sessionRef.current?.interrupt();
+    const currentRoute = routeRef.current;
+    if (currentRoute?.state === 'active' && pairedOutputDevice(currentRoute.output_endpoint)) {
+      await bridgeRef.current?.interruptOutput().catch(() => undefined);
+      await voiceRouteEmit(chatSessionId, currentRoute.generation, 'output_stop', {}).catch(() => null);
+    }
+  }, [chatSessionId]);
+
+  const startManualTurn = useCallback(async () => {
+    await sessionRef.current?.startManualTurn();
+    if (pairedInputDevice(routeRef.current?.input_endpoint)) {
+      manualExternalInputRef.current = true;
+      try {
+        await setRemoteInputGate(true);
+      } catch (reason) {
+        manualExternalInputRef.current = false;
+        throw reason;
+      }
+    }
+  }, [setRemoteInputGate]);
+
+  const finishManualTurn = useCallback(async () => {
+    if (pairedInputDevice(routeRef.current?.input_endpoint)) {
+      await setRemoteInputGate(false);
+      await bridgeRef.current?.waitForInputIdle();
+      manualExternalInputRef.current = false;
+    }
+    await sessionRef.current?.finishManualTurn();
+  }, [setRemoteInputGate]);
 
   return {
     state,
