@@ -1270,7 +1270,8 @@ fn read_clipboard_native() -> Result<String, String> {
 fn native_snapshot() -> Result<NativeSnapshot, String> {
     #[cfg(target_os = "macos")]
     {
-        let bytes = run_native_command("osascript", &["-l", "JavaScript", "-e", MACOS_AX_SCRIPT])?;
+        let script = macos_script(MACOS_AX_SCRIPT);
+        let bytes = run_native_command("osascript", &["-l", "JavaScript", "-e", &script])?;
         return serde_json::from_slice(&bytes)
             .map_err(|error| format!("macOS Accessibility returned invalid data: {error}"));
     }
@@ -1917,6 +1918,27 @@ public static class LMWindow { [DllImport("user32.dll")] public static extern bo
     }
 }
 
+/// Window identity must not follow z-order: `AXWindows` is ordered front to back,
+/// so an index taken straight from it renames every window whenever one is raised
+/// and a window-scoped grant would silently follow whichever window came forward.
+/// Both the snapshot and the action script rank windows through this helper, so
+/// the id a grant holds keeps addressing the window it was granted for.
+#[cfg(target_os = "macos")]
+const MACOS_WINDOW_RANK: &str = r#"
+function lmRankedWindows(p) {
+  const pick = (f, d) => { try { const v = f(); return v === undefined ? d : v; } catch (_) { return d; } };
+  const box = w => { const o = pick(() => w.position(), [0,0]); const s = pick(() => w.size(), [0,0]); return {x:Number(o[0])||0,y:Number(o[1])||0,width:Number(s[0])||0,height:Number(s[1])||0}; };
+  return pick(() => p.windows(), []).slice(0, 32)
+    .map((w, zi) => ({w, zi, title: String(pick(() => w.name(), '')), bounds: box(w)}))
+    .sort((a, b) => (a.title < b.title ? -1 : a.title > b.title ? 1 : (a.bounds.x - b.bounds.x) || (a.bounds.y - b.bounds.y) || (a.zi - b.zi)));
+}
+"#;
+
+#[cfg(target_os = "macos")]
+fn macos_script(body: &str) -> String {
+    format!("{MACOS_WINDOW_RANK}{body}")
+}
+
 #[cfg(target_os = "macos")]
 const MACOS_AX_SCRIPT: &str = r#"
 ObjC.import('AppKit');
@@ -1946,9 +1968,9 @@ for (const p of processList) {
     const name = String(safe(() => p.name(), '')); const bundle = String(safe(() => p.bundleIdentifier(), '')); const app = bundle === 'null' || bundle === 'undefined' || !bundle ? name : bundle;
     const workspaceFrontPid = Number(safe(() => $.NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier, 0));
     const front = onlyPid ? workspaceFrontPid === onlyPid : Boolean(safe(() => p.frontmost(), false)); let wi = 0;
-    for (const w of safe(() => p.windows(), [])) {
-      if (wi >= 32) break;
-      const title = String(safe(() => w.name(), '')); const id = app + '::window-' + wi; const target = {targetId:id,applicationId:app,applicationName:name,windowId:id,windowTitle:title,bounds:rect(w),focused:front && wi===0,sensitive:false,supportedActions:['inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot']}; targets.push(target);
+    for (const entry of lmRankedWindows(p)) {
+      const w = entry.w;
+      const title = entry.title; const id = app + '::window-' + wi; const target = {targetId:id,applicationId:app,applicationName:name,windowId:id,windowTitle:title,bounds:entry.bounds,focused:front && entry.zi===0,sensitive:false,supportedActions:['inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot']}; targets.push(target);
       const out=[]; let ei=0;
       for (const e of safe(() => w.entireContents(), [])) { if (ei++ >= 256) break; const role=String(safe(() => e.role(),'')); const subrole=String(safe(() => e.attribute('AXSubrole'),'')); const label=text(() => e.attribute('AXTitle'), () => e.description(), () => e.name()); const value=safe(() => e.value(), null); const native=String(safe(() => e.attribute('AXIdentifier'), '')); const stable=native.replace(/[^A-Za-z0-9._-]/g,'_'); const eb=rect(e); out.push({id:id+'::element-'+(ei-1)+'::native-'+stable,role,label,value:value===null?null:String(value),bounds:eb,enabled:Boolean(safe(() => e.enabled(),true)),focused:Boolean(safe(() => e.focused(),false)),actions:['click','double_click','set_value','select'],sensitive:/AXSecureTextField|securetextfield|password|secure|auth|credential/i.test(role+' '+subrole+' '+label)}); }
       elements[id]=out; wi++;
@@ -2222,7 +2244,9 @@ const stable = get('LM_ELEMENT_STABLE');
 const action = get('LM_ACTION');
 const value = get('LM_VALUE');
 const process = /^(com|org|net|io)\./.test(appId) ? se.processes.byBundleIdentifier(appId) : se.processes.byName(appId);
-const window = process.windows[windowIndex];
+const ranked = lmRankedWindows(process)[windowIndex];
+if (!ranked) throw new Error('macOS Accessibility window is stale');
+const window = ranked.w;
 const contents = window.entireContents();
 let element = null;
 if (stable) {
@@ -2491,9 +2515,10 @@ fn native_semantic_action(
     #[cfg(target_os = "macos")]
     {
         let window_index = window_index(&target.window_id)?;
+        let script = macos_script(MACOS_AX_ACTION_SCRIPT);
         let bytes = run_native_command_with_env(
             "osascript",
-            &["-l", "JavaScript", "-e", MACOS_AX_ACTION_SCRIPT],
+            &["-l", "JavaScript", "-e", &script],
             &[
                 ("LM_APP_ID", target.application_id.clone()),
                 ("LM_WINDOW_INDEX", window_index.to_string()),
@@ -6145,5 +6170,78 @@ mod tests {
         assert!(WAYLAND_PORTAL_MESSAGE.contains("Wayland clipboard"));
         assert!(WAYLAND_PORTAL_MESSAGE.contains("xdg-desktop-portal"));
         assert!(WAYLAND_PORTAL_MESSAGE.contains("will not fall back"));
+    }
+
+    /// Runs the real macOS provider script against a stubbed System Events so
+    /// the window identity it mints can be checked without a desktop session.
+    #[cfg(target_os = "macos")]
+    fn stubbed_macos_snapshot(windows: &str) -> NativeSnapshot {
+        // Only the System Events handle is stubbed; everything the snapshot is
+        // built from below is the shipped script.
+        const STUB: &str = r#"
+function __systemEvents() {
+  const win = (title, x, y) => ({ name: () => title, position: () => [x, y], size: () => [320, 200], entireContents: () => [] });
+  const windows = __WINDOWS__;
+  return { processes: () => [{ unixId: () => 4242, visible: () => true, name: () => 'Fixture', bundleIdentifier: () => 'com.example.fixture', frontmost: () => true, windows: () => windows }] };
+}
+"#;
+        let provider = macos_script(MACOS_AX_SCRIPT);
+        let stubbed = provider.replace("Application('System Events')", "__systemEvents()");
+        assert_ne!(stubbed, provider, "System Events handle was not stubbed");
+        let script = format!("{}{stubbed}", STUB.replace("__WINDOWS__", windows));
+        let output = Command::new("osascript")
+            .args(["-l", "JavaScript", "-e", &script])
+            .env_remove("COMPUTER_USE_FIXTURE_PID")
+            .env_remove("COMPUTER_USE_FIXTURE_APP_NAME")
+            .output()
+            .expect("osascript is available on macOS");
+        assert!(
+            output.status.success(),
+            "provider script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("provider returned a snapshot")
+    }
+
+    /// A raised window must not inherit another window's id: AXWindows is
+    /// z-ordered, so an index-derived id would repoint a window-scoped grant at
+    /// whichever window came forward.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_window_identity_survives_a_raise() {
+        let secondary_front =
+            stubbed_macos_snapshot("[win('Secondary', 700, 400), win('Primary', 0, 0)]");
+        let primary_front =
+            stubbed_macos_snapshot("[win('Primary', 0, 0), win('Secondary', 700, 400)]");
+        let id = |snapshot: &NativeSnapshot, title: &str| {
+            snapshot
+                .targets
+                .iter()
+                .find(|target| target.window_title == title)
+                .map(|target| target.window_id.clone())
+                .unwrap_or_else(|| panic!("{title} window was not reported"))
+        };
+        assert_eq!(
+            id(&secondary_front, "Primary"),
+            id(&primary_front, "Primary")
+        );
+        assert_eq!(
+            id(&secondary_front, "Secondary"),
+            id(&primary_front, "Secondary")
+        );
+        assert_ne!(
+            id(&primary_front, "Primary"),
+            id(&primary_front, "Secondary")
+        );
+        let focused = |snapshot: &NativeSnapshot, title: &str| {
+            snapshot
+                .targets
+                .iter()
+                .find(|target| target.window_title == title)
+                .is_some_and(|target| target.focused)
+        };
+        assert!(focused(&secondary_front, "Secondary"));
+        assert!(!focused(&secondary_front, "Primary"));
+        assert!(focused(&primary_front, "Primary"));
     }
 }
