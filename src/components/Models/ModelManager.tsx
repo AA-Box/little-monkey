@@ -30,6 +30,32 @@ function mergeInstalled(curated: ModelInfo[], installed: ModelInfo[]): ModelInfo
   });
 }
 
+/**
+ * The projector callbacks a given model's card should get, if any.
+ *
+ * A projector is a llama.cpp GGUF concept, and both backing commands
+ * (`models_detect_projectors`, `models_set_projector`) read the model path as a
+ * regular GGUF file. An MLX bundle is a directory, so offering the button on
+ * that card could only ever produce an error dialog — and `ModelCard` renders
+ * the buttons whenever the callbacks exist and has no runtime rule of its own,
+ * so withholding them here is the whole of the rule. Exported so that rule is
+ * testable without standing the manager up.
+ */
+export function projectorActions(
+  model: ModelInfo,
+  addProjector: (model: ModelInfo) => void,
+  removeProjectorAt: (path: string) => void,
+): { onAddProjector?: () => void; onRemoveProjector?: () => void } {
+  if (model.runtime === "mlx") return {};
+  return {
+    onAddProjector: () => addProjector(model),
+    onRemoveProjector:
+      model.components?.projector && model.path
+        ? () => removeProjectorAt(model.path as string)
+        : undefined,
+  };
+}
+
 /** Active model first, then installed-but-idle, then not-yet-downloaded. */
 function sortModels(models: ModelInfo[], activeId: string | undefined): ModelInfo[] {
   const rank = (model: ModelInfo) => (model.id === activeId ? 0 : model.installed ? 1 : 2);
@@ -133,15 +159,10 @@ export function ModelManager() {
     }
   }, [setProjector, t]);
 
-  const projectorActions = (model: ModelInfo) => ({
-    onAddProjector: () => void handleAddProjector(model),
-    onRemoveProjector: model.components?.projector
-      ? () => {
-          if (!model.path) return;
-          void removeProjector(model.path).catch((error) => window.alert(String(error)));
-        }
-      : undefined,
-  });
+  const cardProjectorActions = (model: ModelInfo) =>
+    projectorActions(model, handleAddProjector, (path) => {
+      void removeProjector(path).catch((error) => window.alert(String(error)));
+    });
 
   return (
     <div className="flex flex-col gap-2 py-2">
@@ -176,7 +197,7 @@ export function ModelManager() {
             onDelete={() => void handleDelete(model)}
             onStart={() => void start(model)}
             onStop={() => void stop()}
-            {...projectorActions(model)}
+            {...cardProjectorActions(model)}
           />
         ))
       )}
@@ -201,7 +222,7 @@ export function ModelManager() {
               onDelete={() => void handleDelete(model)}
               onStart={() => void start(model)}
               onStop={() => void stop()}
-              {...projectorActions(model)}
+              {...cardProjectorActions(model)}
             />
           ))}
         </>

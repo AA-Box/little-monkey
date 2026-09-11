@@ -116,19 +116,23 @@ export function scoreLocalModel(
 ): TrustScorecard {
   const quality = usageEvidence(model.name, usage);
 
+  // A local model is not necessarily a llama.cpp one any more: a folder the
+  // user picks can be MLX safetensors, served by the MLX runtime instead.
+  const runtime = model.runtime === "mlx" ? "the MLX runtime" : "llama-server";
+
   const cost = dim("good", [
-    { field: "ModelInfo.path", fact: "Runs locally via llama-server; no per-token API cost." },
+    { field: "ModelInfo.path", fact: `Runs locally via ${runtime}; no per-token API cost.` },
   ]);
 
   const privacy = dim("good", [
-    { field: "ModelInfo (local kind)", fact: "Local llama.cpp inference — prompts and responses never leave this device." },
+    { field: "ModelInfo (local kind)", fact: `Local inference via ${runtime} — prompts and responses never leave this device.` },
   ]);
 
   const security = dim("good", [
     {
       field: "ModelInfo.is_external",
       fact: model.is_external
-        ? "Registered via models_add_external from a user-chosen local .gguf file; the app never owns or auto-updates it."
+        ? "Registered via models_add_external / models_add_external_folder from a user-chosen local file or folder; the app never owns or auto-updates it."
         : "Downloaded through the app's own models_download command from its curated catalog.",
     },
   ]);
@@ -146,7 +150,7 @@ export function scoreLocalModel(
     {
       field: "ModelInfo.is_external",
       fact: model.is_external
-        ? "Added by the user as an external local model file (models_add_external)."
+        ? "Added by the user as an external local model file or folder (models_add_external / models_add_external_folder)."
         : "Listed in the app's built-in curated model catalog (models_list_curated).",
     },
   ]);
