@@ -6,6 +6,7 @@ import {
   type AudioEndpointDescriptor,
   type VoiceRouteEngine,
   type VoiceRouteRecord,
+  voiceRouteDeactivate,
   voiceRouteEndpoints,
   voiceRouteGet,
   voiceRouteMove,
@@ -132,14 +133,22 @@ export function VoiceRouteSelector({
       }
       setEndpoints(merged.filter(Boolean));
       setFallback(defaultRoute(config.voice));
-      setRoute(saved?.state === 'active' ? saved : null);
-      if (saved?.state === 'active') onRoute?.(saved);
+      let matching = saved?.state === 'active' && saved.engine === engine ? saved : null;
+      // Switching Talk engines is also a capture-boundary change. Retire an
+      // active route from the other engine before exposing this engine's route.
+      if (saved?.state === 'active' && saved.engine !== engine
+          && (saved.input_command_id || saved.output_command_id)) {
+        await voiceRouteDeactivate(sessionId);
+        matching = null;
+      }
+      setRoute(matching);
+      if (matching) onRoute?.(matching);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
       setBusy(false);
     }
-  }, [onRoute, sessionId]);
+  }, [engine, onRoute, sessionId]);
 
   useEffect(() => {
     void refresh();

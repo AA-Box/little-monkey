@@ -20,9 +20,10 @@
 // thing this client deletes a recording on. Both sides are pinned to v3 — see
 // the Rust constant's own note for why additive wire changes still require an explicit reload boundary.
 // v6 adds bounded streamed output metadata (response/chunk/route generation).
-// v7 adds direct mono 48 kHz PCM16 media for paired Realtime WebRTC routing.
-export const TALK_PROTOCOL_VERSION = 7;
-export const REALTIME_PCM_MEDIA_TYPE = "audio/pcm16;rate=48000";
+// v7 added direct Realtime PCM, v8 corrected it to provider-native 24 kHz,
+// and v9 adds the causal input gate used by remote manual push-to-talk.
+export const TALK_PROTOCOL_VERSION = 9;
+export const REALTIME_PCM_MEDIA_TYPE = "audio/pcm16;rate=24000";
 
 /// Exactly `TALK_MEDIA_TYPES` in `protocol.rs`. A container that is not on this
 /// list is refused outright, so guessing one is the same as dropping the
@@ -148,7 +149,7 @@ export function float32ToRealtimePcmBase64(samples, sourceSampleRate) {
   const source = samples instanceof Float32Array ? samples : new Float32Array(samples || []);
   const sourceRate = Number(sourceSampleRate);
   if (!source.length || !Number.isFinite(sourceRate) || sourceRate < 8_000 || sourceRate > 192_000) return "";
-  const targetRate = 48_000;
+  const targetRate = 24_000;
   const outputLength = Math.max(1, Math.round(source.length * targetRate / sourceRate));
   const bytes = new Uint8Array(outputLength * 2);
   const view = new DataView(bytes.buffer);
@@ -347,6 +348,13 @@ export function createTalkFrames({ sessionId, sessionGeneration, mediaType, samp
         throw new Error("A Talk playback acknowledgement needs a positive audio sequence");
       }
       return envelope({ type: "playback_ack", audio_sequence: audioSequence, played: Boolean(played) });
+    },
+    inputGateAck(gateSequence, open) {
+      requireGreeted("input gate acknowledgement");
+      if (!Number.isInteger(gateSequence) || gateSequence < 1) {
+        throw new Error("A Talk input gate acknowledgement needs a positive gate sequence");
+      }
+      return envelope({ type: "input_gate_ack", gate_sequence: gateSequence, open: Boolean(open) });
     },
     /**
      * Durations, and nothing else. No transcript, no audio, no text of any kind

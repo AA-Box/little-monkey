@@ -2884,6 +2884,8 @@ const talk = {
   routeGeneration: null,
   routeRole: null,
   routeEngine: null,
+  /** Host-controlled capture gate for Realtime manual push-to-talk. */
+  realtimeInputEnabled: true,
   pcmCaptureSource: null,
   pcmCaptureProcessor: null,
   pcmCaptureMute: null,
@@ -3012,7 +3014,7 @@ function talkQueueRealtimePcm(audioBase64, audioSequence) {
       if (generation !== talk.playbackGeneration) throw new Error("Playback was interrupted");
       const samples = realtimePcmBase64ToFloat32(audioBase64);
       if (!samples.length) throw new Error("Realtime PCM frame was empty or malformed");
-      const buffer = context.createBuffer(1, samples.length, 48_000);
+      const buffer = context.createBuffer(1, samples.length, 24_000);
       buffer.copyToChannel(samples, 0);
       const source = context.createBufferSource();
       source.buffer = buffer;
@@ -3093,6 +3095,12 @@ function talkHandleFrame(raw) {
   }
   if (frame.session_generation !== talk.sessionGeneration) return;
   switch (frame.type) {
+    case "input_gate": {
+      if (!Number.isInteger(frame.gate_sequence) || frame.gate_sequence < 1) break;
+      talk.realtimeInputEnabled = frame.open === true;
+      if (talk.frames) talkSendFrame(talk.frames.inputGateAck(frame.gate_sequence, talk.realtimeInputEnabled));
+      break;
+    }
     case "ready":
       setTalkState("Listening", "listening");
       break;
@@ -3210,7 +3218,7 @@ async function prepareRealtimeTalkCapture() {
   return {
     context,
     mediaType: REALTIME_PCM_MEDIA_TYPE,
-    sampleRateHz: 48_000,
+    sampleRateHz: 24_000,
     channels: 1,
   };
 }
@@ -3226,7 +3234,7 @@ function talkStartRealtimeCapture(context) {
   const mute = context.createGain();
   mute.gain.value = 0;
   processor.onaudioprocess = (event) => {
-    if (!talk.running || !talk.frames || talk.routeEngine !== "realtime") return;
+    if (!talk.running || !talk.frames || talk.routeEngine !== "realtime" || !talk.realtimeInputEnabled) return;
     const samples = event.inputBuffer.getChannelData(0);
     const audioBase64 = float32ToRealtimePcmBase64(samples, event.inputBuffer.sampleRate || context.sampleRate);
     if (!audioBase64) return;
@@ -3299,6 +3307,7 @@ async function runTalkRoute(argumentsValue, signal) {
     });
     talk.routeRole = role;
     talk.routeEngine = engine;
+    talk.realtimeInputEnabled = true;
     if (engine === "realtime") talkStartRealtimeCapture(capture.context);
     else talkStartCapture(capture.context);
     setTalkState("Listening — controlled by this computer", "listening");
@@ -3330,7 +3339,7 @@ async function runTalkRouteOutput(argumentsValue, signal) {
     await talkConnect({
       sessionId,
       mediaType: engine === "realtime" ? REALTIME_PCM_MEDIA_TYPE : "audio/webm",
-      sampleRateHz: 48_000,
+      sampleRateHz: engine === "realtime" ? 24_000 : 48_000,
       channels: 1,
       routeId,
       routeGeneration: generation,
@@ -3338,6 +3347,7 @@ async function runTalkRouteOutput(argumentsValue, signal) {
     });
     talk.routeRole = "output";
     talk.routeEngine = engine;
+    talk.realtimeInputEnabled = true;
     if (engine === "realtime") await playbackAudioContext();
     setTalkState("Speaker — controlled by this computer", "speaking");
     while (talk.running && !aborted(signal)) await delayUntilAborted(250, signal);
@@ -3814,6 +3824,7 @@ async function stopTalk(reason) {
   talk.routeGeneration = null;
   talk.routeRole = null;
   talk.routeEngine = null;
+  talk.realtimeInputEnabled = true;
   setTalkState(reason || "Not connected", "idle");
   if (reason) showTalkError(reason);
   // Last, and always: the buttons that offer a retry only exist while nothing

@@ -117,6 +117,12 @@ class FakeSession implements RealtimeVoiceSession {
     this.interrupts += 1;
   }
 
+  async setInputRoute(_external: boolean, _deviceId: string | null): Promise<void> {}
+
+  appendInputPcm16(_audioBase64: string): void {}
+
+  async setOutputRoute(_external: boolean, _deviceId: string | null): Promise<void> {}
+
   async startManualTurn(): Promise<void> {}
 
   async finishManualTurn(): Promise<void> {}

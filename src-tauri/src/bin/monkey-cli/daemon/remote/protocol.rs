@@ -43,7 +43,7 @@ pub const MAX_REMOTE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 /// would offer to re-send *every* turn — including ones already answered. That
 /// is exactly the "tell somebody to repeat what is already running" failure the
 /// journal exists to prevent, so the two sides are pinned to each other.
-pub const TALK_PROTOCOL_VERSION: u32 = 7;
+pub const TALK_PROTOCOL_VERSION: u32 = 9;
 
 /// The version whose only difference from [`TALK_PROTOCOL_VERSION`] is the
 /// missing utterance id — so a client speaking it can be told precisely what is
@@ -64,6 +64,12 @@ const TALK_PROTOCOL_VERSION_WITHOUT_BOUNDED_OUTPUT_STREAM: u32 = 5;
 /// Version 6 has bounded routed output, but no raw PCM media type for the direct
 /// paired-device Realtime WebRTC bridge.
 const TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_PCM: u32 = 6;
+/// Version 7 carried direct Realtime PCM at 48 kHz, while the provider input
+/// buffer accepts canonical PCM16 at 24 kHz.
+const TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_PCM_24K: u32 = 7;
+/// Version 8 corrected PCM but had no causal input gate/barrier for remote
+/// manual push-to-talk, so a network-tail chunk could land after commit.
+const TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_INPUT_GATE: u32 = 8;
 pub const MAX_TALK_AUDIO_BYTES: usize = MAX_VOICE_CHUNK_BYTES;
 pub const MAX_TALK_AUDIO_BASE64_BYTES: usize = MAX_TALK_AUDIO_BYTES.div_ceil(3) * 4;
 pub const MAX_TALK_FRAME_BYTES: usize = MAX_TALK_AUDIO_BASE64_BYTES + 16 * 1024;
@@ -1811,6 +1817,13 @@ pub enum TalkClientFrameKind {
         audio_sequence: u64,
         played: bool,
     },
+    /// Acknowledges a host input gate only after all earlier microphone PCM
+    /// frames on this same WebSocket have been sent. This is the causal barrier
+    /// manual push-to-talk needs before the provider input buffer is committed.
+    InputGateAck {
+        gate_sequence: u64,
+        open: bool,
+    },
     /// What the device's half of one utterance cost, in milliseconds.
     ///
     /// The runner can time everything from transcription onwards itself, but
@@ -1893,6 +1906,11 @@ impl TalkClientFrame {
             TalkClientFrameKind::PlaybackAck { audio_sequence, .. } => {
                 validate_talk_audio_sequence(*audio_sequence)?;
             }
+            TalkClientFrameKind::InputGateAck { gate_sequence, .. } => {
+                if *gate_sequence == 0 {
+                    return Err("Talk input gate sequence must be positive".to_string());
+                }
+            }
             TalkClientFrameKind::Metrics {
                 audio_sequence,
                 speech_detection_ms,
@@ -1942,6 +1960,11 @@ pub enum TalkServerFrameKind {
     Ready,
     State {
         state: TalkState,
+    },
+    /// Causal microphone gate for paired Realtime manual push-to-talk.
+    InputGate {
+        gate_sequence: u64,
+        open: bool,
     },
     /// One utterance now exists as a durable turn, and the device may delete
     /// the recording it has been holding.
@@ -2009,6 +2032,11 @@ impl TalkServerFrame {
         )?;
         match &self.kind {
             TalkServerFrameKind::Ready | TalkServerFrameKind::State { .. } => {}
+            TalkServerFrameKind::InputGate { gate_sequence, .. } => {
+                if *gate_sequence == 0 {
+                    return Err("Talk input gate sequence must be positive".to_string());
+                }
+            }
             TalkServerFrameKind::TurnAccepted {
                 utterance_id,
                 run_id,
@@ -2121,6 +2149,8 @@ fn validate_talk_protocol_version(protocol_version: u32) -> Result<(), String> {
             | TALK_PROTOCOL_VERSION_WITHOUT_ROUTE_ROLE
             | TALK_PROTOCOL_VERSION_WITHOUT_BOUNDED_OUTPUT_STREAM
             | TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_PCM
+            | TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_PCM_24K
+            | TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_INPUT_GATE
     ) {
         return Err(
             "This Talk client is from an older version of the app; reload the page to continue"

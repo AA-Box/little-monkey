@@ -550,7 +550,9 @@ pub async fn run_talk_session(
                 session.greeted = true;
                 session.utterance_media_type = Some(media_type);
             }
-            TalkClientFrameKind::State { .. } | TalkClientFrameKind::PlaybackAck { .. } => {}
+            TalkClientFrameKind::State { .. }
+            | TalkClientFrameKind::PlaybackAck { .. }
+            | TalkClientFrameKind::InputGateAck { .. } => {}
             TalkClientFrameKind::Metrics {
                 audio_sequence,
                 speech_detection_ms,

@@ -199,6 +199,9 @@ function scriptedProvider(script: ScriptOptions = {}) {
           emit({ type: 'connected' });
           if (!script.noRemoteTrack) emit({ type: 'remote_audio_track' });
         },
+        async setInputRoute(_external: boolean, _deviceId: string | null) {},
+        appendInputPcm16(_audioBase64: string) {},
+        async setOutputRoute(_external: boolean, _deviceId: string | null) {},
         async startManualTurn() {
           state = 'listening';
           emit({ type: 'listening' });

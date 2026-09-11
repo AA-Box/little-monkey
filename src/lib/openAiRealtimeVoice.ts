@@ -5,6 +5,7 @@ import type {
   RealtimeVoiceCapabilities,
   RealtimeVoiceEvent,
   RealtimeVoiceProvider,
+  RealtimePcmConsumer,
   RealtimeVoiceSession,
   RealtimeVoiceSessionConfig,
   RealtimeVoiceState,
@@ -22,6 +23,7 @@ interface PeerLike {
   connectionState: RTCPeerConnectionState;
   iceConnectionState?: RTCIceConnectionState;
   addTrack(track: MediaStreamTrack, ...streams: MediaStream[]): RTCRtpSender;
+  addTransceiver(kind: 'audio', init?: RTCRtpTransceiverInit): RTCRtpTransceiver;
   createDataChannel(label: string): RTCDataChannel;
   createOffer(): Promise<RTCSessionDescriptionInit>;
   setLocalDescription(description: RTCSessionDescriptionInit): Promise<void>;
@@ -36,6 +38,7 @@ export interface OpenAiRealtimeEnvironment {
   createPeer(): PeerLike;
   getUserMedia(constraints: MediaStreamConstraints): Promise<MediaStream>;
   createAudio(): HTMLAudioElement;
+  createAudioContext(): AudioContext;
   connectBroker: typeof realtimeVoiceClient.connect;
   disconnectBroker: typeof realtimeVoiceClient.disconnect;
   /** How often played-out audio is sampled once the remote track arrives.
@@ -66,6 +69,7 @@ function defaultEnvironment(): OpenAiRealtimeEnvironment {
     createPeer: () => new RTCPeerConnection(),
     getUserMedia: (constraints) => navigator.mediaDevices.getUserMedia(constraints),
     createAudio: () => new Audio(),
+    createAudioContext: () => new AudioContext(),
     connectBroker: realtimeVoiceClient.connect,
     disconnectBroker: realtimeVoiceClient.disconnect,
   };
@@ -166,8 +170,18 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
   state: RealtimeVoiceState = 'idle';
   private peer: PeerLike | null = null;
   private channel: DataChannelLike | null = null;
+  private sender: RTCRtpSender | null = null;
   private stream: MediaStream | null = null;
   private audio: HTMLAudioElement | null = null;
+  private remoteStream: MediaStream | null = null;
+  private externalInput = false;
+  private externalOutput = false;
+  private outputDeviceId: string | null = null;
+  private outputConsumer: RealtimePcmConsumer | null = null;
+  private outputContext: AudioContext | null = null;
+  private outputSource: MediaStreamAudioSourceNode | null = null;
+  private outputProcessor: ScriptProcessorNode | null = null;
+  private outputMute: GainNode | null = null;
   private receiver: AudioReceiverLike | null = null;
   private audioProbe: ReturnType<typeof setInterval> | null = null;
   private lastProgress: RealtimeAudioProgress | null = null;
@@ -185,7 +199,11 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
     private readonly config: RealtimeVoiceSessionConfig,
     private readonly onEvent: (event: RealtimeVoiceEvent) => void,
     private readonly environment: OpenAiRealtimeEnvironment,
-  ) {}
+  ) {
+    this.externalInput = config.externalInput === true;
+    this.externalOutput = config.externalOutput === true;
+    this.outputDeviceId = config.outputDeviceId;
+  }
 
   private emit(event: RealtimeVoiceEvent): void {
     this.onEvent(event);
@@ -212,7 +230,9 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
         this.responseActive = true;
         this.outputStarted = false;
         this.audioConfirmed = false;
-        void this.audio?.play().then(() => { this.playbackStarted = true; }).catch(() => undefined);
+        if (!this.externalOutput) {
+          void this.audio?.play().then(() => { this.playbackStarted = true; }).catch(() => undefined);
+        }
       }
       if (data.type === 'response.done') {
         this.responseActive = false;
@@ -274,38 +294,26 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
     if (this.state !== 'idle') throw new Error('Realtime session has already started.');
     this.state = 'connecting';
     try {
-      const audioConstraints: MediaTrackConstraints = {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      };
-      if (this.config.inputDeviceId) audioConstraints.deviceId = { exact: this.config.inputDeviceId };
-      this.stream = await this.environment.getUserMedia({ audio: audioConstraints, video: false });
-      for (const track of this.stream.getAudioTracks()) {
-        if (this.config.turnDetection === 'manual') track.enabled = false;
-        track.addEventListener('ended', this.onTrackEnded, { once: true });
-      }
       this.peer = this.environment.createPeer();
       this.peer.addEventListener('connectionstatechange', this.onConnectionState);
       this.peer.addEventListener('iceconnectionstatechange', this.onConnectionState);
-      this.stream.getTracks().forEach((track) => this.peer!.addTrack(track, this.stream!));
+      this.sender = this.peer.addTransceiver('audio', { direction: 'sendrecv' }).sender;
+      if (!this.externalInput) await this.openLocalInput(this.config.inputDeviceId);
       this.audio = this.environment.createAudio();
       this.audio.autoplay = true;
       this.audio.addEventListener('playing', this.onAudioPlaying);
       this.audio.addEventListener('waiting', this.onAudioWaiting);
       this.audio.addEventListener('stalled', this.onAudioWaiting);
       this.peer.ontrack = (event) => {
-        if (!this.audio) return;
-        this.audio.srcObject = event.streams[0] ?? new MediaStream([event.track]);
-        const routed = this.audio as HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> };
-        if (this.config.outputDeviceId && routed.setSinkId) {
-          void routed.setSinkId(this.config.outputDeviceId).catch(() => undefined);
-        }
-        void this.audio.play().then(() => { this.playbackStarted = true; }).catch(() => undefined);
-        // This is the only path model audio takes over WebRTC, so its arrival
-        // is reported on its own and playback is measured from here on.
+        this.remoteStream = event.streams[0] ?? new MediaStream([event.track]);
         const receiver = (event as RTCTrackEvent & { receiver?: AudioReceiverLike }).receiver ?? null;
         if (receiver) this.receiver = receiver;
+        void this.applyOutputRoute(this.outputDeviceId).catch((reason) => {
+          this.emit({
+            type: 'error', eventId: `local:output-route:${crypto.randomUUID()}`,
+            code: 'output_route_failed', message: reason instanceof Error ? reason.message : String(reason),
+          });
+        });
         this.emit({ type: 'remote_audio_track', eventId: `local:remote-track:${this.config.sessionId}` });
         this.startAudioProbe();
       };
@@ -340,6 +348,109 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
       await this.close();
       throw error;
     }
+  }
+
+  private async openLocalInput(deviceId: string | null): Promise<void> {
+    const audioConstraints: MediaTrackConstraints = {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    };
+    if (deviceId) audioConstraints.deviceId = { exact: deviceId };
+    const next = await this.environment.getUserMedia({ audio: audioConstraints, video: false });
+    const track = next.getAudioTracks()[0];
+    if (!track) {
+      next.getTracks().forEach((candidate) => candidate.stop());
+      throw new Error('Selected microphone did not provide an audio track.');
+    }
+    if (this.config.turnDetection === 'manual') track.enabled = false;
+    track.addEventListener('ended', this.onTrackEnded, { once: true });
+    const previous = this.stream;
+    this.stream = next;
+    await this.sender?.replaceTrack(track);
+    previous?.getTracks().forEach((candidate) => {
+      candidate.removeEventListener('ended', this.onTrackEnded);
+      candidate.stop();
+    });
+  }
+
+  async setInputRoute(external: boolean, deviceId: string | null): Promise<void> {
+    this.externalInput = external;
+    if (external) {
+      const previous = this.stream;
+      this.stream = null;
+      await this.sender?.replaceTrack(null);
+      previous?.getTracks().forEach((track) => {
+        track.removeEventListener('ended', this.onTrackEnded);
+        track.stop();
+      });
+      return;
+    }
+    await this.openLocalInput(deviceId);
+  }
+
+  appendInputPcm16(audioBase64: string): void {
+    if (!this.externalInput || !audioBase64) return;
+    this.send({ type: 'input_audio_buffer.append', audio: audioBase64 });
+  }
+
+  async setOutputRoute(
+    external: boolean,
+    deviceId: string | null,
+    consumer: RealtimePcmConsumer | null = null,
+  ): Promise<void> {
+    this.externalOutput = external;
+    this.outputDeviceId = deviceId;
+    this.outputConsumer = consumer;
+    await this.applyOutputRoute(deviceId);
+  }
+
+  private teardownOutputCapture(): void {
+    if (this.outputProcessor) this.outputProcessor.onaudioprocess = null;
+    this.outputProcessor?.disconnect();
+    this.outputSource?.disconnect();
+    this.outputMute?.disconnect();
+    this.outputProcessor = null;
+    this.outputSource = null;
+    this.outputMute = null;
+    const context = this.outputContext;
+    this.outputContext = null;
+    if (context && context.state !== 'closed') void context.close().catch(() => undefined);
+  }
+
+  private async applyOutputRoute(deviceId: string | null): Promise<void> {
+    const stream = this.remoteStream;
+    const audio = this.audio;
+    if (!stream || !audio) return;
+    this.teardownOutputCapture();
+    if (this.externalOutput) {
+      audio.pause();
+      audio.srcObject = null;
+      const context = this.environment.createAudioContext();
+      const source = context.createMediaStreamSource(stream);
+      const processor = context.createScriptProcessor(4096, 1, 1);
+      const mute = context.createGain();
+      mute.gain.value = 0;
+      processor.onaudioprocess = (event) => {
+        const consumer = this.outputConsumer;
+        if (!consumer) return;
+        const samples = event.inputBuffer.getChannelData(0);
+        consumer(new Float32Array(samples), event.inputBuffer.sampleRate || context.sampleRate);
+      };
+      source.connect(processor);
+      processor.connect(mute);
+      mute.connect(context.destination);
+      this.outputContext = context;
+      this.outputSource = source;
+      this.outputProcessor = processor;
+      this.outputMute = mute;
+      if (context.state === 'suspended') await context.resume();
+      return;
+    }
+    audio.srcObject = stream;
+    const routed = audio as HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> };
+    if (deviceId && routed.setSinkId) await routed.setSinkId(deviceId).catch(() => undefined);
+    await audio.play().then(() => { this.playbackStarted = true; }).catch(() => undefined);
   }
 
   /** Reads inbound audio statistics and the element's playback position. Null
@@ -522,6 +633,9 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
       this.audioProbe = null;
     }
     this.channel?.removeEventListener('message', this.onMessage);
+    await this.sender?.replaceTrack(null).catch(() => undefined);
+    this.sender = null;
+    this.teardownOutputCapture();
     this.channel?.close();
     if (this.peer) {
       this.peer.removeEventListener('connectionstatechange', this.onConnectionState);
@@ -543,6 +657,8 @@ class OpenAiRealtimeSession implements RealtimeVoiceSession {
     this.peer = null;
     this.channel = null;
     this.stream = null;
+    this.remoteStream = null;
+    this.outputConsumer = null;
     this.audio = null;
     this.receiver = null;
     this.lastProgress = null;

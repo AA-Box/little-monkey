@@ -10,7 +10,7 @@
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use hyper_util::rt::TokioIo;
 use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocketConfig};
 use tokio_tungstenite::WebSocketStream;
@@ -209,7 +209,9 @@ async fn output_wait_for_ack(
                         return Ok(played);
                     }
                     TalkClientFrameKind::Interrupt { .. } => return Ok(false),
-                    TalkClientFrameKind::State { .. } | TalkClientFrameKind::PlaybackAck { .. } => {}
+                    TalkClientFrameKind::State { .. }
+                    | TalkClientFrameKind::PlaybackAck { .. }
+                    | TalkClientFrameKind::InputGateAck { .. } => {}
                     _ => return Err("An output-only Talk socket received a microphone frame".to_string()),
                 }
             }
@@ -230,6 +232,8 @@ async fn run_realtime_route_session(
     let mut outbound_audio_sequence = 0u64;
     let mut inbound = TalkSequenceTracker::default();
     let mut pending_output_acks = HashSet::<u64>::new();
+    let mut pending_input_gates = HashMap::<u64, bool>::new();
+    let mut route_cursor = authorization.route_event_cursor;
     let generation = match authorization.route_generation {
         Some(value) => value,
         None => {
@@ -256,7 +260,7 @@ async fn run_realtime_route_session(
         Ok(TalkClientFrame {
             kind: TalkClientFrameKind::Hello {
                 ref media_type,
-                sample_rate_hz: 48_000,
+                sample_rate_hz: 24_000,
                 channels: 1,
             },
             ..
@@ -270,7 +274,7 @@ async fn run_realtime_route_session(
             &mut outbound_sequence,
             TalkServerFrameKind::Error {
                 code: "realtime_pcm_required".into(),
-                message: "Paired Realtime Talk requires mono 48 kHz PCM16 audio.".into(),
+                message: "Paired Realtime Talk requires mono 24 kHz PCM16 audio.".into(),
                 retryable: false,
             },
         )
@@ -315,6 +319,42 @@ async fn run_realtime_route_session(
             report.grant_revoked = true;
             break;
         }
+
+        for event in api.talk_route_events(&authorization.session_id, route_cursor).unwrap_or_default() {
+            route_cursor = route_cursor.max(event.event_id);
+            if event.generation != generation { continue; }
+            match event.kind.as_str() {
+                "output_stop" if output_role => {
+                    let _ = api.clear_realtime_output_from_host(&authorization.session_id, generation);
+                    pending_output_acks.clear();
+                    let _ = send_output_frame(
+                        socket,
+                        authorization,
+                        &mut outbound_sequence,
+                        TalkServerFrameKind::State { state: TalkState::Interrupted },
+                    ).await;
+                }
+                "input_gate" if input_role => {
+                    let Some(open) = event.payload.get("open").and_then(serde_json::Value::as_bool) else { continue; };
+                    if pending_input_gates.len() >= 8 {
+                        report.errors = report.errors.saturating_add(1);
+                        break;
+                    }
+                    if send_output_frame(
+                        socket,
+                        authorization,
+                        &mut outbound_sequence,
+                        TalkServerFrameKind::InputGate { gate_sequence: event.event_id, open },
+                    ).await.is_err() {
+                        report.stream_dropped = true;
+                        break;
+                    }
+                    pending_input_gates.insert(event.event_id, open);
+                }
+                _ => {}
+            }
+        }
+        if report.stream_dropped || report.errors > 0 { break; }
 
         if output_role {
             while pending_output_acks.len() < MAX_IN_FLIGHT_OUTPUT {
@@ -422,18 +462,30 @@ async fn run_realtime_route_session(
                         }
                     }
                     TalkClientFrameKind::PlaybackAck { audio_sequence, played } if output_role => {
-                        if pending_output_acks.remove(&audio_sequence) && !played {
-                            report.errors = report.errors.saturating_add(1);
+                        if pending_output_acks.remove(&audio_sequence) {
+                            let (kind, payload) = if played {
+                                ("output_played", serde_json::json!({ "audio_sequence": audio_sequence }))
+                            } else {
+                                report.errors = report.errors.saturating_add(1);
+                                ("output_failed", serde_json::json!({
+                                    "audio_sequence": audio_sequence,
+                                    "error": "paired Realtime speaker could not play PCM",
+                                }))
+                            };
+                            let _ = api.append_talk_route_event(
+                                &authorization.session_id, generation, kind, &payload,
+                            );
+                            if !played { break; }
+                        }
+                    }
+                    TalkClientFrameKind::InputGateAck { gate_sequence, open } if input_role => {
+                        if pending_input_gates.remove(&gate_sequence).is_some_and(|expected| expected == open) {
                             let _ = api.append_talk_route_event(
                                 &authorization.session_id,
                                 generation,
-                                "output_failed",
-                                &serde_json::json!({
-                                    "audio_sequence": audio_sequence,
-                                    "error": "paired Realtime speaker could not play PCM",
-                                }),
+                                "input_gate_ack",
+                                &serde_json::json!({ "gate_sequence": gate_sequence, "open": open }),
                             );
-                            break;
                         }
                     }
                     TalkClientFrameKind::Interrupt { reason } => {
@@ -456,7 +508,8 @@ async fn run_realtime_route_session(
                     }
                     TalkClientFrameKind::State { .. }
                     | TalkClientFrameKind::Metrics { .. }
-                    | TalkClientFrameKind::PlaybackAck { .. } => {}
+                    | TalkClientFrameKind::PlaybackAck { .. }
+                    | TalkClientFrameKind::InputGateAck { .. } => {}
                     _ => {
                         report.errors = report.errors.saturating_add(1);
                         break;
@@ -548,7 +601,7 @@ async fn run_output_route_session(
             match tokio::time::timeout(std::time::Duration::from_millis(120), socket.recv()).await {
                 Ok(Some(raw)) => {
                     match parse_output_client_frame(&raw, authorization, &mut inbound) {
-                        Ok(TalkClientFrame { kind: TalkClientFrameKind::State { .. } | TalkClientFrameKind::PlaybackAck { .. }, .. }) => {}
+                        Ok(TalkClientFrame { kind: TalkClientFrameKind::State { .. } | TalkClientFrameKind::PlaybackAck { .. } | TalkClientFrameKind::InputGateAck { .. }, .. }) => {}
                         Ok(TalkClientFrame { kind: TalkClientFrameKind::Interrupt { .. }, .. }) => {
                             let _ = send_output_frame(socket, authorization, &mut outbound_sequence, TalkServerFrameKind::State { state: TalkState::Interrupted }).await;
                         }

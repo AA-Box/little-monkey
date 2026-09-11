@@ -36,7 +36,9 @@ class FakePeer {
   // peer-failure paths are only reachable by firing the listener the session
   // registered, and a fake that drops it silently reports coverage it lacks.
   listeners = new Map<string, Set<EventListener>>();
-  addTrack() { return {} as RTCRtpSender; }
+  sender = { replaceTrack: vi.fn(async (_track: MediaStreamTrack | null) => undefined) } as unknown as RTCRtpSender;
+  addTrack() { return this.sender; }
+  addTransceiver() { return { sender: this.sender } as RTCRtpTransceiver; }
   createDataChannel() { return this.channel as unknown as RTCDataChannel; }
   async createOffer() { return { type: 'offer' as RTCSdpType, sdp: 'v=0\r\n' }; }
   async setLocalDescription() {}
@@ -113,6 +115,7 @@ function harness(
     createPeer: () => peer as never,
     getUserMedia: vi.fn(async () => stream),
     createAudio: () => audio,
+    createAudioContext: () => ({}) as AudioContext,
     connectBroker,
     disconnectBroker,
     ...(probeMs === undefined ? {} : { audioProbeIntervalMs: probeMs }),

@@ -25,8 +25,8 @@ use crate::daemon::store::{restrict_file, DaemonPaths};
 use super::api::{RemoteApi, TalkSocketAuthorization};
 use super::protocol::validate_id;
 
-pub const REALTIME_PCM_MEDIA_TYPE: &str = "audio/pcm16;rate=48000";
-pub const REALTIME_PCM_SAMPLE_RATE_HZ: u32 = 48_000;
+pub const REALTIME_PCM_MEDIA_TYPE: &str = "audio/pcm16;rate=24000";
+pub const REALTIME_PCM_SAMPLE_RATE_HZ: u32 = 24_000;
 pub const REALTIME_PCM_CHANNELS: u8 = 1;
 pub const MAX_REALTIME_PCM_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_REALTIME_PCM_QUEUE_BYTES: usize = 1024 * 1024;
@@ -166,6 +166,20 @@ impl RealtimeMediaBridge {
         Ok(queue.output.pop())
     }
 
+    pub(crate) fn clear_output(&self, session_id: &str, generation: u64) -> Result<(), String> {
+        let mut routes = self
+            .routes
+            .lock()
+            .map_err(|_| "Realtime media bridge lock was poisoned".to_string())?;
+        let Some(queue) = routes.get_mut(&(session_id.to_string(), generation)) else {
+            return Ok(());
+        };
+        queue.output.chunks.clear();
+        queue.output.bytes = 0;
+        queue.last_touched = monotonic_tick();
+        Ok(())
+    }
+
     pub(crate) fn discard(&self, session_id: &str, generation: u64) {
         if let Ok(mut routes) = self.routes.lock() {
             routes.remove(&(session_id.to_string(), generation));
@@ -286,6 +300,12 @@ async fn handle_host_media(
     expected_token: String,
     request: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    // Browser WebViews reach this loopback socket cross-origin. Preflight is
+    // intentionally unauthenticated; every media request still needs the
+    // process-local 256-bit token, and the listener itself is loopback-only.
+    if request.method() == Method::OPTIONS {
+        return Ok(host_response(StatusCode::NO_CONTENT, Bytes::new()));
+    }
     let supplied = request
         .headers()
         .get(HOST_MEDIA_TOKEN_HEADER)
@@ -324,6 +344,10 @@ async fn handle_host_media(
                 Err(_) => host_response(StatusCode::CONFLICT, Bytes::new()),
             }
         }
+        (&Method::DELETE, "output") => match api.clear_realtime_output_from_host(&session_id, generation) {
+            Ok(()) => host_response(StatusCode::NO_CONTENT, Bytes::new()),
+            Err(_) => host_response(StatusCode::CONFLICT, Bytes::new()),
+        },
         _ => host_response(StatusCode::METHOD_NOT_ALLOWED, Bytes::new()),
     };
     Ok(result)
@@ -335,6 +359,13 @@ fn host_response(status: StatusCode, body: Bytes) -> Response<Full<Bytes>> {
         .header("cache-control", "no-store")
         .header("x-content-type-options", "nosniff")
         .header("content-type", "application/octet-stream")
+        .header("access-control-allow-origin", "*")
+        .header("access-control-allow-methods", "GET, POST, DELETE, OPTIONS")
+        .header(
+            "access-control-allow-headers",
+            "content-type, x-little-monkey-host-media-token",
+        )
+        .header("access-control-expose-headers", "x-little-monkey-audio-sequence")
         .body(Full::new(body))
         .expect("static host-media response is valid")
 }

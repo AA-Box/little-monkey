@@ -101,6 +101,12 @@ export interface RealtimeVoiceConnectResponse {
   providerRequestId: string | null;
 }
 
+export interface RealtimeVoiceMediaBridge {
+  protocolVersion: number;
+  baseUrl: string;
+  token: string;
+}
+
 export interface RealtimeVoiceStatus {
   providerId: 'openai';
   configured: boolean;
@@ -136,6 +142,7 @@ export const realtimeVoiceClient = {
   disconnect: (sessionId: string) =>
     invoke<void>('realtime_voice_disconnect', { sessionId }),
   status: () => invoke<RealtimeVoiceStatus>('realtime_voice_status'),
+  mediaBridge: () => invoke<RealtimeVoiceMediaBridge>('realtime_voice_media_bridge'),
   recordMetric: (metric: RealtimeVoiceMetric) =>
     invoke<void>('realtime_voice_metric_record', { metric }),
   metrics: () => invoke<RealtimeVoiceMetricsSnapshot>('realtime_voice_metrics'),

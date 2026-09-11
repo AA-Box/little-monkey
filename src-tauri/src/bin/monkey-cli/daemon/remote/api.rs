@@ -2751,6 +2751,18 @@ impl RemoteApi {
         self.realtime_media.push_output(session_id, generation, bytes)
     }
 
+    pub(crate) fn clear_realtime_output_from_host(
+        &self,
+        session_id: &str,
+        generation: u64,
+    ) -> Result<(), String> {
+        let route = self.realtime_host_route(session_id, generation)?;
+        if !route.output_endpoint.starts_with("paired:") {
+            return Err("Realtime VoiceRoute does not currently use a paired speaker".to_string());
+        }
+        self.realtime_media.clear_output(session_id, generation)
+    }
+
     pub(crate) fn take_realtime_output_for_device(
         &self,
         authorization: &TalkSocketAuthorization,

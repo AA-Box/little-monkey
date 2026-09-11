@@ -106,6 +106,22 @@ pub struct RealtimeVoiceStatus {
     pub endpoint: &'static str,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RealtimeHostMediaConfig {
+    protocol_version: u32,
+    listen: String,
+    token: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RealtimeVoiceMediaBridge {
+    pub protocol_version: u32,
+    pub base_url: String,
+    pub token: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RealtimeVoiceMetric {
@@ -329,6 +345,39 @@ pub fn realtime_voice_disconnect(
     validate_id("realtime session id", &session_id)?;
     lock(&state.active_sessions, "realtime sessions")?.remove(&session_id);
     Ok(())
+}
+
+#[tauri::command]
+pub fn realtime_voice_media_bridge(
+    state: tauri::State<'_, RealtimeVoiceState>,
+) -> Result<RealtimeVoiceMediaBridge, String> {
+    let root = state
+        .root
+        .as_ref()
+        .ok_or_else(|| "Realtime host-media bridge is unavailable".to_string())?;
+    let path = root.join("daemon").join("realtime-host-media.json");
+    let bytes = fs::read(&path)
+        .map_err(|_| "Realtime host-media bridge is not running".to_string())?;
+    let config: RealtimeHostMediaConfig = serde_json::from_slice(&bytes)
+        .map_err(|_| "Realtime host-media bridge configuration is invalid".to_string())?;
+    if config.protocol_version != 1 {
+        return Err("Unsupported Realtime host-media bridge protocol".to_string());
+    }
+    let address: std::net::SocketAddr = config
+        .listen
+        .parse()
+        .map_err(|_| "Realtime host-media bridge address is invalid".to_string())?;
+    if !address.ip().is_loopback() {
+        return Err("Realtime host-media bridge is not loopback-only".to_string());
+    }
+    if config.token.len() != 64 || !config.token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Realtime host-media bridge token is invalid".to_string());
+    }
+    Ok(RealtimeVoiceMediaBridge {
+        protocol_version: config.protocol_version,
+        base_url: format!("http://{address}"),
+        token: config.token,
+    })
 }
 
 #[tauri::command]

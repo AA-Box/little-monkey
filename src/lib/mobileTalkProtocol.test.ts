@@ -90,6 +90,17 @@ describe("the Talk frame builder", () => {
     });
   });
 
+  it("acknowledges a causal Realtime input gate on the same socket", () => {
+    const frames = newFrames();
+    frames.hello();
+    expect(frames.inputGateAck(23, false)).toEqual({
+      ...envelope(2),
+      type: "input_gate_ack",
+      gate_sequence: 23,
+      open: false,
+    });
+  });
+
   it("opens with a hello and numbers every later frame after it", () => {
     const frames = newFrames();
 
@@ -590,6 +601,7 @@ describe("the frames the runner will actually receive", () => {
       frames.audio({ audioBase64: "BQYHCA==", last: true }),
       frames.interrupt("barge_in"),
       frames.playbackAck(7, true),
+      frames.inputGateAck(23, false),
     ];
 
     const fixture = fileURLToPath(

@@ -2094,6 +2094,7 @@ pub fn run() {
             realtime_voice::realtime_voice_connect,
             realtime_voice::realtime_voice_disconnect,
             realtime_voice::realtime_voice_status,
+            realtime_voice::realtime_voice_media_bridge,
             realtime_voice::realtime_voice_metric_record,
             realtime_voice::realtime_voice_metrics,
             realtime_voice::realtime_voice_metrics_clear,
