@@ -716,16 +716,20 @@ async fn gather_runtime_snapshot(
     let ollama_status = crate::ollama::ollama_status().await?;
     runtime.ollama_reachable = ollama_status.reachable;
 
-    {
+    // The live port, not the default constant: the chat server falls back to a
+    // free port when something else already holds 8090, and probing the
+    // constant would report a perfectly healthy server as unreachable.
+    let chat_port = {
         let guard = state
             .llama
             .lock()
             .map_err(|_| "Llama state lock poisoned".to_string())?;
         runtime.llama.status = guard.status.clone();
         runtime.llama.model_path = guard.model_path.clone();
-    }
+        guard.port
+    };
     if runtime.llama.status == "ready" {
-        runtime.llama.health_reachable = Some(probe_health(crate::llama::CHAT_PORT).await);
+        runtime.llama.health_reachable = Some(probe_health(chat_port).await);
     }
 
     {
