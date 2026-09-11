@@ -296,6 +296,16 @@ field for audio in any of them. Wake-phrase and always-listening are off unless
 you turn them on, and Security Doctor reports both — and separately reports any
 path that would send audio off this machine.
 
+Where you speak and where you hear the answer are separate choices, and neither
+has to be the machine the conversation lives on: a conversation can take its
+microphone from a paired phone and play the answer on the desktop, or the other
+way round, or use two different paired devices. It stays one conversation — same
+thread, same model context, same permissions, same pairing identity — and the
+host decides which conversation a routed device is speaking into, never the
+device. Input needs `voice_stream`, output needs `audio_playback`, and a
+device that is only a speaker is never asked for a microphone. See
+[Voice Everywhere](voice-everywhere.md).
+
 On desktop, optional wake gating is a local AudioWorklet-to-native-KWS path:
 neither Whisper nor a durable turn starts before the event, and the live
 microphone is reused for the post-wake command. On a paired phone, Talk remains
