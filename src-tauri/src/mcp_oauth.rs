@@ -1993,44 +1993,70 @@ mod tests {
 
         // Probe the deterministic port before asserting that `bind_for` gets
         // it, because a host where it is unbindable is an environment this
-        // assertion cannot run in rather than a defect. Windows reserves large
-        // blocks *inside* the IANA dynamic range the port is derived from
-        // (`netsh int ipv4 show excludedportrange tcp`, typically claimed by
-        // Hyper-V/WinNAT), and against a reserved port the listener falling
-        // back to an ephemeral one is exactly the documented behaviour. Without
-        // this probe such a runner failed the assertion below and reported a
-        // bug that was not there — see this test's own git history for the
-        // `windows-latest` flake that passed on a rerun of the same commit.
-        let preferred_is_bindable = match TcpListener::bind(("127.0.0.1", preferred_port)).await {
-            // Release it immediately: `bind_for` has to be the call that takes
-            // the port, or the assertion proves nothing about it.
-            Ok(probe) => {
-                drop(probe);
-                true
+        // assertion cannot run in rather than a defect — and do it more than
+        // once, because a host where it is bindable can stop being one between
+        // the probe and the claim.
+        //
+        // `loopback_port_for` derives into 49152-65535, which is also where
+        // both hosts hand out ephemeral ports (macOS 49152-65535, Linux
+        // 32768-60999 by default) — so the window between the probe releasing
+        // the port and `bind_for` claiming it is a window in which any other
+        // bind in this suite, and this one binds a great many, can be given
+        // exactly that number. That is not the defect this asserts; it makes
+        // the precondition false. Retry instead of failing, and only give up
+        // once several attempts in a row have been outbid.
+        let mut preferred_is_bindable = false;
+        let mut listener = None;
+        for _ in 0..8 {
+            match TcpListener::bind(("127.0.0.1", preferred_port)).await {
+                // Release it immediately: `bind_for` has to be the call that
+                // takes the port, or the assertion proves nothing about it.
+                Ok(probe) => {
+                    drop(probe);
+                    preferred_is_bindable = true;
+                }
+                // Not a silent pass: name the port and the range to inspect, so
+                // a leg that ran fewer assertions says so in its log. Windows
+                // reserves large blocks *inside* the dynamic range (`netsh int
+                // ipv4 show excludedportrange tcp`, typically claimed by
+                // Hyper-V/WinNAT), and against a reserved port the listener
+                // falling back to an ephemeral one is exactly the documented
+                // behaviour — see this test's git history for the
+                // `windows-latest` flake that passed on a rerun of the same
+                // commit.
+                Err(error) => {
+                    eprintln!(
+                        "SKIPPED (the preferred-port assertion only): \
+                         127.0.0.1:{preferred_port} cannot be bound on this host ({error}) — it \
+                         is either already in use or inside a reserved port range; on Windows, \
+                         check `netsh int ipv4 show excludedportrange tcp`. The \
+                         ephemeral-fallback and RequirePreferred assertions below still run."
+                    );
+                    preferred_is_bindable = false;
+                }
             }
-            // Not a silent pass: name the port and the range to inspect, so a
-            // leg that ran fewer assertions says so in its log.
-            Err(error) => {
-                eprintln!(
-                    "SKIPPED (the preferred-port assertion only): 127.0.0.1:{preferred_port} \
-                     cannot be bound on this host ({error}) — it is either already in use or \
-                     inside a reserved port range; on Windows, check \
-                     `netsh int ipv4 show excludedportrange tcp`. The ephemeral-fallback and \
-                     RequirePreferred assertions below still run."
-                );
-                false
-            }
-        };
 
-        let listener = LoopbackListener::bind_for(
-            server_id,
-            base_url,
-            LoopbackPortPolicy::AllowEphemeralFallback,
-        )
-        .await
-        .unwrap();
+            let candidate = LoopbackListener::bind_for(
+                server_id,
+                base_url,
+                LoopbackPortPolicy::AllowEphemeralFallback,
+            )
+            .await
+            .unwrap();
+            let claimed_the_preferred_port = candidate.redirect_uri == expected;
+            listener = Some(candidate);
+            if !preferred_is_bindable || claimed_the_preferred_port {
+                break;
+            }
+        }
+
+        let listener = listener.expect("the loop binds at least once");
         if preferred_is_bindable {
-            assert_eq!(listener.redirect_uri, expected);
+            assert_eq!(
+                listener.redirect_uri, expected,
+                "bind_for never got the preferred port across 8 attempts, each of which found it \
+                 free moments earlier — that is a preference bug, not a race"
+            );
         }
 
         // CIMD/DCR learns the URI used for this attempt, so falling back is
