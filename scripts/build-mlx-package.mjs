@@ -42,7 +42,7 @@ const OUTPUT_ROOT = join(REPOSITORY_ROOT, "packaging/mlx/dist");
 const KEY_ID = "release-2026-1";
 const MLX_VERSION = "0.32.2";
 const MLX_LM_VERSION = "0.31.3";
-const MLX_VLM_VERSION = "0.6.17";
+const MLX_VLM_VERSION = "0.7.0";
 const MLX_VIDEO_COMMIT = "87db56a51758fefb748a359b90a5283bb8ba4837";
 /**
  * Audited Lily source revision. Do not use a branch/tag here: a managed
