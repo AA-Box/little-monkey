@@ -86,7 +86,16 @@ export async function* streamProviderChat(
 
   const unlistenChunk = await listen<ChatChunkEvent>('provider://chat-chunk', (event) => {
     if (event.payload.request_id !== requestId) return;
-    pushEvents(parser.feed(event.payload.chunk));
+    try {
+      pushEvents(parser.feed(event.payload.chunk));
+    } catch (err) {
+      // The parser throws on an SSE `error` frame (a stream that failed after
+      // the response already committed to 200). This is an event callback, not
+      // the generator body, so the throw has to be turned back into this
+      // stream's own terminal error instead of escaping as an uncaught
+      // exception the user never sees.
+      fail(errorMessage(err));
+    }
   });
   const unlistenError = await listen<ChatErrorEvent>('provider://chat-error', (event) => {
     if (event.payload.request_id !== requestId) return;
@@ -94,7 +103,13 @@ export async function* streamProviderChat(
   });
   const unlistenDone = await listen<ChatDoneEvent>('provider://chat-done', (event) => {
     if (event.payload.request_id !== requestId) return;
-    if (!event.payload.cancelled) pushEvents(parser.flush());
+    try {
+      if (!event.payload.cancelled) pushEvents(parser.flush());
+    } catch (err) {
+      // Same reason as the chunk handler: a trailing partial line can be an
+      // error frame, and this is a callback.
+      fail(errorMessage(err));
+    }
     finished = true;
     wake();
   });

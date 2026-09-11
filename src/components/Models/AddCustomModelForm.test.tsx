@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const modelStoreState = vi.hoisted(() => ({
   addExternalModel: vi.fn(),
+  addExternalFolder: vi.fn(),
   detectProjectors: vi.fn(),
   setProjector: vi.fn(),
   resolveModelReference: vi.fn(),
@@ -22,6 +23,10 @@ vi.mock("../../lib/i18n", () => {
   const labels: Record<string, string> = {
     "AddCustomModelForm.openGgufDescription": "Open a local GGUF",
     "AddCustomModelForm.openModelFileButton": "Open model file",
+    "AddCustomModelForm.openModelFolderButton": "Open folder",
+    "AddCustomModelForm.folderModelsAdded": "Added from this folder",
+    "AddCustomModelForm.mlxRuntimeBadge": "MLX",
+    "AddCustomModelForm.mlxRuntimeNote": "A safetensors model for the MLX runtime.",
     "AddCustomModelForm.chooseProjectorButton": "Choose projector",
     "AddCustomModelForm.detectedProjector": "Detected projector",
     "AddCustomModelForm.selectedProjector": "selected",
@@ -79,6 +84,7 @@ describe("AddCustomModelForm", () => {
     cleanup();
     openMock.mockReset();
     modelStoreState.addExternalModel.mockReset();
+    modelStoreState.addExternalFolder.mockReset();
     modelStoreState.detectProjectors.mockReset();
     modelStoreState.setProjector.mockReset();
   });
@@ -145,5 +151,32 @@ describe("AddCustomModelForm", () => {
         "/models/mmproj-F16.gguf",
       ),
     );
+  });
+
+  it("registers every model a picked folder holds and never probes it for projectors", async () => {
+    openMock.mockResolvedValueOnce("/weights/Qwen3.8-27B-Uncensored");
+    modelStoreState.addExternalFolder.mockResolvedValue([
+      {
+        id: "external:/weights/Qwen3.8-27B-Uncensored/4-bit",
+        name: "Qwen3.8-27B-Uncensored (4-bit)",
+        size_gb: 16.2,
+        runtime: "mlx",
+      },
+    ]);
+
+    render(<AddCustomModelForm />);
+    fireEvent.click(screen.getByRole("button", { name: "Open folder" }));
+
+    await waitFor(() => expect(screen.getByText("Qwen3.8-27B-Uncensored (4-bit)")).toBeTruthy());
+    expect(openMock).toHaveBeenCalledWith({ directory: true, multiple: false });
+    expect(modelStoreState.addExternalFolder).toHaveBeenCalledWith(
+      "/weights/Qwen3.8-27B-Uncensored",
+    );
+    // `models_detect_projectors` throws on a directory, so a folder pick that
+    // asked for candidates would surface a failure after a successful add.
+    expect(modelStoreState.detectProjectors).not.toHaveBeenCalled();
+    expect(screen.getByText("16.2 GB")).toBeTruthy();
+    expect(screen.getByText("MLX")).toBeTruthy();
+    expect(screen.getByText("A safetensors model for the MLX runtime.")).toBeTruthy();
   });
 });
