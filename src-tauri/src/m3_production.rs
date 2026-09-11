@@ -6405,10 +6405,28 @@ GPU1:
         root.join("models")
     }
 
+    /// `path` goes through `serde_json` rather than straight into the string:
+    /// a Windows path is full of backslashes, `\U` is not a valid JSON escape,
+    /// and an unescaped row makes the whole registry parse as nothing.
     fn mlx_row(name: &str, path: &str, size_gb: &str, tools: bool, vision: bool) -> String {
+        let path = serde_json::Value::from(path);
         format!(
-            r#"{{"id":"{name}","name":"{name}","path":"{path}","size_gb":{size_gb},"runtime":"mlx","tool_calling":{tools},"vision":{vision}}}"#
+            r#"{{"id":"{name}","name":"{name}","path":{path},"size_gb":{size_gb},"runtime":"mlx","tool_calling":{tools},"vision":{vision}}}"#
         )
+    }
+
+    /// A registry row has to survive the round trip on Windows too, where
+    /// every path separator is a backslash JSON reads as an escape.
+    #[test]
+    fn a_registry_row_carrying_a_windows_path_parses_back_unchanged() {
+        let path = r"C:\Users\RUNNER~1\AppData\Local\Temp\Qwen3.8-27B-MLX/4-bit";
+        let rows = format!("[{}]", mlx_row("reference", path, "16.0", true, true));
+
+        let parsed = serde_json::from_str::<Vec<crate::models::ExternalModelEntry>>(&rows)
+            .expect("an unescaped backslash would make this row parse as nothing");
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path, path);
     }
 
     #[test]
