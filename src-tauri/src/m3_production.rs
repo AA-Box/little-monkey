@@ -2969,14 +2969,24 @@ impl ManagedProcessController for SystemManagedProcessController {
                     Some(status) => {
                         return Err(RuntimeAdapterError::Controller {
                             operation: "wait for managed llama.cpp readiness".to_string(),
-                            message: format!("process exited before readiness: {status}"),
+                            message: format!(
+                                "process exited before readiness: {status}{}",
+                                readiness_log_suffix(&log_path)
+                            ),
                         })
                     }
                     None if Self::loopback_port_reachable(spec.port).await => break,
                     None if tokio::time::Instant::now() >= deadline => {
                         let _ = child.kill().await;
                         return Err(RuntimeAdapterError::Timeout {
-                            operation: "wait for managed llama.cpp readiness".to_string(),
+                            // `Timeout` has no message field, and the log is
+                            // the only thing that says *why* nothing came up,
+                            // so it rides along in the operation name rather
+                            // than being dropped.
+                            operation: format!(
+                                "wait for managed llama.cpp readiness{}",
+                                readiness_log_suffix(&log_path)
+                            ),
                             timeout_ms: context.limits.timeout_ms.min(60_000),
                         });
                     }
@@ -3148,6 +3158,20 @@ fn verify_executable(path: &Path) -> Result<(), RuntimeAdapterError> {
         });
     }
     Ok(())
+}
+
+/// The tail of a managed runtime's own log, ready to append to a readiness
+/// error, or nothing when there is nothing to read.
+///
+/// A process that dies or hangs before it answers on its port has almost
+/// always written the reason here — a python traceback from an MLX model
+/// `mlx-vlm` cannot load being the case this exists for. Without it the user
+/// sees an exit status and no way to act on it.
+fn readiness_log_suffix(log_path: &Path) -> String {
+    match read_log_tail(log_path, 4 * 1024) {
+        Ok(chunk) if !chunk.text.trim().is_empty() => format!("\n{}", chunk.text.trim_end()),
+        _ => String::new(),
+    }
 }
 
 fn read_log_tail(path: &Path, max_bytes: usize) -> Result<ManagedLogChunk, RuntimeAdapterError> {
@@ -3825,8 +3849,54 @@ fn runtime_inventory_signature(
                 )
             }),
     );
+    // External folders belong here for the same reason: `mlx_models` exposes
+    // them, so adding one has to read as an inventory change or
+    // `mlx_chat_start`'s `refresh_runtimes` would hand back the drivers built
+    // before the folder existed and the model could not start until relaunch.
+    // The value is the path the id was derived from, which is all that can
+    // change about a row without its id changing with it.
+    signature.extend(
+        external_mlx_rows(models_dir)
+            .into_iter()
+            .map(|entry| (external_mlx_model_id(&entry.path), entry.path)),
+    );
     signature.sort();
     signature
+}
+
+/// A stable MLX model id for an external folder.
+///
+/// It deliberately is not the folder's own name. The common shape a user picks
+/// is a repo directory holding `4-bit/` and `8-bit/`, so basenames collide
+/// almost immediately — and a duplicate id is not a per-model failure here, it
+/// makes `MlxRuntimeAdapter::new` reject the whole model set and the machine
+/// ends up with no MLX driver at all. Hashing the canonical path is unique per
+/// folder, identical across restarts, and well inside what `validate_id`
+/// accepts.
+pub(crate) fn external_mlx_model_id(canonical_path: &str) -> String {
+    let digest = format!("{:x}", Sha256::digest(canonical_path.as_bytes()));
+    format!("ext-{}", &digest[..16])
+}
+
+/// The external-model registry rows the MLX driver should expose.
+///
+/// The registry sits beside the managed models directory rather than inside
+/// it: `models::models_dir` is `profile_data_dir().join("models")` while the
+/// registry is `profile_data_dir().join("external_models.json")`. This module
+/// is built from that same profile root — `lib.rs` hands
+/// `build_m3_command_state` `app_paths::data_dir()`, and both that and
+/// `ProfileScopedPaths::profile_data_dir` resolve to `profiles::active_root`
+/// of `<os data dir>/com.littlemonkey.app` — so the parent of `models_dir` is
+/// that root and no extra path has to be threaded through the factory. That
+/// the two agree is not an assumption made here: `m3_install_mlx_package`
+/// already hands `profile_data_dir()` to `install_mlx_package`, which derives
+/// the same `<root>/m3` the driver built from `app_paths::data_dir()` reads,
+/// so an MLX install would land beside the running driver if they differed.
+fn external_mlx_rows(models_dir: &Path) -> Vec<crate::models::ExternalModelEntry> {
+    models_dir
+        .parent()
+        .map(crate::models::external_mlx_entries)
+        .unwrap_or_default()
 }
 
 impl M3RuntimeReconciler for ProductionRuntimeReconciler {
@@ -3966,6 +4036,49 @@ fn mlx_models(
                 // Not readable from the model's own files the way the other two
                 // are, and claiming a capability the weights do not have
                 // produces a broken turn.
+                structured_output: false,
+            },
+        });
+    }
+    // A folder the user picked gets the same treatment from its registry row.
+    // It has no provenance sidecar and never will — the app does not write
+    // into a user's own directory — so the row is the only description of it
+    // there is.
+    for entry in external_mlx_rows(models_dir) {
+        let local_path = PathBuf::from(&entry.path);
+        // `validate_model` rejects a relative path or a zero size, and one
+        // rejected record fails `MlxRuntimeAdapter::new` for every other model
+        // with it. A registry this app wrote holds neither, so a row that has
+        // been hand-edited into one is skipped rather than allowed to take the
+        // driver down with it.
+        let size_bytes = (f64::from(entry.size_gb.max(0.0)) * 1e9) as u64;
+        if size_bytes == 0 || !local_path.is_absolute() {
+            eprintln!(
+                "ignoring external MLX model {}: needs an absolute path and a non-zero size",
+                entry.path
+            );
+            continue;
+        }
+        let model_id = external_mlx_model_id(&entry.path);
+        // Unlike a bundle collision, a duplicate here only means the registry
+        // lists the same folder twice — bookkeeping noise, not a reason to
+        // return `Conflict` and leave the machine without an MLX driver.
+        if !model_ids.insert(model_id.clone()) {
+            continue;
+        }
+        records.push(MlxModelRecord {
+            model_id,
+            display_name: entry.name,
+            local_path,
+            size_bytes,
+            // Nothing versions a user's own folder.
+            revision: None,
+            capabilities: MlxModelCapabilities {
+                chat: true,
+                tool_calling: entry.tool_calling,
+                vision: entry.vision,
+                // Sniffed from no file, and claiming a capability the weights
+                // do not have produces a broken turn — same call as above.
                 structured_output: false,
             },
         });
@@ -6282,5 +6395,121 @@ GPU1:
         assert_eq!(adopted[0].version, published.version);
         assert_eq!(adopted[0].component_id, published.component_id);
         assert_eq!(adopted[0].kind, published.kind);
+    }
+
+    /// One registry file in the shape `models_add_external_folder` writes it,
+    /// beside the managed models directory. Returns that models directory,
+    /// which is the only path `mlx_models` and the signature are given.
+    fn write_external_registry(root: &Path, rows: &str) -> PathBuf {
+        fs::write(root.join("external_models.json"), rows).expect("write external registry");
+        root.join("models")
+    }
+
+    fn mlx_row(name: &str, path: &str, size_gb: &str, tools: bool, vision: bool) -> String {
+        format!(
+            r#"{{"id":"{name}","name":"{name}","path":"{path}","size_gb":{size_gb},"runtime":"mlx","tool_calling":{tools},"vision":{vision}}}"#
+        )
+    }
+
+    #[test]
+    fn external_mlx_ids_separate_two_folders_that_share_a_basename() {
+        let qwen = "/Users/someone/models/Qwen3.8-27B-Uncensored-MLX/4-bit";
+        let gemma = "/Users/someone/models/gemma-3-27b-mlx/4-bit";
+        let id = external_mlx_model_id(qwen);
+
+        assert_eq!(
+            id,
+            external_mlx_model_id(qwen),
+            "the id is stored in no file, so it has to be derivable again after a restart"
+        );
+        assert_ne!(
+            id,
+            external_mlx_model_id(gemma),
+            "using the basename would give both folders the id `4-bit`, and a duplicate id makes mlx_models fail and the whole MLX driver disappear"
+        );
+        assert!(
+            id.starts_with("ext-") && id.len() == 20,
+            "unexpected id {id}"
+        );
+        assert!(id[4..].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// The registry is app-owned bookkeeping, but it is a plain JSON file on
+    /// disk. A row `MlxRuntimeAdapter::new` would reject — zero size, relative
+    /// path — must cost that row and nothing else, because the adapter
+    /// validates the whole set at once and its rejection leaves the machine
+    /// with no MLX driver.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mlx_models_exposes_external_folders_without_letting_one_bad_row_sink_the_driver() {
+        let root = TestRoot::new("external-mlx");
+        let reference = root.0.join("Qwen3.8-27B-Uncensored-MLX/4-bit");
+        let reference_path = reference.display().to_string();
+        let sibling = root.0.join("gemma-3-27b-mlx/4-bit").display().to_string();
+        let empty = root.0.join("empty").display().to_string();
+        let rows = format!(
+            "[{},{},{},{},{},{}]",
+            mlx_row("reference", &reference_path, "16.0", true, true),
+            mlx_row("sibling", &sibling, "15.5", false, false),
+            // The same folder twice: bookkeeping noise, not a reason to fail.
+            mlx_row("duplicate", &reference_path, "16.0", true, true),
+            mlx_row("zero-size", &empty, "0.0", false, false),
+            mlx_row("relative", "models/not-absolute", "1.0", false, false),
+            format!(
+                r#"{{"id":"gguf","name":"a single file","path":"{}","size_gb":4.1,"runtime":"llama_cpp","tool_calling":false,"vision":false}}"#,
+                root.0.join("mistral.gguf").display()
+            ),
+        );
+        let models_dir = write_external_registry(&root.0, &rows);
+
+        let records = mlx_models(&[], &models_dir).expect("a broken row must not fail the set");
+
+        assert_eq!(
+            records.iter().map(|record| record.model_id.clone()).collect::<BTreeSet<_>>().len(),
+            2,
+            "two distinct folders, deduplicated, with the llama.cpp and invalid rows left out: {records:?}"
+        );
+        let first = records
+            .iter()
+            .find(|record| record.local_path == reference)
+            .expect("the reference folder");
+        assert_eq!(first.model_id, external_mlx_model_id(&reference_path));
+        assert_eq!(first.display_name, "reference");
+        assert_eq!(first.size_bytes, 16_000_000_000);
+        assert!(
+            first.capabilities.chat && first.capabilities.tool_calling && first.capabilities.vision
+        );
+        assert!(!first.capabilities.structured_output);
+        assert!(first.revision.is_none());
+    }
+
+    /// Without this the drivers `mlx_chat_start` refreshes are the ones built
+    /// before the folder was registered, and the model cannot start until the
+    /// app is relaunched.
+    #[test]
+    fn registering_an_external_folder_changes_the_runtime_inventory_signature() {
+        let root = TestRoot::new("external-signature");
+        let models_dir = root.0.join("models");
+        let folder = root.0.join("Qwen3.8-27B-Uncensored-MLX/4-bit");
+        let folder_path = folder.display().to_string();
+
+        let before = runtime_inventory_signature(&[], &models_dir);
+        write_external_registry(
+            &root.0,
+            &format!(
+                "[{}]",
+                mlx_row("reference", &folder_path, "16.0", true, true)
+            ),
+        );
+        let after = runtime_inventory_signature(&[], &models_dir);
+
+        assert!(
+            before.is_empty(),
+            "nothing is installed in this root: {before:?}"
+        );
+        assert_eq!(
+            after,
+            vec![(external_mlx_model_id(&folder_path), folder_path)]
+        );
     }
 }

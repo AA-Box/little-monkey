@@ -92,6 +92,34 @@ describe('SseEventParser', () => {
     ]);
   });
 
+  it('throws the message from an error frame instead of streaming nothing', () => {
+    // What `mlx_chat.rs` sends when the runtime cannot load the model: a 200
+    // response whose only frame is an error. Swallowing it leaves an empty
+    // assistant bubble and no explanation anywhere in the UI.
+    const parser = new SseEventParser();
+    expect(() =>
+      collect(parser, [
+        'event: error\n',
+        dataLine({ error: { message: 'process exited before readiness: signal 6', type: 'little_monkey_m3_error' } }),
+      ])
+    ).toThrow('process exited before readiness: signal 6');
+  });
+
+  it('throws a bare-string error frame, the shape other OpenAI-compatible servers send', () => {
+    // LM Studio and Ollama-style `/v1` proxies report `{"error": "..."}`;
+    // reading only `error.message` there would drop the one thing this branch
+    // exists to surface.
+    expect(() =>
+      collect(new SseEventParser(), [dataLine({ error: 'context length exceeded' })])
+    ).toThrow('context length exceeded');
+  });
+
+  it('still reports an error frame that carries no message', () => {
+    expect(() => collect(new SseEventParser(), [dataLine({ error: {} })])).toThrow(
+      /without saying why/
+    );
+  });
+
   it('skips malformed payloads without crashing', () => {
     const events = collect(new SseEventParser(), ['data: {not json}\n', dataLine({ choices: [{ delta: { content: 'ok' } }] })]);
     expect(events).toEqual([{ type: 'delta', content: 'ok' }]);
@@ -152,6 +180,29 @@ describe('streamChat request shape', () => {
     expect(body.tools).toEqual(tools);
     expect(body.tool_choice).toBe('auto');
     fetchMock.mockRestore();
+  });
+
+  it('rejects with the error frame of an otherwise-successful stream', async () => {
+    // The mid-stream catch in `streamChat` only swallows an aborted fetch, so
+    // an error frame on a live stream has to come back out to the caller.
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        'data: {"error":{"type":"api_error","code":"model_not_found","message":"mlx-vlm cannot load qwen3_5"}}\n',
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+      )
+    );
+
+    try {
+      await expect(async () => {
+        for await (const _event of streamChat('http://127.0.0.1:8081', [], [], 'model')) {
+          // Drain the stream.
+        }
+      }).rejects.toThrow('mlx-vlm cannot load qwen3_5');
+    } finally {
+      // Restored even on failure: a leaked fetch spy makes the *next* test in
+      // this describe read this test's call as its own.
+      fetchMock.mockRestore();
+    }
   });
 
   it('sends an explicit max_tokens ceiling when a bounded caller supplies one', async () => {
