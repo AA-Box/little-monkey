@@ -63,12 +63,60 @@ export interface ChatMessage {
   };
 }
 
+/**
+ * Re-roles the `system` messages that sit inside a conversation rather than
+ * at its head, because a number of OpenAI-compatible servers refuse them.
+ *
+ * This app writes its own notices into the transcript as `system` messages —
+ * `[Mentions]`, `[Model switch]`, `[Verify Fix]`, the workspace-mutation
+ * correction, and the rest of the prefixes in `agentLoop.ts` — and they land
+ * wherever in the conversation they happened. llama.cpp and the big providers'
+ * compat layers accept that; `mlx_lm.server` rejects the whole request:
+ *
+ *     404 {"error": "System message must be at the beginning."}
+ *
+ * which made every local MLX endpoint unusable for any session that had ever
+ * shown a notice. The OpenAI schema permits a system message at any position,
+ * so a strict server is being stricter than the spec — but the app cannot know
+ * which endpoint it is talking to, and a notice is not worth losing a turn
+ * over.
+ *
+ * Demoting to `user` keeps the text and its position, which is what these
+ * notices need: several are instructions the loop depends on the model acting
+ * on next ("Fix the reported problems, then stop"), and an instruction read as
+ * a user turn still lands. Merging them into the leading prompt instead would
+ * turn a one-off correction into a standing rule, and dropping them would lose
+ * the instruction outright.
+ *
+ * `keepLeading` is false for a payload whose system prompt is supplied out of
+ * band — the resident-runner envelope carries `system` as its own field, so
+ * every `system` message in the history it sends is mid-conversation by
+ * construction, including one that happens to be first.
+ */
+export function demoteInlineSystemMessages(
+  messages: ChatMessage[],
+  { keepLeading = true }: { keepLeading?: boolean } = {},
+): ChatMessage[] {
+  let insideConversation = !keepLeading;
+  return messages.map((message) => {
+    if (message.role !== 'system') {
+      insideConversation = true;
+      return message;
+    }
+    return insideConversation ? { ...message, role: 'user' as const } : message;
+  });
+}
+
 /** Strips the local-only fields above so a request body carries nothing but
- * the OpenAI-compatible message shape. Both wire paths run this: cloud
+ * the OpenAI-compatible message shape, and moves any mid-conversation
+ * `system` message off a role some servers reject there (see
+ * {@link demoteInlineSystemMessages}). Both wire paths run this: cloud
  * providers reject unknown message properties outright, and the Rust proxy
  * forwards `messages` as opaque JSON, so it can't do the filtering for us. */
 export function toWireMessages(messages: ChatMessage[]): ChatMessage[] {
-  return messages.map(({ at: _at, chapter: _chapter, realtime: _realtime, ...wire }) => wire);
+  return demoteInlineSystemMessages(
+    messages.map(({ at: _at, chapter: _chapter, realtime: _realtime, ...wire }) => wire),
+  );
 }
 
 /** Extracts the plain-text portion of a message's `content` — a no-op for

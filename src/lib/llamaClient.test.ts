@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  demoteInlineSystemMessages,
   recoverTextToolCalls,
   SseEventParser,
   streamChat,
@@ -224,5 +225,52 @@ describe('recoverTextToolCalls', () => {
   it('recovers nothing when no tools were offered this turn', () => {
     const content = '{"name": "run_shell", "arguments": {"command": "ls"}}';
     expect(recoverTextToolCalls(content, [])).toEqual({ content, toolCalls: [] });
+  });
+});
+
+describe('demoteInlineSystemMessages', () => {
+  it('keeps the leading system prompt and demotes the notices behind it', () => {
+    // The exact shape that made `mlx_lm.server` answer
+    // 404 {"error": "System message must be at the beginning."}
+    const wire = demoteInlineSystemMessages([
+      { role: 'system', content: 'You are Little Monkey.' },
+      { role: 'user', content: 'run the game' },
+      { role: 'assistant', content: 'here is how' },
+      { role: 'system', content: '[Mentions] Couldn\'t read @Mac' },
+      { role: 'user', content: 'did you do it?' },
+    ]);
+    expect(wire.map((message) => message.role)).toEqual(['system', 'user', 'assistant', 'user', 'user']);
+    // The text of a demoted notice is untouched — several are instructions the
+    // loop needs the model to act on.
+    expect(wire[3]).toEqual({ role: 'user', content: "[Mentions] Couldn't read @Mac" });
+  });
+
+  it('keeps a whole leading run of system messages', () => {
+    const wire = demoteInlineSystemMessages([
+      { role: 'system', content: 'prompt' },
+      { role: 'system', content: '[Sources] …' },
+      { role: 'user', content: 'hi' },
+    ]);
+    expect(wire.map((message) => message.role)).toEqual(['system', 'system', 'user']);
+  });
+
+  it('demotes every system message when the prompt is supplied out of band', () => {
+    const wire = demoteInlineSystemMessages(
+      [
+        { role: 'system', content: '[Model switch] …' },
+        { role: 'user', content: 'hi' },
+        { role: 'system', content: '[Verify Fix] fix the reported problems' },
+      ],
+      { keepLeading: false },
+    );
+    expect(wire.map((message) => message.role)).toEqual(['user', 'user', 'user']);
+  });
+
+  it('leaves a conversation that never carried a notice untouched', () => {
+    const messages = [
+      { role: 'system' as const, content: 'prompt' },
+      { role: 'user' as const, content: 'hi' },
+    ];
+    expect(demoteInlineSystemMessages(messages)).toEqual(messages);
   });
 });

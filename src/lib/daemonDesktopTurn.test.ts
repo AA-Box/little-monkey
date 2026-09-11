@@ -202,6 +202,27 @@ describe("daemon desktop turn snapshot", () => {
       { role: "user", content: "continue" },
     ]);
   });
+
+  it("sends no system message at all, because the envelope carries the prompt itself", () => {
+    // `mlx_lm.server` answers 404 {"error": "System message must be at the
+    // beginning."} to a history holding one of this app's own notices, and in
+    // this payload even a leading one is mid-conversation: the frozen turn
+    // supplies `system` as its own field.
+    const history: ChatMessage[] = [
+      { role: "system", content: "[Model switch] switched to the local model" },
+      { role: "user", content: "run it" },
+      { role: "system", content: "[Mentions] Couldn't read @Mac" },
+      { role: "user", content: "did you do it?" },
+    ];
+    for (const target of [
+      { kind: "local" as const, baseUrl: "http://127.0.0.1:8090" },
+      { kind: "ollama" as const, baseUrl: "http://127.0.0.1:11434", model: "qwen" },
+    ]) {
+      const wire = historyForDaemonTarget(history, target) as { role: string; content: string }[];
+      expect(wire.map((message) => message.role)).toEqual(["user", "user", "user", "user"]);
+      expect(wire[2].content).toBe("[Mentions] Couldn't read @Mac");
+    }
+  });
 });
 
 describe("daemon desktop routing and event replay", () => {
