@@ -7,6 +7,7 @@ import {
   ollamaModelTargetKey,
 } from "../lib/modelTargets";
 import { useUsageStore } from "./usageStore";
+import { useRuntimeHubStore } from "./runtimeHubStore";
 import { errorMessage } from "../lib/errors";
 
 /**
@@ -23,7 +24,7 @@ export interface ModelInfo {
   tool_calling: boolean;
   installed: boolean;
   path: string | null;
-  /** True for a model registered via `models_add_external` (a `.gguf` file outside the app's models dir) — the app never owns or deletes that file. */
+  /** True for a model registered via `models_add_external` (a `.gguf` file) or `models_add_external_folder` (a weights directory), both outside the app's models dir — the app never owns or deletes what it points at. */
   is_external: boolean;
   /** "chat" (tool-calling instruct model) or "embedding" — see `models.rs::ModelKind`. Defaults to "chat" on the Rust side for pre-existing entries, so this is always present in practice. */
   kind: "chat" | "embedding";
@@ -405,6 +406,11 @@ export interface ModelStore {
   removeModel: (model: ModelInfo) => Promise<void>;
   /** Register an arbitrary on-disk `.gguf` file (outside the app's models dir) as a usable local model. */
   addExternalModel: (path: string) => Promise<ModelInfo>;
+  /** Register every model found in a picked folder: the folder itself when it
+   *  is one model, otherwise the model folders one level down. Returns one
+   *  entry per model found, already-registered ones included, so re-picking
+   *  the same folder is a no-op that still shows what is there. */
+  addExternalFolder: (path: string) => Promise<ModelInfo[]>;
   detectProjectors: (modelPath: string) => Promise<ProjectorCandidate[]>;
   setProjector: (modelPath: string, projectorPath: string) => Promise<ModelInfo>;
   removeProjector: (modelPath: string) => Promise<ModelInfo>;
@@ -647,6 +653,11 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     // later step — `resolveBaseUrl`, streaming, tools — reads that endpoint
     // exactly the way it reads llama-server's, so only the start differs.
     if (model.runtime === "mlx") {
+      // The MLX runtime serves one fixed port, so starting a second model
+      // while the first still holds it fails with `ModelAlreadyRunning`
+      // instead of switching models. Read the running endpoint before the
+      // optimistic `set` below clears it.
+      const runningMlx = get().mlxChat;
       set({
         active: model,
         llamaStatus: "starting",
@@ -657,6 +668,20 @@ export const useModelStore = create<ModelStore>((set, get) => ({
         mlxChat: null,
       });
       try {
+        if (runningMlx?.running && runningMlx.modelPath !== model.path) {
+          await invoke("mlx_chat_stop");
+        }
+        // The MLX service ships as a separately published package, and until it
+        // is installed every turn fails with "the verified MLX runtime is not
+        // installed" — a message whose fix lives in a Settings panel the user
+        // has no reason to have opened. Studio already resolves that for itself
+        // (`runtimeHubStore`'s own `selectStudioModel`), so chat asks the same
+        // way: the call hydrates its own snapshot, returns immediately when the
+        // package is already active, and is guarded against concurrent installs.
+        // Swallowed like Studio's and Runtime Hub's own calls: if the install
+        // cannot run, the start below fails with the runtime's real reason,
+        // which is more use than the installer's.
+        await useRuntimeHubStore.getState().ensureMlxRuntime().catch(() => {});
         const status = await invoke<MlxChatStatus>("mlx_chat_start", { modelPath: model.path });
         set({ mlxChat: status, llamaStatus: "ready", llamaVisionEnabled: status.vision });
       } catch (err) {
@@ -734,6 +759,12 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     const model = await invoke<ModelInfo>("models_add_external", { path });
     await get().refresh();
     return model;
+  },
+
+  addExternalFolder: async (path) => {
+    const models = await invoke<ModelInfo[]>("models_add_external_folder", { path });
+    await get().refresh();
+    return models;
   },
 
   detectProjectors: (modelPath) =>

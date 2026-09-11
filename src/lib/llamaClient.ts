@@ -240,6 +240,17 @@ export class SseEventParser {
         completion_tokens: number;
         total_tokens: number;
       };
+      // A stream that fails after the response has already committed to 200
+      // can only report the failure as a frame, which both local backends do
+      // in this shape (`mlx_chat.rs`'s dispatch error and
+      // `compatibility_hub.rs`'s `CanonicalStreamEvent::Error`). This parser
+      // is the only place that frame is ever read, so without the throw below
+      // a model the runtime cannot load renders as an empty assistant bubble
+      // with the reason nowhere in the UI.
+      // The bare-string form is what a third-party OpenAI-compatible endpoint
+      // (LM Studio, an Ollama `/v1` proxy) sends, and dropping it would lose
+      // the one thing this branch exists to surface.
+      error?: string | { message?: string };
     };
 
     try {
@@ -247,6 +258,12 @@ export class SseEventParser {
     } catch {
       // Malformed/partial SSE chunk — skip it rather than crashing the loop.
       return;
+    }
+
+    if (payload.error) {
+      const reason =
+        typeof payload.error === 'string' ? payload.error : payload.error.message;
+      throw new Error(reason || 'The model runtime failed the request without saying why.');
     }
 
     if (payload.usage) {

@@ -4,18 +4,21 @@ import { CheckCircle2, Download, FolderOpen, Search } from "lucide-react";
 import { Button } from "../ui";
 import { useModelStore } from "../../store/modelStore";
 import type { ProjectorCandidate, ResolvedModelReference } from "../../store/modelStore";
-import { formatBytes } from "../../lib/modelRegistry";
+import type { ModelInfo } from "../../lib/modelRegistry";
+import { formatBytes, formatSizeGb } from "../../lib/modelRegistry";
 import { useT } from "../../lib/i18n";
 import { errorMessage } from "../../lib/errors";
 
 /**
- * Two ways to add a model outside the curated catalog: pick an already-
- * downloaded `.gguf` file from anywhere on disk (registered as an external
- * reference, never copied), or resolve and install a public GGUF bundle from
+ * Three ways to add a model outside the curated catalog: pick an already-
+ * downloaded `.gguf` file from anywhere on disk, pick a folder and let the
+ * backend work out which models are in it (both registered as external
+ * references, never copied), or resolve and install a public GGUF bundle from
  * an Ollama-style tag or explicit Hugging Face reference.
  */
 export function AddCustomModelForm() {
   const addExternalModel = useModelStore((s) => s.addExternalModel);
+  const addExternalFolder = useModelStore((s) => s.addExternalFolder);
   const detectProjectors = useModelStore((s) => s.detectProjectors);
   const setProjector = useModelStore((s) => s.setProjector);
   const resolveModelReference = useModelStore((s) => s.resolveModelReference);
@@ -30,6 +33,8 @@ export function AddCustomModelForm() {
   const [projectorCandidates, setProjectorCandidates] = useState<ProjectorCandidate[]>([]);
   const [localProjector, setLocalProjector] = useState<string | null>(null);
   const [selectedLocalProjectorPath, setSelectedLocalProjectorPath] = useState<string | null>(null);
+  const [pickingFolder, setPickingFolder] = useState(false);
+  const [folderModels, setFolderModels] = useState<ModelInfo[]>([]);
 
   const [reference, setReference] = useState("");
   const [resolved, setResolved] = useState<ResolvedModelReference | null>(null);
@@ -61,6 +66,26 @@ export function AddCustomModelForm() {
       setPicking(false);
     }
   }, [addExternalModel, detectProjectors]);
+
+  const handlePickFolder = useCallback(async () => {
+    setPickError(null);
+    // The previous pick's results belong to the previous folder: leaving them
+    // up next to an error naming a different one says nothing useful.
+    setFolderModels([]);
+    setPickingFolder(true);
+    try {
+      const selected = await open({ directory: true, multiple: false });
+      if (typeof selected !== "string") return;
+      // Deliberately no `detectProjectors` call here: that command reads the
+      // path as a regular GGUF first and throws on a directory, which would
+      // report a successful folder add as a failure.
+      setFolderModels(await addExternalFolder(selected));
+    } catch (err) {
+      setPickError(errorMessage(err));
+    } finally {
+      setPickingFolder(false);
+    }
+  }, [addExternalFolder]);
 
   const handleChooseProjector = useCallback(async () => {
     if (!localModelPath) return;
@@ -136,13 +161,45 @@ export function AddCustomModelForm() {
 
   return (
     <div className="flex flex-col gap-3 rounded-lg border border-border bg-background p-3">
-      <div className="flex items-center justify-between gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-xs text-muted">{t("AddCustomModelForm.openGgufDescription")}</p>
-        <Button variant="secondary" size="sm" onClick={() => void handlePickFile()} disabled={picking}>
-          <FolderOpen size={14} />
-          {picking ? t("AddCustomModelForm.openingButton") : t("AddCustomModelForm.openModelFileButton")}
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button variant="secondary" size="sm" onClick={() => void handlePickFile()} disabled={picking}>
+            <FolderOpen size={14} />
+            {picking ? t("AddCustomModelForm.openingButton") : t("AddCustomModelForm.openModelFileButton")}
+          </Button>
+          <Button variant="secondary" size="sm" onClick={() => void handlePickFolder()} disabled={pickingFolder}>
+            <FolderOpen size={14} />
+            {pickingFolder ? t("AddCustomModelForm.openingButton") : t("AddCustomModelForm.openModelFolderButton")}
+          </Button>
+        </div>
       </div>
+      {folderModels.length > 0 && (
+        <div className="rounded-md border border-border bg-surface p-2">
+          <p className="flex items-center gap-1 text-xs text-success">
+            <CheckCircle2 size={13} />
+            {t("AddCustomModelForm.folderModelsAdded")}
+          </p>
+          <ul className="mt-1.5 flex flex-col gap-1">
+            {folderModels.map((model) => (
+              <li key={model.id} className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="min-w-0 truncate text-foreground">{model.name}</span>
+                {model.runtime === "mlx" && (
+                  <span className="rounded-full bg-surface-2 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-faint">
+                    {t("AddCustomModelForm.mlxRuntimeBadge")}
+                  </span>
+                )}
+                {/* `size_gb` is decimal GB, so `formatBytes` (base 1024) would
+                    relabel it; this is the same helper the model cards use. */}
+                <span className="ml-auto shrink-0 text-muted">{formatSizeGb(model.size_gb)}</span>
+              </li>
+            ))}
+          </ul>
+          {folderModels.some((model) => model.runtime === "mlx") && (
+            <p className="mt-1.5 text-[11px] text-faint">{t("AddCustomModelForm.mlxRuntimeNote")}</p>
+          )}
+        </div>
+      )}
       <div className="flex items-center justify-between gap-2 text-xs text-muted">
         <span>
           {t("AddCustomModelForm.projectorLabel")}:{" "}
