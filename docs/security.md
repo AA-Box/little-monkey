@@ -46,9 +46,33 @@ contacts only the compiled-in OpenAI Realtime calls origin, then returns an SDP
 answer. The credential is never exposed to JavaScript, a URL, logs, transcript,
 or metrics. A privacy acknowledgement is required before the microphone opens,
 and Security Doctor reports realtime voice as a separate configured/active
-status. Provider function calls do not create a permission shortcut; they enter
+status. The `loopback` test peer that the credential-free acceptance run
+selects never reaches that broker: it answers the SDP offer locally, so no key
+is read and no realtime audio leaves the machine. It is never the default, and
+selecting it is not a way to hold a conversation. Provider function calls do not create a permission shortcut; they enter
 the same schema validation, permission prompt, plan-mode, sandbox, workspace,
 network, MCP, extension, and hook boundary as typed turns. Details and teardown
 semantics are in [Desktop realtime voice](realtime-voice.md).
+
+Routing a conversation's microphone or speaker to a paired device grants nothing by
+being paired. Pairing is not microphone authority: an input endpoint requires
+`voice_stream`, an output endpoint requires `audio_playback`, and a duplex endpoint
+requires both — where *effective* means the operator's grant, the capability the
+device's own build advertises, the operating-system permission where one exists, and
+current readiness all agree, and a device's claim about itself can only narrow that,
+never widen it. The route is conversation-scoped and host-enforced: a device never
+chooses which conversation it is speaking into, and it cannot substitute one. The
+admission ticket is random, single-use, short-lived, and bound to the device that
+minted it, to that device's key generation, and — for a routed socket — to the exact
+route, role and generation; every one of those is re-checked when the socket is
+admitted, not only when the ticket was issued, and a stale generation is refused at
+both points. Withdrawing a grant, revoking or re-keying the device, moving an
+endpoint, or losing the required readiness closes the affected side immediately and
+fail-closed, rather than at whatever moment the device next happens to send a frame.
+Raw audio has no field in the route ledger; the tables hold route state and bounded
+coordination metadata, and paired Realtime PCM lives only in bounded in-memory
+queues and on a loopback-only socket authenticated by a process-local token that is
+regenerated on every daemon start. Details are in
+[Voice Everywhere](voice-everywhere.md).
 
 A support bundle is built to be handed over: it carries a bounded trace of what the messaging, telephony, peer and device subsystems did, and no message text, transcript, audio, key, session or credential — those have no field in the format. Identifiers are pseudonymized with a salt generated per bundle and never recorded, so a party is consistent within one document and correlates with nothing outside it.

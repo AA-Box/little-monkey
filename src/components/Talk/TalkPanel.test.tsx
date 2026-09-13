@@ -310,7 +310,13 @@ describe('TalkPanel', () => {
 
     const start = await screen.findByRole('button', { name: 'Start realtime Talk' });
     expect((start as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getByText(/microphone audio and the bounded conversation context are sent to OpenAI/i)).toBeTruthy();
+    // The wording tracks the route: the microphone may now be a paired device,
+    // so the disclosure names the *selected* microphone rather than "your"
+    // one. What must not drift is the substance -- that audio and bounded
+    // context leave the machine for OpenAI, said before the button unlocks.
+    expect(screen.getByText(
+      /Audio from the selected microphone and the bounded conversation context are sent to OpenAI/i,
+    )).toBeTruthy();
     fireEvent.click(screen.getByRole('checkbox'));
     await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(false));
     expect(commands()).not.toContain('realtime_voice_connect');

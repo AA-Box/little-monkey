@@ -169,7 +169,7 @@ type ScriptedEvent<T> = T extends { eventId: string } ? Omit<T, 'eventId'> : nev
  * tell it apart from the real transport, so a regression in the ledger or the
  * bridge fails here exactly as it would against OpenAI.
  */
-function scriptedProvider(script: ScriptOptions = {}) {
+function scriptedProvider(script: ScriptOptions = {}, providerId = 'openai') {
   const configs: RealtimeVoiceSessionConfig[] = [];
   const toolResults: Array<{ callId: string; output: string }> = [];
   const meter = audioMeter();
@@ -180,7 +180,7 @@ function scriptedProvider(script: ScriptOptions = {}) {
   let seq = 0;
 
   const provider: RealtimeVoiceProvider = {
-    id: 'openai',
+    id: providerId,
     capabilities: CAPABILITIES,
     createSession(config, onEvent) {
       configs.push(config);
@@ -199,6 +199,9 @@ function scriptedProvider(script: ScriptOptions = {}) {
           emit({ type: 'connected' });
           if (!script.noRemoteTrack) emit({ type: 'remote_audio_track' });
         },
+        async setInputRoute(_external: boolean, _deviceId: string | null) {},
+        appendInputPcm16(_audioBase64: string) {},
+        async setOutputRoute(_external: boolean, _deviceId: string | null) {},
         async startManualTurn() {
           state = 'listening';
           emit({ type: 'listening' });
@@ -278,14 +281,19 @@ function scriptedProvider(script: ScriptOptions = {}) {
   return { provider, configs, toolResults, meter, closes: () => closes };
 }
 
+let brokerStatusCalls = 0;
+
 function brokerStatus(overrides: Partial<RealtimeVoiceStatus>): () => Promise<RealtimeVoiceStatus> {
-  return async () => ({
-    providerId: 'openai',
-    configured: true,
-    activeSessions: 0,
-    endpoint: OPENAI_ENDPOINT,
-    ...overrides,
-  });
+  return async () => {
+    brokerStatusCalls += 1;
+    return {
+      providerId: 'openai',
+      configured: true,
+      activeSessions: 0,
+      endpoint: OPENAI_ENDPOINT,
+      ...overrides,
+    };
+  };
 }
 
 /** Lets the scripted exchange and the SHA-256 call key settle without leaning
@@ -298,6 +306,9 @@ async function drain(): Promise<void> {
 
 async function run(options: {
   script?: ScriptOptions;
+  /** Which far end the run believes it reached. Anything but `openai` is a
+   * local peer, and the report has to say so. */
+  providerId?: string;
   status?: Partial<RealtimeVoiceStatus>;
   surface?: RealtimeToolSurface;
   /** The local element keeps advancing across the silence window: a barge-in
@@ -307,7 +318,7 @@ async function run(options: {
    * already stopped. This is a barge-in that WORKED, and it must not fail. */
   remoteKeepsArrivingAcrossWindow?: boolean;
 } = {}) {
-  const fake = scriptedProvider(options.script);
+  const fake = scriptedProvider(options.script, options.providerId);
   let deadlineReached!: () => void;
   const deadline = new Promise<void>((resolve) => { deadlineReached = resolve; });
   const waits: number[] = [];
@@ -358,6 +369,7 @@ function realtimeRows() {
 }
 
 beforeEach(() => {
+  brokerStatusCalls = 0;
   mocks.executeToolCall.mockReset();
   mocks.executeToolCall.mockResolvedValue(FILE_RESULT);
   useSessionStore.setState({
@@ -646,5 +658,98 @@ describe('realtime acceptance run against a scripted provider', () => {
     expect(waits).toEqual([SPEAK_WINDOW_MS, EXCHANGE_TIMEOUT_MS, SILENCE_WINDOW_MS]);
     expect(waits.reduce((total, ms) => total + ms, 0)).toBeGreaterThan(30_000);
     expect(elapsedMs()).toBeLessThan(1_000);
+  });
+});
+
+/** The three steps that read as claims about something a model decided. A
+ * local peer replays each of them, so each has to say so. */
+const MODEL_DEPENDENT_STEPS: RealtimeAcceptanceStepId[] = [
+  'microphone_audio_reached_provider', 'tool_call_bridged', 'spoken_followup',
+];
+
+describe('which layer produced the report', () => {
+  it('names the far end that answered, so a local-peer run is never readable as a live OpenAI pass', async () => {
+    /** The defect this catches: a credential-free routing run and a live
+     * provider run producing byte-identical evidence, which is how "the
+     * realtime engine is end-to-end tested" gets claimed from a report that
+     * never left this computer. */
+    const loopback = await run({ providerId: 'loopback' });
+    expect(loopback.report.providerId).toBe('loopback');
+    expect(loopback.report.status).toBe('passed');
+
+    const live = await run();
+    expect(live.report.providerId).toBe('openai');
+    // Same steps, same order, same outcome — the provider id and the weakened
+    // details are the only things telling the two reports apart, so both have
+    // to be present.
+    expect(loopback.report.steps.map((entry) => entry.id)).toEqual(live.report.steps.map((entry) => entry.id));
+    expect(JSON.stringify(loopback.report)).not.toEqual(JSON.stringify(live.report));
+    expect(JSON.stringify(loopback.report)).not.toContain('openai');
+  });
+
+  it('weakens exactly the steps that claim a model decided something, and leaves the host-side claims alone', async () => {
+    /** The defect this catches: a loopback report passing
+     * `microphone_audio_reached_provider` with "the provider transcribed N
+     * characters" — a sentence about a model understanding speech, produced by
+     * a peer that recognizes nothing. */
+    const { report } = await run({ providerId: 'loopback' });
+    for (const id of MODEL_DEPENDENT_STEPS) {
+      expect(step(report, id).status).toBe('passed');
+      expect(step(report, id).detail).toContain('a local peer');
+    }
+    expect(step(report, 'microphone_audio_reached_provider').detail).toBe(
+      'provider transcribed 46 characters of live microphone audio'
+      + ' — but a local peer recognizes no speech, so this proves captured audio reached the far end'
+      + ' and its transcript event came back, not that a model understood anything',
+    );
+    // The routing claims are the ones this layer exists to prove, and they mean
+    // exactly what they say however local the far end is.
+    const untouched = report.steps
+      .filter((entry) => !MODEL_DEPENDENT_STEPS.includes(entry.id))
+      .map((entry) => entry.detail);
+    expect(untouched.filter((detail) => detail.includes('local peer'))).toEqual([
+      'provider=loopback far end=local peer, no credential and no egress',
+    ]);
+    expect(step(report, 'playback_element_advancing').detail)
+      .toBe('the local audio element played unpaused to 0.50s;'
+        + ' the output device, OS mixer, and speaker are past what this can observe');
+    expect(step(report, 'durable_conversation').detail)
+      .toBe('4 rows for one voice turn in the ordinary chat session');
+  });
+
+  it('asks the keychain broker nothing for a local peer, and everything for OpenAI', async () => {
+    /** The defect this catches: the credential-free layer still demanding a
+     * key, which would leave Voice Everywhere unprovable on a machine with no
+     * OpenAI account — the exact situation this split exists for. */
+    const { report } = await run({ providerId: 'loopback', status: { configured: false } });
+    expect(brokerStatusCalls).toBe(0);
+    expect(step(report, 'provider_configured')).toMatchObject({
+      status: 'passed',
+      detail: 'provider=loopback far end=local peer, no credential and no egress',
+    });
+    expect(report.status).toBe('passed');
+
+    await run();
+    expect(brokerStatusCalls).toBe(1);
+  });
+
+  it('still fails a local-peer run on a routing defect, so the weaker steps are not a softer bar', async () => {
+    /** The defect this catches: caveating a step into never failing. Layer 1
+     * has to be able to catch the thing it is for — a barge-in that does not
+     * stop the speaker — against a local peer just as against OpenAI. */
+    const { report } = await run({ providerId: 'loopback', keepsPlayingAcrossWindow: true });
+    expect(report.status).toBe('failed');
+    expect(report.providerId).toBe('loopback');
+    expect(failedSteps(report)).toEqual(['barge_in']);
+    expect(step(report, 'barge_in').detail)
+      .toBe('local playback kept advancing 0.50s over the 30000ms after the interruption');
+  });
+
+  it('carries no local-peer caveat anywhere in an OpenAI report', async () => {
+    /** The defect this catches: the layering leaking into the live run and
+     * quietly softening the evidence a real provider pass rests on. */
+    const { report } = await run();
+    expect(report.steps.filter((entry) => entry.detail.includes('local peer'))).toEqual([]);
+    expect(step(report, 'provider_configured').detail).toBe('provider=openai endpoint=fixed');
   });
 });

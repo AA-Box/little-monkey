@@ -22,6 +22,14 @@ import { runAgentTurn, stopTurn } from '../../lib/agentLoop';
 import { blobToBase64, companionClient, type CaptureGrant } from '../../lib/companionClient';
 import { errorMessage } from '../../lib/errors';
 import {
+  type VoiceRouteRecord,
+  voiceRouteActivate,
+  voiceRouteDeactivate,
+  voiceRouteEmit,
+  voiceRouteEvents,
+  voiceRouteGet,
+} from '../../lib/daemonClient';
+import {
   BoundedPcmQueue,
   PCM_AUDIO_WORKLET_SOURCE,
   PcmRingBuffer,
@@ -56,6 +64,20 @@ function joinPcm(chunks: readonly Float32Array[]): Float32Array {
     offset += chunk.length;
   }
   return output;
+}
+
+/**
+ * What makes two route records the same selection.
+ *
+ * `VoiceRouteSelector` calls `onRoute` on every refresh — a device appearing or
+ * disappearing is enough — and hands back a freshly deserialised record for a
+ * route that has not moved. Object identity therefore says "changed" far more
+ * often than the route actually changes. The daemon's own identity is the route
+ * id and its monotonic generation, and a stopped route is the same thing as no
+ * route at all as far as this hook's devices are concerned.
+ */
+function routeIdentity(route: VoiceRouteRecord | null | undefined): string | null {
+  return route && route.state === 'active' ? `${route.route_id}:${route.generation}` : null;
 }
 
 /**
@@ -117,6 +139,8 @@ export interface UseTalkSessionOptions {
   enabled?: boolean;
   /** Start in this mode as soon as the engine exists. */
   autoStartMode?: TalkMode | null;
+  /** Host-authoritative route selected for this ordinary conversation. */
+  route?: VoiceRouteRecord | null;
 }
 
 export interface UseTalkSession {
@@ -135,7 +159,7 @@ export interface UseTalkSession {
 
 export function useTalkSession(
   sessionId: string,
-  { enabled = true, autoStartMode = null }: UseTalkSessionOptions = {},
+  { enabled = true, autoStartMode = null, route = null }: UseTalkSessionOptions = {},
 ): UseTalkSession {
   const [snapshot, setSnapshot] = useState<TalkSnapshot | null>(null);
   const [status, setStatus] = useState<TalkStatus | null>(null);
@@ -181,7 +205,85 @@ export function useTalkSession(
   const activeTurnRef = useRef<{ turnId: string; fromIndex: number; spoken: string } | null>(null);
   /** The last output device successfully read from settings. */
   const outputDeviceRef = useRef<string | null>(null);
+  const routeRef = useRef<VoiceRouteRecord | null>(route);
+  const routeCursorRef = useRef<{ generation: number; eventId: number } | null>(null);
+  /** The selection the route effect last acted on — see `routeIdentity`. */
+  const routeIdentityRef = useRef<string | null>(null);
+  /**
+   * The highest route event that has already become conversation, with the
+   * conversation it belongs to.
+   *
+   * The daemon's event ids are one monotonic sequence, so this alone is a
+   * complete record of what has been handled — and a complete answer to the
+   * spec's "never replay a physical capture as a new user turn if the durable
+   * turn already exists". The cursor above is an optimization; this is the
+   * guarantee, and it holds even if the cursor rewinds.
+   */
+  const handledEventRef = useRef<{ sessionId: string; eventId: number }>({ sessionId, eventId: 0 });
+  const routeEmitQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+  const routedSpeechRef = useRef(new Map<string, { resolve: () => void; reject: (reason: Error) => void }>());
   const player = useMemo(() => createTalkPlayer(), []);
+
+  const pairedInputDevice = (value: string | undefined | null) => {
+    const match = value?.match(/^paired:(.+):input$/);
+    return match?.[1] ?? null;
+  };
+  const pairedOutputDevice = (value: string | undefined | null) => {
+    const match = value?.match(/^paired:(.+):output$/);
+    return match?.[1] ?? null;
+  };
+  const localDevice = (value: string | undefined | null, direction: 'input' | 'output') => {
+    const prefix = `local:${direction}:`;
+    return value?.startsWith(prefix) ? value.slice(prefix.length) || 'default' : null;
+  };
+  const emitRoute = (
+    currentRoute: VoiceRouteRecord,
+    kind: string,
+    payload: unknown,
+  ) => {
+    routeEmitQueueRef.current = routeEmitQueueRef.current
+      .catch(() => undefined)
+      .then(() => voiceRouteEmit(sessionId, currentRoute.generation, kind, payload))
+      .catch(() => undefined);
+  };
+
+  const activateAndWaitForRoute = useCallback(async (): Promise<VoiceRouteRecord | null> => {
+    const selected = routeRef.current;
+    if (!selected || selected.state !== 'active') return selected;
+    const activated = await voiceRouteActivate(sessionId);
+    routeRef.current = activated;
+    const required = new Map<string, 'input_ready' | 'output_ready'>();
+    if (pairedInputDevice(activated.input_endpoint) && activated.input_command_id) {
+      required.set(activated.input_command_id, 'input_ready');
+    }
+    const pairedOutput = pairedOutputDevice(activated.output_endpoint);
+    if (pairedOutput
+        && pairedInputDevice(activated.input_endpoint) !== pairedOutput
+        && activated.output_command_id) {
+      required.set(activated.output_command_id, 'output_ready');
+    }
+    if (required.size === 0) return activated;
+    let cursor = routeCursorRef.current?.generation === activated.generation
+      ? routeCursorRef.current.eventId
+      : 0;
+    const deadline = Date.now() + 20_000;
+    while (required.size > 0 && Date.now() < deadline) {
+      const events = await voiceRouteEvents(sessionId, cursor, 100);
+      for (const event of events) {
+        cursor = Math.max(cursor, event.event_id);
+        if (event.generation !== activated.generation || !event.payload || typeof event.payload !== 'object') continue;
+        const payload = event.payload as Record<string, unknown>;
+        const commandId = typeof payload.command_id === 'string' ? payload.command_id : '';
+        if (commandId && required.get(commandId) === event.kind) required.delete(commandId);
+      }
+      routeCursorRef.current = { generation: activated.generation, eventId: cursor };
+      if (required.size > 0) await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    if (required.size > 0) {
+      throw new Error('A paired VoiceRoute endpoint did not become ready within 20 seconds');
+    }
+    return activated;
+  }, [sessionId]);
 
   useEffect(() => {
     grantRef.current = grant;
@@ -282,7 +384,14 @@ export function useTalkSession(
         const grantForCapture = await ensureGrant();
         void grantForCapture;
         const config = await companionClient.config();
-        const deviceId = config.voice.inputDeviceId ?? undefined;
+        const selected = routeRef.current?.state === 'active'
+          ? routeRef.current.input_endpoint
+          : null;
+        if (pairedInputDevice(selected)) {
+          throw new Error('The paired VoiceRoute endpoint owns microphone capture for this Talk session');
+        }
+        const routedLocal = localDevice(selected, 'input');
+        const deviceId = (routedLocal && routedLocal !== 'default' ? routedLocal : config.voice.inputDeviceId) ?? undefined;
         streamRef.current = await navigator.mediaDevices.getUserMedia({
           audio: deviceId
             ? { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true }
@@ -400,6 +509,8 @@ export function useTalkSession(
       },
       submitTurn: async (text, utteranceId) => {
         // The composer's own call. `voice` only labels where the turn was made.
+        // A paired microphone enters here too, so both sources are literally the
+        // same ordinary conversation execution path.
         const session = useSessionStore
           .getState()
           .sessions.find((entry) => entry.id === sessionId);
@@ -408,37 +519,82 @@ export function useTalkSession(
           fromIndex: session?.messages.length ?? 0,
           spoken: '',
         };
+        let failure: string | null = null;
         try {
           await runAgentTurn(sessionId, text, [], undefined, utteranceId, [], [], false, null, 'voice');
+        } catch (reason) {
+          failure = errorMessage(reason);
+          throw reason;
         } finally {
-          // The turn is over when the call that ran it settles — a turn that
-          // only ran tools and said nothing included, which is why the
-          // microphone is released here and not on the arrival of some text.
-          // The store's running flag cannot tell two overlapping turns apart;
-          // this can, and the engine drops the id it has moved past.
-          activeTurnRef.current = null;
-          sessionRef.current?.onTurnFinished(utteranceId);
+          const currentRoute = routeRef.current;
+          if (currentRoute?.state === 'active' && pairedInputDevice(currentRoute.input_endpoint)) {
+            emitRoute(
+              currentRoute,
+              failure ? 'turn_failed' : 'turn_finished',
+              failure ? { turn_id: utteranceId, error: failure } : { turn_id: utteranceId },
+            );
+          }
+          if (activeTurnRef.current?.turnId === utteranceId) {
+            activeTurnRef.current = null;
+            sessionRef.current?.onTurnFinished(utteranceId, failure ?? undefined);
+          }
         }
       },
       cancelTurn: () => stopTurn(sessionId),
+      speakText: async (text, jobId) => {
+        const currentRoute = routeRef.current;
+        const pairedOutput = pairedOutputDevice(currentRoute?.output_endpoint);
+        if (!currentRoute || currentRoute.state !== 'active' || !pairedOutput) return false;
+        // A same-device duplex route already synthesizes the same assistant
+        // deltas on the input Talk socket. Do not emit a second speech job.
+        if (pairedInputDevice(currentRoute.input_endpoint) === pairedOutput) return true;
+        const completion = new Promise<void>((resolve, reject) => {
+          routedSpeechRef.current.set(jobId, { resolve, reject });
+        });
+        try {
+          await voiceRouteEmit(sessionId, currentRoute.generation, 'speak_text', {
+            job_id: jobId,
+            turn_id: activeTurnRef.current?.turnId ?? '',
+            text,
+          });
+          await Promise.race([
+            completion,
+            new Promise<void>((_, reject) => setTimeout(() => reject(new Error('Paired speaker did not acknowledge playback')), 90_000)),
+          ]);
+          return true;
+        } finally {
+          routedSpeechRef.current.delete(jobId);
+        }
+      },
       synthesize: async (text, jobId) => {
         const speech = await talkClient.synthesize(jobId, text);
         return { audioBase64: speech.audioBase64, mediaType: speech.mediaType };
       },
       play: async (audioBase64, mediaType) => {
-        // Read the chosen output before every chunk rather than freezing it for
-        // the session: moving to headphones mid-conversation should be audible
-        // on the next sentence. `config()` is an in-memory read on the Rust
-        // side, and a read that fails is not worth dropping a sentence over —
-        // the device the operator last chose is still the best guess.
+        const currentRoute = routeRef.current;
         try {
-          outputDeviceRef.current = (await companionClient.config()).voice.outputDeviceId;
+          const configured = (await companionClient.config()).voice.outputDeviceId;
+          const routedLocal = localDevice(currentRoute?.output_endpoint, 'output');
+          outputDeviceRef.current = routedLocal && routedLocal !== 'default' ? routedLocal : configured;
         } catch {
           /* keep the last known output */
         }
         await player.play(base64AudioBlob(audioBase64, mediaType), outputDeviceRef.current);
       },
-      stopPlayback: () => player.stop(),
+      stopPlayback: () => {
+        player.stop();
+        const currentRoute = routeRef.current;
+        const pairedOutput = pairedOutputDevice(currentRoute?.output_endpoint);
+        if (currentRoute?.state === 'active'
+            && pairedOutput
+            && pairedInputDevice(currentRoute.input_endpoint) !== pairedOutput) {
+          emitRoute(currentRoute, 'output_stop', { reason: 'host_interrupt' });
+        }
+        for (const pending of routedSpeechRef.current.values()) {
+          pending.reject(new Error('Playback interrupted'));
+        }
+        routedSpeechRef.current.clear();
+      },
       recordMetric: (metric) => {
         void talkClient.recordMetric(metric).catch(() => undefined);
       },
@@ -506,6 +662,100 @@ export function useTalkSession(
   }, [autoStartMode, enabled, ports, releaseDevices, sessionId]);
 
   useEffect(() => {
+    routeRef.current = route;
+    // Only a real change of selection may touch devices or rewind the cursor. A
+    // re-fetch of the same route arrives as a different object several times a
+    // session, and treating it as a change re-read this generation's events
+    // from zero — replaying every transcript already spoken as another turn.
+    const identity = routeIdentity(route);
+    if (identity === routeIdentityRef.current) return;
+    routeIdentityRef.current = identity;
+    const external = Boolean(route?.state === 'active' && pairedInputDevice(route.input_endpoint));
+    // Local capture closes here, before the paired endpoint is asked to own
+    // one below: there must never be an interval where both microphones are
+    // intentionally recording for this conversation.
+    sessionRef.current?.setExternalInput(external);
+    if (external) releaseDevices();
+    routeCursorRef.current = route ? { generation: route.generation, eventId: 0 } : null;
+    // A selector can move the route while Talk is already running. Selection
+    // itself never opens a microphone; activation here preserves that privacy
+    // boundary while making live handoff take effect immediately.
+    if (route?.state === 'active' && snapshot?.state && snapshot.state !== 'off') {
+      void activateAndWaitForRoute().catch(async (reason) => {
+        setSetupError(errorMessage(reason));
+        // Closing local capture first is only safe while a failed activation
+        // still leaves a working microphone. `move_route` restores the previous
+        // endpoints under a fresh generation when a handoff fails, so read that
+        // authoritative record back and hand ownership to local capture again
+        // whenever it no longer says a paired device holds it.
+        if (!external) return;
+        const restored = await voiceRouteGet(sessionId).catch(() => null);
+        routeRef.current = restored;
+        if (!restored || restored.state !== 'active' || !pairedInputDevice(restored.input_endpoint)) {
+          sessionRef.current?.setExternalInput(false);
+        }
+      });
+    }
+  }, [activateAndWaitForRoute, releaseDevices, route, sessionId]);
+
+  useEffect(() => {
+    if (!enabled || snapshot?.state === 'off' || !route || route.state !== 'active'
+        || (!pairedInputDevice(route.input_endpoint) && !pairedOutputDevice(route.output_endpoint))) return;
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = async () => {
+      try {
+        const cursor = routeCursorRef.current?.generation === route.generation
+          ? routeCursorRef.current.eventId
+          : 0;
+        const events = await voiceRouteEvents(sessionId, cursor, 100);
+        if (disposed) return;
+        let next = cursor;
+        for (const event of events) {
+          next = Math.max(next, event.event_id);
+          if (event.generation !== route.generation || typeof event.payload !== 'object' || !event.payload) continue;
+          const handled = handledEventRef.current;
+          if (handled.sessionId === sessionId && event.event_id <= handled.eventId) continue;
+          handledEventRef.current = { sessionId, eventId: event.event_id };
+          const payload = event.payload as Record<string, unknown>;
+          if (event.kind === 'input_transcript') {
+            const text = typeof payload.text === 'string' ? payload.text : '';
+            const turnId = typeof payload.turn_id === 'string' ? payload.turn_id : '';
+            if (text && turnId) {
+              void sessionRef.current?.acceptExternalTranscript(text, turnId, {
+                speechDetectionMs: typeof payload.speech_detection_ms === 'number' ? payload.speech_detection_ms : null,
+                sttMs: typeof payload.stt_ms === 'number' ? payload.stt_ms : null,
+              });
+            }
+          } else if (event.kind === 'interrupt') {
+            sessionRef.current?.interrupt(
+              typeof payload.reason === 'string' ? payload.reason : 'remote_barge_in',
+            );
+          } else if (event.kind === 'output_played' || event.kind === 'output_failed') {
+            const jobId = typeof payload.job_id === 'string' ? payload.job_id : '';
+            const pending = jobId ? routedSpeechRef.current.get(jobId) : undefined;
+            if (pending) {
+              if (event.kind === 'output_played') pending.resolve();
+              else pending.reject(new Error(typeof payload.error === 'string' ? payload.error : 'Paired speaker playback failed'));
+              routedSpeechRef.current.delete(jobId);
+            }
+          }
+        }
+        routeCursorRef.current = { generation: route.generation, eventId: next };
+      } catch (reason) {
+        if (!disposed) setSetupError(errorMessage(reason));
+      } finally {
+        if (!disposed) timer = setTimeout(() => void poll(), 180);
+      }
+    };
+    void poll();
+    return () => {
+      disposed = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [enabled, route, sessionId, snapshot?.state]);
+
+  useEffect(() => {
     sessionRef.current?.setMode(mode);
   }, [mode]);
 
@@ -549,23 +799,35 @@ export function useTalkSession(
       // rewritten and none of what is there now has been said out loud.
       const delta = text.startsWith(active.spoken) ? text.slice(active.spoken.length) : text;
       active.spoken = text;
-      if (delta) engine.onAssistantDelta(delta, active.turnId);
+      if (delta) {
+        engine.onAssistantDelta(delta, active.turnId);
+        const currentRoute = routeRef.current;
+        if (currentRoute?.state === 'active' && pairedInputDevice(currentRoute.input_endpoint)) {
+          emitRoute(currentRoute, 'assistant_delta', { turn_id: active.turnId, text: delta });
+        }
+      }
     });
   }, [sessionId]);
 
   const start = useCallback(async () => {
     setSetupError(null);
     try {
+      const currentRoute = routeRef.current;
+      sessionRef.current?.setExternalInput(Boolean(
+        currentRoute?.state === 'active' && pairedInputDevice(currentRoute.input_endpoint),
+      ));
+      if (currentRoute?.state === 'active') await activateAndWaitForRoute();
       await sessionRef.current?.start();
     } catch (reason) {
       setSetupError(errorMessage(reason));
     }
-  }, []);
+  }, [activateAndWaitForRoute, sessionId]);
 
   const stop = useCallback(async () => {
     await sessionRef.current?.stop();
+    await voiceRouteDeactivate(sessionId).catch(() => null);
     releaseDevices();
-  }, [releaseDevices]);
+  }, [releaseDevices, sessionId]);
 
   /**
    * Turning Always Listening off closes the microphone it opened. Here, not in

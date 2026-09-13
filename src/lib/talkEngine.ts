@@ -88,6 +88,8 @@ export interface TalkPorts {
   submitTurn(text: string, utteranceId: string): Promise<void>;
   /** Ask the running turn to stop. Best effort — see `interrupt`. */
   cancelTurn(): void;
+  /** Optional routed speech sink. Return true when this chunk was played remotely. */
+  speakText?(text: string, jobId: string): Promise<boolean>;
   /** The operator's own configured speech synthesizer. */
   synthesize(text: string, jobId: string): Promise<{ audioBase64: string; mediaType: string }>;
   /** Queue one synthesized chunk for playback. Resolves when it has been played. */
@@ -144,6 +146,8 @@ export class TalkSession {
   private capturing = false;
   private running = false;
   private held = false;
+  /** True when a paired device owns microphone/VAD and delivers finalized text. */
+  private externalInput = false;
 
   /** Identity of the utterance being recorded, minted before the audio is sent. */
   private utteranceId: string | null = null;
@@ -206,6 +210,67 @@ export class TalkSession {
     };
   }
 
+  setExternalInput(enabled: boolean): void {
+    if (this.externalInput === enabled) return;
+    this.externalInput = enabled;
+    this.held = false;
+    if (enabled) {
+      void this.ports.disarmWakeWord();
+      if (this.capturing) {
+        void this.ports.stopRecording().finally(() => {
+          this.capturing = false;
+          this.vad.reset();
+          if (this.running && this.currentTurnId === null) this.setState('armed');
+        });
+      } else if (this.running && this.currentTurnId === null) {
+        this.setState('armed');
+      }
+    } else if (this.running && this.currentTurnId === null && this.mode === 'continuous') {
+      void this.settleCapture();
+    }
+    this.emit();
+  }
+
+  /**
+   * Accepts one already-finalized utterance from the selected paired endpoint.
+   * It enters the exact same submit/assistant/TTS state machine as local STT; no
+   * second conversation or mobile-chat recipe is created.
+   */
+  async acceptExternalTranscript(
+    text: string,
+    utteranceId: string,
+    metadata: { speechDetectionMs?: number | null; sttMs?: number | null } = {},
+  ): Promise<void> {
+    if (!this.running || !this.externalInput) return;
+    const spoken = text.trim();
+    if (!spoken || !utteranceId) return;
+    if (this.state === 'thinking' || this.state === 'speaking') this.interrupt('remote_barge_in');
+    this.transcript = spoken;
+    this.assistantText = '';
+    this.chunker.reset();
+    this.interruptedThisTurn = false;
+    this.fallbackThisTurn = false;
+    this.turnAbandoned = false;
+    this.error = null;
+    this.firstTokenAt = null;
+    this.firstAudioAt = null;
+    this.spokenChunks = 0;
+    this.turnStartedAt = this.ports.now();
+    this.pendingMetric = {
+      speechDetectionMs: metadata.speechDetectionMs ?? null,
+      sttMs: metadata.sttMs ?? null,
+      startedAt: this.turnStartedAt,
+    };
+    this.currentTurnId = utteranceId;
+    this.setState('thinking');
+    void this.ports.submitTurn(spoken, utteranceId).catch((reason) => {
+      if (this.currentTurnId !== utteranceId) return;
+      this.fallbackThisTurn = true;
+      this.fail(reason);
+      if (this.running) this.setState('armed');
+    });
+  }
+
   setMode(mode: TalkMode): void {
     if (this.mode === mode) return;
     this.mode = mode;
@@ -223,7 +288,8 @@ export class TalkSession {
     this.error = null;
     this.turnAbandoned = false;
     this.setState('starting');
-    if (this.mode === 'continuous' && this.wakeWordEnabled) await this.armWakeWord(false);
+    if (this.externalInput) this.setState('armed');
+    else if (this.mode === 'continuous' && this.wakeWordEnabled) await this.armWakeWord(false);
     else if (this.mode === 'continuous') await this.beginUtterance();
     else this.setState('armed');
   }
@@ -244,6 +310,7 @@ export class TalkSession {
 
   /** Push-to-talk, pressed. */
   async press(): Promise<void> {
+    if (this.externalInput) return;
     if (!this.running || this.mode !== 'push_to_talk') return;
     this.held = true;
     // Pressing while the assistant is talking is the plainest possible
@@ -354,7 +421,7 @@ export class TalkSession {
     // whole answer away and, for a run that never settles, never comes at all.
     // `beginUtterance` opens the microphone before it reports listening, so
     // "Listening" cannot mean "nothing can hear you".
-    if (this.running && this.mode === 'continuous') {
+    if (this.running && this.mode === 'continuous' && !this.externalInput) {
       void this.beginUtterance({ continuingSpeech: true });
       return;
     }
@@ -405,6 +472,7 @@ export class TalkSession {
     this.speechQueue = this.speechQueue.then(() => {
       this.finishTurnMetrics();
       if (!this.running) this.setState('off');
+      else if (this.externalInput) this.setState('armed');
       else if (this.mode === 'continuous' && this.wakeWordEnabled) void this.armWakeWord(true);
       else if (this.mode === 'continuous') void this.beginUtterance();
       else this.setState('armed');
@@ -423,7 +491,7 @@ export class TalkSession {
   private async beginUtterance(
     options: { continuingSpeech?: boolean; afterSample?: number } = {},
   ): Promise<void> {
-    if (this.capturing || !this.running) return;
+    if (this.externalInput || this.capturing || !this.running) return;
     try {
       await this.ports.startRecording(
         options.afterSample === undefined ? undefined : { afterSample: options.afterSample },
@@ -451,6 +519,13 @@ export class TalkSession {
   /** Stop the microphone without submitting — used when the mode changes. */
   private async settleCapture(): Promise<void> {
     await this.ports.disarmWakeWord();
+    if (this.externalInput) {
+      if (this.capturing) await this.ports.stopRecording();
+      this.capturing = false;
+      this.vad.reset();
+      this.setState(this.running ? 'armed' : 'off');
+      return;
+    }
     if (this.capturing) {
       await this.ports.stopRecording();
       this.capturing = false;
@@ -578,6 +653,12 @@ export class TalkSession {
         if (generation !== this.playbackGeneration) return;
         try {
           const jobId = `talk-tts-${crypto.randomUUID()}`;
+          if (this.ports.speakText && await this.ports.speakText(chunk, jobId)) {
+            if (generation !== this.playbackGeneration) return;
+            if (this.firstAudioAt === null) this.firstAudioAt = this.ports.now();
+            this.spokenChunks += 1;
+            return;
+          }
           const audio = await this.ports.synthesize(chunk, jobId);
           if (generation !== this.playbackGeneration) return;
           if (this.firstAudioAt === null) this.firstAudioAt = this.ports.now();

@@ -355,8 +355,14 @@ pub const REMOTE_ROUTES: &[RemoteRouteSpec] = &[
     RemoteRouteSpec {
         plane: RemotePlane::Device,
         method: "POST",
+        // Self-service at the gate on purpose: one ticket route now serves an
+        // input role (needs `voice_stream`), an output role (needs
+        // `audio_playback`), and duplex (needs both). A single blanket
+        // capability gate would refuse a legitimate speaker-only device. The
+        // grant is enforced per role inside the handler, which also binds the
+        // route, its generation, and the endpoint to this device.
         path: "/v1/remote/device/talk/ticket",
-        gate: RemoteGate::Capability("VoiceStream"),
+        gate: RemoteGate::SelfService,
     },
     RemoteRouteSpec {
         plane: RemotePlane::Device,

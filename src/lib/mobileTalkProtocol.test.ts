@@ -73,6 +73,34 @@ function feed(
 }
 
 describe("the Talk frame builder", () => {
+  it("builds playback acknowledgements after the hello", () => {
+    const frames = newFrames();
+    frames.hello();
+    expect(frames.playbackAck(7, true)).toEqual({
+      ...envelope(2),
+      type: "playback_ack",
+      audio_sequence: 7,
+      played: true,
+    });
+    expect(frames.playbackAck(8, false)).toEqual({
+      ...envelope(3),
+      type: "playback_ack",
+      audio_sequence: 8,
+      played: false,
+    });
+  });
+
+  it("acknowledges a causal Realtime input gate on the same socket", () => {
+    const frames = newFrames();
+    frames.hello();
+    expect(frames.inputGateAck(23, false)).toEqual({
+      ...envelope(2),
+      type: "input_gate_ack",
+      gate_sequence: 23,
+      open: false,
+    });
+  });
+
   it("opens with a hello and numbers every later frame after it", () => {
     const frames = newFrames();
 
@@ -572,6 +600,8 @@ describe("the frames the runner will actually receive", () => {
       frames.audio({ audioBase64: "AAECAwQ=", last: false }),
       frames.audio({ audioBase64: "BQYHCA==", last: true }),
       frames.interrupt("barge_in"),
+      frames.playbackAck(7, true),
+      frames.inputGateAck(23, false),
     ];
 
     const fixture = fileURLToPath(

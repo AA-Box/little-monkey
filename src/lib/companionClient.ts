@@ -35,7 +35,9 @@ export type RealtimeTurnDetectionKind = 'semantic_vad' | 'manual';
 export interface VoiceConfig {
   /** Desktop Talk engine. Absent in an older saved/test config means pipeline. */
   engineKind?: VoiceEngineKind;
-  realtimeProviderId?: 'openai';
+  /** Which realtime provider serves a Talk session. Absent or unrecognised
+   * means OpenAI: `loopback` is a local test peer, never a default. */
+  realtimeProviderId?: 'openai' | 'loopback';
   realtimeModel?: string;
   realtimeVoice?: string;
   realtimeTurnDetection?: RealtimeTurnDetectionKind;
@@ -101,6 +103,12 @@ export interface RealtimeVoiceConnectResponse {
   providerRequestId: string | null;
 }
 
+export interface RealtimeVoiceMediaBridge {
+  protocolVersion: number;
+  baseUrl: string;
+  token: string;
+}
+
 export interface RealtimeVoiceStatus {
   providerId: 'openai';
   configured: boolean;
@@ -136,6 +144,7 @@ export const realtimeVoiceClient = {
   disconnect: (sessionId: string) =>
     invoke<void>('realtime_voice_disconnect', { sessionId }),
   status: () => invoke<RealtimeVoiceStatus>('realtime_voice_status'),
+  mediaBridge: () => invoke<RealtimeVoiceMediaBridge>('realtime_voice_media_bridge'),
   recordMetric: (metric: RealtimeVoiceMetric) =>
     invoke<void>('realtime_voice_metric_record', { metric }),
   metrics: () => invoke<RealtimeVoiceMetricsSnapshot>('realtime_voice_metrics'),
