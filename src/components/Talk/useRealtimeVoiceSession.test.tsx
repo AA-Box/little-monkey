@@ -107,6 +107,9 @@ class FakeSession implements RealtimeVoiceSession {
   constructor(
     readonly config: RealtimeVoiceSessionConfig,
     readonly onEvent: (event: RealtimeVoiceEvent) => void,
+    /** Which provider handed this session out, so a test can tell the far end
+     * apart without reaching into the hook's internals. */
+    readonly providerId: string = 'openai',
   ) {}
 
   async connect(): Promise<void> {
@@ -156,6 +159,23 @@ vi.mock('../../lib/openAiRealtimeVoice', () => ({
       onEvent: (event: RealtimeVoiceEvent) => void,
     ): RealtimeVoiceSession {
       const session = new FakeSession(config, onEvent);
+      sessions.push(session);
+      return session;
+    }
+  },
+}));
+
+/** The local test peer is replaced for the same reason OpenAI is: these tests
+ * are about which far end the hook picks, not about what either one does. */
+vi.mock('../../lib/loopbackRealtimeVoice', () => ({
+  LoopbackRealtimeVoiceProvider: class {
+    readonly id = 'loopback';
+    readonly capabilities = CAPABILITIES;
+    createSession(
+      config: RealtimeVoiceSessionConfig,
+      onEvent: (event: RealtimeVoiceEvent) => void,
+    ): RealtimeVoiceSession {
+      const session = new FakeSession(config, onEvent, 'loopback');
       sessions.push(session);
       return session;
     }
@@ -768,5 +788,76 @@ describe('barge-in from the paired microphone', () => {
     voiceRoute = pairedRoute(4);
     view.rerender({ route: voiceRoute });
     await waitFor(() => expect(session.inputRoutes).toHaveLength(2));
+  });
+});
+
+/**
+ * Which far end a Talk session connects to.
+ *
+ * The loopback peer exists so Voice Everywhere can be exercised without an
+ * OpenAI key; it echoes audio and answers nothing. That makes reaching it by
+ * accident the defect worth guarding: a config written by an older build, or
+ * one carrying a provider id this build has never heard of, must still reach
+ * the real provider rather than a peer that quietly says nothing useful.
+ */
+describe('choosing the realtime provider', () => {
+  function withProvider(providerId: string | undefined): VoiceConfig {
+    const { realtimeProviderId: _dropped, ...rest } = VOICE;
+    return providerId === undefined
+      ? (rest as VoiceConfig)
+      // Cast because the defect under test is a value that the type system
+      // says cannot exist: a persisted config is JSON from disk, not a literal.
+      : ({ ...rest, realtimeProviderId: providerId } as unknown as VoiceConfig);
+  }
+
+  it('connects to OpenAI when the configuration names no realtime provider at all', async () => {
+    const { session } = await open(withProvider(undefined));
+    expect(session.providerId).toBe('openai');
+  });
+
+  it("connects to OpenAI when the configuration explicitly names 'openai'", async () => {
+    const { session } = await open(withProvider('openai'));
+    expect(session.providerId).toBe('openai');
+  });
+
+  it("connects to the local loopback test peer only when the configuration explicitly names 'loopback'", async () => {
+    const { session } = await open(withProvider('loopback'));
+    expect(session.providerId).toBe('loopback');
+  });
+
+  it('connects to OpenAI when the configuration names a provider this build does not know', async () => {
+    const { session } = await open(withProvider('anthropic-realtime-2029'));
+    expect(session.providerId).toBe('openai');
+  });
+
+  it('keeps one session per start, and hands the next start to the newly configured provider', async () => {
+    const view = renderHook(
+      ({ voice }) => useRealtimeVoiceSession('chat', voice),
+      { initialProps: { voice: withProvider('loopback') } },
+    );
+    await act(async () => { await view.result.current.start(); });
+    expect(sessions.map((session) => session.providerId)).toEqual(['loopback']);
+    feed(sessions[0], { type: 'connected' });
+
+    // A re-render with an equal-but-new config object is what a settings save
+    // or any unrelated store update looks like from here. Rebuilding the
+    // provider on every render would be invisible until something started a
+    // second session on it.
+    view.rerender({ voice: withProvider('loopback') });
+    await act(async () => { await view.result.current.start(); });
+    expect(sessions).toHaveLength(1);
+
+    // Switching the configured provider mid-session must not orphan the live
+    // one: it stays connected and is closed exactly once, by `stop`.
+    view.rerender({ voice: withProvider('openai') });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].closes).toBe(0);
+
+    await act(async () => { await view.result.current.stop(); });
+    expect(sessions[0].closes).toBe(1);
+
+    await act(async () => { await view.result.current.start(); });
+    expect(sessions.map((session) => session.providerId)).toEqual(['loopback', 'openai']);
   });
 });

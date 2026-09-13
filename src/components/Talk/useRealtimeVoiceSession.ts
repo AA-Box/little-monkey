@@ -11,6 +11,7 @@ import {
   voiceRouteEvents,
 } from '../../lib/daemonClient';
 import type { ProviderModelTargetSnapshot } from '../../lib/modelTargets';
+import { LoopbackRealtimeVoiceProvider } from '../../lib/loopbackRealtimeVoice';
 import { OpenAiRealtimeVoiceProvider } from '../../lib/openAiRealtimeVoice';
 import { RealtimeRouteBridge } from '../../lib/realtimeRouteBridge';
 import {
@@ -124,7 +125,20 @@ export function useRealtimeVoiceSession(
   route: VoiceRouteRecord | null = null,
 ): UseRealtimeVoiceSession {
   const controller = useMemo(() => new RealtimeVoiceController(), []);
-  const provider = useMemo(() => new OpenAiRealtimeVoiceProvider(), []);
+  /**
+   * Only an explicit `loopback` reaches the local test peer.
+   *
+   * The comparison is deliberately against the loopback id rather than against
+   * `'openai'`: a config written by an older build, a hand-edited one, or one
+   * carrying a provider id this build has never heard of must connect to the
+   * real provider, not to a peer that answers with silence.
+   */
+  const provider = useMemo(
+    () => (voice.realtimeProviderId === 'loopback'
+      ? new LoopbackRealtimeVoiceProvider()
+      : new OpenAiRealtimeVoiceProvider()),
+    [voice.realtimeProviderId],
+  );
   const [state, setState] = useState<RealtimeVoiceState>('idle');
   const [inputTranscript, setInputTranscript] = useState('');
   const [outputTranscript, setOutputTranscript] = useState('');

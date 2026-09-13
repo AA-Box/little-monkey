@@ -894,7 +894,15 @@ pub fn validate_config(config: &CompanionConfig) -> Result<(), String> {
         || !(400..=2_000).contains(&config.voice.vad_silence_ms)
         || !(1_000..=90_000).contains(&config.voice.vad_max_utterance_ms)
         || config.voice.vad_min_speech_ms >= config.voice.vad_max_utterance_ms
-        || config.voice.realtime_provider_id != "openai"
+        // "loopback" is the in-process test far end, not a second vendor: it
+        // makes no network call and answers with a tone. It is admitted here
+        // only so that a routing claim can be exercised without a provider
+        // credential; `default_realtime_provider_id` stays "openai" so nothing
+        // reaches it except an explicit choice.
+        || !matches!(
+            config.voice.realtime_provider_id.as_str(),
+            "openai" | "loopback"
+        )
         || config.voice.realtime_model.is_empty()
         || config.voice.realtime_model.len() > 128
         || !config

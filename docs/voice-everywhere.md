@@ -82,6 +82,85 @@ Nothing here touches the VoiceRoute ledger. Audio exists only in those bounded q
 
 **What this costs.** Because the provider peer lives in the desktop webview, a paired Realtime route needs the desktop app open and hosting that session: the daemon alone cannot serve one, and the loopback descriptor is reachable only from the desktop process. Paired Realtime audio therefore makes a round trip through this machine — device → daemon queue → webview → provider, and back the same way — which is a hop local Realtime does not pay, and both directions inherit the queue's backpressure limits. If the bridge fails, the session is closed and the route deactivated as `paired_media_bridge_failed`; it is never degraded to the Pipeline engine behind your back.
 
+## Proving it works
+
+Acceptance splits along the line that separates the two real risks: whether
+Voice Everywhere routes the audio correctly, and whether OpenAI accepts the
+session it is handed. The first is this project's own and needs no credentials;
+the second belongs to an external service and needs a key. They are tested
+separately because conflating them made the routing look unprovable when it is
+not.
+
+**Layer 1 — the routing, with no credentials.**
+
+```bash
+pnpm test:realtime:loopback --path README.md
+```
+
+This runs the desktop app itself with the realtime far end set to `loopback`: a
+real `RTCPeerConnection` carrying a real data channel and a real audio track
+through a real SDP exchange, driven by the production session class with its own
+`appendInputPcm16`, its input/output route switching and its teardown. Only the
+far end is substituted — instead of OpenAI's servers, a local peer that answers
+the SDP offer and speaks the same data-channel event dialect, exported as
+`LoopbackRealtimeVoiceProvider` (provider id `loopback`) from
+`src/lib/loopbackRealtimeVoice.ts`.
+
+Be precise about what that run covers: it is the **desktop half** of the
+Realtime path. It does not pair a device, open a Talk socket or start a daemon,
+so it is not on its own evidence about a paired microphone.
+
+The paired half is covered separately, and the two meet in the middle:
+
+- The device leg — signed ticket, authenticated Talk socket, route binding,
+  bounded output chunks paced by playback acknowledgement, stale generations,
+  ticket replay and revocation — is covered by socket tests that bind a real
+  TCP listener and drive a real WebSocket client through production's own
+  connection path, including the Realtime dialect carrying PCM into and out of
+  the media bridge without touching transcription. Run them with
+  `cargo test --manifest-path src-tauri/Cargo.toml --bin monkey-cli`.
+- The join — a paired phone speaking into a Realtime conversation whose far end
+  is the loopback peer — is a manual run today, because it needs a second
+  physical device. Pair the phone, grant `voice_stream` and `audio_playback`,
+  set the route with `monkey voice route set <session> --input
+  paired:<device>:input --output paired:<device>:output --engine realtime`,
+  choose the loopback far end in Settings → Talk, and start Talk. The phone's
+  speech reaches the local peer and its tone comes back to the phone's speaker,
+  with no credential anywhere in the path.
+
+Nobody should read the automated Layer 1 run as proof of that last bullet. It is
+named here as the procedure, not as a passing result.
+
+**Layer 2 — OpenAI compatibility.** The adapter's mocked contract tests pin what
+the product sends and accepts — the SDP exchange with the native broker, the
+`oai-events` dialect, and `input_audio_buffer.append` — and run with the rest of
+the suite:
+
+```bash
+pnpm test
+```
+
+A run against OpenAI's own servers stays optional, for whoever holds a key:
+
+```bash
+pnpm test:realtime:live --path README.md
+```
+
+**What layer 1 does not prove.** The loopback peer answers the event dialect
+because it was written to; it is a stand-in, not a witness. It says nothing
+about whether OpenAI currently accepts this exact session — this model name,
+voice, turn-detection mode and tool schema. Only the live run answers that, and
+that is a question about an external service rather than about routing.
+
+### The loopback provider
+
+`loopback` is a test peer, not a second way to talk to something. It makes no
+network call, contacts no provider, reads no credential, and produces no
+answers: the audio that comes back is whatever the test peer generated, not a
+reply to what was said. It is selectable wherever the realtime provider is
+chosen so an acceptance run can reach it, and it is never the default — OpenAI
+remains the default for every ordinary Talk session.
+
 ## CLI
 
 Inspect endpoints:

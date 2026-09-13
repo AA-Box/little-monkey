@@ -46,7 +46,10 @@ contacts only the compiled-in OpenAI Realtime calls origin, then returns an SDP
 answer. The credential is never exposed to JavaScript, a URL, logs, transcript,
 or metrics. A privacy acknowledgement is required before the microphone opens,
 and Security Doctor reports realtime voice as a separate configured/active
-status. Provider function calls do not create a permission shortcut; they enter
+status. The `loopback` test peer that the credential-free acceptance run
+selects never reaches that broker: it answers the SDP offer locally, so no key
+is read and no realtime audio leaves the machine. It is never the default, and
+selecting it is not a way to hold a conversation. Provider function calls do not create a permission shortcut; they enter
 the same schema validation, permission prompt, plan-mode, sandbox, workspace,
 network, MCP, extension, and hook boundary as typed turns. Details and teardown
 semantics are in [Desktop realtime voice](realtime-voice.md).

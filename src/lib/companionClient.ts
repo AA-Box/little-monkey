@@ -35,7 +35,9 @@ export type RealtimeTurnDetectionKind = 'semantic_vad' | 'manual';
 export interface VoiceConfig {
   /** Desktop Talk engine. Absent in an older saved/test config means pipeline. */
   engineKind?: VoiceEngineKind;
-  realtimeProviderId?: 'openai';
+  /** Which realtime provider serves a Talk session. Absent or unrecognised
+   * means OpenAI: `loopback` is a local test peer, never a default. */
+  realtimeProviderId?: 'openai' | 'loopback';
   realtimeModel?: string;
   realtimeVoice?: string;
   realtimeTurnDetection?: RealtimeTurnDetectionKind;

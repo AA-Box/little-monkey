@@ -462,21 +462,34 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
             <AlertTriangle size={14} />
             <h4 className="text-xs font-semibold">Realtime provider</h4>
             <span className={`ml-auto text-[11px] ${realtimeStatus?.configured ? 'text-success' : 'text-warning'}`}>
-              {realtimeStatus?.configured ? `${realtimeStatus.activeSessions} active · key in OS keychain` : 'OpenAI key required'}
+              {voice.realtimeProviderId === 'loopback'
+                ? 'Loopback test peer · no provider key used'
+                : realtimeStatus?.configured ? `${realtimeStatus.activeSessions} active · key in OS keychain` : 'OpenAI key required'}
             </span>
           </div>
+          {/* The privacy claim below is only true of the real provider, so the
+              loopback peer states its own terms rather than borrowing them. */}
           <p className="mt-1 text-[11px] text-faint">
-            During an active session, microphone audio and a bounded text context are sent to OpenAI.
-            The ordinary API key stays in the native keychain broker and is never exposed to the WebView, logs, storage, or a URL.
+            {voice.realtimeProviderId === 'loopback'
+              ? 'Nothing leaves this machine. Audio is answered by a local test peer, so the session proves the routing and produces no real answers.'
+              : 'During an active session, microphone audio and a bounded text context are sent to OpenAI. The ordinary API key stays in the native keychain broker and is never exposed to the WebView, logs, storage, or a URL.'}
           </p>
           <p className="mt-1 text-[11px] text-faint">
             Capabilities: audio in/out, input and assistant transcripts, semantic or manual VAD, barge-in, function tools, and provider usage events.
           </p>
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <label className="text-xs text-muted">Provider
-              <select className={`${INPUT} mt-1`} value={voice.realtimeProviderId ?? 'openai'} disabled>
+              <select
+                className={`${INPUT} mt-1`}
+                value={voice.realtimeProviderId ?? 'openai'}
+                onChange={(event) => patch({ realtimeProviderId: event.target.value as VoiceConfig['realtimeProviderId'] })}
+              >
                 <option value="openai">OpenAI (fixed official origin)</option>
+                <option value="loopback">Loopback test peer — local, not a model</option>
               </select>
+              <span className="mt-1 block text-[11px] text-faint">
+                The loopback peer is for testing audio routing only: it runs on this machine, makes no network call, and echoes rather than answers.
+              </span>
             </label>
             <label className="text-xs text-muted">Model
               <input className={`${INPUT} mt-1`} value={voice.realtimeModel ?? 'gpt-realtime-2.1'} maxLength={128} onChange={(event) => patch({ realtimeModel: event.target.value })} />
