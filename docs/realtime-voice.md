@@ -223,6 +223,14 @@ harness is exercised in CI against a scripted provider, including the case
 where the provider never speaks after a tool result — the harness fails that
 run rather than hanging.
 
+That run is about OpenAI, not about the routing around it. The credential-free
+half — a real peer connection, a real data channel and a real audio track against
+the local `loopback` test peer, which makes no network call and answers nothing —
+is `pnpm test:realtime:loopback`, described under
+[Voice Everywhere](voice-everywhere.md#proving-it-works). OpenAI stays the
+default provider; `loopback` exists so the routing can be proven without a key,
+and it proves nothing about OpenAI.
+
 For manual acceptance, select **Settings → Talk → Realtime WebRTC**, confirm
 the provider status, choose devices, accept the privacy warning, start Talk,
 interrupt a long answer, approve and refuse tool calls, remove the microphone,

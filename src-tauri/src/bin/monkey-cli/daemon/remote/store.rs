@@ -292,6 +292,37 @@ CREATE TABLE IF NOT EXISTS remote_voice_sessions (
 CREATE INDEX IF NOT EXISTS remote_voice_sessions_device_idx
     ON remote_voice_sessions(device_id,created_at_ms);
 
+
+-- One authoritative Talk route per ordinary conversation. Audio never lives
+-- here: this is only the durable coordination plane shared by the desktop and
+-- the resident remote server. A generation changes on every route mutation so
+-- stale sockets/commands can be rejected without guessing which endpoint won.
+CREATE TABLE IF NOT EXISTS remote_voice_routes (
+    session_id TEXT PRIMARY KEY,
+    route_id TEXT NOT NULL UNIQUE,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    engine TEXT NOT NULL CHECK(engine IN ('pipeline','realtime')),
+    input_endpoint TEXT NOT NULL,
+    output_endpoint TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('active','stopped')),
+    input_command_id TEXT,
+    output_command_id TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS remote_voice_route_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    kind TEXT NOT NULL,
+    payload_json BLOB NOT NULL,
+    created_at_ms INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS remote_voice_route_events_session_idx
+    ON remote_voice_route_events(session_id,event_id);
+
 -- What the run watcher has already told the devices about. One row per job
 -- holding the last state a notification was raised for, so a watcher that polls
 -- every couple of seconds does not send "run finished" forty times, and a
@@ -634,6 +665,32 @@ pub struct DeviceCommandRecord {
     /// command, and on one completed by a build that predates this column.
     pub terminal_sha256: Option<String>,
     pub invocation_id: Option<String>,
+}
+
+/// Host-authoritative routing state for one ordinary conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceRouteRecord {
+    pub session_id: String,
+    pub route_id: String,
+    pub generation: u64,
+    pub engine: String,
+    pub input_endpoint: String,
+    pub output_endpoint: String,
+    pub state: String,
+    pub input_command_id: Option<String>,
+    pub output_command_id: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceRouteEventRecord {
+    pub event_id: u64,
+    pub session_id: String,
+    pub generation: u64,
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub created_at_ms: u64,
 }
 
 /// One microphone stream's ledger row. The audio lives beside the database —
@@ -1212,6 +1269,34 @@ impl RemoteStore {
                     )?;
                 }
             }
+            // Closing this device's sockets is not enough while a Talk route
+            // still names it: the desktop and the CLI would go on reporting a
+            // live conversation that can never carry audio again. A route has
+            // exactly one microphone and one speaker, so losing either leg ends
+            // it — and silently re-pointing that leg at this computer's default
+            // would move someone's conversation onto hardware they did not
+            // choose. Every caller of `revoke_device` gets this, which is why
+            // it lives here rather than beside the operator's revoke button.
+            for route in self.voice_routes_for_device(device_id)? {
+                for command_id in [
+                    route.input_command_id.as_deref(),
+                    route.output_command_id.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let _ = self.request_device_cancel(command_id, now_ms);
+                }
+                self.stop_voice_route(&route.session_id, now_ms)?;
+                self.audit(
+                    now_ms,
+                    Some(device_id),
+                    "voice_route_stopped",
+                    Some(&route.session_id),
+                    "revoked",
+                    None,
+                )?;
+            }
         }
         Ok(changed == 1)
     }
@@ -1453,6 +1538,373 @@ impl RemoteStore {
             )
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    // --- Voice Everywhere route authority ---------------------------------
+
+    pub fn voice_route(&self, session_id: &str) -> Result<Option<VoiceRouteRecord>, String> {
+        self.connection
+            .query_row(
+                &format!("{VOICE_ROUTE_SELECT} WHERE session_id=?1"),
+                [session_id],
+                read_voice_route,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn voice_route_by_id(&self, route_id: &str) -> Result<Option<VoiceRouteRecord>, String> {
+        self.connection
+            .query_row(
+                &format!("{VOICE_ROUTE_SELECT} WHERE route_id=?1"),
+                [route_id],
+                read_voice_route,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    /// The active routes one paired device is currently a leg of.
+    ///
+    /// Matched on the exact endpoint token rather than a pattern, because a
+    /// device id is user-visible text and a `LIKE` would make `%` in one mean
+    /// something.
+    pub fn voice_routes_for_device(&self, device_id: &str) -> Result<Vec<VoiceRouteRecord>, String> {
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "{VOICE_ROUTE_SELECT} WHERE state='active'
+                   AND (input_endpoint=?1 OR output_endpoint=?2) ORDER BY session_id"
+            ))
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![
+                    format!("paired:{device_id}:input"),
+                    format!("paired:{device_id}:output")
+                ],
+                read_voice_route,
+            )
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// The last round trip this device was actually observed to take: from a
+    /// command being queued to its terminal report arriving, through the same
+    /// long-poll queue a Talk route role travels. `None` until it has completed
+    /// one successfully.
+    pub fn last_device_round_trip_ms(&self, device_id: &str) -> Result<Option<u64>, String> {
+        let observed: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT completed_at_ms - created_at_ms FROM remote_device_actions
+                 WHERE device_id=?1 AND state='succeeded' AND completed_at_ms IS NOT NULL
+                 ORDER BY completed_at_ms DESC, command_id DESC LIMIT 1",
+                [device_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        // A negative span means the two stamps came from different clocks, not
+        // that the device answered before it was asked. Unknown, not zero.
+        Ok(observed.and_then(|value| u64::try_from(value).ok()))
+    }
+
+    /// Replaces the route atomically. Callers prepare/validate endpoints before
+    /// this boundary; the monotonically increasing generation is minted here so
+    /// two controller processes cannot accidentally reuse one.
+    pub fn replace_voice_route(
+        &mut self,
+        session_id: &str,
+        engine: &str,
+        input_endpoint: &str,
+        output_endpoint: &str,
+        input_command_id: Option<&str>,
+        output_command_id: Option<&str>,
+        now_ms: u64,
+    ) -> Result<VoiceRouteRecord, String> {
+        if session_id.is_empty() || session_id.len() > 256 {
+            return Err("Voice route session id must be 1-256 characters".to_string());
+        }
+        if !matches!(engine, "pipeline" | "realtime") {
+            return Err("Voice route engine must be pipeline or realtime".to_string());
+        }
+        for (label, value) in [("input", input_endpoint), ("output", output_endpoint)] {
+            if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+                return Err(format!("Voice route {label} endpoint is invalid"));
+            }
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let existing = transaction
+            .query_row(
+                "SELECT route_id,generation,created_at_ms FROM remote_voice_routes WHERE session_id=?1",
+                [session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+            )
+             .optional()
+            .map_err(|error| error.to_string())?;
+        let (route_id, generation, created_at_ms) = match existing {
+            Some((route_id, generation, created_at_ms)) => {
+                let next = generation
+                    .checked_add(1)
+                    .ok_or_else(|| "Voice route generation is exhausted".to_string())?;
+                (route_id, next, created_at_ms)
+            }
+            None => (
+                format!("vr-{}", random_token_id(18)?),
+                1,
+                to_i64(now_ms)?,
+            ),
+        };
+        transaction
+            .execute(
+                "INSERT INTO remote_voice_routes(
+                    session_id,route_id,generation,engine,input_endpoint,output_endpoint,state,
+                    input_command_id,output_command_id,created_at_ms,updated_at_ms
+                 ) VALUES(?1,?2,?3,?4,?5,?6,'active',?7,?8,?9,?10)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    route_id=excluded.route_id,generation=excluded.generation,engine=excluded.engine,
+                    input_endpoint=excluded.input_endpoint,output_endpoint=excluded.output_endpoint,
+                    state='active',input_command_id=excluded.input_command_id,
+                    output_command_id=excluded.output_command_id,updated_at_ms=excluded.updated_at_ms",
+                params![
+                    session_id,
+                    route_id,
+                    generation,
+                    engine,
+                    input_endpoint,
+                    output_endpoint,
+                    input_command_id,
+                    output_command_id,
+                    created_at_ms,
+                    to_i64(now_ms)?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        self.voice_route(session_id)?
+            .ok_or_else(|| "Voice route disappeared after commit".to_string())
+    }
+
+    pub fn set_voice_route_commands(
+        &mut self,
+        session_id: &str,
+        generation: u64,
+        input_command_id: Option<&str>,
+        output_command_id: Option<&str>,
+        now_ms: u64,
+    ) -> Result<VoiceRouteRecord, String> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE remote_voice_routes SET input_command_id=?3,output_command_id=?4,updated_at_ms=?5
+                 WHERE session_id=?1 AND generation=?2 AND state='active'",
+                params![session_id, to_i64(generation)?, input_command_id, output_command_id, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("Voice route generation changed before endpoint activation finished".to_string());
+        }
+        self.voice_route(session_id)?
+            .ok_or_else(|| "Voice route disappeared after command update".to_string())
+    }
+
+    pub fn stop_voice_route(&mut self, session_id: &str, now_ms: u64) -> Result<Option<VoiceRouteRecord>, String> {
+        let Some(existing) = self.voice_route(session_id)? else { return Ok(None); };
+        let next_generation = existing.generation
+            .checked_add(1)
+            .ok_or_else(|| "Voice route generation is exhausted".to_string())?;
+        self.connection
+            .execute(
+                "UPDATE remote_voice_routes SET generation=?2,state='stopped',input_command_id=NULL,
+                    output_command_id=NULL,updated_at_ms=?3 WHERE session_id=?1",
+                params![session_id, to_i64(next_generation)?, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        self.voice_route(session_id)
+    }
+
+    fn validate_voice_route_event(kind: &str, payload: &serde_json::Value) -> Result<(), String> {
+        const KINDS: &[&str] = &[
+            "input_ready",
+            "output_ready",
+            "input_transcript",
+            "assistant_delta",
+            "turn_finished",
+            "turn_failed",
+            "host_interrupt",
+            "interrupt",
+            "speak_text",
+            "output_stop",
+            "output_played",
+            "output_failed",
+            // Realtime manual turn detection. The host holds a paired
+            // microphone shut between turns and the device answers each change
+            // naming the gate it acted on. Both carry one boolean and one event
+            // id; the audio the gate governs never touches this ledger.
+            "input_gate",
+            "input_gate_ack",
+            // Realtime bridge lifecycle is metadata only. The actual PCM
+            // crosses the in-memory bridge and must never use this ledger.
+            "realtime_bridge_ready",
+            "realtime_input_started",
+            "realtime_input_ended",
+            "realtime_output_started",
+            "realtime_output_ended",
+            "realtime_bridge_closed",
+        ];
+        if !KINDS.contains(&kind) {
+            return Err(format!("Unknown VoiceRoute coordination event '{kind}'"));
+        }
+        if !payload.is_object() {
+            return Err("VoiceRoute coordination event payload must be a JSON object".to_string());
+        }
+        fn contains_media(value: &serde_json::Value) -> bool {
+            match value {
+                serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+                    let key = key.to_ascii_lowercase();
+                    matches!(
+                        key.as_str(),
+                        "audio"
+                            | "audio_base64"
+                            | "audio_bytes"
+                            | "raw_audio"
+                            | "pcm"
+                            | "pcm_base64"
+                            | "media_base64"
+                            | "chunk_base64"
+                            | "waveform"
+                    ) || contains_media(value)
+                }),
+                serde_json::Value::Array(values) => values.iter().any(contains_media),
+                _ => false,
+            }
+        }
+        if contains_media(payload) {
+            return Err("VoiceRoute coordination events may not contain raw or encoded media".to_string());
+        }
+        // The gate is the one exchange a caller blocks on: the desktop waits up
+        // to eight seconds for an ack naming the gate it sent, and the Talk
+        // socket silently skips a gate whose `open` it cannot read. A payload
+        // that is wrong in either direction has to fail here, where the emitter
+        // is still on the stack, rather than surfacing as a timeout on a
+        // microphone that was never actually asked to close.
+        match kind {
+            "input_gate" => {
+                if !payload.get("open").is_some_and(serde_json::Value::is_boolean) {
+                    return Err("An input_gate event needs a boolean 'open'".to_string());
+                }
+            }
+            "input_gate_ack" => {
+                if !payload.get("open").is_some_and(serde_json::Value::is_boolean)
+                    || !payload.get("gate_sequence").is_some_and(serde_json::Value::is_u64)
+                {
+                    return Err(
+                        "An input_gate_ack event needs a boolean 'open' and the 'gate_sequence' it answers".to_string(),
+                    );
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn append_voice_route_event(
+        &mut self,
+        session_id: &str,
+        generation: u64,
+        kind: &str,
+        payload: &serde_json::Value,
+        now_ms: u64,
+    ) -> Result<VoiceRouteEventRecord, String> {
+        let route = self.voice_route(session_id)?
+            .ok_or_else(|| "No voice route exists for this conversation".to_string())?;
+        if route.state != "active" || route.generation != generation {
+            return Err("Voice route generation is stale".to_string());
+        }
+        Self::validate_voice_route_event(kind, payload)?;
+        if kind.is_empty() || kind.len() > 64 || !kind.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')) {
+            return Err("Voice route event kind is invalid".to_string());
+        }
+        let encoded = serde_json::to_vec(payload).map_err(|error| error.to_string())?;
+        if encoded.len() > 64 * 1024 {
+            return Err("Voice route event payload exceeds 64 KiB".to_string());
+        }
+        self.connection
+            .execute(
+                "INSERT INTO remote_voice_route_events(session_id,generation,kind,payload_json,created_at_ms)
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![session_id, to_i64(generation)?, kind, encoded, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        let event_id = u64::try_from(self.connection.last_insert_rowid())
+            .map_err(|_| "Voice route event id overflowed".to_string())?;
+        // Bounded coordination log: keep the newest 512 events per session.
+        self.connection
+            .execute(
+                "DELETE FROM remote_voice_route_events WHERE session_id=?1 AND event_id NOT IN (
+                    SELECT event_id FROM remote_voice_route_events WHERE session_id=?1
+                    ORDER BY event_id DESC LIMIT 512
+                 )",
+                [session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(VoiceRouteEventRecord {
+            event_id,
+            session_id: session_id.to_string(),
+            generation,
+            kind: kind.to_string(),
+            payload: payload.clone(),
+            created_at_ms: now_ms,
+        })
+    }
+
+    pub fn latest_voice_route_event_id(&self, session_id: &str) -> Result<u64, String> {
+        let value: i64 = self.connection
+            .query_row(
+                "SELECT COALESCE(MAX(event_id), 0) FROM remote_voice_route_events WHERE session_id=?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        from_i64(value).map_err(|error| error.to_string())
+    }
+
+    pub fn voice_route_events(
+        &self,
+        session_id: &str,
+        after: u64,
+        limit: u32,
+    ) -> Result<Vec<VoiceRouteEventRecord>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT event_id,session_id,generation,kind,payload_json,created_at_ms
+                 FROM remote_voice_route_events WHERE session_id=?1 AND event_id>?2
+                 ORDER BY event_id ASC LIMIT ?3",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![session_id, to_i64(after)?, i64::from(limit.clamp(1, 512))],
+                |row| {
+                    let payload: Vec<u8> = row.get(4)?;
+                    Ok(VoiceRouteEventRecord {
+                        event_id: from_i64(row.get(0)?)?,
+                        session_id: row.get(1)?,
+                        generation: from_i64(row.get(2)?)?,
+                        kind: row.get(3)?,
+                        payload: serde_json::from_slice(&payload).unwrap_or(serde_json::Value::Null),
+                        created_at_ms: from_i64(row.get(5)?)?,
+                    })
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
     }
 
     pub fn audit_entries(&self, limit: u32) -> Result<Vec<AuditEntry>, String> {
@@ -3357,6 +3809,27 @@ pub(super) fn bounded(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
 
+const VOICE_ROUTE_SELECT: &str =
+    "SELECT session_id,route_id,generation,engine,input_endpoint,output_endpoint,state,
+            input_command_id,output_command_id,created_at_ms,updated_at_ms
+     FROM remote_voice_routes";
+
+fn read_voice_route(row: &rusqlite::Row<'_>) -> rusqlite::Result<VoiceRouteRecord> {
+    Ok(VoiceRouteRecord {
+        session_id: row.get(0)?,
+        route_id: row.get(1)?,
+        generation: from_i64(row.get(2)?)?,
+        engine: row.get(3)?,
+        input_endpoint: row.get(4)?,
+        output_endpoint: row.get(5)?,
+        state: row.get(6)?,
+        input_command_id: row.get(7)?,
+        output_command_id: row.get(8)?,
+        created_at_ms: from_i64(row.get(9)?)?,
+        updated_at_ms: from_i64(row.get(10)?)?,
+    })
+}
+
 fn to_i64(value: u64) -> Result<i64, String> {
     i64::try_from(value).map_err(|_| "Remote numeric value exceeds SQLite range".to_string())
 }
@@ -3412,6 +3885,159 @@ mod tests {
             max_artifact_bytes: 1_024,
         };
         (root, store, FakeSecrets::default(), scopes)
+    }
+
+
+    #[test]
+    fn voice_route_coordination_log_rejects_media_and_stale_generations() {
+        let (root, mut store, _secrets, _scopes) = fixture();
+        let route = store
+            .replace_voice_route(
+                "chat-route-privacy",
+                "pipeline",
+                "local:input:default",
+                "local:output:default",
+                None,
+                None,
+                1_000,
+            )
+            .unwrap();
+        store
+            .append_voice_route_event(
+                &route.session_id,
+                route.generation,
+                "input_ready",
+                &serde_json::json!({"command_id": "command-one", "device_id": "phone-one"}),
+                1_001,
+            )
+            .unwrap();
+        let media = store.append_voice_route_event(
+            &route.session_id,
+            route.generation,
+            "assistant_delta",
+            &serde_json::json!({"turn_id": "turn-one", "audio_base64": "AAECAw=="}),
+            1_002,
+        );
+        assert!(media.unwrap_err().contains("may not contain raw or encoded media"));
+        let unknown = store.append_voice_route_event(
+            &route.session_id,
+            route.generation,
+            "audio_chunk",
+            &serde_json::json!({"sequence": 1}),
+            1_003,
+        );
+        assert!(unknown.unwrap_err().contains("Unknown VoiceRoute coordination event"));
+        let next = store
+            .replace_voice_route(
+                &route.session_id,
+                "pipeline",
+                "local:input:default",
+                "local:output:default",
+                None,
+                None,
+                1_004,
+            )
+            .unwrap();
+        assert!(next.generation > route.generation);
+        let stale = store.append_voice_route_event(
+            &route.session_id,
+            route.generation,
+            "turn_finished",
+            &serde_json::json!({"turn_id": "turn-one"}),
+            1_005,
+        );
+        assert_eq!(stale.unwrap_err(), "Voice route generation is stale");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The Realtime push-to-talk gate was dead on arrival: `input_gate` and
+    /// `input_gate_ack` were missing from the ledger's kind whitelist, so every
+    /// gate the desktop emitted was rejected as unknown even though the Talk
+    /// socket relayed it and the paired controller acknowledged it. The gate
+    /// could therefore never close a paired microphone, and the desktop's wait
+    /// for the acknowledgement could only ever time out.
+    #[test]
+    fn a_realtime_input_gate_and_its_acknowledgement_round_trip_through_the_ledger() {
+        let (root, mut store, _secrets, _scopes) = fixture();
+        let route = store
+            .replace_voice_route("chat-gate", "realtime", "paired:phone-one:input", "local:output:default", None, None, 2_000)
+            .unwrap();
+        let gate = store
+            .append_voice_route_event(&route.session_id, route.generation, "input_gate", &serde_json::json!({"open": false}), 2_001)
+            .unwrap();
+        let ack = store
+            .append_voice_route_event(
+                &route.session_id,
+                route.generation,
+                "input_gate_ack",
+                &serde_json::json!({"gate_sequence": gate.event_id, "open": false}),
+                2_002,
+            )
+            .unwrap();
+        let recorded = store.voice_route_events(&route.session_id, 0, 16).unwrap();
+        assert_eq!(
+            recorded.iter().map(|event| event.kind.as_str()).collect::<Vec<_>>(),
+            ["input_gate", "input_gate_ack"],
+        );
+        assert_eq!(recorded[1].payload["gate_sequence"], serde_json::json!(gate.event_id));
+        assert_eq!(ack.generation, route.generation);
+
+        // The shape is part of the contract: the socket skips a gate whose
+        // `open` it cannot read, and the desktop only accepts an ack naming the
+        // gate it sent.
+        assert!(store
+            .append_voice_route_event(&route.session_id, route.generation, "input_gate", &serde_json::json!({"open": "yes"}), 2_003)
+            .unwrap_err()
+            .contains("boolean 'open'"));
+        assert!(store
+            .append_voice_route_event(&route.session_id, route.generation, "input_gate_ack", &serde_json::json!({"open": true}), 2_004)
+            .unwrap_err()
+            .contains("gate_sequence"));
+
+        let retired = store
+            .replace_voice_route(&route.session_id, "realtime", "paired:phone-one:input", "local:output:default", None, None, 2_005)
+            .unwrap();
+        assert!(retired.generation > route.generation);
+        assert_eq!(
+            store
+                .append_voice_route_event(&route.session_id, route.generation, "input_gate", &serde_json::json!({"open": true}), 2_006)
+                .unwrap_err(),
+            "Voice route generation is stale",
+            "a gate minted for a retired generation must not reopen a microphone the route no longer owns",
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn voice_route_coordination_log_is_bounded() {
+        let (root, mut store, _secrets, _scopes) = fixture();
+        let route = store
+            .replace_voice_route(
+                "chat-route-bounded",
+                "pipeline",
+                "local:input:default",
+                "local:output:default",
+                None,
+                None,
+                2_000,
+            )
+            .unwrap();
+        for index in 0..520u64 {
+            store
+                .append_voice_route_event(
+                    &route.session_id,
+                    route.generation,
+                    "turn_finished",
+                    &serde_json::json!({"turn_id": format!("turn-{index}")}),
+                    2_001 + index,
+                )
+                .unwrap();
+        }
+        let events = store.voice_route_events(&route.session_id, 0, 512).unwrap();
+        assert_eq!(events.len(), 512);
+        assert_eq!(events.first().unwrap().payload["turn_id"], "turn-8");
+        assert_eq!(events.last().unwrap().payload["turn_id"], "turn-519");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3937,6 +4563,94 @@ mod tests {
             .revoke_device(&accepted.device_id, "again", 1_400, &secrets, Some(&killer))
             .unwrap());
         assert_eq!(killer.0.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Revocation used to close the device's sockets and stop there, leaving
+    /// the route row `active` and still naming the revoked phone — so the Talk
+    /// panel and `monkey voice route` both kept reporting a live conversation
+    /// that could never carry audio again.
+    #[test]
+    fn revoking_a_device_stops_every_voice_route_that_was_using_it() {
+        let (root, mut store, secrets, scopes) = fixture();
+        let device_id = paired(&mut store, &secrets, &scopes);
+        let other = paired(&mut store, &secrets, &scopes);
+        let route = store
+            .replace_voice_route(
+                "chat-revoked",
+                "pipeline",
+                &format!("paired:{device_id}:input"),
+                "local:output:default",
+                None,
+                None,
+                5_000,
+            )
+            .unwrap();
+        let untouched = store
+            .replace_voice_route(
+                "chat-elsewhere",
+                "pipeline",
+                &format!("paired:{other}:input"),
+                "local:output:default",
+                None,
+                None,
+                5_000,
+            )
+            .unwrap();
+        let command = store
+            .enqueue_device_command(
+                &DeviceCommandRequest {
+                    device_id: device_id.clone(),
+                    capability: DeviceCapability::VoiceStream,
+                    arguments: serde_json::json!({"mode": "talk_route", "role": "input"}),
+                    source_run_id: None,
+                    source_session_id: Some(route.session_id.clone()),
+                    source_tool_call_id: None,
+                    invocation_id: None,
+                    expires_at_ms: 3_600_000,
+                },
+                5_001,
+            )
+            .unwrap();
+        store
+            .set_voice_route_commands(
+                &route.session_id,
+                route.generation,
+                Some(&command.command_id),
+                None,
+                5_002,
+            )
+            .unwrap();
+
+        assert!(store
+            .revoke_device(&device_id, "lost", 6_000, &secrets, None)
+            .unwrap());
+
+        let after = store.voice_route(&route.session_id).unwrap().unwrap();
+        assert_eq!(
+            after.state, "stopped",
+            "a route whose microphone was revoked must not keep reporting itself active"
+        );
+        assert!(after.generation > route.generation);
+        assert_eq!(after.input_command_id, None);
+        assert_eq!(
+            store
+                .device_command(&command.command_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeviceCommandState::Cancelled,
+            "the revoked device's route command must be cancelled, not left queued"
+        );
+        assert_eq!(
+            store
+                .voice_route(&untouched.session_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "active",
+            "another conversation's route must be untouched by this revocation"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

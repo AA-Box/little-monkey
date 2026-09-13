@@ -121,6 +121,7 @@ pub async fn spawn_if_configured(
     }
     let listener = bind(&config).await?;
     let acceptor = acceptor(&config)?;
+    let bridge_paths = paths.clone();
     let api = RemoteApi::production(
         paths,
         config.clone(),
@@ -129,6 +130,7 @@ pub async fn spawn_if_configured(
         placement,
         peer_runs,
     )?;
+    super::realtime_bridge::spawn_host_media_bridge(&bridge_paths, api.clone()).await?;
     tokio::spawn(async move {
         if let Err(error) = serve_bound(listener, acceptor, api).await {
             eprintln!("remote runner listener stopped: {error}");
@@ -151,7 +153,9 @@ pub async fn serve(
     }
     let listener = bind(&config).await?;
     let acceptor = acceptor(&config)?;
+    let bridge_paths = paths.clone();
     let api = RemoteApi::production(paths, config, desktop, mobile_chat, placement, peer_runs)?;
+    super::realtime_bridge::spawn_host_media_bridge(&bridge_paths, api.clone()).await?;
     serve_bound(listener, acceptor, api).await
 }
 

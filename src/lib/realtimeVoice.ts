@@ -155,9 +155,15 @@ export interface RealtimeVoiceSessionConfig {
   turnDetection: 'semantic_vad' | 'manual';
   inputDeviceId: string | null;
   outputDeviceId: string | null;
+  /** Negotiate WebRTC audio without opening the local microphone. */
+  externalInput?: boolean;
+  /** Expose provider audio as PCM instead of playing it on this computer. */
+  externalOutput?: boolean;
   instructions: string;
   tools: ToolDef[];
 }
+
+export type RealtimePcmConsumer = (samples: Float32Array, sampleRate: number) => void;
 
 export interface RealtimeVoiceSession {
   readonly capabilities: RealtimeVoiceCapabilities;
@@ -167,6 +173,12 @@ export interface RealtimeVoiceSession {
    * measure it. Sampling it twice across a window is how a caller proves audio
    * started, and how it proves audio stopped after an interruption. */
   audioProgress?(): Promise<RealtimeAudioProgress | null>;
+  /** Switch the live sender between a local microphone and externally supplied PCM. */
+  setInputRoute(external: boolean, deviceId: string | null): Promise<void>;
+  /** Append mono PCM16 directly to the provider's active Realtime input buffer. */
+  appendInputPcm16(audioBase64: string): void;
+  /** Switch provider audio between local playback and an external PCM consumer. */
+  setOutputRoute(external: boolean, deviceId: string | null, consumer?: RealtimePcmConsumer | null): Promise<void>;
   interrupt(): Promise<void>;
   startManualTurn(): Promise<void>;
   finishManualTurn(): Promise<void>;

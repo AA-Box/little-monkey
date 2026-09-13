@@ -514,7 +514,7 @@
       "plane": "device",
       "method": "POST",
       "path": "/v1/remote/device/talk/ticket",
-      "gate": "capability:VoiceStream"
+      "gate": "self_service"
     },
     {
       "plane": "device",
