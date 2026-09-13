@@ -44,6 +44,11 @@ export interface RealtimeAcceptanceStep {
 
 export interface RealtimeAcceptanceReport {
   status: 'passed' | 'failed';
+  /** Which far end answered. `openai` is the live provider run; any other id is
+   * a local peer, which proves the routing but not the model — see
+   * `LOCAL_PEER_CAVEATS`. A report is not readable as a live provider pass
+   * unless this says so. */
+  providerId: string;
   model: string;
   turnDetection: 'semantic_vad' | 'manual';
   steps: RealtimeAcceptanceStep[];
@@ -87,6 +92,26 @@ export interface RealtimeAcceptanceOptions {
 
 const OPENAI_REALTIME_ENDPOINT = 'https://api.openai.com/v1/realtime/calls';
 
+/**
+ * The steps whose sentence stops being literally true once the far end is a
+ * local peer rather than a model. Each of these reads as a claim about
+ * something the model *decided* — that it understood speech, that it chose a
+ * tool, that it composed a reply — and a local peer replays those on cue. The
+ * routing on either side of the decision is the production path in both runs,
+ * which is exactly what a credential-free run exists to prove, so the rest of
+ * the steps are not weakened and are not listed here. A report that passed
+ * these quietly against a local peer would be the overclaim this harness is
+ * supposed to make impossible.
+ */
+const LOCAL_PEER_CAVEATS: Partial<Record<RealtimeAcceptanceStepId, string>> = {
+  microphone_audio_reached_provider:
+    'a local peer recognizes no speech, so this proves captured audio reached the far end and its transcript event came back, not that a model understood anything',
+  tool_call_bridged:
+    'a local peer replays a scripted function call, so this proves the data channel and the host bridge carried it, not that a model chose to call the tool',
+  spoken_followup:
+    'a local peer answers on cue, so this proves the continuation was requested and answered over the real transport, not that a model composed a reply',
+};
+
 function defaultWait(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
@@ -96,15 +121,19 @@ function messagesOf(chatSessionId: string) {
 }
 
 /**
- * The ten-step real-provider acceptance for desktop realtime voice, as one
- * ordinary function so it can be driven two ways: by the desktop-hosted
- * acceptance runner against OpenAI with a live microphone
+ * The twelve-step acceptance for desktop realtime voice, as one ordinary
+ * function so it can be driven three ways: against a local peer with no
+ * credential and no network (`scripts/realtime-loopback-acceptance.mjs`),
+ * against OpenAI with a live microphone and an operator present
  * (`scripts/realtime-live-acceptance.mjs`), and by the unit suite against a
- * scripted provider. Both drive the same response ledger and the same tool
- * bridge the product uses, so a regression in either fails both.
+ * scripted provider. All three drive the same response ledger, the same tool
+ * bridge and the same routing the product uses, so a regression in any of
+ * those fails every one of them.
  *
- * The operator speaks one short request during the capture window. No
- * credential, transcript, audio, or file content is placed in the report.
+ * Against the real provider the operator speaks one short request during the
+ * capture window. No credential, transcript, audio, or file content is placed
+ * in the report, and a run against a local peer says so on every step whose
+ * meaning depends on a model — see `LOCAL_PEER_CAVEATS`.
  */
 export async function runRealtimeAcceptance(
   options: RealtimeAcceptanceOptions,
@@ -114,10 +143,15 @@ export async function runRealtimeAcceptance(
   const model = options.model ?? 'gpt-realtime-2.1';
   const turnDetection = options.turnDetection ?? 'manual';
   const controller = new RealtimeVoiceController();
+  const provider = options.provider ?? new OpenAiRealtimeVoiceProvider();
+  // Anything that is not the real provider is a local peer standing in for it.
+  // The distinction is drawn once, here, so no step has to decide it again.
+  const localPeer = provider.id !== 'openai';
   const steps = new Map<RealtimeAcceptanceStepId, RealtimeAcceptanceStep>();
   const pass = (id: RealtimeAcceptanceStepId, detail: string) => {
     if (!steps.has(id)) log(`✓ ${id}`);
-    steps.set(id, { id, status: 'passed', detail });
+    const caveat = localPeer ? LOCAL_PEER_CAVEATS[id] : undefined;
+    steps.set(id, { id, status: 'passed', detail: caveat === undefined ? detail : `${detail} — but ${caveat}` });
   };
   const fail = (id: RealtimeAcceptanceStepId, detail: string) => {
     steps.set(id, { id, status: 'failed', detail });
@@ -134,12 +168,21 @@ export async function runRealtimeAcceptance(
   for (const id of REALTIME_ACCEPTANCE_STEPS) fail(id, 'not reached');
 
   try {
-    const status = await (options.status ?? realtimeVoiceClient.status)();
-    if (!status.configured) throw new Error('No OpenAI key is available through the native keychain boundary.');
-    if (status.endpoint !== OPENAI_REALTIME_ENDPOINT) {
-      throw new Error(`The native broker reported an unexpected signaling endpoint: ${status.endpoint}`);
+    if (localPeer) {
+      // Nothing to ask the keychain broker: a local peer is reached without a
+      // credential and without leaving this computer. That is the whole reason
+      // this layer can run on a machine that has no provider account at all,
+      // so the absence of a key is recorded as the run's shape rather than
+      // silently skipped.
+      pass('provider_configured', `provider=${provider.id} far end=local peer, no credential and no egress`);
+    } else {
+      const status = await (options.status ?? realtimeVoiceClient.status)();
+      if (!status.configured) throw new Error('No OpenAI key is available through the native keychain boundary.');
+      if (status.endpoint !== OPENAI_REALTIME_ENDPOINT) {
+        throw new Error(`The native broker reported an unexpected signaling endpoint: ${status.endpoint}`);
+      }
+      pass('provider_configured', `provider=${status.providerId} endpoint=fixed`);
     }
-    pass('provider_configured', `provider=${status.providerId} endpoint=fixed`);
 
     const surface = options.surface ?? await buildRealtimeToolSurface([]);
     const readFile = surface.tools.find((tool) => tool.function.name === 'read_file');
@@ -275,7 +318,7 @@ export async function runRealtimeAcceptance(
     };
 
     controller.connecting();
-    session = (options.provider ?? new OpenAiRealtimeVoiceProvider()).createSession({
+    session = provider.createSession({
       sessionId: realtimeSessionId,
       model,
       voice: options.voice ?? 'marin',
@@ -400,6 +443,7 @@ export async function runRealtimeAcceptance(
   const ordered = REALTIME_ACCEPTANCE_STEPS.map((id) => steps.get(id)!);
   return {
     status: error === null && ordered.every((step) => step.status === 'passed') ? 'passed' : 'failed',
+    providerId: provider.id,
     model,
     turnDetection,
     steps: ordered,
@@ -426,24 +470,42 @@ export async function runRealtimeAcceptance(
  */
 export async function reportRealtimeAcceptanceFromEnvironment(): Promise<void> {
   const testPath = String(import.meta.env.VITE_LITTLE_MONKEY_REALTIME_ACCEPTANCE_PATH ?? '');
+  const providerId = String(import.meta.env.VITE_LITTLE_MONKEY_REALTIME_ACCEPTANCE_PROVIDER ?? 'openai');
   let report: RealtimeAcceptanceReport;
   try {
     if (!testPath) {
       throw new Error('VITE_LITTLE_MONKEY_REALTIME_ACCEPTANCE_PATH must name a harmless readable file in the workspace.');
+    }
+    if (providerId !== 'openai' && providerId !== 'loopback') {
+      throw new Error(`VITE_LITTLE_MONKEY_REALTIME_ACCEPTANCE_PROVIDER must be openai or loopback, not ${providerId}.`);
     }
     const store = useSessionStore.getState();
     const chatSessionId = store.activeSessionId;
     if (!store.sessions.some((candidate) => candidate.id === chatSessionId)) {
       throw new Error('No ordinary chat session is open.');
     }
+    // Loaded only on the branch that uses it. The loopback peer is acceptance
+    // scaffolding that constructs real WebRTC objects, so importing it up front
+    // would drag it into every environment this module is loaded in — including
+    // the unit suite, where no such object exists.
+    const provider = providerId === 'loopback'
+      ? new (await import('./loopbackRealtimeVoice')).LoopbackRealtimeVoiceProvider()
+      : undefined;
     report = await runRealtimeAcceptance({
       chatSessionId,
       testPath,
+      provider,
+      // The local peer answers whatever audio it is given, so nobody has to be
+      // sitting here to speak into the capture window — which is what makes
+      // this layer runnable unattended. The real provider still gets the full
+      // default window, because there a person is talking into it.
+      ...(provider === undefined ? {} : { speakWindowMs: 2_000 }),
       log: (line) => console.log(`[realtime-acceptance] ${line}`),
     });
   } catch (reason) {
     report = {
       status: 'failed',
+      providerId,
       model: 'gpt-realtime-2.1',
       turnDetection: 'manual',
       steps: REALTIME_ACCEPTANCE_STEPS.map((id) => ({ id, status: 'failed' as const, detail: 'not reached' })),

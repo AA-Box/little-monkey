@@ -1,7 +1,16 @@
 #!/usr/bin/env node
 
 /**
- * Real-provider acceptance for desktop realtime voice.
+ * LAYER 2 — live OpenAI acceptance for desktop realtime voice. OPTIONAL.
+ *
+ * This run answers the one question the credential-free layer cannot: whether
+ * OpenAI's servers accept this exact session. Everything else it exercises —
+ * the routing, the bridge, the ledger, the playback path — is already proven
+ * without any provider account by `pnpm test:realtime:loopback`, so a machine
+ * with no OpenAI key is not a machine with unproven Voice Everywhere. It is a
+ * machine that cannot answer an external-service question, and this script
+ * says which precondition is missing and stops, rather than reporting a
+ * failure that reads like a defect in the feature.
  *
  * Runs the app itself — the same webview, the same WebRTC stack, the same
  * native keychain broker, the same tool executor — with the acceptance harness
@@ -12,12 +21,15 @@
  * can reach, and no flag can answer them on the operator's behalf.
  *
  * Exit codes: 0 every step passed and the operator confirmed both, 2 every
- * measurable step passed but nobody witnessed it, 1 something failed.
+ * measurable step passed but nobody witnessed it, 3 a precondition for this
+ * optional layer is missing so it never ran, 1 something failed.
  *
  *   pnpm test:realtime:live --path README.md
  *
- * Requires an OpenAI key saved through Settings, a workspace open on the file
- * given by --path, network access, and microphone permission.
+ * Preconditions, all required and none of them assumed: an OpenAI key saved
+ * through Settings, a workspace open on the file given by --path, network
+ * access, microphone permission, and an operator at this terminal to answer
+ * the two questions at the end.
  */
 
 import { spawn } from "node:child_process";
@@ -37,11 +49,23 @@ if (!testPath) {
   process.exit(2);
 }
 
+// The two closing questions are the point of this run, so a terminal nobody is
+// sitting at cannot satisfy it. Said up front rather than after several minutes
+// of app and provider time, and with the layer that *is* automatable named.
+if (!process.stdin.isTTY) {
+  console.error("Realtime live acceptance needs an operator at an interactive terminal to confirm what was heard.");
+  console.error("For the credential-free routing acceptance that runs unattended, use: pnpm test:realtime:loopback");
+  process.exit(3);
+}
+
 const timeoutMs = Number(arg("--timeout-ms") ?? 420_000);
 const directory = mkdtempSync(join(tmpdir(), "little-monkey-realtime-acceptance-"));
 const reportPath = join(directory, "report.json");
 const keep = process.env.LITTLE_MONKEY_KEEP_ACCEPTANCE_REPORT === "1";
 
+console.log("Layer 2 — live OpenAI realtime acceptance (optional; layer 1 is pnpm test:realtime:loopback).");
+console.log("Requires: an OpenAI key saved through Settings, network access, microphone permission,");
+console.log("a workspace open on the file below, and you at this terminal at the end.");
 console.log("Starting Little Monkey with the realtime acceptance harness enabled.");
 console.log(`Speak one short request when prompted: ask it to read ${testPath}.`);
 
@@ -114,7 +138,19 @@ async function finish(code) {
     process.exit(code === 0 ? 1 : code ?? 1);
   }
   const report = JSON.parse(readFileSync(reportPath, "utf8"));
-  console.log("\nRealtime voice acceptance");
+  // A missing credential is a precondition this optional layer did not meet,
+  // not a defect in the feature. Reporting it as a plain failure is what made
+  // "the realtime engine is untested" sound like a gap in Voice Everywhere
+  // rather than an absent OpenAI account.
+  const configured = report.steps.find((step) => step.id === "provider_configured");
+  if (configured?.status === "failed" && /keychain boundary/.test(report.error ?? "")) {
+    console.error("\nLayer 2 did not run: no OpenAI key is available through the native keychain boundary.");
+    console.error("Save one in Settings, or run the credential-free layer 1: pnpm test:realtime:loopback");
+    if (!keep) rmSync(directory, { recursive: true, force: true });
+    process.exit(3);
+  }
+  console.log("\nRealtime voice acceptance — layer 2, live OpenAI");
+  console.log(`  provider         ${report.providerId}`);
   console.log(`  model            ${report.model} (${report.turnDetection})`);
   console.log(`  continuations    ${report.continuationsRequested}`);
   for (const step of report.steps) {

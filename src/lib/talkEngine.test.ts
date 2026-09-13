@@ -21,6 +21,8 @@ class Harness implements TalkPorts {
   submitted: Array<{ text: string; utteranceId: string }> = [];
   synthesized: string[] = [];
   played: string[] = [];
+  routedSpoken: string[] = [];
+  routeSpeech = false;
   stopPlaybackCalls = 0;
   cancelled = 0;
   metrics: TalkLatencyMetric[] = [];
@@ -77,6 +79,12 @@ class Harness implements TalkPorts {
 
   cancelTurn() {
     this.cancelled += 1;
+  }
+
+  async speakText(text: string) {
+    if (!this.routeSpeech) return false;
+    this.routedSpoken.push(text);
+    return true;
   }
 
   async synthesize(text: string) {
@@ -164,6 +172,22 @@ describe('TalkSession — push to talk', () => {
       'speaking',
       'armed',
     ]);
+  });
+
+  it('uses a routed text speaker without synthesizing or playing audio locally', async () => {
+    const harness = new Harness();
+    harness.routeSpeech = true;
+    harness.transcripts = ['route this'];
+    const session = new TalkSession(harness, { mode: 'push_to_talk' });
+    await session.start();
+    await session.press();
+    await session.release();
+    session.onAssistantDelta('Remote sentence.');
+    session.onTurnFinished();
+    await settle();
+    expect(harness.routedSpoken).toEqual(['Remote sentence.']);
+    expect(harness.synthesized).toEqual([]);
+    expect(harness.played).toEqual([]);
   });
 
   it('never submits a turn for silence', async () => {

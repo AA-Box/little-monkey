@@ -148,6 +148,17 @@ monkey security admission-trail [--limit <n>] [--json]
 
 monkey revisions [--change <change-id>] [--limit <n>]
 
+monkey voice endpoints [--json]                 # local defaults and every paired mic/speaker, with readiness
+monkey voice route get <session-id> [--json]
+monkey voice route set <session-id> --input <endpoint> --output <endpoint> [--engine pipeline|realtime] [--json]
+monkey voice route move <session-id> [--input <endpoint>] [--output <endpoint>] [--json]
+monkey voice route events <session-id> [--after <event-id>] [--limit <n>] [--json]
+monkey voice route stop <session-id> [--json]
+# Endpoint ids are `local:input:<media-device-id>`, `local:output:<media-device-id>`,
+# `paired:<device-id>:input` and `paired:<device-id>:output`. `route set` records a
+# selection and opens no hardware. `route activate|deactivate|emit` exist for the
+# desktop's own bridge and are hidden from `--help`.
+
 monkey daemon install | status [--json]
 monkey daemon ensure [--json]
 monkey daemon run <recipe> [--owned-worktree] [--json]
@@ -187,7 +198,11 @@ monkey channels forget <account-id> <sender-id>                      # their nex
 
 
 The `device-*`, `voice-*` and `push-*` commands are documented in
-[Paired devices](paired-devices.md). The `standards` lifecycle is documented in
+[Paired devices](paired-devices.md); `monkey voice`, which selects *where* one
+conversation listens and speaks, is documented in
+[Voice Everywhere](voice-everywhere.md) — `daemon remote voice-*` records a room
+from a device, and `voice route` chooses the endpoints of a Talk conversation,
+which are different things sharing a word. The `standards` lifecycle is documented in
 [Standards Studio](standards-studio.md) — the CLI reads and writes the same
 `.little-monkey/standards/index.json` document as the desktop Studio. The
 `extensions` developer loop is documented in

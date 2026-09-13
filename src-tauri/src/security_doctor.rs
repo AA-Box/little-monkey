@@ -2160,12 +2160,36 @@ fn audit_voice_privacy(runtime: &SecurityRuntimeSnapshot, findings: &mut Vec<Sec
         ));
     }
 
+    // The loopback far end is this project's own code answering with a tone, so
+    // the two findings below would be lies about it: nothing streams anywhere
+    // and no provider hears anything. Saying "streaming to the configured
+    // realtime provider" over a test peer would teach an operator to distrust
+    // the panel, which is worse than saying nothing.
+    let local_peer = voice.realtime_provider_id.as_deref() == Some("loopback");
+
+    if local_peer && (voice.realtime_configured || voice.realtime_active) {
+        findings.push(finding(
+            "voice.realtime_local_peer",
+            "voice",
+            "Realtime voice is pointed at the local test peer",
+            "The realtime far end is 'loopback' — an in-process test peer that makes no network call and answers with a generated tone instead of a model. It exists to exercise microphone and speaker routing without a provider credential. Talk will appear to work and will say nothing meaningful.",
+            FindingStatus::Warning,
+            false,
+            None,
+            Some("Choose OpenAI in Settings → Talk to speak to a real model, or Classic pipeline to keep the voice engine local and turn-based."),
+        ));
+    }
+
     if voice.realtime_active {
         findings.push(finding(
             "voice.realtime_active",
             "voice",
-            "A realtime voice provider session is active",
-            "The desktop microphone is streaming to the configured realtime provider now. Tool calls still use the normal permission and sandbox boundary.",
+            "A realtime voice session is active",
+            if local_peer {
+                "The desktop microphone is streaming to the local test peer now; it leaves neither this process nor this machine. Tool calls still use the normal permission and sandbox boundary."
+            } else {
+                "The desktop microphone is streaming to the configured realtime provider now. Tool calls still use the normal permission and sandbox boundary."
+            },
             FindingStatus::Warning,
             false,
             None,
@@ -2175,8 +2199,12 @@ fn audit_voice_privacy(runtime: &SecurityRuntimeSnapshot, findings: &mut Vec<Sec
         findings.push(finding(
             "voice.realtime_configured",
             "voice",
-            "Realtime provider voice is configured",
-            "Talk is configured to send live microphone audio to OpenAI only after the privacy warning is accepted and a session is started.",
+            "Realtime voice is configured",
+            if local_peer {
+                "Talk is configured to stream live microphone audio to the local test peer. No audio reaches a provider under this configuration."
+            } else {
+                "Talk is configured to send live microphone audio to OpenAI only after the privacy warning is accepted and a session is started."
+            },
             FindingStatus::Info,
             false,
             None,
@@ -2311,6 +2339,55 @@ mod tests {
         }));
         assert!(has(&active, "voice.realtime_active"));
         assert!(!has(&active, "voice.realtime_configured"));
+    }
+
+    /// The loopback far end is a tone generator in this process. A panel that
+    /// described it as "streaming to the configured realtime provider" would be
+    /// telling an operator their audio left the machine when it did not, and
+    /// would say nothing about the fact that Talk is about to answer with a
+    /// tone -- the failure that makes a test peer dangerous to leave selected.
+    #[test]
+    fn the_doctor_says_when_the_realtime_far_end_is_the_local_test_peer() {
+        let configured = voice_findings(Some(VoicePrivacySnapshot {
+            realtime_configured: true,
+            realtime_provider_id: Some("loopback".to_string()),
+            ..VoicePrivacySnapshot::default()
+        }));
+        assert!(has(&configured, "voice.realtime_local_peer"));
+        let detail = detail_of(&configured, "voice.realtime_configured");
+        assert!(
+            detail.contains("local test peer") && !detail.contains("OpenAI"),
+            "a local peer must not be described as a provider: {detail}"
+        );
+
+        let active = voice_findings(Some(VoicePrivacySnapshot {
+            realtime_configured: true,
+            realtime_active: true,
+            realtime_provider_id: Some("loopback".to_string()),
+            ..VoicePrivacySnapshot::default()
+        }));
+        assert!(has(&active, "voice.realtime_local_peer"));
+        assert!(
+            detail_of(&active, "voice.realtime_active").contains("leaves neither this process nor this machine"),
+        );
+
+        // And the ordinary provider is untouched by any of it.
+        let openai = voice_findings(Some(VoicePrivacySnapshot {
+            realtime_configured: true,
+            realtime_provider_id: Some("openai".to_string()),
+            ..VoicePrivacySnapshot::default()
+        }));
+        assert!(!has(&openai, "voice.realtime_local_peer"));
+        assert!(detail_of(&openai, "voice.realtime_configured").contains("OpenAI"));
+    }
+
+    fn detail_of(findings: &[SecurityFinding], id: &str) -> String {
+        findings
+            .iter()
+            .find(|finding| finding.id == id)
+            .unwrap_or_else(|| panic!("no finding {id}"))
+            .detail
+            .clone()
     }
 
     fn has(findings: &[SecurityFinding], id: &str) -> bool {

@@ -262,6 +262,17 @@ wake model runs only in the desktop Talk renderer/runtime boundary; a phone
 must remain foregrounded and uses the socket/VAD behavior described here. It
 does not gain background wake-word support from the desktop setting.
 
+**Routing it somewhere else.** Everything above assumes one device is both ends
+of the conversation. It does not have to be. A conversation can select its
+microphone and its speaker independently — local or paired, and not necessarily
+the same paired device — and the *host* decides which conversation a routed
+socket belongs to, so a device can never name its own. A routed ticket therefore
+carries the route id, its generation and a role: `input` needs effective
+`voice_stream`, `output` needs effective `audio_playback` and never asks for
+microphone permission at all, `duplex` needs both and reuses one socket. Moving
+either end raises the generation, which is what stops audio from the old
+endpoint arriving as if it were current. See [Voice Everywhere](voice-everywhere.md).
+
 **One conversation.** Talk speaks into the session the operator already has
 selected in the controller's own chat surface, rather than minting one of its
 own — so a spoken turn and a typed one are the same thread, and the message list
