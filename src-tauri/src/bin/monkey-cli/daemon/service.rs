@@ -74,7 +74,39 @@ trait ServiceHealthChecker: Send + Sync {
     ) -> Result<(), String>;
 }
 
-struct StoreHealthChecker;
+/// How long [`StoreHealthChecker`] gives a just-activated service to publish
+/// its first heartbeat.
+///
+/// Sized for a *cold* start, which is the only kind `install` ever performs:
+/// the binary it just pointed the service at is one launchd has not spawned
+/// before, and that first spawn blocks inside dyld — `sample(1)` puts 1216 of
+/// 1312 samples in `mapFileReadOnly` → `open`, before `main` runs at all — for
+/// a time that scales with the size of the executable. Measured on an M-series
+/// Mac: 70s for the 130MB binary the app ships, 293s for a 349MB local debug
+/// build. Every later spawn of the same file publishes in under a second, so
+/// nobody waits for this twice.
+///
+/// Five minutes is roughly four times the shipped binary's measured cold start.
+/// It is not the throttled I/O of `ProcessType Background` — a launchd job with
+/// that key reads uncached at 251MB/s here, against 361MB/s without it.
+///
+/// The previous ten seconds only ever covered the warm case, so `install` and
+/// `ensure` failed and rolled back — republishing the *previous* binary's
+/// manifest — every single time they were asked to move the service onto a
+/// build this machine had not run yet, which is exactly when they are called.
+const HEALTH_BUDGET: Duration = Duration::from_secs(300);
+
+struct StoreHealthChecker {
+    budget: Duration,
+}
+
+impl Default for StoreHealthChecker {
+    fn default() -> Self {
+        Self {
+            budget: HEALTH_BUDGET,
+        }
+    }
+}
 
 impl ServiceHealthChecker for StoreHealthChecker {
     fn wait_until_healthy(
@@ -84,10 +116,14 @@ impl ServiceHealthChecker for StoreHealthChecker {
         newer_than_ms: u64,
         previous_pid: Option<u32>,
     ) -> Result<(), String> {
-        const ATTEMPTS: usize = 100;
         const POLL_INTERVAL: Duration = Duration::from_millis(100);
+        // Long enough that a warm start — the common case, well under a second
+        // — never prints it, short enough to land before anyone wonders.
+        const NOTICE_AFTER: Duration = Duration::from_secs(2);
 
-        for attempt in 0..ATTEMPTS {
+        let started = std::time::Instant::now();
+        let mut noticed = false;
+        loop {
             if let Some(state) = live_daemon_state(paths) {
                 if state.profile_id.as_deref() == Some(profile_id)
                     && state.heartbeat_ms > newer_than_ms
@@ -96,11 +132,21 @@ impl ServiceHealthChecker for StoreHealthChecker {
                     return Ok(());
                 }
             }
-            if attempt + 1 < ATTEMPTS {
-                std::thread::sleep(POLL_INTERVAL);
+            let waited = started.elapsed();
+            if waited >= self.budget {
+                return Err(format!(
+                    "Scoped daemon did not publish a fresh heartbeat within {} seconds",
+                    self.budget.as_secs()
+                ));
             }
+            if !noticed && waited >= NOTICE_AFTER {
+                noticed = true;
+                eprintln!(
+                    "Waiting for the execution service to start. The first start of a new build can take a few minutes."
+                );
+            }
+            std::thread::sleep(POLL_INTERVAL);
         }
-        Err("Scoped daemon did not publish a fresh heartbeat within 10 seconds".into())
     }
 }
 
@@ -154,7 +200,7 @@ impl<R: CommandRunner> ServiceManager<R> {
             home,
             executable,
             roots,
-            Box::new(StoreHealthChecker),
+            Box::new(StoreHealthChecker::default()),
         )
     }
 
@@ -1705,11 +1751,12 @@ impl Drop for DaemonLock {
 pub fn process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        // `kill(2)` rather than the `kill` command: this runs on every poll of
+        // the health wait and every daemon-state read, and the shelled-out
+        // form printed `kill: <pid>: No such process` onto the CLI's stderr
+        // each time it answered "no" — the exact noise that made a stale lock
+        // look like a failed stop.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
     #[cfg(windows)]
     {
@@ -1911,6 +1958,49 @@ mod tests {
         store
             .set_meta("heartbeat_ms", &epoch_ms().unwrap().to_string())
             .unwrap();
+    }
+
+    #[test]
+    fn health_wait_accepts_a_fresh_heartbeat_from_a_new_pid() {
+        let dir = TestDir::new();
+        let paths = DaemonPaths::under(&dir.0);
+        mark_profile_live(&paths, "work");
+        StoreHealthChecker {
+            budget: Duration::from_secs(5),
+        }
+        .wait_until_healthy(&paths, "work", epoch_ms().unwrap() - 1_000, Some(1))
+        .unwrap();
+    }
+
+    /// The regression guard for the cold-start rollback: a service that has
+    /// not published yet must be waited on for the whole budget, and the error
+    /// must name the budget it actually used.
+    #[test]
+    fn health_wait_spends_its_whole_budget_before_giving_up() {
+        let dir = TestDir::new();
+        let paths = DaemonPaths::under(&dir.0);
+        paths.ensure().unwrap();
+        let budget = Duration::from_secs(1);
+        let started = std::time::Instant::now();
+        let error = StoreHealthChecker { budget }
+            .wait_until_healthy(&paths, "work", 0, None)
+            .unwrap_err();
+        assert!(
+            started.elapsed() >= budget,
+            "gave up after {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            error,
+            "Scoped daemon did not publish a fresh heartbeat within 1 seconds"
+        );
+    }
+
+    /// The shipped budget has to cover a cold launchd start of the binary the
+    /// app ships (~70s measured), not just a warm one.
+    #[test]
+    fn health_budget_covers_a_cold_start() {
+        assert!(HEALTH_BUDGET >= Duration::from_secs(280));
     }
 
     #[test]
