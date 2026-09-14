@@ -4,13 +4,17 @@ packages:
 allowBuilds:
   esbuild: true
 
+# Both copies are load-bearing and must stay in step: CI pins pnpm 9, which
+# reads overrides from the "pnpm" field in package.json, while pnpm 10+ reads
+# them only from here and ignores that field. Whichever one is missing, the
+# lockfile's recorded overrides stop matching and `--frozen-lockfile` fails
+# with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH.
+#
 # @xmldom/xmldom reaches us three levels down, under plist -> tauri-liquid-icon,
-# so nothing we declare directly can move it. 0.9.12 clears ten open advisories
-# against 0.9.10; drop this override once tauri-liquid-icon ships a plist that
-# resolves 0.9.12 or later on its own.
+# so nothing we declare directly can move it; 0.9.12 clears ten advisories
+# against 0.9.10. browserslist sits under @babel/core, which asks only for
+# '>= 4.21.0' and so keeps whatever the lockfile already pinned; 4.28.7 fixes
+# GHSA-73wf-gq98-2v4g and pulls a fixed baseline-browser-mapping with it.
 overrides:
   '@xmldom/xmldom': ^0.9.12
-  # browserslist sits under @babel/core, which asks for '>= 4.21.0' and so keeps
-  # whatever the lockfile already pinned. 4.28.7 fixes GHSA-73wf-gq98-2v4g and
-  # pulls a baseline-browser-mapping past GHSA-w5vr-8v7q-w6rv with it.
   browserslist: ^4.28.9
