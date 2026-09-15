@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,6 +13,13 @@ use little_monkey_lib::app_paths::AgentConfigRoots;
 #[cfg(test)]
 use super::store::DaemonStore;
 use super::store::{restrict_file, DaemonConfig, DaemonPaths};
+
+/// How much of the service's own stdout/stderr log the daemon keeps.
+///
+/// `daemon_jobs.max_log_bytes` caps a job's log; nothing capped the service's
+/// own, and a long-lived daemon writes to it forever — one machine reached
+/// 147 MB of a single repeated line.
+const SERVICE_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 const LAUNCHD_LABEL: &str = "com.littlemonkey.daemon";
 const SYSTEMD_UNIT: &str = "little-monkey-daemon.service";
@@ -30,6 +37,66 @@ pub enum ServicePlatform {
     SystemdUser,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     WindowsTask,
+}
+
+/// Trim the service's own stdout/stderr logs back under [`SERVICE_LOG_MAX_BYTES`].
+///
+/// Called from the serve loop on the heartbeat tick; two `stat` calls when
+/// there is nothing to do. Errors are reported and swallowed: a log that cannot
+/// be trimmed is not a reason to take the daemon down.
+pub fn trim_service_logs(paths: &DaemonPaths) {
+    for name in ["service.stderr.log", "service.stdout.log"] {
+        if let Err(error) = trim_log(&paths.logs.join(name), SERVICE_LOG_MAX_BYTES) {
+            eprintln!("monkey daemon: could not trim {name}: {error}");
+        }
+    }
+}
+
+/// Keep the newest half of `path` and drop the rest, in place.
+///
+/// In place, not rotated by rename: launchd opens `StandardErrorPath` once with
+/// `O_APPEND` and never reopens it, so a renamed file would leave the daemon
+/// writing to an inode nothing can read. Truncating the same file keeps the
+/// descriptor valid — appends land at the new end of file.
+///
+/// A missing file is not an error: on systemd the service's stderr goes to the
+/// journal, and the Windows task redirects nothing.
+///
+/// ponytail: an append that lands between the read and the truncate is lost.
+/// That is one tick's worth of lines on a file that only gets here after
+/// overflowing 8 MiB; holding a lock across the write would mean the daemon
+/// owning a descriptor the supervisor opened, which it does not.
+fn trim_log(path: &Path, max_bytes: u64) -> Result<(), String> {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    if metadata.len() <= max_bytes {
+        return Ok(());
+    }
+    let keep = max_bytes / 2;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("open {}: {error}", path.display()))?;
+    file.seek(SeekFrom::End(-(keep as i64)))
+        .map_err(|error| format!("seek {}: {error}", path.display()))?;
+    let mut tail = Vec::with_capacity(keep as usize);
+    file.read_to_end(&mut tail)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    // Start at the first line break so the file does not open mid-line.
+    let start = tail
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    file.set_len(0)
+        .map_err(|error| format!("truncate {}: {error}", path.display()))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind {}: {error}", path.display()))?;
+    file.write_all(&tail[start..])
+        .map_err(|error| format!("rewrite {}: {error}", path.display()))?;
+    Ok(())
 }
 
 impl ServicePlatform {
@@ -2876,5 +2943,36 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert_eq!(calls[14].1, vec!["--user", "enable", SYSTEMD_UNIT]);
         assert_eq!(calls[15].1, vec!["--user", "start", SYSTEMD_UNIT]);
+    }
+
+    /// The cap is enforced in place and keeps the newest lines, so the daemon
+    /// cannot fill the disk over a long uptime and the tail an operator wants
+    /// is what survives.
+    #[test]
+    fn an_oversized_service_log_is_trimmed_to_whole_recent_lines() {
+        let temp = TestDir::new();
+        let log = temp.0.join("service.stderr.log");
+        let line = "monkey daemon: holding job 'ingress-1'\n";
+        std::fs::write(&log, line.repeat(500)).unwrap();
+        let before = std::fs::metadata(&log).unwrap().len();
+
+        trim_log(&log, 4_096).unwrap();
+
+        let trimmed = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            (trimmed.len() as u64) < before && !trimmed.is_empty(),
+            "the file must shrink but keep its tail, got {} bytes",
+            trimmed.len()
+        );
+        assert!((trimmed.len() as u64) <= 4_096 / 2);
+        assert!(
+            trimmed.starts_with(line) && trimmed.ends_with(line),
+            "only whole lines survive"
+        );
+
+        // Under the cap: left exactly as it is, and a missing file is fine.
+        trim_log(&log, 4_096).unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), trimmed);
+        trim_log(&temp.0.join("nothing-here.log"), 4_096).unwrap();
     }
 }
