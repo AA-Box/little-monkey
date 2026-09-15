@@ -4,12 +4,6 @@ packages:
 allowBuilds:
   esbuild: true
 
-# Both copies are load-bearing and must stay in step: CI pins pnpm 9, which
-# reads overrides from the "pnpm" field in package.json, while pnpm 10+ reads
-# them only from here and ignores that field. Whichever one is missing, the
-# lockfile's recorded overrides stop matching and `--frozen-lockfile` fails
-# with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH.
-#
 # @xmldom/xmldom reaches us three levels down, under plist -> tauri-liquid-icon,
 # so nothing we declare directly can move it; 0.9.12 clears ten advisories
 # against 0.9.10. browserslist sits under @babel/core, which asks only for
