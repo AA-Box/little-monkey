@@ -2,10 +2,14 @@ import { describe, expect, it } from 'vitest';
 
 import {
   AdaptiveVad,
+  BoundedPcmQueue,
   DEFAULT_VAD_CONFIG,
   IncrementalSpeechChunker,
+  PcmRingBuffer,
+  StreamingLinearResampler,
   base64AudioBlob,
   normalizeVadConfig,
+  pcm16WavBlob,
   rmsOf,
 } from './talkAudio';
 
@@ -132,5 +136,50 @@ describe('base64AudioBlob', () => {
     expect(await blob.text()).toBe('RIFFfake');
     // An unnamed media type still produces something a player can be handed.
     expect(base64AudioBlob(btoa('x'), '').type).toBe('audio/wav');
+  });
+});
+
+describe('streaming PCM path', () => {
+  it('resamples consecutive 48 kHz chunks to 16 kHz without a boundary gap', () => {
+    const resampler = new StreamingLinearResampler(16_000);
+    const first = Float32Array.from({ length: 480 }, (_, index) => index / 1_000);
+    const second = Float32Array.from({ length: 480 }, (_, index) => (480 + index) / 1_000);
+    const output = new Float32Array([...resampler.process(first, 48_000), ...resampler.process(second, 48_000)]);
+    expect(output).toHaveLength(320);
+    expect(output[0]).toBeCloseTo(0);
+    expect(output[159]).toBeCloseTo(0.477);
+    expect(output[160]).toBeCloseTo(0.48);
+    expect(output[319]).toBeCloseTo(0.957);
+  });
+
+  it('keeps only bounded pre-roll and slices by absolute KWS timestamps', () => {
+    const ring = new PcmRingBuffer(5);
+    ring.write(new Float32Array([1, 2, 3]));
+    ring.write(new Float32Array([4, 5, 6, 7]));
+    expect(ring.totalWritten).toBe(7);
+    expect([...ring.sliceFrom(4)]).toEqual([5, 6, 7]);
+    expect([...ring.sliceFrom(0)]).toEqual([3, 4, 5, 6, 7]);
+    expect([...ring.sliceFrom(99)]).toEqual([]);
+  });
+
+  it('drops old pending KWS audio instead of growing without bound', () => {
+    const queue = new BoundedPcmQueue(4);
+    queue.enqueue(new Float32Array([1, 2, 3]));
+    queue.enqueue(new Float32Array([4, 5, 6]));
+    expect(queue.length).toBe(4);
+    expect(queue.droppedFrames).toBe(1);
+    expect([...queue.take()]).toEqual([3, 4, 5, 6]);
+    expect(queue.length).toBe(0);
+  });
+
+  it('encodes command PCM as a finite mono 16 kHz WAV', async () => {
+    const wav = pcm16WavBlob(new Float32Array([-2, 0, 2]));
+    const view = new DataView(await wav.arrayBuffer());
+    expect(wav.type).toBe('audio/wav');
+    expect(view.getUint32(24, true)).toBe(16_000);
+    expect(view.getUint16(22, true)).toBe(1);
+    expect(view.getUint32(40, true)).toBe(6);
+    expect(view.getInt16(44, true)).toBe(-32_768);
+    expect(view.getInt16(48, true)).toBe(32_767);
   });
 });

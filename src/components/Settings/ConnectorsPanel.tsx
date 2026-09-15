@@ -4,23 +4,30 @@ import {
   Box as BoxIcon,
   Check,
   ChevronDown,
+  CircleDot,
+  Cloud,
   CreditCard,
   Database,
   DollarSign,
   FileSignature,
   FolderOpen,
+  GitBranch,
   GitPullRequest,
   HardDrive,
+  LifeBuoy,
   LineChart,
   ListChecks,
   Mail,
   MessageCircle,
+  MessageSquare,
   NotebookText,
   Palette,
+  Puzzle,
   Receipt,
   RefreshCw,
   Search,
   SlidersHorizontal,
+  Table,
   Ticket,
   Trash2,
   Users,
@@ -29,9 +36,12 @@ import {
 } from "lucide-react";
 import { Button, StatusPill, type PillTone } from "../ui";
 import {
+  CONNECTOR_OAUTH_TERMINAL,
   useConnectorsStore,
   type ConnectorAccount,
   type ConnectorAuditEntry,
+  type ConnectorOAuthPhase,
+  type ConnectorOAuthProvider,
   type ConnectorProvider,
 } from "../../store/connectorsStore";
 import { useMcpStore, type McpOAuthPhase } from "../../store/mcpStore";
@@ -45,6 +55,18 @@ const PROVIDER_ICONS: Record<ConnectorProvider, LucideIcon> = {
   notion: NotebookText,
   jira: Ticket,
   s3: Database,
+  extension: Puzzle,
+  google_drive: HardDrive,
+  microsoft_graph: Cloud,
+  linear: ListChecks,
+  asana: CircleDot,
+  dropbox: FolderOpen,
+  box: BoxIcon,
+  airtable: Table,
+  zendesk: LifeBuoy,
+  hubspot: Users,
+  discord: MessageSquare,
+  gitlab: GitBranch,
 };
 
 const PROVIDER_LABEL_KEYS: Record<ConnectorProvider, string> = {
@@ -53,6 +75,18 @@ const PROVIDER_LABEL_KEYS: Record<ConnectorProvider, string> = {
   notion: "ConnectorsPanel.providerNotion",
   jira: "ConnectorsPanel.providerJira",
   s3: "ConnectorsPanel.providerS3",
+  extension: "ConnectorsPanel.providerExtension",
+  google_drive: "ConnectorsPanel.providerGoogleDrive",
+  microsoft_graph: "ConnectorsPanel.providerMicrosoftGraph",
+  linear: "ConnectorsPanel.providerLinear",
+  asana: "ConnectorsPanel.providerAsana",
+  dropbox: "ConnectorsPanel.providerDropbox",
+  box: "ConnectorsPanel.providerBox",
+  airtable: "ConnectorsPanel.providerAirtable",
+  zendesk: "ConnectorsPanel.providerZendesk",
+  hubspot: "ConnectorsPanel.providerHubspot",
+  discord: "ConnectorsPanel.providerDiscord",
+  gitlab: "ConnectorsPanel.providerGitlab",
 };
 
 interface TokenProviderInfo {
@@ -80,6 +114,56 @@ const TOKEN_PROVIDERS: TokenProviderInfo[] = [
     scopes: ["read:jira-work", "read:confluence-content"],
     copyKey: "ConnectorsPanel.jiraCopy",
     tokenPlaceholderKey: "ConnectorsPanel.jiraTokenPlaceholder",
+  },
+];
+
+/** The user-facing half of `connector_oauth.rs`'s `OAUTH_PROVIDERS` table.
+ * Deliberately NOT a second source of truth for endpoints, scopes or PKCE —
+ * only what the card has to render. */
+interface OAuthProviderInfo {
+  provider: ConnectorOAuthProvider;
+  copyKey: string;
+  /** Mirrors `connector_oauth::SecretPolicy`: `required` — the token endpoint
+   * refuses a request without a client secret; `optional` — accepted either
+   * way, depending on how the app was registered; `never` — the provider
+   * registers public clients only and its token endpoint rejects a secret. */
+  secret: "required" | "optional" | "never";
+  /** Placeholder key for the instance-host / tenant field, when the provider
+   * needs one. */
+  hostPlaceholderKey?: string;
+  /** True when `connector_oauth.rs` has no default for that field (Zendesk's
+   * `ApiHost { default: None }`), so a blank one is refused by the backend.
+   * Catching it here keeps the failure in the form instead of a red pill. */
+  hostRequired?: boolean;
+}
+
+export const OAUTH_PROVIDERS: OAuthProviderInfo[] = [
+  { provider: "google_drive", copyKey: "ConnectorsPanel.googleDriveCopy", secret: "required" },
+  {
+    provider: "microsoft_graph",
+    copyKey: "ConnectorsPanel.microsoftGraphCopy",
+    secret: "never",
+    hostPlaceholderKey: "ConnectorsPanel.oauthHostPlaceholderMicrosoft",
+  },
+  { provider: "linear", copyKey: "ConnectorsPanel.linearCopy", secret: "required" },
+  { provider: "asana", copyKey: "ConnectorsPanel.asanaCopy", secret: "required" },
+  { provider: "dropbox", copyKey: "ConnectorsPanel.dropboxCopy", secret: "optional" },
+  { provider: "box", copyKey: "ConnectorsPanel.boxCopy", secret: "required" },
+  { provider: "airtable", copyKey: "ConnectorsPanel.airtableCopy", secret: "never" },
+  {
+    provider: "zendesk",
+    copyKey: "ConnectorsPanel.zendeskCopy",
+    secret: "optional",
+    hostPlaceholderKey: "ConnectorsPanel.oauthHostPlaceholderZendesk",
+    hostRequired: true,
+  },
+  { provider: "hubspot", copyKey: "ConnectorsPanel.hubspotCopy", secret: "required" },
+  { provider: "discord", copyKey: "ConnectorsPanel.discordCopy", secret: "required" },
+  {
+    provider: "gitlab",
+    copyKey: "ConnectorsPanel.gitlabCopy",
+    secret: "optional",
+    hostPlaceholderKey: "ConnectorsPanel.oauthHostPlaceholderGitlab",
   },
 ];
 
@@ -170,6 +254,24 @@ const APP_OAUTH_PHASE_TONE: Partial<Record<McpOAuthPhase, PillTone>> = {
   error: "danger",
   cancelled: "neutral",
 };
+
+/** Separate from `APP_OAUTH_PHASE_TONE` because `verifying` is not an
+ * `McpOAuthPhase` — the catalog flow proves the account with a live identity
+ * call the MCP flow has no equivalent of. */
+const CONNECTOR_OAUTH_PHASE_TONE: Partial<Record<ConnectorOAuthPhase, PillTone>> = {
+  needs_client_id: "warning",
+  opening_browser: "warning",
+  waiting_for_browser: "warning",
+  exchanging_token: "warning",
+  verifying: "warning",
+  connected: "success",
+  error: "danger",
+  cancelled: "neutral",
+};
+
+/** Terminal phases: the Connect button is usable again and Cancel is not.
+ * `idle` plus the store's own terminal set, so the two cannot drift. */
+export const CONNECTOR_OAUTH_DONE: ConnectorOAuthPhase[] = ["idle", ...CONNECTOR_OAUTH_TERMINAL];
 
 function lastAppErrorLine(message: string): string {
   const lines = message.trim().split("\n").filter((line) => line.trim().length > 0);
@@ -582,6 +684,165 @@ function TokenConnectForm({ info, onDone }: { info: TokenProviderInfo; onDone: (
   );
 }
 
+/** One OAuth provider's connect form. The redirect URI comes first, before
+ * the client fields, because it is what the user has to register with the
+ * provider *before* the client id exists — and it never changes for that
+ * provider (see `connector_oauth::preferred_redirect_uri`). Nothing is saved
+ * until the backend's live read-only identity call has succeeded. */
+export function OAuthConnectForm({ info, onDone }: { info: OAuthProviderInfo; onDone: () => void }) {
+  const { t } = useT();
+  const oauthConnect = useConnectorsStore((s) => s.oauthConnect);
+  const oauthCancel = useConnectorsStore((s) => s.oauthCancel);
+  const oauthRedirectUri = useConnectorsStore((s) => s.oauthRedirectUri);
+  const status = useConnectorsStore((s) => s.oauthStatus[info.provider]);
+
+  const [label, setLabel] = useState("");
+  const [host, setHost] = useState("");
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
+  const [redirectUri, setRedirectUri] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [attempted, setAttempted] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // `oauthStatus` is keyed by provider and outlives this form, so an earlier
+  // attempt's terminal phase is still there when the card is reopened — for a
+  // *second* account of the same provider that would be a green "Connected"
+  // pill over an untouched form. Only this mount's own attempt is rendered.
+  const phase: ConnectorOAuthPhase = status?.phase ?? "idle";
+  const inFlight = connecting && !CONNECTOR_OAUTH_DONE.includes(phase);
+  const showSecretField = info.secret !== "never";
+  // The client ID is deliberately not required: left blank, the backend reuses
+  // the registration already saved in the keychain for this provider, which is
+  // what makes a second account of the same provider one click. Blank with
+  // nothing stored comes back as the `needs_client_id` phase.
+  const canSubmit =
+    label.trim().length > 0 && (!info.hostRequired || host.trim().length > 0) && !connecting;
+
+  useEffect(() => {
+    if (redirectUri !== null) return;
+    void oauthRedirectUri(info.provider)
+      .then(setRedirectUri)
+      .catch(() => {});
+  }, [redirectUri, oauthRedirectUri, info.provider]);
+
+  async function handleConnect() {
+    if (!canSubmit) return;
+    setConnecting(true);
+    setAttempted(true);
+    setError(null);
+    try {
+      await oauthConnect({
+        provider: info.provider,
+        label: label.trim(),
+        host: info.hostPlaceholderKey ? host.trim() || undefined : undefined,
+        clientId: clientId.trim() || undefined,
+        clientSecret: clientSecret.trim() || undefined,
+      });
+      onDone();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setConnecting(false);
+    }
+  }
+
+  return (
+    <div className="rounded-lg border border-border bg-background p-3">
+      <p className="rounded-md bg-surface-2 px-2.5 py-2 text-xs leading-5 text-muted">{t(info.copyKey)}</p>
+      {redirectUri && (
+        <div className="mt-3 rounded-md border border-border bg-surface-2 px-2.5 py-2">
+          <p className="text-[11px] font-semibold uppercase text-faint">{t("ConnectorsPanel.oauthRedirectUriLabel")}</p>
+          <div className="mt-1 flex items-center gap-2">
+            <code className="min-w-0 flex-1 truncate font-mono text-xs text-foreground">{redirectUri}</code>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                void navigator.clipboard.writeText(redirectUri).then(() => {
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 2000);
+                });
+              }}
+            >
+              {copied ? t("ConnectorsPanel.oauthRedirectUriCopied") : t("ConnectorsPanel.oauthRedirectUriCopy")}
+            </Button>
+          </div>
+          <p className="mt-1 text-[11px] leading-4 text-muted">{t("ConnectorsPanel.oauthRedirectUriHint")}</p>
+        </div>
+      )}
+      <div className="mt-3 flex flex-col gap-2">
+        <input
+          type="text"
+          value={label}
+          onChange={(event) => setLabel(event.target.value)}
+          placeholder={t("ConnectorsPanel.labelPlaceholder")}
+          aria-label={t("ConnectorsPanel.labelPlaceholder")}
+          className="h-8 rounded-md border border-border bg-surface px-2.5 text-sm text-foreground placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+        />
+        {info.hostPlaceholderKey && (
+          <input
+            type="text"
+            value={host}
+            onChange={(event) => setHost(event.target.value)}
+            placeholder={t(info.hostPlaceholderKey)}
+            aria-label={t(info.hostPlaceholderKey)}
+            className="h-8 rounded-md border border-border bg-surface px-2.5 font-mono text-sm text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+          />
+        )}
+        <input
+          type="text"
+          value={clientId}
+          onChange={(event) => setClientId(event.target.value)}
+          placeholder={t("ConnectorsPanel.oauthClientIdPlaceholder")}
+          aria-label={t("ConnectorsPanel.oauthClientIdPlaceholder")}
+          autoComplete="off"
+          className="h-8 rounded-md border border-border bg-surface px-2.5 font-mono text-sm text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+        />
+        {showSecretField && (
+          <input
+            type="password"
+            value={clientSecret}
+            onChange={(event) => setClientSecret(event.target.value)}
+            placeholder={t("ConnectorsPanel.oauthClientSecretPlaceholder")}
+            aria-label={t("ConnectorsPanel.oauthClientSecretPlaceholder")}
+            autoComplete="off"
+            className="h-8 rounded-md border border-border bg-surface px-2.5 font-mono text-sm text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+          />
+        )}
+        <p className="text-[11px] leading-4 text-muted">
+          {t(`ConnectorsPanel.oauthSecretHint_${info.secret}`)}
+        </p>
+      </div>
+      {attempted && phase !== "idle" && (
+        <div className="mt-2">
+          <StatusPill tone={CONNECTOR_OAUTH_PHASE_TONE[phase] ?? "neutral"}>
+            {t(`McpPanel.oauthPhase_${phase}`)}
+          </StatusPill>
+        </div>
+      )}
+      {(error || (attempted && status?.error)) && (
+        <p className="mt-2 text-xs text-danger">{lastAppErrorLine(error ?? status?.error ?? "")}</p>
+      )}
+      <div className="mt-3 flex justify-end gap-2">
+        {inFlight ? (
+          <Button variant="ghost" size="sm" onClick={() => void oauthCancel(info.provider)}>
+            {t("ConnectorsPanel.oauthCancelButton")}
+          </Button>
+        ) : (
+          <Button variant="ghost" size="sm" onClick={onDone} disabled={connecting}>
+            {t("ConnectorsPanel.cancelButton")}
+          </Button>
+        )}
+        <Button size="sm" onClick={() => void handleConnect()} disabled={!canSubmit}>
+          {connecting ? t("ConnectorsPanel.connectingButton") : t("ConnectorsPanel.oauthConnectButton")}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function S3ConnectForm({ onDone }: { onDone: () => void }) {
   const { t } = useT();
   const addS3 = useConnectorsStore((s) => s.addS3);
@@ -810,12 +1071,21 @@ function AuditExport() {
 }
 
 /**
- * Settings "Connectors" tab: guided GitHub (via `gh` CLI)/Slack/Notion/Jira/
- * S3 connections — pick a provider, see its exact scopes/storage-location
- * copy, verify-then-save, then manage (reverify/revoke/export audit) what's
- * already connected. Google Drive, SharePoint/Graph, and anything else that
- * genuinely needs a registered OAuth app are explicit non-goals here (see
- * `connectors.rs`'s module doc) — not faked with a token workaround.
+ * Settings "Connectors" tab. Two distinct kinds of connection live here and
+ * they share no credential:
+ *
+ * - **Accounts** ("Connect a new account"): the `connectorsStore` catalog —
+ *   GitHub via the `gh` CLI, Slack/Notion/Jira with a pasted token, S3/R2
+ *   with access keys, and eleven providers over authorization-code OAuth
+ *   against an OAuth app the user registers themselves (`connector_oauth.rs`
+ *   — no client credentials ship in this binary). Each one is proven with a
+ *   live read-only identity call before it is saved and stored in the OS
+ *   keychain only.
+ * - **App connectors** (the grid above): each card adds an *MCP server* and
+ *   connects it through `mcpStore.oauthConnect`. Eight providers appear in both
+ *   places under the same brand name (Slack, Notion, Google Drive, Linear,
+ *   Asana, Box, Dropbox, HubSpot); they are separate connections with
+ *   separate keychain entries, which is why their copy says so.
  */
 export function ConnectorsPanel() {
   const { t } = useT();
@@ -824,7 +1094,7 @@ export function ConnectorsPanel() {
   const error = useConnectorsStore((s) => s.error);
   const refresh = useConnectorsStore((s) => s.refresh);
 
-  const [openForm, setOpenForm] = useState<"slack" | "notion" | "jira" | "s3" | null>(null);
+  const [openForm, setOpenForm] = useState<ConnectorProvider | null>(null);
 
   const [appSearchQuery, setAppSearchQuery] = useState("");
   const [appSelectedCategories, setAppSelectedCategories] = useState<Set<AppConnectorCategory>>(new Set());
@@ -1035,6 +1305,38 @@ export function ConnectorsPanel() {
             )}
             {openForm === "s3" && <S3ConnectForm onDone={() => setOpenForm(null)} />}
           </article>
+        </div>
+
+        <h4 className="mt-5 text-sm font-semibold text-foreground">{t("ConnectorsPanel.oauthHeading")}</h4>
+        <p className="mt-1 text-xs leading-5 text-muted">{t("ConnectorsPanel.oauthDescription")}</p>
+        <div className="mt-3 grid gap-2 lg:grid-cols-2">
+          {OAUTH_PROVIDERS.map((info) => {
+            const Icon = PROVIDER_ICONS[info.provider];
+            const isOpen = openForm === info.provider;
+            return (
+              <article key={info.provider} className="flex flex-col gap-2">
+                {!isOpen && (
+                  <div className="rounded-lg border border-border bg-background p-3">
+                    <div className="flex items-start gap-3">
+                      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-surface-2 text-muted">
+                        <Icon size={17} />
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <h4 className="text-sm font-semibold text-foreground">{t(PROVIDER_LABEL_KEYS[info.provider])}</h4>
+                        <p className="mt-1 text-xs leading-5 text-muted">{t(info.copyKey)}</p>
+                      </div>
+                    </div>
+                    <div className="mt-3 flex justify-end">
+                      <Button size="sm" onClick={() => setOpenForm(info.provider)}>
+                        {t("ConnectorsPanel.connectButton")}
+                      </Button>
+                    </div>
+                  </div>
+                )}
+                {isOpen && <OAuthConnectForm info={info} onDone={() => setOpenForm(null)} />}
+              </article>
+            );
+          })}
         </div>
       </section>
 

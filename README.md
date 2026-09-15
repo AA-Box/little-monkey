@@ -193,7 +193,7 @@ Serves the OpenAI-compatible routes, the Anthropic Messages subset, and native-O
 | | |
 | :-- | :-- |
 | **Chat &amp; collaboration** | Compare one frozen prompt across up to four targets, run Crew chats with a coordinator and parallel members, fork sessions, split-pane, search everything, set up models from the searchable picker itself, and paste big blobs as editable Markdown cards |
-| **Voice** | Talk holds a spoken conversation in the chat window — a bundled zero-config Whisper engine on every desktop platform, five selectable speech-model tiers, a spoken-language control, and interruption by talking over the answer |
+| **Voice** | Two Talk engines: a private classic pipeline with bundled local Whisper, local wake word and arbitrary local/cloud models, plus native WebRTC Realtime voice. Route microphone and speaker independently between the desktop and paired devices, with barge-in, the same conversation, tools and permission boundary |
 | **Workspace** | Code review over real git porcelain, acceptance-criteria mapping whose citations are checked against the diff, a real PTY terminal, a tabbed browser pane |
 | **Agent tools** | File, shell, memory, web, knowledge, MCP, subagent, plan and verification tools — every one behind the permission gate, with checkpoints you can rewind |
 | **Knowledge 2.0** | Ingest files, sites, chats and WebDAV; hybrid lexical and vector retrieval with reranking; inspect the whole pipeline end to end |
@@ -205,6 +205,31 @@ Serves the OpenAI-compatible routes, the Anthropic Messages subset, and native-O
 | **Runs &amp; limits** | Ten tracked process kinds, durable stop/suspend/resume from anywhere, and budgets that record *which* limit fired |
 
 Every one of these has its boundary written down: **[full feature list](docs/features.md)** · **[what each stops short of](docs/limitations.md)**
+
+## Voice architecture
+
+```text
+                         Talk
+                          │
+             ┌────────────┴────────────┐
+             │                         │
+      Classic Pipeline             Realtime
+             │                         │
+    local/cloud STT              WebRTC audio
+             ↓                         ↓
+       any selected LLM          realtime model
+             ↓                         │
+       local/cloud TTS                 │
+             └────────────┬────────────┘
+                          │
+                      VoiceRoute
+                    ↙             ↘
+              local device     paired device
+```
+
+Classic Pipeline can stay completely local: local wake word → bundled Whisper → local model → local speech. Realtime uses native streaming audio for lower-latency conversation. Voice Everywhere independently routes the microphone and speaker between this computer and paired devices.
+
+> **Where this stops.** Paired browser companions capture microphone audio only while the page is in the foreground. Remote **Always Listening** and wake-word detection are not available on a paired companion — wake detection has to run on the endpoint holding the microphone, and streaming continuous ambient audio off a device is not something this project does. Paired **Realtime** requires the desktop app to be open, because the WebRTC provider session lives in its webview. Full boundaries: **[Realtime voice](docs/realtime-voice.md)** · **[Voice Everywhere](docs/voice-everywhere.md)** · **[Limitations](docs/limitations.md)**.
 
 ## Security
 
@@ -237,7 +262,10 @@ Boundaries in full: **[docs/security.md](docs/security.md)**. Vulnerabilities go
 | Install executable extensions from a signed registry | [Extension marketplace](docs/extension-marketplace.md) |
 | Build and publish an extension | [Extension development](docs/extension-development.md) |
 | Speak to it with local transcription | [Zero-config local Whisper](docs/zero-config-local-whisper.md) |
-| Connect remote MCP over OAuth | [BYO OAuth clients](docs/byo-oauth-clients.md) |
+| Arm a wake word that keeps passive audio on this machine | [Local wake-word detection](docs/local-wake-word.md) |
+| Hold a low-latency spoken conversation over WebRTC | [Realtime voice](docs/realtime-voice.md) |
+| Route a Talk microphone or speaker to another device | [Voice Everywhere](docs/voice-everywhere.md) |
+| Connect remote MCP servers and work accounts over OAuth | [BYO OAuth clients](docs/byo-oauth-clients.md) |
 | Use a paired phone's camera, mic or location | [Paired devices](docs/paired-devices.md) |
 | Reach an agent by message, phone, device or peer | [Messaging, devices and phones](docs/messaging-devices-and-phones.md) |
 | Check the conformance suite | [Conformance suite](docs/conformance-suite.md) |

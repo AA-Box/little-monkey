@@ -27,6 +27,11 @@ vite.config.d.ts
 # Rust / Tauri build output
 target
 src-tauri/target
+
+# Shared CARGO_TARGET_DIR used when several git worktrees build against one
+# cache (plus the vendored sherpa-onnx build that points at its own). The
+# `target` rule above misses these — it matches the exact name only.
+target-shared*/
 src-tauri/gen/schemas
 
 # CLI sidecar staged by scripts/stage-cli-sidecar.mjs before tauri dev/build

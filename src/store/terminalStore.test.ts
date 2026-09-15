@@ -22,9 +22,11 @@ import {
   MAX_TERMINAL_EVIDENCE_CHARS,
   MAX_TERMINAL_OUTPUT_CHARS,
   appendBoundedTerminalOutput,
+  bracketedPasteInput,
   buildTerminalEvidence,
   disposeTerminalListenersForTests,
   readableTerminalOutput,
+  terminalCommandLines,
   useTerminalStore,
   type TerminalSession,
 } from "./terminalStore";
@@ -69,6 +71,16 @@ describe("terminal output bounds", () => {
 
   it("normalizes ANSI and carriage returns for display", () => {
     expect(readableTerminalOutput("\u001b[31mred\u001b[0m\r\nnext\rline")).toBe("red\nnext\nline");
+  });
+
+  it("drops the stray C0 controls a shell prompt leaves behind but keeps newline and tab", () => {
+    expect(readableTerminalOutput("\u0001ahmad@Mac\u0002 \u001b]0;title\u0007» ls\u007f")).toBe("ahmad@Mac » ls");
+    // Keypad-mode and reset escapes a zsh prompt emits around every redraw:
+    // the payload characters must go with the ESC, not survive as text.
+    expect(readableTerminalOutput("\u001b=\u001bccat log\u001b>")).toBe("cat log");
+    expect(readableTerminalOutput("\u001b]133;C\u001b\\done")).toBe("done");
+    expect(readableTerminalOutput("\u001b(Bplain")).toBe("plain");
+    expect(readableTerminalOutput("a\tb\nc")).toBe("a\tb\nc");
   });
 
   it("caps evidence independently and labels truncation", () => {
@@ -162,6 +174,30 @@ describe("terminal store lifecycle", () => {
     expect(mocks.invoke).toHaveBeenNthCalledWith(1, "terminal_interrupt", { sessionId: "term-1" });
     expect(mocks.invoke).toHaveBeenNthCalledWith(2, "terminal_kill", { sessionId: "term-1" });
     expect(useTerminalStore.getState().sessions[0].status).toBe("killed");
+  });
+
+  it("submits a multi-line snippet one line at a time, in order", async () => {
+    // `terminal_execute` rejects an embedded newline ("Submit one terminal
+    // command line at a time"), so a multi-line fence has to arrive as
+    // separate submissions or nothing runs at all.
+    expect(terminalCommandLines("  rm ./a  \n\n codesign ./B.app \n")).toEqual([
+      "rm ./a",
+      "codesign ./B.app",
+    ]);
+
+    mocks.invoke.mockResolvedValue(undefined);
+    useTerminalStore.setState({ sessions: [session()], activeSessionId: "term-1" });
+    await useTerminalStore.getState().executeScript("term-1", "rm ./a\ncodesign ./B.app");
+
+    const executed = mocks.invoke.mock.calls
+      .filter(([name]) => name === "terminal_execute")
+      .map(([, args]) => (args as { command: string }).command);
+    expect(executed).toEqual(["rm ./a", "codesign ./B.app"]);
+  });
+
+  it("wraps only multi-line input in bracketed-paste markers", () => {
+    expect(bracketedPasteInput("ls -l")).toBe("ls -l");
+    expect(bracketedPasteInput("a\nb")).toBe("\u001B[200~a\nb\u001B[201~");
   });
 
   it("queues and atomically consumes evidence for one chat", () => {

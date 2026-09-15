@@ -27,7 +27,7 @@ import {
 } from "lucide-react";
 
 import { useT } from "../../lib/i18n";
-import { useTerminalStore, buildTerminalEvidence } from "../../store/terminalStore";
+import { bracketedPasteInput, useTerminalStore, buildTerminalEvidence } from "../../store/terminalStore";
 import { buildTerminalOutputSideTaskSeed, useSideTaskStore } from "../../store/sideTaskStore";
 import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
 import { Button, IconButton } from "../ui";
@@ -99,6 +99,8 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
   const historyByWorkspace = useTerminalStore((state) => state.historyByWorkspace);
   const queueEvidence = useTerminalStore((state) => state.queueEvidence);
   const clearError = useTerminalStore((state) => state.clearError);
+  const pendingCommand = useTerminalStore((state) => state.pendingCommand);
+  const consumePendingCommand = useTerminalStore((state) => state.consumePendingCommand);
   const dock = useTerminalStore((state) => state.dock);
   const setDock = useTerminalStore((state) => state.setDock);
   const panelSize = useTerminalStore((state) => state.panelSize);
@@ -435,6 +437,20 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
     if (!active || active.status !== "running") return;
     void write(active.id, command).then(() => termRef.current?.focus());
   }, [active, write]);
+
+  // A command sent here from a chat code block's "Open in terminal": typed
+  // into the running shell but never submitted, so the user reads it and
+  // presses Enter themselves. Cleared the moment it lands so re-opening the
+  // panel later cannot retype a stale command.
+  useEffect(() => {
+    if (!pendingCommand || !active || active.status !== "running") return;
+    const command = consumePendingCommand();
+    if (command === null) return;
+    // Bracketed paste for a multi-line snippet: a plain write of embedded
+    // newlines would submit every line but the last, the opposite of this
+    // button's contract.
+    void write(active.id, bracketedPasteInput(command)).then(() => termRef.current?.focus());
+  }, [active, consumePendingCommand, pendingCommand, write]);
 
   const prepareEvidence = useCallback(() => {
     if (!active) return;

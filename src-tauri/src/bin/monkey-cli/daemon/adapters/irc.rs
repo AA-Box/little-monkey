@@ -391,11 +391,20 @@ fn now_ms() -> i64 {
 /// The process-wide TLS client config, built once. `rustls::ClientConfig`'s
 /// own root store is immutable after construction, so there is nothing
 /// per-connection to configure here — every IRC adapter in this process
-/// shares one.
+/// shares one. An IRC account cannot name extra trust anchors the way an email
+/// account can; when one needs to, `email.rs`'s `trust_roots` belongs in
+/// `channel_adapter.rs` rather than copied here.
 fn tls_config() -> Arc<rustls::ClientConfig> {
     static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
     CONFIG
         .get_or_init(|| {
+            // `ClientConfig::builder()` *panics* when it cannot pick a crypto
+            // provider, and this build compiles rustls with both `ring` and
+            // `aws-lc-rs`, so it never can. `daemon/remote/server.rs` installs
+            // one for the same reason, but a daemon with an IRC account and no
+            // remote host never reaches that code — this connect would abort
+            // the process. Idempotent, and any installed provider will do.
+            let _ = rustls::crypto::ring::default_provider().install_default();
             let roots = rustls::RootCertStore {
                 roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
             };

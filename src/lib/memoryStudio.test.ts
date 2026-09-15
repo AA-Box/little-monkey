@@ -12,8 +12,15 @@ import {
   exportMemories,
   importMemories,
   listAllMemories,
+  markMemoriesUsed,
+  mergeMemories,
+  purgeExpiredMemories,
   setMemoryEnabled,
+  setMemoryExpiry,
+  setMemoryPinned,
+  unmergeMemories,
   updateMemory,
+  wouldReachPrompt,
   type MemoryEntry,
 } from "./memoryStudio";
 
@@ -25,6 +32,12 @@ function entry(overrides: Partial<MemoryEntry> = {}): MemoryEntry {
     created_at: "2026-01-01T00:00:00.000Z",
     enabled: true,
     source_turn_id: null,
+    pinned: false,
+    expires_at: null,
+    last_used_at: null,
+    merged_from: [],
+    merged_into: null,
+    retired_at: null,
     scope: "project",
     project_root: "/ws/project",
     ...overrides,
@@ -176,5 +189,133 @@ describe("memoryStudio client", () => {
       const summary = await exportMemories("/tmp/out.json", true);
       expect(summary.redacted_count).toBe(1);
     });
+  });
+});
+
+describe("memoryStudio lifecycle commands", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it("setMemoryPinned forwards id, projectRoot, and pinned", async () => {
+    invokeMock.mockResolvedValue(entry({ pinned: true }));
+    await setMemoryPinned("fact-1", "/ws/project", true);
+    expect(invokeMock).toHaveBeenCalledWith("memory_studio_set_pinned", {
+      id: "fact-1",
+      projectRoot: "/ws/project",
+      pinned: true,
+    });
+  });
+
+  it("setMemoryExpiry forwards a bare date and, separately, a null that clears it", async () => {
+    invokeMock.mockResolvedValue(entry({ expires_at: "2026-12-31T23:59:59.999Z" }));
+    await setMemoryExpiry("fact-1", "/ws/project", "2026-12-31");
+    expect(invokeMock).toHaveBeenCalledWith("memory_studio_set_expiry", {
+      id: "fact-1",
+      projectRoot: "/ws/project",
+      expiresAt: "2026-12-31",
+    });
+
+    invokeMock.mockResolvedValue(entry());
+    await setMemoryExpiry("fact-1", null, null);
+    expect(invokeMock).toHaveBeenLastCalledWith("memory_studio_set_expiry", {
+      id: "fact-1",
+      projectRoot: null,
+      expiresAt: null,
+    });
+  });
+
+  it("mergeMemories forwards the id list, projectRoot, and text (null to join the originals)", async () => {
+    invokeMock.mockResolvedValue(entry({ merged_from: ["a", "b"] }));
+    await mergeMemories(["a", "b"], "/ws/project", "combined");
+    expect(invokeMock).toHaveBeenCalledWith("memory_studio_merge", {
+      ids: ["a", "b"],
+      projectRoot: "/ws/project",
+      text: "combined",
+    });
+
+    await mergeMemories(["a", "b"], null, null);
+    expect(invokeMock).toHaveBeenLastCalledWith("memory_studio_merge", {
+      ids: ["a", "b"],
+      projectRoot: null,
+      text: null,
+    });
+  });
+
+  it("unmergeMemories forwards id and projectRoot and resolves to the restored count", async () => {
+    invokeMock.mockResolvedValue(2);
+    await expect(unmergeMemories("merged-1", "/ws/project")).resolves.toBe(2);
+    expect(invokeMock).toHaveBeenCalledWith("memory_studio_unmerge", {
+      id: "merged-1",
+      projectRoot: "/ws/project",
+    });
+  });
+
+  it("purgeExpiredMemories takes no arguments and resolves to the purged count", async () => {
+    invokeMock.mockResolvedValue(3);
+    await expect(purgeExpiredMemories()).resolves.toBe(3);
+    expect(invokeMock).toHaveBeenCalledWith("memory_studio_purge_expired");
+  });
+});
+
+describe("markMemoriesUsed", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it("sends the ids to memory_mark_used", () => {
+    invokeMock.mockResolvedValue(2);
+    markMemoriesUsed(["a", "b"]);
+    expect(invokeMock).toHaveBeenCalledWith("memory_mark_used", { ids: ["a", "b"] });
+  });
+
+  it("does nothing at all for an empty id list", () => {
+    markMemoriesUsed([]);
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("swallows a rejecting backend rather than failing the prompt build", async () => {
+    invokeMock.mockRejectedValue(new Error("unknown command"));
+    expect(() => markMemoriesUsed(["a"])).not.toThrow();
+    // Flush the microtask queue: an unhandled rejection here would fail the
+    // suites that stub `invoke` to reject unknown commands.
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+});
+
+describe("wouldReachPrompt (display only — mirrors list_impl's filter)", () => {
+  // This asserts a TS predicate used for Memory Studio's badges, NOT that
+  // anything was excluded from a real prompt. The prompt guarantee is proved
+  // where the filter actually lives: memory.rs's
+  // `expired_and_merge_retired_facts_are_excluded_from_list_impl` and
+  // monkey-cli's
+  // `an_expired_or_merged_away_fact_is_excluded_from_the_cli_system_prompt`.
+  const NOW = "2026-06-01T00:00:00.000Z";
+
+  it("keeps a plain enabled memory", () => {
+    expect(wouldReachPrompt(entry(), NOW)).toBe(true);
+  });
+
+  it("excludes a disabled memory", () => {
+    expect(wouldReachPrompt(entry({ enabled: false }), NOW)).toBe(false);
+  });
+
+  it("excludes an expired memory but not one whose expiry is still ahead", () => {
+    expect(wouldReachPrompt(entry({ expires_at: "2026-01-01T00:00:00.000Z" }), NOW)).toBe(false);
+    expect(wouldReachPrompt(entry({ expires_at: "2027-01-01T00:00:00.000Z" }), NOW)).toBe(true);
+  });
+
+  it("excludes a memory retired by a merge", () => {
+    expect(wouldReachPrompt(entry({ retired_at: NOW, merged_into: "merged-1" }), NOW)).toBe(false);
+  });
+
+  it("keeps a pinned memory whose expiry has passed", () => {
+    expect(wouldReachPrompt(entry({ pinned: true, expires_at: "2026-01-01T00:00:00.000Z" }), NOW)).toBe(true);
+  });
+
+  it("still excludes a pinned memory that is disabled or retired", () => {
+    expect(wouldReachPrompt(entry({ pinned: true, enabled: false }), NOW)).toBe(false);
+    expect(wouldReachPrompt(entry({ pinned: true, retired_at: NOW }), NOW)).toBe(false);
   });
 });

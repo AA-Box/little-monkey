@@ -8,6 +8,12 @@ A development tree that has not run `pnpm stage:whisper` has no bundled copy. Th
 
 The Whisper engine itself is compiled into the desktop application. The same implementation is used by Talk, desktop companion transcription, phone-call transcription, and paired-device voice input. Browser `MediaRecorder` WebM/Opus recordings are demuxed and decoded in-process before Whisper inference; WAV and the other formats supported by the bundled audio decoder use the same path.
 
+Desktop Talk's optional wake gate does **not** run Whisper continuously. An
+AudioWorklet sends bounded 16 kHz PCM to the bundled native sherpa-onnx keyword
+spotter; only samples after a real wake event enter Talk/VAD and this Whisper
+engine. See [Local wake-word detection](local-wake-word.md). Phone Talk remains
+a distinct foreground socket path and does not inherit the desktop wake model.
+
 Legacy `whisperBinary` and `whisperModel` configuration fields remain readable/writable only for compatibility with older persisted config files and clients. The built-in local backend ignores them, and stale legacy paths cannot prevent startup or make Talk report itself unconfigured.
 
 The release targets covered by CI are macOS arm64/x86_64, Linux arm64/x86_64, and Windows arm64/x86_64. The local-speech workflow compiles the application for all six, performs a real end-to-end transcription of both WAV and WebM/Opus audio including checksum verification, and builds an installable package to prove the model is actually inside what a user installs.

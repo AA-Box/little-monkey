@@ -4,6 +4,30 @@ export interface VadConfig {
   maxUtteranceMs: number;
 }
 
+/** The only browser microphone processor used by Talk and the settings test.
+ * It batches raw mono floats; resampling, bounds and native inference remain in
+ * ordinary testable code outside the real-time audio thread. */
+export const PCM_AUDIO_WORKLET_SOURCE = `
+class LittleMonkeyPcmCapture extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.pending = [];
+  }
+  process(inputs) {
+    const channel = inputs[0] && inputs[0][0];
+    if (!channel || channel.length === 0) return true;
+    for (let i = 0; i < channel.length; i += 1) this.pending.push(channel[i]);
+    if (this.pending.length >= 2048) {
+      const frame = Float32Array.from(this.pending);
+      this.pending = [];
+      this.port.postMessage(frame, [frame.buffer]);
+    }
+    return true;
+  }
+}
+registerProcessor('little-monkey-pcm-capture', LittleMonkeyPcmCapture);
+`;
+
 export type VadEvent = "none" | "speech-start" | "utterance-end" | "max-utterance";
 
 export interface VadFrame {
@@ -39,6 +63,151 @@ export function rmsOf(samples: Float32Array): number {
   let squares = 0;
   for (const sample of samples) squares += sample * sample;
   return Math.sqrt(squares / samples.length);
+}
+
+/** Stateful linear resampler for consecutive AudioWorklet chunks. It keeps the
+ * fractional source position across calls, so chunk boundaries cannot insert
+ * or drop a sample. */
+export class StreamingLinearResampler {
+  private sourceRate = 0;
+  private targetRate: number;
+  private previous: number | null = null;
+  private position = 0;
+
+  constructor(targetRate = 16_000) {
+    if (!Number.isFinite(targetRate) || targetRate <= 0) throw new Error('Invalid target sample rate');
+    this.targetRate = targetRate;
+  }
+
+  reset(): void {
+    this.sourceRate = 0;
+    this.previous = null;
+    this.position = 0;
+  }
+
+  process(input: Float32Array, sourceRate: number): Float32Array {
+    if (input.length === 0) return new Float32Array();
+    if (!Number.isFinite(sourceRate) || sourceRate <= 0) throw new Error('Invalid source sample rate');
+    if (this.sourceRate !== 0 && this.sourceRate !== sourceRate) this.reset();
+    this.sourceRate = sourceRate;
+    if (sourceRate === this.targetRate) {
+      this.previous = input[input.length - 1];
+      return input.slice();
+    }
+
+    const combined = new Float32Array(input.length + (this.previous === null ? 0 : 1));
+    let offset = 0;
+    if (this.previous !== null) {
+      combined[0] = this.previous;
+      offset = 1;
+    }
+    combined.set(input, offset);
+    const step = sourceRate / this.targetRate;
+    const output: number[] = [];
+    while (this.position < combined.length - 1) {
+      const left = Math.floor(this.position);
+      const mix = this.position - left;
+      output.push(combined[left] * (1 - mix) + combined[left + 1] * mix);
+      this.position += step;
+    }
+    this.position -= combined.length - 1;
+    this.previous = combined[combined.length - 1];
+    return Float32Array.from(output);
+  }
+}
+
+/** Fixed-capacity PCM history addressed by the absolute number of samples seen.
+ * It is the bridge between the detector's keyword-end timestamp and the command
+ * recorder: only samples after the keyword are copied into Whisper's clip. */
+export class PcmRingBuffer {
+  private readonly samples: Float32Array;
+  private written = 0;
+
+  constructor(capacity: number) {
+    if (!Number.isInteger(capacity) || capacity <= 0) throw new Error('Invalid PCM ring capacity');
+    this.samples = new Float32Array(capacity);
+  }
+
+  get totalWritten(): number {
+    return this.written;
+  }
+
+  write(frame: Float32Array): void {
+    for (const sample of frame) {
+      this.samples[this.written % this.samples.length] = sample;
+      this.written += 1;
+    }
+  }
+
+  sliceFrom(absoluteStart: number): Float32Array {
+    const earliest = Math.max(0, this.written - this.samples.length);
+    const start = Math.min(this.written, Math.max(earliest, Math.floor(absoluteStart)));
+    const output = new Float32Array(this.written - start);
+    for (let index = 0; index < output.length; index += 1) {
+      output[index] = this.samples[(start + index) % this.samples.length];
+    }
+    return output;
+  }
+}
+
+/** One bounded handoff slot for native KWS. When inference is slower than the
+ * microphone, old pending audio is dropped instead of growing an unbounded
+ * queue; the native metrics receive the exact drop count on stop. */
+export class BoundedPcmQueue {
+  private pending = new Float32Array();
+  droppedFrames = 0;
+
+  constructor(private readonly capacity: number) {}
+
+  enqueue(frame: Float32Array): void {
+    const merged = new Float32Array(this.pending.length + frame.length);
+    merged.set(this.pending);
+    merged.set(frame, this.pending.length);
+    if (merged.length <= this.capacity) {
+      this.pending = merged;
+      return;
+    }
+    this.droppedFrames += 1;
+    this.pending = merged.slice(merged.length - this.capacity);
+  }
+
+  take(): Float32Array {
+    const value = this.pending;
+    this.pending = new Float32Array();
+    return value;
+  }
+
+  get length(): number {
+    return this.pending.length;
+  }
+}
+
+/** Encode transient 16 kHz mono PCM as a WAV Blob for the existing local
+ * Whisper entry point. The float samples are never persisted by this helper. */
+export function pcm16WavBlob(samples: Float32Array, sampleRate = 16_000): Blob {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const ascii = (offset: number, value: string) => {
+    for (let index = 0; index < value.length; index += 1) view.setUint8(offset + index, value.charCodeAt(index));
+  };
+  ascii(0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  ascii(8, 'WAVE');
+  ascii(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  ascii(36, 'data');
+  view.setUint32(40, samples.length * 2, true);
+  for (let index = 0; index < samples.length; index += 1) {
+    const sample = Math.max(-1, Math.min(1, samples[index]));
+    view.setInt16(44 + index * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+  }
+  return new Blob([buffer], { type: 'audio/wav' });
 }
 
 /** Adaptive, local-only speech detector. Quiet frames update the rolling

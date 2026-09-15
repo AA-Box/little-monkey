@@ -8,6 +8,7 @@ pub(crate) mod device;
 mod device_e2e;
 pub(crate) mod migrate;
 pub(crate) mod protocol;
+pub(crate) mod realtime_bridge;
 pub(crate) mod push;
 pub(crate) mod qr;
 mod server;
@@ -15,8 +16,10 @@ pub(crate) mod store;
 pub(crate) mod talk;
 pub(crate) mod talk_socket;
 pub(crate) mod voice;
+pub(crate) mod voice_route;
 pub(crate) mod watch;
 mod web;
+pub(crate) mod webchat;
 
 /// The bound-listener entry point the opt-in peer live-validation test serves
 /// through. Test-only so the module itself stays private.
@@ -1634,7 +1637,15 @@ fn command_json(record: &self::store::DeviceCommandRecord) -> serde_json::Value 
 fn device_list(paths: &DaemonPaths, json: bool) -> Result<(), String> {
     let rows = device_rows(paths)?;
     if json {
-        return print_json(serde_json::json!({ "devices": rows }));
+        // `any_capable` is the same predicate that gates offering the
+        // `device_action` tool on this machine, published here so the desktop
+        // app can gate its own tool list on it without re-deriving it from
+        // `devices` — the extension-device-provider half of the answer has no
+        // row to appear in.
+        return print_json(serde_json::json!({
+            "devices": rows,
+            "any_capable": device::any_device_is_capable(),
+        }));
     }
     if rows.is_empty() {
         println!("No paired devices.");

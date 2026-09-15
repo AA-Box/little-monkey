@@ -8,6 +8,8 @@ import { invoke } from "@tauri-apps/api/core";
  *
  * Read-only by construction: the reply to a Slack thread goes out on Slack and
  * the reply to a phone goes to the phone, so there is nothing here that sends.
+ * The one write is `delete`, which forgets a conversation *here* — the daemon
+ * keeps its durable record, and the next message in it brings it back.
  */
 
 /** Where a conversation lives. `local` is the desktop's own list and never
@@ -46,7 +48,8 @@ export interface ExternalMessage {
   role: string;
   text: string;
   at_ms: number;
-  /** The provider's id for whoever sent it; absent on our own messages. */
+  /** Whoever sent it, as the provider named them — their display name when it
+   * sent one, else its id. Absent on our own messages. */
   author: string | null;
 }
 
@@ -55,6 +58,10 @@ export const conversationsList = (environment: string | null = null, limit = 200
 
 export const conversationsShow = (environment: string, id: string, limit = 500) =>
   invoke<{ messages: ExternalMessage[] }>("conversations_show", { environment, id, limit });
+
+/** Forget a conversation here. Idempotent: one already gone is not an error. */
+export const conversationsDelete = (environment: string, id: string) =>
+  invoke<void>("conversations_delete", { environment, id });
 
 /** The provider token an environment names, or null when it names no channel. */
 export function environmentProvider(environment: string): string | null {

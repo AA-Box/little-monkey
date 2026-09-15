@@ -37,9 +37,11 @@ fn target_dir() -> PathBuf {
 }
 
 fn cli() -> PathBuf {
-    target_dir()
-        .join("debug")
-        .join(if cfg!(windows) { "monkey-cli.exe" } else { "monkey-cli" })
+    target_dir().join("debug").join(if cfg!(windows) {
+        "monkey-cli.exe"
+    } else {
+        "monkey-cli"
+    })
 }
 
 fn output_text(output: &Output) -> String {
@@ -174,8 +176,7 @@ fn add_account(profile: &str, app_id: &str, tenant_id: &str) -> Result<String, S
     let output = require_cli(
         Some(profile),
         &[
-            "channels", "add", "teams", &label,
-            "--config", &config, "--json",
+            "channels", "add", "teams", &label, "--config", &config, "--json",
         ],
     )?;
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
@@ -270,7 +271,9 @@ impl ModelFixture {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
-    stream.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .ok()?;
     let mut received = Vec::new();
     let mut scratch = [0u8; 8192];
     let mut header_end = None;
@@ -322,7 +325,9 @@ fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn json_response(body: &str) -> String {

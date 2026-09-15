@@ -4,6 +4,7 @@ import {
   LOCAL_ENVIRONMENT,
   type ExternalConversation,
 } from "../../lib/conversationsClient";
+import type { ExternalConversationMeta } from "../../store/externalConversationMetaStore";
 import type { SessionStatus } from "./sessionStatus";
 
 /**
@@ -19,8 +20,9 @@ import type { SessionStatus } from "./sessionStatus";
  *
  * The four axes:
  *
- * - **Status** — active / archived / all. Only local sessions can be
- *   archived, so an outside conversation is always "active".
+ * - **Status** — active / archived / all. An outside conversation's pin,
+ *   archive, group and name are this desktop's own notes about it (see
+ *   `externalConversationMetaStore`); the daemon knows nothing of them.
  * - **Environment** — a multi-select over the environments above. The
  *   built-in three are always offered even when nothing has arrived on one:
  *   an empty Slack filter says "no Slack workspace has installed this yet",
@@ -78,9 +80,9 @@ export type SessionRow =
       title: string;
       createdAt: number;
       updatedAt: number;
-      pinned: false;
-      archived: false;
-      groupId: null;
+      pinned: boolean;
+      archived: boolean;
+      groupId: string | null;
       workspacePath: null;
       status: null;
       conversation: ExternalConversation;
@@ -133,23 +135,31 @@ export function localRow(session: ChatSession, status: SessionStatus | null): Se
   };
 }
 
-export function externalRow(conversation: ExternalConversation): SessionRow {
+export function externalRow(
+  conversation: ExternalConversation,
+  meta?: ExternalConversationMeta,
+): SessionRow {
   return {
     kind: "external",
     id: `${conversation.environment} ${conversation.id}`,
     environment: conversation.environment,
-    // A phone's chat is titled by its first message and a channel thread by
-    // whatever the provider called it; both can be empty, and an untitled row
-    // is worse than one named after the account it arrived on.
-    title: conversation.title.trim() || conversation.account_label?.trim() || conversation.id,
+    // The user's own name first. Otherwise a phone's chat is titled by its
+    // first message and a channel thread by whatever the provider called it;
+    // both can be empty, and an untitled row is worse than one named after
+    // the account it arrived on.
+    title:
+      meta?.title?.trim() ||
+      conversation.title.trim() ||
+      conversation.account_label?.trim() ||
+      conversation.id,
     // The daemon records activity, not creation. Sorting by "created time"
     // therefore orders these by the only timestamp there is — honest, and
     // stable, rather than a fabricated birthday.
     createdAt: conversation.updated_at_ms,
     updatedAt: conversation.updated_at_ms,
-    pinned: false,
-    archived: false,
-    groupId: null,
+    pinned: meta?.pinned ?? false,
+    archived: meta?.archived ?? false,
+    groupId: meta?.groupId ?? null,
     workspacePath: null,
     status: null,
     conversation,
@@ -305,9 +315,9 @@ export function buildSessionListView({
           items: rest.filter((row) => row.groupId === group.id),
         }))
         .filter((section) => section.items.length > 0);
-      // Everything with no group of its own — including every outside
-      // conversation — keeps the "Recents" section, even when empty: it is
-      // the list's own heading, and the row the view menu hangs off.
+      // Everything with no group of its own keeps the "Recents" section,
+      // even when empty: it is the list's own heading, and the row the view
+      // menu hangs off.
       sections.push({
         id: "recents",
         title: labels.recents,

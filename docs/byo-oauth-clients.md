@@ -192,9 +192,61 @@ use **Manual bearer token** in the same disclosure.
 | Access + refresh tokens | keychain, `mcp-oauth:<server id>` |
 | Manually pasted bearer token | keychain, `mcp:<server id>` |
 | Server URL, timeout, tool allowlist | `mcp_servers.json` |
+| Your connector OAuth client id + secret | keychain, `connector-oauth-client:<provider>` |
+| Connector access + refresh tokens | keychain, `connector-oauth:<account id>` |
+| Account label, provider, host/tenant, credential ref | `connectors.json` |
 
 **Disconnect** clears the first two together, so a later connect starts clean
 rather than silently reusing a client you may have revoked.
+
+Removing a connector account deletes its `connector-oauth:<account id>` entry,
+and deletes the shared `connector-oauth-client:<provider>` entry only once no
+account of that provider is left — otherwise disconnecting one Google account
+would send the others back to the Google console.
+
+## Connector accounts
+
+Settings → Connectors → **Connect over OAuth** connects a work *account* (not
+an MCP server — that is the App connectors grid, a separate connection with its
+own keychain entry). None of these eleven providers supports dynamic client
+registration, so each one needs an OAuth app you register yourself, once.
+
+The redirect URI is shown on the card **before** the client-id fields, because
+you have to register it while creating the app. It is derived from the provider,
+so it is the same string for every account of that provider and never changes:
+`http://127.0.0.1:<port>/`, root path, no query.
+
+| Provider | Client secret | Extra field |
+| --- | --- | --- |
+| Google Drive | required | — |
+| Microsoft Graph | **never** — register a public "Mobile and desktop applications" client | tenant (defaults to `common`) |
+| Linear | required | — |
+| Asana | required | — |
+| Dropbox | optional | — |
+| Box | required | — |
+| Airtable | **never** — register a public client (PKCE is mandatory, and its confidential flow needs the secret in an HTTP Basic header, which this app does not send) | — |
+| Zendesk | optional with PKCE | your subdomain host, e.g. `acme.zendesk.com` |
+| HubSpot | required | — |
+| Discord | required | — |
+| GitLab | optional | instance host, defaults to `gitlab.com` |
+
+Leave the secret blank for a public PKCE client — sending an empty secret is not
+the same request as sending none, and the app sends none. If a secret is already
+saved against the *same* client id, a blank field keeps it rather than erasing
+it, since that one registration is what every existing account of the provider
+refreshes against. Microsoft Graph and Airtable are the two providers with no
+secret field at all; every other card shows one.
+
+The client id and secret are saved in your keychain per *provider*, so the second
+account of the same provider only needs a label: leave both fields blank and the
+card reuses the registration (blank with nothing saved comes back as "needs a
+client ID"). Because that one registration is what every account of the provider
+refreshes against, pasting a *different* client id while accounts registered
+against the old one still exist is refused — remove them first.
+
+Consent is desktop-only: it opens your system browser and streams progress to
+the Settings window. `monkey connectors list|reverify|remove` manages accounts
+that already exist.
 
 ## Running your own broker instead
 

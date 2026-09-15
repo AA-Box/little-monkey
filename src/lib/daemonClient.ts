@@ -346,13 +346,127 @@ export interface RemoteDeviceRow {
   recent_commands: RemoteDeviceCommandRow[];
 }
 
-export const remoteDeviceList = () => invoke<{ devices: RemoteDeviceRow[] }>("remote_device_list");
+/** Last answer `remote_device_list` gave for `any_capable`; `null` until one
+ * has been asked for. `null` means "not yet known", which callers treat as
+ * "no device" — offering `device_action` is a capability, so an unknown state
+ * must not grant it. Same posture as `skillLearningClient`'s `cachedMode`. */
+let deviceCapable: boolean | null = null;
+
+/** `monkey daemon remote device-list --json`.
+ *
+ * `any_capable` is the daemon's own answer to "could any paired device (or
+ * executable-extension device provider) perform a physical action right now" —
+ * the exact predicate monkey-cli gates offering the `device_action` tool on.
+ * Computed there rather than re-derived from `devices` here, because the
+ * extension-provider half of it has no row to appear in.
+ */
+export const remoteDeviceList = async (): Promise<{ devices: RemoteDeviceRow[]; any_capable: boolean }> => {
+  const response = await invoke<{ devices: RemoteDeviceRow[]; any_capable?: boolean }>("remote_device_list");
+  deviceCapable = response.any_capable === true;
+  return { devices: response.devices, any_capable: deviceCapable };
+};
+
+/**
+ * Whether the `device_action` tool should be offered this turn — see
+ * `agentLoop.ts`'s `toolsForSettings`, and monkey-cli's own
+ * `any_device_is_capable()` gate, which this mirrors.
+ *
+ * Reading it kicks off the probe when nothing has asked yet and answers `false`
+ * meanwhile, rather than making every turn wait on a subprocess: pairing a
+ * device happens in Settings, which calls `remoteDeviceList` itself, so the
+ * cache is already warm by the time a paired device exists. The cost of the
+ * cold read is that the first turn after launch does not offer the tool.
+ */
+export function deviceActionAvailable(): boolean {
+  if (deviceCapable === null) {
+    deviceCapable = false;
+    void remoteDeviceList().catch(() => undefined);
+  }
+  return deviceCapable;
+}
+
 export const remoteDeviceGrant = (deviceId: string, capabilities: string[]) =>
   invoke<string>("remote_device_grant", { deviceId, capabilities });
 export const remoteDeviceCommands = (deviceId: string, limit = 20) =>
   invoke<{ commands: RemoteDeviceCommandRow[] }>("remote_device_commands", { deviceId, limit });
 export const remoteDeviceCancel = (commandId: string) =>
   invoke<string>("remote_device_cancel", { commandId });
+
+export type AudioEndpointDirection = "input" | "output";
+export type AudioEndpointLocality = "local" | "paired";
+export type VoiceRouteEngine = "pipeline" | "realtime";
+
+export interface AudioEndpointDescriptor {
+  id: string;
+  label: string;
+  direction: AudioEndpointDirection;
+  locality: AudioEndpointLocality;
+  device_id: string | null;
+  input_supported: boolean;
+  output_supported: boolean;
+  voice_stream_supported: boolean;
+  os_permission: 'granted' | 'denied' | 'undetermined' | 'promptable' | 'not_required' | 'unsupported' | null;
+  readiness: 'ready' | 'foreground_required' | 'interaction_required' | 'armed_required' | 'unavailable' | null;
+  foreground_required: boolean;
+  interaction_required: boolean;
+  online: boolean;
+  last_seen_at_ms: number | null;
+  latency_ms: number | null;
+  ready: boolean;
+  blocked_code: string | null;
+  blocked_by: string | null;
+}
+
+export interface VoiceRouteRecord {
+  session_id: string;
+  route_id: string;
+  generation: number;
+  engine: VoiceRouteEngine;
+  input_endpoint: string;
+  output_endpoint: string;
+  state: "active" | "stopped";
+  input_command_id: string | null;
+  output_command_id: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface VoiceRouteEvent {
+  event_id: number;
+  session_id: string;
+  generation: number;
+  kind: string;
+  payload: unknown;
+  created_at_ms: number;
+}
+
+export const voiceRouteEndpoints = () =>
+  invoke<{ endpoints: AudioEndpointDescriptor[] }>("voice_route_endpoints");
+export const voiceRouteGet = (sessionId: string) =>
+  invoke<VoiceRouteRecord | null>("voice_route_get", { sessionId });
+export const voiceRouteSet = (
+  sessionId: string,
+  input: string,
+  output: string,
+  engine: VoiceRouteEngine,
+) => invoke<VoiceRouteRecord>("voice_route_set", { sessionId, input, output, engine });
+export const voiceRouteMove = (sessionId: string, input?: string, output?: string) =>
+  invoke<VoiceRouteRecord>("voice_route_move", { sessionId, input: input ?? null, output: output ?? null });
+export const voiceRouteActivate = (sessionId: string) =>
+  invoke<VoiceRouteRecord>("voice_route_activate", { sessionId });
+export const voiceRouteDeactivate = (sessionId: string) =>
+  invoke<VoiceRouteRecord | null>("voice_route_deactivate", { sessionId });
+export const voiceRouteStop = (sessionId: string) =>
+  invoke<VoiceRouteRecord | null>("voice_route_stop", { sessionId });
+export const voiceRouteEvents = (sessionId: string, after = 0, limit = 100) =>
+  invoke<VoiceRouteEvent[]>("voice_route_events", { sessionId, after, limit });
+export const voiceRouteEmit = (
+  sessionId: string,
+  generation: number,
+  kind: string,
+  payload: unknown,
+) => invoke<VoiceRouteEvent>("voice_route_emit", { sessionId, generation, kind, payload });
+
 
 /** One node this machine may place work on, as `monkey daemon remote node-list --json` reports it (roadmap K17 S1). */
 export interface RemoteNodeRow {

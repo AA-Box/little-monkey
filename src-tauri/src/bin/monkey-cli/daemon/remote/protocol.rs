@@ -43,7 +43,7 @@ pub const MAX_REMOTE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 /// would offer to re-send *every* turn — including ones already answered. That
 /// is exactly the "tell somebody to repeat what is already running" failure the
 /// journal exists to prevent, so the two sides are pinned to each other.
-pub const TALK_PROTOCOL_VERSION: u32 = 3;
+pub const TALK_PROTOCOL_VERSION: u32 = 9;
 
 /// The version whose only difference from [`TALK_PROTOCOL_VERSION`] is the
 /// missing utterance id — so a client speaking it can be told precisely what is
@@ -53,6 +53,23 @@ const TALK_PROTOCOL_VERSION_WITHOUT_UTTERANCE_ID: u32 = 1;
 /// The version that names its utterances but has nowhere to hear that one was
 /// durably accepted. Refused by version for the reason above.
 const TALK_PROTOCOL_VERSION_WITHOUT_ACCEPTANCE: u32 = 2;
+/// Version 3 predates host-authoritative routed Talk tickets.
+const TALK_PROTOCOL_VERSION_WITHOUT_VOICE_ROUTE: u32 = 3;
+/// Version 4 can bind a route, but cannot bind independent input/output Talk roles.
+const TALK_PROTOCOL_VERSION_WITHOUT_ROUTE_ROLE: u32 = 4;
+/// Version 5 routed independent speakers but could only send one whole TTS blob
+/// per frame, so it could neither stream long output nor bind each chunk to the
+/// route generation/response that produced it.
+const TALK_PROTOCOL_VERSION_WITHOUT_BOUNDED_OUTPUT_STREAM: u32 = 5;
+/// Version 6 has bounded routed output, but no raw PCM media type for the direct
+/// paired-device Realtime WebRTC bridge.
+const TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_PCM: u32 = 6;
+/// Version 7 carried direct Realtime PCM at 48 kHz, while the provider input
+/// buffer accepts canonical PCM16 at 24 kHz.
+const TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_PCM_24K: u32 = 7;
+/// Version 8 corrected PCM but had no causal input gate/barrier for remote
+/// manual push-to-talk, so a network-tail chunk could land after commit.
+const TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_INPUT_GATE: u32 = 8;
 pub const MAX_TALK_AUDIO_BYTES: usize = MAX_VOICE_CHUNK_BYTES;
 pub const MAX_TALK_AUDIO_BASE64_BYTES: usize = MAX_TALK_AUDIO_BYTES.div_ceil(3) * 4;
 pub const MAX_TALK_FRAME_BYTES: usize = MAX_TALK_AUDIO_BASE64_BYTES + 16 * 1024;
@@ -1620,6 +1637,7 @@ pub const TALK_MEDIA_TYPES: &[&str] = &[
     "audio/mp4",
     "audio/wav",
     "audio/mpeg",
+    super::realtime_bridge::REALTIME_PCM_MEDIA_TYPE,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1639,13 +1657,36 @@ pub enum TalkState {
 #[serde(deny_unknown_fields)]
 pub struct TalkTicketRequest {
     pub protocol_version: u32,
+    /// Legacy/manual Talk conversation. In routed Talk this value is deliberately
+    /// ignored: the host-owned route is the authority for the conversation.
     pub session_id: String,
+    #[serde(default)]
+    pub route_id: Option<String>,
+    #[serde(default)]
+    pub route_generation: Option<u64>,
+    /// Routed Talk role selected by the host: input, output, or duplex.
+    #[serde(default)]
+    pub route_role: Option<String>,
 }
 
 impl TalkTicketRequest {
     pub fn validate(&self) -> Result<(), String> {
         validate_talk_protocol_version(self.protocol_version)?;
-        validate_talk_session_id(&self.session_id)
+        validate_talk_session_id(&self.session_id)?;
+        match (&self.route_id, self.route_generation, self.route_role.as_deref()) {
+            (None, None, None) => Ok(()),
+            (Some(route_id), Some(generation), Some(role)) => {
+                validate_id(route_id)?;
+                if generation == 0 {
+                    return Err("Talk route generation must be positive".to_string());
+                }
+                if !matches!(role, "input" | "output" | "duplex") {
+                    return Err("Talk route role must be input, output, or duplex".to_string());
+                }
+                Ok(())
+            }
+            _ => Err("Routed Talk requires route_id, route_generation, and route_role".to_string()),
+        }
     }
 }
 
@@ -1770,6 +1811,19 @@ pub enum TalkClientFrameKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// Confirms that one runner-to-device audio frame actually finished (or
+    /// failed) playback. Output-only routed Talk uses this as backpressure.
+    PlaybackAck {
+        audio_sequence: u64,
+        played: bool,
+    },
+    /// Acknowledges a host input gate only after all earlier microphone PCM
+    /// frames on this same WebSocket have been sent. This is the causal barrier
+    /// manual push-to-talk needs before the provider input buffer is committed.
+    InputGateAck {
+        gate_sequence: u64,
+        open: bool,
+    },
     /// What the device's half of one utterance cost, in milliseconds.
     ///
     /// The runner can time everything from transcription onwards itself, but
@@ -1849,6 +1903,14 @@ impl TalkClientFrame {
                     validate_talk_text("interrupt reason", reason, MAX_TALK_ERROR_BYTES)?;
                 }
             }
+            TalkClientFrameKind::PlaybackAck { audio_sequence, .. } => {
+                validate_talk_audio_sequence(*audio_sequence)?;
+            }
+            TalkClientFrameKind::InputGateAck { gate_sequence, .. } => {
+                if *gate_sequence == 0 {
+                    return Err("Talk input gate sequence must be positive".to_string());
+                }
+            }
             TalkClientFrameKind::Metrics {
                 audio_sequence,
                 speech_detection_ms,
@@ -1899,6 +1961,11 @@ pub enum TalkServerFrameKind {
     State {
         state: TalkState,
     },
+    /// Causal microphone gate for paired Realtime manual push-to-talk.
+    InputGate {
+        gate_sequence: u64,
+        open: bool,
+    },
     /// One utterance now exists as a durable turn, and the device may delete
     /// the recording it has been holding.
     ///
@@ -1932,7 +1999,19 @@ pub enum TalkServerFrameKind {
         text: String,
     },
     OutputAudio {
+        /// Monotonic across every playable output chunk on this socket.
         audio_sequence: u64,
+        /// Identity of the synthesized response fragment these chunks belong to.
+        /// It is not authority; the authenticated route/session envelope is.
+        response_id: String,
+        /// Zero-based position inside this response fragment.
+        chunk_index: u32,
+        /// Total number of bounded, individually playable chunks.
+        chunk_count: u32,
+        /// Present for a host-owned VoiceRoute so stale output can be rejected
+        /// even before the surrounding socket is torn down.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route_generation: Option<u64>,
         media_type: String,
         audio_base64: String,
     },
@@ -1953,6 +2032,11 @@ impl TalkServerFrame {
         )?;
         match &self.kind {
             TalkServerFrameKind::Ready | TalkServerFrameKind::State { .. } => {}
+            TalkServerFrameKind::InputGate { gate_sequence, .. } => {
+                if *gate_sequence == 0 {
+                    return Err("Talk input gate sequence must be positive".to_string());
+                }
+            }
             TalkServerFrameKind::TurnAccepted {
                 utterance_id,
                 run_id,
@@ -1970,10 +2054,21 @@ impl TalkServerFrame {
             }
             TalkServerFrameKind::OutputAudio {
                 audio_sequence,
+                response_id,
+                chunk_index,
+                chunk_count,
+                route_generation,
                 media_type,
                 audio_base64,
             } => {
                 validate_talk_audio_sequence(*audio_sequence)?;
+                validate_id(response_id)?;
+                if *chunk_count == 0 || *chunk_index >= *chunk_count {
+                    return Err("Talk output chunk position is invalid".to_string());
+                }
+                if matches!(route_generation, Some(0)) {
+                    return Err("Talk route generation must be positive".to_string());
+                }
                 validate_talk_media_type(media_type)?;
                 validate_talk_audio(audio_base64)?;
             }
@@ -2048,7 +2143,14 @@ fn validate_talk_protocol_version(protocol_version: u32) -> Result<(), String> {
     // "unsupported version" would not tell them to.
     if matches!(
         protocol_version,
-        TALK_PROTOCOL_VERSION_WITHOUT_UTTERANCE_ID | TALK_PROTOCOL_VERSION_WITHOUT_ACCEPTANCE
+        TALK_PROTOCOL_VERSION_WITHOUT_UTTERANCE_ID
+            | TALK_PROTOCOL_VERSION_WITHOUT_ACCEPTANCE
+            | TALK_PROTOCOL_VERSION_WITHOUT_VOICE_ROUTE
+            | TALK_PROTOCOL_VERSION_WITHOUT_ROUTE_ROLE
+            | TALK_PROTOCOL_VERSION_WITHOUT_BOUNDED_OUTPUT_STREAM
+            | TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_PCM
+            | TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_PCM_24K
+            | TALK_PROTOCOL_VERSION_WITHOUT_REALTIME_INPUT_GATE
     ) {
         return Err(
             "This Talk client is from an older version of the app; reload the page to continue"
@@ -3056,6 +3158,10 @@ mod tests {
                 5,
                 TalkServerFrameKind::OutputAudio {
                     audio_sequence: 1,
+                    response_id: "response-one".into(),
+                    chunk_index: 0,
+                    chunk_count: 1,
+                    route_generation: Some(7),
                     media_type: "audio/mpeg".into(),
                     audio_base64: audio,
                 },
@@ -3293,4 +3399,50 @@ mod tests {
         expanded.max_artifact_bytes = 2_048;
         assert!(!expanded.is_subset_of(&parent));
     }
+
+    #[test]
+    fn routed_talk_requires_an_explicit_role() {
+        let request = TalkTicketRequest {
+            protocol_version: TALK_PROTOCOL_VERSION,
+            session_id: "session-one".into(),
+            route_id: Some("route-one".into()),
+            route_generation: Some(1),
+            route_role: None,
+        };
+        assert!(request.validate().is_err());
+        let request = TalkTicketRequest { route_role: Some("output".into()), ..request };
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn playback_ack_is_a_valid_ordered_client_frame() {
+        // The ack is what paces remote playback, so it has to survive the same
+        // envelope the runner applies to every other client frame -- and it has
+        // to name a real chunk, because an ack that numbers nothing cannot
+        // release the next one.
+        let frame = client_talk_frame(
+            2,
+            TalkClientFrameKind::PlaybackAck { audio_sequence: 3, played: true },
+        );
+        frame.validate().expect("a playback ack is an ordinary client frame");
+
+        let unnumbered = client_talk_frame(
+            3,
+            TalkClientFrameKind::PlaybackAck { audio_sequence: 0, played: true },
+        );
+        assert_eq!(
+            unnumbered.validate(),
+            Err("Talk audio sequence must be positive".to_string()),
+        );
+
+        // A failed playback is still a valid frame: the host needs to hear
+        // "this chunk did not play" to stop the stream rather than to hang.
+        client_talk_frame(
+            4,
+            TalkClientFrameKind::PlaybackAck { audio_sequence: 4, played: false },
+        )
+        .validate()
+        .expect("a negative playback ack must reach the host");
+    }
+
 }

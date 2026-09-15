@@ -82,7 +82,10 @@ fn safe_marketplace_path(raw: &str) -> Result<PathBuf, String> {
     }
     let normalized = raw.replace('\\', "/");
     if normalized.starts_with('/')
-        || normalized.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+        || normalized
+            .as_bytes()
+            .get(1)
+            .is_some_and(|byte| *byte == b':')
     {
         return Err(format!("Unsafe marketplace package path: {raw}"));
     }
@@ -166,9 +169,12 @@ fn collect_files(
     {
         *entries_seen = entries_seen.saturating_add(1);
         if *entries_seen > MAX_DIRECTORY_ENTRIES {
-            return Err("Marketplace staged package exceeds its bounded directory-entry count".to_string());
+            return Err(
+                "Marketplace staged package exceeds its bounded directory-entry count".to_string(),
+            );
         }
-        let entry = entry.map_err(|error| format!("Cannot inspect marketplace staged entry: {error}"))?;
+        let entry =
+            entry.map_err(|error| format!("Cannot inspect marketplace staged entry: {error}"))?;
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| format!("Cannot inspect marketplace staged entry: {error}"))?;
@@ -180,7 +186,9 @@ fn collect_files(
             continue;
         }
         if !metadata.is_file() {
-            return Err("Marketplace staged package contains an unsupported filesystem entry".to_string());
+            return Err(
+                "Marketplace staged package contains an unsupported filesystem entry".to_string(),
+            );
         }
         let relative = relative_ascii_path(root, &path)?;
         if relative == "extension.json" {
@@ -192,7 +200,9 @@ fn collect_files(
         let length = usize::try_from(metadata.len())
             .map_err(|_| "Marketplace staged file length exceeds platform range".to_string())?;
         if length > MAX_LMX_FILE_BYTES {
-            return Err(format!("Marketplace staged file exceeds its size limit: {relative}"));
+            return Err(format!(
+                "Marketplace staged file exceeds its size limit: {relative}"
+            ));
         }
         *total_bytes = total_bytes
             .checked_add(length)
@@ -209,7 +219,9 @@ fn collect_files(
             )
             .is_some()
         {
-            return Err(format!("Marketplace staged package contains duplicate path: {relative}"));
+            return Err(format!(
+                "Marketplace staged package contains duplicate path: {relative}"
+            ));
         }
     }
     Ok(())
@@ -246,19 +258,31 @@ pub fn validate_handle(handle: &str) -> Result<(), String> {
     if manifest_canonical.len() > MAX_LMX_MANIFEST_BYTES
         || sha256_hex(manifest_canonical.as_bytes()) != lease.manifest_sha256.to_ascii_lowercase()
     {
-        return Err("Marketplace staged manifest no longer matches the signed M4 identity".to_string());
+        return Err(
+            "Marketplace staged manifest no longer matches the signed M4 identity".to_string(),
+        );
     }
-    if manifest.get("extension_id").and_then(serde_json::Value::as_str) != Some(lease.extension_id.as_str())
-        || manifest.get("version").and_then(serde_json::Value::as_str) != Some(lease.version.as_str())
+    if manifest
+        .get("extension_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(lease.extension_id.as_str())
+        || manifest.get("version").and_then(serde_json::Value::as_str)
+            != Some(lease.version.as_str())
     {
-        return Err("Marketplace staged manifest identity/version changed after preparation".to_string());
+        return Err(
+            "Marketplace staged manifest identity/version changed after preparation".to_string(),
+        );
     }
     let registry_id = manifest
         .pointer("/provenance/source/curated_registry/registry_id")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "Marketplace staged manifest lost curated-registry provenance".to_string())?;
+        .ok_or_else(|| {
+            "Marketplace staged manifest lost curated-registry provenance".to_string()
+        })?;
     if registry_id != lease.registry_id {
-        return Err("Marketplace staged manifest registry provenance changed after preparation".to_string());
+        return Err(
+            "Marketplace staged manifest registry provenance changed after preparation".to_string(),
+        );
     }
 
     let mut files_base64 = BTreeMap::new();
@@ -283,7 +307,9 @@ pub fn validate_handle(handle: &str) -> Result<(), String> {
     if canonical.len() > MAX_LMX_DOWNLOAD_BYTES
         || sha256_hex(canonical.as_bytes()) != lease.package_sha256.to_ascii_lowercase()
     {
-        return Err("Marketplace staged bytes no longer reproduce the signed M4 package digest".to_string());
+        return Err(
+            "Marketplace staged bytes no longer reproduce the signed M4 package digest".to_string(),
+        );
     }
     Ok(())
 }
@@ -306,14 +332,20 @@ mod tests {
             "manifest": {"extension_id":"com.example.echo","version":"1.0.0"},
             "files_base64": {"component.wasm":"AQIE"},
         });
-        assert_ne!(sha256_hex(canonical_json(&byte_changed).unwrap().as_bytes()), base_digest);
+        assert_ne!(
+            sha256_hex(canonical_json(&byte_changed).unwrap().as_bytes()),
+            base_digest
+        );
 
         let path_changed = serde_json::json!({
             "schema_version": 1,
             "manifest": {"extension_id":"com.example.echo","version":"1.0.0"},
             "files_base64": {"renamed.wasm":"AQID"},
         });
-        assert_ne!(sha256_hex(canonical_json(&path_changed).unwrap().as_bytes()), base_digest);
+        assert_ne!(
+            sha256_hex(canonical_json(&path_changed).unwrap().as_bytes()),
+            base_digest
+        );
     }
 
     #[test]

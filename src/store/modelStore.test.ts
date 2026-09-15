@@ -532,10 +532,13 @@ describe("effortForTarget", () => {
 });
 
 describe("start", () => {
+  // Held as its own `string` (rather than read back off `mlxModel.path`, which
+  // is `string | null`) because `MlxChatStatus.modelPath` is not nullable.
+  const mlxPath = "/models/mlx-0123456789ab-Qwen3.8-27B-OptiQ-4bit";
   const mlxModel = makeModel({
     name: "Qwen3.8 27B OptiQ 4bit",
     file: "mlx-0123456789ab-Qwen3.8-27B-OptiQ-4bit",
-    path: "/models/mlx-0123456789ab-Qwen3.8-27B-OptiQ-4bit",
+    path: mlxPath,
     runtime: "mlx",
   });
 
@@ -559,6 +562,43 @@ describe("start", () => {
     // A vision-capable MLX model must offer attachments, the way a GGUF with a
     // projector does — that is what `isVisionCapableLocalModel` reads.
     expect(state.llamaVisionEnabled).toBe(true);
+  });
+
+  it("stops the previous MLX model before starting another one", async () => {
+    invokeMock.mockClear();
+    invokeMock.mockImplementation((command: string) =>
+      command === "mlx_chat_start"
+        ? Promise.resolve({ running: true, port: 51234, modelId: "x", modelPath: mlxModel.path, vision: false })
+        : Promise.resolve(undefined),
+    );
+    useModelStore.setState({
+      mlxChat: { running: true, port: 51234, modelId: "other", modelPath: "/models/other-mlx", vision: false },
+    });
+
+    await useModelStore.getState().start(mlxModel);
+
+    // One fixed MLX port: without the stop, this start fails with
+    // ModelAlreadyRunning.
+    const commands = invokeMock.mock.calls.map((call) => call[0] as string);
+    expect(commands).toContain("mlx_chat_stop");
+    expect(commands.indexOf("mlx_chat_stop")).toBeLessThan(commands.indexOf("mlx_chat_start"));
+    expect(useModelStore.getState().llamaStatus).toBe("ready");
+  });
+
+  it("restarts the same MLX model without stopping it first", async () => {
+    invokeMock.mockClear();
+    invokeMock.mockImplementation((command: string) =>
+      command === "mlx_chat_start"
+        ? Promise.resolve({ running: true, port: 51234, modelId: "x", modelPath: mlxModel.path, vision: false })
+        : Promise.resolve(undefined),
+    );
+    useModelStore.setState({
+      mlxChat: { running: true, port: 51234, modelId: "x", modelPath: mlxPath, vision: false },
+    });
+
+    await useModelStore.getState().start(mlxModel);
+
+    expect(invokeMock).not.toHaveBeenCalledWith("mlx_chat_stop");
   });
 
   it("reports a failed MLX start instead of leaving the UI on \"starting\"", async () => {

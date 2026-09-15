@@ -38,9 +38,11 @@ fn target_dir() -> PathBuf {
 }
 
 fn cli() -> PathBuf {
-    target_dir()
-        .join("debug")
-        .join(if cfg!(windows) { "monkey-cli.exe" } else { "monkey-cli" })
+    target_dir().join("debug").join(if cfg!(windows) {
+        "monkey-cli.exe"
+    } else {
+        "monkey-cli"
+    })
 }
 
 fn output_text(output: &Output) -> String {
@@ -90,7 +92,10 @@ fn run_cli_with_stdin(
         .len()
         == 0
     {
-        return Err(format!("{} is the zero-byte Tauri bootstrap placeholder", binary.display()));
+        return Err(format!(
+            "{} is the zero-byte Tauri bootstrap placeholder",
+            binary.display()
+        ));
     }
     let mut command = Command::new(binary);
     command
@@ -259,7 +264,9 @@ impl ModelFixture {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
-    stream.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .ok()?;
     let mut received = Vec::new();
     let mut scratch = [0u8; 8192];
     let mut header_end = None;
@@ -311,7 +318,9 @@ fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn json_response(body: &str) -> String {
@@ -511,7 +520,9 @@ async fn line_webhook_state(
         .await
         .map_err(|error| format!("LINE webhook endpoint JSON: {error}"))?;
     if !status.is_success() {
-        return Err(format!("LINE rejected webhook endpoint GET ({status}): {payload}"));
+        return Err(format!(
+            "LINE rejected webhook endpoint GET ({status}): {payload}"
+        ));
     }
     Ok(WebhookState {
         endpoint: payload
@@ -543,7 +554,9 @@ async fn set_line_webhook(
     } else {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        Err(format!("LINE rejected webhook endpoint PUT ({status}): {body}"))
+        Err(format!(
+            "LINE rejected webhook endpoint PUT ({status}): {body}"
+        ))
     }
 }
 
@@ -560,12 +573,11 @@ async fn test_line_webhook(
         .await
         .map_err(|error| format!("ask LINE to test webhook endpoint: {error}"))?;
     let status = response.status();
-    let payload: serde_json::Value = response
-        .json()
-        .await
-        .unwrap_or(serde_json::Value::Null);
+    let payload: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
     if !status.is_success() {
-        return Err(format!("LINE webhook test API failed ({status}): {payload}"));
+        return Err(format!(
+            "LINE webhook test API failed ({status}): {payload}"
+        ));
     }
     let success = payload
         .get("success")
@@ -574,7 +586,9 @@ async fn test_line_webhook(
     if success {
         Ok(())
     } else {
-        Err(format!("LINE could not reach the installed daemon callback: {payload}"))
+        Err(format!(
+            "LINE could not reach the installed daemon callback: {payload}"
+        ))
     }
 }
 
@@ -864,7 +878,8 @@ async fn run_case(config: &LiveConfig) -> Result<(), String> {
     if config.mutate_webhook {
         if let Some(previous) = previous_webhook.as_ref() {
             if !previous.endpoint.is_empty() {
-                let _ = set_line_webhook(&client, &config.channel_access_token, &previous.endpoint).await;
+                let _ = set_line_webhook(&client, &config.channel_access_token, &previous.endpoint)
+                    .await;
             }
         }
     }

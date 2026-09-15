@@ -912,6 +912,7 @@ mod tests {
             ChannelKind::Slack,
             ChannelKind::Discord,
             ChannelKind::Mattermost,
+            ChannelKind::Email,
         ] {
             assert!(super::super::adapters::sends_attachments(kind), "{kind:?}");
         }
@@ -924,6 +925,11 @@ mod tests {
             ChannelKind::Line,
             ChannelKind::GoogleChat,
             ChannelKind::Irc,
+            // A Home Assistant notify service has no upload at all, and the
+            // served chat page uploads and downloads nothing in either
+            // direction.
+            ChannelKind::HomeAssistant,
+            ChannelKind::WebChat,
         ] {
             assert!(!super::super::adapters::sends_attachments(kind), "{kind:?}");
         }

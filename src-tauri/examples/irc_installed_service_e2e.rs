@@ -550,6 +550,9 @@ fn real_external_irc_round_trip(
     tcp.set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|error| format!("set IRC write timeout: {error}"))?;
 
+    // Both `ring` and `aws-lc-rs` are compiled in, so rustls will not pick
+    // one and `ClientConfig::builder()` would panic without this.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
@@ -703,9 +706,14 @@ fn assert_durable_events(profile: &str, account_id: &str) -> Result<(), String> 
             accepted_inbound.len()
         ));
     }
-    if outbound != 1 {
+    // Two outbound rows, not one: the daemon greets a person's first message
+    // with a one-time notice naming the model, and every harness runs a fresh
+    // profile, so its sender is always a first contact. The count stays exact
+    // on purpose — a third row would be a reply sent twice, which is the bug
+    // this assertion exists to catch.
+    if outbound != 2 {
         return Err(format!(
-            "expected exactly one durable outbound event, got {outbound}: {payload}"
+            "expected exactly two durable outbound events (the first-contact notice and the reply), got {outbound}: {payload}"
         ));
     }
     Ok(())

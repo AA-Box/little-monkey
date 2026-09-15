@@ -1033,8 +1033,25 @@ const MAX_NATIVE_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const NATIVE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(not(target_os = "windows"))]
 const NATIVE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
+/// What the real UIA provider is allowed to take on a hosted CI runner.
+///
+/// A hosted Windows runner is not somebody's desktop: the provider is a cold
+/// `powershell.exe` loading the UIAutomation assemblies and enumerating a WPF
+/// fixture on a shared vCPU, and 45 s is a guess about a machine nobody else
+/// is using. Every acceptance leg that drives the real provider on such a
+/// runner gets this bound; the product keeps the short one, because a
+/// three-minute wait is not something an operator should ever be asked for.
 #[cfg(target_os = "windows")]
-const FULL_PRODUCT_E2E_PROVIDER_TIMEOUT: Duration = Duration::from_secs(180);
+const HOSTED_E2E_PROVIDER_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// The acceptance legs that run the real provider on a hosted runner. Both set
+/// their own variable, and both drive the same `powershell.exe`; keying the
+/// long bound to one of their names left the other timing out at 45 s.
+#[cfg(target_os = "windows")]
+const HOSTED_E2E_VARIABLES: [&str; 2] = [
+    "COMPUTER_USE_FULL_PRODUCT_E2E",
+    "COMPUTER_USE_REMOTE_WINDOWS_E2E",
+];
 const MAX_TARGETS: usize = 64;
 const MAX_ELEMENTS: usize = 256;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -1173,8 +1190,11 @@ fn run_native_command_with_env(
         let _ = stdout_sender.send(result);
     });
     #[cfg(target_os = "windows")]
-    let provider_timeout = if std::env::var("COMPUTER_USE_FULL_PRODUCT_E2E").as_deref() == Ok("1") {
-        FULL_PRODUCT_E2E_PROVIDER_TIMEOUT
+    let provider_timeout = if HOSTED_E2E_VARIABLES
+        .iter()
+        .any(|name| std::env::var(name).as_deref() == Ok("1"))
+    {
+        HOSTED_E2E_PROVIDER_TIMEOUT
     } else {
         NATIVE_PROVIDER_TIMEOUT
     };
@@ -1250,7 +1270,8 @@ fn read_clipboard_native() -> Result<String, String> {
 fn native_snapshot() -> Result<NativeSnapshot, String> {
     #[cfg(target_os = "macos")]
     {
-        let bytes = run_native_command("osascript", &["-l", "JavaScript", "-e", MACOS_AX_SCRIPT])?;
+        let script = macos_script(MACOS_AX_SCRIPT);
+        let bytes = run_native_command("osascript", &["-l", "JavaScript", "-e", &script])?;
         return serde_json::from_slice(&bytes)
             .map_err(|error| format!("macOS Accessibility returned invalid data: {error}"));
     }
@@ -1897,6 +1918,27 @@ public static class LMWindow { [DllImport("user32.dll")] public static extern bo
     }
 }
 
+/// Window identity must not follow z-order: `AXWindows` is ordered front to back,
+/// so an index taken straight from it renames every window whenever one is raised
+/// and a window-scoped grant would silently follow whichever window came forward.
+/// Both the snapshot and the action script rank windows through this helper, so
+/// the id a grant holds keeps addressing the window it was granted for.
+#[cfg(target_os = "macos")]
+const MACOS_WINDOW_RANK: &str = r#"
+function lmRankedWindows(p) {
+  const pick = (f, d) => { try { const v = f(); return v === undefined ? d : v; } catch (_) { return d; } };
+  const box = w => { const o = pick(() => w.position(), [0,0]); const s = pick(() => w.size(), [0,0]); return {x:Number(o[0])||0,y:Number(o[1])||0,width:Number(s[0])||0,height:Number(s[1])||0}; };
+  return pick(() => p.windows(), []).slice(0, 32)
+    .map((w, zi) => ({w, zi, title: String(pick(() => w.name(), '')), bounds: box(w)}))
+    .sort((a, b) => (a.title < b.title ? -1 : a.title > b.title ? 1 : (a.bounds.x - b.bounds.x) || (a.bounds.y - b.bounds.y) || (a.zi - b.zi)));
+}
+"#;
+
+#[cfg(target_os = "macos")]
+fn macos_script(body: &str) -> String {
+    format!("{MACOS_WINDOW_RANK}{body}")
+}
+
 #[cfg(target_os = "macos")]
 const MACOS_AX_SCRIPT: &str = r#"
 ObjC.import('AppKit');
@@ -1926,9 +1968,9 @@ for (const p of processList) {
     const name = String(safe(() => p.name(), '')); const bundle = String(safe(() => p.bundleIdentifier(), '')); const app = bundle === 'null' || bundle === 'undefined' || !bundle ? name : bundle;
     const workspaceFrontPid = Number(safe(() => $.NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier, 0));
     const front = onlyPid ? workspaceFrontPid === onlyPid : Boolean(safe(() => p.frontmost(), false)); let wi = 0;
-    for (const w of safe(() => p.windows(), [])) {
-      if (wi >= 32) break;
-      const title = String(safe(() => w.name(), '')); const id = app + '::window-' + wi; const target = {targetId:id,applicationId:app,applicationName:name,windowId:id,windowTitle:title,bounds:rect(w),focused:front && wi===0,sensitive:false,supportedActions:['inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot']}; targets.push(target);
+    for (const entry of lmRankedWindows(p)) {
+      const w = entry.w;
+      const title = entry.title; const id = app + '::window-' + wi; const target = {targetId:id,applicationId:app,applicationName:name,windowId:id,windowTitle:title,bounds:entry.bounds,focused:front && entry.zi===0,sensitive:false,supportedActions:['inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot']}; targets.push(target);
       const out=[]; let ei=0;
       for (const e of safe(() => w.entireContents(), [])) { if (ei++ >= 256) break; const role=String(safe(() => e.role(),'')); const subrole=String(safe(() => e.attribute('AXSubrole'),'')); const label=text(() => e.attribute('AXTitle'), () => e.description(), () => e.name()); const value=safe(() => e.value(), null); const native=String(safe(() => e.attribute('AXIdentifier'), '')); const stable=native.replace(/[^A-Za-z0-9._-]/g,'_'); const eb=rect(e); out.push({id:id+'::element-'+(ei-1)+'::native-'+stable,role,label,value:value===null?null:String(value),bounds:eb,enabled:Boolean(safe(() => e.enabled(),true)),focused:Boolean(safe(() => e.focused(),false)),actions:['click','double_click','set_value','select'],sensitive:/AXSecureTextField|securetextfield|password|secure|auth|credential/i.test(role+' '+subrole+' '+label)}); }
       elements[id]=out; wi++;
@@ -2202,7 +2244,9 @@ const stable = get('LM_ELEMENT_STABLE');
 const action = get('LM_ACTION');
 const value = get('LM_VALUE');
 const process = /^(com|org|net|io)\./.test(appId) ? se.processes.byBundleIdentifier(appId) : se.processes.byName(appId);
-const window = process.windows[windowIndex];
+const ranked = lmRankedWindows(process)[windowIndex];
+if (!ranked) throw new Error('macOS Accessibility window is stale');
+const window = ranked.w;
 const contents = window.entireContents();
 let element = null;
 if (stable) {
@@ -2471,9 +2515,10 @@ fn native_semantic_action(
     #[cfg(target_os = "macos")]
     {
         let window_index = window_index(&target.window_id)?;
+        let script = macos_script(MACOS_AX_ACTION_SCRIPT);
         let bytes = run_native_command_with_env(
             "osascript",
-            &["-l", "JavaScript", "-e", MACOS_AX_ACTION_SCRIPT],
+            &["-l", "JavaScript", "-e", &script],
             &[
                 ("LM_APP_ID", target.application_id.clone()),
                 ("LM_WINDOW_INDEX", window_index.to_string()),
@@ -4526,6 +4571,7 @@ pub async fn desktop_control_request_action(
     action: ControlAction,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     ensure_main_window(&window)?;
     request_action_impl(
@@ -4537,10 +4583,52 @@ pub async fn desktop_control_request_action(
         action,
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
 
+/// Notes that a control action delivered (or may have delivered) input to
+/// another application during this turn.
+///
+/// The `AppState` is fetched from the handle rather than taken as a parameter
+/// because `DesktopControlState` is its own Tauri-managed state and none of the
+/// `computer_*` commands hold both; every one of them already has the handle.
+fn record_desktop_control_effect(
+    app: &tauri::AppHandle,
+    checkpoint_id: Option<&str>,
+) -> Result<(), String> {
+    crate::checkpoints::record_external_effect(
+        app.state::<crate::AppState>().inner(),
+        checkpoint_id,
+        crate::checkpoints::ExternalEffectKind::DesktopControl,
+    )
+}
+
+/// The success half of [`record_desktop_control_effect`] — the action returned
+/// an outcome, so it was watched to completion rather than merely believed to
+/// have happened.
+fn commit_desktop_control_effect(
+    app: &tauri::AppHandle,
+    checkpoint_id: Option<&str>,
+) -> Result<(), String> {
+    crate::checkpoints::commit_external_effect(
+        app.state::<crate::AppState>().inner(),
+        checkpoint_id,
+        crate::checkpoints::ExternalEffectKind::DesktopControl,
+    )
+}
+
+/// `checkpoint_id` is the turn's open checkpoint, and the only reason this
+/// function takes it: an action that actually reaches another application is an
+/// external effect a file restore cannot undo, so it is recorded on the two
+/// arms below that executed one (see [`crate::checkpoints::ExternalEffectKind::DesktopControl`]).
+/// Threaded like `turn_id`/`tool_call_id` rather than special-cased per action:
+/// which tools get a checkpoint id at all is decided in the frontend
+/// (`turnEngine.ts`'s `RESERVED_ARGS`, keyed off `classifyExternalTool`), and it
+/// deliberately supplies none for `computer_wait` — sleeping delivers no input,
+/// so there is nothing for a revert to reconcile. `None` records nothing.
+#[allow(clippy::too_many_arguments)]
 async fn request_action_impl(
     app: &tauri::AppHandle,
     state: &DesktopControlState,
@@ -4550,6 +4638,7 @@ async fn request_action_impl(
     action: ControlAction,
     run_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     let context = AuditContext {
         run_id,
@@ -4584,6 +4673,12 @@ async fn request_action_impl(
     };
     match gate {
         ActionGate::Executed(result) => {
+            // Declared here rather than before the gate, because the gate is
+            // also what refuses: a refused or denied action records nothing.
+            // Declared before the result is unwrapped, because an action that
+            // failed part-way may still have delivered its input — the same
+            // pessimism `tool_web_fetch` applies to a failed request.
+            record_desktop_control_effect(app, checkpoint_id.as_deref())?;
             let result = result.map_err(|error| {
                 if error.trim_start().starts_with('{') {
                     error
@@ -4595,6 +4690,7 @@ async fn request_action_impl(
                     )
                 }
             })?;
+            commit_desktop_control_effect(app, checkpoint_id.as_deref())?;
             Ok(ActionOutcome {
                 action_id: format!("batch-{}", Uuid::new_v4()),
                 executed: true,
@@ -4626,12 +4722,17 @@ async fn request_action_impl(
             );
             match tokio::time::timeout(ACTION_APPROVAL_TIMEOUT, receiver).await {
                 Ok(Ok(true)) => {
+                    // The operator approved, so from here the input is about to
+                    // be delivered — declared before that happens, for the
+                    // Executed arm's reason.
+                    record_desktop_control_effect(app, checkpoint_id.as_deref())?;
                     let result =
                         state
                             .take_approved_pending(&action_id, &action)
                             .map_err(|error| {
                                 wire_control_error(error, ComputerUseFailurePhase::Authorize)
                             })?;
+                    commit_desktop_control_effect(app, checkpoint_id.as_deref())?;
                     Ok(ActionOutcome {
                         action_id,
                         executed: true,
@@ -4805,6 +4906,7 @@ pub async fn tool_computer_focus(
     target_window_id: Option<String>,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     request_action_impl(
         &app,
@@ -4815,6 +4917,7 @@ pub async fn tool_computer_focus(
         ControlAction::Focus,
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -4833,6 +4936,7 @@ pub async fn tool_computer_click(
     expected_value: Option<String>,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     let button = button.unwrap_or(MouseButtonKind::Left);
     let action = if let Some(element_id) = element_id {
@@ -4867,6 +4971,7 @@ pub async fn tool_computer_click(
         action,
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -4885,6 +4990,7 @@ pub async fn tool_computer_double_click(
     expected_value: Option<String>,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     let button = button.unwrap_or(MouseButtonKind::Left);
     let action = if let Some(element_id) = element_id {
@@ -4919,6 +5025,7 @@ pub async fn tool_computer_double_click(
         action,
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -4934,6 +5041,7 @@ pub async fn tool_computer_scroll(
     delta_y: i32,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     request_action_impl(
         &app,
@@ -4944,6 +5052,7 @@ pub async fn tool_computer_scroll(
         ControlAction::Scroll { delta_x, delta_y },
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -4958,6 +5067,7 @@ pub async fn tool_computer_type(
     text: String,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     request_action_impl(
         &app,
@@ -4968,6 +5078,7 @@ pub async fn tool_computer_type(
         ControlAction::TypeText { text },
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -4982,6 +5093,7 @@ pub async fn tool_computer_key(
     key: String,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     request_action_impl(
         &app,
@@ -4992,6 +5104,7 @@ pub async fn tool_computer_key(
         ControlAction::KeyPress { key },
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -5006,6 +5119,7 @@ pub async fn tool_computer_hotkey(
     keys: Vec<String>,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     request_action_impl(
         &app,
@@ -5016,6 +5130,7 @@ pub async fn tool_computer_hotkey(
         ControlAction::Hotkey { keys },
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -5030,6 +5145,7 @@ pub async fn tool_computer_wait(
     milliseconds: u64,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     request_action_impl(
         &app,
@@ -5040,6 +5156,7 @@ pub async fn tool_computer_wait(
         ControlAction::Wait { milliseconds },
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -5055,6 +5172,7 @@ pub async fn tool_computer_select(
     value: String,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     request_action_impl(
         &app,
@@ -5065,6 +5183,7 @@ pub async fn tool_computer_select(
         ControlAction::Select { element_id, value },
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -5080,6 +5199,7 @@ pub async fn tool_computer_set_value(
     value: String,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     request_action_impl(
         &app,
@@ -5090,6 +5210,7 @@ pub async fn tool_computer_set_value(
         ControlAction::SetValue { element_id, value },
         turn_id,
         tool_call_id,
+        checkpoint_id,
     )
     .await
 }
@@ -6049,5 +6170,78 @@ mod tests {
         assert!(WAYLAND_PORTAL_MESSAGE.contains("Wayland clipboard"));
         assert!(WAYLAND_PORTAL_MESSAGE.contains("xdg-desktop-portal"));
         assert!(WAYLAND_PORTAL_MESSAGE.contains("will not fall back"));
+    }
+
+    /// Runs the real macOS provider script against a stubbed System Events so
+    /// the window identity it mints can be checked without a desktop session.
+    #[cfg(target_os = "macos")]
+    fn stubbed_macos_snapshot(windows: &str) -> NativeSnapshot {
+        // Only the System Events handle is stubbed; everything the snapshot is
+        // built from below is the shipped script.
+        const STUB: &str = r#"
+function __systemEvents() {
+  const win = (title, x, y) => ({ name: () => title, position: () => [x, y], size: () => [320, 200], entireContents: () => [] });
+  const windows = __WINDOWS__;
+  return { processes: () => [{ unixId: () => 4242, visible: () => true, name: () => 'Fixture', bundleIdentifier: () => 'com.example.fixture', frontmost: () => true, windows: () => windows }] };
+}
+"#;
+        let provider = macos_script(MACOS_AX_SCRIPT);
+        let stubbed = provider.replace("Application('System Events')", "__systemEvents()");
+        assert_ne!(stubbed, provider, "System Events handle was not stubbed");
+        let script = format!("{}{stubbed}", STUB.replace("__WINDOWS__", windows));
+        let output = Command::new("osascript")
+            .args(["-l", "JavaScript", "-e", &script])
+            .env_remove("COMPUTER_USE_FIXTURE_PID")
+            .env_remove("COMPUTER_USE_FIXTURE_APP_NAME")
+            .output()
+            .expect("osascript is available on macOS");
+        assert!(
+            output.status.success(),
+            "provider script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("provider returned a snapshot")
+    }
+
+    /// A raised window must not inherit another window's id: AXWindows is
+    /// z-ordered, so an index-derived id would repoint a window-scoped grant at
+    /// whichever window came forward.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_window_identity_survives_a_raise() {
+        let secondary_front =
+            stubbed_macos_snapshot("[win('Secondary', 700, 400), win('Primary', 0, 0)]");
+        let primary_front =
+            stubbed_macos_snapshot("[win('Primary', 0, 0), win('Secondary', 700, 400)]");
+        let id = |snapshot: &NativeSnapshot, title: &str| {
+            snapshot
+                .targets
+                .iter()
+                .find(|target| target.window_title == title)
+                .map(|target| target.window_id.clone())
+                .unwrap_or_else(|| panic!("{title} window was not reported"))
+        };
+        assert_eq!(
+            id(&secondary_front, "Primary"),
+            id(&primary_front, "Primary")
+        );
+        assert_eq!(
+            id(&secondary_front, "Secondary"),
+            id(&primary_front, "Secondary")
+        );
+        assert_ne!(
+            id(&primary_front, "Primary"),
+            id(&primary_front, "Secondary")
+        );
+        let focused = |snapshot: &NativeSnapshot, title: &str| {
+            snapshot
+                .targets
+                .iter()
+                .find(|target| target.window_title == title)
+                .is_some_and(|target| target.focused)
+        };
+        assert!(focused(&secondary_front, "Secondary"));
+        assert!(!focused(&secondary_front, "Primary"));
+        assert!(focused(&primary_front, "Primary"));
     }
 }

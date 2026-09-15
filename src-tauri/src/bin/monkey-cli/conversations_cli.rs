@@ -11,6 +11,11 @@
 //! Unlike `monkey ingress`, this IS a transcript surface: `show` returns the
 //! message text this machine durably recorded, because the point is to read a
 //! conversation that happened somewhere else.
+//!
+//! `delete` erases a conversation *here* — its messages, replies, turns and
+//! finished jobs — and is refused while any of that is still moving. The
+//! provider keeps its own copy. `--forget` only drops it from the list, which
+//! is cheaper, always succeeds, and lasts until the next message in it.
 
 use crate::daemon::remote::store::RemoteStore;
 use crate::daemon::store::{DaemonPaths, DaemonStore};
@@ -41,6 +46,21 @@ pub enum ConversationsCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Erase one conversation from this machine. Refused while a turn or a
+    /// reply for it is still in flight.
+    Delete {
+        #[arg(long)]
+        environment: String,
+        /// The id `list` gave this conversation.
+        #[arg(long)]
+        id: String,
+        /// Only drop it from the list, keeping the record. It comes back with
+        /// its next message.
+        #[arg(long)]
+        forget: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// A paired phone's chat with this installation. `local` — the desktop's own
@@ -64,6 +84,12 @@ pub fn dispatch(command: &ConversationsCmd) -> Result<(), String> {
             limit,
             json,
         } => show(environment, id, *limit, *json),
+        ConversationsCmd::Delete {
+            environment,
+            id,
+            forget,
+            json,
+        } => delete(environment, id, *forget, *json),
     }
 }
 
@@ -228,5 +254,86 @@ fn show(environment: &str, id: &str, limit: u32, json: bool) -> Result<(), Strin
             message["text"].as_str().unwrap_or(""),
         );
     }
+    Ok(())
+}
+
+fn delete(environment: &str, id: &str, forget: bool, json: bool) -> Result<(), String> {
+    use crate::daemon::channel_store::PurgeOutcome;
+
+    let paths = DaemonPaths::resolve()?;
+    let outcome = if environment == REMOTE_CONTROL {
+        // A phone session is only its messages, so forgetting and erasing
+        // are the same act.
+        match RemoteStore::open(&paths.root)?.delete_mobile_session(id)? {
+            0 => PurgeOutcome::NotFound,
+            messages => PurgeOutcome::Purged {
+                events: messages,
+                sends: 0,
+                turns: 0,
+                jobs: 0,
+            },
+        }
+    } else if environment == "channel" || environment.starts_with(CHANNEL_PREFIX) {
+        let mut store = DaemonStore::open(&paths)?;
+        if forget {
+            if store.delete_channel_conversation(id)? {
+                PurgeOutcome::Purged {
+                    events: 0,
+                    sends: 0,
+                    turns: 0,
+                    jobs: 0,
+                }
+            } else {
+                PurgeOutcome::NotFound
+            }
+        } else {
+            store.purge_channel_conversation(id)?
+        }
+    } else {
+        return Err(format!(
+            "Unknown environment '{environment}' (expected {REMOTE_CONTROL} or channel:<provider>)"
+        ));
+    };
+    // A refusal is the one outcome that is an error to the caller: the
+    // desktop shows its text, and the exit code says nothing was deleted.
+    if let PurgeOutcome::Refused(reason) = &outcome {
+        return Err(reason.clone());
+    }
+    if json {
+        let (removed, counts) = match &outcome {
+            PurgeOutcome::Purged {
+                events,
+                sends,
+                turns,
+                jobs,
+            } => (
+                true,
+                serde_json::json!({ "events": events, "sends": sends, "turns": turns, "jobs": jobs }),
+            ),
+            _ => (false, serde_json::Value::Null),
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "environment": environment,
+                "id": id,
+                "removed": removed,
+                "forgot_only": forget,
+                "erased": counts,
+            })
+        );
+        return Ok(());
+    }
+    // Already gone is the same outcome, not a failure: the sidebar may ask twice.
+    println!(
+        "{}",
+        match outcome {
+            PurgeOutcome::NotFound => "No such conversation here.",
+            PurgeOutcome::Purged { .. } if forget =>
+                "Forgot the conversation here. It starts again with its next message.",
+            PurgeOutcome::Purged { .. } => "Deleted the conversation from this machine.",
+            PurgeOutcome::Refused(_) => unreachable!("refusals return above"),
+        }
+    );
     Ok(())
 }
