@@ -2,6 +2,7 @@
   "name": "little-monkey",
   "private": true,
   "version": "1.7.1",
+  "packageManager": "pnpm@11.5.2",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -94,11 +95,5 @@
     "typescript": "~5.8.3",
     "vite": "^7.0.4",
     "vitest": "^4.1.11"
-  },
-  "pnpm": {
-    "overrides": {
-      "@xmldom/xmldom": "^0.9.12",
-      "browserslist": "^4.28.9"
-    }
   }
 }
