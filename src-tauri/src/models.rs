@@ -1546,7 +1546,9 @@ pub fn models_add_external_folder(app: AppHandle, path: String) -> Result<Vec<Mo
 ///
 /// `None` whenever anything at all could run — including when there is no MLX
 /// install to ask, since a model registered now is meant to work after the
-/// runtime is installed or updated.
+/// runtime is installed or updated, and on every platform that has no MLX
+/// runtime at all: `mlx_runtime` is compiled only on macOS.
+#[cfg(target_os = "macos")]
 fn unsupported_mlx_architectures(app: &AppHandle, shapes: &[LocalModelShape]) -> Option<String> {
     let app_data = app.profile_data_dir().ok()?;
     let version_directory =
@@ -1566,6 +1568,11 @@ fn unsupported_mlx_architectures(app: &AppHandle, shapes: &[LocalModelShape]) ->
         }
     }
     (!unsupported.is_empty()).then(|| unsupported.into_iter().collect::<Vec<_>>().join(", "))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unsupported_mlx_architectures(_app: &AppHandle, _shapes: &[LocalModelShape]) -> Option<String> {
+    None
 }
 
 /// Forgets a previously-registered external model reference by id. Never
