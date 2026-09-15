@@ -86,6 +86,13 @@ pub enum MlxError {
     },
     NotInstalled,
     NotRunning,
+    /// The installed runtime ships no loader for this model's architecture.
+    /// Caught before the service is spawned, because the Python side reports it
+    /// as a traceback on a process that exits during load.
+    UnsupportedArchitecture {
+        architecture: String,
+        package_version: String,
+    },
     ModelNotFound(String),
     ModelAlreadyRunning(String),
     RequestAlreadyRunning(String),
@@ -133,6 +140,15 @@ impl fmt::Display for MlxError {
             }
             Self::NotInstalled => write!(f, "the verified MLX runtime is not installed"),
             Self::NotRunning => write!(f, "the managed MLX service is not running"),
+            Self::UnsupportedArchitecture {
+                architecture,
+                package_version,
+            } => write!(
+                f,
+                "this model's architecture ({architecture}) has no loader in the installed MLX \
+                 runtime ({package_version}) — update the MLX runtime from Runtime Hub, or pick a \
+                 model the installed one supports"
+            ),
             Self::ModelNotFound(model) => write!(f, "MLX model {model:?} is not registered"),
             Self::ModelAlreadyRunning(model) => {
                 write!(f, "MLX is already serving model {model:?}")
@@ -1222,6 +1238,14 @@ impl MlxRuntimeAdapter {
             .models
             .get(model_id)
             .ok_or_else(|| MlxError::ModelNotFound(model_id.to_string()))?;
+        if let Some(architecture) =
+            unsupported_architecture(&install.version_directory, &model.local_path)
+        {
+            return Err(MlxError::UnsupportedArchitecture {
+                architecture,
+                package_version: install.package_version,
+            });
+        }
         let existing = {
             let state = lock(&self.state)?;
             state.running.clone()
@@ -1757,6 +1781,84 @@ fn validate_generation_request(
     Ok(())
 }
 
+/// The architecture `model_directory` declares, when its `config.json` names
+/// one the installed runtime cannot load.
+///
+/// `None` means "nothing to object to": either the model loads here, or its
+/// config and the install's layout could not be read, and a guess must never
+/// block a start that would have worked. The evidence is the install's own
+/// `mlx_lm`/`mlx_vlm` model modules — the same files `_get_classes` imports by
+/// `model_type` — rather than a list in this repository, which would go stale
+/// against every runtime package the hub publishes.
+pub fn unsupported_architecture(
+    version_directory: &Path,
+    model_directory: &Path,
+) -> Option<String> {
+    let architecture = model_architecture(model_directory)?;
+    let supported = installed_architectures(version_directory)?;
+    (!supported.contains(&architecture)).then_some(architecture)
+}
+
+/// The active install's version directory under an MLX runtime root, if one is
+/// published. Lets a caller outside this module (the model picker) reach the
+/// installed tree without building an installer and its verifier.
+pub fn active_version_directory(mlx_root: &Path) -> Option<PathBuf> {
+    let bytes = fs::read(mlx_root.join(ACTIVE_STATE_FILE)).ok()?;
+    let active: MlxActiveState = serde_json::from_slice(&bytes).ok()?;
+    if active.schema_version != MLX_ACTIVE_STATE_SCHEMA_VERSION || active.manifest_sha256.len() < 16
+    {
+        return None;
+    }
+    Some(mlx_root.join(VERSIONS_DIRECTORY).join(version_directory_name(
+        &active.package_version,
+        &active.manifest_sha256,
+    )))
+}
+
+fn model_architecture(model_directory: &Path) -> Option<String> {
+    let config = model_directory.join("config.json");
+    let metadata = fs::symlink_metadata(&config).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_TEXT_BYTES as u64 {
+        return None;
+    }
+    let parsed: Value = serde_json::from_slice(&fs::read(&config).ok()?).ok()?;
+    let architecture = parsed.get("model_type")?.as_str()?.trim();
+    (!architecture.is_empty()).then(|| architecture.to_string())
+}
+
+/// Every `model_type` the installed runtime has a module for. Deliberately
+/// permissive: helper modules in those directories (`base`, `cache`) join the
+/// set, which can only make this fail open.
+fn installed_architectures(version_directory: &Path) -> Option<BTreeSet<String>> {
+    let site_packages = fs::read_dir(version_directory.join("runtime").join("lib"))
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path().join("site-packages"))
+        .find(|path| path.is_dir())?;
+    let mut architectures = BTreeSet::new();
+    for package in ["mlx_lm", "mlx_vlm"] {
+        let Ok(entries) = fs::read_dir(site_packages.join(package).join("models")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // `mlx_lm` keeps one module per architecture; `mlx_vlm` keeps one
+            // package per architecture. Both are imported by bare name.
+            let name = match path.extension().and_then(|extension| extension.to_str()) {
+                Some("py") => path.file_stem(),
+                None if path.is_dir() => path.file_name(),
+                _ => continue,
+            };
+            if let Some(name) = name.and_then(|name| name.to_str()) {
+                if !name.starts_with('_') {
+                    architectures.insert(name.to_string());
+                }
+            }
+        }
+    }
+    (!architectures.is_empty()).then_some(architectures)
+}
+
 fn validate_launch_spec(spec: &MlxLaunchSpec) -> MlxResult<()> {
     validate_id(&spec.runtime_id, "launch.runtimeId")?;
     validate_id(&spec.model_id, "launch.modelId")?;
@@ -2118,6 +2220,41 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// The check that stands between a user picking a folder and a Python
+    /// traceback: the answer comes from the install's own model modules.
+    #[test]
+    fn an_architecture_the_install_has_no_module_for_is_named() {
+        let install = TestDirectory::new("arch-install");
+        let site = install
+            .0
+            .join("runtime/lib/python3.14/site-packages");
+        fs::create_dir_all(site.join("mlx_lm/models")).unwrap();
+        fs::create_dir_all(site.join("mlx_vlm/models/qwen2_vl")).unwrap();
+        for module in ["qwen3.py", "qwen3_moe.py", "__init__.py"] {
+            fs::write(site.join("mlx_lm/models").join(module), b"").unwrap();
+        }
+
+        let model = TestDirectory::new("arch-model");
+        let config = model.0.join("config.json");
+
+        fs::write(&config, br#"{"model_type":"qwen3_5"}"#).unwrap();
+        assert_eq!(
+            unsupported_architecture(&install.0, &model.0).as_deref(),
+            Some("qwen3_5")
+        );
+
+        // Present in either package, or unreadable on either side: no objection.
+        for supported in [&br#"{"model_type":"qwen3"}"#[..], &br#"{"model_type":"qwen2_vl"}"#[..]] {
+            fs::write(&config, supported).unwrap();
+            assert_eq!(unsupported_architecture(&install.0, &model.0), None);
+        }
+        fs::write(&config, b"not json").unwrap();
+        assert_eq!(unsupported_architecture(&install.0, &model.0), None);
+        fs::write(&config, br#"{"model_type":"qwen3_5"}"#).unwrap();
+        let empty = TestDirectory::new("arch-empty");
+        assert_eq!(unsupported_architecture(&empty.0, &model.0), None);
     }
 
     pub(crate) struct TestSignatureVerifier;
