@@ -3164,6 +3164,10 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
             if let Err(error) = remote::expire_device_work(&paths) {
                 eprintln!("monkey daemon: device expiry sweep paused: {error}");
             }
+            // And on the same tick, the daemon's own log: nothing else caps the
+            // file the supervisor redirects stderr into, so a long uptime is
+            // otherwise only bounded by the disk.
+            service::trim_service_logs(&paths);
         }
         if let Err(error) =
             workflow_trigger_sync.sync_if_changed(&paths.root, &mut engine.shared, now)
