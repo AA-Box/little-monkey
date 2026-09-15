@@ -38,7 +38,14 @@ export const FILE_TOOL_NAMES = new Set(['write_file', 'edit_file']);
 /** What kind of non-file side effect an external-effect tool has — shown in
  * the UI so "a shell command ran" and "a network call happened" read as
  * distinct, specific warnings rather than one generic caveat. */
-export type ExternalEffectKind = 'shell' | 'network' | 'memory' | 'mcp' | 'task-suggestion';
+export type ExternalEffectKind =
+  | 'shell'
+  | 'network'
+  | 'memory'
+  | 'mcp'
+  | 'task-suggestion'
+  | 'device'
+  | 'desktop-control';
 
 /** Plain (non-MCP) tool names with a real side effect outside the
  * checkpointed workspace, and the kind each one is:
@@ -50,13 +57,33 @@ export type ExternalEffectKind = 'shell' | 'network' | 'memory' | 'mcp' | 'task-
  *   state that lives outside the checkpointed workspace files.
  * - `spawn_task`: stages a follow-up chip. Nothing runs until the user clicks
  *   it, but the chip outlives the turn — a reverted turn that keeps proposing
- *   work is proposing it on the strength of something the user took back. */
+ *   work is proposing it on the strength of something the user took back.
+ * - `device_action`: a paired phone or tablet used its own hardware — a
+ *   photograph was taken, a notification was shown in a room somebody is in, a
+ *   location fix was read. It happened on a device this app does not own.
+ * - the actuating `computer_*` tools: a click, keystroke or scroll was
+ *   delivered to another application on this machine. Only the ones that
+ *   actually send input are listed — `computer_list_targets`,
+ *   `computer_inspect`, `computer_screenshot` and `computer_clipboard_read`
+ *   observe, and `computer_wait` does nothing at all, so none of the five is an
+ *   effect to reconcile. Mirrors which arms of `request_action_impl`
+ *   (`desktop_control.rs`) record `ExternalEffectKind::DesktopControl`. */
 const EXTERNAL_TOOL_KINDS: Record<string, ExternalEffectKind> = {
   run_shell: 'shell',
   web_fetch: 'network',
   web_search: 'network',
   remember: 'memory',
   spawn_task: 'task-suggestion',
+  device_action: 'device',
+  computer_focus: 'desktop-control',
+  computer_click: 'desktop-control',
+  computer_double_click: 'desktop-control',
+  computer_scroll: 'desktop-control',
+  computer_type: 'desktop-control',
+  computer_key: 'desktop-control',
+  computer_hotkey: 'desktop-control',
+  computer_select: 'desktop-control',
+  computer_set_value: 'desktop-control',
 };
 
 /** MCP tool calls (`mcp__<server>__<tool>`) are always external: an MCP

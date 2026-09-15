@@ -2478,6 +2478,123 @@ pub async fn remote_node_label(
 
 // --- Paired physical devices, for the desktop -----------------------------
 
+// --- Voice Everywhere routing, for desktop Talk --------------------------
+
+#[tauri::command]
+pub async fn voice_route_endpoints() -> Result<Value, String> {
+    parse_json(&command(vec!["voice".into(), "endpoints".into(), "--json".into()]).await?)
+}
+
+#[tauri::command]
+pub async fn voice_route_get(session_id: String) -> Result<Value, String> {
+    validate_id("session id", &session_id)?;
+    parse_json(&command(vec![
+        "voice".into(), "route".into(), "get".into(), session_id, "--json".into(),
+    ]).await?)
+}
+
+#[tauri::command]
+pub async fn voice_route_set(
+    session_id: String,
+    input: String,
+    output: String,
+    engine: String,
+) -> Result<Value, String> {
+    validate_id("session id", &session_id)?;
+    validate_token("voice input endpoint", &input, 512)?;
+    validate_token("voice output endpoint", &output, 512)?;
+    validate_token("voice engine", &engine, 32)?;
+    parse_json(&command(vec![
+        "voice".into(), "route".into(), "set".into(), session_id,
+        "--input".into(), input, "--output".into(), output,
+        "--engine".into(), engine, "--json".into(),
+    ]).await?)
+}
+
+#[tauri::command]
+pub async fn voice_route_move(
+    session_id: String,
+    input: Option<String>,
+    output: Option<String>,
+) -> Result<Value, String> {
+    validate_id("session id", &session_id)?;
+    if input.is_none() && output.is_none() {
+        return Err("A voice route move needs --input, --output, or both".to_string());
+    }
+    let mut args = vec!["voice".into(), "route".into(), "move".into(), session_id];
+    if let Some(input) = input {
+        validate_token("voice input endpoint", &input, 512)?;
+        args.extend(["--input".into(), input]);
+    }
+    if let Some(output) = output {
+        validate_token("voice output endpoint", &output, 512)?;
+        args.extend(["--output".into(), output]);
+    }
+    args.push("--json".into());
+    parse_json(&command(args).await?)
+}
+
+#[tauri::command]
+pub async fn voice_route_activate(session_id: String) -> Result<Value, String> {
+    validate_id("session id", &session_id)?;
+    parse_json(&command(vec![
+        "voice".into(), "route".into(), "activate".into(), session_id,
+    ]).await?)
+}
+
+#[tauri::command]
+pub async fn voice_route_deactivate(session_id: String) -> Result<Value, String> {
+    validate_id("session id", &session_id)?;
+    parse_json(&command(vec![
+        "voice".into(), "route".into(), "deactivate".into(), session_id,
+    ]).await?)
+}
+
+#[tauri::command]
+pub async fn voice_route_stop(session_id: String) -> Result<Value, String> {
+    validate_id("session id", &session_id)?;
+    parse_json(&command(vec![
+        "voice".into(), "route".into(), "stop".into(), session_id, "--json".into(),
+    ]).await?)
+}
+
+#[tauri::command]
+pub async fn voice_route_events(
+    session_id: String,
+    after: u64,
+    limit: u32,
+) -> Result<Value, String> {
+    validate_id("session id", &session_id)?;
+    if !(1..=512).contains(&limit) {
+        return Err("Voice route event limit must be 1..=512".to_string());
+    }
+    parse_json(&command(vec![
+        "voice".into(), "route".into(), "events".into(), session_id,
+        "--after".into(), after.to_string(), "--limit".into(), limit.to_string(), "--json".into(),
+    ]).await?)
+}
+
+#[tauri::command]
+pub async fn voice_route_emit(
+    session_id: String,
+    generation: u64,
+    kind: String,
+    payload: Value,
+) -> Result<Value, String> {
+    validate_id("session id", &session_id)?;
+    validate_token("voice route event kind", &kind, 64)?;
+    let payload_json = serde_json::to_string(&payload).map_err(|error| error.to_string())?;
+    if payload_json.len() > 64 * 1024 {
+        return Err("Voice route event payload exceeds 64 KiB".to_string());
+    }
+    parse_json(&command(vec![
+        "voice".into(), "route".into(), "emit".into(), session_id,
+        "--generation".into(), generation.to_string(), "--kind".into(), kind,
+        "--payload-json".into(), payload_json,
+    ]).await?)
+}
+
+
 #[tauri::command]
 pub async fn remote_device_list() -> Result<Value, String> {
     parse_json(
@@ -2575,6 +2692,7 @@ pub async fn tool_device_action(
     wait_ms: Option<u64>,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
+    checkpoint_id: Option<String>,
 ) -> Result<Value, String> {
     validate_token("device action", &action, 64)?;
     let detail = match &device_id {
@@ -2592,6 +2710,17 @@ pub async fn tool_device_action(
         None,
     )
     .await?;
+
+    // After the gate, so a refused action records nothing, and before the
+    // dispatch, because a command the daemon accepted and then stopped waiting
+    // for may still have reached the device — the same pessimistic ordering
+    // `tool_web_fetch` uses, and the reason the declaration is separate from
+    // the commit below.
+    crate::checkpoints::record_external_effect(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        crate::checkpoints::ExternalEffectKind::Device,
+    )?;
 
     let mut args = vec![
         "daemon".into(),
@@ -2641,7 +2770,15 @@ pub async fn tool_device_action(
             format!("{turn_id}:{tool_call_id}"),
         ]);
     }
-    parse_json(&command(args).await?)
+    let outcome = parse_json(&command(args).await?)?;
+    // Only here: the daemon answered, so this effect was watched to completion
+    // rather than merely believed to have happened.
+    crate::checkpoints::commit_external_effect(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        crate::checkpoints::ExternalEffectKind::Device,
+    )?;
+    Ok(outcome)
 }
 
 /// Fixed, pre-authorized device bridge for the Wasm permission broker. The
@@ -4104,9 +4241,8 @@ const MAX_CHANNEL_ID: usize = 256;
 /// as a flag by the CLI's own parser even though nothing here goes through a
 /// shell.
 fn channel_id(label: &str, value: &str) -> Result<String, String> {
-    let allowed = |ch: char| {
-        ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '@' | '+')
-    };
+    let allowed =
+        |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '@' | '+');
     if value.is_empty()
         || value.len() > MAX_CHANNEL_ID
         || value.contains("..")
@@ -4168,6 +4304,27 @@ pub async fn conversations_show(
         ])
         .await?,
     )
+}
+
+/// Erase one outside conversation from this machine. The CLI refuses — with
+/// a reason the sidebar shows — while a turn or a reply for it is in flight.
+#[tauri::command]
+pub async fn conversations_delete(environment: String, id: String) -> Result<(), String> {
+    validate_token("environment", &environment, 64)?;
+    let id = channel_id("conversation id", &id)?;
+    if environment.starts_with('-') {
+        return Err("Invalid environment".to_string());
+    }
+    command(vec![
+        "conversations".into(),
+        "delete".into(),
+        "--environment".into(),
+        environment,
+        "--id".into(),
+        id,
+    ])
+    .await
+    .map(|_| ())
 }
 
 #[tauri::command]
@@ -4258,7 +4415,8 @@ pub async fn channels_senders(account_id: String) -> Result<Value, String> {
     )
 }
 
-/// Approve or block a waiting sender.
+/// Approve or block a sender — a waiting one, or an approved one whose access
+/// the operator is taking back.
 ///
 /// Approval is the ability to send messages and nothing else — no tool, device
 /// or telephony authority follows from it.
@@ -4277,6 +4435,22 @@ pub async fn channels_decide_sender(
         } else {
             "block".into()
         },
+        account_id,
+        sender_id,
+    ])
+    .await
+    .map(|_| ())
+}
+
+/// Forget a sender: their approval or block, their model pick, and that they
+/// were greeted. Their next message meets the pairing challenge afresh.
+#[tauri::command]
+pub async fn channels_forget_sender(account_id: String, sender_id: String) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let sender_id = channel_id("sender id", &sender_id)?;
+    command(vec![
+        "channels".into(),
+        "forget".into(),
         account_id,
         sender_id,
     ])
@@ -4598,11 +4772,7 @@ pub async fn channels_exposure_set_tunnel(
 pub async fn channels_exposure_set_token(token: String) -> Result<(), String> {
     bounded_secret("tunnel credential", &token)?;
     command_with_stdin(
-        vec![
-            "channels".into(),
-            "exposure".into(),
-            "set-token".into(),
-        ],
+        vec!["channels".into(), "exposure".into(), "set-token".into()],
         token,
     )
     .await

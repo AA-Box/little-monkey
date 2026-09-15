@@ -48,7 +48,7 @@ import { useSessionStore } from "../store/sessionStore";
 import { providerModelTargetKey } from "./modelTargets";
 import { useUserHooksStore } from "../store/userHooksStore";
 import { usePermissionStore } from "../store/permissionStore";
-import { DurableRunRecorder } from "./durableRun";
+import { DurableRunRecorder, protocolToolCallId } from "./durableRun";
 import type { RunEventWire } from "./runProtocol";
 import { ComputerUseRunBudget } from "./taskCoordinator";
 
@@ -1839,7 +1839,7 @@ describe("executeToolCall / Plan Mode dispatch backstop", () => {
     usePermissionStore.setState({ mode: "manual" });
   });
 
-  it.each(["write_file", "edit_file", "run_shell", "shell_kill", "remember", "web_fetch", "web_search"])(
+  it.each(["write_file", "edit_file", "run_shell", "shell_kill", "remember", "web_fetch", "web_search", "device_action"])(
     "refuses %s without dispatching to Rust",
     async (name) => {
       const result = await executeToolCall(call(name, { path: "a.ts" }), null, "turn-1", emptyMcpRegistry);
@@ -1870,12 +1870,118 @@ describe("executeToolCall / Plan Mode dispatch backstop", () => {
   });
 
   it("isBlockedInPlanMode: pins the exact blocked-name predicate", () => {
-    for (const name of ["write_file", "edit_file", "run_shell", "shell_kill", "remember", "web_fetch", "web_search", "mcp__x__y"]) {
+    for (const name of ["write_file", "edit_file", "run_shell", "shell_kill", "remember", "web_fetch", "web_search", "device_action", "mcp__x__y"]) {
       expect(isBlockedInPlanMode(name), name).toBe(true);
     }
+    // `spawn_task` stays on this side deliberately: it has no `tool_spawn_task`
+    // Rust command and no side effect at all — it stages a suggestion chip and
+    // returns, and nothing runs until the user clicks it. Rust never sees the
+    // call, so there is nothing for this predicate to mirror.
     for (const name of ["read_file", "list_dir", "glob", "grep", "shell_output", "task", "workflow", "skill", "present_plan", "spawn_task"]) {
       expect(isBlockedInPlanMode(name), name).toBe(false);
     }
+  });
+});
+
+describe("executeToolCall / device_action invocation identity", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    usePermissionStore.setState({ mode: "manual" });
+  });
+
+  // `tool_device_action` builds its `--invocation-id` as `{turn_id}:{tool_call_id}`
+  // and only when BOTH arrive, and that id is what the daemon's unique index on
+  // `remote_device_actions(invocation_id)` dedupes a replayed turn against. So
+  // the pair has to reach it, or the same retried turn takes a second photograph.
+  it("injects the turn and tool-call ids the daemon's idempotency key is built from", async () => {
+    invokeMock.mockResolvedValue({ status: "ok" });
+    const toolCall = call("device_action", { action: "camera_capture" });
+    await executeToolCall(toolCall, null, "turn-1", emptyMcpRegistry);
+
+    const [command, args] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(command).toBe("tool_device_action");
+    expect(args.turn_id).toBe("turn-1");
+    expect(args.tool_call_id).toBe(protocolToolCallId(toolCall.id));
+  });
+
+  it("scrubs model-supplied ids — the model can never choose its own idempotency key", async () => {
+    invokeMock.mockResolvedValue({ status: "ok" });
+    const toolCall = call("device_action", {
+      action: "camera_capture",
+      turn_id: "attacker-turn",
+      tool_call_id: "attacker-call",
+    });
+    await executeToolCall(toolCall, null, "turn-1", emptyMcpRegistry);
+
+    const [, args] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(args.turn_id).toBe("turn-1");
+    expect(args.tool_call_id).toBe(protocolToolCallId(toolCall.id));
+  });
+});
+
+describe("executeToolCall / checkpoint_id for effects outside the workspace files", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    usePermissionStore.setState({ mode: "manual" });
+  });
+
+  // Both tools are enumerated in `EXTERNAL_TOOL_KINDS`, and `checkpoint_id`'s
+  // `RESERVED_ARGS` entry resolves off `classifyExternalTool` — so this is what
+  // proves the classification actually reaches the Rust side that records the
+  // effect. Without it the effect lives only in the transcript, which
+  // `contextTrimmer.ts` may drop, after which a revert reports nothing to
+  // reconcile for a photograph that was taken.
+  it("passes the turn's checkpoint to device_action", async () => {
+    invokeMock.mockResolvedValue({ status: "ok" });
+    await executeToolCall(
+      call("device_action", { action: "camera_capture" }),
+      "checkpoint-1",
+      "turn-1",
+      emptyMcpRegistry,
+    );
+
+    const [, args] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(args.checkpoint_id).toBe("checkpoint-1");
+  });
+
+  it("passes it to an actuating computer_* call but not to the observations around it", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "tool_computer_list_targets") return JSON.stringify({ targets: [{ window_id: "w-1" }] });
+      if (command === "tool_computer_inspect") return JSON.stringify({ elements: [] });
+      if (command === "tool_computer_click") return JSON.stringify({ executed: true, stateVerified: true });
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    await executeToolCall(
+      call("computer_click", {
+        session_id: "desktop-session",
+        target_application_id: "Notes",
+        target_window_id: "w-1",
+        element_id: "Notes::element-1::native-button",
+      }),
+      "checkpoint-1",
+      "turn-native",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { computerUseBudget: new ComputerUseRunBudget() },
+    );
+
+    const byCommand = new Map(
+      (invokeMock.mock.calls as [string, Record<string, unknown>][]).map(([command, args]) => [command, args]),
+    );
+    expect(byCommand.get("tool_computer_click")?.checkpoint_id).toBe("checkpoint-1");
+    // The observe/verify legs read; only the leg that sends input is an effect.
+    expect(byCommand.get("tool_computer_list_targets")?.checkpoint_id).toBeUndefined();
+    expect(byCommand.get("tool_computer_inspect")?.checkpoint_id).toBeUndefined();
   });
 });
 

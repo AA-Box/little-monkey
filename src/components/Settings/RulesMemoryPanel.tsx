@@ -422,7 +422,7 @@ function MemorySection({ hasWorkspace }: { hasWorkspace: boolean }) {
             {confirmingClear ? (
               <div className="flex flex-1 items-center justify-between gap-2">
                 <span className="text-xs text-warning">
-                  {t("RulesMemoryPanel.memoryClearConfirmPrompt", { count: facts.length })}
+                  {t("RulesMemoryPanel.memoryClearConfirmPrompt")}
                 </span>
                 <div className="flex shrink-0 gap-1.5">
                   <Button size="sm" variant="ghost" onClick={() => setConfirmingClear(false)} disabled={clearing}>

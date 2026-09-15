@@ -8,10 +8,11 @@
  * actually narrows the list rather than only labelling it.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 const conversationsList = vi.fn();
 const conversationsShow = vi.fn(() => Promise.resolve({ messages: [] }));
+const conversationsDelete = vi.fn((_environment: string, _id: string) => Promise.resolve());
 vi.mock("../../lib/conversationsClient", async () => {
   const actual = await vi.importActual<typeof import("../../lib/conversationsClient")>(
     "../../lib/conversationsClient",
@@ -20,6 +21,7 @@ vi.mock("../../lib/conversationsClient", async () => {
     ...actual,
     conversationsList: () => conversationsList(),
     conversationsShow: () => conversationsShow(),
+    conversationsDelete: (environment: string, id: string) => conversationsDelete(environment, id),
   };
 });
 // Stores imported down the tree subscribe to Tauri events at module load;
@@ -33,11 +35,24 @@ vi.mock("@tauri-apps/api/core", () => ({
 import ChatSessionList from "./ChatSessionList";
 import { useSessionStore, type ChatSession } from "../../store/sessionStore";
 import { useExternalConversationStore } from "../../store/externalConversationStore";
+import { useExternalConversationMetaStore } from "../../store/externalConversationMetaStore";
 import { useSessionListViewStore } from "../../store/sessionListViewStore";
 import { DEFAULT_SESSION_LIST_PREFS } from "./sessionListView";
 import { REMOTE_CONTROL_ENVIRONMENT, SLACK_ENVIRONMENT } from "../../lib/conversationsClient";
 
 const NOW = 1_760_000_000_000;
+
+/** A Telegram DM as the daemon lists it: titled by the person in it. */
+const TELEGRAM_DM_KEY = "channel:telegram telegram:acct-1:931819457";
+const TELEGRAM_DM = {
+  environment: "channel:telegram",
+  provider: "telegram",
+  id: "telegram:acct-1:931819457",
+  title: "ahmad",
+  account_label: "Little",
+  updated_at_ms: NOW + 2_000,
+  message_count: 4,
+};
 
 function session(overrides: Partial<ChatSession> = {}): ChatSession {
   return {
@@ -78,8 +93,14 @@ beforeEach(() => {
   });
   useSessionStore.setState({ sessions: [session()], groups: [], activeSessionId: "local-1" });
   useExternalConversationStore.setState({ conversations: [], messages: {}, selected: null, error: null });
+  useExternalConversationMetaStore.setState({ meta: {} });
   useSessionListViewStore.setState({ prefs: DEFAULT_SESSION_LIST_PREFS });
 });
+
+/** The sidebar row carrying `title`, for scoping queries to one row. */
+function rowOf(title: string): HTMLElement {
+  return screen.getByText(title).closest("[role=button]") as HTMLElement;
+}
 
 afterEach(() => {
   cleanup();
@@ -114,13 +135,16 @@ describe("ChatSessionList across environments", () => {
     expect(screen.getByRole("img", { name: "Failed" }).querySelector("svg")).toBeTruthy();
   });
 
-  it("exposes pin and archive actions on a local chat row", () => {
+  it("exposes pin and archive actions on a local chat row", async () => {
     render(<ChatSessionList />);
+    await screen.findByText("From my phone");
+    // Every row offers these now, so the query is scoped to the local one.
+    const row = rowOf("Local session");
 
-    fireEvent.click(screen.getByRole("button", { name: "Pin" }));
+    fireEvent.click(within(row).getByRole("button", { name: "Pin" }));
     expect(useSessionStore.getState().sessions[0]?.pinned).toBe(true);
 
-    fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+    fireEvent.click(within(rowOf("Local session")).getByRole("button", { name: "Archive" }));
     expect(useSessionStore.getState().sessions[0]?.archived).toBe(true);
   });
 
@@ -191,6 +215,90 @@ describe("ChatSessionList across environments", () => {
     useSessionListViewStore.getState().setPrefs({ environments: [SLACK_ENVIRONMENT] });
     await waitFor(() => expect(screen.queryByText("From my phone")).toBeNull());
     expect(screen.getByText("No sessions match this filter.")).toBeTruthy();
+  });
+
+  it("gives an outside conversation the same row actions a local chat has", async () => {
+    conversationsList.mockResolvedValue({ conversations: [TELEGRAM_DM] });
+    render(<ChatSessionList />);
+    await screen.findByText("ahmad");
+
+    // Pin: the row moves under its own heading, and stays selected-free.
+    fireEvent.click(within(rowOf("ahmad")).getByRole("button", { name: "Pin" }));
+    expect(screen.getByText("Pinned")).toBeTruthy();
+    expect(useExternalConversationMetaStore.getState().meta[TELEGRAM_DM_KEY]?.pinned).toBe(true);
+    expect(useExternalConversationStore.getState().selected).toBeNull();
+
+    // Archive un-pins and files it behind the collapsed footer.
+    fireEvent.click(within(rowOf("ahmad")).getByRole("button", { name: "Archive" }));
+    expect(screen.queryByText("Pinned")).toBeNull();
+    expect(screen.getByText("Archived (1)")).toBeTruthy();
+    fireEvent.click(screen.getByText("Archived (1)"));
+    fireEvent.click(within(rowOf("ahmad")).getByRole("button", { name: "Unarchive" }));
+    expect(screen.queryByText(/Archived \(/)).toBeNull();
+
+    // Rename, from the menu, is this desktop's own name for it.
+    fireEvent.click(within(rowOf("ahmad")).getByRole("button", { name: "Session menu" }));
+    fireEvent.click(screen.getByRole("menu").querySelector("button:nth-of-type(3)")!);
+    const input = screen.getByDisplayValue("ahmad");
+    fireEvent.change(input, { target: { value: "Ahmad (Telegram)" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(await screen.findByText("Ahmad (Telegram)")).toBeTruthy();
+    expect(useExternalConversationMetaStore.getState().meta[TELEGRAM_DM_KEY]?.title).toBe(
+      "Ahmad (Telegram)",
+    );
+  });
+
+  it("marks an outside conversation unread until it is opened", async () => {
+    conversationsList.mockResolvedValue({ conversations: [TELEGRAM_DM] });
+    useExternalConversationMetaStore.getState().update(TELEGRAM_DM_KEY, { unread: true });
+    render(<ChatSessionList />);
+
+    const title = await screen.findByText("ahmad");
+    expect(title.closest("span.font-semibold")).toBeTruthy();
+    fireEvent.click(title);
+    await waitFor(() =>
+      expect(useExternalConversationMetaStore.getState().meta[TELEGRAM_DM_KEY]?.unread).toBeFalsy(),
+    );
+  });
+
+  it("deletes an outside conversation from the menu, after asking", async () => {
+    conversationsList.mockResolvedValue({ conversations: [TELEGRAM_DM] });
+    useExternalConversationMetaStore.getState().update(TELEGRAM_DM_KEY, { pinned: true });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<ChatSessionList />);
+    await screen.findByText("ahmad");
+
+    fireEvent.click(within(rowOf("ahmad")).getByRole("button", { name: "Session menu" }));
+    // The listing the refetch sees after the daemon erased the row.
+    conversationsList.mockResolvedValue({ conversations: [] });
+    fireEvent.click(within(screen.getByRole("menu")).getByText("Delete"));
+
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(confirm.mock.calls[0]?.[0]).toContain("ahmad");
+    await waitFor(() =>
+      expect(conversationsDelete).toHaveBeenCalledWith("channel:telegram", "telegram:acct-1:931819457"),
+    );
+    await waitFor(() => expect(screen.queryByText("ahmad")).toBeNull());
+    // Deleting is not selecting, and the desktop's notes about it go with it.
+    expect(useExternalConversationStore.getState().selected).toBeNull();
+    await waitFor(() =>
+      expect(useExternalConversationMetaStore.getState().meta[TELEGRAM_DM_KEY]).toBeUndefined(),
+    );
+    confirm.mockRestore();
+  });
+
+  it("does nothing when deleting is declined", async () => {
+    conversationsList.mockResolvedValue({ conversations: [TELEGRAM_DM] });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(<ChatSessionList />);
+    await screen.findByText("ahmad");
+
+    fireEvent.click(within(rowOf("ahmad")).getByRole("button", { name: "Session menu" }));
+    fireEvent.click(within(screen.getByRole("menu")).getByText("Delete"));
+
+    expect(conversationsDelete).not.toHaveBeenCalled();
+    expect(screen.getByText("ahmad")).toBeTruthy();
+    confirm.mockRestore();
   });
 
   it("keeps the list usable when the daemon cannot be reached", async () => {

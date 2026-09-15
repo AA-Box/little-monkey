@@ -1296,17 +1296,32 @@ mod tests {
                 )
                 .map_err(|(_, error)| error)?;
             let discovery_session = session_id_of(&discovered);
-            let targets = runtime
-                .list_targets("remote-windows-ci", &discovery_session)
-                .map_err(|(_, error)| error)?;
-            let target = targets["targets"]
-                .as_array()
-                .and_then(|items| {
-                    items
-                        .iter()
-                        .find(|item| item["windowTitle"] == "Little Monkey TestApp")
-                })
-                .cloned()
+            // The window, not a stopwatch. The fixture is a WPF window a cold
+            // PowerShell is still constructing, and on a shared runner it can
+            // still be absent from the first enumeration — which is what the
+            // sleep above was guessing at, and what failed CI as "did not
+            // discover the fixture" on a slow host. Same bounded poll as the
+            // signed golden flow in `api.rs`: ten seconds of asking, then give
+            // up with the same message.
+            let mut discovered_target = None;
+            for _ in 0..20 {
+                let targets = runtime
+                    .list_targets("remote-windows-ci", &discovery_session)
+                    .map_err(|(_, error)| error)?;
+                discovered_target = targets["targets"]
+                    .as_array()
+                    .and_then(|items| {
+                        items
+                            .iter()
+                            .find(|item| item["windowTitle"] == "Little Monkey TestApp")
+                    })
+                    .cloned();
+                if discovered_target.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            let target = discovered_target
                 .ok_or_else(|| "production remote UIA did not discover the fixture".to_string())?;
             let application_id = target["applicationId"].as_str().unwrap().to_string();
             let window_id = target["windowId"].as_str().unwrap().to_string();

@@ -1,4 +1,4 @@
-import { AlertTriangle, Download, Play, Square, Trash2, X } from "lucide-react";
+import { AlertTriangle, Download, Square, Trash2, X } from "lucide-react";
 import type { ModelInfo } from "../../lib/modelRegistry";
 import { formatBytes, formatSizeGb } from "../../lib/modelRegistry";
 import { useT } from "../../lib/i18n";
@@ -82,7 +82,21 @@ export function ModelCard({
         isActive ? "border-l-2 border-l-accent pl-2.5" : ""
       }`}
     >
-      <div className="min-w-0">
+      {/* The card itself starts the model. A Start button beside a card that
+          ignores a click is an extra thing to aim at for the action the card
+          already stands for, and the pill above already says what state it is
+          in. A real <button> rather than a handler on the wrapper, so it keeps
+          focus, Enter/Space and an accessible name; every other action (stop,
+          pull, projector, delete) stays outside it, because interactive
+          elements must not nest. */}
+      <button
+        type="button"
+        onClick={onStart}
+        disabled={!model.installed || busy}
+        aria-current={isRunning ? "true" : undefined}
+        title={t("ModelCard.startButton")}
+        className="min-w-0 flex-1 rounded text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-default"
+      >
         <div className="flex flex-wrap items-center gap-2">
           <h3 className="truncate text-sm font-medium text-foreground">{model.name}</h3>
           {model.runtime === "mlx" && (
@@ -124,7 +138,7 @@ export function ModelCard({
             </span>
           </p>
         )}
-      </div>
+      </button>
 
       <div className="flex shrink-0 items-center gap-2">
         {isDownloading && downloadProgress ? (
@@ -172,13 +186,6 @@ export function ModelCard({
               <Button variant="danger" size="sm" onClick={onStop}>
                 <Square size={14} />
                 {t("ModelCard.stopButton")}
-              </Button>
-            )}
-
-            {!busy && (
-              <Button variant="primary" size="sm" onClick={onStart}>
-                <Play size={14} />
-                {t("ModelCard.startButton")}
               </Button>
             )}
 

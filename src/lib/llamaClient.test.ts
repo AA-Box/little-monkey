@@ -1,6 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { SseEventParser, streamChat, textContent, type StreamEvent } from './llamaClient';
+import {
+  demoteInlineSystemMessages,
+  recoverTextToolCalls,
+  SseEventParser,
+  streamChat,
+  textContent,
+  type StreamEvent,
+  type ToolDef,
+} from './llamaClient';
 
 function collect(parser: SseEventParser, chunks: string[]): StreamEvent[] {
   const events: StreamEvent[] = [];
@@ -85,6 +93,34 @@ describe('SseEventParser', () => {
     ]);
   });
 
+  it('throws the message from an error frame instead of streaming nothing', () => {
+    // What `mlx_chat.rs` sends when the runtime cannot load the model: a 200
+    // response whose only frame is an error. Swallowing it leaves an empty
+    // assistant bubble and no explanation anywhere in the UI.
+    const parser = new SseEventParser();
+    expect(() =>
+      collect(parser, [
+        'event: error\n',
+        dataLine({ error: { message: 'process exited before readiness: signal 6', type: 'little_monkey_m3_error' } }),
+      ])
+    ).toThrow('process exited before readiness: signal 6');
+  });
+
+  it('throws a bare-string error frame, the shape other OpenAI-compatible servers send', () => {
+    // LM Studio and Ollama-style `/v1` proxies report `{"error": "..."}`;
+    // reading only `error.message` there would drop the one thing this branch
+    // exists to surface.
+    expect(() =>
+      collect(new SseEventParser(), [dataLine({ error: 'context length exceeded' })])
+    ).toThrow('context length exceeded');
+  });
+
+  it('still reports an error frame that carries no message', () => {
+    expect(() => collect(new SseEventParser(), [dataLine({ error: {} })])).toThrow(
+      /without saying why/
+    );
+  });
+
   it('skips malformed payloads without crashing', () => {
     const events = collect(new SseEventParser(), ['data: {not json}\n', dataLine({ choices: [{ delta: { content: 'ok' } }] })]);
     expect(events).toEqual([{ type: 'delta', content: 'ok' }]);
@@ -147,6 +183,29 @@ describe('streamChat request shape', () => {
     fetchMock.mockRestore();
   });
 
+  it('rejects with the error frame of an otherwise-successful stream', async () => {
+    // The mid-stream catch in `streamChat` only swallows an aborted fetch, so
+    // an error frame on a live stream has to come back out to the caller.
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        'data: {"error":{"type":"api_error","code":"model_not_found","message":"mlx-vlm cannot load qwen3_5"}}\n',
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+      )
+    );
+
+    try {
+      await expect(async () => {
+        for await (const _event of streamChat('http://127.0.0.1:8081', [], [], 'model')) {
+          // Drain the stream.
+        }
+      }).rejects.toThrow('mlx-vlm cannot load qwen3_5');
+    } finally {
+      // Restored even on failure: a leaked fetch spy makes the *next* test in
+      // this describe read this test's call as its own.
+      fetchMock.mockRestore();
+    }
+  });
+
   it('sends an explicit max_tokens ceiling when a bounded caller supplies one', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response('data: [DONE]\n', { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
@@ -160,5 +219,109 @@ describe('streamChat request shape', () => {
     const body = JSON.parse(init.body as string) as Record<string, unknown>;
     expect(body.max_tokens).toBe(2048);
     fetchMock.mockRestore();
+  });
+});
+
+describe('recoverTextToolCalls', () => {
+  const tools: ToolDef[] = [
+    { type: 'function', function: { name: 'run_shell', description: '', parameters: {} } },
+    { type: 'function', function: { name: 'edit_file', description: '', parameters: {} } },
+  ];
+
+  it('recovers a fenced tool call the model wrote as prose and strips it from the answer', () => {
+    const recovered = recoverTextToolCalls(
+      'Let me check the log.\n\n```json\n{\n  "name": "run_shell",\n  "arguments": {\n    "command": "cat ~/Library/Logs/bf6.log"\n  }\n}\n```\n',
+      tools,
+    );
+    expect(recovered.toolCalls).toEqual([
+      {
+        id: 'call_text_0',
+        type: 'function',
+        function: { name: 'run_shell', arguments: '{"command":"cat ~/Library/Logs/bf6.log"}' },
+      },
+    ]);
+    expect(recovered.content).toBe('Let me check the log.');
+  });
+
+  it('collapses a call the model restated twice in one message', () => {
+    const block = '```json\n{"name": "run_shell", "arguments": {"command": "ls"}}\n```';
+    const recovered = recoverTextToolCalls(`Do it.\n\n${block}\n\nRunning it now.\n${block}`, tools);
+    expect(recovered.toolCalls).toHaveLength(1);
+    expect(recovered.content).toBe('Do it.\n\nRunning it now.');
+  });
+
+  it('recovers a Hermes-style tool_call tag the server template did not parse', () => {
+    const recovered = recoverTextToolCalls(
+      '<tool_call>{"name": "edit_file", "arguments": {"path": "a.ts", "old_string": "}", "new_string": "{"}}</tool_call>',
+      tools,
+    );
+    expect(recovered.toolCalls[0]?.function).toEqual({
+      name: 'edit_file',
+      arguments: '{"path":"a.ts","old_string":"}","new_string":"{"}',
+    });
+    expect(recovered.content).toBe('');
+  });
+
+  it('leaves JSON that is not a call for an offered tool completely alone', () => {
+    const prose = 'The config is `{"name": "little-monkey", "arguments": {"command": "x"}}` — note the name.';
+    expect(recoverTextToolCalls(prose, tools)).toEqual({ content: prose, toolCalls: [] });
+
+    const documented = '{"name": "run_shell", "arguments": {"command": "ls"}, "note": "example only"}';
+    expect(recoverTextToolCalls(documented, tools)).toEqual({ content: documented, toolCalls: [] });
+
+    const noArgs = '{"name": "run_shell"}';
+    expect(recoverTextToolCalls(noArgs, tools)).toEqual({ content: noArgs, toolCalls: [] });
+  });
+
+  it('recovers nothing when no tools were offered this turn', () => {
+    const content = '{"name": "run_shell", "arguments": {"command": "ls"}}';
+    expect(recoverTextToolCalls(content, [])).toEqual({ content, toolCalls: [] });
+  });
+});
+
+describe('demoteInlineSystemMessages', () => {
+  it('keeps the leading system prompt and demotes the notices behind it', () => {
+    // The exact shape that made `mlx_lm.server` answer
+    // 404 {"error": "System message must be at the beginning."}
+    const wire = demoteInlineSystemMessages([
+      { role: 'system', content: 'You are Little Monkey.' },
+      { role: 'user', content: 'run the game' },
+      { role: 'assistant', content: 'here is how' },
+      { role: 'system', content: '[Mentions] Couldn\'t read @Mac' },
+      { role: 'user', content: 'did you do it?' },
+    ]);
+    expect(wire.map((message) => message.role)).toEqual(['system', 'user', 'assistant', 'user', 'user']);
+    // The text of a demoted notice is untouched — several are instructions the
+    // loop needs the model to act on.
+    expect(wire[3]).toEqual({ role: 'user', content: "[Mentions] Couldn't read @Mac" });
+  });
+
+  it('keeps a whole leading run of system messages', () => {
+    const wire = demoteInlineSystemMessages([
+      { role: 'system', content: 'prompt' },
+      { role: 'system', content: '[Sources] …' },
+      { role: 'user', content: 'hi' },
+    ]);
+    expect(wire.map((message) => message.role)).toEqual(['system', 'system', 'user']);
+  });
+
+  it('demotes every system message when the prompt is supplied out of band', () => {
+    const wire = demoteInlineSystemMessages(
+      [
+        { role: 'system', content: '[Model switch] …' },
+        { role: 'user', content: 'hi' },
+        { role: 'system', content: '[Verify Fix] fix the reported problems' },
+      ],
+      { keepLeading: false },
+    );
+    expect(wire.map((message) => message.role)).toEqual(['user', 'user', 'user']);
+  });
+
+  it('leaves a conversation that never carried a notice untouched', () => {
+    const messages = [
+      { role: 'system' as const, content: 'prompt' },
+      { role: 'user' as const, content: 'hi' },
+    ];
+    expect(demoteInlineSystemMessages(messages)).toEqual(messages);
   });
 });

@@ -1473,7 +1473,6 @@ const translated: Record<string, string> = {
   "RulesMemoryPanel.memoryDeleteButton": "Elimina",
   "RulesMemoryPanel.memoryDeletingButton": "Eliminazione…",
   "RulesMemoryPanel.memoryClearAllButton": "Cancella tutto",
-  "RulesMemoryPanel.memoryClearConfirmPrompt": "Eliminare tutti i {{count}} fatti memorizzati? Non può essere annullato.",
   "RulesMemoryPanel.memoryClearConfirmButton": "Sì, cancella tutto",
   "RulesMemoryPanel.memoryClearCancelButton": "Annulla",
   "RulesMemoryPanel.memoryClearingButton": "Cancellazione…",

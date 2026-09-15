@@ -153,6 +153,11 @@ pub struct LocalTranscript {
 /// never succeed. Development trees that have not run `pnpm stage:whisper` have
 /// no bundled copy, and fall back to the download path below.
 pub fn set_resource_dir(resource_dir: Option<&Path>) {
+    // whisper.cpp's default native callback writes decoder tokens (including
+    // the user's transcript) to stderr in some build configurations. Route it
+    // through whisper-rs with no logging backend, which deliberately discards
+    // native diagnostics before any microphone audio is ever decoded.
+    whisper_rs::install_logging_hooks();
     let _ = BUNDLED_MODEL.set(resolve_bundled(resource_dir));
 }
 
@@ -821,6 +826,19 @@ mod tests {
         ] {
             assert!(!is_non_speech_annotation(speech), "{speech}");
         }
+    }
+
+    #[test]
+    fn native_decoder_logging_is_disabled_at_startup() {
+        const SOURCE: &str = include_str!("local_whisper.rs");
+        let startup = SOURCE
+            .split_once("pub fn set_resource_dir")
+            .unwrap()
+            .1
+            .split_once("\n}")
+            .unwrap()
+            .0;
+        assert!(startup.contains("whisper_rs::install_logging_hooks()"));
     }
 
     #[test]

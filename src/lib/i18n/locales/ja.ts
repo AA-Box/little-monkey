@@ -1472,7 +1472,6 @@ const translated: Record<string, string> = {
   "RulesMemoryPanel.memoryDeleteButton": "削除",
   "RulesMemoryPanel.memoryDeletingButton": "削除中…",
   "RulesMemoryPanel.memoryClearAllButton": "すべて削除",
-  "RulesMemoryPanel.memoryClearConfirmPrompt": "記憶した{{count}}件の事実をすべて削除しますか？元に戻せません。",
   "RulesMemoryPanel.memoryClearConfirmButton": "はい、すべて削除します",
   "RulesMemoryPanel.memoryClearCancelButton": "キャンセル",
   "RulesMemoryPanel.memoryClearingButton": "削除中…",

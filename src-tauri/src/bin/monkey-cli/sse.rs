@@ -175,3 +175,261 @@ impl SseParser {
         }
     }
 }
+
+/// Keys a text-emitted tool-call object may carry and still be recognized as
+/// one. Anything else in the object means it is not a call the model meant to
+/// make — see [`recover_text_tool_calls`].
+const TEXT_TOOL_CALL_KEYS: [&str; 6] = ["name", "arguments", "parameters", "id", "type", "index"];
+
+/// Byte spans of the top-level `{…}` objects in `text`, brace-matched with
+/// string/escape awareness so a `}` inside a JSON string value cannot end a
+/// span early.
+fn top_level_object_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, character) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = index;
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    spans.push((start, index + character.len_utf8()));
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
+}
+
+/// Parses one candidate span as a call for a tool that was actually offered.
+/// Deliberately strict: a name the model was not given, missing arguments, or
+/// any unexpected key disqualifies it.
+fn parse_text_tool_call(candidate: &str, offered: &[String]) -> Option<(String, String)> {
+    let parsed: serde_json::Value = serde_json::from_str(candidate).ok()?;
+    let object = parsed.as_object()?;
+    if object.keys().any(|key| !TEXT_TOOL_CALL_KEYS.contains(&key.as_str())) {
+        return None;
+    }
+    let name = object.get("name")?.as_str()?;
+    if !offered.iter().any(|offered_name| offered_name == name) {
+        return None;
+    }
+    let arguments = object.get("arguments").or_else(|| object.get("parameters"))?;
+    let arguments = match arguments {
+        serde_json::Value::String(raw) => raw.clone(),
+        serde_json::Value::Object(_) => serde_json::to_string(arguments).ok()?,
+        _ => return None,
+    };
+    Some((name.to_string(), arguments))
+}
+
+/// Removes the fences and Hermes tags the extracted JSON was wrapped in, now
+/// that they would otherwise be left behind empty.
+fn tidy_recovered_content(text: &str) -> String {
+    let without_tags = text.replace("<tool_call>", "").replace("</tool_call>", "");
+    let empty_fence = regex::Regex::new(r"```[a-zA-Z]*\s*```").expect("static regex");
+    let blank_runs = regex::Regex::new(r"\n{3,}").expect("static regex");
+    let stripped = empty_fence.replace_all(&without_tags, "");
+    blank_runs.replace_all(&stripped, "\n\n").trim().to_string()
+}
+
+/// Recovers the tool calls a model wrote as prose instead of emitting on the
+/// wire, and returns the content with that JSON removed.
+///
+/// Rust port of `recoverTextToolCalls` in `src/lib/llamaClient.ts`, and it
+/// exists for the same reason `SseParser` above does: the GUI's in-process
+/// turn loop does this in the WebView, but a packaged desktop hands every
+/// chat turn to this daemon (see `agentLoop.ts`'s `runDaemonAgentTurn`), so a
+/// fix that lived only in TS would never run for the app's own chat.
+///
+/// Small local models do this routinely: the system prompt names the tools,
+/// so the model knows they exist, but it answers with a ```json fenced
+/// `{"name": …, "arguments": {…}}` block (or a bare `<tool_call>` one whose
+/// tags the server's chat template parser did not recognise) rather than a
+/// real `tool_calls` delta. Qwen2.5-7B on llama.cpp — the model this app
+/// ships — does it several turns into a session. Nothing executes, and the
+/// user is shown wire JSON and left to run the command themselves.
+///
+/// A recovered call is executed through the same path as a native one, with
+/// the same permission gate, so this changes what runs only in that it makes
+/// the model's stated intent actually happen. The match is kept strict to
+/// keep an answer that merely *documents* a call from becoming one: only when
+/// the turn produced no real tool call, only for a tool that was offered this
+/// turn, and only for an object carrying nothing but the tool-call keys.
+/// Identical repeated blocks (models often restate the same call twice in one
+/// message) collapse to a single call.
+pub fn recover_text_tool_calls(
+    content: &str,
+    tools: &[serde_json::Value],
+) -> (String, Vec<ToolCallEvent>) {
+    if tools.is_empty() || !content.contains('{') {
+        return (content.to_string(), Vec::new());
+    }
+    let offered: Vec<String> = tools
+        .iter()
+        .filter_map(|tool| {
+            tool.get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    if offered.is_empty() {
+        return (content.to_string(), Vec::new());
+    }
+
+    let mut calls: Vec<ToolCallEvent> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    let mut kept = String::new();
+    let mut cursor = 0usize;
+
+    for (start, end) in top_level_object_spans(content) {
+        let Some((name, arguments)) = parse_text_tool_call(&content[start..end], &offered) else {
+            continue;
+        };
+        let key = format!("{name} {arguments}");
+        if !seen.contains(&key) {
+            seen.push(key);
+            calls.push(ToolCallEvent {
+                id: format!("call_text_{}", calls.len()),
+                name,
+                arguments,
+            });
+        }
+        kept.push_str(&content[cursor..start]);
+        cursor = end;
+    }
+
+    if calls.is_empty() {
+        return (content.to_string(), Vec::new());
+    }
+    kept.push_str(&content[cursor..]);
+    (tidy_recovered_content(&kept), calls)
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::{recover_text_tool_calls, ToolCallEvent};
+
+    fn tools(names: &[&str]) -> Vec<serde_json::Value> {
+        names
+            .iter()
+            .map(|name| serde_json::json!({"type": "function", "function": {"name": name}}))
+            .collect()
+    }
+
+    fn shapes(calls: &[ToolCallEvent]) -> Vec<(String, String)> {
+        calls
+            .iter()
+            .map(|call| (call.name.clone(), call.arguments.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn recovers_a_fenced_call_and_strips_it_from_the_answer() {
+        let content = "Let me check the log.\n\n```json\n{\n  \"name\": \"run_shell\",\n  \"arguments\": {\n    \"command\": \"cat ~/Library/Logs/bf6.log\"\n  }\n}\n```\n";
+        let (answer, calls) = recover_text_tool_calls(content, &tools(&["run_shell"]));
+        assert_eq!(
+            shapes(&calls),
+            vec![(
+                "run_shell".to_string(),
+                "{\"command\":\"cat ~/Library/Logs/bf6.log\"}".to_string()
+            )]
+        );
+        assert_eq!(answer, "Let me check the log.");
+    }
+
+    #[test]
+    fn recovers_every_call_in_a_multi_step_answer_and_collapses_repeats() {
+        // The real shape a 7B model produces: a numbered plan, one fence per
+        // step, and the same call restated at the end.
+        let content = "### Step 1\n```json\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.env\", \"content\": \"X=1\"}}\n```\n### Step 2\n```json\n{\"name\": \"run_shell\", \"arguments\": {\"command\": \"./run\"}}\n```\nStarting now.\n```json\n{\"name\": \"run_shell\", \"arguments\": {\"command\": \"./run\"}}\n```";
+        let (_, calls) = recover_text_tool_calls(content, &tools(&["run_shell", "write_file"]));
+        assert_eq!(
+            shapes(&calls),
+            vec![
+                // Keys come back sorted: this crate's `serde_json` has no
+                // `preserve_order`, so re-serializing the arguments object
+                // orders them. A JSON object is unordered and every tool reads
+                // its arguments by name, so the call is identical.
+                (
+                    "write_file".to_string(),
+                    "{\"content\":\"X=1\",\"path\":\"a.env\"}".to_string()
+                ),
+                ("run_shell".to_string(), "{\"command\":\"./run\"}".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovers_a_hermes_tag_the_server_template_did_not_parse() {
+        let content =
+            "<tool_call>{\"name\": \"run_shell\", \"arguments\": {\"command\": \"echo \\\"}\\\"\"}}</tool_call>";
+        let (answer, calls) = recover_text_tool_calls(content, &tools(&["run_shell"]));
+        // The `}` inside the string value must not end the object early.
+        assert_eq!(
+            shapes(&calls),
+            vec![(
+                "run_shell".to_string(),
+                "{\"command\":\"echo \\\"}\\\"\"}".to_string()
+            )]
+        );
+        assert_eq!(answer, "");
+    }
+
+    #[test]
+    fn leaves_json_that_is_not_a_call_for_an_offered_tool_alone() {
+        for content in [
+            // A tool this turn was not offered.
+            "{\"name\": \"run_shell\", \"arguments\": {\"command\": \"ls\"}}",
+            // An object that merely documents a call.
+            "{\"name\": \"write_file\", \"arguments\": {\"path\": \"a\"}, \"note\": \"example\"}",
+            // No arguments at all.
+            "{\"name\": \"write_file\"}",
+            // Ordinary JSON that happens to have a `name`.
+            "{\"name\": \"little-monkey\", \"version\": \"1.7.1\"}",
+        ] {
+            let (answer, calls) = recover_text_tool_calls(content, &tools(&["write_file"]));
+            assert!(calls.is_empty(), "recovered from: {content}");
+            assert_eq!(answer, content);
+        }
+    }
+
+    #[test]
+    fn recovers_nothing_when_no_tools_were_offered() {
+        let content = "{\"name\": \"run_shell\", \"arguments\": {\"command\": \"ls\"}}";
+        let (answer, calls) = recover_text_tool_calls(content, &[]);
+        assert!(calls.is_empty());
+        assert_eq!(answer, content);
+    }
+
+    #[test]
+    fn keeps_multibyte_prose_intact_around_a_recovered_call() {
+        // Byte-indexed spans over a UTF-8 answer: a naive slice would panic or
+        // cut a character in half.
+        let content = "Kör det här — nu:\n```json\n{\"name\": \"run_shell\", \"arguments\": {\"command\": \"ls\"}}\n```\nKlart ✅";
+        let (answer, calls) = recover_text_tool_calls(content, &tools(&["run_shell"]));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(answer, "Kör det här — nu:\n\nKlart ✅");
+    }
+}

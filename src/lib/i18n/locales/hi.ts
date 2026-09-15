@@ -1472,7 +1472,6 @@ const translated: Record<string, string> = {
   "RulesMemoryPanel.memoryDeleteButton": "हटाएं",
   "RulesMemoryPanel.memoryDeletingButton": "हटाया जा रहा है…",
   "RulesMemoryPanel.memoryClearAllButton": "सभी साफ़ करें",
-  "RulesMemoryPanel.memoryClearConfirmPrompt": "सभी {{count}} याद रखे गए तथ्य हटाएं? इसे पूर्ववत नहीं किया जा सकता।",
   "RulesMemoryPanel.memoryClearConfirmButton": "हां, सभी साफ़ करें",
   "RulesMemoryPanel.memoryClearCancelButton": "रद्द करें",
   "RulesMemoryPanel.memoryClearingButton": "साफ़ किया जा रहा है…",

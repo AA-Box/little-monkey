@@ -295,32 +295,36 @@ describe("ExecutableExtensionsPanel", () => {
       invoke.mock.calls.some(([command]) => command === "extensions_preview_update"),
     ).toBe(true));
 
-    const review = await screen.findByLabelText("Review extension");
-    expect(within(review).getByText("d".repeat(64))).toBeTruthy();
-    expect(within(review).getByText("Added")).toBeTruthy();
-    expect(within(review).getByText("Removed")).toBeTruthy();
-    expect(within(review).getByText("Unchanged")).toBeTruthy();
-    expect(within(review).getAllByText("https://api.example.test").length).toBeGreaterThan(0);
-    expect(within(review).getByText("dev.example.fixture")).toBeTruthy();
-    expect(within(review).getByText("Independent Fixture")).toBeTruthy();
-    expect(within(review).getByText("/tmp/fixture-update")).toBeTruthy();
-    expect(within(review).getByText("/tmp/fixture-extension")).toBeTruthy();
-    expect(within(review).getByText("fixture-v1")).toBeTruthy();
-    expect(within(review).getByText("ed25519 · unknown-root/release-2")).toBeTruthy();
-    expect(within(review).getByText("Echo")).toBeTruthy();
-    expect(within(review).getByText("c".repeat(64))).toBeTruthy();
+    await screen.findByLabelText("Review extension");
+    // Re-queried on every use, never captured. Holding a node across a render
+    // is how a test starts asserting on an element the component has already
+    // replaced or unmounted.
+    const review = () => screen.getByLabelText("Review extension");
+    expect(within(review()).getByText("d".repeat(64))).toBeTruthy();
+    expect(within(review()).getByText("Added")).toBeTruthy();
+    expect(within(review()).getByText("Removed")).toBeTruthy();
+    expect(within(review()).getByText("Unchanged")).toBeTruthy();
+    expect(within(review()).getAllByText("https://api.example.test").length).toBeGreaterThan(0);
+    expect(within(review()).getByText("dev.example.fixture")).toBeTruthy();
+    expect(within(review()).getByText("Independent Fixture")).toBeTruthy();
+    expect(within(review()).getByText("/tmp/fixture-update")).toBeTruthy();
+    expect(within(review()).getByText("/tmp/fixture-extension")).toBeTruthy();
+    expect(within(review()).getByText("fixture-v1")).toBeTruthy();
+    expect(within(review()).getByText("ed25519 · unknown-root/release-2")).toBeTruthy();
+    expect(within(review()).getByText("Echo")).toBeTruthy();
+    expect(within(review()).getByText("c".repeat(64))).toBeTruthy();
 
-    const apply = within(review).getByRole("button", { name: "Update" });
-    expect((apply as HTMLButtonElement).disabled).toBe(true);
+    const apply = () => within(review()).getByRole("button", { name: "Update" }) as HTMLButtonElement;
+    expect(apply().disabled).toBe(true);
     for (const text of [/signing root is not trusted/i, /reviewed the high-risk permissions/i]) {
-      const label = within(review).getByText(text).closest("label");
+      const label = within(review()).getByText(text).closest("label");
       fireEvent.click(label?.querySelector("input") as HTMLInputElement);
     }
-    const permissionLabel = within(review).getAllByText("https://api.example.test")[0].closest("label");
+    const permissionLabel = within(review()).getAllByText("https://api.example.test")[0].closest("label");
     const permissionToggle = permissionLabel?.querySelector("input") as HTMLInputElement;
     if (!permissionToggle.checked) fireEvent.click(permissionToggle);
-    expect((apply as HTMLButtonElement).disabled).toBe(false);
-    fireEvent.click(apply);
+    expect(apply().disabled).toBe(false);
+    fireEvent.click(apply());
 
     await waitFor(() => {
       const call = invoke.mock.calls.find(([command]) => command === "extensions_update");
@@ -357,24 +361,27 @@ describe("ExecutableExtensionsPanel", () => {
       invoke.mock.calls.some(([command]) => command === "extensions_preview_update"),
     ).toBe(true));
 
-    const review = await screen.findByLabelText("Review extension");
-    // Awaited, not queried. The dialog is on screen as soon as a preview
-    // exists, but the binding row is behind `grantedIds` — and the effect that
-    // clears a preview whose extension no longer matches the selection can
-    // blank it for a render. A `get*` samples one instant of that; `findBy*`
-    // waits for the state to settle, which is what the assertions below mean.
-    const binding = (await within(review).findByPlaceholderText(
+    // Re-queried on every use, never captured: the binding row and the Update
+    // button sit behind conditionals, so a held reference can outlive its own
+    // element and go on answering for a subtree the component has dropped.
+    const review = () => screen.getByLabelText("Review extension");
+    const binding = () => within(review()).getByPlaceholderText(
       "Choose the directory bound to this opaque handle",
-    )) as HTMLInputElement;
-    const apply = within(review).getByRole("button", { name: "Update" }) as HTMLButtonElement;
-    expect(binding.value).toBe("");
-    expect(apply.disabled).toBe(true);
-    expect(within(review).getByText(/old-workspace/)).toBeTruthy();
+    ) as HTMLInputElement;
+    const apply = () => within(review()).getByRole("button", { name: "Update" }) as HTMLButtonElement;
 
-    fireEvent.click(within(review).getByRole("button", { name: "Choose" }));
-    await waitFor(() => expect(binding.value).toBe("/tmp/reselected-workspace"));
-    expect(apply.disabled).toBe(false);
-    fireEvent.click(apply);
+    // `get*`, not `find*`: the workspace permission arrives already granted, so
+    // the binding row is in the same commit as the dialog. Waiting for it would
+    // hide a regression that drops it behind a 1s timeout.
+    await screen.findByLabelText("Review extension");
+    expect(binding().value).toBe("");
+    expect(apply().disabled).toBe(true);
+    expect(within(review()).getByText(/old-workspace/)).toBeTruthy();
+
+    fireEvent.click(within(review()).getByRole("button", { name: "Choose" }));
+    await waitFor(() => expect(binding().value).toBe("/tmp/reselected-workspace"));
+    expect(apply().disabled).toBe(false);
+    fireEvent.click(apply());
 
     await waitFor(() => expect(
       invoke.mock.calls.find(([command]) => command === "extensions_update")?.[1],

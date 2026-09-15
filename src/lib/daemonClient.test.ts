@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   MAX_REMOTE_ARTIFACT_BYTES,
   OPEN_BACKPRESSURE,
@@ -11,6 +11,9 @@ import {
   validateDaemonQueuePolicy,
   validateRemotePairRequest,
 } from "./daemonClient";
+
+const invokeMock = vi.hoisted(() => vi.fn());
+vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 const base: DaemonQueueRequest = {
   recipe: "review",
@@ -206,5 +209,53 @@ describe("K8 backpressure signal", () => {
     expect(backpressureMessage(full, "fallback", (ms) => `retry in ${ms}ms`)).toBe("the queue is full retry in 5000ms");
     // No detail (older or terser daemon) still yields a sentence.
     expect(backpressureMessage(OPEN_BACKPRESSURE, "fallback", (ms) => `retry ${ms}`)).toBe("fallback");
+  });
+});
+
+// The cache is module-level, so each case re-imports the module for a fresh
+// one — the point under test is what an *unasked* probe answers, which only
+// happens once per module instance.
+describe("deviceActionAvailable", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    invokeMock.mockReset();
+  });
+
+  it("answers false and probes in the background when nothing has asked yet", async () => {
+    invokeMock.mockResolvedValue({ devices: [], any_capable: true });
+    const { deviceActionAvailable } = await import("./daemonClient");
+
+    // Fail closed: an unknown capability is not a granted one, so the tool is
+    // not offered on the strength of a probe that has not answered.
+    expect(deviceActionAvailable()).toBe(false);
+    await vi.waitFor(() => expect(invokeMock).toHaveBeenCalledWith("remote_device_list"));
+    await vi.waitFor(() => expect(deviceActionAvailable()).toBe(true));
+    // One probe, not one per turn — the daemon call spawns a subprocess.
+    expect(invokeMock.mock.calls.filter(([command]) => command === "remote_device_list")).toHaveLength(1);
+  });
+
+  it("stays false when the daemon reports no capable device", async () => {
+    invokeMock.mockResolvedValue({ devices: [{ device_id: "d-1" }], any_capable: false });
+    const { deviceActionAvailable, remoteDeviceList } = await import("./daemonClient");
+
+    await remoteDeviceList();
+    expect(deviceActionAvailable()).toBe(false);
+  });
+
+  it("treats a daemon that never learned to report any_capable as no device", async () => {
+    invokeMock.mockResolvedValue({ devices: [{ device_id: "d-1" }] });
+    const { deviceActionAvailable, remoteDeviceList } = await import("./daemonClient");
+
+    await remoteDeviceList();
+    expect(deviceActionAvailable()).toBe(false);
+  });
+
+  it("stays false when the probe fails outright — asking must never break a turn", async () => {
+    invokeMock.mockRejectedValue(new Error("no daemon"));
+    const { deviceActionAvailable } = await import("./daemonClient");
+
+    expect(deviceActionAvailable()).toBe(false);
+    await vi.waitFor(() => expect(invokeMock).toHaveBeenCalled());
+    expect(deviceActionAvailable()).toBe(false);
   });
 });

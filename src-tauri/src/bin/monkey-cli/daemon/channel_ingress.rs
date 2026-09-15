@@ -342,27 +342,17 @@ pub(crate) fn accept_channel_envelope_with(
                 Ok(route) => route.clone(),
                 Err(error) => return refuse(store, &event, &error.to_string(), now_ms),
             };
-            // Nobody has chosen a model yet, so the menu is the answer and this
-            // message does not run. Machine-wide and one-time: the first choice
-            // opens the gate for every conversation, which is the same scope the
-            // choice itself has.
-            if !super::channel_commands::model_chosen(
-                store,
-                super::channel_commands::routed_target(Some(&route)).as_deref(),
-            )? {
-                return answer_command(
-                    store,
-                    queue,
-                    &account,
-                    envelope,
-                    &event,
-                    super::channel_commands::Command::ChooseFirst,
-                    IgnoreReason::ModelNotChosen,
-                    now_ms,
-                );
-            }
 
-            let mut ingress = ConversationIngress::from_channel(envelope, &route);
+            let who = super::channel_commands::Who {
+                account_id: &account.account_id,
+                sender_id: &envelope.sender.sender_id,
+            };
+            // The sender's own `/model` pick rides along to the freeze. The
+            // recipe file is the machine's default and stays it.
+            let mut ingress =
+                ConversationIngress::from_channel(envelope, &route).with_model_override(
+                    super::channel_commands::sender_model(store, who.account_id, who.sender_id)?,
+                );
             if depth > 0 {
                 ingress = ingress.with_automation(depth);
             }
@@ -380,6 +370,25 @@ pub(crate) fn accept_channel_envelope_with(
                 Ok(execution) => ingress.with_execution(execution),
                 Err(error) => return refuse(store, &event, &error, now_ms),
             };
+
+            // A person's first message is answered like any other — and, once,
+            // told which model is answering and how to change it. Queued under
+            // its own key so a redelivery of this event sends it once; queued
+            // *after* the flag flips (see `first_contact`) so a crash between
+            // loses a courtesy line rather than repeating it; and never allowed
+            // to cost the message its run.
+            if super::channel_commands::first_contact(store, who.account_id, who.sender_id)? {
+                let notice = outbound_row(
+                    &account,
+                    envelope,
+                    super::channel_commands::first_run_notice(store, who, Some(&route)),
+                    format!("notice-{}", envelope.provider_event_id),
+                    0,
+                    None,
+                    now_ms,
+                )?;
+                let _ = store.enqueue_channel_message(&notice);
+            }
 
             match store.accept_channel_envelope(
                 &event,
@@ -1302,6 +1311,17 @@ mod tests {
     const NOW: i64 = 1_700_000_000_000;
 
     fn store_with_account(policy: ChannelAccessPolicy) -> DaemonStore {
+        let mut store = store_with_account_untold(policy);
+        // These tests are about the acceptance path, not the first-contact
+        // notice: the machine is set up as one whose people were already told.
+        // `a_first_message_runs_and_is_told_which_model_answers` covers the
+        // other side.
+        super::super::channel_commands::suppress_first_run_notice(&mut store).expect("told");
+        store
+    }
+
+    /// The same account on a machine that has introduced itself to nobody yet.
+    fn store_with_account_untold(policy: ChannelAccessPolicy) -> DaemonStore {
         let mut store = DaemonStore::open_in_memory().expect("open");
         store
             .upsert_channel_account(&ChannelAccountRecord {
@@ -1327,11 +1347,6 @@ mod tests {
                 updated_at_ms: NOW,
             })
             .expect("route");
-        // These tests are about the acceptance path, not the first-run model
-        // gate: the machine is set up as one where a model was already chosen.
-        // `a_first_message_before_any_pick_shows_the_menu` covers the other
-        // side.
-        super::super::channel_commands::mark_model_chosen(&mut store).expect("model chosen");
         store
     }
 
@@ -1408,16 +1423,6 @@ mod tests {
         )?;
         store.enqueue_channel_message(&row)?;
         Ok(())
-    }
-
-    /// Put the machine back in the state it is in before anyone has chosen a
-    /// model, armed against the model this store's route actually names — the
-    /// same string the acceptance path computes, so the gate is pinned shut
-    /// whatever this machine has installed.
-    fn arm_gate(store: &mut DaemonStore) {
-        let routes = store.channel_routes().expect("routes");
-        let target = super::super::channel_commands::routed_target(routes.first());
-        super::super::channel_commands::arm_model_gate(store, target.as_deref()).expect("arm");
     }
 
     fn ignored_reason(accepted: &ChannelAcceptance) -> IgnoreReason {
@@ -1756,54 +1761,129 @@ mod tests {
         assert!(store.recent_ingress_turns(10).unwrap().is_empty());
     }
 
-    /// The first message on a machine where nobody has chosen a model is met
-    /// with the menu, and is not run: the gate is the whole point of asking.
+    /// Nobody is asked to pick a model before being answered. The first message
+    /// runs on the default, and the person is told — once, in a line of its own
+    /// — which model that is and that `/model` changes it.
     #[test]
-    fn a_first_message_before_any_choice_is_answered_with_the_menu() {
-        let mut store = store_with_account(open_policy());
-        arm_gate(&mut store);
+    fn a_first_message_runs_and_is_told_which_model_answers() {
+        let mut store = store_with_account_untold(open_policy());
 
         let planned = plan(&mut store, &dm("what is the weather", "1"));
 
-        assert_eq!(ignored_reason(&planned), IgnoreReason::ModelNotChosen);
-        assert!(store.recent_ingress_turns(10).unwrap().is_empty());
-        let queued = store.claim_outbox_batch(NOW, 10).unwrap();
-        let payload: OutboxPayload = serde_json::from_str(&queued[0].payload_json).unwrap();
         assert!(
-            payload.message.text.contains("Pick a model first"),
+            matches!(planned, ChannelAcceptance::Run { .. }),
+            "{planned:?}"
+        );
+        assert_eq!(store.recent_ingress_turns(10).unwrap().len(), 1);
+        let queued = store.claim_outbox_batch(NOW, 10).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].idempotency_key, "notice-1");
+        let payload: OutboxPayload = serde_json::from_str(&queued[0].payload_json).unwrap();
+        // The line names the routed task and how to change the model. (Which
+        // model it names is `channel_commands`' business; this fixture has no
+        // recipe file to read it from.)
+        assert!(payload.message.text.contains("'chat'"), "{payload:?}");
+        assert!(payload.message.text.contains("/model"), "{payload:?}");
+        assert!(
+            !payload.message.text.contains("Pick a model"),
             "{payload:?}"
         );
+        assert!(
+            !payload.message.text.contains("Models on this machine"),
+            "the notice must not carry the menu: {payload:?}"
+        );
     }
 
-    /// And once a model is chosen, the same conversation runs normally.
+    /// Once per person, not per message and not per machine: the same sender's
+    /// second message adds no notice, another sender's first does.
     #[test]
-    fn a_message_after_the_choice_runs() {
-        let mut store = store_with_account(open_policy());
-        arm_gate(&mut store);
-        assert_eq!(
-            ignored_reason(&plan(&mut store, &dm("hello", "1"))),
-            IgnoreReason::ModelNotChosen
-        );
+    fn the_notice_goes_out_once_per_sender() {
+        let mut store = store_with_account_untold(open_policy());
+        plan(&mut store, &dm("hello", "1"));
+        plan(&mut store, &dm("hello again", "2"));
+        let mut other = dm("hi from someone else", "3");
+        other.sender = ChannelSender::new("user-4");
+        plan(&mut store, &other);
 
-        super::super::channel_commands::mark_model_chosen(&mut store).expect("chosen");
+        let keys: Vec<String> = store
+            .claim_outbox_batch(NOW, 10)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.idempotency_key)
+            .collect();
+        assert_eq!(keys, vec!["notice-1", "notice-3"]);
+    }
 
+    /// A redelivered first message hands back the turn that was frozen for it
+    /// — the pending pass re-decides an accepted, unsubmitted event on every
+    /// pass — and the notice is not queued again: the flag says it went, and
+    /// the outbox key would refuse it anyway.
+    #[test]
+    fn a_redelivered_first_message_does_not_repeat_the_notice() {
+        let mut store = store_with_account_untold(open_policy());
+        plan(&mut store, &dm("hello", "1"));
         assert!(matches!(
-            plan(&mut store, &dm("hello", "2")),
+            plan(&mut store, &dm("hello", "1")),
             ChannelAcceptance::Run { .. }
         ));
+        assert_eq!(store.recent_ingress_turns(10).unwrap().len(), 1);
+        assert_eq!(store.claim_outbox_batch(NOW, 10).unwrap().len(), 1);
     }
 
-    /// A gated machine still answers its own commands: `/model` is how the
-    /// person gets past the gate, so it cannot be behind it.
+    /// A command from somebody new is answered as a command, and is not the
+    /// moment for the notice: `/model` already says what the notice would.
     #[test]
-    fn a_command_is_answered_even_while_the_gate_is_shut() {
-        let mut store = store_with_account(open_policy());
-        arm_gate(&mut store);
+    fn a_command_from_a_new_sender_is_answered_without_the_notice() {
+        let mut store = store_with_account_untold(open_policy());
 
         assert_eq!(
             ignored_reason(&plan(&mut store, &dm("/model", "1"))),
             IgnoreReason::Command
         );
+        let queued = store.claim_outbox_batch(NOW, 10).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].idempotency_key, "command-1");
+
+        // `/start` already named the model, so the message that follows is
+        // answered without saying it again.
+        plan(&mut store, &dm("/start", "2"));
+        assert!(matches!(
+            plan(&mut store, &dm("hello", "3")),
+            ChannelAcceptance::Run { .. }
+        ));
+        let keys: Vec<String> = store
+            .claim_outbox_batch(NOW, 10)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.idempotency_key)
+            .collect();
+        assert_eq!(keys, vec!["command-2"]);
+    }
+
+    /// One person's `/model` pick reaches their own turns and nobody else's:
+    /// the frozen recipe is what runs, and the route's default is untouched.
+    #[test]
+    fn a_senders_pick_rides_along_on_their_turns_only() {
+        let mut store = store_with_account(open_policy());
+        let chosen = little_monkey_lib::recipes::RecipeTarget {
+            managed_model: Some("llama".to_string()),
+            ..Default::default()
+        };
+        super::super::channel_commands::set_sender_model(&mut store, "acct-1", "user-3", &chosen)
+            .expect("pick");
+
+        let ChannelAcceptance::Run { ingress, .. } = plan(&mut store, &dm("hello", "1")) else {
+            panic!("expected a run");
+        };
+        assert_eq!(ingress.model_override, Some(chosen));
+        assert_eq!(ingress.target, RouteTarget::new("chat"));
+
+        let mut other = dm("hello", "2");
+        other.sender = ChannelSender::new("user-4");
+        let ChannelAcceptance::Run { ingress, .. } = plan(&mut store, &other) else {
+            panic!("expected a run");
+        };
+        assert_eq!(ingress.model_override, None);
     }
 
     /// The same redelivery rule every other decision follows: the provider
@@ -2409,11 +2489,9 @@ mod tests {
                 updated_at_ms: NOW,
             })
             .expect("route");
-        // These tests are about the acceptance path, not the first-run model
-        // gate: the machine is set up as one where a model was already chosen.
-        // `a_first_message_before_any_pick_shows_the_menu` covers the other
-        // side.
-        super::super::channel_commands::mark_model_chosen(&mut store).expect("model chosen");
+        // These tests are about the acceptance path, not the first-contact
+        // notice: the machine is set up as one whose people were already told.
+        super::super::channel_commands::suppress_first_run_notice(&mut store).expect("told");
         store
     }
 

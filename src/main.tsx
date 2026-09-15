@@ -66,6 +66,10 @@ if (!import.meta.env.DEV) {
 const isCompanionOverlay = new URLSearchParams(window.location.search).get("overlay") === "1";
 const localeReady = loadLocaleTranslations(useLocaleStore.getState().locale);
 const isFullProductE2e = !isCompanionOverlay && import.meta.env.VITE_COMPUTER_USE_FULL_PRODUCT_E2E === "1";
+// The realtime-voice acceptance run needs a hydrated session store and a live
+// microphone, so unlike the product golden above it starts after hydration —
+// see the `isRealtimeAcceptance` block further down.
+const isRealtimeAcceptance = !isCompanionOverlay && import.meta.env.VITE_LITTLE_MONKEY_REALTIME_ACCEPTANCE === "1";
 
 // The product golden is itself the boot-time health check. Start it as soon as
 // the webview module loads rather than making it wait behind optional store
@@ -107,6 +111,10 @@ if (isCompanionOverlay) {
   const preselectedSessionId = new URLSearchParams(window.location.search).get("session");
   if (preselectedSessionId) {
     useSessionStore.getState().switchSession(preselectedSessionId);
+  }
+  if (isRealtimeAcceptance) {
+    void import("./lib/realtimeAcceptance")
+      .then(({ reportRealtimeAcceptanceFromEnvironment }) => reportRealtimeAcceptanceFromEnvironment());
   }
 
   // Marketplace update policy belongs to the application lifecycle, not to

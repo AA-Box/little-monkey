@@ -99,10 +99,10 @@ pub(crate) fn seed_account_and_route(store: &mut DaemonStore, account_id: &str, 
             updated_at_ms: NOW,
         })
         .expect("route");
-    // A machine whose model was already chosen — the steady state. The
-    // first-run gate is exercised in `channel_commands` and in
-    // `channel_ingress`, not by every provider's path through here.
-    super::channel_commands::mark_model_chosen(store).expect("model chosen");
+    // A machine whose people were already told which model answers — the
+    // steady state. The first-contact notice is exercised in `channel_commands`
+    // and `channel_ingress`, not by every provider's path through here.
+    super::channel_commands::suppress_first_run_notice(store).expect("told");
 }
 
 fn account_record(account_id: &str, kind: ChannelKind) -> ChannelAccountRecord {

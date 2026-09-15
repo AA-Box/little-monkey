@@ -16,6 +16,7 @@ import { usePromptStore, type PromptEntry } from '../store/promptStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useVerifyStore } from '../store/verifyStore';
 import { usePermissionStore, type PermissionMode } from '../store/permissionStore';
+import { markMemoriesUsed } from './memoryStudio';
 
 /** A connected MCP server's label + `initialize`-result instructions —
  * mirrors the subset of `McpServerInfo` (mcpStore.ts) that
@@ -370,6 +371,17 @@ export function currentSystemPrompt(
   const roots = useWorkspaceStore.getState().roots;
   const osLabel = detectOsLabel(typeof navigator !== 'undefined' ? navigator.platform : '');
   const { rules, facts } = useRulesStore.getState();
+  // `facts` is exactly what `memory_list`/`list_impl` decided may reach a
+  // prompt, already ordered (pinned first) — this is the one place all four
+  // desktop prompt callers (agentLoop, crewRunner, compareRunner,
+  // compareLabRunner) funnel through, so it is where "a prompt was built
+  // from these memories" is recorded. Deliberately not filtered or
+  // reordered here: `list_impl` is the single truth. Cannot throw — see
+  // `markMemoriesUsed`'s doc comment.
+  // `facts ?? []`: this must never throw, and several suites stub
+  // `useRulesStore` with a partial state that omits `facts` entirely
+  // (`buildSystemPrompt` already defaults it the same way).
+  markMemoriesUsed((facts ?? []).map((fact) => fact.id));
   const mcpServers: McpServerPromptInfo[] = useMcpStore
     .getState()
     .servers.filter((server) => server.status === 'connected' && !!server.instructions?.trim())

@@ -344,9 +344,6 @@ pub enum IgnoreReason {
     /// `daemon::channel_commands`. Recorded as ignored because no turn ran,
     /// with its own reason so a listing does not read it as a message dropped.
     Command,
-    /// The first message on a machine where nobody has chosen a model yet. The
-    /// sender was shown the menu instead; the message itself never ran.
-    ModelNotChosen,
 }
 
 impl IgnoreReason {
@@ -362,7 +359,6 @@ impl IgnoreReason {
             IgnoreReason::EmptyMessage => "empty_message",
             IgnoreReason::ReplyDepthExceeded => "reply_depth_exceeded",
             IgnoreReason::Command => "command",
-            IgnoreReason::ModelNotChosen => "model_not_chosen",
         }
     }
 }

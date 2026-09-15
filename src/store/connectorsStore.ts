@@ -1,15 +1,85 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { isTauri } from "@tauri-apps/api/core";
 import { errorMessage } from "../lib/errors";
+import { type McpOAuthPhase } from "./mcpStore";
 
 /**
  * Mirrors the Rust `ConnectorProvider` enum (src-tauri/src/connectors.rs)
  * exactly — `#[serde(rename_all = "snake_case")]`, so each variant is its
- * lowercase string on the wire. `jira` covers Jira and Confluence (same
- * Atlassian API-token + email scheme); `s3` covers S3 and R2 (same
- * access-key/secret-key scheme).
+ * lowercase string on the wire. Seventeen providers across five credential
+ * schemes: `github` rides the `gh` CLI; `slack`/`notion`/`jira` take a pasted
+ * token (`jira` covers Jira and Confluence on the same Atlassian API-token +
+ * email scheme); `s3` covers S3 and R2 with access keys; `extension` is
+ * supplied by a sandboxed executable extension and holds no credential here;
+ * and the remaining eleven connect over authorization-code OAuth against an
+ * app the user registers themselves (see `connector_oauth.rs`).
  */
-export type ConnectorProvider = "github" | "slack" | "notion" | "jira" | "s3";
+export type ConnectorProvider =
+  | "github"
+  | "slack"
+  | "notion"
+  | "jira"
+  | "s3"
+  | "extension"
+  | "google_drive"
+  | "microsoft_graph"
+  | "linear"
+  | "asana"
+  | "dropbox"
+  | "box"
+  | "airtable"
+  | "zendesk"
+  | "hubspot"
+  | "discord"
+  | "gitlab";
+
+/** The eleven providers `connectors_oauth_connect` accepts. */
+export type ConnectorOAuthProvider = Exclude<
+  ConnectorProvider,
+  "github" | "slack" | "notion" | "jira" | "s3" | "extension"
+>;
+
+/** Mirrors the phases `connector_oauth.rs::emit_progress` streams on
+ * `connector-oauth://status`. No `discovering` — endpoints come from a static
+ * table, so there is nothing to discover; `verifying` is the live read-only
+ * identity call that runs before the account is saved. */
+export type ConnectorOAuthPhase = Exclude<McpOAuthPhase, "discovering"> | "verifying";
+
+/** The phases the backend only ever emits as the last word on one attempt.
+ * `oauthConnect`'s catch checks against these so a rejection arriving after
+ * the event cannot overwrite the more specific reason with a generic
+ * `error` — a user cancellation would otherwise render as a red "Failed". */
+export const CONNECTOR_OAUTH_TERMINAL: ConnectorOAuthPhase[] = [
+  "connected",
+  "error",
+  "cancelled",
+  "needs_client_id",
+];
+
+export interface ConnectorOAuthStatus {
+  phase: ConnectorOAuthPhase;
+  error: string | null;
+}
+
+/** Payload of the `connector-oauth://status` Tauri event — a third,
+ * non-colliding event name alongside `mcp-oauth://status` and
+ * `hosted-oauth://status`, keyed by provider rather than by server id. */
+interface ConnectorOAuthStatusEvent {
+  provider: ConnectorProvider;
+  phase: Exclude<ConnectorOAuthPhase, "idle">;
+  error: string | null;
+}
+
+export interface OAuthConnectParams {
+  provider: ConnectorOAuthProvider;
+  label: string;
+  /** GitLab/Zendesk instance host, or a Microsoft tenant. */
+  host?: string;
+  clientId?: string;
+  clientSecret?: string;
+}
 
 /**
  * Mirrors the Rust `ConnectorAccount` struct exactly — plain snake_case
@@ -75,6 +145,20 @@ export interface ConnectorsStore {
   remove: (id: string) => Promise<void>;
   reverify: (id: string) => Promise<ConnectorAccount>;
   exportAudit: () => Promise<ConnectorAuditEntry[]>;
+  /** Live progress of an in-flight/last `oauthConnect`, keyed by provider —
+   * updated by `connector-oauth://status` events. */
+  oauthStatus: Partial<Record<ConnectorProvider, ConnectorOAuthStatus>>;
+  /** The loopback redirect URI to register with `provider`. Stable, needs no
+   * network call and no saved credential, so the card shows it before
+   * anything is pasted. */
+  oauthRedirectUri: (provider: ConnectorOAuthProvider) => Promise<string>;
+  /** Runs the full authorization-code (+ PKCE, where the provider supports
+   * it) connect: opens the system browser, awaits the loopback redirect,
+   * exchanges the code, and proves the account with one live read-only
+   * identity call before it is saved. Resolves with the saved account. */
+  oauthConnect: (params: OAuthConnectParams) => Promise<ConnectorAccount>;
+  /** Cancels an in-flight `oauthConnect`. A no-op if none is running. */
+  oauthCancel: (provider: ConnectorOAuthProvider) => Promise<void>;
 }
 
 // Module-scoped (not store state) since it's purely an internal sequencing
@@ -155,4 +239,61 @@ export const useConnectorsStore = create<ConnectorsStore>((set, get) => ({
   },
 
   exportAudit: () => invoke<ConnectorAuditEntry[]>("connectors_export_audit"),
+
+  oauthStatus: {},
+
+  // The Rust commands use `rename_all = "snake_case"`, so these payload keys
+  // are `client_id`/`client_secret`, not camelCase. `clientId`/`clientSecret`/
+  // `host` cross the invoke boundary only — never assigned into store state.
+  oauthRedirectUri: (provider) =>
+    invoke<string>("connectors_oauth_redirect_uri", { provider }),
+
+  oauthConnect: async ({ provider, label, host, clientId, clientSecret }) => {
+    set((state) => ({
+      oauthStatus: { ...state.oauthStatus, [provider]: { phase: "opening_browser", error: null } },
+    }));
+    let account: ConnectorAccount;
+    try {
+      account = await invoke<ConnectorAccount>("connectors_oauth_connect", {
+        provider,
+        label,
+        host: host ?? null,
+        client_id: clientId ?? null,
+        client_secret: clientSecret ?? null,
+      });
+    } catch (err) {
+      // The backend emits a terminal phase for every failure it reaches, and
+      // that phase is the better one to show — "cancelled" rather than
+      // "error", or `needs_client_id` with its own copy. Only an invoke that
+      // rejects before the command got that far (bad payload, a panic) leaves
+      // the pill mid-flight, and only that case is seeded here.
+      const message = errorMessage(err);
+      const reached = get().oauthStatus[provider]?.phase;
+      if (reached === undefined || !CONNECTOR_OAUTH_TERMINAL.includes(reached)) {
+        set((state) => ({
+          oauthStatus: { ...state.oauthStatus, [provider]: { phase: "error", error: message } },
+        }));
+      }
+      throw err;
+    }
+    await get().refresh();
+    return account;
+  },
+
+  oauthCancel: async (provider) => {
+    await invoke("connectors_oauth_cancel", { provider });
+  },
 }));
+
+// Tauri-shell only: in plain-browser dev `listen` itself throws. Same
+// registration idiom as `mcpStore.ts`'s `mcp-oauth://status` handler.
+if (isTauri()) {
+  void listen<ConnectorOAuthStatusEvent>("connector-oauth://status", (event) => {
+    const { provider, phase, error } = event.payload;
+    useConnectorsStore.setState((state) => ({
+      oauthStatus: { ...state.oauthStatus, [provider]: { phase, error } },
+    }));
+  }).catch((error) => {
+    console.error("Failed to listen for connector-oauth://status events", error);
+  });
+}

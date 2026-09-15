@@ -1152,7 +1152,8 @@ pub(crate) mod tests {
         assert_eq!(
             exit.status,
             crate::process_table::ExitStatus::LimitExceeded,
-            "{result:?}{}", lookup_context()
+            "{result:?}{}",
+            lookup_context()
         );
         let breach = exit.breach.expect("a limit kill carries its typed breach");
         assert_eq!(breach.limit, ProcessLimitKind::Wall.as_str());
@@ -1202,7 +1203,12 @@ pub(crate) mod tests {
 
         let row = projector.only(ProcessKind::VerifyCommand);
         let exit = row.exit.expect("an exited row carries its exit");
-        assert_eq!(exit.status, crate::process_table::ExitStatus::Cancelled, "{result:?}{}", lookup_context());
+        assert_eq!(
+            exit.status,
+            crate::process_table::ExitStatus::Cancelled,
+            "{result:?}{}",
+            lookup_context()
+        );
         assert!(exit.breach.is_none(), "a Stop is not a resource kill");
 
         let _ = std::fs::remove_dir_all(&cwd);
@@ -1440,7 +1446,11 @@ pub(crate) mod tests {
 
         assert!(!result.timed_out, "{result:?}{}", lookup_context());
         assert!(result.code.is_none(), "{result:?}{}", lookup_context());
-        assert!(result.stderr.contains("cancelled"), "{result:?}{}", lookup_context());
+        assert!(
+            result.stderr.contains("cancelled"),
+            "{result:?}{}",
+            lookup_context()
+        );
         // Returned promptly after the ~100ms cancel fired, not the 30s sleep.
         assert!(started.elapsed() < Duration::from_secs(10));
 

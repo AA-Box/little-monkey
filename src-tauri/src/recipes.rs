@@ -1925,7 +1925,12 @@ fn replace_target_json(raw: &str, target: &RecipeTarget) -> Result<String, Strin
         .ok_or("This recipe is not a JSON object, so it has no `target` to change.")?;
     let fields = target_fields(target)
         .into_iter()
-        .map(|(key, value)| (key.to_string(), serde_json::Value::String(value.to_string())))
+        .map(|(key, value)| {
+            (
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            )
+        })
         .collect::<serde_json::Map<_, _>>();
     // Replaced wholesale, never merged: a provider target left behind next to
     // a new `ollama` would be two targets at once, which the XOR refuses.
@@ -2062,8 +2067,7 @@ pub fn recipes_set_target(
 ) -> Result<Recipe, String> {
     let workspace_root = crate::workspace::primary_root_canon(state.inner()).ok();
     let roots = app_paths::ensure_agent_config_roots()?.ordered();
-    let (recipe, _path) =
-        set_recipe_target(&name, workspace_root.as_deref(), &roots, &target)?;
+    let (recipe, _path) = set_recipe_target(&name, workspace_root.as_deref(), &roots, &target)?;
     let _ = app.emit(RECIPES_CHANGED_EVENT, window.label());
     Ok(recipe)
 }
@@ -2713,12 +2717,21 @@ params:
             ..Default::default()
         };
         let out = replace_target_block(raw, &target).unwrap();
-        assert!(out.starts_with("# hand-written, keep me\nversion: 1\n"), "{out}");
-        assert!(out.contains("target:\n  ollama: \"qwen3.8:27b-mlx\"\n"), "{out}");
+        assert!(
+            out.starts_with("# hand-written, keep me\nversion: 1\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("target:\n  ollama: \"qwen3.8:27b-mlx\"\n"),
+            "{out}"
+        );
         assert!(!out.contains("openrouter"), "{out}");
         assert!(!out.contains("aion-labs"), "{out}");
         // Everything after the block is untouched, block scalar and all.
-        assert!(out.ends_with("permission_mode: plan\nsystem: |\n  Answer briefly.\n"), "{out}");
+        assert!(
+            out.ends_with("permission_mode: plan\nsystem: |\n  Answer briefly.\n"),
+            "{out}"
+        );
     }
 
     /// The replacement has to parse as the recipe it claims to be, or the swap
@@ -2727,8 +2740,14 @@ params:
     fn a_swapped_target_still_parses_as_a_recipe() {
         let raw = "version: 1\nname: \"channel-chat\"\ntarget:\n  ollama: \"qwen2.5:7b\"\npermission_mode: plan\nprompt: |\n  {{message}}\nparams:\n  \"message\": \"\"\n";
         for target in [
-            RecipeTarget { ollama: Some("qwen3.8:27b-mlx".into()), ..Default::default() },
-            RecipeTarget { managed_model: Some("Qwen2.5-7B-Instruct".into()), ..Default::default() },
+            RecipeTarget {
+                ollama: Some("qwen3.8:27b-mlx".into()),
+                ..Default::default()
+            },
+            RecipeTarget {
+                managed_model: Some("Qwen2.5-7B-Instruct".into()),
+                ..Default::default()
+            },
             RecipeTarget {
                 provider: Some("openrouter".into()),
                 model: Some("anthropic/claude-sonnet".into()),
@@ -2749,7 +2768,10 @@ params:
         let raw = "version: 1\nname: \"t\"\ntarget:\n  provider: \"openrouter\"\n  model: \"a/b\"\npermission_mode: plan\nprompt: \"hi\"\n";
         let out = replace_target_block(
             raw,
-            &RecipeTarget { ollama: Some("qwen2.5:7b".into()), ..Default::default() },
+            &RecipeTarget {
+                ollama: Some("qwen2.5:7b".into()),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(out.matches("model:").count(), 0, "{out}");
@@ -2774,7 +2796,9 @@ params:
         )
         .unwrap();
         assert!(
-            out.contains("\n\n# Do not remove - explanation for permission mode\npermission_mode: plan\n"),
+            out.contains(
+                "\n\n# Do not remove - explanation for permission mode\npermission_mode: plan\n"
+            ),
             "{out}"
         );
         assert!(!out.contains("qwen3:8b"), "{out}");
@@ -2913,7 +2937,10 @@ params:
         let parsed = parse_recipe(&out, "yml").unwrap();
         assert_eq!(parsed.target.ollama.as_deref(), Some("new"));
         // The block scalar that merely contains the word survives verbatim.
-        assert!(out.contains("system: |\n  target:\n    not a key\n"), "{out}");
+        assert!(
+            out.contains("system: |\n  target:\n    not a key\n"),
+            "{out}"
+        );
     }
 
     /// A file with no `target:` line of its own is refused rather than guessed
@@ -2923,7 +2950,10 @@ params:
     fn a_recipe_without_a_target_block_is_refused() {
         let error = replace_target_block(
             "version: 1\nname: \"t\"\nprompt: \"hi\"\n",
-            &RecipeTarget { ollama: Some("x".into()), ..Default::default() },
+            &RecipeTarget {
+                ollama: Some("x".into()),
+                ..Default::default()
+            },
         )
         .unwrap_err();
         assert!(error.contains("no top-level `target:` key"), "{error}");

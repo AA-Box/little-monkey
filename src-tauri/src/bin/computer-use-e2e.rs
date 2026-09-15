@@ -749,9 +749,16 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
             .iter()
             .any(|element| element.label == "Disabled button" && !element.enabled);
         if !secure || !disabled {
-            return Err(
-                "production provider did not expose secure and disabled controls".to_string(),
-            );
+            return Err(format!(
+                "production provider did not expose secure and disabled controls: \
+                 window={:?} secure={secure} disabled={disabled} labels={:?}",
+                first.target.window_title,
+                first
+                    .elements
+                    .iter()
+                    .map(|element| element.label.clone())
+                    .collect::<Vec<_>>()
+            ));
         }
         let model_trace =
             model_facing_golden_flow(&state, &session, &target, screenshot_path, &profile_value)?;

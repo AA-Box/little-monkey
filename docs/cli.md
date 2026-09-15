@@ -74,6 +74,13 @@ monkey profiles current [--json]
 monkey stacks list | reindex <name>
 monkey stacks embed-server start --model-path <embedding.gguf> | status | stop
 
+monkey memory list [--all]
+monkey memory pin <id> | unpin <id>
+monkey memory expire <id> --at <YYYY-MM-DD|RFC3339> | expire <id> --clear
+monkey memory merge <id> <id> [<id> ...] [--text "the combined memory"]
+monkey memory unmerge <id>
+monkey memory purge
+
 monkey task list | validate <recipe-file>
 monkey task run <name-or-path> [--param key=value ...] [--json]
 monkey task schedule <name-or-path> --cron "<expr>"
@@ -124,6 +131,11 @@ monkey extensions publish <dir> --snapshot <index.json> --registry-root <dir> --
 
 monkey providers set-key <id>    # key arrives on stdin, never in a process listing
 
+monkey connectors list [--json]           # id, provider, label, identity, last verification
+monkey connectors reverify <id> [--json]  # re-runs the live check; refreshes an OAuth token first
+monkey connectors remove <id>             # best-effort revoke where the provider publishes an endpoint, then deletes
+# Connecting a new OAuth account is desktop-only: consent opens a system browser.
+
 monkey plugins list [--json]
 monkey plugins health [--json]
 monkey security audit [--deep] [--fix] [--json]
@@ -135,6 +147,17 @@ monkey security egress-evidence [--limit <n>] [--json]
 monkey security admission-trail [--limit <n>] [--json]
 
 monkey revisions [--change <change-id>] [--limit <n>]
+
+monkey voice endpoints [--json]                 # local defaults and every paired mic/speaker, with readiness
+monkey voice route get <session-id> [--json]
+monkey voice route set <session-id> --input <endpoint> --output <endpoint> [--engine pipeline|realtime] [--json]
+monkey voice route move <session-id> [--input <endpoint>] [--output <endpoint>] [--json]
+monkey voice route events <session-id> [--after <event-id>] [--limit <n>] [--json]
+monkey voice route stop <session-id> [--json]
+# Endpoint ids are `local:input:<media-device-id>`, `local:output:<media-device-id>`,
+# `paired:<device-id>:input` and `paired:<device-id>:output`. `route set` records a
+# selection and opens no hardware. `route activate|deactivate|emit` exist for the
+# desktop's own bridge and are hidden from `--help`.
 
 monkey daemon install | status [--json]
 monkey daemon ensure [--json]
@@ -160,8 +183,26 @@ monkey daemon remote push-configure --project-id <id> --service-account <file> [
 monkey daemon remote push-status [--json] | push-disable | push-test <device-id>
 ```
 
+Conversations the daemon holds outside the desktop — a paired phone's chat, a
+messaging conversation the agent is answering — and who may start one:
+
+```sh
+monkey conversations list [--environment remote_control|channel|channel:<provider>] [--json]
+monkey conversations show --environment <env> --id <id> [--json]
+monkey conversations delete --environment <env> --id <id> [--forget] [--json]   # erases it here; --forget only drops the row
+monkey channels senders <account-id> [--json]                        # waiting, approved and blocked, with names and each one's model
+monkey channels approve <account-id> <sender-id>
+monkey channels block <account-id> <sender-id>                       # also how an approved sender's access is revoked
+monkey channels forget <account-id> <sender-id>                      # their next message meets the pairing challenge again
+```
+
+
 The `device-*`, `voice-*` and `push-*` commands are documented in
-[Paired devices](paired-devices.md). The `standards` lifecycle is documented in
+[Paired devices](paired-devices.md); `monkey voice`, which selects *where* one
+conversation listens and speaks, is documented in
+[Voice Everywhere](voice-everywhere.md) — `daemon remote voice-*` records a room
+from a device, and `voice route` chooses the endpoints of a Talk conversation,
+which are different things sharing a word. The `standards` lifecycle is documented in
 [Standards Studio](standards-studio.md) — the CLI reads and writes the same
 `.little-monkey/standards/index.json` document as the desktop Studio. The
 `extensions` developer loop is documented in
