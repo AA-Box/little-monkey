@@ -252,6 +252,46 @@ function raise(message: string): never {
   throw new Error(message);
 }
 
+/**
+ * The backend's own budget for a catalog sync, plus room for the adoption it
+ * does after the fetch.
+ *
+ * The button is disabled while a sync runs, so a call that never settles takes
+ * the only way to retry with it: the panel then sits on a spinner with no
+ * notice, and every later click is silently swallowed. That is what a sync
+ * starved by a busy main thread looked like — indistinguishable, from the
+ * outside, from a button that does nothing. Failing loudly keeps the retry.
+ */
+const CATALOG_SYNC_DEADLINE_MS = 45_000;
+
+/** Rejects if `work` has not settled within `ms`. */
+export async function withDeadline<T>(
+  work: Promise<T>,
+  ms: number = CATALOG_SYNC_DEADLINE_MS,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              new Error(
+                `The catalog check did not finish within ${Math.round(
+                  ms / 1000,
+                )} seconds. The versions already known to this machine are unchanged — try again.`,
+              ),
+            ),
+          ms,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export function RuntimeHubComponents() {
   const installedComponents = useRuntimeHubStore((state) => state.installedComponents);
   const componentRegistry = useRuntimeHubStore((state) => state.componentRegistry);
@@ -295,7 +335,7 @@ export function RuntimeHubComponents() {
     setCatalogNotice(null);
     setSyncing(true);
     try {
-      await syncComponentCatalog();
+      await withDeadline(syncComponentCatalog());
     } catch (reason) {
       // Deliberately a notice rather than an error: the registry on disk is
       // what the list is rendered from, so an unreachable catalog costs the
