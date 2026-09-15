@@ -605,7 +605,11 @@ jobs:
   # interactive Windows desktop and the real WPF/UIAutomation fixture.
   remote-windows-computer-use-e2e:
     runs-on: windows-latest
-    timeout-minutes: 30
+    # A cold Windows build plus the real UIA provider, whose CI bound is now
+    # three minutes per call rather than 45 seconds — a run that pays that bound
+    # once must not be cut off with the acceptance half-finished. The last run
+    # spent 25 of its 30 minutes compiling and was cancelled during cache upload.
+    timeout-minutes: 45
     env:
       COMPUTER_USE_REMOTE_WINDOWS_E2E: 1
       CARGO_PROFILE_TEST_DEBUG: 0

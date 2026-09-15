@@ -49,6 +49,10 @@ export const ARTIFACT_CAPABILITIES = new Set([
 // Capabilities that need the page in front of the user to work honestly. On a
 // phone a backgrounded page is suspended: the camera yields nothing and the
 // microphone stops, so claiming readiness would be a lie that costs a run.
+//
+// `audio_playback` belongs to the same family but is deliberately not here: it
+// is foreground-only on a phone and not on a desktop, so its case below decides
+// it with the platform in hand rather than for every companion alike.
 const FOREGROUND_CAPABILITIES = new Set([
   "camera_capture",
   "microphone_capture",
@@ -69,6 +73,9 @@ const FOREGROUND_CAPABILITIES = new Set([
  *   screenShareLive      — an armed display stream is running
  *   audioEnabled         — someone has enabled playback with a gesture
  *   foreground           — the page is visible
+ *   mobile               — this is a phone or tablet browser, where a hidden
+ *                          page is suspended rather than merely throttled;
+ *                          `false` only when the collector could establish it
  */
 export function describeCapability(capability, probe) {
   if (!probe.supported) {
@@ -92,13 +99,33 @@ export function describeCapability(capability, probe) {
         permission: PERMISSION.notRequired,
         readiness: probe.screenShareLive ? READINESS.ready : READINESS.armedRequired,
       };
-    case "audio_playback":
+    case "audio_playback": {
       // No platform has a "may this page make a sound" permission. Autoplay
       // policy is a readiness state, and it clears with a user gesture.
+      if (!probe.audioEnabled) {
+        return { permission: PERMISSION.notRequired, readiness: READINESS.interactionRequired };
+      }
+      // The gesture unlocks playback; it does not survive the page being put
+      // away. A hidden tab's AudioContext is suspended on both mobile
+      // platforms, so a phone that goes on reporting `ready` while backgrounded
+      // is a speaker the operator routes a conversation to and then hears
+      // nothing from — the one failure the desktop selector cannot show,
+      // because from there the endpoint looks fine.
+      //
+      // A desktop tab really does keep playing while hidden, and reporting
+      // foreground_required for it would make a perfectly usable laptop speaker
+      // unroutable for a browser rule that does not apply to it. So the two are
+      // told apart rather than treated alike. A probe that could not say which
+      // it is counts as the phone: the cost of guessing wrong that way is a
+      // route the operator has to re-point, and of guessing wrong the other way
+      // is silence nobody can diagnose.
+      const backgroundPlayback = probe.mobile === false;
       return {
         permission: PERMISSION.notRequired,
-        readiness: probe.audioEnabled ? READINESS.ready : READINESS.interactionRequired,
+        readiness:
+          probe.foreground || backgroundPlayback ? READINESS.ready : READINESS.foregroundRequired,
       };
+    }
     default: {
       const permission = queriedPermission(capability, probe);
       let readiness = READINESS.ready;

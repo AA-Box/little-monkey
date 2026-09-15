@@ -16,3 +16,9 @@
 !/resources/local-whisper/
 /resources/local-whisper/*
 !/resources/local-whisper/README.md
+# Same shape for the wake-word model: the directory and its placeholder README
+# are tracked so `tauri-build` can resolve the packaged resource glob in a
+# checkout where nothing has been staged yet.
+!/resources/local-wake-word/
+/resources/local-wake-word/*
+!/resources/local-wake-word/PLACEHOLDER.md

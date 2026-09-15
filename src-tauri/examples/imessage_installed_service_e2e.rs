@@ -103,7 +103,10 @@ mod macos {
             .len()
             == 0
         {
-            return Err(format!("{} is the zero-byte Tauri sidecar placeholder", binary.display()));
+            return Err(format!(
+                "{} is the zero-byte Tauri sidecar placeholder",
+                binary.display()
+            ));
         }
         let mut command = Command::new(binary);
         command
@@ -251,7 +254,9 @@ mod macos {
     }
 
     fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
-        stream.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .ok()?;
         let mut received = Vec::new();
         let mut scratch = [0u8; 8192];
         let mut header_end = None;
@@ -303,7 +308,9 @@ mod macos {
     }
 
     fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack.windows(needle.len()).position(|window| window == needle)
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
     }
 
     fn json_response(body: &str) -> String {
@@ -445,7 +452,9 @@ mod macos {
                 ingress_id: row
                     .get(3)
                     .map_err(|error| format!("read ingress id: {error}"))?,
-                job_id: row.get(4).map_err(|error| format!("read job id: {error}"))?,
+                job_id: row
+                    .get(4)
+                    .map_err(|error| format!("read job id: {error}"))?,
             }));
         }
         Ok(None)
@@ -484,7 +493,8 @@ mod macos {
         while Instant::now() < deadline {
             if let Ok(output) = run_cli(Some(profile), &["daemon", "status", "--json"]) {
                 if output.status.success() {
-                    if let Ok(status) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                    if let Ok(status) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                    {
                         last = status.to_string();
                         let running = status
                             .get("service_running")
@@ -506,7 +516,9 @@ mod macos {
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-        Err(format!("installed daemon never reported a fresh resident pid; last status: {last}"))
+        Err(format!(
+            "installed daemon never reported a fresh resident pid; last status: {last}"
+        ))
     }
 
     fn wait_for_account_connected(
@@ -525,7 +537,8 @@ mod macos {
                 .and_then(serde_json::Value::as_array)
                 .and_then(|accounts| {
                     accounts.iter().find(|row| {
-                        row.get("account_id").and_then(serde_json::Value::as_str) == Some(account_id)
+                        row.get("account_id").and_then(serde_json::Value::as_str)
+                            == Some(account_id)
                     })
                 })
             {
@@ -642,7 +655,9 @@ mod macos {
             }
             let helper_path = required(HELPER_ENV)?;
             if !Path::new(&helper_path).is_file() {
-                return Err(format!("{HELPER_ENV} does not name an installed helper file"));
+                return Err(format!(
+                    "{HELPER_ENV} does not name an installed helper file"
+                ));
             }
             Ok(Self {
                 helper_path,

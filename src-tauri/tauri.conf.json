@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Little Monkey",
-  "version": "1.7.1",
+  "version": "1.8.0",
   "identifier": "com.littlemonkey.app",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "pnpm stage:runtime && pnpm codesign:runtime && pnpm stage:runtime:tts && pnpm codesign:runtime:tts && pnpm stage:runtime:sd && pnpm codesign:runtime:sd && pnpm stage:cli && pnpm build",
+    "beforeBuildCommand": "pnpm stage:runtime && pnpm codesign:runtime && pnpm stage:runtime:tts && pnpm codesign:runtime:tts && pnpm stage:runtime:sd && pnpm codesign:runtime:sd && pnpm stage:whisper && pnpm stage:sherpa-runtime && pnpm stage:wake-word && pnpm stage:cli && pnpm build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -61,7 +61,8 @@
     ],
     "resources": [
       "resources/managed-runtime/**/*",
-      "resources/local-whisper/**/*"
+      "resources/local-whisper/**/*",
+      "resources/local-wake-word/**/*"
     ],
     "macOS": {
       "files": {

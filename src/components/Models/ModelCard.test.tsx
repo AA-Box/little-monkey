@@ -8,6 +8,8 @@ vi.mock("../../lib/i18n", () => ({
       ({
         "ModelCard.projectorLabel": "Multimodal projector",
         "ModelCard.projectorMissing": "Projector missing",
+        "ModelCard.mlxRuntimeBadge": "MLX",
+        "ModelCard.addProjectorButton": "Add vision component",
         "ModelCard.visionConfiguredBadge": "Vision configured",
         "ModelCard.visionReadyBadge": "Vision ready",
         "ModelCard.embeddingsUnavailableWithProjector": "Embeddings unavailable with projector",
@@ -130,5 +132,46 @@ describe("ModelCard multimodal state", () => {
 
     expect(markup).toContain("Vision ready");
     expect(markup).not.toContain("Vision configured");
+  });
+});
+
+describe("ModelCard MLX bundle", () => {
+  it("badges an external MLX directory and offers no projector button", () => {
+    const markup = renderToStaticMarkup(
+      <ModelCard
+        model={{
+          id: "external:/weights/Qwen3.8-27B-Uncensored/4-bit",
+          // A directory bundle: the name is not the folder's bare name, and
+          // `file` is the directory itself, with no extension.
+          name: "Qwen3.8-27B-Uncensored (4-bit)",
+          repo: "",
+          file: "4-bit",
+          size_gb: 16.2,
+          tool_calling: false,
+          installed: true,
+          path: "/weights/Qwen3.8-27B-Uncensored/4-bit",
+          is_external: true,
+          kind: "chat",
+          runtime: "mlx",
+          capabilities: { text: true, image_input: true },
+        }}
+        isActive={false}
+        llamaStatus="stopped"
+        onInstall={() => {}}
+        onCancelDownload={() => {}}
+        onDelete={() => {}}
+        onStart={() => {}}
+        onStop={() => {}}
+      />,
+    );
+
+    expect(markup).toContain("MLX");
+    expect(markup).toContain("Vision configured");
+    expect(markup).toContain("Start");
+    // The card has no runtime rule of its own — it renders the projector
+    // button whenever the callback exists, and `ModelManager` is what withholds
+    // it for an MLX bundle. `ModelManager.test.tsx` covers that rule; asserting
+    // the button's absence here would only be asserting that this render
+    // passed no callback.
   });
 });

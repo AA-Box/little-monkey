@@ -485,24 +485,59 @@ fn json_response(status: StatusCode, body: Value) -> Response<ResponseBody> {
 /// the slot to chat.
 #[tauri::command]
 pub async fn mlx_chat_start(
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     m3: tauri::State<'_, crate::m3_commands::M3CommandState>,
     model_path: String,
 ) -> Result<MlxChatStatus, String> {
     let path = std::path::PathBuf::from(&model_path);
-    let provenance = crate::model_sources::load_bundle_provenance(&path)?
-        .ok_or_else(|| format!("{model_path} is not an app-owned model bundle"))?;
-    if provenance.runtime != crate::model_sources::ModelRuntimeKind::Mlx {
-        return Err(format!("{model_path} is not an MLX model"));
-    }
-    crate::model_sources::verify_bundle_for_runtime(&path)?;
+    // Two kinds of path can start here, and which one this is has to be decided
+    // by *where the path is*, not by what happens to be lying in it. A bundle
+    // inside the app's own models directory is described by its provenance
+    // sidecar and verified against it; `mlx_models` mints that bundle's driver
+    // id from `installed_bundles`, which scans only that directory. Anywhere
+    // else — a folder the user picked — the external registry row the picker
+    // wrote is the whole description, and `m3_production` builds the driver
+    // record from that same row.
+    //
+    // Deciding on the sidecar instead would let a copy of a managed bundle
+    // sitting on an external drive take the managed arm and resolve to a driver
+    // id that only exists for the directory it was copied out of: the start
+    // would succeed and the first chat turn would fail with `ModelNotFound`.
+    let managed_root = crate::models::models_dir(&app)?;
+    let is_managed = path
+        .canonicalize()
+        .ok()
+        .zip(managed_root.canonicalize().ok())
+        .is_some_and(|(path, root)| path.starts_with(root));
+    let (model_id, tool_calling, vision) = if is_managed {
+        let provenance = crate::model_sources::load_bundle_provenance(&path)?
+            .ok_or_else(|| format!("{model_path} is not an app-owned model bundle"))?;
+        if provenance.runtime != crate::model_sources::ModelRuntimeKind::Mlx {
+            return Err(format!("{model_path} is not an MLX model"));
+        }
+        crate::model_sources::verify_bundle_for_runtime(&path)?;
+        (
+            provenance.local_dir_name,
+            provenance.tool_calling,
+            provenance.vision,
+        )
+    } else {
+        let entry = crate::models::external_mlx_entry(&app, &path)?
+            .ok_or_else(|| format!("{model_path} is not an app-owned model bundle"))?;
+        (
+            crate::m3_production::external_mlx_model_id(&entry.path),
+            entry.tool_calling,
+            entry.vision,
+        )
+    };
 
     let _owner = m3.mlx_ownership.acquire().await;
     state.generation_engine.stop()?;
-    // A bundle installed since the drivers were last built is not in the MLX
-    // adapter's model map yet, and the driver refuses a model it has not
-    // reconciled. Refreshing here is what makes "install, then start" work
-    // without a restart.
+    // A bundle installed — or a folder added — since the drivers were last
+    // built is not in the MLX adapter's model map yet, and the driver refuses a
+    // model it has not reconciled. Refreshing here is what makes "add, then
+    // start" work without a restart.
     let context = M3OperationContext::default();
     m3.hub
         .refresh_runtimes(&context)
@@ -512,10 +547,10 @@ pub async fn mlx_chat_start(
     start(
         &state.mlx_chat,
         m3.hub.clone(),
-        provenance.local_dir_name.clone(),
+        model_id,
         model_path,
-        provenance.tool_calling,
-        provenance.vision,
+        tool_calling,
+        vision,
     )
     .await
 }

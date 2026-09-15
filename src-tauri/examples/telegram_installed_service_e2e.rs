@@ -55,9 +55,11 @@ fn target_dir() -> PathBuf {
 }
 
 fn cli() -> PathBuf {
-    target_dir()
-        .join("debug")
-        .join(if cfg!(windows) { "monkey-cli.exe" } else { "monkey-cli" })
+    target_dir().join("debug").join(if cfg!(windows) {
+        "monkey-cli.exe"
+    } else {
+        "monkey-cli"
+    })
 }
 
 fn output_text(output: &Output) -> String {
@@ -173,8 +175,12 @@ fn require_cli_stdin(profile: &str, args: &[&str], stdin: &str) -> Result<Output
 fn create_profile() -> Result<String, String> {
     let name = format!("Telegram installed-service E2E {}", unique());
     let output = require_cli(None, &["profiles", "create", &name, "--json"])?;
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("profile JSON was invalid: {error}\n{}", output_text(&output)))?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "profile JSON was invalid: {error}\n{}",
+            output_text(&output)
+        )
+    })?;
     payload
         .get("id")
         .and_then(serde_json::Value::as_str)
@@ -188,8 +194,12 @@ fn add_account(profile: &str) -> Result<String, String> {
         Some(profile),
         &["channels", "add", "telegram", &label, "--json"],
     )?;
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("account JSON was invalid: {error}\n{}", output_text(&output)))?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "account JSON was invalid: {error}\n{}",
+            output_text(&output)
+        )
+    })?;
     payload
         .get("account_id")
         .and_then(serde_json::Value::as_str)
@@ -280,7 +290,9 @@ impl ModelFixture {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
-    stream.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .ok()?;
     let mut received = Vec::new();
     let mut scratch = [0u8; 8192];
     let mut header_end = None;
@@ -332,7 +344,9 @@ fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn json_response(body: &str) -> String {
@@ -577,7 +591,10 @@ fn wait_for_account_connected(
             .and_then(serde_json::Value::as_u64);
         let fresh = last_probe.is_some_and(|value| value >= since_ms);
         if fresh && last_health == "error" {
-            return Err("resident daemon rejected or could not reach the operator-supplied Telegram bot".to_string());
+            return Err(
+                "resident daemon rejected or could not reach the operator-supplied Telegram bot"
+                    .to_string(),
+            );
         }
         if fresh && last_health == "connected" {
             return Ok(());
@@ -641,19 +658,12 @@ fn pending_contains(profile: &str, account_id: &str, sender_id: &str) -> Result<
         .and_then(serde_json::Value::as_array)
         .is_some_and(|pending| {
             pending.iter().any(|sender| {
-                sender
-                    .get("sender_id")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(sender_id)
+                sender.get("sender_id").and_then(serde_json::Value::as_str) == Some(sender_id)
             })
         }))
 }
 
-async fn observe_telegram(
-    token: &str,
-    chat_id: &str,
-    message_id: &str,
-) -> Result<String, String> {
+async fn observe_telegram(token: &str, chat_id: &str, message_id: &str) -> Result<String, String> {
     let message_id = message_id
         .parse::<i64>()
         .map_err(|_| format!("Telegram outbound id {message_id:?} is not numeric"))?;
@@ -661,7 +671,9 @@ async fn observe_telegram(
         .build()
         .map_err(|_| "could not build hardened Telegram observer client".to_string())?;
     let request = client
-        .post(format!("https://api.telegram.org/bot{token}/forwardMessage"))
+        .post(format!(
+            "https://api.telegram.org/bot{token}/forwardMessage"
+        ))
         .json(&serde_json::json!({
             "chat_id": chat_id,
             "from_chat_id": chat_id,
@@ -675,7 +687,8 @@ async fn observe_telegram(
         .json()
         .await
         .map_err(|_| "Telegram forwardMessage returned invalid JSON".to_string())?;
-    if !status.is_success() || payload.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+    if !status.is_success() || payload.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+    {
         return Err(format!(
             "Telegram did not confirm the generated reply through forwardMessage (HTTP {status})"
         ));
@@ -742,7 +755,9 @@ impl LiveConfig {
         let token = std::env::var(TOKEN_ENV)
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| format!("{TOKEN_ENV} is required and must be a token for a bot you own"))?;
+            .ok_or_else(|| {
+                format!("{TOKEN_ENV} is required and must be a token for a bot you own")
+            })?;
         Ok(Self { token })
     }
 }

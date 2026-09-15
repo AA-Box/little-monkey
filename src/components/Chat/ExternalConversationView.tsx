@@ -9,6 +9,7 @@ import {
   useExternalConversationStore,
   type ExternalSelection,
 } from "../../store/externalConversationStore";
+import { useExternalConversationMetaStore } from "../../store/externalConversationMetaStore";
 
 /**
  * A conversation that happened somewhere else, read from what this machine
@@ -43,7 +44,10 @@ export function ExternalConversationView({ selection }: { selection: ExternalSel
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selection.environment, selection.id]);
 
-  const title = conversation?.title?.trim() || selection.id;
+  const ownTitle = useExternalConversationMetaStore(
+    (state) => state.meta[conversationKey(selection)]?.title ?? null,
+  );
+  const title = ownTitle?.trim() || conversation?.title?.trim() || selection.id;
   const environment = environmentLabel(selection.environment);
 
   return (
@@ -64,9 +68,10 @@ export function ExternalConversationView({ selection }: { selection: ExternalSel
           type="button"
           onClick={() => void loadMessages(selection)}
           aria-label={t("ExternalConversation.refresh")}
+          title={t("ExternalConversation.refresh")}
           className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-faint hover:bg-surface-2 hover:text-foreground"
         >
-          <RefreshCw size={14} />
+          <RefreshCw size={14} aria-hidden />
         </button>
       </div>
 
@@ -101,7 +106,9 @@ export function ExternalConversationView({ selection }: { selection: ExternalSel
                   }`}
                 >
                   <span className="whitespace-pre-wrap break-words">{message.text}</span>
-                  <span className="text-[11px] text-faint">
+                  {/* The author is the provider's own string for the sender —
+                      shown, and kept to one line however long they made it. */}
+                  <span className="truncate text-[11px] text-faint">
                     {message.author ? `${message.author} · ` : ""}
                     {formatMessageTimestamp(message.at_ms)}
                   </span>

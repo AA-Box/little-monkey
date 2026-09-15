@@ -38,6 +38,13 @@ pub enum ChannelKind {
     IMessage,
     Irc,
     Sms,
+    /// The operator's own mailbox: IMAP in, SMTP out.
+    Email,
+    /// The operator's own Home Assistant instance.
+    HomeAssistant,
+    /// A chat page the resident daemon serves to a browser itself. There is no
+    /// provider behind it — the "provider" is this machine's own TLS listener.
+    WebChat,
     /// A messaging provider a sandboxed executable extension speaks for.
     ///
     /// One wire string for every such provider, because the persisted string
@@ -66,6 +73,9 @@ impl ChannelKind {
         ChannelKind::IMessage,
         ChannelKind::Irc,
         ChannelKind::Sms,
+        ChannelKind::Email,
+        ChannelKind::HomeAssistant,
+        ChannelKind::WebChat,
         ChannelKind::Extension,
     ];
 
@@ -84,6 +94,9 @@ impl ChannelKind {
             ChannelKind::IMessage => "imessage",
             ChannelKind::Irc => "irc",
             ChannelKind::Sms => "sms",
+            ChannelKind::Email => "email",
+            ChannelKind::HomeAssistant => "home_assistant",
+            ChannelKind::WebChat => "webchat",
             ChannelKind::Extension => "extension",
         }
     }
@@ -112,6 +125,9 @@ impl ChannelKind {
             ChannelKind::IMessage => "iMessage",
             ChannelKind::Irc => "IRC",
             ChannelKind::Sms => "SMS",
+            ChannelKind::Email => "Email",
+            ChannelKind::HomeAssistant => "Home Assistant",
+            ChannelKind::WebChat => "Web chat",
             ChannelKind::Extension => "Extension",
         }
     }
@@ -131,6 +147,15 @@ pub enum InboundTransport {
     Webhook,
     /// A supervised local helper process streams events (Signal, iMessage).
     Helper,
+    /// The daemon serves a page and is posted to on its own TLS listener
+    /// (WebChat).
+    ///
+    /// Unlike [`InboundTransport::Webhook`] there is no provider and no public
+    /// callback URL to expose — the surface is this machine's own, already
+    /// configured listener, so an operator owes it nothing further. Kept
+    /// distinct from `Webhook` precisely so Security Doctor and the setup UI do
+    /// not ask a webhook provider's questions about it.
+    Served,
 }
 
 impl InboundTransport {
@@ -140,6 +165,7 @@ impl InboundTransport {
             InboundTransport::Socket => "socket",
             InboundTransport::Webhook => "webhook",
             InboundTransport::Helper => "helper",
+            InboundTransport::Served => "served",
         }
     }
 }

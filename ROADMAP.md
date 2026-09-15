@@ -204,6 +204,8 @@ Stated so they are not mistaken for missing work:
   or RBAC/SSO plane. Remote access is user-owned infrastructure only.
 - **No Gmail/Outlook inbox integration.** Inbox triage covers Slack, Jira, and
   GitHub read-only.
-- **No Google Drive knowledge connector.**
+- **No Google Drive knowledge connector.** A Google Drive *account* can be
+  connected in Settings → Connectors (identity and scope only); nothing
+  indexes Drive files into Knowledge.
 - **Browser verification stays disposable** — no persistent authenticated
   profiles, file transfer, clipboard, or extensions.

@@ -43,9 +43,11 @@ fn target_dir() -> PathBuf {
 }
 
 fn cli() -> PathBuf {
-    target_dir()
-        .join("debug")
-        .join(if cfg!(windows) { "monkey-cli.exe" } else { "monkey-cli" })
+    target_dir().join("debug").join(if cfg!(windows) {
+        "monkey-cli.exe"
+    } else {
+        "monkey-cli"
+    })
 }
 
 fn nonce() -> u128 {
@@ -82,7 +84,12 @@ fn run_cli_stdin(
         ));
     }
     let size = std::fs::metadata(&binary)
-        .map_err(|error| format!("could not stat prebuilt monkey-cli at {}: {error}", binary.display()))?
+        .map_err(|error| {
+            format!(
+                "could not stat prebuilt monkey-cli at {}: {error}",
+                binary.display()
+            )
+        })?
         .len();
     if size == 0 {
         return Err(format!(
@@ -170,13 +177,22 @@ fn require_cli(profile: Option<&str>, args: &[&str]) -> Result<Output, String> {
 fn create_profile() -> Result<String, String> {
     let name = format!("Channel secure-store E2E {}", nonce());
     let output = require_cli(None, &["profiles", "create", &name, "--json"])?;
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("profile JSON was invalid: {error}\n{}", output_text(&output)))?;
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "profile JSON was invalid: {error}\n{}",
+            output_text(&output)
+        )
+    })?;
     value
         .get("id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| format!("profile JSON had no id: {}", String::from_utf8_lossy(&output.stdout)))
+        .ok_or_else(|| {
+            format!(
+                "profile JSON had no id: {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })
 }
 
 fn add_telegram_account(profile: &str) -> Result<String, String> {
@@ -185,13 +201,22 @@ fn add_telegram_account(profile: &str) -> Result<String, String> {
         Some(profile),
         &["channels", "add", "telegram", &label, "--json"],
     )?;
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("account JSON was invalid: {error}\n{}", output_text(&output)))?;
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "account JSON was invalid: {error}\n{}",
+            output_text(&output)
+        )
+    })?;
     value
         .get("account_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| format!("account JSON had no account_id: {}", String::from_utf8_lossy(&output.stdout)))
+        .ok_or_else(|| {
+            format!(
+                "account JSON had no account_id: {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })
 }
 
 fn exact_digest(secret: &str) -> String {
@@ -203,11 +228,7 @@ fn exact_digest(secret: &str) -> String {
 
 /// Spawn this harness's own binary to read back the credential the CLI wrote,
 /// checking the exact bytes survived the round trip through the native store.
-fn run_reader_child(
-    profile: &str,
-    account_id: &str,
-    expected_sha256: &str,
-) -> Result<(), String> {
+fn run_reader_child(profile: &str, account_id: &str, expected_sha256: &str) -> Result<(), String> {
     let mut command = Command::new(std::env::current_exe().map_err(|error| error.to_string())?);
     command
         .arg("reader")
@@ -284,22 +305,26 @@ fn wait_for_resident_credential_use(
                             .and_then(serde_json::Value::as_array)
                             .and_then(|accounts| {
                                 accounts.iter().find(|account| {
-                                    account.get("account_id").and_then(serde_json::Value::as_str)
+                                    account
+                                        .get("account_id")
+                                        .and_then(serde_json::Value::as_str)
                                         == Some(account_id)
                                 })
                             })
-                            .ok_or_else(|| format!("account {account_id} disappeared from channels list"))?;
+                            .ok_or_else(|| {
+                                format!("account {account_id} disappeared from channels list")
+                            })?;
                         // Only a fixed label crosses back out of the account
                         // payload: the harness reports why it is still waiting
                         // without ever writing credential-bearing JSON to a log.
-                        last_health = match account.get("health").and_then(serde_json::Value::as_str)
-                        {
-                            Some("connected") => "connected",
-                            Some("degraded") => "degraded",
-                            Some("error") => "error",
-                            Some("disconnected") => "disconnected",
-                            Some(_) | None => "unknown",
-                        };
+                        last_health =
+                            match account.get("health").and_then(serde_json::Value::as_str) {
+                                Some("connected") => "connected",
+                                Some("degraded") => "degraded",
+                                Some("error") => "error",
+                                Some("disconnected") => "disconnected",
+                                Some(_) | None => "unknown",
+                            };
 
                         if last_health == "error" {
                             return Err(
@@ -309,7 +334,9 @@ fn wait_for_resident_credential_use(
                         }
                         if matches!(last_health, "degraded" | "connected") {
                             if account.to_string().contains(secret) {
-                                return Err("Telegram credential leaked into channel status".to_string());
+                                return Err(
+                                    "Telegram credential leaked into channel status".to_string()
+                                );
                             }
                             return Ok(());
                         }
@@ -385,7 +412,9 @@ fn run_real_service_case(case: &str) -> Result<(), String> {
         let installed = require_cli(Some(&created), &["daemon", "install"])?;
         let install_text = String::from_utf8_lossy(&installed.stdout);
         if !install_text.contains("Installed") {
-            return Err(format!("daemon install returned unexpected output: {install_text}"));
+            return Err(format!(
+                "daemon install returned unexpected output: {install_text}"
+            ));
         }
 
         wait_for_resident_credential_use(&created, &account, &secret)
@@ -514,7 +543,11 @@ fn real_main() -> Result<(), String> {
     })?;
 
     match mode.as_str() {
-        "reader" => reader(&args.next().ok_or_else(|| "reader requires account id".to_string())?),
+        "reader" => reader(
+            &args
+                .next()
+                .ok_or_else(|| "reader requires account id".to_string())?,
+        ),
         "desktop" => run_real_service_case("desktop"),
         other => Err(format!("unknown mode {other}")),
     }

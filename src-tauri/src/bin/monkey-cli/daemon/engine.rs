@@ -30,6 +30,16 @@ use little_monkey_lib::profiles::ProfileLimits;
 /// The contract's verification event is written at the very end of a turn, so
 /// this only has to be larger than one turn's event count. A run that somehow
 /// exceeds it reads as "reported nothing", which routes to the safe verdict.
+/// Ceiling on how far back `terminal_outcome` will read a run's event log
+/// looking for its mutation verification, and the page size it reads in.
+///
+/// The page size must stay within the ledger's own `MAX_LIST_LIMIT` (1,000 —
+/// `run_ledger.rs`), which `load_events` enforces by rejecting the call
+/// outright. Asking for more than that in one call does not truncate, it
+/// fails: every settle attempt errored with "list limit must be between 1 and
+/// 1000", so no mutation contract could ever be settled and the daemon logged
+/// it once per tick forever.
+const OUTCOME_EVENT_PAGE: usize = 1_000;
 const MAX_OUTCOME_EVENTS: usize = 10_000;
 
 /// The workspace-mutation outcome of a finished run, read from its own durable
@@ -67,18 +77,35 @@ impl RunOutcomeSource for LedgerRunOutcomes {
         let Some(run_id) = job.run_id.as_deref() else {
             return Ok(Some(None));
         };
-        for envelope in self.shared.events(run_id, 0, MAX_OUTCOME_EVENTS)? {
-            if let RunEvent::VerificationFinished {
-                name,
-                passed,
-                summary,
-                ..
-            } = &envelope.event
-            {
-                if name == MUTATION_VERIFICATION_NAME {
-                    return Ok(Some(Some(MutationOutcome::from_summary(*passed, summary))));
+        // Paged, because the ledger caps one read at `MAX_LIST_LIMIT`. The
+        // overall ceiling stays `MAX_OUTCOME_EVENTS`: a run with more events
+        // than that has not reported a mutation verification in the only place
+        // one is ever written, and reading its whole log per tick would cost
+        // more than the answer is worth.
+        let mut after_sequence = 0u64;
+        while after_sequence < MAX_OUTCOME_EVENTS as u64 {
+            let page = self
+                .shared
+                .events(run_id, after_sequence, OUTCOME_EVENT_PAGE)?;
+            let Some(last) = page.last() else { break };
+            let next_sequence = last.sequence;
+            for envelope in &page {
+                if let RunEvent::VerificationFinished {
+                    name,
+                    passed,
+                    summary,
+                    ..
+                } = &envelope.event
+                {
+                    if name == MUTATION_VERIFICATION_NAME {
+                        return Ok(Some(Some(MutationOutcome::from_summary(*passed, summary))));
+                    }
                 }
             }
+            if page.len() < OUTCOME_EVENT_PAGE || next_sequence <= after_sequence {
+                break;
+            }
+            after_sequence = next_sequence;
         }
         Ok(Some(None))
     }
@@ -3168,6 +3195,23 @@ pub(super) mod tests {
         Arc<DurableRunRecorder>,
         String,
     ) {
+        fixture_with_budgets(label, max_memory_bytes, 1000)
+    }
+
+    /// `fixture`, but with room to emit more events than the default budget
+    /// allows — the one test that has to cross the ledger's read page needs a
+    /// run whose own event ceiling is not the thing that stops it.
+    fn fixture_with_budgets(
+        label: &str,
+        max_memory_bytes: Option<u64>,
+        max_event_count: u64,
+    ) -> (
+        DaemonPaths,
+        DaemonStore,
+        SharedLedger,
+        Arc<DurableRunRecorder>,
+        String,
+    ) {
         let root = std::env::temp_dir().join(format!(
             "little-monkey-daemon-engine-{label}-{}",
             uuid::Uuid::new_v4()
@@ -3177,9 +3221,10 @@ pub(super) mod tests {
         paths.ensure().unwrap();
         let run_id = format!("run-{label}");
         let ledger = RunLedger::open(&paths.ledger_db).unwrap();
+        let mut run_spec = spec(&run_id, 1_000);
+        run_spec.budgets.max_event_count = max_event_count;
         let (recorder, _) =
-            DurableRunRecorder::submit(ledger, &spec(&run_id, 1_000), "daemon-fixture".into())
-                .unwrap();
+            DurableRunRecorder::submit(ledger, &run_spec, "daemon-fixture".into()).unwrap();
         let mut store = DaemonStore::open(&paths).unwrap();
         let snapshot = paths.snapshots.join(format!("job-{label}.json"));
         std::fs::write(&snapshot, b"{}").unwrap();
@@ -5423,6 +5468,64 @@ pub(super) mod tests {
             "two attempts sharing one process id is the bug this scoping removes"
         );
         assert!(engine.shared.load_run(&run_id).unwrap().is_some());
+    }
+
+    /// The mutation verdict has to be findable past the ledger's one-read cap.
+    ///
+    /// `terminal_outcome` used to ask for `MAX_OUTCOME_EVENTS` (10,000) in a
+    /// single `load_events` call, and the ledger rejects any limit above
+    /// `MAX_LIST_LIMIT` (1,000) rather than truncating it — so every call
+    /// failed with "list limit must be between 1 and 1000", no contract could
+    /// ever settle, and the daemon logged it once per tick forever. This run
+    /// puts the verification past the first page, so a single-read
+    /// implementation cannot pass it either way: it errors before the fix, and
+    /// would miss the event if the limit were merely clamped.
+    #[test]
+    fn a_mutation_verdict_is_found_past_the_first_event_page() {
+        use little_monkey_lib::channels::mutation::MUTATION_VERIFICATION_NAME;
+        use little_monkey_lib::run_protocol::OutputChannel;
+
+        let (paths, mut store, _shared, recorder, _run_id) =
+            fixture_with_budgets("pastpage", None, 5_000);
+        recorder
+            .emit(RunEvent::Started {
+                engine_id: "fixture".into(),
+            })
+            .unwrap();
+        for index in 0..OUTCOME_EVENT_PAGE {
+            recorder
+                .emit(RunEvent::ModelDelta {
+                    message_id: "message-one".into(),
+                    channel: OutputChannel::Assistant,
+                    text: format!("chunk {index}"),
+                })
+                .unwrap();
+        }
+        recorder
+            .emit(RunEvent::VerificationFinished {
+                verification_id: "verification-one".into(),
+                name: MUTATION_VERIFICATION_NAME.into(),
+                passed: true,
+                summary: "wrote 2 files".into(),
+                artifact_ids: Vec::new(),
+                duration_ms: 12,
+            })
+            .unwrap();
+        store
+            .transition("job-pastpage", JobState::Succeeded, 2_000, None, None)
+            .unwrap();
+
+        let outcomes = LedgerRunOutcomes::open(&paths).unwrap();
+        let reported = outcomes
+            .terminal_outcome("job-pastpage")
+            .expect("reading a finished run's outcome must not fail");
+        let outcome = reported
+            .expect("the job is terminal, so its outcome is decided")
+            .expect("the verification was recorded, so the run did report one");
+        assert!(
+            outcome.satisfied(),
+            "a passing verification past page one still means the contract was met: {outcome:?}"
+        );
     }
 
     #[test]

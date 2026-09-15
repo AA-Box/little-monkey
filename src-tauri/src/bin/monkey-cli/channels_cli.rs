@@ -31,7 +31,8 @@ pub enum ChannelsCmd {
     /// Add an account. It starts disabled and with no credential.
     Add {
         /// Provider: telegram, discord, slack, whatsapp, teams, google_chat,
-        /// line, mattermost, irc, matrix, signal, imessage, sms.
+        /// line, mattermost, irc, matrix, signal, imessage, sms, email,
+        /// home_assistant, webchat.
         kind: String,
         /// Name shown in listings and in the app.
         label: String,
@@ -85,7 +86,8 @@ pub enum ChannelsCmd {
         #[arg(long)]
         activation: Option<String>,
     },
-    /// List senders waiting for approval.
+    /// List every sender this account has decided about: waiting, approved,
+    /// blocked.
     Senders {
         account_id: String,
         #[arg(long)]
@@ -99,6 +101,12 @@ pub enum ChannelsCmd {
     },
     /// Block a sender.
     Block {
+        account_id: String,
+        sender_id: String,
+    },
+    /// Forget a sender: their approval or block, their model pick, and that
+    /// they were ever greeted. Their next message meets the pairing challenge.
+    Forget {
         account_id: String,
         sender_id: String,
     },
@@ -288,6 +296,10 @@ pub async fn dispatch(action: &ChannelsCmd) -> Result<(), String> {
             account_id,
             sender_id,
         } => decide_sender(account_id, sender_id, false),
+        ChannelsCmd::Forget {
+            account_id,
+            sender_id,
+        } => forget_sender(account_id, sender_id),
         ChannelsCmd::Routes { json } => routes(*json),
         ChannelsCmd::AddRoute {
             recipe,
@@ -493,8 +505,8 @@ async fn starter_recipe_target() -> Result<String, String> {
             return Ok(format!("ollama: {}", yaml_scalar(&model.name)));
         }
     }
-    let app_data =
-        crate::app_data_dir().ok_or_else(|| "Could not resolve the app data directory".to_string())?;
+    let app_data = crate::app_data_dir()
+        .ok_or_else(|| "Could not resolve the app data directory".to_string())?;
     if let Some(model) =
         little_monkey_lib::m3_runtime_hub::installed_model_inventory(&app_data).first()
     {
@@ -679,7 +691,7 @@ pub async fn add(
     json: bool,
 ) -> Result<(), String> {
     let kind = ChannelKind::parse(kind).ok_or_else(|| {
-        format!("Unknown provider '{kind}'. Try one of: telegram, discord, slack, whatsapp, signal, teams, google_chat, matrix, mattermost, line, imessage, irc, sms")
+        format!("Unknown provider '{kind}'. Try one of: telegram, discord, slack, whatsapp, signal, teams, google_chat, matrix, mattermost, line, imessage, irc, sms, email, home_assistant, webchat")
     })?;
     let non_secret_config: serde_json::Value = match config_json {
         Some(raw) => serde_json::from_str(raw)
@@ -1008,36 +1020,79 @@ pub fn set_policy(
     Ok(())
 }
 
+/// Who may talk to this account, and who is waiting to.
+///
+/// The JSON keeps `pending` as its own list — that is what the desktop reads to
+/// offer approvals — and adds `approved` and `blocked` beside it, so the
+/// operator can see who was let in and take it back. A sender's name is the
+/// one the provider sent with their pairing request; it is theirs to claim and
+/// is shown, never trusted for a decision.
 pub fn senders(account_id: &str, json: bool) -> Result<(), String> {
-    let pending = store()?.pending_channel_senders(account_id)?;
+    let store = store()?;
+    let senders = store.channel_senders(account_id)?;
     if json {
-        let rows: Vec<serde_json::Value> = pending
-            .iter()
-            .map(|sender| {
-                serde_json::json!({
-                    "sender_id": sender.sender_id,
-                    "state": sender.state.as_str(),
-                    "display_label": sender.display_label,
-                    "requested_at_ms": sender.requested_at_ms,
-                    "expires_at_ms": sender.expires_at_ms,
+        let rows = |state: SenderState| -> Result<Vec<serde_json::Value>, String> {
+            senders
+                .iter()
+                .filter(|sender| sender.state == state)
+                .map(|sender| {
+                    Ok(serde_json::json!({
+                        "sender_id": sender.sender_id,
+                        "state": sender.state.as_str(),
+                        "display_label": sender.display_label,
+                        "requested_at_ms": sender.requested_at_ms,
+                        "expires_at_ms": sender.expires_at_ms,
+                        "approved_at_ms": sender.approved_at_ms,
+                        "blocked_at_ms": sender.blocked_at_ms,
+                        // Their own `/model` pick; null means the machine's default.
+                        "model": crate::daemon::channel_commands::sender_model_label(
+                            &store, account_id, &sender.sender_id
+                        )?,
+                    }))
                 })
-            })
-            .collect();
-        println!("{}", serde_json::json!({ "pending": rows }));
-        return Ok(());
-    }
-    if pending.is_empty() {
-        println!("No senders are waiting for approval on {account_id}.");
-        return Ok(());
-    }
-    for sender in &pending {
+                .collect()
+        };
         println!(
-            "{}  {}  requested {}",
+            "{}",
+            serde_json::json!({
+                "pending": rows(SenderState::Pending)?,
+                "approved": rows(SenderState::Approved)?,
+                "blocked": rows(SenderState::Blocked)?,
+            })
+        );
+        return Ok(());
+    }
+    if senders.is_empty() {
+        println!("No sender has asked to talk to {account_id} yet.");
+        return Ok(());
+    }
+    for sender in &senders {
+        println!(
+            "{:<9} {}  {}",
+            sender.state.as_str(),
             sender.sender_id,
             sender.display_label.as_deref().unwrap_or("(no name)"),
-            sender.requested_at_ms
         );
     }
+    Ok(())
+}
+
+/// Forget a sender: not a decision about them, the absence of one. Their next
+/// message is a stranger's and meets whatever the policy does with strangers —
+/// under pairing, a fresh code. Their model pick goes too; a person let back
+/// in starts on the default like anybody else.
+pub fn forget_sender(account_id: &str, sender_id: &str) -> Result<(), String> {
+    let mut store = store()?;
+    let existed = store.delete_channel_sender(account_id, sender_id)?;
+    crate::daemon::channel_commands::forget_sender_state(&mut store, account_id, sender_id)?;
+    println!(
+        "{}",
+        if existed {
+            format!("{sender_id} is forgotten on {account_id}. Their next message is a stranger's.")
+        } else {
+            format!("{sender_id} had no standing on {account_id}; nothing to forget.")
+        }
+    );
     Ok(())
 }
 

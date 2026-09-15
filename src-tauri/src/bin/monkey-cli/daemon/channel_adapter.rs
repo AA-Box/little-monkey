@@ -1047,6 +1047,13 @@ pub fn credential_required(account: &ChannelAccountRecord) -> bool {
         // for one here would block an operator from enabling a number they
         // already configured.
         ChannelKind::Sms => false,
+        // There is no provider behind a served chat page, so there is no
+        // provider credential to hold. A visitor is not authenticated by a
+        // secret this account keeps — they are gated by the account's ordinary
+        // sender pairing policy, decided in `channel_ingress` like everyone
+        // else's. Demanding a credential here would make the account
+        // impossible to enable.
+        ChannelKind::WebChat => false,
         ChannelKind::Irc => account
             .non_secret_config
             .get("use_sasl")

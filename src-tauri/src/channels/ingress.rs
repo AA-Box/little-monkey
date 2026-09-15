@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::channels::routing::{ChannelRoute, RouteTarget};
 use crate::channels::types::{BoundedMetadata, ChannelAttachment, ChannelEnvelope};
+use crate::recipes::RecipeTarget;
 
 /// Where an externally originated turn came from.
 ///
@@ -333,6 +334,12 @@ pub struct ConversationIngress {
     /// whatever the operator's configuration says by then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<FrozenExecutionContext>,
+    /// The model the *sender* picked for themselves with `/model`, when they
+    /// have. Replaces the routed recipe's target at freeze time and nowhere
+    /// else: the recipe file stays the machine's default, so one person's pick
+    /// never changes what everybody else is answered on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<RecipeTarget>,
     /// How many automated replies deep this turn is. Zero for a turn a human
     /// originated; incremented when an agent's own output triggers another turn.
     #[serde(default)]
@@ -371,6 +378,7 @@ impl ConversationIngress {
             target: route.target.clone(),
             route_id: Some(route.route_id.clone()),
             execution: None,
+            model_override: None,
             reply_depth: 0,
             automation_origin: false,
             mutation_required: false,
@@ -402,6 +410,7 @@ impl ConversationIngress {
             target,
             route_id: None,
             execution: None,
+            model_override: None,
             reply_depth: 0,
             automation_origin: false,
             mutation_required: false,
@@ -414,6 +423,13 @@ impl ConversationIngress {
     /// Attach the execution configuration resolved for this turn.
     pub fn with_execution(mut self, execution: FrozenExecutionContext) -> Self {
         self.execution = Some(execution);
+        self
+    }
+
+    /// Answer this turn on the model its sender chose rather than the routed
+    /// recipe's. `None` leaves the recipe's own target in force.
+    pub fn with_model_override(mut self, target: Option<RecipeTarget>) -> Self {
+        self.model_override = target;
         self
     }
 

@@ -128,16 +128,20 @@ pub struct PushPrivacySnapshot {
     pub registered_devices: usize,
 }
 
-/// The operator's voice configuration, reduced to the three questions the audit
-/// asks: is anything listening without being asked, is it opt-in, and could
-/// what it hears leave the machine.
+/// The operator's voice configuration, reduced to the independent claims
+/// Security Doctor must make about passive listening and about the hosted
+/// realtime engine, which is selected separately from the classic STT/TTS
+/// pipeline and from the phone-call extension setting.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VoicePrivacySnapshot {
     pub wake_phrase_enabled: bool,
     pub always_listening: bool,
-    /// True when transcription runs on this machine. False means audio is
-    /// uploaded to a provider the operator configured.
-    pub local_only: bool,
+    pub wake_processing_local: bool,
+    pub passive_audio_off_device: bool,
+    pub transcription_local: bool,
+    pub realtime_configured: bool,
+    pub realtime_active: bool,
+    pub realtime_provider_id: Option<String>,
 }
 
 /// Everything about the machine's security posture that only the daemon can
@@ -2052,48 +2056,20 @@ fn summarize(findings: &[SecurityFinding]) -> SecuritySummary {
 /// device audit asks what a *phone* was granted. This asks what *this machine*
 /// does on its own — a wake phrase and always-listening are desktop settings,
 /// not grants, and nothing in the grant model would ever surface them. The
-/// combination that matters most is the one neither half sees alone:
-/// always-listening plus a hosted transcription provider is a room whose audio
-/// leaves the machine without anyone pressing anything.
+/// audit reports four independent claims — wake enabled, always-listening,
+/// where wake processing runs, and whether passive audio has an off-device
+/// path — because an operator reading one of them should not have to infer
+/// the other three from a single combined verdict.
 fn audit_voice_privacy(runtime: &SecurityRuntimeSnapshot, findings: &mut Vec<SecurityFinding>) {
     let Some(voice) = &runtime.voice else {
         return;
     };
-    if voice.always_listening && !voice.local_only {
-        findings.push(finding(
-            "voice.passive_cloud_upload",
-            "voice",
-            "An always-on microphone is uploading to a provider",
-            "Always-listening is on and transcription is a hosted provider, so audio captured \
-             without anyone pressing anything can leave this machine.",
-            FindingStatus::Critical,
-            false,
-            None,
-            Some(
-                "Either turn always-listening off, or switch transcription to local Whisper in \
-                 Settings → Companion → Voice.",
-            ),
-        ));
-    } else if voice.always_listening {
-        findings.push(finding(
-            "voice.always_listening",
-            "voice",
-            "The microphone is always listening",
-            "This machine listens for a wake phrase continuously. Detection is local and no \
-             audio is uploaded until the phrase is heard, but the microphone is open.",
-            FindingStatus::Warning,
-            false,
-            None,
-            Some(
-                "Turn always-listening off in Settings → Companion → Voice when it is not in use.",
-            ),
-        ));
-    } else if voice.wake_phrase_enabled {
+    if voice.wake_phrase_enabled {
         findings.push(finding(
             "voice.wake_phrase_enabled",
             "voice",
-            "A wake phrase is enabled",
-            "The wake phrase is armed but the microphone only opens when Talk is started.",
+            "Wake word is enabled",
+            "Talk can arm the configured local keyword spotter after microphone permission is granted.",
             FindingStatus::Info,
             false,
             None,
@@ -2103,26 +2079,149 @@ fn audit_voice_privacy(runtime: &SecurityRuntimeSnapshot, findings: &mut Vec<Sec
         findings.push(finding(
             "voice.wake_disabled",
             "voice",
-            "Nothing is listening on its own",
-            "The wake phrase and always-listening are both off; the microphone opens only when \
-             it is pressed.",
+            "Wake word is off",
+            "No keyword spotter is armed; the microphone opens only after an explicit Talk action.",
             FindingStatus::Pass,
             false,
             None,
             None,
         ));
     }
-    if !voice.local_only {
+
+    if voice.always_listening {
+        findings.push(finding(
+            "voice.always_listening",
+            "voice",
+            "Always listening is enabled",
+            "Opening Talk keeps the microphone active and locally checks bounded PCM frames for the wake word.",
+            FindingStatus::Warning,
+            false,
+            None,
+            Some("Turn always listening off in Settings → Companion → Voice when it is not in use."),
+        ));
+    } else {
+        findings.push(finding(
+            "voice.always_listening_disabled",
+            "voice",
+            "Always listening is off",
+            "Talk does not open the microphone merely because the surface exists.",
+            FindingStatus::Pass,
+            false,
+            None,
+            None,
+        ));
+    }
+
+    if voice.wake_processing_local {
+        findings.push(finding(
+            "voice.wake_processing_local",
+            "voice",
+            "Wake processing is local",
+            "The in-process sherpa-onnx keyword spotter receives PCM directly; Whisper and providers are not used while armed.",
+            FindingStatus::Pass,
+            false,
+            None,
+            None,
+        ));
+    } else {
+        findings.push(finding(
+            "voice.wake_processing_nonlocal",
+            "voice",
+            "Wake processing is not local",
+            "The configured wake backend cannot prove that passive microphone audio stays on this machine.",
+            FindingStatus::Critical,
+            false,
+            None,
+            Some("Disable always listening and select the bundled local wake-word backend."),
+        ));
+    }
+
+    if voice.passive_audio_off_device {
+        findings.push(finding(
+            "voice.passive_cloud_upload",
+            "voice",
+            "Passive microphone audio can leave this device",
+            "A network path can receive microphone audio before a wake event.",
+            FindingStatus::Critical,
+            false,
+            None,
+            Some("Turn always listening off until the passive-audio network path is removed."),
+        ));
+    } else {
+        findings.push(finding(
+            "voice.passive_audio_local",
+            "voice",
+            "Passive audio has no network path",
+            "No passive-listening PCM is sent to a provider, agent run, analytics, or artifact store.",
+            FindingStatus::Pass,
+            false,
+            None,
+            None,
+        ));
+    }
+
+    // The loopback far end is this project's own code answering with a tone, so
+    // the two findings below would be lies about it: nothing streams anywhere
+    // and no provider hears anything. Saying "streaming to the configured
+    // realtime provider" over a test peer would teach an operator to distrust
+    // the panel, which is worse than saying nothing.
+    let local_peer = voice.realtime_provider_id.as_deref() == Some("loopback");
+
+    if local_peer && (voice.realtime_configured || voice.realtime_active) {
+        findings.push(finding(
+            "voice.realtime_local_peer",
+            "voice",
+            "Realtime voice is pointed at the local test peer",
+            "The realtime far end is 'loopback' — an in-process test peer that makes no network call and answers with a generated tone instead of a model. It exists to exercise microphone and speaker routing without a provider credential. Talk will appear to work and will say nothing meaningful.",
+            FindingStatus::Warning,
+            false,
+            None,
+            Some("Choose OpenAI in Settings → Talk to speak to a real model, or Classic pipeline to keep the voice engine local and turn-based."),
+        ));
+    }
+
+    if voice.realtime_active {
+        findings.push(finding(
+            "voice.realtime_active",
+            "voice",
+            "A realtime voice session is active",
+            if local_peer {
+                "The desktop microphone is streaming to the local test peer now; it leaves neither this process nor this machine. Tool calls still use the normal permission and sandbox boundary."
+            } else {
+                "The desktop microphone is streaming to the configured realtime provider now. Tool calls still use the normal permission and sandbox boundary."
+            },
+            FindingStatus::Warning,
+            false,
+            None,
+            Some("End Talk to close the WebRTC peer, data channel, microphone tracks, and provider session."),
+        ));
+    } else if voice.realtime_configured {
+        findings.push(finding(
+            "voice.realtime_configured",
+            "voice",
+            "Realtime voice is configured",
+            if local_peer {
+                "Talk is configured to stream live microphone audio to the local test peer. No audio reaches a provider under this configuration."
+            } else {
+                "Talk is configured to send live microphone audio to OpenAI only after the privacy warning is accepted and a session is started."
+            },
+            FindingStatus::Info,
+            false,
+            None,
+            Some("Choose Classic pipeline in Settings → Talk to keep the voice engine local/turn-based."),
+        ));
+    }
+
+    if !voice.transcription_local && !voice.realtime_configured {
         findings.push(finding(
             "voice.hosted_transcription",
             "voice",
             "Speech is transcribed by a hosted provider",
-            "What is said into Talk, the companion overlay and answered calls is uploaded to the \
-             transcription provider configured in Settings.",
+            "Ordinary Talk utterances, companion recordings, and answered calls use the configured transcription provider. Wake gating cannot be enabled with this configuration, and no passive audio is sent there.",
             FindingStatus::Info,
             false,
             None,
-            Some("Local Whisper keeps every recording on this machine."),
+            Some("Local Whisper keeps command and recording transcription on this machine."),
         ));
     }
 }
@@ -2220,6 +2319,77 @@ mod tests {
         findings
     }
 
+    #[test]
+    fn the_doctor_reports_realtime_voice_separately_when_configured_and_active() {
+        let configured = voice_findings(Some(VoicePrivacySnapshot {
+            realtime_configured: true,
+            realtime_provider_id: Some("openai".to_string()),
+            ..VoicePrivacySnapshot::default()
+        }));
+        assert!(has(&configured, "voice.realtime_configured"));
+        // The realtime findings already say where the audio goes; the hosted
+        // transcription notice would be a second finding for one choice.
+        assert!(!has(&configured, "voice.hosted_transcription"));
+
+        let active = voice_findings(Some(VoicePrivacySnapshot {
+            realtime_configured: true,
+            realtime_active: true,
+            realtime_provider_id: Some("openai".to_string()),
+            ..VoicePrivacySnapshot::default()
+        }));
+        assert!(has(&active, "voice.realtime_active"));
+        assert!(!has(&active, "voice.realtime_configured"));
+    }
+
+    /// The loopback far end is a tone generator in this process. A panel that
+    /// described it as "streaming to the configured realtime provider" would be
+    /// telling an operator their audio left the machine when it did not, and
+    /// would say nothing about the fact that Talk is about to answer with a
+    /// tone -- the failure that makes a test peer dangerous to leave selected.
+    #[test]
+    fn the_doctor_says_when_the_realtime_far_end_is_the_local_test_peer() {
+        let configured = voice_findings(Some(VoicePrivacySnapshot {
+            realtime_configured: true,
+            realtime_provider_id: Some("loopback".to_string()),
+            ..VoicePrivacySnapshot::default()
+        }));
+        assert!(has(&configured, "voice.realtime_local_peer"));
+        let detail = detail_of(&configured, "voice.realtime_configured");
+        assert!(
+            detail.contains("local test peer") && !detail.contains("OpenAI"),
+            "a local peer must not be described as a provider: {detail}"
+        );
+
+        let active = voice_findings(Some(VoicePrivacySnapshot {
+            realtime_configured: true,
+            realtime_active: true,
+            realtime_provider_id: Some("loopback".to_string()),
+            ..VoicePrivacySnapshot::default()
+        }));
+        assert!(has(&active, "voice.realtime_local_peer"));
+        assert!(
+            detail_of(&active, "voice.realtime_active").contains("leaves neither this process nor this machine"),
+        );
+
+        // And the ordinary provider is untouched by any of it.
+        let openai = voice_findings(Some(VoicePrivacySnapshot {
+            realtime_configured: true,
+            realtime_provider_id: Some("openai".to_string()),
+            ..VoicePrivacySnapshot::default()
+        }));
+        assert!(!has(&openai, "voice.realtime_local_peer"));
+        assert!(detail_of(&openai, "voice.realtime_configured").contains("OpenAI"));
+    }
+
+    fn detail_of(findings: &[SecurityFinding], id: &str) -> String {
+        findings
+            .iter()
+            .find(|finding| finding.id == id)
+            .unwrap_or_else(|| panic!("no finding {id}"))
+            .detail
+            .clone()
+    }
+
     fn has(findings: &[SecurityFinding], id: &str) -> bool {
         findings.iter().any(|finding| finding.id == id)
     }
@@ -2236,19 +2406,23 @@ mod tests {
         findings
     }
 
-    /// The voice surface graded by what it can actually do, worst case first.
-    ///
-    /// The combination the operator most needs named is always-listening plus a
-    /// hosted transcription backend: neither is alarming alone, and together
-    /// they are a microphone that uploads a room nobody opened.
+    /// Every passive-listening property is independent so one healthy control
+    /// cannot conceal another unsafe one.
     #[test]
-    fn the_doctor_grades_always_listening_by_where_the_audio_goes() {
+    fn the_doctor_reports_four_independent_voice_controls() {
         let leaking = voice_findings(Some(VoicePrivacySnapshot {
             wake_phrase_enabled: true,
             always_listening: true,
-            local_only: false,
+            wake_processing_local: false,
+            passive_audio_off_device: true,
+            transcription_local: false,
+            ..VoicePrivacySnapshot::default()
         }));
+        assert!(has(&leaking, "voice.wake_phrase_enabled"));
+        assert!(has(&leaking, "voice.always_listening"));
+        assert!(has(&leaking, "voice.wake_processing_nonlocal"));
         assert!(has(&leaking, "voice.passive_cloud_upload"));
+        assert!(has(&leaking, "voice.hosted_transcription"));
         assert_eq!(
             leaking
                 .iter()
@@ -2258,29 +2432,37 @@ mod tests {
             FindingStatus::Critical
         );
 
-        // The same setting, kept on this machine, is a warning rather than a
-        // critical: the microphone is open, but nothing leaves.
         let local = voice_findings(Some(VoicePrivacySnapshot {
             wake_phrase_enabled: true,
             always_listening: true,
-            local_only: true,
+            wake_processing_local: true,
+            passive_audio_off_device: false,
+            transcription_local: true,
+            ..VoicePrivacySnapshot::default()
         }));
         assert!(has(&local, "voice.always_listening"));
         assert!(!has(&local, "voice.passive_cloud_upload"));
-        assert!(!has(&local, "voice.hosted_transcription"));
+        assert!(has(&local, "voice.wake_processing_local"));
+        assert!(has(&local, "voice.passive_audio_local"));
 
         // Armed but not listening, and the default: neither is a problem, and
         // both are stated rather than left silent.
         let armed = voice_findings(Some(VoicePrivacySnapshot {
             wake_phrase_enabled: true,
             always_listening: false,
-            local_only: true,
+            wake_processing_local: true,
+            passive_audio_off_device: false,
+            transcription_local: true,
+            ..VoicePrivacySnapshot::default()
         }));
         assert!(has(&armed, "voice.wake_phrase_enabled"));
         let quiet = voice_findings(Some(VoicePrivacySnapshot {
             wake_phrase_enabled: false,
             always_listening: false,
-            local_only: true,
+            wake_processing_local: true,
+            passive_audio_off_device: false,
+            transcription_local: true,
+            ..VoicePrivacySnapshot::default()
         }));
         assert!(has(&quiet, "voice.wake_disabled"));
         assert_eq!(quiet[0].status, FindingStatus::Pass);
