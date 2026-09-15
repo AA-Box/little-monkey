@@ -595,7 +595,7 @@ impl MlxPackageInstaller {
         let destination = versions.join(&prepared.version_directory_name);
         match fs::symlink_metadata(&destination) {
             Ok(metadata) if metadata.file_type().is_dir() => {
-                let verified = self.verify_version_directory(&destination)?;
+                let verified = self.verify_version_directory(&destination, VerificationDepth::Digests)?;
                 if verified.manifest_sha256 != prepared.manifest_sha256 {
                     return Err(invalid(
                         "packageVersion",
@@ -664,7 +664,7 @@ impl MlxPackageInstaller {
             let _ = fs::remove_dir_all(&staging);
             return Err(error);
         }
-        let staged_verified = self.verify_version_directory(&staging)?;
+        let staged_verified = self.verify_version_directory(&staging, VerificationDepth::Digests)?;
         if staged_verified.manifest_sha256 != prepared.manifest_sha256 {
             let _ = fs::remove_dir_all(&staging);
             return Err(invalid(
@@ -677,7 +677,7 @@ impl MlxPackageInstaller {
             return Err(io_at("publish MLX package", &destination, source));
         }
         sync_directory(&versions)?;
-        let verified = self.verify_version_directory(&destination)?;
+        let verified = self.verify_version_directory(&destination, VerificationDepth::Digests)?;
         self.activate(&verified)?;
         Ok(verified)
     }
@@ -721,7 +721,27 @@ impl MlxPackageInstaller {
             .is_file()
     }
 
+    /// The active install, re-read in full: signature, declared shape, and
+    /// every file's digest. What has to pass before anything is executed.
     pub fn verify_active(&self) -> MlxResult<VerifiedMlxInstall> {
+        self.read_active(VerificationDepth::Digests)
+    }
+
+    /// The active install, checked for shape only — signature, declared file
+    /// list, and each declared file's size — without re-reading its contents.
+    ///
+    /// A real package is 230 MB across ~13k files, so hashing all of it is
+    /// seconds of CPU. The Runtime Hub asks for status, metrics and cache state
+    /// together and repeats that on every refresh, which turned three full
+    /// re-hashes into a pegged core and an app that looks hung. Nothing is
+    /// spawned off the back of a status read; the digest pass still gates
+    /// [`MlxRuntime::start`] and every engine launch, which is where a
+    /// tampered file would otherwise reach a process.
+    pub fn inspect_active(&self) -> MlxResult<VerifiedMlxInstall> {
+        self.read_active(VerificationDepth::Shape)
+    }
+
+    fn read_active(&self, depth: VerificationDepth) -> MlxResult<VerifiedMlxInstall> {
         let _guard = lock(&self.operation_lock)?;
         let active_path = self.root.join(ACTIVE_STATE_FILE);
         let bytes = match read_regular_bounded(&active_path, self.limits.max_manifest_bytes) {
@@ -744,7 +764,7 @@ impl MlxPackageInstaller {
                 &active.package_version,
                 &active.manifest_sha256,
             ));
-        let verified = self.verify_version_directory(&destination)?;
+        let verified = self.verify_version_directory(&destination, depth)?;
         if verified.manifest_sha256 != active.manifest_sha256 {
             return Err(invalid(
                 "active.manifestSha256",
@@ -824,7 +844,11 @@ impl MlxPackageInstaller {
         })
     }
 
-    fn verify_version_directory(&self, directory: &Path) -> MlxResult<VerifiedMlxInstall> {
+    fn verify_version_directory(
+        &self,
+        directory: &Path,
+        depth: VerificationDepth,
+    ) -> MlxResult<VerifiedMlxInstall> {
         let metadata = fs::symlink_metadata(directory)
             .map_err(|source| io_at("inspect MLX version", directory, source))?;
         if !metadata.file_type().is_dir() {
@@ -848,6 +872,17 @@ impl MlxPackageInstaller {
         for file in &manifest.files {
             expected_paths.insert(file.path.clone());
             let path = directory.join(&file.path);
+            if depth == VerificationDepth::Shape {
+                let metadata = fs::symlink_metadata(&path)
+                    .map_err(|source| io_at("inspect installed MLX file", &path, source))?;
+                if !metadata.file_type().is_file() {
+                    return Err(invalid(&file.path, "must be a real regular file"));
+                }
+                if metadata.len() != file.size_bytes {
+                    return Err(invalid(&file.path, "installed file size changed"));
+                }
+                continue;
+            }
             let bytes = read_regular_bounded(
                 &path,
                 usize::try_from(file.size_bytes)
@@ -886,6 +921,15 @@ impl MlxPackageInstaller {
         let bytes = canonical_json(&active)?;
         atomic_write_private(&self.root.join(ACTIVE_STATE_FILE), &bytes)
     }
+}
+
+/// How much of an installed package a verification re-reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VerificationDepth {
+    /// Signature, declared shape, and every file's digest.
+    Digests,
+    /// Signature, declared shape, and each declared file's size — no contents.
+    Shape,
 }
 
 struct PreparedPackage {
@@ -1186,7 +1230,9 @@ impl MlxRuntimeAdapter {
         if !capabilities.is_available() {
             return Ok(MlxRuntimeStatus::Unavailable { capabilities });
         }
-        let install = match self.installer.verify_active() {
+        // Shape only: a status read spawns nothing, and re-hashing the whole
+        // package on every Runtime Hub refresh is what pegged a core.
+        let install = match self.installer.inspect_active() {
             Ok(install) => install,
             Err(MlxError::NotInstalled) => {
                 return Ok(MlxRuntimeStatus::NotInstalled { capabilities })
@@ -2255,6 +2301,41 @@ pub(crate) mod tests {
         fs::write(&config, br#"{"model_type":"qwen3_5"}"#).unwrap();
         let empty = TestDirectory::new("arch-empty");
         assert_eq!(unsupported_architecture(&empty.0, &model.0), None);
+    }
+
+    /// A status read must not re-hash the package, but it must still refuse an
+    /// install whose declared shape no longer holds.
+    #[test]
+    fn a_shape_check_skips_digests_and_still_catches_a_resized_file() {
+        let root = TestDirectory::new("shape");
+        let installer = installer(&root.0);
+        let bundle = package();
+        let installed = installer
+            .install_and_activate(&bundle, &supported_host())
+            .expect("install");
+
+        let payload = installed.version_directory.join("service/mlx_server.py");
+        let original = fs::read(&payload).expect("read payload");
+
+        // Same size, different bytes: only the digest pass can see this.
+        let mut edited = original.clone();
+        let last = edited.len() - 1;
+        edited[last] ^= 0xff;
+        fs::write(&payload, &edited).expect("rewrite payload");
+        assert!(installer.inspect_active().is_ok());
+        assert!(matches!(
+            installer.verify_active(),
+            Err(MlxError::DigestMismatch { .. })
+        ));
+
+        // A different size is a shape change, and both passes reject it.
+        fs::write(&payload, [original.as_slice(), b"x"].concat()).expect("grow payload");
+        assert!(installer.inspect_active().is_err());
+        assert!(installer.verify_active().is_err());
+
+        fs::write(&payload, &original).expect("restore payload");
+        assert!(installer.inspect_active().is_ok());
+        assert!(installer.verify_active().is_ok());
     }
 
     pub(crate) struct TestSignatureVerifier;
