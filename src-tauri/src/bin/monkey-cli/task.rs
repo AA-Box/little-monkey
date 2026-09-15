@@ -5987,7 +5987,11 @@ async fn run_inner(
         .last()
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
-        .map(|message| bounded_text(message, 60 * 1024));
+        .map(|message| bounded_text(message, 60 * 1024))
+        // `RunEvent::Completed` rejects `Some("")` — an answer that came back
+        // blank must read as "no summary", or emitting it fails the whole run
+        // and the daemon can only report "child exited with code 1".
+        .filter(|message| !message.trim().is_empty());
 
     if iterations_capped {
         recorder.emit(RunEvent::Failed {

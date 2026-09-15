@@ -68,6 +68,13 @@ use uuid::Uuid;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const M3_DIRECTORY: &str = "m3";
+
+/// The MLX runtime root under a profile's data directory. The installer, the
+/// hub and the model picker all have to name the same tree, so they name it
+/// here.
+pub fn mlx_runtime_root(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join(M3_DIRECTORY).join("runtimes").join("mlx")
+}
 /// Where `models::models_dir` keeps managed model weights, relative to the same
 /// profile data directory this module is built from.
 const MANAGED_MODELS_DIRECTORY: &str = "models";
@@ -4339,7 +4346,7 @@ fn install_mlx_from_artifact_with_verifier(
         }
     };
     let installer = MlxPackageInstaller::new(
-        app_data_dir.join(M3_DIRECTORY).join("runtimes").join("mlx"),
+        mlx_runtime_root(app_data_dir),
         verifier,
         limits,
     )
