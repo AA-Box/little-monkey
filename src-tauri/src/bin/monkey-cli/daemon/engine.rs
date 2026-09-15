@@ -423,6 +423,38 @@ fn retry_permitted(job: &DaemonJob) -> bool {
         && job.attempt.saturating_add(1) < job.max_attempts
 }
 
+/// The part of a hold reason that says *what* the job is waiting for, with the
+/// measurement dropped.
+///
+/// Hold reasons quote the shortfall ("needs 8.5 GiB more system memory than is
+/// free"), and free memory moves under a job that is waiting, so the sentence
+/// is different on nearly every tick while the wait itself has not changed at
+/// all. Comparing the text verbatim therefore re-logged and re-wrote the same
+/// hold four times a second — that is what grew one machine's
+/// `service.stderr.log` to 147 MB. Masking digit runs leaves the shape of the
+/// sentence, which is the thing that actually changes when the answer does.
+///
+/// ponytail: masking every digit also masks digits in a suspended victim's job
+/// id, so two victim sets that differ only in digits read as one hold. That
+/// costs a skipped log line, never a wrong decision; if it ever matters, pass
+/// the stable key in from the two call sites instead of deriving it here.
+fn hold_shape(reason: &str) -> String {
+    let mut shape = String::with_capacity(reason.len());
+    let mut in_number = false;
+    for character in reason.chars() {
+        if character.is_ascii_digit() || (in_number && character == '.') {
+            if !in_number {
+                shape.push('#');
+                in_number = true;
+            }
+            continue;
+        }
+        in_number = false;
+        shape.push(character);
+    }
+    shape
+}
+
 /// Whether a queued retry has waited out its backoff.
 ///
 /// Derived from `updated_at_ms` rather than a new column: a retry transitions
@@ -2179,7 +2211,11 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
     /// scheduling decision log — a decision worth recording is one that changed
     /// something.
     fn hold(&mut self, job: &DaemonJob, reason: &str) -> Result<bool, String> {
-        if job.hold_reason.as_deref() == Some(reason) {
+        if job
+            .hold_reason
+            .as_deref()
+            .is_some_and(|held| hold_shape(held) == hold_shape(reason))
+        {
             return Ok(false);
         }
         eprintln!("monkey daemon: holding job '{}' — {reason}", job.job_id);
@@ -3630,6 +3666,56 @@ pub(super) mod tests {
         assert_eq!(
             admitted.hold_reason, None,
             "the hold reason is stale once the job starts"
+        );
+    }
+
+    /// The hold log is a state-change log, and "the state" is the shape of the
+    /// reason, not its text: the shortfall figure drifts with free memory on
+    /// every poll, and re-logging the same wait because 8.5 GiB became 8.6 GiB
+    /// is what grew one machine's `service.stderr.log` to 147 MB.
+    #[test]
+    fn a_hold_is_rewritten_only_when_the_reason_changes_shape() {
+        const TWELVE_GIB: u64 = 12 * 1024 * 1024 * 1024;
+        let (paths, store, shared) = admission_fixture(
+            "holdchurn",
+            &[("a", TWELVE_GIB, "first"), ("b", TWELVE_GIB, "second")],
+        );
+        let mut engine = admission_engine(paths, store, shared, fake_adapter());
+        engine.tick().unwrap();
+
+        let held = engine.store.get_job("job-b").unwrap().unwrap();
+        assert!(
+            engine
+                .hold(&held, "needs 8.5 GiB more VRAM than is free")
+                .unwrap(),
+            "a reason this job was not already waiting on is news"
+        );
+
+        let held = engine.store.get_job("job-b").unwrap().unwrap();
+        assert!(
+            !engine
+                .hold(&held, "needs 8.6 GiB more VRAM than is free")
+                .unwrap(),
+            "only the drifting figure moved, so nothing is written or logged"
+        );
+        assert_eq!(
+            engine
+                .store
+                .get_job("job-b")
+                .unwrap()
+                .unwrap()
+                .hold_reason
+                .as_deref(),
+            Some("needs 8.5 GiB more VRAM than is free"),
+            "the row keeps the reason it was given, figure and all"
+        );
+
+        let held = engine.store.get_job("job-b").unwrap().unwrap();
+        assert!(
+            engine
+                .hold(&held, "needs 8.6 GiB more system memory than is free")
+                .unwrap(),
+            "a different resource is a different wait, and must be recorded"
         );
     }
 
