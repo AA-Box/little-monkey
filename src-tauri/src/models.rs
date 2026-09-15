@@ -1487,6 +1487,18 @@ pub fn models_add_external_folder(app: AppHandle, path: String) -> Result<Vec<Mo
         ));
     }
 
+    // A folder whose every model the installed MLX runtime has no loader for is
+    // refused here rather than registered: the model would list fine, and then
+    // fail on the first turn with a Python traceback from the service process.
+    // Only when *nothing* in the folder can run — a mixed folder still
+    // registers, and `MlxRuntime::start` stops the unsupported row on its own.
+    if let Some(unsupported) = unsupported_mlx_architectures(&app, &shapes) {
+        return Err(format!(
+            "The installed MLX runtime has no loader for this model's architecture ({unsupported}). \
+             Update the MLX runtime in Settings → Runtime Hub, or pick a model it supports."
+        ));
+    }
+
     let mut entries = load_external_registry(&app)?;
     let mut added = false;
     let mut models = Vec::with_capacity(shapes.len());
@@ -1527,6 +1539,40 @@ pub fn models_add_external_folder(app: AppHandle, path: String) -> Result<Vec<Mo
         save_external_registry(&app, &entries)?;
     }
     Ok(models)
+}
+
+/// The architectures in `shapes` the installed MLX runtime cannot load, when
+/// that accounts for every model in the folder.
+///
+/// `None` whenever anything at all could run — including when there is no MLX
+/// install to ask, since a model registered now is meant to work after the
+/// runtime is installed or updated, and on every platform that has no MLX
+/// runtime at all: `mlx_runtime` is compiled only on macOS.
+#[cfg(target_os = "macos")]
+fn unsupported_mlx_architectures(app: &AppHandle, shapes: &[LocalModelShape]) -> Option<String> {
+    let app_data = app.profile_data_dir().ok()?;
+    let version_directory =
+        crate::mlx_runtime::active_version_directory(&crate::m3_production::mlx_runtime_root(
+            &app_data,
+        ))?;
+    let mut unsupported = std::collections::BTreeSet::new();
+    for shape in shapes {
+        if shape.runtime != model_sources::ModelRuntimeKind::Mlx {
+            return None;
+        }
+        match crate::mlx_runtime::unsupported_architecture(&version_directory, &shape.path) {
+            Some(architecture) => {
+                unsupported.insert(architecture);
+            }
+            None => return None,
+        }
+    }
+    (!unsupported.is_empty()).then(|| unsupported.into_iter().collect::<Vec<_>>().join(", "))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unsupported_mlx_architectures(_app: &AppHandle, _shapes: &[LocalModelShape]) -> Option<String> {
+    None
 }
 
 /// Forgets a previously-registered external model reference by id. Never
