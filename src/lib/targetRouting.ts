@@ -287,6 +287,45 @@ export function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSn
   ) ?? null;
 }
 
+/**
+ * Why `snapshotForResolvedTarget` came back empty, in words the person reading
+ * the chat can act on.
+ *
+ * The generic sentence this replaces — "The selected model target could not be
+ * frozen for the resident runner." — names the mechanism and none of the
+ * causes. Every one of them is readable from the store at the moment of the
+ * failure: no model picked, a model picked but never started, a start that
+ * failed and left its reason in `llamaError`, or a selection that no longer
+ * matches anything installed. Reporting the mechanism instead of the cause
+ * turned a one-glance problem into a debugging session, twice.
+ */
+export function describeMissingTargetSnapshot(target: ResolvedTarget): string {
+  if (target.kind === 'ollama') {
+    return `Ollama has no model named ${target.model} loaded. Start it with \`ollama run ${target.model}\`, or pick another target.`;
+  }
+  if (target.kind === 'provider') {
+    return `${target.providerId} has no model ${target.model} available. Check the provider's API key and model list in Settings.`;
+  }
+  const state = useModelStore.getState();
+  const active = state.active ?? residentLocalModel(state.installed, state.mlxChat);
+  if (!active) {
+    return 'No local model is loaded. Pick one in the model picker — selecting it is what starts the runtime.';
+  }
+  if (state.llamaStatus === 'error') {
+    const reason = state.llamaError?.trim();
+    return reason
+      ? `${active.name} failed to start: ${reason}`
+      : `${active.name} failed to start, and the runtime reported no reason.`;
+  }
+  if (state.llamaStatus === 'starting') {
+    return `${active.name} is still loading. Send this again once it reports ready.`;
+  }
+  if (state.llamaStatus !== 'ready') {
+    return `${active.name} is selected but not running (${state.llamaStatus}). Pick it again in the model picker to start it.`;
+  }
+  return `${active.name} is loaded, but it is no longer in the installed model list. Refresh the model list, or pick another model.`;
+}
+
 /** Human-readable label for a switch notice. */
 export function targetLabel(target: ResolvedTarget): string {
   if (target.kind === 'provider') return `${target.providerId} (${target.model})`;
