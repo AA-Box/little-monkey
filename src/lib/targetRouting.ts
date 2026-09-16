@@ -222,15 +222,45 @@ async function refreshTargetInventoryIfMissing(target: ResolvedTarget): Promise<
 /** Exported so `issueToPrRunner.ts` can build the `target` field
  * `beginDurableRun` needs for its own headless run, the same reuse reasoning
  * as `resolveTarget` above. */
+/**
+ * The model an MLX runtime is holding right now, when the chat store has no
+ * active model of its own.
+ *
+ * Two surfaces load a local model: the chat picker, which sets `active`, and
+ * Runtime Hub, which loads it into the runtime and says nothing to this store.
+ * After the second one, a model really is resident and answering on its own
+ * port, while chat refused the turn outright:
+ *
+ *     The selected model target could not be frozen for the resident runner.
+ *
+ * The resident model is a target by definition — it is the one thing on this
+ * machine already loaded and serving — so read it from the runtime rather than
+ * requiring the two surfaces to agree about who sets what. `llama_status`
+ * already feeds `active` this way in `refreshLlamaStatus`; MLX had no
+ * equivalent.
+ */
+function residentLocalModel(
+  installed: ReturnType<typeof useModelStore.getState>["installed"],
+  mlxChat: MlxChatStatusPayload | null,
+): ReturnType<typeof useModelStore.getState>["active"] {
+  if (!mlxChat?.running || !mlxChat.modelPath) return null;
+  return installed.find((model) => model.path === mlxChat.modelPath) ?? null;
+}
+
 /** The live target inventory — the same set the model picker offers. Shared by
  * `snapshotForResolvedTarget` and the K9 routing candidates below so a target
  * routing can choose is by construction one the user already configured. */
 export function currentTargetInventory(): ModelTargetInventory {
   const state = useModelStore.getState();
+  const resident = residentLocalModel(state.installed, state.mlxChat);
   return buildModelTargetInventory({
     installed: state.installed,
-    active: state.active,
-    llamaStatus: state.llamaStatus,
+    active: state.active ?? resident,
+    // `llamaStatus` is this app's one "a local model is loaded" signal — the
+    // chat picker sets it to `ready` for an MLX load too. A model made resident
+    // anywhere else is just as loaded, so say so rather than leaving the
+    // inventory to conclude nothing local is running.
+    llamaStatus: state.active ? state.llamaStatus : resident ? "ready" : state.llamaStatus,
     ollamaModels: state.ollamaModels,
     ollamaReachable: state.ollamaReachable,
     providers: state.providers,
