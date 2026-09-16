@@ -10,6 +10,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import {
+  describeMissingTargetSnapshot,
   resolveLoadedLocalEndpoint,
   resolveTarget,
   resolvedTargetSupportsVision,
@@ -231,5 +232,46 @@ describe("resolveTarget", () => {
       kind: "ollama",
       model: model.name,
     });
+  });
+});
+
+describe("why a target could not be frozen", () => {
+  const localTarget: ResolvedTarget = { kind: "local", baseUrl: "http://127.0.0.1:59045" };
+
+  it("says nothing is loaded when no model is selected", () => {
+    expect(describeMissingTargetSnapshot(localTarget)).toContain("No local model is loaded");
+  });
+
+  it("reports the runtime's own reason when the start failed", () => {
+    useModelStore.setState({
+      installed: [localModel()],
+      active: localModel(),
+      llamaStatus: "error",
+      llamaError: "the verified MLX runtime is not installed",
+    });
+    const message = describeMissingTargetSnapshot(localTarget);
+    expect(message).toContain("Qwen 27B");
+    expect(message).toContain("the verified MLX runtime is not installed");
+  });
+
+  it("says a selected model is not running rather than naming the freeze", () => {
+    useModelStore.setState({
+      installed: [localModel()],
+      active: localModel(),
+      llamaStatus: "stopped",
+    });
+    const message = describeMissingTargetSnapshot(localTarget);
+    expect(message).toContain("not running");
+    expect(message).not.toContain("frozen");
+  });
+
+  it("names the model an Ollama target wanted", () => {
+    expect(describeMissingTargetSnapshot({
+        kind: "ollama",
+        baseUrl: "http://127.0.0.1:11434",
+        model: "qwen3.8:27b-mlx",
+      })).toContain(
+      "qwen3.8:27b-mlx",
+    );
   });
 });
