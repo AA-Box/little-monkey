@@ -234,6 +234,65 @@ describe("a tooltip is not clipped by the list it sits in", () => {
     // viewport" case — the one where opening upwards is what clips it.
     expect(showTooltip().className).not.toContain("-translate-y-full");
   });
+
+  /** Fixes an element's viewport rect, which jsdom otherwise reports as zero. */
+  function at(element: Element, top: number, height: number) {
+    element.getBoundingClientRect = () =>
+      ({ top, bottom: top + height, left: 0, right: 28, width: 28, height }) as DOMRect;
+  }
+
+  it("measures its room from the scrolling area, not the window", () => {
+    // Above the message list sits a title bar in normal flow. A tooltip that
+    // only avoids running off the top of the *screen* opens straight into it —
+    // there is 140px of window above this trigger and 40px of list.
+    const list = document.createElement("div");
+    list.style.overflowY = "auto";
+    document.body.appendChild(list);
+    at(list, 100, 700);
+    try {
+      const { container } = render(
+        <span className="group/action relative">
+          <button type="button">Edit</button>
+          <Tooltip text="Edit message" hint="Resends from here." />
+        </span>,
+        { container: list },
+      );
+      const trigger = container.firstElementChild as HTMLElement;
+      at(trigger, 140, 28);
+      fireEvent.mouseEnter(trigger);
+
+      const tooltip = document.body.querySelector("[role=tooltip]") as HTMLElement;
+      expect(tooltip.className).not.toContain("-translate-y-full");
+      expect(tooltip.style.top).toBe("172px");
+    } finally {
+      list.remove();
+    }
+  });
+
+  it("still opens upwards when the list has room", () => {
+    const list = document.createElement("div");
+    list.style.overflowY = "auto";
+    document.body.appendChild(list);
+    at(list, 100, 700);
+    try {
+      const { container } = render(
+        <span className="group/action relative">
+          <button type="button">Edit</button>
+          <Tooltip text="Edit message" hint="Resends from here." />
+        </span>,
+        { container: list },
+      );
+      const trigger = container.firstElementChild as HTMLElement;
+      at(trigger, 400, 28);
+      fireEvent.mouseEnter(trigger);
+
+      const tooltip = document.body.querySelector("[role=tooltip]") as HTMLElement;
+      expect(tooltip.className).toContain("-translate-y-full");
+      expect(tooltip.style.top).toBe("396px");
+    } finally {
+      list.remove();
+    }
+  });
 });
 
 describe("the tooltip hint's contrast", () => {

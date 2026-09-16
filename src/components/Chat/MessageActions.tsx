@@ -41,6 +41,24 @@ const TOOLTIP_GAP_PX = 4;
  * pass on every hover. */
 const TOOLTIP_FLIP_ABOVE_PX = 80;
 
+/**
+ * Where the tooltip's room runs out above: the top of the scrolling area its
+ * trigger lives in, or the top of the window when there is none.
+ *
+ * The window is the wrong boundary. Above the message list sits a title bar in
+ * normal flow, and a tooltip that only avoids running off the top of the screen
+ * happily opens into it. Escaping the scrollport's *clipping* is what a portal
+ * is for; staying inside the scrollport's *bounds* is a separate question, and
+ * this is the answer to it.
+ */
+function scrollTop(from: HTMLElement): number {
+  for (let node = from.parentElement; node; node = node.parentElement) {
+    const overflowY = getComputedStyle(node).overflowY;
+    if (overflowY === "auto" || overflowY === "scroll") return node.getBoundingClientRect().top;
+  }
+  return 0;
+}
+
 export function Tooltip({ text, hint }: { text: string; hint?: string }) {
   const anchor = useRef<HTMLSpanElement>(null);
   const [at, setAt] = useState<{ left: number; top: number; below: boolean } | null>(null);
@@ -52,7 +70,7 @@ export function Tooltip({ text, hint }: { text: string; hint?: string }) {
     if (!trigger) return;
     const open = () => {
       const rect = trigger.getBoundingClientRect();
-      const below = rect.top < TOOLTIP_FLIP_ABOVE_PX;
+      const below = rect.top - scrollTop(trigger) < TOOLTIP_FLIP_ABOVE_PX;
       setAt({
         left: rect.left + rect.width / 2,
         top: below ? rect.bottom + TOOLTIP_GAP_PX : rect.top - TOOLTIP_GAP_PX,
