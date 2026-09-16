@@ -128,6 +128,49 @@ describe("MLX local runtime", () => {
   });
 });
 
+describe("a model loaded outside the chat picker", () => {
+  const mlxModel = (): ModelInfo => ({
+    ...localModel(),
+    id: "mlx-qwen",
+    path: "/models/mlx-qwen",
+    runtime: "mlx",
+  });
+
+  it("freezes the resident model as a target even though nothing set `active`", () => {
+    const model = mlxModel();
+    // What Runtime Hub's own load leaves behind: the runtime holds the model
+    // and reports it, and the chat store's `active` was never touched.
+    useModelStore.setState({
+      installed: [model],
+      active: null,
+      mlxChat: { running: true, port: 51234, modelId: "ext-1", modelPath: model.path, vision: false },
+    });
+
+    const snapshot = snapshotForResolvedTarget({ kind: "local" } as ResolvedTarget);
+
+    // Without this the turn is refused with "The selected model target could
+    // not be frozen for the resident runner" while a model is loaded and
+    // answering on its own port.
+    expect(snapshot).not.toBeNull();
+    expect(snapshot?.kind).toBe("local");
+    expect((snapshot as { modelPath?: string }).modelPath).toBe(model.path);
+  });
+
+  it("claims nothing when no runtime is holding a model", () => {
+    useModelStore.setState({ installed: [mlxModel()], active: null, mlxChat: null });
+    expect(snapshotForResolvedTarget({ kind: "local" } as ResolvedTarget)).toBeNull();
+  });
+
+  it("ignores a runtime holding a model this machine no longer lists", () => {
+    useModelStore.setState({
+      installed: [],
+      active: null,
+      mlxChat: { running: true, port: 51234, modelId: "ext-1", modelPath: "/models/gone", vision: false },
+    });
+    expect(snapshotForResolvedTarget({ kind: "local" } as ResolvedTarget)).toBeNull();
+  });
+});
+
 describe("resolveTarget", () => {
   it("reconciles native llama status before freezing a local target", async () => {
     const model = localModel();
