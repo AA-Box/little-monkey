@@ -1,4 +1,5 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { Check, Copy, Pin, PinOff, Square, Volume2 } from "lucide-react";
 
 import { useT } from "../../lib/i18n";
@@ -32,22 +33,73 @@ const ACTION_CLASSES =
  * ones falling back to `title`. Wrap the button in
  * `<span className="group/action relative">` for the hover/focus target.
  */
+/** Distance between the trigger and the tooltip, matching the old `mb-1`. */
+const TOOLTIP_GAP_PX = 4;
+/** Below this much room above the trigger, the tooltip opens downwards instead.
+ * Three lines of 11px text plus padding is about 60px; the extra covers the
+ * tallest hint in the app without measuring, which would cost a second layout
+ * pass on every hover. */
+const TOOLTIP_FLIP_ABOVE_PX = 80;
+
 export function Tooltip({ text, hint }: { text: string; hint?: string }) {
+  const anchor = useRef<HTMLSpanElement>(null);
+  const [at, setAt] = useState<{ left: number; top: number; below: boolean } | null>(null);
+
+  // The trigger is this span's parent — `<span className="group/action relative">`
+  // around the button — so call sites keep passing nothing but their strings.
+  useEffect(() => {
+    const trigger = anchor.current?.parentElement;
+    if (!trigger) return;
+    const open = () => {
+      const rect = trigger.getBoundingClientRect();
+      const below = rect.top < TOOLTIP_FLIP_ABOVE_PX;
+      setAt({
+        left: rect.left + rect.width / 2,
+        top: below ? rect.bottom + TOOLTIP_GAP_PX : rect.top - TOOLTIP_GAP_PX,
+        below,
+      });
+    };
+    const close = () => setAt(null);
+    trigger.addEventListener("mouseenter", open);
+    trigger.addEventListener("mouseleave", close);
+    trigger.addEventListener("focusin", open);
+    trigger.addEventListener("focusout", close);
+    // A tooltip pinned to viewport coordinates is wrong the moment the list
+    // moves under it, and it cannot follow what it no longer overlaps.
+    window.addEventListener("scroll", close, true);
+    return () => {
+      trigger.removeEventListener("mouseenter", open);
+      trigger.removeEventListener("mouseleave", close);
+      trigger.removeEventListener("focusin", open);
+      trigger.removeEventListener("focusout", close);
+      window.removeEventListener("scroll", close, true);
+    };
+  }, []);
+
   return (
-    <span
-      role="tooltip"
-      className={`pointer-events-none absolute bottom-full left-1/2 z-30 mb-1 hidden -translate-x-1/2 rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground shadow-lg group-hover/action:block group-focus-within/action:block ${
-        hint ? "w-max max-w-[15rem] text-left" : "whitespace-nowrap"
-      }`}
-    >
-      {text}
-      {/* `muted`, not `faint`: this is an 11px sentence someone has to read,
-          not a de-emphasised label they can skim past. `faint` on the tooltip's
-          background is 4.83:1 in light and 5.08:1 in dark — over the AA line
-          for normal text and under it for text this small, which is exactly
-          how it reads. `muted` is 7.73:1 and 7.24:1. */}
-      {hint && <span className="mt-0.5 block text-muted">{hint}</span>}
-    </span>
+    <>
+      <span ref={anchor} className="hidden" aria-hidden="true" />
+      {at !== null &&
+        createPortal(
+          <span
+            role="tooltip"
+            style={{ left: at.left, top: at.top }}
+            className={`pointer-events-none fixed z-50 -translate-x-1/2 rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground shadow-lg ${
+              at.below ? "" : "-translate-y-full"
+            } ${hint ? "w-max max-w-[15rem] text-left" : "whitespace-nowrap"}`}
+          >
+            {text}
+            {/* `muted`, not `faint`: this is an 11px sentence someone has to
+                read, not a de-emphasised label they can skim past. `faint` on
+                the tooltip's background is 4.83:1 in light and 5.08:1 in dark —
+                over the AA line for normal text and under it for text this
+                small, which is exactly how it reads. `muted` is 7.73:1 and
+                7.24:1. */}
+            {hint && <span className="mt-0.5 block text-muted">{hint}</span>}
+          </span>,
+          document.body,
+        )}
+    </>
   );
 }
 
