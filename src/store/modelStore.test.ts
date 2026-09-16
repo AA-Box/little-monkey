@@ -585,6 +585,48 @@ describe("start", () => {
     expect(useModelStore.getState().llamaStatus).toBe("ready");
   });
 
+  it("keeps an MLX start failure instead of adopting llama-server's stopped", async () => {
+    // llama-server is legitimately stopped while an MLX model is selected, so
+    // its status is not an opinion about that model. Adopting it turns a
+    // specific failure into "selected but not running (stopped)".
+    invokeMock.mockClear();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "models_list") return Promise.resolve([]);
+      if (command === "llama_status") return Promise.resolve({ status: "stopped" });
+      return Promise.resolve(undefined);
+    });
+    useModelStore.setState({
+      active: mlxModel,
+      mlxChat: null,
+      llamaStatus: "error",
+      llamaError: "the verified MLX runtime is not installed",
+    });
+
+    await useModelStore.getState().refresh();
+
+    const state = useModelStore.getState();
+    expect(state.llamaStatus).toBe("error");
+    expect(state.llamaError).toBe("the verified MLX runtime is not installed");
+  });
+
+  // Guard, not a change: the optimistic `set` at the top of the MLX path
+  // already clears `llamaError`. The freeze-failure message reads that field,
+  // so a stale reason surviving a successful start would be reported as a live
+  // one — this pins the behaviour that keeps it honest.
+  it("retires the previous failure once a start succeeds", async () => {
+    invokeMock.mockClear();
+    invokeMock.mockImplementation((command: string) =>
+      command === "mlx_chat_start"
+        ? Promise.resolve({ running: true, port: 51234, modelId: "x", modelPath: mlxModel.path, vision: false })
+        : Promise.resolve(undefined),
+    );
+    useModelStore.setState({ mlxChat: null, llamaStatus: "error", llamaError: "an earlier failure" });
+
+    await useModelStore.getState().start(mlxModel);
+
+    expect(useModelStore.getState().llamaError).toBeNull();
+  });
+
   it("stops the MLX runtime the backend reports, not the one the mirror remembers", async () => {
     // The mirror is empty and the runtime is holding a model — the state after
     // a switch whose optimistic clear raced a refresh. Trusting the mirror here

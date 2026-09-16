@@ -612,6 +612,15 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     // stopped on every model-list refresh.
     const residentMlx = (await currentMlxChat(set)) ?? get().mlxChat;
     if (residentMlx?.running) return;
+    // `llama_status` describes llama-server and nothing else. When the selected
+    // model runs on MLX, llama-server is legitimately stopped, and adopting its
+    // answer overwrites whatever the MLX start recorded — including the `error`
+    // that carries the reason it failed. The turn then reports
+    //
+    //     … is selected but not running (stopped).
+    //
+    // for a model whose start failed with something specific and knowable.
+    if (get().active?.runtime === "mlx") return;
     try {
       const status = await invoke<LlamaStatusEvent>("llama_status");
       set((state) => ({
