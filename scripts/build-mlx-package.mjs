@@ -245,7 +245,9 @@ function publish(version, manifest) {
       lilyGardenCommit: LILY_GARDEN_COMMIT,
       lilyModel: "Qwen3.6-35B-A3B",
       lilyMinimumMacos: "26.1",
-      lilyMinimumAppleMGeneration: 1,
+      // Strings, not numbers: `metadata` deserializes into a
+      // `BTreeMap<String, String>` and one integer refuses the whole catalog.
+      lilyMinimumAppleMGeneration: "1",
     },
   };
   assertCatalogEntryShape(entry);
@@ -276,6 +278,14 @@ const ACCELERATORS = new Set([
  * standing.
  */
 function assertCatalogEntryShape(entry) {
+  for (const [key, value] of Object.entries(entry.metadata ?? {})) {
+    if (typeof value !== "string") {
+      throw new Error(
+        `metadata.${key} must be a string — the app reads metadata as a map of strings, ` +
+          `and one other type refuses the whole catalog — got ${JSON.stringify(value)}`,
+      );
+    }
+  }
   if (entry.accelerator !== null && !ACCELERATORS.has(entry.accelerator)) {
     throw new Error(
       `accelerator must be null or one of ${[...ACCELERATORS].join(", ")}, got ${JSON.stringify(entry.accelerator)}`,
