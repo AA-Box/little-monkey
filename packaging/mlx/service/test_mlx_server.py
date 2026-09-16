@@ -9,8 +9,10 @@ machine with a model on disk to catch a renamed JSON key or a cache-state bug
 would mean never catching it.
 """
 
+import io
 import json
 import sys
+import tempfile
 import threading
 import types
 import urllib.error
@@ -407,6 +409,43 @@ def check_vision_models_are_detected_from_their_own_config():
     print("ok: a vision tower is detected from config.json")
 
 
+def check_a_vision_model_the_vlm_stack_cannot_read_falls_back_to_text():
+    """`vision_config` says what the checkpoint carries, not what MLX can read.
+
+    The two stacks add architectures on their own schedules, so a model
+    mlx-vlm has no module for may still load as text in mlx-lm. Serving it
+    without images beats refusing to serve it.
+    """
+    config = {"model_type": "some_new_arch", "vision_config": {"depth": 2}}
+    written = tempfile.mkdtemp()
+    (Path(written) / "config.json").write_text(json.dumps(config))
+
+    failing = types.ModuleType("mlx_vlm")
+
+    def _refuse(path):
+        raise ValueError("Model type some_new_arch not supported.")
+
+    failing.load = _refuse
+    previous = sys.modules.get("mlx_vlm")
+    sys.modules["mlx_vlm"] = failing
+    captured = io.StringIO()
+    stderr = sys.stderr
+    sys.stderr = captured
+    try:
+        runtime = mlx_server._load_model(written)
+    finally:
+        sys.stderr = stderr
+        if previous is None:
+            del sys.modules["mlx_vlm"]
+        else:
+            sys.modules["mlx_vlm"] = previous
+
+    assert isinstance(runtime, mlx_server._TextRuntime), type(runtime)
+    assert "vision_stack_unavailable" in captured.getvalue(), captured.getvalue()
+    assert "fallback=text" in captured.getvalue()
+    print("ok: a vision model the VLM stack cannot read is served as text")
+
+
 def check_generation_failure_still_terminates():
     """A model that dies mid-stream must still close the protocol.
 
@@ -486,6 +525,7 @@ if __name__ == "__main__":
     check_a_text_model_refuses_images_instead_of_ignoring_them()
     check_only_inline_images_are_accepted()
     check_vision_models_are_detected_from_their_own_config()
+    check_a_vision_model_the_vlm_stack_cannot_read_falls_back_to_text()
     check_generation_failure_still_terminates()
     check_prompt_cache_key_is_bounded()
     check_rejects_non_loopback_host()
