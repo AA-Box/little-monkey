@@ -2988,6 +2988,16 @@ impl ManagedProcessController for SystemManagedProcessController {
             let mut command = tokio::process::Command::new(&spec.program);
             command
                 .args(&spec.args)
+                // A packaged interpreter must not write bytecode into the tree
+                // its own manifest is verified against. `-B` on the argument
+                // vector covers only the process we spawn: `runtime_router.py`
+                // ends in `os.execv`, which builds a fresh argv and drops the
+                // flag, so the service that actually loads the model runs
+                // without it. The environment survives that exec and every
+                // child below it, which is why the guarantee lives here — the
+                // one place every managed runtime child is spawned — rather
+                // than in each argument vector.
+                .env("PYTHONDONTWRITEBYTECODE", "1")
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(stdout))
                 .stderr(Stdio::from(stderr))
