@@ -250,6 +250,18 @@ def test_router_model_gate() -> None:
         assert not router._model_is_lily_candidate(root)
 
 
+def test_router_macos_gate() -> None:
+    """Lily's BF16 tensor kernels need macOS 26.1; 26.0 must serve MLX."""
+    router = _load(ROUTER, "runtime_router_macos_test")
+    original = router.platform.mac_ver
+    try:
+        for version, expected in (("26.1", True), ("26.5.2", True), ("27.0", True), ("26.0", False), ("15.6", False)):
+            router.platform.mac_ver = lambda version=version: (version, ("", "", ""), "arm64")
+            assert router._macos_26_1_or_newer() is expected, version
+    finally:
+        router.platform.mac_ver = original
+
+
 def test_request_capability_gate() -> None:
     managed = _load(SERVICE, "lily_managed_test")
     base = {
@@ -397,6 +409,7 @@ def test_full_managed_lily_then_cancel_then_capability_fallback() -> None:
 def main() -> None:
     _stage("router gate")
     test_router_model_gate()
+    test_router_macos_gate()
     _stage("request capability gate")
     test_request_capability_gate()
     test_full_managed_lily_then_cancel_then_capability_fallback()
