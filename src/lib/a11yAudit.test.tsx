@@ -19,6 +19,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { A11Y_RULES, auditDom, formatViolations } from "./a11yAudit";
+import { Tooltip } from "../components/Chat/MessageActions";
 
 afterEach(cleanup);
 
@@ -173,5 +174,73 @@ describe("rendered screens", () => {
     );
     const violations = auditDom(container);
     expect(violations, `DiffViewer violations:\n${formatViolations(violations)}`).toEqual([]);
+  });
+});
+
+/**
+ * Colour contrast for the one place the app writes a *sentence* in a secondary
+ * colour: the hint line under a tooltip's label.
+ *
+ * It is 11px, it explains what a button will do to the conversation, and it was
+ * shipped in `faint` — the weakest token in the palette, 4.83:1 on the tooltip
+ * background in light and 5.08:1 in dark. Over the AA line for normal text,
+ * under it for text this small, and unreadable in practice. The threshold here
+ * is AAA rather than AA for that reason: a sentence nobody can read is not a
+ * hint, and the size is what makes the usual line too generous.
+ */
+describe("the tooltip hint's contrast", () => {
+  const THEMES = ["light", "dark", "light high-contrast", "dark high-contrast"] as const;
+  const AAA_NORMAL_TEXT = 7;
+
+  /** Every custom property declared in one `:root…{ }` block of index.css. */
+  function block(css: string, selector: string): Record<string, string> {
+    const start = css.indexOf(`${selector} {`);
+    if (start < 0) throw new Error(`index.css has no ${selector} block`);
+    const body = css.slice(start, css.indexOf("}", start));
+    return Object.fromEntries(
+      [...body.matchAll(/(--c-[a-z0-9-]+):\s*(#[0-9a-f]{6})/gi)].map((m) => [m[1], m[2]]),
+    );
+  }
+
+  function relativeLuminance(hex: string): number {
+    const channel = (pair: string) => {
+      const srgb = parseInt(pair, 16) / 255;
+      return srgb <= 0.03928 ? srgb / 12.92 : ((srgb + 0.055) / 1.055) ** 2.4;
+    };
+    const [r, g, b] = [hex.slice(1, 3), hex.slice(3, 5), hex.slice(5, 7)].map(channel);
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  }
+
+  function contrast(foreground: string, background: string): number {
+    const [lighter, darker] = [relativeLuminance(foreground), relativeLuminance(background)].sort(
+      (a, b) => b - a,
+    );
+    return (lighter + 0.05) / (darker + 0.05);
+  }
+
+  it.each(THEMES)("reads at AAA in %s", (theme) => {
+    const css = fs.readFileSync(path.join(process.cwd(), "src/index.css"), "utf8");
+    const light = block(css, ":root");
+    const resolved = {
+      light,
+      dark: { ...light, ...block(css, ':root[data-theme="dark"]') },
+      "light high-contrast": { ...light, ...block(css, ':root[data-contrast="high"]') },
+      "dark high-contrast": {
+        ...light,
+        ...block(css, ':root[data-theme="dark"]'),
+        ...block(css, ':root[data-theme="dark"][data-contrast="high"]'),
+      },
+    }[theme];
+
+    // The token the component actually uses, so swapping it back to `faint`
+    // fails here rather than only on someone's screen.
+    const { container } = render(<Tooltip text="Edit" hint="Resends from here." />);
+    const hint = container.querySelector("[role=tooltip] > span");
+    const token = hint?.className.match(/\btext-([a-z0-9-]+)\b/)?.[1];
+    expect(token, "the hint should carry a colour token").toBeTruthy();
+
+    // The tooltip paints itself `bg-background`.
+    const ratio = contrast(resolved[`--c-${token}`], resolved["--c-background"]);
+    expect(ratio).toBeGreaterThanOrEqual(AAA_NORMAL_TEXT);
   });
 });
