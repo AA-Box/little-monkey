@@ -15,6 +15,55 @@ pub struct SystemMemoryInfo {
     pub available_bytes: u64,
 }
 
+/// Physical memory the OS can hand out to a new process without swapping.
+///
+/// Deliberately not `system_memory::available()` on macOS. That crate sums
+/// `active + free`, which counts pages a process is *using right now* as
+/// available and leaves out the inactive pages that are the largest
+/// reclaimable pool on a Mac. The two errors do not cancel: the figure tracks
+/// whatever the busiest app happens to be holding, so an admission decision
+/// made from it flips for reasons that have nothing to do with how much memory
+/// is free. A daemon job reserving more than the understated figure is held
+/// forever, on a machine with the memory to run it.
+///
+/// `free_count` already includes `speculative_count`, so adding speculative
+/// separately would double-count it. Purgeable pages are counted because the
+/// kernel drops them on demand rather than swapping.
+#[cfg(target_os = "macos")]
+pub(crate) fn available_memory_bytes() -> u64 {
+    let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64_data_t>::uninit();
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    // SAFETY: the kernel writes `count` u32-sized fields into a buffer sized
+    // from the same struct definition `count` is derived from, and the value is
+    // read only after a success status.
+    let status = unsafe {
+        libc::host_statistics64(
+            libc::mach_host_self(),
+            libc::HOST_VM_INFO64,
+            stats.as_mut_ptr().cast(),
+            &mut count,
+        )
+    };
+    // SAFETY: `_SC_PAGESIZE` takes no pointer and cannot fail for a valid name.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if status != libc::KERN_SUCCESS || page_size <= 0 {
+        // A probe the kernel refused is not a reason to report zero free bytes,
+        // which would hold every queued job. Fall back to the crate's figure.
+        return system_memory::available();
+    }
+    // SAFETY: `host_statistics64` returned success, so the struct is initialized.
+    let stats = unsafe { stats.assume_init() };
+    let pages = u64::from(stats.free_count)
+        + u64::from(stats.inactive_count)
+        + u64::from(stats.purgeable_count);
+    pages.saturating_mul(page_size as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn available_memory_bytes() -> u64 {
+    system_memory::available()
+}
+
 /// Returns a point-in-time physical-memory snapshot for comparison launch
 /// planning. The third-party syscall wrapper documents that a platform call
 /// may panic; convert that into an ordinary IPC error so model selection can
@@ -23,7 +72,7 @@ pub struct SystemMemoryInfo {
 pub fn system_memory_info() -> Result<SystemMemoryInfo, String> {
     std::panic::catch_unwind(|| SystemMemoryInfo {
         total_bytes: system_memory::total(),
-        available_bytes: system_memory::available(),
+        available_bytes: available_memory_bytes(),
     })
     .map_err(|_| "Failed to read system memory information".to_string())
 }
@@ -183,5 +232,16 @@ mod tests {
         let info = system_memory_info().expect("system memory query");
         assert!(info.total_bytes > 0);
         assert!(info.available_bytes <= info.total_bytes);
+    }
+
+    /// The bug this guards: a figure built from `active + free` reports pages
+    /// in use as available and omits the inactive pool, so it can land *below*
+    /// what the machine can really hand out. Any machine with idle inactive
+    /// pages fails this if the summation goes back to counting `active`.
+    #[test]
+    fn available_memory_is_never_more_than_the_machine_has() {
+        let available = available_memory_bytes();
+        assert!(available > 0, "a running machine has some memory to hand out");
+        assert!(available <= system_memory::total());
     }
 }
