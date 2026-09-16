@@ -143,11 +143,13 @@ pub struct SystemM3HardwareProbe;
 
 impl crate::m3_runtime_hub::M3HardwareProbe for SystemM3HardwareProbe {
     fn snapshot(&self) -> M3HubResult<HardwareSnapshot> {
-        let (total_ram_bytes, available_ram_bytes) =
-            std::panic::catch_unwind(|| (system_memory::total(), system_memory::available()))
-                .map_err(|_| {
-                    M3HubError::Runtime("operating-system memory probe failed".to_string())
-                })?;
+        let (total_ram_bytes, available_ram_bytes) = std::panic::catch_unwind(|| {
+            (
+                system_memory::total(),
+                crate::system::available_memory_bytes(),
+            )
+        })
+        .map_err(|_| M3HubError::Runtime("operating-system memory probe failed".to_string()))?;
         if total_ram_bytes == 0 || available_ram_bytes > total_ram_bytes {
             return Err(M3HubError::Runtime(
                 "operating-system memory probe returned impossible values".to_string(),
