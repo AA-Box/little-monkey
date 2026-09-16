@@ -521,6 +521,40 @@ async function fetchProviderModelRetirements(
   }
 }
 
+/**
+ * What the MLX runtime is actually doing, not what this store last recorded.
+ *
+ * `mlxChat` is a mirror, and three writers race on it: `selectModel` clears it
+ * optimistically before a switch, `refresh` overwrites `llamaStatus` from
+ * llama-server whenever the mirror looks idle, and `stop` picks which runtime
+ * to stop by reading it. Lose that race once and the store believes nothing is
+ * resident while a model is still loaded and holding its memory — `stop` then
+ * stops llama-server instead, `selectModel` skips the `mlx_chat_stop` the
+ * switch needed, and the next model cannot start because the old one never let
+ * go:
+ *
+ *     Qwen3.6-35B-A3B-MLX (4-bit) is selected but not running (stopped).
+ *
+ * `mlx_chat_status` is the runtime's own answer and costs one IPC call. Ask it
+ * at each of those three decision points rather than trusting the mirror, and
+ * write what it says back so the mirror converges instead of drifting.
+ */
+async function currentMlxChat(
+  set: (partial: Partial<ModelStore>) => void,
+): Promise<MlxChatStatus | null> {
+  try {
+    const status = await invoke<MlxChatStatus>("mlx_chat_status");
+    const resolved = status.running ? status : null;
+    set({ mlxChat: resolved });
+    return resolved;
+  } catch (error) {
+    // An unreachable runtime is not evidence that nothing is loaded, so leave
+    // the mirror alone and let the caller fall back to it.
+    console.error("Failed to read MLX chat status", error);
+    return null;
+  }
+}
+
 export const useModelStore = create<ModelStore>((set, get) => ({
   curated: [],
   installed: [],
@@ -576,7 +610,8 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     // Skipped while an MLX model is resident: llama-server is legitimately
     // stopped then, and syncing from it would report the running model as
     // stopped on every model-list refresh.
-    if (get().mlxChat?.running) return;
+    const residentMlx = (await currentMlxChat(set)) ?? get().mlxChat;
+    if (residentMlx?.running) return;
     try {
       const status = await invoke<LlamaStatusEvent>("llama_status");
       set((state) => ({
@@ -657,7 +692,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       // while the first still holds it fails with `ModelAlreadyRunning`
       // instead of switching models. Read the running endpoint before the
       // optimistic `set` below clears it.
-      const runningMlx = get().mlxChat;
+      const runningMlx = (await currentMlxChat(set)) ?? get().mlxChat;
       set({
         active: model,
         llamaStatus: "starting",
@@ -736,7 +771,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
   },
 
   stop: async () => {
-    if (get().mlxChat?.running) {
+    if (((await currentMlxChat(set)) ?? get().mlxChat)?.running) {
       await invoke("mlx_chat_stop");
       set({ mlxChat: null, llamaStatus: "stopped", llamaError: null, llamaVisionEnabled: false, llamaProjectorPath: null });
       return;

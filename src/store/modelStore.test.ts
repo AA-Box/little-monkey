@@ -585,6 +585,46 @@ describe("start", () => {
     expect(useModelStore.getState().llamaStatus).toBe("ready");
   });
 
+  it("stops the MLX runtime the backend reports, not the one the mirror remembers", async () => {
+    // The mirror is empty and the runtime is holding a model — the state after
+    // a switch whose optimistic clear raced a refresh. Trusting the mirror here
+    // stops llama-server, leaves the MLX model resident holding its memory, and
+    // the next start has nowhere to run.
+    invokeMock.mockClear();
+    invokeMock.mockImplementation((command: string) =>
+      command === "mlx_chat_status"
+        ? Promise.resolve({ running: true, port: 51234, modelId: "x", modelPath: mlxPath, vision: false })
+        : Promise.resolve(undefined),
+    );
+    useModelStore.setState({ mlxChat: null });
+
+    await useModelStore.getState().stop();
+
+    const commands = invokeMock.mock.calls.map((call) => call[0] as string);
+    expect(commands).toContain("mlx_chat_stop");
+    expect(commands).not.toContain("llama_stop");
+  });
+
+  it("stops a resident MLX model before starting another, even with an empty mirror", async () => {
+    invokeMock.mockClear();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "mlx_chat_status") {
+        return Promise.resolve({ running: true, port: 51234, modelId: "other", modelPath: "/models/other-mlx", vision: false });
+      }
+      if (command === "mlx_chat_start") {
+        return Promise.resolve({ running: true, port: 51234, modelId: "x", modelPath: mlxModel.path, vision: false });
+      }
+      return Promise.resolve(undefined);
+    });
+    useModelStore.setState({ mlxChat: null });
+
+    await useModelStore.getState().start(mlxModel);
+
+    const commands = invokeMock.mock.calls.map((call) => call[0] as string);
+    expect(commands).toContain("mlx_chat_stop");
+    expect(commands.indexOf("mlx_chat_stop")).toBeLessThan(commands.indexOf("mlx_chat_start"));
+  });
+
   it("restarts the same MLX model without stopping it first", async () => {
     invokeMock.mockClear();
     invokeMock.mockImplementation((command: string) =>
