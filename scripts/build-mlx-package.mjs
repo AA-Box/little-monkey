@@ -9,7 +9,7 @@
  * The package is self-contained and signed. In addition to the pinned MLX
  * Python stack it carries a Lily binary built from one immutable upstream
  * commit. `service/runtime_router.py` is the only serviceEntry: it selects Lily
- * conservatively on supported M5+/macOS 26+ Qwen3.6 hosts and otherwise execs
+ * conservatively on macOS 26.1+ Apple silicon Qwen3.6 hosts and otherwise execs
  * the normal MLX service. No user PATH executable is trusted at runtime.
  */
 
@@ -48,8 +48,8 @@ const MLX_VIDEO_COMMIT = "87db56a51758fefb748a359b90a5283bb8ba4837";
  * Audited Lily source revision. Do not use a branch/tag here: a managed
  * executable must be reproducibly attributable to the source we reviewed.
  */
-const LILY_GARDEN_COMMIT = "1ed972ed3f0bd5616c997c9507c25616c63394fc";
-const LILY_REPOSITORY = "https://github.com/perplexityai/pplx-garden.git";
+const LILY_GARDEN_COMMIT = "27cb5d9b257c757468b2420d064cfda55b2e72f0";
+const LILY_REPOSITORY = "https://github.com/AA-Box/pplx-garden.git";
 const SOURCE_ID = "little-monkey-mlx";
 const COMPONENT_ID = "mlx-runtime-apple-silicon";
 const ARCHIVE_PREFIX = "mlx-runtime";
@@ -234,7 +234,7 @@ function publish(version, manifest) {
     compatibilityNote:
       `Requires Apple silicon. Carries MLX ${MLX_VERSION}, mlx-lm ${MLX_LM_VERSION}, ` +
       `mlx-vlm ${MLX_VLM_VERSION}, the pinned MLX video engine, and Lily ${LILY_GARDEN_COMMIT.slice(0, 12)}. ` +
-      `Lily acceleration is selected only on M5+/macOS 26+ with its exact Qwen3.6 affine-Q4 model; ` +
+      `Lily acceleration is selected only on macOS 26.1+ with its exact Qwen3.6 affine-Q4 model; ` +
       `all other models and unsupported Lily request surfaces use the normal MLX engine. ` +
       `Ships ${manifest.files.length} files.`,
     metadata: {
@@ -244,8 +244,8 @@ function publish(version, manifest) {
       mlxVideoCommit: MLX_VIDEO_COMMIT,
       lilyGardenCommit: LILY_GARDEN_COMMIT,
       lilyModel: "Qwen3.6-35B-A3B",
-      lilyMinimumMacos: "26",
-      lilyMinimumAppleMGeneration: 5,
+      lilyMinimumMacos: "26.1",
+      lilyMinimumAppleMGeneration: 1,
     },
   };
   assertCatalogEntryShape(entry);
