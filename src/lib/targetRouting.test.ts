@@ -16,6 +16,7 @@ import {
   snapshotForResolvedTarget,
 } from "./targetRouting";
 import { useModelStore, type ModelInfo, type OllamaModelInfo } from "../store/modelStore";
+import type { ResolvedTarget } from "./turnEngine";
 
 function localModel(): ModelInfo {
   return {
@@ -143,7 +144,13 @@ describe("a model loaded outside the chat picker", () => {
     useModelStore.setState({
       installed: [model],
       active: null,
-      mlxChat: { running: true, port: 51234, modelId: "ext-1", modelPath: model.path, vision: false },
+      mlxChat: {
+        running: true,
+        port: 51234,
+        modelId: "ext-1",
+        modelPath: model.path ?? "",
+        vision: false,
+      },
     });
 
     const snapshot = snapshotForResolvedTarget({ kind: "local" } as ResolvedTarget);
