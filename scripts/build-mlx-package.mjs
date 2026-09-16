@@ -221,7 +221,10 @@ function publish(version, manifest) {
     componentId: COMPONENT_ID,
     kind: "mlx_runtime",
     displayName: "MLX runtime (Apple silicon)",
-    accelerator: "Lily on M5+ / macOS 26+ for Qwen3.6-35B-A3B",
+    // The enum the app deserializes into, not prose: anything else and the
+    // published catalog fails to parse, so every client's "Check for new
+    // versions" refuses the whole file. What Lily needs is in the note below.
+    accelerator: "metal",
     version,
     channel: "stable",
     downloadUrl: process.env.MLX_DOWNLOAD_URL ?? `file://${archive}`,
@@ -245,10 +248,51 @@ function publish(version, manifest) {
       lilyMinimumAppleMGeneration: 5,
     },
   };
+  assertCatalogEntryShape(entry);
   const catalog = join(REPOSITORY_ROOT, "packaging/mlx", "mlx-catalog.json");
   writeFileSync(catalog, `${JSON.stringify([entry], null, 2)}\n`);
   console.log(`archive: ${archive} (${(bytes.length / 1e6).toFixed(0)} MB)`);
   console.log(`catalog: ${catalog}`);
+}
+
+/** Accelerators `AcceleratorKind` (src-tauri/src/runtime_adapter.rs) accepts. */
+const ACCELERATORS = new Set([
+  "cpu",
+  "metal",
+  "cuda",
+  "rocm",
+  "vulkan",
+  "direct_ml",
+  "apple_neural_engine",
+]);
+
+/**
+ * Refuses to publish a catalog entry the app cannot deserialize.
+ *
+ * A catalog is parsed whole or not at all — deliberately, so nothing adopts
+ * half a file — which means one bad field silently costs every client every
+ * update in it, and the failure surfaces as a button that appears to do
+ * nothing. Cheaper to fail here, where the person who changed the field is
+ * standing.
+ */
+function assertCatalogEntryShape(entry) {
+  if (entry.accelerator !== null && !ACCELERATORS.has(entry.accelerator)) {
+    throw new Error(
+      `accelerator must be null or one of ${[...ACCELERATORS].join(", ")}, got ${JSON.stringify(entry.accelerator)}`,
+    );
+  }
+  for (const [field, expected] of [
+    ["componentId", "string"],
+    ["version", "string"],
+    ["downloadUrl", "string"],
+    ["sha256", "string"],
+    ["sizeBytes", "number"],
+    ["publishedAtMs", "number"],
+  ]) {
+    if (typeof entry[field] !== expected) {
+      throw new Error(`${field} must be a ${expected}, got ${JSON.stringify(entry[field])}`);
+    }
+  }
 }
 
 function pruneBytecode(directory) {
