@@ -20,7 +20,15 @@
  */
 
 import { createHash, sign as cryptoSign, createPrivateKey } from "node:crypto";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import { basename, join, relative, sep } from "node:path";
 
 /** Schema the Rust side accepts. Bump only alongside MLX_PACKAGE_SCHEMA_VERSION. */
@@ -145,4 +153,45 @@ export function signManifest(manifest, privateKeyPem) {
   }
   const signature = cryptoSign(null, signedPayload(manifest), key);
   return { ...manifest, signatureBase64: signature.toString("base64") };
+}
+
+/**
+ * Replaces every symlink under `directory` with a copy of what it pointed at.
+ *
+ * The installer refuses a package containing symlinks — a link is a second name
+ * for bytes the manifest did not sign — and the relocatable CPython archive
+ * ships eight of them, `bin/python3` among them.
+ */
+export function materializeSymlinks(directory) {
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isSymbolicLink()) {
+      const target = realpathSync(path);
+      const mode = statSync(target).mode;
+      unlinkSync(path);
+      copyFileSync(target, path);
+      chmodSync(path, mode);
+    } else if (entry.isDirectory()) {
+      materializeSymlinks(path);
+    }
+  }
+}
+
+/**
+ * Whether a library a packaged binary loads lives outside the package.
+ *
+ * `/usr/lib` and `/System` are the OS and are present on every Mac by
+ * definition. A Homebrew or `/usr/local` path is the build host's, and needing
+ * it is what made a published runtime abort on every machine that did not
+ * happen to have that exact version:
+ *
+ *     dyld: Library not loaded: /opt/homebrew/Cellar/python@3.14/3.14.7/…/Python
+ *
+ * Relative loader paths (`@executable_path`, `@loader_path`, `@rpath`) resolve
+ * inside the package, which is the whole point of shipping one.
+ */
+export function loadsFromOutsideThePackage(library) {
+  if (!library || library.startsWith("@")) return false;
+  if (library.startsWith("/usr/lib/") || library.startsWith("/System/")) return false;
+  return library.startsWith("/");
 }

@@ -17,19 +17,32 @@ import { execFileSync } from "node:child_process";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import {
   chmodSync,
+  copyFileSync,
   cpSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
+  renameSync,
   rmSync,
+  statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { buildManifest, canonicalJson, serviceRevision, signManifest } from "./lib/mlxPackage.mjs";
+import {
+  buildManifest,
+  canonicalJson,
+  loadsFromOutsideThePackage,
+  materializeSymlinks,
+  serviceRevision,
+  signManifest,
+} from "./lib/mlxPackage.mjs";
 
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SOURCE_SERVICE = join(REPOSITORY_ROOT, "packaging/mlx/service/mlx_server.py");
@@ -44,6 +57,27 @@ const MLX_VERSION = "0.32.2";
 const MLX_LM_VERSION = "0.31.3";
 const MLX_VLM_VERSION = "0.7.0";
 const MLX_VIDEO_COMMIT = "87db56a51758fefb748a359b90a5283bb8ba4837";
+/**
+ * A relocatable CPython, not the build host's.
+ *
+ * `python3 -m venv` copies a launcher that still links the interpreter it was
+ * made from by absolute path — on a GitHub runner, Homebrew's
+ * `/opt/homebrew/Cellar/python@3.14/<version>/…/Python`. Every client then needs
+ * that exact patch version installed in that exact prefix, and the day the
+ * runner's Homebrew moved from 3.14.6 to 3.14.7 every installed app got:
+ *
+ *     dyld: Library not loaded: /opt/homebrew/Cellar/python@3.14/3.14.7/…/Python
+ *
+ * python-build-standalone links only system libraries and resolves its own
+ * libpython relative to the executable, which is what makes a package that runs
+ * where it is unpacked.
+ */
+const PYTHON_RELEASE = "20260901";
+const PYTHON_VERSION = "3.14.7";
+const PYTHON_ARCHIVE = `cpython-${PYTHON_VERSION}+${PYTHON_RELEASE}-aarch64-apple-darwin-install_only.tar.gz`;
+const PYTHON_URL = `https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_RELEASE}/${PYTHON_ARCHIVE}`;
+/** From that release's `SHA256SUMS`. */
+const PYTHON_SHA256 = "30daa970c7d223530120f1693cd3c6fa4c0c0d31ef158710b0dd77f286a5b23e";
 /**
  * Audited Lily source revision. Do not use a branch/tag here: a managed
  * executable must be reproducibly attributable to the source we reviewed.
@@ -68,6 +102,73 @@ function keygen() {
       "",
     ].join("\n"),
   );
+}
+
+/**
+ * Unpacks the pinned CPython into `destination`, digest-checked, with no
+ * symlinks and nothing linked outside the package.
+ */
+function installRelocatablePython(destination) {
+  const staging = mkdtempSync(join(tmpdir(), "little-monkey-python-"));
+  try {
+    const archive = join(staging, PYTHON_ARCHIVE);
+    execFileSync("curl", ["--fail", "--location", "--silent", "--show-error", "--output", archive, PYTHON_URL], {
+      stdio: "inherit",
+    });
+    const digest = createHash("sha256").update(readFileSync(archive)).digest("hex");
+    if (digest !== PYTHON_SHA256) {
+      throw new Error(`CPython archive digest mismatch: wanted ${PYTHON_SHA256}, got ${digest}`);
+    }
+    execFileSync("tar", ["-xzf", archive, "-C", staging], { stdio: "inherit" });
+    renameSync(join(staging, "python"), destination);
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+  }
+  materializeSymlinks(destination);
+  assertNothingLinksOutside(destination);
+}
+
+/**
+ * Fails the build if anything in the package loads a library from outside it.
+ *
+ * This is the check that was missing: a venv-built interpreter linked the build
+ * host's Homebrew framework by absolute path, the package installed and
+ * verified fine everywhere, and the failure arrived at each client as a dyld
+ * abort the first time a model was loaded.
+ */
+function assertNothingLinksOutside(root) {
+  const offenders = [];
+  const walk = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        walk(path);
+        continue;
+      }
+      if (!entry.isFile() || lstatSync(path).size < 4) continue;
+      // Mach-O, thin or fat, either endianness.
+      const magic = readFileSync(path).subarray(0, 4).readUInt32BE(0);
+      if (![0xfeedfacf, 0xcffaedfe, 0xfeedface, 0xcefaedfe, 0xcafebabe].includes(magic)) continue;
+      let linked = "";
+      try {
+        linked = execFileSync("otool", ["-L", path], { encoding: "utf8" });
+      } catch {
+        continue; // Not something otool reads; nothing to claim about it.
+      }
+      for (const line of linked.split("\n").slice(1)) {
+        const library = line.trim().split(" ")[0];
+        if (loadsFromOutsideThePackage(library)) {
+          offenders.push(`${path.slice(root.length + 1)} → ${library}`);
+        }
+      }
+    }
+  };
+  walk(root);
+  if (offenders.length) {
+    throw new Error(
+      `the packaged runtime links libraries outside itself, which no client is guaranteed to have:\n  ${offenders.join("\n  ")}`,
+    );
+  }
 }
 
 function buildLily() {
@@ -120,10 +221,8 @@ function build() {
   rmSync(OUTPUT_ROOT, { recursive: true, force: true });
   mkdirSync(OUTPUT_ROOT, { recursive: true });
 
-  console.log("creating the packaged interpreter…");
-  execFileSync("python3", ["-m", "venv", "--copies", join(OUTPUT_ROOT, "runtime")], {
-    stdio: "inherit",
-  });
+  console.log(`fetching the packaged interpreter (CPython ${PYTHON_VERSION})…`);
+  installRelocatablePython(join(OUTPUT_ROOT, "runtime"));
   const python = join(OUTPUT_ROOT, "runtime/bin/python3");
   execFileSync(
     python,
