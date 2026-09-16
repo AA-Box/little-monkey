@@ -16,11 +16,12 @@ import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
 import { generateKeyPairSync, verify as cryptoVerify } from "node:crypto";
 import {
   chmodSync,
-  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -184,15 +185,21 @@ test("materializeSymlinks replaces links with the bytes they pointed at", () => 
 
     materializeSymlinks(root);
 
+    // Directory entries carry the type, so nothing has to stat a path and then
+    // open the same path again.
+    const entries = new Map(
+      readdirSync(join(root, "bin"), { withFileTypes: true }).map((entry) => [entry.name, entry]),
+    );
     for (const name of ["python3", "python"]) {
-      const path = join(root, "bin", name);
       // A real file now, not a second name for one: the installer refuses a
       // package containing symlinks.
-      ok(!lstatSync(path).isSymbolicLink(), `${name} is still a link`);
+      ok(entries.get(name)?.isFile(), `${name} is not a real file`);
+      ok(!entries.get(name)?.isSymbolicLink(), `${name} is still a link`);
+      const path = join(root, "bin", name);
       strictEqual(readFileSync(path, "utf8"), readFileSync(real, "utf8"));
       // Executable bits come along, or the package ships an interpreter nothing
       // can run.
-      strictEqual(lstatSync(path).mode & 0o111, lstatSync(real).mode & 0o111);
+      strictEqual(statSync(path).mode & 0o111, statSync(real).mode & 0o111);
     }
   } finally {
     rmSync(root, { recursive: true, force: true });

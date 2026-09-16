@@ -17,13 +17,15 @@ import { execFileSync } from "node:child_process";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   copyFileSync,
   cpSync,
-  lstatSync,
+  openSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -145,9 +147,20 @@ function assertNothingLinksOutside(root) {
         walk(path);
         continue;
       }
-      if (!entry.isFile() || lstatSync(path).size < 4) continue;
-      // Mach-O, thin or fat, either endianness.
-      const magic = readFileSync(path).subarray(0, 4).readUInt32BE(0);
+      if (!entry.isFile()) continue;
+      // Read the header through one descriptor rather than stat-then-read: the
+      // second look is both a wasted syscall and a file that could have changed
+      // in between. Mach-O, thin or fat, either endianness.
+      const header = Buffer.alloc(4);
+      const handle = openSync(path, "r");
+      let read = 0;
+      try {
+        read = readSync(handle, header, 0, 4, 0);
+      } finally {
+        closeSync(handle);
+      }
+      if (read < 4) continue;
+      const magic = header.readUInt32BE(0);
       if (![0xfeedfacf, 0xcffaedfe, 0xfeedface, 0xcefaedfe, 0xcafebabe].includes(magic)) continue;
       let linked = "";
       try {
