@@ -14,12 +14,30 @@
 
 import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
 import { generateKeyPairSync, verify as cryptoVerify } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { buildManifest, canonicalJson, signedPayload, signManifest, serviceRevision } from "./mlxPackage.mjs";
+import {
+  buildManifest,
+  canonicalJson,
+  loadsFromOutsideThePackage,
+  materializeSymlinks,
+  serviceRevision,
+  signManifest,
+  signedPayload,
+} from "./mlxPackage.mjs";
 
 const CANONICAL_FIXTURE =
   '{"files":[{"executable":true,"path":"bin/python","sha256":"' +
@@ -153,4 +171,57 @@ test("a service-only change is a new version", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("materializeSymlinks replaces links with the bytes they pointed at", () => {
+  const root = mkdtempSync(join(tmpdir(), "mlx-symlinks-"));
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    const real = join(root, "bin/python3.14");
+    writeFileSync(real, "#!/bin/sh\necho hi\n");
+    chmodSync(real, 0o755);
+    symlinkSync("python3.14", join(root, "bin/python3"));
+    symlinkSync("python3.14", join(root, "bin/python"));
+
+    materializeSymlinks(root);
+
+    // Directory entries carry the type, so nothing has to stat a path and then
+    // open the same path again.
+    const entries = new Map(
+      readdirSync(join(root, "bin"), { withFileTypes: true }).map((entry) => [entry.name, entry]),
+    );
+    for (const name of ["python3", "python"]) {
+      // A real file now, not a second name for one: the installer refuses a
+      // package containing symlinks.
+      ok(entries.get(name)?.isFile(), `${name} is not a real file`);
+      ok(!entries.get(name)?.isSymbolicLink(), `${name} is still a link`);
+      const path = join(root, "bin", name);
+      strictEqual(readFileSync(path, "utf8"), readFileSync(real, "utf8"));
+      // Executable bits come along, or the package ships an interpreter nothing
+      // can run.
+      strictEqual(statSync(path).mode & 0o111, statSync(real).mode & 0o111);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("loadsFromOutsideThePackage accepts the OS and the package, refuses the build host", () => {
+  // The exact library that shipped broken: present on the runner, absent on
+  // every machine without that Homebrew version.
+  ok(
+    loadsFromOutsideThePackage(
+      "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Python",
+    ),
+  );
+  ok(loadsFromOutsideThePackage("/usr/local/lib/libfoo.dylib"));
+
+  // The OS is on every Mac by definition.
+  ok(!loadsFromOutsideThePackage("/usr/lib/libSystem.B.dylib"));
+  ok(!loadsFromOutsideThePackage("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation"));
+  // Loader-relative paths resolve inside the package, which is the point.
+  for (const relative of ["@executable_path/../lib/libpython3.14.dylib", "@loader_path/x.dylib", "@rpath/y.dylib"]) {
+    ok(!loadsFromOutsideThePackage(relative), relative);
+  }
+  ok(!loadsFromOutsideThePackage(""));
 });
