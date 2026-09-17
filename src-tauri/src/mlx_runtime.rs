@@ -1334,6 +1334,17 @@ impl MlxRuntimeAdapter {
             runtime_id: self.config.runtime_id.clone(),
             program: install.python_executable,
             args: vec![
+                // The interpreter must not write into the tree its own
+                // manifest is about to be verified against. Importing any
+                // stdlib module whose shipped `.pyc` fails Python's staleness
+                // check rewrites that `.pyc` in place, and the next verify
+                // refuses the install it just wrote:
+                //
+                //     runtime: MLX file bytes is 9705, exceeding 9567
+                //
+                // `-B` rather than PYTHONDONTWRITEBYTECODE because the process
+                // spec carries arguments and no environment.
+                "-B".to_string(),
                 install.service_entry.to_string_lossy().to_string(),
                 "--host".to_string(),
                 "127.0.0.1".to_string(),
@@ -2973,7 +2984,11 @@ pub(crate) mod tests {
             self.launch_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 assert!(spec.program.is_absolute());
-                assert_eq!(spec.args[1..5], ["--host", "127.0.0.1", "--port", "8081"]);
+                // `-B` first: the interpreter must not write bytecode into the
+                // tree its own manifest is verified against.
+                assert_eq!(spec.args[0], "-B");
+                assert!(spec.args[1].ends_with("service/mlx_server.py"));
+                assert_eq!(spec.args[2..6], ["--host", "127.0.0.1", "--port", "8081"]);
                 Ok(MlxProcessHandle {
                     process_id: "mlx-process-1".to_string(),
                     os_pid: Some(77),
