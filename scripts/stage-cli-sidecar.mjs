@@ -25,7 +25,7 @@
 // the build succeeds.
 
 import { execFileSync } from "node:child_process";
-import { chmodSync, copyFileSync, statSync } from "node:fs";
+import { chmodSync, copyFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -71,7 +71,22 @@ if (statSync(builtPath).size === 0) {
 if (filesIdentical(builtPath, stagedPath)) {
   console.log(`[stage-cli-sidecar] ${stagedPath} already current`);
 } else {
-  copyFileSync(builtPath, stagedPath);
-  if (!isWindows) chmodSync(stagedPath, 0o755);
+  // Stage through a sibling and rename over, rather than copying onto the
+  // path in place. A copy in place keeps the inode, and an endpoint security
+  // agent that has pinned that inode goes on killing every later exec from it
+  // — the sidecar then dies with SIGKILL while the identical bytes run fine
+  // from any other path. A rename gives each staged build a new inode, so a
+  // pin cannot outlive the build it was taken against. The rename is atomic,
+  // which also means a crash mid-copy can no longer leave a truncated sidecar
+  // at the path tauri-build copies into the bundle.
+  const staging = `${stagedPath}.staging`;
+  try {
+    copyFileSync(builtPath, staging);
+    if (!isWindows) chmodSync(staging, 0o755);
+    renameSync(staging, stagedPath);
+  } catch (error) {
+    rmSync(staging, { force: true });
+    throw error;
+  }
   console.log(`[stage-cli-sidecar] staged ${stagedPath}`);
 }
