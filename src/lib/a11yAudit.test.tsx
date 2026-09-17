@@ -14,7 +14,7 @@
  * against.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -188,6 +188,113 @@ describe("rendered screens", () => {
  * is AAA rather than AA for that reason: a sentence nobody can read is not a
  * hint, and the size is what makes the usual line too generous.
  */
+/**
+ * Opens a tooltip the way a pointer does and returns it.
+ *
+ * It is rendered through a portal, so it is never inside the tree `render`
+ * hands back — which is the whole point of the change that put it there.
+ */
+function showTooltip(hint = "Resends from here."): HTMLElement {
+  const { container } = render(
+    <span className="group/action relative">
+      <button type="button">Edit</button>
+      <Tooltip text="Edit message" hint={hint} />
+    </span>,
+  );
+  fireEvent.mouseEnter(container.firstElementChild as HTMLElement);
+  const tooltip = document.body.querySelector("[role=tooltip]");
+  if (!tooltip) throw new Error("hovering the trigger did not open the tooltip");
+  return tooltip as HTMLElement;
+}
+
+describe("a tooltip is not clipped by the list it sits in", () => {
+  // The message list scrolls (`overflow-y-auto`), and an absolutely positioned
+  // tooltip inside a scrollport is cut off at its edges — the top line of a
+  // three-line hint was sliced through the middle. Escaping the scrollport is
+  // what fixes that, so assert it escapes rather than asserting a pixel.
+  it("renders outside every scrolling ancestor", () => {
+    const scrollport = document.createElement("div");
+    scrollport.style.overflowY = "auto";
+    document.body.appendChild(scrollport);
+    try {
+      const tooltip = showTooltip();
+      expect(tooltip.parentElement).toBe(document.body);
+      expect(scrollport.contains(tooltip)).toBe(false);
+      // Tailwind is not compiled here, so the class is the honest assertion:
+      // `absolute` is what a scrollport clips, `fixed` is what it cannot.
+      expect(tooltip.className).toContain("fixed");
+      expect(tooltip.className).not.toContain("absolute");
+    } finally {
+      scrollport.remove();
+    }
+  });
+
+  it("opens downwards when there is no room above", () => {
+    // jsdom reports a zero rect, which is the "pinned to the top of the
+    // viewport" case — the one where opening upwards is what clips it.
+    expect(showTooltip().className).not.toContain("-translate-y-full");
+  });
+
+  /** Fixes an element's viewport rect, which jsdom otherwise reports as zero. */
+  function at(element: Element, top: number, height: number) {
+    element.getBoundingClientRect = () =>
+      ({ top, bottom: top + height, left: 0, right: 28, width: 28, height }) as DOMRect;
+  }
+
+  it("measures its room from the scrolling area, not the window", () => {
+    // Above the message list sits a title bar in normal flow. A tooltip that
+    // only avoids running off the top of the *screen* opens straight into it —
+    // there is 140px of window above this trigger and 40px of list.
+    const list = document.createElement("div");
+    list.style.overflowY = "auto";
+    document.body.appendChild(list);
+    at(list, 100, 700);
+    try {
+      const { container } = render(
+        <span className="group/action relative">
+          <button type="button">Edit</button>
+          <Tooltip text="Edit message" hint="Resends from here." />
+        </span>,
+        { container: list },
+      );
+      const trigger = container.firstElementChild as HTMLElement;
+      at(trigger, 140, 28);
+      fireEvent.mouseEnter(trigger);
+
+      const tooltip = document.body.querySelector("[role=tooltip]") as HTMLElement;
+      expect(tooltip.className).not.toContain("-translate-y-full");
+      expect(tooltip.style.top).toBe("172px");
+    } finally {
+      list.remove();
+    }
+  });
+
+  it("still opens upwards when the list has room", () => {
+    const list = document.createElement("div");
+    list.style.overflowY = "auto";
+    document.body.appendChild(list);
+    at(list, 100, 700);
+    try {
+      const { container } = render(
+        <span className="group/action relative">
+          <button type="button">Edit</button>
+          <Tooltip text="Edit message" hint="Resends from here." />
+        </span>,
+        { container: list },
+      );
+      const trigger = container.firstElementChild as HTMLElement;
+      at(trigger, 400, 28);
+      fireEvent.mouseEnter(trigger);
+
+      const tooltip = document.body.querySelector("[role=tooltip]") as HTMLElement;
+      expect(tooltip.className).toContain("-translate-y-full");
+      expect(tooltip.style.top).toBe("396px");
+    } finally {
+      list.remove();
+    }
+  });
+});
+
 describe("the tooltip hint's contrast", () => {
   const THEMES = ["light", "dark", "light high-contrast", "dark high-contrast"] as const;
   const AAA_NORMAL_TEXT = 7;
@@ -234,8 +341,7 @@ describe("the tooltip hint's contrast", () => {
 
     // The token the component actually uses, so swapping it back to `faint`
     // fails here rather than only on someone's screen.
-    const { container } = render(<Tooltip text="Edit" hint="Resends from here." />);
-    const hint = container.querySelector("[role=tooltip] > span");
+    const hint = showTooltip().querySelector("span");
     const token = hint?.className.match(/\btext-([a-z0-9-]+)\b/)?.[1];
     expect(token, "the hint should carry a colour token").toBeTruthy();
 
