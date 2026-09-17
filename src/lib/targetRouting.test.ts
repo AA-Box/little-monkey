@@ -254,11 +254,27 @@ describe("why a target could not be frozen", () => {
     expect(message).toContain("the verified MLX runtime is not installed");
   });
 
+  it("prefers the runtime's reason even after the status was overwritten", () => {
+    // The status is one word anything may overwrite; the reason is written once
+    // by whatever failed. A start failure whose status has since been flattened
+    // to "stopped" must still report why it failed.
+    useModelStore.setState({
+      installed: [localModel()],
+      active: localModel(),
+      llamaStatus: "stopped",
+      llamaError: "the verified MLX runtime is not installed",
+    });
+    expect(describeMissingTargetSnapshot(localTarget)).toContain(
+      "the verified MLX runtime is not installed",
+    );
+  });
+
   it("says a selected model is not running rather than naming the freeze", () => {
     useModelStore.setState({
       installed: [localModel()],
       active: localModel(),
       llamaStatus: "stopped",
+      llamaError: null,
     });
     const message = describeMissingTargetSnapshot(localTarget);
     expect(message).toContain("not running");
