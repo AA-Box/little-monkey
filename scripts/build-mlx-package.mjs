@@ -302,6 +302,7 @@ function build() {
     serviceEntry: "service/runtime_router.py",
     keyId: KEY_ID,
   });
+  assertNoBytecodeWasSigned(manifest);
 
   const signingKey = process.env.MLX_SIGNING_KEY;
   if (signingKey) {
@@ -429,8 +430,41 @@ function pruneBytecode(directory) {
   }
 }
 
+/**
+ * Refuse to sign regenerable bytecode.
+ *
+ * `pruneBytecode` removes it, but anything that runs the packaged interpreter
+ * afterwards writes some of it straight back, and a `.pyc` inside a signed
+ * manifest is a file the runtime is free to rewrite: Python regenerates one
+ * whose staleness check fails, the size no longer matches what was signed, and
+ * verification refuses the install it just wrote —
+ *
+ *     runtime: MLX file bytes is 9705, exceeding 9567
+ *
+ * — with no way back short of a reinstall. Publishing is the last place this
+ * can be caught cheaply, so catch it here rather than shipping it.
+ */
+function assertNoBytecodeWasSigned(manifest) {
+  const bytecode = manifest.files
+    .map((file) => file.path)
+    .filter((path) => path.endsWith(".pyc") || path.includes("/__pycache__/"));
+  if (bytecode.length > 0) {
+    throw new Error(
+      `${bytecode.length} bytecode file(s) reached the manifest — something ran the packaged ` +
+        `interpreter after pruneBytecode without -B. First: ${bytecode.slice(0, 3).join(", ")}`,
+    );
+  }
+}
+
 function pythonVersion(interpreter) {
-  return execFileSync(interpreter, ["-c", "import sys;print('py%d.%d' % sys.version_info[:2])"])
+  // `-B`: this runs *after* pruneBytecode, and a bare `python -c` writes the
+  // `.pyc` for every module its own startup imports — linecache and the
+  // encodings package. Without this those four files are recreated after the
+  // prune, land in the signed manifest, and are then rewritten by the first
+  // runtime launch that imports them differently, which fails verification:
+  //
+  //     runtime: MLX file bytes is 9705, exceeding 9567
+  return execFileSync(interpreter, ["-B", "-c", "import sys;print('py%d.%d' % sys.version_info[:2])"])
     .toString()
     .trim();
 }
