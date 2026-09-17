@@ -219,7 +219,13 @@ export function VoiceRouteSelector({
         if (endpoint.locality === 'paired') merged.push(endpoint);
       }
       for (const direction of ['input', 'output'] as const) {
-        if (merged.some((endpoint) => endpoint.direction === direction)) continue;
+        // Local, not merely present. A paired endpoint is not a substitute for
+        // this computer's own microphone or speaker, and treating it as one
+        // costs the user the default they are actually routed to: WebKit does
+        // not enumerate `audiooutput` at all, so one paired phone — offline,
+        // even — was enough to leave the speaker list without a single local
+        // entry, and `local:output:default` then rendered as "unavailable".
+        if (merged.some((endpoint) => endpoint.direction === direction && endpoint.locality === 'local')) continue;
         merged.push(
           advertised.find((endpoint) => endpoint.id === `local:${direction}:default`)
             ?? localDefaultEndpoint(direction),
