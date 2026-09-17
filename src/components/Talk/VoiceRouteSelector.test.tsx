@@ -182,6 +182,35 @@ describe('VoiceRouteSelector', () => {
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
+  it('keeps this computer\u2019s speaker when a paired one is the only other output', async () => {
+    // WebKit does not enumerate `audiooutput` at all, so the browser
+    // contributes no local speaker. One paired phone — offline, even — used to
+    // count as "this direction is covered", and the route's own
+    // `local:output:default` then had no option to sit in and rendered as
+    // "unavailable", with nothing selectable to fall back to.
+    mock({
+      endpoints: [paired({
+        id: 'paired:phone-9:output',
+        label: 'E2E Browser Phone — speaker',
+        direction: 'output',
+        input_supported: false,
+        output_supported: true,
+        voice_stream_supported: false,
+        online: false,
+        ready: false,
+        readiness: 'unavailable',
+      })],
+      voice: { inputDeviceId: null, outputDeviceId: null },
+    });
+    stubDevices([{ deviceId: 'mic-1', kind: 'audioinput', label: 'Built-in microphone' }]);
+    render(<VoiceRouteSelector sessionId="session-1" engine="pipeline" />);
+
+    const local = await screen.findByRole('option', { name: /default speaker/i }) as HTMLOptionElement;
+    expect(local.disabled).toBe(false);
+    expect(speaker().value).toBe('local:output:default');
+    expect(options(speaker()).map((option) => option.textContent).join(' ')).not.toContain('unavailable');
+  });
+
   it('refuses a paired endpoint the daemon already blocked, and names the fix', async () => {
     mock({
       endpoints: [paired({
