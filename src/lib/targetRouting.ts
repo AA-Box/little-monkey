@@ -311,11 +311,16 @@ export function describeMissingTargetSnapshot(target: ResolvedTarget): string {
   if (!active) {
     return 'No local model is loaded. Pick one in the model picker — selecting it is what starts the runtime.';
   }
+  // `llamaError` before `llamaStatus`, not only when the status still says
+  // `error`. A status is one word that anything may overwrite — llama-server's
+  // own `stopped` used to land on top of an MLX start failure — while the
+  // reason text is written once, by whatever failed, and cleared when a start
+  // succeeds. When both exist, the sentence the runtime wrote is the better
+  // one, whatever the status has since become.
+  const reason = state.llamaError?.trim();
+  if (reason) return `${active.name} failed to start: ${reason}`;
   if (state.llamaStatus === 'error') {
-    const reason = state.llamaError?.trim();
-    return reason
-      ? `${active.name} failed to start: ${reason}`
-      : `${active.name} failed to start, and the runtime reported no reason.`;
+    return `${active.name} failed to start, and the runtime reported no reason.`;
   }
   if (state.llamaStatus === 'starting') {
     return `${active.name} is still loading. Send this again once it reports ready.`;
