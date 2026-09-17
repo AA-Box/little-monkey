@@ -9,7 +9,7 @@
  * must actually open one without waiting for a second press.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, renderHook, waitFor } from '@testing-library/react';
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 
 const invoke = vi.fn();
 vi.mock('@tauri-apps/api/core', () => ({
@@ -127,6 +127,10 @@ const streams: StubTrack[] = [];
 /** The operating system's answer to the microphone prompt, per test. */
 let microphoneGrant: 'granted' | 'denied' = 'granted';
 let resumed = 0;
+/** WebKit outside a gesture: `resume()` settles and the context stays suspended. */
+let resumeStarts = true;
+/** How many AudioContexts were constructed, and when. */
+let contexts = 0;
 let sourceNodes: { connected: number; disconnected: number }[] = [];
 let workletNodes: Array<{ port: { onmessage: ((event: MessageEvent<Float32Array>) => void) | null; close(): void }; disconnect(): void }> = [];
 
@@ -134,6 +138,8 @@ function stubMedia() {
   streams.length = 0;
   microphoneGrant = 'granted';
   resumed = 0;
+  resumeStarts = true;
+  contexts = 0;
   sourceNodes = [];
   workletNodes = [];
   Object.defineProperty(navigator, 'mediaDevices', {
@@ -170,10 +176,11 @@ function stubMedia() {
     class {
       sampleRate = 48_000;
       audioWorklet = { addModule: () => Promise.resolve() };
+      constructor() { contexts += 1; }
       // What WebKit hands back for a context built outside a user gesture.
       state = 'suspended';
       resume() {
-        this.state = 'running';
+        if (resumeStarts) this.state = 'running';
         resumed += 1;
         return Promise.resolve();
       }
@@ -315,6 +322,45 @@ describe('useTalkSession', () => {
     expect(result.current.snapshot?.capturing).not.toBe(true);
     expect(result.current.snapshot?.state).not.toBe('armed');
     expect(invoke).not.toHaveBeenCalledWith('m7_wake_word_start', expect.anything());
+  });
+
+  /**
+   * WebKit decides whether a context may run from what is on the stack when it
+   * is *constructed*. `start` awaits the route activation, the grant, the
+   * config read and `getUserMedia` before capture needs one, and by then the
+   * gesture that pressed Talk is spent. Building it in the synchronous part of
+   * `start` is the whole fix; one `await` above that line undoes it, and this
+   * is what notices.
+   */
+  it('builds the audio context in the gesture, before anything is awaited', async () => {
+    const { result } = renderHook(() => useTalkSession('session-1', { enabled: false }));
+    expect(contexts).toBe(0);
+
+    act(() => { void result.current.start(); });
+
+    // Synchronously after the call: nothing it awaits has resolved yet.
+    expect(contexts).toBe(1);
+  });
+
+  /**
+   * The failure this whole path is built to avoid, and the one that shipped:
+   * `resume()` resolving is not the same as the context running. Outside a
+   * gesture WebKit settles the promise and leaves the state `suspended`, the
+   * worklet is installed and fed nothing, and every symptom after that is an
+   * absence — meter at zero, badge on "Listening", nothing transcribed, no
+   * error. Reporting it is the difference between a bug and a retry.
+   */
+  it('refuses to claim it is listening when the context stayed suspended', async () => {
+    resumeStarts = false;
+    const { result } = renderHook(() =>
+      useTalkSession('session-1', { enabled: true, autoStartMode: 'continuous' }),
+    );
+    await waitFor(() =>
+      expect(result.current.snapshot?.error ?? result.current.setupError).toMatch(/suspended/i),
+    );
+    expect(result.current.snapshot?.state).not.toBe('armed');
+    // The microphone it opened before finding out is handed back.
+    expect(streams.every((track) => track.stopped > 0)).toBe(true);
   });
 
   /**
