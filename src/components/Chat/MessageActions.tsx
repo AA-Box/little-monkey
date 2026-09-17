@@ -41,7 +41,12 @@ export function Tooltip({ text, hint }: { text: string; hint?: string }) {
       }`}
     >
       {text}
-      {hint && <span className="mt-0.5 block text-faint">{hint}</span>}
+      {/* `muted`, not `faint`: this is an 11px sentence someone has to read,
+          not a de-emphasised label they can skim past. `faint` on the tooltip's
+          background is 4.83:1 in light and 5.08:1 in dark — over the AA line
+          for normal text and under it for text this small, which is exactly
+          how it reads. `muted` is 7.73:1 and 7.24:1. */}
+      {hint && <span className="mt-0.5 block text-muted">{hint}</span>}
     </span>
   );
 }
