@@ -403,16 +403,28 @@ export function useTalkSession(
             once: true,
           });
         }
-        const context = new AudioContext();
+        // Built in the Talk button's own gesture when there is one — see
+        // `openAudioContext`. Falling back to building it here keeps the
+        // non-gesture callers (wake word rearming) working.
+        const context = audioContextRef.current ?? new AudioContext();
+        audioContextRef.current = context;
         // WebKit starts a context built outside a user gesture suspended, and a
         // suspended worklet receives no samples: the detector never hears an
         // utterance end, so Talk sits on "Listening" forever and nothing is
-        // ever transcribed. The Talk button *is* a gesture, but the awaits
-        // above — the grant, the config read, `getUserMedia` — have spent it by
-        // the time the context exists. A refusal here is not silently ignored:
-        // it fails `startRecording`, and the engine says so rather than
-        // claiming to be listening with a dead meter.
+        // ever transcribed.
         if (context.state === 'suspended') await context.resume();
+        // `resume()` resolving is not the same as the context running. Outside
+        // a gesture WebKit settles the promise and leaves the state
+        // `suspended`, and every failure downstream of that is silent: the
+        // worklet is installed, the meter reads zero, the state badge sits on
+        // "Listening", and nothing is ever transcribed. Say so instead.
+        if (context.state === 'suspended') {
+          streamRef.current.getTracks().forEach((track) => track.stop());
+          streamRef.current = null;
+          throw new Error(
+            'The browser kept audio suspended, so the microphone produced no samples. Press Talk again.',
+          );
+        }
         if (!context.audioWorklet || typeof AudioWorkletNode === 'undefined') {
           streamRef.current.getTracks().forEach((track) => track.stop());
           streamRef.current = null;
@@ -809,7 +821,32 @@ export function useTalkSession(
     });
   }, [sessionId]);
 
+  /**
+   * Build the AudioContext while the click that asked for Talk is still the
+   * current gesture.
+   *
+   * WebKit decides whether a context may run from what is on the stack when it
+   * is *constructed*, and `start` awaits the route activation, the permission
+   * grant, the config read and `getUserMedia` before capture gets there. By
+   * then the gesture is spent, the context is born suspended, `resume()`
+   * settles without starting it, and the whole failure is silent — worklet
+   * installed, meter at zero, badge on "Listening", nothing transcribed.
+   *
+   * Synchronous on purpose: one `await` above this line puts it back where it
+   * was.
+   */
+  const openAudioContext = useCallback(() => {
+    if (audioContextRef.current) return;
+    try {
+      audioContextRef.current = new AudioContext();
+    } catch {
+      // A webview that refuses to construct one at all fails later, in
+      // `openPcmDevices`, where the message already explains itself.
+    }
+  }, []);
+
   const start = useCallback(async () => {
+    openAudioContext();
     setSetupError(null);
     try {
       const currentRoute = routeRef.current;
@@ -821,7 +858,7 @@ export function useTalkSession(
     } catch (reason) {
       setSetupError(errorMessage(reason));
     }
-  }, [activateAndWaitForRoute, sessionId]);
+  }, [activateAndWaitForRoute, openAudioContext, sessionId]);
 
   const stop = useCallback(async () => {
     await sessionRef.current?.stop();
