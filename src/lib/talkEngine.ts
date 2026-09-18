@@ -492,10 +492,26 @@ export class TalkSession {
     options: { continuingSpeech?: boolean; afterSample?: number } = {},
   ): Promise<void> {
     if (this.externalInput || this.capturing || !this.running) return;
+    // Opening the device is three awaits deep — the capture grant, the config
+    // read, then `getUserMedia` — and `press()` sets only the private `held`
+    // flag, which the snapshot does not expose. Without this line a hold whose
+    // permission prompt is never answered is byte-identical to a press that
+    // never landed: badge "Ready", button "Hold to talk", meter at zero, no
+    // error. A rejection is loud; a *pending* decision was silent, and that is
+    // the state an unsigned dev binary with no TCC grant sits in forever.
+    this.setState('starting');
     try {
       await this.ports.startRecording(
         options.afterSample === undefined ? undefined : { afterSample: options.afterSample },
       );
+      // The key can be let go while the open is still pending. `release()`
+      // returned at its `!this.held` guard long ago, so without this the
+      // recorder is left running with nobody holding it.
+      if (this.mode === 'push_to_talk' && !this.held) {
+        await this.ports.stopRecording();
+        this.setState(this.running ? 'armed' : 'off');
+        return;
+      }
       this.capturing = true;
       this.utteranceId = `talk-${crypto.randomUUID()}`;
       const startedAt = this.ports.now();
