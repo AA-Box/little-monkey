@@ -336,6 +336,27 @@ static NSString *lm_microphone_permission_status(void) {
     return @"unknown";
 }
 
+/// Ask macOS for the microphone, outside a dictation session.
+///
+/// `requestAccessForMediaType:` is the only call that raises the TCC dialog,
+/// and it raises it *only* when the status is notDetermined; for a decision
+/// that already exists it answers from the record and shows nothing. That is
+/// exactly the two-branch answer a caller needs, so the completion handler
+/// reports the resulting status rather than a bool.
+///
+/// Talk used to let WebKit decide whether macOS was asked at all. A refusal
+/// from there is a message-less `NotAllowedError` that never reaches TCC, is
+/// indistinguishable between "never asked", "denied" and "no device", and
+/// depends on gesture heuristics the app does not control. This does not.
+void little_monkey_microphone_request_access(
+    void (*done)(void *, const char *), void *user_data) {
+    [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio
+                             completionHandler:^(BOOL granted) {
+        (void)granted;
+        @autoreleasepool { done(user_data, lm_utf8(lm_microphone_permission_status())); }
+    }];
+}
+
 char *little_monkey_dictation_macos_capabilities_json(void) {
     @autoreleasepool {
         NSMutableArray *languages = [NSMutableArray array];

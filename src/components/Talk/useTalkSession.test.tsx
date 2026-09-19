@@ -2,7 +2,7 @@
 /**
  * The hook's own claim, which neither surface above it can make alone.
  *
- * `TalkPanel.test.tsx` covers a conversation end to end. What is left here is
+ * `talkTurn.test.tsx` covers a conversation end to end. What is left here is
  * the gate the chat composer depends on: a ChatWindow renders this hook for
  * every open session, and until somebody presses Talk it must cost nothing —
  * no IPC, no engine, and above all no microphone. Then, when it is enabled, it
