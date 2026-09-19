@@ -68,7 +68,8 @@
       "files": {
         "Resources/Assets.car": "resources/Assets.car"
       },
-      "entitlements": "Entitlements.plist"
+      "entitlements": "Entitlements.plist",
+      "signingIdentity": "-"
     }
   }
 }
