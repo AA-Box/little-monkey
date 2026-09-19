@@ -115,7 +115,6 @@ import {
   SpreadsheetCopilotPanel,
   StudioPanel,
   SyntheticMonitoringPanel,
-  TalkPanel,
   TerminalPanel,
   TrustScorecardsPanel,
   VisualEditModePanel,
@@ -353,7 +352,6 @@ function App() {
   const dbAdminGuardrailsOpen = activeFeaturePanel === "db-admin-guardrails";
   const apiContractDiffLabOpen = activeFeaturePanel === "api-contract-diff-lab";
   const workflowTestHarnessOpen = activeFeaturePanel === "workflow-test-harness";
-  const talkOpen = activeFeaturePanel === "talk";
   useEffect(() => {
     if (settingsOpen) setSettingsMounted(true);
   }, [settingsOpen]);
@@ -1109,7 +1107,6 @@ function App() {
             setTerminalOpen(false);
             restartOnboarding();
           }}
-          onOpenTalk={() => openFeaturePanel("talk")}
           onOpenDailyBrief={() => openFeaturePanel("daily-brief")}
           onOpenApiContractDiffLab={() => openFeaturePanel("api-contract-diff-lab")}
           onOpenGoldenDatasetBuilder={() => openFeaturePanel("golden-dataset-builder")}
@@ -1206,13 +1203,6 @@ function App() {
                 }}
                 onOpenAgentInbox={() => openFeaturePanel("agent-inbox")}
                 onOpenSettingsTab={openSettingsTab}
-              />
-            ) : talkOpen ? (
-              <TalkPanel
-                sessionId={activeSessionId}
-                onClose={() => closeFeaturePanel("talk")}
-                onReturnToChat={() => closeFeaturePanel("talk")}
-                onOpenVoiceSettings={() => openSettingsTab("companion")}
               />
             ) : dataNotebookOpen ? (
               <DataNotebookPanel onClose={() => closeFeaturePanel("data-notebook")} />
@@ -1332,7 +1322,6 @@ function App() {
                 onOpenBackgroundTasks={openBackgroundTasksPanel}
                 onOpenPmCopilot={() => openFeaturePanel("pm-copilot")}
                 onOpenStudio={() => setSection("studio")}
-                onOpenTalk={() => openFeaturePanel("talk")}
               />
             )}
           </Suspense>
@@ -1371,10 +1360,6 @@ function App() {
                   onOpenBackgroundTasks={openBackgroundTasksPanel}
                   onOpenPmCopilot={() => openFeaturePanel("pm-copilot")}
                   onOpenStudio={() => setSection("studio")}
-                  onOpenTalk={() => {
-                    switchSession(splitSessionId);
-                    openFeaturePanel("talk");
-                  }}
                 />
               )}
             </Suspense>
