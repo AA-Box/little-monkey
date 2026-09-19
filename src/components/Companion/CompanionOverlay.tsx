@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { openMicrophone } from "../../lib/microphoneAccess";
 import { Camera, Clipboard, Mic, Octagon, Send, Volume2, X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -149,7 +150,7 @@ export function CompanionOverlay() {
     setError(null);
     try {
       const grant = await ensureGrant(kind);
-      const stream = await navigator.mediaDevices.getUserMedia({
+      const stream = await openMicrophone({
         audio: { echoCancellation: true, noiseSuppression: true },
         video: false,
       });

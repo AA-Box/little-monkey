@@ -211,6 +211,31 @@ describe('VoiceRouteSelector', () => {
     expect(options(speaker()).map((option) => option.textContent).join(' ')).not.toContain('unavailable');
   });
 
+  it('keeps "follow the system default" once real devices appear', async () => {
+    // WebKit reveals `audiooutput` only after a microphone grant, so the real
+    // speakers arrive mid-session — and the saved selection is almost always
+    // `local:output:default`, because that is what a fresh install writes.
+    // Dropping the generic entry the moment real ones existed left that
+    // selection matching no option, rendered as a disabled "unavailable".
+    mock({ endpoints: [], voice: { inputDeviceId: null, outputDeviceId: null } });
+    stubDevices([
+      { deviceId: 'mic-1', kind: 'audioinput', label: 'Built-in microphone' },
+      { deviceId: 'AppleHDAEngineOutput:1B,0,1,2:0', kind: 'audiooutput', label: 'External Headphones' },
+      { deviceId: 'BuiltInSpeakerDevice', kind: 'audiooutput', label: 'MacBook Pro Speakers' },
+    ]);
+    render(<VoiceRouteSelector sessionId="session-1" engine="pipeline" />);
+
+    // The real ones are offered...
+    await screen.findByRole('option', { name: /External Headphones/ });
+    expect(await screen.findByRole('option', { name: /MacBook Pro Speakers/ })).toBeTruthy();
+
+    // ...and so is the default the route actually points at.
+    const fallback = await screen.findByRole('option', { name: /default speaker/i }) as HTMLOptionElement;
+    expect(fallback.disabled).toBe(false);
+    expect(speaker().value).toBe('local:output:default');
+    expect(options(speaker()).map((option) => option.textContent).join(' ')).not.toContain('unavailable');
+  });
+
   it('refuses a paired endpoint the daemon already blocked, and names the fix', async () => {
     mock({
       endpoints: [paired({

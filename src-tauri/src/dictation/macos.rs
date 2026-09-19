@@ -26,6 +26,10 @@ unsafe extern "C" {
     fn little_monkey_dictation_macos_cancel(session: *mut c_void);
     fn little_monkey_dictation_macos_release(session: *mut c_void);
     fn little_monkey_dictation_macos_open_permission_settings(kind: *const c_char) -> bool;
+    fn little_monkey_microphone_request_access(
+        done: unsafe extern "C" fn(*mut c_void, *const c_char),
+        user_data: *mut c_void,
+    );
 }
 
 struct CallbackContext {
@@ -159,6 +163,37 @@ pub fn start(
         return Err("Apple Speech could not start".to_string());
     }
     Ok(Session { native, context })
+}
+
+unsafe extern "C" fn microphone_access_callback(user_data: *mut c_void, status: *const c_char) {
+    if user_data.is_null() {
+        return;
+    }
+    let sender =
+        unsafe { Box::from_raw(user_data.cast::<tokio::sync::oneshot::Sender<String>>()) };
+    let _ = sender.send(copy_c_string(status));
+}
+
+/// Ask macOS for the microphone and answer with what it decided.
+///
+/// Async, and deliberately not blocking: the TCC dialog is driven by the main
+/// runloop, and a synchronous Tauri command runs on the main thread — waiting
+/// there would deadlock against the very dialog being waited for.
+pub async fn request_microphone_access() -> super::DictationPermissionStatus {
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    unsafe {
+        little_monkey_microphone_request_access(
+            microphone_access_callback,
+            Box::into_raw(Box::new(tx)).cast::<c_void>(),
+        )
+    };
+    match rx.await.ok().as_deref() {
+        Some("granted") => super::DictationPermissionStatus::Granted,
+        Some("denied") => super::DictationPermissionStatus::Denied,
+        Some("restricted") => super::DictationPermissionStatus::Restricted,
+        Some("notDetermined") => super::DictationPermissionStatus::NotDetermined,
+        _ => super::DictationPermissionStatus::Unknown,
+    }
 }
 
 pub fn open_permission_settings(kind: &str) -> Result<(), String> {

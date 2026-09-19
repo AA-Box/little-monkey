@@ -2102,6 +2102,7 @@ pub fn run() {
             realtime_voice::realtime_voice_acceptance_report,
             dictation::dictation_capabilities,
             dictation::dictation_open_permission_settings,
+            dictation::microphone_request_access,
             dictation::dictation_start,
             dictation::dictation_stop,
             dictation::dictation_cancel,
