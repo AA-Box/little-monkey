@@ -31,7 +31,7 @@ import {
 } from '../../lib/daemonClient';
 import {
   BoundedPcmQueue,
-  PCM_AUDIO_WORKLET_SOURCE,
+  PCM_CAPTURE_WORKLET_URL,
   PcmRingBuffer,
   StreamingLinearResampler,
   base64AudioBlob,
@@ -173,7 +173,6 @@ export function useTalkSession(
   /** Held for as long as the microphone is open — see `startRecording`. */
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const workletRef = useRef<AudioWorkletNode | null>(null);
-  const workletUrlRef = useRef<string | null>(null);
   const resamplerRef = useRef(new StreamingLinearResampler(KWS_SAMPLE_RATE));
   const ringRef = useRef(new PcmRingBuffer(KWS_RING_SAMPLES));
   const recordingPcmRef = useRef<Float32Array[] | null>(null);
@@ -332,8 +331,6 @@ export function useTalkSession(
     ringRef.current = new PcmRingBuffer(KWS_RING_SAMPLES);
     wakeQueueRef.current = new BoundedPcmQueue(KWS_PENDING_SAMPLES);
     wakePushBusyRef.current = false;
-    if (workletUrlRef.current) URL.revokeObjectURL(workletUrlRef.current);
-    workletUrlRef.current = null;
     const activeGrant = grantRef.current;
     grantRef.current = null;
     setGrant(null);
@@ -431,11 +428,7 @@ export function useTalkSession(
           await context.close();
           throw new Error('This webview does not support the AudioWorklet PCM path required by Talk');
         }
-        const workletUrl = URL.createObjectURL(
-          new Blob([PCM_AUDIO_WORKLET_SOURCE], { type: 'text/javascript' }),
-        );
-        workletUrlRef.current = workletUrl;
-        await context.audioWorklet.addModule(workletUrl);
+        await context.audioWorklet.addModule(PCM_CAPTURE_WORKLET_URL);
         const worklet = new AudioWorkletNode(context, 'little-monkey-pcm-capture', {
           numberOfInputs: 1,
           numberOfOutputs: 0,

@@ -28,7 +28,7 @@ import { errorMessage } from '../../lib/errors';
 import { useT } from '../../lib/i18n';
 import {
   BoundedPcmQueue,
-  PCM_AUDIO_WORKLET_SOURCE,
+  PCM_CAPTURE_WORKLET_URL,
   StreamingLinearResampler,
   base64AudioBlob,
 } from '../../lib/talkAudio';
@@ -258,7 +258,6 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
     let context: AudioContext | null = null;
     let source: MediaStreamAudioSourceNode | null = null;
     let worklet: AudioWorkletNode | null = null;
-    let workletUrl: string | null = null;
     let wakeSessionId: string | null = null;
     let grantId: string | null = null;
     let timeoutId: number | null = null;
@@ -275,10 +274,7 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
       if (!context.audioWorklet || typeof AudioWorkletNode === 'undefined') {
         throw new Error('This webview does not support the required AudioWorklet PCM path');
       }
-      workletUrl = URL.createObjectURL(
-        new Blob([PCM_AUDIO_WORKLET_SOURCE], { type: 'text/javascript' }),
-      );
-      await context.audioWorklet.addModule(workletUrl);
+      await context.audioWorklet.addModule(PCM_CAPTURE_WORKLET_URL);
       worklet = new AudioWorkletNode(context, 'little-monkey-pcm-capture', {
         numberOfInputs: 1,
         numberOfOutputs: 0,
@@ -344,7 +340,6 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
       source?.disconnect();
       stream?.getTracks().forEach((track) => track.stop());
       if (context) await context.close().catch(() => undefined);
-      if (workletUrl) URL.revokeObjectURL(workletUrl);
       if (grantId) await companionClient.revoke(grantId).catch(() => false);
       void talkClient.wakeWordStatus().then(setWakeStatus).catch(() => undefined);
       setBusy(null);
