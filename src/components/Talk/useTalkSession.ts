@@ -41,7 +41,7 @@ import {
   rmsOf,
 } from '../../lib/talkAudio';
 import { talkClient, type TalkStatus } from '../../lib/talkClient';
-import { createTalkPlayer } from '../../lib/talkPlayback';
+import { talkPlayer } from '../../lib/talkPlayback';
 import {
   TalkSession,
   type TalkMode,
@@ -229,7 +229,7 @@ export function useTalkSession(
   const handledEventRef = useRef<{ sessionId: string; eventId: number }>({ sessionId, eventId: 0 });
   const routeEmitQueueRef = useRef<Promise<unknown>>(Promise.resolve());
   const routedSpeechRef = useRef(new Map<string, { resolve: () => void; reject: (reason: Error) => void }>());
-  const player = useMemo(() => createTalkPlayer(), []);
+  const player = talkPlayer;
 
   const pairedInputDevice = (value: string | undefined | null) => {
     const match = value?.match(/^paired:(.+):input$/);
@@ -326,6 +326,9 @@ export function useTalkSession(
         .catch(() => undefined);
     }
     recordingPcmRef.current = null;
+    // The speaker goes with the microphone: the output was chosen inside the
+    // gesture that opened this session, and it is not this one's to keep.
+    player.release();
     workletRef.current?.port.close();
     workletRef.current?.disconnect();
     workletRef.current = null;
@@ -403,6 +406,13 @@ export function useTalkSession(
             : { echoCancellation: true, noiseSuppression: true },
           video: false,
         });
+        // Still inside the press that opened the microphone, which is the only
+        // moment WebKit will accept a sink. `config` is already in hand, so
+        // this costs nothing extra.
+        const routedOutput = localDevice(selected, 'output');
+        outputDeviceRef.current =
+          routedOutput && routedOutput !== 'default' ? routedOutput : config.voice.outputDeviceId;
+        void player.setOutput(outputDeviceRef.current);
         for (const track of streamRef.current.getTracks()) {
           track.addEventListener?.('ended', () => sessionRef.current?.microphoneRevoked(), {
             once: true,
@@ -584,15 +594,11 @@ export function useTalkSession(
         return { audioBase64: speech.audioBase64, mediaType: speech.mediaType };
       },
       play: async (audioBase64, mediaType) => {
-        const currentRoute = routeRef.current;
-        try {
-          const configured = (await companionClient.config()).voice.outputDeviceId;
-          const routedLocal = localDevice(currentRoute?.output_endpoint, 'output');
-          outputDeviceRef.current = routedLocal && routedLocal !== 'default' ? routedLocal : configured;
-        } catch {
-          /* keep the last known output */
-        }
-        await player.play(base64AudioBlob(audioBase64, mediaType), outputDeviceRef.current);
+        // The output was chosen when the microphone opened, inside the gesture
+        // that asked for it — see `openPcmDevices`. Choosing it here instead
+        // is what made the picker decorative: an answer arrives minutes after
+        // any press, and WebKit refuses `setSinkId` without one.
+        await player.play(base64AudioBlob(audioBase64, mediaType));
       },
       stopPlayback: () => {
         player.stop();

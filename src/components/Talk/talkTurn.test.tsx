@@ -195,7 +195,11 @@ function stubMedia(options: { routing?: boolean } = {}) {
     sinks: string[] = [];
     plays = 0;
     setSinkId?: (deviceId: string) => Promise<void>;
-    constructor(readonly src: string) {
+    /** Assigned per clip now that one element plays every clip. */
+    src = '';
+    /** Every clip this element was pointed at, in order. */
+    srcs: string[] = [];
+    constructor() {
       if (options.routing !== false) {
         this.setSinkId = async (deviceId) => {
           this.sinks.push(deviceId);
@@ -204,6 +208,7 @@ function stubMedia(options: { routing?: boolean } = {}) {
       speakers.push(this);
     }
     async play() {
+      this.srcs.push(this.src);
       this.plays += 1;
       queueMicrotask(() => this.onended?.());
     }
@@ -487,6 +492,10 @@ describe('Talk — a spoken turn end to end', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(commands()).not.toContain('m7_tts_synthesize');
-    expect(media.speakers).toHaveLength(0);
+    // The element exists from the moment the microphone opened — that is where
+    // the output device is chosen, inside the gesture WebKit requires. What
+    // matters is that nothing was ever played through it.
+    expect(media.speakers.flatMap((speaker) => speaker.srcs ?? [])).toHaveLength(0);
+    expect(media.speakers.every((speaker) => speaker.plays === 0)).toBe(true);
   });
 });
