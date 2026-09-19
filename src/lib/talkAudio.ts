@@ -4,29 +4,22 @@ export interface VadConfig {
   maxUtteranceMs: number;
 }
 
-/** The only browser microphone processor used by Talk and the settings test.
- * It batches raw mono floats; resampling, bounds and native inference remain in
- * ordinary testable code outside the real-time audio thread. */
-export const PCM_AUDIO_WORKLET_SOURCE = `
-class LittleMonkeyPcmCapture extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this.pending = [];
-  }
-  process(inputs) {
-    const channel = inputs[0] && inputs[0][0];
-    if (!channel || channel.length === 0) return true;
-    for (let i = 0; i < channel.length; i += 1) this.pending.push(channel[i]);
-    if (this.pending.length >= 2048) {
-      const frame = Float32Array.from(this.pending);
-      this.pending = [];
-      this.port.postMessage(frame, [frame.buffer]);
-    }
-    return true;
-  }
-}
-registerProcessor('little-monkey-pcm-capture', LittleMonkeyPcmCapture);
-`;
+/**
+ * Where the microphone processor is fetched from.
+ *
+ * A same-origin path, not a `blob:` URL built at runtime. An AudioWorklet
+ * module is fetched as a script, so the app's CSP decides whether it loads —
+ * and that CSP declares no `script-src`, so scripts fall back to
+ * `default-src 'self'`. `img-src`, `media-src` and `frame-src` each name
+ * `blob:` explicitly; scripts never did. `addModule()` was therefore rejected,
+ * the worklet never installed, `process()` never ran, and Talk sat on "Ready"
+ * with a level meter at zero and no error anywhere — the failure was a refused
+ * fetch on the audio thread, which surfaces nowhere the operator can see.
+ *
+ * `public/` is copied verbatim by Vite, so this resolves under `'self'` in both
+ * `tauri dev` and a bundled build.
+ */
+export const PCM_CAPTURE_WORKLET_URL = '/pcm-capture-worklet.js';
 
 export type VadEvent = "none" | "speech-start" | "utterance-end" | "max-utterance";
 
