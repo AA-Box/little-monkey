@@ -42,6 +42,7 @@ import {
 } from '../../lib/talkAudio';
 import { talkClient, type TalkStatus } from '../../lib/talkClient';
 import { talkPlayer } from '../../lib/talkPlayback';
+import { MicrophoneBlockedError, openMicrophone, type MicrophoneBlock } from '../../lib/microphoneAccess';
 import {
   TalkSession,
   type TalkMode,
@@ -153,6 +154,8 @@ export interface UseTalkSession {
   setMode: (mode: TalkMode) => void;
   setupError: string | null;
   setSetupError: (message: string | null) => void;
+  /** Why the microphone is unavailable, when the answer has an action. */
+  microphoneBlocked: MicrophoneBlock | null;
   start: () => Promise<void>;
   stop: () => Promise<void>;
   /** The live engine, for push-to-talk and the Stop button. */
@@ -167,6 +170,8 @@ export function useTalkSession(
   const [status, setStatus] = useState<TalkStatus | null>(null);
   const [mode, setMode] = useState<TalkMode>('push_to_talk');
   const [setupError, setSetupError] = useState<string | null>(null);
+  /** Set when the refusal has a remedy, so the UI can offer it instead of prose. */
+  const [microphoneBlocked, setMicrophoneBlocked] = useState<MicrophoneBlock | null>(null);
   const [grant, setGrant] = useState<CaptureGrant | null>(null);
 
   const sessionRef = useRef<TalkSession | null>(null);
@@ -400,12 +405,20 @@ export function useTalkSession(
         }
         const routedLocal = localDevice(selected, 'input');
         const deviceId = (routedLocal && routedLocal !== 'default' ? routedLocal : config.voice.inputDeviceId) ?? undefined;
-        streamRef.current = await navigator.mediaDevices.getUserMedia({
-          audio: deviceId
-            ? { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true }
-            : { echoCancellation: true, noiseSuppression: true },
-          video: false,
-        });
+        try {
+          streamRef.current = await openMicrophone({
+            audio: deviceId
+              ? { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true }
+              : { echoCancellation: true, noiseSuppression: true },
+            video: false,
+          });
+        } catch (reason) {
+          // Caught here because this is the last frame that still has the
+          // error's identity: one below, `talkEngine` flattens it to
+          // `reason.message` and the remedy goes with it.
+          if (reason instanceof MicrophoneBlockedError) setMicrophoneBlocked(reason.block);
+          throw reason;
+        }
         // Still inside the press that opened the microphone, which is the only
         // moment WebKit will accept a sink. `config` is already in hand, so
         // this costs nothing extra.
@@ -868,6 +881,7 @@ export function useTalkSession(
   const start = useCallback(async () => {
     openAudioContext();
     setSetupError(null);
+    setMicrophoneBlocked(null);
     try {
       const currentRoute = routeRef.current;
       sessionRef.current?.setExternalInput(Boolean(
@@ -949,6 +963,7 @@ export function useTalkSession(
     setMode,
     setupError,
     setSetupError,
+    microphoneBlocked,
     start,
     stop,
     sessionRef,

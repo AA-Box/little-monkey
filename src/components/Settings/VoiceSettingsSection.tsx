@@ -11,6 +11,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { openMicrophone } from "../../lib/microphoneAccess";
 import { AlertTriangle, Gauge, Mic, Radio, Save, Trash2, Volume2 } from 'lucide-react';
 
 import {
@@ -170,7 +171,7 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
     let stream: MediaStream | null = null;
     try {
       const grant = await companionClient.grant('microphone', 60_000, 'voice-settings-test');
-      stream = await navigator.mediaDevices.getUserMedia({
+      stream = await openMicrophone({
         audio: voice.inputDeviceId
           ? { deviceId: { exact: voice.inputDeviceId } }
           : true,
@@ -265,7 +266,7 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
       await onSave(config, 'Wake word settings saved for the production-path test.');
       const grant = await companionClient.grant('microphone', 60_000, 'wake-word-test');
       grantId = grant.grantId;
-      stream = await navigator.mediaDevices.getUserMedia({
+      stream = await openMicrophone({
         audio: voice.inputDeviceId ? { deviceId: { exact: voice.inputDeviceId } } : true,
         video: false,
       });

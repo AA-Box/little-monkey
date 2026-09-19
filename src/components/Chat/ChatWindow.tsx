@@ -77,6 +77,7 @@ import type { VoiceRouteEngine, VoiceRouteRecord } from "../../lib/daemonClient"
 import type { TalkMode } from "../../lib/talkEngine";
 import { Button, IconButton } from "../ui";
 import { talkClient } from "../../lib/talkClient";
+import { openMicrophoneSettings } from "../../lib/microphoneAccess";
 import { TalkMenu } from "./TalkMenu";
 import { RealtimeTalkBar } from "./RealtimeTalkBar";
 import { loadGeneratedImage, loadWorkspaceImage } from "../../lib/imageGeneration";
@@ -1741,7 +1742,25 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                     transcription returns Talk to listening, and showing only
                     `setupError` here meant the composer said "Listening" and
                     nothing else while every turn died. */}
-                {(talk.setupError ?? talk.snapshot?.error) && (
+                {/* A refusal with a remedy is a button, not a sentence. macOS
+                    asks about the microphone exactly once, so when the answer
+                    was no there is nothing left to prompt — the only way
+                    forward is the Settings pane, and printing a DOMException
+                    instead left the operator with no way to reach it. */}
+                {talk.microphoneBlocked ? (
+                  <span role="alert" className="flex min-w-0 items-center gap-2">
+                    <span className="min-w-0 truncate text-danger">
+                      {talk.microphoneBlocked === "webviewDenied"
+                        ? t("ChatWindow.talkMicrophoneWebviewBlocked")
+                        : t("ChatWindow.talkMicrophoneBlocked")}
+                    </span>
+                    {talk.microphoneBlocked !== "webviewDenied" && (
+                      <Button size="sm" variant="secondary" onClick={() => void openMicrophoneSettings()}>
+                        {t("ChatWindow.talkOpenMicrophoneSettings")}
+                      </Button>
+                    )}
+                  </span>
+                ) : (talk.setupError ?? talk.snapshot?.error) && (
                   <button
                     type="button"
                     role="alert"
