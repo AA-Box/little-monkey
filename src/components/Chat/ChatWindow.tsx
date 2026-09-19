@@ -77,7 +77,7 @@ import type { VoiceRouteEngine, VoiceRouteRecord } from "../../lib/daemonClient"
 import type { TalkMode } from "../../lib/talkEngine";
 import { Button, IconButton } from "../ui";
 import { talkClient } from "../../lib/talkClient";
-import { askForMicrophoneAgain, openMicrophoneSettings } from "../../lib/microphoneAccess";
+import { openMicrophoneSettings } from "../../lib/microphoneAccess";
 import { TalkMenu } from "./TalkMenu";
 import { RealtimeTalkBar } from "./RealtimeTalkBar";
 import { loadGeneratedImage, loadWorkspaceImage } from "../../lib/imageGeneration";
@@ -1742,11 +1742,12 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                     transcription returns Talk to listening, and showing only
                     `setupError` here meant the composer said "Listening" and
                     nothing else while every turn died. */}
-                {/* A refusal with a remedy is a button, not a sentence. macOS
-                    asks about the microphone exactly once, so when the answer
-                    was no there is nothing left to prompt — the only way
-                    forward is the Settings pane, and printing a DOMException
-                    instead left the operator with no way to reach it. */}
+                {/* A refusal with a remedy is a button, not a sentence, and
+                    a remedy the app can take itself is not even a button:
+                    pressing Talk after a refusal makes macOS forget its answer
+                    and ask again, so by the time this shows the operator has
+                    already said no to a second dialog. Settings is what is
+                    left. */}
                 {talk.microphoneBlocked ? (
                   <span role="alert" className="flex min-w-0 items-center gap-2">
                     <span className="min-w-0 truncate text-danger">
@@ -1755,29 +1756,9 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                         : t("ChatWindow.talkMicrophoneBlocked")}
                     </span>
                     {talk.microphoneBlocked !== "webviewDenied" && (
-                      <>
-                        {/* The OS will not ask twice on its own, but it will
-                            ask again once it has forgotten the answer — so the
-                            first offer is one click, not a trip to Settings.
-                            Nothing is granted here; the operator still
-                            answers the dialog. */}
-                        <Button
-                          size="sm"
-                          variant="primary"
-                          onClick={() => {
-                            void askForMicrophoneAgain()
-                              .then((status) => { if (status === "granted") void talk.start(); })
-                              // Where there is no decision to reset, the pane
-                              // beside this is still the honest way through.
-                              .catch(() => openMicrophoneSettings());
-                          }}
-                        >
-                          {t("ChatWindow.talkAskForMicrophoneAgain")}
-                        </Button>
-                        <Button size="sm" variant="secondary" onClick={() => void openMicrophoneSettings()}>
-                          {t("ChatWindow.talkOpenMicrophoneSettings")}
-                        </Button>
-                      </>
+                      <Button size="sm" variant="secondary" onClick={() => void openMicrophoneSettings()}>
+                        {t("ChatWindow.talkOpenMicrophoneSettings")}
+                      </Button>
                     )}
                   </span>
                 ) : (talk.setupError ?? talk.snapshot?.error) && (

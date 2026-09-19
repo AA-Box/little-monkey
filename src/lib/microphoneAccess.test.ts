@@ -13,7 +13,7 @@ const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invoke(...args) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => undefined) }));
 
-import { askForMicrophoneAgain, MicrophoneBlockedError, openMicrophone } from "./microphoneAccess";
+import { MicrophoneBlockedError, openMicrophone } from "./microphoneAccess";
 
 const getUserMedia = vi.fn();
 Object.defineProperty(navigator, "mediaDevices", {
@@ -101,21 +101,55 @@ describe("opening the microphone", () => {
 });
 
 describe("asking again after a refusal", () => {
-  it("has the operating system forget its answer, then asks", async () => {
-    invoke.mockResolvedValue("granted");
-    expect(await askForMicrophoneAgain()).toBe("granted");
+  /** The OS answers `first`, then `second` once it has forgotten. */
+  function answers(first: string, second: string | Error) {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "microphone_request_access") return first;
+      if (command === "microphone_ask_again") {
+        if (second instanceof Error) throw second;
+        return second;
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+  }
+
+  it("has the system forget a refusal and ask again, inside the same press", async () => {
+    // macOS asks once, so a refusal used to end at a Settings pane the
+    // operator had to go and find. Forgetting the answer is a state the OS is
+    // willing to ask about again — and the operator still answers it.
+    answers("denied", "granted");
+    getUserMedia.mockResolvedValue(STREAM);
+
+    expect(await openMicrophone({ audio: true })).toBe(STREAM);
     expect(invoke).toHaveBeenCalledWith("microphone_ask_again");
   });
 
-  it("reports a second refusal rather than pretending it asked", async () => {
-    // The dialog appeared and the answer was no again. Saying anything else
-    // would send the operator back to a button that changes nothing.
-    invoke.mockResolvedValue("denied");
-    expect(await askForMicrophoneAgain()).toBe("denied");
+  it("asks once, not until the answer changes", async () => {
+    answers("denied", "denied");
+    const reason = await openMicrophone({ audio: true }).catch((error) => error);
+
+    expect(reason).toBeInstanceOf(MicrophoneBlockedError);
+    // A second no is a decision. Resetting again would be nagging with extra
+    // steps, and it is the behaviour the permission exists to prevent.
+    expect(invoke.mock.calls.filter(([command]) => command === "microphone_ask_again")).toHaveLength(1);
+    expect(getUserMedia).not.toHaveBeenCalled();
   });
 
-  it("surfaces platforms where there is no decision to reset", async () => {
-    invoke.mockRejectedValue(new Error("Resetting the microphone permission is a macOS feature"));
-    await expect(askForMicrophoneAgain()).rejects.toThrow(/macOS feature/);
+  it("keeps the first answer where there is no decision to reset", async () => {
+    // Every platform that is not macOS. The refusal stands, with Settings
+    // still reachable from the alert — it does not become a raw Rust error.
+    answers("denied", new Error("Resetting the microphone permission is a macOS feature"));
+
+    const reason = await openMicrophone({ audio: true }).catch((error) => error);
+    expect(reason).toBeInstanceOf(MicrophoneBlockedError);
+    expect(reason.block).toBe("denied");
+  });
+
+  it("never forgets an answer that was yes", async () => {
+    answers("granted", "denied");
+    getUserMedia.mockResolvedValue(STREAM);
+
+    await openMicrophone({ audio: true });
+    expect(invoke).not.toHaveBeenCalledWith("microphone_ask_again");
   });
 });

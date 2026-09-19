@@ -41,12 +41,19 @@ export class MicrophoneBlockedError extends Error {
 
 /** `getUserMedia`, having asked the operating system first. */
 export async function openMicrophone(constraints: MediaStreamConstraints): Promise<MediaStream> {
-  let status: DictationPermissionStatus | null = null;
-  try {
-    status = await invoke<DictationPermissionStatus>("microphone_request_access");
-  } catch {
-    // A platform with nothing to ask, or a shell that predates the command.
-    // Refusing here would break the platforms that never needed asking.
+  let status = await askTheOperatingSystem();
+  // macOS asks once. After a refusal the request returns the recorded answer
+  // without any dialog, which used to leave System Settings as the only way
+  // back — a remedy the operator has to go and find. The app cannot grant
+  // itself anything, but it can make the OS forget its answer, and a forgotten
+  // answer is one it is willing to ask about again. So a refusal now costs one
+  // more dialog rather than a trip through Settings.
+  //
+  // Only ever here, inside a press that asked for the microphone, and only
+  // once per press: erasing a "no" nobody is waiting on is exactly the
+  // behaviour the permission exists to prevent.
+  if (status === "denied" || status === "restricted") {
+    status = await invoke<DictationPermissionStatus>("microphone_ask_again").catch(() => status);
   }
   if (status === "denied" || status === "restricted") throw new MicrophoneBlockedError(status);
   try {
@@ -62,6 +69,17 @@ export async function openMicrophone(constraints: MediaStreamConstraints): Promi
   }
 }
 
+/** The recorded answer, or null on a platform with nothing to ask. */
+async function askTheOperatingSystem(): Promise<DictationPermissionStatus | null> {
+  try {
+    return await invoke<DictationPermissionStatus>("microphone_request_access");
+  } catch {
+    // A platform with nothing to ask, or a shell that predates the command.
+    // Refusing here would break the platforms that never needed asking.
+    return null;
+  }
+}
+
 /**
  * Open the OS pane where the decision can be changed.
  *
@@ -72,20 +90,3 @@ export async function openMicrophone(constraints: MediaStreamConstraints): Promi
  * `ForbiddenUrl` without one.
  */
 export const openMicrophoneSettings = () => dictationClient.openPermissionSettings("microphone");
-
-/**
- * Have the operating system forget its answer, and ask again.
- *
- * macOS asks once. After a refusal nothing the app calls will show the dialog
- * again, which is why the remedy is otherwise a trip to System Settings.
- * Resetting the decision for this bundle identifier restores the state in which
- * the OS is willing to ask — it grants nothing, and the operator still answers.
- *
- * Offered behind a button and never taken on the app's own initiative: quietly
- * erasing somebody's "no" and re-prompting is the behaviour the permission
- * exists to prevent. Returns the status they chose, or throws where there is no
- * such decision to reset.
- */
-export async function askForMicrophoneAgain(): Promise<DictationPermissionStatus> {
-  return invoke<DictationPermissionStatus>("microphone_ask_again");
-}

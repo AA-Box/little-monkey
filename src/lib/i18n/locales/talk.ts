@@ -31,7 +31,6 @@ export const talkLocale: Record<string, string> = {
   "ChatWindow.talkMicrophoneBlocked": "Little Monkey does not have permission to use the microphone.",
   "ChatWindow.talkMicrophoneWebviewBlocked": "The system allows Little Monkey to use the microphone, but this window was refused. Restart Little Monkey.",
   "ChatWindow.talkOpenMicrophoneSettings": "Open microphone settings",
-  "ChatWindow.talkAskForMicrophoneAgain": "Ask again",
   "ChatWindow.talkAlwaysListeningOn": "Always listening is on: the microphone is active, local keyword spotting is armed, and full transcription starts only after the wake word.",
   "ChatWindow.talkAlwaysListeningArming": "Always listening is on, but Talk is not claiming wake readiness until the microphone and local keyword spotter are armed.",
   "ChatWindow.talkStopListening": "Stop listening",
