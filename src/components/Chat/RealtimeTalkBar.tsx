@@ -82,7 +82,7 @@ export function RealtimeTalkBar({
         <p role="alert" className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 p-2">
           <AlertTriangle size={14} className="mt-0.5 shrink-0" />
           <span>
-            An OpenAI API key is not available in the OS keychain. Realtime Talk will not fall back to another provider.{' '}
+            {t('RealtimeTalk.noProviderKey')}{' '}
             <button type="button" className="underline" onClick={onOpenVoiceSettings}>{t('TalkMenu.openVoiceSettings')}</button>
           </span>
         </p>
@@ -92,31 +92,29 @@ export function RealtimeTalkBar({
         <label className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 p-2">
           <input className="mt-0.5" type="checkbox" checked={privacyAccepted} onChange={(event) => setPrivacyAccepted(event.target.checked)} />
           <span>
-            <span className="mb-1 flex items-center gap-1 font-semibold"><ShieldAlert size={14} />Before connecting</span>
-            Audio from the selected microphone and the bounded conversation context are sent to OpenAI for this live session.
-            Tool calls still pass through Little Monkey’s existing permission, sandbox, workspace, network, and MCP controls.
-            Audio is not stored by Little Monkey.
+            <span className="mb-1 flex items-center gap-1 font-semibold"><ShieldAlert size={14} />{t('RealtimeTalk.beforeConnecting')}</span>
+            {t('RealtimeTalk.privacyNotice')}
           </span>
         </label>
       )}
 
       {session.awaitingApproval && (
         <p className="rounded-md border border-warning/40 bg-warning/10 p-2">
-          Little Monkey is running a tool through its normal boundary. If it needs a decision, the usual permission prompt appears.
+          {t('RealtimeTalk.awaitingApproval')}
         </p>
       )}
 
       {session.error && (
         <div role="alert" className="rounded-md border border-danger/40 bg-danger/10 p-2">
           <p className="text-danger">{session.error}</p>
-          <Button className="mt-1.5" size="sm" variant="secondary" onClick={() => void session.start()}>Retry same provider</Button>
+          <Button className="mt-1.5" size="sm" variant="secondary" onClick={() => void session.start()}>{t('RealtimeTalk.retrySameProvider')}</Button>
         </div>
       )}
 
       <div className="flex flex-wrap items-center gap-2">
         {!running ? (
           <Button size="sm" variant="primary" onClick={() => void session.start()} disabled={!privacyAccepted || providerStatus?.configured !== true}>
-            <Mic size={14} />Start realtime Talk
+            <Mic size={14} />{t('RealtimeTalk.start')}
           </Button>
         ) : (
           <Button size="sm" variant="secondary" onClick={() => { void session.stop(); onEnd(); }}>
@@ -139,7 +137,7 @@ export function RealtimeTalkBar({
           </Button>
         )}
         <Button size="sm" variant="danger" disabled={session.state !== 'responding'} onClick={() => void session.interrupt()}>
-          <Square size={12} />Stop response
+          <Square size={12} />{t('RealtimeTalk.stopResponse')}
         </Button>
         <span className="ml-auto text-faint">OpenAI · {voice.realtimeModel ?? 'gpt-realtime-2.1'} · {voice.realtimeVoice ?? 'marin'}</span>
       </div>

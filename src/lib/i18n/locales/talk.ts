@@ -45,4 +45,11 @@ export const talkLocale: Record<string, string> = {
   "RealtimeTalk.stateReconnecting": "Reconnecting\u2026",
   "RealtimeTalk.stateError": "Something went wrong",
   "RealtimeTalk.stateClosed": "Closed",
+  "RealtimeTalk.start": "Start realtime Talk",
+  "RealtimeTalk.stopResponse": "Stop response",
+  "RealtimeTalk.retrySameProvider": "Retry same provider",
+  "RealtimeTalk.beforeConnecting": "Before connecting",
+  "RealtimeTalk.privacyNotice": "Audio from the selected microphone and the bounded conversation context are sent to OpenAI for this live session. Tool calls still pass through Little Monkey\u2019s existing permission, sandbox, workspace, network, and MCP controls. Audio is not stored by Little Monkey.",
+  "RealtimeTalk.noProviderKey": "An OpenAI API key is not available in the OS keychain. Realtime Talk will not fall back to another provider.",
+  "RealtimeTalk.awaitingApproval": "Little Monkey is running a tool through its normal boundary. If it needs a decision, the usual permission prompt appears.",
 };
