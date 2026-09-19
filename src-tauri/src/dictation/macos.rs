@@ -196,6 +196,31 @@ pub async fn request_microphone_access() -> super::DictationPermissionStatus {
     }
 }
 
+/// Return this app's microphone decision to "not determined", so the OS will
+/// ask again.
+///
+/// macOS asks once. After a refusal `requestAccessForMediaType:` answers from
+/// the record without showing anything, and no API can change the answer — the
+/// only route left is a trip to System Settings. `tccutil` resets a decision
+/// for one bundle identifier, needs no elevation, and grants nothing by itself:
+/// it restores the state in which the operating system is willing to ask, and
+/// the operator still answers.
+///
+/// Never on the app's own initiative. Erasing somebody's deliberate "no"
+/// without being asked to is the behaviour this permission exists to prevent;
+/// this runs when they press a button that says so.
+pub fn reset_microphone_access(bundle_identifier: &str) -> Result<(), String> {
+    let output = std::process::Command::new("/usr/bin/tccutil")
+        .args(["reset", "Microphone", bundle_identifier])
+        .output()
+        .map_err(|error| format!("Could not run tccutil: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
 pub fn open_permission_settings(kind: &str) -> Result<(), String> {
     let kind = CString::new(kind).map_err(|_| "Invalid dictation permission kind".to_string())?;
     let opened = unsafe { little_monkey_dictation_macos_open_permission_settings(kind.as_ptr()) };

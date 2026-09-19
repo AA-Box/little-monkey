@@ -77,7 +77,7 @@ import type { VoiceRouteEngine, VoiceRouteRecord } from "../../lib/daemonClient"
 import type { TalkMode } from "../../lib/talkEngine";
 import { Button, IconButton } from "../ui";
 import { talkClient } from "../../lib/talkClient";
-import { openMicrophoneSettings } from "../../lib/microphoneAccess";
+import { askForMicrophoneAgain, openMicrophoneSettings } from "../../lib/microphoneAccess";
 import { TalkMenu } from "./TalkMenu";
 import { RealtimeTalkBar } from "./RealtimeTalkBar";
 import { loadGeneratedImage, loadWorkspaceImage } from "../../lib/imageGeneration";
@@ -1755,9 +1755,29 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                         : t("ChatWindow.talkMicrophoneBlocked")}
                     </span>
                     {talk.microphoneBlocked !== "webviewDenied" && (
-                      <Button size="sm" variant="secondary" onClick={() => void openMicrophoneSettings()}>
-                        {t("ChatWindow.talkOpenMicrophoneSettings")}
-                      </Button>
+                      <>
+                        {/* The OS will not ask twice on its own, but it will
+                            ask again once it has forgotten the answer — so the
+                            first offer is one click, not a trip to Settings.
+                            Nothing is granted here; the operator still
+                            answers the dialog. */}
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          onClick={() => {
+                            void askForMicrophoneAgain()
+                              .then((status) => { if (status === "granted") void talk.start(); })
+                              // Where there is no decision to reset, the pane
+                              // beside this is still the honest way through.
+                              .catch(() => openMicrophoneSettings());
+                          }}
+                        >
+                          {t("ChatWindow.talkAskForMicrophoneAgain")}
+                        </Button>
+                        <Button size="sm" variant="secondary" onClick={() => void openMicrophoneSettings()}>
+                          {t("ChatWindow.talkOpenMicrophoneSettings")}
+                        </Button>
+                      </>
                     )}
                   </span>
                 ) : (talk.setupError ?? talk.snapshot?.error) && (

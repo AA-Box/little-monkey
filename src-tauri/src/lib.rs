@@ -2103,6 +2103,7 @@ pub fn run() {
             dictation::dictation_capabilities,
             dictation::dictation_open_permission_settings,
             dictation::microphone_request_access,
+            dictation::microphone_ask_again,
             dictation::dictation_start,
             dictation::dictation_stop,
             dictation::dictation_cancel,

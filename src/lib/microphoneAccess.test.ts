@@ -13,7 +13,7 @@ const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invoke(...args) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: () => Promise.resolve(() => undefined) }));
 
-import { MicrophoneBlockedError, openMicrophone } from "./microphoneAccess";
+import { askForMicrophoneAgain, MicrophoneBlockedError, openMicrophone } from "./microphoneAccess";
 
 const getUserMedia = vi.fn();
 Object.defineProperty(navigator, "mediaDevices", {
@@ -97,5 +97,25 @@ describe("opening the microphone", () => {
     const reason = await openMicrophone({ audio: true }).catch((error) => error);
     expect(reason).toBe(missing);
     expect(reason).not.toBeInstanceOf(MicrophoneBlockedError);
+  });
+});
+
+describe("asking again after a refusal", () => {
+  it("has the operating system forget its answer, then asks", async () => {
+    invoke.mockResolvedValue("granted");
+    expect(await askForMicrophoneAgain()).toBe("granted");
+    expect(invoke).toHaveBeenCalledWith("microphone_ask_again");
+  });
+
+  it("reports a second refusal rather than pretending it asked", async () => {
+    // The dialog appeared and the answer was no again. Saying anything else
+    // would send the operator back to a button that changes nothing.
+    invoke.mockResolvedValue("denied");
+    expect(await askForMicrophoneAgain()).toBe("denied");
+  });
+
+  it("surfaces platforms where there is no decision to reset", async () => {
+    invoke.mockRejectedValue(new Error("Resetting the microphone permission is a macOS feature"));
+    await expect(askForMicrophoneAgain()).rejects.toThrow(/macOS feature/);
   });
 });

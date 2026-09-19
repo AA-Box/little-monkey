@@ -575,3 +575,8 @@ unsafe fn phrase_text(result: &ISpRecoResult) -> Result<String, String> {
 pub async fn request_microphone_access() -> super::DictationPermissionStatus {
     super::DictationPermissionStatus::Unknown
 }
+
+/// No per-app microphone decision to reset on this platform.
+pub fn reset_microphone_access(_bundle_identifier: &str) -> Result<(), String> {
+    Err("Resetting the microphone permission is a macOS feature".to_string())
+}

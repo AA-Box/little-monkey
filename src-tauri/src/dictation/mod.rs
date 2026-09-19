@@ -362,6 +362,25 @@ pub async fn microphone_request_access() -> Result<DictationPermissionStatus, St
     }
 }
 
+/// Ask the operating system to forget this app's microphone decision, then ask
+/// again — the one-click form of the trip to System Settings.
+#[tauri::command]
+pub async fn microphone_ask_again(
+    app: tauri::AppHandle,
+) -> Result<DictationPermissionStatus, String> {
+    let identifier = app.config().identifier.clone();
+    #[cfg(target_os = "macos")]
+    {
+        macos::reset_microphone_access(&identifier)?;
+        return Ok(macos::request_microphone_access().await);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = identifier;
+        Err("Resetting the microphone permission is a macOS feature".to_string())
+    }
+}
+
 fn open_permission_settings(kind: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
