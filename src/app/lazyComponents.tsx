@@ -112,9 +112,6 @@ export const GoldenDatasetBuilderPanel = lazy(() =>
     default: GoldenDatasetBuilderPanel,
   })),
 );
-export const TalkPanel = lazy(() =>
-  import("../components/Talk/TalkPanel").then(({ TalkPanel }) => ({ default: TalkPanel })),
-);
 
 export const DailyBriefPanel = lazy(() =>
   import("../components/DailyBrief/DailyBriefPanel").then(({ DailyBriefPanel }) => ({ default: DailyBriefPanel })),

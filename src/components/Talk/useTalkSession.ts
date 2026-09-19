@@ -6,9 +6,11 @@
  * utterance ended or what may be spoken; it opens devices, moves bytes, and
  * reports what the engine says.
  *
- * It lives apart from `TalkPanel` because the same conversation now runs from
- * two surfaces — the Talk panel and the chat composer's Talk button — and a
- * voice loop duplicated across two files is a voice loop that drifts.
+ * It lives apart from the components that render it because a voice loop
+ * duplicated across files is a voice loop that drifts. There used to be two
+ * surfaces — a Talk page and the chat composer — and every difference between
+ * them was a bug in one of them; now the composer is the only caller, and this
+ * is still the only place that owns the devices.
  *
  * The turn itself is an ordinary one. `runAgentTurn(..., 'voice')` is the same
  * call the composer's Send makes, into the same session, with the same model
@@ -190,6 +192,12 @@ export function useTalkSession(
    * it, from whichever surface it was switched off on.
    */
   const autoListeningRef = useRef(false);
+  // Read inside the engine effect but deliberately not a dependency of it: the
+  // composer changes this every time the operator flips push-to-talk, and
+  // rebuilding the engine there would tear the microphone down and reopen it
+  // mid-conversation. `mode` is already handled this way, through `setMode`.
+  const autoStartModeRef = useRef(autoStartMode);
+  autoStartModeRef.current = autoStartMode;
   const grantRef = useRef<CaptureGrant | null>(null);
   /**
    * The turn Talk is waiting on: the utterance id the durable ingress was given,
@@ -606,10 +614,41 @@ export function useTalkSession(
     };
   }, [ensureGrant, player, sessionId]);
 
+  /**
+   * Build the AudioContext while the click that asked for Talk is still the
+   * current gesture.
+   *
+   * WebKit decides whether a context may run from what is on the stack when it
+   * is *constructed*, and `start` awaits the route activation, the permission
+   * grant, the config read and `getUserMedia` before capture gets there. By
+   * then the gesture is spent, the context is born suspended, `resume()`
+   * settles without starting it, and the whole failure is silent — worklet
+   * installed, meter at zero, badge on "Listening", nothing transcribed.
+   *
+   * Synchronous on purpose: one `await` above this line puts it back where it
+   * was.
+   */
+  const openAudioContext = useCallback(() => {
+    if (audioContextRef.current) return;
+    try {
+      audioContextRef.current = new AudioContext();
+    } catch {
+      // A webview that refuses to construct one at all fails later, in
+      // `openPcmDevices`, where the message already explains itself.
+    }
+  }, []);
+
   // One engine per session. Rebuilt when the session changes, because a Talk
   // session belongs to exactly one conversation.
   useEffect(() => {
     if (!enabled) return;
+    // Synchronous, and first: WebKit decides whether an AudioContext may run
+    // from what is on the stack when it is *constructed*, and the `config()`
+    // await below spends the click that enabled this hook. Without this the
+    // composer's auto-started Talk builds a suspended context — meter at zero,
+    // nothing transcribed, no error — which is the bug 78e45876 fixed for the
+    // `start()` path only.
+    openAudioContext();
     let disposed = false;
     let engine: TalkSession | null = null;
     void companionClient
@@ -639,8 +678,13 @@ export function useTalkSession(
         // once somebody has pressed something. Either way the microphone opens
         // no earlier than this, and closes with the surface that opened it:
         // there is no listening behind the operator's back.
-        const auto = autoStartMode ?? (config.voice.alwaysListening ? 'continuous' : null);
-        autoListeningRef.current = autoStartMode === null && config.voice.alwaysListening;
+        const auto = autoStartModeRef.current ?? (config.voice.alwaysListening ? 'continuous' : null);
+        // Only a microphone the *setting* opened is the setting's to close. The
+        // composer enables this hook when somebody presses Talk, so on that
+        // path this is deliberately false and the teardown watcher below has
+        // nothing to do: turning Always Listening off in Settings must not cut
+        // off a conversation the operator started by hand.
+        autoListeningRef.current = autoStartModeRef.current === null && config.voice.alwaysListening;
         if (auto) {
           setMode(auto);
           engine.setMode(auto);
@@ -664,7 +708,7 @@ export function useTalkSession(
     // `ports` is memoized on the session; `mode` is applied through `setMode`
     // below rather than by rebuilding the engine mid-conversation.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoStartMode, enabled, ports, releaseDevices, sessionId]);
+  }, [enabled, openAudioContext, ports, releaseDevices, sessionId]);
 
   useEffect(() => {
     routeRef.current = route;
@@ -814,29 +858,6 @@ export function useTalkSession(
     });
   }, [sessionId]);
 
-  /**
-   * Build the AudioContext while the click that asked for Talk is still the
-   * current gesture.
-   *
-   * WebKit decides whether a context may run from what is on the stack when it
-   * is *constructed*, and `start` awaits the route activation, the permission
-   * grant, the config read and `getUserMedia` before capture gets there. By
-   * then the gesture is spent, the context is born suspended, `resume()`
-   * settles without starting it, and the whole failure is silent — worklet
-   * installed, meter at zero, badge on "Listening", nothing transcribed.
-   *
-   * Synchronous on purpose: one `await` above this line puts it back where it
-   * was.
-   */
-  const openAudioContext = useCallback(() => {
-    if (audioContextRef.current) return;
-    try {
-      audioContextRef.current = new AudioContext();
-    } catch {
-      // A webview that refuses to construct one at all fails later, in
-      // `openPcmDevices`, where the message already explains itself.
-    }
-  }, []);
 
   const start = useCallback(async () => {
     openAudioContext();
@@ -864,7 +885,7 @@ export function useTalkSession(
    * the switch.
    *
    * The setting is read once, when the engine is built, and the surface that
-   * read it can be open for hours — a Talk panel armed since breakfast is
+   * read it can be open for hours — a conversation armed since breakfast is
    * exactly the session an operator goes to Settings to turn off. Reacting in
    * the Settings switch, or in the panel's own "Stop listening" button, only
    * covers the surface that happens to hold the switch; every other route to
@@ -893,7 +914,7 @@ export function useTalkSession(
           if (cancelled || !autoListeningRef.current || config.voice.alwaysListening) return;
           autoListeningRef.current = false;
           await stop();
-          // The Talk panel's "Always listening is on: the microphone is active"
+          // The composer's "Always listening is on: the microphone is active"
           // banner is drawn from `TalkStatus`, which was read when the surface
           // opened. Leaving it stale would put a claim that the microphone is
           // active directly above a microphone this just closed.
