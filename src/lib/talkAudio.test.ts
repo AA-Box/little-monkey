@@ -199,6 +199,44 @@ describe('streaming PCM path', () => {
  * "Ready" with a level meter at zero and no error anywhere, because the refusal
  * happens on the audio thread where nothing surfaces it.
  */
+/**
+ * Talk needs two separate macOS grants, and only one of them is obvious.
+ *
+ * Tauri signs the bundle with the hardened runtime, and under hardened runtime
+ * the microphone is unreachable without `com.apple.security.device.audio-input`:
+ * `getUserMedia` is refused by the platform before TCC is consulted, so no
+ * permission dialog ever appears and the page gets a bare `NotAllowedError`.
+ * `NSMicrophoneUsageDescription` supplies the sentence that dialog would show;
+ * it cannot make the dialog happen. Shipping one without the other is the
+ * configuration that looks complete and silently cannot record.
+ */
+describe('the macOS microphone grants', () => {
+  const conf = JSON.parse(
+    readFileSync(join(process.cwd(), 'src-tauri/tauri.conf.json'), 'utf8'),
+  );
+
+  it('points the bundle at an entitlements file', () => {
+    expect(conf.bundle?.macOS?.entitlements).toBe('Entitlements.plist');
+  });
+
+  it('grants audio input in that file', () => {
+    const entitlements = readFileSync(
+      join(process.cwd(), 'src-tauri', conf.bundle.macOS.entitlements),
+      'utf8',
+    );
+    expect(entitlements).toContain('com.apple.security.device.audio-input');
+    // A key with no `<true/>` after it is a key that grants nothing.
+    expect(
+      /com\.apple\.security\.device\.audio-input<\/key>\s*<true\s*\/>/.test(entitlements),
+    ).toBe(true);
+  });
+
+  it('still explains itself in Info.plist, which the dialog needs', () => {
+    const plist = readFileSync(join(process.cwd(), 'src-tauri/Info.plist'), 'utf8');
+    expect(plist).toContain('NSMicrophoneUsageDescription');
+  });
+});
+
 describe('the capture worklet and the CSP', () => {
   const policies = (() => {
     const conf = JSON.parse(

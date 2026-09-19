@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <!--
+      Tauri signs the macOS bundle with the hardened runtime
+      (CodeDirectory flags=0x10000). Under hardened runtime the microphone is
+      unreachable without this entitlement: `getUserMedia` is refused by the
+      platform before TCC is ever consulted, so no permission dialog appears
+      and the page sees
+
+          NotAllowedError: The request is not allowed by the user agent or the
+          platform in the current context, possibly because the user denied
+          permission.
+
+      NSMicrophoneUsageDescription in Info.plist is necessary and not
+      sufficient: it supplies the sentence the dialog would show, while this
+      entitlement is what allows the dialog to happen at all.
+    -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+  </dict>
+</plist>

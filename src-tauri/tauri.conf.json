@@ -67,7 +67,8 @@
     "macOS": {
       "files": {
         "Resources/Assets.car": "resources/Assets.car"
-      }
+      },
+      "entitlements": "Entitlements.plist"
     }
   }
 }
