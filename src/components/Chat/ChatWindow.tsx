@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import type { ClipboardEvent, FormEvent, KeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { AudioLines, CornerDownLeft, Square } from "lucide-react";
+import { AudioLines, CornerDownLeft, Radio, Square } from "lucide-react";
 
 import { compactSessionNow, runAgentTurn, stopTurn } from "../../lib/agentLoop";
 import type { AttachmentRef } from "../../lib/agentLoop";
@@ -72,7 +72,14 @@ import {
 import { useEcosystemStore } from "../../store/ecosystemStore";
 import { useNativeSkillsStore } from "../../store/nativeSkillsStore";
 import { useSkillActivationPolicyStore } from "../../store/skillActivationPolicyStore";
-import { companionClient } from "../../lib/companionClient";
+import { companionClient, type VoiceConfig } from "../../lib/companionClient";
+import type { VoiceRouteEngine, VoiceRouteRecord } from "../../lib/daemonClient";
+import type { TalkMode } from "../../lib/talkEngine";
+import { Button, IconButton } from "../ui";
+import { talkClient } from "../../lib/talkClient";
+import { openMicrophoneSettings } from "../../lib/microphoneAccess";
+import { TalkMenu } from "./TalkMenu";
+import { RealtimeTalkBar } from "./RealtimeTalkBar";
 import { loadGeneratedImage, loadWorkspaceImage } from "../../lib/imageGeneration";
 import {
   BUILT_IN_SLASH_COMMANDS,
@@ -312,13 +319,13 @@ const TALK_STATE_LABEL_KEY: Record<TalkState, string> = {
   off: "ChatWindow.talkStateIdle",
   starting: "ChatWindow.talkStateStarting",
   armed: "ChatWindow.talkStateListening",
-  wake_detected: "ChatWindow.talkStateListening",
+  wake_detected: "ChatWindow.talkStateWakeDetected",
   capturing_command: "ChatWindow.talkStateListening",
   transcribing: "ChatWindow.talkStateTranscribing",
   thinking: "ChatWindow.talkStateThinking",
   speaking: "ChatWindow.talkStateSpeaking",
   interrupted: "ChatWindow.talkStateInterrupted",
-  rearming: "ChatWindow.talkStateStarting",
+  rearming: "ChatWindow.talkStateRearming",
   error: "ChatWindow.talkStateError",
 };
 
@@ -330,9 +337,6 @@ interface ChatWindowProps {
   onOpenBackgroundTasks?: () => void;
   onOpenPmCopilot?: () => void;
   onOpenStudio?: () => void;
-  /** Realtime mode needs the full surface so its privacy warning is shown
-   * before any microphone is opened. */
-  onOpenTalk?: () => void;
 }
 
 interface ComposerDraftSnapshot {
@@ -341,7 +345,7 @@ interface ComposerDraftSnapshot {
   pastedPlacements: PastedTextPlacement[];
 }
 
-export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks, onOpenPmCopilot, onOpenStudio, onOpenTalk }: ChatWindowProps) {
+export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks, onOpenPmCopilot, onOpenStudio }: ChatWindowProps) {
   const messages = useSessionStore(selectSessionMessages(sessionId));
   const persistError = useSessionStore((state) => state.persistError);
   const roots = useWorkspaceStore((state) => state.roots);
@@ -382,7 +386,21 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   // stays inert — no config read, no engine, no microphone — until this flips,
   // so a chat nobody has spoken to opens no devices.
   const [talkActive, setTalkActive] = useState(false);
-  const talk = useTalkSession(sessionId, { enabled: talkActive, autoStartMode: "continuous" });
+  // Read once, when Talk starts, from the same config call that used to decide
+  // whether to open the standalone page.
+  const [voice, setVoice] = useState<VoiceConfig | null>(null);
+  const [talkRoute, setTalkRoute] = useState<VoiceRouteRecord | null>(null);
+  const [talkMode, setTalkMode] = useState<TalkMode>("continuous");
+  const [talkStartError, setTalkStartError] = useState<string | null>(null);
+  const talkEngine: VoiceRouteEngine = voice?.engineKind === "realtime" ? "realtime" : "pipeline";
+  // The pipeline hook stays inert while the realtime engine is the chosen one:
+  // `useRealtimeVoiceSession` owns the voice route unconditionally, and two
+  // live engines would fight over it — and over one spoken sentence.
+  const talk = useTalkSession(sessionId, {
+    enabled: talkActive && talkEngine === "pipeline",
+    autoStartMode: talkMode,
+    route: talkRoute,
+  });
   const talkState: TalkState = talkActive ? talk.snapshot?.state ?? "starting" : "off";
 
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
@@ -1477,12 +1495,19 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const startTalk = useCallback(() => {
     void companionClient.config()
       .then((config) => {
-        if (config.voice.engineKind === 'realtime' && onOpenTalk) onOpenTalk();
-        else setTalkActive(true);
+        // Both engines start here now. Realtime used to be handed to a separate
+        // page so its privacy warning could be shown before a microphone
+        // opened; `RealtimeTalkBar` shows the same gate in the composer and
+        // connects nothing until it is accepted.
+        setVoice(config.voice);
+        setTalkActive(true);
       })
       // Unknown configuration must not silently select a voice/privacy path.
-      .catch(() => { onOpenTalk?.(); });
-  }, [onOpenTalk]);
+      // With no page left to defer to, refusing to start is the fail-closed
+      // answer — and saying so is better than a microphone button that does
+      // nothing.
+      .catch((reason) => setTalkStartError(errorMessage(reason)));
+  }, []);
   const stopTalk = useCallback(() => {
     void talk.stop();
     setTalkActive(false);
@@ -1636,7 +1661,19 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                 })}
               </div>
             )}
-            {talkActive && (
+            {talkActive && talkEngine === "realtime" && voice && (
+              <RealtimeTalkBar
+                sessionId={sessionId}
+                voice={voice}
+                route={talkRoute}
+                onOpenVoiceSettings={() => onOpenSettingsTab("companion")}
+                onEnd={() => setTalkActive(false)}
+              />
+            )}
+            {talkStartError && (
+              <p role="alert" className="mb-1.5 truncate text-xs text-danger">{talkStartError}</p>
+            )}
+            {talkActive && talkEngine === "pipeline" && (
               // What Talk is doing, where the person doing it is already
               // looking. The level meter is the honest part: "Listening" with a
               // flat meter is a dead microphone, and that is worth seeing
@@ -1666,12 +1703,106 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                     transcription returns Talk to listening, and showing only
                     `setupError` here meant the composer said "Listening" and
                     nothing else while every turn died. */}
-                {(talk.setupError ?? talk.snapshot?.error) && (
-                  <span role="alert" className="min-w-0 truncate text-danger">
-                    {talk.setupError ?? talk.snapshot?.error}
+                {/* Bounding one utterance by hand. The page had this and the
+                    composer did not, so anyone who preferred push-to-talk had
+                    to leave chat to use it. Space and Enter are the keyboard
+                    route; `repeat` is what stops a held key pressing twice. */}
+                {talk.mode === "push_to_talk" && (
+                  <Button
+                    size="sm"
+                    variant={talk.snapshot?.capturing ? "danger" : "secondary"}
+                    onPointerDown={() => void talk.sessionRef.current?.press()}
+                    onPointerUp={() => void talk.sessionRef.current?.release()}
+                    onPointerCancel={() => void talk.sessionRef.current?.release()}
+                    onKeyDown={(event) => {
+                      if ((event.key === " " || event.key === "Enter") && !event.repeat) {
+                        event.preventDefault();
+                        void talk.sessionRef.current?.press();
+                      }
+                    }}
+                    onKeyUp={(event) => {
+                      if (event.key === " " || event.key === "Enter") void talk.sessionRef.current?.release();
+                    }}
+                  >
+                    {talk.snapshot?.capturing ? t("ChatWindow.talkReleaseToSend") : t("ChatWindow.talkHoldToTalk")}
+                  </Button>
+                )}
+                {/* Interrupting the answer is not ending the session — the
+                    primary button does that. */}
+                <IconButton
+                  size="sm"
+                  variant="ghost"
+                  aria-label={t("ChatWindow.talkStopAnswerAriaLabel")}
+                  disabled={!(talkState === "thinking" || talkState === "speaking")}
+                  onClick={() => talk.sessionRef.current?.interrupt("stop_button")}
+                >
+                  <Square size={12} />
+                </IconButton>
+                {/* The engine's own errors too, not just setup's. A failed
+                    transcription returns Talk to listening, and showing only
+                    `setupError` here meant the composer said "Listening" and
+                    nothing else while every turn died. */}
+                {/* A refusal with a remedy is a button, not a sentence. macOS
+                    asks about the microphone exactly once, so when the answer
+                    was no there is nothing left to prompt — the only way
+                    forward is the Settings pane, and printing a DOMException
+                    instead left the operator with no way to reach it. */}
+                {talk.microphoneBlocked ? (
+                  <span role="alert" className="flex min-w-0 items-center gap-2">
+                    <span className="min-w-0 truncate text-danger">
+                      {talk.microphoneBlocked === "webviewDenied"
+                        ? t("ChatWindow.talkMicrophoneWebviewBlocked")
+                        : t("ChatWindow.talkMicrophoneBlocked")}
+                    </span>
+                    {talk.microphoneBlocked !== "webviewDenied" && (
+                      <Button size="sm" variant="secondary" onClick={() => void openMicrophoneSettings()}>
+                        {t("ChatWindow.talkOpenMicrophoneSettings")}
+                      </Button>
+                    )}
                   </span>
+                ) : (talk.setupError ?? talk.snapshot?.error) && (
+                  <button
+                    type="button"
+                    role="alert"
+                    onClick={() => void talk.start()}
+                    className="min-w-0 cursor-pointer truncate text-danger underline"
+                    title={t("ChatWindow.talkTryAgain")}
+                  >
+                    {talk.setupError ?? talk.snapshot?.error}
+                  </button>
                 )}
               </div>
+            )}
+            {talkActive && talkEngine === "pipeline" && talk.status?.alwaysListening && (
+              // A live microphone needs a visible off switch, not one behind a
+              // click. This is the one control that does not go in the tray.
+              <p role="status" className="mb-1.5 flex items-center gap-2 rounded-md border border-danger/40 bg-danger/10 px-2 py-1 text-[11px] text-danger">
+                <Radio size={12} className="shrink-0 animate-pulse" />
+                {talkState === "armed"
+                  ? t("ChatWindow.talkAlwaysListeningOn")
+                  : t("ChatWindow.talkAlwaysListeningArming")}
+                <Button
+                  className="ml-auto"
+                  size="sm"
+                  variant="danger"
+                  onClick={() => {
+                    void talk.stop();
+                    void companionClient
+                      .config()
+                      .then((config) =>
+                        companionClient.saveConfig({
+                          ...config,
+                          voice: { ...config.voice, alwaysListening: false, wakePhraseEnabled: false },
+                        }),
+                      )
+                      .then(() => talkClient.status())
+                      .then(talk.setStatus)
+                      .catch((reason) => talk.setSetupError(errorMessage(reason)));
+                  }}
+                >
+                  {t("ChatWindow.talkStopListening")}
+                </Button>
+              </p>
             )}
             <div className="flex items-end gap-2">
               <div className="relative min-w-0 flex-1">
@@ -1765,6 +1896,20 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
             <ModeSelector />
             <PersonaSelector sessionId={sessionId} onManagePrompts={onManagePrompts} />
             <AttachMenu onAddFiles={() => void handleAddFiles()} onAddFolder={() => void handleAddFolder()} />
+            {/* Always available, not only while Talk runs: the microphone and
+                speaker are chosen before pressing Talk, not after. */}
+            <TalkMenu
+              sessionId={sessionId}
+              engine={talkEngine}
+              talk={talk}
+              mode={talk.mode}
+              onModeChange={(next) => {
+                setTalkMode(next);
+                talk.setMode(next);
+              }}
+              onRoute={setTalkRoute}
+              onOpenVoiceSettings={() => onOpenSettingsTab("companion")}
+            />
             {!headerActionsSlot && comparisonPickers}
           </div>
           <div className="flex flex-wrap items-center gap-3">

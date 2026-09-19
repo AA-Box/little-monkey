@@ -1,15 +1,16 @@
 // @vitest-environment jsdom
 /**
- * The Talk surface, driven the way an operator drives it.
+ * A spoken turn, end to end, through the hook that owns it.
  *
- * The claims worth a test here are the ones a screenshot cannot make. A machine
- * that cannot transcribe must say so instead of offering a Start button that
- * fails silently. A machine that is listening continuously must be impossible
- * to miss, and must be stoppable from the surface that admits it. And Talk has
- * to be a way back to typing rather than a mode you get stuck in.
+ * These were written against the standalone Talk page. The page is gone — Talk
+ * is a control in the chat composer now — but none of the claims below were
+ * ever about its markup: what is spoken, what is never spoken, which device the
+ * answer comes out of, and what the recognizer is primed with are properties of
+ * `useTalkSession` and the engine underneath it. So they are driven here the
+ * way the composer drives them: the hook, enabled, in continuous mode.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 
 const invoke = vi.fn();
 const runAgentTurn = vi.fn((..._args: unknown[]) => Promise.resolve());
@@ -24,7 +25,7 @@ vi.mock('../../lib/agentLoop', () => ({
   stopTurn: (...args: unknown[]) => stopTurn(...args),
 }));
 
-import { TalkPanel } from './TalkPanel';
+import { useTalkSession, type UseTalkSession } from './useTalkSession';
 import type { CompanionConfig } from '../../lib/companionClient';
 import type { TalkStatus } from '../../lib/talkClient';
 import { useSessionStore } from '../../store/sessionStore';
@@ -143,7 +144,7 @@ function mock(status: Partial<TalkStatus> = {}, config: CompanionConfig = CONFIG
   return saved;
 }
 
-/** Every command the panel sent, in order, for asking which path it took. */
+/** Every command Talk sent, in order, for asking which path it took. */
 const commands = () => invoke.mock.calls.map((call) => call[0] as string);
 
 class FakeTrack {
@@ -164,7 +165,7 @@ class FakeStream {
  * The devices jsdom does not have.
  *
  * Talk's decisions are tested through the engine's ports; what is left here is
- * the part the panel genuinely owns — opening the microphone, and handing a
+ * the part the hook genuinely owns — opening the microphone, and handing a
  * clip to a speaker — so these stand in for the hardware and record what they
  * were asked to do.
  */
@@ -194,7 +195,11 @@ function stubMedia(options: { routing?: boolean } = {}) {
     sinks: string[] = [];
     plays = 0;
     setSinkId?: (deviceId: string) => Promise<void>;
-    constructor(readonly src: string) {
+    /** Assigned per clip now that one element plays every clip. */
+    src = '';
+    /** Every clip this element was pointed at, in order. */
+    srcs: string[] = [];
+    constructor() {
       if (options.routing !== false) {
         this.setSinkId = async (deviceId) => {
           this.sinks.push(deviceId);
@@ -203,6 +208,7 @@ function stubMedia(options: { routing?: boolean } = {}) {
       speakers.push(this);
     }
     async play() {
+      this.srcs.push(this.src);
       this.plays += 1;
       queueMicrotask(() => this.onended?.());
     }
@@ -249,16 +255,44 @@ function stubMedia(options: { routing?: boolean } = {}) {
   return { streams, recorders, speakers };
 }
 
-/** Hold the push-to-talk control down, say something, and let go. */
-async function saySomething(media: ReturnType<typeof stubMedia>): Promise<void> {
-  const start = await screen.findByRole('button', { name: /start talk/i });
-  await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(false));
-  fireEvent.click(start);
-  const hold = await screen.findByRole('button', { name: /hold to talk/i });
-  fireEvent.keyDown(hold, { key: ' ' });
+/** The hook as the composer renders it once somebody has asked for Talk. */
+function talk(sessionId: string) {
+  return renderHook(() => useTalkSession(sessionId, { enabled: true, autoStartMode: 'continuous' }));
+}
+
+/** The microphone this session opened, once it is really open. */
+async function listening(
+  result: { current: UseTalkSession },
+  media: ReturnType<typeof stubMedia>,
+) {
   await waitFor(() => expect(media.recorders).toHaveLength(1));
-  media.recorders[0].emit();
-  fireEvent.keyUp(hold, { key: ' ' });
+  await waitFor(() => expect(result.current.snapshot?.capturing).toBe(true));
+  const engine = result.current.sessionRef.current;
+  if (!engine) throw new Error('Talk never built an engine');
+  return engine;
+}
+
+/**
+ * Say something into the open microphone, and stop talking.
+ *
+ * Continuous capture is ended by the detector, not by a key, so the utterance
+ * is closed the way silence closes it. The frames carry their own timestamps —
+ * the same parameter the worklet's own frames use — because the alternative is
+ * a test that sleeps through a real second of `vadSilenceMs` per utterance.
+ */
+async function saySomething(
+  result: { current: UseTalkSession },
+  media: ReturnType<typeof stubMedia>,
+): Promise<void> {
+  const engine = await listening(result, media);
+  await act(async () => {
+    media.recorders[0].emit();
+    const at = Date.now();
+    // Past `vadMinSpeechMs`: somebody is talking.
+    engine.observeLevel(0.2, at + 180);
+    // Past `vadSilenceMs` of quiet after that: they stopped.
+    engine.observeLevel(0, at + 1_200);
+  });
 }
 
 /** A session in the real store, since Talk reads the answer from it. */
@@ -285,166 +319,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('TalkPanel', () => {
-  it('does not guess a voice engine when settings cannot be loaded', async () => {
-    invoke.mockRejectedValue(new Error('config unavailable'));
-    render(<TalkPanel sessionId="session-1" onClose={vi.fn()} />);
-    expect((await screen.findByRole('alert')).textContent).toContain('No voice engine was started');
-    expect(commands()).not.toContain('m7_talk_status');
-    expect(commands()).not.toContain('realtime_voice_connect');
-  });
-
-  it('requires an explicit privacy acknowledgement before realtime Talk can connect', async () => {
-    mock({}, {
-      ...CONFIG,
-      voice: {
-        ...CONFIG.voice,
-        engineKind: 'realtime',
-        realtimeProviderId: 'openai',
-        realtimeModel: 'gpt-realtime-2.1',
-        realtimeVoice: 'marin',
-        realtimeTurnDetection: 'semantic_vad',
-      },
-    });
-    render(<TalkPanel sessionId="session-1" onClose={vi.fn()} />);
-
-    const start = await screen.findByRole('button', { name: 'Start realtime Talk' });
-    expect((start as HTMLButtonElement).disabled).toBe(true);
-    // The wording tracks the route: the microphone may now be a paired device,
-    // so the disclosure names the *selected* microphone rather than "your"
-    // one. What must not drift is the substance -- that audio and bounded
-    // context leave the machine for OpenAI, said before the button unlocks.
-    expect(screen.getByText(
-      /Audio from the selected microphone and the bounded conversation context are sent to OpenAI/i,
-    )).toBeTruthy();
-    fireEvent.click(screen.getByRole('checkbox'));
-    await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(false));
-    expect(commands()).not.toContain('realtime_voice_connect');
-  });
-
-  it('refuses to start when nothing can transcribe, and points at the fix', async () => {
-    mock({ configured: false });
-    const openSettings = vi.fn();
-    render(
-      <TalkPanel sessionId="session-1" onClose={vi.fn()} onOpenVoiceSettings={openSettings} />,
-    );
-
-    const warning = await screen.findByRole('alert');
-    expect(warning.textContent).toContain('No transcription backend is configured');
-    expect((screen.getByRole('button', { name: /start talk/i }) as HTMLButtonElement).disabled).toBe(true);
-
-    fireEvent.click(screen.getByRole('button', { name: /open voice settings/i }));
-    expect(openSettings).toHaveBeenCalled();
-  });
-
-  it('offers Start when a backend is configured, and shows the state out loud', async () => {
-    mock();
-    render(<TalkPanel sessionId="session-1" onClose={vi.fn()} />);
-
-    await waitFor(() =>
-      expect(
-        (screen.getByRole('button', { name: /start talk/i }) as HTMLButtonElement).disabled,
-      ).toBe(false),
-    );
-    // The state is announced, not only coloured — the dot alone is unreadable
-    // to a screen reader and to anyone who cannot see it.
-    expect(screen.getByRole('status').textContent).toContain('Not listening');
-    expect(screen.getByRole('meter', { name: /microphone level/i })).toBeTruthy();
-  });
-
-  it('makes always-listening impossible to miss and stoppable from here', async () => {
-    const saved = mock({ alwaysListening: true, wakePhraseEnabled: true });
-    render(<TalkPanel sessionId="session-1" onClose={vi.fn()} />);
-
-    const banner = await screen.findByText(/Always listening is on/i);
-    expect(banner).toBeTruthy();
-
-    fireEvent.click(screen.getByRole('button', { name: /stop listening/i }));
-    await waitFor(() => expect(saved).toHaveLength(1));
-    // Both settings go off together: leaving the phrase armed would re-arm
-    // continuous listening on the next start.
-    expect(saved[0].voice.alwaysListening).toBe(false);
-    expect(saved[0].voice.wakePhraseEnabled).toBe(false);
-  });
-
-  it('is a way back to typing rather than a mode you get stuck in', async () => {
-    mock();
-    const returnToChat = vi.fn();
-    const close = vi.fn();
-    render(
-      <TalkPanel sessionId="session-1" onClose={close} onReturnToChat={returnToChat} />,
-    );
-
-    fireEvent.click(await screen.findByRole('button', { name: /back to typing/i }));
-    expect(returnToChat).toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: /close talk/i }));
-    expect(close).toHaveBeenCalled();
-  });
-
-  it('offers Continuous as a toggle and keeps Stop inert until there is something to stop', async () => {
-    mock();
-    render(<TalkPanel sessionId="session-1" onClose={vi.fn()} />);
-
-    const continuous = await screen.findByRole('checkbox', { name: /continuous/i });
-    expect((continuous as HTMLInputElement).checked).toBe(false);
-    // Push-to-talk is the default, so its control is the one on screen.
-    expect(screen.getByRole('button', { name: /hold to talk/i })).toBeTruthy();
-
-    fireEvent.click(continuous);
-    expect((continuous as HTMLInputElement).checked).toBe(true);
-    // In Continuous there is no hold control — the microphone is already open.
-    expect(screen.queryByRole('button', { name: /hold to talk/i })).toBeNull();
-
-    expect((screen.getByRole('button', { name: /^stop$/i }) as HTMLButtonElement).disabled).toBe(true);
-  });
-});
-
-describe('TalkPanel — always listening', () => {
-  const listening: CompanionConfig = {
-    ...CONFIG,
-    voice: { ...CONFIG.voice, wakePhraseEnabled: true, alwaysListening: true },
-  };
-
-  it('opens no microphone until the operator starts Talk', async () => {
-    const media = stubMedia();
-    mock();
-    render(<TalkPanel sessionId="session-1" onClose={vi.fn()} />);
-
-    await screen.findByRole('button', { name: /start talk/i });
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    // The setting is off, so the surface being open is not consent to listen.
-    expect(media.streams).toHaveLength(0);
-    expect(screen.getByRole('status').textContent).toContain('Not listening');
-  });
-
-  it('captures as soon as it is opened when always-listening is on', async () => {
-    const media = stubMedia();
-    mock({ alwaysListening: true, wakePhraseEnabled: true }, listening);
-    render(<TalkPanel sessionId="session-1" onClose={vi.fn()} />);
-
-    // Nobody pressed Start. That is the whole claim the banner makes.
-    await waitFor(() => expect(media.streams).toHaveLength(1));
-    // The first `status` is the header's; the second is the banner that admits
-    // what is going on.
-    await waitFor(() =>
-      expect(screen.getAllByRole('status')[0].textContent).toContain('listening for the wake word'),
-    );
-    expect((await screen.findByRole('checkbox', { name: /continuous/i }) as HTMLInputElement).checked).toBe(true);
-  });
-
-  it('closes the microphone when Talk closes', async () => {
-    const media = stubMedia();
-    mock({ alwaysListening: true, wakePhraseEnabled: true }, listening);
-    const { unmount } = render(<TalkPanel sessionId="session-1" onClose={vi.fn()} />);
-    await waitFor(() => expect(media.streams).toHaveLength(1));
-
-    unmount();
-    // Foreground only: there is no listening left behind this surface.
-    await waitFor(() => expect(media.streams[0].tracks[0].stopped).toBe(1));
-  });
-});
-
-describe('TalkPanel — a spoken turn end to end', () => {
+describe('Talk — a spoken turn end to end', () => {
   it('plays the answer through the chosen output and keeps no recording of it', async () => {
     const media = stubMedia();
     mock({}, { ...CONFIG, voice: { ...CONFIG.voice, outputDeviceId: 'speaker-2' } });
@@ -454,9 +329,9 @@ describe('TalkPanel — a spoken turn end to end', () => {
       store.addMessage(sessionId, { role: 'user', content: 'what is the deploy status' });
       store.addMessage(sessionId, { role: 'assistant', content: 'The deploy finished. ' });
     });
-    render(<TalkPanel sessionId={sessionId} onClose={vi.fn()} />);
+    const { result } = talk(sessionId);
 
-    await saySomething(media);
+    await saySomething(result, media);
     await waitFor(() => expect(media.speakers).toHaveLength(1));
     // The setting that was previously true only of the speaker test.
     expect(media.speakers[0].sinks).toEqual(['speaker-2']);
@@ -485,9 +360,9 @@ describe('TalkPanel — a spoken turn end to end', () => {
         .getState()
         .addMessage(sessionId, { role: 'assistant', content: 'The deploy finished. ' });
     });
-    render(<TalkPanel sessionId={sessionId} onClose={vi.fn()} />);
+    const { result } = talk(sessionId);
 
-    await saySomething(media);
+    await saySomething(result, media);
     // No `setSinkId` anywhere, and the conversation still happens.
     await waitFor(() => expect(media.speakers[0]?.plays).toBe(1));
   });
@@ -508,9 +383,9 @@ describe('TalkPanel — a spoken turn end to end', () => {
       await Promise.resolve();
       store.updateLastMessage(sessionId, { content: 'The deploy finished cleanly. ' });
     });
-    render(<TalkPanel sessionId={sessionId} onClose={vi.fn()} />);
+    const { result } = talk(sessionId);
 
-    await saySomething(media);
+    await saySomething(result, media);
     await waitFor(() => expect(media.speakers).toHaveLength(1));
     const spoken = invoke.mock.calls
       .filter((call) => call[0] === 'm7_tts_synthesize')
@@ -536,9 +411,9 @@ describe('TalkPanel — a spoken turn end to end', () => {
       await Promise.resolve();
       store.updateLastMessage(sessionId, { content: 'The deploy finished cleanly. ' });
     });
-    render(<TalkPanel sessionId={sessionId} onClose={vi.fn()} />);
+    const { result } = talk(sessionId);
 
-    await saySomething(media);
+    await saySomething(result, media);
     await waitFor(() => expect(media.speakers).toHaveLength(1));
     const spoken = invoke.mock.calls
       .filter((call) => call[0] === 'm7_tts_synthesize')
@@ -555,9 +430,9 @@ describe('TalkPanel — a spoken turn end to end', () => {
       store.addMessage(sessionId, { role: 'user', content: 'I live in Sundbyberg' });
       store.addMessage(sessionId, { role: 'assistant', content: '⏳ Resident agent is working…' });
     });
-    render(<TalkPanel sessionId={sessionId} onClose={vi.fn()} />);
+    const { result } = talk(sessionId);
 
-    await saySomething(media);
+    await saySomething(result, media);
     // The recorder stops, then the audio is transcribed a tick later.
     await waitFor(() =>
       expect(invoke.mock.calls.some((entry) => entry[0] === 'm7_talk_transcribe')).toBe(true),
@@ -591,9 +466,9 @@ describe('TalkPanel — a spoken turn end to end', () => {
       await Promise.resolve();
       store.addMessage(sessionId, { role: 'assistant', content: 'The deploy finished cleanly. ' });
     });
-    render(<TalkPanel sessionId={sessionId} onClose={vi.fn()} />);
+    const { result } = talk(sessionId);
 
-    await saySomething(media);
+    await saySomething(result, media);
     await waitFor(() => expect(media.speakers).toHaveLength(1));
     const spoken = invoke.mock.calls
       .filter((call) => call[0] === 'm7_tts_synthesize')
@@ -605,8 +480,9 @@ describe('TalkPanel — a spoken turn end to end', () => {
     const media = stubMedia();
     mock();
     const sessionId = liveSession();
-    render(<TalkPanel sessionId={sessionId} onClose={vi.fn()} />);
-    await screen.findByRole('button', { name: /start talk/i });
+    const { result } = talk(sessionId);
+    // Listening, and nobody has said anything into it.
+    await listening(result, media);
 
     await act(async () => {
       const store = useSessionStore.getState();
@@ -616,6 +492,10 @@ describe('TalkPanel — a spoken turn end to end', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(commands()).not.toContain('m7_tts_synthesize');
-    expect(media.speakers).toHaveLength(0);
+    // The element exists from the moment the microphone opened — that is where
+    // the output device is chosen, inside the gesture WebKit requires. What
+    // matters is that nothing was ever played through it.
+    expect(media.speakers.flatMap((speaker) => speaker.srcs ?? [])).toHaveLength(0);
+    expect(media.speakers.every((speaker) => speaker.plays === 0)).toBe(true);
   });
 });

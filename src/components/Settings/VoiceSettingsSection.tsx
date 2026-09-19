@@ -10,7 +10,8 @@
  * "always listening" can never quietly mean "always uploading".
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { openMicrophone } from "../../lib/microphoneAccess";
 import { AlertTriangle, Gauge, Mic, Radio, Save, Trash2, Volume2 } from 'lucide-react';
 
 import {
@@ -40,7 +41,7 @@ import {
   type TranscriptionModel,
   type WakeWordRuntimeStatus,
 } from '../../lib/talkClient';
-import { createTalkPlayer } from '../../lib/talkPlayback';
+import { talkPlayer } from '../../lib/talkPlayback';
 import { Button } from '../ui';
 
 /** Download size, in the units the choice is actually weighed in. */
@@ -96,7 +97,10 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
 
   const voice = config.voice;
   const { t } = useT();
-  const player = useMemo(() => createTalkPlayer(), []);
+  // The window's one player. A second element would be a second output, set
+  // to the system default and deaf to this panel's picker — which is the exact
+  // bug that put every clip on one path in the first place.
+  const player = talkPlayer;
   const selectedDictationLanguage = dictationCapabilities?.languages.find(
     (language) => language.id === voice.dictationLanguage,
   );
@@ -167,7 +171,7 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
     let stream: MediaStream | null = null;
     try {
       const grant = await companionClient.grant('microphone', 60_000, 'voice-settings-test');
-      stream = await navigator.mediaDevices.getUserMedia({
+      stream = await openMicrophone({
         audio: voice.inputDeviceId
           ? { deviceId: { exact: voice.inputDeviceId } }
           : true,
@@ -220,10 +224,7 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
       // The same player a conversation uses, so what this button proves is what
       // Talk will do — including the chosen output, and including falling back
       // to the system default where the browser cannot route at all.
-      const played = await player.play(
-        base64AudioBlob(speech.audioBase64, speech.mediaType),
-        voice.outputDeviceId,
-      );
+      const played = await player.play(base64AudioBlob(speech.audioBase64, speech.mediaType));
       setNote(
         played
           ? 'Played a test phrase through the selected output.'
@@ -265,7 +266,7 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
       await onSave(config, 'Wake word settings saved for the production-path test.');
       const grant = await companionClient.grant('microphone', 60_000, 'wake-word-test');
       grantId = grant.grantId;
-      stream = await navigator.mediaDevices.getUserMedia({
+      stream = await openMicrophone({
         audio: voice.inputDeviceId ? { deviceId: { exact: voice.inputDeviceId } } : true,
         video: false,
       });
@@ -509,7 +510,7 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
               </select>
             </label>
             <label className="text-xs text-muted">Speaker
-              <select className={`${INPUT} mt-1`} value={voice.outputDeviceId ?? ''} onChange={(event) => patch({ outputDeviceId: event.target.value || null })}>
+              <select className={`${INPUT} mt-1`} value={voice.outputDeviceId ?? ''} onChange={(event) => { const chosen = event.target.value || null; void player.setOutput(chosen); patch({ outputDeviceId: chosen }); }}>
                 <option value="">System default</option>
                 {outputs.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}
               </select>
@@ -677,7 +678,13 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
           <select
             className={`${INPUT} mt-1`}
             value={voice.outputDeviceId ?? ''}
-            onChange={(event) => patch({ outputDeviceId: event.target.value || null })}
+            // Synchronous on purpose: the change event is the user gesture
+            // WebKit requires for `setSinkId`, and one await spends it.
+            onChange={(event) => {
+              const chosen = event.target.value || null;
+              void player.setOutput(chosen);
+              patch({ outputDeviceId: chosen });
+            }}
           >
             <option value="">System default</option>
             {outputs.map((device) => (

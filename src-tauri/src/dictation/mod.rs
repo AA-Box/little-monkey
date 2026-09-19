@@ -322,21 +322,43 @@ fn take_session(
     }
 }
 
+/// Reading what the OS already decided, and sending somebody to change it, are
+/// not dictation sessions — so neither is gated to the main window. `ChatWindow`
+/// hosts Talk and the composer's dictation button in every `session-*` window
+/// as well, and refusing there produced exactly the dead-end this pair exists to
+/// prevent: a permission error with its remedy unreachable.
 #[tauri::command]
-pub fn dictation_capabilities(window: tauri::Window) -> Result<DictationCapabilities, String> {
-    ensure_main_window(&window)?;
+pub fn dictation_capabilities() -> Result<DictationCapabilities, String> {
     Ok(platform_capabilities())
 }
 
 #[tauri::command]
-pub fn dictation_open_permission_settings(
-    window: tauri::Window,
-    kind: String,
-) -> Result<(), String> {
-    ensure_main_window(&window)?;
+pub fn dictation_open_permission_settings(kind: String) -> Result<(), String> {
     match kind.as_str() {
         "microphone" | "speech" => open_permission_settings(&kind),
         _ => Err("Invalid dictation permission kind".to_string()),
+    }
+}
+
+/// Ask the operating system for the microphone.
+///
+/// The dialog appears only when no decision exists yet; otherwise this reports
+/// the recorded one and shows nothing. Either way the answer is the real one,
+/// which is what lets a caller tell "ask again" apart from "send them to
+/// Settings" — a distinction `getUserMedia`'s `NotAllowedError` does not make.
+#[tauri::command]
+pub async fn microphone_request_access() -> Result<DictationPermissionStatus, String> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(macos::request_microphone_access().await)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Ok(windows::request_microphone_access().await)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Ok(unsupported::request_microphone_access().await)
     }
 }
 

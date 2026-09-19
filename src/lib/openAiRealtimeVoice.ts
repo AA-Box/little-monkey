@@ -1,4 +1,5 @@
 import { realtimeVoiceClient } from './companionClient';
+import { openMicrophone } from './microphoneAccess';
 import type {
   RealtimeAudioProgress,
   RealtimeResponseStatus,
@@ -67,7 +68,7 @@ const capabilities: RealtimeVoiceCapabilities = {
 function defaultEnvironment(): OpenAiRealtimeEnvironment {
   return {
     createPeer: () => new RTCPeerConnection(),
-    getUserMedia: (constraints) => navigator.mediaDevices.getUserMedia(constraints),
+    getUserMedia: (constraints) => openMicrophone(constraints),
     createAudio: () => new Audio(),
     createAudioContext: () => new AudioContext(),
     connectBroker: realtimeVoiceClient.connect,
