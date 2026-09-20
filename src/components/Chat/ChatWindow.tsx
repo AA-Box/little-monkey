@@ -1493,8 +1493,19 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   // the microphone when `talkActive` goes false; stopping the engine first is
   // what makes the speaker go quiet in the same moment rather than a chunk later.
   const startTalk = useCallback(() => {
+    // Before the configuration read below, which is an IPC round trip and
+    // spends the press. WebKit refuses a capture request that carries no user
+    // activation once this origin has been refused once, so the request has to
+    // leave from inside the click handler itself — and only the pipeline
+    // engine wants a local microphone, the realtime one opens its own after
+    // its privacy gate.
+    if (talkEngine !== "realtime") talk.openMicrophoneInGesture();
     void companionClient.config()
       .then((config) => {
+        // The engine the *previous* configuration named is what the guard
+        // above could see. If this one chooses realtime, the microphone that
+        // press asked for is not wanted after all.
+        if (config.voice.engineKind === "realtime") talk.dropPendingMicrophone();
         // Both engines start here now. Realtime used to be handed to a separate
         // page so its privacy warning could be shown before a microphone
         // opened; `RealtimeTalkBar` shows the same gate in the composer and
@@ -1506,8 +1517,12 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       // With no page left to defer to, refusing to start is the fail-closed
       // answer — and saying so is better than a microphone button that does
       // nothing.
-      .catch((reason) => setTalkStartError(errorMessage(reason)));
-  }, []);
+      .catch((reason) => {
+        // Talk never starts, so nothing will ever release it.
+        talk.dropPendingMicrophone();
+        setTalkStartError(errorMessage(reason));
+      });
+  }, [talk, talkEngine]);
   const stopTalk = useCallback(() => {
     void talk.stop();
     setTalkActive(false);

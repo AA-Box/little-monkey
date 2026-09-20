@@ -166,6 +166,18 @@ export interface UseTalkSession {
   setSetupError: (message: string | null) => void;
   /** Why the microphone is unavailable, when the answer has an action. */
   microphoneBlocked: MicrophoneBlock | null;
+  /**
+   * Ask for the microphone while the click is still the current gesture.
+   *
+   * Exposed because the composer's Talk button does not call `start`: it reads
+   * the configuration and then *enables* Talk, and capture happens later, from
+   * an effect, with the press long gone. WebKit denies a request carrying no
+   * user activation against an origin it has refused before, so the request
+   * has to leave from inside the handler that the operator's click ran.
+   */
+  openMicrophoneInGesture: () => void;
+  /** Give back a microphone the press asked for and the flow did not want. */
+  dropPendingMicrophone: () => void;
   start: () => Promise<void>;
   stop: () => Promise<void>;
   /** The live engine, for push-to-talk and the Stop button. */
@@ -354,6 +366,21 @@ export function useTalkSession(
   }, []);
 
   /** Close the microphone and every node hanging off it. Safe to call twice. */
+  /**
+   * Drop a request made in a press that turned out not to want a microphone.
+   *
+   * A request still in flight resolves into a microphone nobody asked for any
+   * more, and an open one nothing references is a recording light with no
+   * owner.
+   */
+  const dropPendingMicrophone = useCallback(() => {
+    const abandoned = pendingMicrophoneRef.current;
+    pendingMicrophoneRef.current = null;
+    void abandoned
+      ?.then((stream) => stream.getTracks().forEach((track) => track.stop()))
+      .catch(() => undefined);
+  }, []);
+
   const releaseDevices = useCallback(() => {
     const wake = wakeSessionRef.current;
     wakeSessionRef.current = null;
@@ -365,12 +392,7 @@ export function useTalkSession(
     recordingPcmRef.current = null;
     if (silenceWatchRef.current) window.clearTimeout(silenceWatchRef.current.timer);
     silenceWatchRef.current = null;
-    // A request still in flight resolves into a microphone nobody asked for
-    // any more, and an open one nothing references is a recording light with
-    // no owner.
-    const abandoned = pendingMicrophoneRef.current;
-    pendingMicrophoneRef.current = null;
-    void abandoned?.then((stream) => stream.getTracks().forEach((track) => track.stop())).catch(() => undefined);
+    dropPendingMicrophone();
     // The speaker goes with the microphone: the output was chosen inside the
     // gesture that opened this session, and it is not this one's to keep.
     player.release();
@@ -391,7 +413,7 @@ export function useTalkSession(
     grantRef.current = null;
     setGrant(null);
     if (activeGrant) void companionClient.revoke(activeGrant.grantId).catch(() => undefined);
-  }, []);
+  }, [dropPendingMicrophone]);
 
   const ports = useMemo<TalkPorts>(() => {
     const pumpWakeQueue = async (): Promise<void> => {
@@ -1068,6 +1090,8 @@ export function useTalkSession(
     setupError,
     setSetupError,
     microphoneBlocked,
+    openMicrophoneInGesture,
+    dropPendingMicrophone,
     start,
     stop,
     sessionRef,
