@@ -813,6 +813,7 @@ fn apply_event(
             content.push_str(&text);
         }
         StreamEvent::ToolCall(call) => tool_calls.push(call),
+        StreamEvent::Error(reason) => return Err(reason),
         StreamEvent::Usage {
             prompt_tokens,
             completion_tokens,

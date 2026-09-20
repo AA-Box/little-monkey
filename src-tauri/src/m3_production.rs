@@ -68,6 +68,13 @@ use uuid::Uuid;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const M3_DIRECTORY: &str = "m3";
+
+/// The MLX runtime root under a profile's data directory. The installer, the
+/// hub and the model picker all have to name the same tree, so they name it
+/// here.
+pub fn mlx_runtime_root(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join(M3_DIRECTORY).join("runtimes").join("mlx")
+}
 /// Where `models::models_dir` keeps managed model weights, relative to the same
 /// profile data directory this module is built from.
 const MANAGED_MODELS_DIRECTORY: &str = "models";
@@ -136,11 +143,13 @@ pub struct SystemM3HardwareProbe;
 
 impl crate::m3_runtime_hub::M3HardwareProbe for SystemM3HardwareProbe {
     fn snapshot(&self) -> M3HubResult<HardwareSnapshot> {
-        let (total_ram_bytes, available_ram_bytes) =
-            std::panic::catch_unwind(|| (system_memory::total(), system_memory::available()))
-                .map_err(|_| {
-                    M3HubError::Runtime("operating-system memory probe failed".to_string())
-                })?;
+        let (total_ram_bytes, available_ram_bytes) = std::panic::catch_unwind(|| {
+            (
+                system_memory::total(),
+                crate::system::available_memory_bytes(),
+            )
+        })
+        .map_err(|_| M3HubError::Runtime("operating-system memory probe failed".to_string()))?;
         if total_ram_bytes == 0 || available_ram_bytes > total_ram_bytes {
             return Err(M3HubError::Runtime(
                 "operating-system memory probe returned impossible values".to_string(),
@@ -1200,6 +1209,50 @@ struct ProductionComponentRegistry {
     entries: Vec<M3ComponentCatalogEntry>,
 }
 
+/// The registry as it is read back: rows stay JSON until each is decoded on its
+/// own.
+///
+/// A fetched catalog is refused whole rather than half-adopted, and that is
+/// right — nothing should adopt half a publisher's file. This file is the other
+/// side of that: it is read during app startup, so a single row this build
+/// cannot decode used to abort the process before a window ever appeared
+/// (`failed to initialize the local runtime and API hub: unknown variant …`).
+/// A row from a newer publisher, or a hand edit, must cost that row and nothing
+/// else.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredComponentRegistry {
+    schema_version: u32,
+    entries: Vec<serde_json::Value>,
+}
+
+impl StoredComponentRegistry {
+    /// Every row this build understands, with the rest named on stderr so a
+    /// missing component is diagnosable rather than mysterious.
+    fn readable_entries(self) -> Vec<M3ComponentCatalogEntry> {
+        self.entries
+            .into_iter()
+            .filter_map(|row| {
+                let component = row
+                    .get("componentId")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("<unnamed>")
+                    .to_string();
+                match serde_json::from_value::<M3ComponentCatalogEntry>(row) {
+                    Ok(entry) => Some(entry),
+                    Err(error) => {
+                        eprintln!(
+                            "component registry: skipping '{component}', which this build cannot \
+                             read: {error}"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+}
+
 /// Loads the app's local, operator-editable registry of known runtime
 /// component versions (llama.cpp/MLX/tokenizer/converter/projector/
 /// accelerator-support builds).
@@ -1231,14 +1284,14 @@ pub fn component_registry_entries(root: &Path) -> M3HubResult<Vec<M3ComponentCat
         path: path.clone(),
         source,
     })?;
-    let registry: ProductionComponentRegistry = serde_json::from_slice(&bytes)?;
+    let registry: StoredComponentRegistry = serde_json::from_slice(&bytes)?;
     if registry.schema_version != COMPONENT_REGISTRY_SCHEMA_VERSION {
         return Err(M3HubError::State(
             "M3 component registry version is unsupported".to_string(),
         ));
     }
     // Constructing the source is the canonical validation for every entry.
-    let entries = adopt_into_registry(registry.entries);
+    let entries = adopt_into_registry(registry.readable_entries());
     StaticM3ComponentSource::new(COMPONENT_REGISTRY_SOURCE_ID, entries.clone())?;
     Ok(entries)
 }
@@ -2937,6 +2990,16 @@ impl ManagedProcessController for SystemManagedProcessController {
             let mut command = tokio::process::Command::new(&spec.program);
             command
                 .args(&spec.args)
+                // A packaged interpreter must not write bytecode into the tree
+                // its own manifest is verified against. `-B` on the argument
+                // vector covers only the process we spawn: `runtime_router.py`
+                // ends in `os.execv`, which builds a fresh argv and drops the
+                // flag, so the service that actually loads the model runs
+                // without it. The environment survives that exec and every
+                // child below it, which is why the guarantee lives here — the
+                // one place every managed runtime child is spawned — rather
+                // than in each argument vector.
+                .env("PYTHONDONTWRITEBYTECODE", "1")
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(stdout))
                 .stderr(Stdio::from(stderr))
@@ -4339,7 +4402,7 @@ fn install_mlx_from_artifact_with_verifier(
         }
     };
     let installer = MlxPackageInstaller::new(
-        app_data_dir.join(M3_DIRECTORY).join("runtimes").join("mlx"),
+        mlx_runtime_root(app_data_dir),
         verifier,
         limits,
     )
@@ -4616,6 +4679,63 @@ mod tests {
     use std::convert::Infallible;
     use tokio::net::TcpListener;
     use tokio::sync::Notify;
+
+    /// Startup reads this file. A row it cannot decode — a newer publisher's
+    /// field, or a hand edit — must cost that row, not the process.
+    #[test]
+    fn a_registry_row_this_build_cannot_read_is_skipped_not_fatal() {
+        let root = TestRoot::new("registry-unreadable-row");
+        fs::write(
+            root.0.join(COMPONENT_REGISTRY_FILE),
+            br#"{
+              "schemaVersion": 1,
+              "entries": [
+                {
+                  "schemaVersion": 1,
+                  "sourceId": "little-monkey-mlx",
+                  "componentId": "poisoned",
+                  "kind": "mlx_runtime",
+                  "displayName": "MLX runtime (Apple silicon)",
+                  "accelerator": "Lily on M5+ / macOS 26+ for Qwen3.6-35B-A3B",
+                  "version": "mlx-lm-0.31.3",
+                  "channel": "stable",
+                  "downloadUrl": "https://components.example.test/mlx.tar.gz",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "sizeBytes": 1024,
+                  "publishedAtMs": 2000,
+                  "compatibilityNote": null,
+                  "metadata": {}
+                },
+                {
+                  "schemaVersion": 1,
+                  "sourceId": "little-monkey-mlx",
+                  "componentId": "readable",
+                  "kind": "mlx_runtime",
+                  "displayName": "MLX runtime (Apple silicon)",
+                  "accelerator": "metal",
+                  "version": "mlx-lm-0.31.3",
+                  "channel": "stable",
+                  "downloadUrl": "https://components.example.test/mlx.tar.gz",
+                  "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "sizeBytes": 1024,
+                  "publishedAtMs": 2000,
+                  "compatibilityNote": null,
+                  "metadata": {}
+                }
+              ]
+            }"#,
+        )
+        .expect("write registry");
+
+        let entries = component_registry_entries(&root.0).expect("registry still loads");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.component_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["readable"]
+        );
+    }
 
     struct TestRoot(PathBuf);
 

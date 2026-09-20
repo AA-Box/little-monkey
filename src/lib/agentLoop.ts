@@ -114,6 +114,7 @@ import { useArtifactStore } from '../store/artifactStore';
 // Re-exported below because ~70 modules already read them through here.
 import {
   applyTargetSwitch,
+  describeMissingTargetSnapshot,
   resolveTarget,
   resolvedTargetSupportsVision,
   routeFromActive,
@@ -2032,7 +2033,7 @@ async function runDaemonAgentTurn(
   }
   let targetSnapshot = snapshotForResolvedTarget(resolvedTarget);
   if (!targetSnapshot) {
-    throw new Error('The selected model target could not be frozen for the resident runner.');
+    throw new Error(describeMissingTargetSnapshot(resolvedTarget));
   }
 
   await useRulesStore.getState().refresh();

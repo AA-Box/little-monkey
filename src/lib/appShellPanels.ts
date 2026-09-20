@@ -39,7 +39,6 @@ export const FEATURE_PANEL_IDS = [
   "db-admin-guardrails",
   "api-contract-diff-lab",
   "workflow-test-harness",
-  "talk",
 ] as const;
 
 export type FeaturePanelId = (typeof FEATURE_PANEL_IDS)[number];

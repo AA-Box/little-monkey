@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import type { M3ComponentCatalogEntry, M3InstalledComponent } from "../../../lib/runtimeHubClient";
-import { describeRegistryAction, entryKey, parseCatalogText } from "./RuntimeHubComponents";
+import {
+  describeRegistryAction,
+  entryKey,
+  groupRegistryByComponent,
+  parseCatalogText,
+} from "./RuntimeHubComponents";
 
 function registryEntry(overrides: Partial<M3ComponentCatalogEntry> = {}): M3ComponentCatalogEntry {
   return {
@@ -125,5 +130,29 @@ describe("parseCatalogText", () => {
     expect(() => parseCatalogText(JSON.stringify([{ hello: "world" }]))).toThrow(
       /not a component catalog/,
     );
+  });
+});
+
+describe("groupRegistryByComponent", () => {
+  it("collects every version of a component into one group, newest first", () => {
+    const groups = groupRegistryByComponent([
+      registryEntry({ componentId: "mlx", version: "0.28.4", publishedAtMs: 1_000 }),
+      registryEntry({ componentId: "mflux", version: "0.18.0", publishedAtMs: 1_500 }),
+      registryEntry({ componentId: "mlx", version: "0.31.3", publishedAtMs: 2_000 }),
+    ]);
+
+    // One group per component, not one per row: two known MLX versions are one
+    // thing to install, not two.
+    expect(groups).toHaveLength(2);
+    const mlx = groups.find((group) => group[0].componentId === "mlx");
+    expect(mlx?.map((entry) => entry.version)).toEqual(["0.31.3", "0.28.4"]);
+  });
+
+  it("keeps the order components first appeared in, so the list does not reshuffle", () => {
+    const groups = groupRegistryByComponent([
+      registryEntry({ componentId: "b", publishedAtMs: 1 }),
+      registryEntry({ componentId: "a", publishedAtMs: 2 }),
+    ]);
+    expect(groups.map((group) => group[0].componentId)).toEqual(["b", "a"]);
   });
 });

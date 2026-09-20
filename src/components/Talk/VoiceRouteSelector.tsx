@@ -219,7 +219,19 @@ export function VoiceRouteSelector({
         if (endpoint.locality === 'paired') merged.push(endpoint);
       }
       for (const direction of ['input', 'output'] as const) {
-        if (merged.some((endpoint) => endpoint.direction === direction)) continue;
+        // "Follow whatever this computer is set to" is a choice in its own
+        // right, not a stand-in for the device list being empty — and it is the
+        // one almost everybody is actually routed to, because it is what a
+        // fresh install saves. Offering it only when nothing else exists meant
+        // it disappeared the moment real devices showed up, taking the saved
+        // selection with it: `local:output:default` matched no option and
+        // rendered as a disabled "unavailable".
+        //
+        // WebKit hides `audiooutput` devices until a microphone grant exists in
+        // the frame, so "real devices showed up" happens mid-session, the first
+        // time somebody allows the microphone — which is exactly when the
+        // speaker picker used to break.
+        if (merged.some((endpoint) => endpoint.id === `local:${direction}:default`)) continue;
         merged.push(
           advertised.find((endpoint) => endpoint.id === `local:${direction}:default`)
             ?? localDefaultEndpoint(direction),

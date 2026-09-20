@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -8,6 +11,7 @@ import {
   PcmRingBuffer,
   StreamingLinearResampler,
   base64AudioBlob,
+  PCM_CAPTURE_WORKLET_URL,
   normalizeVadConfig,
   pcm16WavBlob,
   rmsOf,
@@ -181,5 +185,113 @@ describe('streaming PCM path', () => {
     expect(view.getUint32(40, true)).toBe(6);
     expect(view.getInt16(44, true)).toBe(-32_768);
     expect(view.getInt16(48, true)).toBe(32_767);
+  });
+});
+
+/**
+ * The microphone processor has to survive the app's own Content-Security-Policy.
+ *
+ * An AudioWorklet module is fetched as a script, so `script-src` decides whether
+ * it loads — and the shipped policy declares none, which means scripts fall back
+ * to `default-src 'self'`. `img-src`, `media-src` and `frame-src` each name
+ * `blob:` explicitly, so building the worklet as a `blob:` URL looked safe and
+ * was not: `addModule()` was refused, `process()` never ran, and Talk reported
+ * "Ready" with a level meter at zero and no error anywhere, because the refusal
+ * happens on the audio thread where nothing surfaces it.
+ */
+/**
+ * Talk needs two separate macOS grants, and only one of them is obvious.
+ *
+ * Tauri signs the bundle with the hardened runtime, and under hardened runtime
+ * the microphone is unreachable without `com.apple.security.device.audio-input`:
+ * `getUserMedia` is refused by the platform before TCC is consulted, so no
+ * permission dialog ever appears and the page gets a bare `NotAllowedError`.
+ * `NSMicrophoneUsageDescription` supplies the sentence that dialog would show;
+ * it cannot make the dialog happen. Shipping one without the other is the
+ * configuration that looks complete and silently cannot record.
+ */
+describe('the macOS microphone grants', () => {
+  const conf = JSON.parse(
+    readFileSync(join(process.cwd(), 'src-tauri/tauri.conf.json'), 'utf8'),
+  );
+
+  it('points the bundle at an entitlements file', () => {
+    expect(conf.bundle?.macOS?.entitlements).toBe('Entitlements.plist');
+  });
+
+  it('grants audio input in that file', () => {
+    const entitlements = readFileSync(
+      join(process.cwd(), 'src-tauri', conf.bundle.macOS.entitlements),
+      'utf8',
+    );
+    expect(entitlements).toContain('com.apple.security.device.audio-input');
+    // A key with no `<true/>` after it is a key that grants nothing.
+    expect(
+      /com\.apple\.security\.device\.audio-input<\/key>\s*<true\s*\/>/.test(entitlements),
+    ).toBe(true);
+  });
+
+  it('still explains itself in Info.plist, which the dialog needs', () => {
+    const plist = readFileSync(join(process.cwd(), 'src-tauri/Info.plist'), 'utf8');
+    expect(plist).toContain('NSMicrophoneUsageDescription');
+  });
+
+  it('signs the bundle, because an entitlements file nothing applies is inert', () => {
+    // The bundler runs `codesign` only when it has an identity. With none, the
+    // binary keeps the linker's ad-hoc signature: no entitlements, a cdhash
+    // identifier instead of the bundle id, and `Info.plist=not bound` — so
+    // hardened runtime blocks the microphone and TCC never even records the
+    // app. Declaring the entitlements file without this did nothing at all.
+    //
+    // `'-'` is ad-hoc. It is not a release signature and is not meant to be:
+    // APPLE_SIGNING_IDENTITY overrides it, which is what CI sets. Verified by
+    // building with a bogus identity — the bundler used the environment's and
+    // failed on it, rather than falling back here.
+    expect(conf.bundle?.macOS?.signingIdentity).toBe('-');
+  });
+});
+
+describe('the capture worklet and the CSP', () => {
+  const policies = (() => {
+    const conf = JSON.parse(
+      readFileSync(join(process.cwd(), 'src-tauri/tauri.conf.json'), 'utf8'),
+    );
+    const security = conf.app?.security ?? {};
+    return [
+      ['csp', security.csp as string],
+      ['devCsp', security.devCsp as string],
+    ] as const;
+  })();
+
+  /** The sources a script may be fetched from, with CSP's fallback applied. */
+  function scriptSources(policy: string): string[] {
+    const directives = new Map(
+      policy
+        .split(';')
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .map((part) => {
+          const [name, ...values] = part.split(/\s+/);
+          return [name, values] as const;
+        }),
+    );
+    return directives.get('script-src') ?? directives.get('default-src') ?? [];
+  }
+
+  it.each(policies)('loads the worklet from a source %s permits', (_name, policy) => {
+    const sources = scriptSources(policy);
+    if (PCM_CAPTURE_WORKLET_URL.startsWith('blob:')) {
+      expect(sources).toContain('blob:');
+    } else {
+      // A root-relative path is same-origin, which is what `'self'` covers.
+      expect(PCM_CAPTURE_WORKLET_URL.startsWith('/')).toBe(true);
+      expect(sources).toContain("'self'");
+    }
+  });
+
+  it.each(policies)('%s does not permit blob: scripts, which is why this matters', (_name, policy) => {
+    // Not a wish — a statement of the policy as shipped. If someone widens it,
+    // this fails and the comment above explains what it was protecting.
+    expect(scriptSources(policy)).not.toContain('blob:');
   });
 });

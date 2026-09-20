@@ -149,7 +149,7 @@ The setting is read once, when a Talk surface builds its engine, and that
 surface can be open for hours; a panel armed since breakfast is exactly the
 session an operator goes to Settings to turn off. So `m7_config_save` announces
 every saved configuration as `m7://config-changed`, and `useTalkSession` — the
-hook that owns the devices, shared by the Talk panel and the chat composer's
+hook that owns the devices, used by the chat composer's
 Talk button — re-reads the configuration when one arrives. If Always Listening
 is now off, it stops the engine, closes the native keyword-spotting generation,
 stops the media tracks, tears down the worklet and audio context, replaces the
@@ -341,7 +341,7 @@ not record it as done:
    wake word.
 5. Let it re-arm, then turn Always Listening off **in Settings** while Talk is
    still open. The operating system's microphone indicator should go out
-   without touching the Talk panel.
+   without touching the composer's Talk controls.
 
 **The microphone prompt itself.** Nobody can click it from a test; both of its
 answers are covered against the real hook.

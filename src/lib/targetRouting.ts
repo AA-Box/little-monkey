@@ -222,15 +222,45 @@ async function refreshTargetInventoryIfMissing(target: ResolvedTarget): Promise<
 /** Exported so `issueToPrRunner.ts` can build the `target` field
  * `beginDurableRun` needs for its own headless run, the same reuse reasoning
  * as `resolveTarget` above. */
+/**
+ * The model an MLX runtime is holding right now, when the chat store has no
+ * active model of its own.
+ *
+ * Two surfaces load a local model: the chat picker, which sets `active`, and
+ * Runtime Hub, which loads it into the runtime and says nothing to this store.
+ * After the second one, a model really is resident and answering on its own
+ * port, while chat refused the turn outright:
+ *
+ *     The selected model target could not be frozen for the resident runner.
+ *
+ * The resident model is a target by definition — it is the one thing on this
+ * machine already loaded and serving — so read it from the runtime rather than
+ * requiring the two surfaces to agree about who sets what. `llama_status`
+ * already feeds `active` this way in `refreshLlamaStatus`; MLX had no
+ * equivalent.
+ */
+function residentLocalModel(
+  installed: ReturnType<typeof useModelStore.getState>["installed"],
+  mlxChat: MlxChatStatusPayload | null,
+): ReturnType<typeof useModelStore.getState>["active"] {
+  if (!mlxChat?.running || !mlxChat.modelPath) return null;
+  return installed.find((model) => model.path === mlxChat.modelPath) ?? null;
+}
+
 /** The live target inventory — the same set the model picker offers. Shared by
  * `snapshotForResolvedTarget` and the K9 routing candidates below so a target
  * routing can choose is by construction one the user already configured. */
 export function currentTargetInventory(): ModelTargetInventory {
   const state = useModelStore.getState();
+  const resident = residentLocalModel(state.installed, state.mlxChat);
   return buildModelTargetInventory({
     installed: state.installed,
-    active: state.active,
-    llamaStatus: state.llamaStatus,
+    active: state.active ?? resident,
+    // `llamaStatus` is this app's one "a local model is loaded" signal — the
+    // chat picker sets it to `ready` for an MLX load too. A model made resident
+    // anywhere else is just as loaded, so say so rather than leaving the
+    // inventory to conclude nothing local is running.
+    llamaStatus: state.active ? state.llamaStatus : resident ? "ready" : state.llamaStatus,
     ollamaModels: state.ollamaModels,
     ollamaReachable: state.ollamaReachable,
     providers: state.providers,
@@ -255,6 +285,50 @@ export function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSn
       candidate.providerId === target.providerId &&
       candidate.model === target.model,
   ) ?? null;
+}
+
+/**
+ * Why `snapshotForResolvedTarget` came back empty, in words the person reading
+ * the chat can act on.
+ *
+ * The generic sentence this replaces — "The selected model target could not be
+ * frozen for the resident runner." — names the mechanism and none of the
+ * causes. Every one of them is readable from the store at the moment of the
+ * failure: no model picked, a model picked but never started, a start that
+ * failed and left its reason in `llamaError`, or a selection that no longer
+ * matches anything installed. Reporting the mechanism instead of the cause
+ * turned a one-glance problem into a debugging session, twice.
+ */
+export function describeMissingTargetSnapshot(target: ResolvedTarget): string {
+  if (target.kind === 'ollama') {
+    return `Ollama has no model named ${target.model} loaded. Start it with \`ollama run ${target.model}\`, or pick another target.`;
+  }
+  if (target.kind === 'provider') {
+    return `${target.providerId} has no model ${target.model} available. Check the provider's API key and model list in Settings.`;
+  }
+  const state = useModelStore.getState();
+  const active = state.active ?? residentLocalModel(state.installed, state.mlxChat);
+  if (!active) {
+    return 'No local model is loaded. Pick one in the model picker — selecting it is what starts the runtime.';
+  }
+  // `llamaError` before `llamaStatus`, not only when the status still says
+  // `error`. A status is one word that anything may overwrite — llama-server's
+  // own `stopped` used to land on top of an MLX start failure — while the
+  // reason text is written once, by whatever failed, and cleared when a start
+  // succeeds. When both exist, the sentence the runtime wrote is the better
+  // one, whatever the status has since become.
+  const reason = state.llamaError?.trim();
+  if (reason) return `${active.name} failed to start: ${reason}`;
+  if (state.llamaStatus === 'error') {
+    return `${active.name} failed to start, and the runtime reported no reason.`;
+  }
+  if (state.llamaStatus === 'starting') {
+    return `${active.name} is still loading. Send this again once it reports ready.`;
+  }
+  if (state.llamaStatus !== 'ready') {
+    return `${active.name} is selected but not running (${state.llamaStatus}). Pick it again in the model picker to start it.`;
+  }
+  return `${active.name} is loaded, but it is no longer in the installed model list. Refresh the model list, or pick another model.`;
 }
 
 /** Human-readable label for a switch notice. */

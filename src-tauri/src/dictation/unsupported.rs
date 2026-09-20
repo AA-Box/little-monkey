@@ -31,3 +31,18 @@ impl Session {
         Ok(())
     }
 }
+
+/// Nothing to ask on this platform.
+///
+/// `Unknown` rather than `Granted`: an unpackaged Win32 app has no per-app
+/// microphone prompt — the webview shows its own — and claiming a grant nobody
+/// made would be a lie the caller acts on. The shared helper only refuses on
+/// `denied`/`restricted`, so this means "carry on".
+pub async fn request_microphone_access() -> super::DictationPermissionStatus {
+    super::DictationPermissionStatus::Unknown
+}
+
+/// No per-app microphone decision to reset on this platform.
+pub fn reset_microphone_access(_bundle_identifier: &str) -> Result<(), String> {
+    Err("Resetting the microphone permission is a macOS feature".to_string())
+}

@@ -7023,10 +7023,42 @@ pub(crate) fn canonical_component_catalog_payload(
     canonical_json(&unsigned)
 }
 
+/// The envelope shape on its own, so a failed untagged parse can be re-run
+/// against one variant and report what serde actually objected to.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogEnvelope {
+    entries: Vec<M3ComponentCatalogEntry>,
+}
+
 fn parse_component_catalog(bytes: &[u8]) -> M3HubResult<Vec<M3ComponentCatalogEntry>> {
-    let entries = match serde_json::from_slice::<M3ComponentCatalogDocument>(bytes)? {
-        M3ComponentCatalogDocument::Entries(entries) => entries,
-        M3ComponentCatalogDocument::Envelope { entries } => entries,
+    let entries = match serde_json::from_slice::<M3ComponentCatalogDocument>(bytes) {
+        Ok(M3ComponentCatalogDocument::Entries(entries)) => entries,
+        Ok(M3ComponentCatalogDocument::Envelope { entries }) => entries,
+        // An untagged enum reports only that nothing matched — "data did not
+        // match any variant of untagged enum M3ComponentCatalogDocument" names
+        // neither the entry nor the field. That is what a published catalog
+        // carrying one integer where a string belongs looked like from the
+        // panel: a fetch that failed for no stated reason, and a Runtime Hub
+        // that silently kept offering the version it already had. Re-parse
+        // against the shape this document claims to be so the message names
+        // the field.
+        Err(_) => {
+            let looks_like_envelope = serde_json::from_slice::<serde_json::Value>(bytes)
+                .is_ok_and(|value| value.is_object());
+            let error = if looks_like_envelope {
+                serde_json::from_slice::<CatalogEnvelope>(bytes).err()
+            } else {
+                serde_json::from_slice::<Vec<M3ComponentCatalogEntry>>(bytes).err()
+            };
+            return Err(invalid(
+                "componentCatalog",
+                error.map_or_else(
+                    || "is not a component catalog".to_string(),
+                    |error| error.to_string(),
+                ),
+            ));
+        }
     };
     if entries.len() > MAX_CATALOG_ENTRIES {
         return Err(invalid(
@@ -9457,6 +9489,35 @@ mod tests {
         )
         .expect("registry export");
         assert_eq!(array, envelope);
+    }
+
+    /// The failure that cost a week: the published catalog carried
+    /// `"lilyMinimumAppleMGeneration": 1` in `metadata`, which deserializes as
+    /// a map of strings, so every client refused the whole file and the panel
+    /// reported only that nothing matched an untagged enum.
+    #[test]
+    fn a_catalog_refused_over_one_field_says_which_field() {
+        let mut entries: Vec<serde_json::Value> =
+            serde_json::from_str(PUBLISHED_CATALOG).expect("parse fixture");
+        entries[0]["metadata"] = serde_json::json!({ "lilyMinimumAppleMGeneration": 1 });
+        let array = serde_json::to_vec(&entries).expect("serialize");
+        let error = parse_component_catalog(&array).expect_err("an integer is not a string");
+        let message = error.to_string();
+        // serde names map *values* by position rather than by key, so the claim
+        // is the type and where it sits — both actionable, unlike "no variant
+        // matched", which was all this said before.
+        assert!(message.contains("invalid type: integer"), "{message}");
+        assert!(message.contains("expected a string"), "{message}");
+        assert!(message.contains("line 1 column"), "{message}");
+        assert!(!message.contains("untagged"), "{message}");
+
+        // The same document as a registry export is diagnosed the same way.
+        let envelope =
+            serde_json::to_vec(&serde_json::json!({ "schemaVersion": 1, "entries": entries }))
+                .expect("serialize");
+        let error = parse_component_catalog(&envelope).expect_err("an integer is not a string");
+        assert!(error.to_string().contains("expected a string"), "{error}");
+        assert!(!error.to_string().contains("untagged"), "{error}");
     }
 
     #[test]
