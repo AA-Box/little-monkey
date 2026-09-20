@@ -235,6 +235,20 @@ describe('the macOS microphone grants', () => {
     const plist = readFileSync(join(process.cwd(), 'src-tauri/Info.plist'), 'utf8');
     expect(plist).toContain('NSMicrophoneUsageDescription');
   });
+
+  it('signs the bundle, because an entitlements file nothing applies is inert', () => {
+    // The bundler runs `codesign` only when it has an identity. With none, the
+    // binary keeps the linker's ad-hoc signature: no entitlements, a cdhash
+    // identifier instead of the bundle id, and `Info.plist=not bound` — so
+    // hardened runtime blocks the microphone and TCC never even records the
+    // app. Declaring the entitlements file without this did nothing at all.
+    //
+    // `'-'` is ad-hoc. It is not a release signature and is not meant to be:
+    // APPLE_SIGNING_IDENTITY overrides it, which is what CI sets. Verified by
+    // building with a bogus identity — the bundler used the environment's and
+    // failed on it, rather than falling back here.
+    expect(conf.bundle?.macOS?.signingIdentity).toBe('-');
+  });
 });
 
 describe('the capture worklet and the CSP', () => {
