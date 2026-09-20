@@ -283,6 +283,25 @@ describe('useTalkSession', () => {
     expect(result.current.mode).toBe('continuous');
   });
 
+  /**
+   * The sibling of the AudioContext test below, and the same failure.
+   *
+   * WebKit denies a capture request carrying no user activation once that
+   * origin has been refused once — no prompt, no delegate, a bare
+   * `NotAllowedError`. `start` awaits the route activation, the grant and the
+   * config read before capture wants a microphone, and each of those spends
+   * the press. One `await` above this line puts the bug back.
+   */
+  it('asks for the microphone inside the press, before anything is awaited', async () => {
+    const { result } = renderHook(() => useTalkSession('session-1', { enabled: true }));
+    await waitFor(() => expect(typeof result.current.start).toBe('function'));
+
+    act(() => { void result.current.start(); });
+
+    // Same tick as the press: no route activation, no grant, no config read.
+    expect(streams).toHaveLength(1);
+  });
+
   it('resumes the audio context, so the detector hears something', async () => {
     renderHook(() => useTalkSession('session-1', { enabled: true, autoStartMode: 'continuous' }));
     await waitFor(() => expect(streams).toHaveLength(1));

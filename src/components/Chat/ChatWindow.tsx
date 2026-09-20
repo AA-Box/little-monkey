@@ -1753,9 +1753,15 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                     <span className="min-w-0 truncate text-danger">
                       {talk.microphoneBlocked === "webviewDenied"
                         ? t("ChatWindow.talkMicrophoneWebviewBlocked")
-                        : t("ChatWindow.talkMicrophoneBlocked")}
+                        : talk.microphoneBlocked === "justGranted"
+                          ? t("ChatWindow.talkMicrophoneJustGranted")
+                          : t("ChatWindow.talkMicrophoneBlocked")}
                     </span>
-                    {talk.microphoneBlocked !== "webviewDenied" && (
+                    {/* Neither of those two is a permission problem any more:
+                        one needs a press, the other a restart. A Settings
+                        button would send the operator to a switch already on. */}
+                    {talk.microphoneBlocked !== "webviewDenied"
+                      && talk.microphoneBlocked !== "justGranted" && (
                       <Button size="sm" variant="secondary" onClick={() => void openMicrophoneSettings()}>
                         {t("ChatWindow.talkOpenMicrophoneSettings")}
                       </Button>

@@ -25,47 +25,75 @@ import { invoke } from "@tauri-apps/api/core";
 
 import { dictationClient, type DictationPermissionStatus } from "./dictationClient";
 
-export type MicrophoneBlock = "denied" | "restricted" | "webviewDenied";
+export type MicrophoneBlock = "denied" | "restricted" | "webviewDenied" | "justGranted";
+
+const MICROPHONE_BLOCK_MESSAGE: Record<MicrophoneBlock, string> = {
+  denied: "Little Monkey does not have permission to use the microphone.",
+  restricted: "Little Monkey does not have permission to use the microphone.",
+  webviewDenied:
+    "The system allows Little Monkey to use the microphone, but this window was refused. Restart Little Monkey.",
+  justGranted: "macOS has granted the microphone. Press Talk again to start listening.",
+};
 
 /** A refusal with somewhere to go, as opposed to a sentence to read. */
 export class MicrophoneBlockedError extends Error {
   constructor(readonly block: MicrophoneBlock) {
-    super(
-      block === "webviewDenied"
-        ? "The system allows Little Monkey to use the microphone, but this window was refused. Restart Little Monkey."
-        : "Little Monkey does not have permission to use the microphone.",
-    );
+    super(MICROPHONE_BLOCK_MESSAGE[block]);
     this.name = "MicrophoneBlockedError";
   }
 }
 
-/** `getUserMedia`, having asked the operating system first. */
+/**
+ * `getUserMedia`, with the operating system asked only if it refuses.
+ *
+ * The webview goes first, and nothing is awaited before it. WebKit denies a
+ * capture request outright — no delegate, no dialog, a bare `NotAllowedError`
+ * — when the request carries no user activation and that origin has been
+ * refused once before:
+ *
+ *     if (!request->isUserGesturePriviledged() && wasRequestDenied(...))
+ *         return RequestAction::Deny;
+ *
+ * An `await` before the call is enough to lose the activation, so asking the
+ * OS first — one IPC round trip — cost exactly the thing the request needed.
+ * Every later press then failed on a refusal recorded minutes earlier, while
+ * macOS said the microphone was granted and meant it.
+ *
+ * So: ask the webview inside the press. `getUserMedia` raises the OS dialog by
+ * itself when no decision exists yet. Only once it refuses is macOS worth
+ * asking, and then its answer says which refusal this is — a recorded "no",
+ * which can be withdrawn and asked again, or WebKit's own, which cannot.
+ */
 export async function openMicrophone(constraints: MediaStreamConstraints): Promise<MediaStream> {
-  let status = await askTheOperatingSystem();
-  // macOS asks once. After a refusal the request returns the recorded answer
-  // without any dialog, which used to leave System Settings as the only way
-  // back — a remedy the operator has to go and find. The app cannot grant
-  // itself anything, but it can make the OS forget its answer, and a forgotten
-  // answer is one it is willing to ask about again. So a refusal now costs one
-  // more dialog rather than a trip through Settings.
-  //
-  // Only ever here, inside a press that asked for the microphone, and only
-  // once per press: erasing a "no" nobody is waiting on is exactly the
-  // behaviour the permission exists to prevent.
-  if (status === "denied" || status === "restricted") {
-    status = await invoke<DictationPermissionStatus>("microphone_ask_again").catch(() => status);
-  }
-  if (status === "denied" || status === "restricted") throw new MicrophoneBlockedError(status);
   try {
     return await navigator.mediaDevices.getUserMedia(constraints);
   } catch (reason) {
-    // The OS says yes and the webview still says no: a denial cached against
-    // this origin while the grant did not yet exist. Only a reload clears it,
-    // so say that rather than sending the operator to a setting already on.
-    if (status === "granted" && reason instanceof Error && reason.name === "NotAllowedError") {
-      throw new MicrophoneBlockedError("webviewDenied");
+    if (!(reason instanceof Error) || reason.name !== "NotAllowedError") throw reason;
+    const status = await askTheOperatingSystem();
+    // A platform with nothing to ask cannot tell us anything the refusal did
+    // not already say, and dressing it up as a macOS problem would send the
+    // operator somewhere that does not exist.
+    if (status === null) throw reason;
+    // The OS is content, so the refusal was WebKit's own, and no permission
+    // screen anywhere will change it.
+    if (status !== "denied" && status !== "restricted") throw new MicrophoneBlockedError("webviewDenied");
+    // macOS asks once, and this process cannot see the answer withdrawn — see
+    // `ask_for_microphone_in_a_fresh_process`. A child can ask, and the
+    // operator answers it.
+    const asked = await invoke<DictationPermissionStatus>("microphone_ask_again").catch(() => status);
+    if (asked === "denied" || asked === "restricted") throw new MicrophoneBlockedError(asked);
+    // Granted now — but answering a dialog is not a press, so this retry
+    // carries no activation of its own. It succeeds where WebKit has nothing
+    // recorded against this origin, and where it does, the press that follows
+    // does.
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (retry) {
+      if (retry instanceof Error && retry.name === "NotAllowedError") {
+        throw new MicrophoneBlockedError("justGranted");
+      }
+      throw retry;
     }
-    throw reason;
   }
 }
 

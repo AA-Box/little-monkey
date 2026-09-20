@@ -187,6 +187,17 @@ export function useTalkSession(
   const sessionRef = useRef<TalkSession | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  /**
+   * The microphone request made inside the press, waiting to be collected.
+   *
+   * WebKit denies a capture request that carries no user activation once that
+   * origin has been refused once, without consulting anything. `start` awaits
+   * the route activation, the grant and the config read before capture needs a
+   * microphone, and every one of those spends the press — so the request has
+   * to leave before them and be picked up afterwards. Same reason, same shape
+   * as `openAudioContext`.
+   */
+  const pendingMicrophoneRef = useRef<Promise<MediaStream> | null>(null);
   /** Held for as long as the microphone is open — see `startRecording`. */
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const workletRef = useRef<AudioWorkletNode | null>(null);
@@ -354,6 +365,12 @@ export function useTalkSession(
     recordingPcmRef.current = null;
     if (silenceWatchRef.current) window.clearTimeout(silenceWatchRef.current.timer);
     silenceWatchRef.current = null;
+    // A request still in flight resolves into a microphone nobody asked for
+    // any more, and an open one nothing references is a recording light with
+    // no owner.
+    const abandoned = pendingMicrophoneRef.current;
+    pendingMicrophoneRef.current = null;
+    void abandoned?.then((stream) => stream.getTracks().forEach((track) => track.stop())).catch(() => undefined);
     // The speaker goes with the microphone: the output was chosen inside the
     // gesture that opened this session, and it is not this one's to keep.
     player.release();
@@ -428,13 +445,31 @@ export function useTalkSession(
         }
         const routedLocal = localDevice(selected, 'input');
         const deviceId = (routedLocal && routedLocal !== 'default' ? routedLocal : config.voice.inputDeviceId) ?? undefined;
+        // Asked for inside the press, before this function's awaits spent it.
+        const requested = pendingMicrophoneRef.current;
+        pendingMicrophoneRef.current = null;
         try {
-          streamRef.current = await openMicrophone({
-            audio: deviceId
-              ? { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true }
-              : { echoCancellation: true, noiseSuppression: true },
-            video: false,
-          });
+          const carriesPermission = requested ? await requested : null;
+          // The press could not know which device the route names, so it asked
+          // for the default one. Where that is not the right microphone, swap
+          // now: WebKit has this origin recorded as allowed by the request
+          // that just succeeded, so the second one needs no press of its own.
+          const wrongDevice = Boolean(
+            carriesPermission
+              && deviceId
+              && carriesPermission.getAudioTracks()[0]?.getSettings?.().deviceId !== deviceId,
+          );
+          if (carriesPermission && wrongDevice) {
+            carriesPermission.getTracks().forEach((track) => track.stop());
+          }
+          streamRef.current = carriesPermission && !wrongDevice
+            ? carriesPermission
+            : await openMicrophone({
+              audio: deviceId
+                ? { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true }
+                : { echoCancellation: true, noiseSuppression: true },
+              video: false,
+            });
         } catch (reason) {
           // Caught here because this is the last frame that still has the
           // error's identity: one below, `talkEngine` flattens it to
@@ -694,6 +729,22 @@ export function useTalkSession(
    * Synchronous on purpose: one `await` above this line puts it back where it
    * was.
    */
+  const openMicrophoneInGesture = useCallback(() => {
+    if (pendingMicrophoneRef.current || streamRef.current) return;
+    // The routed device is not known yet — it needs the config read this is
+    // deliberately ahead of. The default one carries the permission; where the
+    // route names another, `openPcmDevices` swaps to it, and by then WebKit
+    // has this origin recorded as allowed and grants without a press.
+    const request = openMicrophone({
+      audio: { echoCancellation: true, noiseSuppression: true },
+      video: false,
+    });
+    // Collected in `openPcmDevices`. Nothing awaits it until then, and an
+    // unobserved rejection is an unhandled one.
+    request.catch(() => undefined);
+    pendingMicrophoneRef.current = request;
+  }, []);
+
   const openAudioContext = useCallback(() => {
     if (audioContextRef.current) return;
     try {
@@ -927,6 +978,12 @@ export function useTalkSession(
 
   const start = useCallback(async () => {
     openAudioContext();
+    const pressedWith = routeRef.current;
+    // Both of these have to leave inside the press, before the awaits below
+    // spend it — and neither may open a microphone another device owns.
+    if (!(pressedWith?.state === 'active' && pairedInputDevice(pressedWith.input_endpoint))) {
+      openMicrophoneInGesture();
+    }
     setSetupError(null);
     setMicrophoneBlocked(null);
     try {
@@ -939,7 +996,7 @@ export function useTalkSession(
     } catch (reason) {
       setSetupError(errorMessage(reason));
     }
-  }, [activateAndWaitForRoute, openAudioContext, sessionId]);
+  }, [activateAndWaitForRoute, openAudioContext, openMicrophoneInGesture, sessionId]);
 
   const stop = useCallback(async () => {
     await sessionRef.current?.stop();
