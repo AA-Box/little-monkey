@@ -166,6 +166,8 @@ export interface UseTalkSession {
   setSetupError: (message: string | null) => void;
   /** Why the microphone is unavailable, when the answer has an action. */
   microphoneBlocked: MicrophoneBlock | null;
+  /** What the webview was when it refused, for a refusal it will not explain. */
+  microphoneBlockedDetail: string | null;
   /**
    * Ask for the microphone while the click is still the current gesture.
    *
@@ -194,6 +196,8 @@ export function useTalkSession(
   const [setupError, setSetupError] = useState<string | null>(null);
   /** Set when the refusal has a remedy, so the UI can offer it instead of prose. */
   const [microphoneBlocked, setMicrophoneBlocked] = useState<MicrophoneBlock | null>(null);
+  /** What the webview was when it refused — see `refusalDetail`. */
+  const [microphoneBlockedDetail, setMicrophoneBlockedDetail] = useState<string | null>(null);
   const [grant, setGrant] = useState<CaptureGrant | null>(null);
 
   const sessionRef = useRef<TalkSession | null>(null);
@@ -496,7 +500,10 @@ export function useTalkSession(
           // Caught here because this is the last frame that still has the
           // error's identity: one below, `talkEngine` flattens it to
           // `reason.message` and the remedy goes with it.
-          if (reason instanceof MicrophoneBlockedError) setMicrophoneBlocked(reason.block);
+          if (reason instanceof MicrophoneBlockedError) {
+            setMicrophoneBlocked(reason.block);
+            setMicrophoneBlockedDetail(reason.detail);
+          }
           throw reason;
         }
         // Still inside the press that opened the microphone, which is the only
@@ -1008,6 +1015,7 @@ export function useTalkSession(
     }
     setSetupError(null);
     setMicrophoneBlocked(null);
+    setMicrophoneBlockedDetail(null);
     try {
       const currentRoute = routeRef.current;
       sessionRef.current?.setExternalInput(Boolean(
@@ -1090,6 +1098,7 @@ export function useTalkSession(
     setupError,
     setSetupError,
     microphoneBlocked,
+    microphoneBlockedDetail,
     openMicrophoneInGesture,
     dropPendingMicrophone,
     start,

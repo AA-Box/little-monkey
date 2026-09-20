@@ -1765,12 +1765,20 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                     left. */}
                 {talk.microphoneBlocked ? (
                   <span role="alert" className="flex min-w-0 items-center gap-2">
-                    <span className="min-w-0 truncate text-danger">
+                    {/* Not truncated: what WebKit refused and why is the whole
+                        content of these two, and a cut-off sentence is what
+                        sent this bug round the houses for a day. */}
+                    <span className="min-w-0 text-danger">
                       {talk.microphoneBlocked === "webviewDenied"
                         ? t("ChatWindow.talkMicrophoneWebviewBlocked")
                         : talk.microphoneBlocked === "justGranted"
                           ? t("ChatWindow.talkMicrophoneJustGranted")
                           : t("ChatWindow.talkMicrophoneBlocked")}
+                      {talk.microphoneBlockedDetail ? (
+                        <span className="block font-mono text-[10px] text-faint">
+                          {talk.microphoneBlockedDetail}
+                        </span>
+                      ) : null}
                     </span>
                     {/* Neither of those two is a permission problem any more:
                         one needs a press, the other a restart. A Settings

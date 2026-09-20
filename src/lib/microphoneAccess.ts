@@ -37,10 +37,36 @@ const MICROPHONE_BLOCK_MESSAGE: Record<MicrophoneBlock, string> = {
 
 /** A refusal with somewhere to go, as opposed to a sentence to read. */
 export class MicrophoneBlockedError extends Error {
-  constructor(readonly block: MicrophoneBlock) {
+  constructor(readonly block: MicrophoneBlock, readonly detail: string | null = null) {
     super(MICROPHONE_BLOCK_MESSAGE[block]);
     this.name = "MicrophoneBlockedError";
   }
+}
+
+/**
+ * What the webview was when it refused.
+ *
+ * WebKit's refusal is one error name for a dozen reasons, and each of them has
+ * been chased by rebuilding the app to print one more fact. These are the
+ * facts: the origin decides whether capture is allowed at all, the secure flag
+ * decides whether the API is even real, the activation decides whether a
+ * refusal recorded earlier is fatal, and WebKit occasionally says something
+ * useful in the message nobody reads.
+ */
+function refusalDetail(reason: Error, activation: boolean | null): string {
+  // Defensive to the point of dullness: this runs on a path that is already
+  // failing, and a diagnostic that throws replaces the fault it was meant to
+  // describe.
+  const parts = [`name=${reason.name}`];
+  if (reason.message) parts.push(`message=${reason.message}`);
+  parts.push(`activation=${activation ?? "unknown"}`);
+  try {
+    parts.push(`origin=${globalThis.location?.origin ?? "unknown"}`);
+    parts.push(`secure=${globalThis.isSecureContext ?? "unknown"}`);
+  } catch {
+    // Somewhere without a document. The error's own name still says something.
+  }
+  return parts.join(" ");
 }
 
 /**
@@ -65,10 +91,13 @@ export class MicrophoneBlockedError extends Error {
  * which can be withdrawn and asked again, or WebKit's own, which cannot.
  */
 export async function openMicrophone(constraints: MediaStreamConstraints): Promise<MediaStream> {
+  // Read before the call, because the call is what spends it.
+  const activation = navigator.userActivation ? navigator.userActivation.isActive : null;
   try {
     return await navigator.mediaDevices.getUserMedia(constraints);
   } catch (reason) {
     if (!(reason instanceof Error) || reason.name !== "NotAllowedError") throw reason;
+    const detail = refusalDetail(reason, activation);
     const status = await askTheOperatingSystem();
     // A platform with nothing to ask cannot tell us anything the refusal did
     // not already say, and dressing it up as a macOS problem would send the
@@ -76,7 +105,9 @@ export async function openMicrophone(constraints: MediaStreamConstraints): Promi
     if (status === null) throw reason;
     // The OS is content, so the refusal was WebKit's own, and no permission
     // screen anywhere will change it.
-    if (status !== "denied" && status !== "restricted") throw new MicrophoneBlockedError("webviewDenied");
+    if (status !== "denied" && status !== "restricted") {
+      throw new MicrophoneBlockedError("webviewDenied", detail);
+    }
     // macOS asks once, and this process cannot see the answer withdrawn — see
     // `ask_for_microphone_in_a_fresh_process`. A child can ask, and the
     // operator answers it.
@@ -90,7 +121,7 @@ export async function openMicrophone(constraints: MediaStreamConstraints): Promi
       return await navigator.mediaDevices.getUserMedia(constraints);
     } catch (retry) {
       if (retry instanceof Error && retry.name === "NotAllowedError") {
-        throw new MicrophoneBlockedError("justGranted");
+        throw new MicrophoneBlockedError("justGranted", refusalDetail(retry, activation));
       }
       throw retry;
     }
