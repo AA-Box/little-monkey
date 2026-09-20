@@ -307,6 +307,52 @@ describe('useTalkSession', () => {
   });
 
   /**
+   * The failure this whole file exists downstream of, said out loud.
+   *
+   * Every cause of a microphone that is open and inaudible — a worklet module
+   * the CSP refused, a context WebKit left suspended, a muted track, a capture
+   * unit handing back digital silence — presents identically: Listening, a
+   * meter at zero, no error. Each one was found by rebuilding the app with a
+   * print statement in it. These two say which it was instead.
+   */
+  it('says so when an open microphone delivers no audio at all', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result } = renderHook(() =>
+        useTalkSession('session-1', { enabled: true, autoStartMode: 'continuous' }),
+      );
+      await waitFor(() => expect(workletNodes).toHaveLength(1));
+      // The worklet posts nothing, ever.
+      await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+      expect(result.current.setupError).toMatch(/no audio is arriving/i);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('tells a silent device apart from a silent pipeline', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result } = renderHook(() =>
+        useTalkSession('session-1', { enabled: true, autoStartMode: 'continuous' }),
+      );
+      await waitFor(() => expect(workletNodes).toHaveLength(1));
+      // Frames do arrive — every sample in them is zero.
+      await act(async () => {
+        for (let frame = 0; frame < 4; frame += 1) {
+          workletNodes[0].port.onmessage?.({
+            data: new Float32Array(2_048),
+          } as MessageEvent<Float32Array>);
+        }
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(result.current.setupError).toMatch(/delivering silence/i);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
    * The one step of the acceptance script no test can perform is a human
    * clicking the operating system's microphone prompt. What the hook does with
    * each of that prompt's two answers is not, and this is it: a refusal is

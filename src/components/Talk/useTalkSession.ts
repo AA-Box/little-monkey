@@ -57,6 +57,16 @@ const GRANT_LIFETIME_MS = 30 * 60_000;
 const KWS_SAMPLE_RATE = 16_000;
 const KWS_RING_SAMPLES = KWS_SAMPLE_RATE * 3;
 const KWS_PENDING_SAMPLES = KWS_SAMPLE_RATE / 5;
+/**
+ * How long an open microphone may deliver nothing before it has to explain
+ * itself, and the level below which "nothing" is the honest word.
+ *
+ * A quiet room still reads around 1e-3; a dead capture path reads exactly
+ * zero. The window is long enough to cover a device that takes a moment to
+ * start and short enough that nobody sits watching a flat meter wondering.
+ */
+const SILENT_MICROPHONE_MS = 4_000;
+const SILENT_MICROPHONE_RMS = 1e-4;
 
 function joinPcm(chunks: readonly Float32Array[]): Float32Array {
   const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
@@ -183,6 +193,17 @@ export function useTalkSession(
   const resamplerRef = useRef(new StreamingLinearResampler(KWS_SAMPLE_RATE));
   const ringRef = useRef(new PcmRingBuffer(KWS_RING_SAMPLES));
   const recordingPcmRef = useRef<Float32Array[] | null>(null);
+  /**
+   * Watches the first seconds of an open microphone for any sound at all.
+   *
+   * An open microphone that delivers nothing looks exactly like a quiet room:
+   * the state badge says Listening, the meter sits at zero, and nothing
+   * anywhere fails. Every cause behind that — a refused worklet module, a
+   * suspended context, a muted track, a capture unit that hands back silence —
+   * has been diagnosed by rebuilding the app with a print statement in it. The
+   * microphone can say so itself instead.
+   */
+  const silenceWatchRef = useRef<{ frames: number; peak: number; timer: number } | null>(null);
   const wakeSessionRef = useRef<{ sessionId: string; startSample: number } | null>(null);
   const wakeQueueRef = useRef(new BoundedPcmQueue(KWS_PENDING_SAMPLES));
   const wakePushBusyRef = useRef(false);
@@ -331,6 +352,8 @@ export function useTalkSession(
         .catch(() => undefined);
     }
     recordingPcmRef.current = null;
+    if (silenceWatchRef.current) window.clearTimeout(silenceWatchRef.current.timer);
+    silenceWatchRef.current = null;
     // The speaker goes with the microphone: the output was chosen inside the
     // gesture that opened this session, and it is not this one's to keep.
     player.release();
@@ -470,13 +493,37 @@ export function useTalkSession(
         sourceRef.current = source;
         workletRef.current = worklet;
         audioContextRef.current = context;
+        const watch = {
+          frames: 0,
+          peak: 0,
+          timer: window.setTimeout(() => {
+            const heard = silenceWatchRef.current;
+            silenceWatchRef.current = null;
+            if (!heard || heard.peak > SILENT_MICROPHONE_RMS) return;
+            const track = streamRef.current?.getAudioTracks?.()[0];
+            // Which of the two it is decides where to look next, so say which.
+            setSetupError(
+              heard.frames === 0
+                ? `The microphone is open but no audio is arriving from it (device ${track?.label || 'unknown'}, `
+                  + `track ${track?.readyState ?? 'missing'}${track?.muted ? ', muted' : ''}, `
+                  + `audio ${context.state}). Talk cannot hear anything.`
+                : `The microphone is open and delivering silence (device ${track?.label || 'unknown'}`
+                  + `${track?.muted ? ', muted' : ''}, ${heard.frames} frames, peak ${heard.peak.toFixed(5)}). `
+                  + 'Check that the right input is selected and that it is not muted.',
+            );
+          }, SILENT_MICROPHONE_MS),
+        };
+        silenceWatchRef.current = watch;
         worklet.port.onmessage = (event: MessageEvent<Float32Array | ArrayBuffer>) => {
           const raw = event.data instanceof Float32Array ? event.data : new Float32Array(event.data);
           const pcm = resamplerRef.current.process(raw, context.sampleRate);
           if (pcm.length === 0) return;
           ringRef.current.write(pcm);
           recordingPcmRef.current?.push(pcm.slice());
-          sessionRef.current?.observeLevel(rmsOf(pcm));
+          const level = rmsOf(pcm);
+          watch.frames += 1;
+          if (level > watch.peak) watch.peak = level;
+          sessionRef.current?.observeLevel(level);
           if (wakeSessionRef.current) {
             wakeQueueRef.current.enqueue(pcm);
             void pumpWakeQueue();
