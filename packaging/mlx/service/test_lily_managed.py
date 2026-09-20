@@ -253,13 +253,28 @@ def test_router_model_gate() -> None:
 def test_router_macos_gate() -> None:
     """Lily's BF16 tensor kernels need macOS 26.1; 26.0 must serve MLX."""
     router = _load(ROUTER, "runtime_router_macos_test")
-    original = router.platform.mac_ver
+    # The gate refuses anything that is not Apple silicon before it reads a
+    # version at all, so stubbing `mac_ver` alone asserts the host this runs on
+    # rather than the arithmetic: every case passes on an arm64 Mac and the
+    # first one fails on a Linux runner. `sys` and `platform` are the real
+    # modules, so each stub is put back rather than left for whatever imports
+    # them next.
+    original = (router.sys.platform, router.platform.machine, router.platform.mac_ver)
     try:
+        router.sys.platform = "darwin"
+        router.platform.machine = lambda: "arm64"
         for version, expected in (("26.1", True), ("26.5.2", True), ("27.0", True), ("26.0", False), ("15.6", False)):
             router.platform.mac_ver = lambda version=version: (version, ("", "", ""), "arm64")
             assert router._macos_26_1_or_newer() is expected, version
+        # And the refusal the stubs above were hiding, which is the whole
+        # reason a Linux runner reaches this function at all.
+        router.sys.platform = "linux"
+        assert router._macos_26_1_or_newer() is False
+        router.sys.platform = "darwin"
+        router.platform.machine = lambda: "x86_64"
+        assert router._macos_26_1_or_newer() is False
     finally:
-        router.platform.mac_ver = original
+        router.sys.platform, router.platform.machine, router.platform.mac_ver = original
 
 
 def test_request_capability_gate() -> None:
