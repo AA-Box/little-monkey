@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
     "build": "pnpm typecheck && vite build",
     "clean:stale-bundle": "node scripts/clear-stale-app-bundle.mjs",
+    "build:app": "node scripts/build-app.mjs",
     "bundle:check": "node scripts/check-bundle-budget.mjs",
     "build:budget": "pnpm build && pnpm bundle:check",
     "release:preflight": "pnpm build:budget && pnpm test && pnpm test:machO && pnpm test:manifest && pnpm test:runtime-archive && pnpm test:wake-assets && pnpm test:mlx-package && pnpm test:mlx-service && pnpm test:mlx-lily-managed",
