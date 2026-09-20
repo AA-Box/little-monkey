@@ -77,6 +77,7 @@ import type { VoiceRouteEngine, VoiceRouteRecord } from "../../lib/daemonClient"
 import type { TalkMode } from "../../lib/talkEngine";
 import { Button, IconButton } from "../ui";
 import { talkClient } from "../../lib/talkClient";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { openMicrophoneSettings } from "../../lib/microphoneAccess";
 import { TalkMenu } from "./TalkMenu";
 import { RealtimeTalkBar } from "./RealtimeTalkBar";
@@ -1493,8 +1494,19 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   // the microphone when `talkActive` goes false; stopping the engine first is
   // what makes the speaker go quiet in the same moment rather than a chunk later.
   const startTalk = useCallback(() => {
+    // Before the configuration read below, which is an IPC round trip and
+    // spends the press. WebKit refuses a capture request that carries no user
+    // activation once this origin has been refused once, so the request has to
+    // leave from inside the click handler itself — and only the pipeline
+    // engine wants a local microphone, the realtime one opens its own after
+    // its privacy gate.
+    if (talkEngine !== "realtime") talk.openMicrophoneInGesture();
     void companionClient.config()
       .then((config) => {
+        // The engine the *previous* configuration named is what the guard
+        // above could see. If this one chooses realtime, the microphone that
+        // press asked for is not wanted after all.
+        if (config.voice.engineKind === "realtime") talk.dropPendingMicrophone();
         // Both engines start here now. Realtime used to be handed to a separate
         // page so its privacy warning could be shown before a microphone
         // opened; `RealtimeTalkBar` shows the same gate in the composer and
@@ -1506,8 +1518,12 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       // With no page left to defer to, refusing to start is the fail-closed
       // answer — and saying so is better than a microphone button that does
       // nothing.
-      .catch((reason) => setTalkStartError(errorMessage(reason)));
-  }, []);
+      .catch((reason) => {
+        // Talk never starts, so nothing will ever release it.
+        talk.dropPendingMicrophone();
+        setTalkStartError(errorMessage(reason));
+      });
+  }, [talk, talkEngine]);
   const stopTalk = useCallback(() => {
     void talk.stop();
     setTalkActive(false);
@@ -1728,33 +1744,68 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                   </Button>
                 )}
                 {/* Interrupting the answer is not ending the session — the
-                    primary button does that. */}
-                <IconButton
-                  size="sm"
-                  variant="ghost"
-                  aria-label={t("ChatWindow.talkStopAnswerAriaLabel")}
-                  disabled={!(talkState === "thinking" || talkState === "speaking")}
-                  onClick={() => talk.sessionRef.current?.interrupt("stop_button")}
-                >
-                  <Square size={12} />
-                </IconButton>
+                    primary button does that.
+
+                    Only while there is an answer to interrupt. Sitting there
+                    disabled the rest of the time, a hollow outline in a row
+                    that has no other icons, it read as an unticked checkbox —
+                    and a checkbox beside "Listening" looks like a setting. The
+                    fill is what makes a square a stop button rather than a
+                    box. */}
+                {(talkState === "thinking" || talkState === "speaking") && (
+                  <IconButton
+                    size="sm"
+                    variant="ghost"
+                    className="text-danger hover:text-danger"
+                    aria-label={t("ChatWindow.talkStopAnswerAriaLabel")}
+                    title={t("ChatWindow.talkStopAnswerAriaLabel")}
+                    onClick={() => talk.sessionRef.current?.interrupt("stop_button")}
+                  >
+                    <Square size={11} className="fill-current" />
+                  </IconButton>
+                )}
                 {/* The engine's own errors too, not just setup's. A failed
                     transcription returns Talk to listening, and showing only
                     `setupError` here meant the composer said "Listening" and
                     nothing else while every turn died. */}
-                {/* A refusal with a remedy is a button, not a sentence. macOS
-                    asks about the microphone exactly once, so when the answer
-                    was no there is nothing left to prompt — the only way
-                    forward is the Settings pane, and printing a DOMException
-                    instead left the operator with no way to reach it. */}
+                {/* A refusal with a remedy is a button, not a sentence, and
+                    a remedy the app can take itself is not even a button:
+                    pressing Talk after a refusal makes macOS forget its answer
+                    and ask again, so by the time this shows the operator has
+                    already said no to a second dialog. Settings is what is
+                    left. */}
                 {talk.microphoneBlocked ? (
                   <span role="alert" className="flex min-w-0 items-center gap-2">
-                    <span className="min-w-0 truncate text-danger">
+                    {/* Not truncated: what WebKit refused and why is the whole
+                        content of these two, and a cut-off sentence is what
+                        sent this bug round the houses for a day. */}
+                    <span className="min-w-0 text-danger">
                       {talk.microphoneBlocked === "webviewDenied"
                         ? t("ChatWindow.talkMicrophoneWebviewBlocked")
-                        : t("ChatWindow.talkMicrophoneBlocked")}
+                        : talk.microphoneBlocked === "justGranted"
+                          ? t("ChatWindow.talkMicrophoneJustGranted")
+                          : t("ChatWindow.talkMicrophoneBlocked")}
+                      {talk.microphoneBlockedDetail ? (
+                        <span className="block font-mono text-[10px] text-faint">
+                          {talk.microphoneBlockedDetail}
+                        </span>
+                      ) : null}
                     </span>
-                    {talk.microphoneBlocked !== "webviewDenied" && (
+                    {/* Neither of those two is a permission problem: macOS
+                        has already said yes, and WebKit's capture process
+                        reads that answer once, when it starts. Nothing this
+                        window does can make it read again — measured — so the
+                        remedy is the restart, and it is a button rather than
+                        an instruction. A Settings pane would only show a
+                        switch that is already on. */}
+                    {(talk.microphoneBlocked === "webviewDenied"
+                      || talk.microphoneBlocked === "justGranted") && (
+                      <Button size="sm" variant="primary" onClick={() => void relaunch()}>
+                        {t("ChatWindow.talkRestartNow")}
+                      </Button>
+                    )}
+                    {talk.microphoneBlocked !== "webviewDenied"
+                      && talk.microphoneBlocked !== "justGranted" && (
                       <Button size="sm" variant="secondary" onClick={() => void openMicrophoneSettings()}>
                         {t("ChatWindow.talkOpenMicrophoneSettings")}
                       </Button>
