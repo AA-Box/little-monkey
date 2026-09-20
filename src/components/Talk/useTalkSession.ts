@@ -57,6 +57,16 @@ const GRANT_LIFETIME_MS = 30 * 60_000;
 const KWS_SAMPLE_RATE = 16_000;
 const KWS_RING_SAMPLES = KWS_SAMPLE_RATE * 3;
 const KWS_PENDING_SAMPLES = KWS_SAMPLE_RATE / 5;
+/**
+ * How long an open microphone may deliver nothing before it has to explain
+ * itself, and the level below which "nothing" is the honest word.
+ *
+ * A quiet room still reads around 1e-3; a dead capture path reads exactly
+ * zero. The window is long enough to cover a device that takes a moment to
+ * start and short enough that nobody sits watching a flat meter wondering.
+ */
+const SILENT_MICROPHONE_MS = 4_000;
+const SILENT_MICROPHONE_RMS = 1e-4;
 
 function joinPcm(chunks: readonly Float32Array[]): Float32Array {
   const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
@@ -156,6 +166,20 @@ export interface UseTalkSession {
   setSetupError: (message: string | null) => void;
   /** Why the microphone is unavailable, when the answer has an action. */
   microphoneBlocked: MicrophoneBlock | null;
+  /** What the webview was when it refused, for a refusal it will not explain. */
+  microphoneBlockedDetail: string | null;
+  /**
+   * Ask for the microphone while the click is still the current gesture.
+   *
+   * Exposed because the composer's Talk button does not call `start`: it reads
+   * the configuration and then *enables* Talk, and capture happens later, from
+   * an effect, with the press long gone. WebKit denies a request carrying no
+   * user activation against an origin it has refused before, so the request
+   * has to leave from inside the handler that the operator's click ran.
+   */
+  openMicrophoneInGesture: () => void;
+  /** Give back a microphone the press asked for and the flow did not want. */
+  dropPendingMicrophone: () => void;
   start: () => Promise<void>;
   stop: () => Promise<void>;
   /** The live engine, for push-to-talk and the Stop button. */
@@ -172,17 +196,41 @@ export function useTalkSession(
   const [setupError, setSetupError] = useState<string | null>(null);
   /** Set when the refusal has a remedy, so the UI can offer it instead of prose. */
   const [microphoneBlocked, setMicrophoneBlocked] = useState<MicrophoneBlock | null>(null);
+  /** What the webview was when it refused — see `refusalDetail`. */
+  const [microphoneBlockedDetail, setMicrophoneBlockedDetail] = useState<string | null>(null);
   const [grant, setGrant] = useState<CaptureGrant | null>(null);
 
   const sessionRef = useRef<TalkSession | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  /**
+   * The microphone request made inside the press, waiting to be collected.
+   *
+   * WebKit denies a capture request that carries no user activation once that
+   * origin has been refused once, without consulting anything. `start` awaits
+   * the route activation, the grant and the config read before capture needs a
+   * microphone, and every one of those spends the press — so the request has
+   * to leave before them and be picked up afterwards. Same reason, same shape
+   * as `openAudioContext`.
+   */
+  const pendingMicrophoneRef = useRef<Promise<MediaStream> | null>(null);
   /** Held for as long as the microphone is open — see `startRecording`. */
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const workletRef = useRef<AudioWorkletNode | null>(null);
   const resamplerRef = useRef(new StreamingLinearResampler(KWS_SAMPLE_RATE));
   const ringRef = useRef(new PcmRingBuffer(KWS_RING_SAMPLES));
   const recordingPcmRef = useRef<Float32Array[] | null>(null);
+  /**
+   * Watches the first seconds of an open microphone for any sound at all.
+   *
+   * An open microphone that delivers nothing looks exactly like a quiet room:
+   * the state badge says Listening, the meter sits at zero, and nothing
+   * anywhere fails. Every cause behind that — a refused worklet module, a
+   * suspended context, a muted track, a capture unit that hands back silence —
+   * has been diagnosed by rebuilding the app with a print statement in it. The
+   * microphone can say so itself instead.
+   */
+  const silenceWatchRef = useRef<{ frames: number; peak: number; timer: number } | null>(null);
   const wakeSessionRef = useRef<{ sessionId: string; startSample: number } | null>(null);
   const wakeQueueRef = useRef(new BoundedPcmQueue(KWS_PENDING_SAMPLES));
   const wakePushBusyRef = useRef(false);
@@ -322,6 +370,21 @@ export function useTalkSession(
   }, []);
 
   /** Close the microphone and every node hanging off it. Safe to call twice. */
+  /**
+   * Drop a request made in a press that turned out not to want a microphone.
+   *
+   * A request still in flight resolves into a microphone nobody asked for any
+   * more, and an open one nothing references is a recording light with no
+   * owner.
+   */
+  const dropPendingMicrophone = useCallback(() => {
+    const abandoned = pendingMicrophoneRef.current;
+    pendingMicrophoneRef.current = null;
+    void abandoned
+      ?.then((stream) => stream.getTracks().forEach((track) => track.stop()))
+      .catch(() => undefined);
+  }, []);
+
   const releaseDevices = useCallback(() => {
     const wake = wakeSessionRef.current;
     wakeSessionRef.current = null;
@@ -331,6 +394,9 @@ export function useTalkSession(
         .catch(() => undefined);
     }
     recordingPcmRef.current = null;
+    if (silenceWatchRef.current) window.clearTimeout(silenceWatchRef.current.timer);
+    silenceWatchRef.current = null;
+    dropPendingMicrophone();
     // The speaker goes with the microphone: the output was chosen inside the
     // gesture that opened this session, and it is not this one's to keep.
     player.release();
@@ -351,7 +417,7 @@ export function useTalkSession(
     grantRef.current = null;
     setGrant(null);
     if (activeGrant) void companionClient.revoke(activeGrant.grantId).catch(() => undefined);
-  }, []);
+  }, [dropPendingMicrophone]);
 
   const ports = useMemo<TalkPorts>(() => {
     const pumpWakeQueue = async (): Promise<void> => {
@@ -405,18 +471,39 @@ export function useTalkSession(
         }
         const routedLocal = localDevice(selected, 'input');
         const deviceId = (routedLocal && routedLocal !== 'default' ? routedLocal : config.voice.inputDeviceId) ?? undefined;
+        // Asked for inside the press, before this function's awaits spent it.
+        const requested = pendingMicrophoneRef.current;
+        pendingMicrophoneRef.current = null;
         try {
-          streamRef.current = await openMicrophone({
-            audio: deviceId
-              ? { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true }
-              : { echoCancellation: true, noiseSuppression: true },
-            video: false,
-          });
+          const carriesPermission = requested ? await requested : null;
+          // The press could not know which device the route names, so it asked
+          // for the default one. Where that is not the right microphone, swap
+          // now: WebKit has this origin recorded as allowed by the request
+          // that just succeeded, so the second one needs no press of its own.
+          const wrongDevice = Boolean(
+            carriesPermission
+              && deviceId
+              && carriesPermission.getAudioTracks()[0]?.getSettings?.().deviceId !== deviceId,
+          );
+          if (carriesPermission && wrongDevice) {
+            carriesPermission.getTracks().forEach((track) => track.stop());
+          }
+          streamRef.current = carriesPermission && !wrongDevice
+            ? carriesPermission
+            : await openMicrophone({
+              audio: deviceId
+                ? { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true }
+                : { echoCancellation: true, noiseSuppression: true },
+              video: false,
+            });
         } catch (reason) {
           // Caught here because this is the last frame that still has the
           // error's identity: one below, `talkEngine` flattens it to
           // `reason.message` and the remedy goes with it.
-          if (reason instanceof MicrophoneBlockedError) setMicrophoneBlocked(reason.block);
+          if (reason instanceof MicrophoneBlockedError) {
+            setMicrophoneBlocked(reason.block);
+            setMicrophoneBlockedDetail(reason.detail);
+          }
           throw reason;
         }
         // Still inside the press that opened the microphone, which is the only
@@ -470,13 +557,37 @@ export function useTalkSession(
         sourceRef.current = source;
         workletRef.current = worklet;
         audioContextRef.current = context;
+        const watch = {
+          frames: 0,
+          peak: 0,
+          timer: window.setTimeout(() => {
+            const heard = silenceWatchRef.current;
+            silenceWatchRef.current = null;
+            if (!heard || heard.peak > SILENT_MICROPHONE_RMS) return;
+            const track = streamRef.current?.getAudioTracks?.()[0];
+            // Which of the two it is decides where to look next, so say which.
+            setSetupError(
+              heard.frames === 0
+                ? `The microphone is open but no audio is arriving from it (device ${track?.label || 'unknown'}, `
+                  + `track ${track?.readyState ?? 'missing'}${track?.muted ? ', muted' : ''}, `
+                  + `audio ${context.state}). Talk cannot hear anything.`
+                : `The microphone is open and delivering silence (device ${track?.label || 'unknown'}`
+                  + `${track?.muted ? ', muted' : ''}, ${heard.frames} frames, peak ${heard.peak.toFixed(5)}). `
+                  + 'Check that the right input is selected and that it is not muted.',
+            );
+          }, SILENT_MICROPHONE_MS),
+        };
+        silenceWatchRef.current = watch;
         worklet.port.onmessage = (event: MessageEvent<Float32Array | ArrayBuffer>) => {
           const raw = event.data instanceof Float32Array ? event.data : new Float32Array(event.data);
           const pcm = resamplerRef.current.process(raw, context.sampleRate);
           if (pcm.length === 0) return;
           ringRef.current.write(pcm);
           recordingPcmRef.current?.push(pcm.slice());
-          sessionRef.current?.observeLevel(rmsOf(pcm));
+          const level = rmsOf(pcm);
+          watch.frames += 1;
+          if (level > watch.peak) watch.peak = level;
+          sessionRef.current?.observeLevel(level);
           if (wakeSessionRef.current) {
             wakeQueueRef.current.enqueue(pcm);
             void pumpWakeQueue();
@@ -647,6 +758,22 @@ export function useTalkSession(
    * Synchronous on purpose: one `await` above this line puts it back where it
    * was.
    */
+  const openMicrophoneInGesture = useCallback(() => {
+    if (pendingMicrophoneRef.current || streamRef.current) return;
+    // The routed device is not known yet — it needs the config read this is
+    // deliberately ahead of. The default one carries the permission; where the
+    // route names another, `openPcmDevices` swaps to it, and by then WebKit
+    // has this origin recorded as allowed and grants without a press.
+    const request = openMicrophone({
+      audio: { echoCancellation: true, noiseSuppression: true },
+      video: false,
+    });
+    // Collected in `openPcmDevices`. Nothing awaits it until then, and an
+    // unobserved rejection is an unhandled one.
+    request.catch(() => undefined);
+    pendingMicrophoneRef.current = request;
+  }, []);
+
   const openAudioContext = useCallback(() => {
     if (audioContextRef.current) return;
     try {
@@ -880,8 +1007,15 @@ export function useTalkSession(
 
   const start = useCallback(async () => {
     openAudioContext();
+    const pressedWith = routeRef.current;
+    // Both of these have to leave inside the press, before the awaits below
+    // spend it — and neither may open a microphone another device owns.
+    if (!(pressedWith?.state === 'active' && pairedInputDevice(pressedWith.input_endpoint))) {
+      openMicrophoneInGesture();
+    }
     setSetupError(null);
     setMicrophoneBlocked(null);
+    setMicrophoneBlockedDetail(null);
     try {
       const currentRoute = routeRef.current;
       sessionRef.current?.setExternalInput(Boolean(
@@ -892,7 +1026,7 @@ export function useTalkSession(
     } catch (reason) {
       setSetupError(errorMessage(reason));
     }
-  }, [activateAndWaitForRoute, openAudioContext, sessionId]);
+  }, [activateAndWaitForRoute, openAudioContext, openMicrophoneInGesture, sessionId]);
 
   const stop = useCallback(async () => {
     await sessionRef.current?.stop();
@@ -964,6 +1098,9 @@ export function useTalkSession(
     setupError,
     setSetupError,
     microphoneBlocked,
+    microphoneBlockedDetail,
+    openMicrophoneInGesture,
+    dropPendingMicrophone,
     start,
     stop,
     sessionRef,
