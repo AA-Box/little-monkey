@@ -4,6 +4,7 @@
 //! recognition session, emits only text/state events, and never creates an
 //! audio artifact or an agent turn.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,20 @@ pub const STATE_EVENT: &str = "dictation://state";
 pub const PARTIAL_EVENT: &str = "dictation://partial";
 pub const FINAL_EVENT: &str = "dictation://final";
 pub const ERROR_EVENT: &str = "dictation://error";
+
+/// Argument that turns this executable into the child process that asks macOS
+/// about the microphone. See `ask_for_microphone_in_a_fresh_process`.
+pub const ASK_FOR_MICROPHONE_ARG: &str = "--little-monkey-ask-for-microphone";
+
+/// What a fresh process last told us, when that is newer than anything this
+/// process can see. 0 means nothing has overtaken the cache yet.
+///
+/// `AVCaptureDevice` answers from a cache fixed for the life of a process, so
+/// after the child has raised the dialog and come back with a grant, this
+/// process would still report the refusal it was given before — and every
+/// later press would reset the decision and prompt all over again. The child's
+/// answer is the fresher one, so it wins for the rest of the session.
+static ANSWER_FROM_A_FRESH_PROCESS: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +54,56 @@ pub enum DictationPermissionStatus {
     Restricted,
     Unknown,
     Unavailable,
+}
+
+impl DictationPermissionStatus {
+    /// The spelling the frontend already uses, so the child can print it and
+    /// the parent can read it back without a second vocabulary.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            Self::Denied => "denied",
+            Self::NotDetermined => "notDetermined",
+            Self::Restricted => "restricted",
+            Self::Unknown => "unknown",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "granted" => Some(Self::Granted),
+            "denied" => Some(Self::Denied),
+            "notDetermined" => Some(Self::NotDetermined),
+            "restricted" => Some(Self::Restricted),
+            "unknown" => Some(Self::Unknown),
+            "unavailable" => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+
+    fn code(&self) -> u8 {
+        match self {
+            Self::Granted => 1,
+            Self::Denied => 2,
+            Self::NotDetermined => 3,
+            Self::Restricted => 4,
+            Self::Unknown => 5,
+            Self::Unavailable => 6,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Granted),
+            2 => Some(Self::Denied),
+            3 => Some(Self::NotDetermined),
+            4 => Some(Self::Restricted),
+            5 => Some(Self::Unknown),
+            6 => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
 }
 
 impl Default for DictationPermissionStatus {
@@ -348,6 +413,13 @@ pub fn dictation_open_permission_settings(kind: String) -> Result<(), String> {
 /// Settings" — a distinction `getUserMedia`'s `NotAllowedError` does not make.
 #[tauri::command]
 pub async fn microphone_request_access() -> Result<DictationPermissionStatus, String> {
+    // A child process has asked since this one last could, and its answer is
+    // the only one that reflects what the operator actually decided.
+    if let Some(fresher) =
+        DictationPermissionStatus::from_code(ANSWER_FROM_A_FRESH_PROCESS.load(Ordering::Relaxed))
+    {
+        return Ok(fresher);
+    }
     #[cfg(target_os = "macos")]
     {
         Ok(macos::request_microphone_access().await)
@@ -371,14 +443,54 @@ pub async fn microphone_ask_again(
     let identifier = app.config().identifier.clone();
     #[cfg(target_os = "macos")]
     {
-        macos::reset_microphone_access(&identifier)?;
-        return Ok(macos::request_microphone_access().await);
+        let answer = tauri::async_runtime::spawn_blocking(move || {
+            macos::reset_microphone_access(&identifier)?;
+            ask_for_microphone_in_a_fresh_process()
+        })
+        .await
+        .map_err(|error| format!("Asking for the microphone again failed: {error}"))??;
+        ANSWER_FROM_A_FRESH_PROCESS.store(answer.code(), Ordering::Relaxed);
+        return Ok(answer);
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = identifier;
         Err("Resetting the microphone permission is a macOS feature".to_string())
     }
+}
+
+/// Spawn this same executable to do the asking, and read back what it decided.
+///
+/// `AVCaptureDevice` answers from a cache fixed when a process first asks, and
+/// a `tccutil` reset does not disturb it: measured, not assumed — the process
+/// that reset its own decision went on reporting the refusal, and asking again
+/// returned instantly with no dialog. A process spawned afterwards reads TCC
+/// fresh and does raise the dialog. Since the child is this app's own binary,
+/// signed with this app's identity and launched by this app, TCC records the
+/// answer against this app.
+///
+/// The child needs no window: it runs its own runloop, waits for the dialog,
+/// prints the status and exits.
+#[cfg(target_os = "macos")]
+fn ask_for_microphone_in_a_fresh_process() -> Result<DictationPermissionStatus, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("Could not find Little Monkey's own program: {error}"))?;
+    let output = std::process::Command::new(executable)
+        .arg(ASK_FOR_MICROPHONE_ARG)
+        .output()
+        .map_err(|error| format!("Could not ask macOS for the microphone: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let answer = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    DictationPermissionStatus::from_str(&answer)
+        .ok_or_else(|| format!("macOS answered something unreadable: {answer}"))
+}
+
+/// The child half of the above: ask, wait, print, exit.
+#[cfg(target_os = "macos")]
+pub fn ask_for_microphone_in_this_process() -> &'static str {
+    macos::request_microphone_access_blocking().as_str()
 }
 
 fn open_permission_settings(kind: &str) -> Result<(), String> {

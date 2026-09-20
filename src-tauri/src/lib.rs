@@ -862,6 +862,14 @@ fn any_window_visible<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Spawned by the running app purely to ask macOS about the microphone, and
+    // gone again a moment later. It must return before Tauri starts: the point
+    // is a process with no cached answer, not a second copy of the app.
+    #[cfg(target_os = "macos")]
+    if std::env::args().nth(1).as_deref() == Some(dictation::ASK_FOR_MICROPHONE_ARG) {
+        println!("{}", dictation::ask_for_microphone_in_this_process());
+        return;
+    }
     let full_product_e2e = std::env::var("COMPUTER_USE_FULL_PRODUCT_E2E").as_deref() == Ok("1");
     const FULL_PRODUCT_E2E_CAPABILITY: &str = r#"{
   "identifier": "computer-use-full-product-e2e",

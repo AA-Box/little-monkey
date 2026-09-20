@@ -30,6 +30,7 @@ unsafe extern "C" {
         done: unsafe extern "C" fn(*mut c_void, *const c_char),
         user_data: *mut c_void,
     );
+    fn little_monkey_microphone_request_access_blocking() -> i32;
 }
 
 struct CallbackContext {
@@ -192,6 +193,20 @@ pub async fn request_microphone_access() -> super::DictationPermissionStatus {
         Some("denied") => super::DictationPermissionStatus::Denied,
         Some("restricted") => super::DictationPermissionStatus::Restricted,
         Some("notDetermined") => super::DictationPermissionStatus::NotDetermined,
+        _ => super::DictationPermissionStatus::Unknown,
+    }
+}
+
+/// Ask macOS for the microphone and wait here for the answer.
+///
+/// Only ever called in the short-lived child process spawned to ask, where
+/// blocking is the entire job and the runloop belongs to nobody else.
+pub fn request_microphone_access_blocking() -> super::DictationPermissionStatus {
+    match unsafe { little_monkey_microphone_request_access_blocking() } {
+        1 => super::DictationPermissionStatus::Granted,
+        2 => super::DictationPermissionStatus::Denied,
+        3 => super::DictationPermissionStatus::Restricted,
+        4 => super::DictationPermissionStatus::NotDetermined,
         _ => super::DictationPermissionStatus::Unknown,
     }
 }
