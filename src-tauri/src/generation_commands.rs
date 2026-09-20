@@ -312,7 +312,10 @@ fn mflux_image_command(app_data: &Path) -> Result<EngineCommand, String> {
     }
     Ok(EngineCommand {
         program: install.python_executable,
-        prefix_args: vec![service.to_string_lossy().to_string()],
+        // `-B`: see the MLX chat launch in mlx_runtime.rs. A packaged
+        // interpreter that rewrites a shipped `.pyc` breaks the digest
+        // verification of its own install.
+        prefix_args: vec!["-B".to_string(), service.to_string_lossy().to_string()],
     })
 }
 
@@ -352,7 +355,10 @@ fn mlx_video_command(app_data: &Path) -> Result<EngineCommand, String> {
     }
     Ok(EngineCommand {
         program: install.python_executable,
-        prefix_args: vec![service.to_string_lossy().to_string()],
+        // `-B`: see the MLX chat launch in mlx_runtime.rs. A packaged
+        // interpreter that rewrites a shipped `.pyc` breaks the digest
+        // verification of its own install.
+        prefix_args: vec!["-B".to_string(), service.to_string_lossy().to_string()],
     })
 }
 

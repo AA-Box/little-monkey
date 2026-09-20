@@ -10,12 +10,14 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import {
+  describeMissingTargetSnapshot,
   resolveLoadedLocalEndpoint,
   resolveTarget,
   resolvedTargetSupportsVision,
   snapshotForResolvedTarget,
 } from "./targetRouting";
 import { useModelStore, type ModelInfo, type OllamaModelInfo } from "../store/modelStore";
+import type { ResolvedTarget } from "./turnEngine";
 
 function localModel(): ModelInfo {
   return {
@@ -128,6 +130,55 @@ describe("MLX local runtime", () => {
   });
 });
 
+describe("a model loaded outside the chat picker", () => {
+  const mlxModel = (): ModelInfo => ({
+    ...localModel(),
+    id: "mlx-qwen",
+    path: "/models/mlx-qwen",
+    runtime: "mlx",
+  });
+
+  it("freezes the resident model as a target even though nothing set `active`", () => {
+    const model = mlxModel();
+    // What Runtime Hub's own load leaves behind: the runtime holds the model
+    // and reports it, and the chat store's `active` was never touched.
+    useModelStore.setState({
+      installed: [model],
+      active: null,
+      mlxChat: {
+        running: true,
+        port: 51234,
+        modelId: "ext-1",
+        modelPath: model.path ?? "",
+        vision: false,
+      },
+    });
+
+    const snapshot = snapshotForResolvedTarget({ kind: "local" } as ResolvedTarget);
+
+    // Without this the turn is refused with "The selected model target could
+    // not be frozen for the resident runner" while a model is loaded and
+    // answering on its own port.
+    expect(snapshot).not.toBeNull();
+    expect(snapshot?.kind).toBe("local");
+    expect((snapshot as { modelPath?: string }).modelPath).toBe(model.path);
+  });
+
+  it("claims nothing when no runtime is holding a model", () => {
+    useModelStore.setState({ installed: [mlxModel()], active: null, mlxChat: null });
+    expect(snapshotForResolvedTarget({ kind: "local" } as ResolvedTarget)).toBeNull();
+  });
+
+  it("ignores a runtime holding a model this machine no longer lists", () => {
+    useModelStore.setState({
+      installed: [],
+      active: null,
+      mlxChat: { running: true, port: 51234, modelId: "ext-1", modelPath: "/models/gone", vision: false },
+    });
+    expect(snapshotForResolvedTarget({ kind: "local" } as ResolvedTarget)).toBeNull();
+  });
+});
+
 describe("resolveTarget", () => {
   it("reconciles native llama status before freezing a local target", async () => {
     const model = localModel();
@@ -181,5 +232,62 @@ describe("resolveTarget", () => {
       kind: "ollama",
       model: model.name,
     });
+  });
+});
+
+describe("why a target could not be frozen", () => {
+  const localTarget: ResolvedTarget = { kind: "local", baseUrl: "http://127.0.0.1:59045" };
+
+  it("says nothing is loaded when no model is selected", () => {
+    expect(describeMissingTargetSnapshot(localTarget)).toContain("No local model is loaded");
+  });
+
+  it("reports the runtime's own reason when the start failed", () => {
+    useModelStore.setState({
+      installed: [localModel()],
+      active: localModel(),
+      llamaStatus: "error",
+      llamaError: "the verified MLX runtime is not installed",
+    });
+    const message = describeMissingTargetSnapshot(localTarget);
+    expect(message).toContain("Qwen 27B");
+    expect(message).toContain("the verified MLX runtime is not installed");
+  });
+
+  it("prefers the runtime's reason even after the status was overwritten", () => {
+    // The status is one word anything may overwrite; the reason is written once
+    // by whatever failed. A start failure whose status has since been flattened
+    // to "stopped" must still report why it failed.
+    useModelStore.setState({
+      installed: [localModel()],
+      active: localModel(),
+      llamaStatus: "stopped",
+      llamaError: "the verified MLX runtime is not installed",
+    });
+    expect(describeMissingTargetSnapshot(localTarget)).toContain(
+      "the verified MLX runtime is not installed",
+    );
+  });
+
+  it("says a selected model is not running rather than naming the freeze", () => {
+    useModelStore.setState({
+      installed: [localModel()],
+      active: localModel(),
+      llamaStatus: "stopped",
+      llamaError: null,
+    });
+    const message = describeMissingTargetSnapshot(localTarget);
+    expect(message).toContain("not running");
+    expect(message).not.toContain("frozen");
+  });
+
+  it("names the model an Ollama target wanted", () => {
+    expect(describeMissingTargetSnapshot({
+        kind: "ollama",
+        baseUrl: "http://127.0.0.1:11434",
+        model: "qwen3.8:27b-mlx",
+      })).toContain(
+      "qwen3.8:27b-mlx",
+    );
   });
 });

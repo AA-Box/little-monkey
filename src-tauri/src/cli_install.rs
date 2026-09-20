@@ -88,13 +88,58 @@ fn sidecar_file_name() -> &'static str {
 
 /// Locates the bundled sidecar next to the running app's own executable —
 /// where Tauri's `externalBin` copies it (stripped of its target-triple
-/// suffix) in a built app. `None` in an unbundled dev run with nothing
-/// staged there.
+/// suffix) in a built app — falling back to the staged sidecar in a dev run.
 pub fn bundled_cli_path() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    let candidate = dir.join(sidecar_file_name());
-    candidate.is_file().then_some(candidate)
+    if let Some(exe) = std::env::current_exe().ok() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(sidecar_file_name());
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    staged_cli_path()
+}
+
+/// The sidecar `pnpm stage:cli` writes into `src-tauri/binaries`, for dev runs.
+///
+/// `tauri dev` launches the app from a temporary copy — `…/T/tauri_current_app*/
+/// current_app/little-monkey` — and unlinks that directory immediately, so the
+/// sibling lookup above cannot succeed however the sidecar was staged, and
+/// every daemon-backed command failed with "Failed to start bundled
+/// monkey-cli: No such file or directory". A built app never reaches this:
+/// `externalBin` puts the real sidecar beside the executable.
+///
+/// Debug-only on purpose. The path is this crate's source directory, baked in
+/// at compile time; a release build must load the sidecar it actually shipped
+/// with, not whatever a developer happens to have staged.
+#[cfg(debug_assertions)]
+fn staged_cli_path() -> Option<PathBuf> {
+    let binaries = Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries");
+    // Named with the target triple there (`monkey-cli-aarch64-apple-darwin`),
+    // which this build has no need to spell out: one staged sidecar is what the
+    // staging script writes, and matching the prefix keeps this working when
+    // the triple changes.
+    let prefix = sidecar_file_name();
+    let mut staged = std::fs::read_dir(binaries)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix))
+        })
+        .collect::<Vec<_>>();
+    staged.sort();
+    staged.pop()
+}
+
+#[cfg(not(debug_assertions))]
+fn staged_cli_path() -> Option<PathBuf> {
+    None
 }
 
 fn dir_on_path(dir: &Path) -> bool {
@@ -945,11 +990,32 @@ mod tests {
     }
 
     #[test]
-    fn bundled_cli_path_is_none_when_nothing_staged() {
-        // `cargo test`'s own test binary never has a `monkey-cli[.exe]`
-        // sitting next to it, so this just pins the "unbundled dev run"
-        // no-op path the module doc promises.
-        assert!(bundled_cli_path().is_none());
+    fn bundled_cli_path_falls_back_to_the_staged_sidecar_in_a_dev_build() {
+        // `cargo test`'s own binary never has a `monkey-cli[.exe]` beside it,
+        // and neither does the app `tauri dev` runs: it launches from a
+        // temporary copy it then unlinks. So this exercises the fallback, which
+        // is the only thing standing between a dev run and "Failed to start
+        // bundled monkey-cli: No such file or directory".
+        let staged = Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries");
+        let has_staged = std::fs::read_dir(&staged).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(sidecar_file_name()))
+            })
+        });
+
+        match bundled_cli_path() {
+            Some(path) => {
+                assert!(has_staged, "resolved {} with nothing staged", path.display());
+                assert!(path.is_file(), "{} is not a file", path.display());
+                assert!(path.starts_with(&staged), "{} is not staged", path.display());
+            }
+            // Nothing staged — `pnpm stage:cli` has not run in this checkout —
+            // and refusing to guess is the documented answer.
+            None => assert!(!has_staged),
+        }
     }
 
     #[cfg(unix)]

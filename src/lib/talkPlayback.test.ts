@@ -5,6 +5,8 @@ import { createTalkPlayer, type PlaybackAudio } from './talkPlayback';
 /** An audio element that reports what it was asked to do with a clip. */
 class FakeAudio implements PlaybackAudio {
   currentTime = 0;
+  src = '';
+  srcs: string[] = [];
   onended: ((...args: never[]) => unknown) | null = null;
   onerror: ((...args: never[]) => unknown) | null = null;
   sinks: string[] = [];
@@ -13,7 +15,6 @@ class FakeAudio implements PlaybackAudio {
   setSinkId?: (deviceId: string) => Promise<void>;
 
   constructor(
-    readonly url: string,
     options: { routing?: 'supported' | 'absent' | 'refused'; refusesToPlay?: boolean } = {},
   ) {
     if (options.routing === 'supported') {
@@ -33,6 +34,7 @@ class FakeAudio implements PlaybackAudio {
   private refusesToPlay: boolean;
 
   async play(): Promise<void> {
+    this.srcs.push(this.src);
     if (this.refusesToPlay) throw new Error('play() failed because the user did not interact');
     this.plays += 1;
   }
@@ -47,7 +49,7 @@ class FakeAudio implements PlaybackAudio {
 }
 
 /** A player wired to one fake element, with the object URLs it opened and closed. */
-function harness(options: ConstructorParameters<typeof FakeAudio>[1] = {}) {
+function harness(options: ConstructorParameters<typeof FakeAudio>[0] = {}) {
   const opened: string[] = [];
   const revoked: string[] = [];
   const elements: FakeAudio[] = [];
@@ -58,8 +60,8 @@ function harness(options: ConstructorParameters<typeof FakeAudio>[1] = {}) {
       return url;
     },
     revokeObjectUrl: (url) => revoked.push(url),
-    createAudio: (url) => {
-      const audio = new FakeAudio(url, options);
+    createAudio: () => {
+      const audio = new FakeAudio(options);
       elements.push(audio);
       return audio;
     },
@@ -70,22 +72,76 @@ function harness(options: ConstructorParameters<typeof FakeAudio>[1] = {}) {
 const CLIP = new Blob(['audio'], { type: 'audio/wav' });
 
 describe('createTalkPlayer', () => {
-  it('plays a configured output through the sink it was given', async () => {
-    const { player, elements, revoked } = harness({ routing: 'supported' });
-    const playing = player.play(CLIP, 'speaker-2');
-    await Promise.resolve();
-    await Promise.resolve();
+  /**
+   * The regression that made the speaker picker decorative.
+   *
+   * WebKit refuses `setSinkId` outside a user gesture, and an answer arrives
+   * long after the press that asked for it. Routing at play time therefore
+   * threw on every single turn, the catch swallowed it, and Talk played on the
+   * system default no matter what was chosen. The sink is set once, at gesture
+   * time, on an element that is kept.
+   */
+  it('never touches the sink while playing a clip', async () => {
+    const { player, elements } = harness({ routing: 'supported' });
+    await player.setOutput('speaker-2');
     expect(elements[0].sinks).toEqual(['speaker-2']);
-    expect(elements[0].plays).toBe(1);
 
+    const playing = player.play(CLIP);
+    await Promise.resolve();
+    await Promise.resolve();
+    // Still one: playback asked for no routing of its own.
+    expect(elements[0].sinks).toEqual(['speaker-2']);
     elements[0].end();
     expect(await playing).toBe(true);
-    expect(revoked).toEqual(['blob:clip-1']);
+  });
+
+  it('keeps one element, so the chosen sink outlives the clip', async () => {
+    const { player, elements, revoked } = harness({ routing: 'supported' });
+    await player.setOutput('speaker-2');
+
+    const first = player.play(CLIP);
+    await Promise.resolve();
+    await Promise.resolve();
+    elements[0].end();
+    await first;
+
+    const second = player.play(CLIP);
+    await Promise.resolve();
+    await Promise.resolve();
+    elements[0].end();
+    await second;
+
+    // A second element would be a second output, on the system default.
+    expect(elements).toHaveLength(1);
+    expect(elements[0].srcs).toEqual(['blob:clip-1', 'blob:clip-2']);
+    expect(elements[0].sinks).toEqual(['speaker-2']);
+    expect(revoked).toEqual(['blob:clip-1', 'blob:clip-2']);
+  });
+
+  it('asks for the user agent default when the choice is cleared', async () => {
+    const { player, elements } = harness({ routing: 'supported' });
+    await player.setOutput('speaker-2');
+    await player.setOutput(null);
+    // Not "leave it alone": an empty id is the spec's way of saying default,
+    // and anything else would keep routing where nobody asked any more.
+    expect(elements[0].sinks).toEqual(['speaker-2', '']);
+  });
+
+  it('reports whether the browser took the device, rather than pretending', async () => {
+    const supported = harness({ routing: 'supported' });
+    expect(await supported.player.setOutput('speaker-2')).toBe(true);
+
+    const absent = harness({ routing: 'absent' });
+    expect(await absent.player.setOutput('speaker-2')).toBe(false);
+
+    const refused = harness({ routing: 'refused' });
+    expect(await refused.player.setOutput('unplugged-headphones')).toBe(false);
   });
 
   it('still plays when the browser cannot route to a chosen output at all', async () => {
     const { player, elements } = harness({ routing: 'absent' });
-    const playing = player.play(CLIP, 'speaker-2');
+    await player.setOutput('speaker-2');
+    const playing = player.play(CLIP);
     await Promise.resolve();
     await Promise.resolve();
     // No `setSinkId` means the system default, which is audible. Refusing to
@@ -97,28 +153,19 @@ describe('createTalkPlayer', () => {
 
   it('falls back to the default output when the device is refused', async () => {
     const { player, elements } = harness({ routing: 'refused' });
-    const playing = player.play(CLIP, 'unplugged-headphones');
-    await Promise.resolve();
-    await Promise.resolve();
+    await player.setOutput('unplugged-headphones');
     expect(elements[0].sinks).toEqual(['unplugged-headphones']);
+    const playing = player.play(CLIP);
+    await Promise.resolve();
+    await Promise.resolve();
     expect(elements[0].plays).toBe(1);
-    elements[0].end();
-    expect(await playing).toBe(true);
-  });
-
-  it('leaves the system default alone when nothing is configured', async () => {
-    const { player, elements } = harness({ routing: 'supported' });
-    const playing = player.play(CLIP, null);
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(elements[0].sinks).toEqual([]);
     elements[0].end();
     expect(await playing).toBe(true);
   });
 
   it('settles and releases the clip when playback is stopped mid-sentence', async () => {
     const { player, elements, revoked } = harness({ routing: 'supported' });
-    const playing = player.play(CLIP, 'speaker-2');
+    const playing = player.play(CLIP);
     await Promise.resolve();
     await Promise.resolve();
 
@@ -136,7 +183,7 @@ describe('createTalkPlayer', () => {
 
   it('does not stall the queue behind a speaker that refuses to play', async () => {
     const { player, revoked } = harness({ routing: 'supported', refusesToPlay: true });
-    expect(await player.play(CLIP, 'speaker-2')).toBe(false);
+    expect(await player.play(CLIP)).toBe(false);
     expect(revoked).toEqual(['blob:clip-1']);
   });
 });

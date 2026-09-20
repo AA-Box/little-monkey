@@ -77,8 +77,20 @@ def _load_model(model_path: str):
     if _is_vision_model(config):
         from mlx_vlm import load  # noqa: PLC0415 - deliberate: see docstring
 
-        model, processor = load(model_path)
-        return _VisionRuntime(model, processor, config)
+        try:
+            model, processor = load(model_path)
+            return _VisionRuntime(model, processor, config)
+        except Exception as error:  # noqa: BLE001 - any loader failure, see below
+            # A `vision_config` says what the checkpoint carries, not what this
+            # runtime can read: the two MLX stacks ship architectures on their
+            # own schedules, so a model mlx-vlm has no module for may still load
+            # as text in mlx-lm. Serving it without images beats refusing to
+            # serve it at all, and the line below is what tells a user why the
+            # picture they attached came back refused.
+            sys.stderr.write(
+                f"mlx-service vision_stack_unavailable={error!s} fallback=text\n"
+            )
+            sys.stderr.flush()
     from mlx_lm import load  # noqa: PLC0415 - deliberate: see docstring
 
     model, tokenizer = load(model_path)

@@ -20,6 +20,10 @@ pub struct ToolCallEvent {
 pub enum StreamEvent {
     Delta(String),
     ToolCall(ToolCallEvent),
+    /// A stream that failed after the response committed to 200 reports it as a
+    /// frame. Without this the caller sees an empty answer and the reason is
+    /// lost — see the same branch in `llamaClient.ts`.
+    Error(String),
     Usage {
         prompt_tokens: u64,
         completion_tokens: u64,
@@ -107,6 +111,19 @@ impl SseParser {
             Ok(v) => v,
             Err(_) => return, // malformed/partial chunk — skip rather than crash the loop
         };
+
+        // Both local backends (`mlx_chat.rs`'s dispatch error and
+        // `compatibility_hub.rs`'s `CanonicalStreamEvent::Error`) report a
+        // mid-stream failure this way; a third-party endpoint sends the bare
+        // string form.
+        if let Some(error) = payload.get("error") {
+            let reason = error
+                .as_str()
+                .or_else(|| error.get("message").and_then(|m| m.as_str()))
+                .unwrap_or("The model runtime failed the request without saying why.");
+            events.push(StreamEvent::Error(reason.to_string()));
+            return;
+        }
 
         if let Some(usage) = payload.get("usage") {
             events.push(StreamEvent::Usage {
@@ -431,5 +448,25 @@ mod recovery_tests {
         let (answer, calls) = recover_text_tool_calls(content, &tools(&["run_shell"]));
         assert_eq!(calls.len(), 1);
         assert_eq!(answer, "Kör det här — nu:\n\nKlart ✅");
+    }
+}
+
+#[cfg(test)]
+mod parser_tests {
+    use super::{SseParser, StreamEvent};
+
+    #[test]
+    fn surfaces_a_mid_stream_error_frame() {
+        let mut parser = SseParser::new();
+        let events = parser.feed(
+            "data: {\"error\": {\"message\": \"Model type qwen3_5 not supported.\"}}\n\n",
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::Error(reason)] if reason == "Model type qwen3_5 not supported."
+        ));
+        // The bare-string form a third-party endpoint sends.
+        let events = parser.feed("data: {\"error\": \"boom\"}\n\n");
+        assert!(matches!(events.as_slice(), [StreamEvent::Error(reason)] if reason == "boom"));
     }
 }

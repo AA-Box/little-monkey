@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Signed MLX runtime entrypoint selecting the safest available engine.
 
-The product always launches this entrypoint. On an M5+ / macOS 26+ host with
-the exact Qwen3.6 MLX affine-Q4 layout and a packaged Lily binary, it execs the
-managed Lily adapter. Every other case execs the normal MLX service unchanged.
+The product always launches this entrypoint. On an Apple silicon / macOS 26.1+
+host with the exact Qwen3.6 MLX affine-Q4 layout and a packaged Lily binary, it
+execs the managed Lily adapter. Every other case execs the normal MLX service
+unchanged.
 No user PATH executable, custom provider, or manually started process is used.
 """
 
@@ -40,18 +41,28 @@ def _model_is_lily_candidate(model_path: Path) -> bool:
     )
 
 
-def _macos_26_or_newer() -> bool:
+def _macos_26_1_or_newer() -> bool:
+    """Lily's production TensorOps use BF16 tensors, added in macOS 26.1."""
     if sys.platform != "darwin" or platform.machine().lower() not in {"arm64", "aarch64"}:
         return False
+    parts = (platform.mac_ver()[0] or "0").split(".")
     try:
-        major = int((platform.mac_ver()[0] or "0").split(".", 1)[0])
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
     except ValueError:
         return False
-    return major >= 26
+    return (major, minor) >= (26, 1)
 
 
 def _apple_m_generation() -> int | None:
-    """Conservatively identify Apple M-series generation without guessing GPU family."""
+    """Identify the Apple M-series generation without guessing GPU family.
+
+    The number is a sanity check that this is Apple silicon at all, not a
+    capability verdict: Lily itself reads the Metal GPU family and refuses
+    anything below family 7, and `lily_managed` answers a refusal by serving the
+    normal MLX service. Encoding a second, coarser opinion here would only make
+    the two disagree.
+    """
     try:
         output = subprocess.check_output(
             ["/usr/sbin/system_profiler", "SPHardwareDataType", "-json"],
@@ -75,9 +86,9 @@ def _lily_eligible(model_path: Path, lily_binary: Path) -> bool:
     return (
         lily_binary.is_file()
         and os.access(lily_binary, os.X_OK)
-        and _macos_26_or_newer()
+        and _macos_26_1_or_newer()
         and generation is not None
-        and generation >= 5
+        and generation >= 1
         and _model_is_lily_candidate(model_path)
     )
 
