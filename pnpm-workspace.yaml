@@ -3,3 +3,12 @@ packages:
 
 allowBuilds:
   esbuild: true
+
+# @xmldom/xmldom reaches us three levels down, under plist -> tauri-liquid-icon,
+# so nothing we declare directly can move it; 0.9.12 clears ten advisories
+# against 0.9.10. browserslist sits under @babel/core, which asks only for
+# '>= 4.21.0' and so keeps whatever the lockfile already pinned; 4.28.7 fixes
+# GHSA-73wf-gq98-2v4g and pulls a fixed baseline-browser-mapping with it.
+overrides:
+  '@xmldom/xmldom': ^0.9.12
+  browserslist: ^4.28.9

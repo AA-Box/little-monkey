@@ -288,6 +288,16 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
         "signature and notarization checks of this app's own bundle",
     ),
     (
+        "dictation/macos.rs",
+        Class::HostUtility,
+        "`/usr/bin/tccutil reset Microphone <bundle identifier>`, with the identifier read          from this app's own Tauri config and the other two arguments literal. There is no          argument here a model could reach, and the command can only ever return this app's          own microphone decision to \"not determined\" — it grants nothing, and the          operator still answers the dialog that follows",
+    ),
+    (
+        "dictation/mod.rs",
+        Class::HostUtility,
+        "re-execs this app's own binary, from `current_exe`, with one literal flag, to ask          macOS for the microphone in a process that has not cached an answer yet. The child          runs that one branch and exits before Tauri starts; it takes no input, and the only          thing it returns is the permission status it printed",
+    ),
+    (
         "update_rollback.rs",
         Class::HostUtility,
         "installer and rollback invocations with fixed arguments",

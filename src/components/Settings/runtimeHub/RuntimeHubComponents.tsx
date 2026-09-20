@@ -145,13 +145,52 @@ function InstalledComponentCard({
   );
 }
 
-function RegistryEntryCard({ entry }: { entry: M3ComponentCatalogEntry }) {
+/**
+ * Every known version of one component, newest first.
+ *
+ * Grouped rather than one card per row because a component with three known
+ * versions is one thing a user can install, not three things — and the choice
+ * between them (take the new one, go back to the one that worked) only reads as
+ * a choice when they sit together. The registry is keyed per row, so the
+ * grouping happens here rather than in the store.
+ */
+export function groupRegistryByComponent(
+  entries: M3ComponentCatalogEntry[],
+): M3ComponentCatalogEntry[][] {
+  const groups = new Map<string, M3ComponentCatalogEntry[]>();
+  for (const entry of entries) {
+    const group = groups.get(entry.componentId);
+    if (group) group.push(entry);
+    else groups.set(entry.componentId, [entry]);
+  }
+  return [...groups.values()].map((group) =>
+    [...group].sort((left, right) => right.publishedAtMs - left.publishedAtMs),
+  );
+}
+
+function RegistryComponentCard({ entries }: { entries: M3ComponentCatalogEntry[] }) {
   const installedComponents = useRuntimeHubStore((state) => state.installedComponents);
   const installComponent = useRuntimeHubStore((state) => state.installComponent);
   const busy = useRuntimeHubStore((state) => state.busy);
   const errors = useRuntimeHubStore((state) => state.errors);
+  // Newest first, and the newest is the default selection: the common case is
+  // taking the update, and choosing an older one should be deliberate.
+  const [selectedKey, setSelectedKey] = useState(entryKey(entries[0]));
+  const entry = entries.find((candidate) => entryKey(candidate) === selectedKey) ?? entries[0];
   const action = describeRegistryAction(entry, installedComponents);
+  const installedVersion = installedComponents
+    .find((component) => component.componentId === entry.componentId)
+    ?.versions.find((version) => version.active)?.version;
+  // Published before what is running: the honest word for this is a rollback,
+  // not an update, and the button should say which one the user is about to do.
+  const older =
+    installedVersion !== undefined &&
+    entries.some(
+      (candidate) =>
+        candidate.version === installedVersion && candidate.publishedAtMs > entry.publishedAtMs,
+    );
   const key = `component-install:${entry.componentId}`;
+  const selectId = `component-version-${entry.componentId}`;
 
   return (
     <article className="rounded-lg border border-border bg-background p-4">
@@ -162,13 +201,31 @@ function RegistryEntryCard({ entry }: { entry: M3ComponentCatalogEntry }) {
             <ChannelPill channel={entry.channel} />
           </div>
           <p className="mt-1 break-all font-mono text-xs text-muted">
-            {entry.componentId} · {labelize(entry.kind)} · v{entry.version}
+            {entry.componentId} · {labelize(entry.kind)}
           </p>
         </div>
         <span className="rounded-md border border-border px-2 py-1 font-mono text-xs text-muted">
           {formatBytes(entry.sizeBytes)}
         </span>
       </div>
+
+      <label className="mt-3 block text-xs text-muted" htmlFor={selectId}>
+        {entries.length > 1 ? `Version (${entries.length} known)` : "Version"}
+      </label>
+      <select
+        id={selectId}
+        value={selectedKey}
+        onChange={(event) => setSelectedKey(event.target.value)}
+        className="mt-1 min-h-11 w-full rounded-md border border-border bg-surface-2 px-2 font-mono text-xs text-foreground"
+      >
+        {entries.map((candidate) => (
+          <option key={entryKey(candidate)} value={entryKey(candidate)}>
+            {candidate.version}
+            {candidate.version === installedVersion ? " · installed" : ""}
+          </option>
+        ))}
+      </select>
+
       <CompatibilityNote note={entry.compatibilityNote} />
       <ErrorNotice message={errors[key]} />
       <div className="mt-4 flex justify-end">
@@ -183,7 +240,16 @@ function RegistryEntryCard({ entry }: { entry: M3ComponentCatalogEntry }) {
             busy={busy[key]}
             onClick={() => void installComponent(entry).catch(() => {})}
           >
-            <PackagePlus size={15} aria-hidden="true" /> {action === "update" ? "Install this version" : "Install"}
+            {older ? (
+              <>
+                <ArchiveRestore size={15} aria-hidden="true" /> Go back to this version
+              </>
+            ) : (
+              <>
+                <PackagePlus size={15} aria-hidden="true" />{" "}
+                {action === "update" ? "Install this version" : "Install"}
+              </>
+            )}
           </BusyButton>
         )}
       </div>
@@ -252,6 +318,46 @@ function raise(message: string): never {
   throw new Error(message);
 }
 
+/**
+ * The backend's own budget for a catalog sync, plus room for the adoption it
+ * does after the fetch.
+ *
+ * The button is disabled while a sync runs, so a call that never settles takes
+ * the only way to retry with it: the panel then sits on a spinner with no
+ * notice, and every later click is silently swallowed. That is what a sync
+ * starved by a busy main thread looked like — indistinguishable, from the
+ * outside, from a button that does nothing. Failing loudly keeps the retry.
+ */
+const CATALOG_SYNC_DEADLINE_MS = 45_000;
+
+/** Rejects if `work` has not settled within `ms`. */
+export async function withDeadline<T>(
+  work: Promise<T>,
+  ms: number = CATALOG_SYNC_DEADLINE_MS,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              new Error(
+                `The catalog check did not finish within ${Math.round(
+                  ms / 1000,
+                )} seconds. The versions already known to this machine are unchanged — try again.`,
+              ),
+            ),
+          ms,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export function RuntimeHubComponents() {
   const installedComponents = useRuntimeHubStore((state) => state.installedComponents);
   const componentRegistry = useRuntimeHubStore((state) => state.componentRegistry);
@@ -266,17 +372,39 @@ export function RuntimeHubComponents() {
   const [importing, setImporting] = useState(false);
   const [catalogNotice, setCatalogNotice] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
-  const catalogInput = useRef<HTMLInputElement | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [importUrl, setImportUrl] = useState("");
+  const [importText, setImportText] = useState("");
   const syncedThisMount = useRef(false);
 
-  const importCatalog = async (file: File) => {
+  /**
+   * Adopts a catalog the user names, without a native file dialog.
+   *
+   * The dialog is why this changed: a webview file input hands the open panel
+   * to AppKit, and a panel that fails to vend takes the whole process with it —
+   * `unexpected NULL returned from +[NSOpenPanel openPanel]`, an abort that no
+   * Rust code here can catch. A URL and a paste box cover the same two cases a
+   * file did (a catalog published beside a component, a registry someone
+   * exported) and neither can end the app.
+   */
+  const importCatalog = async (source: { url?: string; text?: string }) => {
     setImportError(null);
     setImporting(true);
     try {
-      // Read here, merged in the backend. The panel does not hold the registry it
-      // is adding to, which is what stops an import from writing back a state
-      // that was current when this component rendered and stale by now.
-      await mergeComponentRegistry(parseCatalogText(await file.text()));
+      if (source.url) {
+        // The same backend fetch-and-merge the published catalog goes through,
+        // pointed at the URL the user gave.
+        await withDeadline(syncComponentCatalog(source.url.trim()));
+      } else {
+        // Parsed here, merged in the backend. The panel does not hold the
+        // registry it is adding to, which is what stops an import from writing
+        // back a state that was current when this component rendered and stale
+        // by now.
+        await mergeComponentRegistry(parseCatalogText(source.text ?? ""));
+      }
+      setImportOpen(false);
+      setImportUrl("");
+      setImportText("");
     } catch (reason) {
       setImportError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -295,7 +423,7 @@ export function RuntimeHubComponents() {
     setCatalogNotice(null);
     setSyncing(true);
     try {
-      await syncComponentCatalog();
+      await withDeadline(syncComponentCatalog());
     } catch (reason) {
       // Deliberately a notice rather than an error: the registry on disk is
       // what the list is rendered from, so an unreachable catalog costs the
@@ -364,29 +492,64 @@ export function RuntimeHubComponents() {
               >
                 <CloudDownload size={15} aria-hidden="true" /> Check for new versions
               </BusyButton>
-              <input
-                ref={catalogInput}
-                type="file"
-                accept="application/json,.json"
-                className="hidden"
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  if (file) void importCatalog(file);
-                  // Cleared so re-importing the same file still fires a change.
-                  event.target.value = "";
-                }}
-              />
-              <BusyButton
-                type="button"
-                busy={importing}
-                onClick={() => catalogInput.current?.click()}
-              >
+              <BusyButton type="button" busy={importing} onClick={() => setImportOpen((open) => !open)}>
                 <PackagePlus size={15} aria-hidden="true" /> Import catalog
               </BusyButton>
             </>
           }
         />
         <ErrorNotice message={importError} />
+        {importOpen ? (
+          <div className="flex flex-col gap-3 rounded-lg border border-border bg-surface-2 p-3">
+            <div>
+              <label className="text-xs text-muted" htmlFor="component-catalog-url">
+                Catalog URL
+              </label>
+              <div className="mt-1 flex flex-wrap gap-2">
+                <input
+                  id="component-catalog-url"
+                  type="url"
+                  inputMode="url"
+                  placeholder="https://example.com/component-catalog.json"
+                  value={importUrl}
+                  onChange={(event) => setImportUrl(event.target.value)}
+                  className="min-h-11 min-w-0 flex-1 rounded-md border border-border bg-background px-2 text-xs text-foreground"
+                />
+                <BusyButton
+                  type="button"
+                  busy={importing}
+                  disabled={!importUrl.trim()}
+                  onClick={() => void importCatalog({ url: importUrl })}
+                >
+                  <CloudDownload size={15} aria-hidden="true" /> Fetch and add
+                </BusyButton>
+              </div>
+            </div>
+            <div>
+              <label className="text-xs text-muted" htmlFor="component-catalog-json">
+                …or paste the catalog JSON
+              </label>
+              <textarea
+                id="component-catalog-json"
+                rows={4}
+                placeholder='[{"schemaVersion":1,"componentId":"…"}]'
+                value={importText}
+                onChange={(event) => setImportText(event.target.value)}
+                className="mt-1 w-full rounded-md border border-border bg-background p-2 font-mono text-[11px] text-foreground"
+              />
+              <div className="mt-2 flex justify-end">
+                <BusyButton
+                  type="button"
+                  busy={importing}
+                  disabled={!importText.trim()}
+                  onClick={() => void importCatalog({ text: importText })}
+                >
+                  <PackagePlus size={15} aria-hidden="true" /> Add these versions
+                </BusyButton>
+              </div>
+            </div>
+          </div>
+        ) : null}
         {catalogNotice ? (
           <p className="text-xs text-muted" role="status">
             Showing the versions already known to this machine — the published catalog could not be
@@ -409,9 +572,9 @@ export function RuntimeHubComponents() {
         </label>
         <div id="component-registry-heading" className="grid gap-3 lg:grid-cols-2" aria-live="polite">
           {(showInstalledOnly ? notYetInstalled : componentRegistry).length ? (
-            (showInstalledOnly ? notYetInstalled : componentRegistry).map((entry) => (
-              <RegistryEntryCard key={`${entry.componentId}:${entry.version}:${entry.sha256}`} entry={entry} />
-            ))
+            groupRegistryByComponent(showInstalledOnly ? notYetInstalled : componentRegistry).map(
+              (group) => <RegistryComponentCard key={group[0].componentId} entries={group} />,
+            )
           ) : (
             <div className="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted lg:col-span-2">
               {componentRegistry.length

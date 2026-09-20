@@ -40,7 +40,13 @@ class Harness implements TalkPorts {
     return this.clock;
   }
 
+  /** Set to hold `startRecording` open — the shape of an unanswered prompt. */
+  pendingOpen: Promise<void> | null = null;
+  startRecordingCalls = 0;
+
   async startRecording() {
+    this.startRecordingCalls += 1;
+    if (this.pendingOpen) await this.pendingOpen;
     this.recording = true;
   }
 
@@ -130,6 +136,59 @@ beforeEach(() => {
 });
 
 describe('TalkSession — push to talk', () => {
+  /**
+   * The bug that made a broken microphone indistinguishable from an ignored
+   * button. `press()` sets only the private `held` flag, and the device chain
+   * behind it is three awaits deep — capture grant, config read,
+   * `getUserMedia`. A rejection is loud. A decision that is never answered —
+   * an unsigned dev binary that holds no TCC grant, say — was completely
+   * silent: badge "Ready", button "Hold to talk", meter at zero, no error.
+   */
+  it('reports that it is opening the device while the press is pending', async () => {
+    const harness = new Harness();
+    let release: () => void = () => {};
+    harness.pendingOpen = new Promise<void>((resolve) => { release = resolve; });
+    const session = new TalkSession(harness, { mode: 'push_to_talk' });
+
+    await session.start();
+    expect(session.snapshot().state).toBe('armed');
+
+    void session.press();
+    await settle();
+
+    expect(session.snapshot().state).toBe('starting');
+    expect(session.snapshot().capturing).toBe(false);
+
+    release();
+    await settle();
+    expect(session.snapshot().state).toBe('capturing_command');
+  });
+
+  /**
+   * Letting go before the microphone finishes opening. `release()` has already
+   * returned at its `!held` guard by the time `startRecording` resolves, so
+   * without the check the recorder is left running with nobody holding it and
+   * `capturing` latches true for the rest of the session.
+   */
+  it('does not latch capturing when the key is released before the device opens', async () => {
+    const harness = new Harness();
+    let release: () => void = () => {};
+    harness.pendingOpen = new Promise<void>((resolve) => { release = resolve; });
+    const session = new TalkSession(harness, { mode: 'push_to_talk' });
+
+    await session.start();
+    void session.press();
+    await settle();
+    await session.release();
+
+    release();
+    await settle();
+
+    expect(session.snapshot().capturing).toBe(false);
+    expect(harness.recording).toBe(false);
+    expect(session.snapshot().state).toBe('armed');
+  });
+
   it('records while held, submits one turn on release, and speaks the answer', async () => {
     const harness = new Harness();
     harness.transcripts = ['what is the deploy status'];
@@ -166,6 +225,9 @@ describe('TalkSession — push to talk', () => {
       'off',
       'starting',
       'armed',
+      // The press says so before it awaits the device chain — see
+      // "reports that it is opening the device while the press is pending".
+      'starting',
       'capturing_command',
       'transcribing',
       'thinking',
@@ -325,6 +387,7 @@ describe('TalkSession — barge-in', () => {
     expect(states.slice(states.indexOf('speaking'))).toEqual([
       'speaking',
       'interrupted',
+      'starting',
       'capturing_command',
       'transcribing',
       'thinking',

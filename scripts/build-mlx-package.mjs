@@ -9,7 +9,7 @@
  * The package is self-contained and signed. In addition to the pinned MLX
  * Python stack it carries a Lily binary built from one immutable upstream
  * commit. `service/runtime_router.py` is the only serviceEntry: it selects Lily
- * conservatively on supported M5+/macOS 26+ Qwen3.6 hosts and otherwise execs
+ * conservatively on macOS 26.1+ Apple silicon Qwen3.6 hosts and otherwise execs
  * the normal MLX service. No user PATH executable is trusted at runtime.
  */
 
@@ -17,19 +17,34 @@ import { execFileSync } from "node:child_process";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
+  copyFileSync,
   cpSync,
+  openSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  readSync,
+  realpathSync,
+  renameSync,
   rmSync,
+  statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { buildManifest, canonicalJson, serviceRevision, signManifest } from "./lib/mlxPackage.mjs";
+import {
+  buildManifest,
+  canonicalJson,
+  loadsFromOutsideThePackage,
+  materializeSymlinks,
+  serviceRevision,
+  signManifest,
+} from "./lib/mlxPackage.mjs";
 
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SOURCE_SERVICE = join(REPOSITORY_ROOT, "packaging/mlx/service/mlx_server.py");
@@ -45,11 +60,32 @@ const MLX_LM_VERSION = "0.31.3";
 const MLX_VLM_VERSION = "0.7.0";
 const MLX_VIDEO_COMMIT = "87db56a51758fefb748a359b90a5283bb8ba4837";
 /**
+ * A relocatable CPython, not the build host's.
+ *
+ * `python3 -m venv` copies a launcher that still links the interpreter it was
+ * made from by absolute path — on a GitHub runner, Homebrew's
+ * `/opt/homebrew/Cellar/python@3.14/<version>/…/Python`. Every client then needs
+ * that exact patch version installed in that exact prefix, and the day the
+ * runner's Homebrew moved from 3.14.6 to 3.14.7 every installed app got:
+ *
+ *     dyld: Library not loaded: /opt/homebrew/Cellar/python@3.14/3.14.7/…/Python
+ *
+ * python-build-standalone links only system libraries and resolves its own
+ * libpython relative to the executable, which is what makes a package that runs
+ * where it is unpacked.
+ */
+const PYTHON_RELEASE = "20260901";
+const PYTHON_VERSION = "3.14.7";
+const PYTHON_ARCHIVE = `cpython-${PYTHON_VERSION}+${PYTHON_RELEASE}-aarch64-apple-darwin-install_only.tar.gz`;
+const PYTHON_URL = `https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_RELEASE}/${PYTHON_ARCHIVE}`;
+/** From that release's `SHA256SUMS`. */
+const PYTHON_SHA256 = "30daa970c7d223530120f1693cd3c6fa4c0c0d31ef158710b0dd77f286a5b23e";
+/**
  * Audited Lily source revision. Do not use a branch/tag here: a managed
  * executable must be reproducibly attributable to the source we reviewed.
  */
-const LILY_GARDEN_COMMIT = "1ed972ed3f0bd5616c997c9507c25616c63394fc";
-const LILY_REPOSITORY = "https://github.com/perplexityai/pplx-garden.git";
+const LILY_GARDEN_COMMIT = "27cb5d9b257c757468b2420d064cfda55b2e72f0";
+const LILY_REPOSITORY = "https://github.com/AA-Box/pplx-garden.git";
 const SOURCE_ID = "little-monkey-mlx";
 const COMPONENT_ID = "mlx-runtime-apple-silicon";
 const ARCHIVE_PREFIX = "mlx-runtime";
@@ -68,6 +104,84 @@ function keygen() {
       "",
     ].join("\n"),
   );
+}
+
+/**
+ * Unpacks the pinned CPython into `destination`, digest-checked, with no
+ * symlinks and nothing linked outside the package.
+ */
+function installRelocatablePython(destination) {
+  const staging = mkdtempSync(join(tmpdir(), "little-monkey-python-"));
+  try {
+    const archive = join(staging, PYTHON_ARCHIVE);
+    execFileSync("curl", ["--fail", "--location", "--silent", "--show-error", "--output", archive, PYTHON_URL], {
+      stdio: "inherit",
+    });
+    const digest = createHash("sha256").update(readFileSync(archive)).digest("hex");
+    if (digest !== PYTHON_SHA256) {
+      throw new Error(`CPython archive digest mismatch: wanted ${PYTHON_SHA256}, got ${digest}`);
+    }
+    execFileSync("tar", ["-xzf", archive, "-C", staging], { stdio: "inherit" });
+    renameSync(join(staging, "python"), destination);
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+  }
+  materializeSymlinks(destination);
+  assertNothingLinksOutside(destination);
+}
+
+/**
+ * Fails the build if anything in the package loads a library from outside it.
+ *
+ * This is the check that was missing: a venv-built interpreter linked the build
+ * host's Homebrew framework by absolute path, the package installed and
+ * verified fine everywhere, and the failure arrived at each client as a dyld
+ * abort the first time a model was loaded.
+ */
+function assertNothingLinksOutside(root) {
+  const offenders = [];
+  const walk = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        walk(path);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      // Read the header through one descriptor rather than stat-then-read: the
+      // second look is both a wasted syscall and a file that could have changed
+      // in between. Mach-O, thin or fat, either endianness.
+      const header = Buffer.alloc(4);
+      const handle = openSync(path, "r");
+      let read = 0;
+      try {
+        read = readSync(handle, header, 0, 4, 0);
+      } finally {
+        closeSync(handle);
+      }
+      if (read < 4) continue;
+      const magic = header.readUInt32BE(0);
+      if (![0xfeedfacf, 0xcffaedfe, 0xfeedface, 0xcefaedfe, 0xcafebabe].includes(magic)) continue;
+      let linked = "";
+      try {
+        linked = execFileSync("otool", ["-L", path], { encoding: "utf8" });
+      } catch {
+        continue; // Not something otool reads; nothing to claim about it.
+      }
+      for (const line of linked.split("\n").slice(1)) {
+        const library = line.trim().split(" ")[0];
+        if (loadsFromOutsideThePackage(library)) {
+          offenders.push(`${path.slice(root.length + 1)} → ${library}`);
+        }
+      }
+    }
+  };
+  walk(root);
+  if (offenders.length) {
+    throw new Error(
+      `the packaged runtime links libraries outside itself, which no client is guaranteed to have:\n  ${offenders.join("\n  ")}`,
+    );
+  }
 }
 
 function buildLily() {
@@ -120,10 +234,8 @@ function build() {
   rmSync(OUTPUT_ROOT, { recursive: true, force: true });
   mkdirSync(OUTPUT_ROOT, { recursive: true });
 
-  console.log("creating the packaged interpreter…");
-  execFileSync("python3", ["-m", "venv", "--copies", join(OUTPUT_ROOT, "runtime")], {
-    stdio: "inherit",
-  });
+  console.log(`fetching the packaged interpreter (CPython ${PYTHON_VERSION})…`);
+  installRelocatablePython(join(OUTPUT_ROOT, "runtime"));
   const python = join(OUTPUT_ROOT, "runtime/bin/python3");
   execFileSync(
     python,
@@ -190,6 +302,7 @@ function build() {
     serviceEntry: "service/runtime_router.py",
     keyId: KEY_ID,
   });
+  assertNoBytecodeWasSigned(manifest);
 
   const signingKey = process.env.MLX_SIGNING_KEY;
   if (signingKey) {
@@ -221,7 +334,10 @@ function publish(version, manifest) {
     componentId: COMPONENT_ID,
     kind: "mlx_runtime",
     displayName: "MLX runtime (Apple silicon)",
-    accelerator: "Lily on M5+ / macOS 26+ for Qwen3.6-35B-A3B",
+    // The enum the app deserializes into, not prose: anything else and the
+    // published catalog fails to parse, so every client's "Check for new
+    // versions" refuses the whole file. What Lily needs is in the note below.
+    accelerator: "metal",
     version,
     channel: "stable",
     downloadUrl: process.env.MLX_DOWNLOAD_URL ?? `file://${archive}`,
@@ -231,7 +347,7 @@ function publish(version, manifest) {
     compatibilityNote:
       `Requires Apple silicon. Carries MLX ${MLX_VERSION}, mlx-lm ${MLX_LM_VERSION}, ` +
       `mlx-vlm ${MLX_VLM_VERSION}, the pinned MLX video engine, and Lily ${LILY_GARDEN_COMMIT.slice(0, 12)}. ` +
-      `Lily acceleration is selected only on M5+/macOS 26+ with its exact Qwen3.6 affine-Q4 model; ` +
+      `Lily acceleration is selected only on macOS 26.1+ with its exact Qwen3.6 affine-Q4 model; ` +
       `all other models and unsupported Lily request surfaces use the normal MLX engine. ` +
       `Ships ${manifest.files.length} files.`,
     metadata: {
@@ -241,14 +357,65 @@ function publish(version, manifest) {
       mlxVideoCommit: MLX_VIDEO_COMMIT,
       lilyGardenCommit: LILY_GARDEN_COMMIT,
       lilyModel: "Qwen3.6-35B-A3B",
-      lilyMinimumMacos: "26",
-      lilyMinimumAppleMGeneration: 5,
+      lilyMinimumMacos: "26.1",
+      // Strings, not numbers: `metadata` deserializes into a
+      // `BTreeMap<String, String>` and one integer refuses the whole catalog.
+      lilyMinimumAppleMGeneration: "1",
     },
   };
+  assertCatalogEntryShape(entry);
   const catalog = join(REPOSITORY_ROOT, "packaging/mlx", "mlx-catalog.json");
   writeFileSync(catalog, `${JSON.stringify([entry], null, 2)}\n`);
   console.log(`archive: ${archive} (${(bytes.length / 1e6).toFixed(0)} MB)`);
   console.log(`catalog: ${catalog}`);
+}
+
+/** Accelerators `AcceleratorKind` (src-tauri/src/runtime_adapter.rs) accepts. */
+const ACCELERATORS = new Set([
+  "cpu",
+  "metal",
+  "cuda",
+  "rocm",
+  "vulkan",
+  "direct_ml",
+  "apple_neural_engine",
+]);
+
+/**
+ * Refuses to publish a catalog entry the app cannot deserialize.
+ *
+ * A catalog is parsed whole or not at all — deliberately, so nothing adopts
+ * half a file — which means one bad field silently costs every client every
+ * update in it, and the failure surfaces as a button that appears to do
+ * nothing. Cheaper to fail here, where the person who changed the field is
+ * standing.
+ */
+function assertCatalogEntryShape(entry) {
+  for (const [key, value] of Object.entries(entry.metadata ?? {})) {
+    if (typeof value !== "string") {
+      throw new Error(
+        `metadata.${key} must be a string — the app reads metadata as a map of strings, ` +
+          `and one other type refuses the whole catalog — got ${JSON.stringify(value)}`,
+      );
+    }
+  }
+  if (entry.accelerator !== null && !ACCELERATORS.has(entry.accelerator)) {
+    throw new Error(
+      `accelerator must be null or one of ${[...ACCELERATORS].join(", ")}, got ${JSON.stringify(entry.accelerator)}`,
+    );
+  }
+  for (const [field, expected] of [
+    ["componentId", "string"],
+    ["version", "string"],
+    ["downloadUrl", "string"],
+    ["sha256", "string"],
+    ["sizeBytes", "number"],
+    ["publishedAtMs", "number"],
+  ]) {
+    if (typeof entry[field] !== expected) {
+      throw new Error(`${field} must be a ${expected}, got ${JSON.stringify(entry[field])}`);
+    }
+  }
 }
 
 function pruneBytecode(directory) {
@@ -263,8 +430,41 @@ function pruneBytecode(directory) {
   }
 }
 
+/**
+ * Refuse to sign regenerable bytecode.
+ *
+ * `pruneBytecode` removes it, but anything that runs the packaged interpreter
+ * afterwards writes some of it straight back, and a `.pyc` inside a signed
+ * manifest is a file the runtime is free to rewrite: Python regenerates one
+ * whose staleness check fails, the size no longer matches what was signed, and
+ * verification refuses the install it just wrote —
+ *
+ *     runtime: MLX file bytes is 9705, exceeding 9567
+ *
+ * — with no way back short of a reinstall. Publishing is the last place this
+ * can be caught cheaply, so catch it here rather than shipping it.
+ */
+function assertNoBytecodeWasSigned(manifest) {
+  const bytecode = manifest.files
+    .map((file) => file.path)
+    .filter((path) => path.endsWith(".pyc") || path.includes("/__pycache__/"));
+  if (bytecode.length > 0) {
+    throw new Error(
+      `${bytecode.length} bytecode file(s) reached the manifest — something ran the packaged ` +
+        `interpreter after pruneBytecode without -B. First: ${bytecode.slice(0, 3).join(", ")}`,
+    );
+  }
+}
+
 function pythonVersion(interpreter) {
-  return execFileSync(interpreter, ["-c", "import sys;print('py%d.%d' % sys.version_info[:2])"])
+  // `-B`: this runs *after* pruneBytecode, and a bare `python -c` writes the
+  // `.pyc` for every module its own startup imports — linecache and the
+  // encodings package. Without this those four files are recreated after the
+  // prune, land in the signed manifest, and are then rewritten by the first
+  // runtime launch that imports them differently, which fails verification:
+  //
+  //     runtime: MLX file bytes is 9705, exceeding 9567
+  return execFileSync(interpreter, ["-B", "-c", "import sys;print('py%d.%d' % sys.version_info[:2])"])
     .toString()
     .trim();
 }

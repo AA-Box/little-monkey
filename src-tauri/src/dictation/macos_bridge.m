@@ -336,6 +336,57 @@ static NSString *lm_microphone_permission_status(void) {
     return @"unknown";
 }
 
+/// Ask macOS for the microphone, outside a dictation session.
+///
+/// `requestAccessForMediaType:` is the only call that raises the TCC dialog,
+/// and it raises it *only* when the status is notDetermined; for a decision
+/// that already exists it answers from the record and shows nothing. That is
+/// exactly the two-branch answer a caller needs, so the completion handler
+/// reports the resulting status rather than a bool.
+///
+/// Talk used to let WebKit decide whether macOS was asked at all. A refusal
+/// from there is a message-less `NotAllowedError` that never reaches TCC, is
+/// indistinguishable between "never asked", "denied" and "no device", and
+/// depends on gesture heuristics the app does not control. This does not.
+void little_monkey_microphone_request_access(
+    void (*done)(void *, const char *), void *user_data) {
+    [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio
+                             completionHandler:^(BOOL granted) {
+        (void)granted;
+        @autoreleasepool { done(user_data, lm_utf8(lm_microphone_permission_status())); }
+    }];
+}
+
+/// The same request, made by a process that exists only to make it.
+///
+/// `AVCaptureDevice` answers from a per-process cache: once this process has
+/// been told no, it is told no forever, and a `tccutil` reset it performs
+/// itself is invisible to it — measured, not assumed. A freshly spawned
+/// process reads TCC fresh and raises the dialog, and because it is this
+/// app's own executable, signed with this app's identity, TCC attributes the
+/// answer to this app.
+///
+/// Blocking on purpose: the caller is a short-lived child whose whole job is
+/// to wait for the dialog. The runloop is this process's own, so nothing else
+/// is held up. Returns the resulting status as an enum value rather than a
+/// string, so there is nothing to free across the boundary.
+int little_monkey_microphone_request_access_blocking(void) {
+    __block int decided = 0;
+    CFRunLoopRef loop = CFRunLoopGetCurrent();
+    [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio
+                             completionHandler:^(BOOL granted) {
+        switch ([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio]) {
+            case AVAuthorizationStatusAuthorized: decided = 1; break;
+            case AVAuthorizationStatusDenied: decided = 2; break;
+            case AVAuthorizationStatusRestricted: decided = 3; break;
+            case AVAuthorizationStatusNotDetermined: decided = granted ? 1 : 4; break;
+        }
+        CFRunLoopStop(loop);
+    }];
+    CFRunLoopRun();
+    return decided;
+}
+
 char *little_monkey_dictation_macos_capabilities_json(void) {
     @autoreleasepool {
         NSMutableArray *languages = [NSMutableArray array];
