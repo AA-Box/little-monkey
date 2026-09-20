@@ -121,17 +121,17 @@ describe("a refusal macOS recorded", () => {
     expect(invoke.mock.calls.filter(([command]) => command === "microphone_ask_again")).toHaveLength(1);
   });
 
-  it("asks for a press rather than blaming the webview, right after a grant", async () => {
-    // Answering the operating system's dialog is not a press, so the retry
-    // carries no activation of its own and WebKit may still refuse it. What is
-    // needed is one more press, and saying "restart" would be a lie.
+  it("asks for a restart rather than blaming the window, right after a grant", async () => {
+    // WebKit's capture process reads the system's answer when it starts and
+    // holds it: a grant taken after that cannot be used by the window that
+    // asked for it, however many times it is pressed. Only a restart can.
     webviewRefuses(99);
     invoke.mockImplementation(async (command: string) =>
       command === "microphone_request_access" ? "denied" : "granted");
 
     const reason = await openMicrophone({ audio: true }).catch((error) => error);
     expect(reason.block).toBe("justGranted");
-    expect(reason.message).toMatch(/press talk again/i);
+    expect(reason.message).toMatch(/restart/i);
   });
 
   it("keeps the recorded answer where there is no decision to reset", async () => {

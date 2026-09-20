@@ -77,6 +77,7 @@ import type { VoiceRouteEngine, VoiceRouteRecord } from "../../lib/daemonClient"
 import type { TalkMode } from "../../lib/talkEngine";
 import { Button, IconButton } from "../ui";
 import { talkClient } from "../../lib/talkClient";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { openMicrophoneSettings } from "../../lib/microphoneAccess";
 import { TalkMenu } from "./TalkMenu";
 import { RealtimeTalkBar } from "./RealtimeTalkBar";
@@ -1743,16 +1744,26 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                   </Button>
                 )}
                 {/* Interrupting the answer is not ending the session — the
-                    primary button does that. */}
-                <IconButton
-                  size="sm"
-                  variant="ghost"
-                  aria-label={t("ChatWindow.talkStopAnswerAriaLabel")}
-                  disabled={!(talkState === "thinking" || talkState === "speaking")}
-                  onClick={() => talk.sessionRef.current?.interrupt("stop_button")}
-                >
-                  <Square size={12} />
-                </IconButton>
+                    primary button does that.
+
+                    Only while there is an answer to interrupt. Sitting there
+                    disabled the rest of the time, a hollow outline in a row
+                    that has no other icons, it read as an unticked checkbox —
+                    and a checkbox beside "Listening" looks like a setting. The
+                    fill is what makes a square a stop button rather than a
+                    box. */}
+                {(talkState === "thinking" || talkState === "speaking") && (
+                  <IconButton
+                    size="sm"
+                    variant="ghost"
+                    className="text-danger hover:text-danger"
+                    aria-label={t("ChatWindow.talkStopAnswerAriaLabel")}
+                    title={t("ChatWindow.talkStopAnswerAriaLabel")}
+                    onClick={() => talk.sessionRef.current?.interrupt("stop_button")}
+                  >
+                    <Square size={11} className="fill-current" />
+                  </IconButton>
+                )}
                 {/* The engine's own errors too, not just setup's. A failed
                     transcription returns Talk to listening, and showing only
                     `setupError` here meant the composer said "Listening" and
@@ -1780,9 +1791,19 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                         </span>
                       ) : null}
                     </span>
-                    {/* Neither of those two is a permission problem any more:
-                        one needs a press, the other a restart. A Settings
-                        button would send the operator to a switch already on. */}
+                    {/* Neither of those two is a permission problem: macOS
+                        has already said yes, and WebKit's capture process
+                        reads that answer once, when it starts. Nothing this
+                        window does can make it read again — measured — so the
+                        remedy is the restart, and it is a button rather than
+                        an instruction. A Settings pane would only show a
+                        switch that is already on. */}
+                    {(talk.microphoneBlocked === "webviewDenied"
+                      || talk.microphoneBlocked === "justGranted") && (
+                      <Button size="sm" variant="primary" onClick={() => void relaunch()}>
+                        {t("ChatWindow.talkRestartNow")}
+                      </Button>
+                    )}
                     {talk.microphoneBlocked !== "webviewDenied"
                       && talk.microphoneBlocked !== "justGranted" && (
                       <Button size="sm" variant="secondary" onClick={() => void openMicrophoneSettings()}>

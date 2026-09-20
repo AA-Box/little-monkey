@@ -32,7 +32,8 @@ const MICROPHONE_BLOCK_MESSAGE: Record<MicrophoneBlock, string> = {
   restricted: "Little Monkey does not have permission to use the microphone.",
   webviewDenied:
     "The system allows Little Monkey to use the microphone, but this window was refused. Restart Little Monkey.",
-  justGranted: "macOS has granted the microphone. Press Talk again to start listening.",
+  justGranted:
+    "macOS has granted the microphone. Little Monkey has to restart before this window can use it.",
 };
 
 /** A refusal with somewhere to go, as opposed to a sentence to read. */
@@ -113,10 +114,12 @@ export async function openMicrophone(constraints: MediaStreamConstraints): Promi
     // operator answers it.
     const asked = await invoke<DictationPermissionStatus>("microphone_ask_again").catch(() => status);
     if (asked === "denied" || asked === "restricted") throw new MicrophoneBlockedError(asked);
-    // Granted now — but answering a dialog is not a press, so this retry
-    // carries no activation of its own. It succeeds where WebKit has nothing
-    // recorded against this origin, and where it does, the press that follows
-    // does.
+    // Granted now, and this window still cannot use it. WebKit's capture
+    // process reads the system's answer once, when it starts, and holds it for
+    // its lifetime — the same per-process cache `AVCaptureDevice` keeps, and
+    // measured the same way. The retry is worth one attempt, because a process
+    // that never asked has nothing stale to hold; when it fails, only a
+    // restart clears the answer it took before the grant existed.
     try {
       return await navigator.mediaDevices.getUserMedia(constraints);
     } catch (retry) {
