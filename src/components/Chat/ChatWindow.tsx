@@ -346,6 +346,24 @@ interface ComposerDraftSnapshot {
   pastedPlacements: PastedTextPlacement[];
 }
 
+/**
+ * Whether the Always Listening setting opens Talk on its own, with no press.
+ *
+ * Exported for its test: mounting a whole chat to assert three conditions is a
+ * fixture, not a check.
+ */
+export function shouldAutoOpenTalk(voice: VoiceConfig): boolean {
+  // Realtime opens its own microphone after the privacy gate in
+  // `RealtimeTalkBar`, so it is never opened from a setting.
+  if (voice.engineKind === "realtime") return false;
+  // The Rust side refuses Always Listening without the phrase, so this should
+  // not be reachable — but a continuous session with no wake gating is a hot
+  // microphone submitting every sentence in the room, which is worth one
+  // condition here rather than an invariant held somewhere else.
+  if (!voice.wakePhraseEnabled) return false;
+  return voice.alwaysListening;
+}
+
 export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks, onOpenPmCopilot, onOpenStudio }: ChatWindowProps) {
   const messages = useSessionStore(selectSessionMessages(sessionId));
   const persistError = useSessionStore((state) => state.persistError);
@@ -387,6 +405,10 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   // stays inert — no config read, no engine, no microphone — until this flips,
   // so a chat nobody has spoken to opens no devices.
   const [talkActive, setTalkActive] = useState(false);
+  // Whether the Always Listening setting opened this session rather than a
+  // press. It decides what `autoStartMode` is, which is what tells the hook
+  // whose microphone this is — see the mount effect below.
+  const [talkAutoOpened, setTalkAutoOpened] = useState(false);
   // Read once, when Talk starts, from the same config call that used to decide
   // whether to open the standalone page.
   const [voice, setVoice] = useState<VoiceConfig | null>(null);
@@ -399,10 +421,43 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   // live engines would fight over it — and over one spoken sentence.
   const talk = useTalkSession(sessionId, {
     enabled: talkActive && talkEngine === "pipeline",
-    autoStartMode: talkMode,
+    // `null` is what the deleted page passed, and it is not the same as
+    // "continuous": the hook reads it as nobody having asked for a mode, falls
+    // back to the Always Listening setting for one, and marks the microphone
+    // as the setting's to close. Passing a mode here claims a press.
+    autoStartMode: talkAutoOpened ? null : talkMode,
     route: talkRoute,
   });
   const talkState: TalkState = talkActive ? talk.snapshot?.state ?? "starting" : "off";
+
+  // Always Listening's claim is that Talk listens for as long as it is open
+  // without anyone pressing Start. The standalone Talk page made that true by
+  // mounting the hook with no `enabled` and no `autoStartMode` the moment it
+  // opened; #552 deleted the page, and the composer gates the hook behind a
+  // press, so nothing was left to arm the spotter and the setting silently
+  // meant "listens once you press Talk".
+  //
+  // Mount only, deliberately. Turning the setting *on* from a background event
+  // would open a microphone nobody is in front of, and the hook says the same
+  // thing about its own teardown watcher: arming is a decision the next mount
+  // makes. Turning it off still closes this one, which is that watcher's job.
+  useEffect(() => {
+    let cancelled = false;
+    void companionClient
+      .config()
+      .then((config) => {
+        if (cancelled || !shouldAutoOpenTalk(config.voice)) return;
+        setVoice(config.voice);
+        setTalkAutoOpened(true);
+        setTalkActive(true);
+      })
+      // A configuration that cannot be read selects no voice path at all,
+      // exactly as it does in `startTalk`. Nothing opened, so nothing to say.
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   const [mentionEntries, setMentionEntries] = useState<MentionEntry[]>([]);
@@ -1512,6 +1567,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         // opened; `RealtimeTalkBar` shows the same gate in the composer and
         // connects nothing until it is accepted.
         setVoice(config.voice);
+        setTalkAutoOpened(false);
         setTalkActive(true);
       })
       // Unknown configuration must not silently select a voice/privacy path.
@@ -1527,6 +1583,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const stopTalk = useCallback(() => {
     void talk.stop();
     setTalkActive(false);
+    setTalkAutoOpened(false);
   }, [talk]);
   const editingPastedAttachment = editingPastedPath
     ? attachments.find((attachment) => attachment.path === editingPastedPath && isPastedTextPath(attachment.path)) ?? null
