@@ -39,6 +39,7 @@ export const MANAGED_SD_SOURCE_COMMIT =
 const llamaBase = `https://github.com/ggml-org/llama.cpp/releases/download/${MANAGED_LLAMA_VERSION}`;
 const ttsBase = `https://github.com/ggml-org/llama.cpp/releases/download/${MANAGED_TTS_VERSION}`;
 const sdBase = `https://github.com/leejet/stable-diffusion.cpp/releases/download/${MANAGED_SD_VERSION}`;
+const sdReleasePage = `https://github.com/leejet/stable-diffusion.cpp/releases/tag/${MANAGED_SD_VERSION}`;
 
 export const MANAGED_LLAMA_ASSETS = Object.freeze({
   "aarch64-apple-darwin": {
@@ -139,9 +140,7 @@ for (const asset of Object.values(MANAGED_TTS_ASSETS)) {
   asset.url = `${ttsBase}/${asset.archive}`;
 }
 for (const asset of Object.values(MANAGED_SD_ASSETS)) {
-  if (asset.archive) asset.url = `${sdBase}/${asset.archive}`;
-  else
-    asset.url = `https://github.com/leejet/stable-diffusion.cpp/commit/${asset.sourceCommit}`;
+  asset.url = asset.archive ? `${sdBase}/${asset.archive}` : sdReleasePage;
 }
 
 export const MANAGED_RUNTIMES = Object.freeze({
@@ -181,13 +180,18 @@ export function managedRuntime(id) {
   return runtime;
 }
 
-/** Resolves the immutable provenance token stored in a runtime manifest. */
+/**
+ * The legacy manifest field is named archiveSha256. For source-built fallback
+ * targets there is no downloaded archive, so store a SHA-256 fingerprint of
+ * the exact Git commit identifier. The manifest itself is SHA-256 pinned into
+ * the Rust binary, and the staging path independently verifies HEAD == commit
+ * before compiling, so this remains immutable provenance without a schema
+ * migration for the other managed runtimes.
+ */
 export function managedRuntimeProvenance(asset) {
-  if (asset.archive && asset.sha256) {
-    return { archiveSha256: asset.sha256, sourceCommit: null };
-  }
+  if (asset.archive && asset.sha256) return asset.sha256;
   if (asset.sourceCommit) {
-    return { archiveSha256: null, sourceCommit: asset.sourceCommit };
+    return createHash("sha256").update(asset.sourceCommit).digest("hex");
   }
   throw new Error("Managed runtime asset has no archive digest or source commit");
 }
