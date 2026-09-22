@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // Stages one pinned managed runtime for the current release target. Official
 // archives are downloaded and SHA-256 verified. A runtime target may instead
-// opt into a pinned source build when upstream publishes no binary for that
-// architecture; the exact Git commit is checked before CMake is allowed to run.
-// The resulting self-contained tree is bundled as a Tauri resource.
+// opt into a pinned source build when upstream publishes no compatible binary
+// for that architecture; the exact Git commit is checked before CMake runs.
+// Linux x64 additionally bootstraps a pinned, verified Vulkan SDK because the
+// Ubuntu 22.04 compatibility baseline does not package the glslc revision this
+// stable-diffusion.cpp/ggml pin requires.
 //
 // Usage: node scripts/stage-managed-runtime.mjs [runtime-id]
 //   llama (default) — llama.cpp `llama-server`
@@ -42,6 +44,12 @@ import {
   serverFileName,
   stagedRuntimeDirectory,
 } from "./lib/managedRuntimeManifest.mjs";
+
+const VULKAN_SDK_VERSION = "1.4.341.1";
+const VULKAN_SDK_SHA256 =
+  "3bf0f762afb6c79bc6a9d9fb5998745ccff928800a29619b501ed9de7fd9789b";
+const VULKAN_SDK_ARCHIVE = `vulkansdk-linux-x86_64-${VULKAN_SDK_VERSION}.tar.xz`;
+const VULKAN_SDK_URL = `https://sdk.lunarg.com/sdk/download/${VULKAN_SDK_VERSION}/linux/${VULKAN_SDK_ARCHIVE}`;
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const runtime = managedRuntime(process.argv[2] ?? "llama");
@@ -135,23 +143,27 @@ function copyExecutable(source, destination) {
   if (!target.includes("windows")) chmodSync(destination, 0o755);
 }
 
-async function stageArchiveAsset() {
-  const archivePath = join(workRoot, basename(asset.archive));
-  console.log(`[stage-managed-runtime] downloading ${asset.url}`);
-  const response = await fetch(asset.url, { redirect: "follow" });
+async function downloadVerified(url, destination, expectedSha256, label) {
+  console.log(`[stage-managed-runtime] downloading ${label} from ${url}`);
+  const response = await fetch(url, { redirect: "follow" });
   if (!response.ok || !response.body) {
     throw new Error(
-      `Runtime download failed (${response.status} ${response.statusText})`,
+      `${label} download failed (${response.status} ${response.statusText})`,
     );
   }
   const bytes = Buffer.from(await response.arrayBuffer());
-  const actualArchiveSha = createHash("sha256").update(bytes).digest("hex");
-  if (actualArchiveSha !== asset.sha256) {
+  const actualSha256 = createHash("sha256").update(bytes).digest("hex");
+  if (actualSha256 !== expectedSha256) {
     throw new Error(
-      `Runtime archive checksum mismatch: expected ${asset.sha256}, got ${actualArchiveSha}`,
+      `${label} checksum mismatch: expected ${expectedSha256}, got ${actualSha256}`,
     );
   }
-  writeFileSync(archivePath, bytes);
+  writeFileSync(destination, bytes);
+}
+
+async function stageArchiveAsset() {
+  const archivePath = join(workRoot, basename(asset.archive));
+  await downloadVerified(asset.url, archivePath, asset.sha256, "runtime archive");
 
   // Windows and macOS ship bsdtar, which reads zip archives too. Linux uses
   // unzip for zip assets because GNU tar does not accept them.
@@ -202,7 +214,47 @@ async function stageArchiveAsset() {
   }
 }
 
-function stageSourceAsset() {
+async function sourceBuildEnvironment() {
+  const env = { ...process.env };
+  if (asset.backend !== "vulkan") return env;
+  if (target !== "x86_64-unknown-linux-gnu") {
+    throw new Error(`Pinned Vulkan source toolchain is not configured for ${target}`);
+  }
+
+  // The pinned ggml submodule uses CMake's Vulkan `glslc` component. Jammy's
+  // archive has libvulkan-dev but no glslc package, while building on Noble
+  // makes the final executable depend on GLIBC 2.38. Bootstrap a verified SDK
+  // instead so the binary is still compiled on the Ubuntu 22.04 ABI baseline.
+  const archivePath = join(workRoot, VULKAN_SDK_ARCHIVE);
+  await downloadVerified(
+    VULKAN_SDK_URL,
+    archivePath,
+    VULKAN_SDK_SHA256,
+    `Vulkan SDK ${VULKAN_SDK_VERSION}`,
+  );
+  const sdkExtractRoot = join(workRoot, "vulkan-sdk");
+  mkdirSync(sdkExtractRoot);
+  execFileSync("tar", ["-xf", archivePath, "-C", sdkExtractRoot], {
+    stdio: "inherit",
+  });
+  const sdkRoot = join(sdkExtractRoot, VULKAN_SDK_VERSION, "x86_64");
+  const glslc = join(sdkRoot, "bin", "glslc");
+  if (!existsSync(glslc)) {
+    throw new Error(`Verified Vulkan SDK did not contain ${glslc}`);
+  }
+
+  env.VULKAN_SDK = sdkRoot;
+  env.PATH = `${join(sdkRoot, "bin")}:${env.PATH ?? ""}`;
+  env.CMAKE_PREFIX_PATH = env.CMAKE_PREFIX_PATH
+    ? `${sdkRoot}:${env.CMAKE_PREFIX_PATH}`
+    : sdkRoot;
+  env.LD_LIBRARY_PATH = env.LD_LIBRARY_PATH
+    ? `${join(sdkRoot, "lib")}:${env.LD_LIBRARY_PATH}`
+    : join(sdkRoot, "lib");
+  return env;
+}
+
+async function stageSourceAsset() {
   if (runtime.id !== "sd") {
     throw new Error(
       `Pinned source builds are not implemented for managed runtime ${runtime.id}`,
@@ -241,6 +293,7 @@ function stageSourceAsset() {
     { stdio: "inherit" },
   );
 
+  const buildEnv = await sourceBuildEnvironment();
   execFileSync(
     "cmake",
     [
@@ -250,7 +303,7 @@ function stageSourceAsset() {
       buildRoot,
       ...managedRuntimeSourceCmakeArgs(asset),
     ],
-    { stdio: "inherit" },
+    { stdio: "inherit", env: buildEnv },
   );
   execFileSync(
     "cmake",
@@ -264,7 +317,7 @@ function stageSourceAsset() {
       "--parallel",
       process.env.CMAKE_BUILD_PARALLEL_LEVEL || "2",
     ],
-    { stdio: "inherit" },
+    { stdio: "inherit", env: buildEnv },
   );
 
   const serverCandidates = walkFiles(buildRoot).filter(
@@ -285,7 +338,7 @@ function stageSourceAsset() {
 
 try {
   if (asset.archive) await stageArchiveAsset();
-  else stageSourceAsset();
+  else await stageSourceAsset();
 
   const executableNames = new Set([
     serverName,
