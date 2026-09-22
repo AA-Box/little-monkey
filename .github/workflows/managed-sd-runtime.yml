@@ -1,0 +1,162 @@
+name: Managed SD runtime
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/managed-sd-runtime.yml"
+      - "scripts/stage-managed-runtime.mjs"
+      - "scripts/lib/managedRuntimeManifest.mjs"
+      - "scripts/lib/managedRuntimeManifest.test.mjs"
+      - "src-tauri/build.rs"
+      - "src-tauri/src/managed_runtime.rs"
+      - "src/lib/weightFileHints.ts"
+      - "src/lib/weightFileHints.test.ts"
+  push:
+    branches:
+      - develop
+    paths:
+      - ".github/workflows/managed-sd-runtime.yml"
+      - "scripts/stage-managed-runtime.mjs"
+      - "scripts/lib/managedRuntimeManifest.mjs"
+      - "scripts/lib/managedRuntimeManifest.test.mjs"
+      - "src-tauri/build.rs"
+      - "src-tauri/src/managed_runtime.rs"
+
+permissions:
+  contents: read
+
+jobs:
+  stage-runtime:
+    name: stage (${{ matrix.target }})
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            source_build: false
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            source_build: true
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            source_build: false
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            source_build: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            source_build: false
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            source_build: true
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install Linux source-build dependencies
+        if: matrix.source_build && startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git
+
+      - name: Validate managed-runtime metadata and staging syntax
+        shell: bash
+        run: |
+          node --check scripts/stage-managed-runtime.mjs
+          node --test scripts/lib/managedRuntimeManifest.test.mjs
+
+      - name: Stage managed SD runtime
+        env:
+          MANAGED_RUNTIME_TARGET: ${{ matrix.target }}
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
+        run: node scripts/stage-managed-runtime.mjs sd
+
+      - name: Verify staged manifest and binary
+        env:
+          MANAGED_RUNTIME_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, statSync } from "node:fs";
+          import { join } from "node:path";
+          import {
+            MANAGED_SD_VERSION,
+            managedRuntime,
+            serverFileName,
+            stagedRuntimeDirectory,
+          } from "./scripts/lib/managedRuntimeManifest.mjs";
+
+          const target = process.env.MANAGED_RUNTIME_TARGET;
+          const runtime = managedRuntime("sd");
+          const directory = join(
+            "src-tauri",
+            "resources",
+            "managed-runtime",
+            stagedRuntimeDirectory(runtime),
+          );
+          const manifest = JSON.parse(
+            readFileSync(join(directory, "runtime-manifest.json"), "utf8"),
+          );
+          const server = serverFileName(runtime, target);
+          if (manifest.version !== MANAGED_SD_VERSION) throw new Error("wrong runtime version");
+          if (manifest.target !== target) throw new Error("wrong runtime target");
+          if (!/^[0-9a-f]{64}$/.test(manifest.archiveSha256)) {
+            throw new Error("invalid runtime provenance digest");
+          }
+          const entry = manifest.files.find((file) => file.name === server);
+          if (!entry?.executable) throw new Error(`manifest does not carry executable ${server}`);
+          if (statSync(join(directory, server)).size <= 0) throw new Error(`${server} is empty`);
+          NODE
+
+      - name: Smoke-test native runtime executable
+        if: matrix.target != 'x86_64-apple-darwin'
+        env:
+          MANAGED_RUNTIME_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { spawnSync } from "node:child_process";
+          import { join, resolve } from "node:path";
+          import {
+            managedRuntime,
+            serverFileName,
+            stagedRuntimeDirectory,
+          } from "./scripts/lib/managedRuntimeManifest.mjs";
+
+          const target = process.env.MANAGED_RUNTIME_TARGET;
+          const runtime = managedRuntime("sd");
+          const binary = resolve(
+            join(
+              "src-tauri",
+              "resources",
+              "managed-runtime",
+              stagedRuntimeDirectory(runtime),
+              serverFileName(runtime, target),
+            ),
+          );
+          const result = spawnSync(binary, ["--help"], { encoding: "utf8" });
+          if (result.error) throw result.error;
+          if (result.status !== 0) {
+            throw new Error(`sd-server --help exited ${result.status}: ${result.stderr}`);
+          }
+          const output = `${result.stdout}\n${result.stderr}`;
+          if (!output.includes("--diffusion-model")) {
+            throw new Error("staged sd-server does not expose --diffusion-model");
+          }
+          NODE
+
+      - name: Verify Intel macOS source-build architecture
+        if: matrix.target == 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          file src-tauri/resources/managed-runtime/sd-master-883-137f740/sd-server | grep -E 'x86_64|x86-64'
