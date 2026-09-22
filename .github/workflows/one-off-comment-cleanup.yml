@@ -1,0 +1,69 @@
+name: One-off comment cleanup
+
+on:
+  push:
+    branches:
+      - fix/qwen-image-2-1-runtime-all-platforms
+    paths:
+      - ".github/workflows/one-off-comment-cleanup.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/qwen-image-2-1-runtime-all-platforms
+          fetch-depth: 0
+
+      - name: Correct release and dependency comments
+        shell: python
+        run: |
+          from pathlib import Path
+
+          replacements = {
+              "scripts/lib/managedRuntimeManifest.mjs": [(
+                  "// Latest published stable-diffusion.cpp release at integration time. It\n"
+                  "// includes the initial Qwen-Image 2.1 support plus the immediately-following\n"
+                  "// FP8, ggml metadata, VAE retry, reference-image, and mode-validation fixes.\n",
+                  "// Latest published stable-diffusion.cpp release at integration time. It is\n"
+                  "// deliberately pinned to a release rather than moving master; newer master-only\n"
+                  "// fixes are tracked separately and are not claimed as part of this runtime.\n",
+              )],
+              "src-tauri/src/managed_runtime.rs": [(
+                  "/// Pinned stable-diffusion.cpp release. `master-890-74988b2` is the latest\n"
+                  "/// published release qualified by this tree: it includes Qwen-Image 2.1 plus\n"
+                  "/// the immediate FP8, ggml metadata, VAE retry, reference-image, and generation-\n"
+                  "/// mode fixes that followed the initial support commit.\n",
+                  "/// Pinned stable-diffusion.cpp release. `master-890-74988b2` is the latest\n"
+                  "/// published release qualified by this tree. We deliberately pin a release\n"
+                  "/// rather than moving master; newer master-only fixes are tracked separately\n"
+                  "/// and are not claimed as part of this runtime.\n",
+              )],
+              "src-tauri/Cargo.toml": [(
+                  "# depends on 0.37 specifically.\n",
+                  "# depends on 0.40.2 specifically.\n",
+              )],
+          }
+
+          for path, edits in replacements.items():
+              p = Path(path)
+              text = p.read_text()
+              for old, new in edits:
+                  if old not in text:
+                      raise SystemExit(f"expected text not found in {path}: {old!r}")
+                  text = text.replace(old, new)
+              p.write_text(text)
+
+      - name: Commit comment corrections
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scripts/lib/managedRuntimeManifest.mjs src-tauri/src/managed_runtime.rs src-tauri/Cargo.toml
+          git diff --cached --check
+          git commit -m "docs(runtime): describe released SD pin accurately"
+          git push origin HEAD:fix/qwen-image-2-1-runtime-all-platforms
