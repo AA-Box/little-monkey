@@ -109,3 +109,12 @@ test("Linux x64 is built with Vulkan on the Ubuntu 22.04 compatibility baseline"
   assert.equal(asset.backend, "vulkan");
   assert.ok(managedRuntimeSourceCmakeArgs(asset).includes("-DSD_VULKAN=ON"));
 });
+
+test("Windows ARM uses clang-cl because pinned ggml rejects MSVC on ARM", () => {
+  const args = managedRuntimeSourceCmakeArgs(
+    MANAGED_SD_ASSETS["aarch64-pc-windows-msvc"],
+  );
+  const toolsetIndex = args.indexOf("-T");
+  assert.notEqual(toolsetIndex, -1);
+  assert.equal(args[toolsetIndex + 1], "ClangCL");
+});
