@@ -55,14 +55,14 @@ export const MANAGED_LLAMA_ASSETS = Object.freeze({
   },
   "x86_64-unknown-linux-gnu": {
     archive: `llama-${MANAGED_LLAMA_VERSION}-bin-ubuntu-x64.tar.gz`,
-    sha256: "a50ee14f021a9d8e92e30f622f7e3be1318eea5c13c08b693f539e100bf6d3a4",
+    sha256: "a50ee14f021a9d8e92e30f622f7e3be1318ee1125bb9a9ba8d2025388df48743",
   },
   "aarch64-pc-windows-msvc": {
     archive: `llama-${MANAGED_LLAMA_VERSION}-bin-win-cpu-arm64.zip`,
     sha256: "db1d3f4c13c08b693f539e100bf6d3a435148b0ffc186b044fdd65d490cc6df7",
   },
   "x86_64-pc-windows-msvc": {
-    archive: `llama-${MANAGED_LLAMA_VERSION}-bin-win-cpu-x64.zip`,
+    archive: `llama-${MANAGED_LLAMA_VERSION}-bin-win-cpu-x64.tar.gz`,
     sha256: "f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e",
   },
 });
@@ -89,10 +89,10 @@ export const MANAGED_TTS_ASSETS = Object.freeze({
   },
   "aarch64-pc-windows-msvc": {
     archive: `llama-${MANAGED_TTS_VERSION}-bin-win-cpu-arm64.zip`,
-    sha256: "21a8e0e4177fae0a15375bef580781edc6488940660126265bbecb5a79e28208c",
+    sha256: "21a8e0e4177fa1833052e7de4e82d8fd326acb5731ed236441c77afc2174be05",
   },
   "x86_64-pc-windows-msvc": {
-    archive: `llama-${MANAGED_TTS_VERSION}-bin-win-cpu-x64.zip`,
+    archive: `llama-${MANAGED_TTS_VERSION}-bin-win-cpu-x64.tar.gz`,
     sha256: "2f7cde0ed9e76ccac9f095ede8c6469dc8690cbdd04d9e0a60179d8ff14b8cfa",
   },
 });
@@ -209,7 +209,7 @@ export function managedRuntimeSourceCmakeArgs(asset) {
   return [...args, ...(asset.cmakeArgs ?? [])];
 }
 
-/** Resolves a runtime by id, failing loudly on an unknown one. */
+/** Directory name used for a staged runtime resource. */
 export function stagedRuntimeDirectory(runtime) {
   return `${runtime.id}-${runtime.version}`;
 }
