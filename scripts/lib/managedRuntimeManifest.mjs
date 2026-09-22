@@ -126,7 +126,9 @@ export const MANAGED_SD_ASSETS = Object.freeze({
   "aarch64-pc-windows-msvc": {
     sourceCommit: MANAGED_SD_SOURCE_COMMIT,
     backend: "cpu",
-    cmakeArgs: [],
+    // Pinned ggml rejects the MSVC frontend on ARM. The native Windows ARM64
+    // runner ships clang-cl through the Visual Studio ClangCL toolset.
+    cmakeArgs: ["-T", "ClangCL"],
   },
   "x86_64-pc-windows-msvc": {
     archive: "sd-master-137f740-bin-win-vulkan-x64.zip",
