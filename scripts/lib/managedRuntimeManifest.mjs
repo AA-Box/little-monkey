@@ -1,7 +1,7 @@
 // Pinned native runtimes used by Little Monkey's release builds. Official
 // upstream archives are preferred when stable-diffusion.cpp publishes one for
-// the target. Targets without an upstream archive are built from the exact
-// pinned upstream commit by stage-managed-runtime.mjs, so Studio remains
+// the target. Targets without a compatible upstream archive are built from the
+// exact pinned upstream commit by stage-managed-runtime.mjs, so Studio remains
 // available on every desktop architecture Little Monkey ships.
 //
 // Three runtimes ship on these rails:
@@ -98,11 +98,11 @@ export const MANAGED_TTS_ASSETS = Object.freeze({
   },
 });
 
-// Upstream publishes accelerated Qwen-Image-2.1-capable binaries for these
-// three hosts. The other three targets are source-built from the exact same
-// commit as CPU baselines. A CPU fallback is deliberate: platform availability
-// is the contract; acceleration is an optimization and must never decide
-// whether Studio exists.
+// Upstream publishes accelerated Qwen-Image-2.1-capable binaries for Apple
+// silicon and Windows x64. Linux x64 is intentionally source-built on Little
+// Monkey's Ubuntu 22.04 release baseline: the upstream Ubuntu 24.04 archive
+// requires GLIBC 2.38 / GLIBCXX 3.4.32 and would not launch on supported older
+// distributions. The remaining unpublished architectures use CPU baselines.
 export const MANAGED_SD_ASSETS = Object.freeze({
   "aarch64-apple-darwin": {
     archive: "sd-master-137f740-bin-Darwin-macOS-26.6.2-arm64.zip",
@@ -119,8 +119,9 @@ export const MANAGED_SD_ASSETS = Object.freeze({
     cmakeArgs: [],
   },
   "x86_64-unknown-linux-gnu": {
-    archive: "sd-master-137f740-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip",
-    sha256: "4b65cfa5e7d4ced8fe43185b314bcba994413655e6273c78aeaaaaeab2ecec0f",
+    sourceCommit: MANAGED_SD_SOURCE_COMMIT,
+    backend: "vulkan",
+    cmakeArgs: [],
   },
   "aarch64-pc-windows-msvc": {
     sourceCommit: MANAGED_SD_SOURCE_COMMIT,
