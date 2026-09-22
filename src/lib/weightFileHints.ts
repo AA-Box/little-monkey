@@ -66,6 +66,13 @@ const SLOT_HINTS: [RegExp, ComponentSlot][] = [
   [/(^|[^a-z])vae([^a-z]|$)/i, "vae"],
   [/high[._-]?noise/i, "high_noise_diffusion_model"],
   [/qwen.*vl|(^|[^a-z])llm([^a-z]|$)|mistral|text[._\-/]?encoder/i, "llm"],
+  // Qwen-Image 2.1's official and community GGUF diffusion files are named
+  // `qwen_image_2.1-Q4_K.gguf` / `qwen-image-2.1-Q8_0.gguf`; unlike most
+  // component releases they do not include `diffusion_model` or `transformer`
+  // in the filename. Without this evidence-based hint the fresh row's
+  // `checkpoint` default sends them to `--model`, where sd.cpp reports the
+  // misleading "get sd version from file failed" error.
+  [/qwen[._-]?image(?:[._-]?\d+(?:\.\d+)*)?/i, "diffusion_model"],
   [/unet|diffusion[._\-/]?model|transformer/i, "diffusion_model"],
 ];
 
