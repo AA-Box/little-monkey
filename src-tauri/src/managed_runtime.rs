@@ -33,10 +33,11 @@ pub const MANAGED_LLAMA_VERSION: &str = "b9637";
 /// `unknown model architecture: 'qwen3tts'`. Two pins keep speech from
 /// re-qualifying every chat and embedding path.
 pub const MANAGED_TTS_VERSION: &str = "b10278";
-/// Pinned stable-diffusion.cpp release. Upstream tags releases as
-/// `master-<build>-<commit>`; the whole tag is the version so the staged
-/// directory name is unambiguous across rebuilds of the same commit.
-pub const MANAGED_SD_VERSION: &str = "master-812-ea7f0c8";
+/// Pinned stable-diffusion.cpp release. `master-883-137f740` is the first
+/// upstream release with Qwen-Image 2.1 support. Upstream publishes accelerated
+/// archives for three targets; the release staging path builds the same pinned
+/// commit as a portable CPU runtime for the remaining desktop architectures.
+pub const MANAGED_SD_VERSION: &str = "master-883-137f740";
 const MANIFEST_FILE: &str = "runtime-manifest.json";
 const MAX_RUNTIME_FILES: usize = 256;
 const MAX_RUNTIME_FILE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -134,10 +135,10 @@ pub const LLAMA_TTS: ManagedRuntimeSpec = ManagedRuntimeSpec {
     trusted_manifest_sha256: TRUSTED_TTS_MANIFEST_SHA256,
 };
 
-/// stable-diffusion.cpp — image and video generation. Upstream publishes
-/// prebuilt binaries for three hosts only (Metal on Apple silicon, Vulkan on
-/// x86_64 Windows and Linux), so the other targets get no managed runtime and
-/// the Studio surface stays unavailable there rather than failing at launch.
+/// stable-diffusion.cpp — image and video generation. Every desktop release
+/// target has a managed runtime: upstream Metal/Vulkan archives where they are
+/// published and pinned CPU source builds for Intel macOS, Linux arm64, and
+/// Windows arm64.
 pub const STABLE_DIFFUSION: ManagedRuntimeSpec = ManagedRuntimeSpec {
     id: "sd",
     manifest_runtime: "stable-diffusion.cpp",
@@ -146,7 +147,10 @@ pub const STABLE_DIFFUSION: ManagedRuntimeSpec = ManagedRuntimeSpec {
     override_env: "LITTLE_MONKEY_SD_RUNTIME",
     supported_targets: &[
         "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
         "x86_64-unknown-linux-gnu",
+        "aarch64-pc-windows-msvc",
         "x86_64-pc-windows-msvc",
     ],
     executable_unix: "sd-server",
@@ -955,21 +959,14 @@ mod tests {
         assert!(expected_runtime_target(&LLAMA).is_some());
     }
 
-    /// stable-diffusion.cpp publishes fewer prebuilt targets than llama.cpp.
-    /// A host outside that set must report "unsupported" rather than silently
-    /// accepting a tree built for a different triple.
+    /// stable-diffusion.cpp must now cover every desktop target the app ships.
+    /// The release pipeline can choose acceleration per target, but availability
+    /// must not be a subset of the llama runtime matrix anymore.
     #[test]
-    fn stable_diffusion_targets_are_a_subset_of_llama_targets() {
-        for target in STABLE_DIFFUSION.supported_targets {
-            assert!(LLAMA.supported_targets.contains(target), "{target}");
-        }
+    fn stable_diffusion_targets_match_llama_targets() {
+        assert_eq!(STABLE_DIFFUSION.supported_targets, LLAMA.supported_targets);
         assert!(runtime_supported_here(&LLAMA));
-        assert_eq!(
-            runtime_supported_here(&STABLE_DIFFUSION),
-            STABLE_DIFFUSION
-                .supported_targets
-                .contains(&host_target().unwrap())
-        );
+        assert!(runtime_supported_here(&STABLE_DIFFUSION));
     }
 
     /// The two runtimes must never share a directory, a staged resource name,
