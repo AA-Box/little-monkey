@@ -41,7 +41,7 @@ jobs:
             source_build: true
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            source_build: false
+            source_build: true
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             source_build: true
@@ -67,7 +67,7 @@ jobs:
         if: matrix.source_build && startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake git
+          sudo apt-get install -y build-essential cmake git libvulkan-dev glslc spirv-headers
 
       - name: Validate managed-runtime metadata and staging syntax
         shell: bash
