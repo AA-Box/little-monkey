@@ -50,6 +50,7 @@ const VULKAN_SDK_SHA256 =
   "3bf0f762afb6c79bc6a9d9fb5998745ccff928800a29619b501ed9de7fd9789b";
 const VULKAN_SDK_ARCHIVE = `vulkansdk-linux-x86_64-${VULKAN_SDK_VERSION}.tar.xz`;
 const VULKAN_SDK_URL = `https://sdk.lunarg.com/sdk/download/${VULKAN_SDK_VERSION}/linux/${VULKAN_SDK_ARCHIVE}`;
+const MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024;
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const runtime = managedRuntime(process.argv[2] ?? "llama");
@@ -143,27 +144,47 @@ function copyExecutable(source, destination) {
   if (!target.includes("windows")) chmodSync(destination, 0o755);
 }
 
-async function downloadVerified(url, destination, expectedSha256, label) {
+function downloadVerified(url, destination, expectedSha256, label) {
   console.log(`[stage-managed-runtime] downloading ${label} from ${url}`);
-  const response = await fetch(url, { redirect: "follow" });
-  if (!response.ok || !response.body) {
-    throw new Error(
-      `${label} download failed (${response.status} ${response.statusText})`,
+  rmSync(destination, { force: true });
+  try {
+    // Keep network bytes out of Node's file-write path: curl writes only into
+    // this process-owned temporary directory, then the file is authenticated
+    // before any extractor or build tool is allowed to consume it. execFileSync
+    // does not invoke a shell, so the pinned URL and destination stay inert.
+    execFileSync(
+      "curl",
+      [
+        "--fail",
+        "--location",
+        "--silent",
+        "--show-error",
+        "--proto",
+        "=https",
+        "--tlsv1.2",
+        "--max-filesize",
+        String(MAX_DOWNLOAD_BYTES),
+        "--output",
+        destination,
+        url,
+      ],
+      { stdio: "inherit" },
     );
+    const actualSha256 = sha256File(destination);
+    if (actualSha256 !== expectedSha256) {
+      throw new Error(
+        `${label} checksum mismatch: expected ${expectedSha256}, got ${actualSha256}`,
+      );
+    }
+  } catch (error) {
+    rmSync(destination, { force: true });
+    throw error;
   }
-  const bytes = Buffer.from(await response.arrayBuffer());
-  const actualSha256 = createHash("sha256").update(bytes).digest("hex");
-  if (actualSha256 !== expectedSha256) {
-    throw new Error(
-      `${label} checksum mismatch: expected ${expectedSha256}, got ${actualSha256}`,
-    );
-  }
-  writeFileSync(destination, bytes);
 }
 
 async function stageArchiveAsset() {
   const archivePath = join(workRoot, basename(asset.archive));
-  await downloadVerified(asset.url, archivePath, asset.sha256, "runtime archive");
+  downloadVerified(asset.url, archivePath, asset.sha256, "runtime archive");
 
   // Windows and macOS ship bsdtar, which reads zip archives too. Linux uses
   // unzip for zip assets because GNU tar does not accept them.
@@ -226,7 +247,7 @@ async function sourceBuildEnvironment() {
   // makes the final executable depend on GLIBC 2.38. Bootstrap a verified SDK
   // instead so the binary is still compiled on the Ubuntu 22.04 ABI baseline.
   const archivePath = join(workRoot, VULKAN_SDK_ARCHIVE);
-  await downloadVerified(
+  downloadVerified(
     VULKAN_SDK_URL,
     archivePath,
     VULKAN_SDK_SHA256,
