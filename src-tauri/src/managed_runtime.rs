@@ -34,9 +34,9 @@ pub const MANAGED_LLAMA_VERSION: &str = "b9637";
 /// re-qualifying every chat and embedding path.
 pub const MANAGED_TTS_VERSION: &str = "b10278";
 /// Pinned stable-diffusion.cpp release. `master-890-74988b2` is the latest
-/// published release qualified by this tree: it includes Qwen-Image 2.1 plus
-/// the immediate FP8, ggml metadata, VAE retry, reference-image, and generation-
-/// mode fixes that followed the initial support commit.
+/// published release qualified by this tree. We deliberately pin a release
+/// rather than moving master; newer master-only fixes are tracked separately
+/// and are not claimed as part of this runtime.
 pub const MANAGED_SD_VERSION: &str = "master-890-74988b2";
 const MANIFEST_FILE: &str = "runtime-manifest.json";
 const MAX_RUNTIME_FILES: usize = 256;

@@ -31,9 +31,9 @@ export const MANIFEST_FILE = "runtime-manifest.json";
 
 export const MANAGED_LLAMA_VERSION = "b9637";
 export const MANAGED_TTS_VERSION = "b10278";
-// Latest published stable-diffusion.cpp release at integration time. It
-// includes the initial Qwen-Image 2.1 support plus the immediately-following
-// FP8, ggml metadata, VAE retry, reference-image, and mode-validation fixes.
+// Latest published stable-diffusion.cpp release at integration time. It is
+// deliberately pinned to a release rather than moving master; newer master-only
+// fixes are tracked separately and are not claimed as part of this runtime.
 export const MANAGED_SD_VERSION = "master-890-74988b2";
 export const MANAGED_SD_SOURCE_COMMIT =
   "74988b290e40155fe2313914e44b979b750e958b";

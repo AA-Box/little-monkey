@@ -299,7 +299,7 @@ system-memory = "0.1.7"
 # be the same. Bumping this without upstream bumping theirs fails at
 # resolution, loudly, which is the failure mode we want. When
 # `matrix-sdk-sqlite` moves to a newer rusqlite, move with it — nothing here
-# depends on 0.37 specifically.
+# depends on 0.40.2 specifically.
 rusqlite = { version = "0.40.2", features = ["bundled", "backup", "limits"] }
 # terminal.rs: one cross-platform pseudoterminal implementation for the
 # in-app terminal. The frontend intentionally stays a thin line-oriented
