@@ -67,7 +67,7 @@ jobs:
         if: matrix.source_build && startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake git libvulkan-dev glslc spirv-headers
+          sudo apt-get install -y build-essential cmake git
 
       - name: Validate managed-runtime metadata and staging syntax
         shell: bash
