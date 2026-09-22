@@ -71,8 +71,8 @@ jobs:
           )
           replace(
               "src-tauri/Cargo.toml",
-              'matrix-sdk = { version = "0.18", default-features = false, features = ["sqlite"] }',
-              'matrix-sdk = { version = "0.19.1", default-features = false, features = ["sqlite"] }',
+              'matrix-sdk = { version = "0.18", default-features = false, features = [\n    "e2e-encryption",\n    "sqlite",\n    "testing",\n] }',
+              'matrix-sdk = { version = "0.19.1", default-features = false, features = [\n    "e2e-encryption",\n    "sqlite",\n    "testing",\n] }',
           )
           replace(
               "src-tauri/Cargo.toml",
