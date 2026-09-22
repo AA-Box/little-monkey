@@ -40,11 +40,6 @@ jobs:
               '"sd-master-890-74988b2"',
           )
           replace(
-              ".github/workflows/managed-sd-runtime.yml",
-              "sd-master-883-137f740",
-              "sd-master-890-74988b2",
-          )
-          replace(
               "src-tauri/src/managed_runtime.rs",
               '/// Pinned stable-diffusion.cpp release. `master-883-137f740` is the first\n/// upstream release with Qwen-Image 2.1 support. Upstream publishes accelerated\n/// archives for three targets; the release staging path builds the same pinned\n/// commit as a portable CPU runtime for the remaining desktop architectures.\npub const MANAGED_SD_VERSION: &str = "master-883-137f740";',
               '/// Pinned stable-diffusion.cpp release. `master-890-74988b2` is the latest\n/// published release qualified by this tree: it includes Qwen-Image 2.1 plus\n/// the immediate FP8, ggml metadata, VAE retry, reference-image, and generation-\n/// mode fixes that followed the initial support commit.\npub const MANAGED_SD_VERSION: &str = "master-890-74988b2";',
@@ -80,9 +75,9 @@ jobs:
               'matrix-sdk-test = "0.19.1"',
           )
 
-      - name: Resolve the patched dependency graph
+      - name: Resolve only the Matrix dependency migration
         working-directory: src-tauri
-        run: cargo update
+        run: cargo update -p matrix-sdk@0.18.0 --precise 0.19.1
 
       - name: Prove vulnerable sized chunks are gone
         working-directory: src-tauri
@@ -90,6 +85,7 @@ jobs:
         run: |
           grep -A3 'name = "matrix-sdk"' Cargo.lock | head -4
           grep -A3 'name = "matrix-sdk-test"' Cargo.lock | head -4
+          grep -A3 'name = "rusqlite"' Cargo.lock | head -4
           grep -A3 'name = "imbl"' Cargo.lock | head -4
           grep -A3 'name = "imbl-sized-chunks"' Cargo.lock | head -4
           if grep -A3 'name = "imbl-sized-chunks"' Cargo.lock | grep -q 'version = "0.1.3"'; then
@@ -102,7 +98,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/build.rs src-tauri/src/managed_runtime.rs .github/workflows/managed-sd-runtime.yml
+          git add src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/build.rs src-tauri/src/managed_runtime.rs
           git diff --cached --check
+          git diff --cached --stat
           git commit -m "fix(deps): remove vulnerable imbl-sized-chunks chain"
           git push origin HEAD:fix/qwen-image-2-1-runtime-all-platforms
