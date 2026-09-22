@@ -33,11 +33,11 @@ pub const MANAGED_LLAMA_VERSION: &str = "b9637";
 /// `unknown model architecture: 'qwen3tts'`. Two pins keep speech from
 /// re-qualifying every chat and embedding path.
 pub const MANAGED_TTS_VERSION: &str = "b10278";
-/// Pinned stable-diffusion.cpp release. `master-883-137f740` is the first
-/// upstream release with Qwen-Image 2.1 support. Upstream publishes accelerated
-/// archives for three targets; the release staging path builds the same pinned
-/// commit as a portable CPU runtime for the remaining desktop architectures.
-pub const MANAGED_SD_VERSION: &str = "master-883-137f740";
+/// Pinned stable-diffusion.cpp release. `master-890-74988b2` is the latest
+/// published release qualified by this tree: it includes Qwen-Image 2.1 plus
+/// the immediate FP8, ggml metadata, VAE retry, reference-image, and generation-
+/// mode fixes that followed the initial support commit.
+pub const MANAGED_SD_VERSION: &str = "master-890-74988b2";
 const MANIFEST_FILE: &str = "runtime-manifest.json";
 const MAX_RUNTIME_FILES: usize = 256;
 const MAX_RUNTIME_FILE_BYTES: u64 = 1024 * 1024 * 1024;
