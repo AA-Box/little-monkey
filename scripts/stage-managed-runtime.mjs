@@ -57,7 +57,7 @@ if (!asset) {
   );
 }
 
-const provenance = managedRuntimeProvenance(asset);
+const provenanceSha256 = managedRuntimeProvenance(asset);
 const serverName = serverFileName(runtime, target);
 const stageRoot = join(
   repoRoot,
@@ -87,19 +87,6 @@ function walkFiles(directory) {
   return candidates;
 }
 
-function manifestProvenanceMatches(manifest) {
-  if (provenance.archiveSha256) {
-    return (
-      manifest.archiveSha256 === provenance.archiveSha256 &&
-      manifest.sourceCommit == null
-    );
-  }
-  return (
-    manifest.sourceCommit === provenance.sourceCommit &&
-    manifest.archiveSha256 == null
-  );
-}
-
 function cachedStageIsCurrent() {
   if (!existsSync(stagedBinary) || !existsSync(stagedManifest)) return false;
   try {
@@ -110,7 +97,7 @@ function cachedStageIsCurrent() {
       manifest.version !== runtime.version ||
       manifest.target !== target ||
       manifest.sourceUrl !== asset.url ||
-      !manifestProvenanceMatches(manifest)
+      manifest.archiveSha256 !== provenanceSha256
     ) {
       return false;
     }
@@ -316,20 +303,21 @@ try {
       executable: executableNames.has(name),
     }));
 
-  const manifest = {
-    schemaVersion: 1,
-    runtime: runtime.manifestRuntime,
-    version: runtime.version,
-    target,
-    sourceUrl: asset.url,
-    ...(provenance.archiveSha256
-      ? { archiveSha256: provenance.archiveSha256 }
-      : { sourceCommit: provenance.sourceCommit }),
-    files,
-  };
   writeFileSync(
     join(publishRoot, "runtime-manifest.json"),
-    `${JSON.stringify(manifest, null, 2)}\n`,
+    `${JSON.stringify(
+      {
+        schemaVersion: 1,
+        runtime: runtime.manifestRuntime,
+        version: runtime.version,
+        target,
+        sourceUrl: asset.url,
+        archiveSha256: provenanceSha256,
+        files,
+      },
+      null,
+      2,
+    )}\n`,
   );
 
   rmSync(stageRoot, { recursive: true, force: true });
