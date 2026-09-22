@@ -159,4 +159,4 @@ jobs:
         if: matrix.target == 'x86_64-apple-darwin'
         shell: bash
         run: |
-          file src-tauri/resources/managed-runtime/sd-master-883-137f740/sd-server | grep -E 'x86_64|x86-64'
+          file src-tauri/resources/managed-runtime/sd-master-890-74988b2/sd-server | grep -E 'x86_64|x86-64'
