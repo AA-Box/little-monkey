@@ -31,10 +31,12 @@ export const MANIFEST_FILE = "runtime-manifest.json";
 
 export const MANAGED_LLAMA_VERSION = "b9637";
 export const MANAGED_TTS_VERSION = "b10278";
-// First upstream stable-diffusion.cpp release with Qwen-Image 2.1 support.
-export const MANAGED_SD_VERSION = "master-883-137f740";
+// Latest published stable-diffusion.cpp release at integration time. It
+// includes the initial Qwen-Image 2.1 support plus the immediately-following
+// FP8, ggml metadata, VAE retry, reference-image, and mode-validation fixes.
+export const MANAGED_SD_VERSION = "master-890-74988b2";
 export const MANAGED_SD_SOURCE_COMMIT =
-  "137f7409bbfb98c70a350a57d6a135487080db96";
+  "74988b290e40155fe2313914e44b979b750e958b";
 
 const llamaBase = `https://github.com/ggml-org/llama.cpp/releases/download/${MANAGED_LLAMA_VERSION}`;
 const ttsBase = `https://github.com/ggml-org/llama.cpp/releases/download/${MANAGED_TTS_VERSION}`;
@@ -101,12 +103,12 @@ export const MANAGED_TTS_ASSETS = Object.freeze({
 // Upstream publishes accelerated Qwen-Image-2.1-capable binaries for Apple
 // silicon and Windows x64. Linux x64 is intentionally source-built on Little
 // Monkey's Ubuntu 22.04 release baseline: the upstream Ubuntu 24.04 archive
-// requires GLIBC 2.38 / GLIBCXX 3.4.32 and would not launch on supported older
-// distributions. The remaining unpublished architectures use CPU baselines.
+// requires newer GLIBC / libstdc++ symbols than that compatibility floor. The
+// remaining unpublished architectures use CPU baselines.
 export const MANAGED_SD_ASSETS = Object.freeze({
   "aarch64-apple-darwin": {
-    archive: "sd-master-137f740-bin-Darwin-macOS-26.6.2-arm64.zip",
-    sha256: "d850bc4eaa0a2254f0a44b10e1ce1ebf6b7dd866c3ea48a3a73246d49173212f",
+    archive: "sd-master-74988b2-bin-Darwin-macOS-26.6.2-arm64.zip",
+    sha256: "fbffe2165d2e34098a673a3398286880d7dc1cdf2625e87ebb8b6235aac51553",
   },
   "x86_64-apple-darwin": {
     sourceCommit: MANAGED_SD_SOURCE_COMMIT,
@@ -131,8 +133,8 @@ export const MANAGED_SD_ASSETS = Object.freeze({
     cmakeArgs: ["-T", "ClangCL"],
   },
   "x86_64-pc-windows-msvc": {
-    archive: "sd-master-137f740-bin-win-vulkan-x64.zip",
-    sha256: "c76b8427d4dd4946f1f2e088512835550f7c6a17565cf2064ca7b656a6d7f7a6",
+    archive: "sd-master-74988b2-bin-win-vulkan-x64.zip",
+    sha256: "744c8f817c66ecfd02fbb9dc8b122e1f29f7240db1f6086dfde2669403c5d896",
   },
 });
 
