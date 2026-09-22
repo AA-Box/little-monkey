@@ -19,7 +19,14 @@ const RELEASE_TARGETS = [
   "x86_64-pc-windows-msvc",
 ];
 
-const SOURCE_FALLBACK_TARGETS = [
+const SOURCE_BUILD_TARGETS = [
+  "x86_64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-pc-windows-msvc",
+];
+
+const CPU_FALLBACK_TARGETS = [
   "x86_64-apple-darwin",
   "aarch64-unknown-linux-gnu",
   "aarch64-pc-windows-msvc",
@@ -27,7 +34,6 @@ const SOURCE_FALLBACK_TARGETS = [
 
 const UPSTREAM_ARCHIVE_TARGETS = [
   "aarch64-apple-darwin",
-  "x86_64-unknown-linux-gnu",
   "x86_64-pc-windows-msvc",
 ];
 
@@ -54,7 +60,7 @@ test("stable-diffusion runtime is pinned to the Qwen Image 2.1 release", () => {
   }
 });
 
-test("published targets use verified upstream accelerated archives", () => {
+test("compatible published targets use verified upstream accelerated archives", () => {
   for (const target of UPSTREAM_ARCHIVE_TARGETS) {
     const asset = MANAGED_SD_ASSETS[target];
     assert.equal(typeof asset.archive, "string", target);
@@ -64,12 +70,11 @@ test("published targets use verified upstream accelerated archives", () => {
   }
 });
 
-test("missing upstream architectures use pinned portable CPU builds", () => {
-  for (const target of SOURCE_FALLBACK_TARGETS) {
+test("source-built targets are tied to the exact upstream commit", () => {
+  for (const target of SOURCE_BUILD_TARGETS) {
     const asset = MANAGED_SD_ASSETS[target];
     assert.equal(asset.archive, undefined, target);
     assert.equal(asset.sourceCommit, MANAGED_SD_SOURCE_COMMIT, target);
-    assert.equal(asset.backend, "cpu", target);
     assert.match(asset.url, /releases\/tag\/master-883-137f740$/, target);
 
     const args = managedRuntimeSourceCmakeArgs(asset);
@@ -79,6 +84,14 @@ test("missing upstream architectures use pinned portable CPU builds", () => {
     assert.ok(args.includes("-DSD_WEBP=OFF"), target);
     assert.ok(args.includes("-DSD_WEBM=OFF"), target);
     assert.ok(args.includes("-DSD_SERVER_BUILD_FRONTEND=OFF"), target);
+  }
+});
+
+test("unpublished architectures use portable CPU builds", () => {
+  for (const target of CPU_FALLBACK_TARGETS) {
+    const asset = MANAGED_SD_ASSETS[target];
+    assert.equal(asset.backend, "cpu", target);
+    const args = managedRuntimeSourceCmakeArgs(asset);
     assert.ok(!args.includes("-DSD_METAL=ON"), target);
     assert.ok(!args.includes("-DSD_VULKAN=ON"), target);
   }
@@ -88,4 +101,11 @@ test("missing upstream architectures use pinned portable CPU builds", () => {
       "-DCMAKE_OSX_ARCHITECTURES=x86_64",
     ),
   );
+});
+
+test("Linux x64 is built with Vulkan on the Ubuntu 22.04 compatibility baseline", () => {
+  const asset = MANAGED_SD_ASSETS["x86_64-unknown-linux-gnu"];
+  assert.equal(asset.archive, undefined);
+  assert.equal(asset.backend, "vulkan");
+  assert.ok(managedRuntimeSourceCmakeArgs(asset).includes("-DSD_VULKAN=ON"));
 });
