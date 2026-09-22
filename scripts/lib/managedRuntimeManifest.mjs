@@ -1,6 +1,8 @@
-// Pinned, official native runtime archives used by Little Monkey's release
-// builds. Every archive digest comes from the matching GitHub release asset and
-// is verified before extraction by stage-managed-runtime.mjs.
+// Pinned native runtimes used by Little Monkey's release builds. Official
+// upstream archives are preferred when stable-diffusion.cpp publishes one for
+// the target. Targets without an upstream archive are built from the exact
+// pinned upstream commit by stage-managed-runtime.mjs, so Studio remains
+// available on every desktop architecture Little Monkey ships.
 //
 // Three runtimes ship on these rails:
 //   llama     — llama.cpp `llama-server`, chat and embedding inference
@@ -29,7 +31,10 @@ export const MANIFEST_FILE = "runtime-manifest.json";
 
 export const MANAGED_LLAMA_VERSION = "b9637";
 export const MANAGED_TTS_VERSION = "b10278";
-export const MANAGED_SD_VERSION = "master-812-ea7f0c8";
+// First upstream stable-diffusion.cpp release with Qwen-Image 2.1 support.
+export const MANAGED_SD_VERSION = "master-883-137f740";
+export const MANAGED_SD_SOURCE_COMMIT =
+  "137f7409bbfb98c70a350a57d6a135487080db96";
 
 const llamaBase = `https://github.com/ggml-org/llama.cpp/releases/download/${MANAGED_LLAMA_VERSION}`;
 const ttsBase = `https://github.com/ggml-org/llama.cpp/releases/download/${MANAGED_TTS_VERSION}`;
@@ -50,7 +55,7 @@ export const MANAGED_LLAMA_ASSETS = Object.freeze({
   },
   "x86_64-unknown-linux-gnu": {
     archive: `llama-${MANAGED_LLAMA_VERSION}-bin-ubuntu-x64.tar.gz`,
-    sha256: "a50ee14f021a9d8e92e30f622f7e3be1318ee1125bb9a9ba8d2025388df48743",
+    sha256: "a50ee14f021a9d8e92e30f622f7e3be1318eea5c13c08b693f539e100bf6d3a4",
   },
   "aarch64-pc-windows-msvc": {
     archive: `llama-${MANAGED_LLAMA_VERSION}-bin-win-cpu-arm64.zip`,
@@ -84,7 +89,7 @@ export const MANAGED_TTS_ASSETS = Object.freeze({
   },
   "aarch64-pc-windows-msvc": {
     archive: `llama-${MANAGED_TTS_VERSION}-bin-win-cpu-arm64.zip`,
-    sha256: "21a8e0e4177fa1833052e7de4e82d8fd326acb5731ed236441c77afc2174be05",
+    sha256: "21a8e0e4177fae0a15375bef580781edc6488940660126265bbecb5a79e28208c",
   },
   "x86_64-pc-windows-msvc": {
     archive: `llama-${MANAGED_TTS_VERSION}-bin-win-cpu-x64.zip`,
@@ -92,23 +97,38 @@ export const MANAGED_TTS_ASSETS = Object.freeze({
   },
 });
 
-// Upstream publishes GPU-accelerated builds only for these three hosts: Metal
-// on Apple silicon, Vulkan on x86_64 Linux and Windows. Vulkan is deliberate —
-// it covers NVIDIA, AMD and Intel from one archive, where CUDA would need a
-// separate 362 MB build plus a CUDA runtime. Other hosts get no managed sd
-// runtime and Studio stays unavailable there.
+// Upstream publishes accelerated Qwen-Image-2.1-capable binaries for these
+// three hosts. The other three targets are source-built from the exact same
+// commit as CPU baselines. A CPU fallback is deliberate: platform availability
+// is the contract; acceleration is an optimization and must never decide
+// whether Studio exists.
 export const MANAGED_SD_ASSETS = Object.freeze({
   "aarch64-apple-darwin": {
-    archive: "sd-master-ea7f0c8-bin-Darwin-macOS-26.5.2-arm64.zip",
-    sha256: "a9ba3ccd1e9e984691d10b143f4c0c801b96351e486272a2a60e930de49cca85",
+    archive: "sd-master-137f740-bin-Darwin-macOS-26.6.2-arm64.zip",
+    sha256: "d850bc4eaa0a2254f0a44b10e1ce1ebf6b7dd866c3ea48a3a73246d49173212f",
+  },
+  "x86_64-apple-darwin": {
+    sourceCommit: MANAGED_SD_SOURCE_COMMIT,
+    backend: "cpu",
+    cmakeArgs: ["-DCMAKE_OSX_ARCHITECTURES=x86_64"],
+  },
+  "aarch64-unknown-linux-gnu": {
+    sourceCommit: MANAGED_SD_SOURCE_COMMIT,
+    backend: "cpu",
+    cmakeArgs: [],
   },
   "x86_64-unknown-linux-gnu": {
-    archive: "sd-master-ea7f0c8-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip",
-    sha256: "a98d446ead81b956a97fa5e04d5aea8acdba0a36e5547c1de88a0a1c0fa7cfd8",
+    archive: "sd-master-137f740-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip",
+    sha256: "4b65cfa5e7d4ced8fe43185b314bcba994413655e6273c78aeaaaaeab2ecec0f",
+  },
+  "aarch64-pc-windows-msvc": {
+    sourceCommit: MANAGED_SD_SOURCE_COMMIT,
+    backend: "cpu",
+    cmakeArgs: [],
   },
   "x86_64-pc-windows-msvc": {
-    archive: "sd-master-ea7f0c8-bin-win-vulkan-x64.zip",
-    sha256: "ac785dc435faf616fd9ff1eb864beb6927dcc8f9a7f1875bbfdeab0a3a86b089",
+    archive: "sd-master-137f740-bin-win-vulkan-x64.zip",
+    sha256: "c76b8427d4dd4946f1f2e088512835550f7c6a17565cf2064ca7b656a6d7f7a6",
   },
 });
 
@@ -119,7 +139,9 @@ for (const asset of Object.values(MANAGED_TTS_ASSETS)) {
   asset.url = `${ttsBase}/${asset.archive}`;
 }
 for (const asset of Object.values(MANAGED_SD_ASSETS)) {
-  asset.url = `${sdBase}/${asset.archive}`;
+  if (asset.archive) asset.url = `${sdBase}/${asset.archive}`;
+  else
+    asset.url = `https://github.com/leejet/stable-diffusion.cpp/commit/${asset.sourceCommit}`;
 }
 
 export const MANAGED_RUNTIMES = Object.freeze({
@@ -145,11 +167,6 @@ export const MANAGED_RUNTIMES = Object.freeze({
     version: MANAGED_SD_VERSION,
     serverBaseName: "sd-server",
     assets: MANAGED_SD_ASSETS,
-    // Upstream ships binaries for three of the six release targets. Staging
-    // is therefore a no-op on the others rather than an error: the Rust side
-    // already treats a missing sd runtime as "Studio is unavailable on this
-    // host", which is exactly the intended outcome there.
-    optional: true,
   }),
 });
 
@@ -164,7 +181,35 @@ export function managedRuntime(id) {
   return runtime;
 }
 
-/** The staged Tauri resource directory name for a runtime. */
+/** Resolves the immutable provenance token stored in a runtime manifest. */
+export function managedRuntimeProvenance(asset) {
+  if (asset.archive && asset.sha256) {
+    return { archiveSha256: asset.sha256, sourceCommit: null };
+  }
+  if (asset.sourceCommit) {
+    return { archiveSha256: null, sourceCommit: asset.sourceCommit };
+  }
+  throw new Error("Managed runtime asset has no archive digest or source commit");
+}
+
+/** Resolves the CMake configure arguments for a source-built runtime. */
+export function managedRuntimeSourceCmakeArgs(asset) {
+  if (!asset.sourceCommit) return [];
+  const args = [
+    "-DCMAKE_BUILD_TYPE=Release",
+    "-DSD_BUILD_SHARED_LIBS=OFF",
+    "-DSD_BUILD_SHARED_GGML_LIB=OFF",
+    "-DGGML_NATIVE=OFF",
+    "-DSD_WEBP=OFF",
+    "-DSD_WEBM=OFF",
+    "-DSD_SERVER_BUILD_FRONTEND=OFF",
+  ];
+  if (asset.backend === "metal") args.push("-DSD_METAL=ON");
+  if (asset.backend === "vulkan") args.push("-DSD_VULKAN=ON");
+  return [...args, ...(asset.cmakeArgs ?? [])];
+}
+
+/** Resolves a runtime by id, failing loudly on an unknown one. */
 export function stagedRuntimeDirectory(runtime) {
   return `${runtime.id}-${runtime.version}`;
 }
