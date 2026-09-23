@@ -1,0 +1,61 @@
+name: Apply PR 558 security fixes
+
+on:
+  push:
+    branches:
+      - feat/auto-update-sd-runtime
+    paths:
+      - ".github/workflows/fix-pr558-security.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/auto-update-sd-runtime
+          fetch-depth: 0
+
+      - name: Patch findings and remove this one-shot workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/sd-runtime-qualification.yml')
+          text = workflow.read_text()
+          bad = 'Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6c'
+          good = 'Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6'
+          if text.count(bad) != 1:
+              raise SystemExit(f'expected exactly one malformed rust-cache ref, found {text.count(bad)}')
+          workflow.write_text(text.replace(bad, good))
+
+          updater = Path('scripts/update-managed-sd-runtime.mjs')
+          text = updater.read_text()
+          old_signature = 'async function discoverLatestRelease(currentCommit) {'
+          old_stop = '    if (selected && history.includes(currentCommit.toLowerCase())) break;\n'
+          old_call = '  const { selected: latest, history } = await discoverLatestRelease(current.commit);'
+          for needle in (old_signature, old_stop, old_call):
+              if text.count(needle) != 1:
+                  raise SystemExit(f'expected exactly one updater pattern: {needle!r}')
+          text = text.replace(old_signature, 'async function discoverLatestRelease() {')
+          text = text.replace(old_stop, '')
+          text = text.replace(old_call, '  const { selected: latest, history } = await discoverLatestRelease();')
+          updater.write_text(text)
+          PY
+
+          rm .github/workflows/fix-pr558-security.yml
+          node --check scripts/update-managed-sd-runtime.mjs
+          node --test scripts/update-managed-sd-runtime.test.mjs scripts/lib/managedRuntimeManifest.test.mjs
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/sd-runtime-qualification.yml scripts/update-managed-sd-runtime.mjs .github/workflows/fix-pr558-security.yml
+          git diff --cached --check
+          git commit -m "fix(ci): close updater security findings"
+          git push origin HEAD:feat/auto-update-sd-runtime
