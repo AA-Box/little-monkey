@@ -6,6 +6,36 @@ export type DiscoveryAssetKind = "model" | "lora";
 export interface DiscoveryItem { id: string; source: string; name: string; assetKind: DiscoveryAssetKind; family: string; repo: string | null; fileName: string; downloadUrl: string; pageUrl: string; sha256: string | null; sizeBytes: number; tags: string[] }
 export interface DiscoveryDownloadResult { path: string; sizeBytes: number; sha256: string }
 export interface CharacterTrainingResult { loraPath: string; imageCount: number; logTail: string }
+export interface CharacterTrainerCapabilities {
+  backend: "mflux" | "musubi_zimage";
+  supported: boolean;
+  setupReady: boolean;
+  pythonVersion: string | null;
+  gpuName: string | null;
+  vramMib: number | null;
+  computeCapability: string | null;
+  minimumVramMib: number | null;
+  sourceVersion: string;
+  reason: string | null;
+}
+export interface PortableTrainingStatus {
+  status: "idle" | "setting_up" | "running" | "complete" | "error" | "cancelled";
+  phase: string;
+  logTail: string;
+  loraPath: string | null;
+  loraName: string | null;
+  currentPid: number | null;
+}
+export interface PortableTrainingRequest {
+  name: string;
+  sourceDir: string;
+  ditPath: string;
+  vaePath: string;
+  textEncoderPath: string;
+  triggerWord: string;
+  steps: number;
+  resolution: number;
+}
 export interface WorkflowUpload { name: string; dataBase64: string }
 export type WorkflowKind = "music" | "talking_character" | "motion_control" | "extend_video";
 
@@ -26,7 +56,12 @@ export const WORKFLOW_PRESETS: Record<WorkflowKind, { label: string; description
 export const studioParityClient = {
   search: (source: DiscoverySource, query: string, assetKind: DiscoveryAssetKind) => invoke<DiscoveryItem[]>("studio_discovery_search", { source, query, assetKind }),
   download: (item: DiscoveryItem) => invoke<DiscoveryDownloadResult>("studio_discovery_download", { request: { name: item.name, assetKind: item.assetKind, downloadUrl: item.downloadUrl, sha256: item.sha256 ?? "", sizeBytes: item.sizeBytes, fileName: item.fileName } }),
+  characterCapabilities: () => invoke<CharacterTrainerCapabilities>("character_trainer_capabilities"),
+  setupPortableCharacterTrainer: () => invoke<CharacterTrainerCapabilities>("character_trainer_setup"),
   trainCharacter: (request: { name: string; sourceDir: string; baseModelPath: string; triggerWord: string; epochs: number; rank: number; maxResolution: number }) => invoke<CharacterTrainingResult>("character_training_start", { request }),
+  startPortableCharacterTraining: (request: PortableTrainingRequest) => invoke<PortableTrainingStatus>("character_portable_training_start", { request }),
+  portableCharacterStatus: () => invoke<PortableTrainingStatus>("character_training_status"),
+  cancelPortableCharacterTraining: () => invoke<void>("character_training_cancel"),
   runWorkflow: (request: { kind: WorkflowKind; baseUrl: string; workflow: unknown; values: Record<string, unknown>; inputImage?: WorkflowUpload | null; inputVideo?: WorkflowUpload | null }) => invoke<import("./studioClient").GenerationEntry[]>("studio_workflow_run", { request }),
 };
 
