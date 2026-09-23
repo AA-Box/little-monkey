@@ -237,15 +237,15 @@ function applyPin(root, update) {
   );
 }
 
-function argumentValue(name) {
-  const index = process.argv.indexOf(name);
-  return index === -1 ? null : process.argv[index + 1] ?? null;
-}
-
 async function main() {
-  const root = resolve(argumentValue("--root") ?? process.cwd());
+  // The updater deliberately has no arbitrary filesystem-path arguments. It
+  // only rewrites Little Monkey pin files beneath its current working directory
+  // and emits its machine-readable result to stdout. Workflows that need an
+  // isolated fixture change cwd before invoking it and redirect stdout to a
+  // runner-owned path. This keeps untrusted CLI/environment data out of every
+  // filesystem write sink.
+  const root = process.cwd();
   const apply = process.argv.includes("--apply");
-  const outputPath = argumentValue("--output");
   const manifestText = readFileSync(resolve(root, FILES.manifest), "utf8");
   const current = readCurrentPin(manifestText);
   const latest = await discoverLatestRelease();
@@ -260,7 +260,6 @@ async function main() {
       version: latest.release.tag_name,
       commit: latest.commit,
     };
-    if (outputPath) writeFileSync(outputPath, `${JSON.stringify(result, null, 2)}\n`);
     console.log(JSON.stringify(result));
     return;
   }
@@ -283,7 +282,6 @@ async function main() {
     ...assets,
   };
   if (apply && changed) applyPin(root, { ...result });
-  if (outputPath) writeFileSync(outputPath, `${JSON.stringify(result, null, 2)}\n`);
   console.log(JSON.stringify(result));
 }
 
