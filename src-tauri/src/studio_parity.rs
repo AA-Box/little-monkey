@@ -55,7 +55,9 @@ fn public_client() -> Result<reqwest::Client, String> {
         crate::egress::PublicDestinations::Only,
         "studio-community-assets",
     )
-    .timeout(Duration::from_secs(10 * 60))
+    // No total deadline: `studio_discovery_download` streams up to
+    // `MAX_DOWNLOAD_BYTES`, which a fixed budget would truncate.
+    // `hardened()`'s read timeout bounds silence instead.
     .build()
     .map_err(|error| error.to_string())
 }
@@ -731,8 +733,11 @@ struct ComfyFile {
 }
 
 fn workflow_client() -> Result<reqwest::Client, String> {
+    // A silence budget from `hardened()`, not a per-request deadline: uploads
+    // and `/view` reads carry up to `MAX_WORKFLOW_MEDIA_BYTES` to a ComfyUI that
+    // may be on the LAN, and the run as a whole is bounded by `WORKFLOW_TIMEOUT`
+    // in the `/history` poll.
     crate::egress::hardened()
-        .timeout(WORKFLOW_TIMEOUT)
         .build()
         .map_err(|e| e.to_string())
 }

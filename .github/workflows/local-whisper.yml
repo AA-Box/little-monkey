@@ -103,6 +103,11 @@ jobs:
     env:
       CARGO_PROFILE_RELEASE_DEBUG: 0
       RUST_BACKTRACE: 1
+      # whisper.cpp defaults to `-march=native`, and the cached build below is
+      # restored onto whichever runner CPU comes next: a cache saved on an
+      # AVX-512 host dies with SIGILL on one without. Build for the portable
+      # AVX2 baseline instead (whisper-rs-sys forwards `GGML_*` to CMake).
+      GGML_NATIVE: 'OFF'
     steps:
       - uses: actions/checkout@v4
       - name: Install build and audio dependencies
@@ -120,7 +125,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
-          key: local-whisper-e2e-release
+          # Renamed with `GGML_NATIVE`: whisper-rs-sys does not rerun on that
+          # variable, so the old key would keep restoring native objects.
+          key: local-whisper-e2e-release-portable
       - name: Prepare immutable speech fixtures
         shell: bash
         run: |
