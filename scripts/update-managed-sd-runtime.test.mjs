@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   patchManagedRuntimeManifest,
+  pinRelationFromHistory,
   publishedReleaseCandidates,
   releaseAssetsFor,
   selectNewestPublishedRelease,
@@ -34,6 +35,19 @@ test("release selection follows default-branch ancestry, not publication order",
   const selected = selectNewestPublishedRelease(candidates, [sha900, sha899]);
   assert.equal(selected.release.tag_name, "master-900-c92d73c");
   assert.equal(selected.commit, sha900);
+});
+
+test("pin relation is derived locally from newest-first upstream history", () => {
+  const older = "74988b290e40155fe2313914e44b979b750e958b";
+  const newerUnpublished = "f".repeat(40);
+  const history = [newerUnpublished, sha900, sha899, older];
+  assert.equal(pinRelationFromHistory(older, sha900, history), "ahead");
+  assert.equal(pinRelationFromHistory(sha900, sha900, history), "identical");
+  assert.equal(pinRelationFromHistory(newerUnpublished, sha900, history), "behind");
+  assert.throws(
+    () => pinRelationFromHistory("e".repeat(40), sha900, history),
+    /Current managed SD commit was not found/,
+  );
 });
 
 test("drafts and prereleases can never become the managed runtime", () => {
