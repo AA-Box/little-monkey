@@ -1,3 +1,6 @@
+    Checking portable-pty v0.9.0
+    Checking rustyline v17.0.2
+    Checking notify v8.2.0
     Checking globset v0.4.20
     Checking mail-parser v0.11.8
 error: failed to run custom build command for `little-monkey v1.9.0 (/home/runner/work/little-monkey/little-monkey/src-tauri)`
@@ -5,6 +8,52 @@ error: failed to run custom build command for `little-monkey v1.9.0 (/home/runne
 Caused by:
   process didn't exit successfully: `/home/runner/work/little-monkey/little-monkey/src-tauri/target/debug/build/little-monkey-9522a63bf6f82d35/build-script-build` (exit status: 101)
   --- stdout
+  cargo:rerun-if-changed=/home/runner/work/little-monkey/little-monkey/src-tauri/resources/managed-runtime/llama-b9637/runtime-manifest.json
+  cargo:rerun-if-changed=/home/runner/work/little-monkey/little-monkey/src-tauri/resources/managed-runtime/llama-tts-b10278/runtime-manifest.json
+  cargo:rerun-if-changed=/home/runner/work/little-monkey/little-monkey/src-tauri/resources/managed-runtime/sd-master-890-74988b2/runtime-manifest.json
+  cargo:rerun-if-env-changed=TAURI_CONFIG
+  cargo:rustc-check-cfg=cfg(desktop)
+  cargo:rustc-cfg=desktop
+  cargo:rustc-check-cfg=cfg(mobile)
+  cargo:rerun-if-changed=/home/runner/work/little-monkey/little-monkey/src-tauri/tauri.conf.json
+  cargo:rustc-env=TAURI_ANDROID_PACKAGE_NAME_APP_NAME=app
+  cargo:rustc-env=TAURI_ANDROID_PACKAGE_NAME_PREFIX=com_littlemonkey
+  cargo:rustc-check-cfg=cfg(dev)
+  cargo:rustc-cfg=dev
+  cargo:PERMISSION_FILES_PATH=/home/runner/work/little-monkey/little-monkey/src-tauri/target/debug/build/little-monkey-9c9a986f9dde466a/out/app-manifest/__app__-permission-files
+  cargo:rerun-if-changed=capabilities
+  cargo:rerun-if-env-changed=REMOVE_UNUSED_COMMANDS
+  cargo:rustc-env=TAURI_ENV_TARGET_TRIPLE=x86_64-unknown-linux-gnu
+
+  --- stderr
+
+  thread 'main' (14742) panicked at build.rs:53:40:
+  failed to run tauri-build: resource path `binaries/monkey-cli-x86_64-unknown-linux-gnu` doesn't exist
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+warning: build failed, waiting for other jobs to finish...
+
+CARGO_CHECK_EXIT=101
+  cargo:PERMISSION_FILES_PATH=/home/runner/work/little-monkey/little-monkey/src-tauri/target/debug/build/little-monkey-9c9a986f9dde466a/out/app-manifest/__app__-permission-files
+  cargo:rerun-if-changed=capabilities
+  cargo:rerun-if-env-changed=REMOVE_UNUSED_COMMANDS
+  cargo:rustc-env=TAURI_ENV_TARGET_TRIPLE=x86_64-unknown-linux-gnu
+
+  --- stderr
+
+  thread 'main' (14742) panicked at build.rs:53:40:
+  failed to run tauri-build: resource path `binaries/monkey-cli-x86_64-unknown-linux-gnu` doesn't exist
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+warning: build failed, waiting for other jobs to finish...
+
+CARGO_CHECK_EXIT=101
+  cargo:rerun-if-env-changed=REMOVE_UNUSED_COMMANDS
+  cargo:rustc-env=TAURI_ENV_TARGET_TRIPLE=x86_64-unknown-linux-gnu
+
+  --- stderr
+
+  thread 'main' (14742) panicked at build.rs:53:40:
+  failed to run tauri-build: resource path `binaries/monkey-cli-x86_64-unknown-linux-gnu` doesn't exist
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 warning: build failed, waiting for other jobs to finish...
 
 CARGO_CHECK_EXIT=101
