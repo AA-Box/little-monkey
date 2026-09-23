@@ -159,4 +159,5 @@ jobs:
         if: matrix.target == 'x86_64-apple-darwin'
         shell: bash
         run: |
-          file src-tauri/resources/managed-runtime/sd-master-890-74988b2/sd-server | grep -E 'x86_64|x86-64'
+          directory="$(node --input-type=module -e 'import { managedRuntime, stagedRuntimeDirectory } from "./scripts/lib/managedRuntimeManifest.mjs"; process.stdout.write(stagedRuntimeDirectory(managedRuntime("sd")));')"
+          file "src-tauri/resources/managed-runtime/${directory}/sd-server" | grep -E 'x86_64|x86-64'
