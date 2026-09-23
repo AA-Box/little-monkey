@@ -20,8 +20,8 @@ fn main() {
         // to resolve at Windows loader time (STATUS_ENTRYPOINT_NOT_FOUND,
         // 0xc0000139) even though the same import (bcryptprimitives.dll's
         // ProcessPrng, used unconditionally by Rust std for HashMap's
-        // RandomState seed) is well-formed and present — this is exactly
-        // the crash this project's Windows CI leg was hitting on
+        // RandomState seed) is well-formed and present — this is exactly the
+        // crash this project's Windows CI leg was hitting on
         // `cargo test`, confirmed via `dumpbin /imports` showing a
         // correctly-declared but unresolved-at-runtime import.
         //
@@ -81,7 +81,7 @@ fn emit_managed_runtime_trust() {
         "LITTLE_MONKEY_TRUSTED_TTS_MANIFEST_SHA256",
     );
     emit_runtime_digest(
-        "sd-master-812-ea7f0c8",
+        "sd-master-890-74988b2",
         "LITTLE_MONKEY_TRUSTED_SD_MANIFEST_SHA256",
     );
 }

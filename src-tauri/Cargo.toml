@@ -293,14 +293,14 @@ system-memory = "0.1.7"
 # backup/restore. Bundling avoids depending on whatever SQLite version happens
 # to be installed on a user's machine; backup/limits support bounded portable
 # snapshots and hostile-input guardrails.
-# Held at 0.37 by `matrix-sdk-sqlite`, not by anything in this tree.
+# Held at 0.40.2 by `matrix-sdk-sqlite` 0.19.1, not by anything in this tree.
 # `libsqlite3-sys` declares `links = "sqlite3"`, so exactly one version of it
 # may exist in a binary: the Matrix crypto store's rusqlite and ours have to
 # be the same. Bumping this without upstream bumping theirs fails at
 # resolution, loudly, which is the failure mode we want. When
 # `matrix-sdk-sqlite` moves to a newer rusqlite, move with it — nothing here
-# depends on 0.37 specifically.
-rusqlite = { version = "0.37", features = ["bundled", "backup", "limits"] }
+# depends on 0.40.2 specifically.
+rusqlite = { version = "0.40.2", features = ["bundled", "backup", "limits"] }
 # terminal.rs: one cross-platform pseudoterminal implementation for the
 # in-app terminal. The frontend intentionally stays a thin line-oriented
 # terminal surface; process ownership, output bounds, cancellation, and
@@ -318,7 +318,7 @@ enigo = "0.6.1"
 # every restart would register a new device against the user's account.
 #
 # Two known costs, both compile-time loud: the SDK's `matrix-sdk-sqlite` is
-# what holds `rusqlite` at 0.37 above, and `matrix-sdk-base` pulls `decancer`,
+# what holds `rusqlite` at 0.40.2 above, and `matrix-sdk-base` pulls `decancer`,
 # whose `impl Add<_> for String` makes `String + &String` ambiguous tree-wide
 # (write `format!` instead). Its HTTP is this tree's own `egress::hardened()`
 # client, handed to `ClientBuilder::http_client`, so no Matrix request escapes
@@ -327,7 +327,7 @@ enigo = "0.6.1"
 # Ruma types are reached through `matrix_sdk::ruma` rather than a second direct
 # `ruma` dependency, so this tree cannot compile against a different feature
 # set from the one the SDK itself was built with.
-matrix-sdk = { version = "0.18", default-features = false, features = ["e2e-encryption", "sqlite"] }
+matrix-sdk = { version = "0.19.1", default-features = false, features = ["e2e-encryption", "sqlite"] }
 # `mime::Mime` is the type `Room::send_attachment` takes for a file's content
 # type. Already in the tree via reqwest/matrix-sdk; named here because this is
 # the one place our own code constructs one.
@@ -417,14 +417,14 @@ tauri = { version = "2", features = ["test"] }
 #
 # The production `MatrixAdapter` is the client under test in every one of those
 # tests. Nothing here replaces it.
-matrix-sdk = { version = "0.18", default-features = false, features = [
+matrix-sdk = { version = "0.19.1", default-features = false, features = [
     "e2e-encryption",
     "sqlite",
     "testing",
 ] }
 # The sync-response builder those helpers take, for putting a room, a timeline
 # event or a to-device message into one `/sync` answer.
-matrix-sdk-test = "0.18"
+matrix-sdk-test = "0.19.1"
 # Tiny hostile/limit fixtures compile from WAT during host tests; contributors
 # do not need a guest-language toolchain for the sandbox test suite.
 wat = "1"
