@@ -15,7 +15,6 @@ const FILES = Object.freeze({
   manifestTest: "scripts/lib/managedRuntimeManifest.test.mjs",
   managedRuntimeRust: "src-tauri/src/managed_runtime.rs",
   buildRust: "src-tauri/build.rs",
-  runtimeWorkflow: ".github/workflows/managed-sd-runtime.yml",
 });
 
 function githubHeaders() {
@@ -211,25 +210,31 @@ function applyPin(root, update) {
   const manifestText = readFileSync(manifestPath, "utf8");
   writeFileSync(manifestPath, patchManagedRuntimeManifest(manifestText, update));
 
-  for (const relative of [
-    FILES.manifestTest,
-    FILES.managedRuntimeRust,
-  ]) {
+  for (const relative of [FILES.manifestTest, FILES.managedRuntimeRust]) {
     const path = resolve(root, relative);
     let text = readFileSync(path, "utf8");
     text = replaceLiteral(text, update.currentVersion, update.version, `${relative} SD version`);
-    text = replaceLiteral(text, update.currentCommit, update.commit, `${relative} SD commit`, relative === FILES.manifestTest ? 1 : 0);
+    text = replaceLiteral(
+      text,
+      update.currentCommit,
+      update.commit,
+      `${relative} SD commit`,
+      relative === FILES.manifestTest ? 1 : 0,
+    );
     writeFileSync(path, text);
   }
 
-  for (const relative of [FILES.buildRust, FILES.runtimeWorkflow]) {
-    const path = resolve(root, relative);
-    const text = readFileSync(path, "utf8");
-    writeFileSync(
-      path,
-      replaceLiteral(text, `sd-${update.currentVersion}`, `sd-${update.version}`, `${relative} staged SD directory`),
-    );
-  }
+  const buildPath = resolve(root, FILES.buildRust);
+  const buildText = readFileSync(buildPath, "utf8");
+  writeFileSync(
+    buildPath,
+    replaceLiteral(
+      buildText,
+      `sd-${update.currentVersion}`,
+      `sd-${update.version}`,
+      `${FILES.buildRust} staged SD directory`,
+    ),
+  );
 }
 
 function argumentValue(name) {
