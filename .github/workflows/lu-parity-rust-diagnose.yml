@@ -19,7 +19,7 @@ jobs:
         with:
           ref: feature/lu-parity-media-imports
           fetch-depth: 0
-      - name: Extract existing cargo diagnostics
+      - name: Extract existing cargo failure context
         run: |
           python3 - <<'PY'
           import re
@@ -27,20 +27,19 @@ jobs:
           text = Path('.ci-rust-check.log').read_text(errors='replace')
           text = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)
           lines = text.splitlines()
-          keep = []
+          blocks = []
+          needles = ('failed to run custom build command', '--- stderr', "panicked at", 'error:')
           for i, line in enumerate(lines):
-              if ('error[' in line or 'error:' in line or 'could not compile' in line or 'CARGO_CHECK_EXIT=' in line):
-                  lo = max(0, i - 2)
-                  hi = min(len(lines), i + 5)
-                  keep.extend(lines[lo:hi])
+              if any(needle in line for needle in needles):
+                  blocks.extend(lines[max(0, i - 5):min(len(lines), i + 100)])
           compact = []
-          for line in keep:
+          for line in blocks:
               if not compact or compact[-1] != line:
                   compact.append(line)
-          Path('.ci-rust-errors.log').write_text('\n'.join(compact[-300:]) + '\n')
+          Path('.ci-rust-errors.log').write_text('\n'.join(compact[-500:]) + '\n')
           PY
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -f .ci-rust-errors.log
-          git commit -m "chore: extract Rust compiler diagnostics"
+          git commit -m "chore: expose Rust build-script failure"
           git push origin HEAD:feature/lu-parity-media-imports
