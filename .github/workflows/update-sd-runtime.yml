@@ -78,11 +78,14 @@ jobs:
             scripts/lib/managedRuntimeManifest.mjs \
             scripts/lib/managedRuntimeManifest.test.mjs \
             src-tauri/build.rs \
-            src-tauri/src/managed_runtime.rs \
-            .github/workflows/managed-sd-runtime.yml
+            src-tauri/src/managed_runtime.rs
           git diff --cached --quiet && { echo "Updater reported a change but produced no diff" >&2; exit 1; }
           git commit -m "chore(runtime): update stable-diffusion.cpp to ${VERSION}"
-          git fetch origin "$branch" || true
+
+          # Seed the remote-tracking ref so --force-with-lease can safely
+          # refresh an existing branch instead of either failing with stale
+          # info or falling back to an unsafe unconditional force push.
+          git fetch origin "$branch:refs/remotes/origin/$branch" || true
           git push --force-with-lease origin HEAD:"refs/heads/$branch"
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
           echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -118,7 +121,8 @@ jobs:
           - Upstream commit: \`${COMMIT}\`
           - Release: ${RELEASE_URL}
           - Selection policy: newest published non-prerelease release by position in upstream's default-branch history, not GitHub's \`latest\` label or publication timestamp.
-          - Merge policy: the generated branch is merged only by \`SD runtime auto-update qualification\` after the six-platform runtime matrix, cross-platform Rust compilation, metadata tests, and core frontend checks all pass on the exact head SHA.
+          - Merge policy: the generated branch is merged only by \`SD runtime auto-update qualification\` after the exact-head metadata checks, cross-platform Rust compile gate, core frontend regression gate, and six-platform runtime matrix pass.
+          - Update scope: only four ordinary runtime-pin files are changed; workflow files are deliberately version-dynamic so the built-in Actions token never needs permission to rewrite workflow definitions.
 
           If qualification fails, this PR stays open and nothing reaches \`develop\`.
           EOF
