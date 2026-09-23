@@ -147,7 +147,7 @@ function parseChatGptConversation(raw: UnknownRecord, index: number): ImportedCo
     while (node && !seen.has(node.id)) {
       seen.add(node.id);
       chain.push(node);
-      const nextId = node.children[node.children.length - 1];
+      const nextId: string | undefined = node.children[node.children.length - 1];
       node = nextId ? nodes.get(nextId) : undefined;
     }
     return chain;
