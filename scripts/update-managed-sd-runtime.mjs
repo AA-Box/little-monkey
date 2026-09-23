@@ -191,7 +191,7 @@ async function resolveCandidateCommits(candidates) {
   }
 }
 
-async function discoverLatestRelease(currentCommit) {
+async function discoverLatestRelease() {
   const [repository, releases] = await Promise.all([
     githubJson(`/repos/${UPSTREAM_REPOSITORY}`),
     paged(`/repos/${UPSTREAM_REPOSITORY}/releases`, MAX_RELEASE_PAGES),
@@ -212,7 +212,6 @@ async function discoverLatestRelease(currentCommit) {
       const visible = candidates.filter((candidate) => history.includes(candidate.commit));
       if (visible.length > 0) selected = selectNewestPublishedRelease(visible, history);
     }
-    if (selected && history.includes(currentCommit.toLowerCase())) break;
     if (commits.length < PER_PAGE) break;
   }
   if (!selected) {
@@ -266,7 +265,7 @@ async function main() {
   const apply = process.argv.includes("--apply");
   const manifestText = readFileSync(resolve(root, FILES.manifest), "utf8");
   const current = readCurrentPin(manifestText);
-  const { selected: latest, history } = await discoverLatestRelease(current.commit);
+  const { selected: latest, history } = await discoverLatestRelease();
   const relation = pinRelationFromHistory(current.commit, latest.commit, history);
 
   if (relation === "behind") {
