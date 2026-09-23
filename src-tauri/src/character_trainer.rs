@@ -147,7 +147,12 @@ fn marker_matches(root: &Path) -> bool {
     fs::read_to_string(marker_path(root))
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|value| value.get("commit").and_then(|v| v.as_str()).map(str::to_string))
+        .and_then(|value| {
+            value
+                .get("commit")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
         .is_some_and(|commit| commit == MUSUBI_COMMIT)
 }
 
@@ -236,7 +241,13 @@ fn detect_python() -> Option<PythonCommand> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        for binary in ["python3.12", "python3.11", "python3.10", "python3", "python"] {
+        for binary in [
+            "python3.12",
+            "python3.11",
+            "python3.10",
+            "python3",
+            "python",
+        ] {
             if let Some(python) = python_probe(binary, &[]) {
                 return Some(python);
             }
@@ -257,46 +268,62 @@ fn supports_fp8(gpu: &NvidiaGpu) -> bool {
     gpu.major > 8 || (gpu.major == 8 && gpu.minor >= 9)
 }
 
+fn portable_gpu_reason(gpu: Option<&NvidiaGpu>) -> Option<String> {
+    let Some(gpu) = gpu else {
+        return Some("Local Character Studio training on Windows/Linux currently requires an NVIDIA GPU visible to nvidia-smi.".into());
+    };
+    if gpu.major < 8 {
+        return Some(format!(
+            "{} reports CUDA compute capability {}.{}. Z-Image training requires capability 8.0 or newer because its text-encoder path requires bfloat16.",
+            gpu.name, gpu.major, gpu.minor
+        ));
+    }
+    let floor = minimum_vram_mib(gpu);
+    if gpu.vram_mib < floor {
+        return Some(format!(
+            "{} has {:.1} GiB VRAM; this training recipe requires at least {:.0} GiB.",
+            gpu.name,
+            gpu.vram_mib as f64 / 1024.0,
+            floor as f64 / 1024.0
+        ));
+    }
+    None
+}
+
+fn git_available() -> bool {
+    command_output("git", &["--version"]).is_some()
+}
+
 fn capability_reason(gpu: Option<&NvidiaGpu>, python: Option<&PythonCommand>) -> Option<String> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         let _ = (gpu, python);
         return None;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
     {
         let _ = (gpu, python);
         return Some("Portable Character Studio is not supported on Intel macOS. Apple Silicon uses the MFLUX trainer.".into());
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let Some(gpu) = gpu else {
-            return Some("Local Character Studio training on Windows/Linux currently requires an NVIDIA GPU visible to nvidia-smi.".into());
-        };
-        if gpu.major < 8 {
-            return Some(format!(
-                "{} reports CUDA compute capability {}.{}. Z-Image training requires capability 8.0 or newer because its text-encoder path requires bfloat16.",
-                gpu.name, gpu.major, gpu.minor
-            ));
-        }
-        let floor = minimum_vram_mib(gpu);
-        if gpu.vram_mib < floor {
-            return Some(format!(
-                "{} has {:.1} GiB VRAM; this training recipe requires at least {:.0} GiB.",
-                gpu.name,
-                gpu.vram_mib as f64 / 1024.0,
-                floor as f64 / 1024.0
-            ));
+        if let Some(reason) = portable_gpu_reason(gpu) {
+            return Some(reason);
         }
         if python.is_none() {
             return Some("Install a 64-bit Python 3.10, 3.11, or 3.12 interpreter before setting up the local trainer.".into());
+        }
+        if !git_available() {
+            return Some("Install Git before setting up the local Character Studio trainer; the pinned Musubi source is verified by commit before use.".into());
         }
         None
     }
 }
 
 #[tauri::command]
-pub fn character_trainer_capabilities(app: AppHandle) -> Result<CharacterTrainerCapabilities, String> {
+pub fn character_trainer_capabilities(
+    app: AppHandle,
+) -> Result<CharacterTrainerCapabilities, String> {
     let trainer_root = root(&app)?;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
@@ -346,7 +373,7 @@ fn safe_leaf(value: &str) -> String {
             }
         })
         .collect();
-    let trimmed = safe.trim_matches(['.', '_']);
+    let trimmed = safe.trim_matches(|character| character == '.' || character == '_');
     if trimmed.is_empty() {
         "character".into()
     } else {
@@ -379,7 +406,9 @@ fn now_ms() -> u64 {
 }
 
 fn reset_run(status: &str, phase: &str, log_path: PathBuf) -> Result<(), String> {
-    let mut run = state().lock().map_err(|_| "Character trainer state is poisoned")?;
+    let mut run = state()
+        .lock()
+        .map_err(|_| "Character trainer state is poisoned")?;
     if matches!(run.status.as_str(), "running" | "setting_up") {
         return Err("Character Studio already has an active operation".into());
     }
@@ -396,6 +425,12 @@ fn reset_run(status: &str, phase: &str, log_path: PathBuf) -> Result<(), String>
 fn set_phase(phase: &str) {
     if let Ok(mut run) = state().lock() {
         run.phase = phase.to_string();
+    }
+}
+
+fn attach_training_log(path: PathBuf) {
+    if let Ok(mut run) = state().lock() {
+        run.log_path = Some(path);
     }
 }
 
@@ -541,7 +576,7 @@ fn git_checkout(root: &Path, log_path: &Path) -> Result<(), String> {
     let mut fetch = Command::new("git");
     fetch
         .current_dir(&repo)
-        .args(["fetch", "--depth=1", "origin", MUSUBI_COMMIT]);
+        .args(["fetch", "--depth=1", "origin", "tag", MUSUBI_VERSION]);
     run_logged(fetch, "download pinned Musubi Tuner source", log_path)?;
     let mut checkout = Command::new("git");
     checkout
@@ -573,12 +608,13 @@ fn command_output_in(directory: &Path, program: &str, args: &[&str]) -> Option<S
 
 fn setup_impl(app: &AppHandle) -> Result<CharacterTrainerCapabilities, String> {
     let trainer_root = root(app)?;
-    let gpu = detect_nvidia_gpu().ok_or(
-        "Local Character Studio setup requires an NVIDIA GPU visible to nvidia-smi",
-    )?;
-    let python = detect_python().ok_or(
-        "Local Character Studio setup requires 64-bit Python 3.10, 3.11, or 3.12",
-    )?;
+    let gpu = detect_nvidia_gpu()
+        .ok_or("Local Character Studio setup requires an NVIDIA GPU visible to nvidia-smi")?;
+    let python = detect_python()
+        .ok_or("Local Character Studio setup requires 64-bit Python 3.10, 3.11, or 3.12")?;
+    if !git_available() {
+        return Err("Local Character Studio setup requires Git so the pinned Musubi release can be verified before use".into());
+    }
     if let Some(reason) = capability_reason(Some(&gpu), Some(&python)) {
         return Err(reason);
     }
@@ -644,18 +680,16 @@ fn setup_impl(app: &AppHandle) -> Result<CharacterTrainerCapabilities, String> {
 
         set_phase("Installing Musubi Tuner dependencies");
         let mut package = venv_command(&trainer_root);
-        package
-            .current_dir(repo_dir(&trainer_root))
-            .args([
-                "-m",
-                "pip",
-                "install",
-                "--no-input",
-                "--progress-bar",
-                "off",
-                "-e",
-                ".",
-            ]);
+        package.current_dir(repo_dir(&trainer_root)).args([
+            "-m",
+            "pip",
+            "install",
+            "--no-input",
+            "--progress-bar",
+            "off",
+            "-e",
+            ".",
+        ]);
         run_logged(package, "install Musubi Tuner", &log_path)?;
 
         set_phase("Checking CUDA training environment");
@@ -686,7 +720,9 @@ fn setup_impl(app: &AppHandle) -> Result<CharacterTrainerCapabilities, String> {
 }
 
 #[tauri::command]
-pub async fn character_trainer_setup(app: AppHandle) -> Result<CharacterTrainerCapabilities, String> {
+pub async fn character_trainer_setup(
+    app: AppHandle,
+) -> Result<CharacterTrainerCapabilities, String> {
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     {
         tauri::async_runtime::spawn_blocking(move || setup_impl(&app))
@@ -752,7 +788,10 @@ fn prepare_dataset(
         let caption = if caption_source.is_file() {
             fs::read_to_string(caption_source).unwrap_or_else(|_| request.trigger_word.clone())
         } else {
-            format!("{}, portrait photograph of the same person", request.trigger_word.trim())
+            format!(
+                "{}, portrait photograph of the same person",
+                request.trigger_word.trim()
+            )
         };
         fs::write(images.join(format!("{stem}.txt")), caption)
             .map_err(|error| error.to_string())?;
@@ -774,7 +813,10 @@ fn prepare_dataset(
     Ok((dataset, count))
 }
 
-fn training_impl(app: AppHandle, request: PortableTrainingRequest) -> Result<(PathBuf, String), String> {
+fn training_impl(
+    app: AppHandle,
+    request: PortableTrainingRequest,
+) -> Result<(PathBuf, String), String> {
     let trainer_root = root(&app)?;
     if !setup_ready(&trainer_root) {
         return Err("Set up the portable Character Studio trainer first".into());
@@ -792,23 +834,25 @@ fn training_impl(app: AppHandle, request: PortableTrainingRequest) -> Result<(Pa
         return Err("Training resolution must be 512–1024 and divisible by 64".into());
     }
     let gpu = detect_nvidia_gpu().ok_or("NVIDIA GPU disappeared before training")?;
-    if let Some(reason) = capability_reason(Some(&gpu), detect_python().as_ref()) {
+    if let Some(reason) = portable_gpu_reason(Some(&gpu)) {
         return Err(reason);
     }
     let dit = canonical_model_file(&request.dit_path, "DiT model")?;
     let vae = canonical_model_file(&request.vae_path, "VAE model")?;
     let text_encoder = canonical_model_file(&request.text_encoder_path, "text encoder")?;
 
-    let run_root = trainer_root
-        .join("runs")
-        .join(format!("{}-{}", safe_leaf(&request.name), Uuid::new_v4()));
+    let run_root =
+        trainer_root
+            .join("runs")
+            .join(format!("{}-{}", safe_leaf(&request.name), Uuid::new_v4()));
     fs::create_dir_all(&run_root).map_err(|error| error.to_string())?;
     let output = run_root.join("output");
     fs::create_dir_all(&output).map_err(|error| error.to_string())?;
     let (dataset, _image_count) = prepare_dataset(&request, &run_root)?;
     let log_path = run_root.join("training.log");
     let _ = File::create(&log_path).map_err(|error| error.to_string())?;
-    reset_run("running", "Caching image latents", log_path.clone())?;
+    attach_training_log(log_path.clone());
+    set_phase("Caching image latents");
 
     let repo = repo_dir(&trainer_root);
     let python = venv_python(&trainer_root);
@@ -910,6 +954,7 @@ fn training_impl(app: AppHandle, request: PortableTrainingRequest) -> Result<(Pa
     set_phase("Step 4/4 · Converting LoRA for Studio");
     let library = trainer_root
         .parent()
+        .and_then(Path::parent)
         .unwrap_or(&trainer_root)
         .join("trained-loras");
     fs::create_dir_all(&library).map_err(|error| error.to_string())?;
@@ -918,7 +963,7 @@ fn training_impl(app: AppHandle, request: PortableTrainingRequest) -> Result<(Pa
     let final_s = final_path.to_string_lossy().to_string();
     let mut convert = Command::new(&python);
     convert.current_dir(&repo).args([
-        "src/musubi_tuner/networks/convert_lora.py",
+        "src/musubi_tuner/convert_lora.py",
         "--input",
         &trained_s,
         "--output",
@@ -941,10 +986,19 @@ pub fn character_portable_training_start(
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     {
         {
-            let run = state().lock().map_err(|_| "Character trainer state is poisoned")?;
+            let mut run = state()
+                .lock()
+                .map_err(|_| "Character trainer state is poisoned")?;
             if matches!(run.status.as_str(), "running" | "setting_up") {
                 return Err("Character Studio already has an active operation".into());
             }
+            run.status = "running".into();
+            run.phase = "Preparing training dataset".into();
+            run.log_path = None;
+            run.current_pid = None;
+            run.cancel_requested = false;
+            run.lora_path = None;
+            run.lora_name = None;
         }
         thread::spawn(move || match training_impl(app, request) {
             Ok((path, name)) => finish("complete", "Character LoRA ready", Some((&path, &name))),
@@ -969,7 +1023,9 @@ pub fn character_portable_training_start(
 
 #[tauri::command]
 pub fn character_training_status() -> Result<PortableTrainingStatus, String> {
-    let run = state().lock().map_err(|_| "Character trainer state is poisoned")?;
+    let run = state()
+        .lock()
+        .map_err(|_| "Character trainer state is poisoned")?;
     Ok(PortableTrainingStatus {
         status: run.status.clone(),
         phase: run.phase.clone(),
@@ -987,7 +1043,9 @@ pub fn character_training_status() -> Result<PortableTrainingStatus, String> {
 #[tauri::command]
 pub fn character_training_cancel() -> Result<(), String> {
     let pid = {
-        let mut run = state().lock().map_err(|_| "Character trainer state is poisoned")?;
+        let mut run = state()
+            .lock()
+            .map_err(|_| "Character trainer state is poisoned")?;
         if !matches!(run.status.as_str(), "running" | "setting_up") {
             return Ok(());
         }

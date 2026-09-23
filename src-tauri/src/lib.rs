@@ -49,6 +49,7 @@ pub mod runtime_adapter;
 pub mod generation;
 pub(crate) mod generation_commands;
 pub mod studio_parity;
+pub mod character_trainer;
 pub mod studio_tools;
 // The two generation backends the app talks to but never ships: a ComfyUI the
 // user installed, and hosted OpenAI-compatible image APIs. HTTP only.
@@ -2098,6 +2099,11 @@ pub fn run() {
             studio_parity::studio_discovery_download,
             studio_parity::chat_export_write_documents,
             studio_parity::character_training_start,
+            character_trainer::character_trainer_capabilities,
+            character_trainer::character_trainer_setup,
+            character_trainer::character_portable_training_start,
+            character_trainer::character_training_status,
+            character_trainer::character_training_cancel,
             studio_parity::studio_workflow_run,
             generation_commands::studio_tools_running,
             generation_commands::studio_tool_import_catalog,
