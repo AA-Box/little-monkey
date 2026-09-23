@@ -1,0 +1,152 @@
+name: Apply Qwen 2.1 INT8 offload fix
+
+on:
+  push:
+    branches:
+      - fix/qwen-image-2-1-metal-int8-abort
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/qwen-image-2-1-metal-int8-abort
+
+      - name: Install Rust and Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Patch Qwen 2.1 launch defaults and native-abort diagnostics
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src-tauri/src/generation.rs')
+          text = path.read_text()
+
+          def replace_once(old: str, new: str):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected exactly one match, found {count}: {old[:80]!r}')
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              'const MAX_STDERR_TAIL: usize = 4_000;',
+              'const MAX_STDERR_TAIL: usize = 32 * 1024;'
+          )
+
+          replace_once(
+              '''        .filter(|line| line.contains("[ERROR]") || line.starts_with("error"))\n''',
+              '''        .filter(|line| {\n            let lower = line.to_ascii_lowercase();\n            line.contains("[ERROR]")\n                || lower.starts_with("error")\n                || lower.contains("libc++abi")\n                || lower.contains("uncaught exception")\n                || lower.contains("terminate called")\n                || lower.contains("what():")\n                || lower.contains("std::runtime_error")\n                || lower.contains("std::bad_alloc")\n                || lower.contains("ggml_assert")\n                || lower.contains("assertion failed")\n                || lower.starts_with("fatal")\n        })\n'''
+          )
+
+          old_hint = '''    (\n        "wrong shape in model metadata",\n        "That file's tensors are laid out for a different loader. A ComfyUI-GGUF quantization will not load here even though the extension matches — use one built for stable-diffusion.cpp.",\n    ),\n];\n'''
+          new_hint = '''    (\n        "wrong shape in model metadata",\n        "That file's tensors are laid out for a different loader. A ComfyUI-GGUF quantization will not load here even though the extension matches — use one built for stable-diffusion.cpp.",\n    ),\n    (\n        "INT8 tensorwise/convrot is not supported by this ggml build",\n        "This text encoder uses ComfyUI INT8 ConvRot weights, but this stable-diffusion.cpp runtime was built without the patched GGML extensions required to execute them. Use the BF16 Qwen3-VL encoder, a GGUF Qwen3-VL encoder, or a managed runtime built with stable-diffusion.cpp's patched GGML.",\n    ),\n];\n'''
+          replace_once(old_hint, new_hint)
+
+          launch_anchor = '''/// Builds the `sd-server` command line for a model. Every weight path is\n/// absolute and app-owned; nothing is read from a user shell or PATH.\npub fn launch_args(spec: &GenerationModelSpec, model_root: &Path, port: u16) -> Vec<String> {\n'''
+          helper = '''/// Qwen Image 2.1's Qwen3-VL INT8 ConvRot encoder is designed to live in RAM.\n///\n/// stable-diffusion.cpp's own Qwen Image 2.1 examples use `--offload-to-cpu`,\n/// and its INT8 ConvRot documentation notes that Metal and other non-CUDA GPU\n/// backends rely on CPU fallback for this path. Keeping the encoder parameters\n/// on the GPU can therefore fail during runner construction before the server\n/// ever becomes ready. The diffusion model remains on its normal runtime\n/// backend; only parameter residency is changed.\nfn qwen_image_2_1_int8_convrot_needs_cpu_offload(spec: &GenerationModelSpec) -> bool {\n    let has_qwen_21_diffusion = spec.components.iter().any(|component| {\n        if component.slot != ComponentSlot::DiffusionModel {\n            return false;\n        }\n        component\n            .file_name()\n            .to_ascii_lowercase()\n            .replace('_', "-")\n            .contains("qwen-image-2.1")\n    });\n    let has_int8_convrot_llm = spec.components.iter().any(|component| {\n        if component.slot != ComponentSlot::Llm {\n            return false;\n        }\n        let name = component.file_name().to_ascii_lowercase().replace('_', "-");\n        name.contains("qwen3vl") && name.contains("int8") && name.contains("convrot")\n    });\n    let residency_is_explicit = spec.extra_launch_args.iter().any(|argument| {\n        let argument = argument.trim();\n        argument == "--offload-to-cpu"\n            || argument == "--params-backend"\n            || argument.starts_with("--params-backend=")\n    });\n    has_qwen_21_diffusion && has_int8_convrot_llm && !residency_is_explicit\n}\n\n/// Builds the `sd-server` command line for a model. Every weight path is\n/// absolute and app-owned; nothing is read from a user shell or PATH.\npub fn launch_args(spec: &GenerationModelSpec, model_root: &Path, port: u16) -> Vec<String> {\n'''
+          replace_once(launch_anchor, helper)
+
+          replace_once(
+              '''    args.extend(spec.extra_launch_args.iter().cloned());\n    args\n}\n''',
+              '''    if qwen_image_2_1_int8_convrot_needs_cpu_offload(spec) {\n        args.push("--offload-to-cpu".to_string());\n    }\n    args.extend(spec.extra_launch_args.iter().cloned());\n    args\n}\n'''
+          )
+
+          test_anchor = '''    /// A warm engine is reused on what it was launched with, not on the model\n'''
+          tests = r'''    #[test]
+    fn qwen_image_2_1_int8_convrot_defaults_to_cpu_offload() {
+        let mut spec = model(
+            "qwen21",
+            vec![GenerationTask::TextToImage],
+            FrameGrid::DownTo4nPlus1,
+        );
+        spec.family = "Qwen Image 2.1".to_string();
+        spec.extra_launch_args.clear();
+        spec.components = vec![
+            ModelComponent::huggingface(
+                ComponentSlot::DiffusionModel,
+                "KasugaiSakura/Qwen-Image-2.1-Uncensored-Abenzerps-GGUF",
+                "qwen-image-2.1-Q6_K.gguf",
+                1,
+            ),
+            ModelComponent::huggingface(
+                ComponentSlot::Llm,
+                "Comfy-Org/Qwen-Image-2.1",
+                "text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+                1,
+            ),
+            ModelComponent::huggingface(
+                ComponentSlot::Vae,
+                "Comfy-Org/Qwen-Image-2.1",
+                "vae/qwen_image_2.1_vae_bf16.safetensors",
+                1,
+            ),
+        ];
+
+        let args = launch_args(&spec, Path::new("/models"), 8092);
+        assert!(args.contains(&"--offload-to-cpu".to_string()));
+
+        let mut bf16 = spec.clone();
+        bf16.components[1] = ModelComponent::huggingface(
+            ComponentSlot::Llm,
+            "Comfy-Org/Qwen-Image-2.1",
+            "text_encoders/qwen3vl_8b_bf16.safetensors",
+            1,
+        );
+        assert!(!launch_args(&bf16, Path::new("/models"), 8092)
+            .contains(&"--offload-to-cpu".to_string()));
+
+        let mut explicit = spec.clone();
+        explicit.extra_launch_args = vec![
+            "--params-backend".to_string(),
+            "*=metal".to_string(),
+        ];
+        assert!(!launch_args(&explicit, Path::new("/models"), 8092)
+            .contains(&"--offload-to-cpu".to_string()));
+    }
+
+    #[test]
+    fn native_abort_detail_keeps_the_exception_reason() {
+        let tail = "libc++abi: terminating due to uncaught exception of type std::runtime_error: INT8 tensorwise/convrot is not supported by this ggml build\n0 libsystem_kernel.dylib ...\n19 libstable-diffusion.dylib StableDiffusionGGML::build_runners + 572\n20 libstable-diffusion.dylib StableDiffusionGGML::apply_model_update + 908";
+        let detail = engine_failure_detail(tail);
+        assert!(detail.contains("libc++abi"));
+        assert!(detail.contains("INT8 tensorwise/convrot"));
+        assert!(detail.contains("patched GGML"));
+        assert!(!detail.contains("19 libstable-diffusion"));
+    }
+
+'''
+          if text.count(test_anchor) != 1:
+              raise SystemExit('test insertion anchor not unique')
+          text = text.replace(test_anchor, tests + test_anchor, 1)
+
+          path.write_text(text)
+          PY
+
+      - name: Format and run targeted Rust tests
+        run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+          cargo test --manifest-path src-tauri/Cargo.toml --lib qwen_image_2_1_int8_convrot_defaults_to_cpu_offload
+          cargo test --manifest-path src-tauri/Cargo.toml --lib native_abort_detail_keeps_the_exception_reason
+
+      - name: Commit final patch and remove one-shot workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/apply-qwen21-metal-int8-fix.yml
+          git add src-tauri/src/generation.rs
+          git commit -m "fix(studio): offload Qwen 2.1 INT8 text encoder safely"
+          git push origin HEAD:fix/qwen-image-2-1-metal-int8-abort
