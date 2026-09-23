@@ -1,0 +1,152 @@
+name: Update stable-diffusion.cpp runtime
+
+on:
+  schedule:
+    # Upstream publishes frequently; daily keeps the pinned runtime current
+    # without making Little Monkey depend on a moving binary at app startup.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: update-stable-diffusion-runtime
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Test updater logic
+        run: node --test scripts/update-managed-sd-runtime.test.mjs
+
+      - name: Discover newest published upstream release and apply pin
+        id: update
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          UPDATE_JSON: ${{ runner.temp }}/sd-runtime-update.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/update-managed-sd-runtime.mjs --apply --output "$UPDATE_JSON"
+          node --input-type=module <<'NODE' >> "$GITHUB_OUTPUT"
+          import { readFileSync } from "node:fs";
+          const result = JSON.parse(readFileSync(process.env.UPDATE_JSON, "utf8"));
+          for (const key of ["changed", "version", "commit", "releaseUrl", "reason"]) {
+            if (result[key] !== undefined) console.log(`${key}=${result[key]}`);
+          }
+          NODE
+
+      - name: No update needed
+        if: steps.update.outputs.changed != 'true'
+        run: |
+          echo "stable-diffusion.cpp is already current: ${{ steps.update.outputs.reason }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate rewritten pin metadata
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          node --check scripts/stage-managed-runtime.mjs
+          node --test scripts/lib/managedRuntimeManifest.test.mjs scripts/update-managed-sd-runtime.test.mjs
+
+      - name: Commit update branch
+        if: steps.update.outputs.changed == 'true'
+        id: commit
+        env:
+          VERSION: ${{ steps.update.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="automation/sd-runtime-${VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$branch"
+          git add \
+            scripts/lib/managedRuntimeManifest.mjs \
+            scripts/lib/managedRuntimeManifest.test.mjs \
+            src-tauri/build.rs \
+            src-tauri/src/managed_runtime.rs \
+            .github/workflows/managed-sd-runtime.yml
+          git diff --cached --quiet && { echo "Updater reported a change but produced no diff" >&2; exit 1; }
+          git commit -m "chore(runtime): update stable-diffusion.cpp to ${VERSION}"
+          git fetch origin "$branch" || true
+          git push --force-with-lease origin HEAD:"refs/heads/$branch"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Open or refresh qualification PR
+        if: steps.update.outputs.changed == 'true'
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.commit.outputs.branch }}
+          VERSION: ${{ steps.update.outputs.version }}
+          COMMIT: ${{ steps.update.outputs.commit }}
+          RELEASE_URL: ${{ steps.update.outputs.releaseUrl }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Keep only one active automatic runtime update. A newer upstream
+          # release supersedes an older unmerged bot PR rather than stacking
+          # multiple native-runtime candidates.
+          while IFS=$'\t' read -r number head; do
+            [ -z "$number" ] && continue
+            if [[ "$head" == automation/sd-runtime-* && "$head" != "$BRANCH" ]]; then
+              gh pr close "$number" --comment "Superseded by automatic qualification of ${VERSION}."
+            fi
+          done < <(gh pr list --base develop --state open --limit 100 --json number,headRefName --jq '.[] | [.number, .headRefName] | @tsv')
+
+          pr="$(gh pr list --head "$BRANCH" --base develop --state open --json number --jq '.[0].number // empty')"
+          cat > "$RUNNER_TEMP/body.md" <<EOF
+          Automated stable-diffusion.cpp runtime update.
+
+          - Upstream release: \`${VERSION}\`
+          - Upstream commit: \`${COMMIT}\`
+          - Release: ${RELEASE_URL}
+          - Selection policy: newest published non-prerelease release by position in upstream's default-branch history, not GitHub's \`latest\` label or publication timestamp.
+          - Merge policy: the generated branch is merged only by \`SD runtime auto-update qualification\` after the six-platform runtime matrix, cross-platform Rust compilation, metadata tests, and core frontend checks all pass on the exact head SHA.
+
+          If qualification fails, this PR stays open and nothing reaches \`develop\`.
+          EOF
+
+          if [ -z "$pr" ]; then
+            gh pr create \
+              --base develop \
+              --head "$BRANCH" \
+              --title "chore(runtime): update stable-diffusion.cpp to ${VERSION}" \
+              --body-file "$RUNNER_TEMP/body.md"
+            pr="$(gh pr list --head "$BRANCH" --base develop --state open --json number --jq '.[0].number')"
+          else
+            gh pr edit "$pr" \
+              --title "chore(runtime): update stable-diffusion.cpp to ${VERSION}" \
+              --body-file "$RUNNER_TEMP/body.md"
+          fi
+          echo "number=$pr" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch exact-head qualification
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.commit.outputs.branch }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.commit.outputs.head_sha }}
+        run: |
+          gh workflow run sd-runtime-qualification.yml \
+            --ref "$BRANCH" \
+            -f pr_number="$PR_NUMBER" \
+            -f expected_head_sha="$HEAD_SHA"
+          echo "Opened PR #${PR_NUMBER} and dispatched qualification for ${HEAD_SHA}." >> "$GITHUB_STEP_SUMMARY"
