@@ -1033,8 +1033,8 @@ impl OwnedBrowser {
         }
 
         let launch_result = (|| {
-            let port = wait_for_devtools_port(&profile, &mut child, Duration::from_secs(10))?;
-            let websocket = discover_page_websocket(port)?;
+            // Ten seconds was too tight for a loaded CI runner under Xvfb.
+            let websocket = wait_for_page_websocket(&profile, &mut child, Duration::from_secs(30))?;
             let mut cdp = CdpConnection::connect(&websocket, grant)?;
             cdp.command("Page.enable", json!({}))?;
             cdp.command("Runtime.enable", json!({}))?;
@@ -2957,14 +2957,22 @@ fn validate_chromium_path(path: PathBuf) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn wait_for_devtools_port(
+/// Waits, under one deadline, for Chromium to write `DevToolsActivePort` and
+/// then to serve a page target on that port.
+///
+/// Chromium writes the port file before its HTTP server answers and before it
+/// registers its first page, so discovery is retried rather than asked once; a
+/// slow port file leaves less time for discovery instead of each half getting a
+/// budget of its own.
+fn wait_for_page_websocket(
     profile: &Path,
     child: &mut Child,
     timeout: Duration,
-) -> Result<u16, String> {
+) -> Result<String, String> {
     let path = profile.join("DevToolsActivePort");
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+    let mut pending = "DevToolsActivePort was never written".to_string();
+    loop {
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
             return Err(format!("Owned Chromium exited during startup: {status}"));
         }
@@ -2975,68 +2983,96 @@ fn wait_for_devtools_port(
                 .and_then(|line| line.parse::<u16>().ok())
                 .filter(|port| *port > 0)
                 .ok_or_else(|| "Invalid DevToolsActivePort".to_string())?;
-            return Ok(port);
+            match discover_page_websocket(port)? {
+                Ok(websocket) => return Ok(websocket),
+                Err(reason) => pending = reason,
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Owned Chromium did not expose a DevTools page target within {} seconds: {pending}",
+                timeout.as_secs()
+            ));
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    Err("Owned Chromium did not expose DevTools within 10 seconds".to_string())
 }
 
-fn discover_page_websocket(port: u16) -> Result<String, String> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|error| error.to_string())?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .map_err(|error| error.to_string())?;
-    write!(
-        stream,
-        "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    )
-    .map_err(|error| error.to_string())?;
-    stream.flush().map_err(|error| error.to_string())?;
+/// Asks Chromium's DevTools HTTP endpoint for its first page target.
+///
+/// `Ok(Err(reason))` is "not yet": a refused or reset connection, an empty or
+/// partial reply, or no page registered so far, all of which a starting
+/// Chromium produces and the caller retries. `Err` is a reply no amount of
+/// waiting fixes.
+fn discover_page_websocket(port: u16) -> Result<Result<String, String>, String> {
     let mut bytes = Vec::new();
-    let mut chunk = [0_u8; 16 * 1024];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(count) => {
-                bytes.extend_from_slice(&chunk[..count]);
-                if bytes.len() > MAX_DEVTOOLS_HTTP_BYTES {
-                    return Err("DevTools target response exceeds 2 MiB".to_string());
-                }
-                if let Some(split) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-                    let body_start = split + 4;
-                    let header = String::from_utf8_lossy(&bytes[..body_start]);
-                    if let Some(length) = header.lines().find_map(|line| {
-                        line.split_once(':').and_then(|(name, value)| {
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                    }) {
-                        if bytes.len().saturating_sub(body_start) >= length {
-                            break;
+    let read = (|| -> std::io::Result<()> {
+        let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        write!(
+            stream,
+            "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        )?;
+        stream.flush()?;
+        let mut chunk = [0_u8; 16 * 1024];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => return Ok(()),
+                Ok(count) => {
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if bytes.len() > MAX_DEVTOOLS_HTTP_BYTES {
+                        return Ok(());
+                    }
+                    if let Some(split) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                        let body_start = split + 4;
+                        let header = String::from_utf8_lossy(&bytes[..body_start]);
+                        if let Some(length) = header.lines().find_map(|line| {
+                            line.split_once(':').and_then(|(name, value)| {
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                        }) {
+                            if bytes.len().saturating_sub(body_start) >= length {
+                                return Ok(());
+                            }
                         }
                     }
                 }
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                break;
-            }
-            Err(error) => return Err(error.to_string()),
         }
+    })();
+    if bytes.len() > MAX_DEVTOOLS_HTTP_BYTES {
+        return Err("DevTools target response exceeds 2 MiB".to_string());
     }
-    let split = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| "Invalid DevTools HTTP response".to_string())?
-        + 4;
+    if let Err(error) = read {
+        return Ok(Err(format!("DevTools HTTP endpoint unreachable: {error}")));
+    }
+    let Some(split) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return Ok(Err(format!(
+            "Invalid DevTools HTTP response: no complete header in {} bytes",
+            bytes.len()
+        )));
+    };
+    let split = split + 4;
     let header = String::from_utf8_lossy(&bytes[..split]);
     if !header.starts_with("HTTP/1.1 200") {
-        return Err("DevTools target discovery failed".to_string());
+        return Err(format!(
+            "DevTools target discovery failed: {}",
+            header.lines().next().unwrap_or_default()
+        ));
     }
-    let targets: Vec<Value> = serde_json::from_slice(&bytes[split..])
-        .map_err(|error| format!("Invalid DevTools target list: {error}"))?;
-    targets
+    let targets: Vec<Value> = match serde_json::from_slice(&bytes[split..]) {
+        Ok(targets) => targets,
+        Err(error) => return Ok(Err(format!("Invalid DevTools target list: {error}"))),
+    };
+    Ok(targets
         .into_iter()
         .find(|target| target.get("type").and_then(Value::as_str) == Some("page"))
         .and_then(|target| {
@@ -3045,7 +3081,7 @@ fn discover_page_websocket(port: u16) -> Result<String, String> {
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })
-        .ok_or_else(|| "Chromium exposed no page target".to_string())
+        .ok_or_else(|| "Chromium exposed no page target".to_string()))
 }
 
 fn read_http_header(stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
@@ -4821,6 +4857,52 @@ mod tests {
         assert_eq!(used.load(Ordering::SeqCst), 6);
         reserve_quota(&used, 10, 4).unwrap();
         assert_eq!(used.load(Ordering::SeqCst), 10);
+    }
+
+    /// The CI flake: Chromium writes `DevToolsActivePort` before its HTTP server
+    /// answers, so the first `/json/list` can come back empty. Startup has to ask
+    /// again instead of failing the launch on it. Unix-only because
+    /// `observable_child` exits at once on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn page_discovery_retries_until_devtools_serves_a_page_target() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            drop(listener.accept().unwrap());
+            let (mut stream, _) = listener.accept().unwrap();
+            let body =
+                br#"[{"type":"page","webSocketDebuggerUrl":"ws://127.0.0.1/devtools/page/1"}]"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+            // Drain the request until the client hangs up: closing with unread
+            // bytes resets the connection and can discard the reply in flight.
+            let _ = std::io::copy(&mut stream, &mut std::io::sink());
+        });
+        let profile =
+            std::env::temp_dir().join(format!("lm-devtools-retry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(
+            profile.join("DevToolsActivePort"),
+            format!("{port}\n/devtools/browser/x"),
+        )
+        .unwrap();
+        let mut child = observable_child();
+
+        let websocket = wait_for_page_websocket(&profile, &mut child, Duration::from_secs(10));
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&profile);
+        // Before the join: a startup that gave up leaves the server parked in
+        // its second `accept`.
+        assert_eq!(websocket.unwrap(), "ws://127.0.0.1/devtools/page/1");
+        server.join().unwrap();
     }
 
     #[test]
