@@ -1,15 +1,19 @@
 #!/usr/bin/env node
-// Downloads one pinned official runtime archive for the current release
-// target, verifies its SHA-256, extracts only the server binary + its adjacent
-// runtime libraries/licenses, and stages that self-contained tree as a Tauri
-// resource. The resulting runtime is owned by Little Monkey; end users do not
-// need Ollama, a system llama.cpp, ComfyUI, or a Python environment.
+// Stages one pinned managed runtime for the current release target. Official
+// archives are downloaded and SHA-256 verified. A runtime target may instead
+// opt into a pinned source build when upstream publishes no compatible binary
+// for that architecture; the exact Git commit is checked before CMake runs.
+// Linux x64 additionally bootstraps a pinned, verified Vulkan SDK because the
+// Ubuntu 22.04 compatibility baseline does not package the glslc revision this
+// stable-diffusion.cpp/ggml pin requires.
 //
 // Usage: node scripts/stage-managed-runtime.mjs [runtime-id]
 //   llama (default) — llama.cpp `llama-server`
+//   llama-tts       — llama.cpp `llama-tts`
 //   sd              — stable-diffusion.cpp `sd-server`
 // The target triple comes from MANAGED_RUNTIME_TARGET, CLI_SIDECAR_TARGET, or
-// the host. A runtime that publishes no binary for the target exits non-zero.
+// the host. Every configured managed runtime target must resolve to either a
+// verified archive or a pinned source build.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -35,9 +39,18 @@ import { hostTriple } from "./lib/cliSidecarPlaceholder.mjs";
 import { managedRuntimeArchiveExtractor } from "./lib/managedRuntimeArchive.mjs";
 import {
   managedRuntime,
+  managedRuntimeProvenance,
+  managedRuntimeSourceCmakeArgs,
   serverFileName,
   stagedRuntimeDirectory,
 } from "./lib/managedRuntimeManifest.mjs";
+
+const VULKAN_SDK_VERSION = "1.4.341.1";
+const VULKAN_SDK_SHA256 =
+  "3bf0f762afb6c79bc6a9d9fb5998745ccff928800a29619b501ed9de7fd9789b";
+const VULKAN_SDK_ARCHIVE = `vulkansdk-linux-x86_64-${VULKAN_SDK_VERSION}.tar.xz`;
+const VULKAN_SDK_URL = `https://sdk.lunarg.com/sdk/download/${VULKAN_SDK_VERSION}/linux/${VULKAN_SDK_ARCHIVE}`;
+const MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024;
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const runtime = managedRuntime(process.argv[2] ?? "llama");
@@ -47,17 +60,13 @@ const target =
   hostTriple();
 const asset = runtime.assets[target];
 if (!asset) {
-  const detail =
+  throw new Error(
     `No managed ${runtime.manifestRuntime} runtime is pinned for target ${target}. ` +
-    `Supported targets: ${Object.keys(runtime.assets).join(", ")}`;
-  // An optional runtime simply does not exist on some hosts. Skipping is the
-  // correct outcome — the app already treats an absent tree as "this feature
-  // is unavailable here" — so a release build for such a target must not fail.
-  if (!runtime.optional) throw new Error(detail);
-  console.log(`[stage-managed-runtime] ${detail} Skipping.`);
-  process.exit(0);
+      `Supported targets: ${Object.keys(runtime.assets).join(", ")}`,
+  );
 }
 
+const provenanceSha256 = managedRuntimeProvenance(asset);
 const serverName = serverFileName(runtime, target);
 const stageRoot = join(
   repoRoot,
@@ -73,6 +82,20 @@ function sha256File(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
+function walkFiles(directory) {
+  const candidates = [];
+  const walk = (current) => {
+    for (const name of readdirSync(current)) {
+      const path = join(current, name);
+      const stat = lstatSync(path);
+      if (stat.isDirectory()) walk(path);
+      else candidates.push(path);
+    }
+  };
+  walk(directory);
+  return candidates;
+}
+
 function cachedStageIsCurrent() {
   if (!existsSync(stagedBinary) || !existsSync(stagedManifest)) return false;
   try {
@@ -82,7 +105,8 @@ function cachedStageIsCurrent() {
       manifest.runtime !== runtime.manifestRuntime ||
       manifest.version !== runtime.version ||
       manifest.target !== target ||
-      manifest.archiveSha256 !== asset.sha256
+      manifest.sourceUrl !== asset.url ||
+      manifest.archiveSha256 !== provenanceSha256
     ) {
       return false;
     }
@@ -110,60 +134,72 @@ if (cachedStageIsCurrent()) {
 const workRoot = mkdtempSync(
   join(tmpdir(), `little-monkey-${runtime.id}-runtime-`),
 );
-const archivePath = join(workRoot, basename(asset.archive));
 const extractRoot = join(workRoot, "extract");
 const publishRoot = join(workRoot, "publish");
 mkdirSync(extractRoot);
 mkdirSync(publishRoot);
 
-try {
-  console.log(`[stage-managed-runtime] downloading ${asset.url}`);
-  const response = await fetch(asset.url, { redirect: "follow" });
-  if (!response.ok || !response.body) {
-    throw new Error(
-      `Runtime download failed (${response.status} ${response.statusText})`,
-    );
-  }
-  const bytes = Buffer.from(await response.arrayBuffer());
-  // Verify the pinned digest in memory, before the download reaches the
-  // filesystem, so an archive that fails its checksum is never written at all.
-  const actualArchiveSha = createHash("sha256").update(bytes).digest("hex");
-  if (actualArchiveSha !== asset.sha256) {
-    throw new Error(
-      `Runtime archive checksum mismatch: expected ${asset.sha256}, got ${actualArchiveSha}`,
-    );
-  }
-  writeFileSync(archivePath, bytes);
+function copyExecutable(source, destination) {
+  copyFileSync(source, destination);
+  if (!target.includes("windows")) chmodSync(destination, 0o755);
+}
 
-  // Only Windows and macOS ship `tar` as bsdtar, which reads zip archives too.
-  // Linux `tar` is GNU tar and cannot ("This does not look like a tar
-  // archive"), so zips go through unzip everywhere except Windows, whose
-  // images have no unzip. Passing each argument separately avoids a shell and
-  // keeps archive paths inert.
+function downloadVerified(url, destination, expectedSha256, label) {
+  console.log(`[stage-managed-runtime] downloading ${label} from ${url}`);
+  rmSync(destination, { force: true });
+  try {
+    // Keep network bytes out of Node's file-write path: curl writes only into
+    // this process-owned temporary directory, then the file is authenticated
+    // before any extractor or build tool is allowed to consume it. execFileSync
+    // does not invoke a shell, so the pinned URL and destination stay inert.
+    execFileSync(
+      "curl",
+      [
+        "--fail",
+        "--location",
+        "--silent",
+        "--show-error",
+        "--proto",
+        "=https",
+        "--tlsv1.2",
+        "--max-filesize",
+        String(MAX_DOWNLOAD_BYTES),
+        "--output",
+        destination,
+        url,
+      ],
+      { stdio: "inherit" },
+    );
+    const actualSha256 = sha256File(destination);
+    if (actualSha256 !== expectedSha256) {
+      throw new Error(
+        `${label} checksum mismatch: expected ${expectedSha256}, got ${actualSha256}`,
+      );
+    }
+  } catch (error) {
+    rmSync(destination, { force: true });
+    throw error;
+  }
+}
+
+async function stageArchiveAsset() {
+  const archivePath = join(workRoot, basename(asset.archive));
+  downloadVerified(asset.url, archivePath, asset.sha256, "runtime archive");
+
+  // Windows and macOS ship bsdtar, which reads zip archives too. Linux uses
+  // unzip for zip assets because GNU tar does not accept them.
   const [extractCommand, extractArgs] = managedRuntimeArchiveExtractor(
     archivePath,
     extractRoot,
   );
   execFileSync(extractCommand, extractArgs, { stdio: "inherit" });
 
-  const candidates = [];
-  const walk = (directory) => {
-    for (const name of readdirSync(directory)) {
-      const path = join(directory, name);
-      const stat = lstatSync(path);
-      if (stat.isDirectory()) walk(path);
-      else candidates.push(path);
-    }
-  };
-  walk(extractRoot);
-
+  const candidates = walkFiles(extractRoot);
   const server = candidates.find((path) => basename(path) === serverName);
   if (!server) {
     throw new Error(`Verified archive did not contain ${serverName}`);
   }
   const serverDirectory = dirname(server);
-
-  // Extra executables the runtime ships and the app also launches.
   const extraNames = (runtime.extraBinaries ?? []).map((name) =>
     target.includes("windows") ? `${name}.exe` : name,
   );
@@ -177,8 +213,6 @@ try {
   const shouldStage = (path) => {
     if (dirname(path) !== serverDirectory) return false;
     const name = basename(path);
-    // `.txt` covers stable-diffusion.cpp's ggml.txt / stable-diffusion.cpp.txt
-    // license notices, which upstream ships instead of a bare LICENSE file.
     if (executableNames.has(name) || name === "LICENSE") return true;
     if (extname(name).toLowerCase() === ".txt") return true;
     if (target.includes("windows")) return extname(name).toLowerCase() === ".dll";
@@ -192,18 +226,147 @@ try {
       throw new Error(`Runtime staging lost ${name}`);
     }
   }
-
   for (const source of selected) {
-    // copyFileSync dereferences archive symlinks. That intentionally produces
-    // a flat, portable tree whose versioned and compatibility library names
-    // all remain valid after Tauri packages it.
     const destination = join(publishRoot, basename(source));
     copyFileSync(source, destination);
     if (!target.includes("windows") && executableNames.has(basename(source))) {
       chmodSync(destination, 0o755);
     }
   }
+}
 
+async function sourceBuildEnvironment() {
+  const env = { ...process.env };
+  if (asset.backend !== "vulkan") return env;
+  if (target !== "x86_64-unknown-linux-gnu") {
+    throw new Error(`Pinned Vulkan source toolchain is not configured for ${target}`);
+  }
+
+  // The pinned ggml submodule uses CMake's Vulkan `glslc` component. Jammy's
+  // archive has libvulkan-dev but no glslc package, while building on Noble
+  // makes the final executable depend on GLIBC 2.38. Bootstrap a verified SDK
+  // instead so the binary is still compiled on the Ubuntu 22.04 ABI baseline.
+  const archivePath = join(workRoot, VULKAN_SDK_ARCHIVE);
+  downloadVerified(
+    VULKAN_SDK_URL,
+    archivePath,
+    VULKAN_SDK_SHA256,
+    `Vulkan SDK ${VULKAN_SDK_VERSION}`,
+  );
+  const sdkExtractRoot = join(workRoot, "vulkan-sdk");
+  mkdirSync(sdkExtractRoot);
+  execFileSync("tar", ["-xf", archivePath, "-C", sdkExtractRoot], {
+    stdio: "inherit",
+  });
+  const sdkRoot = join(sdkExtractRoot, VULKAN_SDK_VERSION, "x86_64");
+  const glslc = join(sdkRoot, "bin", "glslc");
+  if (!existsSync(glslc)) {
+    throw new Error(`Verified Vulkan SDK did not contain ${glslc}`);
+  }
+
+  env.VULKAN_SDK = sdkRoot;
+  env.PATH = `${join(sdkRoot, "bin")}:${env.PATH ?? ""}`;
+  env.CMAKE_PREFIX_PATH = env.CMAKE_PREFIX_PATH
+    ? `${sdkRoot}:${env.CMAKE_PREFIX_PATH}`
+    : sdkRoot;
+  env.LD_LIBRARY_PATH = env.LD_LIBRARY_PATH
+    ? `${join(sdkRoot, "lib")}:${env.LD_LIBRARY_PATH}`
+    : join(sdkRoot, "lib");
+  return env;
+}
+
+async function stageSourceAsset() {
+  if (runtime.id !== "sd") {
+    throw new Error(
+      `Pinned source builds are not implemented for managed runtime ${runtime.id}`,
+    );
+  }
+  const sourceRoot = join(workRoot, "source");
+  const buildRoot = join(workRoot, "build");
+  const sourceRepo = "https://github.com/leejet/stable-diffusion.cpp.git";
+
+  console.log(
+    `[stage-managed-runtime] building stable-diffusion.cpp ${asset.sourceCommit} for ${target}`,
+  );
+  execFileSync("git", ["init", sourceRoot], { stdio: "inherit" });
+  execFileSync("git", ["-C", sourceRoot, "remote", "add", "origin", sourceRepo], {
+    stdio: "inherit",
+  });
+  execFileSync(
+    "git",
+    ["-C", sourceRoot, "fetch", "--depth", "1", "origin", asset.sourceCommit],
+    { stdio: "inherit" },
+  );
+  execFileSync("git", ["-C", sourceRoot, "checkout", "--detach", "FETCH_HEAD"], {
+    stdio: "inherit",
+  });
+  const checkedOut = execFileSync("git", ["-C", sourceRoot, "rev-parse", "HEAD"], {
+    encoding: "utf8",
+  }).trim();
+  if (checkedOut !== asset.sourceCommit) {
+    throw new Error(
+      `stable-diffusion.cpp source checkout mismatch: expected ${asset.sourceCommit}, got ${checkedOut}`,
+    );
+  }
+  execFileSync(
+    "git",
+    ["-C", sourceRoot, "submodule", "update", "--init", "--recursive", "--depth", "1"],
+    { stdio: "inherit" },
+  );
+
+  const buildEnv = await sourceBuildEnvironment();
+  execFileSync(
+    "cmake",
+    [
+      "-S",
+      sourceRoot,
+      "-B",
+      buildRoot,
+      ...managedRuntimeSourceCmakeArgs(asset),
+    ],
+    { stdio: "inherit", env: buildEnv },
+  );
+  execFileSync(
+    "cmake",
+    [
+      "--build",
+      buildRoot,
+      "--config",
+      "Release",
+      "--target",
+      "sd-server",
+      "--parallel",
+      process.env.CMAKE_BUILD_PARALLEL_LEVEL || "2",
+    ],
+    { stdio: "inherit", env: buildEnv },
+  );
+
+  const serverCandidates = walkFiles(buildRoot).filter(
+    (path) => basename(path) === serverName,
+  );
+  if (serverCandidates.length !== 1) {
+    throw new Error(
+      `Pinned source build produced ${serverCandidates.length} ${serverName} binaries; expected exactly one`,
+    );
+  }
+  copyExecutable(serverCandidates[0], join(publishRoot, serverName));
+
+  // Keep the upstream license beside the source-built binary just as the
+  // official release archives do for their notices.
+  const license = join(sourceRoot, "LICENSE");
+  if (existsSync(license)) copyFileSync(license, join(publishRoot, "LICENSE"));
+}
+
+try {
+  if (asset.archive) await stageArchiveAsset();
+  else await stageSourceAsset();
+
+  const executableNames = new Set([
+    serverName,
+    ...(runtime.extraBinaries ?? []).map((name) =>
+      target.includes("windows") ? `${name}.exe` : name,
+    ),
+  ]);
   const files = readdirSync(publishRoot)
     .filter((name) => statSync(join(publishRoot, name)).isFile())
     .sort()
@@ -213,6 +376,7 @@ try {
       sizeBytes: statSync(join(publishRoot, name)).size,
       executable: executableNames.has(name),
     }));
+
   writeFileSync(
     join(publishRoot, "runtime-manifest.json"),
     `${JSON.stringify(
@@ -222,7 +386,7 @@ try {
         version: runtime.version,
         target,
         sourceUrl: asset.url,
-        archiveSha256: asset.sha256,
+        archiveSha256: provenanceSha256,
         files,
       },
       null,

@@ -15,6 +15,7 @@ describe("describeWeightFile", () => {
       // Qwen3-VL, but shipped as MiniMax H3's text encoder — the model it
       // belongs to is the one worth naming.
       ["qwen3vl_32b_minimax_h3-Q2_K_M.gguf", "qwen3vl 32b minimax h3", "MiniMax"],
+      ["qwen-image-2.1-Q8_0.gguf", "qwen image 2 1", "Qwen"],
       ["flux1-dev.safetensors", "flux1 dev", "FLUX"],
       ["Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf", "Qwen3 TTS 12Hz 1 7B Base", "Qwen"],
     ] as const) {
@@ -37,6 +38,11 @@ describe("describeWeightFile", () => {
       ["WavTokenizer-Large-75-F16.gguf", "vocoder"],
       ["taesd_decoder.safetensors", "taesd"],
       ["qwen3vl_32b_minimax_h3-Q2_K_M.gguf", "llm"],
+      // Qwen Image 2.1's diffusion GGUF does not contain `diffusion_model` in
+      // its filename. It still must go to --diffusion-model, not the fresh
+      // row's all-in-one --model/checkpoint default.
+      ["qwen-image-2.1-Q8_0.gguf", "diffusion_model"],
+      ["qwen_image_2.1-Q4_K.gguf", "diffusion_model"],
       // The directory is the only thing that names this one, and repositories
       // lay these files out by component.
       ["split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors", "diffusion_model"],
@@ -70,6 +76,9 @@ describe("describeWeightFile", () => {
       ["ip-adapter_sd15_vit-h.safetensors", "ip_adapter"],
       // Contains "diffusion_model" outright.
       ["uncond-diffusion-model.safetensors", "uncond_diffusion_model"],
+      // A Qwen Image VAE must stay a VAE even though the architecture name is
+      // itself enough to identify the companion diffusion model.
+      ["qwen_image_2.1_vae_bf16.safetensors", "vae"],
       // Contains "sd15", which the SD family pattern also reads — family and
       // slot are independent, and the slot must still be the motion module.
       ["mm_sd_v15.ckpt", "motion_module"],
