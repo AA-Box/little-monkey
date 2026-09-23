@@ -244,19 +244,14 @@ fn top_level_object_spans(text: &str) -> Vec<(usize, usize)> {
 fn parse_text_tool_call(candidate: &str, offered: &[String]) -> Option<(String, String)> {
     let parsed: serde_json::Value = serde_json::from_str(candidate).ok()?;
     let object = parsed.as_object()?;
-    if object
-        .keys()
-        .any(|key| !TEXT_TOOL_CALL_KEYS.contains(&key.as_str()))
-    {
+    if object.keys().any(|key| !TEXT_TOOL_CALL_KEYS.contains(&key.as_str())) {
         return None;
     }
     let name = object.get("name")?.as_str()?;
     if !offered.iter().any(|offered_name| offered_name == name) {
         return None;
     }
-    let arguments = object
-        .get("arguments")
-        .or_else(|| object.get("parameters"))?;
+    let arguments = object.get("arguments").or_else(|| object.get("parameters"))?;
     let arguments = match arguments {
         serde_json::Value::String(raw) => raw.clone(),
         serde_json::Value::Object(_) => serde_json::to_string(arguments).ok()?,
@@ -398,10 +393,7 @@ mod recovery_tests {
                     "write_file".to_string(),
                     "{\"content\":\"X=1\",\"path\":\"a.env\"}".to_string()
                 ),
-                (
-                    "run_shell".to_string(),
-                    "{\"command\":\"./run\"}".to_string()
-                ),
+                ("run_shell".to_string(), "{\"command\":\"./run\"}".to_string()),
             ]
         );
     }
@@ -466,8 +458,9 @@ mod parser_tests {
     #[test]
     fn surfaces_a_mid_stream_error_frame() {
         let mut parser = SseParser::new();
-        let events = parser
-            .feed("data: {\"error\": {\"message\": \"Model type qwen3_5 not supported.\"}}\n\n");
+        let events = parser.feed(
+            "data: {\"error\": {\"message\": \"Model type qwen3_5 not supported.\"}}\n\n",
+        );
         assert!(matches!(
             events.as_slice(),
             [StreamEvent::Error(reason)] if reason == "Model type qwen3_5 not supported."

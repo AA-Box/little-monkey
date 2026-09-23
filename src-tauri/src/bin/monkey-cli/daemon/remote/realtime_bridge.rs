@@ -285,9 +285,7 @@ pub(crate) async fn spawn_host_media_bridge(
                     .keep_alive(true)
                     .serve_connection(
                         TokioIo::new(stream),
-                        service_fn(move |request| {
-                            handle_host_media(api.clone(), token.clone(), request)
-                        }),
+                        service_fn(move |request| handle_host_media(api.clone(), token.clone(), request)),
                     )
                     .await;
             });
@@ -332,23 +330,17 @@ async fn handle_host_media(
         return Ok(host_response(StatusCode::BAD_REQUEST, Bytes::new()));
     };
     let result = match (request.method(), direction) {
-        (&Method::GET, "input") => {
-            match api.take_realtime_input_for_host(&session_id, generation) {
-                Ok(Some(chunk)) => {
-                    let mut response = host_response(StatusCode::OK, Bytes::from(chunk.bytes));
-                    if let Ok(value) =
-                        hyper::header::HeaderValue::from_str(&chunk.sequence.to_string())
-                    {
-                        response
-                            .headers_mut()
-                            .insert("x-little-monkey-audio-sequence", value);
-                    }
-                    response
+        (&Method::GET, "input") => match api.take_realtime_input_for_host(&session_id, generation) {
+            Ok(Some(chunk)) => {
+                let mut response = host_response(StatusCode::OK, Bytes::from(chunk.bytes));
+                if let Ok(value) = hyper::header::HeaderValue::from_str(&chunk.sequence.to_string()) {
+                    response.headers_mut().insert("x-little-monkey-audio-sequence", value);
                 }
-                Ok(None) => host_response(StatusCode::NO_CONTENT, Bytes::new()),
-                Err(_) => host_response(StatusCode::CONFLICT, Bytes::new()),
+                response
             }
-        }
+            Ok(None) => host_response(StatusCode::NO_CONTENT, Bytes::new()),
+            Err(_) => host_response(StatusCode::CONFLICT, Bytes::new()),
+        },
         (&Method::POST, "output") => {
             let body = match Limited::new(request.into_body(), MAX_REALTIME_PCM_CHUNK_BYTES)
                 .collect()
@@ -362,12 +354,10 @@ async fn handle_host_media(
                 Err(_) => host_response(StatusCode::CONFLICT, Bytes::new()),
             }
         }
-        (&Method::DELETE, "output") => {
-            match api.clear_realtime_output_from_host(&session_id, generation) {
-                Ok(()) => host_response(StatusCode::NO_CONTENT, Bytes::new()),
-                Err(_) => host_response(StatusCode::CONFLICT, Bytes::new()),
-            }
-        }
+        (&Method::DELETE, "output") => match api.clear_realtime_output_from_host(&session_id, generation) {
+            Ok(()) => host_response(StatusCode::NO_CONTENT, Bytes::new()),
+            Err(_) => host_response(StatusCode::CONFLICT, Bytes::new()),
+        },
         _ => host_response(StatusCode::METHOD_NOT_ALLOWED, Bytes::new()),
     };
     Ok(result)
@@ -386,10 +376,7 @@ fn host_response(status: StatusCode, body: Bytes) -> Response<Full<Bytes>> {
             "content-type, x-little-monkey-host-media-token, x-little-monkey-route-session, \
              x-little-monkey-route-generation",
         )
-        .header(
-            "access-control-expose-headers",
-            "x-little-monkey-audio-sequence",
-        )
+        .header("access-control-expose-headers", "x-little-monkey-audio-sequence")
         .body(Full::new(body))
         .expect("static host-media response is valid")
 }

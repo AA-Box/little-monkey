@@ -1551,9 +1551,10 @@ pub fn models_add_external_folder(app: AppHandle, path: String) -> Result<Vec<Mo
 #[cfg(target_os = "macos")]
 fn unsupported_mlx_architectures(app: &AppHandle, shapes: &[LocalModelShape]) -> Option<String> {
     let app_data = app.profile_data_dir().ok()?;
-    let version_directory = crate::mlx_runtime::active_version_directory(
-        &crate::m3_production::mlx_runtime_root(&app_data),
-    )?;
+    let version_directory =
+        crate::mlx_runtime::active_version_directory(&crate::m3_production::mlx_runtime_root(
+            &app_data,
+        ))?;
     let mut unsupported = std::collections::BTreeSet::new();
     for shape in shapes {
         if shape.runtime != model_sources::ModelRuntimeKind::Mlx {

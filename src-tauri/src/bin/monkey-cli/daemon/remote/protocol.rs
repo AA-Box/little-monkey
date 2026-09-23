@@ -1673,11 +1673,7 @@ impl TalkTicketRequest {
     pub fn validate(&self) -> Result<(), String> {
         validate_talk_protocol_version(self.protocol_version)?;
         validate_talk_session_id(&self.session_id)?;
-        match (
-            &self.route_id,
-            self.route_generation,
-            self.route_role.as_deref(),
-        ) {
+        match (&self.route_id, self.route_generation, self.route_role.as_deref()) {
             (None, None, None) => Ok(()),
             (Some(route_id), Some(generation), Some(role)) => {
                 validate_id(route_id)?;
@@ -3414,10 +3410,7 @@ mod tests {
             route_role: None,
         };
         assert!(request.validate().is_err());
-        let request = TalkTicketRequest {
-            route_role: Some("output".into()),
-            ..request
-        };
+        let request = TalkTicketRequest { route_role: Some("output".into()), ..request };
         assert!(request.validate().is_ok());
     }
 
@@ -3429,21 +3422,13 @@ mod tests {
         // release the next one.
         let frame = client_talk_frame(
             2,
-            TalkClientFrameKind::PlaybackAck {
-                audio_sequence: 3,
-                played: true,
-            },
+            TalkClientFrameKind::PlaybackAck { audio_sequence: 3, played: true },
         );
-        frame
-            .validate()
-            .expect("a playback ack is an ordinary client frame");
+        frame.validate().expect("a playback ack is an ordinary client frame");
 
         let unnumbered = client_talk_frame(
             3,
-            TalkClientFrameKind::PlaybackAck {
-                audio_sequence: 0,
-                played: true,
-            },
+            TalkClientFrameKind::PlaybackAck { audio_sequence: 0, played: true },
         );
         assert_eq!(
             unnumbered.validate(),
@@ -3454,12 +3439,10 @@ mod tests {
         // "this chunk did not play" to stop the stream rather than to hang.
         client_talk_frame(
             4,
-            TalkClientFrameKind::PlaybackAck {
-                audio_sequence: 4,
-                played: false,
-            },
+            TalkClientFrameKind::PlaybackAck { audio_sequence: 4, played: false },
         )
         .validate()
         .expect("a negative playback ack must reach the host");
     }
+
 }

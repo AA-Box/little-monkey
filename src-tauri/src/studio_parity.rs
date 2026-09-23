@@ -14,7 +14,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tauri::AppHandle;
 use uuid::Uuid;
 
@@ -51,18 +51,18 @@ pub struct DiscoveryItem {
 }
 
 fn public_client() -> Result<reqwest::Client, String> {
-    crate::web::executable_extension_http_client(Duration::from_secs(10 * 60))
-        .map_err(|error| error.to_string())
+    crate::egress::public_download_client(
+        crate::egress::PublicDestinations::Only,
+        "studio-community-assets",
+    )
+    .timeout(Duration::from_secs(10 * 60))
+    .build()
+    .map_err(|error| error.to_string())
 }
 
 fn validate_public_https(url: &Url) -> Result<(), String> {
-    if url.scheme() != "https" {
-        return Err("Studio discovery only permits HTTPS downloads".to_string());
-    }
-    if url.host_str().is_none() {
-        return Err("The download URL has no host".to_string());
-    }
-    Ok(())
+    crate::egress::classify_public_download_url(url, crate::egress::PublicDestinations::Only)
+        .map_err(|error| error.to_string())
 }
 
 async fn get_json(url: Url) -> Result<Value, String> {
@@ -242,7 +242,8 @@ async fn search_hugging_face(
     url.query_pairs_mut()
         .append_pair("search", query)
         .append_pair("limit", "24")
-        .append_pair("full", "true");
+        .append_pair("full", "true")
+        .append_pair("blobs", "true");
     let payload = get_json(url).await?;
     let Some(models) = payload.as_array() else {
         return Err("Unexpected Hugging Face response".into());
@@ -906,6 +907,12 @@ pub async fn studio_workflow_run(
     app: AppHandle,
     request: StudioWorkflowRequest,
 ) -> Result<Vec<GenerationEntry>, String> {
+    if !matches!(
+        request.kind.as_str(),
+        "music" | "talking_character" | "motion_control" | "extend_video"
+    ) {
+        return Err("Unknown Studio workflow preset".into());
+    }
     if serde_json::to_vec(&request.workflow)
         .map_err(|e| e.to_string())?
         .len()
@@ -944,7 +951,11 @@ pub async fn studio_workflow_run(
         ));
     }
     let submitted: ComfyPromptResponse = response.json().await.map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + WORKFLOW_TIMEOUT;
     let history = loop {
+        if Instant::now() >= deadline {
+            return Err("ComfyUI workflow timed out".into());
+        }
         tokio::time::sleep(Duration::from_millis(750)).await;
         let response = crate::egress::send(
             client.get(

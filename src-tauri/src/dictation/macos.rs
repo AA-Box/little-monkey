@@ -170,7 +170,8 @@ unsafe extern "C" fn microphone_access_callback(user_data: *mut c_void, status: 
     if user_data.is_null() {
         return;
     }
-    let sender = unsafe { Box::from_raw(user_data.cast::<tokio::sync::oneshot::Sender<String>>()) };
+    let sender =
+        unsafe { Box::from_raw(user_data.cast::<tokio::sync::oneshot::Sender<String>>()) };
     let _ = sender.send(copy_c_string(status));
 }
 

@@ -356,8 +356,8 @@ pub fn realtime_voice_media_bridge(
         .as_ref()
         .ok_or_else(|| "Realtime host-media bridge is unavailable".to_string())?;
     let path = root.join("daemon").join("realtime-host-media.json");
-    let bytes =
-        fs::read(&path).map_err(|_| "Realtime host-media bridge is not running".to_string())?;
+    let bytes = fs::read(&path)
+        .map_err(|_| "Realtime host-media bridge is not running".to_string())?;
     let config: RealtimeHostMediaConfig = serde_json::from_slice(&bytes)
         .map_err(|_| "Realtime host-media bridge configuration is invalid".to_string())?;
     if config.protocol_version != 1 {

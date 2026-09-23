@@ -1569,10 +1569,7 @@ impl RemoteStore {
     /// Matched on the exact endpoint token rather than a pattern, because a
     /// device id is user-visible text and a `LIKE` would make `%` in one mean
     /// something.
-    pub fn voice_routes_for_device(
-        &self,
-        device_id: &str,
-    ) -> Result<Vec<VoiceRouteRecord>, String> {
+    pub fn voice_routes_for_device(&self, device_id: &str) -> Result<Vec<VoiceRouteRecord>, String> {
         let mut statement = self
             .connection
             .prepare(&format!(
@@ -1657,7 +1654,11 @@ impl RemoteStore {
                     .ok_or_else(|| "Voice route generation is exhausted".to_string())?;
                 (route_id, next, created_at_ms)
             }
-            None => (format!("vr-{}", random_token_id(18)?), 1, to_i64(now_ms)?),
+            None => (
+                format!("vr-{}", random_token_id(18)?),
+                1,
+                to_i64(now_ms)?,
+            ),
         };
         transaction
             .execute(
@@ -1706,24 +1707,15 @@ impl RemoteStore {
             )
             .map_err(|error| error.to_string())?;
         if changed != 1 {
-            return Err(
-                "Voice route generation changed before endpoint activation finished".to_string(),
-            );
+            return Err("Voice route generation changed before endpoint activation finished".to_string());
         }
         self.voice_route(session_id)?
             .ok_or_else(|| "Voice route disappeared after command update".to_string())
     }
 
-    pub fn stop_voice_route(
-        &mut self,
-        session_id: &str,
-        now_ms: u64,
-    ) -> Result<Option<VoiceRouteRecord>, String> {
-        let Some(existing) = self.voice_route(session_id)? else {
-            return Ok(None);
-        };
-        let next_generation = existing
-            .generation
+    pub fn stop_voice_route(&mut self, session_id: &str, now_ms: u64) -> Result<Option<VoiceRouteRecord>, String> {
+        let Some(existing) = self.voice_route(session_id)? else { return Ok(None); };
+        let next_generation = existing.generation
             .checked_add(1)
             .ok_or_else(|| "Voice route generation is exhausted".to_string())?;
         self.connection
@@ -1793,9 +1785,7 @@ impl RemoteStore {
             }
         }
         if contains_media(payload) {
-            return Err(
-                "VoiceRoute coordination events may not contain raw or encoded media".to_string(),
-            );
+            return Err("VoiceRoute coordination events may not contain raw or encoded media".to_string());
         }
         // The gate is the one exchange a caller blocks on: the desktop waits up
         // to eight seconds for an ack naming the gate it sent, and the Talk
@@ -1805,20 +1795,13 @@ impl RemoteStore {
         // microphone that was never actually asked to close.
         match kind {
             "input_gate" => {
-                if !payload
-                    .get("open")
-                    .is_some_and(serde_json::Value::is_boolean)
-                {
+                if !payload.get("open").is_some_and(serde_json::Value::is_boolean) {
                     return Err("An input_gate event needs a boolean 'open'".to_string());
                 }
             }
             "input_gate_ack" => {
-                if !payload
-                    .get("open")
-                    .is_some_and(serde_json::Value::is_boolean)
-                    || !payload
-                        .get("gate_sequence")
-                        .is_some_and(serde_json::Value::is_u64)
+                if !payload.get("open").is_some_and(serde_json::Value::is_boolean)
+                    || !payload.get("gate_sequence").is_some_and(serde_json::Value::is_u64)
                 {
                     return Err(
                         "An input_gate_ack event needs a boolean 'open' and the 'gate_sequence' it answers".to_string(),
@@ -1838,19 +1821,13 @@ impl RemoteStore {
         payload: &serde_json::Value,
         now_ms: u64,
     ) -> Result<VoiceRouteEventRecord, String> {
-        let route = self
-            .voice_route(session_id)?
+        let route = self.voice_route(session_id)?
             .ok_or_else(|| "No voice route exists for this conversation".to_string())?;
         if route.state != "active" || route.generation != generation {
             return Err("Voice route generation is stale".to_string());
         }
         Self::validate_voice_route_event(kind, payload)?;
-        if kind.is_empty()
-            || kind.len() > 64
-            || !kind.bytes().all(|byte| {
-                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
-            })
-        {
+        if kind.is_empty() || kind.len() > 64 || !kind.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')) {
             return Err("Voice route event kind is invalid".to_string());
         }
         let encoded = serde_json::to_vec(payload).map_err(|error| error.to_string())?;
@@ -1921,15 +1898,13 @@ impl RemoteStore {
                         session_id: row.get(1)?,
                         generation: from_i64(row.get(2)?)?,
                         kind: row.get(3)?,
-                        payload: serde_json::from_slice(&payload)
-                            .unwrap_or(serde_json::Value::Null),
+                        payload: serde_json::from_slice(&payload).unwrap_or(serde_json::Value::Null),
                         created_at_ms: from_i64(row.get(5)?)?,
                     })
                 },
             )
             .map_err(|error| error.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
     }
 
     pub fn audit_entries(&self, limit: u32) -> Result<Vec<AuditEntry>, String> {
@@ -3912,6 +3887,7 @@ mod tests {
         (root, store, FakeSecrets::default(), scopes)
     }
 
+
     #[test]
     fn voice_route_coordination_log_rejects_media_and_stale_generations() {
         let (root, mut store, _secrets, _scopes) = fixture();
@@ -3942,9 +3918,7 @@ mod tests {
             &serde_json::json!({"turn_id": "turn-one", "audio_base64": "AAECAw=="}),
             1_002,
         );
-        assert!(media
-            .unwrap_err()
-            .contains("may not contain raw or encoded media"));
+        assert!(media.unwrap_err().contains("may not contain raw or encoded media"));
         let unknown = store.append_voice_route_event(
             &route.session_id,
             route.generation,
@@ -3952,9 +3926,7 @@ mod tests {
             &serde_json::json!({"sequence": 1}),
             1_003,
         );
-        assert!(unknown
-            .unwrap_err()
-            .contains("Unknown VoiceRoute coordination event"));
+        assert!(unknown.unwrap_err().contains("Unknown VoiceRoute coordination event"));
         let next = store
             .replace_voice_route(
                 &route.session_id,
@@ -3988,24 +3960,10 @@ mod tests {
     fn a_realtime_input_gate_and_its_acknowledgement_round_trip_through_the_ledger() {
         let (root, mut store, _secrets, _scopes) = fixture();
         let route = store
-            .replace_voice_route(
-                "chat-gate",
-                "realtime",
-                "paired:phone-one:input",
-                "local:output:default",
-                None,
-                None,
-                2_000,
-            )
+            .replace_voice_route("chat-gate", "realtime", "paired:phone-one:input", "local:output:default", None, None, 2_000)
             .unwrap();
         let gate = store
-            .append_voice_route_event(
-                &route.session_id,
-                route.generation,
-                "input_gate",
-                &serde_json::json!({"open": false}),
-                2_001,
-            )
+            .append_voice_route_event(&route.session_id, route.generation, "input_gate", &serde_json::json!({"open": false}), 2_001)
             .unwrap();
         let ack = store
             .append_voice_route_event(
@@ -4018,52 +3976,26 @@ mod tests {
             .unwrap();
         let recorded = store.voice_route_events(&route.session_id, 0, 16).unwrap();
         assert_eq!(
-            recorded
-                .iter()
-                .map(|event| event.kind.as_str())
-                .collect::<Vec<_>>(),
+            recorded.iter().map(|event| event.kind.as_str()).collect::<Vec<_>>(),
             ["input_gate", "input_gate_ack"],
         );
-        assert_eq!(
-            recorded[1].payload["gate_sequence"],
-            serde_json::json!(gate.event_id)
-        );
+        assert_eq!(recorded[1].payload["gate_sequence"], serde_json::json!(gate.event_id));
         assert_eq!(ack.generation, route.generation);
 
         // The shape is part of the contract: the socket skips a gate whose
         // `open` it cannot read, and the desktop only accepts an ack naming the
         // gate it sent.
         assert!(store
-            .append_voice_route_event(
-                &route.session_id,
-                route.generation,
-                "input_gate",
-                &serde_json::json!({"open": "yes"}),
-                2_003
-            )
+            .append_voice_route_event(&route.session_id, route.generation, "input_gate", &serde_json::json!({"open": "yes"}), 2_003)
             .unwrap_err()
             .contains("boolean 'open'"));
         assert!(store
-            .append_voice_route_event(
-                &route.session_id,
-                route.generation,
-                "input_gate_ack",
-                &serde_json::json!({"open": true}),
-                2_004
-            )
+            .append_voice_route_event(&route.session_id, route.generation, "input_gate_ack", &serde_json::json!({"open": true}), 2_004)
             .unwrap_err()
             .contains("gate_sequence"));
 
         let retired = store
-            .replace_voice_route(
-                &route.session_id,
-                "realtime",
-                "paired:phone-one:input",
-                "local:output:default",
-                None,
-                None,
-                2_005,
-            )
+            .replace_voice_route(&route.session_id, "realtime", "paired:phone-one:input", "local:output:default", None, None, 2_005)
             .unwrap();
         assert!(retired.generation > route.generation);
         assert_eq!(

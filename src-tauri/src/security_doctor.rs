@@ -2367,8 +2367,9 @@ mod tests {
             ..VoicePrivacySnapshot::default()
         }));
         assert!(has(&active, "voice.realtime_local_peer"));
-        assert!(detail_of(&active, "voice.realtime_active")
-            .contains("leaves neither this process nor this machine"),);
+        assert!(
+            detail_of(&active, "voice.realtime_active").contains("leaves neither this process nor this machine"),
+        );
 
         // And the ordinary provider is untouched by any of it.
         let openai = voice_findings(Some(VoicePrivacySnapshot {

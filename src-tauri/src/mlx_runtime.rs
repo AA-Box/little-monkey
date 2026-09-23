@@ -595,8 +595,7 @@ impl MlxPackageInstaller {
         let destination = versions.join(&prepared.version_directory_name);
         match fs::symlink_metadata(&destination) {
             Ok(metadata) if metadata.file_type().is_dir() => {
-                let verified =
-                    self.verify_version_directory(&destination, VerificationDepth::Digests)?;
+                let verified = self.verify_version_directory(&destination, VerificationDepth::Digests)?;
                 if verified.manifest_sha256 != prepared.manifest_sha256 {
                     return Err(invalid(
                         "packageVersion",
@@ -665,8 +664,7 @@ impl MlxPackageInstaller {
             let _ = fs::remove_dir_all(&staging);
             return Err(error);
         }
-        let staged_verified =
-            self.verify_version_directory(&staging, VerificationDepth::Digests)?;
+        let staged_verified = self.verify_version_directory(&staging, VerificationDepth::Digests)?;
         if staged_verified.manifest_sha256 != prepared.manifest_sha256 {
             let _ = fs::remove_dir_all(&staging);
             return Err(invalid(
@@ -1868,14 +1866,10 @@ pub fn active_version_directory(mlx_root: &Path) -> Option<PathBuf> {
     {
         return None;
     }
-    Some(
-        mlx_root
-            .join(VERSIONS_DIRECTORY)
-            .join(version_directory_name(
-                &active.package_version,
-                &active.manifest_sha256,
-            )),
-    )
+    Some(mlx_root.join(VERSIONS_DIRECTORY).join(version_directory_name(
+        &active.package_version,
+        &active.manifest_sha256,
+    )))
 }
 
 fn model_architecture(model_directory: &Path) -> Option<String> {
@@ -2290,7 +2284,9 @@ pub(crate) mod tests {
     #[test]
     fn an_architecture_the_install_has_no_module_for_is_named() {
         let install = TestDirectory::new("arch-install");
-        let site = install.0.join("runtime/lib/python3.14/site-packages");
+        let site = install
+            .0
+            .join("runtime/lib/python3.14/site-packages");
         fs::create_dir_all(site.join("mlx_lm/models")).unwrap();
         fs::create_dir_all(site.join("mlx_vlm/models/qwen2_vl")).unwrap();
         for module in ["qwen3.py", "qwen3_moe.py", "__init__.py"] {
@@ -2307,10 +2303,7 @@ pub(crate) mod tests {
         );
 
         // Present in either package, or unreadable on either side: no objection.
-        for supported in [
-            &br#"{"model_type":"qwen3"}"#[..],
-            &br#"{"model_type":"qwen2_vl"}"#[..],
-        ] {
+        for supported in [&br#"{"model_type":"qwen3"}"#[..], &br#"{"model_type":"qwen2_vl"}"#[..]] {
             fs::write(&config, supported).unwrap();
             assert_eq!(unsupported_architecture(&install.0, &model.0), None);
         }

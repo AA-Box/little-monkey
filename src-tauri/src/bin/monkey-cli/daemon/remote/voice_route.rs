@@ -7,8 +7,7 @@
 //! audio never lands here.
 
 use super::protocol::{
-    capability_block, legacy_capabilities, validate_id, DeviceCapability, DeviceReadiness,
-    OsPermission,
+    capability_block, legacy_capabilities, validate_id, DeviceCapability, DeviceReadiness, OsPermission,
 };
 use super::store::{DeviceCommandRequest, RemoteStore, VoiceRouteEventRecord, VoiceRouteRecord};
 use crate::daemon::store::DaemonPaths;
@@ -106,11 +105,7 @@ pub struct EndpointDescriptor {
     pub blocked_by: Option<String>,
 }
 
-fn device_online(
-    last_seen_at_ms: Option<u64>,
-    surface_seen_at_ms: Option<u64>,
-    now_ms: u64,
-) -> bool {
+fn device_online(last_seen_at_ms: Option<u64>, surface_seen_at_ms: Option<u64>, now_ms: u64) -> bool {
     last_seen_at_ms
         .into_iter()
         .chain(surface_seen_at_ms)
@@ -163,11 +158,7 @@ pub fn endpoints(paths: &DaemonPaths) -> Result<Vec<EndpointDescriptor>, String>
             blocked_by: None,
         },
     ];
-    for device in store
-        .devices()?
-        .into_iter()
-        .filter(|device| device.active())
-    {
+    for device in store.devices()?.into_iter().filter(|device| device.active()) {
         let surface = store.device_surface(&device.device_id)?;
         let granted = if device.capabilities.is_empty() {
             legacy_capabilities(&device.scopes)
@@ -191,40 +182,17 @@ pub fn endpoints(paths: &DaemonPaths) -> Result<Vec<EndpointDescriptor>, String>
             let readiness = surface.as_ref().map(|value| value.readiness(capability));
             let block = capability_block(&granted, surface.as_ref(), capability);
             let (blocked_code, blocked_by) = if !online {
-                (
-                    Some("offline".to_string()),
-                    Some(
-                        "Paired device is offline or has not made signed contact recently."
-                            .to_string(),
-                    ),
-                )
+                (Some("offline".to_string()), Some("Paired device is offline or has not made signed contact recently.".to_string()))
             } else if let Some(block) = block {
-                (
-                    Some(block.as_str().to_string()),
-                    Some(block.explain(capability)),
-                )
+                (Some(block.as_str().to_string()), Some(block.explain(capability)))
             } else {
                 (None, None)
             };
-            let input_supported = surface
-                .as_ref()
-                .is_some_and(|value| value.capabilities.contains(&DeviceCapability::VoiceStream));
-            let output_supported = surface.as_ref().is_some_and(|value| {
-                value
-                    .capabilities
-                    .contains(&DeviceCapability::AudioPlayback)
-            });
+            let input_supported = surface.as_ref().is_some_and(|value| value.capabilities.contains(&DeviceCapability::VoiceStream));
+            let output_supported = surface.as_ref().is_some_and(|value| value.capabilities.contains(&DeviceCapability::AudioPlayback));
             result.push(EndpointDescriptor {
                 id: endpoint,
-                label: format!(
-                    "{} — {}",
-                    device.device_name,
-                    if direction == "input" {
-                        "microphone"
-                    } else {
-                        "speaker"
-                    }
-                ),
+                label: format!("{} — {}", device.device_name, if direction == "input" { "microphone" } else { "speaker" }),
                 direction,
                 locality: "paired",
                 device_id: Some(device.device_id.clone()),
@@ -234,10 +202,7 @@ pub fn endpoints(paths: &DaemonPaths) -> Result<Vec<EndpointDescriptor>, String>
                 os_permission: permission,
                 readiness,
                 foreground_required: matches!(readiness, Some(DeviceReadiness::ForegroundRequired)),
-                interaction_required: matches!(
-                    readiness,
-                    Some(DeviceReadiness::InteractionRequired)
-                ),
+                interaction_required: matches!(readiness, Some(DeviceReadiness::InteractionRequired)),
                 online,
                 last_seen_at_ms: last_seen,
                 latency_ms,
@@ -250,11 +215,7 @@ pub fn endpoints(paths: &DaemonPaths) -> Result<Vec<EndpointDescriptor>, String>
     Ok(result)
 }
 
-fn validate_endpoint(
-    store: &RemoteStore,
-    endpoint: &AudioEndpoint,
-    now_ms: u64,
-) -> Result<(), String> {
+fn validate_endpoint(store: &RemoteStore, endpoint: &AudioEndpoint, now_ms: u64) -> Result<(), String> {
     match endpoint {
         AudioEndpoint::LocalInput(_) | AudioEndpoint::LocalOutput(_) => Ok(()),
         AudioEndpoint::PairedInput(device_id) | AudioEndpoint::PairedOutput(device_id) => {
@@ -267,14 +228,9 @@ fn validate_endpoint(
             let device = store
                 .device(device_id)?
                 .ok_or_else(|| format!("Paired device '{device_id}' no longer exists"))?;
-            let surface_seen = store
-                .device_surface(device_id)?
-                .map(|value| value.reported_at_ms);
+            let surface_seen = store.device_surface(device_id)?.map(|value| value.reported_at_ms);
             if !device_online(device.last_seen_at_ms, surface_seen, now_ms) {
-                return Err(
-                    "Paired VoiceRoute endpoint is offline or has not made signed contact recently"
-                        .to_string(),
-                );
+                return Err("Paired VoiceRoute endpoint is offline or has not made signed contact recently".to_string());
             }
             Ok(())
         }
@@ -293,9 +249,7 @@ fn retire_command(
     now_ms: u64,
     role: &str,
 ) -> Result<(), String> {
-    let Some(command_id) = command_id else {
-        return Ok(());
-    };
+    let Some(command_id) = command_id else { return Ok(()); };
     store.request_device_cancel(command_id, now_ms)?;
     // The physical executor watches `cancel_requested` while a routed role is
     // running. A handoff does not commit its next generation until the previous
@@ -304,9 +258,7 @@ fn retire_command(
     // route after the UI already says the move completed.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let Some(command) = store.device_command(command_id)? else {
-            return Ok(());
-        };
+        let Some(command) = store.device_command(command_id)? else { return Ok(()); };
         if command.state.terminal() {
             return Ok(());
         }
@@ -323,23 +275,17 @@ fn wait_for_prepare(store: &RemoteStore, command_id: &str, role: &str) -> Result
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     loop {
         let Some(command) = store.device_command(command_id)? else {
-            return Err(format!(
-                "VoiceRoute {role} preparation disappeared before acknowledgement"
-            ));
+            return Err(format!("VoiceRoute {role} preparation disappeared before acknowledgement"));
         };
         if command.state.terminal() {
             return if command.state == super::protocol::DeviceCommandState::Succeeded {
                 Ok(())
             } else {
-                Err(command.error.unwrap_or_else(|| {
-                    format!("VoiceRoute {role} preparation was not accepted by the device")
-                }))
+                Err(command.error.unwrap_or_else(|| format!("VoiceRoute {role} preparation was not accepted by the device")))
             };
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "VoiceRoute {role} preparation was not acknowledged within 8 seconds"
-            ));
+            return Err(format!("VoiceRoute {role} preparation was not acknowledged within 8 seconds"));
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -363,9 +309,7 @@ fn already_carrying_route(
     previous: &VoiceRouteRecord,
     endpoint: &AudioEndpoint,
 ) -> Result<bool, String> {
-    let Some(device_id) = endpoint.paired_device() else {
-        return Ok(false);
-    };
+    let Some(device_id) = endpoint.paired_device() else { return Ok(false); };
     for command_id in [
         previous.input_command_id.as_deref(),
         previous.output_command_id.as_deref(),
@@ -392,14 +336,8 @@ fn prepare_paired_endpoint(
     now_ms: u64,
 ) -> Result<(), String> {
     let (device_id, capability, role) = match endpoint {
-        AudioEndpoint::PairedInput(device_id) => {
-            (device_id.as_str(), DeviceCapability::VoiceStream, "input")
-        }
-        AudioEndpoint::PairedOutput(device_id) => (
-            device_id.as_str(),
-            DeviceCapability::AudioPlayback,
-            "output",
-        ),
+        AudioEndpoint::PairedInput(device_id) => (device_id.as_str(), DeviceCapability::VoiceStream, "input"),
+        AudioEndpoint::PairedOutput(device_id) => (device_id.as_str(), DeviceCapability::AudioPlayback, "output"),
         _ => return Ok(()),
     };
     validate_endpoint(store, endpoint, now_ms)?;
@@ -418,9 +356,7 @@ fn prepare_paired_endpoint(
             source_run_id: None,
             source_session_id: Some(session_id.to_string()),
             source_tool_call_id: None,
-            invocation_id: Some(format!(
-                "voice-route-prepare:{session_id}:{generation}:{role}:{device_id}"
-            )),
+            invocation_id: Some(format!("voice-route-prepare:{session_id}:{generation}:{role}:{device_id}")),
             expires_at_ms: now_ms.saturating_add(15_000),
         },
         now_ms,
@@ -456,9 +392,7 @@ fn enqueue_role(
             source_run_id: None,
             source_session_id: Some(session_id.to_string()),
             source_tool_call_id: None,
-            invocation_id: Some(format!(
-                "voice-route:{session_id}:{generation}:{role}:{device_id}"
-            )),
+            invocation_id: Some(format!("voice-route:{session_id}:{generation}:{role}:{device_id}")),
             expires_at_ms,
         },
         now_ms,
@@ -485,16 +419,10 @@ pub fn set_route(
     }
     let input = AudioEndpoint::parse(input)?;
     let output = AudioEndpoint::parse(output)?;
-    if !matches!(
-        input,
-        AudioEndpoint::LocalInput(_) | AudioEndpoint::PairedInput(_)
-    ) {
+    if !matches!(input, AudioEndpoint::LocalInput(_) | AudioEndpoint::PairedInput(_)) {
         return Err("Voice route input endpoint is not an input".to_string());
     }
-    if !matches!(
-        output,
-        AudioEndpoint::LocalOutput(_) | AudioEndpoint::PairedOutput(_)
-    ) {
+    if !matches!(output, AudioEndpoint::LocalOutput(_) | AudioEndpoint::PairedOutput(_)) {
         return Err("Voice route output endpoint is not an output".to_string());
     }
 
@@ -532,26 +460,24 @@ pub fn set_route(
             // generation is retired here — anything the unreleased command
             // still emits is stale rather than current — and the selection is
             // kept so the operator can simply start Talk again.
-            return Err(
-                match store.replace_voice_route(
-                    session_id,
-                    &previous.engine,
-                    &previous.input_endpoint,
-                    &previous.output_endpoint,
-                    None,
-                    None,
-                    now_ms,
-                ) {
-                    Ok(_) => format!(
+            return Err(match store.replace_voice_route(
+                session_id,
+                &previous.engine,
+                &previous.input_endpoint,
+                &previous.output_endpoint,
+                None,
+                None,
+                now_ms,
+            ) {
+                Ok(_) => format!(
                     "{error}. The previous generation was retired, so this conversation now owns \
                      no microphone; start Talk again to re-acquire one."
                 ),
-                    Err(retire_error) => format!(
+                Err(retire_error) => format!(
                     "{error}. Retiring the previous generation also failed ({retire_error}), so \
                      the route row may still name a microphone it no longer owns."
                 ),
-                },
-            );
+            });
         }
     }
     store.replace_voice_route(
@@ -565,11 +491,7 @@ pub fn set_route(
     )
 }
 
-pub fn activate_route(
-    paths: &DaemonPaths,
-    session_id: &str,
-    now_ms: u64,
-) -> Result<VoiceRouteRecord, String> {
+pub fn activate_route(paths: &DaemonPaths, session_id: &str, now_ms: u64) -> Result<VoiceRouteRecord, String> {
     let mut store = RemoteStore::open(&paths.root)?;
     let route = store
         .voice_route(session_id)?
@@ -585,23 +507,13 @@ pub fn activate_route(
     validate_endpoint(&store, &input, now_ms)?;
     validate_endpoint(&store, &output, now_ms)?;
 
-    let paired_input = match &input {
-        AudioEndpoint::PairedInput(id) => Some(id.as_str()),
-        _ => None,
-    };
-    let paired_output = match &output {
-        AudioEndpoint::PairedOutput(id) => Some(id.as_str()),
-        _ => None,
-    };
+    let paired_input = match &input { AudioEndpoint::PairedInput(id) => Some(id.as_str()), _ => None };
+    let paired_output = match &output { AudioEndpoint::PairedOutput(id) => Some(id.as_str()), _ => None };
     let mut input_command_id = None;
     let mut output_command_id = None;
 
     if let Some(device_id) = paired_input {
-        let role = if paired_output == Some(device_id) {
-            "duplex"
-        } else {
-            "input"
-        };
+        let role = if paired_output == Some(device_id) { "duplex" } else { "input" };
         input_command_id = Some(enqueue_role(
             &mut store,
             device_id,
@@ -681,35 +593,17 @@ pub fn move_route(
     // do we retire the old capture owner and commit the new generation.
     if was_live {
         let mut store = RemoteStore::open(&paths.root)?;
-        let next_generation = previous
-            .generation
-            .checked_add(1)
+        let next_generation = previous.generation.checked_add(1)
             .ok_or_else(|| "Voice route generation is exhausted".to_string())?;
         if next_input.token() != previous.input_endpoint
             && !already_carrying_route(&store, &previous, &next_input)?
         {
-            prepare_paired_endpoint(
-                &mut store,
-                &next_input,
-                session_id,
-                &previous.route_id,
-                next_generation,
-                &previous.engine,
-                now_ms,
-            )?;
+            prepare_paired_endpoint(&mut store, &next_input, session_id, &previous.route_id, next_generation, &previous.engine, now_ms)?;
         }
         if next_output.token() != previous.output_endpoint
             && !already_carrying_route(&store, &previous, &next_output)?
         {
-            prepare_paired_endpoint(
-                &mut store,
-                &next_output,
-                session_id,
-                &previous.route_id,
-                next_generation,
-                &previous.engine,
-                now_ms,
-            )?;
+            prepare_paired_endpoint(&mut store, &next_output, session_id, &previous.route_id, next_generation, &previous.engine, now_ms)?;
         }
     }
     let selected = set_route(
@@ -760,15 +654,9 @@ pub fn move_route(
     }
 }
 
-pub fn deactivate_route(
-    paths: &DaemonPaths,
-    session_id: &str,
-    now_ms: u64,
-) -> Result<Option<VoiceRouteRecord>, String> {
+pub fn deactivate_route(paths: &DaemonPaths, session_id: &str, now_ms: u64) -> Result<Option<VoiceRouteRecord>, String> {
     let mut store = RemoteStore::open(&paths.root)?;
-    let Some(route) = store.voice_route(session_id)? else {
-        return Ok(None);
-    };
+    let Some(route) = store.voice_route(session_id)? else { return Ok(None); };
     cancel_command(&mut store, route.input_command_id.as_deref(), now_ms);
     if route.output_command_id != route.input_command_id {
         cancel_command(&mut store, route.output_command_id.as_deref(), now_ms);
@@ -795,11 +683,7 @@ pub fn deactivate_route(
         .map(Some)
 }
 
-pub fn stop_route(
-    paths: &DaemonPaths,
-    session_id: &str,
-    now_ms: u64,
-) -> Result<Option<VoiceRouteRecord>, String> {
+pub fn stop_route(paths: &DaemonPaths, session_id: &str, now_ms: u64) -> Result<Option<VoiceRouteRecord>, String> {
     let mut store = RemoteStore::open(&paths.root)?;
     let previous = store.voice_route(session_id)?;
     if let Some(previous) = previous.as_ref() {
@@ -825,16 +709,12 @@ fn stored_route(paths: &DaemonPaths, session_id: &str) -> Result<Option<VoiceRou
 /// card away from the operator at exactly the moment they need it, so the
 /// stored row is returned instead and the next read tries again.
 pub fn route(paths: &DaemonPaths, session_id: &str) -> Result<Option<VoiceRouteRecord>, String> {
-    let Some(current) = stored_route(paths, session_id)? else {
-        return Ok(None);
-    };
+    let Some(current) = stored_route(paths, session_id)? else { return Ok(None); };
     let now_ms = super::now_ms_public()?;
-    Ok(Some(
-        match reclaim_released_endpoints(paths, &current, now_ms) {
-            Ok(reconciled) => reconciled,
-            Err(_) => current,
-        },
-    ))
+    Ok(Some(match reclaim_released_endpoints(paths, &current, now_ms) {
+        Ok(reconciled) => reconciled,
+        Err(_) => current,
+    }))
 }
 
 /// The marker a paired controller puts in a routed role's report when the
@@ -857,22 +737,16 @@ const RELEASED_TO_HOST: &str = "returned_to_host";
 /// operator's own doing rather than the device's. Anything still running, or
 /// terminal for any other reason, leaves the route exactly as it is.
 fn released_by_device(store: &RemoteStore, command_id: Option<&str>) -> Result<bool, String> {
-    let Some(command_id) = command_id else {
-        return Ok(false);
-    };
-    let Some(command) = store.device_command(command_id)? else {
-        return Ok(false);
-    };
-    Ok(
-        command.state == super::protocol::DeviceCommandState::Succeeded
-            && !command.cancel_requested
-            && command
-                .result
-                .as_ref()
-                .and_then(|result| result.get("release"))
-                .and_then(serde_json::Value::as_str)
-                == Some(RELEASED_TO_HOST),
-    )
+    let Some(command_id) = command_id else { return Ok(false); };
+    let Some(command) = store.device_command(command_id)? else { return Ok(false); };
+    Ok(command.state == super::protocol::DeviceCommandState::Succeeded
+        && !command.cancel_requested
+        && command
+            .result
+            .as_ref()
+            .and_then(|result| result.get("release"))
+            .and_then(serde_json::Value::as_str)
+            == Some(RELEASED_TO_HOST))
 }
 
 /// Returns each direction whose paired device released it to this computer,
@@ -892,15 +766,11 @@ fn reclaim_released_endpoints(
         return Ok(current.clone());
     }
     let store = RemoteStore::open(&paths.root)?;
-    let input_released = AudioEndpoint::parse(&current.input_endpoint)?
-        .paired_device()
-        .is_some()
+    let input_released = AudioEndpoint::parse(&current.input_endpoint)?.paired_device().is_some()
         && released_by_device(&store, current.input_command_id.as_deref())?;
     // A single command serving a duplex role releases both directions at once,
     // which is the device saying it is done with the conversation entirely.
-    let output_released = AudioEndpoint::parse(&current.output_endpoint)?
-        .paired_device()
-        .is_some()
+    let output_released = AudioEndpoint::parse(&current.output_endpoint)?.paired_device().is_some()
         && released_by_device(&store, current.output_command_id.as_deref())?;
     if !input_released && !output_released {
         return Ok(current.clone());
@@ -923,8 +793,7 @@ pub fn append_event(
     payload: &serde_json::Value,
     now_ms: u64,
 ) -> Result<VoiceRouteEventRecord, String> {
-    RemoteStore::open(&paths.root)?
-        .append_voice_route_event(session_id, generation, kind, payload, now_ms)
+    RemoteStore::open(&paths.root)?.append_voice_route_event(session_id, generation, kind, payload, now_ms)
 }
 
 pub fn events(
@@ -978,18 +847,10 @@ mod tests {
 
     impl RemoteSecretStore for MemorySecrets {
         fn get(&self, slot: &str) -> Result<Vec<u8>, String> {
-            self.0
-                .lock()
-                .unwrap()
-                .get(slot)
-                .cloned()
-                .ok_or_else(|| "missing".to_string())
+            self.0.lock().unwrap().get(slot).cloned().ok_or_else(|| "missing".to_string())
         }
         fn set(&self, slot: &str, secret: &[u8]) -> Result<(), String> {
-            self.0
-                .lock()
-                .unwrap()
-                .insert(slot.to_string(), secret.to_vec());
+            self.0.lock().unwrap().insert(slot.to_string(), secret.to_vec());
             Ok(())
         }
         fn delete(&self, slot: &str) -> Result<(), String> {
@@ -1001,10 +862,8 @@ mod tests {
     /// A real store under a real temporary daemon root, because every function
     /// under test reaches the database through `DaemonPaths`.
     fn fixture() -> (std::path::PathBuf, DaemonPaths, MemorySecrets) {
-        let app_data = std::env::temp_dir().join(format!(
-            "little-monkey-voice-route-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let app_data = std::env::temp_dir()
+            .join(format!("little-monkey-voice-route-{}", uuid::Uuid::new_v4()));
         let paths = DaemonPaths::under(&app_data);
         (app_data, paths, MemorySecrets(Mutex::new(HashMap::new())))
     }
@@ -1026,14 +885,7 @@ mod tests {
             .create_invitation_with_capabilities(&scopes, &capabilities, 1_000, 2_000)
             .unwrap();
         store
-            .accept_invitation(
-                &invitation.pairing_id,
-                &invitation.token,
-                name,
-                "runner-one",
-                1_100,
-                secrets,
-            )
+            .accept_invitation(&invitation.pairing_id, &invitation.token, name, "runner-one", 1_100, secrets)
             .unwrap()
             .device_id
     }
@@ -1052,14 +904,8 @@ mod tests {
             app_version: "1.3.0".to_string(),
             device_model: "Test".to_string(),
             capabilities: advertised.iter().copied().collect(),
-            permissions: advertised
-                .iter()
-                .map(|capability| (*capability, permission))
-                .collect::<BTreeMap<_, _>>(),
-            readiness: advertised
-                .iter()
-                .map(|capability| (*capability, readiness))
-                .collect::<BTreeMap<_, _>>(),
+            permissions: advertised.iter().map(|capability| (*capability, permission)).collect::<BTreeMap<_, _>>(),
+            readiness: advertised.iter().map(|capability| (*capability, readiness)).collect::<BTreeMap<_, _>>(),
             constraints: Default::default(),
             reported_at_ms,
         }
@@ -1067,22 +913,14 @@ mod tests {
 
     /// A ready microphone-and-speaker phone, described exactly as the device
     /// itself would describe it.
-    fn ready_phone(
-        store: &mut RemoteStore,
-        secrets: &MemorySecrets,
-        name: &str,
-        now_ms: u64,
-    ) -> String {
+    fn ready_phone(store: &mut RemoteStore, secrets: &MemorySecrets, name: &str, now_ms: u64) -> String {
         let device_id = pair(store, secrets, name);
         store
             .save_device_surface(
                 &device_id,
                 &surface(
                     "ios",
-                    &[
-                        DeviceCapability::VoiceStream,
-                        DeviceCapability::AudioPlayback,
-                    ],
+                    &[DeviceCapability::VoiceStream, DeviceCapability::AudioPlayback],
                     OsPermission::Granted,
                     DeviceReadiness::Ready,
                     now_ms,
@@ -1122,74 +960,26 @@ mod tests {
     #[test]
     fn set_route_is_conversation_scoped_and_mints_monotonic_generations() {
         let (app_data, paths, _secrets) = fixture();
-        let first = set_route(
-            &paths,
-            "chat-one",
-            "pipeline",
-            LOCAL_INPUT_DEFAULT,
-            LOCAL_OUTPUT_DEFAULT,
-            1_000,
-        )
-        .unwrap();
+        let first = set_route(&paths, "chat-one", "pipeline", LOCAL_INPUT_DEFAULT, LOCAL_OUTPUT_DEFAULT, 1_000).unwrap();
         assert_eq!(first.generation, 1);
         assert_eq!(first.state, "active");
         assert_eq!(first.input_endpoint, LOCAL_INPUT_DEFAULT);
 
-        let second = set_route(
-            &paths,
-            "chat-one",
-            "realtime",
-            "local:input:usb-mic",
-            LOCAL_OUTPUT_DEFAULT,
-            1_100,
-        )
-        .unwrap();
-        assert_eq!(
-            second.generation, 2,
-            "a second selection must retire the first generation"
-        );
-        assert_eq!(
-            second.route_id, first.route_id,
-            "the route identity survives a re-selection"
-        );
+        let second = set_route(&paths, "chat-one", "realtime", "local:input:usb-mic", LOCAL_OUTPUT_DEFAULT, 1_100).unwrap();
+        assert_eq!(second.generation, 2, "a second selection must retire the first generation");
+        assert_eq!(second.route_id, first.route_id, "the route identity survives a re-selection");
         assert_eq!(second.engine, "realtime");
         assert_eq!(second.input_endpoint, "local:input:usb-mic");
 
-        let other = set_route(
-            &paths,
-            "chat-two",
-            "pipeline",
-            LOCAL_INPUT_DEFAULT,
-            LOCAL_OUTPUT_DEFAULT,
-            1_200,
-        )
-        .unwrap();
-        assert_eq!(
-            other.generation, 1,
-            "another conversation starts at its own generation 1"
-        );
+        let other = set_route(&paths, "chat-two", "pipeline", LOCAL_INPUT_DEFAULT, LOCAL_OUTPUT_DEFAULT, 1_200).unwrap();
+        assert_eq!(other.generation, 1, "another conversation starts at its own generation 1");
         assert_ne!(other.route_id, first.route_id);
         assert_eq!(route(&paths, "chat-one").unwrap().unwrap().generation, 2);
 
-        assert!(set_route(
-            &paths,
-            "chat-one",
-            "pipeline",
-            LOCAL_OUTPUT_DEFAULT,
-            LOCAL_OUTPUT_DEFAULT,
-            1_300
-        )
-        .unwrap_err()
-        .contains("input endpoint is not an input"));
-        assert!(set_route(
-            &paths,
-            "chat-one",
-            "whisper",
-            LOCAL_INPUT_DEFAULT,
-            LOCAL_OUTPUT_DEFAULT,
-            1_300
-        )
-        .is_err());
+        assert!(set_route(&paths, "chat-one", "pipeline", LOCAL_OUTPUT_DEFAULT, LOCAL_OUTPUT_DEFAULT, 1_300)
+            .unwrap_err()
+            .contains("input endpoint is not an input"));
+        assert!(set_route(&paths, "chat-one", "whisper", LOCAL_INPUT_DEFAULT, LOCAL_OUTPUT_DEFAULT, 1_300).is_err());
         let _ = std::fs::remove_dir_all(app_data);
     }
 
@@ -1209,57 +999,17 @@ mod tests {
         // A device that has never described itself has never made contact
         // either, so the outermost axis — reachability — is the honest reason.
         assert_eq!(described.blocked_code.as_deref(), Some("offline"));
-        assert!(
-            !described.input_supported,
-            "a device that has said nothing supports nothing"
-        );
+        assert!(!described.input_supported, "a device that has said nothing supports nothing");
 
         for (advertised, permission, readiness, reported_at_ms, expected) in [
-            (
-                vec![
-                    DeviceCapability::VoiceStream,
-                    DeviceCapability::AudioPlayback,
-                ],
-                OsPermission::Granted,
-                DeviceReadiness::Ready,
-                now,
-                None,
-            ),
-            (
-                vec![DeviceCapability::AudioPlayback],
-                OsPermission::Granted,
-                DeviceReadiness::Ready,
-                now,
-                Some("unsupported"),
-            ),
-            (
-                vec![DeviceCapability::VoiceStream],
-                OsPermission::Denied,
-                DeviceReadiness::Ready,
-                now,
-                Some("permission_denied"),
-            ),
-            (
-                vec![DeviceCapability::VoiceStream],
-                OsPermission::Granted,
-                DeviceReadiness::ForegroundRequired,
-                now,
-                Some("foreground_required"),
-            ),
-            (
-                vec![DeviceCapability::VoiceStream],
-                OsPermission::Granted,
-                DeviceReadiness::Ready,
-                now - ENDPOINT_ONLINE_WINDOW_MS - 1_000,
-                Some("offline"),
-            ),
+            (vec![DeviceCapability::VoiceStream, DeviceCapability::AudioPlayback], OsPermission::Granted, DeviceReadiness::Ready, now, None),
+            (vec![DeviceCapability::AudioPlayback], OsPermission::Granted, DeviceReadiness::Ready, now, Some("unsupported")),
+            (vec![DeviceCapability::VoiceStream], OsPermission::Denied, DeviceReadiness::Ready, now, Some("permission_denied")),
+            (vec![DeviceCapability::VoiceStream], OsPermission::Granted, DeviceReadiness::ForegroundRequired, now, Some("foreground_required")),
+            (vec![DeviceCapability::VoiceStream], OsPermission::Granted, DeviceReadiness::Ready, now - ENDPOINT_ONLINE_WINDOW_MS - 1_000, Some("offline")),
         ] {
             store
-                .save_device_surface(
-                    &device,
-                    &surface("ios", &advertised, permission, readiness, reported_at_ms),
-                    reported_at_ms,
-                )
+                .save_device_surface(&device, &surface("ios", &advertised, permission, readiness, reported_at_ms), reported_at_ms)
                 .unwrap();
             let described = endpoint(&paths, &input_id);
             assert_eq!(
@@ -1268,10 +1018,7 @@ mod tests {
                 "advertised {advertised:?} permission {permission:?} readiness {readiness:?} should block with {expected:?}"
             );
             assert_eq!(described.ready, expected.is_none());
-            assert!(
-                described.blocked_by.is_some() == expected.is_some(),
-                "a blocked endpoint always says why"
-            );
+            assert!(described.blocked_by.is_some() == expected.is_some(), "a blocked endpoint always says why");
         }
 
         // Withdrawing the operator's grant blocks it even though the device
@@ -1279,30 +1026,18 @@ mod tests {
         store
             .save_device_surface(
                 &device,
-                &surface(
-                    "ios",
-                    &[DeviceCapability::VoiceStream],
-                    OsPermission::Granted,
-                    DeviceReadiness::Ready,
-                    now,
-                ),
+                &surface("ios", &[DeviceCapability::VoiceStream], OsPermission::Granted, DeviceReadiness::Ready, now),
                 now,
             )
             .unwrap();
         store
             .set_device_capabilities(
                 &device,
-                &BTreeSet::from([
-                    DeviceCapability::ViewRuns,
-                    DeviceCapability::MicrophoneCapture,
-                ]),
+                &BTreeSet::from([DeviceCapability::ViewRuns, DeviceCapability::MicrophoneCapture]),
                 now,
             )
             .unwrap();
-        assert_eq!(
-            endpoint(&paths, &input_id).blocked_code.as_deref(),
-            Some("not_granted")
-        );
+        assert_eq!(endpoint(&paths, &input_id).blocked_code.as_deref(), Some("not_granted"));
 
         let local = endpoint(&paths, LOCAL_INPUT_DEFAULT);
         assert!(local.ready && local.online && local.blocked_code.is_none());
@@ -1322,13 +1057,7 @@ mod tests {
         store
             .save_device_surface(
                 &device,
-                &surface(
-                    "ios",
-                    &[DeviceCapability::AudioPlayback],
-                    OsPermission::Granted,
-                    DeviceReadiness::Ready,
-                    now,
-                ),
+                &surface("ios", &[DeviceCapability::AudioPlayback], OsPermission::Granted, DeviceReadiness::Ready, now),
                 now,
             )
             .unwrap();
@@ -1338,10 +1067,7 @@ mod tests {
         assert_eq!(input.blocked_code.as_deref(), Some("unsupported"));
         let output = endpoint(&paths, &format!("paired:{device}:output"));
         assert!(output.output_supported && output.ready);
-        assert!(
-            !output.input_supported,
-            "the speaker endpoint must not claim a microphone either"
-        );
+        assert!(!output.input_supported, "the speaker endpoint must not claim a microphone either");
         let _ = std::fs::remove_dir_all(app_data);
     }
 
@@ -1353,10 +1079,7 @@ mod tests {
         let now = super::super::now_ms_public().unwrap();
         let mut store = RemoteStore::open(&paths.root).unwrap();
         let device = ready_phone(&mut store, &secrets, "Phone", now);
-        assert_eq!(
-            endpoint(&paths, &format!("paired:{device}:output")).latency_ms,
-            None
-        );
+        assert_eq!(endpoint(&paths, &format!("paired:{device}:output")).latency_ms, None);
 
         let command = store
             .enqueue_device_command(
@@ -1395,10 +1118,7 @@ mod tests {
     }
 
     fn role_of(store: &RemoteStore, command_id: &str) -> String {
-        store.device_command(command_id).unwrap().unwrap().arguments["role"]
-            .as_str()
-            .unwrap()
-            .to_string()
+        store.device_command(command_id).unwrap().unwrap().arguments["role"].as_str().unwrap().to_string()
     }
 
     /// One command per role, and exactly one when a single device holds both —
@@ -1412,34 +1132,12 @@ mod tests {
         let phone = ready_phone(&mut store, &secrets, "Phone", now);
         let speaker = ready_phone(&mut store, &secrets, "Kitchen", now);
 
-        set_route(
-            &paths,
-            "chat-topology",
-            "pipeline",
-            LOCAL_INPUT_DEFAULT,
-            LOCAL_OUTPUT_DEFAULT,
-            now,
-        )
-        .unwrap();
+        set_route(&paths, "chat-topology", "pipeline", LOCAL_INPUT_DEFAULT, LOCAL_OUTPUT_DEFAULT, now).unwrap();
         let local = activate_route(&paths, "chat-topology", now).unwrap();
-        assert_eq!(
-            (
-                local.input_command_id.clone(),
-                local.output_command_id.clone()
-            ),
-            (None, None),
-            "a fully local route queues nothing on any device"
-        );
+        assert_eq!((local.input_command_id.clone(), local.output_command_id.clone()), (None, None),
+            "a fully local route queues nothing on any device");
 
-        set_route(
-            &paths,
-            "chat-topology",
-            "pipeline",
-            &format!("paired:{phone}:input"),
-            LOCAL_OUTPUT_DEFAULT,
-            now,
-        )
-        .unwrap();
+        set_route(&paths, "chat-topology", "pipeline", &format!("paired:{phone}:input"), LOCAL_OUTPUT_DEFAULT, now).unwrap();
         let input_only = activate_route(&paths, "chat-topology", now).unwrap();
         let input_command = input_only.input_command_id.clone().unwrap();
         assert_eq!(input_only.output_command_id, None);
@@ -1449,66 +1147,23 @@ mod tests {
         assert_eq!(queued.arguments["route_generation"], input_only.generation);
         assert_eq!(queued.arguments["mode"], "talk_route");
 
-        set_route(
-            &paths,
-            "chat-topology",
-            "pipeline",
-            LOCAL_INPUT_DEFAULT,
-            &format!("paired:{speaker}:output"),
-            now,
-        )
-        .unwrap();
+        set_route(&paths, "chat-topology", "pipeline", LOCAL_INPUT_DEFAULT, &format!("paired:{speaker}:output"), now).unwrap();
         let output_only = activate_route(&paths, "chat-topology", now).unwrap();
         assert_eq!(output_only.input_command_id, None);
-        assert_eq!(
-            role_of(&store, output_only.output_command_id.as_deref().unwrap()),
-            "output"
-        );
+        assert_eq!(role_of(&store, output_only.output_command_id.as_deref().unwrap()), "output");
 
-        set_route(
-            &paths,
-            "chat-topology",
-            "pipeline",
-            &format!("paired:{phone}:input"),
-            &format!("paired:{phone}:output"),
-            now,
-        )
-        .unwrap();
+        set_route(&paths, "chat-topology", "pipeline", &format!("paired:{phone}:input"), &format!("paired:{phone}:output"), now).unwrap();
         let duplex = activate_route(&paths, "chat-topology", now).unwrap();
-        assert_eq!(
-            duplex.input_command_id, duplex.output_command_id,
-            "one device carrying both roles runs one command"
-        );
-        assert_eq!(
-            role_of(&store, duplex.input_command_id.as_deref().unwrap()),
-            "duplex"
-        );
+        assert_eq!(duplex.input_command_id, duplex.output_command_id, "one device carrying both roles runs one command");
+        assert_eq!(role_of(&store, duplex.input_command_id.as_deref().unwrap()), "duplex");
 
-        set_route(
-            &paths,
-            "chat-topology",
-            "pipeline",
-            &format!("paired:{phone}:input"),
-            &format!("paired:{speaker}:output"),
-            now,
-        )
-        .unwrap();
+        set_route(&paths, "chat-topology", "pipeline", &format!("paired:{phone}:input"), &format!("paired:{speaker}:output"), now).unwrap();
         let split = activate_route(&paths, "chat-topology", now).unwrap();
         assert_ne!(split.input_command_id, split.output_command_id);
+        assert_eq!(role_of(&store, split.input_command_id.as_deref().unwrap()), "input");
+        assert_eq!(role_of(&store, split.output_command_id.as_deref().unwrap()), "output");
         assert_eq!(
-            role_of(&store, split.input_command_id.as_deref().unwrap()),
-            "input"
-        );
-        assert_eq!(
-            role_of(&store, split.output_command_id.as_deref().unwrap()),
-            "output"
-        );
-        assert_eq!(
-            store
-                .device_command(split.output_command_id.as_deref().unwrap())
-                .unwrap()
-                .unwrap()
-                .capability,
+            store.device_command(split.output_command_id.as_deref().unwrap()).unwrap().unwrap().capability,
             DeviceCapability::AudioPlayback
         );
         let _ = std::fs::remove_dir_all(app_data);
@@ -1553,29 +1208,17 @@ mod tests {
             .unwrap();
 
         let error = activate_route(&paths, "chat-rollback", now).unwrap_err();
-        assert!(
-            error.contains("already queued a different device command"),
-            "unexpected error: {error}"
-        );
+        assert!(error.contains("already queued a different device command"), "unexpected error: {error}");
 
         let after = route(&paths, "chat-rollback").unwrap().unwrap();
-        assert_eq!(
-            (after.input_command_id, after.output_command_id),
-            (None, None),
-            "a route that could not start both roles must claim neither"
-        );
+        assert_eq!((after.input_command_id, after.output_command_id), (None, None),
+            "a route that could not start both roles must claim neither");
         let attempted = store
-            .device_command_by_invocation(&format!(
-                "voice-route:chat-rollback:{}:input:{phone}",
-                selected.generation
-            ))
+            .device_command_by_invocation(&format!("voice-route:chat-rollback:{}:input:{phone}", selected.generation))
             .unwrap()
             .unwrap();
-        assert_eq!(
-            attempted.state,
-            DeviceCommandState::Cancelled,
-            "the microphone command queued before the failure must be cancelled, not left running"
-        );
+        assert_eq!(attempted.state, DeviceCommandState::Cancelled,
+            "the microphone command queued before the failure must be cancelled, not left running");
         let _ = std::fs::remove_dir_all(app_data);
     }
 
@@ -1589,27 +1232,11 @@ mod tests {
         let now = super::super::now_ms_public().unwrap();
         let mut store = RemoteStore::open(&paths.root).unwrap();
         let phone = ready_phone(&mut store, &secrets, "Phone", now);
-        set_route(
-            &paths,
-            "chat-handoff",
-            "pipeline",
-            &format!("paired:{phone}:input"),
-            LOCAL_OUTPUT_DEFAULT,
-            now,
-        )
-        .unwrap();
+        set_route(&paths, "chat-handoff", "pipeline", &format!("paired:{phone}:input"), LOCAL_OUTPUT_DEFAULT, now).unwrap();
         let live = activate_route(&paths, "chat-handoff", now).unwrap();
         let holding = live.input_command_id.clone().unwrap();
-        store
-            .lease_device_command(&phone, 30_000, now)
-            .unwrap()
-            .unwrap();
-        assert!(
-            store
-                .start_device_command(&phone, &holding, Some("execution-one"), now)
-                .unwrap()
-                .started
-        );
+        store.lease_device_command(&phone, 30_000, now).unwrap().unwrap();
+        assert!(store.start_device_command(&phone, &holding, Some("execution-one"), now).unwrap().started);
 
         let root = paths.root.clone();
         let watcher_command = holding.clone();
@@ -1636,36 +1263,21 @@ mod tests {
             (observed_route, observed_command)
         });
 
-        let moved =
-            move_route(&paths, "chat-handoff", Some(LOCAL_INPUT_DEFAULT), None, now).unwrap();
+        let moved = move_route(&paths, "chat-handoff", Some(LOCAL_INPUT_DEFAULT), None, now).unwrap();
         let (observed_route, observed_command) = watcher.join().unwrap();
 
         assert_eq!(observed_command.state, DeviceCommandState::Running);
-        assert!(
-            observed_command.cancel_requested,
-            "the previous microphone is asked to stop first"
-        );
+        assert!(observed_command.cancel_requested, "the previous microphone is asked to stop first");
         assert_eq!(
             observed_route.generation, live.generation,
             "the new generation was committed while the previous microphone was still running"
         );
-        assert_eq!(
-            observed_route.input_endpoint,
-            format!("paired:{phone}:input")
-        );
+        assert_eq!(observed_route.input_endpoint, format!("paired:{phone}:input"));
         assert!(moved.generation > live.generation);
-        assert_eq!(
-            moved.route_id, live.route_id,
-            "a move keeps the route identity"
-        );
+        assert_eq!(moved.route_id, live.route_id, "a move keeps the route identity");
         assert_eq!(moved.session_id, live.session_id);
         assert_eq!(moved.input_endpoint, LOCAL_INPUT_DEFAULT);
-        assert!(store
-            .device_command(&holding)
-            .unwrap()
-            .unwrap()
-            .state
-            .terminal());
+        assert!(store.device_command(&holding).unwrap().unwrap().state.terminal());
         let _ = std::fs::remove_dir_all(app_data);
     }
 
@@ -1679,15 +1291,7 @@ mod tests {
         let mut store = RemoteStore::open(&paths.root).unwrap();
         let phone = ready_phone(&mut store, &secrets, "Phone", now);
         let speaker = ready_phone(&mut store, &secrets, "Kitchen", now);
-        set_route(
-            &paths,
-            "chat-failed",
-            "pipeline",
-            &format!("paired:{phone}:input"),
-            LOCAL_OUTPUT_DEFAULT,
-            now,
-        )
-        .unwrap();
+        set_route(&paths, "chat-failed", "pipeline", &format!("paired:{phone}:input"), LOCAL_OUTPUT_DEFAULT, now).unwrap();
         let live = activate_route(&paths, "chat-failed", now).unwrap();
         let doomed_generation = live.generation + 1;
         // The destination acknowledges its prepare, and then its role command
@@ -1709,16 +1313,12 @@ mod tests {
             .unwrap();
 
         let root = paths.root.clone();
-        let prepare_invocation =
-            format!("voice-route-prepare:chat-failed:{doomed_generation}:output:{speaker}");
+        let prepare_invocation = format!("voice-route-prepare:chat-failed:{doomed_generation}:output:{speaker}");
         let answering_speaker = speaker.clone();
         let device = std::thread::spawn(move || {
             let mut store = RemoteStore::open(&root).unwrap();
             for _ in 0..100 {
-                if let Some(command) = store
-                    .device_command_by_invocation(&prepare_invocation)
-                    .unwrap()
-                {
+                if let Some(command) = store.device_command_by_invocation(&prepare_invocation).unwrap() {
                     store
                         .complete_device_command(
                             &answering_speaker,
@@ -1738,54 +1338,20 @@ mod tests {
             false
         });
 
-        let error = move_route(
-            &paths,
-            "chat-failed",
-            None,
-            Some(&format!("paired:{speaker}:output")),
-            now,
-        )
-        .unwrap_err();
-        assert!(
-            device.join().unwrap(),
-            "the destination never saw its prepare command"
-        );
-        assert!(
-            error.contains("restored under a fresh generation"),
-            "unexpected error: {error}"
-        );
+        let error = move_route(&paths, "chat-failed", None, Some(&format!("paired:{speaker}:output")), now).unwrap_err();
+        assert!(device.join().unwrap(), "the destination never saw its prepare command");
+        assert!(error.contains("restored under a fresh generation"), "unexpected error: {error}");
 
         let restored = route(&paths, "chat-failed").unwrap().unwrap();
         assert_eq!(restored.input_endpoint, format!("paired:{phone}:input"));
-        assert_eq!(
-            restored.output_endpoint, LOCAL_OUTPUT_DEFAULT,
-            "the speaker move must not stick"
-        );
-        assert!(
-            restored.generation > doomed_generation,
-            "the rollback rolls forward, it does not rewind"
-        );
-        assert!(
-            restored.input_command_id.is_some(),
-            "the restored microphone is re-acquired"
-        );
-        assert!(!store
-            .device_command(restored.input_command_id.as_deref().unwrap())
-            .unwrap()
-            .unwrap()
-            .state
-            .terminal());
+        assert_eq!(restored.output_endpoint, LOCAL_OUTPUT_DEFAULT, "the speaker move must not stick");
+        assert!(restored.generation > doomed_generation, "the rollback rolls forward, it does not rewind");
+        assert!(restored.input_command_id.is_some(), "the restored microphone is re-acquired");
+        assert!(!store.device_command(restored.input_command_id.as_deref().unwrap()).unwrap().unwrap().state.terminal());
         for stale in [live.generation, doomed_generation] {
             assert_eq!(
-                append_event(
-                    &paths,
-                    "chat-failed",
-                    stale,
-                    "turn_finished",
-                    &serde_json::json!({"turn_id": "t"}),
-                    now
-                )
-                .unwrap_err(),
+                append_event(&paths, "chat-failed", stale, "turn_finished", &serde_json::json!({"turn_id": "t"}), now)
+                    .unwrap_err(),
                 "Voice route generation is stale",
                 "generation {stale} must never become current again"
             );
@@ -1801,78 +1367,27 @@ mod tests {
         let now = super::super::now_ms_public().unwrap();
         let mut store = RemoteStore::open(&paths.root).unwrap();
         let phone = ready_phone(&mut store, &secrets, "Phone", now);
-        set_route(
-            &paths,
-            "chat-stop",
-            "pipeline",
-            &format!("paired:{phone}:input"),
-            &format!("paired:{phone}:output"),
-            now,
-        )
-        .unwrap();
+        set_route(&paths, "chat-stop", "pipeline", &format!("paired:{phone}:input"), &format!("paired:{phone}:output"), now).unwrap();
         let live = activate_route(&paths, "chat-stop", now).unwrap();
         let carrying = live.input_command_id.clone().unwrap();
 
         let idle = deactivate_route(&paths, "chat-stop", now).unwrap().unwrap();
+        assert_eq!(idle.state, "active", "the selection survives a stop; only the roles and the generation do not");
+        assert_eq!((idle.input_command_id.clone(), idle.output_command_id.clone()), (None, None));
+        assert!(idle.generation > live.generation, "a deliberate stop retires the generation");
+        assert_eq!(store.device_command(&carrying).unwrap().unwrap().state, DeviceCommandState::Cancelled);
         assert_eq!(
-            idle.state, "active",
-            "the selection survives a stop; only the roles and the generation do not"
-        );
-        assert_eq!(
-            (
-                idle.input_command_id.clone(),
-                idle.output_command_id.clone()
-            ),
-            (None, None)
-        );
-        assert!(
-            idle.generation > live.generation,
-            "a deliberate stop retires the generation"
-        );
-        assert_eq!(
-            store.device_command(&carrying).unwrap().unwrap().state,
-            DeviceCommandState::Cancelled
-        );
-        assert_eq!(
-            append_event(
-                &paths,
-                "chat-stop",
-                live.generation,
-                "input_ready",
-                &serde_json::json!({}),
-                now
-            )
-            .unwrap_err(),
+            append_event(&paths, "chat-stop", live.generation, "input_ready", &serde_json::json!({}), now).unwrap_err(),
             "Voice route generation is stale"
         );
-        append_event(
-            &paths,
-            "chat-stop",
-            idle.generation,
-            "input_ready",
-            &serde_json::json!({}),
-            now,
-        )
-        .unwrap();
+        append_event(&paths, "chat-stop", idle.generation, "input_ready", &serde_json::json!({}), now).unwrap();
 
         let stopped = stop_route(&paths, "chat-stop", now).unwrap().unwrap();
         assert_eq!(stopped.state, "stopped");
         assert!(stopped.generation > idle.generation);
-        assert!(append_event(
-            &paths,
-            "chat-stop",
-            stopped.generation,
-            "input_ready",
-            &serde_json::json!({}),
-            now
-        )
-        .is_err());
+        assert!(append_event(&paths, "chat-stop", stopped.generation, "input_ready", &serde_json::json!({}), now).is_err());
         assert!(
-            store
-                .device_commands(&phone, 50)
-                .unwrap()
-                .iter()
-                .all(|command| command.state.terminal()),
+            store.device_commands(&phone, 50).unwrap().iter().all(|command| command.state.terminal()),
             "no capture may be left owned after Talk was stopped"
         );
         let _ = std::fs::remove_dir_all(app_data);
@@ -1884,68 +1399,17 @@ mod tests {
     #[test]
     fn the_event_ledger_refuses_media_and_stale_generations() {
         let (app_data, paths, _secrets) = fixture();
-        let live = set_route(
-            &paths,
-            "chat-ledger",
-            "pipeline",
-            LOCAL_INPUT_DEFAULT,
-            LOCAL_OUTPUT_DEFAULT,
-            1_000,
-        )
-        .unwrap();
-        append_event(
-            &paths,
-            "chat-ledger",
-            live.generation,
-            "input_transcript",
-            &serde_json::json!({"text": "hello"}),
-            1_001,
-        )
-        .unwrap();
-        assert!(append_event(
-            &paths,
-            "chat-ledger",
-            live.generation,
-            "assistant_delta",
-            &serde_json::json!({"audio_base64": "AAEC"}),
-            1_002
-        )
-        .unwrap_err()
-        .contains("may not contain raw or encoded media"));
-        let next = set_route(
-            &paths,
-            "chat-ledger",
-            "pipeline",
-            LOCAL_INPUT_DEFAULT,
-            LOCAL_OUTPUT_DEFAULT,
-            1_003,
-        )
-        .unwrap();
-        assert!(append_event(
-            &paths,
-            "chat-ledger",
-            live.generation,
-            "input_transcript",
-            &serde_json::json!({"text": "late"}),
-            1_004
-        )
-        .is_err());
-        append_event(
-            &paths,
-            "chat-ledger",
-            next.generation,
-            "input_transcript",
-            &serde_json::json!({"text": "current"}),
-            1_005,
-        )
-        .unwrap();
+        let live = set_route(&paths, "chat-ledger", "pipeline", LOCAL_INPUT_DEFAULT, LOCAL_OUTPUT_DEFAULT, 1_000).unwrap();
+        append_event(&paths, "chat-ledger", live.generation, "input_transcript", &serde_json::json!({"text": "hello"}), 1_001).unwrap();
+        assert!(append_event(&paths, "chat-ledger", live.generation, "assistant_delta", &serde_json::json!({"audio_base64": "AAEC"}), 1_002)
+            .unwrap_err()
+            .contains("may not contain raw or encoded media"));
+        let next = set_route(&paths, "chat-ledger", "pipeline", LOCAL_INPUT_DEFAULT, LOCAL_OUTPUT_DEFAULT, 1_003).unwrap();
+        assert!(append_event(&paths, "chat-ledger", live.generation, "input_transcript", &serde_json::json!({"text": "late"}), 1_004).is_err());
+        append_event(&paths, "chat-ledger", next.generation, "input_transcript", &serde_json::json!({"text": "current"}), 1_005).unwrap();
 
         let recorded = events(&paths, "chat-ledger", 0, 64).unwrap();
-        assert_eq!(
-            recorded.len(),
-            2,
-            "only the two accepted events were stored"
-        );
+        assert_eq!(recorded.len(), 2, "only the two accepted events were stored");
         assert_eq!(recorded[0].payload["text"], "hello");
         assert_eq!(recorded[1].generation, next.generation);
         let _ = std::fs::remove_dir_all(app_data);
@@ -1955,16 +1419,8 @@ mod tests {
     /// capture is in: leased, started, and only stopping when the device says
     /// so.
     fn capture_running(store: &mut RemoteStore, device_id: &str, command_id: &str, now_ms: u64) {
-        store
-            .lease_device_command(device_id, 30_000, now_ms)
-            .unwrap()
-            .unwrap();
-        assert!(
-            store
-                .start_device_command(device_id, command_id, Some("execution-one"), now_ms)
-                .unwrap()
-                .started
-        );
+        store.lease_device_command(device_id, 30_000, now_ms).unwrap().unwrap();
+        assert!(store.start_device_command(device_id, command_id, Some("execution-one"), now_ms).unwrap().started);
     }
 
     /// A microphone that never confirms its release used to leave the row
@@ -1976,55 +1432,22 @@ mod tests {
         let now = super::super::now_ms_public().unwrap();
         let mut store = RemoteStore::open(&paths.root).unwrap();
         let phone = ready_phone(&mut store, &secrets, "Phone", now);
-        set_route(
-            &paths,
-            "chat-stuck",
-            "pipeline",
-            &format!("paired:{phone}:input"),
-            LOCAL_OUTPUT_DEFAULT,
-            now,
-        )
-        .unwrap();
+        set_route(&paths, "chat-stuck", "pipeline", &format!("paired:{phone}:input"), LOCAL_OUTPUT_DEFAULT, now).unwrap();
         let live = activate_route(&paths, "chat-stuck", now).unwrap();
         let holding = live.input_command_id.clone().unwrap();
         capture_running(&mut store, &phone, &holding, now);
 
-        let error =
-            move_route(&paths, "chat-stuck", Some(LOCAL_INPUT_DEFAULT), None, now).unwrap_err();
-        assert!(
-            error.contains("did not release within 5 seconds"),
-            "unexpected error: {error}"
-        );
-        assert!(
-            error.contains("owns no microphone"),
-            "the error has to say what the route is left holding: {error}"
-        );
+        let error = move_route(&paths, "chat-stuck", Some(LOCAL_INPUT_DEFAULT), None, now).unwrap_err();
+        assert!(error.contains("did not release within 5 seconds"), "unexpected error: {error}");
+        assert!(error.contains("owns no microphone"), "the error has to say what the route is left holding: {error}");
 
         let after = route(&paths, "chat-stuck").unwrap().unwrap();
+        assert_eq!(after.input_endpoint, format!("paired:{phone}:input"), "the selection is kept");
+        assert_eq!((after.input_command_id, after.output_command_id), (None, None),
+            "the route must not claim a microphone the device never released");
+        assert!(after.generation > live.generation, "the unreleased generation is retired");
         assert_eq!(
-            after.input_endpoint,
-            format!("paired:{phone}:input"),
-            "the selection is kept"
-        );
-        assert_eq!(
-            (after.input_command_id, after.output_command_id),
-            (None, None),
-            "the route must not claim a microphone the device never released"
-        );
-        assert!(
-            after.generation > live.generation,
-            "the unreleased generation is retired"
-        );
-        assert_eq!(
-            append_event(
-                &paths,
-                "chat-stuck",
-                live.generation,
-                "input_ready",
-                &serde_json::json!({}),
-                now
-            )
-            .unwrap_err(),
+            append_event(&paths, "chat-stuck", live.generation, "input_ready", &serde_json::json!({}), now).unwrap_err(),
             "Voice route generation is stale",
             "anything the unreleased command still emits must read as stale"
         );
@@ -2035,12 +1458,7 @@ mod tests {
     /// the computer" button has to: the command completes successfully, was
     /// never cancelled by the host, and says in its own result that the role
     /// was handed back.
-    fn device_returns_control(
-        store: &mut RemoteStore,
-        device_id: &str,
-        command_id: &str,
-        now_ms: u64,
-    ) {
+    fn device_returns_control(store: &mut RemoteStore, device_id: &str, command_id: &str, now_ms: u64) {
         store
             .complete_device_command(
                 device_id,
@@ -2065,15 +1483,7 @@ mod tests {
         let now = super::super::now_ms_public().unwrap();
         let mut store = RemoteStore::open(&paths.root).unwrap();
         let phone = ready_phone(&mut store, &secrets, "Phone", now);
-        set_route(
-            &paths,
-            "chat-return",
-            "pipeline",
-            &format!("paired:{phone}:input"),
-            LOCAL_OUTPUT_DEFAULT,
-            now,
-        )
-        .unwrap();
+        set_route(&paths, "chat-return", "pipeline", &format!("paired:{phone}:input"), LOCAL_OUTPUT_DEFAULT, now).unwrap();
         let live = activate_route(&paths, "chat-return", now).unwrap();
         let holding = live.input_command_id.clone().unwrap();
         capture_running(&mut store, &phone, &holding, now);
@@ -2081,41 +1491,15 @@ mod tests {
         device_returns_control(&mut store, &phone, &holding, now + 10);
 
         let after = route(&paths, "chat-return").unwrap().unwrap();
-        assert_eq!(
-            after.input_endpoint, LOCAL_INPUT_DEFAULT,
-            "the microphone comes back to this computer"
-        );
-        assert_eq!(
-            after.output_endpoint, LOCAL_OUTPUT_DEFAULT,
-            "the untouched direction keeps its selection"
-        );
-        assert_eq!(
-            after.route_id, live.route_id,
-            "the same conversation keeps the same route"
-        );
+        assert_eq!(after.input_endpoint, LOCAL_INPUT_DEFAULT, "the microphone comes back to this computer");
+        assert_eq!(after.output_endpoint, LOCAL_OUTPUT_DEFAULT, "the untouched direction keeps its selection");
+        assert_eq!(after.route_id, live.route_id, "the same conversation keeps the same route");
         assert_eq!(after.session_id, live.session_id);
+        assert_eq!(after.state, "active", "handing a role back ends the role, not the conversation");
+        assert!(after.generation > live.generation, "the device's generation is retired with it");
+        assert_eq!(after.input_command_id, None, "a local microphone is carried by no device command");
         assert_eq!(
-            after.state, "active",
-            "handing a role back ends the role, not the conversation"
-        );
-        assert!(
-            after.generation > live.generation,
-            "the device's generation is retired with it"
-        );
-        assert_eq!(
-            after.input_command_id, None,
-            "a local microphone is carried by no device command"
-        );
-        assert_eq!(
-            append_event(
-                &paths,
-                "chat-return",
-                live.generation,
-                "input_ready",
-                &serde_json::json!({}),
-                now
-            )
-            .unwrap_err(),
+            append_event(&paths, "chat-return", live.generation, "input_ready", &serde_json::json!({}), now).unwrap_err(),
             "Voice route generation is stale",
             "anything the released device still emits has to read as stale",
         );
@@ -2139,15 +1523,7 @@ mod tests {
         let mut store = RemoteStore::open(&paths.root).unwrap();
         let phone = ready_phone(&mut store, &secrets, "Phone", now);
         let microphone = format!("paired:{phone}:input");
-        set_route(
-            &paths,
-            "chat-dropped",
-            "pipeline",
-            &microphone,
-            LOCAL_OUTPUT_DEFAULT,
-            now,
-        )
-        .unwrap();
+        set_route(&paths, "chat-dropped", "pipeline", &microphone, LOCAL_OUTPUT_DEFAULT, now).unwrap();
         let live = activate_route(&paths, "chat-dropped", now).unwrap();
         let holding = live.input_command_id.clone().unwrap();
         capture_running(&mut store, &phone, &holding, now);
@@ -2174,14 +1550,8 @@ mod tests {
             )
             .unwrap();
         let backgrounded = route(&paths, "chat-dropped").unwrap().unwrap();
-        assert_eq!(
-            backgrounded.input_endpoint, microphone,
-            "the route still names the phone the operator chose"
-        );
-        assert_eq!(
-            backgrounded.generation, live.generation,
-            "no generation was minted for a role nobody handed back"
-        );
+        assert_eq!(backgrounded.input_endpoint, microphone, "the route still names the phone the operator chose");
+        assert_eq!(backgrounded.generation, live.generation, "no generation was minted for a role nobody handed back");
         let _ = std::fs::remove_dir_all(app_data);
     }
 
@@ -2195,15 +1565,7 @@ mod tests {
         let now = super::super::now_ms_public().unwrap();
         let mut store = RemoteStore::open(&paths.root).unwrap();
         let phone = ready_phone(&mut store, &secrets, "Phone", now);
-        set_route(
-            &paths,
-            "chat-duplex",
-            "pipeline",
-            &format!("paired:{phone}:input"),
-            LOCAL_OUTPUT_DEFAULT,
-            now,
-        )
-        .unwrap();
+        set_route(&paths, "chat-duplex", "pipeline", &format!("paired:{phone}:input"), LOCAL_OUTPUT_DEFAULT, now).unwrap();
         let live = activate_route(&paths, "chat-duplex", now).unwrap();
         let holding = live.input_command_id.clone().unwrap();
         capture_running(&mut store, &phone, &holding, now);
@@ -2228,24 +1590,11 @@ mod tests {
                 .unwrap();
         });
 
-        let moved = move_route(
-            &paths,
-            "chat-duplex",
-            None,
-            Some(&format!("paired:{phone}:output")),
-            now,
-        )
-        .unwrap();
+        let moved = move_route(&paths, "chat-duplex", None, Some(&format!("paired:{phone}:output")), now).unwrap();
         device.join().unwrap();
         assert!(moved.generation > live.generation);
-        assert_eq!(
-            moved.input_command_id, moved.output_command_id,
-            "one device carrying both roles runs one command"
-        );
-        assert_eq!(
-            role_of(&store, moved.input_command_id.as_deref().unwrap()),
-            "duplex"
-        );
+        assert_eq!(moved.input_command_id, moved.output_command_id, "one device carrying both roles runs one command");
+        assert_eq!(role_of(&store, moved.input_command_id.as_deref().unwrap()), "duplex");
         assert!(
             store
                 .device_commands(&phone, 50)

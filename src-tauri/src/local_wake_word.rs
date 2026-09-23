@@ -424,8 +424,8 @@ impl WakeWordManager {
             // Only a keyword end this module could prove produces a latency.
             // Reporting the fall back's zero as a measurement would advertise
             // an instant detector.
-            let detection_lag_micros =
-                trusted_lag_samples.map(|lag| u128::from(lag) * 1_000_000 / SAMPLE_RATE as u128);
+            let detection_lag_micros = trusted_lag_samples
+                .map(|lag| u128::from(lag) * 1_000_000 / SAMPLE_RATE as u128);
             (detection_end, detection_lag_micros)
         };
         let inference_micros = inference_started.elapsed().as_micros();
@@ -473,7 +473,8 @@ impl WakeWordManager {
     /// decoded tokens, or when it happened.
     pub fn report_false_trigger(&self) -> Result<WakeWordRuntimeStatus, String> {
         let mut inner = lock(&self.inner)?;
-        inner.metrics.false_trigger_reports = inner.metrics.false_trigger_reports.saturating_add(1);
+        inner.metrics.false_trigger_reports =
+            inner.metrics.false_trigger_reports.saturating_add(1);
         Ok(status_from(&inner))
     }
 }

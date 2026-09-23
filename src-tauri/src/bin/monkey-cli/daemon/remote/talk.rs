@@ -429,9 +429,7 @@ fn split_wav_output(bytes: Vec<u8>) -> Result<Vec<Vec<u8>>, String> {
         let id = &bytes[at..at + 4];
         let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
         let start = at + 8;
-        let end = start
-            .checked_add(size)
-            .ok_or_else(|| "WAV chunk size overflow".to_string())?;
+        let end = start.checked_add(size).ok_or_else(|| "WAV chunk size overflow".to_string())?;
         if end > bytes.len() {
             return Err("WAV chunk extends past the synthesized payload".to_string());
         }
@@ -468,19 +466,17 @@ fn split_wav_output(bytes: Vec<u8>) -> Result<Vec<Vec<u8>>, String> {
         let riff_size = 4usize + 8 + fmt_padded + 8 + payload.len();
         let riff_size = u32::try_from(riff_size)
             .map_err(|_| "WAV Talk chunk is too large for RIFF".to_string())?;
-        let fmt_size =
-            u32::try_from(fmt.len()).map_err(|_| "WAV fmt chunk is too large".to_string())?;
-        let data_size =
-            u32::try_from(payload.len()).map_err(|_| "WAV data chunk is too large".to_string())?;
+        let fmt_size = u32::try_from(fmt.len())
+            .map_err(|_| "WAV fmt chunk is too large".to_string())?;
+        let data_size = u32::try_from(payload.len())
+            .map_err(|_| "WAV data chunk is too large".to_string())?;
         let mut chunk = Vec::with_capacity(header_bytes + payload.len());
         chunk.extend_from_slice(b"RIFF");
         chunk.extend_from_slice(&riff_size.to_le_bytes());
         chunk.extend_from_slice(b"WAVEfmt ");
         chunk.extend_from_slice(&fmt_size.to_le_bytes());
         chunk.extend_from_slice(&fmt);
-        if fmt.len() & 1 == 1 {
-            chunk.push(0);
-        }
+        if fmt.len() & 1 == 1 { chunk.push(0); }
         chunk.extend_from_slice(b"data");
         chunk.extend_from_slice(&data_size.to_le_bytes());
         chunk.extend_from_slice(payload);
