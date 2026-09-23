@@ -1008,9 +1008,17 @@ mod tests {
 
         match bundled_cli_path() {
             Some(path) => {
-                assert!(has_staged, "resolved {} with nothing staged", path.display());
+                assert!(
+                    has_staged,
+                    "resolved {} with nothing staged",
+                    path.display()
+                );
                 assert!(path.is_file(), "{} is not a file", path.display());
-                assert!(path.starts_with(&staged), "{} is not staged", path.display());
+                assert!(
+                    path.starts_with(&staged),
+                    "{} is not staged",
+                    path.display()
+                );
             }
             // Nothing staged — `pnpm stage:cli` has not run in this checkout —
             // and refusing to guess is the documented answer.

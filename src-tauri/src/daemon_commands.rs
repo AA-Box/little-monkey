@@ -2488,9 +2488,16 @@ pub async fn voice_route_endpoints() -> Result<Value, String> {
 #[tauri::command]
 pub async fn voice_route_get(session_id: String) -> Result<Value, String> {
     validate_id("session id", &session_id)?;
-    parse_json(&command(vec![
-        "voice".into(), "route".into(), "get".into(), session_id, "--json".into(),
-    ]).await?)
+    parse_json(
+        &command(vec![
+            "voice".into(),
+            "route".into(),
+            "get".into(),
+            session_id,
+            "--json".into(),
+        ])
+        .await?,
+    )
 }
 
 #[tauri::command]
@@ -2504,11 +2511,22 @@ pub async fn voice_route_set(
     validate_token("voice input endpoint", &input, 512)?;
     validate_token("voice output endpoint", &output, 512)?;
     validate_token("voice engine", &engine, 32)?;
-    parse_json(&command(vec![
-        "voice".into(), "route".into(), "set".into(), session_id,
-        "--input".into(), input, "--output".into(), output,
-        "--engine".into(), engine, "--json".into(),
-    ]).await?)
+    parse_json(
+        &command(vec![
+            "voice".into(),
+            "route".into(),
+            "set".into(),
+            session_id,
+            "--input".into(),
+            input,
+            "--output".into(),
+            output,
+            "--engine".into(),
+            engine,
+            "--json".into(),
+        ])
+        .await?,
+    )
 }
 
 #[tauri::command]
@@ -2537,25 +2555,44 @@ pub async fn voice_route_move(
 #[tauri::command]
 pub async fn voice_route_activate(session_id: String) -> Result<Value, String> {
     validate_id("session id", &session_id)?;
-    parse_json(&command(vec![
-        "voice".into(), "route".into(), "activate".into(), session_id,
-    ]).await?)
+    parse_json(
+        &command(vec![
+            "voice".into(),
+            "route".into(),
+            "activate".into(),
+            session_id,
+        ])
+        .await?,
+    )
 }
 
 #[tauri::command]
 pub async fn voice_route_deactivate(session_id: String) -> Result<Value, String> {
     validate_id("session id", &session_id)?;
-    parse_json(&command(vec![
-        "voice".into(), "route".into(), "deactivate".into(), session_id,
-    ]).await?)
+    parse_json(
+        &command(vec![
+            "voice".into(),
+            "route".into(),
+            "deactivate".into(),
+            session_id,
+        ])
+        .await?,
+    )
 }
 
 #[tauri::command]
 pub async fn voice_route_stop(session_id: String) -> Result<Value, String> {
     validate_id("session id", &session_id)?;
-    parse_json(&command(vec![
-        "voice".into(), "route".into(), "stop".into(), session_id, "--json".into(),
-    ]).await?)
+    parse_json(
+        &command(vec![
+            "voice".into(),
+            "route".into(),
+            "stop".into(),
+            session_id,
+            "--json".into(),
+        ])
+        .await?,
+    )
 }
 
 #[tauri::command]
@@ -2568,10 +2605,20 @@ pub async fn voice_route_events(
     if !(1..=512).contains(&limit) {
         return Err("Voice route event limit must be 1..=512".to_string());
     }
-    parse_json(&command(vec![
-        "voice".into(), "route".into(), "events".into(), session_id,
-        "--after".into(), after.to_string(), "--limit".into(), limit.to_string(), "--json".into(),
-    ]).await?)
+    parse_json(
+        &command(vec![
+            "voice".into(),
+            "route".into(),
+            "events".into(),
+            session_id,
+            "--after".into(),
+            after.to_string(),
+            "--limit".into(),
+            limit.to_string(),
+            "--json".into(),
+        ])
+        .await?,
+    )
 }
 
 #[tauri::command]
@@ -2587,13 +2634,22 @@ pub async fn voice_route_emit(
     if payload_json.len() > 64 * 1024 {
         return Err("Voice route event payload exceeds 64 KiB".to_string());
     }
-    parse_json(&command(vec![
-        "voice".into(), "route".into(), "emit".into(), session_id,
-        "--generation".into(), generation.to_string(), "--kind".into(), kind,
-        "--payload-json".into(), payload_json,
-    ]).await?)
+    parse_json(
+        &command(vec![
+            "voice".into(),
+            "route".into(),
+            "emit".into(),
+            session_id,
+            "--generation".into(),
+            generation.to_string(),
+            "--kind".into(),
+            kind,
+            "--payload-json".into(),
+            payload_json,
+        ])
+        .await?,
+    )
 }
-
 
 #[tauri::command]
 pub async fn remote_device_list() -> Result<Value, String> {

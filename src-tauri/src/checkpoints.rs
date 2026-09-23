@@ -2896,10 +2896,7 @@ mod tests {
         // written manifests and in `en.ts`'s `CheckpointPreview.effectKind.*`
         // keys, so renaming one is a migration, not a rewording.
         assert_eq!(ExternalEffectKind::Device.code(), "device");
-        assert_eq!(
-            ExternalEffectKind::DesktopControl.code(),
-            "desktop-control"
-        );
+        assert_eq!(ExternalEffectKind::DesktopControl.code(), "desktop-control");
     }
 
     /// A device action and a control action are separate entries rather than one

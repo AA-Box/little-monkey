@@ -4401,12 +4401,8 @@ fn install_mlx_from_artifact_with_verifier(
             return Err(M3HubError::Runtime(error.to_string()));
         }
     };
-    let installer = MlxPackageInstaller::new(
-        mlx_runtime_root(app_data_dir),
-        verifier,
-        limits,
-    )
-    .map_err(|error| M3HubError::Runtime(error.to_string()))?;
+    let installer = MlxPackageInstaller::new(mlx_runtime_root(app_data_dir), verifier, limits)
+        .map_err(|error| M3HubError::Runtime(error.to_string()))?;
     let installed = installer
         .install_and_activate(&bundle, &MlxHostCapabilities::current())
         .map_err(|error| M3HubError::Runtime(error.to_string()));

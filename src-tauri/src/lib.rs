@@ -47,7 +47,8 @@ pub mod runtime_adapter;
 // Model-agnostic image and video generation over the managed
 // stable-diffusion.cpp runtime. Tauri-free so the CLI can share it.
 pub mod generation;
-mod generation_commands;
+pub(crate) mod generation_commands;
+pub mod studio_parity;
 pub mod studio_tools;
 // The two generation backends the app talks to but never ships: a ComfyUI the
 // user installed, and hosted OpenAI-compatible image APIs. HTTP only.
@@ -140,8 +141,8 @@ pub mod runtime_telemetry;
 // endpoints. The module owns its media jobs so normal app shutdown can revoke
 // every grant and cancel every child/network task before Tauri exits.
 pub mod dictation;
-pub mod local_whisper;
 pub mod local_wake_word;
+pub mod local_whisper;
 pub mod m7_companion;
 pub mod realtime_voice;
 // Global Command Palette (ROADMAP.md, Phase 1): owns only the OS-level
@@ -2093,6 +2094,11 @@ pub fn run() {
             generation_commands::studio_tool_manifest,
             generation_commands::studio_tool_run,
             generation_commands::studio_tool_stop,
+            studio_parity::studio_discovery_search,
+            studio_parity::studio_discovery_download,
+            studio_parity::chat_export_write_documents,
+            studio_parity::character_training_start,
+            studio_parity::studio_workflow_run,
             generation_commands::studio_tools_running,
             generation_commands::studio_tool_import_catalog,
             m7_companion::m7_image_generate,

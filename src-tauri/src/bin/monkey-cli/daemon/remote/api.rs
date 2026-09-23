@@ -2328,12 +2328,24 @@ impl RemoteApi {
             .map_err(|error| (400, format!("Invalid Talk ticket request: {error}")))?;
         request.validate().map_err(|error| (400, error))?;
 
-        let (session_id, route_id, route_generation, route_role, route_engine, route_output_to_socket, route_event_cursor) = {
+        let (
+            session_id,
+            route_id,
+            route_generation,
+            route_role,
+            route_engine,
+            route_output_to_socket,
+            route_event_cursor,
+        ) = {
             let store = self.locked_store()?;
             let surface = store.device_surface(&device.device_id).map_err(internal)?;
             let effective = effective_capabilities(&device.capabilities, surface.as_ref());
 
-            match (&request.route_id, request.route_generation, request.route_role.as_deref()) {
+            match (
+                &request.route_id,
+                request.route_generation,
+                request.route_role.as_deref(),
+            ) {
                 (Some(route_id), Some(generation), Some(role)) => {
                     let route = store
                         .voice_route_by_id(route_id)
@@ -2347,22 +2359,42 @@ impl RemoteApi {
                     match role {
                         "input" => {
                             if route.input_endpoint != expected_input {
-                                return Err((403, "This paired device is not the selected VoiceRoute microphone".to_string()));
+                                return Err((
+                                    403,
+                                    "This paired device is not the selected VoiceRoute microphone"
+                                        .to_string(),
+                                ));
                             }
                             if !effective.contains(&DeviceCapability::VoiceStream) {
-                                return Err((403, "This device's voice_stream capability is not effective".to_string()));
+                                return Err((
+                                    403,
+                                    "This device's voice_stream capability is not effective"
+                                        .to_string(),
+                                ));
                             }
                         }
                         "output" => {
-                            if route.output_endpoint != expected_output || route.input_endpoint == expected_input {
-                                return Err((403, "This paired device is not the independent VoiceRoute speaker".to_string()));
+                            if route.output_endpoint != expected_output
+                                || route.input_endpoint == expected_input
+                            {
+                                return Err((
+                                    403,
+                                    "This paired device is not the independent VoiceRoute speaker"
+                                        .to_string(),
+                                ));
                             }
                             if !effective.contains(&DeviceCapability::AudioPlayback) {
-                                return Err((403, "This device's audio_playback capability is not effective".to_string()));
+                                return Err((
+                                    403,
+                                    "This device's audio_playback capability is not effective"
+                                        .to_string(),
+                                ));
                             }
                         }
                         "duplex" => {
-                            if route.input_endpoint != expected_input || route.output_endpoint != expected_output {
+                            if route.input_endpoint != expected_input
+                                || route.output_endpoint != expected_output
+                            {
                                 return Err((403, "This paired device is not both VoiceRoute microphone and speaker".to_string()));
                             }
                             if !effective.contains(&DeviceCapability::VoiceStream)
@@ -2373,7 +2405,9 @@ impl RemoteApi {
                         }
                         _ => unreachable!("TalkTicketRequest::validate checks role"),
                     }
-                    let cursor = store.latest_voice_route_event_id(&route.session_id).map_err(internal)?;
+                    let cursor = store
+                        .latest_voice_route_event_id(&route.session_id)
+                        .map_err(internal)?;
                     (
                         route.session_id,
                         Some(route.route_id),
@@ -2394,19 +2428,18 @@ impl RemoteApi {
             }
         };
 
-        let issued = TalkTicketResponse::issue(
-            session_id,
-            now_ms,
-            DEFAULT_TALK_TICKET_TTL_MS,
-        )
-        .map_err(|error| (400, error))?;
+        let issued = TalkTicketResponse::issue(session_id, now_ms, DEFAULT_TALK_TICKET_TTL_MS)
+            .map_err(|error| (400, error))?;
         let mut tickets = self
             .talk_tickets
             .lock()
             .map_err(|_| (500, "Talk ticket state was poisoned".to_string()))?;
         tickets.retain(|_, pending| pending.expires_at_ms > now_ms);
         if tickets.len() >= MAX_PENDING_TALK_TICKETS {
-            return Err((429, "Too many Talk sockets are being opened at once.".to_string()));
+            return Err((
+                429,
+                "Too many Talk sockets are being opened at once.".to_string(),
+            ));
         }
         tickets.insert(
             sha256_hex(issued.ticket.as_bytes()),
@@ -2478,23 +2511,35 @@ impl RemoteApi {
                 pending.route_role.as_deref(),
             ) {
                 let route = store.voice_route_by_id(route_id).ok().flatten()?;
-                if route.state != "active" || route.generation != generation || route.session_id != pending.session_id {
+                if route.state != "active"
+                    || route.generation != generation
+                    || route.session_id != pending.session_id
+                {
                     return None;
                 }
                 let expected_input = format!("paired:{}:input", pending.device_id);
                 let expected_output = format!("paired:{}:output", pending.device_id);
                 let valid = match role {
-                    "input" => route.input_endpoint == expected_input && effective.contains(&DeviceCapability::VoiceStream),
-                    "output" => route.output_endpoint == expected_output
-                        && route.input_endpoint != expected_input
-                        && effective.contains(&DeviceCapability::AudioPlayback),
-                    "duplex" => route.input_endpoint == expected_input
-                        && route.output_endpoint == expected_output
-                        && effective.contains(&DeviceCapability::VoiceStream)
-                        && effective.contains(&DeviceCapability::AudioPlayback),
+                    "input" => {
+                        route.input_endpoint == expected_input
+                            && effective.contains(&DeviceCapability::VoiceStream)
+                    }
+                    "output" => {
+                        route.output_endpoint == expected_output
+                            && route.input_endpoint != expected_input
+                            && effective.contains(&DeviceCapability::AudioPlayback)
+                    }
+                    "duplex" => {
+                        route.input_endpoint == expected_input
+                            && route.output_endpoint == expected_output
+                            && effective.contains(&DeviceCapability::VoiceStream)
+                            && effective.contains(&DeviceCapability::AudioPlayback)
+                    }
                     _ => false,
                 };
-                if !valid { return None; }
+                if !valid {
+                    return None;
+                }
                 // Measured here rather than at issue time: a ticket is minted
                 // thirty seconds before it is spent, and what an operator waits
                 // for is the socket, not the bearer.
@@ -2503,7 +2548,9 @@ impl RemoteApi {
                     engine: route.engine.clone(),
                     role: role.to_string(),
                     input_kind: super::talk::TalkRouteReport::endpoint_kind(&route.input_endpoint),
-                    output_kind: super::talk::TalkRouteReport::endpoint_kind(&route.output_endpoint),
+                    output_kind: super::talk::TalkRouteReport::endpoint_kind(
+                        &route.output_endpoint,
+                    ),
                     setup_ms: now_ms.saturating_sub(route.updated_at_ms),
                     duration_ms: 0,
                     route_id: route.route_id,
@@ -2688,15 +2735,29 @@ impl RemoteApi {
     }
 
     pub(crate) fn talk_output_route_live(&self, authorization: &TalkSocketAuthorization) -> bool {
-        let (Some(route_id), Some(generation)) =
-            (authorization.route_id.as_deref(), authorization.route_generation)
-        else { return false; };
-        let Ok(store) = self.store.lock() else { return false; };
-        let Some(device) = store.device(&authorization.device_id).ok().flatten() else { return false; };
-        if !device.active() { return false; }
-        let surface = store.device_surface(&authorization.device_id).ok().flatten();
+        let (Some(route_id), Some(generation)) = (
+            authorization.route_id.as_deref(),
+            authorization.route_generation,
+        ) else {
+            return false;
+        };
+        let Ok(store) = self.store.lock() else {
+            return false;
+        };
+        let Some(device) = store.device(&authorization.device_id).ok().flatten() else {
+            return false;
+        };
+        if !device.active() {
+            return false;
+        }
+        let surface = store
+            .device_surface(&authorization.device_id)
+            .ok()
+            .flatten();
         let effective = effective_capabilities(&device.capabilities, surface.as_ref());
-        let Ok(Some(route)) = store.voice_route_by_id(route_id) else { return false; };
+        let Ok(Some(route)) = store.voice_route_by_id(route_id) else {
+            return false;
+        };
         route.state == "active"
             && route.generation == generation
             && route.session_id == authorization.session_id
@@ -2704,11 +2765,16 @@ impl RemoteApi {
             && effective.contains(&DeviceCapability::AudioPlayback)
     }
 
-    pub(crate) fn talk_route_command_id(&self, authorization: &TalkSocketAuthorization) -> Option<String> {
+    pub(crate) fn talk_route_command_id(
+        &self,
+        authorization: &TalkSocketAuthorization,
+    ) -> Option<String> {
         let route_id = authorization.route_id.as_deref()?;
         let store = self.store.lock().ok()?;
         let route = store.voice_route_by_id(route_id).ok().flatten()?;
-        if route.generation != authorization.route_generation? || route.session_id != authorization.session_id {
+        if route.generation != authorization.route_generation?
+            || route.session_id != authorization.session_id
+        {
             return None;
         }
         match authorization.route_role.as_deref() {
@@ -2745,15 +2811,29 @@ impl RemoteApi {
     }
 
     pub(crate) fn talk_input_route_live(&self, authorization: &TalkSocketAuthorization) -> bool {
-        let (Some(route_id), Some(generation)) =
-            (authorization.route_id.as_deref(), authorization.route_generation)
-        else { return false; };
-        let Ok(store) = self.store.lock() else { return false; };
-        let Some(device) = store.device(&authorization.device_id).ok().flatten() else { return false; };
-        if !device.active() { return false; }
-        let surface = store.device_surface(&authorization.device_id).ok().flatten();
+        let (Some(route_id), Some(generation)) = (
+            authorization.route_id.as_deref(),
+            authorization.route_generation,
+        ) else {
+            return false;
+        };
+        let Ok(store) = self.store.lock() else {
+            return false;
+        };
+        let Some(device) = store.device(&authorization.device_id).ok().flatten() else {
+            return false;
+        };
+        if !device.active() {
+            return false;
+        }
+        let surface = store
+            .device_surface(&authorization.device_id)
+            .ok()
+            .flatten();
         let effective = effective_capabilities(&device.capabilities, surface.as_ref());
-        let Ok(Some(route)) = store.voice_route_by_id(route_id) else { return false; };
+        let Ok(Some(route)) = store.voice_route_by_id(route_id) else {
+            return false;
+        };
         route.state == "active"
             && route.generation == generation
             && route.session_id == authorization.session_id
@@ -2761,7 +2841,11 @@ impl RemoteApi {
             && effective.contains(&DeviceCapability::VoiceStream)
     }
 
-    fn realtime_host_route(&self, session_id: &str, generation: u64) -> Result<super::store::VoiceRouteRecord, String> {
+    fn realtime_host_route(
+        &self,
+        session_id: &str,
+        generation: u64,
+    ) -> Result<super::store::VoiceRouteRecord, String> {
         let store = self
             .store
             .lock()
@@ -2781,7 +2865,10 @@ impl RemoteApi {
         bytes: Vec<u8>,
     ) -> Result<u64, String> {
         if authorization.route_engine.as_deref() != Some("realtime")
-            || !matches!(authorization.route_role.as_deref(), Some("input" | "duplex"))
+            || !matches!(
+                authorization.route_role.as_deref(),
+                Some("input" | "duplex")
+            )
             || !self.talk_input_route_live(authorization)
         {
             return Err("Realtime microphone authority was revoked or moved".to_string());
@@ -2823,7 +2910,8 @@ impl RemoteApi {
             return Err("Realtime paired speaker is not activated".to_string());
         }
         super::realtime_bridge::validate_pcm(&bytes)?;
-        self.realtime_media.push_output(session_id, generation, bytes)
+        self.realtime_media
+            .push_output(session_id, generation, bytes)
     }
 
     pub(crate) fn clear_realtime_output_from_host(
@@ -2843,7 +2931,10 @@ impl RemoteApi {
         authorization: &TalkSocketAuthorization,
     ) -> Result<Option<super::realtime_bridge::RealtimePcmChunk>, String> {
         if authorization.route_engine.as_deref() != Some("realtime")
-            || !matches!(authorization.route_role.as_deref(), Some("output" | "duplex"))
+            || !matches!(
+                authorization.route_role.as_deref(),
+                Some("output" | "duplex")
+            )
             || !self.talk_output_route_live(authorization)
         {
             return Err("Realtime speaker authority was revoked or moved".to_string());
@@ -2851,7 +2942,8 @@ impl RemoteApi {
         let generation = authorization
             .route_generation
             .ok_or_else(|| "Realtime speaker route has no generation".to_string())?;
-        self.realtime_media.pop_output(&authorization.session_id, generation)
+        self.realtime_media
+            .pop_output(&authorization.session_id, generation)
     }
 
     pub(crate) fn discard_realtime_media(&self, session_id: &str, generation: u64) {
@@ -4658,7 +4750,9 @@ impl TalkSessionTurns {
 
 impl super::talk::TalkTurns for TalkSessionTurns {
     fn submit(&self, session_id: &str, client_key: &str, text: &str) -> Result<String, String> {
-        if let (Some(_route_id), Some(generation)) = (self.route_id.as_deref(), self.route_generation) {
+        if let (Some(_route_id), Some(generation)) =
+            (self.route_id.as_deref(), self.route_generation)
+        {
             if session_id != self.route_session_id {
                 return Err("Routed Talk session binding changed".to_string());
             }
@@ -4726,7 +4820,9 @@ impl super::talk::TalkTurns for TalkSessionTurns {
         run_id: &str,
         from_index: u64,
     ) -> Result<super::talk::TalkRunProgress, String> {
-        if let (Some(_route_id), Some(generation)) = (self.route_id.as_deref(), self.route_generation) {
+        if let (Some(_route_id), Some(generation)) =
+            (self.route_id.as_deref(), self.route_generation)
+        {
             let turn_id = run_id
                 .strip_prefix("voice-route:")
                 .ok_or_else(|| "Routed Talk run id is invalid".to_string())?;
@@ -4737,18 +4833,29 @@ impl super::talk::TalkTurns for TalkSessionTurns {
                 .map_err(|_| "Remote state lock was poisoned".to_string())?;
             let events = store.voice_route_events(&self.route_session_id, from_index, 500)?;
             let mut progress = super::talk::TalkRunProgress {
-                next_index: events.last().map(|event| event.event_id).unwrap_or(from_index),
+                next_index: events
+                    .last()
+                    .map(|event| event.event_id)
+                    .unwrap_or(from_index),
                 ..super::talk::TalkRunProgress::default()
             };
             for event in events {
                 if event.generation != generation
-                    || event.payload.get("turn_id").and_then(serde_json::Value::as_str) != Some(turn_id)
+                    || event
+                        .payload
+                        .get("turn_id")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(turn_id)
                 {
                     continue;
                 }
                 match event.kind.as_str() {
                     "assistant_delta" => {
-                        if let Some(text) = event.payload.get("text").and_then(serde_json::Value::as_str) {
+                        if let Some(text) = event
+                            .payload
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                        {
                             progress.delta.push_str(text);
                         }
                     }
@@ -4756,7 +4863,10 @@ impl super::talk::TalkTurns for TalkSessionTurns {
                     "turn_failed" => {
                         progress.finished = true;
                         progress.error = Some(
-                            event.payload.get("error").and_then(serde_json::Value::as_str)
+                            event
+                                .payload
+                                .get("error")
+                                .and_then(serde_json::Value::as_str)
                                 .unwrap_or("The routed turn failed")
                                 .to_string(),
                         );
@@ -4764,7 +4874,8 @@ impl super::talk::TalkTurns for TalkSessionTurns {
                     "host_interrupt" => {
                         progress.finished = true;
                         if progress.delta.is_empty() {
-                            progress.error = Some("This turn was interrupted on the host.".to_string());
+                            progress.error =
+                                Some("This turn was interrupted on the host.".to_string());
                         }
                     }
                     _ => {}
@@ -4814,7 +4925,9 @@ impl super::talk::TalkTurns for TalkSessionTurns {
     }
 
     fn cancel(&self, run_id: &str) -> Result<(), String> {
-        if let (Some(_route_id), Some(generation)) = (self.route_id.as_deref(), self.route_generation) {
+        if let (Some(_route_id), Some(generation)) =
+            (self.route_id.as_deref(), self.route_generation)
+        {
             let turn_id = run_id
                 .strip_prefix("voice-route:")
                 .ok_or_else(|| "Routed Talk run id is invalid".to_string())?;
@@ -4848,11 +4961,16 @@ impl super::talk::TalkTurns for TalkSessionTurns {
         if !self.api.talk_capability_live(device_id) {
             return false;
         }
-        let (Some(route_id), Some(generation)) = (self.route_id.as_deref(), self.route_generation) else {
+        let (Some(route_id), Some(generation)) = (self.route_id.as_deref(), self.route_generation)
+        else {
             return true;
         };
-        let Ok(store) = self.api.store.lock() else { return false; };
-        let Ok(Some(route)) = store.voice_route_by_id(route_id) else { return false; };
+        let Ok(store) = self.api.store.lock() else {
+            return false;
+        };
+        let Ok(Some(route)) = store.voice_route_by_id(route_id) else {
+            return false;
+        };
         if route.state != "active"
             || route.generation != generation
             || route.session_id != self.route_session_id
@@ -4861,7 +4979,9 @@ impl super::talk::TalkTurns for TalkSessionTurns {
             return false;
         }
         if self.route_output_to_socket {
-            let Ok(Some(device)) = store.device(&self.device_id) else { return false; };
+            let Ok(Some(device)) = store.device(&self.device_id) else {
+                return false;
+            };
             let surface = store.device_surface(&self.device_id).ok().flatten();
             return route.output_endpoint == format!("paired:{}:output", self.device_id)
                 && effective_capabilities(&device.capabilities, surface.as_ref())
@@ -7324,7 +7444,15 @@ mod tests {
         capabilities: &[DeviceCapability],
         permissions: &[(DeviceCapability, OsPermission)],
     ) -> ApiResponse {
-        advertise_at(api, device_id, secret, sequence, capabilities, permissions, 2_000)
+        advertise_at(
+            api,
+            device_id,
+            secret,
+            sequence,
+            capabilities,
+            permissions,
+            2_000,
+        )
     }
 
     /// The same surface against a caller-chosen clock. VoiceRoute refuses to
@@ -8600,7 +8728,10 @@ mod tests {
     }
 
     /// The route's own coordination log, as the host wrote it.
-    fn route_events(api: &RemoteApi, session_id: &str) -> Vec<super::super::store::VoiceRouteEventRecord> {
+    fn route_events(
+        api: &RemoteApi,
+        session_id: &str,
+    ) -> Vec<super::super::store::VoiceRouteEventRecord> {
         api.talk_route_events(session_id, 0).expect("route events")
     }
 
@@ -8653,14 +8784,7 @@ mod tests {
         );
         let address = spawn_talk_server(api.clone()).await;
         let (mut socket, generation, session_id) = open_route_socket(
-            &api,
-            &device_id,
-            &secret,
-            2,
-            &route,
-            "input",
-            address,
-            now_ms,
+            &api, &device_id, &secret, 2, &route, "input", address, now_ms,
         )
         .await;
         let _ = read_until(&mut socket, "ready").await;
@@ -8825,14 +8949,7 @@ mod tests {
         );
         let address = spawn_talk_server(api.clone()).await;
         let (mut socket, generation, session_id) = open_route_socket(
-            &api,
-            &device_id,
-            &secret,
-            2,
-            &route,
-            "output",
-            address,
-            now_ms,
+            &api, &device_id, &secret, 2, &route, "output", address, now_ms,
         )
         .await;
         let _ = read_until(&mut socket, "ready").await;
@@ -8920,7 +9037,11 @@ mod tests {
             .into_iter()
             .filter(|event| event.kind == "output_played")
             .collect::<Vec<_>>();
-        assert_eq!(played.len(), 1, "one completed response, one completion row");
+        assert_eq!(
+            played.len(),
+            1,
+            "one completed response, one completion row"
+        );
         assert_eq!(played[0].payload["turn_id"], "turn-one");
         assert_eq!(played[0].payload["chunk_count"], 3);
         assert_eq!(played[0].payload["audio_sequence"], 3);
@@ -8968,14 +9089,7 @@ mod tests {
         );
         let address = spawn_talk_server(api.clone()).await;
         let (mut socket, generation, session_id) = open_route_socket(
-            &api,
-            &device_id,
-            &secret,
-            2,
-            &route,
-            "duplex",
-            address,
-            now_ms,
+            &api, &device_id, &secret, 2, &route, "duplex", address, now_ms,
         )
         .await;
         let _ = read_until(&mut socket, "ready").await;
@@ -9294,14 +9408,7 @@ mod tests {
 
         // Spent while current, then overtaken underneath.
         let (mut socket, generation, session_id) = open_route_socket(
-            &api,
-            &device_id,
-            &secret,
-            3,
-            &moved,
-            "input",
-            address,
-            now_ms,
+            &api, &device_id, &secret, 3, &moved, "input", address, now_ms,
         )
         .await;
         let _ = read_until(&mut socket, "ready").await;
@@ -9713,7 +9820,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            published["listen"], address.to_string(),
+            published["listen"],
+            address.to_string(),
             "the desktop finds the bridge through this file and nothing else"
         );
         (
@@ -9759,7 +9867,10 @@ mod tests {
             if status == 200 {
                 return (bytes, sequence);
             }
-            assert_eq!(status, 204, "the host ingress is open and empty, not refused");
+            assert_eq!(
+                status, 204,
+                "the host ingress is open and empty, not refused"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         panic!("the device's realtime PCM never reached the host ingress");
@@ -9866,8 +9977,10 @@ mod tests {
         );
         let bridge = host_media_bridge(&paths, &api).await;
         let address = spawn_talk_server(api.clone()).await;
-        let (mut socket, generation, session_id) =
-            open_route_socket(&api, &device_id, &secret, 2, &route, "input", address, now_ms).await;
+        let (mut socket, generation, session_id) = open_route_socket(
+            &api, &device_id, &secret, 2, &route, "input", address, now_ms,
+        )
+        .await;
         let _ = read_until(&mut socket, "ready").await;
         realtime_hello(&mut socket, &session_id, &generation).await;
 
@@ -9895,9 +10008,15 @@ mod tests {
             received, spoken,
             "the provider session receives the device's samples unaltered"
         );
-        assert_eq!(sequence, Some(1), "ingress sequences start at one and are stamped");
         assert_eq!(
-            host_takes_input(&bridge, &route.session_id, route.generation).await.0,
+            sequence,
+            Some(1),
+            "ingress sequences start at one and are stamped"
+        );
+        assert_eq!(
+            host_takes_input(&bridge, &route.session_id, route.generation)
+                .await
+                .0,
             204,
             "one chunk in, one chunk out: the queue is not replaying"
         );
@@ -9919,7 +10038,10 @@ mod tests {
             .into_iter()
             .map(|event| event.kind)
             .collect::<Vec<_>>();
-        assert!(kinds.contains(&"input_ready".to_string()), "the route came up: {kinds:?}");
+        assert!(
+            kinds.contains(&"input_ready".to_string()),
+            "the route came up: {kinds:?}"
+        );
         assert!(
             !kinds.iter().any(|kind| kind == "input_transcript"),
             "nothing on a realtime route is transcribed: {kinds:?}"
@@ -9967,14 +10089,18 @@ mod tests {
         );
         let bridge = host_media_bridge(&paths, &api).await;
         let address = spawn_talk_server(api.clone()).await;
-        let (mut socket, generation, session_id) =
-            open_route_socket(&api, &device_id, &secret, 2, &route, "output", address, now_ms).await;
+        let (mut socket, generation, session_id) = open_route_socket(
+            &api, &device_id, &secret, 2, &route, "output", address, now_ms,
+        )
+        .await;
         let _ = read_until(&mut socket, "ready").await;
         realtime_hello(&mut socket, &session_id, &generation).await;
 
         // Ten chunks of provider speech, more than the socket may hold
         // unacknowledged.
-        let pushed = (0..10u8).map(|index| pcm_chunk(index, 32)).collect::<Vec<_>>();
+        let pushed = (0..10u8)
+            .map(|index| pcm_chunk(index, 32))
+            .collect::<Vec<_>>();
         for chunk in &pushed {
             assert_eq!(
                 host_pushes_output(&bridge, &route.session_id, route.generation, chunk).await,
@@ -9999,7 +10125,9 @@ mod tests {
                 super::super::realtime_bridge::REALTIME_PCM_MEDIA_TYPE
             );
             assert_eq!(
-                STANDARD.decode(audio["audio_base64"].as_str().unwrap()).unwrap(),
+                STANDARD
+                    .decode(audio["audio_base64"].as_str().unwrap())
+                    .unwrap(),
                 pushed[index],
                 "chunks reach the speaker in the order the provider produced them"
             );
@@ -10023,9 +10151,14 @@ mod tests {
             .await
             .unwrap();
         let ninth = read_until(&mut socket, "output_audio").await;
-        assert_eq!(ninth["audio_sequence"], 9, "one acknowledgement releases one chunk");
         assert_eq!(
-            STANDARD.decode(ninth["audio_base64"].as_str().unwrap()).unwrap(),
+            ninth["audio_sequence"], 9,
+            "one acknowledgement releases one chunk"
+        );
+        assert_eq!(
+            STANDARD
+                .decode(ninth["audio_base64"].as_str().unwrap())
+                .unwrap(),
             pushed[8]
         );
         assert!(
@@ -10082,8 +10215,10 @@ mod tests {
         );
         let bridge = host_media_bridge(&paths, &api).await;
         let address = spawn_talk_server(api.clone()).await;
-        let (mut socket, generation, session_id) =
-            open_route_socket(&api, &device_id, &secret, 2, &route, "duplex", address, now_ms).await;
+        let (mut socket, generation, session_id) = open_route_socket(
+            &api, &device_id, &secret, 2, &route, "duplex", address, now_ms,
+        )
+        .await;
         let _ = read_until(&mut socket, "ready").await;
         realtime_hello(&mut socket, &session_id, &generation).await;
 
@@ -10106,7 +10241,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            host_waits_for_input(&bridge, &route.session_id, route.generation).await.0,
+            host_waits_for_input(&bridge, &route.session_id, route.generation)
+                .await
+                .0,
             heard
         );
         let answered = pcm_chunk(0x22, 64);
@@ -10116,7 +10253,9 @@ mod tests {
         );
         let audio = read_until(&mut socket, "output_audio").await;
         assert_eq!(
-            STANDARD.decode(audio["audio_base64"].as_str().unwrap()).unwrap(),
+            STANDARD
+                .decode(audio["audio_base64"].as_str().unwrap())
+                .unwrap(),
             answered
         );
 
@@ -10140,10 +10279,15 @@ mod tests {
 
         let moved = bump_route_generation(&paths, &route, now_ms);
         assert!(moved.generation > route.generation);
-        assert_eq!(moved.engine, "realtime", "a handoff does not change the engine");
+        assert_eq!(
+            moved.engine, "realtime",
+            "a handoff does not change the engine"
+        );
 
         assert_eq!(
-            host_takes_input(&bridge, &route.session_id, route.generation).await.0,
+            host_takes_input(&bridge, &route.session_id, route.generation)
+                .await
+                .0,
             409,
             "the host cannot keep reading the microphone of a generation it has left"
         );
@@ -10153,7 +10297,9 @@ mod tests {
             "nor speak into it"
         );
         assert_eq!(
-            host_takes_input(&bridge, &moved.session_id, moved.generation).await.0,
+            host_takes_input(&bridge, &moved.session_id, moved.generation)
+                .await
+                .0,
             204,
             "and the media buffered under the old generation does not become the new one's"
         );
@@ -10308,11 +10454,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            host_waits_for_input(&bridge, conversation, realtime.generation).await.0,
+            host_waits_for_input(&bridge, conversation, realtime.generation)
+                .await
+                .0,
             spoken
         );
         assert_eq!(
-            host_takes_input(&bridge, conversation, pipeline.generation).await.0,
+            host_takes_input(&bridge, conversation, pipeline.generation)
+                .await
+                .0,
             409,
             "the generation the pipeline leg ran on is not a second realtime ingress"
         );
@@ -10342,7 +10492,9 @@ mod tests {
         );
         assert_eq!(back.session_id, pipeline.session_id);
         assert_eq!(
-            host_takes_input(&bridge, conversation, realtime.generation).await.0,
+            host_takes_input(&bridge, conversation, realtime.generation)
+                .await
+                .0,
             409,
             "the realtime session does not outlive the engine that owned it"
         );
@@ -10423,8 +10575,10 @@ mod tests {
         );
         let bridge = host_media_bridge(&paths, &api).await;
         let address = spawn_talk_server(api.clone()).await;
-        let (mut socket, generation, session_id) =
-            open_route_socket(&api, &device_id, &secret, 2, &route, "duplex", address, now_ms).await;
+        let (mut socket, generation, session_id) = open_route_socket(
+            &api, &device_id, &secret, 2, &route, "duplex", address, now_ms,
+        )
+        .await;
         let _ = read_until(&mut socket, "ready").await;
         realtime_hello(&mut socket, &session_id, &generation).await;
 
@@ -10445,7 +10599,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            host_waits_for_input(&bridge, &route.session_id, route.generation).await.0,
+            host_waits_for_input(&bridge, &route.session_id, route.generation)
+                .await
+                .0,
             spoken,
             "the session really did carry this audio"
         );
@@ -10476,11 +10632,19 @@ mod tests {
         assert_eq!(measured["engine"], "realtime");
         assert_eq!(measured["role"], "duplex");
         assert_eq!(measured["input"]["kind"], "paired");
-        assert_eq!(measured["input"]["endpoint"], format!("paired:{device_id}:input"));
+        assert_eq!(
+            measured["input"]["endpoint"],
+            format!("paired:{device_id}:input")
+        );
         assert_eq!(measured["output"]["kind"], "paired");
-        assert_eq!(measured["output"]["endpoint"], format!("paired:{device_id}:output"));
+        assert_eq!(
+            measured["output"]["endpoint"],
+            format!("paired:{device_id}:output")
+        );
 
-        let setup_ms = measured["setupMs"].as_u64().expect("setup latency is a number");
+        let setup_ms = measured["setupMs"]
+            .as_u64()
+            .expect("setup latency is a number");
         assert!(
             (400..60_000).contains(&setup_ms),
             "setup latency is the real gap between activating the route and admitting the socket, not a placeholder: {setup_ms}"
@@ -10506,7 +10670,9 @@ mod tests {
             "no audio payload field reaches the record: {raw}"
         );
         assert!(
-            !recorded_detail_bytes(&paths).windows(spoken.len()).any(|window| window == spoken),
+            !recorded_detail_bytes(&paths)
+                .windows(spoken.len())
+                .any(|window| window == spoken),
             "nor do the raw samples, in any encoding this row could carry them in"
         );
 

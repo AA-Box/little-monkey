@@ -241,7 +241,10 @@ mod tests {
     #[test]
     fn available_memory_is_never_more_than_the_machine_has() {
         let available = available_memory_bytes();
-        assert!(available > 0, "a running machine has some memory to hand out");
+        assert!(
+            available > 0,
+            "a running machine has some memory to hand out"
+        );
         assert!(available <= system_memory::total());
     }
 }

@@ -10,8 +10,8 @@
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
-use std::collections::{HashMap, HashSet, VecDeque};
 use hyper_util::rt::TokioIo;
+use std::collections::{HashMap, HashSet, VecDeque};
 use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocketConfig};
 use tokio_tungstenite::WebSocketStream;
 
@@ -22,7 +22,8 @@ use super::protocol::{
 };
 use super::realtime_bridge::REALTIME_PCM_MEDIA_TYPE;
 use super::talk::{
-    bounded_output_audio_chunks, run_talk_session, TalkIdentity, TalkSessionReport, TalkSocket, TalkSpeech,
+    bounded_output_audio_chunks, run_talk_session, TalkIdentity, TalkSessionReport, TalkSocket,
+    TalkSpeech,
 };
 
 /// How long a Talk socket may stay open. A conversation that outlives this is
@@ -132,7 +133,6 @@ impl TalkSpeech for ConfiguredTalkSpeech {
     }
 }
 
-
 /// A span in whole milliseconds, saturating rather than wrapping — a socket
 /// left open for an hour must not report a negative or truncated duration.
 fn elapsed_ms(since: tokio::time::Instant) -> u64 {
@@ -154,7 +154,9 @@ async fn send_output_frame(
         kind,
     };
     frame.validate()?;
-    socket.send(serde_json::to_string(&frame).map_err(|error| error.to_string())?).await
+    socket
+        .send(serde_json::to_string(&frame).map_err(|error| error.to_string())?)
+        .await
 }
 
 fn parse_output_client_frame(
@@ -162,8 +164,8 @@ fn parse_output_client_frame(
     authorization: &TalkSocketAuthorization,
     tracker: &mut TalkSequenceTracker,
 ) -> Result<TalkClientFrame, String> {
-    let frame: TalkClientFrame = serde_json::from_str(raw)
-        .map_err(|error| format!("Invalid Talk frame: {error}"))?;
+    let frame: TalkClientFrame =
+        serde_json::from_str(raw).map_err(|error| format!("Invalid Talk frame: {error}"))?;
     frame.validate()?;
     if frame.session_id != authorization.session_id
         || frame.session_generation != authorization.session_generation
@@ -196,7 +198,9 @@ async fn report_route_revocation(
             socket,
             authorization,
             sequence,
-            TalkServerFrameKind::State { state: TalkState::Interrupted },
+            TalkServerFrameKind::State {
+                state: TalkState::Interrupted,
+            },
         )
         .await;
     }
@@ -215,7 +219,9 @@ async fn report_route_revocation(
         socket,
         authorization,
         sequence,
-        TalkServerFrameKind::State { state: TalkState::Idle },
+        TalkServerFrameKind::State {
+            state: TalkState::Idle,
+        },
     )
     .await;
 }
@@ -252,7 +258,9 @@ async fn output_wait_for_ack(
     cursor: &mut u64,
     backlog: &mut VecDeque<super::store::VoiceRouteEventRecord>,
 ) -> Result<AckOutcome, String> {
-    let generation = authorization.route_generation.ok_or_else(|| "Output route has no generation".to_string())?;
+    let generation = authorization
+        .route_generation
+        .ok_or_else(|| "Output route has no generation".to_string())?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
     loop {
         if !api.talk_output_route_live(authorization) {
@@ -260,33 +268,51 @@ async fn output_wait_for_ack(
         }
         for event in api.talk_route_events(&authorization.session_id, *cursor)? {
             *cursor = (*cursor).max(event.event_id);
-            if event.generation != generation { continue; }
+            if event.generation != generation {
+                continue;
+            }
             if event.kind == "output_stop" {
                 send_output_frame(
                     socket,
                     authorization,
                     outbound_sequence,
-                    TalkServerFrameKind::State { state: TalkState::Interrupted },
-                ).await?;
+                    TalkServerFrameKind::State {
+                        state: TalkState::Interrupted,
+                    },
+                )
+                .await?;
                 return Ok(AckOutcome::Interrupted);
             }
             backlog.push_back(event);
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err("Timed out waiting for paired speaker playback acknowledgement".to_string());
+            return Err(
+                "Timed out waiting for paired speaker playback acknowledgement".to_string(),
+            );
         }
         match tokio::time::timeout(std::time::Duration::from_millis(100), socket.recv()).await {
             Ok(Some(raw)) => {
                 let frame = parse_output_client_frame(&raw, authorization, tracker)?;
                 match frame.kind {
-                    TalkClientFrameKind::PlaybackAck { audio_sequence: ack, played } if ack == audio_sequence => {
-                        return Ok(if played { AckOutcome::Played } else { AckOutcome::Failed });
+                    TalkClientFrameKind::PlaybackAck {
+                        audio_sequence: ack,
+                        played,
+                    } if ack == audio_sequence => {
+                        return Ok(if played {
+                            AckOutcome::Played
+                        } else {
+                            AckOutcome::Failed
+                        });
                     }
                     TalkClientFrameKind::Interrupt { .. } => return Ok(AckOutcome::Interrupted),
                     TalkClientFrameKind::State { .. }
                     | TalkClientFrameKind::PlaybackAck { .. }
                     | TalkClientFrameKind::InputGateAck { .. } => {}
-                    _ => return Err("An output-only Talk socket received a microphone frame".to_string()),
+                    _ => {
+                        return Err(
+                            "An output-only Talk socket received a microphone frame".to_string()
+                        )
+                    }
                 }
             }
             Ok(None) => return Err("Paired speaker Talk socket closed".to_string()),
@@ -315,12 +341,23 @@ async fn run_realtime_route_session(
             return report;
         }
     };
-    let input_role = matches!(authorization.route_role.as_deref(), Some("input" | "duplex"));
-    let output_role = matches!(authorization.route_role.as_deref(), Some("output" | "duplex"));
+    let input_role = matches!(
+        authorization.route_role.as_deref(),
+        Some("input" | "duplex")
+    );
+    let output_role = matches!(
+        authorization.route_role.as_deref(),
+        Some("output" | "duplex")
+    );
 
-    if send_output_frame(socket, authorization, &mut outbound_sequence, TalkServerFrameKind::Ready)
-        .await
-        .is_err()
+    if send_output_frame(
+        socket,
+        authorization,
+        &mut outbound_sequence,
+        TalkServerFrameKind::Ready,
+    )
+    .await
+    .is_err()
     {
         report.stream_dropped = true;
         return report;
@@ -388,15 +425,25 @@ async fn run_realtime_route_session(
         if input_role && !api.talk_input_route_live(authorization) {
             report.grant_revoked = true;
             report_route_revocation(
-                socket, authorization, &mut outbound_sequence, output_role, INPUT_REVOKED,
-            ).await;
+                socket,
+                authorization,
+                &mut outbound_sequence,
+                output_role,
+                INPUT_REVOKED,
+            )
+            .await;
             break;
         }
         if output_role && !api.talk_output_route_live(authorization) {
             report.grant_revoked = true;
             report_route_revocation(
-                socket, authorization, &mut outbound_sequence, true, OUTPUT_REVOKED,
-            ).await;
+                socket,
+                authorization,
+                &mut outbound_sequence,
+                true,
+                OUTPUT_REVOKED,
+            )
+            .await;
             break;
         }
 
@@ -404,23 +451,38 @@ async fn run_realtime_route_session(
         // be the test: a chunk the speaker could not play raises `errors` too,
         // and that ends one answer rather than the conversation.
         let mut drain_failed = false;
-        for event in api.talk_route_events(&authorization.session_id, route_cursor).unwrap_or_default() {
+        for event in api
+            .talk_route_events(&authorization.session_id, route_cursor)
+            .unwrap_or_default()
+        {
             route_cursor = route_cursor.max(event.event_id);
-            if event.generation != generation { continue; }
+            if event.generation != generation {
+                continue;
+            }
             match event.kind.as_str() {
                 "output_stop" if output_role => {
                     report.interruptions = report.interruptions.saturating_add(1);
-                    let _ = api.clear_realtime_output_from_host(&authorization.session_id, generation);
+                    let _ =
+                        api.clear_realtime_output_from_host(&authorization.session_id, generation);
                     pending_output_acks.clear();
                     let _ = send_output_frame(
                         socket,
                         authorization,
                         &mut outbound_sequence,
-                        TalkServerFrameKind::State { state: TalkState::Interrupted },
-                    ).await;
+                        TalkServerFrameKind::State {
+                            state: TalkState::Interrupted,
+                        },
+                    )
+                    .await;
                 }
                 "input_gate" if input_role => {
-                    let Some(open) = event.payload.get("open").and_then(serde_json::Value::as_bool) else { continue; };
+                    let Some(open) = event
+                        .payload
+                        .get("open")
+                        .and_then(serde_json::Value::as_bool)
+                    else {
+                        continue;
+                    };
                     if pending_input_gates.len() >= 8 {
                         report.errors = report.errors.saturating_add(1);
                         drain_failed = true;
@@ -430,8 +492,14 @@ async fn run_realtime_route_session(
                         socket,
                         authorization,
                         &mut outbound_sequence,
-                        TalkServerFrameKind::InputGate { gate_sequence: event.event_id, open },
-                    ).await.is_err() {
+                        TalkServerFrameKind::InputGate {
+                            gate_sequence: event.event_id,
+                            open,
+                        },
+                    )
+                    .await
+                    .is_err()
+                    {
                         report.stream_dropped = true;
                         break;
                     }
@@ -440,7 +508,9 @@ async fn run_realtime_route_session(
                 _ => {}
             }
         }
-        if report.stream_dropped || drain_failed { break; }
+        if report.stream_dropped || drain_failed {
+            break;
+        }
 
         if output_role {
             while pending_output_acks.len() < MAX_IN_FLIGHT_OUTPUT {
@@ -479,8 +549,13 @@ async fn run_realtime_route_session(
             }
             if report.grant_revoked {
                 report_route_revocation(
-                    socket, authorization, &mut outbound_sequence, true, OUTPUT_REVOKED,
-                ).await;
+                    socket,
+                    authorization,
+                    &mut outbound_sequence,
+                    true,
+                    OUTPUT_REVOKED,
+                )
+                .await;
             }
             if report.stream_dropped || report.grant_revoked {
                 break;
@@ -536,7 +611,9 @@ async fn run_realtime_route_session(
                                 break;
                             }
                         };
-                        if let Err(error) = api.push_realtime_input_from_device(authorization, bytes) {
+                        if let Err(error) =
+                            api.push_realtime_input_from_device(authorization, bytes)
+                        {
                             report.errors = report.errors.saturating_add(1);
                             let _ = send_output_frame(
                                 socket,
@@ -552,20 +629,32 @@ async fn run_realtime_route_session(
                             break;
                         }
                     }
-                    TalkClientFrameKind::PlaybackAck { audio_sequence, played } if output_role => {
+                    TalkClientFrameKind::PlaybackAck {
+                        audio_sequence,
+                        played,
+                    } if output_role => {
                         if pending_output_acks.remove(&audio_sequence) {
                             let (kind, payload) = if played {
-                                ("output_played", serde_json::json!({ "audio_sequence": audio_sequence }))
+                                (
+                                    "output_played",
+                                    serde_json::json!({ "audio_sequence": audio_sequence }),
+                                )
                             } else {
                                 report.errors = report.errors.saturating_add(1);
                                 report.fallbacks = report.fallbacks.saturating_add(1);
-                                ("output_failed", serde_json::json!({
-                                    "audio_sequence": audio_sequence,
-                                    "error": "paired Realtime speaker could not play PCM",
-                                }))
+                                (
+                                    "output_failed",
+                                    serde_json::json!({
+                                        "audio_sequence": audio_sequence,
+                                        "error": "paired Realtime speaker could not play PCM",
+                                    }),
+                                )
                             };
                             let _ = api.append_talk_route_event(
-                                &authorization.session_id, generation, kind, &payload,
+                                &authorization.session_id,
+                                generation,
+                                kind,
+                                &payload,
                             );
                             // A speaker that failed one chunk ends the answer it
                             // was playing, not the conversation — the same rule
@@ -583,8 +672,14 @@ async fn run_realtime_route_session(
                             }
                         }
                     }
-                    TalkClientFrameKind::InputGateAck { gate_sequence, open } if input_role => {
-                        if pending_input_gates.remove(&gate_sequence).is_some_and(|expected| expected == open) {
+                    TalkClientFrameKind::InputGateAck {
+                        gate_sequence,
+                        open,
+                    } if input_role => {
+                        if pending_input_gates
+                            .remove(&gate_sequence)
+                            .is_some_and(|expected| expected == open)
+                        {
                             let _ = api.append_talk_route_event(
                                 &authorization.session_id,
                                 generation,
@@ -644,18 +739,35 @@ async fn run_output_route_session(
     let mut backlog = VecDeque::new();
     let generation = match authorization.route_generation {
         Some(value) => value,
-        None => { report.errors += 1; return report; }
+        None => {
+            report.errors += 1;
+            return report;
+        }
     };
 
-    if send_output_frame(socket, authorization, &mut outbound_sequence, TalkServerFrameKind::Ready).await.is_err() {
+    if send_output_frame(
+        socket,
+        authorization,
+        &mut outbound_sequence,
+        TalkServerFrameKind::Ready,
+    )
+    .await
+    .is_err()
+    {
         report.stream_dropped = true;
         return report;
     }
     // The first client frame remains the normal Talk hello. Output-only roles
     // carry no microphone bytes after it.
-    let Some(raw) = socket.recv().await else { report.stream_dropped = true; return report; };
+    let Some(raw) = socket.recv().await else {
+        report.stream_dropped = true;
+        return report;
+    };
     match parse_output_client_frame(&raw, authorization, &mut inbound) {
-        Ok(TalkClientFrame { kind: TalkClientFrameKind::Hello { .. }, .. }) => {}
+        Ok(TalkClientFrame {
+            kind: TalkClientFrameKind::Hello { .. },
+            ..
+        }) => {}
         _ => {
             report.errors += 1;
             let _ = send_output_frame(
@@ -667,7 +779,8 @@ async fn run_output_route_session(
                     message: "An output-only Talk socket must start with hello.".into(),
                     retryable: false,
                 },
-            ).await;
+            )
+            .await;
             return report;
         }
     }
@@ -675,8 +788,11 @@ async fn run_output_route_session(
         socket,
         authorization,
         &mut outbound_sequence,
-        TalkServerFrameKind::State { state: TalkState::Idle },
-    ).await;
+        TalkServerFrameKind::State {
+            state: TalkState::Idle,
+        },
+    )
+    .await;
     if let Some(command_id) = api.talk_route_command_id(authorization) {
         let _ = api.append_talk_route_event(
             &authorization.session_id,
@@ -690,8 +806,13 @@ async fn run_output_route_session(
         if !api.talk_output_route_live(authorization) {
             report.grant_revoked = true;
             report_route_revocation(
-                socket, authorization, &mut outbound_sequence, true, OUTPUT_REVOKED,
-            ).await;
+                socket,
+                authorization,
+                &mut outbound_sequence,
+                true,
+                OUTPUT_REVOKED,
+            )
+            .await;
             break;
         }
         if backlog.is_empty() {
@@ -699,22 +820,47 @@ async fn run_output_route_session(
                 Ok(events) => {
                     for event in events {
                         cursor = cursor.max(event.event_id);
-                        if event.generation == generation { backlog.push_back(event); }
+                        if event.generation == generation {
+                            backlog.push_back(event);
+                        }
                     }
                 }
-                Err(_) => { report.errors += 1; break; }
+                Err(_) => {
+                    report.errors += 1;
+                    break;
+                }
             }
         }
         let Some(event) = backlog.pop_front() else {
             match tokio::time::timeout(std::time::Duration::from_millis(120), socket.recv()).await {
                 Ok(Some(raw)) => {
                     match parse_output_client_frame(&raw, authorization, &mut inbound) {
-                        Ok(TalkClientFrame { kind: TalkClientFrameKind::State { .. } | TalkClientFrameKind::PlaybackAck { .. } | TalkClientFrameKind::InputGateAck { .. }, .. }) => {}
-                        Ok(TalkClientFrame { kind: TalkClientFrameKind::Interrupt { .. }, .. }) => {
+                        Ok(TalkClientFrame {
+                            kind:
+                                TalkClientFrameKind::State { .. }
+                                | TalkClientFrameKind::PlaybackAck { .. }
+                                | TalkClientFrameKind::InputGateAck { .. },
+                            ..
+                        }) => {}
+                        Ok(TalkClientFrame {
+                            kind: TalkClientFrameKind::Interrupt { .. },
+                            ..
+                        }) => {
                             report.interruptions = report.interruptions.saturating_add(1);
-                            let _ = send_output_frame(socket, authorization, &mut outbound_sequence, TalkServerFrameKind::State { state: TalkState::Interrupted }).await;
+                            let _ = send_output_frame(
+                                socket,
+                                authorization,
+                                &mut outbound_sequence,
+                                TalkServerFrameKind::State {
+                                    state: TalkState::Interrupted,
+                                },
+                            )
+                            .await;
                         }
-                        Ok(_) | Err(_) => { report.errors += 1; break; }
+                        Ok(_) | Err(_) => {
+                            report.errors += 1;
+                            break;
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -725,12 +871,36 @@ async fn run_output_route_session(
         match event.kind.as_str() {
             "output_stop" => {
                 report.interruptions = report.interruptions.saturating_add(1);
-                let _ = send_output_frame(socket, authorization, &mut outbound_sequence, TalkServerFrameKind::State { state: TalkState::Interrupted }).await;
+                let _ = send_output_frame(
+                    socket,
+                    authorization,
+                    &mut outbound_sequence,
+                    TalkServerFrameKind::State {
+                        state: TalkState::Interrupted,
+                    },
+                )
+                .await;
             }
             "speak_text" => {
-                let Some(text) = event.payload.get("text").and_then(serde_json::Value::as_str) else { continue; };
-                let job_id = event.payload.get("job_id").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-                let turn_id = event.payload.get("turn_id").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+                let Some(text) = event
+                    .payload
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                let job_id = event
+                    .payload
+                    .get("job_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let turn_id = event
+                    .payload
+                    .get("turn_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 // Time to first audio is measured from the moment the answer is
                 // handed to this socket, so synthesis is inside it: a slow
                 // synthesizer and a slow speaker are the same silence to
@@ -759,15 +929,23 @@ async fn run_output_route_session(
                 };
                 let chunk_count = match u32::try_from(chunks.len()) {
                     Ok(value) if value > 0 => value,
-                    _ => { report.errors += 1; continue; }
+                    _ => {
+                        report.errors += 1;
+                        continue;
+                    }
                 };
                 let response_id = format!("route-{generation}-{}", event.event_id);
                 if send_output_frame(
                     socket,
                     authorization,
                     &mut outbound_sequence,
-                    TalkServerFrameKind::State { state: TalkState::Speaking },
-                ).await.is_err() {
+                    TalkServerFrameKind::State {
+                        state: TalkState::Speaking,
+                    },
+                )
+                .await
+                .is_err()
+                {
                     report.stream_dropped = true;
                     break;
                 }
@@ -782,8 +960,13 @@ async fn run_output_route_session(
                     if !api.talk_output_route_live(authorization) {
                         report.grant_revoked = true;
                         report_route_revocation(
-                            socket, authorization, &mut outbound_sequence, true, OUTPUT_REVOKED,
-                        ).await;
+                            socket,
+                            authorization,
+                            &mut outbound_sequence,
+                            true,
+                            OUTPUT_REVOKED,
+                        )
+                        .await;
                         playback_error = Some(OUTPUT_REVOKED.to_string());
                         break;
                     }
@@ -802,9 +985,14 @@ async fn run_output_route_session(
                             media_type: media_type.clone(),
                             audio_base64: STANDARD.encode(bytes),
                         },
-                    ).await.is_err() {
+                    )
+                    .await
+                    .is_err()
+                    {
                         report.stream_dropped = true;
-                        playback_error = Some("Paired speaker Talk socket closed while streaming output".to_string());
+                        playback_error = Some(
+                            "Paired speaker Talk socket closed while streaming output".to_string(),
+                        );
                         break;
                     }
                     if chunk_index == 0 {
@@ -814,9 +1002,17 @@ async fn run_output_route_session(
                     // at most the current bounded frame, never an unbounded TTS
                     // response queued in host memory.
                     match output_wait_for_ack(
-                        socket, api, authorization, &mut inbound, &mut outbound_sequence,
-                        audio_sequence, &mut cursor, &mut backlog,
-                    ).await {
+                        socket,
+                        api,
+                        authorization,
+                        &mut inbound,
+                        &mut outbound_sequence,
+                        audio_sequence,
+                        &mut cursor,
+                        &mut backlog,
+                    )
+                    .await
+                    {
                         Ok(AckOutcome::Played) => {}
                         Ok(AckOutcome::Interrupted) => {
                             report.interruptions = report.interruptions.saturating_add(1);
@@ -832,8 +1028,13 @@ async fn run_output_route_session(
                         Ok(AckOutcome::Revoked) => {
                             report.grant_revoked = true;
                             report_route_revocation(
-                                socket, authorization, &mut outbound_sequence, true, OUTPUT_REVOKED,
-                            ).await;
+                                socket,
+                                authorization,
+                                &mut outbound_sequence,
+                                true,
+                                OUTPUT_REVOKED,
+                            )
+                            .await;
                             playback_error = Some(OUTPUT_REVOKED.to_string());
                             break;
                         }
@@ -851,19 +1052,25 @@ async fn run_output_route_session(
                     // in the room as a synthesizer that could not run.
                     report.fallbacks = report.fallbacks.saturating_add(1);
                     let _ = api.append_talk_route_event(
-                        &authorization.session_id, generation, "output_failed",
+                        &authorization.session_id,
+                        generation,
+                        "output_failed",
                         &serde_json::json!({"job_id": job_id, "turn_id": turn_id, "error": error}),
                     );
                     // A revoked speaker leaves the loop here rather than at the
                     // next iteration: the device has already been told, and the
                     // ack it may still send for the abandoned chunk is never
                     // read, so it cannot be recorded as played.
-                    if report.stream_dropped || report.grant_revoked { break; }
+                    if report.stream_dropped || report.grant_revoked {
+                        break;
+                    }
                 } else {
                     report.latency.end_to_end.observe(elapsed_ms(began));
                     report.spoken_chunks = report.spoken_chunks.saturating_add(1);
                     let _ = api.append_talk_route_event(
-                        &authorization.session_id, generation, "output_played",
+                        &authorization.session_id,
+                        generation,
+                        "output_played",
                         &serde_json::json!({
                             "job_id": job_id, "turn_id": turn_id,
                             "audio_sequence": outbound_audio_sequence, "chunk_count": chunk_count,
@@ -871,9 +1078,14 @@ async fn run_output_route_session(
                     );
                 }
                 let _ = send_output_frame(
-                    socket, authorization, &mut outbound_sequence,
-                    TalkServerFrameKind::State { state: TalkState::Idle },
-                ).await;
+                    socket,
+                    authorization,
+                    &mut outbound_sequence,
+                    TalkServerFrameKind::State {
+                        state: TalkState::Idle,
+                    },
+                )
+                .await;
             }
             _ => {}
         }
@@ -911,7 +1123,10 @@ pub(crate) async fn serve(
         None => &configured,
     };
     let mut report = if realtime_route {
-        let input_role = matches!(authorization.route_role.as_deref(), Some("input" | "duplex"));
+        let input_role = matches!(
+            authorization.route_role.as_deref(),
+            Some("input" | "duplex")
+        );
         let capture = if input_role {
             api.open_talk_capture(
                 &authorization.device_id,
@@ -949,9 +1164,10 @@ pub(crate) async fn serve(
             &authorization.session_id,
             started_ms.saturating_add(MAX_SESSION_MS),
         );
-        if let (Some(generation), Some(command_id)) =
-            (authorization.route_generation, api.talk_route_command_id(&authorization))
-        {
+        if let (Some(generation), Some(command_id)) = (
+            authorization.route_generation,
+            api.talk_route_command_id(&authorization),
+        ) {
             let _ = api.append_talk_route_event(
                 &authorization.session_id,
                 generation,
@@ -1081,8 +1297,10 @@ mod tests {
     }
 
     fn fixture(engine: &str) -> Fixture {
-        let root =
-            std::env::temp_dir().join(format!("little-monkey-talk-socket-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-talk-socket-{}",
+            uuid::Uuid::new_v4()
+        ));
         let paths = DaemonPaths::under(&root);
         paths.ensure().unwrap();
         let host = RemoteHostConfig {
@@ -1150,7 +1368,9 @@ mod tests {
             constraints: DeviceConstraints::default(),
             reported_at_ms: 1_200,
         };
-        store.save_device_surface(&device_id, &surface, 1_200).unwrap();
+        store
+            .save_device_surface(&device_id, &surface, 1_200)
+            .unwrap();
         let route = store
             .replace_voice_route(
                 SESSION_ID,
@@ -1359,8 +1579,12 @@ mod tests {
                     );
                 }
             }
-            if let (TalkServerFrameKind::State { state: TalkState::Interrupted }, Some(audio_sequence)) =
-                (&frame.kind, self.late_ack.take())
+            if let (
+                TalkServerFrameKind::State {
+                    state: TalkState::Interrupted,
+                },
+                Some(audio_sequence),
+            ) = (&frame.kind, self.late_ack.take())
             {
                 self.queue(
                     &format!("ack:{audio_sequence}"),
@@ -1488,7 +1712,10 @@ mod tests {
             1,
             "only the first chunk may be in flight while it is unacknowledged",
         );
-        assert!(report.stream_dropped, "a device that stopped answering ended the stream");
+        assert!(
+            report.stream_dropped,
+            "a device that stopped answering ended the stream"
+        );
         assert_eq!(report.fallbacks, 1, "the answer existed and was not spoken");
         assert!(
             !fixture.kinds().contains(&"output_played".to_string()),
@@ -1521,7 +1748,11 @@ mod tests {
         let report =
             run_output_route_session(&mut device, &speech, &fixture.api, &authorization).await;
 
-        assert_eq!(device.output_audio().len(), 1, "the stream stops at the failed chunk");
+        assert_eq!(
+            device.output_audio().len(),
+            1,
+            "the stream stops at the failed chunk"
+        );
         assert!(
             !report.stream_dropped,
             "one chunk the speaker could not play is not a dead socket",
@@ -1560,7 +1791,11 @@ mod tests {
         let authorization = fixture.authorization("output", "realtime");
         fixture
             .api
-            .push_realtime_output_from_host(SESSION_ID, fixture.generation, vec![0x01, 0x02, 0x03, 0x04])
+            .push_realtime_output_from_host(
+                SESSION_ID,
+                fixture.generation,
+                vec![0x01, 0x02, 0x03, 0x04],
+            )
             .unwrap();
         let mut device = FakeDevice::new(&authorization, Ack::Silent);
         device.hello(REALTIME_PCM_MEDIA_TYPE, 24_000);
@@ -1588,7 +1823,8 @@ mod tests {
         );
         let kinds = fixture.kinds();
         assert!(
-            kinds.contains(&"output_failed".to_string()) && kinds.contains(&"interrupt".to_string()),
+            kinds.contains(&"output_failed".to_string())
+                && kinds.contains(&"interrupt".to_string()),
             "the failed chunk and the later interrupt are both recorded: {kinds:?}",
         );
         assert!(
@@ -1624,8 +1860,13 @@ mod tests {
         let api = fixture.api.clone();
         let generation = fixture.generation;
         device.on_first_audio = Some(Box::new(move || {
-            api.append_talk_route_event(SESSION_ID, generation, "output_stop", &serde_json::json!({}))
-                .unwrap();
+            api.append_talk_route_event(
+                SESSION_ID,
+                generation,
+                "output_stop",
+                &serde_json::json!({}),
+            )
+            .unwrap();
         }));
 
         let report = run_realtime_route_session(&mut device, &fixture.api, &authorization).await;
@@ -1689,9 +1930,8 @@ mod tests {
 
         let mut foreign = frame(3, audio(2));
         foreign.session_id = "talk-session-two".to_string();
-        let refused =
-            parse_output_client_frame(&raw(&foreign), &authorization, &mut tracker)
-                .expect_err("a frame naming another session is refused");
+        let refused = parse_output_client_frame(&raw(&foreign), &authorization, &mut tracker)
+            .expect_err("a frame naming another session is refused");
         assert!(refused.contains("different session"), "{refused}");
         let mut moved = frame(3, audio(2));
         moved.session_generation = random_token(18).unwrap();
@@ -1736,7 +1976,9 @@ mod tests {
             .sent
             .iter()
             .find_map(|frame| match &frame.kind {
-                TalkServerFrameKind::Error { code, message, .. } => Some((code.clone(), message.clone())),
+                TalkServerFrameKind::Error { code, message, .. } => {
+                    Some((code.clone(), message.clone()))
+                }
                 _ => None,
             })
             .expect("the device is told why its frame was refused");
@@ -1833,8 +2075,13 @@ mod tests {
         let api = fixture.api.clone();
         let generation = fixture.generation;
         device.on_first_audio = Some(Box::new(move || {
-            api.append_talk_route_event(SESSION_ID, generation, "output_stop", &serde_json::json!({}))
-                .unwrap();
+            api.append_talk_route_event(
+                SESSION_ID,
+                generation,
+                "output_stop",
+                &serde_json::json!({}),
+            )
+            .unwrap();
         }));
 
         let report =
@@ -1921,9 +2168,11 @@ mod tests {
             .sent
             .iter()
             .find_map(|frame| match &frame.kind {
-                TalkServerFrameKind::Error { code, message, retryable } => {
-                    Some((code.clone(), message.clone(), *retryable))
-                }
+                TalkServerFrameKind::Error {
+                    code,
+                    message,
+                    retryable,
+                } => Some((code.clone(), message.clone(), *retryable)),
                 _ => None,
             })
             .expect("a revoked speaker is told why its socket is ending");
@@ -1939,7 +2188,12 @@ mod tests {
             device.states(),
         );
         assert_eq!(
-            (report.grant_revoked, report.stream_dropped, report.spoken_chunks, report.fallbacks),
+            (
+                report.grant_revoked,
+                report.stream_dropped,
+                report.spoken_chunks,
+                report.fallbacks
+            ),
             (true, false, 0, 1),
             "a revoked grant is not a dropped socket, and the answer was not spoken",
         );
@@ -2008,7 +2262,9 @@ mod tests {
             .sent
             .iter()
             .find_map(|frame| match &frame.kind {
-                TalkServerFrameKind::Error { code, retryable, .. } => Some((code.clone(), *retryable)),
+                TalkServerFrameKind::Error {
+                    code, retryable, ..
+                } => Some((code.clone(), *retryable)),
                 _ => None,
             })
             .expect("a revoked Realtime speaker is told why its socket is ending");
@@ -2122,7 +2378,12 @@ mod tests {
             device.states(),
         );
         assert_eq!(
-            (report.interruptions, report.fallbacks, report.spoken_chunks, report.stream_dropped),
+            (
+                report.interruptions,
+                report.fallbacks,
+                report.spoken_chunks,
+                report.stream_dropped
+            ),
             (1, 1, 1, false),
             "one answer was cut off, the next was spoken through, and the socket lived",
         );
