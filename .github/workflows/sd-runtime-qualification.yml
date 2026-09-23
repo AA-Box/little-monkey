@@ -58,7 +58,7 @@ jobs:
         run: |
           set -euo pipefail
           git fetch origin develop
-          allowed='^(scripts/lib/managedRuntimeManifest\.mjs|scripts/lib/managedRuntimeManifest\.test\.mjs|src-tauri/build\.rs|src-tauri/src/managed_runtime\.rs|\.github/workflows/managed-sd-runtime\.yml)$'
+          allowed='^(scripts/lib/managedRuntimeManifest\.mjs|scripts/lib/managedRuntimeManifest\.test\.mjs|src-tauri/build\.rs|src-tauri/src/managed_runtime\.rs)$'
           changed="$(git diff --name-only origin/develop...HEAD)"
           [ -n "$changed" ] || { echo "Automatic update contains no changes" >&2; exit 1; }
           while IFS= read -r path; do
