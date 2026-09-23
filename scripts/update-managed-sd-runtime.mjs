@@ -84,6 +84,28 @@ export function selectNewestPublishedRelease(candidates, defaultBranchHistory) {
   return onBranch[0];
 }
 
+export function pinRelationFromHistory(currentCommit, latestCommit, defaultBranchHistory) {
+  const current = currentCommit.toLowerCase();
+  const latest = latestCommit.toLowerCase();
+  if (current === latest) return "identical";
+
+  const currentIndex = defaultBranchHistory.findIndex((sha) => sha.toLowerCase() === current);
+  const latestIndex = defaultBranchHistory.findIndex((sha) => sha.toLowerCase() === latest);
+  if (latestIndex === -1) {
+    throw new Error("Newest published release commit is missing from fetched default-branch history");
+  }
+  if (currentIndex === -1) {
+    throw new Error(
+      `Current managed SD commit was not found within ${MAX_COMMIT_PAGES * PER_PAGE} commits of upstream default branch`,
+    );
+  }
+  // History is newest-first. These names intentionally mirror GitHub's compare
+  // status used by the previous implementation: "ahead" means latest is ahead
+  // of the current pin and therefore should replace it; "behind" means the
+  // current pin is newer than the newest published release and must be kept.
+  return currentIndex > latestIndex ? "ahead" : "behind";
+}
+
 function parseSha256Digest(asset) {
   const digest = asset?.digest;
   if (typeof digest !== "string" || !/^sha256:[0-9a-f]{64}$/i.test(digest)) {
@@ -153,7 +175,7 @@ function readCurrentPin(manifestText) {
   const version = /MANAGED_SD_VERSION\s*=\s*"([^"]+)"/.exec(manifestText)?.[1];
   const commit = /MANAGED_SD_SOURCE_COMMIT\s*=\s*\n?\s*"([0-9a-f]{40})"/.exec(manifestText)?.[1];
   if (!version || !commit) throw new Error("Could not read the current managed SD pin");
-  return { version, commit };
+  return { version, commit: commit.toLowerCase() };
 }
 
 async function resolveCandidateCommits(candidates) {
@@ -162,11 +184,14 @@ async function resolveCandidateCommits(candidates) {
     const commit = await githubJson(
       `/repos/${UPSTREAM_REPOSITORY}/commits/${encodeURIComponent(candidate.release.tag_name)}`,
     );
+    if (!/^[0-9a-f]{40}$/i.test(commit.sha ?? "")) {
+      throw new Error(`Release ${candidate.release.tag_name} resolved to an invalid commit SHA`);
+    }
     candidate.commit = commit.sha.toLowerCase();
   }
 }
 
-async function discoverLatestRelease() {
+async function discoverLatestRelease(currentCommit) {
   const [repository, releases] = await Promise.all([
     githubJson(`/repos/${UPSTREAM_REPOSITORY}`),
     paged(`/repos/${UPSTREAM_REPOSITORY}/releases`, MAX_RELEASE_PAGES),
@@ -182,11 +207,12 @@ async function discoverLatestRelease() {
     );
     if (!Array.isArray(commits) || commits.length === 0) break;
     history.push(...commits.map((entry) => entry.sha.toLowerCase()));
-    const visible = candidates.filter((candidate) => history.includes(candidate.commit));
-    if (visible.length > 0) {
-      selected = selectNewestPublishedRelease(visible, history);
-      break;
+
+    if (!selected) {
+      const visible = candidates.filter((candidate) => history.includes(candidate.commit));
+      if (visible.length > 0) selected = selectNewestPublishedRelease(visible, history);
     }
+    if (selected && history.includes(currentCommit.toLowerCase())) break;
     if (commits.length < PER_PAGE) break;
   }
   if (!selected) {
@@ -194,15 +220,7 @@ async function discoverLatestRelease() {
       `No published release was found within ${MAX_COMMIT_PAGES * PER_PAGE} commits of ${repository.default_branch}`,
     );
   }
-  return selected;
-}
-
-async function comparePins(currentCommit, latestCommit) {
-  if (currentCommit === latestCommit) return "identical";
-  const comparison = await githubJson(
-    `/repos/${UPSTREAM_REPOSITORY}/compare/${currentCommit}...${latestCommit}`,
-  );
-  return comparison.status;
+  return { selected, history };
 }
 
 function applyPin(root, update) {
@@ -248,8 +266,8 @@ async function main() {
   const apply = process.argv.includes("--apply");
   const manifestText = readFileSync(resolve(root, FILES.manifest), "utf8");
   const current = readCurrentPin(manifestText);
-  const latest = await discoverLatestRelease();
-  const relation = await comparePins(current.commit, latest.commit);
+  const { selected: latest, history } = await discoverLatestRelease(current.commit);
+  const relation = pinRelationFromHistory(current.commit, latest.commit, history);
 
   if (relation === "behind") {
     const result = {
@@ -263,14 +281,9 @@ async function main() {
     console.log(JSON.stringify(result));
     return;
   }
-  if (!new Set(["ahead", "identical"]).has(relation)) {
-    throw new Error(
-      `Newest published release ${latest.release.tag_name} is ${relation} relative to current pin ${current.version}; refusing an automatic rewrite`,
-    );
-  }
 
   const assets = releaseAssetsFor(latest);
-  const changed = current.version !== latest.release.tag_name || current.commit !== latest.commit;
+  const changed = relation === "ahead";
   const result = {
     changed,
     reason: changed ? "newer-published-release" : "already-current",
