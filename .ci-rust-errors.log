@@ -1,0 +1,10 @@
+    Checking globset v0.4.20
+    Checking mail-parser v0.11.8
+error: failed to run custom build command for `little-monkey v1.9.0 (/home/runner/work/little-monkey/little-monkey/src-tauri)`
+
+Caused by:
+  process didn't exit successfully: `/home/runner/work/little-monkey/little-monkey/src-tauri/target/debug/build/little-monkey-9522a63bf6f82d35/build-script-build` (exit status: 101)
+  --- stdout
+warning: build failed, waiting for other jobs to finish...
+
+CARGO_CHECK_EXIT=101
