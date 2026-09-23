@@ -27,6 +27,16 @@ jobs:
       - name: Apply integration patch
         run: |
           python3 .github/scripts/finalize-portable-character-trainer.py
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("src-tauri/src/character_trainer.rs")
+          text = path.read_text()
+          old = '"src/musubi_tuner/networks/convert_lora.py",'
+          new = '"src/musubi_tuner/convert_lora.py",'
+          if old not in text and new not in text:
+              raise SystemExit("Musubi converter path anchor not found")
+          path.write_text(text.replace(old, new, 1))
+          PY
           rustfmt --edition 2021 src-tauri/src/character_trainer.rs
 
       - name: Install Linux system dependencies
