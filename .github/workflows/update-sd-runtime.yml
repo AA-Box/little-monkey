@@ -53,8 +53,10 @@ jobs:
 
       - name: No update needed
         if: steps.update.outputs.changed != 'true'
+        env:
+          REASON: ${{ steps.update.outputs.reason }}
         run: |
-          echo "stable-diffusion.cpp is already current: ${{ steps.update.outputs.reason }}" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "stable-diffusion.cpp is already current: $REASON" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Validate rewritten pin metadata
         if: steps.update.outputs.changed == 'true'
