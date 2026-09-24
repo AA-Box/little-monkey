@@ -1,0 +1,27 @@
+# The built-in Whisper engine is whisper.cpp, compiled by the whisper-rs-sys
+# build script, which forwards every GGML_* variable to CMake. Left alone, ggml
+# builds with GGML_NATIVE=ON: -march=native, -mcpu=native on ARM, or whatever
+# /arch: MSVC detects on the build machine. A release is then tuned to the CPU
+# of the runner that happened to build it, and dies with SIGILL on a user's
+# machine that lacks, say, AVX-512, SVE or i8mm.
+#
+# Pin a baseline instead, as the managed stable-diffusion.cpp build already does
+# (scripts/lib/managedRuntimeManifest.mjs):
+#
+# - x86_64: GGML_NATIVE=OFF alone means SSE4.2, AVX, AVX2, BMI2, FMA and F16C,
+#   i.e. Haswell (2013) and later.
+# - arm64: ARMv8.2 with dot product and FP16 arithmetic. Every Apple silicon Mac
+#   (M1 is the floor) and every Windows 11 on Arm device has both. On Linux this
+#   covers Raspberry Pi 5, Graviton 2 and later, Ampere, Jetson Orin and RK3588,
+#   but not Cortex-A72 or older (Raspberry Pi 4).
+#
+# These are defaults, not overrides: a variable already set in the environment
+# wins, so `GGML_NATIVE=ON` still gives a local build tuned to its own machine.
+#
+# whisper-rs-sys does not rerun its build script when these change, so a warm
+# target/ keeps the objects it already has. After changing either value, run
+# `cargo clean -p whisper-rs-sys` locally and rename every Swatinem/rust-cache
+# key in .github/workflows, or CI and releases keep restoring the old build.
+[env]
+GGML_NATIVE = "OFF"
+GGML_CPU_ARM_ARCH = "armv8.2-a+dotprod+fp16"

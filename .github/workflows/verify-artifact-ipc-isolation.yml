@@ -68,6 +68,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
+          key: portable
 
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
