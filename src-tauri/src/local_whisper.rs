@@ -182,10 +182,50 @@ fn bundled_model() -> Option<PathBuf> {
     BUNDLED_MODEL.get().cloned().flatten()
 }
 
+/// Whether this CPU has every instruction whisper.cpp was compiled to use.
+///
+/// ggml runs inside this process, so a missing instruction is not an error it
+/// can return: it is SIGILL, and the whole desktop app goes with it the first
+/// time somebody speaks. This list is the CPU baseline pinned by the `GGML_*`
+/// variables in `.cargo/config.toml`; change the two together.
+#[cfg(target_arch = "x86_64")]
+fn cpu_meets_baseline() -> bool {
+    use std::arch::is_x86_feature_detected as has;
+    // GGML_NATIVE=OFF: Haswell and later.
+    has!("sse4.2") && has!("avx") && has!("avx2") && has!("bmi2") && has!("fma") && has!("f16c")
+}
+
+#[cfg(target_arch = "aarch64")]
+fn cpu_meets_baseline() -> bool {
+    use std::arch::is_aarch64_feature_detected as has;
+    // GGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16. Windows publishes no FP16
+    // processor feature for std to read, so `fp16` is always false there; every
+    // Windows on Arm CPU with dot product has FP16 arithmetic as well.
+    has!("dotprod") && (cfg!(windows) || has!("fp16"))
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn cpu_meets_baseline() -> bool {
+    true
+}
+
+/// Refuse, rather than crash, on a CPU below the baseline whisper.cpp needs.
+pub fn check_cpu() -> Result<(), String> {
+    if cpu_meets_baseline() {
+        Ok(())
+    } else {
+        Err("Built-in transcription needs a CPU with AVX2 (x86_64) or ARMv8.2 dot product (arm64). Choose a hosted or extension transcription backend in Voice settings instead.".to_string())
+    }
+}
+
 /// Whether a local transcription could start right now without waiting on a
-/// download. Talk and the telephony surface ask before claiming to be ready.
+/// download, on a CPU that can run it. Talk and the telephony surface ask
+/// before claiming to be ready.
 #[must_use]
 pub fn is_ready(model_id: &str) -> bool {
+    if check_cpu().is_err() {
+        return false;
+    }
     let model = model_for(model_id);
     if model.id == DEFAULT_MODEL_ID && bundled_model().is_some() {
         return true;
@@ -368,7 +408,12 @@ async fn download_model(path: &Path, model: &WhisperModel) -> Result<(), String>
 
 /// Ensure the built-in speech model is ready. Safe to call at startup and on
 /// every transcription: concurrent callers collapse behind one install lock.
+///
+/// Every path to the model loader comes through here first, so this is where
+/// an unsupported CPU is refused — before a download it could never use, and
+/// before whisper.cpp executes anything.
 pub async fn prepare(app_data_dir: &Path, model_id: &str) -> Result<PathBuf, String> {
+    check_cpu()?;
     let model = model_for(model_id);
     // The installed application ships the default model, so choosing that one
     // fetches nothing at all. Any other tier is a download, once.
@@ -839,6 +884,14 @@ mod tests {
             .unwrap()
             .0;
         assert!(startup.contains("whisper_rs::install_logging_hooks()"));
+    }
+
+    /// Every CI runner is above the baseline. A check that refused one — a
+    /// feature added here but not to the build, or one std cannot see on that
+    /// OS — would switch transcription off on machines that run it fine.
+    #[test]
+    fn a_cpu_above_the_baseline_is_not_refused() {
+        assert_eq!(check_cpu(), Ok(()));
     }
 
     #[test]
