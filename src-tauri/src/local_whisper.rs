@@ -1010,6 +1010,7 @@ mod tests {
         // returned an empty transcript for every recording ever made.
         for fixture in [&wav, &webm] {
             for language in ["en", "auto"] {
+                let started = std::time::Instant::now();
                 let transcript = transcribe(
                     &root,
                     fixture,
@@ -1022,6 +1023,13 @@ mod tests {
                     .unwrap_or_else(|error| {
                         panic!("{} as {language} failed: {error}", fixture.display())
                     });
+                // The CPU baseline whisper.cpp is compiled for trades speed
+                // for portability; this is where that cost shows.
+                eprintln!(
+                    "transcribed {} as {language} in {:?}",
+                    fixture.display(),
+                    started.elapsed()
+                );
                 let normalized = transcript.text.to_ascii_lowercase();
                 assert!(
                     normalized.contains("country") || normalized.contains("ask not"),
