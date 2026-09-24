@@ -4986,8 +4986,9 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
         let talking = engine.output_mark();
         assert_ne!(quiet, talking);
 
-        // Past the cap: same length every time, different words.
-        for step in 0..600 {
+        // Past the cap: same length every time, different words. Each line is
+        // over 40 bytes, so this writes more than twice the cap.
+        for step in 0..MAX_STDERR_TAIL / 20 {
             say(&format!("loading tensors {step}/400 of a very large model"));
         }
         let capped_len = tail.lock().unwrap().len();
