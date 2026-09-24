@@ -90,9 +90,28 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
-          key: local-whisper-${{ matrix.target }}
+          key: local-whisper-${{ matrix.target }}-portable
       - name: Compile Little Monkey with built-in Whisper
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml --lib --target ${{ matrix.target }}
+      # Releases are built on these same runners. Left to its default, ggml
+      # tunes whisper.cpp to the runner's CPU, and the installer then dies with
+      # SIGILL on a user's machine without it (see .cargo/config.toml).
+      - name: Built-in Whisper is compiled for the portable CPU baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          for cache in src-tauri/target/${{ matrix.target }}/debug/build/whisper-rs-sys-*/out/build/CMakeCache.txt; do
+            echo "$cache"
+            grep -E '^(GGML_NATIVE|GGML_CPU_ARM_ARCH|GGML_AVX512|HAVE_[A-Z0-9_]+):' "$cache"
+            grep -q '^GGML_NATIVE:BOOL=OFF' "$cache"
+            if grep -qE '^(GGML_AVX512:BOOL=ON|HAVE_(SVE|MATMUL_INT8|SME):INTERNAL=1)' "$cache"; then
+              echo "::error::whisper.cpp uses instructions outside the portable baseline"
+              exit 1
+            fi
+            case '${{ matrix.target }}' in
+              aarch64-*) grep -q '^HAVE_DOTPROD:INTERNAL=1' "$cache" ;;
+            esac
+          done
 
   real-transcription:
     name: real WAV + browser WebM/Opus transcription
@@ -120,7 +139,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
-          key: local-whisper-e2e-release
+          key: local-whisper-e2e-release-portable
       - name: Prepare immutable speech fixtures
         shell: bash
         run: |
@@ -156,7 +175,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
-          key: local-whisper-bundle
+          key: local-whisper-bundle-portable
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
       - name: Stage CLI sidecar placeholder

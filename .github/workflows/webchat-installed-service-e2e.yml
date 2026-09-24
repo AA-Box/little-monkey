@@ -41,7 +41,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: src-tauri
-          key: webchat-installed-service-compile
+          key: webchat-installed-service-compile-portable
 
       - name: Stage CLI sidecar placeholder
         run: node scripts/ensure-cli-sidecar-placeholder.mjs
@@ -72,7 +72,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: src-tauri
-          key: webchat-installed-service-live
+          key: webchat-installed-service-live-portable
 
       - name: Build and pin the production CLI
         run: |
