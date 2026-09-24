@@ -2136,6 +2136,7 @@ pub fn call_speech_readiness(app_data_dir: &Path) -> Result<(), String> {
         // call whose every turn will fail is exactly what this guard exists to
         // prevent, and an unstaged development tree can still be in that state.
         TranscriptionBackendKind::LocalWhisper => {
+            crate::local_whisper::check_cpu()?;
             if !crate::local_whisper::is_ready(&voice.transcription_model) {
                 return Err(
                     "The built-in speech model is still being prepared, so nothing said on a call could be understood yet."

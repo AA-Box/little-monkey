@@ -31,7 +31,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: src-tauri
-          key: imessage-installed-service
+          key: imessage-installed-service-portable
       - name: Create the build-time CLI sidecar placeholder
         run: node scripts/ensure-cli-sidecar-placeholder.mjs
       - name: Compile black-box iMessage harness
