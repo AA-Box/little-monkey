@@ -90,9 +90,28 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
-          key: local-whisper-${{ matrix.target }}
+          key: local-whisper-${{ matrix.target }}-portable
       - name: Compile Little Monkey with built-in Whisper
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml --lib --target ${{ matrix.target }}
+      # Releases are built on these same runners. Left to its default, ggml
+      # tunes whisper.cpp to the runner's CPU, and the installer then dies with
+      # SIGILL on a user's machine without it (see .cargo/config.toml).
+      - name: Built-in Whisper is compiled for the portable CPU baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          for cache in src-tauri/target/${{ matrix.target }}/debug/build/whisper-rs-sys-*/out/build/CMakeCache.txt; do
+            echo "$cache"
+            grep -E '^(GGML_NATIVE|GGML_CPU_ARM_ARCH|GGML_AVX512|HAVE_[A-Z0-9_]+):' "$cache"
+            grep -q '^GGML_NATIVE:BOOL=OFF' "$cache"
+            if grep -qE '^(GGML_AVX512:BOOL=ON|HAVE_(SVE|MATMUL_INT8|SME):INTERNAL=1)' "$cache"; then
+              echo "::error::whisper.cpp uses instructions outside the portable baseline"
+              exit 1
+            fi
+            case '${{ matrix.target }}' in
+              aarch64-*) grep -q '^HAVE_DOTPROD:INTERNAL=1' "$cache" ;;
+            esac
+          done
 
   real-transcription:
     name: real WAV + browser WebM/Opus transcription
@@ -103,11 +122,6 @@ jobs:
     env:
       CARGO_PROFILE_RELEASE_DEBUG: 0
       RUST_BACKTRACE: 1
-      # whisper.cpp defaults to `-march=native`, and the cached build below is
-      # restored onto whichever runner CPU comes next: a cache saved on an
-      # AVX-512 host dies with SIGILL on one without. Build for the portable
-      # AVX2 baseline instead (whisper-rs-sys forwards `GGML_*` to CMake).
-      GGML_NATIVE: 'OFF'
     steps:
       - uses: actions/checkout@v4
       - name: Install build and audio dependencies
@@ -125,8 +139,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
-          # Renamed with `GGML_NATIVE`: whisper-rs-sys does not rerun on that
-          # variable, so the old key would keep restoring native objects.
           key: local-whisper-e2e-release-portable
       - name: Prepare immutable speech fixtures
         shell: bash
@@ -163,7 +175,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
-          key: local-whisper-bundle
+          key: local-whisper-bundle-portable
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
       - name: Stage CLI sidecar placeholder

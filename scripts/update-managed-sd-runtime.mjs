@@ -9,6 +9,8 @@ const RELEASE_TAG = /^master-(\d+)-([0-9a-f]{7,40})$/i;
 const MAX_RELEASE_PAGES = 5;
 const MAX_COMMIT_PAGES = 10;
 const PER_PAGE = 100;
+const RELEASE_ASSET_RETRY_ATTEMPTS = 13;
+const RELEASE_ASSET_RETRY_DELAY_MS = 5_000;
 
 const FILES = Object.freeze({
   manifest: "scripts/lib/managedRuntimeManifest.mjs",
@@ -129,9 +131,11 @@ export function releaseAssetsFor(candidate) {
     (asset) => asset.name === `sd-master-${short}-bin-win-vulkan-x64.zip`,
   );
   if (!mac || !windows) {
-    throw new Error(
+    const error = new Error(
       `Release ${candidate.release.tag_name} is missing Little Monkey's required macOS ARM64 or Windows x64 Vulkan archive`,
     );
+    error.code = "INCOMPLETE_RELEASE_ASSETS";
+    throw error;
   }
   return {
     macArchive: mac.name,
@@ -139,6 +143,35 @@ export function releaseAssetsFor(candidate) {
     windowsArchive: windows.name,
     windowsSha256: parseSha256Digest(windows),
   };
+}
+
+export async function releaseAssetsForWithRetry(
+  candidate,
+  refreshRelease,
+  {
+    attempts = RELEASE_ASSET_RETRY_ATTEMPTS,
+    delayMs = RELEASE_ASSET_RETRY_DELAY_MS,
+    sleepFn = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)),
+  } = {},
+) {
+  let current = candidate;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return releaseAssetsFor(current);
+    } catch (error) {
+      if (error?.code !== "INCOMPLETE_RELEASE_ASSETS" || attempt === attempts) {
+        throw error;
+      }
+    }
+
+    await sleepFn(delayMs);
+    current = {
+      ...current,
+      release: await refreshRelease(current.release),
+    };
+  }
+
+  throw new Error("Unreachable release asset retry state");
 }
 
 function replaceLiteral(text, oldValue, newValue, label, minimum = 1) {
@@ -281,7 +314,13 @@ async function main() {
     return;
   }
 
-  const assets = releaseAssetsFor(latest);
+  const assets = await releaseAssetsForWithRetry(
+    latest,
+    () =>
+      githubJson(
+        `/repos/${UPSTREAM_REPOSITORY}/releases/tags/${encodeURIComponent(latest.release.tag_name)}`,
+      ),
+  );
   const changed = relation === "ahead";
   const result = {
     changed,

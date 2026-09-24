@@ -6,6 +6,7 @@ import {
   pinRelationFromHistory,
   publishedReleaseCandidates,
   releaseAssetsFor,
+  releaseAssetsForWithRetry,
   selectNewestPublishedRelease,
 } from "./update-managed-sd-runtime.mjs";
 
@@ -79,6 +80,44 @@ test("required release assets must carry GitHub SHA-256 digests", () => {
     windowsArchive: "sd-master-c92d73c-bin-win-vulkan-x64.zip",
     windowsSha256: "b".repeat(64),
   });
+});
+
+test("release assets are retried while upstream is still publishing them", async () => {
+  const mac = {
+    name: "sd-master-c92d73c-bin-Darwin-macOS-26.6.2-arm64.zip",
+    digest: `sha256:${"a".repeat(64)}`,
+  };
+  const windows = {
+    name: "sd-master-c92d73c-bin-win-vulkan-x64.zip",
+    digest: `sha256:${"b".repeat(64)}`,
+  };
+  const candidate = {
+    commit: sha900,
+    tagShortSha: "c92d73c",
+    release: release("master-900-c92d73c", sha900, "2026-09-22T20:52:10Z", [mac]),
+  };
+  let refreshes = 0;
+  let sleeps = 0;
+
+  const assets = await releaseAssetsForWithRetry(
+    candidate,
+    async () => {
+      refreshes += 1;
+      return release("master-900-c92d73c", sha900, "2026-09-22T20:52:10Z", [mac, windows]);
+    },
+    {
+      attempts: 2,
+      delayMs: 0,
+      sleepFn: async () => {
+        sleeps += 1;
+      },
+    },
+  );
+
+  assert.equal(refreshes, 1);
+  assert.equal(sleeps, 1);
+  assert.equal(assets.windowsArchive, windows.name);
+  assert.equal(assets.windowsSha256, "b".repeat(64));
 });
 
 test("manifest patch changes only the pin and the two upstream archive records", () => {

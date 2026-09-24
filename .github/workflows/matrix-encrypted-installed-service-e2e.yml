@@ -45,7 +45,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: src-tauri
-          key: matrix-encrypted-installed-service
+          key: matrix-encrypted-installed-service-portable
 
       - name: Start official Synapse
         shell: bash
