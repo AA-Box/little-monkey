@@ -81,7 +81,7 @@ fn emit_managed_runtime_trust() {
         "LITTLE_MONKEY_TRUSTED_TTS_MANIFEST_SHA256",
     );
     emit_runtime_digest(
-        "sd-master-900-c92d73c",
+        "sd-master-913-b167b94",
         "LITTLE_MONKEY_TRUSTED_SD_MANIFEST_SHA256",
     );
 }
