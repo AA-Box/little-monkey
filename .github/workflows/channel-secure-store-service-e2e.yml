@@ -72,7 +72,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: src-tauri
-          key: channel-secure-store-${{ matrix.os }}-portable
+          key: channel-secure-store-${{ matrix.os }}-portable-cxxabi0
 
       - name: Build and pin real production CLI
         run: |
@@ -104,7 +104,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: src-tauri
-          key: channel-secure-store-${{ matrix.os }}-portable
+          key: channel-secure-store-${{ matrix.os }}-portable-cxxabi0
 
       # tauri-build checks/copies the externalBin during every build of this
       # package. A cache-restored little-monkey fingerprint can otherwise let
@@ -144,7 +144,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: src-tauri
-          key: channel-secure-store-ubuntu-portable
+          key: channel-secure-store-ubuntu-portable-cxxabi0
 
       - name: Build and pin real production CLI
         run: |

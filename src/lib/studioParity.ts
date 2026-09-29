@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { ComponentSlot, GenerationModelSpec } from "./studioClient";
+import { describeWeightFile } from "./weightFileHints";
 
 export type DiscoverySource = "civitai" | "hugging_face";
 export type DiscoveryAssetKind = "model" | "lora";
@@ -85,6 +86,7 @@ export function modelSpecForDownload(item: DiscoveryItem, path: string, sizeByte
     minRamBytes: Math.ceil(Math.max(sizeBytes * 1.35, video ? 16 * 1024 ** 3 : 8 * 1024 ** 3)),
     license: { id: `community-${item.id}`, name: "Upstream model terms", url: item.pageUrl, excludedTerritories: [], acceptanceRequired: false },
     extraLaunchArgs: [], engine: "stable_diffusion_cpp", quantizationBits: quantization ? Number(quantization) : null,
+    readsRefImages: !video && describeWeightFile(item.fileName).readsRefImages,
   };
 }
 
