@@ -112,6 +112,7 @@ describe("describeWeightFile", () => {
       family: "",
       slot: null,
       profile: null,
+      readsRefImages: false,
     });
   });
 
@@ -144,5 +145,28 @@ describe("describeWeightFile", () => {
     ]);
 
     expect(describeWeightFile("/models/something_custom.safetensors").profile).toBeNull();
+  });
+
+  it("spots an editing model the engine would load as its base model", () => {
+    for (const file of [
+      "flux1-kontext-dev-Q4_K_M.gguf",
+      "Qwen-Image-Edit-2509-Q8_0.gguf",
+      "qwen_image_edit_2511_fp8.safetensors",
+      "flux2-dev-Q4_K_M.gguf",
+      "FLUX.2-klein-4B.safetensors",
+      "cosxl_edit.safetensors",
+      "instruct-pix2pix-00-22000.safetensors",
+    ]) {
+      expect(describeWeightFile(file).readsRefImages, file).toBe(true);
+    }
+    for (const file of [
+      "flux1-dev.safetensors",
+      "qwen-image-2.1-Q8_0.gguf",
+      "sd_xl_base_1.0.safetensors",
+      "photomaker-v2.bin",
+      "edited_portrait_mix.safetensors",
+    ]) {
+      expect(describeWeightFile(file).readsRefImages, file).toBe(false);
+    }
   });
 });

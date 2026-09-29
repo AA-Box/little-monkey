@@ -8,7 +8,14 @@ export interface WeightFileHint {
   slot: ComponentSlot | null;
   /** What this family is for. Null when the name named nothing known. */
   profile: FamilyProfile | null;
+  /** The name says this is an editing model that reads reference images. */
+  readsRefImages: boolean;
 }
+
+/** Editing models, which the engine cannot tell from their base models:
+ *  `flux1-kontext-dev`, `qwen_image_edit_2509`, `cosxl_edit`,
+ *  `instruct-pix2pix`, `flux2-dev`. */
+const EDIT_HINT = /kontext|pix2pix|(^|[^a-z])edit([^a-z]|$)|flux[._-]?2(?!\d)/i;
 
 /** Architecture families, matched against a weight file's own name. */
 const FAMILY_HINTS: [RegExp, string][] = [
@@ -154,5 +161,6 @@ export function describeWeightFile(raw: string): WeightFileHint {
     family,
     slot: SLOT_HINTS.find(([pattern]) => pattern.test(path))?.[1] ?? null,
     profile: profileFor(path, family),
+    readsRefImages: EDIT_HINT.test(base),
   };
 }
