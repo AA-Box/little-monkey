@@ -208,6 +208,9 @@ export const studioLocale: Record<string, string> = {
   "Studio.add.seamless": "Tileable output",
   "Studio.add.seamlessHint":
     "Makes the result repeat without a visible join, for textures and patterns. Set per model rather than per image, because the engine takes it at startup.",
+  "Studio.add.readsRefImages": "Edits from reference images",
+  "Studio.add.readsRefImagesHint":
+    "For FLUX Kontext, Qwen-Image-Edit and FLUX.2: each run can take pictures to edit, and the prompt says what to change. The engine cannot tell these from their base models, so say so here.",
 
   "Studio.add.engineArgs": "Extra engine arguments",
   "Studio.add.engineArgsHint":
@@ -335,7 +338,8 @@ export const studioLocale: Record<string, string> = {
   "Studio.reference.title": "Reference images",
   "Studio.reference.add": "Add reference",
   "Studio.reference.remove": "Remove reference",
-  "Studio.reference.hint": "Photographs of the subject to keep consistent.",
+  "Studio.reference.hint":
+    "The pictures to edit. Say what to change in the prompt — \"make the jacket red leather\".",
   "Studio.reference.full": "At most {{max}} reference images per run.",
   "Studio.reference.numbered": "Number them so the prompt can tell them apart",
   "Studio.reference.numberedHint":
