@@ -233,7 +233,10 @@ impl ComponentSlot {
         match self {
             Self::ControlNet => Some(ConditioningImage::Control),
             Self::IpAdapter => Some(ConditioningImage::IpAdapter),
-            Self::PhotoMaker | Self::PulidWeights => Some(ConditioningImage::Reference),
+            // Not PhotoMaker or PuLID: the engine feeds `ref_images` to the
+            // diffusion model as reference latents, never to either of them.
+            // What unlocks references is
+            // [`GenerationModelSpec::reads_ref_images`].
             _ => None,
         }
     }
@@ -256,7 +259,7 @@ pub enum ConditioningImage {
     Control,
     /// `ip_adapter_image`: style/content to borrow.
     IpAdapter,
-    /// `ref_images`: subjects to keep consistent.
+    /// `ref_images`: the pictures an editing model works from.
     Reference,
 }
 
@@ -604,6 +607,12 @@ pub struct GenerationModelSpec {
     /// Other engines leave this unset.
     #[serde(default)]
     pub quantization_bits: Option<u8>,
+    /// Whether the diffusion model itself reads per-run `ref_images`: FLUX
+    /// Kontext, Qwen-Image-Edit, FLUX.2, the UNet edit models. Declared rather
+    /// than detected because the engine cannot tell — Kontext loads as plain
+    /// FLUX, which drops references on the floor.
+    #[serde(default)]
+    pub reads_ref_images: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1292,8 +1301,8 @@ pub struct GenerationRequest {
     /// How strongly the IP-Adapter image applies. `None` leaves the default.
     #[serde(default)]
     pub ip_adapter_strength: Option<f64>,
-    /// Base64 reference images for the identity- and edit-conditioned
-    /// architectures (PhotoMaker, PuLID, Kontext, Qwen-Edit).
+    /// Base64 reference images for the edit-conditioned architectures
+    /// (Kontext, Qwen-Image-Edit, FLUX.2).
     #[serde(default)]
     pub ref_images_base64: Vec<String>,
     /// Whether each reference image gets its own index rather than sharing
@@ -1414,35 +1423,42 @@ pub fn validate_conditioning(
     spec: &GenerationModelSpec,
     request: &GenerationRequest,
 ) -> Result<(), String> {
-    let available: BTreeSet<ConditioningImage> = spec
+    let mut available: BTreeSet<ConditioningImage> = spec
         .components
         .iter()
         .filter_map(|component| component.slot.conditioning_image())
         .collect();
+    if spec.reads_ref_images && spec.engine == GenerationEngineKind::StableDiffusionCpp {
+        available.insert(ConditioningImage::Reference);
+    }
+    let missing_weights = "Add one to the model or pick one for this run.";
     let required = [
         (
             request.control_image_base64.is_some(),
             ConditioningImage::Control,
             "a control image",
-            "ControlNet",
+            "has no ControlNet weights",
+            missing_weights,
         ),
         (
             request.ip_adapter_image_base64.is_some(),
             ConditioningImage::IpAdapter,
             "a reference image",
-            "IP-Adapter",
+            "has no IP-Adapter weights",
+            missing_weights,
         ),
         (
             !request.ref_images_base64.is_empty(),
             ConditioningImage::Reference,
             "reference images",
-            "PhotoMaker or PuLID",
+            "is not marked as an editing model",
+            "Turn on \"Edits from reference images\" in its settings if it is FLUX Kontext, Qwen-Image-Edit or FLUX.2.",
         ),
     ];
-    for (sent, kind, what, weights) in required {
+    for (sent, kind, what, why, fix) in required {
         if sent && !available.contains(&kind) {
             return Err(format!(
-                "{} has no {weights} weights, so {what} would be ignored. Add one to the model or pick one for this run.",
+                "{} {why}, so {what} would be ignored. {fix}",
                 spec.name
             ));
         }
@@ -3047,6 +3063,7 @@ mod tests {
             extra_launch_args: vec!["--diffusion-fa".to_string()],
             engine: GenerationEngineKind::default(),
             quantization_bits: None,
+            reads_ref_images: false,
         }
     }
 
@@ -3865,12 +3882,19 @@ mod tests {
         let mut identities = image_request(GenerationTask::TextToImage);
         identities.ref_images_base64 = vec!["b25l".to_string()];
         assert!(validate_conditioning(&with_control_net, &identities).is_err());
+        // PhotoMaker is not a route to references: the engine never hands it
+        // `ref_images`. Only a model marked as an editing model reads them.
         let mut with_photo_maker = plain.clone();
         with_photo_maker.components.push(local_component(
             ComponentSlot::PhotoMaker,
             "photomaker.safetensors",
         ));
-        assert!(validate_conditioning(&with_photo_maker, &identities).is_ok());
+        assert!(validate_conditioning(&with_photo_maker, &identities).is_err());
+        let mut kontext = plain.clone();
+        kontext.reads_ref_images = true;
+        assert!(validate_conditioning(&kontext, &identities).is_ok());
+        kontext.engine = GenerationEngineKind::MlxVideo;
+        assert!(validate_conditioning(&kontext, &identities).is_err());
 
         // Nothing sent, nothing to refuse, whatever is loaded.
         assert!(validate_conditioning(&plain, &image_request(GenerationTask::TextToImage)).is_ok());
@@ -3985,7 +4009,7 @@ mod tests {
             );
         }
 
-        // Only the three that unlock a per-run image say so.
+        // Only the two that unlock a per-run image say so.
         assert_eq!(
             ComponentSlot::ControlNet.conditioning_image(),
             Some(ConditioningImage::Control)
@@ -3994,14 +4018,8 @@ mod tests {
             ComponentSlot::IpAdapter.conditioning_image(),
             Some(ConditioningImage::IpAdapter)
         );
-        assert_eq!(
-            ComponentSlot::PhotoMaker.conditioning_image(),
-            Some(ConditioningImage::Reference)
-        );
-        assert_eq!(
-            ComponentSlot::PulidWeights.conditioning_image(),
-            Some(ConditioningImage::Reference)
-        );
+        assert_eq!(ComponentSlot::PhotoMaker.conditioning_image(), None);
+        assert_eq!(ComponentSlot::PulidWeights.conditioning_image(), None);
         assert_eq!(ComponentSlot::Vae.conditioning_image(), None);
         assert_eq!(ComponentSlot::MotionModule.conditioning_image(), None);
     }

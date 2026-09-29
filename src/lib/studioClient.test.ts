@@ -38,11 +38,11 @@ describe("availableConditioning", () => {
     expect(availableConditioning(["ip_adapter", "clip_vision"])).toEqual(new Set(["ip_adapter"]));
   });
 
-  it("treats PhotoMaker and PuLID as two routes to the same reference input", () => {
-    expect(availableConditioning(["photo_maker"])).toEqual(new Set(["reference"]));
-    expect(availableConditioning(["pulid_weights"])).toEqual(new Set(["reference"]));
-    // Both loaded is still one input, not two.
-    expect(availableConditioning(["photo_maker", "pulid_weights"])).toEqual(
+  it("unlocks references for an editing model, not for PhotoMaker or PuLID", () => {
+    // The engine hands `ref_images` to the diffusion model as reference
+    // latents; neither identity add-on ever sees them.
+    expect(availableConditioning(["photo_maker", "pulid_weights"])).toEqual(new Set());
+    expect(availableConditioning(["diffusion_model"], null, true)).toEqual(
       new Set(["reference"]),
     );
   });
@@ -51,7 +51,7 @@ describe("availableConditioning", () => {
     // A ControlNet does not stand in for an IP-Adapter: the engine reads the
     // two from different request fields with different weights.
     expect(availableConditioning(["control_net"]).has("ip_adapter")).toBe(false);
-    expect(availableConditioning(["control_net", "ip_adapter", "photo_maker"])).toEqual(
+    expect(availableConditioning(["control_net", "ip_adapter"], null, true)).toEqual(
       new Set(["control", "ip_adapter", "reference"]),
     );
   });
@@ -81,8 +81,9 @@ describe("the engine's own feature flags", () => {
       ref_images: true,
     });
     expect(availableConditioning(["checkpoint"], current)).toEqual(new Set());
-    expect(availableConditioning(["checkpoint", "photo_maker"], current)).toEqual(
-      new Set(["reference"]),
+    expect(availableConditioning(["checkpoint"], current, true)).toEqual(new Set(["reference"]));
+    expect(availableConditioning(["checkpoint"], reporting({ ref_images: false }), true)).toEqual(
+      new Set(),
     );
   });
 });

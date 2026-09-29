@@ -90,7 +90,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
-          key: local-whisper-${{ matrix.target }}-portable
+          key: local-whisper-${{ matrix.target }}-portable-cxxabi0
       - name: Compile Little Monkey with built-in Whisper
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml --lib --target ${{ matrix.target }}
       # Releases are built on these same runners. Left to its default, ggml
@@ -139,7 +139,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
-          key: local-whisper-e2e-release-portable
+          key: local-whisper-e2e-release-portable-cxxabi0
       - name: Prepare immutable speech fixtures
         shell: bash
         run: |
@@ -175,7 +175,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
-          key: local-whisper-bundle-portable
+          key: local-whisper-bundle-portable-cxxabi0
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
       - name: Stage CLI sidecar placeholder

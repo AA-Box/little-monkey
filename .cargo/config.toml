@@ -25,3 +25,18 @@
 [env]
 GGML_NATIVE = "OFF"
 GGML_CPU_ARM_ARCH = "armv8.2-a+dotprod+fp16"
+
+# Linux x86_64 only: build our C++ (whisper.cpp is the only C++ on this target)
+# with libstdc++'s pre-C++11 string ABI, the one sherpa-onnx's prebuilt
+# onnxruntime uses — it is built on manylinux devtoolset, which forces it.
+#
+# Both instantiate std::regex internals under the same mangled names, since the
+# string ABI changes their layout but not their names. The linker keeps one
+# copy of each, so when whisper's wins, onnxruntime's regex runs code built for
+# a different std::string: ParseSemVerVersion, on every OrtEnv, asks for an
+# absurd allocation or frees garbage ("free(): invalid pointer"). Which copy
+# wins moves with link order, so unrelated code can make wake word start
+# crashing. Matching the ABI makes both copies the same code. Linux arm64's
+# archive is not built this way and needs nothing. The rebuild caveat above
+# applies here too (the rust-cache keys carry `-cxxabi0` for this).
+CXXFLAGS_x86_64_unknown_linux_gnu = "-D_GLIBCXX_USE_CXX11_ABI=0"

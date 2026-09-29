@@ -226,9 +226,9 @@ function ConditioningImageField({
   onStrength: (value: number) => void;
   strengthLabel: string;
   /** Offered only where a hint map is what the slot wants. ControlNet takes an
-   *  edge or depth map rather than a photograph; IP-Adapter and PhotoMaker take
-   *  the picture itself, and running an edge detector over those would throw
-   *  away the very thing they read. */
+   *  edge or depth map rather than a photograph; IP-Adapter takes the picture
+   *  itself, and running an edge detector over that would throw away the very
+   *  thing it reads. */
   onPreprocess?: (kind: Preprocessor) => void;
 }) {
   const { t } = useT();
@@ -658,6 +658,9 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
       // model can read the image, the engine's own flags decide whether this
       // build accepts the field at all.
       capabilities,
+      // References are read by the diffusion model itself, not a slot, and
+      // only stable-diffusion.cpp is sent them.
+      selected.engine === "stable_diffusion_cpp" && selected.readsRefImages,
     );
   }, [remote, selected, overrides, capabilities]);
 

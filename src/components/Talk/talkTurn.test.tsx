@@ -332,7 +332,7 @@ describe('Talk — a spoken turn end to end', () => {
     const { result } = talk(sessionId);
 
     await saySomething(result, media);
-    await waitFor(() => expect(media.speakers).toHaveLength(1));
+    await waitFor(() => expect(media.speakers[0]?.plays).toBe(1));
     // The setting that was previously true only of the speaker test.
     expect(media.speakers[0].sinks).toEqual(['speaker-2']);
     expect(media.speakers[0].plays).toBe(1);
@@ -386,7 +386,7 @@ describe('Talk — a spoken turn end to end', () => {
     const { result } = talk(sessionId);
 
     await saySomething(result, media);
-    await waitFor(() => expect(media.speakers).toHaveLength(1));
+    await waitFor(() => expect(media.speakers[0]?.plays).toBe(1));
     const spoken = invoke.mock.calls
       .filter((call) => call[0] === 'm7_tts_synthesize')
       .map((call) => (call[1] as { text: string }).text);
@@ -414,7 +414,7 @@ describe('Talk — a spoken turn end to end', () => {
     const { result } = talk(sessionId);
 
     await saySomething(result, media);
-    await waitFor(() => expect(media.speakers).toHaveLength(1));
+    await waitFor(() => expect(media.speakers[0]?.plays).toBe(1));
     const spoken = invoke.mock.calls
       .filter((call) => call[0] === 'm7_tts_synthesize')
       .map((call) => (call[1] as { text: string }).text);
@@ -469,7 +469,7 @@ describe('Talk — a spoken turn end to end', () => {
     const { result } = talk(sessionId);
 
     await saySomething(result, media);
-    await waitFor(() => expect(media.speakers).toHaveLength(1));
+    await waitFor(() => expect(media.speakers[0]?.plays).toBe(1));
     const spoken = invoke.mock.calls
       .filter((call) => call[0] === 'm7_tts_synthesize')
       .map((call) => (call[1] as { text: string }).text);
