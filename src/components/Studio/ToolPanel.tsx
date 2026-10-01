@@ -21,6 +21,7 @@ import { SettingsCard } from "./SettingsCard";
 import { pickImageBase64 } from "../../lib/imageAttachment";
 import { useT } from "../../lib/i18n";
 import { formatBytes, studioClient, type GenerationEntry } from "../../lib/studioClient";
+import { CreatorHubPanel } from "./CreatorHubPanel";
 import {
   clampToolNumber,
   missingRequired,
@@ -418,6 +419,8 @@ export function ToolPanel({ railSlot }: Props) {
           </div>
         </section>
       )}
+
+      <CreatorHubPanel />
 
       {railSlot
         ? createPortal(

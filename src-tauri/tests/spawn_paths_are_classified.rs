@@ -257,6 +257,19 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
          model; kept resident under its own LRU and residency budget, which is an \
          owner-sourced bound rather than a `ProcessLimits` one",
     ),
+    (
+        "studio_parity.rs",
+        Class::ManagedService,
+        "Character Studio's MFLUX trainer: the verified runtime's Python on a fixed module, \
+         with a config this app writes from the user's photos and numeric settings",
+    ),
+    (
+        "character_trainer.rs",
+        Class::ManagedService,
+        "the portable Character Studio trainer: `git`, `nvidia-smi` and the pinned Musubi \
+         Tuner scripts in its own venv, argv composed here; each run is its own process \
+         group that cancellation kills as a tree",
+    ),
     // --- Bounded host utilities ---------------------------------------------
     (
         "git.rs",

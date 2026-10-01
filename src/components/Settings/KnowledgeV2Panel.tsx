@@ -35,6 +35,7 @@ import type { KnowledgeStack } from "../../store/stackStore";
 import { useT } from "../../lib/i18n";
 import { Button, IconButton, StatusPill } from "../ui";
 import { errorMessage } from "../../lib/errors";
+import { ChatExportImportCard } from "./ChatExportImportCard";
 
 type ConnectorKind = KnowledgeConnector["kind"];
 
@@ -471,6 +472,8 @@ export function KnowledgeV2Panel({
               )}
             </div>
           </div>
+
+          <ChatExportImportCard stackId={stackId} />
 
           {errors[stackId] && (
             <p className="mt-2 rounded-md border border-danger/30 bg-danger/5 p-2 text-xs text-danger">
