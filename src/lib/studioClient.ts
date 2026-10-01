@@ -52,8 +52,8 @@ export type ConditioningImage = "control" | "ip_adapter" | "reference";
 export const CONDITIONING_SLOTS: Partial<Record<ComponentSlot, ConditioningImage>> = {
   control_net: "control",
   ip_adapter: "ip_adapter",
-  photo_maker: "reference",
-  pulid_weights: "reference",
+  // No slot unlocks "reference": the engine hands `ref_images` to the diffusion
+  // model itself, which is what `readsRefImages` on the model entry declares.
 };
 
 /** Reference images one run may carry. Mirrors the backend's own ceiling —
@@ -84,15 +84,19 @@ export function engineSupports(
   return capabilities === null || capabilities.features[feature] === true;
 }
 
-/** Which conditioning images this set of filled slots unlocks, narrowed to the
- *  ones the running engine still accepts. */
+/** Which conditioning images this set of filled slots unlocks, plus references
+ *  for a model that reads them, narrowed to the ones the running engine still
+ *  accepts. */
 export function availableConditioning(
   slots: ComponentSlot[],
   capabilities: EngineCapabilities | null = null,
+  readsRefImages = false,
 ): Set<ConditioningImage> {
   return new Set(
-    slots
-      .map((slot) => CONDITIONING_SLOTS[slot])
+    [
+      ...slots.map((slot) => CONDITIONING_SLOTS[slot]),
+      readsRefImages ? ("reference" as const) : undefined,
+    ]
       .filter((kind): kind is ConditioningImage => !!kind)
       .filter((kind) => engineSupports(capabilities, CONDITIONING_FEATURES[kind])),
   );
@@ -188,6 +192,9 @@ export interface GenerationModelSpec {
   extraLaunchArgs: string[];
   engine: GenerationEngineKind;
   quantizationBits: number | null;
+  /** The diffusion model itself reads per-run reference images (FLUX Kontext,
+   *  Qwen-Image-Edit, FLUX.2). Mirrors `reads_ref_images` in generation.rs. */
+  readsRefImages: boolean;
 }
 
 export interface GenerationModel {
@@ -203,6 +210,7 @@ export interface GenerationModel {
   extraLaunchArgs: string[];
   engine: GenerationEngineKind;
   quantizationBits: number | null;
+  readsRefImages: boolean;
   installed: boolean;
   /** Measured on this machine, not declared in the entry. */
   totalBytes: number;
@@ -529,6 +537,7 @@ export function backendModels(backends: RemoteBackend[]): GenerationModel[] {
       // Never launched locally, so the field only has to be a valid one.
       engine: "stable_diffusion_cpp" as GenerationEngineKind,
       quantizationBits: null,
+      readsRefImages: false,
       installed: true,
       totalBytes: 0,
       missingBytes: 0,
@@ -823,5 +832,6 @@ export function emptyModelSpec(): GenerationModelSpec {
     extraLaunchArgs: [],
     engine: "stable_diffusion_cpp",
     quantizationBits: null,
+    readsRefImages: false,
   };
 }
