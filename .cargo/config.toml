@@ -1,0 +1,42 @@
+# The built-in Whisper engine is whisper.cpp, compiled by the whisper-rs-sys
+# build script, which forwards every GGML_* variable to CMake. Left alone, ggml
+# builds with GGML_NATIVE=ON: -march=native, -mcpu=native on ARM, or whatever
+# /arch: MSVC detects on the build machine. A release is then tuned to the CPU
+# of the runner that happened to build it, and dies with SIGILL on a user's
+# machine that lacks, say, AVX-512, SVE or i8mm.
+#
+# Pin a baseline instead, as the managed stable-diffusion.cpp build already does
+# (scripts/lib/managedRuntimeManifest.mjs):
+#
+# - x86_64: GGML_NATIVE=OFF alone means SSE4.2, AVX, AVX2, BMI2, FMA and F16C,
+#   i.e. Haswell (2013) and later.
+# - arm64: ARMv8.2 with dot product and FP16 arithmetic. Every Apple silicon Mac
+#   (M1 is the floor) and every Windows 11 on Arm device has both. On Linux this
+#   covers Raspberry Pi 5, Graviton 2 and later, Ampere, Jetson Orin and RK3588,
+#   but not Cortex-A72 or older (Raspberry Pi 4).
+#
+# These are defaults, not overrides: a variable already set in the environment
+# wins, so `GGML_NATIVE=ON` still gives a local build tuned to its own machine.
+#
+# whisper-rs-sys does not rerun its build script when these change, so a warm
+# target/ keeps the objects it already has. After changing either value, run
+# `cargo clean -p whisper-rs-sys` locally and rename every Swatinem/rust-cache
+# key in .github/workflows, or CI and releases keep restoring the old build.
+[env]
+GGML_NATIVE = "OFF"
+GGML_CPU_ARM_ARCH = "armv8.2-a+dotprod+fp16"
+
+# Linux x86_64 only: build our C++ (whisper.cpp is the only C++ on this target)
+# with libstdc++'s pre-C++11 string ABI, the one sherpa-onnx's prebuilt
+# onnxruntime uses — it is built on manylinux devtoolset, which forces it.
+#
+# Both instantiate std::regex internals under the same mangled names, since the
+# string ABI changes their layout but not their names. The linker keeps one
+# copy of each, so when whisper's wins, onnxruntime's regex runs code built for
+# a different std::string: ParseSemVerVersion, on every OrtEnv, asks for an
+# absurd allocation or frees garbage ("free(): invalid pointer"). Which copy
+# wins moves with link order, so unrelated code can make wake word start
+# crashing. Matching the ABI makes both copies the same code. Linux arm64's
+# archive is not built this way and needs nothing. The rebuild caveat above
+# applies here too (the rust-cache keys carry `-cxxabi0` for this).
+CXXFLAGS_x86_64_unknown_linux_gnu = "-D_GLIBCXX_USE_CXX11_ABI=0"

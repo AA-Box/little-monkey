@@ -203,6 +203,10 @@ export function AddModelForm({ onSaved, initialSpec, editing = false }: AddModel
         name: current.name || hint.name,
         family: current.family || hint.family,
         tasks: profile?.tasks ?? current.tasks,
+        // Set from a fresh form's first file, never cleared: a tick the user
+        // made stays theirs.
+        readsRefImages:
+          current.readsRefImages || (current.tasks.length === 0 && hint.readsRefImages),
         defaults: profile
           ? { ...current.defaults, fps: profile.fps, frameGrid: profile.frameGrid }
           : current.defaults,
@@ -290,6 +294,21 @@ export function AddModelForm({ onSaved, initialSpec, editing = false }: AddModel
           ))}
         </div>
       </fieldset>
+
+      {spec.engine === "stable_diffusion_cpp" && (
+        <label className="flex items-start gap-2 text-[11px]">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={spec.readsRefImages}
+            onChange={(event) => patch({ readsRefImages: event.target.checked })}
+          />
+          <span className="grid gap-0.5">
+            <span className="text-foreground">{t("Studio.add.readsRefImages")}</span>
+            <span className="text-faint">{t("Studio.add.readsRefImagesHint")}</span>
+          </span>
+        </label>
+      )}
 
       <label className="grid gap-1 text-[11px] text-muted">
         {t("Studio.add.mfluxSource")}

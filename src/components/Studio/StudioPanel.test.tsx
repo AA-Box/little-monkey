@@ -67,6 +67,7 @@ const MODEL: GenerationModel = {
   components: [],
   source: { kind: "components" },
   quantizationBits: null,
+  readsRefImages: false,
   defaults: {
     width: 512,
     height: 512,
