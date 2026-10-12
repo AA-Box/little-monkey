@@ -22,6 +22,14 @@ describe('strict swarm reviewer reconciliation', () => {
     expect(results.status).toBe('disputed');
     expect(results.claims[0].status).toBe('disputed');
   });
+  it('never hides a lone explicit reviewer rejection as mere lack of evidence',()=>{
+    const result=reconcileSwarmReviewers([
+      {reviewer:'A',report:vote('auth-check','reject')},
+      {reviewer:'B',report:vote('auth-check','unknown',[])},
+    ]);
+    expect(result.status).toBe('disputed');
+    expect(result.claims[0].status).toBe('disputed');
+  });
   it('fails closed for missing or malformed evidence and reviewer reports', () => {
     expect(reconcileSwarmReviewers([{ reviewer: 'a', report: 'looks good' }])).toEqual({
       status: 'inconclusive', parsedReviewerCount: 0, claims: [],
