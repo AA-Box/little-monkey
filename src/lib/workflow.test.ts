@@ -656,6 +656,21 @@ describe("runWorkflow / resume (v2)", () => {
     }));
   }
 
+  it('never drops authenticated peer quorum requirements when reconstructing a resume',()=>{
+    const protectedSpec=spec({consensus:'strict',authenticatedPeerVoting:true,phases:[
+      {title:'Peer review',agents:[
+        {description:'A',prompt:'Review A',profile:'explore',peer:'node-a'},
+        {description:'B',prompt:'Review B',profile:'explore',peer:'node-b'},
+      ]},
+      {title:'Verification',agents:[{description:'V',prompt:'Validate',profile:'explore'}]},
+    ]});
+    seedSession({call_old:{...fullJournal('call_old'),spec:protectedSpec}});
+    const recovered=resolveWorkflowSpec({resume:'call_old'},SESSION);
+    expect(recovered.authenticatedPeerVoting).toBe(true);
+    expect(recovered.consensus).toBe('strict');
+    expect(recovered.phases[0].agents.map(agent=>agent.peer)).toEqual(['node-a','node-b']);
+  });
+
   it("replays every journaled agent on a full prompt-hash match, dispatching nothing", async () => {
     seedSession({ call_old: fullJournal("call_old") });
 
