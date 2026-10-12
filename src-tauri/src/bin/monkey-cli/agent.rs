@@ -960,6 +960,8 @@ async fn present_plan(
 #[serde(deny_unknown_fields)]
 struct CliWorkflowSpec {
     name: String,
+    #[serde(default)]
+    description: Option<String>,
     phases: Vec<CliWorkflowPhase>,
 }
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -980,6 +982,7 @@ fn parse_cli_workflow(raw: &serde_json::Value) -> Result<CliWorkflowSpec, String
     let workflow: CliWorkflowSpec = serde_json::from_value(raw.clone())
         .map_err(|error| format!("Invalid CLI workflow specification: {error}"))?;
     if workflow.name.trim().is_empty() || workflow.name.len() > 100
+        || workflow.description.as_deref().is_some_and(|value| value.len() > 1_200)
         || workflow.phases.is_empty() || workflow.phases.len() > 6
     {
         return Err("A CLI workflow needs a name and 1–6 phases".into());
@@ -1076,7 +1079,8 @@ async fn run_cli_workflow(
         }
         prior.extend(next_reports);
     }
-    serde_json::json!({"workflow":spec.name,"status":"completed","phases":summaries}).to_string()
+    serde_json::json!({"workflow":spec.name,"description":spec.description,
+        "status":"completed","phases":summaries}).to_string()
 }
 
 /// Executes a single model-requested tool call, returning the string to use
