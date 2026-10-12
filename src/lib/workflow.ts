@@ -262,6 +262,7 @@ export function resolveWorkflowSpec(args: Record<string, unknown>, sessionId?: s
       memory_stack_ids: meta.spec.memoryStackIds,
       stop_on_failure: meta.spec.stopOnFailure,
       consensus: meta.spec.consensus,
+      authenticated_peer_voting: meta.spec.authenticatedPeerVoting,
       notebook: meta.spec.notebook,
       learning: meta.spec.learning,
       topology: meta.spec.topology,
