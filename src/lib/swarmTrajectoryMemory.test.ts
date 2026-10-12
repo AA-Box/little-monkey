@@ -17,7 +17,8 @@ describe('local read-only trajectory retrieval',()=>{
     const block=buildSwarmTrajectoryContext([fixture()], 'backend','/workspace','session-x');
     expect(block).toContain('reported successful agents: 1');
     expect(block).toContain('NOT correctness evidence');
-    expect(block).not.toMatch(/SECRET|private prompt|vulnerable|\\/workspace|secret 999/);
+    expect(block).not.toMatch(/SECRET|private prompt|vulnerable|secret 999/);
+    expect(block).not.toContain('/workspace');
   });
   it('isolates workspace, domain and mutable agent execution',()=>{
     expect(buildSwarmTrajectoryContext([fixture()], 'security','/workspace','session-x')).toBe('');
