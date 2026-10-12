@@ -738,6 +738,10 @@ export const WORKFLOW_TOOL: ToolDef = {
           type: 'boolean',
           description: 'Opt-in versioned per-project swarm notebook. Only operator-approved claims from earlier swarms enter this run as untrusted reference. With strict consensus, reviewer-agreed claims are staged as pending proposals; never auto-approved. Not forwarded to paired peers.',
         },
+        authenticated_peer_voting: {
+          type: 'boolean',
+          description: 'Opt-in authenticated multi-peer reviewer voting. Requires consensus and two phases (reviewers then verification); every reviewer must have a distinct pinned paired peer, task grant, read-only explore profile, and no placement failover. Certificates and grants are revalidated before accepting any votes. This is model reviewer agreement, NOT distributed Raft/BFT consensus.',
+        },
         consensus: {
           type: 'string',
           enum: ['strict','majority','supermajority','unanimous'],

@@ -382,3 +382,20 @@ folder, then immediately passes the same selected folder to the normal native
 MLX-capable model registrar. The confirmation cannot activate a model. This
 narrows (but cannot cryptographically eliminate) filesystem mutation races
 between reading an external directory and later serving it for inference.
+
+
+### Authenticated cross-machine reviewer quorum
+
+Opt-in `authenticated_peer_voting: true` on an explicit `workflow` with
+`consensus`, a penultimate read-only reviewer phase and a subsequent
+verification phase. Every reviewer must name a different **pinned** paired
+peer; candidate-pool failover is forbidden for voters. Before dispatch,
+the frontend reads actual pairing records, requires the task grant and distinct
+certificate fingerprints and device identities. Immediately before
+reconciliation or proposing notebook claims it checks that the same peer
+identities and grants remain valid; revoked/re-paired voters invalidate the
+quorum. Votes are attributed to certificate fingerprint rather than editable
+agent description or alias, with existing contradiction and evidence rules.
+This is a bounded signed-peer reviewer vote, **not** Raft, Paxos, BFT, or
+cryptographic proof of model correctness. It cannot by itself certify
+physical installation independence; two-machine acceptance still applies.

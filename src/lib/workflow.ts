@@ -38,6 +38,7 @@ import { reconcileSwarmReviewers,parseSwarmVotePolicy,type SwarmVotePolicy } fro
 import { approvedSwarmNotebookBlock, stageSwarmNote } from './swarmNotebook';
 import { approvedLearningContext } from './swarmLearningCycle';
 import { buildSwarmTrajectoryContext } from './swarmTrajectoryMemory';
+import {frozenAuthenticatedPeerVoters,revalidateAuthenticatedPeerVoters} from './swarmPeerQuorum';
 
 export interface WorkflowAgentSpec {
   description: string;
@@ -78,6 +79,9 @@ export interface WorkflowSpec {
   stopOnFailure?: boolean;
   /** Optional strict non-authoritative agreement/dispute summary from independent reviewers. */
   consensus?: SwarmVotePolicy;
+  /** Explicitly require the vote phase to come from unique paired peer device
+   * identities under unchanged task grants and certificate fingerprints. */
+  authenticatedPeerVoting?: boolean;
   /** Opt-in, operator-approved versioned notebook reference and staging. */
   notebook?: boolean;
   /** Explicit opt-in to operator-approved, domain-matched past learning. */
@@ -127,6 +131,17 @@ export function assertWorkflowBounds(spec: WorkflowSpec): void {
   }
   if (total > MAX_WORKFLOW_AGENTS) throw new Error('Workflow cannot exceed 16 agents.');
   parseSwarmVotePolicy(spec.consensus);
+  if(spec.authenticatedPeerVoting!==undefined&&typeof spec.authenticatedPeerVoting!=='boolean')
+    throw new Error('Authenticated peer voting must be a boolean.');
+  if(spec.authenticatedPeerVoting){
+    if(!spec.consensus||spec.phases.length<2)
+      throw new Error('Authenticated peer voting requires a reviewer consensus phase and a following verification phase.');
+    const reviewers=spec.phases[spec.phases.length-2].agents;
+    if(reviewers.length<2||reviewers.some(agent=>agent.profile!=='explore'||
+       !agent.peer||agent.isolation||agent.peerFailover||agent.peerCandidates?.length)||
+       new Set(reviewers.map(agent=>agent.peer)).size!==reviewers.length)
+      throw new Error('Authenticated peer voting requires distinct pinned, read-only reviewer peers without placement fallback.');
+  }
   const topology = parseSwarmTopology(spec.topology);
   if (topology !== 'phased' && spec.phases.some(phase => phase.agents.some(agent =>
     agent.profile !== 'explore' || agent.peer !== undefined || agent.peerCandidates?.length || agent.isolation))) {
@@ -212,10 +227,13 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
   const topology = parseSwarmTopology(args.topology);
   const memoryStackIds = parseSwarmMemoryStackIds(args.memory_stack_ids);
   const consensus = parseSwarmVotePolicy(args.consensus);
+  if(args.authenticated_peer_voting!==undefined&&typeof args.authenticated_peer_voting!=='boolean')
+    throw new Error('authenticated_peer_voting must be a boolean.');
   return { name, description, phases,
     ...(topology !== 'phased' ? { topology } : {}),
     ...(args.stop_on_failure === true ? { stopOnFailure: true } : {}),
     ...(consensus ? { consensus } : {}),
+    ...(args.authenticated_peer_voting === true ? { authenticatedPeerVoting: true } : {}),
     ...(args.notebook === true ? { notebook: true } : {}),
     ...(args.learning === true ? { learning: true } : {}),
     ...(memoryStackIds.length ? { memoryStackIds } : {}) };
@@ -513,6 +531,10 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
   try {
     assertWorkflowBounds(spec);
     await checkpoint(); // durably register the graph before dispatch
+    const voterSnapshot=spec.authenticatedPeerVoting
+      ? await frozenAuthenticatedPeerVoters(spec.phases[spec.phases.length-2].agents
+        .map(agent=>agent.peer!))
+      : null;
     // Persisted saved workflows can be hand-edited; validate the permission
     // boundary again at dispatch, not only during JSON-tool parsing.
     for (const phase of spec.phases) {
@@ -694,9 +716,15 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
     if (!anyFailure) useSavedWorkflowStore.getState().upsert(spec, Date.now());
     const reviewPhase = spec.consensus && phaseSummaries.length >= 2
       ? phaseSummaries[phaseSummaries.length - 2] : null;
+    // Revalidate the native pairing registry before a remote vote becomes a
+    // notebook candidate. Revocation or certificate rotation invalidates the
+    // quorum even when old report text looks convincing.
+    if(voterSnapshot)await revalidateAuthenticatedPeerVoters(voterSnapshot);
     const consensus = reviewPhase ? reconcileSwarmReviewers(reviewPhase.agents
-      .filter(agent => agent.status === 'done')
-      .map(agent => ({ reviewer: agent.description, report: agent.report })),
+      .flatMap((agent,index)=>agent.status==='done'?[{
+        reviewer:voterSnapshot ? 'paired:'+voterSnapshot[index].certificateSha256 : agent.description,
+        report:agent.report,
+      }]:[]),
       spec.consensus ?? 'strict', reviewPhase.agents.length) : undefined;
     const notebookStaged: string[] = [];
     const notebookWarnings: string[] = [];
