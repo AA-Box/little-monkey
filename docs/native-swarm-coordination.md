@@ -66,6 +66,31 @@ reviewer ranking ever modifies model weights or runtime permissions.
 The learning retrieval flag is refused on modifying or remotely placed
 agents, because historical findings must not cross peer trust boundaries.
 
+## Operator-reviewed JSON capability pack registry
+
+The Swarms panel can import local JSON-only packs with schema version 1, an
+ASCII id, title and description and up to four phases of four agents (twelve
+agents maximum). The JSON manifest contains **only** phase names and
+bounded agent description/prompt fields; no executable modules, tools, peer
+placements, code agents, worktrees or hooks. Unknown fields fail closed.
+
+Example:
+
+```json
+{"schema":1,"id":"api-readiness","title":"API readiness",
+ "description":"Read-only API reliability review",
+ "phases":[{"title":"Inspection","agents":[
+   {"description":"API reviewer","prompt":"Inspect API contracts and cite source evidence."}
+ ]}]}
+```
+
+The operator must confirm an import, then separately prepare and send the
+workflow draft through ordinary agent authorization. Imported data is not
+signed, certified or trusted; review instructions before dispatch. The local
+registry has an eight-pack / 48-KB cap, supports removal and does not
+install third-party code. MCP, executable hooks and signed extensions retain
+separate explicit authorization.
+
 ## Native capability packs and extensions
 
 First-party packs are static, bounded WorkflowSpec declarations under
