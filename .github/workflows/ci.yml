@@ -717,6 +717,17 @@ jobs:
       # The SBOM covers both dependency trees (pnpm-lock.yaml and Cargo.lock are
       # both in the scanned tree), so one artifact describes the whole app.
       - name: Generate SBOM
+        id: generate-sbom
+        continue-on-error: true # Retry the pinned release download if GitHub returns a transient 5xx.
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: little-monkey-sbom.cyclonedx.json
+          output-file: little-monkey-sbom.cyclonedx.json
+
+      - name: Retry SBOM generation after a transient download failure
+        if: steps.generate-sbom.outcome == 'failure'
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           path: .
