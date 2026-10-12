@@ -595,6 +595,38 @@ describe("runWorkflow / resume (v2)", () => {
     expect(Object.keys(final?.agentResults ?? {})).toHaveLength(3);
   });
 
+  it("persists a completed phase before dispatching its dependent reviewers", async () => {
+    seedSession({});
+    const saved: Array<{ workflowRunMeta?: Record<string, WorkflowRunMeta> }> = [];
+    invokeMock.mockImplementation(async (command: unknown, args?: unknown) => {
+      if (command === "sessions_save") {
+        const payload = (args as { payload: string }).payload;
+        saved.push(JSON.parse(payload).sessions.find((s: { id: string }) => s.id === SESSION));
+      }
+      return null;
+    });
+    try {
+      runSubagentTaskMock.mockImplementation(async (params: { toolCallId: string }) => {
+        if (params.toolCallId.endsWith("p1a0")) {
+          const durablySaved = saved.some(snapshot => {
+            const run = snapshot?.workflowRunMeta?.["call_durable"];
+            return run?.status === "running" &&
+              run.agentResults?.[workflowAgentTaskId("call_durable", 0, 0)]?.status === "done" &&
+              run.agentResults?.[workflowAgentTaskId("call_durable", 0, 1)]?.status === "done";
+          });
+          expect(durablySaved).toBe(true);
+        }
+        return "report";
+      });
+      const outcome = await runWorkflow({ sessionId: SESSION, parentCheckpointId: null,
+        toolCallId: "call_durable", spec: spec(), target: TARGET });
+      expect(JSON.parse(outcome).status).toBe("completed");
+      expect(saved.at(-1)?.workflowRunMeta?.call_durable?.status).toBe("done");
+    } finally {
+      invokeMock.mockReset().mockResolvedValue(null);
+    }
+  });
+
   it("hydrates crashed workflow journals as interrupted without executing agents", () => {
     const meta = fullJournal("call_crashed");
     meta.status = "running";
