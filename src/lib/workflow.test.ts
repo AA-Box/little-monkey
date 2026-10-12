@@ -9,7 +9,11 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeM
 // task ids, phase sequencing, prior-report injection, failure/cancellation
 // propagation, and the workflowStore lifecycle.
 const runPairedPeerAgentMock = vi.fn();
+const runPairedPeerAgentWithFailoverMock = vi.fn();
 vi.mock("./swarmPeer", () => ({ runPairedPeerAgent: (...args: unknown[]) => runPairedPeerAgentMock(...args) }));
+vi.mock("./swarmPeerRecovery", () => ({
+  runPairedPeerAgentWithFailover: (...args: unknown[]) => runPairedPeerAgentWithFailoverMock(...args),
+}));
 const retrieveSwarmKnowledgeMock = vi.fn();
 vi.mock("./swarmKnowledge", () => ({
   retrieveSwarmKnowledge: (...args: unknown[]) => retrieveSwarmKnowledgeMock(...args),
@@ -64,6 +68,7 @@ function spec(overrides?: Partial<WorkflowSpec>): WorkflowSpec {
 
 beforeEach(() => {
   runPairedPeerAgentMock.mockReset().mockResolvedValue("Remote peer report");
+  runPairedPeerAgentWithFailoverMock.mockReset().mockResolvedValue("Recovered peer report");
   runSubagentTaskMock.mockReset();
   runSubagentTaskMock.mockResolvedValue("fine report");
   retrieveSwarmKnowledgeMock.mockReset().mockResolvedValue("");
@@ -202,6 +207,20 @@ describe("runWorkflow", () => {
     expect(runPairedPeerAgentMock).toHaveBeenCalledWith(expect.objectContaining({
       peer: "my-node", taskId: "call_wf#p0a0", correlationTaskPosition: "p0a0", prompt: "Inspect API",
     }));
+    expect(runSubagentTaskMock).not.toHaveBeenCalled();
+  });
+
+  it("dispatches an explicitly opt-in peer failure recovery through the guarded runner", async () => {
+    const remoteSpec = spec({
+      phases: [{ title: "Peer recovery", agents: [{ description: "peer audit", prompt: "Read API",
+        profile: "explore", peer: "node-a", peerCandidates: ["node-a","node-b"], peerFailover: true }] }],
+    });
+    await runWorkflow({ ...baseParams, spec: remoteSpec });
+    expect(runPairedPeerAgentWithFailoverMock).toHaveBeenCalledWith(expect.objectContaining({
+      peer: "node-a", peerCandidates: ["node-a","node-b"],
+      correlationTaskPosition: "p0a0", prompt: "Read API",
+    }));
+    expect(runPairedPeerAgentMock).not.toHaveBeenCalled();
     expect(runSubagentTaskMock).not.toHaveBeenCalled();
   });
 
