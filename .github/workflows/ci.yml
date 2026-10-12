@@ -56,6 +56,11 @@ jobs:
           node --check scripts/swarm-two-peer-cancellation-live-acceptance.mjs
           node --test scripts/swarm-two-peer-memory-acceptance.contract.test.mjs scripts/swarm-two-peer-cancellation-acceptance.contract.test.mjs
 
+      - name: Verify independent security source oracle without any model calls
+        run: |
+          node --check scripts/swarm-specialist-live-benchmark.mjs
+          node scripts/swarm-specialist-live-benchmark.mjs --self-check
+
       - name: Production build and bundle budget
         run: pnpm build:budget
 

@@ -392,3 +392,32 @@ Outstanding release proof includes live network partition/recovery, parallel
 author stress, real-model finding-to-fix-to-test success and independently
 evaluated specialist accuracy. Do not mark the system production-ready solely
 because these harnesses are installed.
+
+## Independently verified specialist accuracy and adaptive selection
+
+Runtime completion counters are not evidence of correctness. There is now
+a separate, **default-disabled** quality-based selection path for the three
+supplemental security specialists. Real observations follow this loop:
+
+1. On a host with Little Monkey installed and a configured Ollama model, run
+   `node scripts/swarm-specialist-live-benchmark.mjs --target ollama:<model>
+   --repetitions 3 > specialist-results.json`.
+2. The harness creates disposable security source fixtures including one
+   correct, negative-control example. It executes a real headless model
+   with PLAN permissions, MCP/rules disabled, and checks unchanged Git
+   source, actual durable run IDs, and model reports with an independently
+   coded source oracle. Neither a self-reported pass nor mere completion
+   can count as a verified finding.
+3. In Swarm settings, import the JSON; Little Monkey rechecks all three
+   fixtures for each specialist, every repetition, unique run identifiers,
+   the timestamp and all aggregate rankings. Incomplete or contradictory
+   measurements are rejected. A user-provided JSON file is not
+   cryptographic evidence of provenance.
+4. Only after operator opt-in, verified accuracy ranks the supplemental
+   *security* specialist among existing approved roles. Core review roles,
+   all other engineering domains, model eligibility and tools remain
+   unaffected. Data expires after 90 days; clearing it disables ranking.
+
+These are small, controlled tests, not proof of general repository-audit
+quality. The live evaluator requires a genuine model; CI runs its source
+oracle self-check without pretending to have a configured inference server.

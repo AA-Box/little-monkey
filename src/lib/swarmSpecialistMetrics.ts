@@ -3,6 +3,8 @@
  * Measures execution reliability and wall duration, NOT answer quality.
  * No prompts, source files, reports or model credentials are retained.
  */
+import { chooseVerifiedSpecialist } from './swarmVerifiedSpecialists';
+
 export type SpecialistDomain = 'security' | 'frontend' | 'backend' | 'performance' | 'general';
 export interface SpecialistStats { successes: number; failures: number; completedMs: number }
 export type SpecialistMetrics = Record<string, SpecialistStats>;
@@ -58,6 +60,8 @@ export function chooseSupplementalSpecialist(
   metrics = loadSpecialistMetrics(),
 ): string {
   if (!options.length) throw new Error('Specialist pool is empty.');
+  const verified = chooseVerifiedSpecialist(domain, options);
+  if (verified) return verified; // opt-in source-verified accuracy, never completion telemetry
   return [...options].sort((a, b) => {
     const aa = metrics[key(domain, a)] ?? { successes: 0, failures: 0, completedMs: 0 };
     const bb = metrics[key(domain, b)] ?? { successes: 0, failures: 0, completedMs: 0 };

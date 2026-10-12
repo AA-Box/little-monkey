@@ -65,7 +65,9 @@
     "stage:wake-word": "node scripts/stage-wake-word-model.mjs",
     "stage:cli": "node scripts/stage-cli-sidecar.mjs",
     "stage:cli:placeholder": "node scripts/ensure-cli-sidecar-placeholder.mjs",
-    "icon:mac-liquid": "tauri-liquid-icon --icon ./src-tauri/icons/AppIcon.icon --name AppIcon --output ./src-tauri/resources --tauri-dir ./src-tauri"
+    "icon:mac-liquid": "tauri-liquid-icon --icon ./src-tauri/icons/AppIcon.icon --name AppIcon --output ./src-tauri/resources --tauri-dir ./src-tauri",
+    "test:swarm-specialists:live": "node scripts/swarm-specialist-live-benchmark.mjs",
+    "test:swarm-specialists:oracle": "node scripts/swarm-specialist-live-benchmark.mjs --self-check"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
