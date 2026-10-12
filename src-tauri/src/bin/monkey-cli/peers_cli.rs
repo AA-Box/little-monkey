@@ -1013,6 +1013,38 @@ async fn send(
     Ok(())
 }
 
+/// A peer is untrusted even after TLS pinning: it must never determine the
+/// fields we print into CLI / daemon logs. In particular, the transport may
+/// handle certificates and signing secrets that do not belong in stdout.
+/// Rebuild the cancellation receipt from a closed set of status tokens and
+/// the already validated, locally owned message id. Never forward an entire
+/// remote response or an arbitrary remote warning.
+fn sanitized_cancellation_receipt(
+    response: &serde_json::Value,
+    owned_message_id: &str,
+) -> Result<(serde_json::Value, &'static str), String> {
+    let status = match response.get("status").and_then(serde_json::Value::as_str) {
+        Some("cancellation_requested") => "cancellation_requested",
+        Some("cancellation_already_requested") => "cancellation_already_requested",
+        Some("already_terminal") => "already_terminal",
+        _ => return Err("Peer returned an invalid cancellation status".to_string()),
+    };
+    let receipt = if status == "cancellation_requested" {
+        // The server may return a diagnostic when its separate ledger append
+        // fails. Only its presence is relevant: never print the actual text.
+        let warning = response.get("ledger_warning").is_some_and(|v| !v.is_null())
+            .then_some("Cancellation is durable but its ledger event could not be appended");
+        serde_json::json!({
+            "status": status,
+            "message_id": owned_message_id,
+            "ledger_warning": warning
+        })
+    } else {
+        serde_json::json!({"status": status})
+    };
+    Ok((receipt, status))
+}
+
 /// Ask the receiver to cancel only a task whose outbound receipt this node
 /// still owns. This call is signed and TLS certificate-pinned like task send.
 async fn cancel_task(alias: &str, thread_id: &str, message_id: &str, json: bool) -> Result<(), String> {
@@ -1046,11 +1078,11 @@ async fn cancel_task(alias: &str, thread_id: &str, message_id: &str, json: bool)
         &format!("/v1/remote/peer/threads/{thread_id}/cancel"),
         body,
     ).await?;
+    let (receipt, status) = sanitized_cancellation_receipt(&response, message_id)?;
     if json {
-        println!("{response}");
+        println!("{receipt}");
     } else {
-        println!("Cancellation status for {alias}/{thread_id}/{message_id}: {}",
-            response["status"].as_str().unwrap_or("unknown"));
+        println!("Cancellation status for {alias}/{thread_id}/{message_id}: {status}");
     }
     Ok(())
 }
@@ -1191,6 +1223,57 @@ fn threads(peer: Option<&str>, limit: u32, json: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_receipt_never_logs_remote_secrets_or_untrusted_warnings() {
+        let remote = serde_json::json!({
+            "status": "cancellation_requested",
+            "message_id": "untrusted-remote-id",
+            "ledger_warning": "sensitive-warning-marker",
+            "controller_secret": "sensitive-controller-token",
+            "peer_certificate": "sensitive-certificate",
+            "server_certificate_sha256": "sensitive-fingerprint",
+            "tls_key": "sensitive-key",
+        });
+        let (receipt, status) =
+            sanitized_cancellation_receipt(&remote, "owned-message-id").expect("valid status");
+        assert_eq!(status, "cancellation_requested");
+        assert_eq!(receipt["message_id"], "owned-message-id");
+        assert_eq!(receipt["status"], "cancellation_requested");
+        assert_eq!(
+            receipt["ledger_warning"],
+            "Cancellation is durable but its ledger event could not be appended"
+        );
+        let serialized = receipt.to_string();
+        assert!(!serialized.contains("sensitive-"), "secret-bearing fields must not be forwarded");
+        assert!(!serialized.contains("untrusted-remote-id"));
+        assert_eq!(receipt.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn cancellation_receipt_only_accepts_known_terminal_acknowledgements() {
+        for status in ["already_terminal", "cancellation_already_requested"] {
+            let remote = serde_json::json!({
+                "status": status,
+                "controller_secret": "sensitive-controller-token"
+            });
+            let (receipt, fixed_status) =
+                sanitized_cancellation_receipt(&remote, "owned-id").expect("known state");
+            assert_eq!(fixed_status, status);
+            assert_eq!(receipt, serde_json::json!({"status": status}));
+        }
+        for remote in [
+            serde_json::json!({}),
+            serde_json::json!({"status":"injected\\nsecret"}),
+            serde_json::json!({"status":null}),
+            serde_json::json!({"status": "sensitive-controller-token"}),
+        ] {
+            assert_eq!(
+                sanitized_cancellation_receipt(&remote, "owned-id").unwrap_err(),
+                "Peer returned an invalid cancellation status"
+            );
+        }
+    }
 
     #[test]
     fn grants_parse_from_what_an_operator_would_type() {
