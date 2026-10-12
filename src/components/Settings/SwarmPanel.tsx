@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
 import { prepareResidentSwarm } from '../../lib/residentSwarmBridge';
+import {parseValidatedMlxFusionReceipt,verifyFusedModelConfig} from '../../lib/swarmMlxFusionImport';
+import {useModelStore} from '../../store/modelStore';
 import { parseCommandHooksManifest } from '../../lib/commandHookManifest';
 import { useUserHooksStore } from '../../store/userHooksStore';
 import { daemonSwarmCancel, daemonSwarmStatus, daemonSwarmSubmit, type ResidentSwarmGraphStatus } from '../../lib/daemonClient';
@@ -62,6 +64,7 @@ export function SwarmPanel() {
   const [tokenBudget, setTokenBudget] = useState('200000');
   const [estimatedUsdPerMillion, setEstimatedUsdPerMillion] = useState('');
   const [learningRevision, setLearningRevision] = useState(0);
+  const [fusionImportBusy,setFusionImportBusy]=useState(false);
   const [scope, setScope] = useState('');
   const [consensusPolicy, setConsensusPolicy] = useState<SwarmVotePolicy|'none'>('none');
   const [notebook, setNotebook] = useState(false);
@@ -189,6 +192,30 @@ export function SwarmPanel() {
     catch (cause) { setError('Resident service unavailable: ' + String(cause)); }
   }
   useEffect(() => { void refreshResident(); }, []);
+  async function importValidatedMlxFusion() {
+    setError('');setNotice('');
+    const selected=await open({multiple:false,filters:[
+      {name:'Evaluated MLX training receipt',extensions:['json']},
+    ]});
+    if(typeof selected!=='string')return;
+    setFusionImportBusy(true);
+    try{
+      const raw:unknown=JSON.parse(await readTextFile(selected));
+      const receipt=parseValidatedMlxFusionReceipt(raw);
+      const text=await readTextFile(receipt.fusedModelPath.replace(/[\\/]$/,'')+'/config.json');
+      await verifyFusedModelConfig(text,receipt.fusedConfigSha256);
+      if(!window.confirm('Import this locally trained MLX model directory WITHOUT activating it?\n'+
+        receipt.fusedModelPath+'\n\n'+
+        'Measured fused held-out perplexity: '+receipt.fusedTestPerplexity+
+        '. The receipt and hash are local evidence, NOT a trusted signature. '+
+        'Review the folder source and tests, then select/test the model manually after import.'))return;
+      const models=await useModelStore.getState().addExternalFolder(receipt.fusedModelPath);
+      if(!models.some(model=>model.runtime==='mlx'))
+        throw Error('Native model importer did not register an MLX-compatible model.');
+      setNotice('Fused MLX model registered with the native model catalog. Active model NOT changed. Select it in Models to verify real inference and rollback if needed.');
+    }catch(cause){setError('Fused model not imported: '+String(cause));}
+    finally{setFusionImportBusy(false);}
+  }
   async function submitResident() {
     setError(''); setNotice('');
     const selected = await open({ multiple: false, filters: [{ name: 'Swarm JSON graph', extensions: ['json'] }] });
@@ -709,6 +736,13 @@ export function SwarmPanel() {
       </div>
       <div className="rounded-lg border border-border bg-surface p-3">
         <h4 className="text-sm font-semibold text-foreground">Learning cycle · retrieve / judge / distill / consolidate</h4>
+        <div className="mt-2 rounded-md border border-border p-2">
+          <p className="text-xs font-medium text-foreground">Local MLX LoRA / QLoRA model import</p>
+          <p className="mt-1 text-xs text-muted">After locally training, evaluating, and fusing a new adapter using the documented Apple Silicon runner, select its training-receipt.json. The configuration hash and held-out/regression quality gates are checked before native model registration. Registration does not switch or execute the model.</p>
+          <Button size="sm" className="mt-2" disabled={fusionImportBusy} onClick={()=>void importValidatedMlxFusion()}>
+            {fusionImportBusy?'Checking fused model…':'Review and import evaluated MLX fusion…'}
+          </Button>
+        </div>
         <p className="mt-1 text-xs text-muted">Only real benchmark outcomes with repeated independently graded source fixtures can stage a learning candidate. A candidate is not reusable until manually approved. Approved guidance enters future LOCAL read-only swarms only if you select historical learning. Nothing self-modifies model weights or bypasses permissions.</p>
         <div className="mt-2 flex flex-wrap gap-2">
           <Button size="sm" disabled={!selectedSpecialistQuality}

@@ -337,3 +337,22 @@ permissions and unconfirmed failure block migration. The receiving machine's
 own recipe, tool and workspace policy remain authoritative. This does not
 migrate processes, perform distributed leader election, or provide a
 quorum-consensus protocol; physical two-device validation is still required.
+
+
+### Safe fused-model promotion into the native model catalog
+
+The Swarms panel now offers **Review and import evaluated MLX fusion**.
+After the Apple Silicon runner trains/fuses a new model, select its local
+`training-receipt.json`. The frontend requires the exact
+`validated_fused_model_requires_manual_runtime_import` terminal state,
+non-traversing absolute fused-model path, finite held-out and prior-task
+regression scores, and a matching SHA-256 of the **actual local
+fused-model/config.json** bytes. It then asks for an additional operator
+confirmation before invoking the existing Rust `models_add_external_folder`
+import route, which retains its independent native format/path checks.
+No provider credentials are involved. Neither import nor training starts
+or changes the active model. The operator must manually select the new
+model and run real inference/quality regression checks; reverting to the
+previous model remains possible because training never overwrites the
+original weights. Training receipts are **not signed provenance**, so do
+not import untrusted directories just because a JSON file says they passed.
