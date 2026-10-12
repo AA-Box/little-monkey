@@ -41,7 +41,7 @@ export function buildSwarmTrajectoryContext(
   const failed=sample.reduce((n,r)=>n+r.failed,0);
   const cancelled=sample.reduce((n,r)=>n+r.cancelled,0);
   const reused=sample.reduce((n,r)=>n+r.reused,0);
-  return '\\n\\n## Local workflow trajectory observations — NOT correctness evidence\\n' +
+  return '\n\n## Local workflow trajectory observations — NOT correctness evidence\n' +
     'Same-workspace '+domain+' read-only runs: '+sample.length+
     '; reported successful agents: '+done+'; failed: '+failed+
     '; cancelled: '+cancelled+'; checkpoint reuses: '+reused+

@@ -109,11 +109,15 @@ every third-party plugin.
 
 Settings → Swarms displays actual session-journal outcomes (per-agent
 success, failure, reuse, topology, duration) and installed daemon graphs.
-It includes measured token totals **with coverage counts** so missing
+It includes measured prompt/completion/total tokens **with coverage counts** so missing
 usage does not masquerade as a zero. There is no assumed provider billing:
 `cost` is *unavailable* unless an actual bill/rate is supplied elsewhere.
-An explicitly entered USD-per-million-token value produces an estimated
-projection only; it is not a bill. The four-agent token forecast requires
+An explicitly entered USD-per-million-token value produces both a historical
+**observed-token cost estimate** and a future projection. The estimate
+attributes measured tokens to individual mission rows; it excludes reused
+checkpoints from the new-inference denominator and labels partial measurement
+coverage. It is not a bill or actual per-model invoicing; the session journal
+does not currently retain authoritative provider-billed model/token classes. The four-agent token forecast requires
 three measured agent samples, displays its measurement coverage, and shows
 whether an operator-specified **advisory** token budget is exceeded. This
 forecast does not replace existing runtime/process resource enforcement.
