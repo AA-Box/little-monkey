@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtempSync,mkdirSync,writeFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {trainingPlan,inspectDataset} from './swarm-mlx-lora.mjs';
+import {trainingPlan,inspectDataset,testPpl} from './swarm-mlx-lora.mjs';
 function fixtures(){
  const root=mkdtempSync(join(tmpdir(),'swarm-adapter-contract-'));
  const model=join(root,'model'),data=join(root,'data');
@@ -16,6 +16,14 @@ function fixtures(){
    iters:'20',maxPpl:'15'},lines};
 }
 describe('real MLX adapter quality gate preflight',()=>{
+ it('parses real MLX test loss and perplexity and rejects ambiguous or nonfinite reports',()=>{
+  assert.equal(testPpl('Loading...\nTest loss 1.234, Test ppl 3.435.\n'),3.435);
+  assert.equal(testPpl('Test loss 2.1, Test ppl 8.17.\nTest loss 1.7, Test ppl 5.47.'),5.47);
+  assert.throws(()=>testPpl('No verified evaluation'),/finite positive/);
+  assert.throws(()=>testPpl('Test loss nan, Test ppl 0.000'),/finite positive/);
+  assert.throws(()=>testPpl('Test ppl Infinity'),/finite positive/);
+ });
+
  it('validates independent train/valid/test inputs and an unused output path',()=>{
   const x=fixtures();try{
    const plan=trainingPlan(x.options);
