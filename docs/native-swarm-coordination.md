@@ -303,3 +303,20 @@ it in ordinary MCP Settings. This makes the documented Ruflo MCP tool
 server callable through the existing Little Monkey MCP authorization path
 when configured; it is not Ruflo-native mod or plugin compatibility and
 does not import untrusted arbitrary scripts.
+
+
+#### Optional fusion for the existing Little Monkey MLX runtime
+
+Add `--fuse-for-import --confirm-fusion` to the **real** training command
+after selecting the held-out perplexity ceiling. Only after the new adapter
+passes the held-out and prior-task regression gates does the runner invoke
+`python -m mlx_lm fuse --model BASE --adapter-path ADAPTER --save-path OUTPUT/fused-model`
+to create a separate model directory. Fusion success requires an actual
+`config.json` and `.safetensors` files; the receipt records its configuration
+hash. It never overwrites the original base, installs the fused result or
+changes the currently running model. To activate, explicitly import the
+fused-model directory using Little Monkey's existing local MLX model import
+and independently test representative model responses. A fused model can
+behave differently from the unmerged adapter: an adapter's successful test
+does **not** certify the fused result's accuracy without an additional live
+runtime acceptance check.
