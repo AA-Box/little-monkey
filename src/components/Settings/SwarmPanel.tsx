@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
+import { invoke } from '@tauri-apps/api/core';
 import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
 import { prepareResidentSwarm } from '../../lib/residentSwarmBridge';
 import {parseValidatedMlxFusionReceipt,verifyFusedModelConfig} from '../../lib/swarmMlxFusionImport';
@@ -212,6 +213,11 @@ export function SwarmPanel() {
         throw Error('Selected MLX model folder does not match the evaluated receipt.');
       const text=await readTextFile(selectedFolder.replace(/[\\/]$/,'')+'/config.json');
       await verifyFusedModelConfig(text,receipt.fusedConfigSha256);
+      if(!window.confirm('Verify all '+receipt.fusedWeights.length+
+        ' fused weight shards against their evaluated SHA-256 digests? This may read many gigabytes locally.'))return;
+      const verified=await invoke<boolean>('models_verify_fused_weights',
+        {path:selectedFolder,files:receipt.fusedWeights});
+      if(verified!==true)throw Error('Native fused model weights did not pass verification.');
       if(!window.confirm('Import this locally trained MLX model directory WITHOUT activating it?\n'+
         receipt.fusedModelPath+'\n\n'+
         'Measured fused held-out perplexity: '+receipt.fusedTestPerplexity+

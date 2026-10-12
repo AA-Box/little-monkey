@@ -356,3 +356,17 @@ model and run real inference/quality regression checks; reverting to the
 previous model remains possible because training never overwrites the
 original weights. Training receipts are **not signed provenance**, so do
 not import untrusted directories just because a JSON file says they passed.
+
+
+### Fused safetensors provenance and integrity
+
+The local MLX trainer now SHA-256 hashes **every safetensors shard** before
+and after evaluating fused weights. Its success receipt includes each shard's
+exact filename, byte length and digest. The Swarms import action requires
+operator approval to verify this manifest. Native Rust streams every shard
+on a blocking worker, compares the complete expected and present shard sets,
+rejects symlinks and tampering and then permits the existing model catalog
+import without automatically activating the model. This closes the former
+config-only verification hole. These checks validate bytes, not real-world
+model accuracy or cryptographic author identity; real inference is still an
+explicit deployment gate.

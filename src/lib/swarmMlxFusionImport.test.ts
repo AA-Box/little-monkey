@@ -4,6 +4,7 @@ const hash='e'.repeat(64);
 const valid={version:1,engine:'mlx_lm',
  status:'validated_fused_model_requires_manual_runtime_import',
  fusedModelPath:'/tmp/trained/fused-model',fusedConfigSha256:hash,
+ fusedWeights:[{name:'model.safetensors',sha256:hash,sizeBytes:26}],
  testPerplexity:4,fusedTestPerplexity:4.1,maxTestPpl:5,
  regression:{previousPpl:6,newPpl:6.1,maxFraction:0.05},
  fusedRegressionPpl:6.2};
@@ -16,6 +17,9 @@ describe('operator-approved MLX fused model promotion gate',()=>{
    {...valid,fusedModelPath:'../outside'},
    {...valid,fusedModelPath:'/tmp/../secrets'},
    {...valid,fusedConfigSha256:'not-a-hash'},
+   {...valid,fusedWeights:[]},
+   {...valid,fusedWeights:[{name:'../escape.safetensors',sha256:hash,sizeBytes:26}]},
+   {...valid,fusedWeights:[valid.fusedWeights[0],valid.fusedWeights[0]]},
    {...valid,fusedTestPerplexity:5.8},
    {...valid,testPerplexity:3.7},
    {...valid,regression:{...valid.regression,maxFraction:0.1,newPpl:9}},
