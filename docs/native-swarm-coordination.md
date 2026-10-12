@@ -243,3 +243,48 @@ only verifies the receipt derivation and is **not** real acceptance. Do not use
 the ordinary no-replay restart harness for graphs with fallbacks: these graphs
 intentionally replace a failed primary receipt with one separately authorized
 fallback receipt. Keep live operator evidence separately.
+
+
+### Operator-run MLX LoRA/QLoRA adapter training (Apple Silicon)
+
+A first-party local-only adapter-training script is available at
+`scripts/swarm-mlx-lora.mjs`. It invokes the real installed
+`python3 -m mlx_lm lora` training and held-out test runners, rather
+than producing synthetic weights. It requires a pre-downloaded local MLX base
+model and separately curated `train.jsonl`, `valid.jsonl` and
+`test.jsonl` with disjoint records. It refuses to overwrite old adapters,
+generates new safetensors weights/configuration, records file digests and
+held-out perplexity, and requires an operator-specified acceptance ceiling.
+Existing adapters can be used for continued training using MLX resume weights,
+but only if a distinct **historical regression** test set is supplied. Both
+old and new adapters are evaluated on that set; new weights fail if their test
+perplexity worsens beyond the explicit percentage threshold (5% default).
+This is a real measurable **regression-gated consolidation**, not EWC++.
+It never promotes a new adapter without explicit runtime configuration, nor
+claims source correctness solely from perplexity. Training logs may contain
+private dataset/model details; they remain mode-0600 local files.
+
+```bash
+node scripts/swarm-mlx-lora.mjs \
+  --model /absolute/local/mlx-base-model \
+  --data /absolute/private/split-dataset \
+  --output /absolute/private/new-adapter-run \
+  --iters 200 --max-test-ppl 6.0 --validate-only
+
+node scripts/swarm-mlx-lora.mjs \
+  --model /absolute/local/mlx-base-model \
+  --data /absolute/private/split-dataset \
+  --output /absolute/private/new-adapter-run \
+  --iters 200 --max-test-ppl 6.0 --confirm-local-training
+```
+
+For consecutive training, additionally pass
+`--previous-adapter /absolute/approved/adapter` and
+`--regression-data /absolute/independent/old-evaluation-data`.
+The script requires macOS/ARM64 for actual execution and
+`pip install 'mlx-lm[train]'` in the selected Python. The output is
+`adapter/adapters.safetensors`, `adapter/adapter_config.json` and a
+local receipt; **the active model is not silently switched**. Hardware/model
+acceptance has not been executed by ordinary CI; CI only runs input/command
+contract tests. Real adapter loading and quality should be independently
+verified in the chosen runtime before an operator promotes it.

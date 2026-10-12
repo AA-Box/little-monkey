@@ -66,6 +66,8 @@ jobs:
         run: |
           node --check scripts/swarm-resident-restart-live-acceptance.mjs
           node --check scripts/swarm-resident-fallback-live-acceptance.mjs
+          node --check scripts/swarm-mlx-lora.mjs
+          node --test scripts/swarm-mlx-lora.contract.test.mjs
           node scripts/swarm-resident-fallback-live-acceptance.mjs --self-check
           node --check scripts/swarm-repository-repair-live-acceptance.mjs
           node --test scripts/swarm-resident-restart-acceptance.contract.test.mjs
