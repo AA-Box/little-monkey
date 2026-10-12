@@ -62,8 +62,8 @@ function testPpl(output){
  if(!Number.isFinite(n)||n<=0)throw Error('MLX test did not report a finite positive held-out perplexity');
  return n;
 }
-function mlx(python,args,dir,log){
- const result=spawnSync(python,['-m','mlx_lm','lora',...args],{
+function mlxCommand(python,command,args,dir,log){
+ const result=spawnSync(python,['-m','mlx_lm',command,...args],{
   cwd:dir,encoding:'utf8',timeout:2*60*60*1000,maxBuffer:12*1024*1024,
   env:{...process.env,PYTHONUNBUFFERED:'1'},
  });
@@ -72,6 +72,7 @@ function mlx(python,args,dir,log){
  if(result.error||result.status!==0)throw Error('MLX command failed; inspect protected log '+log);
  return output;
 }
+const mlx=(python,args,dir,log)=>mlxCommand(python,'lora',args,dir,log);
 function manifest(output,value){
  writeFileSync(join(output,'training-receipt.json'),JSON.stringify(value,null,2)+'\n',
    {mode:0o600,flag:'wx'});
@@ -157,7 +158,23 @@ async function main(){
      throw Error('Historical regression holdout worsened beyond explicit gate');
   }
   result.status='validated_requires_manual_activation';
-  console.log(JSON.stringify({status:result.status,adapter,receipt:join(plan.output,'training-receipt.json'),
+  if(process.argv.includes('--fuse-for-import')){
+   if(!process.argv.includes('--confirm-fusion'))
+    throw Error('Creating a new fused local model requires explicit --confirm-fusion');
+   const fused=join(plan.output,'fused-model');
+   mlxCommand(python,'fuse',['--model',plan.model,'--adapter-path',adapter,
+     '--save-path',fused],plan.output,join(plan.output,'fuse.private.log'));
+   if(!existsSync(fused)||!lstatSync(fused).isDirectory()||
+      !existsSync(join(fused,'config.json'))||
+      !readdirSync(fused).some(file=>file.endsWith('.safetensors')))
+     throw Error('MLX fusion did not produce a complete local config/safetensors model');
+   result.fusedModelPath=fused;
+   result.fusedConfigSha256=digest(readFileSync(join(fused,'config.json')));
+   result.status='validated_fused_model_requires_manual_runtime_import';
+  }
+  console.log(JSON.stringify({status:result.status,adapter,
+    fusedModelPath:result.fusedModelPath??null,
+    receipt:join(plan.output,'training-receipt.json'),
     heldOutPpl:ppl,regression:result.regression??null}));
  }catch(error){
   result.failure=String(error);
