@@ -118,7 +118,7 @@ export function assertWorkflowBounds(spec: WorkflowSpec): void {
       if (agent.peerFailover !== undefined && typeof agent.peerFailover !== 'boolean')
         throw new Error('Peer failover flag must be a boolean.');
       if (agent.peerFailover && (agent.profile !== 'explore' || !agent.peer ||
-         agent.isolation || !agent.peerCandidates ||
+         agent.isolation || !Array.isArray(agent.peerCandidates) ||
          agent.peerCandidates.length < 2 || agent.peerCandidates.length > 3 ||
          new Set(agent.peerCandidates).size !== agent.peerCandidates.length)) {
         throw new Error('Peer failover requires 2–3 distinct explicitly approved read-only peer candidates.');
