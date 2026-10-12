@@ -55,7 +55,7 @@ describe('objective fixture-gated specialist selection',()=>{
     expect(()=>parseVerifiedSpecialistBenchmark({...original,results:original.results.slice(1)})).toThrow(/Every specialist|Incomplete|Missing|coverage/);
     const duplicate=report();
     duplicate.results[1].runId=duplicate.results[0].runId;
-    expect(()=>parseVerifiedSpecialistBenchmark(duplicate)).toThrow(/unique/);
+    expect(()=>parseVerifiedSpecialistBenchmark(duplicate)).toThrow(/Duplicate actual model run ID/);
     const spoof=report();
     spoof.results[0].verified='true' as unknown as boolean;
     expect(()=>parseVerifiedSpecialistBenchmark(spoof)).toThrow(/independent verdict/);
@@ -67,6 +67,6 @@ describe('objective fixture-gated specialist selection',()=>{
     const spoof=report();spoof.results[0].runId='fake';
     expect(()=>parseVerifiedSpecialistBenchmark(spoof)).toThrow(/run/);
     const unknown=report();unknown.results[0].specialist='unreviewed special agent';
-    expect(()=>parseVerifiedSpecialistBenchmark(unknown)).toThrow(/unique actual model/);
+    expect(()=>parseVerifiedSpecialistBenchmark(unknown)).toThrow(/valid run receipt|independent checked verdict/);
   });
 });
