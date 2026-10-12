@@ -23,6 +23,14 @@ function model(name: string, cloud = false): OllamaModelInfo {
 }
 const context = {taskClass:'subagent_explore' as const,requiresVision:false,requiresTools:true};
 beforeEach(() => {
+  // Vitest runs these state-machine tests in Node, not necessarily jsdom.
+  // Use an isolated deterministic storage implementation per test.
+  const memory = new Map<string, string>();
+  vi.stubGlobal('localStorage', {
+    getItem: (key: string) => memory.get(key) ?? null,
+    setItem: (key: string, value: string) => { memory.set(key, value); },
+    removeItem: (key: string) => { memory.delete(key); },
+  });
   localStorage.removeItem(SWARM_BENCHMARK_KEY);
   localStorage.removeItem(SWARM_BENCHMARK_OPT_IN);
   useRoutingPolicyStore.setState({policies:[{...policy}],lastDecision:null});
