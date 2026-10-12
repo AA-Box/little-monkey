@@ -2698,7 +2698,7 @@ mod tests {
         ).await;
         let parsed: serde_json::Value = serde_json::from_str(&content).expect("JSON denial");
         assert!(parsed["error"].as_str().unwrap().contains("not enabled"),
-            "must not run a workflow without the opt-in, got {content}");
+            "workflow delegation bypassed the subagent opt-in guard");
         assert_eq!(usage.model_calls, 0, "no child model must have been called");
         assert_eq!(usage.tool_calls, 0, "no child tool must have been called");
     }
