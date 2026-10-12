@@ -39,6 +39,45 @@ Changes and tests remain subject to Little Monkey's standard permissions.
 A workflow tool call can also select the fixed `security-red-team` and
 `security-audit-and-fix` presets described in [Security swarms](security-swarms.md).
 
+## Native workflows in headless and daemon-owned model turns
+
+The native `monkey` CLI now offers the **same explicit phase-based
+workflow operation** to model turns when subagent delegation is enabled.
+It uses the existing frozen task target, workspace permissions and checkpoint,
+and delegates to the CLI's depth-one `explore` / `code` subagent runtime;
+it does not load the desktop's in-memory session or invent credentials.
+
+A model may invoke the `workflow` tool with:
+
+```json
+{
+  "name": "api-review",
+  "phases": [
+    { "title": "Read-only review", "agents": [
+      { "description": "Authorization", "prompt": "Review ownership checks", "profile": "explore" },
+      { "description": "Error handling", "prompt": "Review retries and timeouts", "profile": "explore" }
+    ]},
+    { "title": "Evidence summary", "agents": [
+      { "description": "Independent reviewer", "prompt": "Verify and summarize", "profile": "explore" }
+    ]}
+  ]
+}
+```
+
+This is enabled only if the originating model turn was configured with
+subagent delegation; a model-provided workflow call is rejected at dispatch
+when that opt-in is absent. Its schema permits 1–6 phases, 1–6 agents per
+phase and 16 agents total, with restricted profiles and bounded prompts.
+CLI phases currently execute **sequentially**, stop on the first failed
+agent, and never create remote peers or worktrees. Agents do not receive
+recursive agent tools, network, MCP or memory permissions.
+
+To keep an entire task graph resident across app restarts, use the installed
+daemon's **frozen recipe DAG** from the Swarms settings screen or
+`monkey daemon swarm-submit`. The daemon owns task-level state and restart
+recovery; a single model-called CLI workflow does **not** promise atomic
+replay of arbitrary mutating steps or per-agent restart durability.
+
 ## Dependency-aware task graphs
 
 The workflow tool also accepts an explicit DAG of tasks. The graph compiler
