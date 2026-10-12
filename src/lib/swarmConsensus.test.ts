@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseSwarmReviewerReport, reconcileSwarmReviewers } from './swarmConsensus';
+import { parseSwarmReviewerReport, reconcileSwarmReviewers,requiredSwarmVotes,parseSwarmVotePolicy } from './swarmConsensus';
 
 const vote = (id: string, verdict: 'support' | 'reject' | 'unknown', evidence: string[] = ['src/auth.ts:40']) =>
   JSON.stringify({ claims: [{ id, verdict, evidence }] });
@@ -31,6 +31,20 @@ describe('strict swarm reviewer reconciliation', () => {
       { id: 'dup', verdict: 'support', evidence: [] },
       { id: 'dup', verdict: 'reject', evidence: [] },
     ] }))).toBeNull();
+  });
+  it('enforces distinguishable majority, supermajority and unanimous policies for five reviewers',()=>{
+    const reviewers=Array.from({length:5},(_,i)=>({reviewer:'R'+i,report:vote('claim','support')}));
+    expect([requiredSwarmVotes('strict',5),requiredSwarmVotes('majority',5),
+      requiredSwarmVotes('supermajority',5),requiredSwarmVotes('unanimous',5)]).toEqual([2,3,4,5]);
+    expect(reconcileSwarmReviewers(reviewers.slice(0,3),'majority',5).status).toBe('reviewer_agreement');
+    expect(reconcileSwarmReviewers(reviewers.slice(0,3),'supermajority',5).status).toBe('inconclusive');
+    expect(reconcileSwarmReviewers(reviewers.slice(0,4),'supermajority',5).status).toBe('reviewer_agreement');
+    expect(reconcileSwarmReviewers(reviewers.slice(0,4),'unanimous',5).status).toBe('inconclusive');
+    expect(reconcileSwarmReviewers(reviewers,'unanimous',5).status).toBe('reviewer_agreement');
+    const disputed=[...reviewers.slice(0,4),{reviewer:'R4',report:vote('claim','reject')}];
+    expect(reconcileSwarmReviewers(disputed,'majority',5).status).toBe('disputed');
+    expect(()=>parseSwarmVotePolicy('unsafe')).toThrow(/Unknown/);
+    expect(()=>requiredSwarmVotes('majority',7)).toThrow(/2–6/);
   });
   it('never mistakes malformed or executable model content for reviewer evidence', () => {
     expect(parseSwarmReviewerReport('A', ' ```json\n' + vote('claim-one', 'unknown') + '\n``` ')).not.toBeNull();

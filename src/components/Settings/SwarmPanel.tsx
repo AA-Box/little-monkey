@@ -9,6 +9,7 @@ import { Activity, CheckCircle2, Copy, RefreshCw, ShieldCheck } from 'lucide-rea
 import { useShallow } from 'zustand/react/shallow';
 import { buildGoalSwarm } from '../../lib/swarmPlanning';
 import { SWARM_TOPOLOGIES, type SwarmTopology } from '../../lib/swarmCoordination';
+import { SWARM_VOTE_POLICIES,type SwarmVotePolicy } from '../../lib/swarmConsensus';
 import { swarmMissionOverview, projectSwarmBudget, estimateSwarmMissionSpend } from '../../lib/swarmMissionDashboard';
 import {
   distillLearningCandidate, listLearningPatterns, decideLearningCandidate,
@@ -58,7 +59,7 @@ export function SwarmPanel() {
   const [estimatedUsdPerMillion, setEstimatedUsdPerMillion] = useState('');
   const [learningRevision, setLearningRevision] = useState(0);
   const [scope, setScope] = useState('');
-  const [strictConsensus, setStrictConsensus] = useState(false);
+  const [consensusPolicy, setConsensusPolicy] = useState<SwarmVotePolicy|'none'>('none');
   const [notebook, setNotebook] = useState(false);
   const [notebookRefresh, setNotebookRefresh] = useState(0);
   const [learningBusy, setLearningBusy] = useState<string | null>(null);
@@ -246,7 +247,7 @@ export function SwarmPanel() {
       if (mode === 'analyze' && topology !== 'phased') args.topology = topology;
       if (mode === 'analyze' && learningHints) args.learning = true;
       if (scope.trim()) args.scope = scope.trim();
-      if (mode === 'analyze' && strictConsensus) args.consensus = 'strict';
+      if (mode === 'analyze' && consensusPolicy!=='none') args.consensus = consensusPolicy;
       if (notebook) args.notebook = true;
       if (mode === 'analyze' && peerPool.length) args.auto_peer_pool = peerPool;
       const spec = buildGoalSwarm(args);
@@ -254,7 +255,7 @@ export function SwarmPanel() {
     } catch (cause) {
       return { args: null, spec: null, problem: String(cause).replace(/^Error: /, '') };
     }
-  }, [goal, mode, topology, learningHints, scope, peerPool, strictConsensus, notebook]);
+  }, [goal, mode, topology, learningHints, scope, peerPool, consensusPolicy, notebook]);
 
   const restored = sessions.flatMap(session => Object.entries(session.workflowRunMeta ?? {}).map(([id, run]) => ({
     id, name: run.name, status: run.status, startedAt: run.startedAt,
@@ -539,10 +540,14 @@ export function SwarmPanel() {
           <input type="checkbox" checked={notebook} onChange={event => setNotebook(event.target.checked)} />
           Use approved versioned project notebook claims (local-only; no remote peer forwarding)
         </label>
-        {mode === 'analyze' && <label className="mt-3 flex gap-2 text-xs text-foreground">
-          <input type="checkbox" checked={strictConsensus} onChange={event => setStrictConsensus(event.target.checked)} />
-          Require independent structured reviewer votes; disagreements remain explicitly disputed
-        </label>}
+        {mode === 'analyze' && <label className="mt-3 block text-xs text-foreground">
+          Independent source-claim vote policy (non-authoritative; dissent always disputed)
+          <select aria-label="Swarm review vote policy" className="ml-2 rounded border border-border bg-background p-1"
+            value={consensusPolicy} onChange={e=>setConsensusPolicy(e.target.value as SwarmVotePolicy|'none')}>
+            <option value="none">No structured votes</option>
+            {SWARM_VOTE_POLICIES.map(value=><option key={value} value={value}>{value}</option>)}
+          </select>
+        </label>
         {mode === 'analyze' && <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-foreground">
           <label className="flex items-center gap-2">Team topology
             <select aria-label="Swarm team topology" value={topology}

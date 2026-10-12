@@ -9,6 +9,7 @@ import type { WorkflowAgentSpec, WorkflowSpec } from './workflow';
 import { validSwarmPeer } from './swarmPeerSchema';
 import { chooseSupplementalSpecialist } from './swarmSpecialistMetrics';
 import { parseSwarmTopology } from './swarmCoordination';
+import { parseSwarmVotePolicy } from './swarmConsensus';
 
 export type SwarmMode = 'analyze' | 'implement';
 export const MAX_SWARM_GOAL_CHARS = 1200;
@@ -131,14 +132,14 @@ export function buildGoalSwarm(args: Record<string, unknown>): WorkflowSpec {
   const scope = args.scope === undefined ? 'the selected workspace' : boundedText(args.scope, 'scope', MAX_SWARM_SCOPE_CHARS);
   if (args.mode !== undefined && args.mode !== 'analyze' && args.mode !== 'implement') throw new Error('mode must be analyze or implement.');
   const mode: SwarmMode = args.mode === 'implement' ? 'implement' : 'analyze';
-  if (args.consensus !== undefined && args.consensus !== 'strict') throw new Error('consensus must be strict when supplied.');
-  const strictConsensus = args.consensus === 'strict';
+  const consensus = parseSwarmVotePolicy(args.consensus);
+  const strictConsensus = Boolean(consensus);
   if (args.notebook !== undefined && args.notebook !== true) throw new Error('notebook must be true when supplied.');
   const notebook = args.notebook === true;
   if (args.learning !== undefined && args.learning !== true) throw new Error('learning must be true when supplied.');
   const learning = args.learning === true;
   if (learning && mode !== 'analyze') throw new Error('Approved learning retrieval requires read-only analysis.');
-  if (strictConsensus && mode !== 'analyze') throw new Error('Strict reviewer consensus requires read-only analysis mode.');
+  if (strictConsensus && mode !== 'analyze') throw new Error('Independent reviewer consensus requires read-only analysis mode.');
   const topology = parseSwarmTopology(args.topology);
   if (topology !== 'phased' && mode !== 'analyze') throw new Error('Team topologies are read-only analysis only.');
   const domain = selectSwarmDomain(goal);
@@ -168,9 +169,9 @@ export function buildGoalSwarm(args: Record<string, unknown>): WorkflowSpec {
   };
   if (mode === 'analyze') {
     return {
-      name: goalSwarmName(goal, mode, scope, [...peerAliases, ...automaticPeerPool, ...(topology !== 'phased' ? [topology] : []), ...(strictConsensus ? ['strict'] : []), ...(notebook ? ['notebook'] : []), ...(learning ? ['learning'] : [])].join(',')),
+      name: goalSwarmName(goal, mode, scope, [...peerAliases, ...automaticPeerPool, ...(topology !== 'phased' ? [topology] : []), ...(consensus ? [consensus] : []), ...(notebook ? ['notebook'] : []), ...(learning ? ['learning'] : [])].join(',')),
       ...common,
-      ...(strictConsensus ? { consensus: 'strict' as const } : {}),
+      ...(consensus ? { consensus } : {}),
       phases: [
         { title: 'Specialist discovery', agents: discovery },
         {
@@ -179,6 +180,10 @@ export function buildGoalSwarm(args: Record<string, unknown>): WorkflowSpec {
             ...(strictConsensus ? [
               agent('Independent evidence reviewer A', goal, scope, 'Review claims from the prior phase. Return ONLY a JSON object {"claims":[{"id":"stable-claim-key","verdict":"support|reject|unknown","evidence":["repo-relative:path:line"]}]}. Use the same stable claim ids from prior evidence. Reject unsupported claims. No Markdown.'),
               agent('Independent evidence reviewer B', goal, scope, 'Independently inspect prior claims and current source. Return ONLY {"claims":[{"id":"stable-claim-key","verdict":"support|reject|unknown","evidence":["repo-relative:path:line"]}]}. Do not assume reviewer A is correct. Cite actual source evidence. No Markdown.'),
+              ...(consensus !== 'strict' ? ['C','D','E'].map(label=>
+                agent('Independent evidence reviewer '+label,goal,scope,
+                  'Inspect source independently. Return ONLY {"claims":[{"id":"stable-claim-key","verdict":"support|reject|unknown","evidence":["repo-relative:path:line"]}]}. Explicitly cite source; do not rely on other reviewers. No Markdown.'),
+              ) : []),
             ] : [
               agent('Independent claim validator', goal, scope, 'Independently challenge the prior reports; discard unsupported claims and identify contradictory evidence.'),
               agent('Solution options reviewer', goal, scope, 'Evaluate possible approaches, risks, dependencies and measurable acceptance criteria.'),

@@ -740,8 +740,8 @@ export const WORKFLOW_TOOL: ToolDef = {
         },
         consensus: {
           type: 'string',
-          enum: ['strict'],
-          description: 'Optional read-only agreement/dispute protocol: independent reviewers return structured claim votes, reconciled into supported-by-reviewers, disputed, and insufficient-evidence outcomes. Never counts as factual or test verification.',
+          enum: ['strict','majority','supermajority','unanimous'],
+          description: 'Optional source-citing reviewer vote policy: strict two votes, majority (>1/2), supermajority (>=2/3), or unanimous. Non-strict goal swarms use five independent reviewers. Any explicit dissent remains disputed. Not Raft/BFT or factual verification.',
         },
         stop_on_failure: {
           type: 'boolean',

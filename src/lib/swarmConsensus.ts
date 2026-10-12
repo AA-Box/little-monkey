@@ -9,6 +9,21 @@
 import { unwrapUntrustedContent } from './untrustedContent';
 
 export type ClaimVote = 'support' | 'reject' | 'unknown';
+/** Non-authoritative, local read-only claim-voting policies. */
+export const SWARM_VOTE_POLICIES=['strict','majority','supermajority','unanimous'] as const;
+export type SwarmVotePolicy=typeof SWARM_VOTE_POLICIES[number];
+export function parseSwarmVotePolicy(input:unknown):SwarmVotePolicy|undefined{
+ if(input===undefined)return undefined;
+ if(typeof input!=='string'||!SWARM_VOTE_POLICIES.some(x=>x===input))
+   throw new Error('Unknown read-only swarm reviewer voting policy.');
+ return input as SwarmVotePolicy;
+}
+export function requiredSwarmVotes(policy:SwarmVotePolicy,planned:number):number{
+ if(!Number.isInteger(planned)||planned<2||planned>6)
+   throw new Error('Reviewer voting requires 2–6 planned agents.');
+ return policy==='strict'?2:policy==='majority'?Math.floor(planned/2)+1
+   :policy==='supermajority'?Math.ceil(2*planned/3):planned;
+}
 export interface SwarmClaimVote {
   id: string;
   verdict: ClaimVote;
@@ -66,7 +81,13 @@ export function parseSwarmReviewerReport(reviewer: string, raw: string): SwarmRe
  * A statement in a model report is never elevated to verified truth. */
 export function reconcileSwarmReviewers(
   reports: readonly { reviewer: string; report: string }[],
+  policy:SwarmVotePolicy='strict',
+  expectedReviewers:number=Math.max(2,reports.length),
 ): SwarmConsensusResult {
+  if(reports.length>6||expectedReviewers<2||expectedReviewers>6||
+     !Number.isInteger(expectedReviewers)||reports.length>expectedReviewers)
+    throw new Error('Invalid bounded reviewer voting population.');
+  const required=requiredSwarmVotes(policy,expectedReviewers);
   const parsed = reports.flatMap(item => {
     const report = parseSwarmReviewerReport(item.reviewer, item.report);
     return report ? [report] : [];
@@ -87,7 +108,7 @@ export function reconcileSwarmReviewers(
     id,
     status: entry.reject.size && entry.support.size
       ? 'disputed'
-      : entry.support.size >= 2 && entry.reject.size === 0 && entry.evidence.size > 0
+      : entry.support.size >= required && entry.reject.size === 0 && entry.evidence.size > 0
         ? 'reviewer_agreement' : 'insufficient_evidence',
     supportingReviewers: [...entry.support],
     rejectingReviewers: [...entry.reject],

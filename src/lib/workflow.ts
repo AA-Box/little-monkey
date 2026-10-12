@@ -34,7 +34,7 @@ import { parseSwarmTopology, planCoordinationWaves, nextAdaptiveCoordinationWave
 import { retrieveSwarmKnowledge } from './swarmKnowledge';
 import { compileSwarmTaskGraph } from './swarmGraph';
 import { assertReadOnlyPeerPlacement } from './swarmPeerSchema';
-import { reconcileSwarmReviewers } from './swarmConsensus';
+import { reconcileSwarmReviewers,parseSwarmVotePolicy,type SwarmVotePolicy } from './swarmConsensus';
 import { approvedSwarmNotebookBlock, stageSwarmNote } from './swarmNotebook';
 import { approvedLearningContext } from './swarmLearningCycle';
 import { buildSwarmTrajectoryContext } from './swarmTrajectoryMemory';
@@ -75,7 +75,7 @@ export interface WorkflowSpec {
   /** Do not run downstream phases after failed prerequisites. */
   stopOnFailure?: boolean;
   /** Optional strict non-authoritative agreement/dispute summary from independent reviewers. */
-  consensus?: 'strict';
+  consensus?: SwarmVotePolicy;
   /** Opt-in, operator-approved versioned notebook reference and staging. */
   notebook?: boolean;
   /** Explicit opt-in to operator-approved, domain-matched past learning. */
@@ -116,7 +116,7 @@ export function assertWorkflowBounds(spec: WorkflowSpec): void {
     }
   }
   if (total > MAX_WORKFLOW_AGENTS) throw new Error('Workflow cannot exceed 16 agents.');
-  if (spec.consensus !== undefined && spec.consensus !== 'strict') throw new Error('Invalid consensus mode.');
+  parseSwarmVotePolicy(spec.consensus);
   const topology = parseSwarmTopology(spec.topology);
   if (topology !== 'phased' && spec.phases.some(phase => phase.agents.some(agent =>
     agent.profile !== 'explore' || agent.peer !== undefined || agent.peerCandidates?.length || agent.isolation))) {
@@ -193,11 +193,11 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
   }
   const topology = parseSwarmTopology(args.topology);
   const memoryStackIds = parseSwarmMemoryStackIds(args.memory_stack_ids);
-  if (args.consensus !== undefined && args.consensus !== 'strict') throw new Error('Unsupported workflow consensus policy.');
+  const consensus = parseSwarmVotePolicy(args.consensus);
   return { name, description, phases,
     ...(topology !== 'phased' ? { topology } : {}),
     ...(args.stop_on_failure === true ? { stopOnFailure: true } : {}),
-    ...(args.consensus === 'strict' ? { consensus: 'strict' as const } : {}),
+    ...(consensus ? { consensus } : {}),
     ...(args.notebook === true ? { notebook: true } : {}),
     ...(args.learning === true ? { learning: true } : {}),
     ...(memoryStackIds.length ? { memoryStackIds } : {}) };
@@ -672,11 +672,12 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
     // — what makes `resolveWorkflowSpec`'s `saved` lookup and the drawer's
     // Saved-workflows list work without the user ever pressing Save.
     if (!anyFailure) useSavedWorkflowStore.getState().upsert(spec, Date.now());
-    const reviewPhase = spec.consensus === 'strict' && phaseSummaries.length >= 2
+    const reviewPhase = spec.consensus && phaseSummaries.length >= 2
       ? phaseSummaries[phaseSummaries.length - 2] : null;
     const consensus = reviewPhase ? reconcileSwarmReviewers(reviewPhase.agents
       .filter(agent => agent.status === 'done')
-      .map(agent => ({ reviewer: agent.description, report: agent.report }))) : undefined;
+      .map(agent => ({ reviewer: agent.description, report: agent.report })),
+      spec.consensus, reviewPhase.agents.length) : undefined;
     const notebookStaged: string[] = [];
     const notebookWarnings: string[] = [];
     if (spec.notebook && consensus && !anyFailure) {

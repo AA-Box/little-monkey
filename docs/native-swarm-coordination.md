@@ -153,3 +153,8 @@ repository changes. Pure logic or local contract tests do not constitute
 that real-device evidence. Adaptive topology is local-only; leader election
 across untrusted machines, elastic mesh membership and gradient-based
 fine-tuning are **not** represented as completed here.
+
+
+### Bounded independent reviewer voting policies
+
+`consensus: strict | majority | supermajority | unanimous` selects a read-only vote threshold for source-citing claims. Strict keeps two independent reviewers. The other policies run five separately tasked reviewers and require respectively three, four or five agreeing votes. Any explicit rejection means **disputed**, even if supporters reach quorum. Missing/malformed votes count against the planned threshold, not for it. The result is non-authoritative reviewer agreement, never a proof of correctness or a Raft/Paxos/BFT distributed protocol. No policy grants writes or overrides ordinary approvals.
