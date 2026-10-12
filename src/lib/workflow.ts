@@ -30,13 +30,14 @@ import { unwrapUntrustedContent, wrapUntrustedContent } from './untrustedContent
 import { buildSwarmPreset } from './swarmPresets';
 import { buildGoalSwarm, parseSwarmMemoryStackIds, selectSwarmDomain } from './swarmPlanning';
 import { recordSpecialistMetric, loadSpecialistMetrics } from './swarmSpecialistMetrics';
-import { parseSwarmTopology, planCoordinationWaves, formatWaveMessages, type SwarmTopology } from './swarmCoordination';
+import { parseSwarmTopology, planCoordinationWaves, nextAdaptiveCoordinationWave, formatWaveMessages, type SwarmTopology } from './swarmCoordination';
 import { retrieveSwarmKnowledge } from './swarmKnowledge';
 import { compileSwarmTaskGraph } from './swarmGraph';
 import { assertReadOnlyPeerPlacement } from './swarmPeerSchema';
 import { reconcileSwarmReviewers } from './swarmConsensus';
 import { approvedSwarmNotebookBlock, stageSwarmNote } from './swarmNotebook';
 import { approvedLearningContext } from './swarmLearningCycle';
+import { buildSwarmTrajectoryContext } from './swarmTrajectoryMemory';
 
 export interface WorkflowAgentSpec {
   description: string;
@@ -519,7 +520,13 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
     const session = useSessionStore.getState().sessions.find(s => s.id === sessionId);
     const notebookProject = session?.workspacePath?.trim() || 'session:' + sessionId;
     const notebookBlock = spec.notebook ? approvedSwarmNotebookBlock(notebookProject) : '';
-    const learningBlock = spec.learning ? approvedLearningContext(selectSwarmDomain(spec.description)) : '';
+    const learningBlock = spec.learning
+      ? approvedLearningContext(selectSwarmDomain(spec.description)) +
+        buildSwarmTrajectoryContext(
+          useSessionStore.getState().sessions, selectSwarmDomain(spec.description),
+          notebookProject, sessionId,
+        )
+      : '';
     const priorReports: PhaseReport[] = [];
     const phaseSummaries: { title: string; agents: { description: string; status: string; report: string; reused?: boolean }[] }[] = [];
 
@@ -543,7 +550,17 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
         }));
       const results: string[] = new Array(phase.agents.length);
       const waveMessages: {sender: string; report: string}[] = [];
-      for (const wave of waves.waves) {
+      // Adaptive read-only teams elect a replacement on a failed report,
+      // or fan out the still-pending agents after one coordinator succeeds.
+      // Never repeat a failed or completed agent.
+      const adaptivePending = waves.topology === 'adaptive' ? waves.waves.flat() : [];
+      let coordinatorReady = false;
+      for (let waveIndex = 0; waveIndex < waves.waves.length; waveIndex++) {
+        const wave = waves.topology === 'adaptive'
+          ? nextAdaptiveCoordinationWave(adaptivePending, coordinatorReady)
+          : waves.waves[waveIndex];
+        if (!wave.length) break;
+        if (waves.topology === 'adaptive') adaptivePending.splice(0, wave.length);
         const completed = await runBounded(
           wave.map(agentIndex => {
             const agent = phase.agents[agentIndex];
@@ -619,6 +636,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
           results[index] = report;
           if (report && unwrapUntrustedContent(report) !== CANCELLED_TOOL_RESULT && !resultIsError(report)) {
             waveMessages.push({sender: phase.agents[index].description, report});
+            if (waves.topology === 'adaptive' && wave.length === 1) coordinatorReady = true;
           }
         });
       }

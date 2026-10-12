@@ -15,9 +15,9 @@ Specify `topology` on a read-only local workflow or analysis goal:
 | `hierarchical` | lead then bounded successive worker tiers | reports from earlier tiers are relayed, never as tool commands |
 | `ring` | single successive agent per wave | each successor receives bounded prior successful reports |
 | `mesh` | independent bounded simultaneous agents | findings are reconciled by existing downstream validation/consensus phases, not repeated file edits |
-| `adaptive` | observed reliable coordinator then sequential fallbacks | model mistakes or unavailable agents do not grant others new permissions; only successful reports are relayed |
+| `adaptive` | highest observed reliability first; failed coordinators replaced sequentially; after the first successful coordinator remaining workers run together | each replacement is a different already-authorized read-only agent, successful coordinator evidence is forwarded without replaying any completed work |
 
-A failed initial read-only coordinator is **not re-executed** automatically.
+A failed initial read-only coordinator is **not re-executed** automatically. Adaptive teams dynamically change from single-coordinator election to parallel worker execution after a successful report, or continue electing replacements after failures.
 Subsequent waves continue without the failed report, which permits an
 eligible worker to synthesize and challenge sources. There is no privileged
 leader token. Prompts relay bounded JSON-quoted **untrusted** reports and

@@ -49,6 +49,21 @@ export function planCoordinationWaves(
     (waves[level]??=[]).push(id);return waves;
   },[])].filter(x=>x.length)};
 }
+/** Select the next read-only wave from agents never previously dispatched.
+ * When no coordinator has returned a successful report, schedule exactly
+ * one replacement leader. Once one succeeds, fan out remaining agents in
+ * bounded parallel. No agent is retried, and writes/peers are forbidden by
+ * the WorkflowSpec validator. */
+export function nextAdaptiveCoordinationWave(
+  remaining: readonly number[], coordinatorReady: boolean,
+): number[] {
+  if (remaining.length > 6 || remaining.some(id => !Number.isInteger(id) || id < 0 || id > 5) ||
+      new Set(remaining).size !== remaining.length) {
+    throw new Error('Adaptive coordination requires distinct bounded local agents.');
+  }
+  if (!remaining.length) return [];
+  return coordinatorReady ? [...remaining] : [remaining[0]];
+}
 /** Enforce pure, bounded, untrusted evidence from earlier waves. */
 export function formatWaveMessages(
   accepted:readonly {sender:string;report:string}[],
