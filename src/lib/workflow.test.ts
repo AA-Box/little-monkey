@@ -8,6 +8,12 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeM
 // these tests pin the ORCHESTRATION contract: validation, deterministic
 // task ids, phase sequencing, prior-report injection, failure/cancellation
 // propagation, and the workflowStore lifecycle.
+const peersListMock=vi.fn();
+vi.mock("./peersClient", () => ({ peersList: (...args: unknown[]) => peersListMock(...args) }));
+const voter=(alias:string,index:number)=>({
+  alias,peer_id:'device-'+index,certificate_sha256:String(index).repeat(64),
+  grants:['task'],presence:'online',
+});
 const runPairedPeerAgentMock = vi.fn();
 const runPairedPeerAgentWithFailoverMock = vi.fn();
 vi.mock("./swarmPeer", () => ({ runPairedPeerAgent: (...args: unknown[]) => runPairedPeerAgentMock(...args) }));
@@ -68,6 +74,7 @@ function spec(overrides?: Partial<WorkflowSpec>): WorkflowSpec {
 
 beforeEach(() => {
   runPairedPeerAgentMock.mockReset().mockResolvedValue("Remote peer report");
+  peersListMock.mockReset().mockResolvedValue({outbound:[voter('node-a',1),voter('node-b',2)]});
   runPairedPeerAgentWithFailoverMock.mockReset().mockResolvedValue("Recovered peer report");
   runSubagentTaskMock.mockReset();
   runSubagentTaskMock.mockResolvedValue("fine report");
@@ -197,6 +204,52 @@ describe("runWorkflow", () => {
     expect(result).toContain("read-only");
     expect(runPairedPeerAgentMock).not.toHaveBeenCalled();
     expect(runSubagentTaskMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects unauthenticated, duplicate and revoked peer voters before dispatch',async()=>{
+    const quorum=spec({consensus:'strict',authenticatedPeerVoting:true,phases:[
+      {title:'Peer reviewers',agents:[
+        {description:'Reviewer A',prompt:'Vote on claim',profile:'explore',peer:'node-a'},
+        {description:'Reviewer B',prompt:'Vote on claim',profile:'explore',peer:'node-b'},
+      ]},
+      {title:'Local verification',agents:[{description:'Verifier',prompt:'Verify sources',profile:'explore'}]},
+    ]});
+    peersListMock.mockResolvedValueOnce({outbound:[voter('node-a',1),
+      {...voter('node-b',2),peer_id:'device-1'}]});
+    const failure=await runWorkflow({...baseParams,spec:quorum});
+    expect(failure).toContain('Reviewer quorum peer not distinct');
+    expect(runPairedPeerAgentMock).not.toHaveBeenCalled();
+    expect(runSubagentTaskMock).not.toHaveBeenCalled();
+  });
+
+  it('binds actual peer reviewer agreement to separate certificate identities',async()=>{
+    const vote=JSON.stringify({claims:[{id:'api/auth',verdict:'support',evidence:['src/auth.ts:21']}]});
+    runPairedPeerAgentMock.mockResolvedValue(vote);
+    const quorum=spec({consensus:'strict',authenticatedPeerVoting:true,phases:[
+      {title:'Peer reviewers',agents:[
+        {description:'Reviewer A',prompt:'Vote on claim',profile:'explore',peer:'node-a'},
+        {description:'Reviewer B',prompt:'Vote on claim',profile:'explore',peer:'node-b'},
+      ]},
+      {title:'Local verification',agents:[{description:'Verifier',prompt:'Verify sources',profile:'explore'}]},
+    ]});
+    const success=await runWorkflow({...baseParams,spec:quorum});
+    expect(success).toContain('reviewer_agreement');
+    expect(success).toContain('paired:'+String(1).repeat(64));
+    expect(success).toContain('paired:'+String(2).repeat(64));
+    expect(peersListMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('invalidates the vote if a peer certificate changes after execution',async()=>{
+    const quorum=spec({consensus:'strict',authenticatedPeerVoting:true,phases:[
+      {title:'Review',agents:[
+        {description:'A',prompt:'Report',profile:'explore',peer:'node-a'},
+        {description:'B',prompt:'Report',profile:'explore',peer:'node-b'}]},
+      {title:'Verify',agents:[{description:'V',prompt:'Verify',profile:'explore'}]},
+    ]});
+    peersListMock.mockResolvedValueOnce({outbound:[voter('node-a',1),voter('node-b',2)]})
+      .mockResolvedValueOnce({outbound:[voter('node-a',1),{...voter('node-b',2),certificate_sha256:'f'.repeat(64)}]});
+    const result=await runWorkflow({...baseParams,spec:quorum});
+    expect(result).toContain('certificate identity changed');
   });
 
   it("routes an explicitly selected explore agent to the paired peer", async () => {
