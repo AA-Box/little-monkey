@@ -88,6 +88,19 @@ describe('goal-driven native agent swarms', () => {
     expect(() => buildGoalSwarm({goal:'Analyze API',learning:true,auto_peer_pool:['peer']})).toThrow(/remote peers/);
   });
 
+  it('allocates five distinct bounded reviewers for non-strict quorum policies',()=>{
+    for(const policy of ['majority','supermajority','unanimous'] as const){
+      const spec=buildGoalSwarm({goal:'Audit security posture',consensus:policy});
+      expect(spec.consensus).toBe(policy);
+      expect(spec.phases[1].agents).toHaveLength(5);
+      expect(new Set(spec.phases[1].agents.map(agent=>agent.description)).size).toBe(5);
+      expect(spec.phases.flatMap(phase=>phase.agents)).toHaveLength(10);
+      expect(spec.phases[1].agents.every(agent=>agent.profile==='explore')).toBe(true);
+    }
+    expect(()=>buildGoalSwarm({goal:'Audit security',consensus:'raft'})).toThrow(/Unknown/);
+    expect(()=>buildGoalSwarm({goal:'Implement feature',mode:'implement',consensus:'majority'})).toThrow(/read-only/);
+  });
+  
   it('adds strict independent reviewers and opt-in notebook with no remote forwarding', () => {
     const spec = buildGoalSwarm({ goal: 'Audit API auth', consensus: 'strict', notebook: true });
     expect(spec.consensus).toBe('strict');
