@@ -23,7 +23,7 @@ import { stringifyToolError, stringifyToolResult, CANCELLED_TOOL_RESULT } from '
 import { MAX_REPORT_CHARS, runSubagentTask, type RunSubagentTaskParams } from './subagent';
 import { useWorkflowStore, type WorkflowPhase } from '../store/workflowStore';
 import { useSubagentStore } from '../store/subagentStore';
-import { useSessionStore, type WorkflowAgentResult } from '../store/sessionStore';
+import { flushSessionPersistence, useSessionStore, type WorkflowAgentResult } from '../store/sessionStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useSavedWorkflowStore, type SavedWorkflow } from '../store/savedWorkflowStore';
 import { unwrapUntrustedContent, wrapUntrustedContent } from './untrustedContent';
@@ -406,7 +406,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
    * `ChatSession.workflowRunMeta` so the drawer keeps rendering it after a
    * restart (the agents' own stats persist via each child's existing
    * `setSubagentRun` call). */
-  const finish = (status: 'done' | 'error' | 'cancelled', result: string): string => {
+  const finish = async (status: 'done' | 'error' | 'cancelled', result: string): Promise<string> => {
     useWorkflowStore.getState().finish(toolCallId, status);
     const live = useWorkflowStore.getState().runs[toolCallId];
     useSessionStore.getState().setWorkflowRun(sessionId, toolCallId, {
@@ -421,6 +421,11 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
       ...(runId ? { sourceRunId: runId } : {}),
       spec,
     });
+    try {
+      await flushSessionPersistence();
+    } catch (err) {
+      return stringifyToolError(new Error('Workflow completion could not be persisted: ' + String(err)));
+    }
     return result;
   };
 
@@ -428,15 +433,16 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
    * Session persistence is file-backed but debounced, so forced power loss
    * during a write may still lose the last update; never replay mutations
    * automatically after a crash. */
-  const checkpoint = (): void => {
+  const checkpoint = async (): Promise<void> => {
     const live = useWorkflowStore.getState().runs[toolCallId];
     useSessionStore.getState().setWorkflowRun(sessionId, toolCallId, {
       name: spec.name, description: spec.description, status: 'running',
       startedAt: live?.startedAt ?? Date.now(), finishedAt: Date.now(),
       phases, agentResults: { ...agentResults }, correlationOrigin, ...(runId ? { sourceRunId: runId } : {}), spec,
     });
+    // Dependents cannot start until the last agent journal has been written.
+    await flushSessionPersistence();
   };
-  checkpoint();
 
   /** Registers a replayed (journal-hit) agent in the live store AND the
    * persisted per-agent transcript, so the drawer's workflow card shows a
@@ -469,6 +475,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
 
   try {
     assertWorkflowBounds(spec);
+    await checkpoint(); // durably register the graph before dispatch
     // Persisted saved workflows can be hand-edited; validate the permission
     // boundary again at dispatch, not only during JSON-tool parsing.
     for (const phase of spec.phases) {
@@ -521,7 +528,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
           if (journaled && journaled.status === 'done' && journaled.promptHash === hash) {
             replayJournaledAgent(agentTaskId, agent, prompt, journaled.report);
             agentResults[agentTaskId] = { promptHash: hash, status: 'done', report: journaled.report, reused: true };
-            checkpoint();
+            await checkpoint();
             return journaled.report;
           }
 
@@ -564,7 +571,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
             status: cancelled ? 'cancelled' : failed ? 'error' : 'done',
             report: raw.slice(0, MAX_REPORT_CHARS),
           };
-          checkpoint();
+          await checkpoint();
           if (phaseIndex === 0 && spec.name.startsWith('auto-swarm-') && !cancelled) {
             recordSpecialistMetric(selectSwarmDomain(spec.description), agent.description, !failed, Date.now() - startedAt);
           }
