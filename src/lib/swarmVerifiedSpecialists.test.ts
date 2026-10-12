@@ -58,7 +58,7 @@ describe('objective fixture-gated specialist selection',()=>{
     expect(()=>parseVerifiedSpecialistBenchmark(duplicate)).toThrow(/Duplicate actual model run ID/);
     const spoof=report();
     spoof.results[0].verified='true' as unknown as boolean;
-    expect(()=>parseVerifiedSpecialistBenchmark(spoof)).toThrow(/independent verdict/);
+    expect(()=>parseVerifiedSpecialistBenchmark(spoof)).toThrow(/independent checked verdict/);
   });
   it('requires only security specialists with actual run IDs and fresh fixtures',()=>{
     const original=report();
