@@ -677,7 +677,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
     const consensus = reviewPhase ? reconcileSwarmReviewers(reviewPhase.agents
       .filter(agent => agent.status === 'done')
       .map(agent => ({ reviewer: agent.description, report: agent.report })),
-      spec.consensus, reviewPhase.agents.length) : undefined;
+      spec.consensus ?? 'strict', reviewPhase.agents.length) : undefined;
     const notebookStaged: string[] = [];
     const notebookWarnings: string[] = [];
     if (spec.notebook && consensus && !anyFailure) {
