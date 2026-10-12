@@ -18,6 +18,7 @@ import { toolsForProfile } from './tools';
 import {
   attemptStream,
   describeUsageTarget,
+  costTargetKey,
   executeToolCall,
   isBlockedInPlanMode,
   isToolCallAllowed,
@@ -575,7 +576,7 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
   activeSubagentControllers.set(taskId, ownController);
   // Dispatch-time decision (not a promise of successful model inference).
   // Keep the persisted hint bounded and local to the existing session record.
-  let routingSnapshot: { targetLabel: string; reason: string; policyName: string | null } | undefined;
+  let routingSnapshot: { targetLabel: string; targetKey: string; reason: string; policyName: string | null } | undefined;
 
   /** Marks this run terminal in both the live store and the persisted
    * session field, then returns `result` unchanged — the single exit point
@@ -714,6 +715,7 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
     const resolvedTarget = routed.target;
     routingSnapshot = {
       targetLabel: describeUsageTarget(resolvedTarget).slice(0,180),
+      targetKey: costTargetKey(resolvedTarget).slice(0,180),
       reason: routed.decision.reason.slice(0,500),
       policyName: routed.decision.policyName?.slice(0,120) ?? null,
     };

@@ -3,11 +3,13 @@
  * No prompts, reports, source text or secrets leave local session records. */
 import type {ChatSession,WorkflowRunMeta} from '../store/sessionStore';
 import type {ResidentSwarmGraphStatus} from './daemonClient';
+import type {LabCostRate} from './compareLab';
+import {calculateUsageCostUsd} from '../store/costControlStore';
 export interface SwarmMissionRow {
  id:string;name:string;status:WorkflowRunMeta['status'];
  startedAt:number;elapsedMs:number;agents:number;done:number;failed:number;cancelled:number;reused:number;
  tokens:number|null;promptTokens:number|null;completionTokens:number|null;measuredAgents:number;domain:string;topology:string;
- routing: {agent:string;targetLabel:string;reason:string;policyName:string|null}[];
+ routing: {agent:string;targetLabel:string;targetKey?:string;reason:string;policyName:string|null}[];
 }
 export interface SwarmMissionOverview {
  runs:number;successful:number;failed:number;cancelled:number;running:number;
@@ -152,4 +154,57 @@ export function estimateSwarmMissionSpend(
     incomplete:overview.measuredAgentRuns<dispatchedAgentRuns,
     perMission:rows,
   };
+}
+
+
+/**
+ * Per-model estimated spend, joined by the original deterministic agent task
+ * id and the target that the subagent actually dispatched. These records
+ * carry usage observations, not invoices; provider-side discounts, cache
+ * pricing and billing reconciliation are deliberately not inferred.
+ */
+export interface SwarmRatedSpend {
+ estimatedUsd:number|null;
+ coveredAgents:number;
+ dispatchedAgents:number;
+ measuredUnpricedAgents:number;
+ unmeasuredAgents:number;
+ incomplete:boolean;
+ missions:{id:string;estimatedUsd:number|null;covered:number;dispatched:number}[];
+}
+export function estimateSwarmRatedSpend(
+ sessions:readonly ChatSession[],
+ rates:Readonly<Record<string,LabCostRate>>,
+):SwarmRatedSpend {
+ const missions:SwarmRatedSpend['missions']=[];
+ let total=0,covered=0,dispatched=0,measuredUnpriced=0,unmeasured=0;
+ for(const session of sessions){
+  for(const [runId,run] of Object.entries(session.workflowRunMeta??{})){
+   let missionTotal=0,missionCovered=0,missionDispatched=0;
+   for(const phase of run.phases)for(const agent of phase.agents){
+    // A replay did not make a new model request and must not be billed twice.
+    if(run.agentResults?.[agent.taskId]?.reused)continue;
+    dispatched++;missionDispatched++;
+    const meta=session.subagentRunMeta?.[agent.taskId],usage=meta?.usage;
+    if(!usage || !Number.isSafeInteger(usage.promptTokens)||usage.promptTokens<0 ||
+       !Number.isSafeInteger(usage.completionTokens)||usage.completionTokens<0 ||
+       !Number.isSafeInteger(usage.totalTokens)||usage.totalTokens<0){
+      unmeasured++;continue;
+    }
+    const key=meta.routing?.targetKey;
+    const cost=key ? calculateUsageCostUsd(rates[key],usage) : null;
+    if(cost===null){measuredUnpriced++;continue;}
+    covered++;missionCovered++;total+=cost;missionTotal+=cost;
+   }
+   if(missionDispatched)missions.push({
+     id:session.id+':'+runId,
+     estimatedUsd:missionCovered?Number(missionTotal.toFixed(6)):null,
+     covered:missionCovered,dispatched:missionDispatched,
+   });
+  }
+ }
+ return {estimatedUsd:covered?Number(total.toFixed(6)):null,
+  coveredAgents:covered,dispatchedAgents:dispatched,
+  measuredUnpricedAgents:measuredUnpriced,unmeasuredAgents:unmeasured,
+  incomplete:covered<dispatched,missions};
 }

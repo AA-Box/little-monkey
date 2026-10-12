@@ -181,7 +181,7 @@ export function describeUsageTarget(target: ResolvedTarget): string {
   return `${target.providerId} · ${target.model}`;
 }
 
-function costTargetKey(target: ResolvedTarget): string {
+export function costTargetKey(target: ResolvedTarget): string {
   if (target.kind === 'provider') {
     return providerModelTargetKey(target.providerId, target.model);
   }

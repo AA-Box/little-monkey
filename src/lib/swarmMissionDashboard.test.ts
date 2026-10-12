@@ -1,5 +1,5 @@
 import {describe,it,expect} from 'vitest';
-import {swarmMissionOverview,projectSwarmBudget,estimateSwarmMissionSpend} from './swarmMissionDashboard';
+import {swarmMissionOverview,projectSwarmBudget,estimateSwarmMissionSpend,estimateSwarmRatedSpend} from './swarmMissionDashboard';
 import type {ChatSession} from '../store/sessionStore';
 function sample():ChatSession{
  return {id:'s',subagentRunMeta:{'a':{status:'done',description:'A',profile:'explore',
@@ -64,4 +64,29 @@ describe('swarm observability from real saved journals',()=>{
   expect(swarmMissionOverview([session]).measuredTokens).toBeNull();
   expect(swarmMissionOverview([]).meanDurationMs).toBeNull();
  });
+ it('estimates real measured usage against configured per-model input/output rates without counting replays',()=>{
+   const run=sample();
+   run.subagentRunMeta!['a'].routing={
+     targetLabel:'Example',targetKey:'provider:price-model',reason:'route',policyName:null,
+   };
+   const price=estimateSwarmRatedSpend([run],{
+     'provider:price-model':{inputPerMillionUsd:2,outputPerMillionUsd:5},
+   });
+   expect(price.estimatedUsd).toBe(0.00023);
+   expect(price.missions[0].covered).toBe(1);
+   expect(price.dispatchedAgents).toBe(1);
+   expect(price.incomplete).toBe(false);
+   const missing=estimateSwarmRatedSpend([run],{});
+   expect(missing.estimatedUsd).toBeNull();
+   expect(missing.measuredUnpricedAgents).toBe(1);
+   const reused=sample();
+   reused.subagentRunMeta!['a'].routing={
+     targetLabel:'Example',targetKey:'provider:price-model',reason:'route',policyName:null,
+   };
+   reused.workflowRunMeta!['run-1'].agentResults!.a.reused=true;
+   expect(estimateSwarmRatedSpend([reused],{
+     'provider:price-model':{inputPerMillionUsd:2,outputPerMillionUsd:5},
+   }).dispatchedAgents).toBe(0);
+ });
+
 });

@@ -176,3 +176,17 @@ It never changes the active chat model, authorization, egress, or explicit
 model pins. These are configured-rate **estimates**, not actual provider
 invoices, and model-output quality is task dependent. Existing budget
 enforcement and permission checks remain independently authoritative.
+
+
+### Per-model mission cost attribution
+
+The local subagent journal now records its canonical model target key alongside
+the bounded routing explanation. The mission dashboard joins that key to the
+existing, **operator-configured** per-model input and output rates and each
+agent's measured prompt and completion tokens. New dispatches have a separate
+known-priced coverage count. Reused checkpoint agents are excluded entirely
+from new-dispatch cost accounting, while unknown token measurements and missing
+model rates remain explicitly unknown. Older persisted routing records without
+a model key remain valid but unpriced. This is a user-rate **estimate**;
+provider invoice values, cached-token discounts and remote agent costs are
+not asserted or fabricated.
