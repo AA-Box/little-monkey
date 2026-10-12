@@ -565,16 +565,20 @@ describe("runWorkflow / resume (v2)", () => {
     expect(runSubagentTaskMock).toHaveBeenCalledTimes(3);
   });
 
-  it("ignores resume for an unknown run id or a fully-successful run", async () => {
-    seedSession({ call_done: { ...fullJournal("call_done"), status: "done" } });
-
-    await runWorkflow({ sessionId: SESSION, parentCheckpointId: null, toolCallId: "call_new4", resume: "call_done", spec: spec(), target: TARGET });
-    expect(runSubagentTaskMock).toHaveBeenCalledTimes(3);
-
-    runSubagentTaskMock.mockClear();
-    runSubagentTaskMock.mockResolvedValue("fine report");
-    await runWorkflow({ sessionId: SESSION, parentCheckpointId: null, toolCallId: "call_new5", resume: "call_missing", spec: spec(), target: TARGET });
-    expect(runSubagentTaskMock).toHaveBeenCalledTimes(3);
+  it("refuses to re-dispatch an unknown, active, or completed resume target", async () => {
+    seedSession({
+      call_done: { ...fullJournal("call_done"), status: "done" },
+      call_active: { ...fullJournal("call_active"), status: "running" },
+    });
+    for (const oldId of ["call_done", "call_active", "call_missing"]) {
+      const outcome = await runWorkflow({
+        sessionId: SESSION, parentCheckpointId: null, toolCallId: "call_try_" + oldId,
+        resume: oldId, spec: spec(), target: TARGET,
+      });
+      expect(outcome).toContain("Cannot resume");
+    }
+    expect(runSubagentTaskMock).not.toHaveBeenCalled();
+    expect(runPairedPeerAgentMock).not.toHaveBeenCalled();
   });
 
   it("checkpoints completed agents while later phases are still running", async () => {
