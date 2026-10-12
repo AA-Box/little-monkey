@@ -9,11 +9,45 @@
  */
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
-import {existsSync,lstatSync,mkdirSync,readFileSync,readdirSync,realpathSync,writeFileSync} from 'node:fs';
+import {constants,openSync,closeSync,fstatSync,readSync,existsSync,lstatSync,mkdirSync,readFileSync,readdirSync,realpathSync,writeFileSync} from 'node:fs';
 import {dirname,join,isAbsolute,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 export function digest(bytes){return createHash('sha256').update(bytes).digest('hex');}
+/** Bind checks and reads to the same nofollow file descriptor to prevent
+ * pathname swaps between lstat and read. Hash large weights in chunks. */
+function safeDescriptor(path,label,limit,consumer){
+ const fd=openSync(path,constants.O_RDONLY|(constants.O_NOFOLLOW??0));
+ try{
+  const stat=fstatSync(fd);
+  if(!stat.isFile()||stat.size<0||stat.size>limit)
+   throw Error(label+' must be a bounded regular file');
+  const value=consumer(fd,stat);
+  const later=fstatSync(fd);
+  if(later.size!==stat.size||later.mtimeMs!==stat.mtimeMs)
+   throw Error(label+' changed during read');
+  return value;
+ }finally{closeSync(fd);}
+}
+export function safeRegularBytes(path,label,maxBytes=8*1024*1024){
+ return safeDescriptor(path,label,maxBytes,(fd,stat)=>{
+  const data=readFileSync(fd);
+  if(data.length!==stat.size)throw Error(label+' changed during read');
+  return data;
+ });
+}
+export function safeRegularSha256(path,label,maxBytes=8*1024*1024*1024){
+ return safeDescriptor(path,label,maxBytes,(fd,stat)=>{
+  const hash=createHash('sha256'),buffer=Buffer.allocUnsafe(64*1024);
+  for(let offset=0;offset<stat.size;){
+   const got=readSync(fd,buffer,0,Math.min(buffer.length,stat.size-offset),offset);
+   if(got<=0)throw Error(label+' changed during hash');
+   hash.update(buffer.subarray(0,got));offset+=got;
+  }
+  return hash.digest('hex');
+ });
+}
+
 const argument=name=>{const i=process.argv.indexOf(name);return i===-1?null:process.argv[i+1]??null;};
 export function checkedLocalDir(path,label){
  if(typeof path!=='string'||!isAbsolute(path)||/[\x00-\x1f]/.test(path))throw Error(label+' requires an absolute path');
@@ -22,10 +56,7 @@ export function checkedLocalDir(path,label){
  return realpathSync(path);
 }
 function records(path,label){
- if(!existsSync(path)||!lstatSync(path).isFile()||lstatSync(path).isSymbolicLink())
-   throw Error(label+' must be a regular file, not a symlink');
- const contents=readFileSync(path);
- if(contents.length>8*1024*1024)throw Error(label+' exceeds 8 MiB');
+ const contents=safeRegularBytes(path,label,8*1024*1024);
  const lines=contents.toString('utf8').trim().split('\n');
  if(lines.length<3||lines.length>10000)throw Error(label+' requires 3–10,000 rows');
  const unique=new Set();
@@ -123,7 +154,7 @@ async function main(){
  mkdirSync(plan.output,{mode:0o700,recursive:false});
  const adapter=join(plan.output,'adapter');
  const result={version:1,status:'failed_or_not_verified',engine:'mlx_lm',
-   baseModel:plan.model,modelConfigSha256:digest(readFileSync(join(plan.model,'config.json'))),
+   baseModel:plan.model,modelConfigSha256:digest(safeRegularBytes(join(plan.model,'config.json'),'base model config')),
    createdAt:new Date().toISOString(),data:plan.files,iterations:plan.iterations,
    maxTestPpl:plan.maxTestPpl,previousAdapter:plan.previous??null};
  try{
@@ -134,14 +165,13 @@ async function main(){
   if(plan.previous)train.push('--resume-adapter-file',join(plan.previous,'adapters.safetensors'));
   mlx(python,train,plan.output,join(plan.output,'train.private.log'));
   const weights=join(adapter,'adapters.safetensors');
-  if(!existsSync(weights)||!lstatSync(weights).isFile()||
-     !existsSync(join(adapter,'adapter_config.json')))
-    throw Error('MLX training exited without a real adapter weights/config pair');
+  safeRegularBytes(join(adapter,'adapter_config.json'),'adapter configuration',512*1024);
+  const adapterDigest=safeRegularSha256(weights,'trained adapter weights');
   const test=mlx(python,[...common,'--adapter-path',adapter,'--test', '--batch-size','1','--test-batches','-1'],
     plan.output,join(plan.output,'test.private.log'));
   const ppl=testPpl(test);
   result.testPerplexity=ppl;
-  result.adapterSha256=digest(readFileSync(weights));
+  result.adapterSha256=adapterDigest;
   result.status='candidate_unreviewed';
   if(ppl>plan.maxTestPpl)throw Error('Independent held-out perplexity failed operator threshold');
   if(plan.previous){
@@ -169,7 +199,7 @@ async function main(){
       !readdirSync(fused).some(file=>file.endsWith('.safetensors')))
      throw Error('MLX fusion did not produce a complete local config/safetensors model');
    result.fusedModelPath=fused;
-   result.fusedConfigSha256=digest(readFileSync(join(fused,'config.json')));
+   result.fusedConfigSha256=digest(safeRegularBytes(join(fused,'config.json'),'fused model config'));
    // A file-level fusion receipt cannot prove inference quality. MLX can
    // generate a structurally valid but degraded fused model for some
    // quantization formats: independently evaluate the actual fused weights.
