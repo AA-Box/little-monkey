@@ -72,6 +72,26 @@ on:
         required: false
         default: ''
         type: string
+      mlx_model_dir:
+        description: Optional preinstalled LOCAL MLX base model path for real Apple Silicon LoRA training
+        required: false
+        default: ''
+        type: string
+      mlx_train_data_dir:
+        description: Disjoint operator-curated local train/valid/test JSONL directory
+        required: false
+        default: ''
+        type: string
+      mlx_new_adapter_output:
+        description: New empty local absolute directory for an evaluated adapter (never overwrite existing weights)
+        required: false
+        default: ''
+        type: string
+      mlx_max_test_ppl:
+        description: Explicit maximum held-out perplexity threshold (empty skips training)
+        required: false
+        default: ''
+        type: string
       verify_remote_cancellation:
         description: Run a disposable remote task and verify actual cancellation
         required: false
@@ -194,6 +214,24 @@ jobs:
             --phase verify --graph "$FALLBACK_GRAPH" --root "$FALLBACK_ROOT" \
             --checkpoint "$FALLBACK_RECEIPT" --confirm-disposable \
             > "$RUNNER_TEMP/native-swarm-resident-fallback-acceptance.json"
+      - name: Train and evaluate a real local MLX LoRA adapter with held-out quality gate
+        if: ${{ inputs.mlx_model_dir != '' || inputs.mlx_train_data_dir != '' || inputs.mlx_new_adapter_output != '' || inputs.mlx_max_test_ppl != '' }}
+        shell: bash
+        env:
+          MLX_BASE: ${{ inputs.mlx_model_dir }}
+          MLX_DATA: ${{ inputs.mlx_train_data_dir }}
+          MLX_OUTPUT: ${{ inputs.mlx_new_adapter_output }}
+          MLX_GATE: ${{ inputs.mlx_max_test_ppl }}
+        run: |
+          set -euo pipefail
+          test -n "$MLX_BASE" && test -n "$MLX_DATA" && test -n "$MLX_OUTPUT" && test -n "$MLX_GATE"
+          test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64
+          python3 -c "import mlx_lm"
+          node scripts/swarm-mlx-lora.mjs \
+            --model "$MLX_BASE" --data "$MLX_DATA" --output "$MLX_OUTPUT" \
+            --iters 200 --max-test-ppl "$MLX_GATE" \
+            --confirm-local-training \
+            > "$RUNNER_TEMP/native-swarm-mlx-lora-acceptance.json"
       - name: Publish real-run verification evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -209,3 +247,4 @@ jobs:
             ${{ runner.temp }}/native-swarm-specialist-quality.json
             ${{ runner.temp }}/native-swarm-repository-repair.json
             ${{ runner.temp }}/native-swarm-resident-fallback-acceptance.json
+            ${{ runner.temp }}/native-swarm-mlx-lora-acceptance.json
