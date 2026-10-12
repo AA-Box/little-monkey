@@ -49,8 +49,11 @@ A goal tool call may use:
    reviewer-selection candidate. The candidate stays **pending**.
 4. **Consolidate:** An operator approves, rejects or forgets the candidate
    in Settings. A new pending revision never overwrites an older approved
-   revision. Stored patterns expire after 90 days; there is a 50-pattern,
+   revision. Reimporting identical measured evidence is idempotent; revision
+   numbers advance monotonically for genuinely new measurements. Stored patterns expire after 90 days; there is a 50-pattern,
    24-KiB cap and no raw prompts, tokens, credentials or source blobs.
+   At capacity, rejected and then pending records may be evicted, but approved
+   records are never silently displaced.
 
 This is **non-parametric, review-gated learning**; it does not claim to have
 performed GPU fine-tuning or to have trained LoRA weights. Such an adapter

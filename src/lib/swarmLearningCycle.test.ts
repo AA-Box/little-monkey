@@ -32,10 +32,26 @@ describe('review-gated learning cycle',()=>{
  it('does not silently replace an approved version with a new pending one',()=>{
   const first=distillLearningCandidate(summary)!;
   decideLearningCandidate(first.id,first.revision,'approved');
-  const second=distillLearningCandidate(summary)!;
+  const newEvidence={...summary,generatedAt:new Date(Date.now()+1_000).toISOString()};
+  const second=distillLearningCandidate(newEvidence)!;
   expect(second.revision).toBe(first.revision+1);
+  expect(distillLearningCandidate(newEvidence)?.revision).toBe(second.revision);
+  const third=distillLearningCandidate({...summary,generatedAt:new Date(Date.now()+2_000).toISOString()})!;
+  expect(third.revision).toBe(3);
   expect(approvedLearningContext('backend')).toContain('approved revision: 1');
   expect(()=>decideLearningCandidate(first.id,first.revision,'approved')).toThrow(/already reviewed/);
+ });
+ it('does not evict previously approved observations when proposals exceed capacity',()=>{
+  const first=distillLearningCandidate(summary)!;
+  decideLearningCandidate(first.id,first.revision,'approved');
+  for(let index=0;index<53;index++){
+    const specialized={...summary,ranking:[{...summary.ranking[0],specialist:'Reviewer '+index}]};
+    distillLearningCandidate(specialized);
+  }
+  const learned=listLearningPatterns();
+  expect(learned).toHaveLength(50);
+  expect(learned.some(p=>p.id===first.id&&p.status==='approved')).toBe(true);
+  expect(approvedLearningContext('backend')).toContain('approved revision: 1');
  });
  it('does not retrieve stale learning',()=>{
   const first=distillLearningCandidate(summary)!;

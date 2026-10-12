@@ -49,7 +49,17 @@ function safeLoad(now:number):LearnedPattern[]{
 }
 export function listLearningPatterns(now=Date.now()):LearnedPattern[]{return safeLoad(now);}
 function save(entries:LearnedPattern[]):void{
-  const value=JSON.stringify({schema:1,patterns:entries.slice(-MAX_PATTERNS)});
+  // Protect approved history under repeated staging. Removing the oldest
+  // rejected, then pending draft is safe; silently evicting human-approved
+  // guidance is not. Reject new material when only approved records remain.
+  const retained=[...entries];
+  while(retained.length>MAX_PATTERNS){
+    let discard=retained.findIndex(p=>p.status==='rejected');
+    if(discard<0)discard=retained.findIndex(p=>p.status==='pending');
+    if(discard<0)throw new Error('Approved learning is full; explicitly forget a pattern before staging more.');
+    retained.splice(discard,1);
+  }
+  const value=JSON.stringify({schema:1,patterns:retained});
   if(value.length>MAX_BYTES)throw new Error('Learning index full.');
   localStorage.setItem(SWARM_LEARNING_KEY,value);
 }
@@ -67,12 +77,17 @@ export function distillLearningCandidate(
     .replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')).slice(0,90);
   if(!ID.test(id))return null;
   const entries=safeLoad(now);
-  const previous=entries.find(p=>p.id===id);
+  const revisions=entries.filter(p=>p.id===id);
+  const duplicate=revisions.find(p=>p.generatedAt===timestamp &&
+    p.specialist===best.specialist && p.target===summary.target &&
+    p.observations===best.attempts && p.accuracy===best.accuracy);
+  if(duplicate)return duplicate.status==='pending'?duplicate:null;
+  const revision=revisions.reduce((max,p)=>Math.max(max,p.revision),0)+1;
   const candidate:LearnedPattern={
     id,domain:summary.domain,specialist:best.specialist,target:summary.target,
     accuracy:best.accuracy,observations:best.attempts,
     generatedAt:timestamp,createdAt:now,status:'pending',
-    revision:(previous?.revision??0)+1,source:'independent-source-fixtures',
+    revision,source:'independent-source-fixtures',
   };
   // New evidence creates a *pending* revision; older human-approved data
   // remains intact for retrieval until explicitly replaced or expired.
