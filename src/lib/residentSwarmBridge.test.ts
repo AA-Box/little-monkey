@@ -34,6 +34,8 @@ describe('safe read-only workflow to resident daemon handoff', () => {
     expect(result.graph.nodes[0].depends_on).toEqual([]);
     expect(result.graph.nodes[1].depends_on).toEqual([]);
     expect(result.graph.nodes[2].depends_on).toEqual(['p0a0','p0a1']);
+    expect(result.graph.nodes[0].include_dependency_reports).toBe(false);
+    expect(result.graph.nodes[2].include_dependency_reports).toBe(true);
     expect(result.graphPath).toBe('/tmp/resident-plans/swarm-abc123-graph.json');
     const recipe = JSON.parse(result.recipes[0].contents);
     expect(recipe.target).toEqual({ ollama: 'qwen3:8b' });
@@ -44,7 +46,7 @@ describe('safe read-only workflow to resident daemon handoff', () => {
     expect(recipe.prompt).toBe('Trace auth paths');
     expect(recipe).not.toHaveProperty('channel_send');
     expect(recipe).not.toHaveProperty('placed_run');
-    expect(result.caveat).toContain('not automatically injected');
+    expect(result.caveat).toContain('chain-verified local model reports');
   });
   it('rejects remote peers, write agents, isolation and browser-only secrets before any file write', () => {
     for (const bad of [

@@ -18,6 +18,7 @@ export interface ResidentReadOnlyNode {
   id: string;
   recipe: string;
   depends_on: string[];
+  include_dependency_reports?: boolean;
   max_runtime_seconds: number;
 }
 export interface ResidentReadOnlyGraph {
@@ -173,6 +174,7 @@ export function prepareResidentReadOnlySwarm(
         id,
         recipe: path,
         depends_on: [...previousPhase],
+        include_dependency_reports: previousPhase.length > 0,
         max_runtime_seconds: recipe.timeout_seconds,
       });
       current.push(id);
@@ -189,6 +191,6 @@ export function prepareResidentReadOnlySwarm(
   const graphPath = joinLocalPath(directory, graphId + '-graph.json');
   return {
     graph, graphPath, recipes,
-    caveat: 'Dependent phases start after earlier jobs succeed, but earlier model reports are not automatically injected into later resident prompts. No write-capable or remote tasks are transferred.',
+    caveat: 'Dependent phases receive bounded, chain-verified local model reports as untrusted evidence. Missing or corrupted results stop the graph. No write-capable or remote tasks are transferred.',
   };
 }

@@ -58,14 +58,18 @@ hooks or automatic edits are forwarded. Unsafe configurations fail before
 any file is written. Registered graphs survive application restarts and can
 be inspected/cancelled in the same panel.
 
-**Important limitation:** the resident coordinator correctly enforces task
-dependencies but does not inject model reports from earlier jobs into later
-prompts. Later tasks therefore investigate the same workspace independently.
-For evidence-dependent synthesis requiring prior reports, use the interactive
-workflow tool and its explicitly reviewed recovery rather than assuming
-resident jobs exchanged evidence. Execution still requires a working local
-daemon and installed provider/model credentials. Conversion is opt-in, never
-automatic from a model-generated prompt.
+With `include_dependency_reports: true` on a dependent node, the resident
+daemon verifies each direct prerequisite's run-ledger hash chain and
+successful terminal event, then freezes bounded model output into its input
+as clearly **untrusted evidence**. Incomplete, missing, altered or unsuccessful
+run records prevent the dependent job from starting. This is report
+transmission, not proof that the model's claims are correct; the dependent
+agent must verify source evidence independently. Generated read-only goal
+graphs enable the option only for later phases.
+
+Execution requires a working local daemon and installed provider/model
+credentials. Conversion is opt-in, never automatic from a model-generated
+prompt.
 
 ## Native workflows in headless and daemon-owned model turns
 
