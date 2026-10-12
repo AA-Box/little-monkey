@@ -2668,6 +2668,52 @@ mod tests {
         );
     }
 
+    /// The resident CLI must apply the same opt-in barrier at dispatch, not
+    /// merely hide the tool definition from the model.
+    #[tokio::test]
+    async fn workflow_is_rejected_when_delegation_is_disabled_even_in_bypass_mode() {
+        let state = AppState::default();
+        let registry = McpToolRegistry(std::collections::HashMap::new());
+        let (client, target, options) = dummy_target_and_options();
+        assert!(!options.subagents);
+
+        let mut perms = TerminalPermissions::new(PermissionMode::Bypass);
+        let mut usage = zero_usage();
+        let mut mutated_files = std::collections::HashSet::new();
+        let content = execute_tool_call(
+            &client, &target, &options, &state, &mut perms,
+            "tool-workflow-disabled", "workflow",
+            r#"{"name":"review","phases":[{"title":"review","agents":[{"description":"inspect","prompt":"read files","profile":"explore"}]}]}"#,
+            None, &[], &registry, &[], &mut usage, &mut mutated_files,
+        ).await;
+        let parsed: serde_json::Value = serde_json::from_str(&content).expect("JSON denial");
+        assert!(parsed["error"].as_str().unwrap().contains("not enabled"),
+            "must not run a workflow without the opt-in, got {content}");
+        assert_eq!(usage.model_calls, 0, "no child model must have been called");
+        assert_eq!(usage.tool_calls, 0, "no child tool must have been called");
+    }
+
+    #[tokio::test]
+    async fn workflow_refuses_malformed_agents_before_any_model_call() {
+        let state = AppState::default();
+        let registry = McpToolRegistry(std::collections::HashMap::new());
+        let (client, target, mut options) = dummy_target_and_options();
+        options.subagents = true;
+        let mut perms = TerminalPermissions::new(PermissionMode::Auto);
+        let mut usage = zero_usage();
+        let mut mutated_files = std::collections::HashSet::new();
+        let content = execute_tool_call(
+            &client, &target, &options, &state, &mut perms,
+            "tool-workflow-invalid", "workflow",
+            r#"{"name":"test","phases":[{"title":"inspect","agents":[{"description":"invalid profile","prompt":"run dangerous task","profile":"admin"}]}]}"#,
+            None, &[], &registry, &[], &mut usage, &mut mutated_files,
+        ).await;
+        let parsed: serde_json::Value = serde_json::from_str(&content).expect("JSON error");
+        assert!(parsed["error"].as_str().unwrap().contains("Unknown subagent profile"));
+        assert_eq!(usage.model_calls, 0);
+        assert_eq!(usage.tool_calls, 0);
+    }
+
     #[tokio::test]
     async fn remember_is_rejected_by_frozen_memory_disabled_profile() {
         let state = AppState::default();
