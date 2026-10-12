@@ -345,11 +345,10 @@ export interface RunWorkflowParams {
    * `RunSubagentTaskParams.toolCallId`. */
   toolCallId: string;
   spec: WorkflowSpec;
-  /** An earlier `workflow` call's own runId (toolCallId) to resume from —
-   * `done` agents whose journaled `promptHash` still matches replay their
-   * report instantly; failed/cancelled/missing ones re-dispatch. Best-effort:
-   * an unknown id, or one whose run fully succeeded, simply runs everything
-   * fresh rather than erroring — resume is an optimization, not a gate. */
+  /** An earlier interrupted `workflow` tool-call ID in the same session.
+   * Only completed, full-prompt-matching agents replay their reports. An
+   * unknown, active or already completed run MUST fail closed: silently
+   * treating it as new work could repeat dangerous external mutations. */
   resume?: string;
   target: RunSubagentTaskParams['target'];
   effort?: string;
@@ -369,15 +368,16 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
   const { sessionId, runId, parentCheckpointId, parentSignal, toolCallId, spec, resume, target, effort, risk, onRoutingDecision, onMutatedPath, onMutationFailure } =
     params;
 
-  // The journal of the run being resumed — only a TERMINAL-WITH-FAILURES
-  // run's entries are consulted (a fully-'done' run has nothing to resume,
-  // and re-running it fresh is the least surprising reading of the call).
-  const resumeJournal: Record<string, WorkflowAgentResult> | undefined = (() => {
-    if (!resume) return undefined;
-    const meta = useSessionStore.getState().sessions.find((s) => s.id === sessionId)?.workflowRunMeta?.[resume];
-    if (!meta || meta.status === 'done') return undefined;
-    return meta.agentResults;
-  })();
+  const sourceMeta = resume
+    ? useSessionStore.getState().sessions.find(s => s.id === sessionId)?.workflowRunMeta?.[resume]
+    : undefined;
+  if (resume && (!sourceMeta || (sourceMeta.status !== 'error' && sourceMeta.status !== 'cancelled'))) {
+    return stringifyToolError(new Error(
+      'Cannot resume: workflow run does not exist, is still active, or has already completed in this session. No new agents were dispatched.',
+    ));
+  }
+  const resumeJournal: Record<string, WorkflowAgentResult> | undefined =
+    resume ? sourceMeta?.agentResults : undefined;
 
   // This run's own journal, keyed by the NEW run's deterministic taskIds and
   // snapshotted with the terminal meta in `finish` — which is what makes a
@@ -387,9 +387,6 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
   // For a partial resume chain A -> B -> C, C must still attach to A's
   // durable peer task receipt. Using only the immediately previous run id
   // would mint a new correlation and could send duplicate remote work.
-  const sourceMeta = resume
-    ? useSessionStore.getState().sessions.find(s => s.id === sessionId)?.workflowRunMeta?.[resume]
-    : undefined;
   const correlationOrigin = workflowCorrelationOrigin(toolCallId, resume, sourceMeta);
 
   const phases: WorkflowPhase[] = spec.phases.map((phase, phaseIndex) => ({
