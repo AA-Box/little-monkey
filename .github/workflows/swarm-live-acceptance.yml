@@ -57,6 +57,21 @@ on:
         required: false
         default: ''
         type: string
+      fallback_graph_id:
+        description: Optional already-running disposable resident graph whose primary read-only root was captured before failing
+        required: false
+        default: ''
+        type: string
+      fallback_root_id:
+        description: Root node ID whose preapproved PLAN fallback must complete
+        required: false
+        default: ''
+        type: string
+      fallback_receipt_path:
+        description: Absolute path to pre-captured protected fallback receipt on this persistent self-hosted runner
+        required: false
+        default: ''
+        type: string
       verify_remote_cancellation:
         description: Run a disposable remote task and verify actual cancellation
         required: false
@@ -95,6 +110,8 @@ jobs:
           node --check scripts/swarm-model-benchmark.mjs
           node --check scripts/swarm-specialist-live-benchmark.mjs
           node --check scripts/swarm-resident-restart-live-acceptance.mjs
+          node --check scripts/swarm-resident-fallback-live-acceptance.mjs
+          node scripts/swarm-resident-fallback-live-acceptance.mjs --self-check
           node --check scripts/swarm-repository-repair-live-acceptance.mjs
           node scripts/swarm-repository-repair-live-acceptance.mjs --self-check
           node scripts/swarm-specialist-live-benchmark.mjs --self-check --domain all
@@ -163,6 +180,20 @@ jobs:
             --target "$REPAIR_TARGET" --confirm-manual-approvals \
             --timeout-seconds 2400 \
             > "$RUNNER_TEMP/native-swarm-repository-repair.json"
+      - name: Verify installed daemon re-elects a preapproved read-only fallback
+        if: ${{ inputs.fallback_graph_id != '' || inputs.fallback_root_id != '' || inputs.fallback_receipt_path != '' }}
+        shell: bash
+        env:
+          FALLBACK_GRAPH: ${{ inputs.fallback_graph_id }}
+          FALLBACK_ROOT: ${{ inputs.fallback_root_id }}
+          FALLBACK_RECEIPT: ${{ inputs.fallback_receipt_path }}
+        run: |
+          set -euo pipefail
+          test -n "$FALLBACK_GRAPH" && test -n "$FALLBACK_ROOT" && test -n "$FALLBACK_RECEIPT"
+          node scripts/swarm-resident-fallback-live-acceptance.mjs \
+            --phase verify --graph "$FALLBACK_GRAPH" --root "$FALLBACK_ROOT" \
+            --checkpoint "$FALLBACK_RECEIPT" --confirm-disposable \
+            > "$RUNNER_TEMP/native-swarm-resident-fallback-acceptance.json"
       - name: Publish real-run verification evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -177,3 +208,4 @@ jobs:
             ${{ runner.temp }}/native-swarm-cancellation-acceptance.json
             ${{ runner.temp }}/native-swarm-specialist-quality.json
             ${{ runner.temp }}/native-swarm-repository-repair.json
+            ${{ runner.temp }}/native-swarm-resident-fallback-acceptance.json
