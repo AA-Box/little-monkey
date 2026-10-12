@@ -56,10 +56,11 @@ jobs:
           node --check scripts/swarm-two-peer-cancellation-live-acceptance.mjs
           node --test scripts/swarm-two-peer-memory-acceptance.contract.test.mjs scripts/swarm-two-peer-cancellation-acceptance.contract.test.mjs
 
-      - name: Verify independent security source oracle without any model calls
+      - name: Verify independent source oracles for all five specialist domains (no model calls)
         run: |
           node --check scripts/swarm-specialist-live-benchmark.mjs
-          node scripts/swarm-specialist-live-benchmark.mjs --self-check
+          node scripts/swarm-specialist-live-benchmark.mjs --self-check --domain all
+          node --test scripts/swarm-specialist-oracle.contract.test.mjs
 
       - name: Contract-test safe resident restart and offline repair source oracle
         run: |

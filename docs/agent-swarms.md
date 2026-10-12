@@ -374,3 +374,22 @@ absent: write requests may pause until approved. A process interruption after
 an external mutation requires human reconciliation before retrying; exact-once
 external side effects cannot be guaranteed. Watch the daemon's approval and
 reconciliation states before treating work as complete.
+
+## Evaluated specialist quality — all domains
+
+The supplemental specialist in each of security, frontend, backend, performance,
+and general may optionally use independently verified source-fixture accuracy
+instead of completion-based exploration. Each domain has three fixed eligible
+roles, two defective source cases, and a safe negative control. No task is
+graded on its own self-reported success. Import and opt-in are scoped to one
+domain, with migration of previously stored security-v1 results. Core
+workflow agents, peer placement, tool permissions, and other domains are never
+promoted by imported scores.
+
+Run `node scripts/swarm-specialist-live-benchmark.mjs --self-check --domain all`
+for the no-model 15-fixture source-oracle check, or
+`pnpm test:swarm-specialists:live -- --domain frontend --target ollama:MODEL`
+with an installed model for real evidence (repeat for the other domains).
+See `docs/swarm-release-acceptance.md` for per-domain invocation, result
+import, and operational release gates.
+

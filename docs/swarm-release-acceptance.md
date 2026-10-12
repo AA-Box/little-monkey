@@ -393,34 +393,71 @@ author stress, real-model finding-to-fix-to-test success and independently
 evaluated specialist accuracy. Do not mark the system production-ready solely
 because these harnesses are installed.
 
-## Independently verified specialist accuracy and adaptive selection
+## Real-model verified specialist accuracy: all five domains
 
-Runtime completion counters are not evidence of correctness. There is now
-a separate, **default-disabled** quality-based selection path for the three
-supplemental security specialists. Real observations follow this loop:
+The accuracy-driven specialist selector is implemented for **security, frontend,
+backend, performance, and general** goal domains. Every domain has its own
+exactly three already-eligible supplemental reviewer roles, two defective
+executable source fixtures, and one known-good negative control. The
+read-only runner grades actual model output against an independently
+executed Node regression oracle, unchanged committed Git files, the real
+run receipt, and an exact source-symbol/category report format. A model
+saying "passed" is never accepted as grading evidence.
 
-1. On a host with Little Monkey installed and a configured Ollama model, run
-   `node scripts/swarm-specialist-live-benchmark.mjs --target ollama:<model>
-   --repetitions 3 > specialist-results.json`.
-2. The harness creates disposable security source fixtures including one
-   correct, negative-control example. It executes a real headless model
-   with PLAN permissions, MCP/rules disabled, and checks unchanged Git
-   source, actual durable run IDs, and model reports with an independently
-   coded source oracle. Neither a self-reported pass nor mere completion
-   can count as a verified finding.
-3. In Swarm settings, import the JSON; Little Monkey rechecks all three
-   fixtures for each specialist, every repetition, unique run identifiers,
-   the timestamp and all aggregate rankings. Incomplete or contradictory
-   measurements are rejected. A user-provided JSON file is not
-   cryptographic evidence of provenance.
-4. Only after operator opt-in, verified accuracy ranks the supplemental
-   *security* specialist among existing approved roles. Core review roles,
-   all other engineering domains, model eligibility and tools remain
-   unaffected. Data expires after 90 days; clearing it disables ranking.
+### Execute domain-specific benchmarks
 
-These are small, controlled tests, not proof of general repository-audit
-quality. The live evaluator requires a genuine model; CI runs its source
-oracle self-check without pretending to have a configured inference server.
+On an operator-controlled machine with Little Monkey and a working Ollama
+model, run one of the following (the model is **not mocked**):
+
+```sh
+node scripts/swarm-specialist-live-benchmark.mjs --domain security    --target ollama:YOUR_MODEL --repetitions 3 > security.json
+node scripts/swarm-specialist-live-benchmark.mjs --domain frontend    --target ollama:YOUR_MODEL --repetitions 3 > frontend.json
+node scripts/swarm-specialist-live-benchmark.mjs --domain backend     --target ollama:YOUR_MODEL --repetitions 3 > backend.json
+node scripts/swarm-specialist-live-benchmark.mjs --domain performance --target ollama:YOUR_MODEL --repetitions 3 > performance.json
+node scripts/swarm-specialist-live-benchmark.mjs --domain general     --target ollama:YOUR_MODEL --repetitions 3 > general.json
+```
+
+The benchmark uses a disposable repository for **each attempt**, `plan`
+permission, `--no-mcp` and `--no-rules`. It executes three fixtures for
+each of three specialists per repetition. Failure to answer, missing real
+run IDs, code changes, wrong classifications and false positives on the
+control fixture all count against accuracy. The process returns a nonzero
+exit status if some checks fail but still prints structured results for
+operator review. It does not grant tools, pair peers, or deploy code.
+
+Use `node scripts/swarm-specialist-live-benchmark.mjs --self-check --domain all`
+to exercise **all 15 source oracles without inference**. The self-check
+is for harness correctness only, not accuracy verification on a real model.
+
+### Import, store and apply
+
+In **Settings → Background Agents → Agent swarms → Verified specialist
+quality**, select a domain and import its JSON. Imported reports are checked
+for domain-specific exact role names, fixtures, every repetition, bounded
+durations, fresh timestamps, unique actual-run identifiers, and scores
+recomputed from each independently graded outcome. Existing security-v1
+benchmarks are migrated transparently. Data is kept **per domain**: importing
+backend never replaces security evidence or enables backend routing
+automatically.
+
+An explicit per-domain opt-in then allows only the supplemental reviewer
+among already eligible roles for **that same domain** to be ranked by
+independently measured accuracy (latency is a tie-breaker). Core reviewers,
+model selection, permission policies, peer grants, and other domain results
+are unchanged. Data expires after 90 days. A domain can be cleared without
+removing other domains. Ordinary task completion remains a separate
+reliability signal and never counts as independently verified correctness.
+
+The manual self-hosted **Native swarm live acceptance** workflow has a
+`specialist_domain` selector; it runs real-model checks only when
+`specialist_target` is supplied. Run it separately for each desired
+domain and import each resulting artifact.
+
+**Evidence boundary:** A user-provided benchmark JSON is not signed
+attestation. These intentionally small, source-checked tasks establish
+narrow benchmark performance, not general coding intelligence or accuracy
+on arbitrary production repositories. A real installed model must execute
+each live suite before its accuracy can be asserted.
 
 ## Operator-controlled resident crash/restart proof
 

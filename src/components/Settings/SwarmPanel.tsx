@@ -16,8 +16,9 @@ import {
 } from '../../lib/peersClient';
 import { loadPeerObservations } from '../../lib/swarmPeerMetrics';
 import {
-  importVerifiedSpecialists, loadVerifiedSpecialists, clearVerifiedSpecialists,
+  importVerifiedSpecialists, listVerifiedSpecialists, clearVerifiedSpecialists,
   setVerifiedSpecialistRouting, verifiedSpecialistRoutingEnabled,
+  SPECIALIST_DOMAINS, type VerifiedSpecialistDomain,
 } from '../../lib/swarmVerifiedSpecialists';
 import {
   clearSwarmBenchmark, importSwarmBenchmark, loadSwarmBenchmark,
@@ -46,8 +47,10 @@ export function SwarmPanel() {
   const [learningBusy, setLearningBusy] = useState<string | null>(null);
   const [benchmark, setBenchmark] = useState(() => loadSwarmBenchmark());
   const [benchmarkRouting, setBenchmarkRouting] = useState(() => swarmBenchmarkRoutingEnabled());
-  const [specialistQuality, setSpecialistQuality] = useState(() => loadVerifiedSpecialists());
-  const [specialistQualityRouting, setSpecialistQualityRouting] = useState(() => verifiedSpecialistRoutingEnabled());
+  const [specialistQuality, setSpecialistQuality] = useState(() => listVerifiedSpecialists());
+  const [specialistQualityDomain, setSpecialistQualityDomain] = useState<VerifiedSpecialistDomain>('security');
+  const [specialistQualityRouting, setSpecialistQualityRouting] = useState(() => verifiedSpecialistRoutingEnabled('security'));
+  const selectedSpecialistQuality = specialistQuality.find(item => item.domain === specialistQualityDomain);
   const [benchmarkBusy, setBenchmarkBusy] = useState(false);
   const [pluginBusy, setPluginBusy] = useState<string | null>(null);
   const [resident, setResident] = useState<ResidentSwarmGraphStatus[]>([]);
@@ -396,34 +399,36 @@ export function SwarmPanel() {
   async function importSpecialistQuality() {
     setError(''); setNotice('');
     const selected = await open({multiple:false,filters:[{
-      name:'Verified real-model security specialist benchmark',extensions:['json'],
+      name:'Verified real-model specialist benchmark',extensions:['json'],
     }]});
     if (typeof selected !== 'string') return;
     setBenchmarkBusy(true);
     try {
       const raw=await readTextFile(selected);
-      if (raw.length>96_000) throw new Error('Specialist evaluation exceeds the 96 KiB import limit.');
-      const summary=importVerifiedSpecialists(JSON.parse(raw));
-      setSpecialistQuality(summary);
+      if (raw.length > 100_000) throw new Error('Specialist evaluation exceeds the 100 KiB import limit.');
+      const summary = importVerifiedSpecialists(JSON.parse(raw));
+      setSpecialistQuality(listVerifiedSpecialists());
+      setSpecialistQualityDomain(summary.domain);
       setSpecialistQualityRouting(false);
-      setNotice('Imported complete per-run source-verified fixtures. Review the independent correctness measurements before opting in.');
+      setNotice('Imported independent ' + summary.domain + ' benchmark. Its quality routing is OFF until reviewed. Other domains keep their existing settings.');
     } catch(error) {setError('Specialist quality import refused: '+String(error));}
     finally {setBenchmarkBusy(false);}
   }
   function toggleSpecialistQuality(enabled: boolean) {
-    if (enabled && !specialistQuality) return;
+    if (enabled && !selectedSpecialistQuality) return;
     if (enabled && !window.confirm(
-      'Enable operator-imported real-model source-fixture ranking for the supplemental security specialist only? Core roles, other domains, model and tool permissions are unchanged.'
+      'Enable independently checked real-model accuracy for the supplemental ' + specialistQualityDomain +
+      ' reviewer only? No additional agents, tool permissions or peer capabilities are granted.'
     )) return;
-    setVerifiedSpecialistRouting(enabled);
-    setSpecialistQualityRouting(enabled);
+    setVerifiedSpecialistRouting(enabled, specialistQualityDomain);
+    setSpecialistQualityRouting(verifiedSpecialistRoutingEnabled(specialistQualityDomain));
   }
   function removeSpecialistQuality() {
-    if (!window.confirm('Clear verified specialist accuracy and disable quality-ranked selection?')) return;
-    clearVerifiedSpecialists();
-    setSpecialistQuality(null);
+    if (!window.confirm('Clear verified ' + specialistQualityDomain + ' specialist accuracy and disable its ranking only?')) return;
+    clearVerifiedSpecialists(specialistQualityDomain);
+    setSpecialistQuality(listVerifiedSpecialists());
     setSpecialistQualityRouting(false);
-    setNotice('Verified specialist evidence removed.');
+    setNotice('Verified ' + specialistQualityDomain + ' measurements removed; other domains retained.');
   }
   async function copyConfig() {
     if (!config.args) return;
@@ -512,23 +517,37 @@ export function SwarmPanel() {
         </>}
       </div>
       <div className="rounded-lg border border-border bg-surface p-3">
-        <h4 className="text-sm font-semibold text-foreground">Source-verified specialist quality</h4>
-        <p className="mt-1 text-xs text-muted">Evaluate three security source fixtures per role—including a safe negative control—with a real, installed Ollama model. The runner checks actual unchanged Git source, durable run IDs and final reports against an independent oracle. Completion-only telemetry does not count as correctness. Run locally with pnpm test:swarm-specialists:live and import the resulting JSON.</p>
+        <h4 className="text-sm font-semibold text-foreground">Verified specialist quality · all five domains</h4>
+        <p className="mt-1 text-xs text-muted">Independent real-model source tests cover security, frontend, backend, performance and general reviewers. Each domain uses two defective executable source fixtures and a correct control, tests unchanged Git source, checks real run receipts and recomputes scores. Ordinary task completion is NOT an accuracy measure. Import a domain-specific result from <code>pnpm test:swarm-specialists:live -- --domain DOMAIN --target ollama:MODEL</code>, review it, and opt in separately.</p>
+        <label className="mt-3 flex items-center gap-2 text-xs text-foreground">
+          Domain
+          <select className="rounded border border-border bg-surface px-2 py-1" value={specialistQualityDomain}
+            onChange={event => {
+              const domain = event.target.value as VerifiedSpecialistDomain;
+              setSpecialistQualityDomain(domain);
+              setSpecialistQualityRouting(verifiedSpecialistRoutingEnabled(domain));
+            }}>
+            {SPECIALIST_DOMAINS.map(domain => <option key={domain} value={domain}>{domain}</option>)}
+          </select>
+        </label>
         <div className="mt-3 flex flex-wrap gap-2">
-          <Button size="sm" disabled={benchmarkBusy} onClick={() => void importSpecialistQuality()}>Import verified specialist JSON</Button>
-          {specialistQuality && <Button size="sm" disabled={benchmarkBusy} onClick={removeSpecialistQuality}>Clear specialist measurements</Button>}
+          <Button size="sm" disabled={benchmarkBusy} onClick={() => void importSpecialistQuality()}>Import independent fixture results…</Button>
+          {selectedSpecialistQuality && <Button size="sm" disabled={benchmarkBusy} onClick={removeSpecialistQuality}>Clear this domain</Button>}
         </div>
-        {specialistQuality && <>
-          <p className="mt-2 text-xs text-muted">Generated {specialistQuality.generatedAt} · {specialistQuality.target}</p>
-          {specialistQuality.ranking.map(row => <p key={row.specialist} className="mt-1 text-xs text-foreground">
-            {row.specialist}: {row.passes}/{row.attempts} independent checks passed ({Math.round(100*row.accuracy)}%)
+        <p className="mt-2 text-xs text-muted">Imported: {specialistQuality.length ? specialistQuality.map(row => row.domain).join(', ') : 'none'} · Each imported domain expires after 90 days.</p>
+        {selectedSpecialistQuality ? <>
+          <p className="mt-2 text-xs text-muted">
+            {selectedSpecialistQuality.domain} · {selectedSpecialistQuality.target} · Generated {selectedSpecialistQuality.generatedAt}
+          </p>
+          {selectedSpecialistQuality.ranking.map(row => <p key={row.specialist} className="mt-1 text-xs text-foreground">
+            {row.specialist}: {row.passes}/{row.attempts} independently checked fixtures ({Math.round(100*row.accuracy)}%)
           </p>)}
           <label className="mt-3 flex items-start gap-2 text-xs text-foreground">
             <input type="checkbox" checked={specialistQualityRouting}
               onChange={event => toggleSpecialistQuality(event.target.checked)} />
-            Opt in to verified accuracy ranking of the supplemental security specialist; no effect on other engineering domains.
+            Opt in to accuracy-based supplemental reviewer selection for {specialistQualityDomain} only. Existing specialist pools and all tool permissions remain unchanged.
           </label>
-        </>}
+        </> : <p className="mt-2 text-xs text-faint">No measured accuracy for {specialistQualityDomain}. Execution reliability remains separate.</p>}
       </div>
       <div className="rounded-lg border border-border bg-surface p-3">
         <h4 className="text-sm font-semibold text-foreground">Versioned notebook · {notes.length} claims</h4>

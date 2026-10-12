@@ -26,6 +26,17 @@ on:
         required: false
         default: ''
         type: string
+      specialist_domain:
+        description: Domain to evaluate against independently graded source fixtures
+        required: true
+        default: security
+        type: choice
+        options:
+          - security
+          - frontend
+          - backend
+          - performance
+          - general
       repair_target:
         description: Optional installed Ollama target for real permission-gated repository repair (operator MUST approve every write)
         required: false
@@ -86,7 +97,8 @@ jobs:
           node --check scripts/swarm-resident-restart-live-acceptance.mjs
           node --check scripts/swarm-repository-repair-live-acceptance.mjs
           node scripts/swarm-repository-repair-live-acceptance.mjs --self-check
-          node scripts/swarm-specialist-live-benchmark.mjs --self-check
+          node scripts/swarm-specialist-live-benchmark.mjs --self-check --domain all
+          node --test scripts/swarm-specialist-oracle.contract.test.mjs
           node --check scripts/swarm-two-peer-memory-live-acceptance.mjs
           node --check scripts/swarm-two-peer-cancellation-live-acceptance.mjs
           node --test scripts/swarm-two-peer-acceptance.contract.test.mjs scripts/swarm-two-peer-memory-acceptance.contract.test.mjs scripts/swarm-two-peer-cancellation-acceptance.contract.test.mjs
@@ -133,9 +145,11 @@ jobs:
         shell: bash
         env:
           SPECIALIST_TARGET: ${{ inputs.specialist_target }}
+          SPECIALIST_DOMAIN: ${{ inputs.specialist_domain }}
         run: |
           set -euo pipefail
           node scripts/swarm-specialist-live-benchmark.mjs \
+            --domain "$SPECIALIST_DOMAIN" \
             --target "$SPECIALIST_TARGET" --repetitions 3 \
             > "$RUNNER_TEMP/native-swarm-specialist-quality.json"
       - name: Real vulnerability discovery, manual repair and external regression tests
