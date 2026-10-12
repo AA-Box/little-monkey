@@ -2704,3 +2704,136 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+
+// ---- Streamed post-evaluation MLX fused model weight integrity ----
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FusedModelShardDigest {
+    name: String,
+    sha256: String,
+    size_bytes: u64,
+}
+
+#[tauri::command]
+pub async fn models_verify_fused_weights(
+    path: String,
+    files: Vec<FusedModelShardDigest>,
+) -> Result<bool, String> {
+    // Hashing multi-gigabyte weights on the Tauri UI worker would stall IPC.
+    tauri::async_runtime::spawn_blocking(move || {
+        verify_fused_weight_digests(std::path::Path::new(&path), &files)
+    })
+    .await
+    .map_err(|_| "Model verification worker interrupted".to_string())?
+}
+
+fn verify_fused_weight_digests(
+    folder: &std::path::Path,
+    expected: &[FusedModelShardDigest],
+) -> Result<bool, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    if expected.is_empty() || expected.len() > 128 {
+        return Err("Fused model requires 1–128 expected weight shards".into());
+    }
+    let root = folder.canonicalize().map_err(|_| "Fused model folder missing")?;
+    if !root.is_dir() {
+        return Err("Fused model folder must be a directory".into());
+    }
+    let mut want = std::collections::BTreeSet::new();
+    for row in expected {
+        if row.name.len() < ".safetensors".len() + 1
+            || row.name.len() > 128
+            || !row.name.ends_with(".safetensors")
+            || !row.name.bytes().all(|b| b.is_ascii_alphanumeric()
+                || b == b'.' || b == b'_' || b == b'-')
+            || row.sha256.len() != 64
+            || !row.sha256.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            || row.size_bytes == 0
+            || !want.insert(row.name.clone())
+        {
+            return Err("Invalid or duplicate fused shard evidence".into());
+        }
+    }
+    let mut found = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&root).map_err(|_| "Cannot list fused folder")? {
+        let entry = entry.map_err(|_| "Cannot read fused folder entry")?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or("Fused model has a non-UTF-8 entry")?;
+        if name.ends_with(".safetensors") {
+            if !entry.file_type().map_err(|_| "Cannot inspect weight")?.is_file() {
+                return Err("Fused weight cannot be a symlink or special file".into());
+            }
+            found.insert(name.to_string());
+        }
+    }
+    if want != found {
+        return Err("Fused shards differ from evaluated receipt".into());
+    }
+    for row in expected {
+        let file_path = root.join(&row.name);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(&file_path)
+            .map_err(|_| "Cannot open fused weight")?;
+        let before = file.metadata().map_err(|_| "Cannot stat fused weight")?;
+        if !before.is_file() || before.len() != row.size_bytes {
+            return Err("Fused weight size differs from receipt".into());
+        }
+        let mut sha = Sha256::new();
+        let mut buffer = [0u8; 1024 * 1024];
+        let mut bytes = 0u64;
+        loop {
+            let n = file.read(&mut buffer).map_err(|_| "Cannot read fused weight")?;
+            if n == 0 { break; }
+            bytes += n as u64;
+            if bytes > row.size_bytes {
+                return Err("Fused weight grew during verification".into());
+            }
+            sha.update(&buffer[..n]);
+        }
+        if bytes != row.size_bytes
+            || file.metadata().map_err(|_| "Cannot restat fused weight")?.len() != row.size_bytes
+            || format!("{:x}", sha.finalize()) != row.sha256
+        {
+            return Err("Fused weight hash differs from evaluated receipt".into());
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod fused_weight_integrity_tests {
+    use super::*;
+    #[test]
+    fn detects_weight_tampering_missing_extra_and_path_traversal() {
+        use sha2::{Digest, Sha256};
+        let root = std::env::temp_dir().join(format!("lm-mlx-check-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("model.safetensors");
+        std::fs::write(&file, b"original-evaluated-weights").unwrap();
+        let good = FusedModelShardDigest {
+            name: "model.safetensors".into(),
+            size_bytes: b"original-evaluated-weights".len() as u64,
+            sha256: format!("{:x}", Sha256::digest(b"original-evaluated-weights")),
+        };
+        assert!(verify_fused_weight_digests(&root, &[good.clone()]).unwrap());
+        std::fs::write(&file, b"changed-evaluated-weights").unwrap();
+        assert!(verify_fused_weight_digests(&root, &[good.clone()]).is_err());
+        std::fs::remove_file(&file).unwrap();
+        assert!(verify_fused_weight_digests(&root, &[good.clone()]).is_err());
+        std::fs::write(&file, b"original-evaluated-weights").unwrap();
+        std::fs::write(root.join("extra.safetensors"), b"additional").unwrap();
+        assert!(verify_fused_weight_digests(&root, &[good.clone()]).is_err());
+        let mut invalid = good;
+        invalid.name = "../escape.safetensors".into();
+        assert!(verify_fused_weight_digests(&root, &[invalid]).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
