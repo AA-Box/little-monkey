@@ -63,6 +63,8 @@ export interface RemoteAgentTask {
   /** Stable task position across resumed workflow tool-call ids. */
   correlationTaskPosition: string;
   signal?: AbortSignal;
+  /** Audit-only identity of failed primary; grants no additional capability. */
+  failoverFrom?: string;
 }
 
 function stopped(signal?: AbortSignal): boolean {
@@ -203,6 +205,13 @@ export async function runPairedPeerAgent(task: RemoteAgentTask): Promise<string>
       startedAt,
       finishedAt: Date.now(),
       toolCallCount: 1,
+      routing: {
+        targetLabel: 'Paired peer · ' + peer,
+        reason: task.failoverFrom
+          ? 'Read-only alternate following independently confirmed terminal failure on ' + task.failoverFrom + '. Distinct durable correlation; no write privileges.'
+          : 'Operator-selected read-only paired peer task with native task-grant enforcement.',
+        policyName: null,
+      },
     });
   }
 }

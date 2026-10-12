@@ -85,6 +85,18 @@ describe('paired peer swarm execution', () => {
     expect(mocks.peersRemoteThread).toHaveBeenCalledWith('paired-node', 'thread-1');
     expect(mocks.finish).toHaveBeenCalledWith(task.taskId, 'done');
   });
+
+  it('persists the selected native peer identity as a non-priced routing explanation', async()=>{
+    await runPairedPeerAgent(task);
+    expect(mocks.setSubagentRun).toHaveBeenCalledWith(
+      task.sessionId,task.taskId,expect.any(Array),
+      expect.objectContaining({routing:expect.objectContaining({
+        targetLabel:'Paired peer · paired-node',targetKey:undefined,
+        policyName:null,
+      })}),
+    );
+  });
+
   it('sends through the native bridge when no previous receipt exists', async () => {
     mocks.peersOutbound.mockResolvedValueOnce({ messages: [] });
     const result = await runPairedPeerAgent(task);

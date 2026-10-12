@@ -55,5 +55,6 @@ export async function runPairedPeerAgentWithFailover(task:RemoteAgentTask):Promi
  // Distinct deterministic correlation; the underlying runner checks all
  // authorized peers' durable receipts before sending on this new stage.
  return runPairedPeerAgent({...task,peer:remaining[0],peerCandidates:remaining,
-  correlationTaskPosition:task.correlationTaskPosition+PEER_FAILOVER_SUFFIX});
+  correlationTaskPosition:task.correlationTaskPosition+PEER_FAILOVER_SUFFIX,
+  failoverFrom:failedPeer});
 }
