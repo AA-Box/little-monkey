@@ -625,7 +625,7 @@ describe("runWorkflow / resume (v2)", () => {
       const outcome = await runWorkflow({ sessionId: SESSION, parentCheckpointId: null,
         toolCallId: "call_durable", spec: spec(), target: TARGET });
       expect(JSON.parse(outcome).status).toBe("completed");
-      expect(saved.at(-1)?.workflowRunMeta?.call_durable?.status).toBe("done");
+      expect(saved[saved.length - 1]?.workflowRunMeta?.call_durable?.status).toBe("done");
     } finally {
       invokeMock.mockReset().mockResolvedValue(null);
     }
