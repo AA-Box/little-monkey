@@ -330,3 +330,65 @@ peer-task recipes with explicitly granted task capability, following
 
 Until those observations are recorded, keep the PR draft and **do not claim
 end-to-end production parity**.
+
+## Real multi-installation replication and cancellation evidence gates
+
+Two additional operator-only acceptance harnesses now complement the existing
+real task and model tests. Their `node:test` contract tests use a controlled
+CLI to catch harness bugs; **only execution on two independently installed
+Little Monkey nodes can produce actual product acceptance evidence.** All
+real-device steps remain opt-in and are never run automatically on PRs.
+
+**Vector replication:** Pair two installations, confirm pinned certificate
+fingerprints, grant memory-read and memory-write explicitly **on both inbound
+devices**, and share a disposable `lm-e2e-...` namespace using `peers
+memory-share` on each receiver. On B, pre-seed one *locally authored* record:
+
+```sh
+monkey peers memory-put lm-e2e-disposable-a receiver-record lm-e2e-vector-v1 '1,0,0' 'receiver evidence' --revision 1
+```
+
+On A, invoke:
+
+```sh
+node scripts/swarm-two-peer-memory-live-acceptance.mjs \
+  --peer node-b --namespace lm-e2e-disposable-a \
+  --receiver-record receiver-record --confirm-disposable
+```
+
+It writes a randomly named local sentinel, synchronizes both ways, requires
+a receiver-authored vector to be returned from local search, checks an
+idempotent repeated pull, then publishes a revision-2 tombstone. The script
+never changes grants or remote endpoints. Run again with A/B roles reversed
+and a fresh disposable namespace. A successful local harness contract test
+is not proof of real memory convergence. Incomplete outcomes must be
+inspected, not automatically replayed.
+
+**Remote cancellation:** Configure B with an explicitly read-only peer-task
+recipe pointed at a disposable test repository. Its model must be able to
+remain running long enough for a cancellation request (otherwise the test
+correctly fails rather than pretending an already-completed task was killed).
+From A, run:
+
+```sh
+node scripts/swarm-two-peer-cancellation-live-acceptance.mjs \
+  --peer node-b --confirm-disposable --timeout-seconds 300
+```
+
+This creates **one** correlated disposable read-only request, recovers its
+owned outbound receipt, sends exactly one cancellation, and polls the same
+remote thread until its terminal status is **cancelled**. A cancellation
+acknowledgement alone, an already completed job, a connection timeout, or
+successful task completion do **not** count as verified cancellation.
+
+For an operator-triggered self-hosted run, use GitHub Actions →
+**Native swarm live acceptance** and optionally provide both
+`memory_namespace` and `receiver_memory_record`, or enable
+`verify_remote_cancellation`. The runner must be the actual installed sender
+and the opposite node must be configured in advance. Retained artifacts
+record observations without exposing vector text or provider credentials.
+
+Outstanding release proof includes live network partition/recovery, parallel
+author stress, real-model finding-to-fix-to-test success and independently
+evaluated specialist accuracy. Do not mark the system production-ready solely
+because these harnesses are installed.
