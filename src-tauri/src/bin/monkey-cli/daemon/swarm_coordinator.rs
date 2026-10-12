@@ -773,6 +773,56 @@ mod tests {
     }
 
     #[test]
+    fn crash_after_alternate_queue_write_recovers_the_distinct_durable_job() {
+        use super::super::store::NewDaemonJob;
+        let root=std::env::temp_dir().join(format!("swarm-fallback-reattach-{}",uuid::Uuid::new_v4()));
+        let paths=DaemonPaths::under(&root);
+        let initial=stable_job_id("fallback-restart","lead");
+        let alternate=stable_job_id("fallback-restart","fallback:lead");
+        assert_ne!(initial,alternate);
+        {
+            let mut store=DaemonStore::open(&paths).unwrap();
+            prepare_schema(&store).unwrap();
+            store.connection.execute(
+                "INSERT INTO resident_swarm_graphs
+                 (graph_id,spec_json,state,created_at_ms,updated_at_ms)
+                 VALUES ('fallback-restart','{}','running',1,1)",[]
+            ).unwrap();
+            store.connection.execute(
+                "INSERT INTO resident_swarm_nodes(graph_id,node_id,state,error)
+                 VALUES ('fallback-restart','lead','pending_fallback','first plan-only attempt failed')",[]
+            ).unwrap();
+            store.insert_preparing(&NewDaemonJob{
+                job_id:alternate.clone(),recipe_snapshot:root.join("alternate.json"),
+                priority:0,max_attempts:1,created_at_ms:100,
+                max_runtime_ms:60_000,max_memory_bytes:None,max_log_bytes:1024,
+                repository_policy_json:None,worktree_json:None,parent_run_id:None,
+            },16).unwrap();
+            // Process death here: queued alternate exists but SQLite graph cursor
+            // still says pending_fallback. Reattach without starting another run.
+        }
+        let store=DaemonStore::open(&paths).unwrap();
+        assert!(reattach_durable_job_stage(
+            &store,"fallback-restart","lead",&alternate,true,
+        ).unwrap());
+        let attached:(String,String)=store.connection.query_row(
+            "SELECT state,job_id FROM resident_swarm_nodes
+             WHERE graph_id='fallback-restart' AND node_id='lead'",[],
+            |row|Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(attached,("submitted_fallback".to_string(),alternate.clone()));
+        assert!(store.get_job(&alternate).unwrap().is_some());
+        assert!(store.get_job(&initial).unwrap().is_none());
+        assert!(reattach_durable_job_stage(
+            &store,"fallback-restart","lead",&alternate,true,
+        ).is_err());
+        assert!(!reattach_durable_job_stage(
+            &store,"fallback-restart","lead",&initial,false,
+        ).unwrap());
+        let _=std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn deterministic_node_job_identity_prevents_crash_window_duplication() {
         assert_eq!(stable_job_id("g","t"),stable_job_id("g","t"));
         assert_ne!(stable_job_id("g","t"),stable_job_id("g","u"));
