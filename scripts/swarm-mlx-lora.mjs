@@ -56,7 +56,7 @@ export function inspectDataset(directory){
  }
  return {files,all};
 }
-function testPpl(output){
+export function testPpl(output){
  const match=[...output.matchAll(/Test\s+ppl\s+([0-9]+(?:\.[0-9]+)?)/ig)].at(-1);
  const n=match?Number(match[1]):NaN;
  if(!Number.isFinite(n)||n<=0)throw Error('MLX test did not report a finite positive held-out perplexity');
@@ -137,7 +137,7 @@ async function main(){
   if(!existsSync(weights)||!lstatSync(weights).isFile()||
      !existsSync(join(adapter,'adapter_config.json')))
     throw Error('MLX training exited without a real adapter weights/config pair');
-  const test=mlx(python,[...common,'--adapter-path',adapter,'--test'],
+  const test=mlx(python,[...common,'--adapter-path',adapter,'--test', '--batch-size','1','--test-batches','-1'],
     plan.output,join(plan.output,'test.private.log'));
   const ppl=testPpl(test);
   result.testPerplexity=ppl;
@@ -146,9 +146,9 @@ async function main(){
   if(ppl>plan.maxTestPpl)throw Error('Independent held-out perplexity failed operator threshold');
   if(plan.previous){
    const old=mlx(python,['--model',plan.model,'--data',plan.regression,'--adapter-path',
-     plan.previous,'--test'],plan.output,join(plan.output,'old-regression.private.log'));
+     plan.previous,'--test','--batch-size','1','--test-batches','-1'],plan.output,join(plan.output,'old-regression.private.log'));
    const updated=mlx(python,['--model',plan.model,'--data',plan.regression,
-     '--adapter-path',adapter,'--test'],plan.output,join(plan.output,'new-regression.private.log'));
+     '--adapter-path',adapter,'--test','--batch-size','1','--test-batches','-1'],plan.output,join(plan.output,'new-regression.private.log'));
    result.regression={previousPpl:testPpl(old),newPpl:testPpl(updated)};
    const allowedIncrease=Number(argument('--max-regression-fraction')??'0.05');
    if(!Number.isFinite(allowedIncrease)||allowedIncrease<0||allowedIncrease>0.25)
@@ -170,6 +170,25 @@ async function main(){
      throw Error('MLX fusion did not produce a complete local config/safetensors model');
    result.fusedModelPath=fused;
    result.fusedConfigSha256=digest(readFileSync(join(fused,'config.json')));
+   // A file-level fusion receipt cannot prove inference quality. MLX can
+   // generate a structurally valid but degraded fused model for some
+   // quantization formats: independently evaluate the actual fused weights.
+   const fusedReport=mlx(python,['--model',fused,'--data',plan.data,
+     '--adapter-path','','--test','--batch-size','1','--test-batches','-1'],
+     plan.output,join(plan.output,'fused-test.private.log'));
+   result.fusedTestPerplexity=testPpl(fusedReport);
+   if(result.fusedTestPerplexity>plan.maxTestPpl ||
+      result.fusedTestPerplexity>ppl*1.05)
+     throw Error('Fused model failed held-out parity with its validated adapter');
+   if(plan.regression){
+     const fusedHistory=mlx(python,['--model',fused,'--data',plan.regression,
+       '--adapter-path','','--test','--batch-size','1','--test-batches','-1'],
+       plan.output,join(plan.output,'fused-regression.private.log'));
+     result.fusedRegressionPpl=testPpl(fusedHistory);
+     if(result.fusedRegressionPpl>result.regression.previousPpl*
+       (1+result.regression.maxFraction))
+       throw Error('Fused model failed historical-task regression gate');
+   }
    result.status='validated_fused_model_requires_manual_runtime_import';
   }
   console.log(JSON.stringify({status:result.status,adapter,
