@@ -43,6 +43,10 @@ pub struct ResidentSwarmNode {
     pub id: String,
     /// Local operator-selected recipe file, frozen at registration.
     pub recipe: String,
+    /// Explicitly preapproved local read-only alternate for an independent
+    /// task that fails. Frozen and permission-checked before graph registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_recipe: Option<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
     /// Opt-in: inject verified predecessor reports into this frozen local recipe.
@@ -68,6 +72,10 @@ pub fn validate(spec: &ResidentSwarmSpec) -> Result<Vec<String>, String> {
     for node in &spec.nodes {
         if !valid_id(&node.id) || node.recipe.trim().is_empty() || node.recipe.len() > 1024 ||
            (node.include_dependency_reports && node.depends_on.is_empty()) ||
+           node.fallback_recipe.as_ref().is_some_and(|fallback|
+               fallback.trim().is_empty() || fallback.len() > 1024 ||
+               fallback == &node.recipe || node.include_dependency_reports ||
+               !node.depends_on.is_empty()) ||
            !(1..=86_400).contains(&node.max_runtime_seconds) ||
            lookup.insert(node.id.as_str(), node).is_some() {
             return Err(format!("Invalid or duplicate swarm node '{}'", node.id));
@@ -169,6 +177,31 @@ pub fn submit(paths: &DaemonPaths, input: &Path) -> Result<serde_json::Value, St
         if !origin.is_absolute() { return Err("Swarm recipes must use absolute paths".into()); }
         let frozen = paths.snapshots.join(format!("resident-swarm-{}-{}.json", spec.id, node.id));
         freeze_recipe(&origin, &frozen)?;
+        if let Some(alternate) = node.fallback_recipe.as_ref() {
+            // Alternate execution may only replace a root plan-mode task.
+            // If the first attempt might have mutated files, automatically
+            // treating its failed run as succeeded would be unsafe.
+            let primary: little_monkey_lib::recipes::Recipe =
+                serde_json::from_slice(&std::fs::read(&frozen).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            if primary.permission_mode != "plan" {
+                return Err("Automatic coordinator fallback requires a read-only primary recipe".into());
+            }
+            let alternate_path = PathBuf::from(alternate);
+            if !alternate_path.is_absolute() {
+                return Err("Fallback recipe must use an absolute local path".into());
+            }
+            let alternate_frozen = paths.snapshots.join(format!(
+                "resident-swarm-{}-{}-fallback.json", spec.id, node.id));
+            freeze_recipe(&alternate_path, &alternate_frozen)?;
+            let alternate_check: little_monkey_lib::recipes::Recipe =
+                serde_json::from_slice(&std::fs::read(&alternate_frozen).map_err(|e|e.to_string())?)
+                .map_err(|e|e.to_string())?;
+            if alternate_check.permission_mode != "plan" {
+                return Err("Automatic coordinator fallback recipe must be read-only plan mode".into());
+            }
+            node.fallback_recipe = Some(alternate_frozen.to_string_lossy().to_string());
+        }
         node.recipe = frozen.to_string_lossy().to_string();
     }
     let json = serde_json::to_string(&spec).map_err(|e| e.to_string())?;
@@ -230,24 +263,36 @@ pub fn request_cancel(paths: &DaemonPaths, id: &str) -> Result<(), String> {
 
 /// Repair a crash between writing the daemon job and updating its graph
 /// cursor. Never re-enqueue a job whose deterministic id already exists.
-fn reattach_durable_job(
+fn reattach_durable_job_stage(
     store: &DaemonStore,
     graph_id: &str,
     node_id: &str,
     job_id: &str,
+    fallback: bool,
 ) -> Result<bool, String> {
-    if store.get_job(job_id)?.is_none() {
-        return Ok(false);
-    }
+    if store.get_job(job_id)?.is_none() { return Ok(false); }
+    let (pending,submitted) = if fallback {
+        ("pending_fallback","submitted_fallback")
+    } else { ("pending","submitted") };
     let updated = store.connection.execute(
-        "UPDATE resident_swarm_nodes SET state='submitted',job_id=?3
-         WHERE graph_id=?1 AND node_id=?2 AND state='pending'",
-        params![graph_id,node_id,job_id],
+        "UPDATE resident_swarm_nodes SET state=?4,job_id=?3
+         WHERE graph_id=?1 AND node_id=?2 AND state=?5",
+        params![graph_id,node_id,job_id,submitted,pending],
     ).map_err(|error|error.to_string())?;
     if updated != 1 {
         return Err("Swarm graph cursor changed while reattaching a durable job".into());
     }
     Ok(true)
+}
+fn reattach_durable_job(
+    store: &DaemonStore, graph_id: &str, node_id: &str, job_id: &str,
+) -> Result<bool, String> {
+    reattach_durable_job_stage(store,graph_id,node_id,job_id,false)
+}
+
+fn fallback_allowed(node: &ResidentSwarmNode, status: &str, outcome: JobState) -> bool {
+    status == "submitted" && outcome == JobState::Failed &&
+        node.fallback_recipe.is_some()
 }
 
 fn stable_job_id(graph: &str, task: &str) -> String {
@@ -408,7 +453,7 @@ pub fn tick(
         let mut failure = false;
         let mut active = 0usize;
         for (node, (status, job_id)) in &tasks {
-            if status != "submitted" { continue; }
+            if status != "submitted" && status != "submitted_fallback" { continue; }
             let Some(job_id) = job_id else { failure = true; continue; };
             let Some(job) = store.get_job(job_id)? else { failure = true; continue; };
             if job.state == JobState::Succeeded {
@@ -416,11 +461,23 @@ pub fn tick(
                     WHERE graph_id=?1 AND node_id=?2", params![id,node])
                     .map_err(|e| e.to_string())?;
             } else if job.state.is_terminal() {
-                store.connection.execute("UPDATE resident_swarm_nodes SET state='failed',error=?3
-                    WHERE graph_id=?1 AND node_id=?2",
-                    params![id,node,format!("Daemon job ended in {:?}",job.state)])
-                    .map_err(|e| e.to_string())?;
-                failure = true;
+                if spec.nodes.iter().find(|candidate| candidate.id.as_str() == node.as_str())
+                    .is_some_and(|candidate| fallback_allowed(candidate,status,job.state)) {
+                    // Switch cursor atomically to a different frozen recipe.
+                    // A crash cannot trigger duplicate execution: the second
+                    // attempt gets its own deterministic durable job identity.
+                    store.connection.execute(
+                        "UPDATE resident_swarm_nodes SET state='pending_fallback',job_id=NULL,error=?3
+                         WHERE graph_id=?1 AND node_id=?2 AND state='submitted'",
+                        params![id,node,"Primary read-only agent failed; alternate queued"],
+                    ).map_err(|e|e.to_string())?;
+                } else {
+                    store.connection.execute("UPDATE resident_swarm_nodes SET state='failed',error=?3
+                        WHERE graph_id=?1 AND node_id=?2",
+                        params![id,node,format!("Daemon job ended in {:?}",job.state)])
+                        .map_err(|e| e.to_string())?;
+                    failure = true;
+                }
             } else { active += 1; }
         }
         // Refresh the durable states after all completed children were noted.
@@ -439,12 +496,12 @@ pub fn tick(
         if state == "cancelling" || state == "failing" || failure {
             let mut still_running = false;
             for (node,(status,job_id)) in &states {
-                if status == "submitted" {
+                if status == "submitted" || status == "submitted_fallback" {
                     if let Some(job_id) = job_id {
                         let job = store.request_cancel(job_id, u64::try_from(now).unwrap_or(1))?;
                         if !job.state.is_terminal() { still_running = true; }
                     }
-                } else if status == "pending" {
+                } else if status == "pending" || status == "pending_fallback" {
                     store.connection.execute("UPDATE resident_swarm_nodes SET state='cancelled'
                         WHERE graph_id=?1 AND node_id=?2", params![id,node]).map_err(|e| e.to_string())?;
                 }
@@ -473,23 +530,33 @@ pub fn tick(
         }
         for node in &spec.nodes {
             if active >= spec.max_parallel { break; }
-            if states.get(&node.id).is_none_or(|(status,_)| status != "pending") { continue; }
+            let pending_state = states.get(&node.id).map(|(status,_)|status.as_str());
+            if pending_state != Some("pending") && pending_state != Some("pending_fallback") {
+                continue;
+            }
+            let fallback = pending_state == Some("pending_fallback");
             if !node.depends_on.iter().all(|dep|
                 states.get(dep).is_some_and(|(status,_)| status == "succeeded")) {
                 continue;
             }
-            let run_key = stable_job_id(&id,&node.id);
+            let run_key = if fallback {
+                stable_job_id(&id,&format!("fallback:{}",node.id))
+            } else { stable_job_id(&id,&node.id) };
             // Crash-window recovery: enqueue writes the durable daemon job
             // before recording the graph-node -> job mapping. If the service
             // crashes in between, blindly calling enqueue again would hit a
             // duplicate deterministic id and incorrectly fail the graph.
             // Reattach to that exact original job instead. The job queue is
             // the authority for its status and permissions.
-            if reattach_durable_job(store, &id, &node.id, &run_key)? {
+            if reattach_durable_job_stage(store, &id, &node.id, &run_key, fallback)? {
                 active += 1;
                 continue;
             }
-            let task_input = if node.include_dependency_reports {
+            let task_input: Result<String,String> = if fallback {
+                // Validation allows fallbacks only on independent read-only roots.
+                node.fallback_recipe.clone().ok_or_else(||
+                    "Durable fallback recipe absent from frozen graph".to_string())
+            } else if node.include_dependency_reports {
                 freeze_dependency_input(paths, &id, node, &states, store, shared)
                     .map(|p| p.to_string_lossy().to_string())
             } else { Ok(node.recipe.clone()) };
@@ -523,9 +590,11 @@ pub fn tick(
             match outcome {
                 Ok(queued) => {
                     store.connection.execute(
-                        "UPDATE resident_swarm_nodes SET state='submitted',job_id=?3
-                         WHERE graph_id=?1 AND node_id=?2 AND state='pending'",
-                        params![id,node.id,queued.job_id],
+                        "UPDATE resident_swarm_nodes SET state=?4,job_id=?3
+                         WHERE graph_id=?1 AND node_id=?2 AND state=?5",
+                        params![id,node.id,queued.job_id,
+                            if fallback {"submitted_fallback"} else {"submitted"},
+                            if fallback {"pending_fallback"} else {"pending"}],
                     ).map_err(|e| e.to_string())?;
                     active += 1;
                 }
@@ -555,8 +624,8 @@ mod tests {
     fn example() -> ResidentSwarmSpec {
         ResidentSwarmSpec { version: 1, id: "test-graph".into(), max_parallel: 2,
             nodes: vec![
-                ResidentSwarmNode { id:"survey".into(), recipe:"/tmp/survey.json".into(),depends_on:vec![],include_dependency_reports:false,max_runtime_seconds:100 },
-                ResidentSwarmNode { id:"verify".into(), recipe:"/tmp/verify.json".into(),depends_on:vec!["survey".into()],include_dependency_reports:true,max_runtime_seconds:100 },
+                ResidentSwarmNode { id:"survey".into(), recipe:"/tmp/survey.json".into(),depends_on:vec![],include_dependency_reports:false,fallback_recipe:None,max_runtime_seconds:100 },
+                ResidentSwarmNode { id:"verify".into(), recipe:"/tmp/verify.json".into(),depends_on:vec!["survey".into()],include_dependency_reports:true,fallback_recipe:None,max_runtime_seconds:100 },
             ],
         }
     }
@@ -576,6 +645,16 @@ mod tests {
         bad.nodes[0].include_dependency_reports = true;
         assert!(validate(&bad).is_err());
         assert!(example().nodes[1].include_dependency_reports);
+        let mut good=example();
+        good.nodes[0].fallback_recipe=Some("/tmp/alternative.json".into());
+        assert!(validate(&good).is_ok());
+        good.nodes[1].fallback_recipe=Some("/tmp/alternative.json".into());
+        assert!(validate(&good).is_err());
+        let main=&good.nodes[0];
+        assert!(fallback_allowed(main,"submitted",JobState::Failed));
+        assert!(!fallback_allowed(main,"submitted",JobState::Cancelled));
+        assert!(!fallback_allowed(main,"submitted",JobState::NeedsReconciliation));
+        assert!(!fallback_allowed(main,"submitted_fallback",JobState::Failed));
     }
     #[test]
     fn registered_graph_and_frozen_recipes_survive_reopening_the_daemon() {
@@ -595,15 +674,19 @@ mod tests {
             "params": {}
         }).to_string()).unwrap();
         let graph_path = root.join("graph.json");
+        let backup_path=root.join("backup.json");
+        std::fs::copy(&recipe_path,&backup_path).unwrap();
         let graph = ResidentSwarmSpec {
             version: 1, id: "resumable-test".into(), max_parallel: 1,
             nodes: vec![
                 ResidentSwarmNode {id:"survey".into(),recipe:recipe_path.to_string_lossy().to_string(),
-                    depends_on: vec![],include_dependency_reports:false,max_runtime_seconds: 120},
+                    depends_on: vec![],include_dependency_reports:false,fallback_recipe:None,max_runtime_seconds: 120},
                 ResidentSwarmNode {id:"verify".into(),recipe:recipe_path.to_string_lossy().to_string(),
-                    depends_on: vec!["survey".into()],include_dependency_reports:true,max_runtime_seconds: 120},
+                    depends_on: vec!["survey".into()],include_dependency_reports:true,fallback_recipe:None,max_runtime_seconds: 120},
             ],
         };
+        let mut graph=graph;
+        graph.nodes[0].fallback_recipe=Some(backup_path.to_string_lossy().to_string());
         std::fs::write(&graph_path,serde_json::to_vec(&graph).unwrap()).unwrap();
         let registered = submit(&paths,&graph_path).unwrap();
         assert_eq!(registered["state"],"running");
@@ -614,6 +697,7 @@ mod tests {
         assert_eq!(after_restart["graphs"][0]["state"],"running");
         let frozen = paths.snapshots.join("resident-swarm-resumable-test-survey.json");
         assert!(frozen.is_file());
+        assert!(paths.snapshots.join("resident-swarm-resumable-test-survey-fallback.json").is_file());
         let frozen_recipe: little_monkey_lib::recipes::Recipe =
             serde_json::from_slice(&std::fs::read(frozen).unwrap()).unwrap();
         let canonical_repository = repository.canonicalize().unwrap();
