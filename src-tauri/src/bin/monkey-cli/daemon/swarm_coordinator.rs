@@ -200,6 +200,9 @@ pub fn submit(paths: &DaemonPaths, input: &Path) -> Result<serde_json::Value, St
             if alternate_check.permission_mode != "plan" {
                 return Err("Automatic coordinator fallback recipe must be read-only plan mode".into());
             }
+            if alternate_check.target == primary.target {
+                return Err("Fallback must name a distinct explicitly approved model target".into());
+            }
             if alternate_check.workspace != primary.workspace {
                 return Err("Read-only fallback must use the identical canonical workspace".into());
             }
@@ -691,6 +694,13 @@ mod tests {
         let mut graph=graph;
         graph.nodes[0].fallback_recipe=Some(backup_path.to_string_lossy().to_string());
         std::fs::write(&graph_path,serde_json::to_vec(&graph).unwrap()).unwrap();
+        // The OS daemon must independently enforce a different target even
+        // when a hand-written graph bypasses the desktop compiler.
+        assert!(submit(&paths,&graph_path).unwrap_err().contains("distinct"));
+        let mut alternate:serde_json::Value=serde_json::from_slice(
+            &std::fs::read(&backup_path).unwrap()).unwrap();
+        alternate["target"]=serde_json::json!({"ollama":"qwen2.5:14b"});
+        std::fs::write(&backup_path,serde_json::to_vec(&alternate).unwrap()).unwrap();
         let registered = submit(&paths,&graph_path).unwrap();
         assert_eq!(registered["state"],"running");
         // Reopen the underlying SQLite file: no in-memory scheduler state is
