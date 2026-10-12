@@ -39,6 +39,34 @@ Changes and tests remain subject to Little Monkey's standard permissions.
 A workflow tool call can also select the fixed `security-red-team` and
 `security-audit-and-fix` presets described in [Security swarms](security-swarms.md).
 
+## Review-gated read-only desktop → daemon handoff
+
+In **Settings → Background Agents → Agent swarms**, enter a goal in
+**Read-only analysis** mode and choose **Run approved read-only goal in resident
+daemon**. Select an existing, previously reviewed **JSON task recipe** (which
+fixes the model target and absolute workspace), then select a local directory
+for the generated job snapshots. Review the final summary before submission.
+
+The desktop compiles each local \`explore\` agent into a distinct frozen
+headless task recipe, assigns each previous-phase task as a dependency of the
+next phase, forces **plan** permission even if the source recipe says manual,
+and registers the resulting graph with the resident SQLite-backed daemon.
+Frozen recipes retain the selected target, workspace, bounded system rules,
+timeout and iteration budgets. No remote peers, write agents, unknown
+permissions, messaging destinations, browser-only indexed memory, command
+hooks or automatic edits are forwarded. Unsafe configurations fail before
+any file is written. Registered graphs survive application restarts and can
+be inspected/cancelled in the same panel.
+
+**Important limitation:** the resident coordinator correctly enforces task
+dependencies but does not inject model reports from earlier jobs into later
+prompts. Later tasks therefore investigate the same workspace independently.
+For evidence-dependent synthesis requiring prior reports, use the interactive
+workflow tool and its explicitly reviewed recovery rather than assuming
+resident jobs exchanged evidence. Execution still requires a working local
+daemon and installed provider/model credentials. Conversion is opt-in, never
+automatic from a model-generated prompt.
+
 ## Native workflows in headless and daemon-owned model turns
 
 The native `monkey` CLI now offers the **same explicit phase-based
