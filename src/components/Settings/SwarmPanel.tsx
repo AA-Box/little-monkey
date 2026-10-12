@@ -547,7 +547,7 @@ export function SwarmPanel() {
             <option value="none">No structured votes</option>
             {SWARM_VOTE_POLICIES.map(value=><option key={value} value={value}>{value}</option>)}
           </select>
-        </label>
+        </label>}
         {mode === 'analyze' && <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-foreground">
           <label className="flex items-center gap-2">Team topology
             <select aria-label="Swarm team topology" value={topology}
