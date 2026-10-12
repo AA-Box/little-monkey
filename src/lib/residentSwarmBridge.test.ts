@@ -50,7 +50,7 @@ describe('safe read-only workflow to resident daemon handoff', () => {
     for (const bad of [
       { profile: 'code' },
       { peer: 'paired-node' },
-      { isolation: 'worktree' },
+      { isolation: 'worktree' as const },
       { peerCandidates: ['paired-node'] },
     ]) {
       const changed: WorkflowSpec = { ...spec, phases: [{
