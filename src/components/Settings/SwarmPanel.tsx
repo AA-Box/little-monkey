@@ -176,6 +176,9 @@ export function SwarmPanel() {
     total: run.phases.reduce((sum, phase) => sum + phase.agents.length, 0),
     sessionId: session.id, sourceRunId: run.sourceRunId ?? null, description: run.description,
     recoverable: Boolean(run.spec),
+    phases: run.phases,
+    resultJournal: run.agentResults ?? {},
+    elapsedMs: Math.max(0, run.finishedAt - run.startedAt),
   }))).sort((a, b) => b.startedAt - a.startedAt).slice(0, 20);
 
   const running = runs.filter(run => run.status === 'running');
@@ -551,6 +554,29 @@ export function SwarmPanel() {
             </Button>}
           {(run.status === 'error' || run.status === 'cancelled') && !run.recoverable &&
             <p className="text-faint">This older run has no saved recovery specification; it cannot be automatically reconstructed.</p>}
+          <details className="mt-2 rounded-md border border-border p-2">
+            <summary className="cursor-pointer text-xs font-medium text-foreground">
+              Execution trace · {run.phases.length} phases · {Math.round(run.elapsedMs / 1000)} s recorded
+            </summary>
+            <div className="mt-2 space-y-2">
+              {run.phases.map((phase, phaseIndex) => <section key={phaseIndex}
+                  aria-label={'Phase ' + (phaseIndex + 1) + ': ' + phase.title}>
+                <p className="text-xs font-medium text-foreground">{phaseIndex + 1}. {phase.title}</p>
+                {phase.agents.map(agent => {
+                  const recorded = run.resultJournal[agent.taskId];
+                  const agentState = recorded?.status ?? 'not completed';
+                  return <div key={agent.taskId} className="mt-1 ml-3 text-xs text-muted">
+                    <span className="font-medium">{agent.description}</span>
+                    {' — '}{agentState}{recorded?.reused ? ' (reused verified prompt journal)' : ''}
+                    {recorded?.report && <details className="mt-1">
+                      <summary className="cursor-pointer">Show saved report (untrusted)</summary>
+                      <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-background p-2 text-xs">{recorded.report.slice(0, 1_200)}</pre>
+                    </details>}
+                  </div>;
+                })}
+              </section>)}
+            </div>
+          </details>
           {run.status === 'done' && run.sourceRunId && <Button size="sm"
             disabled={learningBusy !== null}
             onClick={() => void proposeLearningCandidate(run.sourceRunId!, run.description)}>
