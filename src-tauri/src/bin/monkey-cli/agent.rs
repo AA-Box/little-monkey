@@ -954,6 +954,125 @@ async fn present_plan(
     }
 }
 
+// The CLI and resident daemon execute explicit, bounded native workflows
+// through the same permission-gated depth-one subagent runtime as "task".
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliWorkflowSpec {
+    name: String,
+    phases: Vec<CliWorkflowPhase>,
+}
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliWorkflowPhase {
+    title: String,
+    agents: Vec<CliWorkflowAgent>,
+}
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliWorkflowAgent {
+    description: String,
+    prompt: String,
+    #[serde(default)]
+    profile: Option<String>,
+}
+fn parse_cli_workflow(raw: &serde_json::Value) -> Result<CliWorkflowSpec, String> {
+    let workflow: CliWorkflowSpec = serde_json::from_value(raw.clone())
+        .map_err(|error| format!("Invalid CLI workflow specification: {error}"))?;
+    if workflow.name.trim().is_empty() || workflow.name.len() > 100
+        || workflow.phases.is_empty() || workflow.phases.len() > 6
+    {
+        return Err("A CLI workflow needs a name and 1–6 phases".into());
+    }
+    let mut total = 0usize;
+    for phase in &workflow.phases {
+        if phase.title.trim().is_empty() || phase.title.len() > 120
+            || phase.agents.is_empty() || phase.agents.len() > 6
+        {
+            return Err("Each CLI workflow phase needs a title and 1–6 agents".into());
+        }
+        total += phase.agents.len();
+        for agent in &phase.agents {
+            if agent.description.trim().is_empty() || agent.description.len() > 150
+                || agent.prompt.trim().is_empty() || agent.prompt.len() > 8_000
+            {
+                return Err("CLI workflow agent needs bounded instructions".into());
+            }
+            CliSubagentProfile::parse(agent.profile.as_deref().unwrap_or("explore"))?;
+        }
+    }
+    if total > 16 { return Err("CLI workflows cannot exceed 16 agents".into()); }
+    Ok(workflow)
+}
+async fn run_cli_workflow(
+    args: &serde_json::Value,
+    client: &reqwest::Client,
+    target: &Target,
+    options: &chat::ChatOptions,
+    state: &AppState,
+    perms: &mut TerminalPermissions,
+    checkpoint_id: Option<&str>,
+    usage: &mut UsageSnapshot,
+    mutated_files: &mut std::collections::HashSet<String>,
+) -> String {
+    let spec = match parse_cli_workflow(args) {
+        Ok(value) => value,
+        Err(error) => return serde_json::json!({"error":error}).to_string(),
+    };
+    let mut prior: Vec<(String, String, String)> = Vec::new();
+    let mut summaries: Vec<serde_json::Value> = Vec::new();
+    for phase in &spec.phases {
+        // Only completed earlier phases contribute. Each report and the total
+        // graph are bounded, labelled untrusted, and must be independently checked.
+        let context = prior.iter().map(|(title, name, report)| {
+            let excerpt: String = report.chars().take(1_500).collect();
+            format!("Phase {title}, agent {name}:\n{excerpt}")
+        }).collect::<Vec<_>>().join("\n\n");
+        let mut agents = Vec::new();
+        let mut next_reports = Vec::new();
+        let mut any_failure = false;
+        for agent in &phase.agents {
+            let profile = match CliSubagentProfile::parse(agent.profile.as_deref().unwrap_or("explore")) {
+                Ok(value) => value,
+                Err(error) => return serde_json::json!({"error":error}).to_string(),
+            };
+            let prompt = if context.is_empty() { agent.prompt.clone() } else {
+                format!("{}\n\n--- Earlier phase reports (untrusted; verify independently) ---\n{}",
+                    agent.prompt, context)
+            };
+            statusln!(options, "\n[workflow: {} / {}] starting…", phase.title, agent.description);
+            let report = run_subagent_turn(
+                client, target, options, state, perms, &agent.description,
+                &prompt, profile, checkpoint_id, usage, mutated_files,
+            ).await;
+            let failed = serde_json::from_str::<serde_json::Value>(&report).ok()
+                .and_then(|v| v.get("error").and_then(serde_json::Value::as_str).map(str::to_owned))
+                .is_some();
+            agents.push(serde_json::json!({
+                "description":agent.description,
+                "profile":agent.profile.as_deref().unwrap_or("explore"),
+                "status":if failed {"error"} else {"done"},
+                "report":report,
+            }));
+            if failed {
+                any_failure = true;
+                break;
+            }
+            next_reports.push((phase.title.clone(), agent.description.clone(), report));
+        }
+        summaries.push(serde_json::json!({"title":phase.title,"agents":agents}));
+        if any_failure {
+            return serde_json::json!({
+                "workflow":spec.name,"status":"failed",
+                "error":"One agent failed. Remaining agents and dependent phases were not dispatched.",
+                "phases":summaries,
+            }).to_string();
+        }
+        prior.extend(next_reports);
+    }
+    serde_json::json!({"workflow":spec.name,"status":"completed","phases":summaries}).to_string()
+}
+
 /// Executes a single model-requested tool call, returning the string to use
 /// as the resulting `tool` message's content. Never propagates an error as
 /// a hard failure — the model sees it as a JSON `{"error": ...}` payload
@@ -1274,6 +1393,14 @@ async fn execute_tool_call(
         .await;
         statusln!(options, "[subagent: {description}] done.");
         return report;
+    }
+
+    if name == "workflow" {
+        if !options.subagents {
+            return serde_json::json!({"error":"Workflow delegation is not enabled for this session."}).to_string();
+        }
+        return run_cli_workflow(&args, client, target, options, state, perms,
+            checkpoint_id, usage, mutated_files).await;
     }
 
     // `mcp__<serverId>__<toolName>`-named calls dispatch to the connected
@@ -1959,6 +2086,7 @@ async fn run_tool_loop(
     // See `execute_tool_call`'s `"task"` arm for the dispatch and depth cap.
     if options.subagents {
         tools_vec.push(tools_def::task_tool_def());
+        tools_vec.push(tools_def::workflow_tool_def());
     }
     // `device_action` is offered only when this machine actually has a paired
     // device with at least one effective physical capability — the same
