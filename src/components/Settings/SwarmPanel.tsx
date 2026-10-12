@@ -202,14 +202,22 @@ export function SwarmPanel() {
     try{
       const raw:unknown=JSON.parse(await readTextFile(selected));
       const receipt=parseValidatedMlxFusionReceipt(raw);
-      const text=await readTextFile(receipt.fusedModelPath.replace(/[\\/]$/,'')+'/config.json');
+      // The selected receipt only authorizes reading that file. Explicitly
+      // ask the operator to select the model folder too; Tauri FS scopes
+      // must not be silently widened by a JSON-controlled path.
+      const selectedFolder=await open({directory:true,multiple:false});
+      if(typeof selectedFolder!=='string')return;
+      const normalize=(path:string)=>path.replace(/\\/g,'/').replace(/\/+$/,'');
+      if(normalize(selectedFolder)!==normalize(receipt.fusedModelPath))
+        throw Error('Selected MLX model folder does not match the evaluated receipt.');
+      const text=await readTextFile(selectedFolder.replace(/[\\/]$/,'')+'/config.json');
       await verifyFusedModelConfig(text,receipt.fusedConfigSha256);
       if(!window.confirm('Import this locally trained MLX model directory WITHOUT activating it?\n'+
         receipt.fusedModelPath+'\n\n'+
         'Measured fused held-out perplexity: '+receipt.fusedTestPerplexity+
         '. The receipt and hash are local evidence, NOT a trusted signature. '+
         'Review the folder source and tests, then select/test the model manually after import.'))return;
-      const models=await useModelStore.getState().addExternalFolder(receipt.fusedModelPath);
+      const models=await useModelStore.getState().addExternalFolder(selectedFolder);
       if(!models.some(model=>model.runtime==='mlx'))
         throw Error('Native model importer did not register an MLX-compatible model.');
       setNotice('Fused MLX model registered with the native model catalog. Active model NOT changed. Select it in Models to verify real inference and rollback if needed.');
