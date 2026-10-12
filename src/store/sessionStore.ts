@@ -1507,25 +1507,44 @@ function parsePersisted(raw: string | null, interruptRunning: boolean): Persiste
 
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingPayload: string | null = null;
+// File saves must be FIFO: a slow earlier write must never overwrite a
+// completed workflow checkpoint written later. Awaitable barriers share this
+// queue with the ordinary debounced chat saves.
+let persistenceQueue: Promise<void> = Promise.resolve();
 
-function flushPersist(): void {
+function flushPersist(): Promise<void> {
   if (persistTimer !== null) {
     clearTimeout(persistTimer);
     persistTimer = null;
   }
   const payload = pendingPayload;
   pendingPayload = null;
-  if (payload === null) return;
+  if (payload === null) return persistenceQueue;
 
-  invoke("sessions_save", { payload })
-    .then(() => {
+  const next = persistenceQueue.catch(() => undefined).then(async () => {
+    try {
+      await invoke("sessions_save", { payload });
       if (useSessionStore.getState().persistError !== null) {
         useSessionStore.setState({ persistError: null });
       }
-    })
-    .catch((err: unknown) => {
+    } catch (err) {
       useSessionStore.setState({ persistError: errorMessage(err) });
-    });
+      throw err;
+    }
+  });
+  persistenceQueue = next;
+  // Ordinary debounced callers cannot await a timer callback; errors still
+  // surface in persistError. Explicit workflow barriers await the same promise.
+  void next.catch(() => undefined);
+  return next;
+}
+
+/** Durability barrier for workflow checkpoints. Flushes all earlier queued
+ * session saves and the latest snapshot before a dependent agent may start.
+ * Browser-only tests have no filesystem and retain in-memory behavior. */
+export async function flushSessionPersistence(): Promise<void> {
+  if (!isTauri()) return;
+  await flushPersist();
 }
 
 function persist(
@@ -1545,7 +1564,7 @@ function persist(
     return;
   }
   if (persistTimer === null) {
-    persistTimer = setTimeout(flushPersist, PERSIST_DEBOUNCE_MS);
+    persistTimer = setTimeout(() => { void flushPersist(); }, PERSIST_DEBOUNCE_MS);
   }
 }
 
@@ -1553,7 +1572,7 @@ function persist(
 // mid-debounce. The IPC message is posted synchronously even though its
 // completion can't be awaited here.
 if (typeof window !== "undefined") {
-  window.addEventListener("beforeunload", flushPersist);
+  window.addEventListener("beforeunload", () => { void flushPersist(); });
 }
 
 /**
