@@ -43,7 +43,8 @@ import {
 import { getActiveChatTarget, useModelStore, type MlxChatStatus as MlxChatStatusPayload } from '../store/modelStore';
 import { useCostControlStore } from '../store/costControlStore';
 import { useRoutingPolicyStore } from '../store/routingPolicyStore';
-import { rankEligibleSwarmTargets } from './swarmVerifiedBenchmarks';
+import { rankEligibleSwarmTargets,loadSwarmBenchmark,swarmBenchmarkRoutingEnabled } from './swarmVerifiedBenchmarks';
+import { optimizeSwarmRoutingCosts,swarmCostOptimizationEnabled } from './swarmCostOptimizer';
 
 /** Mirrors `LlamaState::default()` in src-tauri/src/llama.rs. */
 const DEFAULT_LLAMA_PORT = 8090;
@@ -476,14 +477,26 @@ export function routeFromActive(active: ResolvedTarget, context: RoutingContext)
     policy?.preferredTargetKeys.length === 0
     ? rankEligibleSwarmTargets(initial.sequence, policy.preferredTargetKeys)
     : [...initial.sequence];
+  const costPlan=initial.policyId &&
+    (context.taskClass==='subagent_explore'||context.taskClass==='subagent_code') &&
+    policy?.preferredTargetKeys.length===0 && swarmBenchmarkRoutingEnabled()
+    ? optimizeSwarmRoutingCosts(ranked,loadSwarmBenchmark(),
+        useCostControlStore.getState().rates,useCostControlStore.getState().entries,
+        swarmCostOptimizationEnabled(),policy.preferredTargetKeys)
+    : {sequence:ranked,changed:false,estimatedSavingsFraction:null,evidenceSamples:0};
+  const finalOrder=costPlan.sequence;
   const benchmarkChanged = ranked.length > 1 && ranked[0] !== initial.chosenKey;
-  const decision: RoutingDecision = benchmarkChanged ? {
+  const decision: RoutingDecision = benchmarkChanged||costPlan.changed ? {
     ...initial,
-    chosenKey: ranked[0],
-    changedFromActive: ranked[0] !== activeKey,
-    sequence: ranked,
+    chosenKey: finalOrder[0],
+    changedFromActive: finalOrder[0] !== activeKey,
+    sequence: finalOrder,
     reason: initial.reason +
-      ' Operator-approved live-model fixture accuracy reordered eligible subagent candidates; permissions, privacy policy and explicit pins remain authoritative.',
+      (benchmarkChanged ? ' Operator-approved live-model fixture accuracy reordered eligible subagent candidates.' : '') +
+      (costPlan.changed ?
+        ' Opted-in cost optimizer picked an independently fixture-equivalent candidate with configured model prices and observed token mix; predicted token-rate savings '+
+        Math.round((costPlan.estimatedSavingsFraction??0)*100)+'% (NOT provider billing).' : '') +
+      ' Permissions, privacy policy and explicit pins remain authoritative.',
   } : initial;
   useRoutingPolicyStore.getState().recordDecision(decision);
 

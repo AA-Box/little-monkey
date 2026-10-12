@@ -35,6 +35,7 @@ import {
   setSwarmBenchmarkRouting, swarmBenchmarkRoutingEnabled,
 } from '../../lib/swarmVerifiedBenchmarks';
 import { skillLearningClient } from '../../lib/skillLearningClient';
+import { setSwarmCostOptimization,swarmCostOptimizationEnabled } from '../../lib/swarmCostOptimizer';
 import { decideSwarmNote, listSwarmNotebook, revertSwarmNote } from '../../lib/swarmNotebook';
 import { approvedNotebookVectorClaim } from '../../lib/swarmNotebookVector';
 import { useSessionStore } from '../../store/sessionStore';
@@ -65,6 +66,7 @@ export function SwarmPanel() {
   const [learningBusy, setLearningBusy] = useState<string | null>(null);
   const [benchmark, setBenchmark] = useState(() => loadSwarmBenchmark());
   const [benchmarkRouting, setBenchmarkRouting] = useState(() => swarmBenchmarkRoutingEnabled());
+  const [costRouting, setCostRouting] = useState(() => swarmCostOptimizationEnabled());
   const [specialistQuality, setSpecialistQuality] = useState(() => listVerifiedSpecialists());
   const [specialistQualityDomain, setSpecialistQualityDomain] = useState<VerifiedSpecialistDomain>('security');
   const [specialistQualityRouting, setSpecialistQualityRouting] = useState(() => verifiedSpecialistRoutingEnabled('security'));
@@ -608,6 +610,14 @@ export function SwarmPanel() {
             <input type="checkbox" checked={benchmarkRouting}
               onChange={event => changeBenchmarkRouting(event.target.checked)} />
             Opt in to quality-ranked candidate order for subagents when a routing policy has no explicit preferred models.
+          </label>
+          <label className="mt-2 flex items-start gap-2 text-xs text-foreground">
+            <input type="checkbox" checked={costRouting}
+              onChange={event => {
+                setSwarmCostOptimization(event.target.checked);
+                setCostRouting(swarmCostOptimizationEnabled());
+              }}/>
+            Additionally optimize price among independently graded, quality-equivalent, already eligible subagent targets. Requires six fixture observations per model, configured input/output rates, and at least three historical usage samples. Minimum 10% estimated rate savings; never overrides model pins, policy restrictions or privacy. This estimates token rates, not bills.
           </label>
         </>}
       </div>

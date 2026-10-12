@@ -158,3 +158,21 @@ fine-tuning are **not** represented as completed here.
 ### Bounded independent reviewer voting policies
 
 `consensus: strict | majority | supermajority | unanimous` selects a read-only vote threshold for source-citing claims. Strict keeps two independent reviewers. The other policies run five separately tasked reviewers and require respectively three, four or five agreeing votes. Any explicit rejection means **disputed**, even if supporters reach quorum. Missing/malformed votes count against the planned threshold, not for it. The result is non-authoritative reviewer agreement, never a proof of correctness or a Raft/Paxos/BFT distributed protocol. No policy grants writes or overrides ordinary approvals.
+
+
+### Opt-in quality-constrained model cost optimizer
+
+The Swarms panel can independently enable model-cost optimization after
+operator-approved source-fixture quality ranking. Inside a pre-existing
+routing policy's **already eligible and unpinned** subagent candidates, the
+optimizer requires at least six independently graded fixtures per model,
+at least 80% accuracy, within two percentage points of the top model,
+explicit input/output rates for both contenders, and at least three real
+recorded input/output usage samples. It applies one shared measured token
+mix to each model rate, choosing a cheaper equivalent only when the
+estimated difference is at least 10%. Otherwise it returns the exact
+original routing order; missing prices/quality/usage never become zero.
+It never changes the active chat model, authorization, egress, or explicit
+model pins. These are configured-rate **estimates**, not actual provider
+invoices, and model-output quality is task dependent. Existing budget
+enforcement and permission checks remain independently authoritative.
