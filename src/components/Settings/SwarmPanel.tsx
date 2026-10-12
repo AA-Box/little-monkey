@@ -12,6 +12,7 @@ import { SWARM_TOPOLOGIES, type SwarmTopology } from '../../lib/swarmCoordinatio
 import { SWARM_VOTE_POLICIES,type SwarmVotePolicy } from '../../lib/swarmConsensus';
 import { swarmMissionOverview, projectSwarmBudget, estimateSwarmMissionSpend, estimateSwarmRatedSpend } from '../../lib/swarmMissionDashboard';
 import {useCostControlStore} from '../../store/costControlStore';
+import {prepareRufloMcpBridge} from '../../lib/rufloMcpBridge';
 import {
   distillLearningCandidate, listLearningPatterns, decideLearningCandidate,
   forgetLearningPattern,
@@ -54,6 +55,7 @@ export function SwarmPanel() {
   const [capabilityPack, setCapabilityPack] = useState<SwarmPresetName>('frontend-audit');
   const [reviewedPacks, setReviewedPacks] = useState(() => listReviewedSwarmPacks());
   const [packBusy, setPackBusy] = useState(false);
+  const [rufloVersion,setRufloVersion]=useState('');
   const [mode, setMode] = useState<'analyze' | 'implement'>('analyze');
   const [topology, setTopology] = useState<SwarmTopology>('phased');
   const [learningHints, setLearningHints] = useState(false);
@@ -121,6 +123,7 @@ export function SwarmPanel() {
   },[mission,estimatedUsdPerMillion]);
   const mcpServers = useMcpStore(state => state.servers);
   const refreshPlugins = useMcpStore(state => state.refresh);
+  const addMcpServer = useMcpStore(state => state.addServer);
   const notebookProject = sessions.find(session => session.id === sessionId)?.workspacePath?.trim() || 'session:' + sessionId;
   const notes = useMemo(() => listSwarmNotebook(notebookProject), [notebookProject, notebookRefresh, sessions]);
 
@@ -311,6 +314,22 @@ export function SwarmPanel() {
       }));
       setNotice('Reviewed pack prepared in chat. Inspect all agents and press Send only if authorized.');
     }catch(e){setError('Pack validation refused: '+String(e));}
+  }
+  async function stageRufloMcp() {
+    setPluginBusy('ruflo');setError('');
+    try {
+      const entry=prepareRufloMcpBridge(rufloVersion.trim());
+      if(mcpServers.some(s=>s.id===entry.id))
+        throw new Error('A Ruflo MCP server is already configured. Manage it in MCP Settings.');
+      if(!window.confirm(
+        'Stage version-pinned external Ruflo MCP as DISABLED with an EMPTY tool allowlist? '+
+        'No npm command will run. Ruflo tooling/mods are external executable code and not sandboxed. '+
+        'You must separately inspect it, grant explicit individual tools, and enable/connect it in MCP Settings.'
+      ))return;
+      await addMcpServer(entry);
+      setNotice('Version-pinned Ruflo MCP registered as disabled and deny-all. No process started or tools granted. Review in MCP Settings.');
+    }catch(e){setError('Ruflo MCP configuration refused: '+String(e));}
+    finally{setPluginBusy(null);}
   }
   function prepareCapabilityPack() {
     try {
@@ -816,6 +835,19 @@ export function SwarmPanel() {
       </div>
       <div className="rounded-lg border border-border bg-surface p-3">
         <h4 className="text-sm font-semibold text-foreground">MCP plugin interoperability</h4>
+        <div className="mt-3 rounded-md border border-border p-3">
+          <p className="text-xs font-medium text-foreground">External Ruflo MCP compatibility (operator reviewed)</p>
+          <p className="mt-1 text-xs text-muted">Registers a pinned npx Ruflo MCP stdio server but does NOT launch it, install host mods, or grant any tools. You must review its package, configure a narrow explicit tool allowlist, enable and connect from MCP Settings. Not a claim of native Ruflo mod/hook parity.</p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <input aria-label="Pinned Ruflo version" value={rufloVersion} onChange={event=>setRufloVersion(event.target.value)}
+              placeholder="Exact release, e.g. 3.6.0"
+              className="min-w-40 flex-1 rounded border border-border bg-background px-2 py-1 text-xs text-foreground" />
+            <Button size="sm" disabled={pluginBusy!==null || mcpServers.some(server=>server.id==='ruflo-operator-mcp')}
+              onClick={()=>void stageRufloMcp()}>
+              {mcpServers.some(server=>server.id==='ruflo-operator-mcp') ? 'Registered in MCP Settings' : 'Stage disabled Ruflo MCP'}
+            </Button>
+          </div>
+        </div>
         <p className="mt-1 text-xs text-muted">Lifecycle controls for operator-configured MCP servers. External servers expose tools only through explicit approvals and do not expand agent permissions automatically. Review each server's allowlist under MCP settings; external stdio processes are outside the native sandbox.</p>
         <div className="mt-2 flex flex-wrap justify-end gap-2">
           <Button size="sm" onClick={() => void refreshPlugins()}><RefreshCw size={13}/> Refresh connections</Button>

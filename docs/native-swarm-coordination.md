@@ -288,3 +288,18 @@ local receipt; **the active model is not silently switched**. Hardware/model
 acceptance has not been executed by ordinary CI; CI only runs input/command
 contract tests. Real adapter loading and quality should be independently
 verified in the chosen runtime before an operator promotes it.
+
+
+### Staged, operator-pinned Ruflo MCP interoperability
+
+The Swarms panel offers an **inert** Ruflo MCP registration helper. Enter
+an exact reviewed npm version; it creates an existing native MCP stdio
+entry using `npx -y ruflo@VERSION mcp start`, but sets
+`enabled: false` and `tool_allowlist: []`, never `null`. It does
+**not launch the external process**, download/install packages, grant any
+tool access, or install Claude host mods/hooks. The operator must review
+the package, configure a limited allowlist and explicitly enable/connect
+it in ordinary MCP Settings. This makes the documented Ruflo MCP tool
+server callable through the existing Little Monkey MCP authorization path
+when configured; it is not Ruflo-native mod or plugin compatibility and
+does not import untrusted arbitrary scripts.
