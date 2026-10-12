@@ -29,12 +29,14 @@ import { useSavedWorkflowStore, type SavedWorkflow } from '../store/savedWorkflo
 import { unwrapUntrustedContent, wrapUntrustedContent } from './untrustedContent';
 import { buildSwarmPreset } from './swarmPresets';
 import { buildGoalSwarm, parseSwarmMemoryStackIds, selectSwarmDomain } from './swarmPlanning';
-import { recordSpecialistMetric } from './swarmSpecialistMetrics';
+import { recordSpecialistMetric, loadSpecialistMetrics } from './swarmSpecialistMetrics';
+import { parseSwarmTopology, planCoordinationWaves, formatWaveMessages, type SwarmTopology } from './swarmCoordination';
 import { retrieveSwarmKnowledge } from './swarmKnowledge';
 import { compileSwarmTaskGraph } from './swarmGraph';
 import { assertReadOnlyPeerPlacement } from './swarmPeerSchema';
 import { reconcileSwarmReviewers } from './swarmConsensus';
 import { approvedSwarmNotebookBlock, stageSwarmNote } from './swarmNotebook';
+import { approvedLearningContext } from './swarmLearningCycle';
 
 export interface WorkflowAgentSpec {
   description: string;
@@ -65,6 +67,8 @@ export interface WorkflowSpec {
   name: string;
   description: string;
   phases: { title: string; agents: WorkflowAgentSpec[] }[];
+  /** Optional read-only local coordination between agents in a phase. */
+  topology?: SwarmTopology;
   /** Existing, indexed Knowledge 2.0 stacks explicitly selected for this run. */
   memoryStackIds?: string[];
   /** Do not run downstream phases after failed prerequisites. */
@@ -73,6 +77,8 @@ export interface WorkflowSpec {
   consensus?: 'strict';
   /** Opt-in, operator-approved versioned notebook reference and staging. */
   notebook?: boolean;
+  /** Explicit opt-in to operator-approved, domain-matched past learning. */
+  learning?: boolean;
 }
 
 /** Caps mirror the tool schema's documented limits — validated here anyway
@@ -110,7 +116,16 @@ export function assertWorkflowBounds(spec: WorkflowSpec): void {
   }
   if (total > MAX_WORKFLOW_AGENTS) throw new Error('Workflow cannot exceed 16 agents.');
   if (spec.consensus !== undefined && spec.consensus !== 'strict') throw new Error('Invalid consensus mode.');
+  const topology = parseSwarmTopology(spec.topology);
+  if (topology !== 'phased' && spec.phases.some(phase => phase.agents.some(agent =>
+    agent.profile !== 'explore' || agent.peer !== undefined || agent.peerCandidates?.length || agent.isolation))) {
+    throw new Error('Non-phased coordination is local, read-only and cannot relay reports to remote peers or modifying agents.');
+  }
   if (spec.memoryStackIds !== undefined) parseSwarmMemoryStackIds(spec.memoryStackIds);
+  if (spec.learning !== undefined && typeof spec.learning !== 'boolean') throw new Error('Invalid learning flag.');
+  if (spec.learning && spec.phases.some(phase=>phase.agents.some(agent=>agent.peer!==undefined || agent.profile!=='explore'))) {
+    throw new Error('Operator-approved learning retrieval is local read-only only.');
+  }
 }
 
 /** Per-injected-report cap for the prior-phase context block (chars) — a
@@ -175,11 +190,15 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
   if (totalAgents > MAX_WORKFLOW_AGENTS) {
     throw new Error(`workflow allows at most ${MAX_WORKFLOW_AGENTS} agents in total.`);
   }
+  const topology = parseSwarmTopology(args.topology);
   const memoryStackIds = parseSwarmMemoryStackIds(args.memory_stack_ids);
   if (args.consensus !== undefined && args.consensus !== 'strict') throw new Error('Unsupported workflow consensus policy.');
-  return { name, description, phases, ...(args.stop_on_failure === true ? { stopOnFailure: true } : {}),
+  return { name, description, phases,
+    ...(topology !== 'phased' ? { topology } : {}),
+    ...(args.stop_on_failure === true ? { stopOnFailure: true } : {}),
     ...(args.consensus === 'strict' ? { consensus: 'strict' as const } : {}),
     ...(args.notebook === true ? { notebook: true } : {}),
+    ...(args.learning === true ? { learning: true } : {}),
     ...(memoryStackIds.length ? { memoryStackIds } : {}) };
 }
 
@@ -207,6 +226,8 @@ export function resolveWorkflowSpec(args: Record<string, unknown>, sessionId?: s
       stop_on_failure: meta.spec.stopOnFailure,
       consensus: meta.spec.consensus,
       notebook: meta.spec.notebook,
+      learning: meta.spec.learning,
+      topology: meta.spec.topology,
     });
   }
   if (args.goal !== undefined) return buildGoalSwarm(args);
@@ -498,6 +519,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
     const session = useSessionStore.getState().sessions.find(s => s.id === sessionId);
     const notebookProject = session?.workspacePath?.trim() || 'session:' + sessionId;
     const notebookBlock = spec.notebook ? approvedSwarmNotebookBlock(notebookProject) : '';
+    const learningBlock = spec.learning ? approvedLearningContext(selectSwarmDomain(spec.description)) : '';
     const priorReports: PhaseReport[] = [];
     const phaseSummaries: { title: string; agents: { description: string; status: string; report: string; reused?: boolean }[] }[] = [];
 
@@ -506,14 +528,29 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
       useWorkflowStore.getState().beginPhase(toolCallId, phaseIndex);
       const phase = spec.phases[phaseIndex];
       const contextBlock = buildPriorReportsBlock(priorReports);
-      const sharedContext = [knowledgeBlock, notebookBlock].filter(Boolean).map(x => '\n\n' + x).join('');
+      const sharedContext = [knowledgeBlock, notebookBlock, learningBlock].filter(Boolean).map(x => '\n\n' + x).join('');
 
       const limit = useSettingsStore.getState().maxConcurrentSubagents;
-      const results = await runBounded(
-        phase.agents.map((agent, agentIndex) => async () => {
+      // A topology is a scheduling policy, never a new agent/permission grant.
+      // A failed coordinator can be bypassed by later read-only waves,
+      // but modifying workflows cannot use these policies.
+      const stats = loadSpecialistMetrics();
+      const domain = selectSwarmDomain(spec.description);
+      const waves = planCoordinationWaves(spec.topology ?? 'phased', phase.agents.length,
+        phase.agents.map(agent => {
+          const observation = stats[domain + ':' + agent.description];
+          return {completions: observation?.successes ?? 0, failures: observation?.failures ?? 0};
+        }));
+      const results: string[] = new Array(phase.agents.length);
+      const waveMessages: {sender: string; report: string}[] = [];
+      for (const wave of waves.waves) {
+        const completed = await runBounded(
+          wave.map(agentIndex => {
+            const agent = phase.agents[agentIndex];
+            return async () => {
           const startedAt = Date.now();
           const agentTaskId = workflowAgentTaskId(toolCallId, phaseIndex, agentIndex);
-          const prompt = `${agent.prompt}${contextBlock}${sharedContext}`;
+          const prompt = `${agent.prompt}${contextBlock}${sharedContext}${formatWaveMessages(waveMessages, agent.description, waves.topology)}`;
           const hash = promptHash(prompt);
 
           // Resume hit: the same position in the resumed run completed with
@@ -573,9 +610,18 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
             recordSpecialistMetric(selectSwarmDomain(spec.description), agent.description, !failed, Date.now() - startedAt);
           }
           return raw;
+          };
         }),
         limit,
       );
+        wave.forEach((index, ordinal) => {
+          const report = completed[ordinal];
+          results[index] = report;
+          if (report && unwrapUntrustedContent(report) !== CANCELLED_TOOL_RESULT && !resultIsError(report)) {
+            waveMessages.push({sender: phase.agents[index].description, report});
+          }
+        });
+      }
 
       const agents = phase.agents.map((agent, agentIndex) => {
         const raw = results[agentIndex];

@@ -393,3 +393,7 @@ with an installed model for real evidence (repeat for the other domains).
 See `docs/swarm-release-acceptance.md` for per-domain invocation, result
 import, and operational release gates.
 
+
+## Native team coordination, evaluated learning and mission observability
+
+See [Native swarm coordination and learning](native-swarm-coordination.md) for read-only team topology modes, independently judged learning, review-gated consolidation, native capability packs, token forecasting, and the remaining real-device acceptance requirements.

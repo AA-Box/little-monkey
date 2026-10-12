@@ -1,0 +1,116 @@
+# Native team coordination, learning, packs and mission telemetry
+
+Little Monkey implements its own permission-controlled agent team runtime. The
+interfaces below operate on first-party workflow, session and daemon records
+and never add an external orchestration framework.
+
+## Team topologies and failure boundaries
+
+Specify `topology` on a read-only local workflow or analysis goal:
+
+| Mode | Dispatch | Communication and leader recovery |
+| --- | --- | --- |
+| `phased` (default) | existing bounded independent agents per phase | previous-phase reports |
+| `star` | initial coordinator, followed by other agents | successful leader report is relayed as untrusted source text |
+| `hierarchical` | lead then bounded successive worker tiers | reports from earlier tiers are relayed, never as tool commands |
+| `ring` | single successive agent per wave | each successor receives bounded prior successful reports |
+| `mesh` | independent bounded simultaneous agents | findings are reconciled by existing downstream validation/consensus phases, not repeated file edits |
+| `adaptive` | observed reliable coordinator then sequential fallbacks | model mistakes or unavailable agents do not grant others new permissions; only successful reports are relayed |
+
+A failed initial read-only coordinator is **not re-executed** automatically.
+Subsequent waves continue without the failed report, which permits an
+eligible worker to synthesize and challenge sources. There is no privileged
+leader token. Prompts relay bounded JSON-quoted **untrusted** reports and
+never grant a new tool, model, workspace or peer. Because agent writes cannot
+be made exactly-once with model-controlled retries, all non-default
+intra-team topologies are rejected for code agents, worktrees and remote
+peers. Write-capable and remote execution continue to use frozen, phase/
+dependency-driven daemon DAGs, checked receipts and operator approval.
+
+A goal tool call may use:
+
+```json
+{"goal":"Investigate API access correctness","mode":"analyze",
+ "topology":"adaptive","consensus":"strict"}
+```
+
+## Four-stage evaluated learning
+
+1. **Retrieve:** With `learning:true` in a local read-only analysis goal,
+   the runner retrieves only operator-approved, unexpired patterns of the
+   **same domain**, wrapped as untrusted historical reference. The configured
+   Knowledge 2.0 stack and versioned notebook can also retrieve explicitly
+   selected source-attributed records.
+2. **Judge:** A real installed model is evaluated on executable source
+   fixtures, including safe negative controls, by independent Node oracles.
+   Completion status and model self-report are not correctness scores.
+3. **Distill:** A source-verified benchmark with at least six independently
+   correct observations and 80% aggregate accuracy can stage a bounded
+   reviewer-selection candidate. The candidate stays **pending**.
+4. **Consolidate:** An operator approves, rejects or forgets the candidate
+   in Settings. A new pending revision never overwrites an older approved
+   revision. Stored patterns expire after 90 days; there is a 50-pattern,
+   24-KiB cap and no raw prompts, tokens, credentials or source blobs.
+
+This is **non-parametric, review-gated learning**; it does not claim to have
+performed GPU fine-tuning or to have trained LoRA weights. Such an adapter
+requires a separately configured training backend, held-out evaluation
+and an explicit deployment process. Neither a learning approval nor a
+reviewer ranking ever modifies model weights or runtime permissions.
+
+```json
+{"goal":"Review service performance","mode":"analyze",
+ "topology":"ring","learning":true}
+```
+
+The learning retrieval flag is refused on modifying or remotely placed
+agents, because historical findings must not cross peer trust boundaries.
+
+## Native capability packs and extensions
+
+First-party packs are static, bounded WorkflowSpec declarations under
+`src/lib/swarmPresets.ts`, including frontend audit, backend resilience,
+performance budgets, knowledge evidence, integration readiness and release
+assurance, alongside the two security packs. Their normal lifecycle is
+**select → inspect → prepare an editable chat draft → send under existing
+tool/agent permissions**. Choosing a pack never downloads or executes
+model-authored code. The application also supports operator-managed,
+allowlisted MCP server lifecycle, import-reviewed executable command hooks,
+and its signed extension marketplace / Wasm SDK. These integrations are
+separate permission boundaries, not blanket compatibility guarantees for
+every third-party plugin.
+
+## Mission observability, attribution and optimization
+
+Settings → Swarms displays actual session-journal outcomes (per-agent
+success, failure, reuse, topology, duration) and installed daemon graphs.
+It includes measured token totals **with coverage counts** so missing
+usage does not masquerade as a zero. There is no assumed provider billing:
+`cost` is *unavailable* unless an actual bill/rate is supplied elsewhere.
+An explicitly entered USD-per-million-token value produces an estimated
+projection only; it is not a bill. The four-agent token forecast requires
+three measured agent samples, displays its measurement coverage, and shows
+whether an operator-specified **advisory** token budget is exceeded. This
+forecast does not replace existing runtime/process resource enforcement.
+
+The existing Resource Ledger is the detailed source of observed process,
+CPU/GPU, I/O and scheduler decisions. Mission aggregates are read-only;
+telemetry failures do not stop agents or modify placement privileges.
+
+## Verification and release gates
+
+`src/lib/swarmCoordination.test.ts`,
+`src/lib/swarmLearningCycle.test.ts`,
+`src/lib/swarmMissionDashboard.test.ts`,
+`src/lib/swarmPresets.test.ts` and workflow runner tests cover topology
+order, intra-wave evidence relay, approval and versioned learning, exact
+pack allowlists and unknown-vs-measured token behavior. Full CI still needs
+to pass on all platforms.
+
+The operator-only real-model and two-installation acceptance gates in
+`docs/swarm-release-acceptance.md` remain necessary for live peer loss,
+remote cancellation, replicated memory, daemon restart, and actual
+repository changes. Pure logic or local contract tests do not constitute
+that real-device evidence. Adaptive topology is local-only; leader election
+across untrusted machines, elastic mesh membership and gradient-based
+fine-tuning are **not** represented as completed here.

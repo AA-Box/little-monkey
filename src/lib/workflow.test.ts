@@ -199,6 +199,30 @@ describe("runWorkflow", () => {
     expect(runPairedPeerAgentMock).not.toHaveBeenCalled();
   });
 
+  it("relays source-labelled successful reports through read-only ring waves", async () => {
+    runSubagentTaskMock.mockImplementation(async (params: {toolCallId: string}) => 'verified report of '+params.toolCallId);
+    const result = await runWorkflow({...baseParams, spec:spec({topology:'ring', phases:[{
+      title:'Team',agents:[
+        {description:'A',prompt:'Inspect A',profile:'explore'},
+        {description:'B',prompt:'Inspect B',profile:'explore'},
+        {description:'C',prompt:'Inspect C',profile:'explore'},
+      ],
+    }]})});
+    const calls=runSubagentTaskMock.mock.calls.map(call=>call[0] as {prompt:string;toolCallId:string});
+    expect(calls.map(call=>call.toolCallId)).toEqual(['call_wf#p0a0','call_wf#p0a1','call_wf#p0a2']);
+    expect(calls[0].prompt).toBe('Inspect A');
+    expect(calls[1].prompt).toContain('verified report of call_wf#p0a0');
+    expect(calls[1].prompt).toContain('untrusted');
+    expect(calls[2].prompt).toContain('verified report of call_wf#p0a1');
+    expect(JSON.parse(result).status).toBe('completed');
+  });
+
+  it("never enables intra-phase relays for modifying or remote peers", async () => {
+    const result=await runWorkflow({...baseParams,spec:spec({topology:'ring',
+      phases:[{title:'Bad',agents:[{description:'write',prompt:'edit',profile:'code'}]}]})});
+    expect(result).toContain('read-only');expect(runSubagentTaskMock).not.toHaveBeenCalled();
+  });
+
   it("dispatches phases strictly in order and injects earlier reports into later prompts", async () => {
     runSubagentTaskMock.mockImplementation(async (params: { toolCallId: string }) => `report of ${params.toolCallId}`);
     const result = await runWorkflow({ ...baseParams, spec: spec() });

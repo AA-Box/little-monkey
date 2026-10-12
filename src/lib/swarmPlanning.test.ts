@@ -79,6 +79,15 @@ describe('goal-driven native agent swarms', () => {
     expect(() => buildGoalSwarm({ goal: 'Review backend', auto_peer_pool: ['node-a'], peer_aliases: ['node-b'] })).toThrow(/not both/);
   });
 
+  it('plans local read-only coordination and explicitly approved learning only', () => {
+    const spec=buildGoalSwarm({goal:'Analyze API reliability',topology:'adaptive',learning:true});
+    expect(spec.topology).toBe('adaptive');
+    expect(spec.learning).toBe(true);
+    expect(() => buildGoalSwarm({goal:'Analyze API',mode:'implement',topology:'ring'})).toThrow(/read-only/);
+    expect(() => buildGoalSwarm({goal:'Analyze API',topology:'ring',peer_aliases:['peer']})).toThrow(/peer/);
+    expect(() => buildGoalSwarm({goal:'Analyze API',learning:true,auto_peer_pool:['peer']})).toThrow(/remote peers/);
+  });
+
   it('adds strict independent reviewers and opt-in notebook with no remote forwarding', () => {
     const spec = buildGoalSwarm({ goal: 'Audit API auth', consensus: 'strict', notebook: true });
     expect(spec.consensus).toBe('strict');

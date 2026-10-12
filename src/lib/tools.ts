@@ -751,6 +751,11 @@ export const WORKFLOW_TOOL: ToolDef = {
           type: 'string',
           description: 'Optional user-provided objective for automatic domain-specific multi-agent orchestration. When set, omit preset, saved, name, description and phases.',
         },
+        topology: {
+          type: 'string',
+          enum: ['phased', 'hierarchical', 'star', 'ring', 'mesh', 'adaptive'],
+          description: 'Read-only local team scheduling and source-labelled report relays. Ring and adaptive relay serially; star and hierarchy elect an initial coordinator; mesh uses independent simultaneous reports reconciled in later phases. Never apply to code agents or remote peer tasks.',
+        },
         mode: {
           type: 'string',
           enum: ['analyze', 'implement'],
@@ -776,7 +781,7 @@ export const WORKFLOW_TOOL: ToolDef = {
         },
         preset: {
           type: 'string',
-          enum: ['security-red-team', 'security-audit-and-fix'],
+          enum: ['security-red-team', 'security-audit-and-fix', 'frontend-audit', 'backend-resilience', 'performance-budget', 'knowledge-evidence', 'integration-readiness', 'release-assurance'],
           description: 'Optional built-in agent swarm. security-red-team is read-only and uses 15 specialist agents. security-audit-and-fix can edit code and run tests behind regular permissions; choose it only after an explicit user request to apply fixes. When set, omit name, description, phases and saved.',
         },
         scope: {

@@ -8,6 +8,7 @@
 import type { WorkflowAgentSpec, WorkflowSpec } from './workflow';
 import { validSwarmPeer } from './swarmPeerSchema';
 import { chooseSupplementalSpecialist } from './swarmSpecialistMetrics';
+import { parseSwarmTopology } from './swarmCoordination';
 
 export type SwarmMode = 'analyze' | 'implement';
 export const MAX_SWARM_GOAL_CHARS = 1200;
@@ -123,7 +124,7 @@ const SUPPLEMENTAL_FOCUS: Record<ReturnType<typeof selectSwarmDomain>, readonly 
 };
 
 export function buildGoalSwarm(args: Record<string, unknown>): WorkflowSpec {
-  const allowed = new Set(['goal', 'scope', 'mode', 'memory_stack_ids', 'peer_aliases', 'auto_peer_pool', 'consensus', 'notebook', 'resume']);
+  const allowed = new Set(['goal', 'scope', 'mode', 'memory_stack_ids', 'peer_aliases', 'auto_peer_pool', 'consensus', 'notebook', 'learning', 'topology', 'resume']);
   const unknown = Object.keys(args).filter(key => !allowed.has(key));
   if (unknown.length) throw new Error('Goal swarm cannot be combined with ' + unknown.join(', ') + '.');
   const goal = boundedText(args.goal, 'goal', MAX_SWARM_GOAL_CHARS);
@@ -134,13 +135,21 @@ export function buildGoalSwarm(args: Record<string, unknown>): WorkflowSpec {
   const strictConsensus = args.consensus === 'strict';
   if (args.notebook !== undefined && args.notebook !== true) throw new Error('notebook must be true when supplied.');
   const notebook = args.notebook === true;
+  if (args.learning !== undefined && args.learning !== true) throw new Error('learning must be true when supplied.');
+  const learning = args.learning === true;
+  if (learning && mode !== 'analyze') throw new Error('Approved learning retrieval requires read-only analysis.');
   if (strictConsensus && mode !== 'analyze') throw new Error('Strict reviewer consensus requires read-only analysis mode.');
+  const topology = parseSwarmTopology(args.topology);
+  if (topology !== 'phased' && mode !== 'analyze') throw new Error('Team topologies are read-only analysis only.');
   const domain = selectSwarmDomain(goal);
   const memoryStackIds = parseSwarmMemoryStackIds(args.memory_stack_ids);
   const peerAliases = parseSwarmPeerAliases(args.peer_aliases);
   const automaticPeerPool = parseSwarmPeerAliases(args.auto_peer_pool);
   if (peerAliases.length && automaticPeerPool.length) throw new Error('Use peer_aliases or auto_peer_pool, not both.');
   if ((peerAliases.length || automaticPeerPool.length) && mode === 'implement') throw new Error('Automatic remote placement is read-only; use analyze mode.');
+  if (topology !== 'phased' && (peerAliases.length || automaticPeerPool.length)) throw new Error('Intra-team report relays cannot forward peer results; disable remote placement.');
+  if ((peerAliases.length || automaticPeerPool.length) && learning)
+    throw new Error('Approved historical learning must not be forwarded to remote peers.');
   if ((peerAliases.length || automaticPeerPool.length) && (memoryStackIds.length || notebook)) throw new Error('Indexed project knowledge cannot be automatically forwarded to peer nodes.');
   const candidates = SUPPLEMENTAL_FOCUS[domain];
   const supplement = chooseSupplementalSpecialist(domain, candidates.map(([name]) => name));
@@ -152,12 +161,14 @@ export function buildGoalSwarm(args: Record<string, unknown>): WorkflowSpec {
   }));
   const common = {
     description: goal.slice(0, 170),
+    ...(topology !== 'phased' ? {topology} : {}),
     ...(memoryStackIds.length ? { memoryStackIds } : {}),
     ...(notebook ? { notebook: true } : {}),
+    ...(learning ? { learning: true } : {}),
   };
   if (mode === 'analyze') {
     return {
-      name: goalSwarmName(goal, mode, scope, [...peerAliases, ...automaticPeerPool, ...(strictConsensus ? ['strict'] : []), ...(notebook ? ['notebook'] : [])].join(',')),
+      name: goalSwarmName(goal, mode, scope, [...peerAliases, ...automaticPeerPool, ...(topology !== 'phased' ? [topology] : []), ...(strictConsensus ? ['strict'] : []), ...(notebook ? ['notebook'] : []), ...(learning ? ['learning'] : [])].join(',')),
       ...common,
       ...(strictConsensus ? { consensus: 'strict' as const } : {}),
       phases: [

@@ -35,6 +35,17 @@ describe('built-in security swarm recipes', () => {
     expect(spec.phases.slice(0, 2).flatMap((phase) => phase.agents).every((agent) => agent.profile === 'explore')).toBe(true);
   });
 
+  it('compiles each native capability pack into bounded reviewed read-only agents',()=>{
+    for(const name of SWARM_PRESET_NAMES.filter(n=>n!=='security-red-team'&&n!=='security-audit-and-fix')){
+      const result=buildSwarmPreset({preset:name,scope:'src/modules'});
+      expect(result.name).toBe(name);
+      expect(result.phases).toHaveLength(2);
+      expect(result.phases.flatMap(phase=>phase.agents)).toHaveLength(4);
+      expect(result.phases.flatMap(phase=>phase.agents).every(agent=>agent.profile==='explore')).toBe(true);
+      expect(result.stopOnFailure).toBe(true);
+    }
+  });
+
   it('rejects unknown recipes, mixed inline specs, and unsafe scopes', () => {
     expect(() => buildSwarmPreset({ preset: 'unknown' })).toThrow(/Unknown/);
     expect(() => buildSwarmPreset({ preset: 'security-red-team', saved: 'other' })).toThrow(/cannot be combined/);
