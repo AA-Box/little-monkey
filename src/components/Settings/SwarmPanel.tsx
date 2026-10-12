@@ -213,17 +213,17 @@ export function SwarmPanel() {
         throw Error('Selected MLX model folder does not match the evaluated receipt.');
       const text=await readTextFile(selectedFolder.replace(/[\\/]$/,'')+'/config.json');
       await verifyFusedModelConfig(text,receipt.fusedConfigSha256);
-      if(!window.confirm('Verify all '+receipt.fusedWeights.length+
-        ' fused weight shards against their evaluated SHA-256 digests? This may read many gigabytes locally.'))return;
-      const verified=await invoke<boolean>('models_verify_fused_weights',
-        {path:selectedFolder,files:receipt.fusedWeights});
-      if(verified!==true)throw Error('Native fused model weights did not pass verification.');
+      if(!window.confirm('Verify and register this fused MLX model? Native verification streams all '+
+        receipt.fusedWeights.length+' weight shards (potentially many gigabytes) and checks the config too. It does NOT activate the model.'))return;
       if(!window.confirm('Import this locally trained MLX model directory WITHOUT activating it?\n'+
         receipt.fusedModelPath+'\n\n'+
         'Measured fused held-out perplexity: '+receipt.fusedTestPerplexity+
         '. The receipt and hash are local evidence, NOT a trusted signature. '+
         'Review the folder source and tests, then select/test the model manually after import.'))return;
-      const models=await useModelStore.getState().addExternalFolder(selectedFolder);
+      const models=await invoke<{runtime:string}[]>('models_import_verified_fusion', {
+        path:selectedFolder,configSha256:receipt.fusedConfigSha256,files:receipt.fusedWeights,
+      });
+      await useModelStore.getState().refresh();
       if(!models.some(model=>model.runtime==='mlx'))
         throw Error('Native model importer did not register an MLX-compatible model.');
       setNotice('Fused MLX model registered with the native model catalog. Active model NOT changed. Select it in Models to verify real inference and rollback if needed.');

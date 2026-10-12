@@ -1418,6 +1418,7 @@ pub fn run() {
             models::models_add_external,
             models::models_add_external_folder,
             models::models_verify_fused_weights,
+            models::models_import_verified_fusion,
             models::models_remove_external,
             models::models_detect_projectors,
             models::models_set_projector,

@@ -370,3 +370,15 @@ import without automatically activating the model. This closes the former
 config-only verification hole. These checks validate bytes, not real-world
 model accuracy or cryptographic author identity; real inference is still an
 explicit deployment gate.
+
+
+### Atomic native verification-to-registration boundary
+
+The UI does not accept a frontend-only digest or perform a separate native
+verify followed by a separate import anymore. Its explicit confirmation now
+calls `models_import_verified_fusion`. This streams and verifies both the
+actual `config.json` and **all** fused safetensors in the operator-selected
+folder, then immediately passes the same selected folder to the normal native
+MLX-capable model registrar. The confirmation cannot activate a model. This
+narrows (but cannot cryptographically eliminate) filesystem mutation races
+between reading an external directory and later serving it for inference.

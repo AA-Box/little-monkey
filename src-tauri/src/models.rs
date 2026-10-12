@@ -2837,3 +2837,84 @@ mod fused_weight_integrity_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+
+/// One Tauri transaction boundary for checked MLX model import. Both weight
+/// shards and config are hashed again inside Rust immediately before calling
+/// the existing format- and architecture-validating native model importer.
+/// No model is activated, nor can a receipt select a different folder from
+/// the explicit dialog path passed by the operator.
+#[tauri::command]
+pub async fn models_import_verified_fusion(
+    app: AppHandle,
+    path: String,
+    config_sha256: String,
+    files: Vec<FusedModelShardDigest>,
+) -> Result<Vec<ModelInfo>, String> {
+    let selected_path = path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        verify_fused_config(&selected_path, &config_sha256)?;
+        verify_fused_weight_digests(std::path::Path::new(&selected_path), &files)
+    })
+    .await
+    .map_err(|_| "Fused model verification worker was interrupted".to_string())??;
+    let registered = models_add_external_folder(app, path)?;
+    if !registered.iter().any(|model| {
+        model.runtime == model_sources::ModelRuntimeKind::Mlx
+    }) {
+        return Err("Verified folder did not contain a native MLX model".into());
+    }
+    Ok(registered)
+}
+
+fn verify_fused_config(path: &str, expected_sha256: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    if expected_sha256.len() != 64
+        || !expected_sha256.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err("Invalid evaluated MLX config hash".into());
+    }
+    let directory = std::path::Path::new(path).canonicalize()
+        .map_err(|_| "Selected MLX folder missing")?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut input = opts.open(directory.join("config.json"))
+        .map_err(|_| "Missing fused model configuration")?;
+    let meta = input.metadata().map_err(|_| "Cannot stat fused model configuration")?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > 1024 * 1024 {
+        return Err("Fused model config must be a bounded regular file".into());
+    }
+    let mut buffer = Vec::with_capacity(meta.len() as usize);
+    input.read_to_end(&mut buffer).map_err(|_| "Cannot read fused model config")?;
+    if buffer.len() as u64 != meta.len()
+        || format!("{:x}", Sha256::digest(&buffer)) != expected_sha256
+    {
+        return Err("Fused model config digest differs from evaluated receipt".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod fused_config_integrity_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    #[test]
+    fn rejects_modified_and_invalid_fused_model_configs() {
+        let root = std::env::temp_dir().join(format!("lm-mlx-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.json");
+        std::fs::write(&config, b"{\"model_type\":\"qwen2\"}").unwrap();
+        let hash = format!("{:x}", Sha256::digest(b"{\"model_type\":\"qwen2\"}"));
+        assert!(verify_fused_config(root.to_str().unwrap(), &hash).is_ok());
+        std::fs::write(&config, b"{\"model_type\":\"other\"}").unwrap();
+        assert!(verify_fused_config(root.to_str().unwrap(), &hash).is_err());
+        assert!(verify_fused_config(root.to_str().unwrap(), "../wrong").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
