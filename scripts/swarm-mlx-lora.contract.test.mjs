@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtempSync,mkdirSync,writeFileSync,rmSync,symlinkSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {trainingPlan,inspectDataset,testPpl,safeRegularBytes,safeRegularSha256,digest} from './swarm-mlx-lora.mjs';
+import {trainingPlan,inspectDataset,testPpl,safeRegularBytes,safeRegularSha256,digest,snapshotVerifiedDataset} from './swarm-mlx-lora.mjs';
 function fixtures(){
  const root=mkdtempSync(join(tmpdir(),'swarm-adapter-contract-'));
  const model=join(root,'model'),data=join(root,'data');
@@ -16,6 +16,22 @@ function fixtures(){
    iters:'20',maxPpl:'15'},lines};
 }
 describe('real MLX adapter quality gate preflight',()=>{
+ it('executes from immutable private snapshots matching the preflight receipt',()=>{
+  const x=fixtures();
+  try{
+   const plan=trainingPlan(x.options);
+   const destination=join(x.root,'verified-snapshot');
+   snapshotVerifiedDataset(x.data,destination,plan.files);
+   for(const kind of ['train','valid','test']){
+    assert.equal(digest(safeRegularBytes(join(destination,kind+'.jsonl'),'snapshot')),
+      plan.files[kind].sha256);
+   }
+   writeFileSync(join(x.data,'train.jsonl'),x.lines('changed',8));
+   assert.throws(()=>snapshotVerifiedDataset(x.data,join(x.root,'changed-snapshot'),plan.files),
+     /Dataset changed since preflight/);
+  }finally{rmSync(x.root,{recursive:true,force:true});}
+ });
+
  it('reads exactly the validated descriptor, rejecting symlinked input and weights',()=>{
   const x=fixtures();try{
    const weights=join(x.root,'adapter.safetensors');
