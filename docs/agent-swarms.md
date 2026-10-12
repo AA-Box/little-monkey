@@ -356,3 +356,21 @@ pnpm typecheck
 GitHub Actions CI is also required for repository acceptance. Passing mocked
 workflow tests establishes scheduling contracts, **not** that a particular
 local model will successfully complete a real codebase-level swarm.
+
+## Manually approved resident implementation graphs
+
+In **implementation** mode, the same reviewed Settings handoff can compile a
+resident graph with code agents **only** if the operator selects an existing
+recipe already configured with `manual` permissions. Every code task keeps
+`manual` approval, each read-only task remains `plan`, and graph
+parallelism is forced to **one** to avoid simultaneous edits to a shared
+workspace. No remote execution, hidden worktree isolation, auto-push,
+deployment, or automatic side-effect retries are allowed. Multiple code
+phases are supported serially (implementation followed by test execution),
+and each dependent task receives bounded verified prerequisite evidence.
+
+This is a durable job graph, **not** permission to edit while the operator is
+absent: write requests may pause until approved. A process interruption after
+an external mutation requires human reconciliation before retrying; exact-once
+external side effects cannot be guaranteed. Watch the daemon's approval and
+reconciliation states before treating work as complete.

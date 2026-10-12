@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { prepareResidentReadOnlySwarm } from './residentSwarmBridge';
+import { prepareResidentReadOnlySwarm, prepareResidentSwarm } from './residentSwarmBridge';
 import type { WorkflowSpec } from './workflow';
 
 const base = {
@@ -87,5 +87,48 @@ describe('safe read-only workflow to resident daemon handoff', () => {
     const result=prepareResidentReadOnlySwarm({...spec,phases:[spec.phases[0]]},{...base,workspace:'C:\\work'},'C:\\jobs','swarm-abc');
     expect(result.graphPath).toBe('C:\\jobs\\swarm-abc-graph.json');
     expect(result.graph.nodes[0].recipe).toBe('C:\\jobs\\swarm-abc-p0a0.json');
+  });
+});
+
+describe('explicitly approved resident mutation mode', () => {
+  const implementation: WorkflowSpec = {
+    ...spec, stopOnFailure: true,
+    phases: [
+      ...spec.phases,
+      { title: 'Implement', agents: [{ description: 'Sole code worker', prompt: 'Fix verified issue', profile: 'code' }] },
+      { title: 'Verify', agents: [{ description: 'Test runner', prompt: 'Run and verify tests', profile: 'code' }] },
+    ],
+  };
+  it('preserves manual tool approvals, run-level dependency evidence, and sequential mutation', () => {
+    const frozen = prepareResidentSwarm(implementation, base, '/tmp/approved', 'swarm-implement', 'implement');
+    expect(frozen.graph.max_parallel).toBe(1);
+    expect(frozen.graph.nodes[2].depends_on).toEqual(['p0a0','p0a1']);
+    expect(frozen.graph.nodes[3].include_dependency_reports).toBe(true);
+    expect(frozen.graph.nodes[4].depends_on).toEqual(['p2a0']);
+    expect(JSON.parse(frozen.recipes[2].contents).permission_mode).toBe('plan');
+    const writer = JSON.parse(frozen.recipes[3].contents);
+    expect(writer.permission_mode).toBe('manual');
+    expect(writer.system).toContain('Request normal permission');
+    expect(frozen.caveat).toContain('reconciliation');
+    expect(writer).not.toHaveProperty('allow_push');
+  });
+  it('refuses write execution without an existing operator-selected manual recipe', () => {
+    expect(() => prepareResidentSwarm(implementation,{...base,permission_mode:'plan'},'/tmp','swarm-write','implement'))
+      .toThrow(/manual-permission/);
+  });
+  it('refuses parallel modifying agents and remote/code worktree privilege escalation', () => {
+    const twoWriters: WorkflowSpec = {...implementation, phases:[{
+      title:'Concurrent write', agents:[
+        {description:'A',prompt:'Change A',profile:'code'},
+        {description:'B',prompt:'Change B',profile:'code'},
+      ],
+    }]};
+    expect(() => prepareResidentSwarm(twoWriters,base,'/tmp','swarm-write','implement'))
+      .toThrow(/parallel code agents/);
+    const remote: WorkflowSpec = {...implementation, phases:[{
+      title:'Code peer',agents:[{description:'A',prompt:'Change A',profile:'code',peer:'paired-node'}],
+    }]};
+    expect(() => prepareResidentSwarm(remote,base,'/tmp','swarm-write','implement'))
+      .toThrow(/only for local/);
   });
 });

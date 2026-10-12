@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
-import { prepareResidentReadOnlySwarm } from '../../lib/residentSwarmBridge';
+import { prepareResidentSwarm } from '../../lib/residentSwarmBridge';
 import { parseCommandHooksManifest } from '../../lib/commandHookManifest';
 import { useUserHooksStore } from '../../store/userHooksStore';
 import { daemonSwarmCancel, daemonSwarmStatus, daemonSwarmSubmit, type ResidentSwarmGraphStatus } from '../../lib/daemonClient';
@@ -149,8 +149,8 @@ export function SwarmPanel() {
     } catch (cause) { setError('Swarm registration refused: ' + String(cause)); }
     finally { setResidentBusy(false); }
   }
-  async function submitReadOnlyGoalToResident() {
-    if (!config.spec || mode !== 'analyze') return;
+  async function submitGoalToResident() {
+    if (!config.spec) return;
     setError(''); setNotice('');
     setResidentBusy(true);
     try {
@@ -164,11 +164,13 @@ export function SwarmPanel() {
       if (typeof directory !== 'string') return;
       const base = JSON.parse(await readTextFile(recipePath)) as unknown;
       const graphId = 'swarm-' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
-      const prepared = prepareResidentReadOnlySwarm(config.spec, base, directory, graphId);
+      const prepared = prepareResidentSwarm(config.spec, base, directory, graphId, mode);
       const approved = window.confirm(
-        'Queue ' + prepared.graph.nodes.length + ' read-only agents as frozen resident tasks?\n\n' +
+        'Queue ' + prepared.graph.nodes.length + ' agents as frozen resident tasks?\n\n' +
         'Model and workspace: the recipe you selected.\n' +
-        'Permission: enforced PLAN mode, no writes or remote peer grants.\n' +
+        (mode === 'implement'
+          ? 'Permission: write-capable agents require MANUAL approval for every mutation. No auto-push or deploy.\n'
+          : 'Permission: enforced PLAN mode, no writes or remote peer grants.\n') +
         'Output: ' + prepared.graphPath + '\n\n' +
         prepared.caveat + '\n\n' +
         'The daemon can continue after the app closes. Review the model/workspace before approving.',
@@ -179,7 +181,7 @@ export function SwarmPanel() {
       }
       await writeTextFile(prepared.graphPath, JSON.stringify(prepared.graph, null, 2), { createNew: true });
       const result = await daemonSwarmSubmit(prepared.graphPath);
-      setNotice('Resident read-only workflow ' + result.id + ' registered (' + result.nodes +
+      setNotice('Resident ' + mode + ' workflow ' + result.id + ' registered (' + result.nodes +
         ' frozen jobs). It continues under the daemon after app exit. ' + prepared.caveat);
       await refreshResident();
     } catch (cause) {
@@ -564,9 +566,9 @@ export function SwarmPanel() {
         <div className="mt-3 flex flex-wrap gap-2">
           <Button size="sm" variant="primary" disabled={residentBusy}
             onClick={() => void submitResident()}>Import and register JSON graph…</Button>
-          <Button size="sm" disabled={residentBusy || !config.spec || mode !== 'analyze'}
-            onClick={() => void submitReadOnlyGoalToResident()}>
-            Run approved read-only goal in resident daemon…
+          <Button size="sm" disabled={residentBusy || !config.spec}
+            onClick={() => void submitGoalToResident()}>
+            Run {mode === 'implement' ? 'manually approved implementation' : 'read-only goal'} in resident daemon…
           </Button>
           <Button size="sm" disabled={residentBusy} onClick={() => void refreshResident()}><RefreshCw size={13}/> Refresh graphs</Button>
         </div>
