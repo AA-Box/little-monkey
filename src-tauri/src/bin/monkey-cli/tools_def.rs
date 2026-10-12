@@ -31,6 +31,7 @@ pub fn workflow_tool_def() -> serde_json::Value {
           "type": "object",
           "properties": {
             "name": {"type": "string", "description": "Short workflow label"},
+            "description": {"type": "string", "description": "Optional short scope; 1,200 chars maximum"},
             "phases": {"type": "array", "minItems": 1, "maxItems": 6,
               "items": {
                 "type": "object",
