@@ -87,6 +87,20 @@ export function inspectDataset(directory){
  }
  return {files,all};
 }
+/** The MLX process sees only verified private byte-for-byte snapshots.
+ * Never reopen user-controlled original JSONL paths after preflight. */
+export function snapshotVerifiedDataset(source,folder,expected){
+ mkdirSync(folder,{mode:0o700});
+ for(const [name,identity] of Object.entries(expected)){
+  if(!['train','valid','test'].includes(name)||!identity||
+     typeof identity.sha256!=='string'||!/^[0-9a-f]{64}$/.test(identity.sha256))
+    throw Error('Invalid dataset receipt');
+  const bytes=safeRegularBytes(join(source,name+'.jsonl'),name+'.jsonl');
+  if(digest(bytes)!==identity.sha256)throw Error('Dataset changed since preflight: '+name);
+  writeFileSync(join(folder,name+'.jsonl'),bytes,{mode:0o600,flag:'wx'});
+ }
+ return folder;
+}
 export function testPpl(output){
  const match=[...output.matchAll(/Test\s+ppl\s+([0-9]+(?:\.[0-9]+)?)/ig)].at(-1);
  const n=match?Number(match[1]):NaN;
@@ -134,7 +148,9 @@ export function trainingPlan(opts){
     throw Error('Regression holdout overlaps training, validation or new test data');
  }
  return {model,data,output,iterations:n,maxTestPpl:maxPpl,
-  ...(previous?{previous,regression}:{}),files:inspected.files};
+  ...(previous?{previous,regression,
+    regressionSha256:records(join(regression,'test.jsonl'),'regression test.jsonl').hash}:{}),
+  files:inspected.files};
 }
 async function main(){
  const opts={model:argument('--model'),data:argument('--data'),output:argument('--output'),
@@ -158,8 +174,15 @@ async function main(){
    createdAt:new Date().toISOString(),data:plan.files,iterations:plan.iterations,
    maxTestPpl:plan.maxTestPpl,previousAdapter:plan.previous??null};
  try{
-  const common=['--model',plan.model,'--data',plan.data];
-  const train=['--model',plan.model,'--train','--data',plan.data,
+  const workingData=snapshotVerifiedDataset(plan.data,join(plan.output,'data-snapshot'),plan.files);
+  let workingRegression=null;
+  if(plan.regression){
+   const snapshotProof={test:{sha256:plan.regressionSha256}};
+   workingRegression=snapshotVerifiedDataset(plan.regression,
+     join(plan.output,'regression-snapshot'),snapshotProof);
+  }
+  const common=['--model',plan.model,'--data',workingData];
+  const train=['--model',plan.model,'--train','--data',workingData,
     '--adapter-path',adapter,'--fine-tune-type','lora','--iters',String(plan.iterations),
     '--batch-size','1','--steps-per-eval','50'];
   if(plan.previous)train.push('--resume-adapter-file',join(plan.previous,'adapters.safetensors'));
@@ -175,9 +198,9 @@ async function main(){
   result.status='candidate_unreviewed';
   if(ppl>plan.maxTestPpl)throw Error('Independent held-out perplexity failed operator threshold');
   if(plan.previous){
-   const old=mlx(python,['--model',plan.model,'--data',plan.regression,'--adapter-path',
+   const old=mlx(python,['--model',plan.model,'--data',workingRegression,'--adapter-path',
      plan.previous,'--test','--batch-size','1','--test-batches','-1'],plan.output,join(plan.output,'old-regression.private.log'));
-   const updated=mlx(python,['--model',plan.model,'--data',plan.regression,
+   const updated=mlx(python,['--model',plan.model,'--data',workingRegression,
      '--adapter-path',adapter,'--test','--batch-size','1','--test-batches','-1'],plan.output,join(plan.output,'new-regression.private.log'));
    result.regression={previousPpl:testPpl(old),newPpl:testPpl(updated)};
    const allowedIncrease=Number(argument('--max-regression-fraction')??'0.05');
@@ -203,7 +226,7 @@ async function main(){
    // A file-level fusion receipt cannot prove inference quality. MLX can
    // generate a structurally valid but degraded fused model for some
    // quantization formats: independently evaluate the actual fused weights.
-   const fusedReport=mlx(python,['--model',fused,'--data',plan.data,
+   const fusedReport=mlx(python,['--model',fused,'--data',workingData,
      '--adapter-path','','--test','--batch-size','1','--test-batches','-1'],
      plan.output,join(plan.output,'fused-test.private.log'));
    result.fusedTestPerplexity=testPpl(fusedReport);
@@ -211,7 +234,7 @@ async function main(){
       result.fusedTestPerplexity>ppl*1.05)
      throw Error('Fused model failed held-out parity with its validated adapter');
    if(plan.regression){
-     const fusedHistory=mlx(python,['--model',fused,'--data',plan.regression,
+     const fusedHistory=mlx(python,['--model',fused,'--data',workingRegression,
        '--adapter-path','','--test','--batch-size','1','--test-batches','-1'],
        plan.output,join(plan.output,'fused-regression.private.log'));
      result.fusedRegressionPpl=testPpl(fusedHistory);
