@@ -177,6 +177,7 @@ async function main(){
     receipt:join(plan.output,'training-receipt.json'),
     heldOutPpl:ppl,regression:result.regression??null}));
  }catch(error){
+  result.status='rejected_unverified';
   result.failure=String(error);
   process.exitCode=1;
   console.error(JSON.stringify({status:'not_verified',receipt:join(plan.output,'training-receipt.json'),
