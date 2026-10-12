@@ -217,6 +217,30 @@ describe("runWorkflow", () => {
     expect(JSON.parse(result).status).toBe('completed');
   });
 
+  it("dynamically replaces a failed read-only coordinator, then fans out without stale or failed messages", async () => {
+    runSubagentTaskMock.mockImplementation(async (params: {toolCallId:string}) =>
+      params.toolCallId === 'call_wf#p0a0'
+        ? JSON.stringify({error:'coordinator unavailable'})
+        : 'verified report of '+params.toolCallId);
+    const result=await runWorkflow({...baseParams,spec:spec({topology:'adaptive',phases:[{
+      title:'Adaptive',agents:[
+        {description:'Lead',prompt:'Check lead',profile:'explore'},
+        {description:'Fallback',prompt:'Check fallback',profile:'explore'},
+        {description:'Worker A',prompt:'Check A',profile:'explore'},
+        {description:'Worker B',prompt:'Check B',profile:'explore'},
+      ],
+    }]})});
+    const calls=runSubagentTaskMock.mock.calls.map(call=>call[0] as {toolCallId:string;prompt:string});
+    expect(calls.map(call=>call.toolCallId)).toEqual([
+      'call_wf#p0a0','call_wf#p0a1','call_wf#p0a2','call_wf#p0a3',
+    ]);
+    expect(calls[1].prompt).not.toContain('coordinator unavailable');
+    expect(calls[2].prompt).toContain('verified report of call_wf#p0a1');
+    expect(calls[3].prompt).toContain('verified report of call_wf#p0a1');
+    expect(calls[3].prompt).not.toContain('verified report of call_wf#p0a2');
+    expect(JSON.parse(result).status).toBe('completed_with_failures');
+  });
+
   it("never enables intra-phase relays for modifying or remote peers", async () => {
     const result=await runWorkflow({...baseParams,spec:spec({topology:'ring',
       phases:[{title:'Bad',agents:[{description:'write',prompt:'edit',profile:'code'}]}]})});
