@@ -191,7 +191,7 @@ export function estimateSwarmRatedSpend(
        !Number.isSafeInteger(usage.totalTokens)||usage.totalTokens<0){
       unmeasured++;continue;
     }
-    const key=meta.routing?.targetKey;
+    const key=meta?.routing?.targetKey;
     const cost=key ? calculateUsageCostUsd(rates[key],usage) : null;
     if(cost===null){measuredUnpriced++;continue;}
     covered++;missionCovered++;total+=cost;missionTotal+=cost;
