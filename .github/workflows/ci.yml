@@ -13,6 +13,13 @@ on:
 permissions:
   contents: read
 
+# A PR should test its newest head, not accumulate obsolete cross-platform
+# native build matrices competing for the same GitHub runner quota.
+# Branch push builds remain non-cancelling.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   frontend:
     # TS/JS checks are platform-independent — one OS is enough, no reason to
