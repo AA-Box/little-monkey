@@ -200,6 +200,9 @@ pub fn submit(paths: &DaemonPaths, input: &Path) -> Result<serde_json::Value, St
             if alternate_check.permission_mode != "plan" {
                 return Err("Automatic coordinator fallback recipe must be read-only plan mode".into());
             }
+            if alternate_check.workspace != primary.workspace {
+                return Err("Read-only fallback must use the identical canonical workspace".into());
+            }
             node.fallback_recipe = Some(alternate_frozen.to_string_lossy().to_string());
         }
         node.recipe = frozen.to_string_lossy().to_string();
