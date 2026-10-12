@@ -18,6 +18,8 @@ import type { WorkflowSpec } from './workflow';
 export interface ResidentReadOnlyNode {
   id: string;
   recipe: string;
+  /** Explicit alternate local PLAN recipe for a failed independent root. */
+  fallback_recipe?: string;
   depends_on: string[];
   include_dependency_reports?: boolean;
   max_runtime_seconds: number;
@@ -91,6 +93,7 @@ export function prepareResidentSwarm(
   directory: string,
   graphId: string,
   mode: 'analyze' | 'implement',
+  alternateBase?: unknown,
 ): PreparedResidentSwarm {
   if (!ID.test(graphId)) throw new Error('Resident graph id must use 2–70 lower-case letters, digits or hyphens.');
   if (!absoluteLocalPath(directory)) throw new Error('Choose an absolute local output directory.');
@@ -127,6 +130,18 @@ export function prepareResidentSwarm(
   }
 
   const target = selectedTarget(base.target);
+  let fallbackTarget: Record<string,string>|null = null;
+  if (alternateBase!==undefined) {
+    if(mode!=='analyze' || !object(alternateBase) || alternateBase.version!==1 ||
+       alternateBase.permission_mode!=='plan' ||
+       alternateBase.workspace!==base.workspace ||
+       FORBIDDEN.some(field=>alternateBase[field]!=null)) {
+      throw new Error('Fallback requires a separate operator-selected PLAN recipe for the identical workspace and read-only analysis mode.');
+    }
+    fallbackTarget=selectedTarget(alternateBase.target);
+    if(JSON.stringify(fallbackTarget)===JSON.stringify(target))
+      throw new Error('Fallback must select a different configured model.');
+  }
   const recipes: ResidentPreparedRecipe[] = [];
   const nodes: ResidentReadOnlyNode[] = [];
   let previousPhase: string[] = [];
@@ -183,9 +198,21 @@ export function prepareResidentSwarm(
         ),
       };
       recipes.push({ path, contents: JSON.stringify(recipe, null, 2) });
+      const fallbackPath = fallbackTarget && previousPhase.length===0
+        ? joinLocalPath(directory,graphId+'-'+id+'-fallback.json') : undefined;
+      if(fallbackPath){
+        const fallback = {...recipe,
+          name:graphId+'-'+id+'-fallback',
+          target:fallbackTarget!,
+          permission_mode:'plan',
+          system:recipe.system+'\nRead-only fallback after a failed prior agent. Do not treat previous failure as authoritative evidence.',
+        };
+        recipes.push({path:fallbackPath,contents:JSON.stringify(fallback,null,2)});
+      }
       nodes.push({
         id,
         recipe: path,
+        ...(fallbackPath ? {fallback_recipe:fallbackPath} : {}),
         depends_on: [...previousPhase],
         include_dependency_reports: previousPhase.length > 0,
         max_runtime_seconds: recipe.timeout_seconds,
@@ -207,7 +234,7 @@ export function prepareResidentSwarm(
     graph, graphPath, recipes,
     caveat: mode === 'implement'
       ? 'Write-capable resident agents use MANUAL tool approvals, run sequentially, and cannot auto-commit, push, or deploy. Missing predecessor evidence stops the graph. Interrupted side effects require human reconciliation and are never replayed automatically.'
-      : 'Dependent phases receive bounded, chain-verified local model reports as untrusted evidence. Missing or corrupted results stop the graph. No write-capable or remote tasks are transferred.',
+      : 'Dependent phases receive bounded, chain-verified local model reports as untrusted evidence. Missing or corrupted results stop the graph. An explicitly selected alternate PLAN model may replace one failed root once, under a separate frozen job id. Cancelled or unreconciled work is never retried. No write-capable or remote tasks are transferred.',
   };
 }
 

@@ -48,6 +48,22 @@ describe('safe read-only workflow to resident daemon handoff', () => {
     expect(recipe).not.toHaveProperty('placed_run');
     expect(result.caveat).toContain('chain-verified local model reports');
   });
+  it('generates a truly separate preapproved PLAN model fallback for independent roots only',()=>{
+    const alternate={...base,permission_mode:'plan',target:{ollama:'qwen3:14b'}};
+    const generated=prepareResidentSwarm(spec,base,'/tmp/fallback','swarm-fallback','analyze',alternate);
+    expect(generated.graph.nodes[0].fallback_recipe).toBe('/tmp/fallback/swarm-fallback-p0a0-fallback.json');
+    expect(generated.graph.nodes[1].fallback_recipe).toBeDefined();
+    expect(generated.graph.nodes[2].fallback_recipe).toBeUndefined();
+    expect(generated.recipes).toHaveLength(5);
+    const prepared=JSON.parse(generated.recipes.find(r=>r.path===generated.graph.nodes[0].fallback_recipe)!.contents);
+    expect(prepared.permission_mode).toBe('plan');
+    expect(prepared.target).toEqual({ollama:'qwen3:14b'});
+    expect(prepared.prompt).toBe('Trace auth paths');
+    expect(()=>prepareResidentSwarm(spec,base,'/tmp','swarm-x','implement',alternate)).toThrow(/Fallback/);
+    expect(()=>prepareResidentSwarm(spec,base,'/tmp','swarm-x','analyze',{...alternate,workspace:'/different'})).toThrow(/identical workspace/);
+    expect(()=>prepareResidentSwarm(spec,base,'/tmp','swarm-x','analyze',{...alternate,permission_mode:'manual'})).toThrow(/PLAN/);
+    expect(()=>prepareResidentSwarm(spec,base,'/tmp','swarm-x','analyze',{...alternate,target:base.target})).toThrow(/different configured model/);
+  });
   it('rejects remote peers, write agents, isolation and browser-only secrets before any file write', () => {
     for (const bad of [
       { profile: 'code' },

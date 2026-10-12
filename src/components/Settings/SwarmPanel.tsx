@@ -78,6 +78,7 @@ export function SwarmPanel() {
   const [pluginBusy, setPluginBusy] = useState<string | null>(null);
   const [resident, setResident] = useState<ResidentSwarmGraphStatus[]>([]);
   const [residentBusy, setResidentBusy] = useState(false);
+  const [residentFallbackEnabled,setResidentFallbackEnabled]=useState(false);
   const [hookBusy, setHookBusy] = useState(false);
   const [memoryDevice, setMemoryDevice] = useState('');
   const [memoryAlias, setMemoryAlias] = useState('');
@@ -212,8 +213,16 @@ export function SwarmPanel() {
       const directory = await open({ directory: true, multiple: false });
       if (typeof directory !== 'string') return;
       const base = JSON.parse(await readTextFile(recipePath)) as unknown;
+      let alternate:unknown=undefined;
+      if(mode==='analyze' && residentFallbackEnabled){
+        const backupPath=await open({multiple:false,filters:[
+          {name:'Read-only PLAN fallback model recipe',extensions:['json']},
+        ]});
+        if(typeof backupPath!=='string')return;
+        alternate=JSON.parse(await readTextFile(backupPath)) as unknown;
+      }
       const graphId = 'swarm-' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
-      const prepared = prepareResidentSwarm(config.spec, base, directory, graphId, mode);
+      const prepared = prepareResidentSwarm(config.spec, base, directory, graphId, mode, alternate);
       const approved = window.confirm(
         'Queue ' + prepared.graph.nodes.length + ' agents as frozen resident tasks?\n\n' +
         'Model and workspace: the recipe you selected.\n' +
@@ -868,6 +877,10 @@ export function SwarmPanel() {
       <div className="rounded-lg border border-border bg-surface p-3">
         <h4 className="text-sm font-semibold text-foreground">Resident autonomous recipe graphs</h4>
         <p className="mt-1 text-xs leading-5 text-muted">Durable DAGs run under the installed OS daemon and survive app restarts. Each graph node uses a frozen, operator-selected local recipe with manual/plan tool permissions. This does not automatically resume write-capable chat agents.</p>
+        {mode==='analyze' && <label className="mt-2 flex gap-2 text-xs text-foreground">
+          <input type="checkbox" checked={residentFallbackEnabled} onChange={event=>setResidentFallbackEnabled(event.target.checked)}/>
+          Select a separate, locally installed PLAN-mode model recipe as durable read-only root-agent fallback. Only a failed job can trigger it once; cancellations and write-capable jobs do not retry.
+        </label>}
         <div className="mt-3 flex flex-wrap gap-2">
           <Button size="sm" variant="primary" disabled={residentBusy}
             onClick={() => void submitResident()}>Import and register JSON graph…</Button>

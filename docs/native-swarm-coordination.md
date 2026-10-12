@@ -190,3 +190,28 @@ model rates remain explicitly unknown. Older persisted routing records without
 a model key remain valid but unpriced. This is a user-rate **estimate**;
 provider invoice values, cached-token discounts and remote agent costs are
 not asserted or fabricated.
+
+
+### Daemon-resident read-only failover
+
+A resident JSON graph may specify an explicit `fallback_recipe` absolute
+path on an independent root node (no predecessor dependencies or injected
+reports). Registration validates and freezes BOTH recipe files, refuses
+self-fallback and requires **plan/read-only permission mode on both**. On
+primary daemon job `Failed`, the resident scheduler changes the durable
+SQLite node cursor to `pending_fallback`, then queues the alternate under
+a separate deterministic id. It survives daemon restarts and cannot replay
+the original job. The resulting successful fallback can satisfy downstream
+dependencies, whose reports are still verified through the existing
+hash-chained ledger. `Cancelled` and `NeedsReconciliation` are terminal
+failures, **not** eligible for fallback; a second failed alternate fails
+the graph. Operator cancellation covers both submission stages.
+
+In the Swarms panel, enabling the optional resident fallback prompts for
+a second, explicitly selected PLAN recipe using a different configured model
+and the identical workspace; the compiler generates separate fallback
+recipes only for independent first-phase read-only agents. Write-capable
+resident swarms do not enable this option. An ordinary import of a JSON
+graph can also supply preapproved `fallback_recipe` paths explicitly.
+This is durable failover of a frozen **local** recipe, not automatic
+cross-machine leader election or a way to replay external side effects.
