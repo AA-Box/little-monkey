@@ -91,7 +91,7 @@ describe('paired peer swarm execution', () => {
     expect(mocks.setSubagentRun).toHaveBeenCalledWith(
       task.sessionId,task.taskId,expect.any(Array),
       expect.objectContaining({routing:expect.objectContaining({
-        targetLabel:'Paired peer · paired-node',targetKey:undefined,
+        targetLabel:'Paired peer · paired-node',
         policyName:null,
       })}),
     );
