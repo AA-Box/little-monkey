@@ -215,3 +215,31 @@ resident swarms do not enable this option. An ordinary import of a JSON
 graph can also supply preapproved `fallback_recipe` paths explicitly.
 This is durable failover of a frozen **local** recipe, not automatic
 cross-machine leader election or a way to replay external side effects.
+
+
+#### Verifying real resident fallback on an installed daemon
+
+Create a disposable read-only graph with an independent root whose primary
+PLAN recipe is expected to fail and a different preapproved PLAN fallback
+recipe that can succeed. After registration, **before the primary fails**:
+
+```bash
+node scripts/swarm-resident-fallback-live-acceptance.mjs \
+  --phase capture --graph swarm-test --root p0a0 \
+  --checkpoint /tmp/little-monkey-fallback-receipt.json --confirm-disposable
+```
+
+After the daemon runs the alternate to terminal graph success:
+
+```bash
+node scripts/swarm-resident-fallback-live-acceptance.mjs \
+  --phase verify --graph swarm-test --root p0a0 \
+  --checkpoint /tmp/little-monkey-fallback-receipt.json --confirm-disposable
+```
+
+This verifies two distinct deterministic durable job receipts and observed
+terminal completion through the **installed** CLI. The offline `--self-check`
+only verifies the receipt derivation and is **not** real acceptance. Do not use
+the ordinary no-replay restart harness for graphs with fallbacks: these graphs
+intentionally replace a failed primary receipt with one separately authorized
+fallback receipt. Keep live operator evidence separately.
