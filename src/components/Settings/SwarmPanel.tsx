@@ -7,6 +7,7 @@ import { daemonSwarmCancel, daemonSwarmStatus, daemonSwarmSubmit, type ResidentS
 import { Activity, CheckCircle2, Copy, RefreshCw, ShieldCheck } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { buildGoalSwarm } from '../../lib/swarmPlanning';
+import { prepareSwarmResumeDraft } from '../../lib/swarmRecoveryDraft';
 import {
   peersList, peersMemoryShare, peersMemoryPut, peersMemorySync, peersMemorySearch, peersMemoryWatch,
   peersMemoryAddText, peersMemoryQueryText,
@@ -174,6 +175,7 @@ export function SwarmPanel() {
     completed: Object.values(run.agentResults ?? {}).filter(item => item.status === 'done').length,
     total: run.phases.reduce((sum, phase) => sum + phase.agents.length, 0),
     sessionId: session.id, sourceRunId: run.sourceRunId ?? null, description: run.description,
+    recoverable: Boolean(run.spec),
   }))).sort((a, b) => b.startedAt - a.startedAt).slice(0, 20);
 
   const running = runs.filter(run => run.status === 'running');
@@ -189,6 +191,30 @@ export function SwarmPanel() {
       },
     }));
     setNotice('Prepared in your active chat composer. Close Settings, review the draft and press Send to start.');
+  }
+  function prepareResume(session: string, id: string) {
+    const targetSession = useSessionStore.getState().sessions.find(item => item.id === session);
+    const run = targetSession?.workflowRunMeta?.[id];
+    if (!run) { setError('The saved workflow is no longer present in its original conversation.'); return; }
+    let draft: ReturnType<typeof prepareSwarmResumeDraft>;
+    try {
+      draft = prepareSwarmResumeDraft(id, run);
+    } catch (cause) { setError('Cannot prepare a safe workflow resume: ' + String(cause)); return; }
+    if (draft.requiresMutationReview && !window.confirm(
+      'This interrupted workflow includes write-capable or isolated agents. Check the repository diff and existing side effects before authorizing any repeat execution. Prepare an editable resume request in the original chat?'
+    )) return;
+    // Switching conversations re-renders ChatWindow. Deliver the draft only
+    // after that render, to the listener scoped to this exact session.
+    if (useSessionStore.getState().activeSessionId !== session) {
+      useSessionStore.getState().switchSession(session);
+    }
+    window.requestAnimationFrame(() => {
+      window.dispatchEvent(new CustomEvent('little-monkey:swarm-draft', {
+        detail: { sessionId: session, text: draft.text },
+      }));
+    });
+    setNotice('Resume request prepared in the original chat. Review it and press Send; no agent was launched by this button.');
+    setError('');
   }
   function decide(id: string, version: number, decision: 'approved' | 'rejected') {
     if (decision === 'approved' && !window.confirm('Approve this model-proposed claim for use as untrusted reference in future project swarms?')) return;
@@ -519,7 +545,12 @@ export function SwarmPanel() {
         </p>)}
         {restored.map(run => <div key={run.sessionId + run.id} className="mt-2 border-t border-border pt-2 text-xs text-foreground">
           <CheckCircle2 className="mr-1 inline" size={13}/> {run.name} — {run.status} · {run.completed}/{run.total} agents
-          {run.status !== 'done' && <p className="text-faint">Resume in its original chat: workflow tool with {JSON.stringify({ resume: run.id })}</p>}
+          {(run.status === 'error' || run.status === 'cancelled') && run.recoverable &&
+            <Button size="sm" onClick={() => prepareResume(run.sessionId, run.id)}>
+              Prepare safe resume in chat
+            </Button>}
+          {(run.status === 'error' || run.status === 'cancelled') && !run.recoverable &&
+            <p className="text-faint">This older run has no saved recovery specification; it cannot be automatically reconstructed.</p>}
           {run.status === 'done' && run.sourceRunId && <Button size="sm"
             disabled={learningBusy !== null}
             onClick={() => void proposeLearningCandidate(run.sourceRunId!, run.description)}>
