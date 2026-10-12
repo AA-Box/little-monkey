@@ -25,6 +25,8 @@
     "test:swarm-models:syntax": "node --check scripts/swarm-model-benchmark.mjs",
     "test:swarm-peer:live": "node scripts/swarm-two-peer-live-acceptance.mjs",
     "test:swarm-peer:syntax": "node --check scripts/swarm-two-peer-live-acceptance.mjs",
+    "test:ruflo-mcp:contract": "node --test scripts/swarm-ruflo-mcp-acceptance.contract.test.mjs",
+    "test:ruflo-mcp:live": "node scripts/swarm-ruflo-mcp-acceptance.mjs",
     "test:swarm-peer:contract": "node --test scripts/swarm-two-peer-acceptance.contract.test.mjs",
     "test:compare:live": "node scripts/smoke-compare-ollama.mjs",
     "test:realtime:loopback": "node scripts/realtime-loopback-acceptance.mjs",

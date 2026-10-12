@@ -21,7 +21,7 @@ export async function probeRufloMcp(binary,args=[],timeoutMs=25000){
   const env={PATH:process.env.PATH??'',HOME:process.env.HOME??'',
    TMPDIR:process.env.TMPDIR??'/tmp',TEMP:process.env.TEMP??''};
   const child=spawn(binary,args,{stdio:['pipe','pipe','ignore'],env,shell:false});
-  let output='',state='init',settled=false;
+  let output='',state='init',settled=false,serverName='external';
   const clear=()=>{clearTimeout(timer);child.stdout.removeAllListeners('data');};
   const fail=(message)=>{if(settled)return;settled=true;clear();child.kill();reject(Error(message));};
   const done=(value)=>{if(settled)return;settled=true;clear();child.kill();resolve(value);};
@@ -43,6 +43,7 @@ export async function probeRufloMcp(binary,args=[],timeoutMs=25000){
      const peerVersion=msg.result.protocolVersion;
      if(typeof peerVersion!=='string'||peerVersion.length>32)
        return fail('MCP protocol negotiation invalid.');
+     serverName=msg.result.serverInfo.name;
      state='list';
      send({jsonrpc:'2.0',method:'notifications/initialized'});
      send({jsonrpc:'2.0',id:2,method:'tools/list',params:{}});
@@ -54,7 +55,7 @@ export async function probeRufloMcp(binary,args=[],timeoutMs=25000){
      if(msg.result.nextCursor) return fail('MCP tool list is paginated; cannot certify incomplete discovery.');
      const names=msg.result.tools.map(t=>t.name);
      if(new Set(names).size!==names.length)return fail('MCP tool catalog contains duplicate names.');
-     done({status:'mcp-handshake-and-discovery-passed',server:msg.result.serverInfo?.name??'external',
+     done({status:'mcp-handshake-and-discovery-passed',server:serverName,
        toolCount:names.length,
        groups:{swarm:names.filter(x=>x.startsWith('swarm_')).length,
         memory:names.filter(x=>x.startsWith('memory_')).length,

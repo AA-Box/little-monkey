@@ -399,3 +399,28 @@ agent description or alias, with existing contradiction and evidence rules.
 This is a bounded signed-peer reviewer vote, **not** Raft, Paxos, BFT, or
 cryptographic proof of model correctness. It cannot by itself certify
 physical installation independence; two-machine acceptance still applies.
+
+
+### Real external Ruflo MCP discovery conformance
+
+The safe Ruflo MCP bridge is a disabled, empty-allowlist registration by
+default. To check **actual version-pinned** Ruflo interoperability on an
+operator-controlled machine (without invoking tools or enabling access):
+
+```sh
+node scripts/swarm-ruflo-mcp-acceptance.mjs \\
+  --binary /absolute/path/to/npx \\
+  --ruflo-version 3.10.1 \\
+  --args-json '["-y","ruflo@3.10.1","mcp","start"]' \\
+  --confirm-external-process
+```
+
+The probe runs the chosen executable with no shell, without inheriting API
+keys/tokens, negotiates real MCP JSON-RPC over standard input/output and
+fetches the complete, unique bounded `tools/list`. It never calls `tools/call`,
+connects an enabled server, alters policies, installs hooks, imports modules,
+or grants a tool. An operator must approve execution of any third-party
+package, and may instead point `--binary` at an already reviewed local tool.
+The controlled subprocess test is in mandatory frontend CI; only a **live**
+run against installed Ruflo demonstrates interoperability. Listing external
+MCP tools is **not full binary Ruflo plugin, agent, worker or hook parity**.
