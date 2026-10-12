@@ -264,6 +264,34 @@ CI does not possess real paired user machines or their model credentials.
 Run this acceptance test on both directions and record the output before a
 production release.
 
+## Manual CI gate with actual models and two paired installations
+
+The repository includes
+`.github/workflows/swarm-live-acceptance.yml`, an **operator-triggered**
+acceptance workflow. It is never run by push or pull-request events because
+it requires real user-owned installations, installed runtimes, paired devices,
+model credentials and a disposable test repository.
+
+Prepare **two independently installed Little Monkey instances**. Register the
+sending installation as a self-hosted runner with the labels
+`swarm-acceptance` and either `swarm-node-a` or `swarm-node-b`.
+The receiving installation must be paired with a task grant and an approved
+read-only `peer-task` recipe pointed at a non-production repository.
+
+After this workflow exists on the repository's default branch, open GitHub
+Actions → **Native swarm live acceptance** → **Run workflow**. Select the
+reviewed branch, the correct sender runner label, the receiver's *paired
+alias*, and real configured model target IDs. The job refuses to proceed
+without an installed `monkey` CLI. It runs the actual signed peer task
+through completion and three independent bug-fix fixtures per configured
+model. Both gates must succeed; missing models and failed real fixes fail
+the job. The resulting evidence JSON artifacts are retained for 14 days.
+
+Repeat with the two sender/receiver roles **reversed**. A completed
+one-direction workflow is not evidence of reverse connectivity, remote
+cancellation under load, or multi-writer memory convergence. Record
+those separately in the release checklist below.
+
 ## Two real installations: required acceptance before production
 
 Use a non-production test repository, local test credentials, and read-only
