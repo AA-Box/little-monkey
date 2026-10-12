@@ -645,9 +645,12 @@ export function SwarmPanel() {
           {forecast?.overTokenBudget ? ' · Above advisory token budget' : ''}
           {' '}· Observations: {forecast?.sampleAgents ?? 0}. Forecast only; not an enforced hard limit.
         </p>
-        {mission.missions.slice(0,8).map(row=><p key={row.id} className="mt-1 truncate text-xs text-muted">
-          {row.name} · {row.status} · {row.topology} · {row.done}/{row.agents} succeeded · {row.failed} failed · {row.cancelled} cancelled · {Math.round(row.elapsedMs/1000)}s · {row.measuredAgents}/{row.agents-row.reused} dispatched usage samples · {row.tokens === null ? 'tokens unavailable' : row.tokens.toLocaleString()+' measured tokens'} · reused {row.reused}
-        </p>)}
+        {mission.missions.slice(0,8).map(row=><details key={row.id} className="mt-2 rounded border border-border p-2 text-xs text-muted">
+          <summary className="cursor-pointer">{row.name} · {row.status} · {row.topology} · {row.done}/{row.agents} succeeded · {row.failed} failed · {row.cancelled} cancelled · {Math.round(row.elapsedMs/1000)}s · {row.measuredAgents}/{row.agents-row.reused} dispatched usage samples · {row.tokens === null ? 'tokens unavailable' : row.tokens.toLocaleString()+' measured tokens'} · reused {row.reused}</summary>
+          <p className="mt-1 text-xs text-faint">Initial model dispatch routing (not a provider invoice or verified completion)</p>
+          {row.routing.length===0 ? <p>Model routing unavailable for this mission (older record, peer placement or checkpoint reuse).</p> :
+            row.routing.map((entry,index)=><p key={index} className="mt-1 break-words">{entry.agent} → {entry.targetLabel} · {entry.policyName ?? 'default / pinned'} · {entry.reason}</p>)}
+        </details>)}
       </div>
       <div className="rounded-lg border border-border bg-surface p-3">
         <h4 className="text-sm font-semibold text-foreground">Learning cycle · retrieve / judge / distill / consolidate</h4>

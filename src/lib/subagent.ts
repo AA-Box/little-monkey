@@ -573,6 +573,9 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
   if (parentSignal?.aborted) ownController.abort();
   else parentSignal?.addEventListener('abort', () => ownController.abort(), { once: true });
   activeSubagentControllers.set(taskId, ownController);
+  // Dispatch-time decision (not a promise of successful model inference).
+  // Keep the persisted hint bounded and local to the existing session record.
+  let routingSnapshot: { targetLabel: string; reason: string; policyName: string | null } | undefined;
 
   /** Marks this run terminal in both the live store and the persisted
    * session field, then returns `result` unchanged — the single exit point
@@ -605,6 +608,7 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
             finishedAt: Date.now(),
             toolCallCount: live.toolCallCount,
             usage: live.usage,
+            ...(routingSnapshot ? { routing: routingSnapshot } : {}),
           }
         : undefined,
     );
@@ -708,6 +712,11 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
     // already-running subagent partway through its own loop.
     const routed = resolveSubagentTarget(target, baseProfile);
     const resolvedTarget = routed.target;
+    routingSnapshot = {
+      targetLabel: describeUsageTarget(resolvedTarget).slice(0,180),
+      reason: routed.decision.reason.slice(0,500),
+      policyName: routed.decision.policyName?.slice(0,120) ?? null,
+    };
     // Onto the parent's run: a subagent has none of its own, and the decision
     // is about work the parent asked for.
     params.onRoutingDecision?.(routed.decision);

@@ -7,6 +7,7 @@ export interface SwarmMissionRow {
  id:string;name:string;status:WorkflowRunMeta['status'];
  startedAt:number;elapsedMs:number;agents:number;done:number;failed:number;cancelled:number;reused:number;
  tokens:number|null;promptTokens:number|null;completionTokens:number|null;measuredAgents:number;domain:string;topology:string;
+ routing: {agent:string;targetLabel:string;reason:string;policyName:string|null}[];
 }
 export interface SwarmMissionOverview {
  runs:number;successful:number;failed:number;cancelled:number;running:number;
@@ -24,13 +25,18 @@ export function swarmMissionOverview(
    const agents=run.phases.reduce((sum,phase)=>sum+phase.agents.length,0);
    if(!agents)continue;
    let done=0,failed=0,cancelled=0,reused=0,measuredAgents=0,tokenSum=0,promptSum=0,completionSum=0;
+   const routing: SwarmMissionRow['routing'] = [];
    for(const phase of run.phases)for(const agent of phase.agents){
     const journal=run.agentResults?.[agent.taskId];
     if(journal?.status==='done')done++;
     if(journal?.status==='error')failed++;
     if(journal?.status==='cancelled')cancelled++;
     if(journal?.reused)reused++;
-    const usage=session.subagentRunMeta?.[agent.taskId]?.usage;
+    const agentMeta=session.subagentRunMeta?.[agent.taskId];
+    if(agentMeta?.routing && routing.length<16)routing.push({
+      agent:agent.description.slice(0,120),...agentMeta.routing,
+    });
+    const usage=agentMeta?.usage;
     if(usage && Number.isSafeInteger(usage.totalTokens) && usage.totalTokens>=0){
       measuredAgents++;tokenSum+=usage.totalTokens;
       if(Number.isSafeInteger(usage.promptTokens) && usage.promptTokens>=0)promptSum+=usage.promptTokens;
@@ -43,7 +49,7 @@ export function swarmMissionOverview(
     agents,done,failed,cancelled,reused,
     tokens:measuredAgents?tokenSum:null,
     promptTokens:measuredAgents?promptSum:null,
-    completionTokens:measuredAgents?completionSum:null,measuredAgents,
+    completionTokens:measuredAgents?completionSum:null,measuredAgents,routing,
     domain:run.spec?.name.startsWith('auto-swarm-')?run.spec.description.slice(0,60):'custom',
     topology:run.spec?.topology??'phased',
    });

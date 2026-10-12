@@ -21,6 +21,17 @@ describe('swarm observability from real saved journals',()=>{
   expect(result.missions[0].promptTokens).toBe(90);
   expect(result.missions[0].completionTokens).toBe(10);
  });
+ it('reports actual routed models and policy decisions only when persisted',()=>{
+   const session=sample();
+   session.subagentRunMeta!['a'].routing={
+     targetLabel:'provider:example-model',reason:'Selected by enabled routing policy',
+     policyName:'fast-reviews',
+   };
+   const first=swarmMissionOverview([session]).missions[0];
+   expect(first.routing).toEqual([{agent:'A',targetLabel:'provider:example-model',
+     reason:'Selected by enabled routing policy',policyName:'fast-reviews'}]);
+   expect(swarmMissionOverview([sample()]).missions[0].routing).toEqual([]);
+ });
  it('forecasts only when enough real measured samples exist',()=>{
   const x=swarmMissionOverview([sample()]);
   const unavailable=projectSwarmBudget(x,4,300);

@@ -183,6 +183,8 @@ export interface SubagentRunMeta {
   finishedAt: number;
   toolCallCount: number;
   usage?: UsageInfo;
+  /** Initial model-routing explanation captured at dispatch, never billed usage. */
+  routing?: { targetLabel: string; reason: string; policyName: string | null };
   /** Set when this run executed in an isolated git worktree that STILL
    * EXISTS (an unchanged worktree is removed at finish and records nothing)
    * — what the SubagentRow footer's Apply/Discard actions operate on.
@@ -1079,6 +1081,14 @@ function normalizeSubagentRunMeta(raw: unknown): Record<string, SubagentRunMeta>
       finishedAt: candidate.finishedAt as number,
       toolCallCount: Number.isFinite(candidate.toolCallCount) ? (candidate.toolCallCount as number) : 0,
       usage,
+      ...(candidate.routing && typeof candidate.routing === "object" &&
+        typeof candidate.routing.targetLabel === "string" && candidate.routing.targetLabel.length <= 180 &&
+        typeof candidate.routing.reason === "string" && candidate.routing.reason.length <= 500 &&
+        (candidate.routing.policyName === null ||
+         (typeof candidate.routing.policyName === "string" && candidate.routing.policyName.length <= 120))
+          ? { routing: { targetLabel: candidate.routing.targetLabel, reason: candidate.routing.reason,
+              policyName: candidate.routing.policyName } }
+          : {}),
       ...(candidate.worktree &&
       typeof candidate.worktree === "object" &&
       typeof (candidate.worktree as SubagentWorktreeInfo).path === "string" &&

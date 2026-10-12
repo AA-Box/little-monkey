@@ -125,6 +125,13 @@ three measured agent samples, displays its measurement coverage, and shows
 whether an operator-specified **advisory** token budget is exceeded. This
 forecast does not replace existing runtime/process resource enforcement.
 
+Initial subagent routing decisions (chosen model, matching policy and explanatory
+reason) now persist in each session's bounded task metadata, are validated on
+hydration and appear on the mission's expandable trace. Missing data on
+older, reused or remotely placed agents are explicitly unavailable. This is
+**dispatch intent**, not independently verified final model selection or a
+provider billing statement.
+
 The existing Resource Ledger is the detailed source of observed process,
 CPU/GPU, I/O and scheduler decisions. Mission aggregates are read-only;
 telemetry failures do not stop agents or modify placement privileges.
