@@ -36,7 +36,7 @@ export function safeRegularBytes(path,label,maxBytes=8*1024*1024){
   return data;
  });
 }
-export function safeRegularSha256(path,label,maxBytes=8*1024*1024*1024){
+export function safeRegularSha256WithSize(path,label,maxBytes=128*1024*1024*1024){
  return safeDescriptor(path,label,maxBytes,(fd,stat)=>{
   const hash=createHash('sha256'),buffer=Buffer.allocUnsafe(64*1024);
   for(let offset=0;offset<stat.size;){
@@ -44,7 +44,20 @@ export function safeRegularSha256(path,label,maxBytes=8*1024*1024*1024){
    if(got<=0)throw Error(label+' changed during hash');
    hash.update(buffer.subarray(0,got));offset+=got;
   }
-  return hash.digest('hex');
+  return {sha256:hash.digest('hex'),sizeBytes:stat.size};
+ });
+}
+export function safeRegularSha256(path,label,maxBytes){
+ return safeRegularSha256WithSize(path,label,maxBytes).sha256;
+}
+/** Bind the fusion proof to every weight shard, not just its config.json. */
+export function fusedWeightsManifest(folder){
+ const names=readdirSync(folder).filter(name=>name.endsWith('.safetensors')).sort();
+ if(!names.length||names.length>128)throw Error('Fused model needs 1–128 safetensors shards');
+ return names.map(name=>{
+  if(!/^[a-zA-Z0-9_.-]{1,128}\.safetensors$/.test(name))
+   throw Error('Fused model shard has invalid filename');
+  return {name,...safeRegularSha256WithSize(join(folder,name),'fused model weight')};
  });
 }
 
@@ -223,6 +236,7 @@ async function main(){
      throw Error('MLX fusion did not produce a complete local config/safetensors model');
    result.fusedModelPath=fused;
    result.fusedConfigSha256=digest(safeRegularBytes(join(fused,'config.json'),'fused model config'));
+   const fusedWeightsBefore=fusedWeightsManifest(fused);
    // A file-level fusion receipt cannot prove inference quality. MLX can
    // generate a structurally valid but degraded fused model for some
    // quantization formats: independently evaluate the actual fused weights.
@@ -242,6 +256,10 @@ async function main(){
        (1+result.regression.maxFraction))
        throw Error('Fused model failed historical-task regression gate');
    }
+   const fusedWeightsAfter=fusedWeightsManifest(fused);
+   if(JSON.stringify(fusedWeightsBefore)!==JSON.stringify(fusedWeightsAfter))
+     throw Error('Fused model shards changed during held-out evaluation');
+   result.fusedWeights=fusedWeightsAfter;
    result.status='validated_fused_model_requires_manual_runtime_import';
   }
   console.log(JSON.stringify({status:result.status,adapter,

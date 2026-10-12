@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtempSync,mkdirSync,writeFileSync,rmSync,symlinkSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {trainingPlan,inspectDataset,testPpl,safeRegularBytes,safeRegularSha256,digest,snapshotVerifiedDataset} from './swarm-mlx-lora.mjs';
+import {trainingPlan,inspectDataset,testPpl,safeRegularBytes,safeRegularSha256,safeRegularSha256WithSize,fusedWeightsManifest,digest,snapshotVerifiedDataset} from './swarm-mlx-lora.mjs';
 function fixtures(){
  const root=mkdtempSync(join(tmpdir(),'swarm-adapter-contract-'));
  const model=join(root,'model'),data=join(root,'data');
@@ -32,6 +32,22 @@ describe('real MLX adapter quality gate preflight',()=>{
   }finally{rmSync(x.root,{recursive:true,force:true});}
  });
 
+ it('hashes every fused shard and detects tampering and symlinked evidence',()=>{
+  const x=fixtures();try{
+   const folder=join(x.root,'fused-model');mkdirSync(folder);
+   writeFileSync(join(folder,'model-00001-of-00002.safetensors'),'first shard');
+   writeFileSync(join(folder,'model-00002-of-00002.safetensors'),'second shard');
+   const receipt=fusedWeightsManifest(folder);
+   assert.equal(receipt.length,2);
+   assert.equal(receipt[0].sha256,digest('first shard'));
+   assert.equal(receipt[1].sizeBytes,Buffer.byteLength('second shard'));
+   assert.deepEqual(fusedWeightsManifest(folder),receipt);
+   writeFileSync(join(folder,'model-00001-of-00002.safetensors'),'changed shard');
+   assert.notDeepEqual(fusedWeightsManifest(folder),receipt);
+   symlinkSync(join(x.model,'config.json'),join(folder,'link.safetensors'));
+   assert.throws(()=>fusedWeightsManifest(folder),/symlink|ELOOP|regular/i);
+  }finally{rmSync(x.root,{recursive:true,force:true});}
+ });
  it('reads exactly the validated descriptor, rejecting symlinked input and weights',()=>{
   const x=fixtures();try{
    const weights=join(x.root,'adapter.safetensors');
