@@ -421,3 +421,70 @@ supplemental security specialists. Real observations follow this loop:
 These are small, controlled tests, not proof of general repository-audit
 quality. The live evaluator requires a genuine model; CI runs its source
 oracle self-check without pretending to have a configured inference server.
+
+## Operator-controlled resident crash/restart proof
+
+The installed daemon persists frozen graphs, child IDs and terminal states.
+To test actual recovery, first register a **disposable active** graph on a
+dedicated Little Monkey installation. While it has a pending/running node:
+
+```sh
+node scripts/swarm-resident-restart-live-acceptance.mjs --phase capture \
+  --graph swarm-your-test-id --checkpoint /tmp/swarm-before-restart.json \
+  --confirm-disposable
+```
+
+Only the operator may then restart the installed service. On a dedicated
+test service, a graceful stop and explicit re-ensure look like:
+
+```sh
+monkey daemon stop
+monkey daemon ensure --json
+```
+
+CAUTION: `daemon stop` cancels active work; do NOT do this on a machine with
+unrelated jobs. After a restart, an interrupted mutating child may end in
+failure/reconciliation rather than successful continuation. That is correct:
+unsafe side effects must NOT silently repeat. After the original graph
+reaches a terminal state, run:
+
+```sh
+node scripts/swarm-resident-restart-live-acceptance.mjs --phase verify \
+  --graph swarm-your-test-id --checkpoint /tmp/swarm-before-restart.json \
+  --confirm-disposable
+```
+
+The gate requires an actual changed OS service PID, fresh daemon heartbeat,
+the same durable graph and node identities, preservation of original job
+IDs and completed work, and no automatic redispatch of failed work. A
+captured-but-not-verified checkpoint is NOT evidence of crash recovery.
+Only controlled contract tests run in CI; they do not restart any service.
+
+## Real source vulnerability → daemon swarm → repair → external tests
+
+On a dedicated operator-owned Little Monkey installation with a real local
+Ollama model, a running daemon and an operator present to approve mutations:
+
+```sh
+node scripts/swarm-repository-repair-live-acceptance.mjs \
+  --target ollama:YOUR_INSTALLED_MODEL --confirm-manual-approvals \
+  --timeout-seconds 2400
+```
+
+This constructs a disposable real Git repository containing a known owner
+authorization regression and tests which fail before any model runs. It
+queues a three-stage frozen DAG (read-only audit; MANUAL permission repair;
+read-only independent review), freezes ledger-verified prior reports and
+allows no auto-push or unapproved code edits. The operator must answer
+ordinary daemon permission prompts through Little Monkey.
+
+The harness waits for three distinct succeeded resident jobs, runs the
+regression tests independently in Node, checks the exact Git diff (only
+`src/module.mjs` may change), and refuses a remaining inverted owner check.
+Failures retain the disposable workspace for review. Its `--self-check`
+only confirms the fixture oracle catches the baseline defect, and does
+not stand in for a real model or permission-approval acceptance run.
+
+The optional real-device GitHub Actions `repair_target` input invokes the
+same gate only when deliberately supplied. Real repairs may require an
+available operator; without one the safe outcome is timeout/failure.

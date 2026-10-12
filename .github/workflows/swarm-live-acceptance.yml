@@ -26,6 +26,11 @@ on:
         required: false
         default: ''
         type: string
+      repair_target:
+        description: Optional installed Ollama target for real permission-gated repository repair (operator MUST approve every write)
+        required: false
+        default: ''
+        type: string
       expected_evidence:
         description: Optional source filename expected in the actual peer report
         required: false
@@ -78,6 +83,9 @@ jobs:
           node --check scripts/swarm-two-peer-live-acceptance.mjs
           node --check scripts/swarm-model-benchmark.mjs
           node --check scripts/swarm-specialist-live-benchmark.mjs
+          node --check scripts/swarm-resident-restart-live-acceptance.mjs
+          node --check scripts/swarm-repository-repair-live-acceptance.mjs
+          node scripts/swarm-repository-repair-live-acceptance.mjs --self-check
           node scripts/swarm-specialist-live-benchmark.mjs --self-check
           node --check scripts/swarm-two-peer-memory-live-acceptance.mjs
           node --check scripts/swarm-two-peer-cancellation-live-acceptance.mjs
@@ -130,6 +138,17 @@ jobs:
           node scripts/swarm-specialist-live-benchmark.mjs \
             --target "$SPECIALIST_TARGET" --repetitions 3 \
             > "$RUNNER_TEMP/native-swarm-specialist-quality.json"
+      - name: Real vulnerability discovery, manual repair and external regression tests
+        if: ${{ inputs.repair_target != '' }}
+        shell: bash
+        env:
+          REPAIR_TARGET: ${{ inputs.repair_target }}
+        run: |
+          set -euo pipefail
+          node scripts/swarm-repository-repair-live-acceptance.mjs \
+            --target "$REPAIR_TARGET" --confirm-manual-approvals \
+            --timeout-seconds 2400 \
+            > "$RUNNER_TEMP/native-swarm-repository-repair.json"
       - name: Publish real-run verification evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -143,3 +162,4 @@ jobs:
             ${{ runner.temp }}/native-swarm-vector-memory-acceptance.json
             ${{ runner.temp }}/native-swarm-cancellation-acceptance.json
             ${{ runner.temp }}/native-swarm-specialist-quality.json
+            ${{ runner.temp }}/native-swarm-repository-repair.json

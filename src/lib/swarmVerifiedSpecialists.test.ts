@@ -52,7 +52,7 @@ describe('objective fixture-gated specialist selection',()=>{
     const original=report();
     expect(()=>parseVerifiedSpecialistBenchmark({...original,ranking:original.ranking.map((r,i)=>
       i===0?{...r,accuracy:0}:r)})).toThrow(/ranking/);
-    expect(()=>parseVerifiedSpecialistBenchmark({...original,results:original.results.slice(1)})).toThrow(/Incomplete|Missing|coverage/);
+    expect(()=>parseVerifiedSpecialistBenchmark({...original,results:original.results.slice(1)})).toThrow(/Every specialist|Incomplete|Missing|coverage/);
     const duplicate=report();
     duplicate.results[1].runId=duplicate.results[0].runId;
     expect(()=>parseVerifiedSpecialistBenchmark(duplicate)).toThrow(/unique/);
