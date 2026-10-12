@@ -17,6 +17,50 @@ pub use little_monkey_lib::agent_tools::{
     search_docs_tool_def, send_message_tool_def, task_tool_def, tool_definitions,
 };
 
+/// Explicit, strictly bounded native multi-agent workflow for CLI/daemon
+/// turns. Offered ONLY with the existing --subagents opt-in. The runner
+/// validates this entire shape again before dispatch; no new permissions or
+/// remote destinations can be created by supplying tool arguments.
+pub fn workflow_tool_def() -> serde_json::Value {
+    serde_json::json!({
+      "type": "function",
+      "function": {
+        "name": "workflow",
+        "description": "Run a bounded sequence of independent, permission-controlled subagents. Each phase completes before the next; up to 6 phases, 6 agents per phase, 16 agents total. No nested delegation, auto-push, remote placement, or implicit worktree isolation. Use explore for read-only and code only with explicit existing permission.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string", "description": "Short workflow label"},
+            "phases": {"type": "array", "minItems": 1, "maxItems": 6,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "title": {"type": "string"},
+                  "agents": {"type": "array", "minItems": 1, "maxItems": 6,
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "description": {"type": "string"},
+                        "prompt": {"type": "string"},
+                        "profile": {"type": "string", "enum": ["explore", "code"]}
+                      },
+                      "required": ["description", "prompt"],
+                      "additionalProperties": false
+                    }
+                  }
+                },
+                "required": ["title", "agents"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": ["name", "phases"],
+          "additionalProperties": false
+        }
+      }
+    })
+}
+
 /// Composite `mcp__<serverId>__<toolName>` tool name mapped to the exact
 /// server id and tool name it was built from, returned by
 /// [`merged_tool_definitions`] alongside the tool defs themselves. Mirrors
