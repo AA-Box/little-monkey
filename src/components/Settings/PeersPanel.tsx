@@ -60,6 +60,8 @@ function standingLabel(standing: ReturnType<typeof standingSummary>, t: Translat
 function grantLabel(grant: PeerGrant, t: Translate): string {
   if (grant === "message") return t("PeersPanel.grantMessage");
   if (grant === "task") return t("PeersPanel.grantTask");
+  if (grant === "memory-read") return "Vector memory · read";
+  if (grant === "memory-write") return "Vector memory · write";
   return t("PeersPanel.grantArtifact");
 }
 
@@ -435,8 +437,8 @@ export function PeersPanel() {
                   onChange={() => setInviteDraft({ ...inviteDraft, grants: toggleGrant(inviteDraft.grants, grant.id) })}
                 />
                 <span>
-                  {t(grant.labelKey)}
-                  <span className="block text-xs text-muted">{t(grant.detailKey)}</span>
+                  {grant.label ?? t(grant.labelKey)}
+                  <span className="block text-xs text-muted">{grant.detail ?? t(grant.detailKey)}</span>
                 </span>
               </label>
             ))}
@@ -570,8 +572,8 @@ export function PeersPanel() {
                         }
                       />
                       <span>
-                        {t(grant.labelKey)}
-                        <span className="block text-xs text-muted">{t(grant.detailKey)}</span>
+                        {grant.label ?? t(grant.labelKey)}
+                        <span className="block text-xs text-muted">{grant.detail ?? t(grant.detailKey)}</span>
                       </span>
                     </label>
                   ))}

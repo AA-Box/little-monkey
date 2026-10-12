@@ -181,6 +181,22 @@ export const daemonStart = () => invoke<string>("daemon_desktop_start");
 export const daemonStop = () => invoke<string>("daemon_desktop_stop");
 export const daemonUninstall = (purgeState = false) => invoke<string>("daemon_desktop_uninstall", { purgeState });
 export const daemonQueue = (request: DaemonQueueRequest) => invoke<Record<string, unknown>>("daemon_desktop_queue", { request });
+/** Resident swarm graphs run in the existing daemon's durable job queue.
+ * Every node executes an operator-selected immutable local recipe. */
+export interface ResidentSwarmGraphStatus {
+  id: string;
+  state: 'running' | 'failing' | 'cancelling' | 'succeeded' | 'failed' | 'cancelled';
+  created_at_ms: number;
+  updated_at_ms: number;
+  tasks: { id: string; state: string; job_id: string | null; error: string | null }[];
+}
+export const daemonSwarmSubmit = (specPath: string) =>
+  invoke<{ id: string; state: string; nodes: number }>("daemon_swarm_submit", { specPath });
+export const daemonSwarmStatus = (id: string | null = null) =>
+  invoke<{ graphs: ResidentSwarmGraphStatus[] }>("daemon_swarm_status", { id });
+export const daemonSwarmCancel = (id: string) =>
+  invoke<string>("daemon_swarm_cancel", { id });
+
 export const daemonPause = (runId: string) => invoke<string>("daemon_desktop_pause", { runId });
 export const daemonResume = (runId: string) => invoke<string>("daemon_desktop_resume", { runId });
 export const daemonCancel = (runId: string, reason?: string) => invoke<string>("daemon_desktop_cancel", { runId, reason: reason ?? null });

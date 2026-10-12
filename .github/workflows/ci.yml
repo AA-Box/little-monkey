@@ -42,6 +42,15 @@ jobs:
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
+      - name: Syntax-check live real-model benchmark harness (no model mocks)
+        run: pnpm test:swarm-models:syntax
+
+      - name: Syntax-check real two-installation acceptance harness (no peer mocks)
+        run: pnpm test:swarm-peer:syntax
+
+      - name: Exercise live two-peer harness contract (controlled CLI only)
+        run: pnpm test:swarm-peer:contract
+
       - name: Production build and bundle budget
         run: pnpm build:budget
 
@@ -315,6 +324,21 @@ jobs:
       - name: Rust tests
         if: ${{ !startsWith(matrix.os, 'ubuntu') }}
         run: pnpm test:rust
+
+      - name: Paired peer live TLS loopback E2E
+        if: startsWith(matrix.os, 'ubuntu')
+        timeout-minutes: 10
+        env:
+          LITTLE_MONKEY_REQUIRE_LIVE_PEER: "1"
+        # Exercise the real certificate-pinned HTTPS server, pairing, task
+        # admission, durable thread readback and unsigned-call rejection.
+        # This is a deterministic loopback transport test using a fake
+        # accepting runner, not a claimed two-machine model smoke test.
+        run: |
+          set -euo pipefail
+          command -v openssl
+          openssl version
+          cargo test --manifest-path src-tauri/Cargo.toml --bin monkey-cli peer_live -- --ignored --nocapture
 
       - name: Build the real Docker autonomous runner
         if: startsWith(matrix.os, 'ubuntu')

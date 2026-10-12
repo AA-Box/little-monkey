@@ -560,6 +560,28 @@ impl DaemonStore {
         Ok(())
     }
 
+    /// Resolve a cancellable job only through its original authenticated
+    /// sender, thread and exact task message id. No peer can cancel an
+    /// unrelated run, even if it guesses a daemon job id.
+    pub fn peer_owned_task_job(
+        &self,
+        peer_device_id: &str,
+        thread_id: &str,
+        message_id: &str,
+    ) -> Result<Option<String>, String> {
+        self.connection
+            .query_row(
+                "SELECT job_id FROM peer_messages
+                 WHERE peer_device_id=?1 AND thread_id=?2 AND message_id=?3
+                   AND direction='inbound' AND kind='task_request'
+                   AND disposition='accepted' AND job_id IS NOT NULL",
+                params![peer_device_id, thread_id, message_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
     /// One thread, named by the pairing that owns it.
     ///
     /// The device id is not a filter that could be dropped for convenience:

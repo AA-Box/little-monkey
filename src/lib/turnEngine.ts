@@ -1125,7 +1125,7 @@ async function executeToolCallInner(
       if (!subagent) {
         return stringifyToolError(new Error('The workflow tool has no subagent execution context configured for this turn.'));
       }
-      const spec = resolveWorkflowSpec(args);
+      const spec = resolveWorkflowSpec(args, subagent.sessionId);
       return await runWorkflow({
         sessionId: subagent.sessionId,
         runId: subagent.runId,

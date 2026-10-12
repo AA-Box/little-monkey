@@ -129,6 +129,76 @@ pub enum PeersCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Request cancellation of an exact task this installation already
+    /// submitted; never accepts an arbitrary remote run/job identifier.
+    CancelTask {
+        alias: String,
+        thread_id: String,
+        message_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Local operator opt-in: share one namespace with an inbound paired peer.
+    MemoryShare {
+        device_id: String,
+        namespace: String,
+        #[arg(long)]
+        read: bool,
+        #[arg(long)]
+        write: bool,
+    },
+    /// Add or revise a local vector document; revision must strictly increase.
+    MemoryPut {
+        namespace: String,
+        id: String,
+        model: String,
+        vector: String,
+        text: String,
+        #[arg(long,default_value_t=1)]
+        revision: u64,
+        #[arg(long)]
+        deleted: bool,
+    },
+    /// Embed a document using an already configured Knowledge 2.0 stack's
+    /// exact model+prefix spec; write its revision to this node's vector store.
+    MemoryAddText {
+        namespace:String,
+        id:String,
+        stack_id:String,
+        text:String,
+        #[arg(long,default_value_t=1)]
+        revision:u64,
+    },
+    /// Embed a query with that same stack and search replicated vector memory.
+    MemoryQueryText {
+        namespace:String,
+        stack_id:String,
+        query:String,
+        #[arg(long,default_value_t=5)]
+        top_k:usize,
+    },
+    /// Search this node's combined local and synced peer vectors.
+    MemorySearch {
+        namespace: String,
+        model: String,
+        vector: String,
+        #[arg(long,default_value_t=5)]
+        top_k: usize,
+    },
+    /// Bidirectionally replicate only each installation's locally authored
+    /// documents over the existing pinned TLS, signed peer transport.
+    MemorySync {
+        alias: String,
+        namespace: String,
+    },
+    /// Automatically sync a pre-paired namespace every minute while the
+    /// installed daemon service runs. Explicit opt-in; never enabled on upgrade.
+    MemoryWatch {
+        alias:String,
+        namespace:String,
+        #[arg(long)]
+        disable:bool,
+    },
     /// Threads inbound peers opened here, and what happened to them.
     Threads {
         #[arg(long)]
@@ -229,6 +299,21 @@ pub async fn dispatch(command: &PeersCmd) -> Result<(), String> {
             thread_id,
             json,
         } => remote_thread(alias, thread_id, *json).await,
+        PeersCmd::CancelTask { alias, thread_id, message_id, json } =>
+            cancel_task(alias, thread_id, message_id, *json).await,
+        PeersCmd::MemoryShare { device_id,namespace,read,write } =>
+            memory_share(device_id,namespace,*read,*write),
+        PeersCmd::MemoryPut { namespace,id,model,vector,text,revision,deleted } =>
+            memory_put(namespace,id,model,vector,text,*revision,*deleted),
+        PeersCmd::MemorySearch { namespace,model,vector,top_k } =>
+            memory_search(namespace,model,vector,*top_k),
+        PeersCmd::MemoryAddText { namespace,id,stack_id,text,revision } =>
+            memory_add_text(namespace,id,stack_id,text,*revision).await,
+        PeersCmd::MemoryQueryText { namespace,stack_id,query,top_k } =>
+            memory_query_text(namespace,stack_id,query,*top_k).await,
+        PeersCmd::MemorySync { alias,namespace } => memory_sync(alias,namespace).await,
+        PeersCmd::MemoryWatch { alias,namespace,disable } =>
+            memory_watch(alias,namespace,!disable),
         PeersCmd::Threads { peer, limit, json } => threads(peer.as_deref(), *limit, *json),
         PeersCmd::Rotate {
             device_id,
@@ -254,6 +339,14 @@ pub async fn dispatch(command: &PeersCmd) -> Result<(), String> {
 fn parse_grants(allow: &str) -> Result<BTreeSet<DeviceCapability>, String> {
     let mut grants = BTreeSet::new();
     for token in allow.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        if token == "memory-read" {
+            grants.insert(DeviceCapability::PeerMemoryRead);
+            continue;
+        }
+        if token == "memory-write" {
+            grants.insert(DeviceCapability::PeerMemoryWrite);
+            continue;
+        }
         let capability = match token {
             "message" => PeerCapability::Message,
             "task" | "task_request" => PeerCapability::TaskRequest,
@@ -283,6 +376,12 @@ fn grant_tokens(capabilities: &BTreeSet<DeviceCapability>) -> Vec<&'static str> 
     }
     if capabilities.contains(&DeviceCapability::PeerArtifact) {
         tokens.push("artifact");
+    }
+    if capabilities.contains(&DeviceCapability::PeerMemoryRead) {
+        tokens.push("memory-read");
+    }
+    if capabilities.contains(&DeviceCapability::PeerMemoryWrite) {
+        tokens.push("memory-write");
     }
     tokens
 }
@@ -675,6 +774,181 @@ fn forget(alias: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A model identifier is supplied explicitly; memory never fabricates or
+/// infers embedding space compatibility from similar dimension counts.
+fn parse_vector(input: &str) -> Result<Vec<f32>,String> {
+    if input.len()>32*1024 {return Err("Vector input too large".into());}
+    let floats=input.split(',').map(|token|token.trim().parse::<f32>()
+        .map_err(|_|"Vector requires comma-separated finite floats".to_string()))
+        .collect::<Result<Vec<_>,_>>()?;
+    if floats.is_empty() || floats.len()>2048 || floats.iter().any(|v|!v.is_finite()) {
+        return Err("Vector requires 1-2048 finite floats".into());
+    }
+    Ok(floats)
+}
+fn memory_share(device_id:&str,namespace:&str,read:bool,write:bool) -> Result<(),String> {
+    let paths=paths()?;
+    let device=RemoteStore::open(&paths.root)?.device(device_id)?
+        .ok_or_else(||"No such inbound pairing".to_string())?;
+    if !device.active() {return Err("Revoked peers cannot access memory".into());}
+    let grants=if device.capabilities.is_empty(){
+        crate::daemon::remote::protocol::legacy_capabilities(&device.scopes)
+    } else {device.capabilities.clone()};
+    if (read && !grants.contains(&DeviceCapability::PeerMemoryRead)) ||
+       (write && !grants.contains(&DeviceCapability::PeerMemoryWrite)) {
+        return Err("Pairing lacks the selected peer memory capability".into());
+    }
+    let store=DaemonStore::open(&paths)?;
+    crate::daemon::peer_memory::grant(&store,device_id,namespace,read,write)?;
+    println!("{}",serde_json::json!({"namespace":namespace,"device_id":device_id,
+        "read":read,"write":write}));
+    Ok(())
+}
+fn memory_put(namespace:&str,id:&str,model:&str,vector:&str,text:&str,
+    revision:u64,deleted:bool) -> Result<(),String> {
+    let mut store=DaemonStore::open(&paths()?)?;
+    let document=crate::daemon::peer_memory::VectorDocument {
+        id:id.into(),revision,model:model.into(),deleted,
+        text:if deleted {String::new()}else{text.into()},
+        vector:if deleted {Vec::new()}else{parse_vector(vector)?},
+    };
+    let updated=crate::daemon::peer_memory::put(&mut store,namespace,
+        crate::daemon::peer_memory::LOCAL_AUTHOR,&document)?;
+    println!("{}",serde_json::json!({"namespace":namespace,"id":id,"updated":updated,"revision":revision}));
+    Ok(())
+}
+fn memory_search(namespace:&str,model:&str,vector:&str,top_k:usize) -> Result<(),String> {
+    let store=DaemonStore::open(&paths()?)?;
+    let rows=crate::daemon::peer_memory::search(&store,namespace,model,&parse_vector(vector)?,top_k)?;
+    println!("{}",serde_json::json!({"namespace":namespace,"matches":rows.iter()
+        .map(|(score,entry)|serde_json::json!({"score":score,"entry":entry})).collect::<Vec<_>>()}));
+    Ok(())
+}
+fn memory_watch(alias:&str,namespace:&str,enabled:bool)->Result<(),String> {
+    let paths=paths()?;
+    // Configuration is not a capability grant. The worker checks the live
+    // outbound pairing and remote namespace ACL on each attempt.
+    let exists=RemoteStore::open(&paths.root)?.controller(alias)?.is_some();
+    if !exists {return Err("Unknown outbound peer alias".into());}
+    crate::daemon::peer_memory::configure_sync(
+        &DaemonStore::open(&paths)?,alias,namespace,enabled,
+    )?;
+    println!("{}",serde_json::json!({"alias":alias,"namespace":namespace,"enabled":enabled}));
+    Ok(())
+}
+/// Reuse the same embedding backend, prefixes and dimension checks that
+/// Knowledge 2.0 already uses. The SHA pins the COMPLETE embedding spec,
+/// preventing two same-named models with different prefixes/backends being
+/// silently mixed in a replicated namespace.
+async fn embed_shared_text(stack_id:&str,text:&str,is_query:bool)
+    -> Result<(String,Vec<f32>),String> {
+    if !crate::daemon::peer_memory::valid_label(stack_id) ||
+       text.trim().is_empty() || text.len()>2048 {
+        return Err("Invalid stack ID or text (1-2048 bytes)".into());
+    }
+    let app_data=little_monkey_lib::app_paths::data_dir()
+        .ok_or_else(||"Could not resolve knowledge stack data".to_string())?;
+    let stack=little_monkey_lib::knowledge_core::list_impl(&app_data)?
+        .into_iter().find(|stack|stack.id==stack_id)
+        .ok_or_else(||"Configured Knowledge 2.0 stack not found".to_string())?;
+    if stack.embedding.dim==0 || stack.embedding.dim>2048 {
+        return Err("Shared memory supports embedding dimensions up to 2048".into());
+    }
+    let model_spec=serde_json::to_vec(&stack.embedding).map_err(|e|e.to_string())?;
+    use sha2::{Digest,Sha256};
+    let digest=format!("{:x}",Sha256::digest(&model_spec));
+    let model=format!("embedding-{}",&digest[..32]);
+    let vectors=little_monkey_lib::knowledge_core::embed_batch_under(
+        &app_data,&stack.embedding,&[text.to_string()],is_query,
+    ).await?;
+    let vector=vectors.into_iter().next()
+        .ok_or_else(||"Embedding backend returned no vector".to_string())?;
+    Ok((model,vector))
+}
+async fn memory_add_text(namespace:&str,id:&str,stack_id:&str,text:&str,revision:u64)
+    -> Result<(),String> {
+    let (model,vector)=embed_shared_text(stack_id,text,false).await?;
+    let document=crate::daemon::peer_memory::VectorDocument {
+        id:id.into(),revision,model,text:text.into(),vector,deleted:false,
+    };
+    let updated=crate::daemon::peer_memory::put(
+        &mut DaemonStore::open(&paths()?)?,namespace,
+        crate::daemon::peer_memory::LOCAL_AUTHOR,&document,
+    )?;
+    println!("{}",serde_json::json!({"namespace":namespace,"id":id,
+        "embedding_spec":document.model,"updated":updated,"revision":revision}));
+    Ok(())
+}
+async fn memory_query_text(namespace:&str,stack_id:&str,query:&str,top_k:usize)
+    -> Result<(),String> {
+    let (model,vector)=embed_shared_text(stack_id,query,true).await?;
+    let rows=crate::daemon::peer_memory::search(
+        &DaemonStore::open(&paths()?)?,namespace,&model,&vector,top_k,
+    )?;
+    println!("{}",serde_json::json!({"namespace":namespace,"embedding_spec":model,
+        "matches":rows.iter().map(|(score,entry)|
+            serde_json::json!({"score":score,"entry":entry})).collect::<Vec<_>>()}));
+    Ok(())
+}
+
+async fn memory_sync(alias:&str,namespace:&str) -> Result<(),String> {
+    let paths=paths()?;
+    let (pulled,pushed)=sync_vectors(&paths,alias,namespace).await?;
+    println!("{}",serde_json::json!({"namespace":namespace,"alias":alias,"pulled":pulled,"pushed":pushed,
+        "note":"Only locally authored memory is replicated; revisions prevent duplicate writes."}));
+    Ok(())
+}
+
+/// Reused by the opted-in resident daemon worker. No stdout, shell or
+/// desktop permission context; every network call is signed by peer_call.
+pub(crate) async fn sync_vectors(
+    paths:&DaemonPaths,alias:&str,namespace:&str,
+) -> Result<(usize,usize),String> {
+    use crate::daemon::peer_memory::{self,VectorDocument};
+    if !peer_memory::valid_label(alias) || !peer_memory::valid_label(namespace){
+        return Err("Invalid peer alias or namespace".into());
+    }
+    let profile=RemoteStore::open(&paths.root)?.controller(alias)?
+        .ok_or_else(||format!("Unknown outbound pairing '{alias}'"))?;
+    if !profile.capabilities.contains(&DeviceCapability::PeerMemoryRead) ||
+       !profile.capabilities.contains(&DeviceCapability::PeerMemoryWrite) {
+        return Err("This peer must explicitly grant memory-read AND memory-write for sync".into());
+    }
+    // Pull first so a remote permission failure cannot expose local documents.
+    let response=crate::daemon::remote::peer_call(
+        &paths,alias,reqwest::Method::GET,
+        &format!("/v1/remote/peer/memory/{namespace}"),Vec::new(),
+    ).await?;
+    let received=response["records"].as_array()
+        .ok_or_else(||"Peer response omitted vector records".to_string())?;
+    if received.len()>peer_memory::MAX_RECORDS {
+        return Err("Peer returned more vector records than the namespace limit".into());
+    }
+    let origin=peer_memory::remote_author(&profile.server_certificate_sha256)?;
+    let documents=received.iter().map(|item|serde_json::from_value::<VectorDocument>(item.clone())
+        .map_err(|e|format!("Invalid peer memory record: {e}")))
+        .collect::<Result<Vec<_>,_>>()?;
+    // All-or-nothing import: conflicting records never leave half a peer
+    // snapshot behind after an interrupted sync.
+    let pulled=peer_memory::put_batch(
+        &mut DaemonStore::open(&paths)?,namespace,&origin,&documents,
+    )?;
+    // Never resend another peer's records: each origin signs its own writes.
+    // Repeating sync after a partial failure is safe via revision idempotence.
+    let own=peer_memory::list(&DaemonStore::open(&paths)?,namespace,true)?;
+    let mut pushed=0;
+    for entry in own {
+        let body=serde_json::to_vec(&entry.document).map_err(|e|e.to_string())?;
+        let ack=crate::daemon::remote::peer_call(
+            &paths,alias,reqwest::Method::POST,
+            &format!("/v1/remote/peer/memory/{namespace}/records"),body,
+        ).await?;
+        if ack["accepted"]!=true {return Err("Remote memory write was not acknowledged".into());}
+        pushed+=1;
+    }
+    Ok((pulled,pushed))
+}
+
 async fn send(
     alias: &str,
     text: &str,
@@ -736,6 +1010,48 @@ async fn send(
         response["state"].as_str().unwrap_or("accepted")
     );
     println!("Read the answer with `monkey peers thread {alias} {thread_id}`.");
+    Ok(())
+}
+
+/// Ask the receiver to cancel only a task whose outbound receipt this node
+/// still owns. This call is signed and TLS certificate-pinned like task send.
+async fn cancel_task(alias: &str, thread_id: &str, message_id: &str, json: bool) -> Result<(), String> {
+    let paths = paths()?;
+    let granted = crate::daemon::peer_tool::reachable_peers()
+        .into_iter().any(|(name, grants)| name == alias &&
+            grants.contains(&DeviceCapability::PeerTaskRequest));
+    if !granted {
+        return Err("This paired node has no active peer task grant".into());
+    }
+    let owned = DaemonStore::open(&paths)?
+        .outbound_peer_messages(Some(alias), 200)?
+        .into_iter().any(|message| message.thread_id == thread_id &&
+            message.message_id == message_id && message.kind == "task_request");
+    if !owned {
+        return Err("Cannot cancel a task without an owned outbound task receipt".into());
+    }
+    let ids_valid = |value: &str| {
+        !value.is_empty() && value.len() <= little_monkey_lib::peers::MAX_ID_LEN &&
+        value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    };
+    if !ids_valid(thread_id) || !ids_valid(message_id) {
+        return Err("Malformed peer task identifier".into());
+    }
+    let body = serde_json::to_vec(&serde_json::json!({"message_id":message_id}))
+        .map_err(|error| error.to_string())?;
+    let response = crate::daemon::remote::peer_call(
+        &paths,
+        alias,
+        reqwest::Method::POST,
+        &format!("/v1/remote/peer/threads/{thread_id}/cancel"),
+        body,
+    ).await?;
+    if json {
+        println!("{response}");
+    } else {
+        println!("Cancellation status for {alias}/{thread_id}/{message_id}: {}",
+            response["status"].as_str().unwrap_or("unknown"));
+    }
     Ok(())
 }
 

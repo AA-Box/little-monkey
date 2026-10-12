@@ -1,0 +1,532 @@
+import { useEffect, useMemo, useState } from 'react';
+import { open } from '@tauri-apps/plugin-dialog';
+import { readTextFile } from '@tauri-apps/plugin-fs';
+import { parseCommandHooksManifest } from '../../lib/commandHookManifest';
+import { useUserHooksStore } from '../../store/userHooksStore';
+import { daemonSwarmCancel, daemonSwarmStatus, daemonSwarmSubmit, type ResidentSwarmGraphStatus } from '../../lib/daemonClient';
+import { Activity, CheckCircle2, Copy, RefreshCw, ShieldCheck } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
+import { buildGoalSwarm } from '../../lib/swarmPlanning';
+import {
+  peersList, peersMemoryShare, peersMemoryPut, peersMemorySync, peersMemorySearch, peersMemoryWatch,
+  peersMemoryAddText, peersMemoryQueryText,
+  type OutboundPeer,
+} from '../../lib/peersClient';
+import { loadPeerObservations } from '../../lib/swarmPeerMetrics';
+import {
+  clearSwarmBenchmark, importSwarmBenchmark, loadSwarmBenchmark,
+  setSwarmBenchmarkRouting, swarmBenchmarkRoutingEnabled,
+} from '../../lib/swarmVerifiedBenchmarks';
+import { skillLearningClient } from '../../lib/skillLearningClient';
+import { decideSwarmNote, listSwarmNotebook, revertSwarmNote } from '../../lib/swarmNotebook';
+import { approvedNotebookVectorClaim } from '../../lib/swarmNotebookVector';
+import { useSessionStore } from '../../store/sessionStore';
+import { useMcpStore } from '../../store/mcpStore';
+import { selectWorkflowRunList, useWorkflowStore } from '../../store/workflowStore';
+import { Button } from '../ui';
+
+/**
+ * Operator-facing bounded native swarm setup and monitoring. A draft is
+ * prepared in the active chat, not run invisibly with the Settings dialog's
+ * own privileges; Send in the chat is the execution approval boundary.
+ */
+export function SwarmPanel() {
+  const [goal, setGoal] = useState('');
+  const [mode, setMode] = useState<'analyze' | 'implement'>('analyze');
+  const [scope, setScope] = useState('');
+  const [strictConsensus, setStrictConsensus] = useState(false);
+  const [notebook, setNotebook] = useState(false);
+  const [notebookRefresh, setNotebookRefresh] = useState(0);
+  const [learningBusy, setLearningBusy] = useState<string | null>(null);
+  const [benchmark, setBenchmark] = useState(() => loadSwarmBenchmark());
+  const [benchmarkRouting, setBenchmarkRouting] = useState(() => swarmBenchmarkRoutingEnabled());
+  const [benchmarkBusy, setBenchmarkBusy] = useState(false);
+  const [pluginBusy, setPluginBusy] = useState<string | null>(null);
+  const [resident, setResident] = useState<ResidentSwarmGraphStatus[]>([]);
+  const [residentBusy, setResidentBusy] = useState(false);
+  const [hookBusy, setHookBusy] = useState(false);
+  const [memoryDevice, setMemoryDevice] = useState('');
+  const [memoryAlias, setMemoryAlias] = useState('');
+  const [memoryNamespace, setMemoryNamespace] = useState('shared-project');
+  const [memoryModel, setMemoryModel] = useState('local-embedding-v1');
+  const [memoryStack, setMemoryStack] = useState('');
+  const [memoryRecord, setMemoryRecord] = useState('claim-1');
+  const [memoryRevision, setMemoryRevision] = useState('1');
+  const [memoryText, setMemoryText] = useState('');
+  const [memoryVector, setMemoryVector] = useState('');
+  const [memoryRead, setMemoryRead] = useState(true);
+  const [memoryWrite, setMemoryWrite] = useState(false);
+  const [memoryBusy, setMemoryBusy] = useState(false);
+  const [memoryMatches, setMemoryMatches] = useState<{ score: number; entry: { author: string; id: string; text: string } }[]>([]);
+
+  const [peerPool, setPeerPool] = useState<string[]>([]);
+  const [peers, setPeers] = useState<OutboundPeer[]>([]);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const runs = useWorkflowStore(useShallow(selectWorkflowRunList));
+  const sessions = useSessionStore(state => state.sessions);
+  const sessionId = useSessionStore(state => state.activeSessionId);
+  const metrics = loadPeerObservations();
+  const mcpServers = useMcpStore(state => state.servers);
+  const refreshPlugins = useMcpStore(state => state.refresh);
+  const notebookProject = sessions.find(session => session.id === sessionId)?.workspacePath?.trim() || 'session:' + sessionId;
+  const notes = useMemo(() => listSwarmNotebook(notebookProject), [notebookProject, notebookRefresh, sessions]);
+
+  function parseMemoryVector(): number[] {
+    const vector = memoryVector.split(',').map(token => Number(token.trim()));
+    if (!memoryVector.trim() || vector.length > 2048 ||
+        vector.some(value => !Number.isFinite(value)) || vector.every(value => value === 0)) {
+      throw new Error('Supply 1–2048 comma-separated finite, nonzero vector coordinates.');
+    }
+    return vector;
+  }
+  async function memoryAction(action: 'share' | 'write' | 'sync' | 'search' | 'watch' | 'unwatch' | 'embed-write' | 'embed-search') {
+    setMemoryBusy(true); setError(''); setNotice('');
+    try {
+      if (action === 'share') {
+        if (!window.confirm('Change the per-namespace memory ACL of this inbound paired device? Read grants expose text and embeddings; write grants allow durable peer records.')) return;
+        await peersMemoryShare(memoryDevice.trim(), memoryNamespace.trim(), memoryRead, memoryWrite);
+        setNotice('Namespace ACL saved on this installation.');
+      } else if (action === 'embed-write') {
+        const revision = Number(memoryRevision);
+        if (!Number.isSafeInteger(revision) || revision < 1) throw new Error('Revision must be a positive integer.');
+        const result = await peersMemoryAddText(memoryNamespace.trim(), memoryRecord.trim(), memoryStack.trim(), memoryText, revision);
+        setNotice(result.updated ? 'Text embedded with the configured model and saved. Sync to replicate.' : 'Same revision already saved.');
+      } else if (action === 'embed-search') {
+        const result = await peersMemoryQueryText(memoryNamespace.trim(), memoryStack.trim(), memoryText, 5);
+        setMemoryMatches(result.matches);
+        setNotice('Text embedded and semantically searched using the configured Knowledge 2.0 model.');
+      } else if (action === 'watch' || action === 'unwatch') {
+        const enabled = action === 'watch';
+        if (enabled && !window.confirm('Enable automatic vector synchronization with this paired peer every 60 seconds while the installed daemon is running? Both sides must explicitly authorize this namespace.')) return;
+        await peersMemoryWatch(memoryAlias.trim(), memoryNamespace.trim(), enabled);
+        setNotice(enabled ? 'Resident vector autosync enabled. An offline peer is retried on subsequent ticks.' :
+          'Resident vector autosync disabled for this peer and namespace.');
+      } else if (action === 'write') {
+        const revision = Number(memoryRevision);
+        if (!Number.isSafeInteger(revision) || revision < 1) throw new Error('Revision must be a positive integer.');
+        const updated = await peersMemoryPut(memoryNamespace.trim(), {
+          id: memoryRecord.trim(), model: memoryModel.trim(), text: memoryText,
+          revision, vector: parseMemoryVector(),
+        });
+        setNotice(updated.updated ? 'Local vector revision stored; use Sync to replicate.' : 'Identical revision already stored.');
+      } else if (action === 'sync') {
+        if (!window.confirm('Replicate locally authored vector records with this explicitly paired node? Both sides must grant memory-read/write and the remote namespace ACL.')) return;
+        const result = await peersMemorySync(memoryAlias.trim(), memoryNamespace.trim());
+        setNotice('Vector sync complete: received ' + result.pulled + ', sent ' + result.pushed + ' records.');
+      } else {
+        const result = await peersMemorySearch(memoryNamespace.trim(), memoryModel.trim(), parseMemoryVector(), 5);
+        setMemoryMatches(result.matches);
+        setNotice('Vector search completed.');
+      }
+    } catch (cause) { setError('Shared vector memory: ' + String(cause)); }
+    finally { setMemoryBusy(false); }
+  }
+
+  async function refreshPeers() {
+    try { setPeers((await peersList()).outbound); setError(''); }
+    catch (e) { setError('Peer list unavailable: ' + String(e)); }
+  }
+  useEffect(() => { void refreshPeers(); }, []);
+  useEffect(() => { void refreshPlugins().catch(() => undefined); }, [refreshPlugins]);
+  async function refreshResident() {
+    try { setResident((await daemonSwarmStatus()).graphs); }
+    catch (cause) { setError('Resident service unavailable: ' + String(cause)); }
+  }
+  useEffect(() => { void refreshResident(); }, []);
+  async function submitResident() {
+    setError(''); setNotice('');
+    const selected = await open({ multiple: false, filters: [{ name: 'Swarm JSON graph', extensions: ['json'] }] });
+    if (typeof selected !== 'string') return;
+    if (!window.confirm('Register this JSON graph with the resident OS daemon? Every node must reference an already configured local recipe with manual/plan permissions. The daemon will run it even after this app closes.')) return;
+    setResidentBusy(true);
+    try {
+      const result = await daemonSwarmSubmit(selected);
+      setNotice('Registered durable swarm ' + result.id + ' with ' + result.nodes + ' nodes.');
+      await refreshResident();
+    } catch (cause) { setError('Swarm registration refused: ' + String(cause)); }
+    finally { setResidentBusy(false); }
+  }
+  async function cancelResident(id: string) {
+    if (!window.confirm('Request cancellation of every still-running job in this resident swarm? Execution may already have side effects.')) return;
+    setResidentBusy(true); setError('');
+    try { await daemonSwarmCancel(id); setNotice('Cancellation requested for ' + id + '. Completion is not yet confirmed.'); await refreshResident(); }
+    catch (cause) { setError('Cancellation not confirmed: ' + String(cause)); }
+    finally { setResidentBusy(false); }
+  }
+
+  const config = useMemo(() => {
+    try {
+      const args: Record<string, unknown> = { goal, mode };
+      if (scope.trim()) args.scope = scope.trim();
+      if (mode === 'analyze' && strictConsensus) args.consensus = 'strict';
+      if (notebook) args.notebook = true;
+      if (mode === 'analyze' && peerPool.length) args.auto_peer_pool = peerPool;
+      const spec = buildGoalSwarm(args);
+      return { args, spec, problem: '' };
+    } catch (cause) {
+      return { args: null, spec: null, problem: String(cause).replace(/^Error: /, '') };
+    }
+  }, [goal, mode, scope, peerPool, strictConsensus, notebook]);
+
+  const restored = sessions.flatMap(session => Object.entries(session.workflowRunMeta ?? {}).map(([id, run]) => ({
+    id, name: run.name, status: run.status, startedAt: run.startedAt,
+    completed: Object.values(run.agentResults ?? {}).filter(item => item.status === 'done').length,
+    total: run.phases.reduce((sum, phase) => sum + phase.agents.length, 0),
+    sessionId: session.id, sourceRunId: run.sourceRunId ?? null, description: run.description,
+  }))).sort((a, b) => b.startedAt - a.startedAt).slice(0, 20);
+
+  const running = runs.filter(run => run.status === 'running');
+  function prepare() {
+    if (!config.spec || !config.args) return;
+    const prompt = mode === 'implement'
+      ? 'I explicitly request the following code implementation. Use the workflow tool with these exact arguments, obey every permission prompt, and report real test results:'
+      : 'Run a native, read-only agent swarm using the workflow tool with these exact arguments. Independently verify findings and report supporting paths:';
+    window.dispatchEvent(new CustomEvent('little-monkey:swarm-draft', {
+      detail: {
+        sessionId,
+        text: prompt + '\n\n```json\n' + JSON.stringify(config.args, null, 2) + '\n```',
+      },
+    }));
+    setNotice('Prepared in your active chat composer. Close Settings, review the draft and press Send to start.');
+  }
+  function decide(id: string, version: number, decision: 'approved' | 'rejected') {
+    if (decision === 'approved' && !window.confirm('Approve this model-proposed claim for use as untrusted reference in future project swarms?')) return;
+    try { decideSwarmNote(notebookProject, id, version, decision); setNotebookRefresh(current => current + 1); setError(''); }
+    catch (cause) { setError(String(cause)); }
+  }
+  async function publishApprovedVector(id: string) {
+    setMemoryBusy(true); setError(''); setNotice('');
+    try {
+      const note=notes.find(item=>item.id===id);
+      if (!note) throw new Error('Approved notebook claim no longer exists.');
+      const exportable=approvedNotebookVectorClaim(note);
+      const revision=Number(memoryRevision);
+      if (!Number.isSafeInteger(revision) || revision<1 || revision>1_000_000) {
+        throw new Error('Supply a positive monotonically increasing vector revision (1–1,000,000).');
+      }
+      if (!memoryStack.trim() || !memoryNamespace.trim()) {
+        throw new Error('Choose an existing Knowledge embedding stack and memory namespace first.');
+      }
+      if (!window.confirm(
+        'Embed the approved notebook evidence with the configured Knowledge 2.0 stack and store it in "'+
+        memoryNamespace+'"? If peer autosync is enabled, the receiver may receive these exact evidence locations. Review their sensitivity and the selected vector revision before continuing.'
+      )) return;
+      const result=await peersMemoryAddText(memoryNamespace.trim(),exportable.id,memoryStack.trim(),exportable.text,revision);
+      setNotice(result.updated
+        ? 'Approved notebook revision '+exportable.approvedVersion+' embedded as local vector '+exportable.id+'. Sync only to explicitly authorized peers.'
+        : 'The same vector revision already exists; no duplicate was written.');
+    } catch (cause) {setError('Approved claim export failed: '+String(cause));}
+    finally {setMemoryBusy(false);}
+  }
+  function rollback(id: string, version: number) {
+    if (!window.confirm('Restore this earlier approved revision for future swarm context?')) return;
+    try { revertSwarmNote(notebookProject, id, version); setNotebookRefresh(current => current + 1); setError(''); }
+    catch (cause) { setError(String(cause)); }
+  }
+  async function importHooks() {
+    setError(''); setNotice('');
+    const selected = await open({ multiple: false, filters: [{ name: 'Command-hook JSON', extensions: ['json'] }] });
+    if (typeof selected !== 'string') return;
+    setHookBusy(true);
+    try {
+      const source = await readTextFile(selected);
+      const preview = parseCommandHooksManifest(source);
+      if (!preview.supported.length) {
+        setNotice('No supported command hooks found. Unsupported groups: ' + preview.unsupported.slice(0, 5).join('; '));
+        return;
+      }
+      const examples = preview.supported.slice(0, 12).map(hook => hook.event + ': ' + hook.command.slice(0, 90)).join('\\n');
+      if (!window.confirm('Enable ' + preview.supported.length +
+          ' executable hook commands? These run on your computer outside the model tool sandbox. Review every command before approving.\\n\\n' +
+          examples + (preview.supported.length > 12 ? '\\n...' : '') +
+          '\\n\\nUnsupported groups (not installed): ' + preview.unsupported.length)) return;
+      const store = useUserHooksStore.getState();
+      const existing = new Set(store.hooks.map(hook => [hook.event, hook.command, hook.matcher ?? ''].join('\\u0000')));
+      let installed = 0;
+      for (const hook of preview.supported) {
+        const key = [hook.event, hook.command, hook.matcher ?? ''].join('\\u0000');
+        if (existing.has(key)) continue;
+        store.add(hook);
+        existing.add(key);
+        installed += 1;
+      }
+      setNotice(installed + ' explicitly approved lifecycle hooks configured. Unsupported groups skipped: ' +
+        preview.unsupported.length + '. Manage or remove individual commands under User Hooks settings.');
+    } catch (cause) { setError('Hook import refused: ' + String(cause)); }
+    finally { setHookBusy(false); }
+  }
+  async function operatePlugin(id: string, action: 'connect' | 'disconnect' | 'enable' | 'disable') {
+    setPluginBusy(id); setError(''); setNotice('');
+    try {
+      const store = useMcpStore.getState();
+      if (action === 'connect') {
+        if (!window.confirm('Launch/connect this operator-configured MCP server? External stdio servers run outside Little Monkey\'s workspace sandbox.')) return;
+        await store.connect(id);
+      } else if (action === 'disconnect') await store.disconnect(id);
+      else await store.setEnabled(id, action === 'enable');
+      await store.refresh();
+      setNotice('MCP server state updated. Review its advertised tool allowlist in MCP settings.');
+    } catch (cause) { setError('MCP connection action failed: ' + String(cause)); }
+    finally { setPluginBusy(null); }
+  }
+  async function proposeLearningCandidate(sourceRunId: string, goalText: string) {
+    setLearningBusy(sourceRunId); setError(''); setNotice('');
+    try {
+      const eligible = await skillLearningClient.captureEligibility(sourceRunId, goalText);
+      if (!eligible) {
+        setNotice('The native run ledger has no verified learning-eligible evidence for this swarm. No skill was staged.');
+        return;
+      }
+      const result = await skillLearningClient.capture(sourceRunId, goalText);
+      setNotice(result.kind === 'created'
+        ? 'Learning candidate staged for evaluation and operator review. This does not promote a skill.'
+        : 'A candidate or learned skill already exists. Review it under Skill Learning settings.');
+    } catch (cause) { setError('Could not capture verified learning evidence: ' + String(cause)); }
+    finally { setLearningBusy(null); }
+  }
+  async function importLiveBenchmark() {
+    setError(''); setNotice('');
+    const selected = await open({ multiple: false, filters: [{
+      name: 'Little Monkey real-model benchmark JSON', extensions: ['json'],
+    }] });
+    if (typeof selected !== 'string') return;
+    setBenchmarkBusy(true);
+    try {
+      const raw = await readTextFile(selected);
+      if (raw.length > 64_000) throw new Error('Benchmark JSON exceeds the 64 KiB import limit.');
+      const summary = importSwarmBenchmark(JSON.parse(raw));
+      setBenchmark(summary);
+      setSwarmBenchmarkRouting(false);
+      setBenchmarkRouting(false);
+      setNotice('Imported operator-provided fixture measurements. Review every target before opting in. Only existing policy-eligible subagent targets may be reordered.');
+    } catch (cause) { setError('Benchmark import refused: ' + String(cause)); }
+    finally { setBenchmarkBusy(false); }
+  }
+  function changeBenchmarkRouting(enabled: boolean) {
+    if (enabled && !benchmark) return;
+    if (enabled && !window.confirm('Use these operator-provided accuracy measurements to rank subagent model candidates already permitted by a routing policy? Explicit model pins still win.')) return;
+    setSwarmBenchmarkRouting(enabled);
+    setBenchmarkRouting(enabled);
+  }
+  function deleteBenchmark() {
+    if (!window.confirm('Clear the locally stored benchmark data and turn off quality routing?')) return;
+    clearSwarmBenchmark();
+    setBenchmark(null);
+    setBenchmarkRouting(false);
+    setNotice('Stored benchmark removed and accuracy-based routing disabled.');
+  }
+  async function copyConfig() {
+    if (!config.args) return;
+    try { await navigator.clipboard.writeText(JSON.stringify(config.args, null, 2)); setNotice('Configuration copied.'); }
+    catch (cause) { setError('Clipboard unavailable: ' + String(cause)); }
+  }
+  return (
+    <div className="space-y-4">
+      <div className="rounded-lg border border-border bg-surface p-3">
+        <h4 className="text-sm font-semibold text-foreground">Native agent swarm</h4>
+        <p className="mt-1 text-xs leading-5 text-muted">Compose an evidence-led, permission-bounded workflow. No model runs until you review and submit its draft in chat. Read-only peers always use the recipient installation's own task recipe and permissions.</p>
+        <label className="mt-3 block text-xs text-muted">Goal
+          <textarea aria-label="Swarm goal" rows={3} maxLength={1200} value={goal} onChange={event => setGoal(event.target.value)}
+            className="mt-1 w-full rounded-md border border-border bg-background p-2 text-foreground"
+            placeholder="Analyze API authorization correctness and provide source evidence" />
+        </label>
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <label className="text-xs text-muted">Execution mode
+            <select aria-label="Swarm execution mode" className="mt-1 w-full rounded-md border border-border bg-background p-2 text-foreground"
+              value={mode} onChange={event => { setMode(event.target.value as 'analyze' | 'implement'); setPeerPool([]); }}>
+              <option value="analyze">Read-only analysis</option>
+              <option value="implement">Permission-gated implementation</option>
+            </select>
+          </label>
+          <label className="text-xs text-muted">Optional scope
+            <input aria-label="Swarm scope" maxLength={300} className="mt-1 w-full rounded-md border border-border bg-background p-2 text-foreground"
+              value={scope} onChange={event => setScope(event.target.value)} placeholder="Selected repository or module" />
+          </label>
+        </div>
+        <label className="mt-3 flex gap-2 text-xs text-foreground">
+          <input type="checkbox" checked={notebook} onChange={event => setNotebook(event.target.checked)} />
+          Use approved versioned project notebook claims (local-only; no remote peer forwarding)
+        </label>
+        {mode === 'analyze' && <label className="mt-3 flex gap-2 text-xs text-foreground">
+          <input type="checkbox" checked={strictConsensus} onChange={event => setStrictConsensus(event.target.checked)} />
+          Require independent structured reviewer votes; disagreements remain explicitly disputed
+        </label>}
+        {mode === 'analyze' && <div className="mt-3 rounded-md border border-border p-3">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold text-foreground">Approved peer pool (optional, maximum 3)</span>
+            <Button size="sm" onClick={() => void refreshPeers()}><RefreshCw size={13}/> Refresh</Button>
+          </div>
+          <p className="mt-1 text-xs text-muted">Only task-granted peers can receive a read-only discovery job. Actual permissions remain under each receiver's task recipe.</p>
+          {peers.length === 0 && <p className="mt-2 text-xs text-faint">No paired peers available. The swarm will run locally.</p>}
+          {peers.map(peer => {
+            const allowed = peer.grants.includes('task');
+            const selected = peerPool.includes(peer.alias);
+            const metric = metrics[peer.alias];
+            return <label key={peer.alias} className="mt-2 flex items-center gap-2 text-xs text-foreground">
+              <input type="checkbox" disabled={!allowed || (!selected && peerPool.length >= 3)}
+                checked={selected} onChange={event => setPeerPool(old =>
+                  event.target.checked ? [...old, peer.alias] : old.filter(alias => alias !== peer.alias))} />
+              <span className="font-medium">{peer.alias}</span>
+              <span className="text-faint">{peer.presence} · {allowed ? 'Task grant' : 'No task grant'} · {metric ? `${metric.successes} completed / ${metric.failures} failed` : 'No observations'}</span>
+            </label>;
+          })}
+        </div>}
+        {config.problem && goal.trim() && <p className="mt-3 text-xs text-warning" role="alert">{config.problem}</p>}
+        {config.spec && <p className="mt-3 text-xs text-muted">
+          <ShieldCheck className="mr-1 inline" size={14}/> {config.spec.phases.length} ordered phases · {config.spec.phases.reduce((count, phase) => count + phase.agents.length, 0)} agents · {mode === 'analyze' ? 'No code writes permitted by local agent profiles' : 'Code tools require existing approvals'}
+        </p>}
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Button variant="primary" disabled={!config.spec} onClick={prepare}><Activity size={14}/> Prepare in chat</Button>
+          <Button disabled={!config.spec} onClick={() => void copyConfig()}><Copy size={14}/> Copy tool arguments</Button>
+        </div>
+        {notice && <p role="status" className="mt-2 text-xs text-muted">{notice}</p>}
+        {error && <p role="alert" className="mt-2 text-xs text-warning">{error}</p>}
+      </div>
+      <div className="rounded-lg border border-border bg-surface p-3">
+        <h4 className="text-sm font-semibold text-foreground">Verified-fixture model accuracy</h4>
+        <p className="mt-1 text-xs text-muted">Import measurements produced by <code>pnpm test:swarm-models:live</code> on real configured models. Results are operator-provided and not cryptographic proof. Little Monkey independently validates fixture completeness and scores. Opt-in routing affects subagents only, after eligibility and routing-policy restrictions; explicit preferred models always win.</p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Button size="sm" disabled={benchmarkBusy} onClick={() => void importLiveBenchmark()}>Import real-model benchmark JSON</Button>
+          {benchmark && <Button size="sm" disabled={benchmarkBusy} onClick={deleteBenchmark}>Clear measurements</Button>}
+        </div>
+        {benchmark && <>
+          <p className="mt-2 text-xs text-muted">Generated {benchmark.generatedAt} · {benchmark.ranking.length} measured targets</p>
+          {benchmark.ranking.map(row => <p key={row.target} className="mt-1 break-all text-xs text-foreground">
+            {row.target} — {row.passes}/{row.attempts} verified fixtures ({Math.round(100*row.accuracy)}%) · {row.averageVerifiedMs === null ? 'no verified latency' : row.averageVerifiedMs + ' ms average'}
+          </p>)}
+          <label className="mt-3 flex items-start gap-2 text-xs text-foreground">
+            <input type="checkbox" checked={benchmarkRouting}
+              onChange={event => changeBenchmarkRouting(event.target.checked)} />
+            Opt in to quality-ranked candidate order for subagents when a routing policy has no explicit preferred models.
+          </label>
+        </>}
+      </div>
+      <div className="rounded-lg border border-border bg-surface p-3">
+        <h4 className="text-sm font-semibold text-foreground">Versioned notebook · {notes.length} claims</h4>
+        <p className="mt-1 text-xs text-muted">Only explicitly approved revisions enter future local swarm prompts. Model suggestions remain pending. Their source paths still need verification against the current repository. To publish one, select a Knowledge embedding stack and monotonic vector revision in the Replicated vector memory section, then explicitly approve its export.</p>
+        {notes.length === 0 && <p className="mt-2 text-xs text-faint">No approved or pending notebook claims in this project.</p>}
+        {notes.slice(0, 30).map(note => {
+          const pending = note.revisions.filter(revision => revision.status === 'pending');
+          return <div key={note.id} className="mt-3 border-t border-border pt-2 text-xs text-foreground">
+            <div className="font-medium break-all">{note.id}</div>
+            <p className="text-faint">Active version: {note.activeVersion ?? 'none'} · {note.revisions.length} retained revisions</p>
+            {note.activeVersion !== null && <Button size="sm" className="mt-2" disabled={memoryBusy}
+              onClick={() => void publishApprovedVector(note.id)}>
+              Embed approved revision into shared vector namespace…
+            </Button>}
+
+            {pending.map(revision => <div key={revision.version} className="mt-1 rounded-md border border-border p-2">
+              <p>Pending revision {revision.version} · {revision.reviewers.length} independent reviewers</p>
+              <p className="mt-1 break-all text-faint">{revision.evidence.join(' · ')}</p>
+              <div className="mt-2 flex gap-2">
+                <Button size="sm" onClick={() => decide(note.id, revision.version, 'approved')}>Approve</Button>
+                <Button size="sm" onClick={() => decide(note.id, revision.version, 'rejected')}>Reject</Button>
+              </div>
+            </div>)}
+            {note.revisions.filter(revision => revision.status === 'approved' && revision.version !== note.activeVersion).map(revision =>
+              <Button key={revision.version} className="mt-2" size="sm" onClick={() => rollback(note.id, revision.version)}>Restore approved v{revision.version}</Button>)}
+          </div>;
+        })}
+      </div>
+      <div className="rounded-lg border border-border bg-surface p-3">
+        <h4 className="text-sm font-semibold text-foreground">MCP plugin interoperability</h4>
+        <p className="mt-1 text-xs text-muted">Lifecycle controls for operator-configured MCP servers. External servers expose tools only through explicit approvals and do not expand agent permissions automatically. Review each server's allowlist under MCP settings; external stdio processes are outside the native sandbox.</p>
+        <div className="mt-2 flex flex-wrap justify-end gap-2">
+          <Button size="sm" onClick={() => void refreshPlugins()}><RefreshCw size={13}/> Refresh connections</Button>
+        </div>
+        <div className="mt-3 border-t border-border pt-2">
+          <p className="text-xs text-muted">Import compatible command-hook manifests manually. Only four supported Little Monkey lifecycle events are mapped; unknown events and hook kinds are refused. A confirmation displays executable commands before enabling them.</p>
+          <Button size="sm" className="mt-2" disabled={hookBusy} onClick={() => void importHooks()}>
+            {hookBusy ? 'Reading hook manifest…' : 'Review and import hooks.json…'}
+          </Button>
+        </div>
+        {mcpServers.length === 0 && <p className="mt-2 text-xs text-faint">No MCP servers are configured. Add one under Settings → Connectors → MCP.</p>}
+        {mcpServers.map(server => <div key={server.id} className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-border pt-2">
+          <div className="text-xs">
+            <p className="font-medium text-foreground">{server.label} <span className="text-faint">({server.status})</span></p>
+            <p className="text-faint">{server.tools.length} discovered tools · {server.toolAllowlist?.length ?? 'no'} allowlist entries · {server.transport.type}</p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" disabled={pluginBusy !== null} onClick={() => void operatePlugin(server.id, server.enabled ? 'disable' : 'enable')}>{server.enabled ? 'Disable' : 'Enable'}</Button>
+            {server.status === 'connected'
+              ? <Button size="sm" disabled={pluginBusy !== null} onClick={() => void operatePlugin(server.id, 'disconnect')}>Disconnect</Button>
+              : <Button size="sm" disabled={pluginBusy !== null || !server.enabled} onClick={() => void operatePlugin(server.id, 'connect')}>Connect</Button>}
+          </div>
+        </div>)}
+      </div>
+      <div className="rounded-lg border border-border bg-surface p-3">
+        <h4 className="text-sm font-semibold text-foreground">Replicated vector memory</h4>
+        <p className="mt-1 text-xs leading-5 text-muted">Opt-in, signed cross-installation vector records with per-namespace access control, embedding-model pinning, independent author revisions and tombstones. The two installations must already be paired. Sync manually or opt in to daemon-owned 60-second replication; vectors must be produced by the same embedding model on each node.</p>
+        <div className="mt-2 grid gap-2 sm:grid-cols-2">
+          <label className="text-xs text-muted">Namespace<input className="mt-1 w-full rounded border border-border bg-background p-2 text-foreground" value={memoryNamespace} onChange={e => setMemoryNamespace(e.target.value)} /></label>
+          <label className="text-xs text-muted">Knowledge 2.0 stack ID (for automatic embeddings)<input className="mt-1 w-full rounded border border-border bg-background p-2 text-foreground" value={memoryStack} onChange={e => setMemoryStack(e.target.value)} placeholder="Existing configured indexed stack ID" /></label>
+          <label className="text-xs text-muted">Embedding model identity<input className="mt-1 w-full rounded border border-border bg-background p-2 text-foreground" value={memoryModel} onChange={e => setMemoryModel(e.target.value)} /></label>
+          <label className="text-xs text-muted">Inbound peer device ID<input className="mt-1 w-full rounded border border-border bg-background p-2 text-foreground" value={memoryDevice} onChange={e => setMemoryDevice(e.target.value)} /></label>
+          <label className="text-xs text-muted">Outbound paired alias<input className="mt-1 w-full rounded border border-border bg-background p-2 text-foreground" value={memoryAlias} onChange={e => setMemoryAlias(e.target.value)} /></label>
+        </div>
+        <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-muted">
+          <label><input type="checkbox" checked={memoryRead} onChange={e => setMemoryRead(e.target.checked)} /> Allow peer read</label>
+          <label><input type="checkbox" checked={memoryWrite} onChange={e => setMemoryWrite(e.target.checked)} /> Allow peer write</label>
+          <Button size="sm" disabled={memoryBusy || !memoryDevice.trim()} onClick={() => void memoryAction('share')}>Apply namespace ACL</Button>
+          <Button size="sm" disabled={memoryBusy || !memoryAlias.trim()} onClick={() => void memoryAction('sync')}>Sync paired vectors</Button>
+          <Button size="sm" disabled={memoryBusy || !memoryAlias.trim()} onClick={() => void memoryAction('watch')}>Enable auto-sync</Button>
+          <Button size="sm" disabled={memoryBusy || !memoryAlias.trim()} onClick={() => void memoryAction('unwatch')}>Disable auto-sync</Button>
+        </div>
+        <div className="mt-3 grid gap-2 sm:grid-cols-2">
+          <label className="text-xs text-muted">Document ID<input className="mt-1 w-full rounded border border-border bg-background p-2 text-foreground" value={memoryRecord} onChange={e => setMemoryRecord(e.target.value)} /></label>
+          <label className="text-xs text-muted">Monotonic revision<input className="mt-1 w-full rounded border border-border bg-background p-2 text-foreground" type="number" min={1} value={memoryRevision} onChange={e => setMemoryRevision(e.target.value)} /></label>
+          <label className="text-xs text-muted sm:col-span-2">Embedding vector (comma-separated floats)<input className="mt-1 w-full rounded border border-border bg-background p-2 text-foreground" value={memoryVector} onChange={e => setMemoryVector(e.target.value)} placeholder="0.25,0.5,0.75" /></label>
+          <label className="text-xs text-muted sm:col-span-2">Document text<textarea rows={2} maxLength={2048} className="mt-1 w-full rounded border border-border bg-background p-2 text-foreground" value={memoryText} onChange={e => setMemoryText(e.target.value)} /></label>
+        </div>
+        <div className="mt-2 flex flex-wrap gap-2">
+          <Button size="sm" disabled={memoryBusy || !memoryStack.trim() || !memoryText.trim()} onClick={() => void memoryAction('embed-write')}>Embed & save text</Button>
+          <Button size="sm" disabled={memoryBusy || !memoryStack.trim() || !memoryText.trim()} onClick={() => void memoryAction('embed-search')}>Semantic search text</Button>
+          <Button size="sm" disabled={memoryBusy || !memoryText.trim()} onClick={() => void memoryAction('write')}>Save local vector revision</Button>
+          <Button size="sm" disabled={memoryBusy} onClick={() => void memoryAction('search')}>Search vectors</Button>
+        </div>
+        {memoryMatches.map((result,index) => <p key={index} className="mt-1 break-words text-xs text-muted">
+          {result.entry.author}/{result.entry.id}: {result.score.toFixed(3)} — {result.entry.text.slice(0,200)}
+        </p>)}
+      </div>
+      <div className="rounded-lg border border-border bg-surface p-3">
+        <h4 className="text-sm font-semibold text-foreground">Resident autonomous recipe graphs</h4>
+        <p className="mt-1 text-xs leading-5 text-muted">Durable DAGs run under the installed OS daemon and survive app restarts. Each graph node uses a frozen, operator-selected local recipe with manual/plan tool permissions. This does not automatically resume write-capable chat agents.</p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Button size="sm" variant="primary" disabled={residentBusy}
+            onClick={() => void submitResident()}>Import and register JSON graph…</Button>
+          <Button size="sm" disabled={residentBusy} onClick={() => void refreshResident()}><RefreshCw size={13}/> Refresh graphs</Button>
+        </div>
+        {resident.length === 0 && <p className="mt-3 text-xs text-faint">No resident swarm graphs recorded.</p>}
+        {resident.map(graph => <div key={graph.id} className="mt-3 border-t border-border pt-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="break-all text-xs font-medium">{graph.id} · {graph.state}</p>
+            {(graph.state === 'running' || graph.state === 'failing') &&
+              <Button size="sm" disabled={residentBusy} onClick={() => void cancelResident(graph.id)}>Request cancellation</Button>}
+          </div>
+          <p className="mt-1 text-xs text-faint">{graph.tasks.filter(t => t.state === 'succeeded').length}/{graph.tasks.length} nodes succeeded</p>
+          {graph.tasks.map(task => <p key={task.id} className="mt-1 text-xs text-muted">
+            {task.id} · {task.state} {task.error ? '— ' + task.error.slice(0, 160) : ''}
+          </p>)}
+        </div>)}
+      </div>
+      <div className="rounded-lg border border-border bg-surface p-3">
+        <h4 className="text-sm font-semibold text-foreground">Swarm runs</h4>
+        <p className="mt-1 text-xs text-muted">Live activity and durable session checkpoints. Interrupted runs require an explicit resume request in the same conversation.</p>
+        {running.length === 0 && restored.length === 0 && <p className="mt-2 text-xs text-faint">No swarm runs recorded.</p>}
+        {running.map(run => <p key={run.runId} className="mt-2 text-xs text-foreground">
+          <Activity className="mr-1 inline" size={13}/> {run.name} — running phase {run.activePhaseIndex + 1}/{run.phases.length}
+        </p>)}
+        {restored.map(run => <div key={run.sessionId + run.id} className="mt-2 border-t border-border pt-2 text-xs text-foreground">
+          <CheckCircle2 className="mr-1 inline" size={13}/> {run.name} — {run.status} · {run.completed}/{run.total} agents
+          {run.status !== 'done' && <p className="text-faint">Resume in its original chat: workflow tool with {JSON.stringify({ resume: run.id })}</p>}
+          {run.status === 'done' && run.sourceRunId && <Button size="sm"
+            disabled={learningBusy !== null}
+            onClick={() => void proposeLearningCandidate(run.sourceRunId!, run.description)}>
+            {learningBusy === run.sourceRunId ? 'Checking verification…' : 'Check verified learning eligibility'}
+          </Button>}
+        </div>)}
+      </div>
+    </div>
+  );
+}

@@ -34,6 +34,7 @@ import {
 } from './modelTargets';
 import {
   observedTimeToFirstTokenMs,
+  matchPolicy,
   routeRequest,
   type RoutingCandidate,
   type RoutingDecision,
@@ -42,6 +43,7 @@ import {
 import { getActiveChatTarget, useModelStore, type MlxChatStatus as MlxChatStatusPayload } from '../store/modelStore';
 import { useCostControlStore } from '../store/costControlStore';
 import { useRoutingPolicyStore } from '../store/routingPolicyStore';
+import { rankEligibleSwarmTargets } from './swarmVerifiedBenchmarks';
 
 /** Mirrors `LlamaState::default()` in src-tauri/src/llama.rs. */
 const DEFAULT_LLAMA_PORT = 8090;
@@ -464,7 +466,25 @@ export function routeFromActive(active: ResolvedTarget, context: RoutingContext)
     candidates.push(routingCandidate(snapshot));
   }
 
-  const decision = routeRequest(policies, candidates, context, activeKey);
+  const initial = routeRequest(policies, candidates, context, activeKey);
+  // Accuracy routing is operator opt-in, only for subagents, and only inside
+  // the *already validated* policy candidate list. Explicit preferred model
+  // order, per-profile model pins and the later Privacy Firewall all win.
+  const policy = matchPolicy(policies, context.taskClass);
+  const ranked = initial.policyId &&
+    (context.taskClass === 'subagent_explore' || context.taskClass === 'subagent_code') &&
+    policy?.preferredTargetKeys.length === 0
+    ? rankEligibleSwarmTargets(initial.sequence, policy.preferredTargetKeys)
+    : [...initial.sequence];
+  const benchmarkChanged = ranked.length > 1 && ranked[0] !== initial.chosenKey;
+  const decision: RoutingDecision = benchmarkChanged ? {
+    ...initial,
+    chosenKey: ranked[0],
+    changedFromActive: ranked[0] !== activeKey,
+    sequence: ranked,
+    reason: initial.reason +
+      ' Operator-approved live-model fixture accuracy reordered eligible subagent candidates; permissions, privacy policy and explicit pins remain authoritative.',
+  } : initial;
   useRoutingPolicyStore.getState().recordDecision(decision);
 
   const sequence: ResolvedTarget[] = [];

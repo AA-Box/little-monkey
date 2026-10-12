@@ -679,6 +679,20 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     requestAnimationFrame(resizeTextarea);
   }, [sessionId, resizeTextarea, setInput]);
 
+  // Settings' SwarmPanel prepares an editable, user-reviewed draft in the
+  // active chat. This does not execute tools or circumvent Send/approvals.
+  useEffect(() => {
+    const onDraft = (raw: Event) => {
+      const payload = (raw as CustomEvent<{ sessionId?: unknown; text?: unknown }>).detail;
+      if (!payload || payload.sessionId !== sessionId || typeof payload.text !== "string" ||
+          payload.text.length < 1 || payload.text.length > 8_000) return;
+      setInput(current => [current.trim(), payload.text as string].filter(Boolean).join("\n\n"));
+      requestAnimationFrame(resizeTextarea);
+    };
+    window.addEventListener("little-monkey:swarm-draft", onDraft);
+    return () => window.removeEventListener("little-monkey:swarm-draft", onDraft);
+  }, [sessionId, resizeTextarea, setInput]);
+
   useEffect(() => {
     if (!pendingBrowserEvidence) return;
     setInput((current) => [current.trim(), pendingBrowserEvidence.summary].filter(Boolean).join("\n\n"));

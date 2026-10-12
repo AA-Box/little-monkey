@@ -22,6 +22,7 @@ import {
 import { primaryRoot, useWorkspaceStore } from "./workspaceStore";
 import { usePromptStore } from "./promptStore";
 import type { UsageInfo } from "./usageStore";
+import type { WorkflowSpec } from "../lib/workflow";
 import { errorMessage } from "../lib/errors";
 
 /** localStorage key sessions were persisted under BEFORE file-based
@@ -221,14 +222,25 @@ export interface WorkflowAgentResult {
 export interface WorkflowRunMeta {
   name: string;
   description: string;
-  status: "done" | "error" | "cancelled";
+  status: "running" | "done" | "error" | "cancelled";
   startedAt: number;
   finishedAt: number;
   phases: { title: string; agents: { taskId: string; description: string }[] }[];
+  /** Explicitly recoverable spec, including selected peer placement.
+   * Persisted to permit user-approved resume after a crash. Never execute
+   * automatically on load, especially for write-capable agents. */
+  spec?: WorkflowSpec;
+  /** Rust run-ledger id of the parent execution, not the workflow tool-call id.
+   * Required for native skill-learning capture/evaluation eligibility. */
+  sourceRunId?: string;
   /** Per-agent journal (workflow v2) — written once, in the same terminal
    * snapshot as the rest of this meta, so any terminal-with-failures run is
    * resumable. Absent on runs persisted before v2. */
   agentResults?: Record<string, WorkflowAgentResult>;
+  /** Initial workflow call id of a resumed chain. Preserving this across
+   * successive resumes lets remote workers reconnect to their original
+   * peer-task receipt instead of accidentally dispatching duplicate work. */
+  correlationOrigin?: string;
 }
 
 export interface MessageTranslation {
@@ -1364,6 +1376,54 @@ function normalizeGroup(raw: unknown, interruptRunning: boolean): SessionGroup |
   return group;
 }
 
+/** Validate workflow checkpoints received from persisted sessions, never
+ * trusting arbitrary JSON to grant tools. A running snapshot becomes an
+ * interrupted error on restart; recovery is always an explicit action. */
+export function normalizeWorkflowRunMeta(value: unknown, interruptRunning = true): Record<string, WorkflowRunMeta> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const result: Record<string, WorkflowRunMeta> = {};
+  for (const [runId, raw] of Object.entries(value as Record<string, unknown>).slice(0, 100)) {
+    if (!runId || runId.length > 200 || !raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const record = raw as Partial<WorkflowRunMeta>;
+    if (typeof record.name !== "string" || !record.name.trim() || typeof record.description !== "string") continue;
+    if (!["running", "done", "error", "cancelled"].includes(record.status ?? "")) continue;
+    if (!Number.isFinite(record.startedAt) || !Number.isFinite(record.finishedAt) || !Array.isArray(record.phases)) continue;
+    if (!record.phases.every(phase => phase && typeof phase.title === "string" &&
+      Array.isArray(phase.agents) && phase.agents.every(agent =>
+        agent && typeof agent.taskId === "string" && typeof agent.description === "string"))) continue;
+    const agentResults: Record<string, WorkflowAgentResult> = {};
+    if (record.agentResults && typeof record.agentResults === "object") {
+      for (const [id, candidate] of Object.entries(record.agentResults).slice(0, 16)) {
+        if (!candidate || typeof candidate !== "object") continue;
+        const item = candidate as WorkflowAgentResult;
+        if (!/^[0-9a-f]{8}$/.test(item.promptHash) ||
+            !["done", "error", "cancelled"].includes(item.status) ||
+            typeof item.report !== "string" || item.report.length > 8_000) continue;
+        agentResults[id] = { promptHash: item.promptHash, status: item.status, report: item.report,
+          ...(item.reused ? { reused: true } : {}) };
+      }
+    }
+    // Specs containing code/peer agents are revalidated at actual dispatch;
+    // hydration must never cause execution or grant access by itself.
+    const spec = record.spec && typeof record.spec === "object" &&
+      Array.isArray(record.spec.phases) && record.spec.phases.length > 0 &&
+      record.spec.phases.length <= 6 ? record.spec : undefined;
+    result[runId] = {
+      name: record.name, description: record.description,
+      status: interruptRunning && record.status === "running" ? "error" : record.status!,
+      startedAt: record.startedAt!, finishedAt: record.finishedAt!,
+      phases: record.phases,
+      agentResults,
+      ...(spec ? { spec } : {}),
+      ...(typeof record.sourceRunId === "string" && record.sourceRunId.length <= 200
+        ? { sourceRunId: record.sourceRunId } : {}),
+      ...(typeof record.correlationOrigin === "string" && record.correlationOrigin.length <= 200
+        ? { correlationOrigin: record.correlationOrigin } : {}),
+    };
+  }
+  return result;
+}
+
 function normalizeSession(raw: Partial<ChatSession>, interruptRunning: boolean): ChatSession {
   const parsedMessages = Array.isArray(raw.messages)
     ? raw.messages.map(normalizeMessage).filter((message): message is ChatMessage => message !== null)
@@ -1390,6 +1450,7 @@ function normalizeSession(raw: Partial<ChatSession>, interruptRunning: boolean):
     docChatMode: raw.docChatMode === true,
     subagentRuns: normalizeSubagentRuns(raw.subagentRuns),
     subagentRunMeta: normalizeSubagentRunMeta(raw.subagentRunMeta),
+    workflowRunMeta: normalizeWorkflowRunMeta(raw.workflowRunMeta, interruptRunning),
     messageTranslations: normalizeMessageTranslations(raw.messageTranslations),
     threadTranslations: normalizeThreadTranslations(raw.threadTranslations),
     displayTranslationLocale: normalizeLocale(raw.displayTranslationLocale),

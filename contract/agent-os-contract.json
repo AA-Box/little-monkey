@@ -1,5 +1,5 @@
 {
-  "contract_version": "2.0.0",
+  "contract_version": "2.2.0",
   "support_window_days": 180,
   "http_routes": [
     {
@@ -591,6 +591,12 @@
     {
       "plane": "peer",
       "method": "POST",
+      "path": "/v1/remote/peer/threads/{thread_id}/cancel",
+      "gate": "capability:PeerTaskRequest"
+    },
+    {
+      "plane": "peer",
+      "method": "POST",
       "path": "/v1/remote/peer/hello",
       "gate": "peer_standing"
     },
@@ -599,6 +605,24 @@
       "method": "POST",
       "path": "/v1/remote/peer/artifacts",
       "gate": "capability:PeerArtifact"
+    },
+    {
+      "plane": "peer",
+      "method": "GET",
+      "path": "/v1/remote/peer/memory/{namespace}",
+      "gate": "capability:PeerMemoryRead"
+    },
+    {
+      "plane": "peer",
+      "method": "POST",
+      "path": "/v1/remote/peer/memory/{namespace}/records",
+      "gate": "capability:PeerMemoryWrite"
+    },
+    {
+      "plane": "peer",
+      "method": "POST",
+      "path": "/v1/remote/peer/memory/{namespace}/search",
+      "gate": "capability:PeerMemoryRead"
     }
   ],
   "acp": {

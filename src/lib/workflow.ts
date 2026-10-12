@@ -26,7 +26,15 @@ import { useSubagentStore } from '../store/subagentStore';
 import { useSessionStore, type WorkflowAgentResult } from '../store/sessionStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useSavedWorkflowStore, type SavedWorkflow } from '../store/savedWorkflowStore';
-import { unwrapUntrustedContent } from './untrustedContent';
+import { unwrapUntrustedContent, wrapUntrustedContent } from './untrustedContent';
+import { buildSwarmPreset } from './swarmPresets';
+import { buildGoalSwarm, parseSwarmMemoryStackIds, selectSwarmDomain } from './swarmPlanning';
+import { recordSpecialistMetric } from './swarmSpecialistMetrics';
+import { retrieveSwarmKnowledge } from './swarmKnowledge';
+import { compileSwarmTaskGraph } from './swarmGraph';
+import { assertReadOnlyPeerPlacement } from './swarmPeerSchema';
+import { reconcileSwarmReviewers } from './swarmConsensus';
+import { approvedSwarmNotebookBlock, stageSwarmNote } from './swarmNotebook';
 
 export interface WorkflowAgentSpec {
   description: string;
@@ -47,12 +55,24 @@ export interface WorkflowAgentSpec {
   /** Optional worktree isolation — same meaning and validation as the `task`
    * tool's `isolation` (see `RunSubagentTaskParams.isolation`). */
   isolation?: 'worktree';
+  /** Explicitly selected paired peer; only allowed for read-only explore agents. */
+  peer?: string;
+  /** Health-ranked candidates supplied explicitly by the operator. */
+  peerCandidates?: string[];
 }
 
 export interface WorkflowSpec {
   name: string;
   description: string;
   phases: { title: string; agents: WorkflowAgentSpec[] }[];
+  /** Existing, indexed Knowledge 2.0 stacks explicitly selected for this run. */
+  memoryStackIds?: string[];
+  /** Do not run downstream phases after failed prerequisites. */
+  stopOnFailure?: boolean;
+  /** Optional strict non-authoritative agreement/dispute summary from independent reviewers. */
+  consensus?: 'strict';
+  /** Opt-in, operator-approved versioned notebook reference and staging. */
+  notebook?: boolean;
 }
 
 /** Caps mirror the tool schema's documented limits — validated here anyway
@@ -62,6 +82,36 @@ export interface WorkflowSpec {
 export const MAX_WORKFLOW_PHASES = 6;
 export const MAX_AGENTS_PER_PHASE = 6;
 export const MAX_WORKFLOW_AGENTS = 16;
+
+/** Runner-side defense-in-depth for stored specs and programmatic callers
+ * that bypass the workflow tool's parser. Reject oversized plans before any
+ * agent can be dispatched, including after a restore from disk. */
+export function assertWorkflowBounds(spec: WorkflowSpec): void {
+  if (!spec || typeof spec.name !== 'string' || !spec.name.trim() ||
+      !Array.isArray(spec.phases) || !spec.phases.length ||
+      spec.phases.length > MAX_WORKFLOW_PHASES) {
+    throw new Error('Workflow must have a name and 1–6 phases.');
+  }
+  let total = 0;
+  for (const phase of spec.phases) {
+    if (!phase || typeof phase.title !== 'string' ||
+        !Array.isArray(phase.agents) || !phase.agents.length ||
+        phase.agents.length > MAX_AGENTS_PER_PHASE) {
+      throw new Error('Each workflow phase requires 1–6 agents.');
+    }
+    total += phase.agents.length;
+    for (const agent of phase.agents) {
+      if (!agent || typeof agent.description !== 'string' ||
+          typeof agent.prompt !== 'string' || !agent.prompt.trim() ||
+          agent.prompt.length > 8_000 || typeof agent.profile !== 'string') {
+        throw new Error('Workflow agent has invalid or oversized instructions.');
+      }
+    }
+  }
+  if (total > MAX_WORKFLOW_AGENTS) throw new Error('Workflow cannot exceed 16 agents.');
+  if (spec.consensus !== undefined && spec.consensus !== 'strict') throw new Error('Invalid consensus mode.');
+  if (spec.memoryStackIds !== undefined) parseSwarmMemoryStackIds(spec.memoryStackIds);
+}
 
 /** Per-injected-report cap for the prior-phase context block (chars) — a
  * later phase sees earlier findings, but a chatty phase must not blow out
@@ -108,7 +158,16 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
       const effort: 'low' | 'medium' | 'high' | undefined =
         rawEffort === 'low' || rawEffort === 'medium' || rawEffort === 'high' ? rawEffort : undefined;
       const isolation: 'worktree' | undefined = agent.isolation === 'worktree' ? 'worktree' : undefined;
-      return { description: agentDescription, prompt, profile, effort, isolation };
+      if (agent.peer !== undefined) assertReadOnlyPeerPlacement(agent.peer, profile, Boolean(isolation));
+      const peer = agent.peer as string | undefined;
+      const peerCandidates = agent.peerCandidates;
+      if (peerCandidates !== undefined && (!Array.isArray(peerCandidates) || peerCandidates.length === 0 ||
+          peerCandidates.length > 3 || !peerCandidates.every((alias: unknown) => typeof alias === 'string' && alias.length <= 120) ||
+          !peer || !peerCandidates.includes(peer))) {
+        throw new Error('Peer candidate pool requires 1–3 aliases and a valid primary read-only peer.');
+      }
+      return { description: agentDescription, prompt, profile, effort, isolation,
+        ...(peer ? { peer } : {}), ...(Array.isArray(peerCandidates) ? { peerCandidates: [...peerCandidates] as string[] } : {}) };
     });
     totalAgents += agents.length;
     return { title, agents };
@@ -116,7 +175,12 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
   if (totalAgents > MAX_WORKFLOW_AGENTS) {
     throw new Error(`workflow allows at most ${MAX_WORKFLOW_AGENTS} agents in total.`);
   }
-  return { name, description, phases };
+  const memoryStackIds = parseSwarmMemoryStackIds(args.memory_stack_ids);
+  if (args.consensus !== undefined && args.consensus !== 'strict') throw new Error('Unsupported workflow consensus policy.');
+  return { name, description, phases, ...(args.stop_on_failure === true ? { stopOnFailure: true } : {}),
+    ...(args.consensus === 'strict' ? { consensus: 'strict' as const } : {}),
+    ...(args.notebook === true ? { notebook: true } : {}),
+    ...(memoryStackIds.length ? { memoryStackIds } : {}) };
 }
 
 /**
@@ -127,7 +191,28 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
  * `executeToolCall` `workflow` branch calls this instead of
  * `parseWorkflowSpec` directly. Exported for the logic tests.
  */
-export function resolveWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
+export function resolveWorkflowSpec(args: Record<string, unknown>, sessionId?: string): WorkflowSpec {
+  // A resume-only tool invocation explicitly opts into recovering an
+  // interrupted workflow. Never re-run one merely because it hydrated.
+  if (typeof args.resume === 'string' && args.resume.trim() && sessionId &&
+      args.goal === undefined && args.preset === undefined &&
+      args.tasks === undefined && args.saved === undefined &&
+      args.phases === undefined && args.name === undefined) {
+    const meta = useSessionStore.getState().sessions.find(s => s.id === sessionId)
+      ?.workflowRunMeta?.[args.resume.trim()];
+    if (!meta?.spec) throw new Error('No recoverable workflow specification for this run in the current session.');
+    return parseWorkflowSpec({
+      ...meta.spec,
+      memory_stack_ids: meta.spec.memoryStackIds,
+      stop_on_failure: meta.spec.stopOnFailure,
+      consensus: meta.spec.consensus,
+      notebook: meta.spec.notebook,
+    });
+  }
+  if (args.goal !== undefined) return buildGoalSwarm(args);
+  if (args.preset !== undefined) return buildSwarmPreset(args);
+  if (args.tasks !== undefined) return compileSwarmTaskGraph(args);
+  if (args.mode !== undefined || args.scope !== undefined) throw new Error('workflow mode and scope require a goal or preset.');
   const saved = typeof args.saved === 'string' ? args.saved.trim() : '';
   if (saved && !Array.isArray(args.phases)) {
     const entry = useSavedWorkflowStore.getState().workflows[saved];
@@ -169,6 +254,16 @@ export function composeSavedWorkflowCatalog(saved: SavedWorkflow[]): string {
  * `WorkflowRunMeta.phases[].agents[].taskId` entries still point at the
  * right `ChatSession.subagentRunMeta` entries. Exported for the logic
  * tests. */
+/** Persisted root identity of a workflow replay chain. Does not change
+ * ordinary local checkpoints, only remote peer receipt correlation. */
+export function workflowCorrelationOrigin(
+  toolCallId: string,
+  resume?: string,
+  previous?: { correlationOrigin?: string },
+): string {
+  return previous?.correlationOrigin ?? resume ?? toolCallId;
+}
+
 export function workflowAgentTaskId(runId: string, phaseIndex: number, agentIndex: number): string {
   return `${runId}#p${phaseIndex}a${agentIndex}`;
 }
@@ -205,7 +300,7 @@ export function buildPriorReportsBlock(reports: PhaseReport[]): string {
       entry.report.length > MAX_INJECTED_REPORT_CHARS
         ? `${entry.report.slice(0, MAX_INJECTED_REPORT_CHARS)}\n[truncated]`
         : entry.report;
-    return `### ${entry.phaseTitle} — ${entry.agentDescription}\n${capped}`;
+    return `### ${entry.phaseTitle} — ${entry.agentDescription}\n${wrapUntrustedContent('prior workflow agent report', capped)}`;
   });
   return `\n\n## Results from earlier phases of this workflow\n\n${sections.join('\n\n')}`;
 }
@@ -289,6 +384,13 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
   // chain of partial resumes work: each resume writes a fresh, complete
   // journal of its own.
   const agentResults: Record<string, WorkflowAgentResult> = {};
+  // For a partial resume chain A -> B -> C, C must still attach to A's
+  // durable peer task receipt. Using only the immediately previous run id
+  // would mint a new correlation and could send duplicate remote work.
+  const sourceMeta = resume
+    ? useSessionStore.getState().sessions.find(s => s.id === sessionId)?.workflowRunMeta?.[resume]
+    : undefined;
+  const correlationOrigin = workflowCorrelationOrigin(toolCallId, resume, sourceMeta);
 
   const phases: WorkflowPhase[] = spec.phases.map((phase, phaseIndex) => ({
     title: phase.title,
@@ -315,9 +417,26 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
       finishedAt: Date.now(),
       phases,
       agentResults,
+      correlationOrigin,
+      ...(runId ? { sourceRunId: runId } : {}),
+      spec,
     });
     return result;
   };
+
+  /** Save a bounded restart journal before dispatch and after each agent.
+   * Session persistence is file-backed but debounced, so forced power loss
+   * during a write may still lose the last update; never replay mutations
+   * automatically after a crash. */
+  const checkpoint = (): void => {
+    const live = useWorkflowStore.getState().runs[toolCallId];
+    useSessionStore.getState().setWorkflowRun(sessionId, toolCallId, {
+      name: spec.name, description: spec.description, status: 'running',
+      startedAt: live?.startedAt ?? Date.now(), finishedAt: Date.now(),
+      phases, agentResults: { ...agentResults }, correlationOrigin, ...(runId ? { sourceRunId: runId } : {}), spec,
+    });
+  };
+  checkpoint();
 
   /** Registers a replayed (journal-hit) agent in the live store AND the
    * persisted per-agent transcript, so the drawer's workflow card shows a
@@ -349,6 +468,32 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
   };
 
   try {
+    assertWorkflowBounds(spec);
+    // Persisted saved workflows can be hand-edited; validate the permission
+    // boundary again at dispatch, not only during JSON-tool parsing.
+    for (const phase of spec.phases) {
+      for (const agent of phase.agents) {
+        if (agent.peer !== undefined) assertReadOnlyPeerPlacement(agent.peer, agent.profile, Boolean(agent.isolation));
+        if (agent.peerCandidates !== undefined && (
+          !agent.peer || !Array.isArray(agent.peerCandidates) || agent.peerCandidates.length < 1 ||
+          agent.peerCandidates.length > 3 ||
+          !agent.peerCandidates.includes(agent.peer) ||
+          agent.peerCandidates.some(candidate => {
+            try { assertReadOnlyPeerPlacement(candidate, agent.profile, Boolean(agent.isolation)); return false; }
+            catch { return true; }
+          })
+        )) throw new Error('Saved workflow has invalid read-only peer candidates.');
+      }
+    }
+    if ((spec.memoryStackIds?.length || spec.notebook) && spec.phases.some(phase => phase.agents.some(agent => agent.peer))) {
+      throw new Error('Indexed knowledge cannot be automatically forwarded to remote peers. Remove memory_stack_ids for a peer workflow.');
+    }
+    const knowledgeBlock = spec.memoryStackIds?.length
+      ? await retrieveSwarmKnowledge(spec.memoryStackIds, spec.description)
+      : '';
+    const session = useSessionStore.getState().sessions.find(s => s.id === sessionId);
+    const notebookProject = session?.workspacePath?.trim() || 'session:' + sessionId;
+    const notebookBlock = spec.notebook ? approvedSwarmNotebookBlock(notebookProject) : '';
     const priorReports: PhaseReport[] = [];
     const phaseSummaries: { title: string; agents: { description: string; status: string; report: string; reused?: boolean }[] }[] = [];
 
@@ -357,12 +502,14 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
       useWorkflowStore.getState().beginPhase(toolCallId, phaseIndex);
       const phase = spec.phases[phaseIndex];
       const contextBlock = buildPriorReportsBlock(priorReports);
+      const sharedContext = [knowledgeBlock, notebookBlock].filter(Boolean).map(x => '\n\n' + x).join('');
 
       const limit = useSettingsStore.getState().maxConcurrentSubagents;
       const results = await runBounded(
         phase.agents.map((agent, agentIndex) => async () => {
+          const startedAt = Date.now();
           const agentTaskId = workflowAgentTaskId(toolCallId, phaseIndex, agentIndex);
-          const prompt = `${agent.prompt}${contextBlock}`;
+          const prompt = `${agent.prompt}${contextBlock}${sharedContext}`;
           const hash = promptHash(prompt);
 
           // Resume hit: the same position in the resumed run completed with
@@ -374,10 +521,24 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
           if (journaled && journaled.status === 'done' && journaled.promptHash === hash) {
             replayJournaledAgent(agentTaskId, agent, prompt, journaled.report);
             agentResults[agentTaskId] = { promptHash: hash, status: 'done', report: journaled.report, reused: true };
+            checkpoint();
             return journaled.report;
           }
 
-          const raw = await runSubagentTask({
+          const raw = agent.peer
+            ? await (await import('./swarmPeer')).runPairedPeerAgent({
+                sessionId,
+                workflowRunId: toolCallId,
+                taskId: agentTaskId,
+                description: agent.description,
+                prompt,
+                peer: agent.peer,
+                peerCandidates: agent.peerCandidates,
+                correlationRunId: correlationOrigin,
+                correlationTaskPosition: `p${phaseIndex}a${agentIndex}`,
+                signal: parentSignal,
+              })
+            : await runSubagentTask({
             sessionId,
             runId,
             parentCheckpointId,
@@ -403,6 +564,10 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
             status: cancelled ? 'cancelled' : failed ? 'error' : 'done',
             report: raw.slice(0, MAX_REPORT_CHARS),
           };
+          checkpoint();
+          if (phaseIndex === 0 && spec.name.startsWith('auto-swarm-') && !cancelled) {
+            recordSpecialistMetric(selectSwarmDomain(spec.description), agent.description, !failed, Date.now() - startedAt);
+          }
           return raw;
         }),
         limit,
@@ -425,9 +590,13 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
       });
       phaseSummaries.push({ title: phase.title, agents });
 
+      // In dependency-aware workflows and modifying swarms, an incomplete
+      // prerequisite must never unlock a downstream agent. Earlier workflow
+      // specs preserve their previous best-effort continuation semantics.
       if (parentSignal?.aborted) {
         return finish('cancelled', CANCELLED_TOOL_RESULT);
       }
+      if (spec.stopOnFailure && agents.some(agent => agent.status !== 'done')) break;
     }
 
     const anyFailure = phaseSummaries.some((phase) => phase.agents.some((agent) => agent.status !== 'done'));
@@ -435,9 +604,34 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
     // — what makes `resolveWorkflowSpec`'s `saved` lookup and the drawer's
     // Saved-workflows list work without the user ever pressing Save.
     if (!anyFailure) useSavedWorkflowStore.getState().upsert(spec, Date.now());
+    const reviewPhase = spec.consensus === 'strict' && phaseSummaries.length >= 2
+      ? phaseSummaries[phaseSummaries.length - 2] : null;
+    const consensus = reviewPhase ? reconcileSwarmReviewers(reviewPhase.agents
+      .filter(agent => agent.status === 'done')
+      .map(agent => ({ reviewer: agent.description, report: agent.report }))) : undefined;
+    const notebookStaged: string[] = [];
+    const notebookWarnings: string[] = [];
+    if (spec.notebook && consensus && !anyFailure) {
+      for (const claim of consensus.claims) {
+        if (claim.status !== 'reviewer_agreement' || !claim.evidence.length) continue;
+        try {
+          stageSwarmNote({ project: notebookProject, id: claim.id,
+            evidence: claim.evidence.slice(0, 6), reviewers: claim.supportingReviewers,
+            runId: correlationOrigin });
+          notebookStaged.push(claim.id);
+        } catch (error) {
+          notebookWarnings.push('Failed to stage claim ' + claim.id + ': ' + String(error).slice(0, 200));
+        }
+      }
+    }
     return finish(
       anyFailure ? 'error' : 'done',
-      stringifyToolResult({ workflow: spec.name, status: anyFailure ? 'completed_with_failures' : 'completed', phases: phaseSummaries }),
+      stringifyToolResult({
+        workflow: spec.name, status: anyFailure ? 'completed_with_failures' : 'completed',
+        phases: phaseSummaries,
+        ...(consensus ? { consensus } : {}),
+        ...(spec.notebook ? { notebookStaged, notebookWarnings, notebookRequiresApproval: true } : {}),
+      }),
     );
   } catch (err) {
     return finish('error', stringifyToolError(err));

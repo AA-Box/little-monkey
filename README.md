@@ -96,6 +96,10 @@ Main task
 
 Agents can work in isolated Git worktrees, report back to a coordinator, and be stopped or inspected individually — multi-agent execution for real software work instead of several chat responses.
 
+Little Monkey also supports **goal-driven agent swarms**, explicit task dependency graphs, opt-in shared indexed knowledge from selected Knowledge 2.0 stacks, and optional read-only discovery on explicitly paired peer installations. Specialized agents reuse native permissions, routing, and workflow limits. Remote peer execution uses the receiving node's independent recipe and permission policy. See [Agent swarms](docs/agent-swarms.md) for setup and limitations.
+
+For security reviews, the built-in **security-red-team** workflow runs 15 read-only specialist agents across phased audits and independent verification. A separate **security-audit-and-fix** preset performs user-authorized fixes and tests through the existing permission boundary. See [Security swarms](docs/security-swarms.md) for the exact capabilities and limits.
+
 ### Run capable agents locally without giving up real tools
 
 Use Ollama, `llama.cpp`, MLX or another configured provider while the agent runtime stays on your own machine.

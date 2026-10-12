@@ -644,6 +644,108 @@ fn a_message_from_one_installation_becomes_a_turn_on_the_other() {
 }
 
 #[test]
+fn a_signed_task_owner_can_request_cancellation_but_cannot_cancel_another_peers_job() {
+    let (alice, bob, pairing) = two_nodes(every_grant());
+    let other_pairing = bob.admit_peer(every_grant(), "other-installation");
+    let request = envelope(&alice, "msg-cancellable", PeerMessageKind::TaskRequest, "Read the test repository");
+    let sent = send(&bob, &pairing, &request, NOW + 100);
+    assert_eq!(sent.status, 202);
+    let job_id = job_id_of(&bob, 0);
+    let run_id = "run-cancellable";
+    let mut store = DaemonStore::open(&bob.paths).unwrap();
+    store.insert_preparing(&NewDaemonJob {
+        job_id: job_id.clone(),
+        recipe_snapshot: PathBuf::from("/tmp/peer-task.json"),
+        priority: 0, max_attempts: 1, created_at_ms: NOW + 110,
+        max_runtime_ms: 60_000, max_memory_bytes: None, max_log_bytes: 1_024,
+        repository_policy_json: None, worktree_json: None, parent_run_id: None,
+    }, 64).unwrap();
+    store.mark_queued(&job_id, run_id, NOW + 120).unwrap();
+    drop(store);
+    let mut ledger = RunLedger::open(&bob.paths.ledger_db).unwrap();
+    ledger.submit_run(&run_spec(run_id, NOW + 120)).unwrap();
+    drop(ledger);
+
+    let body = serde_json::json!({"message_id":"msg-cancellable"}).to_string();
+    let endpoint = "/v1/remote/peer/threads/thread-1/cancel";
+    // Authenticated outsiders have peer standing but not *this* task.
+    assert_eq!(call(&bob, &other_pairing, "POST", endpoint, body.as_bytes(), NOW + 130).status, 404);
+    assert_eq!(call(&bob, &pairing, "POST", "/v1/remote/peer/threads/thread-other/cancel",
+        body.as_bytes(), NOW + 140).status, 404);
+    assert_eq!(call(&bob, &pairing, "POST", endpoint,
+        br#"{"message_id":"different-task"}"#, NOW + 150).status, 404);
+    assert!(!DaemonStore::open(&bob.paths).unwrap().get_job(&job_id).unwrap().unwrap().cancel_requested);
+
+    let response = call(&bob, &pairing, "POST", endpoint, body.as_bytes(), NOW + 160);
+    assert_eq!(response.status, 202, "{:?}", json(&response));
+    assert_eq!(json(&response)["status"], "cancellation_requested");
+    assert!(DaemonStore::open(&bob.paths).unwrap().get_job(&job_id).unwrap().unwrap().cancel_requested);
+    let again = call(&bob, &pairing, "POST", endpoint, body.as_bytes(), NOW + 170);
+    assert_eq!(again.status, 200);
+    assert_eq!(json(&again)["status"], "cancellation_already_requested");
+    // Revoking the task grant also removes the power to cancel.
+    bob.set_grants(&pairing.device_id, BTreeSet::from([DeviceCapability::PeerMessage]));
+    assert_eq!(call(&bob, &pairing, "POST", endpoint, body.as_bytes(), NOW + 180).status, 403);
+}
+
+#[test]
+fn two_separate_installations_share_only_operator_authorized_vector_memory() {
+    use super::peer_memory::{self,VectorDocument,LOCAL_AUTHOR};
+    let (alice,mut bob,pairing)=two_nodes(BTreeSet::from([
+        DeviceCapability::PeerMemoryRead,DeviceCapability::PeerMemoryWrite,
+    ]));
+    let path="/v1/remote/peer/memory/project-alpha";
+    let doc=VectorDocument{id:"claim-1".into(),revision:1,
+        model:"embed-local-v1".into(),text:"Evidence from Alice".into(),
+        vector:vec![0.25,0.5,0.75],deleted:false};
+    let body=serde_json::to_vec(&doc).unwrap();
+    // Pairing never implicitly grants any namespace.
+    assert_eq!(call(&bob,&pairing,"GET",path,b"",NOW+50).status,403);
+    assert_eq!(call(&bob,&pairing,"POST",&format!("{path}/records"),&body,NOW+60).status,403);
+    {
+        let mut store=DaemonStore::open(&bob.paths).unwrap();
+        peer_memory::grant(&store,&pairing.device_id,"project-alpha",true,true).unwrap();
+        peer_memory::put(&mut store,"project-alpha",LOCAL_AUTHOR,&VectorDocument {
+            id:"bob-claim".into(),revision:1,model:"embed-local-v1".into(),
+            text:"Evidence from Bob".into(),vector:vec![0.3,0.4,0.6],deleted:false,
+        }).unwrap();
+    }
+    assert_eq!(call(&bob,&pairing,"GET","/v1/remote/peer/memory/not-shared",b"",NOW+70).status,403);
+    let written=call(&bob,&pairing,"POST",&format!("{path}/records"),&body,NOW+80);
+    assert_eq!(written.status,201,"{:?}",json(&written));
+    let replay=call(&bob,&pairing,"POST",&format!("{path}/records"),&body,NOW+90);
+    assert_eq!(replay.status,200);
+    let mut corrupted=doc.clone();corrupted.text="changed without revision".into();
+    assert_eq!(call(&bob,&pairing,"POST",&format!("{path}/records"),
+        &serde_json::to_vec(&corrupted).unwrap(),NOW+100).status,409);
+    let mut wrong_model=doc.clone();wrong_model.id="claim-2".into();
+    wrong_model.model="different-embedding-space".into();
+    assert_eq!(call(&bob,&pairing,"POST",&format!("{path}/records"),
+        &serde_json::to_vec(&wrong_model).unwrap(),NOW+110).status,409);
+    let remote_only=call(&bob,&pairing,"GET",path,b"",NOW+120);
+    assert_eq!(remote_only.status,200);
+    let exports=json(&remote_only)["records"].as_array().unwrap().clone();
+    // Bob cannot impersonate Alice as an export author; each author
+    // propagates only its own records to the receiving installation.
+    assert_eq!(exports.len(),1);
+    assert_eq!(exports[0]["id"],"bob-claim");
+    let search=call(&bob,&pairing,"POST",&format!("{path}/search"),
+        br#"{"model":"embed-local-v1","vector":[0.25,0.5,0.75],"top_k":5}"#,NOW+130);
+    assert_eq!(search.status,200,"{:?}",json(&search));
+    assert_eq!(json(&search)["matches"].as_array().unwrap().len(),2);
+    bob.restart();
+    assert_eq!(call(&bob,&pairing,"GET",path,b"",NOW+140).status,200);
+    assert_eq!(peer_memory::list(&DaemonStore::open(&bob.paths).unwrap(),"project-alpha",false)
+        .unwrap().len(),2);
+    // Revoking read leaves write independent and prevents further export.
+    peer_memory::grant(&DaemonStore::open(&bob.paths).unwrap(),
+        &pairing.device_id,"project-alpha",false,true).unwrap();
+    assert_eq!(call(&bob,&pairing,"GET",path,b"",NOW+150).status,403);
+    assert_eq!(call(&bob,&pairing,"POST",&format!("{path}/records"),&body,NOW+160).status,200);
+    let _=alice; // distinct node is deliberately not collapsed into Bob.
+}
+
+#[test]
 fn a_task_request_runs_under_the_receivers_own_authority_and_its_result_correlates_back() {
     let (alice, mut bob, pairing) = two_nodes(every_grant());
 
