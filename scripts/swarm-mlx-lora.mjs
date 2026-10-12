@@ -135,7 +135,7 @@ export function trainingPlan(opts){
  if(!Number.isSafeInteger(n)||n<10||n>5000)throw Error('Training iterations must be between 10 and 5,000');
  if(!Number.isFinite(maxPpl)||maxPpl<=0||maxPpl>100)
    throw Error('Operator must declare a finite held-out perplexity acceptance ceiling (0–100)');
- let previous=null, regression=null;
+ let previous=null, regression=null,regressionSha256=null;
  if(opts.previous||opts.regression){
   if(!opts.previous||!opts.regression)throw Error('Previous adapter and held-out regression directory are both required');
   previous=checkedLocalDir(opts.previous,'Previous approved adapter');
@@ -144,12 +144,12 @@ export function trainingPlan(opts){
      throw Error('Previous adapter lacks MLX adapter weights or configuration');
   regression=checkedLocalDir(opts.regression,'Regression dataset');
   const rows=records(join(regression,'test.jsonl'),'regression test.jsonl');
+  regressionSha256=rows.hash;
   for(const hash of rows.unique)if(inspected.all.has(hash))
     throw Error('Regression holdout overlaps training, validation or new test data');
  }
  return {model,data,output,iterations:n,maxTestPpl:maxPpl,
-  ...(previous?{previous,regression,
-    regressionSha256:records(join(regression,'test.jsonl'),'regression test.jsonl').hash}:{}),
+  ...(previous?{previous,regression,regressionSha256}:{}),
   files:inspected.files};
 }
 async function main(){
