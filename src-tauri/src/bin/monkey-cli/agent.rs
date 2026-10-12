@@ -2412,6 +2412,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_cli_workflow_accepts_only_explicit_bounded_local_agent_phases() {
+        let valid = serde_json::json!({
+            "name":"Repository review",
+            "phases":[
+                {"title":"Inspect","agents":[
+                    {"description":"Auth specialist","prompt":"Inspect token checks","profile":"explore"},
+                    {"description":"Cache specialist","prompt":"Inspect cache keys"}
+                ]},
+                {"title":"Authorized patch","agents":[
+                    {"description":"Fixer","prompt":"Fix only confirmed defects","profile":"code"}
+                ]}
+            ]
+        });
+        let plan = parse_cli_workflow(&valid).expect("bounded native plan");
+        assert_eq!(plan.phases.len(), 2);
+        assert_eq!(plan.phases[0].agents.len(), 2);
+        assert_eq!(plan.phases[1].agents[0].profile.as_deref(), Some("code"));
+
+        let mut remote = valid.clone();
+        remote["phases"][0]["agents"][0]["peer"] = serde_json::json!("untrusted-node");
+        assert!(parse_cli_workflow(&remote).is_err(), "receiver placement cannot bypass grants");
+        let mut isolated = valid.clone();
+        isolated["phases"][0]["agents"][0]["isolation"] = serde_json::json!("worktree");
+        assert!(parse_cli_workflow(&isolated).is_err(), "CLI must not silently ignore worktree isolation");
+        let mut unknown = valid.clone();
+        unknown["phases"][0]["agents"][0]["profile"] = serde_json::json!("superuser");
+        assert!(parse_cli_workflow(&unknown).is_err());
+        let mut oversized = valid.clone();
+        oversized["phases"][0]["agents"][0]["prompt"] = serde_json::json!("x".repeat(8_001));
+        assert!(parse_cli_workflow(&oversized).is_err());
+        let mut many = valid;
+        many["phases"][0]["agents"] = serde_json::json!(
+            (0..7).map(|_| serde_json::json!({"description":"x","prompt":"y"}))
+                .collect::<Vec<_>>()
+        );
+        assert!(parse_cli_workflow(&many).is_err());
+    }
+
+    #[test]
+    fn resident_workflow_tool_schema_advertises_only_bounded_native_agents() {
+        let definition = tools_def::workflow_tool_def();
+        assert_eq!(definition["function"]["name"], "workflow");
+        assert_eq!(definition["function"]["parameters"]["properties"]["phases"]["maxItems"], 6);
+        assert_eq!(definition["function"]["parameters"]["additionalProperties"], false);
+        assert_eq!(definition["function"]["parameters"]["properties"]["phases"]["items"]["properties"]["agents"]["maxItems"], 6);
+    }
+
+    #[test]
     fn durable_tool_outcome_distinguishes_denial_failure_and_success() {
         assert_eq!(
             tool_outcome(r#"{"error":"Permission denied: no TTY"}"#),
