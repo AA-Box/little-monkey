@@ -1026,8 +1026,12 @@ async fn run_cli_workflow(
         // graph are bounded, labelled untrusted, and must be independently checked.
         let context = prior.iter().map(|(title, name, report)| {
             let excerpt: String = report.chars().take(1_500).collect();
-            format!("Phase {title}, agent {name}:\n{excerpt}")
+            // Model-generated reports cannot inject role/control tokens or
+            // impersonate an instruction from the parent turn.
+            let safe = wrap_untrusted_content("earlier workflow agent report", &excerpt);
+            format!("Phase {title}, agent {name}:\n{safe}")
         }).collect::<Vec<_>>().join("\n\n");
+        let context: String = context.chars().take(12_000).collect();
         let mut agents = Vec::new();
         let mut next_reports = Vec::new();
         let mut any_failure = false;
@@ -1045,9 +1049,11 @@ async fn run_cli_workflow(
                 client, target, options, state, perms, &agent.description,
                 &prompt, profile, checkpoint_id, usage, mutated_files,
             ).await;
-            let failed = serde_json::from_str::<serde_json::Value>(&report).ok()
-                .and_then(|v| v.get("error").and_then(serde_json::Value::as_str).map(str::to_owned))
-                .is_some();
+            let failed = report.trim().is_empty()
+                || report.starts_with(ITERATION_CAP_MESSAGE_PREFIX)
+                || serde_json::from_str::<serde_json::Value>(&report).ok()
+                    .and_then(|v| v.get("error").and_then(serde_json::Value::as_str).map(str::to_owned))
+                    .is_some();
             agents.push(serde_json::json!({
                 "description":agent.description,
                 "profile":agent.profile.as_deref().unwrap_or("explore"),
