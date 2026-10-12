@@ -106,7 +106,7 @@ export function reconcileSwarmReviewers(
   }
   const result: SwarmConsensusClaim[] = [...claims].sort(([a], [b]) => a.localeCompare(b)).map(([id, entry]) => ({
     id,
-    status: entry.reject.size && entry.support.size
+    status: entry.reject.size > 0
       ? 'disputed'
       : entry.support.size >= required && entry.reject.size === 0 && entry.evidence.size > 0
         ? 'reviewer_agreement' : 'insufficient_evidence',
