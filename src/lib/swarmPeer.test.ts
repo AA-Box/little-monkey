@@ -45,6 +45,14 @@ const reply = (state: string, result_text: string | null = null) => ({
   kind: 'task_request', state, result_text, sent_at_ms: 1, checked_at_ms: 2,
 });
 beforeEach(() => {
+  // Vitest runs these state-machine tests in Node, not necessarily jsdom.
+  // Use an isolated deterministic storage implementation per test.
+  const memory = new Map<string, string>();
+  vi.stubGlobal('localStorage', {
+    getItem: (key: string) => memory.get(key) ?? null,
+    setItem: (key: string, value: string) => { memory.set(key, value); },
+    removeItem: (key: string) => { memory.delete(key); },
+  });
   localStorage.removeItem(PEER_METRICS_KEY);
   for (const fn of Object.values(mocks)) fn.mockReset();
   mocks.peersList.mockResolvedValue({ inbound: [], outbound: [{ alias: 'paired-node', grants: ['task'] }] });
