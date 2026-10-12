@@ -536,6 +536,12 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
       ? await frozenAuthenticatedPeerVoters(spec.phases[spec.phases.length-2].agents
         .map(agent=>agent.peer!))
       : null;
+    // Resolve one module instance per graph instead of racing concurrent
+    // per-agent dynamic imports while a remote reviewer wave fans out.
+    const remoteRunner=spec.phases.some(phase=>phase.agents.some(agent=>!!agent.peer))
+      ? await import('./swarmPeer') : null;
+    const failoverRunner=spec.phases.some(phase=>phase.agents.some(agent=>!!agent.peerFailover))
+      ? await import('./swarmPeerRecovery') : null;
     // Persisted saved workflows can be hand-edited; validate the permission
     // boundary again at dispatch, not only during JSON-tool parsing.
     for (const phase of spec.phases) {
@@ -626,8 +632,8 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
 
           const raw = agent.peer
             ? await (agent.peerFailover
-                ? (await import('./swarmPeerRecovery')).runPairedPeerAgentWithFailover
-                : (await import('./swarmPeer')).runPairedPeerAgent)({
+                ? failoverRunner!.runPairedPeerAgentWithFailover
+                : remoteRunner!.runPairedPeerAgent)({
                 sessionId,
                 workflowRunId: toolCallId,
                 taskId: agentTaskId,
