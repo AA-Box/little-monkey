@@ -62,6 +62,8 @@ export interface WorkflowAgentSpec {
   peer?: string;
   /** Health-ranked candidates supplied explicitly by the operator. */
   peerCandidates?: string[];
+  /** One opt-in read-only alternate only after verified terminal peer failure. */
+  peerFailover?: boolean;
 }
 
 export interface WorkflowSpec {
@@ -112,6 +114,14 @@ export function assertWorkflowBounds(spec: WorkflowSpec): void {
           typeof agent.prompt !== 'string' || !agent.prompt.trim() ||
           agent.prompt.length > 8_000 || typeof agent.profile !== 'string') {
         throw new Error('Workflow agent has invalid or oversized instructions.');
+      }
+      if (agent.peerFailover !== undefined && typeof agent.peerFailover !== 'boolean')
+        throw new Error('Peer failover flag must be a boolean.');
+      if (agent.peerFailover && (agent.profile !== 'explore' || !agent.peer ||
+         agent.isolation || !agent.peerCandidates ||
+         agent.peerCandidates.length < 2 || agent.peerCandidates.length > 3 ||
+         new Set(agent.peerCandidates).size !== agent.peerCandidates.length)) {
+        throw new Error('Peer failover requires 2–3 distinct explicitly approved read-only peer candidates.');
       }
     }
   }
@@ -182,8 +192,16 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
           !peer || !peerCandidates.includes(peer))) {
         throw new Error('Peer candidate pool requires 1–3 aliases and a valid primary read-only peer.');
       }
+      if (agent.peerFailover !== undefined && typeof agent.peerFailover !== 'boolean')
+        throw new Error('peerFailover must be a boolean.');
+      if (agent.peerFailover === true && (profile !== 'explore' || !peer ||
+        !Array.isArray(peerCandidates) || peerCandidates.length < 2 ||
+        new Set(peerCandidates).size !== peerCandidates.length)) {
+        throw new Error('Peer failover requires 2–3 distinct explicitly approved read-only peer candidates.');
+      }
       return { description: agentDescription, prompt, profile, effort, isolation,
-        ...(peer ? { peer } : {}), ...(Array.isArray(peerCandidates) ? { peerCandidates: [...peerCandidates] as string[] } : {}) };
+        ...(peer ? { peer } : {}), ...(Array.isArray(peerCandidates) ? { peerCandidates: [...peerCandidates] as string[] } : {}),
+        ...(agent.peerFailover === true ? { peerFailover: true } : {}) };
     });
     totalAgents += agents.length;
     return { title, agents };
@@ -584,7 +602,9 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
           }
 
           const raw = agent.peer
-            ? await (await import('./swarmPeer')).runPairedPeerAgent({
+            ? await (agent.peerFailover
+                ? (await import('./swarmPeerRecovery')).runPairedPeerAgentWithFailover
+                : (await import('./swarmPeer')).runPairedPeerAgent)({
                 sessionId,
                 workflowRunId: toolCallId,
                 taskId: agentTaskId,

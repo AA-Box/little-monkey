@@ -71,6 +71,22 @@ beforeEach(() => {
 });
 
 describe("parseWorkflowSpec", () => {
+  it('validates opted-in peer failover boundaries',()=>{
+    const parse=(agent:Record<string,unknown>)=>parseWorkflowSpec({
+      name:'peer review',phases:[{title:'P',agents:[{
+        description:'read',prompt:'Inspect sources',profile:'explore',...agent}]}],
+    });
+    expect(parse({peer:'node-a',peerCandidates:['node-a','node-b'],peerFailover:true})
+      .phases[0].agents[0].peerFailover).toBe(true);
+    for(const bad of [
+      {peer:'node-a',peerFailover:true},
+      {peer:'node-a',peerCandidates:['node-a'],peerFailover:true},
+      {peer:'node-a',peerCandidates:['node-a','node-a'],peerFailover:true},
+      {peer:'node-a',peerCandidates:['node-a','node-b'],profile:'code',peerFailover:true},
+      {peer:'node-a',peerCandidates:['node-a','node-b'],peerFailover:'true'},
+    ])expect(()=>parse(bad)).toThrow();
+  });
+
   it("rejects remote code agents and worktree placements", () => {
     expect(() => parseWorkflowSpec({
       name: "bad", phases: [{ title: "P", agents: [{ description: "write", prompt: "change", profile: "code", peer: "paired-node" }] }],

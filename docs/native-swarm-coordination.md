@@ -320,3 +320,20 @@ and independently test representative model responses. A fused model can
 behave differently from the unmerged adapter: an adapter's successful test
 does **not** certify the fused result's accuracy without an additional live
 runtime acceptance check.
+
+
+### One-shot opt-in cross-peer read-only failover
+
+A phased read-only explorer may specify `peer: "node-a"`,
+`peerCandidates: ["node-a","node-b"]`, and `peerFailover: true`.
+After completing or reattaching the original durable peer receipt, a **second**
+paired, task-granted and online/unknown-status peer may receive the **same**
+read-only prompt with a **distinct deterministic correlation**, at most once,
+ONLY if the original exact remote message was independently confirmed to be
+terminal `failed`. Resumed runs search every selected peer's durable receipt
+history for both stages, so completed alternatives are not resent. Network
+uncertainty, timeouts, cancellation, rejection, history saturation, revoked
+permissions and unconfirmed failure block migration. The receiving machine's
+own recipe, tool and workspace policy remain authoritative. This does not
+migrate processes, perform distributed leader election, or provide a
+quorum-consensus protocol; physical two-device validation is still required.
