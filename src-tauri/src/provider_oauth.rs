@@ -98,10 +98,14 @@ where F: FnOnce(String) -> Result<String, String> {
         .append_pair("code_challenge_method", "S256")
         .append_pair("key_label", "Little Monkey CLI");
     let code = request_code(url.to_string())?;
-    if code.trim().is_empty() || code.len() > 4096 || code.chars().any(char::is_whitespace) {
+    let code = code.trim();
+    // Terminal read_line includes a newline; trim that separator first,
+    // then reject embedded whitespace so pasting malformed URLs cannot
+    // accidentally enter the token exchange.
+    if code.is_empty() || code.len() > 4096 || code.chars().any(char::is_whitespace) {
         return Err("Invalid authorization code pasted for OpenRouter".into());
     }
-    exchange_and_store(code.trim(), &verifier).await
+    exchange_and_store(code, &verifier).await
 }
 
 /// Common credential publication for desktop, local CLI, and headless CLI.
