@@ -137,6 +137,12 @@ fn prepare_schema(store: &DaemonStore) -> Result<(), String> {
          );
          CREATE INDEX IF NOT EXISTS idx_resident_swarm_events_graph
            ON resident_swarm_events(graph_id,event_id);
+         CREATE TRIGGER IF NOT EXISTS resident_swarm_event_retention
+         AFTER INSERT ON resident_swarm_events
+         BEGIN
+           DELETE FROM resident_swarm_events
+             WHERE event_id < NEW.event_id - 20000;
+         END;
          CREATE TRIGGER IF NOT EXISTS resident_swarm_graph_created
          AFTER INSERT ON resident_swarm_graphs
          BEGIN
