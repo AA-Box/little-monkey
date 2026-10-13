@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { CodingSessionImportCard } from "./CodingSessionImportCard";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   ArchiveRestore,
@@ -197,6 +198,7 @@ export function PortabilityPanel() {
       </div>
 
       {statusMessage(error, success)}
+      <CodingSessionImportCard />
 
       {pending && (
         <section className="rounded-xl border border-accent/40 bg-accent-soft p-4">
