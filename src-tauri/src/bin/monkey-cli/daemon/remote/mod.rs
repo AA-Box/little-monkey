@@ -2522,6 +2522,22 @@ fn now_ms() -> Result<u64, String> {
         })
 }
 
+/// Publish a monotonic locally-leader-authored DAG observation to an
+/// operator-enrolled peer. This carries NO execution authority or tool grant.
+pub(crate) async fn signed_swarm_checkpoint(
+    paths:&DaemonPaths,alias:&str,expected_server_sha256:&str,
+    body:Vec<u8>,now_ms:u64,
+)->Result<serde_json::Value,String>{
+    let store=RemoteStore::open(&paths.root)?;
+    let profile=store.controller(alias)?
+        .ok_or_else(||"Replica target is not an approved paired peer".to_string())?;
+    if profile.server_certificate_sha256!=expected_server_sha256 {
+        return Err("Cluster replica roster differs from TLS-pinned peer".into());
+    }
+    client::call(paths,alias,Method::POST,
+        "/v1/remote/peer/swarm-state/checkpoints",body,now_ms).await
+}
+
 /// A typed, signed and TLS-certificate-pinned vote request. Only the already
 /// approved outbound peer alias is allowed to choose the destination.
 pub(crate) async fn signed_swarm_vote(
