@@ -390,7 +390,32 @@ mod tests{
             assert!(swarm_cluster::may_schedule(&b,"swarm-team",30_001).unwrap());
             assert!(!swarm_cluster::may_schedule(&c,"swarm-team",30_001).unwrap());
         }
+        // A different enrolled member can honestly publish the SAME graph
+        // name, but that must not authorize re-running A's staged plan.
+        {
+            let mut store=DaemonStore::open(&receiver).unwrap();
+            store.connection.execute(
+                "DELETE FROM resident_swarm_peer_checkpoints
+                 WHERE group_id=?1 AND graph_id=?2 AND source_fp=?3",
+                params!["swarm-team","original",afp]
+            ).unwrap();
+            let mut not_predecessor=record.clone();
+            not_predecessor.source_fingerprint=cfp.clone();
+            not_predecessor.seal().unwrap();
+            assert!(swarm_replication::ingest(
+                &mut store,"signed-c",&not_predecessor,30_001
+            ).unwrap());
+        }
         run_once(&receiver,30_001).unwrap();
+        assert_eq!(status(&receiver).unwrap()["plans"][0]["state"],"armed",
+            "an unrelated enrolled member must not trigger the reviewed predecessor's transfer");
+        {
+            let mut store=DaemonStore::open(&receiver).unwrap();
+            assert!(swarm_replication::ingest(
+                &mut store,"signed-a",&record,30_002
+            ).unwrap());
+        }
+        run_once(&receiver,30_002).unwrap();
         assert_eq!(status(&receiver).unwrap()["plans"][0]["state"],"imported");
         let graph=super::super::swarm_coordinator::status(&receiver,Some("recovered")).unwrap();
         assert_eq!(graph["graphs"][0]["tasks"][0]["state"],"pending");
