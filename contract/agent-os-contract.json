@@ -1,5 +1,5 @@
 {
-  "contract_version": "2.2.0",
+  "contract_version": "2.3.0",
   "support_window_days": 180,
   "http_routes": [
     {
@@ -592,6 +592,24 @@
       "plane": "peer",
       "method": "POST",
       "path": "/v1/remote/peer/threads/{thread_id}/cancel",
+      "gate": "capability:PeerTaskRequest"
+    },
+    {
+      "plane": "peer",
+      "method": "POST",
+      "path": "/v1/remote/peer/swarm-election/vote",
+      "gate": "capability:PeerTaskRequest"
+    },
+    {
+      "plane": "peer",
+      "method": "POST",
+      "path": "/v1/remote/peer/swarm-state/checkpoints",
+      "gate": "capability:PeerTaskRequest"
+    },
+    {
+      "plane": "peer",
+      "method": "GET",
+      "path": "/v1/remote/peer/swarm-state/{group}/{graph}",
       "gate": "capability:PeerTaskRequest"
     },
     {
