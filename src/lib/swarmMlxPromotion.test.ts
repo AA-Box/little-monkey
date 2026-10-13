@@ -56,7 +56,7 @@ describe('verified MLX promotion and automatic live rollback',()=>{
   expect(runtime.start).not.toHaveBeenCalled();
  });
  it('never replaces a running GGUF or silently destroys a prior non-MLX model',async()=>{
-  const gguf={...prev,id:'gguf',runtime:'llama'} as ModelInfo;
+  const gguf={...prev,id:'gguf',runtime:'llama_cpp'} as ModelInfo;
   active=gguf;running=null;
   runtime.otherLocalRunning=()=>true;
   await expect(promoteVerifiedMlxFusion(candidate,runtime,storage)).rejects.toThrow(/Stop the running non-MLX/);
