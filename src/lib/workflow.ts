@@ -481,6 +481,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
   // chain of partial resumes work: each resume writes a fresh, complete
   // journal of its own.
   const agentResults: Record<string, WorkflowAgentResult> = {};
+  let liveBus: LiveSwarmBus | null = null;
   // For a partial resume chain A -> B -> C, C must still attach to A's
   // durable peer task receipt. Using only the immediately previous run id
   // would mint a new correlation and could send duplicate remote work.
@@ -570,6 +571,10 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
   try {
     assertWorkflowBounds(spec);
     await checkpoint(); // durably register the graph before dispatch
+    if (spec.liveMessaging) {
+      liveBus = new LiveSwarmBus(spec.phases.flatMap((phase, phaseIndex) =>
+        phase.agents.map((_, agentIndex) => workflowAgentTaskId(toolCallId, phaseIndex, agentIndex))));
+    }
     const voterSnapshot=spec.authenticatedPeerVoting
       ? await frozenAuthenticatedPeerVoters(spec.phases[spec.phases.length-2].agents
         .map(agent=>agent.peer!))
@@ -599,6 +604,11 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
     if ((spec.memoryStackIds?.length || spec.notebook) && spec.phases.some(phase => phase.agents.some(agent => agent.peer))) {
       throw new Error('Indexed knowledge cannot be automatically forwarded to remote peers. Remove memory_stack_ids for a peer workflow.');
     }
+    const currentSession = useSessionStore.getState().sessions.find(s => s.id === sessionId);
+    const memoryWorkspace = currentSession?.workspacePath?.trim() || 'session:' + sessionId;
+    const autoMemoryBlock = spec.autoMemoryStackId
+      ? await retrieveAutoMemory(spec.autoMemoryStackId, memoryWorkspace, spec.description || spec.name)
+      : '';
     const knowledgeBlock = spec.memoryStackIds?.length
       ? await retrieveSwarmKnowledge(spec.memoryStackIds, spec.description)
       : '';
@@ -620,7 +630,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
       useWorkflowStore.getState().beginPhase(toolCallId, phaseIndex);
       const phase = spec.phases[phaseIndex];
       const contextBlock = buildPriorReportsBlock(priorReports);
-      const sharedContext = [knowledgeBlock, notebookBlock, learningBlock].filter(Boolean).map(x => '\n\n' + x).join('');
+      const sharedContext = [knowledgeBlock, autoMemoryBlock, notebookBlock, learningBlock].filter(Boolean).map(x => '\n\n' + x).join('');
 
       const limit = useSettingsStore.getState().maxConcurrentSubagents;
       // A topology is a scheduling policy, never a new agent/permission grant.
@@ -684,6 +694,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
                 signal: parentSignal,
               })
             : await runSubagentTask({
+            liveBus: liveBus ?? undefined,
             sessionId,
             runId,
             parentCheckpointId,
@@ -786,6 +797,21 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
         }
       }
     }
+    let automaticMemory: { saved: number; warnings: string[] } | undefined;
+    if (spec.autoMemoryStackId && !anyFailure) {
+      try {
+        automaticMemory = await captureAutoMemory(
+          spec.autoMemoryStackId, memoryWorkspace, spec.name,
+          spec.phases.flatMap((phase, phaseIndex) => phase.agents.map((agent, agentIndex) => ({
+            taskId: workflowAgentTaskId(correlationOrigin, phaseIndex, agentIndex),
+            role: agent.description,
+            report: agentResults[workflowAgentTaskId(toolCallId, phaseIndex, agentIndex)]?.report ?? '',
+          }))),
+        );
+      } catch (error) {
+        automaticMemory = { saved: 0, warnings: ['Automatic memory capture failed: ' + String(error).slice(0, 200)] };
+      }
+    }
     return finish(
       anyFailure ? 'error' : 'done',
       stringifyToolResult({
@@ -793,9 +819,12 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
         phases: phaseSummaries,
         ...(consensus ? { consensus } : {}),
         ...(spec.notebook ? { notebookStaged, notebookWarnings, notebookRequiresApproval: true } : {}),
+         ...(automaticMemory ? { automaticMemory } : {}),
       }),
     );
   } catch (err) {
     return finish('error', stringifyToolError(err));
+  } finally {
+    liveBus?.close();
   }
 }
