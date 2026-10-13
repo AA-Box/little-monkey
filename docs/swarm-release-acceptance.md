@@ -525,3 +525,44 @@ not stand in for a real model or permission-approval acceptance run.
 The optional real-device GitHub Actions `repair_target` input invokes the
 same gate only when deliberately supplied. Real repairs may require an
 available operator; without one the safe outcome is timeout/failure.
+
+
+## Portable, operator-reviewed read-only swarm recovery bundles
+
+The resident DAG still stores its own ledger and queued child jobs on one
+machine; this is NOT automatic replicated-log failover. To deliberately
+restart an existing **read-only, plan-mode** frozen graph on another operator
+installation, export its bounded recipe and *observational-only* state:
+
+```bash
+monkey daemon swarm-export original-graph /secure-transfer/graph.json
+```
+
+Transfer that JSON file using a separately authenticated operator-controlled
+channel, inspect it before importing, and select an existing **local** workspace
+on the receiving installation:
+
+```bash
+monkey daemon swarm-import-read-only /secure-transfer/graph.json \
+  --new-id after-failover-v2 --workspace /absolute/disposable/workspace \
+  --confirm-read-only-reexecution
+```
+
+The importer compares whole-bundle and per-recipe SHA-256 checksums, rejects
+unknown fields, oversized files and non-plan recipes, rewrites every recipe
+to the receiving operator's workspace, and calls the *original* daemon graph
+registration path. An import requires a new graph ID, and **every imported node
+starts pending** with new deterministic job identities. A remote "succeeded"
+observation never authorizes a downstream dependency or marks a job completed.
+The original cluster roster is preserved if present; a matching, separately
+enrolled local roster and current signed majority lease are still required
+before a clustered graph schedules anything.
+
+These checksums detect corruption, **not malicious replacement or sender
+authenticity**. The import flag is an explicit agreement to re-run plan-only
+compute and can consume actual model resources. Operators must separately
+approve transferred prompts/target models, authenticate the origin of the
+bundle, and inspect failures. There is no replica membership propagation,
+automatic bundle transfer, persistent replicated commit index, quorum-backed
+graph-log consensus or transparent exactly-once task migration. Those remain
+needed before claiming cross-host automatic recovery.
