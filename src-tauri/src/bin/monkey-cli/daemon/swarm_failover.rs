@@ -313,8 +313,17 @@ fn consume(paths:&DaemonPaths,plan:&ArmedPlan,now:i64)->Result<(),String>{
         // The exact same private snapshot was checked above: recovery
         // cannot switch to a different prompt or recipe between validation
         // and graph registration.
-        swarm_transfer::import_read_only(paths,&staged,&plan.new_graph,
-            Path::new(&plan.workspace))?;
+        if let Err(import_error)=swarm_transfer::import_read_only(
+            paths,&staged,&plan.new_graph,Path::new(&plan.workspace)
+        ){
+            // If another resident tick raced this import and won the unique
+            // graph-key insertion, don't falsely mark the one-shot claim
+            // failed. Only the EXACT approved graph and recipes can turn
+            // that collision into successful crash reconciliation.
+            if !swarm_transfer::verify_existing_import(
+                paths,&staged,&plan.new_graph,Path::new(&plan.workspace)
+            )? {return Err(import_error);}
+        }
         Ok::<_,String>(())
     })();
     let _=fs::remove_file(&staged);
