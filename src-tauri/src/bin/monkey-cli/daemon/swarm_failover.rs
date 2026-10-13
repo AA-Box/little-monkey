@@ -324,6 +324,9 @@ mod tests{
     fn isolated_original_leader_is_recovered_by_the_other_two_voters_without_reusing_foreign_jobs(){
         use super::super::swarm_cluster::{ClusterMember,ClusterRoster,VoteRequest};
         use super::super::swarm_coordinator::{ResidentSwarmSpec,ResidentSwarmNode};
+        // Use a real wall-clock origin: production registration must reject
+        // expired leases, even when a unit test models later elections.
+        let epoch=i64::try_from(super::super::now_ms().unwrap()).unwrap();
         let root=std::env::temp_dir().join(format!("swarm-three-host-handoff-{}",uuid::Uuid::new_v4()));
         let sender=DaemonPaths::under(&root.join("sender"));
         let receiver=DaemonPaths::under(&root.join("receiver"));
@@ -357,16 +360,16 @@ mod tests{
             let mut a=DaemonStore::open(&sender).unwrap();
             let mut b=DaemonStore::open(&receiver).unwrap();
             let mut c=DaemonStore::open(&witness).unwrap();
-            swarm_cluster::configure(&mut a,&a_roster,1000).unwrap();
-            swarm_cluster::configure(&mut b,&b_roster,1000).unwrap();
-            swarm_cluster::configure(&mut c,&c_roster,1000).unwrap();
+            swarm_cluster::configure(&mut a,&a_roster,(epoch+1000)).unwrap();
+            swarm_cluster::configure(&mut b,&b_roster,(epoch+1000)).unwrap();
+            swarm_cluster::configure(&mut c,&c_roster,(epoch+1000)).unwrap();
             let term1=VoteRequest{
                 group:"swarm-team".into(),term:1,candidate_fingerprint:afp.clone(),
                 roster_sha256:a_roster.digest()
             };
-            let voted_a=swarm_cluster::vote(&mut a,&term1,"@local",1000).unwrap();
-            let voted_b=swarm_cluster::vote(&mut b,&term1,"signed-a",1000).unwrap();
-            swarm_cluster::persist_quorum(&a,&term1,&[voted_a,voted_b],1000).unwrap();
+            let voted_a=swarm_cluster::vote(&mut a,&term1,"@local",(epoch+1000)).unwrap();
+            let voted_b=swarm_cluster::vote(&mut b,&term1,"signed-a",(epoch+1000)).unwrap();
+            swarm_cluster::persist_quorum(&a,&term1,&[voted_a,voted_b],(epoch+1000)).unwrap();
         }
         let recipe=root.join("sender-recipe.json");
         fs::write(&recipe,serde_json::json!({
@@ -388,17 +391,17 @@ mod tests{
         let transfer=root.join("preapproved-transfer.json");
         swarm_transfer::export(&sender,"original",&transfer).unwrap();
         let record=swarm_replication::capture_local_leader(
-            &sender,"swarm-team","original","bob",&bfp,2000
+            &sender,"swarm-team","original","bob",&bfp,(epoch+2000)
         ).unwrap();
         {
             let mut b=DaemonStore::open(&receiver).unwrap();
-            assert!(swarm_replication::ingest(&mut b,"signed-a",&record,2001).unwrap());
+            assert!(swarm_replication::ingest(&mut b,"signed-a",&record,(epoch+2001)).unwrap());
         }
         arm(&receiver,"operator-recovery","swarm-team","alice","recovered",&transfer,
-            &workspace_receiver,2100).unwrap();
+            &workspace_receiver,(epoch+2100)).unwrap();
         // The receiver cannot schedule prior to its own fresh signed quorum,
         // even though it has both plan bytes and the previous leader's status.
-        run_once(&receiver,2200).unwrap();
+        run_once(&receiver,(epoch+2200)).unwrap();
         assert_eq!(status(&receiver).unwrap()["plans"][0]["state"],"armed");
         {
             // Simulate a physical partition: NO operations contact A after
@@ -410,11 +413,11 @@ mod tests{
                 group:"swarm-team".into(),term:2,
                 candidate_fingerprint:bfp.clone(),roster_sha256:b_roster.digest()
             };
-            let vote_b=swarm_cluster::vote(&mut b,&term2,"@local",30_000).unwrap();
-            let vote_c=swarm_cluster::vote(&mut c,&term2,"signed-b",30_000).unwrap();
-            swarm_cluster::persist_quorum(&b,&term2,&[vote_b,vote_c],30_000).unwrap();
-            assert!(swarm_cluster::may_schedule(&b,"swarm-team",30_001).unwrap());
-            assert!(!swarm_cluster::may_schedule(&c,"swarm-team",30_001).unwrap());
+            let vote_b=swarm_cluster::vote(&mut b,&term2,"@local",(epoch+30000)).unwrap();
+            let vote_c=swarm_cluster::vote(&mut c,&term2,"signed-b",(epoch+30000)).unwrap();
+            swarm_cluster::persist_quorum(&b,&term2,&[vote_b,vote_c],(epoch+30000)).unwrap();
+            assert!(swarm_cluster::may_schedule(&b,"swarm-team",(epoch+30001)).unwrap());
+            assert!(!swarm_cluster::may_schedule(&c,"swarm-team",(epoch+30001)).unwrap());
         }
         // A different enrolled member can honestly publish the SAME graph
         // name, but that must not authorize re-running A's staged plan.
@@ -429,7 +432,7 @@ mod tests{
             not_predecessor.source_fingerprint=cfp.clone();
             not_predecessor.seal().unwrap();
             assert!(swarm_replication::ingest(
-                &mut store,"signed-c",&not_predecessor,30_001
+                &mut store,"signed-c",&not_predecessor,(epoch+30001)
             ).unwrap());
         }
         // The new B+C majority's C witness independently queried its local
@@ -438,18 +441,18 @@ mod tests{
         // injects the exact parsed signed reply at the record boundary.
         super::super::swarm_recovery_witness::record(
             &receiver,"swarm-team","original",&afp,&cfp,
-            Some(&record),30_001
+            Some(&record),(epoch+30001)
         ).unwrap();
-        run_once(&receiver,30_001).unwrap();
+        run_once(&receiver,(epoch+30001)).unwrap();
         assert_eq!(status(&receiver).unwrap()["plans"][0]["state"],"armed",
             "an unrelated enrolled member must not trigger the reviewed predecessor's transfer");
         {
             let mut store=DaemonStore::open(&receiver).unwrap();
             assert!(swarm_replication::ingest(
-                &mut store,"signed-a",&record,30_002
+                &mut store,"signed-a",&record,(epoch+30002)
             ).unwrap());
         }
-        run_once(&receiver,30_002).unwrap();
+        run_once(&receiver,(epoch+30002)).unwrap();
         assert_eq!(status(&receiver).unwrap()["plans"][0]["state"],"imported");
         let graph=super::super::swarm_coordinator::status(&receiver,Some("recovered")).unwrap();
         assert_eq!(graph["graphs"][0]["tasks"][0]["state"],"pending");
@@ -458,10 +461,10 @@ mod tests{
         {
             let b=DaemonStore::open(&receiver).unwrap();
             assert!(super::super::swarm_coordinator::owns_current_epoch(
-                &b,"swarm-team","recovered",30_002
+                &b,"swarm-team","recovered",(epoch+30002)
             ).unwrap(),"the replacement is owned by B in its newly certified term");
         }
-        run_once(&receiver,30_002).unwrap();
+        run_once(&receiver,(epoch+30002)).unwrap();
         assert_eq!(super::super::swarm_coordinator::status(&receiver,Some("recovered"))
             .unwrap()["graphs"].as_array().unwrap().len(),1);
         let reloaded=DaemonStore::open(&receiver).unwrap();
@@ -475,7 +478,7 @@ mod tests{
         // the new leader cannot know whether an external inference is still
         // running. It MUST NOT re-enqueue those jobs automatically.
         arm(&receiver,"ambiguous-recovery","swarm-team","alice",
-            "do-not-replay",&transfer,&workspace_receiver,30_003).unwrap();
+            "do-not-replay",&transfer,&workspace_receiver,(epoch+30003)).unwrap();
         let mut attempted=record.clone();
         attempted.sequence=2;
         attempted.nodes[0].state="submitted".into();
@@ -484,10 +487,10 @@ mod tests{
         {
             let mut store=DaemonStore::open(&receiver).unwrap();
             assert!(swarm_replication::ingest(
-                &mut store,"signed-a",&attempted,30_003
+                &mut store,"signed-a",&attempted,(epoch+30003)
             ).unwrap());
         }
-        run_once(&receiver,30_004).unwrap();
+        run_once(&receiver,(epoch+30004)).unwrap();
         let all=status(&receiver).unwrap();
         let blocked=all["plans"].as_array().unwrap().iter()
             .find(|plan|plan["id"]=="ambiguous-recovery").unwrap();
@@ -504,14 +507,14 @@ mod tests{
             prepared.seal().unwrap();
             super::super::swarm_recovery_witness::record(
                 &receiver,"swarm-team","original",&afp,&cfp,
-                Some(&prepared),30_005
+                Some(&prepared),(epoch+30005)
             ).unwrap();
             assert!(super::super::swarm_recovery_witness::record(
                 &receiver,"swarm-team","original",&afp,&cfp,
-                Some(&record),30_006
+                Some(&record),(epoch+30006)
             ).is_err(),"out-of-order signed GET cannot roll the witness back");
             assert!(super::super::swarm_recovery_witness::record(
-                &receiver,"swarm-team","original",&afp,&cfp,None,30_007
+                &receiver,"swarm-team","original",&afp,&cfp,None,(epoch+30007)
             ).is_err(),"missing response cannot erase a prior prepared intent");
         }
         // A can regain a signed majority in term 3 after B's lease expires,
@@ -524,12 +527,12 @@ mod tests{
                 group:"swarm-team".into(),term:3,
                 candidate_fingerprint:afp.clone(),roster_sha256:a_roster.digest()
             };
-            let vote_a=swarm_cluster::vote(&mut a,&term3,"@local",55_000).unwrap();
-            let vote_c=swarm_cluster::vote(&mut c,&term3,"signed-a",55_000).unwrap();
-            swarm_cluster::persist_quorum(&a,&term3,&[vote_a,vote_c],55_000).unwrap();
-            assert!(swarm_cluster::may_schedule(&a,"swarm-team",55_001).unwrap());
+            let vote_a=swarm_cluster::vote(&mut a,&term3,"@local",(epoch+55000)).unwrap();
+            let vote_c=swarm_cluster::vote(&mut c,&term3,"signed-a",(epoch+55000)).unwrap();
+            swarm_cluster::persist_quorum(&a,&term3,&[vote_a,vote_c],(epoch+55000)).unwrap();
+            assert!(swarm_cluster::may_schedule(&a,"swarm-team",(epoch+55001)).unwrap());
             assert!(!super::super::swarm_coordinator::owns_current_epoch(
-                &a,"swarm-team","original",55_001
+                &a,"swarm-team","original",(epoch+55001)
             ).unwrap(),"regaining an election cannot replay a previous leader term's DAG");
         }
         assert!(super::super::swarm_coordinator::status(&receiver,
