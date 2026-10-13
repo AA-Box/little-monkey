@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
-import {gradeReport,parsePolicy,chooseDeployment,benchmarkCycle,dispatchRecipe}
+import {gradeReport,parsePolicy,chooseDeployment,benchmarkCycle,dispatchRecipe,acquireCycleLock}
  from './swarm-specialist-continuous-loop.mjs';
 const roles=['Threat model reviewer','Secrets exposure reviewer','Race condition reviewer'];
 const fixtures=['auth-bypass','code-injection','safe-control'];
@@ -146,4 +146,39 @@ describe('continuous verified specialist learning and real native recipe deploym
    assert.equal(next.domains.security.reason,'verified_current');
   }finally{env.dispose();}
  });
+ it('preserves the previous working routing on a crash before manifest commit',()=>{
+  const env=fixture();
+  try{
+   const first=benchmarkCycle(env.policy,{now,run:fakeRunner({
+    [targetA]:report(targetA,27),[targetB]:report(targetB,10)}),log:()=>{}});
+   assert.equal(first.domains.security.active.target,targetA);
+   const manifest=join(env.stateDir,'active-routing.json');
+   const previousBytes=readFileSync(manifest);
+   benchmarkCycle(env.policy,{now:now+1000,run:fakeRunner({
+    [targetA]:report(targetA,24),[targetB]:report(targetB,27)}),log:()=>{}});
+   // Simulate power loss BEFORE the atomic manifest rename. New content-
+   // addressed evidence exists but can never destroy old evidence.
+   writeFileSync(manifest,previousBytes);
+   const recipe=join(env.stateDir,'task.json');
+   writeFileSync(recipe,JSON.stringify({version:1,workspace:env.stateDir,permission_mode:'ask'}));
+   const result=dispatchRecipe(env.policy,'security',recipe,{now,run:()=>({
+    status:0,stdout:'{"run_id":"run-recovered"}'})});
+   assert.equal(result.target,targetA);
+  }finally{env.dispose();}
+ });
+ it('reclaims a dead worker lock, but never steals a live or mismatched lease',()=>{
+  const env=fixture();
+  try{
+   const old=acquireCycleLock(env.stateDir,{pid:12345,now,alive:()=>false});
+   assert.throws(()=>acquireCycleLock(env.stateDir,{
+    pid:23456,now:now+1000,alive:()=>true}),/live or unverified/);
+   const recovered=acquireCycleLock(env.stateDir,{
+    pid:23456,now:now+2000,alive:()=>false});
+   assert.throws(()=>old(),/ownership changed/);
+   recovered();
+   const fresh=acquireCycleLock(env.stateDir,{pid:34567,now:now+3000,alive:()=>false});
+   fresh();
+  }finally{env.dispose();}
+ });
+
 });
