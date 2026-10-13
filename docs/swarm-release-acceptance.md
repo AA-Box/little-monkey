@@ -605,3 +605,44 @@ These twelve roles provide bounded native review automation, not literal
 Ruflo background-worker binary compatibility. Complete event subscriptions,
 cross-node worker leasing, automatic learned role creation, and physical-host
 recovery acceptance remain separate work.
+
+
+## Signed peer DAG state replication (monotonic, operator-rostered)
+
+A current signed majority leader automatically publishes **observational**
+DAG checkpoints at bounded intervals to explicitly enrolled paired peers with
+the existing `peer-task-request` capability. No permissions are granted by
+replication. Checkpoints carry group/graph identities, monotonic durable
+sequence, leader term, source certificate fingerprint, enrolled roster digest,
+bounded node/job states and a corruption-detection SHA-256. The peer TLS/HMAC
+authentication plus its independently operator-enrolled roster membership
+provide identity; the SHA-256 by itself is NOT a signature.
+
+The receiver validates and transactionally stores only an advancing checkpoint
+for the exact originating fingerprint. Duplicate retransmissions are
+idempotent. Same-sequence mismatches, old terms, forged member IDs, oversized
+messages, malformed nodes, stale timestamps, revoked task grants and kill
+switches fail closed. A receiver never inserts foreign daemon jobs, treats a
+claimed remote success as locally verified, or rewrites frozen recipes.
+
+Operators can trigger a specific publish and inspect their own received copies:
+
+```bash
+monkey daemon swarm-replicate my-cluster audit-graph paired-node-b
+monkey daemon swarm-replica-status my-cluster audit-graph
+```
+
+In Settings → Background Agents → Agent swarms, enroll/enter the reviewed
+cluster group, and click **View authenticated peer checkpoints** on a known
+graph. The UI explicitly labels those records non-executable observations.
+
+**Boundaries:** This is real signed peer checkpoint *transport* and persistent
+replication, not a distributed Raft log or transparent transfer of active
+processes or mutable worktrees. A new leader may independently start its
+locally prestaged read-only DAG from its own approved frozen recipes. It cannot
+auto-skip previous leader's completions: externally signed receipts still need
+evidence-chain verification. If a fresh local graph must be created, the
+separate `swarm-import-read-only` path explicitly requires operator
+approval and creates NEW job identities. No cross-host exactly-once effects
+are claimed. Physical two-installation partition and TLS acceptance must be
+recorded before certification.
