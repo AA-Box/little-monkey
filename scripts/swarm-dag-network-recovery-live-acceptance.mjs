@@ -16,6 +16,7 @@ import {spawnSync} from 'node:child_process';
 import {constants,writeFileSync,openSync,closeSync,fstatSync,readSync,fsyncSync,renameSync,unlinkSync} from 'node:fs';
 import {resolve,isAbsolute,dirname,basename,join} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
+import {fileURLToPath} from 'node:url';
 
 const arg=name=>{const i=process.argv.indexOf(name);return i<0?null:process.argv[i+1]??null;};
 const stage=arg('--stage'),group=arg('--group'),graph=arg('--graph'),peer=arg('--peer');
@@ -85,7 +86,7 @@ function save(data,isNew){
  * lstat check. A directory entry replaced with a symlink cannot redirect
  * the evidence reader to a different file. Reads remain capped if a file
  * grows concurrently, and a changed inode's contents are never accepted. */
-function readProtectedEvidence(path){
+export function readProtectedEvidence(path){
   if(typeof constants.O_NOFOLLOW!=='number')
     fail('Platform cannot guarantee no-follow evidence reads');
   const fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW);
@@ -181,6 +182,7 @@ function run(){
     operatorNetworkAttestation:true,
     note:'This confirms signed availability and durable checkpoint recovery, NOT exactly-once process migration or actual task-output verification.'};
 }
+if(process.argv[1]&&fileURLToPath(import.meta.url)===resolve(process.argv[1])){
 if(process.argv.includes('--self-check')){
   const valid= id.test('cluster-1') && !id.test('../evil') &&
     fingerprint.test('a'.repeat(64)) && !fingerprint.test('x'.repeat(64));
@@ -190,4 +192,5 @@ if(process.argv.includes('--self-check')){
   try{console.log(JSON.stringify(run()));}
   catch(error){console.error(JSON.stringify({status:'not_verified',stage,
     error:String(error).slice(0,300)}));process.exitCode=1;}
+}
 }
