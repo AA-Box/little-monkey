@@ -501,6 +501,53 @@ mod tests{
         ).unwrap();
         assert_eq!(count,1,"operator consent and durable one-shot claim survive reopen");
         drop(reloaded);
+        // Simulated daemon crash immediately AFTER the durable claim but
+        // BEFORE registration. Reopening local SQLite must safely resume the
+        // exact same source bundle; it must not require a new operator claim.
+        arm(&receiver,"crashed-after-claim","swarm-team","alice",
+            "after-crash",&transfer,&workspace_receiver,(epoch+30003)).unwrap();
+        {
+            let store=DaemonStore::open(&receiver).unwrap();
+            assert_eq!(store.connection.execute(
+                "UPDATE resident_swarm_failover_plans
+                 SET state='claimed',claimed_at_ms=?2
+                 WHERE plan_id=?1 AND state='armed'",
+                params!["crashed-after-claim",epoch+30003]
+            ).unwrap(),1);
+        }
+        run_once(&receiver,(epoch+30004)).unwrap();
+        let resumed=status(&receiver).unwrap();
+        assert_eq!(resumed["plans"].as_array().unwrap().iter()
+            .find(|x|x["id"]=="crashed-after-claim").unwrap()["state"],"imported");
+        assert_eq!(super::super::swarm_coordinator::status(
+            &receiver,Some("after-crash")
+        ).unwrap()["graphs"][0]["tasks"][0]["state"],"pending");
+        run_once(&receiver,(epoch+30004)).unwrap();
+        let snapshot=super::super::swarm_coordinator::status(
+            &receiver,Some("after-crash")
+        ).unwrap();
+        assert_eq!(snapshot["graphs"].as_array().unwrap().len(),1,
+            "resuming a claimed graph must never create duplicate graphs");
+        // Simulated crash AFTER graph registration but BEFORE marking its
+        // failover plan imported. Only matching frozen recipe bytes can
+        // reconcile that ambiguous claim as a completed registration.
+        arm(&receiver,"crashed-after-registration","swarm-team","alice",
+            "registered-before-crash",&transfer,&workspace_receiver,
+            (epoch+30004)).unwrap();
+        {
+            let store=DaemonStore::open(&receiver).unwrap();
+            assert_eq!(store.connection.execute(
+                "UPDATE resident_swarm_failover_plans SET state='claimed'
+                 WHERE plan_id='crashed-after-registration' AND state='armed'",
+                []
+            ).unwrap(),1);
+        }
+        swarm_transfer::import_read_only(&receiver,&transfer,
+            "registered-before-crash",&workspace_receiver).unwrap();
+        run_once(&receiver,(epoch+30005)).unwrap();
+        assert_eq!(status(&receiver).unwrap()["plans"].as_array().unwrap()
+            .iter().find(|x|x["id"]=="crashed-after-registration")
+            .unwrap()["state"],"imported");
         // A predecessor that already dispatched even one job is ambiguous:
         // the new leader cannot know whether an external inference is still
         // running. It MUST NOT re-enqueue those jobs automatically.
