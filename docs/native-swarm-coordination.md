@@ -560,7 +560,10 @@ same predecessor into different replacement graphs. Legacy imported/claimed
 plans populate that local claim ledger on upgrade. The inspected bytes are
 copied into a private bounded file before any import, preventing a source-path
 swap between approval and execution. Temporary lost quorum leaves the same claim waiting for fresh
-proof; malformed or changed recipes fail closed.
+proof; malformed or changed recipes fail closed. A signed readback that
+returns **no source checkpoint** cannot vote for a safe takeover: at least
+a strict majority must have independently observed matching, pending-only
+source state. Unknown/missing evidence never establishes non-execution.
 
 This closes the local post-claim daemon crash window of the preapproved
 read-only takeover. It is still **not transparent cross-host migration of an
