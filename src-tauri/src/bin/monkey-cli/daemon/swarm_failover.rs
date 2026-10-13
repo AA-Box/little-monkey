@@ -484,6 +484,27 @@ mod tests{
             .find(|plan|plan["id"]=="ambiguous-recovery").unwrap();
         assert_eq!(blocked["state"],"armed",
             "uncertain already-started remote work must never be blindly replayed");
+        // A second independently signed peer has observed a newer prepared
+        // intent: a delayed response claiming an older pending state cannot
+        // erase that witness and trick the recovery quorum.
+        {
+            let mut prepared=record.clone();
+            prepared.sequence=2;
+            prepared.nodes[0].state="preparing".into();
+            prepared.nodes[0].job_id=Some("reserved-predecessor-job".into());
+            prepared.seal().unwrap();
+            super::super::swarm_recovery_witness::record(
+                &receiver,"swarm-team","original",&afp,&cfp,
+                Some(&prepared),30_005
+            ).unwrap();
+            assert!(super::super::swarm_recovery_witness::record(
+                &receiver,"swarm-team","original",&afp,&cfp,
+                Some(&record),30_006
+            ).is_err(),"out-of-order signed GET cannot roll the witness back");
+            assert!(super::super::swarm_recovery_witness::record(
+                &receiver,"swarm-team","original",&afp,&cfp,None,30_007
+            ).is_err(),"missing response cannot erase a prior prepared intent");
+        }
         // A can regain a signed majority in term 3 after B's lease expires,
         // but its old original term-1 graph is permanently fenced. A new
         // majority does NOT automatically authorize replay of old work.
