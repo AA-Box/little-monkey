@@ -182,6 +182,40 @@ This is declarative recursive *planning*, not autonomous model-created
 child tool calls. The child runs are still part of the normal workflow
 executor and inherit its desktop crash-recovery and human-approval limits.
 
+### Durable native nested swarms
+
+The same hierarchy can be submitted to the **resident daemon** by placing
+`children` under each node of the existing version-1
+`monkey daemon swarm-submit` JSON format. For example:
+
+```json
+{
+  "version":1, "id":"read-only-hierarchy-001", "max_parallel":2,
+  "nodes":[{
+    "id":"lead",
+    "recipe":"/ABSOLUTE/PATH/TO/lead-plan-only-recipe.json",
+    "children":[{
+      "id":"security",
+      "recipe":"/ABSOLUTE/PATH/TO/security-plan-only-recipe.json",
+      "children":[{
+        "id":"verify",
+        "recipe":"/ABSOLUTE/PATH/TO/verification-plan-only-recipe.json"
+      }]
+    }]
+  }]
+}
+```
+
+Run `monkey daemon swarm-submit /absolute/path/to/graph.json` after reviewing
+all recipes and dependencies. The CLI flattens the declared hierarchy into
+immutable parent dependencies **before** freezing recipes and registering
+the graph in SQLite. Children default to receiving only verified,
+bounded direct-parent completion reports, marked as untrusted evidence.
+Cancellation, restart recovery, signed-leader authority, manual approvals,
+deterministic job IDs and native limits remain those of the existing
+resident coordinator. This does not spawn arbitrary model-specified children
+or automatically retry uncertain mutating side effects.
+
 ## Persistent indexed knowledge (explicit opt-in)
 
 Use **Knowledge 2.0** to create and index sources with an embeddings-capable
