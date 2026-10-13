@@ -195,7 +195,7 @@ function validateRoutingState(state,policy,now=Date.now()){
 }
 function verifyEvidence(policy,entry,now){
  if(!entry)return;
- const file=join(policy.stateDir,'evidence-'+entry.domain+'-'+sha(entry.target).slice(0,20)+'.json');
+ const file=join(policy.stateDir,'evidence-'+entry.domain+'-'+sha(entry.target).slice(0,20)+'-'+entry.reportSha256+'.json');
  const saved=JSON.parse(readBounded(file,MAX_REPORT_BYTES));
  if(saved.version!==1||!saved.raw||!saved.grade)
   fail('Deployed target has no durable independent oracle evidence');
@@ -236,7 +236,7 @@ export function benchmarkCycle(policy,{run=spawnSync,now=Date.now(),log=console.
    if(!text||Buffer.byteLength(text)>MAX_REPORT_BYTES)fail('Missing bounded independently graded output');
    const raw=JSON.parse(text);
    grade=gradeReport(raw,domain,target,policy.repetitions,Date.now());
-   atomicJson(join(policy.stateDir,'evidence-'+domain+'-'+sha(target).slice(0,20)+'.json'),
+   atomicJson(join(policy.stateDir,'evidence-'+domain+'-'+sha(target).slice(0,20)+'-'+grade.reportSha256+'.json'),
      {version:1,grade,raw});
    reports.push(grade);
   }catch(error){log(JSON.stringify({domain,target,status:'benchmark_rejected',error:String(error)}));}
