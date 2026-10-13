@@ -37,6 +37,11 @@ on:
           - backend
           - performance
           - general
+      repair_review_target:
+        description: Distinct installed Ollama reviewer model (required when repair_target is set)
+        required: false
+        default: ''
+        type: string
       repair_target:
         description: Optional installed Ollama target for real permission-gated repository repair (operator MUST approve every write)
         required: false
@@ -88,6 +93,21 @@ on:
           - restore
       network_evidence_path:
         description: Absolute persistent, private evidence path on the same self-hosted runner
+        required: false
+        default: ''
+        type: string
+      stress_rounds:
+        description: Concurrent checkpoint publications after verified physical restore (10..500)
+        required: false
+        default: '30'
+        type: string
+      stress_concurrency:
+        description: Parallel checkpoint workers (one per separately preapproved graph; 1..8)
+        required: false
+        default: '1'
+        type: string
+      stress_additional_graphs:
+        description: Optional comma-separated other preapproved read-only graph IDs for parallel stress
         required: false
         default: ''
         type: string
@@ -175,6 +195,8 @@ jobs:
           node --check scripts/swarm-specialist-live-benchmark.mjs
           node --check scripts/swarm-cluster-live-acceptance.mjs
           node --check scripts/swarm-dag-network-recovery-live-acceptance.mjs
+          node --check scripts/swarm-replica-stress-live-acceptance.mjs
+          node --test scripts/swarm-replica-stress-acceptance.contract.test.mjs
           node scripts/swarm-dag-network-recovery-live-acceptance.mjs --self-check
           node --check scripts/swarm-resident-restart-live-acceptance.mjs
           node --check scripts/swarm-resident-fallback-live-acceptance.mjs
@@ -189,6 +211,7 @@ jobs:
           node --check scripts/swarm-two-peer-cancellation-live-acceptance.mjs
           node --test scripts/swarm-two-peer-acceptance.contract.test.mjs scripts/swarm-two-peer-memory-acceptance.contract.test.mjs scripts/swarm-two-peer-cancellation-acceptance.contract.test.mjs
       - name: Exercise actual signed, pinned-TLS peer work and completed result
+        if: ${{ inputs.network_stage != 'partition' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -197,7 +220,9 @@ jobs:
             --timeout-seconds 600 --poll-seconds 5 \
             > "$RUNNER_TEMP/native-swarm-peer-acceptance.json"
       - name: Verify real signed peer-leader quorum and local scheduler fencing
-        if: ${{ inputs.cluster_group != '' }}
+        # Never elect a fresh term while replaying an already-owned DAG. In
+        # particular, election during partition/restore can fence its owner.
+        if: ${{ inputs.cluster_group != '' && inputs.replica_graph_id == '' && inputs.network_stage != 'partition' }}
         shell: bash
         env:
           SWARM_CLUSTER_GROUP: ${{ inputs.cluster_group }}
@@ -230,7 +255,30 @@ jobs:
             --peer "$PEER_ALIAS" --evidence "$NETWORK_EVIDENCE" \
             --confirm-operator-owned-readonly-cluster $FLAG \
             > "$RUNNER_TEMP/native-swarm-replica-network-acceptance.json"
+      - name: Stress real two-device SQLite checkpoint publication AFTER proven restore
+        if: ${{ inputs.network_stage == 'restore' && inputs.replica_graph_id != '' }}
+        shell: bash
+        env:
+          STRESS_GROUP: ${{ inputs.cluster_group }}
+          STRESS_GRAPH: ${{ inputs.replica_graph_id }}
+          STRESS_ROUNDS: ${{ inputs.stress_rounds }}
+          STRESS_CONCURRENCY: ${{ inputs.stress_concurrency }}
+          STRESS_ADDITIONAL_GRAPHS: ${{ inputs.stress_additional_graphs }}
+        run: |
+          set -euo pipefail
+          test -n "$STRESS_GROUP" && test -n "$STRESS_GRAPH"
+          ADDITIONAL_GRAPHS=()
+          if [ -n "$STRESS_ADDITIONAL_GRAPHS" ]; then
+            ADDITIONAL_GRAPHS=(--additional-graphs "$STRESS_ADDITIONAL_GRAPHS")
+          fi
+          node scripts/swarm-replica-stress-live-acceptance.mjs \
+            --group "$STRESS_GROUP" --graph "$STRESS_GRAPH" --peer "$PEER_ALIAS" \
+            --rounds "$STRESS_ROUNDS" --concurrency "$STRESS_CONCURRENCY" "${ADDITIONAL_GRAPHS[@]}" \
+            --confirm-operator-owned-readonly-cluster \
+            --confirm-independent-machines --confirm-post-recovery \
+            > "$RUNNER_TEMP/native-swarm-replica-stress-acceptance.json"
       - name: Measure actual model behavior against independent test fixtures
+        if: ${{ inputs.network_stage != 'partition' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -240,7 +288,7 @@ jobs:
       # The following operations never run on PRs or ordinary pushes and
       # never enable capabilities on either node. Explicitly seeded data only.
       - name: Verify real peer vector replication, convergence and tombstones
-        if: ${{ inputs.memory_namespace != '' && inputs.receiver_memory_record != '' }}
+        if: ${{ inputs.network_stage != 'partition' && inputs.memory_namespace != '' && inputs.receiver_memory_record != '' }}
         shell: bash
         env:
           MEMORY_NS: ${{ inputs.memory_namespace }}
@@ -252,7 +300,7 @@ jobs:
             --receiver-record "$MEMORY_RECEIVER_ID" --confirm-disposable \
             > "$RUNNER_TEMP/native-swarm-vector-memory-acceptance.json"
       - name: Verify real authorized remote cancellation reaches terminal state
-        if: ${{ inputs.verify_remote_cancellation }}
+        if: ${{ inputs.network_stage != 'partition' && inputs.verify_remote_cancellation }}
         shell: bash
         run: |
           set -euo pipefail
@@ -277,10 +325,11 @@ jobs:
         shell: bash
         env:
           REPAIR_TARGET: ${{ inputs.repair_target }}
+          REPAIR_REVIEW_TARGET: ${{ inputs.repair_review_target }}
         run: |
           set -euo pipefail
           node scripts/swarm-repository-repair-live-acceptance.mjs \
-            --target "$REPAIR_TARGET" --confirm-manual-approvals \
+            --target "$REPAIR_TARGET" --review-target "$REPAIR_REVIEW_TARGET" --confirm-manual-approvals \
             --timeout-seconds 2400 \
             > "$RUNNER_TEMP/native-swarm-repository-repair.json"
       - name: Verify installed daemon re-elects a preapproved read-only fallback
@@ -355,6 +404,7 @@ jobs:
             ${{ runner.temp }}/native-swarm-peer-acceptance.json
             ${{ runner.temp }}/native-swarm-signed-leader-quorum.json
             ${{ runner.temp }}/native-swarm-replica-network-acceptance.json
+            ${{ runner.temp }}/native-swarm-replica-stress-acceptance.json
             ${{ runner.temp }}/native-swarm-real-model-benchmark.json
             ${{ runner.temp }}/native-swarm-metered-source.json
             ${{ runner.temp }}/native-swarm-vector-memory-acceptance.json

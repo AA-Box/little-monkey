@@ -1,0 +1,127 @@
+name: Hosted Apple Silicon MLX hardware smoke
+
+# Public synthetic fixtures only: NEVER train on user datasets in a PR.
+on:
+  pull_request:
+    paths:
+      - 'scripts/swarm-mlx-lora.mjs'
+      - 'scripts/swarm-mlx-training-deployment-rollback.mjs'
+      - 'scripts/swarm-mlx-training-deployment-rollback.contract.test.mjs'
+      - '.github/workflows/swarm-mlx-hosted-hardware.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  train-fuse-serve-rollback:
+    runs-on: macos-15
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Assert physical Apple Silicon execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64
+          node --test scripts/swarm-mlx-lora.contract.test.mjs scripts/swarm-mlx-training-deployment-rollback.contract.test.mjs
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned MLX training dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/mlx-venv"
+          "$RUNNER_TEMP/mlx-venv/bin/python" -m pip install --disable-pip-version-check "mlx-lm[train]==0.27.0" "huggingface-hub==0.34.4"
+          "$RUNNER_TEMP/mlx-venv/bin/python" -c 'import mlx.core,mlx_lm,huggingface_hub'
+      - name: Download immutable open-licensed tiny MLX model
+        shell: bash
+        env:
+          MODEL_PATH: ${{ runner.temp }}/tiny-local-model
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/mlx-venv/bin/python" -c '
+          import os,hashlib
+          from pathlib import Path
+          from huggingface_hub import snapshot_download
+          snapshot_download(
+            repo_id="mlx-community/SmolLM2-135M-Instruct",
+            revision="refs/pr/1",
+            local_dir=os.environ["MODEL_PATH"],
+          )
+          weights=Path(os.environ["MODEL_PATH"])/"model.safetensors"
+          observed=hashlib.sha256(weights.read_bytes()).hexdigest()
+          if observed!="989e3ef746b41999ca096055a60c87057b8e842824253391bc0d9ed8dfc6936e":
+              raise RuntimeError("Public MLX model differs from pinned safetensors SHA256")
+          '
+          test -s "$MODEL_PATH/config.json"
+          test -s "$MODEL_PATH/model.safetensors"
+      - name: Generate independent disposable text splits
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mlx-splits"
+          node -e '
+            const fs=require("node:fs"),path=require("node:path"),root=process.env.RUNNER_TEMP+"/mlx-splits";
+            const topics=["ocean","forest","garden","library","mountain","river","desert","morning","evening","travel","software","science","music","history","birds","planets","painting","cooking"];
+            const partitions={train:topics.slice(0,12),valid:topics.slice(12,15),test:topics.slice(15,18)};
+            for(const [name,items] of Object.entries(partitions)){
+              const rows=items.map((topic,i)=>JSON.stringify({text:
+                "Question: Write a clear short statement about "+topic+". Answer: "+
+                "A careful explanation of "+topic+" can be concise, factual, and easy to understand."+
+                " Example number "+i+" belongs only to this split."}));
+              fs.writeFileSync(path.join(root,name+".jsonl"),rows.join("\n")+"\n",{mode:0o600});
+            }
+          '
+      - name: Run real training, fuse, service deployment and forced rollback
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/swarm-mlx-training-deployment-rollback.mjs \
+            --model "$RUNNER_TEMP/tiny-local-model" \
+            --previous-model "$RUNNER_TEMP/tiny-local-model" \
+            --data "$RUNNER_TEMP/mlx-splits" \
+            --output "$RUNNER_TEMP/native-mlx-run" \
+            --python "$RUNNER_TEMP/mlx-venv/bin/python" \
+            --iters 20 --max-test-ppl 100 \
+            --confirm-disposable-native-switch \
+            > "$RUNNER_TEMP/native-mlx-run-output.private.log"
+      - name: Print public-fixture native service diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Diagnostic output is restricted to this hosted runner's public fixture."
+          find "${TMPDIR:-/tmp}" -type f -name 'mlx-service-*.private.log' -path '*/swarm-native-mlx-acceptance-*/*' -print -exec tail -n 45 {} \; || true
+          if [ -d "$RUNNER_TEMP/native-mlx-run" ]; then
+            find "$RUNNER_TEMP/native-mlx-run" -maxdepth 1 -type f -name '*.private.log' -print -exec tail -n 45 {} \; || true
+          fi
+      - name: Assert and publish non-sensitive hardware evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f "$RUNNER_TEMP/native-mlx-run/native-lifecycle-acceptance.json" ]; then
+            echo '{"status":"not_verified","reason":"Hardware run did not finish"}' > "$RUNNER_TEMP/hosted-mlx-proof.json"
+            exit 0
+          fi
+          node -e '
+            const fs=require("fs"),p=process.env.RUNNER_TEMP+"/native-mlx-run/native-lifecycle-acceptance.json";
+            const r=JSON.parse(fs.readFileSync(p));
+            const o={status:r.status,platform:r.platform,architecture:r.architecture,
+              testedRealNativeService:!!r.candidate?.passed,baselineCanary:r.baselineCanary??null,
+              training:r.training??null,rollbackVerified:r.rollback?.verified===true,
+              desktopActivationTested:false,completedAt:r.completedAt??null};
+            fs.writeFileSync(process.env.RUNNER_TEMP+"/hosted-mlx-proof.json",JSON.stringify(o,null,2)+"\n");
+          '
+      - name: Archive hardware evidence without private data or filesystem paths
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-apple-silicon-mlx-real-evidence
+          path: ${{ runner.temp }}/hosted-mlx-proof.json
+          retention-days: 14
+          if-no-files-found: error

@@ -138,11 +138,14 @@ function manifest(output,value){
 export function trainingPlan(opts){
  const model=checkedLocalDir(opts.model,'Base model'), data=checkedLocalDir(opts.data,'Training data');
  const inspected=inspectDataset(data);
- const output=opts.output;
- if(typeof output!=='string'||!isAbsolute(output)||/[\x00-\x1f]/.test(output)||
-    existsSync(output))throw Error('Output must be a new absolute directory, never an existing adapter');
- const parent=checkedLocalDir(dirname(output),'Adapter output parent');
- if(resolve(output)!==join(parent,output.split(/[\\/]/).at(-1)))throw Error('Output path must be under a real local parent');
+ const requestedOutput=opts.output;
+ if(typeof requestedOutput!=='string'||!isAbsolute(requestedOutput)||/[\x00-\x1f]/.test(requestedOutput)||
+    existsSync(requestedOutput))throw Error('Output must be a new absolute directory, never an existing adapter');
+ const parent=checkedLocalDir(dirname(requestedOutput),'Adapter output parent');
+ // macOS /var is an OS-managed alias of /private/var. Derive the actual
+ // destination from the verified parent rather than rejecting safe paths.
+ const output=join(parent,requestedOutput.split(/[\\/]/).at(-1));
+ if(existsSync(output))throw Error('Output must not overwrite an existing adapter');
  const n=Number(opts.iters);
  const maxPpl=Number(opts.maxPpl);
  if(!Number.isSafeInteger(n)||n<10||n>5000)throw Error('Training iterations must be between 10 and 5,000');

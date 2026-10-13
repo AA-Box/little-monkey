@@ -11,15 +11,18 @@ import {spawnSync} from 'node:child_process';
 import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
-import {randomUUID} from 'node:crypto';
+import {randomUUID,createHash} from 'node:crypto';
 const option=name=>{const i=process.argv.indexOf(name);return i<0?null:process.argv[i+1]??null;};
-const target=option('--target'),bin=option('--monkey-bin')??process.env.LITTLE_MONKEY_CLI??'monkey';
+const target=option('--target'),reviewTarget=option('--review-target');
+const bin=option('--monkey-bin')??process.env.LITTLE_MONKEY_CLI??'monkey';
 const maxSeconds=Number(option('--timeout-seconds')??'1800');
 const approved=process.argv.includes('--confirm-manual-approvals');
 const keep=process.argv.includes('--keep-repository');
 if(!process.argv.includes('--self-check') && (!approved||!/^ollama:[A-Za-z0-9_.:@+-]{2,140}$/.test(target??'')||
+   !/^ollama:[A-Za-z0-9_.:@+-]{2,140}$/.test(reviewTarget??'')||
+   reviewTarget===target||
    !Number.isSafeInteger(maxSeconds)||maxSeconds<120||maxSeconds>7200)) {
-  console.error('Usage: --target ollama:<installed-model> --confirm-manual-approvals [--timeout-seconds 120..7200] [--keep-repository] [--monkey-bin PATH]');
+  console.error('Usage: --target ollama:<installed-model> --review-target ollama:<different-installed-model> --confirm-manual-approvals [--timeout-seconds 120..7200] [--keep-repository] [--monkey-bin PATH]');
   process.exit(2);
 }
 function execute(command,args,cwd,timeout=30_000) {
@@ -32,6 +35,7 @@ function cli(args,cwd){const out=execute(bin,args,cwd);
   try{return JSON.parse(out.trim());}catch{throw Error('Installed CLI did not return JSON');}
 }
 const source='export function isOwner(requester, resourceOwner) { return requester !== resourceOwner; }\n';
+const patchedSource=source.replace('!==','===');
 const tests=[
 'import assert from "node:assert/strict";',
 'import { isOwner } from "./src/module.mjs";',
@@ -41,8 +45,49 @@ const tests=[
 'console.log("all authorization regressions pass");',
 '',
 ].join('\n');
+function independentlyVerify(work,baselineCommit){
+  // The verifier is outside the model graph. Never execute arbitrary model
+  // code: only the exact safe expected fixture repair may be evaluated.
+  if(execute('git',['rev-parse','HEAD'],work).trim()!==baselineCommit)
+    throw Error('Git baseline was rewritten by an agent.');
+  const statusNow=()=>execute('git',['status','--porcelain=v1','--untracked-files=all','--ignored'],work);
+  if(statusNow()!==' M src/module.mjs\n')
+    throw Error('Unexpected tracked, untracked, ignored or staged changes: '+JSON.stringify(statusNow()));
+  const sourceAfter=readFileSync(join(work,'src','module.mjs'),'utf8');
+  if(sourceAfter!==patchedSource)
+    throw Error('Only the exact minimal authorization fix may pass the source oracle.');
+  if(execute('git',['show','HEAD:src/module.mjs'],work)!==source ||
+     readFileSync(join(work,'test.mjs'),'utf8')!==tests ||
+     execute('git',['show','HEAD:test.mjs'],work)!==tests)
+    throw Error('Frozen source and independent regression tests have been tampered with.');
+  execute('git',['diff','--check'],work);
+  const identities=Array.from({length:16},()=>randomUUID());
+  const holdout=[
+    "import assert from 'node:assert/strict';",
+    "import {pathToFileURL} from 'node:url';",
+    "const {isOwner}=await import(pathToFileURL(process.argv[1]).href);",
+    "const names="+JSON.stringify(identities)+";",
+    "for(const name of names){for(const owner of names){",
+    "assert.equal(isOwner(name,owner),name===owner);}}",
+    "console.log('independent holdout passed');",
+  ].join('\n');
+  if(!execute(process.execPath,['--input-type=module','--eval',holdout,
+      join(work,'src','module.mjs')],work,10_000).includes('independent holdout passed'))
+    throw Error('Independent holdout did not execute.');
+  if(!execute(process.execPath,['test.mjs'],work,10_000).includes('authorization regressions pass'))
+    throw Error('External regression tests did not run.');
+  if(statusNow()!==' M src/module.mjs\n'||
+     readFileSync(join(work,'src','module.mjs'),'utf8')!==patchedSource)
+    throw Error('Worktree changed during independent tests.');
+  const sha256=text=>createHash('sha256').update(text).digest('hex');
+  const evidence={baselineCommit,
+    vulnerableSha256:sha256(source),repairedSha256:sha256(sourceAfter),
+    frozenRegressionSha256:sha256(tests),externalRegression:'passed',
+    independentHoldoutCases:identities.length**2};
+  return evidence;
+}
 function oracleContract(){
-  const good=source.replace('!==','===');
+  const good=patchedSource;
   if(!source.includes('!==')||!good.includes('==='))throw Error('Broken test fixture.');
   const tmp=mkdtempSync(join(tmpdir(),'lm-repair-oracle-'));
   try {
@@ -55,6 +100,35 @@ function oracleContract(){
     writeFileSync(join(tmp,'src','module.mjs'),good);
     const repaired=spawnSync(process.execPath,['test.mjs'],{cwd:tmp,timeout:5000,encoding:'utf8'});
     if(repaired.status!==0)throw Error('Regression oracle rejects correct fix.');
+    const gitRepo=join(tmp,'repo'),gitSource=join(gitRepo,'src','module.mjs');
+    mkdirSync(join(gitRepo,'src'),{recursive:true});
+    writeFileSync(join(gitRepo,'package.json'),JSON.stringify({type:'module',private:true}));
+    writeFileSync(join(gitRepo,'test.mjs'),tests);
+    writeFileSync(gitSource,source);
+    writeFileSync(join(gitRepo,'MONKEY.md'),'Disposable fixture');
+    writeFileSync(join(gitRepo,'.gitignore'),'*.scratch\n');
+    execute('git',['init','-q'],gitRepo);
+    execute('git',['add','.'],gitRepo);
+    execute('git',['-c','user.name=Oracle Contract',
+      '-c','user.email=oracle@example.invalid','-c','commit.gpgsign=false',
+      'commit','-qm','frozen independent fixture'],gitRepo);
+    const baseline=execute('git',['rev-parse','HEAD'],gitRepo).trim();
+    const mustReject=reason=>{
+      let rejected=false;
+      try{independentlyVerify(gitRepo,baseline);}catch{rejected=true;}
+      if(!rejected)throw Error('External verifier accepted '+reason);
+    };
+    mustReject('unrepaired vulnerable source');
+    writeFileSync(gitSource,patchedSource+'// injected model code\\n');
+    mustReject('noncanonical source injection');
+    writeFileSync(gitSource,patchedSource);
+    if(independentlyVerify(gitRepo,baseline).independentHoldoutCases!==256)
+      throw Error('Exact safe repair failed external holdouts.');
+    writeFileSync(join(gitRepo,'test.mjs'),tests+'// tampered\n');
+    mustReject('tampered regression tests');
+    writeFileSync(join(gitRepo,'test.mjs'),tests);
+    writeFileSync(join(gitRepo,'rogue.scratch'),'ignored malware');
+    mustReject('ignored worktree side effects');
   }finally{rmSync(tmp,{recursive:true,force:true});}
 }
 if(process.argv.includes('--self-check')) {
@@ -83,20 +157,21 @@ if(process.argv.includes('--self-check')) {
     execute('git',['-c','user.name=Swarm Acceptance',
       '-c','user.email=acceptance@example.invalid','-c','commit.gpgsign=false',
       'commit','-qm','source fixture'],work);
+    const baselineCommit=execute('git',['rev-parse','HEAD'],work).trim();
     const broken=spawnSync(process.execPath,['test.mjs'],{cwd:work,timeout:5000});
     if(broken.status===0)throw Error('The seeded vulnerable project already passes.');
     const phases=[
       {id:'audit',deps:[],permission:'plan',
         prompt:'Read-only: inspect src/module.mjs and test.mjs, cite the actual authorization bug and the minimal fix. Do not modify any files.'},
       {id:'repair',deps:['audit'],permission:'manual',
-        prompt:'Correct only the confirmed authorization bug in src/module.mjs. Use existing user-approval prompts for every mutation. Do not edit test.mjs, MONKEY.md, dependencies or Git metadata. The original bad comparison must be fixed, no bypasses. Cite the actual changes and authorized verification.'},
+        prompt:'Fix the authorization comparison in src/module.mjs using only the minimal one-operator change, with normal per-tool human approvals. Do not reformat, add code or edit tests, MONKEY.md, dependencies or Git metadata. No bypasses.'},
       {id:'verify',deps:['repair'],permission:'plan',
-        prompt:'Independently review the modified src/module.mjs against test.mjs. Do not edit files or claim tests were run without tool evidence. Report remaining risks and the actual file changed.'},
+        prompt:'Independently inspect the actual modified source against tests. Do not rely on predecessor reports, edit files, or invent test evidence. Report any remaining weakness and exact changes.'},
     ];
     const nodes=phases.map(item=>{
       const path=join(root,item.id+'.json');
       const recipe={version:1,name:graphId+'-'+item.id,
-        target:{ollama:target.slice('ollama:'.length)},workspace:work,
+        target:{ollama:(item.id==='verify'?reviewTarget:target).slice('ollama:'.length)},workspace:work,
         permission_mode:item.permission,
         system:item.permission==='plan'
           ? 'Perform a source-only read-only review. Never modify files or ask to elevate tool permissions.'
@@ -105,7 +180,7 @@ if(process.argv.includes('--self-check')) {
         timeout_seconds:Math.min(1800,maxSeconds),output:{json:true}};
       writeFileSync(path,JSON.stringify(recipe,null,2));
       return {id:item.id,recipe:path,depends_on:item.deps,
-        include_dependency_reports:item.deps.length>0,
+        include_dependency_reports:item.id==='repair',
         max_runtime_seconds:Math.min(1800,maxSeconds)};
     });
     const graphPath=join(root,'graph.json');
@@ -131,20 +206,13 @@ if(process.argv.includes('--self-check')) {
        new Set(jobIds).size!==3||jobIds.some(id=>typeof id!=='string'||!id)) {
       throw Error('A model report was accepted without three distinct completed daemon jobs.');
     }
-    const final=execute(process.execPath,['test.mjs'],work);
-    if(!final.includes('authorization regressions pass'))throw Error('Independent regression oracle did not run.');
-    const changed=execute('git',['status','--porcelain=v1','--untracked-files=all'],work)
-      .split(/\r?\n/).filter(Boolean).map(row=>row.slice(3).trim());
-    if(changed.length!==1||changed[0]!=='src/module.mjs')
-      throw Error('Unexpected or missing repository changes.');
-    if(readFileSync(join(work,'src','module.mjs'),'utf8').includes('!==')) {
-      throw Error('The original authorization flaw remains in the real Git diff.');
-    }
+    const evidence=independentlyVerify(work,baselineCommit);
     verified=true;
     console.log(JSON.stringify({mode:'real-resident-repository-repair',status:'verified',
-      graphId,model:target,distinctResidentJobs:jobIds.length,
-      sourceChanged:changed,externalTests:'node test.mjs',testStatus:'pass',
-      caveat:'The operator must separately audit the actual model/run ledger and approval trail.'},null,2));
+      graphId,repairModel:target,independentReviewModel:reviewTarget,
+      distinctResidentJobs:jobIds.length,sourceChanged:['src/module.mjs'],
+      ...evidence,testStatus:'pass',
+      caveat:'Actual approvals and model run ledger must be inspected separately; this is only a disposable fixture.'},null,2));
   }catch(error){
     console.error(JSON.stringify({mode:'real-resident-repository-repair',status:'not_verified',
       graphId,submitted,error:String(error),

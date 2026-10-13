@@ -28,6 +28,8 @@
     "test:ruflo-mcp:contract": "node --test scripts/swarm-ruflo-mcp-acceptance.contract.test.mjs",
     "test:ruflo-mcp:live": "node scripts/swarm-ruflo-mcp-acceptance.mjs",
     "test:swarm-peer:contract": "node --test scripts/swarm-two-peer-acceptance.contract.test.mjs",
+    "test:swarm-physical:contract": "node --check scripts/swarm-replica-stress-live-acceptance.mjs && node --test scripts/swarm-replica-stress-acceptance.contract.test.mjs",
+    "test:swarm-physical:stress": "node scripts/swarm-replica-stress-live-acceptance.mjs",
     "test:swarm-telemetry:contract": "node --check scripts/swarm-cross-host-telemetry-live-acceptance.mjs && node scripts/swarm-cross-host-telemetry-live-acceptance.mjs --self-check && node --test scripts/swarm-cross-host-telemetry.contract.test.mjs",
     "test:swarm-telemetry:live": "node scripts/swarm-cross-host-telemetry-live-acceptance.mjs",
     "test:compare:live": "node scripts/smoke-compare-ollama.mjs",
@@ -74,7 +76,7 @@
     "test:swarm-specialists:oracle": "node scripts/swarm-specialist-live-benchmark.mjs --self-check --domain all && node --test scripts/swarm-specialist-oracle.contract.test.mjs",
     "test:swarm-restart:live": "node scripts/swarm-resident-restart-live-acceptance.mjs",
     "test:swarm-repair:live": "node scripts/swarm-repository-repair-live-acceptance.mjs",
-    "test:swarm-repair:oracle": "node scripts/swarm-repository-repair-live-acceptance.mjs --self-check"
+    "test:swarm-repair:oracle": "node scripts/swarm-repository-repair-live-acceptance.mjs --self-check && node --test scripts/swarm-repository-repair-acceptance.contract.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
