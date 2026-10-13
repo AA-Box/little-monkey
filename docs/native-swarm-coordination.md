@@ -517,3 +517,22 @@ copy after the old quorum expires. State and output are NOT yet replicated
 across host SQLite databases; previously completed remote model computation
 may be repeated after failover. No automatic cluster membership changes,
 Raft/BFT replicated logs or exactly-once external side effects are claimed.
+
+
+### Ruflo-compatible lifecycle hook execution (bounded subset)
+
+The built-in native user-hook engine now supports `PreCommand`,
+`PostCommand`, `PreEdit`, `PostEdit`, `PreTask`, `PostTask`, and
+`SessionEnd` in addition to its previous four events. Pre-command and
+pre-edit hooks use the same native shell executor, 10-second bound,
+operator-configured matcher and explicit deny decision as `PreToolUse`.
+Post-operation, subagent-start/finish and explicit session-deletion hooks
+run through that existing operator-owned executable path. They are not
+prompt-injected scripts: user-authored hook configuration is required.
+
+The safe external command-hook importer accepts only structurally
+supported command events, rejects silent metadata changes and does not
+pretend that arbitrary Ruflo plugin SDK hooks, background workers,
+plugins installing npm packages, or intercepting native daemon tasks
+are implemented. The Ruflo MCP bridge still needs explicit operator
+registration, version pin and per-tool allowance before real use.

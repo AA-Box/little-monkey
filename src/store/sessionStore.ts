@@ -24,6 +24,7 @@ import { usePromptStore } from "./promptStore";
 import type { UsageInfo } from "./usageStore";
 import type { WorkflowSpec } from "../lib/workflow";
 import { errorMessage } from "../lib/errors";
+import { fireObservedHooks } from "../lib/userHooks";
 
 /** localStorage key sessions were persisted under BEFORE file-based
  * persistence existed — only read (once, then removed) to migrate old data.
@@ -1982,6 +1983,10 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   },
 
   deleteSession: (id) => {
+    // A real user action ends this session. Observe it once, outside Zustand's
+    // pure state updater, and never run shell hooks from model-authored text.
+    if(get().sessions.some(session=>session.id===id))
+      fireObservedHooks('SessionEnd',{session_id:id});
     set((state) => {
       const deleted = state.sessions.find((s) => s.id === id);
       let remaining = state.sessions.filter((s) => s.id !== id);

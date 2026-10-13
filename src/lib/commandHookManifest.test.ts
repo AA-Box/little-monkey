@@ -12,6 +12,16 @@ describe('Native command-hook manifest compatibility', () => {
       { event: 'SessionStart', command: 'node ./session.mjs' },
     ], unsupported: [] });
   });
+  it('accepts concrete pre/post task and command lifecycle hooks',()=>{
+    const parsed=parseCommandHooksManifest(JSON.stringify({hooks:{
+      PreTask:[{hooks:[{type:'command',command:'task-start.sh'}]}],
+      PostTask:[{hooks:[{type:'command',command:'task-end.sh'}]}],
+      PreEdit:[{matcher:'edit_file',hooks:[{type:'command',command:'edit-guard.sh'}]}],
+      SessionEnd:[{hooks:[{type:'command',command:'session-end.sh'}]}],
+    }}));
+    expect(parsed.unsupported).toEqual([]);
+    expect(parsed.supported.map(x=>x.event)).toEqual(['PreTask','PostTask','PreEdit','SessionEnd']);
+  });
   it('refuses unsupported events and arbitrary prompt/subagent hook kinds', () => {
     const parsed = parseCommandHooksManifest(JSON.stringify({ hooks: {
       PermissionRequest: [{ hooks: [{ type: 'command', command: 'echo no' }] }],

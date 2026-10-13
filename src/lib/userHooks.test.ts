@@ -5,7 +5,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeM
 
 import {
   collectUserPromptSubmitContext,
-  evaluatePreToolUseHooks,
+  evaluatePreToolUseHooks,evaluatePreActionHooks,toolLifecyclePair,
   fireObservedHooks,
   matcherMatches,
   type HookExecOutcome,
@@ -44,6 +44,38 @@ describe("matcherMatches", () => {
     expect(matcherMatches("write_file(", "write_file(")).toBe(true);
     expect(matcherMatches("write_file(", "write_file")).toBe(false);
   });
+});
+
+describe("real Ruflo-compatible extended hook execution",()=>{
+ it("recognizes only real shell and file mutation tools",()=>{
+  expect(toolLifecyclePair("run_shell")).toEqual({pre:"PreCommand",post:"PostCommand"});
+  expect(toolLifecyclePair("edit_file")).toEqual({pre:"PreEdit",post:"PostEdit"});
+  expect(toolLifecyclePair("write_file")).toEqual({pre:"PreEdit",post:"PostEdit"});
+  expect(toolLifecyclePair("read_file")).toBeNull();
+ });
+ it("uses native host and honors PreCommand denial",async()=>{
+  useUserHooksStore.setState({hooks:[hook({event:"PreCommand",command:"check-command.sh"})]});
+  invokeMock.mockResolvedValue(outcome({exit_code:0,stdout:'{"decision":"deny","reason":"unsafe command"}'}));
+  expect(await evaluatePreActionHooks("PreCommand","run_shell",{command:"rm"}, "s")).toEqual({reason:"unsafe command"});
+  const args=invokeMock.mock.calls[0][1] as {payload:string};
+  expect(JSON.parse(args.payload)).toMatchObject({event:"PreCommand",tool_name:"run_shell"});
+ });
+ it("runs observable task, command, edit and session end lifecycle hooks",async()=>{
+  useUserHooksStore.setState({hooks:[
+    hook({event:"PreTask",command:"pre-task.sh"}),
+    hook({event:"PostCommand",command:"post-cmd.sh"}),
+    hook({event:"PostEdit",command:"post-edit.sh"}),
+    hook({event:"SessionEnd",command:"close-session.sh"}),
+  ]});
+  invokeMock.mockResolvedValue(outcome());
+  fireObservedHooks("PreTask",{session_id:"s",tool_name:"task"});
+  fireObservedHooks("PostCommand",{session_id:"s",tool_name:"run_shell",result:"ok"});
+  fireObservedHooks("PostEdit",{session_id:"s",tool_name:"write_file",result:"ok"});
+  fireObservedHooks("SessionEnd",{session_id:"s"});
+  await vi.waitFor(()=>expect(invokeMock).toHaveBeenCalledTimes(4));
+  const events=invokeMock.mock.calls.map(c=>JSON.parse((c[1] as {payload:string}).payload).event);
+  expect(events).toEqual(["PreTask","PostCommand","PostEdit","SessionEnd"]);
+ });
 });
 
 describe("evaluatePreToolUseHooks", () => {
