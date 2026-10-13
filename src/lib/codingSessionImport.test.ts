@@ -15,9 +15,19 @@ describe("resumable coding-session parsing",()=>{
     ]);
     const parsed=parseCodingSession(transcript)!;
     expect(parsed.format).toBe("claude-code");
-    expect(parsed.messages.map(msg=>msg.content)).toEqual(["fix my CI","CI fixed"]);
+    expect(parsed.messages.map(msg=>msg.content)).toEqual(["fix my CI","Working...\nCI fixed"]);
     expect(parsed.createdAt).toBe(Date.parse("2026-01-01T12:00:00Z"));
     expect(JSON.stringify(parsed)).not.toMatch(/delete all|private reasoning|secret token/);
+  });
+
+  it("collapses cumulative Claude Code snapshots without duplicating text",()=>{
+    const parsed=parseCodingSession(jsonl([
+      {type:"user",message:{role:"user",content:"Question"}},
+      {type:"assistant",message:{id:"response",role:"assistant",content:[{type:"text",text:"Hello"}]}},
+      {type:"assistant",message:{id:"response",role:"assistant",content:[{type:"text",text:"Hello world"}]}},
+      {type:"assistant",message:{id:"response",role:"assistant",content:[{type:"text",text:"Hello world"}]}}
+    ]))!;
+    expect(parsed.messages.map(msg=>msg.content)).toEqual(["Question","Hello world"]);
   });
 
   it("imports Codex responses without duplicating event messages",()=>{
