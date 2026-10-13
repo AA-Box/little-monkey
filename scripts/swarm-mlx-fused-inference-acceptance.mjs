@@ -99,7 +99,7 @@ async function main(){
        !Number.isSafeInteger(row.sizeBytes)||row.sizeBytes<1)
       throw Error('Invalid evaluated fused shard manifest');
     seen.add(row.name);
-    const actual=await digestFile(join(model,row.name),128*1024**4);
+    const actual=await digestFile(join(model,row.name),128*1024**3);
     if(actual.sha256!==row.sha256||actual.size!==row.sizeBytes)
       throw Error('Fused model shard differs from independently evaluated weights');
   }
