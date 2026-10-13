@@ -599,7 +599,20 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
                 receipt["graph_id"]!=*id || receipt["sequence"]!=snapshot.sequence {
                 return Err("Signed DAG receiver did not confirm exact checkpoint".into());
             }
-            println!("{}",receipt);
+            // A transport POST acknowledgment alone is not a durability
+            // attestation. A separate signed GET must read back the EXACT
+            // checkpoint from the receiver's SQLite replica table.
+            let readback=remote::signed_swarm_checkpoint_readback(
+                &paths,peer,&destination.fingerprint,group,id,now as u64
+            ).await?;
+            let expected=serde_json::to_value(&snapshot).map_err(|e|e.to_string())?;
+            if readback["group"]!=*group || readback["graph"]!=*id ||
+                !readback["replicas"].as_array().is_some_and(|replicas|
+                    replicas.iter().any(|entry|entry==&expected)){
+                return Err("Remote SQLite readback could not verify the exact DAG checkpoint".into());
+            }
+            println!("{}",serde_json::json!({"receipt":receipt,
+                "remote_readback_verified":true,"execution_authorized":false}));
             Ok(())
         },
         DaemonCmd::SwarmWorkerCatalog => {
