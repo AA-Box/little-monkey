@@ -4965,15 +4965,15 @@ mod tests {
             // cap. (C) again, and the most generous ceiling in the tree — but a
             // ceiling on inference, not on transfer.
             ("m5_delivery/reviewer.rs", 1),
-            // The MLX promotion canary targets only 127.0.0.1 and blocks
-            // redirects. Its 90s total deadline bounds local, non-streaming
-            // inference (rather than truncating a remote streaming download).
-            ("mlx_chat.rs", 1),
             // (B), both of them: 1800s on the image-edit multipart and 3600s on the
             // transcription upload, each carrying a body bounded only by
             // `MAX_MEDIA_BYTES` (256 MiB) — 149 KB/s and 74 KB/s respectively,
             // *plus* the provider's own render or transcription time.
             ("m7_companion.rs", 2),
+            // The MLX promotion canary targets only 127.0.0.1 and blocks
+            // redirects. Its 90s total deadline bounds local, non-streaming
+            // inference (rather than truncating a remote streaming download).
+            ("mlx_chat.rs", 1),
             // 1.5s for `/api/version` (a tens-of-bytes object) and 10s for
             // `/api/ps`, both fully buffered. The third is 60s on `/api/embed`,
             // which is (C): `EMBED_BATCH_SIZE` caps the vector *count* at 32, not
