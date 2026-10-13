@@ -117,7 +117,10 @@ async function main(){
     throw Error('Python must be an absolute local selected executable');
   if(!isAbsolute(receiptPath)||hasUnsafePathSegments(receiptPath))
     throw Error('Receipt must be an absolute local path');
-  const py=realpathSync(python);
+  // Verify the real target but invoke the operator-selected virtualenv path.
+  // Calling the resolved binary directly bypasses Python venv site-packages.
+  realpathSync(python);
+  const py=python;
   // A Python path is invoked as an executable by the OS; do not pre-check
   // it with lstat and then assume the executable cannot change afterwards.
   const data=readReceipt(receiptPath);
