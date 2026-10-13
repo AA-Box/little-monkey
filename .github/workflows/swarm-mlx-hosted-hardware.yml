@@ -89,6 +89,16 @@ jobs:
             --iters 20 --max-test-ppl 100 \
             --confirm-disposable-native-switch \
             > "$RUNNER_TEMP/native-mlx-run-output.private.log"
+      - name: Print public-fixture native service diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Diagnostic output is restricted to this hosted runner's public fixture."
+          find "${TMPDIR:-/tmp}" -type f -name 'mlx-service-*.private.log' -path '*/swarm-native-mlx-acceptance-*/*' -print -exec tail -n 45 {} \; || true
+          if [ -d "$RUNNER_TEMP/native-mlx-run" ]; then
+            find "$RUNNER_TEMP/native-mlx-run" -maxdepth 1 -type f -name '*.private.log' -print -exec tail -n 45 {} \; || true
+          fi
       - name: Assert and publish non-sensitive hardware evidence
         if: always()
         shell: bash
