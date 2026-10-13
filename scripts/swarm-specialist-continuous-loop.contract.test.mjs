@@ -87,6 +87,8 @@ describe('continuous verified specialist learning and real native recipe deploym
     const submitted=JSON.parse(readFileSync(args[2],'utf8'));
     assert.equal(submitted.permission_mode,'ask');
     assert.equal(submitted.system,'Keep my original system rules');
+    assert.match(submitted.prompt,/^Check real security/);
+    assert.match(submitted.prompt,/Verified reviewer focus: Threat model reviewer/);
     assert.deepEqual(submitted.target,{ollama:'trusted-a'});
     return {status:0,stdout:'{"status":"ok","run_id":"run-verified123"}'};
    }});
@@ -160,7 +162,7 @@ describe('continuous verified specialist learning and real native recipe deploym
    // addressed evidence exists but can never destroy old evidence.
    writeFileSync(manifest,previousBytes);
    const recipe=join(env.stateDir,'task.json');
-   writeFileSync(recipe,JSON.stringify({version:1,workspace:env.stateDir,permission_mode:'ask'}));
+   writeFileSync(recipe,JSON.stringify({version:1,workspace:env.stateDir,permission_mode:'ask',prompt:'Source task'}));
    const result=dispatchRecipe(env.policy,'security',recipe,{now,run:()=>({
     status:0,stdout:'{"run_id":"run-recovered"}'})});
    assert.equal(result.target,targetA);
