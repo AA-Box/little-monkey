@@ -573,8 +573,9 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
     assertWorkflowBounds(spec);
     await checkpoint(); // durably register the graph before dispatch
     if (spec.liveMessaging) {
+      const workspaceRoot = useSessionStore.getState().sessions.find(s => s.id === sessionId)?.workspacePath ?? '';
       liveBus = new LiveSwarmBus(spec.phases.flatMap((phase, phaseIndex) =>
-        phase.agents.map((_, agentIndex) => workflowAgentTaskId(toolCallId, phaseIndex, agentIndex))));
+        phase.agents.map((_, agentIndex) => workflowAgentTaskId(toolCallId, phaseIndex, agentIndex))), workspaceRoot);
     }
     const voterSnapshot=spec.authenticatedPeerVoting
       ? await frozenAuthenticatedPeerVoters(spec.phases[spec.phases.length-2].agents
