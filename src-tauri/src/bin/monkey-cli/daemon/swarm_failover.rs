@@ -460,6 +460,30 @@ mod tests{
             let mut b=DaemonStore::open(&receiver).unwrap();
             assert!(swarm_replication::ingest(&mut b,"signed-a",&record,(epoch+2001)).unwrap());
         }
+        // Independent operator-approved source DAGs for both crash windows.
+        // A source graph may be consumed only once; these must not reuse the
+        // already imported predecessor merely to make a test pass.
+        let mut crash_sources=Vec::new();
+        for (index,name) in ["source-before-registration","source-after-registration"]
+            .iter().enumerate() {
+            let mut next_spec=spec.clone();
+            next_spec.id=(*name).into();
+            let file=root.join(format!("{name}-spec.json"));
+            fs::write(&file,serde_json::to_vec(&next_spec).unwrap()).unwrap();
+            super::super::swarm_coordinator::submit(&sender,&file).unwrap();
+            let next_transfer=root.join(format!("{name}-transfer.json"));
+            swarm_transfer::export(&sender,name,&next_transfer).unwrap();
+            let snapshot=swarm_replication::capture_local_leader(
+                &sender,"swarm-team",name,"bob",&bfp,epoch+2002+index as i64
+            ).unwrap();
+            {
+                let mut b=DaemonStore::open(&receiver).unwrap();
+                assert!(swarm_replication::ingest(
+                    &mut b,"signed-a",&snapshot,epoch+2010+index as i64
+                ).unwrap());
+            }
+            crash_sources.push((next_transfer,snapshot));
+        }
         arm(&receiver,"operator-recovery","swarm-team","alice","recovered",&transfer,
             &workspace_receiver,(epoch+2100)).unwrap();
         // The receiver cannot schedule prior to its own fresh signed quorum,
@@ -515,6 +539,13 @@ mod tests{
                 &mut store,"signed-a",&record,(epoch+30002)
             ).unwrap());
         }
+        for (i,(_,snapshot)) in crash_sources.iter().enumerate(){
+            super::super::swarm_recovery_witness::record(
+                &receiver,"swarm-team",
+                if i==0 {"source-before-registration"} else {"source-after-registration"},
+                &afp,&cfp,Some(snapshot),epoch+30002
+            ).unwrap();
+        }
         run_once(&receiver,(epoch+30002)).unwrap();
         assert_eq!(status(&receiver).unwrap()["plans"][0]["state"],"imported");
         let graph=super::super::swarm_coordinator::status(&receiver,Some("recovered")).unwrap();
@@ -541,7 +572,8 @@ mod tests{
         // BEFORE registration. Reopening local SQLite must safely resume the
         // exact same source bundle; it must not require a new operator claim.
         arm(&receiver,"crashed-after-claim","swarm-team","alice",
-            "after-crash",&transfer,&workspace_receiver,(epoch+30003)).unwrap();
+            "after-crash",&crash_sources[0].0,&workspace_receiver,
+            (epoch+30003)).unwrap();
         {
             let store=DaemonStore::open(&receiver).unwrap();
             assert_eq!(store.connection.execute(
@@ -568,7 +600,7 @@ mod tests{
         // failover plan imported. Only matching frozen recipe bytes can
         // reconcile that ambiguous claim as a completed registration.
         arm(&receiver,"crashed-after-registration","swarm-team","alice",
-            "registered-before-crash",&transfer,&workspace_receiver,
+            "registered-before-crash",&crash_sources[1].0,&workspace_receiver,
             (epoch+30004)).unwrap();
         {
             let store=DaemonStore::open(&receiver).unwrap();
@@ -578,7 +610,7 @@ mod tests{
                 []
             ).unwrap(),1);
         }
-        swarm_transfer::import_read_only(&receiver,&transfer,
+        swarm_transfer::import_read_only(&receiver,&crash_sources[1].0,
             "registered-before-crash",&workspace_receiver).unwrap();
         run_once(&receiver,(epoch+30005)).unwrap();
         assert_eq!(status(&receiver).unwrap()["plans"].as_array().unwrap()
