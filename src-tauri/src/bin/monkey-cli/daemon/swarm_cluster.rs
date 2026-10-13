@@ -438,6 +438,70 @@ mod tests {
         assert!(persist_quorum(&store,&req,&[good,malicious],1000).is_err());
     }
     #[test]
+    fn partitioned_three_member_cluster_fails_over_only_after_old_lease_expires(){
+        // Three INDEPENDENT durable voter stores. During term 1, C cannot
+        // reach anyone; A and B form majority. During term 2, A is isolated,
+        // B and C form the only valid majority. No fabricated peer replies or
+        // shared-voter memory allow both candidates to schedule concurrently.
+        let mut stores=(0..3).map(|_|DaemonStore::open_in_memory().unwrap())
+            .collect::<Vec<_>>();
+        let identities=["a".repeat(64),"b".repeat(64),"c".repeat(64)];
+        for local in 0..3 {
+            let roster=ClusterRoster{
+                version:1,group:"three-member-partition".into(),
+                members:(0..3).map(|index|ClusterMember{
+                    fingerprint:identities[index].clone(),
+                    device_id:if index==local{"@local".into()}
+                              else{format!("signed-{index}")},
+                    alias:if index==local{None}
+                          else{Some(format!("peer-{index}"))},
+                }).collect()
+            };
+            configure(&mut stores[local],&roster,1000).unwrap();
+        }
+        let configs=stores.iter().map(|store|
+            roster(store,"three-member-partition").unwrap()
+        ).collect::<Vec<_>>();
+        let digest=configs[0].digest();
+        assert!(configs.iter().all(|c|c.digest()==digest));
+        let election_a=VoteRequest{
+            group:"three-member-partition".into(),term:1,
+            candidate_fingerprint:identities[0].clone(),
+            roster_sha256:digest.clone(),
+        };
+        let a=vote(&mut stores[0],&election_a,"@local",1000).unwrap();
+        let b=vote(&mut stores[1],&election_a,"signed-0",1000).unwrap();
+        persist_quorum(&stores[0],&election_a,&[a.clone(),b],1000).unwrap();
+        assert!(may_schedule(&stores[0],&election_a.group,2000).unwrap());
+        assert!(!may_schedule(&stores[2],&election_a.group,2000).unwrap());
+        assert!(persist_quorum(&stores[2],&election_a,&[a.clone()],1000).is_err());
+
+        // A's lease is now stale, and a new majority forms WITHOUT A.
+        let after=30_000;
+        assert!(!may_schedule(&stores[0],&election_a.group,after).unwrap());
+        let election_b=VoteRequest{
+            group:election_a.group.clone(),term:2,
+            candidate_fingerprint:identities[1].clone(),
+            roster_sha256:digest,
+        };
+        let b=vote(&mut stores[1],&election_b,"@local",after).unwrap();
+        let c=vote(&mut stores[2],&election_b,"signed-1",after).unwrap();
+        persist_quorum(&stores[1],&election_b,&[b,c],after).unwrap();
+        assert!(may_schedule(&stores[1],&election_a.group,after+1).unwrap());
+        assert!(!may_schedule(&stores[0],&election_a.group,after+1).unwrap());
+
+        // A can vote for itself in the new term while isolated but C/B must
+        // never award another term-2 vote to a conflicting candidate.
+        let mut losing=election_b.clone();
+        losing.candidate_fingerprint=identities[0].clone();
+        let a2=vote(&mut stores[0],&losing,"@local",after+2).unwrap();
+        assert!(vote(&mut stores[1],&losing,"signed-0",after+2).is_err());
+        assert!(vote(&mut stores[2],&losing,"signed-0",after+2).is_err());
+        assert!(persist_quorum(&stores[0],&losing,&[a2],after+2).is_err());
+        assert!(!may_schedule(&stores[0],&election_a.group,after+2).unwrap());
+    }
+
+    #[test]
     fn strict_quorum_fences_new_job_dispatch_and_rejects_fake_votes(){
         let mut store=DaemonStore::open_in_memory().unwrap();
         let config=members();configure(&mut store,&config,1000).unwrap();
