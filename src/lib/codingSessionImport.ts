@@ -88,7 +88,7 @@ function fromClaude(items: Obj[]): CodingTranscript | null {
       // snapshots instead of either discarding text or duplicating it.
       if (next.startsWith(prior)) messages[index] = text[0];
       else if (prior !== next && !prior.startsWith(next))
-        messages[index] = { ...messages[index], content: prior + "\\n" + next };
+        messages[index] = { ...messages[index], content: prior + "\n" + next };
     } else {
       if (id) positions.set(id,messages.length);
       messages.push(text[0]);
