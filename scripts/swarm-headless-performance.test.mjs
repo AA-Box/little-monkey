@@ -43,7 +43,9 @@ if (args[1] === 'start') {
     assert.equal(good.tiers.length,2);
     assert.ok(good.results.every(r=>r.verified));
     assert.ok(good.tiers.every(t=>t.throughputVerifiedPerMinute>0));
-    assert.equal(good.classification,'task-latency-and-oracle-verified-throughput-not-daemon-memory');
+    assert.equal(good.classification,'independently-verified-task-throughput-and-sampled-process-tree-RSS-not-PSS');
+    assert.ok(good.results.every(r=>Number.isSafeInteger(r.submissionMs)));
+    assert.ok(good.tiers.every(t=>Object.hasOwn(t,'residentTreeRssPeakBytes')));
     process.env.FAKE_MONKEY_BAD='1';
     const bad = await runBenchmark({...opts,counts:[1]});
     assert.equal(bad.results.length,1);
