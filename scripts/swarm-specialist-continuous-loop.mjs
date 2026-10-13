@@ -83,7 +83,7 @@ function atomicJson(path,value){
   try{fsyncSync(directory);}finally{closeSync(directory);}
  }catch(error){rmSync(tmp,{force:true});throw error;}
 }
-export function gradeReport(raw,domain,target,repetitions,now=Date.now()){
+export function gradeReport(raw,domain,target,repetitions,now=Date.now(),maxAgeMs=3_600_000){
  const d=DOMAINS[domain];
  if(!d||!TARGET.test(target)||!boundedInt(repetitions,2,5)||
    !raw||typeof raw!=='object'||Array.isArray(raw)||
@@ -91,7 +91,7 @@ export function gradeReport(raw,domain,target,repetitions,now=Date.now()){
    raw.mode!=='real-model'||raw.domain!==domain||raw.target!==target)
    fail('Wrong live independent specialist benchmark identity');
  const when=typeof raw.generatedAt==='string'?Date.parse(raw.generatedAt):NaN;
- if(!Number.isFinite(when)||when>now+300_000||now-when>3_600_000)fail('Benchmark is stale or future-dated');
+ if(!Number.isFinite(when)||when>now+300_000||now-when>maxAgeMs)fail('Benchmark is stale or future-dated');
  const count=d.roles.length*d.fixtures.length*repetitions;
  if(!Array.isArray(raw.results)||raw.results.length!==count||
    !Array.isArray(raw.ranking)||raw.ranking.length!==d.roles.length)
@@ -193,10 +193,30 @@ function validateRoutingState(state,policy,now=Date.now()){
  }
  return state;
 }
+function verifyEvidence(policy,entry,now){
+ if(!entry)return;
+ const file=join(policy.stateDir,'evidence-'+entry.domain+'-'+sha(entry.target).slice(0,20)+'.json');
+ const saved=JSON.parse(readBounded(file,MAX_REPORT_BYTES));
+ if(saved.version!==1||!saved.raw||!saved.grade)
+  fail('Deployed target has no durable independent oracle evidence');
+ const checked=gradeReport(saved.raw,entry.domain,entry.target,
+   policy.repetitions,now,policy.maxAgeHours*3_600_000);
+ if(checked.reportSha256!==entry.reportSha256||
+    checked.accuracy!==entry.accuracy||
+    checked.bestSpecialist!==entry.bestSpecialist||
+    checked.generatedAt!==entry.generatedAt||
+    saved.grade.reportSha256!==checked.reportSha256)
+  fail('Deployed routing decision and independent evidence disagree');
+}
 function state(policy,now=Date.now()){
  const path=join(policy.stateDir,'active-routing.json');
  if(!existsSync(path))return null;
- return validateRoutingState(JSON.parse(readBounded(path,64_000)),policy,now);
+ const current=validateRoutingState(JSON.parse(readBounded(path,64_000)),policy,now);
+ for(const domain of policy.domains){
+  verifyEvidence(policy,current.domains[domain].active,now);
+  verifyEvidence(policy,current.domains[domain].previous,now);
+ }
+ return current;
 }
 export function benchmarkCycle(policy,{run=spawnSync,now=Date.now(),log=console.error}={}){
  const previous=state(policy,now);
@@ -222,7 +242,9 @@ export function benchmarkCycle(policy,{run=spawnSync,now=Date.now(),log=console.
   }catch(error){log(JSON.stringify({domain,target,status:'benchmark_rejected',error:String(error)}));}
   results.push({domain,target,accuracy:grade?.accuracy??null});
  }
- const next=chooseDeployment(policy,reports,previous,now);
+ const currentTime=Date.now();
+ const fresh=reports.filter(row=>Date.parse(row.generatedAt)>=currentTime-policy.maxAgeHours*3_600_000);
+ const next=chooseDeployment(policy,fresh,previous,now);
  // A lost/rejected benchmark disables this domain; it never silently
  // preserves stale authority. A completed cycle is written in one rename.
  validateRoutingState(next,policy,now);
