@@ -131,7 +131,7 @@ pub(super) fn build(tx:&Transaction<'_>,chunks:&[KnowledgeChunk],
     // A legitimate corpus may contain tens of thousands of identical
     // embeddings (the existing 50k retrieval benchmark does). HNSW cannot
     // improve ties and building it adds no recall; keep exact ranking.
-    if vectors.iter().take(MIN_ACCELERATED).all(|v|v==&vectors[0]){
+    if vectors.iter().all(|v|v==&vectors[0]){
         return Ok(());
     }
     let (top,layer,points)=build_graph(chunks,vectors,cancel)?;
@@ -310,12 +310,15 @@ pub(super) fn query(conn:&Connection,needle:&[f32],dim:usize,limit:usize,
     if layer>MAX_LAYER||limit==0{
         return Err(PipelineError::InvalidIndex("Invalid HNSW search controls".into()));
     }
+    // The bounded beam cannot supply more than 512 unique rows. Fall back to
+    // exact ranking rather than silently under-filling broad caller requests.
+    if limit>512{return Ok(None);}
     let mut cache=HashMap::new();
     for l in (1..=layer).rev(){
         entry=greedy_disk(conn,needle,dim,entry,l,&mut cache,cancel)?;
     }
     let candidates=beam_disk(conn,needle,dim,entry,
-        SEARCH_BEAM.max(limit*4).min(512),&mut cache,cancel)?;
+        SEARCH_BEAM.max(limit.saturating_mul(4)).min(512),&mut cache,cancel)?;
     let mut matched=Vec::new();
     for (id,score) in candidates{
         if !excluded.contains(&load(conn,&id,dim,&mut cache)?.source_id){
@@ -341,3 +344,6 @@ mod tests{
         assert_eq!(similarity(&[1.0,0.0],&[0.0,1.0]),0.0);
     }
 }
+
+#[cfg(test)]
+mod production_bench;
