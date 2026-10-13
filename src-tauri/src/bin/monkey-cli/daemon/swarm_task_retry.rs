@@ -60,12 +60,19 @@ pub fn reassign_failed_primary(
     ).optional().map_err(|error|error.to_string())?;
     let previous=existing.unwrap_or(0);
     if previous>=MAX_READ_ONLY_REASSIGNMENTS {return Ok(false);}
+    // An irreversible *prepared* intent, not a return to plain pending:
+    // independently signed recovery checkpoints must never mistake a task
+    // with earlier attempts for untouched work. A new quorum readback for
+    // this precise job identity is required before enqueue.
+    let next_job=super::swarm_coordinator::stable_job_id(
+        graph,&format!("{node}:reassignment:{}",previous+1)
+    );
     let changed=tx.execute(
         "UPDATE resident_swarm_nodes
-         SET state='pending',job_id=NULL,error=?4
+         SET state='preparing',job_id=?4,error=?5
          WHERE graph_id=?1 AND node_id=?2 AND job_id=?3 AND state='submitted'",
-        params![graph,node,job,format!(
-            "Read-only primary failed; new durable attempt {}/{} scheduled",
+        params![graph,node,job,next_job,format!(
+            "Read-only primary failed; prepared durable attempt {}/{}",
             previous+1,MAX_READ_ONLY_REASSIGNMENTS
         )]
     ).map_err(|error|error.to_string())?;
@@ -136,6 +143,15 @@ mod tests {
         assert_eq!(count(&s,"graph","scan").unwrap(),0);
         assert!(reassign_failed_primary(&mut s,"graph","scan","job-first",2000).unwrap());
         assert_eq!(count(&s,"graph","scan").unwrap(),1);
+        let expected=super::super::swarm_coordinator::stable_job_id(
+            "graph","scan:reassignment:1"
+        );
+        let prepared:(String,String)=s.connection.query_row(
+            "SELECT state,job_id FROM resident_swarm_nodes
+             WHERE graph_id='graph' AND node_id='scan'",
+            [],|r|Ok((r.get(0)?,r.get(1)?))
+        ).unwrap();
+        assert_eq!(prepared,("preparing".into(),expected));
         assert!(!reassign_failed_primary(&mut s,"graph","scan","job-first",2001).unwrap());
         s.connection.execute(
             "UPDATE resident_swarm_nodes SET state='submitted',job_id='job-second'
