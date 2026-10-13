@@ -8,7 +8,8 @@
  *   --workers 1,2,4 --repetitions 2 --timeout-ms 600000
  *
  * The output is end-to-end task latency and verified throughput, NOT
- * daemon RSS/CPU or a memory comparison with JCode. Those measurements need
+ * CPU, proportional set size (PSS), or a JCode comparison. Resident process-tree
+ * RSS is sampled separately; shared pages can be counted multiple times. Those measurements need
  * a separate, OS-specific, process-tree sampling harness.
  */
 import { execFile, execFileSync } from 'node:child_process';
@@ -16,6 +17,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { join, dirname, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
+import { residentDaemonPid, sampleResidentTreeRss } from './lib/swarmResidentRss.mjs';
 
 export function parseArgs(argv) {
   const opts = new Map();
@@ -94,12 +96,14 @@ async function oneTask(opts, tier, repetition, index) {
   const root = mkdtempSync(join(tmpdir(),'monkey-headless-perf-'));
   let runId, verified = false, error = null;
   const started = performance.now();
+  let submissionMs=null;
   try {
     fixture(root);
     const output = await invoke(opts.binary,[
       'task','start','Fix src/module.mjs so node test.mjs passes. Never edit tests, instructions, or other files. Verify results.',
       '--target',opts.target,'--workspace',root,'--json',
     ],root,opts.timeoutMs);
+    submissionMs=Math.round(performance.now()-started);
     runId = parseRunId(output);
     await invoke(opts.binary,['task','attach',runId,'--follow','--json'],root,opts.timeoutMs);
     execFileSync(process.execPath,['test.mjs'],{cwd:root,stdio:'pipe',timeout:10000});
@@ -122,26 +126,50 @@ async function oneTask(opts, tier, repetition, index) {
     }
   }
   return {tier,repetition,index,runId:runId??null,verified,
-    durationMs:Math.round(performance.now()-started),...(error?{error}:{}),
+    durationMs:Math.round(performance.now()-started),submissionMs,...(error?{error}:{}),
     ...(process.env.LITTLE_MONKEY_KEEP_EVAL_REPO==='1'||(!verified&&runId)?{repository:root}:{})};
 }
 export async function runBenchmark(opts) {
   const results=[], tiers=[];
   for (const count of opts.counts) {
     for (let repetition=1;repetition<=opts.repetitions;repetition++) {
+      const daemonPid=await residentDaemonPid(opts.binary);
+      const initialRssBytes=daemonPid===null?null:await sampleResidentTreeRss(daemonPid);
+      let peakRssBytes=initialRssBytes;
+      let rssSamples=initialRssBytes===null?0:1;
+      let sampling=false;
+      const sample=async()=>{
+        if(daemonPid===null||sampling)return;
+        sampling=true;
+        try {
+          const bytes=await sampleResidentTreeRss(daemonPid);
+          if(bytes!==null){peakRssBytes=Math.max(peakRssBytes??0,bytes);rssSamples++;}
+        } finally {sampling=false;}
+      };
       const start=performance.now();
-      const batch=await Promise.all(Array.from({length:count},(_,index)=>
-        oneTask(opts,count,repetition,index+1)));
+      const ticker=setInterval(()=>{void sample();},300);
+      let batch;
+      try {
+        batch=await Promise.all(Array.from({length:count},(_,index)=>
+          oneTask(opts,count,repetition,index+1)));
+      } finally {
+        clearInterval(ticker);
+        await sample();
+      }
       const wallMs=Math.max(1,Math.round(performance.now()-start));
       results.push(...batch);
       tiers.push({workers:count,repetition,wallMs,
+        residentPid:daemonPid,residentRssSampleCount:rssSamples,
+        residentTreeRssBaselineBytes:initialRssBytes,residentTreeRssPeakBytes:peakRssBytes,
+        residentTreeRssGrowthBytes:initialRssBytes===null||peakRssBytes===null
+          ?null:Math.max(0,peakRssBytes-initialRssBytes),
         verified:batch.filter(x=>x.verified).length,
         throughputVerifiedPerMinute:Number((batch.filter(x=>x.verified).length*60000/wallMs).toFixed(4)),
         latencyMs:batch.map(x=>x.durationMs).sort((a,b)=>a-b)});
     }
   }
   return {version:1,benchmark:'headless-real-model-concurrency',target:opts.target,
-    generatedAt:new Date().toISOString(),classification:'task-latency-and-oracle-verified-throughput-not-daemon-memory',
+    generatedAt:new Date().toISOString(),classification:'independently-verified-task-throughput-and-sampled-process-tree-RSS-not-PSS',
     tiers,results};
 }
 async function main() {
