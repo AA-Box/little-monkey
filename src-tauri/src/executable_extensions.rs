@@ -6131,7 +6131,9 @@ mod tests {
     fn extension_logs_redact_credential_shaped_messages_without_host_secrets() {
         let safe = safe_extension_log_message("request --api-key=secret-test-value failed", &[]);
         assert!(!safe.contains("secret-test-value"));
-        assert!(safe.contains("[REDACTED_SECRET]"));
+        // The shared scanner may detect the credential before its CLI flag
+        // fallback does; both intentionally emit a [REDACTED...] marker.
+        assert!(safe.contains("[REDACTED"), "credential must be masked");
         assert_eq!(safe_extension_log_message("extension ready", &[]), "extension ready");
     }
 
