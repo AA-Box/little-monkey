@@ -9,6 +9,8 @@ on:
       - 'scripts/swarm-specialist-live-benchmark.mjs'
       - 'scripts/swarm-mlx-verified-serving.mjs'
       - 'scripts/swarm-mlx-verified-serving.contract.test.mjs'
+      - 'scripts/swarm-mlx-service.mjs'
+      - 'scripts/swarm-mlx-service.contract.test.mjs'
       - 'scripts/swarm-specialist-service.mjs'
       - 'scripts/swarm-specialist-service.contract.test.mjs'
       - '.github/workflows/swarm-specialist-continuous-loop.yml'
@@ -21,6 +23,8 @@ on:
       - 'scripts/swarm-specialist-live-benchmark.mjs'
       - 'scripts/swarm-mlx-verified-serving.mjs'
       - 'scripts/swarm-mlx-verified-serving.contract.test.mjs'
+      - 'scripts/swarm-mlx-service.mjs'
+      - 'scripts/swarm-mlx-service.contract.test.mjs'
       - 'scripts/swarm-specialist-service.mjs'
       - 'scripts/swarm-specialist-service.contract.test.mjs'
       - '.github/workflows/swarm-specialist-continuous-loop.yml'
@@ -47,6 +51,10 @@ jobs:
         run: |
           node --check scripts/swarm-mlx-verified-serving.mjs
           node --test scripts/swarm-mlx-verified-serving.contract.test.mjs
+      - name: Opt-in MLX LaunchAgent install lifecycle contracts
+        run: |
+          node --check scripts/swarm-mlx-service.mjs
+          node --test scripts/swarm-mlx-service.contract.test.mjs
       - name: LaunchAgent service syntax validation
         run: node --check scripts/swarm-specialist-service.mjs
       - name: User-service lifecycle contracts
