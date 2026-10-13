@@ -236,6 +236,68 @@ fn freeze_recipe(path: &Path, destination: &Path) -> Result<(), String> {
     super::store::restrict_file(destination)
 }
 
+/// Flatten preapproved nested task trees BEFORE immutable native registration.
+/// Every descendant depends on its parent. All authority and durable cursor
+/// invariants continue to use the existing flat resident DAG engine.
+/// This does not permit model-created children at execution time.
+fn flatten_nested_resident_node(
+    mut node: serde_json::Value, parent: Option<&str>, depth: usize,
+    output: &mut Vec<serde_json::Value>,
+) -> Result<(), String> {
+    if depth > 3 { return Err("Resident nested swarm exceeds three levels".into()); }
+    let object = node.as_object_mut()
+        .ok_or_else(|| "Resident nested task must be an object".to_string())?;
+    let children = object.remove("children");
+    let id = object.get("id").and_then(|id| id.as_str())
+        .ok_or_else(|| "Nested task needs a valid id".to_string())?.to_string();
+    if let Some(parent) = parent {
+        let dependencies = object.entry("depends_on")
+            .or_insert_with(|| serde_json::json!([]));
+        let dependencies = dependencies.as_array_mut()
+            .ok_or_else(|| "Nested task dependencies must be an array".to_string())?;
+        if !dependencies.iter().any(|dep| dep.as_str() == Some(parent)) {
+            dependencies.push(serde_json::json!(parent));
+        }
+        // Deliver only prior success-chain-verified bounded evidence.
+        // Operator-provided explicit false remains honored.
+        object.entry("include_dependency_reports")
+            .or_insert_with(|| serde_json::json!(true));
+    }
+    output.push(node);
+    if output.len() > MAX_SWARM_NODES {
+        return Err("Resident nested swarm exceeds sixteen tasks".into());
+    }
+    if let Some(children) = children {
+        let children = children.as_array()
+            .ok_or_else(|| "Nested task children must be an array".to_string())?;
+        if children.len() > 6 { return Err("Nested task has more than six children".into()); }
+        if depth == 3 && !children.is_empty() {
+            return Err("Resident nested swarm exceeds three levels".into());
+        }
+        for child in children {
+            flatten_nested_resident_node(child.clone(), Some(&id), depth + 1, output)?;
+        }
+    }
+    Ok(())
+}
+
+fn expand_nested_resident_graph(
+    mut graph: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let object = graph.as_object_mut()
+        .ok_or_else(|| "Resident swarm spec must be an object".to_string())?;
+    let nodes = object.remove("nodes")
+        .ok_or_else(|| "Resident swarm spec requires nodes".to_string())?;
+    let nodes = nodes.as_array()
+        .ok_or_else(|| "Resident swarm nodes must be an array".to_string())?;
+    let mut flat = Vec::new();
+    for node in nodes {
+        flatten_nested_resident_node(node.clone(), None, 1, &mut flat)?;
+    }
+    object.insert("nodes".to_string(), serde_json::Value::Array(flat));
+    Ok(graph)
+}
+
 /// Register a fully frozen graph before the resident service dispatches it.
 /// Reusing an existing id is refused, not an implicit graph overwrite.
 pub fn submit(paths: &DaemonPaths, input: &Path) -> Result<serde_json::Value, String> {
@@ -243,8 +305,11 @@ pub fn submit(paths: &DaemonPaths, input: &Path) -> Result<serde_json::Value, St
     if !info.is_file() || info.file_type().is_symlink() || info.len() > MAX_SWARM_SPEC_BYTES {
         return Err("Swarm spec must be a local regular file under 128 KiB".into());
     }
-    let mut spec: ResidentSwarmSpec =
+    let raw: serde_json::Value =
         serde_json::from_slice(&std::fs::read(input).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("Invalid swarm graph: {e}"))?;
+    let flattened = expand_nested_resident_graph(raw)?;
+    let mut spec: ResidentSwarmSpec = serde_json::from_value(flattened)
         .map_err(|e| format!("Invalid swarm graph: {e}"))?;
     validate(&spec)?;
     let mut store = DaemonStore::open(paths)?;
@@ -823,6 +888,37 @@ pub fn tick(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_durable_tree_adds_parent_dependencies_and_preserves_native_caps() {
+        let original = serde_json::json!({
+            "version":1,"id":"nested-release","max_parallel":2,
+            "nodes":[{"id":"lead","recipe":"/tmp/lead.json","children":[
+                {"id":"audit","recipe":"/tmp/audit.json","children":[
+                    {"id":"verify","recipe":"/tmp/verify.json"}
+                ]},
+                {"id":"security","recipe":"/tmp/security.json"}
+            ]}]
+        });
+        let expanded = expand_nested_resident_graph(original).unwrap();
+        let graph: ResidentSwarmSpec = serde_json::from_value(expanded).unwrap();
+        assert_eq!(graph.nodes.len(), 4);
+        assert_eq!(graph.nodes[0].id,"lead");
+        assert_eq!(graph.nodes[1].depends_on,vec!["lead"]);
+        assert_eq!(graph.nodes[2].depends_on,vec!["audit"]);
+        assert_eq!(graph.nodes[3].depends_on,vec!["lead"]);
+        assert!(graph.nodes[1].include_dependency_reports);
+        assert_eq!(validate(&graph).unwrap(),vec!["lead","audit","verify","security"]);
+        let too_deep = serde_json::json!({"nodes":[{"id":"a","children":[{"id":"b",
+            "children":[{"id":"c","children":[{"id":"d"}]}]}]}]});
+        assert!(expand_nested_resident_graph(too_deep).unwrap_err().contains("three levels"));
+        let wide = serde_json::json!({"nodes":[{"id":"a",
+            "children":(0..7).map(|i|serde_json::json!({"id":format!("b{i}")}))
+              .collect::<Vec<_>>()}]});
+        assert!(expand_nested_resident_graph(wide).unwrap_err().contains("six children"));
+        let invalid = serde_json::json!({"nodes":[{"id":"a","children":null}]});
+        assert!(expand_nested_resident_graph(invalid).is_err());
+    }
 
     fn example() -> ResidentSwarmSpec {
         ResidentSwarmSpec { version: 1, id: "test-graph".into(), max_parallel: 2,cluster_id:None,
