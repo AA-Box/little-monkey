@@ -2521,3 +2521,12 @@ fn now_ms() -> Result<u64, String> {
             u64::try_from(duration.as_millis()).map_err(|_| "timestamp overflow".to_string())
         })
 }
+
+/// A typed, signed and TLS-certificate-pinned vote request. Only the already
+/// approved outbound peer alias is allowed to choose the destination.
+pub(crate) async fn signed_swarm_vote(
+    paths: &DaemonPaths, alias: &str, body: Vec<u8>, now_ms: u64,
+) -> Result<serde_json::Value,String> {
+    client::call(paths,alias,Method::POST,
+        "/v1/remote/peer/swarm-election/vote",body,now_ms).await
+}

@@ -247,10 +247,7 @@ pub async fn campaign(paths:&DaemonPaths,group:&str,term:u64,now:i64)
         // This signs and validates the request using the existing peer
         // controller secret, authenticated sequence and pinned remote TLS cert.
         let bytes=serde_json::to_vec(&req).map_err(|e|e.to_string())?;
-        let response=super::remote::client::call(
-            paths,alias,reqwest::Method::POST,
-            "/v1/remote/peer/swarm-election/vote",bytes,now as u64
-        ).await;
+        let response=super::remote::signed_swarm_vote(paths,alias,bytes,now as u64).await;
         let Ok(value)=response else{continue;};
         let Ok(reply)=serde_json::from_value::<VoteReceipt>(value) else{continue;};
         if reply.voter_fingerprint==member.fingerprint{receipts.push(reply);}

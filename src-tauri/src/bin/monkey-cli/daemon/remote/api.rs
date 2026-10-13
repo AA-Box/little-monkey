@@ -1014,6 +1014,10 @@ impl RemoteApi {
                 require_capability(device, DeviceCapability::PeerTaskRequest)
                     .and_then(|_| self.peer_cancel_task(device, thread_id, &request.body, now_ms))
             }
+            ("POST", ["v1", "remote", "peer", "swarm-election", "vote"]) => {
+                require_capability(device, DeviceCapability::PeerTaskRequest)
+                    .and_then(|_| self.peer_swarm_vote(device, &request.body, now_ms))
+            },
             ("POST", ["v1", "remote", "peer", "hello"]) => require_any_peer_capability(device)
                 .and_then(|_| self.peer_hello_post(device, &request.body, now_ms)),
             ("POST", ["v1", "remote", "peer", "artifacts"]) => {
@@ -3957,6 +3961,24 @@ impl RemoteApi {
     /// Explicit namespace authorization is never inherited from peer standing
     /// or another namespace. This is enforced at every read/write boundary,
     /// independently of the signed request's capability gate.
+    fn peer_swarm_vote(
+        &self, device: &DeviceRecord, body: &[u8], now_ms: u64,
+    ) -> Result<(u16,serde_json::Value,Option<String>),(u16,String)> {
+        if body.len()>2_048 {return Err((413,"Election request exceeds 2 KiB".into()));}
+        let request:crate::daemon::swarm_cluster::VoteRequest=
+            serde_json::from_slice(body).map_err(|_|(400,"Malformed cluster vote".into()))?;
+        let mut store=DaemonStore::open(&self.paths).map_err(internal)?;
+        if store.kill_switch().map_err(internal)? {
+            return Err((409,"Global kill switch prevents new election votes".into()));
+        }
+        let now=i64::try_from(now_ms).map_err(|_|(400,"Election clock overflow".into()))?;
+        let receipt=crate::daemon::swarm_cluster::vote(
+            &mut store,&request,&device.device_id,now
+        ).map_err(|error|(409,error))?;
+        Ok((200,serde_json::to_value(receipt).map_err(internal)?,
+            Some(format!("swarm-election:{}",request.group))))
+    }
+
     fn peer_memory_gate(
         &self, device: &DeviceRecord, namespace: &str, write: bool,
     ) -> Result<DaemonStore,(u16,String)> {

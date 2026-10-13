@@ -47,6 +47,7 @@ pub(crate) mod remote;
 mod scheduler;
 mod service;
 mod swarm_coordinator;
+pub(crate) mod swarm_cluster;
 pub(crate) mod store;
 pub(crate) mod telecom_store;
 pub(crate) mod telecom_tool;
@@ -3150,6 +3151,7 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
     // Opt-in paired vector-memory replication runs independently of queue
     // scheduling. A slow or offline peer cannot stall this daemon's jobs.
     peer_memory::spawn_sync_worker(paths.clone());
+    swarm_cluster::spawn_lease_worker(paths.clone());
     // Messaging channels. Its own task rather than a step in the loop below: a
     // long-polling provider blocks for half a minute at a time, and the queue
     // must keep ticking while it does.
