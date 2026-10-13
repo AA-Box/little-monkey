@@ -473,9 +473,20 @@ mod tests {
         let records_b=list(&b,"partition",false).unwrap();
         assert_eq!(records_a.len(),96);
         assert_eq!(records_b.len(),96);
-        for (left,right) in records_a.iter().zip(&records_b) {
-            assert_eq!(left.author,right.author);
-            assert_eq!(left.document,right.document);
+        for left in &records_a {
+            // @local is relative to EACH machine. A's locally authored
+            // stream appears on B as its pinned remote fingerprint, and B's
+            // @local stream appears on A under B's fingerprint.
+            let peer_author=if left.author==LOCAL_AUTHOR {
+                author_a.as_str()
+            } else {
+                assert_eq!(left.author,author_b);
+                LOCAL_AUTHOR
+            };
+            let counterpart=records_b.iter().find(|right|
+                right.author==peer_author&&right.document.id==left.document.id
+            ).expect("remote copy exists after convergence");
+            assert_eq!(left.document,counterpart.document);
         }
         assert_eq!(records_a.iter().filter(|item|item.document.deleted).count(),16);
         let mut old=doc("a-00",1,"stale replay");
