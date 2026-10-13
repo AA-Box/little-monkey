@@ -47,6 +47,7 @@ pub(crate) mod remote;
 mod scheduler;
 mod service;
 mod swarm_coordinator;
+mod swarm_transfer;
 pub(crate) mod swarm_cluster;
 pub(crate) mod store;
 pub(crate) mod telecom_store;
@@ -139,6 +140,19 @@ pub enum DaemonCmd {
     SwarmStatus { #[arg(long)] id: Option<String> },
     /// Request cancellation of an entire resident swarm graph.
     SwarmCancel { id: String },
+    /// Write an integrity-checked, portable read-only DAG recovery bundle.
+    SwarmExport { id: String, output: PathBuf },
+    /// Explicitly re-run a transferred plan-only graph with NEW job identities.
+    SwarmImportReadOnly {
+        input: PathBuf,
+        #[arg(long)]
+        new_id: String,
+        #[arg(long)]
+        workspace: PathBuf,
+        /// A source completion is never reused; every agent can run again.
+        #[arg(long, required = true)]
+        confirm_read_only_reexecution: bool,
+    },
     /// Print durable events for a run; optionally follow until terminal.
     Attach {
         run_id: String,
@@ -522,6 +536,21 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
             let paths = DaemonPaths::resolve()?;
             swarm_coordinator::request_cancel(&paths, id)?;
             println!("Swarm cancellation requested: {id}");
+            Ok(())
+        },
+        DaemonCmd::SwarmExport { id, output } => {
+            let paths = DaemonPaths::resolve()?;
+            println!("{}", swarm_transfer::export(&paths, id, output)?);
+            Ok(())
+        },
+        DaemonCmd::SwarmImportReadOnly {
+            input,new_id,workspace,confirm_read_only_reexecution
+        } => {
+            if !confirm_read_only_reexecution {
+                return Err("Explicit consent to re-run every imported plan-only agent required".into());
+            }
+            let paths = DaemonPaths::resolve()?;
+            println!("{}", swarm_transfer::import_read_only(&paths,input,new_id,workspace)?);
             Ok(())
         },
         DaemonCmd::Attach {
