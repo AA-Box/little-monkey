@@ -78,8 +78,18 @@ function fromClaude(items: Obj[]): CodingTranscript | null {
     append(text,msg.role,msg.content,row.timestamp);
     if (!text.length) continue;
     const id = str(msg.id) || str(row.uuid);
-    if (id && positions.has(id)) messages[positions.get(id)!] = text[0];
-    else {
+    if (id && positions.has(id)) {
+      const index = positions.get(id)!;
+      const prior = str(messages[index].content);
+      const next = str(text[0].content);
+      // Claude Code emits each visible content block as a separate JSONL
+      // record under the same message.id. Some releases also emit cumulative
+      // snapshots. Keep disjoint blocks, but collapse duplicate/cumulative
+      // snapshots instead of either discarding text or duplicating it.
+      if (next.startsWith(prior)) messages[index] = text[0];
+      else if (prior !== next && !prior.startsWith(next))
+        messages[index] = { ...messages[index], content: prior + "\\n" + next };
+    } else {
       if (id) positions.set(id,messages.length);
       messages.push(text[0]);
     }
