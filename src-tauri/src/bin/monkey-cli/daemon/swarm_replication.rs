@@ -46,6 +46,7 @@ pub struct ReplicaTraceEvent {
 #[serde(deny_unknown_fields)]
 pub struct ReplicaModelUsage {
     pub node_id: String,
+    pub status: String,
     pub target_id: String,
     pub elapsed_ms: u64,
     pub input_tokens: u64,
@@ -155,6 +156,8 @@ impl ReplicaSnapshot{
         let mut usage_nodes=std::collections::BTreeSet::new();
         for usage in &self.model_usage{
             if !unique.contains(usage.node_id.as_str())||
+                !self.nodes.iter().any(|node|node.id==usage.node_id && node.state==usage.status)||
+                !matches!(usage.status.as_str(),"succeeded"|"failed")||
                 !usage_nodes.insert(usage.node_id.as_str())||
                 usage.target_id.is_empty()||usage.target_id.len()>160||
                 !usage.target_id.bytes().all(|c|
@@ -302,7 +305,7 @@ fn measured_usage(
     let Ok(ledger)=RunLedger::open(&paths.ledger_db) else{return vec![]};
     let mut rows=Vec::new();
     for node in nodes {
-        if node.state!="succeeded" {continue;}
+        if !matches!(node.state.as_str(),"succeeded"|"failed") {continue;}
         let Some(job)=node.job_id.as_deref()
             .and_then(|id|store.get_job(id).ok().flatten()) else {continue};
         let (Some(run_id),Some(start),Some(end))=(
@@ -310,21 +313,47 @@ fn measured_usage(
         ) else{continue};
         if end<start||end-start>86_400_000{continue;}
         let Ok(Some(run))=ledger.load_run(run_id) else{continue};
-        if run.status!=little_monkey_lib::run_protocol::RunStatus::Succeeded||
-            run.last_sequence==0||run.last_sequence>4000 {continue;}
+        let status=match run.status{
+            little_monkey_lib::run_protocol::RunStatus::Succeeded=>"succeeded",
+            little_monkey_lib::run_protocol::RunStatus::Failed=>"failed",
+            _=>continue,
+        };
+        if status!=node.state||run.last_sequence==0||run.last_sequence>4000 {continue;}
         if !matches!(ledger.verify_run_chain(run_id),
             Ok(ChainVerification::Intact{
                 covered_from:Some(1),covered_through:Some(last),events_seen,..
             }) if last==run.last_sequence && events_seen==last) {continue;}
-        let Ok(events)=ledger.load_events(run_id,run.last_sequence-1,1) else{continue};
-        let Some(event)=events.into_iter().next() else{continue};
-        let RunEvent::Completed{usage,..}=event.event else{continue};
+        // Completed contains canonical terminal usage. A failed run instead
+        // records cumulative usage in its last UsageRecorded event, if any.
+        // Both are read from the verified event chain; never fabricate tokens
+        // for a failed call that provided no metering.
+        let mut cursor=0;
+        let mut metering=None;
+        let mut terminal=None;
+        while cursor<run.last_sequence {
+            let Ok(events)=ledger.load_events(run_id,cursor,200) else{break};
+            if events.is_empty(){break;}
+            for envelope in events {
+                cursor=envelope.sequence;
+                match envelope.event {
+                    RunEvent::UsageRecorded{usage}=>metering=Some(usage),
+                    RunEvent::Completed{usage,..}=>{
+                        metering=Some(usage);terminal=Some("succeeded");
+                    },
+                    RunEvent::Failed{..}=>terminal=Some("failed"),
+                    _=>{},
+                }
+            }
+        }
+        if cursor!=run.last_sequence||terminal!=Some(status){continue;}
+        let Some(usage)=metering else{continue};
+        if usage.model_calls==0{continue};
         let target=run.spec.target.target_id();
         if target.is_empty()||target.len()>160||
             !target.bytes().all(|c|c.is_ascii_alphanumeric()||
                 matches!(c,b'-'|b'_'|b'.'|b':'|b'/'|b'@'|b'+'|b'%')) {continue;}
         rows.push(ReplicaModelUsage{
-            node_id:node.id.clone(),target_id:target.to_owned(),
+            node_id:node.id.clone(),status:status.into(),target_id:target.to_owned(),
             elapsed_ms:end-start,input_tokens:usage.input_tokens,
             output_tokens:usage.output_tokens,
             cached_input_tokens:usage.cached_input_tokens,
@@ -649,7 +678,7 @@ mod tests{
         cp.version=3;
         cp.nodes[0].state="succeeded".into();
         cp.model_usage=vec![ReplicaModelUsage{
-            node_id:"audit".into(),target_id:"provider:model".into(),
+            node_id:"audit".into(),status:"succeeded".into(),target_id:"provider:model".into(),
             elapsed_ms:1230,input_tokens:120,output_tokens:30,
             cached_input_tokens:10,model_calls:2,cost_micros:Some(450),
         }];
