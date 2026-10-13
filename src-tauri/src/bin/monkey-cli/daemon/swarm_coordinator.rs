@@ -929,6 +929,47 @@ mod tests {
         }
     }
     #[test]
+    fn nested_graph_submit_freezes_recipes_and_persists_flat_dag_after_restart() {
+        let root=std::env::temp_dir().join(format!("swarm-nested-{}",uuid::Uuid::new_v4()));
+        let paths=DaemonPaths::under(&root);
+        paths.ensure().unwrap();
+        let workspace=root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let recipe=root.join("review.json");
+        std::fs::write(&recipe,serde_json::json!({
+            "version":1,"name":"nested-readonly","target":{"ollama":"qwen2.5:7b"},
+            "workspace":workspace,"permission_mode":"plan","prompt":"Review source","params":{}
+        }).to_string()).unwrap();
+        let input=root.join("nested.json");
+        std::fs::write(&input,serde_json::json!({
+            "version":1,"id":"nested-state","max_parallel":2,"nodes":[{
+                "id":"lead","recipe":recipe,"children":[{
+                    "id":"audit","recipe":recipe,"children":[{
+                        "id":"verify","recipe":recipe
+                    }]
+                }]
+            }]
+        }).to_string()).unwrap();
+        let submitted=submit(&paths,&input).unwrap();
+        assert_eq!(submitted["nodes"],3);
+        let stored=DaemonStore::open(&paths).unwrap();
+        let bytes:String=stored.connection.query_row(
+            "SELECT spec_json FROM resident_swarm_graphs WHERE graph_id=?1",
+            ["nested-state"],|row|row.get(0)
+        ).unwrap();
+        let saved:ResidentSwarmSpec=serde_json::from_str(&bytes).unwrap();
+        assert_eq!(saved.nodes[2].depends_on,vec!["audit"]);
+        assert!(saved.nodes[2].include_dependency_reports);
+        assert!(paths.snapshots.join("resident-swarm-nested-state-verify.json").is_file());
+        drop(stored);
+        let recovered=status(&paths,Some("nested-state")).unwrap();
+        assert_eq!(recovered["graphs"][0]["tasks"].as_array().unwrap().len(),3);
+        request_cancel(&paths,"nested-state").unwrap();
+        assert_eq!(status(&paths,Some("nested-state")).unwrap()["graphs"][0]["state"],"cancelling");
+        let _=std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn validates_and_orders_dependencies_without_running_model_code() {
         assert_eq!(validate(&example()).unwrap(),vec!["survey","verify"]);
         let mut bad=example();
