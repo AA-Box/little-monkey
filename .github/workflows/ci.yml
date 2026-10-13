@@ -359,6 +359,18 @@ jobs:
               exit 1
             fi
             pnpm test:rust
+            # Three ACTUAL independently running daemon installations over
+            # signed/pinned TLS on loopback, private SQLite and OS keychain.
+            # This test owns only disposable GitHub-hosted runner state.
+            node --check scripts/swarm-three-process-live-acceptance.mjs
+            node scripts/swarm-three-process-live-acceptance.mjs --self-check
+            cargo build --manifest-path src-tauri/Cargo.toml --bin monkey-cli
+            cli="$(pwd)/src-tauri/target/debug/monkey-cli"
+            test -x "$cli"
+            node scripts/swarm-three-process-live-acceptance.mjs \
+              --monkey-bin "$cli" --confirm-disposable \
+              > "$RUNNER_TEMP/native-swarm-three-process-acceptance.json"
+            cat "$RUNNER_TEMP/native-swarm-three-process-acceptance.json"
           '
 
       - name: Rust tests
