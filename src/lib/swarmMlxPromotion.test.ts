@@ -1,8 +1,9 @@
+import type {ModelInfo} from '../store/modelStore';
 import {beforeEach,describe,expect,it,vi} from 'vitest';
 import {MLX_PROMOTION_JOURNAL,promoteVerifiedMlxFusion,pendingMlxPromotion,
  recoverInterruptedMlxPromotion,type PromotionRuntime} from './swarmMlxPromotion';
-const prev={id:'p',name:'Previous',path:'/models/old',runtime:'mlx',is_external:true} as never;
-const candidate={id:'c',name:'Trained',path:'/models/fused',runtime:'mlx',is_external:true} as never;
+const prev={id:'p',name:'Previous',path:'/models/old',runtime:'mlx',is_external:true} as ModelInfo;
+const candidate={id:'c',name:'Trained',path:'/models/fused',runtime:'mlx',is_external:true} as ModelInfo;
 let map:Map<string,string>,active:typeof candidate|null,running:string|null,runtime:PromotionRuntime;
 const storage={
  getItem:(k:string)=>map.get(k)??null,

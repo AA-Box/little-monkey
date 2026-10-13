@@ -5,7 +5,7 @@ import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
 import { prepareResidentSwarm } from '../../lib/residentSwarmBridge';
 import {parseValidatedMlxFusionReceipt,verifyFusedModelConfig} from '../../lib/swarmMlxFusionImport';
 import {useModelStore,type ModelInfo} from '../../store/modelStore';
-import {promoteVerifiedMlxFusion,recoverInterruptedMlxPromotion,pendingMlxPromotion,type PromotionRuntime} from '../../lib/swarmMlxPromotion';
+import {promoteVerifiedMlxFusion,recoverInterruptedMlxPromotion,type PromotionRuntime} from '../../lib/swarmMlxPromotion';
 import { parseCommandHooksManifest } from '../../lib/commandHookManifest';
 import { useUserHooksStore } from '../../store/userHooksStore';
 import { daemonSwarmCancel, daemonSwarmStatus, daemonSwarmSubmit, type ResidentSwarmGraphStatus } from '../../lib/daemonClient';
@@ -265,7 +265,7 @@ export function SwarmPanel() {
         'Measured fused held-out perplexity: '+receipt.fusedTestPerplexity+
         '. The receipt and hash are local evidence, NOT a trusted signature. '+
         'Review the folder source and tests, then select/test the model manually after import.'))return;
-      const models=await invoke<{runtime:string}[]>('models_import_verified_fusion', {
+      const models=await invoke<ModelInfo[]>('models_import_verified_fusion', {
         path:selectedFolder,configSha256:receipt.fusedConfigSha256,files:receipt.fusedWeights,
       });
       await useModelStore.getState().refresh();
