@@ -99,7 +99,17 @@ function fromCodex(items: Obj[]): CodingTranscript | null {
     else if (row.type === "event_msg" && p.type === "agent_message") append(fallback,"assistant",p.message,row.timestamp);
   }
   // response_item and event_msg often duplicate the same conversation.
-  return finish("codex",primary.length ? primary : fallback,start);
+  // Some Codex versions emit user prompts only as event_msg, while assistant
+  // output still uses response_item. Preserve both roles without duplicating
+  // transcript events that occur on both channels.
+  const hasUser = primary.some(m => m.role === "user");
+  const hasAssistant = primary.some(m => m.role === "assistant");
+  const messages = [
+    ...(!hasUser ? fallback.filter(m => m.role === "user") : []),
+    ...primary,
+    ...(!hasAssistant ? fallback.filter(m => m.role === "assistant") : []),
+  ].sort((a,b) => (a.at ?? 0) - (b.at ?? 0));
+  return finish("codex",messages.length ? messages : fallback,start);
 }
 function fromPi(items: Obj[]): CodingTranscript | null {
   const header = items.find(x=>x.type==="session");
