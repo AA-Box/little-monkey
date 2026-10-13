@@ -135,32 +135,6 @@ export function gradeReport(raw,domain,target,repetitions,now=Date.now()){
    bestSpecialist:ranking[0].specialist,
    reportSha256:sha(JSON.stringify(raw))};
 }
-function validatedState(value,policy,now=Date.now()){
- if(!value||typeof value!=='object'||Array.isArray(value)||value.version!==1||
-   !boundedInt(value.revision,1,1_000_000)||
-   !boundedInt(value.createdAt,1,now+300_000)||
-   !value.active||typeof value.active!=='object')fail('Corrupted active deployment; refuse routing');
- const check=entry=>{
-  if(entry===null)return;
-  if(typeof entry!=='object'||Array.isArray(entry)||
-     !policy.targets.includes(entry.target)||!policy.domains.includes(entry.domain)||
-     !DOMAINS[entry.domain].roles.includes(entry.bestSpecialist)||
-     typeof entry.accuracy!=='number'||entry.accuracy<policy.minAccuracy||entry.accuracy>1||
-     typeof entry.reportSha256!=='string'||!HASH.test(entry.reportSha256)||
-     typeof entry.generatedAt!=='string'||!Number.isFinite(Date.parse(entry.generatedAt))||
-     Date.parse(entry.generatedAt)>now+300_000||
-     now-Date.parse(entry.generatedAt)>policy.maxAgeHours*3_600_000)
-    fail('Invalid or expired deployed specialist benchmark');
- };
- check(value.active);
- check(value.previous??null);
- return value;
-}
-export function readDeployment(policy,now=Date.now()){
- const path=join(policy.stateDir,'active-routing.json');
- if(!existsSync(path))return null;
- return validatedState(JSON.parse(readBounded(path,32_000)),policy,now);
-}
 /** Decides ONLY between fully remeasured already-configured local targets. */
 export function chooseDeployment(policy,reports,prior,now=Date.now()){
  const changes=[];
@@ -180,8 +154,10 @@ export function chooseDeployment(policy,reports,prior,now=Date.now()){
   }else if(winner){active=winner;reason=winner.target===previous?.target?'verified_current':'promoted_verified_target';}
   // A failing previously active target is NEVER grandfathered in. If the
   // old winner regresses, this promotes the strongest remeasured fallback.
-  changes.push({domain,active,previous:previous?.target===active?.target?null:previous,
-    reason});
+  changes.push({domain,active,previous:priorTarget&&priorTarget.target!==active?.target?{
+    domain,target:priorTarget.target,accuracy:priorTarget.accuracy,
+    bestSpecialist:priorTarget.bestSpecialist,reportSha256:priorTarget.reportSha256,
+    generatedAt:priorTarget.generatedAt}:null,reason});
  }
  return {version:1,revision:(prior?.revision??0)+1,createdAt:now,
   domains:Object.fromEntries(changes.map(x=>[x.domain,{
@@ -239,7 +215,7 @@ export function benchmarkCycle(policy,{run=spawnSync,now=Date.now(),log=console.
    const text=result.stdout?.trim();
    if(!text||Buffer.byteLength(text)>MAX_REPORT_BYTES)fail('Missing bounded independently graded output');
    const raw=JSON.parse(text);
-   grade=gradeReport(raw,domain,target,policy.repetitions,now);
+   grade=gradeReport(raw,domain,target,policy.repetitions,Date.now());
    atomicJson(join(policy.stateDir,'evidence-'+domain+'-'+sha(target).slice(0,20)+'.json'),
      {version:1,grade,raw});
    reports.push(grade);
