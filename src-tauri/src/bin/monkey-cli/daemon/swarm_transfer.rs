@@ -148,8 +148,18 @@ pub fn export(paths: &DaemonPaths, graph_id: &str, output: &Path) -> Result<serd
             node_id:id.to_owned(),state:state.to_owned(),job_id:job
         });
     }
-    if observed_nodes.len()!=spec.nodes.len(){
-        return Err("Source node state is incomplete".into());
+    // Status returns nodes sorted by name, while the DAG specification may
+    // use dependency order. Normalize observations to the spec's order.
+    let mut observations=observed_nodes.into_iter().map(|row|
+        (row.node_id.clone(),row)
+    ).collect::<std::collections::BTreeMap<_,_>>();
+    let observed_nodes=spec.nodes.iter().map(|node|
+        observations.remove(&node.id).ok_or_else(||
+            "Source node state is incomplete".to_string()
+        )
+    ).collect::<Result<Vec<_>,_>>()?;
+    if !observations.is_empty() {
+        return Err("Unexpected source node observation".into());
     }
     let mut bundle=TransferBundle{
         version:1,source_graph_id:spec.id.clone(),spec,recipes,observed_nodes,
@@ -175,10 +185,11 @@ fn verify(bundle: &TransferBundle) -> Result<(), String> {
         return Err("Transfer node evidence incomplete".into());
     }
     for (node,record) in bundle.spec.nodes.iter().zip(&bundle.recipes) {
+        let expected_fallback=record.fallback.as_ref()
+            .map(|_|format!("embedded-fallback:{}",node.id));
         if node.id!=record.node_id
             ||node.recipe!=format!("embedded-primary:{}",node.id)
-            ||node.fallback_recipe.as_deref()!=
-                record.fallback.as_ref().map(|_|format!("embedded-fallback:{}",node.id)).as_deref()
+            ||node.fallback_recipe.as_deref()!=expected_fallback.as_deref()
             ||hash_bytes(record.primary.as_bytes())!=record.primary_sha256
             ||record.fallback.as_ref().map(|s|hash_bytes(s.as_bytes()))!=record.fallback_sha256
             ||record.primary.len() as u64>MAX_RECIPE_BYTES
