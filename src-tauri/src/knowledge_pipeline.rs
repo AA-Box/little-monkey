@@ -3461,7 +3461,9 @@ impl HybridIndex {
             }
             // The graph is frozen with the same immutable chunk/vector
             // transaction. Old/small generations continue exact retrieval.
-            hnsw::build(&transaction,chunks,&normalized_vectors,cancel)?;
+            if embedding_spec.normalized {
+                hnsw::build(&transaction,chunks,&normalized_vectors,cancel)?;
+            }
             check_cancelled(cancel)?;
             transaction.commit()?;
         }
