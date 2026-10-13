@@ -281,6 +281,86 @@ pub fn capture_local_leader(
     Ok(snapshot)
 }
 
+/// Periodic best-effort publication of actual locally leader-owned DAG
+/// checkpoints. Every destination is explicitly enrolled in the local
+/// cluster's pinned certificate roster and already granted PeerTaskRequest
+/// on the receiver. This loop grants nothing, cannot schedule foreign jobs
+/// and never applies any remote status as a trusted local completion.
+pub fn spawn_replica_worker(paths:super::store::DaemonPaths){
+    tokio::spawn(async move {
+        let mut timer=tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            timer.tick().await;
+            let now=match super::now_ms().and_then(|ms|
+                i64::try_from(ms).map_err(|_|"Replica clock overflow".to_string())
+            ){Ok(now)=>now,Err(error)=>{
+                eprintln!("Swarm replica clock unavailable: {error}");
+                continue;
+            }};
+            let selected:Vec<(String,String,String,String)>={
+                let store=match DaemonStore::open(&paths){
+                    Ok(s)=>s,Err(error)=>{
+                        eprintln!("Swarm replica database unavailable: {error}");
+                        continue;
+                    }
+                };
+                if store.kill_switch().unwrap_or(true) {
+                    Vec::new()
+                }else{
+                    // Do not launch unbounded network work from a heartbeat.
+                    // All of these are operator-prestaged cluster graphs.
+                    let graphs=store.connection.prepare(
+                        "SELECT graph_id,spec_json FROM resident_swarm_graphs
+                         WHERE state IN ('running','succeeded','failed')
+                         ORDER BY updated_at_ms DESC LIMIT 4"
+                    ).and_then(|mut stmt|stmt.query_map([],|r|
+                        Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))
+                    ).and_then(|rows|rows.collect::<Result<Vec<_>,_>>()))
+                        .unwrap_or_default();
+                    let mut peers=Vec::new();
+                    for (id,raw) in graphs {
+                        let Ok(spec)=serde_json::from_str::<super::swarm_coordinator::ResidentSwarmSpec>(&raw)
+                            else {continue};
+                        let Some(group)=spec.cluster_id else{continue};
+                        if !swarm_cluster::may_schedule(&store,&group,now).unwrap_or(false){continue;}
+                        let Ok(roster)=swarm_cluster::roster(&store,&group) else{continue};
+                        for member in roster.members {
+                            if let Some(alias)=member.alias {
+                                peers.push((group.clone(),id.clone(),alias,member.fingerprint));
+                                if peers.len()>=12{break;}
+                            }
+                        }
+                        if peers.len()>=12{break;}
+                    }
+                    peers
+                }
+            };
+            for (group,graph,alias,fp) in selected {
+                let snapshot=match capture_local_leader(
+                    &paths,&group,&graph,&alias,&fp,now
+                ){Ok(snapshot)=>snapshot,Err(_)=>continue};
+                let Ok(bytes)=serde_json::to_vec(&snapshot) else{continue};
+                let reply=tokio::time::timeout(
+                    std::time::Duration::from_secs(8),
+                    super::remote::signed_swarm_checkpoint(
+                        &paths,&alias,&fp,bytes,now as u64
+                    )
+                ).await;
+                if !matches!(reply,Ok(Ok(ref answer)) if
+                    answer["accepted"]==true &&
+                    answer["sequence"]==snapshot.sequence &&
+                    answer["graph_id"]==graph &&
+                    answer["group"]==group) {
+                    // Failure is never translated into cancellation, progress,
+                    // or a second local task. The next sync receives a newer
+                    // whole checkpoint and safely converges after partitions.
+                    eprintln!("Swarm replica checkpoint deferred for {group}/{graph} on {alias}");
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests{
     use super::*;
