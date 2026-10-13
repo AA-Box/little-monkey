@@ -16,6 +16,19 @@ export interface DistributedTraceEvent {
   term: number | null;
   verifiedExecution: false;
 }
+export interface DistributedTraceMeteredUsage {
+  sourceFingerprint:string;
+  node:string;
+  targetId:string;
+  inputTokens:number;
+  outputTokens:number;
+  cachedInputTokens:number;
+  modelCalls:number;
+  elapsedMs:number;
+  meteredCostMicros:number|null;
+  providerBilled:false;
+  independentlyQualityVerified:false;
+}
 export interface DistributedTraceOverview {
   graph: string;
   receivedPeers: number;
@@ -23,6 +36,8 @@ export interface DistributedTraceOverview {
   stalePeers: number;
   invalidPeerRecords: number;
   historicalPeerEvents: number;
+  meteredPeerRuns: number;
+  meteredUsage: DistributedTraceMeteredUsage[];
   legacySnapshotPeers: number;
   latestReportedTerm: number | null;
   events: DistributedTraceEvent[];
@@ -44,6 +59,7 @@ export function composeDistributedSwarmTrace(
     throw new Error('Invalid distributed trace context');
   }
   const events: DistributedTraceEvent[]=[];
+  const meteredUsage: DistributedTraceMeteredUsage[]=[];
   for(const row of (graph.events??[]).slice(-128)) {
     if(!Number.isSafeInteger(row.sequence)||row.sequence<1||
        !isTime(row.occurred_at_ms)||row.occurred_at_ms>now+5000||
@@ -70,7 +86,7 @@ export function composeDistributedSwarmTrace(
        !STATES.has(peer.graph_state)||!Array.isArray(peer.nodes)||
        peer.nodes.length===0||peer.nodes.length>16||
        peer.nodes.some(node=>!TOKEN.test(node.id)||!STATES.has(node.state))||
-       (peer.version!==1 && peer.version!==2)){
+       (peer.version!==1 && peer.version!==2 && peer.version!==3)){
       invalid++;continue;
     }
     const remoteEvents = peer.trace_events??[];
@@ -89,7 +105,38 @@ export function composeDistributedSwarmTrace(
        })){
       invalid++;continue;
     }
+    const usage=peer.model_usage??[];
+    const usageNodes=new Set<string>();
+    if(!Array.isArray(usage)||usage.length>16||
+       (peer.version<3&&usage.length>0)||
+       usage.some(row=>{
+        if(!row||typeof row.node_id!=='string'||!TOKEN.test(row.node_id)||
+          usageNodes.has(row.node_id)||!peer.nodes.some(node=>
+            node.id===row.node_id && node.state==='succeeded')||
+          typeof row.target_id!=='string'||
+          !/^[A-Za-z0-9][A-Za-z0-9_./:@+%-]{0,159}$/.test(row.target_id)||
+          !Number.isSafeInteger(row.elapsed_ms)||row.elapsed_ms<0||row.elapsed_ms>86_400_000||
+          !Number.isSafeInteger(row.input_tokens)||row.input_tokens<0||row.input_tokens>100_000_000||
+          !Number.isSafeInteger(row.output_tokens)||row.output_tokens<0||row.output_tokens>100_000_000||
+          !Number.isSafeInteger(row.cached_input_tokens)||row.cached_input_tokens<0||
+          row.cached_input_tokens>row.input_tokens||
+          !Number.isSafeInteger(row.model_calls)||row.model_calls<1||row.model_calls>100_000||
+          (row.cost_micros!==null&&
+            (!Number.isSafeInteger(row.cost_micros)||row.cost_micros<0||
+             row.cost_micros>1_000_000_000_000)))return true;
+        usageNodes.add(row.node_id);
+        return false;
+       })){invalid++;continue;}
     seen.add(peer.source_fingerprint);
+    for(const row of usage){
+      meteredUsage.push({
+        sourceFingerprint:peer.source_fingerprint,node:row.node_id,targetId:row.target_id,
+        inputTokens:row.input_tokens,outputTokens:row.output_tokens,
+        cachedInputTokens:row.cached_input_tokens,modelCalls:row.model_calls,
+        elapsedMs:row.elapsed_ms,meteredCostMicros:row.cost_micros,
+        providerBilled:false,independentlyQualityVerified:false,
+      });
+    }
     const freshEnough=now-peer.captured_at_ms<=FRESH_WINDOW_MS;
     if(freshEnough)fresh++;else stale++;
     latestTerm=Math.max(latestTerm??0,peer.term);
@@ -131,6 +178,7 @@ export function composeDistributedSwarmTrace(
     graph:graph.id,receivedPeers:seen.size,freshPeers:fresh,
     stalePeers:stale,invalidPeerRecords:invalid,
     historicalPeerEvents:historical,legacySnapshotPeers:legacy,
+    meteredPeerRuns:meteredUsage.length,meteredUsage,
     latestReportedTerm:latestTerm,events:events.slice(-160),
   };
 }
