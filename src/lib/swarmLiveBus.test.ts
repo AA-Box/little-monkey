@@ -31,6 +31,14 @@ describe('live native workflow mailbox', () => {
     expect(bus.observeMutation('review', 'src/auth.ts')).toBe(0);
   });
 
+  it('matches a workspace-relative read against an absolute file modification', () => {
+    const bus = new LiveSwarmBus(['review', 'writer'], '/projects/demo');
+    bus.observeRead('review', 'src/auth.ts');
+    expect(bus.observeMutation('writer', '/projects/demo/src/auth.ts')).toBe(1);
+    expect(bus.receive('review')[0].kind).toBe('file_changed');
+    expect(bus.observeMutation('writer', '/projects/demo-other/src/auth.ts')).toBe(0);
+  });
+
   it('bounds fanout, rejects a full mailbox atomically and protects peer prompt context', () => {
     const bus = new LiveSwarmBus(['a', 'b', 'c']);
     expect(() => bus.send('a', 'b', 'X'.repeat(1201))).toThrow(/1200/);
