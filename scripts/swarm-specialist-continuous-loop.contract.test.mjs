@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
-import {gradeReport,parsePolicy,chooseDeployment,benchmarkCycle,dispatchRecipe,acquireCycleLock}
+import {gradeReport,parsePolicy,chooseDeployment,benchmarkCycle,dispatchRecipe,acquireCycleLock,recipeTarget}
  from './swarm-specialist-continuous-loop.mjs';
 const roles=['Threat model reviewer','Secrets exposure reviewer','Race condition reviewer'];
 const fixtures=['auth-bypass','code-injection','safe-control'];
@@ -70,6 +70,15 @@ describe('continuous verified specialist learning and real native recipe deploym
   try{
    assert.throws(()=>parsePolicy({...env.policy,minAccuracy:0.3}),/safety/);
    assert.throws(()=>parsePolicy({...env.policy,targets:['not-ollama']}),/Ollama/);
+   const loopback='local-url:http://127.0.0.1:8765|mlx-specialist';
+   assert.deepEqual(recipeTarget(loopback),{local_url:'http://127.0.0.1:8765',model:'mlx-specialist'});
+   assert.deepEqual(recipeTarget(targetA),{ollama:'trusted-a'});
+   assert.equal(parsePolicy({...env.policy,targets:[loopback]}).targets[0],loopback);
+   for(const unsafe of ['local-url:http://127.0.0.2:8765|mlx',
+    'local-url:http://example.com:8765|mlx','local-url:http://127.0.0.1:99999|mlx',
+    'local-url:http://127.0.0.1:80|mlx','local-url:http://127.0.0.1:8765/a|mlx']){
+    assert.throws(()=>parsePolicy({...env.policy,targets:[unsafe]}),/Ollama/);
+   }
    assert.throws(()=>parsePolicy({...env.policy,unknownFlag:true}),/exact/);
    const recipe=join(env.stateDir,'source.json');
    writeFileSync(recipe,JSON.stringify({version:1,workspace:env.stateDir,
