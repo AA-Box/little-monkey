@@ -128,6 +128,76 @@ mod tests{
     use super::*;
     use super::super::swarm_cluster::{ClusterMember,ClusterRoster,VoteRequest};
     #[test]
+    fn native_dispatch_intent_requires_new_quorum_on_every_state_change(){
+        use super::super::swarm_coordinator::{ResidentSwarmSpec,ResidentSwarmNode};
+        let base=std::env::temp_dir().join(format!("swarm-quorum-intents-{}",uuid::Uuid::new_v4()));
+        let paths=DaemonPaths::under(&base);
+        paths.ensure().unwrap();
+        let mut store=DaemonStore::open(&paths).unwrap();
+        let a="a".repeat(64);let b="b".repeat(64);let c="c".repeat(64);
+        let roster=ClusterRoster{version:1,group:"work".into(),members:vec![
+            ClusterMember{fingerprint:a.clone(),device_id:"@local".into(),alias:None},
+            ClusterMember{fingerprint:b.clone(),device_id:"signed-b".into(),alias:Some("b".into())},
+            ClusterMember{fingerprint:c.clone(),device_id:"signed-c".into(),alias:Some("c".into())},
+        ]};
+        swarm_cluster::configure(&mut store,&roster,1000).unwrap();
+        let request=VoteRequest{group:"work".into(),term:1,
+            candidate_fingerprint:a.clone(),roster_sha256:roster.digest()};
+        let local=swarm_cluster::vote(&mut store,&request,"@local",1000).unwrap();
+        let mut remote=local.clone();remote.voter_fingerprint=b.clone();
+        swarm_cluster::persist_quorum(&store,&request,&[local,remote],1000).unwrap();
+        let spec=ResidentSwarmSpec{
+            version:1,id:"graph".into(),cluster_id:Some("work".into()),
+            max_parallel:1,nodes:vec![ResidentSwarmNode{
+                id:"audit".into(),recipe:"/private/approved.json".into(),
+                fallback_recipe:None,depends_on:Vec::new(),
+                include_dependency_reports:false,max_runtime_seconds:60
+            }]
+        };
+        store.connection.execute_batch(
+            "CREATE TABLE resident_swarm_graphs(
+                graph_id TEXT PRIMARY KEY,spec_json TEXT NOT NULL,
+                state TEXT NOT NULL,created_at_ms INTEGER,updated_at_ms INTEGER);
+             CREATE TABLE resident_swarm_nodes(
+                graph_id TEXT,node_id TEXT,state TEXT,job_id TEXT,
+                PRIMARY KEY(graph_id,node_id));"
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO resident_swarm_graphs(graph_id,spec_json,state,created_at_ms,updated_at_ms)
+             VALUES('graph',?1,'running',1000,1000)",
+             params![serde_json::to_string(&spec).unwrap()]
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO resident_swarm_nodes(graph_id,node_id,state,job_id)
+             VALUES('graph','audit','pending',NULL)",[]
+        ).unwrap();
+        assert!(!majority_has_state(&store,"work","graph",2000).unwrap());
+        let pending=local_state(&store,"work","graph",2000).unwrap().unwrap();
+        attest_readback(&paths,&pending,&b,2001).unwrap();
+        assert!(majority_has_state(&store,"work","graph",2002).unwrap());
+        // A task which has only been admitted/observed as pending is not
+        // authorized to start AFTER its durable execution intent is created.
+        store.connection.execute(
+            "UPDATE resident_swarm_nodes SET state='preparing',job_id='stable-job-1'
+             WHERE graph_id='graph' AND node_id='audit'",[]
+        ).unwrap();
+        assert!(!majority_has_state(&store,"work","graph",2003).unwrap(),
+            "a quorum for pending does not authorize execution of preparing");
+        let prepared=local_state(&store,"work","graph",2004).unwrap().unwrap();
+        attest_readback(&paths,&prepared,&c,2005).unwrap();
+        assert!(majority_has_state(&store,"work","graph",2006).unwrap());
+        store.connection.execute(
+            "UPDATE resident_swarm_nodes SET state='submitted'
+             WHERE graph_id='graph' AND node_id='audit'",[]
+        ).unwrap();
+        assert!(!majority_has_state(&store,"work","graph",2007).unwrap(),
+            "a quorum for preparing is not a quorum for submitted");
+        assert!(!majority_has_state(&store,"work","graph",30_000).unwrap(),
+            "stale leader lease cannot authorize any future dispatch");
+        drop(store);
+        let _=std::fs::remove_dir_all(base);
+    }
+    #[test]
     fn majority_requires_exact_state_and_term_and_signed_remote_readback(){
         let mut store=DaemonStore::open_in_memory().unwrap();
         let fp_a="a".repeat(64);
