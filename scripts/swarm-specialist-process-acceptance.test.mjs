@@ -23,7 +23,8 @@ if(benchmark)argv.splice(0,2);
 if(argv[0]!=='task'||argv[1]!=='run'||argv[3]!=='--json') process.exit(3);
 const recipe=JSON.parse(readFileSync(argv[2],'utf8'));
 if(recipe.version!==1||recipe.permission_mode==='bypass'||
-   !recipe.target?.ollama||typeof recipe.workspace!=='string')process.exit(4);
+   !(recipe.target?.ollama||(recipe.target?.local_url&&recipe.target?.model))||
+   typeof recipe.workspace!=='string')process.exit(4);
 if(!benchmark){
  if(!recipe.prompt.includes('Verified reviewer focus: ')||
     !recipe.prompt.startsWith('Review my original task')||
@@ -46,7 +47,7 @@ const sourceDefect={
 };
 const category=Object.entries(sourceDefect).find(([prefix])=>symbol.startsWith(prefix))?.[1]??'safe-control';
 const winner=process.env.LM_ACCEPT_WINNER??'trusted-a';
-const correct=recipe.target.ollama===winner;
+const correct=(recipe.target.ollama??recipe.target.model)===winner;
 const message=correct
  ?category==='safe-control'
   ?'NO_FINDING src/module.mjs '+symbol
@@ -67,7 +68,7 @@ test('real subprocess integration: independent fixtures, quality-driven promotio
   writeFileSync(cli,fakeCli,{mode:0o700});
   chmodSync(cli,0o700);
   const policy=parsePolicy({version:1,monkeyBin:cli,stateDir:directory,
-   targets:['ollama:trusted-a','ollama:trusted-b'],domains:['security'],
+   targets:['ollama:trusted-a','local-url:http://127.0.0.1:8765|trusted-b'],domains:['security'],
    repetitions:2,intervalSeconds:60,timeoutMs:30000,minAccuracy:0.8,
    minImprovement:0.05,maxAgeHours:1});
   const recipe=join(directory,'task.json');
@@ -84,10 +85,10 @@ test('real subprocess integration: independent fixtures, quality-driven promotio
   assert.equal(JSON.parse(result.nativeResult).status,'ok');
   process.env.LM_ACCEPT_WINNER='trusted-b';
   const second=benchmarkCycle(policy,{log:()=>{}});
-  assert.equal(second.domains.security.active?.target,'ollama:trusted-b');
+  assert.equal(second.domains.security.active?.target,'local-url:http://127.0.0.1:8765|trusted-b');
   assert.equal(second.domains.security.active.accuracy,1);
   result=dispatchRecipe(policy,'security',recipe);
-  assert.equal(result.target,'ollama:trusted-b');
+  assert.equal(result.target,'local-url:http://127.0.0.1:8765|trusted-b');
   assert.equal(JSON.parse(readFileSync(recipe,'utf8')).target,undefined);
   process.env.LM_ACCEPT_WINNER='trusted-a';
   const third=benchmarkCycle(policy,{log:()=>{}});
