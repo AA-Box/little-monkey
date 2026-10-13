@@ -44,6 +44,17 @@ describe('live native workflow mailbox', () => {
     expect(bus.receive('b')).toHaveLength(6);
   });
 
+  it('never claims delivery to a completed worker', () => {
+    const bus = new LiveSwarmBus(['a', 'b', 'c']);
+    bus.observeRead('b', 'src/auth.ts');
+    bus.finishAgent('b');
+    expect(bus.listMembers('a')).toEqual(['c']);
+    expect(() => bus.send('a', 'b', 'too late')).toThrow(/Recipient/);
+    expect(bus.send('a', '*', 'still active')).toBe(1);
+    expect(bus.receive('c')).toHaveLength(1);
+    expect(bus.observeMutation('a', 'src/auth.ts')).toBe(0);
+  });
+
   it('rejects oversized/duplicate participant sets', () => {
     expect(() => new LiveSwarmBus(['a', 'a'])).toThrow(/distinct/);
     expect(() => new LiveSwarmBus(Array.from({ length: 17 }, (_, i) => String(i)))).toThrow(/1–16/);
