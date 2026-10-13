@@ -9,7 +9,7 @@
 //! hidden by partitioning or choosing a stale replica. Missing witnesses fail
 //! closed, and any previously attempted work blocks unattended reassignment.
 use futures_util::{stream::FuturesUnordered,StreamExt};
-use rusqlite::params;
+use rusqlite::{params,OptionalExtension};
 use super::store::{DaemonPaths,DaemonStore};
 use super::{swarm_cluster,swarm_replication};
 use super::swarm_replication::ReplicaSnapshot;
@@ -57,6 +57,26 @@ pub fn record(
            snapshot.roster_sha256!=roster.digest()||
            snapshot.term>=term as u64{
             return Err("Predecessor's witness graph, identity, roster or term is invalid".into());
+        }
+    }
+    // Witness state must be monotonic even when a paired peer retries a GET
+    // out of order. An already observed PREPARING state cannot be replaced by
+    // an older PENDING copy or a manufactured "missing source" response.
+    let previous:Option<Option<String>>=store.connection.query_row(
+        "SELECT source_json FROM resident_swarm_takeover_witnesses
+         WHERE group_id=?1 AND source_graph=?2 AND source_fp=?3
+           AND leader_term=?4 AND peer_fp=?5",
+        params![group,graph,source_fp,term,peer_fp],|r|r.get(0)
+    ).optional().map_err(|e|e.to_string())?;
+    if let Some(Some(previous))=previous {
+        let old:ReplicaSnapshot=serde_json::from_str(&previous)
+            .map_err(|e|e.to_string())?;
+        let Some(new)=snapshot else{
+            return Err("Previously observed source checkpoint cannot disappear".into());
+        };
+        if new.term<old.term||new.sequence<old.sequence||
+            (new.sequence==old.sequence&&new.checksum!=old.checksum){
+            return Err("Rollback or conflict in signed recovery witness readback".into());
         }
     }
     let serialized=snapshot.map(serde_json::to_string).transpose()
