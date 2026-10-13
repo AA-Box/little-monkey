@@ -282,6 +282,11 @@ export function dispatchRecipe(policy,domain,recipePath,{run=spawnSync,now=Date.
   const result=run(policy.monkeyBin,['task','run',temporary,'--json'],{
     encoding:'utf8',timeout:policy.timeoutMs,maxBuffer:MAX_REPORT_BYTES,env:process.env});
   if(result.error||result.status!==0)fail('Actual native task failed: '+String(result.error??result.stderr??'').slice(0,250));
+  let outcome;
+  try{outcome=JSON.parse(result.stdout.trim());}
+  catch{fail('Native task returned no parseable durable execution receipt');}
+  if(outcome.status!=='ok'||!RUN.test(outcome.run_id??'')||outcome.iterations_capped===true)
+   fail('Native task did not produce a verified successful execution receipt');
   return {target:active.target,domain,specialist:active.bestSpecialist,
     nativeResult:result.stdout,revision:deployed.revision};
  }finally{rmSync(temporary,{force:true});}
