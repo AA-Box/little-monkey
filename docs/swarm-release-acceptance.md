@@ -765,10 +765,10 @@ doing so could create ambiguous duplicate effects. Inspect the existing
 graph and claim before explicitly arming a new ID. Imported/failed states
 persist across daemon restarts and are operator-visible.
 
-A native two-database test exercises prior A leadership, authenticated
-source checkpoint replication, arming on B, absence of scheduling authority
-before a second election, and automatic registration on B after a newer
-strict-majority term. This is a functional locally simulated takeover test,
+A native three-database test exercises prior A+B majority leadership,
+authenticated source checkpoint replication, arming on B, absence of
+scheduling authority before a second election, and B+C majority takeover
+and automatic DAG registration while A is isolated. This is a functional locally simulated takeover test,
 **not** a substitute for physical partition tests or full distributed
 exactly-once process migration. It only supports read-only re-execution of
 operator-prepared plans; it intentionally refuses unattended edits.
