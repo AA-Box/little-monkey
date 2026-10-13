@@ -51,6 +51,7 @@ mod swarm_transfer;
 mod swarm_workers;
 mod swarm_replication;
 mod swarm_quorum;
+mod swarm_recovery_witness;
 mod swarm_failover;
 pub(crate) mod swarm_cluster;
 pub(crate) mod store;
