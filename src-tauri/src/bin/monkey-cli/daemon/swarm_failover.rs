@@ -248,6 +248,106 @@ pub fn spawn_worker(paths:DaemonPaths){
 mod tests{
     use super::*;
     #[test]
+    fn distinct_daemon_promotes_preapproved_graph_after_higher_term_without_reusing_foreign_jobs(){
+        use super::super::swarm_cluster::{ClusterMember,ClusterRoster,VoteRequest};
+        use super::super::swarm_coordinator::{ResidentSwarmSpec,ResidentSwarmNode};
+        let root=std::env::temp_dir().join(format!("swarm-two-host-handoff-{}",uuid::Uuid::new_v4()));
+        let sender=DaemonPaths::under(&root.join("sender"));
+        let receiver=DaemonPaths::under(&root.join("receiver"));
+        sender.ensure().unwrap();receiver.ensure().unwrap();
+        let workspace_sender=root.join("sender-work");
+        let workspace_receiver=root.join("receiver-work");
+        fs::create_dir_all(&workspace_sender).unwrap();
+        fs::create_dir_all(&workspace_receiver).unwrap();
+        let afp="a".repeat(64);
+        let bfp="b".repeat(64);
+        let a_roster=ClusterRoster{version:1,group:"swarm-team".into(),members:vec![
+            ClusterMember{fingerprint:afp.clone(),device_id:"@local".into(),alias:None},
+            ClusterMember{fingerprint:bfp.clone(),device_id:"signed-b".into(),alias:Some("bob".into())}
+        ]};
+        let b_roster=ClusterRoster{version:1,group:"swarm-team".into(),members:vec![
+            ClusterMember{fingerprint:bfp.clone(),device_id:"@local".into(),alias:None},
+            ClusterMember{fingerprint:afp.clone(),device_id:"signed-a".into(),alias:Some("alice".into())}
+        ]};
+        assert_eq!(a_roster.digest(),b_roster.digest());
+        {
+            let mut a=DaemonStore::open(&sender).unwrap();
+            let mut b=DaemonStore::open(&receiver).unwrap();
+            swarm_cluster::configure(&mut a,&a_roster,1000).unwrap();
+            swarm_cluster::configure(&mut b,&b_roster,1000).unwrap();
+            let term1=VoteRequest{
+                group:"swarm-team".into(),term:1,candidate_fingerprint:afp.clone(),
+                roster_sha256:a_roster.digest()
+            };
+            let voted_a=swarm_cluster::vote(&mut a,&term1,"@local",1000).unwrap();
+            let voted_b=swarm_cluster::vote(&mut b,&term1,"signed-a",1000).unwrap();
+            swarm_cluster::persist_quorum(&a,&term1,&[voted_a,voted_b],1000).unwrap();
+        }
+        let recipe=root.join("sender-recipe.json");
+        fs::write(&recipe,serde_json::json!({
+            "version":1,"name":"safe-plan","target":{"ollama":"qwen2.5:7b"},
+            "workspace":workspace_sender,"permission_mode":"plan",
+            "prompt":"Read-only operator-approved fixture inspection","params":{}
+        }).to_string()).unwrap();
+        let spec=ResidentSwarmSpec{
+            version:1,id:"original".into(),cluster_id:Some("swarm-team".into()),
+            max_parallel:1,nodes:vec![ResidentSwarmNode{
+                id:"audit".into(),recipe:recipe.to_string_lossy().to_string(),
+                fallback_recipe:None,depends_on:Vec::new(),
+                include_dependency_reports:false,max_runtime_seconds:120
+            }]
+        };
+        let spec_file=root.join("original-spec.json");
+        fs::write(&spec_file,serde_json::to_vec(&spec).unwrap()).unwrap();
+        super::super::swarm_coordinator::submit(&sender,&spec_file).unwrap();
+        let transfer=root.join("preapproved-transfer.json");
+        swarm_transfer::export(&sender,"original",&transfer).unwrap();
+        let record=swarm_replication::capture_local_leader(
+            &sender,"swarm-team","original","bob",&bfp,2000
+        ).unwrap();
+        {
+            let mut b=DaemonStore::open(&receiver).unwrap();
+            assert!(swarm_replication::ingest(&mut b,"signed-a",&record,2001).unwrap());
+        }
+        arm(&receiver,"operator-recovery","swarm-team","recovered",&transfer,
+            &workspace_receiver,2100).unwrap();
+        // The receiver cannot schedule prior to its own fresh signed quorum,
+        // even though it has both plan bytes and the previous leader's status.
+        run_once(&receiver,2200).unwrap();
+        assert_eq!(status(&receiver).unwrap()["plans"][0]["state"],"armed");
+        {
+            let mut a=DaemonStore::open(&sender).unwrap();
+            let mut b=DaemonStore::open(&receiver).unwrap();
+            let term2=VoteRequest{
+                group:"swarm-team".into(),term:2,
+                candidate_fingerprint:bfp.clone(),roster_sha256:b_roster.digest()
+            };
+            let vote_b=swarm_cluster::vote(&mut b,&term2,"@local",30_000).unwrap();
+            let vote_a=swarm_cluster::vote(&mut a,&term2,"signed-b",30_000).unwrap();
+            swarm_cluster::persist_quorum(&b,&term2,&[vote_b,vote_a],30_000).unwrap();
+            assert!(!swarm_cluster::may_schedule(&a,"swarm-team",30_001).unwrap());
+            assert!(swarm_cluster::may_schedule(&b,"swarm-team",30_001).unwrap());
+        }
+        run_once(&receiver,30_001).unwrap();
+        assert_eq!(status(&receiver).unwrap()["plans"][0]["state"],"imported");
+        let graph=super::super::swarm_coordinator::status(&receiver,Some("recovered")).unwrap();
+        assert_eq!(graph["graphs"][0]["tasks"][0]["state"],"pending");
+        assert!(graph["graphs"][0]["tasks"][0]["job_id"].is_null(),
+            "foreign model successes and job identities cannot be transferred");
+        run_once(&receiver,30_002).unwrap();
+        assert_eq!(super::super::swarm_coordinator::status(&receiver,Some("recovered"))
+            .unwrap()["graphs"].as_array().unwrap().len(),1);
+        let reloaded=DaemonStore::open(&receiver).unwrap();
+        let count:i64=reloaded.connection.query_row(
+            "SELECT COUNT(*) FROM resident_swarm_failover_plans
+             WHERE state='imported'",[],|r|r.get(0)
+        ).unwrap();
+        assert_eq!(count,1,"operator consent and durable one-shot claim survive reopen");
+        drop(reloaded);
+        let _=fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rejects_unapproved_or_malformed_read_only_bundle_and_ids(){
         let root=std::env::temp_dir().join(format!("failover-{}",uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
