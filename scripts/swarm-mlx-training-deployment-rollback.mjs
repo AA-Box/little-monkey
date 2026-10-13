@@ -8,7 +8,7 @@ import {spawn} from 'node:child_process';
 import {createServer,connect} from 'node:net';
 import {mkdtempSync,openSync,closeSync,existsSync,writeFileSync,rmSync,realpathSync} from 'node:fs';
 import {tmpdir} from 'node:os';
-import {dirname,join,isAbsolute} from 'node:path';
+import {dirname,join,isAbsolute,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {randomUUID} from 'node:crypto';
 import {checkedLocalDir,safeRegularBytes,digest,fusedWeightsManifest,trainingPlan} from './swarm-mlx-lora.mjs';
@@ -231,6 +231,6 @@ async function main(){
   if(receipt.status==='verified_native_service_lifecycle')rmSync(logs,{recursive:true,force:true});
  }
 }
-if(process.argv[1]&&fileURLToPath(import.meta.url)===process.argv[1]){
+if(process.argv[1]&&fileURLToPath(import.meta.url)===resolve(process.argv[1])){
  main().catch(error=>{console.error(JSON.stringify({status:'not_verified',error:String(error).slice(0,400)}));process.exitCode=1;});
 }
