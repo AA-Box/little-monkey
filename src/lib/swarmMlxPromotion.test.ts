@@ -43,7 +43,7 @@ describe('verified MLX promotion and automatic live rollback',()=>{
    active=m as typeof candidate;running=m.path;
   });
   runtime.probe=vi.fn(async()=>{throw Error('Model timeout');});
-  await expect(promoteVerifiedMlxFusion(candidate,runtime,storage)).rejects.toThrow(/routing is blocked/);
+  await expect(promoteVerifiedMlxFusion(candidate,runtime,storage)).rejects.toThrow(/execution is blocked/);
   expect(pendingMlxPromotion(storage)?.previousPath).toBe('/models/old');
   expect(await recoverInterruptedMlxPromotion(runtime,storage)).toBe(true);
   expect(active).toBe(prev);expect(pendingMlxPromotion(storage)).toBeNull();
@@ -57,6 +57,6 @@ describe('verified MLX promotion and automatic live rollback',()=>{
  it('refuses corrupted crash journal and keeps execution blocked',async()=>{
   map.set(MLX_PROMOTION_JOURNAL,'{');
   expect(()=>pendingMlxPromotion(storage)).toThrow(/execution is blocked/);
-  await expect(promoteVerifiedMlxFusion(candidate,runtime,storage)).rejects.toThrow(/routing is blocked/);
+  await expect(promoteVerifiedMlxFusion(candidate,runtime,storage)).rejects.toThrow(/execution is blocked/);
  });
 });

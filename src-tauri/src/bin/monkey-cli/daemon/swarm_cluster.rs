@@ -229,8 +229,9 @@ pub fn all_groups(store:&DaemonStore)->Result<Vec<String>,String>{
     schema(store)?;
     let mut st=store.connection.prepare("SELECT group_id FROM swarm_cluster_rosters LIMIT 16")
         .map_err(|e|e.to_string())?;
-    st.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?
-        .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
+    let groups=st.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?
+        .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    Ok(groups)
 }
 pub async fn campaign(paths:&DaemonPaths,group:&str,term:u64,now:i64)
     ->Result<serde_json::Value,String>{
