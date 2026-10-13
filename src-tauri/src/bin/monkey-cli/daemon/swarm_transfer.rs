@@ -73,8 +73,11 @@ fn read_frozen_recipe(path: &str) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
     let parsed: little_monkey_lib::recipes::Recipe =
         serde_json::from_slice(&bytes).map_err(|e|format!("Invalid frozen recipe: {e}"))?;
-    if parsed.permission_mode != "plan" {
-        return Err("Only plan-mode, read-only recipes may leave a host".into());
+    if parsed.permission_mode != "plan" ||
+        parsed.channel_send.is_some() || parsed.desktop_turn.is_some() ||
+        parsed.placed_run.is_some() || parsed.autonomous_task.is_some() ||
+        parsed.params.values().any(Option::is_none) {
+        return Err("Portable failover permits only fully parameterized plan-mode recipes without messaging, placement or autonomous grants".into());
     }
     String::from_utf8(bytes).map_err(|e|e.to_string())
 }
@@ -227,8 +230,11 @@ pub fn inspect_read_only_bundle(input:&Path)->Result<(String,Option<String>),Str
 fn relocated_recipe(raw: &str, workspace: &Path) -> Result<Vec<u8>, String> {
     let mut recipe: little_monkey_lib::recipes::Recipe =
         serde_json::from_str(raw).map_err(|e|format!("Invalid embedded recipe: {e}"))?;
-    if recipe.permission_mode!="plan" {
-        return Err("Transferred recipe is not read-only plan mode".into());
+    if recipe.permission_mode!="plan" || recipe.channel_send.is_some() ||
+        recipe.desktop_turn.is_some() || recipe.placed_run.is_some() ||
+        recipe.autonomous_task.is_some() ||
+        recipe.params.values().any(Option::is_none) {
+        return Err("Imported failover recipe has an unreviewed execution or communication grant".into());
     }
     recipe.workspace=Some(workspace.to_string_lossy().to_string());
     serde_json::to_vec_pretty(&recipe).map_err(|e|e.to_string())
