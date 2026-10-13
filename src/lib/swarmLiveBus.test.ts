@@ -53,6 +53,18 @@ describe('live native workflow mailbox', () => {
     expect(bus.receive('b')).toHaveLength(6);
   });
 
+  it('preserves a file-staleness alert even when direct-message queue is full', () => {
+    const bus = new LiveSwarmBus(['reader', 'writer']);
+    bus.observeRead('reader', 'auth.ts');
+    for (let i = 0; i < 24; i++) bus.send('writer', 'reader', 'notice ' + i);
+    expect(bus.observeMutation('writer', 'auth.ts')).toBe(1);
+    expect(bus.statistics()).toMatchObject({ displacedForFileChange: 1, fileNotifications: 1, pending: 24 });
+    const first = bus.receive('reader');
+    expect(first.some(message => message.text === 'notice 0')).toBe(false);
+    const rest = [...first, ...bus.receive('reader'), ...bus.receive('reader'), ...bus.receive('reader')];
+    expect(rest.some(message => message.kind === 'file_changed')).toBe(true);
+  });
+
   it('never claims delivery to a completed worker', () => {
     const bus = new LiveSwarmBus(['a', 'b', 'c']);
     bus.observeRead('b', 'src/auth.ts');
