@@ -34,6 +34,7 @@ export class LiveSwarmBus {
   private sequence = 0;
   private directDeliveries = 0;
   private fileNotifications = 0;
+  private displacedForFileChange = 0;
   private received = 0;
   private closed = false;
 
@@ -117,13 +118,16 @@ export class LiveSwarmBus {
     if (!key || key.length > 1024) return 0;
     const affected = [...this.participants].filter(id =>
       id !== sender && !this.finished.has(id) && this.reads.get(id)!.has(key));
-    if (affected.some(id => this.queues.get(id)!.length >= MAX_QUEUE)) {
-      // A notification failure is observable to the mutating agent; the file
-      // change has already happened and MUST NOT be misreported as rolled back.
-      throw new Error('File changed, but a dependent agent mailbox is full.');
-    }
     for (const id of affected) {
-      this.queues.get(id)!.push({
+      const queue = this.queues.get(id)!;
+      if (queue.length >= MAX_QUEUE) {
+        // Keep safety-relevant staleness alerts even under a chatty swarm:
+        // displace an older coordination message first, recording the loss.
+        const oldestDirect = queue.findIndex(message => message.kind === 'direct');
+        queue.splice(oldestDirect >= 0 ? oldestDirect : 0, 1);
+        this.displacedForFileChange++;
+      }
+      queue.push({
         sequence: ++this.sequence, sender, recipient: id, kind: 'file_changed',
         text: 'File changed after your read: ' + key + '. Re-read it before editing or relying on previous content.',
       });
@@ -132,10 +136,11 @@ export class LiveSwarmBus {
     return affected.length;
   }
 
-  statistics(): Readonly<{ directDeliveries: number; fileNotifications: number; received: number; pending: number }> {
+  statistics(): Readonly<{ directDeliveries: number; fileNotifications: number; displacedForFileChange: number; received: number; pending: number }> {
     return {
       directDeliveries: this.directDeliveries,
       fileNotifications: this.fileNotifications,
+      displacedForFileChange: this.displacedForFileChange,
       received: this.received,
       pending: [...this.queues.values()].reduce((total, queue) => total + queue.length, 0),
     };
