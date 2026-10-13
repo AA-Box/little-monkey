@@ -49,6 +49,7 @@ mod service;
 mod swarm_coordinator;
 mod swarm_transfer;
 mod swarm_workers;
+mod swarm_replication;
 pub(crate) mod swarm_cluster;
 pub(crate) mod store;
 pub(crate) mod telecom_store;
