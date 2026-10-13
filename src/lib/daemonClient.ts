@@ -205,6 +205,9 @@ export interface DaemonSwarmReplica {
   version:number;group:string;graph_id:string;source_fingerprint:string;
   roster_sha256:string;sequence:number;term:number;captured_at_ms:number;
   graph_state:string;nodes:{id:string;state:string;job_id:string|null}[];
+  /** v2: real source-host redacted SQLite DAG transitions, transported by the
+   * existing signed pinned-TLS peer checkpoint and verified on readback. */
+  trace_events?:{sequence:number;node_id:string|null;kind:string;state:string;occurred_at_ms:number}[];
   checksum:string;
 }
 export const daemonSwarmReplicaStatus = (group:string,id:string) =>
