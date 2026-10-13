@@ -133,11 +133,11 @@ fn pending(store:&DaemonStore)->Result<Vec<ArmedPlan>,String>{
          FROM resident_swarm_failover_plans
          WHERE state='armed' ORDER BY created_at_ms LIMIT 8"
     ).map_err(|e|e.to_string())?;
-    stmt.query_map([],|r|Ok(ArmedPlan{
+    let rows=stmt.query_map([],|r|Ok(ArmedPlan{
         id:r.get(0)?,group:r.get(1)?,source_graph:r.get(2)?,
         new_graph:r.get(3)?,path:r.get(4)?,hash:r.get(5)?,workspace:r.get(6)?,
-    })).map_err(|e|e.to_string())?
-       .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
+    })).map_err(|e|e.to_string())?;
+    rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
 }
 fn eligible(store:&DaemonStore,plan:&ArmedPlan,now:i64)->Result<bool,String>{
     if store.kill_switch()?||
