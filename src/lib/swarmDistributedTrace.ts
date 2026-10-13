@@ -19,6 +19,7 @@ export interface DistributedTraceEvent {
 export interface DistributedTraceMeteredUsage {
   sourceFingerprint:string;
   node:string;
+  status:'succeeded'|'failed';
   targetId:string;
   inputTokens:number;
   outputTokens:number;
@@ -112,7 +113,8 @@ export function composeDistributedSwarmTrace(
        usage.some(row=>{
         if(!row||typeof row.node_id!=='string'||!TOKEN.test(row.node_id)||
           usageNodes.has(row.node_id)||!peer.nodes.some(node=>
-            node.id===row.node_id && node.state==='succeeded')||
+            node.id===row.node_id && node.state===row.status)||
+          (row.status!=='succeeded'&&row.status!=='failed')||
           typeof row.target_id!=='string'||
           !/^[A-Za-z0-9][A-Za-z0-9_./:@+%-]{0,159}$/.test(row.target_id)||
           !Number.isSafeInteger(row.elapsed_ms)||row.elapsed_ms<0||row.elapsed_ms>86_400_000||
@@ -130,7 +132,7 @@ export function composeDistributedSwarmTrace(
     seen.add(peer.source_fingerprint);
     for(const row of usage){
       meteredUsage.push({
-        sourceFingerprint:peer.source_fingerprint,node:row.node_id,targetId:row.target_id,
+        sourceFingerprint:peer.source_fingerprint,node:row.node_id,status:row.status,targetId:row.target_id,
         inputTokens:row.input_tokens,outputTokens:row.output_tokens,
         cachedInputTokens:row.cached_input_tokens,modelCalls:row.model_calls,
         elapsedMs:row.elapsed_ms,meteredCostMicros:row.cost_micros,
