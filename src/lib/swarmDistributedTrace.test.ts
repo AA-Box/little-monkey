@@ -61,6 +61,31 @@ describe('unified durable/swarm peer trace',()=>{
   expect(result.events.find(x=>x.source==='signed-peer-observation' && x.node==='audit'))
    .toMatchObject({kind:'node_transition',occurredAt:NOW-4000,sequence:23,verifiedExecution:false});
  });
+ it('accepts only valid source-run metering in authenticated v3 peer checkpoints',()=>{
+  const usage={node_id:'audit',target_id:'provider:qualified-model',
+    elapsed_ms:2500,input_tokens:100,output_tokens:50,cached_input_tokens:20,
+    model_calls:2,cost_micros:15};
+  const v3={...peer,version:3,model_usage:[usage]};
+  const result=composeDistributedSwarmTrace(graph,[v3],NOW);
+  expect(result.meteredPeerRuns).toBe(1);
+  expect(result.meteredUsage[0]).toMatchObject({
+    targetId:'provider:qualified-model',inputTokens:100,outputTokens:50,
+    meteredCostMicros:15,providerBilled:false,independentlyQualityVerified:false,
+  });
+  for(const wrong of [
+    {...usage,node_id:'unrelated'},
+    {...usage,model_calls:0},
+    {...usage,input_tokens:-1},
+    {...usage,cached_input_tokens:101},
+    {...usage,cost_micros:-1},
+    {...usage,target_id:'host/private secret'},
+  ]) {
+    expect(composeDistributedSwarmTrace(graph,[{...v3,model_usage:[wrong]}],NOW)
+      .invalidPeerRecords).toBe(1);
+  }
+  expect(composeDistributedSwarmTrace(graph,[{...peer,model_usage:[usage]}],NOW)
+    .invalidPeerRecords).toBe(1);
+ });
  it('fails closed on malformed remote journal, regressions, unrelated node and invalid checksum',()=>{
   const first={sequence:12,node_id:'audit',kind:'node_transition',state:'submitted',occurred_at_ms:NOW-3000};
   for(const trace_events of [
