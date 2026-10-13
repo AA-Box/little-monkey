@@ -29,6 +29,7 @@ export class LiveSwarmBus {
   private readonly participants: Set<string>;
   private readonly queues = new Map<string, LiveSwarmMessage[]>();
   private readonly reads = new Map<string, Set<string>>();
+  private readonly finished = new Set<string>();
   private sequence = 0;
   private closed = false;
 
@@ -55,9 +56,10 @@ export class LiveSwarmBus {
       throw new Error('Swarm message must contain 1–1200 characters.');
     }
     const recipients = recipient === '*'
-      ? [...this.participants].filter(id => id !== sender)
+      ? [...this.participants].filter(id => id !== sender && !this.finished.has(id))
       : [recipient];
-    if (!recipients.length || recipients.some(id => id === sender || !this.participants.has(id))) {
+    if (!recipients.length || recipients.some(id =>
+      id === sender || !this.participants.has(id) || this.finished.has(id))) {
       throw new Error('Recipient must be another agent in this workflow, or * to broadcast.');
     }
     // Reject atomically. A full mailbox must never silently lose evidence.
@@ -75,7 +77,7 @@ export class LiveSwarmBus {
 
   listMembers(id: string): string[] {
     this.requireAgent(id);
-    return [...this.participants].filter(other => other !== id);
+    return [...this.participants].filter(other => other !== id && !this.finished.has(other));
   }
 
   receive(id: string): LiveSwarmMessage[] {
@@ -99,7 +101,7 @@ export class LiveSwarmBus {
     const key = normalizedPath(path);
     if (!key || key.length > 1024) return 0;
     const affected = [...this.participants].filter(id =>
-      id !== sender && this.reads.get(id)!.has(key));
+      id !== sender && !this.finished.has(id) && this.reads.get(id)!.has(key));
     if (affected.some(id => this.queues.get(id)!.length >= MAX_QUEUE)) {
       // A notification failure is observable to the mutating agent; the file
       // change has already happened and MUST NOT be misreported as rolled back.
@@ -123,10 +125,20 @@ export class LiveSwarmBus {
       : '';
   }
 
+  /** A completed worker cannot receive more instructions. Sends to it fail
+   * instead of claiming delivery that no model will ever observe. */
+  finishAgent(id: string): void {
+    this.requireAgent(id);
+    this.finished.add(id);
+    this.queues.get(id)!.length = 0;
+    this.reads.get(id)!.clear();
+  }
+
   close(): void {
     this.closed = true;
     this.queues.clear();
     this.reads.clear();
+    this.finished.clear();
     this.participants.clear();
   }
 }
