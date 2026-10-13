@@ -323,20 +323,28 @@ export async function serve(policy){
   if(previous?.batch)await fusedAcceptance(policy,candidateReceipt(policy,previous.batch),null);
   try{publish(await switchModel(previous?.modelPath??policy.training.model),previous);}
   catch(e){
-   if(!previous||previous.modelPath===policy.training.model)throw e;
-   console.error('MLX recovery failed; regrading base model:',String(e));
-   publish(await switchModel(policy.training.model),null);
+   console.error('Initial MLX model has not passed native independent grading:',String(e));
+   if(previous?.modelPath&&previous.modelPath!==policy.training.model){
+    try{publish(await switchModel(policy.training.model),null);}
+    catch(fallback){console.error('Baseline is also unverified; learning continues without any serving authority:',String(fallback));}
+   }
+   // No passing model is allowed to serve; approved future training batches
+   // can still produce a candidate that passes and establishes first deployment.
   }
   while(!stopping){
-   try{await probe(policy.backendPort);
-    probeState.active=true;
-    state.scores=await independentOracle(policy);
-   }catch(e){
-    state.active=false;state.generation++;
-    if(state.model===policy.training.model)throw e;
-    console.error('MLX model regressed; independently regrading base rollback:',String(e));
-    publish(await switchModel(policy.training.model),null);
-   }finally{probeState.active=false;probeState.generation++;}
+   if(state.active){
+    try{await probe(policy.backendPort);
+     probeState.active=true;
+     state.scores=await independentOracle(policy);
+    }catch(e){
+     state.active=false;state.generation++;
+     console.error('Active MLX model regressed; suspending serving:',String(e));
+     if(state.model!==policy.training.model){
+      try{publish(await switchModel(policy.training.model),null);}
+      catch(fallback){console.error('Base fallback also unverified; learning continues without deployment:',String(fallback));}
+     }
+    }finally{probeState.active=false;probeState.generation++;}
+   }
    try{
     await execute(process.execPath,[join(ROOT,'swarm-mlx-auto-learning.mjs'),
      '--policy',policy.trainingPolicy,'--confirm-auto-training','--once'],{
@@ -363,7 +371,15 @@ export async function serve(policy){
      }catch(e){
       // Recover the exact preceding model and verified receipt identity,
       // never relabel a previously fused model as an untrained base model.
-      publish(await switchModel(oldPath),oldMetadata);
+      if(oldPath){
+       try{publish(await switchModel(oldPath),oldMetadata);}
+       catch(recovery){
+        state.active=false;state.model=null;state.scores=null;state.metadata=null;
+        console.error('Prior model recovery failed; route remains closed:',String(recovery));
+       }
+      }else{
+       state.active=false;state.model=null;state.scores=null;state.metadata=null;
+      }
       throw e;
      }
     }catch(e){console.error('Candidate rejected; last passing model retained:',batch,String(e));}
