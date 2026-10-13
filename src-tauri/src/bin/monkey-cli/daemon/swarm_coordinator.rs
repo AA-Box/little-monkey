@@ -454,7 +454,7 @@ fn fallback_allowed(node: &ResidentSwarmNode, status: &str, outcome: JobState) -
         node.fallback_recipe.is_some()
 }
 
-fn stable_job_id(graph: &str, task: &str) -> String {
+pub(super) fn stable_job_id(graph: &str, task: &str) -> String {
     format!("job-{}", &super::sha256_hex(format!("resident-swarm:{graph}:{task}").as_bytes())[..32])
 }
 
