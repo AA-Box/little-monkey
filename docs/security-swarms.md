@@ -83,3 +83,26 @@ Run:
 pnpm test -- src/lib/swarmPresets.test.ts src/lib/workflow.test.ts
 pnpm typecheck
 ```
+
+## Real model-driven repository repair acceptance
+
+The operator-only `swarm-live-acceptance.yml` runs a disposable local Git
+repository through the installed Little Monkey daemon when `repair_target`
+is set. Set `repair_review_target` to a **different** installed Ollama model.
+Three durable jobs perform model-driven source audit, per-tool human-approved
+repair, and a read-only second-model review. The second reviewer is not given
+prior model reports. All runtime permissions remain those already granted by
+the operator.
+
+An external Node/Git oracle then checks the original baseline commit,
+unmodified committed tests, exactly one unstaged source edit and the *exact*
+minimal authorization fix **before executing any model-modified source**.
+It runs the existing regression and 256 fresh-identity holdout checks and
+outputs SHA-256 evidence and both model identities. Other source changes,
+missing approval, failed graph jobs or regression failures cannot pass.
+
+This is acceptance for one deliberately seeded authorization bug, not a
+general security certificate. A CI `--self-check` does not execute a model;
+only a completed operator-hosted real-model run can demonstrate that the
+swarm itself performed the repair. Retain and inspect the daemon model
+ledger and tool-approval audit trail.

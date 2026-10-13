@@ -92,6 +92,11 @@ static COMPONENT_COMPILATION_GATE: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 const MAX_CACHED_COMPONENTS: usize = 16;
 
+// Extension guest logs are persisted and surfaced in the UI. Keep secret-bearing
+// data out of both successful guest messages and failure diagnostics.
+static EXTENSION_LOG_REDACTOR: LazyLock<crate::runtime_telemetry::Redactor> =
+    LazyLock::new(crate::runtime_telemetry::Redactor::new);
+
 #[derive(Clone)]
 struct ActiveInvocation {
     store_root: PathBuf,
@@ -2464,11 +2469,24 @@ fn validate_persisted_grants(
     Ok(())
 }
 
+fn safe_extension_log_message(message: &str, host_secrets: &[String]) -> String {
+    // Scan the complete input before truncation, so an API key straddling the
+    // maximum-length boundary cannot leave a visible prefix in the log.
+    let mut scrubbed = message.to_string();
+    for secret in host_secrets {
+        if !secret.is_empty() {
+            scrubbed = scrubbed.replace(secret, "[REDACTED_SECRET]");
+        }
+    }
+    let redacted = EXTENSION_LOG_REDACTOR.redact(&scrubbed).0;
+    bounded(&redacted, MAX_LOG_MESSAGE_BYTES)
+}
+
 fn push_log(record: &mut InstalledRecord, level: &str, message: &str, invocation_id: Option<&str>) {
     record.logs.push(ExtensionLogRow {
         at_ms: now_ms(),
         level: bounded(level, 16),
-        message: bounded(message, MAX_LOG_MESSAGE_BYTES),
+        message: safe_extension_log_message(message, &[]),
         invocation_id: invocation_id.map(|value| bounded(value, 160)),
     });
     if record.logs.len() > MAX_LOG_ROWS {
@@ -2549,6 +2567,9 @@ struct RuntimeHost {
     grants: Vec<PermissionGrant>,
     config: BTreeMap<String, serde_json::Value>,
     configured_secret_slots: BTreeSet<String>,
+    // Exact credential bytes are retained only until the invocation finishes,
+    // to prevent echoed response data from exposing brokered secrets in logs.
+    protected_secret_values: Vec<String>,
     input_artifact_ids: BTreeSet<String>,
     /// Every artifact this invocation actually wrote, in the host's own
     /// tally. A guest that names an artifact id in its output has proved
@@ -2690,7 +2711,7 @@ impl RuntimeHost {
         self.logs.push(ExtensionLogRow {
             at_ms: now_ms(),
             level: bounded(level, 16),
-            message: bounded(message, MAX_LOG_MESSAGE_BYTES),
+            message: safe_extension_log_message(message, &self.protected_secret_values),
             invocation_id: Some(self.invocation_id.clone()),
         });
     }
@@ -2865,6 +2886,9 @@ impl bindings::little_monkey::extension::host::Host for RuntimeHost {
             })?;
             let scheme = slot.auth_scheme.as_deref().unwrap_or_default();
             let secret = read_secret(&self.extension_id, &slot_id)?;
+            if !secret.is_empty() && !self.protected_secret_values.contains(&secret) {
+                self.protected_secret_values.push(secret.clone());
+            }
             let value = if scheme.is_empty() {
                 secret
             } else {
@@ -2880,7 +2904,10 @@ impl bindings::little_monkey::extension::host::Host for RuntimeHost {
                 return Err(CANCELLED_ERROR.to_string());
             }
             response = crate::egress::send(builder) => response
-                .map_err(|error| format!("Brokered HTTP request failed: {error}"))?,
+                // Third-party errors can include request metadata. The builder
+                // contains host-managed credentials; never forward Debug/Display
+                // from this failure into the guest or the persistent log.
+                .map_err(|_| "Brokered HTTP request failed".to_string())?,
         };
         if canonical_origin(response.url())? != origin {
             return Err("HTTP redirect left the exact granted origin".to_string());
@@ -2913,7 +2940,7 @@ impl bindings::little_monkey::extension::host::Host for RuntimeHost {
             let Some(chunk) = chunk else {
                 break;
             };
-            let chunk = chunk.map_err(|error| format!("HTTP response failed: {error}"))?;
+            let chunk = chunk.map_err(|_| "HTTP response failed".to_string())?;
             if body.len().saturating_add(chunk.len()) > MAX_HTTP_BODY_BYTES {
                 return Err("HTTP response exceeds 4 MiB".to_string());
             }
@@ -3539,6 +3566,13 @@ impl ExtensionManager {
                         Ok(result)
                     }
                     Err(error) => {
+                        // A guest trap may quote an HTTP response it previously
+                        // received. Do not persist the raw trap, return it to the
+                        // UI, or store it in the durable invocation receipt.
+                        let error = safe_extension_log_message(
+                            &error,
+                            &execution.host.protected_secret_values,
+                        );
                         record_invocation_failure(record, &error, &invocation_id);
                         if record.health.state == HealthState::ProtectiveDisabled {
                             atomic_write(
@@ -3623,6 +3657,7 @@ impl ExtensionManager {
             grants,
             config,
             configured_secret_slots,
+            protected_secret_values: Vec::new(),
             input_artifact_ids,
             written_artifact_ids: BTreeSet::new(),
             artifact_store,
@@ -4406,7 +4441,7 @@ fn record_invocation_failure(record: &mut InstalledRecord, error: &str, invocati
     {
         record.health.trap_count = record.health.trap_count.saturating_add(1);
     }
-    record.health.last_error = Some(bounded(error, MAX_LOG_MESSAGE_BYTES));
+    record.health.last_error = Some(safe_extension_log_message(error, &[]));
     if record.health.consecutive_failures >= PROTECTIVE_DISABLE_FAILURES {
         record.health.state = HealthState::ProtectiveDisabled;
         record.health.enabled = false;
@@ -6080,6 +6115,45 @@ pub(crate) mod test_fixtures {
 mod tests {
     use super::test_fixtures::*;
     use super::*;
+
+    #[test]
+    fn extension_logs_redact_actual_broker_credentials_before_persistence() {
+        let exact_secret = "opaque-broker-value-not-recognizable-by-a-pattern";
+        let safe = safe_extension_log_message(
+            &format!("remote response echoed {exact_secret}; status 200"),
+            &[exact_secret.to_string()],
+        );
+        assert_eq!(safe, "remote response echoed [REDACTED_SECRET]; status 200");
+        assert!(!safe.contains(exact_secret));
+    }
+
+    #[test]
+    fn extension_logs_redact_credential_shaped_messages_without_host_secrets() {
+        let safe = safe_extension_log_message("request --api-key=secret-test-value failed", &[]);
+        assert!(!safe.contains("secret-test-value"));
+        // The shared scanner may detect the credential before its CLI flag
+        // fallback does; both intentionally emit a [REDACTED...] marker.
+        assert!(safe.contains("[REDACTED"), "credential must be masked");
+        assert_eq!(safe_extension_log_message("extension ready", &[]), "extension ready");
+    }
+
+    #[test]
+    fn extension_logs_redact_multiline_secret_messages() {
+        let secret = "broker-known-token";
+        let original = format!("request failed\nAuthorization: Bearer {secret}\n");
+        let persisted = safe_extension_log_message(&original, &[secret.to_string()]);
+        assert!(!persisted.contains(secret));
+        assert!(persisted.contains("[REDACTED_SECRET]"));
+    }
+
+    #[test]
+    fn extension_logs_scan_before_truncating() {
+        let exact_secret = "broker-credential-crosses-the-log-boundary";
+        let message = format!("{}{}", "x".repeat(MAX_LOG_MESSAGE_BYTES - 8), exact_secret);
+        let safe = safe_extension_log_message(&message, &[exact_secret.to_string()]);
+        assert!(!safe.contains(exact_secret));
+        assert!(safe.len() <= MAX_LOG_MESSAGE_BYTES + "…".len());
+    }
 
     struct TestRoot(PathBuf);
 
