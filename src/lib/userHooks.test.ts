@@ -53,6 +53,14 @@ describe("real Ruflo-compatible extended hook execution",()=>{
   expect(toolLifecyclePair("write_file")).toEqual({pre:"PreEdit",post:"PostEdit"});
   expect(toolLifecyclePair("read_file")).toBeNull();
  });
+ it("blocks a task before creating a subagent when operator PreTask explicitly denies",async()=>{
+  useUserHooksStore.setState({hooks:[hook({event:"PreTask",command:"task-gate.sh"})]});
+  invokeMock.mockResolvedValue(outcome({exit_code:1,stderr:'task denied'}));
+  const denial=await evaluatePreActionHooks("PreTask","task",{profile:"code"},"s");
+  expect(denial).toEqual({reason:'task denied'});
+  const payload=JSON.parse((invokeMock.mock.calls[0][1] as {payload:string}).payload);
+  expect(payload).toMatchObject({event:"PreTask",tool_name:"task",args:{profile:"code"}});
+ });
  it("uses native host and honors PreCommand denial",async()=>{
   useUserHooksStore.setState({hooks:[hook({event:"PreCommand",command:"check-command.sh"})]});
   invokeMock.mockResolvedValue(outcome({exit_code:0,stdout:'{"decision":"deny","reason":"unsafe command"}'}));
@@ -62,19 +70,19 @@ describe("real Ruflo-compatible extended hook execution",()=>{
  });
  it("runs observable task, command, edit and session end lifecycle hooks",async()=>{
   useUserHooksStore.setState({hooks:[
-    hook({event:"PreTask",command:"pre-task.sh"}),
+    hook({event:"PostTask",command:"post-task.sh"}),
     hook({event:"PostCommand",command:"post-cmd.sh"}),
     hook({event:"PostEdit",command:"post-edit.sh"}),
     hook({event:"SessionEnd",command:"close-session.sh"}),
   ]});
   invokeMock.mockResolvedValue(outcome());
-  fireObservedHooks("PreTask",{session_id:"s",tool_name:"task"});
+  fireObservedHooks("PostTask",{session_id:"s",tool_name:"task",result:"task finished"});
   fireObservedHooks("PostCommand",{session_id:"s",tool_name:"run_shell",result:"ok"});
   fireObservedHooks("PostEdit",{session_id:"s",tool_name:"write_file",result:"ok"});
   fireObservedHooks("SessionEnd",{session_id:"s"});
   await vi.waitFor(()=>expect(invokeMock).toHaveBeenCalledTimes(4));
   const events=invokeMock.mock.calls.map(c=>JSON.parse((c[1] as {payload:string}).payload).event);
-  expect(events).toEqual(["PreTask","PostCommand","PostEdit","SessionEnd"]);
+  expect(events).toEqual(["PostTask","PostCommand","PostEdit","SessionEnd"]);
  });
 });
 

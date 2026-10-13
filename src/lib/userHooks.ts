@@ -88,7 +88,7 @@ function stdoutDenial(stdout: string): string | null {
  * first denial — or `null` when every hook allowed (or failed to answer; see
  * the module doc comment for why an unanswering hook proceeds).
  */
-export type PreHookEvent = 'PreToolUse'|'PreCommand'|'PreEdit';
+export type PreHookEvent = 'PreToolUse'|'PreCommand'|'PreEdit'|'PreTask';
 /** Execute one explicitly configured pre-operation hook family in order,
  * honoring its deny verdict before any tool execution. */
 export async function evaluatePreActionHooks(
@@ -137,7 +137,7 @@ export function toolLifecyclePair(name:string):
 /** Fires every matching hook for an observe-only event (PostToolUse,
  * SessionStart) and never blocks on, or surfaces, anything they do — errors
  * are console noise by design. */
-export function fireObservedHooks(event: 'PostToolUse' | 'SessionStart' | 'SessionEnd' | 'PreTask' | 'PostTask' | 'PostCommand' | 'PostEdit',
+export function fireObservedHooks(event: 'PostToolUse' | 'SessionStart' | 'SessionEnd' | 'PostTask' | 'PostCommand' | 'PostEdit',
   payload: Omit<HookPayload, 'event'> = {}): void {
   for (const hook of hooksForEvent(event, payload.tool_name)) {
     void execHook(hook, { event, ...payload }).catch((err) => {

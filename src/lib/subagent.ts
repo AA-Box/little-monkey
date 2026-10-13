@@ -1,4 +1,4 @@
-import { fireObservedHooks } from './userHooks';
+import { evaluatePreActionHooks, fireObservedHooks } from './userHooks';
 /**
  * The subagent child loop — `runSubagentTask` is what `turnEngine.ts`'s
  * `executeToolCall` delegates a model-requested `task` tool call to (see
@@ -450,11 +450,24 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
   // Ruflo-compatible task lifecycle hooks observe real child execution. The
   // model cannot use their output as tool grants or amend native policy.
   const args={task_id:params.taskId,description:params.description,profile:params.profile};
-  fireObservedHooks('PreTask',{tool_name:'task',args,session_id:params.sessionId});
+  // PreTask invokes the existing operator-configured native shell hook and
+  // can explicitly DENY before a model, isolated worktree or peer is started.
+  // No model-provided command string is executed as a hook.
+  let report:string|undefined;
   try{
-    return await runSubagentTaskBody(params);
-  } finally {
-    fireObservedHooks('PostTask',{tool_name:'task',args,session_id:params.sessionId});
+    const denial=await evaluatePreActionHooks('PreTask','task',args,params.sessionId);
+    if(denial){
+      report=stringifyToolError(new Error('Blocked by a PreTask hook: '+denial.reason));
+      return report;
+    }
+    report=await runSubagentTaskBody(params);
+    return report;
+  }catch(error){
+    report=stringifyToolError(error);
+    return report;
+  }finally{
+    fireObservedHooks('PostTask',{tool_name:'task',args,session_id:params.sessionId,
+      result:(report??'No result').slice(0,8_000)});
   }
 }
 async function runSubagentTaskBody(params: RunSubagentTaskParams): Promise<string> {
