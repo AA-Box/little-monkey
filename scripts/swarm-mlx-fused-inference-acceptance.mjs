@@ -9,7 +9,7 @@
  */
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
-import {createReadStream,existsSync,lstatSync,readFileSync,realpathSync} from 'node:fs';
+import {constants,openSync,closeSync,fstatSync,readSync,lstatSync,realpathSync} from 'node:fs';
 import {resolve,isAbsolute,join} from 'node:path';
 const opt=k=>{const i=process.argv.indexOf(k);return i<0?null:process.argv[i+1]??null;};
 const token=/^[0-9a-f]{64}$/;
@@ -25,13 +25,52 @@ const inspect=path=>{
     throw Error('MLX acceptance rejects symbolic links and special files');
   return realpathSync(path);
 };
+/** The same open, nofollow descriptor is used for file validation and every
+ * byte read. A path swap between checking and hashing cannot redirect the
+ * receipt or fused weights to different contents. Read bounded chunks, never
+ * an unbounded re-open of a file validated by pathname. */
+function withVerifiedFile(path,max,label,reader){
+  if(typeof constants.O_NOFOLLOW!=='number')
+    throw Error('Platform cannot guarantee no-follow '+label+' reads');
+  const fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW);
+  try{
+    const before=fstatSync(fd);
+    if(!before.isFile()||before.size<=0||before.size>max)
+      throw Error('Invalid bounded '+label);
+    const result=reader(fd,before.size);
+    const after=fstatSync(fd);
+    if(after.size!==before.size||after.mtimeMs!==before.mtimeMs||
+       after.ctimeMs!==before.ctimeMs)
+      throw Error(label+' changed during descriptor-bound read');
+    return {result,size:before.size};
+  }finally{closeSync(fd);}
+}
+function bytesOf(fd,size){
+  const output=Buffer.alloc(size);
+  let offset=0;
+  while(offset<size){
+    const received=readSync(fd,output,offset,size-offset,offset);
+    if(received===0)throw Error('File truncated during read');
+    offset+=received;
+  }
+  return output;
+}
+function readReceipt(path){
+  const {result}=withVerifiedFile(path,512*1024,'MLX receipt',bytesOf);
+  return JSON.parse(result.toString('utf8'));
+}
 async function digestFile(path,max){
-  const stat=lstatSync(path);
-  if(!stat.isFile()||stat.isSymbolicLink()||stat.size<=0||stat.size>max)
-    throw Error('Invalid bounded fused model shard');
-  const hash=createHash('sha256');
-  for await (const part of createReadStream(path))hash.update(part);
-  return {size:stat.size,sha256:hash.digest('hex')};
+  const {result,size}=withVerifiedFile(path,max,'fused model shard',(fd,length)=>{
+    const hash=createHash('sha256'),buffer=Buffer.allocUnsafe(64*1024);
+    let offset=0;
+    while(offset<length){
+      const received=readSync(fd,buffer,0,Math.min(buffer.length,length-offset),offset);
+      if(received<=0)throw Error('Fused weight truncated during hashing');
+      hash.update(buffer.subarray(0,received));offset+=received;
+    }
+    return hash.digest('hex');
+  });
+  return {size,sha256:result};
 }
 function inference(py,modelPath){
   const script=[
@@ -73,12 +112,13 @@ async function main(){
   // a legitimate Apple Silicon MLX environment on path shape alone.
   if(!isAbsolute(python)||/[\\x00-\\x1f]/.test(python)||python.split(/[\\/\\\\]/).includes('..'))
     throw Error('Python must be an absolute local selected executable');
-  const actualReceipt=inspect(receiptPath),py=realpathSync(python);
-  if(!lstatSync(actualReceipt).isFile()||!lstatSync(py).isFile())
-    throw Error('Receipt and reviewed Python must be regular local files');
-  if(lstatSync(actualReceipt).size>512*1024)
-    throw Error('MLX training receipt is oversized');
-  const data=JSON.parse(readFileSync(actualReceipt,'utf8'));
+  if(!isAbsolute(receiptPath)||/[\\x00-\\x1f]/.test(receiptPath)||
+     receiptPath.split(/[\\/\\\\]/).includes('..'))
+    throw Error('Receipt must be an absolute local path');
+  const py=realpathSync(python);
+  // A Python path is invoked as an executable by the OS; do not pre-check
+  // it with lstat and then assume the executable cannot change afterwards.
+  const data=readReceipt(receiptPath);
   if(data.version!==1||data.engine!=='mlx_lm'||
      data.status!=='validated_fused_model_requires_manual_runtime_import'||
      !Number.isFinite(data.testPerplexity)||data.testPerplexity<=0||
