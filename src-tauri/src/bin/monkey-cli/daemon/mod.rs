@@ -3232,6 +3232,9 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
     // scheduling. A slow or offline peer cannot stall this daemon's jobs.
     peer_memory::spawn_sync_worker(paths.clone());
     swarm_cluster::spawn_lease_worker(paths.clone());
+    // Only a CURRENT signed majority leader publishes its local read-only
+    // resident DAG checkpoints to separately enrolled peer identities.
+    swarm_replication::spawn_replica_worker(paths.clone());
     // Messaging channels. Its own task rather than a step in the loop below: a
     // long-polling provider blocks for half a minute at a time, and the queue
     // must keep ticking while it does.
