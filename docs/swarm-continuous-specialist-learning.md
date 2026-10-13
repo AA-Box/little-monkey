@@ -44,6 +44,25 @@ node scripts/swarm-specialist-continuous-loop.mjs --policy /absolute/path/policy
 
 The dispatcher privately copies the original native recipe, replaces the already-configured Ollama target, appends a bounded fixed reviewer-focus hint chosen from the independently ranked specialist roles, and runs the real `monkey task run` executable. It preserves the original task text and system rules and never changes tool access, workspace or permission mode; `bypass` is refused.
 
+## Install unattended current-user service on macOS
+
+A supported Apple Silicon or Intel macOS login user can enable the LaunchAgent
+after reviewing the exact policy and configured local CLI/model targets:
+
+```sh
+node scripts/swarm-specialist-service.mjs install --policy /absolute/path/policy.json --confirm-install-service
+node scripts/swarm-specialist-service.mjs status
+node scripts/swarm-specialist-service.mjs uninstall
+```
+
+The installer writes a user-only `com.littlemonkey.verified-specialist-learning`
+LaunchAgent with `RunAtLoad`, bounded launchd restarts, no root privileges,
+no shell command interpretation and private logs under the configured state
+directory. The existing PID lease prevents concurrent learning cycles and
+recovers after a verified dead owner. A bootstrapping failure removes the
+generated service file. It does not bypass task authorization or start on
+machines where it was not deliberately installed.
+
 ## Quality and rollback
 
 Each candidate is independently checked on three source fixtures (two defects and a negative control) for all three fixed specialist roles and every repetition. The benchmark executor checks native run receipts, executable source behavior and unchanged repositories. The controller rejects missing/duplicate/contradictory results, verifies complete coverage, recomputes ranks, and records per-domain evidence hashes.
