@@ -50,4 +50,30 @@ describe('unified durable/swarm peer trace',()=>{
   expect(result.receivedPeers).toBe(0);
   expect(result.invalidPeerRecords).toBe(1);
  });
+ it('renders original chronological signed peer events rather than inventing completion timestamps',()=>{
+  const remote={...peer,version:2,trace_events:[
+   {sequence:18,node_id:null,kind:'graph_created',state:'running',occurred_at_ms:NOW-9000},
+   {sequence:23,node_id:'audit',kind:'node_transition',state:'succeeded',occurred_at_ms:NOW-4000},
+  ]};
+  const result=composeDistributedSwarmTrace(graph,[remote],NOW);
+  expect(result.historicalPeerEvents).toBe(2);
+  expect(result.legacySnapshotPeers).toBe(0);
+  expect(result.events.find(x=>x.source==='signed-peer-observation' && x.node==='audit'))
+   .toMatchObject({kind:'node_transition',occurredAt:NOW-4000,sequence:23,verifiedExecution:false});
+ });
+ it('fails closed on malformed remote journal, regressions, unrelated node and invalid checksum',()=>{
+  const first={sequence:12,node_id:'audit',kind:'node_transition',state:'submitted',occurred_at_ms:NOW-3000};
+  for(const trace_events of [
+    [first,{...first,sequence:11}],
+    [{...first,node_id:'other'}],
+    [{...first,kind:'unknown'}],
+    [{...first,occurred_at_ms:NOW+10_000}],
+  ]){
+   const result=composeDistributedSwarmTrace(graph,[{...peer,version:2,trace_events}],NOW);
+   expect(result.invalidPeerRecords).toBe(1);
+   expect(result.historicalPeerEvents).toBe(0);
+  }
+  expect(composeDistributedSwarmTrace(graph,[{...peer,checksum:'not-hash'}],NOW).invalidPeerRecords).toBe(1);
+ });
+
 });
