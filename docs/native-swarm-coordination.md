@@ -605,3 +605,55 @@ peer-election CLI through a fixed Tauri command and then rereads
 start previously operator-approved read-only resident graph tasks. The
 same bounds, pinned identities and native rejection policies apply
 whether run through the GUI or CLI.
+
+
+## P1 ambient maintenance discovery through the installed daemon
+
+The opt-in `ambient-discovery` worker uses the existing durable native
+swarm-worker trigger to inspect a configured workspace and suggest up to
+five maintenance tasks with source evidence, uncertainty, impact, and
+verification ideas. Nothing is automatically edited or queued from the
+suggestions. The worker inherits the source recipe's preconfigured model,
+workspace, timeout and read-only `plan` permission.
+
+Install a reviewed plan-only JSON task recipe with a working model target:
+
+```sh
+monkey daemon ensure
+monkey daemon swarm-worker-catalog
+monkey daemon swarm-worker-install my-ambient \
+  --role ambient-discovery \
+  --source-recipe /absolute/path/to/plan-only-recipe.json \
+  --workspace /absolute/path/to/repository \
+  --cron "0 */6 * * *"
+```
+
+The daemon freezes the task recipe and applies its existing backpressure,
+kill switch, persisted run ledger and watchdog. Each run is bounded to
+at most 900 seconds and 12 model iterations. Inspect the daemon's run
+history for suggested work, then explicitly authorize any resulting task.
+
+This is proactive, scheduled codebase discovery, **not** automatic
+cross-session semantic memory, resource-adaptive wake scheduling,
+or unattended execution of newly proposed code changes.
+
+## P1 verified headless concurrency benchmarks
+
+```sh
+pnpm test:swarm-headless:contract
+pnpm test:swarm-headless:live -- --target ollama:YOUR_MODEL \
+  --workers 1,2,4 --repetitions 2 --timeout-ms 600000
+```
+
+The live benchmark submits concurrent real installed `monkey task start`
+runs in separate, disposable repositories where an external Node oracle
+is known to fail before intervention. It waits for each model-run task,
+executes the oracle, checks that only the authorized source changed and
+reports each task's elapsed duration plus wall-clock verified throughput.
+A failed run sends a cancellation request; its repository is retained
+for reconciliation if the run might still be active. No self-reported
+model success is scored as correctness.
+
+The contract test uses an explicitly separate mock CLI executable and
+**does not establish real-model performance**. This harness does not
+measure daemon RSS or CPU or establish a JCode performance comparison.
