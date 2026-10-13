@@ -303,6 +303,9 @@ export async function serve(policy){
    await stopBackend(state.child);state.child=null;
    const child=await startBackend(policy,path);
    state.child=child;
+   child.once('exit',()=>{
+    if(state.child===child){state.active=false;state.generation++;}
+   });
    probeState.active=true;
    try{return {modelPath:path,scores:await independentOracle(policy)};}
    catch(e){await stopBackend(child);state.child=null;throw e;}
