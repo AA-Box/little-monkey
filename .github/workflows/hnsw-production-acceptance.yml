@@ -86,6 +86,12 @@ jobs:
           lscpu >> artifacts/host.txt
           free -h >> artifacts/host.txt
 
+      - name: Stage Tauri build-only CLI sidecar resource
+        # Cargo --lib still executes the Tauri build script, which validates
+        # the platform-named sidecar resource before it compiles any tests.
+        # This acceptance job never executes or packages that placeholder.
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+
       - name: Build actual immutable index, exact recall oracle, and parallel SQLite readers
         working-directory: src-tauri
         run: |
