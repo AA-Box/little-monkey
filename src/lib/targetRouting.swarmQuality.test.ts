@@ -6,7 +6,7 @@ import { routeFromActive } from './targetRouting';
 import { useModelStore, type OllamaModelInfo } from '../store/modelStore';
 import { useRoutingPolicyStore } from '../store/routingPolicyStore';
 import {
-  SWARM_BENCHMARK_KEY, SWARM_BENCHMARK_OPT_IN, setSwarmBenchmarkRouting,
+  SWARM_BENCHMARK_KEY, SWARM_BENCHMARK_OPT_IN, setSwarmBenchmarkRouting, importSwarmBenchmark,
 } from './swarmVerifiedBenchmarks';
 import type { ResolvedTarget } from './turnEngine';
 import type { RoutingPolicy } from './modelRouting';
@@ -45,14 +45,26 @@ beforeEach(() => {
     providers:[],providerModels:{},mlxChat:null,
   });
 });
-function importFixtureRanking() {
-  localStorage.setItem(SWARM_BENCHMARK_KEY,JSON.stringify({
-    generatedAt:new Date().toISOString(),importedAt:Date.now(),
-    ranking:[
-      {target:'ollama:good-model',passes:3,attempts:3,accuracy:1,averageVerifiedMs:500},
-      {target:'ollama:bad-model',passes:1,attempts:3,accuracy:0.3333,averageVerifiedMs:1000},
-    ],
+function importFixtureRanking(equalAccuracy=false) {
+  const targets=['ollama:good-model','ollama:bad-model'];
+  const fixtures=['logic-regression','authorization-regression','parsing-regression'];
+  const repeats=equalAccuracy?5:1;
+  const results=targets.flatMap((target,index)=>Array.from({length:repeats},(_,r)=>
+    fixtures.map((fixture,j)=>({
+      target,fixture,repeat:r+1,runId:'run-bench-'+index+'-'+r+'-'+j,
+      verified:equalAccuracy||index===0||j===0,
+      durationMs:index===0?500:1000,
+    }))).flat());
+  const ranking=targets.map((target,index)=>({
+    target,passes:index===0||equalAccuracy?repeats*3:repeats,
+    attempts:repeats*3,
+    accuracy:index===0||equalAccuracy?1:0.3333,
+    averageVerifiedMs:index===0?500:1000,
   }));
+  importSwarmBenchmark({
+    version:1,benchmark:'live-task-verified-fixtures',mode:'real-model',
+    generatedAt:new Date().toISOString(),ranking,results,
+  });
   setSwarmBenchmarkRouting(true);
 }
 describe('benchmarked swarm model selection respects live policy constraints', () => {
@@ -80,13 +92,7 @@ describe('benchmarked swarm model selection respects live policy constraints', (
     expect(routeFromActive(target,context).target).toMatchObject({model:'bad-model'});
   });
   it('end-to-end cost optimizer only reorders equally verified and previously eligible subagent models',()=>{
-    localStorage.setItem(SWARM_BENCHMARK_KEY,JSON.stringify({
-      generatedAt:new Date().toISOString(),importedAt:Date.now(),ranking:[
-        {target:'ollama:good-model',passes:15,attempts:15,accuracy:1,averageVerifiedMs:500},
-        {target:'ollama:bad-model',passes:15,attempts:15,accuracy:1,averageVerifiedMs:1000},
-      ],
-    }));
-    setSwarmBenchmarkRouting(true);
+    importFixtureRanking(true);
     useCostControlStore.setState({
       rates:{'ollama:good-model':{inputPerMillionUsd:10,outputPerMillionUsd:20},
              'ollama:bad-model':{inputPerMillionUsd:1,outputPerMillionUsd:2}},
