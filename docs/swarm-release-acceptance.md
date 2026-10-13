@@ -784,3 +784,47 @@ and automatic DAG registration while A is isolated. This is a functional locally
 **not** a substitute for physical partition tests or full distributed
 exactly-once process migration. It only supports read-only re-execution of
 operator-prepared plans; it intentionally refuses unattended edits.
+
+
+## Replicated pre-dispatch intent and majority-safe automatic recovery
+
+Clustered read-only graphs now have a two-phase dispatch boundary:
+
+1. Registration requires a **currently elected signed majority leader**. A
+   durable graph ownership record pins that graph to its original leader
+   certificate fingerprint and election term. Recoveries register NEW graph
+   IDs under their successor's new term; a former leader cannot revive an
+   old graph simply by winning a later election.
+2. Before any newly scheduled clustered task is enqueued, its
+   deterministic job identity is committed as `preparing` in the
+   graph's durable SQLite node ledger.
+3. The replication worker sends the exact state vector to separately
+   operator-enrolled peers using the pinned signed peer transport. Only an
+   **independent signed GET of the same peer's SQLite contents** earns one
+   durable state-specific ACK. The leader dispatches only after the ACKs
+   plus itself form a strict majority, under its CURRENT term, with evidence
+   refreshed in the last fifteen seconds.
+4. The coordinator repeats both its original-term ownership test and
+   state-specific majority check immediately before the native job enqueue.
+   A stale ACK for `pending`, an earlier term, or a different job ID
+   cannot start a `preparing` task. Cancelled preparations are
+   recorded as cancelled, never enqueued.
+
+A successor faces a second quorum intersection check. Once elected, it makes
+fresh signed GETs to a strict majority of peers to reconcile the original
+leader's **latest** checkpoint, rather than trusting its locally cached
+`pending` copy. An ACKed pre-dispatch intent must have reached an
+overlapping peer, so a quorum successor cannot suppress that intent by
+reading only stale local replicas. Any witness reporting `preparing`,
+`submitted`, a former job ID or another attempted terminal status
+prevents unattended re-execution. No response or insufficient peers also
+blocks recovery; there is no speculative duplicate.
+
+These guarantees apply to native **plan-mode, local read-only work** using
+previously operator-staged bundles. They do not migrate active inference
+processes, recover arbitrary mutable worktree edits, authenticate a model's
+claimed answers, or provide exactly-once side effects to third-party tools.
+The recovery worker is allowed to re-run only a graph with a quorum-proven
+**no-dispatch** predecessor state and separate preapproved instructions.
+Actual three-machine TLS partition + power-failure tests are still mandatory
+before describing production fault tolerance as physically verified.
