@@ -136,8 +136,13 @@ pub(super) fn build(tx:&Transaction<'_>,chunks:&[KnowledgeChunk],
         FOREIGN KEY(chunk_id) REFERENCES chunks(chunk_id)
     ) WITHOUT ROWID;")?;
     let mut digest=Sha256::new();
-    for point in &points{
+    // Canonical sorted-ID hash can be independently rechecked from SQLite
+    // without needing the original source insertion order.
+    let mut order=(0..points.len()).collect::<Vec<_>>();
+    order.sort_by(|a,b|points[*a].id.cmp(&points[*b].id));
+    for index in order{
         check_cancelled(cancel)?;
+        let point=&points[index];
         let links=point.links.iter().map(|level|
             level.iter().map(|id|points[*id].id.clone()).collect::<Vec<_>>()
         ).collect::<Vec<_>>();
@@ -158,6 +163,53 @@ pub(super) fn build(tx:&Transaction<'_>,chunks:&[KnowledgeChunk],
     }
     Ok(())
 }
+/// The original generation index checksum pins the source embeddings. This
+/// additional checksum pins EVERY persisted graph edge, so an on-disk change
+/// cannot secretly steer accelerated retrieval past legitimate candidates.
+pub(super) fn validate(conn:&Connection)->PipelineResult<()>{
+    let declared:Option<String>=conn.query_row(
+        "SELECT value FROM metadata WHERE key='hnsw_digest'",[],
+        |r|r.get(0)).optional()?;
+    let Some(declared)=declared else{return Ok(());};
+    let version:String=conn.query_row(
+        "SELECT value FROM metadata WHERE key='hnsw_version'",[],
+        |r|r.get(0))?;
+    if version!="1" {
+        return Err(PipelineError::InvalidIndex("Unsupported HNSW generation version".into()));
+    }
+    let mut digest=Sha256::new();
+    let mut stmt=conn.prepare(
+        "SELECT chunk_id,layer,links_json FROM hnsw_nodes ORDER BY chunk_id"
+    )?;
+    let rows=stmt.query_map([],|r|
+        Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?))
+    )?;
+    let mut counted=0usize;
+    for row in rows{
+        let (id,layer,links)=row?;
+        if layer<0||layer as usize>MAX_LAYER{
+            return Err(PipelineError::InvalidIndex("Corrupt HNSW layer".into()));
+        }
+        let links_parsed:Vec<Vec<String>>=serde_json::from_str(&links)?;
+        if links_parsed.len()!=layer as usize+1 ||
+           links_parsed.iter().any(|level|
+               level.len()>MAX_NEIGHBORS||level.iter().any(|id|id.len()>256)
+           ){
+            return Err(PipelineError::InvalidIndex("Corrupt HNSW links".into()));
+        }
+        digest.update(id.as_bytes());
+        digest.update((layer as u32).to_le_bytes());
+        digest.update(links.as_bytes());
+        counted+=1;
+    }
+    let indexed:i64=conn.query_row("SELECT COUNT(*) FROM chunks",[],|r|r.get(0))?;
+    if counted<MIN_ACCELERATED||counted as i64!=indexed||
+       format!("{:x}",digest.finalize())!=declared{
+        return Err(PipelineError::InvalidIndex("HNSW edge integrity digest mismatch".into()));
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 struct DiskPoint{
     links:Vec<Vec<String>>,
