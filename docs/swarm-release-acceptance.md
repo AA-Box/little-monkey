@@ -760,6 +760,17 @@ hash. The worker commits an exclusive one-shot claim to durable SQLite
 and **every task is pending** — no foreign reports, success states, model
 tokens, receipts, conversations, approvals or mutable workspace are imported.
 
+**Safety gate for ambiguous work:** Automatic takeover is refused whenever
+any node in the specifically approved predecessor's latest authenticated
+checkpoint is already submitted, completed, failed, or carries a foreign
+job ID. Those tasks may still be running or may have had effects not
+recorded in the receiving ledger. There is no false exactly-once guarantee:
+the plan remains armed for operator reconciliation rather than automatically
+replaying work with uncertain execution history. Even an all-pending
+checkpoint is not a quorum-replicated pre-dispatch journal, so strict
+cross-host at-most-once guarantees still require a replicated dispatch
+commit protocol and actual physical fault-injection acceptance.
+
 If the process crashes after the one-shot claim and before registration, the
 plan remains in `claimed` state. It is deliberately **not** retried:
 doing so could create ambiguous duplicate effects. Inspect the existing
