@@ -31,6 +31,9 @@ export class LiveSwarmBus {
   private readonly reads = new Map<string, Set<string>>();
   private readonly finished = new Set<string>();
   private sequence = 0;
+  private directDeliveries = 0;
+  private fileNotifications = 0;
+  private received = 0;
   private closed = false;
 
   constructor(ids: readonly string[]) {
@@ -72,6 +75,7 @@ export class LiveSwarmBus {
         sender, recipient: id, kind: 'direct', text,
       });
     }
+    this.directDeliveries += recipients.length;
     return recipients.length;
   }
 
@@ -82,7 +86,9 @@ export class LiveSwarmBus {
 
   receive(id: string): LiveSwarmMessage[] {
     this.requireAgent(id);
-    return this.queues.get(id)!.splice(0, MAX_BATCH);
+    const messages = this.queues.get(id)!.splice(0, MAX_BATCH);
+    this.received += messages.length;
+    return messages;
   }
 
   /** Read observations are recorded only after a successful real file tool. */
@@ -113,7 +119,17 @@ export class LiveSwarmBus {
         text: 'File changed after your read: ' + key + '. Re-read it before editing or relying on previous content.',
       });
     }
+    this.fileNotifications += affected.length;
     return affected.length;
+  }
+
+  statistics(): Readonly<{ directDeliveries: number; fileNotifications: number; received: number; pending: number }> {
+    return {
+      directDeliveries: this.directDeliveries,
+      fileNotifications: this.fileNotifications,
+      received: this.received,
+      pending: [...this.queues.values()].reduce((total, queue) => total + queue.length, 0),
+    };
   }
 
   /** Peer output must never impersonate a system/developer/operator instruction. */
