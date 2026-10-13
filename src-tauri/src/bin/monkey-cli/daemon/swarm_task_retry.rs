@@ -171,9 +171,9 @@ mod tests {
     }
     #[test]
     fn cancelled_and_inflight_work_cannot_be_reassigned(){
-        for state in ["queued","running","waiting_approval","paused","cancelling","cancelled","succeeded"] {
+        for job_state in ["queued","running","waiting_approval","paused","cancelling","cancelled","succeeded"] {
             let mut s=state();
-            job(&s,"job-first",state);
+            job(&s,"job-first",job_state);
             assert!(!reassign_failed_primary(&mut s,"graph","scan","job-first",2000).unwrap());
             assert_eq!(count(&s,"graph","scan").unwrap(),0);
         }
