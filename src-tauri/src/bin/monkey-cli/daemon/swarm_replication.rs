@@ -550,11 +550,12 @@ mod tests{
         let (mut other,legacy,device)=configured();
         assert!(ingest(&mut other,&device,&legacy,1100).unwrap());
         assert!(list_for_member(&other,&device,"team","audit").unwrap()[0].trace_events.is_empty());
-        let has_jobs:i64=store.connection.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='daemon_jobs'",
+        let has_graph:i64=store.connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='table' AND name='resident_swarm_graphs'",
             [],|r|r.get(0)
         ).unwrap();
-        assert_eq!(has_jobs,0,"peer telemetry cannot authorize execution");
+        assert_eq!(has_graph,0,"peer telemetry cannot authorize a resident graph");
     }
     #[test]
     fn altered_timestamp_term_checksum_or_huge_state_fails_closed(){
