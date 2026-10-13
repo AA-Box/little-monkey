@@ -98,7 +98,7 @@ export async function promoteVerifiedMlxFusion(
  }catch(error){
   try{await rollback(journal,runtime,storage);}
   catch(recoveryError){
-   throw Error('Candidate failed; automatic rollback also failed. Normal model routing is blocked. '+
+   throw Error('Candidate failed; automatic rollback also failed. Normal model routing and execution is blocked. '+
      String(recoveryError));
   }
   throw Error('Candidate failed real inference; previous local model restored: '+String(error));
