@@ -11,6 +11,7 @@ describe('live native workflow mailbox', () => {
     expect(bus.send('b', '*', 'I found a possible issue')).toBe(2);
     expect(bus.receive('a')).toHaveLength(1);
     expect(bus.receive('c')).toHaveLength(1);
+    expect(bus.statistics()).toMatchObject({ directDeliveries: 3, received: 3, pending: 0 });
     expect(() => bus.send('a', 'outsider', 'text')).toThrow(/Recipient/);
     expect(() => bus.send('outsider', 'b', 'text')).toThrow(/not a member/);
     expect(() => bus.send('a', 'a', 'text')).toThrow(/Recipient/);
