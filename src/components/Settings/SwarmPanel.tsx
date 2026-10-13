@@ -9,8 +9,8 @@ import {promoteVerifiedMlxFusion,recoverInterruptedMlxPromotion,type PromotionRu
 import { parseCommandHooksManifest } from '../../lib/commandHookManifest';
 import { useUserHooksStore } from '../../store/userHooksStore';
 import { daemonSwarmCancel, daemonSwarmStatus, daemonSwarmSubmit,
- daemonClusterSetup,daemonClusterStatus,daemonClusterElect,
- type DaemonClusterStatus,type ResidentSwarmGraphStatus } from '../../lib/daemonClient';
+ daemonClusterSetup,daemonClusterStatus,daemonClusterElect,daemonSwarmReplicaStatus,
+ type DaemonClusterStatus,type DaemonSwarmReplica,type ResidentSwarmGraphStatus } from '../../lib/daemonClient';
 import { Activity, CheckCircle2, Copy, RefreshCw, ShieldCheck } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { buildGoalSwarm } from '../../lib/swarmPlanning';
@@ -92,6 +92,7 @@ export function SwarmPanel() {
   const [clusterGroup,setClusterGroup]=useState('');
   const [clusterStatus,setClusterStatus]=useState<DaemonClusterStatus|null>(null);
   const [clusterBusy,setClusterBusy]=useState(false);
+  const [replicaView,setReplicaView]=useState<{graph:string;records:DaemonSwarmReplica[]}|null>(null);
   const [residentFallbackEnabled,setResidentFallbackEnabled]=useState(false);
   const [hookBusy, setHookBusy] = useState(false);
   const [memoryDevice, setMemoryDevice] = useState('');
@@ -1095,6 +1096,21 @@ export function SwarmPanel() {
             {(graph.state === 'running' || graph.state === 'failing') &&
               <Button size="sm" disabled={residentBusy} onClick={() => void cancelResident(graph.id)}>Request cancellation</Button>}
           </div>
+          {!!clusterGroup.trim() && <Button size="sm" disabled={residentBusy || clusterBusy}
+            onClick={() => void (async () => {
+              try {
+                const result=await daemonSwarmReplicaStatus(clusterGroup.trim(),graph.id);
+                setReplicaView({graph:graph.id,records:result.replicas});
+              } catch (failure) {setError('DAG peer replicas: '+String(failure));}
+            })()}>
+            View authenticated peer checkpoints
+          </Button>}
+          {replicaView?.graph===graph.id && <div className="mt-2 text-xs text-muted">
+            <p>Received peer observations: {replicaView.records.length} · NOT authorized local jobs</p>
+            {replicaView.records.map(peer => <p key={peer.source_fingerprint} className="break-all">
+              Peer certificate {peer.source_fingerprint.slice(0,16)}… · term {peer.term} · revision {peer.sequence} · {peer.graph_state} · {peer.nodes.length} nodes
+            </p>)}
+          </div>}
           <p className="mt-1 text-xs text-faint">{graph.tasks.filter(t => t.state === 'succeeded').length}/{graph.tasks.length} nodes succeeded</p>
           {graph.tasks.map(task => <p key={task.id} className="mt-1 text-xs text-muted">
             {task.id} · {task.state} {task.error ? '— ' + task.error.slice(0, 160) : ''}
