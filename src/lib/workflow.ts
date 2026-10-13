@@ -673,6 +673,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
           const journaled = resume ? resumeJournal?.[workflowAgentTaskId(resume, phaseIndex, agentIndex)] : undefined;
           if (journaled && journaled.status === 'done' && journaled.promptHash === hash) {
             replayJournaledAgent(agentTaskId, agent, prompt, journaled.report);
+            liveBus?.finishAgent(agentTaskId);
             agentResults[agentTaskId] = { promptHash: hash, status: 'done', report: journaled.report, reused: true };
             await checkpoint();
             return journaled.report;
@@ -713,6 +714,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
             onMutatedPath,
             onMutationFailure,
           });
+          liveBus?.finishAgent(agentTaskId);
           const cancelled = unwrapUntrustedContent(raw) === CANCELLED_TOOL_RESULT;
           const failed = !cancelled && resultIsError(raw);
           agentResults[agentTaskId] = {
