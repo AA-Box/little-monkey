@@ -32,6 +32,7 @@ struct ArmedPlan{
     path:String,
     hash:String,
     workspace:String,
+    state:String,
 }
 fn valid_id(value:&str)->bool{
     (1..=80).contains(&value.len()) &&
@@ -152,15 +153,15 @@ fn pending(store:&DaemonStore)->Result<Vec<ArmedPlan>,String>{
     schema(store)?;
     let mut stmt=store.connection.prepare(
         "SELECT plan_id,group_id,source_graph,source_fingerprint,new_graph,bundle_path,
-                bundle_sha256,workspace
+                bundle_sha256,workspace,state
          FROM resident_swarm_failover_plans
-         WHERE state='armed' AND source_fingerprint IS NOT NULL
+         WHERE state IN ('armed','claimed') AND source_fingerprint IS NOT NULL
          ORDER BY created_at_ms LIMIT 8"
     ).map_err(|e|e.to_string())?;
     let rows=stmt.query_map([],|r|Ok(ArmedPlan{
         id:r.get(0)?,group:r.get(1)?,source_graph:r.get(2)?,
         source_fingerprint:r.get(3)?,new_graph:r.get(4)?,path:r.get(5)?,
-        hash:r.get(6)?,workspace:r.get(7)?,
+        hash:r.get(6)?,workspace:r.get(7)?,state:r.get(8)?,
     })).map_err(|e|e.to_string())?;
     rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
 }
@@ -210,17 +211,23 @@ fn mark(store:&DaemonStore,id:&str,state:&str,now:i64,message:&str)->Result<(),S
 }
 fn consume(paths:&DaemonPaths,plan:&ArmedPlan,now:i64)->Result<(),String>{
     let store=DaemonStore::open(paths)?;
-    if !eligible(&store,plan,now)? {return Ok(());}
-    let updated=store.connection.execute(
-        "UPDATE resident_swarm_failover_plans
-         SET state='claimed',claimed_at_ms=?2
-         WHERE plan_id=?1 AND state='armed'",
-        params![plan.id,now],
-    ).map_err(|e|e.to_string())?;
-    if updated!=1 {return Ok(());}
+    if plan.state=="armed" {
+        if !eligible(&store,plan,now)? {return Ok(());}
+        let updated=store.connection.execute(
+            "UPDATE resident_swarm_failover_plans
+             SET state='claimed',claimed_at_ms=?2
+             WHERE plan_id=?1 AND state='armed'",
+            params![plan.id,now],
+        ).map_err(|e|e.to_string())?;
+        if updated!=1 {return Ok(());}
+    } else if plan.state!="claimed" {
+        return Ok(());
+    }
     drop(store);
-    // The one-shot claim is COMMITTED before touching any imported files or
-    // registering daemon work. A crash cannot launch the same graph twice.
+    // A crash after this committed claim must not strand the graph forever.
+    // The same approved bytes/identity are revalidated below; if the graph
+    // was already registered, verify the entire frozen spec and every recipe
+    // instead of creating another graph or accepting a name collision.
     let operation=(||{
         let path=PathBuf::from(&plan.path);
         let actual=bounded_file(&path)?;
@@ -240,6 +247,20 @@ fn consume(paths:&DaemonPaths,plan:&ArmedPlan,now:i64)->Result<(),String>{
             return Err("Local majority lease was lost before recovery registration".into());
         }
         drop(store);
+        if swarm_transfer::verify_existing_import(
+            paths,&path,&plan.new_graph,Path::new(&plan.workspace)
+        )? {
+            return Ok(());
+        }
+        // A previously claimed registration without any graph is safe to
+        // resume ONLY with a fresh majority certificate and independent
+        // no-dispatch readback. The old one-shot claim alone confers no
+        // ongoing right to create work under a new epoch.
+        let current=DaemonStore::open(paths)?;
+        if !eligible(&current,plan,now)? {
+            return Err("Read-only registration still needs a fresh no-dispatch majority".into());
+        }
+        drop(current);
         // Read ONLY the bytes just validated, not the operator-controlled
         // pathname again. Copy to a fresh private, exclusive daemon snapshot:
         // otherwise a file replaced between SHA check and import could run a
@@ -267,7 +288,7 @@ fn consume(paths:&DaemonPaths,plan:&ArmedPlan,now:i64)->Result<(),String>{
     let store=DaemonStore::open(paths)?;
     match operation {
         Ok(())=>mark(&store,&plan.id,"imported",now,
-            "New local graph registered; all source tasks are newly pending, never reused"),
+            "Approved graph registered or crash-reconciled; original jobs never reused"),
         Err(reason)=>{
             mark(&store,&plan.id,"failed",now,
                 "Automatic failover stopped; operator must inspect local plan and graph")?;
