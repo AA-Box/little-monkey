@@ -734,7 +734,8 @@ an exact immutable bundle, known local workspace and new target graph ID:
 
 ```bash
 monkey daemon swarm-failover-arm recovery-on-b \
-  --group my-cluster --new-id read-only-recovery-b \
+  --group my-cluster --source-peer original-leader-a \
+  --new-id read-only-recovery-b \
   --bundle /private/preapproved/read-only-graph.json \
   --workspace /absolute/disposable/approved-workspace \
   --confirm-read-only-reexecution
@@ -746,7 +747,7 @@ Nothing runs when this command is issued. Both installations must already be
 operator-enrolled in the exact same cluster; the **source** exports the
 read-only bundle and the **destination** independently stages it. At arming,
 the destination checks the bundle's per-recipe and graph digests, plan-mode
-permissions, source cluster, destination workspace and the file SHA-256.
+permissions, source cluster, destination workspace and the file SHA-256. The operator must also bind the plan to a specific, enrolled **original leader fingerprint** via `--source-peer`; an unrelated cluster member's checkpoint can never authorize the takeover. Older unbound draft plans are migrated to a disabled (non-eligible) state and must be re-armed, rather than silently inheriting an origin.
 
 Every ten seconds the installed daemon checks armed plans. A plan can only
 activate when ALL conditions hold: this host currently possesses a valid
