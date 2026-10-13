@@ -97,6 +97,12 @@ describe('benchmarked swarm model selection respects live policy constraints', (
     const quality=routeFromActive(target,context);
     expect(quality.target).toMatchObject({model:'good-model'});
     setSwarmCostOptimization(true);
+    // A cost-only proposal no longer automatically captures all traffic.
+    // Real terminal outcomes must first establish the primary's reliability.
+    localStorage.setItem('little-monkey-swarm-live-outcomes-v1',JSON.stringify(
+      Array.from({length:6},(_,i)=>({target:'ollama:good-model',status:'done',
+        elapsedMs:800,finishedAtMs:Date.now()-i*1000}))));
+    const canary=vi.spyOn(Math,'random').mockReturnValue(0);
     const optimized=routeFromActive(target,context);
     expect(optimized.target).toMatchObject({model:'bad-model'});
     expect(optimized.decision.reason).toContain('Opted-in cost optimizer');
@@ -105,6 +111,7 @@ describe('benchmarked swarm model selection respects live policy constraints', (
     expect(routeFromActive(target,context).target).toMatchObject({model:'good-model'});
     useRoutingPolicyStore.setState({policies:[{...policy}]});
     expect(routeFromActive(target,{...context,taskClass:'chat'}).target).toMatchObject({model:'bad-model'});
+    canary.mockRestore();
   });
 
 });
