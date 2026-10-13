@@ -17,6 +17,9 @@ use std::collections::BTreeSet;
 use super::store::{DaemonPaths,DaemonStore};
 const LEASE_MS:i64=20_000;
 const SAFETY_MS:i64=5_000;
+// Prevent a compromised but task-granted paired node from persisting a
+// terminal i64::MAX epoch and permanently exhausting the election counter.
+const MAX_ELECTION_TERM:u64=1_000_000_000;
 fn valid_id(value:&str)->bool{
     (1..=80).contains(&value.len())&&
     value.bytes().all(|c| c.is_ascii_alphanumeric()||matches!(c,b'-'|b'_'|b'.'))
@@ -126,6 +129,11 @@ pub fn configure(store:&mut DaemonStore,roster:&ClusterRoster,now:i64)->Result<(
     store.connection.execute(
         "DELETE FROM swarm_cluster_leases WHERE group_id=?1",[&roster.group]
     ).map_err(|e|e.to_string())?;
+    // The operator may reset an EXPIRED or exhausted election only through
+    // explicit local roster enrollment. Active votes were rejected above.
+    store.connection.execute(
+        "DELETE FROM swarm_cluster_votes WHERE group_id=?1",[&roster.group]
+    ).map_err(|e|e.to_string())?;
     Ok(())
 }
 pub fn roster(store:&DaemonStore,group:&str)->Result<ClusterRoster,String>{
@@ -139,7 +147,7 @@ pub fn roster(store:&DaemonStore,group:&str)->Result<ClusterRoster,String>{
 }
 pub fn vote(store:&mut DaemonStore,req:&VoteRequest,caller_device_id:&str,now:i64)
     ->Result<VoteReceipt,String>{
-    if now<=0||req.term==0||req.term>i64::MAX as u64||!valid_fp(&req.candidate_fingerprint)
+    if now<=0||req.term==0||req.term>MAX_ELECTION_TERM||!valid_fp(&req.candidate_fingerprint)
         {return Err("Invalid election term, identity or clock".into());}
     let registered=roster(store,&req.group)?;
     if registered.digest()!=req.roster_sha256{return Err("Cluster roster differs between nodes".into());}
@@ -180,8 +188,12 @@ pub fn next_term(store:&DaemonStore,group:&str)->Result<u64,String>{
         "SELECT term FROM swarm_cluster_votes WHERE group_id=?1",
         [group],|r|r.get::<_,i64>(0)
     ).optional().map_err(|e|e.to_string())?.unwrap_or(0);
-    u64::try_from(current).map_err(|_|"Invalid saved election term".to_string())?
-        .checked_add(1).ok_or_else(||"Election term overflow".to_string())
+    let next=u64::try_from(current).map_err(|_|"Invalid saved election term".to_string())?
+        .checked_add(1).ok_or_else(||"Election term overflow".to_string())?;
+    if next>MAX_ELECTION_TERM {
+        return Err("Election term exhausted; explicitly re-enroll the roster after lease expiry".into());
+    }
+    Ok(next)
 }
 pub fn persist_quorum(store:&DaemonStore,req:&VoteRequest,votes:&[VoteReceipt],
     now:i64)->Result<i64,String>{
@@ -189,16 +201,19 @@ pub fn persist_quorum(store:&DaemonStore,req:&VoteRequest,votes:&[VoteReceipt],
     let fingerprints=members.members.iter().map(|m|m.fingerprint.as_str())
         .collect::<BTreeSet<_>>();
     let voters=votes.iter().map(|v|v.voter_fingerprint.as_str()).collect::<BTreeSet<_>>();
-    if voters.len()<=members.members.len()/2 || voters.len()!=votes.len() ||
+    if now<=0 || req.term==0 || req.term>MAX_ELECTION_TERM ||
+       voters.len()<=members.members.len()/2 || voters.len()!=votes.len() ||
        !voters.is_subset(&fingerprints) ||
        votes.iter().any(|v|v.group!=req.group||v.term!=req.term||
           v.candidate_fingerprint!=req.candidate_fingerprint||
           v.roster_sha256!=req.roster_sha256||
-          v.decided_at_ms<now-5_000||v.decided_at_ms>now+5_000||
-          v.expires_at_ms-v.decided_at_ms!=LEASE_MS){
+          v.decided_at_ms<now.saturating_sub(5_000)||
+          v.decided_at_ms>now.saturating_add(5_000)||
+          v.expires_at_ms.checked_sub(v.decided_at_ms)!=Some(LEASE_MS)){
         return Err("Signed peer replies did not establish a fresh strict majority".into());
     }
-    let expires=votes.iter().map(|v|v.expires_at_ms).min().unwrap_or(0)-SAFETY_MS;
+    let expires=votes.iter().map(|v|v.expires_at_ms).min().unwrap_or(0)
+        .checked_sub(SAFETY_MS).ok_or("Election lease timestamp underflow")?;
     if expires<=now+2_000{return Err("Quorum lease expired before it could be accepted".into());}
     let votes_json=serde_json::to_string(votes).map_err(|e|e.to_string())?;
     store.connection.execute(
@@ -338,6 +353,19 @@ mod tests {
         let mut invalid=req(&config,1,&"b".repeat(64));
         invalid.roster_sha256="0".repeat(64);
         assert!(vote(&mut store,&invalid,"signed-b",1000).is_err());
+    }
+    #[test]
+    fn rejects_epoch_exhaustion_and_nonfinite_lease_arithmetic(){
+        let mut store=DaemonStore::open_in_memory().unwrap();
+        let config=members();configure(&mut store,&config,1000).unwrap();
+        let mut req=req(&config,u64::MAX,&"a".repeat(64));
+        assert!(vote(&mut store,&req,"@local",1000).is_err());
+        req.term=1;
+        let good=vote(&mut store,&req,"@local",1000).unwrap();
+        let mut malicious=good.clone();
+        malicious.voter_fingerprint="b".repeat(64);
+        malicious.expires_at_ms=i64::MIN;
+        assert!(persist_quorum(&store,&req,&[good,malicious],1000).is_err());
     }
     #[test]
     fn strict_quorum_fences_new_job_dispatch_and_rejects_fake_votes(){
