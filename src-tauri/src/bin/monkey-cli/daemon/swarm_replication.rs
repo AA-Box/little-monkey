@@ -60,6 +60,13 @@ fn valid_state(s:&str)->bool{
         "pending"|"pending_fallback"|"submitted"|"submitted_fallback")
 }
 impl ReplicaSnapshot{
+    /// Seal exactly the immutable values carried in this checkpoint. This is
+    /// corruption detection, NOT an authentication signature; TLS/HMAC and
+    /// the enrolled peer identity authenticate the transport separately.
+    pub fn seal(&mut self)->Result<(),String>{
+        self.checksum=hash(self)?;
+        Ok(())
+    }
     pub fn validate(&self,now:i64)->Result<(),String>{
         if self.version!=1 || !valid_id(&self.group)||!valid_id(&self.graph_id)||
             !self.source_fingerprint.bytes().all(|c|c.is_ascii_hexdigit()&&!c.is_ascii_uppercase())||
@@ -314,10 +321,12 @@ mod tests{
         assert!(list_for_member(&store,"alien","team","audit").is_err());
         assert!(ingest(&mut store,&device,&conflicting,1200).is_err());
         // The replicated observation never creates local daemon runs/graphs.
-        let jobs:i64=store.connection.query_row(
-            "SELECT COUNT(*) FROM daemon_jobs",[],|r|r.get(0)
-        ).unwrap_or(0);
-        assert_eq!(jobs,0);
+        let resident_tables:i64=store.connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='table' AND name='resident_swarm_graphs'",[],|r|r.get(0)
+        ).unwrap();
+        assert_eq!(resident_tables,0,
+            "a remote success assertion must never create a local graph");
     }
     #[test]
     fn altered_timestamp_term_checksum_or_huge_state_fails_closed(){
