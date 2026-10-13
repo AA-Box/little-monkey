@@ -224,8 +224,9 @@ pub fn capture_local_leader(
     if peer.fingerprint!=expected_peer_sha256 {
         return Err("Replication peer certificate mismatches enrolled roster".into());
     }
-    if store.kill_switch()?||!swarm_cluster::may_schedule(&store,group,now)?{
-        return Err("No current signed majority lease for local DAG publication".into());
+    if store.kill_switch()?||
+        !super::swarm_coordinator::owns_current_epoch(&store,group,graph,now)?{
+        return Err("DAG publisher is not the original majority-term owner".into());
     }
     let (raw,state):(String,String)=store.connection.query_row(
         "SELECT spec_json,state FROM resident_swarm_graphs WHERE graph_id=?1",
