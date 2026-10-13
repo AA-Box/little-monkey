@@ -1,0 +1,105 @@
+name: Apple Silicon MLX real lifecycle
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Absolute local MLX base model directory
+        required: true
+        type: string
+      data:
+        description: Absolute reviewed train/valid/test JSONL directory
+        required: true
+        type: string
+      output:
+        description: New absolute output directory (must not exist)
+        required: true
+        type: string
+      python:
+        description: Absolute Apple Silicon Python with mlx-lm[train]
+        required: true
+        type: string
+      previous_model:
+        description: Known-good rollback model (empty uses base)
+        required: false
+        default: ''
+        type: string
+      iters:
+        description: Bounded training iterations
+        required: true
+        default: '200'
+        type: string
+      max_test_ppl:
+        description: Reviewed held-out quality threshold
+        required: true
+        type: string
+
+permissions:
+  contents: read
+concurrency:
+  group: native-mlx-single-host
+  cancel-in-progress: false
+jobs:
+  native-lifecycle:
+    runs-on: [self-hosted, macOS, ARM64, mlx-live-acceptance]
+    timeout-minutes: 240
+    env:
+      MLX_MODEL: ${{ inputs.model }}
+      MLX_DATA: ${{ inputs.data }}
+      MLX_OUT: ${{ inputs.output }}
+      MLX_PYTHON: ${{ inputs.python }}
+      MLX_OLD: ${{ inputs.previous_model }}
+      MLX_ITERS: ${{ inputs.iters }}
+      MLX_GATE: ${{ inputs.max_test_ppl }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Preflight real Apple Silicon machine
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          test ! -e "$MLX_OUT"
+          test -d "$MLX_MODEL" && test -d "$MLX_DATA" && test -x "$MLX_PYTHON"
+          "$MLX_PYTHON" -c 'import mlx.core,mlx_lm'
+          node --check scripts/swarm-mlx-training-deployment-rollback.mjs
+          node --test scripts/swarm-mlx-lora.contract.test.mjs scripts/swarm-mlx-training-deployment-rollback.contract.test.mjs
+      - name: Train, fuse, serve candidate, inject fault, restore baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          FLAGS=()
+          if [ -n "$MLX_OLD" ]; then FLAGS=(--previous-model "$MLX_OLD"); fi
+          node scripts/swarm-mlx-training-deployment-rollback.mjs \
+            --model "$MLX_MODEL" --data "$MLX_DATA" \
+            --output "$MLX_OUT" --python "$MLX_PYTHON" \
+            --iters "$MLX_ITERS" --max-test-ppl "$MLX_GATE" \
+            --confirm-disposable-native-switch "${FLAGS[@]}" \
+            > "$RUNNER_TEMP/native-mlx-run.private.log"
+      - name: Generate sanitized proof
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f "$MLX_OUT/native-lifecycle-acceptance.json" ]; then
+            echo '{"status":"not_verified","reason":"No native receipt"}' > "$RUNNER_TEMP/native-mlx-public.json"
+            exit 0
+          fi
+          node -e '
+            const fs=require("fs"),r=JSON.parse(fs.readFileSync(process.env.MLX_OUT+"/native-lifecycle-acceptance.json"));
+            const v={status:r.status,platform:r.platform,architecture:r.architecture,
+              baselineCanary:r.baselineCanary??null,training:r.training??null,
+              candidate:r.candidate?{passed:r.candidate.passed,outputChars:r.candidate.outputChars}:null,
+              rollback:r.rollback?{verified:r.rollback.verified,restoredOutputChars:r.rollback.restoredOutputChars??null}:null,
+              desktopActivationTested:false,completedAt:r.completedAt??null};
+            fs.writeFileSync(process.env.RUNNER_TEMP+"/native-mlx-public.json",JSON.stringify(v,null,2)+"\n");
+          '
+      - name: Upload sanitized hardware outcome
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-silicon-native-mlx-lifecycle
+          retention-days: 14
+          if-no-files-found: error
+          path: ${{ runner.temp }}/native-mlx-public.json
