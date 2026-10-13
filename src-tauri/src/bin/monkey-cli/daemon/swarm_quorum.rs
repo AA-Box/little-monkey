@@ -61,7 +61,7 @@ fn local_state(store:&DaemonStore,group:&str,graph:&str,now:i64)
         version:1,group:group.into(),graph_id:graph.into(),
         source_fingerprint:roster.local().fingerprint.clone(),
         roster_sha256:roster.digest(),sequence:1,term:term as u64,
-        captured_at_ms:now,graph_state:result.1,nodes,trace_events:vec![],checksum:String::new()
+        captured_at_ms:now,graph_state:result.1,nodes,trace_events:vec![],model_usage:vec![],checksum:String::new()
     };
     snapshot.seal()?;
     snapshot.validate(now)?;
@@ -223,7 +223,7 @@ mod tests{
             version:1,group:"quorum-test".into(),graph_id:"graph".into(),
             source_fingerprint:fp_a.clone(),roster_sha256:roster.digest(),
             sequence:1,term:1,captured_at_ms:2000,
-            graph_state:"running".into(),nodes,trace_events:vec![],checksum:String::new()
+            graph_state:"running".into(),nodes,trace_events:vec![],model_usage:vec![],checksum:String::new()
         };
         snap.seal().unwrap();
         assert_ne!(state_digest(&snap).unwrap(),{
