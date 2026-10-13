@@ -1,6 +1,6 @@
 import {describe,it} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,lstatSync,rmSync,existsSync}
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,fstatSync,openSync,closeSync,constants,rmSync,existsSync}
  from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
@@ -44,9 +44,13 @@ describe('macOS native user-level specialist learning supervisor contract',()=>{
    assert.equal(installed.installed,true);
    assert.equal(calls[0].bin,'/bin/launchctl');
    assert.deepEqual(calls[0].args.slice(0,2),['bootstrap','gui/501']);
-   assert.equal(lstatSync(x.plist).mode&0o777,0o600);
-   assert.match(readFileSync(x.plist,'utf8'),/--confirm-unattended-local-evaluation/);
-   assert.match(readFileSync(x.plist,'utf8'),/--policy/);
+   const fd=openSync(x.plist,constants.O_RDONLY|constants.O_NOFOLLOW);
+   try{
+    assert.equal(fstatSync(fd).mode&0o777,0o600);
+    const contents=readFileSync(fd,'utf8');
+    assert.match(contents,/--confirm-unattended-local-evaluation/);
+    assert.match(contents,/--policy/);
+   }finally{closeSync(fd);}
    assert.throws(()=>manageService('install',x.policy,params),/already exists/);
    assert.deepEqual(manageService('status',null,params),{installed:true,running:true});
    const uninstalled=manageService('uninstall',null,params);
