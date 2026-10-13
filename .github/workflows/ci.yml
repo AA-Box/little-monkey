@@ -90,6 +90,7 @@ jobs:
           node --check scripts/swarm-repository-repair-live-acceptance.mjs
           node --test scripts/swarm-resident-restart-acceptance.contract.test.mjs
           node scripts/swarm-repository-repair-live-acceptance.mjs --self-check
+          node --test scripts/swarm-repository-repair-acceptance.contract.test.mjs
 
       - name: Production build and bundle budget
         run: pnpm build:budget

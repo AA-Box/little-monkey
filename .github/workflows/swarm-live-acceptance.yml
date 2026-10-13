@@ -37,6 +37,11 @@ on:
           - backend
           - performance
           - general
+      repair_review_target:
+        description: Distinct installed Ollama reviewer model (required when repair_target is set)
+        required: false
+        default: ''
+        type: string
       repair_target:
         description: Optional installed Ollama target for real permission-gated repository repair (operator MUST approve every write)
         required: false
@@ -272,10 +277,11 @@ jobs:
         shell: bash
         env:
           REPAIR_TARGET: ${{ inputs.repair_target }}
+          REPAIR_REVIEW_TARGET: ${{ inputs.repair_review_target }}
         run: |
           set -euo pipefail
           node scripts/swarm-repository-repair-live-acceptance.mjs \
-            --target "$REPAIR_TARGET" --confirm-manual-approvals \
+            --target "$REPAIR_TARGET" --review-target "$REPAIR_REVIEW_TARGET" --confirm-manual-approvals \
             --timeout-seconds 2400 \
             > "$RUNNER_TEMP/native-swarm-repository-repair.json"
       - name: Verify installed daemon re-elects a preapproved read-only fallback

@@ -160,7 +160,7 @@ if(process.argv.includes('--self-check')) {
       "for(const name of names){for(const owner of names){",
       "assert.equal(isOwner(name,owner),name===owner);}}",
       "console.log('independent holdout passed');",
-    ].join('\\n');
+    ].join('\n');
     if(!execute(process.execPath,['--input-type=module','--eval',holdout,
         join(work,'src','module.mjs')],work,10_000).includes('independent holdout passed'))
       throw Error('Independent holdout did not execute.');
