@@ -35,7 +35,7 @@ export function verifiedFusion(output,base){
     !Array.isArray(data.fusedWeights)||!data.fusedWeights.length||
     !/^[0-9a-f]{64}$/.test(data.fusedConfigSha256??''))fail('Fused weight or quality receipt is unverified');
  const model=checkedLocalDir(data.fusedModelPath,'fused model');
- if(model!==join(output,'fused-model'))fail('The fused model is not located in this training run');
+ if(model!==join(checkedLocalDir(output,'training output'),'fused-model'))fail('The fused model is not located in this training run');
  const config=digest(safeRegularBytes(join(model,'config.json'),'fused model config',1024*1024));
  if(config!==data.fusedConfigSha256)fail('Fused model configuration changed');
  const measured=fusedWeightsManifest(model);
