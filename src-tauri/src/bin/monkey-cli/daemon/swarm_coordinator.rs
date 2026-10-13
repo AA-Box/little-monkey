@@ -31,6 +31,11 @@ pub struct ResidentSwarmSpec {
     pub version: u32,
     pub id: String,
     pub nodes: Vec<ResidentSwarmNode>,
+    /// An operator-enrolled signed peer quorum. Only a current certified
+    /// leader may submit NEW daemon DAG nodes; failover may repeat read-only
+    /// compute, never an unattended edit or deployment.
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub cluster_id: Option<String>,
     #[serde(default = "default_parallel")]
     pub max_parallel: usize,
 }
@@ -67,6 +72,9 @@ pub fn validate(spec: &ResidentSwarmSpec) -> Result<Vec<String>, String> {
     if spec.version != 1 || !valid_id(&spec.id) || spec.nodes.is_empty() ||
        spec.nodes.len() > MAX_SWARM_NODES || !(1..=6).contains(&spec.max_parallel) {
         return Err("Swarm requires version 1, valid id, 1–16 nodes and parallelism 1–6".into());
+    }
+    if spec.cluster_id.as_deref().is_some_and(|group|!valid_id(group)){
+        return Err("Invalid cluster leadership group id".into());
     }
     let mut lookup = BTreeMap::new();
     for node in &spec.nodes {
@@ -166,6 +174,11 @@ pub fn submit(paths: &DaemonPaths, input: &Path) -> Result<serde_json::Value, St
     validate(&spec)?;
     let mut store = DaemonStore::open(paths)?;
     prepare_schema(&store)?;
+    if let Some(group)=spec.cluster_id.as_deref(){
+        // Do not allow graph registration to silently enroll a peer or create
+        // a federation. An operator configures both sides separately.
+        super::swarm_cluster::roster(&store,group)?;
+    }
     let existing: Option<String> = store.connection.query_row(
         "SELECT graph_id FROM resident_swarm_graphs WHERE graph_id=?1",
         [&spec.id], |row| row.get(0),
@@ -177,6 +190,14 @@ pub fn submit(paths: &DaemonPaths, input: &Path) -> Result<serde_json::Value, St
         if !origin.is_absolute() { return Err("Swarm recipes must use absolute paths".into()); }
         let frozen = paths.snapshots.join(format!("resident-swarm-{}-{}.json", spec.id, node.id));
         freeze_recipe(&origin, &frozen)?;
+        if spec.cluster_id.is_some(){
+            let frozen_recipe:little_monkey_lib::recipes::Recipe=
+                serde_json::from_slice(&std::fs::read(&frozen).map_err(|e|e.to_string())?)
+                .map_err(|e|e.to_string())?;
+            if frozen_recipe.permission_mode!="plan"{
+                return Err("Cluster-failover recipes must be read-only plan mode".into());
+            }
+        }
         if let Some(alternate) = node.fallback_recipe.as_ref() {
             // Alternate execution may only replace a root plan-mode task.
             // If the first attempt might have mutated files, automatically
@@ -530,6 +551,12 @@ pub fn tick(
                 WHERE graph_id=?1",params![id,now]).map_err(|e| e.to_string())?;
             continue;
         }
+        if let Some(group)=spec.cluster_id.as_deref(){
+            // A lost quorum, expired lease or a new candidate term cannot
+            // schedule new work. Previously started read-only computations
+            // remain under ordinary daemon cancellation/supervision.
+            if !super::swarm_cluster::may_schedule(store,group,now)?{continue;}
+        }
         if store.kill_switch()? || super::backpressure_for(store,config)?.state ==
             super::scheduler::BackpressureState::Closed {
             continue;
@@ -628,7 +655,7 @@ mod tests {
     use super::*;
 
     fn example() -> ResidentSwarmSpec {
-        ResidentSwarmSpec { version: 1, id: "test-graph".into(), max_parallel: 2,
+        ResidentSwarmSpec { version: 1, id: "test-graph".into(), max_parallel: 2,cluster_id:None,
             nodes: vec![
                 ResidentSwarmNode { id:"survey".into(), recipe:"/tmp/survey.json".into(),depends_on:vec![],include_dependency_reports:false,fallback_recipe:None,max_runtime_seconds:100 },
                 ResidentSwarmNode { id:"verify".into(), recipe:"/tmp/verify.json".into(),depends_on:vec!["survey".into()],include_dependency_reports:true,fallback_recipe:None,max_runtime_seconds:100 },
@@ -683,7 +710,7 @@ mod tests {
         let backup_path=root.join("backup.json");
         std::fs::copy(&recipe_path,&backup_path).unwrap();
         let graph = ResidentSwarmSpec {
-            version: 1, id: "resumable-test".into(), max_parallel: 1,
+            version: 1, id: "resumable-test".into(), max_parallel: 1,cluster_id:None,
             nodes: vec![
                 ResidentSwarmNode {id:"survey".into(),recipe:recipe_path.to_string_lossy().to_string(),
                     depends_on: vec![],include_dependency_reports:false,fallback_recipe:None,max_runtime_seconds: 120},
