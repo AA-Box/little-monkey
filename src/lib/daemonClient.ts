@@ -200,6 +200,17 @@ export const daemonSwarmSubmit = (specPath: string) =>
   invoke<{ id: string; state: string; nodes: number }>("daemon_swarm_submit", { specPath });
 export const daemonSwarmStatus = (id: string | null = null) =>
   invoke<{ graphs: ResidentSwarmGraphStatus[] }>("daemon_swarm_status", { id });
+/** Remote state is signed-peer evidence only, not an executed local graph. */
+export interface DaemonSwarmReplica {
+  version:number;group:string;graph_id:string;source_fingerprint:string;
+  roster_sha256:string;sequence:number;term:number;captured_at_ms:number;
+  graph_state:string;nodes:{id:string;state:string;job_id:string|null}[];
+  checksum:string;
+}
+export const daemonSwarmReplicaStatus = (group:string,id:string) =>
+  invoke<{group:string;graph:string;replicas:DaemonSwarmReplica[];trusted_for_execution:false}>(
+    'daemon_swarm_replica_status',{group,id});
+
 export const daemonSwarmCancel = (id: string) =>
   invoke<string>("daemon_swarm_cancel", { id });
 
