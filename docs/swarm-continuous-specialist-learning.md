@@ -122,3 +122,19 @@ To include the served MLX model in specialist learning, add the string `local-ur
 The supervisor verifies candidate weights and runs a fresh source-oracle benchmark through a separate local-only probe port. It returns HTTP 503 when no independently passing candidate is active or while switching. Real candidate regressions trigger independent regrading of the prior model before rollback. Failed deployment attempts cannot repeat unattended after a crash; the operator must explicitly review an attempt marker.
 
 **Verification boundary:** the test suite verifies subprocess wiring, safety gates and rollback contracts using stand-ins. Apple Silicon MLX training, actual fused serving and tool-call compatibility are **not** demonstrated by CI. If `mlx_lm.server` does not support the native CLI's tools for a fixture, source-oracle grading fails and promotion is blocked. This integration does not automatically activate the Tauri desktop's resident MLX model and is not a production-hardened remote API.
+
+To make this operator-approved supervisor survive login/restart, install its
+current-user macOS LaunchAgent (never root, no shell, no inherited provider secrets):
+
+```sh
+node scripts/swarm-mlx-service.mjs install --policy /absolute/path/serving-policy.json --confirm-install-service
+node scripts/swarm-mlx-service.mjs status
+node scripts/swarm-mlx-service.mjs uninstall
+```
+
+The agent starts automatically with the user session and is restarted by
+`launchd` if the supervised process fails. State ownership and pre-existing
+backend ports are checked before resuming; an unknown orphan process is
+not killed merely to get the service running. The selected live backend must
+report the exact model identity, and a new model must pass real generation
+and independent native-source grading before publication.
