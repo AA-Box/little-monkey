@@ -234,6 +234,7 @@ pub mod models;
 pub mod ollama;
 mod process_lock;
 pub mod providers;
+pub mod provider_oauth;
 pub mod triage;
 // Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14):
 // Tauri-free static-registry + comparison logic shared by `providers.rs`'s
@@ -1400,6 +1401,7 @@ pub fn run() {
             providers::providers_add_custom,
             providers::providers_remove_custom,
             providers::providers_set_key,
+            provider_oauth::providers_openrouter_login,
             providers::providers_remove_key,
             providers::providers_list_models,
             providers::providers_check_model_retirements,
