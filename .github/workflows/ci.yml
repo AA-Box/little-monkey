@@ -57,6 +57,8 @@ jobs:
 
       - name: Exercise live two-peer harness contract (controlled CLI only)
         run: pnpm test:swarm-peer:contract
+      - name: Verify physical recovery stress harness contracts (no real peers)
+        run: pnpm test:swarm-physical:contract
       - name: Contract-test real-device vector memory and cancellation gates (no network)
         run: |
           node --check scripts/swarm-two-peer-memory-live-acceptance.mjs
