@@ -38,11 +38,15 @@ roster for all three stage runs. Do not recreate the graph between stages.
    `network_stage=restore` using the original evidence path. It refuses
    a changed sender identity, missing operator partition checkpoint, an
    expired/absent majority lease or a non-advancing durable replica
-   sequence. The workflow then runs **30 concurrent-stress publications
-   (4 workers)** by default, with no retransmission or synthetic ACKs.
-   Customize `stress_rounds` 10–500, `stress_concurrency` 1–8. The gate
-   requires every POST and exact remote SQLite readback, distinct sequence
-   numbers, a stable sender roster, a stable receiver instance identity,
+   sequence. The workflow then runs **30 readback-verified checkpoint
+   publications** by default on one preapproved graph, with no synthetic ACKs.
+   For **actual parallel stress**, separately prestage three more operator-
+   approved read-only graphs assigned to the same cluster and set
+   `stress_concurrency=4` and `stress_additional_graphs=graph-b,graph-c,graph-d`.
+   Each concurrent worker must have its own graph identity: the receiving
+   SQLite store correctly rejects stale out-of-order snapshots on one key.
+   The gate requires every POST and exact remote SQLite readback, distinct
+   sequences **per graph**, a stable sender roster, a stable receiver identity,
    100% successful publications and p95 at most 30 seconds.
 5. Repeat on machine B with `swarm-node-b`, a separate readonly DAG,
    the reverse paired alias and a different private evidence path. Then
@@ -58,6 +62,7 @@ On A **after the baseline/partition/restore evidence is complete**:
 node scripts/swarm-replica-stress-live-acceptance.mjs \
   --group enrolled-test-group --graph preapproved-graph-a --peer node-b \
   --rounds 30 --concurrency 4 \
+  --additional-graphs graph-b,graph-c,graph-d \
   --confirm-operator-owned-readonly-cluster \
   --confirm-independent-machines --confirm-post-recovery
 ```
