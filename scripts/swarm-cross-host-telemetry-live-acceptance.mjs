@@ -52,7 +52,8 @@ export function verifyRemoteJournal(view,{group,graph,sourceFingerprint,now=Date
  for(const row of usage){
   if(!row||typeof row.node_id!=='string'||!nodeIds.has(row.node_id)||
     unique.has(row.node_id)||!snapshot.nodes.some(n=>
-      n.id===row.node_id&&n.state==='succeeded')||
+      n.id===row.node_id&&n.state===row.status)||
+    !['succeeded','failed'].includes(row.status)||
     typeof row.target_id!=='string'||
     !/^[A-Za-z0-9][A-Za-z0-9_./:@+%-]{0,159}$/.test(row.target_id)||
     !Number.isSafeInteger(row.elapsed_ms)||row.elapsed_ms<0||row.elapsed_ms>86_400_000||
