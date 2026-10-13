@@ -234,9 +234,9 @@ fn consume(paths:&DaemonPaths,plan:&ArmedPlan,now:i64)->Result<(),String>{
         // Re-check the majority lease just before registration. Dispatch
         // remains separately fenced by the swarm coordinator's own tick.
         let store=DaemonStore::open(paths)?;
-        let fresh=i64::try_from(super::now_ms()?)
-            .map_err(|_|"Recovery clock overflow".to_string())?;
-        if !swarm_cluster::may_schedule(&store,&plan.group,fresh)?{
+        // run_once is passed a fresh post-network clock by the live worker;
+        // unit tests supply a deterministic synthetic election clock.
+        if !swarm_cluster::may_schedule(&store,&plan.group,now)?{
             return Err("Local majority lease was lost before recovery registration".into());
         }
         drop(store);
