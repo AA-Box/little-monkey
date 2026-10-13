@@ -35,7 +35,11 @@ describe('real opt-in auto-learning; no synthetic test results accepted',()=>{
   const x=create();try{
    const waiting=join(x.policy.inbox,'batch-unfinished');
    mkdirSync(waiting);writeFileSync(join(waiting,'train.jsonl'),'{"text":"in progress"}');
-   const noApproval=learnOnce(x.policy,{execute:()=>{throw Error('GPU started');},log:()=>{}});
+   let executions=0;
+   const noApproval=learnOnce(x.policy,{execute:()=>{executions++;return {status:0};},log:()=>{}});
+   // The existing approved fixture may train, but the unfinished second
+   // batch must NOT dispatch and cannot poison the whole worker.
+   assert.equal(executions,1);
    assert.equal(noApproval[0].status,'failed_receipt_requires_operator_review');
    // Existing valid batch was claimed. An unapproved batch is safely ignored.
    assert.equal(readFileSync(join(waiting,'train.jsonl'),'utf8'),'{"text":"in progress"}');
