@@ -42,7 +42,7 @@ test('rejects tampered, stale, unrelated, and replayed trace observations',()=>{
 });
 test('v3 independent receiver requires real metered usage for complete cross-host verification',()=>{
  const v=sample();
- const usage={node_id:'n',target_id:'provider:model',
+ const usage={node_id:'n',status:'succeeded',target_id:'provider:model',
    elapsed_ms:1400,input_tokens:700,output_tokens:100,
    cached_input_tokens:200,model_calls:1,cost_micros:250};
  assert.throws(()=>verifyRemoteJournal(v,{...input,requireModelUsage:true}),/metering/);
