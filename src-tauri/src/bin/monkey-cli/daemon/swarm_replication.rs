@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest,Sha256};
 use super::store::DaemonStore;
 use super::swarm_cluster;
+use little_monkey_lib::run_ledger::{ChainVerification, RunLedger};
+use little_monkey_lib::run_protocol::RunEvent;
 
 const MAX_GRAPH_NODES: usize = 16;
 const MAX_CHECKPOINT_BYTES: usize = 64 * 1024;
@@ -40,6 +42,22 @@ pub struct ReplicaTraceEvent {
 }
 #[derive(Clone,Debug,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Aggregate metered inference usage from a completed, hash-chain-verified
+/// original-host run. This is NOT a provider invoice or answer correctness.
+#[derive(Clone,Debug,Serialize,Deserialize,PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaModelUsage {
+    pub node_id: String,
+    pub target_id: String,
+    pub elapsed_ms: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub model_calls: u32,
+    pub cost_micros: Option<u64>,
+}
+#[derive(Clone,Debug,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplicaSnapshot {
     pub version: u32,
     pub group: String,
@@ -53,6 +71,8 @@ pub struct ReplicaSnapshot {
     pub nodes: Vec<ReplicaNode>,
     #[serde(default, skip_serializing_if="Vec::is_empty")]
     pub trace_events: Vec<ReplicaTraceEvent>,
+    #[serde(default, skip_serializing_if="Vec::is_empty")]
+    pub model_usage: Vec<ReplicaModelUsage>,
     pub checksum: String,
 }
 fn hash(snapshot:&ReplicaSnapshot)->Result<String,String>{
@@ -66,12 +86,20 @@ fn hash(snapshot:&ReplicaSnapshot)->Result<String,String>{
             snapshot.sequence,snapshot.term,snapshot.captured_at_ms,
             &snapshot.graph_state,&snapshot.nodes,
         ))
+    }else if snapshot.version==2{
+        serde_json::to_vec(&(
+            snapshot.version,&snapshot.group,&snapshot.graph_id,
+            &snapshot.source_fingerprint,&snapshot.roster_sha256,
+            snapshot.sequence,snapshot.term,snapshot.captured_at_ms,
+            &snapshot.graph_state,&snapshot.nodes,&snapshot.trace_events,
+        ))
     }else{
         serde_json::to_vec(&(
             snapshot.version,&snapshot.group,&snapshot.graph_id,
             &snapshot.source_fingerprint,&snapshot.roster_sha256,
             snapshot.sequence,snapshot.term,snapshot.captured_at_ms,
             &snapshot.graph_state,&snapshot.nodes,&snapshot.trace_events,
+            &snapshot.model_usage,
         ))
     }.map_err(|e|e.to_string())?;
     Ok(format!("{:x}",Sha256::digest(&bytes)))
@@ -94,7 +122,7 @@ impl ReplicaSnapshot{
         Ok(())
     }
     pub fn validate(&self,now:i64)->Result<(),String>{
-        if !matches!(self.version,1|2) || !valid_id(&self.group)||!valid_id(&self.graph_id)||
+        if !matches!(self.version,1|2|3) || !valid_id(&self.group)||!valid_id(&self.graph_id)||
             !self.source_fingerprint.bytes().all(|c|c.is_ascii_hexdigit()&&!c.is_ascii_uppercase())||
             self.source_fingerprint.len()!=64||
             self.roster_sha256.len()!=64 ||
@@ -121,6 +149,25 @@ impl ReplicaSnapshot{
         if (self.version==1 && !self.trace_events.is_empty())||
             self.trace_events.len()>MAX_TRACE_EVENTS{
             return Err("Unsupported or excessive distributed trace events".into());
+        }
+        if (self.version<3 && !self.model_usage.is_empty())||
+           self.model_usage.len()>MAX_GRAPH_NODES{
+            return Err("Unsupported or excessive original-host inference telemetry".into());
+        }
+        let mut usage_nodes=std::collections::BTreeSet::new();
+        for usage in &self.model_usage{
+            if !unique.contains(usage.node_id.as_str())||
+                !usage_nodes.insert(usage.node_id.as_str())||
+                usage.target_id.is_empty()||usage.target_id.len()>160||
+                !usage.target_id.bytes().all(|c|
+                    c.is_ascii_alphanumeric()||matches!(c,b'-'|b'_'|b'.'|b':'|b'/'|b'@'|b'+'|b'%'))||
+                usage.elapsed_ms>3_600_000*24||
+                usage.input_tokens>100_000_000||usage.output_tokens>100_000_000||
+                usage.cached_input_tokens>usage.input_tokens||
+                usage.model_calls==0||usage.model_calls>100_000||
+                usage.cost_micros.is_some_and(|cost|cost>1_000_000_000_000){
+                return Err("Malformed or unrelated metered inference telemetry".into());
+            }
         }
         let mut last=0;
         for event in &self.trace_events{
@@ -249,6 +296,43 @@ pub fn list_local(
         serde_json::from_str(&raw).map_err(|e|e.to_string())
     ).collect()
 }
+/// Extract only independently hash-chain-verified metered usage from completed
+/// local daemon runs. Never trust a job status or model-produced success claim.
+fn measured_usage(
+    paths:&super::store::DaemonPaths,store:&DaemonStore,nodes:&[ReplicaNode],
+)->Vec<ReplicaModelUsage>{
+    let Ok(ledger)=RunLedger::open(&paths.ledger_db) else{return vec![]};
+    let mut rows=Vec::new();
+    for node in nodes {
+        if node.state!="succeeded" {continue;}
+        let Some(job)=node.job_id.as_deref()
+            .and_then(|id|store.get_job(id).ok().flatten()) else {continue};
+        let (Some(run_id),Some(start),Some(end))=(
+            job.run_id.as_deref(),job.started_at_ms,job.finished_at_ms
+        ) else{continue};
+        if end<start||end-start>86_400_000{continue;}
+        let Ok(Some(run))=ledger.load_run(run_id) else{continue};
+        if run.status!=little_monkey_lib::run_protocol::RunStatus::Succeeded||
+            run.last_sequence==0||run.last_sequence>4000 {continue;}
+        if !matches!(ledger.verify_run_chain(run_id),
+            Ok(ChainVerification::Intact{
+                covered_from:Some(1),covered_through:Some(last),events_seen,..
+            }) if last==run.last_sequence && events_seen==last) {continue;}
+        let Ok(events)=ledger.load_events(run_id,run.last_sequence-1,1) else{continue};
+        let Some(event)=events.into_iter().next() else{continue};
+        let RunEvent::Completed{usage,..}=event.event else{continue};
+        let target=run.spec.target.target_id();
+        if target.is_empty()||target.len()>160 {continue;}
+        rows.push(ReplicaModelUsage{
+            node_id:node.id.clone(),target_id:target.to_owned(),
+            elapsed_ms:end-start,input_tokens:usage.input_tokens,
+            output_tokens:usage.output_tokens,
+            cached_input_tokens:usage.cached_input_tokens,
+            model_calls:usage.model_calls,cost_micros:usage.cost_micros,
+        });
+    }
+    rows
+}
 /// Capture an actual locally authorized leader's DAG state for one
 /// operator-selected peer. Neither prompts nor credentials nor model outputs
 /// are included. Outbound sequence allocation is durable and transactional:
@@ -339,13 +423,14 @@ pub fn capture_local_leader(
       .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
     trace_events.reverse();
     drop(events_stmt);
+    let model_usage=measured_usage(paths,&store,&nodes);
     let mut snapshot=ReplicaSnapshot{
-        version:2,group:group.to_owned(),graph_id:graph.to_owned(),
+        version:if model_usage.is_empty(){2}else{3},group:group.to_owned(),graph_id:graph.to_owned(),
         source_fingerprint:members.local().fingerprint.clone(),
         roster_sha256:members.digest(),
         sequence:next as u64,
         term:u64::try_from(term).map_err(|_|"Invalid persisted election term")?,
-        captured_at_ms:now,graph_state:state,nodes,trace_events,
+        captured_at_ms:now,graph_state:state,nodes,trace_events,model_usage,
         checksum:String::new(),
     };
     snapshot.checksum=hash(&snapshot)?;
@@ -475,6 +560,7 @@ mod tests{
             graph_state:"running".into(),
             nodes:vec![ReplicaNode{id:"audit".into(),state:"submitted".into(),job_id:Some("job-original".into())}],
             trace_events:vec![],
+            model_usage:vec![],
             checksum:String::new(),
         };
         snapshot.checksum=hash(&snapshot).unwrap();
