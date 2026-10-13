@@ -705,6 +705,33 @@ export const TASK_TOOL: ToolDef = {
  * Frontend-only: `executeToolCall` intercepts the name before the
  * `invoke('tool_'+name)` dispatch, exactly like `task`.
  */
+/** A finite JSON schema (no unbounded $ref) for nested delegation.
+ * It is constructed once when tools are registered, not by a model turn.
+ * Every level is strict, and the compiler repeats the structural checks. */
+function workflowGraphTaskSchema(depth: number): Record<string, unknown> {
+  return {
+    type: 'object',
+    properties: {
+      id: { type: 'string', description: 'Unique lowercase kebab-case task id.' },
+      description: { type: 'string', description: 'Short label.' },
+      prompt: { type: 'string', description: 'Complete independent task instructions.' },
+      profile: { type: 'string', description: 'explore, code or an installed agent profile.' },
+      depends_on: { type: 'array', items: { type: 'string' }, description: 'Explicit predecessor IDs. Child also always depends on its parent.' },
+      effort: { type: 'string', enum: ['low', 'medium', 'high'] },
+      isolation: { type: 'string', enum: ['worktree'] },
+      peer: { type: 'string', description: 'Read-only paired peer alias, checked by existing peer permission policy.' },
+      ...(depth < 3 ? {
+        children: {
+          type: 'array', maxItems: 6, items: workflowGraphTaskSchema(depth + 1),
+          description: 'Bounded preapproved child tasks, never a grant of new tool authority.',
+        },
+      } : {}),
+    },
+    required: ['id', 'description', 'prompt'],
+    additionalProperties: false,
+  };
+}
+
 export const WORKFLOW_TOOL: ToolDef = {
   type: 'function',
   function: {
@@ -717,28 +744,8 @@ export const WORKFLOW_TOOL: ToolDef = {
         tasks: {
           type: 'array',
           maxItems: 16,
-          description: 'Optional explicit dependency graph instead of phases or a goal. Give name, description and tasks; each task has a unique id and depends_on references. The compiler schedules independent waves (at most 6 phases / 6 agents per phase), stops on failed prerequisites, and uses ordinary agent permissions.',
-          items: {
-            type: 'object',
-            properties: {
-              id: { type: 'string', description: 'Unique lowercase kebab-case task id.' },
-              description: { type: 'string', description: 'Short label for this task.' },
-              prompt: { type: 'string', description: 'Complete, self-contained instructions.' },
-              profile: { type: 'string', description: 'explore, code, or an installed custom agent profile.' },
-              depends_on: { type: 'array', items: { type: 'string' }, description: 'IDs of tasks that must complete successfully first.' },
-              effort: { type: 'string', enum: ['low', 'medium', 'high'] },
-              isolation: { type: 'string', enum: ['worktree'] },
-              peer: { type: 'string', description: 'Optional paired Little Monkey peer alias for a read-only explore task. Requires explicit peer-task grant and the peer-task recipe; never selects remote workspace/permissions.' },
-              children: {
-                type: 'array',
-                maxItems: 6,
-                description: 'Optional nested task descendants; same task fields, at most three levels and sixteen total. Every child implicitly depends on its parent. Compiler validates all descendants and rejects unknown fields.',
-                items: { type: 'object', description: 'Nested task with id, description, prompt, optional profile, depends_on and children. Validated by native graph compiler.', additionalProperties: true },
-              },
-            },
-            required: ['id', 'description', 'prompt'],
-            additionalProperties: false,
-          },
+          description: 'Explicit DAG with optional three-level, six-child bounded hierarchical delegation. Every child waits for its parent and inherits the normal execution permission boundary.',
+          items: workflowGraphTaskSchema(1),
         },
         notebook: {
           type: 'boolean',
