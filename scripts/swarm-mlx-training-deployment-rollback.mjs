@@ -6,7 +6,7 @@
  */
 import {spawn} from 'node:child_process';
 import {createServer,connect} from 'node:net';
-import {mkdtempSync,openSync,closeSync,existsSync,writeFileSync,rmSync,realpathSync} from 'node:fs';
+import {mkdtempSync,openSync,closeSync,existsSync,writeFileSync,rmSync,realpathSync,statSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {dirname,join,isAbsolute,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -183,7 +183,12 @@ async function main(){
  const iterations=option('--iters')??'200',gate=option('--max-test-ppl');
  const plan=trainingPlan({model,data,output,iters:iterations,maxPpl:gate});
  if(previous===output||output.startsWith(previous+'/'))fail('Do not place candidate output within the previous production model');
- const python=realpathSync(exactAbsolute(option('--python'),'Python executable'));
+ const python=exactAbsolute(option('--python'),'Python executable');
+ // A macOS venv/bin/python is usually a symlink to the framework interpreter.
+ // Executing the resolved target BYPASSES the venv's site-packages. Verify its
+ // target, but invoke the operator-selected venv entrypoint unchanged.
+ realpathSync(python);
+ if(!statSync(python).isFile())fail('Python must resolve to an existing regular executable');
  const logs=mkdtempSync(join(tmpdir(),'swarm-native-mlx-acceptance-'));
  const receipt={version:1,status:'not_verified',acceptance:'native-mlx-train-fuse-live-service-rollback',
   platform:process.platform,architecture:process.arch,baseline:previous,
