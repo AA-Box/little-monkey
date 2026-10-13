@@ -162,7 +162,7 @@ pub fn vote(store:&mut DaemonStore,req:&VoteRequest,caller_device_id:&str,now:i6
         [&req.group],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?))
     ).optional().map_err(|e|e.to_string())?;
     if let Some((term,candidate,expiry))=existing{
-        if req.term as i64<term ||
+        if (req.term as i64) < term ||
            (req.term as i64==term&&candidate!=req.candidate_fingerprint) ||
            (req.term as i64>term&&expiry>now){
             return Err("Voter has a newer term or an overlapping lease for another candidate".into());
