@@ -446,6 +446,12 @@ mod tests{
         assert_eq!(graph["graphs"][0]["tasks"][0]["state"],"pending");
         assert!(graph["graphs"][0]["tasks"][0]["job_id"].is_null(),
             "foreign model successes and job identities cannot be transferred");
+        {
+            let b=DaemonStore::open(&receiver).unwrap();
+            assert!(super::super::swarm_coordinator::owns_current_epoch(
+                &b,"swarm-team","recovered",30_002
+            ).unwrap(),"the replacement is owned by B in its newly certified term");
+        }
         run_once(&receiver,30_002).unwrap();
         assert_eq!(super::super::swarm_coordinator::status(&receiver,Some("recovered"))
             .unwrap()["graphs"].as_array().unwrap().len(),1);
@@ -478,6 +484,24 @@ mod tests{
             .find(|plan|plan["id"]=="ambiguous-recovery").unwrap();
         assert_eq!(blocked["state"],"armed",
             "uncertain already-started remote work must never be blindly replayed");
+        // A can regain a signed majority in term 3 after B's lease expires,
+        // but its old original term-1 graph is permanently fenced. A new
+        // majority does NOT automatically authorize replay of old work.
+        {
+            let mut a=DaemonStore::open(&sender).unwrap();
+            let mut c=DaemonStore::open(&witness).unwrap();
+            let term3=VoteRequest{
+                group:"swarm-team".into(),term:3,
+                candidate_fingerprint:afp.clone(),roster_sha256:a_roster.digest()
+            };
+            let vote_a=swarm_cluster::vote(&mut a,&term3,"@local",55_000).unwrap();
+            let vote_c=swarm_cluster::vote(&mut c,&term3,"signed-a",55_000).unwrap();
+            swarm_cluster::persist_quorum(&a,&term3,&[vote_a,vote_c],55_000).unwrap();
+            assert!(swarm_cluster::may_schedule(&a,"swarm-team",55_001).unwrap());
+            assert!(!super::super::swarm_coordinator::owns_current_epoch(
+                &a,"swarm-team","original",55_001
+            ).unwrap(),"regaining an election cannot replay a previous leader term's DAG");
+        }
         assert!(super::super::swarm_coordinator::status(&receiver,
             Some("do-not-replay")).unwrap()["graphs"].as_array().unwrap().is_empty());
         let _=fs::remove_dir_all(root);
