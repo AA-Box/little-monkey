@@ -656,4 +656,4 @@ model success is scored as correctness.
 
 The contract test uses an explicitly separate mock CLI executable and
 **does not establish real-model performance**. This harness does not
-measure daemon RSS or CPU or establish a JCode performance comparison.
+measure CPU utilization, PSS, or establish a JCode performance comparison. It samples the installed daemon's PID and descendant process-tree resident RSS when available, recording a per-tier baseline, peak and growth. Shared pages may be counted twice; missing daemon/sampling permissions produce explicit null metrics instead of fabricated memory values.
