@@ -443,3 +443,77 @@ settings and the previous model can be restored. Nothing automatically
 switches cloud providers or widens peer/tool permissions. Held-out MLX
 perplexity and source-backed real-model benchmark results remain independent
 of the availability canary; one generic completion does not certify those.
+
+
+### Signed-peer cluster leader leases for resident read-only DAGs
+
+Cluster mode is opt-in. It uses real TLS-pinned, HMAC-authenticated peer
+requests, explicit task grants and a strict majority of durable votes.
+Every node must have an operator-configured roster with exactly the same
+set of **real server certificate fingerprints** and its own corresponding
+inbound pairing-device IDs and outbound aliases. Enrollment never grants
+peer permissions.
+
+Example shape to author on EACH machine (replace the illustrative
+fingerprint strings with ACTUAL 64-hex-character SHA-256 fingerprints):
+
+~~~json
+{
+  "version": 1,
+  "group": "research-cluster",
+  "members": [
+    {
+      "fingerprint": "the-real-local-server-TLS-SHA256-fingerprint",
+      "device_id": "@local",
+      "alias": null
+    },
+    {
+      "fingerprint": "the-real-remote-server-TLS-SHA256-fingerprint",
+      "device_id": "the-real-inbound-pairing-device-id",
+      "alias": "an-existing-outbound-pairing-alias"
+    }
+  ]
+}
+~~~
+
+The fingerprint placeholders above are NOT valid hashes: enter genuine
+64-character lowercase SHA-256. Cluster IDs, TLS identities, aliases and
+device IDs are never inferred from untrusted model output. Configure,
+query and optionally elect on each installed node:
+
+~~~sh
+monkey peers cluster-setup /absolute/path/to/roster.json
+monkey peers cluster-status research-cluster
+monkey peers cluster-elect research-cluster
+~~~
+
+An operator-enrolled resident graph includes a cluster_id property with
+value research-cluster in its version-1 JSON. Every clustered recipe is
+frozen and strictly read-only plan mode: neither edits nor arbitrary
+deployments can be replayed by a newly elected leader. A native coordinator
+heartbeat may schedule new jobs ONLY when this installation has a live
+quorum certificate. A 20-second exclusive voting term is fenced by a
+5-second local safety margin. The resident daemon attempts renewal or
+higher-term re-election after expiry using ONLY the pinned roster.
+Disagreement on roster SHA-256, changed certificate, revoked task grant,
+overlapping vote, unknown identity or minority network partition cannot
+establish a valid majority.
+
+Run actual signed quorum acceptance on two or more independently installed,
+pre-paired machines:
+
+~~~sh
+node scripts/swarm-cluster-live-acceptance.mjs \
+  --group research-cluster --min-voters 2 --confirm-operator-cluster
+~~~
+
+The script checks signed native election responses and an independently
+read back current local scheduling lease. Its acceptance does not stand
+in for a real model run or a physical failure-injection exercise.
+
+Each cluster node keeps its own locally submitted frozen DAG. New leaders
+can resume pending **read-only computation** by scheduling their own graph
+copy after the old quorum expires. State and output are NOT yet replicated
+across host SQLite databases; previously completed remote model computation
+may be repeated after failover. No automatic cluster membership changes,
+Raft/BFT replicated logs or exactly-once external side effects are claimed.
