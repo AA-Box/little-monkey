@@ -39,10 +39,11 @@ export function parseServingPolicy(raw){
  const p=typeof raw==='string'?JSON.parse(raw):raw;
  if(!p||Array.isArray(p)||typeof p!=='object'||
   Object.keys(p).sort().join(',')!==
-  'backendPort,checkSeconds,domains,listenPort,minAccuracy,minImprovement,modelAlias,monkeyBin,repetitions,stateDir,timeoutMs,trainingPolicy,version')
+  'backendPort,checkSeconds,domains,listenPort,minAccuracy,minImprovement,modelAlias,monkeyBin,probePort,repetitions,stateDir,timeoutMs,trainingPolicy,version')
   fail('Expected exact supervised MLX serving policy version 1');
  if(p.version!==1||!integer(p.backendPort,1024,65535)||!integer(p.listenPort,1024,65535)||
-  p.backendPort===p.listenPort||typeof p.modelAlias!=='string'||
+  !integer(p.probePort,1024,65535)||
+  new Set([p.backendPort,p.listenPort,p.probePort]).size!==3||typeof p.modelAlias!=='string'||
   !/^[A-Za-z0-9_.-]{2,80}$/.test(p.modelAlias)||!integer(p.repetitions,2,5)||
   !integer(p.timeoutMs,10000,3600000)||!integer(p.checkSeconds,60,86400)||
   !Array.isArray(p.domains)||p.domains.length<1||p.domains.length>5||
@@ -170,7 +171,7 @@ async function stopBackend(child){
  if(child.exitCode===null){child.kill('SIGKILL');await exited;}
 }
 async function independentOracle(policy){
- const scores={},target='local-url:http://127.0.0.1:'+policy.backendPort+'|'+policy.modelAlias;
+ const scores={},target='local-url:http://127.0.0.1:'+policy.probePort+'|'+policy.modelAlias;
  for(const domain of policy.domains){
   const run=await execute(process.execPath,[join(ROOT,'swarm-specialist-live-benchmark.mjs'),
    '--domain',domain,'--target',target,'--repetitions',String(policy.repetitions),
@@ -261,19 +262,28 @@ export async function serve(policy){
  const unlock=acquireCycleLock(policy.stateDir);
  const state={active:false,generation:0,model:null,child:null,scores:null,metadata:null};
  const server=localProxy(policy,state);
+ // The separate local acceptance proxy exposes candidate inference only while
+ // independent native grading runs. Production routing remains 503 until passed.
+ const probeState={active:false,generation:0};
+ const probeServer=localProxy(policy,probeState);
  let stopping=false;
  const close=()=>{stopping=true;};
  process.on('SIGINT',close);process.on('SIGTERM',close);
  try{
   await new Promise((done,reject)=>{server.once('error',reject);
    server.listen(policy.listenPort,'127.0.0.1',done);});
+  await new Promise((done,reject)=>{probeServer.once('error',reject);
+   probeServer.listen(policy.probePort,'127.0.0.1',done);});
   const switchModel=async(path)=>{
    state.active=false;state.generation++;
+   probeState.active=false;probeState.generation++;
    await stopBackend(state.child);state.child=null;
    const child=await startBackend(policy,path);
    state.child=child;
+   probeState.active=true;
    try{return {modelPath:path,scores:await independentOracle(policy)};}
    catch(e){await stopBackend(child);state.child=null;throw e;}
+   finally{probeState.active=false;probeState.generation++;}
   };
   const publish=(tested,metadata)=>{
    const saved={version:1,modelPath:tested.modelPath,scores:tested.scores,
@@ -293,13 +303,14 @@ export async function serve(policy){
   }
   while(!stopping){
    try{await probe(policy.backendPort);
+    probeState.active=true;
     state.scores=await independentOracle(policy);
    }catch(e){
     state.active=false;state.generation++;
     if(state.model===policy.training.model)throw e;
     console.error('MLX model regressed; independently regrading base rollback:',String(e));
     publish(await switchModel(policy.training.model),null);
-   }
+   }finally{probeState.active=false;probeState.generation++;}
    try{
     await execute(process.execPath,[join(ROOT,'swarm-mlx-auto-learning.mjs'),
      '--policy',policy.trainingPolicy,'--confirm-auto-training','--once'],{
@@ -335,7 +346,7 @@ export async function serve(policy){
   }
  }finally{
   state.active=false;state.generation++;
-  server.close();
+  server.close();probeServer.close();
   await stopBackend(state.child);
   unlock();
  }
