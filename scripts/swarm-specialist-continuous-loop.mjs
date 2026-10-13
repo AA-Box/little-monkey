@@ -11,7 +11,8 @@
 import {spawnSync} from 'node:child_process';
 import {createHash,randomUUID} from 'node:crypto';
 import {readFileSync,writeFileSync,openSync,closeSync,fsyncSync,renameSync,
-  mkdirSync,rmdirSync,rmSync,realpathSync,lstatSync,existsSync,renameSync as moveDir} from 'node:fs';
+  mkdirSync,rmdirSync,rmSync,realpathSync,lstatSync,existsSync,renameSync as moveDir,
+  constants,fstatSync} from 'node:fs';
 import {join,resolve,isAbsolute,dirname} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
@@ -74,12 +75,21 @@ export function parsePolicy(value){
  return {...x,monkeyBin:realpathSync(x.monkeyBin),stateDir};
 }
 function readBounded(path,max=MAX_REPORT_BYTES){
- if(lstatSync(path).isSymbolicLink())fail('Symbolic evidence link refused');
- const stat=lstatSync(path);
- if(!stat.isFile()||stat.size<=0||stat.size>max)fail('Malformed or oversized state/evidence');
- const text=readFileSync(path,'utf8');
- if(Buffer.byteLength(text)>max)fail('Evidence changed while reading');
- return text;
+ // Verify and read through the SAME no-follow file descriptor; a pathname
+ // check followed by a separate open is vulnerable to symlink-swap races.
+ if(typeof constants.O_NOFOLLOW!=='number')fail('No no-follow file descriptor support');
+ const fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW);
+ try{
+  const before=fstatSync(fd);
+  if(!before.isFile()||before.size<=0||before.size>max)
+   fail('Malformed or oversized state/evidence');
+  const text=readFileSync(fd,'utf8');
+  const after=fstatSync(fd);
+  if(Buffer.byteLength(text)>max||after.size!==before.size||
+     after.mtimeMs!==before.mtimeMs||after.ctimeMs!==before.ctimeMs)
+   fail('Evidence changed while reading');
+  return text;
+ }finally{closeSync(fd);}
 }
 function atomicJson(path,value){
  const tmp=path+'.'+randomUUID()+'.tmp';
