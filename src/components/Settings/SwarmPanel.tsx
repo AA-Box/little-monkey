@@ -1126,6 +1126,83 @@ export function SwarmPanel() {
             {distributedTrace && <details className="mt-2">
               <summary className="cursor-pointer">Combined local and peer trace · {distributedTrace.events.length} events</summary>
               <p>Fresh peer checkpoints: {distributedTrace.freshPeers} · Stale: {distributedTrace.stalePeers} · Invalid: {distributedTrace.invalidPeerRecords} · Original remote journal events: {distributedTrace.historicalPeerEvents} · Legacy snapshot-only peers: {distributedTrace.legacySnapshotPeers}</p>
+              <p>Verified source-run metering: {distributedTrace.meteredPeerRuns} completed peer runs; token counts are from the original host's intact run ledger, and reported amounts are NOT provider invoices or independent answer-quality grades.</p>
+              {distributedTrace.meteredUsage.map(row=><p key={row.sourceFingerprint+':'+row.node} className="break-all">
+                Peer {row.sourceFingerprint.slice(0,12)}… · {row.node} · target {row.targetId} · input {row.inputTokens.toLocaleString()} · output {row.outputTokens.toLocaleString()} · cache {row.cachedInputTokens.toLocaleString()} · calls {row.modelCalls} · elapsed {row.elapsedMs} ms · {row.meteredCostMicros===null?'cost unavailable':'metered USD 
+              <div className="max-h-60 space-y-1 overflow-auto" aria-label="Authenticated distributed DAG observations">
+                {distributedTrace.events.slice(-40).map((entry,index)=><p key={entry.source+':'+entry.sequence+':'+entry.node+':'+index}>
+                  {entry.source==='local-ledger'?'Local journal':'Signed peer report'} · {entry.node} · {entry.kind} · {entry.state} · #{entry.sequence} · {new Date(entry.occurredAt).toLocaleString()}
+                  {entry.term!==null?' · term '+entry.term:''}
+                </p>)}
+              </div>
+              <p>Remote completion reports are observations, never independent model-output verification or execution authority.</p>
+            </details>}
+          </div>}
+          <p className="mt-1 text-xs text-faint">{graph.tasks.filter(t => t.state === 'succeeded').length}/{graph.tasks.length} nodes succeeded</p>
+          {graph.tasks.map(task => <p key={task.id} className="mt-1 text-xs text-muted">
+            {task.id} · {task.state} {task.error ? '— ' + task.error.slice(0, 160) : ''}
+          </p>)}
+          {!!graph.events?.length && <details className="mt-2 text-xs text-muted">
+            <summary className="cursor-pointer">Durable transition trace · {graph.events.length} recent events</summary>
+            <div className="mt-1 max-h-56 space-y-1 overflow-auto" aria-label="Resident swarm transition trace">
+              {graph.events.slice(-30).map(event => <p key={event.sequence} className="break-all">
+                #{event.sequence} · {event.node_id ?? 'graph'} · {event.previous_state ?? 'new'} → {event.state}
+                {event.job_id ? ' · ' + event.job_id.slice(0, 48) : ''}
+              </p>)}
+            </div>
+          </details>}
+        </div>)}
+      </div>
+      <div className="rounded-lg border border-border bg-surface p-3">
+        <h4 className="text-sm font-semibold text-foreground">Swarm runs</h4>
+        <p className="mt-1 text-xs text-muted">Live activity and durable session checkpoints. Interrupted runs require an explicit resume request in the same conversation.</p>
+        {running.length === 0 && restored.length === 0 && <p className="mt-2 text-xs text-faint">No swarm runs recorded.</p>}
+        {running.map(run => <p key={run.runId} className="mt-2 text-xs text-foreground">
+          <Activity className="mr-1 inline" size={13}/> {run.name} — running phase {run.activePhaseIndex + 1}/{run.phases.length}
+        </p>)}
+        {restored.map(run => <div key={run.sessionId + run.id} className="mt-2 border-t border-border pt-2 text-xs text-foreground">
+          <CheckCircle2 className="mr-1 inline" size={13}/> {run.name} — {run.status} · {run.completed}/{run.total} agents
+          {(run.status === 'error' || run.status === 'cancelled') && run.recoverable &&
+            <Button size="sm" onClick={() => prepareResume(run.sessionId, run.id)}>
+              Prepare safe resume in chat
+            </Button>}
+          {(run.status === 'error' || run.status === 'cancelled') && !run.recoverable &&
+            <p className="text-faint">This older run has no saved recovery specification; it cannot be automatically reconstructed.</p>}
+          <details className="mt-2 rounded-md border border-border p-2">
+            <summary className="cursor-pointer text-xs font-medium text-foreground">
+              Execution trace · {run.phases.length} phases · {Math.round(run.elapsedMs / 1000)} s recorded
+            </summary>
+            <div className="mt-2 space-y-2">
+              {run.phases.map((phase, phaseIndex) => <section key={phaseIndex}
+                  aria-label={'Phase ' + (phaseIndex + 1) + ': ' + phase.title}>
+                <p className="text-xs font-medium text-foreground">{phaseIndex + 1}. {phase.title}</p>
+                {phase.agents.map(agent => {
+                  const recorded = run.resultJournal[agent.taskId];
+                  const agentState = recorded?.status ?? 'not completed';
+                  return <div key={agent.taskId} className="mt-1 ml-3 text-xs text-muted">
+                    <span className="font-medium">{agent.description}</span>
+                    {' — '}{agentState}{recorded?.reused ? ' (reused verified prompt journal)' : ''}
+                    {recorded?.report && <details className="mt-1">
+                      <summary className="cursor-pointer">Show saved report (untrusted)</summary>
+                      <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-background p-2 text-xs">{recorded.report.slice(0, 1_200)}</pre>
+                    </details>}
+                  </div>;
+                })}
+              </section>)}
+            </div>
+          </details>
+          {run.status === 'done' && run.sourceRunId && <Button size="sm"
+            disabled={learningBusy !== null}
+            onClick={() => void proposeLearningCandidate(run.sourceRunId!, run.description)}>
+            {learningBusy === run.sourceRunId ? 'Checking verification…' : 'Check verified learning eligibility'}
+          </Button>}
+        </div>)}
+      </div>
+    </div>
+  );
+}
++(row.meteredCostMicros/1_000_000).toFixed(6)}
+              </p>)}
               <div className="max-h-60 space-y-1 overflow-auto" aria-label="Authenticated distributed DAG observations">
                 {distributedTrace.events.slice(-40).map((entry,index)=><p key={entry.source+':'+entry.sequence+':'+entry.node+':'+index}>
                   {entry.source==='local-ledger'?'Local journal':'Signed peer report'} · {entry.node} · {entry.kind} · {entry.state} · #{entry.sequence} · {new Date(entry.occurredAt).toLocaleString()}
