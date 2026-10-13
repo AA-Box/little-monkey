@@ -199,6 +199,49 @@ have imported measurements, routing is unchanged.
 The benchmark has **not** been executed against real configured models by CI
 and does **not** measure general agent correctness or consensus quality.
 
+## Distributed telemetry and continuous cost routing (v2)
+
+The existing **snapshot-only** combined trace has been extended with redacted
+real SQLite graph/node transitions replicated in v2 signed peer checkpoints.
+The writer's original cursor and timestamps are retained; v1 peers remain
+supported but cannot provide historical event sequences. The local UI merges
+those observations chronologically without treating peer success as authority
+or independently verified work.
+
+Opted-in cost routing now requires rolling live operational baseline samples
+and uses 10%/30%/100% canary steps. Real subagent terminal outcomes feed
+the guard automatically. Two of the last three failures, adverse recent
+completion reliability, or a severe p90 wall-duration regression rejects the
+cheaper candidate on subsequent dispatches. Actual completion is not proof of
+answer quality: the separate imported independent verified-fixture ranking
+continues to define quality eligibility. Neither estimated token-rate savings
+nor locally aggregated cost records constitute reconciled bills.
+
+Contract commands:
+
+```bash
+pnpm test:swarm-telemetry:contract
+pnpm test -- src/lib/swarmDistributedTrace.test.ts \
+  src/lib/swarmCostOptimizer.test.ts \
+  src/lib/swarmLiveOptimizer.test.ts \
+  src/lib/targetRouting.swarmQuality.test.ts
+```
+
+**Required release acceptance** is a physical sender and receiver running the
+same reviewed revision, authenticated and enrolled in a signed DAG cluster,
+plus an actually transitioning resident task. Run the two stages described
+in [native-swarm-coordination.md](native-swarm-coordination.md):
+`pnpm test:swarm-telemetry:live -- --stage publish ...` on A and
+`--stage verify ...` on B, then reverse their roles. Preserve signed
+readback and receiver SQLite evidence for both directions. Missing peers or
+events fail closed. Passing unit tests, contract tests and a single-host TLS
+fixture **does not** satisfy this physical acceptance criterion.
+
+This gate covers resident DAG transitions and adaptive routing operational
+feedback. It does not yet certify complete arbitrary peer-task model-token,
+provider-invoice, and end-to-end span instrumentation across every host,
+or statistically controlled independent real-model quality experiments.
+
 ## Automated checks
 
 ```bash
