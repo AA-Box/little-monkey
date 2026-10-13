@@ -645,11 +645,17 @@ pub fn tick(
                     // new deterministic job id and must pass the fresh
                     // signed-replica readback barrier again.
                 } else {
-                    store.connection.execute("UPDATE resident_swarm_nodes SET state='failed',error=?3
-                        WHERE graph_id=?1 AND node_id=?2",
-                        params![id,node,format!("Daemon job ended in {:?}",job.state)])
-                        .map_err(|e| e.to_string())?;
-                    failure = true;
+                    // A second daemon/coordinator can race our read of this
+                    // node. Never overwrite a freshly prepared reassignment or
+                    // another terminal resolution with a stale failure verdict.
+                    let changed=store.connection.execute(
+                        "UPDATE resident_swarm_nodes SET state='failed',error=?3
+                         WHERE graph_id=?1 AND node_id=?2
+                           AND state=?4 AND job_id=?5",
+                        params![id,node,format!("Daemon job ended in {:?}",job.state),
+                            status,job_id]
+                    ).map_err(|e|e.to_string())?;
+                    failure |= changed==1;
                 }
             } else { active += 1; }
         }
