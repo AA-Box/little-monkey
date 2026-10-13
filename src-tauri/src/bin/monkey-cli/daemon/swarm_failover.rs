@@ -539,6 +539,14 @@ mod tests{
                 &mut store,"signed-a",&record,(epoch+30002)
             ).unwrap());
         }
+        // A signed but EMPTY GET is not evidence the predecessor never
+        // dispatched. The destination cannot auto-reassign on this basis.
+        super::super::swarm_recovery_witness::record(
+            &receiver,"swarm-team","original",&afp,&cfp,None,(epoch+30002)
+        ).unwrap();
+        run_once(&receiver,(epoch+30002)).unwrap();
+        assert_eq!(status(&receiver).unwrap()["plans"][0]["state"],"armed",
+            "missing checkpoint must not count toward no-dispatch quorum");
         for (i,(_,snapshot)) in crash_sources.iter().enumerate(){
             super::super::swarm_recovery_witness::record(
                 &receiver,"swarm-team",
