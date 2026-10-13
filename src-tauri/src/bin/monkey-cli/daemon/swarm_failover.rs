@@ -234,7 +234,9 @@ fn consume(paths:&DaemonPaths,plan:&ArmedPlan,now:i64)->Result<(),String>{
         // Re-check the majority lease just before registration. Dispatch
         // remains separately fenced by the swarm coordinator's own tick.
         let store=DaemonStore::open(paths)?;
-        if !swarm_cluster::may_schedule(&store,&plan.group,now)?{
+        let fresh=i64::try_from(super::now_ms()?)
+            .map_err(|_|"Recovery clock overflow".to_string())?;
+        if !swarm_cluster::may_schedule(&store,&plan.group,fresh)?{
             return Err("Local majority lease was lost before recovery registration".into());
         }
         drop(store);
@@ -301,8 +303,15 @@ pub fn spawn_worker(paths:DaemonPaths){
                 if let Err(error)=super::swarm_recovery_witness::refresh(&paths,now).await{
                     eprintln!("Read-only swarm recovery quorum unavailable: {error}");
                 }
-                if let Err(error)=run_once(&paths,now){
-                    eprintln!("Read-only swarm failover scan unavailable: {error}");
+                // Network reconciliation can consume a substantial part of a
+                // 20-second election lease. NEVER reuse the pre-network clock
+                // to claim or import work after that lease actually expired.
+                let now_after_network=super::now_ms().ok()
+                    .and_then(|value|i64::try_from(value).ok());
+                if let Some(now_after_network)=now_after_network {
+                    if let Err(error)=run_once(&paths,now_after_network){
+                        eprintln!("Read-only swarm failover scan unavailable: {error}");
+                    }
                 }
             }
         }
