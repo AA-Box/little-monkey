@@ -222,7 +222,7 @@ mod tests{
             sequence:1,term:1,captured_at_ms:1000,graph_state:"running".into(),
             nodes:vec![super::super::swarm_replication::ReplicaNode{
                 id:"node".into(),state:"pending".into(),job_id:None
-            }],checksum:String::new()
+            }],trace_events:vec![],checksum:String::new()
         };
         pending.seal().unwrap();
         assert!(all_pending(&pending));
