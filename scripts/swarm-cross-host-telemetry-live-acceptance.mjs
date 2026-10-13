@@ -15,13 +15,13 @@ const KINDS=new Set(['graph_created','graph_transition','node_created','node_tra
 const STATES=new Set(['running','failing','cancelling','succeeded','failed','cancelled',
  'pending','pending_fallback','preparing','preparing_fallback','submitted','submitted_fallback']);
 const fail=(reason)=>{throw Error(reason);};
-export function verifyRemoteJournal(view,{group,graph,sourceFingerprint,now=Date.now(),minimumEvents=2}){
+export function verifyRemoteJournal(view,{group,graph,sourceFingerprint,now=Date.now(),minimumEvents=2,requireModelUsage=false}){
  if(view?.group!==group||view?.graph!==graph||
     !Array.isArray(view.replicas)||view.replicas.length<1)fail('Remote receiver lacks a durable cluster checkpoint');
  const rows=view.replicas.filter(v=>v.source_fingerprint===sourceFingerprint);
  if(rows.length!==1)fail('Expected exactly one checkpoint with the enrolled source certificate identity');
  const snapshot=rows[0];
- if(snapshot.version!==2||snapshot.group!==group||snapshot.graph_id!==graph||
+ if(![2,3].includes(snapshot.version)||snapshot.group!==group||snapshot.graph_id!==graph||
     !FP.test(snapshot.checksum??'')||!FP.test(snapshot.roster_sha256??'')||
     !Number.isSafeInteger(snapshot.sequence)||snapshot.sequence<1||
     !Number.isSafeInteger(snapshot.term)||snapshot.term<1||
@@ -43,13 +43,42 @@ export function verifyRemoteJournal(view,{group,graph,sourceFingerprint,now=Date
  }
  if(!snapshot.trace_events.some(e=>e.kind==='node_transition'))
    fail('Expected at least one REAL node transition from the original source host');
+ const usage=snapshot.model_usage??[];
+ if(!Array.isArray(usage)||usage.length>16||
+    (snapshot.version===2&&usage.length>0)||
+    (requireModelUsage&&(!usage.length||snapshot.version!==3)))
+   fail('Real original-host model metering missing or invalid');
+ const unique=new Set();
+ for(const row of usage){
+  if(!row||typeof row.node_id!=='string'||!nodeIds.has(row.node_id)||
+    unique.has(row.node_id)||!snapshot.nodes.some(n=>
+      n.id===row.node_id&&n.state==='succeeded')||
+    typeof row.target_id!=='string'||
+    !/^[A-Za-z0-9][A-Za-z0-9_./:@+%-]{0,159}$/.test(row.target_id)||
+    !Number.isSafeInteger(row.elapsed_ms)||row.elapsed_ms<0||row.elapsed_ms>86_400_000||
+    !Number.isSafeInteger(row.input_tokens)||row.input_tokens<0||row.input_tokens>100_000_000||
+    !Number.isSafeInteger(row.output_tokens)||row.output_tokens<0||row.output_tokens>100_000_000||
+    !Number.isSafeInteger(row.cached_input_tokens)||row.cached_input_tokens<0||
+    row.cached_input_tokens>row.input_tokens||
+    !Number.isSafeInteger(row.model_calls)||row.model_calls<1||row.model_calls>100_000||
+    (row.cost_micros!==null&&
+      (!Number.isSafeInteger(row.cost_micros)||row.cost_micros<0||
+       row.cost_micros>1_000_000_000_000)))
+   fail('Invalid or unrelated original-host model metering');
+  unique.add(row.node_id);
+ }
  return {status:'verified_on_independent_receiver',group,graph,
    sourceFingerprint,checkpointSequence:snapshot.sequence,term:snapshot.term,
    traceEvents:snapshot.trace_events.length,
    earliestEventMs:snapshot.trace_events[0].occurred_at_ms,
    latestEventMs:snapshot.trace_events.at(-1).occurred_at_ms,
-   executedModelQualityVerified:false,
-   note:'The receiving host durably observed DAG states. No model output or billing was verified.'};
+   measuredPeerRuns:usage.length,
+   observedInputTokens:usage.reduce((n,r)=>n+r.input_tokens,0),
+   observedOutputTokens:usage.reduce((n,r)=>n+r.output_tokens,0),
+   observedCostMicros:usage.every(r=>r.cost_micros!==null)?
+     usage.reduce((n,r)=>n+r.cost_micros,0):null,
+   executedModelQualityVerified:false,providerBillingReconciled:false,
+   note:'Receiver durably observed signed original-host journal and metered model calls. Output correctness and provider invoices are not independently proven.'};
 }
 function native(args){
  const r=spawnSync(option('--monkey-bin')??process.env.LITTLE_MONKEY_CLI??'monkey',args,{
@@ -77,7 +106,7 @@ function run(){
  }
  if(!FP.test(fp??''))fail('Verify requires the source A enrolled --source-fingerprint');
  return verifyRemoteJournal(native(['daemon','swarm-replica-status',group,graph]),
-  {group,graph,sourceFingerprint:fp});
+  {group,graph,sourceFingerprint:fp,requireModelUsage:process.argv.includes('--require-model-usage')});
 }
 if(process.argv[1]&&fileURLToPath(import.meta.url)===resolve(process.argv[1])){
  try{
