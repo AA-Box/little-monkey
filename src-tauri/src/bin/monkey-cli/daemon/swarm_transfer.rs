@@ -342,6 +342,17 @@ mod tests {
         assert!(import_read_only(&target,&bad,"tampered",&target_ws).is_err());
         assert!(swarm_coordinator::status(&target,Some("tampered")).unwrap()["graphs"]
             .as_array().unwrap().is_empty());
+        // An unresolved operator parameter must never become an unattended
+        // prompt variable on a different machine, even in plan mode.
+        let unbound=serde_json::json!({
+            "version":1,"name":"requires-review",
+            "target":{"ollama":"qwen2.5:7b"},"permission_mode":"plan",
+            "prompt":"Review this repository","params":{"unreviewed":null}
+        });
+        let not_ready=base.join("unbound.json");
+        fs::write(&not_ready,unbound.to_string()).unwrap();
+        assert!(read_frozen_recipe(not_ready.to_str().unwrap()).is_err());
+        assert!(relocated_recipe(&unbound.to_string(),&target_ws).is_err());
         let _=fs::remove_dir_all(&base);
     }
 }
