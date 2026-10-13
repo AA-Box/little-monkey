@@ -27,6 +27,7 @@ struct ArmedPlan{
     id:String,
     group:String,
     source_graph:String,
+    source_fingerprint:String,
     new_graph:String,
     path:String,
     hash:String,
@@ -42,6 +43,7 @@ fn schema(store:&DaemonStore)->Result<(),String>{
         "CREATE TABLE IF NOT EXISTS resident_swarm_failover_plans(
           plan_id TEXT PRIMARY KEY NOT NULL,
           group_id TEXT NOT NULL, source_graph TEXT NOT NULL,
+          source_fingerprint TEXT,
           new_graph TEXT NOT NULL,bundle_path TEXT NOT NULL,
           bundle_sha256 TEXT NOT NULL,workspace TEXT NOT NULL,
           state TEXT NOT NULL,created_at_ms INTEGER NOT NULL,
@@ -49,7 +51,21 @@ fn schema(store:&DaemonStore)->Result<(),String>{
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_failover_unique_graph
           ON resident_swarm_failover_plans(new_graph);"
-    ).map_err(|e|e.to_string())
+    ).map_err(|e|e.to_string())?;
+    // Older draft builds did not bind a pre-authorized source identity.
+    // Migrated rows retain NULL and are NEVER eligible for auto failover.
+    // An operator must enroll a fresh plan naming the exact predecessor.
+    let mut stmt=store.connection.prepare("PRAGMA table_info(resident_swarm_failover_plans)")
+        .map_err(|e|e.to_string())?;
+    let cols=stmt.query_map([],|r|r.get::<_,String>(1))
+        .map_err(|e|e.to_string())?
+        .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    if !cols.iter().any(|name|name=="source_fingerprint"){
+        store.connection.execute_batch(
+            "ALTER TABLE resident_swarm_failover_plans ADD COLUMN source_fingerprint TEXT"
+        ).map_err(|e|e.to_string())?;
+    }
+    Ok(())
 }
 fn bounded_file(path:&Path)->Result<Vec<u8>,String>{
     let m=fs::symlink_metadata(path).map_err(|e|e.to_string())?;
@@ -60,7 +76,7 @@ fn bounded_file(path:&Path)->Result<Vec<u8>,String>{
 }
 fn sha(bytes:&[u8])->String{format!("{:x}",Sha256::digest(bytes))}
 pub fn arm(
-    paths:&DaemonPaths,id:&str,group:&str,new_graph:&str,
+    paths:&DaemonPaths,id:&str,group:&str,source_peer:&str,new_graph:&str,
     input:&Path,workspace:&Path,now:i64,
 )->Result<serde_json::Value,String>{
     if !valid_id(id)||!valid_id(group)||!valid_id(new_graph)||now<=0||
@@ -81,7 +97,11 @@ pub fn arm(
     }
     paths.ensure()?;
     let store=DaemonStore::open(paths)?;
-    swarm_cluster::roster(&store,group)?;
+    let roster=swarm_cluster::roster(&store,group)?;
+    let source=roster.members.iter().find(|member|
+        member.alias.as_deref()==Some(source_peer) && member.device_id!="@local"
+    ).ok_or("Previous leader must be a specific operator-enrolled signed peer alias")?;
+    let source_fingerprint=source.fingerprint.clone();
     schema(&store)?;
     let count:i64=store.connection.query_row(
         "SELECT COUNT(*) FROM resident_swarm_failover_plans",[],
@@ -94,15 +114,16 @@ pub fn arm(
     // replacing a previously claimed/failed plan.
     store.connection.execute(
         "INSERT INTO resident_swarm_failover_plans(
-           plan_id,group_id,source_graph,new_graph,bundle_path,bundle_sha256,
+           plan_id,group_id,source_graph,source_fingerprint,new_graph,bundle_path,bundle_sha256,
            workspace,state,created_at_ms)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,'armed',?8)",
-        params![id,group,source_graph,new_graph,
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'armed',?9)",
+        params![id,group,source_graph,source_fingerprint,new_graph,
             canonical_input.to_string_lossy().as_ref(),sha(&bundle),
             canonical_workspace.to_string_lossy().as_ref(),now],
     ).map_err(|e|format!("Unable to arm unique operator failover plan: {e}"))?;
     Ok(serde_json::json!({
         "plan":id,"cluster":group,"source_graph":source_graph,
+        "source_fingerprint":source_fingerprint,
         "new_graph":new_graph,"state":"armed",
         "warning":"Requires a fresh previous-leader checkpoint and a NEW higher-term signed local majority; every task re-runs in plan mode."
     }))
@@ -111,16 +132,18 @@ pub fn status(paths:&DaemonPaths)->Result<serde_json::Value,String>{
     let store=DaemonStore::open(paths)?;
     schema(&store)?;
     let mut stmt=store.connection.prepare(
-        "SELECT plan_id,group_id,source_graph,new_graph,state,
+        "SELECT plan_id,group_id,source_graph,source_fingerprint,new_graph,state,
                 created_at_ms,claimed_at_ms,message
          FROM resident_swarm_failover_plans ORDER BY created_at_ms DESC LIMIT 8"
     ).map_err(|e|e.to_string())?;
     let rows=stmt.query_map([],|r|Ok(serde_json::json!({
         "id":r.get::<_,String>(0)?,"group":r.get::<_,String>(1)?,
-        "source_graph":r.get::<_,String>(2)?,"target_graph":r.get::<_,String>(3)?,
-        "state":r.get::<_,String>(4)?,"created_at_ms":r.get::<_,i64>(5)?,
-        "claimed_at_ms":r.get::<_,Option<i64>>(6)?,
-        "message":r.get::<_,Option<String>>(7)?
+        "source_graph":r.get::<_,String>(2)?,
+        "source_fingerprint":r.get::<_,Option<String>>(3)?,
+        "target_graph":r.get::<_,String>(4)?,
+        "state":r.get::<_,String>(5)?,"created_at_ms":r.get::<_,i64>(6)?,
+        "claimed_at_ms":r.get::<_,Option<i64>>(7)?,
+        "message":r.get::<_,Option<String>>(8)?
     }))).map_err(|e|e.to_string())?
        .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
     Ok(serde_json::json!({"plans":rows}))
@@ -128,14 +151,16 @@ pub fn status(paths:&DaemonPaths)->Result<serde_json::Value,String>{
 fn pending(store:&DaemonStore)->Result<Vec<ArmedPlan>,String>{
     schema(store)?;
     let mut stmt=store.connection.prepare(
-        "SELECT plan_id,group_id,source_graph,new_graph,bundle_path,
+        "SELECT plan_id,group_id,source_graph,source_fingerprint,new_graph,bundle_path,
                 bundle_sha256,workspace
          FROM resident_swarm_failover_plans
-         WHERE state='armed' ORDER BY created_at_ms LIMIT 8"
+         WHERE state='armed' AND source_fingerprint IS NOT NULL
+         ORDER BY created_at_ms LIMIT 8"
     ).map_err(|e|e.to_string())?;
     let rows=stmt.query_map([],|r|Ok(ArmedPlan{
         id:r.get(0)?,group:r.get(1)?,source_graph:r.get(2)?,
-        new_graph:r.get(3)?,path:r.get(4)?,hash:r.get(5)?,workspace:r.get(6)?,
+        source_fingerprint:r.get(3)?,new_graph:r.get(4)?,path:r.get(5)?,
+        hash:r.get(6)?,workspace:r.get(7)?,
     })).map_err(|e|e.to_string())?;
     rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
 }
@@ -155,6 +180,7 @@ fn eligible(store:&DaemonStore,plan:&ArmedPlan,now:i64)->Result<bool,String>{
     // election succeeded. An absent or old receipt does not grant execution.
     let peer_rows=swarm_replication::list_local(store,&plan.group,&plan.source_graph)?;
     Ok(peer_rows.iter().any(|snapshot|
+        snapshot.source_fingerprint==plan.source_fingerprint &&
         snapshot.source_fingerprint!=roster.local().fingerprint &&
         snapshot.roster_sha256==roster.digest() &&
         snapshot.term < current as u64 &&
@@ -342,7 +368,7 @@ mod tests{
             let mut b=DaemonStore::open(&receiver).unwrap();
             assert!(swarm_replication::ingest(&mut b,"signed-a",&record,2001).unwrap());
         }
-        arm(&receiver,"operator-recovery","swarm-team","recovered",&transfer,
+        arm(&receiver,"operator-recovery","swarm-team","alice","recovered",&transfer,
             &workspace_receiver,2100).unwrap();
         // The receiver cannot schedule prior to its own fresh signed quorum,
         // even though it has both plan bytes and the previous leader's status.
@@ -392,7 +418,7 @@ mod tests{
         fs::write(&source,b"{}").unwrap();
         assert!(!valid_id("../bad"));
         assert!(!valid_id(""));
-        assert!(arm(&paths,"review","cluster","new-graph",&source,&root,1000).is_err());
+        assert!(arm(&paths,"review","cluster","previous-node","new-graph",&source,&root,1000).is_err());
         let _=fs::remove_dir_all(root);
     }
 }
