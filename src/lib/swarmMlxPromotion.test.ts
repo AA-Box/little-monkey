@@ -56,7 +56,7 @@ describe('verified MLX promotion and automatic live rollback',()=>{
  });
  it('refuses corrupted crash journal and keeps execution blocked',async()=>{
   map.set(MLX_PROMOTION_JOURNAL,'{');
-  expect(()=>pendingMlxPromotion(storage)).toThrow(/routing is blocked/);
+  expect(()=>pendingMlxPromotion(storage)).toThrow(/execution is blocked/);
   await expect(promoteVerifiedMlxFusion(candidate,runtime,storage)).rejects.toThrow(/routing is blocked/);
  });
 });
