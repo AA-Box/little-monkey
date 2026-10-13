@@ -185,7 +185,13 @@ fn eligible(store:&DaemonStore,plan:&ArmedPlan,now:i64)->Result<bool,String>{
         snapshot.roster_sha256==roster.digest() &&
         snapshot.term < current as u64 &&
         snapshot.captured_at_ms<=now+5_000 &&
-        now.saturating_sub(snapshot.captured_at_ms)<=MAX_CHECKPOINT_AGE_MS
+        now.saturating_sub(snapshot.captured_at_ms)<=MAX_CHECKPOINT_AGE_MS &&
+        // Never automatically re-dispatch a task for which the previously
+        // elected host reports ANY execution attempt or old job identity.
+        // An authenticated observation is not an externally reconciled
+        // exactly-once receipt. Once a job was submitted, unattended
+        // migration must fail closed until an operator can reconcile it.
+        snapshot.nodes.iter().all(|node|node.state=="pending"&&node.job_id.is_none())
     ))
 }
 fn mark(store:&DaemonStore,id:&str,state:&str,now:i64,message:&str)->Result<(),String>{
