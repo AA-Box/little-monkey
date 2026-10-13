@@ -50,6 +50,7 @@ mod swarm_coordinator;
 mod swarm_transfer;
 mod swarm_workers;
 mod swarm_replication;
+mod swarm_failover;
 pub(crate) mod swarm_cluster;
 pub(crate) mod store;
 pub(crate) mod telecom_store;
@@ -159,6 +160,17 @@ pub enum DaemonCmd {
     SwarmReplicate { group: String, id: String, peer: String },
     /// Inspect identity-bound cluster checkpoints received from other peers.
     SwarmReplicaStatus { group: String, id: String },
+    /// Explicitly stage a plan-only immutable bundle for one higher-term automatic failover.
+    SwarmFailoverArm {
+        id: String,
+        #[arg(long)] group: String,
+        #[arg(long)] new_id: String,
+        #[arg(long)] bundle: PathBuf,
+        #[arg(long)] workspace: PathBuf,
+        #[arg(long, required=true)] confirm_read_only_reexecution: bool,
+    },
+    /// Inspect all preauthorized one-shot failover plans and their claim states.
+    SwarmFailoverStatus,
     /// List the 12 opt-in background worker roles.
     SwarmWorkerCatalog,
     /// Install a frozen, plan-only native worker using existing durable cron or filesystem triggers.
@@ -613,6 +625,22 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
             }
             println!("{}",serde_json::json!({"receipt":receipt,
                 "remote_readback_verified":true,"execution_authorized":false}));
+            Ok(())
+        },
+        DaemonCmd::SwarmFailoverArm {
+            id,group,new_id,bundle,workspace,confirm_read_only_reexecution
+        } => {
+            if !confirm_read_only_reexecution {
+                return Err("Operator must explicitly consent to unattended re-execution of read-only model tasks".into());
+            }
+            let paths=DaemonPaths::resolve()?;
+            let now=i64::try_from(now_ms()?).map_err(|_|"Failover clock overflow")?;
+            println!("{}",swarm_failover::arm(&paths,id,group,new_id,bundle,workspace,now)?);
+            Ok(())
+        },
+        DaemonCmd::SwarmFailoverStatus => {
+            let paths=DaemonPaths::resolve()?;
+            println!("{}",swarm_failover::status(&paths)?);
             Ok(())
         },
         DaemonCmd::SwarmWorkerCatalog => {
@@ -3258,6 +3286,10 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
     // Only a CURRENT signed majority leader publishes its local read-only
     // resident DAG checkpoints to separately enrolled peer identities.
     swarm_replication::spawn_replica_worker(paths.clone());
+    // No automatic recovery unless the destination operator separately
+    // staged and approved a frozen plan-only bundle plus local workspace.
+    // Requires a fresh prior leader checkpoint and a NEW signed majority term.
+    swarm_failover::spawn_worker(paths.clone());
     // Messaging channels. Its own task rather than a step in the loop below: a
     // long-polling provider blocks for half a minute at a time, and the queue
     // must keep ticking while it does.
