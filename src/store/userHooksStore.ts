@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
  * external plugin SDK events remain unsupported, never silently remapped. */
 export const USER_HOOK_EVENTS = [
   "PreToolUse","PostToolUse","SessionStart","SessionEnd","UserPromptSubmit",
-  "PreTask","PostTask","PreCommand","PostCommand","PreEdit","PostEdit",
+  "PreTask","PostTask","PreCommand","PostCommand","PreEdit","PostEdit","Stop",
 ] as const;
 export type UserHookEvent = (typeof USER_HOOK_EVENTS)[number];
 

@@ -137,7 +137,7 @@ export function toolLifecyclePair(name:string):
 /** Fires every matching hook for an observe-only event (PostToolUse,
  * SessionStart) and never blocks on, or surfaces, anything they do — errors
  * are console noise by design. */
-export function fireObservedHooks(event: 'PostToolUse' | 'SessionStart' | 'SessionEnd' | 'PostTask' | 'PostCommand' | 'PostEdit',
+export function fireObservedHooks(event: 'PostToolUse' | 'SessionStart' | 'SessionEnd' | 'PostTask' | 'PostCommand' | 'PostEdit' | 'Stop',
   payload: Omit<HookPayload, 'event'> = {}): void {
   for (const hook of hooksForEvent(event, payload.tool_name)) {
     void execHook(hook, { event, ...payload }).catch((err) => {
