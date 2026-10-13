@@ -202,6 +202,8 @@ pub fn persist_quorum(store:&DaemonStore,req:&VoteRequest,votes:&[VoteReceipt],
         .collect::<BTreeSet<_>>();
     let voters=votes.iter().map(|v|v.voter_fingerprint.as_str()).collect::<BTreeSet<_>>();
     if now<=0 || req.term==0 || req.term>MAX_ELECTION_TERM ||
+       members.digest()!=req.roster_sha256 ||
+       req.candidate_fingerprint!=members.local().fingerprint ||
        voters.len()<=members.members.len()/2 || voters.len()!=votes.len() ||
        !voters.is_subset(&fingerprints) ||
        votes.iter().any(|v|v.group!=req.group||v.term!=req.term||
@@ -216,13 +218,27 @@ pub fn persist_quorum(store:&DaemonStore,req:&VoteRequest,votes:&[VoteReceipt],
         .checked_sub(SAFETY_MS).ok_or("Election lease timestamp underflow")?;
     if expires<=now+2_000{return Err("Quorum lease expired before it could be accepted".into());}
     let votes_json=serde_json::to_string(votes).map_err(|e|e.to_string())?;
-    store.connection.execute(
+    // One atomic compare-and-set: a majority's stale network responses can
+    // never install an older term, nor certify a term that this machine no
+    // longer holds as its own live exclusive vote. This matters when two
+    // independent installed peers campaign concurrently around a partition.
+    let updated=store.connection.execute(
         "INSERT INTO swarm_cluster_leases(group_id,term,leader,expires_at_ms,quorum_json)
-         VALUES (?1,?2,?3,?4,?5) ON CONFLICT(group_id) DO UPDATE SET
+         SELECT ?1,?2,?3,?4,?5 WHERE EXISTS(
+           SELECT 1 FROM swarm_cluster_votes
+           WHERE group_id=?1 AND term=?2 AND candidate=?3 AND expires_at_ms>?6
+         )
+         ON CONFLICT(group_id) DO UPDATE SET
          term=excluded.term,leader=excluded.leader,
-         expires_at_ms=excluded.expires_at_ms,quorum_json=excluded.quorum_json",
-        params![req.group,req.term as i64,req.candidate_fingerprint,expires,votes_json]
+         expires_at_ms=excluded.expires_at_ms,quorum_json=excluded.quorum_json
+         WHERE swarm_cluster_leases.term < excluded.term OR
+           (swarm_cluster_leases.term=excluded.term AND
+            swarm_cluster_leases.leader=excluded.leader)",
+        params![req.group,req.term as i64,req.candidate_fingerprint,expires,votes_json,now]
     ).map_err(|e|e.to_string())?;
+    if updated!=1 {
+        return Err("Quorum certificate is stale, nonlocal or not backed by the current durable voter term".into());
+    }
     Ok(expires)
 }
 pub fn may_schedule(store:&DaemonStore,group:&str,now:i64)->Result<bool,String>{
@@ -361,6 +377,41 @@ mod tests {
         assert!(vote(&mut store,&req(&config,1,&"a".repeat(64)),"@local",26000).is_err());
         assert_eq!(first.voter_fingerprint,"a".repeat(64));
     }
+    #[test]
+    fn stale_or_unbacked_quorum_never_replaces_newer_local_election() {
+        let mut store=DaemonStore::open_in_memory().unwrap();
+        let conf=members();
+        configure(&mut store,&conf,1000).unwrap();
+        let mut old=req(&conf,1,&"a".repeat(64));
+        let mut early=VoteReceipt {
+            group:conf.group.clone(),term:1,
+            candidate_fingerprint:"a".repeat(64),
+            voter_fingerprint:"a".repeat(64),
+            roster_sha256:conf.digest(),expires_at_ms:21000,
+            decided_at_ms:1000,
+        };
+        let mut other=early.clone();
+        other.voter_fingerprint="b".repeat(64);
+        assert!(persist_quorum(&store,&old,&[early.clone(),other.clone()],1000).is_err(),
+          "cannot install majority without local durable voted term");
+        vote(&mut store,&old,"@local",1000).unwrap();
+        persist_quorum(&store,&old,&[early.clone(),other.clone()],1000).unwrap();
+        assert!(may_schedule(&store,"team",2000).unwrap());
+        let fresh=req(&conf,2,&"a".repeat(64));
+        vote(&mut store,&fresh,"@local",26000).unwrap();
+        early.term=2;early.expires_at_ms=46000;early.decided_at_ms=26000;
+        other.term=2;other.expires_at_ms=46000;other.decided_at_ms=26000;
+        persist_quorum(&store,&fresh,&[early.clone(),other.clone()],26000).unwrap();
+        assert!(persist_quorum(&store,&old,&[
+            VoteReceipt{voter_fingerprint:"a".repeat(64),..early.clone()},
+            VoteReceipt{voter_fingerprint:"b".repeat(64),..other.clone()},
+        ],26000).is_err(),"old term may not replace new leadership");
+        // A fabricated local candidate cannot be certified even by a
+        // structurally valid collection of voter receipt identities.
+        old.candidate_fingerprint="b".repeat(64);
+        assert!(persist_quorum(&store,&old,&[early,other],26000).is_err());
+    }
+
     #[test]
     fn only_authenticated_identity_and_same_roster_can_vote(){
         let mut store=DaemonStore::open_in_memory().unwrap();
