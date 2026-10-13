@@ -566,3 +566,42 @@ bundle, and inspect failures. There is no replica membership propagation,
 automatic bundle transfer, persistent replicated commit index, quorum-backed
 graph-log consensus or transparent exactly-once task migration. Those remain
 needed before claiming cross-host automatic recovery.
+
+
+## Native event-driven background worker catalog
+
+The resident daemon now provides twelve optional, bounded review roles using
+its **existing persisted cron and filesystem triggers**. The worker's model is
+the operator-selected source recipe's own configured model. No background
+worker is installed by default, and no plugin or remote peer is granted.
+
+```bash
+monkey daemon swarm-worker-catalog
+monkey daemon swarm-worker-install security-nightly \
+  --role security-review \
+  --source-recipe /absolute/review-plan.json \
+  --workspace /absolute/disposable/workspace \
+  --cron '0 2 * * *'
+monkey daemon swarm-worker-install test-file-changes \
+  --role test-gap-review \
+  --source-recipe /absolute/review-plan.json \
+  --workspace /absolute/disposable/workspace \
+  --watch /absolute/disposable/workspace
+```
+
+Source recipes must already be valid **plan-mode**, bounded and fully
+parameterized. Explicit messaging, privileged placement, autonomous-task and
+desktop-turn snapshots are rejected. The worker freezes its own private recipe
+and uses ordinary native trigger delivery, deterministic job IDs, kill-switch,
+backpressure and runtime approval policies. Scheduled results are ordinary
+daemon runs; the worker does not auto-apply fixes or auto-promote models.
+
+The installed trigger ID is prefixed with `swarm-worker-`. Disable it
+using the existing `monkey daemon trigger remove <id>` command.
+A disabled trigger is not silently reenabled by installing another worker with
+the same ID; install rejects duplicates and requires review.
+
+These twelve roles provide bounded native review automation, not literal
+Ruflo background-worker binary compatibility. Complete event subscriptions,
+cross-node worker leasing, automatic learned role creation, and physical-host
+recovery acceptance remain separate work.
