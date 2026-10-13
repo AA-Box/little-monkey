@@ -539,21 +539,12 @@ mod tests{
                 &mut store,"signed-a",&record,(epoch+30002)
             ).unwrap());
         }
-        // A signed but EMPTY GET is not evidence the predecessor never
-        // dispatched. The destination cannot auto-reassign on this basis.
+        // Keep the first crash source without an affirmative witness for a
+        // negative test below; only the second has signed source evidence yet.
         super::super::swarm_recovery_witness::record(
-            &receiver,"swarm-team","original",&afp,&cfp,None,(epoch+30002)
+            &receiver,"swarm-team","source-after-registration",
+            &afp,&cfp,Some(&crash_sources[1].1),epoch+30002
         ).unwrap();
-        run_once(&receiver,(epoch+30002)).unwrap();
-        assert_eq!(status(&receiver).unwrap()["plans"][0]["state"],"armed",
-            "missing checkpoint must not count toward no-dispatch quorum");
-        for (i,(_,snapshot)) in crash_sources.iter().enumerate(){
-            super::super::swarm_recovery_witness::record(
-                &receiver,"swarm-team",
-                if i==0 {"source-before-registration"} else {"source-after-registration"},
-                &afp,&cfp,Some(snapshot),epoch+30002
-            ).unwrap();
-        }
         run_once(&receiver,(epoch+30002)).unwrap();
         assert_eq!(status(&receiver).unwrap()["plans"][0]["state"],"imported");
         let graph=super::super::swarm_coordinator::status(&receiver,Some("recovered")).unwrap();
@@ -582,6 +573,21 @@ mod tests{
         arm(&receiver,"crashed-after-claim","swarm-team","alice",
             "after-crash",&crash_sources[0].0,&workspace_receiver,
             (epoch+30003)).unwrap();
+        // A remote peer can respond successfully with no source checkpoint.
+        // That missing information must NOT become an affirmative vote.
+        super::super::swarm_recovery_witness::record(
+            &receiver,"swarm-team","source-before-registration",
+            &afp,&cfp,None,epoch+30003
+        ).unwrap();
+        run_once(&receiver,epoch+30003).unwrap();
+        assert_eq!(status(&receiver).unwrap()["plans"].as_array().unwrap()
+            .iter().find(|x|x["id"]=="crashed-after-claim")
+            .unwrap()["state"],"armed",
+            "signed absence cannot authorize an unattended cross-host retry");
+        super::super::swarm_recovery_witness::record(
+            &receiver,"swarm-team","source-before-registration",
+            &afp,&cfp,Some(&crash_sources[0].1),epoch+30004
+        ).unwrap();
         {
             let store=DaemonStore::open(&receiver).unwrap();
             assert_eq!(store.connection.execute(
