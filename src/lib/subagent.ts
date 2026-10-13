@@ -37,6 +37,7 @@ import { useSubagentStore } from '../store/subagentStore';
 import { useSessionStore } from '../store/sessionStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { routeFromActive, type RoutedTarget } from './targetRouting';
+import { recordSwarmLiveOutcome } from './swarmLiveOptimizer';
 import type { RoutingDecision } from './modelRouting';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { protectToolResult, unwrapUntrustedContent } from './untrustedContent';
@@ -638,6 +639,15 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
           }
         : undefined,
     );
+    // Only actual terminal, target-resolved runs update the durable rolling
+    // operational guard. This says nothing about independent answer quality.
+    // Cancelled runs and preflight errors do not become model failures.
+    if (live && routingSnapshot) {
+      recordSwarmLiveOutcome(
+        routingSnapshot.targetKey, status,
+        Math.max(0, Date.now() - live.startedAt),
+      );
+    }
     // Not awaited: `finish` is synchronous and is the single exit point every
     // return routes through, so blocking it on IPC would change the loop's
     // shape. The projection is best-effort by design.
