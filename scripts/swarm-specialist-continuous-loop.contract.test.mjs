@@ -97,6 +97,8 @@ describe('continuous verified specialist learning and real native recipe deploym
    assert.equal(JSON.parse(readFileSync(recipe,'utf8')).target.ollama,'operator-default');
    assert.throws(()=>dispatchRecipe(env.policy,'security',recipe,{now,
     run:()=>({status:1,stderr:'task failed'})}),/Actual native task failed/);
+   assert.throws(()=>dispatchRecipe(env.policy,'security',recipe,{now,
+    run:()=>({status:0,stdout:'{"status":"failed","run_id":"run-badcase"}'})}),/verified successful execution receipt/);
    const bypass=join(env.stateDir,'bypass.json');
    writeFileSync(bypass,JSON.stringify({version:1,workspace:env.stateDir,permission_mode:'bypass'}));
    assert.throws(()=>dispatchRecipe(env.policy,'security',bypass,{now}),/bypass/);
@@ -164,7 +166,7 @@ describe('continuous verified specialist learning and real native recipe deploym
    const recipe=join(env.stateDir,'task.json');
    writeFileSync(recipe,JSON.stringify({version:1,workspace:env.stateDir,permission_mode:'ask',prompt:'Source task'}));
    const result=dispatchRecipe(env.policy,'security',recipe,{now,run:()=>({
-    status:0,stdout:'{"run_id":"run-recovered"}'})});
+    status:0,stdout:'{"status":"ok","run_id":"run-recovered"}'})});
    assert.equal(result.target,targetA);
   }finally{env.dispose();}
  });
