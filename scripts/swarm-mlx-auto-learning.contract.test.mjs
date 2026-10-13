@@ -31,6 +31,20 @@ describe('real opt-in auto-learning; no synthetic test results accepted',()=>{
    assert.throws(()=>approvedBatch(x.batch,'operator-batch-1'));
   }finally{rmSync(x.root,{recursive:true,force:true});}
  });
+ it('ignores incomplete batches and quarantines rejected operator approvals without GPU subprocess',()=>{
+  const x=create();try{
+   const waiting=join(x.policy.inbox,'batch-unfinished');
+   mkdirSync(waiting);writeFileSync(join(waiting,'train.jsonl'),'{"text":"in progress"}');
+   const noApproval=learnOnce(x.policy,{execute:()=>{throw Error('GPU started');},log:()=>{}});
+   assert.equal(noApproval[0].status,'failed_receipt_requires_operator_review');
+   // Existing valid batch was claimed. An unapproved batch is safely ignored.
+   assert.equal(readFileSync(join(waiting,'train.jsonl'),'utf8'),'{"text":"in progress"}');
+   writeFileSync(join(waiting,'ready.json'),'{"version":1,"approved":true}');
+   const quarantined=learnOnce(x.policy,{execute:()=>{throw Error('GPU started');},log:()=>{}});
+   assert.equal(quarantined[0].status,'rejected_requires_operator_review');
+   assert.match(readFileSync(join(x.policy.outputRoot,'claim-batch-unfinished.json'),'utf8'),/invalid_approval/);
+  }finally{rmSync(x.root,{recursive:true,force:true});}
+ });
  it('writes a single permanent claim before dispatch, never retrains same batch',()=>{
   const x=create();try{
    const c=claimBatch(x.policy.outputRoot,'operator-batch-1',{train:{sha256:'a'.repeat(64)}});

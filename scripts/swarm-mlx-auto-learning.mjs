@@ -99,7 +99,23 @@ export function learnOnce(policy,{execute=spawnSync,log=console.log}={}){
   const out=join(policy.outputRoot,'run-'+name);
   const claim=join(policy.outputRoot,'claim-'+name+'.json');
   if(existsSync(out)||existsSync(claim))continue;
-  const hashes=approvedBatch(checkedLocalDir(source,'approved batch'),name);
+  // Dataset writers commonly create a folder before its last JSONL row or
+  // approval file. Ignore these in-progress batches instead of killing the
+  // continuous worker or accidentally treating them as approved.
+  if(!existsSync(join(source,'ready.json')))continue;
+  let hashes;
+  try{
+   hashes=approvedBatch(checkedLocalDir(source,'approved batch'),name);
+  }catch(error){
+   // Approval exists but has changed or is malformed. Quarantine this
+   // batch durably. Never retrain it later just because files changed
+   // underneath a running worker; explicit operator reset is required.
+   claimBatch(policy.outputRoot,name,{rejected:'invalid_approval_or_changed_dataset'});
+   log(JSON.stringify({batch:name,status:'rejected_requires_operator_review',
+     error:String(error).slice(0,250)}));
+   results.push({batch:name,status:'rejected_requires_operator_review'});
+   continue;
+  }
   claimBatch(policy.outputRoot,name,hashes);
   // From this point errors are terminal until an operator explicitly
   // reviews/clears claim-N.json; unattended retry is not safe.
