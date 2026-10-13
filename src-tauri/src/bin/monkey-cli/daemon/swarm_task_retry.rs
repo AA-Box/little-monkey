@@ -169,7 +169,7 @@ mod tests {
              WHERE graph_id='graph' AND node_id='scan'",
             [],|r|Ok((r.get(0)?,r.get(1)?))
         ).unwrap();
-        assert_eq!(prepared,("preparing".into(),expected));
+        assert_eq!(prepared,("preparing".into(),expected.clone()));
         assert!(!mark_current_failed(
             &s,"graph","scan","job-first","submitted","stale coordinator failure"
         ).unwrap(),"stale competing coordinator must not erase prepared intent");
