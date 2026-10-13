@@ -27,6 +27,7 @@ function normalizedPath(path: string): string {
 
 export class LiveSwarmBus {
   private readonly participants: Set<string>;
+  private readonly workspaceRoot: string;
   private readonly queues = new Map<string, LiveSwarmMessage[]>();
   private readonly reads = new Map<string, Set<string>>();
   private readonly finished = new Set<string>();
@@ -36,7 +37,8 @@ export class LiveSwarmBus {
   private received = 0;
   private closed = false;
 
-  constructor(ids: readonly string[]) {
+  constructor(ids: readonly string[], workspaceRoot = '') {
+    this.workspaceRoot = normalizedPath(workspaceRoot).replace(/\/$/, '');
     if (!ids.length || ids.length > MAX_AGENTS ||
         ids.some(id => !id || id.length > 200) || new Set(ids).size !== ids.length) {
       throw new Error('Live swarm requires 1–16 distinct bounded workflow agent IDs.');
@@ -46,6 +48,13 @@ export class LiveSwarmBus {
       this.queues.set(id, []);
       this.reads.set(id, new Set());
     }
+  }
+
+  private scopedPath(path: string): string {
+    const candidate = normalizedPath(path);
+    const root = this.workspaceRoot;
+    if (root && candidate.startsWith(root + '/')) return candidate.slice(root.length + 1);
+    return candidate;
   }
 
   private requireAgent(id: string): void {
@@ -94,7 +103,7 @@ export class LiveSwarmBus {
   /** Read observations are recorded only after a successful real file tool. */
   observeRead(id: string, path: string): void {
     this.requireAgent(id);
-    const key = normalizedPath(path);
+    const key = this.scopedPath(path);
     if (!key || key.length > 1024) return;
     const set = this.reads.get(id)!;
     if (!set.has(key) && set.size >= MAX_READ_PATHS) set.delete(set.values().next().value!);
@@ -104,7 +113,7 @@ export class LiveSwarmBus {
   /** Called only after a successful permission-gated file mutation. */
   observeMutation(sender: string, path: string): number {
     this.requireAgent(sender);
-    const key = normalizedPath(path);
+    const key = this.scopedPath(path);
     if (!key || key.length > 1024) return 0;
     const affected = [...this.participants].filter(id =>
       id !== sender && !this.finished.has(id) && this.reads.get(id)!.has(key));
