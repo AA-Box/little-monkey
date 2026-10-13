@@ -62,6 +62,10 @@ fn build_recipe(
     recipe.name=format!("swarm-worker-{id}");
     recipe.workspace=Some(local.to_string_lossy().to_string());
     recipe.output=Default::default();
+    // A scheduled job has no operator at the keyboard. Bound both wall time
+    // and inference/tool turns independent of permissive source defaults.
+    recipe.timeout_seconds=Some(recipe.timeout_seconds.unwrap_or(900).clamp(1,900));
+    recipe.max_iterations=Some(recipe.max_iterations.unwrap_or(12).clamp(1,12));
     recipe.prompt=format!(
         "This is an operator-scheduled READ-ONLY evidence task. No file modifications, \
          network writes, deployment, external messaging or permission escalation.\n\
@@ -119,6 +123,11 @@ pub fn install(
         .map_err(|e|e.to_string())?;
     super::store::restrict_file(&target)?;
     let contents=serde_json::to_vec_pretty(&recipe).map_err(|e|e.to_string())?;
+    if contents.len()>1024*1024 {
+        drop(file);
+        let _=fs::remove_file(&target);
+        return Err("Frozen worker exceeds the 1 MiB recipe limit".into());
+    }
     let persisted=(||{
         file.write_all(&contents).map_err(|e|e.to_string())?;
         file.sync_all().map_err(|e|e.to_string())?;
@@ -175,6 +184,8 @@ mod tests{
         let loaded:little_monkey_lib::recipes::Recipe=
             serde_json::from_slice(&fs::read(&stored).unwrap()).unwrap();
         assert_eq!(loaded.permission_mode,"plan");
+        assert_eq!(loaded.max_iterations,Some(12));
+        assert_eq!(loaded.timeout_seconds,Some(900));
         assert!(loaded.prompt.contains("security-review"));
         assert!(install(&paths,"scheduled-security","security-review",&input,
             &workspace,Some("*/5 * * * *"),None).is_err());
