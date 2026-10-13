@@ -13,7 +13,7 @@
  * requires the operator's independent attestation of network isolation.
  */
 import {spawnSync} from 'node:child_process';
-import {readFileSync,writeFileSync,openSync,closeSync,fsyncSync,renameSync,unlinkSync,lstatSync} from 'node:fs';
+import {constants,writeFileSync,openSync,closeSync,fstatSync,readSync,fsyncSync,renameSync,unlinkSync} from 'node:fs';
 import {resolve,isAbsolute,dirname,basename,join} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 
@@ -81,11 +81,35 @@ function save(data,isNew){
     try{unlinkSync(temp);}catch{}
   }
 }
+/** Check and read the SAME open file, not a pathname after a separate
+ * lstat check. A directory entry replaced with a symlink cannot redirect
+ * the evidence reader to a different file. Reads remain capped if a file
+ * grows concurrently, and a changed inode's contents are never accepted. */
+function readProtectedEvidence(path){
+  if(typeof constants.O_NOFOLLOW!=='number')
+    fail('Platform cannot guarantee no-follow evidence reads');
+  const fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW);
+  try{
+    const before=fstatSync(fd);
+    if(!before.isFile()||before.size<1||before.size>16*1024||
+       (before.mode&0o077)!==0)
+      fail('Evidence must be a private, bounded regular file');
+    const buffer=Buffer.alloc(16*1024+1);
+    let offset=0;
+    while(offset<buffer.length){
+      const received=readSync(fd,buffer,offset,buffer.length-offset,offset);
+      if(received===0)break;
+      offset+=received;
+    }
+    const after=fstatSync(fd);
+    if(offset!==before.size||after.size!==before.size||
+       after.mtimeMs!==before.mtimeMs||after.ctimeMs!==before.ctimeMs)
+      fail('Evidence changed during descriptor-bound read');
+    return JSON.parse(buffer.toString('utf8',0,offset));
+  }finally{closeSync(fd);}
+}
 function load(){
-  const info=lstatSync(evidence);
-  if(!info.isFile()||info.isSymbolicLink()||info.size>16*1024)
-    fail('Evidence must be a bounded, regular, non-symlink local file');
-  const value=JSON.parse(readFileSync(evidence,'utf8'));
+  const value=readProtectedEvidence(evidence);
   if(value?.version!==1||value.kind!=='native-two-device-dag-replication'||
      value.group!==group||value.graph!==graph||value.peer!==peer||
      !fingerprint.test(value.source_fingerprint)||
