@@ -15,7 +15,7 @@ test('MLX supervised deployment requires approved fused training and strict loca
   writeFileSync(trainingPolicy,JSON.stringify({version:1,model,python:process.execPath,
    inbox,outputRoot,iters:12,maxTestPpl:20,pollSeconds:60,batchLimit:1,fuseForImport:true}));
   const settings={version:1,trainingPolicy,stateDir,monkeyBin:process.execPath,
-   listenPort:8765,backendPort:8766,modelAlias:'little-monkey-mlx',
+   listenPort:8765,backendPort:8766,probePort:8767,modelAlias:'little-monkey-mlx',
    domains:['security','backend'],repetitions:2,timeoutMs:30000,
    checkSeconds:60,minAccuracy:0.8,minImprovement:0.05};
   const policy=parseServingPolicy(settings);
@@ -25,6 +25,7 @@ test('MLX supervised deployment requires approved fused training and strict loca
    {...settings,listenPort:settings.backendPort},
    {...settings,listenPort:80},
    {...settings,backendPort:99999},
+   {...settings,probePort:settings.listenPort},
    {...settings,domains:['security','security']},
    {...settings,minAccuracy:0.6},
    {...settings,modelAlias:'../unsafe'},
