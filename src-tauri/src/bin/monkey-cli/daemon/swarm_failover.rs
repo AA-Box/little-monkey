@@ -387,15 +387,35 @@ mod tests{
         };
         let spec_file=root.join("original-spec.json");
         fs::write(&spec_file,serde_json::to_vec(&spec).unwrap()).unwrap();
+        // Refresh a real short-lived election immediately before actual-clock
+        // registration. Windows CI may pause fixture construction long enough
+        // for the earlier 15s safety-fenced lease to expire.
+        let refresh_sender_quorum = || {
+            let now=i64::try_from(super::super::now_ms().unwrap()).unwrap();
+            let mut a=DaemonStore::open(&sender).unwrap();
+            let mut b=DaemonStore::open(&receiver).unwrap();
+            let req=VoteRequest{
+                group:"swarm-team".into(),term:1,
+                candidate_fingerprint:afp.clone(),roster_sha256:a_roster.digest()
+            };
+            let self_vote=swarm_cluster::vote(&mut a,&req,"@local",now).unwrap();
+            let peer_vote=swarm_cluster::vote(&mut b,&req,"signed-a",now).unwrap();
+            swarm_cluster::persist_quorum(&a,&req,&[self_vote,peer_vote],now).unwrap();
+        };
+        refresh_sender_quorum();
         super::super::swarm_coordinator::submit(&sender,&spec_file).unwrap();
         let transfer=root.join("preapproved-transfer.json");
         swarm_transfer::export(&sender,"original",&transfer).unwrap();
+        // Checkpoint timestamps must follow the real durable event journal,
+        // not an arbitrarily old simulated fixture clock.
+        let source_capture_ms=i64::try_from(super::super::now_ms().unwrap())
+            .unwrap().max(epoch+2000);
         let record=swarm_replication::capture_local_leader(
-            &sender,"swarm-team","original","bob",&bfp,(epoch+2000)
+            &sender,"swarm-team","original","bob",&bfp,source_capture_ms
         ).unwrap();
         {
             let mut b=DaemonStore::open(&receiver).unwrap();
-            assert!(swarm_replication::ingest(&mut b,"signed-a",&record,(epoch+2001)).unwrap());
+            assert!(swarm_replication::ingest(&mut b,"signed-a",&record,source_capture_ms+1).unwrap());
         }
         arm(&receiver,"operator-recovery","swarm-team","alice","recovered",&transfer,
             &workspace_receiver,(epoch+2100)).unwrap();
