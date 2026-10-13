@@ -23,7 +23,7 @@
     "test:autonomous-eval:live": "node scripts/autonomous-task-live-eval.mjs",
     "test:swarm-models:live": "node scripts/swarm-model-benchmark.mjs",
     "test:swarm-models:syntax": "node --check scripts/swarm-model-benchmark.mjs",
-    "test:swarm-headless:contract": "node --check scripts/swarm-headless-performance.mjs && node --test scripts/swarm-headless-performance.test.mjs",
+    "test:swarm-headless:contract": "node --check scripts/swarm-headless-performance.mjs && node --test scripts/swarm-headless-performance.test.mjs scripts/lib/swarmResidentRss.test.mjs",
     "test:swarm-headless:live": "node scripts/swarm-headless-performance.mjs",
     "test:swarm-peer:live": "node scripts/swarm-two-peer-live-acceptance.mjs",
     "test:swarm-peer:syntax": "node --check scripts/swarm-two-peer-live-acceptance.mjs",
