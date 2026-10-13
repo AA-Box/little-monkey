@@ -40,6 +40,30 @@ test('rejects tampered, stale, unrelated, and replayed trace observations',()=>{
   assert.throws(()=>verifyRemoteJournal(v,input));
  }
 });
+test('v3 independent receiver requires real metered usage for complete cross-host verification',()=>{
+ const v=sample();
+ const usage={node_id:'n',target_id:'provider:model',
+   elapsed_ms:1400,input_tokens:700,output_tokens:100,
+   cached_input_tokens:200,model_calls:1,cost_micros:250};
+ assert.throws(()=>verifyRemoteJournal(v,{...input,requireModelUsage:true}),/metering/);
+ v.replicas[0].version=3;v.replicas[0].model_usage=[usage];
+ const accepted=verifyRemoteJournal(v,{...input,requireModelUsage:true});
+ assert.equal(accepted.measuredPeerRuns,1);
+ assert.equal(accepted.observedInputTokens,700);
+ assert.equal(accepted.observedOutputTokens,100);
+ assert.equal(accepted.observedCostMicros,250);
+ assert.equal(accepted.providerBillingReconciled,false);
+ for(const bad of [
+   {...usage,node_id:'outsider'}, {...usage,model_calls:0},
+   {...usage,output_tokens:-1}, {...usage,cached_input_tokens:800},
+   {...usage,cost_micros:-1},
+ ]){
+   const corrupt=structuredClone(v);corrupt.replicas[0].model_usage=[bad];
+   assert.throws(()=>verifyRemoteJournal(corrupt,{...input,requireModelUsage:true}));
+ }
+ const forgedVersion=structuredClone(v);forgedVersion.replicas[0].version=2;
+ assert.throws(()=>verifyRemoteJournal(forgedVersion,input),/metering/);
+});
 test('live mode requires actual operator-confirmed devices and installed daemon',()=>{
  const run=spawnSync(process.execPath,
   ['scripts/swarm-cross-host-telemetry-live-acceptance.mjs',
