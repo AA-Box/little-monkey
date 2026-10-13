@@ -197,6 +197,27 @@ export const daemonSwarmStatus = (id: string | null = null) =>
 export const daemonSwarmCancel = (id: string) =>
   invoke<string>("daemon_swarm_cancel", { id });
 
+/** Actual local membership and signed multi-installation quorum status. */
+export interface DaemonClusterStatus {
+  group:string;
+  roster_sha256:string;
+  configured_members:number;
+  local_fingerprint:string;
+  lease:{term:number;leader:string;expires_at_ms:number;active:boolean}|null;
+  may_schedule:boolean;
+}
+export interface DaemonClusterElection {
+  status:'elected';cluster:string;term:number;leader:string;
+  quorum:number;members:number;expires_at_ms:number;
+}
+export const daemonClusterSetup=(rosterPath:string)=>
+  invoke<{cluster:string;members:number;roster_sha256:string;status:string}>(
+    "daemon_cluster_setup",{rosterPath});
+export const daemonClusterStatus=(group:string)=>
+  invoke<DaemonClusterStatus>("daemon_cluster_status",{group});
+export const daemonClusterElect=(group:string)=>
+  invoke<DaemonClusterElection>("daemon_cluster_elect",{group});
+
 export const daemonPause = (runId: string) => invoke<string>("daemon_desktop_pause", { runId });
 export const daemonResume = (runId: string) => invoke<string>("daemon_desktop_resume", { runId });
 export const daemonCancel = (runId: string, reason?: string) => invoke<string>("daemon_desktop_cancel", { runId, reason: reason ?? null });

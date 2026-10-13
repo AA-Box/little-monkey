@@ -8,7 +8,9 @@ import {useModelStore,type ModelInfo} from '../../store/modelStore';
 import {promoteVerifiedMlxFusion,recoverInterruptedMlxPromotion,type PromotionRuntime} from '../../lib/swarmMlxPromotion';
 import { parseCommandHooksManifest } from '../../lib/commandHookManifest';
 import { useUserHooksStore } from '../../store/userHooksStore';
-import { daemonSwarmCancel, daemonSwarmStatus, daemonSwarmSubmit, type ResidentSwarmGraphStatus } from '../../lib/daemonClient';
+import { daemonSwarmCancel, daemonSwarmStatus, daemonSwarmSubmit,
+ daemonClusterSetup,daemonClusterStatus,daemonClusterElect,
+ type DaemonClusterStatus,type ResidentSwarmGraphStatus } from '../../lib/daemonClient';
 import { Activity, CheckCircle2, Copy, RefreshCw, ShieldCheck } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { buildGoalSwarm } from '../../lib/swarmPlanning';
@@ -87,6 +89,9 @@ export function SwarmPanel() {
   const [pluginBusy, setPluginBusy] = useState<string | null>(null);
   const [resident, setResident] = useState<ResidentSwarmGraphStatus[]>([]);
   const [residentBusy, setResidentBusy] = useState(false);
+  const [clusterGroup,setClusterGroup]=useState('');
+  const [clusterStatus,setClusterStatus]=useState<DaemonClusterStatus|null>(null);
+  const [clusterBusy,setClusterBusy]=useState(false);
   const [residentFallbackEnabled,setResidentFallbackEnabled]=useState(false);
   const [hookBusy, setHookBusy] = useState(false);
   const [memoryDevice, setMemoryDevice] = useState('');
@@ -191,6 +196,37 @@ export function SwarmPanel() {
   }
   useEffect(() => { void refreshPeers(); }, []);
   useEffect(() => { void refreshPlugins().catch(() => undefined); }, [refreshPlugins]);
+  async function signedClusterAction(action:'setup'|'status'|'elect') {
+    setClusterBusy(true);setError('');setNotice('');
+    try {
+      if(action==='setup'){
+        const selected=await open({multiple:false,filters:[
+          {name:'Signed peer quorum roster',extensions:['json']},
+        ]});
+        if(typeof selected!=='string')return;
+        if(!window.confirm('Enroll this explicit roster of already paired device identities and TLS certificate fingerprints on THIS machine? This grants no task permissions. Your other installations must be enrolled separately.'))return;
+        const result=await daemonClusterSetup(selected);
+        setClusterGroup(result.cluster);
+        setClusterStatus(await daemonClusterStatus(result.cluster));
+        setNotice('Local signed peer roster enrolled: '+result.members+
+          ' members. No election has been implied by enrollment.');
+      }else{
+        const group=clusterGroup.trim();
+        if(!group)throw Error('Enter an operator-enrolled cluster group.');
+        if(action==='elect'){
+          if(!window.confirm('Request actual signed votes from the pinned paired nodes for '+
+            group+'? If a strict majority grants a lease, pre-approved local read-only resident graph tasks may start automatically. No permission grants or remote edits will be created.'))return;
+          const answer=await daemonClusterElect(group);
+          if(answer.status!=='elected'||answer.quorum<=Math.floor(answer.members/2))
+            throw Error('The native election did not return a valid strict majority.');
+          setNotice('Actual signed quorum elected term '+answer.term+
+            ' with '+answer.quorum+'/'+answer.members+' voters. Re-read lease status for current authorization.');
+        }
+        setClusterStatus(await daemonClusterStatus(group));
+      }
+    }catch(error){setError('Signed cluster: '+String(error));}
+    finally{setClusterBusy(false);}
+  }
   async function refreshResident() {
     try { setResident((await daemonSwarmStatus()).graphs); }
     catch (cause) { setError('Resident service unavailable: ' + String(cause)); }
@@ -1017,6 +1053,27 @@ export function SwarmPanel() {
       </div>
       <div className="rounded-lg border border-border bg-surface p-3">
         <h4 className="text-sm font-semibold text-foreground">Resident autonomous recipe graphs</h4>
+        <div className="mt-3 rounded border border-border p-2">
+          <p className="text-xs font-medium text-foreground">Signed multi-node leader quorum</p>
+          <p className="mt-1 text-xs text-muted">Requires independently installed, TLS-pinned, task-granted peers. Enroll a reviewed roster on each machine. Only a current local signed strict-majority lease authorizes new clustered read-only DAG dispatch. Network failure and expired votes do not grant leadership.</p>
+          <label className="mt-2 block text-xs text-muted">Cluster group
+            <input aria-label="Signed cluster group" value={clusterGroup}
+              onChange={event=>{setClusterGroup(event.target.value);setClusterStatus(null);}}
+              maxLength={80} placeholder="research-cluster"
+              className="mt-1 w-full rounded border border-border bg-background p-2 text-foreground"/>
+          </label>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <Button size="sm" disabled={clusterBusy} onClick={()=>void signedClusterAction('setup')}>Enroll reviewed roster JSON…</Button>
+            <Button size="sm" disabled={clusterBusy||!clusterGroup.trim()} onClick={()=>void signedClusterAction('status')}>Refresh native lease status</Button>
+            <Button size="sm" disabled={clusterBusy||!clusterGroup.trim()} onClick={()=>void signedClusterAction('elect')}>Request signed leader election…</Button>
+          </div>
+          {clusterStatus&&<div className="mt-2 space-y-1 text-xs text-foreground">
+            <p>Group: {clusterStatus.group} · Members: {clusterStatus.configured_members}</p>
+            <p className="break-all">Roster digest: {clusterStatus.roster_sha256}</p>
+            <p>Local dispatch authorized by a CURRENT quorum: {clusterStatus.may_schedule?'yes':'no'}</p>
+            <p>Term: {clusterStatus.lease?.term??'none'} · Leader: {clusterStatus.lease?.leader?.slice(0,16)??'none'} · Expires: {clusterStatus.lease?new Date(clusterStatus.lease.expires_at_ms).toLocaleString():'no lease'}</p>
+          </div>}
+        </div>
         <p className="mt-1 text-xs leading-5 text-muted">Durable DAGs run under the installed OS daemon and survive app restarts. Each graph node uses a frozen, operator-selected local recipe with manual/plan tool permissions. This does not automatically resume write-capable chat agents.</p>
         {mode==='analyze' && <label className="mt-2 flex gap-2 text-xs text-foreground">
           <input type="checkbox" checked={residentFallbackEnabled} onChange={event=>setResidentFallbackEnabled(event.target.checked)}/>

@@ -1160,6 +1160,34 @@ pub async fn daemon_swarm_status(id: Option<String>) -> Result<Value, String> {
     parse_json(&command(args).await?)
 }
 
+/// Operator-owned signed swarm cluster management through installed native
+/// CLI. These endpoints do not expose arbitrary shell commands or enable
+/// pairing; each local roster is independently validated in Rust.
+#[tauri::command]
+pub async fn daemon_cluster_setup(roster_path: String) -> Result<Value,String> {
+    validate_output_path(&roster_path)?;
+    let path=std::path::Path::new(&roster_path);
+    let metadata=std::fs::symlink_metadata(path).map_err(|e|e.to_string())?;
+    if !metadata.is_file()||metadata.file_type().is_symlink()||
+       metadata.len()>16_384||metadata.len()==0||
+       path.extension().and_then(|x|x.to_str())!=Some("json") {
+        return Err("Choose a regular operator-owned JSON cluster roster under 16 KiB".into());
+    }
+    parse_json(&command(vec![
+        "peers".into(),"cluster-setup".into(),roster_path
+    ]).await?)
+}
+#[tauri::command]
+pub async fn daemon_cluster_status(group: String) -> Result<Value,String> {
+    validate_id("signed cluster group",&group)?;
+    parse_json(&command(vec!["peers".into(),"cluster-status".into(),group]).await?)
+}
+#[tauri::command]
+pub async fn daemon_cluster_elect(group: String) -> Result<Value,String> {
+    validate_id("signed cluster group",&group)?;
+    parse_json(&command(vec!["peers".into(),"cluster-elect".into(),group]).await?)
+}
+
 #[tauri::command]
 pub async fn daemon_swarm_cancel(id: String) -> Result<String, String> {
     validate_id("swarm graph id", &id)?;
