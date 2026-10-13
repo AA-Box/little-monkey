@@ -428,6 +428,66 @@ mod tests {
     }
 
     #[test]
+    fn partitioned_multiwriter_revisions_converge_without_confusing_writer_identities() {
+        // Simulate two independently persisted installation databases whose
+        // network is unavailable for several revision epochs. This checks
+        // conflict resolution and capacity under load; real TLS partitions
+        // remain part of operator-owned two-host acceptance.
+        let mut a=DaemonStore::open_in_memory().unwrap();
+        let mut b=DaemonStore::open_in_memory().unwrap();
+        let author_a=remote_author(&"a".repeat(64)).unwrap();
+        let author_b=remote_author(&"b".repeat(64)).unwrap();
+        let first_a=(0..48).map(|i|doc(&format!("a-{i:02}"),1,"origin A"))
+            .collect::<Vec<_>>();
+        let first_b=(0..48).map(|i|doc(&format!("b-{i:02}"),1,"origin B"))
+            .collect::<Vec<_>>();
+        assert_eq!(put_batch(&mut a,"partition",LOCAL_AUTHOR,&first_a).unwrap(),48);
+        assert_eq!(put_batch(&mut b,"partition",LOCAL_AUTHOR,&first_b).unwrap(),48);
+        // Both peers were offline and then recover. The transport converts
+        // each publisher's @local stream to its pinned certificate identity.
+        assert_eq!(put_batch(&mut b,"partition",&author_a,&first_a).unwrap(),48);
+        assert_eq!(put_batch(&mut a,"partition",&author_b,&first_b).unwrap(),48);
+        assert_eq!(list(&a,"partition",false).unwrap().len(),96);
+        assert_eq!(list(&b,"partition",false).unwrap().len(),96);
+        assert_eq!(put_batch(&mut b,"partition",&author_a,&first_a).unwrap(),0);
+        assert_eq!(put_batch(&mut a,"partition",&author_b,&first_b).unwrap(),0);
+        // Another disconnected interval: independent revisions, including
+        // deletions. Deliver the batches in both directions after reconnect.
+        let updates_a=(0..16).map(|i|{
+            let mut item=doc(&format!("a-{i:02}"),2,"amended on A");
+            if i<8 {item.revision=3;item.deleted=true;item.text.clear();item.vector.clear();}
+            item
+        }).collect::<Vec<_>>();
+        let updates_b=(0..16).map(|i|{
+            let mut item=doc(&format!("b-{i:02}"),2,"amended on B");
+            if i<8 {item.revision=3;item.deleted=true;item.text.clear();item.vector.clear();}
+            item
+        }).collect::<Vec<_>>();
+        assert_eq!(put_batch(&mut a,"partition",LOCAL_AUTHOR,&updates_a).unwrap(),16);
+        assert_eq!(put_batch(&mut b,"partition",LOCAL_AUTHOR,&updates_b).unwrap(),16);
+        assert_eq!(put_batch(&mut a,"partition",&author_b,&updates_b).unwrap(),16);
+        assert_eq!(put_batch(&mut b,"partition",&author_a,&updates_a).unwrap(),16);
+        assert_eq!(put_batch(&mut a,"partition",&author_b,&updates_b).unwrap(),0);
+        assert_eq!(put_batch(&mut b,"partition",&author_a,&updates_a).unwrap(),0);
+        let records_a=list(&a,"partition",false).unwrap();
+        let records_b=list(&b,"partition",false).unwrap();
+        assert_eq!(records_a.len(),96);
+        assert_eq!(records_b.len(),96);
+        for (left,right) in records_a.iter().zip(&records_b) {
+            assert_eq!(left.author,right.author);
+            assert_eq!(left.document,right.document);
+        }
+        assert_eq!(records_a.iter().filter(|item|item.document.deleted).count(),16);
+        let mut old=doc("a-00",1,"stale replay");
+        assert!(put_batch(&mut b,"partition",&author_a,&[old.clone()]).is_err());
+        old.revision=3;
+        assert!(put_batch(&mut b,"partition",&author_a,&[old]).is_err(),
+            "same revision may never resurrect a tombstone");
+        assert_eq!(search(&a,"partition","embed-model-v1",&[0.3,0.4,0.5],10)
+            .unwrap().len(),10);
+    }
+
+    #[test]
     fn durable_vector_revisions_and_tombstones_cannot_be_replayed_or_cross_models() {
         let mut store=DaemonStore::open_in_memory().unwrap();
         grant(&store,"paired-alice","shared",true,false).unwrap();
