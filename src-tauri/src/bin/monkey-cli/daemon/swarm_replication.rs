@@ -57,7 +57,7 @@ fn valid_id(s:&str)->bool{
 }
 fn valid_state(s:&str)->bool{
     matches!(s,"running"|"failing"|"cancelling"|"succeeded"|"failed"|"cancelled"|
-        "pending"|"pending_fallback"|"submitted"|"submitted_fallback")
+        "pending"|"pending_fallback"|"preparing"|"preparing_fallback"|"submitted"|"submitted_fallback")
 }
 impl ReplicaSnapshot{
     /// Seal exactly the immutable values carried in this checkpoint. This is
@@ -298,7 +298,7 @@ pub fn capture_local_leader(
 /// and never applies any remote status as a trusted local completion.
 pub fn spawn_replica_worker(paths:super::store::DaemonPaths){
     tokio::spawn(async move {
-        let mut timer=tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut timer=tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             timer.tick().await;
             let now=match super::now_ms().and_then(|ms|
@@ -361,10 +361,33 @@ pub fn spawn_replica_worker(paths:super::store::DaemonPaths){
                     answer["sequence"]==snapshot.sequence &&
                     answer["graph_id"]==graph &&
                     answer["group"]==group) {
-                    // Failure is never translated into cancellation, progress,
-                    // or a second local task. The next sync receives a newer
-                    // whole checkpoint and safely converges after partitions.
                     eprintln!("Swarm replica checkpoint deferred for {group}/{graph} on {alias}");
+                    continue;
+                }
+                // A POST acceptance alone cannot prove the receiver durably
+                // committed this state. Read the same receiver over independently
+                // signed pinned TLS GET and compare the ENTIRE snapshot.
+                let readback=tokio::time::timeout(
+                    std::time::Duration::from_secs(8),
+                    super::remote::signed_swarm_checkpoint_readback(
+                        &paths,&alias,&fp,&group,&graph,now as u64
+                    )
+                ).await;
+                let Ok(Ok(observed))=readback else{continue;};
+                let Ok(expected)=serde_json::to_value(&snapshot) else{continue;};
+                if observed["group"]!=group||observed["graph"]!=graph||
+                    !observed["replicas"].as_array().is_some_and(|rows|
+                        rows.iter().any(|row|row==&expected)) {
+                    eprintln!("Swarm replica readback differed for {group}/{graph} on {alias}");
+                    continue;
+                }
+                // A remote readback that matches the exact state/term earns
+                // one durable vote toward the PRE-DISPATCH state barrier.
+                // It never counts for newer states or terms.
+                if let Err(error)=super::swarm_quorum::attest_readback(
+                    &paths,&snapshot,&fp,now
+                ){
+                    eprintln!("Swarm replica quorum record deferred: {error}");
                 }
             }
         }
