@@ -157,6 +157,8 @@ pub enum DaemonCmd {
     },
     /// Publish an authenticated, bounded DAG observation to a specifically enrolled peer.
     SwarmReplicate { group: String, id: String, peer: String },
+    /// Inspect identity-bound cluster checkpoints received from other peers.
+    SwarmReplicaStatus { group: String, id: String },
     /// List the 12 opt-in background worker roles.
     SwarmWorkerCatalog,
     /// Install a frozen, plan-only native worker using existing durable cron or filesystem triggers.
@@ -566,6 +568,14 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
             }
             let paths = DaemonPaths::resolve()?;
             println!("{}", swarm_transfer::import_read_only(&paths,input,new_id,workspace)?);
+            Ok(())
+        },
+        DaemonCmd::SwarmReplicaStatus {group,id} => {
+            let paths=DaemonPaths::resolve()?;
+            let store=DaemonStore::open(&paths)?;
+            let snapshots=swarm_replication::list_local(&store,group,id)?;
+            println!("{}",serde_json::json!({"group":group,"graph":id,
+                "replicas":snapshots,"trusted_for_execution":false}));
             Ok(())
         },
         DaemonCmd::SwarmReplicate {group,id,peer} => {
