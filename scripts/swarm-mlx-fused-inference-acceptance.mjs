@@ -110,10 +110,11 @@ async function main(){
   // Homebrew/virtualenv Python entrypoints commonly are symlinks; resolve
   // the selected binary to its reviewed regular target rather than refusing
   // a legitimate Apple Silicon MLX environment on path shape alone.
-  if(!isAbsolute(python)||/[\\x00-\\x1f]/.test(python)||python.split(/[\\/\\\\]/).includes('..'))
+  const hasUnsafePathSegments=value=>[...value].some(char=>char.charCodeAt(0)<32||char.charCodeAt(0)===127)||
+    value.replaceAll('\\\\','/').split('/').includes('..');
+  if(!isAbsolute(python)||hasUnsafePathSegments(python))
     throw Error('Python must be an absolute local selected executable');
-  if(!isAbsolute(receiptPath)||/[\\x00-\\x1f]/.test(receiptPath)||
-     receiptPath.split(/[\\/\\\\]/).includes('..'))
+  if(!isAbsolute(receiptPath)||hasUnsafePathSegments(receiptPath))
     throw Error('Receipt must be an absolute local path');
   const py=realpathSync(python);
   // A Python path is invoked as an executable by the OS; do not pre-check
