@@ -81,7 +81,32 @@ where F: FnOnce(String) -> Result<(), String> {
 
     let callback = listener.await_callback(Duration::from_secs(300)).await?;
     let code = validate_callback(callback, &state)?;
+    exchange_and_store(&code, &verifier).await
+}
 
+/// Headless OAuth PKCE requires no loopback listener. OpenRouter displays a
+/// single-use code in the browser, and the user pastes it into the terminal.
+/// The verifier never leaves the CLI process except during HTTPS exchange.
+pub async fn login_openrouter_headless_with<F>(request_code: F) -> Result<(), String>
+where F: FnOnce(String) -> Result<String, String> {
+    let _guard = LOGIN_LOCK.lock().await;
+    let verifier = random_verifier();
+    let mut url = url::Url::parse(AUTHORIZE_ENDPOINT)
+        .map_err(|e| format!("Invalid OpenRouter authorization endpoint: {e}"))?;
+    url.query_pairs_mut()
+        .append_pair("code_challenge", &code_challenge(&verifier))
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("key_label", "Little Monkey CLI");
+    let code = request_code(url.to_string())?;
+    if code.trim().is_empty() || code.len() > 4096 || code.chars().any(char::is_whitespace) {
+        return Err("Invalid authorization code pasted for OpenRouter".into());
+    }
+    exchange_and_store(code.trim(), &verifier).await
+}
+
+/// Common credential publication for desktop, local CLI, and headless CLI.
+/// Existing keys are not touched before a successful HTTPS code exchange.
+async fn exchange_and_store(code: &str, verifier: &str) -> Result<(), String> {
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
