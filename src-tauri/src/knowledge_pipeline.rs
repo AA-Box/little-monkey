@@ -26,6 +26,8 @@ use walkdir::WalkDir;
 
 use crate::egress::{EgressDenial, EgressRule};
 
+mod hnsw;
+
 pub const KNOWLEDGE_PIPELINE_SCHEMA_VERSION: u32 = 1;
 pub const CONNECTOR_CONTRACT_VERSION: u32 = 1;
 pub const EXTRACTOR_CONTRACT_VERSION: u32 = 1;
@@ -3457,6 +3459,9 @@ impl HybridIndex {
                     params![chunk.chunk_id, chunk.text, heading],
                 )?;
             }
+            // The graph is frozen with the same immutable chunk/vector
+            // transaction. Old/small generations continue exact retrieval.
+            hnsw::build(&transaction,chunks,&normalized_vectors,cancel)?;
             check_cancelled(cancel)?;
             transaction.commit()?;
         }
@@ -3516,6 +3521,7 @@ impl HybridIndex {
                 ));
             }
             verify_fts_mirror(&connection)?;
+            hnsw::validate(&connection)?;
             remember_validated(identity, index_digest.clone());
         }
         Ok(Self {
@@ -3977,6 +3983,12 @@ fn vector_candidates_filtered(
     excluded_source_ids: &BTreeSet<String>,
     cancel: &CancellationToken,
 ) -> PipelineResult<Vec<(String, f32)>> {
+    // Persisted, tamper-checked graph search for large new generations.
+    // Exact scan remains authoritative for old and small indexes, or broad
+    // exclusions where ANN candidate recall cannot be guaranteed.
+    if let Some(candidates)=hnsw::query(connection,query,dimension,limit,excluded_source_ids,cancel)?{
+        return Ok(candidates);
+    }
     if excluded_source_ids.is_empty() {
         return vector_candidates(connection, query, dimension, limit, cancel);
     }
