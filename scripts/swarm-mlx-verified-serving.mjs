@@ -9,6 +9,7 @@
  */
 import {spawn} from 'node:child_process';
 import {createServer,request as httpRequest} from 'node:http';
+import {connect as tcpConnect} from 'node:net';
 import {randomUUID,createHash} from 'node:crypto';
 import {readFileSync,writeFileSync,existsSync,readdirSync,openSync,closeSync,fsyncSync,
  renameSync,rmSync,mkdirSync,realpathSync,lstatSync} from 'node:fs';
@@ -139,6 +140,26 @@ function postToBackend(port,payload,timeoutMs=120000){
   req.on('error',reject);req.end(data);
  });
 }
+function portOccupied(port){
+ return new Promise(resolve=>{
+  const client=tcpConnect({host:'127.0.0.1',port});
+  client.setTimeout(2500,()=>{client.destroy();resolve(true);});
+  client.once('connect',()=>{client.destroy();resolve(true);});
+  client.once('error',error=>{client.destroy();resolve(error?.code!=='ECONNREFUSED');});
+ });
+}
+async function assertModelIdentity(port,expected){
+ const models=await new Promise((resolve,reject)=>{
+  const req=httpRequest({hostname:'127.0.0.1',port,path:'/v1/models',method:'GET',timeout:15000},res=>{
+   let data='';res.on('data',chunk=>{data+=chunk;if(data.length>65536)req.destroy(Error('Model identity oversized'));});
+   res.on('end',()=>{if(res.statusCode!==200)return reject(Error('MLX model list rejected'));
+    try{resolve(JSON.parse(data));}catch{reject(Error('Invalid live MLX model identity'));}
+   });
+  });req.on('error',reject);req.on('timeout',()=>req.destroy(Error('Model identity timed out')));req.end();
+ });
+ if(!models||!Array.isArray(models.data)||!models.data.some(row=>row?.id===expected))
+  fail('Live MLX server does not prove the exact fused/base model selected for deployment');
+}
 async function probe(port){
  const output=await postToBackend(port,{messages:[{role:'user',content:'Reply briefly.'}],max_tokens:24,stream:false});
  const answer=output?.choices?.[0]?.message?.content;
@@ -148,6 +169,8 @@ async function probe(port){
 async function startBackend(policy,modelPath){
  // With one local model in memory, stop the previous service before this
  // call. This intentionally causes temporary 503 rather than an OOM hot-swap.
+ if(await portOccupied(policy.backendPort))
+  fail('Refusing an already occupied MLX backend port; another process may own the model');
  const child=spawn(policy.training.python,['-m','mlx_lm.server',
   '--model',modelPath,'--host','127.0.0.1','--port',String(policy.backendPort)],{
   stdio:['ignore','ignore','pipe'],env:{PATH:process.env.PATH??'',HOME:process.env.HOME??'',
@@ -158,7 +181,7 @@ async function startBackend(policy,modelPath){
  const deadline=Date.now()+180000;
  while(Date.now()<deadline){
   if(child.exitCode!==null)fail('Local MLX service exited before ready');
-  try{await probe(policy.backendPort);return child;}
+  try{await probe(policy.backendPort);await assertModelIdentity(policy.backendPort,modelPath);return child;}
   catch{await new Promise(done=>setTimeout(done,2500));}
  }
  child.kill('SIGKILL');fail('MLX service failed real generation before readiness deadline');
