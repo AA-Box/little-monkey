@@ -9,7 +9,7 @@ use super::super::{
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use uuid::Uuid;
 
 const K: usize = 10;
@@ -165,6 +165,13 @@ fn production_hnsw_scale_gate() {
     let mut excluded=BTreeSet::new();excluded.insert("source:benchmark:0".into());
     assert!(query(&conn,&vectors[0],dim,K,&excluded,&cancel).unwrap().is_none(),
         "exclusion must force complete exact scan, never leak filtered candidates");
+    let filtered=index.search_excluding_sources("benchmark",&vectors[0],
+        &HybridSearchConfig::default(),&PipelineLimits::default(),None,
+        &excluded,&cancel).expect("filtered full pipeline");
+    assert!(filtered.hits.iter().all(|hit|!excluded.contains(&hit.chunk.source_id)),
+        "filtered production index must not reveal excluded chunks");
+    assert!(query(&conn,&vectors[0],dim,513,&BTreeSet::new(),&cancel).unwrap().is_none(),
+        "requests wider than the bounded ANN beam must use exact ranking");
     let cancelled=CancellationToken::new();cancelled.cancel();
     assert!(query(&conn,&vectors[0],dim,K,&BTreeSet::new(),&cancelled).is_err(),
         "cancellation must interrupt persisted traversal");
@@ -196,7 +203,7 @@ fn production_hnsw_scale_gate() {
         "concurrent_readers":8,"concurrent_queries_per_sec":concurrent_qps,
         "sqlite_file_mib":disk_mib,"process_peak_rss_mib":hwm,
         "integrity":"reopened_and_verified","hybrid_search":"passed",
-        "source_exclusion":"exact_fallback","cancellation":"passed",
+        "source_exclusion":"end_to_end_exact_fallback","cancellation":"passed",
         "concurrent_independent_sqlite_readers":"passed",
     });
     report(result);
