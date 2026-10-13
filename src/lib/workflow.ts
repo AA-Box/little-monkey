@@ -39,6 +39,8 @@ import { approvedSwarmNotebookBlock, stageSwarmNote } from './swarmNotebook';
 import { approvedLearningContext } from './swarmLearningCycle';
 import { buildSwarmTrajectoryContext } from './swarmTrajectoryMemory';
 import {frozenAuthenticatedPeerVoters,revalidateAuthenticatedPeerVoters} from './swarmPeerQuorum';
+import { LiveSwarmBus } from './swarmLiveBus';
+import { captureAutoMemory, retrieveAutoMemory, validateAutoMemoryStack } from './swarmAutoMemory';
 
 export interface WorkflowAgentSpec {
   description: string;
@@ -86,6 +88,10 @@ export interface WorkflowSpec {
   notebook?: boolean;
   /** Explicit opt-in to operator-approved, domain-matched past learning. */
   learning?: boolean;
+  /** Opt-in in-process collaboration. Remote agents are disallowed. */
+  liveMessaging?: boolean;
+  /** Opt-in semantic storage bound to an existing Knowledge embedding stack. */
+  autoMemoryStackId?: string;
 }
 
 /** Caps mirror the tool schema's documented limits — validated here anyway
@@ -148,6 +154,15 @@ export function assertWorkflowBounds(spec: WorkflowSpec): void {
     throw new Error('Non-phased coordination is local, read-only and cannot relay reports to remote peers or modifying agents.');
   }
   if (spec.memoryStackIds !== undefined) parseSwarmMemoryStackIds(spec.memoryStackIds);
+  if (spec.liveMessaging !== undefined && typeof spec.liveMessaging !== 'boolean')
+    throw new Error('Invalid live messaging flag.');
+  if (spec.liveMessaging && spec.phases.some(p => p.agents.some(a => !!a.peer)))
+    throw new Error('Live workflow messages are local only.');
+  if (spec.autoMemoryStackId !== undefined) {
+    validateAutoMemoryStack(spec.autoMemoryStackId);
+    if (spec.phases.some(p => p.agents.some(a => !!a.peer)))
+      throw new Error('Automatic local memory cannot be shared with remote agents.');
+  }
   if (spec.learning !== undefined && typeof spec.learning !== 'boolean') throw new Error('Invalid learning flag.');
   if (spec.learning && spec.phases.some(phase=>phase.agents.some(agent=>agent.peer!==undefined || agent.profile!=='explore'))) {
     throw new Error('Operator-approved learning retrieval is local read-only only.');
@@ -227,6 +242,10 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
   const topology = parseSwarmTopology(args.topology);
   const memoryStackIds = parseSwarmMemoryStackIds(args.memory_stack_ids);
   const consensus = parseSwarmVotePolicy(args.consensus);
+  if (args.live_messaging !== undefined && typeof args.live_messaging !== 'boolean')
+    throw new Error('live_messaging must be a boolean.');
+  if (args.auto_memory_stack_id !== undefined && typeof args.auto_memory_stack_id !== 'string')
+    throw new Error('auto_memory_stack_id must be a stack ID string.');
   if(args.authenticated_peer_voting!==undefined&&typeof args.authenticated_peer_voting!=='boolean')
     throw new Error('authenticated_peer_voting must be a boolean.');
   return { name, description, phases,
@@ -236,6 +255,9 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
     ...(args.authenticated_peer_voting === true ? { authenticatedPeerVoting: true } : {}),
     ...(args.notebook === true ? { notebook: true } : {}),
     ...(args.learning === true ? { learning: true } : {}),
+    ...(args.live_messaging === true ? { liveMessaging: true } : {}),
+    ...(typeof args.auto_memory_stack_id === 'string'
+      ? { autoMemoryStackId: validateAutoMemoryStack(args.auto_memory_stack_id) } : {}),
     ...(memoryStackIds.length ? { memoryStackIds } : {}) };
 }
 
@@ -247,6 +269,20 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
  * `executeToolCall` `workflow` branch calls this instead of
  * `parseWorkflowSpec` directly. Exported for the logic tests.
  */
+function withLiveOptions(spec: WorkflowSpec, args: Record<string, unknown>): WorkflowSpec {
+  if (args.live_messaging !== undefined && typeof args.live_messaging !== 'boolean')
+    throw new Error('live_messaging must be a boolean.');
+  if (args.auto_memory_stack_id !== undefined && typeof args.auto_memory_stack_id !== 'string')
+    throw new Error('auto_memory_stack_id must be a stack ID string.');
+  const augmented: WorkflowSpec = {
+    ...spec,
+    ...(args.live_messaging === true ? { liveMessaging: true } : {}),
+    ...(typeof args.auto_memory_stack_id === 'string'
+      ? { autoMemoryStackId: validateAutoMemoryStack(args.auto_memory_stack_id) } : {}),
+  };
+  assertWorkflowBounds(augmented);
+  return augmented;
+}
 export function resolveWorkflowSpec(args: Record<string, unknown>, sessionId?: string): WorkflowSpec {
   // A resume-only tool invocation explicitly opts into recovering an
   // interrupted workflow. Never re-run one merely because it hydrated.
@@ -266,11 +302,13 @@ export function resolveWorkflowSpec(args: Record<string, unknown>, sessionId?: s
       notebook: meta.spec.notebook,
       learning: meta.spec.learning,
       topology: meta.spec.topology,
+      live_messaging: meta.spec.liveMessaging,
+      auto_memory_stack_id: meta.spec.autoMemoryStackId,
     });
   }
-  if (args.goal !== undefined) return buildGoalSwarm(args);
-  if (args.preset !== undefined) return buildSwarmPreset(args);
-  if (args.tasks !== undefined) return compileSwarmTaskGraph(args);
+  if (args.goal !== undefined) return withLiveOptions(buildGoalSwarm(args), args);
+  if (args.preset !== undefined) return withLiveOptions(buildSwarmPreset(args), args);
+  if (args.tasks !== undefined) return withLiveOptions(compileSwarmTaskGraph(args), args);
   if (args.mode !== undefined || args.scope !== undefined) throw new Error('workflow mode and scope require a goal or preset.');
   const saved = typeof args.saved === 'string' ? args.saved.trim() : '';
   if (saved && !Array.isArray(args.phases)) {
