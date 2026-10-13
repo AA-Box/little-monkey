@@ -14,7 +14,7 @@ use super::store::DaemonStore;
 
 const MAX_READ_ONLY_REASSIGNMENTS: i64 = 2;
 
-fn schema(store: &DaemonStore) -> Result<(), String> {
+pub(super) fn schema(store: &DaemonStore) -> Result<(), String> {
     store.connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS resident_swarm_task_reassignments (
             graph_id TEXT NOT NULL,
