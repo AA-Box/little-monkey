@@ -3,7 +3,7 @@
  * pairings, majority failover, signed replica readback and new DAG import.
  * Linux CI only; never run against users' real devices or model accounts. */
 import {spawn,spawnSync} from 'node:child_process';
-import {mkdtempSync,mkdirSync,writeFileSync,existsSync,rmSync,statSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,openSync,closeSync,existsSync,rmSync,statSync} from 'node:fs';
 import {join,isAbsolute} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createServer,connect} from 'node:net';
@@ -17,7 +17,12 @@ function cmd(exe,args,env,timeout=60000){
  return r.stdout.trim();
 }
 function run(node,args){return cmd(bin,args,node.env)}
-function json(node,args){try{return JSON.parse(run(node,args))}catch{throw Error('Native JSON contract failed: '+args[0]+' '+args[1])}}
+function json(node,args){
+ let output;try{output=run(node,args);}catch(error){
+  throw Error(String(error.message)+' on '+node.name);
+ }
+ try{return JSON.parse(output)}catch{throw Error('Native JSON contract failed: '+node.name+' '+args[0]+' '+args[1])}
+}
 const children=new Set();
 async function port(){
  return new Promise((ok,fail)=>{
@@ -25,12 +30,29 @@ async function port(){
   server.listen(0,'127.0.0.1',()=>{const p=server.address().port;server.close(e=>e?fail(e):ok(p))});
  });
 }
+function exitReason(node,mode,child){
+ // Output only the final diagnostic line of a disposable peer's local log.
+ // Never publish TLS keys, invitation tokens, signing headers or full logs.
+ let message='no diagnostic logged';
+ try {
+  const lines=readFileSync(node.logPath,'utf8').split(/\r?\n/).filter(Boolean);
+  const candidate=lines.filter(l=>/error|failed|invalid|not configured|permission denied|lock|usage:/i.test(l)).at(-1);
+  if(candidate)message=candidate.replace(/(?:token|secret|password|key|authorization)\s*[:=]\s*\S+/gi,'[redacted]').slice(0,340);
+ } catch {}
+ return 'Independent native peer '+node.name+' exited during '+mode+
+  ' startup (exit '+child.exitCode+', signal '+child.signalCode+'): '+message;
+}
 async function launch(node,mode){
- const child=spawn(bin,mode==='full'?['daemon','serve']:['daemon','remote','host-serve'],
-  {env:node.env,stdio:'ignore'});
+ node.logPath=join(node.dir,'peer-'+mode+'.log');
+ const fd=openSync(node.logPath,'w',0o600);
+ let child;
+ try {
+  child=spawn(bin,mode==='full'?['daemon','serve']:['daemon','remote','host-serve'],
+   {env:node.env,stdio:['ignore',fd,fd]});
+ }finally{closeSync(fd);}
  node.child=child;children.add(child);
  for(let i=0;i<65;i++){
-  if(child.exitCode!==null||child.signalCode!==null)throw Error('Independent native peer exited');
+  if(child.exitCode!==null||child.signalCode!==null)throw Error(exitReason(node,mode,child));
   const online=await new Promise(ok=>{
    const sock=connect({host:'127.0.0.1',port:node.port});
    sock.setTimeout(300);
@@ -41,7 +63,7 @@ async function launch(node,mode){
   if(online)return;
   await delay(200);
  }
- throw Error('Native signed peer listener never bound');
+ throw Error('Native signed peer '+node.name+' '+mode+' listener never bound');
 }
 async function stop(node){
  const child=node.child;if(!child)return;
