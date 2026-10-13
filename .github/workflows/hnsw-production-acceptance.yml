@@ -41,8 +41,8 @@ jobs:
       CARGO_INCREMENTAL: '0'
       LM_HNSW_DB: ${{ github.workspace }}/artifacts/hnsw.sqlite3
       LM_HNSW_REPORT: ${{ github.workspace }}/artifacts/metrics.json
-      LM_HNSW_COUNT: ${{ github.event_name == 'pull_request' && '10000' || inputs.corpus || '100000' }}
-      LM_HNSW_DIM: ${{ github.event_name == 'pull_request' && '128' || inputs.dimension || '384' }}
+      LM_HNSW_COUNT: ${{ github.event_name == 'pull_request' && '100000' || inputs.corpus || '100000' }}
+      LM_HNSW_DIM: ${{ github.event_name == 'pull_request' && '384' || inputs.dimension || '384' }}
       LM_HNSW_QUERIES: '64'
       LM_HNSW_MIN_RECALL: '0.80'
       LM_HNSW_MAX_P95_MS: '250'
