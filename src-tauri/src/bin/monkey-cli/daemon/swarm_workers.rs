@@ -13,6 +13,7 @@ use super::ledger::SharedLedger;
 use super::trigger::{TriggerConfig, TriggerTarget};
 
 pub const WORKERS: &[(&str,&str)] = &[
+    ("ambient-discovery","Act as an opt-in read-only maintenance scout. Inspect only current workspace source and documentation. Propose at most five distinct next tasks with source paths, evidence, impact, uncertainty, and a safe verification plan. Explicitly say when no warranted work is found. Never edit, execute shell commands, expose secrets, enqueue work, use external messaging, or claim unrun tests passed."),
     ("security-review","Review source for concrete exploitable security flaws. Give file paths, evidence and suggested tests, never modify files."),
     ("test-gap-review","Identify high-impact untested behavior, missing negative tests and brittle assertions. Report exact source locations."),
     ("dependency-review","Examine dependency manifests and locks for maintainability, licensing and known-risk indicators. Do not fetch or install packages."),
@@ -152,7 +153,7 @@ mod tests{
     use super::*;
     #[test]
     fn every_builtin_role_has_a_unique_bounded_read_only_instruction(){
-        assert_eq!(WORKERS.len(),12);
+        assert_eq!(WORKERS.len(),13);
         let mut seen=std::collections::BTreeSet::new();
         for (role,instruction) in WORKERS {
             assert!(seen.insert(*role));
@@ -160,6 +161,7 @@ mod tests{
             assert!(!instruction.is_empty()&&instruction.len()<600);
         }
         assert!(role_instruction("run-shell").is_err());
+        assert!(role_instruction("ambient-discovery").unwrap().contains("read-only"));
         assert!(!valid_id("../evil"));
     }
     #[test]
@@ -184,6 +186,15 @@ mod tests{
         let loaded:little_monkey_lib::recipes::Recipe=
             serde_json::from_slice(&fs::read(&stored).unwrap()).unwrap();
         assert_eq!(loaded.permission_mode,"plan");
+        // Discovery is a real native daemon worker role and uses the same
+        // frozen recipe, trigger, bounded turn count and permission gate.
+        let discovery = install(&paths,"ambient-review","ambient-discovery",&input,
+            &workspace,Some("0 */6 * * *"),None).unwrap();
+        assert_eq!(discovery["status"],"scheduled");
+        let discovery_recipe: little_monkey_lib::recipes::Recipe =
+            serde_json::from_slice(&fs::read(paths.snapshots.join("swarm-worker-ambient-review.json")).unwrap()).unwrap();
+        assert_eq!(discovery_recipe.permission_mode,"plan");
+        assert!(discovery_recipe.prompt.contains("ambient-discovery"));
         assert_eq!(loaded.max_iterations,Some(12));
         assert_eq!(loaded.timeout_seconds,Some(900));
         assert!(loaded.prompt.contains("security-review"));
