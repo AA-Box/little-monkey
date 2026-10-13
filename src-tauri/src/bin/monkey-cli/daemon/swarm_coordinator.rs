@@ -125,6 +125,12 @@ fn prepare_schema(store: &DaemonStore) -> Result<(), String> {
         );
          CREATE INDEX IF NOT EXISTS idx_resident_swarm_graph_state
            ON resident_swarm_graphs(state);
+         CREATE TABLE IF NOT EXISTS resident_swarm_graph_owners (
+            graph_id TEXT PRIMARY KEY NOT NULL,
+            group_id TEXT NOT NULL,leader_fp TEXT NOT NULL,
+            original_term INTEGER NOT NULL,
+            FOREIGN KEY(graph_id) REFERENCES resident_swarm_graphs(graph_id)
+         );
          CREATE TABLE IF NOT EXISTS resident_swarm_events (
            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
            graph_id TEXT NOT NULL,
@@ -178,6 +184,25 @@ fn prepare_schema(store: &DaemonStore) -> Result<(), String> {
     ).map_err(|e| e.to_string())
 }
 
+fn owns_current_epoch(store:&DaemonStore,group:&str,graph:&str,now:i64)
+    ->Result<bool,String>{
+    if !super::swarm_cluster::may_schedule(store,group,now)?{return Ok(false);}
+    let local=super::swarm_cluster::roster(store,group)?;
+    let rows=store.connection.query_row(
+        "SELECT owner.group_id,owner.leader_fp,owner.original_term,lease.term
+         FROM resident_swarm_graph_owners owner
+         JOIN swarm_cluster_leases lease ON lease.group_id=owner.group_id
+         WHERE owner.graph_id=?1 AND owner.group_id=?2",
+        params![graph,group],|r|Ok((
+            r.get::<_,String>(0)?,r.get::<_,String>(1)?,
+            r.get::<_,i64>(2)?,r.get::<_,i64>(3)?
+        ))
+    ).optional().map_err(|e|e.to_string())?;
+    Ok(rows.is_some_and(|(saved_group,fp,term,current)|
+        saved_group==group&&fp==local.local().fingerprint&&
+        term>0&&term==current))
+}
+
 fn clock() -> Result<i64, String> {
     i64::try_from(super::now_ms()?).map_err(|_| "Clock out of bounds".to_string())
 }
@@ -224,11 +249,22 @@ pub fn submit(paths: &DaemonPaths, input: &Path) -> Result<serde_json::Value, St
     validate(&spec)?;
     let mut store = DaemonStore::open(paths)?;
     prepare_schema(&store)?;
-    if let Some(group)=spec.cluster_id.as_deref(){
-        // Do not allow graph registration to silently enroll a peer or create
-        // a federation. An operator configures both sides separately.
-        super::swarm_cluster::roster(&store,group)?;
-    }
+    // Registration of a clustered plan is an OWNERSHIP commitment, not a
+    // passive replica installation. Any recovered graph must be re-registered
+    // by the newly elected leader AFTER its predecessor state was reconciled.
+    let ownership=if let Some(group)=spec.cluster_id.as_deref(){
+        let roster=super::swarm_cluster::roster(&store,group)?;
+        let now=clock()?;
+        if !super::swarm_cluster::may_schedule(&store,group,now)?{
+            return Err("Only the current signed majority leader may register a runnable clustered graph".into());
+        }
+        let term:i64=store.connection.query_row(
+            "SELECT term FROM swarm_cluster_leases
+             WHERE group_id=?1 AND leader=?2 AND expires_at_ms>?3",
+            params![group,roster.local().fingerprint,now],|r|r.get(0)
+        ).map_err(|_|"Cluster ownership requires an unexpired signed majority term")?;
+        Some((group.to_string(),roster.local().fingerprint.clone(),term))
+    }else{None};
     let existing: Option<String> = store.connection.query_row(
         "SELECT graph_id FROM resident_swarm_graphs WHERE graph_id=?1",
         [&spec.id], |row| row.get(0),
@@ -289,6 +325,13 @@ pub fn submit(paths: &DaemonPaths, input: &Path) -> Result<serde_json::Value, St
     for node in &spec.nodes {
         tx.execute("INSERT INTO resident_swarm_nodes(graph_id,node_id,state) VALUES (?1,?2,'pending')",
             params![spec.id,node.id]).map_err(|e| e.to_string())?;
+    }
+    if let Some((group,fp,term))=ownership {
+        tx.execute(
+            "INSERT INTO resident_swarm_graph_owners
+             (graph_id,group_id,leader_fp,original_term) VALUES(?1,?2,?3,?4)",
+            params![spec.id,group,fp,term]
+        ).map_err(|e|e.to_string())?;
     }
     tx.commit().map_err(|e| e.to_string())?;
     Ok(serde_json::json!({"id": spec.id, "state": "running", "nodes": spec.nodes.len(),
@@ -626,7 +669,7 @@ pub fn tick(
             // A lost quorum, expired lease or a new candidate term cannot
             // schedule new work. Previously started read-only computations
             // remain under ordinary daemon cancellation/supervision.
-            if !super::swarm_cluster::may_schedule(store,group,now)?{continue;}
+            if !owns_current_epoch(store,group,&id,now)?{continue;}
         }
         if store.kill_switch()? || super::backpressure_for(store,config)?.state ==
             super::scheduler::BackpressureState::Closed {
@@ -714,7 +757,7 @@ pub fn tick(
             // leader must not submit one last read-only graph task.
             if let Some(group)=spec.cluster_id.as_deref() {
                 let fresh=clock()?;
-                if !super::swarm_cluster::may_schedule(store,group,fresh)? ||
+                if !owns_current_epoch(store,group,&id,fresh)? ||
                    !super::swarm_quorum::majority_has_state(store,group,&id,fresh)? {
                     // A readback can age out while the coordinator freezes
                     // dependency input. Never enqueue on a stale quorum.
