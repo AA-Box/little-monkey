@@ -47,6 +47,16 @@ describe('operator opt-in bounded quality/cost optimization',()=>{
   expect(optimizeSwarmRoutingCosts(['provider:high','provider:unknown'],ranking,prices,entries,true).changed).toBe(false);
   expect(optimizeSwarmRoutingCosts(['provider:high','provider:cheap','provider:cheap'],ranking,prices,entries,true).changed).toBe(false);
  });
+ it('does not trade independently observed severe latency regression for cheaper token rates',()=>{
+  const slower:SwarmBenchmarkSummary={...ranking,
+    ranking:ranking.ranking.map(row=>row.target==='provider:cheap'
+      ?{...row,averageVerifiedMs:1000}:row)};
+  expect(optimizeSwarmRoutingCosts(keys,slower,prices,entries,true).changed).toBe(false);
+  const missing:SwarmBenchmarkSummary={...ranking,
+    ranking:ranking.ranking.map(row=>row.target==='provider:cheap'
+      ?{...row,averageVerifiedMs:null}:row)};
+  expect(optimizeSwarmRoutingCosts(keys,missing,prices,entries,true).changed).toBe(false);
+ });
  it('ignores old, future and forged usage instead of treating it as current spend',()=>{
   const stale=entries.map(row=>({...row,occurredAtMs:Date.now()-30*24*60*60_000}));
   expect(optimizeSwarmRoutingCosts(keys,ranking,prices,stale,true).changed).toBe(false);
