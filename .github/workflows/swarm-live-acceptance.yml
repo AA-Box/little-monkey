@@ -300,13 +300,15 @@ jobs:
           MLX_DATA: ${{ inputs.mlx_train_data_dir }}
           MLX_OUTPUT: ${{ inputs.mlx_new_adapter_output }}
           MLX_GATE: ${{ inputs.mlx_max_test_ppl }}
+          MLX_FUSE: ${{ inputs.mlx_fuse_for_import }}
+          MLX_PREVIOUS: ${{ inputs.mlx_previous_model_dir }}
         run: |
           set -euo pipefail
           test -n "$MLX_BASE" && test -n "$MLX_DATA" && test -n "$MLX_OUTPUT" && test -n "$MLX_GATE"
           test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64
           python3 -c "import mlx_lm"
           FUSE_FLAGS=()
-          if [ "${{ inputs.mlx_fuse_for_import }}" = "true" ]; then
+          if [ "$MLX_FUSE" = "true" ]; then
             FUSE_FLAGS=(--fuse-for-import --confirm-fusion)
           fi
           node scripts/swarm-mlx-lora.mjs \
@@ -314,10 +316,10 @@ jobs:
             --iters 200 --max-test-ppl "$MLX_GATE" \
             --confirm-local-training "${FUSE_FLAGS[@]}" \
             > "$RUNNER_TEMP/native-swarm-mlx-lora-acceptance.json"
-          if [ "${{ inputs.mlx_fuse_for_import }}" = "true" ]; then
+          if [ "$MLX_FUSE" = "true" ]; then
             PREVIOUS_ARGS=()
-            if [ -n "${{ inputs.mlx_previous_model_dir }}" ]; then
-              PREVIOUS_ARGS=(--previous-model "${{ inputs.mlx_previous_model_dir }}")
+            if [ -n "$MLX_PREVIOUS" ]; then
+              PREVIOUS_ARGS=(--previous-model "$MLX_PREVIOUS")
             fi
             node scripts/swarm-mlx-fused-inference-acceptance.mjs \
               --receipt "$MLX_OUTPUT/training-receipt.json" \
