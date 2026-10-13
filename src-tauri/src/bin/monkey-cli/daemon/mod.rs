@@ -155,6 +155,8 @@ pub enum DaemonCmd {
         #[arg(long, required = true)]
         confirm_read_only_reexecution: bool,
     },
+    /// Publish an authenticated, bounded DAG observation to a specifically enrolled peer.
+    SwarmReplicate { group: String, id: String, peer: String },
     /// List the 12 opt-in background worker roles.
     SwarmWorkerCatalog,
     /// Install a frozen, plan-only native worker using existing durable cron or filesystem triggers.
@@ -564,6 +566,30 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
             }
             let paths = DaemonPaths::resolve()?;
             println!("{}", swarm_transfer::import_read_only(&paths,input,new_id,workspace)?);
+            Ok(())
+        },
+        DaemonCmd::SwarmReplicate {group,id,peer} => {
+            let paths=DaemonPaths::resolve()?;
+            let roster={
+                let store=DaemonStore::open(&paths)?;
+                swarm_cluster::roster(&store,group)?
+            };
+            let destination=roster.members.iter()
+                .find(|member|member.alias.as_deref()==Some(peer.as_str()))
+                .ok_or_else(||"Peer not enrolled in the local signed cluster".to_string())?;
+            let now=i64::try_from(now_ms()?).map_err(|_|"Replication time overflow")?;
+            let snapshot=swarm_replication::capture_local_leader(
+                &paths,group,id,peer,&destination.fingerprint,now
+            )?;
+            let bytes=serde_json::to_vec(&snapshot).map_err(|e|e.to_string())?;
+            let receipt=remote::signed_swarm_checkpoint(
+                &paths,peer,&destination.fingerprint,bytes,now as u64
+            ).await?;
+            if receipt["accepted"]!=true || receipt["group"]!=*group ||
+                receipt["graph_id"]!=*id || receipt["sequence"]!=snapshot.sequence {
+                return Err("Signed DAG receiver did not confirm exact checkpoint".into());
+            }
+            println!("{}",receipt);
             Ok(())
         },
         DaemonCmd::SwarmWorkerCatalog => {
