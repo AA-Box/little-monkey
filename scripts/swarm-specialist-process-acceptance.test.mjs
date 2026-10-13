@@ -9,7 +9,7 @@
  */
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,writeFileSync,readFileSync,rmSync,chmodSync,readdirSync} from 'node:fs';
+import {mkdtempSync,writeFileSync,readFileSync,rmSync,chmodSync,readdirSync,mkdirSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {benchmarkCycle,parsePolicy,dispatchRecipe} from './swarm-specialist-continuous-loop.mjs';
@@ -58,10 +58,12 @@ console.log(JSON.stringify({status:'ok',
 `;
 
 test('real subprocess integration: independent fixtures, quality-driven promotion, dispatch, regression rollback, and evidence fail-closed',()=>{
- const directory=mkdtempSync(join(tmpdir(),'lm-specialist-e2e-'));
+ const root=mkdtempSync(join(tmpdir(),'lm-specialist-e2e-'));
+ const directory=join(root,'state');
+ mkdirSync(directory);
  const saved=process.env.LM_ACCEPT_WINNER;
  try{
-  const cli=join(directory,'monkey-test-double.mjs');
+  const cli=join(root,'monkey-test-double.mjs');
   writeFileSync(cli,fakeCli,{mode:0o700});
   chmodSync(cli,0o700);
   const policy=parsePolicy({version:1,monkeyBin:cli,stateDir:directory,
@@ -102,6 +104,6 @@ test('real subprocess integration: independent fixtures, quality-driven promotio
  }finally{
   if(saved===undefined)delete process.env.LM_ACCEPT_WINNER;
   else process.env.LM_ACCEPT_WINNER=saved;
-  rmSync(directory,{recursive:true,force:true});
+  rmSync(root,{recursive:true,force:true});
  }
 });
