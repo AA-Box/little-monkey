@@ -179,20 +179,25 @@ fn eligible(store:&DaemonStore,plan:&ArmedPlan,now:i64)->Result<bool,String>{
     // original machine published the exact source graph, and a higher-term
     // election succeeded. An absent or old receipt does not grant execution.
     let peer_rows=swarm_replication::list_local(store,&plan.group,&plan.source_graph)?;
-    Ok(peer_rows.iter().any(|snapshot|
+    // A local pending replica may be stale while another voter stored the
+    // original leader's already-prepared execution. A freshly elected leader
+    // MUST reconcile an intersecting signed majority before importing any
+    // work. Never trust the newest copy visible on this machine alone.
+    for snapshot in peer_rows.iter().filter(|snapshot|
         snapshot.source_fingerprint==plan.source_fingerprint &&
         snapshot.source_fingerprint!=roster.local().fingerprint &&
         snapshot.roster_sha256==roster.digest() &&
         snapshot.term < current as u64 &&
         snapshot.captured_at_ms<=now+5_000 &&
         now.saturating_sub(snapshot.captured_at_ms)<=MAX_CHECKPOINT_AGE_MS &&
-        // Never automatically re-dispatch a task for which the previously
-        // elected host reports ANY execution attempt or old job identity.
-        // An authenticated observation is not an externally reconciled
-        // exactly-once receipt. Once a job was submitted, unattended
-        // migration must fail closed until an operator can reconcile it.
         snapshot.nodes.iter().all(|node|node.state=="pending"&&node.job_id.is_none())
-    ))
+    ){
+        if super::swarm_recovery_witness::majority_confirms_no_dispatch(
+            store,&plan.group,&plan.source_graph,&plan.source_fingerprint,
+            snapshot,now
+        )?{return Ok(true);}
+    }
+    Ok(false)
 }
 fn mark(store:&DaemonStore,id:&str,state:&str,now:i64,message:&str)->Result<(),String>{
     store.connection.execute(
@@ -290,6 +295,12 @@ pub fn spawn_worker(paths:DaemonPaths){
             timer.tick().await;
             let now=super::now_ms().ok().and_then(|n|i64::try_from(n).ok());
             if let Some(now)=now{
+                // Signed peer readback happens asynchronously BEFORE local
+                // eligibility. A lost peer gives no certificate or implicit
+                // permission to replay an uncertain in-flight task.
+                if let Err(error)=super::swarm_recovery_witness::refresh(&paths,now).await{
+                    eprintln!("Read-only swarm recovery quorum unavailable: {error}");
+                }
                 if let Err(error)=run_once(&paths,now){
                     eprintln!("Read-only swarm failover scan unavailable: {error}");
                 }
@@ -412,6 +423,14 @@ mod tests{
                 &mut store,"signed-c",&not_predecessor,30_001
             ).unwrap());
         }
+        // The new B+C majority's C witness independently queried its local
+        // durable copy of A's latest checkpoint and found no prior attempt.
+        // A signed pinned peer GET is mandatory in production; the unit test
+        // injects the exact parsed signed reply at the record boundary.
+        super::super::swarm_recovery_witness::record(
+            &receiver,"swarm-team","original",&afp,&cfp,
+            Some(&record),30_001
+        ).unwrap();
         run_once(&receiver,30_001).unwrap();
         assert_eq!(status(&receiver).unwrap()["plans"][0]["state"],"armed",
             "an unrelated enrolled member must not trigger the reviewed predecessor's transfer");
