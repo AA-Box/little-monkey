@@ -189,7 +189,11 @@ export async function importCodingSessionFiles(): Promise<number> {
   if (Object.keys(state.runningTurns).length || Object.keys(state.runningCrews).length)
     throw new Error("Stop active agent turns before importing sessions");
   const existing = new Set(state.sessions.map(x=>x.id));
-  const incoming = candidates.filter(x => !existing.has(x.id) && !existing.add(x.id));
+  const incoming = candidates.filter(x => {
+    if (existing.has(x.id)) return false;
+    existing.add(x.id);
+    return true;
+  });
   if (!incoming.length) return 0;
   const plan = planPortableSessionImport(state,incoming,"merge");
   await invoke("sessions_save",{payload:portableSessionPlanPayload(plan)});
