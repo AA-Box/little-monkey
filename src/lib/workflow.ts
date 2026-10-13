@@ -40,7 +40,7 @@ import { approvedLearningContext } from './swarmLearningCycle';
 import { buildSwarmTrajectoryContext } from './swarmTrajectoryMemory';
 import {frozenAuthenticatedPeerVoters,revalidateAuthenticatedPeerVoters} from './swarmPeerQuorum';
 import { LiveSwarmBus } from './swarmLiveBus';
-import { captureAutoMemory, retrieveAutoMemory, validateAutoMemoryStack } from './swarmAutoMemory';
+import { captureAutoMemory, retrieveAutoMemory, validateAutoMemoryStack, type AutoMemoryResult } from './swarmAutoMemory';
 
 export interface WorkflowAgentSpec {
   description: string;
@@ -800,7 +800,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
         }
       }
     }
-    let automaticMemory: { saved: number; warnings: string[] } | undefined;
+    let automaticMemory: AutoMemoryResult | undefined;
     if (spec.autoMemoryStackId && !anyFailure) {
       try {
         automaticMemory = await captureAutoMemory(
@@ -812,7 +812,8 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
           }))),
         );
       } catch (error) {
-        automaticMemory = { saved: 0, warnings: ['Automatic memory capture failed: ' + String(error).slice(0, 200)] };
+        automaticMemory = { saved: 0, reused: 0,
+          warnings: ['Automatic memory capture failed: ' + String(error).slice(0, 200)] };
       }
     }
     return finish(
