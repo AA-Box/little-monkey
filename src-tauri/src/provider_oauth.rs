@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(qs.get("code_challenge_method").map(String::as_str),Some("S256"));
         assert_eq!(qs.get("code_challenge"),Some(&code_challenge("valid-test-verifier")));
         assert!(!qs.contains_key("callback_url"));
-        assert_eq!(validate_headless_code("code-abc\\n").unwrap(), "code-abc");
+        assert_eq!(validate_headless_code("code-abc\n").unwrap(), "code-abc");
         assert!(validate_headless_code("code abc").is_err());
         assert!(validate_headless_code("  ").is_err());
     }
