@@ -505,6 +505,58 @@ mod tests{
             "a remote success assertion must never create a local graph");
     }
     #[test]
+    fn v2_remote_journal_is_authenticated_bounded_and_not_execution_authority(){
+        let (mut store,mut cp,device)=configured();
+        cp.version=2;
+        cp.trace_events=vec![
+            ReplicaTraceEvent{sequence:10,node_id:None,
+                kind:"graph_created".into(),state:"running".into(),occurred_at_ms:900},
+            ReplicaTraceEvent{sequence:12,node_id:Some("audit".into()),
+                kind:"node_transition".into(),state:"submitted".into(),occurred_at_ms:1000},
+        ];
+        cp.seal().unwrap();
+        assert!(ingest(&mut store,&device,&cp,1100).unwrap());
+        let persisted=list_for_member(&store,&device,"team","audit").unwrap();
+        assert_eq!(persisted[0].trace_events,cp.trace_events);
+        let mut modified=cp.clone();
+        modified.trace_events[1].state="succeeded".into();
+        assert!(ingest(&mut store,&device,&modified,1100).is_err(),
+            "modified remote event without a new checksum");
+        modified.seal().unwrap();
+        assert!(ingest(&mut store,&device,&modified,1100).is_err(),
+            "conflicting same-sequence remote trace");
+        modified.sequence=2;modified.seal().unwrap();
+        assert!(ingest(&mut store,&device,&modified,1200).unwrap(),
+            "a fresh signed revision may report new state observations");
+        let mut backward=modified.clone();
+        backward.sequence=3;
+        backward.trace_events.swap(0,1);
+        backward.seal().unwrap();
+        assert!(ingest(&mut store,&device,&backward,1200).is_err());
+        let mut forged=modified.clone();
+        forged.sequence=3;
+        forged.trace_events[0].node_id=Some("unknown-node".into());
+        forged.seal().unwrap();
+        assert!(ingest(&mut store,&device,&forged,1200).is_err());
+        let mut too_many=modified.clone();
+        too_many.sequence=3;
+        too_many.trace_events=(1..=49).map(|n|ReplicaTraceEvent{
+            sequence:n,node_id:Some("audit".into()),
+            kind:"node_transition".into(),state:"submitted".into(),occurred_at_ms:1000,
+        }).collect();
+        too_many.seal().unwrap();
+        assert!(ingest(&mut store,&device,&too_many,1200).is_err());
+        // Existing peers still accept and persist exact legacy v1 checkpoints.
+        let (mut other,legacy,device)=configured();
+        assert!(ingest(&mut other,&device,&legacy,1100).unwrap());
+        assert!(list_for_member(&other,&device,"team","audit").unwrap()[0].trace_events.is_empty());
+        let has_jobs:i64=store.connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='daemon_jobs'",
+            [],|r|r.get(0)
+        ).unwrap();
+        assert_eq!(has_jobs,0,"peer telemetry cannot authorize execution");
+    }
+    #[test]
     fn altered_timestamp_term_checksum_or_huge_state_fails_closed(){
         let (mut store,cp,device)=configured();
         let mut t=cp.clone();
