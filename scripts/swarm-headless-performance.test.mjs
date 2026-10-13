@@ -22,6 +22,10 @@ test('concurrent harness checks independent fixtures and does not accept a no-op
   const source = String.raw`#!/usr/bin/env node
 const fs = require('node:fs'), path = require('node:path');
 const args = process.argv.slice(2);
+if (args[0] === 'daemon' && args[1] === 'status') {
+  process.stdout.write(JSON.stringify({ service_running:true,heartbeat_fresh:true,pid:process.ppid }) + '\n');
+  process.exit(0);
+}
 if (args[0] !== 'task') process.exit(2);
 if (args[1] === 'start') {
   const idx = args.indexOf('--workspace');
@@ -46,6 +50,8 @@ if (args[1] === 'start') {
     assert.equal(good.classification,'independently-verified-task-throughput-and-sampled-process-tree-RSS-not-PSS');
     assert.ok(good.results.every(r=>Number.isSafeInteger(r.submissionMs)));
     assert.ok(good.tiers.every(t=>Object.hasOwn(t,'residentTreeRssPeakBytes')));
+    assert.ok(good.tiers.every(t=>t.residentRssSampleCount>=1));
+    assert.ok(good.tiers.every(t=>t.residentTreeRssPeakBytes>0));
     process.env.FAKE_MONKEY_BAD='1';
     const bad = await runBenchmark({...opts,counts:[1]});
     assert.equal(bad.results.length,1);
