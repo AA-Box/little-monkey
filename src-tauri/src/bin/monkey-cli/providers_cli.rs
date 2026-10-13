@@ -46,11 +46,18 @@ pub enum ProvidersCmd {
         /// custom provider's id from `providers.json`.
         id: String,
     },
+    /// Sign in with the official OpenRouter OAuth PKCE browser flow.
+    /// Stores the resulting provider key in the CLI-owned OS keychain.
+    Login {
+        /// Currently supported: openrouter. Other subscriptions are not API keys.
+        id: String,
+    },
 }
 
 pub fn dispatch(action: &ProvidersCmd) -> Result<(), String> {
     match action {
         ProvidersCmd::SetKey { id } => set_key(id),
+        ProvidersCmd::Login { id } => login(id),
     }
 }
 
@@ -63,5 +70,27 @@ fn set_key(id: &str) -> Result<(), String> {
     let key = crate::channels_cli::read_secret_from_stdin()?;
     little_monkey_lib::providers::write_key(id, &key)?;
     println!("API key stored for {id}.");
+    Ok(())
+}
+
+fn login(id: &str) -> Result<(), String> {
+    if id != "openrouter" {
+        return Err("Only OpenRouter exposes a supported OAuth PKCE grant for model API keys. Use 'monkey providers set-key' for other providers.".into());
+    }
+    // The main CLI already runs inside Tokio. A separate OS thread owns this
+    // interactive flow so we never block_on a nested runtime.
+    std::thread::spawn(|| {
+        tokio::runtime::Builder::new_current_thread().enable_all().build()
+            .map_err(|e| format!("Failed to start authorization runtime: {e}"))?
+            .block_on(little_monkey_lib::provider_oauth::login_openrouter_with(|url| {
+                println!("Open this URL on the same machine to authorize OpenRouter: {url}");
+                #[cfg(target_os = "macos")]
+                let _ = std::process::Command::new("open").arg(&url).spawn();
+                #[cfg(target_os = "linux")]
+                let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+                Ok(())
+            }))
+    }).join().map_err(|_| "OpenRouter login thread panicked".to_string())??;
+    println!("OpenRouter authorization succeeded; key saved for CLI and daemon.");
     Ok(())
 }
