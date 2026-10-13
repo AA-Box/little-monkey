@@ -18,6 +18,24 @@ describe('continuous live operational guard (not a correctness oracle)',()=>{
    {target:'provider:primary',status:'done',elapsedMs:1000,finishedAtMs:NOW}
   ]);
  });
+ it('stores observed tokens and per-task rate estimates without ever claiming a provider invoice',()=>{
+  recordSwarmLiveOutcome('provider:primary','done',1250,NOW,
+   {promptTokens:120,completionTokens:35},0.00027);
+  const saved=loadSwarmLiveOutcomes(NOW);
+  expect(saved).toHaveLength(1);
+  expect(saved[0]).toMatchObject({
+    usage:{promptTokens:120,completionTokens:35},meteredCostUsd:0.00027,
+  });
+  recordSwarmLiveOutcome('provider:primary','done',1250,NOW+1,
+   {promptTokens:-1,completionTokens:35},-9);
+  expect(loadSwarmLiveOutcomes(NOW+1)[1].usage).toBeUndefined();
+  expect(loadSwarmLiveOutcomes(NOW+1)[1].meteredCostUsd).toBeUndefined();
+  localStorage.setItem(SWARM_LIVE_OUTCOMES_KEY,JSON.stringify([
+   {target:'provider:primary',status:'done',elapsedMs:1250,finishedAtMs:NOW,
+    usage:{promptTokens:NaN,completionTokens:-9}},
+  ]));
+  expect(loadSwarmLiveOutcomes(NOW)).toEqual([]);
+ });
  it('keeps all traffic on measured baseline until six actual baseline outcomes exist',()=>{
   const limited=rows(original[0],'done',5);
   expect(selectLiveGuardedCostRoute(original,proposed,true,NOW,0,limited))
