@@ -5,12 +5,16 @@ on:
     paths:
       - 'scripts/swarm-specialist-continuous-loop.mjs'
       - 'scripts/swarm-specialist-continuous-loop.contract.test.mjs'
+      - 'scripts/swarm-specialist-service.mjs'
+      - 'scripts/swarm-specialist-service.contract.test.mjs'
       - '.github/workflows/swarm-specialist-continuous-loop.yml'
   push:
     branches: [develop]
     paths:
       - 'scripts/swarm-specialist-continuous-loop.mjs'
       - 'scripts/swarm-specialist-continuous-loop.contract.test.mjs'
+      - 'scripts/swarm-specialist-service.mjs'
+      - 'scripts/swarm-specialist-service.contract.test.mjs'
       - '.github/workflows/swarm-specialist-continuous-loop.yml'
 
 permissions:
@@ -29,3 +33,7 @@ jobs:
         run: node --check scripts/swarm-specialist-continuous-loop.mjs
       - name: Independent evidence, promotion, rollback, and dispatch contracts
         run: node --test scripts/swarm-specialist-continuous-loop.contract.test.mjs
+      - name: LaunchAgent service syntax validation
+        run: node --check scripts/swarm-specialist-service.mjs
+      - name: User-service lifecycle contracts
+        run: node --test scripts/swarm-specialist-service.contract.test.mjs
