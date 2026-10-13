@@ -184,17 +184,27 @@ pub fn list_for_member(
     if !roster.members.iter().any(|m|m.device_id==device_id) {
         return Err("Requester is not enrolled in this cluster".into());
     }
+    list_local(store,group,graph_id)
+}
+/// Local operator-only view; the signed network route uses list_for_member.
+pub fn list_local(
+    store:&DaemonStore,group:&str,graph_id:&str,
+)->Result<Vec<ReplicaSnapshot>,String>{
+    if !valid_id(group)||!valid_id(graph_id){
+        return Err("Invalid cluster or graph identity".into());
+    }
+    swarm_cluster::roster(store,group)?;
     schema(store)?;
     let mut stmt=store.connection.prepare(
         "SELECT snapshot_json FROM resident_swarm_peer_checkpoints
          WHERE group_id=?1 AND graph_id=?2 ORDER BY source_fp LIMIT 7"
     ).map_err(|e|e.to_string())?;
-    stmt.query_map(params![group,graph_id],|r|r.get::<_,String>(0))
+    let rows=stmt.query_map(params![group,graph_id],|r|r.get::<_,String>(0))
         .map_err(|e|e.to_string())?
-        .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?
-        .into_iter().map(|raw|
-            serde_json::from_str(&raw).map_err(|e|e.to_string())
-        ).collect()
+        .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    rows.into_iter().map(|raw|
+        serde_json::from_str(&raw).map_err(|e|e.to_string())
+    ).collect()
 }
 /// Capture an actual locally authorized leader's DAG state for one
 /// operator-selected peer. Neither prompts nor credentials nor model outputs
