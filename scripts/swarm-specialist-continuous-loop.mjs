@@ -244,10 +244,11 @@ export function benchmarkCycle(policy,{run=spawnSync,now=Date.now(),log=console.
  }
  const currentTime=Date.now();
  const fresh=reports.filter(row=>Date.parse(row.generatedAt)>=currentTime-policy.maxAgeHours*3_600_000);
- const next=chooseDeployment(policy,fresh,previous,now);
+ const committedAt=Math.max(now,currentTime);
+ const next=chooseDeployment(policy,fresh,previous,committedAt);
  // A lost/rejected benchmark disables this domain; it never silently
  // preserves stale authority. A completed cycle is written in one rename.
- validateRoutingState(next,policy,now);
+ validateRoutingState(next,policy,committedAt);
  atomicJson(join(policy.stateDir,'active-routing.json'),next);
  log(JSON.stringify({status:'specialist_cycle_completed',revision:next.revision,results,
    routing:Object.fromEntries(Object.entries(next.domains).map(([d,v])=>[d,v.active?.target??null]))}));
