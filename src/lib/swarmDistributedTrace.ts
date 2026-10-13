@@ -83,7 +83,7 @@ export function composeDistributedSwarmTrace(
     }
   }
   events.sort((a,b)=>a.occurredAt-b.occurredAt||
-    (a.source==='local-ledger'?-1:1)||
+    a.source.localeCompare(b.source)||
     a.sequence-b.sequence||a.node.localeCompare(b.node));
   return {
     graph:graph.id,receivedPeers:seen.size,freshPeers:fresh,
