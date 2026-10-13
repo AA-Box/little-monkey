@@ -72,6 +72,8 @@ jobs:
       - name: Contract-test safe resident restart and offline repair source oracle
         run: |
           node --check scripts/swarm-cluster-live-acceptance.mjs
+          node --check scripts/swarm-dag-network-recovery-live-acceptance.mjs
+          node scripts/swarm-dag-network-recovery-live-acceptance.mjs --self-check
           node --test scripts/swarm-cluster-acceptance.contract.test.mjs
           node --check scripts/swarm-resident-restart-live-acceptance.mjs
           node --check scripts/swarm-resident-fallback-live-acceptance.mjs
