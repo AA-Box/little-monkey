@@ -577,6 +577,12 @@ mod tests{
         {
             let store=DaemonStore::open(&receiver).unwrap();
             assert_eq!(store.connection.execute(
+                "INSERT INTO resident_swarm_failover_sources
+                   (group_id,source_graph,source_fingerprint,plan_id)
+                 VALUES ('swarm-team','source-before-registration',?1,'crashed-after-claim')",
+                params![afp]
+            ).unwrap(),1);
+            assert_eq!(store.connection.execute(
                 "UPDATE resident_swarm_failover_plans
                  SET state='claimed',claimed_at_ms=?2
                  WHERE plan_id=?1 AND state='armed'",
@@ -604,6 +610,12 @@ mod tests{
             (epoch+30004)).unwrap();
         {
             let store=DaemonStore::open(&receiver).unwrap();
+            assert_eq!(store.connection.execute(
+                "INSERT INTO resident_swarm_failover_sources
+                   (group_id,source_graph,source_fingerprint,plan_id)
+                 VALUES ('swarm-team','source-after-registration',?1,'crashed-after-registration')",
+                params![afp]
+            ).unwrap(),1);
             assert_eq!(store.connection.execute(
                 "UPDATE resident_swarm_failover_plans SET state='claimed'
                  WHERE plan_id='crashed-after-registration' AND state='armed'",
