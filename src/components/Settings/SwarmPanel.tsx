@@ -4,7 +4,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
 import { prepareResidentSwarm } from '../../lib/residentSwarmBridge';
 import {parseValidatedMlxFusionReceipt,verifyFusedModelConfig} from '../../lib/swarmMlxFusionImport';
-import {useModelStore} from '../../store/modelStore';
+import {useModelStore,type ModelInfo} from '../../store/modelStore';
+import {promoteVerifiedMlxFusion,recoverInterruptedMlxPromotion,pendingMlxPromotion,type PromotionRuntime} from '../../lib/swarmMlxPromotion';
 import { parseCommandHooksManifest } from '../../lib/commandHookManifest';
 import { useUserHooksStore } from '../../store/userHooksStore';
 import { daemonSwarmCancel, daemonSwarmStatus, daemonSwarmSubmit, type ResidentSwarmGraphStatus } from '../../lib/daemonClient';
@@ -66,6 +67,8 @@ export function SwarmPanel() {
   const [estimatedUsdPerMillion, setEstimatedUsdPerMillion] = useState('');
   const [learningRevision, setLearningRevision] = useState(0);
   const [fusionImportBusy,setFusionImportBusy]=useState(false);
+  const [fusionActivationBusy,setFusionActivationBusy]=useState(false);
+  const [importedFusion,setImportedFusion]=useState<ModelInfo|null>(null);
   const [scope, setScope] = useState('');
   const [consensusPolicy, setConsensusPolicy] = useState<SwarmVotePolicy|'none'>('none');
   const [notebook, setNotebook] = useState(false);
@@ -193,6 +196,48 @@ export function SwarmPanel() {
     catch (cause) { setError('Resident service unavailable: ' + String(cause)); }
   }
   useEffect(() => { void refreshResident(); }, []);
+  function mlxPromotionRuntime():PromotionRuntime {
+    return {
+      installed:()=>useModelStore.getState().installed,
+      active:()=>useModelStore.getState().active,
+      activeProvider:()=>useModelStore.getState().activeProvider,
+      runningPath:()=>{
+        const state=useModelStore.getState().mlxChat;
+        return state?.running?state.modelPath:null;
+      },
+      start:model=>useModelStore.getState().start(model),
+      stop:()=>useModelStore.getState().stop(),
+      clearInactive:previous=>useModelStore.setState({
+        active:previous,activeProvider:'local',llamaStatus:'stopped',
+      }),
+      probe:path=>invoke('mlx_chat_canary',{expectedModelPath:path}),
+    };
+  }
+  useEffect(()=>{
+    if(!localStorage.getItem('little-monkey-mlx-fusion-promotion-v1'))return;
+    let alive=true;
+    void (async()=>{
+      try{
+        await useModelStore.getState().refresh();
+        const recovered=await recoverInterruptedMlxPromotion(mlxPromotionRuntime(),localStorage);
+        if(alive&&recovered)setNotice('Recovered the previous model from an interrupted MLX activation. Candidate was NOT accepted.');
+      }catch(error){
+        if(alive)setError('Interrupted MLX model promotion requires manual recovery: '+String(error));
+      }
+    })();
+    return ()=>{alive=false;};
+  },[]);
+  async function activateImportedMlxFusion(){
+    if(!importedFusion)return;
+    setFusionActivationBusy(true);setError('');setNotice('');
+    try{
+      if(!window.confirm('Switch to the evaluated fused model, execute a REAL local MLX chat completion, and restore the previous local model automatically if inference fails? Other AI provider modes are refused.'))return;
+      const result=await promoteVerifiedMlxFusion(importedFusion,mlxPromotionRuntime(),localStorage);
+      setNotice('New fused MLX model passed a real local inference canary ('+result.nonemptyOutputChars+' output characters) and is now active. Previous weights remain installed for rollback.');
+    }catch(e){setError('MLX activation failed: '+String(e));}
+    finally{setFusionActivationBusy(false);}
+  }
+
   async function importValidatedMlxFusion() {
     setError('');setNotice('');
     const selected=await open({multiple:false,filters:[
@@ -224,9 +269,14 @@ export function SwarmPanel() {
         path:selectedFolder,configSha256:receipt.fusedConfigSha256,files:receipt.fusedWeights,
       });
       await useModelStore.getState().refresh();
-      if(!models.some(model=>model.runtime==='mlx'))
-        throw Error('Native model importer did not register an MLX-compatible model.');
-      setNotice('Fused MLX model registered with the native model catalog. Active model NOT changed. Select it in Models to verify real inference and rollback if needed.');
+      const registered=models.find(model=>model.runtime==='mlx'&&
+        model.path?.replace(/\\/g,'/').replace(/\/+$/,'')===
+          selectedFolder.replace(/\\/g,'/').replace(/\/+$/,''));
+      if(!registered)throw Error('Native importer did not register the exact operator-selected MLX directory.');
+      const real=useModelStore.getState().installed.find(model=>model.id===registered.id);
+      if(!real)throw Error('Registered fused model is not present in refreshed native catalog.');
+      setImportedFusion(real);
+      setNotice('Fused MLX model is registered and verified. It has NOT been activated; use the real-inference canary action to promote safely.');
     }catch(cause){setError('Fused model not imported: '+String(cause));}
     finally{setFusionImportBusy(false);}
   }
@@ -756,6 +806,13 @@ export function SwarmPanel() {
           <Button size="sm" className="mt-2" disabled={fusionImportBusy} onClick={()=>void importValidatedMlxFusion()}>
             {fusionImportBusy?'Checking fused model…':'Review and import evaluated MLX fusion…'}
           </Button>
+          {importedFusion&&<div className="mt-2">
+            <p className="mb-1 text-xs text-muted">Verified candidate: {importedFusion.name}</p>
+            <Button size="sm" disabled={fusionImportBusy||fusionActivationBusy}
+              onClick={()=>void activateImportedMlxFusion()}>
+              {fusionActivationBusy?'Running real model canary and rollback protection…':'Activate verified fusion · real inference + rollback'}
+            </Button>
+          </div>}
         </div>
         <p className="mt-1 text-xs text-muted">Only real benchmark outcomes with repeated independently graded source fixtures can stage a learning candidate. A candidate is not reusable until manually approved. Approved guidance enters future LOCAL read-only swarms only if you select historical learning. Nothing self-modifies model weights or bypasses permissions.</p>
         <div className="mt-2 flex flex-wrap gap-2">

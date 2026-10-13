@@ -2858,9 +2858,16 @@ pub async fn models_import_verified_fusion(
     })
     .await
     .map_err(|_| "Fused model verification worker was interrupted".to_string())??;
+    // The verified directory is the exact directory requested. Never accept
+    // an unverified child model merely because the selected parent contained
+    // one or more model subfolders.
+    let canonical = std::path::Path::new(&path).canonicalize()
+        .map_err(|_| "Fused folder disappeared before registration")?;
     let registered = models_add_external_folder(app, path)?;
     if !registered.iter().any(|model| {
-        model.runtime == model_sources::ModelRuntimeKind::Mlx
+        model.runtime == model_sources::ModelRuntimeKind::Mlx &&
+        model.path.as_deref().and_then(|p| std::path::Path::new(p).canonicalize().ok())
+            == Some(canonical.clone())
     }) {
         return Err("Verified folder did not contain a native MLX model".into());
     }

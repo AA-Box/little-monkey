@@ -424,3 +424,22 @@ package, and may instead point `--binary` at an already reviewed local tool.
 The controlled subprocess test is in mandatory frontend CI; only a **live**
 run against installed Ruflo demonstrates interoperability. Listing external
 MCP tools is **not full binary Ruflo plugin, agent, worker or hook parity**.
+
+
+### Real-model activation and automatic rollback
+
+After verifying the complete training receipt, config SHA-256 and **all**
+model weight shards using the Rust-native registrar, the Swarms panel offers
+`Activate verified fusion · real inference + rollback`. This does actual
+runtime work, not a simulated test: it switches the local MLX service to the
+new model, then asks the registered, model-path-fenced loopback inference
+endpoint for a **non-empty assistant completion**. The Rust canary requires
+a bounded successful answer from the exact active candidate and rejects a
+model switch or service failure during inference. A failed check restores
+the previously running MLX model, or stops the candidate if no prior runtime
+was running. A rollback failure **preserves a durable recovery journal** and
+blocks normal Chat/agent target resolution until the operator opens Swarm
+settings and the previous model can be restored. Nothing automatically
+switches cloud providers or widens peer/tool permissions. Held-out MLX
+perplexity and source-backed real-model benchmark results remain independent
+of the availability canary; one generic completion does not certify those.
