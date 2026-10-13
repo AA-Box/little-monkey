@@ -8,7 +8,7 @@ import {fileURLToPath} from 'node:url';
 
 const script=resolve(dirname(fileURLToPath(import.meta.url)),'swarm-replica-stress-live-acceptance.mjs');
 const common=['--group','test-group','--graph','graph-test','--peer','peer-b',
-  '--rounds','10','--concurrency','3',
+  '--rounds','10','--concurrency','3','--additional-graphs','graph-b,graph-c',
   '--confirm-operator-owned-readonly-cluster','--confirm-independent-machines',
   '--confirm-post-recovery'];
 function fake(mode='normal'){
@@ -22,7 +22,7 @@ const result = args[0]==='peers'&&args[1]==='cluster-status'?
  {alias:'peer-b',presence:'online',peer_id:'distinct-b',granted:['task']}:
  args[0]==='daemon'&&args[1]==='swarm-replicate'?
  {remote_readback_verified:mode!=='missing-readback',execution_authorized:false,
- receipt:{accepted:true,group:'test-group',graph_id:'graph-test',
+ receipt:{accepted:true,group:'test-group',graph_id:args[3],
  sequence:mode==='duplicate'?1:process.pid}}:null;
 if(!result)process.exit(1);
 console.log(JSON.stringify(result));
@@ -40,7 +40,7 @@ test('refuses to run without explicit physical operator and post-recovery confir
 });
 test('rejects duplicate, zero, negative or too-large flags before spawning CLI',()=>{
   for(const extra of [['--rounds','1'],['--concurrency','9'],['--concurrency','0'],
-    ['--rounds','5000'],['--group','../escape']]){
+    ['--rounds','5000'],['--group','../escape'],['--additional-graphs','graph-b,graph-b']]){
     const f=fake();try{assert.equal(f.invoke(extra).status,2);}finally{f.dispose();}
   }
 });
