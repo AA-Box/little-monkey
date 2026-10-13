@@ -12,7 +12,7 @@ test('CLI arguments are bounded and rejects invalid/missing targets', () => {
   assert.throws(() => parseArgs(['--target','ollama:test','--workers','1','--unknown','yes']), /Unknown option/);
   assert.throws(() => parseArgs(['--target','ollama:test','--timeout-ms','5000']), /Invalid workload/);
   assert.deepEqual(parseArgs(['--target','ollama:qwen','--workers','1,2','--repetitions','2']).counts,[1,2]);
-  assert.equal(parseRunId('progress\n{"run_id":"run-valid-task"}\n'),'run-valid-task');
+  assert.equal(parseRunId('progress\n{"run_id":"task-valid-task"}\n'),'task-valid-task');
   assert.throws(() => parseRunId('{"run_id":"../../evil"}'),/valid run id/);
 });
 
@@ -30,7 +30,7 @@ if (args[1] === 'start') {
     fs.writeFileSync(path.join(args[idx+1],'src/module.mjs'),
       'export const add = (a, b) => a + b;\n');
   }
-  process.stdout.write('{"run_id":"run-test-1234"}\n');
+  process.stdout.write('{"run_id":"task-test-1234"}\n');
 } else if (args[1] === 'attach' || args[1] === 'cancel') {
   process.exit(0);
 } else process.exit(2);
