@@ -189,6 +189,12 @@ export interface ResidentSwarmGraphStatus {
   created_at_ms: number;
   updated_at_ms: number;
   tasks: { id: string; state: string; job_id: string | null; error: string | null }[];
+  /** Durable ordered SQLite graph/node transitions; no agent report bodies. */
+  events?: {
+    sequence: number; node_id: string | null; kind: string;
+    previous_state: string | null; state: string; job_id: string | null;
+    occurred_at_ms: number;
+  }[];
 }
 export const daemonSwarmSubmit = (specPath: string) =>
   invoke<{ id: string; state: string; nodes: number }>("daemon_swarm_submit", { specPath });
