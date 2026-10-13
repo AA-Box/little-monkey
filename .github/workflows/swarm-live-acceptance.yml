@@ -121,6 +121,16 @@ on:
         required: false
         default: ''
         type: string
+      mlx_fuse_for_import:
+        description: Opt in to fusing and real MLX inference acceptance of the evaluated adapter
+        required: false
+        default: false
+        type: boolean
+      mlx_previous_model_dir:
+        description: Optional previous LOCAL MLX model to probe rollback viability without activation
+        required: false
+        default: ''
+        type: string
       verify_remote_cancellation:
         description: Run a disposable remote task and verify actual cancellation
         required: false
@@ -168,6 +178,8 @@ jobs:
           node scripts/swarm-repository-repair-live-acceptance.mjs --self-check
           node scripts/swarm-specialist-live-benchmark.mjs --self-check --domain all
           node --test scripts/swarm-specialist-oracle.contract.test.mjs
+          node --check scripts/swarm-mlx-fused-inference-acceptance.mjs
+          node scripts/swarm-mlx-fused-inference-acceptance.mjs --self-check
           node --check scripts/swarm-two-peer-memory-live-acceptance.mjs
           node --check scripts/swarm-two-peer-cancellation-live-acceptance.mjs
           node --test scripts/swarm-two-peer-acceptance.contract.test.mjs scripts/swarm-two-peer-memory-acceptance.contract.test.mjs scripts/swarm-two-peer-cancellation-acceptance.contract.test.mjs
@@ -293,11 +305,26 @@ jobs:
           test -n "$MLX_BASE" && test -n "$MLX_DATA" && test -n "$MLX_OUTPUT" && test -n "$MLX_GATE"
           test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64
           python3 -c "import mlx_lm"
+          FUSE_FLAGS=()
+          if [ "${{ inputs.mlx_fuse_for_import }}" = "true" ]; then
+            FUSE_FLAGS=(--fuse-for-import --confirm-fusion)
+          fi
           node scripts/swarm-mlx-lora.mjs \
             --model "$MLX_BASE" --data "$MLX_DATA" --output "$MLX_OUTPUT" \
             --iters 200 --max-test-ppl "$MLX_GATE" \
-            --confirm-local-training \
+            --confirm-local-training "${FUSE_FLAGS[@]}" \
             > "$RUNNER_TEMP/native-swarm-mlx-lora-acceptance.json"
+          if [ "${{ inputs.mlx_fuse_for_import }}" = "true" ]; then
+            PREVIOUS_ARGS=()
+            if [ -n "${{ inputs.mlx_previous_model_dir }}" ]; then
+              PREVIOUS_ARGS=(--previous-model "${{ inputs.mlx_previous_model_dir }}")
+            fi
+            node scripts/swarm-mlx-fused-inference-acceptance.mjs \
+              --receipt "$MLX_OUTPUT/training-receipt.json" \
+              --python "$(command -v python3)" \
+              --confirm-local-mlx-inference "${PREVIOUS_ARGS[@]}" \
+              > "$RUNNER_TEMP/native-swarm-mlx-fused-inference-acceptance.json"
+          fi
       - name: Publish real-run verification evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -316,3 +343,4 @@ jobs:
             ${{ runner.temp }}/native-swarm-repository-repair.json
             ${{ runner.temp }}/native-swarm-resident-fallback-acceptance.json
             ${{ runner.temp }}/native-swarm-mlx-lora-acceptance.json
+            ${{ runner.temp }}/native-swarm-mlx-fused-inference-acceptance.json
