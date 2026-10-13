@@ -553,9 +553,13 @@ node. A crash after registration but before the plan is marked `imported`
 reuses the already registered graph **without creating another job** only
 after validating the entire persisted graph specification and each frozen
 recipe against the originally approved bounded transfer bundle. A graph
-name match alone is rejected. The inspected bytes are copied into a private
-bounded file before any import, preventing a source-path swap between approval
-and execution. Temporary lost quorum leaves the same claim waiting for fresh
+name match alone is rejected. An immediate SQLite claim on the immutable
+`(group, source graph, source fingerprint)` also prevents two separate
+approved failover plans on the SAME receiving installation from importing the
+same predecessor into different replacement graphs. Legacy imported/claimed
+plans populate that local claim ledger on upgrade. The inspected bytes are
+copied into a private bounded file before any import, preventing a source-path
+swap between approval and execution. Temporary lost quorum leaves the same claim waiting for fresh
 proof; malformed or changed recipes fail closed.
 
 This closes the local post-claim daemon crash window of the preapproved
