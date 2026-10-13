@@ -239,6 +239,81 @@ fn relocated_recipe(raw: &str, workspace: &Path) -> Result<Vec<u8>, String> {
     recipe.workspace=Some(workspace.to_string_lossy().to_string());
     serde_json::to_vec_pretty(&recipe).map_err(|e|e.to_string())
 }
+/// Reconcile a crash after registration but before the one-shot failover
+/// plan was marked imported. A graph name alone proves NOTHING: compare the
+/// stored complete DAG and every frozen recipe with exactly the operator
+/// approved bundle after relocation. Never trust a remote completion.
+pub fn verify_existing_import(
+    paths:&DaemonPaths,input:&Path,new_id:&str,workspace:&Path,
+)->Result<bool,String>{
+    check_regular(input,MAX_BUNDLE_BYTES)?;
+    let bundle:TransferBundle=serde_json::from_slice(
+        &fs::read(input).map_err(|e|e.to_string())?
+    ).map_err(|e|format!("Invalid recovery bundle: {e}"))?;
+    verify(&bundle)?;
+    if new_id==bundle.source_graph_id {
+        return Err("Recovered graph cannot reuse its predecessor identity".into());
+    }
+    let workspace=workspace.canonicalize().map_err(|e|e.to_string())?;
+    if !workspace.is_dir(){return Err("Recovered workspace no longer exists".into());}
+    let _=swarm_coordinator::status(paths,Some(new_id))?;
+    let store=DaemonStore::open(paths)?;
+    let existing:Option<String>=store.connection.query_row(
+        "SELECT spec_json FROM resident_swarm_graphs WHERE graph_id=?1",
+        [new_id],|row|row.get(0),
+    ).optional().map_err(|e|e.to_string())?;
+    let Some(existing)=existing else{return Ok(false)};
+    let actual:ResidentSwarmSpec=serde_json::from_str(&existing)
+        .map_err(|e|format!("Registered recovery graph is malformed: {e}"))?;
+    let mut expected=bundle.spec;
+    expected.id=new_id.to_string();
+    for (node,record) in expected.nodes.iter_mut().zip(&bundle.recipes) {
+        let primary=paths.snapshots.join(format!(
+            "resident-swarm-{new_id}-{}.json",node.id
+        ));
+        node.recipe=primary.to_string_lossy().to_string();
+        if record.fallback.is_some(){
+            node.fallback_recipe=Some(paths.snapshots.join(format!(
+                "resident-swarm-{new_id}-{}-fallback.json",node.id
+            )).to_string_lossy().to_string());
+        }else{node.fallback_recipe=None;}
+    }
+    if serde_json::to_value(&actual).map_err(|e|e.to_string())? !=
+       serde_json::to_value(&expected).map_err(|e|e.to_string())?{
+        return Err("Registered graph differs from operator-approved recovery plan".into());
+    }
+    let node_count:i64=store.connection.query_row(
+        "SELECT COUNT(*) FROM resident_swarm_nodes WHERE graph_id=?1",
+        [new_id],|row|row.get(0),
+    ).map_err(|e|e.to_string())?;
+    if node_count!=expected.nodes.len() as i64 {
+        return Err("Previously imported graph has an incomplete node ledger".into());
+    }
+    for (node,record) in expected.nodes.iter().zip(&bundle.recipes) {
+        let compare=|path:&str,raw:&str|->Result<(),String>{
+            let file=Path::new(path);
+            check_regular(file,MAX_RECIPE_BYTES)?;
+            let actual:little_monkey_lib::recipes::Recipe=
+                serde_json::from_slice(&fs::read(file).map_err(|e|e.to_string())?)
+                    .map_err(|e|e.to_string())?;
+            let expected:little_monkey_lib::recipes::Recipe=
+                serde_json::from_slice(&relocated_recipe(raw,&workspace)?)
+                    .map_err(|e|e.to_string())?;
+            if serde_json::to_value(&actual).map_err(|e|e.to_string())? !=
+               serde_json::to_value(&expected).map_err(|e|e.to_string())? {
+                return Err("Previously imported recipe differs from approved bytes".into());
+            }
+            Ok(())
+        };
+        compare(&node.recipe,&record.primary)?;
+        if let Some(raw)=record.fallback.as_deref(){
+            compare(node.fallback_recipe.as_deref()
+                .ok_or("Missing approved fallback recipe")?,raw)?;
+        }
+    }
+    Ok(true)
+}
+
 /// Explicit import always creates a DIFFERENT graph with every node pending.
 /// It never imports foreign successful jobs, votes, lease certificates,
 /// credentials, permissions, or operation approvals.
