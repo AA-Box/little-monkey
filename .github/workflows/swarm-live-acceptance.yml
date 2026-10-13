@@ -67,6 +67,25 @@ on:
         required: false
         default: '2'
         type: string
+      replica_graph_id:
+        description: Optional already-prestaged read-only DAG to verify on two real installations
+        required: false
+        default: ''
+        type: string
+      network_stage:
+        description: Operator-controlled physical peer partition stage; no firewall edits are made
+        required: false
+        default: baseline
+        type: choice
+        options:
+          - baseline
+          - partition
+          - restore
+      network_evidence_path:
+        description: Absolute persistent, private evidence path on the same self-hosted runner
+        required: false
+        default: ''
+        type: string
       fallback_graph_id:
         description: Optional already-running disposable resident graph whose primary read-only root was captured before failing
         required: false
@@ -140,6 +159,8 @@ jobs:
           node --check scripts/swarm-model-benchmark.mjs
           node --check scripts/swarm-specialist-live-benchmark.mjs
           node --check scripts/swarm-cluster-live-acceptance.mjs
+          node --check scripts/swarm-dag-network-recovery-live-acceptance.mjs
+          node scripts/swarm-dag-network-recovery-live-acceptance.mjs --self-check
           node --check scripts/swarm-resident-restart-live-acceptance.mjs
           node --check scripts/swarm-resident-fallback-live-acceptance.mjs
           node scripts/swarm-resident-fallback-live-acceptance.mjs --self-check
@@ -170,6 +191,28 @@ jobs:
             --group "$SWARM_CLUSTER_GROUP" --min-voters "$SWARM_CLUSTER_VOTERS" \
             --confirm-operator-cluster \
             > "$RUNNER_TEMP/native-swarm-signed-leader-quorum.json"
+      - name: Verify signed DAG remote SQLite state across an operator-owned network partition
+        if: ${{ inputs.replica_graph_id != '' }}
+        shell: bash
+        env:
+          SWARM_GROUP: ${{ inputs.cluster_group }}
+          SWARM_GRAPH: ${{ inputs.replica_graph_id }}
+          NETWORK_STAGE: ${{ inputs.network_stage }}
+          NETWORK_EVIDENCE: ${{ inputs.network_evidence_path }}
+        run: |
+          set -euo pipefail
+          test -n "$SWARM_GROUP" && test -n "$SWARM_GRAPH" && test -n "$NETWORK_EVIDENCE"
+          case "$NETWORK_STAGE" in
+            baseline) FLAG='' ;;
+            partition) FLAG='--confirm-network-isolated-externally' ;;
+            restore) FLAG='--confirm-network-restored-externally' ;;
+            *) exit 2 ;;
+          esac
+          node scripts/swarm-dag-network-recovery-live-acceptance.mjs \
+            --stage "$NETWORK_STAGE" --group "$SWARM_GROUP" --graph "$SWARM_GRAPH" \
+            --peer "$PEER_ALIAS" --evidence "$NETWORK_EVIDENCE" \
+            --confirm-operator-owned-readonly-cluster $FLAG \
+            > "$RUNNER_TEMP/native-swarm-replica-network-acceptance.json"
       - name: Measure actual model behavior against independent test fixtures
         shell: bash
         run: |
@@ -265,6 +308,7 @@ jobs:
           path: |
             ${{ runner.temp }}/native-swarm-peer-acceptance.json
             ${{ runner.temp }}/native-swarm-signed-leader-quorum.json
+            ${{ runner.temp }}/native-swarm-replica-network-acceptance.json
             ${{ runner.temp }}/native-swarm-real-model-benchmark.json
             ${{ runner.temp }}/native-swarm-vector-memory-acceptance.json
             ${{ runner.temp }}/native-swarm-cancellation-acceptance.json
