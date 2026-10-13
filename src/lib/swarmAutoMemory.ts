@@ -15,6 +15,7 @@ export interface AutoMemoryReport {
 }
 export interface AutoMemoryResult {
   saved: number;
+  reused: number;
   warnings: string[];
 }
 
@@ -97,6 +98,7 @@ export async function captureAutoMemory(
   const namespace = await autoMemoryNamespace(workspace);
   const warnings: string[] = [];
   let saved = 0;
+  let reused = 0;
   for (const report of reports.slice(0, 16)) {
     if (!report.report.trim()) continue;
     const text = boundedUTF8(
@@ -105,15 +107,17 @@ export async function captureAutoMemory(
     );
     const id = 'r-' + (await digest(report.taskId + '\0' + text)).slice(0, 48);
     try {
-      await invoke('peers_memory_add_text', {
+      const result = await invoke<{updated: boolean}>('peers_memory_add_text', {
         namespace, id, stackId, text, revision: 1,
       });
-      saved++;
+      if (result?.updated === true) saved++;
+      else if (result?.updated === false) reused++;
+      else throw new Error('Memory service omitted durable write confirmation.');
     } catch (error) {
       // A failed embedding/SQLite write is explicitly reported, never counted
       // as learned knowledge. Do not fail or repeat the already finished task.
       warnings.push('Memory ' + id + ': ' + String(error).slice(0, 200));
     }
   }
-  return { saved, warnings };
+  return { saved, reused, warnings };
 }
