@@ -609,9 +609,14 @@ pub fn tick(
             let Some(job_id) = job_id else { failure = true; continue; };
             let Some(job) = store.get_job(job_id)? else { failure = true; continue; };
             if job.state == JobState::Succeeded {
-                store.connection.execute("UPDATE resident_swarm_nodes SET state='succeeded'
-                    WHERE graph_id=?1 AND node_id=?2", params![id,node])
-                    .map_err(|e| e.to_string())?;
+                // A delayed result can never complete a superseded logical
+                // task attempt: both the current cursor and the daemon's
+                // terminal job record must match before the SQLite commit.
+                if !super::swarm_task_retry::commit_current_success(
+                    store,&id,node,job_id
+                )? {
+                    return Err("Swarm success arrived for a non-current task attempt".into());
+                }
             } else if job.state.is_terminal() {
                 if spec.nodes.iter().find(|candidate| candidate.id.as_str() == node.as_str())
                     .is_some_and(|candidate| fallback_allowed(candidate,status,job.state)) {
@@ -623,6 +628,15 @@ pub fn tick(
                          WHERE graph_id=?1 AND node_id=?2 AND state='submitted'",
                         params![id,node,"Primary read-only agent failed; alternate queued"],
                     ).map_err(|e|e.to_string())?;
+                } else if spec.cluster_id.is_some() && status == "submitted"
+                    && job.state == JobState::Failed
+                    && super::swarm_task_retry::reassign_failed_primary(
+                        store,&id,node,job_id,now
+                    )? {
+                    // The task's logical identity remains (graph,node).
+                    // Only its attempt advances. The next dispatch uses a
+                    // new deterministic job id and must pass the fresh
+                    // signed-replica readback barrier again.
                 } else {
                     store.connection.execute("UPDATE resident_swarm_nodes SET state='failed',error=?3
                         WHERE graph_id=?1 AND node_id=?2",
@@ -701,7 +715,14 @@ pub fn tick(
             }
             let run_key = if fallback {
                 stable_job_id(&id,&format!("fallback:{}",node.id))
-            } else { stable_job_id(&id,&node.id) };
+            } else {
+                let attempt=super::swarm_task_retry::count(store,&id,&node.id)?;
+                if attempt == 0 {
+                    stable_job_id(&id,&node.id)
+                } else {
+                    stable_job_id(&id,&format!("{}:reassignment:{attempt}",node.id))
+                }
+            };
             // Crash-window recovery: enqueue writes the durable daemon job
             // before recording the graph-node -> job mapping. If the service
             // crashes in between, blindly calling enqueue again would hit a
