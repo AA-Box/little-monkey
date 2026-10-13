@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import {composeDistributedSwarmTrace} from '../../lib/swarmDistributedTrace';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
@@ -93,6 +94,11 @@ export function SwarmPanel() {
   const [clusterStatus,setClusterStatus]=useState<DaemonClusterStatus|null>(null);
   const [clusterBusy,setClusterBusy]=useState(false);
   const [replicaView,setReplicaView]=useState<{graph:string;records:DaemonSwarmReplica[]}|null>(null);
+  const distributedTrace=useMemo(()=>{
+    const selected=resident.find(graph=>graph.id===replicaView?.graph);
+    return selected && replicaView
+      ?composeDistributedSwarmTrace(selected,replicaView.records):null;
+  },[resident,replicaView]);
   const [residentFallbackEnabled,setResidentFallbackEnabled]=useState(false);
   const [hookBusy, setHookBusy] = useState(false);
   const [memoryDevice, setMemoryDevice] = useState('');
@@ -1110,6 +1116,17 @@ export function SwarmPanel() {
             {replicaView.records.map(peer => <p key={peer.source_fingerprint} className="break-all">
               Peer certificate {peer.source_fingerprint.slice(0,16)}… · term {peer.term} · revision {peer.sequence} · {peer.graph_state} · {peer.nodes.length} nodes
             </p>)}
+            {distributedTrace && <details className="mt-2">
+              <summary className="cursor-pointer">Combined local and peer trace · {distributedTrace.events.length} events</summary>
+              <p>Fresh peer checkpoints: {distributedTrace.freshPeers} · Stale: {distributedTrace.stalePeers} · Invalid: {distributedTrace.invalidPeerRecords}</p>
+              <div className="max-h-60 space-y-1 overflow-auto" aria-label="Authenticated distributed DAG observations">
+                {distributedTrace.events.slice(-40).map((entry,index)=><p key={entry.source+':'+entry.sequence+':'+entry.node+':'+index}>
+                  {entry.source==='local-ledger'?'Local journal':'Signed peer report'} · {entry.node} · {entry.state} · #{entry.sequence}
+                  {entry.term!==null?' · term '+entry.term:''}
+                </p>)}
+              </div>
+              <p>Remote completion reports are observations, never independent model-output verification or execution authority.</p>
+            </details>}
           </div>}
           <p className="mt-1 text-xs text-faint">{graph.tasks.filter(t => t.state === 'succeeded').length}/{graph.tasks.length} nodes succeeded</p>
           {graph.tasks.map(task => <p key={task.id} className="mt-1 text-xs text-muted">
