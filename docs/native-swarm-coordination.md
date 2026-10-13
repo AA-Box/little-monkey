@@ -542,6 +542,29 @@ not automatic cross-machine task migration. It does not provide global
 exactly-once execution: peers have separate ledgers; external tools must
 implement their own transactional idempotency/fencing for that guarantee.
 
+### Crash-resumable approved cross-machine failover
+
+An operator's existing immutable plan-only transfer remains required on the
+receiving installation. On a newly elected quorum leader, the service
+reconciles both `armed` and previously `claimed` failover plans. A crash after
+the durable one-shot claim but before registration can resume only after a
+fresh signed majority proves the previous leader had never dispatched any
+node. A crash after registration but before the plan is marked `imported`
+reuses the already registered graph **without creating another job** only
+after validating the entire persisted graph specification and each frozen
+recipe against the originally approved bounded transfer bundle. A graph
+name match alone is rejected. The inspected bytes are copied into a private
+bounded file before any import, preventing a source-path swap between approval
+and execution. Temporary lost quorum leaves the same claim waiting for fresh
+proof; malformed or changed recipes fail closed.
+
+This closes the local post-claim daemon crash window of the preapproved
+read-only takeover. It is still **not transparent cross-host migration of an
+arbitrary running task** and does not automatically reassign already-started
+external effects. Cross-machine exactly-once execution would additionally
+require replicated, authoritative consumption records and transactional
+idempotency support at every write-capable effect destination.
+
 
 ### Ruflo-compatible lifecycle hook execution (bounded subset)
 
