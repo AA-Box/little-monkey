@@ -20,6 +20,10 @@ export interface SwarmLiveOutcome {
  status:'done'|'error';
  elapsedMs:number;
  finishedAtMs:number;
+ /** Observed provider/local usage, when the model emitted usable token metering. */
+ usage?:{promptTokens:number;completionTokens:number};
+ /** User-configured rate estimate, NEVER the provider's settled invoice. */
+ meteredCostUsd?:number|null;
 }
 export interface SwarmLiveDecision {
  sequence:string[];
@@ -39,7 +43,14 @@ function read(now:number):SwarmLiveOutcome[]{
     (r.status==='done'||r.status==='error')&&
     Number.isSafeInteger(r.finishedAtMs)&&r.finishedAtMs!>=now-WINDOW_MS&&
     r.finishedAtMs!<=now+5000&&Number.isSafeInteger(r.elapsedMs)&&
-    r.elapsedMs!>=0&&r.elapsedMs!<=MAX_ELAPSED_MS;
+    r.elapsedMs!>=0&&r.elapsedMs!<=MAX_ELAPSED_MS&&
+    (r.usage===undefined||(
+      Number.isSafeInteger(r.usage.promptTokens)&&r.usage.promptTokens>=0&&
+      r.usage.promptTokens<=100_000_000&&
+      Number.isSafeInteger(r.usage.completionTokens)&&r.usage.completionTokens>=0&&
+      r.usage.completionTokens<=100_000_000))&&
+    (r.meteredCostUsd===undefined||r.meteredCostUsd===null||
+      (Number.isFinite(r.meteredCostUsd)&&r.meteredCostUsd>=0&&r.meteredCostUsd<=1_000_000));
   });
  }catch{return [];}
 }
@@ -49,6 +60,8 @@ export function loadSwarmLiveOutcomes(now=Date.now()):SwarmLiveOutcome[]{
 export function recordSwarmLiveOutcome(
  target:string|null|undefined,status:'done'|'error'|'cancelled',
  elapsedMs:number,now=Date.now(),
+ usage?:{promptTokens:number;completionTokens:number},
+ meteredCostUsd?:number|null,
 ):void{
  // Human cancellation and aborted pre-routing runs must not poison a model.
  if(!target||!TARGET.test(target)||status==='cancelled'||
@@ -56,7 +69,17 @@ export function recordSwarmLiveOutcome(
     !Number.isFinite(elapsedMs)||elapsedMs<0||elapsedMs>MAX_ELAPSED_MS)return;
  try {
   const rows=read(now);
-  rows.push({target,status,elapsedMs:Math.round(elapsedMs),finishedAtMs:now});
+  const validUsage=usage&&Number.isSafeInteger(usage.promptTokens)&&
+    Number.isSafeInteger(usage.completionTokens)&&usage.promptTokens>=0&&
+    usage.completionTokens>=0&&usage.promptTokens<=100_000_000&&
+    usage.completionTokens<=100_000_000;
+  const validCost=meteredCostUsd!==null&&meteredCostUsd!==undefined&&
+    Number.isFinite(meteredCostUsd)&&meteredCostUsd>=0&&meteredCostUsd<=1_000_000;
+  rows.push({target,status,elapsedMs:Math.round(elapsedMs),finishedAtMs:now,
+    ...(validUsage?{usage:{promptTokens:usage.promptTokens,
+      completionTokens:usage.completionTokens}}:{}),
+    ...(validCost?{meteredCostUsd}:{}),
+  });
   localStorage.setItem(SWARM_LIVE_OUTCOMES_KEY,JSON.stringify(rows.slice(-MAX_RECORDS)));
  }catch{ /* Observability is best effort; never abort an executing subagent. */ }
 }
