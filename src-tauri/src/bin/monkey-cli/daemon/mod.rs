@@ -164,6 +164,8 @@ pub enum DaemonCmd {
     SwarmFailoverArm {
         id: String,
         #[arg(long)] group: String,
+        /// Explicitly enrolled outbound peer alias of the original leader.
+        #[arg(long)] source_peer: String,
         #[arg(long)] new_id: String,
         #[arg(long)] bundle: PathBuf,
         #[arg(long)] workspace: PathBuf,
@@ -628,14 +630,14 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
             Ok(())
         },
         DaemonCmd::SwarmFailoverArm {
-            id,group,new_id,bundle,workspace,confirm_read_only_reexecution
+            id,group,source_peer,new_id,bundle,workspace,confirm_read_only_reexecution
         } => {
             if !confirm_read_only_reexecution {
                 return Err("Operator must explicitly consent to unattended re-execution of read-only model tasks".into());
             }
             let paths=DaemonPaths::resolve()?;
             let now=i64::try_from(now_ms()?).map_err(|_|"Failover clock overflow")?;
-            println!("{}",swarm_failover::arm(&paths,id,group,new_id,bundle,workspace,now)?);
+            println!("{}",swarm_failover::arm(&paths,id,group,source_peer,new_id,bundle,workspace,now)?);
             Ok(())
         },
         DaemonCmd::SwarmFailoverStatus => {
