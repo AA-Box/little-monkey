@@ -74,8 +74,16 @@ export function optimizeSwarmRoutingCosts(
   if(baselinePrice===null||baselinePrice<=0)return unchanged(samples.length);
   const equivalents=original.filter(key=>{
     const quality=scores.get(key);
+    // A cheaper model whose independently measured successful fixture runs
+    // are more than 3x slower is not an equivalent substitution. Unknown
+    // timings are not permission to bypass this service-quality guard.
+    const latencyAcceptable=quality && baseline.averageVerifiedMs!==null &&
+      quality.averageVerifiedMs!==null &&
+      Number.isFinite(quality.averageVerifiedMs)&&
+      Number.isFinite(baseline.averageVerifiedMs)&&
+      quality.averageVerifiedMs<=Math.max(100,baseline.averageVerifiedMs*3);
     return quality && baseline.accuracy-quality.accuracy<=0.02 &&
-      quality.accuracy>=0.8 && price(key)!==null;
+      quality.accuracy>=0.8 && latencyAcceptable && price(key)!==null;
   });
   const leastExpensive=equivalents.sort((a,b)=>price(a)!-price(b)! ||
     original.indexOf(a)-original.indexOf(b))[0];
