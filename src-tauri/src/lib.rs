@@ -1411,6 +1411,7 @@ pub fn run() {
             models::models_cancel_download,
             mlx_chat::mlx_chat_start,
             mlx_chat::mlx_chat_status,
+            mlx_chat::mlx_chat_canary,
             mlx_chat::mlx_chat_stop,
             models::models_resolve_reference,
             models::models_install_reference,
