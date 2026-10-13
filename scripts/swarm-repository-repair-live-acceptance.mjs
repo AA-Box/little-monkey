@@ -45,6 +45,47 @@ const tests=[
 'console.log("all authorization regressions pass");',
 '',
 ].join('\n');
+function independentlyVerify(work,baselineCommit){
+  // The verifier is outside the model graph. Never execute arbitrary model
+  // code: only the exact safe expected fixture repair may be evaluated.
+  if(execute('git',['rev-parse','HEAD'],work).trim()!==baselineCommit)
+    throw Error('Git baseline was rewritten by an agent.');
+  const statusNow=()=>execute('git',['status','--porcelain=v1','--untracked-files=all','--ignored'],work);
+  if(statusNow()!==' M src/module.mjs\n')
+    throw Error('Unexpected tracked, untracked, ignored or staged changes: '+JSON.stringify(statusNow()));
+  const sourceAfter=readFileSync(join(work,'src','module.mjs'),'utf8');
+  if(sourceAfter!==patchedSource)
+    throw Error('Only the exact minimal authorization fix may pass the source oracle.');
+  if(execute('git',['show','HEAD:src/module.mjs'],work)!==source ||
+     readFileSync(join(work,'test.mjs'),'utf8')!==tests ||
+     execute('git',['show','HEAD:test.mjs'],work)!==tests)
+    throw Error('Frozen source and independent regression tests have been tampered with.');
+  execute('git',['diff','--check'],work);
+  const identities=Array.from({length:16},()=>randomUUID());
+  const holdout=[
+    "import assert from 'node:assert/strict';",
+    "import {pathToFileURL} from 'node:url';",
+    "const {isOwner}=await import(pathToFileURL(process.argv[1]).href);",
+    "const names="+JSON.stringify(identities)+";",
+    "for(const name of names){for(const owner of names){",
+    "assert.equal(isOwner(name,owner),name===owner);}}",
+    "console.log('independent holdout passed');",
+  ].join('\n');
+  if(!execute(process.execPath,['--input-type=module','--eval',holdout,
+      join(work,'src','module.mjs')],work,10_000).includes('independent holdout passed'))
+    throw Error('Independent holdout did not execute.');
+  if(!execute(process.execPath,['test.mjs'],work,10_000).includes('authorization regressions pass'))
+    throw Error('External regression tests did not run.');
+  if(statusNow()!==' M src/module.mjs\n'||
+     readFileSync(join(work,'src','module.mjs'),'utf8')!==patchedSource)
+    throw Error('Worktree changed during independent tests.');
+  const sha256=text=>createHash('sha256').update(text).digest('hex');
+  const evidence={baselineCommit,
+    vulnerableSha256:sha256(source),repairedSha256:sha256(sourceAfter),
+    frozenRegressionSha256:sha256(tests),externalRegression:'passed',
+    independentHoldoutCases:identities.length**2};
+  return evidence;
+}
 function oracleContract(){
   const good=patchedSource;
   if(!source.includes('!==')||!good.includes('==='))throw Error('Broken test fixture.');
@@ -59,6 +100,35 @@ function oracleContract(){
     writeFileSync(join(tmp,'src','module.mjs'),good);
     const repaired=spawnSync(process.execPath,['test.mjs'],{cwd:tmp,timeout:5000,encoding:'utf8'});
     if(repaired.status!==0)throw Error('Regression oracle rejects correct fix.');
+    const gitRepo=join(tmp,'repo'),gitSource=join(gitRepo,'src','module.mjs');
+    mkdirSync(join(gitRepo,'src'),{recursive:true});
+    writeFileSync(join(gitRepo,'package.json'),JSON.stringify({type:'module',private:true}));
+    writeFileSync(join(gitRepo,'test.mjs'),tests);
+    writeFileSync(gitSource,source);
+    writeFileSync(join(gitRepo,'MONKEY.md'),'Disposable fixture');
+    writeFileSync(join(gitRepo,'.gitignore'),'*.scratch\\n');
+    execute('git',['init','-q'],gitRepo);
+    execute('git',['add','.'],gitRepo);
+    execute('git',['-c','user.name=Oracle Contract',
+      '-c','user.email=oracle@example.invalid','-c','commit.gpgsign=false',
+      'commit','-qm','frozen independent fixture'],gitRepo);
+    const baseline=execute('git',['rev-parse','HEAD'],gitRepo).trim();
+    const mustReject=reason=>{
+      let rejected=false;
+      try{independentlyVerify(gitRepo,baseline);}catch{rejected=true;}
+      if(!rejected)throw Error('External verifier accepted '+reason);
+    };
+    mustReject('unrepaired vulnerable source');
+    writeFileSync(gitSource,patchedSource+'// injected model code\\n');
+    mustReject('noncanonical source injection');
+    writeFileSync(gitSource,patchedSource);
+    if(independentlyVerify(gitRepo,baseline).independentHoldoutCases!==256)
+      throw Error('Exact safe repair failed external holdouts.');
+    writeFileSync(join(gitRepo,'test.mjs'),tests+'// tampered\\n');
+    mustReject('tampered regression tests');
+    writeFileSync(join(gitRepo,'test.mjs'),tests);
+    writeFileSync(join(gitRepo,'rogue.scratch'),'ignored malware');
+    mustReject('ignored worktree side effects');
   }finally{rmSync(tmp,{recursive:true,force:true});}
 }
 if(process.argv.includes('--self-check')) {
@@ -136,44 +206,7 @@ if(process.argv.includes('--self-check')) {
        new Set(jobIds).size!==3||jobIds.some(id=>typeof id!=='string'||!id)) {
       throw Error('A model report was accepted without three distinct completed daemon jobs.');
     }
-    // The verifier is outside the model graph. Never execute arbitrary model
-    // code: only the exact safe expected fixture repair may be evaluated.
-    if(execute('git',['rev-parse','HEAD'],work).trim()!==baselineCommit)
-      throw Error('Git baseline was rewritten by an agent.');
-    const statusNow=()=>execute('git',['status','--porcelain=v1','--untracked-files=all','--ignored'],work);
-    if(statusNow()!==' M src/module.mjs\n')
-      throw Error('Unexpected tracked, untracked, ignored or staged changes: '+JSON.stringify(statusNow()));
-    const sourceAfter=readFileSync(join(work,'src','module.mjs'),'utf8');
-    if(sourceAfter!==patchedSource)
-      throw Error('Only the exact minimal authorization fix may pass the source oracle.');
-    if(execute('git',['show','HEAD:src/module.mjs'],work)!==source ||
-       readFileSync(join(work,'test.mjs'),'utf8')!==tests ||
-       execute('git',['show','HEAD:test.mjs'],work)!==tests)
-      throw Error('Frozen source and independent regression tests have been tampered with.');
-    execute('git',['diff','--check'],work);
-    const identities=Array.from({length:16},()=>randomUUID());
-    const holdout=[
-      "import assert from 'node:assert/strict';",
-      "import {pathToFileURL} from 'node:url';",
-      "const {isOwner}=await import(pathToFileURL(process.argv[1]).href);",
-      "const names="+JSON.stringify(identities)+";",
-      "for(const name of names){for(const owner of names){",
-      "assert.equal(isOwner(name,owner),name===owner);}}",
-      "console.log('independent holdout passed');",
-    ].join('\n');
-    if(!execute(process.execPath,['--input-type=module','--eval',holdout,
-        join(work,'src','module.mjs')],work,10_000).includes('independent holdout passed'))
-      throw Error('Independent holdout did not execute.');
-    if(!execute(process.execPath,['test.mjs'],work,10_000).includes('authorization regressions pass'))
-      throw Error('External regression tests did not run.');
-    if(statusNow()!==' M src/module.mjs\n'||
-       readFileSync(join(work,'src','module.mjs'),'utf8')!==patchedSource)
-      throw Error('Worktree changed during independent tests.');
-    const sha256=text=>createHash('sha256').update(text).digest('hex');
-    const evidence={baselineCommit,
-      vulnerableSha256:sha256(source),repairedSha256:sha256(sourceAfter),
-      frozenRegressionSha256:sha256(tests),externalRegression:'passed',
-      independentHoldoutCases:identities.length**2};
+    const evidence=independentlyVerify(work,baselineCommit);
     verified=true;
     console.log(JSON.stringify({mode:'real-resident-repository-repair',status:'verified',
       graphId,repairModel:target,independentReviewModel:reviewTarget,
