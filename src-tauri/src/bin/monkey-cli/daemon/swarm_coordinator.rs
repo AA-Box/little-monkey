@@ -372,8 +372,9 @@ fn reattach_durable_job_stage(
     } else { ("pending","submitted") };
     let updated = store.connection.execute(
         "UPDATE resident_swarm_nodes SET state=?4,job_id=?3
-         WHERE graph_id=?1 AND node_id=?2 AND state=?5",
-        params![graph_id,node_id,job_id,submitted,pending],
+         WHERE graph_id=?1 AND node_id=?2 AND state IN (?5,?6)",
+        params![graph_id,node_id,job_id,submitted,pending,
+            if fallback {"preparing_fallback"} else {"preparing"}],
     ).map_err(|error|error.to_string())?;
     if updated != 1 {
         return Err("Swarm graph cursor changed while reattaching a durable job".into());
@@ -633,10 +634,11 @@ pub fn tick(
         for node in &spec.nodes {
             if active >= spec.max_parallel { break; }
             let pending_state = states.get(&node.id).map(|(status,_)|status.as_str());
-            if pending_state != Some("pending") && pending_state != Some("pending_fallback") {
+            if !matches!(pending_state,Some("pending"|"pending_fallback"|
+                "preparing"|"preparing_fallback")) {
                 continue;
             }
-            let fallback = pending_state == Some("pending_fallback");
+            let fallback = matches!(pending_state,Some("pending_fallback"|"preparing_fallback"));
             if !node.depends_on.iter().all(|dep|
                 states.get(dep).is_some_and(|(status,_)| status == "succeeded")) {
                 continue;
@@ -650,6 +652,34 @@ pub fn tick(
             // duplicate deterministic id and incorrectly fail the graph.
             // Reattach to that exact original job instead. The job queue is
             // the authority for its status and permissions.
+            // Exactly-once *dispatch intent* for clustered, read-only work:
+            // materialize the unique job identity locally BEFORE enqueue.
+            // The signed peer checkpoint worker must then obtain a majority
+            // of durable replica readbacks for THIS exact intent/state/term.
+            // If leadership crashes before the barrier, nothing has started.
+            // If it crashes afterwards, peers retain the pre-dispatch intent;
+            // successors refuse ambiguous automatic re-execution.
+            if let Some(group)=spec.cluster_id.as_deref() {
+                if matches!(pending_state,Some("pending"|"pending_fallback")) {
+                    if reattach_durable_job_stage(store,&id,&node.id,&run_key,fallback)?{
+                        active+=1;
+                        continue;
+                    }
+                    let intended=if fallback {"preparing_fallback"} else {"preparing"};
+                    let changed=store.connection.execute(
+                        "UPDATE resident_swarm_nodes SET state=?4,job_id=?3
+                         WHERE graph_id=?1 AND node_id=?2 AND state=?5",
+                        params![id,node.id,run_key,intended,
+                            if fallback {"pending_fallback"} else {"pending"}]
+                    ).map_err(|e|e.to_string())?;
+                    if changed!=1{return Err("Cluster dispatch cursor changed while reserving intent".into());}
+                    active+=1;
+                    continue;
+                }
+                if !super::swarm_quorum::majority_has_state(store,group,&id,now)?{
+                    continue;
+                }
+            }
             if reattach_durable_job_stage(store, &id, &node.id, &run_key, fallback)? {
                 active += 1;
                 continue;
@@ -705,7 +735,9 @@ pub fn tick(
                          WHERE graph_id=?1 AND node_id=?2 AND state=?5",
                         params![id,node.id,queued.job_id,
                             if fallback {"submitted_fallback"} else {"submitted"},
-                            if fallback {"pending_fallback"} else {"pending"}],
+                            if spec.cluster_id.is_some() {
+                                if fallback {"preparing_fallback"} else {"preparing"}
+                            } else if fallback {"pending_fallback"} else {"pending"}],
                     ).map_err(|e| e.to_string())?;
                     active += 1;
                 }
