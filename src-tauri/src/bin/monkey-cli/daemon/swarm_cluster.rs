@@ -262,16 +262,32 @@ pub async fn campaign(paths:&DaemonPaths,group:&str,term:u64,now:i64)
     let local=vote(&mut store,&req,"@local",now)?;
     let mut receipts=vec![local];
     drop(store);
+    // Parallel, bounded ballots: an offline member must never prevent an
+    // otherwise valid majority from leasing. Stop waiting once a strict
+    // majority is cryptographically authenticated by the existing pinned
+    // peer transport. In-flight losing/late requests are dropped; votes
+    // already accepted remotely still obey their exclusive term/expiry.
+    use futures_util::{stream::FuturesUnordered, StreamExt};
+    let outstanding=FuturesUnordered::new();
     for member in config.members.iter().filter(|m|m.device_id!="@local"){
-        let Some(alias)=member.alias.as_deref() else{continue;};
-        // This signs and validates the request using the existing peer
-        // controller secret, authenticated sequence and pinned remote TLS cert.
+        let Some(alias)=member.alias.clone() else{continue;};
+        let expected=member.fingerprint.clone();
         let bytes=serde_json::to_vec(&req).map_err(|e|e.to_string())?;
-        let response=super::remote::signed_swarm_vote(
-            paths,alias,&member.fingerprint,bytes,now as u64).await;
-        let Ok(value)=response else{continue;};
+        outstanding.push(async move {
+            let result=tokio::time::timeout(
+                std::time::Duration::from_secs(4),
+                super::remote::signed_swarm_vote(
+                    paths,&alias,&expected,bytes,now as u64),
+            ).await;
+            (expected,result)
+        });
+    }
+    let mut outstanding=outstanding;
+    while receipts.len()<=config.members.len()/2 {
+        let Some((expected,result))=outstanding.next().await else{break;};
+        let Ok(Ok(value))=result else{continue;};
         let Ok(reply)=serde_json::from_value::<VoteReceipt>(value) else{continue;};
-        if reply.voter_fingerprint==member.fingerprint{receipts.push(reply);}
+        if reply.voter_fingerprint==expected{receipts.push(reply);}
     }
     let store=DaemonStore::open(paths)?;
     match persist_quorum(&store,&req,&receipts,now){
