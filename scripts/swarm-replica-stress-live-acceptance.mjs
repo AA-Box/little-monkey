@@ -23,19 +23,23 @@ const graph = value('--graph');
 const peer = value('--peer');
 const bin = value('--monkey-bin') ?? process.env.LITTLE_MONKEY_CLI ?? 'monkey';
 const rounds = Number(value('--rounds') ?? 30);
-const concurrency = Number(value('--concurrency') ?? 4);
+const concurrency = Number(value('--concurrency') ?? 1);
+const additionalGraphs = value('--additional-graphs')?.split(',') ?? [];
+const graphs = [graph, ...additionalGraphs];
 const maxP95Ms = Number(value('--max-p95-ms') ?? 30_000);
 const confirmed = process.argv.includes('--confirm-operator-owned-readonly-cluster') &&
   process.argv.includes('--confirm-independent-machines') &&
   process.argv.includes('--confirm-post-recovery');
 const uniqueFlags = ['--group','--graph','--peer','--monkey-bin','--rounds',
-  '--concurrency','--max-p95-ms'];
+  '--concurrency','--max-p95-ms','--additional-graphs'];
 const duplicatedFlag = uniqueFlags.some(flag => process.argv.filter(item => item === flag).length > 1);
 const usage = 'Usage: --group GROUP --graph PRESTAGED_GRAPH --peer ENROLLED_ALIAS ' +
-  '[--rounds 10..500] [--concurrency 1..8] [--max-p95-ms 1000..60000] ' +
+  '[--rounds 10..500] [--concurrency 1..8] [--additional-graphs id1,id2,...] [--max-p95-ms 1000..60000] ' +
   '--confirm-operator-owned-readonly-cluster --confirm-independent-machines ' +
   '--confirm-post-recovery [--monkey-bin PATH]';
 if (duplicatedFlag || ![group,graph,peer].every(s => validId.test(s ?? '')) ||
+  !graphs.every(s => validId.test(s ?? '')) || new Set(graphs).size !== graphs.length ||
+  graphs.length > 8 || concurrency > graphs.length ||
   !Number.isSafeInteger(rounds) || rounds < 10 || rounds > 500 ||
   !Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 8 ||
   concurrency > rounds || !Number.isSafeInteger(maxP95Ms) ||
@@ -95,36 +99,39 @@ async function contact() {
     'A fresh signed peer hello did not confirm the expected task-granted identity');
   return v;
 }
-async function publish() {
+async function publish(graphId) {
   const started = performance.now();
-  const value = await cli(['daemon','swarm-replicate',group,graph,peer], 45_000);
+  const value = await cli(['daemon','swarm-replicate',group,graphId,peer], 45_000);
   const receipt = value?.receipt;
   must(value?.remote_readback_verified === true &&
     value?.execution_authorized === false && receipt?.accepted === true &&
-    receipt?.group === group && receipt?.graph_id === graph &&
+    receipt?.group === group && receipt?.graph_id === graphId &&
     Number.isSafeInteger(receipt?.sequence) && receipt.sequence > 0,
     'No matching, durable, remote TLS-signed SQLite checkpoint readback');
-  return {sequence:receipt.sequence, latencyMs:performance.now()-started};
+  return {graph:graphId, sequence:receipt.sequence, latencyMs:performance.now()-started};
 }
 
 async function run() {
   const started = performance.now();
   const before = await cluster();
   const identity = await contact();
-  // This first snapshot is a fresh baseline. Subsequent attempts must all
-  // advance the persistent sender's sequence without a collision.
-  const baseline = await publish();
-  let next = 0;
+  // One writer per graph: the receiver intentionally rejects stale snapshots
+  // for a single graph. Competing writers on one graph are not a valid
+  // all-success stress test. Separate preapproved graph keys allow real
+  // parallel transport/SQLite contention without violating monotonicity.
+  const active = graphs.slice(0,concurrency);
+  const baselines = await Promise.all(active.map(id => publish(id)));
+  const baselineByGraph = new Map(baselines.map(v => [v.graph,v.sequence]));
   const observations = [];
   const errors = [];
-  async function worker() {
-    while (next < rounds && errors.length === 0) {
-      next++;
-      try { observations.push(await publish()); }
+  async function worker(index) {
+    const assignedGraph = active[index];
+    for (let step=index;step<rounds && errors.length===0;step+=concurrency) {
+      try { observations.push(await publish(assignedGraph)); }
       catch (e) { errors.push(String(e)); }
     }
   }
-  await Promise.all(Array.from({length:concurrency}, () => worker()));
+  await Promise.all(active.map((_,i) => worker(i)));
   const last = await cluster();
   const remote = await contact();
   must(last.local_fingerprint === before.local_fingerprint &&
@@ -133,10 +140,15 @@ async function run() {
     'Cluster roster, sender or receiver identity changed during stress');
   must(errors.length === 0 && observations.length === rounds,
     'At least one signed publication failed or could not be verified');
-  const sequences = observations.map(v => v.sequence);
-  must(sequences.every(s => s > baseline.sequence) &&
-    new Set(sequences).size === rounds,
-    'Lost or duplicated a durable checkpoint sequence under concurrency');
+  const perGraph = active.map(id => {
+    const sequences = observations.filter(v=>v.graph===id).map(v=>v.sequence);
+    must(sequences.every(s=>s>baselineByGraph.get(id)) &&
+      new Set(sequences).size === sequences.length,
+      'Lost or duplicated a durable checkpoint sequence under concurrency');
+    return {graph:id,baselineSequence:baselineByGraph.get(id),
+      minSequence:Math.min(...sequences),maxSequence:Math.max(...sequences),
+      uniqueSequences:sequences.length};
+  });
   const timings = observations.map(v=>v.latencyMs).sort((a,b)=>a-b);
   const p95 = timings[Math.ceil(timings.length*0.95)-1];
   must(p95 <= maxP95Ms, 'Observed p95 latency exceeded operator-selected gate');
@@ -146,8 +158,7 @@ async function run() {
     independentHardwareAttestation:false,
     group, graph, peer, sourceFingerprint:before.local_fingerprint,
     rosterSha256:before.roster_sha256, receiverInstanceId:identity.peer_id,
-    rounds, concurrency, baselineSequence:baseline.sequence,
-    minSequence:Math.min(...sequences), maxSequence:Math.max(...sequences),
+    rounds, concurrency, perGraph,
     uniqueSequences:rounds, failedPublications:0,
     elapsedMs:Math.round(performance.now()-started),
     throughputPerSecond:Number((rounds/((performance.now()-started)/1000)).toFixed(2)),
