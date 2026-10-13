@@ -353,6 +353,7 @@ pub fn submit(paths: &DaemonPaths, input: &Path) -> Result<serde_json::Value, St
 pub fn status(paths: &DaemonPaths, graph_id: Option<&str>) -> Result<serde_json::Value, String> {
     let store = DaemonStore::open(paths)?;
     prepare_schema(&store)?;
+    super::swarm_task_retry::schema(&store)?;
     if let Some(id) = graph_id {
         if !valid_id(id) { return Err("Invalid swarm id".into()); }
     }
@@ -367,11 +368,17 @@ pub fn status(paths: &DaemonPaths, graph_id: Option<&str>) -> Result<serde_json:
         let (id, state, created, updated) = row.map_err(|e| e.to_string())?;
         if graph_id.is_some_and(|wanted| wanted != id) { continue; }
         let mut tasks = Vec::new();
-        let mut stmt = store.connection.prepare("SELECT node_id,state,job_id,error FROM resident_swarm_nodes
-            WHERE graph_id=?1 ORDER BY node_id").map_err(|e| e.to_string())?;
+        let mut stmt = store.connection.prepare(
+            "SELECT n.node_id,n.state,n.job_id,n.error,COALESCE(a.attempts,0)
+             FROM resident_swarm_nodes n
+             LEFT JOIN resident_swarm_task_reassignments a
+               ON a.graph_id=n.graph_id AND a.node_id=n.node_id
+             WHERE n.graph_id=?1 ORDER BY n.node_id"
+        ).map_err(|e| e.to_string())?;
         for record in stmt.query_map([&id], |r| Ok(serde_json::json!({
             "id":r.get::<_,String>(0)?, "state":r.get::<_,String>(1)?,
             "job_id":r.get::<_,Option<String>>(2)?, "error":r.get::<_,Option<String>>(3)?,
+            "reassignments":r.get::<_,i64>(4)?,
         }))).map_err(|e| e.to_string())? {
             tasks.push(record.map_err(|e| e.to_string())?);
         }
