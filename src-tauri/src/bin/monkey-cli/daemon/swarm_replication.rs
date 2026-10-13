@@ -644,6 +644,43 @@ mod tests{
         assert_eq!(has_graph,0,"peer telemetry cannot authorize a resident graph");
     }
     #[test]
+    fn v3_source_metering_is_checksums_bound_bounded_and_readback_durable(){
+        let (mut store,mut cp,device)=configured();
+        cp.version=3;
+        cp.nodes[0].state="succeeded".into();
+        cp.model_usage=vec![ReplicaModelUsage{
+            node_id:"audit".into(),target_id:"provider:model".into(),
+            elapsed_ms:1230,input_tokens:120,output_tokens:30,
+            cached_input_tokens:10,model_calls:2,cost_micros:Some(450),
+        }];
+        cp.seal().unwrap();
+        assert!(ingest(&mut store,&device,&cp,1100).unwrap());
+        assert_eq!(list_for_member(&store,&device,"team","audit").unwrap()[0].model_usage,
+            cp.model_usage);
+        let mut forged=cp.clone();
+        forged.model_usage[0].cost_micros=Some(999_999);
+        assert!(ingest(&mut store,&device,&forged,1100).is_err(),
+            "changed original-host metered amount must invalidate checksum");
+        forged.seal().unwrap();
+        assert!(ingest(&mut store,&device,&forged,1100).is_err(),
+            "conflicting same-sequence model usage must not replace durable receipt");
+        for bad in [
+            ReplicaModelUsage{node_id:"absent".into(),..cp.model_usage[0].clone()},
+            ReplicaModelUsage{cached_input_tokens:121,..cp.model_usage[0].clone()},
+            ReplicaModelUsage{model_calls:0,..cp.model_usage[0].clone()},
+            ReplicaModelUsage{target_id:"secret query".into(),..cp.model_usage[0].clone()},
+        ] {
+            let mut modified=cp.clone();
+            modified.sequence=2;modified.model_usage=vec![bad];
+            modified.seal().unwrap();
+            assert!(ingest(&mut store,&device,&modified,1200).is_err());
+        }
+        let mut legacy=cp.clone();
+        legacy.version=2;legacy.sequence=2;legacy.seal().unwrap();
+        assert!(ingest(&mut store,&device,&legacy,1200).is_err(),
+            "an older schema cannot impersonate source-measured run usage");
+    }
+    #[test]
     fn altered_timestamp_term_checksum_or_huge_state_fails_closed(){
         let (mut store,cp,device)=configured();
         let mut t=cp.clone();
