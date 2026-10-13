@@ -525,9 +525,12 @@ read-only daemon job now automatically receives up to two additional attempts.
 The immutable logical identity is `(graph_id, node_id)`. Attempt zero retains
 its original deterministic job ID; successive attempts have deterministic,
 distinct job IDs derived from the logical identity and reassignment counter.
-The SQLite node cursor and the retry counter advance in the same immediate
-transaction, requiring the previous job to be in the durable `failed` state.
-The coordinator cannot accept a stale job's late success as the current result.
+The SQLite node cursor, next deterministic job identity, and retry counter
+advance in the same immediate transaction, requiring the previous job to be in
+the durable `failed` state. The replacement is persisted as `preparing`, never
+as an unattempted `pending` node; takeover witnesses cannot mistake it for a
+never-dispatched task. The coordinator cannot accept a stale job's late
+success as the current result.
 Each new dispatch must pass the current signed quorum/term/state barrier.
 
 Automatic attempts are **not** scheduled for cancelled, running, paused,
