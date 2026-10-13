@@ -18,6 +18,7 @@ const MAX_GRAPH_NODES: usize = 16;
 const MAX_CHECKPOINT_BYTES: usize = 64 * 1024;
 const MAX_AGE_MS: i64 = 5 * 60 * 1000;
 const MAX_STORED_SNAPSHOTS: i64 = 1024;
+const MAX_TRACE_EVENTS: usize = 48;
 
 #[derive(Clone,Debug,Serialize,Deserialize,PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +26,17 @@ pub struct ReplicaNode {
     pub id: String,
     pub state: String,
     pub job_id: Option<String>,
+}
+/// Redacted durable DAG transition, captured on its original host. This is
+/// execution *state telemetry* and never a graded model outcome.
+#[derive(Clone,Debug,Serialize,Deserialize,PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaTraceEvent {
+    pub sequence: u64,
+    pub node_id: Option<String>,
+    pub kind: String,
+    pub state: String,
+    pub occurred_at_ms: i64,
 }
 #[derive(Clone,Debug,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,15 +51,29 @@ pub struct ReplicaSnapshot {
     pub captured_at_ms: i64,
     pub graph_state: String,
     pub nodes: Vec<ReplicaNode>,
+    #[serde(default, skip_serializing_if="Vec::is_empty")]
+    pub trace_events: Vec<ReplicaTraceEvent>,
     pub checksum: String,
 }
 fn hash(snapshot:&ReplicaSnapshot)->Result<String,String>{
-    let bytes=serde_json::to_vec(&(
-        snapshot.version,&snapshot.group,&snapshot.graph_id,
-        &snapshot.source_fingerprint,&snapshot.roster_sha256,
-        snapshot.sequence,snapshot.term,snapshot.captured_at_ms,
-        &snapshot.graph_state,&snapshot.nodes,
-    )).map_err(|e|e.to_string())?;
+    // v1 checksum is byte-for-byte compatible with existing peers. v2 seals
+    // the trace too; an attacker cannot swap event timestamps or states while
+    // retaining the same authenticated, read-back-verified payload.
+    let bytes=if snapshot.version==1{
+        serde_json::to_vec(&(
+            snapshot.version,&snapshot.group,&snapshot.graph_id,
+            &snapshot.source_fingerprint,&snapshot.roster_sha256,
+            snapshot.sequence,snapshot.term,snapshot.captured_at_ms,
+            &snapshot.graph_state,&snapshot.nodes,
+        ))
+    }else{
+        serde_json::to_vec(&(
+            snapshot.version,&snapshot.group,&snapshot.graph_id,
+            &snapshot.source_fingerprint,&snapshot.roster_sha256,
+            snapshot.sequence,snapshot.term,snapshot.captured_at_ms,
+            &snapshot.graph_state,&snapshot.nodes,&snapshot.trace_events,
+        ))
+    }.map_err(|e|e.to_string())?;
     Ok(format!("{:x}",Sha256::digest(&bytes)))
 }
 fn valid_id(s:&str)->bool{
@@ -68,7 +94,7 @@ impl ReplicaSnapshot{
         Ok(())
     }
     pub fn validate(&self,now:i64)->Result<(),String>{
-        if self.version!=1 || !valid_id(&self.group)||!valid_id(&self.graph_id)||
+        if !matches!(self.version,1|2) || !valid_id(&self.group)||!valid_id(&self.graph_id)||
             !self.source_fingerprint.bytes().all(|c|c.is_ascii_hexdigit()&&!c.is_ascii_uppercase())||
             self.source_fingerprint.len()!=64||
             self.roster_sha256.len()!=64 ||
@@ -91,6 +117,23 @@ impl ReplicaSnapshot{
                         c.is_ascii_alphanumeric()||matches!(c,b'-'|b'_'|b'.'))) {
                 return Err("Malformed or duplicate DAG checkpoint task".into());
             }
+        }
+        if (self.version==1 && !self.trace_events.is_empty())||
+            self.trace_events.len()>MAX_TRACE_EVENTS{
+            return Err("Unsupported or excessive distributed trace events".into());
+        }
+        let mut last=0;
+        for event in &self.trace_events{
+            if event.sequence<=last||event.sequence>i64::MAX as u64||
+                event.occurred_at_ms<=0||
+                event.occurred_at_ms>self.captured_at_ms.saturating_add(5_000)||
+                event.node_id.as_deref().is_some_and(|id|!unique.contains(id))||
+                !valid_state(&event.state)||
+                !matches!(event.kind.as_str(),"graph_created"|"graph_transition"|
+                    "node_created"|"node_transition"){
+                return Err("Invalid signed remote trace event".into());
+            }
+            last=event.sequence;
         }
         Ok(())
     }
@@ -278,13 +321,31 @@ pub fn capture_local_leader(
         params![group,graph,next]
     ).map_err(|e|e.to_string())?;
     tx.commit().map_err(|e|e.to_string())?;
+    // The original author's persistent event ledger is the only trace source.
+    // Never serialize messages, recipes, reports or arbitrary model text.
+    let mut events_stmt=store.connection.prepare(
+        "SELECT event_id,node_id,event_kind,next_state,occurred_at_ms
+         FROM resident_swarm_events WHERE graph_id=?1
+         ORDER BY event_id DESC LIMIT ?2"
+    ).map_err(|e|e.to_string())?;
+    let mut trace_events=events_stmt.query_map(params![graph,MAX_TRACE_EVENTS as i64],|r|{
+        let id:i64=r.get(0)?;
+        Ok(ReplicaTraceEvent{
+            sequence:u64::try_from(id).unwrap_or(0),
+            node_id:r.get(1)?,kind:r.get(2)?,
+            state:r.get(3)?,occurred_at_ms:r.get(4)?,
+        })
+    }).map_err(|e|e.to_string())?
+      .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    trace_events.reverse();
+    drop(events_stmt);
     let mut snapshot=ReplicaSnapshot{
-        version:1,group:group.to_owned(),graph_id:graph.to_owned(),
+        version:2,group:group.to_owned(),graph_id:graph.to_owned(),
         source_fingerprint:members.local().fingerprint.clone(),
         roster_sha256:members.digest(),
         sequence:next as u64,
         term:u64::try_from(term).map_err(|_|"Invalid persisted election term")?,
-        captured_at_ms:now,graph_state:state,nodes,
+        captured_at_ms:now,graph_state:state,nodes,trace_events,
         checksum:String::new(),
     };
     snapshot.checksum=hash(&snapshot)?;
@@ -413,6 +474,7 @@ mod tests{
             sequence:1,term:1,captured_at_ms:1000,
             graph_state:"running".into(),
             nodes:vec![ReplicaNode{id:"audit".into(),state:"submitted".into(),job_id:Some("job-original".into())}],
+            trace_events:vec![],
             checksum:String::new(),
         };
         snapshot.checksum=hash(&snapshot).unwrap();
