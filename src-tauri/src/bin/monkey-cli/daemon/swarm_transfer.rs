@@ -398,7 +398,10 @@ mod tests {
         export(&source,"original",&bundle).unwrap();
         assert!(export(&source,"original",&bundle).is_err());
         assert!(import_read_only(&target,&bundle,"original",&target_ws).is_err());
+        assert!(!verify_existing_import(&target,&bundle,"new-leader",&target_ws).unwrap());
         let restored=import_read_only(&target,&bundle,"new-leader",&target_ws).unwrap();
+        assert!(verify_existing_import(&target,&bundle,"new-leader",&target_ws).unwrap(),
+            "A crash after registration must safely reconcile the existing graph");
         assert_eq!(restored["status"]["state"],"running");
         let state=swarm_coordinator::status(&target,Some("new-leader")).unwrap();
         assert_eq!(state["graphs"][0]["tasks"][0]["state"],"pending");
@@ -409,6 +412,17 @@ mod tests {
         assert_eq!(installed.workspace.as_deref(),
             Some(target_ws.canonicalize().unwrap().to_string_lossy().as_ref()));
         assert_eq!(installed.permission_mode,"plan");
+        // A preexisting name with modified recipe bytes is not evidence
+        // that the operator-approved import succeeded.
+        let original_bytes=fs::read(&target.snapshots.join(
+            "resident-swarm-new-leader-survey.json"
+        )).unwrap();
+        fs::write(target.snapshots.join("resident-swarm-new-leader-survey.json"),
+            b"{}").unwrap();
+        assert!(verify_existing_import(&target,&bundle,"new-leader",&target_ws).is_err());
+        fs::write(target.snapshots.join("resident-swarm-new-leader-survey.json"),
+            &original_bytes).unwrap();
+        assert!(verify_existing_import(&target,&bundle,"new-leader",&target_ws).unwrap());
         let mut damaged:serde_json::Value=
             serde_json::from_slice(&fs::read(&bundle).unwrap()).unwrap();
         damaged["recipes"][0]["primary_sha256"]=serde_json::json!("00");
