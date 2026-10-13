@@ -2495,8 +2495,11 @@ mod foreground_process_row {
         false
     }
 
-    /// Normal completion: the row exists, carries the pid and the effective
-    /// limits, and closes as `succeeded` with no breach.
+    /// A *live, observable* shell must preserve its kernel-verified process
+    /// identity and actual limits after completion. An instantaneous `printf`
+    /// can exit before the supervisor attaches on a loaded macOS runner;
+    /// inventing a pid/start time for that already-exited process is unsafe.
+    /// Keep the process alive long enough for an actual supervised attach.
     #[tokio::test]
     async fn a_completed_foreground_shell_is_a_row_with_its_pid_limits_and_exit() {
         if !confinement_available() {
@@ -2504,7 +2507,7 @@ mod foreground_process_row {
         }
         let harness = Harness::create();
         let capture = harness
-            .run("printf ok", ProcessLimits::default())
+            .run("sleep 2; printf ok", ProcessLimits::default())
             .await
             .expect("the command runs");
         assert!(capture.status.success());

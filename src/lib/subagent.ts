@@ -1,3 +1,4 @@
+import { evaluatePreActionHooks, fireObservedHooks } from './userHooks';
 /**
  * The subagent child loop — `runSubagentTask` is what `turnEngine.ts`'s
  * `executeToolCall` delegates a model-requested `task` tool call to (see
@@ -18,6 +19,7 @@ import { toolsForProfile } from './tools';
 import {
   attemptStream,
   describeUsageTarget,
+  costTargetKey,
   executeToolCall,
   isBlockedInPlanMode,
   isToolCallAllowed,
@@ -445,6 +447,30 @@ function isErrorResult(result: string): boolean {
  * worktree bookkeeping failure must not corrupt the tool result.
  */
 export async function runSubagentTask(params: RunSubagentTaskParams): Promise<string> {
+  // Ruflo-compatible task lifecycle hooks observe real child execution. The
+  // model cannot use their output as tool grants or amend native policy.
+  const args={task_id:params.taskId,description:params.description,profile:params.profile};
+  // PreTask invokes the existing operator-configured native shell hook and
+  // can explicitly DENY before a model, isolated worktree or peer is started.
+  // No model-provided command string is executed as a hook.
+  let report:string|undefined;
+  try{
+    const denial=await evaluatePreActionHooks('PreTask','task',args,params.sessionId);
+    if(denial){
+      report=stringifyToolError(new Error('Blocked by a PreTask hook: '+denial.reason));
+      return report;
+    }
+    report=await runSubagentTaskBody(params);
+    return report;
+  }catch(error){
+    report=stringifyToolError(error);
+    return report;
+  }finally{
+    fireObservedHooks('PostTask',{tool_name:'task',args,session_id:params.sessionId,
+      result:(report??'No result').slice(0,8_000)});
+  }
+}
+async function runSubagentTaskBody(params: RunSubagentTaskParams): Promise<string> {
   if (params.isolation !== 'worktree') {
     const report = await runSubagentTaskLoop(params);
     const live = useSubagentStore.getState().runs[params.toolCallId ?? params.taskId];
@@ -573,6 +599,9 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
   if (parentSignal?.aborted) ownController.abort();
   else parentSignal?.addEventListener('abort', () => ownController.abort(), { once: true });
   activeSubagentControllers.set(taskId, ownController);
+  // Dispatch-time decision (not a promise of successful model inference).
+  // Keep the persisted hint bounded and local to the existing session record.
+  let routingSnapshot: { targetLabel: string; targetKey: string; reason: string; policyName: string | null } | undefined;
 
   /** Marks this run terminal in both the live store and the persisted
    * session field, then returns `result` unchanged — the single exit point
@@ -605,6 +634,7 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
             finishedAt: Date.now(),
             toolCallCount: live.toolCallCount,
             usage: live.usage,
+            ...(routingSnapshot ? { routing: routingSnapshot } : {}),
           }
         : undefined,
     );
@@ -708,6 +738,12 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
     // already-running subagent partway through its own loop.
     const routed = resolveSubagentTarget(target, baseProfile);
     const resolvedTarget = routed.target;
+    routingSnapshot = {
+      targetLabel: describeUsageTarget(resolvedTarget).slice(0,180),
+      targetKey: costTargetKey(resolvedTarget).slice(0,180),
+      reason: routed.decision.reason.slice(0,500),
+      policyName: routed.decision.policyName?.slice(0,120) ?? null,
+    };
     // Onto the parent's run: a subagent has none of its own, and the decision
     // is about work the parent asked for.
     params.onRoutingDecision?.(routed.decision);

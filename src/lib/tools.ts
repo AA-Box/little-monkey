@@ -710,10 +710,88 @@ export const WORKFLOW_TOOL: ToolDef = {
   function: {
     name: 'workflow',
     description:
-      'Run a named, multi-phase orchestration of subagents. Phases run in order; the agents inside one phase run in parallel. Each later phase automatically receives the earlier phases\' reports appended to its prompts. Use this instead of plain task calls when the work has distinct stages (e.g. survey then verify, or explore then implement then review). Each agent is isolated: give every prompt full, self-contained context. Limits: at most 6 phases, 6 agents per phase, 16 agents total. To re-run a previously saved workflow, pass only {"saved": "<name>"} (see the "Saved workflows" section of the system prompt) and omit every other field.',
+      'Run a named, multi-phase orchestration of subagents. Phases run in order; the agents inside one phase run in parallel. Each later phase automatically receives the earlier phases\' reports appended to its prompts. Use this instead of plain task calls when the work has distinct stages (e.g. survey then verify, or explore then implement then review). For built-in multi-agent security reviews, pass {"preset":"security-red-team"} for a read-only 15-agent audit or {"preset":"security-audit-and-fix"} ONLY when the user explicitly requests code modifications; optional "scope" narrows the target. These presets reuse the same permission-gated workflow engine. For evidence-heavy reviews, optional "consensus":"strict" adds independent, source-attributed reviewer votes and explicitly reports disputes. Optional "notebook":true shares approved versioned project claims and stages new consensus claims for operator review without auto-promoting them. For arbitrary goals, use {"goal":"...","mode":"analyze"} to select specialist agents automatically, or mode "implement" ONLY when the user explicitly requests code changes. For explicit interdependent subtasks, pass name and tasks:[{id,description,prompt,profile,depends_on:[ids],peer?:alias}]. Peer execution is opt-in for read-only explore tasks, and requires an already paired and task-authorized peer; independent waves run in parallel, dependent waves wait, and failed prerequisites stop downstream work. For an explicitly named read-only phased agent, peerFailover:true with peerCandidates:[aliases] permits a single distinct correlation on another authorized peer ONLY after an independently verified terminal failure. Network uncertainty and cancellation never trigger failover. Optionally pass memory_stack_ids naming already-indexed Knowledge stacks for source-attributed shared retrieval. Optional peer_aliases:[alias] on a read-only goal analysis dispatches specialist discovery to operator-selected paired peers; never auto-select a peer or use for code changes. Alternatively use auto_peer_pool:[aliases] to choose a healthy recipient within that explicit list using observed task outcomes; this never widens access. Each agent is isolated: give every prompt full, self-contained context. Limits: at most 6 phases, 6 agents per phase, 16 agents total. To re-run a previously saved workflow, pass only {"saved": "<name>"} (see the "Saved workflows" section of the system prompt) and omit every other field.',
     parameters: {
       type: 'object',
       properties: {
+        tasks: {
+          type: 'array',
+          maxItems: 16,
+          description: 'Optional explicit dependency graph instead of phases or a goal. Give name, description and tasks; each task has a unique id and depends_on references. The compiler schedules independent waves (at most 6 phases / 6 agents per phase), stops on failed prerequisites, and uses ordinary agent permissions.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Unique lowercase kebab-case task id.' },
+              description: { type: 'string', description: 'Short label for this task.' },
+              prompt: { type: 'string', description: 'Complete, self-contained instructions.' },
+              profile: { type: 'string', description: 'explore, code, or an installed custom agent profile.' },
+              depends_on: { type: 'array', items: { type: 'string' }, description: 'IDs of tasks that must complete successfully first.' },
+              effort: { type: 'string', enum: ['low', 'medium', 'high'] },
+              isolation: { type: 'string', enum: ['worktree'] },
+              peer: { type: 'string', description: 'Optional paired Little Monkey peer alias for a read-only explore task. Requires explicit peer-task grant and the peer-task recipe; never selects remote workspace/permissions.' },
+            },
+            required: ['id', 'description', 'prompt'],
+            additionalProperties: false,
+          },
+        },
+        notebook: {
+          type: 'boolean',
+          description: 'Opt-in versioned per-project swarm notebook. Only operator-approved claims from earlier swarms enter this run as untrusted reference. With strict consensus, reviewer-agreed claims are staged as pending proposals; never auto-approved. Not forwarded to paired peers.',
+        },
+        authenticated_peer_voting: {
+          type: 'boolean',
+          description: 'Opt-in authenticated multi-peer reviewer voting. Requires consensus and two phases (reviewers then verification); every reviewer must have a distinct pinned paired peer, task grant, read-only explore profile, and no placement failover. Certificates and grants are revalidated before accepting any votes. This is model reviewer agreement, NOT distributed Raft/BFT consensus.',
+        },
+        consensus: {
+          type: 'string',
+          enum: ['strict','majority','supermajority','unanimous'],
+          description: 'Optional source-citing reviewer vote policy: strict two votes, majority (>1/2), supermajority (>=2/3), or unanimous. Non-strict goal swarms use five independent reviewers. Any explicit dissent remains disputed. Not Raft/BFT or factual verification.',
+        },
+        stop_on_failure: {
+          type: 'boolean',
+          description: 'Optional for explicit phases: stop before later phases when any agent fails. Always enabled for task dependency graphs and built-in implementation swarms.',
+        },
+        goal: {
+          type: 'string',
+          description: 'Optional user-provided objective for automatic domain-specific multi-agent orchestration. When set, omit preset, saved, name, description and phases.',
+        },
+        topology: {
+          type: 'string',
+          enum: ['phased', 'hierarchical', 'star', 'ring', 'mesh', 'adaptive'],
+          description: 'Read-only local team scheduling and source-labelled report relays. Ring and adaptive relay serially; star and hierarchy elect an initial coordinator; mesh uses independent simultaneous reports reconciled in later phases. Never apply to code agents or remote peer tasks.',
+        },
+        mode: {
+          type: 'string',
+          enum: ['analyze', 'implement'],
+          description: 'Only valid with goal. analyze (default) is read-only. implement may change code and run tests under ordinary permission gates: use ONLY when the user explicitly asks for implementation.',
+        },
+        auto_peer_pool: {
+          type: 'array',
+          items: { type: 'string' },
+          maxItems: 3,
+          description: 'Opt-in adaptive placement for read-only goal analysis only. Choose a pool of 1–3 already paired peer aliases. Before dispatch, ranks granted, non-offline peers by recent observed completion reliability and latency; never discovers or contacts a new peer. Reattaches to existing remote receipts before selecting a peer.',
+        },
+        peer_aliases: {
+          type: 'array',
+          items: { type: 'string' },
+          maxItems: 3,
+          description: 'Optional explicit list of up to three already-paired, task-granted Little Monkey peer aliases. Only with goal + analyze: specialist discovery tasks are assigned across the selected peers; all later verification remains local. Never selects peers automatically.',
+        },
+        memory_stack_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          maxItems: 5,
+          description: 'Optional explicit selection of existing, indexed Knowledge 2.0 stack IDs. Retrieves capped source-attributed snippets for all agents. Never silently select private indexes.',
+        },
+        preset: {
+          type: 'string',
+          enum: ['security-red-team', 'security-audit-and-fix', 'frontend-audit', 'backend-resilience', 'performance-budget', 'knowledge-evidence', 'integration-readiness', 'release-assurance'],
+          description: 'Optional built-in agent swarm. security-red-team is read-only and uses 15 specialist agents. security-audit-and-fix can edit code and run tests behind regular permissions; choose it only after an explicit user request to apply fixes. When set, omit name, description, phases and saved.',
+        },
+        scope: {
+          type: 'string',
+          description: 'Optional one-line workspace/module/repository scope for a preset (maximum 300 characters). Only valid with goal or preset.',
+        },
         saved: {
           type: 'string',
           description: 'Name of a previously saved workflow to re-run. When set, omit "name"/"description"/"phases" — the saved spec is used as-is.',
@@ -763,6 +841,20 @@ export const WORKFLOW_TOOL: ToolDef = {
                       type: 'string',
                       enum: ['worktree'],
                       description: "Optional — same meaning as the task tool's isolation: run this (code-class) agent in its own git worktree so parallel agents never collide on files.",
+                    },
+                    peerCandidates: {
+                      type: 'array',
+                      items: { type: 'string' },
+                      maxItems: 3,
+                      description: 'Optional explicitly approved alternative aliases for this read-only peer task. Runtime reconnects to any prior receipt before selecting one healthy task-granted peer.',
+                    },
+                    peerFailover: {
+                      type: 'boolean',
+                      description: 'Optional TRUE only with 2–3 distinct explicitly approved peerCandidates and a read-only explore agent. Allows exactly ONE alternate peer after receiver-confirmed terminal failure of the original durable request. Never retries cancellations, missing network acknowledgements or uncertain delivery.',
+                    },
+                    peer: {
+                      type: 'string',
+                      description: 'Explicit paired peer alias (read-only explore agents only, no worktree). The remote peer applies its own task grants, recipe and permissions. No automatic remote placement.',
                     },
                   },
                   required: ['description', 'prompt', 'profile'],

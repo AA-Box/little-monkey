@@ -104,6 +104,11 @@ const CONTROLLER_CAPABILITIES = {
   peer_message: null,
   peer_task_request: null,
   peer_artifact: null,
+  // Peer vector-memory grants apply only to a separately paired installation
+  // with a namespace ACL and signed peer transport. A mobile controller's
+  // pairing MUST NOT acquire memory read/write endpoints or imply authority.
+  peer_memory_read: null,
+  peer_memory_write: null,
   admin: null,
 };
 

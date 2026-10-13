@@ -181,6 +181,60 @@ export const daemonStart = () => invoke<string>("daemon_desktop_start");
 export const daemonStop = () => invoke<string>("daemon_desktop_stop");
 export const daemonUninstall = (purgeState = false) => invoke<string>("daemon_desktop_uninstall", { purgeState });
 export const daemonQueue = (request: DaemonQueueRequest) => invoke<Record<string, unknown>>("daemon_desktop_queue", { request });
+/** Resident swarm graphs run in the existing daemon's durable job queue.
+ * Every node executes an operator-selected immutable local recipe. */
+export interface ResidentSwarmGraphStatus {
+  id: string;
+  state: 'running' | 'failing' | 'cancelling' | 'succeeded' | 'failed' | 'cancelled';
+  created_at_ms: number;
+  updated_at_ms: number;
+  tasks: { id: string; state: string; job_id: string | null; error: string | null }[];
+  /** Durable ordered SQLite graph/node transitions; no agent report bodies. */
+  events?: {
+    sequence: number; node_id: string | null; kind: string;
+    previous_state: string | null; state: string; job_id: string | null;
+    occurred_at_ms: number;
+  }[];
+}
+export const daemonSwarmSubmit = (specPath: string) =>
+  invoke<{ id: string; state: string; nodes: number }>("daemon_swarm_submit", { specPath });
+export const daemonSwarmStatus = (id: string | null = null) =>
+  invoke<{ graphs: ResidentSwarmGraphStatus[] }>("daemon_swarm_status", { id });
+/** Remote state is signed-peer evidence only, not an executed local graph. */
+export interface DaemonSwarmReplica {
+  version:number;group:string;graph_id:string;source_fingerprint:string;
+  roster_sha256:string;sequence:number;term:number;captured_at_ms:number;
+  graph_state:string;nodes:{id:string;state:string;job_id:string|null}[];
+  checksum:string;
+}
+export const daemonSwarmReplicaStatus = (group:string,id:string) =>
+  invoke<{group:string;graph:string;replicas:DaemonSwarmReplica[];trusted_for_execution:false}>(
+    'daemon_swarm_replica_status',{group,id});
+
+export const daemonSwarmCancel = (id: string) =>
+  invoke<string>("daemon_swarm_cancel", { id });
+
+/** Actual local membership and signed multi-installation quorum status. */
+export interface DaemonClusterStatus {
+  group:string;
+  roster_sha256:string;
+  configured_members:number;
+  local_fingerprint:string;
+  lease:{term:number;leader:string;expires_at_ms:number;active:boolean}|null;
+  may_schedule:boolean;
+}
+export interface DaemonClusterElection {
+  status:'elected';cluster:string;term:number;leader:string;
+  quorum:number;members:number;expires_at_ms:number;
+}
+export const daemonClusterSetup=(rosterPath:string)=>
+  invoke<{cluster:string;members:number;roster_sha256:string;status:string}>(
+    "daemon_cluster_setup",{rosterPath});
+export const daemonClusterStatus=(group:string)=>
+  invoke<DaemonClusterStatus>("daemon_cluster_status",{group});
+export const daemonClusterElect=(group:string)=>
+  invoke<DaemonClusterElection>("daemon_cluster_elect",{group});
+
 export const daemonPause = (runId: string) => invoke<string>("daemon_desktop_pause", { runId });
 export const daemonResume = (runId: string) => invoke<string>("daemon_desktop_resume", { runId });
 export const daemonCancel = (runId: string, reason?: string) => invoke<string>("daemon_desktop_cancel", { runId, reason: reason ?? null });

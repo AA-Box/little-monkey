@@ -26,6 +26,8 @@ use walkdir::WalkDir;
 
 use crate::egress::{EgressDenial, EgressRule};
 
+mod hnsw;
+
 pub const KNOWLEDGE_PIPELINE_SCHEMA_VERSION: u32 = 1;
 pub const CONNECTOR_CONTRACT_VERSION: u32 = 1;
 pub const EXTRACTOR_CONTRACT_VERSION: u32 = 1;
@@ -3457,6 +3459,11 @@ impl HybridIndex {
                     params![chunk.chunk_id, chunk.text, heading],
                 )?;
             }
+            // The graph is frozen with the same immutable chunk/vector
+            // transaction. Old/small generations continue exact retrieval.
+            if embedding_spec.normalized {
+                hnsw::build(&transaction,chunks,&normalized_vectors,cancel)?;
+            }
             check_cancelled(cancel)?;
             transaction.commit()?;
         }
@@ -3516,6 +3523,7 @@ impl HybridIndex {
                 ));
             }
             verify_fts_mirror(&connection)?;
+            hnsw::validate(&connection)?;
             remember_validated(identity, index_digest.clone());
         }
         Ok(Self {
@@ -3977,6 +3985,12 @@ fn vector_candidates_filtered(
     excluded_source_ids: &BTreeSet<String>,
     cancel: &CancellationToken,
 ) -> PipelineResult<Vec<(String, f32)>> {
+    // Persisted, tamper-checked graph search for large new generations.
+    // Exact scan remains authoritative for old and small indexes, or broad
+    // exclusions where ANN candidate recall cannot be guaranteed.
+    if let Some(candidates)=hnsw::query(connection,query,dimension,limit,excluded_source_ids,cancel)?{
+        return Ok(candidates);
+    }
     if excluded_source_ids.is_empty() {
         return vector_candidates(connection, query, dimension, limit, cancel);
     }
@@ -6796,5 +6810,64 @@ mod tests {
             reranked < Duration::from_millis(1_500),
             "top-30 to top-8 reranking was {reranked:?}"
         );
+    }
+    #[test]
+    fn actual_persisted_hnsw_retrieval_survives_reopen_and_rejects_graph_tampering(){
+        let directory=TestDirectory::new("native-hnsw-persistent");
+        let file=directory.path().join("index.sqlite3");
+        let mut chunks=Vec::new();
+        let mut vectors=Vec::new();
+        for i in 0..768_u32 {
+            let text=format!("HNSW persistence fixture vector {i}");
+            let text_sha256=sha256_bytes(text.as_bytes());
+            let chunk_id=sha256_bytes(format!("ann-fixture-{i}").as_bytes());
+            let object_id=format!("object:ann:{i}");
+            let location=DocumentLocation::Text {
+                line_start:1,line_end:1,char_start:0,char_end:text.len() as u64,
+            };
+            chunks.push(KnowledgeChunk {
+                chunk_id:chunk_id.clone(),source_id:"source:ann".into(),
+                object_id:object_id.clone(),
+                object_content_sha256:text_sha256.clone(),
+                text_sha256,text:text.clone(),
+                heading_path:vec!["Graph fixture".into()],
+                location:location.clone(),
+                block_char_start:0,block_char_end:text.len() as u64,
+                citation:Citation {
+                    citation_id:sha256_bytes(format!("ann-citation-{i}").as_bytes()),
+                    source_id:"source:ann".into(),object_id,
+                    canonical_uri:format!("fixture://ann/{i}"),
+                    location,block_char_start:0,block_char_end:text.len() as u64,
+                },
+                content_role:ContentRole::RetrievedData,
+                content_type:"text".into(),
+                confidence_micros:None,low_confidence:false,
+            });
+            let angle=(i as f32)*std::f32::consts::TAU/768.0;
+            vectors.push(vec![angle.cos(),angle.sin()]);
+        }
+        let index=HybridIndex::create(
+            &file,"generation:hnsw-real-v1",&chunks,&vectors,
+            &embedding_spec(),&CancellationToken::new()
+        ).expect("immutable HNSW index persists");
+        let reopened=HybridIndex::open(&file).expect("HNSW digest verifies after reopen");
+        assert_eq!(reopened.index_digest(),index.index_digest());
+        let conn=Connection::open(&file).unwrap();
+        let found=super::hnsw::query(
+            &conn,&[1.0,0.0],2,10,&BTreeSet::new(),&CancellationToken::new()
+        ).unwrap().expect("large generation must have persisted HNSW");
+        assert_eq!(found.len(),10);
+        assert!(found[0].1>0.99,"ANN must find a near-exact source vector");
+        drop(conn);
+        {
+            let changed=Connection::open(&file).unwrap();
+            changed.execute(
+                "UPDATE hnsw_nodes SET links_json='[]' WHERE chunk_id=?1",
+                [&found[0].0],
+            ).unwrap();
+        }
+        forget_validated_indexes();
+        assert!(HybridIndex::open(&file).is_err(),
+            "tampered graph must not bypass content/edge integrity checks");
     }
 }

@@ -259,3 +259,44 @@ describe("deviceActionAvailable", () => {
     expect(deviceActionAvailable()).toBe(false);
   });
 });
+
+describe("signed cluster native operator bridge", () => {
+  beforeEach(() => invokeMock.mockReset());
+
+  it("enrolls only an explicit, operator-selected local roster path", async () => {
+    invokeMock.mockResolvedValueOnce({
+      cluster:"research-cluster",members:3,roster_sha256:"a".repeat(64),
+      status:"configured_not_elected",
+    });
+    const {daemonClusterSetup}=await import("./daemonClient");
+    const receipt=await daemonClusterSetup("/operator/reviewed-roster.json");
+    expect(receipt.status).toBe("configured_not_elected");
+    expect(invokeMock).toHaveBeenCalledExactlyOnceWith(
+      "daemon_cluster_setup",{rosterPath:"/operator/reviewed-roster.json"});
+  });
+
+  it("reads independently persisted lease state instead of inferring leadership",async()=>{
+    invokeMock.mockResolvedValueOnce({
+      group:"research-cluster",roster_sha256:"a".repeat(64),
+      configured_members:3,local_fingerprint:"b".repeat(64),
+      lease:{term:2,leader:"a".repeat(64),expires_at_ms:10000,active:false},
+      may_schedule:false,
+    });
+    const {daemonClusterStatus}=await import("./daemonClient");
+    const status=await daemonClusterStatus("research-cluster");
+    expect(status.may_schedule).toBe(false);
+    expect(invokeMock).toHaveBeenCalledExactlyOnceWith(
+      "daemon_cluster_status",{group:"research-cluster"});
+  });
+
+  it("delegates real signed voting exclusively to the native daemon protocol",async()=>{
+    invokeMock.mockResolvedValueOnce({
+      status:"elected",cluster:"research-cluster",term:4,
+      leader:"a".repeat(64),quorum:2,members:3,expires_at_ms:30000,
+    });
+    const {daemonClusterElect}=await import("./daemonClient");
+    expect((await daemonClusterElect("research-cluster")).quorum).toBe(2);
+    expect(invokeMock).toHaveBeenCalledExactlyOnceWith(
+      "daemon_cluster_elect",{group:"research-cluster"});
+  });
+});

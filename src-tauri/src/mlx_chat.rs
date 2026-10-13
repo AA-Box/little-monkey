@@ -723,3 +723,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+
+/// Real model-inference canary, not merely HTTP health, restricted to the
+/// runtime's exact currently loaded MLX model and a bounded loopback response.
+/// This gate is operator-initiated after verified weight registration.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MlxCanaryEvidence {
+    pub model_path: String,
+    pub nonempty_output_chars: usize,
+}
+
+fn mlx_canary_output(response: &serde_json::Value) -> Result<usize, String> {
+    let content = response
+        .pointer("/choices/0/message/content")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "MLX canary response has no real assistant text".to_string())?;
+    let count = content.trim().chars().count();
+    if count == 0 || count > 16_384 {
+        return Err("MLX canary response is empty or unbounded".into());
+    }
+    Ok(count)
+}
+
+#[tauri::command]
+pub async fn mlx_chat_canary(
+    state: tauri::State<'_, crate::AppState>,
+    expected_model_path: String,
+) -> Result<MlxCanaryEvidence, String> {
+    let status = state.mlx_chat.status();
+    let expected = std::path::Path::new(&expected_model_path).canonicalize()
+        .map_err(|_| "Expected MLX model path no longer exists")?;
+    let serving = std::path::Path::new(&status.model_path).canonicalize()
+        .map_err(|_| "Running MLX model path is unavailable")?;
+    if !status.running || status.port == 0 || expected != serving {
+        return Err("MLX canary refuses a different or stopped model".into());
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(90))
+        .build()
+        .map_err(|_| "Cannot create local-only MLX canary client")?;
+    let endpoint = format!("http://127.0.0.1:{}/v1/chat/completions", status.port);
+    let mut response = client.post(endpoint)
+        .json(&serde_json::json!({
+            "model": status.model_id,
+            "stream": false,
+            "max_tokens": 48,
+            "temperature": 0,
+            "messages": [{"role":"user","content":"Reply in one short sentence that you are ready."}],
+        }))
+        .send().await.map_err(|_| "Running MLX candidate did not answer inference")?;
+    if !response.status().is_success() {
+        return Err("Running MLX candidate rejected real chat inference".into());
+    }
+    let mut received = Vec::new();
+    while let Some(chunk) = response.chunk().await
+        .map_err(|_| "Cannot read MLX candidate inference output")? {
+        if received.len() + chunk.len() > 128 * 1024 {
+            return Err("MLX candidate response exceeded 128 KiB".into());
+        }
+        received.extend_from_slice(&chunk);
+    }
+    let result: serde_json::Value = serde_json::from_slice(&received)
+        .map_err(|_| "MLX canary returned malformed inference JSON")?;
+    let count = mlx_canary_output(&result)?;
+    let after = state.mlx_chat.status();
+    if !after.running || after.port != status.port || after.model_path != status.model_path {
+        return Err("MLX model changed during canary inference".into());
+    }
+    Ok(MlxCanaryEvidence {
+        model_path: after.model_path,
+        nonempty_output_chars: count,
+    })
+}
+
+#[cfg(test)]
+mod mlx_canary_gate_tests {
+    use super::*;
+    #[test]
+    fn only_real_nonempty_assistant_text_satisfies_inference_gate() {
+        let valid = serde_json::json!({"choices":[{"message":{"role":"assistant","content":"Ready for tasks."}}]});
+        assert_eq!(mlx_canary_output(&valid).unwrap(), 16);
+        for bad in [
+            serde_json::json!({"choices":[]}),
+            serde_json::json!({"choices":[{"message":{"content":""}}]}),
+            serde_json::json!({"choices":[{"message":{"content":"   "}}]}),
+            serde_json::json!({"error":"model failed"}),
+        ] {
+            assert!(mlx_canary_output(&bad).is_err());
+        }
+    }
+}
