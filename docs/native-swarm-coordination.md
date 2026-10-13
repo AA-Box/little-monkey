@@ -605,3 +605,75 @@ peer-election CLI through a fixed Tauri command and then rereads
 start previously operator-approved read-only resident graph tasks. The
 same bounds, pinned identities and native rejection policies apply
 whether run through the GUI or CLI.
+
+## Cross-host resident DAG telemetry (v2 checkpoints)
+
+Leader-owned resident graphs now publish up to 48 original SQLite
+`resident_swarm_events` transitions with each monotonic v2 signed checkpoint.
+Each transition includes its author-local event cursor, graph/node scope, event
+kind, state and original timestamp. The full v2 payload is checksummed, carried
+over existing operator-enrolled pinned-TLS/HMAC peer transport, persisted on
+the receiving host and checked by a second signed GET of the receiver's durable
+copy. v1 peers are still readable, but report only checkpoint snapshots and
+cannot claim historical spans. No prompts, arbitrary tool text, agent reports,
+workspace paths or secrets enter these events. The receiver must never use
+remote success states as permission to execute or model-answer verification.
+
+The UI's combined trace orders local durable transitions and remote original
+event timestamps. It separates signed peer evidence from local journal events,
+labels legacy snapshot-only senders, rejects malformed journal cursors and
+explicitly marks all remote success claims as **unverified execution**.
+
+### Physical two-machine acceptance
+
+Install the reviewed revision on two independently running machines. Pair them,
+enroll their pinned identities in the same cluster, permit only the documented
+task/state replication capabilities, and stage a read-only resident DAG with at
+least one actual node transition on leader A.
+
+On **leader A**:
+
+```bash
+pnpm test:swarm-telemetry:contract
+pnpm test:swarm-telemetry:live -- --stage publish --group GROUP --graph GRAPH \
+  --peer RECEIVER_ALIAS --confirm-independent-installed-peers
+```
+
+On **receiver B** (use A's *actual* enrolled SHA-256 certificate fingerprint):
+
+```bash
+pnpm test:swarm-telemetry:live -- --stage verify --group GROUP --graph GRAPH \
+  --source-fingerprint SOURCE_A_FINGERPRINT --confirm-independent-installed-peers
+```
+
+The publish phase must pass an independent signed SQLite readback on B;
+verify runs on B itself, confirming source identity, a fresh v2 checkpoint,
+chronological original events and a real node state transition. Repeat with
+the two machines' roles swapped and archive separate command outputs before
+claiming physical two-way acceptance. A single machine, mocked loopback peer
+or passing contract suite is not that evidence. Absence of a real peer, stale
+events, or missing runtime commands must fail the live script.
+
+### Event-driven real-run cost optimization
+
+Cost routing remains off by default and requires the existing independent
+real-model fixture grades, explicit model rates and *observed* workload tokens.
+It now also consumes real resolved subagent terminal events (success/failure and
+wall-clock elapsed time), retained locally for 14 days, never peer assertions.
+Six baseline task outcomes are required before replacing any traffic.
+An equivalently graded cheaper candidate receives a 10% canary until it has
+six actual outcomes, then a 30% ramp until 12, then full routing only while
+the live circuit breaker permits it. A material excess failure rate, two of
+three recent errors, or a measured severe p90 latency regression blocks new
+cost-driven selection immediately. Each dispatch re-evaluates the gate from
+durable observations. The regular policy eligibility, explicit pins, privacy
+firewall, independent fixture-quality requirements and operator opt-in remain
+authoritative.
+
+**Scope:** Task terminal success is *not* objective answer quality. Token-rate
+savings are forecasts, not audited provider bills. This implementation does
+not assert complete model-level traces across arbitrary remote peer-task calls,
+globally synchronized telemetry retention, independent deployed-model grade
+collection, or statistically controlled production quality/cost A/B trials.
+Those require separate physical acceptance and instrumentation. No live
+two-device results are asserted by repository unit tests.
