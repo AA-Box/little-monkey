@@ -123,6 +123,11 @@ fn build_graph(chunks:&[KnowledgeChunk],vectors:&[Vec<f32>],
     }
     Ok((top,top_layer,points))
 }
+// Check the ENTIRE corpus, not just an initial prefix. A run of 512
+// identical values followed by diverse embeddings still needs acceleration.
+fn uniformly_embedded(vectors:&[Vec<f32>])->bool{
+    vectors.first().is_some_and(|first|vectors.iter().all(|v|v==first))
+}
 /// Called after the vectors have been checked and inserted, inside the
 /// generation's existing immutable SQLite transaction.
 pub(super) fn build(tx:&Transaction<'_>,chunks:&[KnowledgeChunk],
@@ -131,9 +136,7 @@ pub(super) fn build(tx:&Transaction<'_>,chunks:&[KnowledgeChunk],
     // A legitimate corpus may contain tens of thousands of identical
     // embeddings (the existing 50k retrieval benchmark does). HNSW cannot
     // improve ties and building it adds no recall; keep exact ranking.
-    if vectors.iter().all(|v|v==&vectors[0]){
-        return Ok(());
-    }
+    if uniformly_embedded(vectors){return Ok(());}
     let (top,layer,points)=build_graph(chunks,vectors,cancel)?;
     tx.execute_batch("CREATE TABLE hnsw_nodes(
         chunk_id TEXT PRIMARY KEY NOT NULL,
@@ -182,6 +185,29 @@ pub(super) fn validate(conn:&Connection)->PipelineResult<()>{
         |r|r.get(0))?;
     if version!="1" {
         return Err(PipelineError::InvalidIndex("Unsupported HNSW generation version".into()));
+    }
+    // These controls are used before a single edge is traversed. Validate
+    // them on OPEN, not on first retrieval, so corrupt metadata cannot
+    // activate a generation whose graph is already unusable.
+    let entry:String=conn.query_row(
+        "SELECT value FROM metadata WHERE key='hnsw_entry'",[],|r|r.get(0))?;
+    let max_layer:String=conn.query_row(
+        "SELECT value FROM metadata WHERE key='hnsw_max_layer'",[],|r|r.get(0))?;
+    let max_layer=max_layer.parse::<usize>().map_err(|_|
+        PipelineError::InvalidIndex("Invalid HNSW maximum layer".into()))?;
+    if max_layer>MAX_LAYER{
+        return Err(PipelineError::InvalidIndex("HNSW maximum layer out of bounds".into()));
+    }
+    let entry_layer:Option<i64>=conn.query_row(
+        "SELECT layer FROM hnsw_nodes WHERE chunk_id=?1",[&entry],|r|r.get(0)
+    ).optional()?;
+    if entry_layer!=Some(max_layer as i64){
+        return Err(PipelineError::InvalidIndex("HNSW entry is missing or has wrong layer".into()));
+    }
+    let actual_max:Option<i64>=conn.query_row(
+        "SELECT MAX(layer) FROM hnsw_nodes",[],|r|r.get(0))?;
+    if actual_max!=Some(max_layer as i64){
+        return Err(PipelineError::InvalidIndex("HNSW graph layer metadata mismatch".into()));
     }
     let mut digest=Sha256::new();
     let mut stmt=conn.prepare(
@@ -342,6 +368,13 @@ mod tests{
         assert_eq!(best_first(vec![(4,0.5),(2,0.9),(7,0.1)],2),
             vec![(2,0.9),(4,0.5)]);
         assert_eq!(similarity(&[1.0,0.0],&[0.0,1.0]),0.0);
+    }
+    #[test]
+    fn all_equal_requires_all_embeddings_not_only_first_512(){
+        let mut vectors=vec![vec![1.0,0.0];512];
+        assert!(uniformly_embedded(&vectors));
+        vectors.push(vec![0.0,1.0]);
+        assert!(!uniformly_embedded(&vectors));
     }
 }
 
