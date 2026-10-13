@@ -70,7 +70,7 @@ pub fn reassign_failed_primary(
         )]
     ).map_err(|error|error.to_string())?;
     if changed!=1{return Ok(false);}
-    tx.execute(
+    let recorded=tx.execute(
         "INSERT INTO resident_swarm_task_reassignments
            (graph_id,node_id,attempts,previous_job_id,updated_at_ms)
          VALUES (?1,?2,?3,?4,?5)
@@ -81,6 +81,9 @@ pub fn reassign_failed_primary(
          WHERE resident_swarm_task_reassignments.attempts=?6",
         params![graph,node,previous+1,job,now,previous]
     ).map_err(|error|error.to_string())?;
+    if recorded!=1 {
+        return Err("Reassignment cursor CAS failed; refusing to dispatch".into());
+    }
     tx.commit().map_err(|error|error.to_string())?;
     Ok(true)
 }
@@ -140,6 +143,10 @@ mod tests {
         ).unwrap();
         job(&s,"job-second","running");
         assert!(!reassign_failed_primary(&mut s,"graph","scan","job-second",2002).unwrap());
+        // Even a wrongly delayed terminal success cannot win once its
+        // logical attempt has been superseded.
+        s.connection.execute("UPDATE daemon_jobs SET state='succeeded'
+            WHERE job_id='job-first'",[]).unwrap();
         assert!(!commit_current_success(&s,"graph","scan","job-first").unwrap());
         s.connection.execute("UPDATE daemon_jobs SET state='failed'
             WHERE job_id='job-second'",[]).unwrap();
@@ -178,4 +185,42 @@ mod tests {
             assert_eq!(count(&s,"graph","scan").unwrap(),0);
         }
     }
+    #[test]
+    fn retry_counter_and_single_winner_survive_a_real_sqlite_reopen(){
+        let root=std::env::temp_dir().join(format!(
+            "swarm-attempt-durability-{}",uuid::Uuid::new_v4()
+        ));
+        let paths=super::super::store::DaemonPaths::under(&root);
+        {
+            let mut s=DaemonStore::open(&paths).unwrap();
+            s.connection.execute_batch(
+                "CREATE TABLE resident_swarm_nodes (
+                   graph_id TEXT NOT NULL,node_id TEXT NOT NULL,
+                   state TEXT NOT NULL,job_id TEXT,error TEXT,
+                   PRIMARY KEY(graph_id,node_id)
+                 );
+                 INSERT INTO resident_swarm_nodes(graph_id,node_id,state,job_id)
+                   VALUES('graph','scan','submitted','job-first');"
+            ).unwrap();
+            job(&s,"job-first","failed");
+            assert!(reassign_failed_primary(
+                &mut s,"graph","scan","job-first",2000
+            ).unwrap());
+        }
+        {
+            let s=DaemonStore::open(&paths).unwrap();
+            assert_eq!(count(&s,"graph","scan").unwrap(),1);
+            s.connection.execute(
+                "UPDATE resident_swarm_nodes
+                 SET state='submitted',job_id='job-second'
+                 WHERE graph_id='graph' AND node_id='scan'",[]
+            ).unwrap();
+            job(&s,"job-second","succeeded");
+            // The daemon must not accept a prior job as the winning result.
+            assert!(!commit_current_success(&s,"graph","scan","job-first").unwrap());
+            assert!(commit_current_success(&s,"graph","scan","job-second").unwrap());
+        }
+        let _=std::fs::remove_dir_all(root);
+    }
+
 }
