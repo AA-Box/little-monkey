@@ -15,7 +15,7 @@ const prices={
  'provider:weak':{inputPerMillionUsd:0.01,outputPerMillionUsd:0.01},
 };
 const entries:Array<CostUsageEntry>=Array.from({length:4},(_,i)=>({
- id:'sample'+i,occurredAtMs:i,targetKey:'provider:high',
+ id:'sample'+i,occurredAtMs:Date.now()-i*1000,targetKey:'provider:high',
  targetLabel:'high',sessionId:'s',runId:null,
  usage:{promptTokens:800,completionTokens:200,totalTokens:1000},
  costUsd:null,
@@ -46,6 +46,14 @@ describe('operator opt-in bounded quality/cost optimization',()=>{
   expect(result.sequence).toEqual(['provider:high','provider:weak']);
   expect(optimizeSwarmRoutingCosts(['provider:high','provider:unknown'],ranking,prices,entries,true).changed).toBe(false);
   expect(optimizeSwarmRoutingCosts(['provider:high','provider:cheap','provider:cheap'],ranking,prices,entries,true).changed).toBe(false);
+ });
+ it('ignores old, future and forged usage instead of treating it as current spend',()=>{
+  const stale=entries.map(row=>({...row,occurredAtMs:Date.now()-30*24*60*60_000}));
+  expect(optimizeSwarmRoutingCosts(keys,ranking,prices,stale,true).changed).toBe(false);
+  const future=entries.map(row=>({...row,occurredAtMs:Date.now()+20*60_000}));
+  expect(optimizeSwarmRoutingCosts(keys,ranking,prices,future,true).changed).toBe(false);
+  const invalid=entries.map(row=>({...row,occurredAtMs:NaN}));
+  expect(optimizeSwarmRoutingCosts(keys,ranking,prices,invalid,true).changed).toBe(false);
  });
  it('does not switch on minor savings or invalid prices',()=>{
   const close={...prices,'provider:cheap':{inputPerMillionUsd:5.9,outputPerMillionUsd:19.8}};
