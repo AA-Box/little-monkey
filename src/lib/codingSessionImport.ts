@@ -179,7 +179,7 @@ export async function importCodingSessionFiles(): Promise<number> {
     if (bytes.length > MAX_BYTES) throw new Error("Coding session exceeds 32 MiB limit");
     const transcript = parseCodingSession(new TextDecoder("utf-8",{fatal:true}).decode(bytes));
     if (!transcript) throw new Error("Unsupported or empty coding session: " + path.split(/[/\\]/).pop());
-    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256",bytes));
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256",new Uint8Array(bytes).buffer));
     const hash = Array.from(digest,b=>b.toString(16).padStart(2,"0")).join("");
     candidates.push(toNative(transcript,"coding-import-"+transcript.format+"-"+hash));
   }
