@@ -1969,6 +1969,7 @@ pub fn run() {
             daemon_commands::daemon_desktop_uninstall,
             daemon_commands::daemon_desktop_queue,
             daemon_commands::daemon_swarm_submit,
+            daemon_commands::daemon_swarm_replica_status,
             daemon_commands::daemon_swarm_status,
             daemon_commands::daemon_cluster_setup,
             daemon_commands::daemon_cluster_status,
