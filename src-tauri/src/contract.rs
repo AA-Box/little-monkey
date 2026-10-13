@@ -45,7 +45,7 @@ use crate::http_route_registry::{
 /// * **minor**: anything additive — a new route, method, tool, or optional
 ///   parameter.
 /// * **patch**: descriptions and other non-structural wording.
-pub const CONTRACT_VERSION: &str = "2.2.0";
+pub const CONTRACT_VERSION: &str = "2.3.0";
 
 /// How long a surface stays after it is announced deprecated.
 ///
@@ -442,6 +442,29 @@ pub const REMOTE_ROUTES: &[RemoteRouteSpec] = &[
         plane: RemotePlane::Peer,
         method: "POST",
         path: "/v1/remote/peer/threads/{thread_id}/cancel",
+        gate: RemoteGate::Capability("PeerTaskRequest"),
+    },
+    // A task-granted paired peer may request an election vote, but the
+    // receiver separately validates its immutable cluster roster, term,
+    // candidate fingerprint and signed majority quorum before leasing.
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "POST",
+        path: "/v1/remote/peer/swarm-election/vote",
+        gate: RemoteGate::Capability("PeerTaskRequest"),
+    },
+    // A checkpoint is only an authenticated observation. It never grants
+    // execution authority or permission to import another host's jobs.
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "POST",
+        path: "/v1/remote/peer/swarm-state/checkpoints",
+        gate: RemoteGate::Capability("PeerTaskRequest"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "GET",
+        path: "/v1/remote/peer/swarm-state/{group}/{graph}",
         gate: RemoteGate::Capability("PeerTaskRequest"),
     },
     // Liveness and self-description in one call: a peer says who it is and
