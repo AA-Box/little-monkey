@@ -124,7 +124,51 @@ fn prepare_schema(store: &DaemonStore) -> Result<(), String> {
             FOREIGN KEY(graph_id) REFERENCES resident_swarm_graphs(graph_id)
         );
          CREATE INDEX IF NOT EXISTS idx_resident_swarm_graph_state
-           ON resident_swarm_graphs(state);"
+           ON resident_swarm_graphs(state);
+         CREATE TABLE IF NOT EXISTS resident_swarm_events (
+           event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+           graph_id TEXT NOT NULL,
+           node_id TEXT,
+           event_kind TEXT NOT NULL,
+           previous_state TEXT,
+           next_state TEXT NOT NULL,
+           job_id TEXT,
+           occurred_at_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_resident_swarm_events_graph
+           ON resident_swarm_events(graph_id,event_id);
+         CREATE TRIGGER IF NOT EXISTS resident_swarm_graph_created
+         AFTER INSERT ON resident_swarm_graphs
+         BEGIN
+           INSERT INTO resident_swarm_events
+             (graph_id,node_id,event_kind,previous_state,next_state,job_id,occurred_at_ms)
+           VALUES (NEW.graph_id,NULL,'graph_created',NULL,NEW.state,NULL,NEW.created_at_ms);
+         END;
+         CREATE TRIGGER IF NOT EXISTS resident_swarm_graph_transition
+         AFTER UPDATE OF state ON resident_swarm_graphs
+         WHEN OLD.state IS NOT NEW.state
+         BEGIN
+           INSERT INTO resident_swarm_events
+             (graph_id,node_id,event_kind,previous_state,next_state,job_id,occurred_at_ms)
+           VALUES (NEW.graph_id,NULL,'graph_transition',OLD.state,NEW.state,NULL,NEW.updated_at_ms);
+         END;
+         CREATE TRIGGER IF NOT EXISTS resident_swarm_node_created
+         AFTER INSERT ON resident_swarm_nodes
+         BEGIN
+           INSERT INTO resident_swarm_events
+             (graph_id,node_id,event_kind,previous_state,next_state,job_id,occurred_at_ms)
+           VALUES (NEW.graph_id,NEW.node_id,'node_created',NULL,NEW.state,NEW.job_id,
+             CAST(strftime('%s','now') AS INTEGER)*1000);
+         END;
+         CREATE TRIGGER IF NOT EXISTS resident_swarm_node_transition
+         AFTER UPDATE OF state,job_id ON resident_swarm_nodes
+         WHEN OLD.state IS NOT NEW.state OR OLD.job_id IS NOT NEW.job_id
+         BEGIN
+           INSERT INTO resident_swarm_events
+             (graph_id,node_id,event_kind,previous_state,next_state,job_id,occurred_at_ms)
+           VALUES (NEW.graph_id,NEW.node_id,'node_transition',OLD.state,NEW.state,NEW.job_id,
+             CAST(strftime('%s','now') AS INTEGER)*1000);
+         END;"
     ).map_err(|e| e.to_string())
 }
 
@@ -270,8 +314,27 @@ pub fn status(paths: &DaemonPaths, graph_id: Option<&str>) -> Result<serde_json:
         }))).map_err(|e| e.to_string())? {
             tasks.push(record.map_err(|e| e.to_string())?);
         }
+        // Read directly from the same SQLite database as graph/job writes.
+        // Triggers capture every transition, including status changes made by
+        // other CLI paths, without depending on an in-memory observer.
+        let mut event_stmt = store.connection.prepare(
+            "SELECT event_id,node_id,event_kind,previous_state,next_state,job_id,occurred_at_ms
+             FROM resident_swarm_events WHERE graph_id=?1
+             ORDER BY event_id DESC LIMIT 128"
+        ).map_err(|e|e.to_string())?;
+        let mut events=event_stmt.query_map([&id], |r|Ok(serde_json::json!({
+            "sequence":r.get::<_,i64>(0)?,
+            "node_id":r.get::<_,Option<String>>(1)?,
+            "kind":r.get::<_,String>(2)?,
+            "previous_state":r.get::<_,Option<String>>(3)?,
+            "state":r.get::<_,String>(4)?,
+            "job_id":r.get::<_,Option<String>>(5)?,
+            "occurred_at_ms":r.get::<_,i64>(6)?,
+        }))).map_err(|e|e.to_string())?
+            .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+        events.reverse();
         graphs.push(serde_json::json!({"id":id,"state":state,"created_at_ms":created,
-            "updated_at_ms":updated,"tasks":tasks}));
+            "updated_at_ms":updated,"tasks":tasks,"events":events}));
     }
     Ok(serde_json::json!({"graphs":graphs}))
 }
@@ -744,6 +807,13 @@ mod tests {
         let after_restart = status(&paths,Some("resumable-test")).unwrap();
         assert_eq!(after_restart["graphs"][0]["tasks"].as_array().unwrap().len(),2);
         assert_eq!(after_restart["graphs"][0]["state"],"running");
+        let initial_events=after_restart["graphs"][0]["events"].as_array().unwrap();
+        assert_eq!(initial_events.len(),3);
+        assert_eq!(initial_events[0]["kind"],"graph_created");
+        assert_eq!(initial_events[1]["kind"],"node_created");
+        assert_eq!(initial_events[2]["kind"],"node_created");
+        assert!(initial_events[0]["sequence"].as_i64().unwrap() <
+            initial_events[1]["sequence"].as_i64().unwrap());
         let frozen = paths.snapshots.join("resident-swarm-resumable-test-survey.json");
         assert!(frozen.is_file());
         assert!(paths.snapshots.join("resident-swarm-resumable-test-survey-fallback.json").is_file());
