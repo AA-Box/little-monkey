@@ -247,7 +247,8 @@ pub async fn campaign(paths:&DaemonPaths,group:&str,term:u64,now:i64)
         // This signs and validates the request using the existing peer
         // controller secret, authenticated sequence and pinned remote TLS cert.
         let bytes=serde_json::to_vec(&req).map_err(|e|e.to_string())?;
-        let response=super::remote::signed_swarm_vote(paths,alias,bytes,now as u64).await;
+        let response=super::remote::signed_swarm_vote(
+            paths,alias,&member.fingerprint,bytes,now as u64).await;
         let Ok(value)=response else{continue;};
         let Ok(reply)=serde_json::from_value::<VoteReceipt>(value) else{continue;};
         if reply.voter_fingerprint==member.fingerprint{receipts.push(reply);}
@@ -348,4 +349,24 @@ mod tests {
         remote.roster_sha256="0".repeat(64);
         assert!(persist_quorum(&store,&request,&[local,remote],1000).is_err());
     }
+}
+
+
+pub fn status(paths:&DaemonPaths,group:&str,now:i64)->Result<serde_json::Value,String>{
+    let store=DaemonStore::open(paths)?;
+    let config=roster(&store,group)?;
+    let lease=store.connection.query_row(
+        "SELECT term,leader,expires_at_ms FROM swarm_cluster_leases WHERE group_id=?1",
+        [group],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?))
+    ).optional().map_err(|e|e.to_string())?;
+    Ok(serde_json::json!({
+        "group":group,"roster_sha256":config.digest(),
+        "configured_members":config.members.len(),
+        "local_fingerprint":config.local().fingerprint,
+        "lease":lease.map(|(term,leader,expires)|serde_json::json!({
+            "term":term,"leader":leader,"expires_at_ms":expires,
+            "active":expires>now
+        })),
+        "may_schedule":may_schedule(&store,group,now)?,
+    }))
 }

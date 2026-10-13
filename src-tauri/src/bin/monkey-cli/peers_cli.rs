@@ -236,6 +236,22 @@ pub enum PeersCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Operator-owned, versioned static cluster membership with exact
+    /// incoming pairing IDs and pinned outbound certificate aliases.
+    ClusterSetup {
+        roster: PathBuf,
+    },
+    /// Request a real signed strict-majority leadership term; does not grant
+    /// any permissions or submit jobs.
+    ClusterElect {
+        group: String,
+        #[arg(long)]
+        term: Option<u64>,
+    },
+    /// Read this installation's durable election and quorum lease evidence.
+    ClusterStatus {
+        group: String,
+    },
     /// Clear one peer's traffic here. A revoked pairing also loses its retained
     /// peer grants, so it stops occupying the Peers screen.
     Clear {
@@ -330,6 +346,9 @@ pub async fn dispatch(command: &PeersCmd) -> Result<(), String> {
             request,
             json,
         } => status(alias, request, *json).await,
+        PeersCmd::ClusterSetup { roster } => cluster_setup(roster),
+        PeersCmd::ClusterElect { group,term } => cluster_elect(group,*term).await,
+        PeersCmd::ClusterStatus { group } => cluster_status(group),
         PeersCmd::Clear { device_id, json } => clear(device_id, *json),
         PeersCmd::Forget { alias } => forget(alias),
     }
@@ -1329,4 +1348,40 @@ mod tests {
             grants
         );
     }
+}
+
+
+fn cluster_setup(source:&std::path::Path)->Result<(),String>{
+    let meta=std::fs::symlink_metadata(source).map_err(|e|e.to_string())?;
+    if !meta.is_file()||meta.file_type().is_symlink()||meta.len()>16_384{
+        return Err("Cluster roster must be a regular local JSON file under 16 KiB".into());
+    }
+    let bytes=std::fs::read(source).map_err(|e|e.to_string())?;
+    let roster:crate::daemon::swarm_cluster::ClusterRoster=
+        serde_json::from_slice(&bytes).map_err(|e|e.to_string())?;
+    let paths=paths()?;
+    let mut store=DaemonStore::open(&paths)?;
+    let now=crate::daemon::remote::now_ms_public()? as i64;
+    crate::daemon::swarm_cluster::configure(&mut store,&roster,now)?;
+    println!("{}",serde_json::json!({"cluster":roster.group,
+        "members":roster.members.len(),"roster_sha256":roster.digest(),
+        "status":"configured_not_elected"}));
+    Ok(())
+}
+async fn cluster_elect(group:&str,term:Option<u64>)->Result<(),String>{
+    let paths=paths()?;
+    let store=DaemonStore::open(&paths)?;
+    let actual=term.unwrap_or(crate::daemon::swarm_cluster::next_term(&store,group)?);
+    drop(store);
+    let now=crate::daemon::remote::now_ms_public()? as i64;
+    let result=crate::daemon::swarm_cluster::campaign(&paths,group,actual,now).await?;
+    println!("{}",result);
+    Ok(())
+}
+fn cluster_status(group:&str)->Result<(),String>{
+    let paths=paths()?;
+    let result=crate::daemon::swarm_cluster::status(&paths,group,
+        crate::daemon::remote::now_ms_public()? as i64)?;
+    println!("{}",result);
+    Ok(())
 }

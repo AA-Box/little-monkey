@@ -2525,8 +2525,15 @@ fn now_ms() -> Result<u64, String> {
 /// A typed, signed and TLS-certificate-pinned vote request. Only the already
 /// approved outbound peer alias is allowed to choose the destination.
 pub(crate) async fn signed_swarm_vote(
-    paths: &DaemonPaths, alias: &str, body: Vec<u8>, now_ms: u64,
+    paths: &DaemonPaths, alias: &str, expected_server_sha256: &str,
+    body: Vec<u8>, now_ms: u64,
 ) -> Result<serde_json::Value,String> {
+    let store=RemoteStore::open(&paths.root)?;
+    let profile=store.controller(alias)?
+        .ok_or_else(||"Cluster voter is not an approved paired peer".to_string())?;
+    if profile.server_certificate_sha256!=expected_server_sha256 {
+        return Err("Cluster roster identity does not match actual pinned TLS peer".into());
+    }
     client::call(paths,alias,Method::POST,
         "/v1/remote/peer/swarm-election/vote",body,now_ms).await
 }
