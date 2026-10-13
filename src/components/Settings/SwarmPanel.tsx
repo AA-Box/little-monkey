@@ -45,6 +45,7 @@ import {
 } from '../../lib/swarmVerifiedBenchmarks';
 import { skillLearningClient } from '../../lib/skillLearningClient';
 import { setSwarmCostOptimization,swarmCostOptimizationEnabled } from '../../lib/swarmCostOptimizer';
+import { loadSwarmLiveOutcomes } from '../../lib/swarmLiveOptimizer';
 import { decideSwarmNote, listSwarmNotebook, revertSwarmNote } from '../../lib/swarmNotebook';
 import { approvedNotebookVectorClaim } from '../../lib/swarmNotebookVector';
 import { useSessionStore } from '../../store/sessionStore';
@@ -80,6 +81,7 @@ export function SwarmPanel() {
   const [benchmark, setBenchmark] = useState(() => loadSwarmBenchmark());
   const [benchmarkRouting, setBenchmarkRouting] = useState(() => swarmBenchmarkRoutingEnabled());
   const [costRouting, setCostRouting] = useState(() => swarmCostOptimizationEnabled());
+  const recentOperationalOutcomes=loadSwarmLiveOutcomes();
   const [specialistQuality, setSpecialistQuality] = useState(() => listVerifiedSpecialists());
   const [specialistQualityDomain, setSpecialistQualityDomain] = useState<VerifiedSpecialistDomain>('security');
   const [specialistQualityRouting, setSpecialistQualityRouting] = useState(() => verifiedSpecialistRoutingEnabled('security'));
@@ -787,8 +789,13 @@ export function SwarmPanel() {
                 setSwarmCostOptimization(event.target.checked);
                 setCostRouting(swarmCostOptimizationEnabled());
               }}/>
-            Additionally optimize price among independently graded, quality-equivalent, already eligible subagent targets. Requires six fixture observations per model, configured input/output rates, and at least three historical usage samples. Minimum 10% estimated rate savings; never overrides model pins, policy restrictions or privacy. This estimates token rates, not bills.
+            Additionally optimize price among independently graded, quality-equivalent, already eligible subagent targets. Requires six fixture observations per model, configured input/output rates, and at least three historical usage samples. Minimum 10% estimated rate savings; never overrides model pins, policy restrictions or privacy. After six real baseline completions, an eligible cheaper candidate starts at 10% canary, ramps to 30% with six recorded candidate outcomes, then to 100% with 12, unless the real-run failure/latency circuit breaker trips. Model completion is not answer correctness. This estimates token rates, not bills.
           </label>
+          <p className="mt-2 text-xs text-muted">Operational feedback (local and durable): {recentOperationalOutcomes.length} terminal model runs in the last 14 days. Continuous cost-routing safety decisions are made on each subagent dispatch; only an actual run can feed this count. This is not a verified answer-quality score.</p>
+          {benchmark.ranking.map(row=>{
+            const recent=recentOperationalOutcomes.filter(item=>item.target===row.target);
+            return <p key={row.target} className="mt-1 text-xs text-muted">{row.target}: {recent.length} observed · {recent.filter(item=>item.status==='error').length} failed · {recent.filter(item=>item.status==='done').length} finished</p>;
+          })}
         </>}
       </div>
       <div className="rounded-lg border border-border bg-surface p-3">
@@ -1118,10 +1125,10 @@ export function SwarmPanel() {
             </p>)}
             {distributedTrace && <details className="mt-2">
               <summary className="cursor-pointer">Combined local and peer trace · {distributedTrace.events.length} events</summary>
-              <p>Fresh peer checkpoints: {distributedTrace.freshPeers} · Stale: {distributedTrace.stalePeers} · Invalid: {distributedTrace.invalidPeerRecords}</p>
+              <p>Fresh peer checkpoints: {distributedTrace.freshPeers} · Stale: {distributedTrace.stalePeers} · Invalid: {distributedTrace.invalidPeerRecords} · Original remote journal events: {distributedTrace.historicalPeerEvents} · Legacy snapshot-only peers: {distributedTrace.legacySnapshotPeers}</p>
               <div className="max-h-60 space-y-1 overflow-auto" aria-label="Authenticated distributed DAG observations">
                 {distributedTrace.events.slice(-40).map((entry,index)=><p key={entry.source+':'+entry.sequence+':'+entry.node+':'+index}>
-                  {entry.source==='local-ledger'?'Local journal':'Signed peer report'} · {entry.node} · {entry.state} · #{entry.sequence}
+                  {entry.source==='local-ledger'?'Local journal':'Signed peer report'} · {entry.node} · {entry.kind} · {entry.state} · #{entry.sequence} · {new Date(entry.occurredAt).toLocaleString()}
                   {entry.term!==null?' · term '+entry.term:''}
                 </p>)}
               </div>
