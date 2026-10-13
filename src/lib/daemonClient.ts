@@ -210,7 +210,7 @@ export interface DaemonSwarmReplica {
   trace_events?:{sequence:number;node_id:string|null;kind:string;state:string;occurred_at_ms:number}[];
   /** v3: source-host terminal metered model usage from intact local run ledger.
    * Financial amounts are runtime-metered, NOT provider invoice reconciliation. */
-  model_usage?:{node_id:string;target_id:string;elapsed_ms:number;input_tokens:number;
+  model_usage?:{node_id:string;status:'succeeded'|'failed';target_id:string;elapsed_ms:number;input_tokens:number;
     output_tokens:number;cached_input_tokens:number;model_calls:number;cost_micros:number|null}[];
   checksum:string;
 }
