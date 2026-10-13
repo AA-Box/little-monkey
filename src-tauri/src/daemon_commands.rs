@@ -1188,6 +1188,17 @@ pub async fn daemon_cluster_elect(group: String) -> Result<Value,String> {
     parse_json(&command(vec!["peers".into(),"cluster-elect".into(),group]).await?)
 }
 
+/// Local operator can inspect bounded authenticated DAG observations, never
+/// use those observations to authorize execution or import credentials.
+#[tauri::command]
+pub async fn daemon_swarm_replica_status(group: String, id: String) -> Result<Value,String> {
+    validate_id("signed swarm group",&group)?;
+    validate_id("resident swarm graph",&id)?;
+    parse_json(&command(vec![
+        "daemon".into(),"swarm-replica-status".into(),group,id
+    ]).await?)
+}
+
 #[tauri::command]
 pub async fn daemon_swarm_cancel(id: String) -> Result<String, String> {
     validate_id("swarm graph id", &id)?;
