@@ -154,31 +154,44 @@ mod tests {
         assert_eq!(prepared,("preparing".into(),expected));
         assert!(!reassign_failed_primary(&mut s,"graph","scan","job-first",2001).unwrap());
         s.connection.execute(
-            "UPDATE resident_swarm_nodes SET state='submitted',job_id='job-second'
-             WHERE graph_id='graph' AND node_id='scan'",[]
+            "UPDATE resident_swarm_nodes SET state='submitted'
+             WHERE graph_id='graph' AND node_id='scan' AND job_id=?1",
+            [&expected]
         ).unwrap();
-        job(&s,"job-second","running");
-        assert!(!reassign_failed_primary(&mut s,"graph","scan","job-second",2002).unwrap());
+        job(&s,&expected,"running");
+        assert!(!reassign_failed_primary(&mut s,"graph","scan",&expected,2002).unwrap());
         // Even a wrongly delayed terminal success cannot win once its
         // logical attempt has been superseded.
         s.connection.execute("UPDATE daemon_jobs SET state='succeeded'
             WHERE job_id='job-first'",[]).unwrap();
         assert!(!commit_current_success(&s,"graph","scan","job-first").unwrap());
-        s.connection.execute("UPDATE daemon_jobs SET state='failed'
-            WHERE job_id='job-second'",[]).unwrap();
-        assert!(reassign_failed_primary(&mut s,"graph","scan","job-second",2003).unwrap());
-        assert_eq!(count(&s,"graph","scan").unwrap(),2);
         s.connection.execute(
-            "UPDATE resident_swarm_nodes SET state='submitted',job_id='job-third'
-             WHERE graph_id='graph' AND node_id='scan'",[]
+            "UPDATE daemon_jobs SET state='failed' WHERE job_id=?1",
+            [&expected]
         ).unwrap();
-        job(&s,"job-third","failed");
-        assert!(!reassign_failed_primary(&mut s,"graph","scan","job-third",2004).unwrap());
+        assert!(reassign_failed_primary(&mut s,"graph","scan",&expected,2003).unwrap());
+        assert_eq!(count(&s,"graph","scan").unwrap(),2);
+        let third=super::super::swarm_coordinator::stable_job_id(
+            "graph","scan:reassignment:2"
+        );
+        let prepared_again:(String,String)=s.connection.query_row(
+            "SELECT state,job_id FROM resident_swarm_nodes
+             WHERE graph_id='graph' AND node_id='scan'",
+            [],|r|Ok((r.get(0)?,r.get(1)?))
+        ).unwrap();
+        assert_eq!(prepared_again,("preparing".into(),third.clone()));
+        s.connection.execute(
+            "UPDATE resident_swarm_nodes SET state='submitted'
+             WHERE graph_id='graph' AND node_id='scan' AND job_id=?1",
+            [&third]
+        ).unwrap();
+        job(&s,&third,"failed");
+        assert!(!reassign_failed_primary(&mut s,"graph","scan",&third,2004).unwrap());
         let (cursor,job_id):(String,Option<String>)=s.connection.query_row(
             "SELECT state,job_id FROM resident_swarm_nodes WHERE graph_id='graph'",
             [],|r|Ok((r.get(0)?,r.get(1)?))
         ).unwrap();
-        assert_eq!((cursor.as_str(),job_id.as_deref()),("submitted",Some("job-third")));
+        assert_eq!((cursor.as_str(),job_id.as_deref()),("submitted",Some(third.as_str())));
     }
     #[test]
     fn only_current_durable_success_is_committed_and_uncertain_jobs_never_retry(){
@@ -226,15 +239,24 @@ mod tests {
         {
             let s=DaemonStore::open(&paths).unwrap();
             assert_eq!(count(&s,"graph","scan").unwrap(),1);
-            s.connection.execute(
-                "UPDATE resident_swarm_nodes
-                 SET state='submitted',job_id='job-second'
-                 WHERE graph_id='graph' AND node_id='scan'",[]
+            let next=super::super::swarm_coordinator::stable_job_id(
+                "graph","scan:reassignment:1"
+            );
+            let current:(String,String)=s.connection.query_row(
+                "SELECT state,job_id FROM resident_swarm_nodes
+                 WHERE graph_id='graph' AND node_id='scan'",
+                [],|r|Ok((r.get(0)?,r.get(1)?))
             ).unwrap();
-            job(&s,"job-second","succeeded");
+            assert_eq!(current,("preparing".to_owned(),next.clone()));
+            s.connection.execute(
+                "UPDATE resident_swarm_nodes SET state='submitted'
+                 WHERE graph_id='graph' AND node_id='scan' AND job_id=?1",
+                [&next]
+            ).unwrap();
+            job(&s,&next,"succeeded");
             // The daemon must not accept a prior job as the winning result.
             assert!(!commit_current_success(&s,"graph","scan","job-first").unwrap());
-            assert!(commit_current_success(&s,"graph","scan","job-second").unwrap());
+            assert!(commit_current_success(&s,"graph","scan",&next).unwrap());
         }
         let _=std::fs::remove_dir_all(root);
     }
