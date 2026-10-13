@@ -12,7 +12,7 @@ import {createServer,request as httpRequest} from 'node:http';
 import {connect as tcpConnect} from 'node:net';
 import {randomUUID,createHash} from 'node:crypto';
 import {readFileSync,writeFileSync,existsSync,readdirSync,openSync,closeSync,fsyncSync,
- renameSync,rmSync,mkdirSync,realpathSync,lstatSync} from 'node:fs';
+ renameSync,rmSync,mkdirSync,realpathSync,lstatSync,constants,fstatSync} from 'node:fs';
 import {join,dirname,resolve,isAbsolute} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {parseLearningPolicy} from './swarm-mlx-auto-learning.mjs';
@@ -23,10 +23,19 @@ const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
 const integer=(n,min,max)=>Number.isSafeInteger(n)&&n>=min&&n<=max;
 const fail=message=>{throw Error(message);};
 function readFile(path,max=512*1024){
- const st=lstatSync(path);
- if(st.isSymbolicLink()||!st.isFile()||st.size<1||st.size>max)
-  fail('Refusing missing, linked or oversized MLX evidence');
- return readFileSync(path,'utf8');
+ if(typeof constants.O_NOFOLLOW!=='number')fail('Platform lacks safe no-follow MLX receipt reads');
+ const fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW);
+ try{
+  const before=fstatSync(fd);
+  if(!before.isFile()||before.size<1||before.size>max)
+   fail('Refusing missing, linked or oversized MLX evidence');
+  const bytes=readFileSync(fd,'utf8');
+  const after=fstatSync(fd);
+  if(Buffer.byteLength(bytes)>max||after.size!==before.size||
+     after.ctimeMs!==before.ctimeMs||after.mtimeMs!==before.mtimeMs)
+   fail('MLX evidence changed during descriptor-bound read');
+  return bytes;
+ }finally{closeSync(fd);}
 }
 function checkedDir(path){
  if(typeof path!=='string'||!isAbsolute(path)||path.split(/[\\/]/).includes('..')||
