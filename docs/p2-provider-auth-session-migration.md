@@ -28,15 +28,21 @@ left in place on denial, timeout, state mismatch or failed exchange.
 
 ```shell
 monkey providers login openrouter
+# For SSH, containers, and remote/headless machines:
+monkey providers login openrouter --headless
 ```
 
 The CLI displays the authorization URL and tries to open a local browser on
 macOS/Linux. Open it on the **same machine** that is running the CLI and finish
 the flow. It stores the token from the CLI executable, avoiding macOS keychain
 access prompts when unattended CLI/daemon jobs read their own credentials.
-The CLI must have access to the OS keychain. For remote servers without a
-local browser, use `monkey providers set-key openrouter` with an authorized
-user-controlled API key (read from standard input, not shell arguments).
+The CLI must have access to the OS keychain. For remote SSH servers or containers, `--headless` generates an S256
+PKCE challenge without any loopback listener. Open the displayed OpenRouter
+URL on another device, approve access and paste the one-time code into the
+terminal. The authorization code is never passed as a command-line argument
+or saved to disk. The normal keychain must be accessible to the CLI. When
+OAuth is unavailable, use `monkey providers set-key openrouter` with an
+authorized user-controlled API key (read from standard input).
 
 OpenRouter's OAuth PKCE endpoint grants a **user-controlled API key**. It is
 not a free inference service and is subject to OpenRouter billing and policy.
@@ -82,7 +88,7 @@ cargo test --manifest-path src-tauri/Cargo.toml provider_oauth
 pnpm build
 ```
 
-Manual provider acceptance requires a real OpenRouter account: sign in, list
+Manual provider acceptance requires a real OpenRouter account: sign in from the desktop, test CLI localhost mode and CLI `--headless` through a remote/SSH session, list
 models, stream a completion, restart, and repeat using the saved key. Run the
 CLI path separately with a daemon using the same CLI-owned credential, and
 verify a revoked/invalid key is surfaced as an error rather than falsely
