@@ -16,22 +16,24 @@ import {benchmarkCycle,parsePolicy,dispatchRecipe} from './swarm-specialist-cont
 
 const fakeCli=String.raw`#!/usr/bin/env node
 import {readFileSync} from 'node:fs';
-import {basename,join} from 'node:path';
+import {join} from 'node:path';
 const argv=process.argv.slice(2);
-if(argv.includes('--no-mcp') && argv.includes('--no-rules')) argv.splice(0,2);
+const benchmark=argv.includes('--no-mcp') && argv.includes('--no-rules');
+if(benchmark)argv.splice(0,2);
 if(argv[0]!=='task'||argv[1]!=='run'||argv[3]!=='--json') process.exit(3);
 const recipe=JSON.parse(readFileSync(argv[2],'utf8'));
 if(recipe.version!==1||recipe.permission_mode==='bypass'||
    !recipe.target?.ollama||typeof recipe.workspace!=='string')process.exit(4);
+if(!benchmark){
+ if(!recipe.prompt.includes('Verified reviewer focus: ')||
+    !recipe.prompt.startsWith('Review my original task')||
+    recipe.system!=='Retain rules'||recipe.permission_mode!=='plan')process.exit(6);
+ console.log(JSON.stringify({status:'ok',run_id:'run-live-receipt-'+process.pid}));
+ process.exit(0);
+}
 const source=readFileSync(join(recipe.workspace,'src','module.mjs'),'utf8');
 const symbol=source.match(/export function ([A-Za-z0-9_]+)\(/)?.[1];
 if(!symbol)process.exit(5);
-let category='safe-control';
-for(const c of ['auth-bypass','code-injection','event-handler',
-  'accessibility-label','tenant-leak','timeout-budget','quadratic-scan',
-  'cache-recompute','configuration-flag','integration-contract']){
-  if(source.includes(c.replaceAll('-',''))) category=c;
-}
 // The oracle's fixture symbols are deliberately not the category strings.
 // Determine the category by inspecting the concrete function body, as a
 // deterministic stand-in for the model's actual source inspection.
@@ -42,7 +44,7 @@ const sourceDefect={
  inspectItems_:'quadratic-scan',cachedLookup_:'cache-recompute',
  parseFlag_:'configuration-flag',makePayload_:'integration-contract',
 };
-category=Object.entries(sourceDefect).find(([prefix])=>symbol.startsWith(prefix))?.[1]??'safe-control';
+const category=Object.entries(sourceDefect).find(([prefix])=>symbol.startsWith(prefix))?.[1]??'safe-control';
 const winner=process.env.LM_ACCEPT_WINNER??'trusted-a';
 const correct=recipe.target.ollama===winner;
 const message=correct
@@ -88,9 +90,8 @@ test('real subprocess integration: independent fixtures, quality-driven promotio
   process.env.LM_ACCEPT_WINNER='trusted-a';
   const third=benchmarkCycle(policy,{log:()=>{}});
   assert.equal(third.domains.security.active?.target,'ollama:trusted-a');
-  const evidence=readdirSync(directory).find(file=>file.endsWith('.json')&&
-    file.startsWith('evidence-security-')&&
-    readFileSync(join(directory,file),'utf8').includes('"target": "ollama:trusted-a"'));
+  const evidence=readdirSync(directory).find(file=>file.startsWith('evidence-security-')&&
+   file.includes(third.domains.security.active.reportSha256));
   // Evidence JSON is content-addressed. Tampering with it cannot change
   // the deployed routing, and dispatch must stop before invoking any model.
   assert.ok(evidence);
