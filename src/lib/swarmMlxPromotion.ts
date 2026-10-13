@@ -16,6 +16,7 @@ export interface PromotionRuntime {
  installed():ModelInfo[];
  active():ModelInfo|null;
  runningPath():string|null;
+ otherLocalRunning():boolean;
  activeProvider():string;
  start(model:ModelInfo):Promise<void>;
  stop():Promise<void>;
@@ -51,7 +52,10 @@ async function rollback(j:PromotionJournal,runtime:PromotionRuntime,storage:Prom
    :null;
  if(j.previousPath&&!previous)throw Error('Previous verified MLX model no longer registered; refusing unsafe fallback.');
  if(j.previousWasRunning&&previous)await runtime.start(previous);
- else {await runtime.stop();runtime.clearInactive(previous??null);}
+ else {
+  if(runtime.runningPath())await runtime.stop();
+  runtime.clearInactive(previous??null);
+ }
  storage.removeItem(MLX_PROMOTION_JOURNAL);
 }
 export async function recoverInterruptedMlxPromotion(runtime:PromotionRuntime,storage:PromotionStorage):Promise<boolean>{
@@ -72,6 +76,8 @@ export async function promoteVerifiedMlxFusion(
  if(runtime.activeProvider()!=='local')
    throw Error('Switch back to the local MLX provider before live deployment.');
  const prior=runtime.active();
+ if(runtime.otherLocalRunning() || (prior?.path && prior.runtime!=='mlx'))
+   throw Error('Stop the running non-MLX model and select a local MLX model (or no local model) before promotion.');
  const running=runtime.runningPath();
  if(running&&(!prior||prior.path!==running||prior.runtime!=='mlx'))
    throw Error('Running local model and selected model disagree; refusing promotion.');

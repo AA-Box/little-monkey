@@ -201,6 +201,10 @@ export function SwarmPanel() {
       installed:()=>useModelStore.getState().installed,
       active:()=>useModelStore.getState().active,
       activeProvider:()=>useModelStore.getState().activeProvider,
+      otherLocalRunning:()=>{
+        const st=useModelStore.getState();
+        return st.llamaStatus==='ready' && !st.mlxChat?.running;
+      },
       runningPath:()=>{
         const state=useModelStore.getState().mlxChat;
         return state?.running?state.modelPath:null;

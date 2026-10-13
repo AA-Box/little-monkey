@@ -15,6 +15,7 @@ beforeEach(()=>{
  runtime={
   installed:()=>[prev,candidate],active:()=>active,
   activeProvider:()=> 'local',runningPath:()=>running,
+  otherLocalRunning:()=>false,
   start:vi.fn(async m=>{active=m as typeof candidate;running=m.path;}),
   stop:vi.fn(async()=>{running=null;}),
   clearInactive:vi.fn(m=>{active=m as typeof candidate|null;}),
@@ -53,6 +54,23 @@ describe('verified MLX promotion and automatic live rollback',()=>{
   runtime.activeProvider=()=> 'provider';
   await expect(promoteVerifiedMlxFusion(candidate,runtime,storage)).rejects.toThrow(/local MLX/);
   expect(runtime.start).not.toHaveBeenCalled();
+ });
+ it('never replaces a running GGUF or silently destroys a prior non-MLX model',async()=>{
+  const gguf={...prev,id:'gguf',runtime:'llama'} as ModelInfo;
+  active=gguf;running=null;
+  runtime.otherLocalRunning=()=>true;
+  await expect(promoteVerifiedMlxFusion(candidate,runtime,storage)).rejects.toThrow(/Stop the running non-MLX/);
+  runtime.otherLocalRunning=()=>false;
+  await expect(promoteVerifiedMlxFusion(candidate,runtime,storage)).rejects.toThrow(/select a local MLX/);
+  expect(storage.getItem(MLX_PROMOTION_JOURNAL)).toBeNull();
+  expect(runtime.start).not.toHaveBeenCalled();
+ });
+ it('skips unnecessary MLX stop when previous model was already stopped',async()=>{
+  running=null;
+  runtime.probe=vi.fn(async()=>{throw Error('Model refused inference');});
+  await expect(promoteVerifiedMlxFusion(candidate,runtime,storage)).rejects.toThrow(/restored/);
+  expect(runtime.stop).toHaveBeenCalledTimes(1);
+  expect(active).toBe(prev);
  });
  it('refuses corrupted crash journal and keeps execution blocked',async()=>{
   map.set(MLX_PROMOTION_JOURNAL,'{');
