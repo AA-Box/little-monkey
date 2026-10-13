@@ -92,9 +92,14 @@ on:
         default: '30'
         type: string
       stress_concurrency:
-        description: Maximum concurrent sender publications during post-recovery stress (1..8)
+        description: Parallel checkpoint workers (one per separately preapproved graph; 1..8)
         required: false
-        default: '4'
+        default: '1'
+        type: string
+      stress_additional_graphs:
+        description: Optional comma-separated other preapproved read-only graph IDs for parallel stress
+        required: false
+        default: ''
         type: string
       fallback_graph_id:
         description: Optional already-running disposable resident graph whose primary read-only root was captured before failing
@@ -248,12 +253,17 @@ jobs:
           STRESS_GRAPH: ${{ inputs.replica_graph_id }}
           STRESS_ROUNDS: ${{ inputs.stress_rounds }}
           STRESS_CONCURRENCY: ${{ inputs.stress_concurrency }}
+          STRESS_ADDITIONAL_GRAPHS: ${{ inputs.stress_additional_graphs }}
         run: |
           set -euo pipefail
           test -n "$STRESS_GROUP" && test -n "$STRESS_GRAPH"
+          ADDITIONAL_GRAPHS=()
+          if [ -n "$STRESS_ADDITIONAL_GRAPHS" ]; then
+            ADDITIONAL_GRAPHS=(--additional-graphs "$STRESS_ADDITIONAL_GRAPHS")
+          fi
           node scripts/swarm-replica-stress-live-acceptance.mjs \
             --group "$STRESS_GROUP" --graph "$STRESS_GRAPH" --peer "$PEER_ALIAS" \
-            --rounds "$STRESS_ROUNDS" --concurrency "$STRESS_CONCURRENCY" \
+            --rounds "$STRESS_ROUNDS" --concurrency "$STRESS_CONCURRENCY" "${ADDITIONAL_GRAPHS[@]}" \
             --confirm-operator-owned-readonly-cluster \
             --confirm-independent-machines --confirm-post-recovery \
             > "$RUNNER_TEMP/native-swarm-replica-stress-acceptance.json"
