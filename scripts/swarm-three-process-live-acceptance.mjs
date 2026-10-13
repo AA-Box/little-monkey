@@ -74,6 +74,13 @@ async function main(){
     '-config',cfg,'-extensions','leaf','-keyout',key,'-out',cert],process.env,20000);
    const node={name,port:p,dir,child:null,env:{...process.env,HOME:home,
     XDG_DATA_HOME:data,XDG_CONFIG_HOME:join(dir,'config'),LITTLE_MONKEY_HOME:auth}};
+   // Different Linux HOME directories do not isolate the shared OS keyring
+   // service name. Use three actual first-party named profiles so each peer's
+   // signing credentials get a DISTINCT secure-store service namespace.
+   const profile=json(node,['profiles','create','CI disposable peer '+name,'--json']);
+   check(typeof profile.id==='string'&&profile.id!=='default',
+    'Could not create isolated native keychain profile');
+   node.env.LITTLE_MONKEY_PROFILE=profile.id;
    nodes.push(node);by[name]=node;
    run(node,['daemon','remote','host-configure','--listen','127.0.0.1:'+p,
     '--advertise-url','https://127.0.0.1:'+p,
