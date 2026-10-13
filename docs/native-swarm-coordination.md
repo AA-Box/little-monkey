@@ -606,7 +606,7 @@ start previously operator-approved read-only resident graph tasks. The
 same bounds, pinned identities and native rejection policies apply
 whether run through the GUI or CLI.
 
-## Cross-host resident DAG telemetry (v2 checkpoints)
+## Cross-host resident DAG telemetry (v2 DAG transitions, v3 metered inference)
 
 Leader-owned resident graphs now publish up to 48 original SQLite
 `resident_swarm_events` transitions with each monotonic v2 signed checkpoint.
@@ -618,6 +618,20 @@ copy. v1 peers are still readable, but report only checkpoint snapshots and
 cannot claim historical spans. No prompts, arbitrary tool text, agent reports,
 workspace paths or secrets enter these events. The receiver must never use
 remote success states as permission to execute or model-answer verification.
+
+When a resident node completes its actual local daemon run, the native
+publisher opens its canonical run ledger and requires a fully intact
+hash chain from sequence 1 through the terminal `Completed` event. An eligible
+v3 checkpoint includes redacted original-host metering by node: frozen model
+target ID, prompt/output/cache tokens, completed model-call count, task wall
+time and optional ledger `cost_micros`. Snapshots are versioned and the entire
+metering array is included in the v3 SHA-256 checksum, then delivered using
+the same authenticated sender identity, enrolled cluster roster, persistent
+receiver and exact signed TLS readback. v1/v2 remain readable; neither gains
+invented token counts. Runs without verifiable usage are not converted into
+fabricated measurements. Each record is a local metering claim with an intact
+origin chain, not an independently checked billing invoice, proof of output
+correctness or universal tracing of unrelated peer task traffic.
 
 The UI's combined trace orders local durable transitions and remote original
 event timestamps. It separates signed peer evidence from local journal events,
@@ -646,6 +660,23 @@ pnpm test:swarm-telemetry:live -- --stage verify --group GROUP --graph GRAPH \
   --source-fingerprint SOURCE_A_FINGERPRINT --confirm-independent-installed-peers
 ```
 
+To require real metered model calls rather than only state transitions,
+complete at least one real resident DAG node under the reviewed model, then run
+the receiver command with `--require-model-usage`:
+
+```bash
+pnpm test:swarm-telemetry:live -- --stage verify --group GROUP --graph GRAPH \
+  --source-fingerprint SOURCE_A_FINGERPRINT --require-model-usage \
+  --confirm-independent-installed-peers
+```
+
+The operator-run GitHub workflow now also accepts `source_fingerprint`. With
+`replica_graph_id` and `cluster_group`, it publishes from one enrolled
+self-hosted runner and starts a **separate runner job** on the opposite
+`swarm-node-a`/`swarm-node-b` runner label, refusing completion without
+real verified original-host model usage. This must actually execute on two
+independently installed and paired devices; defining a workflow is not proof.
+
 The publish phase must pass an independent signed SQLite readback on B;
 verify runs on B itself, confirming source identity, a fresh v2 checkpoint,
 chronological original events and a real node state transition. Repeat with
@@ -655,6 +686,13 @@ or passing contract suite is not that evidence. Absence of a real peer, stale
 events, or missing runtime commands must fail the live script.
 
 ### Event-driven real-run cost optimization
+
+Imported live-model quality reports are now stored with their original
+per-run source fixture outcomes and re-graded at every routing decision.
+Score-only legacy caches and edited rankings are invalidated rather than
+trusted as new correctness evidence. Reports still require a real operator
+benchmark execution and import; a manually forged run ID alone is not a
+cryptographic attestation.
 
 Cost routing remains off by default and requires the existing independent
 real-model fixture grades, explicit model rates and *observed* workload tokens.
