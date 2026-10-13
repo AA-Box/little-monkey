@@ -66,6 +66,19 @@ fn schema(store:&DaemonStore)->Result<(),String>{
             "ALTER TABLE resident_swarm_failover_plans ADD COLUMN source_fingerprint TEXT"
         ).map_err(|e|e.to_string())?;
     }
+    store.connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS resident_swarm_failover_sources (
+           group_id TEXT NOT NULL,source_graph TEXT NOT NULL,
+           source_fingerprint TEXT NOT NULL,plan_id TEXT NOT NULL,
+           PRIMARY KEY(group_id,source_graph,source_fingerprint)
+         );
+         INSERT OR IGNORE INTO resident_swarm_failover_sources(
+           group_id,source_graph,source_fingerprint,plan_id)
+         SELECT group_id,source_graph,source_fingerprint,plan_id
+           FROM resident_swarm_failover_plans
+           WHERE source_fingerprint IS NOT NULL AND state IN ('claimed','imported')
+           ORDER BY created_at_ms,plan_id;"
+    ).map_err(|e|e.to_string())?;
     Ok(())
 }
 fn bounded_file(path:&Path)->Result<Vec<u8>,String>{
@@ -210,19 +223,42 @@ fn mark(store:&DaemonStore,id:&str,state:&str,now:i64,message:&str)->Result<(),S
     Ok(())
 }
 fn consume(paths:&DaemonPaths,plan:&ArmedPlan,now:i64)->Result<(),String>{
-    let store=DaemonStore::open(paths)?;
+    let mut store=DaemonStore::open(paths)?;
+    schema(&store)?;
     if plan.state=="armed" {
         if !eligible(&store,plan,now)? {return Ok(());}
-        let updated=store.connection.execute(
+        // Multiple approved destination IDs must not create multiple
+        // recovered copies of the SAME predecessor on one installation.
+        // Claim both the logical source and the selected plan atomically.
+        let tx=store.connection.transaction_with_behavior(
+            rusqlite::TransactionBehavior::Immediate
+        ).map_err(|e|e.to_string())?;
+        let inserted=tx.execute(
+            "INSERT OR IGNORE INTO resident_swarm_failover_sources(
+               group_id,source_graph,source_fingerprint,plan_id)
+             VALUES (?1,?2,?3,?4)",
+            params![plan.group,plan.source_graph,plan.source_fingerprint,plan.id]
+        ).map_err(|e|e.to_string())?;
+        if inserted!=1 {return Ok(());}
+        let updated=tx.execute(
             "UPDATE resident_swarm_failover_plans
              SET state='claimed',claimed_at_ms=?2
              WHERE plan_id=?1 AND state='armed'",
             params![plan.id,now],
         ).map_err(|e|e.to_string())?;
         if updated!=1 {return Ok(());}
-    } else if plan.state!="claimed" {
-        return Ok(());
-    }
+        tx.commit().map_err(|e|e.to_string())?;
+    } else if plan.state=="claimed" {
+        let owner:Option<String>=store.connection.query_row(
+            "SELECT plan_id FROM resident_swarm_failover_sources
+             WHERE group_id=?1 AND source_graph=?2 AND source_fingerprint=?3",
+            params![plan.group,plan.source_graph,plan.source_fingerprint],
+            |r|r.get(0)
+        ).optional().map_err(|e|e.to_string())?;
+        if owner.as_deref()!=Some(plan.id.as_str()){
+            return Err("Claimed source is owned by a different authorized recovery plan".into());
+        }
+    } else {return Ok(());}
     drop(store);
     // A crash after this committed claim must not strand the graph forever.
     // The same approved bytes/identity are revalidated below; if the graph
