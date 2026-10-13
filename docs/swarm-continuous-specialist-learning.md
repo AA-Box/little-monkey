@@ -80,3 +80,45 @@ node scripts/swarm-specialist-live-benchmark.mjs --self-check --domain all
 ```
 
 The deterministic contract tests stub the model process; they establish validation, promotion, rollback and native dispatch behavior, not live model quality. Run `--once` with configured real Ollama models and inspect the native run receipts and source-oracle outcomes to establish real-model acceptance. Verify service restart, model loss, damaged evidence, malformed policy, repeated regression and CLI task errors on the intended host.
+## Unattended Apple Silicon MLX training-to-verified-local-serving
+
+The opt-in `scripts/swarm-mlx-verified-serving.mjs` supervisor bridges approved-batch MLX LoRA training, held-out evaluation, fused-weight hashing and real inference acceptance to a stable local OpenAI-compatible model endpoint. It runs the independent native CLI source oracle against each candidate *before* activating the production route. It is independent of desktop/Tauri model selection.
+
+Create a private serving state directory distinct from the training inbox and output tree. Use the existing `swarm-mlx-auto-learning.mjs` learning policy with `fuseForImport: true`, and configure:
+
+```json
+{
+  "version": 1,
+  "trainingPolicy": "/Users/me/private/approved-mlx-learning-policy.json",
+  "monkeyBin": "/Users/me/bin/monkey",
+  "stateDir": "/Users/me/private/mlx-serving-state",
+  "listenPort": 8765,
+  "backendPort": 8766,
+  "probePort": 8767,
+  "modelAlias": "little-monkey-mlx",
+  "domains": ["security", "backend"],
+  "repetitions": 2,
+  "timeoutMs": 600000,
+  "checkSeconds": 3600,
+  "minAccuracy": 0.8,
+  "minImprovement": 0.05
+}
+```
+
+Start on an operator-owned Apple Silicon Mac with a verified native CLI and installed MLX-LM Python environment:
+
+```sh
+node scripts/swarm-mlx-verified-serving.mjs --policy /absolute/path/serving-policy.json --confirm-unattended-mlx-deployment
+```
+
+Use the stable model in a native CLI recipe with:
+
+```json
+{ "local_url": "http://127.0.0.1:8765", "model": "little-monkey-mlx" }
+```
+
+To include the served MLX model in specialist learning, add the string `local-url:http://127.0.0.1:8765|little-monkey-mlx` to the `targets` array in the specialist controller's policy. The controller rejects arbitrary remote addresses for this target type.
+
+The supervisor verifies candidate weights and runs a fresh source-oracle benchmark through a separate local-only probe port. It returns HTTP 503 when no independently passing candidate is active or while switching. Real candidate regressions trigger independent regrading of the prior model before rollback. Failed deployment attempts cannot repeat unattended after a crash; the operator must explicitly review an attempt marker.
+
+**Verification boundary:** the test suite verifies subprocess wiring, safety gates and rollback contracts using stand-ins. Apple Silicon MLX training, actual fused serving and tool-call compatibility are **not** demonstrated by CI. If `mlx_lm.server` does not support the native CLI's tools for a fixture, source-oracle grading fails and promotion is blocked. This integration does not automatically activate the Tauri desktop's resident MLX model and is not a production-hardened remote API.
