@@ -725,3 +725,50 @@ rollback was exercised. Real desktop provider handoff, post-switch acceptance,
 failure injection and actual rollback still require physical Apple Silicon
 execution. Neither generated package/weight bytes nor private inference output
 are uploaded as CI evidence; the workflow uploads bounded JSON receipts.
+
+
+## One-shot, operator-armed automatic DAG leader handoff
+
+A receiving installation can now be armed **before** the leader disappears with
+an exact immutable bundle, known local workspace and new target graph ID:
+
+```bash
+monkey daemon swarm-failover-arm recovery-on-b \
+  --group my-cluster --new-id read-only-recovery-b \
+  --bundle /private/preapproved/read-only-graph.json \
+  --workspace /absolute/disposable/approved-workspace \
+  --confirm-read-only-reexecution
+
+monkey daemon swarm-failover-status
+```
+
+Nothing runs when this command is issued. Both installations must already be
+operator-enrolled in the exact same cluster; the **source** exports the
+read-only bundle and the **destination** independently stages it. At arming,
+the destination checks the bundle's per-recipe and graph digests, plan-mode
+permissions, source cluster, destination workspace and the file SHA-256.
+
+Every ten seconds the installed daemon checks armed plans. A plan can only
+activate when ALL conditions hold: this host currently possesses a valid
+strict-majority leader lease; the local election term is **newer** than an
+authenticated other-member checkpoint for the exact original graph; that
+checkpoint has the matching operator-enrolled roster digest and is no older
+than ten minutes; and the staged bundle still matches the original approval
+hash. The worker commits an exclusive one-shot claim to durable SQLite
+**before** importing. The newly registered graph is assigned a new identity,
+and **every task is pending** — no foreign reports, success states, model
+tokens, receipts, conversations, approvals or mutable workspace are imported.
+
+If the process crashes after the one-shot claim and before registration, the
+plan remains in `claimed` state. It is deliberately **not** retried:
+doing so could create ambiguous duplicate effects. Inspect the existing
+graph and claim before explicitly arming a new ID. Imported/failed states
+persist across daemon restarts and are operator-visible.
+
+A native two-database test exercises prior A leadership, authenticated
+source checkpoint replication, arming on B, absence of scheduling authority
+before a second election, and automatic registration on B after a newer
+strict-majority term. This is a functional locally simulated takeover test,
+**not** a substitute for physical partition tests or full distributed
+exactly-once process migration. It only supports read-only re-execution of
+operator-prepared plans; it intentionally refuses unattended edits.
