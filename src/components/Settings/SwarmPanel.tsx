@@ -1099,6 +1099,15 @@ export function SwarmPanel() {
           {graph.tasks.map(task => <p key={task.id} className="mt-1 text-xs text-muted">
             {task.id} · {task.state} {task.error ? '— ' + task.error.slice(0, 160) : ''}
           </p>)}
+          {!!graph.events?.length && <details className="mt-2 text-xs text-muted">
+            <summary className="cursor-pointer">Durable transition trace · {graph.events.length} recent events</summary>
+            <div className="mt-1 max-h-56 space-y-1 overflow-auto" aria-label="Resident swarm transition trace">
+              {graph.events.slice(-30).map(event => <p key={event.sequence} className="break-all">
+                #{event.sequence} · {event.node_id ?? 'graph'} · {event.previous_state ?? 'new'} → {event.state}
+                {event.job_id ? ' · ' + event.job_id.slice(0, 48) : ''}
+              </p>)}
+            </div>
+          </details>}
         </div>)}
       </div>
       <div className="rounded-lg border border-border bg-surface p-3">
