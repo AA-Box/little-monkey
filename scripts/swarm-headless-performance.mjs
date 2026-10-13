@@ -54,8 +54,8 @@ export function parseRunId(output) {
   for (const line of [output.trim(), ...output.trim().split(/\r?\n/).reverse()]) {
     try {
       const json = JSON.parse(line);
-      if (typeof json?.run_id === 'string' && /^run-[a-zA-Z0-9_-]{4,150}$/.test(json.run_id)) return json.run_id;
-      if (typeof json?.runId === 'string' && /^run-[a-zA-Z0-9_-]{4,150}$/.test(json.runId)) return json.runId;
+      if (typeof json?.run_id === 'string' && /^(?:task|run)-[a-zA-Z0-9_-]{4,150}$/.test(json.run_id)) return json.run_id;
+      if (typeof json?.runId === 'string' && /^(?:task|run)-[a-zA-Z0-9_-]{4,150}$/.test(json.runId)) return json.runId;
     } catch { /* structured progress is optional */ }
   }
   throw Error('CLI did not return a valid run id.');
