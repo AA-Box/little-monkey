@@ -536,3 +536,61 @@ pretend that arbitrary Ruflo plugin SDK hooks, background workers,
 plugins installing npm packages, or intercepting native daemon tasks
 are implemented. The Ruflo MCP bridge still needs explicit operator
 registration, version pin and per-tool allowance before real use.
+
+
+### Operator-opted automatic Apple Silicon adapter learning
+
+The continuous watcher is a real local MLX-LoRA training worker, not a
+simulated "learned" rank update. It requires the operator to launch it
+on Apple Silicon and grants no network, peer, file-edit or plugin authority.
+
+Create a protected local policy JSON with EXACTLY these fields (substitute
+your reviewed absolute local paths):
+
+~~~json
+{
+ "version":1,
+ "model":"/your-local-mlx-base",
+ "inbox":"/private/approved-dataset-batches",
+ "outputRoot":"/private/new-model-candidates",
+ "python":"/absolute/path/to/reviewed-mlx-python",
+ "iters":200,
+ "maxTestPpl":15,
+ "pollSeconds":300,
+ "batchLimit":1,
+ "fuseForImport":true
+}
+~~~
+
+For each approved subfolder such as inbox/operator-batch-1 place disjoint
+train.jsonl, valid.jsonl and test.jsonl files, along with a ready.json:
+
+~~~json
+{
+ "version":1,
+ "approved":true,
+ "note":"I reviewed the private dataset and test evidence",
+ "files":{"train":"SHA256_OF_TRAIN","valid":"SHA256_OF_VALID","test":"SHA256_OF_TEST"}
+}
+~~~
+
+Real SHA-256 digests are required; the strings above are placeholders,
+not valid proofs. The worker recomputes hashes, applies the original
+MLX preflight and isolated byte-for-byte dataset snapshots, invokes
+actual mlx_lm LoRA training, runs the complete held-out and optional
+fused-model quality checks, and records a permanent claim BEFORE any GPU
+subprocess. It cannot silently repeat a batch after crash/failure; explicit
+operator review and claim reset is necessary.
+
+~~~sh
+node scripts/swarm-mlx-auto-learning.mjs \
+  --policy /absolute/path/to/learning-policy.json \
+  --confirm-auto-training
+~~~
+
+Add --once to process only the current approved batch queue. A worker lock
+rejects concurrent local training. **This worker produces verified
+candidates only**: it never registers, activates or removes a runtime model.
+The already implemented Swarms panel native SHA-256 importer and
+actual-inference promotion/rollback remain the separate safety authority.
+No unattended model rollout, and no test result from a stub, is claimed.
