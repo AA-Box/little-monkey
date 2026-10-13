@@ -594,3 +594,14 @@ candidates only**: it never registers, activates or removes a runtime model.
 The already implemented Swarms panel native SHA-256 importer and
 actual-inference promotion/rollback remain the separate safety authority.
 No unattended model rollout, and no test result from a stub, is claimed.
+
+
+The desktop Swarms panel also includes **Signed multi-node leader quorum**
+controls. An operator can select a local reviewed roster JSON, inspect
+the actual enrolled group and lease, and explicitly request a signed
+election. The button does not invent quorum state: it calls the native
+peer-election CLI through a fixed Tauri command and then rereads
+`cluster-status`. It explicitly warns that a successful majority may
+start previously operator-approved read-only resident graph tasks. The
+same bounds, pinned identities and native rejection policies apply
+whether run through the GUI or CLI.
