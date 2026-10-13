@@ -127,6 +127,9 @@ pub fn majority_confirms_no_dispatch(store:&DaemonStore,group:&str,graph:&str,
 /// Collect only for operator-armed, locally leader-owned read-only DAGs.
 /// Remote responses carry observations, NEVER runnable recipes or grants.
 pub async fn refresh(paths:&DaemonPaths,now:i64)->Result<(),String>{
+    // No failover table exists on an installation until this feature is
+    // configured. Bootstrap it without granting permissions or scheduling.
+    let _=super::swarm_failover::status(paths)?;
     let candidates:Vec<(String,String,String,Vec<(String,String)>)>={
         let store=DaemonStore::open(paths)?;
         schema(&store)?;
