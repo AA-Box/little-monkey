@@ -3,7 +3,15 @@ name: Dependency security audit
 on:
   push:
     branches:
-      - security/dependabot-remediate-20261013
+      - develop
+      - main
+    paths:
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - src-tauri/Cargo.toml
+      - src-tauri/Cargo.lock
+      - .github/workflows/dependency-security-audit.yml
   pull_request:
     paths:
       - package.json
