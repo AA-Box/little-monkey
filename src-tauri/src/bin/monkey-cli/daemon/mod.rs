@@ -48,6 +48,7 @@ mod scheduler;
 mod service;
 mod swarm_coordinator;
 mod swarm_transfer;
+mod swarm_workers;
 pub(crate) mod swarm_cluster;
 pub(crate) mod store;
 pub(crate) mod telecom_store;
@@ -152,6 +153,17 @@ pub enum DaemonCmd {
         /// A source completion is never reused; every agent can run again.
         #[arg(long, required = true)]
         confirm_read_only_reexecution: bool,
+    },
+    /// List the 12 opt-in background worker roles.
+    SwarmWorkerCatalog,
+    /// Install a frozen, plan-only native worker using existing durable cron or filesystem triggers.
+    SwarmWorkerInstall {
+        id: String,
+        #[arg(long)] role: String,
+        #[arg(long)] source_recipe: PathBuf,
+        #[arg(long)] workspace: PathBuf,
+        #[arg(long, conflicts_with="watch")] cron: Option<String>,
+        #[arg(long, conflicts_with="cron")] watch: Option<PathBuf>,
     },
     /// Print durable events for a run; optionally follow until terminal.
     Attach {
@@ -551,6 +563,18 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
             }
             let paths = DaemonPaths::resolve()?;
             println!("{}", swarm_transfer::import_read_only(&paths,input,new_id,workspace)?);
+            Ok(())
+        },
+        DaemonCmd::SwarmWorkerCatalog => {
+            println!("{}", swarm_workers::catalog());
+            Ok(())
+        },
+        DaemonCmd::SwarmWorkerInstall {
+            id,role,source_recipe,workspace,cron,watch,
+        } => {
+            let paths=DaemonPaths::resolve()?;
+            println!("{}",swarm_workers::install(&paths,id,role,source_recipe,workspace,
+                cron.as_deref(),watch.as_deref())?);
             Ok(())
         },
         DaemonCmd::Attach {
