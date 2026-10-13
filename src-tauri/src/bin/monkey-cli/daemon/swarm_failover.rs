@@ -1,0 +1,262 @@
+//! Explicitly armed automatic READ-ONLY resident swarm failover.
+//!
+//! Both installations must be individually operator-enrolled in the same
+//! signed peer cluster. The receiving operator pre-stages and hashes a known
+//! plan-only portable bundle and an existing local workspace. It does NOT
+//! accept runnable prompts from the network. Once a DIFFERENT peer's fresh
+//! signed checkpoint exists and this node later gains a HIGHER-TERM strict
+//! majority lease, a durable one-shot claim authorizes registering the
+//! preapproved plan under a NEW graph ID. Every node starts pending and must
+//! re-run; remote 'succeeded' rows have no scheduling authority.
+//!
+//! This is bounded read-only re-execution, not transparent exactly-once
+//! migration or arbitrary remote repository mutation. A crash after claim
+//! fails closed and requires explicit operator reconciliation.
+use std::fs;
+use std::path::{Path,PathBuf};
+use rusqlite::{params,OptionalExtension};
+use sha2::{Digest,Sha256};
+use super::store::{DaemonPaths,DaemonStore};
+use super::{swarm_cluster,swarm_replication,swarm_transfer};
+
+const MAX_BUNDLE:u64=34*1024*1024;
+const MAX_PLANS:i64=8;
+const MAX_CHECKPOINT_AGE_MS:i64=10*60*1000;
+#[derive(Debug,Clone)]
+struct ArmedPlan{
+    id:String,
+    group:String,
+    source_graph:String,
+    new_graph:String,
+    path:String,
+    hash:String,
+    workspace:String,
+}
+fn valid_id(value:&str)->bool{
+    (1..=80).contains(&value.len()) &&
+    value.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric) &&
+    value.bytes().all(|c|c.is_ascii_alphanumeric()||matches!(c,b'_'|b'-'))
+}
+fn schema(store:&DaemonStore)->Result<(),String>{
+    store.connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS resident_swarm_failover_plans(
+          plan_id TEXT PRIMARY KEY NOT NULL,
+          group_id TEXT NOT NULL, source_graph TEXT NOT NULL,
+          new_graph TEXT NOT NULL,bundle_path TEXT NOT NULL,
+          bundle_sha256 TEXT NOT NULL,workspace TEXT NOT NULL,
+          state TEXT NOT NULL,created_at_ms INTEGER NOT NULL,
+          claimed_at_ms INTEGER,message TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_failover_unique_graph
+          ON resident_swarm_failover_plans(new_graph);"
+    ).map_err(|e|e.to_string())
+}
+fn bounded_file(path:&Path)->Result<Vec<u8>,String>{
+    let m=fs::symlink_metadata(path).map_err(|e|e.to_string())?;
+    if !m.file_type().is_file()||m.len()>MAX_BUNDLE||m.len()==0{
+        return Err("Failover bundle must be a regular non-symlink file under 34 MiB".into());
+    }
+    fs::read(path).map_err(|e|e.to_string())
+}
+fn sha(bytes:&[u8])->String{format!("{:x}",Sha256::digest(bytes))}
+pub fn arm(
+    paths:&DaemonPaths,id:&str,group:&str,new_graph:&str,
+    input:&Path,workspace:&Path,now:i64,
+)->Result<serde_json::Value,String>{
+    if !valid_id(id)||!valid_id(group)||!valid_id(new_graph)||now<=0||
+       !input.is_absolute()||!workspace.is_absolute(){
+        return Err("Invalid operator failover plan identities or absolute paths".into());
+    }
+    let bundle=bounded_file(input)?;
+    let canonical_input=input.canonicalize().map_err(|e|e.to_string())?;
+    let canonical_workspace=workspace.canonicalize().map_err(|e|e.to_string())?;
+    let meta=fs::symlink_metadata(workspace).map_err(|e|e.to_string())?;
+    if !meta.is_dir()||meta.file_type().is_symlink()||
+       !canonical_workspace.is_dir(){
+        return Err("Failover destination must be an existing real directory".into());
+    }
+    let (source_graph,source_cluster)=swarm_transfer::inspect_read_only_bundle(&canonical_input)?;
+    if source_graph==new_graph||source_cluster.as_deref()!=Some(group){
+        return Err("Prepared read-only bundle must be from this exact cluster, with a NEW target graph identity".into());
+    }
+    paths.ensure()?;
+    let store=DaemonStore::open(paths)?;
+    swarm_cluster::roster(&store,group)?;
+    schema(&store)?;
+    let count:i64=store.connection.query_row(
+        "SELECT COUNT(*) FROM resident_swarm_failover_plans",[],
+        |r|r.get(0)
+    ).map_err(|e|e.to_string())?;
+    if count>=MAX_PLANS {
+        return Err("Automatic failover plan capacity reached".into());
+    }
+    // Arm is a one-way, explicit local approval; no upsert and no implicit
+    // replacing a previously claimed/failed plan.
+    store.connection.execute(
+        "INSERT INTO resident_swarm_failover_plans(
+           plan_id,group_id,source_graph,new_graph,bundle_path,bundle_sha256,
+           workspace,state,created_at_ms)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,'armed',?8)",
+        params![id,group,source_graph,new_graph,
+            canonical_input.to_string_lossy().as_ref(),sha(&bundle),
+            canonical_workspace.to_string_lossy().as_ref(),now],
+    ).map_err(|e|format!("Unable to arm unique operator failover plan: {e}"))?;
+    Ok(serde_json::json!({
+        "plan":id,"cluster":group,"source_graph":source_graph,
+        "new_graph":new_graph,"state":"armed",
+        "warning":"Requires a fresh previous-leader checkpoint and a NEW higher-term signed local majority; every task re-runs in plan mode."
+    }))
+}
+pub fn status(paths:&DaemonPaths)->Result<serde_json::Value,String>{
+    let store=DaemonStore::open(paths)?;
+    schema(&store)?;
+    let mut stmt=store.connection.prepare(
+        "SELECT plan_id,group_id,source_graph,new_graph,state,
+                created_at_ms,claimed_at_ms,message
+         FROM resident_swarm_failover_plans ORDER BY created_at_ms DESC LIMIT 8"
+    ).map_err(|e|e.to_string())?;
+    let rows=stmt.query_map([],|r|Ok(serde_json::json!({
+        "id":r.get::<_,String>(0)?,"group":r.get::<_,String>(1)?,
+        "source_graph":r.get::<_,String>(2)?,"target_graph":r.get::<_,String>(3)?,
+        "state":r.get::<_,String>(4)?,"created_at_ms":r.get::<_,i64>(5)?,
+        "claimed_at_ms":r.get::<_,Option<i64>>(6)?,
+        "message":r.get::<_,Option<String>>(7)?
+    }))).map_err(|e|e.to_string())?
+       .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    Ok(serde_json::json!({"plans":rows}))
+}
+fn pending(store:&DaemonStore)->Result<Vec<ArmedPlan>,String>{
+    schema(store)?;
+    let mut stmt=store.connection.prepare(
+        "SELECT plan_id,group_id,source_graph,new_graph,bundle_path,
+                bundle_sha256,workspace
+         FROM resident_swarm_failover_plans
+         WHERE state='armed' ORDER BY created_at_ms LIMIT 8"
+    ).map_err(|e|e.to_string())?;
+    stmt.query_map([],|r|Ok(ArmedPlan{
+        id:r.get(0)?,group:r.get(1)?,source_graph:r.get(2)?,
+        new_graph:r.get(3)?,path:r.get(4)?,hash:r.get(5)?,workspace:r.get(6)?,
+    })).map_err(|e|e.to_string())?
+       .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
+}
+fn eligible(store:&DaemonStore,plan:&ArmedPlan,now:i64)->Result<bool,String>{
+    if store.kill_switch()?||
+       !swarm_cluster::may_schedule(store,&plan.group,now)?{
+        return Ok(false);
+    }
+    let roster=swarm_cluster::roster(store,&plan.group)?;
+    let current:i64=store.connection.query_row(
+        "SELECT term FROM swarm_cluster_leases
+         WHERE group_id=?1 AND leader=?2 AND expires_at_ms>?3",
+        params![plan.group,roster.local().fingerprint,now],|r|r.get(0)
+    ).map_err(|_|"No locally certified, unexpired majority term")?;
+    // This recovery plan is permitted only after a DIFFERENT enrolled
+    // original machine published the exact source graph, and a higher-term
+    // election succeeded. An absent or old receipt does not grant execution.
+    let peer_rows=swarm_replication::list_local(store,&plan.group,&plan.source_graph)?;
+    Ok(peer_rows.iter().any(|snapshot|
+        snapshot.source_fingerprint!=roster.local().fingerprint &&
+        snapshot.roster_sha256==roster.digest() &&
+        snapshot.term < current as u64 &&
+        snapshot.captured_at_ms<=now+5_000 &&
+        now.saturating_sub(snapshot.captured_at_ms)<=MAX_CHECKPOINT_AGE_MS
+    ))
+}
+fn mark(store:&DaemonStore,id:&str,state:&str,now:i64,message:&str)->Result<(),String>{
+    store.connection.execute(
+        "UPDATE resident_swarm_failover_plans
+         SET state=?2,claimed_at_ms=COALESCE(claimed_at_ms,?3),message=?4
+         WHERE plan_id=?1 AND state='claimed'",
+        params![id,state,now,message.chars().take(240).collect::<String>()]
+    ).map_err(|e|e.to_string())?;
+    Ok(())
+}
+fn consume(paths:&DaemonPaths,plan:&ArmedPlan,now:i64)->Result<(),String>{
+    let store=DaemonStore::open(paths)?;
+    if !eligible(&store,plan,now)? {return Ok(());}
+    let updated=store.connection.execute(
+        "UPDATE resident_swarm_failover_plans
+         SET state='claimed',claimed_at_ms=?2
+         WHERE plan_id=?1 AND state='armed'",
+        params![plan.id,now],
+    ).map_err(|e|e.to_string())?;
+    if updated!=1 {return Ok(());}
+    drop(store);
+    // The one-shot claim is COMMITTED before touching any imported files or
+    // registering daemon work. A crash cannot launch the same graph twice.
+    let operation=(||{
+        let path=PathBuf::from(&plan.path);
+        let actual=bounded_file(&path)?;
+        if sha(&actual)!=plan.hash{
+            return Err("Armed recovery bytes were modified after explicit approval".into());
+        }
+        let (source,group)=swarm_transfer::inspect_read_only_bundle(&path)?;
+        if source!=plan.source_graph||group.as_deref()!=Some(plan.group.as_str()){
+            return Err("Staged recovery identity or cluster changed".into());
+        }
+        // Re-check the majority lease just before registration. Dispatch
+        // remains separately fenced by the swarm coordinator's own tick.
+        let store=DaemonStore::open(paths)?;
+        if !swarm_cluster::may_schedule(&store,&plan.group,now)?{
+            return Err("Local majority lease was lost before recovery registration".into());
+        }
+        drop(store);
+        swarm_transfer::import_read_only(paths,&path,&plan.new_graph,Path::new(&plan.workspace))?;
+        Ok::<_,String>(())
+    })();
+    let store=DaemonStore::open(paths)?;
+    match operation {
+        Ok(())=>mark(&store,&plan.id,"imported",now,
+            "New local graph registered; all source tasks are newly pending, never reused"),
+        Err(reason)=>{
+            mark(&store,&plan.id,"failed",now,
+                "Automatic failover stopped; operator must inspect local plan and graph")?;
+            Err(reason)
+        }
+    }
+}
+pub fn run_once(paths:&DaemonPaths,now:i64)->Result<(),String>{
+    let store=DaemonStore::open(paths)?;
+    let plans=pending(&store)?;
+    drop(store);
+    for plan in plans{
+        // One malformed/stale/operator-revoked plan must not prevent other
+        // independent clusters from progressing.
+        if let Err(error)=consume(paths,&plan,now){
+            eprintln!("Read-only failover {} halted: {}",plan.id,
+                if error.contains("majority"){"lease changed"}
+                else{"operator review required"});
+        }
+    }
+    Ok(())
+}
+pub fn spawn_worker(paths:DaemonPaths){
+    tokio::spawn(async move{
+        let mut timer=tokio::time::interval(std::time::Duration::from_secs(10));
+        loop{
+            timer.tick().await;
+            let now=super::now_ms().ok().and_then(|n|i64::try_from(n).ok());
+            if let Some(now)=now{
+                if let Err(error)=run_once(&paths,now){
+                    eprintln!("Read-only swarm failover scan unavailable: {error}");
+                }
+            }
+        }
+    });
+}
+#[cfg(test)]
+mod tests{
+    use super::*;
+    #[test]
+    fn rejects_unapproved_or_malformed_read_only_bundle_and_ids(){
+        let root=std::env::temp_dir().join(format!("failover-{}",uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let paths=DaemonPaths::under(&root);
+        let source=root.join("bad.json");
+        fs::write(&source,b"{}").unwrap();
+        assert!(!valid_id("../bad"));
+        assert!(!valid_id(""));
+        assert!(arm(&paths,"review","cluster","new-graph",&source,&root,1000).is_err());
+        let _=fs::remove_dir_all(root);
+    }
+}
