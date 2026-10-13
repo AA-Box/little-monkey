@@ -162,8 +162,9 @@ pub async fn refresh(paths:&DaemonPaths,now:i64)->Result<(),String>{
         let mut stmt=store.connection.prepare(
             "SELECT group_id,source_graph,source_fingerprint
              FROM resident_swarm_failover_plans
-             WHERE state='armed' AND source_fingerprint IS NOT NULL
-             ORDER BY created_at_ms LIMIT 4"
+             WHERE state IN ('armed','claimed')
+               AND source_fingerprint IS NOT NULL
+             ORDER BY created_at_ms LIMIT 8"
         ).map_err(|e|e.to_string())?;
         let plans=stmt.query_map([],|r|Ok((
             r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?
