@@ -106,7 +106,7 @@ function oracleContract(){
     writeFileSync(join(gitRepo,'test.mjs'),tests);
     writeFileSync(gitSource,source);
     writeFileSync(join(gitRepo,'MONKEY.md'),'Disposable fixture');
-    writeFileSync(join(gitRepo,'.gitignore'),'*.scratch\\n');
+    writeFileSync(join(gitRepo,'.gitignore'),'*.scratch\n');
     execute('git',['init','-q'],gitRepo);
     execute('git',['add','.'],gitRepo);
     execute('git',['-c','user.name=Oracle Contract',
@@ -124,7 +124,7 @@ function oracleContract(){
     writeFileSync(gitSource,patchedSource);
     if(independentlyVerify(gitRepo,baseline).independentHoldoutCases!==256)
       throw Error('Exact safe repair failed external holdouts.');
-    writeFileSync(join(gitRepo,'test.mjs'),tests+'// tampered\\n');
+    writeFileSync(join(gitRepo,'test.mjs'),tests+'// tampered\n');
     mustReject('tampered regression tests');
     writeFileSync(join(gitRepo,'test.mjs'),tests);
     writeFileSync(join(gitRepo,'rogue.scratch'),'ignored malware');
