@@ -145,6 +145,11 @@ pub(super) fn build(tx:&Transaction<'_>,chunks:&[KnowledgeChunk],
         FOREIGN KEY(chunk_id) REFERENCES chunks(chunk_id)
     ) WITHOUT ROWID;")?;
     let mut digest=Sha256::new();
+    // V2 authenticates the entry and maximum layer as well as every edge.
+    // V1 graphs remain readable for already persisted generations.
+    digest.update(b"hnsw-v2-controls-and-edges");
+    digest.update(points[top].id.as_bytes());
+    digest.update((layer as u32).to_le_bytes());
     // Canonical sorted-ID hash can be independently rechecked from SQLite
     // without needing the original source insertion order.
     let mut order=(0..points.len()).collect::<Vec<_>>();
@@ -163,7 +168,7 @@ pub(super) fn build(tx:&Transaction<'_>,chunks:&[KnowledgeChunk],
             params![point.id,point.level as i64,links_json])?;
     }
     for (key,value) in [
-        ("hnsw_version","1".to_string()),
+        ("hnsw_version","2".to_string()),
         ("hnsw_entry",points[top].id.clone()),
         ("hnsw_max_layer",layer.to_string()),
         ("hnsw_digest",format!("{:x}",digest.finalize())),
@@ -183,7 +188,7 @@ pub(super) fn validate(conn:&Connection)->PipelineResult<()>{
     let version:String=conn.query_row(
         "SELECT value FROM metadata WHERE key='hnsw_version'",[],
         |r|r.get(0))?;
-    if version!="1" {
+    if version!="1" && version!="2" {
         return Err(PipelineError::InvalidIndex("Unsupported HNSW generation version".into()));
     }
     // These controls are used before a single edge is traversed. Validate
@@ -210,6 +215,11 @@ pub(super) fn validate(conn:&Connection)->PipelineResult<()>{
         return Err(PipelineError::InvalidIndex("HNSW graph layer metadata mismatch".into()));
     }
     let mut digest=Sha256::new();
+    if version=="2"{
+        digest.update(b"hnsw-v2-controls-and-edges");
+        digest.update(entry.as_bytes());
+        digest.update((max_layer as u32).to_le_bytes());
+    }
     let mut stmt=conn.prepare(
         "SELECT chunk_id,layer,links_json FROM hnsw_nodes ORDER BY chunk_id"
     )?;
