@@ -76,7 +76,7 @@ import { composeSavedWorkflowCatalog } from './workflow';
 import { selectSavedWorkflowList, useSavedWorkflowStore } from '../store/savedWorkflowStore';
 import { composeCustomAgentCatalog } from './customAgents';
 import { selectCustomAgentList, useCustomAgentStore } from '../store/customAgentStore';
-import { collectUserPromptSubmitContext } from './userHooks';
+import { collectUserPromptSubmitContext,fireObservedHooks } from './userHooks';
 import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
 import { isBtwNotice } from './slashCommands';
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
@@ -1868,6 +1868,12 @@ export async function runAgentTurn(
     }
     useTurnStatusStore.getState().end(sessionId);
     useUsageHistoryStore.getState().recordTurnCompleted(Date.now() - startedAt);
+    // Stop is an observe-only hook on an ACTUAL turn terminal boundary.
+    // A shell hook cannot overturn the daemon's signed terminal decision or
+    // silently restart model work. One event per accepted turn, including
+    // cancellation, with bounded metadata rather than prompt/transcript.
+    fireObservedHooks('Stop',{session_id:sessionId,
+      args:{turn_id:turnId,outcome:controller.signal.aborted?'cancelled':turnError?'error':'done'}});
     if (processId) {
       const outcome = exitStatusFor({
         aborted: controller.signal.aborted,

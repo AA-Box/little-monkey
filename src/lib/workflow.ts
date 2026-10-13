@@ -23,10 +23,22 @@ import { stringifyToolError, stringifyToolResult, CANCELLED_TOOL_RESULT } from '
 import { MAX_REPORT_CHARS, runSubagentTask, type RunSubagentTaskParams } from './subagent';
 import { useWorkflowStore, type WorkflowPhase } from '../store/workflowStore';
 import { useSubagentStore } from '../store/subagentStore';
-import { useSessionStore, type WorkflowAgentResult } from '../store/sessionStore';
+import { flushSessionPersistence, useSessionStore, type WorkflowAgentResult } from '../store/sessionStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useSavedWorkflowStore, type SavedWorkflow } from '../store/savedWorkflowStore';
-import { unwrapUntrustedContent } from './untrustedContent';
+import { unwrapUntrustedContent, wrapUntrustedContent } from './untrustedContent';
+import { buildSwarmPreset } from './swarmPresets';
+import { buildGoalSwarm, parseSwarmMemoryStackIds, selectSwarmDomain } from './swarmPlanning';
+import { recordSpecialistMetric, loadSpecialistMetrics } from './swarmSpecialistMetrics';
+import { parseSwarmTopology, planCoordinationWaves, nextAdaptiveCoordinationWave, formatWaveMessages, type SwarmTopology } from './swarmCoordination';
+import { retrieveSwarmKnowledge } from './swarmKnowledge';
+import { compileSwarmTaskGraph } from './swarmGraph';
+import { assertReadOnlyPeerPlacement } from './swarmPeerSchema';
+import { reconcileSwarmReviewers,parseSwarmVotePolicy,type SwarmVotePolicy } from './swarmConsensus';
+import { approvedSwarmNotebookBlock, stageSwarmNote } from './swarmNotebook';
+import { approvedLearningContext } from './swarmLearningCycle';
+import { buildSwarmTrajectoryContext } from './swarmTrajectoryMemory';
+import {frozenAuthenticatedPeerVoters,revalidateAuthenticatedPeerVoters} from './swarmPeerQuorum';
 
 export interface WorkflowAgentSpec {
   description: string;
@@ -47,12 +59,33 @@ export interface WorkflowAgentSpec {
   /** Optional worktree isolation — same meaning and validation as the `task`
    * tool's `isolation` (see `RunSubagentTaskParams.isolation`). */
   isolation?: 'worktree';
+  /** Explicitly selected paired peer; only allowed for read-only explore agents. */
+  peer?: string;
+  /** Health-ranked candidates supplied explicitly by the operator. */
+  peerCandidates?: string[];
+  /** One opt-in read-only alternate only after verified terminal peer failure. */
+  peerFailover?: boolean;
 }
 
 export interface WorkflowSpec {
   name: string;
   description: string;
   phases: { title: string; agents: WorkflowAgentSpec[] }[];
+  /** Optional read-only local coordination between agents in a phase. */
+  topology?: SwarmTopology;
+  /** Existing, indexed Knowledge 2.0 stacks explicitly selected for this run. */
+  memoryStackIds?: string[];
+  /** Do not run downstream phases after failed prerequisites. */
+  stopOnFailure?: boolean;
+  /** Optional strict non-authoritative agreement/dispute summary from independent reviewers. */
+  consensus?: SwarmVotePolicy;
+  /** Explicitly require the vote phase to come from unique paired peer device
+   * identities under unchanged task grants and certificate fingerprints. */
+  authenticatedPeerVoting?: boolean;
+  /** Opt-in, operator-approved versioned notebook reference and staging. */
+  notebook?: boolean;
+  /** Explicit opt-in to operator-approved, domain-matched past learning. */
+  learning?: boolean;
 }
 
 /** Caps mirror the tool schema's documented limits — validated here anyway
@@ -62,6 +95,64 @@ export interface WorkflowSpec {
 export const MAX_WORKFLOW_PHASES = 6;
 export const MAX_AGENTS_PER_PHASE = 6;
 export const MAX_WORKFLOW_AGENTS = 16;
+
+/** Runner-side defense-in-depth for stored specs and programmatic callers
+ * that bypass the workflow tool's parser. Reject oversized plans before any
+ * agent can be dispatched, including after a restore from disk. */
+export function assertWorkflowBounds(spec: WorkflowSpec): void {
+  if (!spec || typeof spec.name !== 'string' || !spec.name.trim() ||
+      !Array.isArray(spec.phases) || !spec.phases.length ||
+      spec.phases.length > MAX_WORKFLOW_PHASES) {
+    throw new Error('Workflow must have a name and 1–6 phases.');
+  }
+  let total = 0;
+  for (const phase of spec.phases) {
+    if (!phase || typeof phase.title !== 'string' ||
+        !Array.isArray(phase.agents) || !phase.agents.length ||
+        phase.agents.length > MAX_AGENTS_PER_PHASE) {
+      throw new Error('Each workflow phase requires 1–6 agents.');
+    }
+    total += phase.agents.length;
+    for (const agent of phase.agents) {
+      if (!agent || typeof agent.description !== 'string' ||
+          typeof agent.prompt !== 'string' || !agent.prompt.trim() ||
+          agent.prompt.length > 8_000 || typeof agent.profile !== 'string') {
+        throw new Error('Workflow agent has invalid or oversized instructions.');
+      }
+      if (agent.peerFailover !== undefined && typeof agent.peerFailover !== 'boolean')
+        throw new Error('Peer failover flag must be a boolean.');
+      if (agent.peerFailover && (agent.profile !== 'explore' || !agent.peer ||
+         agent.isolation || !Array.isArray(agent.peerCandidates) ||
+         agent.peerCandidates.length < 2 || agent.peerCandidates.length > 3 ||
+         new Set(agent.peerCandidates).size !== agent.peerCandidates.length)) {
+        throw new Error('Peer failover requires 2–3 distinct explicitly approved read-only peer candidates.');
+      }
+    }
+  }
+  if (total > MAX_WORKFLOW_AGENTS) throw new Error('Workflow cannot exceed 16 agents.');
+  parseSwarmVotePolicy(spec.consensus);
+  if(spec.authenticatedPeerVoting!==undefined&&typeof spec.authenticatedPeerVoting!=='boolean')
+    throw new Error('Authenticated peer voting must be a boolean.');
+  if(spec.authenticatedPeerVoting){
+    if(!spec.consensus||spec.phases.length<2)
+      throw new Error('Authenticated peer voting requires a reviewer consensus phase and a following verification phase.');
+    const reviewers=spec.phases[spec.phases.length-2].agents;
+    if(reviewers.length<2||reviewers.some(agent=>agent.profile!=='explore'||
+       !agent.peer||agent.isolation||agent.peerFailover||agent.peerCandidates?.length)||
+       new Set(reviewers.map(agent=>agent.peer)).size!==reviewers.length)
+      throw new Error('Authenticated peer voting requires distinct pinned, read-only reviewer peers without placement fallback.');
+  }
+  const topology = parseSwarmTopology(spec.topology);
+  if (topology !== 'phased' && spec.phases.some(phase => phase.agents.some(agent =>
+    agent.profile !== 'explore' || agent.peer !== undefined || agent.peerCandidates?.length || agent.isolation))) {
+    throw new Error('Non-phased coordination is local, read-only and cannot relay reports to remote peers or modifying agents.');
+  }
+  if (spec.memoryStackIds !== undefined) parseSwarmMemoryStackIds(spec.memoryStackIds);
+  if (spec.learning !== undefined && typeof spec.learning !== 'boolean') throw new Error('Invalid learning flag.');
+  if (spec.learning && spec.phases.some(phase=>phase.agents.some(agent=>agent.peer!==undefined || agent.profile!=='explore'))) {
+    throw new Error('Operator-approved learning retrieval is local read-only only.');
+  }
+}
 
 /** Per-injected-report cap for the prior-phase context block (chars) — a
  * later phase sees earlier findings, but a chatty phase must not blow out
@@ -108,7 +199,24 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
       const effort: 'low' | 'medium' | 'high' | undefined =
         rawEffort === 'low' || rawEffort === 'medium' || rawEffort === 'high' ? rawEffort : undefined;
       const isolation: 'worktree' | undefined = agent.isolation === 'worktree' ? 'worktree' : undefined;
-      return { description: agentDescription, prompt, profile, effort, isolation };
+      if (agent.peer !== undefined) assertReadOnlyPeerPlacement(agent.peer, profile, Boolean(isolation));
+      const peer = agent.peer as string | undefined;
+      const peerCandidates = agent.peerCandidates;
+      if (peerCandidates !== undefined && (!Array.isArray(peerCandidates) || peerCandidates.length === 0 ||
+          peerCandidates.length > 3 || !peerCandidates.every((alias: unknown) => typeof alias === 'string' && alias.length <= 120) ||
+          !peer || !peerCandidates.includes(peer))) {
+        throw new Error('Peer candidate pool requires 1–3 aliases and a valid primary read-only peer.');
+      }
+      if (agent.peerFailover !== undefined && typeof agent.peerFailover !== 'boolean')
+        throw new Error('peerFailover must be a boolean.');
+      if (agent.peerFailover === true && (profile !== 'explore' || !peer ||
+        !Array.isArray(peerCandidates) || peerCandidates.length < 2 ||
+        new Set(peerCandidates).size !== peerCandidates.length)) {
+        throw new Error('Peer failover requires 2–3 distinct explicitly approved read-only peer candidates.');
+      }
+      return { description: agentDescription, prompt, profile, effort, isolation,
+        ...(peer ? { peer } : {}), ...(Array.isArray(peerCandidates) ? { peerCandidates: [...peerCandidates] as string[] } : {}),
+        ...(agent.peerFailover === true ? { peerFailover: true } : {}) };
     });
     totalAgents += agents.length;
     return { title, agents };
@@ -116,7 +224,19 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
   if (totalAgents > MAX_WORKFLOW_AGENTS) {
     throw new Error(`workflow allows at most ${MAX_WORKFLOW_AGENTS} agents in total.`);
   }
-  return { name, description, phases };
+  const topology = parseSwarmTopology(args.topology);
+  const memoryStackIds = parseSwarmMemoryStackIds(args.memory_stack_ids);
+  const consensus = parseSwarmVotePolicy(args.consensus);
+  if(args.authenticated_peer_voting!==undefined&&typeof args.authenticated_peer_voting!=='boolean')
+    throw new Error('authenticated_peer_voting must be a boolean.');
+  return { name, description, phases,
+    ...(topology !== 'phased' ? { topology } : {}),
+    ...(args.stop_on_failure === true ? { stopOnFailure: true } : {}),
+    ...(consensus ? { consensus } : {}),
+    ...(args.authenticated_peer_voting === true ? { authenticatedPeerVoting: true } : {}),
+    ...(args.notebook === true ? { notebook: true } : {}),
+    ...(args.learning === true ? { learning: true } : {}),
+    ...(memoryStackIds.length ? { memoryStackIds } : {}) };
 }
 
 /**
@@ -127,7 +247,31 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
  * `executeToolCall` `workflow` branch calls this instead of
  * `parseWorkflowSpec` directly. Exported for the logic tests.
  */
-export function resolveWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
+export function resolveWorkflowSpec(args: Record<string, unknown>, sessionId?: string): WorkflowSpec {
+  // A resume-only tool invocation explicitly opts into recovering an
+  // interrupted workflow. Never re-run one merely because it hydrated.
+  if (typeof args.resume === 'string' && args.resume.trim() && sessionId &&
+      args.goal === undefined && args.preset === undefined &&
+      args.tasks === undefined && args.saved === undefined &&
+      args.phases === undefined && args.name === undefined) {
+    const meta = useSessionStore.getState().sessions.find(s => s.id === sessionId)
+      ?.workflowRunMeta?.[args.resume.trim()];
+    if (!meta?.spec) throw new Error('No recoverable workflow specification for this run in the current session.');
+    return parseWorkflowSpec({
+      ...meta.spec,
+      memory_stack_ids: meta.spec.memoryStackIds,
+      stop_on_failure: meta.spec.stopOnFailure,
+      consensus: meta.spec.consensus,
+      authenticated_peer_voting: meta.spec.authenticatedPeerVoting,
+      notebook: meta.spec.notebook,
+      learning: meta.spec.learning,
+      topology: meta.spec.topology,
+    });
+  }
+  if (args.goal !== undefined) return buildGoalSwarm(args);
+  if (args.preset !== undefined) return buildSwarmPreset(args);
+  if (args.tasks !== undefined) return compileSwarmTaskGraph(args);
+  if (args.mode !== undefined || args.scope !== undefined) throw new Error('workflow mode and scope require a goal or preset.');
   const saved = typeof args.saved === 'string' ? args.saved.trim() : '';
   if (saved && !Array.isArray(args.phases)) {
     const entry = useSavedWorkflowStore.getState().workflows[saved];
@@ -169,6 +313,16 @@ export function composeSavedWorkflowCatalog(saved: SavedWorkflow[]): string {
  * `WorkflowRunMeta.phases[].agents[].taskId` entries still point at the
  * right `ChatSession.subagentRunMeta` entries. Exported for the logic
  * tests. */
+/** Persisted root identity of a workflow replay chain. Does not change
+ * ordinary local checkpoints, only remote peer receipt correlation. */
+export function workflowCorrelationOrigin(
+  toolCallId: string,
+  resume?: string,
+  previous?: { correlationOrigin?: string },
+): string {
+  return previous?.correlationOrigin ?? resume ?? toolCallId;
+}
+
 export function workflowAgentTaskId(runId: string, phaseIndex: number, agentIndex: number): string {
   return `${runId}#p${phaseIndex}a${agentIndex}`;
 }
@@ -205,7 +359,7 @@ export function buildPriorReportsBlock(reports: PhaseReport[]): string {
       entry.report.length > MAX_INJECTED_REPORT_CHARS
         ? `${entry.report.slice(0, MAX_INJECTED_REPORT_CHARS)}\n[truncated]`
         : entry.report;
-    return `### ${entry.phaseTitle} — ${entry.agentDescription}\n${capped}`;
+    return `### ${entry.phaseTitle} — ${entry.agentDescription}\n${wrapUntrustedContent('prior workflow agent report', capped)}`;
   });
   return `\n\n## Results from earlier phases of this workflow\n\n${sections.join('\n\n')}`;
 }
@@ -250,11 +404,10 @@ export interface RunWorkflowParams {
    * `RunSubagentTaskParams.toolCallId`. */
   toolCallId: string;
   spec: WorkflowSpec;
-  /** An earlier `workflow` call's own runId (toolCallId) to resume from —
-   * `done` agents whose journaled `promptHash` still matches replay their
-   * report instantly; failed/cancelled/missing ones re-dispatch. Best-effort:
-   * an unknown id, or one whose run fully succeeded, simply runs everything
-   * fresh rather than erroring — resume is an optimization, not a gate. */
+  /** An earlier interrupted `workflow` tool-call ID in the same session.
+   * Only completed, full-prompt-matching agents replay their reports. An
+   * unknown, active or already completed run MUST fail closed: silently
+   * treating it as new work could repeat dangerous external mutations. */
   resume?: string;
   target: RunSubagentTaskParams['target'];
   effort?: string;
@@ -274,21 +427,26 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
   const { sessionId, runId, parentCheckpointId, parentSignal, toolCallId, spec, resume, target, effort, risk, onRoutingDecision, onMutatedPath, onMutationFailure } =
     params;
 
-  // The journal of the run being resumed — only a TERMINAL-WITH-FAILURES
-  // run's entries are consulted (a fully-'done' run has nothing to resume,
-  // and re-running it fresh is the least surprising reading of the call).
-  const resumeJournal: Record<string, WorkflowAgentResult> | undefined = (() => {
-    if (!resume) return undefined;
-    const meta = useSessionStore.getState().sessions.find((s) => s.id === sessionId)?.workflowRunMeta?.[resume];
-    if (!meta || meta.status === 'done') return undefined;
-    return meta.agentResults;
-  })();
+  const sourceMeta = resume
+    ? useSessionStore.getState().sessions.find(s => s.id === sessionId)?.workflowRunMeta?.[resume]
+    : undefined;
+  if (resume && (!sourceMeta || (sourceMeta.status !== 'error' && sourceMeta.status !== 'cancelled'))) {
+    return stringifyToolError(new Error(
+      'Cannot resume: workflow run does not exist, is still active, or has already completed in this session. No new agents were dispatched.',
+    ));
+  }
+  const resumeJournal: Record<string, WorkflowAgentResult> | undefined =
+    resume ? sourceMeta?.agentResults : undefined;
 
   // This run's own journal, keyed by the NEW run's deterministic taskIds and
   // snapshotted with the terminal meta in `finish` — which is what makes a
   // chain of partial resumes work: each resume writes a fresh, complete
   // journal of its own.
   const agentResults: Record<string, WorkflowAgentResult> = {};
+  // For a partial resume chain A -> B -> C, C must still attach to A's
+  // durable peer task receipt. Using only the immediately previous run id
+  // would mint a new correlation and could send duplicate remote work.
+  const correlationOrigin = workflowCorrelationOrigin(toolCallId, resume, sourceMeta);
 
   const phases: WorkflowPhase[] = spec.phases.map((phase, phaseIndex) => ({
     title: phase.title,
@@ -304,7 +462,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
    * `ChatSession.workflowRunMeta` so the drawer keeps rendering it after a
    * restart (the agents' own stats persist via each child's existing
    * `setSubagentRun` call). */
-  const finish = (status: 'done' | 'error' | 'cancelled', result: string): string => {
+  const finish = async (status: 'done' | 'error' | 'cancelled', result: string): Promise<string> => {
     useWorkflowStore.getState().finish(toolCallId, status);
     const live = useWorkflowStore.getState().runs[toolCallId];
     useSessionStore.getState().setWorkflowRun(sessionId, toolCallId, {
@@ -315,8 +473,31 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
       finishedAt: Date.now(),
       phases,
       agentResults,
+      correlationOrigin,
+      ...(runId ? { sourceRunId: runId } : {}),
+      spec,
     });
+    try {
+      await flushSessionPersistence();
+    } catch (err) {
+      return stringifyToolError(new Error('Workflow completion could not be persisted: ' + String(err)));
+    }
     return result;
+  };
+
+  /** Save a bounded restart journal before dispatch and after each agent.
+   * Session persistence is file-backed but debounced, so forced power loss
+   * during a write may still lose the last update; never replay mutations
+   * automatically after a crash. */
+  const checkpoint = async (): Promise<void> => {
+    const live = useWorkflowStore.getState().runs[toolCallId];
+    useSessionStore.getState().setWorkflowRun(sessionId, toolCallId, {
+      name: spec.name, description: spec.description, status: 'running',
+      startedAt: live?.startedAt ?? Date.now(), finishedAt: Date.now(),
+      phases, agentResults: { ...agentResults }, correlationOrigin, ...(runId ? { sourceRunId: runId } : {}), spec,
+    });
+    // Dependents cannot start until the last agent journal has been written.
+    await flushSessionPersistence();
   };
 
   /** Registers a replayed (journal-hit) agent in the live store AND the
@@ -349,6 +530,50 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
   };
 
   try {
+    assertWorkflowBounds(spec);
+    await checkpoint(); // durably register the graph before dispatch
+    const voterSnapshot=spec.authenticatedPeerVoting
+      ? await frozenAuthenticatedPeerVoters(spec.phases[spec.phases.length-2].agents
+        .map(agent=>agent.peer!))
+      : null;
+    // Resolve one module instance per graph instead of racing concurrent
+    // per-agent dynamic imports while a remote reviewer wave fans out.
+    const remoteRunner=spec.phases.some(phase=>phase.agents.some(agent=>!!agent.peer))
+      ? await import('./swarmPeer') : null;
+    const failoverRunner=spec.phases.some(phase=>phase.agents.some(agent=>!!agent.peerFailover))
+      ? await import('./swarmPeerRecovery') : null;
+    // Persisted saved workflows can be hand-edited; validate the permission
+    // boundary again at dispatch, not only during JSON-tool parsing.
+    for (const phase of spec.phases) {
+      for (const agent of phase.agents) {
+        if (agent.peer !== undefined) assertReadOnlyPeerPlacement(agent.peer, agent.profile, Boolean(agent.isolation));
+        if (agent.peerCandidates !== undefined && (
+          !agent.peer || !Array.isArray(agent.peerCandidates) || agent.peerCandidates.length < 1 ||
+          agent.peerCandidates.length > 3 ||
+          !agent.peerCandidates.includes(agent.peer) ||
+          agent.peerCandidates.some(candidate => {
+            try { assertReadOnlyPeerPlacement(candidate, agent.profile, Boolean(agent.isolation)); return false; }
+            catch { return true; }
+          })
+        )) throw new Error('Saved workflow has invalid read-only peer candidates.');
+      }
+    }
+    if ((spec.memoryStackIds?.length || spec.notebook) && spec.phases.some(phase => phase.agents.some(agent => agent.peer))) {
+      throw new Error('Indexed knowledge cannot be automatically forwarded to remote peers. Remove memory_stack_ids for a peer workflow.');
+    }
+    const knowledgeBlock = spec.memoryStackIds?.length
+      ? await retrieveSwarmKnowledge(spec.memoryStackIds, spec.description)
+      : '';
+    const session = useSessionStore.getState().sessions.find(s => s.id === sessionId);
+    const notebookProject = session?.workspacePath?.trim() || 'session:' + sessionId;
+    const notebookBlock = spec.notebook ? approvedSwarmNotebookBlock(notebookProject) : '';
+    const learningBlock = spec.learning
+      ? approvedLearningContext(selectSwarmDomain(spec.description)) +
+        buildSwarmTrajectoryContext(
+          useSessionStore.getState().sessions, selectSwarmDomain(spec.description),
+          notebookProject, sessionId,
+        )
+      : '';
     const priorReports: PhaseReport[] = [];
     const phaseSummaries: { title: string; agents: { description: string; status: string; report: string; reused?: boolean }[] }[] = [];
 
@@ -357,12 +582,39 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
       useWorkflowStore.getState().beginPhase(toolCallId, phaseIndex);
       const phase = spec.phases[phaseIndex];
       const contextBlock = buildPriorReportsBlock(priorReports);
+      const sharedContext = [knowledgeBlock, notebookBlock, learningBlock].filter(Boolean).map(x => '\n\n' + x).join('');
 
       const limit = useSettingsStore.getState().maxConcurrentSubagents;
-      const results = await runBounded(
-        phase.agents.map((agent, agentIndex) => async () => {
+      // A topology is a scheduling policy, never a new agent/permission grant.
+      // A failed coordinator can be bypassed by later read-only waves,
+      // but modifying workflows cannot use these policies.
+      const stats = loadSpecialistMetrics();
+      const domain = selectSwarmDomain(spec.description);
+      const waves = planCoordinationWaves(spec.topology ?? 'phased', phase.agents.length,
+        phase.agents.map(agent => {
+          const observation = stats[domain + ':' + agent.description];
+          return {completions: observation?.successes ?? 0, failures: observation?.failures ?? 0};
+        }));
+      const results: string[] = new Array(phase.agents.length);
+      const waveMessages: {sender: string; report: string}[] = [];
+      // Adaptive read-only teams elect a replacement on a failed report,
+      // or fan out the still-pending agents after one coordinator succeeds.
+      // Never repeat a failed or completed agent.
+      const adaptivePending = waves.topology === 'adaptive' ? waves.waves.flat() : [];
+      let coordinatorReady = false;
+      for (let waveIndex = 0; waveIndex < waves.waves.length; waveIndex++) {
+        const wave = waves.topology === 'adaptive'
+          ? nextAdaptiveCoordinationWave(adaptivePending, coordinatorReady)
+          : waves.waves[waveIndex];
+        if (!wave.length) break;
+        if (waves.topology === 'adaptive') adaptivePending.splice(0, wave.length);
+        const completed = await runBounded(
+          wave.map(agentIndex => {
+            const agent = phase.agents[agentIndex];
+            return async () => {
+          const startedAt = Date.now();
           const agentTaskId = workflowAgentTaskId(toolCallId, phaseIndex, agentIndex);
-          const prompt = `${agent.prompt}${contextBlock}`;
+          const prompt = `${agent.prompt}${contextBlock}${sharedContext}${formatWaveMessages(waveMessages, agent.description, waves.topology)}`;
           const hash = promptHash(prompt);
 
           // Resume hit: the same position in the resumed run completed with
@@ -374,10 +626,26 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
           if (journaled && journaled.status === 'done' && journaled.promptHash === hash) {
             replayJournaledAgent(agentTaskId, agent, prompt, journaled.report);
             agentResults[agentTaskId] = { promptHash: hash, status: 'done', report: journaled.report, reused: true };
+            await checkpoint();
             return journaled.report;
           }
 
-          const raw = await runSubagentTask({
+          const raw = agent.peer
+            ? await (agent.peerFailover
+                ? failoverRunner!.runPairedPeerAgentWithFailover
+                : remoteRunner!.runPairedPeerAgent)({
+                sessionId,
+                workflowRunId: toolCallId,
+                taskId: agentTaskId,
+                description: agent.description,
+                prompt,
+                peer: agent.peer,
+                peerCandidates: agent.peerCandidates,
+                correlationRunId: correlationOrigin,
+                correlationTaskPosition: `p${phaseIndex}a${agentIndex}`,
+                signal: parentSignal,
+              })
+            : await runSubagentTask({
             sessionId,
             runId,
             parentCheckpointId,
@@ -403,10 +671,24 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
             status: cancelled ? 'cancelled' : failed ? 'error' : 'done',
             report: raw.slice(0, MAX_REPORT_CHARS),
           };
+          await checkpoint();
+          if (phaseIndex === 0 && spec.name.startsWith('auto-swarm-') && !cancelled) {
+            recordSpecialistMetric(selectSwarmDomain(spec.description), agent.description, !failed, Date.now() - startedAt);
+          }
           return raw;
+          };
         }),
         limit,
       );
+        wave.forEach((index, ordinal) => {
+          const report = completed[ordinal];
+          results[index] = report;
+          if (report && unwrapUntrustedContent(report) !== CANCELLED_TOOL_RESULT && !resultIsError(report)) {
+            waveMessages.push({sender: phase.agents[index].description, report});
+            if (waves.topology === 'adaptive' && wave.length === 1) coordinatorReady = true;
+          }
+        });
+      }
 
       const agents = phase.agents.map((agent, agentIndex) => {
         const raw = results[agentIndex];
@@ -425,9 +707,13 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
       });
       phaseSummaries.push({ title: phase.title, agents });
 
+      // In dependency-aware workflows and modifying swarms, an incomplete
+      // prerequisite must never unlock a downstream agent. Earlier workflow
+      // specs preserve their previous best-effort continuation semantics.
       if (parentSignal?.aborted) {
         return finish('cancelled', CANCELLED_TOOL_RESULT);
       }
+      if (spec.stopOnFailure && agents.some(agent => agent.status !== 'done')) break;
     }
 
     const anyFailure = phaseSummaries.some((phase) => phase.agents.some((agent) => agent.status !== 'done'));
@@ -435,9 +721,41 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
     // — what makes `resolveWorkflowSpec`'s `saved` lookup and the drawer's
     // Saved-workflows list work without the user ever pressing Save.
     if (!anyFailure) useSavedWorkflowStore.getState().upsert(spec, Date.now());
+    const reviewPhase = spec.consensus && phaseSummaries.length >= 2
+      ? phaseSummaries[phaseSummaries.length - 2] : null;
+    // Revalidate the native pairing registry before a remote vote becomes a
+    // notebook candidate. Revocation or certificate rotation invalidates the
+    // quorum even when old report text looks convincing.
+    if(voterSnapshot)await revalidateAuthenticatedPeerVoters(voterSnapshot);
+    const consensus = reviewPhase ? reconcileSwarmReviewers(reviewPhase.agents
+      .flatMap((agent,index)=>agent.status==='done'?[{
+        reviewer:voterSnapshot ? 'paired:'+voterSnapshot[index].certificateSha256 : agent.description,
+        report:agent.report,
+      }]:[]),
+      spec.consensus ?? 'strict', reviewPhase.agents.length) : undefined;
+    const notebookStaged: string[] = [];
+    const notebookWarnings: string[] = [];
+    if (spec.notebook && consensus && !anyFailure) {
+      for (const claim of consensus.claims) {
+        if (claim.status !== 'reviewer_agreement' || !claim.evidence.length) continue;
+        try {
+          stageSwarmNote({ project: notebookProject, id: claim.id,
+            evidence: claim.evidence.slice(0, 6), reviewers: claim.supportingReviewers,
+            runId: correlationOrigin });
+          notebookStaged.push(claim.id);
+        } catch (error) {
+          notebookWarnings.push('Failed to stage claim ' + claim.id + ': ' + String(error).slice(0, 200));
+        }
+      }
+    }
     return finish(
       anyFailure ? 'error' : 'done',
-      stringifyToolResult({ workflow: spec.name, status: anyFailure ? 'completed_with_failures' : 'completed', phases: phaseSummaries }),
+      stringifyToolResult({
+        workflow: spec.name, status: anyFailure ? 'completed_with_failures' : 'completed',
+        phases: phaseSummaries,
+        ...(consensus ? { consensus } : {}),
+        ...(spec.notebook ? { notebookStaged, notebookWarnings, notebookRequiresApproval: true } : {}),
+      }),
     );
   } catch (err) {
     return finish('error', stringifyToolError(err));

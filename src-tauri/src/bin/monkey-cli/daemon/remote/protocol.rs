@@ -170,6 +170,12 @@ pub enum DeviceCapability {
     /// content over is not the same as talking, and it is the grant that
     /// decides whether this node will fetch what a peer offers.
     PeerArtifact,
+    /// Query a specifically shared vector-memory namespace. Does not imply
+    /// message, task, run or artifact access.
+    PeerMemoryRead,
+    /// Replicate bounded vector records into a specifically shared namespace.
+    /// Requires a separate per-namespace ACL; pairing grant alone is insufficient.
+    PeerMemoryWrite,
     /// Hand this node a *frozen process image* from another owned node and let
     /// it resume the run (roadmap K18).
     ///
@@ -736,6 +742,8 @@ pub fn is_peer_only(capabilities: &BTreeSet<DeviceCapability>) -> bool {
                 DeviceCapability::PeerMessage
                     | DeviceCapability::PeerTaskRequest
                     | DeviceCapability::PeerArtifact
+                    | DeviceCapability::PeerMemoryRead
+                    | DeviceCapability::PeerMemoryWrite
             )
         })
 }
@@ -2461,6 +2469,8 @@ pub fn all_peer_capabilities() -> BTreeSet<DeviceCapability> {
         DeviceCapability::PeerMessage,
         DeviceCapability::PeerTaskRequest,
         DeviceCapability::PeerArtifact,
+        DeviceCapability::PeerMemoryRead,
+        DeviceCapability::PeerMemoryWrite,
     ])
 }
 
@@ -2477,6 +2487,8 @@ pub fn peer_capabilities_of(
                 DeviceCapability::PeerMessage
                     | DeviceCapability::PeerTaskRequest
                     | DeviceCapability::PeerArtifact
+                    | DeviceCapability::PeerMemoryRead
+                    | DeviceCapability::PeerMemoryWrite
             )
         })
         .collect()

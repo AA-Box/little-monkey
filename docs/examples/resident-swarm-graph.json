@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "id": "project-audit-001",
+  "max_parallel": 2,
+  "nodes": [
+    {
+      "id": "architecture",
+      "recipe": "/ABSOLUTE/PATH/TO/your/read-only-architecture-recipe.json",
+      "depends_on": [],
+      "max_runtime_seconds": 1800
+    },
+    {
+      "id": "security",
+      "recipe": "/ABSOLUTE/PATH/TO/your/read-only-security-recipe.json",
+      "depends_on": [],
+      "max_runtime_seconds": 1800
+    },
+    {
+      "id": "verification",
+      "recipe": "/ABSOLUTE/PATH/TO/your/read-only-verification-recipe.json",
+      "depends_on": ["architecture", "security"],
+      "max_runtime_seconds": 1800
+    }
+  ]
+}

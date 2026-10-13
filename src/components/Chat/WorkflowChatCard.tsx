@@ -43,7 +43,7 @@ export function parseWorkflowArgs(args: string): { name: string; agentCount: num
  * Exported for the logic tests. */
 export function resolveWorkflowStatus(
   liveStatus: WorkflowStatus | undefined,
-  metaStatus: "done" | "error" | "cancelled" | undefined,
+  metaStatus: WorkflowStatus | undefined,
   result: string | undefined,
 ): WorkflowStatus {
   if (liveStatus) return liveStatus;

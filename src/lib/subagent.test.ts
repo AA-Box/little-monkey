@@ -56,6 +56,10 @@ vi.mock("./turnEngine", () => ({
   stringifyToolError: (err: unknown) => JSON.stringify({ error: errorMessage(err) }),
   describeUsageTarget: (target: ResolvedTarget) =>
     target.kind === "local" ? "Local model" : target.kind === "ollama" ? `Ollama · ${target.model}` : `${target.providerId} · ${target.model}`,
+  costTargetKey: (target: ResolvedTarget) =>
+    target.kind === "local" ? "local:test-model"
+      : target.kind === "ollama" ? `ollama:${target.model}`
+      : `provider:${target.providerId}:${target.model}`,
 }));
 
 import { MAX_SUBAGENT_ITERATIONS, resolveSubagentProfile, runSubagentTask, steerSubagentRun, type RunSubagentTaskParams } from "./subagent";

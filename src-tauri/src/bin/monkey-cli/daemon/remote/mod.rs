@@ -2521,3 +2521,57 @@ fn now_ms() -> Result<u64, String> {
             u64::try_from(duration.as_millis()).map_err(|_| "timestamp overflow".to_string())
         })
 }
+
+/// Publish a monotonic locally-leader-authored DAG observation to an
+/// operator-enrolled peer. This carries NO execution authority or tool grant.
+pub(crate) async fn signed_swarm_checkpoint(
+    paths:&DaemonPaths,alias:&str,expected_server_sha256:&str,
+    body:Vec<u8>,now_ms:u64,
+)->Result<serde_json::Value,String>{
+    let store=RemoteStore::open(&paths.root)?;
+    let profile=store.controller(alias)?
+        .ok_or_else(||"Replica target is not an approved paired peer".to_string())?;
+    if profile.server_certificate_sha256!=expected_server_sha256 {
+        return Err("Cluster replica roster differs from TLS-pinned peer".into());
+    }
+    client::call(paths,alias,Method::POST,
+        "/v1/remote/peer/swarm-state/checkpoints",body,now_ms).await
+}
+
+/// Verify actual remote SQLite persistence through a SECOND signed request.
+/// The source leader must not treat a successful POST alone as proof that a
+/// checkpoint was durably queryable by the paired receiver.
+pub(crate) async fn signed_swarm_checkpoint_readback(
+    paths:&DaemonPaths,alias:&str,expected_server_sha256:&str,
+    group:&str,graph:&str,now_ms:u64,
+)->Result<serde_json::Value,String>{
+    if !group.bytes().all(|c|c.is_ascii_alphanumeric()||matches!(c,b'-'|b'_'|b'.'))||
+        !graph.bytes().all(|c|c.is_ascii_alphanumeric()||matches!(c,b'-'|b'_'|b'.'))||
+        group.is_empty()||graph.is_empty()||group.len()>80||graph.len()>80{
+        return Err("Invalid cluster or graph for remote DAG readback".into());
+    }
+    let store=RemoteStore::open(&paths.root)?;
+    let profile=store.controller(alias)?
+        .ok_or_else(||"Replica readback target is not an approved paired peer".to_string())?;
+    if profile.server_certificate_sha256!=expected_server_sha256 {
+        return Err("Cluster readback target differs from TLS-pinned peer".into());
+    }
+    client::call(paths,alias,Method::GET,
+        &format!("/v1/remote/peer/swarm-state/{group}/{graph}"),Vec::new(),now_ms).await
+}
+
+/// A typed, signed and TLS-certificate-pinned vote request. Only the already
+/// approved outbound peer alias is allowed to choose the destination.
+pub(crate) async fn signed_swarm_vote(
+    paths: &DaemonPaths, alias: &str, expected_server_sha256: &str,
+    body: Vec<u8>, now_ms: u64,
+) -> Result<serde_json::Value,String> {
+    let store=RemoteStore::open(&paths.root)?;
+    let profile=store.controller(alias)?
+        .ok_or_else(||"Cluster voter is not an approved paired peer".to_string())?;
+    if profile.server_certificate_sha256!=expected_server_sha256 {
+        return Err("Cluster roster identity does not match actual pinned TLS peer".into());
+    }
+    client::call(paths,alias,Method::POST,
+        "/v1/remote/peer/swarm-election/vote",body,now_ms).await
+}

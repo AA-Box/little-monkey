@@ -1154,6 +1154,12 @@ export type ChatTarget =
   | { kind: "provider"; providerId: string | null; model: string | null };
 
 export function getActiveChatTarget(): ChatTarget {
+  // After a process crash mid-rollout, no agent may silently run a candidate
+  // that never passed inference. The Swarm settings recovery explicitly
+  // restores the prior local model and removes this durable fencing journal.
+  if(typeof localStorage!=='undefined' &&
+     localStorage.getItem('little-monkey-mlx-fusion-promotion-v1'))
+    throw new Error('An MLX deployment was interrupted. Open Agent Swarms to restore the previous model before using chat or agents.');
   const { activeProvider, activeOllamaModel, activeProviderId, activeProviderModel } = useModelStore.getState();
   if (activeProvider === "ollama") {
     return { kind: "ollama", baseUrl: "http://127.0.0.1:11434", model: activeOllamaModel };

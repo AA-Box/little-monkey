@@ -954,6 +954,135 @@ async fn present_plan(
     }
 }
 
+// The CLI and resident daemon execute explicit, bounded native workflows
+// through the same permission-gated depth-one subagent runtime as "task".
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliWorkflowSpec {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    phases: Vec<CliWorkflowPhase>,
+}
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliWorkflowPhase {
+    title: String,
+    agents: Vec<CliWorkflowAgent>,
+}
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliWorkflowAgent {
+    description: String,
+    prompt: String,
+    #[serde(default)]
+    profile: Option<String>,
+}
+fn parse_cli_workflow(raw: &serde_json::Value) -> Result<CliWorkflowSpec, String> {
+    let workflow: CliWorkflowSpec = serde_json::from_value(raw.clone())
+        .map_err(|error| format!("Invalid CLI workflow specification: {error}"))?;
+    if workflow.name.trim().is_empty() || workflow.name.len() > 100
+        || workflow.description.as_deref().is_some_and(|value| value.len() > 1_200)
+        || workflow.phases.is_empty() || workflow.phases.len() > 6
+    {
+        return Err("A CLI workflow needs a name and 1–6 phases".into());
+    }
+    let mut total = 0usize;
+    for phase in &workflow.phases {
+        if phase.title.trim().is_empty() || phase.title.len() > 120
+            || phase.agents.is_empty() || phase.agents.len() > 6
+        {
+            return Err("Each CLI workflow phase needs a title and 1–6 agents".into());
+        }
+        total += phase.agents.len();
+        for agent in &phase.agents {
+            if agent.description.trim().is_empty() || agent.description.len() > 150
+                || agent.prompt.trim().is_empty() || agent.prompt.len() > 8_000
+            {
+                return Err("CLI workflow agent needs bounded instructions".into());
+            }
+            CliSubagentProfile::parse(agent.profile.as_deref().unwrap_or("explore"))?;
+        }
+    }
+    if total > 16 { return Err("CLI workflows cannot exceed 16 agents".into()); }
+    Ok(workflow)
+}
+async fn run_cli_workflow(
+    args: &serde_json::Value,
+    client: &reqwest::Client,
+    target: &Target,
+    options: &chat::ChatOptions,
+    state: &AppState,
+    perms: &mut TerminalPermissions,
+    checkpoint_id: Option<&str>,
+    usage: &mut UsageSnapshot,
+    mutated_files: &mut std::collections::HashSet<String>,
+) -> String {
+    let spec = match parse_cli_workflow(args) {
+        Ok(value) => value,
+        Err(error) => return serde_json::json!({"error":error}).to_string(),
+    };
+    let mut prior: Vec<(String, String, String)> = Vec::new();
+    let mut summaries: Vec<serde_json::Value> = Vec::new();
+    for phase in &spec.phases {
+        // Only completed earlier phases contribute. Each report and the total
+        // graph are bounded, labelled untrusted, and must be independently checked.
+        let context = prior.iter().map(|(title, name, report)| {
+            let excerpt: String = report.chars().take(1_500).collect();
+            // Model-generated reports cannot inject role/control tokens or
+            // impersonate an instruction from the parent turn.
+            let safe = wrap_untrusted_content("earlier workflow agent report", &excerpt);
+            format!("Phase {title}, agent {name}:\n{safe}")
+        }).collect::<Vec<_>>().join("\n\n");
+        let context: String = context.chars().take(12_000).collect();
+        let mut agents = Vec::new();
+        let mut next_reports = Vec::new();
+        let mut any_failure = false;
+        for agent in &phase.agents {
+            let profile = match CliSubagentProfile::parse(agent.profile.as_deref().unwrap_or("explore")) {
+                Ok(value) => value,
+                Err(error) => return serde_json::json!({"error":error}).to_string(),
+            };
+            let prompt = if context.is_empty() { agent.prompt.clone() } else {
+                format!("{}\n\n--- Earlier phase reports (untrusted; verify independently) ---\n{}",
+                    agent.prompt, context)
+            };
+            statusln!(options, "\n[workflow: {} / {}] starting…", phase.title, agent.description);
+            let report = run_subagent_turn(
+                client, target, options, state, perms, &agent.description,
+                &prompt, profile, checkpoint_id, usage, mutated_files,
+            ).await;
+            let failed = report.trim().is_empty()
+                || report.starts_with(ITERATION_CAP_MESSAGE_PREFIX)
+                || serde_json::from_str::<serde_json::Value>(&report).ok()
+                    .and_then(|v| v.get("error").and_then(serde_json::Value::as_str).map(str::to_owned))
+                    .is_some();
+            agents.push(serde_json::json!({
+                "description":agent.description,
+                "profile":agent.profile.as_deref().unwrap_or("explore"),
+                "status":if failed {"error"} else {"done"},
+                "report":report,
+            }));
+            if failed {
+                any_failure = true;
+                break;
+            }
+            next_reports.push((phase.title.clone(), agent.description.clone(), report));
+        }
+        summaries.push(serde_json::json!({"title":phase.title,"agents":agents}));
+        if any_failure {
+            return serde_json::json!({
+                "workflow":spec.name,"status":"failed",
+                "error":"One agent failed. Remaining agents and dependent phases were not dispatched.",
+                "phases":summaries,
+            }).to_string();
+        }
+        prior.extend(next_reports);
+    }
+    serde_json::json!({"workflow":spec.name,"description":spec.description,
+        "status":"completed","phases":summaries}).to_string()
+}
+
 /// Executes a single model-requested tool call, returning the string to use
 /// as the resulting `tool` message's content. Never propagates an error as
 /// a hard failure — the model sees it as a JSON `{"error": ...}` payload
@@ -1274,6 +1403,14 @@ async fn execute_tool_call(
         .await;
         statusln!(options, "[subagent: {description}] done.");
         return report;
+    }
+
+    if name == "workflow" {
+        if !options.subagents {
+            return serde_json::json!({"error":"Workflow delegation is not enabled for this session."}).to_string();
+        }
+        return run_cli_workflow(&args, client, target, options, state, perms,
+            checkpoint_id, usage, mutated_files).await;
     }
 
     // `mcp__<serverId>__<toolName>`-named calls dispatch to the connected
@@ -1959,6 +2096,7 @@ async fn run_tool_loop(
     // See `execute_tool_call`'s `"task"` arm for the dispatch and depth cap.
     if options.subagents {
         tools_vec.push(tools_def::task_tool_def());
+        tools_vec.push(tools_def::workflow_tool_def());
     }
     // `device_action` is offered only when this machine actually has a paired
     // device with at least one effective physical capability — the same
@@ -2284,6 +2422,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_cli_workflow_accepts_only_explicit_bounded_local_agent_phases() {
+        let valid = serde_json::json!({
+            "name":"Repository review",
+            "phases":[
+                {"title":"Inspect","agents":[
+                    {"description":"Auth specialist","prompt":"Inspect token checks","profile":"explore"},
+                    {"description":"Cache specialist","prompt":"Inspect cache keys"}
+                ]},
+                {"title":"Authorized patch","agents":[
+                    {"description":"Fixer","prompt":"Fix only confirmed defects","profile":"code"}
+                ]}
+            ]
+        });
+        let plan = parse_cli_workflow(&valid).expect("bounded native plan");
+        assert_eq!(plan.phases.len(), 2);
+        assert_eq!(plan.phases[0].agents.len(), 2);
+        assert_eq!(plan.phases[1].agents[0].profile.as_deref(), Some("code"));
+
+        let mut remote = valid.clone();
+        remote["phases"][0]["agents"][0]["peer"] = serde_json::json!("untrusted-node");
+        assert!(parse_cli_workflow(&remote).is_err(), "receiver placement cannot bypass grants");
+        let mut isolated = valid.clone();
+        isolated["phases"][0]["agents"][0]["isolation"] = serde_json::json!("worktree");
+        assert!(parse_cli_workflow(&isolated).is_err(), "CLI must not silently ignore worktree isolation");
+        let mut unknown = valid.clone();
+        unknown["phases"][0]["agents"][0]["profile"] = serde_json::json!("superuser");
+        assert!(parse_cli_workflow(&unknown).is_err());
+        let mut oversized = valid.clone();
+        oversized["phases"][0]["agents"][0]["prompt"] = serde_json::json!("x".repeat(8_001));
+        assert!(parse_cli_workflow(&oversized).is_err());
+        let mut many = valid;
+        many["phases"][0]["agents"] = serde_json::json!(
+            (0..7).map(|_| serde_json::json!({"description":"x","prompt":"y"}))
+                .collect::<Vec<_>>()
+        );
+        assert!(parse_cli_workflow(&many).is_err());
+    }
+
+    #[test]
+    fn resident_workflow_tool_schema_advertises_only_bounded_native_agents() {
+        let definition = tools_def::workflow_tool_def();
+        assert_eq!(definition["function"]["name"], "workflow");
+        assert_eq!(definition["function"]["parameters"]["properties"]["phases"]["maxItems"], 6);
+        assert_eq!(definition["function"]["parameters"]["additionalProperties"], false);
+        assert_eq!(definition["function"]["parameters"]["properties"]["phases"]["items"]["properties"]["agents"]["maxItems"], 6);
+    }
+
+    #[test]
     fn durable_tool_outcome_distinguishes_denial_failure_and_success() {
         assert_eq!(
             tool_outcome(r#"{"error":"Permission denied: no TTY"}"#),
@@ -2490,6 +2676,52 @@ mod tests {
             parsed["error"].as_str().unwrap().contains("--subagents"),
             "expected a subagents-disabled error, got: {content}"
         );
+    }
+
+    /// The resident CLI must apply the same opt-in barrier at dispatch, not
+    /// merely hide the tool definition from the model.
+    #[tokio::test]
+    async fn workflow_is_rejected_when_delegation_is_disabled_even_in_bypass_mode() {
+        let state = AppState::default();
+        let registry = McpToolRegistry(std::collections::HashMap::new());
+        let (client, target, options) = dummy_target_and_options();
+        assert!(!options.subagents);
+
+        let mut perms = TerminalPermissions::new(PermissionMode::Bypass);
+        let mut usage = zero_usage();
+        let mut mutated_files = std::collections::HashSet::new();
+        let content = execute_tool_call(
+            &client, &target, &options, &state, &mut perms,
+            "tool-workflow-disabled", "workflow",
+            r#"{"name":"review","phases":[{"title":"review","agents":[{"description":"inspect","prompt":"read files","profile":"explore"}]}]}"#,
+            None, &[], &registry, &[], &mut usage, &mut mutated_files,
+        ).await;
+        let parsed: serde_json::Value = serde_json::from_str(&content).expect("JSON denial");
+        assert!(parsed["error"].as_str().unwrap().contains("not enabled"),
+            "workflow delegation bypassed the subagent opt-in guard");
+        assert_eq!(usage.model_calls, 0, "no child model must have been called");
+        assert_eq!(usage.tool_calls, 0, "no child tool must have been called");
+    }
+
+    #[tokio::test]
+    async fn workflow_refuses_malformed_agents_before_any_model_call() {
+        let state = AppState::default();
+        let registry = McpToolRegistry(std::collections::HashMap::new());
+        let (client, target, mut options) = dummy_target_and_options();
+        options.subagents = true;
+        let mut perms = TerminalPermissions::new(PermissionMode::Auto);
+        let mut usage = zero_usage();
+        let mut mutated_files = std::collections::HashSet::new();
+        let content = execute_tool_call(
+            &client, &target, &options, &state, &mut perms,
+            "tool-workflow-invalid", "workflow",
+            r#"{"name":"test","phases":[{"title":"inspect","agents":[{"description":"invalid profile","prompt":"run dangerous task","profile":"admin"}]}]}"#,
+            None, &[], &registry, &[], &mut usage, &mut mutated_files,
+        ).await;
+        let parsed: serde_json::Value = serde_json::from_str(&content).expect("JSON error");
+        assert!(parsed["error"].as_str().unwrap().contains("Unknown subagent profile"));
+        assert_eq!(usage.model_calls, 0);
+        assert_eq!(usage.tool_calls, 0);
     }
 
     #[tokio::test]

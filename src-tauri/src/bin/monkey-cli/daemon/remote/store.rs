@@ -1171,6 +1171,8 @@ impl RemoteStore {
                 DeviceCapability::PeerMessage
                     | DeviceCapability::PeerTaskRequest
                     | DeviceCapability::PeerArtifact
+                    | DeviceCapability::PeerMemoryRead
+                    | DeviceCapability::PeerMemoryWrite
             )
         });
         capabilities.extend(peer_capabilities.iter().copied());

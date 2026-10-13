@@ -4756,7 +4756,11 @@ mod tests {
             // it just bound on `127.0.0.1`. Loopback by construction, carrying
             // no credential and reaching no third party — the same case as the
             // bare-client entries above, and `hardened()` refuses loopback.
-            ("mlx_chat.rs", 1, 0),
+            // Native MLX promotion canary: a second client sends one
+            // bounded non-streaming inference POST to the exact local
+            // 127.0.0.1 listener; redirects are disabled, no credentials
+            // are sent, and the client has a 90s total deadline.
+            ("mlx_chat.rs", 1, 1),
             ("model_sources.rs", 0, 1),
             // `download_to_file` and the Hugging Face repository-tree listing,
             // the same shape and the same reason, likewise on
@@ -4966,6 +4970,10 @@ mod tests {
             // `MAX_MEDIA_BYTES` (256 MiB) — 149 KB/s and 74 KB/s respectively,
             // *plus* the provider's own render or transcription time.
             ("m7_companion.rs", 2),
+            // The MLX promotion canary targets only 127.0.0.1 and blocks
+            // redirects. Its 90s total deadline bounds local, non-streaming
+            // inference (rather than truncating a remote streaming download).
+            ("mlx_chat.rs", 1),
             // 1.5s for `/api/version` (a tens-of-bytes object) and 10s for
             // `/api/ps`, both fully buffered. The third is 60s on `/api/embed`,
             // which is (C): `EMBED_BATCH_SIZE` caps the vector *count* at 32, not
