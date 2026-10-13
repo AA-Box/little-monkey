@@ -68,7 +68,12 @@ async function main(){
   if(!consent||process.platform!=='darwin'||process.arch!=='arm64'||
      !receiptPath||!python)
     throw Error('An operator-owned Apple Silicon Mac and explicit --receipt, --python and --confirm-local-mlx-inference are required');
-  const actualReceipt=inspect(receiptPath),py=inspect(python);
+  // Homebrew/virtualenv Python entrypoints commonly are symlinks; resolve
+  // the selected binary to its reviewed regular target rather than refusing
+  // a legitimate Apple Silicon MLX environment on path shape alone.
+  if(!isAbsolute(python)||/[\\x00-\\x1f]/.test(python)||python.split(/[\\/\\\\]/).includes('..'))
+    throw Error('Python must be an absolute local selected executable');
+  const actualReceipt=inspect(receiptPath),py=realpathSync(python);
   if(!lstatSync(actualReceipt).isFile()||!lstatSync(py).isFile())
     throw Error('Receipt and reviewed Python must be regular local files');
   if(lstatSync(actualReceipt).size>512*1024)
