@@ -67,6 +67,11 @@ on:
         required: false
         default: '2'
         type: string
+      source_fingerprint:
+        description: Original source A device certificate fingerprint (64 lowercase hex); activates independently hosted receiver acceptance
+        required: false
+        default: ''
+        type: string
       replica_graph_id:
         description: Optional already-prestaged read-only DAG to verify on two real installations
         required: false
@@ -327,6 +332,18 @@ jobs:
               --confirm-local-mlx-inference "${PREVIOUS_ARGS[@]}" \
               > "$RUNNER_TEMP/native-swarm-mlx-fused-inference-acceptance.json"
           fi
+      - name: Publish source model usage and DAG transitions via signed pinned-TLS readback
+        if: ${{ inputs.source_fingerprint != '' && inputs.replica_graph_id != '' && inputs.cluster_group != '' }}
+        shell: bash
+        env:
+          SWARM_GROUP: ${{ inputs.cluster_group }}
+          SWARM_GRAPH: ${{ inputs.replica_graph_id }}
+        run: |
+          set -euo pipefail
+          node scripts/swarm-cross-host-telemetry-live-acceptance.mjs \
+            --stage publish --group "$SWARM_GROUP" --graph "$SWARM_GRAPH" \
+            --peer "$PEER_ALIAS" --confirm-independent-installed-peers \
+            > "$RUNNER_TEMP/native-swarm-metered-source.json"
       - name: Publish real-run verification evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -339,6 +356,7 @@ jobs:
             ${{ runner.temp }}/native-swarm-signed-leader-quorum.json
             ${{ runner.temp }}/native-swarm-replica-network-acceptance.json
             ${{ runner.temp }}/native-swarm-real-model-benchmark.json
+            ${{ runner.temp }}/native-swarm-metered-source.json
             ${{ runner.temp }}/native-swarm-vector-memory-acceptance.json
             ${{ runner.temp }}/native-swarm-cancellation-acceptance.json
             ${{ runner.temp }}/native-swarm-specialist-quality.json
@@ -346,3 +364,35 @@ jobs:
             ${{ runner.temp }}/native-swarm-resident-fallback-acceptance.json
             ${{ runner.temp }}/native-swarm-mlx-lora-acceptance.json
             ${{ runner.temp }}/native-swarm-mlx-fused-inference-acceptance.json
+
+  verify-independent-receiver:
+    name: Verify original-host metered model execution on separate enrolled runner
+    if: ${{ inputs.source_fingerprint != '' && inputs.replica_graph_id != '' && inputs.cluster_group != '' }}
+    needs: live-two-node-models
+    runs-on: [self-hosted, swarm-acceptance, "${{ inputs.sender_runner == 'swarm-node-a' && 'swarm-node-b' || 'swarm-node-a' }}"]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout the same reviewed acceptance code
+        uses: actions/checkout@v4
+      - name: Query the receiver installation's OWN SQLite-backed daemon
+        shell: bash
+        env:
+          SWARM_GROUP: ${{ inputs.cluster_group }}
+          SWARM_GRAPH: ${{ inputs.replica_graph_id }}
+          ORIGINAL_SOURCE_FP: ${{ inputs.source_fingerprint }}
+        run: |
+          set -euo pipefail
+          command -v monkey
+          node scripts/swarm-cross-host-telemetry-live-acceptance.mjs \
+            --stage verify --group "$SWARM_GROUP" --graph "$SWARM_GRAPH" \
+            --source-fingerprint "$ORIGINAL_SOURCE_FP" \
+            --require-model-usage --confirm-independent-installed-peers \
+            > "$RUNNER_TEMP/native-swarm-independent-metering.json"
+      - name: Store actual independent receiver receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-swarm-independent-receiver-${{ inputs.sender_runner }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: ${{ runner.temp }}/native-swarm-independent-metering.json
