@@ -237,6 +237,10 @@ pub async fn campaign(paths:&DaemonPaths,group:&str,term:u64,now:i64)
     ->Result<serde_json::Value,String>{
     let mut store=DaemonStore::open(paths)?;
     let config=roster(&store,group)?;
+    if store.kill_switch()?{
+        expire_leader(&store,group)?;
+        return Err("Global kill switch prevents local cluster election and renewal".into());
+    }
     let req=VoteRequest{group:group.to_string(),term,
         candidate_fingerprint:config.local().fingerprint.clone(),
         roster_sha256:config.digest()};

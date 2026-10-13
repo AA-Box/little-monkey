@@ -608,6 +608,15 @@ pub fn tick(
                     break;
                 }
             };
+            // The original per-graph lease check may be older than the time
+            // spent materializing verified dependency reports. Re-check just
+            // before EVERY native enqueue: an expired, partitioned or replaced
+            // leader must not submit one last read-only graph task.
+            if let Some(group)=spec.cluster_id.as_deref() {
+                if !super::swarm_cluster::may_schedule(store,group,clock()?)? {
+                    break;
+                }
+            }
             let outcome = super::enqueue(Some(cli),paths,roots,config,store,shared,QueueOptions {
                 recipe: task_input, params: Vec::new(),
                 origin: QueueOrigin::Local, deterministic_job_id: Some(run_key),
