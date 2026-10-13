@@ -792,6 +792,13 @@ export function SwarmPanel() {
             Additionally optimize price among independently graded, quality-equivalent, already eligible subagent targets. Requires six fixture observations per model, configured input/output rates, and at least three historical usage samples. Minimum 10% estimated rate savings; never overrides model pins, policy restrictions or privacy. After six real baseline completions, an eligible cheaper candidate starts at 10% canary, ramps to 30% with six recorded candidate outcomes, then to 100% with 12, unless the real-run failure/latency circuit breaker trips. Model completion is not answer correctness. This estimates token rates, not bills.
           </label>
           <p className="mt-2 text-xs text-muted">Operational feedback (local and durable): {recentOperationalOutcomes.length} terminal model runs in the last 14 days. Continuous cost-routing safety decisions are made on each subagent dispatch; only an actual run can feed this count. This is not a verified answer-quality score.</p>
+          <p className="mt-1 text-xs text-muted">
+            Real usage attached to {recentOperationalOutcomes.filter(row=>row.usage).length}/{recentOperationalOutcomes.length} terminal runs ·
+            observed tokens {recentOperationalOutcomes.reduce((n,row)=>n+(row.usage?.promptTokens??0)+(row.usage?.completionTokens??0),0).toLocaleString()} ·
+            configured-rate estimate {recentOperationalOutcomes.some(row=>row.meteredCostUsd!==undefined)?
+              'USD '+recentOperationalOutcomes.reduce((n,row)=>n+(row.meteredCostUsd??0),0).toFixed(6)+' (partial when rates unknown)':
+              'unavailable'} · NOT audited provider billing.
+          </p>
           {benchmark.ranking.map(row=>{
             const recent=recentOperationalOutcomes.filter(item=>item.target===row.target);
             return <p key={row.target} className="mt-1 text-xs text-muted">{row.target}: {recent.length} observed · {recent.filter(item=>item.status==='error').length} failed · {recent.filter(item=>item.status==='done').length} finished</p>;
