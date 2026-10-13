@@ -40,8 +40,6 @@ pub struct ReplicaTraceEvent {
     pub state: String,
     pub occurred_at_ms: i64,
 }
-#[derive(Clone,Debug,Serialize,Deserialize)]
-#[serde(deny_unknown_fields)]
 /// Aggregate metered inference usage from a completed, hash-chain-verified
 /// original-host run. This is NOT a provider invoice or answer correctness.
 #[derive(Clone,Debug,Serialize,Deserialize,PartialEq)]
@@ -322,7 +320,9 @@ fn measured_usage(
         let Some(event)=events.into_iter().next() else{continue};
         let RunEvent::Completed{usage,..}=event.event else{continue};
         let target=run.spec.target.target_id();
-        if target.is_empty()||target.len()>160 {continue;}
+        if target.is_empty()||target.len()>160||
+            !target.bytes().all(|c|c.is_ascii_alphanumeric()||
+                matches!(c,b'-'|b'_'|b'.'|b':'|b'/'|b'@'|b'+'|b'%')) {continue;}
         rows.push(ReplicaModelUsage{
             node_id:node.id.clone(),target_id:target.to_owned(),
             elapsed_ms:end-start,input_tokens:usage.input_tokens,
