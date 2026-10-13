@@ -2071,3 +2071,70 @@ fn signed_three_node_election_uses_majority_when_third_member_is_partitioned() {
         &serde_json::to_vec(&req).unwrap(),NOW+200);
     assert_ne!(blocked.status,200);
 }
+
+
+#[test]
+fn signed_replica_endpoint_persists_monotonic_checkpoints_and_never_grants_task_execution(){
+    use super::swarm_cluster::{ClusterMember,ClusterRoster};
+    use super::swarm_replication::{ReplicaNode,ReplicaSnapshot};
+    let (alice,mut bob,pairing)=two_nodes(
+        BTreeSet::from([DeviceCapability::PeerTaskRequest]));
+    let a_fp="a".repeat(64);
+    let b_fp="b".repeat(64);
+    let roster=ClusterRoster{
+        version:1,group:"signed-replica-e2e".into(),members:vec![
+            ClusterMember{fingerprint:b_fp.clone(),device_id:"@local".into(),alias:None},
+            ClusterMember{fingerprint:a_fp.clone(),device_id:pairing.device_id.clone(),
+                alias:Some("alice".into())},
+        ],
+    };
+    {
+        let mut store=DaemonStore::open(&bob.paths).unwrap();
+        super::swarm_cluster::configure(&mut store,&roster,NOW as i64).unwrap();
+    }
+    let mut snapshot=ReplicaSnapshot{
+        version:1,group:roster.group.clone(),graph_id:"review-123".into(),
+        source_fingerprint:a_fp,roster_sha256:roster.digest(),
+        sequence:1,term:1,captured_at_ms:NOW as i64,
+        graph_state:"running".into(),
+        nodes:vec![ReplicaNode{id:"audit".into(),state:"submitted".into(),
+            job_id:Some("job-abc123".into())}],
+        checksum:String::new(),
+    };
+    snapshot.seal().unwrap();
+    let url="/v1/remote/peer/swarm-state/checkpoints";
+    let post=|node:&Node,snap:&ReplicaSnapshot,time:u64|call(
+        node,&pairing,"POST",url,&serde_json::to_vec(snap).unwrap(),time,
+    );
+    let first=post(&bob,&snapshot,NOW+50);
+    assert_eq!(first.status,200,"signed checkpoint: {:?}",json(&first));
+    assert_eq!(json(&first)["changed"],true);
+    assert_eq!(json(&post(&bob,&snapshot,NOW+51))["changed"],false);
+    let mut conflict=snapshot.clone();
+    conflict.nodes[0].state="succeeded".into();
+    conflict.seal().unwrap();
+    assert_eq!(post(&bob,&conflict,NOW+52).status,409);
+    bob.restart();
+    let list=call(&bob,&pairing,"GET",
+        "/v1/remote/peer/swarm-state/signed-replica-e2e/review-123",
+        &[],NOW+54);
+    assert_eq!(list.status,200);
+    assert_eq!(json(&list)["replicas"][0]["sequence"],1);
+    assert_eq!(json(&list)["replicas"][0]["nodes"][0]["state"],"submitted");
+    snapshot.sequence=2;snapshot.nodes[0].state="succeeded".into();
+    snapshot.seal().unwrap();
+    assert_eq!(post(&bob,&snapshot,NOW+55).status,200);
+    assert_eq!(post(&bob,&conflict,NOW+56).status,409);
+    let mut incorrect=snapshot.clone();
+    incorrect.source_fingerprint="c".repeat(64);
+    incorrect.seal().unwrap();
+    assert_eq!(post(&bob,&incorrect,NOW+57).status,409);
+    // A peer whose explicit task grant is removed cannot fetch or publish.
+    bob.set_grants(&pairing.device_id,BTreeSet::from([DeviceCapability::PeerMessage]));
+    assert_ne!(post(&bob,&snapshot,NOW+58).status,200);
+    let denied=call(&bob,&pairing,"GET",
+        "/v1/remote/peer/swarm-state/signed-replica-e2e/review-123",
+        &[],NOW+59);
+    assert_ne!(denied.status,200);
+    drop(alice);
+}
