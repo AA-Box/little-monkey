@@ -78,6 +78,8 @@ jobs:
           node --check scripts/swarm-resident-restart-live-acceptance.mjs
           node --check scripts/swarm-resident-fallback-live-acceptance.mjs
           node --check scripts/swarm-mlx-lora.mjs
+          node --check scripts/swarm-mlx-fused-inference-acceptance.mjs
+          node scripts/swarm-mlx-fused-inference-acceptance.mjs --self-check
           node --test scripts/swarm-mlx-lora.contract.test.mjs
           node --check scripts/swarm-mlx-auto-learning.mjs
           node --test scripts/swarm-mlx-auto-learning.contract.test.mjs
