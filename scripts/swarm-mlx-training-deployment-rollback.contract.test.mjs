@@ -1,6 +1,6 @@
 import {describe,it} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,mkdirSync,writeFileSync,rmSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,writeFileSync,rmSync,realpathSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createHash} from 'node:crypto';
@@ -31,7 +31,7 @@ describe('native MLX training -> live deployment -> fault rollback gates',()=>{
     fusedModelPath:model,fusedConfigSha256:sha(config),fusedWeights:[{name:'model.safetensors',sha256:sha(weight),sizeBytes:weight.length}]};
    const receiptPath=join(output,'training-receipt.json');
    writeFileSync(receiptPath,JSON.stringify(receipt));
-   assert.equal(verifiedFusion(output,'/base/model').model,model);
+   assert.equal(verifiedFusion(output,'/base/model').model,realpathSync(model));
    assert.throws(()=>verifiedFusion(output,'/wrong/model'),/unverified/);
    writeFileSync(join(model,'model.safetensors'),'tampered');
    assert.throws(()=>verifiedFusion(output,'/base/model'),/shards changed/);
