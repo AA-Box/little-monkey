@@ -169,11 +169,15 @@ async function assertModelIdentity(port,expected){
  if(!models||!Array.isArray(models.data)||!models.data.some(row=>row?.id===expected))
   fail('Live MLX server does not prove the exact fused/base model selected for deployment');
 }
-async function probe(port){
+async function probe(port,expectedModel){
  const output=await postToBackend(port,{messages:[{role:'user',content:'Reply briefly.'}],max_tokens:24,stream:false});
  const answer=output?.choices?.[0]?.message?.content;
  if(typeof answer!=='string'||answer.trim().length<1||answer.length>16384)
   fail('MLX serving process did not generate a real assistant response');
+ // /v1/models can list cached models other than the resident one. Its
+ // presence is insufficient: verify the model identity on inference itself.
+ if(expectedModel && output.model!==expectedModel)
+  fail('Inference response belongs to a different resident MLX model');
 }
 async function startBackend(policy,modelPath){
  // With one local model in memory, stop the previous service before this
@@ -190,7 +194,7 @@ async function startBackend(policy,modelPath){
  const deadline=Date.now()+180000;
  while(Date.now()<deadline){
   if(child.exitCode!==null)fail('Local MLX service exited before ready');
-  try{await probe(policy.backendPort);await assertModelIdentity(policy.backendPort,modelPath);return child;}
+  try{await probe(policy.backendPort,modelPath);await assertModelIdentity(policy.backendPort,modelPath);return child;}
   catch{await new Promise(done=>setTimeout(done,2500));}
  }
  child.kill('SIGKILL');fail('MLX service failed real generation before readiness deadline');
@@ -342,7 +346,7 @@ export async function serve(policy){
   }
   while(!stopping){
    if(state.active){
-    try{await probe(policy.backendPort);
+    try{await probe(policy.backendPort,state.model);
      probeState.active=true;
      state.scores=await independentOracle(policy);
     }catch(e){
