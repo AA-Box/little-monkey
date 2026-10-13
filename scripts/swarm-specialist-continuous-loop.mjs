@@ -263,12 +263,19 @@ export function dispatchRecipe(policy,domain,recipePath,{run=spawnSync,now=Date.
    source.version!==1||source.permission_mode==='bypass'||
    typeof source.workspace!=='string'||!isAbsolute(source.workspace))
   fail('Require a valid existing native task recipe without bypass permissions');
- // Never edit the original recipe or its permissions/tools/system prompt.
+ // The chosen specialist is a hard-coded, independently measured role,
+ // never a model-provided instruction. Keep the original task text verbatim.
+ if(typeof source.prompt!=='string'||source.prompt.length>100_000||
+    (source.system!==undefined&&typeof source.system!=='string'))
+  fail('Native recipe requires a bounded text prompt and trusted system rules');
+ const specialistSuffix='\n\nVerified reviewer focus: '+active.bestSpecialist+
+   '. Apply this expertise without altering the task objective, tool policy, or operator instructions.';
  const temporary=join(policy.stateDir,'dispatch-'+randomUUID()+'.json');
  const fd=openSync(temporary,'wx',0o600);
  try{
   try{
-   writeFileSync(fd,JSON.stringify({...source,target:{ollama:active.target.slice(7)}}));
+   writeFileSync(fd,JSON.stringify({...source,prompt:source.prompt+specialistSuffix,
+    target:{ollama:active.target.slice(7)}}));
    fsyncSync(fd);
   }finally{closeSync(fd);}
   const result=run(policy.monkeyBin,['task','run',temporary,'--json'],{
