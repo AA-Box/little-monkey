@@ -4,6 +4,42 @@ import { MAX_WORKFLOW_AGENTS, MAX_WORKFLOW_PHASES } from './workflow';
 
 const graphTask = (id: string, deps: string[] = []) => ({
   id, description: 'Task ' + id, prompt: 'Do task ' + id, profile: 'explore', depends_on: deps,
+  it('executes parent before descendants with three-level bounded delegation', () => {
+    const spec = compileSwarmTaskGraph({
+      name: 'delegated-project',
+      tasks: [
+        { ...graphTask('review'), children: [
+          { ...graphTask('frontend'), children: [
+            graphTask('accessibility'),
+          ] },
+          graphTask('backend'),
+        ] },
+        graphTask('independent'),
+      ],
+    });
+    expect(spec.phases[0].agents.map(a => a.description)).toEqual(['Task review', 'Task independent']);
+    expect(spec.phases[1].agents.map(a => a.description)).toEqual(['Task frontend', 'Task backend']);
+    expect(spec.phases[2].agents.map(a => a.description)).toEqual(['Task accessibility']);
+    expect(spec.phases[1].agents[0].prompt).toContain('Prerequisites: review');
+    expect(spec.phases[2].agents[0].prompt).toContain('Prerequisites: frontend');
+    expect(spec.stopOnFailure).toBe(true);
+  });
+
+  it('rejects nested cycles, duplicate identifiers, oversized trees, unknown children and excess depth', () => {
+    const nested = (...children: unknown[]) => ({ ...graphTask('parent'), children });
+    expect(() => compileSwarmTaskGraph({ name:'dup', tasks:[nested(graphTask('parent'))] })).toThrow(/unique/);
+    expect(() => compileSwarmTaskGraph({ name:'cycle', tasks:[nested(graphTask('child',['parent'])), { ...graphTask('independent',['child']), depends_on:['child','parent'] }, { ...graphTask('child'), depends_on:['independent'] }] })).toThrow(/unique/);
+    expect(() => compileSwarmTaskGraph({ name:'many',tasks:[nested(...Array.from({length:7},(_,i)=>graphTask('worker'+i)))] })).toThrow(/at most six/);
+    expect(() => compileSwarmTaskGraph({ name:'depth',tasks:[
+      { ...graphTask('a'),children:[{ ...graphTask('b'),children:[{ ...graphTask('c'),children:[graphTask('d')] }] }] },
+    ] })).toThrow(/three levels/);
+    expect(() => compileSwarmTaskGraph({ name:'too-many',tasks:[
+      { ...graphTask('a'),children:Array.from({length:6},(_,i)=>({ ...graphTask('child'+i),children:Array.from({length:2},(_,j)=>graphTask('grand'+i+'x'+j)) })) },
+    ] })).toThrow(/16 agents/);
+    expect(() => compileSwarmTaskGraph({ name:'unknown',tasks:[{ ...graphTask('a'),children:'bad' }] })).toThrow(/children/);
+    expect(() => compileSwarmTaskGraph({ name:'bad',tasks:[{...graphTask('a'),tools:['shell']}] })).toThrow(/Unknown graph task fields/);
+  });
+
 });
 
 describe('dependency-aware native workflow graph', () => {
