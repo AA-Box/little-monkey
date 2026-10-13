@@ -206,6 +206,24 @@ fn verify(bundle: &TransferBundle) -> Result<(), String> {
     }
     Ok(())
 }
+/// Inspect an immutable transfer before arming any automatic read-only
+/// failover. The operator's staged bytes remain untrusted until every
+/// re-import validation has run again after the new leader is elected.
+pub fn inspect_read_only_bundle(input:&Path)->Result<(String,Option<String>),String>{
+    check_regular(input,MAX_BUNDLE_BYTES)?;
+    let bundle:TransferBundle=serde_json::from_slice(
+        &fs::read(input).map_err(|e|e.to_string())?
+    ).map_err(|e|format!("Invalid frozen recovery bundle: {e}"))?;
+    verify(&bundle)?;
+    for record in &bundle.recipes {
+        let _=relocated_recipe(&record.primary,Path::new("/"))?;
+        if let Some(fallback)=record.fallback.as_deref(){
+            let _=relocated_recipe(fallback,Path::new("/"))?;
+        }
+    }
+    Ok((bundle.source_graph_id,bundle.spec.cluster_id))
+}
+
 fn relocated_recipe(raw: &str, workspace: &Path) -> Result<Vec<u8>, String> {
     let mut recipe: little_monkey_lib::recipes::Recipe =
         serde_json::from_str(raw).map_err(|e|format!("Invalid embedded recipe: {e}"))?;
