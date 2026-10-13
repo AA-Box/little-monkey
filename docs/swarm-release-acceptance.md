@@ -697,3 +697,31 @@ modified by this harness. It proves the operator-declared isolation/reconnect
 and signed stored-state transfer, **not** process migration or exactly-once
 tool execution. No result is certified until a real two-installation run has
 produced the workflow artifact.
+
+
+## Apple Silicon fused-model inference acceptance (real MLX-LM)
+
+The operator-owned live workflow exposes an opt-in
+`mlx_fuse_for_import` switch. On an actual `darwin/arm64` self-hosted
+Mac, this invokes the existing actual MLX LoRA trainer, evaluates independent
+held-out and historical regression datasets, fuses the resulting adapter,
+then re-evaluates **the fused weights**. It fails closed if adapter or fused
+weights degrade beyond the operator's configured held-out gate.
+
+A second independent Node/Python acceptance runner now reopens the
+`training-receipt.json`, SHA-256 checks the actual fused config and each
+safetensors shard against the evaluated weight manifest, loads the fused
+model in `mlx_lm` on Apple Silicon, and requires a bounded non-empty
+**fresh model generation**. The optional `mlx_previous_model_dir` probes
+the explicitly selected previous model on the same installed MLX runtime,
+so operators can check that rollback weights remain loadable before changing
+their running model.
+
+The native desktop already has an operator-initiated verified import,
+live-inference canary and crash-journal-protected rollback in
+`src/lib/swarmMlxPromotion.ts`. This acceptance runner does NOT
+automatically activate the candidate in the desktop or claim that desktop
+rollback was exercised. Real desktop provider handoff, post-switch acceptance,
+failure injection and actual rollback still require physical Apple Silicon
+execution. Neither generated package/weight bytes nor private inference output
+are uploaded as CI evidence; the workflow uploads bounded JSON receipts.
