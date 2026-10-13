@@ -339,11 +339,11 @@ jobs:
               if (Object.keys(p).some(k => !allowed.includes(k))) process.exit(2);
               const checked = (v, optional=false) => {
                 if (optional && (v === undefined || v === "")) return "";
-                if (typeof v !== "string" || v.length === 0 || v.length > 4096 || /[\\x00-\\x1f]/.test(v)) process.exit(2);
+                if (typeof v !== "string" || v.length === 0 || v.length > 4096 || /[\x00-\x1f]/.test(v)) process.exit(2);
                 return v;
               };
               const threshold = String(p.max_test_ppl ?? "");
-              if (!/^(?:[0-9]+)(?:\\.[0-9]+)?$/.test(threshold) || Number(threshold) <= 0) process.exit(2);
+              if (!/^(?:[0-9]+)(?:\.[0-9]+)?$/.test(threshold) || Number(threshold) <= 0) process.exit(2);
               if (p.fuse_for_import !== undefined && ![true,false,"true","false"].includes(p.fuse_for_import)) process.exit(2);
               const fields = [
                 checked(p.model_dir),checked(p.train_data_dir),
@@ -351,7 +351,7 @@ jobs:
                 p.fuse_for_import === true || p.fuse_for_import === "true" ? "true" : "false",
                 checked(p.previous_model_dir, true)
               ];
-              for (const value of fields) process.stdout.write(value + "\\0");
+              for (const value of fields) process.stdout.write(value + "\0");
             '
           )
           test "${#MLX_FIELDS[@]}" -eq 6
