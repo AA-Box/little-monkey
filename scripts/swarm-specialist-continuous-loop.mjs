@@ -22,7 +22,16 @@ const DOMAINS={
  performance:{roles:['Queueing reviewer','Memory and cache reviewer','Capacity reviewer'],fixtures:['quadratic-scan','cache-recompute','safe-control']},
  general:{roles:['Documentation reviewer','Incident response reviewer','Integration reviewer'],fixtures:['configuration-flag','integration-contract','safe-control']},
 };
-const TARGET=/^ollama:[A-Za-z0-9_.:@+-]{2,140}$/;
+const TARGET=/^(?:ollama:[A-Za-z0-9_.:@+-]{2,140}|local-url:http:\/\/127\.0\.0\.1:[1-9][0-9]{3,4}\|[A-Za-z0-9_.:@+-]{2,140})$/;
+/** Local URL targets are strictly loopback-only; no arbitrary network SSRF. */
+export function recipeTarget(value){
+ if(typeof value!=='string'||!TARGET.test(value))fail('Invalid configured model target');
+ if(value.startsWith('ollama:'))return {ollama:value.slice(7)};
+ const match=/^local-url:http:\/\/127\.0\.0\.1:([0-9]+)\|(.+)$/.exec(value);
+ const port=Number(match?.[1]);
+ if(!match||!boundedInt(port,1024,65535))fail('Invalid loopback model port');
+ return {local_url:'http://127.0.0.1:'+port,model:match[2]};
+}
 const RUN=/^run-[A-Za-z0-9-]{6,200}$/;
 const HASH=/^[0-9a-f]{64}$/;
 const MAX_REPORT_BYTES=1_000_000;
@@ -50,8 +59,8 @@ export function parsePolicy(value){
    fail('Operator must select an installed absolute native monkey executable');
  const stateDir=localDir(x.stateDir,'State directory');
  if(!Array.isArray(x.targets)||x.targets.length<1||x.targets.length>8||
-   new Set(x.targets).size!==x.targets.length||x.targets.some(t=>typeof t!=='string'||!TARGET.test(t)))
-   fail('Only unique configured Ollama target identifiers are allowed');
+   new Set(x.targets).size!==x.targets.length||x.targets.some(t=>{try{recipeTarget(t);return false;}catch{return true;}}))
+   fail('Only unique configured Ollama or local loopback model target identifiers are allowed');
  if(!Array.isArray(x.domains)||!x.domains.length||x.domains.length>5||
    new Set(x.domains).size!==x.domains.length||x.domains.some(d=>typeof d!=='string'||!own(d)))
    fail('Invalid or duplicate specialist domains');
@@ -86,6 +95,7 @@ function atomicJson(path,value){
 export function gradeReport(raw,domain,target,repetitions,now=Date.now(),maxAgeMs=3_600_000){
  const d=DOMAINS[domain];
  if(!d||!TARGET.test(target)||!boundedInt(repetitions,2,5)||
+   (target.startsWith('local-url:') && !(()=>{try{recipeTarget(target);return true;}catch{return false;}})())||
    !raw||typeof raw!=='object'||Array.isArray(raw)||
    raw.version!==2||raw.benchmark!=='live-specialist-source-fixtures'||
    raw.mode!=='real-model'||raw.domain!==domain||raw.target!==target)
@@ -276,7 +286,7 @@ export function dispatchRecipe(policy,domain,recipePath,{run=spawnSync,now=Date.
  try{
   try{
    writeFileSync(fd,JSON.stringify({...source,prompt:source.prompt+specialistSuffix,
-    target:{ollama:active.target.slice(7)}}));
+    target:recipeTarget(active.target)}));
    fsyncSync(fd);
   }finally{closeSync(fd);}
   const result=run(policy.monkeyBin,['task','run',temporary,'--json'],{
