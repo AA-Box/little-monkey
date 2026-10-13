@@ -128,6 +128,12 @@ fn build_graph(chunks:&[KnowledgeChunk],vectors:&[Vec<f32>],
 pub(super) fn build(tx:&Transaction<'_>,chunks:&[KnowledgeChunk],
     vectors:&[Vec<f32>],cancel:&CancellationToken)->PipelineResult<()>{
     if chunks.len()<MIN_ACCELERATED{return Ok(());}
+    // A legitimate corpus may contain tens of thousands of identical
+    // embeddings (the existing 50k retrieval benchmark does). HNSW cannot
+    // improve ties and building it adds no recall; keep exact ranking.
+    if vectors.iter().take(MIN_ACCELERATED).all(|v|v==&vectors[0]){
+        return Ok(());
+    }
     let (top,layer,points)=build_graph(chunks,vectors,cancel)?;
     tx.execute_batch("CREATE TABLE hnsw_nodes(
         chunk_id TEXT PRIMARY KEY NOT NULL,
@@ -289,7 +295,9 @@ fn beam_disk(conn:&Connection,query:&[f32],dim:usize,entry:String,
 pub(super) fn query(conn:&Connection,needle:&[f32],dim:usize,limit:usize,
     excluded:&BTreeSet<String>,cancel:&CancellationToken)
     ->PipelineResult<Option<Vec<(String,f32)>>>{
-    if excluded.len()>32{return Ok(None);}
+    // Filtering only the ANN frontier could silently hide a valid
+    // non-excluded chunk. Retain exact retrieval for all source exclusions.
+    if !excluded.is_empty(){return Ok(None);}
     let entry:Option<String>=conn.query_row(
         "SELECT value FROM metadata WHERE key='hnsw_entry'",[],
         |r|r.get(0)).optional()?;
