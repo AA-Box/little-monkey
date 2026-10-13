@@ -78,6 +78,7 @@ export function selectLiveGuardedCostRoute(
     !Number.isSafeInteger(now)||now<=0||
     !Number.isInteger(bucket)||bucket<0||bucket>9||
     new Set(before).size!==before.length||
+    new Set(proposedSequence).size!==proposedSequence.length||
     proposedSequence.some(x=>!before.includes(x)))return unchanged('disabled');
  if(proposedSequence[0]===before[0])return unchanged('unchanged');
  const baseline=before[0],candidate=proposedSequence[0];
