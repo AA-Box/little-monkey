@@ -21,8 +21,8 @@ run without the expected persisted `hnsw_nodes` row count.
   independently rejected by immutable index/graph checksum validation.
 
 The workflow `.github/workflows/hnsw-production-acceptance.yml` exercises
-10,000 × 128-dimensional vectors on affected PRs and 100,000 × 384-D on
-a weekly schedule or explicit manual dispatch. It saves measured JSON,
+100,000 × 384-dimensional vectors on affected PRs and the weekly
+schedule. Manual dispatch also supports smaller diagnostic profiles. It saves measured JSON,
 the source commit, and host resource details as GitHub Actions artifacts.
 Assertions fail CI rather than creating a fictitious success result.
 
