@@ -189,6 +189,91 @@ pub fn list_for_member(
             serde_json::from_str(&raw).map_err(|e|e.to_string())
         ).collect()
 }
+/// Capture an actual locally authorized leader's DAG state for one
+/// operator-selected peer. Neither prompts nor credentials nor model outputs
+/// are included. Outbound sequence allocation is durable and transactional:
+/// a crashed uploader cannot reuse an earlier sequence with different bytes.
+pub fn capture_local_leader(
+    paths:&super::store::DaemonPaths,group:&str,graph:&str,alias:&str,
+    expected_peer_sha256:&str,now:i64,
+)->Result<ReplicaSnapshot,String>{
+    if !valid_id(group)||!valid_id(graph)||alias.is_empty()||now<=0{
+        return Err("Invalid swarm replication selection".into());
+    }
+    let mut store=DaemonStore::open(paths)?;
+    let members=swarm_cluster::roster(&store,group)?;
+    let peer=members.members.iter().find(|m|m.alias.as_deref()==Some(alias))
+        .ok_or("Replication target must be an operator-enrolled outbound alias")?;
+    if peer.fingerprint!=expected_peer_sha256 {
+        return Err("Replication peer certificate mismatches enrolled roster".into());
+    }
+    if store.kill_switch()?||!swarm_cluster::may_schedule(&store,group,now)?{
+        return Err("No current signed majority lease for local DAG publication".into());
+    }
+    let (raw,state):(String,String)=store.connection.query_row(
+        "SELECT spec_json,state FROM resident_swarm_graphs WHERE graph_id=?1",
+        [graph],|r|Ok((r.get(0)?,r.get(1)?))
+    ).map_err(|_|"The resident swarm graph is not locally registered")?;
+    let spec:super::swarm_coordinator::ResidentSwarmSpec=
+        serde_json::from_str(&raw).map_err(|e|e.to_string())?;
+    if spec.cluster_id.as_deref()!=Some(group){
+        return Err("Graph is not assigned to this operator-enrolled cluster".into());
+    }
+    let mut stmt=store.connection.prepare(
+        "SELECT node_id,state,job_id FROM resident_swarm_nodes
+         WHERE graph_id=?1 ORDER BY node_id"
+    ).map_err(|e|e.to_string())?;
+    let nodes=stmt.query_map([graph],|r|Ok(ReplicaNode{
+        id:r.get(0)?,state:r.get(1)?,job_id:r.get(2)?,
+    })).map_err(|e|e.to_string())?
+        .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    drop(stmt);
+    if nodes.len()!=spec.nodes.len(){
+        return Err("Local DAG node ledger is incomplete".into());
+    }
+    let term:i64=store.connection.query_row(
+        "SELECT term FROM swarm_cluster_leases
+         WHERE group_id=?1 AND leader=?2 AND expires_at_ms>?3",
+        params![group,members.local().fingerprint,now],|r|r.get(0)
+    ).map_err(|_|"Signed majority lease expired before DAG snapshot")?;
+    schema(&store)?;
+    store.connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS resident_swarm_checkpoint_outbox(
+           group_id TEXT NOT NULL,graph_id TEXT NOT NULL,
+           sequence INTEGER NOT NULL,
+           PRIMARY KEY(group_id,graph_id)
+         );"
+    ).map_err(|e|e.to_string())?;
+    let tx=store.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e|e.to_string())?;
+    let last:Option<i64>=tx.query_row(
+        "SELECT sequence FROM resident_swarm_checkpoint_outbox
+         WHERE group_id=?1 AND graph_id=?2",
+        params![group,graph],|r|r.get(0)
+    ).optional().map_err(|e|e.to_string())?;
+    let next=last.unwrap_or(0).checked_add(1)
+        .filter(|v|*v>0).ok_or("DAG checkpoint sequence exhausted")?;
+    tx.execute(
+        "INSERT INTO resident_swarm_checkpoint_outbox(group_id,graph_id,sequence)
+         VALUES(?1,?2,?3) ON CONFLICT(group_id,graph_id) DO UPDATE SET
+         sequence=excluded.sequence",
+        params![group,graph,next]
+    ).map_err(|e|e.to_string())?;
+    tx.commit().map_err(|e|e.to_string())?;
+    let mut snapshot=ReplicaSnapshot{
+        version:1,group:group.to_owned(),graph_id:graph.to_owned(),
+        source_fingerprint:members.local().fingerprint.clone(),
+        roster_sha256:members.digest(),
+        sequence:next as u64,
+        term:u64::try_from(term).map_err(|_|"Invalid persisted election term")?,
+        captured_at_ms:now,graph_state:state,nodes,
+        checksum:String::new(),
+    };
+    snapshot.checksum=hash(&snapshot)?;
+    snapshot.validate(now)?;
+    Ok(snapshot)
+}
+
 #[cfg(test)]
 mod tests{
     use super::*;
