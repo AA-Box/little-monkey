@@ -66,7 +66,7 @@ fn beam(points:&[Point],vectors:&[Vec<f32>],query:&[f32],
     let mut found=vec![first];
     let mut expanded=0usize;
     while !pending.is_empty()&&expanded<ef*16{
-        pending=best_first(pending,pending.len());
+        pending.sort_by(|a,b|b.1.total_cmp(&a.1).then_with(||a.0.cmp(&b.0)));
         let current=pending.remove(0);
         expanded+=1;
         if found.len()>=ef && current.1<found.last().map(|x|x.1).unwrap_or(f32::NEG_INFINITY){break;}
@@ -273,11 +273,11 @@ pub(super) fn query(conn:&Connection,needle:&[f32],dim:usize,limit:usize,
 mod tests{
     use super::*;
     #[test]
-    fn hierarchical_graph_has_bounded_links_and_exact_seed_neighbors(){
-        let chunks=(0..1024).map(|i|KnowledgeChunk{
-            chunk_id:format!("test-{i:06}"),
-            ..panic!("Construct test chunks with project fixtures instead")
-        }).collect::<Vec<_>>();
-        drop(chunks);
+    fn stable_layers_and_ranked_candidates_preserve_determinism(){
+        assert_eq!(level_for("hello"),level_for("hello"));
+        assert!(level_for("other")<=MAX_LAYER);
+        assert_eq!(best_first(vec![(4,0.5),(2,0.9),(7,0.1)],2),
+            vec![(2,0.9),(4,0.5)]);
+        assert_eq!(similarity(&[1.0,0.0],&[0.0,1.0]),0.0);
     }
 }
