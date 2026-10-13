@@ -1906,3 +1906,96 @@ fn every_layer_agrees_on_what_a_peer_may_hand_over() {
     absurd.artifacts[0].size_bytes = Some(ceiling + 1);
     assert_eq!(send(&bob, &pairing, &absurd, NOW + 120).status, 400);
 }
+
+
+#[test]
+fn signed_pairing_votes_establish_real_two_store_strict_quorum_and_survive_restart() {
+    use super::swarm_cluster::{ClusterMember,ClusterRoster,VoteRequest,VoteReceipt};
+    let (alice,mut bob,pairing)=two_nodes(
+        BTreeSet::from([DeviceCapability::PeerTaskRequest]));
+    let alice_fingerprint="a".repeat(64);
+    let bob_fingerprint="b".repeat(64);
+    let bob_roster=ClusterRoster{
+        version:1,group:"real-paired-election".into(),members:vec![
+            ClusterMember{fingerprint:bob_fingerprint.clone(),
+                device_id:"@local".into(),alias:None},
+            ClusterMember{fingerprint:alice_fingerprint.clone(),
+                device_id:pairing.device_id.clone(),alias:Some("alice".into())},
+        ],
+    };
+    let alice_roster=ClusterRoster{
+        version:1,group:bob_roster.group.clone(),members:vec![
+            ClusterMember{fingerprint:alice_fingerprint.clone(),
+                device_id:"@local".into(),alias:None},
+            ClusterMember{fingerprint:bob_fingerprint.clone(),
+                device_id:"bob-paired-device".into(),alias:Some("bob".into())},
+        ],
+    };
+    let mut alice_store=DaemonStore::open(&alice.paths).unwrap();
+    let mut bob_store=DaemonStore::open(&bob.paths).unwrap();
+    super::swarm_cluster::configure(&mut alice_store,&alice_roster,NOW as i64).unwrap();
+    super::swarm_cluster::configure(&mut bob_store,&bob_roster,NOW as i64).unwrap();
+    assert_eq!(alice_roster.digest(),bob_roster.digest());
+    let election=VoteRequest{group:bob_roster.group.clone(),term:1,
+        candidate_fingerprint:alice_fingerprint.clone(),
+        roster_sha256:alice_roster.digest()};
+    let initial=super::swarm_cluster::vote(
+        &mut alice_store,&election,"@local",NOW as i64).unwrap();
+    let remote=call(&bob,&pairing,"POST","/v1/remote/peer/swarm-election/vote",
+        &serde_json::to_vec(&election).unwrap(),NOW+2);
+    assert_eq!(remote.status,200,"actual paired signed vote: {:?}",json(&remote));
+    let bob_vote:VoteReceipt=serde_json::from_slice(&remote.body).unwrap();
+    assert_eq!(bob_vote.voter_fingerprint,bob_fingerprint);
+    let until=super::swarm_cluster::persist_quorum(
+        &alice_store,&election,&[initial,bob_vote],NOW as i64).unwrap();
+    assert!(until>NOW as i64+5000);
+    assert!(super::swarm_cluster::may_schedule(
+        &alice_store,&election.group,NOW as i64+10).unwrap());
+    assert!(!super::swarm_cluster::may_schedule(
+        &alice_store,&election.group,until+1).unwrap());
+
+    // The voter lease lives on disk, not in RemoteApi memory. A restarted
+    // peer still rejects a candidate attempting to steal the same term.
+    bob.restart();
+    let mut different=election.clone();
+    different.candidate_fingerprint=bob_fingerprint;
+    let unauthorized=call(&bob,&pairing,"POST","/v1/remote/peer/swarm-election/vote",
+        &serde_json::to_vec(&different).unwrap(),NOW+5);
+    assert_eq!(unauthorized.status,409);
+
+    let replay=call(&bob,&pairing,"POST","/v1/remote/peer/swarm-election/vote",
+        &serde_json::to_vec(&election).unwrap(),NOW+8);
+    assert_eq!(replay.status,200);
+    let mut altered=election.clone();
+    altered.roster_sha256="0".repeat(64);
+    let mismatch=call(&bob,&pairing,"POST","/v1/remote/peer/swarm-election/vote",
+        &serde_json::to_vec(&altered).unwrap(),NOW+10);
+    assert_eq!(mismatch.status,409);
+
+    // Pairing revocation is stronger than any stored election result:
+    // a revoked source may never renew its lease.
+    bob.revoke(&pairing.device_id);
+    let revoked=call(&bob,&pairing,"POST","/v1/remote/peer/swarm-election/vote",
+        &serde_json::to_vec(&election).unwrap(),NOW+22);
+    assert_ne!(revoked.status,200);
+}
+
+#[test]
+fn election_route_never_grants_non_task_peers_a_voting_capability() {
+    use super::swarm_cluster::{ClusterMember,ClusterRoster,VoteRequest};
+    let (_alice,bob,pairing)=two_nodes(
+        BTreeSet::from([DeviceCapability::PeerMessage]));
+    let roster=ClusterRoster{version:1,group:"read-only-voting".into(),
+        members:vec![
+            ClusterMember{fingerprint:"b".repeat(64),device_id:"@local".into(),alias:None},
+            ClusterMember{fingerprint:"a".repeat(64),
+                device_id:pairing.device_id.clone(),alias:Some("alice".into())},
+        ]};
+    let mut store=DaemonStore::open(&bob.paths).unwrap();
+    super::swarm_cluster::configure(&mut store,&roster,NOW as i64).unwrap();
+    let req=VoteRequest{group:roster.group.clone(),term:1,
+        candidate_fingerprint:"a".repeat(64),roster_sha256:roster.digest()};
+    let forbidden=call(&bob,&pairing,"POST","/v1/remote/peer/swarm-election/vote",
+        &serde_json::to_vec(&req).unwrap(),NOW+10);
+    assert_eq!(forbidden.status,403);
+}
