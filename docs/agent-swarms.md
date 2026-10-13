@@ -150,6 +150,38 @@ An explicit DAG is still a local bounded workflow, not a distributed task
 scheduler. It uses the same permission boundary for code-profile agents and
 does not automatically merge parallel worktrees.
 
+## Bounded nested team delegation (P1)
+
+A task graph may declare preapproved children beneath a parent. The compiler
+recursively flattens the tree into an ordinary workflow DAG and adds a
+mandatory child dependency on the parent. Parents execute exactly once,
+and children run only after their parent succeeds, using the existing
+permission gate, prior-phase reports, workflow cancellation and journal.
+
+Maximum depth: three; maximum six children per parent; 16 total agents,
+six dependency waves. Cycles, duplicate IDs, unexpected tool or permission
+fields and oversized plans fail before any execution.
+
+```json
+{
+  "name": "release-review-tree",
+  "tasks": [{
+    "id":"lead", "description":"Prepare release audit",
+    "prompt":"Inspect the repository and identify reviews", "profile":"explore",
+    "children":[
+      {"id":"security","description":"Security","prompt":"Audit auth","profile":"explore"},
+      {"id":"quality","description":"Quality","prompt":"Audit tests","profile":"explore",
+       "children":[{"id":"acceptance","description":"Acceptance",
+        "prompt":"Verify reports from repository evidence","profile":"explore"}]}
+    ]
+  }]
+}
+```
+
+This is declarative recursive *planning*, not autonomous model-created
+child tool calls. The child runs are still part of the normal workflow
+executor and inherit its desktop crash-recovery and human-approval limits.
+
 ## Persistent indexed knowledge (explicit opt-in)
 
 Use **Knowledge 2.0** to create and index sources with an embeddings-capable
