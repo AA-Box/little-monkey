@@ -228,13 +228,26 @@ fn consume(paths:&DaemonPaths,plan:&ArmedPlan,now:i64)->Result<(),String>{
     // The same approved bytes/identity are revalidated below; if the graph
     // was already registered, verify the entire frozen spec and every recipe
     // instead of creating another graph or accepting a name collision.
+    let staged=paths.snapshots.join(format!(
+        "failover-candidate-{}.json",uuid::Uuid::new_v4()
+    ));
     let operation=(||{
         let path=PathBuf::from(&plan.path);
         let actual=bounded_file(&path)?;
         if sha(&actual)!=plan.hash{
             return Err("Armed recovery bytes were modified after explicit approval".into());
         }
-        let (source,group)=swarm_transfer::inspect_read_only_bundle(&path)?;
+        // Descriptor-bound immutable copy: all later inspections, crash
+        // reconciliation and imports use THESE exact previously hashed bytes.
+        use std::io::Write;
+        let mut file=std::fs::OpenOptions::new()
+            .create_new(true).write(true).open(&staged)
+            .map_err(|e|e.to_string())?;
+        file.write_all(&actual).map_err(|e|e.to_string())?;
+        file.sync_all().map_err(|e|e.to_string())?;
+        drop(file);
+        super::store::restrict_file(&staged)?;
+        let (source,group)=swarm_transfer::inspect_read_only_bundle(&staged)?;
         if source!=plan.source_graph||group.as_deref()!=Some(plan.group.as_str()){
             return Err("Staged recovery identity or cluster changed".into());
         }
@@ -248,7 +261,7 @@ fn consume(paths:&DaemonPaths,plan:&ArmedPlan,now:i64)->Result<(),String>{
         }
         drop(store);
         if swarm_transfer::verify_existing_import(
-            paths,&path,&plan.new_graph,Path::new(&plan.workspace)
+            paths,&staged,&plan.new_graph,Path::new(&plan.workspace)
         )? {
             return Ok(());
         }
@@ -261,35 +274,28 @@ fn consume(paths:&DaemonPaths,plan:&ArmedPlan,now:i64)->Result<(),String>{
             return Err("Read-only registration still needs a fresh no-dispatch majority".into());
         }
         drop(current);
-        // Read ONLY the bytes just validated, not the operator-controlled
-        // pathname again. Copy to a fresh private, exclusive daemon snapshot:
-        // otherwise a file replaced between SHA check and import could run a
-        // different prompt after consent was granted (TOCTOU).
-        let staged=paths.snapshots.join(format!(
-            "failover-candidate-{}.json",uuid::Uuid::new_v4()
-        ));
-        let import=(||{
-            use std::io::Write;
-            let mut file=std::fs::OpenOptions::new()
-                .create_new(true).write(true).open(&staged)
-                .map_err(|e|e.to_string())?;
-            file.write_all(&actual).map_err(|e|e.to_string())?;
-            file.sync_all().map_err(|e|e.to_string())?;
-            drop(file);
-            super::store::restrict_file(&staged)?;
-            swarm_transfer::import_read_only(paths,&staged,&plan.new_graph,
-                Path::new(&plan.workspace))?;
-            Ok::<_,String>(())
-        })();
-        let _=fs::remove_file(&staged);
-        import?;
+        // The exact same private snapshot was checked above: recovery
+        // cannot switch to a different prompt or recipe between validation
+        // and graph registration.
+        swarm_transfer::import_read_only(paths,&staged,&plan.new_graph,
+            Path::new(&plan.workspace))?;
         Ok::<_,String>(())
     })();
+    let _=fs::remove_file(&staged);
     let store=DaemonStore::open(paths)?;
     match operation {
         Ok(())=>mark(&store,&plan.id,"imported",now,
             "Approved graph registered or crash-reconciled; original jobs never reused"),
         Err(reason)=>{
+            // Ordinary peer availability and lease changes are recoverable:
+            // retain the one-shot claim rather than silently replacing it.
+            // Only a newly verified quorum may resume the unchanged import.
+            if reason.contains("still needs a fresh no-dispatch majority") ||
+               reason.contains("lease was lost before recovery registration") {
+                mark(&store,&plan.id,"claimed",now,
+                    "Awaiting fresh majority to safely reconcile claimed recovery")?;
+                return Ok(());
+            }
             mark(&store,&plan.id,"failed",now,
                 "Automatic failover stopped; operator must inspect local plan and graph")?;
             Err(reason)
