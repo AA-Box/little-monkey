@@ -39,7 +39,7 @@ import {
   providerModelTargetKey,
 } from './modelTargets';
 import { riskCacheKey, type RiskClassification } from './riskJudge';
-import { evaluatePreToolUseHooks, fireObservedHooks, hooksForEvent } from './userHooks';
+import { evaluatePreActionHooks, fireObservedHooks, hooksForEvent, toolLifecyclePair } from './userHooks';
 import { gatePrivacyWireMessages, type PrivacyWireCache } from './privacyWire';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
@@ -801,17 +801,21 @@ export async function executeToolCall(
     }
   };
 
-  if (hooksForEvent('PreToolUse', name).length > 0) {
-    try {
-      const denial = await evaluatePreToolUseHooks(name, argsForHooks(), sessionId);
-      if (denial !== null) {
-        return stringifyToolError(new Error(`Blocked by a PreToolUse hook: ${denial.reason}`));
-      }
-    } catch (err) {
-      // The evaluator itself already proceeds past individual hook failures;
-      // this catch is defense in depth so a hook-layer bug can never leave a
-      // tool_calls entry without a result.
-      console.warn('PreToolUse hook evaluation failed — proceeding:', err);
+  const pairedLifecycle=toolLifecyclePair(name);
+  const preEvents=([
+    'PreToolUse', ...(pairedLifecycle?[pairedLifecycle.pre]:[]),
+  ] as const);
+  for(const event of preEvents){
+    if(hooksForEvent(event,name).length===0)continue;
+    try{
+      const denial=await evaluatePreActionHooks(event,name,argsForHooks(),sessionId);
+      if(denial!==null)
+        return stringifyToolError(new Error(`Blocked by a ${event} hook: ${denial.reason}`));
+    }catch(err){
+      // Keep the existing user-authored overlay failure posture. A hook that
+      // explicitly DENIES still blocks, but an unresponsive hook does not
+      // corrupt the transcript or impersonate a successful tool result.
+      console.warn(`${event} hook evaluation failed — proceeding:`,err);
     }
   }
 
@@ -836,6 +840,10 @@ export async function executeToolCall(
   if (hooksForEvent('PostToolUse', name).length > 0) {
     fireObservedHooks('PostToolUse', { tool_name: name, args: argsForHooks(), session_id: sessionId, result });
   }
+  if(pairedLifecycle && hooksForEvent(pairedLifecycle.post,name).length>0)
+    fireObservedHooks(pairedLifecycle.post,{
+      tool_name:name,args:argsForHooks(),session_id:sessionId,result,
+    });
   try {
     await executionContext?.onCompleted?.(toolCall, result);
   } catch (error) {

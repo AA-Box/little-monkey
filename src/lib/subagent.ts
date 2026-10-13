@@ -1,3 +1,4 @@
+import { fireObservedHooks } from './userHooks';
 /**
  * The subagent child loop — `runSubagentTask` is what `turnEngine.ts`'s
  * `executeToolCall` delegates a model-requested `task` tool call to (see
@@ -446,6 +447,17 @@ function isErrorResult(result: string): boolean {
  * worktree bookkeeping failure must not corrupt the tool result.
  */
 export async function runSubagentTask(params: RunSubagentTaskParams): Promise<string> {
+  // Ruflo-compatible task lifecycle hooks observe real child execution. The
+  // model cannot use their output as tool grants or amend native policy.
+  const args={task_id:params.taskId,description:params.description,profile:params.profile};
+  fireObservedHooks('PreTask',{tool_name:'task',args,session_id:params.sessionId});
+  try{
+    return await runSubagentTaskBody(params);
+  } finally {
+    fireObservedHooks('PostTask',{tool_name:'task',args,session_id:params.sessionId});
+  }
+}
+async function runSubagentTaskBody(params: RunSubagentTaskParams): Promise<string> {
   if (params.isolation !== 'worktree') {
     const report = await runSubagentTaskLoop(params);
     const live = useSubagentStore.getState().runs[params.toolCallId ?? params.taskId];

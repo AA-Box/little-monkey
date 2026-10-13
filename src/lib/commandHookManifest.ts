@@ -6,7 +6,7 @@
  * operator action, not model-triggered capability expansion. Other hook
  * kinds/events are refused rather than mapped to a misleading equivalent.
  */
-import type { UserHookEvent } from '../store/userHooksStore';
+import {USER_HOOK_EVENTS, type UserHookEvent} from '../store/userHooksStore';
 
 export interface CompatibleCommandHook {
   event: UserHookEvent;
@@ -17,7 +17,7 @@ export interface CommandHookImport {
   supported: CompatibleCommandHook[];
   unsupported: string[];
 }
-const EVENTS: readonly UserHookEvent[] = ['PreToolUse', 'PostToolUse', 'SessionStart', 'UserPromptSubmit'];
+const EVENTS: readonly UserHookEvent[] = USER_HOOK_EVENTS;
 const MAX_MANIFEST = 128 * 1024;
 const MAX_HOOKS = 32;
 const MAX_COMMAND_CHARS = 2_000;
