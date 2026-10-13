@@ -248,33 +248,45 @@ pub fn spawn_worker(paths:DaemonPaths){
 mod tests{
     use super::*;
     #[test]
-    fn distinct_daemon_promotes_preapproved_graph_after_higher_term_without_reusing_foreign_jobs(){
+    fn isolated_original_leader_is_recovered_by_the_other_two_voters_without_reusing_foreign_jobs(){
         use super::super::swarm_cluster::{ClusterMember,ClusterRoster,VoteRequest};
         use super::super::swarm_coordinator::{ResidentSwarmSpec,ResidentSwarmNode};
-        let root=std::env::temp_dir().join(format!("swarm-two-host-handoff-{}",uuid::Uuid::new_v4()));
+        let root=std::env::temp_dir().join(format!("swarm-three-host-handoff-{}",uuid::Uuid::new_v4()));
         let sender=DaemonPaths::under(&root.join("sender"));
         let receiver=DaemonPaths::under(&root.join("receiver"));
-        sender.ensure().unwrap();receiver.ensure().unwrap();
+        let witness=DaemonPaths::under(&root.join("witness"));
+        sender.ensure().unwrap();receiver.ensure().unwrap();witness.ensure().unwrap();
         let workspace_sender=root.join("sender-work");
         let workspace_receiver=root.join("receiver-work");
         fs::create_dir_all(&workspace_sender).unwrap();
         fs::create_dir_all(&workspace_receiver).unwrap();
         let afp="a".repeat(64);
         let bfp="b".repeat(64);
+        let cfp="c".repeat(64);
         let a_roster=ClusterRoster{version:1,group:"swarm-team".into(),members:vec![
             ClusterMember{fingerprint:afp.clone(),device_id:"@local".into(),alias:None},
-            ClusterMember{fingerprint:bfp.clone(),device_id:"signed-b".into(),alias:Some("bob".into())}
+            ClusterMember{fingerprint:bfp.clone(),device_id:"signed-b".into(),alias:Some("bob".into())},
+            ClusterMember{fingerprint:cfp.clone(),device_id:"signed-c".into(),alias:Some("charlie".into())}
         ]};
         let b_roster=ClusterRoster{version:1,group:"swarm-team".into(),members:vec![
             ClusterMember{fingerprint:bfp.clone(),device_id:"@local".into(),alias:None},
-            ClusterMember{fingerprint:afp.clone(),device_id:"signed-a".into(),alias:Some("alice".into())}
+            ClusterMember{fingerprint:afp.clone(),device_id:"signed-a".into(),alias:Some("alice".into())},
+            ClusterMember{fingerprint:cfp.clone(),device_id:"signed-c".into(),alias:Some("charlie".into())}
+        ]};
+        let c_roster=ClusterRoster{version:1,group:"swarm-team".into(),members:vec![
+            ClusterMember{fingerprint:cfp.clone(),device_id:"@local".into(),alias:None},
+            ClusterMember{fingerprint:afp.clone(),device_id:"signed-a".into(),alias:Some("alice".into())},
+            ClusterMember{fingerprint:bfp.clone(),device_id:"signed-b".into(),alias:Some("bob".into())}
         ]};
         assert_eq!(a_roster.digest(),b_roster.digest());
+        assert_eq!(a_roster.digest(),c_roster.digest());
         {
             let mut a=DaemonStore::open(&sender).unwrap();
             let mut b=DaemonStore::open(&receiver).unwrap();
+            let mut c=DaemonStore::open(&witness).unwrap();
             swarm_cluster::configure(&mut a,&a_roster,1000).unwrap();
             swarm_cluster::configure(&mut b,&b_roster,1000).unwrap();
+            swarm_cluster::configure(&mut c,&c_roster,1000).unwrap();
             let term1=VoteRequest{
                 group:"swarm-team".into(),term:1,candidate_fingerprint:afp.clone(),
                 roster_sha256:a_roster.digest()
@@ -316,17 +328,20 @@ mod tests{
         run_once(&receiver,2200).unwrap();
         assert_eq!(status(&receiver).unwrap()["plans"][0]["state"],"armed");
         {
-            let mut a=DaemonStore::open(&sender).unwrap();
+            // Simulate a physical partition: NO operations contact A after
+            // it exported the verified read-only source checkpoint. B and C
+            // independently form the new majority after the former lease.
             let mut b=DaemonStore::open(&receiver).unwrap();
+            let mut c=DaemonStore::open(&witness).unwrap();
             let term2=VoteRequest{
                 group:"swarm-team".into(),term:2,
                 candidate_fingerprint:bfp.clone(),roster_sha256:b_roster.digest()
             };
             let vote_b=swarm_cluster::vote(&mut b,&term2,"@local",30_000).unwrap();
-            let vote_a=swarm_cluster::vote(&mut a,&term2,"signed-b",30_000).unwrap();
-            swarm_cluster::persist_quorum(&b,&term2,&[vote_b,vote_a],30_000).unwrap();
-            assert!(!swarm_cluster::may_schedule(&a,"swarm-team",30_001).unwrap());
+            let vote_c=swarm_cluster::vote(&mut c,&term2,"signed-b",30_000).unwrap();
+            swarm_cluster::persist_quorum(&b,&term2,&[vote_b,vote_c],30_000).unwrap();
             assert!(swarm_cluster::may_schedule(&b,"swarm-team",30_001).unwrap());
+            assert!(!swarm_cluster::may_schedule(&c,"swarm-team",30_001).unwrap());
         }
         run_once(&receiver,30_001).unwrap();
         assert_eq!(status(&receiver).unwrap()["plans"][0]["state"],"imported");
