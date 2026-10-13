@@ -44,7 +44,10 @@ export function parseLearningPolicy(raw){
   fail('Training inbox and candidate output must be disjoint');
  if(typeof data.python!=='string'||!isAbsolute(data.python)||
   /[\x00-\x1f]/.test(data.python))fail('Python must be an absolute reviewed MLX environment binary');
- const python=realpathSync(data.python);
+ // Keep the chosen virtualenv entrypoint: resolving its macOS symlink and
+ // then executing the target silently drops mlx-lm[train] from site-packages.
+ const python=data.python;
+ realpathSync(python); // verify the target exists without changing invocation
  if(!statSync(python).isFile())fail('Reviewed Python executable must be a regular file');
  if(model===outputRoot||outputRoot.startsWith(model+'/')||
    model===inbox||inbox.startsWith(model+'/'))

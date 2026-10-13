@@ -388,8 +388,16 @@ For an operator-triggered self-hosted run, use GitHub Actions →
 and the opposite node must be configured in advance. Retained artifacts
 record observations without exposing vector text or provider credentials.
 
-Outstanding release proof includes live network partition/recovery, parallel
-author stress, real-model finding-to-fix-to-test success and independently
+The operator-run physical three-stage network-cut and post-restore checkpoint
+stress procedure is documented in
+[physical two-machine swarm acceptance](swarm-physical-two-machine-acceptance.md).
+After a successful restore the manual workflow now requires verified concurrent
+SQLite checkpoint publications, with stable peer identity and no duplicated
+sequence. A contract test alone remains insufficient. No physical result has
+been verified solely by adding these gates.
+
+Outstanding release proof includes actual live network partition/recovery,
+parallel-author stress, real-model finding-to-fix-to-test success and independently
 evaluated specialist accuracy. Do not mark the system production-ready solely
 because these harnesses are installed.
 
