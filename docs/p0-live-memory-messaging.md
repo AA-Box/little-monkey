@@ -44,9 +44,10 @@ different local worker posts a change notification to that reader.
 
 The inbox is deliberately bounded: 16 agents per workflow, 24 queued messages
 per recipient, 1,200 characters per direct message, six messages per drain.
-An overflowing send fails without partial broadcast delivery; an overflowing
-change notice is logged without undoing or mislabelling the already completed
-file edit. Messages reach recipient models at their next model turn or when
+An overflowing direct-message send fails without partial broadcast delivery.
+A safety-relevant file-change notification displaces the oldest queued
+coordination message if needed; `displacedForFileChange` records the loss.
+A completed file edit is never mislabelled as rolled back. Messages reach recipient models at their next model turn or when
 they explicitly read the inbox. They cannot interrupt an in-progress model
 request or an agent that has already finished.
 
@@ -70,8 +71,8 @@ When `auto_memory_stack_id` is specified:
   evidence** into worker context. Current repository evidence takes precedence.
 - After a workflow **fully succeeds**, embed and store its completed agent
   reports with deterministic SHA-256 content IDs and idempotent revision 1.
-  The tool result reports `automaticMemory.saved` and
-  `automaticMemory.warnings` rather than claiming silent success.
+  The tool result reports actual new `automaticMemory.saved`, idempotent
+  `automaticMemory.reused`, and `automaticMemory.warnings` rather than claiming silent success.
 - Persist using the existing `peers_memory_add_text` /
   `peers_memory_query_text` operations, which pin the model/dimension/prefixes
   and fail closed on inconsistent embedding spaces. No new vector engine,
