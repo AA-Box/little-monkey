@@ -50,6 +50,7 @@ mod swarm_coordinator;
 mod swarm_transfer;
 mod swarm_workers;
 mod swarm_replication;
+mod swarm_quorum;
 mod swarm_failover;
 pub(crate) mod swarm_cluster;
 pub(crate) mod store;
