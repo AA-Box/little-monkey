@@ -34,7 +34,7 @@ Run a real independent grading cycle:
 node scripts/swarm-specialist-continuous-loop.mjs --policy /absolute/path/policy.json --confirm-unattended-local-evaluation --once
 ```
 
-Remove `--once` to keep running under an operator-owned service supervisor such as launchd. A lock prevents concurrent cycles. Check any stale lock before restarting a crashed worker; never remove a live lock blindly.
+Remove `--once` to keep running under an operator-owned service supervisor such as launchd. A lock prevents concurrent cycles. A dead worker PID is automatically reclaimed with a quarantine rename; a live or unverified owner always blocks, rather than risking concurrent model runs.
 
 Dispatch a real CLI recipe through the verified active domain:
 
@@ -42,7 +42,7 @@ Dispatch a real CLI recipe through the verified active domain:
 node scripts/swarm-specialist-continuous-loop.mjs --policy /absolute/path/policy.json --confirm-unattended-local-evaluation --dispatch --domain security --recipe /absolute/path/recipe.json
 ```
 
-The dispatcher privately copies the original native recipe, replaces only the already-configured Ollama target, and runs the real `monkey task run` executable. It never changes tool access, workspace, prompt, or permission mode; `bypass` is refused.
+The dispatcher privately copies the original native recipe, replaces the already-configured Ollama target, appends a bounded fixed reviewer-focus hint chosen from the independently ranked specialist roles, and runs the real `monkey task run` executable. It preserves the original task text and system rules and never changes tool access, workspace or permission mode; `bypass` is refused.
 
 ## Quality and rollback
 
