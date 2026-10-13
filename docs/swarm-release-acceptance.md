@@ -646,3 +646,54 @@ separate `swarm-import-read-only` path explicitly requires operator
 approval and creates NEW job identities. No cross-host exactly-once effects
 are claimed. Physical two-installation partition and TLS acceptance must be
 recorded before certification.
+
+
+## Real, externally isolated DAG replica acceptance
+
+Checkpoint publication now requires TWO independent authenticated operations:
+a signed POST of the monotonic source checkpoint, followed by a separately
+signed, certificate-pinned GET that retrieves the **exact** JSON state from
+the receiving daemon's SQLite replica store. If the read-back does not
+match the source bytes, the CLI fails instead of claiming replication worked.
+
+A three-member independent-voter regression also tests A+B majority while C
+is disconnected, lease expiry, then B+C majority while A is disconnected.
+These are real native Rust state-machine tests, **not physical peer acceptance**.
+
+For the physical network test, use the operator-owned two-device workflow
+`.github/workflows/swarm-live-acceptance.yml` with
+`cluster_group`, `replica_graph_id` (already-prestaged plan-only graph),
+`peer_alias`, `network_evidence_path` on a persistent self-hosted
+machine, and `network_stage`. Use the **same** evidence path and machine
+for all three separately invoked stages:
+
+1. `baseline`: with network healthy and a current strict-majority lease, a real signed probe plus remote SQLite checkpoint readback creates new protected evidence.
+2. `partition`: operator physically isolates the peer and confirms that condition; a fresh signed peer probe must fail. The harness records the outage only when it can observe the transport failure. A failed probe by itself does not distinguish network isolation from service failure or revoked credentials.
+3. `restore`: operator restores connectivity and declares it; a fresh signed probe and **strictly newer** remotely persisted DAG checkpoint must succeed with the same enrolled source identity.
+
+Direct invocation is available when testing outside GitHub Actions:
+
+```bash
+node scripts/swarm-dag-network-recovery-live-acceptance.mjs \
+  --stage baseline --group my-cluster --graph disposable-graph \
+  --peer paired-node-b --evidence /private/swarm-evidence.json \
+  --confirm-operator-owned-readonly-cluster
+
+# Operator isolates remote peer using their own reviewed network controls.
+node scripts/swarm-dag-network-recovery-live-acceptance.mjs \
+  --stage partition --group my-cluster --graph disposable-graph \
+  --peer paired-node-b --evidence /private/swarm-evidence.json \
+  --confirm-operator-owned-readonly-cluster --confirm-network-isolated-externally
+
+# Operator restores the peer and confirms that independently.
+node scripts/swarm-dag-network-recovery-live-acceptance.mjs \
+  --stage restore --group my-cluster --graph disposable-graph \
+  --peer paired-node-b --evidence /private/swarm-evidence.json \
+  --confirm-operator-owned-readonly-cluster --confirm-network-restored-externally
+```
+
+No network permissions, firewall rules, remote tasks or security grants are
+modified by this harness. It proves the operator-declared isolation/reconnect
+and signed stored-state transfer, **not** process migration or exactly-once
+tool execution. No result is certified until a real two-installation run has
+produced the workflow artifact.
