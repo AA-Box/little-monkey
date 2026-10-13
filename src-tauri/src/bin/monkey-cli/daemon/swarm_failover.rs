@@ -628,6 +628,19 @@ mod tests{
         assert_eq!(status(&receiver).unwrap()["plans"].as_array().unwrap()
             .iter().find(|x|x["id"]=="crashed-after-registration")
             .unwrap()["state"],"imported");
+        // A second approved destination for an already-consumed predecessor
+        // must never create another graph, even if the old source's latest
+        // authenticated checkpoint still says all nodes are pending.
+        arm(&receiver,"duplicate-source-consumer","swarm-team","alice",
+            "never-double-import",&transfer,&workspace_receiver,
+            (epoch+30005)).unwrap();
+        run_once(&receiver,(epoch+30006)).unwrap();
+        assert_eq!(status(&receiver).unwrap()["plans"].as_array().unwrap()
+            .iter().find(|x|x["id"]=="duplicate-source-consumer")
+            .unwrap()["state"],"armed");
+        assert!(super::super::swarm_coordinator::status(
+            &receiver,Some("never-double-import")
+        ).unwrap()["graphs"].as_array().unwrap().is_empty());
         // A predecessor that already dispatched even one job is ambiguous:
         // the new leader cannot know whether an external inference is still
         // running. It MUST NOT re-enqueue those jobs automatically.
