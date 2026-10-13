@@ -43,7 +43,7 @@ fn authorization_url(callback_url: &str, verifier: &str, state: &str) -> Result<
         .append_pair("callback_url", callback.as_str())
         .append_pair("code_challenge", &code_challenge(verifier))
         .append_pair("code_challenge_method", "S256");
-    Ok(url.into())
+    Ok(url.to_string())
 }
 
 fn validate_callback(callback: CallbackParams, expected_state: &str) -> Result<String, String> {
