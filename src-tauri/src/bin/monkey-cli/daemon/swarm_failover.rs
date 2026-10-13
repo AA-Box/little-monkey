@@ -201,7 +201,28 @@ fn consume(paths:&DaemonPaths,plan:&ArmedPlan,now:i64)->Result<(),String>{
             return Err("Local majority lease was lost before recovery registration".into());
         }
         drop(store);
-        swarm_transfer::import_read_only(paths,&path,&plan.new_graph,Path::new(&plan.workspace))?;
+        // Read ONLY the bytes just validated, not the operator-controlled
+        // pathname again. Copy to a fresh private, exclusive daemon snapshot:
+        // otherwise a file replaced between SHA check and import could run a
+        // different prompt after consent was granted (TOCTOU).
+        let staged=paths.snapshots.join(format!(
+            "failover-candidate-{}.json",uuid::Uuid::new_v4()
+        ));
+        let import=(||{
+            use std::io::Write;
+            let mut file=std::fs::OpenOptions::new()
+                .create_new(true).write(true).open(&staged)
+                .map_err(|e|e.to_string())?;
+            file.write_all(&actual).map_err(|e|e.to_string())?;
+            file.sync_all().map_err(|e|e.to_string())?;
+            drop(file);
+            super::store::restrict_file(&staged)?;
+            swarm_transfer::import_read_only(paths,&staged,&plan.new_graph,
+                Path::new(&plan.workspace))?;
+            Ok::<_,String>(())
+        })();
+        let _=fs::remove_file(&staged);
+        import?;
         Ok::<_,String>(())
     })();
     let store=DaemonStore::open(paths)?;
