@@ -518,6 +518,27 @@ across host SQLite databases; previously completed remote model computation
 may be repeated after failover. No automatic cluster membership changes,
 Raft/BFT replicated logs or exactly-once external side effects are claimed.
 
+### Durable local read-only task reassignment
+
+For an operator-enrolled clustered graph, a *terminally failed* primary
+read-only daemon job now automatically receives up to two additional attempts.
+The immutable logical identity is `(graph_id, node_id)`. Attempt zero retains
+its original deterministic job ID; successive attempts have deterministic,
+distinct job IDs derived from the logical identity and reassignment counter.
+The SQLite node cursor and the retry counter advance in the same immediate
+transaction, requiring the previous job to be in the durable `failed` state.
+The coordinator cannot accept a stale job's late success as the current result.
+Each new dispatch must pass the current signed quorum/term/state barrier.
+
+Automatic attempts are **not** scheduled for cancelled, running, paused,
+approval-waiting or needs-reconciliation jobs, and never for manually authorized
+code-edit graphs or nonclustered graphs. Explicit approved fallback recipes
+still take precedence. After the retry budget is exhausted the DAG fails
+normally. This is automatic **local worker retry** on the certified leader,
+not automatic cross-machine task migration. It does not provide global
+exactly-once execution: peers have separate ledgers; external tools must
+implement their own transactional idempotency/fencing for that guarantee.
+
 
 ### Ruflo-compatible lifecycle hook execution (bounded subset)
 
