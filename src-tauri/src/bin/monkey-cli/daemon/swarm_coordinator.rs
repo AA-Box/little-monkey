@@ -595,6 +595,18 @@ pub fn tick(
     for (id, raw, state) in graphs {
         let spec: ResidentSwarmSpec = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
         validate(&spec)?;
+        // Never apply model results, graph success, or retry transitions under
+        // a superseded distributed owner epoch. The daemon job itself may
+        // finish locally after partition, but its graph cursor is fenced until
+        // an operator reconciles the old term. Cancellation still works in
+        // the normal cancelling/failing branch below.
+        if state == "running" {
+            if let Some(group)=spec.cluster_id.as_deref(){
+                if !owns_current_epoch(store,group,&id,clock()?)?{
+                    continue;
+                }
+            }
+        }
         let mut tasks = BTreeMap::new();
         let mut stmt = store.connection.prepare(
             "SELECT node_id,state,job_id FROM resident_swarm_nodes WHERE graph_id=?1"
