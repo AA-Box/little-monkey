@@ -95,6 +95,24 @@ pub fn reassign_failed_primary(
     Ok(true)
 }
 
+/// Record a terminal failure only if this is still the node's current
+/// attempt. Racing coordinator ticks must not overwrite a prepared retry.
+pub fn mark_current_failed(
+    store: &DaemonStore, graph: &str, node: &str, job: &str,
+    expected_state: &str, reason: &str,
+) -> Result<bool, String> {
+    if !matches!(expected_state,"submitted"|"submitted_fallback") {
+        return Err("Cannot fail a node outside the submitted state".into());
+    }
+    let changed=store.connection.execute(
+        "UPDATE resident_swarm_nodes SET state='failed',error=?4
+         WHERE graph_id=?1 AND node_id=?2 AND job_id=?3
+           AND state=?5",
+        params![graph,node,job,reason,expected_state]
+    ).map_err(|error|error.to_string())?;
+    Ok(changed==1)
+}
+
 /// A result can win only when it belongs to the task's currently authorized
 /// attempt and the corresponding daemon job is durably succeeded.
 pub fn commit_current_success(
@@ -152,6 +170,9 @@ mod tests {
             [],|r|Ok((r.get(0)?,r.get(1)?))
         ).unwrap();
         assert_eq!(prepared,("preparing".into(),expected));
+        assert!(!mark_current_failed(
+            &s,"graph","scan","job-first","submitted","stale coordinator failure"
+        ).unwrap(),"stale competing coordinator must not erase prepared intent");
         assert!(!reassign_failed_primary(&mut s,"graph","scan","job-first",2001).unwrap());
         s.connection.execute(
             "UPDATE resident_swarm_nodes SET state='submitted'
