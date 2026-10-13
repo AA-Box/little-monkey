@@ -598,7 +598,8 @@ pub fn tick(
                         let job = store.request_cancel(job_id, u64::try_from(now).unwrap_or(1))?;
                         if !job.state.is_terminal() { still_running = true; }
                     }
-                } else if status == "pending" || status == "pending_fallback" {
+                } else if matches!(status.as_str(),
+                    "pending"|"pending_fallback"|"preparing"|"preparing_fallback") {
                     store.connection.execute("UPDATE resident_swarm_nodes SET state='cancelled'
                         WHERE graph_id=?1 AND node_id=?2", params![id,node]).map_err(|e| e.to_string())?;
                 }
@@ -712,7 +713,11 @@ pub fn tick(
             // before EVERY native enqueue: an expired, partitioned or replaced
             // leader must not submit one last read-only graph task.
             if let Some(group)=spec.cluster_id.as_deref() {
-                if !super::swarm_cluster::may_schedule(store,group,clock()?)? {
+                let fresh=clock()?;
+                if !super::swarm_cluster::may_schedule(store,group,fresh)? ||
+                   !super::swarm_quorum::majority_has_state(store,group,&id,fresh)? {
+                    // A readback can age out while the coordinator freezes
+                    // dependency input. Never enqueue on a stale quorum.
                     break;
                 }
             }
