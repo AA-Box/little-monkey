@@ -65,8 +65,10 @@ struct ExchangeResponse {
 
 /// Browser consent, one-time code exchange, and keychain publication.
 /// The provider already supports model discovery and streaming using this key.
-#[tauri::command]
-pub async fn providers_openrouter_login(app: tauri::AppHandle) -> Result<(), String> {
+/// The callback also allows the daemon-owned CLI binary to store its own
+/// keychain credential, avoiding macOS cross-executable read prompts.
+pub async fn login_openrouter_with<F>(open_browser: F) -> Result<(), String>
+where F: FnOnce(String) -> Result<(), String> {
     // Serialize to avoid two simultaneous windows racing over browser callbacks
     // or keychain entries. No credentials are overwritten until exchange succeeds.
     let _guard = LOGIN_LOCK.lock().await;
@@ -75,8 +77,7 @@ pub async fn providers_openrouter_login(app: tauri::AppHandle) -> Result<(), Str
     let state = uuid::Uuid::new_v4().to_string();
     let authorize = authorization_url(&listener.redirect_uri, &verifier, &state)?;
 
-    app.opener().open_url(authorize, None::<String>)
-        .map_err(|e| format!("Could not open browser for OpenRouter login: {e}"))?;
+    open_browser(authorize)?;
 
     let callback = listener.await_callback(Duration::from_secs(300)).await?;
     let code = validate_callback(callback, &state)?;
@@ -105,6 +106,14 @@ pub async fn providers_openrouter_login(app: tauri::AppHandle) -> Result<(), Str
     }
     crate::providers::write_key("openrouter", &result.key)?;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn providers_openrouter_login(app: tauri::AppHandle) -> Result<(), String> {
+    login_openrouter_with(|url| {
+        app.opener().open_url(url, None::<String>)
+            .map_err(|e| format!("Could not open browser for OpenRouter login: {e}"))
+    }).await
 }
 
 #[cfg(test)]
