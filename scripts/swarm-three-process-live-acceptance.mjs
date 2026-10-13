@@ -103,6 +103,21 @@ async function main(){
    check(typeof profile.id==='string'&&profile.id!=='default',
     'Could not create isolated native keychain profile');
    node.env.LITTLE_MONKEY_PROFILE=profile.id;
+   check(typeof profile.root==='string'&&isAbsolute(profile.root)&&
+    profile.root.startsWith(data+'/'),
+    'Native test profile must resolve to an isolated disposable app-data root');
+   // daemon serve intentionally requires an already-created config.json.
+   // A production install writes this via DaemonConfig::save(), but calling
+   // 'daemon install' in CI would mutate the hosted runner's real user
+   // service manager. Supply the exact validated schema-v1 default in the
+   // private disposable profile instead; never install a persistent unit.
+   const nativeDaemonRoot=join(profile.root,'daemon');
+   mkdirSync(nativeDaemonRoot,{recursive:true,mode:0o700});
+   writeFileSync(join(nativeDaemonRoot,'config.json'),JSON.stringify({
+    schema_version:1,max_queue:128,concurrency:4,retention_days:30,
+    poll_interval_ms:250,lease_duration_ms:15000,
+    webhook_port:null,notifications:false,max_log_bytes:8*1024*1024
+   }),{mode:0o600});
    nodes.push(node);by[name]=node;
    run(node,['daemon','remote','host-configure','--listen','127.0.0.1:'+p,
     '--advertise-url','https://127.0.0.1:'+p,
