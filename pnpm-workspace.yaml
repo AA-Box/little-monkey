@@ -12,3 +12,12 @@ allowBuilds:
 overrides:
   '@xmldom/xmldom': ^0.9.12
   browserslist: ^4.28.9
+  # All five packages are transitive; keep fixed baselines until upstream
+  # parents raise their dependency ranges. GHSA-2v37-7h3g-55p8,
+  # GHSA-68fv-2mgg-jv7q, GHSA-rj75-hqrm-r3gf,
+  # GHSA-p98j-92pf-mc4p / GHSA-6688-9rhm-gjv2, GHSA-238p-pmpm-9mq7.
+  nanoid: ^3.3.18
+  source-map-js: ^1.2.2
+  postcss-selector-parser: ^7.1.6
+  dompurify: ^3.4.16
+  katex: ^0.18.2
