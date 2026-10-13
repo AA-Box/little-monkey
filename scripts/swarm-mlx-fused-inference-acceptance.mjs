@@ -11,6 +11,7 @@ import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {constants,openSync,closeSync,fstatSync,readSync,lstatSync,realpathSync} from 'node:fs';
 import {resolve,isAbsolute,join} from 'node:path';
+import {fileURLToPath} from 'node:url';
 const opt=k=>{const i=process.argv.indexOf(k);return i<0?null:process.argv[i+1]??null;};
 const token=/^[0-9a-f]{64}$/;
 const required=['--receipt','--python'];
@@ -55,11 +56,11 @@ function bytesOf(fd,size){
   }
   return output;
 }
-function readReceipt(path){
+export function readReceipt(path){
   const {result}=withVerifiedFile(path,512*1024,'MLX receipt',bytesOf);
   return JSON.parse(result.toString('utf8'));
 }
-async function digestFile(path,max){
+export async function digestFile(path,max){
   const {result,size}=withVerifiedFile(path,max,'fused model shard',(fd,length)=>{
     const hash=createHash('sha256'),buffer=Buffer.allocUnsafe(64*1024);
     let offset=0;
@@ -167,7 +168,9 @@ async function main(){
     note:'This is real MLX inference, NOT desktop activation, running-provider handoff or a live rollback test.',
   }));
 }
+if(process.argv[1]&&fileURLToPath(import.meta.url)===resolve(process.argv[1])){
 main().catch(e=>{
   console.error(JSON.stringify({status:'not_verified',error:String(e).slice(0,300)}));
   process.exitCode=1;
 });
+}
