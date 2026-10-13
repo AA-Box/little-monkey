@@ -1018,6 +1018,17 @@ impl RemoteApi {
                 require_capability(device, DeviceCapability::PeerTaskRequest)
                     .and_then(|_| self.peer_swarm_vote(device, &request.body, now_ms))
             },
+            // Replicated DAG checkpoints are observations, never remote job
+            // submissions. Existing authenticated peer task grant plus
+            // separate immutable local cluster membership are both checked.
+            ("POST", ["v1", "remote", "peer", "swarm-state", "checkpoints"]) => {
+                require_capability(device, DeviceCapability::PeerTaskRequest)
+                    .and_then(|_| self.peer_swarm_replica_ingest(device, &request.body, now_ms))
+            }
+            ("GET", ["v1", "remote", "peer", "swarm-state", group, graph]) => {
+                require_capability(device, DeviceCapability::PeerTaskRequest)
+                    .and_then(|_| self.peer_swarm_replica_list(device, group, graph))
+            },
             ("POST", ["v1", "remote", "peer", "hello"]) => require_any_peer_capability(device)
                 .and_then(|_| self.peer_hello_post(device, &request.body, now_ms)),
             ("POST", ["v1", "remote", "peer", "artifacts"]) => {
@@ -3977,6 +3988,35 @@ impl RemoteApi {
         ).map_err(|error|(409,error))?;
         Ok((200,serde_json::to_value(receipt).map_err(internal)?,
             Some(format!("swarm-election:{}",request.group))))
+    }
+
+    fn peer_swarm_replica_ingest(
+        &self,device:&DeviceRecord,body:&[u8],now_ms:u64,
+    )->Result<(u16,serde_json::Value,Option<String>),(u16,String)>{
+        if body.len()>64*1024 {
+            return Err((413,"Swarm DAG checkpoint exceeds 64 KiB".into()));
+        }
+        let cp:crate::daemon::swarm_replication::ReplicaSnapshot=
+            serde_json::from_slice(body).map_err(|_|(400,"Malformed DAG checkpoint".into()))?;
+        let now=i64::try_from(now_ms).map_err(|_|(400,"DAG clock overflow".into()))?;
+        let mut store=DaemonStore::open(&self.paths).map_err(internal)?;
+        let changed=crate::daemon::swarm_replication::ingest(
+            &mut store,&device.device_id,&cp,now
+        ).map_err(|error|(409,error))?;
+        Ok((200,serde_json::json!({
+            "accepted":true,"changed":changed,"group":cp.group,
+            "graph_id":cp.graph_id,"sequence":cp.sequence,
+        }),Some(format!("swarm-replica:{}",cp.group))))
+    }
+    fn peer_swarm_replica_list(
+        &self,device:&DeviceRecord,group:&str,graph:&str,
+    )->Result<(u16,serde_json::Value,Option<String>),(u16,String)>{
+        let store=DaemonStore::open(&self.paths).map_err(internal)?;
+        let replicas=crate::daemon::swarm_replication::list_for_member(
+            &store,&device.device_id,group,graph
+        ).map_err(|error|(403,error))?;
+        Ok((200,serde_json::json!({"group":group,"graph":graph,"replicas":replicas}),
+            Some(format!("swarm-replica:{group}"))))
     }
 
     fn peer_memory_gate(
