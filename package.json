@@ -28,6 +28,8 @@
     "test:ruflo-mcp:contract": "node --test scripts/swarm-ruflo-mcp-acceptance.contract.test.mjs",
     "test:ruflo-mcp:live": "node scripts/swarm-ruflo-mcp-acceptance.mjs",
     "test:swarm-peer:contract": "node --test scripts/swarm-two-peer-acceptance.contract.test.mjs",
+    "test:swarm-telemetry:contract": "node --check scripts/swarm-cross-host-telemetry-live-acceptance.mjs && node scripts/swarm-cross-host-telemetry-live-acceptance.mjs --self-check && node --test scripts/swarm-cross-host-telemetry.contract.test.mjs",
+    "test:swarm-telemetry:live": "node scripts/swarm-cross-host-telemetry-live-acceptance.mjs",
     "test:compare:live": "node scripts/smoke-compare-ollama.mjs",
     "test:realtime:loopback": "node scripts/realtime-loopback-acceptance.mjs",
     "test:realtime:live": "node scripts/realtime-live-acceptance.mjs",
