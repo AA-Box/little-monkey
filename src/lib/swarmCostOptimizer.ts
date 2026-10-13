@@ -31,6 +31,7 @@ export function optimizeSwarmRoutingCosts(
   usage:readonly CostUsageEntry[],
   enabled:boolean,
   preferredKeys:readonly string[]=[],
+  now=Date.now(),
 ):SwarmCostRoute {
   const original=[...eligibleKeys];
   const unchanged=(samples=0):SwarmCostRoute=>({
@@ -46,7 +47,14 @@ export function optimizeSwarmRoutingCosts(
   if(!baseline)return unchanged();
   // Use a SHARED observed input/output mix for all targets: comparing each
   // provider's own outputs biases the estimate by different answer lengths.
+  // A routing price estimate is only useful for a recent workload mix.
+  // Ignore old, malformed and future-dated usage rather than allowing a
+  // stale token distribution to change a newly configured model choice.
+  if(!Number.isFinite(now)||now<=0)return unchanged();
+  const windowStart=now-14*24*60*60_000;
   const samples=usage.filter(row=>original.includes(row.targetKey) &&
+    Number.isSafeInteger(row.occurredAtMs)&&
+    row.occurredAtMs>=windowStart && row.occurredAtMs<=now+5*60_000 &&
     Number.isFinite(row.usage?.promptTokens)&&row.usage.promptTokens>=0 &&
     Number.isFinite(row.usage?.completionTokens)&&row.usage.completionTokens>=0 &&
     row.usage.promptTokens+row.usage.completionTokens>0).slice(-100);
