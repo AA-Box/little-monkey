@@ -402,10 +402,13 @@ mod tests {
         early.term=2;early.expires_at_ms=46000;early.decided_at_ms=26000;
         other.term=2;other.expires_at_ms=46000;other.decided_at_ms=26000;
         persist_quorum(&store,&fresh,&[early.clone(),other.clone()],26000).unwrap();
+        let mut stale_local=early.clone();
+        stale_local.term=1;
+        let mut stale_remote=other.clone();
+        stale_remote.term=1;
         assert!(persist_quorum(&store,&old,&[
-            VoteReceipt{voter_fingerprint:"a".repeat(64),..early.clone()},
-            VoteReceipt{voter_fingerprint:"b".repeat(64),..other.clone()},
-        ],26000).is_err(),"old term may not replace new leadership");
+            stale_local,stale_remote,
+        ],26000).is_err(),"freshly delivered older term may not replace new leadership");
         // A fabricated local candidate cannot be certified even by a
         // structurally valid collection of voter receipt identities.
         old.candidate_fingerprint="b".repeat(64);
