@@ -11,7 +11,7 @@
 import {spawnSync} from 'node:child_process';
 import {createHash,randomUUID} from 'node:crypto';
 import {readFileSync,writeFileSync,openSync,closeSync,fsyncSync,renameSync,
-  mkdirSync,rmdirSync,rmSync,realpathSync,lstatSync,existsSync} from 'node:fs';
+  mkdirSync,rmdirSync,rmSync,realpathSync,lstatSync,existsSync,renameSync as moveDir} from 'node:fs';
 import {join,resolve,isAbsolute,dirname} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
@@ -278,6 +278,55 @@ export function dispatchRecipe(policy,domain,recipePath,{run=spawnSync,now=Date.
     nativeResult:result.stdout,revision:deployed.revision};
  }finally{rmSync(temporary,{force:true});}
 }
+/**
+ * Crash-safe service ownership. A dead PID can be quarantined and reclaimed;
+ * a live PID, unknown owner, or too-recent half-written lease always blocks.
+ * Only read-only benchmarks are run; an orphan inference cannot mutate code.
+ */
+export function acquireCycleLock(stateDir,{
+ pid=process.pid,now=Date.now(),alive=pid=>{
+  try{process.kill(pid,0);return true;}catch(error){
+   if(error?.code==='ESRCH')return false;
+   return true; // EPERM and unknown OS errors must fail closed.
+  }
+ }}={}){
+ const lock=join(stateDir,'.specialist-cycle-owner');
+ const install=()=>{
+  mkdirSync(lock,{mode:0o700});
+  const token=randomUUID();
+  try{atomicJson(join(lock,'owner.json'),{version:1,pid,token,createdAt:now});}
+  catch(error){rmSync(lock,{recursive:true,force:true});throw error;}
+  return ()=>{
+   const owner=JSON.parse(readBounded(join(lock,'owner.json'),2048));
+   if(owner.pid!==pid||owner.token!==token)fail('Lock ownership changed: do not remove another worker');
+   rmSync(join(lock,'owner.json'));
+   rmdirSync(lock);
+  };
+ };
+ try{return install();}
+ catch(error){
+  if(error?.code!=='EEXIST')throw error;
+ }
+ if(lstatSync(lock).isSymbolicLink()||!lstatSync(lock).isDirectory())
+  fail('Specialist worker lock must be a real directory');
+ const ownerPath=join(lock,'owner.json');
+ if(existsSync(ownerPath)){
+  const owner=JSON.parse(readBounded(ownerPath,2048));
+  if(owner.version!==1||!boundedInt(owner.pid,1,2**31-1)||
+     typeof owner.token!=='string'||!/^[a-z0-9-]{36}$/i.test(owner.token)||
+     !boundedInt(owner.createdAt,1,now+300_000)||alive(owner.pid))
+   fail('A live or unverified specialist worker already owns this state directory');
+ }else{
+  // Owner creation may have been interrupted. Do not steal a young lock.
+  const stat=lstatSync(lock);
+  if(now-stat.mtimeMs<5*60_000)
+   fail('A recent uninitialized worker lease cannot be safely reclaimed');
+ }
+ const quarantine=lock+'.crashed-'+randomUUID();
+ moveDir(lock,quarantine); // only one contender can move this exact stale lock
+ rmSync(quarantine,{recursive:true,force:true});
+ return install();
+}
 const flag=name=>{const index=process.argv.indexOf(name);return index<0?null:process.argv[index+1]??null;};
 async function main(){
  const policyPath=flag('--policy');
@@ -288,15 +337,14 @@ async function main(){
   const result=dispatchRecipe(policy,flag('--domain'),flag('--recipe'));
   process.stdout.write(JSON.stringify(result)+'\n');return;
  }
- const lock=join(policy.stateDir,'.specialist-cycle-owner');
- mkdirSync(lock,{mode:0o700});
+ const release=acquireCycleLock(policy.stateDir);
  try{
   do{
    benchmarkCycle(policy);
    if(process.argv.includes('--once'))break;
    await new Promise(done=>setTimeout(done,policy.intervalSeconds*1000));
   }while(true);
- }finally{rmdirSync(lock);}
+ }finally{release();}
 }
 if(process.argv[1]&&fileURLToPath(import.meta.url)===resolve(process.argv[1])){
  main().catch(error=>{console.error(JSON.stringify({status:'specialist_loop_stopped',
