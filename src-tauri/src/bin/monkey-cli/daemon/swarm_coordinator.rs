@@ -184,7 +184,7 @@ fn prepare_schema(store: &DaemonStore) -> Result<(), String> {
     ).map_err(|e| e.to_string())
 }
 
-fn owns_current_epoch(store:&DaemonStore,group:&str,graph:&str,now:i64)
+pub(super) fn owns_current_epoch(store:&DaemonStore,group:&str,graph:&str,now:i64)
     ->Result<bool,String>{
     if !super::swarm_cluster::may_schedule(store,group,now)?{return Ok(false);}
     let local=super::swarm_cluster::roster(store,group)?;
@@ -319,6 +319,18 @@ pub fn submit(paths: &DaemonPaths, input: &Path) -> Result<serde_json::Value, St
     }
     let json = serde_json::to_string(&spec).map_err(|e| e.to_string())?;
     let now = clock()?;
+    if let Some((group,fp,term))=ownership.as_ref() {
+        // Freezing and verifying recipes may outlive the original lease.
+        // Recheck ownership before the graph registration transaction.
+        let fresh:Option<i64>=store.connection.query_row(
+            "SELECT term FROM swarm_cluster_leases WHERE group_id=?1
+             AND leader=?2 AND expires_at_ms>?3",
+            params![group,fp,now],|r|r.get(0)
+        ).optional().map_err(|e|e.to_string())?;
+        if fresh!=Some(*term)||!super::swarm_cluster::may_schedule(&store,group,now)?{
+            return Err("Leader lease or term changed while freezing clustered DAG".into());
+        }
+    }
     let tx = store.connection.transaction().map_err(|e| e.to_string())?;
     tx.execute("INSERT INTO resident_swarm_graphs(graph_id,spec_json,state,created_at_ms,updated_at_ms)
         VALUES (?1,?2,'running',?3,?3)", params![spec.id, json, now]).map_err(|e| e.to_string())?;
