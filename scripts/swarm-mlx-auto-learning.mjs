@@ -12,12 +12,12 @@
  * a claim themselves if they deliberately want to repeat that batch.
  * Trained/fused models are NEVER registered/activated automatically.
  */
-import {readFileSync,readdirSync,existsSync,mkdirSync,writeFileSync,
- rmSync,realpathSync,statSync} from 'node:fs';
+import {readdirSync,existsSync,mkdirSync,writeFileSync,
+ rmdirSync,realpathSync,statSync,openSync,closeSync,fsyncSync} from 'node:fs';
 import {join,isAbsolute,resolve,dirname} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {spawnSync} from 'node:child_process';
-import {inspectDataset,checkedLocalDir,safeRegularBytes,digest} from './swarm-mlx-lora.mjs';
+import {inspectDataset,checkedLocalDir,safeRegularBytes} from './swarm-mlx-lora.mjs';
 const TOKEN=/^[A-Za-z0-9][A-Za-z0-9_.-]{0,78}$/;
 const HEX=/^[0-9a-f]{64}$/;
 function fail(msg){throw Error(msg);}
@@ -79,7 +79,13 @@ export function claimBatch(outputRoot,batch,hashes,now=Date.now()){
  const payload={version:1,batch,claimedAt:now,hashes};
  // Durable no-retry marker BEFORE any Python/MLX process starts. A stale
  // claim requires an explicit human reset; it can never create duplicates.
- writeFileSync(claim,JSON.stringify(payload)+'\n',{flag:'wx',mode:0o600});
+ const fd=openSync(claim,'wx',0o600);
+ try{
+  writeFileSync(fd,JSON.stringify(payload)+'\n');
+  // Claim durability must precede launching another copy of expensive GPU
+  // training. On a crash, the operator must explicitly review the claim.
+  fsyncSync(fd);
+ }finally{closeSync(fd);}
  return claim;
 }
 export function learnOnce(policy,{execute=spawnSync,log=console.log}={}){
@@ -113,12 +119,20 @@ export function learnOnce(policy,{execute=spawnSync,log=console.log}={}){
     results.push({batch:name,status:'failed_requires_operator_review'});
     continue;
   }
-  const receipt=JSON.parse(safeRegularBytes(join(out,'training-receipt.json'),
-    'MLX finished training receipt',512*1024).toString('utf8'));
+  let receipt;
+  try{
+    receipt=JSON.parse(safeRegularBytes(join(out,'training-receipt.json'),
+      'MLX finished training receipt',512*1024).toString('utf8'));
+  }catch{
+    log(JSON.stringify({batch:name,status:'failed_receipt_requires_operator_review'}));
+    results.push({batch:name,status:'failed_receipt_requires_operator_review'});
+    continue;
+  }
   const expected=policy.fuseForImport
     ?'validated_fused_model_requires_manual_runtime_import'
     :'validated_requires_manual_activation';
-  if(receipt.status!==expected ||
+  if(receipt.version!==1||receipt.engine!=='mlx_lm'||
+     receipt.baseModel!==policy.model||receipt.status!==expected ||
      !['train','valid','test'].every(key=>
        receipt.data?.[key]?.sha256===hashes[key].sha256)||
      !Number.isFinite(receipt.testPerplexity)||
@@ -155,7 +169,7 @@ async function main(){
  }finally{
   // A killed process leaves this lock in place. This is deliberate:
   // never steal a potentially still-running GPU training slot.
-  rmSync(lock,{recursive:false});
+  rmdirSync(lock);
  }
 }
 if(process.argv[1]&&fileURLToPath(import.meta.url)===resolve(process.argv[1]))

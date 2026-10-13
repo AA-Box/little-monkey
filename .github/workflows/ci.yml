@@ -77,6 +77,8 @@ jobs:
           node --check scripts/swarm-resident-fallback-live-acceptance.mjs
           node --check scripts/swarm-mlx-lora.mjs
           node --test scripts/swarm-mlx-lora.contract.test.mjs
+          node --check scripts/swarm-mlx-auto-learning.mjs
+          node --test scripts/swarm-mlx-auto-learning.contract.test.mjs
           node --check scripts/swarm-ruflo-mcp-acceptance.mjs
           node --test scripts/swarm-ruflo-mcp-acceptance.contract.test.mjs
           node scripts/swarm-resident-fallback-live-acceptance.mjs --self-check
