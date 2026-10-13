@@ -44,13 +44,18 @@ jobs:
         run: |
           set -euo pipefail
           "$RUNNER_TEMP/mlx-venv/bin/python" -c '
-          import os
+          import os,hashlib
+          from pathlib import Path
           from huggingface_hub import snapshot_download
           snapshot_download(
             repo_id="mlx-community/SmolLM2-135M-Instruct",
-            revision="6126dda7b522a48b1072c4c37fd912a6b871b5f696e6d4f0a8f983d6bb50f9c6",
+            revision="refs/pr/1",
             local_dir=os.environ["MODEL_PATH"],
           )
+          weights=Path(os.environ["MODEL_PATH"])/"model.safetensors"
+          observed=hashlib.sha256(weights.read_bytes()).hexdigest()
+          if observed!="989e3ef746b41999ca096055a60c87057b8e842824253391bc0d9ed8dfc6936e":
+              raise RuntimeError("Public MLX model differs from pinned safetensors SHA256")
           '
           test -s "$MODEL_PATH/config.json"
           test -s "$MODEL_PATH/model.safetensors"
