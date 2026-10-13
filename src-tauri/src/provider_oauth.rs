@@ -84,6 +84,27 @@ where F: FnOnce(String) -> Result<(), String> {
     exchange_and_store(&code, &verifier).await
 }
 
+/// OpenRouter displays a code to the browser when callback_url is omitted.
+/// Even in this mode, the challenge is mandatory and bound to the verifier.
+fn headless_authorization_url(verifier: &str) -> Result<String, String> {
+    let mut url = url::Url::parse(AUTHORIZE_ENDPOINT)
+        .map_err(|e| format!("Invalid OpenRouter authorization endpoint: {e}"))?;
+    url.query_pairs_mut()
+        .append_pair("code_challenge", &code_challenge(verifier))
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("key_label", "Little Monkey CLI");
+    Ok(url.to_string())
+}
+
+fn validate_headless_code(pasted: &str) -> Result<&str, String> {
+    // Terminal read_line includes a newline; trim that separator first.
+    let code = pasted.trim();
+    if code.is_empty() || code.len() > 4096 || code.chars().any(char::is_whitespace) {
+        return Err("Invalid authorization code pasted for OpenRouter".into());
+    }
+    Ok(code)
+}
+
 /// Headless OAuth PKCE requires no loopback listener. OpenRouter displays a
 /// single-use code in the browser, and the user pastes it into the terminal.
 /// The verifier never leaves the CLI process except during HTTPS exchange.
@@ -91,20 +112,8 @@ pub async fn login_openrouter_headless_with<F>(request_code: F) -> Result<(), St
 where F: FnOnce(String) -> Result<String, String> {
     let _guard = LOGIN_LOCK.lock().await;
     let verifier = random_verifier();
-    let mut url = url::Url::parse(AUTHORIZE_ENDPOINT)
-        .map_err(|e| format!("Invalid OpenRouter authorization endpoint: {e}"))?;
-    url.query_pairs_mut()
-        .append_pair("code_challenge", &code_challenge(&verifier))
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("key_label", "Little Monkey CLI");
-    let code = request_code(url.to_string())?;
-    let code = code.trim();
-    // Terminal read_line includes a newline; trim that separator first,
-    // then reject embedded whitespace so pasting malformed URLs cannot
-    // accidentally enter the token exchange.
-    if code.is_empty() || code.len() > 4096 || code.chars().any(char::is_whitespace) {
-        return Err("Invalid authorization code pasted for OpenRouter".into());
-    }
+    let code = request_code(headless_authorization_url(&verifier)?)?;
+    let code = validate_headless_code(&code)?;
     exchange_and_store(code, &verifier).await
 }
 
@@ -163,6 +172,21 @@ mod tests {
         assert!(pairs.get("state").is_none());
         assert!(!url.as_str().contains("correct-horse-battery"));
         assert!(authorization_url("https://evil.invalid/", "x", "y").is_err());
+    }
+
+    #[test]
+    fn headless_authorization_requires_pkce_without_callback() {
+        let parsed = url::Url::parse(
+            &headless_authorization_url("valid-test-verifier").unwrap()
+        ).unwrap();
+        let qs: std::collections::HashMap<_, _> =
+            parsed.query_pairs().map(|(k,v)|(k.into_owned(),v.into_owned())).collect();
+        assert_eq!(qs.get("code_challenge_method").map(String::as_str),Some("S256"));
+        assert_eq!(qs.get("code_challenge"),Some(&code_challenge("valid-test-verifier")));
+        assert!(!qs.contains_key("callback_url"));
+        assert_eq!(validate_headless_code("code-abc\\n").unwrap(), "code-abc");
+        assert!(validate_headless_code("code abc").is_err());
+        assert!(validate_headless_code("  ").is_err());
     }
 
     #[test]
