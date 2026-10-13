@@ -437,6 +437,30 @@ mod tests{
         ).unwrap();
         assert_eq!(count,1,"operator consent and durable one-shot claim survive reopen");
         drop(reloaded);
+        // A predecessor that already dispatched even one job is ambiguous:
+        // the new leader cannot know whether an external inference is still
+        // running. It MUST NOT re-enqueue those jobs automatically.
+        arm(&receiver,"ambiguous-recovery","swarm-team","alice",
+            "do-not-replay",&transfer,&workspace_receiver,30_003).unwrap();
+        let mut attempted=record.clone();
+        attempted.sequence=2;
+        attempted.nodes[0].state="submitted".into();
+        attempted.nodes[0].job_id=Some("original-inflight-job".into());
+        attempted.seal().unwrap();
+        {
+            let mut store=DaemonStore::open(&receiver).unwrap();
+            assert!(swarm_replication::ingest(
+                &mut store,"signed-a",&attempted,30_003
+            ).unwrap());
+        }
+        run_once(&receiver,30_004).unwrap();
+        let all=status(&receiver).unwrap();
+        let blocked=all["plans"].as_array().unwrap().iter()
+            .find(|plan|plan["id"]=="ambiguous-recovery").unwrap();
+        assert_eq!(blocked["state"],"armed",
+            "uncertain already-started remote work must never be blindly replayed");
+        assert!(super::super::swarm_coordinator::status(&receiver,
+            Some("do-not-replay")).unwrap()["graphs"].as_array().unwrap().is_empty());
         let _=fs::remove_dir_all(root);
     }
 
