@@ -1999,3 +1999,75 @@ fn election_route_never_grants_non_task_peers_a_voting_capability() {
         &serde_json::to_vec(&req).unwrap(),NOW+10);
     assert_eq!(forbidden.status,403);
 }
+
+
+#[test]
+fn signed_three_node_election_uses_majority_when_third_member_is_partitioned() {
+    use super::swarm_cluster::{ClusterMember,ClusterRoster,VoteRequest,VoteReceipt};
+    let alice=Node::start("quorum-alice");
+    let bob=Node::start("quorum-bob");
+    let carol=Node::start("quorum-carol");
+    let grants=BTreeSet::from([DeviceCapability::PeerTaskRequest]);
+    let alice_at_bob=bob.admit_peer(grants.clone(),"quorum-alice");
+    let alice_at_carol=carol.admit_peer(grants,"quorum-alice");
+    let fingerprints=["a".repeat(64),"b".repeat(64),"c".repeat(64)];
+    let group="majority-with-one-offline";
+    let alice_roster=ClusterRoster { version:1,group:group.into(),members:vec![
+        ClusterMember{fingerprint:fingerprints[0].clone(),
+            device_id:"@local".into(),alias:None},
+        ClusterMember{fingerprint:fingerprints[1].clone(),
+            device_id:"paired-bob".into(),alias:Some("bob".into())},
+        ClusterMember{fingerprint:fingerprints[2].clone(),
+            device_id:"paired-carol".into(),alias:Some("carol".into())},
+    ]};
+    let bob_roster=ClusterRoster { version:1,group:group.into(),members:vec![
+        ClusterMember{fingerprint:fingerprints[0].clone(),
+            device_id:alice_at_bob.device_id.clone(),alias:Some("alice".into())},
+        ClusterMember{fingerprint:fingerprints[1].clone(),
+            device_id:"@local".into(),alias:None},
+        ClusterMember{fingerprint:fingerprints[2].clone(),
+            device_id:"paired-carol".into(),alias:Some("carol".into())},
+    ]};
+    let carol_roster=ClusterRoster { version:1,group:group.into(),members:vec![
+        ClusterMember{fingerprint:fingerprints[0].clone(),
+            device_id:alice_at_carol.device_id.clone(),alias:Some("alice".into())},
+        ClusterMember{fingerprint:fingerprints[1].clone(),
+            device_id:"paired-bob".into(),alias:Some("bob".into())},
+        ClusterMember{fingerprint:fingerprints[2].clone(),
+            device_id:"@local".into(),alias:None},
+    ]};
+    let mut stores=[
+        DaemonStore::open(&alice.paths).unwrap(),
+        DaemonStore::open(&bob.paths).unwrap(),
+        DaemonStore::open(&carol.paths).unwrap(),
+    ];
+    for (store,roster) in stores.iter_mut().zip(
+      [&alice_roster,&bob_roster,&carol_roster].iter()) {
+        super::swarm_cluster::configure(store,roster,NOW as i64).unwrap();
+    }
+    let req=VoteRequest{group:group.into(),term:1,
+        candidate_fingerprint:fingerprints[0].clone(),
+        roster_sha256:alice_roster.digest()};
+    let local=super::swarm_cluster::vote(
+        &mut stores[0],&req,"@local",NOW as i64).unwrap();
+    // Bob is reachable, Carol is partitioned. Alice + Bob is a legitimate
+    // strict majority; Carol neither votes nor learns a synthesized vote.
+    let approved=call(&bob,&alice_at_bob,"POST","/v1/remote/peer/swarm-election/vote",
+        &serde_json::to_vec(&req).unwrap(),NOW+100);
+    assert_eq!(approved.status,200);
+    let bob_vote:VoteReceipt=serde_json::from_slice(&approved.body).unwrap();
+    let now=NOW as i64+100;
+    assert!(super::swarm_cluster::persist_quorum(
+        &stores[0],&req,&[local.clone(),bob_vote.clone()],now).is_ok());
+    assert!(super::swarm_cluster::may_schedule(&stores[0],group,now+100).unwrap());
+    // A fabricated vote by unreachable Carol is not constructed or accepted
+    // by the signed HTTP path. One local receipt alone is never a quorum.
+    assert!(super::swarm_cluster::persist_quorum(
+        &stores[2],&req,&[local.clone()],now).is_err());
+    assert!(!super::swarm_cluster::may_schedule(&stores[2],group,now).unwrap());
+    // An explicit revocation before a later election makes Bob unavailable.
+    bob.revoke(&alice_at_bob.device_id);
+    let blocked=call(&bob,&alice_at_bob,"POST","/v1/remote/peer/swarm-election/vote",
+        &serde_json::to_vec(&req).unwrap(),NOW+200);
+    assert_ne!(blocked.status,200);
+}
