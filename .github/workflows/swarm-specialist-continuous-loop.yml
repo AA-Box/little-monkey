@@ -5,6 +5,7 @@ on:
     paths:
       - 'scripts/swarm-specialist-continuous-loop.mjs'
       - 'scripts/swarm-specialist-continuous-loop.contract.test.mjs'
+      - 'scripts/swarm-specialist-process-acceptance.test.mjs'
       - 'scripts/swarm-specialist-service.mjs'
       - 'scripts/swarm-specialist-service.contract.test.mjs'
       - '.github/workflows/swarm-specialist-continuous-loop.yml'
@@ -13,6 +14,7 @@ on:
     paths:
       - 'scripts/swarm-specialist-continuous-loop.mjs'
       - 'scripts/swarm-specialist-continuous-loop.contract.test.mjs'
+      - 'scripts/swarm-specialist-process-acceptance.test.mjs'
       - 'scripts/swarm-specialist-service.mjs'
       - 'scripts/swarm-specialist-service.contract.test.mjs'
       - '.github/workflows/swarm-specialist-continuous-loop.yml'
@@ -23,7 +25,7 @@ permissions:
 jobs:
   contract:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -33,6 +35,8 @@ jobs:
         run: node --check scripts/swarm-specialist-continuous-loop.mjs
       - name: Independent evidence, promotion, rollback, and dispatch contracts
         run: node --test scripts/swarm-specialist-continuous-loop.contract.test.mjs
+      - name: Source-oracle process acceptance through real Git repositories and child processes
+        run: node --test scripts/swarm-specialist-process-acceptance.test.mjs
       - name: LaunchAgent service syntax validation
         run: node --check scripts/swarm-specialist-service.mjs
       - name: User-service lifecycle contracts
