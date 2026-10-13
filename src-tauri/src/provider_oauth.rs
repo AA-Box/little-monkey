@@ -33,13 +33,16 @@ fn authorization_url(callback_url: &str, verifier: &str, state: &str) -> Result<
         || parsed.path() != "/" || parsed.query().is_some() {
         return Err("OpenRouter callback must be an unadorned 127.0.0.1 loopback URL".into());
     }
+    let mut callback = parsed;
+    // OpenRouter documents state as a query parameter in callback_url.
+    // It returns alongside code, unlike servers that accept top-level state.
+    callback.query_pairs_mut().append_pair("state", state);
     let mut url = url::Url::parse(AUTHORIZE_ENDPOINT)
         .map_err(|e| format!("Invalid OpenRouter authorization endpoint: {e}"))?;
     url.query_pairs_mut()
-        .append_pair("callback_url", callback_url)
+        .append_pair("callback_url", callback.as_str())
         .append_pair("code_challenge", &code_challenge(verifier))
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("state", state);
+        .append_pair("code_challenge_method", "S256");
     Ok(url.into())
 }
 
@@ -116,10 +119,10 @@ mod tests {
         let pairs: std::collections::HashMap<_,_> =
             url.query_pairs().map(|(k,v)|(k.into_owned(),v.into_owned())).collect();
         assert_eq!(url.host_str(), Some("openrouter.ai"));
-        assert_eq!(pairs.get("callback_url").map(String::as_str), Some("http://127.0.0.1:51234/"));
+        assert_eq!(pairs.get("callback_url").map(String::as_str), Some("http://127.0.0.1:51234/?state=nonce123"));
         assert_eq!(pairs.get("code_challenge_method").map(String::as_str), Some("S256"));
         assert_eq!(pairs.get("code_challenge").unwrap(), &code_challenge("correct-horse-battery"));
-        assert_eq!(pairs.get("state").map(String::as_str), Some("nonce123"));
+        assert!(pairs.get("state").is_none());
         assert!(!url.as_str().contains("correct-horse-battery"));
         assert!(authorization_url("https://evil.invalid/", "x", "y").is_err());
     }
