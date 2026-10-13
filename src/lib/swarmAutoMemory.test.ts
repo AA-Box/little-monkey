@@ -41,17 +41,19 @@ describe('durable semantic workflow memory', () => {
   });
 
   it('captures only requested completed reports and saves deterministic idempotent IDs', async () => {
-    vi.mocked(invoke).mockResolvedValue({});
+    vi.mocked(invoke).mockResolvedValueOnce({ updated: true })
+      .mockResolvedValueOnce({ updated: false });
     const reports = [{ taskId: 'task-1', role: 'Auth reviewer', report: 'Verified with tests: token owner must match' }];
     const result = await captureAutoMemory('stack-one', '/repo', 'security', reports);
-    expect(result).toEqual({ saved: 1, warnings: [] });
+    expect(result).toEqual({ saved: 1, reused: 0, warnings: [] });
     const first = vi.mocked(invoke).mock.calls[0];
     expect(first[0]).toBe('peers_memory_add_text');
     expect(first[1]).toMatchObject({
       namespace: await autoMemoryNamespace('/repo'),
       stackId: 'stack-one', revision: 1,
     });
-    await captureAutoMemory('stack-one', '/repo', 'security', reports);
+    const replay = await captureAutoMemory('stack-one', '/repo', 'security', reports);
+    expect(replay).toEqual({ saved: 0, reused: 1, warnings: [] });
     expect(vi.mocked(invoke).mock.calls[1][1]).toEqual(first[1]);
   });
 
@@ -61,6 +63,7 @@ describe('durable semantic workflow memory', () => {
       { taskId: 'one', role: 'Reviewer', report: 'Report' },
     ]);
     expect(result.saved).toBe(0);
+    expect(result.reused).toBe(0);
     expect(result.warnings.join(' ')).toContain('offline');
   });
 
