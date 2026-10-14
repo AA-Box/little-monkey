@@ -23,20 +23,20 @@ jobs:
           node --test scripts/swarm-continuous-quality.contract.test.mjs scripts/swarm-provider-billing.contract.test.mjs
   installed:
     needs: contracts
-    if: \${{ vars.LM_SWARM_CONTINUOUS_ENABLED == 'true' }}
+    if: ${{ vars.LM_SWARM_CONTINUOUS_ENABLED == 'true' }}
     runs-on: [self-hosted, swarm-acceptance, swarm-node-a]
     timeout-minutes: 120
     env:
-      MODEL_TARGETS: \${{ vars.LM_SWARM_CONTINUOUS_TARGETS }}
-      QUALITY_OUTPUT: \${{ vars.LM_SWARM_QUALITY_OUTPUT }}
-      BILLING_LEDGER_OPENAI: \${{ vars.LM_SWARM_OPENAI_LEDGER }}
-      BILLING_OUTPUT_OPENAI: \${{ vars.LM_SWARM_OPENAI_BILLING_OUTPUT }}
-      BILLING_SCOPE_OPENAI: \${{ vars.LM_SWARM_OPENAI_API_KEY_ID }}
-      BILLING_LEDGER_ANTHROPIC: \${{ vars.LM_SWARM_ANTHROPIC_LEDGER }}
-      BILLING_OUTPUT_ANTHROPIC: \${{ vars.LM_SWARM_ANTHROPIC_BILLING_OUTPUT }}
-      BILLING_SCOPE_ANTHROPIC: \${{ vars.LM_SWARM_ANTHROPIC_WORKSPACE_ID }}
-      OPENAI_ADMIN_KEY: \${{ secrets.OPENAI_ADMIN_KEY }}
-      ANTHROPIC_ADMIN_KEY: \${{ secrets.ANTHROPIC_ADMIN_KEY }}
+      MODEL_TARGETS: ${{ vars.LM_SWARM_CONTINUOUS_TARGETS }}
+      QUALITY_OUTPUT: ${{ vars.LM_SWARM_QUALITY_OUTPUT }}
+      BILLING_LEDGER_OPENAI: ${{ vars.LM_SWARM_OPENAI_LEDGER }}
+      BILLING_OUTPUT_OPENAI: ${{ vars.LM_SWARM_OPENAI_BILLING_OUTPUT }}
+      BILLING_SCOPE_OPENAI: ${{ vars.LM_SWARM_OPENAI_API_KEY_ID }}
+      BILLING_LEDGER_ANTHROPIC: ${{ vars.LM_SWARM_ANTHROPIC_LEDGER }}
+      BILLING_OUTPUT_ANTHROPIC: ${{ vars.LM_SWARM_ANTHROPIC_BILLING_OUTPUT }}
+      BILLING_SCOPE_ANTHROPIC: ${{ vars.LM_SWARM_ANTHROPIC_WORKSPACE_ID }}
+      OPENAI_ADMIN_KEY: ${{ secrets.OPENAI_ADMIN_KEY }}
+      ANTHROPIC_ADMIN_KEY: ${{ secrets.ANTHROPIC_ADMIN_KEY }}
     steps:
       - uses: actions/checkout@v4
       - name: Require installed approved runtime and actual model targets
@@ -81,6 +81,6 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
           path: |
-            \${{ vars.LM_SWARM_QUALITY_OUTPUT }}
-            \${{ vars.LM_SWARM_OPENAI_BILLING_OUTPUT }}
-            \${{ vars.LM_SWARM_ANTHROPIC_BILLING_OUTPUT }}
+            ${{ vars.LM_SWARM_QUALITY_OUTPUT }}
+            ${{ vars.LM_SWARM_OPENAI_BILLING_OUTPUT }}
+            ${{ vars.LM_SWARM_ANTHROPIC_BILLING_OUTPUT }}
