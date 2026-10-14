@@ -522,6 +522,11 @@ mod tests{
         // even though it has both plan bytes and the previous leader's status.
         run_once(&receiver,(epoch+2200)).unwrap();
         assert_eq!(status(&receiver).unwrap()["plans"][0]["state"],"armed");
+        // The source renewed its actual-time term-1 lease during fixture setup.
+        // Advance the simulated clock beyond that specific lease before B/C
+        // vote for term 2; never weaken overlap rejection in production.
+        let takeover_epoch = i64::try_from(super::super::now_ms().unwrap())
+            .unwrap().max(source_capture_ms).saturating_add(30_000);
         {
             // Simulate a physical partition: NO operations contact A after
             // it exported the verified read-only source checkpoint. B and C
@@ -532,11 +537,11 @@ mod tests{
                 group:"swarm-team".into(),term:2,
                 candidate_fingerprint:bfp.clone(),roster_sha256:b_roster.digest()
             };
-            let vote_b=swarm_cluster::vote(&mut b,&term2,"@local",(epoch+30000)).unwrap();
-            let vote_c=swarm_cluster::vote(&mut c,&term2,"signed-b",(epoch+30000)).unwrap();
-            swarm_cluster::persist_quorum(&b,&term2,&[vote_b,vote_c],(epoch+30000)).unwrap();
-            assert!(swarm_cluster::may_schedule(&b,"swarm-team",(epoch+30001)).unwrap());
-            assert!(!swarm_cluster::may_schedule(&c,"swarm-team",(epoch+30001)).unwrap());
+            let vote_b=swarm_cluster::vote(&mut b,&term2,"@local",(takeover_epoch+0)).unwrap();
+            let vote_c=swarm_cluster::vote(&mut c,&term2,"signed-b",(takeover_epoch+0)).unwrap();
+            swarm_cluster::persist_quorum(&b,&term2,&[vote_b,vote_c],(takeover_epoch+0)).unwrap();
+            assert!(swarm_cluster::may_schedule(&b,"swarm-team",(takeover_epoch+1)).unwrap());
+            assert!(!swarm_cluster::may_schedule(&c,"swarm-team",(takeover_epoch+1)).unwrap());
         }
         // A different enrolled member can honestly publish the SAME graph
         // name, but that must not authorize re-running A's staged plan.
@@ -551,7 +556,7 @@ mod tests{
             not_predecessor.source_fingerprint=cfp.clone();
             not_predecessor.seal().unwrap();
             assert!(swarm_replication::ingest(
-                &mut store,"signed-c",&not_predecessor,(epoch+30001)
+                &mut store,"signed-c",&not_predecessor,(takeover_epoch+1)
             ).unwrap());
         }
         // The new B+C majority's C witness independently queried its local
@@ -560,24 +565,24 @@ mod tests{
         // injects the exact parsed signed reply at the record boundary.
         super::super::swarm_recovery_witness::record(
             &receiver,"swarm-team","original",&afp,&cfp,
-            Some(&record),(epoch+30001)
+            Some(&record),(takeover_epoch+1)
         ).unwrap();
-        run_once(&receiver,(epoch+30001)).unwrap();
+        run_once(&receiver,(takeover_epoch+1)).unwrap();
         assert_eq!(status(&receiver).unwrap()["plans"][0]["state"],"armed",
             "an unrelated enrolled member must not trigger the reviewed predecessor's transfer");
         {
             let mut store=DaemonStore::open(&receiver).unwrap();
             assert!(swarm_replication::ingest(
-                &mut store,"signed-a",&record,(epoch+30002)
+                &mut store,"signed-a",&record,(takeover_epoch+2)
             ).unwrap());
         }
         // Keep the first crash source without an affirmative witness for a
         // negative test below; only the second has signed source evidence yet.
         super::super::swarm_recovery_witness::record(
             &receiver,"swarm-team","source-after-registration",
-            &afp,&cfp,Some(&crash_sources[1].1),epoch+30002
+            &afp,&cfp,Some(&crash_sources[1].1),takeover_epoch+2
         ).unwrap();
-        run_once(&receiver,(epoch+30002)).unwrap();
+        run_once(&receiver,(takeover_epoch+2)).unwrap();
         assert_eq!(status(&receiver).unwrap()["plans"][0]["state"],"imported");
         let graph=super::super::swarm_coordinator::status(&receiver,Some("recovered")).unwrap();
         assert_eq!(graph["graphs"][0]["tasks"][0]["state"],"pending");
@@ -586,10 +591,10 @@ mod tests{
         {
             let b=DaemonStore::open(&receiver).unwrap();
             assert!(super::super::swarm_coordinator::owns_current_epoch(
-                &b,"swarm-team","recovered",(epoch+30002)
+                &b,"swarm-team","recovered",(takeover_epoch+2)
             ).unwrap(),"the replacement is owned by B in its newly certified term");
         }
-        run_once(&receiver,(epoch+30002)).unwrap();
+        run_once(&receiver,(takeover_epoch+2)).unwrap();
         assert_eq!(super::super::swarm_coordinator::status(&receiver,Some("recovered"))
             .unwrap()["graphs"].as_array().unwrap().len(),1);
         let reloaded=DaemonStore::open(&receiver).unwrap();
@@ -604,21 +609,21 @@ mod tests{
         // exact same source bundle; it must not require a new operator claim.
         arm(&receiver,"crashed-after-claim","swarm-team","alice",
             "after-crash",&crash_sources[0].0,&workspace_receiver,
-            (epoch+30003)).unwrap();
+            (takeover_epoch+3)).unwrap();
         // A remote peer can respond successfully with no source checkpoint.
         // That missing information must NOT become an affirmative vote.
         super::super::swarm_recovery_witness::record(
             &receiver,"swarm-team","source-before-registration",
-            &afp,&cfp,None,epoch+30003
+            &afp,&cfp,None,takeover_epoch+3
         ).unwrap();
-        run_once(&receiver,epoch+30003).unwrap();
+        run_once(&receiver,takeover_epoch+3).unwrap();
         assert_eq!(status(&receiver).unwrap()["plans"].as_array().unwrap()
             .iter().find(|x|x["id"]=="crashed-after-claim")
             .unwrap()["state"],"armed",
             "signed absence cannot authorize an unattended cross-host retry");
         super::super::swarm_recovery_witness::record(
             &receiver,"swarm-team","source-before-registration",
-            &afp,&cfp,Some(&crash_sources[0].1),epoch+30004
+            &afp,&cfp,Some(&crash_sources[0].1),takeover_epoch+4
         ).unwrap();
         {
             let store=DaemonStore::open(&receiver).unwrap();
@@ -632,17 +637,17 @@ mod tests{
                 "UPDATE resident_swarm_failover_plans
                  SET state='claimed',claimed_at_ms=?2
                  WHERE plan_id=?1 AND state='armed'",
-                params!["crashed-after-claim",epoch+30003]
+                params!["crashed-after-claim",takeover_epoch+3]
             ).unwrap(),1);
         }
-        run_once(&receiver,(epoch+30004)).unwrap();
+        run_once(&receiver,(takeover_epoch+4)).unwrap();
         let resumed=status(&receiver).unwrap();
         assert_eq!(resumed["plans"].as_array().unwrap().iter()
             .find(|x|x["id"]=="crashed-after-claim").unwrap()["state"],"imported");
         assert_eq!(super::super::swarm_coordinator::status(
             &receiver,Some("after-crash")
         ).unwrap()["graphs"][0]["tasks"][0]["state"],"pending");
-        run_once(&receiver,(epoch+30004)).unwrap();
+        run_once(&receiver,(takeover_epoch+4)).unwrap();
         let snapshot=super::super::swarm_coordinator::status(
             &receiver,Some("after-crash")
         ).unwrap();
@@ -653,7 +658,7 @@ mod tests{
         // reconcile that ambiguous claim as a completed registration.
         arm(&receiver,"crashed-after-registration","swarm-team","alice",
             "registered-before-crash",&crash_sources[1].0,&workspace_receiver,
-            (epoch+30004)).unwrap();
+            (takeover_epoch+4)).unwrap();
         {
             let store=DaemonStore::open(&receiver).unwrap();
             assert_eq!(store.connection.execute(
@@ -670,7 +675,7 @@ mod tests{
         }
         swarm_transfer::import_read_only(&receiver,&crash_sources[1].0,
             "registered-before-crash",&workspace_receiver).unwrap();
-        run_once(&receiver,(epoch+30005)).unwrap();
+        run_once(&receiver,(takeover_epoch+5)).unwrap();
         assert_eq!(status(&receiver).unwrap()["plans"].as_array().unwrap()
             .iter().find(|x|x["id"]=="crashed-after-registration")
             .unwrap()["state"],"imported");
@@ -679,8 +684,8 @@ mod tests{
         // authenticated checkpoint still says all nodes are pending.
         arm(&receiver,"duplicate-source-consumer","swarm-team","alice",
             "never-double-import",&transfer,&workspace_receiver,
-            (epoch+30005)).unwrap();
-        run_once(&receiver,(epoch+30006)).unwrap();
+            (takeover_epoch+5)).unwrap();
+        run_once(&receiver,(takeover_epoch+6)).unwrap();
         assert_eq!(status(&receiver).unwrap()["plans"].as_array().unwrap()
             .iter().find(|x|x["id"]=="duplicate-source-consumer")
             .unwrap()["state"],"armed");
@@ -691,7 +696,7 @@ mod tests{
         // the new leader cannot know whether an external inference is still
         // running. It MUST NOT re-enqueue those jobs automatically.
         arm(&receiver,"ambiguous-recovery","swarm-team","alice",
-            "do-not-replay",&transfer,&workspace_receiver,(epoch+30003)).unwrap();
+            "do-not-replay",&transfer,&workspace_receiver,(takeover_epoch+3)).unwrap();
         let mut attempted=record.clone();
         attempted.sequence=2;
         attempted.nodes[0].state="submitted".into();
@@ -700,10 +705,10 @@ mod tests{
         {
             let mut store=DaemonStore::open(&receiver).unwrap();
             assert!(swarm_replication::ingest(
-                &mut store,"signed-a",&attempted,(epoch+30003)
+                &mut store,"signed-a",&attempted,(takeover_epoch+3)
             ).unwrap());
         }
-        run_once(&receiver,(epoch+30004)).unwrap();
+        run_once(&receiver,(takeover_epoch+4)).unwrap();
         let all=status(&receiver).unwrap();
         let blocked=all["plans"].as_array().unwrap().iter()
             .find(|plan|plan["id"]=="ambiguous-recovery").unwrap();
@@ -720,14 +725,14 @@ mod tests{
             prepared.seal().unwrap();
             super::super::swarm_recovery_witness::record(
                 &receiver,"swarm-team","original",&afp,&cfp,
-                Some(&prepared),(epoch+30005)
+                Some(&prepared),(takeover_epoch+5)
             ).unwrap();
             assert!(super::super::swarm_recovery_witness::record(
                 &receiver,"swarm-team","original",&afp,&cfp,
-                Some(&record),(epoch+30006)
+                Some(&record),(takeover_epoch+6)
             ).is_err(),"out-of-order signed GET cannot roll the witness back");
             assert!(super::super::swarm_recovery_witness::record(
-                &receiver,"swarm-team","original",&afp,&cfp,None,(epoch+30007)
+                &receiver,"swarm-team","original",&afp,&cfp,None,(takeover_epoch+7)
             ).is_err(),"missing response cannot erase a prior prepared intent");
         }
         // A can regain a signed majority in term 3 after B's lease expires,
@@ -740,12 +745,12 @@ mod tests{
                 group:"swarm-team".into(),term:3,
                 candidate_fingerprint:afp.clone(),roster_sha256:a_roster.digest()
             };
-            let vote_a=swarm_cluster::vote(&mut a,&term3,"@local",(epoch+55000)).unwrap();
-            let vote_c=swarm_cluster::vote(&mut c,&term3,"signed-a",(epoch+55000)).unwrap();
-            swarm_cluster::persist_quorum(&a,&term3,&[vote_a,vote_c],(epoch+55000)).unwrap();
-            assert!(swarm_cluster::may_schedule(&a,"swarm-team",(epoch+55001)).unwrap());
+            let vote_a=swarm_cluster::vote(&mut a,&term3,"@local",(takeover_epoch+25000)).unwrap();
+            let vote_c=swarm_cluster::vote(&mut c,&term3,"signed-a",(takeover_epoch+25000)).unwrap();
+            swarm_cluster::persist_quorum(&a,&term3,&[vote_a,vote_c],(takeover_epoch+25000)).unwrap();
+            assert!(swarm_cluster::may_schedule(&a,"swarm-team",(takeover_epoch+25001)).unwrap());
             assert!(!super::super::swarm_coordinator::owns_current_epoch(
-                &a,"swarm-team","original",(epoch+55001)
+                &a,"swarm-team","original",(takeover_epoch+25001)
             ).unwrap(),"regaining an election cannot replay a previous leader term's DAG");
         }
         assert!(super::super::swarm_coordinator::status(&receiver,
