@@ -188,6 +188,27 @@ describe("settingsStore.memoryEnabled", () => {
   });
 });
 
+describe("settingsStore.autoMemoryEnabled", () => {
+  it("defaults to false unless explicitly enabled", async () => {
+    if (typeof localStorage !== "undefined") localStorage.removeItem(STORAGE_KEY);
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().autoMemoryEnabled).toBe(false);
+  });
+
+  it("toggles and persists the opt-in on a real browser localStorage", async () => {
+    useSettingsStore.getState().setAutoMemoryEnabled(true);
+    expect(useSettingsStore.getState().autoMemoryEnabled).toBe(true);
+    if (typeof localStorage !== "undefined") {
+      vi.resetModules();
+      const fresh = await import("./settingsStore");
+      expect(fresh.useSettingsStore.getState().autoMemoryEnabled).toBe(true);
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    useSettingsStore.getState().setAutoMemoryEnabled(false);
+  });
+});
+
 describe("settingsStore.webToolsEnabled", () => {
   beforeEach(() => {
     useSettingsStore.setState({ webToolsEnabled: true });
