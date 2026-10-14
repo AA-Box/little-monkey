@@ -7,7 +7,7 @@
  */
 import {createHash} from 'node:crypto';
 import {readFileSync,writeFileSync,renameSync,mkdirSync,openSync,closeSync,unlinkSync} from 'node:fs';
-import {dirname,resolve} from 'node:path';
+import {dirname,resolve,isAbsolute} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 const option=(name)=>{const i=process.argv.indexOf(name);return i<0?null:process.argv[i+1]??null};
@@ -26,13 +26,13 @@ function dates(month,now=new Date()){
  if(expected<1||expected>31)fail('Invalid billing month interval');
  return {start,end,expected,final:end===monthEnd,month};
 }
-function micro(amount,scale=1){
+function micro(amount,scale=1000000){
  const value=typeof amount==='number'?String(amount):amount;
  if(typeof value!=='string'||!/^\d+(?:\.\d{1,12})?$/.test(value))
   fail('Official provider returned an invalid decimal cost');
  const [integer,fraction='']=value.split('.');
  const numerator=BigInt(integer+fraction.padEnd(12,'0'))*BigInt(scale);
- const micros=(numerator+500000n)/1000000n;
+ const micros=(numerator+500000000000n)/1000000000000n;
  if(micros>100000000000000n)fail('Official amount exceeds supported bound');
  return micros;
 }
@@ -170,7 +170,7 @@ function atomicReceipt(filepath,record){
 async function main(){
  const provider=option('--provider'),month=option('--month'),output=option('--output');
  if(!provider||!month||!output)fail('Require --provider openai|anthropic --month YYYY-MM --output ABSOLUTE_PATH');
- if(!resolve(output).startsWith('/'))fail('Require absolute output path');
+ if(!isAbsolute(output))fail('Require absolute output path');
  const token=process.env[provider==='openai'?'OPENAI_ADMIN_KEY':'ANTHROPIC_ADMIN_KEY'];
  const scopeId=option('--scope-id');
  const bill=await fetchOfficialCost({provider,month,token,scopeId});
