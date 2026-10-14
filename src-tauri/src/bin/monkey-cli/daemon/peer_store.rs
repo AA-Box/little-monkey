@@ -1670,6 +1670,39 @@ mod tests {
     }
 
     #[test]
+    fn verified_remote_model_usage_is_idempotent_scoped_and_not_peer_authority(){
+        let mut store=DaemonStore::open_in_memory().unwrap();
+        store.record_outbound_peer_message(
+            "paired-a","pmsg-1","thread-1",None,"task_request","queued",NOW
+        ).unwrap();
+        let usage=serde_json::json!({
+            "version":1,"source":"receiver_verified_run_ledger",
+            "run_id":"run-model-abcdef01","target_id":"provider:anthropic:model",
+            "status":"succeeded","duration_ms":1000,
+            "input_tokens":100,"output_tokens":30,"cached_input_tokens":5,
+            "model_calls":1,"cost_micros":200,
+            "independently_quality_verified":false,
+            "provider_billing_reconciled":false,
+        });
+        assert!(store.record_outbound_peer_metering("paired-a","pmsg-1","succeeded",&usage).is_err(),
+            "an unaccepted result is not telemetry");
+        store.record_outbound_peer_result("paired-a","pmsg-1","succeeded",
+            Some("done"),NOW+1).unwrap();
+        store.record_outbound_peer_metering("paired-a","pmsg-1","succeeded",&usage).unwrap();
+        store.record_outbound_peer_metering("paired-a","pmsg-1","succeeded",&usage).unwrap();
+        let rows=store.outbound_peer_messages(Some("paired-a"),10).unwrap();
+        assert_eq!(rows[0].model_metering.as_ref(),Some(&usage));
+        let mut forged=usage.clone();
+        forged["input_tokens"]=serde_json::json!(9999);
+        assert!(store.record_outbound_peer_metering("paired-a","pmsg-1","succeeded",&forged).is_err());
+        let mut forged=usage.clone();
+        forged["provider_billing_reconciled"]=serde_json::json!(true);
+        assert!(store.record_outbound_peer_metering("paired-a","pmsg-2","succeeded",&forged).is_err());
+        assert!(store.record_outbound_peer_metering("another-peer","pmsg-1","succeeded",&usage).is_err());
+        assert_eq!(store.delete_outbound_peer_messages("paired-a").unwrap(),1);
+        assert!(store.outbound_peer_messages(Some("paired-a"),10).unwrap().is_empty());
+    }
+    #[test]
     fn revoking_a_peer_takes_its_traffic_with_it() {
         let mut store = store_with_thread();
         store
