@@ -42,7 +42,10 @@ import {
 import {
   clearSwarmBenchmark, importSwarmBenchmark, loadSwarmBenchmark,
   setSwarmBenchmarkRouting, swarmBenchmarkRoutingEnabled,
+  setSwarmContinuousQuality,swarmContinuousQualityEnabled,
+  invalidateSwarmContinuousQuality,
 } from '../../lib/swarmVerifiedBenchmarks';
+import {synchronizeContinuousSwarmQuality} from '../../lib/swarmContinuousEvidence';
 import { skillLearningClient } from '../../lib/skillLearningClient';
 import { setSwarmCostOptimization,swarmCostOptimizationEnabled } from '../../lib/swarmCostOptimizer';
 import { loadSwarmLiveOutcomes } from '../../lib/swarmLiveOptimizer';
@@ -81,6 +84,13 @@ export function SwarmPanel() {
   const [benchmark, setBenchmark] = useState(() => loadSwarmBenchmark());
   const [benchmarkRouting, setBenchmarkRouting] = useState(() => swarmBenchmarkRoutingEnabled());
   const [costRouting, setCostRouting] = useState(() => swarmCostOptimizationEnabled());
+  const [continuousQuality,setContinuousQuality]=useState(()=>swarmContinuousQualityEnabled());
+  useEffect(()=>{
+    if(!continuousQuality)return;
+    const refresh=()=>setBenchmark(loadSwarmBenchmark());
+    const timer=window.setInterval(refresh,60_000);
+    return ()=>window.clearInterval(timer);
+  },[continuousQuality]);
   const recentOperationalOutcomes=loadSwarmLiveOutcomes();
   const [specialistQuality, setSpecialistQuality] = useState(() => listVerifiedSpecialists());
   const [specialistQualityDomain, setSpecialistQualityDomain] = useState<VerifiedSpecialistDomain>('security');
@@ -617,6 +627,27 @@ export function SwarmPanel() {
     } catch (cause) { setError('Could not capture verified learning evidence: ' + String(cause)); }
     finally { setLearningBusy(null); }
   }
+  async function toggleContinuousQuality(enabled:boolean){
+    if(enabled&&!window.confirm('Enable continuously refreshed, independently tested real-model quality gates? The installed operator-owned benchmark service must write swarm-quality-latest.json to this app data folder every day. A missing, failed or stale receipt blocks quality/cost optimizer routing. No models or privileges are automatically installed.'))return;
+    if(enabled){
+      setSwarmContinuousQuality(true);
+      setContinuousQuality(true);
+      setSwarmBenchmarkRouting(true);
+      const latest=await synchronizeContinuousSwarmQuality();
+      setBenchmark(latest);
+      setBenchmarkRouting(!!latest);
+      setNotice(latest?'Fresh independent quality receipt accepted. Only policy-eligible models can be routed.':
+        'Continuous mode enrolled. No fresh independent receipt found yet; quality routing remains blocked.');
+    }else{
+      invalidateSwarmContinuousQuality();
+      setSwarmContinuousQuality(false);
+      setContinuousQuality(false);
+      setSwarmBenchmarkRouting(false);
+      setBenchmarkRouting(false);
+      setBenchmark(null);
+      setNotice('Continuous independent model routing disabled. Re-import a manual benchmark to use manual mode.');
+    }
+  }
   async function importLiveBenchmark() {
     setError(''); setNotice('');
     const selected = await open({ multiple: false, filters: [{
@@ -768,6 +799,11 @@ export function SwarmPanel() {
       </div>
       <div className="rounded-lg border border-border bg-surface p-3">
         <h4 className="text-sm font-semibold text-foreground">Verified-fixture model accuracy</h4>
+        <label className="mt-2 flex gap-2 text-xs text-foreground">
+          <input type="checkbox" checked={continuousQuality}
+            onChange={event=>{void toggleContinuousQuality(event.target.checked)}} />
+          Enable unattended independent quality monitoring. Read a fresh local runner receipt every minute and fail closed after 36 hours, test failure or regression; never trust success asserted by a model.
+        </label>
         <p className="mt-1 text-xs text-muted">Import measurements produced by <code>pnpm test:swarm-models:live</code> on real configured models. Results are operator-provided and not cryptographic proof. Little Monkey independently validates fixture completeness and scores. Opt-in routing affects subagents only, after eligibility and routing-policy restrictions; explicit preferred models always win.</p>
         <div className="mt-3 flex flex-wrap gap-2">
           <Button size="sm" disabled={benchmarkBusy} onClick={() => void importLiveBenchmark()}>Import real-model benchmark JSON</Button>
