@@ -126,19 +126,24 @@ pub fn majority_confirms_no_dispatch(store:&DaemonStore,group:&str,graph:&str,
        .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
     let mut seen=BTreeSet::new();
     for (fp,raw) in rows{
-        if !roster.members.iter().any(|m|m.device_id!="@local"&&m.fingerprint==fp) ||
-            !seen.insert(fp) {continue;}
-        if let Some(raw)=raw{
-            let observation:ReplicaSnapshot=serde_json::from_str(&raw)
-                .map_err(|e|e.to_string())?;
-            observation.validate(now)?;
-            if observation.source_fingerprint!=source_fp||
-               observation.group!=group||observation.graph_id!=graph||
-               observation.roster_sha256!=local.roster_sha256||
-               observation.term>=term as u64||!all_pending(&observation){
-                return Ok(false);
-            }
+        if !roster.members.iter().any(|m|m.device_id!="@local"&&m.fingerprint==fp) {
+            continue;
         }
+        // A signed GET returning no checkpoint is a MISSING observation,
+        // never an affirmative no-dispatch vote. Counting it could allow
+        // a stale PENDING source replica to outvote a majority-persisted
+        // PREPARING intent after a partition.
+        let Some(raw)=raw else{continue;};
+        let observation:ReplicaSnapshot=serde_json::from_str(&raw)
+            .map_err(|e|e.to_string())?;
+        observation.validate(now)?;
+        if observation.source_fingerprint!=source_fp||
+           observation.group!=group||observation.graph_id!=graph||
+           observation.roster_sha256!=local.roster_sha256||
+           observation.term>=term as u64||!all_pending(&observation){
+            return Ok(false);
+        }
+        seen.insert(fp);
     }
     // One vote is local; every additional vote is a fresh, signed TLS GET
     // of the remote peer's own durable predecessor replica store.
@@ -157,8 +162,9 @@ pub async fn refresh(paths:&DaemonPaths,now:i64)->Result<(),String>{
         let mut stmt=store.connection.prepare(
             "SELECT group_id,source_graph,source_fingerprint
              FROM resident_swarm_failover_plans
-             WHERE state='armed' AND source_fingerprint IS NOT NULL
-             ORDER BY created_at_ms LIMIT 4"
+             WHERE state IN ('armed','claimed')
+               AND source_fingerprint IS NOT NULL
+             ORDER BY created_at_ms LIMIT 8"
         ).map_err(|e|e.to_string())?;
         let plans=stmt.query_map([],|r|Ok((
             r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?
