@@ -10,7 +10,7 @@ const openBucket=(d,value)=>({object:'bucket',start_time:(start+d*day)/1000,
  ]});
 const anthBucket=(d,value)=>({starting_at:new Date(start+d*day).toISOString(),
  ending_at:new Date(start+(d+1)*day).toISOString(),results:[
-  {amount:value,currency:'USD'},
+  {amount:value,currency:'USD',workspace_id:'wrk_1'},
  ]});
 const response=body=>({ok:true,status:200,json:async()=>body});
 test('real OpenAI pagination and exact micro-USD conversion with admin key isolation',async()=>{
@@ -37,9 +37,15 @@ test('Anthropic fractional CENTS are not misreported as dollars',async()=>{
   token:'admin-key-secret',scopeId:'wrk_1',now,fetchImpl:async(url,opts)=>{
    assert.equal(new URL(url).origin,'https://api.anthropic.com');
    assert.equal(opts.headers['x-api-key'],'admin-key-secret');
+   assert.equal(new URL(url).searchParams.get('group_by[]'),'workspace_id');
    return response({data:[anthBucket(0,'123.78912'),anthBucket(1,'0')],has_more:false,next_page:null});
   }});
  assert.equal(report.billedMicroUsd,1237891);
+ const zero=await fetchOfficialCost({provider:'anthropic',month:'2026-10',
+  token:'admin-key-secret',scopeId:'other_workspace',now,
+  fetchImpl:async()=>response({data:[
+    anthBucket(0,'123.78912'),anthBucket(1,'0')],has_more:false,next_page:null})});
+ assert.equal(zero.billedMicroUsd,0,'unrelated workspaces must never inflate scoped billing');
 });
 test('must reject missing, repeated, malformed and unbounded provider pages',async()=>{
  const input={provider:'openai',month:'2026-10',token:'admin-key-secret',now};
