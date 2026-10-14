@@ -1896,10 +1896,27 @@ export async function runAgentTurn(
               const reflectionController = new AbortController();
               const timeout = setTimeout(() => reflectionController.abort(), 60_000);
               try {
+                let permittedMessages = messages;
+                if (target.kind === 'provider') {
+                  assertCostBudgetAllowsRequest(useCostControlStore.getState());
+                  const privacyOutcome = await gatePrivacyWireMessages(
+                    messages,
+                    (content) => usePrivacyFirewallStore.getState().gateOutbound(
+                      content, 'cloud_model', workspace ?? 'global',
+                    ),
+                    new Map(),
+                  );
+                  if (privacyOutcome.action !== 'send')
+                    throw new Error('Automatic memory extraction blocked by privacy policy.');
+                  permittedMessages = privacyOutcome.messages;
+                  recordRequest(target.providerId);
+                }
                 const reflection = await attemptStream(
-                  target, messages, [], reflectionController.signal, effortForTarget(target),
+                  target, permittedMessages, [], reflectionController.signal, effortForTarget(target),
                   sessionId, undefined, false,
                 );
+                if (reflection.usage)
+                  useUsageHistoryStore.getState().recordUsage(describeUsageTarget(target), reflection.usage);
                 if (reflectionController.signal.aborted || reflection.streamError !== null || reflection.toolCalls.length)
                   throw new Error(reflection.streamError || 'Automatic memory reflection timed out or returned unexpected tools');
                 return reflection.content;
