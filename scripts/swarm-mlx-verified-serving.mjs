@@ -19,6 +19,9 @@ import {parseLearningPolicy} from './swarm-mlx-auto-learning.mjs';
 import {gradeReport,acquireCycleLock} from './swarm-specialist-continuous-loop.mjs';
 const ROOT=dirname(fileURLToPath(import.meta.url));
 const allowed=new Set(['security','frontend','backend','performance','general']);
+// Private mlx_lm.server transport is not selected by a policy file. File-controlled
+// destinations must never be able to route local inference to other host services.
+const BACKEND_PORT=8766;
 const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
 const integer=(n,min,max)=>Number.isSafeInteger(n)&&n>=min&&n<=max;
 const fail=message=>{throw Error(message);};
@@ -52,7 +55,7 @@ export function parseServingPolicy(raw){
   'backendPort,checkSeconds,domains,listenPort,minAccuracy,minImprovement,modelAlias,monkeyBin,probePort,repetitions,stateDir,timeoutMs,trainingPolicy,version')
   fail('Expected exact supervised MLX serving policy version 1');
  if(p.version!==1||!integer(p.backendPort,1024,65535)||!integer(p.listenPort,1024,65535)||
-  !integer(p.probePort,1024,65535)||
+  !integer(p.probePort,1024,65535)||p.backendPort!==BACKEND_PORT||
   new Set([p.backendPort,p.listenPort,p.probePort]).size!==3||typeof p.modelAlias!=='string'||
   !/^[A-Za-z0-9_.-]{2,80}$/.test(p.modelAlias)||!integer(p.repetitions,2,5)||
   !integer(p.timeoutMs,10000,3600000)||!integer(p.checkSeconds,60,86400)||
@@ -133,10 +136,10 @@ function execute(program,args,{timeoutMs=600000,accepted=[0],environment=process
   });
  });
 }
-function postToBackend(port,payload,timeoutMs=120000){
+function postToBackend(payload,timeoutMs=120000){
  return new Promise((resolve,reject)=>{
   const data=Buffer.from(JSON.stringify(payload));
-  const req=httpRequest({hostname:'127.0.0.1',port,path:'/v1/chat/completions',
+  const req=httpRequest({hostname:'127.0.0.1',port:BACKEND_PORT,path:'/v1/chat/completions',
    method:'POST',headers:{'content-type':'application/json','content-length':String(data.length)},
    timeout:timeoutMs},res=>{
     let body='';
@@ -157,9 +160,9 @@ function portOccupied(port){
   client.once('error',error=>{client.destroy();resolve(error?.code!=='ECONNREFUSED');});
  });
 }
-async function assertModelIdentity(port,expected){
+async function assertModelIdentity(expected){
  const models=await new Promise((resolve,reject)=>{
-  const req=httpRequest({hostname:'127.0.0.1',port,path:'/v1/models',method:'GET',timeout:15000},res=>{
+  const req=httpRequest({hostname:'127.0.0.1',port:BACKEND_PORT,path:'/v1/models',method:'GET',timeout:15000},res=>{
    let data='';res.on('data',chunk=>{data+=chunk;if(data.length>65536)req.destroy(Error('Model identity oversized'));});
    res.on('end',()=>{if(res.statusCode!==200)return reject(Error('MLX model list rejected'));
     try{resolve(JSON.parse(data));}catch{reject(Error('Invalid live MLX model identity'));}
@@ -169,8 +172,8 @@ async function assertModelIdentity(port,expected){
  if(!models||!Array.isArray(models.data)||!models.data.some(row=>row?.id===expected))
   fail('Live MLX server does not prove the exact fused/base model selected for deployment');
 }
-async function probe(port,expectedModel){
- const output=await postToBackend(port,{messages:[{role:'user',content:'Reply briefly.'}],max_tokens:24,stream:false});
+async function probe(expectedModel){
+ const output=await postToBackend({messages:[{role:'user',content:'Reply briefly.'}],max_tokens:24,stream:false});
  const answer=output?.choices?.[0]?.message?.content;
  if(typeof answer!=='string'||answer.trim().length<1||answer.length>16384)
   fail('MLX serving process did not generate a real assistant response');
@@ -182,10 +185,10 @@ async function probe(port,expectedModel){
 async function startBackend(policy,modelPath){
  // With one local model in memory, stop the previous service before this
  // call. This intentionally causes temporary 503 rather than an OOM hot-swap.
- if(await portOccupied(policy.backendPort))
+ if(await portOccupied(BACKEND_PORT))
   fail('Refusing an already occupied MLX backend port; another process may own the model');
  const child=spawn(policy.training.python,['-m','mlx_lm.server',
-  '--model',modelPath,'--host','127.0.0.1','--port',String(policy.backendPort)],{
+  '--model',modelPath,'--host','127.0.0.1','--port',String(BACKEND_PORT)],{
   stdio:['ignore','ignore','pipe'],env:{PATH:process.env.PATH??'',HOME:process.env.HOME??'',
    TMPDIR:process.env.TMPDIR??'/tmp',PYTHONUNBUFFERED:'1'},
  });
@@ -194,7 +197,7 @@ async function startBackend(policy,modelPath){
  const deadline=Date.now()+180000;
  while(Date.now()<deadline){
   if(child.exitCode!==null)fail('Local MLX service exited before ready');
-  try{await probe(policy.backendPort,modelPath);await assertModelIdentity(policy.backendPort,modelPath);return child;}
+  try{await probe(modelPath);await assertModelIdentity(modelPath);return child;}
   catch{await new Promise(done=>setTimeout(done,2500));}
  }
  child.kill('SIGKILL');fail('MLX service failed real generation before readiness deadline');
@@ -278,7 +281,7 @@ function localProxy(policy,state){
    delete payload.model; // MLX-LM serves the model loaded by its operator-owned process
    if(!state.active||state.generation!==generation)return error(503,'MLX route switched during request');
    const body=Buffer.from(JSON.stringify(payload));
-   const upstream=httpRequest({hostname:'127.0.0.1',port:policy.backendPort,
+   const upstream=httpRequest({hostname:'127.0.0.1',port:BACKEND_PORT,
     path:'/v1/chat/completions',method:'POST',
     headers:{'content-type':'application/json','content-length':String(body.length)},
     timeout:policy.timeoutMs},answer=>{
@@ -346,7 +349,7 @@ export async function serve(policy){
   }
   while(!stopping){
    if(state.active){
-    try{await probe(policy.backendPort,state.model);
+    try{await probe(state.model);
      probeState.active=true;
      state.scores=await independentOracle(policy);
     }catch(e){
