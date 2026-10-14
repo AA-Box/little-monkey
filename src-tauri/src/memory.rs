@@ -1586,7 +1586,12 @@ pub fn memory_auto_apply(
     }
     let active = workspace::primary_root_canon(state.inner()).ok()
         .map(|root| root.to_string_lossy().to_string());
-    if expected_workspace != active {
+    let expected = expected_workspace
+        .map(|root| std::fs::canonicalize(&root)
+            .map(|path| path.to_string_lossy().to_string())
+            .map_err(|_| "Conversation workspace is no longer accessible".to_string()))
+        .transpose()?;
+    if expected != active {
         return Err("Conversation workspace changed before memory capture".into());
     }
     let scope = active.unwrap_or_else(|| GLOBAL_SCOPE_KEY.to_string());
