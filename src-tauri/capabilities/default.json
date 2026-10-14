@@ -40,6 +40,23 @@
         },
         {
           "path": "$APPDATA/swarm-provider-billing-latest.json"
+        },
+        {
+          "path": "$APPDATA/swarm-billing-openai-latest.json"
+        },
+        {
+          "path": "$APPDATA/swarm-billing-anthropic-latest.json"
+        }
+      ]
+    },
+    {
+      "identifier": "fs:allow-write-text-file",
+      "allow": [
+        {
+          "path": "$APPDATA/swarm-cost-ledger-openai.json"
+        },
+        {
+          "path": "$APPDATA/swarm-cost-ledger-anthropic.json"
         }
       ]
     }
