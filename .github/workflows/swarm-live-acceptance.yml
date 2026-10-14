@@ -192,7 +192,7 @@ jobs:
           set -euo pipefail
           node scripts/swarm-two-peer-live-acceptance.mjs \
             --peer "$PEER_ALIAS" --expect "$EXPECT_EVIDENCE" \
-            --timeout-seconds 600 --poll-seconds 5 \
+            --timeout-seconds 600 --poll-seconds 5 --require-model-metering \
             > "$RUNNER_TEMP/native-swarm-peer-acceptance.json"
       - name: Verify real signed peer-leader quorum and local scheduler fencing
         # Never elect a fresh term while replaying an already-owned DAG. In
