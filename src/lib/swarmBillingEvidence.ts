@@ -71,7 +71,9 @@ export function validateProviderBillingEvidence(
     !Number.isSafeInteger(v.comparison.driftMicroUsd)||
     !Number.isSafeInteger(v.comparison.knownCalls)||v.comparison.knownCalls<1||
     v.comparison.unknownCalls!==0||
-    v.comparison.estimatedMicroUsd+v.comparison.driftMicroUsd!==v.billedMicroUsd){
+    v.comparison.estimatedMicroUsd+v.comparison.driftMicroUsd!==v.billedMicroUsd||
+    Math.abs(v.comparison.driftMicroUsd)>
+      Math.max(100,Math.round(v.billedMicroUsd*0.05))){
    throw Error('Billing is stale, incomplete, unscoped, mismatched, or outside tolerance');
  }
  return v as unknown as ProviderBillingEvidence;
@@ -87,7 +89,23 @@ export function billingGuardAllowsKeys(keys:readonly string[],now=Date.now()):bo
    if(!scope)return false;
    const raw=localStorage.getItem(cacheKey(p));
    if(!raw)return false;
-   validateProviderBillingEvidence(JSON.parse(raw),p,scope,now);
+   const verified=validateProviderBillingEvidence(JSON.parse(raw),p,scope,now);
+   // Recompute local source usage again on EVERY routing decision.
+   // A cached admin receipt cannot be paired with arbitrary edited totals or
+   // a new set of calls, and the operator must account for ALL recorded
+   // provider calls in this closed calendar month.
+   const usage=useCostControlStore.getState().entries.filter(row=>{
+     if(providerIdOfTargetKey(row.targetKey)!==p)return false;
+     if(!Number.isSafeInteger(row.occurredAtMs))return false;
+     return new Date(row.occurredAtMs).toISOString().slice(0,7)===verified.month;
+   });
+   const known=usage.filter(row=>row.costUsd!==null&&
+     Number.isFinite(row.costUsd)&&row.costUsd>=0);
+   if(known.length!==usage.length||known.length!==verified.comparison.knownCalls)
+     return false;
+   const total=known.reduce((n,row)=>n+Math.round(row.costUsd!*1_000_000),0);
+   if(!Number.isSafeInteger(total)||total!==verified.comparison.estimatedMicroUsd)
+     return false;
   }
   return true;
  }catch{return false}
