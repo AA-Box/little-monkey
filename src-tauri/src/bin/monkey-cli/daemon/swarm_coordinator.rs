@@ -418,6 +418,7 @@ pub fn submit(paths: &DaemonPaths, input: &Path) -> Result<serde_json::Value, St
 pub fn status(paths: &DaemonPaths, graph_id: Option<&str>) -> Result<serde_json::Value, String> {
     let store = DaemonStore::open(paths)?;
     prepare_schema(&store)?;
+    super::swarm_task_retry::schema(&store)?;
     if let Some(id) = graph_id {
         if !valid_id(id) { return Err("Invalid swarm id".into()); }
     }
@@ -432,11 +433,17 @@ pub fn status(paths: &DaemonPaths, graph_id: Option<&str>) -> Result<serde_json:
         let (id, state, created, updated) = row.map_err(|e| e.to_string())?;
         if graph_id.is_some_and(|wanted| wanted != id) { continue; }
         let mut tasks = Vec::new();
-        let mut stmt = store.connection.prepare("SELECT node_id,state,job_id,error FROM resident_swarm_nodes
-            WHERE graph_id=?1 ORDER BY node_id").map_err(|e| e.to_string())?;
+        let mut stmt = store.connection.prepare(
+            "SELECT n.node_id,n.state,n.job_id,n.error,COALESCE(a.attempts,0)
+             FROM resident_swarm_nodes n
+             LEFT JOIN resident_swarm_task_reassignments a
+               ON a.graph_id=n.graph_id AND a.node_id=n.node_id
+             WHERE n.graph_id=?1 ORDER BY n.node_id"
+        ).map_err(|e| e.to_string())?;
         for record in stmt.query_map([&id], |r| Ok(serde_json::json!({
             "id":r.get::<_,String>(0)?, "state":r.get::<_,String>(1)?,
             "job_id":r.get::<_,Option<String>>(2)?, "error":r.get::<_,Option<String>>(3)?,
+            "reassignments":r.get::<_,i64>(4)?,
         }))).map_err(|e| e.to_string())? {
             tasks.push(record.map_err(|e| e.to_string())?);
         }
@@ -512,7 +519,7 @@ fn fallback_allowed(node: &ResidentSwarmNode, status: &str, outcome: JobState) -
         node.fallback_recipe.is_some()
 }
 
-fn stable_job_id(graph: &str, task: &str) -> String {
+pub(super) fn stable_job_id(graph: &str, task: &str) -> String {
     format!("job-{}", &super::sha256_hex(format!("resident-swarm:{graph}:{task}").as_bytes())[..32])
 }
 
@@ -653,6 +660,18 @@ pub fn tick(
     for (id, raw, state) in graphs {
         let spec: ResidentSwarmSpec = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
         validate(&spec)?;
+        // Never apply model results, graph success, or retry transitions under
+        // a superseded distributed owner epoch. The daemon job itself may
+        // finish locally after partition, but its graph cursor is fenced until
+        // an operator reconciles the old term. Cancellation still works in
+        // the normal cancelling/failing branch below.
+        if state == "running" {
+            if let Some(group)=spec.cluster_id.as_deref(){
+                if !owns_current_epoch(store,group,&id,clock()?)?{
+                    continue;
+                }
+            }
+        }
         let mut tasks = BTreeMap::new();
         let mut stmt = store.connection.prepare(
             "SELECT node_id,state,job_id FROM resident_swarm_nodes WHERE graph_id=?1"
@@ -674,9 +693,14 @@ pub fn tick(
             let Some(job_id) = job_id else { failure = true; continue; };
             let Some(job) = store.get_job(job_id)? else { failure = true; continue; };
             if job.state == JobState::Succeeded {
-                store.connection.execute("UPDATE resident_swarm_nodes SET state='succeeded'
-                    WHERE graph_id=?1 AND node_id=?2", params![id,node])
-                    .map_err(|e| e.to_string())?;
+                // A delayed result can never complete a superseded logical
+                // task attempt: both the current cursor and the daemon's
+                // terminal job record must match before the SQLite commit.
+                if !super::swarm_task_retry::commit_current_success(
+                    store,&id,node,job_id
+                )? {
+                    return Err("Swarm success arrived for a non-current task attempt".into());
+                }
             } else if job.state.is_terminal() {
                 if spec.nodes.iter().find(|candidate| candidate.id.as_str() == node.as_str())
                     .is_some_and(|candidate| fallback_allowed(candidate,status,job.state)) {
@@ -688,12 +712,23 @@ pub fn tick(
                          WHERE graph_id=?1 AND node_id=?2 AND state='submitted'",
                         params![id,node,"Primary read-only agent failed; alternate queued"],
                     ).map_err(|e|e.to_string())?;
+                } else if spec.cluster_id.is_some() && status == "submitted"
+                    && job.state == JobState::Failed
+                    && super::swarm_task_retry::reassign_failed_primary(
+                        store,&id,node,job_id,now
+                    )? {
+                    // The task's logical identity remains (graph,node).
+                    // Only its attempt advances. The next dispatch uses a
+                    // new deterministic job id and must pass the fresh
+                    // signed-replica readback barrier again.
                 } else {
-                    store.connection.execute("UPDATE resident_swarm_nodes SET state='failed',error=?3
-                        WHERE graph_id=?1 AND node_id=?2",
-                        params![id,node,format!("Daemon job ended in {:?}",job.state)])
-                        .map_err(|e| e.to_string())?;
-                    failure = true;
+                    // A second daemon/coordinator can race our read of this
+                    // node. Never overwrite a freshly prepared reassignment or
+                    // another terminal resolution with a stale failure verdict.
+                    failure |= super::swarm_task_retry::mark_current_failed(
+                        store,&id,node,job_id,status,
+                        &format!("Daemon job ended in {:?}",job.state),
+                    )?;
                 }
             } else { active += 1; }
         }
@@ -766,7 +801,14 @@ pub fn tick(
             }
             let run_key = if fallback {
                 stable_job_id(&id,&format!("fallback:{}",node.id))
-            } else { stable_job_id(&id,&node.id) };
+            } else {
+                let attempt=super::swarm_task_retry::count(store,&id,&node.id)?;
+                if attempt == 0 {
+                    stable_job_id(&id,&node.id)
+                } else {
+                    stable_job_id(&id,&format!("{}:reassignment:{attempt}",node.id))
+                }
+            };
             // Crash-window recovery: enqueue writes the durable daemon job
             // before recording the graph-node -> job mapping. If the service
             // crashes in between, blindly calling enqueue again would hit a
