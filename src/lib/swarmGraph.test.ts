@@ -4,6 +4,9 @@ import { MAX_WORKFLOW_AGENTS, MAX_WORKFLOW_PHASES } from './workflow';
 
 const graphTask = (id: string, deps: string[] = []) => ({
   id, description: 'Task ' + id, prompt: 'Do task ' + id, profile: 'explore', depends_on: deps,
+});
+
+describe('bounded nested delegation', () => {
   it('executes parent before descendants with three-level bounded delegation', () => {
     const spec = compileSwarmTaskGraph({
       name: 'delegated-project',
