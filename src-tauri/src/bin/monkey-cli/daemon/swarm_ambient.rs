@@ -258,6 +258,16 @@ mod tests{
         let status=status(&paths).unwrap();
         assert_eq!(status["policies"][0]["history_titles"],true);
         assert!(install(&paths,"my-review",&recipe,&ws,false).is_err());
+        let provider=root.join("external.json");
+        fs::write(&provider,serde_json::json!({
+            "version":1,"name":"review","target":{"provider":"openai","model":"gpt-4o"},
+            "workspace":ws,"permission_mode":"plan","prompt":"Review history","params":{}
+        }).to_string()).unwrap();
+        assert!(install(&paths,"external-history",&provider,&ws,true)
+            .unwrap_err().contains("local model"));
+        assert_eq!(install(&paths,"external-metadata",&provider,&ws,false)
+            .unwrap()["history_titles"],false);
+
         disable(&paths,"my-review").unwrap();
         assert_eq!(status(&paths).unwrap()["policies"][0]["enabled"],false);
         let _=fs::remove_dir_all(root);
