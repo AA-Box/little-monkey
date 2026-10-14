@@ -121,10 +121,10 @@ on:
         required: false
         default: ''
         type: string
-      mlx_lifecycle_json:
-        description: 'Optional MLX JSON: model_dir, train_data_dir, new_adapter_output, max_test_ppl, fuse_for_import, previous_model_dir'
+      mlx_config_json:
+        description: 'Optional JSON with model_dir, train_data_dir, new_adapter_output, max_test_ppl, fuse_for_import, previous_model_dir. Empty object skips MLX.'
         required: false
-        default: ''
+        default: '{}'
         type: string
       verify_remote_cancellation:
         description: Run a disposable remote task and verify actual cancellation
@@ -317,10 +317,10 @@ jobs:
             --checkpoint "$FALLBACK_RECEIPT" --confirm-disposable \
             > "$RUNNER_TEMP/native-swarm-resident-fallback-acceptance.json"
       - name: Train and evaluate a real local MLX LoRA adapter with held-out quality gate
-        if: ${{ inputs.mlx_lifecycle_json != '' }}
+        if: ${{ inputs.mlx_config_json != '{}' && inputs.mlx_config_json != '' }}
         shell: bash
         env:
-          MLX_LIFECYCLE_JSON: ${{ inputs.mlx_lifecycle_json }}
+          MLX_CONFIG_JSON: ${{ inputs.mlx_config_json }}
         run: |
           set -euo pipefail
           # GitHub workflow_dispatch permits at most 25 top-level inputs.
@@ -328,7 +328,7 @@ jobs:
           MLX_FIELDS=()
           while IFS= read -r -d '' field; do MLX_FIELDS+=("$field"); done < <(
             node -e '
-              const p = JSON.parse(process.env.MLX_LIFECYCLE_JSON);
+              const p = JSON.parse(process.env.MLX_CONFIG_JSON);
               if (!p || typeof p !== "object" || Array.isArray(p)) process.exit(2);
               const allowed = ["model_dir","train_data_dir","new_adapter_output","max_test_ppl","fuse_for_import","previous_model_dir"];
               if (Object.keys(p).some(k => !allowed.includes(k))) process.exit(2);
