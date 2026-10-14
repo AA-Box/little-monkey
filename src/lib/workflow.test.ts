@@ -38,7 +38,7 @@ vi.mock("./subagent", () => ({
 }));
 
 import { CANCELLED_TOOL_RESULT } from "./turnEngine";
-import type { LiveSwarmBus } from './swarmLiveBus';
+import { LiveSwarmBus } from './swarmLiveBus';
 import {
   MAX_WORKFLOW_PHASES,
   buildPriorReportsBlock,
@@ -806,6 +806,63 @@ describe("runWorkflow / resume (v2)", () => {
     expect(resolved.memoryStackIds).toEqual(["existing-stack"]);
     expect(runSubagentTaskMock).not.toHaveBeenCalled();
     expect(() => resolveWorkflowSpec({ resume: "call_crashed" }, "different-session")).toThrow(/recoverable/);
+  });
+
+  it('recovers pending mailbox messages after a simulated process restart without replaying completed code work',async()=>{
+    const old='crashed-mailbox';
+    const agents=[
+      {description:'reader',prompt:'Read code',profile:'explore'},
+      {description:'verifier',prompt:'Verify code',profile:'explore'},
+    ];
+    const durableSpec: WorkflowSpec={
+      name:'durable-agent-chat',description:'Verify mail delivery',
+      liveMessaging:true,phases:[{title:'Review',agents}],
+    };
+    const ids=[workflowAgentTaskId(old,0,0),workflowAgentTaskId(old,0,1)];
+    const oldBus=new LiveSwarmBus(ids);
+    oldBus.send(ids[0],ids[1],'Review auth.ts before completing');
+    oldBus.finishAgent(ids[0]);
+    oldBus.finishAgent(ids[1]);
+    const snapshot=oldBus.snapshot();
+    // An actual app restart normalizes every running snapshot into an
+    // interrupted one before the operator explicitly resumes it.
+    const persisted=normalizeWorkflowRunMeta({[old]:{
+      name:durableSpec.name,description:durableSpec.description,status:'running',
+      startedAt:1,finishedAt:2,spec:durableSpec,
+      phases:[{title:'Review',agents:ids.map((taskId,i)=>({
+        taskId,description:agents[i].description,
+      }))}],
+      liveMailbox:snapshot,
+      agentResults:{
+        [ids[0]]:{promptHash:promptHash('Read code'),status:'done',report:'read complete'},
+        [ids[1]]:{promptHash:promptHash('Verify code'),status:'error',report:'lost model connection'},
+      },
+    }},true);
+    seedSession(persisted);
+    expect(persisted[old].status).toBe('error');
+    expect(persisted[old].liveMailbox?.queues[ids[1]]).toHaveLength(0);
+    // To simulate a crash while a recipient was incomplete, restore its
+    // pending inbox from the last durable checkpoint, not terminal cleanup.
+    persisted[old].liveMailbox=structuredClone(snapshot);
+    persisted[old].liveMailbox!.queues[ids[1]]=[{
+      sequence:1,sender:ids[0],recipient:ids[1],kind:'direct',
+      text:'Review auth.ts before completing',
+    }];
+    let recovered=false;
+    runSubagentTaskMock.mockImplementation(async (params:{toolCallId:string;liveBus:LiveSwarmBus})=>{
+      if(params.toolCallId.endsWith('#p0a1')){
+        const received=params.liveBus.peek(params.toolCallId);
+        expect(received).toMatchObject([{sender:workflowAgentTaskId('restored-mailbox',0,0),
+          recipient:params.toolCallId,kind:'direct'}]);
+        recovered=true;
+      }
+      return 'verified';
+    });
+    const outcome=await runWorkflow({sessionId:SESSION,parentCheckpointId:null,
+      toolCallId:'restored-mailbox',resume:old,spec:durableSpec,target:TARGET});
+    expect(outcome).toContain('completed');
+    expect(recovered).toBe(true);
+    expect(runSubagentTaskMock).toHaveBeenCalledTimes(1);
   });
 
   it("stages only structurally agreed claims for explicit operator approval", async () => {
