@@ -1575,6 +1575,8 @@ pub fn memory_auto_apply(
     operation: String,
     existing_id: Option<String>,
     expected_old_text: Option<String>,
+    existing_ids: Option<Vec<String>>,
+    expected_old_texts: Option<Vec<String>>,
     expected_workspace: Option<String>,
 ) -> Result<Fact, String> {
     if turn_id.is_empty() || turn_id.len() > 120 ||
@@ -1592,9 +1594,30 @@ pub fn memory_auto_apply(
     let _lock = state.memory_lock.lock()
         .map_err(|_| "Memory lock poisoned".to_string())?;
     match operation.as_str() {
-        "add" if existing_id.is_none() && expected_old_text.is_none() =>
+        "add" if existing_id.is_none() && expected_old_text.is_none() &&
+            existing_ids.is_none() && expected_old_texts.is_none() =>
             add_fact_impl(&path, &scope, &text, "agent", Some(&turn_id)),
-        "replace" => {
+        "merge" => {
+            let ids = existing_ids.ok_or("Missing source memory IDs")?;
+            let expected = expected_old_texts.ok_or("Missing source memory texts")?;
+            if ids.len() < 2 || ids.len() > 4 || ids.len() != expected.len() ||
+                ids.iter().collect::<std::collections::HashSet<_>>().len() != ids.len() {
+                return Err("Automatic merge needs 2–4 distinct source memories".into());
+            }
+            let store = load_impl(&path)?;
+            let facts = store.projects.get(&scope)
+                .ok_or("Automatic merge source scope not found")?;
+            for (id, old) in ids.iter().zip(expected.iter()) {
+                let fact = facts.facts.iter().find(|fact| &fact.id == id)
+                    .ok_or("Automatic merge source memory not found")?;
+                if fact.source != "agent" || fact.pinned || !fact.enabled ||
+                    fact.retired_at.is_some() || fact.text != *old {
+                    return Err("Automatic merge refused: changed, user-owned or pinned source".into());
+                }
+            }
+            merge_impl(&path, &scope, &ids, Some(&text))
+        },
+        "replace" if existing_ids.is_none() && expected_old_texts.is_none() => {
             let id = existing_id.as_deref().ok_or("Missing old memory ID")?;
             let expected = expected_old_text.as_deref().ok_or("Missing expected old text")?;
             let store = load_impl(&path)?;
