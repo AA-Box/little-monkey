@@ -87,10 +87,70 @@ promotion, and a physical two-machine acceptance run are **not provided** by
 this change. The operator must opt in and select a stack so private project
 content cannot be silently embedded against an unknown provider.
 
+## Automatic memory across ordinary conversations
+
+In **Settings → Rules & Memory**, enable **Automatically learn from my
+conversations** (default OFF). The separate parent "Remember" toggle must
+remain enabled. Turning either switch off stops new automatic capture; older
+memories remain under Memory Studio's enable/delete/merge/undo controls.
+
+Every successfully completed ordinary desktop chat turn, whether handled by
+the resident daemon or the foreground loop, triggers one tool-free model
+reflection through the currently selected model. Only the actual user
+message is eligible. The reflection returns at most three proposed stable
+facts, each with a **literal quote that must appear in that user message**.
+The host rejects secret-shaped input, unsupported quotes, oversize claims,
+duplicate text and attempts to edit pinned, manually entered or retired
+memories. A model error cannot make the already completed chat fail.
+
+Valid inserts use the new Rust `memory_auto_apply` command, the same
+cross-process-locked atomic `memories.json` fact store used by the regular
+`remember` tool. New records are `source: agent` and carry the source
+turn ID. In project chats they are scoped to the active, canonical
+workspace; without a project they use the existing global scope. The
+command rejects a workspace switch before a write. A correction can only
+modify an existing agent-authored, unpinned, enabled fact with **exact old
+text** still present in the current scope. User-owned and pinned facts
+cannot be automatically rewritten.
+
+The selected model may be a cloud provider. Enabling extraction makes an
+additional model request containing the current user message and a bounded
+set of prior agent facts; only enable it when that transmission is
+acceptable. No tool outputs, assistant-written claims or connector bytes
+are eligible as new direct memories. This is conservative model extraction,
+not independently verified truth or autonomous rewriting of user-owned
+memories. If the app is terminated between completing a turn and committing
+the extraction, that final reflection can be missed; the old conversation
+is never silently re-executed after restart.
+
+## Durable live messaging and restart recovery
+
+The live mailbox snapshot is included in the existing file-backed
+`WorkflowRunMeta.liveMailbox` journal. An agent message is acknowledged
+to its sender only after `flushSessionPersistence` has successfully
+persisted the new bounded snapshot; a failed save rolls back the in-memory
+change and surfaces an error. File read observations, file-change notices,
+completion and acknowledgments use the same serialized journal barrier.
+
+At the recipient, queued messages are **peeked**, not destructively removed.
+The receiver acknowledges message sequence numbers only after a model
+request succeeds. Crashes before acknowledgement leave messages queued for
+the next explicitly authorized workflow resume. Remapping of old agent
+task IDs to new IDs is restricted to the same validated task positions.
+A corrupt or missing live-mailbox journal fails closed instead of
+fabricating a fresh state.
+
+The resume flow remains operator-controlled. Code tools are never silently
+replayed across process restarts, and a delivered message is not an
+authorization to execute anything. Network peers are not part of this
+local run-scoped mailbox. Exactly-once model/tool side effects are not
+guaranteed; replayable untrusted notices may be delivered more than once
+if the process crashes after receipt but before a durable acknowledgment.
+
 ## Verification
 
 ```sh
-pnpm exec vitest run src/lib/swarmLiveBus.test.ts src/lib/swarmAutoMemory.test.ts
+pnpm exec vitest run src/lib/swarmLiveBus.test.ts src/lib/swarmAutoMemory.test.ts src/lib/conversationAutoMemory.test.ts src/lib/workflow.test.ts src/lib/subagent.test.ts
 pnpm typecheck
 pnpm test
 ```
