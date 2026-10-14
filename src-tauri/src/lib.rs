@@ -1490,6 +1490,7 @@ pub fn run() {
             hooks::hook_exec,
             memory::memory_list,
             memory::memory_add,
+            memory::memory_auto_apply,
             memory::memory_delete,
             memory::memory_update,
             memory::memory_clear,

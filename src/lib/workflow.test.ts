@@ -24,6 +24,13 @@ const retrieveSwarmKnowledgeMock = vi.fn();
 vi.mock("./swarmKnowledge", () => ({
   retrieveSwarmKnowledge: (...args: unknown[]) => retrieveSwarmKnowledgeMock(...args),
 }));
+const autoMemoryRetrieveMock = vi.fn();
+const autoMemoryCaptureMock = vi.fn();
+vi.mock('./swarmAutoMemory', () => ({
+  validateAutoMemoryStack: (id: string) => id,
+  retrieveAutoMemory: (...args: unknown[]) => autoMemoryRetrieveMock(...args),
+  captureAutoMemory: (...args: unknown[]) => autoMemoryCaptureMock(...args),
+}));
 const runSubagentTaskMock = vi.fn();
 vi.mock("./subagent", () => ({
   runSubagentTask: (...args: unknown[]) => runSubagentTaskMock(...args),
@@ -31,6 +38,7 @@ vi.mock("./subagent", () => ({
 }));
 
 import { CANCELLED_TOOL_RESULT } from "./turnEngine";
+import { LiveSwarmBus } from './swarmLiveBus';
 import {
   MAX_WORKFLOW_PHASES,
   buildPriorReportsBlock,
@@ -79,6 +87,8 @@ beforeEach(() => {
   runSubagentTaskMock.mockReset();
   runSubagentTaskMock.mockResolvedValue("fine report");
   retrieveSwarmKnowledgeMock.mockReset().mockResolvedValue("");
+  autoMemoryRetrieveMock.mockReset().mockResolvedValue('');
+  autoMemoryCaptureMock.mockReset().mockResolvedValue({saved:2,warnings:[]});
   useWorkflowStore.setState({ runs: {} });
 });
 
@@ -798,6 +808,55 @@ describe("runWorkflow / resume (v2)", () => {
     expect(() => resolveWorkflowSpec({ resume: "call_crashed" }, "different-session")).toThrow(/recoverable/);
   });
 
+  it('recovers pending mailbox messages after a simulated process restart without replaying completed code work',async()=>{
+    const old='crashed-mailbox';
+    const agents=[
+      {description:'reader',prompt:'Read code',profile:'explore'},
+      {description:'verifier',prompt:'Verify code',profile:'explore'},
+    ];
+    const durableSpec: WorkflowSpec={
+      name:'durable-agent-chat',description:'Verify mail delivery',
+      liveMessaging:true,phases:[{title:'Review',agents}],
+    };
+    const ids=[workflowAgentTaskId(old,0,0),workflowAgentTaskId(old,0,1)];
+    const oldBus=new LiveSwarmBus(ids);
+    oldBus.send(ids[0],ids[1],'Review auth.ts before completing');
+    oldBus.finishAgent(ids[0]);
+    const snapshot=oldBus.snapshot();
+    // An actual app restart normalizes every running snapshot into an
+    // interrupted one before the operator explicitly resumes it.
+    const persisted=normalizeWorkflowRunMeta({[old]:{
+      name:durableSpec.name,description:durableSpec.description,status:'running',
+      startedAt:1,finishedAt:2,spec:durableSpec,
+      phases:[{title:'Review',agents:ids.map((taskId,i)=>({
+        taskId,description:agents[i].description,
+      }))}],
+      liveMailbox:snapshot,
+      agentResults:{
+        [ids[0]]:{promptHash:promptHash('Read code'),status:'done',report:'read complete'},
+        [ids[1]]:{promptHash:promptHash('Verify code'),status:'error',report:'lost model connection'},
+      },
+    }},true);
+    seedSession(persisted);
+    expect(persisted[old].status).toBe('error');
+    expect(persisted[old].liveMailbox?.queues[ids[1]]).toHaveLength(1);
+    let recovered=false;
+    runSubagentTaskMock.mockImplementation(async (params:{toolCallId:string;liveBus:LiveSwarmBus})=>{
+      if(params.toolCallId.endsWith('#p0a1')){
+        const received=params.liveBus.peek(params.toolCallId);
+        expect(received).toMatchObject([{sender:workflowAgentTaskId('restored-mailbox',0,0),
+          recipient:params.toolCallId,kind:'direct'}]);
+        recovered=true;
+      }
+      return 'verified';
+    });
+    const outcome=await runWorkflow({sessionId:SESSION,parentCheckpointId:null,
+      toolCallId:'restored-mailbox',resume:old,spec:durableSpec,target:TARGET});
+    expect(outcome).toContain('completed');
+    expect(recovered).toBe(true);
+    expect(runSubagentTaskMock).toHaveBeenCalledTimes(1);
+  });
+
   it("stages only structurally agreed claims for explicit operator approval", async () => {
     const data = new Map<string, string>();
     vi.stubGlobal('localStorage', {
@@ -865,5 +924,75 @@ describe("parseWorkflowSpec / isolation", () => {
     });
     expect(parsed.phases[0].agents[0].isolation).toBe("worktree");
     expect(parsed.phases[0].agents[1].isolation).toBeUndefined();
+  });
+});
+
+describe('P0 runtime workflow integration', () => {
+  const base = {
+    sessionId: 'p0-session', parentCheckpointId: null,
+    toolCallId: 'p0-call', target: TARGET,
+  };
+
+  it('passes a live mailbox into independently running agents and collects actual delivery evidence', async () => {
+    let releaseReader: () => void = () => {};
+    const readerReady = new Promise<void>(resolve => { releaseReader = resolve; });
+    runSubagentTaskMock.mockImplementation(async (params: {toolCallId: string; liveBus: LiveSwarmBus}) => {
+      const bus = params.liveBus;
+      if (params.toolCallId.endsWith('#p0a0')) {
+        bus.observeRead(params.toolCallId, 'src/auth.ts');
+        await readerReady;
+        const incoming = bus.receive(params.toolCallId);
+        expect(incoming).toHaveLength(2);
+        expect(incoming.map(message => message.kind)).toEqual(['direct', 'file_changed']);
+        return 'reader reviewed changed source';
+      }
+      bus.send(params.toolCallId, 'p0-call#p0a0', 'please re-read before reviewing');
+      bus.observeMutation(params.toolCallId, 'src/auth.ts');
+      releaseReader();
+      return 'writer completed';
+    });
+    const workflow: WorkflowSpec = {
+      name: 'p0-local', description: 'verify local collaboration',
+      liveMessaging: true,
+      phases: [{ title: 'Collaborate', agents: [
+        {description: 'reader',prompt: 'Read',profile: 'explore'},
+        {description: 'writer',prompt: 'Write',profile: 'code'},
+      ]}],
+    };
+    const response = await runWorkflow({ ...base, spec: workflow });
+    expect(response).toContain('completed');
+    expect(response).toContain('"directDeliveries":1');
+    expect(response).toContain('"fileNotifications":1');
+    expect(response).toContain('"received":2');
+  });
+
+  it('retrieves semantic history before dispatch and captures successful reports afterwards', async () => {
+    autoMemoryRetrieveMock.mockResolvedValue('## Historical model report');
+    const workflow: WorkflowSpec = {
+      name: 'p0-memory', description: 'review authentication',
+      autoMemoryStackId: 'stack-one',
+      phases: [{title:'Audit',agents:[{description:'reviewer',prompt:'Review',profile:'explore'}]}],
+    };
+    const response = await runWorkflow({ ...base, spec: workflow });
+    expect(autoMemoryRetrieveMock).toHaveBeenCalledWith(
+      'stack-one', 'session:p0-session', 'review authentication',
+    );
+    expect(runSubagentTaskMock.mock.calls[0][0].prompt).toContain('Historical model report');
+    expect(autoMemoryCaptureMock).toHaveBeenCalledWith(
+      'stack-one', 'session:p0-session', 'p0-memory',
+      expect.arrayContaining([expect.objectContaining({role:'reviewer',report:'fine report'})]),
+    );
+    expect(response).toContain('"saved":2');
+  });
+
+  it('rejects remote placement without sharing live collaboration or memory', async () => {
+    const remote: WorkflowSpec = {
+      name:'remote',description:'remote work',liveMessaging:true,autoMemoryStackId:'stack-one',
+      phases:[{title:'P',agents:[{description:'peer',prompt:'Run',profile:'explore',peer:'node-a'}]}],
+    };
+    const result = await runWorkflow({ ...base, spec: remote });
+    expect(result).toContain('local only');
+    expect(runSubagentTaskMock).not.toHaveBeenCalled();
+    expect(autoMemoryRetrieveMock).not.toHaveBeenCalled();
   });
 });

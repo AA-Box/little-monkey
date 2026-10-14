@@ -244,6 +244,9 @@ export interface WorkflowRunMeta {
    * successive resumes lets remote workers reconnect to their original
    * peer-task receipt instead of accidentally dispatching duplicate work. */
   correlationOrigin?: string;
+  /** Crash-consistent local mailbox. Recovery is only by explicit workflow
+   * resume and never grants tool access by itself. */
+  liveMailbox?: import('../lib/swarmLiveBus').LiveSwarmSnapshot;
 }
 
 export interface MessageTranslation {
@@ -1434,6 +1437,10 @@ export function normalizeWorkflowRunMeta(value: unknown, interruptRunning = true
         ? { sourceRunId: record.sourceRunId } : {}),
       ...(typeof record.correlationOrigin === "string" && record.correlationOrigin.length <= 200
         ? { correlationOrigin: record.correlationOrigin } : {}),
+      ...(record.liveMailbox && typeof record.liveMailbox === "object" &&
+        !Array.isArray(record.liveMailbox) &&
+        JSON.stringify(record.liveMailbox).length <= 900_000
+        ? { liveMailbox: record.liveMailbox } : {}),
     };
   }
   return result;
