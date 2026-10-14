@@ -414,7 +414,7 @@ function MemorySection({ hasWorkspace }: { hasWorkspace: boolean }) {
         checked={autoMemoryEnabled && memoryEnabled}
         onChange={setAutoMemoryEnabled}
         label="Automatically learn from my conversations"
-        description="Off by default. After successful chats, the selected model extracts stable facts only from your own message. Approved-by-validation facts are saved locally; agent-created facts may be corrected. This makes an additional model request and may send your message to the configured model provider."
+        description="Off by default. After successful chats, the selected model extracts stable facts only from your own message. Structurally validated proposals are saved locally and may still be inaccurate; existing agent-created facts may be corrected or merged. This makes an additional model request and may send your message to the configured model provider."
       />
       <div className="flex flex-col gap-3">
         <div className="flex flex-col gap-2">
