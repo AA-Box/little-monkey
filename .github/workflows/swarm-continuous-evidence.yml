@@ -1,0 +1,86 @@
+name: Real continuous swarm quality and provider billing
+
+# Operator opt-in: no provider credentials or paid real-model runs on PRs.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *'
+
+permissions:
+  contents: read
+concurrency:
+  group: native-swarm-continuous-evidence
+  cancel-in-progress: false
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Independent grading and official cost parsers
+        run: |
+          node --check scripts/swarm-continuous-quality.mjs
+          node --check scripts/swarm-provider-billing.mjs
+          node --test scripts/swarm-continuous-quality.contract.test.mjs scripts/swarm-provider-billing.contract.test.mjs
+  installed:
+    needs: contracts
+    if: \${{ vars.LM_SWARM_CONTINUOUS_ENABLED == 'true' }}
+    runs-on: [self-hosted, swarm-acceptance, swarm-node-a]
+    timeout-minutes: 120
+    env:
+      MODEL_TARGETS: \${{ vars.LM_SWARM_CONTINUOUS_TARGETS }}
+      QUALITY_OUTPUT: \${{ vars.LM_SWARM_QUALITY_OUTPUT }}
+      BILLING_LEDGER_OPENAI: \${{ vars.LM_SWARM_OPENAI_LEDGER }}
+      BILLING_OUTPUT_OPENAI: \${{ vars.LM_SWARM_OPENAI_BILLING_OUTPUT }}
+      BILLING_SCOPE_OPENAI: \${{ vars.LM_SWARM_OPENAI_API_KEY_ID }}
+      BILLING_LEDGER_ANTHROPIC: \${{ vars.LM_SWARM_ANTHROPIC_LEDGER }}
+      BILLING_OUTPUT_ANTHROPIC: \${{ vars.LM_SWARM_ANTHROPIC_BILLING_OUTPUT }}
+      BILLING_SCOPE_ANTHROPIC: \${{ vars.LM_SWARM_ANTHROPIC_WORKSPACE_ID }}
+      OPENAI_ADMIN_KEY: \${{ secrets.OPENAI_ADMIN_KEY }}
+      ANTHROPIC_ADMIN_KEY: \${{ secrets.ANTHROPIC_ADMIN_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require installed approved runtime and actual model targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v node
+          command -v monkey
+          monkey --version
+          test -n "$MODEL_TARGETS" && test -n "$QUALITY_OUTPUT"
+          node --test scripts/swarm-continuous-quality.contract.test.mjs scripts/swarm-provider-billing.contract.test.mjs
+      - name: Grade installed models against executable independent fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/swarm-continuous-quality.mjs \
+            --targets "$MODEL_TARGETS" --output "$QUALITY_OUTPUT"
+      - name: Retrieve actual scoped provider admin costs and reconcile local ledger
+        shell: bash
+        run: |
+          set -euo pipefail
+          MONTH="$(node -e 'const n=new Date(); process.stdout.write(new Date(Date.UTC(n.getUTCFullYear(),n.getUTCMonth()-1,1)).toISOString().slice(0,7))')"
+          if [ -n "$BILLING_SCOPE_OPENAI" ]; then
+            test -n "$OPENAI_ADMIN_KEY" && test -n "$BILLING_LEDGER_OPENAI" && test -n "$BILLING_OUTPUT_OPENAI"
+            node scripts/swarm-provider-billing.mjs \
+              --provider openai --month "$MONTH" --scope-id "$BILLING_SCOPE_OPENAI" \
+              --ledger "$BILLING_LEDGER_OPENAI" --output "$BILLING_OUTPUT_OPENAI" \
+              --require-reconciled
+          fi
+          if [ -n "$BILLING_SCOPE_ANTHROPIC" ]; then
+            test -n "$ANTHROPIC_ADMIN_KEY" && test -n "$BILLING_LEDGER_ANTHROPIC" && test -n "$BILLING_OUTPUT_ANTHROPIC"
+            node scripts/swarm-provider-billing.mjs \
+              --provider anthropic --month "$MONTH" --scope-id "$BILLING_SCOPE_ANTHROPIC" \
+              --ledger "$BILLING_LEDGER_ANTHROPIC" --output "$BILLING_OUTPUT_ANTHROPIC" \
+              --require-reconciled
+          fi
+      - name: Archive redacted grader and cost receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: operator-owned-swarm-quality-and-billing
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            \${{ vars.LM_SWARM_QUALITY_OUTPUT }}
+            \${{ vars.LM_SWARM_OPENAI_BILLING_OUTPUT }}
+            \${{ vars.LM_SWARM_ANTHROPIC_BILLING_OUTPUT }}
