@@ -86,6 +86,7 @@ import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { useTurnStatusStore } from '../store/turnStatusStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useRulesStore } from '../store/rulesStore';
+import { captureConversationMemory } from './conversationAutoMemory';
 import { useCheckpointStore } from '../store/checkpointStore';
 import { usePermissionStore, type PermissionMode } from '../store/permissionStore';
 import { useStackStore, type StackQueryResult } from '../store/stackStore';
@@ -1874,6 +1875,44 @@ export async function runAgentTurn(
     // cancellation, with bounded metadata rather than prompt/transcript.
     fireObservedHooks('Stop',{session_id:sessionId,
       args:{turn_id:turnId,outcome:controller.signal.aborted?'cancelled':turnError?'error':'done'}});
+    // A normal completed conversation (including daemon-backed chats) is
+    // eligible for memory capture ONLY after explicit operator opt-in.
+    // Extraction sees only the actual user message, not arbitrary model or
+    // connector output, and writes through Rust's guarded fact store.
+    if (!controller.signal.aborted && !turnError && resume === null &&
+        useSettingsStore.getState().memoryEnabled &&
+        useSettingsStore.getState().autoMemoryEnabled &&
+        typeof userText === 'string' && userText.trim()) {
+      try {
+        await useRulesStore.getState().refresh();
+        const target = await resolveTarget();
+        const workspace = useSessionStore.getState().sessions.find(entry => entry.id === sessionId)?.workspacePath ?? null;
+        const active = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? null;
+        if (workspace === active) {
+          const result = await captureConversationMemory({
+            userText, turnId, expectedWorkspace: workspace,
+            facts: useRulesStore.getState().facts,
+            callModel: async (messages) => {
+              const reflection = await attemptStream(
+                target, messages, [], controller.signal, effortForTarget(target),
+                sessionId, undefined, false,
+              );
+              if (reflection.streamError !== null || reflection.toolCalls.length)
+                throw new Error(reflection.streamError || 'Memory extractor returned unexpected tools');
+              return reflection.content;
+            },
+          });
+          if (result.added || result.corrected)
+            await useRulesStore.getState().refresh();
+          if (result.warnings.length)
+            console.warn('Automatic memory capture warnings:', result.warnings);
+        }
+      } catch (error) {
+        // No memory failure can convert an already completed conversation
+        // into a failed turn or trigger a retry of tools or mutations.
+        console.warn('Automatic memory capture failed:', error);
+      }
+    }
     if (processId) {
       const outcome = exitStatusFor({
         aborted: controller.signal.aborted,
