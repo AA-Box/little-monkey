@@ -463,3 +463,23 @@ import, and operational release gates.
 ## Native team coordination, evaluated learning and mission observability
 
 See [Native swarm coordination and learning](native-swarm-coordination.md) for read-only team topology modes, independently judged learning, review-gated consolidation, native capability packs, token forecasting, and the remaining real-device acceptance requirements.
+
+
+## On-demand recursive child execution during a desktop model turn
+
+In addition to the predeclared tree compiler above, **running desktop
+subagents** may call `agent_spawn` to create children dynamically,
+`agent_inbox` / `agent_send` to exchange direct live messages and
+`agent_join` to await their direct descendants. This uses the same
+native permission-gated `runSubagentTask` loop and a capped team budget;
+it is not an open-ended model-granted delegation privilege.
+
+Only the currently active team may communicate internally. Messages
+are bounded, persisted for seven days, and injected as untrusted
+model context. New children are limited to depth four, 24 total and
+six concurrent workers; parent cancellation propagates. See
+[Native swarm coordination](native-swarm-coordination.md) for details.
+
+A daemon-owned frozen graph is a **different execution surface** and
+does not adopt these desktop in-process tools. It keeps its durable
+predeclared DAG and the existing recovery semantics.
