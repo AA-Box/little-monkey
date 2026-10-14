@@ -7,6 +7,7 @@
  * or assumes rates / observed usage that have not been recorded.
  */
 import type { LabCostRate } from './compareLab';
+import {billingGuardAllowsKeys} from './swarmBillingEvidence';
 import type { CostUsageEntry } from '../store/costControlStore';
 import type { SwarmBenchmarkSummary } from './swarmVerifiedBenchmarks';
 
@@ -39,6 +40,9 @@ export function optimizeSwarmRoutingCosts(
   });
   if(!enabled||preferredKeys.length||!ranking||original.length<2||
      new Set(original).size!==original.length)return unchanged();
+  // Optional policy requires current, provider-reported costs scoped to the
+  // same observed ledger, with no unexplained overrun, BEFORE cost promotion.
+  if(!billingGuardAllowsKeys(original,now))return unchanged();
   const scores=new Map(ranking.ranking
     .filter(row=>Number.isInteger(row.attempts)&&row.attempts>=6&&
       row.accuracy>=0.8&&row.accuracy<=1)
