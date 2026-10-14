@@ -62,7 +62,7 @@ describe('unified durable/swarm peer trace',()=>{
    .toMatchObject({kind:'node_transition',occurredAt:NOW-4000,sequence:23,verifiedExecution:false});
  });
  it('accepts only valid source-run metering in authenticated v3 peer checkpoints',()=>{
-  const usage={node_id:'audit',status:'succeeded',target_id:'provider:qualified-model',
+  const usage={node_id:'audit',status:'succeeded' as const,target_id:'provider:qualified-model',
     elapsed_ms:2500,input_tokens:100,output_tokens:50,cached_input_tokens:20,
     model_calls:2,cost_micros:15};
   const v3={...peer,version:3,model_usage:[usage]};
