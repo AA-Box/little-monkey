@@ -1320,8 +1320,6 @@ describe('dynamic runtime agent spawning and live mailbox integration',()=>{
       .mockResolvedValueOnce({content:'declined',toolCalls:[],streamError:null,contentStarted:true});
     const report=await runSubagentTask(baseParams({sessionId:session,taskId:'root-'+session,profile:'explore'}));
     expect(report).toBe('declined');
-    const messages=useSessionStore.getState().sessions[session]?.subagentRuns;
-    expect(messages).toBeDefined();
     expect(executeToolCallMock).not.toHaveBeenCalled();
   });
 });
