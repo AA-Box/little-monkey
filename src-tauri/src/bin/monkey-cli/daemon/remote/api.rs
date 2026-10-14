@@ -4684,6 +4684,7 @@ fn verified_peer_task_metering(ledger:&RunLedger,run_id:&str)->Option<serde_json
     if state!=expected{return None;}
     let usage=last_usage?;
     if usage.model_calls==0 || usage.model_calls>100_000||
+       usage.input_tokens.saturating_add(usage.output_tokens)==0||
        usage.cached_input_tokens>usage.input_tokens||
        usage.input_tokens>100_000_000||usage.output_tokens>100_000_000{
         return None;
