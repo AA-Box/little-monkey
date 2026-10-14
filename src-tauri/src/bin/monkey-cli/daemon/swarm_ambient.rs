@@ -268,8 +268,8 @@ mod tests{
             "workspace":ws,"permission_mode":"plan","prompt":"Review history","params":{}
         }).to_string()).unwrap();
         assert_eq!(install(&paths,"my-review",&recipe,&ws,true).unwrap()["enabled"],true);
-        let status=status(&paths).unwrap();
-        assert_eq!(status["policies"][0]["history_titles"],true);
+        let initial_status=status(&paths).unwrap();
+        assert_eq!(initial_status["policies"][0]["history_titles"],true);
         assert!(install(&paths,"my-review",&recipe,&ws,false).is_err());
         let provider=root.join("external.json");
         fs::write(&provider,serde_json::json!({
