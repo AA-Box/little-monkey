@@ -320,14 +320,42 @@ jobs:
         if: ${{ inputs.mlx_config_json != '{}' && inputs.mlx_config_json != '' }}
         shell: bash
         env:
-          MLX_BASE: ${{ fromJSON(inputs.mlx_config_json).model_dir }}
-          MLX_DATA: ${{ fromJSON(inputs.mlx_config_json).train_data_dir }}
-          MLX_OUTPUT: ${{ fromJSON(inputs.mlx_config_json).new_adapter_output }}
-          MLX_GATE: ${{ fromJSON(inputs.mlx_config_json).max_test_ppl }}
-          MLX_FUSE: ${{ fromJSON(inputs.mlx_config_json).fuse_for_import }}
-          MLX_PREVIOUS: ${{ fromJSON(inputs.mlx_config_json).previous_model_dir }}
+          MLX_CONFIG_JSON: ${{ inputs.mlx_config_json }}
         run: |
           set -euo pipefail
+          # GitHub workflow_dispatch permits at most 25 top-level inputs.
+          # Decode six supervised MLX settings without eval or shell interpolation.
+          MLX_FIELDS=()
+          while IFS= read -r -d '' field; do MLX_FIELDS+=("$field"); done < <(
+            node -e '
+              const p = JSON.parse(process.env.MLX_CONFIG_JSON);
+              if (!p || typeof p !== "object" || Array.isArray(p)) process.exit(2);
+              const allowed = ["model_dir","train_data_dir","new_adapter_output","max_test_ppl","fuse_for_import","previous_model_dir"];
+              if (Object.keys(p).some(k => !allowed.includes(k))) process.exit(2);
+              const checked = (v, optional=false) => {
+                if (optional && (v === undefined || v === "")) return "";
+                if (typeof v !== "string" || v.length === 0 || v.length > 4096 || /[\x00-\x1f]/.test(v)) process.exit(2);
+                return v;
+              };
+              const threshold = String(p.max_test_ppl ?? "");
+              if (!/^(?:[0-9]+)(?:\.[0-9]+)?$/.test(threshold) || Number(threshold) <= 0) process.exit(2);
+              if (p.fuse_for_import !== undefined && ![true,false,"true","false"].includes(p.fuse_for_import)) process.exit(2);
+              const fields = [
+                checked(p.model_dir),checked(p.train_data_dir),
+                checked(p.new_adapter_output),threshold,
+                p.fuse_for_import === true || p.fuse_for_import === "true" ? "true" : "false",
+                checked(p.previous_model_dir, true)
+              ];
+              for (const value of fields) process.stdout.write(value + "\0");
+            '
+          )
+          test "${#MLX_FIELDS[@]}" -eq 6
+          MLX_BASE="${MLX_FIELDS[0]}"
+          MLX_DATA="${MLX_FIELDS[1]}"
+          MLX_OUTPUT="${MLX_FIELDS[2]}"
+          MLX_GATE="${MLX_FIELDS[3]}"
+          MLX_FUSE="${MLX_FIELDS[4]}"
+          MLX_PREVIOUS="${MLX_FIELDS[5]}"
           test -n "$MLX_BASE" && test -n "$MLX_DATA" && test -n "$MLX_OUTPUT" && test -n "$MLX_GATE"
           test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64
           python3 -c "import mlx_lm"
