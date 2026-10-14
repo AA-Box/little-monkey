@@ -284,12 +284,12 @@ function localProxy(policy,state){
    const upstream=httpRequest({hostname:'127.0.0.1',port:BACKEND_PORT,
     path:'/v1/chat/completions',method:'POST',
     headers:{'content-type':'application/json','content-length':String(body.length)},
-    timeout:policy.timeoutMs},answer=>{
+   },answer=>{
     res.writeHead(answer.statusCode??502,{'content-type':answer.headers['content-type']??'application/json'});
     answer.pipe(res);
    });
    upstream.on('error',()=>{if(!res.headersSent)error(502,'MLX backend unavailable');else res.destroy();});
-   upstream.on('timeout',()=>upstream.destroy(Error('MLX backend timed out')));
+   upstream.setTimeout(policy.timeoutMs,()=>upstream.destroy(Error('MLX backend timed out')));
    res.on('close',()=>{if(!res.writableEnded)upstream.destroy();});
    upstream.end(body);
   }catch(e){if(!res.headersSent)error(400,'Invalid bounded MLX request: '+String(e).slice(0,100));}
