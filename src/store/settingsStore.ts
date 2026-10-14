@@ -265,6 +265,7 @@ interface PersistedShape {
   processWallBudgetEnabled: boolean;
   processWallBudgetHours: number;
   memoryEnabled: boolean;
+  autoMemoryEnabled: boolean;
   webToolsEnabled: boolean;
   verifyEnabled: boolean;
   verifyMaxRounds: number;
