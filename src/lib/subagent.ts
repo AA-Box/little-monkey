@@ -779,7 +779,7 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
       }
 
       if (params.liveBus) {
-        const notice = params.liveBus.drainPrompt(storeKey);
+        const notice = await params.liveBus.drainPromptDurable(storeKey);
         if (notice) {
           const mailboxMessage: ChatMessage = { role: 'user', content: notice };
           messages = [...messages, mailboxMessage];
@@ -852,14 +852,14 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
               )
             : params.liveBus && toolCall.function.name === 'swarm_read_messages'
               ? JSON.stringify({ members: params.liveBus.listMembers(storeKey),
-                  messages: params.liveBus.receive(storeKey) })
+                  messages: await params.liveBus.receiveDurable(storeKey) })
             : params.liveBus && toolCall.function.name === 'swarm_send_message'
-              ? (() => {
+              ? (async () => {
                   try {
                     const args = JSON.parse(toolCall.function.arguments) as { recipient?: unknown; text?: unknown };
                     if (typeof args.recipient !== 'string' || typeof args.text !== 'string')
                       throw new Error('Swarm message requires recipient and text.');
-                    const delivered = params.liveBus!.send(storeKey, args.recipient, args.text);
+                    const delivered = await params.liveBus!.sendDurable(storeKey, args.recipient, args.text);
                     return JSON.stringify({ delivered });
                   } catch (error) { return stringifyToolError(error); }
                 })()
@@ -899,7 +899,7 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
         if (allowed && params.liveBus && toolCall.function.name === 'read_file' &&
             !resultContent.startsWith('{"error"')) {
           const path = toolCallPathArg(toolCall);
-          if (path) params.liveBus.observeRead(storeKey, path);
+          if (path) await params.liveBus.observeReadDurable(storeKey, path);
         }
         const toolMessage: ChatMessage = {
           role: 'tool',
@@ -929,7 +929,7 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
             if (path) {
               onMutatedPath?.(path);
               if (params.liveBus) {
-                try { params.liveBus.observeMutation(storeKey, path); }
+                try { await params.liveBus.observeMutationDurable(storeKey, path); }
                 catch (error) {
                   console.warn('Successful file mutation had an undelivered swarm notification:', error);
                 }
