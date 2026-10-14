@@ -42,6 +42,7 @@ export class AgentTeamRuntime {
     try{localStorage.setItem(PREFIX+this.id,JSON.stringify({version:1,mail:this.mail}));}catch{}
   }
   registerRoot(id:string):void{
+    if(!this.members.has(id)&&this.count>=MAX_RUNTIME_AGENTS)throw Error('Runtime agent count exhausted.');
     if(!this.members.has(id)){this.members.set(id,{id,parent:null,depth:0,active:true});this.count++;}
   }
   reserveChild(parent:string,id:string):number{
