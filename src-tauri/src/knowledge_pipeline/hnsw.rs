@@ -13,9 +13,9 @@ use super::{KnowledgeChunk,PipelineError,PipelineResult,check_cancelled,decode_v
 
 const MIN_ACCELERATED:usize=512;
 const MAX_LAYER:usize=10;
-const MAX_NEIGHBORS:usize=12;
-const BUILD_BEAM:usize=64;
-const SEARCH_BEAM:usize=128;
+const MAX_NEIGHBORS:usize=24;
+const BUILD_BEAM:usize=192;
+const SEARCH_BEAM:usize=256;
 
 #[derive(Clone)]
 struct Point{
