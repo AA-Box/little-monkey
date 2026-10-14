@@ -7,6 +7,7 @@ import {
  billingGuardAllowsKeys,billingGuardEnabled,billingScope,
  setBillingGuardEnabled,setBillingScope,validateProviderBillingEvidence,
 } from './swarmBillingEvidence';
+import {useCostControlStore} from '../store/costControlStore';
 const NOW=Date.parse('2026-10-14T10:00:00Z');
 const payload=()=>({
  version:1,source:'official_provider_admin_cost_api',provider:'openai',month:'2026-09',
@@ -16,7 +17,18 @@ const payload=()=>({
  comparison:{state:'within_tolerance',exactScopeCompared:true,
   estimatedMicroUsd:990000,driftMicroUsd:10000,knownCalls:3,unknownCalls:0},
 });
-beforeEach(()=>localStorage.clear());
+beforeEach(()=>{
+ localStorage.clear();
+ useCostControlStore.setState({entries:[
+  ...[0,1,2].map((n)=>({
+   id:'c'+n,occurredAtMs:Date.parse('2026-09-10T12:00:00Z'),
+   targetKey:'provider:openai:gpt',targetLabel:'gpt',
+   sessionId:'s',runId:null,
+   usage:{promptTokens:100,completionTokens:50,totalTokens:150},
+   costUsd:0.33,
+  })),
+ ]});
+});
 describe('provider-admin billing is an independent cost guard, not an invoice',()=>{
  it('requires a scoped official provider cost report and matched local model ledger',()=>{
   setBillingScope('openai','key_1');
@@ -28,6 +40,15 @@ describe('provider-admin billing is an independent cost guard, not an invoice',(
   expect(validateProviderBillingEvidence(v,'openai','key_1',NOW).billedMicroUsd).toBe(1000000);
   localStorage.setItem('little-monkey-swarm-billing-admin-receipt-openai',JSON.stringify(v));
   expect(billingGuardAllowsKeys(['provider:openai:gpt'],NOW)).toBe(true);
+  useCostControlStore.setState({entries:[]});
+  expect(billingGuardAllowsKeys(['provider:openai:gpt'],NOW)).toBe(false);
+  useCostControlStore.setState({entries:[
+   ...[0,1,2].map(n=>({
+    id:'c'+n,occurredAtMs:Date.parse('2026-09-10T12:00:00Z'),
+    targetKey:'provider:openai:gpt',targetLabel:'gpt',sessionId:'s',runId:null,
+    usage:{promptTokens:100,completionTokens:50,totalTokens:150},costUsd:0.33,
+   })),
+  ]});
   expect(billingGuardAllowsKeys(['provider:openrouter:model'],NOW)).toBe(false);
   expect(billingGuardAllowsKeys(['provider:anthropic:model'],NOW)).toBe(false);
  });
