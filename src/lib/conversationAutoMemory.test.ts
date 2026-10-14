@@ -40,6 +40,7 @@ describe('automatic ordinary conversation memory',()=>{
     expect(invoke).toHaveBeenCalledWith('memory_auto_apply',{
       text:'Prefers Kotlin for Android.',turnId:'uuid-turn-1',
       operation:'add',existingId:null,expectedOldText:null,
+      existingIds:null,expectedOldTexts:null,
       expectedWorkspace:'/projects/app',
     });
     expect(model).toHaveBeenCalledTimes(1);
@@ -66,6 +67,28 @@ describe('automatic ordinary conversation memory',()=>{
     expect(invoke).toHaveBeenCalledWith('memory_auto_apply',expect.objectContaining({
       operation:'replace',existingId:'old',expectedOldText:'Prefers Java for Android.',
     }));
+  });
+
+  it('merges only matching, agent-created, non-pinned source memories',async()=>{
+    const user='I prefer modern Kotlin and Compose for my Android projects.';
+    const facts=[agent('a','User likes Kotlin.'),agent('b','User likes Compose.'),
+      human('c','User prefers Java.')];
+    const model=vi.fn().mockResolvedValue(JSON.stringify({facts:[{
+      operation:'merge',evidence:user,
+      text:'Prefers Kotlin and Jetpack Compose for Android.',
+      existing_ids:['a','b'],
+    }]}));
+    const result=await captureConversationMemory({
+      userText:user,turnId:'merge-turn',expectedWorkspace:'/repo',facts,callModel:model,
+    });
+    expect(result.merged).toBe(1);
+    expect(invoke).toHaveBeenCalledWith('memory_auto_apply',
+      expect.objectContaining({operation:'merge',existingIds:['a','b'],
+        expectedOldTexts:['User likes Kotlin.','User likes Compose.']}));
+    expect(validateMemoryProposals({facts:[{
+      operation:'merge',evidence:user,text:'Java only.',
+      existing_ids:['a','c'],
+    }]},user,facts)).toEqual([]);
   });
 
   it('fails closed if a backend write cannot be confirmed',async()=>{
