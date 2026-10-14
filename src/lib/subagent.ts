@@ -778,10 +778,12 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
         }
       }
 
+      let mailboxSequences: number[] = [];
       if (params.liveBus) {
-        const notice = await params.liveBus.drainPromptDurable(storeKey);
-        if (notice) {
-          const mailboxMessage: ChatMessage = { role: 'user', content: notice };
+        const notice = params.liveBus.peekPrompt(storeKey);
+        mailboxSequences = notice.sequences;
+        if (notice.text) {
+          const mailboxMessage: ChatMessage = { role: 'user', content: notice.text };
           messages = [...messages, mailboxMessage];
           useSubagentStore.getState().appendMessage(storeKey, mailboxMessage);
         }
@@ -793,6 +795,10 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
       // context-usage ring. `onDelta` is omitted: nothing renders the
       // child's in-progress streaming content anywhere in this slice.
       const attempt = await attemptStream(resolvedTarget, wireHistory, tools, signal, childEffort, sessionId, undefined, false);
+      // Do not remove a notice before the receiving model has completed a
+      // successful step; a crash/error leaves it durably queued for recovery.
+      if (params.liveBus && mailboxSequences.length && !signal.aborted && attempt.streamError === null)
+        await params.liveBus.acknowledgeDurable(storeKey, mailboxSequences);
 
       if (attempt.usage) {
         useSubagentStore.getState().accumulateUsage(storeKey, attempt.usage);
@@ -852,7 +858,7 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
               )
             : params.liveBus && toolCall.function.name === 'swarm_read_messages'
               ? JSON.stringify({ members: params.liveBus.listMembers(storeKey),
-                  messages: await params.liveBus.receiveDurable(storeKey) })
+                  messages: params.liveBus.peek(storeKey) })
             : params.liveBus && toolCall.function.name === 'swarm_send_message'
               ? await (async () => {
                   try {
