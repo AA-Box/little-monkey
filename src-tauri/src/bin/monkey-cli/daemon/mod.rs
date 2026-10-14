@@ -49,6 +49,7 @@ mod service;
 mod swarm_coordinator;
 mod swarm_transfer;
 mod swarm_workers;
+mod swarm_ambient;
 mod swarm_replication;
 mod swarm_quorum;
 mod swarm_recovery_witness;
@@ -186,6 +187,18 @@ pub enum DaemonCmd {
         #[arg(long, conflicts_with="watch")] cron: Option<String>,
         #[arg(long, conflicts_with="cron")] watch: Option<PathBuf>,
     },
+    /// Enroll an opt-in adaptive ambient scout over prior durable sessions.
+    SwarmAmbientInstall {
+        id: String,
+        #[arg(long)] source_recipe: PathBuf,
+        #[arg(long)] workspace: PathBuf,
+        /// Opt-in to including bounded previous task titles in LOCAL model context.
+        #[arg(long)] include_history_titles: bool,
+    },
+    /// List adaptive ambient policies and next due times.
+    SwarmAmbientStatus,
+    /// Prevent future ambient dispatch; running jobs use standard cancellation.
+    SwarmAmbientDisable { id: String },
     /// Print durable events for a run; optionally follow until terminal.
     Attach {
         run_id: String,
@@ -657,6 +670,24 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
             let paths=DaemonPaths::resolve()?;
             println!("{}",swarm_workers::install(&paths,id,role,source_recipe,workspace,
                 cron.as_deref(),watch.as_deref())?);
+            Ok(())
+        },
+        DaemonCmd::SwarmAmbientInstall {
+            id,source_recipe,workspace,include_history_titles,
+        } => {
+            let paths=DaemonPaths::resolve()?;
+            println!("{}",swarm_ambient::install(&paths,id,source_recipe,workspace,*include_history_titles)?);
+            Ok(())
+        },
+        DaemonCmd::SwarmAmbientStatus => {
+            let paths=DaemonPaths::resolve()?;
+            println!("{}",swarm_ambient::status(&paths)?);
+            Ok(())
+        },
+        DaemonCmd::SwarmAmbientDisable { id } => {
+            let paths=DaemonPaths::resolve()?;
+            swarm_ambient::disable(&paths,id)?;
+            println!("Ambient policy disabled: {id}");
             Ok(())
         },
         DaemonCmd::Attach {
@@ -3363,6 +3394,11 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
             cli, &paths, &roots.ordered(), &config, &mut engine.store, &mut engine.shared,
         ) {
             eprintln!("Resident swarm tick paused: {error}");
+        }
+        if let Err(error) = swarm_ambient::tick(
+            cli, &paths, &roots.ordered(), &config, &mut engine.store, &mut engine.shared,
+        ) {
+            eprintln!("Adaptive ambient tick paused: {error}");
         }
         engine.tick()?;
         // Enforce cross-process desktop-control stops: an engaged kill switch,
