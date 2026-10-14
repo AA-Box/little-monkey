@@ -252,7 +252,7 @@ export function parseWorkflowSpec(args: Record<string, unknown>): WorkflowSpec {
     ...(topology !== 'phased' ? { topology } : {}),
     ...(args.stop_on_failure === true ? { stopOnFailure: true } : {}),
     ...(consensus ? { consensus } : {}),
-         ...(liveBus ? { liveMessaging: liveBus.statistics() } : {}),
+
     ...(args.authenticated_peer_voting === true ? { authenticatedPeerVoting: true } : {}),
     ...(args.notebook === true ? { notebook: true } : {}),
     ...(args.learning === true ? { learning: true } : {}),
@@ -824,6 +824,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
         phases: phaseSummaries,
         ...(consensus ? { consensus } : {}),
         ...(spec.notebook ? { notebookStaged, notebookWarnings, notebookRequiresApproval: true } : {}),
+         ...(liveBus ? { liveMessaging: liveBus.statistics() } : {}),
          ...(automaticMemory ? { automaticMemory } : {}),
       }),
     );
