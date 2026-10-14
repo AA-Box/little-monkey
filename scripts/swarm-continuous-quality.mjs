@@ -95,6 +95,13 @@ function main(){
     selection.some(t=>!TARGET.test(t)))fail('Malformed approved target list');
  let previous=null;
  try{previous=JSON.parse(readFileSync(output,'utf8'))}catch{}
+ // Revoke the previous good receipt BEFORE any potentially expensive model
+ // call. An interrupted test, power outage, crash, or killed daemon cannot
+ // leave the last green verification silently authorizing new routing.
+ atomic(output,{version:1,status:'blocked',
+  source:'native_disposable_repository_independent_tests',
+  createdAt:new Date().toISOString(),
+  reason:'Independent model quality recheck is in progress'});
  // Benchmark failures are real negative quality outcomes, not a reason to
  // forge a green receipt or retain a stale successful receipt indefinitely.
  const command=spawnSync(process.execPath,[
