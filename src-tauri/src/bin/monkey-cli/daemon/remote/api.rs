@@ -7,7 +7,7 @@ use little_monkey_lib::artifact_store::ArtifactStore;
 use little_monkey_lib::migration::{
     admit, MigrationVerdict, TargetNode, MAX_MIGRATION_PAYLOAD_BYTES,
 };
-use little_monkey_lib::run_ledger::{RunLedger, StoredApproval, StoredRun};
+use little_monkey_lib::run_ledger::{ChainVerification, RunLedger, StoredApproval, StoredRun};
 use little_monkey_lib::run_protocol::{
     ClientIdentity, ClientKind, ModelTargetSnapshot, PermissionDecision, RunEvent,
     RunEventEnvelope, RUN_PROTOCOL_SCHEMA_VERSION,
@@ -4247,6 +4247,11 @@ impl RemoteApi {
             let Some(outcome) = terminal_outcome(&events) else {
                 continue; // Still running.
             };
+            // The peer may receive redacted metering from a canonical
+            // hash-chain-verified run. A status-only reply is never treated
+            // as token evidence; the source report remains non-authoritative
+            // for answer correctness and external billing.
+            let metering=verified_peer_task_metering(&ledger,run_id);
             store
                 .record_peer_result(
                     &thread.thread_id,
@@ -4259,6 +4264,7 @@ impl RemoteApi {
                         "in_reply_to": message.message_id,
                         "state": outcome.state,
                         "text": outcome.text,
+                        "model_metering": metering,
                     })
                     .to_string(),
                     i64::try_from(now_ms).unwrap_or(i64::MAX),
@@ -4625,6 +4631,85 @@ struct PeerRunOutcome {
 /// the fallback, and a failure or a cancellation is reported as such rather
 /// than as an empty success. A run still going produces `None`, which is how
 /// the caller knows to leave the request waiting.
+/// A machine-independent peer task can execute any configured provider.
+ /// Report exactly the canonical terminal *metering*, not a self-asserted
+ /// model score, and only if the entire source run ledger chain verifies.
+ /// Values originate from the receiver's model runtime; this does not inspect
+ /// prompts, instructions, tool output, paths or provider credentials.
+fn verified_peer_task_metering(ledger:&RunLedger,run_id:&str)->Option<serde_json::Value>{
+    let run=ledger.load_run(run_id).ok()??;
+    if !run.status.is_terminal()||run.last_sequence==0||run.last_sequence>4000{
+        return None;
+    }
+    if !matches!(ledger.verify_run_chain(run_id).ok()?,
+        ChainVerification::Intact{
+            covered_from:Some(1),covered_through:Some(last),events_seen,..
+        } if last==run.last_sequence&&events_seen==last){return None;}
+    let mut cursor=0_u64;
+    let mut last_usage=None;
+    let mut started=None;
+    let mut ended=None;
+    let mut terminal_state=None;
+    while cursor<run.last_sequence{
+        let batch=ledger.load_events(run_id,cursor,200).ok()?;
+        if batch.is_empty(){return None;}
+        for item in batch{
+            if item.sequence!=cursor+1{return None;}
+            cursor=item.sequence;
+            match item.event {
+                RunEvent::Started{..}=>started=Some(item.occurred_at_ms),
+                RunEvent::UsageRecorded{usage}=>last_usage=Some(usage),
+                RunEvent::Completed{usage,..}=>{
+                    last_usage=Some(usage);
+                    terminal_state=Some("succeeded");
+                    ended=Some(item.occurred_at_ms);
+                },
+                RunEvent::Failed{..}=>{
+                    terminal_state=Some("failed");ended=Some(item.occurred_at_ms);
+                },
+                RunEvent::Cancelled{..}=>{
+                    terminal_state=Some("cancelled");ended=Some(item.occurred_at_ms);
+                },
+                _=>{},
+            }
+        }
+    }
+    let state=terminal_state?;
+    let expected=match run.status{
+        little_monkey_lib::run_protocol::RunStatus::Succeeded=>"succeeded",
+        little_monkey_lib::run_protocol::RunStatus::Failed=>"failed",
+        little_monkey_lib::run_protocol::RunStatus::Cancelled=>"cancelled",
+        _=>return None,
+    };
+    if state!=expected{return None;}
+    let usage=last_usage?;
+    if usage.model_calls==0 || usage.model_calls>100_000||
+       usage.cached_input_tokens>usage.input_tokens||
+       usage.input_tokens>100_000_000||usage.output_tokens>100_000_000{
+        return None;
+    }
+    let target_id=run.spec.target.target_id();
+    if target_id.is_empty()||target_id.len()>160||
+        !target_id.bytes().all(|b|b.is_ascii_alphanumeric()||
+            matches!(b,b'-'|b'_'|b'.'|b':'|b'/'|b'@'|b'+'|b'%')){
+        return None;
+    }
+    let duration_ms=ended?.checked_sub(started?)?;
+    if duration_ms>86_400_000{return None;}
+    Some(serde_json::json!({
+        "version":1,"source":"receiver_verified_run_ledger",
+        "run_id":run_id,"target_id":target_id,
+        "status":state,"duration_ms":duration_ms,
+        "input_tokens":usage.input_tokens,
+        "output_tokens":usage.output_tokens,
+        "cached_input_tokens":usage.cached_input_tokens,
+        "model_calls":usage.model_calls,
+        "cost_micros":usage.cost_micros,
+        "independently_quality_verified":false,
+        "provider_billing_reconciled":false,
+    }))
+}
+
 fn terminal_outcome(
     events: &[little_monkey_lib::run_protocol::RunEventEnvelope],
 ) -> Option<PeerRunOutcome> {
