@@ -157,6 +157,11 @@ fn production_hnsw_scale_gate() {
         correct+=ground.iter().filter(|id|got.contains(id.as_str())).count();
     }
     let recall=correct as f64/(query_count*K) as f64;
+    // Include the cold, verified SQLite-to-memory graph materialization in
+    // the measured sample. Report it explicitly rather than hiding startup
+    // cost inside a warm p50/p95 percentile.
+    let cold_first_ms=elapsed[0];
+    let worst_query_ms=elapsed.iter().copied().fold(0.0_f64,f64::max);
     let p50=percentile(&mut elapsed.clone(),0.50);
     let p95=percentile(&mut elapsed,0.95);
     let app=index.search("benchmark", &vectors[0],
@@ -200,6 +205,7 @@ fn production_hnsw_scale_gate() {
         "index_size":count,"dimensions":dim,"queries":query_count,
         "build_seconds":build_seconds,"reopen_ms":reopen_ms,
         "recall_at_10":recall,"ann_p50_ms":p50,"ann_p95_ms":p95,
+        "ann_cold_first_ms":cold_first_ms,"ann_worst_ms":worst_query_ms,
         "concurrent_readers":8,"concurrent_queries_per_sec":concurrent_qps,
         "sqlite_file_mib":disk_mib,"process_peak_rss_mib":hwm,
         "integrity":"reopened_and_verified","hybrid_search":"passed",

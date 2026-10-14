@@ -12,7 +12,7 @@ embeddings, drops it, and reopens via `HybridIndex::open`. It refuses any
 run without the expected persisted `hnsw_nodes` row count.
 
 - Recall@10 against independent full-vector exact cosine ranking.
-- Build wall time; disk ANN p50/p95; 8-reader concurrent query throughput.
+- Build wall time; persisted SQLite graph cold-load and ANN query latency (including the first cold query in the sample), p50/p95, and 8-reader concurrent query throughput. The runtime holds a bounded, inode/version-keyed in-process graph snapshot shared by independent SQLite readers; it is reconstructed and integrity-verified from the immutable persisted generation, not a fixture or an exact-search shortcut.
 - Linux process peak resident memory (including corpus/build) and SQLite bytes.
 - Full hybrid retrieval and excluded-source correctness, cancellation, and
   exact fallback for candidate requests wider than the bounded ANN beam.
