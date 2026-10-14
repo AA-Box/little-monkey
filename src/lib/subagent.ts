@@ -854,7 +854,7 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
               ? JSON.stringify({ members: params.liveBus.listMembers(storeKey),
                   messages: await params.liveBus.receiveDurable(storeKey) })
             : params.liveBus && toolCall.function.name === 'swarm_send_message'
-              ? (async () => {
+              ? await (async () => {
                   try {
                     const args = JSON.parse(toolCall.function.arguments) as { recipient?: unknown; text?: unknown };
                     if (typeof args.recipient !== 'string' || typeof args.text !== 'string')
