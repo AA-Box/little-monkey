@@ -358,6 +358,8 @@ function MemorySection({ hasWorkspace }: { hasWorkspace: boolean }) {
   const refresh = useRulesStore((s) => s.refresh);
   const memoryEnabled = useSettingsStore((s) => s.memoryEnabled);
   const setMemoryEnabled = useSettingsStore((s) => s.setMemoryEnabled);
+  const autoMemoryEnabled = useSettingsStore((s) => s.autoMemoryEnabled);
+  const setAutoMemoryEnabled = useSettingsStore((s) => s.setAutoMemoryEnabled);
 
   const [newFactText, setNewFactText] = useState("");
   const [adding, setAdding] = useState(false);
@@ -407,6 +409,12 @@ function MemorySection({ hasWorkspace }: { hasWorkspace: boolean }) {
         onChange={setMemoryEnabled}
         label={t("RulesMemoryPanel.memoryToggleLabel")}
         description={t("RulesMemoryPanel.memoryToggleDescription")}
+      />
+      <Toggle
+        checked={autoMemoryEnabled && memoryEnabled}
+        onChange={setAutoMemoryEnabled}
+        label="Automatically learn from my conversations"
+        description="Off by default. After successful chats, the selected model extracts stable facts only from your own message. Structurally validated proposals are saved locally and may still be inaccurate; existing agent-created facts may be corrected or merged. This makes an additional model request and may send your message to the configured model provider."
       />
       <div className="flex flex-col gap-3">
         <div className="flex flex-col gap-2">
