@@ -130,13 +130,18 @@ pub fn status(paths:&DaemonPaths)->Result<serde_json::Value,String>{
         .map_err(|e|e.to_string())?;
     Ok(serde_json::json!({"policies":rows}))
 }
-fn history(shared:&SharedLedger,include_titles:bool)
+fn history(shared:&SharedLedger,workspace:&str,include_titles:bool)
     ->Result<(String,String),String>{
     let ledger=shared.run_ledger()?;
     let runs=ledger.list_runs(64,false).map_err(|e|e.to_string())?;
     let mut entries=Vec::new();
     for run in runs{
         if !run.status.is_terminal()||run.spec.task.contains("swarm-ambient") {continue;}
+        // Historical context stays within the exact originally approved
+        // canonical workspace grant, even when other sessions belong to
+        // different repositories in the same profile.
+        if !run.spec.workspace.as_ref().is_some_and(|grant|
+            grant.roots.iter().any(|root|root.canonical_path==workspace)){continue;}
         let title=if include_titles{
             Some(run.spec.task.chars().take(240)
                 .map(|c|if c.is_control(){' '}else{c}).collect::<String>())
@@ -163,10 +168,15 @@ pub fn tick(cli:&crate::Cli,paths:&DaemonPaths,roots:&[PathBuf],config:&DaemonCo
     if store.kill_switch()?{return Ok(());}
     let now=super::now_ms()?;
     for policy in policies(store)?{
+        let source:little_monkey_lib::recipes::Recipe=serde_json::from_slice(
+            &fs::read(&policy.recipe).map_err(|e|e.to_string())?
+        ).map_err(|e|e.to_string())?;
+        let workspace=source.workspace.as_deref()
+            .ok_or_else(||"Ambient policy missing frozen workspace".to_string())?;
         if let Some(job_id)=policy.pending_job.as_deref(){
             if let Some(job)=store.get_job(job_id)?{
                 if !job.state.is_terminal(){continue;}
-                let (fingerprint,_)=history(shared,policy.include_titles)?;
+                let (fingerprint,_)=history(shared,workspace,policy.include_titles)?;
                 let changed=fingerprint!=policy.fingerprint;
                 let interval=next_interval(policy.interval_ms,changed,job.state==JobState::Succeeded);
                 store.connection.execute(
@@ -180,7 +190,7 @@ pub fn tick(cli:&crate::Cli,paths:&DaemonPaths,roots:&[PathBuf],config:&DaemonCo
             // Uncertain crash window: retry the IDENTICAL deterministic job
             // against its already-written frozen snapshot, never a new turn.
         }else if now<policy.next_wake_ms{continue;}
-        let (fingerprint,raw)=history(shared,policy.include_titles)?;
+        let (fingerprint,raw)=history(shared,workspace,policy.include_titles)?;
         if policy.pending_job.is_none() && !policy.fingerprint.is_empty() &&
             fingerprint==policy.fingerprint{
             let interval=next_interval(policy.interval_ms,false,true);
