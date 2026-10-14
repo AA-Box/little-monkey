@@ -98,7 +98,7 @@ function main(){
  // Benchmark failures are real negative quality outcomes, not a reason to
  // forge a green receipt or retain a stale successful receipt indefinitely.
  const command=spawnSync(process.execPath,[
-  new URL('./swarm-model-benchmark.mjs',import.meta.url).pathname,
+  fileURLToPath(new URL('./swarm-model-benchmark.mjs',import.meta.url)),
   '--targets',selection.join(','),'--repetitions','3',
  ],{encoding:'utf8',timeout:3_600_000,maxBuffer:1024*1024,
     env:process.env});
