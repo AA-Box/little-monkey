@@ -46,6 +46,8 @@ import {
   invalidateSwarmContinuousQuality,
 } from '../../lib/swarmVerifiedBenchmarks';
 import {synchronizeContinuousSwarmQuality} from '../../lib/swarmContinuousEvidence';
+import {billingGuardEnabled,setBillingGuardEnabled,billingScope,setBillingScope,
+  synchronizeOfficialBilling,billingGuardAllowsKeys} from '../../lib/swarmBillingEvidence';
 import { skillLearningClient } from '../../lib/skillLearningClient';
 import { setSwarmCostOptimization,swarmCostOptimizationEnabled } from '../../lib/swarmCostOptimizer';
 import { loadSwarmLiveOutcomes } from '../../lib/swarmLiveOptimizer';
@@ -85,6 +87,9 @@ export function SwarmPanel() {
   const [benchmarkRouting, setBenchmarkRouting] = useState(() => swarmBenchmarkRoutingEnabled());
   const [costRouting, setCostRouting] = useState(() => swarmCostOptimizationEnabled());
   const [continuousQuality,setContinuousQuality]=useState(()=>swarmContinuousQualityEnabled());
+  const [billingGuard,setBillingGuard]=useState(()=>billingGuardEnabled());
+  const [openaiBillingScope,setOpenaiBillingScope]=useState(()=>billingScope('openai')??'');
+  const [anthropicBillingScope,setAnthropicBillingScope]=useState(()=>billingScope('anthropic')??'');
   useEffect(()=>{
     if(!continuousQuality)return;
     const refresh=()=>setBenchmark(loadSwarmBenchmark());
@@ -827,6 +832,30 @@ export function SwarmPanel() {
               }}/>
             Additionally optimize price among independently graded, quality-equivalent, already eligible subagent targets. Requires six fixture observations per model, configured input/output rates, and at least three historical usage samples. Minimum 10% estimated rate savings; never overrides model pins, policy restrictions or privacy. After six real baseline completions, an eligible cheaper candidate starts at 10% canary, ramps to 30% with six recorded candidate outcomes, then to 100% with 12, unless the real-run failure/latency circuit breaker trips. Model completion is not answer correctness. This estimates token rates, not bills.
           </label>
+          <label className="mt-3 flex items-start gap-2 text-xs text-foreground">
+            <input type="checkbox" checked={billingGuard} onChange={event=>{
+              const enabled=event.target.checked;
+              if(enabled&&!window.confirm('Require independently fetched provider admin cost reports for every provider model before opting into cheaper routing? This fails closed when billing keys, exact scopes, full-month reports, or metered ledger estimates are missing. It does not verify answer correctness or settled invoices.'))return;
+              setBillingGuardEnabled(enabled);setBillingGuard(enabled);
+              if(enabled)void synchronizeOfficialBilling();
+            }}/>
+            Require real provider-admin cost reconciliation before cost-based model routing. Absent, mismatched, or stale billing evidence blocks optimization, never normal model execution.
+          </label>
+          <div className="mt-2 grid gap-2 sm:grid-cols-2">
+            <label className="text-xs text-foreground">OpenAI API key ID (not the secret)
+              <input className="mt-1 w-full rounded border border-border bg-background p-1"
+                value={openaiBillingScope} onChange={event=>setOpenaiBillingScope(event.target.value)}
+                onBlur={()=>{try{setBillingScope('openai',openaiBillingScope.trim())}
+                  catch(error){setError(String(error))}}} placeholder="key ID from organization billing" />
+            </label>
+            <label className="text-xs text-foreground">Anthropic workspace ID (not the secret)
+              <input className="mt-1 w-full rounded border border-border bg-background p-1"
+                value={anthropicBillingScope} onChange={event=>setAnthropicBillingScope(event.target.value)}
+                onBlur={()=>{try{setBillingScope('anthropic',anthropicBillingScope.trim())}
+                  catch(error){setError(String(error))}}} placeholder="workspace ID for reported costs" />
+            </label>
+          </div>
+          <p className="mt-1 text-xs text-muted">The installed operator-owned runner fetches official costs using admin credentials from its environment. These are provider-reported costs, not settled invoices. Scopes are operator-asserted: only select an API key/workspace exclusively used by this installation. Cost guard: {billingGuard?billingGuardAllowsKeys(benchmark.ranking.map(row=>row.target))?'current scoped reports verified':'blocked until complete scoped reports arrive':'off'}.</p>
           <p className="mt-2 text-xs text-muted">Operational feedback (local and durable): {recentOperationalOutcomes.length} terminal model runs in the last 14 days. Continuous cost-routing safety decisions are made on each subagent dispatch; only an actual run can feed this count. This is not a verified answer-quality score.</p>
           <p className="mt-1 text-xs text-muted">
             Real usage attached to {recentOperationalOutcomes.filter(row=>row.usage).length}/{recentOperationalOutcomes.length} terminal runs ·
