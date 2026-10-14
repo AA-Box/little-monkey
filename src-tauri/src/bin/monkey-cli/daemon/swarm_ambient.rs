@@ -62,8 +62,7 @@ pub fn install(paths:&DaemonPaths,id:&str,source:&Path,workspace:&Path,
     if !resolved.is_dir(){return Err("Ambient workspace must exist".into());}
     if include_titles{
         // Private historical tasks cannot silently leave the user's machine.
-        let target=serde_json::to_value(&recipe.target).map_err(|e|e.to_string())?;
-        if target.get("ollama").is_none()&&target.get("managed_llama").is_none(){
+        if recipe.target.ollama.is_none() && recipe.target.managed_model.is_none(){
             return Err("Historical task titles require an explicitly local model target".into());
         }
     }
