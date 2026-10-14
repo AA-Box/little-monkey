@@ -105,6 +105,8 @@ Create a private serving state directory distinct from the training inbox and ou
 }
 ```
 
+`backendPort` must be exactly `8766`. Unlike the operator-facing `listenPort` and the temporary grading `probePort`, the MLX backend destination is pinned in code to `127.0.0.1:8766`. This prevents a tampered policy file from directing model inference traffic to arbitrary local services. The supervisor refuses to start if this port is already occupied.
+
 Start on an operator-owned Apple Silicon Mac with a verified native CLI and installed MLX-LM Python environment:
 
 ```sh
