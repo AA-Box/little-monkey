@@ -43,6 +43,8 @@ export class AgentTeamRuntime {
   }
   registerRoot(id:string):void{
     if(!this.members.has(id)&&this.count>=MAX_RUNTIME_AGENTS)throw Error('Runtime agent count exhausted.');
+    if(!this.members.has(id)&&[...this.members.values()].filter(m=>m.active).length>=MAX_RUNTIME_CONCURRENT)
+      throw Error('Concurrent agent budget exhausted.');
     if(!this.members.has(id)){this.members.set(id,{id,parent:null,depth:0,active:true});this.count++;}
   }
   reserveChild(parent:string,id:string):number{
@@ -66,7 +68,13 @@ export class AgentTeamRuntime {
     if(!m||m.parent!==parent||!m.completion)throw Error('Can join direct children only.');
     return m.completion;
   }
-  finish(id:string):void{const m=this.members.get(id);if(m)m.active=false;}
+  finish(id:string):void{
+    const m=this.members.get(id);if(m)m.active=false;
+    // Retained mail is in profile storage; release completed in-memory team
+    // state rather than growing the registry over a long desktop lifetime.
+    if(![...this.members.values()].some(member=>member.active))
+      registry.delete(this.id);
+  }
   isActive(id:string):boolean{return this.members.get(id)?.active===true;}
   children(id:string):string[]{
     if(!this.members.has(id))throw Error('Unknown team member.');
