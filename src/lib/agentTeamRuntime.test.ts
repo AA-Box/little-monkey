@@ -9,6 +9,7 @@ describe('live runtime agent collaboration',()=>{
     expect(()=>t.reserveChild(parent,'too-deep')).toThrow(/depth/);
     expect(()=>t.reserveChild('root','child-0')).toThrow(/Duplicate/);
     expect(()=>t.reserveChild('unknown','x')).toThrow(/not active/);
+    t.reserveChild('root','sixth-member');
     expect(()=>t.reserveChild('root','overflow')).toThrow(/Concurrent/);
     t.finish('child-3');
     expect(t.reserveChild('root','new-member')).toBe(1);
