@@ -558,7 +558,7 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
   const { sessionId, runId, parentCheckpointId, parentSignal, taskId, toolCallId, groupId, workflowRunId, description, prompt, profile, target, effort, risk, onMutatedPath, onMutationFailure, capabilities } =
     params;
 
-  const team = params.teamRuntime ?? teamForRun(sessionId,runId ?? taskId);
+  const team = params.teamRuntime ?? teamForRun(sessionId,runId ?? crypto.randomUUID());
   if (params.parentAgentId === undefined) team.registerRoot(taskId);
   else if (!team.isActive(taskId)) {
     return stringifyToolError(new Error('Unregistered runtime child agent.'));
