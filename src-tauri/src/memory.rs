@@ -1558,6 +1558,87 @@ pub fn memory_add(
     )
 }
 
+/// Post-turn automatic memory, explicitly opted into in desktop settings.
+///
+/// New memories have agent provenance and the originating turn id. An automatic
+/// correction may only update an existing *agent-created*, enabled, unpinned
+/// fact in this SAME scope, and requires an exact old-text compare (optimistic
+/// concurrency). User-entered/pinned/retired facts are never overwritten.
+/// No workspace -> global scope, matching ordinary chats without a root.
+/// A caller cannot write another workspace's memories or escalate a scope.
+#[tauri::command]
+pub fn memory_auto_apply(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    text: String,
+    turn_id: String,
+    operation: String,
+    existing_id: Option<String>,
+    expected_old_text: Option<String>,
+    existing_ids: Option<Vec<String>>,
+    expected_old_texts: Option<Vec<String>>,
+    expected_workspace: Option<String>,
+) -> Result<Fact, String> {
+    if turn_id.is_empty() || turn_id.len() > 120 ||
+        !turn_id.bytes().all(|c| c.is_ascii_alphanumeric() ||
+            matches!(c, b'-' | b'_' | b'.' | b'#')) {
+        return Err("Invalid automatic-memory turn id".into());
+    }
+    let active = workspace::primary_root_canon(state.inner()).ok()
+        .map(|root| root.to_string_lossy().to_string());
+    let expected = expected_workspace
+        .map(|root| std::fs::canonicalize(&root)
+            .map(|path| path.to_string_lossy().to_string())
+            .map_err(|_| "Conversation workspace is no longer accessible".to_string()))
+        .transpose()?;
+    if expected != active {
+        return Err("Conversation workspace changed before memory capture".into());
+    }
+    let scope = active.unwrap_or_else(|| GLOBAL_SCOPE_KEY.to_string());
+    let path = memories_file_path(&app)?;
+    let _lock = state.memory_lock.lock()
+        .map_err(|_| "Memory lock poisoned".to_string())?;
+    match operation.as_str() {
+        "add" if existing_id.is_none() && expected_old_text.is_none() &&
+            existing_ids.is_none() && expected_old_texts.is_none() =>
+            add_fact_impl(&path, &scope, &text, "agent", Some(&turn_id)),
+        "merge" => {
+            let ids = existing_ids.ok_or("Missing source memory IDs")?;
+            let expected = expected_old_texts.ok_or("Missing source memory texts")?;
+            if ids.len() < 2 || ids.len() > 4 || ids.len() != expected.len() ||
+                ids.iter().collect::<std::collections::HashSet<_>>().len() != ids.len() {
+                return Err("Automatic merge needs 2–4 distinct source memories".into());
+            }
+            let store = load_impl(&path)?;
+            let facts = store.projects.get(&scope)
+                .ok_or("Automatic merge source scope not found")?;
+            for (id, old) in ids.iter().zip(expected.iter()) {
+                let fact = facts.facts.iter().find(|fact| &fact.id == id)
+                    .ok_or("Automatic merge source memory not found")?;
+                if fact.source != "agent" || fact.pinned || !fact.enabled ||
+                    fact.retired_at.is_some() || fact.text != *old {
+                    return Err("Automatic merge refused: changed, user-owned or pinned source".into());
+                }
+            }
+            merge_impl(&path, &scope, &ids, Some(&text))
+        },
+        "replace" if existing_ids.is_none() && expected_old_texts.is_none() => {
+            let id = existing_id.as_deref().ok_or("Missing old memory ID")?;
+            let expected = expected_old_text.as_deref().ok_or("Missing expected old text")?;
+            let store = load_impl(&path)?;
+            let fact = store.projects.get(&scope).and_then(|project|
+                project.facts.iter().find(|fact| fact.id == id))
+                .ok_or("Old automatic memory not found in the current scope")?;
+            if fact.source != "agent" || fact.pinned || !fact.enabled ||
+                fact.retired_at.is_some() || fact.text != expected {
+                return Err("Automatic memory correction refused: changed, user-owned or pinned fact".into());
+            }
+            update_fact_impl(&path, &scope, id, &text)
+        },
+        _ => Err("Invalid automatic memory operation".into()),
+    }
+}
+
 /// Delete a fact by id — used by the transcript's "Forget" button (see
 /// `MessageList.tsx`'s `MemoryRow`) and, in slice 4, the Settings fact list.
 /// Searches [`GLOBAL_SCOPE_KEY`] and the current primary root (whichever
