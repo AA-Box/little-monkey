@@ -11,8 +11,24 @@ import {useCostControlStore,providerIdOfTargetKey} from '../store/costControlSto
 export type MeteredBillingProvider='openai'|'anthropic';
 const PROVIDERS:readonly MeteredBillingProvider[]=['openai','anthropic'];
 const GUARD='little-monkey-swarm-official-billing-guard-v1';
+// Scope identifiers and validated receipts are sensitive account metadata.
+// Keep them for this renderer session only, never in clear-text Web Storage.
+// The persistent enable flag is non-sensitive; missing scopes after restart
+// deliberately fail closed until the operator re-enters them.
 const scopeKey=(p:MeteredBillingProvider)=>'little-monkey-swarm-billing-scope-'+p;
 const cacheKey=(p:MeteredBillingProvider)=>'little-monkey-swarm-billing-admin-receipt-'+p;
+const scopes=new Map<MeteredBillingProvider,string>();
+const verifiedReceipts=new Map<MeteredBillingProvider,ProviderBillingEvidence>();
+function purgeLegacyBillingStorage():void{
+ try{
+  for(const p of PROVIDERS){
+   localStorage.removeItem(scopeKey(p));
+   localStorage.removeItem(cacheKey(p));
+  }
+ }catch{/* Restricted Web Storage must not weaken the fail-closed guard. */}
+}
+// Remove identifiers/receipts written by earlier releases as soon as loaded.
+purgeLegacyBillingStorage();
 const ID=/^[A-Za-z0-9_-]{1,160}$/;
 const HASH=/^[0-9a-f]{64}$/;
 const MONTH=/^20\d\d-(0[1-9]|1[0-2])$/;
@@ -25,14 +41,14 @@ export function setBillingGuardEnabled(enabled:boolean):void{
  localStorage.setItem(GUARD,enabled?'true':'false');
 }
 export function billingScope(provider:MeteredBillingProvider):string|null{
- try{const s=localStorage.getItem(scopeKey(provider));return s&&ID.test(s)?s:null}
- catch{return null}
+ return scopes.get(provider)??null;
 }
 export function setBillingScope(provider:MeteredBillingProvider,id:string):void{
  if(id!==''&&!ID.test(id))throw new Error('Invalid official billing API key/workspace scope ID');
- if(id)localStorage.setItem(scopeKey(provider),id);
- else localStorage.removeItem(scopeKey(provider));
- localStorage.removeItem(cacheKey(provider));
+ if(id)scopes.set(provider,id);
+ else scopes.delete(provider);
+ verifiedReceipts.delete(provider);
+ purgeLegacyBillingStorage();
 }
 function lastUtcMonth(now:number):string{
  const date=new Date(now);
@@ -87,9 +103,9 @@ export function billingGuardAllowsKeys(keys:readonly string[],now=Date.now()):bo
    if(id!=='openai'&&id!=='anthropic')return false;
    const p=id as MeteredBillingProvider,scope=billingScope(p);
    if(!scope)return false;
-   const raw=localStorage.getItem(cacheKey(p));
+   const raw=verifiedReceipts.get(p);
    if(!raw)return false;
-   const verified=validateProviderBillingEvidence(JSON.parse(raw),p,scope,now);
+   const verified=validateProviderBillingEvidence(raw,p,scope,now);
    // Recompute local source usage again on EVERY routing decision.
    // A cached admin receipt cannot be paired with arbitrary edited totals or
    // a new set of calls, and the operator must account for ALL recorded
@@ -115,7 +131,7 @@ export async function synchronizeOfficialBilling():Promise<void>{
  const root=await appDataDir();
  for(const provider of PROVIDERS){
   const scope=billingScope(provider);
-  if(!scope){localStorage.removeItem(cacheKey(provider));continue;}
+  if(!scope){verifiedReceipts.delete(provider);continue;}
   try{
    const path=await join(root,'swarm-billing-'+provider+'-latest.json');
    const raw=await readTextFile(path);
@@ -132,8 +148,8 @@ export async function synchronizeOfficialBilling():Promise<void>{
      byte.toString(16).padStart(2,'0')).join('');
    if(actual!==sha256)throw Error('Corrupted provider admin cost receipt');
    validateProviderBillingEvidence(parsed,provider,scope);
-   localStorage.setItem(cacheKey(provider),JSON.stringify(parsed));
-  }catch{localStorage.removeItem(cacheKey(provider))}
+   verifiedReceipts.set(provider,parsed as unknown as ProviderBillingEvidence);
+  }catch{verifiedReceipts.delete(provider)}
  }
 }
 /** Operator-scoped model estimates, with no prompts or provider credentials. */
