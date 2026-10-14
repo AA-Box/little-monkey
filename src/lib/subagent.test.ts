@@ -1272,3 +1272,56 @@ describe("runSubagentTask / worktree isolation", () => {
     expect(meta?.worktree?.status).toBe("applied");
   });
 });
+
+
+describe('dynamic runtime agent spawning and live mailbox integration',()=>{
+  beforeEach(()=>{
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+    useSettingsStore.setState({subagentsEnabled:true});
+  });
+  it('executes a model-requested child, receives its report and joins under parent permission policy',async()=>{
+    const session='dynamic-'+crypto.randomUUID();
+    attemptStreamMock.mockImplementation(async (_target,history:ChatMessage[],tools:{function:{name:string}}[])=>{
+      const first=history.find(m=>m.role==='user')?.content;
+      const isChild=typeof first==='string'&&first==='review the auth helper';
+      const toolReplies=history.filter(m=>m.role==='tool');
+      if(isChild){
+        expect(tools.some(t=>t.function.name==='agent_send')).toBe(true);
+        expect(tools.some(t=>t.function.name==='write_file')).toBe(false);
+        return {content:'auth helper checked',toolCalls:[],streamError:null,contentStarted:true};
+      }
+      expect(tools.some(t=>t.function.name==='agent_spawn')).toBe(true);
+      if(toolReplies.length===0){
+        return {content:'',toolCalls:[{id:'spawn-1',type:'function',function:{name:'agent_spawn',arguments:JSON.stringify({
+          description:'Read-only nested auth review',prompt:'review the auth helper',profile:'explore'
+        })}}],streamError:null,contentStarted:true};
+      }
+      if(toolReplies.length===1){
+        const reply=JSON.parse(toolReplies[0].content as string) as {id:string};
+        expect(reply.id).toBeTruthy();
+        return {content:'',toolCalls:[{id:'join-1',type:'function',function:{name:'agent_join',
+          arguments:JSON.stringify({id:reply.id})}}],streamError:null,contentStarted:true};
+      }
+      expect(String(toolReplies.at(-1)?.content)).toContain('auth helper checked');
+      return {content:'parent verified child result',toolCalls:[],streamError:null,contentStarted:true};
+    });
+    const report=await runSubagentTask(baseParams({sessionId:session,taskId:'parent-'+session,profile:'explore'}));
+    expect(report).toBe('parent verified child result');
+    expect(executeToolCallMock).not.toHaveBeenCalled();
+  });
+  it('prevents child permission escalation from explore into code',async()=>{
+    const session='escalate-'+crypto.randomUUID();
+    attemptStreamMock
+      .mockResolvedValueOnce({content:'',toolCalls:[{id:'spawn',type:'function',
+        function:{name:'agent_spawn',arguments:JSON.stringify({
+          description:'Try unsafe privilege change',prompt:'mutate the repo',profile:'code'
+        })}}],streamError:null,contentStarted:true})
+      .mockResolvedValueOnce({content:'declined',toolCalls:[],streamError:null,contentStarted:true});
+    const report=await runSubagentTask(baseParams({sessionId:session,taskId:'root-'+session,profile:'explore'}));
+    expect(report).toBe('declined');
+    const messages=useSessionStore.getState().sessions[session]?.subagentRuns;
+    expect(messages).toBeDefined();
+    expect(executeToolCallMock).not.toHaveBeenCalled();
+  });
+});
