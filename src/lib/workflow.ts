@@ -513,6 +513,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
       finishedAt: Date.now(),
       phases,
       agentResults,
+      ...(liveBus ? { liveMailbox: liveBus.snapshot() } : {}),
       correlationOrigin,
       ...(runId ? { sourceRunId: runId } : {}),
       spec,
@@ -534,7 +535,9 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
     useSessionStore.getState().setWorkflowRun(sessionId, toolCallId, {
       name: spec.name, description: spec.description, status: 'running',
       startedAt: live?.startedAt ?? Date.now(), finishedAt: Date.now(),
-      phases, agentResults: { ...agentResults }, correlationOrigin, ...(runId ? { sourceRunId: runId } : {}), spec,
+      phases, agentResults: { ...agentResults },
+      ...(liveBus ? { liveMailbox: liveBus.snapshot() } : {}),
+      correlationOrigin, ...(runId ? { sourceRunId: runId } : {}), spec,
     });
     // Dependents cannot start until the last agent journal has been written.
     await flushSessionPersistence();
@@ -576,6 +579,20 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
       const workspaceRoot = useSessionStore.getState().sessions.find(s => s.id === sessionId)?.workspacePath ?? '';
       liveBus = new LiveSwarmBus(spec.phases.flatMap((phase, phaseIndex) =>
         phase.agents.map((_, agentIndex) => workflowAgentTaskId(toolCallId, phaseIndex, agentIndex))), workspaceRoot);
+      if (resume) {
+        if (!sourceMeta?.liveMailbox)
+          throw new Error('Cannot resume live messaging: no persisted mailbox checkpoint.');
+        liveBus.restore(sourceMeta.liveMailbox,
+          sourceMeta.phases.flatMap(phase => phase.agents.map(agent => agent.taskId)));
+        for (let pi = 0; pi < spec.phases.length; pi++)
+          for (let ai = 0; ai < spec.phases[pi].agents.length; ai++) {
+            const previous = sourceMeta.agentResults?.[workflowAgentTaskId(resume, pi, ai)];
+            if (previous?.status !== 'done')
+              liveBus.reopenAgent(workflowAgentTaskId(toolCallId, pi, ai));
+          }
+      }
+      liveBus.setPersistence(async () => { await checkpoint(); });
+      await checkpoint();
     }
     const voterSnapshot=spec.authenticatedPeerVoting
       ? await frozenAuthenticatedPeerVoters(spec.phases[spec.phases.length-2].agents
@@ -675,7 +692,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
           const journaled = resume ? resumeJournal?.[workflowAgentTaskId(resume, phaseIndex, agentIndex)] : undefined;
           if (journaled && journaled.status === 'done' && journaled.promptHash === hash) {
             replayJournaledAgent(agentTaskId, agent, prompt, journaled.report);
-            liveBus?.finishAgent(agentTaskId);
+            if (liveBus) await liveBus.finishAgentDurable(agentTaskId);
             agentResults[agentTaskId] = { promptHash: hash, status: 'done', report: journaled.report, reused: true };
             await checkpoint();
             return journaled.report;
@@ -716,7 +733,7 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
             onMutatedPath,
             onMutationFailure,
           });
-          liveBus?.finishAgent(agentTaskId);
+          if (liveBus) await liveBus.finishAgentDurable(agentTaskId);
           const cancelled = unwrapUntrustedContent(raw) === CANCELLED_TOOL_RESULT;
           const failed = !cancelled && resultIsError(raw);
           agentResults[agentTaskId] = {
