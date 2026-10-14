@@ -1893,13 +1893,19 @@ export async function runAgentTurn(
             userText, turnId, expectedWorkspace: workspace,
             facts: useRulesStore.getState().facts,
             callModel: async (messages) => {
-              const reflection = await attemptStream(
-                target, messages, [], controller.signal, effortForTarget(target),
-                sessionId, undefined, false,
-              );
-              if (reflection.streamError !== null || reflection.toolCalls.length)
-                throw new Error(reflection.streamError || 'Memory extractor returned unexpected tools');
-              return reflection.content;
+              const reflectionController = new AbortController();
+              const timeout = setTimeout(() => reflectionController.abort(), 60_000);
+              try {
+                const reflection = await attemptStream(
+                  target, messages, [], reflectionController.signal, effortForTarget(target),
+                  sessionId, undefined, false,
+                );
+                if (reflectionController.signal.aborted || reflection.streamError !== null || reflection.toolCalls.length)
+                  throw new Error(reflection.streamError || 'Automatic memory reflection timed out or returned unexpected tools');
+                return reflection.content;
+              } finally {
+                clearTimeout(timeout);
+              }
             },
           });
           if (result.added || result.corrected || result.merged)
