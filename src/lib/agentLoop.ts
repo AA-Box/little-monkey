@@ -1902,7 +1902,7 @@ export async function runAgentTurn(
               return reflection.content;
             },
           });
-          if (result.added || result.corrected)
+          if (result.added || result.corrected || result.merged)
             await useRulesStore.getState().refresh();
           if (result.warnings.length)
             console.warn('Automatic memory capture warnings:', result.warnings);
