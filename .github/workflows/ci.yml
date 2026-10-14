@@ -61,6 +61,8 @@ jobs:
         run: pnpm test:swarm-physical:contract
       - name: Exercise authenticated cross-host telemetry contract (no physical peers)
         run: pnpm test:swarm-telemetry:contract
+      - name: Contract-test continuous independent model quality and official billing readers
+        run: pnpm test:swarm-continuous:contract
       - name: Contract-test real-device vector memory and cancellation gates (no network)
         run: |
           node --check scripts/swarm-two-peer-memory-live-acceptance.mjs
