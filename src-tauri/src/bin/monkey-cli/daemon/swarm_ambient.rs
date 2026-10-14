@@ -269,7 +269,10 @@ mod tests{
             .unwrap()["history_titles"],false);
 
         disable(&paths,"my-review").unwrap();
-        assert_eq!(status(&paths).unwrap()["policies"][0]["enabled"],false);
+        let current=status(&paths).unwrap();
+        let record=current["policies"].as_array().unwrap().iter()
+            .find(|item|item["id"]=="my-review").unwrap();
+        assert_eq!(record["enabled"],false);
         let _=fs::remove_dir_all(root);
     }
 }
