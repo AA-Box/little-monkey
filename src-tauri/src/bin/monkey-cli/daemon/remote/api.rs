@@ -4425,6 +4425,10 @@ impl RemoteApi {
                 ),
                 result: None,
             });
+        let model_metering=if state.terminal {
+            self.run_ledger().ok().and_then(|ledger|
+                verified_peer_task_metering(&ledger,&record.node_run_id))
+        } else {None};
         Ok((
             200,
             serde_json::to_value(little_monkey_lib::node_placement::PlacedRunStatus {
@@ -4437,6 +4441,7 @@ impl RemoteApi {
                 updated_at_ms: state.updated_at_ms,
                 last_error: state.last_error,
                 result: state.result,
+                model_metering,
             })
             .map_err(internal)?,
             Some(record.submitted_run_id),
