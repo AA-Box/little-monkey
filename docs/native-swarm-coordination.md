@@ -519,6 +519,61 @@ may be repeated after failover. No automatic cluster membership changes,
 Raft/BFT replicated logs or exactly-once external side effects are claimed.
 
 
+### Durable local read-only task reassignment
+
+For an operator-enrolled clustered graph, a *terminally failed* primary
+read-only daemon job now automatically receives up to two additional attempts.
+The immutable logical identity is `(graph_id, node_id)`. Attempt zero retains
+its original deterministic job ID; successive attempts have deterministic,
+distinct job IDs derived from the logical identity and reassignment counter.
+The SQLite node cursor, next deterministic job identity, and retry counter
+advance in the same immediate transaction, requiring the previous job to be in
+the durable `failed` state. The replacement is persisted as `preparing`, never
+as an unattempted `pending` node; takeover witnesses cannot mistake it for a
+never-dispatched task. The coordinator cannot accept a stale job's late
+success as the current result.
+Each new dispatch must pass the current signed quorum/term/state barrier.
+
+Automatic attempts are **not** scheduled for cancelled, running, paused,
+approval-waiting or needs-reconciliation jobs, and never for manually authorized
+code-edit graphs or nonclustered graphs. Explicit approved fallback recipes
+still take precedence. After the retry budget is exhausted the DAG fails
+normally. This is automatic **local worker retry** on the certified leader,
+not automatic cross-machine task migration. It does not provide global
+exactly-once execution: peers have separate ledgers; external tools must
+implement their own transactional idempotency/fencing for that guarantee.
+
+### Crash-resumable approved cross-machine failover
+
+An operator's existing immutable plan-only transfer remains required on the
+receiving installation. On a newly elected quorum leader, the service
+reconciles both `armed` and previously `claimed` failover plans. A crash after
+the durable one-shot claim but before registration can resume only after a
+fresh signed majority proves the previous leader had never dispatched any
+node. A crash after registration but before the plan is marked `imported`
+reuses the already registered graph **without creating another job** only
+after validating the entire persisted graph specification and each frozen
+recipe against the originally approved bounded transfer bundle. A graph
+name match alone is rejected. An immediate SQLite claim on the immutable
+`(group, source graph, source fingerprint)` also prevents two separate
+approved failover plans on the SAME receiving installation from importing the
+same predecessor into different replacement graphs. Legacy imported/claimed
+plans populate that local claim ledger on upgrade. The inspected bytes are
+copied into a private bounded file before any import, preventing a source-path
+swap between approval and execution. Temporary lost quorum leaves the same claim waiting for fresh
+proof; malformed or changed recipes fail closed. A signed readback that
+returns **no source checkpoint** cannot vote for a safe takeover: at least
+a strict majority must have independently observed matching, pending-only
+source state. Unknown/missing evidence never establishes non-execution.
+
+This closes the local post-claim daemon crash window of the preapproved
+read-only takeover. It is still **not transparent cross-host migration of an
+arbitrary running task** and does not automatically reassign already-started
+external effects. Cross-machine exactly-once execution would additionally
+require replicated, authoritative consumption records and transactional
+idempotency support at every write-capable effect destination.
+
+
 ### Ruflo-compatible lifecycle hook execution (bounded subset)
 
 The built-in native user-hook engine now supports `PreCommand`,
