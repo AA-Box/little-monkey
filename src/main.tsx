@@ -8,6 +8,7 @@ import "./index.css";
 import { applyAppearance, subscribeToSystemTheme } from "./lib/theme";
 import { resolveAppearanceSettings } from "./lib/appearanceProfiles";
 import { startExtensionMarketplaceUpdateCoordinator } from "./lib/extensionMarketplaceUpdateCoordinator";
+import {startContinuousSwarmQualityReader} from "./lib/swarmContinuousEvidence";
 import { useSettingsStore } from "./store/settingsStore";
 import { primaryRoot, useWorkspaceStore } from "./store/workspaceStore";
 import { hydrateSessions, useSessionStore } from "./store/sessionStore";
@@ -122,6 +123,9 @@ if (isCompanionOverlay) {
   // coordinator; secondary session windows load this entry point too.
   if (getCurrentWindow().label === "main") {
     startExtensionMarketplaceUpdateCoordinator();
+    // Operator-opted independent quality evidence is refreshed whether
+    // Settings is open or not. Stale or failed receipts revoke auto-routing.
+    startContinuousSwarmQualityReader();
   }
 
   // Top-level boundary: without it a render error anywhere unmounts the
