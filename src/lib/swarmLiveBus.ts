@@ -298,6 +298,12 @@ export class LiveSwarmBus {
     this.reads.get(id)!.clear();
   }
 
+  /** Only the explicit resume controller may reopen an incomplete agent. */
+  reopenAgent(id: string): void {
+    this.requireAgent(id);
+    this.finished.delete(id);
+  }
+
   close(): void {
     this.closed = true;
     this.queues.clear();
