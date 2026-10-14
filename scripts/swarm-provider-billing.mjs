@@ -177,6 +177,8 @@ async function main(){
  const ledgerPath=option('--ledger');
  const compare=ledgerPath?reconcileObservedBilling(bill,JSON.parse(readFileSync(ledgerPath,'utf8'))):
   {state:'not_comparable',reason:'No measured ledger supplied'};
+ if(process.argv.includes('--require-reconciled')&&compare.state!=='within_tolerance')
+  fail('Official provider costs are not reconciled to a complete matching model-call ledger');
  const receipt={...bill,comparison:compare};
  receipt.sha256=createHash('sha256').update(JSON.stringify(receipt)).digest('hex');
  atomicReceipt(output,receipt);
