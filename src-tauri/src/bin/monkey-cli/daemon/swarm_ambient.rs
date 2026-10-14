@@ -191,8 +191,11 @@ pub fn tick(cli:&crate::Cli,paths:&DaemonPaths,roots:&[PathBuf],config:&DaemonCo
             // against its already-written frozen snapshot, never a new turn.
         }else if now<policy.next_wake_ms{continue;}
         let (fingerprint,raw)=history(shared,workspace,policy.include_titles)?;
+        // Even without a new conversation, scan the workspace at least once
+        // per maximum backoff window. Otherwise a codebase modified outside
+        // Little Monkey would never be inspected again.
         if policy.pending_job.is_none() && !policy.fingerprint.is_empty() &&
-            fingerprint==policy.fingerprint{
+            fingerprint==policy.fingerprint && policy.interval_ms<MAX_MS{
             let interval=next_interval(policy.interval_ms,false,true);
             store.connection.execute(
                 "UPDATE swarm_ambient_policies SET next_wake_ms=?2,interval_ms=?3 WHERE id=?1",
