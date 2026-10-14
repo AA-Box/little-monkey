@@ -36,7 +36,7 @@ function micro(amount,scale=1000000){
  if(micros>100000000000000n)fail('Official amount exceeds supported bound');
  return micros;
 }
-function parsePage(provider,body,range,seen){
+function parsePage(provider,body,range,seen,scopeId){
  if(!body||!Array.isArray(body.data)||typeof body.has_more!=='boolean'||
     (body.has_more&&(!body.next_page||typeof body.next_page!=='string'))||
     body.data.length>180)fail('Provider response lacks complete pagination');
@@ -57,6 +57,13 @@ function parsePage(provider,body,range,seen){
     total+=micro(row.amount.value);
    }else{
     if(row?.currency!=='USD')fail('Anthropic returned non-USD cost item');
+    // The Anthropic Cost Report does not support workspace_ids[] filters.
+    // group_by[]=workspace_id is the supported way to obtain attribution,
+    // then strictly match the requested workspace in each individual result.
+    if(scopeId!==null){
+      if(typeof row.workspace_id!=='string')fail('Missing Anthropic workspace cost attribution');
+      if(row.workspace_id!==scopeId)continue;
+    }
     // Anthropic Cost Report amounts are decimal CENTS, not dollars.
     total+=micro(row.amount,10000);
    }
@@ -91,7 +98,7 @@ export async function fetchOfficialCost({provider,month,token,scopeId=null,
    u.searchParams.set('ending_at',new Date(range.end).toISOString());
    u.searchParams.set('bucket_width','1d');
    u.searchParams.set('limit','31');
-   if(scopeId)u.searchParams.append('workspace_ids[]',scopeId);
+   if(scopeId)u.searchParams.append('group_by[]','workspace_id');
   }
   if(page)u.searchParams.set('page',page);
   const ctrl=new AbortController();
@@ -103,7 +110,7 @@ export async function fetchOfficialCost({provider,month,token,scopeId=null,
   if(!response.ok)fail('Provider billing API refused the request (HTTP '+response.status+')');
   let json;
   try{json=await response.json()}catch{fail('Malformed provider billing JSON')}
-  total+=parsePage(provider,json,range,seen);
+  total+=parsePage(provider,json,range,seen,scopeId);
   if(!json.has_more){
    if(seen.size!==range.expected)fail('Provider omitted one or more complete daily billing buckets');
    const billedMicro=Number(total);
