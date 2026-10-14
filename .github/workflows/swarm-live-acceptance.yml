@@ -121,35 +121,10 @@ on:
         required: false
         default: ''
         type: string
-      mlx_model_dir:
-        description: Optional preinstalled LOCAL MLX base model path for real Apple Silicon LoRA training
+      mlx_config_json:
+        description: 'Optional JSON with model_dir, train_data_dir, new_adapter_output, max_test_ppl, fuse_for_import, previous_model_dir. Empty object skips MLX.'
         required: false
-        default: ''
-        type: string
-      mlx_train_data_dir:
-        description: Disjoint operator-curated local train/valid/test JSONL directory
-        required: false
-        default: ''
-        type: string
-      mlx_new_adapter_output:
-        description: New empty local absolute directory for an evaluated adapter (never overwrite existing weights)
-        required: false
-        default: ''
-        type: string
-      mlx_max_test_ppl:
-        description: Explicit maximum held-out perplexity threshold (empty skips training)
-        required: false
-        default: ''
-        type: string
-      mlx_fuse_for_import:
-        description: Opt in to fusing and real MLX inference acceptance of the evaluated adapter
-        required: false
-        default: false
-        type: boolean
-      mlx_previous_model_dir:
-        description: Optional previous LOCAL MLX model to probe rollback viability without activation
-        required: false
-        default: ''
+        default: '{}'
         type: string
       verify_remote_cancellation:
         description: Run a disposable remote task and verify actual cancellation
@@ -342,15 +317,15 @@ jobs:
             --checkpoint "$FALLBACK_RECEIPT" --confirm-disposable \
             > "$RUNNER_TEMP/native-swarm-resident-fallback-acceptance.json"
       - name: Train and evaluate a real local MLX LoRA adapter with held-out quality gate
-        if: ${{ inputs.mlx_model_dir != '' || inputs.mlx_train_data_dir != '' || inputs.mlx_new_adapter_output != '' || inputs.mlx_max_test_ppl != '' }}
+        if: ${{ inputs.mlx_config_json != '{}' && inputs.mlx_config_json != '' }}
         shell: bash
         env:
-          MLX_BASE: ${{ inputs.mlx_model_dir }}
-          MLX_DATA: ${{ inputs.mlx_train_data_dir }}
-          MLX_OUTPUT: ${{ inputs.mlx_new_adapter_output }}
-          MLX_GATE: ${{ inputs.mlx_max_test_ppl }}
-          MLX_FUSE: ${{ inputs.mlx_fuse_for_import }}
-          MLX_PREVIOUS: ${{ inputs.mlx_previous_model_dir }}
+          MLX_BASE: ${{ fromJSON(inputs.mlx_config_json).model_dir }}
+          MLX_DATA: ${{ fromJSON(inputs.mlx_config_json).train_data_dir }}
+          MLX_OUTPUT: ${{ fromJSON(inputs.mlx_config_json).new_adapter_output }}
+          MLX_GATE: ${{ fromJSON(inputs.mlx_config_json).max_test_ppl }}
+          MLX_FUSE: ${{ fromJSON(inputs.mlx_config_json).fuse_for_import }}
+          MLX_PREVIOUS: ${{ fromJSON(inputs.mlx_config_json).previous_model_dir }}
         run: |
           set -euo pipefail
           test -n "$MLX_BASE" && test -n "$MLX_DATA" && test -n "$MLX_OUTPUT" && test -n "$MLX_GATE"
