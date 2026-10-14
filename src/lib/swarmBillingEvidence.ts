@@ -120,7 +120,17 @@ export async function synchronizeOfficialBilling():Promise<void>{
    const path=await join(root,'swarm-billing-'+provider+'-latest.json');
    const raw=await readTextFile(path);
    if(raw.length>16000)throw Error('Official provider receipt too large');
-   const parsed=JSON.parse(raw);
+   const parsed=JSON.parse(raw) as Record<string,unknown>;
+   const {sha256,...unsigned}=parsed;
+   // Node writes sha256 over the exact canonical JSON serialization before
+   // appending the digest. Validate byte integrity on desktop import too.
+   // This is corruption detection; it is NOT a digital signature of the
+   // admin provider or a proof of settled invoice payment.
+   const bytes=new TextEncoder().encode(JSON.stringify(unsigned));
+   const digest=await crypto.subtle.digest('SHA-256',bytes);
+   const actual=Array.from(new Uint8Array(digest)).map(byte=>
+     byte.toString(16).padStart(2,'0')).join('');
+   if(actual!==sha256)throw Error('Corrupted provider admin cost receipt');
    validateProviderBillingEvidence(parsed,provider,scope);
    localStorage.setItem(cacheKey(provider),JSON.stringify(parsed));
   }catch{localStorage.removeItem(cacheKey(provider))}
