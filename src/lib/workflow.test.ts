@@ -822,7 +822,6 @@ describe("runWorkflow / resume (v2)", () => {
     const oldBus=new LiveSwarmBus(ids);
     oldBus.send(ids[0],ids[1],'Review auth.ts before completing');
     oldBus.finishAgent(ids[0]);
-    oldBus.finishAgent(ids[1]);
     const snapshot=oldBus.snapshot();
     // An actual app restart normalizes every running snapshot into an
     // interrupted one before the operator explicitly resumes it.
@@ -840,14 +839,7 @@ describe("runWorkflow / resume (v2)", () => {
     }},true);
     seedSession(persisted);
     expect(persisted[old].status).toBe('error');
-    expect(persisted[old].liveMailbox?.queues[ids[1]]).toHaveLength(0);
-    // To simulate a crash while a recipient was incomplete, restore its
-    // pending inbox from the last durable checkpoint, not terminal cleanup.
-    persisted[old].liveMailbox=structuredClone(snapshot);
-    persisted[old].liveMailbox!.queues[ids[1]]=[{
-      sequence:1,sender:ids[0],recipient:ids[1],kind:'direct',
-      text:'Review auth.ts before completing',
-    }];
+    expect(persisted[old].liveMailbox?.queues[ids[1]]).toHaveLength(1);
     let recovered=false;
     runSubagentTaskMock.mockImplementation(async (params:{toolCallId:string;liveBus:LiveSwarmBus})=>{
       if(params.toolCallId.endsWith('#p0a1')){
