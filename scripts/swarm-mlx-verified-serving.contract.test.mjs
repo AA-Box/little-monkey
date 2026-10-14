@@ -20,11 +20,13 @@ test('MLX supervised deployment requires approved fused training and strict loca
    checkSeconds:60,minAccuracy:0.8,minImprovement:0.05};
   const policy=parseServingPolicy(settings);
   assert.equal(policy.training.fuseForImport,true);
+  assert.equal(policy.backendPort,8766,'trusted outbound MLX backend port must be fixed');
   assert.deepEqual(policy.domains,['security','backend']);
   for(const invalid of [
    {...settings,listenPort:settings.backendPort},
    {...settings,listenPort:80},
    {...settings,backendPort:99999},
+   {...settings,backendPort:8768}, // Reject other loopback services even on valid ports
    {...settings,probePort:settings.listenPort},
    {...settings,domains:['security','security']},
    {...settings,minAccuracy:0.6},
