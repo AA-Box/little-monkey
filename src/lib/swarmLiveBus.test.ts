@@ -76,6 +76,46 @@ describe('live native workflow mailbox', () => {
     expect(bus.observeMutation('a', 'src/auth.ts')).toBe(0);
   });
 
+  it('persists every send before acknowledgment and rehydrates after a process restart', async () => {
+    const snapshots: ReturnType<LiveSwarmBus['snapshot']>[] = [];
+    const bus = new LiveSwarmBus(['old-a','old-b'], '/repo');
+    bus.setPersistence(async snapshot => {
+      snapshots.push(structuredClone(snapshot));
+    });
+    expect(await bus.sendDurable('old-a','old-b','Read auth.ts')).toBe(1);
+    await bus.observeReadDurable('old-b','src/auth.ts');
+    await bus.observeMutationDurable('old-a','/repo/src/auth.ts');
+    expect(snapshots).toHaveLength(3);
+    const restarted = new LiveSwarmBus(['new-a','new-b'], '/repo');
+    restarted.restore(snapshots[2], ['old-a','old-b']);
+    expect(await restarted.receiveDurable('new-b')).toMatchObject([
+      {sender:'new-a',recipient:'new-b',kind:'direct'},
+      {sender:'new-a',recipient:'new-b',kind:'file_changed'},
+    ]);
+  });
+
+  it('rolls back messages if the durability barrier fails, never acknowledging uncommitted delivery', async () => {
+    const bus = new LiveSwarmBus(['a','b']);
+    bus.setPersistence(async () => { throw new Error('disk full'); });
+    await expect(bus.sendDurable('a','b','hello')).rejects.toThrow(/persistence failed/);
+    expect(bus.statistics()).toMatchObject({directDeliveries:0,pending:0});
+    expect(bus.receive('b')).toEqual([]);
+    const snapshot = bus.snapshot();
+    expect(() => new LiveSwarmBus(['other','ids']).restore(snapshot)).toThrow(/snapshot/);
+  });
+
+  it('reopens only selected participants for explicit recovery without replaying completed agents', async()=>{
+    const old = new LiveSwarmBus(['a','b']);
+    old.finishAgent('a');
+    expect(() => old.send('b','*','no remaining recipients')).toThrow(/Recipient/);
+    const next = new LiveSwarmBus(['a2','b2']);
+    next.restore(old.snapshot(), ['a','b']);
+    expect(next.listMembers('b2')).toEqual([]);
+    next.reopenAgent('a2');
+    expect(await next.sendDurable('b2','a2','Please finish verification')).toBe(1);
+    expect(next.receive('a2')).toHaveLength(1);
+  });
+
   it('rejects oversized/duplicate participant sets', () => {
     expect(() => new LiveSwarmBus(['a', 'a'])).toThrow(/distinct/);
     expect(() => new LiveSwarmBus(Array.from({ length: 17 }, (_, i) => String(i)))).toThrow(/1–16/);
