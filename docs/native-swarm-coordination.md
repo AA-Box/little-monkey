@@ -715,3 +715,127 @@ globally synchronized telemetry retention, independent deployed-model grade
 collection, or statistically controlled production quality/cost A/B trials.
 Those require separate physical acceptance and instrumentation. No live
 two-device results are asserted by repository unit tests.
+
+
+## Continuous independent quality, arbitrary peer inference telemetry and official provider costs
+
+This optional, opt-in pipeline extends the original resident-DAG v3 metering
+into the **ordinary peer task** and **remote node placement** pathways.
+The receiving installation's existing permitted, pinned-TLS/HMAC peer
+channel now carries a small `model_metering` object when it can verify an
+actual canonical run from its very first hash-chained event through its
+terminal outcome. It includes a frozen target identifier, measured prompt,
+completion and cached tokens, model calls, elapsed time, optional runtime
+metered cost, outcome and its original run ID. A remote result with no verified
+source usage remains **unmetered**. The requesting installation persists
+strictly bounded observations keyed by its already-authorized outbound
+`(peer alias,message ID)`; changed/replayed/fabricated receipts, invalid
+identities, unbounded values and foreign threads fail closed. A receipt can
+report execution metering **only**: it never proves answer accuracy, billing
+settlement, or permission to execute new remote work.
+
+### Actual unattended answer-quality verification
+
+The existing source-tested real-model harness is the independent oracle;
+it verifies changes in disposable Git repositories by executing deterministic
+tests, not by asking a model to say whether its own answer is correct.
+
+On an operator-owned machine with installed `monkey`, preapproved
+configured model targets, and access to the same app-data folder as the
+desktop installation:
+
+```bash
+node scripts/swarm-continuous-quality.mjs \
+  --targets "ollama:MODEL_A,ollama:MODEL_B" \
+  --output "/ABSOLUTE/APPDATA/swarm-quality-latest.json"
+```
+
+It runs three independent iterations of each regression fixture per target,
+rebuilds the grades from individual model runs, checks unique run identities
+and measured durations, rejects incomplete/duplicate reports, and records
+`verified` or `regression_blocked`. Any missing or failed evaluation
+**overwrites** the previous green receipt with a blocked receipt. The result
+expires after **36 hours**. In Settings → Agent swarms, enable
+**unattended independent quality monitoring** only after arranging the
+operator-controlled runner; the desktop imports the current evidence on boot,
+once per minute and on focus. Missing, invalid, stale, and failed runs revoke
+automatic quality eligibility; normal chat/model settings and manual
+permission policies remain unchanged. Explicit model pins and eligibility
+restrictions are never bypassed.
+
+This is **continuously refreshed independent fixture correctness**, not
+independently labeled correctness for every open-ended production response.
+There is no credible general oracle for arbitrary natural-language quality;
+deployments must continue to label those responses as ungraded.
+
+### Official provider-reported cost reconciliation
+
+The operator-controlled reader makes **real read-only admin** API requests
+to the fixed endpoints for OpenAI organization costs and Anthropic organization
+cost reports. It obtains its admin API key from `OPENAI_ADMIN_KEY` or
+`ANTHROPIC_ADMIN_KEY` environment variables, never from a prompt, peer,
+model, browser setting, CLI argument or Git repository file. It validates all
+complete UTC daily buckets, pagination, currencies, totals and provider
+identities and atomically writes a tightly bounded redacted receipt. Anthropic
+costs are reported in decimal **cents**, OpenAI values in **dollars**; both
+are normalized to integer micro-USD. Anthropic workspace grouping is
+performed with `group_by[]=workspace_id` and strict per-line filters, not
+the unsupported `workspace_ids[]` query.
+
+```bash
+# Previous complete UTC month; repeat after each month's cost report is final.
+node scripts/swarm-provider-billing.mjs \
+  --provider openai --month YYYY-MM --scope-id OPENAI_API_KEY_ID \
+  --ledger "/ABSOLUTE/APPDATA/swarm-cost-ledger-openai.json" \
+  --output "/ABSOLUTE/APPDATA/swarm-billing-openai-latest.json" \
+  --require-reconciled
+
+node scripts/swarm-provider-billing.mjs \
+  --provider anthropic --month YYYY-MM --scope-id ANTHROPIC_WORKSPACE_ID \
+  --ledger "/ABSOLUTE/APPDATA/swarm-cost-ledger-anthropic.json" \
+  --output "/ABSOLUTE/APPDATA/swarm-billing-anthropic-latest.json" \
+  --require-reconciled
+```
+
+The desktop exports only redacted local per-model token/estimated-cost
+records to those fixed ledger files. In Settings, enroll the corresponding
+**non-secret provider API key ID / workspace ID** and opt into **official
+provider-admin cost reconciliation** to require an exactly scoped, final
+last-month report with complete priced calls and <=5% variance before the
+cost optimizer changes a model route. Absent/mismatched/newly expired evidence
+blocks **price-driven switching**, not the existing user's ordinary model
+executions. Unknown providers are blocked under this optional gate. Costs
+reported by provider APIs still may omit credits, taxes, external charges,
+other platforms or discounted invoice amounts. Model-call attribution to an
+API key/workspace is currently **operator asserted**, not cryptographically
+inferred by the model runtime; an operator must dedicate the configured
+provider key/workspace to this installation before treating an exact-scope
+comparison as meaningful.
+
+### Scheduled proof, CI and deployment limits
+
+`.github/workflows/swarm-continuous-evidence.yml` runs parser/negative
+contracts on an ordinary runner; actual paid benchmark and provider admin
+queries run **only** when the repository's
+`LM_SWARM_CONTINUOUS_ENABLED=true` variable is explicitly configured
+and a trusted `[self-hosted, swarm-acceptance, swarm-node-a]` runner is
+installed. Configure `LM_SWARM_CONTINUOUS_TARGETS`,
+`LM_SWARM_QUALITY_OUTPUT`, `LM_SWARM_OPENAI_LEDGER`,
+`LM_SWARM_OPENAI_BILLING_OUTPUT`, `LM_SWARM_OPENAI_API_KEY_ID`,
+`LM_SWARM_ANTHROPIC_LEDGER`, `LM_SWARM_ANTHROPIC_BILLING_OUTPUT`,
+`LM_SWARM_ANTHROPIC_WORKSPACE_ID` with actual operator-approved
+absolute paths/scope IDs; store admin keys only in GitHub Actions secrets
+`OPENAI_ADMIN_KEY` and `ANTHROPIC_ADMIN_KEY`. Ensure the runner sees
+the **same installed user's app data directory**; writing to a CI-only
+workspace does not update a desktop. Disable the workflow opt-in to stop
+unattended real calls. Run
+`pnpm test:swarm-continuous:contract` for independent negative tests.
+
+Passing mock contracts or merely defining a scheduled workflow is never
+proof of a paid real-provider query, a physically independent peer, or
+real-model test success. The following evidence still needs an actual
+operator-run acceptance artifact before claiming production certification:
+a full external CLI model grading run, an authorized independent-machine
+peer request/placement with measurable inference and persisted replay
+protection, and a genuine admin-cost readback for each chosen provider and
+an exactly scoped ledger. No credentials or invoices are synthesized.
