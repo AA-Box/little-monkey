@@ -733,9 +733,12 @@ export async function runWorkflow(params: RunWorkflowParams): Promise<string> {
             onMutatedPath,
             onMutationFailure,
           });
-          if (liveBus) await liveBus.finishAgentDurable(agentTaskId);
           const cancelled = unwrapUntrustedContent(raw) === CANCELLED_TOOL_RESULT;
           const failed = !cancelled && resultIsError(raw);
+          if (liveBus) {
+            if (cancelled || failed) await liveBus.suspendAgentDurable(agentTaskId);
+            else await liveBus.finishAgentDurable(agentTaskId);
+          }
           agentResults[agentTaskId] = {
             promptHash: hash,
             status: cancelled ? 'cancelled' : failed ? 'error' : 'done',
