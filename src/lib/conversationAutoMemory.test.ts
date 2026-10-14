@@ -43,7 +43,9 @@ describe('automatic ordinary conversation memory',()=>{
       expectedWorkspace:'/projects/app',
     });
     expect(model).toHaveBeenCalledTimes(1);
-    expect(JSON.stringify(memoryExtractionMessages(user,[]))).not.toContain('tool');
+    const wire = memoryExtractionMessages(user, []);
+    expect(wire).toHaveLength(2);
+    expect(wire[1].content).toContain(user);
   });
 
   it('consolidates a clear correction but never overwrites pinned or user memories',async()=>{
