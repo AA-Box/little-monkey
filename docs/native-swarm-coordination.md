@@ -657,3 +657,72 @@ model success is scored as correctness.
 The contract test uses an explicitly separate mock CLI executable and
 **does not establish real-model performance**. This harness does not
 measure CPU utilization, PSS, or establish a JCode performance comparison. It samples the installed daemon's PID and descendant process-tree resident RSS when available, recording a per-tier baseline, peak and growth. Shared pages may be counted twice; missing daemon/sampling permissions produce explicit null metrics instead of fabricated memory values.
+
+
+## Live dynamic agent delegation and direct team mail
+
+Desktop subagents can use the native `agent_spawn`, `agent_send`,
+`agent_inbox` and `agent_join` model tools while running. These are
+available only inside the live agent loop; a model cannot inject arbitrary
+tools or skip normal permissions. Turn on **Subagents** before using them.
+
+- `agent_spawn({description,prompt,profile})` creates a live child with
+  its own unique task id, model loop and process entry. The parent continues
+  working while the child executes. A child can delegate further.
+- `agent_inbox({after})` returns active peers and bounded messages to the
+  caller only. `agent_send({to,text})` delivers a message to an active
+  member within the same session/run team, and it enters that agent's next
+  model iteration as JSON-quoted, explicitly untrusted evidence.
+- `agent_join({id})` awaits a directly spawned child and reports its
+  final answer. Parent cancellation flows to children; unfinished children
+  are cancelled when their parent finishes.
+
+Runtime-created teams are bounded to depth four, 24 total agents and six
+simultaneously active agents; an explore parent can spawn explore only.
+Code children keep native workspace, checkpoint, permission, routing and
+tool access constraints and never inherit broader capabilities. Nested
+worktree children remain in the parent's already-isolated root.
+There is no unlimited, unmetered agent creation.
+
+The direct-message mailbox is kept in bounded profile-local app storage
+(maximum 100 messages, 2000 characters per message, seven-day retention).
+Messages survive app restart for inspection, but **a currently running
+model cannot resume the same arbitrary in-flight tool call exactly once**.
+The runtime registry only marks active processes during that process's
+lifetime. These desktop tools do not claim native cross-host live delivery.
+
+## Adaptive cross-session ambient agents
+
+Unlike fixed-cadence `swarm-worker-install`, adaptive ambient runs are
+owned by the daemon's normal tick and examine the profile's durable
+completed run ledger across prior sessions, including after daemon restart.
+They produce analysis proposals only, not unattended implementation. Run:
+
+```sh
+monkey daemon ensure
+monkey daemon swarm-ambient-install project-scout \
+  --source-recipe /absolute/path/to/review-plan-only-recipe.json \
+  --workspace /absolute/path/to/repository
+monkey daemon swarm-ambient-status
+monkey daemon swarm-ambient-disable project-scout
+```
+
+By default, ambient context contains run IDs, terminal states and timestamps,
+not task titles. To explicitly include up to twelve prior run titles, add
+`--include-history-titles` at install time. The installer refuses that
+flag for non-local model targets to prevent unreviewed transmission of
+previous sessions to an external provider.
+
+The scheduler derives a stable fingerprint from up to twelve previous
+terminal run records. It initially wakes promptly, rechecks after new
+history, uses 15 minutes as its minimum cadence on change and doubles
+its delay on inactivity or failure, capped at 24 hours. It never
+schedules an ambient run solely because its own output appeared in the
+ledger. A frozen plan-only task recipe, immutable run snapshot and
+deterministic job identity ensure crash reconciliation reattaches instead
+of automatically duplicating a possibly-running task.
+
+Ambient observations are source evidence, never a permission grant.
+Existing daemon kill switches, resource admission, queue backpressure
+and model budgets continue to apply. Changes require explicit user
+authorization through normal task controls.
