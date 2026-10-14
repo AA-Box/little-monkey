@@ -104,6 +104,22 @@ describe('live native workflow mailbox', () => {
     expect(() => new LiveSwarmBus(['other','ids']).restore(snapshot)).toThrow(/snapshot/);
   });
 
+  it('preserves failed agent inboxes while refusing new sends until explicit recovery', async()=>{
+    const bus=new LiveSwarmBus(['a','b']);
+    bus.send('a','b','unprocessed instruction');
+    await bus.suspendAgentDurable('b');
+    expect(() => bus.send('a','b','should be blocked')).toThrow(/Recipient/);
+    expect(bus.snapshot().queues.b).toHaveLength(1);
+    const reloaded=new LiveSwarmBus(['a-new','b-new']);
+    reloaded.restore(bus.snapshot(),['a','b']);
+    reloaded.reopenAgent('b-new');
+    expect(reloaded.peek('b-new')).toMatchObject([{
+      sender:'a-new',recipient:'b-new',text:'unprocessed instruction',
+    }]);
+    expect(await reloaded.acknowledgeDurable('b-new',[1])).toBe(1);
+    expect(reloaded.peek('b-new')).toEqual([]);
+  });
+
   it('reopens only selected participants for explicit recovery without replaying completed agents', async()=>{
     const old = new LiveSwarmBus(['a','b']);
     old.finishAgent('a');
