@@ -34,13 +34,13 @@ fn policies(store:&DaemonStore)->Result<Vec<Policy>,String>{
         "SELECT id,frozen_recipe,include_titles,epoch,last_fingerprint,pending_job,
             interval_ms,next_wake_ms FROM swarm_ambient_policies WHERE enabled=1 ORDER BY id LIMIT 8"
     ).map_err(|e|e.to_string())?;
-    stmt.query_map([],|r|Ok(Policy{
+    let mapped=stmt.query_map([],|r|Ok(Policy{
         id:r.get(0)?,recipe:r.get(1)?,include_titles:r.get::<_,i64>(2)?!=0,
         epoch:r.get::<_,i64>(3)? as u64,fingerprint:r.get(4)?,
         pending_job:r.get(5)?,interval_ms:r.get::<_,i64>(6)? as u64,
         next_wake_ms:r.get::<_,i64>(7)? as u64,
-    })).map_err(|e|e.to_string())?
-    .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
+    })).map_err(|e|e.to_string())?;
+    mapped.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
 }
 pub fn install(paths:&DaemonPaths,id:&str,source:&Path,workspace:&Path,
     include_titles:bool)->Result<serde_json::Value,String>{
@@ -97,7 +97,7 @@ pub fn install(paths:&DaemonPaths,id:&str,source:&Path,workspace:&Path,
         "INSERT INTO swarm_ambient_policies
          (id,frozen_recipe,enabled,include_titles,epoch,last_fingerprint,pending_job,interval_ms,next_wake_ms)
          VALUES(?1,?2,1,?3,0,'',NULL,?4,0)",
-        params![id,destination.to_string_lossy().to_string(),i64::from(include_titles),MIN_MS as i64],
+        params![id,destination.to_string_lossy().to_string(),if include_titles {1_i64}else{0_i64},MIN_MS as i64],
     ){
         let _=fs::remove_file(destination);
         return Err(error.to_string());
