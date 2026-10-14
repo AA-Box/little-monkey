@@ -120,8 +120,7 @@ where F: FnOnce(String) -> Result<String, String> {
 /// Common credential publication for desktop, local CLI, and headless CLI.
 /// Existing keys are not touched before a successful HTTPS code exchange.
 async fn exchange_and_store(code: &str, verifier: &str) -> Result<(), String> {
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
+    let response = crate::egress::hardened()
         .build()
         .map_err(|e| format!("Failed to create OpenRouter OAuth client: {e}"))?
         .post(EXCHANGE_ENDPOINT)
