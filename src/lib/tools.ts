@@ -735,6 +735,33 @@ function workflowGraphTaskSchema(depth: number): Record<string, unknown> {
 /** Tools are only offered to agents explicitly enrolled in a live local
  * workflow. Dispatch is bound to the validated run-scoped mailbox; no peer
  * transport, filesystem, network, or tool permission is acquired here. */
+/** Session-to-session messages are NOT native swarm messages: these are
+ * explicitly opt-in, desktop-only, file-backed, same-workspace notices. */
+export const SESSION_PEERS_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'session_list_peers',
+    description: 'List OTHER local desktop chat sessions available for opt-in same-workspace messaging. Never includes sessions from another workspace.',
+    parameters: {type:'object',properties:{},additionalProperties:false},
+  },
+};
+export const SESSION_SEND_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'session_send_message',
+    description: 'Send a bounded untrusted notice to a peer desktop chat session in the same workspace. Persists before acknowledging. It never wakes/resumes the recipient, grants tools, or reaches remote peers.',
+    parameters: {
+      type:'object',
+      properties:{
+        recipient_session_id:{type:'string',description:'Exact session ID returned by session_list_peers.'},
+        text:{type:'string',description:'Message text, max 1600 characters. No secrets.'},
+      },
+      required:['recipient_session_id','text'],
+      additionalProperties:false,
+    },
+  },
+};
+
 export const SWARM_SEND_MESSAGE_TOOL: ToolDef = {
   type: 'function',
   function: {
