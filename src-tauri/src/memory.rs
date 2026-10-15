@@ -820,7 +820,7 @@ pub fn garden_exact_agent_duplicates_impl(path: &Path, root: &str) -> Result<usi
     for fact in &project.facts {
         if fact.source != "agent" || fact.pinned || !fact.enabled ||
            fact.retired_at.is_some() || fact.expires_at.is_some() ||
-           !fact.merged_from.is_empty() || !fact.text.trim().len().gt(&0) {
+           !fact.merged_from.is_empty() || fact.text.trim().is_empty() {
             continue;
         }
         // Strict byte-for-byte equality after harmless outer whitespace
@@ -848,6 +848,74 @@ pub fn garden_exact_agent_duplicates_impl(path: &Path, root: &str) -> Result<usi
     }
     if merged > 0 {save_impl(path, &data)?;}
     Ok(merged)
+}
+
+#[cfg(test)]
+mod ambient_exact_garden_tests {
+    use super::*;
+
+    fn fact(id: &str, text: &str, source: &str, pinned: bool) -> Fact {
+        Fact {
+            id: id.to_owned(), text: text.to_owned(), source: source.to_owned(),
+            created_at: now_rfc3339(), enabled: true, source_turn_id: None,
+            pinned, expires_at: None, last_used_at: None,
+            merged_from: Vec::new(), merged_into: None, retired_at: None,
+        }
+    }
+
+    #[test]
+    fn reversible_garden_is_scoped_agent_only_and_idempotent() {
+        let folder=std::env::temp_dir().join(format!(
+            "little-monkey-ambient-garden-{}",uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path=folder.join("memories.json");
+        let scope="/workspace/one";
+        let mut file=MemoriesFile::default();
+        let mut project=ProjectMemory::default();
+        project.facts.push(fact("a","Use Cargo test","agent",false));
+        project.facts.push(fact("b","Use Cargo test","agent",false));
+        project.facts.push(fact("pin","Use Cargo test","agent",true));
+        project.facts.push(fact("human","Use Cargo test","user",false));
+        project.facts.push(fact("different","USE cargo test","agent",false));
+        file.projects.insert(scope.to_owned(),project);
+        file.projects.insert("/workspace/another".to_owned(),ProjectMemory {
+            facts: vec![fact("third","Use Cargo test","agent",false)],
+        });
+        save_impl(&path,&file).unwrap();
+
+        assert_eq!(garden_exact_agent_duplicates_impl(&path,scope).unwrap(),1);
+        assert_eq!(garden_exact_agent_duplicates_impl(&path,scope).unwrap(),0);
+        let actual=load_impl(&path).unwrap();
+        let entries=&actual.projects[scope].facts;
+        let survivor=entries.iter().find(|f|f.merged_from.len()==2).unwrap();
+        assert_eq!(survivor.text,"Use Cargo test");
+        assert_eq!(survivor.source,"agent");
+        assert_eq!(survivor.merged_from,vec!["a","b"]);
+        assert!(entries.iter().find(|f|f.id=="a").unwrap().retired_at.is_some());
+        assert!(entries.iter().find(|f|f.id=="b").unwrap().retired_at.is_some());
+        assert!(entries.iter().find(|f|f.id=="pin").unwrap().retired_at.is_none());
+        assert!(entries.iter().find(|f|f.id=="human").unwrap().retired_at.is_none());
+        assert!(entries.iter().find(|f|f.id=="different").unwrap().retired_at.is_none());
+        assert_eq!(actual.projects["/workspace/another"].facts.len(),1);
+        assert_eq!(unmerge_impl(&path,scope,&survivor.id).unwrap(),2);
+        let restored=load_impl(&path).unwrap();
+        assert!(restored.projects[scope].facts.iter()
+            .find(|f|f.id=="a").unwrap().retired_at.is_none());
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn empty_scope_and_expiring_facts_do_not_change_store() {
+        let folder=std::env::temp_dir().join(format!(
+            "little-monkey-ambient-empty-{}",uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path=folder.join("memories.json");
+        assert_eq!(garden_exact_agent_duplicates_impl(&path,"/missing").unwrap(),0);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(folder).unwrap();
+    }
 }
 
 /// Core merge logic behind `memory_studio_merge`: combine two or more facts
