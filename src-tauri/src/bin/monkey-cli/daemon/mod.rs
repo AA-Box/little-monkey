@@ -195,6 +195,9 @@ pub enum DaemonCmd {
         #[arg(long)] workspace: PathBuf,
         /// Opt-in to including bounded previous task titles in LOCAL model context.
         #[arg(long)] include_history_titles: bool,
+        /// Explicit opt-in to reversible exact-duplicate housekeeping for
+        /// agent-authored memories in this canonical workspace only.
+        #[arg(long)] garden_agent_memories: bool,
     },
     /// List adaptive ambient policies and next due times.
     SwarmAmbientStatus,
@@ -674,10 +677,11 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
             Ok(())
         },
         DaemonCmd::SwarmAmbientInstall {
-            id,source_recipe,workspace,include_history_titles,
+            id,source_recipe,workspace,include_history_titles,garden_agent_memories,
         } => {
             let paths=DaemonPaths::resolve()?;
-            println!("{}",swarm_ambient::install(&paths,id,source_recipe,workspace,*include_history_titles)?);
+            println!("{}",swarm_ambient::install(&paths,id,source_recipe,workspace,
+                *include_history_titles,*garden_agent_memories)?);
             Ok(())
         },
         DaemonCmd::SwarmAmbientStatus => {
