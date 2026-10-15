@@ -1304,7 +1304,7 @@ describe('dynamic runtime agent spawning and live mailbox integration',()=>{
         return {content:'',toolCalls:[{id:'join-1',type:'function',function:{name:'agent_join',
           arguments:JSON.stringify({id:reply.id})}}],streamError:null,contentStarted:true};
       }
-      expect(String(toolReplies.at(-1)?.content)).toContain('auth helper checked');
+      expect(String(toolReplies[toolReplies.length - 1]?.content)).toContain('auth helper checked');
       return {content:'parent verified child result',toolCalls:[],streamError:null,contentStarted:true};
     });
     const report=await runSubagentTask(baseParams({sessionId:session,taskId:'parent-'+session,profile:'explore'}));
