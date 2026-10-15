@@ -373,6 +373,14 @@ const CLASSIFIED_CLI: &[(&str, Class, &str)] = &[
         "re-execs this binary to attach a terminal session",
     ),
     (
+        "providers_cli.rs",
+        Class::HostUtility,
+        "interactive OpenRouter PKCE sign-in only: launches the OS browser with a \
+         trusted https://openrouter.ai/auth URL assembled by provider_oauth; \
+         the executable is the fixed macOS 'open' or Linux 'xdg-open' helper, \
+         not a model/user-authored shell command. Does not launch an agent task",
+    ),
+    (
         "cmds.rs",
         Class::HostUtility,
         "top-level command dispatch helpers with fixed arguments",
