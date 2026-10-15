@@ -2,7 +2,10 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the main window and secondary session windows opened via the session menu's \"Open in > Split view/New window\" (see system::open_session_window)",
-  "windows": ["main", "session-*"],
+  "windows": [
+    "main",
+    "session-*"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
@@ -15,11 +18,47 @@
     "process:allow-restart",
     {
       "identifier": "fs:allow-write-text-file",
-      "allow": [{ "path": "$TEMP/**" }]
+      "allow": [
+        {
+          "path": "$TEMP/**"
+        }
+      ]
     },
     {
       "identifier": "opener:allow-open-path",
-      "allow": [{ "path": "$TEMP/**" }]
+      "allow": [
+        {
+          "path": "$TEMP/**"
+        }
+      ]
+    },
+    {
+      "identifier": "fs:allow-read-text-file",
+      "allow": [
+        {
+          "path": "$APPDATA/swarm-quality-latest.json"
+        },
+        {
+          "path": "$APPDATA/swarm-provider-billing-latest.json"
+        },
+        {
+          "path": "$APPDATA/swarm-billing-openai-latest.json"
+        },
+        {
+          "path": "$APPDATA/swarm-billing-anthropic-latest.json"
+        }
+      ]
+    },
+    {
+      "identifier": "fs:allow-write-text-file",
+      "allow": [
+        {
+          "path": "$APPDATA/swarm-cost-ledger-openai.json"
+        },
+        {
+          "path": "$APPDATA/swarm-cost-ledger-anthropic.json"
+        }
+      ]
     }
   ]
 }

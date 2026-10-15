@@ -8,6 +8,7 @@ import "./index.css";
 import { applyAppearance, subscribeToSystemTheme } from "./lib/theme";
 import { resolveAppearanceSettings } from "./lib/appearanceProfiles";
 import { startExtensionMarketplaceUpdateCoordinator } from "./lib/extensionMarketplaceUpdateCoordinator";
+
 import { useSettingsStore } from "./store/settingsStore";
 import { primaryRoot, useWorkspaceStore } from "./store/workspaceStore";
 import { hydrateSessions, useSessionStore } from "./store/sessionStore";
@@ -122,6 +123,20 @@ if (isCompanionOverlay) {
   // coordinator; secondary session windows load this entry point too.
   if (getCurrentWindow().label === "main") {
     startExtensionMarketplaceUpdateCoordinator();
+    // Operator-opted independent quality evidence is refreshed whether
+    // Settings is open or not. Stale or failed receipts revoke auto-routing.
+    // Readers run in the main-window lifecycle but are not a dependency of
+    // the first paint. Loading them asynchronously avoids retaining their
+    // ledger/quality implementation in the entry bundle.
+    void Promise.all([
+      import("./lib/swarmContinuousEvidence"),
+      import("./lib/swarmBillingEvidence"),
+    ]).then(([quality, billing]) => {
+      quality.startContinuousSwarmQualityReader();
+      billing.startSwarmBillingLedgerAndReceiptReader();
+    }).catch((error: unknown) => {
+      console.error("Failed to initialize swarm quality/billing readers", error);
+    });
   }
 
   // Top-level boundary: without it a render error anywhere unmounts the

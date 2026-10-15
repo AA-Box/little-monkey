@@ -518,6 +518,7 @@ across host SQLite databases; previously completed remote model computation
 may be repeated after failover. No automatic cluster membership changes,
 Raft/BFT replicated logs or exactly-once external side effects are claimed.
 
+
 ### Durable local read-only task reassignment
 
 For an operator-enrolled clustered graph, a *terminally failed* primary
@@ -780,3 +781,237 @@ Ambient observations are source evidence, never a permission grant.
 Existing daemon kill switches, resource admission, queue backpressure
 and model budgets continue to apply. Changes require explicit user
 authorization through normal task controls.
+
+## Cross-host resident DAG telemetry (v2 DAG transitions, v3 metered inference)
+
+Leader-owned resident graphs now publish up to 48 original SQLite
+`resident_swarm_events` transitions with each monotonic v2 signed checkpoint.
+Each transition includes its author-local event cursor, graph/node scope, event
+kind, state and original timestamp. The full v2 payload is checksummed, carried
+over existing operator-enrolled pinned-TLS/HMAC peer transport, persisted on
+the receiving host and checked by a second signed GET of the receiver's durable
+copy. v1 peers are still readable, but report only checkpoint snapshots and
+cannot claim historical spans. No prompts, arbitrary tool text, agent reports,
+workspace paths or secrets enter these events. The receiver must never use
+remote success states as permission to execute or model-answer verification.
+
+When a resident node completes its actual local daemon run, the native
+publisher opens its canonical run ledger and requires a fully intact
+hash chain from sequence 1 through the terminal `Completed` event. An eligible
+v3 checkpoint includes redacted original-host metering by node: frozen model
+target ID, prompt/output/cache tokens, completed model-call count, task wall
+time and optional ledger `cost_micros`. Snapshots are versioned and the entire
+metering array is included in the v3 SHA-256 checksum, then delivered using
+the same authenticated sender identity, enrolled cluster roster, persistent
+receiver and exact signed TLS readback. v1/v2 remain readable; neither gains
+invented token counts. Runs without verifiable usage are not converted into
+fabricated measurements. Each record is a local metering claim with an intact
+origin chain, not an independently checked billing invoice, proof of output
+correctness or universal tracing of unrelated peer task traffic.
+
+The UI's combined trace orders local durable transitions and remote original
+event timestamps. It separates signed peer evidence from local journal events,
+labels legacy snapshot-only senders, rejects malformed journal cursors and
+explicitly marks all remote success claims as **unverified execution**.
+
+### Physical two-machine acceptance
+
+Install the reviewed revision on two independently running machines. Pair them,
+enroll their pinned identities in the same cluster, permit only the documented
+task/state replication capabilities, and stage a read-only resident DAG with at
+least one actual node transition on leader A.
+
+On **leader A**:
+
+```bash
+pnpm test:swarm-telemetry:contract
+pnpm test:swarm-telemetry:live -- --stage publish --group GROUP --graph GRAPH \
+  --peer RECEIVER_ALIAS --confirm-independent-installed-peers
+```
+
+On **receiver B** (use A's *actual* enrolled SHA-256 certificate fingerprint):
+
+```bash
+pnpm test:swarm-telemetry:live -- --stage verify --group GROUP --graph GRAPH \
+  --source-fingerprint SOURCE_A_FINGERPRINT --confirm-independent-installed-peers
+```
+
+To require real metered model calls rather than only state transitions,
+complete at least one real resident DAG node under the reviewed model, then run
+the receiver command with `--require-model-usage`:
+
+```bash
+pnpm test:swarm-telemetry:live -- --stage verify --group GROUP --graph GRAPH \
+  --source-fingerprint SOURCE_A_FINGERPRINT --require-model-usage \
+  --confirm-independent-installed-peers
+```
+
+The operator-run GitHub workflow now also accepts `source_fingerprint`. With
+`replica_graph_id` and `cluster_group`, it publishes from one enrolled
+self-hosted runner and starts a **separate runner job** on the opposite
+`swarm-node-a`/`swarm-node-b` runner label, refusing completion without
+real verified original-host model usage. This must actually execute on two
+independently installed and paired devices; defining a workflow is not proof.
+
+The publish phase must pass an independent signed SQLite readback on B;
+verify runs on B itself, confirming source identity, a fresh v2 checkpoint,
+chronological original events and a real node state transition. Repeat with
+the two machines' roles swapped and archive separate command outputs before
+claiming physical two-way acceptance. A single machine, mocked loopback peer
+or passing contract suite is not that evidence. Absence of a real peer, stale
+events, or missing runtime commands must fail the live script.
+
+### Event-driven real-run cost optimization
+
+Imported live-model quality reports are now stored with their original
+per-run source fixture outcomes and re-graded at every routing decision.
+Score-only legacy caches and edited rankings are invalidated rather than
+trusted as new correctness evidence. Reports still require a real operator
+benchmark execution and import; a manually forged run ID alone is not a
+cryptographic attestation.
+
+Cost routing remains off by default and requires the existing independent
+real-model fixture grades, explicit model rates and *observed* workload tokens.
+It now also consumes real resolved subagent terminal events (success/failure and
+wall-clock elapsed time), retained locally for 14 days, never peer assertions.
+Six baseline task outcomes are required before replacing any traffic.
+An equivalently graded cheaper candidate receives a 10% canary until it has
+six actual outcomes, then a 30% ramp until 12, then full routing only while
+the live circuit breaker permits it. A material excess failure rate, two of
+three recent errors, or a measured severe p90 latency regression blocks new
+cost-driven selection immediately. Each dispatch re-evaluates the gate from
+durable observations. The regular policy eligibility, explicit pins, privacy
+firewall, independent fixture-quality requirements and operator opt-in remain
+authoritative.
+
+**Scope:** Task terminal success is *not* objective answer quality. Token-rate
+savings are forecasts, not audited provider bills. This implementation does
+not assert complete model-level traces across arbitrary remote peer-task calls,
+globally synchronized telemetry retention, independent deployed-model grade
+collection, or statistically controlled production quality/cost A/B trials.
+Those require separate physical acceptance and instrumentation. No live
+two-device results are asserted by repository unit tests.
+
+
+## Continuous independent quality, arbitrary peer inference telemetry and official provider costs
+
+This optional, opt-in pipeline extends the original resident-DAG v3 metering
+into the **ordinary peer task** and **remote node placement** pathways.
+The receiving installation's existing permitted, pinned-TLS/HMAC peer
+channel now carries a small `model_metering` object when it can verify an
+actual canonical run from its very first hash-chained event through its
+terminal outcome. It includes a frozen target identifier, measured prompt,
+completion and cached tokens, model calls, elapsed time, optional runtime
+metered cost, outcome and its original run ID. A remote result with no verified
+source usage remains **unmetered**. The requesting installation persists
+strictly bounded observations keyed by its already-authorized outbound
+`(peer alias,message ID)`; changed/replayed/fabricated receipts, invalid
+identities, unbounded values and foreign threads fail closed. A receipt can
+report execution metering **only**: it never proves answer accuracy, billing
+settlement, or permission to execute new remote work.
+
+### Actual unattended answer-quality verification
+
+The existing source-tested real-model harness is the independent oracle;
+it verifies changes in disposable Git repositories by executing deterministic
+tests, not by asking a model to say whether its own answer is correct.
+
+On an operator-owned machine with installed `monkey`, preapproved
+configured model targets, and access to the same app-data folder as the
+desktop installation:
+
+```bash
+node scripts/swarm-continuous-quality.mjs \
+  --targets "ollama:MODEL_A,ollama:MODEL_B" \
+  --output "/ABSOLUTE/APPDATA/swarm-quality-latest.json"
+```
+
+It runs three independent iterations of each regression fixture per target,
+rebuilds the grades from individual model runs, checks unique run identities
+and measured durations, rejects incomplete/duplicate reports, and records
+`verified` or `regression_blocked`. Any missing or failed evaluation
+**overwrites** the previous green receipt with a blocked receipt. The result
+expires after **36 hours**. In Settings → Agent swarms, enable
+**unattended independent quality monitoring** only after arranging the
+operator-controlled runner; the desktop imports the current evidence on boot,
+once per minute and on focus. Missing, invalid, stale, and failed runs revoke
+automatic quality eligibility; normal chat/model settings and manual
+permission policies remain unchanged. Explicit model pins and eligibility
+restrictions are never bypassed.
+
+This is **continuously refreshed independent fixture correctness**, not
+independently labeled correctness for every open-ended production response.
+There is no credible general oracle for arbitrary natural-language quality;
+deployments must continue to label those responses as ungraded.
+
+### Official provider-reported cost reconciliation
+
+The operator-controlled reader makes **real read-only admin** API requests
+to the fixed endpoints for OpenAI organization costs and Anthropic organization
+cost reports. It obtains its admin API key from `OPENAI_ADMIN_KEY` or
+`ANTHROPIC_ADMIN_KEY` environment variables, never from a prompt, peer,
+model, browser setting, CLI argument or Git repository file. It validates all
+complete UTC daily buckets, pagination, currencies, totals and provider
+identities and atomically writes a tightly bounded redacted receipt. Anthropic
+costs are reported in decimal **cents**, OpenAI values in **dollars**; both
+are normalized to integer micro-USD. Anthropic workspace grouping is
+performed with `group_by[]=workspace_id` and strict per-line filters, not
+the unsupported `workspace_ids[]` query.
+
+```bash
+# Previous complete UTC month; repeat after each month's cost report is final.
+node scripts/swarm-provider-billing.mjs \
+  --provider openai --month YYYY-MM --scope-id OPENAI_API_KEY_ID \
+  --ledger "/ABSOLUTE/APPDATA/swarm-cost-ledger-openai.json" \
+  --output "/ABSOLUTE/APPDATA/swarm-billing-openai-latest.json" \
+  --require-reconciled
+
+node scripts/swarm-provider-billing.mjs \
+  --provider anthropic --month YYYY-MM --scope-id ANTHROPIC_WORKSPACE_ID \
+  --ledger "/ABSOLUTE/APPDATA/swarm-cost-ledger-anthropic.json" \
+  --output "/ABSOLUTE/APPDATA/swarm-billing-anthropic-latest.json" \
+  --require-reconciled
+```
+
+The desktop exports only redacted local per-model token/estimated-cost
+records to those fixed ledger files. In Settings, enroll the corresponding
+**non-secret provider API key ID / workspace ID** and opt into **official
+provider-admin cost reconciliation** to require an exactly scoped, final
+last-month report with complete priced calls and <=5% variance before the
+cost optimizer changes a model route. Absent/mismatched/newly expired evidence
+blocks **price-driven switching**, not the existing user's ordinary model
+executions. Unknown providers are blocked under this optional gate. Costs
+reported by provider APIs still may omit credits, taxes, external charges,
+other platforms or discounted invoice amounts. Model-call attribution to an
+API key/workspace is currently **operator asserted**, not cryptographically
+inferred by the model runtime; an operator must dedicate the configured
+provider key/workspace to this installation before treating an exact-scope
+comparison as meaningful.
+
+### Scheduled proof, CI and deployment limits
+
+`.github/workflows/swarm-continuous-evidence.yml` runs parser/negative
+contracts on an ordinary runner; actual paid benchmark and provider admin
+queries run **only** when the repository's
+`LM_SWARM_CONTINUOUS_ENABLED=true` variable is explicitly configured
+and a trusted `[self-hosted, swarm-acceptance, swarm-node-a]` runner is
+installed. Configure `LM_SWARM_CONTINUOUS_TARGETS`,
+`LM_SWARM_QUALITY_OUTPUT`, `LM_SWARM_OPENAI_LEDGER`,
+`LM_SWARM_OPENAI_BILLING_OUTPUT`, `LM_SWARM_OPENAI_API_KEY_ID`,
+`LM_SWARM_ANTHROPIC_LEDGER`, `LM_SWARM_ANTHROPIC_BILLING_OUTPUT`,
+`LM_SWARM_ANTHROPIC_WORKSPACE_ID` with actual operator-approved
+absolute paths/scope IDs; store admin keys only in GitHub Actions secrets
+`OPENAI_ADMIN_KEY` and `ANTHROPIC_ADMIN_KEY`. Ensure the runner sees
+the **same installed user's app data directory**; writing to a CI-only
+workspace does not update a desktop. Disable the workflow opt-in to stop
+unattended real calls. Run
+`pnpm test:swarm-continuous:contract` for independent negative tests.
+
+Passing mock contracts or merely defining a scheduled workflow is never
+proof of a paid real-provider query, a physically independent peer, or
+real-model test success. The following evidence still needs an actual
+operator-run acceptance artifact before claiming production certification:
+a full external CLI model grading run, an authorized independent-machine
+peer request/placement with measurable inference and persisted replay
+protection, and a genuine admin-cost readback for each chosen provider and
+an exactly scoped ledger. No credentials or invoices are synthesized.

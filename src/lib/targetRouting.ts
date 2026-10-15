@@ -45,6 +45,7 @@ import { useCostControlStore } from '../store/costControlStore';
 import { useRoutingPolicyStore } from '../store/routingPolicyStore';
 import { rankEligibleSwarmTargets,loadSwarmBenchmark,swarmBenchmarkRoutingEnabled } from './swarmVerifiedBenchmarks';
 import { optimizeSwarmRoutingCosts,swarmCostOptimizationEnabled } from './swarmCostOptimizer';
+import { selectLiveGuardedCostRoute } from './swarmLiveOptimizer';
 
 /** Mirrors `LlamaState::default()` in src-tauri/src/llama.rs. */
 const DEFAULT_LLAMA_PORT = 8090;
@@ -484,17 +485,25 @@ export function routeFromActive(active: ResolvedTarget, context: RoutingContext)
         useCostControlStore.getState().rates,useCostControlStore.getState().entries,
         swarmCostOptimizationEnabled(),policy.preferredTargetKeys)
     : {sequence:ranked,changed:false,estimatedSavingsFraction:null,evidenceSamples:0};
-  const finalOrder=costPlan.sequence;
+  // Completion/failure telemetry is continuously recorded by the real
+  // subagent executor. Gate cost proposals behind a rolling baseline, gradual
+  // canary and automated reliability/latency rollback. Self-reported success
+  // never substitutes for the independently benchmarked correctness gate.
+  const guarded=selectLiveGuardedCostRoute(
+    ranked,costPlan.sequence,costPlan.changed&&swarmCostOptimizationEnabled(),
+  );
+  const finalOrder=guarded.sequence;
   const benchmarkChanged = ranked.length > 1 && ranked[0] !== initial.chosenKey;
-  const decision: RoutingDecision = benchmarkChanged||costPlan.changed ? {
+  const decision: RoutingDecision = benchmarkChanged||guarded.changed ? {
     ...initial,
     chosenKey: finalOrder[0],
     changedFromActive: finalOrder[0] !== activeKey,
     sequence: finalOrder,
     reason: initial.reason +
       (benchmarkChanged ? ' Operator-approved live-model fixture accuracy reordered eligible subagent candidates.' : '') +
-      (costPlan.changed ?
-        ' Opted-in cost optimizer picked an independently fixture-equivalent candidate with configured model prices and observed token mix; predicted token-rate savings '+
+      (guarded.changed ?
+        ' Opted-in cost optimizer chose an independently fixture-equivalent candidate, with '+
+        guarded.phase+' live rollout, observed token mix and configured prices; predicted token-rate savings '+
         Math.round((costPlan.estimatedSavingsFraction??0)*100)+'% (NOT provider billing).' : '') +
       ' Permissions, privacy policy and explicit pins remain authoritative.',
   } : initial;

@@ -282,6 +282,18 @@ function SentHistory({
                 {message.result_text && (
                   <p className="mt-1 whitespace-pre-wrap break-words text-foreground">{message.result_text}</p>
                 )}
+                {message.model_metering?.source==='receiver_verified_run_ledger' && (
+                  <div className="mt-1 break-all text-xs text-muted">
+                    Authenticated source-run metering: {message.model_metering.target_id} · {message.model_metering.status}
+                    {' · '}{message.model_metering.input_tokens.toLocaleString()} input tokens
+                    {' · '}{message.model_metering.output_tokens.toLocaleString()} output tokens
+                    {' · '}{message.model_metering.cached_input_tokens.toLocaleString()} cached tokens
+                    {' · '}{message.model_metering.duration_ms.toLocaleString()} ms
+                    {' · '}{message.model_metering.model_calls} model calls
+                    {' · '}{message.model_metering.cost_micros===null?'cost unavailable':'metered micro-USD '+message.model_metering.cost_micros.toLocaleString()}
+                    {' · '}not independently quality graded or provider-billed
+                  </div>
+                )}
                 {isPending(message) && message.checked_at_ms === null && (
                   <p className="mt-1 text-muted">{t("PeersPanel.sentNeverChecked")}</p>
                 )}
