@@ -26,7 +26,6 @@ const MAX_SESSION_CHARS = 250_000;
 type Row = Record<string, unknown>;
 const object = (x: unknown): Row | null => x && typeof x === 'object' && !Array.isArray(x) ? x as Row : null;
 const str = (x: unknown): string => typeof x === 'string' ? x : '';
-const arr = (x: unknown): unknown[] => Array.isArray(x) ? x : [];
 
 function contentString(value: unknown, toolOutput = false): string {
   const cap = toolOutput ? MAX_TOOL_CHARS : MAX_MESSAGE_CHARS;
