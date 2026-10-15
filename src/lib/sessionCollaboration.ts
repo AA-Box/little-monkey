@@ -1,7 +1,7 @@
 /**
  * Opt-in, scope-bound messaging between ordinary desktop chat sessions.
  *
- * This uses the app's EXISTING encrypted/profile-scoped sessions store
+ * This uses the app's EXISTING profile-scoped sessions store
  * (file-backed when running under Tauri), not an unauthenticated HTTP
  * listener or invented daemon transport. No tool or permission delegation.
  */
