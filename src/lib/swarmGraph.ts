@@ -51,6 +51,39 @@ function asTask(value: unknown): GraphTask {
   };
 }
 
+/**
+ * A nested task tree describes *preapproved* delegation, not model-generated
+ * tool authority. Each parent runs once and must successfully complete before
+ * any children are admitted into the ordinary permission-gated WorkflowSpec.
+ *
+ * No independent child runner exists: the proven workflow journal, approvals,
+ * cancellation and model restrictions still govern every flattened agent.
+ */
+function expandTaskTree(raw: readonly unknown[]): GraphTask[] {
+  const tasks: GraphTask[] = [];
+  const visit = (node: unknown, parent: string | null, depth: number): void => {
+    if (depth > 3) throw new Error('Nested delegation exceeds three levels.');
+    if (!node || typeof node !== 'object' || Array.isArray(node)) {
+      throw new Error('Each nested graph task must be an object.');
+    }
+    const { children, ...fields } = node as Record<string, unknown>;
+    if (children !== undefined && (!Array.isArray(children) || children.length > 6)) {
+      throw new Error('Task children must be an array of at most six agents.');
+    }
+    const task = asTask(fields);
+    if (parent !== null) {
+      if (!task.depends_on.includes(parent)) task.depends_on.push(parent);
+      // A child is explicitly connected to its preapproved parent. A parent
+      // cannot grant permissions, models or tools beyond its own agent spec.
+    }
+    tasks.push(task);
+    if (tasks.length > MAX_TASKS) throw new Error('Task graph cannot exceed 16 agents.');
+    for (const child of (children as unknown[] | undefined) ?? []) visit(child, task.id, depth + 1);
+  };
+  for (const node of raw) visit(node, null, 1);
+  return tasks;
+}
+
 export function compileSwarmTaskGraph(args: Record<string, unknown>): WorkflowSpec {
   const unknown = Object.keys(args).filter(k => !['name', 'description', 'tasks', 'memory_stack_ids', 'resume'].includes(k));
   if (unknown.length) throw new Error('Task graph cannot be combined with ' + unknown.join(', '));
@@ -58,7 +91,7 @@ export function compileSwarmTaskGraph(args: Record<string, unknown>): WorkflowSp
   const description = args.description === undefined ? '' : args.description;
   if (typeof description !== 'string' || description.length > 1200) throw new Error('Invalid task graph description.');
   if (!Array.isArray(args.tasks) || args.tasks.length < 1 || args.tasks.length > MAX_TASKS) throw new Error('Task graph requires 1–16 tasks.');
-  const tasks = args.tasks.map(asTask);
+  const tasks = expandTaskTree(args.tasks);
   const byId = new Map(tasks.map(t => [t.id, t]));
   if (byId.size !== tasks.length) throw new Error('Task ids must be unique.');
   for (const task of tasks) {

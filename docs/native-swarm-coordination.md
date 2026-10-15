@@ -661,6 +661,127 @@ start previously operator-approved read-only resident graph tasks. The
 same bounds, pinned identities and native rejection policies apply
 whether run through the GUI or CLI.
 
+
+## P1 ambient maintenance discovery through the installed daemon
+
+The opt-in `ambient-discovery` worker uses the existing durable native
+swarm-worker trigger to inspect a configured workspace and suggest up to
+five maintenance tasks with source evidence, uncertainty, impact, and
+verification ideas. Nothing is automatically edited or queued from the
+suggestions. The worker inherits the source recipe's preconfigured model,
+workspace, timeout and read-only `plan` permission.
+
+Install a reviewed plan-only JSON task recipe with a working model target:
+
+```sh
+monkey daemon ensure
+monkey daemon swarm-worker-catalog
+monkey daemon swarm-worker-install my-ambient \
+  --role ambient-discovery \
+  --source-recipe /absolute/path/to/plan-only-recipe.json \
+  --workspace /absolute/path/to/repository \
+  --cron "0 */6 * * *"
+```
+
+The daemon freezes the task recipe and applies its existing backpressure,
+kill switch, persisted run ledger and watchdog. Each run is bounded to
+at most 900 seconds and 12 model iterations. Inspect the daemon's run
+history for suggested work, then explicitly authorize any resulting task.
+
+This is proactive, scheduled codebase discovery, **not** automatic
+cross-session semantic memory, resource-adaptive wake scheduling,
+or unattended execution of newly proposed code changes.
+
+## P1 verified headless concurrency benchmarks
+
+```sh
+pnpm test:swarm-headless:contract
+pnpm test:swarm-headless:live -- --target ollama:YOUR_MODEL \
+  --workers 1,2,4 --repetitions 2 --timeout-ms 600000
+```
+
+The live benchmark submits concurrent real installed `monkey task start`
+runs in separate, disposable repositories where an external Node oracle
+is known to fail before intervention. It waits for each model-run task,
+executes the oracle, checks that only the authorized source changed and
+reports each task's elapsed duration plus wall-clock verified throughput.
+A failed run sends a cancellation request; its repository is retained
+for reconciliation if the run might still be active. No self-reported
+model success is scored as correctness.
+
+The contract test uses an explicitly separate mock CLI executable and
+**does not establish real-model performance**. This harness does not
+measure CPU utilization, PSS, or establish a JCode performance comparison. It samples the installed daemon's PID and descendant process-tree resident RSS when available, recording a per-tier baseline, peak and growth. Shared pages may be counted twice; missing daemon/sampling permissions produce explicit null metrics instead of fabricated memory values.
+
+
+## Live dynamic agent delegation and direct team mail
+
+Desktop subagents can use the native `agent_spawn`, `agent_send`,
+`agent_inbox` and `agent_join` model tools while running. These are
+available only inside the live agent loop; a model cannot inject arbitrary
+tools or skip normal permissions. Turn on **Subagents** before using them.
+
+- `agent_spawn({description,prompt,profile})` creates a live child with
+  its own unique task id, model loop and process entry. The parent continues
+  working while the child executes. A child can delegate further.
+- `agent_inbox({after})` returns active peers and bounded messages to the
+  caller only. `agent_send({to,text})` delivers a message to an active
+  member within the same session/run team, and it enters that agent's next
+  model iteration as JSON-quoted, explicitly untrusted evidence.
+- `agent_join({id})` awaits a directly spawned child and reports its
+  final answer. Parent cancellation flows to children; unfinished children
+  are cancelled when their parent finishes.
+
+Runtime-created teams are bounded to depth four, 24 total agents and six
+simultaneously active agents; an explore parent can spawn explore only.
+Code children keep native workspace, checkpoint, permission, routing and
+tool access constraints and never inherit broader capabilities. Nested
+worktree children remain in the parent's already-isolated root.
+There is no unlimited, unmetered agent creation.
+
+The direct-message mailbox is kept in bounded profile-local app storage
+(maximum 100 messages, 2000 characters per message, seven-day retention).
+Messages survive app restart for inspection, but **a currently running
+model cannot resume the same arbitrary in-flight tool call exactly once**.
+The runtime registry only marks active processes during that process's
+lifetime. These desktop tools do not claim native cross-host live delivery.
+
+## Adaptive cross-session ambient agents
+
+Unlike fixed-cadence `swarm-worker-install`, adaptive ambient runs are
+owned by the daemon's normal tick and examine the profile's durable
+completed run ledger across prior sessions, including after daemon restart.
+They produce analysis proposals only, not unattended implementation. Run:
+
+```sh
+monkey daemon ensure
+monkey daemon swarm-ambient-install project-scout \
+  --source-recipe /absolute/path/to/review-plan-only-recipe.json \
+  --workspace /absolute/path/to/repository
+monkey daemon swarm-ambient-status
+monkey daemon swarm-ambient-disable project-scout
+```
+
+By default, ambient context contains run IDs, terminal states and timestamps,
+not task titles. To explicitly include up to twelve prior run titles, add
+`--include-history-titles` at install time. The installer refuses that
+flag for non-local model targets to prevent unreviewed transmission of
+previous sessions to an external provider.
+
+The scheduler derives a stable fingerprint from up to twelve previous
+terminal run records. It initially wakes promptly, rechecks after new
+history, uses 15 minutes as its minimum cadence on change and doubles
+its delay on inactivity or failure, capped at 24 hours. It never
+schedules an ambient run solely because its own output appeared in the
+ledger. A frozen plan-only task recipe, immutable run snapshot and
+deterministic job identity ensure crash reconciliation reattaches instead
+of automatically duplicating a possibly-running task.
+
+Ambient observations are source evidence, never a permission grant.
+Existing daemon kill switches, resource admission, queue backpressure
+and model budgets continue to apply. Changes require explicit user
+authorization through normal task controls.
+
 ## Cross-host resident DAG telemetry (v2 DAG transitions, v3 metered inference)
 
 Leader-owned resident graphs now publish up to 48 original SQLite
