@@ -14,6 +14,9 @@ const productionBuild = {
       manualChunks(id: string) {
         if (!id.includes("node_modules")) return undefined;
         if (/[\\/]node_modules[\\/](react|react-dom|scheduler|zustand)[\\/]/.test(id)) return "react-vendor";
+        // Keep tree-shaken SVG icon components outside the main entry chunk.
+        // Lucide imports React but has no dependency on application modules.
+        if (/[\\/]node_modules[\\/]lucide-react[\\/]/.test(id)) return "icons-vendor";
         if (/[\\/]node_modules[\\/]@tauri-apps[\\/]/.test(id)) return "tauri-vendor";
         if (/[\\/]node_modules[\\/](react-markdown|remark-|rehype-|unified|micromark|mdast-|hast-|unist-)/.test(id)) return "markdown-vendor";
         // Syntax highlighting is only used by the lazy ArtifactPane. Let
