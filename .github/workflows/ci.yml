@@ -52,6 +52,9 @@ jobs:
       - name: Syntax-check live real-model benchmark harness (no model mocks)
         run: pnpm test:swarm-models:syntax
 
+      - name: Contract-check physical OS daemon memory accounting (no model mocks)
+        run: pnpm test:headless-resource:contract
+
       - name: Contract-check real-task concurrency and independent oracle (mock CLI only)
         run: pnpm test:swarm-headless:contract
 
