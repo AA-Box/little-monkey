@@ -101,7 +101,8 @@ pub fn tool_definitions() -> serde_json::Value {
                     "type": "object",
                     "properties": {
                         "pattern": { "type": "string", "description": "Regular expression pattern to search for." },
-                        "path": { "type": "string", "description": "Optional directory or file to scope the search to, relative to the workspace root. Defaults to the whole workspace." }
+                        "path": { "type": "string", "description": "Optional directory or file to scope the search to, relative to the workspace root. Defaults to the whole workspace." },
+                        "structure": { "type": "boolean", "description": "Include bounded lexical declaration hints, declaration line and distance; these are not AST containment proof." }
                     },
                     "required": ["pattern"],
                     "additionalProperties": false
