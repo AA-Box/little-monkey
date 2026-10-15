@@ -307,18 +307,18 @@ mod tests{
             "version":1,"name":"review","target":{"ollama":"qwen2.5:7b"},
             "workspace":ws,"permission_mode":"plan","prompt":"Review history","params":{}
         }).to_string()).unwrap();
-        assert_eq!(install(&paths,"my-review",&recipe,&ws,true).unwrap()["enabled"],true);
+        assert_eq!(install(&paths,"my-review",&recipe,&ws,true,false).unwrap()["enabled"],true);
         let initial_status=status(&paths).unwrap();
         assert_eq!(initial_status["policies"][0]["history_titles"],true);
-        assert!(install(&paths,"my-review",&recipe,&ws,false).is_err());
+        assert!(install(&paths,"my-review",&recipe,&ws,false,false).is_err());
         let provider=root.join("external.json");
         fs::write(&provider,serde_json::json!({
             "version":1,"name":"review","target":{"provider":"openai","model":"gpt-4o"},
             "workspace":ws,"permission_mode":"plan","prompt":"Review history","params":{}
         }).to_string()).unwrap();
-        assert!(install(&paths,"external-history",&provider,&ws,true)
+        assert!(install(&paths,"external-history",&provider,&ws,true,false)
             .unwrap_err().contains("local model"));
-        assert_eq!(install(&paths,"external-metadata",&provider,&ws,false)
+        assert_eq!(install(&paths,"external-metadata",&provider,&ws,false,false)
             .unwrap()["history_titles"],false);
 
         disable(&paths,"my-review").unwrap();
