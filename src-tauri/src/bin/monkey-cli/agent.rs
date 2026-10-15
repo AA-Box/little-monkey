@@ -323,7 +323,7 @@ async fn execute_subagent_tool_call(
             args["path"].as_str(),
         )
         .map(|paths| serde_json::Value::Array(paths.into_iter().map(Into::into).collect())),
-        "grep" => tools_cli::grep(state, args["pattern"].as_str().unwrap_or_default(), args["path"].as_str())
+        "grep" => tools_cli::grep(state, args["pattern"].as_str().unwrap_or_default(), args["path"].as_str(), args["structure"].as_bool().unwrap_or(false))
             .map(serde_json::Value::Array),
         "write_file" if profile.is_code() => tools_cli::write_file(
             state,
@@ -1447,6 +1447,7 @@ async fn execute_tool_call(
             state,
             args["pattern"].as_str().unwrap_or_default(),
             args["path"].as_str(),
+            args["structure"].as_bool().unwrap_or(false),
         )
         .map(serde_json::Value::Array),
         "write_file" => tools_cli::write_file(
