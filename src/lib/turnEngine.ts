@@ -984,6 +984,8 @@ async function executeToolCallInner(
   if (coordination.error) return stringifyToolError(new Error(coordination.error));
 
   if (name === 'session_list_peers' || name === 'session_send_message') {
+    if (usePermissionStore.getState().mode === 'plan')
+      return stringifyToolError(new Error('Session messaging is unavailable in Plan Mode.'));
     if (!chatSessionId || executionContext?.isToolAvailable?.(name) !== true) {
       return stringifyToolError(new Error('Cross-session messages are not offered to this turn.'));
     }
