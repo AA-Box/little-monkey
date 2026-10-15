@@ -277,6 +277,7 @@ interface PersistedShape {
   artifactScriptsEnabled: boolean;
   artifactAutoPreview: boolean;
   subagentsEnabled: boolean;
+  sessionCollaborationEnabled: boolean;
   skillAutoInvokeEnabled: boolean;
   maxConcurrentSubagents: number;
   subagentProfileModels: Partial<Record<'explore' | 'code', SubagentModelOverride>>;
