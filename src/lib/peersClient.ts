@@ -150,6 +150,15 @@ export interface PeerOutboundMessage {
   /** `queued`, `accepted`, `duplicate`, `rejected`, `succeeded`, `failed` or `cancelled`. */
   state: string;
   result_text: string | null;
+  /** Verified original-host model usage, when available from an actual
+   * metered native run. No correctness or provider billing claim. */
+  model_metering?: {
+    version:1;source:'receiver_verified_run_ledger';run_id:string;
+    target_id:string;status:'succeeded'|'failed'|'cancelled';
+    duration_ms:number;input_tokens:number;output_tokens:number;
+    cached_input_tokens:number;model_calls:number;cost_micros:number|null;
+    independently_quality_verified:false;provider_billing_reconciled:false;
+  } | null;
   sent_at_ms: number;
   /** When this installation last asked the peer about it. */
   checked_at_ms: number | null;

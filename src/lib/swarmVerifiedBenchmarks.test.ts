@@ -78,6 +78,19 @@ describe('opt-in real-model accuracy routing', () => {
     synthetic.mode='synthetic';
     expect(() => parseLiveSwarmBenchmark(synthetic,now)).toThrow(/real-model/);
   });
+  it('does not trust edited persisted benchmark scores or legacy score-only caches',()=>{
+    importSwarmBenchmark(report(),now);
+    const stored=JSON.parse(localStorage.getItem(SWARM_BENCHMARK_KEY)!);
+    stored.evidence.ranking[0].accuracy=0;
+    localStorage.setItem(SWARM_BENCHMARK_KEY,JSON.stringify(stored));
+    expect(loadSwarmBenchmark(now)).toBeNull();
+    localStorage.setItem(SWARM_BENCHMARK_KEY,JSON.stringify({
+      generatedAt:report().generatedAt,importedAt:now,ranking:report().ranking,
+    }));
+    expect(loadSwarmBenchmark(now)).toBeNull();
+    importSwarmBenchmark(report(),now);
+    expect(loadSwarmBenchmark(now)?.ranking[0].accuracy).toBe(1);
+  });
   it('rejects stale benchmarks and clears the opt-in with its evidence', () => {
     const parsed=importSwarmBenchmark(report(),now);
     expect(parsed.ranking).toHaveLength(2);

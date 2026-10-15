@@ -150,6 +150,72 @@ An explicit DAG is still a local bounded workflow, not a distributed task
 scheduler. It uses the same permission boundary for code-profile agents and
 does not automatically merge parallel worktrees.
 
+## Bounded nested team delegation (P1)
+
+A task graph may declare preapproved children beneath a parent. The compiler
+recursively flattens the tree into an ordinary workflow DAG and adds a
+mandatory child dependency on the parent. Parents execute exactly once,
+and children run only after their parent succeeds, using the existing
+permission gate, prior-phase reports, workflow cancellation and journal.
+
+Maximum depth: three; maximum six children per parent; 16 total agents,
+six dependency waves. Cycles, duplicate IDs, unexpected tool or permission
+fields and oversized plans fail before any execution.
+
+```json
+{
+  "name": "release-review-tree",
+  "tasks": [{
+    "id":"lead", "description":"Prepare release audit",
+    "prompt":"Inspect the repository and identify reviews", "profile":"explore",
+    "children":[
+      {"id":"security","description":"Security","prompt":"Audit auth","profile":"explore"},
+      {"id":"quality","description":"Quality","prompt":"Audit tests","profile":"explore",
+       "children":[{"id":"acceptance","description":"Acceptance",
+        "prompt":"Verify reports from repository evidence","profile":"explore"}]}
+    ]
+  }]
+}
+```
+
+This is declarative recursive *planning*, not autonomous model-created
+child tool calls. The child runs are still part of the normal workflow
+executor and inherit its desktop crash-recovery and human-approval limits.
+
+### Durable native nested swarms
+
+The same hierarchy can be submitted to the **resident daemon** by placing
+`children` under each node of the existing version-1
+`monkey daemon swarm-submit` JSON format. For example:
+
+```json
+{
+  "version":1, "id":"read-only-hierarchy-001", "max_parallel":2,
+  "nodes":[{
+    "id":"lead",
+    "recipe":"/ABSOLUTE/PATH/TO/lead-plan-only-recipe.json",
+    "children":[{
+      "id":"security",
+      "recipe":"/ABSOLUTE/PATH/TO/security-plan-only-recipe.json",
+      "children":[{
+        "id":"verify",
+        "recipe":"/ABSOLUTE/PATH/TO/verification-plan-only-recipe.json"
+      }]
+    }]
+  }]
+}
+```
+
+Run `monkey daemon swarm-submit /absolute/path/to/graph.json` after reviewing
+all recipes and dependencies. The CLI flattens the declared hierarchy into
+immutable parent dependencies **before** freezing recipes and registering
+the graph in SQLite. Children default to receiving only verified,
+bounded direct-parent completion reports, marked as untrusted evidence.
+Cancellation, restart recovery, signed-leader authority, manual approvals,
+deterministic job IDs and native limits remain those of the existing
+resident coordinator. This does not spawn arbitrary model-specified children
+or automatically retry uncertain mutating side effects.
+
 ## Persistent indexed knowledge (explicit opt-in)
 
 Use **Knowledge 2.0** to create and index sources with an embeddings-capable
@@ -397,3 +463,23 @@ import, and operational release gates.
 ## Native team coordination, evaluated learning and mission observability
 
 See [Native swarm coordination and learning](native-swarm-coordination.md) for read-only team topology modes, independently judged learning, review-gated consolidation, native capability packs, token forecasting, and the remaining real-device acceptance requirements.
+
+
+## On-demand recursive child execution during a desktop model turn
+
+In addition to the predeclared tree compiler above, **running desktop
+subagents** may call `agent_spawn` to create children dynamically,
+`agent_inbox` / `agent_send` to exchange direct live messages and
+`agent_join` to await their direct descendants. This uses the same
+native permission-gated `runSubagentTask` loop and a capped team budget;
+it is not an open-ended model-granted delegation privilege.
+
+Only the currently active team may communicate internally. Messages
+are bounded, persisted for seven days, and injected as untrusted
+model context. New children are limited to depth four, 24 total and
+six concurrent workers; parent cancellation propagates. See
+[Native swarm coordination](native-swarm-coordination.md) for details.
+
+A daemon-owned frozen graph is a **different execution surface** and
+does not adopt these desktop in-process tools. It keeps its durable
+predeclared DAG and the existing recovery semantics.

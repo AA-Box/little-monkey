@@ -2099,6 +2099,8 @@ fn signed_replica_endpoint_persists_monotonic_checkpoints_and_never_grants_task_
         graph_state:"running".into(),
         nodes:vec![ReplicaNode{id:"audit".into(),state:"submitted".into(),
             job_id:Some("job-abc123".into())}],
+        trace_events:vec![],
+        model_usage:vec![],
         checksum:String::new(),
     };
     snapshot.seal().unwrap();

@@ -705,6 +705,33 @@ export const TASK_TOOL: ToolDef = {
  * Frontend-only: `executeToolCall` intercepts the name before the
  * `invoke('tool_'+name)` dispatch, exactly like `task`.
  */
+/** A finite JSON schema (no unbounded $ref) for nested delegation.
+ * It is constructed once when tools are registered, not by a model turn.
+ * Every level is strict, and the compiler repeats the structural checks. */
+function workflowGraphTaskSchema(depth: number): Record<string, unknown> {
+  return {
+    type: 'object',
+    properties: {
+      id: { type: 'string', description: 'Unique lowercase kebab-case task id.' },
+      description: { type: 'string', description: 'Short label.' },
+      prompt: { type: 'string', description: 'Complete independent task instructions.' },
+      profile: { type: 'string', description: 'explore, code or an installed agent profile.' },
+      depends_on: { type: 'array', items: { type: 'string' }, description: 'Explicit predecessor IDs. Child also always depends on its parent.' },
+      effort: { type: 'string', enum: ['low', 'medium', 'high'] },
+      isolation: { type: 'string', enum: ['worktree'] },
+      peer: { type: 'string', description: 'Read-only paired peer alias, checked by existing peer permission policy.' },
+      ...(depth < 3 ? {
+        children: {
+          type: 'array', maxItems: 6, items: workflowGraphTaskSchema(depth + 1),
+          description: 'Bounded preapproved child tasks, never a grant of new tool authority.',
+        },
+      } : {}),
+    },
+    required: ['id', 'description', 'prompt'],
+    additionalProperties: false,
+  };
+}
+
 /** Tools are only offered to agents explicitly enrolled in a live local
  * workflow. Dispatch is bound to the validated run-scoped mailbox; no peer
  * transport, filesystem, network, or tool permission is acquired here. */
@@ -739,29 +766,15 @@ export const WORKFLOW_TOOL: ToolDef = {
   function: {
     name: 'workflow',
     description:
-      'Run a named, multi-phase orchestration of subagents. Phases run in order; the agents inside one phase run in parallel. Each later phase automatically receives the earlier phases\' reports appended to its prompts. Use this instead of plain task calls when the work has distinct stages (e.g. survey then verify, or explore then implement then review). For built-in multi-agent security reviews, pass {"preset":"security-red-team"} for a read-only 15-agent audit or {"preset":"security-audit-and-fix"} ONLY when the user explicitly requests code modifications; optional "scope" narrows the target. These presets reuse the same permission-gated workflow engine. For evidence-heavy reviews, optional "consensus":"strict" adds independent, source-attributed reviewer votes and explicitly reports disputes. Optional "notebook":true shares approved versioned project claims and stages new consensus claims for operator review without auto-promoting them. For arbitrary goals, use {"goal":"...","mode":"analyze"} to select specialist agents automatically, or mode "implement" ONLY when the user explicitly requests code changes. For explicit interdependent subtasks, pass name and tasks:[{id,description,prompt,profile,depends_on:[ids],peer?:alias}]. Peer execution is opt-in for read-only explore tasks, and requires an already paired and task-authorized peer; independent waves run in parallel, dependent waves wait, and failed prerequisites stop downstream work. For an explicitly named read-only phased agent, peerFailover:true with peerCandidates:[aliases] permits a single distinct correlation on another authorized peer ONLY after an independently verified terminal failure. Network uncertainty and cancellation never trigger failover. Optionally pass memory_stack_ids naming already-indexed Knowledge stacks for source-attributed shared retrieval. Optional peer_aliases:[alias] on a read-only goal analysis dispatches specialist discovery to operator-selected paired peers; never auto-select a peer or use for code changes. Alternatively use auto_peer_pool:[aliases] to choose a healthy recipient within that explicit list using observed task outcomes; this never widens access. Each agent is isolated: give every prompt full, self-contained context. Set live_messaging:true to let LOCAL agents coordinate through a bounded untrusted mailbox and receive file-change notices. Set auto_memory_stack_id to an existing Knowledge 2.0 stack ID for opt-in local semantic recall and successful-report capture; both features refuse remote peers. Limits: at most 6 phases, 6 agents per phase, 16 agents total. To re-run a previously saved workflow, pass only {"saved": "<name>"} (see the "Saved workflows" section of the system prompt) and omit every other field.',
+      'Run a named, multi-phase orchestration of subagents. Phases run in order; the agents inside one phase run in parallel. Each later phase automatically receives the earlier phases\' reports appended to its prompts. Use this instead of plain task calls when the work has distinct stages (e.g. survey then verify, or explore then implement then review). For built-in multi-agent security reviews, pass {"preset":"security-red-team"} for a read-only 15-agent audit or {"preset":"security-audit-and-fix"} ONLY when the user explicitly requests code modifications; optional "scope" narrows the target. These presets reuse the same permission-gated workflow engine. For evidence-heavy reviews, optional "consensus":"strict" adds independent, source-attributed reviewer votes and explicitly reports disputes. Optional "notebook":true shares approved versioned project claims and stages new consensus claims for operator review without auto-promoting them. For arbitrary goals, use {"goal":"...","mode":"analyze"} to select specialist agents automatically, or mode "implement" ONLY when the user explicitly requests code changes. For explicit interdependent subtasks, pass name and tasks:[{id,description,prompt,profile,depends_on:[ids],children?:[nested tasks],peer?:alias}]. Children form a preapproved three-level tree: they start only after their parent succeeds, are flattened into the standard bounded DAG and never receive additional authority. Peer execution is opt-in for read-only explore tasks, and requires an already paired and task-authorized peer; independent waves run in parallel, dependent waves wait, and failed prerequisites stop downstream work. For an explicitly named read-only phased agent, peerFailover:true with peerCandidates:[aliases] permits a single distinct correlation on another authorized peer ONLY after an independently verified terminal failure. Network uncertainty and cancellation never trigger failover. Optionally pass memory_stack_ids naming already-indexed Knowledge stacks for source-attributed shared retrieval. Optional peer_aliases:[alias] on a read-only goal analysis dispatches specialist discovery to operator-selected paired peers; never auto-select a peer or use for code changes. Alternatively use auto_peer_pool:[aliases] to choose a healthy recipient within that explicit list using observed task outcomes; this never widens access. Each agent is isolated: give every prompt full, self-contained context. Set live_messaging:true to let LOCAL agents coordinate through a bounded untrusted mailbox and receive file-change notices. Set auto_memory_stack_id to an existing Knowledge 2.0 stack ID for opt-in local semantic recall and successful-report capture; both features refuse remote peers. Limits: at most 6 phases, 6 agents per phase, 16 agents total. To re-run a previously saved workflow, pass only {"saved": "<name>"} (see the "Saved workflows" section of the system prompt) and omit every other field.',
     parameters: {
       type: 'object',
       properties: {
         tasks: {
           type: 'array',
           maxItems: 16,
-          description: 'Optional explicit dependency graph instead of phases or a goal. Give name, description and tasks; each task has a unique id and depends_on references. The compiler schedules independent waves (at most 6 phases / 6 agents per phase), stops on failed prerequisites, and uses ordinary agent permissions.',
-          items: {
-            type: 'object',
-            properties: {
-              id: { type: 'string', description: 'Unique lowercase kebab-case task id.' },
-              description: { type: 'string', description: 'Short label for this task.' },
-              prompt: { type: 'string', description: 'Complete, self-contained instructions.' },
-              profile: { type: 'string', description: 'explore, code, or an installed custom agent profile.' },
-              depends_on: { type: 'array', items: { type: 'string' }, description: 'IDs of tasks that must complete successfully first.' },
-              effort: { type: 'string', enum: ['low', 'medium', 'high'] },
-              isolation: { type: 'string', enum: ['worktree'] },
-              peer: { type: 'string', description: 'Optional paired Little Monkey peer alias for a read-only explore task. Requires explicit peer-task grant and the peer-task recipe; never selects remote workspace/permissions.' },
-            },
-            required: ['id', 'description', 'prompt'],
-            additionalProperties: false,
-          },
+          description: 'Explicit DAG with optional three-level, six-child bounded hierarchical delegation. Every child waits for its parent and inherits the normal execution permission boundary.',
+          items: workflowGraphTaskSchema(1),
         },
         notebook: {
           type: 'boolean',

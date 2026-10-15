@@ -52,6 +52,9 @@ jobs:
       - name: Syntax-check live real-model benchmark harness (no model mocks)
         run: pnpm test:swarm-models:syntax
 
+      - name: Contract-check real-task concurrency and independent oracle (mock CLI only)
+        run: pnpm test:swarm-headless:contract
+
       - name: Syntax-check real two-installation acceptance harness (no peer mocks)
         run: pnpm test:swarm-peer:syntax
 
@@ -59,6 +62,10 @@ jobs:
         run: pnpm test:swarm-peer:contract
       - name: Verify physical recovery stress harness contracts (no real peers)
         run: pnpm test:swarm-physical:contract
+      - name: Exercise authenticated cross-host telemetry contract (no physical peers)
+        run: pnpm test:swarm-telemetry:contract
+      - name: Contract-test continuous independent model quality and official billing readers
+        run: pnpm test:swarm-continuous:contract
       - name: Contract-test real-device vector memory and cancellation gates (no network)
         run: |
           node --check scripts/swarm-two-peer-memory-live-acceptance.mjs
