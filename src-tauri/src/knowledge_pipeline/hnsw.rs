@@ -93,7 +93,7 @@ fn select_diverse(node:usize,neighbours:Vec<usize>,vectors:&[Vec<f32>])->Vec<usi
         .filter(|&n|n!=node&&unique.insert(n))
         .map(|n|(n,similarity(&vectors[node],&vectors[n]))).collect(),
         usize::MAX);
-    let mut kept=Vec::with_capacity(MAX_NEIGHBORS);
+    let mut kept: Vec<usize> = Vec::with_capacity(MAX_NEIGHBORS);
     let mut redundant=Vec::new();
     for (candidate,score) in ranked{
         if kept.iter().all(|&chosen|
