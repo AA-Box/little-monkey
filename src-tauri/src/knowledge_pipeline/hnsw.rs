@@ -6,16 +6,21 @@
 //! existing exact dot-product scan. A malformed accelerated index fails closed.
 //! Never replaces FTS5, reranking, permission checks or source exclusions.
 use std::collections::{BTreeSet,HashMap,HashSet};
+use std::path::Path;
+use std::sync::{Arc,Mutex,OnceLock};
 use rusqlite::{params,Connection,OptionalExtension,Transaction};
 use sha2::{Digest,Sha256};
 use tokio_util::sync::CancellationToken;
-use super::{KnowledgeChunk,PipelineError,PipelineResult,check_cancelled,decode_vector};
+use super::{KnowledgeChunk,PipelineError,PipelineResult,FileIdentity,check_cancelled,decode_vector};
 
 const MIN_ACCELERATED:usize=512;
 const MAX_LAYER:usize=10;
-const MAX_NEIGHBORS:usize=12;
-const BUILD_BEAM:usize=64;
-const SEARCH_BEAM:usize=128;
+const MAX_NEIGHBORS:usize=24;
+const BUILD_BEAM:usize=192;
+// The 100k/384d clustered SQLite corpus exposed inadequate recall with ef=512
+// (0.7875 against the unchanged 0.80 gate). Expand the real HNSW frontier;
+// never lower the exact-oracle acceptance threshold to mask missed neighbors.
+const SEARCH_BEAM:usize=1536;
 
 #[derive(Clone)]
 struct Point{
@@ -82,14 +87,38 @@ fn beam(points:&[Point],vectors:&[Vec<f32>],query:&[f32],
     }
     found
 }
+// Preserve useful long-range edges instead of retaining only near duplicates.
+// Pure nearest-neighbour pruning forms local cliques with no route to other
+// neighbourhoods, which severely damages recall on high-dimensional corpora.
+fn select_diverse(node:usize,neighbours:Vec<usize>,vectors:&[Vec<f32>])->Vec<usize>{
+    let mut unique=HashSet::new();
+    let ranked=best_first(neighbours.into_iter()
+        .filter(|&n|n!=node&&unique.insert(n))
+        .map(|n|(n,similarity(&vectors[node],&vectors[n]))).collect(),
+        usize::MAX);
+    let mut kept: Vec<usize> = Vec::with_capacity(MAX_NEIGHBORS);
+    let mut redundant=Vec::new();
+    for (candidate,score) in ranked{
+        if kept.iter().all(|&chosen|
+            similarity(&vectors[candidate],&vectors[chosen])<score
+        ){
+            kept.push(candidate);
+        }else{
+            redundant.push(candidate);
+        }
+        if kept.len()==MAX_NEIGHBORS{break;}
+    }
+    // The heuristic may find fewer than M diverse neighbours; use the
+    // highest-scoring discarded candidates for the remaining capacity.
+    for candidate in redundant{
+        if kept.len()==MAX_NEIGHBORS{break;}
+        kept.push(candidate);
+    }
+    kept
+}
 fn prune(points:&mut [Point],vectors:&[Vec<f32>],node:usize,layer:usize){
     let neighbours=points[node].links[layer].clone();
-    let mut scored=Vec::with_capacity(neighbours.len());
-    for id in neighbours{
-        scored.push((id,similarity(&vectors[node],&vectors[id])));
-    }
-    points[node].links[layer]=best_first(scored,MAX_NEIGHBORS)
-        .into_iter().map(|row|row.0).collect();
+    points[node].links[layer]=select_diverse(node,neighbours,vectors);
 }
 fn build_graph(chunks:&[KnowledgeChunk],vectors:&[Vec<f32>],
     cancel:&CancellationToken)->PipelineResult<(usize,usize,Vec<Point>)>{
@@ -110,8 +139,8 @@ fn build_graph(chunks:&[KnowledgeChunk],vectors:&[Vec<f32>],
         }
         for layer in (0..=level.min(top_layer)).rev(){
             let candidates=beam(&points,vectors,&vectors[id],entry,layer,BUILD_BEAM);
-            let chosen=candidates.into_iter().filter(|row|row.0!=id)
-                .take(MAX_NEIGHBORS).map(|x|x.0).collect::<Vec<_>>();
+            let chosen=select_diverse(id,candidates.into_iter()
+                .map(|x|x.0).collect(),vectors);
             if let Some(&candidate)=chosen.first(){entry=candidate;}
             points[id].links[layer]=chosen.clone();
             for other in chosen {
@@ -123,6 +152,11 @@ fn build_graph(chunks:&[KnowledgeChunk],vectors:&[Vec<f32>],
     }
     Ok((top,top_layer,points))
 }
+// Check the ENTIRE corpus, not just an initial prefix. A run of 512
+// identical values followed by diverse embeddings still needs acceleration.
+fn uniformly_embedded(vectors:&[Vec<f32>])->bool{
+    vectors.first().is_some_and(|first|vectors.iter().all(|v|v==first))
+}
 /// Called after the vectors have been checked and inserted, inside the
 /// generation's existing immutable SQLite transaction.
 pub(super) fn build(tx:&Transaction<'_>,chunks:&[KnowledgeChunk],
@@ -131,9 +165,7 @@ pub(super) fn build(tx:&Transaction<'_>,chunks:&[KnowledgeChunk],
     // A legitimate corpus may contain tens of thousands of identical
     // embeddings (the existing 50k retrieval benchmark does). HNSW cannot
     // improve ties and building it adds no recall; keep exact ranking.
-    if vectors.iter().take(MIN_ACCELERATED).all(|v|v==&vectors[0]){
-        return Ok(());
-    }
+    if uniformly_embedded(vectors){return Ok(());}
     let (top,layer,points)=build_graph(chunks,vectors,cancel)?;
     tx.execute_batch("CREATE TABLE hnsw_nodes(
         chunk_id TEXT PRIMARY KEY NOT NULL,
@@ -142,6 +174,11 @@ pub(super) fn build(tx:&Transaction<'_>,chunks:&[KnowledgeChunk],
         FOREIGN KEY(chunk_id) REFERENCES chunks(chunk_id)
     ) WITHOUT ROWID;")?;
     let mut digest=Sha256::new();
+    // V2 authenticates the entry and maximum layer as well as every edge.
+    // V1 graphs remain readable for already persisted generations.
+    digest.update(b"hnsw-v2-controls-and-edges");
+    digest.update(points[top].id.as_bytes());
+    digest.update((layer as u32).to_le_bytes());
     // Canonical sorted-ID hash can be independently rechecked from SQLite
     // without needing the original source insertion order.
     let mut order=(0..points.len()).collect::<Vec<_>>();
@@ -160,7 +197,7 @@ pub(super) fn build(tx:&Transaction<'_>,chunks:&[KnowledgeChunk],
             params![point.id,point.level as i64,links_json])?;
     }
     for (key,value) in [
-        ("hnsw_version","1".to_string()),
+        ("hnsw_version","2".to_string()),
         ("hnsw_entry",points[top].id.clone()),
         ("hnsw_max_layer",layer.to_string()),
         ("hnsw_digest",format!("{:x}",digest.finalize())),
@@ -180,10 +217,38 @@ pub(super) fn validate(conn:&Connection)->PipelineResult<()>{
     let version:String=conn.query_row(
         "SELECT value FROM metadata WHERE key='hnsw_version'",[],
         |r|r.get(0))?;
-    if version!="1" {
+    if version!="1" && version!="2" {
         return Err(PipelineError::InvalidIndex("Unsupported HNSW generation version".into()));
     }
+    // These controls are used before a single edge is traversed. Validate
+    // them on OPEN, not on first retrieval, so corrupt metadata cannot
+    // activate a generation whose graph is already unusable.
+    let entry:String=conn.query_row(
+        "SELECT value FROM metadata WHERE key='hnsw_entry'",[],|r|r.get(0))?;
+    let max_layer:String=conn.query_row(
+        "SELECT value FROM metadata WHERE key='hnsw_max_layer'",[],|r|r.get(0))?;
+    let max_layer=max_layer.parse::<usize>().map_err(|_|
+        PipelineError::InvalidIndex("Invalid HNSW maximum layer".into()))?;
+    if max_layer>MAX_LAYER{
+        return Err(PipelineError::InvalidIndex("HNSW maximum layer out of bounds".into()));
+    }
+    let entry_layer:Option<i64>=conn.query_row(
+        "SELECT layer FROM hnsw_nodes WHERE chunk_id=?1",[&entry],|r|r.get(0)
+    ).optional()?;
+    if entry_layer!=Some(max_layer as i64){
+        return Err(PipelineError::InvalidIndex("HNSW entry is missing or has wrong layer".into()));
+    }
+    let actual_max:Option<i64>=conn.query_row(
+        "SELECT MAX(layer) FROM hnsw_nodes",[],|r|r.get(0))?;
+    if actual_max!=Some(max_layer as i64){
+        return Err(PipelineError::InvalidIndex("HNSW graph layer metadata mismatch".into()));
+    }
     let mut digest=Sha256::new();
+    if version=="2"{
+        digest.update(b"hnsw-v2-controls-and-edges");
+        digest.update(entry.as_bytes());
+        digest.update((max_layer as u32).to_le_bytes());
+    }
     let mut stmt=conn.prepare(
         "SELECT chunk_id,layer,links_json FROM hnsw_nodes ORDER BY chunk_id"
     )?;
@@ -290,6 +355,152 @@ fn beam_disk(conn:&Connection,query:&[f32],dim:usize,entry:String,
     }
     Ok(found)
 }
+
+// A process-local immutable materialization of the *persisted* SQLite graph.
+// SQLite stays the source of truth: nodes are decoded from the indexed file
+// after its edge digest is verified, and the snapshot is keyed by the same
+// file identity used by HybridIndex's validation cache. Sharing one Arc between
+// independent SQLite readers avoids thousands of per-hop SQL round trips and
+// per-query JSON deserializations, without an exact-scan bypass of HNSW.
+struct ResidentPoint{
+    vector:Vec<f32>,
+    links:Vec<Vec<usize>>,
+}
+struct ResidentGraph{
+    ids:Vec<String>,
+    points:Vec<ResidentPoint>,
+    entry:usize,
+    max_layer:usize,
+}
+type GraphCacheKey=(FileIdentity,String,usize);
+const MAX_RESIDENT_GRAPHS:usize=2;
+static RESIDENT_GRAPHS:OnceLock<Mutex<Vec<(GraphCacheKey,Arc<ResidentGraph>)>>>=OnceLock::new();
+
+fn decode_resident(conn:&Connection,dim:usize,entry:&str,max_layer:usize,
+    cancel:&CancellationToken)->PipelineResult<ResidentGraph>{
+    // A direct caller of hnsw::query may not have called HybridIndex::open.
+    // Verify the actual persisted edge digest before caching those edges.
+    validate(conn)?;
+    let mut stmt=conn.prepare(
+        "SELECT h.chunk_id,h.layer,h.links_json,c.vector
+         FROM hnsw_nodes h JOIN chunks c ON c.chunk_id=h.chunk_id
+         ORDER BY h.chunk_id"
+    )?;
+    let rows=stmt.query_map([],|r|Ok((
+        r.get::<_,String>(0)?,r.get::<_,i64>(1)?,
+        r.get::<_,String>(2)?,r.get::<_,Vec<u8>>(3)?
+    )))?;
+    let mut ids=Vec::new();
+    let mut points=Vec::new();
+    let mut links_by_id=Vec::<Vec<Vec<String>>>::new();
+    for row in rows{
+        if ids.len()%256==0{check_cancelled(cancel)?;}
+        let (id,layer,links_json,raw)=row?;
+        if layer<0||layer as usize>MAX_LAYER{
+            return Err(PipelineError::InvalidIndex("Invalid resident HNSW layer".into()));
+        }
+        let links:Vec<Vec<String>>=serde_json::from_str(&links_json)?;
+        if links.len()!=layer as usize+1||
+           links.iter().any(|row|row.len()>MAX_NEIGHBORS){
+            return Err(PipelineError::InvalidIndex("Invalid resident HNSW links".into()));
+        }
+        ids.push(id);
+        points.push(ResidentPoint{vector:decode_vector(&raw,dim)?,links:Vec::new()});
+        links_by_id.push(links);
+    }
+    let map:HashMap<&str,usize>=ids.iter().enumerate()
+        .map(|(i,id)|(id.as_str(),i)).collect();
+    let Some(&entry)=map.get(entry) else{
+        return Err(PipelineError::InvalidIndex("Missing resident HNSW entry".into()));
+    };
+    let level_counts=links_by_id.iter().map(|layers|layers.len()).collect::<Vec<_>>();
+    for (i,layers) in links_by_id.into_iter().enumerate(){
+        if i%256==0{check_cancelled(cancel)?;}
+        let mut converted=Vec::with_capacity(layers.len());
+        for (layer,neighbours) in layers.into_iter().enumerate(){
+            let mut seen=HashSet::new();
+            let mut resolved=Vec::with_capacity(neighbours.len());
+            for id in neighbours{
+                let Some(&n)=map.get(id.as_str()) else{
+                    return Err(PipelineError::InvalidIndex("Dangling resident HNSW edge".into()));
+                };
+                if n==i||!seen.insert(n)||level_counts[n]<=layer{
+                    return Err(PipelineError::InvalidIndex("Invalid resident HNSW edge".into()));
+                }
+                resolved.push(n);
+            }
+            converted.push(resolved);
+        }
+        points[i].links=converted;
+    }
+    if points[entry].links.len()!=max_layer+1{
+        return Err(PipelineError::InvalidIndex("Resident HNSW entry layer mismatch".into()));
+    }
+    Ok(ResidentGraph{ids,points,entry,max_layer})
+}
+fn resident(conn:&Connection,dim:usize,entry:&str,max_layer:usize,
+    cancel:&CancellationToken)->PipelineResult<Option<Arc<ResidentGraph>>>{
+    let file:String=conn.query_row("PRAGMA database_list",[],|r|r.get(2))?;
+    if file.is_empty(){return Ok(None);}
+    let Ok(metadata)=std::fs::metadata(&file) else{return Ok(None)};
+    let digest:String=conn.query_row(
+        "SELECT value FROM metadata WHERE key='hnsw_digest'",[],|r|r.get(0))?;
+    let key=(FileIdentity::of(Path::new(&file),&metadata),digest,dim);
+    let cache=RESIDENT_GRAPHS.get_or_init(||Mutex::new(Vec::new()));
+    let mut guard=cache.lock().map_err(|_|
+        PipelineError::InvalidIndex("Resident graph cache lock poisoned".into()))?;
+    if let Some((_,graph))=guard.iter().find(|(cached,_)|cached==&key){
+        return Ok(Some(Arc::clone(graph)));
+    }
+    let graph=Arc::new(decode_resident(conn,dim,entry,max_layer,cancel)?);
+    // Never accumulate every regenerated Knowledge stack indefinitely.
+    if guard.len()>=MAX_RESIDENT_GRAPHS{guard.remove(0);}
+    guard.push((key,Arc::clone(&graph)));
+    Ok(Some(graph))
+}
+fn greedy_resident(graph:&ResidentGraph,query:&[f32],mut current:usize,
+    layer:usize,cancel:&CancellationToken)->PipelineResult<usize>{
+    let mut best=similarity(query,&graph.points[current].vector);
+    for _ in 0..1_000{
+        check_cancelled(cancel)?;
+        let mut next=current;
+        let mut score=best;
+        for &id in graph.points[current].links.get(layer)
+            .ok_or_else(||PipelineError::InvalidIndex("Missing resident upper layer".into()))?{
+            let candidate=similarity(query,&graph.points[id].vector);
+            if candidate>score||(candidate==score&&id<next){
+                next=id;score=candidate;
+            }
+        }
+        if next==current{return Ok(current);}
+        current=next;best=score;
+    }
+    Err(PipelineError::InvalidIndex("Resident HNSW traversal exceeded bound".into()))
+}
+fn beam_resident(graph:&ResidentGraph,query:&[f32],entry:usize,ef:usize,
+    cancel:&CancellationToken)->PipelineResult<Vec<(usize,f32)>>{
+    let initial=(entry,similarity(query,&graph.points[entry].vector));
+    let mut seen=HashSet::from([entry]);
+    let mut pending=vec![initial];
+    let mut found=vec![initial];
+    for _ in 0..ef*16{
+        if pending.is_empty(){break;}
+        pending.sort_by(|a,b|b.1.total_cmp(&a.1).then_with(||a.0.cmp(&b.0)));
+        let current=pending.remove(0);
+        if found.len()>=ef&&current.1<found.last().map(|x|x.1).unwrap_or(f32::NEG_INFINITY){break;}
+        check_cancelled(cancel)?;
+        for &next in &graph.points[current.0].links[0]{
+            if !seen.insert(next){continue;}
+            let score=similarity(query,&graph.points[next].vector);
+            if found.len()<ef||score>=found.last().map(|x|x.1).unwrap_or(f32::NEG_INFINITY){
+                pending.push((next,score));found.push((next,score));
+                found=best_first(found,ef);
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// None means old index/no accelerated graph: retain exact search behavior.
 /// Some(result) means this immutable generation's built HNSW was used.
 pub(super) fn query(conn:&Connection,needle:&[f32],dim:usize,limit:usize,
@@ -310,12 +521,37 @@ pub(super) fn query(conn:&Connection,needle:&[f32],dim:usize,limit:usize,
     if layer>MAX_LAYER||limit==0{
         return Err(PipelineError::InvalidIndex("Invalid HNSW search controls".into()));
     }
+    // The bounded beam cannot supply more than 512 unique rows. Fall back to
+    // exact ranking rather than silently under-filling broad caller requests.
+    if limit>512{return Ok(None);}
+    if let Some(graph)=resident(conn,dim,&entry,layer,cancel)?{
+        if graph.max_layer!=layer{
+            return Err(PipelineError::InvalidIndex("Resident HNSW layer mismatch".into()));
+        }
+        let mut start=graph.entry;
+        for l in (1..=layer).rev(){
+            start=greedy_resident(&graph,needle,start,l,cancel)?;
+        }
+        let rows=beam_resident(&graph,needle,start,
+            SEARCH_BEAM,cancel)?;
+        if rows.len()<limit{
+            return Err(PipelineError::InvalidIndex("Resident HNSW beam underfilled".into()));
+        }
+        let mut matched=Vec::with_capacity(limit);
+        for (id,score) in best_first(rows,limit){
+            if !score.is_finite(){
+                return Err(PipelineError::InvalidIndex("Non-finite resident HNSW score".into()));
+            }
+            matched.push((graph.ids[id].clone(),score));
+        }
+        return Ok(Some(matched));
+    }
     let mut cache=HashMap::new();
     for l in (1..=layer).rev(){
         entry=greedy_disk(conn,needle,dim,entry,l,&mut cache,cancel)?;
     }
     let candidates=beam_disk(conn,needle,dim,entry,
-        SEARCH_BEAM.max(limit*4).min(512),&mut cache,cancel)?;
+        SEARCH_BEAM,&mut cache,cancel)?;
     let mut matched=Vec::new();
     for (id,score) in candidates{
         if !excluded.contains(&load(conn,&id,dim,&mut cache)?.source_id){
@@ -340,4 +576,25 @@ mod tests{
             vec![(2,0.9),(4,0.5)]);
         assert_eq!(similarity(&[1.0,0.0],&[0.0,1.0]),0.0);
     }
+    #[test]
+    fn diversified_pruning_retains_bridge_edges_in_dense_local_clusters(){
+        let mut vectors=vec![vec![1.0,0.0]];
+        vectors.extend((0..30).map(|_|vec![0.99,0.10]));
+        vectors.push(vec![0.70,-0.714]);
+        let distant=vectors.len()-1;
+        let selected=select_diverse(0,(1..vectors.len()).collect(),&vectors);
+        assert_eq!(selected.len(),MAX_NEIGHBORS);
+        assert!(selected.contains(&distant),
+            "preserve a geometrically distinct edge ahead of redundant near duplicates");
+    }
+    #[test]
+    fn all_equal_requires_all_embeddings_not_only_first_512(){
+        let mut vectors=vec![vec![1.0,0.0];512];
+        assert!(uniformly_embedded(&vectors));
+        vectors.push(vec![0.0,1.0]);
+        assert!(!uniformly_embedded(&vectors));
+    }
 }
+
+#[cfg(test)]
+mod production_bench;
