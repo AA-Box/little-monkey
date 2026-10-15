@@ -60,7 +60,7 @@ describe('coding-agent harness session continuation',()=>{
     expect(()=>parseHarnessSession([
       {type:'user',sessionId:'a',message:{role:'user',content:'A'}},
       {type:'user',sessionId:'b',message:{role:'user',content:'B'}},
-    ].map(JSON.stringify).join('\n'))).toThrow(/multiple sessions/);
+    ].map(value => JSON.stringify(value)).join('\n'))).toThrow(/multiple sessions/);
     expect(()=>parseHarnessSession('{not-valid-json')).toThrow();
     expect(()=>parseHarnessSession(JSON.stringify({unrecognized:true}))).toThrow(/Unsupported/);
     expect(()=>parseHarnessSession('x'.repeat(16*1024*1024+1))).toThrow(/16 MiB/);
@@ -75,7 +75,7 @@ describe('coding-agent harness session continuation',()=>{
       {type:'user',sessionId:'c',message:{role:'user',content:[
         {type:'tool_result',tool_use_id:'old-tool',content:'old output'},
       ]}},
-    ].map(JSON.stringify).join('\n');
+    ].map(value => JSON.stringify(value)).join('\n');
     const parsed=parseHarnessSession(input);
     expect(parsed.messages).toHaveLength(3);
     expect(parsed.messages.every(x=>x.tool_calls===undefined && x.tool_call_id===undefined)).toBe(true);
