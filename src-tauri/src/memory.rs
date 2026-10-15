@@ -802,6 +802,54 @@ pub fn purge_expired_impl(path: &Path) -> Result<usize, String> {
     Ok(removed)
 }
 
+/// Conservative, opt-in background memory garden.
+///
+/// Only collapses EXACT duplicate, active, unpinned AGENT-created facts
+/// within the same verified canonical project. Does not guess equivalence,
+/// delete an original, change user-created facts, or touch expired memories.
+/// Instead, uses the existing reversible merged_from/merged_into ancestry.
+/// The exclusive cross-process lock makes this an atomic transaction with
+/// manual edits from desktop or another daemon.
+pub fn garden_exact_agent_duplicates_impl(path: &Path, root: &str) -> Result<usize, String> {
+    let _lock = write_lock(path)?;
+    let mut data = load_impl(path)?;
+    let now = now_rfc3339();
+    let Some(project) = data.projects.get_mut(root) else {return Ok(0)};
+    let mut groups: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for fact in &project.facts {
+        if fact.source != "agent" || fact.pinned || !fact.enabled ||
+           fact.retired_at.is_some() || fact.expires_at.is_some() ||
+           !fact.merged_from.is_empty() || !fact.text.trim().len().gt(&0) {
+            continue;
+        }
+        // Strict byte-for-byte equality after harmless outer whitespace
+        // trimming. Case-folding/paraphrase matching is not reliable truth.
+        groups.entry(fact.text.trim().to_owned())
+            .or_default().push(fact.id.clone());
+    }
+    let mut merged = 0usize;
+    for (text, ids) in groups.into_iter().filter(|(_, ids)| ids.len() > 1).take(8) {
+        if text.chars().count() > MAX_FACT_CHARS {continue;}
+        let id = uuid::Uuid::new_v4().to_string();
+        for fact in &mut project.facts {
+            if ids.contains(&fact.id) {
+                fact.retired_at = Some(now.clone());
+                fact.merged_into = Some(id.clone());
+            }
+        }
+        project.facts.push(Fact {
+            id, text, source: "agent".to_string(), created_at: now.clone(),
+            enabled: true, source_turn_id: None, pinned: false,
+            expires_at: None, last_used_at: None, merged_from: ids,
+            merged_into: None, retired_at: None,
+        });
+        merged += 1;
+    }
+    if merged > 0 {save_impl(path, &data)?;}
+    Ok(merged)
+}
+
 /// Core merge logic behind `memory_studio_merge`: combine two or more facts
 /// in one scope into a single new fact that records its parents' ids in
 /// `merged_from`, and soft-retire the parents (`merged_into` + `retired_at`,
