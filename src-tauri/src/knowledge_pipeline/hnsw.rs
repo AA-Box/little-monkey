@@ -17,7 +17,10 @@ const MIN_ACCELERATED:usize=512;
 const MAX_LAYER:usize=10;
 const MAX_NEIGHBORS:usize=24;
 const BUILD_BEAM:usize=192;
-const SEARCH_BEAM:usize=512;
+// The 100k/384d clustered SQLite corpus exposed inadequate recall with ef=512
+// (0.7875 against the unchanged 0.80 gate). Expand the real HNSW frontier;
+// never lower the exact-oracle acceptance threshold to mask missed neighbors.
+const SEARCH_BEAM:usize=1536;
 
 #[derive(Clone)]
 struct Point{
@@ -530,7 +533,7 @@ pub(super) fn query(conn:&Connection,needle:&[f32],dim:usize,limit:usize,
             start=greedy_resident(&graph,needle,start,l,cancel)?;
         }
         let rows=beam_resident(&graph,needle,start,
-            SEARCH_BEAM.max(limit.saturating_mul(4)).min(512),cancel)?;
+            SEARCH_BEAM,cancel)?;
         if rows.len()<limit{
             return Err(PipelineError::InvalidIndex("Resident HNSW beam underfilled".into()));
         }
@@ -548,7 +551,7 @@ pub(super) fn query(conn:&Connection,needle:&[f32],dim:usize,limit:usize,
         entry=greedy_disk(conn,needle,dim,entry,l,&mut cache,cancel)?;
     }
     let candidates=beam_disk(conn,needle,dim,entry,
-        SEARCH_BEAM.max(limit.saturating_mul(4)).min(512),&mut cache,cancel)?;
+        SEARCH_BEAM,&mut cache,cancel)?;
     let mut matched=Vec::new();
     for (id,score) in candidates{
         if !excluded.contains(&load(conn,&id,dim,&mut cache)?.source_id){
