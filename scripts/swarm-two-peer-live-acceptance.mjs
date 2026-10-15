@@ -23,6 +23,7 @@ function flag(name) {
 const alias = flag('--peer');
 const binary = flag('--monkey-bin') ?? process.env.LITTLE_MONKEY_CLI ?? 'monkey';
 const expectText = flag('--expect');
+const requireMetering = process.argv.includes('--require-model-metering');
 const timeoutSeconds = Number(flag('--timeout-seconds') ?? '300');
 const intervalSeconds = Number(flag('--poll-seconds') ?? '5');
 if (!alias || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$/.test(alias) ||
@@ -86,7 +87,35 @@ try {
         if (expectText && !result.result_text.includes(expectText)) {
           throw Error('The real peer result did not contain the explicitly expected evidence string.');
         }
-        verification = { status: 'verified_terminal_result', textLength: result.result_text.length };
+        let measured = null;
+        if (requireMetering) {
+          measured=result.model_metering;
+          if(!measured||measured.version!==1||
+             measured.source!=='receiver_verified_run_ledger'||
+             measured.status!=='succeeded'||
+             typeof measured.run_id!=='string'||!measured.run_id.startsWith('run-')||
+             typeof measured.target_id!=='string'||measured.target_id.length<1||
+             !Number.isSafeInteger(measured.duration_ms)||measured.duration_ms<0||
+             !Number.isSafeInteger(measured.input_tokens)||measured.input_tokens<0||
+             !Number.isSafeInteger(measured.output_tokens)||measured.output_tokens<0||
+             measured.input_tokens+measured.output_tokens<1||
+             !Number.isSafeInteger(measured.cached_input_tokens)||
+             measured.cached_input_tokens>measured.input_tokens||
+             !Number.isSafeInteger(measured.model_calls)||measured.model_calls<1||
+             measured.independently_quality_verified!==false||
+             measured.provider_billing_reconciled!==false)
+            throw Error('Independent recipient did not persist any authenticated original-model metering');
+        }
+        verification = { status: 'verified_terminal_result',
+          textLength: result.result_text.length,
+          metering: measured?{
+            runId:measured.run_id,target:measured.target_id,
+            modelCalls:measured.model_calls,inputTokens:measured.input_tokens,
+            outputTokens:measured.output_tokens,durationMs:measured.duration_ms,
+            meteredCostMicros:measured.cost_micros,
+            billingVerified:false,answerQualityVerified:false,
+          }:null,
+        };
         break;
       }
       if (['failed', 'rejected', 'cancelled'].includes(result?.state)) {
@@ -95,7 +124,7 @@ try {
       }
       lastTransientError = null;
     } catch (error) {
-      if (/terminated with state|returned no actual|expected evidence/.test(String(error))) throw error;
+      if (/terminated with state|returned no actual|expected evidence|original-model metering/.test(String(error))) throw error;
       lastTransientError = String(error);
       // Loss of connectivity is not proof of failure. Poll the SAME receipt
       // after reconnecting; never submit a second task automatically.

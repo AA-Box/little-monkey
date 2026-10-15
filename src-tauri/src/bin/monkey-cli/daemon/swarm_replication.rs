@@ -13,11 +13,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest,Sha256};
 use super::store::DaemonStore;
 use super::swarm_cluster;
+use little_monkey_lib::run_ledger::{ChainVerification, RunLedger};
+use little_monkey_lib::run_protocol::RunEvent;
 
 const MAX_GRAPH_NODES: usize = 16;
 const MAX_CHECKPOINT_BYTES: usize = 64 * 1024;
 const MAX_AGE_MS: i64 = 5 * 60 * 1000;
 const MAX_STORED_SNAPSHOTS: i64 = 1024;
+const MAX_TRACE_EVENTS: usize = 48;
 
 #[derive(Clone,Debug,Serialize,Deserialize,PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +28,32 @@ pub struct ReplicaNode {
     pub id: String,
     pub state: String,
     pub job_id: Option<String>,
+}
+/// Redacted durable DAG transition, captured on its original host. This is
+/// execution *state telemetry* and never a graded model outcome.
+#[derive(Clone,Debug,Serialize,Deserialize,PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaTraceEvent {
+    pub sequence: u64,
+    pub node_id: Option<String>,
+    pub kind: String,
+    pub state: String,
+    pub occurred_at_ms: i64,
+}
+/// Aggregate metered inference usage from a completed, hash-chain-verified
+/// original-host run. This is NOT a provider invoice or answer correctness.
+#[derive(Clone,Debug,Serialize,Deserialize,PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaModelUsage {
+    pub node_id: String,
+    pub status: String,
+    pub target_id: String,
+    pub elapsed_ms: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub model_calls: u32,
+    pub cost_micros: Option<u64>,
 }
 #[derive(Clone,Debug,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,15 +68,39 @@ pub struct ReplicaSnapshot {
     pub captured_at_ms: i64,
     pub graph_state: String,
     pub nodes: Vec<ReplicaNode>,
+    #[serde(default, skip_serializing_if="Vec::is_empty")]
+    pub trace_events: Vec<ReplicaTraceEvent>,
+    #[serde(default, skip_serializing_if="Vec::is_empty")]
+    pub model_usage: Vec<ReplicaModelUsage>,
     pub checksum: String,
 }
 fn hash(snapshot:&ReplicaSnapshot)->Result<String,String>{
-    let bytes=serde_json::to_vec(&(
-        snapshot.version,&snapshot.group,&snapshot.graph_id,
-        &snapshot.source_fingerprint,&snapshot.roster_sha256,
-        snapshot.sequence,snapshot.term,snapshot.captured_at_ms,
-        &snapshot.graph_state,&snapshot.nodes,
-    )).map_err(|e|e.to_string())?;
+    // v1 checksum is byte-for-byte compatible with existing peers. v2 seals
+    // the trace too; an attacker cannot swap event timestamps or states while
+    // retaining the same authenticated, read-back-verified payload.
+    let bytes=if snapshot.version==1{
+        serde_json::to_vec(&(
+            snapshot.version,&snapshot.group,&snapshot.graph_id,
+            &snapshot.source_fingerprint,&snapshot.roster_sha256,
+            snapshot.sequence,snapshot.term,snapshot.captured_at_ms,
+            &snapshot.graph_state,&snapshot.nodes,
+        ))
+    }else if snapshot.version==2{
+        serde_json::to_vec(&(
+            snapshot.version,&snapshot.group,&snapshot.graph_id,
+            &snapshot.source_fingerprint,&snapshot.roster_sha256,
+            snapshot.sequence,snapshot.term,snapshot.captured_at_ms,
+            &snapshot.graph_state,&snapshot.nodes,&snapshot.trace_events,
+        ))
+    }else{
+        serde_json::to_vec(&(
+            snapshot.version,&snapshot.group,&snapshot.graph_id,
+            &snapshot.source_fingerprint,&snapshot.roster_sha256,
+            snapshot.sequence,snapshot.term,snapshot.captured_at_ms,
+            &snapshot.graph_state,&snapshot.nodes,&snapshot.trace_events,
+            &snapshot.model_usage,
+        ))
+    }.map_err(|e|e.to_string())?;
     Ok(format!("{:x}",Sha256::digest(&bytes)))
 }
 fn valid_id(s:&str)->bool{
@@ -68,7 +121,7 @@ impl ReplicaSnapshot{
         Ok(())
     }
     pub fn validate(&self,now:i64)->Result<(),String>{
-        if self.version!=1 || !valid_id(&self.group)||!valid_id(&self.graph_id)||
+        if !matches!(self.version,1|2|3) || !valid_id(&self.group)||!valid_id(&self.graph_id)||
             !self.source_fingerprint.bytes().all(|c|c.is_ascii_hexdigit()&&!c.is_ascii_uppercase())||
             self.source_fingerprint.len()!=64||
             self.roster_sha256.len()!=64 ||
@@ -91,6 +144,44 @@ impl ReplicaSnapshot{
                         c.is_ascii_alphanumeric()||matches!(c,b'-'|b'_'|b'.'))) {
                 return Err("Malformed or duplicate DAG checkpoint task".into());
             }
+        }
+        if (self.version==1 && !self.trace_events.is_empty())||
+            self.trace_events.len()>MAX_TRACE_EVENTS{
+            return Err("Unsupported or excessive distributed trace events".into());
+        }
+        if (self.version<3 && !self.model_usage.is_empty())||
+           self.model_usage.len()>MAX_GRAPH_NODES{
+            return Err("Unsupported or excessive original-host inference telemetry".into());
+        }
+        let mut usage_nodes=std::collections::BTreeSet::new();
+        for usage in &self.model_usage{
+            if !unique.contains(usage.node_id.as_str())||
+                !self.nodes.iter().any(|node|node.id==usage.node_id && node.state==usage.status)||
+                !matches!(usage.status.as_str(),"succeeded"|"failed")||
+                !usage_nodes.insert(usage.node_id.as_str())||
+                usage.target_id.is_empty()||usage.target_id.len()>160||
+                !usage.target_id.bytes().all(|c|
+                    c.is_ascii_alphanumeric()||matches!(c,b'-'|b'_'|b'.'|b':'|b'/'|b'@'|b'+'|b'%'))||
+                usage.elapsed_ms>3_600_000*24||
+                usage.input_tokens>100_000_000||usage.output_tokens>100_000_000||
+                usage.cached_input_tokens>usage.input_tokens||
+                usage.model_calls==0||usage.model_calls>100_000||
+                usage.cost_micros.is_some_and(|cost|cost>1_000_000_000_000){
+                return Err("Malformed or unrelated metered inference telemetry".into());
+            }
+        }
+        let mut last=0;
+        for event in &self.trace_events{
+            if event.sequence<=last||event.sequence>i64::MAX as u64||
+                event.occurred_at_ms<=0||
+                event.occurred_at_ms>self.captured_at_ms.saturating_add(5_000)||
+                event.node_id.as_deref().is_some_and(|id|!unique.contains(id))||
+                !valid_state(&event.state)||
+                !matches!(event.kind.as_str(),"graph_created"|"graph_transition"|
+                    "node_created"|"node_transition"){
+                return Err("Invalid signed remote trace event".into());
+            }
+            last=event.sequence;
         }
         Ok(())
     }
@@ -206,6 +297,71 @@ pub fn list_local(
         serde_json::from_str(&raw).map_err(|e|e.to_string())
     ).collect()
 }
+/// Extract only independently hash-chain-verified metered usage from completed
+/// local daemon runs. Never trust a job status or model-produced success claim.
+fn measured_usage(
+    paths:&super::store::DaemonPaths,store:&DaemonStore,nodes:&[ReplicaNode],
+)->Vec<ReplicaModelUsage>{
+    let Ok(ledger)=RunLedger::open(&paths.ledger_db) else{return vec![]};
+    let mut rows=Vec::new();
+    for node in nodes {
+        if !matches!(node.state.as_str(),"succeeded"|"failed") {continue;}
+        let Some(job)=node.job_id.as_deref()
+            .and_then(|id|store.get_job(id).ok().flatten()) else {continue};
+        let (Some(run_id),Some(start),Some(end))=(
+            job.run_id.as_deref(),job.started_at_ms,job.finished_at_ms
+        ) else{continue};
+        if end<start||end-start>86_400_000{continue;}
+        let Ok(Some(run))=ledger.load_run(run_id) else{continue};
+        let status=match run.status{
+            little_monkey_lib::run_protocol::RunStatus::Succeeded=>"succeeded",
+            little_monkey_lib::run_protocol::RunStatus::Failed=>"failed",
+            _=>continue,
+        };
+        if status!=node.state||run.last_sequence==0||run.last_sequence>4000 {continue;}
+        if !matches!(ledger.verify_run_chain(run_id),
+            Ok(ChainVerification::Intact{
+                covered_from:Some(1),covered_through:Some(last),events_seen,..
+            }) if last==run.last_sequence && events_seen==last) {continue;}
+        // Completed contains canonical terminal usage. A failed run instead
+        // records cumulative usage in its last UsageRecorded event, if any.
+        // Both are read from the verified event chain; never fabricate tokens
+        // for a failed call that provided no metering.
+        let mut cursor=0;
+        let mut metering=None;
+        let mut terminal=None;
+        while cursor<run.last_sequence {
+            let Ok(events)=ledger.load_events(run_id,cursor,200) else{break};
+            if events.is_empty(){break;}
+            for envelope in events {
+                cursor=envelope.sequence;
+                match envelope.event {
+                    RunEvent::UsageRecorded{usage}=>metering=Some(usage),
+                    RunEvent::Completed{usage,..}=>{
+                        metering=Some(usage);terminal=Some("succeeded");
+                    },
+                    RunEvent::Failed{..}=>terminal=Some("failed"),
+                    _=>{},
+                }
+            }
+        }
+        if cursor!=run.last_sequence||terminal!=Some(status){continue;}
+        let Some(usage)=metering else{continue};
+        if usage.model_calls==0{continue};
+        let target=run.spec.target.target_id();
+        if target.is_empty()||target.len()>160||
+            !target.bytes().all(|c|c.is_ascii_alphanumeric()||
+                matches!(c,b'-'|b'_'|b'.'|b':'|b'/'|b'@'|b'+'|b'%')) {continue;}
+        rows.push(ReplicaModelUsage{
+            node_id:node.id.clone(),status:status.into(),target_id:target.to_owned(),
+            elapsed_ms:end-start,input_tokens:usage.input_tokens,
+            output_tokens:usage.output_tokens,
+            cached_input_tokens:usage.cached_input_tokens,
+            model_calls:usage.model_calls,cost_micros:usage.cost_micros,
+        });
+    }
+    rows
+}
 /// Capture an actual locally authorized leader's DAG state for one
 /// operator-selected peer. Neither prompts nor credentials nor model outputs
 /// are included. Outbound sequence allocation is durable and transactional:
@@ -278,13 +434,32 @@ pub fn capture_local_leader(
         params![group,graph,next]
     ).map_err(|e|e.to_string())?;
     tx.commit().map_err(|e|e.to_string())?;
+    // The original author's persistent event ledger is the only trace source.
+    // Never serialize messages, recipes, reports or arbitrary model text.
+    let mut events_stmt=store.connection.prepare(
+        "SELECT event_id,node_id,event_kind,next_state,occurred_at_ms
+         FROM resident_swarm_events WHERE graph_id=?1
+         ORDER BY event_id DESC LIMIT ?2"
+    ).map_err(|e|e.to_string())?;
+    let mut trace_events=events_stmt.query_map(params![graph,MAX_TRACE_EVENTS as i64],|r|{
+        let id:i64=r.get(0)?;
+        Ok(ReplicaTraceEvent{
+            sequence:u64::try_from(id).unwrap_or(0),
+            node_id:r.get(1)?,kind:r.get(2)?,
+            state:r.get(3)?,occurred_at_ms:r.get(4)?,
+        })
+    }).map_err(|e|e.to_string())?
+      .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    trace_events.reverse();
+    drop(events_stmt);
+    let model_usage=measured_usage(paths,&store,&nodes);
     let mut snapshot=ReplicaSnapshot{
-        version:1,group:group.to_owned(),graph_id:graph.to_owned(),
+        version:if model_usage.is_empty(){2}else{3},group:group.to_owned(),graph_id:graph.to_owned(),
         source_fingerprint:members.local().fingerprint.clone(),
         roster_sha256:members.digest(),
         sequence:next as u64,
         term:u64::try_from(term).map_err(|_|"Invalid persisted election term")?,
-        captured_at_ms:now,graph_state:state,nodes,
+        captured_at_ms:now,graph_state:state,nodes,trace_events,model_usage,
         checksum:String::new(),
     };
     snapshot.checksum=hash(&snapshot)?;
@@ -413,6 +588,8 @@ mod tests{
             sequence:1,term:1,captured_at_ms:1000,
             graph_state:"running".into(),
             nodes:vec![ReplicaNode{id:"audit".into(),state:"submitted".into(),job_id:Some("job-original".into())}],
+            trace_events:vec![],
+            model_usage:vec![],
             checksum:String::new(),
         };
         snapshot.checksum=hash(&snapshot).unwrap();
@@ -441,6 +618,96 @@ mod tests{
         ).unwrap();
         assert_eq!(resident_tables,0,
             "a remote success assertion must never create a local graph");
+    }
+    #[test]
+    fn v2_remote_journal_is_authenticated_bounded_and_not_execution_authority(){
+        let (mut store,mut cp,device)=configured();
+        cp.version=2;
+        cp.trace_events=vec![
+            ReplicaTraceEvent{sequence:10,node_id:None,
+                kind:"graph_created".into(),state:"running".into(),occurred_at_ms:900},
+            ReplicaTraceEvent{sequence:12,node_id:Some("audit".into()),
+                kind:"node_transition".into(),state:"submitted".into(),occurred_at_ms:1000},
+        ];
+        cp.seal().unwrap();
+        assert!(ingest(&mut store,&device,&cp,1100).unwrap());
+        let persisted=list_for_member(&store,&device,"team","audit").unwrap();
+        assert_eq!(persisted[0].trace_events,cp.trace_events);
+        let mut modified=cp.clone();
+        modified.trace_events[1].state="succeeded".into();
+        assert!(ingest(&mut store,&device,&modified,1100).is_err(),
+            "modified remote event without a new checksum");
+        modified.seal().unwrap();
+        assert!(ingest(&mut store,&device,&modified,1100).is_err(),
+            "conflicting same-sequence remote trace");
+        modified.sequence=2;modified.seal().unwrap();
+        assert!(ingest(&mut store,&device,&modified,1200).unwrap(),
+            "a fresh signed revision may report new state observations");
+        let mut backward=modified.clone();
+        backward.sequence=3;
+        backward.trace_events.swap(0,1);
+        backward.seal().unwrap();
+        assert!(ingest(&mut store,&device,&backward,1200).is_err());
+        let mut forged=modified.clone();
+        forged.sequence=3;
+        forged.trace_events[0].node_id=Some("unknown-node".into());
+        forged.seal().unwrap();
+        assert!(ingest(&mut store,&device,&forged,1200).is_err());
+        let mut too_many=modified.clone();
+        too_many.sequence=3;
+        too_many.trace_events=(1..=49).map(|n|ReplicaTraceEvent{
+            sequence:n,node_id:Some("audit".into()),
+            kind:"node_transition".into(),state:"submitted".into(),occurred_at_ms:1000,
+        }).collect();
+        too_many.seal().unwrap();
+        assert!(ingest(&mut store,&device,&too_many,1200).is_err());
+        // Existing peers still accept and persist exact legacy v1 checkpoints.
+        let (mut other,legacy,device)=configured();
+        assert!(ingest(&mut other,&device,&legacy,1100).unwrap());
+        assert!(list_for_member(&other,&device,"team","audit").unwrap()[0].trace_events.is_empty());
+        let has_graph:i64=store.connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='table' AND name='resident_swarm_graphs'",
+            [],|r|r.get(0)
+        ).unwrap();
+        assert_eq!(has_graph,0,"peer telemetry cannot authorize a resident graph");
+    }
+    #[test]
+    fn v3_source_metering_is_checksums_bound_bounded_and_readback_durable(){
+        let (mut store,mut cp,device)=configured();
+        cp.version=3;
+        cp.nodes[0].state="succeeded".into();
+        cp.model_usage=vec![ReplicaModelUsage{
+            node_id:"audit".into(),status:"succeeded".into(),target_id:"provider:model".into(),
+            elapsed_ms:1230,input_tokens:120,output_tokens:30,
+            cached_input_tokens:10,model_calls:2,cost_micros:Some(450),
+        }];
+        cp.seal().unwrap();
+        assert!(ingest(&mut store,&device,&cp,1100).unwrap());
+        assert_eq!(list_for_member(&store,&device,"team","audit").unwrap()[0].model_usage,
+            cp.model_usage);
+        let mut forged=cp.clone();
+        forged.model_usage[0].cost_micros=Some(999_999);
+        assert!(ingest(&mut store,&device,&forged,1100).is_err(),
+            "changed original-host metered amount must invalidate checksum");
+        forged.seal().unwrap();
+        assert!(ingest(&mut store,&device,&forged,1100).is_err(),
+            "conflicting same-sequence model usage must not replace durable receipt");
+        for bad in [
+            ReplicaModelUsage{node_id:"absent".into(),..cp.model_usage[0].clone()},
+            ReplicaModelUsage{cached_input_tokens:121,..cp.model_usage[0].clone()},
+            ReplicaModelUsage{model_calls:0,..cp.model_usage[0].clone()},
+            ReplicaModelUsage{target_id:"secret query".into(),..cp.model_usage[0].clone()},
+        ] {
+            let mut modified=cp.clone();
+            modified.sequence=2;modified.model_usage=vec![bad];
+            modified.seal().unwrap();
+            assert!(ingest(&mut store,&device,&modified,1200).is_err());
+        }
+        let mut legacy=cp.clone();
+        legacy.version=2;legacy.sequence=2;legacy.seal().unwrap();
+        assert!(ingest(&mut store,&device,&legacy,1200).is_err(),
+            "an older schema cannot impersonate source-measured run usage");
     }
     #[test]
     fn altered_timestamp_term_checksum_or_huge_state_fails_closed(){
