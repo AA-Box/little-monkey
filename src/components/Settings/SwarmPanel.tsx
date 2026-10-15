@@ -42,9 +42,15 @@ import {
 import {
   clearSwarmBenchmark, importSwarmBenchmark, loadSwarmBenchmark,
   setSwarmBenchmarkRouting, swarmBenchmarkRoutingEnabled,
+  setSwarmContinuousQuality,swarmContinuousQualityEnabled,
+  invalidateSwarmContinuousQuality,
 } from '../../lib/swarmVerifiedBenchmarks';
+import {synchronizeContinuousSwarmQuality} from '../../lib/swarmContinuousEvidence';
+import {billingGuardEnabled,setBillingGuardEnabled,billingScope,setBillingScope,
+  synchronizeOfficialBilling,billingGuardAllowsKeys} from '../../lib/swarmBillingEvidence';
 import { skillLearningClient } from '../../lib/skillLearningClient';
 import { setSwarmCostOptimization,swarmCostOptimizationEnabled } from '../../lib/swarmCostOptimizer';
+import { loadSwarmLiveOutcomes } from '../../lib/swarmLiveOptimizer';
 import { decideSwarmNote, listSwarmNotebook, revertSwarmNote } from '../../lib/swarmNotebook';
 import { approvedNotebookVectorClaim } from '../../lib/swarmNotebookVector';
 import { useSessionStore } from '../../store/sessionStore';
@@ -80,6 +86,17 @@ export function SwarmPanel() {
   const [benchmark, setBenchmark] = useState(() => loadSwarmBenchmark());
   const [benchmarkRouting, setBenchmarkRouting] = useState(() => swarmBenchmarkRoutingEnabled());
   const [costRouting, setCostRouting] = useState(() => swarmCostOptimizationEnabled());
+  const [continuousQuality,setContinuousQuality]=useState(()=>swarmContinuousQualityEnabled());
+  const [billingGuard,setBillingGuard]=useState(()=>billingGuardEnabled());
+  const [openaiBillingScope,setOpenaiBillingScope]=useState(()=>billingScope('openai')??'');
+  const [anthropicBillingScope,setAnthropicBillingScope]=useState(()=>billingScope('anthropic')??'');
+  useEffect(()=>{
+    if(!continuousQuality)return;
+    const refresh=()=>setBenchmark(loadSwarmBenchmark());
+    const timer=window.setInterval(refresh,60_000);
+    return ()=>window.clearInterval(timer);
+  },[continuousQuality]);
+  const recentOperationalOutcomes=loadSwarmLiveOutcomes();
   const [specialistQuality, setSpecialistQuality] = useState(() => listVerifiedSpecialists());
   const [specialistQualityDomain, setSpecialistQualityDomain] = useState<VerifiedSpecialistDomain>('security');
   const [specialistQualityRouting, setSpecialistQualityRouting] = useState(() => verifiedSpecialistRoutingEnabled('security'));
@@ -615,6 +632,27 @@ export function SwarmPanel() {
     } catch (cause) { setError('Could not capture verified learning evidence: ' + String(cause)); }
     finally { setLearningBusy(null); }
   }
+  async function toggleContinuousQuality(enabled:boolean){
+    if(enabled&&!window.confirm('Enable continuously refreshed, independently tested real-model quality gates? The installed operator-owned benchmark service must write swarm-quality-latest.json to this app data folder every day. A missing, failed or stale receipt blocks quality/cost optimizer routing. No models or privileges are automatically installed.'))return;
+    if(enabled){
+      setSwarmContinuousQuality(true);
+      setContinuousQuality(true);
+      setSwarmBenchmarkRouting(true);
+      const latest=await synchronizeContinuousSwarmQuality();
+      setBenchmark(latest);
+      setBenchmarkRouting(!!latest);
+      setNotice(latest?'Fresh independent quality receipt accepted. Only policy-eligible models can be routed.':
+        'Continuous mode enrolled. No fresh independent receipt found yet; quality routing remains blocked.');
+    }else{
+      invalidateSwarmContinuousQuality();
+      setSwarmContinuousQuality(false);
+      setContinuousQuality(false);
+      setSwarmBenchmarkRouting(false);
+      setBenchmarkRouting(false);
+      setBenchmark(null);
+      setNotice('Continuous independent model routing disabled. Re-import a manual benchmark to use manual mode.');
+    }
+  }
   async function importLiveBenchmark() {
     setError(''); setNotice('');
     const selected = await open({ multiple: false, filters: [{
@@ -766,6 +804,11 @@ export function SwarmPanel() {
       </div>
       <div className="rounded-lg border border-border bg-surface p-3">
         <h4 className="text-sm font-semibold text-foreground">Verified-fixture model accuracy</h4>
+        <label className="mt-2 flex gap-2 text-xs text-foreground">
+          <input type="checkbox" checked={continuousQuality}
+            onChange={event=>{void toggleContinuousQuality(event.target.checked)}} />
+          Enable unattended independent quality monitoring. Read a fresh local runner receipt every minute and fail closed after 36 hours, test failure or regression; never trust success asserted by a model.
+        </label>
         <p className="mt-1 text-xs text-muted">Import measurements produced by <code>pnpm test:swarm-models:live</code> on real configured models. Results are operator-provided and not cryptographic proof. Little Monkey independently validates fixture completeness and scores. Opt-in routing affects subagents only, after eligibility and routing-policy restrictions; explicit preferred models always win.</p>
         <div className="mt-3 flex flex-wrap gap-2">
           <Button size="sm" disabled={benchmarkBusy} onClick={() => void importLiveBenchmark()}>Import real-model benchmark JSON</Button>
@@ -787,8 +830,44 @@ export function SwarmPanel() {
                 setSwarmCostOptimization(event.target.checked);
                 setCostRouting(swarmCostOptimizationEnabled());
               }}/>
-            Additionally optimize price among independently graded, quality-equivalent, already eligible subagent targets. Requires six fixture observations per model, configured input/output rates, and at least three historical usage samples. Minimum 10% estimated rate savings; never overrides model pins, policy restrictions or privacy. This estimates token rates, not bills.
+            Additionally optimize price among independently graded, quality-equivalent, already eligible subagent targets. Requires six fixture observations per model, configured input/output rates, and at least three historical usage samples. Minimum 10% estimated rate savings; never overrides model pins, policy restrictions or privacy. After six real baseline completions, an eligible cheaper candidate starts at 10% canary, ramps to 30% with six recorded candidate outcomes, then to 100% with 12, unless the real-run failure/latency circuit breaker trips. Model completion is not answer correctness. This estimates token rates, not bills.
           </label>
+          <label className="mt-3 flex items-start gap-2 text-xs text-foreground">
+            <input type="checkbox" checked={billingGuard} onChange={event=>{
+              const enabled=event.target.checked;
+              if(enabled&&!window.confirm('Require independently fetched provider admin cost reports for every provider model before opting into cheaper routing? This fails closed when billing keys, exact scopes, full-month reports, or metered ledger estimates are missing. It does not verify answer correctness or settled invoices.'))return;
+              setBillingGuardEnabled(enabled);setBillingGuard(enabled);
+              if(enabled)void synchronizeOfficialBilling();
+            }}/>
+            Require real provider-admin cost reconciliation before cost-based model routing. Absent, mismatched, or stale billing evidence blocks optimization, never normal model execution.
+          </label>
+          <div className="mt-2 grid gap-2 sm:grid-cols-2">
+            <label className="text-xs text-foreground">OpenAI API key ID (not the secret)
+              <input className="mt-1 w-full rounded border border-border bg-background p-1"
+                value={openaiBillingScope} onChange={event=>setOpenaiBillingScope(event.target.value)}
+                onBlur={()=>{try{setBillingScope('openai',openaiBillingScope.trim())}
+                  catch(error){setError(String(error))}}} placeholder="key ID from organization billing" />
+            </label>
+            <label className="text-xs text-foreground">Anthropic workspace ID (not the secret)
+              <input className="mt-1 w-full rounded border border-border bg-background p-1"
+                value={anthropicBillingScope} onChange={event=>setAnthropicBillingScope(event.target.value)}
+                onBlur={()=>{try{setBillingScope('anthropic',anthropicBillingScope.trim())}
+                  catch(error){setError(String(error))}}} placeholder="workspace ID for reported costs" />
+            </label>
+          </div>
+          <p className="mt-1 text-xs text-muted">The installed operator-owned runner fetches official costs using admin credentials from its environment. These are provider-reported costs, not settled invoices. Scopes are operator-asserted: only select an API key/workspace exclusively used by this installation. Scope IDs and validated receipts are held in memory, not browser storage; re-enter scope IDs after every app restart. The billing guard fails closed until fresh evidence is imported. Cost guard: {billingGuard?billingGuardAllowsKeys(benchmark.ranking.map(row=>row.target))?'current scoped reports verified':'blocked until complete scoped reports arrive':'off'}.</p>
+          <p className="mt-2 text-xs text-muted">Operational feedback (local and durable): {recentOperationalOutcomes.length} terminal model runs in the last 14 days. Continuous cost-routing safety decisions are made on each subagent dispatch; only an actual run can feed this count. This is not a verified answer-quality score.</p>
+          <p className="mt-1 text-xs text-muted">
+            Real usage attached to {recentOperationalOutcomes.filter(row=>row.usage).length}/{recentOperationalOutcomes.length} terminal runs ·
+            observed tokens {recentOperationalOutcomes.reduce((n,row)=>n+(row.usage?.promptTokens??0)+(row.usage?.completionTokens??0),0).toLocaleString()} ·
+            configured-rate estimate {recentOperationalOutcomes.some(row=>row.meteredCostUsd!==undefined)?
+              'USD '+recentOperationalOutcomes.reduce((n,row)=>n+(row.meteredCostUsd??0),0).toFixed(6)+' (partial when rates unknown)':
+              'unavailable'} · NOT audited provider billing.
+          </p>
+          {benchmark.ranking.map(row=>{
+            const recent=recentOperationalOutcomes.filter(item=>item.target===row.target);
+            return <p key={row.target} className="mt-1 text-xs text-muted">{row.target}: {recent.length} observed · {recent.filter(item=>item.status==='error').length} failed · {recent.filter(item=>item.status==='done').length} finished</p>;
+          })}
         </>}
       </div>
       <div className="rounded-lg border border-border bg-surface p-3">
@@ -1118,10 +1197,14 @@ export function SwarmPanel() {
             </p>)}
             {distributedTrace && <details className="mt-2">
               <summary className="cursor-pointer">Combined local and peer trace · {distributedTrace.events.length} events</summary>
-              <p>Fresh peer checkpoints: {distributedTrace.freshPeers} · Stale: {distributedTrace.stalePeers} · Invalid: {distributedTrace.invalidPeerRecords}</p>
+              <p>Fresh peer checkpoints: {distributedTrace.freshPeers} · Stale: {distributedTrace.stalePeers} · Invalid: {distributedTrace.invalidPeerRecords} · Original remote journal events: {distributedTrace.historicalPeerEvents} · Legacy snapshot-only peers: {distributedTrace.legacySnapshotPeers}</p>
+              <p>Verified source-run metering: {distributedTrace.meteredPeerRuns} completed peer runs; token counts are from the original host's intact run ledger, and reported amounts are NOT provider invoices or independent answer-quality grades.</p>
+              {distributedTrace.meteredUsage.map(row=><p key={row.sourceFingerprint+':'+row.node} className="break-all">
+                Peer {row.sourceFingerprint.slice(0,12)}… · {row.node} · {row.status} · target {row.targetId} · input {row.inputTokens.toLocaleString()} · output {row.outputTokens.toLocaleString()} · cache {row.cachedInputTokens.toLocaleString()} · calls {row.modelCalls} · elapsed {row.elapsedMs} ms · {row.meteredCostMicros===null ? 'cost unavailable' : 'metered micro-USD '+row.meteredCostMicros.toLocaleString()}
+              </p>)}
               <div className="max-h-60 space-y-1 overflow-auto" aria-label="Authenticated distributed DAG observations">
                 {distributedTrace.events.slice(-40).map((entry,index)=><p key={entry.source+':'+entry.sequence+':'+entry.node+':'+index}>
-                  {entry.source==='local-ledger'?'Local journal':'Signed peer report'} · {entry.node} · {entry.state} · #{entry.sequence}
+                  {entry.source==='local-ledger'?'Local journal':'Signed peer report'} · {entry.node} · {entry.kind} · {entry.state} · #{entry.sequence} · {new Date(entry.occurredAt).toLocaleString()}
                   {entry.term!==null?' · term '+entry.term:''}
                 </p>)}
               </div>

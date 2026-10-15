@@ -9,6 +9,7 @@
  */
 export const SWARM_BENCHMARK_KEY = 'little-monkey-swarm-verified-benchmark-v1';
 export const SWARM_BENCHMARK_OPT_IN = 'little-monkey-swarm-benchmark-routing-v1';
+export const SWARM_CONTINUOUS_QUALITY_OPT_IN='little-monkey-swarm-continuous-quality-v1';
 
 const FIXTURES = ['logic-regression', 'authorization-regression', 'parsing-regression'] as const;
 const MAX_AGE_MS = 90 * 24 * 60 * 60_000;
@@ -112,28 +113,62 @@ export function parseLiveSwarmBenchmark(json: unknown, now = Date.now()): SwarmB
   return { generatedAt: data.generatedAt, importedAt: now, ranking };
 }
 
+/** Persist the original independently graded per-run fixture observations,
+ * not a writable summary. Re-run the parser on every routing read so an
+ * edited/stale/incomplete local record cannot silently certify a new model.
+ * Old v1 summary-only cache intentionally fails closed until re-imported. */
+interface StoredSwarmBenchmarkEvidence {
+  storageVersion: 2;
+  importedAt: number;
+  evidence: unknown;
+  automatic?: boolean;
+}
 export function loadSwarmBenchmark(now = Date.now()): SwarmBenchmarkSummary | null {
   try {
     const raw = localStorage.getItem(SWARM_BENCHMARK_KEY);
-    if (!raw) return null;
+    if (!raw || raw.length > 128_000 || !Number.isSafeInteger(now) || now<=0) return null;
     const saved: unknown = JSON.parse(raw);
     if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return null;
-    const stored = saved as Partial<SwarmBenchmarkSummary>;
-    if (!Array.isArray(stored.ranking) || !finiteInt(stored.importedAt, 0, now + 5 * 60_000) ||
-      typeof stored.generatedAt !== 'string' || Number.isNaN(Date.parse(stored.generatedAt)) ||
-      now - Date.parse(stored.generatedAt) > MAX_AGE_MS || Date.parse(stored.generatedAt) > now + 5*60_000 ||
-      stored.ranking.length > 8) return null;
-    if (!stored.ranking.every(x => targetId(x.target) && finiteInt(x.attempts,3,15) &&
-      finiteInt(x.passes,0,x.attempts) && x.accuracy === Number((x.passes/x.attempts).toFixed(4)) &&
-      (x.averageVerifiedMs === null || finiteInt(x.averageVerifiedMs,0,3_600_000)))) return null;
-    return stored as SwarmBenchmarkSummary;
+    const stored = saved as Partial<StoredSwarmBenchmarkEvidence>;
+    if (stored.storageVersion!==2 || !finiteInt(stored.importedAt, 1, now+5*60_000) ||
+        stored.evidence===undefined || now-stored.importedAt>MAX_AGE_MS) return null;
+    // Continuous mode is fail-closed. A manual import or an old passing
+    // fixture cannot keep an autonomous optimizer enabled after the live
+    // independent evaluator stops. Only fresh automatic source evidence counts.
+    const automatic=localStorage.getItem(SWARM_CONTINUOUS_QUALITY_OPT_IN)==='true';
+    if(automatic&&(stored.automatic!==true||
+      now-stored.importedAt>36*60*60_000))return null;
+    const verified=parseLiveSwarmBenchmark(stored.evidence,now);
+    if(automatic&&now-Date.parse(verified.generatedAt)>36*60*60_000)return null;
+    // Parse may be given a malicious generatedAt; it rejects stale/future
+    // and rebuilds all scores from fixture observations rather than trusting
+    // a reported ranking.
+    return {...verified,importedAt:stored.importedAt};
   } catch { return null; }
 }
 
-export function importSwarmBenchmark(value: unknown, now = Date.now()): SwarmBenchmarkSummary {
+export function importSwarmBenchmark(value: unknown, now = Date.now(),automatic=false): SwarmBenchmarkSummary {
   const parsed = parseLiveSwarmBenchmark(value, now);
-  localStorage.setItem(SWARM_BENCHMARK_KEY, JSON.stringify(parsed));
+  const source=JSON.stringify(value);
+  if(source.length>128_000)throw new Error('Benchmark evidence exceeds retention limits.');
+  localStorage.setItem(SWARM_BENCHMARK_KEY, JSON.stringify({
+    storageVersion:2,importedAt:now,evidence:value,automatic,
+  } satisfies StoredSwarmBenchmarkEvidence));
   return parsed;
+}
+/** Continuous mode is explicitly enrolled and cannot silently fall back to
+ * a human-imported 90-day-old score after the background evaluator stops. */
+export function setSwarmContinuousQuality(enabled:boolean):void{
+  localStorage.setItem(SWARM_CONTINUOUS_QUALITY_OPT_IN,enabled?'true':'false');
+}
+export function swarmContinuousQualityEnabled():boolean{
+  try{return localStorage.getItem(SWARM_CONTINUOUS_QUALITY_OPT_IN)==='true';}
+  catch{return false;}
+}
+export function invalidateSwarmContinuousQuality():void{
+  if(swarmContinuousQualityEnabled()){
+    localStorage.removeItem(SWARM_BENCHMARK_KEY);
+  }
 }
 export function setSwarmBenchmarkRouting(enabled: boolean): void {
   localStorage.setItem(SWARM_BENCHMARK_OPT_IN, enabled ? 'true' : 'false');

@@ -341,6 +341,10 @@ pub struct PlacedRunStatus {
     /// result at the origin.
     #[serde(default)]
     pub result: Option<serde_json::Value>,
+    /// Redacted native node-run metering, when backed by a complete,
+    /// hash-chain-verified source ledger. NOT a provider bill or model grade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_metering: Option<serde_json::Value>,
 }
 
 /// The execution-relevant half of a placed `RunSpec`, frozen into the node's

@@ -340,13 +340,18 @@ pub(crate) async fn refresh_remote_thread(
                 let Some(in_reply_to) = payload["in_reply_to"].as_str() else {
                     continue;
                 };
+                let state=payload["state"].as_str().unwrap_or("succeeded");
                 store.record_outbound_peer_result(
-                    alias,
-                    in_reply_to,
-                    payload["state"].as_str().unwrap_or("succeeded"),
-                    payload["text"].as_str(),
-                    now,
+                    alias,in_reply_to,state,payload["text"].as_str(),now,
                 )?;
+                // Peer result came over enrolled pinned TLS/HMAC. Store only
+                // strictly typed, bounded original-run metering and never
+                // infer usage from a free-form model response.
+                if let Some(metering)=payload.get("model_metering").filter(|v|!v.is_null()){
+                    store.record_outbound_peer_metering(
+                        alias,in_reply_to,state,metering,
+                    )?;
+                }
             }
             // The peer's echo of what this installation sent, which is where a
             // refusal shows up.
