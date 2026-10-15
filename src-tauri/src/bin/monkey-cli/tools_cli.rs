@@ -140,6 +140,7 @@ pub fn grep(
     state: &AppState,
     pattern: &str,
     path: Option<&str>,
+    structure: bool,
 ) -> Result<Vec<serde_json::Value>, String> {
     let regex = Regex::new(pattern).map_err(|e| format!("Invalid regex '{pattern}': {e}"))?;
     let (search_root, _display_root) =
@@ -178,9 +179,17 @@ pub fn grep(
 
         for (idx, line) in content.lines().enumerate() {
             if regex.is_match(line) {
-                matches.push(
-                    serde_json::json!({ "file": display_path, "line": idx + 1, "text": line }),
-                );
+                let mut row = serde_json::json!({
+                    "file": display_path, "line": idx + 1, "text": line,
+                });
+                if structure {
+                    if let Some(hint) = little_monkey_lib::structural_grep::nearest_declaration(
+                        entry.path(), &content, idx + 1,
+                    ) {
+                        row["structure"] = hint;
+                    }
+                }
+                matches.push(row);
                 if matches.len() >= GREP_MAX_MATCHES {
                     break 'outer;
                 }
