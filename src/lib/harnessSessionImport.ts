@@ -90,7 +90,12 @@ function classify(row: Row): {role: 'user'|'assistant'; text: string} | null {
   if (role !== 'user' && role !== 'assistant') return null;
   const raw = source.content ?? source.text ?? row.parts ?? row.content ?? row.text;
   const text = contentString(raw);
-  return text ? {role,text} : null;
+  // A Claude tool_result is a message written by the tool, *not* the human.
+  // Preserve it as inert assistant context rather than as a trusted new
+  // instruction from the importing user.
+  const toolOnly = Array.isArray(raw) && raw.length > 0 &&
+    raw.every(item => object(item)?.type === 'tool_result');
+  return text ? {role: toolOnly ? 'assistant' : role,text} : null;
 }
 
 function identify(raw: Row[]): Harness {
@@ -134,7 +139,10 @@ export function parseHarnessSession(source: string): HarnessImport {
   const rows = rawRows(source);
   const harness = identify(rows);
   const sessions = new Set(rows.map(row=>
-    str(row.sessionId) || str(object(row.payload)?.session_id) ||
+    str(row.sessionId) || str(row.sessionID) ||
+    (row.type === 'session_meta' ? str(object(row.payload)?.id) : '') ||
+    (row.type === 'session' ? str(row.id) : '') ||
+    str(object(row.payload)?.session_id) ||
     str(object(object(row.payload)?.session)?.id) || str(row.session_id))
     .filter(Boolean));
   if (sessions.size > 1) throw new Error('Export contains multiple sessions; select a single session file.');
