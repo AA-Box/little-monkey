@@ -3133,7 +3133,7 @@ async function runAgentTurnBody(
       skillSearchToolEnabled,
       settings.desktopControlEnabled,
       deviceActionAvailable(),
-      settings.sessionCollaborationEnabled,
+      settings.sessionCollaborationEnabled && mode !== 'plan',
     ),
     hasWorkspace,
   );
@@ -3367,7 +3367,7 @@ async function runAgentTurnBody(
       const currentSettings = useSettingsStore.getState();
       if (toolName === 'remember' && !currentSettings.memoryEnabled) return false;
       if ((toolName === 'session_send_message' || toolName === 'session_list_peers')
-          && !currentSettings.sessionCollaborationEnabled) return false;
+          && (!currentSettings.sessionCollaborationEnabled || usePermissionStore.getState().mode === 'plan')) return false;
       if (WEB_TOOL_NAMES.has(toolName) && !currentSettings.webToolsEnabled) return false;
       if ((toolName === 'task' || toolName === 'workflow') && !currentSettings.subagentsEnabled && !ultracode) {
         return false;
