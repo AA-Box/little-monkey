@@ -780,6 +780,10 @@
           "pattern": {
             "description": "Regular expression pattern to search for.",
             "type": "string"
+          },
+          "structure": {
+            "description": "Include bounded lexical declaration hints, declaration line and distance; these are not AST containment proof.",
+            "type": "boolean"
           }
         },
         "required": [
