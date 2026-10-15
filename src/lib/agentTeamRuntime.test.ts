@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 import {describe,expect,it,beforeEach} from 'vitest';
 import {AgentTeamRuntime,MAX_RUNTIME_AGENTS,MAX_RUNTIME_DEPTH,AGENT_TEAM_TOOLS} from './agentTeamRuntime';
 describe('live runtime agent collaboration',()=>{
