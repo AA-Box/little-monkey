@@ -107,11 +107,17 @@ function rawRows(text: string): Row[] {
     throw new Error('Coding session exceeds the 16 MiB import limit.');
   const trimmed = text.trim();
   if (!trimmed) throw new Error('Coding-session file is empty.');
-  if (trimmed[0] === '[' || (trimmed[0] === '{' && !trimmed.includes('\n'))) {
-    const raw: unknown = JSON.parse(trimmed);
-    const source = Array.isArray(raw) ? raw : object(raw)?.messages;
-    const rows = Array.isArray(source) ? source : [raw];
-    return rows.map(object).filter((x):x is Row => !!x);
+  // First try a whole JSON document (including pretty-printed exports).
+  // JSONL is attempted only when parsing one document did not work.
+  if (trimmed[0] === '[' || trimmed[0] === '{') {
+    try {
+      const raw: unknown = JSON.parse(trimmed);
+      const source = Array.isArray(raw) ? raw : object(raw)?.messages;
+      const rows = Array.isArray(source) ? source : [raw];
+      return rows.map(object).filter((x):x is Row => !!x);
+    } catch {
+      // A normal JSONL log consists of separate JSON objects per line.
+    }
   }
   const rows: Row[] = [];
   for (const line of trimmed.split(/\r?\n/)) {
