@@ -20,6 +20,10 @@ import {
   type MemoryEntry,
 } from "../../lib/memoryStudio";
 import { errorMessage } from "../../lib/errors";
+import {
+  requestSemanticMemoryReview,reviewScopeKey,
+  type SemanticReviewProposal,
+} from "../../lib/semanticMemoryReview";
 
 /** Must match `MAX_FACT_CHARS` in `src-tauri/src/memory.rs`. */
 const MAX_FACT_CHARS = 500;
@@ -439,6 +443,7 @@ export function MemoryStudioPanel() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [semanticSuggestions, setSemanticSuggestions] = useState<SemanticReviewProposal[]>([]);
 
   const refresh = async () => {
     try {
@@ -571,6 +576,52 @@ export function MemoryStudioPanel() {
     setSuccess(t("MemoryStudioPanel.mergeComplete", { count: merged.merged_from.length }));
   });
 
+  // Explicit button is the user approval to ask the SELECTED model to
+  // inspect bounded current agent facts; cloud privacy/cost policies still
+  // apply. The model can propose, but cannot mutate any memory.
+  const requestReview = () => run("semantic-review",async()=>{
+    const groups = new Map<string,MemoryEntry[]>();
+    for(const fact of filtered){
+      if(fact.source!=="agent" || !wouldReachPrompt(fact,now) || fact.pinned ||
+         fact.text.length>500)continue;
+      const key=reviewScopeKey(fact);
+      const list=groups.get(key)??[];
+      list.push(fact);
+      groups.set(key,list);
+    }
+    const batch=[...groups.values()].filter(items=>items.length>=2)
+      .sort((a,b)=>b.length-a.length)[0]?.slice(0,24);
+    if(!batch)throw Error("At least two eligible agent-owned memories in one scope are required.");
+    const proposals=await requestSemanticMemoryReview(batch);
+    setSemanticSuggestions(proposals);
+    if(!proposals.length)setSuccess("No confident semantic changes suggested for this scope.");
+  });
+
+  const applySemanticSuggestion = (proposal:SemanticReviewProposal,keepId?:string)=>
+    run("semantic-approval",async()=>{
+      const latest=await listAllMemories();
+      // A human clicked Approve, but facts may have changed in another
+      // window since the model proposed them. Re-check every original
+      // identity, text, scope and eligibility before requesting Rust writes.
+      const originals=proposal.ids.map(id=>latest.find(f=>f.id===id));
+      if(originals.some((fact,i)=>!fact || fact.text!==proposal.expectedTexts[i]||
+         reviewScopeKey(fact)!==proposal.scopeKey ||
+         fact.source!=="agent" || !wouldReachPrompt(fact, new Date().toISOString()) ||
+         fact.pinned))throw Error("Memory facts changed since review; refresh and re-review.");
+      if(proposal.kind==="merge"){
+        await mergeMemories(proposal.ids,originals[0]!.project_root,proposal.suggestedText);
+        setSuccess("Approved and reversibly merged semantic memory suggestion.");
+      }else{
+        if(!keepId || !proposal.ids.includes(keepId))
+          throw Error("Select which contradictory memory to retain.");
+        const other=originals.find(f=>f?.id!==keepId)!;
+        await setMemoryEnabled(other.id,other.project_root,false);
+        setSuccess("Resolved selected contradiction; the other memory is disabled, not deleted.");
+      }
+      setSemanticSuggestions(items=>items.filter(item=>item!==proposal));
+      await refresh();
+    });
+
   const purge = () => run("purge", async () => {
     const removed = await purgeExpiredMemories();
     await refresh();
@@ -643,6 +694,64 @@ export function MemoryStudioPanel() {
       </div>
 
       {statusBanner(error, success)}
+      <div className="flex items-center gap-2 text-xs text-muted">
+        <Button size="sm" variant="secondary"
+          disabled={busy !== null}
+          onClick={() => void requestReview()}>
+          {busy==="semantic-review"?"Reviewing…":"Review paraphrases with selected model"}
+        </Button>
+        <span>
+          Optional: sends up to 24 unpinned agent memories from one scope through
+          your selected model and privacy controls. Nothing is changed until approved.
+        </span>
+      </div>
+
+      {semanticSuggestions.length>0 && (
+        <section className="space-y-2 rounded-lg border border-border p-3"
+          aria-label="Model-proposed memory changes awaiting approval">
+          <h3 className="text-sm font-semibold">Review proposed memory changes</h3>
+          <p className="text-xs text-muted">
+            The model may be wrong. Read both originals and the proposed summary
+            before making a deliberate decision.
+          </p>
+          {semanticSuggestions.map((proposal,index)=>(
+            <div key={proposal.kind+":"+proposal.ids.join(":")+":"+index}
+              className="space-y-1 rounded border border-border p-2 text-xs">
+              <p className="font-semibold">
+                {proposal.kind==="merge"?"Suggested semantic merge":"Possible contradiction"}
+              </p>
+              {proposal.expectedTexts.map((value,i)=>(
+                <p key={proposal.ids[i]}>{i+1}. {value}</p>
+              ))}
+              {proposal.kind==="merge" && (
+                <p className="font-semibold">Proposed final memory: {proposal.suggestedText}</p>
+              )}
+              <p className="text-muted">Model rationale: {proposal.reason}</p>
+              <p className="text-[10px] text-muted">Scope: {proposal.scopeKey}</p>
+              <div className="flex flex-wrap gap-2">
+                {proposal.kind==="merge" ? (
+                  <Button size="sm" variant="secondary" disabled={busy!==null}
+                    onClick={()=>void applySemanticSuggestion(proposal)}>
+                    Approve reversible merge
+                  </Button>
+                ) : (
+                  proposal.ids.map((id,i)=>(
+                    <Button key={id} size="sm" variant="secondary" disabled={busy!==null}
+                      onClick={()=>void applySemanticSuggestion(proposal,id)}>
+                      Keep statement {i+1}
+                    </Button>
+                  ))
+                )}
+                <Button size="sm" variant="ghost" disabled={busy!==null}
+                  onClick={()=>setSemanticSuggestions(items=>items.filter(item=>item!==proposal))}>
+                  Dismiss
+                </Button>
+              </div>
+            </div>
+          ))}
+        </section>
+      )}
+
       {contradictions.length > 0 && (
         <section className="rounded-lg border border-warning/40 p-3" aria-label="Memory contradictions requiring review">
           <h3 className="text-sm font-semibold">Contradictory memories need your decision</h3>
