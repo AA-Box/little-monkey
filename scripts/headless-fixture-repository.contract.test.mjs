@@ -4,14 +4,15 @@ import {spawnSync} from 'node:child_process';
 import {mkdtempSync,mkdirSync,writeFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {initHeadlessFixtureRepository} from './headless-fixture-repository.mjs';
+import {initHeadlessFixtureRepository,assertHeadlessFixtureUnchanged} from './headless-fixture-repository.mjs';
 
 test('real temporary fixture is a clean committed Git repository accepted by autonomous task startup',()=>{
  const root=mkdtempSync(join(tmpdir(),'little-monkey-native-git-fixture-'));
  try{
   mkdirSync(join(root,'src'));
   writeFileSync(join(root,'src','fixture.txt'),'MARKER_FROM_ACTUAL_FIXTURE\n');
-  initHeadlessFixtureRepository(root);
+  const baseline=initHeadlessFixtureRepository(root);
+  assertHeadlessFixtureUnchanged(root,baseline);
   const git=(...args)=>{
    const out=spawnSync('git',['-C',root,...args],{
     encoding:'utf8',timeout:15000,maxBuffer:1024*1024,
@@ -24,5 +25,11 @@ test('real temporary fixture is a clean committed Git repository accepted by aut
   assert.equal(git('show','HEAD:src/fixture.txt'),'MARKER_FROM_ACTUAL_FIXTURE');
   // Read-only challenge has a committed HEAD even without user's ~/.gitconfig.
   assert.equal(git('log','-1','--format=%an'),'Little Monkey Benchmark');
+  writeFileSync(join(root,'src','fixture.txt'),'UNAUTHORIZED EDIT\n');
+  assert.throws(()=>assertHeadlessFixtureUnchanged(root,baseline),/changed or added/);
+  writeFileSync(join(root,'src','fixture.txt'),'MARKER_FROM_ACTUAL_FIXTURE\n');
+  writeFileSync(join(root,'src','unexpected.txt'),'unexpected untracked');
+  assert.throws(()=>assertHeadlessFixtureUnchanged(root,baseline),/changed or added/);
+
  }finally{rmSync(root,{recursive:true,force:true});}
 });
