@@ -35,6 +35,35 @@ export function rssForTree(rows, rootPid) {
   const pids = descendants(rows,rootPid);
   return {pids,rssKiB:pids.reduce((sum,pid)=>sum+rows.get(pid).rssKiB,0)};
 }
+/**
+ * Linux proportional set size from /proc/PID/smaps_rollup, in KiB.
+ * Unlike RSS, PSS apportions shared pages and is comparable in definition
+ * to JCode's reported Linux PSS (only with identical process scope).
+ * A missing/denied rollup returns no measurement; NEVER report it as zero.
+ */
+export function parseLinuxSmapsPssKiB(contents) {
+  if(typeof contents!=='string')throw Error('Invalid smaps_rollup contents');
+  const matches=[...contents.matchAll(/^Pss:\s+(\d+)\s+kB\s*$/gm)];
+  if(matches.length!==1)throw Error('Missing or ambiguous Linux Pss in smaps_rollup');
+  const pss=Number(matches[0][1]);
+  if(!Number.isSafeInteger(pss)||pss<0)throw Error('Invalid OS PSS size');
+  return pss;
+}
+
+/** A complete PSS snapshot must cover every PID included in the RSS tree.
+ * Missing processes/permission denials yield null, not guessed values. */
+export function completeTreePssKiB(pids, rollupByPid) {
+  if(!Array.isArray(pids)||!pids.length||!(rollupByPid instanceof Map))return null;
+  let total=0;
+  for(const pid of pids) {
+    const bytes=rollupByPid.get(pid);
+    if(typeof bytes!=='string')return null;
+    try {total+=parseLinuxSmapsPssKiB(bytes);}
+    catch {return null;}
+  }
+  return total;
+}
+
 export function summary(level, outcomes, samples) {
   if (!Number.isInteger(level) || level < 1 || !Array.isArray(outcomes) ||
       outcomes.length !== level || !Array.isArray(samples) || !samples.length)
