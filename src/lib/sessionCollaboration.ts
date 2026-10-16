@@ -13,6 +13,7 @@ import {textContent} from './llamaClient';
 import {wrapUntrustedContent} from './untrustedContent';
 import {flushSessionPersistence,useSessionStore} from '../store/sessionStore';
 import {useSettingsStore} from '../store/settingsStore';
+import {primaryRoot,useWorkspaceStore} from '../store/workspaceStore';
 
 const MAX_TEXT_BYTES=1600;
 const MAX_PEERS=24;
@@ -41,6 +42,8 @@ function authorizedSource(id:string) {
   const session=useSessionStore.getState().sessions.find(x=>x.id===id);
   if(!session||!session.workspacePath)
     throw new Error('Message sender must be a known workspace-bound chat.');
+  if(primaryRoot(useWorkspaceStore.getState().roots)?.path!==session.workspacePath)
+    throw new Error('Active workspace changed from sender session; refusing cross-project mail.');
   return session;
 }
 
