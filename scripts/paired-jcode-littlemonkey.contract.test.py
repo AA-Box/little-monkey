@@ -15,7 +15,10 @@ class PhysicalComparisonContracts(unittest.TestCase):
     def test_real_linux_self_process_kernel_pss(self):
         if not Path("/proc").is_dir():
             self.skipTest("Linux OS PSS required")
-        measured = MODULE["live_pss_kib"](os.getpid())
+        # The process tree includes a short-lived 'ps' child in its snapshot.
+        # Linux may reap that PID before we read /proc: root-only PSS tests
+        # the actual kernel path without fabricating a complete tree.
+        measured = MODULE["read_process_pss_kib"](os.getpid())
         self.assertIsInstance(measured, int)
         self.assertGreater(measured, 0)
 
