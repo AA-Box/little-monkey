@@ -85,6 +85,9 @@ export interface SettingsState {
    * the model (not merely denied), mirroring `memoryEnabled`'s "disabled =
    * not offered" treatment of `remember`. */
   subagentsEnabled: boolean;
+  /** Opt-in local desktop peer communication only within the exact same
+   * originally selected workspace. No remote, daemon or cross-profile bus. */
+  sessionCollaborationEnabled: boolean;
   /** Whether the model can invoke an installed skill on its own initiative
    * (see `tools.ts`'s `SKILL_INVOKE_TOOL` and `agentLoop.ts`'s
    * `toolsForSettings` filter), in addition to a user explicitly typing
@@ -180,6 +183,7 @@ export interface SettingsState {
   setArtifactScriptsEnabled: (value: boolean) => void;
   setArtifactAutoPreview: (value: boolean) => void;
   setSubagentsEnabled: (value: boolean) => void;
+  setSessionCollaborationEnabled: (value: boolean) => void;
   setSkillAutoInvokeEnabled: (value: boolean) => void;
   setMaxConcurrentSubagents: (value: number) => void;
   setSubagentProfileModel: (profile: 'explore' | 'code', override: SubagentModelOverride) => void;
@@ -273,6 +277,7 @@ interface PersistedShape {
   artifactScriptsEnabled: boolean;
   artifactAutoPreview: boolean;
   subagentsEnabled: boolean;
+  sessionCollaborationEnabled: boolean;
   skillAutoInvokeEnabled: boolean;
   maxConcurrentSubagents: number;
   subagentProfileModels: Partial<Record<'explore' | 'code', SubagentModelOverride>>;
@@ -308,6 +313,7 @@ function defaults(): PersistedShape {
     artifactScriptsEnabled: true,
     artifactAutoPreview: false,
     subagentsEnabled: false,
+    sessionCollaborationEnabled: false,
     skillAutoInvokeEnabled: false,
     maxConcurrentSubagents: DEFAULT_MAX_CONCURRENT_SUBAGENTS,
     subagentProfileModels: {},
@@ -427,6 +433,8 @@ function hydrate(): PersistedShape {
       artifactAutoPreview:
         typeof parsed.artifactAutoPreview === "boolean" ? parsed.artifactAutoPreview : fallback.artifactAutoPreview,
       subagentsEnabled: typeof parsed.subagentsEnabled === "boolean" ? parsed.subagentsEnabled : fallback.subagentsEnabled,
+      sessionCollaborationEnabled: typeof parsed.sessionCollaborationEnabled === "boolean"
+        ? parsed.sessionCollaborationEnabled : false,
       skillAutoInvokeEnabled:
         typeof parsed.skillAutoInvokeEnabled === "boolean" ? parsed.skillAutoInvokeEnabled : fallback.skillAutoInvokeEnabled,
       maxConcurrentSubagents:
@@ -653,6 +661,10 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 
   setSubagentsEnabled: (value) => {
     set({ subagentsEnabled: value });
+    persist({ ...get() });
+  },
+  setSessionCollaborationEnabled: (value) => {
+    set({ sessionCollaborationEnabled: value });
     persist({ ...get() });
   },
 

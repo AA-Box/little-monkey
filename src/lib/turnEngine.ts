@@ -46,6 +46,7 @@ import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import { useSessionStore } from '../store/sessionStore';
 import { usePermissionStore } from '../store/permissionStore';
 import { runSubagentTask } from './subagent';
+import { listCollaboratingSessions, sendSessionMessage } from './sessionCollaboration';
 import { resolveWorkflowSpec, runWorkflow } from './workflow';
 import { protocolToolCallId } from './durableRun';
 import { formatSkillSearchResults, formatSkillToolResult, type SkillRankingSignals, type SlashSkill } from './skills';
@@ -981,6 +982,30 @@ async function executeToolCallInner(
 
   const coordination = coordinateToolInvocation(name, args);
   if (coordination.error) return stringifyToolError(new Error(coordination.error));
+
+  if (name === 'session_list_peers' || name === 'session_send_message') {
+    if (usePermissionStore.getState().mode === 'plan')
+      return stringifyToolError(new Error('Session messaging is unavailable in Plan Mode.'));
+    if (!chatSessionId || executionContext?.isToolAvailable?.(name) !== true) {
+      return stringifyToolError(new Error('Cross-session messages are not offered to this turn.'));
+    }
+    try {
+      if (name === 'session_list_peers') {
+        return stringifyToolResult({sessions:await listCollaboratingSessions(chatSessionId)});
+      }
+      const recipient = args.recipient_session_id;
+      const text = args.text;
+      if (typeof recipient !== 'string' || typeof text !== 'string')
+        throw new Error('session_send_message requires a recipient_session_id and text.');
+      const receipt = await sendSessionMessage({
+        senderSessionId:chatSessionId,recipientSessionId:recipient,
+        text,toolCallId:toolCall.id,turnId,
+      });
+      return stringifyToolResult(receipt);
+    } catch (error) {
+      return stringifyToolError(error);
+    }
+  }
 
   if (name === PROGRAMMATIC_TOOL_NAME) {
     if (!programmatic) {

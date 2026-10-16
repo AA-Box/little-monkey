@@ -157,6 +157,13 @@ def main() -> int:
     capability.pop("remote", None)
     capability["permissions"].extend([
         "allow-computer-use-full-product-report",
+        "allow-session-mail-register",
+        "allow-session-mail-peers",
+        "allow-session-mail-send",
+        "allow-session-mail-pending",
+        "allow-session-mail-ack",
+        "allow-sessions-load",
+        "allow-sessions-save",
         "allow-desktop-control-start-session",
         "allow-desktop-control-stop-session",
         "allow-desktop-control-provider-info",
@@ -250,6 +257,11 @@ def main() -> int:
         for key, expected in required.items():
             if report.get(key) != expected:
                 print(f"full product evidence failed {key}: {report.get(key)!r}", file=sys.stderr)
+                return 1
+        native_mail = report.get("session_mail_product", {})
+        for key in ("verified", "realTauriIpc", "sqliteDurable", "noSpoofedToolAuthorization"):
+            if native_mail.get(key) is not True:
+                print(f"native session mail product did not verify {key}", file=sys.stderr)
                 return 1
         model_loop = report.get("model_loop", {})
         if model_loop.get("kind") != "deterministic-frontend-model-tool-loop" or model_loop.get("completed") is not True:

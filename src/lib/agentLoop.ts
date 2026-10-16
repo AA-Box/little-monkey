@@ -27,7 +27,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { allowedToolsRestriction, applyAllowedToolsRestriction } from './allowedTools';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SEARCH_SKILLS_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools, toolsForWorkspace } from './tools';
+import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SEARCH_SKILLS_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, SESSION_PEERS_TOOL, SESSION_SEND_TOOL, buildTools, toolsForWorkspace } from './tools';
 import {
   candidateNotice,
   finalizeLearningForRun,
@@ -80,6 +80,7 @@ import { collectUserPromptSubmitContext,fireObservedHooks } from './userHooks';
 import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
 import { isBtwNotice } from './slashCommands';
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
+import { syncSessionMailbox } from './sessionCollaboration';
 import { effortForTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
@@ -669,6 +670,7 @@ export function toolsForSettings(
   skillSearchToolEnabled = false,
   desktopControlEnabled = false,
   deviceActionAvailable = false,
+  sessionCollaborationEnabled = false,
 ): ToolDef[] {
   const filtered = tools.filter((tool) => {
     if (!memoryEnabled && tool.function.name === 'remember') return false;
@@ -684,6 +686,7 @@ export function toolsForSettings(
     ...(readSkillResourceToolEnabled ? [READ_SKILL_RESOURCE_TOOL] : []),
     ...(skillLearningToolEnabled ? [MANAGE_SKILL_LEARNING_TOOL] : []),
     ...(skillSearchToolEnabled ? [SEARCH_SKILLS_TOOL] : []),
+    ...(sessionCollaborationEnabled ? [SESSION_PEERS_TOOL, SESSION_SEND_TOOL] : []),
   ];
 }
 
@@ -1730,6 +1733,10 @@ export async function runAgentTurn(
   }
   turnControllers.set(sessionId, controller);
   registerDurableController(turnId, controller, sessionId);
+  // Resume persisted local peer notices BEFORE this turn begins streaming.
+  // A failed read does not discard durable SQLite messages or block chat.
+  try { await syncSessionMailbox(sessionId); }
+  catch (error) { console.warn('Local peer mail remains pending:', error); }
   useSessionStore.getState().markTurnRunning(sessionId, true);
   useTurnStatusStore.getState().begin(sessionId);
   const startedAt = Date.now();
@@ -3131,6 +3138,7 @@ async function runAgentTurnBody(
       skillSearchToolEnabled,
       settings.desktopControlEnabled,
       deviceActionAvailable(),
+      settings.sessionCollaborationEnabled && mode !== 'plan',
     ),
     hasWorkspace,
   );
@@ -3363,6 +3371,8 @@ async function runAgentTurnBody(
       if (!toolsForTurn.some((tool) => tool.function.name === toolName)) return false;
       const currentSettings = useSettingsStore.getState();
       if (toolName === 'remember' && !currentSettings.memoryEnabled) return false;
+      if ((toolName === 'session_send_message' || toolName === 'session_list_peers')
+          && (!currentSettings.sessionCollaborationEnabled || usePermissionStore.getState().mode === 'plan')) return false;
       if (WEB_TOOL_NAMES.has(toolName) && !currentSettings.webToolsEnabled) return false;
       if ((toolName === 'task' || toolName === 'workflow') && !currentSettings.subagentsEnabled && !ultracode) {
         return false;
