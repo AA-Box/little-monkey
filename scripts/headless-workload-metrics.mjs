@@ -52,3 +52,30 @@ export function summary(level, outcomes, samples) {
     samples:samples.length,
   };
 }
+
+/**
+ * Independent success oracle for real durable task acceptance.
+ * A non-JSON stdout line, model assertion of success, unknown outcome,
+ * foreign run event, or output lacking the actual task fixture marker fails.
+ */
+export function verifyDurableModelCompletion(id, statusRows, eventStdout, marker) {
+  if (!Array.isArray(statusRows) || statusRows.length !== 1 ||
+      statusRows[0]?.run_id !== id || statusRows[0]?.status !== 'succeeded')
+    throw Error('Durable task ledger did not report exactly one succeeded run');
+  let assistantText = '';
+  let eventCount = 0;
+  for (const line of eventStdout.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const entry = JSON.parse(line);
+    if (entry.run_id !== id || !Number.isSafeInteger(entry.sequence) ||
+        entry.sequence < 1 || !entry.event || typeof entry.event !== 'object')
+      throw Error('Invalid or cross-run native event');
+    eventCount++;
+    if (entry.event.type === 'model_delta' && entry.event.payload?.channel === 'assistant' &&
+        typeof entry.event.payload.text === 'string')
+      assistantText += entry.event.payload.text;
+  }
+  if (!eventCount || !assistantText.includes(marker))
+    throw Error('Completed task lacks actual assistant fixture evidence');
+  return true;
+}
