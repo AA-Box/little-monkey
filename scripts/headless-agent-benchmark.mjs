@@ -9,6 +9,7 @@ import {mkdtempSync,mkdirSync,writeFileSync,rmSync,readFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {parsePs,rssForTree,summary,completeTreePssKiB,verifyDurableModelCompletion} from './headless-workload-metrics.mjs';
+import {initHeadlessFixtureRepository} from './headless-fixture-repository.mjs';
 const value=key=>{const i=process.argv.indexOf(key);return i<0?null:process.argv[i+1]??null;};
 const target=value('--target'),binary=value('--monkey-bin')??process.env.LITTLE_MONKEY_CLI??'monkey';
 const levels=(value('--levels')??'1,2,5,10').split(',').map(Number);
@@ -109,6 +110,8 @@ for(const count of levels){
    mkdirSync(join(root,'src'));
    writeFileSync(join(root,'src','fixture.txt'),
     'Disposable read-only model benchmark.\nMarker: RESPONSES_CAN_READ_THIS_FIXTURE\n');
+   // Autonomous tasks require a committed Git HEAD and revision snapshot.
+   initHeadlessFixtureRepository(root);
    const prompt='Read src/fixture.txt in this disposable test workspace. '+
     'Return the exact marker and explain the observed file. Do not edit files, '+
     'run shell commands, make network requests or deploy anything.';
