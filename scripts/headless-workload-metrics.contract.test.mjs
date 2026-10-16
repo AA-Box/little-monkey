@@ -1,6 +1,20 @@
 import {describe,it} from 'node:test';
 import assert from 'node:assert/strict';
-import {parsePs,descendants,rssForTree,summary} from './headless-workload-metrics.mjs';
+import {parsePs,descendants,rssForTree,summary,parseLinuxSmapsPssKiB,completeTreePssKiB} from './headless-workload-metrics.mjs';
+
+describe('real proportional memory accounting',()=>{
+ it('extracts real Linux smaps_rollup format and sums complete PID tree',()=>{
+  const mk=n=>'00400000-7fffffffffff ---p 00000000 00:00 0 [rollup]\\nRss: 9999 kB\\nPss: '+n+' kB\\nPrivate_Clean: 0 kB\\n';
+  assert.equal(parseLinuxSmapsPssKiB(mk(2468)),2468);
+  assert.equal(completeTreePssKiB([11,12],new Map([[11,mk(100)],[12,mk(75)]])),175);
+ });
+ it('never fabricates PSS when OS data is missing, inaccessible or ambiguous',()=>{
+  assert.equal(completeTreePssKiB([11,12],new Map([[11,'Pss: 123 kB\\n']])),null);
+  assert.equal(completeTreePssKiB([11],new Map([[11,'Rss: 123 kB\\n']])),null);
+  assert.throws(()=>parseLinuxSmapsPssKiB('Pss: 5 kB\\nPss: 8 kB\\n'),/ambiguous/);
+  assert.throws(()=>parseLinuxSmapsPssKiB('Pss: invalid kB\\n'),/Missing/);
+ });
+});
 
 describe('real-process measurement contracts',()=>{
  it('totals ONLY daemon descendants and does not include unrelated model servers',()=>{
