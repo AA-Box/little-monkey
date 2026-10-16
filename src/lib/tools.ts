@@ -252,6 +252,10 @@ export const TOOLS: ToolDef[] = [
             description:
               "Optional directory or file to scope the search to, relative to the primary workspace folder. Defaults to the whole primary folder. To search a secondary attached folder, pass its label (or a label-prefixed subpath), e.g. 'other-folder'.",
           },
+          structure: {
+            type: 'boolean',
+            description: 'When true, include bounded nearest named function/class/type hints with declaration line and line displacement for Rust, Python, JS/TS and other common coding languages. Hints are lexical, not AST proof of containment.',
+          },
         },
         required: ['pattern'],
         additionalProperties: false,

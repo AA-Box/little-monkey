@@ -140,6 +140,7 @@ pub fn grep(
     state: &AppState,
     pattern: &str,
     path: Option<&str>,
+    structure: bool,
 ) -> Result<Vec<serde_json::Value>, String> {
     let regex = Regex::new(pattern).map_err(|e| format!("Invalid regex '{pattern}': {e}"))?;
     let (search_root, _display_root) =
@@ -178,9 +179,17 @@ pub fn grep(
 
         for (idx, line) in content.lines().enumerate() {
             if regex.is_match(line) {
-                matches.push(
-                    serde_json::json!({ "file": display_path, "line": idx + 1, "text": line }),
-                );
+                let mut row = serde_json::json!({
+                    "file": display_path, "line": idx + 1, "text": line,
+                });
+                if structure {
+                    if let Some(hint) = little_monkey_lib::structural_grep::nearest_declaration(
+                        entry.path(), &content, idx + 1,
+                    ) {
+                        row["structure"] = hint;
+                    }
+                }
+                matches.push(row);
                 if matches.len() >= GREP_MAX_MATCHES {
                     break 'outer;
                 }
@@ -477,6 +486,25 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn grep_structural_hints_share_desktop_semantics_and_respect_scope() {
+        let workspace = TestWorkspace::new();
+        std::fs::write(workspace.root.join("src/main.rs"),
+            "pub fn handler() {\n    let important = 1;\n    println!(\"important={important}\");\n}\n").unwrap();
+        let plain = grep(&workspace.state, "important", Some("src"), false).unwrap();
+        assert_eq!(plain.len(), 2);
+        assert!(plain[0].get("structure").is_none());
+        let structured = grep(&workspace.state, "important", Some("src"), true).unwrap();
+        assert_eq!(structured.len(), 2);
+        for item in &structured {
+            assert_eq!(item["structure"]["name"], "handler");
+            assert_eq!(item["structure"]["declaration_line"], 1);
+            assert_eq!(item["structure"]["confidence"], "lexical_nearest_preceding");
+        }
+        assert!(grep(&workspace.state, "important", Some("../"), true).is_err());
+        assert!(grep(&workspace.state, "[", Some("src"), true).is_err());
     }
 
     #[test]

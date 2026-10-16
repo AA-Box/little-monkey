@@ -58,6 +58,8 @@ pub mod managed_runtime;
 // K22: the startup self-integrity check every native launch path consults, and
 // the one-step rollback the in-app updater takes before it replaces the install.
 pub mod self_integrity;
+// Shared bounded lexical declaration hints for coding-agent grep.
+pub mod structural_grep;
 pub mod update_rollback;
 // The stack registry and the embedding path, shared by v1 Knowledge Stacks
 // (`stacks`) and Knowledge 2.0 (`knowledge_service`/`knowledge_pipeline`).
