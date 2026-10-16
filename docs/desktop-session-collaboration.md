@@ -74,3 +74,33 @@ does not yet guarantee general exactly-once mutations under adversarial
 simultaneous multiwindow writes. Existing daemon workflows have their own
 separately authenticated message transports. Do not claim general
 cross-device agent messaging or auto-resumption from this implementation.
+
+
+## Real multi-process crash and stress acceptance
+
+The Linux/macOS/Windows Rust test suite includes OS-child-process
+acceptance, not only a mock of \`invoke\`:
+
+- \`process_killed_after_sqlite_commit_redelivers_across_reopen\` spawns
+  an independent sender, observes its physically committed SQLite marker,
+  forcibly kills it before recipient acknowledgement, opens the database
+  in fresh connections, verifies redelivery, and acknowledges exactly once
+- \`concurrent_independent_os_processes_replay_same_send_only_once\` forces
+  four separate sender processes to reuse an identical idempotency key,
+  expecting exactly one persisted row
+- \`independent_os_process_stress_survives_fresh_reader_connections\`
+  launches four distinct native processes, each sending a bounded sequence
+  of unique messages to one SQLite inbox, then uses fresh recipient
+  connections to verify every row and acknowledge it. The CI default is
+  12 messages per sender; locally run \`LM_MAIL_STRESS_COUNT=60 cargo test\`
+  to exercise a longer 240-message workload
+
+On Windows, WAL cold-start schema acquisition now retries **only**
+\`SQLITE_BUSY\`/\`SQLITE_LOCKED\` with a bounded deadline; unrelated
+database corruption, permission failures or validation errors are never
+silently retried. Child stderr is captured on failure for diagnosis.
+
+These tests run with actual independent operating-system processes and disk
+transactions but do not launch multiple installed Tauri desktop windows,
+simulate true host power loss, or verify cross-device network transports.
+Those require separate physical operator acceptance and are not claimed.
