@@ -316,6 +316,27 @@ mod tests{
         assert!(pending_impl(&path,"to","/project",10).unwrap().is_empty());
         drop(got);let _=std::fs::remove_dir_all(path.parent().unwrap());
     }
+    #[test]fn exact_workspace_peer_directory_and_stale_enrolment_refusal(){
+        let path=tmp();
+        register_impl(&path,"one","/shared","One").unwrap();
+        assert!(list_peers_impl(&path,"one","/shared").unwrap().is_empty());
+        register_impl(&path,"two","/shared","Two").unwrap();
+        register_impl(&path,"third","/elsewhere","Third").unwrap();
+        let found=list_peers_impl(&path,"one","/shared").unwrap();
+        assert_eq!(found.len(),1);
+        assert_eq!(found[0].id,"two");
+        assert!(list_peers_impl(&path,"third","/shared").is_err());
+        assert!(send_impl(&path,"one","third","/shared","try","call","wrong").is_err());
+        let db=open(&path).unwrap();
+        db.execute("UPDATE local_session_peers SET updated_at_ms=0
+            WHERE session_id='two'",[]).unwrap();
+        assert!(send_impl(&path,"one","two","/shared","try","call","stale").is_err());
+        register_impl(&path,"two","/shared","Two").unwrap();
+        assert!(send_impl(&path,"one","two","/shared","try","call","now live").unwrap().persisted);
+        assert_eq!(pending_impl(&path,"two","/shared",10).unwrap().len(),1);
+        drop(db);
+        let _=std::fs::remove_dir_all(path.parent().unwrap());
+    }
     #[test]fn concurrent_process_safe_exactly_one_inbox_record(){
         let path=tmp();
         register_impl(&path,"from","/project","Sender").unwrap();
