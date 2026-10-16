@@ -63,3 +63,26 @@ a live daemon tick, a real duplicate in the opted-in canonical project,
 a stable `garden_merges_total` counter, and successful unmerge through
 Memory Studio after process restart. The unit tests do not constitute
 this physical acceptance.
+
+
+## Conservative natural-language consolidation and unresolved conflicts
+
+Enrolled gardeners additionally consolidate unpinned, enabled, unexpired
+agent-owned statements where the **full sentence** differs only in
+whitespace, Unicode case or a final period. That is deliberately a narrow
+semantic equivalence: URLs, code, paths, quotes, special markup and sentence
+questions are excluded. Merged originals are soft-retired and reversible
+through the existing Memory Studio unmerge mechanism.
+
+The curator also recognizes a small set of explicit contradictory pairs,
+including "User prefers X" vs "User does not prefer X", without changing
+either side. The ambient status includes \`garden_conflicts_latest\` so the
+operator can investigate, instead of silently choosing a winner. Conflict
+review is **not** autonomous truth selection, broad paraphrase clustering
+or reasoning over uncertain temporal claims. That remaining work needs
+grounded evidence, a reliable independent quality gate, and an explicit
+user-controlled dispute-resolution policy.
+
+\`\`\`sh
+cargo test --manifest-path src-tauri/Cargo.toml semantic_garden_tests
+\`\`\`
