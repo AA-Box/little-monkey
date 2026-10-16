@@ -393,6 +393,67 @@ mod tests{
         assert_eq!(pending_impl(&path,"to","/project",10).unwrap().len(),1);
         let _=std::fs::remove_dir_all(path.parent().unwrap());
     }
+    #[test]fn independent_os_process_stress_writer(){
+        let Ok(path)=std::env::var("LITTLE_MONKEY_TEST_MAIL_STRESS_PATH") else{return};
+        let worker=std::env::var("LITTLE_MONKEY_TEST_MAIL_STRESS_WORKER").unwrap();
+        let messages=std::env::var("LITTLE_MONKEY_TEST_MAIL_STRESS_COUNT")
+            .unwrap().parse::<usize>().unwrap();
+        let sender=format!("writer-{worker}");
+        register_impl(Path::new(&path),&sender,"/stress","Real process").unwrap();
+        for index in 0..messages {
+            let id=format!("msg-{index}");
+            let body=format!("stress-message-from-{sender}-{index}");
+            let receipt=send_impl(Path::new(&path),&sender,"parent","/stress",
+                &sender,&id,&body).unwrap();
+            assert!(!receipt.already_existed);
+        }
+    }
+
+    #[test]fn independent_os_process_stress_survives_fresh_reader_connections(){
+        // Real external processes with independent SQLite connections,
+        // incompatible with an in-memory mock. Increase LM_MAIL_STRESS_COUNT
+        // locally to 40+ for extended operator acceptance.
+        let count=std::env::var("LM_MAIL_STRESS_COUNT").ok()
+            .and_then(|s|s.parse::<usize>().ok()).unwrap_or(12).clamp(1,60);
+        let workers=4usize;
+        let path=tmp();
+        register_impl(&path,"parent","/stress","Recipient").unwrap();
+        let mut children=Vec::new();
+        for worker in 0..workers {
+            children.push(std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact").arg("session_mail::tests::independent_os_process_stress_writer")
+                .env("LITTLE_MONKEY_TEST_MAIL_STRESS_PATH",&path)
+                .env("LITTLE_MONKEY_TEST_MAIL_STRESS_WORKER",worker.to_string())
+                .env("LITTLE_MONKEY_TEST_MAIL_STRESS_COUNT",count.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn().unwrap());
+        }
+        for child in children {
+            let result=child.wait_with_output().unwrap();
+            assert!(result.status.success(),
+                "Independent SQLite writer failed: {}",
+                String::from_utf8_lossy(&result.stderr).chars()
+                    .take(1000).collect::<String>());
+        }
+        let mut received=std::collections::HashSet::new();
+        loop {
+            // Every call reopens SQLite: the reader never shares connection
+            // state or in-memory buffers with any terminated sender process.
+            let pending=pending_impl(&path,"parent","/stress",100).unwrap();
+            if pending.is_empty(){break;}
+            for item in pending {
+                assert!(received.insert(item.id.clone()),"Duplicate unacked message ID");
+                assert!(item.text.starts_with("stress-message-from-writer-"));
+                assert!(ack_impl(&path,"parent","/stress",&item.id).unwrap());
+            }
+        }
+        assert_eq!(received.len(),workers*count,
+            "Every independently committed peer message must survive");
+        assert!(pending_impl(&path,"parent","/stress",100).unwrap().is_empty());
+        let _=std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]fn child_writer_entry(){
         let Ok(path)=std::env::var("LITTLE_MONKEY_TEST_MAIL_CHILD") else{return};
         register_impl(Path::new(&path),"child","/acceptance","Child").unwrap();
