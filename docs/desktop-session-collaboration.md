@@ -14,6 +14,15 @@ network-facing endpoints or independent agent processes are created.
 
 ## Delivery and crash recovery
 
+The **authoritative mailbox and recent local-peer directory are per-profile SQLite**,
+separate from the frontend's session file. A desktop chat only enrolls in
+the directory when collaboration is explicitly enabled. Mounted chat windows
+refresh their registration; the sender registers other eligible known sessions
+before asking for peers. Registrations older than one hour stop authorizing
+new sends. The backend requires *both* sender and recipient to be registered
+with the same workspace in the current profile; a model-supplied recipient
+ID alone is never enough.
+
 The **authoritative mailbox is per-profile SQLite**, separate from the
 frontend's session file. On send, Rust uses WAL and an IMMEDIATE transaction
 to insert a unique `turn_id:tool_call_id` message with a frozen sender,
@@ -34,8 +43,9 @@ and avoids inserting a duplicate. Acknowledge is idempotent and requires the
 exact recipient and workspace. A model cannot obtain write permissions or
 invoke a new assistant turn by sending mail.
 
-The Rust tests cover SQLite transactions, repeated opens, thread contention
-and a child test process that writes before the parent reopens and acknowledges.
+The Rust tests cover SQLite transactions, registration and workspace ACL,
+stale peer expiry, repeated opens, thread contention, and a child test process
+that writes before the parent reopens and acknowledges.
 The frontend tests cover real IPC *call ordering* with mock native endpoints,
 same-workspace consent, crash windows and failure postures.
 
