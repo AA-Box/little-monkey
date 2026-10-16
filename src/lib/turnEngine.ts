@@ -991,7 +991,7 @@ async function executeToolCallInner(
     }
     try {
       if (name === 'session_list_peers') {
-        return stringifyToolResult({sessions:listCollaboratingSessions(chatSessionId)});
+        return stringifyToolResult({sessions:await listCollaboratingSessions(chatSessionId)});
       }
       const recipient = args.recipient_session_id;
       const text = args.text;
