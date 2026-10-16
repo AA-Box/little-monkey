@@ -17,6 +17,7 @@ type InboxMessage={
 };
 let sessions:FakeSession[]=[];
 let mail:InboxMessage[]=[];
+const registered=new Map<string,{id:string;title:string;workspace:string;updatedAtMs:number}>();
 const runningTurns:Record<string,boolean>={};
 
 vi.mock('@tauri-apps/api/core',()=>({
@@ -45,12 +46,23 @@ beforeEach(()=>{
   {id:'other',title:'Other project',workspacePath:'/repo/b',archived:false,comparisonBranch:null,messages:[]},
   {id:'global',title:'No workspace',workspacePath:null,archived:false,comparisonBranch:null,messages:[]},
  ];
- mail=[];
+ mail=[];registered.clear();
  for(const key of Object.keys(runningTurns))delete runningTurns[key];
  add.mockImplementation((id:string,message:FakeMessage)=>{
   const session=sessions.find(s=>s.id===id);if(session)session.messages.push(message);
  });
  invokeMock.mockReset().mockImplementation(async (name:string,args:Record<string,unknown>)=>{
+  if(name==='session_mail_register'){
+   registered.set(String(args.sessionId),{
+    id:String(args.sessionId),title:String(args.title),
+    workspace:String(args.workspace),updatedAtMs:Date.now(),
+   });
+   return null;
+  }
+  if(name==='session_mail_peers'){
+   return [...registered.values()].filter(item=>item.id!==args.senderSessionId &&
+    item.workspace===args.workspace);
+  }
   if(name==='session_mail_send'){
    const id=String(args.turnId)+':'+String(args.toolCallId);
    const existing=mail.find(m=>m.id===id);
@@ -78,11 +90,11 @@ beforeEach(()=>{
 describe('native SQLite backed local session messaging integration',()=>{
  const args={senderSessionId:'sender',recipientSessionId:'target',
   toolCallId:'call-1',turnId:'turn-1',text:'Please review auth.ts'};
- it('only lists accessible workspace peers',()=>{
-  expect(listCollaboratingSessions('sender')).toEqual([
-   {id:'target',title:'Target',workspace:'/repo/a'},
+ it('only lists accessible workspace peers',async()=>{
+  expect(await listCollaboratingSessions('sender')).toEqual([
+   expect.objectContaining({id:'target',title:'Target',workspace:'/repo/a'}),
   ]);
-  expect(()=>listCollaboratingSessions('global')).toThrow(/workspace/);
+  await expect(listCollaboratingSessions('global')).rejects.toThrow(/workspace/);
  });
  it('durably sends and separately acknowledges after transcript flush',async()=>{
   const receipt=await sendSessionMessage(args);
@@ -94,7 +106,10 @@ describe('native SQLite backed local session messaging integration',()=>{
   }));
   expect(sessions[1].messages).toHaveLength(1);
   const commands=invokeMock.mock.calls.map(call=>call[0]);
-  expect(commands).toEqual(['session_mail_send','session_mail_pending','session_mail_ack']);
+  expect(commands).toEqual([
+   'session_mail_register','session_mail_register','session_mail_peers',
+   'session_mail_send','session_mail_register','session_mail_pending','session_mail_ack',
+  ]);
   expect(flush).toHaveBeenCalledTimes(1);
   expect(mail[0].delivered).toBe(true);
   await sendSessionMessage(args);
@@ -136,7 +151,7 @@ describe('native SQLite backed local session messaging integration',()=>{
   sessions[1].archived=false;
   enabled=false;
   await expect(sendSessionMessage(args)).rejects.toThrow(/disabled/);
-  expect(invokeMock).not.toHaveBeenCalled();
+  expect(mail).toHaveLength(0);
  });
  it('refuses a stale chat after the user switches the active workspace',async()=>{
   activeWorkspace='/repo/b';
