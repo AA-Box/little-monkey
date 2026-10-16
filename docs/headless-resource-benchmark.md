@@ -31,18 +31,26 @@ created by this script. Temporary workspaces are removed.
 The benchmark samples `ps -axo pid,ppid,rss`, builds a recursive subtree
 rooted at the running daemon PID, and records **real total RSS in MiB**,
 sample counts, per-level completion outcomes, observed p50/p95 elapsed time
-and peak memory delta compared with the sampled baseline. A missing daemon
-process or unavailable OS sample fails instead of manufacturing a number.
+and peak memory delta compared with the sampled baseline. On **Linux only**,
+it additionally samples real `/proc/PID/smaps_rollup` `Pss:` for each process
+in the daemon tree. **peakPssMiB is null** unless every process in every
+observed sample has a valid OS PSS reading; `completePssSamples` and
+`totalRssSamples` show coverage. A missing daemon or unavailable RSS
+fails instead of manufacturing a number.
 
 **Limits of what this proves:**
 
-- Memory is the **sum of RSS**, which double counts shared pages; it is NOT
-  JCode's PSS, and must not be compared directly against JCode's published
-  PSS metrics. It excludes external providers/Ollama/model runtimes outside
-  the daemon's process tree.
-- We cannot certify CLI task completion solely from process exit; success
-  requires a terminal success indicator in the actual `task attach` stream.
-  It does not independently score source-accuracy. Use the existing
+- Memory totals use **sum of RSS**, which double counts shared pages.
+  `peakPssMiB` (when non-null) is the **sum of measured Linux process-tree
+  proportional set sizes**, comparable in definition to JCode's Linux PSS,
+  **not** a controlled head-to-head benchmark. Neither metric includes
+  external providers/Ollama/model runtimes outside the daemon's process tree.
+  On macOS and incomplete Linux `smaps_rollup` sampling, PSS is null.
+- Task completion requires both `succeeded` in the durable run ledger
+  **and** a matching, real assistant model-delta event containing the known
+  disposable fixture marker. Arbitrary model text claiming "success" or a
+  process exit code alone is insufficient. This source marker is a narrow
+  task correctness oracle, not a comprehensive independent quality score. Use the existing
   `scripts/swarm-model-benchmark.mjs` to run actual executable fixture
   correctness checks.
 - Installed model and daemon concurrency restrictions may queue work rather
