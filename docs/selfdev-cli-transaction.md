@@ -50,7 +50,13 @@ pnpm test:selfdev:contract
 Security properties: user-specified SHA confirmation, isolated managed
 versions, no silent update, staged binary hash verification, clean source
 validation, full preflight tests, atomic POSIX symlink swaps, persisted
-rollback target, and code refusal on tampered candidates. The manager
+rollback target, and code refusal on tampered candidates. Concurrent
+build/stage/activation/rollback processes are admitted by an **exclusive
+on-disk manager lock**. A crash may leave a stale lock; the updater fails
+closed rather than overriding it. Inspect the lock owner in
+`~/.littlemonkey/selfdev/.selfdev-operation.lock/owner.json` and check
+that the process has actually exited before manually removing it.
+The test suite also verifies this fail-closed contention behavior. The manager
 accepts only operator-staged executables, and running any candidate is
 equivalent to running native code with the developer's privileges.
 
