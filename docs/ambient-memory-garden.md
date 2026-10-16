@@ -107,3 +107,40 @@ disabled and unrelated/user-owned facts are preserved.
 \`\`\`sh
 pnpm exec vitest run src/components/Settings/MemoryStudioPanel.test.tsx
 \`\`\`
+
+
+## Model-assisted paraphrase review in Memory Studio
+
+Open **Settings → Memory Studio** and click
+**Review paraphrases with selected model**. Unlike the resident automatic
+duplicate pass, this is a *deliberately initiated* model request:
+up to 24 active, unpinned, non-secret, agent-authored facts from the SAME
+scope may reach the selected model. Cloud targets still invoke the
+regular outbound privacy firewall, cost budget, and usage ledger; local
+model requests stay local. The UI explains that memories may be sent to a
+configured cloud provider before the operator invokes the review.
+
+The model can propose genuinely paraphrased memory merges (e.g. "likes
+brief recaps" with "prefers short summaries") or two contradictory facts
+that require adjudication. Returned IDs are checked against the exact
+in-memory set; duplicate IDs, cross-scope proposals, excessive output,
+credentials and malformed JSON fail closed. Nothing is persisted from an
+unreviewed model answer.
+
+Each proposal shows the original text, selected scope, model rationale,
+and new merged wording. Only **Approve reversible merge** writes through
+the existing canonical Rust merge API. For contradictions, the operator
+must explicitly choose which statement remains enabled; the other is
+soft-disabled and may be restored in Memory Studio. The app checks the
+original IDs, texts and lifecycle states immediately before an approval
+to detect intervening changes. Proposals can always be dismissed.
+
+\`\`\`sh
+pnpm exec vitest run src/lib/semanticMemoryReview.test.ts
+pnpm exec vitest run src/components/Settings/MemoryStudioPanel.test.tsx
+\`\`\`
+
+Semantic *evidence* remains model-judged: a review proposal is **not**
+independent proof of equivalence. The user must examine and authorize
+meaning-changing edits. There is deliberately no unattended auto-resolution
+of paraphrase ambiguities, medical claims, or conflicting memories.
