@@ -16,6 +16,7 @@ installed and approved.
 
 ```sh
 pnpm test:headless-resource:contract
+pnpm test:headless-resource:os  # Linux: physical kernel PSS for this stable Node process
 pnpm test:headless-resource:live -- \
   --target ollama:YOUR_INSTALLED_MODEL \
   --levels 1,2,5,10 \
@@ -27,6 +28,11 @@ Options: choose up to six unique concurrency levels in 1..20; 30..3600
 seconds maximum per wave. Failed or timed-out test jobs are explicitly
 marked, and timeout requests cancellation of ONLY the disposable jobs
 created by this script. Temporary workspaces are removed.
+
+The OS-only CI smoke intentionally measures the currently running Node
+process (a stable PID), because build helpers can exit between `ps` and
+`/proc` sampling. It verifies the real kernel PSS path and parser but
+**does not** claim a complete daemon/workload memory sample.
 
 The benchmark samples `ps -axo pid,ppid,rss`, builds a recursive subtree
 rooted at the running daemon PID, and records **real total RSS in MiB**,
