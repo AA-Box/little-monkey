@@ -38,6 +38,13 @@ fn main() {
     if std::env::var("COMPUTER_USE_FULL_PRODUCT_E2E").as_deref() == Ok("1") {
         attributes = attributes.app_manifest(tauri_build::AppManifest::new().commands(&[
             "computer_use_full_product_report",
+            "session_mail_register",
+            "session_mail_peers",
+            "session_mail_send",
+            "session_mail_pending",
+            "session_mail_ack",
+            "sessions_load",
+            "sessions_save",
             "desktop_control_start_session",
             "desktop_control_stop_session",
             "desktop_control_provider_info",
