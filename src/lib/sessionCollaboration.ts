@@ -76,8 +76,14 @@ export async function listCollaboratingSessions(senderSessionId:string):Promise<
   const registered=await invoke<LocalPeer[]>('session_mail_peers',{
     senderSessionId,workspace:sender.workspacePath,
   });
-  return registered.filter(peer=>peer.workspace===sender.workspacePath &&
-    peer.id!==senderSessionId).slice(0,MAX_PEERS);
+  return registered.filter(peer=>{
+    if(peer.workspace!==sender.workspacePath || peer.id===senderSessionId)return false;
+    // The local store is authoritative for sessions we know were archived or
+    // converted to a comparison branch after an earlier registration.
+    const known=useSessionStore.getState().sessions.find(item=>item.id===peer.id);
+    return !known || (!known.archived && !known.comparisonBranch &&
+      known.workspacePath===sender.workspacePath);
+  }).slice(0,MAX_PEERS);
 }
 
 const inFlight=new Map<string,Promise<number>>();
