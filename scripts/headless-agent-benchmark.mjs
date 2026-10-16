@@ -61,9 +61,32 @@ async function attach(id,deadline){
   child.stderr.on('data',b=>{if(stderr.length<2000)stderr+=b.toString().slice(0,2000-stderr.length);});
   child.on('error',e=>finish(false,e.message));
   child.on('close',code=>{
-   const terminal=/\b(succeeded|completed|success)\b/i.test(stdout)&&
-    !/\b(failed|cancelled|error)\b/i.test(stdout);
-   finish(code===0&&terminal,code===0&&!terminal?'No verifiable terminal success receipt':stderr.slice(0,180));
+   if(code!==0){finish(false,stderr.slice(0,180)||'Attachment failed');return;}
+   // Never infer success from arbitrary model text containing the word
+   // "success". The authoritative status is the durable run ledger.
+   let verified=false,reason='No durable terminal success evidence';
+   try{
+    const records=json(['task','status','--run-id',id,'--json']);
+    if(!Array.isArray(records)||records.length!==1 || records[0].run_id!==id)
+     throw Error('Missing or mismatched durable status record');
+    if(records[0].status!=='succeeded')throw Error('Run ended: '+records[0].status);
+    // Task events are machine-readable JSON envelopes. Read actual assistant
+    // deltas; cannot accept the original user prompt or a tool command.
+    let output='';
+    for(const line of stdout.split(/\r?\n/)){
+     if(!line.trim())continue;
+     const event=JSON.parse(line);
+     if(event.run_id!==id)throw Error('Foreign run event in attachment stream');
+     if(event.event?.type==='model_delta' &&
+       event.event?.payload?.channel==='assistant' &&
+       typeof event.event?.payload?.text==='string')
+       output+=event.event.payload.text;
+    }
+    if(!output.includes('RESPONSES_CAN_READ_THIS_FIXTURE'))
+     throw Error('Model did not report the verified fixture marker');
+    verified=true;reason='';
+   }catch(error){reason=String(error).slice(0,180);}
+   finish(verified,reason);
   });
   const timer=setInterval(()=>{
    if(Date.now()>deadline&&!done){
@@ -116,8 +139,9 @@ for(const count of levels){
   for(const id of ids){
    try{
     const status=json(['task','status','--run-id',id,'--json']);
-    const entry=status.runs?.find(x=>x.run_id===id)??status;
-    if(!['succeeded','failed','cancelled','completed'].includes(entry.status))
+    if(!Array.isArray(status)||status.length!==1||status[0].run_id!==id)
+     throw Error('Unrecognized durable task status during cleanup');
+    if(!['succeeded','failed','cancelled','needs_reconciliation'].includes(status[0].status))
      invoke(['task','cancel',id]);
    }catch{}
   }
