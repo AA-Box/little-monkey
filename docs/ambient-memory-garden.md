@@ -86,3 +86,24 @@ user-controlled dispute-resolution policy.
 \`\`\`sh
 cargo test --manifest-path src-tauri/Cargo.toml semantic_garden_tests
 \`\`\`
+
+
+## Human-confirmed contradiction resolution in Memory Studio
+
+When two live **agent-authored** facts in the same project are unambiguously
+opposite under a supported negation pattern, Memory Studio displays both
+statements together. The operator can choose **Keep first statement** or
+**Keep second statement**. Only the rejected fact is soft-disabled, via the
+same authoritative native \`memory_studio_set_enabled\` call as any other
+manual memory edit. The retained fact, any user-owned fact and every
+other project's memory remain unchanged. Disabled facts remain visible and
+can be re-enabled in Memory Studio.
+
+This preserves the user's final authority over contradictory information
+rather than silently letting an LLM decide which preference or project
+statement is true. UI tests verify that the selected project fact is
+disabled and unrelated/user-owned facts are preserved.
+
+\`\`\`sh
+pnpm exec vitest run src/components/Settings/MemoryStudioPanel.test.tsx
+\`\`\`
