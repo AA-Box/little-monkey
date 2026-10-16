@@ -43,6 +43,10 @@ export interface ChatMessage {
    * index map so it survives forks, edits, and truncation without any
    * index bookkeeping; stripped from the wire like `at`. */
   chapter?: string;
+  /** Durable local-only peer-mail identity, never forwarded to a model.
+   * This metadata (not spoofable assistant text) is the idempotent replay key
+   * after a crash between session persistence and native inbox ack. */
+  peerMail?: { id: string; senderSessionId: string };
   /** Local-only provenance used to make realtime transcript/event replay
    * idempotent across reconnects. Never sent to a model provider. */
   realtime?: {
@@ -115,7 +119,7 @@ export function demoteInlineSystemMessages(
  * forwards `messages` as opaque JSON, so it can't do the filtering for us. */
 export function toWireMessages(messages: ChatMessage[]): ChatMessage[] {
   return demoteInlineSystemMessages(
-    messages.map(({ at: _at, chapter: _chapter, realtime: _realtime, ...wire }) => wire),
+    messages.map(({ at: _at, chapter: _chapter, realtime: _realtime, peerMail: _peerMail, ...wire }) => wire),
   );
 }
 
