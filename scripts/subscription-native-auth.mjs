@@ -20,17 +20,35 @@ if(!['codex','claude'].includes(provider) ||
 }
 const bin=binaries[provider];
 const fail=message=>{throw Error(message);};
+function vendorEnvironment(){
+ // An OPENAI_API_KEY in the parent shell silently switches many official
+ // CLIs from ChatGPT subscription login to separately metered API usage.
+ // Subscription delegation must never inherit API-key or custom endpoint
+ // overrides. This does NOT read, parse or copy existing vendor tokens.
+ const env={...process.env};
+ for(const name of [
+  'OPENAI_API_KEY','CODEX_API_KEY','OPENAI_BASE_URL','OPENAI_API_BASE',
+  'CODEX_BASE_URL','CODEX_API_BASE_URL',
+ ])delete env[name];
+ return env;
+}
 const approved=()=>{if(!args.includes('--consent'))fail('Explicit --consent required');};
 const authenticated=()=>{
  const command=provider==='codex'?['login','status']:['auth','status'];
  const v=spawnSync(bin,command,{encoding:'utf8',timeout:15000,
-  stdio:['ignore','pipe','pipe'],maxBuffer:65536});
- return !v.error && v.status===0;
+  stdio:['ignore','pipe','pipe'],maxBuffer:65536,env:vendorEnvironment()});
+ if(v.error || v.status!==0)return false;
+ // Merely being "logged in" is not sufficient: Codex may instead be
+ // authenticated by an independently billed API key or custom endpoint.
+ // Require the official CLI to identify ChatGPT subscription sign-in.
+ if(provider==='codex')return /logged\s+in[^\r\n]*chatgpt/i.test(
+  String(v.stdout??'')+'\n'+String(v.stderr??''));
+ return true;
 };
 async function interactive(command){
  approved();
  const code=await new Promise((resolve,reject)=>{
-  const child=spawn(bin,command,{stdio:'inherit',env:process.env});
+  const child=spawn(bin,command,{stdio:'inherit',env:vendorEnvironment()});
   child.on('error',reject);
   child.on('close',resolve);
  });
@@ -42,14 +60,14 @@ async function runCodex(){
  const prompt=opt('--prompt');
  if(typeof prompt!=='string'||!prompt.trim()||prompt.length>4000||prompt.includes('\0'))
   fail('Requires explicit prompt of 1–4000 characters');
- if(!authenticated())fail('Official Codex CLI is not logged in; use codex login');
+ if(!authenticated())fail('Codex CLI must explicitly report ChatGPT subscription login, not API-key authentication; use codex login');
  const workspace=mkdtempSync(join(tmpdir(),'lm-codex-native-'));
  chmodSync(workspace,0o700);
  try{
   const cliArgs=['exec','--json','--ephemeral','--sandbox','read-only',
    '--skip-git-repo-check','--cd',workspace,prompt];
   const output=await new Promise((resolve,reject)=>{
-   const child=spawn(bin,cliArgs,{cwd:workspace,env:process.env,
+   const child=spawn(bin,cliArgs,{cwd:workspace,env:vendorEnvironment(),
     stdio:['ignore','pipe','pipe']});
    let stdout='',tooLarge=false;
    const timer=setTimeout(()=>child.kill(),120000);
