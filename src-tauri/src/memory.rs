@@ -918,10 +918,14 @@ pub fn garden_conservative_semantic_review_impl(
         std::collections::BTreeMap::new();
     for fact in &project.facts {
         if fact.source!="agent"||fact.pinned||!fact.enabled||
-           fact.retired_at.is_some()||fact.expires_at.is_some()||
-           !fact.merged_from.is_empty(){continue;}
+           fact.retired_at.is_some()||fact.expires_at.is_some(){continue;}
         let Some(key)=conservative_natural_fact_key(&fact.text) else {continue};
-        group.entry(key.clone()).or_default().push(fact.id.clone());
+        // A previously merged summary is not eligible for ANOTHER automatic
+        // merge (ancestry must remain reversible), but it still reaches the
+        // prompt and can conflict with a separate fact.
+        if fact.merged_from.is_empty() {
+            group.entry(key.clone()).or_default().push(fact.id.clone());
+        }
         if let Some((head,negative))=contradiction_key(&key){
             conflicts.entry(head).or_default().push((fact.id.clone(),negative));
         }
@@ -986,7 +990,10 @@ mod semantic_garden_tests {
         let review=garden_conservative_semantic_review_impl(&path,"/demo").unwrap();
         assert_eq!(review.merged_groups,1);
         assert_eq!(review.unresolved_contradictions.len(),1);
-        assert_eq!(garden_conservative_semantic_review_impl(&path,"/demo").unwrap().merged_groups,0);
+        let second=garden_conservative_semantic_review_impl(&path,"/demo").unwrap();
+        assert_eq!(second.merged_groups,0);
+        assert_eq!(second.unresolved_contradictions.len(),1,
+            "An outstanding contradiction must remain visible after dedupe");
         let data=load_impl(&path).unwrap();
         let merged=data.projects["/demo"].facts.iter().find(|f|f.merged_from.len()==2).unwrap();
         assert_eq!(merged.merged_from,vec!["a","b"]);
