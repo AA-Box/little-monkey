@@ -49,25 +49,24 @@ function safePath(path){
 function ensureRoot(){
  for(const d of [root,versions])safePath(d);
  const marker=join(root,'.selfdev-managed');
- // Verify an existing marker by directly reading it; missing-file errors are
- // the ONLY case where we initialize, so there is no existence-check/write
- // race. A competing initializer wins by creating with O_EXCL ('wx').
- try{
-  const value=readFileSync(marker,'utf8');
-  if(value!==mode+'\n')fail('Root is not an approved selfdev directory');
-  return;
- }catch(error){
-  if(error?.code!=='ENOENT')throw error;
- }
- // A preexisting current path without the marker belongs to another tool.
- if(lstatMaybe(entry))fail('Refusing to adopt existing installation');
  mkdirSync(versions,{recursive:true,mode:0o700});
+ // O_EXCL is the ONLY gate for adoption. No existence probe or read occurs
+ // before the exclusive marker write. Existing markers are verified AFTER
+ // the atomically failed creation attempt.
+ let created=false;
  try{
   writeFileSync(marker,mode+'\n',{flag:'wx',mode:0o600});
+  created=true;
  }catch(error){
   if(error?.code!=='EEXIST')throw error;
   if(readFileSync(marker,'utf8')!==mode+'\n')
-   fail('Concurrent selfdev initializer wrote an unrecognized marker');
+   fail('Root is not an approved selfdev directory');
+ }
+ if(created && lstatMaybe(entry)){
+  // A newly initialized directory cannot adopt a pre-existing activation.
+  // The manager never touches that external activation path.
+  rmSync(marker,{force:true});
+  fail('Refusing to adopt existing installation');
  }
 }
 function linkTarget(link){
