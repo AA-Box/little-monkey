@@ -13,6 +13,8 @@ const MAX_TEXT: usize = 1600;
 const MAX_PENDING: i64 = 1000;
 const MAX_BATCH: usize = 100;
 const MAX_AGE_MS: i64 = 90 * 24 * 3600 * 1000;
+const PEER_STALE_MS:i64=60 * 60 * 1000;
+const MAX_PEER_LIST:usize=24;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +25,15 @@ pub struct Mail {
     pub workspace: String,
     pub text: String,
     pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPeer {
+    pub id: String,
+    pub title: String,
+    pub workspace: String,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +62,14 @@ fn open(path:&Path)->Result<Connection,String>{
     db.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=FULL;
+         CREATE TABLE IF NOT EXISTS local_session_peers (
+           session_id TEXT PRIMARY KEY NOT NULL,
+           workspace TEXT NOT NULL,
+           title TEXT NOT NULL,
+           updated_at_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS local_session_peers_workspace
+           ON local_session_peers(workspace,updated_at_ms);
          CREATE TABLE IF NOT EXISTS local_session_mail (
            id TEXT PRIMARY KEY NOT NULL,
            sender_session_id TEXT NOT NULL,
@@ -78,6 +97,50 @@ fn open(path:&Path)->Result<Connection,String>{
     Ok(db)
 }
 
+/// Presence is a profile-local, explicit-opt-in registration by a desktop
+/// session already attached to a concrete workspace. It does NOT grant a
+/// model prompt or mutate the recipient's chat.
+pub fn register_impl(path:&Path,id:&str,workspace:&str,title:&str)
+    ->Result<(),String>{
+    if !valid_id(id)||workspace.trim().is_empty()||workspace.len()>4096||
+        title.len()>200 {return Err("Invalid local peer registration".into());}
+    let db=open(path)?;
+    db.execute("INSERT INTO local_session_peers(session_id,workspace,title,updated_at_ms)
+        VALUES(?1,?2,?3,?4)
+        ON CONFLICT(session_id) DO UPDATE SET workspace=excluded.workspace,
+            title=excluded.title,updated_at_ms=excluded.updated_at_ms",
+        params![id,workspace,title,now_ms()?]).map_err(|e|e.to_string())?;
+    Ok(())
+}
+
+/// Cross-process discovery. Only recent same-profile, same-workspace peers
+/// appear. No network server or untrusted workspace enumeration is created.
+pub fn list_peers_impl(path:&Path,requester:&str,workspace:&str)
+    ->Result<Vec<SessionPeer>,String>{
+    if !valid_id(requester)||workspace.trim().is_empty()||workspace.len()>4096 {
+        return Err("Invalid local peer lookup".into());
+    }
+    let db=open(path)?;
+    let now=now_ms()?;
+    let requester_matches:i64=db.query_row(
+        "SELECT COUNT(*) FROM local_session_peers WHERE session_id=?1
+           AND workspace=?2 AND updated_at_ms>=?3",
+        params![requester,workspace,now.saturating_sub(PEER_STALE_MS)],
+        |row|row.get(0)).map_err(|e|e.to_string())?;
+    if requester_matches!=1{return Err("Sender is not enrolled in this workspace".into());}
+    let mut stmt=db.prepare(
+        "SELECT session_id,title,workspace,updated_at_ms FROM local_session_peers
+           WHERE session_id!=?1 AND workspace=?2 AND updated_at_ms>=?3
+           ORDER BY updated_at_ms DESC,session_id LIMIT ?4"
+    ).map_err(|e|e.to_string())?;
+    let rows=stmt.query_map(params![requester,workspace,
+            now.saturating_sub(PEER_STALE_MS),MAX_PEER_LIST as i64],
+        |r|Ok(SessionPeer{
+            id:r.get(0)?,title:r.get(1)?,workspace:r.get(2)?,updated_at_ms:r.get(3)?
+        })).map_err(|e|e.to_string())?;
+    rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
+}
+
 /// Durable, idempotent send. Reusing a tool identity with changed recipients,
 /// workspace or text fails rather than disguising a second send as a replay.
 pub fn send_impl(path:&Path, sender:&str, recipient:&str, workspace:&str,
@@ -101,6 +164,17 @@ pub fn send_impl(path:&Path, sender:&str, recipient:&str, workspace:&str,
         WHERE delivered_at_ms IS NOT NULL AND delivered_at_ms<?1",
         params![now_ms()?.saturating_sub(MAX_AGE_MS)])
         .map_err(|e|e.to_string())?;
+    // Both parties must be registered by the desktop profile in the same
+    // workspace. Another process may discover them, but a model-supplied
+    // arbitrary session ID alone is not authority to create an inbox.
+    for party in [sender,recipient] {
+        let accepted:i64=tx.query_row(
+            "SELECT COUNT(*) FROM local_session_peers
+             WHERE session_id=?1 AND workspace=?2 AND updated_at_ms>=?3",
+            params![party,workspace,now_ms()?.saturating_sub(PEER_STALE_MS)],
+            |r|r.get(0)).map_err(|e|e.to_string())?;
+        if accepted!=1 {return Err("Sender or recipient is not an enrolled local peer".into());}
+    }
     let present:Option<(String,String,String,String)>=tx.query_row(
         "SELECT sender_session_id,recipient_session_id,workspace,text
          FROM local_session_mail WHERE id=?1",
@@ -186,6 +260,17 @@ fn profile_path(app:&tauri::AppHandle)->Result<std::path::PathBuf,String>{
 }
 
 #[tauri::command]
+pub fn session_mail_register(app:tauri::AppHandle,session_id:String,
+    workspace:String,title:String)->Result<(),String>{
+    register_impl(&profile_path(&app)?,&session_id,&workspace,&title)
+}
+#[tauri::command]
+pub fn session_mail_peers(app:tauri::AppHandle,sender_session_id:String,
+    workspace:String)->Result<Vec<SessionPeer>,String>{
+    list_peers_impl(&profile_path(&app)?,&sender_session_id,&workspace)
+}
+
+#[tauri::command]
 pub fn session_mail_send(app:tauri::AppHandle,sender_session_id:String,
     recipient_session_id:String,workspace:String,turn_id:String,
     tool_call_id:String,text:String)->Result<MailReceipt,String>{
@@ -213,6 +298,8 @@ mod tests{
     }
     #[test]fn durable_ack_after_restart_and_failed_replays(){
         let path=tmp();
+        register_impl(&path,"from","/project","Sender").unwrap();
+        register_impl(&path,"to","/project","Target").unwrap();
         let first=send_impl(&path,"from","to","/project","turn1","tool1","hello").unwrap();
         assert!(first.persisted && !first.already_existed);
         let retried=send_impl(&path,"from","to","/project","turn1","tool1","hello").unwrap();
@@ -231,7 +318,9 @@ mod tests{
     }
     #[test]fn concurrent_process_safe_exactly_one_inbox_record(){
         let path=tmp();
-        let handles:(Vec<_>)=(0..12).map(|_|{
+        register_impl(&path,"from","/project","Sender").unwrap();
+        register_impl(&path,"to","/project","Target").unwrap();
+        let handles:Vec<_>=(0..12).map(|_|{
             let p=path.clone();
             std::thread::spawn(move||{
                 send_impl(&p,"from","to","/project","one","call","safe")
@@ -248,6 +337,8 @@ mod tests{
     }
     #[test]fn child_writer_entry(){
         let Ok(path)=std::env::var("LITTLE_MONKEY_TEST_MAIL_CHILD") else{return};
+        register_impl(Path::new(&path),"child","/acceptance","Child").unwrap();
+        register_impl(Path::new(&path),"parent","/acceptance","Parent").unwrap();
         send_impl(Path::new(&path),"child","parent","/acceptance","turn","call","after reboot")
             .unwrap();
     }
