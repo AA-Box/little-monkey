@@ -80,6 +80,7 @@ import { collectUserPromptSubmitContext,fireObservedHooks } from './userHooks';
 import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
 import { isBtwNotice } from './slashCommands';
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
+import { syncSessionMailbox } from './sessionCollaboration';
 import { effortForTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
@@ -1732,6 +1733,10 @@ export async function runAgentTurn(
   }
   turnControllers.set(sessionId, controller);
   registerDurableController(turnId, controller, sessionId);
+  // Resume persisted local peer notices BEFORE this turn begins streaming.
+  // A failed read does not discard durable SQLite messages or block chat.
+  try { await syncSessionMailbox(sessionId); }
+  catch (error) { console.warn('Local peer mail remains pending:', error); }
   useSessionStore.getState().markTurnRunning(sessionId, true);
   useTurnStatusStore.getState().begin(sessionId);
   const startedAt = Date.now();
