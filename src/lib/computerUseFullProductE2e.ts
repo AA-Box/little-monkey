@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type { ToolCall } from './llamaClient';
 import { executeToolCall } from './turnEngine';
 import { ComputerUseRunBudget } from './taskCoordinator';
+import { runSessionMailFullProductE2e } from './sessionMailFullProductE2e';
 
 type NativeTarget = {
   applicationId: string;
@@ -76,6 +77,7 @@ export async function runComputerUseFullProductE2e(): Promise<void> {
     model_loop: { kind: 'deterministic-frontend-model-tool-loop', completed: false, tool_calls: [] as string[] },
     tool_calls: [] as Array<{ name: string; result: string; durationMs: number }>,
     error: null as string | null,
+    session_mail_product: { verified: false, realTauriIpc: false, sqliteDurable: false, noSpoofedToolAuthorization: false },
   };
   let sessionId: string | undefined;
   const budget = new ComputerUseRunBudget();
@@ -249,6 +251,7 @@ export async function runComputerUseFullProductE2e(): Promise<void> {
       trace.real_desktop_actions_executed = trace.tool_calls.some((call) => call.name === 'computer_set_value')
         && trace.postconditions.profile === profileValue
         && trace.postconditions.dark_mode;
+      trace.session_mail_product = await runSessionMailFullProductE2e();
       trace.status = trace.real_frontend_dispatcher
         && trace.task_coordinator
         && trace.real_tauri_ipc
@@ -258,6 +261,9 @@ export async function runComputerUseFullProductE2e(): Promise<void> {
         && trace.postconditions.saved
         && trace.screenshot_received_by_frontend
         && trace.state_verified
+        && trace.session_mail_product.verified
+        && trace.session_mail_product.sqliteDurable
+        && trace.session_mail_product.noSpoofedToolAuthorization
         ? 'completed'
         : 'failed';
       trace.model_loop.completed = trace.status === 'completed';
