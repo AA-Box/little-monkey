@@ -862,11 +862,12 @@ fn conservative_natural_fact_key(text:&str)->Option<String>{
     let trimmed=text.trim();
     if trimmed.chars().count()<12 || trimmed.chars().count()>MAX_FACT_CHARS ||
        trimmed.chars().any(|ch| ch.is_control()) ||
-       trimmed.contains(['/', '\\', '\`', '@', '=', '{', '}', '[', ']', '<', '>', '#', '"', ':']) {
+       trimmed.chars().any(|ch| matches!(ch, '/' | '\\' | '`' | '@' | '=' |
+           '{' | '}' | '[' | ']' | '<' | '>' | '#' | '"' | ':')) {
         return None;
     }
     let without_periods=trimmed.trim_end_matches('.');
-    if without_periods.is_empty()|| without_periods.ends_with(['?', '!']){return None;}
+    if without_periods.is_empty() || without_periods.ends_with('?') || without_periods.ends_with('!') {return None;}
     let words:Vec<String>=without_periods.split_whitespace()
         .map(|word|word.to_lowercase()).collect();
     if words.len()<3{return None;}
