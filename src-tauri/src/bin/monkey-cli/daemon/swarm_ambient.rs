@@ -22,28 +22,47 @@ fn schema(store:&DaemonStore)->Result<(),String>{
             last_fingerprint TEXT NOT NULL DEFAULT '', pending_job TEXT,
             interval_ms INTEGER NOT NULL, next_wake_ms INTEGER NOT NULL
         );"
-    ).map_err(|e|e.to_string())
+    ).map_err(|e|e.to_string())?;
+    let mut stmt=store.connection.prepare("PRAGMA table_info(swarm_ambient_policies)")
+        .map_err(|e|e.to_string())?;
+    let columns=stmt.query_map([],|row|row.get::<_,String>(1))
+        .map_err(|e|e.to_string())?
+        .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    drop(stmt);
+    if !columns.iter().any(|name|name=="garden_agent_memory") {
+        store.connection.execute_batch("ALTER TABLE swarm_ambient_policies
+            ADD COLUMN garden_agent_memory INTEGER NOT NULL DEFAULT 0;")
+            .map_err(|e|e.to_string())?;
+    }
+    if !columns.iter().any(|name|name=="garden_merges_total") {
+        store.connection.execute_batch("ALTER TABLE swarm_ambient_policies
+            ADD COLUMN garden_merges_total INTEGER NOT NULL DEFAULT 0;")
+            .map_err(|e|e.to_string())?;
+    }
+    Ok(())
 }
 #[derive(Debug)]
 struct Policy{
     id:String,recipe:String,include_titles:bool,epoch:u64,
     fingerprint:String,pending_job:Option<String>,interval_ms:u64,next_wake_ms:u64,
+    garden_agent_memory:bool,
 }
 fn policies(store:&DaemonStore)->Result<Vec<Policy>,String>{
     let mut stmt=store.connection.prepare(
         "SELECT id,frozen_recipe,include_titles,epoch,last_fingerprint,pending_job,
-            interval_ms,next_wake_ms FROM swarm_ambient_policies WHERE enabled=1 ORDER BY id LIMIT 8"
+            interval_ms,next_wake_ms,garden_agent_memory FROM swarm_ambient_policies WHERE enabled=1 ORDER BY id LIMIT 8"
     ).map_err(|e|e.to_string())?;
     let mapped=stmt.query_map([],|r|Ok(Policy{
         id:r.get(0)?,recipe:r.get(1)?,include_titles:r.get::<_,i64>(2)?!=0,
         epoch:r.get::<_,i64>(3)? as u64,fingerprint:r.get(4)?,
         pending_job:r.get(5)?,interval_ms:r.get::<_,i64>(6)? as u64,
         next_wake_ms:r.get::<_,i64>(7)? as u64,
+        garden_agent_memory:r.get::<_,i64>(8)?!=0,
     })).map_err(|e|e.to_string())?;
     mapped.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
 }
 pub fn install(paths:&DaemonPaths,id:&str,source:&Path,workspace:&Path,
-    include_titles:bool)->Result<serde_json::Value,String>{
+    include_titles:bool,garden_agent_memory:bool)->Result<serde_json::Value,String>{
     if !valid_id(id){return Err("Invalid ambient worker id".into());}
     let stat=fs::symlink_metadata(source).map_err(|e|e.to_string())?;
     if !stat.file_type().is_file()||stat.len()>1024*1024{
@@ -94,15 +113,18 @@ pub fn install(paths:&DaemonPaths,id:&str,source:&Path,workspace:&Path,
     file.sync_all().map_err(|e|e.to_string())?;
     if let Err(error)=store.connection.execute(
         "INSERT INTO swarm_ambient_policies
-         (id,frozen_recipe,enabled,include_titles,epoch,last_fingerprint,pending_job,interval_ms,next_wake_ms)
-         VALUES(?1,?2,1,?3,0,'',NULL,?4,0)",
-        params![id,destination.to_string_lossy().to_string(),if include_titles {1_i64}else{0_i64},MIN_MS as i64],
+         (id,frozen_recipe,enabled,include_titles,epoch,last_fingerprint,pending_job,interval_ms,next_wake_ms,garden_agent_memory)
+         VALUES(?1,?2,1,?3,0,'',NULL,?4,0,?5)",
+        params![id,destination.to_string_lossy().to_string(),if include_titles {1_i64}else{0_i64},MIN_MS as i64,
+            if garden_agent_memory {1_i64}else{0_i64}],
     ){
         let _=fs::remove_file(destination);
         return Err(error.to_string());
     }
     Ok(serde_json::json!({"id":id,"enabled":true,"adaptive":true,
-       "history_titles":include_titles,"note":"Opt-in read-only analysis; proposals are not automatically executed"}))
+       "history_titles":include_titles,
+       "garden_agent_memory":garden_agent_memory,
+       "note":"Read-only model proposals; optional exact-duplicate memory merge is local and reversible"}))
 }
 pub fn disable(paths:&DaemonPaths,id:&str)->Result<(),String>{
     let store=DaemonStore::open(paths)?;
@@ -118,7 +140,8 @@ pub fn status(paths:&DaemonPaths)->Result<serde_json::Value,String>{
     let store=DaemonStore::open(paths)?;
     schema(&store)?;
     let mut stmt=store.connection.prepare(
-        "SELECT id,enabled,epoch,interval_ms,next_wake_ms,pending_job,include_titles
+        "SELECT id,enabled,epoch,interval_ms,next_wake_ms,pending_job,include_titles,
+                garden_agent_memory,garden_merges_total
          FROM swarm_ambient_policies ORDER BY id LIMIT 50"
     ).map_err(|e|e.to_string())?;
     let rows=stmt.query_map([],|r|Ok(serde_json::json!({
@@ -126,6 +149,8 @@ pub fn status(paths:&DaemonPaths)->Result<serde_json::Value,String>{
         "epoch":r.get::<_,i64>(2)?,"interval_ms":r.get::<_,i64>(3)?,
         "next_wake_ms":r.get::<_,i64>(4)?,"pending_job":r.get::<_,Option<String>>(5)?,
         "history_titles":r.get::<_,i64>(6)?!=0,
+        "garden_agent_memory":r.get::<_,i64>(7)?!=0,
+        "garden_merges_total":r.get::<_,i64>(8)?,
     }))).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>()
         .map_err(|e|e.to_string())?;
     Ok(serde_json::json!({"policies":rows}))
@@ -190,6 +215,21 @@ pub fn tick(cli:&crate::Cli,paths:&DaemonPaths,roots:&[PathBuf],config:&DaemonCo
             // Uncertain crash window: retry the IDENTICAL deterministic job
             // against its already-written frozen snapshot, never a new turn.
         }else if now<policy.next_wake_ms{continue;}
+        if policy.garden_agent_memory {
+            // Only explicitly opted-in policies may change local agent facts.
+            // Model-generated plans remain read-only; no model writes here.
+            let path=little_monkey_lib::app_paths::data_dir()
+                .ok_or("Cannot resolve memory directory")?.join("memories.json");
+            let merged=little_monkey_lib::memory::garden_exact_agent_duplicates_impl(
+                &path,workspace)?;
+            if merged>0 {
+                store.connection.execute(
+                    "UPDATE swarm_ambient_policies
+                     SET garden_merges_total=garden_merges_total+?2 WHERE id=?1",
+                    params![policy.id,merged as i64],
+                ).map_err(|e|e.to_string())?;
+            }
+        }
         let (fingerprint,raw)=history(shared,workspace,policy.include_titles)?;
         // Even without a new conversation, scan the workspace at least once
         // per maximum backoff window. Otherwise a codebase modified outside
@@ -267,18 +307,18 @@ mod tests{
             "version":1,"name":"review","target":{"ollama":"qwen2.5:7b"},
             "workspace":ws,"permission_mode":"plan","prompt":"Review history","params":{}
         }).to_string()).unwrap();
-        assert_eq!(install(&paths,"my-review",&recipe,&ws,true).unwrap()["enabled"],true);
+        assert_eq!(install(&paths,"my-review",&recipe,&ws,true,false).unwrap()["enabled"],true);
         let initial_status=status(&paths).unwrap();
         assert_eq!(initial_status["policies"][0]["history_titles"],true);
-        assert!(install(&paths,"my-review",&recipe,&ws,false).is_err());
+        assert!(install(&paths,"my-review",&recipe,&ws,false,false).is_err());
         let provider=root.join("external.json");
         fs::write(&provider,serde_json::json!({
             "version":1,"name":"review","target":{"provider":"openai","model":"gpt-4o"},
             "workspace":ws,"permission_mode":"plan","prompt":"Review history","params":{}
         }).to_string()).unwrap();
-        assert!(install(&paths,"external-history",&provider,&ws,true)
+        assert!(install(&paths,"external-history",&provider,&ws,true,false)
             .unwrap_err().contains("local model"));
-        assert_eq!(install(&paths,"external-metadata",&provider,&ws,false)
+        assert_eq!(install(&paths,"external-metadata",&provider,&ws,false,false)
             .unwrap()["history_titles"],false);
 
         disable(&paths,"my-review").unwrap();
