@@ -16,8 +16,11 @@ test('official native Codex auth uses existing CLI, never reads tokens and gates
    '#!/usr/bin/env node',
    "const {writeFileSync}=require('node:fs');",
    "const command=process.argv.slice(2);",
-   "writeFileSync(process.env.LM_AUTH_TEST_LOG,JSON.stringify(command));",
-   "if(command[0]==='login'&&command[1]==='status')process.exit(0);",
+   "writeFileSync(process.env.LM_AUTH_TEST_LOG,JSON.stringify({argv:command,apiKey:!!process.env.OPENAI_API_KEY,baseUrl:!!process.env.OPENAI_BASE_URL}));",
+   "if(command[0]==='login'&&command[1]==='status'){",
+   "  console.log(process.env.LM_FAKE_AUTH_MODE==='apikey'?'Logged in using API key':'Logged in using ChatGPT');",
+   "  process.exit(0);",
+   "}",
    "if(command[0]==='exec'){",
    "  console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'Read-only native response'}}));",
    "  console.log(JSON.stringify({type:'turn.completed'}));",
@@ -27,13 +30,20 @@ test('official native Codex auth uses existing CLI, never reads tokens and gates
   ].join('\n')+'\n';
   writeFileSync(bin,content,{mode:0o700});
   chmodSync(bin,0o700);
-  const invoke=(args)=>spawnSync(process.execPath,[script,'codex',...args],{
+  const invoke=(args,extra={})=>spawnSync(process.execPath,[script,'codex',...args],{
    encoding:'utf8',timeout:20000,
-   env:{...process.env,LITTLE_MONKEY_CODEX_BIN:bin,LM_AUTH_TEST_LOG:logfile},
+   env:{...process.env,LITTLE_MONKEY_CODEX_BIN:bin,LM_AUTH_TEST_LOG:logfile,
+     OPENAI_API_KEY:'NEVER_FORWARD_THIS_BILLABLE_KEY',
+     OPENAI_BASE_URL:'https://nonstandard.example.invalid',
+     ...extra},
   });
   let r=invoke(['status']);
   assert.equal(r.status,0,r.stderr);
   assert.equal(JSON.parse(r.stdout).credentialBytesRead,0);
+  const billed=invoke(['status'],{LM_FAKE_AUTH_MODE:'apikey'});
+  assert.notEqual(billed.status,0,
+   'An official CLI API-key login must NEVER be presented as subscription authentication');
+
   r=invoke(['run','--prompt','Write a summary']);
   assert.notEqual(r.status,0,'Unsigned user consent must fail');
   r=invoke(['run','--prompt','Write a summary','--consent']);
@@ -42,7 +52,11 @@ test('official native Codex auth uses existing CLI, never reads tokens and gates
   assert.equal(output.completed,true);
   assert.equal(output.response,'Read-only native response');
   assert.equal(output.usedOfficialClient,true);
-  const args=JSON.parse(readFileSync(logfile,'utf8'));
+  const recorded=JSON.parse(readFileSync(logfile,'utf8'));
+  const args=recorded.argv;
+  assert.equal(recorded.apiKey,false,'Codex may not inherit API-key billing overrides');
+  assert.equal(recorded.baseUrl,false,'Codex may not inherit a custom API endpoint');
+
   assert.deepEqual(args.slice(0,9),['exec','--json','--ephemeral',
    '--sandbox','read-only','--skip-git-repo-check','--cd',args[7],'Write a summary']);
   assert.ok(args[7].includes('lm-codex-native-'));
