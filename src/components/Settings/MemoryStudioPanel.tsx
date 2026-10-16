@@ -10,6 +10,7 @@ import {
   importMemories,
   listAllMemories,
   mergeMemories,
+  mergeMemoriesIfUnchanged,
   purgeExpiredMemories,
   setMemoryEnabled,
   setMemoryExpiry,
@@ -609,7 +610,10 @@ export function MemoryStudioPanel() {
          fact.source!=="agent" || !wouldReachPrompt(fact, new Date().toISOString()) ||
          fact.pinned))throw Error("Memory facts changed since review; refresh and re-review.");
       if(proposal.kind==="merge"){
-        await mergeMemories(proposal.ids,originals[0]!.project_root,proposal.suggestedText);
+        await mergeMemoriesIfUnchanged(
+          proposal.ids,originals[0]!.project_root,
+          proposal.suggestedText,proposal.expectedTexts,
+        );
         setSuccess("Approved and reversibly merged semantic memory suggestion.");
       }else{
         if(!keepId || !proposal.ids.includes(keepId))
