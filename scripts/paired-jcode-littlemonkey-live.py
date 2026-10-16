@@ -140,6 +140,12 @@ def fixture_digest(folder: Path) -> str:
     """Strict whole-directory digest: no unnoticed model mutations between waves."""
     state = hashlib.sha256()
     for item in sorted(folder.rglob("*")):
+        # Native agents need a committed Git repository, but Git may update
+        # internal index/status bookkeeping during READ-ONLY operations.
+        # Score the checkout, not .git internals, and still reject every
+        # added/changed/deleted workspace file including hidden files.
+        if ".git" in item.relative_to(folder).parts:
+            continue
         if item.is_symlink():
             raise RuntimeError("Agent introduced a symlink in disposable fixture")
         if not item.is_file():
@@ -213,6 +219,15 @@ def main():
             fixture.mkdir()
             marker = "SAME_REAL_FIXTURE_" + uuid.uuid4().hex
             (fixture / "fixture.txt").write_text("Independent marker: " + marker + "\n")
+            # monkey task start validates a durable Git workspace revision.
+            # A plain temp directory would be rejected BEFORE any real model
+            # execution, falsely suggesting the comparative harness worked.
+            command(["git", "init", "--quiet", str(fixture)])
+            command(["git", "-C", str(fixture), "add", "--", "fixture.txt"])
+            command(["git", "-C", str(fixture),
+                     "-c", "user.name=Little Monkey Benchmark",
+                     "-c", "user.email=benchmark@localhost",
+                     "commit", "--quiet", "-m", "Disposable read-only fixture"])
             pristine = fixture_digest(fixture)
             prompt = ("Use a tool to read fixture.txt in the current workspace. "
                       "Return its exact independent marker in your answer. "
