@@ -25,6 +25,7 @@
     "test:headless-resource:live": "node scripts/headless-agent-benchmark.mjs",
     "test:headless-resource:contract": "node --check scripts/headless-agent-benchmark.mjs && node --test scripts/headless-workload-metrics.contract.test.mjs",
     "test:headless-resource:os": "node scripts/headless-os-sampling.e2e.mjs",
+    "test:selfdev:contract": "node --check scripts/selfdev-transaction.mjs && node --test scripts/selfdev-transaction.contract.test.mjs",
     "test:swarm-models:syntax": "node --check scripts/swarm-model-benchmark.mjs",
     "test:swarm-headless:contract": "node --check scripts/swarm-headless-performance.mjs && node --test scripts/swarm-headless-performance.test.mjs scripts/lib/swarmResidentRss.test.mjs",
     "test:swarm-headless:live": "node scripts/swarm-headless-performance.mjs",
