@@ -14,7 +14,7 @@ import {
   copyFileSync,chmodSync,renameSync,rmSync,symlinkSync,readlinkSync,
   realpathSync,
 } from 'node:fs';
-import {homedir,tmpdir} from 'node:os';
+import {homedir} from 'node:os';
 import {resolve,join,basename,dirname} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {spawnSync} from 'node:child_process';
@@ -40,17 +40,6 @@ function exec(file,params,{cwd,timeout=120000}={}){
 }
 function safePath(path){
  if(existsSync(path) && lstatSync(path).isSymbolicLink())fail('Refusing symlink-controlled installation root: '+path);
-}
-function init(){
- for(const d of [root,versions])safePath(d);
- mkdirSync(versions,{recursive:true,mode:0o700});
- const marker=join(root,'.selfdev-managed');
- if(existsSync(marker)){
-  if(readFileSync(marker,'utf8')!==mode+'\n')fail('Root is not an approved Little Monkey selfdev installation');
- }else{
-  // Refuse adopting arbitrary existing directories as managed install roots.
-  if(readFileSync(marker,'utf8')!=='')fail('Unexpected root state');
- }
 }
 function ensureRoot(){
  for(const d of [root,versions])safePath(d);
@@ -162,7 +151,7 @@ function build(){
  const head=exec('git',['rev-parse','HEAD'],{cwd:repo});
  if(exec('git',['status','--porcelain'],{cwd:repo})!=='')
   fail('Refusing to build from a dirty Git source tree');
- exec('pnpm',['exec','tsc','--noEmit'],{cwd:repo,timeout:240000});
+ exec('pnpm',['typecheck'],{cwd:repo,timeout:240000});
  exec('cargo',['test','--manifest-path','src-tauri/Cargo.toml','--lib'],{
   cwd:repo,timeout:20*60*1000,
  });
