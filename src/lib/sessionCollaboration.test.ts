@@ -5,6 +5,7 @@ const flush=vi.fn();
 const invokeMock=vi.fn();
 const add=vi.fn();
 let enabled=true;
+let activeWorkspace='/repo/a';
 type FakeMessage={role:string;content:string};
 type FakeSession={
  id:string;title:string;workspacePath:string|null;archived:boolean;
@@ -25,6 +26,10 @@ vi.mock('@tauri-apps/api/core',()=>({
 vi.mock('../store/settingsStore',()=>({
   useSettingsStore:{getState:()=>({sessionCollaborationEnabled:enabled})},
 }));
+vi.mock('../store/workspaceStore',()=>({
+  primaryRoot:()=>({path:activeWorkspace}),
+  useWorkspaceStore:{getState:()=>({roots:[]})},
+}));
 vi.mock('../store/sessionStore',()=>({
   useSessionStore:{getState:()=>({
     sessions,runningTurns,addMessage:add,
@@ -33,7 +38,7 @@ vi.mock('../store/sessionStore',()=>({
 }));
 
 beforeEach(()=>{
- enabled=true;flush.mockReset().mockResolvedValue(undefined);add.mockReset();
+ enabled=true;activeWorkspace='/repo/a';flush.mockReset().mockResolvedValue(undefined);add.mockReset();
  sessions=[
   {id:'sender',title:'Sender',workspacePath:'/repo/a',archived:false,comparisonBranch:null,messages:[]},
   {id:'target',title:'Target',workspacePath:'/repo/a',archived:false,comparisonBranch:null,messages:[]},
@@ -131,6 +136,11 @@ describe('native SQLite backed local session messaging integration',()=>{
   sessions[1].archived=false;
   enabled=false;
   await expect(sendSessionMessage(args)).rejects.toThrow(/disabled/);
+  expect(invokeMock).not.toHaveBeenCalled();
+ });
+ it('refuses a stale chat after the user switches the active workspace',async()=>{
+  activeWorkspace='/repo/b';
+  await expect(sendSessionMessage(args)).rejects.toThrow(/Active workspace changed/);
   expect(invokeMock).not.toHaveBeenCalled();
  });
  it('rejects oversized Unicode messages and invalid identities before native send',async()=>{
