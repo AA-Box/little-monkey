@@ -470,6 +470,43 @@ export function MemoryStudioPanel() {
   // One `now` per render pass, so every row's expiry verdict agrees.
   const now = useMemo(() => new Date().toISOString(), [entries]);
 
+  // Display only: all disabling still goes through the authoritative Rust
+  // memory studio command and applies to the next prompt build. A conflict
+  // always requires an explicit human choice about which statement to keep.
+  const contradictions = useMemo(() => {
+    const byScope = new Map<string,Map<string,{positive:MemoryEntry[];negative:MemoryEntry[]}>>();
+    for (const entry of entries) {
+      if (entry.source !== "agent" || !wouldReachPrompt(entry, now)) continue;
+      const normalized = entry.text.trim().replace(/\.+$/,"").replace(/\s+/g," ").toLowerCase();
+      const pairs = [
+        ["user prefers ","user does not prefer "],
+        ["user wants ","user does not want "],
+        ["the project is ","the project is not "],
+      ] as const;
+      for (const [positive,negative] of pairs) {
+        const isNegative = normalized.startsWith(negative);
+        const isPositive = !isNegative && normalized.startsWith(positive);
+        if (!isNegative && !isPositive) continue;
+        const tail = normalized.slice((isNegative?negative:positive).length);
+        if (!tail || /[/\\@=\`{}[\]<>#":?!]/.test(tail)) break;
+        const scope = entry.scope + ":" + (entry.project_root ?? "");
+        const list = byScope.get(scope) ?? new Map();
+        const key = positive + tail;
+        const pair = list.get(key) ?? {positive:[],negative:[]};
+        (isNegative ? pair.negative : pair.positive).push(entry);
+        list.set(key,pair);byScope.set(scope,list);
+        break;
+      }
+    }
+    const result:{positive:MemoryEntry;negative:MemoryEntry}[]=[];
+    for (const scope of byScope.values()) for (const pair of scope.values()) {
+      if (pair.positive[0] && pair.negative[0]) {
+        result.push({positive:pair.positive[0],negative:pair.negative[0]});
+      }
+    }
+    return result.slice(0,20);
+  },[entries,now]);
+
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();
     return entries.filter((entry) => {
@@ -606,6 +643,45 @@ export function MemoryStudioPanel() {
       </div>
 
       {statusBanner(error, success)}
+      {contradictions.length > 0 && (
+        <section className="rounded-lg border border-warning/40 p-3" aria-label="Memory contradictions requiring review">
+          <h3 className="text-sm font-semibold">Contradictory memories need your decision</h3>
+          <p className="mt-1 text-xs text-muted">
+            The background curator never picks a winner. Select which statement should
+            remain enabled; the other will be soft-disabled and can be restored in Memory Studio.
+          </p>
+          <div className="mt-2 space-y-3">
+            {contradictions.map(({positive,negative}) => (
+              <div key={positive.id+":"+negative.id} className="rounded-md border border-border p-2">
+                <p className="text-xs">{positive.text}</p>
+                <p className="mt-1 text-xs">{negative.text}</p>
+                <p className="mt-1 text-[10px] text-muted">
+                  Scope: {positive.project_root ?? "global"}
+                </p>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <Button size="sm" variant="secondary" disabled={busy !== null}
+                    onClick={() => void run("conflict",async()=>{
+                      await setMemoryEnabled(negative.id,negative.project_root,false);
+                      await refresh();
+                      setSuccess("Kept the positive memory; disabled the contradictory one.");
+                    })}>
+                    Keep first statement
+                  </Button>
+                  <Button size="sm" variant="secondary" disabled={busy !== null}
+                    onClick={() => void run("conflict",async()=>{
+                      await setMemoryEnabled(positive.id,positive.project_root,false);
+                      await refresh();
+                      setSuccess("Kept the negative memory; disabled the contradictory one.");
+                    })}>
+                    Keep second statement
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
 
       <div className="flex flex-wrap items-center gap-2">
         <div className="flex gap-1 rounded-lg border border-border bg-surface-2 p-0.5">
