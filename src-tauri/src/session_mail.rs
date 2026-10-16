@@ -316,6 +316,25 @@ mod tests{
         assert!(pending_impl(&path,"to","/project",10).unwrap().is_empty());
         drop(got);let _=std::fs::remove_dir_all(path.parent().unwrap());
     }
+    #[test]fn serialized_ipc_contract_matches_desktop_consumer(){
+        let peer=SessionPeer{id:"agent-1".into(),title:"Test".into(),
+            workspace:"/root".into(),updated_at_ms:123};
+        let json=serde_json::to_value(&peer).unwrap();
+        assert_eq!(json["updatedAtMs"],123);
+        assert_eq!(json["workspace"],"/root");
+        let mail=Mail{id:"turn:tool".into(),sender_session_id:"a".into(),
+            recipient_session_id:"b".into(),workspace:"/root".into(),
+            text:"Hello".into(),created_at_ms:123};
+        let json=serde_json::to_value(&mail).unwrap();
+        assert_eq!(json["senderSessionId"],"a");
+        assert_eq!(json["recipientSessionId"],"b");
+        assert_eq!(json["createdAtMs"],123);
+        let receipt=MailReceipt{message_id:"turn:tool".into(),
+            recipient_session_id:"b".into(),persisted:true,already_existed:false};
+        let json=serde_json::to_value(&receipt).unwrap();
+        assert_eq!(json["messageId"],"turn:tool");
+        assert_eq!(json["alreadyExisted"],false);
+    }
     #[test]fn exact_workspace_peer_directory_and_stale_enrolment_refusal(){
         let path=tmp();
         register_impl(&path,"one","/shared","One").unwrap();
