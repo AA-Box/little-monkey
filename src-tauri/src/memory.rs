@@ -850,6 +850,154 @@ pub fn garden_exact_agent_duplicates_impl(path: &Path, root: &str) -> Result<usi
     Ok(merged)
 }
 
+/// Deterministic second-pass curator for a narrow subset of semantically
+/// equivalent natural-language facts. Unlike model summarization this can
+/// prove equivalence syntactically; it MUST NOT infer preferences, drop
+/// negations, synthesize text, or choose which conflicting claim is true.
+///
+/// Only whitespace, ASCII sentence-final "." and Unicode letter case vary.
+/// Paths, URLs, markup, quote-laden instructions, code and control characters
+/// are ineligible for this normalization because their case can be semantic.
+fn conservative_natural_fact_key(text:&str)->Option<String>{
+    let trimmed=text.trim();
+    if trimmed.chars().count()<12 || trimmed.chars().count()>MAX_FACT_CHARS ||
+       trimmed.chars().any(|ch| ch.is_control()) ||
+       trimmed.contains(['/', '\\', '\`', '@', '=', '{', '}', '[', ']', '<', '>', '#', '"', ':']) {
+        return None;
+    }
+    let without_periods=trimmed.trim_end_matches('.');
+    if without_periods.is_empty()|| without_periods.ends_with(['?', '!']){return None;}
+    let words:Vec<String>=without_periods.split_whitespace()
+        .map(|word|word.to_lowercase()).collect();
+    if words.len()<3{return None;}
+    Some(words.join(" "))
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GardenSemanticReview {
+    pub merged_groups:usize,
+    /// This is a warning, NOT a decision about which statement is true.
+    pub unresolved_contradictions:Vec<(String,String)>,
+}
+/// Compare a very narrow set of explicit language negations. A conflict is
+/// reported by stable fact IDs but NEVER automatically "resolved"; recency
+/// and model confidence cannot establish which memory is correct.
+fn contradiction_key(key:&str)->Option<(String,bool)> {
+    for (positive,negative) in [
+        ("user prefers ","user does not prefer "),
+        ("user wants ","user does not want "),
+        ("the project is ","the project is not "),
+    ] {
+        if let Some(tail)=key.strip_prefix(positive){
+            return Some((format!("{positive}{tail}"),false));
+        }
+        if let Some(tail)=key.strip_prefix(negative){
+            return Some((format!("{positive}{tail}"),true));
+        }
+    }
+    None
+}
+
+/// Atomic opt-in consolidation with soft-retired ancestry and reporting of
+/// unambiguous positive-vs-negative contradictions. Every edit is within a
+/// single workspace, agent-owned, enabled, unpinned and undoable.
+pub fn garden_conservative_semantic_review_impl(
+    path:&Path,root:&str,
+)->Result<GardenSemanticReview,String>{
+    let _guard=write_lock(path)?;
+    let mut data=load_impl(path)?;
+    let now=now_rfc3339();
+    let Some(project)=data.projects.get_mut(root) else {
+        return Ok(GardenSemanticReview{merged_groups:0,
+            unresolved_contradictions:Vec::new()});
+    };
+    let mut group:std::collections::BTreeMap<String,Vec<String>>=
+        std::collections::BTreeMap::new();
+    let mut conflicts:std::collections::BTreeMap<String,Vec<(String,bool)>>=
+        std::collections::BTreeMap::new();
+    for fact in &project.facts {
+        if fact.source!="agent"||fact.pinned||!fact.enabled||
+           fact.retired_at.is_some()||fact.expires_at.is_some()||
+           !fact.merged_from.is_empty(){continue;}
+        let Some(key)=conservative_natural_fact_key(&fact.text) else {continue};
+        group.entry(key.clone()).or_default().push(fact.id.clone());
+        if let Some((head,negative))=contradiction_key(&key){
+            conflicts.entry(head).or_default().push((fact.id.clone(),negative));
+        }
+    }
+    let mut unresolved=Vec::new();
+    for values in conflicts.into_values() {
+        if unresolved.len()>=20 {break;}
+        if let (Some(yes),Some(no))=(values.iter().find(|x|!x.1),
+            values.iter().find(|x|x.1)){
+            unresolved.push((yes.0.clone(),no.0.clone()));
+        }
+    }
+    let mut count=0;
+    for ids in group.into_values().filter(|ids|ids.len()>1).take(8) {
+        let original=project.facts.iter().find(|f|f.id==ids[0])
+            .ok_or("Garden source disappeared")?.text.clone();
+        let merged_id=uuid::Uuid::new_v4().to_string();
+        for fact in &mut project.facts {
+            if ids.contains(&fact.id){
+                fact.retired_at=Some(now.clone());
+                fact.merged_into=Some(merged_id.clone());
+            }
+        }
+        project.facts.push(Fact{
+            id:merged_id,text:original,source:"agent".into(),
+            created_at:now.clone(),enabled:true,source_turn_id:None,
+            pinned:false,expires_at:None,last_used_at:None,
+            merged_from:ids,merged_into:None,retired_at:None,
+        });
+        count+=1;
+    }
+    if count>0 {save_impl(path,&data)?;}
+    Ok(GardenSemanticReview{merged_groups:count,
+        unresolved_contradictions:unresolved})
+}
+
+#[cfg(test)]
+mod semantic_garden_tests {
+    use super::*;
+    fn fact(id:&str,text:&str)->Fact{
+        Fact{id:id.into(),text:text.into(),source:"agent".into(),
+            created_at:now_rfc3339(),enabled:true,source_turn_id:None,
+            pinned:false,expires_at:None,last_used_at:None,
+            merged_from:vec![],merged_into:None,retired_at:None}
+    }
+    #[test]
+    fn normalized_equivalent_sentences_merge_with_reversible_provenance() {
+        let dir=std::env::temp_dir().join(format!("lm-semantic-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path=dir.join("memories.json");
+        let mut data=MemoriesFile::default();
+        data.projects.insert("/demo".into(),ProjectMemory{
+            facts:vec![
+                fact("a","User prefers shorter written updates."),
+                fact("b","USER   PREFERS shorter written updates"),
+                fact("c","User does not prefer shorter written updates."),
+                fact("d","Use src/Main.rs for the configuration"),
+                fact("e","Use src/main.rs for the configuration"),
+            ],
+        });
+        save_impl(&path,&data).unwrap();
+        let review=garden_conservative_semantic_review_impl(&path,"/demo").unwrap();
+        assert_eq!(review.merged_groups,1);
+        assert_eq!(review.unresolved_contradictions.len(),1);
+        assert_eq!(garden_conservative_semantic_review_impl(&path,"/demo").unwrap().merged_groups,0);
+        let data=load_impl(&path).unwrap();
+        let merged=data.projects["/demo"].facts.iter().find(|f|f.merged_from.len()==2).unwrap();
+        assert_eq!(merged.merged_from,vec!["a","b"]);
+        assert!(data.projects["/demo"].facts.iter().find(|f|f.id=="c")
+            .unwrap().retired_at.is_none(),"negation must never auto-resolve");
+        assert!(data.projects["/demo"].facts.iter().find(|f|f.id=="d")
+            .unwrap().retired_at.is_none(),"case-sensitive paths may differ");
+        assert_eq!(unmerge_impl(&path,"/demo",&merged.id).unwrap(),2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod ambient_exact_garden_tests {
     use super::*;
