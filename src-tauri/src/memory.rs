@@ -972,6 +972,35 @@ mod semantic_garden_tests {
             merged_from:vec![],merged_into:None,retired_at:None}
     }
     #[test]
+    fn approved_model_merge_rejects_stale_text_under_cross_process_lock() {
+        let dir=std::env::temp_dir().join(format!("lm-guarded-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path=dir.join("memories.json");
+        let scope="/scope/a";
+        let a=add_fact_impl(&path,scope,"User prefers brief updates","agent",None).unwrap();
+        let b=add_fact_impl(&path,scope,"User likes concise summaries","agent",None).unwrap();
+        let ids=vec![a.id.clone(),b.id.clone()];
+        let originals=vec![a.text.clone(),b.text.clone()];
+        // A separate chat corrected the first fact AFTER the human approved
+        // the model proposal. Atomic CAS rejects rather than merging old
+        // assumptions into a newly corrected source of truth.
+        update_fact_impl(&path,scope,&a.id,"User now prefers detailed reports").unwrap();
+        assert!(merge_guarded_impl(&path,scope,&ids,
+            Some("User prefers short reports"),Some(&originals)).is_err());
+        let facts=list_impl(&path,Some(scope)).unwrap();
+        assert_eq!(facts.len(),2);
+        assert!(facts.iter().all(|f|f.retired_at.is_none()));
+
+        update_fact_impl(&path,scope,&a.id,&a.text).unwrap();
+        let merged=merge_guarded_impl(&path,scope,&ids,
+            Some("User prefers concise updates"),Some(&originals)).unwrap();
+        assert_eq!(merged.merged_from,ids);
+        assert_eq!(list_impl(&path,Some(scope)).unwrap().len(),1);
+        assert_eq!(unmerge_impl(&path,scope,&merged.id).unwrap(),2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn normalized_equivalent_sentences_merge_with_reversible_provenance() {
         let dir=std::env::temp_dir().join(format!("lm-semantic-{}",uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1152,7 +1181,7 @@ pub fn merge_guarded_impl(
     }
     if let Some(expected)=expected_old_texts {
         if expected.len()!=parents.len() || parents.iter().zip(expected.iter())
-            .any(|(actual,old)|actual.text!=*old ||
+            .any(|(actual,old)|actual.text.as_str()!=old.as_str() ||
                  actual.source!="agent" ||actual.pinned ||
                  actual.retired_at.is_some()||!actual.enabled){
             return Err("Memory changed since model review; no merge was applied.".into());
