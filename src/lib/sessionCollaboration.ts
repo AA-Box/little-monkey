@@ -47,13 +47,37 @@ function authorizedSource(id:string) {
   return session;
 }
 
-export function listCollaboratingSessions(senderSessionId:string) {
+interface LocalPeer {
+  id:string;
+  title:string;
+  workspace:string;
+  updatedAtMs:number;
+}
+
+/** Enrolling an existing user-created session advertises only its identifier,
+ * title and SAME workspace to other opted-in desktop processes. */
+async function registerPeer(session:{id:string;title:string;workspacePath:string|null}):Promise<void> {
+  if(!session.workspacePath)throw new Error('Cannot register a global chat as a peer.');
+  await invoke('session_mail_register',{
+    sessionId:session.id,workspace:session.workspacePath,
+    title:session.title.slice(0,100),
+  });
+}
+
+/** Cross-process directory: native SQLite is the authority for admitted peers. */
+export async function listCollaboratingSessions(senderSessionId:string):Promise<LocalPeer[]> {
   const sender=authorizedSource(senderSessionId);
-  return useSessionStore.getState().sessions
+  const peers=useSessionStore.getState().sessions
     .filter(other=>other.id!==sender.id && other.workspacePath===sender.workspacePath &&
       !other.archived && !other.comparisonBranch)
-    .slice(0,MAX_PEERS)
-    .map(other=>({id:other.id,title:other.title.slice(0,100),workspace:sender.workspacePath}));
+    .slice(0,MAX_PEERS);
+  await registerPeer(sender);
+  for(const peer of peers)await registerPeer(peer);
+  const registered=await invoke<LocalPeer[]>('session_mail_peers',{
+    senderSessionId,workspace:sender.workspacePath,
+  });
+  return registered.filter(peer=>peer.workspace===sender.workspacePath &&
+    peer.id!==senderSessionId).slice(0,MAX_PEERS);
 }
 
 const inFlight=new Map<string,Promise<number>>();
@@ -81,6 +105,8 @@ async function syncImpl(recipientSessionId:string):Promise<number>{
   if(!current || !current.workspacePath || current.archived ||
      current.comparisonBranch || useSessionStore.getState().runningTurns[recipientSessionId])return 0;
   const workspace=current.workspacePath;
+  if(primaryRoot(useWorkspaceStore.getState().roots)?.path!==workspace)return 0;
+  await registerPeer(current);
   const mail=await invoke<DurableMail[]>('session_mail_pending',{
     recipientSessionId,workspace,limit:MAX_PER_RECEIVE,
   });
@@ -129,16 +155,13 @@ export async function sendSessionMessage(args:{
 }):Promise<{messageId:string;persisted:true;recipientSessionId:string}>{
   const {senderSessionId,recipientSessionId,toolCallId,turnId,text}=args;
   const sender=authorizedSource(senderSessionId);
-  const recipient=listCollaboratingSessions(senderSessionId).find(p=>p.id===recipientSessionId);
-  if(!recipient)throw new Error('Recipient does not belong to the same authorized workspace or is inactive.');
+  const recipient=(await listCollaboratingSessions(senderSessionId))
+    .find(peer=>peer.id===recipientSessionId);
+  if(!recipient)throw new Error('Recipient is not registered in this workspace.');
   if(typeof text!=='string' || !text.trim() || new TextEncoder().encode(text).length>MAX_TEXT_BYTES)
     throw new Error('Peer message must contain 1–1600 UTF-8 bytes.');
   if(!/^[\w.:-]{1,160}$/.test(toolCallId)||!/^[\w.:-]{1,160}$/.test(turnId))
     throw new Error('Invalid turn/tool identity.');
-  const current=useSessionStore.getState().sessions.find(s=>s.id===recipientSessionId);
-  if(!current || current.workspacePath!==sender.workspacePath)
-    throw new Error('Target session changed before delivery.');
-
   // SQLite commits BEFORE acknowledging. This survives arbitrary process
   // restarts even if no chat window is open to display the note yet.
   const receipt=await invoke<MailReceipt>('session_mail_send',{
