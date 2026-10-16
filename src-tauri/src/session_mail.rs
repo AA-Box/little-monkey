@@ -59,8 +59,26 @@ fn open(path:&Path)->Result<Connection,String>{
     std::fs::create_dir_all(folder).map_err(|e|e.to_string())?;
     let db=Connection::open(path).map_err(|e|e.to_string())?;
     db.busy_timeout(Duration::from_secs(8)).map_err(|e|e.to_string())?;
+    // Fresh multi-process startup can race on the WAL journal transition.
+    // SQLite's busy_timeout alone does not guarantee PRAGMA journal_mode
+    // succeeds on Windows; retry ONLY a busy/locked schema race with an
+    // independently bounded deadline, never syntax or I/O failures.
+    let deadline=std::time::Instant::now()+Duration::from_secs(12);
+    loop {
+        match db.execute_batch("PRAGMA journal_mode=WAL;") {
+            Ok(())=>break,
+            Err(rusqlite::Error::SqliteFailure(ref cause,_))
+                if matches!(cause.code,
+                    rusqlite::ErrorCode::DatabaseBusy |
+                    rusqlite::ErrorCode::DatabaseLocked)
+                    && std::time::Instant::now()<deadline => {
+                std::thread::sleep(Duration::from_millis(45));
+            }
+            Err(error)=>return Err(format!("Mailbox WAL startup: {error}")),
+        }
+    }
     db.execute_batch(
-        "PRAGMA journal_mode=WAL;
+        "PRAGMA synchronous=FULL;
          PRAGMA synchronous=FULL;
          CREATE TABLE IF NOT EXISTS local_session_peers (
            session_id TEXT PRIMARY KEY NOT NULL,
@@ -427,12 +445,15 @@ mod tests{
                 .arg("--exact").arg("session_mail::tests::child_writer_entry")
                 .env("LITTLE_MONKEY_TEST_MAIL_CHILD",&path)
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
                 .spawn().unwrap());
         }
-        for mut child in children {
-            assert!(child.wait().unwrap().success(),
-                "Independent sender must successfully commit or replay");
+        for child in children {
+            let output=child.wait_with_output().unwrap();
+            assert!(output.status.success(),
+                "Independent sender failed: {}",
+                String::from_utf8_lossy(&output.stderr).chars().take(1000)
+                    .collect::<String>());
         }
         let rows=pending_impl(&path,"parent","/acceptance",10).unwrap();
         assert_eq!(rows.len(),1,"Four distinct processes must commit one message");
