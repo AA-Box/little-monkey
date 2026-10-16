@@ -39,27 +39,54 @@ function exec(file,params,{cwd,timeout=120000}={}){
  return r.stdout.trim();
 }
 function safePath(path){
- if(existsSync(path) && lstatSync(path).isSymbolicLink())fail('Refusing symlink-controlled installation root: '+path);
+ try {
+  if(lstatSync(path).isSymbolicLink())
+   fail('Refusing symlink-controlled installation root: '+path);
+ }catch(error){
+  if(error?.code!=='ENOENT')throw error;
+ }
 }
 function ensureRoot(){
  for(const d of [root,versions])safePath(d);
  const marker=join(root,'.selfdev-managed');
- if(!existsSync(marker)){
-  if(existsSync(root)&&statSync(root).isDirectory()&&
-     existsSync(join(root,'current')))fail('Refusing to adopt existing installation');
-  mkdirSync(versions,{recursive:true,mode:0o700});
+ // Verify an existing marker by directly reading it; missing-file errors are
+ // the ONLY case where we initialize, so there is no existence-check/write
+ // race. A competing initializer wins by creating with O_EXCL ('wx').
+ try{
+  const value=readFileSync(marker,'utf8');
+  if(value!==mode+'\n')fail('Root is not an approved selfdev directory');
+  return;
+ }catch(error){
+  if(error?.code!=='ENOENT')throw error;
+ }
+ // A preexisting current path without the marker belongs to another tool.
+ if(lstatMaybe(entry))fail('Refusing to adopt existing installation');
+ mkdirSync(versions,{recursive:true,mode:0o700});
+ try{
   writeFileSync(marker,mode+'\n',{flag:'wx',mode:0o600});
- }else if(readFileSync(marker,'utf8')!==mode+'\n')
-  fail('Root is not marked as an owned selfdev directory');
+ }catch(error){
+  if(error?.code!=='EEXIST')throw error;
+  if(readFileSync(marker,'utf8')!==mode+'\n')
+   fail('Concurrent selfdev initializer wrote an unrecognized marker');
+ }
 }
 function linkTarget(link){
- if(!existsSync(link) && !lstatMaybe(link))return null;
- if(!lstatSync(link).isSymbolicLink())fail('Managed activation path was replaced by a non-symlink');
- const dest=resolve(dirname(link),readlinkSync(link));
+ // readlink is the actual authority, including for dangling symlinks.
+ // Avoid a lstat/existence test followed by a separate vulnerable readlink.
+ let target;
+ try {target=readlinkSync(link);}
+ catch(error){
+  if(error?.code==='ENOENT')return null;
+  fail('Managed activation path is not a valid symlink: '+error.code);
+ }
+ const dest=resolve(dirname(link),target);
  if(!dest.startsWith(versions+'/'))fail('Activation link points outside managed versions');
  return dest;
 }
-function lstatMaybe(path){try{return lstatSync(path);}catch{return null;}}
+function lstatMaybe(path){
+ try{return lstatSync(path);}
+ catch(error){if(error?.code==='ENOENT')return null;throw error;}
+}
 function verify(binary){
  const r=spawnSync(binary,['--version'],{encoding:'utf8',timeout:15000,maxBuffer:128*1024});
  if(r.error||r.status!==0)fail('Candidate did not pass native CLI --version smoke: '+String(r.error?.message??r.stderr).slice(0,200));
