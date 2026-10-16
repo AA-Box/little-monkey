@@ -1,52 +1,66 @@
-# Opt-in desktop chat-to-chat agent collaboration
+# Durable, opt-in desktop session collaboration
 
-In **Settings → Automation → Subagents**, enable **Allow local agent messages
-between my chat sessions** (default OFF). Little Monkey will then offer
-`session_list_peers` and `session_send_message` to the model in normal
-desktop chat turns attached to an actual workspace.
+**Default OFF.** Enable **Settings → Automation → Subagents → Allow local agent
+messages between my chat sessions**. Ordinary desktop coding-agent turns will
+then see two bounded model tools:
 
-The trusted sender identity is the active local chat session id supplied by
-Little Monkey's own tool dispatcher, never a model argument. The send tool
-receives an exact recipient session id returned by the list tool. Both
-sessions MUST already exist and share the same literal workspace root.
-Global chats, archived chats, comparison branches, other project roots,
-unavailable peers and self-sends cannot be addressed. This setting is
-globally per profile and automatically disabled in Plan Mode.
+- `session_list_peers` lists unarchived, non-comparison chat sessions already
+  attached to the **exact same workspace**.
+- `session_send_message` sends at most 1,600 UTF-8 bytes of untrusted text
+  to one of those session IDs.
 
-- Notices are limited to 1,600 UTF-16 code units and are wrapped as
-  **untrusted peer content**, clearly attributed to the sending session.
-  They cannot confer permissions, prompt priority or filesystem rights.
-- Sending mutates the recipient's persisted chat transcript and waits for
-  `flushSessionPersistence` before issuing a success receipt.
-- The receipt is tied to the current turn ID + model tool-call ID. Replaying
-  the same message in a single desktop instance does not append a duplicate.
-  Failed persistence returns an error instead of claiming durability.
-- The receiver sees the message immediately in the same window or through
-  existing cross-window session-change events; the model sees the historical
-  notice only when the user initiates a future turn. Messages DO NOT
-  automatically wake an idle agent or rerun a failed task.
-- The original workspace must already be attached by the user. The tool
-  cannot attach a new root or resolve a foreign path, and it does not give
-  any agent a new network, shell or file-edit capability.
+No dynamic workspace grants, automatic model turns, shell execution,
+network-facing endpoints or independent agent processes are created.
 
-**Important limitations:** This is local DESKTOP session collaboration,
-not JCode's daemon-wide live session bus. It does not connect independent
-daemon processes or paired machines; existing session-file persistence does
-not supply a general compare-and-swap transport between simultaneous
-writers. Crash-consistent exactly-once delivery under multiwindow races,
-real-time file-read invalidation outside an enrolled workflow, cross-device
-agent messaging, and automatic task takeover remain unimplemented.
+## Delivery and crash recovery
 
-## Verification
+The **authoritative mailbox is per-profile SQLite**, separate from the
+frontend's session file. On send, Rust uses WAL and an IMMEDIATE transaction
+to insert a unique `turn_id:tool_call_id` message with a frozen sender,
+recipient, workspace and text. Retrying the identical identity is idempotent;
+reusing that identity with different content is rejected. Each recipient is
+limited to 1,000 outstanding messages.
 
-```sh
+The recipient reads only messages for its own session ID and frozen workspace.
+Its desktop window polls while visible/idle, and every new model turn first
+reads pending messages. Each message is appended as an **untrusted assistant
+notice** with a stable receipt marker (not a real tool call or new human
+instruction). Then Little Monkey flushes its session file to disk. Only
+**after successful persistence** does it acknowledge the message in SQLite.
+
+A crash before transcript persistence leaves the SQLite row pending; a crash
+after persistence but before acknowledgement delivers the same marker again
+and avoids inserting a duplicate. Acknowledge is idempotent and requires the
+exact recipient and workspace. A model cannot obtain write permissions or
+invoke a new assistant turn by sending mail.
+
+The Rust tests cover SQLite transactions, repeated opens, thread contention
+and a child test process that writes before the parent reopens and acknowledges.
+The frontend tests cover real IPC *call ordering* with mock native endpoints,
+same-workspace consent, crash windows and failure postures.
+
+## Local verification
+
+\`\`\`sh
 pnpm exec vitest run src/lib/sessionCollaboration.test.ts
 pnpm typecheck
-```
+cargo test --manifest-path src-tauri/Cargo.toml session_mail::tests
+\`\`\`
 
-Actual desktop acceptance: enable the feature, create two chats attached
-to the same canonical workspace, have A list peers and send to B, restart
-the app, confirm the note is in B and no tool was executed, then disable
-the setting and verify sends fail. Test cross-workspace, archived-chat and
-Plan Mode refusal. The tests above exercise the persistence barrier through
-mocks; they do not replace a physical two-window race test.
+Physical desktop acceptance must additionally launch **two separate Little
+Monkey processes under the same test profile**, enable collaboration in their
+settings, create two sessions with the same attached workspace, send from one
+process, close/relaunch the second and verify that its transcript contains the
+message once; also test a running streamed turn, idle-window delivery and a
+deliberately interrupted session persistence. None of these steps needs
+connection to a remote peer.
+
+**Boundary:** This is genuine durable *local* desktop messaging, not a
+JCode-compatible server-wide session bus or cross-host peer channel. Delivery
+is **at least once to the consumer until acknowledged**, with idempotence
+in the normal persisted transcript. Because frontend chat sessions themselves
+are stored in a file and concurrently edited by independent windows, this
+does not yet guarantee general exactly-once mutations under adversarial
+simultaneous multiwindow writes. Existing daemon workflows have their own
+separately authenticated message transports. Do not claim general
+cross-device agent messaging or auto-resumption from this implementation.
