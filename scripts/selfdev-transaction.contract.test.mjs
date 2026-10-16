@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
-import {mkdtempSync,writeFileSync,chmodSync,readlinkSync,readFileSync,rmSync,existsSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,writeFileSync,chmodSync,readlinkSync,readFileSync,rmSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join,resolve,basename} from 'node:path';
 
@@ -65,6 +65,17 @@ test('real OS executable symlinks: stage, two activations, rollback and digest r
     assert.equal(r.ok,true,r.stderr);
     assert.equal(basename(readlinkSync(join(root,'current'))),shaA);
     assert.equal(basename(readlinkSync(join(root,'previous'))),shaB);
+
+    // Another independent process owns the manager directory lock.
+    // The self-updater must fail closed without changing active or rollback
+    // pointers, regardless of the requested target.
+    const lock=join(root,'.selfdev-operation.lock');
+    mkdirSync(lock,{mode:0o700});
+    r=call('activate','--root',root,'--confirm-sha',shaA);
+    assert.equal(r.ok,false,'Activation must refuse a contended manager lock');
+    assert.match(r.stderr,/owns the lock/);
+    assert.equal(basename(readlinkSync(join(root,'current'))),shaA);
+    rmSync(lock,{recursive:true,force:true});
 
     // Manually corrupt the staged artifact to prove activation checks bytes,
     // not only metadata or the name of the SHA-pinned directory.
