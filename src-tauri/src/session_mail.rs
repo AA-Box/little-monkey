@@ -382,6 +382,26 @@ mod tests{
         send_impl(Path::new(&path),"child","parent","/acceptance","turn","call","after reboot")
             .unwrap();
     }
+    #[test]fn concurrent_independent_os_processes_replay_same_send_only_once(){
+        let path=tmp();
+        let mut children=Vec::new();
+        for _ in 0..4 {
+            children.push(std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact").arg("session_mail::tests::child_writer_entry")
+                .env("LITTLE_MONKEY_TEST_MAIL_CHILD",&path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn().unwrap());
+        }
+        for mut child in children {
+            assert!(child.wait().unwrap().success(),
+                "Independent sender must successfully commit or replay");
+        }
+        let rows=pending_impl(&path,"parent","/acceptance",10).unwrap();
+        assert_eq!(rows.len(),1,"Four distinct processes must commit one message");
+        assert_eq!(rows[0].text,"after reboot");
+        let _=std::fs::remove_dir_all(path.parent().unwrap());
+    }
     #[test]fn distinct_os_process_can_send_and_parent_can_ack(){
         let path=tmp();
         let status=std::process::Command::new(std::env::current_exe().unwrap())
