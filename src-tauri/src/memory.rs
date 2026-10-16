@@ -1105,6 +1105,19 @@ pub fn merge_impl(
     ids: &[String],
     text: Option<&str>,
 ) -> Result<Fact, String> {
+    merge_guarded_impl(path,root,ids,text,None)
+}
+
+/// Atomic compare-and-merge: the human reviewed THESE exact agent fact texts,
+/// so a concurrent desktop/daemon edit must fail inside the same filesystem
+/// lock which applies the reversible merged_from/merged_into transaction.
+pub fn merge_guarded_impl(
+    path: &Path,
+    root: &str,
+    ids: &[String],
+    text: Option<&str>,
+    expected_old_texts: Option<&[String]>,
+) -> Result<Fact, String> {
     let mut unique: Vec<&String> = Vec::new();
     for id in ids {
         if !unique.iter().any(|existing| *existing == id) {
@@ -1136,6 +1149,14 @@ pub fn merge_impl(
             );
         }
         parents.push(fact.clone());
+    }
+    if let Some(expected)=expected_old_texts {
+        if expected.len()!=parents.len() || parents.iter().zip(expected.iter())
+            .any(|(actual,old)|actual.text!=*old ||
+                 actual.source!="agent" ||actual.pinned ||
+                 actual.retired_at.is_some()||!actual.enabled){
+            return Err("Memory changed since model review; no merge was applied.".into());
+        }
     }
 
     let merged_text = match text {
@@ -2090,6 +2111,26 @@ pub fn memory_studio_merge(
         .lock()
         .map_err(|_| "Memory lock poisoned".to_string())?;
     merge_impl(&path, &studio_scope(project_root), &ids, text.as_deref())
+}
+
+/// Memory Studio's explicitly approved model review: compare the original
+/// source text inside the same cross-process lock as the actual merge.
+/// An in-flight concurrent correction invalidates approval rather than
+/// accidentally merging different statements.
+#[tauri::command]
+pub fn memory_studio_merge_guarded(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    ids: Vec<String>,
+    expected_old_texts: Vec<String>,
+    project_root: Option<String>,
+    text: String,
+) -> Result<Fact, String> {
+    let path=memories_file_path(&app)?;
+    let _lock=state.memory_lock.lock().map_err(|_|
+        "Memory lock poisoned".to_string())?;
+    merge_guarded_impl(&path,&studio_scope(project_root),
+        &ids,Some(&text),Some(&expected_old_texts))
 }
 
 /// Undo a merge: restore the originals and drop the merged memory — see
