@@ -5,10 +5,10 @@
  * The daemon and its configuration are NEVER started or changed by this tool.
  */
 import {spawn,spawnSync} from 'node:child_process';
-import {mkdtempSync,mkdirSync,writeFileSync,rmSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,writeFileSync,rmSync,readFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
-import {parsePs,rssForTree,summary} from './headless-workload-metrics.mjs';
+import {parsePs,rssForTree,summary,completeTreePssKiB,verifyDurableModelCompletion} from './headless-workload-metrics.mjs';
 const value=key=>{const i=process.argv.indexOf(key);return i<0?null:process.argv[i+1]??null;};
 const target=value('--target'),binary=value('--monkey-bin')??process.env.LITTLE_MONKEY_CLI??'monkey';
 const levels=(value('--levels')??'1,2,5,10').split(',').map(Number);
@@ -46,7 +46,17 @@ function runId(raw){
 function sample(pid){
  const x=spawnSync('ps',['-axo','pid=,ppid=,rss='],{encoding:'utf8',timeout:10000,maxBuffer:12*1024*1024});
  if(x.error||x.status!==0)throw Error('OS process table unavailable');
- return rssForTree(parsePs(x.stdout),pid);
+ const rss=rssForTree(parsePs(x.stdout),pid);
+ let pssKiB=null;
+ if(process.platform==='linux'){
+  const rollups=new Map();
+  for(const child of rss.pids){
+   try {rollups.set(child,readFileSync('/proc/'+child+'/smaps_rollup','utf8'));}
+   catch {break;}
+  }
+  pssKiB=completeTreePssKiB(rss.pids,rollups);
+ }
+ return {...rss,pssKiB};
 }
 async function attach(id,deadline){
  return new Promise(resolve=>{
@@ -62,28 +72,12 @@ async function attach(id,deadline){
   child.on('error',e=>finish(false,e.message));
   child.on('close',code=>{
    if(code!==0){finish(false,stderr.slice(0,180)||'Attachment failed');return;}
-   // Never infer success from arbitrary model text containing the word
-   // "success". The authoritative status is the durable run ledger.
+   // The ledger and assistant-delta stream, not model claims, determine
+   // whether the real fixture completed.
    let verified=false,reason='No durable terminal success evidence';
    try{
     const records=json(['task','status','--run-id',id,'--json']);
-    if(!Array.isArray(records)||records.length!==1 || records[0].run_id!==id)
-     throw Error('Missing or mismatched durable status record');
-    if(records[0].status!=='succeeded')throw Error('Run ended: '+records[0].status);
-    // Task events are machine-readable JSON envelopes. Read actual assistant
-    // deltas; cannot accept the original user prompt or a tool command.
-    let output='';
-    for(const line of stdout.split(/\r?\n/)){
-     if(!line.trim())continue;
-     const event=JSON.parse(line);
-     if(event.run_id!==id)throw Error('Foreign run event in attachment stream');
-     if(event.event?.type==='model_delta' &&
-       event.event?.payload?.channel==='assistant' &&
-       typeof event.event?.payload?.text==='string')
-       output+=event.event.payload.text;
-    }
-    if(!output.includes('RESPONSES_CAN_READ_THIS_FIXTURE'))
-     throw Error('Model did not report the verified fixture marker');
+    verifyDurableModelCompletion(id,records,stdout,'RESPONSES_CAN_READ_THIS_FIXTURE');
     verified=true;reason='';
    }catch(error){reason=String(error).slice(0,180);}
    finish(verified,reason);
@@ -130,9 +124,16 @@ for(const count of levels){
   }
   const outcomes=await pending;
   const stats=summary(count,outcomes,samples);
+  const measuredPss=samples.map(row=>row.pssKiB)
+   .filter(value=>Number.isSafeInteger(value)&&value>=0);
+  const peakPssMiB=measuredPss.length===samples.length
+   ? +(Math.max(...measuredPss)/1024).toFixed(2):null;
   all.push({...stats,target,
    baselineDaemonTreeRssMiB:+(baseline.rssKiB/1024).toFixed(2),
    peakRssDeltaMiB:+Math.max(0,stats.daemonTreePeakRssMiB-baseline.rssKiB/1024).toFixed(2),
+   peakPssMiB,completePssSamples:measuredPss.length,totalRssSamples:samples.length,
+   pssUnavailableReason:peakPssMiB===null
+    ? (process.platform==='linux'?'Missing/inaccessible rollup or process-exit race':'Linux-only metric'):null,
    runs:outcomes});
   console.error('Real model headless '+count+': '+stats.completed+'/'+count+' completed');
  }finally{
@@ -151,7 +152,7 @@ for(const count of levels){
 console.log(JSON.stringify({
  schema:1,kind:'physical-headless-daemon-model-benchmark',executedRealModels:true,
  metric:'ps RSS KiB summed over installed daemon PID and OS descendants',
- exclusions:'External model runtimes outside daemon tree excluded. Not PSS. Not a JCode head-to-head benchmark.',
+ exclusions:'External model runtimes outside daemon tree excluded. Only complete Linux PSS snapshots are comparable in definition; no JCode head-to-head measurements.',
  machine:{platform:process.platform,arch:process.arch},daemonPid:pid,
  initialRssMiB:+(initial.rssKiB/1024).toFixed(2),
  results:all,recordedAt:new Date().toISOString(),
