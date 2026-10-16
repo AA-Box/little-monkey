@@ -65,6 +65,20 @@ def jcode_debug(path: str, operation: str, session_id: str | None = None,
     raise RuntimeError("JCode did not return a verified debug response")
 
 
+def read_process_pss_kib(pid: int) -> int | None:
+    try:
+        rollup = Path(f"/proc/{pid}/smaps_rollup").read_text()
+    except (OSError, UnicodeError):
+        return None
+    entries = [line.split() for line in rollup.splitlines() if line.startswith("Pss:")]
+    if len(entries) != 1 or len(entries[0]) < 3 or entries[0][2] != "kB":
+        return None
+    try:
+        return int(entries[0][1])
+    except ValueError:
+        return None
+
+
 def live_pss_kib(root_pid: int) -> int | None:
     table = command(["ps", "-axo", "pid=,ppid="], timeout=15)
     rows = {}
@@ -82,17 +96,10 @@ def live_pss_kib(root_pid: int) -> int | None:
         changed = len(ids) != before
     total = 0
     for pid in ids:
-        try:
-            rollup = Path(f"/proc/{pid}/smaps_rollup").read_text()
-        except (OSError, UnicodeError):
-            return None
-        entries = [line.split() for line in rollup.splitlines() if line.startswith("Pss:")]
-        if len(entries) != 1 or len(entries[0]) < 3 or entries[0][2] != "kB":
-            return None
-        try:
-            total += int(entries[0][1])
-        except ValueError:
-            return None
+        sample = read_process_pss_kib(pid)
+        if sample is None:
+            return None  # The process exited or OS denied a complete sample.
+        total += sample
     return total
 
 
