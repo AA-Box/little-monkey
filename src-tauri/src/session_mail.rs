@@ -62,6 +62,8 @@ fn open(path:&Path)->Result<Connection,String>{
          );
          CREATE INDEX IF NOT EXISTS local_session_mail_pending
            ON local_session_mail(recipient_session_id,workspace,delivered_at_ms,created_at_ms);
+         CREATE INDEX IF NOT EXISTS local_session_mail_retention
+           ON local_session_mail(delivered_at_ms);
         "
     ).map_err(|e|e.to_string())?;
     #[cfg(unix)]
@@ -92,6 +94,12 @@ pub fn send_impl(path:&Path, sender:&str, recipient:&str, workspace:&str,
     if id.len()>330{return Err("Peer message identity too long".into());}
     let mut db=open(path)?;
     let tx=db.transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e|e.to_string())?;
+    // Already-acknowledged 90-day history can be discarded, but unread mail
+    // must never expire without explicit user acknowledgement.
+    tx.execute("DELETE FROM local_session_mail
+        WHERE delivered_at_ms IS NOT NULL AND delivered_at_ms<?1",
+        params![now_ms()?.saturating_sub(MAX_AGE_MS)])
         .map_err(|e|e.to_string())?;
     let present:Option<(String,String,String,String)>=tx.query_row(
         "SELECT sender_session_id,recipient_session_id,workspace,text
