@@ -93,6 +93,40 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
+describe("explicit contradiction resolution", () => {
+  it("detects opposite agent claims in one project and disables only the rejected claim",async()=>{
+    const facts=[
+      entry({id:"yes",text:"User prefers short summaries.",scope:"project",project_root:"/ws/a"}),
+      entry({id:"no",text:"User does not prefer short summaries.",scope:"project",project_root:"/ws/a"}),
+      entry({id:"other",text:"User does not prefer short summaries.",scope:"project",project_root:"/ws/b"}),
+      entry({id:"user",text:"User does not prefer short summaries.",source:"user",
+        scope:"project",project_root:"/ws/a"}),
+    ];
+    invoke.mockImplementation((name:string,params?:{id:string;enabled?:boolean})=>{
+      if(name==="memory_list_all")return Promise.resolve([...facts]);
+      if(name==="memory_studio_set_enabled"){
+        const index=facts.findIndex(f=>f.id===params?.id);
+        if(index>=0 && params)facts[index]={...facts[index],enabled:params.enabled??false};
+        return Promise.resolve(facts[index]);
+      }
+      return Promise.reject(Error("Unexpected native memory command "+name));
+    });
+    render(<MemoryStudioPanel />);
+    const section=await screen.findByRole("region",{name:"Memory contradictions requiring review"});
+    expect(section).toBeTruthy();
+    fireEvent.click(screen.getByRole("button",{name:"Keep first statement"}));
+    await waitFor(()=>{
+      expect(invoke).toHaveBeenCalledWith("memory_studio_set_enabled",{
+        id:"no",projectRoot:"/ws/a",enabled:false,
+      });
+      expect(screen.queryByRole("region",{name:"Memory contradictions requiring review"})).toBeNull();
+    });
+    expect(facts.find(f=>f.id==="yes")?.enabled).toBe(true);
+    expect(facts.find(f=>f.id==="other")?.enabled).toBe(true);
+    expect(facts.find(f=>f.id==="user")?.enabled).toBe(true);
+  });
+});
+
 describe("Memory Studio panel", () => {
   it("tells the truth about a pinned memory that still holds an expiry, and lets it be cleared", async () => {
     listing([PINNED_WITH_EXPIRY]);
