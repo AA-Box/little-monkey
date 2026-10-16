@@ -17,6 +17,14 @@ node scripts/subscription-native-auth.mjs codex run \
   --consent
 \`\`\`
 
+Before any delegated Codex run, the bridge requires the official login
+status output to explicitly identify **ChatGPT sign-in**. A successful
+API-key-only login is refused rather than misreported as subscription
+access. Delegation also strips inherited `OPENAI_API_KEY`, `CODEX_API_KEY`
+and custom OpenAI/Codex endpoint overrides, preventing silent metered
+API-key fallback. These checks fail closed if the official CLI changes
+its status format.
+
 The bridge verifies \`codex login status\`, then calls the official
 \`codex exec --json --ephemeral --sandbox read-only\` in a newly created
 private empty workspace. No external repository is attached, no API tokens
@@ -59,7 +67,7 @@ pnpm test:native-auth:contract
 
 Tests invoke **real child OS executables** with controlled fake vendor CLI
 protocols, proving argument isolation, user consent, bounded official
-assistant output and no credential-file access. They do NOT authenticate
+assistant output, API-key-login refusal, credential-override scrubbing and no credential-file access. They do NOT authenticate
 against a real ChatGPT/Claude account. Full live account acceptance
 requires a consenting operator to run the official CLI on their own
 machine and review native provider session/billing policies. Never
