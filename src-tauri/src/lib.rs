@@ -266,6 +266,7 @@ pub mod config_revisions;
 // the CLI cannot drift into two different learning behaviours.
 mod login_path;
 mod sessions;
+mod session_mail;
 pub mod skill_activation;
 mod skill_activation_commands;
 pub mod skill_learning;
@@ -1509,6 +1510,9 @@ pub fn run() {
             memory::memory_mark_used,
             sessions::sessions_load,
             sessions::sessions_save,
+            session_mail::session_mail_send,
+            session_mail::session_mail_pending,
+            session_mail::session_mail_ack,
             profiles::profiles_list,
             profiles::profiles_create,
             profiles::profiles_rename,
