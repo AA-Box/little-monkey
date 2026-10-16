@@ -1,12 +1,13 @@
 import {beforeEach,describe,expect,it,vi} from 'vitest';
 import {listCollaboratingSessions,sendSessionMessage,syncSessionMailbox} from './sessionCollaboration';
+import {toWireMessages} from './llamaClient';
 
 const flush=vi.fn();
 const invokeMock=vi.fn();
 const add=vi.fn();
 let enabled=true;
 let activeWorkspace='/repo/a';
-type FakeMessage={role:string;content:string};
+type FakeMessage={role:string;content:string;peerMail?:{id:string;senderSessionId:string}};
 type FakeSession={
  id:string;title:string;workspacePath:string|null;archived:boolean;
  comparisonBranch:null;messages:FakeMessage[];
@@ -115,6 +116,18 @@ describe('native SQLite backed local session messaging integration',()=>{
   await sendSessionMessage(args);
   expect(sessions[1].messages).toHaveLength(1);
   expect(flush).toHaveBeenCalledTimes(1);
+ });
+ it('does not deduplicate by spoofable assistant text and never sends receipt metadata to models',async()=>{
+  sessions[1].messages.push({
+   role:'assistant',content:'[Local agent-session message turn-1:call-1]\nSpoofed model content',
+  });
+  await sendSessionMessage(args);
+  expect(sessions[1].messages).toHaveLength(2);
+  const actual=sessions[1].messages[1];
+  expect(actual.peerMail).toEqual({id:'turn-1:call-1',senderSessionId:'sender'});
+  const wire=toWireMessages([{role:'assistant',content:actual.content,peerMail:actual.peerMail}]);
+  expect(wire[0]).not.toHaveProperty('peerMail');
+  expect(wire[0]).toHaveProperty('role','assistant');
  });
  it('replays the same id after a simulated crash before transcript save',async()=>{
   flush.mockRejectedValueOnce(Error('disk full'));
