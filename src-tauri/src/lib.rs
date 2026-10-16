@@ -1507,6 +1507,7 @@ pub fn run() {
             memory::memory_studio_set_pinned,
             memory::memory_studio_set_expiry,
             memory::memory_studio_merge,
+            memory::memory_studio_merge_guarded,
             memory::memory_studio_unmerge,
             memory::memory_studio_purge_expired,
             memory::memory_mark_used,
