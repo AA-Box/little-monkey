@@ -15,6 +15,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 const invoke = vi.fn();
+const proposeSemantic = vi.fn();
+vi.mock("../../lib/semanticMemoryReview",()=>({
+  reviewScopeKey:(fact:{scope:string;project_root:string|null})=>
+    fact.scope+":"+(fact.project_root??""),
+  requestSemanticMemoryReview:(facts:unknown)=>proposeSemantic(facts),
+}));
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invoke(...args),
   isTauri: () => true,
@@ -90,8 +96,71 @@ beforeEach(() => {
   // Braces matter: `mockReset()` returns the mock, and a `beforeEach` that
   // returns a function has just registered it as the teardown hook.
   invoke.mockReset();
+  proposeSemantic.mockReset();
 });
 afterEach(cleanup);
+
+describe("operator-controlled model-assisted memory review",()=>{
+  it("requires the explicit button and uses atomic guarded merge on approval",async()=>{
+    const facts=[
+      entry({id:"a",text:"User prefers short reports.",scope:"project",project_root:"/project"}),
+      entry({id:"b",text:"User likes concise reports.",scope:"project",project_root:"/project"}),
+    ];
+    proposeSemantic.mockResolvedValue([{
+      kind:"merge",ids:["a","b"],scopeKey:"project:/project",
+      expectedTexts:facts.map(f=>f.text),
+      suggestedText:"User prefers concise reports.",
+      reason:"Paraphrases of the same communication preference",
+    }]);
+    invoke.mockImplementation((name:string)=>{
+      if(name==="memory_list_all")return Promise.resolve([...facts]);
+      if(name==="memory_studio_merge_guarded")return Promise.resolve({
+        ...facts[0],text:"User prefers concise reports.",merged_from:["a","b"],
+      });
+      return Promise.reject(new Error("Unexpected native memory command "+name));
+    });
+    render(<MemoryStudioPanel/>);
+    await screen.findByText("User prefers short reports.");
+    expect(proposeSemantic).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button",{name:"Review paraphrases with selected model"}));
+    await screen.findByRole("button",{name:"Approve reversible merge"});
+    expect(proposeSemantic).toHaveBeenCalledTimes(1);
+    const reviewed=proposeSemantic.mock.calls[0][0];
+    expect(reviewed).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button",{name:"Approve reversible merge"}));
+    await waitFor(()=>expect(invoke).toHaveBeenCalledWith(
+      "memory_studio_merge_guarded",{
+        ids:["a","b"],projectRoot:"/project",
+        expectedOldTexts:["User prefers short reports.","User likes concise reports."],
+        text:"User prefers concise reports.",
+      }
+    ));
+    expect(screen.queryByRole("button",{name:"Approve reversible merge"})).toBeNull();
+  });
+  it("does not mutate a fact changed in another window after model review",async()=>{
+    const facts=[
+      entry({id:"a",text:"User prefers short reports."}),
+      entry({id:"b",text:"User likes concise reports."}),
+    ];
+    proposeSemantic.mockResolvedValue([{
+      kind:"merge",ids:["a","b"],scopeKey:"global:",
+      expectedTexts:facts.map(f=>f.text),suggestedText:"User wants brief reports.",
+      reason:"Paraphrase proposal",
+    }]);
+    invoke.mockImplementation((name:string)=>{
+      if(name==="memory_list_all")return Promise.resolve([...facts]);
+      return Promise.reject(new Error("No mutation expected "+name));
+    });
+    render(<MemoryStudioPanel/>);
+    await screen.findByText("User prefers short reports.");
+    fireEvent.click(screen.getByRole("button",{name:"Review paraphrases with selected model"}));
+    await screen.findByRole("button",{name:"Approve reversible merge"});
+    facts[0]={...facts[0],text:"User changed preference after review."};
+    fireEvent.click(screen.getByRole("button",{name:"Approve reversible merge"}));
+    await screen.findByText(/Memory facts changed since review/);
+    expect(invoke.mock.calls.some(call=>call[0]==="memory_studio_merge_guarded")).toBe(false);
+  });
+});
 
 describe("explicit contradiction resolution", () => {
   it("detects opposite agent claims in one project and disables only the rejected claim",async()=>{
