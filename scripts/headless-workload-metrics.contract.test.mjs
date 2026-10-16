@@ -1,6 +1,33 @@
 import {describe,it} from 'node:test';
 import assert from 'node:assert/strict';
-import {parsePs,descendants,rssForTree,summary,parseLinuxSmapsPssKiB,completeTreePssKiB} from './headless-workload-metrics.mjs';
+import {parsePs,descendants,rssForTree,summary,parseLinuxSmapsPssKiB,completeTreePssKiB,verifyDurableModelCompletion} from './headless-workload-metrics.mjs';
+
+describe('strict real-model durable completion oracle',()=>{
+ const marker='RESPONSES_CAN_READ_THIS_FIXTURE';
+ const id='task-real-acceptance';
+ const status=[{run_id:id,status:'succeeded'}];
+ const event=(type,channel,text,run_id=id)=>JSON.stringify({
+  run_id,sequence:1,event:{type,payload:{channel,text}},
+ });
+ it('accepts only matching durable status plus actual assistant model delta',()=>{
+  assert.equal(verifyDurableModelCompletion(id,status,
+   event('model_delta','assistant','Found '+marker),marker),true);
+ });
+ it('does not count simulated success text in tool output or user messages',()=>{
+  assert.throws(()=>verifyDurableModelCompletion(id,status,
+   event('tool_finished','assistant','success '+marker),marker),/lacks actual assistant/);
+  assert.throws(()=>verifyDurableModelCompletion(id,status,
+   event('model_delta','status',marker),marker),/lacks actual assistant/);
+  assert.throws(()=>verifyDurableModelCompletion(id,[{run_id:id,status:'failed'}],
+   event('model_delta','assistant',marker),marker),/ledger/);
+ });
+ it('rejects wrong run ids, malformed streams and absent native evidence',()=>{
+  assert.throws(()=>verifyDurableModelCompletion(id,status,
+   event('model_delta','assistant',marker,'other-run'),marker),/cross-run/);
+  assert.throws(()=>verifyDurableModelCompletion(id,status,'not-json',marker));
+  assert.throws(()=>verifyDurableModelCompletion(id,status,'',marker),/lacks actual assistant/);
+ });
+});
 
 describe('real proportional memory accounting',()=>{
  it('extracts real Linux smaps_rollup format and sums complete PID tree',()=>{
