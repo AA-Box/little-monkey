@@ -381,6 +381,43 @@ mod tests{
         register_impl(Path::new(&path),"parent","/acceptance","Parent").unwrap();
         send_impl(Path::new(&path),"child","parent","/acceptance","turn","call","after reboot")
             .unwrap();
+        // Actual process death AFTER the SQLite commit and BEFORE the consumer
+        // gets a chance to acknowledge: the parent intentionally kills us.
+        if let Ok(ready)=std::env::var("LITTLE_MONKEY_TEST_MAIL_READY"){
+            std::fs::write(&ready,b"committed").unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
+    #[test]fn process_killed_after_sqlite_commit_redelivers_across_reopen(){
+        let path=tmp();
+        let marker=path.parent().unwrap().join("child-ready");
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact").arg("session_mail::tests::child_writer_entry")
+            .env("LITTLE_MONKEY_TEST_MAIL_CHILD",&path)
+            .env("LITTLE_MONKEY_TEST_MAIL_READY",&marker)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn().unwrap();
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(8);
+        while !marker.exists() && std::time::Instant::now()<deadline {
+            if let Ok(Some(status))=child.try_wait(){
+                panic!("Child exited before committing mailbox row: {status}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(marker.exists(),"Child never committed before death");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // Each access opens a fresh SQLite connection, simulating a newly
+        // booted process after the sender was forcibly terminated.
+        let pending=pending_impl(&path,"parent","/acceptance",10).unwrap();
+        assert_eq!(pending.len(),1,"Committed mail must outlive sender death");
+        assert_eq!(pending[0].text,"after reboot");
+        assert_eq!(pending_impl(&path,"parent","/acceptance",10).unwrap().len(),1,
+            "Unacknowledged mail must survive repeated independent reads");
+        assert!(ack_impl(&path,"parent","/acceptance",&pending[0].id).unwrap());
+        assert!(pending_impl(&path,"parent","/acceptance",10).unwrap().is_empty());
+        let _=std::fs::remove_dir_all(path.parent().unwrap());
     }
     #[test]fn concurrent_independent_os_processes_replay_same_send_only_once(){
         let path=tmp();
