@@ -13,6 +13,7 @@ unless exact model IDs match and all workloads independently pass.
 """
 from __future__ import annotations
 import argparse
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
@@ -128,6 +129,19 @@ def monkey_one(cli: str, target: str, cwd: str, prompt: str, marker: str, timeou
             "seconds": round(time.monotonic() - started, 3)}
 
 
+def fixture_digest(folder: Path) -> str:
+    """Strict whole-directory digest: no unnoticed model mutations between waves."""
+    state = hashlib.sha256()
+    for item in sorted(folder.rglob("*")):
+        if item.is_symlink():
+            raise RuntimeError("Agent introduced a symlink in disposable fixture")
+        if not item.is_file():
+            continue
+        state.update(str(item.relative_to(folder)).encode())
+        state.update(hashlib.sha256(item.read_bytes()).digest())
+    return state.hexdigest()
+
+
 def wave(samples: int, roots: dict[str, int], label: str, jobs, timeout: int):
     outcomes = []
     memory = []
@@ -192,6 +206,7 @@ def main():
             fixture.mkdir()
             marker = "SAME_REAL_FIXTURE_" + uuid.uuid4().hex
             (fixture / "fixture.txt").write_text("Independent marker: " + marker + "\n")
+            pristine = fixture_digest(fixture)
             prompt = ("Use a tool to read fixture.txt in the current workspace. "
                       "Return its exact independent marker in your answer. "
                       "Do not modify any files or execute network requests.")
@@ -221,6 +236,8 @@ def main():
             rows = {}
             for key, jobs in (first, second):
                 rows[key] = wave(sessions, roots, key, jobs, args.timeout_seconds)
+                if fixture_digest(fixture) != pristine:
+                    raise RuntimeError(key + " mutated a read-only test fixture")
             results.append({"sessions": sessions, **rows})
     models_equal = args.jcode_model == args.little_monkey_target
     passed = all(entry[who]["failures"] == 0 for entry in results
