@@ -69,6 +69,28 @@ function ensureRoot(){
   fail('Refusing to adopt existing installation');
  }
 }
+function withManagerLock(operation){
+ // Atomic POSIX mkdir admission prevents two independent agent/developer
+ // processes from staging or switching the same pointer simultaneously.
+ // Stale locks are intentionally fail-closed: never delete an unverified lock
+ // of a crashed upgrader without an operator examining the owner first.
+ ensureRoot();
+ const lock=join(root,'.selfdev-operation.lock');
+ try{mkdirSync(lock,{mode:0o700});}
+ catch(error){
+  if(error?.code==='EEXIST')fail('Another selfdev operation owns the lock. Check its PID or remove a verified stale lock manually.');
+  throw error;
+ }
+ try{
+  writeFileSync(join(lock,'owner.json'),JSON.stringify({
+   pid:process.pid,startedAt:new Date().toISOString(),
+  })+'\n',{flag:'wx',mode:0o600});
+  return operation();
+ }finally{
+  rmSync(lock,{recursive:true,force:true});
+ }
+}
+
 function linkTarget(link){
  // readlink is the actual authority, including for dangling symlinks.
  // Avoid a lstat/existence test followed by a separate vulnerable readlink.
@@ -195,11 +217,16 @@ try{
   const current=linkTarget(entry),old=linkTarget(fallback);
   result={active:current?basename(current):null,previous:old?basename(old):null,
    managedRoot:root,automaticSystemInstall:false};
- }else if(command==='stage'){
-  if(!opt('--candidate'))fail('--candidate is required');
-  result={sha:stage(opt('--candidate'))};
- }else if(command==='build')result=build();
- else if(command==='activate')result=activate(opt('--confirm-sha')??'');
- else result=rollback();
+ }else{
+  result=withManagerLock(()=>{
+   if(command==='stage'){
+    if(!opt('--candidate'))fail('--candidate is required');
+    return {sha:stage(opt('--candidate'))};
+   }
+   if(command==='build')return build();
+   if(command==='activate')return activate(opt('--confirm-sha')??'');
+   return rollback();
+  });
+ }
  console.log(JSON.stringify({ok:true,command,...result}));
 }catch(e){console.error('SELFDEV_ERROR: '+String(e.message??e));process.exitCode=1;}
