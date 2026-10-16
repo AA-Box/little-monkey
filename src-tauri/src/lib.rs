@@ -1510,6 +1510,8 @@ pub fn run() {
             memory::memory_mark_used,
             sessions::sessions_load,
             sessions::sessions_save,
+            session_mail::session_mail_register,
+            session_mail::session_mail_peers,
             session_mail::session_mail_send,
             session_mail::session_mail_pending,
             session_mail::session_mail_ack,
