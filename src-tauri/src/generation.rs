@@ -4778,50 +4778,53 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
         let request = validate_request(&spec, &request).unwrap();
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let engine = GenerationEngineState::default();
-            // The normal readiness probe can wait hours for a model load.
-            // Physical acceptance must terminate and release its child on a
-            // bounded failure instead of hanging an operator indefinitely.
-            let outcome = tokio::time::timeout(Duration::from_secs(900), async {
-                let base_url = engine
-                    .ensure_ready(&EngineCommand::binary(&binary), &spec, Path::new("/unused"))
-                    .await
-                    .expect("engine ready");
-                let client = reqwest::Client::new();
-                let job = submit_job(&client, &base_url, &spec, &request)
-                    .await
-                    .expect("submit");
+        let engine = GenerationEngineState::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                // The normal readiness probe can wait hours for a model load.
+                // Physical acceptance must terminate and release its child on a
+                // bounded failure instead of hanging an operator indefinitely.
+                let outcome = tokio::time::timeout(Duration::from_secs(900), async {
+                    let base_url = engine
+                        .ensure_ready(&EngineCommand::binary(&binary), &spec, Path::new("/unused"))
+                        .await
+                        .expect("engine ready");
+                    let client = reqwest::Client::new();
+                    let job = submit_job(&client, &base_url, &spec, &request)
+                        .await
+                        .expect("submit");
 
-                let mut saw_progress = None;
-                let media = loop {
-                    match poll_job(&client, &base_url, &job).await.unwrap() {
-                        JobProgress::Running { .. } => {
-                            saw_progress = saw_progress.or_else(|| engine.progress());
+                    let mut saw_progress = None;
+                    let media = loop {
+                        match poll_job(&client, &base_url, &job).await.unwrap() {
+                            JobProgress::Running { .. } => {
+                                saw_progress = saw_progress.or_else(|| engine.progress());
+                            }
+                            JobProgress::Completed(mut media) => {
+                                assert_eq!(media.len(), 1, "one image was asked for");
+                                break media.remove(0);
+                            }
+                            other => panic!("{other:?}"),
                         }
-                        JobProgress::Completed(mut media) => {
-                            assert_eq!(media.len(), 1, "one image was asked for");
-                            break media.remove(0);
-                        }
-                        other => panic!("{other:?}"),
-                    }
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                };
-                let (step, total) = saw_progress.expect("a step count reached the app mid-job");
-                assert_eq!(total, 25, "total steps came from the request");
-                assert!(step >= 1 && step <= total);
-                assert_eq!(media.media_type, "image/png");
-                assert!(media.bytes.starts_with(b"\x89PNG"));
-                // IHDR carries the real canvas: a 2× hires pass on 256 px has to
-                // come back at 512, or the second pass never ran.
-                let dimension =
-                    |at: usize| u32::from_be_bytes(media.bytes[at..at + 4].try_into().unwrap());
-                assert_eq!((dimension(16), dimension(20)), (512, 512));
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    };
+                    let (step, total) = saw_progress.expect("a step count reached the app mid-job");
+                    assert_eq!(total, 25, "total steps came from the request");
+                    assert!(step >= 1 && step <= total);
+                    assert_eq!(media.media_type, "image/png");
+                    assert!(media.bytes.starts_with(b"\x89PNG"));
+                    // IHDR carries the real canvas: a 2× hires pass on 256 px has to
+                    // come back at 512, or the second pass never ran.
+                    let dimension =
+                        |at: usize| u32::from_be_bytes(media.bytes[at..at + 4].try_into().unwrap());
+                    assert_eq!((dimension(16), dimension(20)), (512, 512));
+                })
+                .await;
+                outcome.expect("physical image inference exceeded 15 minutes");
             })
-            .await;
-            engine.stop().unwrap();
-            outcome.expect("physical image inference exceeded 15 minutes");
-        });
+        }));
+        engine.stop().unwrap();
+        result.unwrap();
     }
 
     #[test]
