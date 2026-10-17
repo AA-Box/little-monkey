@@ -27,7 +27,7 @@ class PreflightError extends Error {
   constructor(code) { super(code); this.code = code; }
 }
 const fail = (code) => { throw new PreflightError(code); };
-const versionParts = (version) => /^\d+\.\d+\.\d+$/.test(version ?? '')
+const versionParts = (version) => typeof version === 'string' && /^\d+\.\d+\.\d+$/.test(version)
   ? version.split('.').map(Number) : null;
 const greaterVersion = (next, current) => {
   const a = versionParts(next), b = versionParts(current);

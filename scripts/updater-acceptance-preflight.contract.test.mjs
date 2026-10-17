@@ -46,6 +46,12 @@ test('requires a newer release', () => {
   assert.equal(result.output.code, 'NO_NEWER_RELEASE');
 });
 
+test('malformed release version produces a structured failure', () => {
+  const result = run(manifest({ version: ['1.10.0'] }));
+  assert.equal(result.status, 1);
+  assert.equal(result.output.code, 'INVALID_VERSION');
+});
+
 test('requires an updater artifact on the exact release', () => {
   const result = run(manifest({ platforms: { 'darwin-aarch64': {
     ...entry, url: 'https://github.com/AA-Box/little-monkey/releases/download/1.10.0/download.zip',
