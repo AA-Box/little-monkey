@@ -26,12 +26,20 @@ API-key fallback. These checks fail closed if the official CLI changes
 its status format.
 
 The bridge verifies \`codex login status\`, then calls the official
-\`codex exec --json --ephemeral --sandbox read-only\` in a newly created
+\`codex exec --json --ephemeral --ignore-user-config --sandbox read-only\` in a newly created
 private empty workspace. No external repository is attached, no API tokens
 are parsed, and only confirmed completed assistant messages are returned;
 raw stderr, auth state, environment details, tool streams and account data
 are never returned. The temporary directory is removed on exit. Access
 depends entirely on the installed Codex CLI and the operator's plan/access.
+The bridge gives each run a 120-second limit by default. \`--timeout-ms N\`
+accepts 100–300000 milliseconds; SIGINT/SIGTERM cancels it. A timeout or
+cancellation terminates the native client and its process group on Unix.
+Login and interactive open have a five-minute default limit. Failures are
+JSON objects with stable codes and safe messages; raw client stderr and
+status output are discarded. Status distinguishes missing clients, expired
+sessions, API-key sessions, and unrecognized status formats. Claude status
+requires \`loggedIn: true\` and \`authMethod: "claude.ai"\`.
 
 This bridge is invoked explicitly from the developer's shell. It does
 **not** register Codex as a transparent Little Monkey provider, grant
@@ -67,7 +75,8 @@ pnpm test:native-auth:contract
 
 Tests invoke **real child OS executables** with controlled fake vendor CLI
 protocols, proving argument isolation, user consent, bounded official
-assistant output, API-key-login refusal, credential-override scrubbing and no credential-file access. They do NOT authenticate
+assistant output, API-key-login refusal, credential-override scrubbing,
+timeouts, cancellation, process cleanup and no credential-file access. They do NOT authenticate
 against a real ChatGPT/Claude account. Full live account acceptance
 requires a consenting operator to run the official CLI on their own
 machine and review native provider session/billing policies. Never
