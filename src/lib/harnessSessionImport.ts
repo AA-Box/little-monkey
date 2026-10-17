@@ -135,9 +135,41 @@ function rawRows(text: string): Row[] {
   return rows;
 }
 
+/**
+ * Pi session headers and messages use id/parentId as a BRANCHING log.
+ * The final leaf is the selected conversation; siblings were alternate
+ * histories and must not be mixed into the imported chat. Walk all event
+ * parents (including metadata nodes) because parentId can reference a model
+ * change or compaction entry between two actual messages.
+ */
+export function selectActivePiBranch(rows: Row[]): Row[] {
+  const nodes=new Map<string,Row>();
+  const messages:Row[]=[];
+  for(const row of rows) {
+    const id=str(row.id);
+    if(id && row.type!=='session')nodes.set(id,row);
+    if(row.type==='message' && id && (typeof row.parentId==='string'||row.parentId===null))
+      messages.push(row);
+  }
+  if(!messages.length || messages.length!==rows.filter(row=>row.type==='message').length)
+    return rows;
+  const selected=new Set<string>();
+  let id=str(messages[messages.length-1].id);
+  while(id) {
+    if(selected.has(id))throw new Error('Pi session contains a parent-link cycle.');
+    const row=nodes.get(id);
+    if(!row)throw new Error('Pi session branch references a missing parent entry.');
+    selected.add(id);
+    id=typeof row.parentId==='string' ? row.parentId : '';
+  }
+  return rows.filter(row=>row.type==='session' || !row.id ||
+    selected.has(str(row.id)) || row.type!=='message' && !nodes.has(str(row.id)));
+}
+
 export function parseHarnessSession(source: string): HarnessImport {
-  const rows = rawRows(source);
-  const harness = identify(rows);
+  const parsedRows = rawRows(source);
+  const harness = identify(parsedRows);
+  const rows = harness === 'pi' ? selectActivePiBranch(parsedRows) : parsedRows;
   const sessions = new Set(rows.map(row=>
     str(row.sessionId) || str(row.sessionID) ||
     (row.type === 'session_meta' ? str(object(row.payload)?.id) : '') ||

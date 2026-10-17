@@ -134,6 +134,17 @@ export async function mergeMemories(ids: string[], projectRoot: string | null, t
   return invoke("memory_studio_merge", { ids, projectRoot, text });
 }
 
+/** Approve an LLM-suggested merge only if the exact texts reviewed by the
+ * operator are still the ones stored under the Rust cross-process write lock.
+ * Unlike a frontend read-before-write, this is a true atomic CAS merge. */
+export async function mergeMemoriesIfUnchanged(
+  ids:string[],projectRoot:string|null,text:string,expectedOldTexts:string[],
+):Promise<MemoryEntry>{
+  return invoke("memory_studio_merge_guarded",{
+    ids,projectRoot,text,expectedOldTexts,
+  });
+}
+
 /** Undo a merge: restore the originals and drop the merged memory (so any
  * edit made to the merged text after the merge is lost). Resolves to the
  * number of originals restored. */

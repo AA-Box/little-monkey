@@ -39,6 +39,11 @@ fn schema(store:&DaemonStore)->Result<(),String>{
             ADD COLUMN garden_merges_total INTEGER NOT NULL DEFAULT 0;")
             .map_err(|e|e.to_string())?;
     }
+    if !columns.iter().any(|name|name=="garden_conflicts_latest") {
+        store.connection.execute_batch("ALTER TABLE swarm_ambient_policies
+            ADD COLUMN garden_conflicts_latest INTEGER NOT NULL DEFAULT 0;")
+            .map_err(|e|e.to_string())?;
+    }
     Ok(())
 }
 #[derive(Debug)]
@@ -141,7 +146,7 @@ pub fn status(paths:&DaemonPaths)->Result<serde_json::Value,String>{
     schema(&store)?;
     let mut stmt=store.connection.prepare(
         "SELECT id,enabled,epoch,interval_ms,next_wake_ms,pending_job,include_titles,
-                garden_agent_memory,garden_merges_total
+                garden_agent_memory,garden_merges_total,garden_conflicts_latest
          FROM swarm_ambient_policies ORDER BY id LIMIT 50"
     ).map_err(|e|e.to_string())?;
     let rows=stmt.query_map([],|r|Ok(serde_json::json!({
@@ -151,6 +156,7 @@ pub fn status(paths:&DaemonPaths)->Result<serde_json::Value,String>{
         "history_titles":r.get::<_,i64>(6)?!=0,
         "garden_agent_memory":r.get::<_,i64>(7)?!=0,
         "garden_merges_total":r.get::<_,i64>(8)?,
+        "garden_conflicts_latest":r.get::<_,i64>(9)?,
     }))).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>()
         .map_err(|e|e.to_string())?;
     Ok(serde_json::json!({"policies":rows}))
@@ -220,15 +226,19 @@ pub fn tick(cli:&crate::Cli,paths:&DaemonPaths,roots:&[PathBuf],config:&DaemonCo
             // Model-generated plans remain read-only; no model writes here.
             let path=little_monkey_lib::app_paths::data_dir()
                 .ok_or("Cannot resolve memory directory")?.join("memories.json");
-            let merged=little_monkey_lib::memory::garden_exact_agent_duplicates_impl(
+            let exact=little_monkey_lib::memory::garden_exact_agent_duplicates_impl(
                 &path,workspace)?;
-            if merged>0 {
-                store.connection.execute(
-                    "UPDATE swarm_ambient_policies
-                     SET garden_merges_total=garden_merges_total+?2 WHERE id=?1",
-                    params![policy.id,merged as i64],
-                ).map_err(|e|e.to_string())?;
-            }
+            // Review normalized natural-language equivalents and explicit
+            // contradictions, but do NOT choose which conflicting fact wins.
+            let review=little_monkey_lib::memory::garden_conservative_semantic_review_impl(
+                &path,workspace)?;
+            let total=(exact+review.merged_groups) as i64;
+            store.connection.execute(
+                "UPDATE swarm_ambient_policies
+                 SET garden_merges_total=garden_merges_total+?2,
+                     garden_conflicts_latest=?3 WHERE id=?1",
+                params![policy.id,total,review.unresolved_contradictions.len() as i64],
+            ).map_err(|e|e.to_string())?;
         }
         let (fingerprint,raw)=history(shared,workspace,policy.include_titles)?;
         // Even without a new conversation, scan the workspace at least once
