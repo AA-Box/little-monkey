@@ -179,6 +179,9 @@ jobs:
         # them. Keep the platform-specific selector covered before release.
         run: pnpm test:runtime-archive
 
+      - name: Signed updater dependency and release contract
+        run: pnpm test:updater-security
+
   rust-tests:
     # Real per-OS compilation + test coverage for `#[cfg(target_os = ...)]`
     # code — a single-OS CI job would silently never compile the arms that
