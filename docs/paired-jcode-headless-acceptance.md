@@ -23,9 +23,12 @@ python3 scripts/paired-jcode-littlemonkey-live.py \
   --jcode-debug-socket /private/path/to/jcode-debug.sock \
   --jcode-pid ACTUAL_JCODE_SERVER_PID \
   --jcode-model EXACT_SAME_MODEL_IDENTIFIER \
+  --jcode-backend EXACT_SAME_BACKEND_IDENTIFIER \
   --monkey-cli /absolute/path/to/monkey-cli \
   --little-monkey-target EXACT_SAME_MODEL_IDENTIFIER \
+  --little-monkey-backend EXACT_SAME_BACKEND_IDENTIFIER \
   --levels 1,2,5 \
+  --output ./paired-headless-report.json \
   --confirm-live-model-costs
 \`\`\`
 
@@ -38,17 +41,35 @@ The runner fails if either modifies the disposable fixture.
 
 PSS comes from genuine Linux \`/proc/PID/smaps_rollup\` for each daemon and
 its process descendants; missing/denied measurements are **null**, never
-manufactured. Warming advantage is reduced by alternating wave order.
+manufactured. The sampler reads the kernel process table directly, retries
+short-lived process races, and rejects an incomplete tree. CLI calls run in
+isolated process groups that are reaped on timeout or excess output; the two
+pre-existing services remain under the operator's control. Warming advantage
+is reduced by alternating wave order.
 It reports observed completed requests, p50 completion and sampled peak
-PSS, with no invented baseline or model cost normalization.
+PSS in JSON on stdout and, with \`--output\`, an atomically written file, with
+no invented baseline or model cost normalization.
+
+The two model identifiers and the two operator-declared backend identifiers
+must match exactly before any workload starts. The harness cannot inspect a
+provider's internal model revision or remote billing account. Verify those
+settings, hardware, tool permissions, cache state and source revisions on both
+services before treating numbers as comparable.
+
+A real run succeeds only with exit code 0, \`status: "PASS"\`,
+\`verifiedLiveRuns: true\`, zero workload failures, and a non-null peak PSS for
+every wave on both sides. Any malformed event, incomplete task status,
+mutation of the committed fixture, missing process sample, or configuration
+mismatch is a failure. The JSON report records the completed counts, timing,
+PSS sample counts, and peak memory for each level.
 
 **Limitations:** This is a *one-turn* real-tool workload, not an identical
 five-turn stateful-session benchmark, and different runtime architectures
 may include different processes in the sampled trees. Processes outside
 the daemon tree, notably externally hosted model inference, are excluded.
 Passing the runner proves its selected fixture path only, not general
-quality superiority. It explicitly refuses to pass if the two exact
-model ID strings differ or any PSS snapshot is incomplete.
+quality superiority. It explicitly refuses to pass if the model/backend
+identifiers differ or any PSS snapshot is incomplete.
 
 The operator must inspect the actual model IDs/configuration, cache state,
 CPU/GPU and backend accounting to establish strict comparability. Do not
@@ -60,6 +81,9 @@ pnpm test:paired-headless:contract
 \`\`\`
 
 The default CI checks actual Linux kernel PSS access and strict report
-handling, but DOES NOT run model inference or claim real JCode parity.
+handling. It runs an end-to-end \`--simulation\` with controlled local socket
+and CLI processes, committed Git fixtures, real kernel PSS, and malformed
+event injection. Its report can show \`status: "PASS"\` but always has
+\`verifiedLiveRuns: false\`. CI DOES NOT run model inference or claim real JCode parity.
 Real physical runs require both installed runtimes and authorized model
 credentials in the operator environment.
