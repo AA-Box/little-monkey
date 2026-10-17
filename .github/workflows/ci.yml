@@ -63,6 +63,10 @@ jobs:
         if: runner.os == 'Linux'
         run: pnpm test:selfdev:contract
 
+      - name: Contract and Linux kernel gate for real paired JCode comparison
+        if: runner.os == 'Linux'
+        run: pnpm test:paired-headless:contract
+
       - name: Contract-check real-task concurrency and independent oracle (mock CLI only)
         run: pnpm test:swarm-headless:contract
 

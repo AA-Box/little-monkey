@@ -9,6 +9,7 @@ import {mkdtempSync,mkdirSync,writeFileSync,rmSync,readFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {parsePs,rssForTree,summary,completeTreePssKiB,verifyDurableModelCompletion} from './headless-workload-metrics.mjs';
+import {initHeadlessFixtureRepository,assertHeadlessFixtureUnchanged} from './headless-fixture-repository.mjs';
 const value=key=>{const i=process.argv.indexOf(key);return i<0?null:process.argv[i+1]??null;};
 const target=value('--target'),binary=value('--monkey-bin')??process.env.LITTLE_MONKEY_CLI??'monkey';
 const levels=(value('--levels')??'1,2,5,10').split(',').map(Number);
@@ -100,7 +101,7 @@ if(state.installed!==true||state.service_running!==true||state.heartbeat_fresh!=
  throw Error('An already-installed healthy daemon is required; benchmark will not install one');
 const pid=state.pid,initial=sample(pid),all=[];
 for(const count of levels){
- const roots=[],ids=[];
+ const roots=[],ids=[],immutableHeads=[];
  try{
   const baseline=sample(pid);
   for(let i=0;i<count;i++){
@@ -109,6 +110,8 @@ for(const count of levels){
    mkdirSync(join(root,'src'));
    writeFileSync(join(root,'src','fixture.txt'),
     'Disposable read-only model benchmark.\nMarker: RESPONSES_CAN_READ_THIS_FIXTURE\n');
+   // Autonomous tasks require a committed Git HEAD and revision snapshot.
+   immutableHeads.push(initHeadlessFixtureRepository(root));
    const prompt='Read src/fixture.txt in this disposable test workspace. '+
     'Return the exact marker and explain the observed file. Do not edit files, '+
     'run shell commands, make network requests or deploy anything.';
@@ -123,6 +126,17 @@ for(const count of levels){
    await Promise.race([pending,new Promise(resolve=>setTimeout(resolve,250))]);
   }
   const outcomes=await pending;
+  // A read-only *prompt* is not a write-protection boundary. Validate the
+  // actual committed Git checkout after each native model task, before
+  // accounting its result as successful. This catches autonomous file
+  // edits, new untracked files and unauthorized Git commits.
+  for(let i=0;i<roots.length;i++){
+   try{assertHeadlessFixtureUnchanged(roots[i],immutableHeads[i]);}
+   catch(error){
+    outcomes[i]={...outcomes[i],completed:false,
+     error:String(error?.message??error).slice(0,180)};
+   }
+  }
   const stats=summary(count,outcomes,samples);
   const measuredPss=samples.map(row=>row.pssKiB)
    .filter(value=>Number.isSafeInteger(value)&&value>=0);
