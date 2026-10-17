@@ -69,11 +69,10 @@ a fault that was about to be fixed.
 
 ## Turning it on
 
-Signing is set up as of 2026-08-04: the keypair exists, `plugins.updater.pubkey`
-holds the public half, and `TAURI_SIGNING_PRIVATE_KEY` is a repository secret.
-One thing still gates a working update: the key password secret. Publishing is
-automatic — the `publish` job flips the draft once every matrix target has
-uploaded.
+Signing is set up: the keypair exists, `plugins.updater.pubkey` holds the
+public half, and the published 1.10.0 release includes `latest.json` and
+signed updater artifacts. Publishing is automatic — the `publish` job flips
+the draft once every matrix target has uploaded.
 
 To (re)do the setup from scratch:
 
@@ -114,8 +113,7 @@ an "update" your users' apps will install.
 
 ## Which assets the updater uses
 
-The release already builds everything needed; only the signatures were
-missing.
+The published release contains updater artifacts and their signatures.
 
 | Platform | Updater artifact | Notes |
 | --- | --- | --- |
@@ -132,6 +130,11 @@ vulnerable ZIP extraction code into the Windows build. Do not publish a zipped
 Windows updater or a gzipped Linux AppImage without changing this contract and
 rechecking the dependency audit. `pnpm test:updater-security` guards the
 updater feature selection, signing configuration, and lockfile.
+
+Run `pnpm test:updater-acceptance` for the manifest preflight contract and
+follow `docs/external-acceptance.md` for artifact signature verification and
+physical installation acceptance. A successful manifest preflight without a
+downloaded artifact does not prove that the artifact signature is valid.
 
 ## Testing without a release
 

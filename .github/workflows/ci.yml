@@ -182,6 +182,9 @@ jobs:
       - name: Signed updater dependency and release contract
         run: pnpm test:updater-security
 
+      - name: Signed updater acceptance preflight contract
+        run: pnpm test:updater-acceptance
+
   rust-tests:
     # Real per-OS compilation + test coverage for `#[cfg(target_os = ...)]`
     # code — a single-OS CI job would silently never compile the arms that
