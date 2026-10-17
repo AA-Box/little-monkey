@@ -16,7 +16,7 @@ test('official native Codex auth uses existing CLI, never reads tokens and gates
    '#!/usr/bin/env node',
    "const {writeFileSync}=require('node:fs');",
    "const command=process.argv.slice(2);",
-   "writeFileSync(process.env.LM_AUTH_TEST_LOG,JSON.stringify({argv:command,apiKey:!!process.env.OPENAI_API_KEY,baseUrl:!!process.env.OPENAI_BASE_URL}));",
+   "writeFileSync(process.env.LM_AUTH_TEST_LOG,JSON.stringify({argv:command,apiKey:!!process.env.OPENAI_API_KEY,baseUrl:!!process.env.OPENAI_BASE_URL,accessToken:!!process.env.CODEX_ACCESS_TOKEN,orgId:!!process.env.OPENAI_ORG_ID,projectId:!!process.env.OPENAI_PROJECT_ID}));",
    "if(command[0]==='login'&&command[1]==='status'){",
    "  console.log(process.env.LM_FAKE_AUTH_MODE==='apikey'?'Logged in using API key':'Logged in using ChatGPT');",
    "  process.exit(0);",
@@ -34,6 +34,9 @@ test('official native Codex auth uses existing CLI, never reads tokens and gates
    encoding:'utf8',timeout:20000,
    env:{...process.env,LITTLE_MONKEY_CODEX_BIN:bin,LM_AUTH_TEST_LOG:logfile,
      OPENAI_API_KEY:'NEVER_FORWARD_THIS_BILLABLE_KEY',
+      CODEX_ACCESS_TOKEN:'NEVER_FORWARD_THIS_OAUTH_OVERRIDE',
+      OPENAI_ORG_ID:'NEVER_FORWARD_BILLING_ORG',
+      OPENAI_PROJECT_ID:'NEVER_FORWARD_BILLING_PROJECT',
      OPENAI_BASE_URL:'https://nonstandard.example.invalid',
      ...extra},
   });
@@ -56,6 +59,9 @@ test('official native Codex auth uses existing CLI, never reads tokens and gates
   const args=recorded.argv;
   assert.equal(recorded.apiKey,false,'Codex may not inherit API-key billing overrides');
   assert.equal(recorded.baseUrl,false,'Codex may not inherit a custom API endpoint');
+   assert.equal(recorded.accessToken,false,'Codex may not inherit injected access token');
+   assert.equal(recorded.orgId,false,'Codex may not inherit billing organization');
+   assert.equal(recorded.projectId,false,'Codex may not inherit billing project');
 
   assert.deepEqual(args.slice(0,9),['exec','--json','--ephemeral',
    '--sandbox','read-only','--skip-git-repo-check','--cd',args[7],'Write a summary']);
