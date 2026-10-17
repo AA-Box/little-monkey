@@ -59,6 +59,10 @@ jobs:
         if: runner.os == 'Linux'
         run: pnpm test:headless-resource:os
 
+      - name: Verify actual local CLI selfdev transactional activation and rollback
+        if: runner.os == 'Linux'
+        run: pnpm test:selfdev:contract
+
       - name: Contract and Linux kernel gate for real paired JCode comparison
         if: runner.os == 'Linux'
         run: pnpm test:paired-headless:contract
