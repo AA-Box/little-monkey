@@ -59,8 +59,26 @@ fn open(path:&Path)->Result<Connection,String>{
     std::fs::create_dir_all(folder).map_err(|e|e.to_string())?;
     let db=Connection::open(path).map_err(|e|e.to_string())?;
     db.busy_timeout(Duration::from_secs(8)).map_err(|e|e.to_string())?;
+    // Fresh multi-process startup can race on the WAL journal transition.
+    // SQLite's busy_timeout alone does not guarantee PRAGMA journal_mode
+    // succeeds on Windows; retry ONLY a busy/locked schema race with an
+    // independently bounded deadline, never syntax or I/O failures.
+    let deadline=std::time::Instant::now()+Duration::from_secs(12);
+    loop {
+        match db.execute_batch("PRAGMA journal_mode=WAL;") {
+            Ok(())=>break,
+            Err(rusqlite::Error::SqliteFailure(ref cause,_))
+                if matches!(cause.code,
+                    rusqlite::ErrorCode::DatabaseBusy |
+                    rusqlite::ErrorCode::DatabaseLocked)
+                    && std::time::Instant::now()<deadline => {
+                std::thread::sleep(Duration::from_millis(45));
+            }
+            Err(error)=>return Err(format!("Mailbox WAL startup: {error}")),
+        }
+    }
     db.execute_batch(
-        "PRAGMA journal_mode=WAL;
+        "PRAGMA synchronous=FULL;
          PRAGMA synchronous=FULL;
          CREATE TABLE IF NOT EXISTS local_session_peers (
            session_id TEXT PRIMARY KEY NOT NULL,
@@ -375,12 +393,110 @@ mod tests{
         assert_eq!(pending_impl(&path,"to","/project",10).unwrap().len(),1);
         let _=std::fs::remove_dir_all(path.parent().unwrap());
     }
+    #[test]fn independent_os_process_stress_writer(){
+        let Ok(path)=std::env::var("LITTLE_MONKEY_TEST_MAIL_STRESS_PATH") else{return};
+        let worker=std::env::var("LITTLE_MONKEY_TEST_MAIL_STRESS_WORKER").unwrap();
+        let messages=std::env::var("LITTLE_MONKEY_TEST_MAIL_STRESS_COUNT")
+            .unwrap().parse::<usize>().unwrap();
+        let sender=format!("writer-{worker}");
+        register_impl(Path::new(&path),&sender,"/stress","Real process").unwrap();
+        for index in 0..messages {
+            let id=format!("msg-{index}");
+            let body=format!("stress-message-from-{sender}-{index}");
+            let receipt=send_impl(Path::new(&path),&sender,"parent","/stress",
+                &sender,&id,&body).unwrap();
+            assert!(!receipt.already_existed);
+        }
+    }
+
+    #[test]fn independent_os_process_stress_survives_fresh_reader_connections(){
+        // Real external processes with independent SQLite connections,
+        // incompatible with an in-memory mock. Increase LM_MAIL_STRESS_COUNT
+        // locally to 40+ for extended operator acceptance.
+        let count=std::env::var("LM_MAIL_STRESS_COUNT").ok()
+            .and_then(|s|s.parse::<usize>().ok()).unwrap_or(12).clamp(1,60);
+        let workers=4usize;
+        let path=tmp();
+        register_impl(&path,"parent","/stress","Recipient").unwrap();
+        let mut children=Vec::new();
+        for worker in 0..workers {
+            children.push(std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact").arg("session_mail::tests::independent_os_process_stress_writer")
+                .env("LITTLE_MONKEY_TEST_MAIL_STRESS_PATH",&path)
+                .env("LITTLE_MONKEY_TEST_MAIL_STRESS_WORKER",worker.to_string())
+                .env("LITTLE_MONKEY_TEST_MAIL_STRESS_COUNT",count.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn().unwrap());
+        }
+        for child in children {
+            let result=child.wait_with_output().unwrap();
+            assert!(result.status.success(),
+                "Independent SQLite writer failed: {}",
+                String::from_utf8_lossy(&result.stderr).chars()
+                    .take(1000).collect::<String>());
+        }
+        let mut received=std::collections::HashSet::new();
+        loop {
+            // Every call reopens SQLite: the reader never shares connection
+            // state or in-memory buffers with any terminated sender process.
+            let pending=pending_impl(&path,"parent","/stress",100).unwrap();
+            if pending.is_empty(){break;}
+            for item in pending {
+                assert!(received.insert(item.id.clone()),"Duplicate unacked message ID");
+                assert!(item.text.starts_with("stress-message-from-writer-"));
+                assert!(ack_impl(&path,"parent","/stress",&item.id).unwrap());
+            }
+        }
+        assert_eq!(received.len(),workers*count,
+            "Every independently committed peer message must survive");
+        assert!(pending_impl(&path,"parent","/stress",100).unwrap().is_empty());
+        let _=std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]fn child_writer_entry(){
         let Ok(path)=std::env::var("LITTLE_MONKEY_TEST_MAIL_CHILD") else{return};
         register_impl(Path::new(&path),"child","/acceptance","Child").unwrap();
         register_impl(Path::new(&path),"parent","/acceptance","Parent").unwrap();
         send_impl(Path::new(&path),"child","parent","/acceptance","turn","call","after reboot")
             .unwrap();
+        // Actual process death AFTER the SQLite commit and BEFORE the consumer
+        // gets a chance to acknowledge: the parent intentionally kills us.
+        if let Ok(ready)=std::env::var("LITTLE_MONKEY_TEST_MAIL_READY"){
+            std::fs::write(&ready,b"committed").unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
+    #[test]fn process_killed_after_sqlite_commit_redelivers_across_reopen(){
+        let path=tmp();
+        let marker=path.parent().unwrap().join("child-ready");
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact").arg("session_mail::tests::child_writer_entry")
+            .env("LITTLE_MONKEY_TEST_MAIL_CHILD",&path)
+            .env("LITTLE_MONKEY_TEST_MAIL_READY",&marker)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn().unwrap();
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(8);
+        while !marker.exists() && std::time::Instant::now()<deadline {
+            if let Ok(Some(status))=child.try_wait(){
+                panic!("Child exited before committing mailbox row: {status}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(marker.exists(),"Child never committed before death");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // Each access opens a fresh SQLite connection, simulating a newly
+        // booted process after the sender was forcibly terminated.
+        let pending=pending_impl(&path,"parent","/acceptance",10).unwrap();
+        assert_eq!(pending.len(),1,"Committed mail must outlive sender death");
+        assert_eq!(pending[0].text,"after reboot");
+        assert_eq!(pending_impl(&path,"parent","/acceptance",10).unwrap().len(),1,
+            "Unacknowledged mail must survive repeated independent reads");
+        assert!(ack_impl(&path,"parent","/acceptance",&pending[0].id).unwrap());
+        assert!(pending_impl(&path,"parent","/acceptance",10).unwrap().is_empty());
+        let _=std::fs::remove_dir_all(path.parent().unwrap());
     }
     #[test]fn concurrent_independent_os_processes_replay_same_send_only_once(){
         let path=tmp();
@@ -390,12 +506,15 @@ mod tests{
                 .arg("--exact").arg("session_mail::tests::child_writer_entry")
                 .env("LITTLE_MONKEY_TEST_MAIL_CHILD",&path)
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
                 .spawn().unwrap());
         }
-        for mut child in children {
-            assert!(child.wait().unwrap().success(),
-                "Independent sender must successfully commit or replay");
+        for child in children {
+            let output=child.wait_with_output().unwrap();
+            assert!(output.status.success(),
+                "Independent sender failed: {}",
+                String::from_utf8_lossy(&output.stderr).chars().take(1000)
+                    .collect::<String>());
         }
         let rows=pending_impl(&path,"parent","/acceptance",10).unwrap();
         assert_eq!(rows.len(),1,"Four distinct processes must commit one message");
