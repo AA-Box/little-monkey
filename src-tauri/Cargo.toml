@@ -54,7 +54,10 @@ tauri-plugin-window-state = "2"
 # `plugins.updater.pubkey` every check fails signature verification and the
 # frontend swallows it, so an unconfigured build behaves as if updates didn't
 # exist.
-tauri-plugin-updater = "2.10.1"
+# Release updater artifacts are signed raw installers/AppImages, not ZIP bundles.
+# Keep TLS and signature verification while omitting optional ZIP extraction,
+# which pulls in vulnerable zip 4.x on Windows.
+tauri-plugin-updater = { version = "2.10.1", default-features = false, features = ["rustls-tls"] }
 # Only used for `relaunch()` after an update installs — the second half of the
 # "Relaunch to update" click. Separate crate from the updater itself.
 tauri-plugin-process = "2.3.1"
