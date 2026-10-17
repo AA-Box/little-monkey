@@ -4,8 +4,9 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
-const script = new URL('./updater-acceptance-preflight.mjs', import.meta.url);
+const script = fileURLToPath(new URL('./updater-acceptance-preflight.mjs', import.meta.url));
 const signature = Buffer.from('untrusted comment: signature from test key\nRWtest\ntrusted comment: timestamp:1\nRWtest\n').toString('base64');
 const entry = {
   url: 'https://github.com/AA-Box/little-monkey/releases/download/1.10.0/Little.Monkey_aarch64.app.tar.gz',
@@ -17,7 +18,7 @@ function run(manifest, extra = [], installedVersion = '1.9.0') {
   try {
     const path = join(directory, 'latest.json');
     writeFileSync(path, JSON.stringify(manifest));
-    const result = spawnSync(process.execPath, [script.pathname,
+    const result = spawnSync(process.execPath, [script,
       '--platform', 'darwin-aarch64', '--installed-version', installedVersion,
       '--manifest-file', path, ...extra], { encoding: 'utf8', timeout: 5000 });
     return { status: result.status, output: JSON.parse(result.status === 0 ? result.stdout : result.stderr) };
