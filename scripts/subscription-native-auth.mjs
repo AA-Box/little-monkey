@@ -27,8 +27,10 @@ function vendorEnvironment(){
  // overrides. This does NOT read, parse or copy existing vendor tokens.
  const env={...process.env};
  for(const name of [
-  'OPENAI_API_KEY','CODEX_API_KEY','OPENAI_BASE_URL','OPENAI_API_BASE',
+  'OPENAI_API_KEY','CODEX_API_KEY','CODEX_ACCESS_TOKEN',
+  'OPENAI_BASE_URL','OPENAI_API_BASE',
   'CODEX_BASE_URL','CODEX_API_BASE_URL',
+  'OPENAI_ORG_ID','OPENAI_PROJECT_ID',
  ])delete env[name];
  return env;
 }
