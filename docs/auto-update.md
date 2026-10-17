@@ -126,6 +126,13 @@ missing.
 Each gets a matching `.sig` file once signing is on, and `latest.json` maps
 `{platform}-{arch}` to the artifact URL plus its signature.
 
+The Rust updater enables `rustls-tls` with default features disabled. The
+optional `zip` feature is unnecessary for these raw artifacts and would pull
+vulnerable ZIP extraction code into the Windows build. Do not publish a zipped
+Windows updater or a gzipped Linux AppImage without changing this contract and
+rechecking the dependency audit. `pnpm test:updater-security` guards the
+updater feature selection, signing configuration, and lockfile.
+
 ## Testing without a release
 
 Point `plugins.updater.endpoints` at a locally served `latest.json` (any

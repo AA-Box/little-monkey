@@ -49,6 +49,7 @@
     "test:machO": "node scripts/lib/machO.test.mjs",
     "test:manifest": "node scripts/lib/runtimeManifest.test.mjs",
     "test:runtime-archive": "node --test scripts/lib/managedRuntimeArchive.test.mjs",
+    "test:updater-security": "node --test scripts/updater-security.contract.test.mjs",
     "test:managed-runtime": "node --check scripts/stage-managed-runtime.mjs && node --test scripts/lib/managedRuntimeManifest.test.mjs",
     "test:wake-assets": "node --test scripts/lib/wakeWordAssets.test.mjs",
     "test:wake-walkthrough": "node scripts/run-wake-walkthrough.mjs",
