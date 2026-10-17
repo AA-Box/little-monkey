@@ -34,9 +34,9 @@ export const MANAGED_TTS_VERSION = "b10278";
 // Latest published stable-diffusion.cpp release at integration time. It is
 // deliberately pinned to a release rather than moving master; newer master-only
 // fixes are tracked separately and are not claimed as part of this runtime.
-export const MANAGED_SD_VERSION = "master-970-2f016e8";
+export const MANAGED_SD_VERSION = "master-973-f0aac52";
 export const MANAGED_SD_SOURCE_COMMIT =
-  "2f016e8e30ab0d0051c268944ae96c0951dba4f0";
+  "f0aac524d3f29140e60ba78f3cfb16d6acea87db";
 
 const llamaBase = `https://github.com/ggml-org/llama.cpp/releases/download/${MANAGED_LLAMA_VERSION}`;
 const ttsBase = `https://github.com/ggml-org/llama.cpp/releases/download/${MANAGED_TTS_VERSION}`;
@@ -107,8 +107,8 @@ export const MANAGED_TTS_ASSETS = Object.freeze({
 // remaining unpublished architectures use CPU baselines.
 export const MANAGED_SD_ASSETS = Object.freeze({
   "aarch64-apple-darwin": {
-    archive: "sd-master-2f016e8-bin-Darwin-macOS-26.6.2-arm64.zip",
-    sha256: "88b9de9ed7a156685ac3b8b77cf963d8f1030028685a3ff3d075c6e7d40a27c9",
+    archive: "sd-master-f0aac52-bin-Darwin-macOS-26.6.2-arm64.zip",
+    sha256: "e5abc3b8a0ff81bd848b32b46d10a07fe33767a54240848ab53c8bc394c5ef95",
   },
   "x86_64-apple-darwin": {
     sourceCommit: MANAGED_SD_SOURCE_COMMIT,
@@ -133,8 +133,8 @@ export const MANAGED_SD_ASSETS = Object.freeze({
     cmakeArgs: ["-T", "ClangCL"],
   },
   "x86_64-pc-windows-msvc": {
-    archive: "sd-master-2f016e8-bin-win-vulkan-x64.zip",
-    sha256: "c9ce9278c43fae4dd8e07baab7bab02aa7ef8893ed6f4d9f4494a2c709becc86",
+    archive: "sd-master-f0aac52-bin-win-vulkan-x64.zip",
+    sha256: "64ae41edf331723871ff6925f6f9d8bb46f6407d49e51f2073ef11f646765cb2",
   },
 });
 
