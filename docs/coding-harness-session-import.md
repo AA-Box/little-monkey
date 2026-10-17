@@ -23,3 +23,42 @@ pnpm typecheck
 ```
 
 Integration acceptance additionally requires selecting a real saved session log, importing via the desktop file picker, restarting Little Monkey and confirming the imported transcript persists, then submitting a new turn and verifying only the *current* permissions apply. Importing text cannot verify safe re-execution of a tool from a different agent, and the feature intentionally forbids that execution.
+
+
+## Published-schema and genuine-export acceptance
+
+The regression suite now covers the current upstream envelope shapes for
+Codex CLI JSONL, Claude Code JSONL, Pi v3 linked-branch JSONL, and OpenCode
+export JSON. For Pi we reconstruct the path to the last message leaf
+through id/parentId links and **exclude abandoned sibling branches**.
+Missing parents and cycles fail closed rather than mixing unrelated chat
+histories. Specimens are reconstructed from upstream format documentation
+and contain no personal transcripts.
+
+**A published-schema fixture is NOT proof that a real export from a current
+third-party binary works.** To perform that acceptance, export one genuine
+non-sensitive chat from each installed harness. Keep them outside the
+repository, then run with every environment variable populated:
+
+\`\`\`sh
+LM_REQUIRE_REAL_HARNESS=1 \
+LM_REAL_CODEX_JSONL=/private/safe/codex.jsonl \
+LM_REAL_CLAUDE_CODE_JSONL=/private/safe/claude.jsonl \
+LM_REAL_PI_JSONL=/private/safe/pi.jsonl \
+LM_REAL_OPENCODE_JSON=/private/safe/opencode.json \
+pnpm exec vitest run src/lib/harnessSessionImport.realExports.test.ts
+\`\`\`
+
+The source bytes never leave the local test process. This check rejects
+empty/non-text results, incorrect source identification and executable
+tool-call metadata. The built-in test suite skips this hardware-dependent
+check when original files are not supplied; the explicit
+\`LM_REQUIRE_REAL_HARNESS=1\` flag makes missing files a **failure**.
+After it passes, use the desktop picker to import each file, restart the
+application, and send a new prompt using only the currently selected
+workspace permissions.
+
+Source schemas: [Pi session format](https://pi.dev/docs/latest/session-format),
+Claude Code session JSONL, Codex CLI rollout JSONL, and OpenCode session
+export. The exact versions of third-party tools used for physical
+acceptance should be recorded alongside the test report.
