@@ -1,3 +1,4 @@
+import { desktopContextExposure } from './contextExposure';
 /**
  * The core turn-execution engine: one streaming model attempt
  * (`attemptStream`) and one tool-call dispatch (`executeToolCall`), plus the
@@ -820,7 +821,7 @@ export async function executeToolCall(
     }
   }
 
-  const result = await executeToolCallInner(
+  let result = await executeToolCallInner(
     toolCall,
     checkpointId,
     turnId,
@@ -837,6 +838,17 @@ export async function executeToolCall(
     programmatic,
     executionContext,
   );
+
+  // Compact only repeat read-only payloads from the same executing agent turn.
+  // Execute the native tool first so filesystem permissions and freshness
+  // checks cannot be bypassed by a stale frontend cache.
+  const exposureScope = [sessionId ?? 'unbound',turnId,workspaceRootOverride ?? '',agentLabel ?? ''].join('::');
+  if(name==='read_file' || name==='grep') {
+    const raw=argsForHooks();
+    result=desktopContextExposure.observe(exposureScope,name,raw,result);
+  } else if(name==='write_file' || name==='edit_file' || name==='run_shell') {
+    desktopContextExposure.invalidate(exposureScope);
+  }
 
   if (hooksForEvent('PostToolUse', name).length > 0) {
     fireObservedHooks('PostToolUse', { tool_name: name, args: argsForHooks(), session_id: sessionId, result });
