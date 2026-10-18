@@ -1,6 +1,6 @@
 import {describe,expect,it} from 'vitest';
 import {
-  buildSemanticReviewPrompt,reviewEligibleFacts,validateSemanticReview,
+  buildSemanticReviewPrompt,reviewEligibleFacts,validateSemanticReview,intersectIndependentSemanticReviews,
   reviewScopeKey,
 } from './semanticMemoryReview';
 import type {MemoryEntry} from './memoryStudio';
@@ -36,6 +36,24 @@ describe('untrusted semantic memory candidate validation',()=>{
    scopeKey:'project:/repo/a',
   });
   expect(candidates[1]).toMatchObject({kind:'contradiction',ids:['a','c']});
+ });
+ it('requires separate proposal and verification to agree on exact scoped identities',()=>{
+  const proposer=validateSemanticReview({proposals:[
+   {kind:'merge',ids:['a','b'],suggestedText:'User likes concise summaries.',
+    reason:'Paraphrase'},
+   {kind:'contradiction',ids:['a','c'],reason:'Different requests'},
+  ]},facts);
+  const verifier=validateSemanticReview({proposals:[
+   {kind:'merge',ids:['b','a'],suggestedText:'Concise output preferred.',
+    reason:'Same enduring claim'},
+   {kind:'merge',ids:['a','c'],suggestedText:'Conflicting claims',
+    reason:'Improper merge'},
+  ]},[...facts].reverse());
+  const shared=intersectIndependentSemanticReviews(proposer,verifier);
+  expect(shared).toHaveLength(1);
+  expect(shared[0].kind).toBe('merge');
+  expect(shared[0].ids).toEqual(['a','b']);
+  expect(intersectIndependentSemanticReviews(proposer,[])).toEqual([]);
  });
  it('rejects forged IDs, cross-workspace and user-pinned/disabled fact edits',()=>{
   const other=f('different','User likes short summaries.',{project_root:'/repo/b'});
