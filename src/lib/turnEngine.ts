@@ -46,7 +46,7 @@ import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import { useSessionStore } from '../store/sessionStore';
 import { usePermissionStore } from '../store/permissionStore';
 import { runSubagentTask } from './subagent';
-import { listCollaboratingSessions, sendSessionMessage } from './sessionCollaboration';
+import { listCollaboratingSessions, sendSessionMessage, broadcastSessionMessage } from './sessionCollaboration';
 import { resolveWorkflowSpec, runWorkflow } from './workflow';
 import { protocolToolCallId } from './durableRun';
 import { formatSkillSearchResults, formatSkillToolResult, type SkillRankingSignals, type SlashSkill } from './skills';
@@ -983,7 +983,7 @@ async function executeToolCallInner(
   const coordination = coordinateToolInvocation(name, args);
   if (coordination.error) return stringifyToolError(new Error(coordination.error));
 
-  if (name === 'session_list_peers' || name === 'session_send_message') {
+  if (name === 'session_list_peers' || name === 'session_send_message' || name === 'session_broadcast_message') {
     if (usePermissionStore.getState().mode === 'plan')
       return stringifyToolError(new Error('Session messaging is unavailable in Plan Mode.'));
     if (!chatSessionId || executionContext?.isToolAvailable?.(name) !== true) {
@@ -992,6 +992,13 @@ async function executeToolCallInner(
     try {
       if (name === 'session_list_peers') {
         return stringifyToolResult({sessions:await listCollaboratingSessions(chatSessionId)});
+      }
+      if(name==='session_broadcast_message') {
+        if(typeof args.text!=='string')
+          throw new Error('session_broadcast_message requires a text string.');
+        return stringifyToolResult(await broadcastSessionMessage({
+          senderSessionId:chatSessionId,turnId,toolCallId:toolCall.id,text:args.text,
+        }));
       }
       const recipient = args.recipient_session_id;
       const text = args.text;
