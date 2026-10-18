@@ -3585,6 +3585,18 @@ pub(super) mod tests {
             tampered.process_id=Some(pid.saturating_add(1));
             assert!(attested_worker(&paths,&tampered).is_err(),
                 "a different PID cannot steal the provider worker identity");
+            let marker=identity_path(&paths,&job.job_id);
+            let original=std::fs::read(&marker).map_err(|e|e.to_string())?;
+            let mut value:WorkerIdentity=serde_json::from_slice(&original)
+                .map_err(|e|e.to_string())?;
+            value.boot_id="00000000-0000-0000-0000-000000000000".to_string();
+            std::fs::write(&marker,serde_json::to_vec(&value)
+                .map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+            assert!(attested_worker(&paths,&job).is_err(),
+                "a stale marker from an earlier kernel boot cannot adopt a reused PID");
+            std::fs::write(&marker,&original).map_err(|e|e.to_string())?;
+            assert!(attested_worker(&paths,&job)?.is_some(),
+                "original process must remain reattachable after restoring identity");
             Ok(())
         })();
         cleanup();
