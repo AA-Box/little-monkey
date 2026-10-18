@@ -132,7 +132,7 @@ export function intersectIndependentSemanticReviews(
  * by the reviewer. Merely calling the same model twice is not an independent
  * evaluation, and quietly switching the primary chat target is forbidden.
  */
-export function configuredSemanticVerifiers():Array<{key:string;label:string;target:ResolvedTarget}>{
+export function configuredSemanticVerifiers():Array<{key:string;label:string;target:Extract<ResolvedTarget,{kind:'provider'}>}>{
  const {providers,providerModels}=useModelStore.getState();
  return providers.filter(p=>p.has_key && !p.is_extension)
   .flatMap(p=>(providerModels[p.id]??[]).filter(m=>typeof m.id==='string' && !!m.id)
