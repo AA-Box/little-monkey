@@ -85,3 +85,29 @@ paste or upload `auth.json`, bearer tokens or refresh credentials.
 Official guidance:
 - https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan
 - https://support.claude.com/en/articles/13189465-log-in-to-your-claude-account
+
+## Cursor Agent official browser sign-in (status/login only)
+
+Cursor's published CLI offers `cursor-agent login` and `cursor-agent status`.
+The native-auth helper now delegates `cursor status`, `cursor login --consent`,
+and `cursor open --consent` to the official client, while stripping
+`CURSOR_API_KEY` and endpoint overrides from the child environment.
+It does not read or copy Cursor credentials, infer subscription entitlement,
+or route model API requests through an undocumented token endpoint.
+The helper rejects `cursor run` because unrestricted noninteractive Cursor
+Agent mode can write files and execute commands; a read-only sandbox contract
+is not established for that action.
+
+```sh
+node scripts/subscription-native-auth.mjs cursor status
+node scripts/subscription-native-auth.mjs cursor login --consent
+node --test scripts/subscription-native-auth.contract.test.mjs
+```
+
+To validate genuine session imports, capture a Cursor Agent CLI `--print
+--output-format stream-json` run **without modifying sensitive files**, save
+its stdout locally, and set `LM_REAL_CURSOR_AGENT_STREAM_JSON` when running
+`LM_REQUIRE_REAL_CODING_EXPORTS=1 pnpm exec vitest run
+src/lib/codingSessionImport.realExports.test.ts`. The other four original
+format environment variables are also required. These tests intentionally
+skip by default rather than claiming evidence from invented exports.
