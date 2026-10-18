@@ -1,0 +1,60 @@
+# Requires a REAL enrolled selfdev Linux user service, two approved native
+# binaries and a streaming provider session. Hosted CI is intentionally
+# ineligible; no synthetic session may satisfy this acceptance.
+name: Actual live daemon stream handoff
+on:
+  workflow_dispatch:
+    inputs:
+      supervisor_root:
+        description: Absolute path to isolated, opt-in managed selfdev root
+        required: true
+        type: string
+      real_run_id:
+        description: Existing running daemon job's real RunLedger run ID
+        required: true
+        type: string
+      candidate_sha256:
+        description: Reviewed and staged replacement native binary SHA-256
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: live-selfdev-daemon-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  original-provider-stream:
+    runs-on: [self-hosted, linux, x64, little-monkey-live-handoff]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify actual user session and service
+        env:
+          ROOT: ${{ inputs.supervisor_root }}
+        run: |
+          test "$(uname -s)" = Linux
+          test -d "$ROOT"
+          test -f "$ROOT/.supervised-daemon.json"
+          command -v systemctl
+          command -v python3
+          command -v node
+          test -r /proc/sys/kernel/random/boot_id
+          test -n "${XDG_RUNTIME_DIR:-}"
+          systemctl --user show-environment >/dev/null
+      - name: Run strict real-provider continuity acceptance across approved live upgrade
+        env:
+          ROOT: ${{ inputs.supervisor_root }}
+          REAL_RUN: ${{ inputs.real_run_id }}
+          SHA: ${{ inputs.candidate_sha256 }}
+        run: |
+          python3 scripts/selfdev-live-provider-stream-acceptance.py \
+            --root "$ROOT" --run-id "$REAL_RUN" \
+            --candidate-sha "$SHA" \
+            --out "$RUNNER_TEMP/little-monkey-real-live-handoff.json"
+      - name: Upload actual provider-stream evidence only after verified success
+        uses: actions/upload-artifact@v4
+        with:
+          name: actual-live-provider-handoff
+          path: ${{ runner.temp }}/little-monkey-real-live-handoff.json
+          if-no-files-found: error
+          retention-days: 7
