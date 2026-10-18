@@ -1281,6 +1281,13 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
     /// one; and admissions walk the ranking in order, holding rather than
     /// stopping at whatever does not fit.
     fn schedule(&mut self, now: u64) -> Result<(), String> {
+        // A cold self-development service swap must never kill an in-flight
+        // model turn or replay its non-idempotent tools. Drain leaves ACTIVE
+        // tasks running and all queued snapshots durable, admitting no new
+        // jobs until an operator explicitly clears the flag after restart.
+        if self.store.get_meta("maintenance_drain")?.as_deref()==Some("1"){
+            return Ok(());
+        }
         // The candidate window is the whole queue, not the free-slot count.
         //
         // This is the starvation bug the `// ponytail:` comment that used to live
