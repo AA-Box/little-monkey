@@ -48,7 +48,10 @@ def process_tree_pss_kb(roots: list[int]) -> int:
         fields = raw.split()
         if len(fields) == 3 and all(value.isdigit() for value in fields):
             rows.append(tuple(int(value) for value in fields))
-    groups = {group for pid, _, group in rows if pid in roots}
+    # Only add a process group if a measured root itself leads it. Otherwise
+    # a CI/test process can share its parent's group with unrelated jobs whose
+    # /proc/PID/smaps_rollup is inaccessible. Descendants remain traced via PPID.
+    groups = {group for pid, _, group in rows if pid in roots and pid == group}
     included = set(roots)
     while True:
         expanded = included | {
