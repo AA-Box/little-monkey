@@ -2378,8 +2378,7 @@ async fn run_tool_loop(
             perms.finish_tool_call();
             if let Some(peer)=local_peer.as_ref(){
                 let observed=match call.name.as_str(){
-                    "read_file" => !content.starts_with("{\\"error\\":") &&
-                        !content.starts_with("{ \\"error\\":"),
+                    "read_file" => mutation_tool_failure_reason(&content).is_none(),
                     "write_file"|"edit_file" => is_successful_mutation_result(&content),
                     _=>false
                 };
