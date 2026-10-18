@@ -27,12 +27,19 @@ if(args.includes('daemon')&&args.includes('status')){
  const value=fs.existsSync(state)?JSON.parse(fs.readFileSync(state,'utf8')):null;
  console.log(JSON.stringify({installed:!!value,service_running:!!value,
  heartbeat_fresh:!!value,pid:value?.pid??null,
- active:value?.active??0,queued:0,paused:0,waiting_approval:0,managed_run_ids:[]}));
+ active:value?.active??0,queued:value?.queued??0,paused:0,waiting_approval:0,\n maintenance_drain:value?.drain??false,managed_run_ids:[]}));
  process.exit(0);
 }
 if(args.includes('daemon')&&args.includes('install')){
  if(${broken})process.exit(7);
- fs.writeFileSync(state,JSON.stringify({pid:${pid},active:0}));process.exit(0);
+ const prior=fs.existsSync(state)?JSON.parse(fs.readFileSync(state,'utf8')):{};
+ fs.writeFileSync(state,JSON.stringify({pid:${pid},active:0,
+  queued:prior.queued??2,drain:prior.drain??false}));process.exit(0);
+}
+if(args.includes('daemon')&&args.includes('drain')){
+ const old=JSON.parse(fs.readFileSync(state,'utf8'));
+ old.drain=args.includes('--enable');
+ fs.writeFileSync(state,JSON.stringify(old));process.exit(0);
 }
 if(args.includes('daemon')&&args.includes('stop')){process.exit(0)}
 if(args.includes('daemon')&&args.includes('uninstall')){
@@ -67,6 +74,7 @@ test('supervisor enrolls isolated identity, restarts cold, and rolls back failed
   assert.equal(r.ok,true,r.stderr);
   assert.equal(r.body.servicePid,1202);
   assert.equal(r.body.liveSessionHandoff,false);
+  assert.equal(r.body.queuedSessionsPreserved,2);
   r=call(supervisor,'upgrade','--root',root,'--confirm-sha',shaBad);
   assert.equal(r.ok,false,'failed candidate must not produce success artifact');
   assert.match(r.stderr,/ROLLED BACK/);
