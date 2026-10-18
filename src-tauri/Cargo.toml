@@ -86,6 +86,11 @@ regex = "1.12.4"
 # Real Rust AST containment for structural grep, not lexical nearest-declaration guessing.
 syn = { version = "=2.0.119", features = ["full", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
+# Grammar-backed structural containment for executable agent grep results.
+tree-sitter = "=0.25.10"
+tree-sitter-python = "=0.25.0"
+tree-sitter-javascript = "=0.25.0"
+tree-sitter-typescript = "=0.23.2"
 walkdir = "2.5.0"
 unicode-normalization = "0.1"
 globset = "0.4"
