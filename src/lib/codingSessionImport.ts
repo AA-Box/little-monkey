@@ -172,6 +172,8 @@ function fromCursor(items: Obj[]): CodingTranscript | null {
   const messages: ChatMessage[] = [];
   let pending = "";
   let hasUser = false;
+  let awaitingTerminal = false;
+  let completedTurns = 0;
   const flush = () => {
     if (pending.trim() && hasUser) append(messages, "assistant", pending);
     pending = "";
@@ -181,12 +183,17 @@ function fromCursor(items: Obj[]): CodingTranscript | null {
     // silently stitch an unrelated transcript into this one.
     if (row.session_id !== id) return null;
     if (row.type === "user") {
-      flush();
+      // Cursor streams end each print invocation with a success record.
+      // Incomplete earlier invocations cannot be silently imported as valid.
+      if (awaitingTerminal) return null;
       const message = obj(row.message);
       if (message?.role !== "user") continue;
       const before = messages.length;
       append(messages, "user", message.content, row.timestamp);
-      if (messages.length > before) hasUser = true;
+      if (messages.length > before) {
+        hasUser = true;
+        awaitingTerminal = true;
+      }
     } else if (row.type === "assistant") {
       const message = obj(row.message);
       if (message?.role === "assistant") {
@@ -195,15 +202,18 @@ function fromCursor(items: Obj[]): CodingTranscript | null {
         if (pending.length > 1_000_000) throw new Error("Cursor response exceeds text limit");
       }
     } else if (row.type === "result") {
-      if (row.subtype !== "success" || row.is_error === true) return null;
+      if (!awaitingTerminal || row.subtype !== "success" || row.is_error === true) return null;
       const aggregated = str(row.result);
       // The terminal result is the canonical aggregate for this invocation.
       // Replacing the pending stream prevents doubling delta and final text.
       if (aggregated.trim()) pending = aggregated.slice(0, 1_000_000);
+      flush();
+      awaitingTerminal = false;
+      completedTurns++;
     }
     // Never follow tool_call args/results, model settings or login metadata.
   }
-  flush();
+  if (awaitingTerminal || completedTurns === 0) return null;
   return hasUser && messages.some(m => m.role === "assistant")
     ? finish("cursor", messages, time(init.timestamp), "Cursor Agent session")
     : null;
