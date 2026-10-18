@@ -846,7 +846,7 @@ export async function executeToolCall(
       (name==='read_file'||name==='write_file'||name==='edit_file')){
     const parsed=argsForHooks();
     if(typeof parsed.path==='string' &&
-       !/^\\s*\\{\\s*"error"\\s*:/.test(result) &&
+       !/^\s*\{\s*"error"\s*:/.test(result) &&
        result!=='CANCELLED'){
       try{
         await noteSessionFileActivity({
