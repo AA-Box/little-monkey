@@ -947,10 +947,8 @@ fn status(json: bool) -> Result<(), String> {
         #[cfg(target_os="linux")]
         for job in store.active_jobs()? {
             handoff_candidates += 1;
-            if let Some(pid)=engine::attested_worker(&paths,&job)? {
+            if let Some((pid,start))=engine::attested_worker(&paths,&job)? {
                 handoff_attested+=1;
-                let start=engine::worker_start_ticks(pid)?.ok_or(
-                    "Original worker vanished while reporting live handoff")?;
                 handoff_worker_ids.push(format!("{}:{pid}:{start}",job.job_id));
             }
         }
