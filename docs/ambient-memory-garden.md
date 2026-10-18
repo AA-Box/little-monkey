@@ -204,3 +204,50 @@ pnpm typecheck
 Independent quality acceptance still requires a separately curated, consented
 ground-truth set and provider-backed live comparisons. These were not run in
 the repository authoring environment and have no manufactured scores.
+
+## Live semantic precision and recall acceptance
+
+`scripts/semantic-memory-live-quality.py` requires **20 or more independently
+human-annotated private cases**, at least five positive and five negative
+pair labels. It makes actual, separate provider calls for each case (one
+proposer, one verifier), requires the returned model identities to match
+the configured distinct names, and computes precision, recall, and F1 for
+equivalent-memory merges and contradictory-memory flags.
+
+Example private JSON structure (illustrative only; *not acceptance data*):
+
+```json
+{
+  "human_annotated": true,
+  "annotator_id": "independent-reviewer-identifier",
+  "cases": [
+    {"id": "case-1",
+     "facts": [{"id": "a", "text": "The user prefers short updates."},
+               {"id": "b", "text": "The user prefers concise updates."}],
+     "truth": [{"kind": "merge", "ids": ["a", "b"]}]}
+  ]
+}
+```
+
+Complete the corpus with at least 20 unique, genuinely labeled cases, including
+cases whose `truth` is `[]` (hard negatives). Truth labels must be exhaustive
+within each case; do not derive them from the model being graded.
+
+```bash
+python3 scripts/semantic-memory-live-quality.py \
+  --gold ./private/human-labeled-memories.json \
+  --proposer-url http://127.0.0.1:11434/v1/chat/completions \
+  --proposer-model MODEL_A \
+  --verifier-url http://127.0.0.1:11434/v1/chat/completions \
+  --verifier-model MODEL_B \
+  --output ./private/semantic-quality-evidence.json
+```
+
+Models must actually be installed and running; the evaluator never fabricates
+completions or labels. API keys for authenticated endpoints may be passed in
+`LM_EVAL_PROPOSER_API_KEY` and `LM_EVAL_VERIFIER_API_KEY`.
+Sending memory facts to non-loopback endpoints requires explicit
+`--allow-remote-sensitive-facts`. Scores persist **only** case counts, source
+SHA-256, model IDs and TP/FP/FN metrics, never plaintext facts or credentials.
+One failed request means **no successful quality report**. CI tests only the
+scoring implementation, not provider accuracy.
