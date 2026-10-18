@@ -208,7 +208,8 @@ function fromCursor(items: Obj[]): CodingTranscript | null {
     ? finish("cursor", messages, time(init.timestamp), "Cursor Agent session")
     : null;
 }
-\nexport function parseCodingSession(source: string): CodingTranscript | null {
+
+export function parseCodingSession(source: string): CodingTranscript | null {
   if (new TextEncoder().encode(source).length > MAX_BYTES) throw new Error("Session exceeds 32 MiB limit");
   if (!source.trim()) return null;
   // OpenCode "export" is one JSON object; other tools persist JSONL events.
@@ -217,7 +218,8 @@ function fromCursor(items: Obj[]): CodingTranscript | null {
     if (doc) { const imported = fromOpenCode(doc); if (imported) return imported; }
   } catch { /* try JSONL */ }
   const rows = jsonl(source);
-  if (rows.some(r=>r.type==="system" && r.subtype==="init" && r.session_id)) return fromCursor(rows);\n  if (rows.some(r=>r.type==="session_meta")) return fromCodex(rows);
+  if (rows.some(r=>r.type==="system" && r.subtype==="init" && r.session_id)) return fromCursor(rows);
+  if (rows.some(r=>r.type==="session_meta")) return fromCodex(rows);
   if (rows.some(r=>r.type==="session" && typeof r.cwd==="string")) return fromPi(rows);
   if (rows.some(r=>(r.type==="assistant" || r.type==="user") && obj(r.message))) return fromClaude(rows);
   return null;
