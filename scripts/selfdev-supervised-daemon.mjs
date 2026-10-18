@@ -175,7 +175,9 @@ function upgrade(){
     if(!drained.maintenance_drain ||
       drained.handoff_candidates!==drained.handoff_attested ||
       drained.handoff_attested<1 ||
-      drained.handoff_candidates>baseline.handoff_candidates)
+      drained.handoff_candidates>baseline.handoff_candidates ||
+      !Array.isArray(drained.handoff_worker_ids) ||
+      drained.handoff_worker_ids.length!==drained.handoff_attested)
       fail('Live handoff was not durably drained or process identity changed');
   }else{
     drained=drainUntilSafe(current,identity.profile);
@@ -197,8 +199,14 @@ function upgrade(){
     if(!Number.isInteger(observed.handoff_attested) ||
        observed.handoff_attested<1 ||
        observed.handoff_attested!==observed.handoff_candidates ||
-       observed.handoff_attested>drained.handoff_attested)
-      fail('Post-restart live worker PID identity was not successfully reattached');
+       observed.handoff_attested>drained.handoff_attested ||
+       !Array.isArray(observed.handoff_worker_ids) ||
+       !observed.handoff_worker_ids.some(id=>drained.handoff_worker_ids.includes(id)) ||
+       observed.handoff_adopted_daemon_pid!==observed.pid ||
+       !Number.isInteger(observed.handoff_adopted_count) ||
+       observed.handoff_adopted_count<1 ||
+       observed.handoff_adopted_count<observed.handoff_attested)
+      fail('Post-restart live worker PID/birth identity or ownership by new daemon was not verified');
   }else if(observed.active!==0 ||
     observed.waiting_approval<drained.waiting_approval ||
     observed.paused<drained.paused)
