@@ -104,3 +104,13 @@ These tests run with actual independent operating-system processes and disk
 transactions but do not launch multiple installed Tauri desktop windows,
 simulate true host power loss, or verify cross-device network transports.
 Those require separate physical operator acceptance and are not claimed.
+
+## Live safe-point delivery and local broadcast
+
+An enrolled executing desktop turn now checks its durable SQLite inbox **between** model requests, after tool results are complete and before another assistant placeholder starts streaming. Messages are appended as explicitly untrusted peer content. The transcript is flushed before acknowledgement; after crashes, unread SQLite rows replay. A message arriving during uninterrupted token streaming waits until the next safe point or next user turn; it never mutates an incomplete assistant response.
+
+The new opt-in `session_broadcast_message` agent tool sends the same bounded notice to all currently registered peers in the same workspace, partitioned into deterministic per-recipient send identities. It never sends to outside workspaces, wakes dormant sessions, or escalates tool rights. A partially successful broadcast reports an error, but already committed messages remain durable.
+
+These improvements still **do not** implement the daemon's server-managed active-agent directory or automatic file read/edit conflict detection; the SQLite mailbox remains desktop-scoped.
+
+Run `pnpm exec vitest run src/lib/sessionCollaboration.test.ts && pnpm typecheck` and independently verify two desktop processes against the same profile and workspace, a running turn receiving mail after its next model/tool boundary, and crash recovery before/after ack.
