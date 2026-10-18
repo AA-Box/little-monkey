@@ -160,6 +160,20 @@ function upgrade(){
    baseline.handoff_candidates<1 ||
    baseline.handoff_candidates!==baseline.handoff_attested))
    fail('Live upgrade requires at least one executing worker with a verified original PID/birth attestation');
+ if(live){
+   // Verify the APPROVED replacement executable understands this protocol
+   // *before* touching the running service. An older CLI's cold recover()
+   // would kill the preserved provider worker before rollback could help.
+   const candidate=join(root,'versions',sha,'monkey-cli');
+   if(!existsSync(candidate)||lstatSync(candidate).isSymbolicLink())
+     fail('Cannot live-upgrade to a missing or symlinked approved binary');
+   const compatible=status(candidate,identity.profile);
+   const fields=['handoff_candidates','handoff_attested','handoff_worker_ids',
+     'handoff_adopted_count','handoff_adopted_daemon_pid'];
+   if(!fields.every(field=>Object.hasOwn(compatible,field)) ||
+      !Array.isArray(compatible.handoff_worker_ids))
+     fail('Replacement CLI lacks live worker adoption; refusing destructive old-style crash recovery');
+ }
  if(baseline.maintenance_drain)fail('An existing maintenance drain needs operator review');
  let activated=false;
  let drainStarted=false;
