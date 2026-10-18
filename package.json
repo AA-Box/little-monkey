@@ -27,6 +27,7 @@
     "test:headless-resource:os": "node scripts/headless-os-sampling.e2e.mjs",
     "test:selfdev:contract": "node --check scripts/selfdev-transaction.mjs && node --test scripts/selfdev-transaction.contract.test.mjs",
     "test:paired-headless:contract": "python3 -m py_compile scripts/paired-jcode-littlemonkey-live.py && python3 scripts/paired-jcode-littlemonkey.contract.test.py",
+    "test:native-auth:contract": "node --check scripts/subscription-native-auth.mjs && node --test scripts/subscription-native-auth.contract.test.mjs",
     "test:swarm-models:syntax": "node --check scripts/swarm-model-benchmark.mjs",
     "test:swarm-headless:contract": "node --check scripts/swarm-headless-performance.mjs && node --test scripts/swarm-headless-performance.test.mjs scripts/lib/swarmResidentRss.test.mjs",
     "test:swarm-headless:live": "node scripts/swarm-headless-performance.mjs",
