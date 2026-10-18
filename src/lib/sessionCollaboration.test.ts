@@ -1,5 +1,5 @@
 import {beforeEach,describe,expect,it,vi} from 'vitest';
-import {listCollaboratingSessions,sendSessionMessage,syncSessionMailbox} from './sessionCollaboration';
+import {listCollaboratingSessions,sendSessionMessage,syncSessionMailbox,syncSessionMailboxAtSafePoint,broadcastSessionMessage} from './sessionCollaboration';
 import {toWireMessages} from './llamaClient';
 
 const flush=vi.fn();
@@ -155,6 +155,34 @@ describe('native SQLite backed local session messaging integration',()=>{
   expect(sessions[1].messages).toHaveLength(0);
   runningTurns.target=false;
   expect(await syncSessionMailbox('target')).toBe(1);
+ });
+ it('delivers durable notices to an actively executing recipient at an explicit safe point',async()=>{
+  runningTurns.target=true;
+  await sendSessionMessage(args);
+  expect(mail[0].delivered).toBe(false);
+  expect(sessions[1].messages).toHaveLength(0);
+  expect(await syncSessionMailboxAtSafePoint('target')).toBe(1);
+  expect(sessions[1].messages).toHaveLength(1);
+  expect(flush).toHaveBeenCalledTimes(1);
+  expect(mail[0].delivered).toBe(true);
+  runningTurns.target=false;
+  await expect(syncSessionMailboxAtSafePoint('target')).rejects.toThrow(/executing turn/);
+ });
+ it('broadcasts to all and only admitted same-workspace recipients',async()=>{
+  sessions.push({id:'second',title:'Second',workspacePath:'/repo/a',
+    archived:false,comparisonBranch:null,messages:[]});
+  runningTurns.target=true;
+  runningTurns.second=true;
+  const first=await broadcastSessionMessage({
+    senderSessionId:'sender',toolCallId:'broadcast-1',turnId:'turn-1',text:'Review the shared API',
+  });
+  expect(first).toEqual({persistedRecipients:['second','target'],count:2});
+  expect(mail.map(m=>m.recipientSessionId)).toEqual(['second','target']);
+  expect(mail.every(m=>!m.delivered)).toBe(true);
+  await broadcastSessionMessage({
+    senderSessionId:'sender',toolCallId:'broadcast-1',turnId:'turn-1',text:'Review the shared API',
+  });
+  expect(mail).toHaveLength(2);
  });
  it('refuses cross-workspace, self, archived and disabled access',async()=>{
   await expect(sendSessionMessage({...args,recipientSessionId:'other'})).rejects.toThrow();
