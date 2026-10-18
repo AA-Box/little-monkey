@@ -3535,6 +3535,11 @@ pub(super) mod tests {
         let result=(||->Result<(),String>{
             recorder.emit(RunEvent::Started{engine_id:"original-stream".into()})
                 .map_err(|e|e.to_string())?;
+            recorder.emit(RunEvent::ModelDelta{
+                message_id:"original-model-message".into(),
+                channel:little_monkey_lib::run_protocol::OutputChannel::Assistant,
+                text:"first provider fragment".into(),
+            }).map_err(|e|e.to_string())?;
             store.transition("job-actual-handoff",JobState::Running,2_000,Some(pid),None)?;
             let job=store.get_job("job-actual-handoff")?
                 .ok_or("missing running fixture")?;
@@ -3557,6 +3562,23 @@ pub(super) mod tests {
             assert_eq!(adopted.lease.owner_id,"daemon-100-new");
             assert_eq!(adopted.lease.generation,2);
             assert!(engine.shared.heartbeat_lease(&adopted.lease,3_000,30_000)?);
+            // The ORIGINAL recorder (analogous to the already-running model
+            // request held inside the detached CLI child) keeps appending to
+            // the SAME ledger after the daemon owner has been replaced.
+            recorder.emit(RunEvent::ModelDelta{
+                message_id:"original-model-message".into(),
+                channel:little_monkey_lib::run_protocol::OutputChannel::Assistant,
+                text:"next provider fragment".into(),
+            }).map_err(|e|e.to_string())?;
+            let events=engine.shared.events(&run_id,0,100)?;
+            let deltas=events.iter().filter_map(|e|match &e.event{
+                RunEvent::ModelDelta{text,..}=>Some(text.as_str()),
+                _=>None,
+            }).collect::<Vec<_>>();
+            assert_eq!(deltas,vec!["first provider fragment","next provider fragment"],
+               "the original event cursor must continue across supervisor restart");
+            assert_eq!(events.iter().filter(|e|matches!(e.event,RunEvent::Started{..})).count(),1,
+               "recovery must not duplicate a Started event or replay the model");
             assert_eq!(engine.store.get_job("job-actual-handoff")?
                 .ok_or("missing adopted job")?.state,JobState::Running);
             let mut tampered=job.clone();
