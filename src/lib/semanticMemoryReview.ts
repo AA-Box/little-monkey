@@ -110,8 +110,19 @@ export function intersectIndependentSemanticReviews(
 ):SemanticReviewProposal[]{
  const signature=(p:SemanticReviewProposal)=>
   JSON.stringify([p.scopeKey,p.kind,[...p.ids].sort()]);
- const agreement=new Set(second.map(signature));
- return first.filter(proposal=>agreement.has(signature(proposal)));
+ const bySignature=new Map(second.map(item=>[signature(item),item]));
+ return first.filter(proposal=>{
+  const other=bySignature.get(signature(proposal));
+  if(!other)return false;
+  // Pair agreement is not enough: a model could agree that two facts are
+  // related but invent an unsupported summary. Demand the other model's
+  // independently authored summary also match before displaying approval.
+  if(proposal.kind==='merge' && other.kind==='merge'){
+   const normalize=(text:string)=>text.trim().replace(/\\s+/g,' ').toLocaleLowerCase();
+   return normalize(proposal.suggestedText)===normalize(other.suggestedText);
+  }
+  return proposal.kind==='contradiction' && other.kind==='contradiction';
+ });
 }
 
 export async function requestSemanticMemoryReview(
