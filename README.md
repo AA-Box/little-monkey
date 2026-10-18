@@ -1,120 +1,56 @@
 <div align="center">
 
-<img width="96" height="98" alt="Little Monkey" src="https://github.com/user-attachments/assets/84651d01-f18b-4c49-b203-8d1b7e8f16b6" />
+<img width="96" height="98" alt="Little Monkey logo" src="https://github.com/user-attachments/assets/84651d01-f18b-4c49-b203-8d1b7e8f16b6" />
 
-# Little Monkey — open-source local Agent OS
+# Little Monkey
 
-**Run autonomous AI agents on your own computer.**
+**Local AI coding agents with inspectable permissions, durable work and reviewable changes.**
 
-Local or cloud models, real computer tools, kernel-sandboxed execution and jobs
-that survive a restart — with every process, network request and tool call
-behind one permission boundary you can inspect.
+Give an agent a real repository task, control what tools it can use, and inspect the tests and diff before accepting a result. Use a model on your machine or a provider you configure.
 
-[![CI](https://github.com/AA-Box/little-monkey/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/AA-Box/little-monkey/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/AA-Box/little-monkey?color=6f4e37&label=release)](https://github.com/AA-Box/little-monkey/releases)
-[![License](https://img.shields.io/badge/license-MIT-6f4e37)](LICENSE)
-[![Platforms](https://img.shields.io/badge/macOS%20%C2%B7%20Windows%20%C2%B7%20Linux-6f4e37)](docs/setup.md)
-[![Built with](https://img.shields.io/badge/Tauri%202%20%C2%B7%20Rust%20%C2%B7%20React-6f4e37)](docs/setup.md)
+[![CI on develop](https://github.com/AA-Box/little-monkey/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/AA-Box/little-monkey/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/AA-Box/little-monkey?label=stable)](https://github.com/AA-Box/little-monkey/releases/latest)
+[![MIT](https://img.shields.io/badge/license-MIT-6f4e37)](LICENSE)
+[![macOS, Windows, Linux](https://img.shields.io/badge/macOS%20%C2%B7%20Windows%20%C2%B7%20Linux-6f4e37)](docs/setup.md)
 
-### [⬇ Download for macOS, Windows or Linux](https://github.com/AA-Box/little-monkey/releases/latest)
+### [Download the latest stable release](https://github.com/AA-Box/little-monkey/releases/latest) · [Try a real coding task](docs/first-run.md) · [Check limitations](docs/limitations.md)
 
-Local-first · llama.cpp · Ollama · MLX · any OpenAI-compatible provider · MCP · sandboxed shells · local voice · persistent agents · MIT
-
-[**Features**](docs/features.md) · [**CLI**](docs/cli.md) · [**Setup**](docs/setup.md) · [**Security**](docs/security.md) · [**Limitations**](docs/limitations.md) · [**Roadmap**](ROADMAP.md)
+[Quick start](#quick-start) · [Features](docs/features.md) · [Security](docs/security.md) · [Contribute](CONTRIBUTING.md) · [Roadmap](ROADMAP.md)
 
 </div>
 
----
+> **Release vs. development:** You are reading the `develop` branch. Its feature and limitation docs describe the **development tree**, which can contain changes not included in the latest published installer. Before relying on a capability in an installed version, check the [latest release notes](https://github.com/AA-Box/little-monkey/releases/latest) and select that release's tag in GitHub to read its matching documentation. `main` is the release branch; `develop` is not a release promise.
 
-Little Monkey runs against a managed `llama.cpp`, Ollama, MLX on supported Apple Silicon, or any OpenAI-compatible provider you configure — and generates images, video and speech locally through its own managed `stable-diffusion.cpp` and `llama-tts` runtimes. No account, no relay, no hosted GPU.
+## Watch the workflow, then try it
 
-Every surface shares one set of contracts — workspace, permission, run, model, generation, package, browser, Git, background service — rather than reimplementing them per feature. Capability claims here describe the current `develop` tree; where a feature is narrower than its name suggests, the boundary is stated in **[Limitations](docs/limitations.md)** rather than left for you to discover.
-
-## What you can actually do with Little Monkey
-
-### Fix a real coding task end to end
-
-Give it a bug, a feature request, or a repository chore. It inspects the codebase, searches files, uses Git, runs commands, delegates work to subagents, executes tests and reviews the resulting diff — with the whole run behind explicit permissions.
+**A small, verifiable coding task:** The [first-run example](examples/first-run/) contains a real bug and a failing Node.js test. You can reproduce the failure yourself, ask Little Monkey to fix it, and independently rerun the same test. No simulated terminal output or claimed success rate is involved.
 
 ```text
-"Fix the authentication regression in this repo"
-
-→ inspect the repository
-→ trace the failing path
-→ create isolated working changes
-→ run tests and verification
-→ review the diff
-→ return the finished result
+Open a workspace with a failing test
+              ↓
+Give an agent the task and choose its model
+              ↓
+Review requested file / command permissions
+              ↓
+Inspect the edits, test evidence and Git diff
+              ↓
+Independently rerun the test before accepting changes
 ```
 
-You can inspect what the agent did instead of treating execution as a black box.
+**[Follow the reproducible first-run walkthrough →](docs/first-run.md)**
 
-### Let agents use your computer without unrestricted access
+There is not yet a checked-in recording of a real desktop run. The [recording protocol](docs/adoption.md#publish-a-real-demo-not-a-mockup) explains what must be captured before a video or screenshot can honestly be shown here.
 
-An autonomous agent needs tools, but that should not mean handing a model your entire machine. Tool execution goes through one shared permission and isolation layer.
+## Why use Little Monkey for repository work?
 
-```text
-Agent wants to run a command
-        ↓
-permission policy
-        ↓
-workspace boundary
-        ↓
-sandboxed process
-        ↓
-tracked execution
-```
+| What you need | How Little Monkey approaches it |
+| :-- | :-- |
+| **Local or BYOK models** | Use the managed `llama.cpp` runtime, Ollama, MLX on supported Apple Silicon, or a configured provider. Model quality and tool support depend on the actual model. |
+| **Inspectable execution** | File edits, commands and tool calls are subject to explicit permissions and workspace boundaries; see [Security](docs/security.md). |
+| **Work that survives closing a window** | Daemon-backed tasks can preserve state and resume under the documented recovery rules. An ordinary desktop chat turn is **not** a crash-resumable live agent loop; see [Limitations](docs/limitations.md). |
+| **Review rather than blind trust** | See file changes, tool activity and verification evidence. Tests should be independently rerun before relying on a result. |
 
-Processes, tool calls, network access and execution state stay inspectable and controllable.
-
-### Start durable agent work and come back later
-
-Long-running work should not depend on a window staying open. Submit it as a background job: the daemon ticks independently of the app, the job carries a frozen recipe snapshot that fully describes how to run it, and its ledger row, checkpoints, limits and stop/suspend intent are written to disk as it goes.
-
-```text
-"Refactor this module and verify every call site"   → submitted as a background job
-
-→ agent works through multiple steps
-→ close and reopen Little Monkey
-→ the job, its row and its checkpoints are still there
-→ inspect, stop, suspend or intervene — from the app or a terminal
-```
-
-A daemon job is the one kind a supervisor can re-run after a crash, because it is the one kind with both a supervisor outliving the process and a durable description of what to run. Work the desktop hosts — a chat turn, a subagent, a Crew member — keeps durable *intent* and durable history across a restart, not a live loop: see **[Limitations](docs/limitations.md)**.
-
-### Run several agents without turning your repository into chaos
-
-Break larger work into parallel agent tasks while keeping their changes isolated.
-
-```text
-Main task
-├── Agent A: backend change
-├── Agent B: frontend change
-├── Agent C: tests
-└── Coordinator: review + integration
-```
-
-Agents can work in isolated Git worktrees, report back to a coordinator, and be stopped or inspected individually — multi-agent execution for real software work instead of several chat responses.
-
-Little Monkey also supports **goal-driven agent swarms**, explicit task dependency graphs, opt-in shared indexed knowledge from selected Knowledge 2.0 stacks, and optional read-only discovery on explicitly paired peer installations. Specialized agents reuse native permissions, routing, and workflow limits. Remote peer execution uses the receiving node's independent recipe and permission policy. See [Agent swarms](docs/agent-swarms.md) for setup and limitations.
-
-For security reviews, the built-in **security-red-team** workflow runs 15 read-only specialist agents across phased audits and independent verification. A separate **security-audit-and-fix** preset performs user-authorized fixes and tests through the existing permission boundary. See [Security swarms](docs/security-swarms.md) for the exact capabilities and limits.
-
-### Run capable agents locally without giving up real tools
-
-Use Ollama, `llama.cpp`, MLX or another configured provider while the agent runtime stays on your own machine.
-
-```text
-local model
-→ read workspace
-→ edit files
-→ run shell commands
-→ use Git
-→ search knowledge
-→ call approved tools
-```
-
-Local does not have to mean "chat only." The same agent infrastructure works whether the model runs locally or through a provider you configure.
+Little Monkey is also an extensible local agent platform with voice, Studio, knowledge, workflows, swarms and IDE clients. Those are documented in the [full feature inventory](docs/features.md); this introduction focuses on the coding workflow instead of treating every feature as the main product.
 
 ## How it fits together
 
@@ -192,7 +128,10 @@ Serves the OpenAI-compatible routes, the Anthropic Messages subset, and native-O
 
 </details>
 
-## What it does
+<details>
+<summary><b>Beyond coding: more Little Monkey capabilities</b></summary>
+
+### Additional capabilities
 
 | | |
 | :-- | :-- |
@@ -209,6 +148,9 @@ Serves the OpenAI-compatible routes, the Anthropic Messages subset, and native-O
 | **Runs &amp; limits** | Ten tracked process kinds, durable stop/suspend/resume from anywhere, and budgets that record *which* limit fired |
 
 Every one of these has its boundary written down: **[full feature list](docs/features.md)** · **[what each stops short of](docs/limitations.md)**
+
+
+</details>
 
 ## Voice architecture
 

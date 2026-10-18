@@ -1,0 +1,48 @@
+name: First-run feedback
+description: Share a verified result or an onboarding blocker from the reproducible example
+title: "[First run] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tell us what happened with [the first-run example](https://github.com/AA-Box/little-monkey/blob/develop/docs/first-run.md), including failures. Never share secrets, private code or identifying local paths. For security vulnerabilities use a [private advisory](https://github.com/AA-Box/little-monkey/security/advisories/new).
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: What happened?
+      options:
+        - Could not install or start the app
+        - Could not configure a model
+        - Agent could not start or request permissions
+        - Agent ran but the task or independent test failed
+        - Agent changed files and independent test passed
+        - Other / did not try the example
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps and observed result
+      description: Include the actual error or independent test result. Don't claim a pass solely from the agent's summary.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Exact app version (or develop commit)
+      placeholder: "e.g. v1.10.0"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: OS / architecture and model runtime
+      placeholder: "e.g. macOS arm64; managed llama.cpp and model tag"
+    validations:
+      required: true
+  - type: textarea
+    id: friction
+    attributes:
+      label: Biggest obstacle or confusing step
+      description: Optional. Redact credentials and personal data.
