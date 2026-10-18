@@ -111,3 +111,38 @@ its stdout locally, and set `LM_REAL_CURSOR_AGENT_STREAM_JSON` when running
 src/lib/codingSessionImport.realExports.test.ts`. The other four original
 format environment variables are also required. These tests intentionally
 skip by default rather than claiming evidence from invented exports.
+
+## Authentic five-vendor import acceptance
+
+The preinstalled formats are Cursor Agent stream-JSON, Claude Code JSONL,
+Codex JSONL, Pi JSONL, and OpenCode's real `opencode export --sanitize` JSON.
+The private collector does not synthesize any session. Pass original files
+from the official Claude Code `~/.claude/projects`, Codex `~/.codex/sessions`
+and Pi `~/.pi/agent/sessions` directories. An installed OpenCode client and
+an existing OpenCode session ID are required. Cursor Agent runs an actual
+official CLI print request in a newly created empty working directory.
+
+**Security:** Cursor print mode can execute shell commands and may access files
+outside the temporary directory. The explicit `--allow-cursor-agent-execution`
+flag authorizes that risk; an empty cwd is not an OS sandbox. Use a disposable
+account/VM if you need process-level isolation. Only run on your own machine.
+Session exports may contain secrets and proprietary content; never commit,
+upload or share the private evidence directory without review.
+
+```bash
+node scripts/accept-real-agent-exports.mjs \
+  --explicit-private-export-consent \
+  --allow-cursor-agent-execution \
+  --claude-file ~/.claude/projects/PROJECT/ACTUAL.jsonl \
+  --codex-file ~/.codex/sessions/YEAR/MONTH/DAY/ACTUAL.jsonl \
+  --pi-file ~/.pi/agent/sessions/PROJECT/ACTUAL.jsonl \
+  --opencode-session EXISTING_SESSION_ID \
+  --out ./private-agent-evidence
+```
+
+The collector reads actual source files, invokes the official OpenCode exporter
+and Cursor Agent CLI, then executes the existing five-vendor mandatory Vitest
+acceptance suite against the captured bytes. It writes a hashed manifest only
+after all five genuine imports pass; otherwise it fails closed and reports no
+acceptance. CI can verify the collector contract, but cannot impersonate the
+user's logged-in vendor apps or certify live captures in their absence.
