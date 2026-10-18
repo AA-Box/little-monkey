@@ -954,10 +954,18 @@ impl<R: CommandRunner> ServiceManager<R> {
                 )
             }
             ServicePlatform::SystemdUser => format!(
-                "[Unit]\nDescription=Little Monkey durable local agent daemon\nAfter=network-online.target\n\n[Service]\nType=simple\nEnvironment={}\nEnvironment={}\nEnvironment=\"XDG_RUNTIME_DIR=%t\"\nEnvironment=\"DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus\"\nExecStart={} --profile={} daemon serve\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=full\nWorkingDirectory=%h\n\n[Install]\nWantedBy=default.target\n",
+                "[Unit]\nDescription=Little Monkey durable local agent daemon\nAfter=network-online.target\n\n[Service]\nType=simple\nEnvironment={}\nEnvironment={}\nEnvironment=\"XDG_RUNTIME_DIR=%t\"\nEnvironment=\"DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus\"\nExecStart={} --profile={} daemon serve\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\n{}ProtectSystem=full\nWorkingDirectory=%h\n\n[Install]\nWantedBy=default.target\n",
                 systemd_environment_escape(&format!("LITTLE_MONKEY_HOME={agent_home}")),
                 systemd_environment_escape(&format!("HOME={user_home}")),
                 systemd_escape(&executable),
+                if self.profile_id.starts_with("selfdev-") &&
+                   std::env::var("LITTLE_MONKEY_DAEMON_LIVE_HANDOFF").as_deref()==Ok("1") {
+                    // systemd's default KillMode=control-group would kill
+                    // every provider worker when the daemon is replaced.
+                    // Only isolated, explicitly opted-in Linux selfdev
+                    // services may retain workers for the new daemon to adopt.
+                    "KillMode=process\\nEnvironment=LITTLE_MONKEY_DAEMON_LIVE_HANDOFF=1\\n"
+                }else{""},
                 systemd_escape(&self.profile_id),
             ),
             ServicePlatform::WindowsTask => {
