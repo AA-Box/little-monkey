@@ -46,7 +46,7 @@ import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import { useSessionStore } from '../store/sessionStore';
 import { usePermissionStore } from '../store/permissionStore';
 import { runSubagentTask } from './subagent';
-import { listCollaboratingSessions, sendSessionMessage, broadcastSessionMessage } from './sessionCollaboration';
+import { listCollaboratingSessions, sendSessionMessage, broadcastSessionMessage, noteSessionFileActivity } from './sessionCollaboration';
 import { resolveWorkflowSpec, runWorkflow } from './workflow';
 import { protocolToolCallId } from './durableRun';
 import { formatSkillSearchResults, formatSkillToolResult, type SkillRankingSignals, type SlashSkill } from './skills';
@@ -837,6 +837,29 @@ export async function executeToolCall(
     programmatic,
     executionContext,
   );
+
+  // Detect a file version conflict only AFTER a real successful native
+  // read/write/edit. This additional observation cannot authorize tools or
+  // change the returned model result. Worktree-isolated children cannot
+  // enroll under their parent's original workspace root.
+  if(sessionId && !workspaceRootOverride &&
+      (name==='read_file'||name==='write_file'||name==='edit_file')){
+    const parsed=argsForHooks();
+    if(typeof parsed.path==='string' &&
+       !/^\\s*\\{\\s*"error"\\s*:/.test(result) &&
+       result!=='CANCELLED'){
+      try{
+        await noteSessionFileActivity({
+          sessionId,turnId,toolCallId:toolCall.id,
+          path:parsed.path,action:name==='read_file'?'read':'write',
+        });
+      }catch(error){
+        // The actual file tool already succeeded; never replay a mutation
+        // just because peer-awareness persistence is unavailable.
+        console.warn('Session file-change notification remains unavailable:',error);
+      }
+    }
+  }
 
   if (hooksForEvent('PostToolUse', name).length > 0) {
     fireObservedHooks('PostToolUse', { tool_name: name, args: argsForHooks(), session_id: sessionId, result });
