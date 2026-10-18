@@ -764,6 +764,21 @@ fn install(args: &DaemonInstallArgs) -> Result<(), String> {
     };
     let mut store = DaemonStore::open(&paths)?;
     store.set_meta("stop_requested", "0")?;
+    #[cfg(target_os="linux")]
+    if little_monkey_lib::app_paths::agent_config_roots()?.profile_id.starts_with("selfdev-")
+       && std::env::var("LITTLE_MONKEY_DAEMON_LIVE_HANDOFF").as_deref()==Ok("1") {
+        // Persistent opt-in is profile-local; later status/ensure/rollback
+        // must render the SAME systemd unit even without an env override.
+        let marker=paths.root.join(".selfdev-live-handoff");
+        if let Ok(meta)=std::fs::symlink_metadata(&marker){
+            if meta.file_type().is_symlink()||!meta.is_file(){
+                return Err("Refusing non-regular live handoff enrollment marker".into());
+            }
+        }
+        std::fs::write(&marker,b"selfdev-live-handoff-v1\n")
+           .map_err(|e|format!("Failed to persist selfdev live enrollment: {e}"))?;
+        store::restrict_file(&marker)?;
+    }
     let manifest = manager.install(&paths, &config)?;
     println!(
         "Installed {} user service at {}",
