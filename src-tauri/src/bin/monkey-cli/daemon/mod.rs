@@ -121,6 +121,14 @@ pub enum DaemonCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Enter/leave durable scheduling drain without cancelling queued jobs.
+    /// Active model tasks finish normally before a cold service upgrade.
+    Drain {
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+    },
     /// Show recent scheduling decisions: what was chosen, over what, and which
     /// measurement decided it.
     Decisions {
@@ -518,6 +526,7 @@ struct DaemonStatus {
     installed: bool,
     service_running: bool,
     heartbeat_fresh: bool,
+    maintenance_drain: bool,
     pid: Option<u32>,
     kill_switch: bool,
     queued: u32,
@@ -568,6 +577,16 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
             manager.start(&paths)
         }
         DaemonCmd::Status { json } => status(*json),
+        DaemonCmd::Drain { enable, disable } => {
+            if *enable == *disable {
+                return Err("Choose exactly one of --enable or --disable".into());
+            }
+            let paths=DaemonPaths::resolve()?;
+            let mut store=DaemonStore::open(&paths)?;
+            store.set_meta("maintenance_drain",if *enable {"1"}else{"0"})?;
+            println!("{}",serde_json::json!({"maintenance_drain":enable}));
+            Ok(())
+        },
         DaemonCmd::Decisions { limit, json } => decisions(*limit, *json),
         DaemonCmd::Stop => stop().await,
         DaemonCmd::Uninstall { purge_state } => uninstall(*purge_state),
@@ -911,6 +930,8 @@ fn status(json: bool) -> Result<(), String> {
         installed,
         service_running,
         heartbeat_fresh: heartbeat.is_some_and(|value| now.saturating_sub(value) < 5_000),
+        maintenance_drain:paths.state_db.is_file() &&
+            DaemonStore::open(&paths)?.get_meta("maintenance_drain")?.as_deref()==Some("1"),
         pid,
         kill_switch,
         queued,
