@@ -22,10 +22,14 @@ service and does not modify the signed desktop executable. The local
 authorization here is OS-user and SHA approval; it is **not remotely
 authenticated daemon control**.
 
-A cold upgrade refuses **all active, queued, paused, approval-waiting jobs and
-managed run IDs**. It stops the old dedicated service, activates the new
-staged binary, installs the profile's service, and demands fresh heartbeat,
-service health and a changed PID. On failure, it restores the previous
+A cold upgrade now enters a persistent `monkey daemon drain --enable` state.
+The daemon completes active jobs normally without admitting new work. Queued,
+paused, waiting-approval and pending run snapshots remain in the profile's
+SQLite store rather than being cancelled by `daemon stop`. Once all active
+jobs finish, the supervisor switches the verified binary, reinstalls the same
+profile-owned service, checks the heartbeat/PID and that pending queue counts
+have not decreased while the drain was held, and finally executes
+`monkey daemon drain --disable` to resume pending jobs. On failure, it restores the previous
 immutable binary and OS service, independently checking health before
 reporting a rollback. If recovery fails, execution stops with a visible
 manual-recovery error.
@@ -34,8 +38,9 @@ manual-recovery error.
 node --test scripts/selfdev-supervised-daemon.contract.test.mjs
 ```
 
-**Outstanding:** safe live session drain/handoff, seamless continuation of
-in-flight model streams, remote authenticated orchestration, and hardware/
-OS service acceptance. The mocked contract tests cover the state machine,
+**Outstanding:** transparent transfer of an in-flight model stream (not
+attempted: active tasks are allowed to finish before a swap), remote
+cryptographically authenticated orchestration, real provider handoff across
+the restart, and hardware/OS service acceptance. The mocked contract tests cover the state machine,
 not a real daemon hot reload. These operations explicitly fail closed rather
 than abandoning a user's active job.
