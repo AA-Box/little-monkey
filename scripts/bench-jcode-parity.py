@@ -220,7 +220,7 @@ def measure(monkey: str, jcode: str, model: str, provider: str, cwd: str,
            "provider": provider, "samples": []}
     for name in ("monkey", "jcode"):
         log = base / (name + "-" + str(sessions))
-        log.mkdir()
+        log.mkdir(parents=True)
         agents = []
         server = None
         try:
