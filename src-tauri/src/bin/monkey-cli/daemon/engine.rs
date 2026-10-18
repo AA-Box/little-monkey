@@ -3465,6 +3465,53 @@ pub(super) mod tests {
         }
     }
 
+    #[cfg(target_os="linux")]
+    #[test]
+    fn real_os_worker_is_reattached_with_same_pid_and_live_lease_after_daemon_replacement(){
+        use std::os::unix::process::CommandExt;
+        let (paths,mut store,mut shared,recorder,run_id)=fixture("actual-handoff");
+        let mut child=Command::new("sleep").arg("30").process_group(0)
+            .spawn().expect("spawn independent real worker process group");
+        let pid=child.id();
+        let mut cleanup=||{let _=child.kill();let _=child.wait();};
+        let result=(||->Result<(),String>{
+            recorder.emit(RunEvent::Started{engine_id:"original-stream".into()})
+                .map_err(|e|e.to_string())?;
+            store.transition("job-actual-handoff",JobState::Running,2_000,Some(pid),None)?;
+            let job=store.get_job("job-actual-handoff")?
+                .ok_or("missing running fixture")?;
+            store_worker_identity(&paths,&job,pid)?;
+            let old=shared.acquire_lease(&run_id,"daemon-4294967295-prior",
+                2_000,30_000)?.ok_or("missing old lease")?;
+            assert_eq!(old.generation,1);
+            let mut engine=DaemonEngine::new(store,shared,paths.clone(),
+                DaemonConfig::default(),
+                RealProcessAdapter{executable:std::path::PathBuf::from("/bin/sleep")},
+                FakeNotifier::default(),FakeClock(Arc::new(Mutex::new(3_000))),
+                "daemon-100-new".into()).with_live_handoff(true);
+            engine.recover()?;
+            assert_eq!(engine.active_count(),1,
+                "new daemon must adopt original worker, not reconcile or spawn");
+            let adopted=engine.active.get_mut("job-actual-handoff")
+                .expect("durably reattached running job");
+            assert_eq!(adopted.process.id(),pid);
+            assert_eq!(adopted.process.try_wait()?,None);
+            assert_eq!(adopted.lease.owner_id,"daemon-100-new");
+            assert_eq!(adopted.lease.generation,2);
+            assert!(engine.shared.heartbeat_lease(&adopted.lease,3_000,30_000)?);
+            assert_eq!(engine.store.get_job("job-actual-handoff")?
+                .ok_or("missing adopted job")?.state,JobState::Running);
+            let mut tampered=job.clone();
+            tampered.process_id=Some(pid.saturating_add(1));
+            assert!(attested_worker(&paths,&tampered).is_err(),
+                "a different PID cannot steal the provider worker identity");
+            Ok(())
+        })();
+        cleanup();
+        let _=std::fs::remove_dir_all(&paths.root);
+        result.unwrap();
+    }
+
     #[test]
     fn maintenance_drain_preserves_durable_queue_and_resumes_after_release(){
         let (paths,mut store,shared,_recorder,_run_id)=fixture("safe-drain");
