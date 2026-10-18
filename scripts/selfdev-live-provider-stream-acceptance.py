@@ -52,12 +52,13 @@ def evidence(path,run_id):
         starts=conn.execute(
           "SELECT COUNT(*) FROM run_events WHERE run_id=? AND event_type='started'",
           (run_id,)).fetchone()[0]
-        terminals=conn.execute(
-          "SELECT COUNT(*) FROM run_events WHERE run_id=? AND is_terminal=1",
-          (run_id,)).fetchone()[0]
+        terminal_rows=conn.execute(
+          "SELECT derived_status FROM run_events WHERE run_id=? AND is_terminal=1",
+          (run_id,)).fetchall()
     return {"delta_count":len(rows),"last_delta_sequence":rows[-1][0] if rows else 0,
       "last_delta_at_ms":rows[-1][1] if rows else 0,
-      "started_events":starts,"terminal_events":terminals}
+      "started_events":starts,"terminal_events":len(terminal_rows),
+      "terminal_statuses":[row[0] for row in terminal_rows]}
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
@@ -112,8 +113,9 @@ def main():
             after["last_delta_sequence"]>prev["last_delta_sequence"] and
             after["last_delta_at_ms"]>=activation_ms,
             "No newly emitted original-provider stream deltas AFTER replacement daemon was healthy")
-    require(after["terminal_events"]>0,
-            "Original provider run did not reach a durable terminal event")
+    require(after["terminal_events"]==1 and
+            after["terminal_statuses"]==["succeeded"],
+            "Original provider run must finish successfully once; failed/cancelled/ambiguous runs are NOT seamless handoff successes")
     require(after["started_events"]==prev["started_events"],
             "The run was restarted or duplicated instead of retaining its streaming worker")
     out=Path(args.out)
