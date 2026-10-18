@@ -171,7 +171,7 @@ export async function syncSessionMailboxAtSafePoint(sessionId:string):Promise<nu
 export async function broadcastSessionMessage(args:{
   senderSessionId:string;turnId:string;toolCallId:string;text:string;
 }):Promise<{persistedRecipients:string[];count:number}>{
-  if(!/^[\\w.:-]{1,140}$/.test(args.toolCallId))
+  if(!/^[\w.:-]{1,140}$/.test(args.toolCallId))
     throw new Error('Broadcast call ID must be 1-140 permitted characters.');
   const peers=(await listCollaboratingSessions(args.senderSessionId))
     .sort((a,b)=>a.id.localeCompare(b.id));
