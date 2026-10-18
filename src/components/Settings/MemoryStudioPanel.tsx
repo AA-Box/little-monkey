@@ -21,8 +21,9 @@ import {
   type MemoryEntry,
 } from "../../lib/memoryStudio";
 import { errorMessage } from "../../lib/errors";
+import { useModelStore } from "../../store/modelStore";
 import {
-  requestSemanticMemoryReview,reviewScopeKey,
+  requestSemanticMemoryReview,reviewScopeKey,configuredSemanticVerifiers,
   type SemanticReviewProposal,
 } from "../../lib/semanticMemoryReview";
 
@@ -445,6 +446,10 @@ export function MemoryStudioPanel() {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [semanticSuggestions, setSemanticSuggestions] = useState<SemanticReviewProposal[]>([]);
+  const [verifierKey,setVerifierKey]=useState("");
+  const providers=useModelStore(s=>s.providers);
+  const providerModels=useModelStore(s=>s.providerModels);
+  const semanticVerifiers=useMemo(()=>configuredSemanticVerifiers(),[providers,providerModels]);
 
   const refresh = async () => {
     try {
@@ -593,7 +598,7 @@ export function MemoryStudioPanel() {
     const batch=[...groups.values()].filter(items=>items.length>=2)
       .sort((a,b)=>b.length-a.length)[0]?.slice(0,24);
     if(!batch)throw Error("At least two eligible agent-owned memories in one scope are required.");
-    const proposals=await requestSemanticMemoryReview(batch);
+    const proposals=await requestSemanticMemoryReview(batch,verifierKey);
     setSemanticSuggestions(proposals);
     if(!proposals.length)setSuccess("No confident semantic changes suggested for this scope.");
   });
@@ -698,15 +703,24 @@ export function MemoryStudioPanel() {
       </div>
 
       {statusBanner(error, success)}
-      <div className="flex items-center gap-2 text-xs text-muted">
+      <div className="flex flex-wrap items-center gap-2 text-xs text-muted">
+        <label htmlFor="semantic-independent-verifier">Independent verifier model</label>
+        <select id="semantic-independent-verifier" value={verifierKey}
+          onChange={event=>setVerifierKey(event.target.value)}
+          className="rounded-md border border-border bg-surface px-2 py-1 text-xs"
+          disabled={busy!==null}>
+          <option value="">Select a separately configured model</option>
+          {semanticVerifiers.map(item=><option key={item.key} value={item.key}>{item.label}</option>)}
+        </select>
         <Button size="sm" variant="secondary"
-          disabled={busy !== null}
+          disabled={busy !== null || !verifierKey}
           onClick={() => void requestReview()}>
           {busy==="semantic-review"?"Reviewing…":"Review paraphrases with selected model"}
         </Button>
         <span>
-          Optional: sends up to 24 unpinned agent memories from one scope through
-          your selected model and privacy controls. Nothing is changed until approved.
+          The selected chat model proposes, and a different explicitly configured model
+          independently verifies. Both calls use your normal privacy and cost controls;
+          no memory changes without review and approval.
         </span>
       </div>
 
