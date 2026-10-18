@@ -83,6 +83,9 @@ reqwest = { version = "0.13.4", features = ["json", "stream", "form", "query", "
 futures-util = "0.3.32"
 uuid = { version = "1.23.4", features = ["v4"] }
 regex = "1.12.4"
+# Real Rust AST containment for structural grep, not lexical nearest-declaration guessing.
+syn = { version = "=2.0.119", features = ["full", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
 walkdir = "2.5.0"
 unicode-normalization = "0.1"
 globset = "0.4"
