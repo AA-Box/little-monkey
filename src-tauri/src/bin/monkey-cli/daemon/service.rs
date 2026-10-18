@@ -958,15 +958,15 @@ impl<R: CommandRunner> ServiceManager<R> {
                 systemd_environment_escape(&format!("LITTLE_MONKEY_HOME={agent_home}")),
                 systemd_environment_escape(&format!("HOME={user_home}")),
                 systemd_escape(&executable),
+                systemd_escape(&self.profile_id),
                 if self.profile_id.starts_with("selfdev-") &&
                    std::env::var("LITTLE_MONKEY_DAEMON_LIVE_HANDOFF").as_deref()==Ok("1") {
                     // systemd's default KillMode=control-group would kill
                     // every provider worker when the daemon is replaced.
                     // Only isolated, explicitly opted-in Linux selfdev
                     // services may retain workers for the new daemon to adopt.
-                    "KillMode=process\\nEnvironment=LITTLE_MONKEY_DAEMON_LIVE_HANDOFF=1\\n"
+                    "KillMode=process\nEnvironment=LITTLE_MONKEY_DAEMON_LIVE_HANDOFF=1\n"
                 }else{""},
-                systemd_escape(&self.profile_id),
             ),
             ServicePlatform::WindowsTask => {
                 let script = format!(
