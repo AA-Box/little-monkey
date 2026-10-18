@@ -3312,6 +3312,32 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn maintenance_drain_preserves_durable_queue_and_resumes_after_release(){
+        let (paths,mut store,shared,_recorder,_run_id)=fixture("safe-drain");
+        store.set_meta("maintenance_drain","1").unwrap();
+        let adapter=fake_adapter();
+        let count=adapter.spawns.clone();
+        let mut engine=DaemonEngine::new(
+            store,shared,paths.clone(),DaemonConfig::default(),
+            adapter,FakeNotifier::default(),
+            FakeClock(Arc::new(Mutex::new(2_000))),
+            "daemon-drain-test-owner".into()
+        );
+        engine.tick().unwrap();
+        assert_eq!(*count.lock().unwrap(),0);
+        let job=engine.store.get_job("job-safe-drain").unwrap().unwrap();
+        assert_eq!(job.state,JobState::Queued);
+        assert_eq!(engine.store.get_meta("maintenance_drain").unwrap().as_deref(),Some("1"));
+        engine.store.set_meta("maintenance_drain","0").unwrap();
+        engine.tick().unwrap();
+        assert_eq!(*count.lock().unwrap(),1);
+        let job=engine.store.get_job("job-safe-drain").unwrap().unwrap();
+        assert_eq!(job.state,JobState::Running);
+        drop(engine);
+        let _=std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
     fn interactive_runs_do_not_emit_os_notifications() {
         let (paths, store, shared, _recorder, background_run_id) = fixture("notifications");
         let interactive_run_id = "run-interactive";
