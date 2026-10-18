@@ -1,7 +1,8 @@
 //! Bounded structural hints shared by desktop and CLI grep implementations.
 //!
-//! These are lexical declaration hints, not an AST or a claim that a match
-//! belongs to the declaration (preprocessor/macro nesting is language-specific).
+//! Rust, Python, JavaScript, TypeScript and TSX use actual syntax trees to
+//! identify declaration containment; other supported languages still use
+//! explicitly labeled conservative lexical hints.
 //! The caller retains the actual regex match and workspace permission policy.
 use regex::Regex;
 use serde_json::{json, Value};
@@ -95,6 +96,68 @@ fn rust_ast_declaration(source:&str,line_number:usize)->Option<Value>{
     }))
 }
 
+/// Grammar-backed AST containment for Python, JavaScript, TypeScript and TSX.
+/// The entire file must parse without errors: returning None is safer than
+/// claiming a nearby unrelated declaration on malformed source.
+fn grammar_ast_declaration(path:&Path,source:&str,line_number:usize)->Option<Value>{
+    use tree_sitter::{Parser,Point};
+    if source.len()>1_000_000||line_number==0{return None;}
+    let ext=path.extension()?.to_str()?;
+    let language=match ext {
+        "py"=>tree_sitter_python::LANGUAGE.into(),
+        "js"|"jsx"|"mjs"|"cjs"=>tree_sitter_javascript::LANGUAGE.into(),
+        "ts"=>tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        "tsx"=>tree_sitter_typescript::LANGUAGE_TSX.into(),
+        _=>return None,
+    };
+    let mut parser=Parser::new();
+    parser.set_language(&language).ok()?;
+    let tree=parser.parse(source,None)?;
+    if tree.root_node().has_error(){return None;}
+    let line=source.lines().nth(line_number-1)?;
+    // Tree-sitter points use byte columns (not UTF-16 code units).
+    let column=line.len()-line.trim_start().len();
+    let point=Point::new(line_number-1,column);
+    let mut node=Some(tree.root_node().named_descendant_for_point_range(point,point)?);
+    while let Some(current)=node {
+        let kind=current.kind();
+        let named=matches!(kind,
+          "function_definition"|"class_definition"|
+          "function_declaration"|"generator_function_declaration"|
+          "class_declaration"|"method_definition"|
+          "interface_declaration"|"type_alias_declaration"|"enum_declaration"|
+          "abstract_class_declaration");
+        let is_arrow=kind=="variable_declarator" && current
+            .child_by_field_name("value")
+            .is_some_and(|value|matches!(value.kind(),
+              "arrow_function"|"function_expression"|"generator_function"));
+        if named||is_arrow {
+            let start=current.start_position().row+1;
+            let end_point=current.end_position();
+            let end=if end_point.column==0 {end_point.row}
+                else{end_point.row+1};
+            if start<=line_number && line_number<=end {
+                let name=current.child_by_field_name("name")
+                    .and_then(|node|node.utf8_text(source.as_bytes()).ok())?
+                    .trim();
+                if name.is_empty(){return None;}
+                let declaration=source.lines().nth(start-1)?.trim();
+                return Some(json!({
+                  "kind":if is_arrow{"arrow_function"}else{kind},
+                  "name":name,
+                  "declaration_line":start,
+                  "distance":line_number-start,
+                  "declaration":declaration.chars().take(MAX_DECLARATION_CHARS).collect::<String>(),
+                  "confidence":"ast_containment",
+                  "region":{"start_line":start,"end_line":end,"method":"tree_sitter_ast"}
+                }));
+            }
+        }
+        node=current.parent();
+    }
+    None
+}
+
 /// Conservative lexical region bounds. This is intentionally NOT an AST:
 /// indentation closes Python suites and balanced delimiters close brace
 /// languages. Strings/comments are skipped when counting braces. Unsupported
@@ -166,6 +229,10 @@ pub fn nearest_declaration(path: &Path, source: &str, line_number: usize) -> Opt
     if path.extension().and_then(|e|e.to_str())==Some("rs"){
         return rust_ast_declaration(source,line_number);
     }
+    if matches!(path.extension().and_then(|e|e.to_str()),
+       Some("py"|"js"|"jsx"|"mjs"|"cjs"|"ts"|"tsx")){
+        return grammar_ast_declaration(path,source,line_number);
+    }
     let lines: Vec<&str> = source.lines().collect();
     if lines.len() < line_number || lines.len()>100_000 { return None; }
     let first = line_number.saturating_sub(MAX_SCAN_BACK_LINES + 1);
@@ -232,6 +299,32 @@ mod tests {
         let unrelated="fn only() {}\nconst NOTHING: i32 = 1;\n";
         assert!(nearest_declaration(Path::new("x.rs"),unrelated,2).is_none());
         assert!(nearest_declaration(Path::new("x.rs"),"fn broken( {",1).is_none());
+    }
+
+    #[test]
+    fn grammar_ast_identifies_python_nested_functions_and_excludes_unrelated_lines(){
+        let source="def outer():\n    def inner():\n        return 42\n    return inner()\n\nvalue = 10\n";
+        let inner=nearest_declaration(Path::new("file.py"),source,3).unwrap();
+        assert_eq!(inner["name"],"inner");
+        assert_eq!(inner["confidence"],"ast_containment");
+        assert_eq!(inner["region"]["method"],"tree_sitter_ast");
+        let outer=nearest_declaration(Path::new("file.py"),source,4).unwrap();
+        assert_eq!(outer["name"],"outer");
+        assert!(nearest_declaration(Path::new("file.py"),source,6).is_none());
+        assert!(nearest_declaration(Path::new("file.py"),"def broken(:\n",1).is_none());
+    }
+    #[test]
+    fn grammar_ast_covers_js_ts_tsx_and_ignores_comments_as_code(){
+        let js="function earlier(){return 1;}\nclass Box {\n method() {\n  return 2;\n }\n}\n";
+        let found=nearest_declaration(Path::new("x.js"),js,4).unwrap();
+        assert_eq!(found["name"],"method");
+        assert_eq!(found["region"]["start_line"],3);
+        let ts="type Flag = boolean;\nconst getFlag = (value: Flag): Flag => {\n return value;\n};\n";
+        assert_eq!(nearest_declaration(Path::new("x.ts"),ts,3).unwrap()["name"],"getFlag");
+        let tsx="export function View() {\n  return <span>ok</span>;\n}\n";
+        assert_eq!(nearest_declaration(Path::new("x.tsx"),tsx,2).unwrap()["name"],"View");
+        let unrelated="// function imaginary() {}\nconst count=1;\n";
+        assert!(nearest_declaration(Path::new("x.js"),unrelated,2).is_none());
     }
 
     #[test]
