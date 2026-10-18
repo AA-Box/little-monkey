@@ -67,6 +67,7 @@ other CLIs' private credentials is out of scope.
 | Codex CLI | A `.codex/sessions/**/rollout-*.jsonl` transcript |
 | Pi | A v2/v3 tree-structured `.pi/agent/sessions/**/*.jsonl` file; active leaf |
 | OpenCode | A JSON export with `info` and `messages` (each with `info`/`parts`) |
+| Cursor Agent CLI | A user-saved `--print --output-format stream-json` NDJSON capture, including system initialization and the user prompt |
 
 The importer preserves visible **user** and **assistant** text only.
 System instructions, tool outputs and tool calls, reasoning, model settings,
@@ -102,3 +103,4 @@ oversized files.
 
 Automated parser and state/URL unit tests do not substitute for these live
 cross-product acceptance runs.
+\n### Cursor format boundary\n\nCursor CLI `stream-json` has documented `system/init`, `user`, `assistant` delta, `tool_call`, and terminal `result` events. Import concatenates assistant text deltas, prefers the successful terminal aggregate and strips all tool data, login source, and filesystem paths. Choose the captured NDJSON file manually; the app does not search Cursor private storage. A Cursor IDE history export/SQLite database is **not** a supported format. The parser uses documented example-shaped fixtures; genuine Cursor exports and restart/resume acceptance are not yet verified.\n
