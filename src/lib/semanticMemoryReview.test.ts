@@ -1,9 +1,10 @@
 import {describe,expect,it} from 'vitest';
 import {
   buildSemanticReviewPrompt,reviewEligibleFacts,validateSemanticReview,intersectIndependentSemanticReviews,
-  reviewScopeKey,
+  reviewScopeKey,configuredSemanticVerifiers,distinctVerifierOrThrow,
 } from './semanticMemoryReview';
 import type {MemoryEntry} from './memoryStudio';
+import {useModelStore} from '../store/modelStore';
 
 const f=(id:string,text:string,extra:Partial<MemoryEntry>={}):MemoryEntry=>({
  id,text,source:'agent',enabled:true,created_at:'2026-01-01T00:00:00Z',
@@ -16,6 +17,29 @@ const facts=[
  f('b','User prefers brief recaps.'),
  f('c','User prefers detailed explanations.'),
 ];
+
+describe('independent model identity gate',()=>{
+ it('does not allow the selected model to verify its own proposal',()=>{
+  const original=useModelStore.getState();
+  try{
+   useModelStore.setState({
+    providers:[{id:'provider-a',label:'Provider A',has_key:true,is_extension:false},
+               {id:'provider-b',label:'Provider B',has_key:true,is_extension:false}] as typeof original.providers,
+    providerModels:{'provider-a':[{id:'model-a'}],'provider-b':[{id:'model-b'}]} as typeof original.providerModels,
+   });
+   const models=configuredSemanticVerifiers();
+   expect(models).toHaveLength(2);
+   expect(()=>distinctVerifierOrThrow(
+     {kind:'provider',providerId:'provider-a',model:'model-a'},models[0].key,
+   )).toThrow(/different model/);
+   expect(distinctVerifierOrThrow(
+     {kind:'provider',providerId:'provider-a',model:'model-a'},models[1].key,
+   )).toEqual({kind:'provider',providerId:'provider-b',model:'model-b'});
+   expect(()=>distinctVerifierOrThrow({kind:'local',baseUrl:'http://127.0.0.1:8090'},'other'))
+     .toThrow(/Select a configured/);
+  }finally{useModelStore.setState({providers:original.providers,providerModels:original.providerModels});}
+ });
+});
 
 describe('untrusted semantic memory candidate validation',()=>{
  it('permits genuine paraphrase suggestions with approval required and exact original snapshots',()=>{
