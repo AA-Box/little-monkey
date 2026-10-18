@@ -14,6 +14,8 @@ import {spawnSync} from 'node:child_process';
 const argv=process.argv.slice(2),command=argv[0];
 const opt=(flag)=>{const i=argv.indexOf(flag);return i>=0?argv[i+1]:null;};
 const root=resolve(opt('--root')??join(homedir(),'.littlemonkey','selfdev'));
+const liveRequested=(command==='enroll' && argv.includes('--live-handoff')) || command==='upgrade-live';
+if(liveRequested && process.platform!=='linux')fail('Live handoff is limited to explicitly enrolled Linux systemd selfdev services');
 const mode='selfdev-managed-v1',marker=join(root,'.selfdev-managed');
 const current=join(root,'current','monkey-cli'),previous=join(root,'previous','monkey-cli');
 const selfdevScript=resolve('scripts/selfdev-transaction.mjs');
@@ -21,7 +23,7 @@ const managed=join(root,'.supervised-daemon.json'),lock=join(root,'.supervised-d
 const agentHome=join(root,'supervised-agent-home');
 const sha=opt('--confirm-sha');
 const fail=(message)=>{throw Error(message);};
-if(!['enroll','upgrade','status'].includes(command))fail('Usage: enroll|upgrade|status [--root PATH] [--confirm-sha SHA]');
+if(!['enroll','upgrade','upgrade-live','status'].includes(command))fail('Usage: enroll [--live-handoff]|upgrade|upgrade-live|status [--root PATH] [--confirm-sha SHA]');
 if(process.platform==='win32')fail('Selfdev supervisor currently requires POSIX host');
 if(!existsSync(marker)||lstatSync(marker).isSymbolicLink()||
     readFileSync(marker,'utf8')!==mode+'\n')
@@ -30,7 +32,8 @@ if(lstatSync(root).isSymbolicLink())fail('Refusing symlinked supervisor root');
 function exec(file,args,timeout=300000){
  const result=spawnSync(file,args,{
   encoding:'utf8',timeout,maxBuffer:1024*1024,
-  env:{...process.env,GIT_TERMINAL_PROMPT:'0'},
+  env:{...process.env,GIT_TERMINAL_PROMPT:'0',
+    ...(liveRequested?{LITTLE_MONKEY_DAEMON_LIVE_HANDOFF:'1'}:{})},
  });
  if(result.error||result.status!==0)fail(file+' '+args.slice(-3).join(' ')+
    ' failed: '+String(result.error?.message??result.stderr??result.stdout).slice(0,600));
@@ -130,7 +133,8 @@ function enroll(){
   daemon(current,profile,'install');
   const observed=healthy(current,profile);
   writeFileSync(managed,JSON.stringify({
-   kind:'selfdev-supervisor-v1',profile,agentHome,createdAt:new Date().toISOString(),
+   kind:'selfdev-supervisor-v1',profile,agentHome,liveHandoff:liveRequested,
+   createdAt:new Date().toISOString(),
   },null,2)+'\n',{flag:'wx',mode:0o600});
   return {profile,active:sha,servicePid:observed.pid,supervised:true};
  }catch(error){
@@ -145,8 +149,17 @@ function upgrade(){
  const pointers=active();
  if(!pointers.active||pointers.active===sha)
   fail('Update requires an existing healthy previous version and a different candidate SHA');
+ const live=command==='upgrade-live';
+ if(live && identity.liveHandoff!==true)
+   fail('Live upgrade requires a prior enroll --live-handoff; retroactive opt-in cannot preserve existing worker state');
  const baseline=status(current,identity.profile);
  requireHealthy(baseline);
+ if(live && (baseline.active<1 ||
+   !Number.isInteger(baseline.handoff_candidates) ||
+   !Number.isInteger(baseline.handoff_attested) ||
+   baseline.handoff_candidates<1 ||
+   baseline.handoff_candidates!==baseline.handoff_attested))
+   fail('Live upgrade requires at least one executing worker with a verified original PID/birth attestation');
  if(baseline.maintenance_drain)fail('An existing maintenance drain needs operator review');
  let activated=false;
  let drainStarted=false;
@@ -154,7 +167,19 @@ function upgrade(){
   // Drain live model work naturally at a durable run boundary. New queued
   // work stays in SQLite and must NOT be cancelled by 'daemon stop'.
   drainStarted=true;
-  const drained=drainUntilSafe(current,identity.profile);
+  let drained;
+  if(live){
+    daemon(current,identity.profile,'drain','--enable');
+    drained=status(current,identity.profile);
+    requireHealthy(drained);
+    if(!drained.maintenance_drain ||
+      drained.handoff_candidates!==drained.handoff_attested ||
+      drained.handoff_attested<1 ||
+      drained.handoff_candidates>baseline.handoff_candidates)
+      fail('Live handoff was not durably drained or process identity changed');
+  }else{
+    drained=drainUntilSafe(current,identity.profile);
+  }
   // Manager activation is atomic; reinstalling the SAME enrolled service
   // replaces its process without invoking the queue-cancelling Stop command.
   manager('activate','--confirm-sha',sha);
@@ -162,11 +187,22 @@ function upgrade(){
   daemon(current,identity.profile,'install');
   const observed=healthy(current,identity.profile,baseline.pid);
   requireHealthy(observed);
-  if(!observed.maintenance_drain||observed.active!==0||
-    observed.queued<drained.queued ||
+  if(!observed.maintenance_drain ||
+     observed.queued<drained.queued)
+    fail('Queued handoff acceptance failed: daemon resumed too early or queued work disappeared');
+  if(live){
+    // A real stream was adopted only when a pre-existing PID is STILL alive
+    // under the new daemon. A completed job during restart is safe, but is
+    // not evidence of in-flight continuity and cannot satisfy this gate.
+    if(!Number.isInteger(observed.handoff_attested) ||
+       observed.handoff_attested<1 ||
+       observed.handoff_attested!==observed.handoff_candidates ||
+       observed.handoff_attested>drained.handoff_attested)
+      fail('Post-restart live worker PID identity was not successfully reattached');
+  }else if(observed.active!==0 ||
     observed.waiting_approval<drained.waiting_approval ||
     observed.paused<drained.paused)
-   fail('Queued handoff acceptance failed: daemon resumed too early or pending work disappeared');
+    fail('Cold drain acceptance failed: pending work disappeared');
   daemon(current,identity.profile,'drain','--disable');
   const resumed=status(current,identity.profile);
   requireHealthy(resumed);
@@ -175,7 +211,8 @@ function upgrade(){
   return{active:sha,previous:pointers.active,profile:identity.profile,
     servicePid:resumed.pid,accepted:true,drainedActiveJobs:drained.active,
     queuedSessionsPreserved:drained.queued,
-    liveSessionHandoff:false,inFlightStreamsTransferred:false};
+    liveSessionHandoff:live,inFlightStreamsTransferred:live,
+    attestedActiveWorkers:live?observed.handoff_attested:0};
  }catch(error){
   // A drain timeout is NOT a crash and must never cause a service install:
   // reinstalling the old binary here would kill the very active jobs whose
@@ -217,7 +254,7 @@ try{
   const identity=meta();
   const pointers=active();
   const result=status(current,identity.profile);
-  console.log(JSON.stringify({ok:true,profile:identity.profile,...pointers,daemon:result}));
+  console.log(JSON.stringify({ok:true,profile:identity.profile,liveHandoff:identity.liveHandoff===true,...pointers,daemon:result}));
  }else{
   acquire();
   try{
