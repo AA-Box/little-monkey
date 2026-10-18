@@ -1344,6 +1344,12 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         // the legacy/crashed jobs above were moved out of an active state.
         // Never sweep live claims when a verified worker survived.
         if self.active.is_empty(){self.store.sweep_stale_reservations()?;}
+        // Prove new-daemon ownership of existing provider workers, not merely
+        // the existence of a surviving PID or an unchanged SQLite row.
+        self.store.set_meta("last_live_handoff_adopted_count",
+            &self.active.len().to_string())?;
+        self.store.set_meta("last_live_handoff_daemon_pid",
+            &std::process::id().to_string())?;
         self.store.set_meta("last_recovery_ms", &now.to_string())?;
         Ok(())
     }
