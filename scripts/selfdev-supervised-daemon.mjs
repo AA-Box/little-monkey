@@ -15,7 +15,6 @@ const argv=process.argv.slice(2),command=argv[0];
 const opt=(flag)=>{const i=argv.indexOf(flag);return i>=0?argv[i+1]:null;};
 const root=resolve(opt('--root')??join(homedir(),'.littlemonkey','selfdev'));
 const liveRequested=(command==='enroll' && argv.includes('--live-handoff')) || command==='upgrade-live';
-if(liveRequested && process.platform!=='linux')fail('Live handoff is limited to explicitly enrolled Linux systemd selfdev services');
 const mode='selfdev-managed-v1',marker=join(root,'.selfdev-managed');
 const current=join(root,'current','monkey-cli'),previous=join(root,'previous','monkey-cli');
 const selfdevScript=resolve('scripts/selfdev-transaction.mjs');
@@ -23,6 +22,7 @@ const managed=join(root,'.supervised-daemon.json'),lock=join(root,'.supervised-d
 const agentHome=join(root,'supervised-agent-home');
 const sha=opt('--confirm-sha');
 const fail=(message)=>{throw Error(message);};
+if(liveRequested && process.platform!=='linux')fail('Live handoff is limited to explicitly enrolled Linux systemd selfdev services');
 if(!['enroll','upgrade','upgrade-live','status'].includes(command))fail('Usage: enroll [--live-handoff]|upgrade|upgrade-live|status [--root PATH] [--confirm-sha SHA]');
 if(process.platform==='win32')fail('Selfdev supervisor currently requires POSIX host');
 if(!existsSync(marker)||lstatSync(marker).isSymbolicLink()||
