@@ -188,6 +188,21 @@ fn git_branch(root: &std::path::Path) -> Option<String> {
     Some(head.trim().strip_prefix("ref: refs/heads/")?.to_string())
 }
 
+/// Benchmark-only content-free completion record for persistent CLI sessions.
+fn benchmark_turn_event(ok:bool, history:&[serde_json::Value]) {
+    if std::env::var("LITTLE_MONKEY_BENCH_EVENTS").ok().as_deref()!=Some("1") {return;}
+    let tools=history.iter().filter(|message|
+        message["role"]=="tool" || message["role"]=="function"
+    ).count();
+    let calls=history.iter().filter_map(|message|
+        message["tool_calls"].as_array().map(Vec::len)
+    ).sum::<usize>();
+    eprintln!("LITTLE_MONKEY_BENCH_EVENT={}",serde_json::json!({
+        "ok":ok,"history_messages":history.len(),
+        "tool_results":tools,"tool_calls":calls,
+    }));
+}
+
 /// Runs the interactive session against an already-resolved target until
 /// `/bye`, `exit`, `quit`, or EOF. `options.system` coming in is just
 /// rules/facts + `--system` text — WITHOUT any `--persona` folded in (see
@@ -266,7 +281,7 @@ pub async fn run(
                         continue;
                     }
                 };
-                if let Err(error) = agent::run_turn(
+                let turn_result = agent::run_turn(
                     client,
                     &target,
                     state,
@@ -276,11 +291,9 @@ pub async fn run(
                     trimmed,
                     mcp_entries,
                     attached_stacks,
-                )
-                .await
-                {
-                    eprintln!("\nError: {error}");
-                }
+                ).await;
+                benchmark_turn_event(turn_result.is_ok(), &history);
+                if let Err(error)=turn_result {eprintln!("\\nError: {error}");}
                 println!();
                 continue;
             }
@@ -314,7 +327,7 @@ pub async fn run(
         if !keep_history {
             truncate_to_system(&mut history);
         }
-        if let Err(e) = agent::run_turn(
+        let turn_result = agent::run_turn(
             client,
             &target,
             state,
@@ -324,11 +337,9 @@ pub async fn run(
             &text,
             mcp_entries,
             attached_stacks,
-        )
-        .await
-        {
-            eprintln!("\nError: {e}");
-        }
+        ).await;
+        benchmark_turn_event(turn_result.is_ok(), &history);
+        if let Err(error)=turn_result {eprintln!("\\nError: {error}");}
         println!();
     }
 }
