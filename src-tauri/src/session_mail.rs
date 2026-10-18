@@ -441,6 +441,40 @@ mod tests{
         let root=std::env::temp_dir().join(format!("lm-mail-{}",uuid::Uuid::new_v4()));
         root.join("box.sqlite")
     }
+    #[test]fn file_change_notifications_are_atomic_scoped_and_idempotent(){
+        let path=tmp();
+        let dir=path.parent().unwrap();
+        let root=dir.join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let file=root.join("main.rs");
+        std::fs::write(&file,"fn first() {}").unwrap();
+        let workspace=root.to_string_lossy().to_string();
+        register_impl(&path,"a",&workspace,"Actor").unwrap();
+        register_impl(&path,"b",&workspace,"Reader").unwrap();
+        assert_eq!(file_activity_impl(&path,"b",&workspace,"main.rs",
+            "read","readturn","readtool").unwrap(),0);
+        std::fs::write(&file,"fn second() {}").unwrap();
+        assert_eq!(file_activity_impl(&path,"a",&workspace,"main.rs",
+            "write","editturn","edittool").unwrap(),1);
+        let notice=pending_impl(&path,"b",&workspace,10).unwrap();
+        assert_eq!(notice.len(),1);
+        assert!(notice[0].text.contains("main.rs"));
+        assert!(!notice[0].text.contains("fn second"));
+        assert_eq!(file_activity_impl(&path,"a",&workspace,"main.rs",
+            "write","editturn","edittool").unwrap(),0);
+        assert!(file_activity_impl(&path,"a",&workspace,"main.rs",
+            "write","editturn","edittool2").is_ok());
+        assert!(file_activity_impl(&path,"a",&workspace,"../other.rs",
+            "write","newturn","newtool").is_err());
+        assert!(ack_impl(&path,"b",&workspace,&notice[0].id).unwrap());
+        // A fresh read adopts the new version, so an unchanged publication
+        // cannot notify that peer until a DIFFERENT change occurs.
+        file_activity_impl(&path,"b",&workspace,"main.rs",
+            "read","readturn2","readtool2").unwrap();
+        assert_eq!(file_activity_impl(&path,"a",&workspace,"main.rs",
+            "write","editturn2","edittool2").unwrap(),0);
+        let _=std::fs::remove_dir_all(dir);
+    }
     #[test]fn durable_ack_after_restart_and_failed_replays(){
         let path=tmp();
         register_impl(&path,"from","/project","Sender").unwrap();
