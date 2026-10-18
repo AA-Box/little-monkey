@@ -33,11 +33,11 @@ pub const MANAGED_LLAMA_VERSION: &str = "b9637";
 /// `unknown model architecture: 'qwen3tts'`. Two pins keep speech from
 /// re-qualifying every chat and embedding path.
 pub const MANAGED_TTS_VERSION: &str = "b10278";
-/// Pinned stable-diffusion.cpp release. `master-964-1d0a58a` is the latest
+/// Pinned stable-diffusion.cpp release. `master-973-f0aac52` is the latest
 /// published release qualified by this tree. We deliberately pin a release
 /// rather than moving master; newer master-only fixes are tracked separately
 /// and are not claimed as part of this runtime.
-pub const MANAGED_SD_VERSION: &str = "master-964-1d0a58a";
+pub const MANAGED_SD_VERSION: &str = "master-973-f0aac52";
 const MANIFEST_FILE: &str = "runtime-manifest.json";
 const MAX_RUNTIME_FILES: usize = 256;
 const MAX_RUNTIME_FILE_BYTES: u64 = 1024 * 1024 * 1024;
