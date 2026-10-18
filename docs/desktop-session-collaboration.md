@@ -145,3 +145,37 @@ between the original tool and observer hash remains a possible blind spot.
 pnpm exec vitest run src/lib/sessionCollaboration.test.ts
 cargo test --manifest-path src-tauri/Cargo.toml file_change_notifications_are_atomic_scoped_and_idempotent
 ```
+
+## Resident daemon agent integration (explicit opt-in)
+
+The daemon's native CLI agent now joins the same profile-local SQLite peer
+directory when the service process is started with
+`LITTLE_MONKEY_AGENT_COLLABORATION=1`. Joining additionally requires a
+workspace-bound, **durable run-event identity**; a one-off non-durable terminal
+chat cannot impersonate an executing daemon job.
+
+After enrollment, the executing resident agent receives a
+`local_agent_message` tool with same-workspace DM and broadcast options. It
+checks the enrolled peer directory at dispatch (not merely in the model's
+tool list) and uses SQLite's transactional, idempotent send. Successful native
+`read_file`/`write_file`/`edit_file` calls use the exact same on-disk
+change tracker as the desktop. Pending messages are delivered between
+completed model calls, wrapped as untrusted data; the durable run ledger
+records the notification before the profile-local inbox is acknowledged.
+
+The runtime does **not** start a network-accessible server, grant filesystem
+rights, or elevate sending peers to system/user instruction status. Sender
+permissions and the model's normal file permission policy stay unchanged.
+
+```sh
+# Set this for the daemon user service environment, then restart it deliberately
+# only when the existing run policy permits an interruption.
+LITTLE_MONKEY_AGENT_COLLABORATION=1 monkey --workspace /path/to/repo daemon serve
+cargo test --manifest-path src-tauri/Cargo.toml real_sqlite_backed_local_direct_and_broadcast
+```
+
+**Evidence still needed:** a full physical multi-process concurrency test
+including a real running daemon and two real model-backed workspaces, Windows
+service propagation of this environment toggle, and an end-to-end delivery
+through a real streaming model. The mailbox integration does not substitute
+for these tests or for remote authenticated multi-host messaging.
