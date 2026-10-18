@@ -1305,7 +1305,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         let now = self.clock.now_ms();
         for job in self.store.active_jobs()? {
             #[cfg(target_os="linux")]
-            if self.live_handoff && job.process_id.is_some() {
+            if self.live_handoff {
                 // This is the SAME child that owns the provider socket. Its
                 // RunLedger events have been durable the whole time. Never
                 // re-invoke the model, shell tools, or recipe on adoption.
@@ -1317,6 +1317,21 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                     self.active.insert(job.job_id.clone(),ActiveProcess{process,lease});
                     continue;
                 }
+                if let Some(pid)=job.process_id {
+                    // A PID may have been reused after the original worker
+                    // exited. Never blindly signal a PID that does not match
+                    // our recorded birth identity. If it is occupied, fail
+                    // closed for operator reconciliation instead of killing
+                    // an unrelated process or replaying a non-idempotent tool.
+                    if worker_start_ticks(pid)?.is_some(){
+                        return Err(format!(
+                           "Cannot reattach live worker '{}': PID {} is occupied without valid matching worker identity",
+                           job.job_id,pid));
+                    }
+                }
+                self.reconcile_interrupted(&job,now,
+                    "original attested worker exited before daemon reattachment")?;
+                continue;
             }
             if let Some(process_id) = job.process_id {
                 // Old behavior is retained for legacy, dead or unprovable
