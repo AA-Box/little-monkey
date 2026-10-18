@@ -13,6 +13,8 @@ import type {ChatMessage} from './llamaClient';
 import type {MemoryEntry} from './memoryStudio';
 import {attemptStream} from './turnEngine';
 import {resolveTarget} from './targetRouting';
+import {useModelStore} from '../store/modelStore';
+import type {ResolvedTarget} from './turnEngine';
 import {effortForTarget} from '../store/modelStore';
 import {useSessionStore} from '../store/sessionStore';
 
@@ -125,11 +127,35 @@ export function intersectIndependentSemanticReviews(
  });
 }
 
+/**
+ * A second model must be independently configured and explicitly selected
+ * by the reviewer. Merely calling the same model twice is not an independent
+ * evaluation, and quietly switching the primary chat target is forbidden.
+ */
+export function configuredSemanticVerifiers():Array<{key:string;label:string;target:ResolvedTarget}>{
+ const {providers,providerModels}=useModelStore.getState();
+ return providers.filter(p=>p.has_key && !p.is_extension)
+  .flatMap(p=>(providerModels[p.id]??[]).filter(m=>typeof m.id==='string' && !!m.id)
+   .map(m=>({key:JSON.stringify([p.id,m.id]),label:p.label+' / '+m.id,
+    target:{kind:'provider',providerId:p.id,model:m.id} as const})));
+}
+export function distinctVerifierOrThrow(
+ proposer:ResolvedTarget, verifierKey:string,
+):ResolvedTarget{
+ const picked=configuredSemanticVerifiers().find(v=>v.key===verifierKey);
+ if(!picked)throw Error('Select a configured second provider model for independent verification.');
+ if(proposer.kind==='provider' && proposer.providerId===picked.target.providerId &&
+    proposer.model===picked.target.model)
+   throw Error('The proposer and verifier must use different model identities.');
+ return picked.target;
+}
+
 export async function requestSemanticMemoryReview(
- facts:readonly MemoryEntry[],
+ facts:readonly MemoryEntry[],verifierKey:string,
 ):Promise<SemanticReviewProposal[]>{
  const approved=reviewEligibleFacts(facts);
  const target=await resolveTarget();
+ const verifierTarget=distinctVerifierOrThrow(target,verifierKey);
  const sessionId=useSessionStore.getState().activeSessionId??'memory-studio-review';
  const invokeReview=async (items:readonly MemoryEntry[],kind:'proposer'|'verifier')=>{
   const messages=buildSemanticReviewPrompt(items);
@@ -141,7 +167,7 @@ export async function requestSemanticMemoryReview(
   const timeout=setTimeout(()=>controller.abort(),60_000);
   try{
    const result=await attemptStream(
-    target,messages,[],controller.signal,effortForTarget(target),
+    kind==='proposer'?target:verifierTarget,messages,[],controller.signal,effortForTarget(target),
     sessionId,undefined,false,1100,undefined,false,
    );
    if(controller.signal.aborted)throw Error('Independent memory review request timed out');
