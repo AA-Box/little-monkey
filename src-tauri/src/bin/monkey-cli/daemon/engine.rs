@@ -299,6 +299,32 @@ struct WorkerIdentity {
     run_id: String,
     pid: u32,
     start_ticks: u64,
+    /// Process start ticks reset on reboot. A persistent handoff marker must
+    /// also bind to the OS boot to reject accidental PID/ticks collisions.
+    boot_id: String,
+}
+#[cfg(target_os="linux")]
+fn worker_boot_id()->Result<String,String>{
+    let id=std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+       .map_err(|e|format!("Cannot attest Linux kernel boot identity: {e}"))?;
+    let id=id.trim();
+    if id.len()!=36||!id.bytes().all(|x|x.is_ascii_hexdigit()||x==b'-'){
+        return Err("Invalid kernel boot identity".into());
+    }
+    Ok(id.to_string())
+}
+#[cfg(target_os="linux")]
+fn worker_process_group(pid:u32)->Result<Option<u32>,String>{
+    let raw=match std::fs::read_to_string(format!("/proc/{pid}/stat")){
+        Ok(raw)=>raw,
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+        Err(e)=>return Err(format!("Cannot inspect worker process group: {e}")),
+    };
+    let fields=raw.rsplit_once(") ").ok_or("Malformed process group stat")?
+        .1.split_whitespace().collect::<Vec<_>>();
+    if fields.len()<3||matches!(fields[0],"Z"|"X"|"x"){return Ok(None);}
+    fields[2].parse::<u32>().map(Some)
+        .map_err(|_|"Malformed worker process group identity".to_string())
 }
 #[cfg(target_os="linux")]
 pub(super) fn worker_start_ticks(pid:u32)->Result<Option<u64>,String>{
@@ -323,8 +349,12 @@ fn identity_path(paths:&DaemonPaths,job_id:&str)->std::path::PathBuf{
 #[cfg(target_os="linux")]
 fn store_worker_identity(paths:&DaemonPaths,job:&DaemonJob,pid:u32)->Result<(),String>{
     let ticks=worker_start_ticks(pid)?.ok_or("Managed child exited before handoff marker")?;
+    if worker_process_group(pid)?!=Some(pid){
+        return Err("Managed worker is not a process-group leader".into());
+    }
     let identity=WorkerIdentity{job_id:job.job_id.clone(),
-      run_id:job.run_id.clone().ok_or("Missing run id for handoff")?,pid,start_ticks:ticks};
+      run_id:job.run_id.clone().ok_or("Missing run id for handoff")?,pid,start_ticks:ticks,
+      boot_id:worker_boot_id()?};
     let path=identity_path(paths,&job.job_id);
     let tmp=paths.logs.join(format!("{}.{}.tmp",job.job_id,uuid::Uuid::new_v4()));
     let result=(||{
@@ -357,6 +387,12 @@ pub(super) fn attested_worker(paths:&DaemonPaths,job:&DaemonJob)->Result<Option<
         .map_err(|e|format!("Malformed worker identity marker: {e}"))?;
     if identity.job_id!=job.job_id||Some(identity.run_id.as_str())!=job.run_id.as_deref()
       ||identity.pid!=pid {return Err("Worker identity does not match durable job".into());}
+    if identity.boot_id!=worker_boot_id()?{
+        return Err("Worker identity was recorded during a different Linux boot".into());
+    }
+    if worker_process_group(pid)?!=Some(pid){
+        return Err("Attested PID no longer owns its own process group".into());
+    }
     let current=worker_start_ticks(pid)?;
     if current==Some(identity.start_ticks){Ok(Some((pid,identity.start_ticks)))}else{Ok(None)}
 }
