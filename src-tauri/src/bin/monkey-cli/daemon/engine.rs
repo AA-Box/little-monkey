@@ -341,7 +341,7 @@ fn store_worker_identity(paths:&DaemonPaths,job:&DaemonJob,pid:u32)->Result<(),S
     result
 }
 #[cfg(target_os="linux")]
-fn attested_worker(paths:&DaemonPaths,job:&DaemonJob)->Result<Option<u32>,String>{
+pub(super) fn attested_worker(paths:&DaemonPaths,job:&DaemonJob)->Result<Option<u32>,String>{
     let pid=match job.process_id{Some(pid)=>pid,None=>return Ok(None)};
     let path=identity_path(paths,&job.job_id);
     let meta=match std::fs::symlink_metadata(&path){
