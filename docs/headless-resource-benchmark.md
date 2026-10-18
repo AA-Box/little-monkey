@@ -34,6 +34,16 @@ process (a stable PID), because build helpers can exit between `ps` and
 `/proc` sampling. It verifies the real kernel PSS path and parser but
 **does not** claim a complete daemon/workload memory sample.
 
+Each disposable workspace is now initialized as a **real Git repository**
+with a committed fixture before it is handed to `monkey task start`.
+Native autonomous tasks require that Git HEAD and workspace revision.
+After all model outcomes the harness independently compares the original
+HEAD and complete tracked/untracked checkout state. Any edited, newly created
+or committed workspace file turns that task into a failed acceptance, even
+when the model claims it completed correctly. These verification checks
+protect the measurement; they do **not** make the native task sandbox
+read-only on their own.
+
 The benchmark samples `ps -axo pid,ppid,rss`, builds a recursive subtree
 rooted at the running daemon PID, and records **real total RSS in MiB**,
 sample counts, per-level completion outcomes, observed p50/p95 elapsed time

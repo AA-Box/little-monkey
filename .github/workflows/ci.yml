@@ -63,6 +63,10 @@ jobs:
         if: runner.os == 'Linux'
         run: pnpm test:selfdev:contract
 
+      - name: Contract and Linux kernel gate for real paired JCode comparison
+        if: runner.os == 'Linux'
+        run: pnpm test:paired-headless:contract
+
       - name: Verify native vendor-CLI auth boundary and consent
         if: runner.os == 'Linux'
         run: pnpm test:native-auth:contract
@@ -185,6 +189,9 @@ jobs:
 
       - name: Signed updater dependency and release contract
         run: pnpm test:updater-security
+
+      - name: Signed updater acceptance preflight contract
+        run: pnpm test:updater-acceptance
 
   rust-tests:
     # Real per-OS compilation + test coverage for `#[cfg(target_os = ...)]`
