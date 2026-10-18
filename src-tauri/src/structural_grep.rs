@@ -115,6 +115,7 @@ fn grammar_ast_declaration(path:&Path,source:&str,line_number:usize)->Option<Val
         "cs"=>tree_sitter_c_sharp::LANGUAGE.into(),
         "php"=>tree_sitter_php::LANGUAGE_PHP.into(),
         "swift"=>tree_sitter_swift::LANGUAGE.into(),
+        "kt"|"kts"=>tree_sitter_kotlin_ng::LANGUAGE.into(),
         _=>return None,
     };
     let mut parser=Parser::new();
@@ -137,7 +138,8 @@ fn grammar_ast_declaration(path:&Path,source:&str,line_number:usize)->Option<Val
           "method_declaration"|"class_specifier"|"struct_specifier"|
           "interface_declaration"|"type_spec"|"struct_declaration"|
           "enum_specifier"|"namespace_definition"|
-          "protocol_declaration"|"extension_declaration");
+          "protocol_declaration"|"extension_declaration"|
+          "property_declaration"|"object_declaration");
         let is_arrow=kind=="variable_declarator" && current
             .child_by_field_name("value")
             .is_some_and(|value|matches!(value.kind(),
@@ -161,6 +163,17 @@ fn grammar_ast_declaration(path:&Path,source:&str,line_number:usize)->Option<Val
                         }
                         declarator=d.child_by_field_name("declarator")
                           .or_else(||d.child_by_field_name("name"));
+                    }
+                }
+                if name_node.is_none() && matches!(ext,"kt"|"kts"){
+                    // Kotlin's grammar may nest the declared simple
+                    // identifier beneath a function/value subtree rather
+                    // than providing the standard 'name' field.
+                    let mut cursor=current.walk();
+                    for child in current.named_children(&mut cursor){
+                        if matches!(child.kind(),"simple_identifier"|"identifier"){
+                            name_node=Some(child);break;
+                        }
                     }
                 }
                 let name=name_node
@@ -258,7 +271,7 @@ pub fn nearest_declaration(path: &Path, source: &str, line_number: usize) -> Opt
     if matches!(path.extension().and_then(|e|e.to_str()),
        Some("py"|"js"|"jsx"|"mjs"|"cjs"|"ts"|"tsx"|
             "go"|"java"|"c"|"h"|"cc"|"cpp"|"hpp"|
-            "cs"|"php"|"swift")){
+            "cs"|"php"|"swift"|"kt"|"kts")){
         return grammar_ast_declaration(path,source,line_number);
     }
     let lines: Vec<&str> = source.lines().collect();
@@ -367,6 +380,8 @@ mod tests {
         assert_eq!(nearest_declaration(Path::new("x.cpp"),cpp,2).unwrap()["name"],"add");
         let cs="class Demo {\n int Add(int a,int b){\n  return a+b;\n }\n}\n";
         assert_eq!(nearest_declaration(Path::new("Demo.cs"),cs,3).unwrap()["name"],"Add");
+        let kotlin="class Demo {\n fun add(a: Int, b: Int): Int {\n  return a+b\n }\n}\n";
+        assert_eq!(nearest_declaration(Path::new("Demo.kt"),kotlin,3).unwrap()["name"],"add");
     }
 
     #[test]
