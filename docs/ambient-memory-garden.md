@@ -144,3 +144,37 @@ Semantic *evidence* remains model-judged: a review proposal is **not**
 independent proof of equivalence. The user must examine and authorize
 meaning-changing edits. There is deliberately no unattended auto-resolution
 of paraphrase ambiguities, medical claims, or conflicting memories.
+
+## Evidence-backed background candidate queue (opt-in)
+
+Each due ambient worker configured with `--garden-agent-memories` now also
+performs a **read-only**, workspace-scoped review pass. It uses two distinct,
+conservative lexical evaluators (word Jaccard and character-trigram Dice) to
+flag *possible* paraphrases where both agent-created facts have nonempty
+original source-turn IDs. It skips pinned, user-authored, disabled, expired,
+retired, already-merged, and obvious negation-conflicting statements. This
+algorithm makes **no model-semantic equivalence claim**; independent lexical
+scores are candidate filters, not a proof of truth.
+
+The daemon stores up to twelve deterministic candidate ID pairs with exact
+source-turn identifiers, SHA-256 hashes of the original fact texts, the two
+scores and `requires_user_approval=true`. The latest snapshot is returned in
+`monkey daemon swarm-ambient-status` under
+`garden_evidence_candidates`. Raw memory text is not copied to the daemon
+status database. Memory Studio remains the ONLY way to compare original
+texts and authorize a guarded merge. A stale review cannot override current
+fact text: the existing Memory Studio guarded merge checks original contents
+under a cross-process lock before changing anything. The daemon itself never
+applies ambiguous proposals. All changes are opt-in and no new network model
+calls are introduced.
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml review_candidates_are_scoped_evidenced
+cargo test --manifest-path src-tauri/Cargo.toml evidence_manifest_schema_is_durable
+```
+
+**Unresolved acceptance:** independently verified model-based semantic
+judgment, end-to-end human approval flow surfaced directly from daemon
+candidate IDs, longitudinal real-model quality evaluation, and live daemon
+restart acceptance. The current evidence queue does not by itself satisfy
+those requirements.
