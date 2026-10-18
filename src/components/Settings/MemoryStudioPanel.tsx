@@ -22,6 +22,7 @@ import {
 } from "../../lib/memoryStudio";
 import { errorMessage } from "../../lib/errors";
 import { useModelStore } from "../../store/modelStore";
+import {readSemanticReviewQuality,recordSemanticReviewQuality,humanAgreementFraction} from "../../lib/semanticMemoryQuality";
 import {
   requestSemanticMemoryReview,reviewScopeKey,configuredSemanticVerifiers,
   type SemanticReviewProposal,
@@ -447,6 +448,7 @@ export function MemoryStudioPanel() {
   const [success, setSuccess] = useState<string | null>(null);
   const [semanticSuggestions, setSemanticSuggestions] = useState<SemanticReviewProposal[]>([]);
   const [verifierKey,setVerifierKey]=useState("");
+  const [quality,setQuality]=useState(readSemanticReviewQuality);
   const providers=useModelStore(s=>s.providers);
   const providerModels=useModelStore(s=>s.providerModels);
   const semanticVerifiers=useMemo(()=>configuredSemanticVerifiers(),[providers,providerModels]);
@@ -600,6 +602,7 @@ export function MemoryStudioPanel() {
     if(!batch)throw Error("At least two eligible agent-owned memories in one scope are required.");
     const proposals=await requestSemanticMemoryReview(batch,verifierKey);
     setSemanticSuggestions(proposals);
+    if(proposals.length)setQuality(recordSemanticReviewQuality('proposed',proposals.length));
     if(!proposals.length)setSuccess("No confident semantic changes suggested for this scope.");
   });
 
@@ -627,6 +630,7 @@ export function MemoryStudioPanel() {
         await setMemoryEnabled(other.id,other.project_root,false);
         setSuccess("Resolved selected contradiction; the other memory is disabled, not deleted.");
       }
+      setQuality(recordSemanticReviewQuality('approved'));
       setSemanticSuggestions(items=>items.filter(item=>item!==proposal));
       await refresh();
     });
@@ -724,6 +728,13 @@ export function MemoryStudioPanel() {
         </span>
       </div>
 
+      <p className="text-xs text-muted" aria-label="Local memory review quality counters">
+        Locally observed reviews: {quality.proposed} proposed, {quality.approved} approved,
+        {quality.dismissed} dismissed.
+        Human agreement among decided suggestions: {humanAgreementFraction(quality)===null
+          ?"not established":(100*humanAgreementFraction(quality)!).toFixed(1)+"%"}.
+        These decisions are not an independent semantic accuracy benchmark.
+      </p>
       {semanticSuggestions.length>0 && (
         <section className="space-y-2 rounded-lg border border-border p-3"
           aria-label="Model-proposed memory changes awaiting approval">
@@ -761,7 +772,10 @@ export function MemoryStudioPanel() {
                   ))
                 )}
                 <Button size="sm" variant="ghost" disabled={busy!==null}
-                  onClick={()=>setSemanticSuggestions(items=>items.filter(item=>item!==proposal))}>
+                  onClick={()=>{
+                    setSemanticSuggestions(items=>items.filter(item=>item!==proposal));
+                    setQuality(recordSemanticReviewQuality('dismissed'));
+                  }}>
                   Dismiss
                 </Button>
               </div>
