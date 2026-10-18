@@ -197,9 +197,16 @@ fn benchmark_turn_event(ok:bool, history:&[serde_json::Value]) {
     let calls=history.iter().filter_map(|message|
         message["tool_calls"].as_array().map(Vec::len)
     ).sum::<usize>();
+    // Only report a boolean for the final answer. No private prompts or
+    // assistant content leave the CLI via the benchmark metadata channel.
+    let last_answer=history.iter().rev()
+        .find(|message|message["role"]=="assistant" &&
+            message["content"].as_str().is_some())
+        .and_then(|message|message["content"].as_str()).unwrap_or_default();
     eprintln!("LITTLE_MONKEY_BENCH_EVENT={}",serde_json::json!({
         "ok":ok,"history_messages":history.len(),
         "tool_results":tools,"tool_calls":calls,
+        "answer_is_done":last_answer.trim()=="done",
     }));
 }
 
