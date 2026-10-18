@@ -17,4 +17,4 @@ pnpm exec vitest run src/lib/contextExposure.test.ts
 pnpm typecheck
 ```
 
-The shared desktop/CLI grep helper also identifies conservative Python indentation\nand balanced-brace declaration regions. These are lexical bounds, **not** AST\nproof: strings, macros, generated code and unusual grammar may still require a\nreal language parser.\n\n**Outstanding:** full AST node matching, CLI/daemon exposure integration,\nand full-model efficiency comparisons. These are separate acceptance requirements.
+The shared desktop/CLI grep helper also identifies conservative Python indentation\nand balanced-brace declaration regions. These are lexical bounds, **not** AST\nproof: strings, macros, generated code and unusual grammar may still require a\nreal language parser.\n\n**Outstanding:** parser-backed AST matching for Python/JavaScript/TypeScript and other supported languages, CLI/daemon exposure integration,\nand full-model efficiency comparisons. These are separate acceptance requirements.
