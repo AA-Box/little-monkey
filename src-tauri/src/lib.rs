@@ -268,7 +268,7 @@ pub mod config_revisions;
 // the CLI cannot drift into two different learning behaviours.
 mod login_path;
 mod sessions;
-mod session_mail;
+pub mod session_mail;
 pub mod skill_activation;
 mod skill_activation_commands;
 pub mod skill_learning;
