@@ -114,3 +114,34 @@ The new opt-in `session_broadcast_message` agent tool sends the same bounded not
 These improvements still **do not** implement the daemon's server-managed active-agent directory or automatic file read/edit conflict detection; the SQLite mailbox remains desktop-scoped.
 
 Run `pnpm exec vitest run src/lib/sessionCollaboration.test.ts && pnpm typecheck` and independently verify two desktop processes against the same profile and workspace, a running turn receiving mail after its next model/tool boundary, and crash recovery before/after ack.
+
+## Automatic file-read/edit awareness
+
+A successful desktop `read_file` result now registers the real on-disk SHA-256
+under its enrolled session ID and canonical workspace-contained relative path.
+After a successful `write_file` or `edit_file`, the native observer checks
+up to 24 same-workspace peers with an older read hash. The observation and
+file-change notices commit in one SQLite `IMMEDIATE` transaction with
+per-tool-call idempotency; a crash cannot leave an event recorded without its
+corresponding notices. The existing live safe-point mailbox then shows those
+notices as untrusted data to an executing recipient. It does not follow a
+message as an instruction and does not automatically merge or overwrite files.
+
+This is opt-in and tracks regular files no larger than 8 MiB, for workspaces
+whose local peer sessions are currently registered. A managed agent worktree
+is intentionally excluded: a child worktree cannot masquerade as a reader
+of its parent's original checkout. The tracker never copies file content
+into mailbox messages. The subsystem runs **after** a successful tool call,
+so a failure of optional observation cannot cause re-execution of a write.
+
+**Remaining scope limit:** This is a desktop/native SQLite coordinator shared
+between multiple desktop processes on the machine. It is NOT an authenticated
+network daemon directory and currently does not instrument headless CLI or
+resident daemon agent file tools. An external editor edit also is not observed
+until a Little Monkey file tool publishes a change. A read-versus-write race
+between the original tool and observer hash remains a possible blind spot.
+
+```sh
+pnpm exec vitest run src/lib/sessionCollaboration.test.ts
+cargo test --manifest-path src-tauri/Cargo.toml file_change_notifications_are_atomic_scoped_and_idempotent
+```
