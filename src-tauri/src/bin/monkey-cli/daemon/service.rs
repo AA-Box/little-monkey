@@ -959,8 +959,10 @@ impl<R: CommandRunner> ServiceManager<R> {
                 systemd_environment_escape(&format!("HOME={user_home}")),
                 systemd_escape(&executable),
                 systemd_escape(&self.profile_id),
-                if self.profile_id.starts_with("selfdev-") &&
-                   std::env::var("LITTLE_MONKEY_DAEMON_LIVE_HANDOFF").as_deref()==Ok("1") {
+                if cfg!(target_os="linux") &&
+                   self.profile_id.starts_with("selfdev-") &&
+                   std::fs::read_to_string(paths.root.join(".selfdev-live-handoff"))
+                      .as_deref()==Ok("selfdev-live-handoff-v1\n") {
                     // systemd's default KillMode=control-group would kill
                     // every provider worker when the daemon is replaced.
                     // Only isolated, explicitly opted-in Linux selfdev
