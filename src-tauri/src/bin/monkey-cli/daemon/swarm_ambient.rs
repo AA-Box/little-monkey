@@ -44,6 +44,11 @@ fn schema(store:&DaemonStore)->Result<(),String>{
             ADD COLUMN garden_conflicts_latest INTEGER NOT NULL DEFAULT 0;")
             .map_err(|e|e.to_string())?;
     }
+    if !columns.iter().any(|name|name=="garden_candidates_json") {
+        store.connection.execute_batch("ALTER TABLE swarm_ambient_policies
+            ADD COLUMN garden_candidates_json TEXT NOT NULL DEFAULT '[]';")
+            .map_err(|e|e.to_string())?;
+    }
     Ok(())
 }
 #[derive(Debug)]
@@ -146,7 +151,7 @@ pub fn status(paths:&DaemonPaths)->Result<serde_json::Value,String>{
     schema(&store)?;
     let mut stmt=store.connection.prepare(
         "SELECT id,enabled,epoch,interval_ms,next_wake_ms,pending_job,include_titles,
-                garden_agent_memory,garden_merges_total,garden_conflicts_latest
+                garden_agent_memory,garden_merges_total,garden_conflicts_latest,garden_candidates_json
          FROM swarm_ambient_policies ORDER BY id LIMIT 50"
     ).map_err(|e|e.to_string())?;
     let rows=stmt.query_map([],|r|Ok(serde_json::json!({
@@ -157,6 +162,9 @@ pub fn status(paths:&DaemonPaths)->Result<serde_json::Value,String>{
         "garden_agent_memory":r.get::<_,i64>(7)?!=0,
         "garden_merges_total":r.get::<_,i64>(8)?,
         "garden_conflicts_latest":r.get::<_,i64>(9)?,
+        "garden_evidence_candidates":
+            serde_json::from_str::<serde_json::Value>(&r.get::<_,String>(10)?)
+                .unwrap_or_else(|_|serde_json::json!([])),
     }))).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>()
         .map_err(|e|e.to_string())?;
     Ok(serde_json::json!({"policies":rows}))
@@ -232,12 +240,21 @@ pub fn tick(cli:&crate::Cli,paths:&DaemonPaths,roots:&[PathBuf],config:&DaemonCo
             // contradictions, but do NOT choose which conflicting fact wins.
             let review=little_monkey_lib::memory::garden_conservative_semantic_review_impl(
                 &path,workspace)?;
+            // Independent lexical scorers only flag candidates. Their
+            // evidence manifest is source-turn-bound and contains hashes,
+            // never raw potentially personal memory text. No generated
+            // suggestion can mutate memory without Memory Studio approval.
+            let candidates=little_monkey_lib::memory::garden_evidence_candidates_impl(
+                &path,workspace)?;
+            let evidence=serde_json::to_string(&candidates)
+                .map_err(|e|e.to_string())?;
             let total=(exact+review.merged_groups) as i64;
             store.connection.execute(
                 "UPDATE swarm_ambient_policies
                  SET garden_merges_total=garden_merges_total+?2,
-                     garden_conflicts_latest=?3 WHERE id=?1",
-                params![policy.id,total,review.unresolved_contradictions.len() as i64],
+                     garden_conflicts_latest=?3,
+                     garden_candidates_json=?4 WHERE id=?1",
+                params![policy.id,total,review.unresolved_contradictions.len() as i64,evidence],
             ).map_err(|e|e.to_string())?;
         }
         let (fingerprint,raw)=history(shared,workspace,policy.include_titles)?;
@@ -306,6 +323,25 @@ mod tests{
         assert_eq!(next_interval(MIN_MS,false,true),MIN_MS*2);
         assert_eq!(next_interval(MAX_MS,false,false),MAX_MS);
         assert!(!valid_id("../broken"));
+    }
+    #[test]
+    fn evidence_manifest_schema_is_durable_and_defaults_to_empty(){
+        let root=std::env::temp_dir().join(format!("ambient-proposals-{}",uuid::Uuid::new_v4()));
+        let paths=DaemonPaths::under(&root);paths.ensure().unwrap();
+        {
+            let store=DaemonStore::open(&paths).unwrap();
+            schema(&store).unwrap();
+            store.connection.execute(
+                "INSERT INTO swarm_ambient_policies
+                 (id,frozen_recipe,enabled,include_titles,epoch,last_fingerprint,
+                 interval_ms,next_wake_ms,garden_agent_memory)
+                 VALUES('proposal-01','/unreachable',0,0,0,'',900000,0,1)",[]
+            ).unwrap();
+        }
+        let summary=status(&paths).unwrap();
+        assert_eq!(summary["policies"][0]["garden_evidence_candidates"],
+            serde_json::json!([]));
+        let _=fs::remove_dir_all(root);
     }
     #[test]
     fn read_only_install_is_opt_in_and_persists_across_database_reopen(){
