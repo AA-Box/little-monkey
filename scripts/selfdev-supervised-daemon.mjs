@@ -173,10 +173,25 @@ function upgrade(){
     queuedSessionsPreserved:drained.queued,
     liveSessionHandoff:false,inFlightStreamsTransferred:false};
  }catch(error){
+  // A drain timeout is NOT a crash and must never cause a service install:
+  // reinstalling the old binary here would kill the very active jobs whose
+  // completion we were waiting for. Clear the drain in-place and return.
+  if(!activated && active().active===pointers.active){
+    if(drainStarted){
+      try {daemon(current,identity.profile,'drain','--disable');}
+      catch(unwind){
+        throw Error('UPGRADE ABORTED: '+error.message+
+          '; existing daemon was NOT restarted; failed to clear maintenance drain: '+unwind.message);
+      }
+    }
+    throw Error('UPGRADE ABORTED WITHOUT RESTART: '+error.message);
+  }
   let recovery;
   try{
-   if(activated)manager('rollback','--confirm-rollback');
-   // This restores the old service without queue cancellation.
+   // Even an activation that returned an error might have switched the
+   // pointer before failing. Inspect the durable pointer rather than relying
+   // exclusively on a local boolean.
+   if(active().active!==pointers.active)manager('rollback','--confirm-rollback');
    daemon(current,identity.profile,'install');
    recovery=healthy(current,identity.profile);
    requireHealthy(recovery);
