@@ -137,6 +137,8 @@ function enroll(){
  try{
   daemon(current,profile,'install');
   const observed=healthy(current,profile);
+  if(liveRequested && observed.live_handoff_enabled!==true)
+    fail('Isolated systemd unit does not attest KillMode=process; refusing unsafe live enrollment');
   writeFileSync(managed,JSON.stringify({
    kind:'selfdev-supervisor-v1',profile,agentHome,liveHandoff:liveRequested,
    createdAt:new Date().toISOString(),
@@ -159,7 +161,7 @@ function upgrade(){
    fail('Live upgrade requires a prior enroll --live-handoff; retroactive opt-in cannot preserve existing worker state');
  const baseline=status(current,identity.profile);
  requireHealthy(baseline);
- if(live && (baseline.active<1 ||
+ if(live && (baseline.live_handoff_enabled!==true || baseline.active<1 ||
    !Number.isInteger(baseline.handoff_candidates) ||
    !Number.isInteger(baseline.handoff_attested) ||
    baseline.handoff_candidates<1 ||
@@ -217,7 +219,8 @@ function upgrade(){
     // A real stream was adopted only when a pre-existing PID is STILL alive
     // under the new daemon. A completed job during restart is safe, but is
     // not evidence of in-flight continuity and cannot satisfy this gate.
-    if(!Number.isInteger(observed.handoff_attested) ||
+    if(observed.live_handoff_enabled!==true ||
+       !Number.isInteger(observed.handoff_attested) ||
        observed.handoff_attested<1 ||
        observed.handoff_attested!==observed.handoff_candidates ||
        observed.handoff_attested>drained.handoff_attested ||
