@@ -301,7 +301,7 @@ struct WorkerIdentity {
     start_ticks: u64,
 }
 #[cfg(target_os="linux")]
-fn worker_start_ticks(pid:u32)->Result<Option<u64>,String>{
+pub(super) fn worker_start_ticks(pid:u32)->Result<Option<u64>,String>{
     let content=match std::fs::read_to_string(format!("/proc/{pid}/stat")){
         Ok(content)=>content,
         Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
@@ -1031,6 +1031,9 @@ pub struct DaemonEngine<P, N, C> {
     notifier: N,
     clock: C,
     owner_id: String,
+    /// Only the isolated Linux service installed with KillMode=process may
+    /// leave its executing task workers alive across a daemon replacement.
+    live_handoff: bool,
     active: HashMap<String, ActiveProcess>,
     last_retention_ms: u64,
     /// Jobs whose durable latch asked for `kill` rather than `stop`, so the
@@ -1081,6 +1084,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             notifier,
             clock,
             owner_id,
+            live_handoff: false,
             active: HashMap::new(),
             last_retention_ms: 0,
             immediate_termination: std::collections::HashSet::new(),
@@ -1089,6 +1093,15 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             profile_limits: ProfileLimits::unbounded(),
             preempted: HashMap::new(),
         }
+    }
+
+    /// Enable only for the selfdev-owned Linux systemd service whose unit
+    /// independently guarantees that terminating the daemon never terminates
+    /// the provider worker's process group.
+    #[must_use]
+    pub fn with_live_handoff(mut self,enabled:bool)->Self{
+        self.live_handoff=enabled && cfg!(target_os="linux");
+        self
     }
 
     /// Holds this daemon to the active profile's quota and machine share.
@@ -1291,20 +1304,31 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
     pub fn recover(&mut self) -> Result<(), String> {
         let now = self.clock.now_ms();
         for job in self.store.active_jobs()? {
+            #[cfg(target_os="linux")]
+            if self.live_handoff && job.process_id.is_some() {
+                // This is the SAME child that owns the provider socket. Its
+                // RunLedger events have been durable the whole time. Never
+                // re-invoke the model, shell tools, or recipe on adoption.
+                if let Some(process)=self.process_adapter.adopt(&job,&self.paths)?{
+                    let run_id=job.run_id.as_deref()
+                        .ok_or("Attested running worker has no run ID")?;
+                    let lease=self.shared.take_over_attested_worker_lease(
+                        run_id,&self.owner_id,now,self.config.lease_duration_ms)?;
+                    self.active.insert(job.job_id.clone(),ActiveProcess{process,lease});
+                    continue;
+                }
+            }
             if let Some(process_id) = job.process_id {
-                // A service crash can leave the task child detached. Stop the
-                // whole process group before deciding from durable events;
-                // never run a second copy alongside an orphan.
+                // Old behavior is retained for legacy, dead or unprovable
+                // workers: do not re-execute uncertain external mutations.
                 let _ = self.process_adapter.terminate_orphan(process_id);
             }
             self.reconcile_interrupted(&job, now, "daemon restarted while the run was active")?;
         }
-        // Reservations belong to processes that no longer exist. The loop above
-        // already moved every active job out of an active state, so this is the
-        // belt to that braces: any row still carrying a claim after it is one
-        // nothing released, and holding it would shrink the budget of a daemon
-        // that has nothing running at all.
-        self.store.sweep_stale_reservations()?;
+        // Adopted live workers still hold their original reservations; only
+        // the legacy/crashed jobs above were moved out of an active state.
+        // Never sweep live claims when a verified worker survived.
+        if self.active.is_empty(){self.store.sweep_stale_reservations()?;}
         self.store.set_meta("last_recovery_ms", &now.to_string())?;
         Ok(())
     }
