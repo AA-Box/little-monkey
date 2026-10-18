@@ -66,6 +66,8 @@ jobs:
       - name: Contract and Linux kernel gate for real paired JCode comparison
         if: runner.os == 'Linux'
         run: pnpm test:paired-headless:contract
+      - name: Real-evidence preflight contract (no fabricated evidence)
+        run: pnpm test:semantic-memory-live:contract
 
       - name: Verify native vendor-CLI auth boundary and consent
         if: runner.os == 'Linux'
