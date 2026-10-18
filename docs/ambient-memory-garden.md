@@ -178,3 +178,29 @@ judgment, end-to-end human approval flow surfaced directly from daemon
 candidate IDs, longitudinal real-model quality evaluation, and live daemon
 restart acceptance. The current evidence queue does not by itself satisfy
 those requirements.
+
+## Independent reviewer configuration and observed quality
+
+Memory Studio now requires the operator to choose an explicit second provider
+model with a configured credential. The primary selected model proposes; a
+different provider/model identity independently evaluates the original facts
+in reverse order. Only strictly agreeing candidate identities **and** merge
+summaries are surfaced for human approval. The verifier never receives the
+proposer output. A missing credential, an unselected verifier, or identical
+model identities fails closed. Calls reuse ordinary provider privacy,
+budget and usage accounting.
+
+The app separately records counts of actual proposed, approved and dismissed
+suggestions in local-only storage. No memory contents, IDs, workspace names,
+raw prompts or credentials are retained in the metrics. The UI labels the
+approval fraction as *human agreement among decided suggestions* and does not
+misrepresent it as ground-truth semantic accuracy, precision or recall.
+
+```sh
+pnpm exec vitest run src/lib/semanticMemoryReview.test.ts src/lib/semanticMemoryQuality.test.ts
+pnpm typecheck
+```
+
+Independent quality acceptance still requires a separately curated, consented
+ground-truth set and provider-backed live comparisons. These were not run in
+the repository authoring environment and have no manufactured scores.
