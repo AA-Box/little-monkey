@@ -129,6 +129,11 @@ function enroll(){
  const initial=status(current,profile);
  if(initial.installed||initial.service_running||initial.active||initial.queued)
   fail('An existing service or pending job occupies the isolated identity');
+ if(liveRequested &&
+    (!Object.hasOwn(initial,'handoff_candidates') ||
+     !Object.hasOwn(initial,'handoff_worker_ids') ||
+     !Object.hasOwn(initial,'handoff_adopted_count')))
+   fail('Initial enrolled CLI lacks verified Linux live worker adoption; refusing unsafe service opt-in');
  try{
   daemon(current,profile,'install');
   const observed=healthy(current,profile);
