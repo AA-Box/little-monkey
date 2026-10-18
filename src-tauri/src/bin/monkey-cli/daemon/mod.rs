@@ -534,6 +534,9 @@ struct DaemonStatus {
     waiting_approval: u32,
     paused: u32,
     managed_run_ids: Vec<String>,
+    /// Verifiable task workers, not a promise about unstarted queue entries.
+    handoff_candidates: u32,
+    handoff_attested: u32,
     platform: service::ServicePlatform,
     /// The K8 backpressure signal. Added to *this* payload rather than given its
     /// own command because this is already the thing every producer polls — the
@@ -896,6 +899,8 @@ fn status(json: bool) -> Result<(), String> {
     let mut heartbeat = None;
     let mut pid = None;
     let mut managed_run_ids = Vec::new();
+    let mut handoff_candidates = 0u32;
+    let mut handoff_attested = 0u32;
     let mut held = 0;
     let mut nonterminal = 0;
     // The installed config when there is one, defaults otherwise: an uninstalled
@@ -914,6 +919,11 @@ fn status(json: bool) -> Result<(), String> {
             .get_meta("pid")?
             .and_then(|value| value.parse::<u32>().ok());
         managed_run_ids = store.managed_run_ids(512)?;
+        #[cfg(target_os="linux")]
+        for job in store.active_jobs()? {
+            handoff_candidates += 1;
+            if engine::attested_worker(&paths,&job)?.is_some() {handoff_attested+=1;}
+        }
         for job in store.nonterminal_jobs()? {
             match job.state {
                 JobState::Preparing | JobState::Queued => queued += 1,
@@ -939,6 +949,8 @@ fn status(json: bool) -> Result<(), String> {
         waiting_approval,
         paused,
         managed_run_ids,
+        handoff_candidates,
+        handoff_attested,
         platform: manager.platform(),
         backpressure: scheduler::backpressure(
             kill_switch,
