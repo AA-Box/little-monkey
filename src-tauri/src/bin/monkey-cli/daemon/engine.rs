@@ -341,7 +341,7 @@ fn store_worker_identity(paths:&DaemonPaths,job:&DaemonJob,pid:u32)->Result<(),S
     result
 }
 #[cfg(target_os="linux")]
-pub(super) fn attested_worker(paths:&DaemonPaths,job:&DaemonJob)->Result<Option<u32>,String>{
+pub(super) fn attested_worker(paths:&DaemonPaths,job:&DaemonJob)->Result<Option<(u32,u64)>,String>{
     let pid=match job.process_id{Some(pid)=>pid,None=>return Ok(None)};
     let path=identity_path(paths,&job.job_id);
     let meta=match std::fs::symlink_metadata(&path){
@@ -358,7 +358,7 @@ pub(super) fn attested_worker(paths:&DaemonPaths,job:&DaemonJob)->Result<Option<
     if identity.job_id!=job.job_id||Some(identity.run_id.as_str())!=job.run_id.as_deref()
       ||identity.pid!=pid {return Err("Worker identity does not match durable job".into());}
     let current=worker_start_ticks(pid)?;
-    if current==Some(identity.start_ticks){Ok(Some(pid))}else{Ok(None)}
+    if current==Some(identity.start_ticks){Ok(Some((pid,identity.start_ticks)))}else{Ok(None)}
 }
 /// Reattached POSIX worker is NOT a Child after supervisor restart.
 /// The task itself owns the original provider connection and still publishes
@@ -479,8 +479,9 @@ impl ProcessAdapter for RealProcessAdapter {
         ->Result<Option<Box<dyn ManagedProcess>>,String>{
         #[cfg(target_os="linux")]
         {
-            if let Some(pid)=attested_worker(paths,job)?{
-                let ticks=worker_start_ticks(pid)?.ok_or("Worker died during adoption")?;
+            if let Some((pid,ticks))=attested_worker(paths,job)?{
+                // Reuse only the birth identity that matched the marker;
+                // never adopt a PID using a second, potentially reused birth.
                 return Ok(Some(Box::new(AdoptedProcess{pid,start_ticks:ticks})));
             }
         }
