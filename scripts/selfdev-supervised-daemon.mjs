@@ -219,7 +219,12 @@ function upgrade(){
   return{active:sha,previous:pointers.active,profile:identity.profile,
     servicePid:resumed.pid,accepted:true,drainedActiveJobs:drained.active,
     queuedSessionsPreserved:drained.queued,
-    liveSessionHandoff:live,inFlightStreamsTransferred:live,
+    liveSessionHandoff:live,
+    // The TLS/provider socket stays in the original task process; it does
+    // not get transferred to the replacement daemon.
+    inFlightStreamsTransferred:false,
+    originalProviderWorkerPreserved:live,
+    providerDeltaContinuityMeasured:false,
     attestedActiveWorkers:live?observed.handoff_attested:0};
  }catch(error){
   // A drain timeout is NOT a crash and must never cause a service install:
