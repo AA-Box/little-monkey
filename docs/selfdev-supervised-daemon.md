@@ -108,3 +108,34 @@ acceptance additionally requires a genuine installed Linux user service and
 a slow, streaming model/provider response observed across
 `upgrade-live`. Do not claim this physical acceptance until that real
 measurement has been performed.
+
+## Physical end-to-end provider stream acceptance
+
+Run a genuinely slow, already-started **model-backed** task in the isolated
+live-enabled service. Observe at least two durable `model_delta` events
+before invoking this acceptance command:
+
+```sh
+python3 scripts/selfdev-live-provider-stream-acceptance.py \
+  --root ~/.littlemonkey/selfdev \
+  --run-id REAL_RUNNING_DAEMON_RUN_ID \
+  --candidate-sha SHA256_OF_REVIEWED_CANDIDATE \
+  --out ./private-live-handoff-evidence.json
+```
+
+This command calls `upgrade-live` while the real provider request is active,
+checks the exact original OS worker PID and kernel start identity on both
+sides, verifies that the new daemon adopted it, and reads the **real**
+`run_events` SQLite ledger read-only. It refuses success unless new streamed
+`model_delta` events arrive **after the new daemon became healthy**, the
+original run reaches a terminal event, and no second `started` event was
+produced. It never prints the private provider content, credentials, or
+tool results; the report contains event counts and process metadata only.
+A single failed gate writes no acceptance artifact. The script may initiate
+an approved production-like service upgrade and must only be invoked on an
+operator-controlled selfdev profile.
+
+**Do not equate the simulated OS-process CI test with this physical real-model
+acceptance.** Genuine streaming verification requires running this script
+against a real installed local service and provider; it has not been executed
+on the GitHub-only implementation host.
