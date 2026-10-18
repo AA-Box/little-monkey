@@ -93,7 +93,7 @@ function sessionStatus() {
     // credential files or infer a subscription from an API-key environment.
     // Status output is human-readable and not stable; ambiguous text fails.
     if(/api[ -]?key/i.test(output))return {authenticated:false,code:'API_KEY_SESSION'};
-    if(/not authenticated|not logged in|logged out|login required/i.test(output))
+    if(/unauthenticated|not authenticated|not logged in|logged out|login required/i.test(output))
       return {authenticated:false,code:'SESSION_EXPIRED'};
     if(/authenticated|logged in|signed in/i.test(output))
       return {authenticated:true};
