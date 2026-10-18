@@ -293,7 +293,7 @@ pub async fn run(
                     attached_stacks,
                 ).await;
                 benchmark_turn_event(turn_result.is_ok(), &history);
-                if let Err(error)=turn_result {eprintln!("\\nError: {error}");}
+                if let Err(error)=turn_result {eprintln!("\nError: {error}");}
                 println!();
                 continue;
             }
@@ -339,7 +339,7 @@ pub async fn run(
             attached_stacks,
         ).await;
         benchmark_turn_event(turn_result.is_ok(), &history);
-        if let Err(error)=turn_result {eprintln!("\\nError: {error}");}
+        if let Err(error)=turn_result {eprintln!("\nError: {error}");}
         println!();
     }
 }
