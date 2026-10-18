@@ -51,6 +51,32 @@ process.exit(5);
  writeFileSync(source,content,{mode:0o700});chmodSync(source,0o700);
  return source;
 }
+test('Linux live handoff requires explicit prior enrollment and a proven executing worker',{
+ skip:process.platform!=='linux',
+},()=>{
+ const temp=mkdtempSync(join(tmpdir(),'lm-hot-supervisor-'));
+ const root=join(temp,'managed');
+ try{
+  const source=fake(temp,'LIVE-A',2111),target=fake(temp,'LIVE-B',2112);
+  let out=call(rootScript,'stage','--candidate',source,'--root',root);
+  assert.equal(out.ok,true,out.stderr);
+  const shaA=out.body.sha;
+  out=call(rootScript,'activate','--root',root,'--confirm-sha',shaA);
+  assert.equal(out.ok,true,out.stderr);
+  out=call(rootScript,'stage','--candidate',target,'--root',root);
+  assert.equal(out.ok,true,out.stderr);
+  const shaB=out.body.sha;
+  out=call(supervisor,'enroll','--root',root,'--confirm-sha',shaA,
+    '--live-handoff');
+  assert.equal(out.ok,true,out.stderr);
+  const manifest=JSON.parse(readFileSync(join(root,'.supervised-daemon.json'),'utf8'));
+  assert.equal(manifest.liveHandoff,true);
+  out=call(supervisor,'upgrade-live','--root',root,'--confirm-sha',shaB);
+  assert.equal(out.ok,false,'No real attested worker = NEVER pretend a live transfer');
+  assert.match(out.stderr,/verified original PID\/birth attestation/);
+  assert.equal(call(rootScript,'status','--root',root).body.active,shaA);
+ }finally{rmSync(temp,{recursive:true,force:true});}
+});
 test('supervisor enrolls isolated identity, restarts cold, and rolls back failed candidate',{
  skip:process.platform==='win32',
 },()=>{
