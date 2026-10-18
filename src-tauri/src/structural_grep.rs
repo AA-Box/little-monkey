@@ -108,6 +108,13 @@ fn grammar_ast_declaration(path:&Path,source:&str,line_number:usize)->Option<Val
         "js"|"jsx"|"mjs"|"cjs"=>tree_sitter_javascript::LANGUAGE.into(),
         "ts"=>tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         "tsx"=>tree_sitter_typescript::LANGUAGE_TSX.into(),
+        "go"=>tree_sitter_go::LANGUAGE.into(),
+        "java"=>tree_sitter_java::LANGUAGE.into(),
+        "c"|"h"=>tree_sitter_c::LANGUAGE.into(),
+        "cc"|"cpp"|"hpp"=>tree_sitter_cpp::LANGUAGE.into(),
+        "cs"=>tree_sitter_c_sharp::LANGUAGE.into(),
+        "php"=>tree_sitter_php::LANGUAGE_PHP.into(),
+        "swift"=>tree_sitter_swift::LANGUAGE.into(),
         _=>return None,
     };
     let mut parser=Parser::new();
@@ -126,7 +133,11 @@ fn grammar_ast_declaration(path:&Path,source:&str,line_number:usize)->Option<Val
           "function_declaration"|"generator_function_declaration"|
           "class_declaration"|"method_definition"|
           "interface_declaration"|"type_alias_declaration"|"enum_declaration"|
-          "abstract_class_declaration");
+          "abstract_class_declaration"|"function_definition"|
+          "method_declaration"|"class_specifier"|"struct_specifier"|
+          "interface_declaration"|"type_spec"|"struct_declaration"|
+          "enum_specifier"|"namespace_definition"|
+          "protocol_declaration"|"extension_declaration");
         let is_arrow=kind=="variable_declarator" && current
             .child_by_field_name("value")
             .is_some_and(|value|matches!(value.kind(),
@@ -137,7 +148,22 @@ fn grammar_ast_declaration(path:&Path,source:&str,line_number:usize)->Option<Val
             let end=if end_point.column==0 {end_point.row}
                 else{end_point.row+1};
             if start<=line_number && line_number<=end {
-                let name=current.child_by_field_name("name")
+                // C and C++ place identifiers inside nested declarators;
+                // other grammars usually expose a direct 'name' field.
+                let mut name_node=current.child_by_field_name("name");
+                if name_node.is_none(){
+                    let mut declarator=current.child_by_field_name("declarator");
+                    for _ in 0..12 {
+                        let Some(d)=declarator else{break};
+                        if matches!(d.kind(),"identifier"|"field_identifier"|
+                            "type_identifier"|"qualified_identifier"|"operator_name"){
+                            name_node=Some(d);break;
+                        }
+                        declarator=d.child_by_field_name("declarator")
+                          .or_else(||d.child_by_field_name("name"));
+                    }
+                }
+                let name=name_node
                     .and_then(|node|node.utf8_text(source.as_bytes()).ok())?
                     .trim();
                 if name.is_empty(){return None;}
@@ -230,7 +256,9 @@ pub fn nearest_declaration(path: &Path, source: &str, line_number: usize) -> Opt
         return rust_ast_declaration(source,line_number);
     }
     if matches!(path.extension().and_then(|e|e.to_str()),
-       Some("py"|"js"|"jsx"|"mjs"|"cjs"|"ts"|"tsx")){
+       Some("py"|"js"|"jsx"|"mjs"|"cjs"|"ts"|"tsx"|
+            "go"|"java"|"c"|"h"|"cc"|"cpp"|"hpp"|
+            "cs"|"php"|"swift")){
         return grammar_ast_declaration(path,source,line_number);
     }
     let lines: Vec<&str> = source.lines().collect();
@@ -325,6 +353,20 @@ mod tests {
         assert_eq!(nearest_declaration(Path::new("x.tsx"),tsx,2).unwrap()["name"],"View");
         let unrelated="// function imaginary() {}\nconst count=1;\n";
         assert!(nearest_declaration(Path::new("x.js"),unrelated,2).is_none());
+    }
+
+    #[test]
+    fn additional_grammars_provide_ast_symbol_containment(){
+        let go="package demo\nfunc add(a int,b int) int {\n return a+b\n}\n";
+        assert_eq!(nearest_declaration(Path::new("x.go"),go,3).unwrap()["name"],"add");
+        let java="class Demo {\n int add(int a,int b){\n  return a+b;\n }\n}\n";
+        assert_eq!(nearest_declaration(Path::new("Demo.java"),java,3).unwrap()["name"],"add");
+        let c="int add(int a,int b) {\n return a+b;\n}\n";
+        assert_eq!(nearest_declaration(Path::new("x.c"),c,2).unwrap()["name"],"add");
+        let cpp="int add(int a,int b) {\n return a+b;\n}\n";
+        assert_eq!(nearest_declaration(Path::new("x.cpp"),cpp,2).unwrap()["name"],"add");
+        let cs="class Demo {\n int Add(int a,int b){\n  return a+b;\n }\n}\n";
+        assert_eq!(nearest_declaration(Path::new("Demo.cs"),cs,3).unwrap()["name"],"Add");
     }
 
     #[test]
