@@ -62,7 +62,7 @@ function daemon(binary,profile,...args){
 function status(binary,profile){
  const value=JSON.parse(daemon(binary,profile,'status','--json'));
  for(const key of ['installed','service_running','heartbeat_fresh','active',
-   'queued','waiting_approval','paused','managed_run_ids']){
+   'queued','waiting_approval','paused','managed_run_ids','maintenance_drain']){
   if(!(key in value))fail('Incomplete daemon status missing '+key);
  }
  return value;
@@ -83,12 +83,22 @@ function healthy(binary,profile,oldPid=null){
  }while(Date.now()<deadline);
  fail('Daemon post-restart acceptance did not pass: '+JSON.stringify(last).slice(0,300));
 }
-function requireIdle(value){
+function requireHealthy(value){
  if(value.installed!==true||value.service_running!==true||
-   value.heartbeat_fresh!==true)fail('Previous supervised daemon must be healthy');
- if(value.active!==0||value.queued!==0||value.waiting_approval!==0||
-    value.paused!==0||value.managed_run_ids.length!==0)
-  fail('Active/pending sessions or jobs exist. Live handoff is not verified: update refused.');
+    value.heartbeat_fresh!==true)fail('Supervised daemon must be healthy');
+}
+function drainUntilSafe(binary,profile){
+ daemon(binary,profile,'drain','--enable');
+ const deadline=Date.now()+300000;
+ let last;
+ do{
+  last=status(binary,profile);
+  requireHealthy(last);
+  if(last.maintenance_drain!==true)fail('Daemon has not acknowledged durable maintenance drain');
+  if(last.active===0)return last;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,500);
+ }while(Date.now()<deadline);
+ fail('Active tasks did not finish before the bounded drain deadline; no upgrade performed');
 }
 function acquire(){
  try{mkdirSync(lock,{mode:0o700});}
@@ -132,25 +142,48 @@ function upgrade(){
  if(!pointers.active||pointers.active===sha)
   fail('Update requires an existing healthy previous version and a different candidate SHA');
  const baseline=status(current,identity.profile);
- requireIdle(baseline);
- // Persisted histories and jobs live outside binaries. Refuse active state,
- // then use the daemon's own OS service manager for the cold transition.
- daemon(current,identity.profile,'stop');
+ requireHealthy(baseline);
+ if(baseline.maintenance_drain)fail('An existing maintenance drain needs operator review');
  let activated=false;
+ let drainStarted=false;
  try{
+  // Drain live model work naturally at a durable run boundary. New queued
+  // work stays in SQLite and must NOT be cancelled by 'daemon stop'.
+  drainStarted=true;
+  const drained=drainUntilSafe(current,identity.profile);
+  // Manager activation is atomic; reinstalling the SAME enrolled service
+  // replaces its process without invoking the queue-cancelling Stop command.
   manager('activate','--confirm-sha',sha);
   activated=true;
   daemon(current,identity.profile,'install');
   const observed=healthy(current,identity.profile,baseline.pid);
-  requireIdle(observed);
+  requireHealthy(observed);
+  if(!observed.maintenance_drain||observed.active!==0||
+    observed.queued<drained.queued ||
+    observed.waiting_approval<drained.waiting_approval ||
+    observed.paused<drained.paused)
+   fail('Queued handoff acceptance failed: daemon resumed too early or pending work disappeared');
+  daemon(current,identity.profile,'drain','--disable');
+  const resumed=status(current,identity.profile);
+  requireHealthy(resumed);
+  if(resumed.maintenance_drain)
+    fail('Candidate did not release durable maintenance drain');
   return{active:sha,previous:pointers.active,profile:identity.profile,
-    servicePid:observed.pid,accepted:true,liveSessionHandoff:false};
+    servicePid:resumed.pid,accepted:true,drainedActiveJobs:drained.active,
+    queuedSessionsPreserved:drained.queued,
+    liveSessionHandoff:false,inFlightStreamsTransferred:false};
  }catch(error){
   let recovery;
   try{
    if(activated)manager('rollback','--confirm-rollback');
+   // This restores the old service without queue cancellation.
    daemon(current,identity.profile,'install');
    recovery=healthy(current,identity.profile);
+   requireHealthy(recovery);
+   if(drainStarted)daemon(current,identity.profile,'drain','--disable');
+   recovery=status(current,identity.profile);
+   if(recovery.maintenance_drain)
+    fail('Rollback service did not release maintenance drain');
   }catch(repair){
    throw Error('UPGRADE FAILED: '+error.message+
     '; AUTOMATIC RECOVERY FAILED: '+repair.message+
