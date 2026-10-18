@@ -89,7 +89,11 @@ function requireHealthy(value){
 }
 function drainUntilSafe(binary,profile){
  daemon(binary,profile,'drain','--enable');
- const deadline=Date.now()+300000;
+ const requested=process.env.LM_SELFDEV_DRAIN_TIMEOUT_MS;
+ const timeout=requested===undefined?300000:Number(requested);
+ if(!Number.isInteger(timeout)||timeout<100||timeout>300000)
+  fail('Invalid drain timeout; require 100–300000 milliseconds');
+ const deadline=Date.now()+timeout;
  let last;
  do{
   last=status(binary,profile);
