@@ -73,6 +73,7 @@ try {
     try {
       const signaturePath = join(temporary, 'artifact.minisig');
       const keyPath = join(temporary, 'updater.pub');
+      // Manifest data never selects a write path; both files live in this private temporary directory.
       writeFileSync(signaturePath, signature, { mode: 0o600 });
       writeFileSync(keyPath, publicKey, { mode: 0o600 });
       const result = spawnSync('minisign', ['-Vm', artifact, '-x', signaturePath, '-p', keyPath],

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -77,6 +77,27 @@ test('artifact filename must match the selected release', () => {
     const result = run(manifest(), ['--artifact', artifact]);
     assert.equal(result.status, 1);
     assert.equal(result.output.code, 'ARTIFACT_MISMATCH');
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('network signature cannot choose a file path and temporary files are removed', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lm-updater-write-'));
+  try {
+    const path = join(directory, 'latest.json');
+    const artifact = join(directory, 'Little.Monkey_aarch64.app.tar.gz');
+    const malicious = Buffer.from('untrusted comment: ../../escape\nRWtest\ntrusted comment: timestamp:1\nRWtest\n').toString('base64');
+    writeFileSync(path, JSON.stringify(manifest({ platforms: {
+      'darwin-aarch64': { ...entry, signature: malicious },
+    } })));
+    writeFileSync(artifact, 'invalid artifact');
+    const result = spawnSync(process.execPath, [script, '--platform', 'darwin-aarch64',
+      '--installed-version', '1.9.0', '--manifest-file', path, '--artifact', artifact],
+    { encoding: 'utf8', timeout: 5000, env: { ...process.env, TMPDIR: directory, PATH: '' } });
+    assert.equal(result.status, 1);
+    assert.equal(JSON.parse(result.stderr).code, 'MINISIGN_MISSING');
+    assert.deepEqual(readdirSync(directory).sort(), ['Little.Monkey_aarch64.app.tar.gz', 'latest.json']);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
