@@ -537,6 +537,9 @@ struct DaemonStatus {
     /// Verifiable task workers, not a promise about unstarted queue entries.
     handoff_candidates: u32,
     handoff_attested: u32,
+    handoff_worker_ids: Vec<String>,
+    handoff_adopted_count: u32,
+    handoff_adopted_daemon_pid: Option<u32>,
     platform: service::ServicePlatform,
     /// The K8 backpressure signal. Added to *this* payload rather than given its
     /// own command because this is already the thing every producer polls — the
@@ -901,6 +904,9 @@ fn status(json: bool) -> Result<(), String> {
     let mut managed_run_ids = Vec::new();
     let mut handoff_candidates = 0u32;
     let mut handoff_attested = 0u32;
+    let mut handoff_worker_ids = Vec::new();
+    let mut handoff_adopted_count = 0u32;
+    let mut handoff_adopted_daemon_pid = None;
     let mut held = 0;
     let mut nonterminal = 0;
     // The installed config when there is one, defaults otherwise: an uninstalled
@@ -919,10 +925,19 @@ fn status(json: bool) -> Result<(), String> {
             .get_meta("pid")?
             .and_then(|value| value.parse::<u32>().ok());
         managed_run_ids = store.managed_run_ids(512)?;
+        handoff_adopted_count = store.get_meta("last_live_handoff_adopted_count")?
+           .and_then(|v|v.parse::<u32>().ok()).unwrap_or(0);
+        handoff_adopted_daemon_pid = store.get_meta("last_live_handoff_daemon_pid")?
+           .and_then(|v|v.parse::<u32>().ok());
         #[cfg(target_os="linux")]
         for job in store.active_jobs()? {
             handoff_candidates += 1;
-            if engine::attested_worker(&paths,&job)?.is_some() {handoff_attested+=1;}
+            if let Some(pid)=engine::attested_worker(&paths,&job)? {
+                handoff_attested+=1;
+                let start=engine::worker_start_ticks(pid)?.ok_or(
+                    "Original worker vanished while reporting live handoff")?;
+                handoff_worker_ids.push(format!("{}:{pid}:{start}",job.job_id));
+            }
         }
         for job in store.nonterminal_jobs()? {
             match job.state {
@@ -951,6 +966,9 @@ fn status(json: bool) -> Result<(), String> {
         managed_run_ids,
         handoff_candidates,
         handoff_attested,
+        handoff_worker_ids,
+        handoff_adopted_count,
+        handoff_adopted_daemon_pid,
         platform: manager.platform(),
         backpressure: scheduler::backpressure(
             kill_switch,
