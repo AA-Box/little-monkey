@@ -1978,6 +1978,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(target_os="linux")]
     #[test]
     fn linux_live_handoff_systemd_manifest_is_stable_from_durable_opt_in(){
         let base=std::env::temp_dir().join(format!("lm-systemd-live-{}",
