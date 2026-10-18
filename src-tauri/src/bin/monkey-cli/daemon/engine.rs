@@ -282,6 +282,113 @@ pub trait ProcessAdapter: Send + Sync {
         paths: &DaemonPaths,
     ) -> Result<Box<dyn ManagedProcess>, String>;
     fn terminate_orphan(&self, process_id: u32) -> Result<(), String>;
+    /// Only an attested original process may be adopted. A test/fake or
+    /// unsupported platform must NEVER pretend a worker survived.
+    fn adopt(
+        &self, _job: &DaemonJob, _paths: &DaemonPaths,
+    ) -> Result<Option<Box<dyn ManagedProcess>>, String> { Ok(None) }
+}
+
+/// PID reuse protection: immutable proc start ticks (Linux boot-relative)
+/// plus durable job/run identity written before the daemon publishes its PID.
+/// The marker is NEVER a credential or an executable instruction.
+#[cfg(target_os="linux")]
+#[derive(serde::Serialize,serde::Deserialize)]
+struct WorkerIdentity {
+    job_id: String,
+    run_id: String,
+    pid: u32,
+    start_ticks: u64,
+}
+#[cfg(target_os="linux")]
+fn worker_start_ticks(pid:u32)->Result<Option<u64>,String>{
+    let content=match std::fs::read_to_string(format!("/proc/{pid}/stat")){
+        Ok(content)=>content,
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+        Err(error)=>return Err(format!("Could not inspect managed PID: {error}")),
+    };
+    // The comm field is parentheses-delimited and may itself contain spaces.
+    let fields=content.rsplit_once(") ")
+        .ok_or("Invalid /proc PID format")?.1.split_whitespace().collect::<Vec<_>>();
+    if fields.len()<=19{return Err("Incomplete /proc PID start identity".into());}
+    if matches!(fields[0],"Z"|"X"|"x"){return Ok(None);}
+    let ticks=fields[19].parse::<u64>()
+       .map_err(|_|"Invalid /proc PID start ticks".to_string())?;
+    Ok(Some(ticks))
+}
+#[cfg(target_os="linux")]
+fn identity_path(paths:&DaemonPaths,job_id:&str)->std::path::PathBuf{
+    paths.logs.join(format!("{job_id}.handoff.json"))
+}
+#[cfg(target_os="linux")]
+fn store_worker_identity(paths:&DaemonPaths,job:&DaemonJob,pid:u32)->Result<(),String>{
+    let ticks=worker_start_ticks(pid)?.ok_or("Managed child exited before handoff marker")?;
+    let identity=WorkerIdentity{job_id:job.job_id.clone(),
+      run_id:job.run_id.clone().ok_or("Missing run id for handoff")?,pid,start_ticks:ticks};
+    let path=identity_path(paths,&job.job_id);
+    let tmp=paths.logs.join(format!("{}.{}.tmp",job.job_id,uuid::Uuid::new_v4()));
+    let result=(||{
+        use std::io::Write;
+        let mut file=std::fs::OpenOptions::new().create_new(true).write(true)
+           .open(&tmp).map_err(|e|e.to_string())?;
+        super::store::restrict_file(&tmp)?;
+        file.write_all(&serde_json::to_vec(&identity).map_err(|e|e.to_string())?)
+          .map_err(|e|e.to_string())?;
+        file.sync_all().map_err(|e|e.to_string())?;
+        std::fs::rename(&tmp,&path).map_err(|e|e.to_string())
+    })();
+    if result.is_err(){let _=std::fs::remove_file(&tmp);}
+    result
+}
+#[cfg(target_os="linux")]
+fn attested_worker(paths:&DaemonPaths,job:&DaemonJob)->Result<Option<u32>,String>{
+    let pid=match job.process_id{Some(pid)=>pid,None=>return Ok(None)};
+    let path=identity_path(paths,&job.job_id);
+    let meta=match std::fs::symlink_metadata(&path){
+       Ok(meta)=>meta,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+       Err(error)=>return Err(format!("Could not inspect handoff marker: {error}")),
+    };
+    if !meta.is_file()||meta.file_type().is_symlink(){
+        return Err("Refusing non-regular worker identity marker".into());
+    }
+    let bytes=std::fs::read(&path).map_err(|e|e.to_string())?;
+    if bytes.len()>4096{return Err("Oversized worker identity marker".into());}
+    let identity:WorkerIdentity=serde_json::from_slice(&bytes)
+        .map_err(|e|format!("Malformed worker identity marker: {e}"))?;
+    if identity.job_id!=job.job_id||Some(identity.run_id.as_str())!=job.run_id.as_deref()
+      ||identity.pid!=pid {return Err("Worker identity does not match durable job".into());}
+    let current=worker_start_ticks(pid)?;
+    if current==Some(identity.start_ticks){Ok(Some(pid))}else{Ok(None)}
+}
+/// Reattached POSIX worker is NOT a Child after supervisor restart.
+/// The task itself owns the original provider connection and still publishes
+/// its RunLedger events; the daemon only regains monitoring/signalling.
+#[cfg(target_os="linux")]
+struct AdoptedProcess { pid:u32,start_ticks:u64 }
+#[cfg(target_os="linux")]
+impl ManagedProcess for AdoptedProcess {
+    fn id(&self)->u32{self.pid}
+    fn try_wait(&mut self)->Result<Option<i32>,String>{
+        match worker_start_ticks(self.pid)?{
+            Some(ticks) if ticks==self.start_ticks=>Ok(None),
+            _=>Ok(Some(1)), // Terminal truth comes from the durable run ledger.
+        }
+    }
+    fn signal(&mut self,signal:ProcessSignal)->Result<(),String>{
+        if worker_start_ticks(self.pid)?!=Some(self.start_ticks){
+           return Err("Reattached worker identity changed; refusing to signal reused PID".into());
+        }
+        match signal{
+           ProcessSignal::Pause=>little_monkey_lib::os_signal::suspend_process_group(self.pid),
+           ProcessSignal::Resume=>little_monkey_lib::os_signal::resume_process_group(self.pid),
+           ProcessSignal::Terminate=>terminate_process_group(self.pid),
+           ProcessSignal::Kill=>kill_process_group(self.pid),
+        }
+    }
+    fn memory_bytes(&self)->Result<Option<u64>,String>{
+        if worker_start_ticks(self.pid)?!=Some(self.start_ticks){return Ok(None);}
+        process_memory_bytes(self.pid)
+    }
 }
 
 pub struct RealProcessAdapter {
@@ -349,14 +456,37 @@ impl ProcessAdapter for RealProcessAdapter {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|error| format!("Failed to launch daemon task child: {error}"))?;
+        // Only opt-in Linux live handoff requires a recoverable birth identity.
+        // Persist BEFORE the scheduler marks the new child as running.
+        #[cfg(target_os="linux")]
+        if std::env::var("LITTLE_MONKEY_DAEMON_LIVE_HANDOFF").as_deref()==Ok("1"){
+            if let Err(error)=store_worker_identity(paths,job,child.id()){
+                let _=terminate_process_group(child.id());
+                let _=child.wait();
+                return Err(error);
+            }
+        }
         Ok(Box::new(RealManagedProcess { child }))
     }
 
     fn terminate_orphan(&self, process_id: u32) -> Result<(), String> {
         terminate_process_group(process_id)
+    }
+    fn adopt(&self,job:&DaemonJob,paths:&DaemonPaths)
+        ->Result<Option<Box<dyn ManagedProcess>>,String>{
+        #[cfg(target_os="linux")]
+        {
+            if let Some(pid)=attested_worker(paths,job)?{
+                let ticks=worker_start_ticks(pid)?.ok_or("Worker died during adoption")?;
+                return Ok(Some(Box::new(AdoptedProcess{pid,start_ticks:ticks})));
+            }
+        }
+        #[cfg(not(target_os="linux"))]
+        let _=(job,paths);
+        Ok(None)
     }
 }
 
