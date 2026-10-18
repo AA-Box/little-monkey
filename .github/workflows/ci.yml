@@ -70,6 +70,8 @@ jobs:
       - name: Verify native vendor-CLI auth boundary and consent
         if: runner.os == 'Linux'
         run: pnpm test:native-auth:contract
+      - name: Real-evidence preflight contract (no fabricated evidence)
+        run: pnpm test:real-agent-exports:contract
 
       - name: Contract-check real-task concurrency and independent oracle (mock CLI only)
         run: pnpm test:swarm-headless:contract
