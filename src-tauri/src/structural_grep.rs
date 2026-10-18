@@ -176,12 +176,12 @@ mod tests {
 
     #[test]
     fn bounded_regions_respect_python_dedent_and_rust_braces() {
-        let rust="fn earlier() {\\n let here = 1;\\n}\\nfn later() {\\n let inside = 2;\\n}\\n";
+        let rust="fn earlier() {\n let here = 1;\n}\nfn later() {\n let inside = 2;\n}\n";
         let in_later=nearest_declaration(Path::new("lib.rs"),rust,5).unwrap();
         assert_eq!(in_later["name"],"later");
         assert_eq!(in_later["region"]["start_line"],4);
         assert_eq!(in_later["region"]["end_line"],6);
-        let python="def one():\\n  return 1\\ndef two():\\n  value = 2\\n  return value\\n";
+        let python="def one():\n  return 1\ndef two():\n  value = 2\n  return value\n";
         let in_two=nearest_declaration(Path::new("main.py"),python,5).unwrap();
         assert_eq!(in_two["name"],"two");
         assert_eq!(in_two["region"]["method"],"python_indentation");
