@@ -256,6 +256,10 @@ def measure(monkey: str, jcode: str, model: str, provider: str, cwd: str,
                     thread.join(timeout + 10)
                 if errors or any(value is None for value in outcomes) or any(thread.is_alive() for thread in threads):
                     raise RuntimeError(f"{name} turn {index} failed: " + "; ".join(errors[:3]))
+                if name == "monkey" and index == len(TURNS) and any(
+                    result.get("answer_is_done") is not True for result in outcomes
+                ):
+                    raise RuntimeError("Little Monkey final model reply did not match the required terminal marker")
                 time.sleep(.5)
                 row = {"turn": index, "pss_kb": process_tree_pss_kb(roots)}
                 if name == "monkey":
@@ -269,6 +273,11 @@ def measure(monkey: str, jcode: str, model: str, provider: str, cwd: str,
                     session = json.loads(server.command("history", ident, timeout=30))
                     if not isinstance(session, list) or len(session) < 5:
                         raise RuntimeError("JCode did not preserve a real five-turn history")
+                    evidence = json.dumps(session, ensure_ascii=False)
+                    if not any(token in evidence for token in ('"tool_use"', '"ToolUse"', '"tool_calls"')):
+                        raise RuntimeError("JCode completed no detectable real tool calls")
+                    if server.command("last_response", ident, timeout=30).strip().lower() != "done":
+                        raise RuntimeError("JCode final model reply did not match terminal marker")
             out[name] = {"samples": samples,
                          "peak_pss_kb": max(row["pss_kb"] for row in samples)}
         finally:
