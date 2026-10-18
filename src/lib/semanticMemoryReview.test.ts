@@ -44,7 +44,7 @@ describe('untrusted semantic memory candidate validation',()=>{
    {kind:'contradiction',ids:['a','c'],reason:'Different requests'},
   ]},facts);
   const verifier=validateSemanticReview({proposals:[
-   {kind:'merge',ids:['b','a'],suggestedText:'Concise output preferred.',
+   {kind:'merge',ids:['b','a'],suggestedText:' USER LIKES CONCISE SUMMARIES. ',
     reason:'Same enduring claim'},
    {kind:'merge',ids:['a','c'],suggestedText:'Conflicting claims',
     reason:'Improper merge'},
@@ -53,6 +53,10 @@ describe('untrusted semantic memory candidate validation',()=>{
   expect(shared).toHaveLength(1);
   expect(shared[0].kind).toBe('merge');
   expect(shared[0].ids).toEqual(['a','b']);
+  const unsafe=verifier.map(item=>item.kind==='merge'&&item.ids.includes('b')
+   ? {...item,suggestedText:'Different meaning entirely.'} : item);
+  expect(intersectIndependentSemanticReviews(proposer,unsafe)).toEqual([]);
+
   expect(intersectIndependentSemanticReviews(proposer,[])).toEqual([]);
  });
  it('rejects forged IDs, cross-workspace and user-pinned/disabled fact edits',()=>{
