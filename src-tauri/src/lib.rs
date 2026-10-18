@@ -1518,6 +1518,7 @@ pub fn run() {
             session_mail::session_mail_send,
             session_mail::session_mail_pending,
             session_mail::session_mail_ack,
+            session_mail::session_mail_file_activity,
             profiles::profiles_list,
             profiles::profiles_create,
             profiles::profiles_rename,
