@@ -3317,7 +3317,9 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
         SystemClock,
         owner_id,
     )
-    .with_profile_limits(profile_limits);
+    .with_profile_limits(profile_limits)
+    .with_live_handoff(roots.profile_id.starts_with("selfdev-") &&
+       std::env::var("LITTLE_MONKEY_DAEMON_LIVE_HANDOFF").as_deref()==Ok("1"));
     engine.recover()?;
     reap_dead_workflow_hosts(&engine.shared);
     // One machine-wide desktop-control runtime, shared with the remote API so
