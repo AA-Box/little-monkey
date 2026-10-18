@@ -8,7 +8,7 @@
 import {existsSync,mkdirSync,readFileSync,writeFileSync,rmSync,lstatSync,readlinkSync} from 'node:fs';
 import {homedir} from 'node:os';
 import {join,resolve,basename} from 'node:path';
-import {randomUUID} from 'node:crypto';
+import {randomUUID,createHash} from 'node:crypto';
 import {spawnSync} from 'node:child_process';
 
 const argv=process.argv.slice(2),command=argv[0];
@@ -167,6 +167,8 @@ function upgrade(){
    const candidate=join(root,'versions',sha,'monkey-cli');
    if(!existsSync(candidate)||lstatSync(candidate).isSymbolicLink())
      fail('Cannot live-upgrade to a missing or symlinked approved binary');
+   if(createHash('sha256').update(readFileSync(candidate)).digest('hex')!==sha)
+     fail('Candidate binary digest changed after review; refusing to execute it');
    const compatible=status(candidate,identity.profile);
    const fields=['handoff_candidates','handoff_attested','handoff_worker_ids',
      'handoff_adopted_count','handoff_adopted_daemon_pid'];
