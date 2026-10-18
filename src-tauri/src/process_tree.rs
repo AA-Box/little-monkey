@@ -1167,11 +1167,23 @@ mod tests {
         // The other half of an ownership record, taken here rather than in a
         // test of its own so the suite spawns no extra process: a live child is
         // named by *its* program, not by the caller's.
-        let named = process_image_path(child.id()).expect("a live child is named");
-        assert!(
-            named.ends_with("sleep"),
-            "the program the pid is running, not this test binary: {named}"
-        );
+        // spawn returns before the child has necessarily replaced the forked test image.
+        let mut named = process_image_path(child.id());
+        for _ in 0..200 {
+            if named.as_deref().is_some_and(|path| path.ends_with("sleep")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            named = process_image_path(child.id());
+        }
+        if !named.as_deref().is_some_and(|path| path.ends_with("sleep")) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the program the pid is running, not this test binary: {}",
+                named.as_deref().unwrap_or("<unavailable>")
+            );
+        }
         child.kill().expect("kill");
         // Deliberately not reaped yet: this is the zombie window.
         for _ in 0..200 {
