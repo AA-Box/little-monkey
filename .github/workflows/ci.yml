@@ -63,6 +63,10 @@ jobs:
         if: runner.os == 'Linux'
         run: pnpm test:selfdev:contract
 
+      - name: Verify native vendor-CLI auth boundary and consent
+        if: runner.os == 'Linux'
+        run: pnpm test:native-auth:contract
+
       - name: Contract-check real-task concurrency and independent oracle (mock CLI only)
         run: pnpm test:swarm-headless:contract
 
@@ -178,6 +182,9 @@ jobs:
         # Linux and macOS ZIP runtime assets require `unzip`; GNU tar rejects
         # them. Keep the platform-specific selector covered before release.
         run: pnpm test:runtime-archive
+
+      - name: Signed updater dependency and release contract
+        run: pnpm test:updater-security
 
   rust-tests:
     # Real per-OS compilation + test coverage for `#[cfg(target_os = ...)]`
