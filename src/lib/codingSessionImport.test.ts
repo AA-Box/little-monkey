@@ -71,6 +71,28 @@ describe("resumable coding-session parsing",()=>{
     expect(JSON.stringify(parsed)).not.toMatch(/private|a secret/);
   });
 
+  it("imports Cursor CLI stream-json once, excluding tool output and credentials",()=>{
+    const parsed=parseCodingSession(jsonl([
+      {type:"system",subtype:"init",session_id:"cursor-1",apiKeySource:"login",cwd:"/secret/project"},
+      {type:"user",session_id:"cursor-1",message:{role:"user",content:[{type:"text",text:"Fix tests"}]}},
+      {type:"assistant",session_id:"cursor-1",message:{role:"assistant",content:[{type:"text",text:"I will "}]}},
+      {type:"tool_call",session_id:"cursor-1",subtype:"completed",tool_call:{readToolCall:{result:{success:{content:"sensitive token"}}}}},
+      {type:"assistant",session_id:"cursor-1",message:{role:"assistant",content:[{type:"text",text:"fix tests."}]}},
+      {type:"result",subtype:"success",is_error:false,session_id:"cursor-1",result:"I will fix tests."}
+    ]))!;
+    expect(parsed.format).toBe("cursor");
+    expect(parsed.messages.map(m=>m.content)).toEqual(["Fix tests","I will fix tests."]);
+    expect(JSON.stringify(parsed)).not.toMatch(/sensitive token|\/secret\/project|login/);
+  });
+
+  it("rejects Cursor CLI failed or mixed-session transcripts",()=>{
+    const init={type:"system",subtype:"init",session_id:"one"};
+    const user={type:"user",session_id:"one",message:{role:"user",content:"Hi"}};
+    expect(parseCodingSession(jsonl([init,user,{type:"result",session_id:"one",subtype:"error",is_error:true}]))).toBeNull();
+    expect(parseCodingSession(jsonl([init,user,{type:"assistant",session_id:"two",message:{role:"assistant",content:"Other"}}]))).toBeNull();
+    expect(parseCodingSession(jsonl([{type:"result",subtype:"success",result:"Unpaired output"}]))).toBeNull();
+  });
+
   it("rejects unsupported and truncated formats without silently dropping events",()=>{
     expect(parseCodingSession("{}")).toBeNull();
     expect(parseCodingSession("")).toBeNull();
