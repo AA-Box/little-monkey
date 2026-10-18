@@ -27,7 +27,8 @@ if(args.includes('daemon')&&args.includes('status')){
  const value=fs.existsSync(state)?JSON.parse(fs.readFileSync(state,'utf8')):null;
  console.log(JSON.stringify({installed:!!value,service_running:!!value,
  heartbeat_fresh:!!value,pid:value?.pid??null,
- active:value?.active??0,queued:value?.queued??0,paused:0,waiting_approval:0,\n maintenance_drain:value?.drain??false,managed_run_ids:[]}));
+ active:value?.active??0,queued:value?.queued??0,paused:0,waiting_approval:0,\n maintenance_drain:value?.drain??false,managed_run_ids:[]
+ ${label.startsWith('LIVE')?',handoff_candidates:value?.handoff_candidates??0,handoff_attested:value?.handoff_attested??0,handoff_worker_ids:value?.handoff_worker_ids??[],handoff_adopted_count:0,handoff_adopted_daemon_pid:null':''}}));
  process.exit(0);
 }
 if(args.includes('daemon')&&args.includes('install')){
