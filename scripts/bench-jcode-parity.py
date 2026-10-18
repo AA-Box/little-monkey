@@ -8,6 +8,7 @@ remote model/provider, and access to /proc/*/smaps_rollup.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -236,7 +237,12 @@ def measure(monkey: str, jcode: str, model: str, provider: str, cwd: str,
                 agent_ids = []
                 for _ in range(sessions):
                     ident = json.loads(server.command("create_session:" + cwd, timeout=120))["session_id"]
-                    server.command("set_model:" + model, ident, timeout=60)
+                    selected = json.loads(server.command("set_model:" + model, ident, timeout=60))
+                    state = json.loads(server.command("state", ident, timeout=60))
+                    if selected.get("model") != model or state.get("model") != model:
+                        raise RuntimeError("JCode active runtime model differs from requested exact model")
+                    if selected.get("provider") != provider or state.get("provider") != provider:
+                        raise RuntimeError("JCode active provider differs from Little Monkey provider")
                     agent_ids.append(ident)
             time.sleep(.5)
             samples = [{"turn": 0, "pss_kb": process_tree_pss_kb(roots)}]
@@ -256,6 +262,11 @@ def measure(monkey: str, jcode: str, model: str, provider: str, cwd: str,
                     thread.join(timeout + 10)
                 if errors or any(value is None for value in outcomes) or any(thread.is_alive() for thread in threads):
                     raise RuntimeError(f"{name} turn {index} failed: " + "; ".join(errors[:3]))
+                if name == "jcode":
+                    for ident in agent_ids:
+                        state = json.loads(server.command("state", ident, timeout=30))
+                        if state.get("provider") != provider or state.get("model") != model:
+                            raise RuntimeError("JCode changed model/provider during benchmark; invalid trial")
                 if name == "monkey" and index == len(TURNS) and any(
                     result.get("answer_is_done") is not True for result in outcomes
                 ):
@@ -307,9 +318,20 @@ def main() -> None:
         raise SystemExit("Turn timeout must be at least 30 seconds")
     monkey = require_binary(args.monkey)
     jcode = require_binary(args.jcode)
-    results = {"schema": 1, "model": args.model, "provider": args.provider,
+    def executable_proof(binary):
+        path = Path(binary).resolve(strict=True)
+        return {"executable": str(path),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "version": subprocess.run([str(path), "--version"], capture_output=True,
+                                          text=True, timeout=20, check=True).stdout.strip()[:200]}
+    results = {"schema": 2, "model": args.model, "provider": args.provider,
                "workload": list(TURNS), "hardware": os.uname().machine,
-               "linux_kernel": os.uname().release, "runs": []}
+               "linux_kernel": os.uname().release,
+               "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+               "executables": {"monkey": executable_proof(monkey),
+                               "jcode": executable_proof(jcode)},
+               "model_evidence": "JCode set_model and state checked per real session and turn; Little Monkey CLI locked by --provider and explicit model",
+               "runs": []}
     with tempfile.TemporaryDirectory(prefix="little-monkey-jcode-parity-") as temporary:
         directory = Path(temporary)
         for repeat in range(2):
