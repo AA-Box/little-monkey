@@ -77,8 +77,8 @@ impl LocalPeerRun {
             }
             completed.push(peer.id.clone());
         }
-        Ok(json!({"persisted":true,"recipients":completed,
-            "count":completed.len()}).to_string())
+        let count=completed.len();
+        Ok(json!({"persisted":true,"recipients":completed,"count":count}).to_string())
     }
 
     pub fn record_file(&self,tool:&str,path:&str,tool_call_id:&str)
@@ -148,6 +148,30 @@ pub fn send_tool_definition()->Value{
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]
+    fn real_sqlite_backed_local_direct_and_broadcast_are_durable_and_idempotent(){
+        let parent=std::env::temp_dir().join(format!("lm-resident-peers-{}",
+            uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let workspace=parent.to_string_lossy().to_string();
+        let db=parent.join("peers.sqlite");
+        let a=LocalPeerRun{path:db.clone(),session_id:"run-a".into(),
+            workspace:workspace.clone()};
+        let b=LocalPeerRun{path:db.clone(),session_id:"run-b".into(),
+            workspace:workspace.clone()};
+        a.refresh().unwrap();
+        b.refresh().unwrap();
+        let one=a.send("Please re-read the file",Some("run-b"),false,"tool-1").unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&one).unwrap()["count"],1);
+        let retry=a.send("Please re-read the file",Some("run-b"),false,"tool-1").unwrap();
+        assert_eq!(retry,one);
+        assert_eq!(session_mail::pending_impl(&db,"run-b",&workspace,10).unwrap().len(),1);
+        let all=a.send("Update from run A",None,true,"tool-2").unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&all).unwrap()["count"],1);
+        assert_eq!(session_mail::pending_impl(&db,"run-b",&workspace,10).unwrap().len(),2);
+        assert!(a.send("exfiltrate",Some("foreign"),false,"tool-3").is_err());
+        let _=std::fs::remove_dir_all(parent);
+    }
     #[test]
     fn native_tool_definition_never_promises_remote_or_permission_grants(){
         let tool=send_tool_definition();
