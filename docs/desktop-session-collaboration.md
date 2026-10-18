@@ -136,8 +136,8 @@ so a failure of optional observation cannot cause re-execution of a write.
 
 **Remaining scope limit:** This is a desktop/native SQLite coordinator shared
 between multiple desktop processes on the machine. It is NOT an authenticated
-network daemon directory and currently does not instrument headless CLI or
-resident daemon agent file tools. An external editor edit also is not observed
+network daemon directory. Headless daemon agents participate only when the
+separate resident-process opt-in is explicitly configured (see below). An external editor edit also is not observed
 until a Little Monkey file tool publishes a change. A read-versus-write race
 between the original tool and observer hash remains a possible blind spot.
 
