@@ -100,26 +100,53 @@ export function validateSemanticReview(
  return accepted;
 }
 
+/** Only separately produced review decisions that independently agree on
+ * identity, scope and change kind may reach Memory Studio approval. A model
+ * cannot confirm itself by echoing its first response: the two requests see
+ * only the original facts, in opposite order, and do not see each other. */
+export function intersectIndependentSemanticReviews(
+ first:readonly SemanticReviewProposal[],
+ second:readonly SemanticReviewProposal[],
+):SemanticReviewProposal[]{
+ const signature=(p:SemanticReviewProposal)=>
+  JSON.stringify([p.scopeKey,p.kind,[...p.ids].sort()]);
+ const agreement=new Set(second.map(signature));
+ return first.filter(proposal=>agreement.has(signature(proposal)));
+}
+
 export async function requestSemanticMemoryReview(
  facts:readonly MemoryEntry[],
 ):Promise<SemanticReviewProposal[]>{
- const messages=buildSemanticReviewPrompt(facts);
+ const approved=reviewEligibleFacts(facts);
  const target=await resolveTarget();
- const controller=new AbortController();
- const timeout=setTimeout(()=>controller.abort(),60_000);
- try{
-  // No model tools or effects; cloud requests pass through the exact same
-  // privacy firewall/cost gate/usage attribution as an ordinary turn.
-  const result=await attemptStream(
-   target,messages,[],controller.signal,effortForTarget(target),
-   useSessionStore.getState().activeSessionId??'memory-studio-review',
-   undefined,false,1100,undefined,false,
-  );
-  if(controller.signal.aborted)throw Error('Memory review model request timed out');
-  if(result.streamError!==null||result.toolCalls.length>0)
-   throw Error(result.streamError??'Memory review model returned tool calls');
-  if(result.content.length>MAX_RESPONSE)throw Error('Model review response exceeded byte cap');
-  const body=result.content.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'');
-  return validateSemanticReview(JSON.parse(body),facts);
- }finally{clearTimeout(timeout);}
+ const sessionId=useSessionStore.getState().activeSessionId??'memory-studio-review';
+ const invokeReview=async (items:readonly MemoryEntry[],kind:'proposer'|'verifier')=>{
+  const messages=buildSemanticReviewPrompt(items);
+  if(kind==='verifier'){
+   messages[0]={...messages[0],content:messages[0].content+
+    '\\nIndependent verification: assess each input claim from scratch. You do not have access to any first review. Report no change if uncertain. Reject contradictions based only on differing preferences that could coexist.'};
+  }
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),60_000);
+  try{
+   const result=await attemptStream(
+    target,messages,[],controller.signal,effortForTarget(target),
+    sessionId,undefined,false,1100,undefined,false,
+   );
+   if(controller.signal.aborted)throw Error('Independent memory review request timed out');
+   if(result.streamError!==null||result.toolCalls.length>0)
+    throw Error(result.streamError??'Memory review model returned tool calls');
+   if(result.content.length>MAX_RESPONSE)
+    throw Error('Memory review response exceeded byte cap');
+   const body=result.content.trim().replace(/^\`\`\`(?:json)?\\s*/i,'').replace(/\\s*\`\`\`$/,'');
+   return validateSemanticReview(JSON.parse(body),approved);
+  }finally{clearTimeout(timeout);}
+ };
+ // Both independently initiated completions must succeed: a failed verifier
+ // never turns unchecked proposals into approved candidates. This doubles
+ // provider requests, usage and costs; the explicit Review action opts in.
+ const first=await invokeReview(approved,'proposer');
+ if(first.length===0)return[];
+ const second=await invokeReview([...approved].reverse(),'verifier');
+ return intersectIndependentSemanticReviews(first,second);
 }
