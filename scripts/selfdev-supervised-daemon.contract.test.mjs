@@ -70,6 +70,24 @@ test('supervisor enrolls isolated identity, restarts cold, and rolls back failed
   assert.equal(r.ok,true,r.stderr);
   assert.match(r.body.profile,/^selfdev-[a-f0-9]{16}$/);
   assert.equal(r.body.servicePid,1201);
+  // A timeout while a model job is active must NEVER stop or reinstall the
+  // old service. This tests the load-bearing no-loss failure path.
+  const daemonState=join(root,'supervised-agent-home','test-daemon-installed.json');
+  const running=JSON.parse(readFileSync(daemonState,'utf8'));
+  writeFileSync(daemonState,JSON.stringify({...running,active:1}));
+  process.env.LM_SELFDEV_DRAIN_TIMEOUT_MS='120';
+  try {
+    r=call(supervisor,'upgrade','--root',root,'--confirm-sha',shaB);
+    assert.equal(r.ok,false);
+    assert.match(r.stderr,/ABORTED WITHOUT RESTART/);
+    assert.match(r.stderr,/Active tasks did not finish/);
+    const untouched=JSON.parse(readFileSync(daemonState,'utf8'));
+    assert.equal(untouched.pid,1201);
+    assert.equal(untouched.active,1);
+    assert.equal(untouched.drain,false);
+    assert.equal(call(rootScript,'status','--root',root).body.active,shaA);
+  } finally {delete process.env.LM_SELFDEV_DRAIN_TIMEOUT_MS;}
+  writeFileSync(daemonState,JSON.stringify({...running,active:0,drain:false}));
   r=call(supervisor,'upgrade','--root',root,'--confirm-sha',shaB);
   assert.equal(r.ok,true,r.stderr);
   assert.equal(r.body.servicePid,1202);
