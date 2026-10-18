@@ -34,6 +34,67 @@ fn has_supported_extension(path: &Path) -> bool {
     )
 }
 
+/// Parse complete Rust source with `syn` before attributing any match to a
+/// declaration. Unlike a preceding-line guess this excludes unrelated items
+/// and selects the narrowest true AST ancestor, including methods.
+fn rust_ast_declaration(source:&str,line_number:usize)->Option<Value>{
+    use syn::spanned::Spanned;
+    use syn::visit::{self,Visit};
+    struct Finder {line:usize,choice:Option<(usize,usize,String,String)>}
+    impl Finder {
+        fn consider(&mut self,start:usize,end:usize,kind:&str,name:String){
+            if start==0 || start>self.line || end<self.line{return;}
+            let smaller=self.choice.as_ref().is_none_or(|(a,b,_,_)|
+                end.saturating_sub(start)<b.saturating_sub(*a));
+            if smaller {self.choice=Some((start,end,kind.to_string(),name));}
+        }
+    }
+    impl<'ast> Visit<'ast> for Finder {
+        fn visit_item_fn(&mut self,item:&'ast syn::ItemFn){
+            self.consider(item.sig.fn_token.span.start().line,
+                item.block.brace_token.span.close().end().line,
+                "fn",item.sig.ident.to_string());
+            visit::visit_item_fn(self,item);
+        }
+        fn visit_impl_item_fn(&mut self,item:&'ast syn::ImplItemFn){
+            self.consider(item.sig.fn_token.span.start().line,
+                item.block.brace_token.span.close().end().line,
+                "method",item.sig.ident.to_string());
+            visit::visit_impl_item_fn(self,item);
+        }
+        fn visit_trait_item_fn(&mut self,item:&'ast syn::TraitItemFn){
+            self.consider(item.sig.fn_token.span.start().line,
+                item.span().end().line,"trait_method",item.sig.ident.to_string());
+            visit::visit_trait_item_fn(self,item);
+        }
+        fn visit_item_mod(&mut self,item:&'ast syn::ItemMod){
+            if item.content.is_some() {
+                self.consider(item.mod_token.span.start().line,item.span().end().line,
+                    "mod",item.ident.to_string());
+            }
+            visit::visit_item_mod(self,item);
+        }
+        fn visit_item_impl(&mut self,item:&'ast syn::ItemImpl){
+            self.consider(item.impl_token.span.start().line,item.span().end().line,
+                "impl",format!("impl @{}",item.impl_token.span.start().line));
+            visit::visit_item_impl(self,item);
+        }
+    }
+    // Syn refuses invalid source instead of attributing a false AST region.
+    let parsed:syn::File=syn::parse_file(source).ok()?;
+    let mut finder=Finder{line:line_number,choice:None};
+    finder.visit_file(&parsed);
+    let (start,end,kind,name)=finder.choice?;
+    let declaration=source.lines().nth(start-1)?.trim();
+    Some(json!({
+        "kind":kind,"name":name,"declaration_line":start,
+        "distance":line_number-start,
+        "declaration":declaration.chars().take(MAX_DECLARATION_CHARS).collect::<String>(),
+        "confidence":"ast_containment",
+        "region":{"start_line":start,"end_line":end,"method":"syn_ast"}
+    }))
+}
+
 /// Conservative lexical region bounds. This is intentionally NOT an AST:
 /// indentation closes Python suites and balanced delimiters close brace
 /// languages. Strings/comments are skipped when counting braces. Unsupported
@@ -102,6 +163,9 @@ pub fn nearest_declaration(path: &Path, source: &str, line_number: usize) -> Opt
     if !has_supported_extension(path) || line_number == 0 {
         return None;
     }
+    if path.extension().and_then(|e|e.to_str())==Some("rs"){
+        return rust_ast_declaration(source,line_number);
+    }
     let lines: Vec<&str> = source.lines().collect();
     if lines.len() < line_number || lines.len()>100_000 { return None; }
     let first = line_number.saturating_sub(MAX_SCAN_BACK_LINES + 1);
@@ -155,6 +219,20 @@ pub fn nearest_declaration(path: &Path, source: &str, line_number: usize) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_ast_contains_real_methods_and_rejects_nearest_unrelated_items(){
+        let code="struct A;\nimpl A {\n fn first(&self) {\n  let inside=1;\n }\n fn second(&self) {\n  let inside=2;\n }\n}\n";
+        let inside=nearest_declaration(Path::new("x.rs"),code,7).unwrap();
+        assert_eq!(inside["name"],"second");
+        assert_eq!(inside["confidence"],"ast_containment");
+        assert_eq!(inside["region"]["method"],"syn_ast");
+        assert_eq!(inside["region"]["start_line"],6);
+        assert_eq!(inside["region"]["end_line"],8);
+        let unrelated="fn only() {}\nconst NOTHING: i32 = 1;\n";
+        assert!(nearest_declaration(Path::new("x.rs"),unrelated,2).is_none());
+        assert!(nearest_declaration(Path::new("x.rs"),"fn broken( {",1).is_none());
+    }
 
     #[test]
     fn rust_function_offset_is_grounded_in_actual_lines() {
