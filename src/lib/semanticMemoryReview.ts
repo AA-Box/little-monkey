@@ -118,7 +118,7 @@ export function intersectIndependentSemanticReviews(
   // related but invent an unsupported summary. Demand the other model's
   // independently authored summary also match before displaying approval.
   if(proposal.kind==='merge' && other.kind==='merge'){
-   const normalize=(text:string)=>text.trim().replace(/\\s+/g,' ').toLocaleLowerCase();
+   const normalize=(text:string)=>text.trim().replace(/\s+/g,' ').toLocaleLowerCase();
    return normalize(proposal.suggestedText)===normalize(other.suggestedText);
   }
   return proposal.kind==='contradiction' && other.kind==='contradiction';
