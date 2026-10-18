@@ -501,7 +501,8 @@ mod tests {
         for item in &structured {
             assert_eq!(item["structure"]["name"], "handler");
             assert_eq!(item["structure"]["declaration_line"], 1);
-            assert_eq!(item["structure"]["confidence"], "lexical_nearest_preceding");
+            assert_eq!(item["structure"]["confidence"], "ast_containment");
+            assert_eq!(item["structure"]["region"]["method"], "syn_ast");
         }
         assert!(grep(&workspace.state, "important", Some("../"), true).is_err());
         assert!(grep(&workspace.state, "[", Some("src"), true).is_err());
