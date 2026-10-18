@@ -1978,6 +1978,29 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn linux_live_handoff_systemd_manifest_is_stable_from_durable_opt_in(){
+        let base=std::env::temp_dir().join(format!("lm-systemd-live-{}",
+            uuid::Uuid::new_v4()));
+        let paths=DaemonPaths::under(&base);
+        paths.ensure().unwrap();
+        let special=manager(ServicePlatform::SystemdUser,
+            "selfdev-0123456789abcdef",&base);
+        assert!(!special.render_manifest(&paths).unwrap().contains("KillMode=process"));
+        std::fs::write(paths.root.join(".selfdev-live-handoff"),
+            b"selfdev-live-handoff-v1\n").unwrap();
+        let manifest=special.render_manifest(&paths).unwrap();
+        assert!(manifest.contains("KillMode=process\n"));
+        assert!(manifest.contains("Environment=LITTLE_MONKEY_DAEMON_LIVE_HANDOFF=1\n"));
+        assert_eq!(manifest,special.render_manifest(&paths).unwrap());
+        let regular=manager(ServicePlatform::SystemdUser,"default",&base);
+        assert!(!regular.render_manifest(&paths).unwrap().contains("KillMode=process"),
+            "the main profile must never retain orphaned task processes");
+        std::fs::write(paths.root.join(".selfdev-live-handoff"),b"corrupt\n").unwrap();
+        assert!(!special.render_manifest(&paths).unwrap().contains("KillMode=process"));
+        let _=std::fs::remove_dir_all(&base);
+    }
+
     fn test_roots(
         profile_id: &str,
         registry_active_id: &str,
