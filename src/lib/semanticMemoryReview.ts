@@ -124,7 +124,7 @@ export async function requestSemanticMemoryReview(
   const messages=buildSemanticReviewPrompt(items);
   if(kind==='verifier'){
    messages[0]={...messages[0],content:messages[0].content+
-    '\\nIndependent verification: assess each input claim from scratch. You do not have access to any first review. Report no change if uncertain. Reject contradictions based only on differing preferences that could coexist.'};
+    '\nIndependent verification: assess each input claim from scratch. You do not have access to any first review. Report no change if uncertain. Reject contradictions based only on differing preferences that could coexist.'};
   }
   const controller=new AbortController();
   const timeout=setTimeout(()=>controller.abort(),60_000);
@@ -138,7 +138,7 @@ export async function requestSemanticMemoryReview(
     throw Error(result.streamError??'Memory review model returned tool calls');
    if(result.content.length>MAX_RESPONSE)
     throw Error('Memory review response exceeded byte cap');
-   const body=result.content.trim().replace(/^\`\`\`(?:json)?\\s*/i,'').replace(/\\s*\`\`\`$/,'');
+   const body=result.content.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'');
    return validateSemanticReview(JSON.parse(body),approved);
   }finally{clearTimeout(timeout);}
  };
