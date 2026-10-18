@@ -189,6 +189,24 @@ export async function broadcastSessionMessage(args:{
   return {persistedRecipients:done,count:done.length};
 }
 
+/** Native per-profile SQLite observer records only successful tool reads or
+ * writes, with in-workspace canonical paths. A later edit generates durable
+ * notifications for enrolled peers who have read an older version. */
+export async function noteSessionFileActivity(args:{
+ sessionId:string;turnId:string;toolCallId:string;path:string;
+ action:'read'|'write';
+}):Promise<number>{
+ if(!isTauri()||!useSettingsStore.getState().sessionCollaborationEnabled)return 0;
+ const session=authorizedSource(args.sessionId);
+ if(session.archived||session.comparisonBranch)return 0;
+ if(typeof args.path!=='string'||!args.path.trim()||args.path.length>4096)return 0;
+ await registerPeer(session);
+ return invoke<number>('session_mail_file_activity',{
+  sessionId:session.id,workspace:session.workspacePath,path:args.path,
+  action:args.action,turnId:args.turnId,toolCallId:args.toolCallId,
+ });
+}
+
 export async function sendSessionMessage(args:{
   senderSessionId:string;
   recipientSessionId:string;
