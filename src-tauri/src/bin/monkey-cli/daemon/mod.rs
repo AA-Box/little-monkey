@@ -527,6 +527,9 @@ struct DaemonStatus {
     service_running: bool,
     heartbeat_fresh: bool,
     maintenance_drain: bool,
+    /// Only true when this isolated Linux selfdev user service has a stable,
+    /// verified published manifest that actually retains child processes.
+    live_handoff_enabled: bool,
     pid: Option<u32>,
     kill_switch: bool,
     queued: u32,
@@ -970,6 +973,12 @@ fn status(json: bool) -> Result<(), String> {
         heartbeat_fresh: heartbeat.is_some_and(|value| now.saturating_sub(value) < 5_000),
         maintenance_drain:paths.state_db.is_file() &&
             DaemonStore::open(&paths)?.get_meta("maintenance_drain")?.as_deref()==Some("1"),
+        live_handoff_enabled:cfg!(target_os="linux")
+           && manager.platform()==service::ServicePlatform::SystemdUser
+           && little_monkey_lib::app_paths::agent_config_roots()?.profile_id.starts_with("selfdev-")
+           && std::fs::read_to_string(paths.root.join(".selfdev-live-handoff"))
+               .as_deref().is_ok_and(|m|m=="selfdev-live-handoff-v1\n")
+           && manager.manifest_is_current(&paths)?,
         pid,
         kill_switch,
         queued,
