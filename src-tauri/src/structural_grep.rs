@@ -355,7 +355,7 @@ mod tests {
         let python="def one():\n  return 1\ndef two():\n  value = 2\n  return value\n";
         let in_two=nearest_declaration(Path::new("main.py"),python,5).unwrap();
         assert_eq!(in_two["name"],"two");
-        assert_eq!(in_two["region"]["method"],"python_indentation");
+        assert_eq!(in_two["region"]["method"],"tree_sitter_ast");
         assert_eq!(in_two["region"]["end_line"],5);
     }
 
