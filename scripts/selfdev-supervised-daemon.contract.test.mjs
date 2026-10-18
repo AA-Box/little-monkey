@@ -78,6 +78,40 @@ test('Linux live handoff requires explicit prior enrollment and a proven executi
   assert.equal(call(rootScript,'status','--root',root).body.active,shaA);
  }finally{rmSync(temp,{recursive:true,force:true});}
 });
+test('a legacy replacement cannot touch an attested live worker or switch the approved binary',{
+ skip:process.platform!=='linux',
+},()=>{
+ const temp=mkdtempSync(join(tmpdir(),'lm-hot-incompatible-'));
+ const root=join(temp,'managed');
+ try{
+  const original=fake(temp,'LIVE-ORIGINAL',4111);
+  const incompatible=fake(temp,'LEGACY-REPLACEMENT',4222);
+  const stage=candidate=>{
+   const result=call(rootScript,'stage','--candidate',candidate,'--root',root);
+   assert.equal(result.ok,true,result.stderr);return result.body.sha;
+  };
+  const originalSha=stage(original);
+  let r=call(rootScript,'activate','--root',root,'--confirm-sha',originalSha);
+  assert.equal(r.ok,true,r.stderr);
+  const legacySha=stage(incompatible);
+  r=call(supervisor,'enroll','--root',root,'--confirm-sha',originalSha,
+    '--live-handoff');
+  assert.equal(r.ok,true,r.stderr);
+  const statePath=join(root,'supervised-agent-home','test-daemon-installed.json');
+  const before=JSON.parse(readFileSync(statePath,'utf8'));
+  writeFileSync(statePath,JSON.stringify({...before,active:1,
+    handoff_candidates:1,handoff_attested:1,
+    handoff_worker_ids:['original-job:4111:424242']}));
+  r=call(supervisor,'upgrade-live','--root',root,'--confirm-sha',legacySha);
+  assert.equal(r.ok,false,'A legacy binary must never restart an active provider');
+  assert.match(r.stderr,/Replacement CLI lacks live worker adoption/);
+  assert.equal(call(rootScript,'status','--root',root).body.active,originalSha);
+  const after=JSON.parse(readFileSync(statePath,'utf8'));
+  assert.equal(after.pid,4111);
+  assert.equal(after.active,1);
+  assert.equal(after.drain??false,false);
+ }finally{rmSync(temp,{recursive:true,force:true});}
+});
 test('supervisor enrolls isolated identity, restarts cold, and rolls back failed candidate',{
  skip:process.platform==='win32',
 },()=>{
