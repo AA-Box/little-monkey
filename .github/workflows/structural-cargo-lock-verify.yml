@@ -1,0 +1,26 @@
+name: Tree-sitter Cargo lockfile reconciliation
+on:
+  push:
+    branches: [feature/agent-context-exposure-20261018]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  lockfile-canonical-diff:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate canonical lockfile with Cargo
+        run: |
+          cd src-tauri
+          cargo metadata --format-version 1 > /dev/null
+          echo "=== BEGIN EXPECTED CARGO.LOCK DIFF ==="
+          git diff -- Cargo.lock
+          echo "=== END EXPECTED CARGO.LOCK DIFF ==="
+          if ! git diff --quiet -- Cargo.lock; then
+            echo "::error::Cargo.lock differs from Cargo's canonical dependency resolution; commit corrected Cargo.lock"
+            exit 1
+          fi
