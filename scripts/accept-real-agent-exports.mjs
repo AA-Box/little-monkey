@@ -4,7 +4,7 @@
  * Never upload sessions to GitHub/CI, print conversation text, or generate
  * pretend JSONL fixtures. Reuse the parser's fail-closed five-format suite.
  */
-import {existsSync,readFileSync,writeFileSync,mkdirSync,copyFileSync,realpathSync,lstatSync,chmodSync} from 'node:fs';
+import {existsSync,readFileSync,writeFileSync,mkdirSync,copyFileSync,realpathSync,lstatSync,chmodSync,openSync,closeSync,fstatSync} from 'node:fs';
 import {join,resolve,sep} from 'node:path';
 import {homedir,tmpdir} from 'node:os';
 import {spawnSync} from 'node:child_process';
@@ -42,10 +42,15 @@ function officialFile(filename,base){
  const expected=realpathSync(base);
  const path=realpathSync(resolve(filename));
  if(!path.startsWith(expected+sep))die('Session must be an authentic file under '+base);
- if(!lstatSync(path).isFile())die('Source is not a regular vendor-session file');
- const bytes=readFileSync(path);
- if(bytes.length===0||bytes.length>32*1024*1024)die('Source session outside parser size limit');
- return path;
+ // One descriptor for the kind check, the size check and the read: a path
+ // re-opened after a stat can be swapped between the two.
+ const fd=openSync(path,'r');
+ try{
+  if(!fstatSync(fd).isFile())die('Source is not a regular vendor-session file');
+  const bytes=readFileSync(fd);
+  if(bytes.length===0||bytes.length>32*1024*1024)die('Source session outside parser size limit');
+  return bytes;
+ }finally{closeSync(fd);}
 }
 function save(value,name){
  if(Buffer.byteLength(value)>32*1024*1024)die('Vendor export exceeds importer limits');
@@ -61,8 +66,7 @@ function run(){
  for(const item of inputs){
   const source=val(item.flag);
   if(!source)die('Missing required official session path '+item.flag);
-  const path=officialFile(source,item.base);
-  evidence[item.env]=save(readFileSync(path),item.name);
+  evidence[item.env]=save(officialFile(source,item.base),item.name);
  }
  const session=val('--opencode-session');
  if(!session||!/^[a-zA-Z0-9_-]{4,128}$/.test(session))
