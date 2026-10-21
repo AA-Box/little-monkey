@@ -5,7 +5,7 @@
  * Live sessions must be absent. Reuses native service install's on-disk
  * recovery, but does NOT claim hot reload or live conversation handoff.
  */
-import {existsSync,mkdirSync,readFileSync,writeFileSync,rmSync,lstatSync,readlinkSync} from 'node:fs';
+import {existsSync,mkdirSync,readFileSync,writeFileSync,rmSync,lstatSync,readlinkSync,openSync,closeSync,constants} from 'node:fs';
 import {homedir} from 'node:os';
 import {join,resolve,basename} from 'node:path';
 import {randomUUID,createHash} from 'node:crypto';
@@ -22,11 +22,18 @@ const managed=join(root,'.supervised-daemon.json'),lock=join(root,'.supervised-d
 const agentHome=join(root,'supervised-agent-home');
 const sha=opt('--confirm-sha');
 const fail=(message)=>{throw Error(message);};
+// One O_NOFOLLOW descriptor instead of exists/lstat-then-read: between a
+// symlink check and a read of the same path the file can be swapped. Returns
+// null when the path is missing, a symlink, or otherwise unreadable.
+const readGuarded=(path,encoding)=>{
+ let fd;
+ try{fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW);}catch{return null;}
+ try{return readFileSync(fd,encoding);}catch{return null;}finally{closeSync(fd);}
+};
 if(liveRequested && process.platform!=='linux')fail('Live handoff is limited to explicitly enrolled Linux systemd selfdev services');
 if(!['enroll','upgrade','upgrade-live','status'].includes(command))fail('Usage: enroll [--live-handoff]|upgrade|upgrade-live|status [--root PATH] [--confirm-sha SHA]');
 if(process.platform==='win32')fail('Selfdev supervisor currently requires POSIX host');
-if(!existsSync(marker)||lstatSync(marker).isSymbolicLink()||
-    readFileSync(marker,'utf8')!==mode+'\n')
+if(readGuarded(marker,'utf8')!==mode+'\n')
   fail('Unapproved selfdev root. Stage and activate through the existing transaction manager first.');
 if(lstatSync(root).isSymbolicLink())fail('Refusing symlinked supervisor root');
 function exec(file,args,timeout=300000){
@@ -49,9 +56,9 @@ function active(){
  return {active:result.active,previous:result.previous};
 }
 function meta(){
- if(!existsSync(managed)||lstatSync(managed).isSymbolicLink())
-  fail('No authorized supervised daemon enrollment');
- const data=JSON.parse(readFileSync(managed,'utf8'));
+ const raw=readGuarded(managed,'utf8');
+ if(raw===null)fail('No authorized supervised daemon enrollment');
+ const data=JSON.parse(raw);
  if(data.kind!=='selfdev-supervisor-v1' ||
     !/^selfdev-[a-f0-9]{16}$/.test(data.profile) ||
     data.agentHome!==agentHome)fail('Supervisor identity manifest invalid');
@@ -114,7 +121,7 @@ function acquire(){
 }
 function release(){rmSync(lock,{recursive:true,force:true});}
 function enroll(){
- if(existsSync(managed))fail('Supervisor enrollment already exists');
+ if(readGuarded(managed)!==null)fail('Supervisor enrollment already exists');
  const pointers=active();
  if(!sha||pointers.active!==sha||!/^[a-f0-9]{64}$/.test(sha))
   fail('Enroll requires explicitly confirmed current binary digest');
@@ -172,9 +179,9 @@ function upgrade(){
    // *before* touching the running service. An older CLI's cold recover()
    // would kill the preserved provider worker before rollback could help.
    const candidate=join(root,'versions',sha,'monkey-cli');
-   if(!existsSync(candidate)||lstatSync(candidate).isSymbolicLink())
-     fail('Cannot live-upgrade to a missing or symlinked approved binary');
-   if(createHash('sha256').update(readFileSync(candidate)).digest('hex')!==sha)
+   const bytes=readGuarded(candidate);
+   if(bytes===null)fail('Cannot live-upgrade to a missing or symlinked approved binary');
+   if(createHash('sha256').update(bytes).digest('hex')!==sha)
      fail('Candidate binary digest changed after review; refusing to execute it');
    const compatible=status(candidate,identity.profile);
    const fields=['handoff_candidates','handoff_attested','handoff_worker_ids',
