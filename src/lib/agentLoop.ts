@@ -27,7 +27,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { allowedToolsRestriction, applyAllowedToolsRestriction } from './allowedTools';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SEARCH_SKILLS_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, SESSION_PEERS_TOOL, SESSION_SEND_TOOL, buildTools, toolsForWorkspace } from './tools';
+import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SEARCH_SKILLS_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, SESSION_PEERS_TOOL, SESSION_SEND_TOOL, SESSION_BROADCAST_TOOL, buildTools, toolsForWorkspace } from './tools';
 import {
   candidateNotice,
   finalizeLearningForRun,
@@ -80,7 +80,7 @@ import { collectUserPromptSubmitContext,fireObservedHooks } from './userHooks';
 import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
 import { isBtwNotice } from './slashCommands';
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
-import { syncSessionMailbox } from './sessionCollaboration';
+import { syncSessionMailbox, syncSessionMailboxAtSafePoint } from './sessionCollaboration';
 import { effortForTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
@@ -686,7 +686,7 @@ export function toolsForSettings(
     ...(readSkillResourceToolEnabled ? [READ_SKILL_RESOURCE_TOOL] : []),
     ...(skillLearningToolEnabled ? [MANAGE_SKILL_LEARNING_TOOL] : []),
     ...(skillSearchToolEnabled ? [SEARCH_SKILLS_TOOL] : []),
-    ...(sessionCollaborationEnabled ? [SESSION_PEERS_TOOL, SESSION_SEND_TOOL] : []),
+    ...(sessionCollaborationEnabled ? [SESSION_PEERS_TOOL, SESSION_SEND_TOOL, SESSION_BROADCAST_TOOL] : []),
   ];
 }
 
@@ -3326,6 +3326,14 @@ async function runAgentTurnBody(
     // round trips, where there's no stream to abort) — don't start another.
     if (signal?.aborted) return;
 
+    // No stream or partial tool call is in flight at this boundary. Replaying
+    // SQLite mail here makes the next model attempt see peer notices during
+    // the CURRENT execution, not only after the whole turn ends.
+    if (settings.sessionCollaborationEnabled) {
+      try { await syncSessionMailboxAtSafePoint(sessionId); }
+      catch(error) { console.warn('Live peer mail remains durable and pending:',error); }
+    }
+
     if (settings.contextTrimEnabled) {
       const current = sessionMessages(sessionId);
       if (shouldTrim(current, useUsageStore.getState().contextLimit, settings.contextTrimThreshold)) {
@@ -3371,7 +3379,7 @@ async function runAgentTurnBody(
       if (!toolsForTurn.some((tool) => tool.function.name === toolName)) return false;
       const currentSettings = useSettingsStore.getState();
       if (toolName === 'remember' && !currentSettings.memoryEnabled) return false;
-      if ((toolName === 'session_send_message' || toolName === 'session_list_peers')
+      if ((toolName === 'session_send_message' || toolName === 'session_list_peers' || toolName === 'session_broadcast_message')
           && (!currentSettings.sessionCollaborationEnabled || usePermissionStore.getState().mode === 'plan')) return false;
       if (WEB_TOOL_NAMES.has(toolName) && !currentSettings.webToolsEnabled) return false;
       if ((toolName === 'task' || toolName === 'workflow') && !currentSettings.subagentsEnabled && !ultracode) {

@@ -104,12 +104,12 @@ export function syncSessionMailbox(recipientSessionId:string):Promise<number> {
   return operation;
 }
 
-async function syncImpl(recipientSessionId:string):Promise<number>{
+async function syncImpl(recipientSessionId:string,safePoint=false):Promise<number>{
   if(!isTauri() || !useSettingsStore.getState().sessionCollaborationEnabled)return 0;
   const getRecipient=()=>useSessionStore.getState().sessions.find(s=>s.id===recipientSessionId);
   const current=getRecipient();
   if(!current || !current.workspacePath || current.archived ||
-     current.comparisonBranch || useSessionStore.getState().runningTurns[recipientSessionId])return 0;
+     current.comparisonBranch || (!safePoint && useSessionStore.getState().runningTurns[recipientSessionId]))return 0;
   const workspace=current.workspacePath;
   if(primaryRoot(useWorkspaceStore.getState().roots)?.path!==workspace)return 0;
   await registerPeer(current);
@@ -122,7 +122,7 @@ async function syncImpl(recipientSessionId:string):Promise<number>{
     const recipient=getRecipient();
     if(!useSettingsStore.getState().sessionCollaborationEnabled || !recipient ||
        recipient.archived || recipient.workspacePath!==workspace ||
-       state.runningTurns[recipientSessionId])break;
+       (!safePoint && state.runningTurns[recipientSessionId]))break;
     if(item.recipientSessionId!==recipientSessionId || item.workspace!==workspace ||
        typeof item.id!=='string' || typeof item.text!=='string') {
       throw new Error('Received malformed or out-of-scope native mailbox message');
@@ -151,6 +151,60 @@ async function syncImpl(recipientSessionId:string):Promise<number>{
     accepted++;
   }
   return accepted;
+}
+
+/**
+ * Only call BETWEEN model attempts (after the previous streamed/tool response
+ * is completed, before creating the next assistant placeholder). The caller
+ * owns the executing session and may persist notices at this safe point.
+ * The SQLite acknowledgement still follows the durable transcript flush.
+ */
+export async function syncSessionMailboxAtSafePoint(sessionId:string):Promise<number> {
+  if(!useSessionStore.getState().runningTurns[sessionId])
+    throw new Error('Live mailbox safe-point delivery requires an executing turn.');
+  return syncImpl(sessionId,true);
+}
+
+/** Send one durable DM to every currently enrolled same-workspace peer.
+ * The tool call identity is deterministically partitioned by recipient,
+ * preserving idempotent retries after a partially successful broadcast. */
+export async function broadcastSessionMessage(args:{
+  senderSessionId:string;turnId:string;toolCallId:string;text:string;
+}):Promise<{persistedRecipients:string[];count:number}>{
+  if(!/^[\w.:-]{1,140}$/.test(args.toolCallId))
+    throw new Error('Broadcast call ID must be 1-140 permitted characters.');
+  const peers=(await listCollaboratingSessions(args.senderSessionId))
+    .sort((a,b)=>a.id.localeCompare(b.id));
+  const done:string[]=[];
+  for(const peer of peers) {
+    try {
+      await sendSessionMessage({...args,recipientSessionId:peer.id,
+        toolCallId:args.toolCallId+':'+done.length});
+      done.push(peer.id);
+    } catch(error) {
+      throw new Error('Broadcast partially persisted to '+done.length+' peer(s): '+
+        (error instanceof Error?error.message:String(error)));
+    }
+  }
+  return {persistedRecipients:done,count:done.length};
+}
+
+/** Native per-profile SQLite observer records only successful tool reads or
+ * writes, with in-workspace canonical paths. A later edit generates durable
+ * notifications for enrolled peers who have read an older version. */
+export async function noteSessionFileActivity(args:{
+ sessionId:string;turnId:string;toolCallId:string;path:string;
+ action:'read'|'write';
+}):Promise<number>{
+ if(!isTauri()||!useSettingsStore.getState().sessionCollaborationEnabled)return 0;
+ const session=authorizedSource(args.sessionId);
+ if(session.archived||session.comparisonBranch)return 0;
+ if(typeof args.path!=='string'||!args.path.trim()||args.path.length>4096)return 0;
+ await registerPeer(session);
+ return invoke<number>('session_mail_file_activity',{
+  sessionId:session.id,workspace:session.workspacePath,path:args.path,
+  action:args.action,turnId:args.turnId,toolCallId:args.toolCallId,
+ });
 }
 
 export async function sendSessionMessage(args:{

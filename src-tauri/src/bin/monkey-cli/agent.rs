@@ -1126,6 +1126,18 @@ async fn execute_tool_call(
         }
     };
 
+    if name == "local_agent_message" {
+        let Some(peer)=crate::local_peer_collaboration::LocalPeerRun::create(state,perms)
+        else {
+            return serde_json::json!({"error":"Resident local collaboration is not enabled for a durable workspace run"}).to_string();
+        };
+        let text=args["text"].as_str().unwrap_or_default();
+        let recipient=args["recipient_session_id"].as_str();
+        let broadcast=args["broadcast"].as_bool().unwrap_or(false);
+        return peer.send(text,recipient,broadcast,tool_call_id)
+            .unwrap_or_else(|error|serde_json::json!({"error":error}).to_string());
+    }
+
     // `present_plan` is a frontend/terminal-only tool (see `tools_def.rs`'s
     // `present_plan_tool_def` doc comment): it never dispatches to any
     // `tool_<name>` command, checked BEFORE the mcp__/tool_<name> dispatch
@@ -2077,6 +2089,12 @@ async fn run_tool_loop(
             tools_vec.push(tools_def::peer_message_tool_def(&peers));
         }
     }
+    // Resident agent collaboration is opt-in at the service process
+    // boundary, requires a durable run identity and never grants network IO.
+    let local_peer=crate::local_peer_collaboration::LocalPeerRun::create(state,perms);
+    if local_peer.is_some(){
+        tools_vec.push(crate::local_peer_collaboration::send_tool_definition());
+    }
     // `place_call` is offered only when the operator actually configured a
     // number that may dial out. An operator whose numbers are all receive-only
     // never sees the tool, rather than being offered one whose only possible
@@ -2146,7 +2164,15 @@ async fn run_tool_loop(
         .unwrap_or_else(|_| "workspace-unavailable".to_string());
 
     let max_iterations = max_iterations_override.unwrap_or(MAX_ITERATIONS);
+    let mut received_local_notes=std::collections::HashSet::new();
     for round_index in 0..max_iterations {
+        if let Some(peer)=local_peer.as_ref(){
+            // Safe point: the last completed tool result is already in
+            // history and no model stream is in flight.
+            if let Err(error)=peer.receive(perms,history,&mut received_local_notes){
+                eprintln!("Resident peer mailbox delivery deferred: {error}");
+            }
+        }
         usage.model_calls = usage
             .model_calls
             .checked_add(1)
@@ -2350,6 +2376,22 @@ async fn run_tool_loop(
             )
             .await;
             perms.finish_tool_call();
+            if let Some(peer)=local_peer.as_ref(){
+                let observed=match call.name.as_str(){
+                    "read_file" => mutation_tool_failure_reason(&content).is_none(),
+                    "write_file"|"edit_file" => is_successful_mutation_result(&content),
+                    _=>false
+                };
+                if observed{
+                    if let Some(path)=tool_call_path_arg(&call.arguments){
+                        if let Err(error)=peer.record_file(
+                            &call.name,&path,&observed_tool_call_id
+                        ){
+                            eprintln!("Resident file-conflict observer unavailable: {error}");
+                        }
+                    }
+                }
+            }
             let duration_ms = u64::try_from(tool_started.elapsed().as_millis())
                 .unwrap_or(7 * 24 * 60 * 60 * 1_000)
                 .min(7 * 24 * 60 * 60 * 1_000);
