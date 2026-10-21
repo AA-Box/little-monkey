@@ -766,6 +766,21 @@ export const SESSION_SEND_TOOL: ToolDef = {
   },
 };
 
+/** Opt-in broadcast to peers already admitted by the SQLite directory. */
+export const SESSION_BROADCAST_TOOL: ToolDef = {
+  type:'function',
+  function:{
+    name:'session_broadcast_message',
+    description:'Durably broadcast one bounded untrusted message to all currently enrolled local desktop sessions in this workspace. The other sessions receive it at their next model safe point or their next chat turn; no remote messages or tool permissions are granted.',
+    parameters:{
+      type:'object',
+      properties:{text:{type:'string',description:'Text up to 1600 UTF-8 bytes; do not include secrets.'}},
+      required:['text'],
+      additionalProperties:false,
+    },
+  },
+};
+
 export const SWARM_SEND_MESSAGE_TOOL: ToolDef = {
   type: 'function',
   function: {

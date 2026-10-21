@@ -101,6 +101,23 @@ fn open(path:&Path)->Result<Connection,String>{
            ON local_session_mail(recipient_session_id,workspace,delivered_at_ms,created_at_ms);
          CREATE INDEX IF NOT EXISTS local_session_mail_retention
            ON local_session_mail(delivered_at_ms);
+         CREATE TABLE IF NOT EXISTS local_session_file_reads (
+           session_id TEXT NOT NULL,
+           workspace TEXT NOT NULL,
+           path TEXT NOT NULL,
+           digest TEXT NOT NULL,
+           observed_at_ms INTEGER NOT NULL,
+           PRIMARY KEY(session_id,workspace,path)
+         );
+         CREATE INDEX IF NOT EXISTS local_session_file_reads_recent
+           ON local_session_file_reads(workspace,path,observed_at_ms);
+         CREATE TABLE IF NOT EXISTS local_session_file_events (
+           id TEXT PRIMARY KEY NOT NULL,
+           workspace TEXT NOT NULL,
+           sender_session_id TEXT NOT NULL,
+           path TEXT NOT NULL,
+           digest TEXT NOT NULL
+         );
         "
     ).map_err(|e|e.to_string())?;
     #[cfg(unix)]
@@ -271,6 +288,116 @@ pub fn prune_acknowledged_impl(path:&Path)->Result<usize,String>{
        .map_err(|e|e.to_string())
 }
 
+/// Register a successful native file read or publication of a successful
+/// write/edit. The (file-event ledger + recipient notices) commit atomically
+/// in the SAME WAL transaction. This prevents a crash between observation and
+/// durable notification from losing change alerts.
+pub fn file_activity_impl(db_path:&Path,session_id:&str,workspace:&str,
+    path:&str,action:&str,turn_id:&str,tool_call_id:&str)->Result<usize,String>{
+    use sha2::{Digest,Sha256};
+    if !valid_id(session_id)||!valid_id(turn_id)||!valid_id(tool_call_id)||
+       !matches!(action,"read"|"write")||path.len()>4096||
+       workspace.trim().is_empty() || workspace.len()>4096{
+        return Err("Invalid scoped file activity".into());
+    }
+    let root=std::fs::canonicalize(workspace).map_err(|e|e.to_string())?;
+    if !root.is_dir(){return Err("Workspace is not a directory".into());}
+    let candidate=std::path::Path::new(path);
+    let candidate=if candidate.is_absolute(){candidate.to_path_buf()}
+        else{root.join(candidate)};
+    let canonical=std::fs::canonicalize(&candidate).map_err(|e|e.to_string())?;
+    if !canonical.starts_with(&root)||!canonical.is_file(){
+        return Err("File outside declared workspace".into());
+    }
+    let metadata=std::fs::metadata(&canonical).map_err(|e|e.to_string())?;
+    // Hash exactly the bytes on disk. Large or special files remain outside
+    // this optional awareness subsystem, not part of the model response.
+    if metadata.len()>8*1024*1024{return Err("File too large to track safely".into());}
+    let digest=format!("{:x}",Sha256::digest(
+        std::fs::read(&canonical).map_err(|e|e.to_string())?));
+    let full_path=canonical.to_string_lossy().to_string();
+    let mut db=open(db_path)?;
+    let tx=db.transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e|e.to_string())?;
+    let now=now_ms()?;
+    let accepted:i64=tx.query_row("SELECT COUNT(*) FROM local_session_peers
+      WHERE session_id=?1 AND workspace=?2 AND updated_at_ms>=?3",
+      params![session_id,workspace,now.saturating_sub(PEER_STALE_MS)],
+      |r|r.get(0)).map_err(|e|e.to_string())?;
+    if accepted!=1{return Err("File observer not enrolled in workspace".into());}
+    tx.execute("DELETE FROM local_session_file_reads WHERE observed_at_ms<?1",
+       params![now.saturating_sub(24*3600*1000)])
+       .map_err(|e|e.to_string())?;
+    if action=="read"{
+        tx.execute("INSERT INTO local_session_file_reads
+            (session_id,workspace,path,digest,observed_at_ms)
+            VALUES(?1,?2,?3,?4,?5)
+            ON CONFLICT(session_id,workspace,path) DO UPDATE SET
+            digest=excluded.digest,observed_at_ms=excluded.observed_at_ms",
+            params![session_id,workspace,full_path,digest,now])
+            .map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e|e.to_string())?;
+        return Ok(0);
+    }
+    let event_id=format!("{turn_id}:{tool_call_id}:{session_id}");
+    let prior:Option<(String,String,String,String)>=tx.query_row(
+      "SELECT workspace,sender_session_id,path,digest FROM local_session_file_events
+       WHERE id=?1",[&event_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))
+       .optional().map_err(|e|e.to_string())?;
+    if let Some(existing)=prior{
+        if existing!=(workspace.to_string(),session_id.to_string(),full_path,digest){
+           return Err("File event idempotency conflict".into());
+        }
+        return Ok(0);
+    }
+    let mut stmt=tx.prepare("SELECT r.session_id,r.digest FROM local_session_file_reads r
+       JOIN local_session_peers p ON p.session_id=r.session_id
+       WHERE r.workspace=?1 AND r.path=?2 AND r.session_id!=?3
+       AND r.digest!=?4 AND p.workspace=?1 AND p.updated_at_ms>=?5
+       ORDER BY r.session_id LIMIT 24").map_err(|e|e.to_string())?;
+    let observed:Vec<(String,String)>=stmt.query_map(params![
+       workspace,full_path,session_id,digest,now.saturating_sub(PEER_STALE_MS)
+    ],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|e.to_string())?
+    .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    drop(stmt);
+    // Never add model source text, passwords, or full absolute paths to mail.
+    let relative=canonical.strip_prefix(&root).map_err(|e|e.to_string())?;
+    let display=relative.to_string_lossy();
+    let display=if display.len()>500 {"[long workspace-relative path]"}
+        else {display.as_ref()};
+    let mut notified=0;
+    for (recipient,_) in observed{
+        let pending:i64=tx.query_row("SELECT COUNT(*) FROM local_session_mail
+          WHERE recipient_session_id=?1 AND delivered_at_ms IS NULL",
+          [&recipient],|r|r.get(0)).map_err(|e|e.to_string())?;
+        if pending>=MAX_PENDING{continue;}
+        let id=format!("file:{:x}",Sha256::digest(format!(
+           "{event_id}:{workspace}:{full_path}:{recipient}").as_bytes()));
+        let body=format!(
+          "File changed after your last read: {display}. Another enrolled agent edited it. Re-read and inspect the diff before applying edits; no merge is automatic.");
+        tx.execute("INSERT INTO local_session_mail
+          (id,sender_session_id,recipient_session_id,workspace,text,created_at_ms)
+          VALUES(?1,?2,?3,?4,?5,?6)",
+          params![id,session_id,recipient,workspace,body,now])
+          .map_err(|e|e.to_string())?;
+        notified+=1;
+    }
+    tx.execute("INSERT INTO local_session_file_events
+      (id,workspace,sender_session_id,path,digest) VALUES(?1,?2,?3,?4,?5)",
+      params![event_id,workspace,session_id,full_path,digest])
+      .map_err(|e|e.to_string())?;
+    tx.commit().map_err(|e|e.to_string())?;
+    Ok(notified)
+}
+
+#[tauri::command]
+pub fn session_mail_file_activity(app:tauri::AppHandle,session_id:String,
+    workspace:String,path:String,action:String,turn_id:String,
+    tool_call_id:String)->Result<usize,String>{
+    file_activity_impl(&profile_path(&app)?,&session_id,&workspace,&path,
+        &action,&turn_id,&tool_call_id)
+}
+
 fn profile_path(app:&tauri::AppHandle)->Result<std::path::PathBuf,String>{
     use crate::profiles::ProfileScopedPaths;
     let root=app.profile_data_dir().map_err(|e|e.to_string())?;
@@ -313,6 +440,40 @@ mod tests{
     fn tmp()->PathBuf{
         let root=std::env::temp_dir().join(format!("lm-mail-{}",uuid::Uuid::new_v4()));
         root.join("box.sqlite")
+    }
+    #[test]fn file_change_notifications_are_atomic_scoped_and_idempotent(){
+        let path=tmp();
+        let dir=path.parent().unwrap();
+        let root=dir.join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let file=root.join("main.rs");
+        std::fs::write(&file,"fn first() {}").unwrap();
+        let workspace=root.to_string_lossy().to_string();
+        register_impl(&path,"a",&workspace,"Actor").unwrap();
+        register_impl(&path,"b",&workspace,"Reader").unwrap();
+        assert_eq!(file_activity_impl(&path,"b",&workspace,"main.rs",
+            "read","readturn","readtool").unwrap(),0);
+        std::fs::write(&file,"fn second() {}").unwrap();
+        assert_eq!(file_activity_impl(&path,"a",&workspace,"main.rs",
+            "write","editturn","edittool").unwrap(),1);
+        let notice=pending_impl(&path,"b",&workspace,10).unwrap();
+        assert_eq!(notice.len(),1);
+        assert!(notice[0].text.contains("main.rs"));
+        assert!(!notice[0].text.contains("fn second"));
+        assert_eq!(file_activity_impl(&path,"a",&workspace,"main.rs",
+            "write","editturn","edittool").unwrap(),0);
+        assert!(file_activity_impl(&path,"a",&workspace,"main.rs",
+            "write","editturn","edittool2").is_ok());
+        assert!(file_activity_impl(&path,"a",&workspace,"../other.rs",
+            "write","newturn","newtool").is_err());
+        assert!(ack_impl(&path,"b",&workspace,&notice[0].id).unwrap());
+        // A fresh read adopts the new version, so an unchanged publication
+        // cannot notify that peer until a DIFFERENT change occurs.
+        file_activity_impl(&path,"b",&workspace,"main.rs",
+            "read","readturn2","readtool2").unwrap();
+        assert_eq!(file_activity_impl(&path,"a",&workspace,"main.rs",
+            "write","editturn2","edittool2").unwrap(),0);
+        let _=std::fs::remove_dir_all(dir);
     }
     #[test]fn durable_ack_after_restart_and_failed_replays(){
         let path=tmp();

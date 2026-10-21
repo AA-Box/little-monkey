@@ -47,7 +47,7 @@ import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import { useSessionStore } from '../store/sessionStore';
 import { usePermissionStore } from '../store/permissionStore';
 import { runSubagentTask } from './subagent';
-import { listCollaboratingSessions, sendSessionMessage } from './sessionCollaboration';
+import { listCollaboratingSessions, sendSessionMessage, broadcastSessionMessage, noteSessionFileActivity } from './sessionCollaboration';
 import { resolveWorkflowSpec, runWorkflow } from './workflow';
 import { protocolToolCallId } from './durableRun';
 import { formatSkillSearchResults, formatSkillToolResult, type SkillRankingSignals, type SlashSkill } from './skills';
@@ -839,6 +839,29 @@ export async function executeToolCall(
     executionContext,
   );
 
+  // Detect a file version conflict only AFTER a real successful native
+  // read/write/edit. This additional observation cannot authorize tools or
+  // change the returned model result. Worktree-isolated children cannot
+  // enroll under their parent's original workspace root.
+  if(sessionId && !workspaceRootOverride &&
+      (name==='read_file'||name==='write_file'||name==='edit_file')){
+    const parsed=argsForHooks();
+    if(typeof parsed.path==='string' &&
+       !/^\s*\{\s*"error"\s*:/.test(result) &&
+       result!=='CANCELLED'){
+      try{
+        await noteSessionFileActivity({
+          sessionId,turnId,toolCallId:toolCall.id,
+          path:parsed.path,action:name==='read_file'?'read':'write',
+        });
+      }catch(error){
+        // The actual file tool already succeeded; never replay a mutation
+        // just because peer-awareness persistence is unavailable.
+        console.warn('Session file-change notification remains unavailable:',error);
+      }
+    }
+  }
+
   // Compact only repeat read-only payloads from the same executing agent turn.
   // Execute the native tool first so filesystem permissions and freshness
   // checks cannot be bypassed by a stale frontend cache.
@@ -995,7 +1018,7 @@ async function executeToolCallInner(
   const coordination = coordinateToolInvocation(name, args);
   if (coordination.error) return stringifyToolError(new Error(coordination.error));
 
-  if (name === 'session_list_peers' || name === 'session_send_message') {
+  if (name === 'session_list_peers' || name === 'session_send_message' || name === 'session_broadcast_message') {
     if (usePermissionStore.getState().mode === 'plan')
       return stringifyToolError(new Error('Session messaging is unavailable in Plan Mode.'));
     if (!chatSessionId || executionContext?.isToolAvailable?.(name) !== true) {
@@ -1004,6 +1027,13 @@ async function executeToolCallInner(
     try {
       if (name === 'session_list_peers') {
         return stringifyToolResult({sessions:await listCollaboratingSessions(chatSessionId)});
+      }
+      if(name==='session_broadcast_message') {
+        if(typeof args.text!=='string')
+          throw new Error('session_broadcast_message requires a text string.');
+        return stringifyToolResult(await broadcastSessionMessage({
+          senderSessionId:chatSessionId,turnId,toolCallId:toolCall.id,text:args.text,
+        }));
       }
       const recipient = args.recipient_session_id;
       const text = args.text;

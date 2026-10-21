@@ -144,3 +144,110 @@ Semantic *evidence* remains model-judged: a review proposal is **not**
 independent proof of equivalence. The user must examine and authorize
 meaning-changing edits. There is deliberately no unattended auto-resolution
 of paraphrase ambiguities, medical claims, or conflicting memories.
+
+## Evidence-backed background candidate queue (opt-in)
+
+Each due ambient worker configured with `--garden-agent-memories` now also
+performs a **read-only**, workspace-scoped review pass. It uses two distinct,
+conservative lexical evaluators (word Jaccard and character-trigram Dice) to
+flag *possible* paraphrases where both agent-created facts have nonempty
+original source-turn IDs. It skips pinned, user-authored, disabled, expired,
+retired, already-merged, and obvious negation-conflicting statements. This
+algorithm makes **no model-semantic equivalence claim**; independent lexical
+scores are candidate filters, not a proof of truth.
+
+The daemon stores up to twelve deterministic candidate ID pairs with exact
+source-turn identifiers, SHA-256 hashes of the original fact texts, the two
+scores and `requires_user_approval=true`. The latest snapshot is returned in
+`monkey daemon swarm-ambient-status` under
+`garden_evidence_candidates`. Raw memory text is not copied to the daemon
+status database. Memory Studio remains the ONLY way to compare original
+texts and authorize a guarded merge. A stale review cannot override current
+fact text: the existing Memory Studio guarded merge checks original contents
+under a cross-process lock before changing anything. The daemon itself never
+applies ambiguous proposals. All changes are opt-in and no new network model
+calls are introduced.
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml review_candidates_are_scoped_evidenced
+cargo test --manifest-path src-tauri/Cargo.toml evidence_manifest_schema_is_durable
+```
+
+**Unresolved acceptance:** independently verified model-based semantic
+judgment, end-to-end human approval flow surfaced directly from daemon
+candidate IDs, longitudinal real-model quality evaluation, and live daemon
+restart acceptance. The current evidence queue does not by itself satisfy
+those requirements.
+
+## Independent reviewer configuration and observed quality
+
+Memory Studio now requires the operator to choose an explicit second provider
+model with a configured credential. The primary selected model proposes; a
+different provider/model identity independently evaluates the original facts
+in reverse order. Only strictly agreeing candidate identities **and** merge
+summaries are surfaced for human approval. The verifier never receives the
+proposer output. A missing credential, an unselected verifier, or identical
+model identities fails closed. Calls reuse ordinary provider privacy,
+budget and usage accounting.
+
+The app separately records counts of actual proposed, approved and dismissed
+suggestions in local-only storage. No memory contents, IDs, workspace names,
+raw prompts or credentials are retained in the metrics. The UI labels the
+approval fraction as *human agreement among decided suggestions* and does not
+misrepresent it as ground-truth semantic accuracy, precision or recall.
+
+```sh
+pnpm exec vitest run src/lib/semanticMemoryReview.test.ts src/lib/semanticMemoryQuality.test.ts
+pnpm typecheck
+```
+
+Independent quality acceptance still requires a separately curated, consented
+ground-truth set and provider-backed live comparisons. These were not run in
+the repository authoring environment and have no manufactured scores.
+
+## Live semantic precision and recall acceptance
+
+`scripts/semantic-memory-live-quality.py` requires **20 or more independently
+human-annotated private cases**, at least five positive and five negative
+pair labels. It makes actual, separate provider calls for each case (one
+proposer, one verifier), requires the returned model identities to match
+the configured distinct names, and computes precision, recall, and F1 for
+equivalent-memory merges and contradictory-memory flags.
+
+Example private JSON structure (illustrative only; *not acceptance data*):
+
+```json
+{
+  "human_annotated": true,
+  "annotator_id": "independent-reviewer-identifier",
+  "cases": [
+    {"id": "case-1",
+     "facts": [{"id": "a", "text": "The user prefers short updates."},
+               {"id": "b", "text": "The user prefers concise updates."}],
+     "truth": [{"kind": "merge", "ids": ["a", "b"]}]}
+  ]
+}
+```
+
+Complete the corpus with at least 20 unique, genuinely labeled cases, including
+cases whose `truth` is `[]` (hard negatives). Truth labels must be exhaustive
+within each case; do not derive them from the model being graded.
+
+```bash
+python3 scripts/semantic-memory-live-quality.py \
+  --gold ./private/human-labeled-memories.json \
+  --proposer-url http://127.0.0.1:11434/v1/chat/completions \
+  --proposer-model MODEL_A \
+  --verifier-url http://127.0.0.1:11434/v1/chat/completions \
+  --verifier-model MODEL_B \
+  --output ./private/semantic-quality-evidence.json
+```
+
+Models must actually be installed and running; the evaluator never fabricates
+completions or labels. API keys for authenticated endpoints may be passed in
+`LM_EVAL_PROPOSER_API_KEY` and `LM_EVAL_VERIFIER_API_KEY`.
+Sending memory facts to non-loopback endpoints requires explicit
+`--allow-remote-sensitive-facts`. Scores persist **only** case counts, source
+SHA-256, model IDs and TP/FP/FN metrics, never plaintext facts or credentials.
+One failed request means **no successful quality report**. CI tests only the
+scoring implementation, not provider accuracy.

@@ -1,9 +1,10 @@
 import {describe,expect,it} from 'vitest';
 import {
-  buildSemanticReviewPrompt,reviewEligibleFacts,validateSemanticReview,
-  reviewScopeKey,
+  buildSemanticReviewPrompt,reviewEligibleFacts,validateSemanticReview,intersectIndependentSemanticReviews,
+  reviewScopeKey,configuredSemanticVerifiers,distinctVerifierOrThrow,
 } from './semanticMemoryReview';
 import type {MemoryEntry} from './memoryStudio';
+import {useModelStore} from '../store/modelStore';
 
 const f=(id:string,text:string,extra:Partial<MemoryEntry>={}):MemoryEntry=>({
  id,text,source:'agent',enabled:true,created_at:'2026-01-01T00:00:00Z',
@@ -16,6 +17,29 @@ const facts=[
  f('b','User prefers brief recaps.'),
  f('c','User prefers detailed explanations.'),
 ];
+
+describe('independent model identity gate',()=>{
+ it('does not allow the selected model to verify its own proposal',()=>{
+  const original=useModelStore.getState();
+  try{
+   useModelStore.setState({
+    providers:[{id:'provider-a',label:'Provider A',has_key:true,is_extension:false},
+               {id:'provider-b',label:'Provider B',has_key:true,is_extension:false}] as typeof original.providers,
+    providerModels:{'provider-a':[{id:'model-a'}],'provider-b':[{id:'model-b'}]} as typeof original.providerModels,
+   });
+   const models=configuredSemanticVerifiers();
+   expect(models).toHaveLength(2);
+   expect(()=>distinctVerifierOrThrow(
+     {kind:'provider',providerId:'provider-a',model:'model-a'},models[0].key,
+   )).toThrow(/different model/);
+   expect(distinctVerifierOrThrow(
+     {kind:'provider',providerId:'provider-a',model:'model-a'},models[1].key,
+   )).toEqual({kind:'provider',providerId:'provider-b',model:'model-b'});
+   expect(()=>distinctVerifierOrThrow({kind:'local',baseUrl:'http://127.0.0.1:8090'},'other'))
+     .toThrow(/Select a configured/);
+  }finally{useModelStore.setState({providers:original.providers,providerModels:original.providerModels});}
+ });
+});
 
 describe('untrusted semantic memory candidate validation',()=>{
  it('permits genuine paraphrase suggestions with approval required and exact original snapshots',()=>{
@@ -36,6 +60,28 @@ describe('untrusted semantic memory candidate validation',()=>{
    scopeKey:'project:/repo/a',
   });
   expect(candidates[1]).toMatchObject({kind:'contradiction',ids:['a','c']});
+ });
+ it('requires separate proposal and verification to agree on exact scoped identities',()=>{
+  const proposer=validateSemanticReview({proposals:[
+   {kind:'merge',ids:['a','b'],suggestedText:'User likes concise summaries.',
+    reason:'Paraphrase'},
+   {kind:'contradiction',ids:['a','c'],reason:'Different requests'},
+  ]},facts);
+  const verifier=validateSemanticReview({proposals:[
+   {kind:'merge',ids:['b','a'],suggestedText:' USER LIKES CONCISE SUMMARIES. ',
+    reason:'Same enduring claim'},
+   {kind:'merge',ids:['a','c'],suggestedText:'Conflicting claims',
+    reason:'Improper merge'},
+  ]},[...facts].reverse());
+  const shared=intersectIndependentSemanticReviews(proposer,verifier);
+  expect(shared).toHaveLength(1);
+  expect(shared[0].kind).toBe('merge');
+  expect(shared[0].ids).toEqual(['a','b']);
+  const unsafe=verifier.map(item=>item.kind==='merge'&&item.ids.includes('b')
+   ? {...item,suggestedText:'Different meaning entirely.'} : item);
+  expect(intersectIndependentSemanticReviews(proposer,unsafe)).toEqual([]);
+
+  expect(intersectIndependentSemanticReviews(proposer,[])).toEqual([]);
  });
  it('rejects forged IDs, cross-workspace and user-pinned/disabled fact edits',()=>{
   const other=f('different','User likes short summaries.',{project_root:'/repo/b'});

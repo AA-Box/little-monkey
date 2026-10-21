@@ -1,5 +1,5 @@
 import {beforeEach,describe,expect,it,vi} from 'vitest';
-import {listCollaboratingSessions,sendSessionMessage,syncSessionMailbox} from './sessionCollaboration';
+import {listCollaboratingSessions,sendSessionMessage,syncSessionMailbox,syncSessionMailboxAtSafePoint,broadcastSessionMessage,noteSessionFileActivity} from './sessionCollaboration';
 import {toWireMessages} from './llamaClient';
 
 const flush=vi.fn();
@@ -78,6 +78,7 @@ beforeEach(()=>{
   }
   if(name==='session_mail_pending')return mail.filter(m=>!m.delivered &&
     m.recipientSessionId===args.recipientSessionId&&m.workspace===args.workspace);
+  if(name==='session_mail_file_activity')return 1;
   if(name==='session_mail_ack'){
    const item=mail.find(m=>m.id===args.messageId&&
     m.recipientSessionId===args.recipientSessionId&&m.workspace===args.workspace);
@@ -155,6 +156,50 @@ describe('native SQLite backed local session messaging integration',()=>{
   expect(sessions[1].messages).toHaveLength(0);
   runningTurns.target=false;
   expect(await syncSessionMailbox('target')).toBe(1);
+ });
+ it('delivers durable notices to an actively executing recipient at an explicit safe point',async()=>{
+  runningTurns.target=true;
+  await sendSessionMessage(args);
+  expect(mail[0].delivered).toBe(false);
+  expect(sessions[1].messages).toHaveLength(0);
+  expect(await syncSessionMailboxAtSafePoint('target')).toBe(1);
+  expect(sessions[1].messages).toHaveLength(1);
+  expect(flush).toHaveBeenCalledTimes(1);
+  expect(mail[0].delivered).toBe(true);
+  runningTurns.target=false;
+  await expect(syncSessionMailboxAtSafePoint('target')).rejects.toThrow(/executing turn/);
+ });
+ it('broadcasts to all and only admitted same-workspace recipients',async()=>{
+  sessions.push({id:'second',title:'Second',workspacePath:'/repo/a',
+    archived:false,comparisonBranch:null,messages:[]});
+  runningTurns.target=true;
+  runningTurns.second=true;
+  const first=await broadcastSessionMessage({
+    senderSessionId:'sender',toolCallId:'broadcast-1',turnId:'turn-1',text:'Review the shared API',
+  });
+  expect(first).toEqual({persistedRecipients:['second','target'],count:2});
+  expect(mail.map(m=>m.recipientSessionId)).toEqual(['second','target']);
+  expect(mail.every(m=>!m.delivered)).toBe(true);
+  await broadcastSessionMessage({
+    senderSessionId:'sender',toolCallId:'broadcast-1',turnId:'turn-1',text:'Review the shared API',
+  });
+  expect(mail).toHaveLength(2);
+ });
+ it('records file activity only for opted-in workspace-bound sessions',async()=>{
+  const value=await noteSessionFileActivity({
+   sessionId:'sender',turnId:'turn1',toolCallId:'tool1',path:'src/main.rs',action:'read',
+  });
+  expect(value).toBe(1);
+  expect(invokeMock).toHaveBeenCalledWith('session_mail_file_activity',expect.objectContaining({
+   sessionId:'sender',workspace:'/repo/a',path:'src/main.rs',action:'read',
+  }));
+  enabled=false;
+  invokeMock.mockClear();
+  expect(await noteSessionFileActivity({
+   sessionId:'sender',turnId:'turn1',toolCallId:'tool2',
+   path:'src/main.rs',action:'write',
+  })).toBe(0);
+  expect(invokeMock).not.toHaveBeenCalled();
  });
  it('refuses cross-workspace, self, archived and disabled access',async()=>{
   await expect(sendSessionMessage({...args,recipientSessionId:'other'})).rejects.toThrow();

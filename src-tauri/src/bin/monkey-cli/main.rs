@@ -30,6 +30,7 @@ mod execution_cli;
 mod extensions_cli;
 mod ingress_cli;
 mod launcher;
+mod local_peer_collaboration;
 mod managed_model_cli;
 mod mcp_cli;
 mod memory_cli;

@@ -84,3 +84,19 @@ For a fair external JCode comparison, run its own independently documented
 harness on the **same machine, model, prompts, cache state and concurrency**,
 then collect comparable RSS/PSS and terminal-correctness evidence.
 This PR intentionally does not invent that measurement.
+
+## Actual same-hardware execution
+
+The manual `.github/workflows/live-jcode-parity.yml` job requires a real
+user-owned Linux runner labeled `self-hosted, linux, x64,
+little-monkey-benchmark`, with **both installed and authenticated agents**.
+Run it through GitHub Actions using the exact `workspace`, `model` and
+`provider`. The benchmark refuses missing tools and checks JCode's real
+active provider and model for every turn, not just a requested model string.
+Its successful result includes binary SHA-256 hashes and versions, Linux boot
+ID, identical five-turn workload, tool-call evidence and PSS measurements.
+
+The workflow does **not** run on hosted CI because an ordinary Actions runner
+cannot supply the same installed authenticated agents. Successful frontend CI
+or a queued manual workflow is **not** a real-model parity measurement. Provider
+sampling and reasoning settings must also be audited for equivalence.
