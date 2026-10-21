@@ -121,6 +121,14 @@ pub enum DaemonCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Enter/leave durable scheduling drain without cancelling queued jobs.
+    /// Active model tasks finish normally before a cold service upgrade.
+    Drain {
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+    },
     /// Show recent scheduling decisions: what was chosen, over what, and which
     /// measurement decided it.
     Decisions {
@@ -518,6 +526,10 @@ struct DaemonStatus {
     installed: bool,
     service_running: bool,
     heartbeat_fresh: bool,
+    maintenance_drain: bool,
+    /// Only true when this isolated Linux selfdev user service has a stable,
+    /// verified published manifest that actually retains child processes.
+    live_handoff_enabled: bool,
     pid: Option<u32>,
     kill_switch: bool,
     queued: u32,
@@ -525,6 +537,12 @@ struct DaemonStatus {
     waiting_approval: u32,
     paused: u32,
     managed_run_ids: Vec<String>,
+    /// Verifiable task workers, not a promise about unstarted queue entries.
+    handoff_candidates: u32,
+    handoff_attested: u32,
+    handoff_worker_ids: Vec<String>,
+    handoff_adopted_count: u32,
+    handoff_adopted_daemon_pid: Option<u32>,
     platform: service::ServicePlatform,
     /// The K8 backpressure signal. Added to *this* payload rather than given its
     /// own command because this is already the thing every producer polls — the
@@ -568,6 +586,16 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
             manager.start(&paths)
         }
         DaemonCmd::Status { json } => status(*json),
+        DaemonCmd::Drain { enable, disable } => {
+            if *enable == *disable {
+                return Err("Choose exactly one of --enable or --disable".into());
+            }
+            let paths=DaemonPaths::resolve()?;
+            let mut store=DaemonStore::open(&paths)?;
+            store.set_meta("maintenance_drain",if *enable {"1"}else{"0"})?;
+            println!("{}",serde_json::json!({"maintenance_drain":enable}));
+            Ok(())
+        },
         DaemonCmd::Decisions { limit, json } => decisions(*limit, *json),
         DaemonCmd::Stop => stop().await,
         DaemonCmd::Uninstall { purge_state } => uninstall(*purge_state),
@@ -739,6 +767,21 @@ fn install(args: &DaemonInstallArgs) -> Result<(), String> {
     };
     let mut store = DaemonStore::open(&paths)?;
     store.set_meta("stop_requested", "0")?;
+    #[cfg(target_os="linux")]
+    if little_monkey_lib::app_paths::agent_config_roots()?.profile_id.starts_with("selfdev-")
+       && std::env::var("LITTLE_MONKEY_DAEMON_LIVE_HANDOFF").as_deref()==Ok("1") {
+        // Persistent opt-in is profile-local; later status/ensure/rollback
+        // must render the SAME systemd unit even without an env override.
+        let marker=paths.root.join(".selfdev-live-handoff");
+        if let Ok(meta)=std::fs::symlink_metadata(&marker){
+            if meta.file_type().is_symlink()||!meta.is_file(){
+                return Err("Refusing non-regular live handoff enrollment marker".into());
+            }
+        }
+        std::fs::write(&marker,b"selfdev-live-handoff-v1\n")
+           .map_err(|e|format!("Failed to persist selfdev live enrollment: {e}"))?;
+        store::restrict_file(&marker)?;
+    }
     let manifest = manager.install(&paths, &config)?;
     println!(
         "Installed {} user service at {}",
@@ -877,6 +920,11 @@ fn status(json: bool) -> Result<(), String> {
     let mut heartbeat = None;
     let mut pid = None;
     let mut managed_run_ids = Vec::new();
+    let mut handoff_candidates = 0u32;
+    let mut handoff_attested = 0u32;
+    let mut handoff_worker_ids = Vec::new();
+    let mut handoff_adopted_count = 0u32;
+    let mut handoff_adopted_daemon_pid = None;
     let mut held = 0;
     let mut nonterminal = 0;
     // The installed config when there is one, defaults otherwise: an uninstalled
@@ -895,6 +943,18 @@ fn status(json: bool) -> Result<(), String> {
             .get_meta("pid")?
             .and_then(|value| value.parse::<u32>().ok());
         managed_run_ids = store.managed_run_ids(512)?;
+        handoff_adopted_count = store.get_meta("last_live_handoff_adopted_count")?
+           .and_then(|v|v.parse::<u32>().ok()).unwrap_or(0);
+        handoff_adopted_daemon_pid = store.get_meta("last_live_handoff_daemon_pid")?
+           .and_then(|v|v.parse::<u32>().ok());
+        #[cfg(target_os="linux")]
+        for job in store.active_jobs()? {
+            handoff_candidates += 1;
+            if let Some((pid,start))=engine::attested_worker(&paths,&job)? {
+                handoff_attested+=1;
+                handoff_worker_ids.push(format!("{}:{pid}:{start}",job.job_id));
+            }
+        }
         for job in store.nonterminal_jobs()? {
             match job.state {
                 JobState::Preparing | JobState::Queued => queued += 1,
@@ -911,6 +971,14 @@ fn status(json: bool) -> Result<(), String> {
         installed,
         service_running,
         heartbeat_fresh: heartbeat.is_some_and(|value| now.saturating_sub(value) < 5_000),
+        maintenance_drain:paths.state_db.is_file() &&
+            DaemonStore::open(&paths)?.get_meta("maintenance_drain")?.as_deref()==Some("1"),
+        live_handoff_enabled:cfg!(target_os="linux")
+           && manager.platform()==service::ServicePlatform::SystemdUser
+           && little_monkey_lib::app_paths::agent_config_roots()?.profile_id.starts_with("selfdev-")
+           && std::fs::read_to_string(paths.root.join(".selfdev-live-handoff"))
+               .as_deref().is_ok_and(|m|m=="selfdev-live-handoff-v1\n")
+           && manager.manifest_is_current(&paths)?,
         pid,
         kill_switch,
         queued,
@@ -918,6 +986,11 @@ fn status(json: bool) -> Result<(), String> {
         waiting_approval,
         paused,
         managed_run_ids,
+        handoff_candidates,
+        handoff_attested,
+        handoff_worker_ids,
+        handoff_adopted_count,
+        handoff_adopted_daemon_pid,
         platform: manager.platform(),
         backpressure: scheduler::backpressure(
             kill_switch,
@@ -3296,7 +3369,9 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
         SystemClock,
         owner_id,
     )
-    .with_profile_limits(profile_limits);
+    .with_profile_limits(profile_limits)
+    .with_live_handoff(roots.profile_id.starts_with("selfdev-") &&
+       std::env::var("LITTLE_MONKEY_DAEMON_LIVE_HANDOFF").as_deref()==Ok("1"));
     engine.recover()?;
     reap_dead_workflow_hosts(&engine.shared);
     // One machine-wide desktop-control runtime, shared with the remote API so

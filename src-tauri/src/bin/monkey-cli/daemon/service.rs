@@ -954,11 +954,21 @@ impl<R: CommandRunner> ServiceManager<R> {
                 )
             }
             ServicePlatform::SystemdUser => format!(
-                "[Unit]\nDescription=Little Monkey durable local agent daemon\nAfter=network-online.target\n\n[Service]\nType=simple\nEnvironment={}\nEnvironment={}\nEnvironment=\"XDG_RUNTIME_DIR=%t\"\nEnvironment=\"DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus\"\nExecStart={} --profile={} daemon serve\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=full\nWorkingDirectory=%h\n\n[Install]\nWantedBy=default.target\n",
+                "[Unit]\nDescription=Little Monkey durable local agent daemon\nAfter=network-online.target\n\n[Service]\nType=simple\nEnvironment={}\nEnvironment={}\nEnvironment=\"XDG_RUNTIME_DIR=%t\"\nEnvironment=\"DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus\"\nExecStart={} --profile={} daemon serve\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\n{}ProtectSystem=full\nWorkingDirectory=%h\n\n[Install]\nWantedBy=default.target\n",
                 systemd_environment_escape(&format!("LITTLE_MONKEY_HOME={agent_home}")),
                 systemd_environment_escape(&format!("HOME={user_home}")),
                 systemd_escape(&executable),
                 systemd_escape(&self.profile_id),
+                if cfg!(target_os="linux") &&
+                   self.profile_id.starts_with("selfdev-") &&
+                   std::fs::read_to_string(paths.root.join(".selfdev-live-handoff"))
+                      .as_deref().is_ok_and(|value|value=="selfdev-live-handoff-v1\n") {
+                    // systemd's default KillMode=control-group would kill
+                    // every provider worker when the daemon is replaced.
+                    // Only isolated, explicitly opted-in Linux selfdev
+                    // services may retain workers for the new daemon to adopt.
+                    "KillMode=process\nEnvironment=LITTLE_MONKEY_DAEMON_LIVE_HANDOFF=1\n"
+                }else{""},
             ),
             ServicePlatform::WindowsTask => {
                 let script = format!(
@@ -1966,6 +1976,30 @@ mod tests {
             test_roots(profile_id, profile_id, agent_home),
         )
         .unwrap()
+    }
+
+    #[cfg(target_os="linux")]
+    #[test]
+    fn linux_live_handoff_systemd_manifest_is_stable_from_durable_opt_in(){
+        let base=std::env::temp_dir().join(format!("lm-systemd-live-{}",
+            uuid::Uuid::new_v4()));
+        let paths=DaemonPaths::under(&base);
+        paths.ensure().unwrap();
+        let special=manager(ServicePlatform::SystemdUser,
+            "selfdev-0123456789abcdef",&base);
+        assert!(!special.render_manifest(&paths).unwrap().contains("KillMode=process"));
+        std::fs::write(paths.root.join(".selfdev-live-handoff"),
+            b"selfdev-live-handoff-v1\n").unwrap();
+        let manifest=special.render_manifest(&paths).unwrap();
+        assert!(manifest.contains("KillMode=process\n"));
+        assert!(manifest.contains("Environment=LITTLE_MONKEY_DAEMON_LIVE_HANDOFF=1\n"));
+        assert_eq!(manifest,special.render_manifest(&paths).unwrap());
+        let regular=manager(ServicePlatform::SystemdUser,"default",&base);
+        assert!(!regular.render_manifest(&paths).unwrap().contains("KillMode=process"),
+            "the main profile must never retain orphaned task processes");
+        std::fs::write(paths.root.join(".selfdev-live-handoff"),b"corrupt\n").unwrap();
+        assert!(!special.render_manifest(&paths).unwrap().contains("KillMode=process"));
+        let _=std::fs::remove_dir_all(&base);
     }
 
     fn test_roots(
