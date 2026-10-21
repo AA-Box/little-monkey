@@ -13,6 +13,8 @@ import type {ChatMessage} from './llamaClient';
 import type {MemoryEntry} from './memoryStudio';
 import {attemptStream} from './turnEngine';
 import {resolveTarget} from './targetRouting';
+import {useModelStore} from '../store/modelStore';
+import type {ResolvedTarget} from './turnEngine';
 import {effortForTarget} from '../store/modelStore';
 import {useSessionStore} from '../store/sessionStore';
 
@@ -100,26 +102,88 @@ export function validateSemanticReview(
  return accepted;
 }
 
+/** Only separately produced review decisions that independently agree on
+ * identity, scope and change kind may reach Memory Studio approval. A model
+ * cannot confirm itself by echoing its first response: the two requests see
+ * only the original facts, in opposite order, and do not see each other. */
+export function intersectIndependentSemanticReviews(
+ first:readonly SemanticReviewProposal[],
+ second:readonly SemanticReviewProposal[],
+):SemanticReviewProposal[]{
+ const signature=(p:SemanticReviewProposal)=>
+  JSON.stringify([p.scopeKey,p.kind,[...p.ids].sort()]);
+ const bySignature=new Map(second.map(item=>[signature(item),item]));
+ return first.filter(proposal=>{
+  const other=bySignature.get(signature(proposal));
+  if(!other)return false;
+  // Pair agreement is not enough: a model could agree that two facts are
+  // related but invent an unsupported summary. Demand the other model's
+  // independently authored summary also match before displaying approval.
+  if(proposal.kind==='merge' && other.kind==='merge'){
+   const normalize=(text:string)=>text.trim().replace(/\s+/g,' ').toLocaleLowerCase();
+   return normalize(proposal.suggestedText)===normalize(other.suggestedText);
+  }
+  return proposal.kind==='contradiction' && other.kind==='contradiction';
+ });
+}
+
+/**
+ * A second model must be independently configured and explicitly selected
+ * by the reviewer. Merely calling the same model twice is not an independent
+ * evaluation, and quietly switching the primary chat target is forbidden.
+ */
+export function configuredSemanticVerifiers():Array<{key:string;label:string;target:Extract<ResolvedTarget,{kind:'provider'}>}>{
+ const {providers,providerModels}=useModelStore.getState();
+ return providers.filter(p=>p.has_key && !p.is_extension)
+  .flatMap(p=>(providerModels[p.id]??[]).filter(m=>typeof m.id==='string' && !!m.id)
+   .map(m=>({key:JSON.stringify([p.id,m.id]),label:p.label+' / '+m.id,
+    target:{kind:'provider',providerId:p.id,model:m.id} as const})));
+}
+export function distinctVerifierOrThrow(
+ proposer:ResolvedTarget, verifierKey:string,
+):ResolvedTarget{
+ const picked=configuredSemanticVerifiers().find(v=>v.key===verifierKey);
+ if(!picked)throw Error('Select a configured second provider model for independent verification.');
+ if(proposer.kind==='provider' && proposer.providerId===picked.target.providerId &&
+    proposer.model===picked.target.model)
+   throw Error('The proposer and verifier must use different model identities.');
+ return picked.target;
+}
+
 export async function requestSemanticMemoryReview(
- facts:readonly MemoryEntry[],
+ facts:readonly MemoryEntry[],verifierKey:string,
 ):Promise<SemanticReviewProposal[]>{
- const messages=buildSemanticReviewPrompt(facts);
+ const approved=reviewEligibleFacts(facts);
  const target=await resolveTarget();
- const controller=new AbortController();
- const timeout=setTimeout(()=>controller.abort(),60_000);
- try{
-  // No model tools or effects; cloud requests pass through the exact same
-  // privacy firewall/cost gate/usage attribution as an ordinary turn.
-  const result=await attemptStream(
-   target,messages,[],controller.signal,effortForTarget(target),
-   useSessionStore.getState().activeSessionId??'memory-studio-review',
-   undefined,false,1100,undefined,false,
-  );
-  if(controller.signal.aborted)throw Error('Memory review model request timed out');
-  if(result.streamError!==null||result.toolCalls.length>0)
-   throw Error(result.streamError??'Memory review model returned tool calls');
-  if(result.content.length>MAX_RESPONSE)throw Error('Model review response exceeded byte cap');
-  const body=result.content.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'');
-  return validateSemanticReview(JSON.parse(body),facts);
- }finally{clearTimeout(timeout);}
+ const verifierTarget=distinctVerifierOrThrow(target,verifierKey);
+ const sessionId=useSessionStore.getState().activeSessionId??'memory-studio-review';
+ const invokeReview=async (items:readonly MemoryEntry[],kind:'proposer'|'verifier')=>{
+  const messages=buildSemanticReviewPrompt(items);
+  if(kind==='verifier'){
+   messages[0]={...messages[0],content:messages[0].content+
+    '\nIndependent verification: assess each input claim from scratch. You do not have access to any first review. Report no change if uncertain. Reject contradictions based only on differing preferences that could coexist.'};
+  }
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),60_000);
+  try{
+   const result=await attemptStream(
+    kind==='proposer'?target:verifierTarget,messages,[],controller.signal,effortForTarget(target),
+    sessionId,undefined,false,1100,undefined,false,
+   );
+   if(controller.signal.aborted)throw Error('Independent memory review request timed out');
+   if(result.streamError!==null||result.toolCalls.length>0)
+    throw Error(result.streamError??'Memory review model returned tool calls');
+   if(result.content.length>MAX_RESPONSE)
+    throw Error('Memory review response exceeded byte cap');
+   const body=result.content.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'');
+   return validateSemanticReview(JSON.parse(body),approved);
+  }finally{clearTimeout(timeout);}
+ };
+ // Both independently initiated completions must succeed: a failed verifier
+ // never turns unchecked proposals into approved candidates. This doubles
+ // provider requests, usage and costs; the explicit Review action opts in.
+ const first=await invokeReview(approved,'proposer');
+ if(first.length===0)return[];
+ const second=await invokeReview([...approved].reverse(),'verifier');
+ return intersectIndependentSemanticReviews(first,second);
 }

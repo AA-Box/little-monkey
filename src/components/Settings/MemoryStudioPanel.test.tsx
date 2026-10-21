@@ -20,6 +20,10 @@ vi.mock("../../lib/semanticMemoryReview",()=>({
   reviewScopeKey:(fact:{scope:string;project_root:string|null})=>
     fact.scope+":"+(fact.project_root??""),
   requestSemanticMemoryReview:(facts:unknown)=>proposeSemantic(facts),
+  configuredSemanticVerifiers:()=>[{
+    key:'["provider-b","model-b"]',label:'Provider B / model-b',
+    target:{kind:'provider',providerId:'provider-b',model:'model-b'},
+  }],
 }));
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invoke(...args),
@@ -122,6 +126,9 @@ describe("operator-controlled model-assisted memory review",()=>{
     render(<MemoryStudioPanel/>);
     await screen.findByText("User prefers short reports.");
     expect(proposeSemantic).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText("Independent verifier model"),{
+      target:{value:'["provider-b","model-b"]'},
+    });
     fireEvent.click(screen.getByRole("button",{name:"Review paraphrases with selected model"}));
     await screen.findByRole("button",{name:"Approve reversible merge"});
     expect(proposeSemantic).toHaveBeenCalledTimes(1);
@@ -153,6 +160,9 @@ describe("operator-controlled model-assisted memory review",()=>{
     });
     render(<MemoryStudioPanel/>);
     await screen.findByText("User prefers short reports.");
+    fireEvent.change(screen.getByLabelText("Independent verifier model"),{
+      target:{value:'["provider-b","model-b"]'},
+    });
     fireEvent.click(screen.getByRole("button",{name:"Review paraphrases with selected model"}));
     await screen.findByRole("button",{name:"Approve reversible merge"});
     facts[0]={...facts[0],text:"User changed preference after review."};

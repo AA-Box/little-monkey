@@ -962,6 +962,90 @@ pub fn garden_conservative_semantic_review_impl(
         unresolved_contradictions:unresolved})
 }
 
+/// Read-only review candidate. A proposal is never permission to change facts:
+/// the operator uses Memory Studio's guarded merge after reviewing evidence.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AmbientMemoryCandidate {
+    pub fact_ids: [String; 2],
+    pub source_turn_ids: [String; 2],
+    pub text_sha256: [String; 2],
+    pub token_overlap_permille: u16,
+    pub trigram_similarity_permille: u16,
+    pub requires_user_approval: bool,
+}
+
+/// Two independent, deterministic *lexical* evaluators (word overlap and
+/// character trigrams) must both agree before a candidate is even proposed.
+/// This is not model-based semantic adjudication. Proposals are in-memory,
+/// bounded, project-scoped, provenance-backed, and NEVER auto-applied.
+pub fn garden_evidence_candidates_impl(path:&Path,root:&str)
+    -> Result<Vec<AmbientMemoryCandidate>,String>{
+    use sha2::{Digest,Sha256};
+    use std::collections::BTreeSet;
+    let data=load_impl(path)?;
+    let Some(project)=data.projects.get(root) else {return Ok(vec![])};
+    let eligible:Vec<_>=project.facts.iter().filter(|fact|
+        fact.source=="agent" && fact.enabled && !fact.pinned &&
+        fact.retired_at.is_none() && fact.expires_at.is_none() &&
+        fact.merged_from.is_empty() && fact.source_turn_id.as_ref()
+            .is_some_and(|turn|!turn.trim().is_empty()) &&
+        conservative_natural_fact_key(&fact.text).is_some()
+    ).take(100).collect();
+    let mut candidates=Vec::new();
+    for (index,a) in eligible.iter().enumerate() {
+        for b in eligible.iter().skip(index+1) {
+            let ka=conservative_natural_fact_key(&a.text).unwrap_or_default();
+            let kb=conservative_natural_fact_key(&b.text).unwrap_or_default();
+            if ka==kb {continue;} // handled by proven-equality curator
+            // Explicit negation conflicts require separate manual adjudication.
+            if let (Some((head_a,neg_a)),Some((head_b,neg_b)))=
+                (contradiction_key(&ka),contradiction_key(&kb)){
+                if head_a==head_b && neg_a!=neg_b {continue;}
+            }
+            let wa:BTreeSet<_>=ka.split_whitespace().collect();
+            let wb:BTreeSet<_>=kb.split_whitespace().collect();
+            // Words asserting negation or changed truth conditions are not
+            // safe paraphrase candidates even if most other words overlap.
+            if ["not","never","no","without","except","only","always"].iter()
+                .any(|word|wa.contains(word)!=wb.contains(word)){continue;}
+            let common=wa.intersection(&wb).count();
+            let union=wa.union(&wb).count();
+            if union==0 {continue;}
+            let overlap=(1000*common/union) as u16;
+            if overlap<480 {continue;}
+            let grams=|key:&str| -> BTreeSet<String> {
+                let chars:Vec<char>=key.chars().collect();
+                chars.windows(3).map(|win|win.iter().collect::<String>()).collect()
+            };
+            let ga=grams(&ka);let gb=grams(&kb);
+            let denominator=ga.len()+gb.len();
+            if denominator==0 {continue;}
+            let score=(2000*ga.intersection(&gb).count()/denominator) as u16;
+            if score<620 {continue;}
+            let hash=|text:&str|format!("{:x}",Sha256::digest(text.as_bytes()));
+            candidates.push(AmbientMemoryCandidate{
+                fact_ids:[a.id.clone(),b.id.clone()],
+                source_turn_ids:[
+                    a.source_turn_id.clone().unwrap_or_default(),
+                    b.source_turn_id.clone().unwrap_or_default(),
+                ],
+                text_sha256:[hash(&a.text),hash(&b.text)],
+                token_overlap_permille:overlap,
+                trigram_similarity_permille:score,
+                requires_user_approval:true,
+            });
+        }
+    }
+    // Strongest agreement first with deterministic tie-breaking by fact id.
+    candidates.sort_by(|a,b|
+        (u32::from(b.token_overlap_permille)+u32::from(b.trigram_similarity_permille))
+            .cmp(&(u32::from(a.token_overlap_permille)+u32::from(a.trigram_similarity_permille)))
+            .then_with(||a.fact_ids.cmp(&b.fact_ids))
+    );
+    candidates.truncate(12);
+    Ok(candidates)
+}
+
 #[cfg(test)]
 mod semantic_garden_tests {
     use super::*;
@@ -971,6 +1055,35 @@ mod semantic_garden_tests {
             pinned:false,expires_at:None,last_used_at:None,
             merged_from:vec![],merged_into:None,retired_at:None}
     }
+    #[test]
+    fn review_candidates_are_scoped_evidenced_and_never_mutate_memory() {
+        let dir=std::env::temp_dir().join(format!("lm-evidence-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path=dir.join("memories.json");
+        let mut data=MemoriesFile::default();
+        let mut first=fact("one","The user prefers concise written explanations with examples");
+        first.source_turn_id=Some("turn-a".into());
+        let mut second=fact("two","The user prefers concise explanations with written examples");
+        second.source_turn_id=Some("turn-b".into());
+        let mut sensitive=fact("secret","The user prefers concise passwords with examples");
+        sensitive.source_turn_id=None;
+        let third=fact("other","The user prefers concise explanations with written examples");
+        data.projects.insert("/demo".into(),ProjectMemory{facts:vec![
+            first.clone(),second.clone(),sensitive,third,
+        ]});
+        save_impl(&path,&data).unwrap();
+        let before=std::fs::read(&path).unwrap();
+        let result=garden_evidence_candidates_impl(&path,"/demo").unwrap();
+        assert_eq!(result.len(),1);
+        assert_eq!(result[0].fact_ids,["one","two"]);
+        assert_eq!(result[0].source_turn_ids,["turn-a","turn-b"]);
+        assert!(result[0].requires_user_approval);
+        assert_eq!(result[0].text_sha256[0].len(),64);
+        assert!(garden_evidence_candidates_impl(&path,"/unrelated").unwrap().is_empty());
+        assert_eq!(before,std::fs::read(&path).unwrap(),"Background proposal must be read-only");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn approved_model_merge_rejects_stale_text_under_cross_process_lock() {
         let dir=std::env::temp_dir().join(format!("lm-guarded-{}",uuid::Uuid::new_v4()));

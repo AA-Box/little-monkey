@@ -1,0 +1,54 @@
+# This workflow runs ONLY on a user-owned Linux computer explicitly labeled
+# little-monkey-benchmark. It cannot produce genuine provider calls on hosted CI.
+name: Actual Little Monkey/JCode same-host benchmark
+on:
+  workflow_dispatch:
+    inputs:
+      workspace:
+        description: Absolute directory on the self-hosted runner (must have README.md)
+        required: true
+        type: string
+      model:
+        description: Exact provider model ID present in BOTH installed clients
+        required: true
+        type: string
+      provider:
+        description: Exact shared provider identity (e.g. openai)
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: real-little-monkey-jcode-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  actual-model-parity:
+    runs-on: [self-hosted, linux, x64, little-monkey-benchmark]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Refuse misconfigured/inaccessible model agents
+        env:
+          WORKSPACE: ${{ inputs.workspace }}
+        run: |
+          command -v monkey-cli
+          command -v jcode
+          test -r "$WORKSPACE/README.md"
+          test -r /proc/self/smaps_rollup
+      - name: Run actual models, same kernel/host, two repetitions each of 1/5/10 sessions
+        env:
+          WORKSPACE: ${{ inputs.workspace }}
+          MODEL: ${{ inputs.model }}
+          PROVIDER: ${{ inputs.provider }}
+        run: |
+          python3 scripts/bench-jcode-parity.py \
+            --workspace "$WORKSPACE" \
+            --model "$MODEL" --provider "$PROVIDER" \
+            --output "$RUNNER_TEMP/real-model-parity.json"
+      - name: Upload genuine, non-secret measurement report only on success
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-model-parity
+          path: ${{ runner.temp }}/real-model-parity.json
+          retention-days: 7
+          if-no-files-found: error
