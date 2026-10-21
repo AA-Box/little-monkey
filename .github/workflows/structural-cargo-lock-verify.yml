@@ -24,3 +24,16 @@ jobs:
             echo "::error::Cargo.lock differs from Cargo's canonical dependency resolution; commit corrected Cargo.lock"
             exit 1
           fi
+  cross-platform-locked-resolution:
+    needs: lockfile-canonical-diff
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust dependency resolution cannot change Cargo.lock
+        run: cargo metadata --locked --manifest-path src-tauri/Cargo.toml --format-version 1 --no-deps
